@@ -2073,9 +2073,9 @@ export const mockScenarios: readonly MockScenario[] = [
       "A mobile client on a flaky network re-uploaded an entire multi-gigabyte file after one part failed, because the starter's status read returns only a percentage and the client had no list of gaps to act on. Debug it, fix it, and prove resume is part-exact.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      "The starter's GET /v1/uploads/{upload_id} divides the manifest length by part_count and returns a percentage; it compares no checksum, so a corrupted part counts as present, and it reads no tenant header, so any caller can read any upload by id.",
+      "The starter's GET /v1/uploads/{upload_id} returns uploaded_bytes and a percent_complete computed from the byte counter, with no list of missing parts; it reads no X-Tenant-Id, so any caller can read any upload by id, and it reads the parts hash and the counter in two commands, so a part registered in between is counted but not listed.",
     testIdea:
-      "Fail one part and assert only its number appears in the resume list; corrupt a stored part's checksum and assert it moves to corrupt and resume; read the upload with a foreign X-Tenant-Id and assert 404.",
+      'Register parts 1, 2 and 4 of 5 and assert resume is exactly [3, 5]; read the upload with a foreign X-Tenant-Id and assert 404; register a part between the read of the parts and the read of the counter and assert uploaded_bytes equals the sizes listed in stored.',
     followUps: [
       'What minimum part size keeps manifests sane?',
       'How should resumable uploads work for mobile networks that change IPs?',
@@ -2087,17 +2087,17 @@ export const mockScenarios: readonly MockScenario[] = [
     id: 'invoice-service-the-invoice-that-changed-after-it-was-paid',
     problemId: 'invoice-service',
     stepId: 'dependency',
-    title: 'The invoice that changed after it was paid',
+    title: 'The invoices issued with zero tax',
     blurb: 'A tax-service outage issued a batch of invoices with zero tax.',
     role: 'Payments engineer · 20 min',
     minutes: 20,
     prompt:
-      'An auditor found a batch of invoices issued with zero tax during a ten-minute tax-service outage, and a customer in a jurisdiction the tax service refuses was invoiced anyway after five identical rejections. The starter for finalize_with_tax calls Quote with no deadline, retries the jurisdiction codes as if they were transient, and finalizes with tax_cents = 0 when the attempts run out. Debug it, fix it, and prove an unanswered quote holds the draft, a jurisdiction rejection is a 422 that names it, and no invoice is finalized without a tax source.',
+      'An auditor found a batch of invoices issued with zero tax during a ten-minute tax-service outage, and a customer in a jurisdiction the tax service refuses was invoiced anyway after five identical refusals. The starter for finalize_with_tax calls Quote with no deadline, retries FAILED_PRECONDITION as if it were transient, and records zero tax and claims a number when the attempts run out. Debug it, fix it, and prove an unanswered quote holds the draft without a number, a jurisdiction refusal raises JurisdictionRejected naming it after one call, and every quote carries a 2 s deadline.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'The starter substitutes zero tax when the quote fails instead of holding the draft, so an outage quietly under-charges in a way nobody reconciles; its RETRYABLE set includes INVALID_ARGUMENT and FAILED_PRECONDITION, so a permanent jurisdiction refusal is hammered and then issued; it calls Quote with no deadline; and it stamps tax_source = "quote" on an amount no quote produced.',
+      'The starter records zero tax with source "quote" when no quote arrived and claims the number anyway, so an outage quietly under-charges in a way nobody reconciles; its RETRYABLE set includes FAILED_PRECONDITION and INVALID_ARGUMENT, so a permanent jurisdiction refusal is asked five times and then issued; it allows five attempts; and it calls Quote with no deadline.',
     testIdea:
-      'Time out the tax call and assert the invoice stays a draft with a tax_hold marker and a 202; return FAILED_PRECONDITION and assert one call, a 422 and the jurisdiction in the body; assert every finalized invoice carries a tax_source and that the quote carries a 2 s deadline.',
+      'Fail Quote with UNAVAILABLE and assert three calls, a held outcome, a tax hold on the draft and no number claimed; return FAILED_PRECONDITION and assert one call, no sleep and JurisdictionRejected naming the jurisdiction; assert every Quote call carries a 2 s deadline.',
     followUps: [
       'Who may ever adjust a finalized invoice, and how is it represented?',
       'How do gapless numbers survive a crash?',
@@ -2109,17 +2109,17 @@ export const mockScenarios: readonly MockScenario[] = [
     id: 'shipment-tracking-the-package-that-un-delivered-itself',
     problemId: 'shipment-tracking',
     stepId: 'state',
-    title: 'The package that un-delivered itself',
-    blurb: 'A late scan rolled a delivered shipment backward.',
+    title: 'The parcel that went back to the depot',
+    blurb: 'A later depot scan rolled an out-for-delivery parcel backward.',
     role: 'Logistics backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A delivered shipment flipped back to in transit because a delayed carrier scan arrived after the delivery scan, and a returned scan later reopened a shipment that was already on the porch. The starter writes whatever status the scan body carries. Debug it, fix it, and prove transitions are monotonic and terminal states stay closed.',
+      'A parcel out for delivery flipped back to in transit when the van returned to the depot and the carrier sent a later scan, and a returned scan reopened a shipment that was already on the porch. The starter orders scans by their timestamp and writes the status from the process. Debug it, fix it, and prove transitions are forward only and terminal states stay closed.',
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      'The starter reads the current status in the process and HSETs the body status, so an out-of-order scan regresses a terminal shipment, two concurrent carrier scans race and the later write wins, and a dropped scan leaves no record for operations.',
+      'The starter reads status and status_at with HMGET, keeps any scan newer than the last one and HSETs it, so a later scan of a lower rank regresses the shipment, a returned scan reopens a delivered one, two concurrent carrier scans race and the slower write wins, and a dropped scan leaves no record for operations.',
     testIdea:
-      'Deliver a shipment then apply an older in-transit scan and assert the state stays delivered and the rejected edge is recorded; send a returned scan after delivery and assert it is dropped; fire two scans concurrently and assert the furthest valid state wins.',
+      "Apply out_for_delivery then a later in_transit scan and assert the status holds and the edge lands on shipment:{id}:rejects; send returned after delivered and assert it is dropped; land a delivery between a scan's read and write and assert delivered wins.",
     followUps: [
       'How are returns represented in the state machine?',
       'When should tracking stop polling?',
@@ -2132,14 +2132,14 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'returns-processing',
     stepId: 'state',
     title: 'The return that over-refunded a line',
-    blurb: 'Non-atomic eligibility and auto-refund on timeouts.',
+    blurb: 'Returnable units checked, taken and given back in separate round trips.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
       'One order line was returned three times over: two requests for the last unit both passed, a crash left a decrement with no return behind it, and a replayed cancel pushed the line above its ordered quantity. The starter reads the counter and writes it in separate round trips. Debug it, fix it, and prove the quantities with the checks.',
     signals: ['Verify', 'Operate', 'Secure'],
     aiNote:
-      'The starter reads the remaining quantity with GET and decrements with a separate DECRBY, writes the return record after the counter moved, and restores a cancel without checking whether the return was already canceled, so concurrent returns overdraw the line and a replayed cancel inflates it.',
+      'The starter reads the remaining quantity with GET and decrements with a separate DECRBY, writes the return record after the counter moved, and cancels by INCRing one unit whatever the return took, without checking whether the return was already canceled, so concurrent returns overdraw the line and a replayed cancel inflates it.',
     testIdea:
       'Race two returns against the last unit and assert one succeeds; time out inspection and assert the refund holds as awaiting inspection; move a refund to failed and assert the state does not read refunded.',
     followUps: [
@@ -2153,17 +2153,17 @@ export const mockScenarios: readonly MockScenario[] = [
     id: 'ad-serving-the-ad-that-followed-one-user-everywhere',
     problemId: 'ad-serving',
     stepId: 'state',
-    title: 'The ad that followed one user everywhere',
-    blurb: 'Frequency caps were not enforced and impressions counted at serve.',
+    title: 'The budget two serves both spent',
+    blurb: 'A pacing reservation split over round trips, and a cap that never expired.',
     role: 'Ads platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'One user saw the same campaign on every page for an hour, and the advertiser was billed for impressions on pages the ad never rendered. The starter also served exhausted budgets during a burst. Debug it, fix it, and prove caps, budget and counting are truthful.',
+      'A campaign spent past its paced budget during a traffic burst, users who were refused an ad still lost an impression from their cap, and a user capped last month is still capped. Debug the reservation, fix it, and prove a burst cannot overspend and the window rolls off.',
     signals: ['Specify', 'Operate', 'Verify'],
     aiNote:
-      'The starter checks and increments the frequency cap and pacing counters in separate round trips, so a burst of serves passes the same cap, and it counts an impression when the ad is served rather than when a render beacon confirms display.',
+      'The starter runs INCR on the user counter before it decides, reads the pacing counter in one round trip and INCRBYs it in another, so two racing serves both pass the last of a budget, and it never sets a TTL on the cap key.',
     testIdea:
-      'Serve one user fifty times and assert the capped campaign stops appearing after the cap; exhaust a budget and assert no serve under a burst; drop a render beacon and assert no impression is counted.',
+      'Cap a user at two and ask three times, asserting the counter stays at 2; land a second serve between the read and the write of the pacing counter and assert only one is allowed; advance past the window and assert the user is served again.',
     followUps: [
       'What belongs in a user context hash so no PII enters serving?',
       'How should fallback impressions be reported to advertisers?',
@@ -2176,16 +2176,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'realtime-bidding',
     stepId: 'endpoint',
     title: 'The bidder that was always late',
-    blurb: 'No deadline propagation, no validation, and a bid even after the close.',
+    blurb: 'The exchange sent a 20 ms budget; the bidder answered after 75 ms.',
     role: 'Ads platform engineer · 20 min',
     minutes: 20,
     prompt:
-      'A bidder won almost nothing while the exchange logged it as "no response", because its bids arrived after auctions closed; the same starter accepted a negative floor and turned it into a winning bid. Debug it, fix it, and prove the deadline reaches every stage.',
+      'A bidder won almost nothing while the exchange logged it as "no response": its bids arrived after auctions closed, and it also bid with a negative floor, with no bidder header, and past its daily cap. Debug the bid endpoint, fix it, and prove the exchange\'s deadline is the one every stage spends.',
     signals: ['Operate', 'Evaluate', 'Verify'],
     aiNote:
-      'The starter never reads timeout_ms: features, the scorer and the creative cache run back to back at their own latency, so bids systematically arrive after the close, and it validates neither floor_cents nor timeout_ms, so a negative floor becomes a nonsense bid.',
+      "The starter starts its own 100 ms Deadline instead of the request's timeout_ms, sends the quote however little time is left, validates neither the X-Bidder-Id header nor floor_cents and timeout_ms, and ignores the false that spend.claim returns when the cap cannot cover the bid.",
     testIdea:
-      'Set a 100 ms budget and a 200 ms feature stub and assert the response is a marked no-bid or degraded bid inside the budget; lose an auction and assert the cap claim returns; inspect stats for timeout and degradation shares.',
+      'Send timeout_ms 20 with feature calls taking 25 ms and assert a no-bid with reason deadline_exceeded inside 20 ms; send a negative floor and no bidder and assert 400 and 401; cap the bidder below the quote and assert budget_exhausted.',
     followUps: [
       'Which features deserve which slice of a 100 ms budget?',
       'How should a conservative degraded bid be priced?',
@@ -2202,12 +2202,12 @@ export const mockScenarios: readonly MockScenario[] = [
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A product's price quadrupled in one hour: ten parallel 15 percent updates each measured their move against the price on disk, each passed, and the guard:{sku} counter they bumped has no hour window and no expiry. Debug the starter, fix it, and prove the headroom is shared.",
+      "A product's price quadrupled in one hour: ten 15 percent changes each passed the guard on their own, and the guard:{sku} counter they bumped has no hour window and no expiry. Debug the starter, fix it, and prove the headroom is shared.",
     signals: ['Operate', 'Verify', 'Evaluate'],
     aiNote:
-      'The starter compares each update against the on-disk price in isolation and bumps its counter with a client-side GET then INCRBY, so concurrent updates that each fit the per-update limit compound past the per-window cap; the key has no window bucket or TTL, the refusal is a 422 with no bound, and the publish carries no update id.',
+      'The starter judges each change alone against MAX_MOVE_BP and spends with a client-side GET then INCRBY on guard:{sku}, so changes that each fit 20 percent compound past it and two concurrent reservations both spend the same headroom; the key has no window and no TTL, and a refusal reports headroom_bp and bound_cents as zero.',
     testIdea:
-      'Fire ten concurrent 15 percent updates and assert the cumulative move stays inside the 20 percent window bound with the rest answered 409 carrying headroom_bp and bound_cents; check guard:{sku}:{window} has a TTL; assert the published row and price:{sku} share one update_id.',
+      "Reserve two 15 percent changes in one window and assert the second is refused with headroom_bp 500; land a second reservation between the first one's commands and assert only one succeeds; assert guard:{sku}:{window} has a TTL and the next hour starts with 2000 bp.",
     followUps: [
       'Who owns the guardrail recipe?',
       'How do you roll back a bad price across storefronts?',
@@ -2232,7 +2232,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'Two sessions each remember a tab at the same path with different contents; pick snippets for session A and assert only A’s text can appear. Remember a tab, advance the clock 601 s, assert the key is gone. Score a tab that shares two identifiers out of forty with the cursor window and assert it is still included as the best match. Count Redis commands for a request with eight open tabs and assert one MGET.',
     followUps: [
       'The editor sends the full text of every open tab on every keystroke. What would you change in the protocol so the cache is updated only when a tab changes?',
-      'Jaccard over identifiers ignores order and structure. Where would you put a smarter similarity — an embedding, a language-aware tokenizer — and what would it cost on a 300 ms keystroke budget?',
+      'Jaccard over identifiers ignores order and structure. Where would you put a smarter similarity (an embedding, a language-aware tokenizer), and what would it cost on a 300 ms keystroke budget?',
       'How would you evict a tab the instant the editor closes it, and what happens to your TTL design if the editor crashes without reporting?',
     ],
     defaultLanguage: 'python',

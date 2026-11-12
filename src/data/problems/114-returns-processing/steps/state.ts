@@ -1,9 +1,5 @@
 import type {Step} from '@/lib/types';
 
-/**
- * Step 2 — the returnable counter. One atomic script per state change: register rejects, decrements
- * and records the return together, and cancel restores exactly what its return consumed, once.
- */
 export const stateStep: Step = {
   id: 'state',
   title: 'Redis returnable quantities with atomic decrements',
@@ -12,929 +8,937 @@ export const stateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter owns the Redis state behind the returns API: \`register_return\`
-reads the counter at \`line:{order_line_id}:returnable\`, compares, \`DECRBY\`s it, then \`HSET\`s
-the record at \`return:{return_id}\`; \`cancel_return\` reads the record's quantity and \`INCRBY\`s
-it back. It compiles, serves the demo, and hides 5 flaws.
+**Starting point.** The starter is the ledger every other step imports as \`returns.ledger\`:
+\`register_return(order_line_id, return_id, quantity, fields)\` reads \`line:{id}:returnable\`,
+compares, \`DECRBY\`s it, then \`HSET\`s the record \`return:{id}\` (\`return_id\`, \`order_line_id\`,
+\`quantity\`, \`state\` \`registered\`, plus \`fields\`); \`cancel_return(order_line_id, return_id)\`
+checks the record exists, \`INCR\`s the counter and marks it \`canceled\`. It serves the demo and
+hides three flaws.
 
-**Failure mode the checks target.** Two returns for the same line arrive in the same millisecond
-and both take the last unit; a crash between the decrement and the record leaves a unit nobody can
-cancel; a replayed cancel inflates the line past its ordered quantity.
+**Failure mode the checks target.** Two returns for the last unit land together and both take it;
+canceling a return of three units gives one back; a cancel that is replayed, or sent twice at once,
+gives the units back twice and the line ends up with more to return than was ordered.
 
-- The counter is seeded to the ordered quantity when the line is delivered. The record hash carries
-  at least \`line_id\`, \`quantity\`, \`reason_code\`, \`photo_ref\` and \`state\`.
-- \`register_return\` rejects, decrements and records in **one Lua script run through \`EVAL\`**. A
-  quantity above what remains makes the script return \`quantity_exceeds_remaining\` with the
-  remaining count and touch nothing; otherwise the script \`DECRBY\`s the counter and \`HSET\`s the
-  record with \`state = 'registered'\` in the same execution.
-- \`cancel_return(order_line_id, return_id)\` restores **exactly what its return consumed**: the
-  script reads the record's own \`quantity\`, \`INCRBY\`s the counter by it and marks the record
-  \`canceled\`. The restore amount is never anything the caller sends.
-- A **second cancel restores nothing**: the script sees \`state == 'canceled'\` and returns
-  \`already_canceled\` with 0 restored.
-- No client-side read-then-write path remains: no \`GET\`/\`HGET\` in one round trip followed by a
-  \`DECRBY\`/\`INCRBY\`/\`HSET\` in the next.`,
+- \`register_return\` is **one Lua script** (\`EVAL\` or a registered script): read the counter,
+  return 0 and touch nothing when \`quantity\` is above it, else \`DECRBY\` and \`HSET\` the record,
+  and return 1.
+- \`cancel_return\` is one script too: it restores the record's **own \`quantity\`** with
+  \`INCRBY\`, and only while the record's \`state\` is \`registered\`; it marks it \`canceled\` and
+  returns the units restored (0 for an unknown or already canceled return).`,
   sequence: {
-    participants: ['Returns API', 'Redis', 'Returns consumer'],
+    participants: ['Returns API', 'Redis', 'Support console'],
     messages: [
-      {
-        from: 'Returns API',
-        to: 'Redis',
-        label: 'EVAL register · line:17:returnable · return:ret_9f3 · qty 1',
-        kind: 'sync',
-      },
+      {from: 'Returns API', to: 'Redis', label: 'EVAL register · line:L1:returnable · return:ret-7 · 1', kind: 'sync'},
       {
         from: 'Redis',
         to: 'Returns API',
-        label: "DECRBY + HSET in the same script · 'quantity_exceeds_remaining' when the line is short",
+        label: '1: DECRBY + HSET in one script · 0: too few left, nothing written',
         kind: 'reply',
       },
-      {
-        from: 'Returns consumer',
-        to: 'Redis',
-        label: 'EVAL cancel · return:ret_9f3 · reads quantity, marks canceled',
-        kind: 'sync',
-      },
+      {from: 'Support console', to: 'Redis', label: 'EVAL cancel · line:L1:returnable · return:ret-7', kind: 'sync'},
       {
         from: 'Redis',
-        to: 'Returns consumer',
-        label: 'restored = 1 · 0 when already canceled',
+        to: 'Support console',
+        label: "INCRBY the record's quantity, state canceled · 0 when already canceled",
         kind: 'reply',
       },
     ],
   },
   checks: [
     {
-      id: 'atomic-decrement',
-      title: 'Rejects and decrements inside one atomic script',
+      id: 'atomic-register',
+      title: 'Checks, decrements and records in one script',
       detail:
-        'The remaining quantity is read, compared and decremented inside one Lua script run through `EVAL`, and a quantity above what remains returns `quantity_exceeds_remaining` before the counter is touched. The starter reads with a client-side `GET` and decrements with a separate `DECRBY`, so two concurrent returns both pass the last unit.',
+        'The comparison, the `DECRBY` and the record `HSET` run inside one Lua script, so a second return for the last unit cannot land between the read and the decrement, and no decrement exists without its record. The starter does all three as separate commands.',
       match: {
         python: {
-          all: [/RETURNS_LUA/, /\.eval\(/, /redis\.call\('GET'/, /redis\.call\('DECRBY'/, /quantity_exceeds_remaining/],
-          order: [/quantity_exceeds_remaining/, /redis\.call\('DECRBY'/],
-        },
-        typescript: {
-          all: [/RETURNS_LUA/, /\.eval\(/, /redis\.call\('GET'/, /redis\.call\('DECRBY'/, /quantity_exceeds_remaining/],
-          order: [/quantity_exceeds_remaining/, /redis\.call\('DECRBY'/],
-        },
-        go: {
-          all: [/returnsLua/, /\.Eval\(/, /redis\.call\('GET'/, /redis\.call\('DECRBY'/, /quantity_exceeds_remaining/],
-          order: [/quantity_exceeds_remaining/, /redis\.call\('DECRBY'/],
-        },
-        scala: {
-          all: [/ReturnsLua/, /\.eval\(/, /redis\.call\('GET'/, /redis\.call\('DECRBY'/, /quantity_exceeds_remaining/],
-          order: [/quantity_exceeds_remaining/, /redis\.call\('DECRBY'/],
-        },
-        cpp: {
           all: [
-            /kReturnsLua/,
-            /redisCommand\(\s*ctx,\s*"EVAL/,
-            /redis\.call\('GET'/,
-            /redis\.call\('DECRBY'/,
-            /quantity_exceeds_remaining/,
+            /register_script\(|\.eval\(/,
+            /redis\.call\(\s*['"]DECRBY['"]/,
+            /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/,
           ],
-          order: [/quantity_exceeds_remaining/, /redis\.call\('DECRBY'/],
-        },
-      },
-    },
-    {
-      id: 'record-in-script',
-      title: 'The return record is written by the same script',
-      detail:
-        'The return’s own record — `line_id`, `quantity`, the reason and its evidence, state `registered` — is written by the same script that decrements the counter, so a decrement can never exist without a return. The starter writes the record from the client after the counter already moved.',
-      match: {
-        python: {
-          all: [/RETURNS_LUA/, /redis\.call\('DECRBY'/, /redis\.call\('HSET'/, /'registered'/],
-          none: [/\.hset\(/],
+          none: [/\.decrby\(/],
         },
         typescript: {
-          all: [/RETURNS_LUA/, /redis\.call\('DECRBY'/, /redis\.call\('HSET'/, /'registered'/],
-          none: [/\.hset\(/],
+          all: [
+            /defineCommand\(|\.eval\(/,
+            /redis\.call\(\s*['"]DECRBY['"]/,
+            /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/,
+          ],
+          none: [/\.decrby\(/],
         },
         go: {
-          all: [/returnsLua/, /redis\.call\('DECRBY'/, /redis\.call\('HSET'/, /'registered'/],
-          none: [/\.HSet\(/],
+          all: [
+            /redis\.NewScript\(|\.Eval\(/,
+            /redis\.call\(\s*['"]DECRBY['"]/,
+            /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/,
+          ],
+          none: [/\.DecrBy\(/],
         },
         scala: {
-          all: [/ReturnsLua/, /redis\.call\('DECRBY'/, /redis\.call\('HSET'/, /'registered'/],
-          none: [/\.hset\(/],
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/],
+          none: [/jedis\.decrBy\(/],
         },
         cpp: {
-          all: [/kReturnsLua/, /redis\.call\('DECRBY'/, /redis\.call\('HSET'/, /'registered'/],
-          none: [/redisCommand\(\s*ctx,\s*"HSET/],
+          all: [/\.eval(sha)?</, /redis\.call\(\s*['"]DECRBY['"]/, /redis\.call\(\s*['"]HSET['"],\s*KEYS\[2\]/],
+          none: [/\.decrby\(/],
         },
       },
     },
     {
       id: 'cancel-exact',
-      title: 'Cancel restores exactly the quantity its return consumed',
+      title: 'A cancel gives back the return’s own quantity',
       detail:
-        'The cancel path runs the script: it reads the return record’s own `quantity` and `INCRBY`s the line’s counter by exactly that amount, so a cancel can only give back what the registration took — never an amount from the caller.',
+        'The cancel script reads the record’s `quantity` and `INCRBY`s the counter by it; the starter `INCR`s by one whatever the return took.',
       match: {
         python: {
-          all: [
-            /def cancel_return\(/,
-            /\.eval\(/,
-            /redis\.call\('HGET', KEYS\[2\], 'quantity'\)/,
-            /redis\.call\('INCRBY', KEYS\[1\], quantity\)/,
-          ],
-          order: [/redis\.call\('HGET', KEYS\[2\], 'quantity'\)/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
+          none: [/\.incr\(/],
         },
         typescript: {
-          all: [
-            /async function cancelReturn\(/,
-            /\.eval\(/,
-            /redis\.call\('HGET', KEYS\[2\], 'quantity'\)/,
-            /redis\.call\('INCRBY', KEYS\[1\], quantity\)/,
-          ],
-          order: [/redis\.call\('HGET', KEYS\[2\], 'quantity'\)/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
+          none: [/\.incr\(/],
         },
-        go: {
-          all: [
-            /func CancelReturn\(/,
-            /\.Eval\(/,
-            /redis\.call\('HGET', KEYS\[2\], 'quantity'\)/,
-            /redis\.call\('INCRBY', KEYS\[1\], quantity\)/,
-          ],
-          order: [/redis\.call\('HGET', KEYS\[2\], 'quantity'\)/, /redis\.call\('INCRBY'/],
-        },
+        go: {all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.Incr\(/]},
         scala: {
-          all: [
-            /def cancelReturn\(/,
-            /\.eval\(/,
-            /redis\.call\('HGET', KEYS\[2\], 'quantity'\)/,
-            /redis\.call\('INCRBY', KEYS\[1\], quantity\)/,
-          ],
-          order: [/redis\.call\('HGET', KEYS\[2\], 'quantity'\)/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/],
+          none: [/jedis\.incr\(/],
         },
-        cpp: {
-          all: [
-            /int cancelReturn\(/,
-            /redisCommand\(\s*ctx,\s*"EVAL/,
-            /redis\.call\('HGET', KEYS\[2\], 'quantity'\)/,
-            /redis\.call\('INCRBY', KEYS\[1\], quantity\)/,
-          ],
-          order: [/redis\.call\('HGET', KEYS\[2\], 'quantity'\)/, /redis\.call\('INCRBY'/],
-        },
+        cpp: {all: [/HGET['"],\s*KEYS\[2\],\s*['"]quantity['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incr\(/]},
       },
     },
     {
-      id: 'cancel-idempotent',
-      title: 'A second cancel restores nothing',
+      id: 'cancel-once',
+      title: 'A return is canceled once',
       detail:
-        'The script reads the record’s `state`, flips it to `canceled` when it restores, and returns `already_canceled` with 0 restored the next time — so replaying a cancel cannot inflate the line. The starter restores the record’s quantity without ever looking at its state.',
+        'The cancel script restores only while the record’s `state` is `registered` and marks it `canceled` in the same script, so a replayed or concurrent cancel restores nothing. The starter checks only that the record exists, from the client.',
       match: {
         python: {
-          all: [
-            /redis\.call\('HGET', KEYS\[2\], 'state'\)/,
-            /redis\.call\('HSET', KEYS\[2\], 'state', 'canceled'\)/,
-            /already_canceled/,
-            /redis\.call\('INCRBY'/,
-          ],
-          order: [/already_canceled/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
+          none: [/\.exists\(/],
         },
         typescript: {
-          all: [
-            /redis\.call\('HGET', KEYS\[2\], 'state'\)/,
-            /redis\.call\('HSET', KEYS\[2\], 'state', 'canceled'\)/,
-            /already_canceled/,
-            /redis\.call\('INCRBY'/,
-          ],
-          order: [/already_canceled/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
+          none: [/\.exists\(/],
         },
         go: {
-          all: [
-            /redis\.call\('HGET', KEYS\[2\], 'state'\)/,
-            /redis\.call\('HSET', KEYS\[2\], 'state', 'canceled'\)/,
-            /already_canceled/,
-            /redis\.call\('INCRBY'/,
-          ],
-          order: [/already_canceled/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
+          none: [/\.Exists\(/],
         },
         scala: {
-          all: [
-            /redis\.call\('HGET', KEYS\[2\], 'state'\)/,
-            /redis\.call\('HSET', KEYS\[2\], 'state', 'canceled'\)/,
-            /already_canceled/,
-            /redis\.call\('INCRBY'/,
-          ],
-          order: [/already_canceled/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
+          none: [/jedis\.exists\(/],
         },
         cpp: {
-          all: [
-            /redis\.call\('HGET', KEYS\[2\], 'state'\)/,
-            /redis\.call\('HSET', KEYS\[2\], 'state', 'canceled'\)/,
-            /already_canceled/,
-            /redis\.call\('INCRBY'/,
-          ],
-          order: [/already_canceled/, /redis\.call\('INCRBY'/],
+          all: [/HGET['"],\s*KEYS\[2\],\s*['"]state['"]/, /HSET['"],\s*KEYS\[2\],\s*['"]state['"],\s*['"]canceled['"]/],
+          none: [/\.exists\(/],
         },
-      },
-    },
-    {
-      id: 'no-client-round-trip',
-      title: 'No read-then-write path left in the application code',
-      detail:
-        'The module talks to Redis only through the scripts: no client-side `GET`/`HGET` read followed by a separate `DECRBY`/`INCRBY`/`HSET` write remains. The starter does exactly that pair in both directions, which is where the concurrent over-return and the double restore live.',
-      match: {
-        python: {none: [/r\.get\(/, /r\.hget\(/, /r\.decrby\(/, /r\.incrby\(/, /r\.hset\(/]},
-        typescript: {none: [/r\.get\(/, /r\.hget\(/, /r\.decrby\(/, /r\.incrby\(/, /r\.hset\(/]},
-        go: {none: [/rdb\.(Get|HGet|DecrBy|IncrBy|HSet)\(/]},
-        scala: {none: [/jedis\.(get|hget|decrBy|incrBy|hset)\(/]},
-        cpp: {none: [/redisCommand\(\s*ctx,\s*"(GET|HGET|DECRBY|INCRBY|HSET)\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-from uuid import uuid4
+      starter: `import redis
 
-import redis as redis_client
-
-logger = logging.getLogger("returns")
-
-r = redis_client.Redis(host="redis", port=6379, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-def returnable_key(order_line_id: str) -> str:
-    """Remaining returnable quantity for the line, seeded when the line is delivered."""
+def counter_key(order_line_id: str) -> str:
     return f"line:{order_line_id}:returnable"
 
 
-def return_key(return_id: str) -> str:
-    """The return's own record: the line, the quantity it consumed, and its state."""
+def record_key(return_id: str) -> str:
     return f"return:{return_id}"
 
 
-def register_return(order_line_id: str, quantity: int, reason_code: str, photo_ref: str | None) -> tuple[str | None, int]:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    remaining = int(r.get(returnable_key(order_line_id)) or 0)
-    if quantity > remaining:
-        return None, remaining
-    r.decrby(returnable_key(order_line_id), quantity)
-    return_id = f"ret_{uuid4().hex}"
-    r.hset(
-        return_key(return_id),
-        mapping={
-            "line_id": order_line_id,
-            "quantity": quantity,
-            "reason_code": reason_code,
-            "photo_ref": photo_ref or "",
-            "state": "registered",
-        },
-    )
-    logger.info("return registered line=%s return=%s qty=%d", order_line_id, return_id, quantity)
-    return return_id, remaining - quantity
+def remaining(order_line_id: str) -> int:
+    """The units of the line still returnable."""
+    return int(r.get(counter_key(order_line_id)) or 0)
+
+
+def register_return(order_line_id: str, return_id: str, quantity: int, fields: dict) -> bool:
+    """Take quantity units off the line and record the return, or nothing when fewer remain."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    if quantity > remaining(order_line_id):
+        return False
+    r.decrby(counter_key(order_line_id), quantity)
+    record = {"return_id": return_id, "order_line_id": order_line_id, "quantity": quantity, "state": "registered", **fields}
+    r.hset(record_key(return_id), mapping=record)
+    return True
 
 
 def cancel_return(order_line_id: str, return_id: str) -> int:
-    quantity = int(r.hget(return_key(return_id), "quantity") or 0)
-    r.incrby(returnable_key(order_line_id), quantity)
-    logger.info("return canceled line=%s return=%s restored=%d", order_line_id, return_id, quantity)
-    return quantity
+    """Give the return's own quantity back to the line, once; the units restored."""
+    if not r.exists(record_key(return_id)):
+        return 0
+    r.incr(counter_key(order_line_id))
+    r.hset(record_key(return_id), "state", "canceled")
+    return 1
 `,
-      solution: `import logging
-from uuid import uuid4
+      solution: `import redis
 
-import redis as redis_client
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-logger = logging.getLogger("returns")
-
-# One script per state change: the counter check, the DECRBY and the return's record are a single
-# step, and a cancel gives back exactly the quantity the record shows the return consumed.
-RETURNS_LUA = """
-local mode = ARGV[1]
-if mode == 'register' then
-  local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
-  local quantity = tonumber(ARGV[2])
-  if quantity > remaining then
-    return {'quantity_exceeds_remaining', remaining}
-  end
-  redis.call('DECRBY', KEYS[1], quantity)
-  redis.call('HSET', KEYS[2], 'line_id', ARGV[3], 'quantity', quantity, 'reason_code', ARGV[4], 'photo_ref', ARGV[5], 'state', 'registered')
-  return {'ok', remaining - quantity}
+# KEYS: the line's counter, the return's record. ARGV: quantity, return_id, order_line_id, then field/value pairs.
+REGISTER_LUA = """
+local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+local quantity = tonumber(ARGV[1])
+if quantity > left then return 0 end
+redis.call('DECRBY', KEYS[1], quantity)
+redis.call('HSET', KEYS[2], 'return_id', ARGV[2], 'order_line_id', ARGV[3], 'quantity', ARGV[1], 'state', 'registered')
+for i = 4, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
 end
-local state = redis.call('HGET', KEYS[2], 'state')
-if state == false then
-  return {'unknown_return', 0}
-end
-if state == 'canceled' then
-  return {'already_canceled', 0}
-end
-local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
-redis.call('HSET', KEYS[2], 'state', 'canceled')
-redis.call('INCRBY', KEYS[1], quantity)
-return {'ok', quantity}
+return 1
 """
 
-r = redis_client.Redis(host="redis", port=6379, decode_responses=True)
+# Restores the record's own quantity, only from registered, and marks it canceled in the same step.
+CANCEL_LUA = """
+if redis.call('HGET', KEYS[2], 'state') ~= 'registered' then return 0 end
+local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
+redis.call('INCRBY', KEYS[1], quantity)
+redis.call('HSET', KEYS[2], 'state', 'canceled')
+return quantity
+"""
+
+register = r.register_script(REGISTER_LUA)
+cancel = r.register_script(CANCEL_LUA)
 
 
-def returnable_key(order_line_id: str) -> str:
-    """Remaining returnable quantity for the line, seeded when the line is delivered."""
+def counter_key(order_line_id: str) -> str:
     return f"line:{order_line_id}:returnable"
 
 
-def return_key(return_id: str) -> str:
-    """The return's own record: the line, the quantity it consumed, and its state."""
+def record_key(return_id: str) -> str:
     return f"return:{return_id}"
 
 
-def register_return(order_line_id: str, quantity: int, reason_code: str, photo_ref: str | None) -> tuple[str | None, int]:
-    """Reject, decrement and record in one atomic step: (return_id, remaining).
+def remaining(order_line_id: str) -> int:
+    """The units of the line still returnable."""
+    return int(r.get(counter_key(order_line_id)) or 0)
 
-    A quantity above what remains returns (None, remaining) and moves nothing.
-    """
-    return_id = f"ret_{uuid4().hex}"
-    status, value = r.eval(
-        RETURNS_LUA,
-        2,
-        returnable_key(order_line_id),
-        return_key(return_id),
-        "register",
-        quantity,
-        order_line_id,
-        reason_code,
-        photo_ref or "",
-    )
-    if status != "ok":
-        logger.info("return rejected line=%s status=%s", order_line_id, status)
-        return None, int(value)
-    logger.info("return registered line=%s return=%s qty=%d", order_line_id, return_id, quantity)
-    return return_id, int(value)
+
+def register_return(order_line_id: str, return_id: str, quantity: int, fields: dict) -> bool:
+    """Take quantity units off the line and record the return, or nothing when fewer remain."""
+    args = [quantity, return_id, order_line_id]
+    for name, value in fields.items():
+        args += [name, value]
+    return register(keys=[counter_key(order_line_id), record_key(return_id)], args=args) == 1
 
 
 def cancel_return(order_line_id: str, return_id: str) -> int:
-    """Give back exactly what this return consumed; a second cancel restores nothing."""
-    status, value = r.eval(RETURNS_LUA, 2, returnable_key(order_line_id), return_key(return_id), "cancel")
-    if status != "ok":
-        logger.info("cancel ignored line=%s return=%s status=%s", order_line_id, return_id, status)
-        return 0
-    logger.info("return canceled line=%s return=%s restored=%d", order_line_id, return_id, int(value))
-    return int(value)
+    """Give the return's own quantity back to the line, once; the units restored."""
+    return int(cancel(keys=[counter_key(order_line_id), record_key(return_id)], args=[]))
 `,
     },
     typescript: {
-      starter: `/** Redis returnable quantities for the returns service. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Redis from 'ioredis';
 
-import {Redis} from 'ioredis';
+const redis = new Redis({host: 'redis', port: 6379});
 
-const r = new Redis('redis://redis:6379');
+export const counterKey = (orderLineId: string): string => \`line:\${orderLineId}:returnable\`;
+export const recordKey = (returnId: string): string => \`return:\${returnId}\`;
 
-export const returnableKey = (orderLineId: string): string => \`line:\${orderLineId}:returnable\`;
-export const returnKey = (returnId: string): string => \`return:\${returnId}\`;
-
-export interface Registration {
-  returnId: string | null;
-  remaining: number;
+/** The units of the line still returnable. */
+export async function remaining(orderLineId: string): Promise<number> {
+  return Number((await redis.get(counterKey(orderLineId))) ?? 0);
 }
 
-export async function registerReturn(
-  orderLineId: string,
-  quantity: number,
-  reasonCode: string,
-  photoRef?: string,
-): Promise<Registration> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const remaining = Number((await r.get(returnableKey(orderLineId))) ?? 0);
-  if (quantity > remaining) return {returnId: null, remaining};
-  await r.decrby(returnableKey(orderLineId), quantity);
-  const returnId = \`ret_\${randomUUID().replace(/-/g, '')}\`;
-  await r.hset(returnKey(returnId), {
-    line_id: orderLineId,
-    quantity: String(quantity),
-    reason_code: reasonCode,
-    photo_ref: photoRef ?? '',
-    state: 'registered',
-  });
-  console.info({line: orderLineId, returnId, quantity}, 'return registered');
-  return {returnId, remaining: remaining - quantity};
+/** Take quantity units off the line and record the return, or nothing when fewer remain. */
+export async function registerReturn(orderLineId: string, returnId: string, quantity: number, fields: Record<string, string>): Promise<boolean> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  if (quantity > (await remaining(orderLineId))) return false;
+  await redis.decrby(counterKey(orderLineId), quantity);
+  await redis.hset(recordKey(returnId), {return_id: returnId, order_line_id: orderLineId, quantity: String(quantity), state: 'registered', ...fields});
+  return true;
 }
 
+/** Give the return's own quantity back to the line, once; the units restored. */
 export async function cancelReturn(orderLineId: string, returnId: string): Promise<number> {
-  const restored = Number((await r.hget(returnKey(returnId), 'quantity')) ?? 0);
-  await r.incrby(returnableKey(orderLineId), restored);
-  console.info({line: orderLineId, returnId, restored}, 'return canceled');
-  return restored;
+  if (!(await redis.exists(recordKey(returnId)))) return 0;
+  await redis.incr(counterKey(orderLineId));
+  await redis.hset(recordKey(returnId), 'state', 'canceled');
+  return 1;
 }
 `,
-      solution: `/** Redis returnable quantities for the returns service: one atomic script per state change. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Redis from 'ioredis';
 
-import {Redis} from 'ioredis';
-
-const r = new Redis('redis://redis:6379');
-
-// One script per state change: the counter check, the DECRBY and the return's record are a single
-// step, and a cancel gives back exactly the quantity the record shows the return consumed.
-const RETURNS_LUA = \`
-local mode = ARGV[1]
-if mode == 'register' then
-  local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
-  local quantity = tonumber(ARGV[2])
-  if quantity > remaining then
-    return {'quantity_exceeds_remaining', remaining}
-  end
-  redis.call('DECRBY', KEYS[1], quantity)
-  redis.call('HSET', KEYS[2], 'line_id', ARGV[3], 'quantity', quantity, 'reason_code', ARGV[4], 'photo_ref', ARGV[5], 'state', 'registered')
-  return {'ok', remaining - quantity}
+// KEYS: the line's counter, the return's record. ARGV: quantity, return_id, order_line_id, then field/value pairs.
+export const REGISTER_LUA = \`
+local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+local quantity = tonumber(ARGV[1])
+if quantity > left then return 0 end
+redis.call('DECRBY', KEYS[1], quantity)
+redis.call('HSET', KEYS[2], 'return_id', ARGV[2], 'order_line_id', ARGV[3], 'quantity', ARGV[1], 'state', 'registered')
+for i = 4, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
 end
-local state = redis.call('HGET', KEYS[2], 'state')
-if state == false then
-  return {'unknown_return', 0}
-end
-if state == 'canceled' then
-  return {'already_canceled', 0}
-end
-local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
-redis.call('HSET', KEYS[2], 'state', 'canceled')
-redis.call('INCRBY', KEYS[1], quantity)
-return {'ok', quantity}
+return 1
 \`;
 
-export const returnableKey = (orderLineId: string): string => \`line:\${orderLineId}:returnable\`;
-export const returnKey = (returnId: string): string => \`return:\${returnId}\`;
+// Restores the record's own quantity, only from registered, and marks it canceled in the same step.
+export const CANCEL_LUA = \`
+if redis.call('HGET', KEYS[2], 'state') ~= 'registered' then return 0 end
+local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
+redis.call('INCRBY', KEYS[1], quantity)
+redis.call('HSET', KEYS[2], 'state', 'canceled')
+return quantity
+\`;
 
-export interface Registration {
-  returnId: string | null;
-  remaining: number;
+interface LedgerRedis extends Redis {
+  registerScript(counter: string, record: string, ...args: (string | number)[]): Promise<number>;
+  cancelScript(counter: string, record: string): Promise<number>;
 }
 
-export async function registerReturn(
-  orderLineId: string,
-  quantity: number,
-  reasonCode: string,
-  photoRef?: string,
-): Promise<Registration> {
-  const returnId = \`ret_\${randomUUID().replace(/-/g, '')}\`;
-  const [status, value] = (await r.eval(
-    RETURNS_LUA,
-    2,
-    returnableKey(orderLineId),
-    returnKey(returnId),
-    'register',
-    quantity,
-    orderLineId,
-    reasonCode,
-    photoRef ?? '',
-  )) as [string, number];
-  if (status !== 'ok') {
-    console.info({line: orderLineId, status}, 'return rejected');
-    return {returnId: null, remaining: value};
-  }
-  console.info({line: orderLineId, returnId, quantity}, 'return registered');
-  return {returnId, remaining: value};
+const redis = new Redis({host: 'redis', port: 6379}) as LedgerRedis;
+redis.defineCommand('registerScript', {numberOfKeys: 2, lua: REGISTER_LUA});
+redis.defineCommand('cancelScript', {numberOfKeys: 2, lua: CANCEL_LUA});
+
+export const counterKey = (orderLineId: string): string => \`line:\${orderLineId}:returnable\`;
+export const recordKey = (returnId: string): string => \`return:\${returnId}\`;
+
+/** The units of the line still returnable. */
+export async function remaining(orderLineId: string): Promise<number> {
+  return Number((await redis.get(counterKey(orderLineId))) ?? 0);
 }
 
-/** Give back exactly what this return consumed; a second cancel restores nothing. */
+/** Take quantity units off the line and record the return, or nothing when fewer remain. */
+export async function registerReturn(orderLineId: string, returnId: string, quantity: number, fields: Record<string, string>): Promise<boolean> {
+  const pairs = Object.entries(fields).flat();
+  return (await redis.registerScript(counterKey(orderLineId), recordKey(returnId), quantity, returnId, orderLineId, ...pairs)) === 1;
+}
+
+/** Give the return's own quantity back to the line, once; the units restored. */
 export async function cancelReturn(orderLineId: string, returnId: string): Promise<number> {
-  const [status, value] = (await r.eval(
-    RETURNS_LUA,
-    2,
-    returnableKey(orderLineId),
-    returnKey(returnId),
-    'cancel',
-  )) as [string, number];
-  if (status !== 'ok') {
-    console.info({line: orderLineId, returnId, status}, 'cancel ignored');
-    return 0;
-  }
-  console.info({line: orderLineId, returnId, restored: value}, 'return canceled');
-  return value;
+  return Number(await redis.cancelScript(counterKey(orderLineId), recordKey(returnId)));
 }
 `,
     },
     go: {
-      starter: `package state
+      starter: `package main
 
 import (
 	"context"
-	"fmt"
-	"log"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-var rdb *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func returnableKey(orderLineID string) string {
-	return fmt.Sprintf("line:%s:returnable", orderLineID)
-}
+func counterKey(orderLineID string) string { return "line:" + orderLineID + ":returnable" }
+func recordKey(returnID string) string     { return "return:" + returnID }
 
-func returnKey(returnID string) string {
-	return fmt.Sprintf("return:%s", returnID)
-}
-
-// RegisterReturn registers the return against the line's returnable quantity.
-func RegisterReturn(ctx context.Context, orderLineID string, quantity int, reasonCode, photoRef string) (string, int) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	counter := returnableKey(orderLineID)
-	remaining, err := rdb.Get(ctx, counter).Int()
+// remaining is the units of the line still returnable.
+func remaining(ctx context.Context, orderLineID string) (int64, error) {
+	n, err := rdb.Get(ctx, counterKey(orderLineID)).Int64()
 	if err == redis.Nil {
-		remaining, err = 0, nil
+		return 0, nil
 	}
-	if err != nil {
-		log.Printf("read failed line=%s err=%v", orderLineID, err)
-		return "", 0
-	}
-	if quantity > remaining {
-		return "", remaining
-	}
-	rdb.DecrBy(ctx, counter, int64(quantity))
-	returnID := "ret_" + uuid.NewString()
-	rdb.HSet(ctx, returnKey(returnID), "line_id", orderLineID, "quantity", quantity, "reason_code", reasonCode, "photo_ref", photoRef, "state", "registered")
-	log.Printf("return registered line=%s return=%s qty=%d", orderLineID, returnID, quantity)
-	return returnID, remaining - quantity
+	return n, err
 }
 
-// CancelReturn gives the return's quantity back to the line.
-func CancelReturn(ctx context.Context, orderLineID, returnID string) int {
-	restored, _ := rdb.HGet(ctx, returnKey(returnID), "quantity").Int()
-	rdb.IncrBy(ctx, returnableKey(orderLineID), int64(restored))
-	log.Printf("return canceled line=%s return=%s restored=%d", orderLineID, returnID, restored)
-	return restored
+// registerReturn takes quantity units off the line and records the return, or does nothing when fewer remain.
+func registerReturn(ctx context.Context, orderLineID, returnID string, quantity int64, fields map[string]string) (bool, error) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	left, err := remaining(ctx, orderLineID)
+	if err != nil {
+		return false, err
+	}
+	if quantity > left {
+		return false, nil
+	}
+	if err := rdb.DecrBy(ctx, counterKey(orderLineID), quantity).Err(); err != nil {
+		return false, err
+	}
+	record := map[string]any{"return_id": returnID, "order_line_id": orderLineID, "quantity": quantity, "state": "registered"}
+	for name, value := range fields {
+		record[name] = value
+	}
+	return true, rdb.HSet(ctx, recordKey(returnID), record).Err()
+}
+
+// cancelReturn gives the return's own quantity back to the line, once; the units restored.
+func cancelReturn(ctx context.Context, orderLineID, returnID string) (int64, error) {
+	n, err := rdb.Exists(ctx, recordKey(returnID)).Result()
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	if err := rdb.Incr(ctx, counterKey(orderLineID)).Err(); err != nil {
+		return 0, err
+	}
+	return 1, rdb.HSet(ctx, recordKey(returnID), "state", "canceled").Err()
 }
 `,
-      solution: `package state
+      solution: `package main
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"sort"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-// One script per state change: the counter check, the DECRBY and the return's record are a single
-// step, and a cancel gives back exactly the quantity the record shows the return consumed.
-const returnsLua = \`
-local mode = ARGV[1]
-if mode == 'register' then
-  local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
-  local quantity = tonumber(ARGV[2])
-  if quantity > remaining then
-    return {'quantity_exceeds_remaining', remaining}
-  end
-  redis.call('DECRBY', KEYS[1], quantity)
-  redis.call('HSET', KEYS[2], 'line_id', ARGV[3], 'quantity', quantity, 'reason_code', ARGV[4], 'photo_ref', ARGV[5], 'state', 'registered')
-  return {'ok', remaining - quantity}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+// registerScript: KEYS the line's counter and the return's record; ARGV quantity, return_id,
+// order_line_id, then field/value pairs.
+var registerScript = redis.NewScript(\`
+local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+local quantity = tonumber(ARGV[1])
+if quantity > left then return 0 end
+redis.call('DECRBY', KEYS[1], quantity)
+redis.call('HSET', KEYS[2], 'return_id', ARGV[2], 'order_line_id', ARGV[3], 'quantity', ARGV[1], 'state', 'registered')
+for i = 4, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
 end
-local state = redis.call('HGET', KEYS[2], 'state')
-if state == false then
-  return {'unknown_return', 0}
-end
-if state == 'canceled' then
-  return {'already_canceled', 0}
-end
+return 1
+\`)
+
+// cancelScript restores the record's own quantity, only from registered, and marks it canceled in the same step.
+var cancelScript = redis.NewScript(\`
+if redis.call('HGET', KEYS[2], 'state') ~= 'registered' then return 0 end
 local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
-redis.call('HSET', KEYS[2], 'state', 'canceled')
 redis.call('INCRBY', KEYS[1], quantity)
-return {'ok', quantity}
-\`
+redis.call('HSET', KEYS[2], 'state', 'canceled')
+return quantity
+\`)
 
-var rdb *redis.Client
+func counterKey(orderLineID string) string { return "line:" + orderLineID + ":returnable" }
+func recordKey(returnID string) string     { return "return:" + returnID }
 
-func returnableKey(orderLineID string) string {
-	return fmt.Sprintf("line:%s:returnable", orderLineID)
+// remaining is the units of the line still returnable.
+func remaining(ctx context.Context, orderLineID string) (int64, error) {
+	n, err := rdb.Get(ctx, counterKey(orderLineID)).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return n, err
 }
 
-func returnKey(returnID string) string {
-	return fmt.Sprintf("return:%s", returnID)
+// registerReturn takes quantity units off the line and records the return, or does nothing when fewer remain.
+func registerReturn(ctx context.Context, orderLineID, returnID string, quantity int64, fields map[string]string) (bool, error) {
+	args := []any{quantity, returnID, orderLineID}
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		args = append(args, name, fields[name])
+	}
+	n, err := registerScript.Run(ctx, rdb, []string{counterKey(orderLineID), recordKey(returnID)}, args...).Int64()
+	return n == 1, err
 }
 
-// scriptReply reads the script's [status, value] reply: status is "ok" or an error code, value the
-// remaining quantity after a register or the restored quantity after a cancel.
-func scriptReply(values []any) (string, int) {
-	if len(values) != 2 {
-		return "script_failed", 0
-	}
-	status, _ := values[0].(string)
-	value, _ := values[1].(int64)
-	return status, int(value)
-}
-
-// RegisterReturn rejects, decrements and records in one atomic step: the return id is empty when
-// the line cannot cover the quantity, and the remaining count is what the line still allows.
-func RegisterReturn(ctx context.Context, orderLineID string, quantity int, reasonCode, photoRef string) (string, int) {
-	returnID := "ret_" + uuid.NewString()
-	values, err := rdb.Eval(ctx, returnsLua, []string{returnableKey(orderLineID), returnKey(returnID)},
-		"register", quantity, orderLineID, reasonCode, photoRef).Slice()
-	if err != nil {
-		log.Printf("register failed line=%s err=%v", orderLineID, err)
-		return "", 0
-	}
-	status, remaining := scriptReply(values)
-	if status != "ok" {
-		log.Printf("return rejected line=%s status=%s", orderLineID, status)
-		return "", remaining
-	}
-	log.Printf("return registered line=%s return=%s qty=%d", orderLineID, returnID, quantity)
-	return returnID, remaining
-}
-
-// CancelReturn gives back exactly what this return consumed; a second cancel restores nothing.
-func CancelReturn(ctx context.Context, orderLineID, returnID string) int {
-	values, err := rdb.Eval(ctx, returnsLua, []string{returnableKey(orderLineID), returnKey(returnID)}, "cancel").Slice()
-	if err != nil {
-		log.Printf("cancel failed line=%s return=%s err=%v", orderLineID, returnID, err)
-		return 0
-	}
-	status, restored := scriptReply(values)
-	if status != "ok" {
-		log.Printf("cancel ignored line=%s return=%s status=%s", orderLineID, returnID, status)
-		return 0
-	}
-	log.Printf("return canceled line=%s return=%s restored=%d", orderLineID, returnID, restored)
-	return restored
+// cancelReturn gives the return's own quantity back to the line, once; the units restored.
+func cancelReturn(ctx context.Context, orderLineID, returnID string) (int64, error) {
+	return cancelScript.Run(ctx, rdb, []string{counterKey(orderLineID), recordKey(returnID)}).Int64()
 }
 `,
     },
     scala: {
-      starter: `import java.util
+      starter: `import redis.clients.jedis.JedisPooled
 
-import redis.clients.jedis.Jedis
+import scala.jdk.CollectionConverters._
 
-object ReturnsState {
-  val jedis = new Jedis("redis", 6379)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def returnableKey(orderLineId: String): String = s"line:$orderLineId:returnable"
+  def counterKey(orderLineId: String): String = s"line:$orderLineId:returnable"
+  def recordKey(returnId: String): String = s"return:$returnId"
 
-  def returnKey(returnId: String): String = s"return:$returnId"
+  /** The units of the line still returnable. */
+  def remaining(orderLineId: String): Long = Option(jedis.get(counterKey(orderLineId))).map(_.toLong).getOrElse(0L)
 
-  def registerReturn(orderLineId: String, quantity: Int, reasonCode: String, photoRef: Option[String]): (Option[String], Int) = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val remaining = Option(jedis.get(returnableKey(orderLineId))).map(_.toInt).getOrElse(0)
-    if (quantity > remaining) {
-      (None, remaining)
-    } else {
-      jedis.decrBy(returnableKey(orderLineId), quantity.toLong)
-      val returnId = "ret_" + util.UUID.randomUUID().toString.replace("-", "")
-      jedis.hset(
-        returnKey(returnId),
-        util.Map.of(
-          "line_id",
-          orderLineId,
-          "quantity",
-          quantity.toString,
-          "reason_code",
-          reasonCode,
-          "photo_ref",
-          photoRef.getOrElse(""),
-          "state",
-          "registered"
-        )
-      )
-      println(s"return registered line=$orderLineId return=$returnId qty=$quantity")
-      (Some(returnId), remaining - quantity)
+  /** Take quantity units off the line and record the return, or nothing when fewer remain. */
+  def registerReturn(orderLineId: String, returnId: String, quantity: Long, fields: Map[String, String]): Boolean = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    if (quantity > remaining(orderLineId)) false
+    else {
+      jedis.decrBy(counterKey(orderLineId), quantity)
+      val record = Map("return_id" -> returnId, "order_line_id" -> orderLineId, "quantity" -> quantity.toString, "state" -> "registered") ++ fields
+      jedis.hset(recordKey(returnId), record.asJava)
+      true
     }
   }
 
-  def cancelReturn(orderLineId: String, returnId: String): Int = {
-    val restored = Option(jedis.hget(returnKey(returnId), "quantity")).map(_.toInt).getOrElse(0)
-    jedis.incrBy(returnableKey(orderLineId), restored.toLong)
-    println(s"return canceled line=$orderLineId return=$returnId restored=$restored")
-    restored
-  }
+  /** Give the return's own quantity back to the line, once; the units restored. */
+  def cancelReturn(orderLineId: String, returnId: String): Long =
+    if (!jedis.exists(recordKey(returnId))) 0L
+    else {
+      jedis.incr(counterKey(orderLineId))
+      jedis.hset(recordKey(returnId), "state", "canceled")
+      1L
+    }
 }
 `,
-      solution: `import java.util
+      solution: `import redis.clients.jedis.JedisPooled
 
-import redis.clients.jedis.Jedis
+import scala.jdk.CollectionConverters._
 
-object ReturnsState {
-  // One script per state change: the counter check, the DECRBY and the return's record are a single
-  // step, and a cancel gives back exactly the quantity the record shows the return consumed.
-  val ReturnsLua: String =
-    """
-local mode = ARGV[1]
-if mode == 'register' then
-  local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
-  local quantity = tonumber(ARGV[2])
-  if quantity > remaining then
-    return {'quantity_exceeds_remaining', remaining}
-  end
-  redis.call('DECRBY', KEYS[1], quantity)
-  redis.call('HSET', KEYS[2], 'line_id', ARGV[3], 'quantity', quantity, 'reason_code', ARGV[4], 'photo_ref', ARGV[5], 'state', 'registered')
-  return {'ok', remaining - quantity}
-end
-local state = redis.call('HGET', KEYS[2], 'state')
-if state == false then
-  return {'unknown_return', 0}
-end
-if state == 'canceled' then
-  return {'already_canceled', 0}
-end
-local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
-redis.call('HSET', KEYS[2], 'state', 'canceled')
-redis.call('INCRBY', KEYS[1], quantity)
-return {'ok', quantity}
-"""
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val jedis = new Jedis("redis", 6379)
+  /** KEYS: the line's counter, the return's record. ARGV: quantity, return_id, order_line_id, then field/value pairs. */
+  val RegisterLua: String =
+    """local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+      |local quantity = tonumber(ARGV[1])
+      |if quantity > left then return 0 end
+      |redis.call('DECRBY', KEYS[1], quantity)
+      |redis.call('HSET', KEYS[2], 'return_id', ARGV[2], 'order_line_id', ARGV[3], 'quantity', ARGV[1], 'state', 'registered')
+      |for i = 4, #ARGV, 2 do
+      |  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
+      |end
+      |return 1
+      |""".stripMargin
 
-  def returnableKey(orderLineId: String): String = s"line:$orderLineId:returnable"
+  /** Restores the record's own quantity, only from registered, and marks it canceled in the same step. */
+  val CancelLua: String =
+    """if redis.call('HGET', KEYS[2], 'state') ~= 'registered' then return 0 end
+      |local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
+      |redis.call('INCRBY', KEYS[1], quantity)
+      |redis.call('HSET', KEYS[2], 'state', 'canceled')
+      |return quantity
+      |""".stripMargin
 
-  def returnKey(returnId: String): String = s"return:$returnId"
+  def counterKey(orderLineId: String): String = s"line:$orderLineId:returnable"
+  def recordKey(returnId: String): String = s"return:$returnId"
 
-  /** The script's [status, value] reply: remaining after a register, restored after a cancel. */
-  private def reply(raw: Object): (String, Int) = {
-    val values = raw.asInstanceOf[util.List[Object]]
-    (values.get(0).toString, values.get(1).asInstanceOf[java.lang.Long].longValue().toInt)
+  /** The units of the line still returnable. */
+  def remaining(orderLineId: String): Long = Option(jedis.get(counterKey(orderLineId))).map(_.toLong).getOrElse(0L)
+
+  /** Take quantity units off the line and record the return, or nothing when fewer remain. */
+  def registerReturn(orderLineId: String, returnId: String, quantity: Long, fields: Map[String, String]): Boolean = {
+    val args = List(quantity.toString, returnId, orderLineId) ++ fields.toList.flatMap { case (name, value) => List(name, value) }
+    jedis.eval(RegisterLua, List(counterKey(orderLineId), recordKey(returnId)).asJava, args.asJava).asInstanceOf[java.lang.Long] == 1L
   }
 
-  /** Reject, decrement and record in one atomic step: (Some(return_id), remaining) or (None, remaining). */
-  def registerReturn(orderLineId: String, quantity: Int, reasonCode: String, photoRef: Option[String]): (Option[String], Int) = {
-    val returnId = "ret_" + util.UUID.randomUUID().toString.replace("-", "")
-    val (status, remaining) = reply(
-      jedis.eval(
-        ReturnsLua,
-        util.List.of(returnableKey(orderLineId), returnKey(returnId)),
-        util.List.of("register", quantity.toString, orderLineId, reasonCode, photoRef.getOrElse(""))
-      )
-    )
-    if (status != "ok") {
-      println(s"return rejected line=$orderLineId status=$status")
-      (None, remaining)
-    } else {
-      println(s"return registered line=$orderLineId return=$returnId qty=$quantity")
-      (Some(returnId), remaining)
-    }
-  }
-
-  /** Give back exactly what this return consumed; a second cancel restores nothing. */
-  def cancelReturn(orderLineId: String, returnId: String): Int = {
-    val (status, restored) = reply(
-      jedis.eval(
-        ReturnsLua,
-        util.List.of(returnableKey(orderLineId), returnKey(returnId)),
-        util.List.of("cancel")
-      )
-    )
-    if (status != "ok") {
-      println(s"cancel ignored line=$orderLineId return=$returnId status=$status")
-      0
-    } else {
-      println(s"return canceled line=$orderLineId return=$returnId restored=$restored")
-      restored
-    }
-  }
+  /** Give the return's own quantity back to the line, once; the units restored. */
+  def cancelReturn(orderLineId: String, returnId: String): Long =
+    jedis.eval(CancelLua, List(counterKey(orderLineId), recordKey(returnId)).asJava, List.empty[String].asJava).asInstanceOf[java.lang.Long]
 }
 `,
     },
     cpp: {
-      starter: `#include <hiredis/hiredis.h>
+      starter: `#include <sw/redis++/redis++.h>
 
-#include <iostream>
-#include <random>
+#include <map>
 #include <string>
-#include <utility>
+#include <unordered_map>
 
-std::string returnableKey(const std::string& orderLineId) {
-  return "line:" + orderLineId + ":returnable";
+sw::redis::Redis& redis() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
 }
 
-std::string returnKey(const std::string& returnId) {
-  return "return:" + returnId;
+std::string counterKey(const std::string& order_line_id) { return "line:" + order_line_id + ":returnable"; }
+std::string recordKey(const std::string& return_id) { return "return:" + return_id; }
+
+// The units of the line still returnable.
+long long remaining(const std::string& order_line_id) {
+  const auto value = redis().get(counterKey(order_line_id));
+  return value ? std::stoll(*value) : 0;
 }
 
-std::string newReturnId() {
-  static std::mt19937_64 rng{std::random_device{}()};
-  return "ret_" + std::to_string(rng());
+// Take quantity units off the line and record the return, or nothing when fewer remain.
+bool registerReturn(const std::string& order_line_id, const std::string& return_id, long long quantity,
+                    const std::map<std::string, std::string>& fields) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  if (quantity > remaining(order_line_id)) return false;
+  redis().decrby(counterKey(order_line_id), quantity);
+  std::unordered_map<std::string, std::string> record(fields.begin(), fields.end());
+  record["return_id"] = return_id;
+  record["order_line_id"] = order_line_id;
+  record["quantity"] = std::to_string(quantity);
+  record["state"] = "registered";
+  redis().hset(recordKey(return_id), record.begin(), record.end());
+  return true;
 }
 
-// Register the return against the line's returnable quantity.
-std::pair<std::string, int> registerReturn(redisContext* ctx, const std::string& orderLineId, int quantity,
-                                           const std::string& reasonCode, const std::string& photoRef) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const std::string counter = returnableKey(orderLineId);
-  redisReply* read = (redisReply*)redisCommand(ctx, "GET %s", counter.c_str());
-  const int remaining = read != nullptr && read->type == REDIS_REPLY_STRING ? std::stoi(read->str) : 0;
-  freeReplyObject(read);
-  if (quantity > remaining) {
-    return {"", remaining};
-  }
-  redisReply* moved = (redisReply*)redisCommand(ctx, "DECRBY %s %d", counter.c_str(), quantity);
-  freeReplyObject(moved);
-  const std::string returnId = newReturnId();
-  redisReply* written = (redisReply*)redisCommand(ctx, "HSET %s state registered quantity %d", returnKey(returnId).c_str(), quantity);
-  freeReplyObject(written);
-  std::cerr << "return registered line=" << orderLineId << " return=" << returnId << " qty=" << quantity << std::endl;
-  return {returnId, remaining - quantity};
-}
-
-// Give the return's quantity back to the line.
-int cancelReturn(redisContext* ctx, const std::string& orderLineId, const std::string& returnId) {
-  redisReply* read = (redisReply*)redisCommand(ctx, "HGET %s quantity", returnKey(returnId).c_str());
-  const int restored = read != nullptr && read->type == REDIS_REPLY_STRING ? std::stoi(read->str) : 0;
-  freeReplyObject(read);
-  redisReply* moved = (redisReply*)redisCommand(ctx, "INCRBY %s %d", returnableKey(orderLineId).c_str(), restored);
-  freeReplyObject(moved);
-  std::cerr << "return canceled line=" << orderLineId << " return=" << returnId << " restored=" << restored << std::endl;
-  return restored;
+// Give the return's own quantity back to the line, once; the units restored.
+long long cancelReturn(const std::string& order_line_id, const std::string& return_id) {
+  if (!redis().exists(recordKey(return_id))) return 0;
+  redis().incr(counterKey(order_line_id));
+  redis().hset(recordKey(return_id), "state", "canceled");
+  return 1;
 }
 `,
-      solution: `#include <hiredis/hiredis.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <iostream>
-#include <random>
+#include <map>
 #include <string>
-#include <utility>
+#include <vector>
 
-// One script per state change: the counter check, the DECRBY and the return's record are a single
-// step, and a cancel gives back exactly the quantity the record shows the return consumed.
-const char* kReturnsLua = R"LUA(
-local mode = ARGV[1]
-if mode == 'register' then
-  local remaining = tonumber(redis.call('GET', KEYS[1]) or '0')
-  local quantity = tonumber(ARGV[2])
-  if quantity > remaining then
-    return {'quantity_exceeds_remaining', remaining}
-  end
-  redis.call('DECRBY', KEYS[1], quantity)
-  redis.call('HSET', KEYS[2], 'line_id', ARGV[3], 'quantity', quantity, 'reason_code', ARGV[4], 'photo_ref', ARGV[5], 'state', 'registered')
-  return {'ok', remaining - quantity}
+// KEYS: the line's counter, the return's record. ARGV: quantity, return_id, order_line_id, then field/value pairs.
+const std::string kRegisterLua = R"lua(
+local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+local quantity = tonumber(ARGV[1])
+if quantity > left then return 0 end
+redis.call('DECRBY', KEYS[1], quantity)
+redis.call('HSET', KEYS[2], 'return_id', ARGV[2], 'order_line_id', ARGV[3], 'quantity', ARGV[1], 'state', 'registered')
+for i = 4, #ARGV, 2 do
+  redis.call('HSET', KEYS[2], ARGV[i], ARGV[i + 1])
 end
-local state = redis.call('HGET', KEYS[2], 'state')
-if state == false then
-  return {'unknown_return', 0}
-end
-if state == 'canceled' then
-  return {'already_canceled', 0}
-end
+return 1
+)lua";
+
+// Restores the record's own quantity, only from registered, and marks it canceled in the same step.
+const std::string kCancelLua = R"lua(
+if redis.call('HGET', KEYS[2], 'state') ~= 'registered' then return 0 end
 local quantity = tonumber(redis.call('HGET', KEYS[2], 'quantity'))
-redis.call('HSET', KEYS[2], 'state', 'canceled')
 redis.call('INCRBY', KEYS[1], quantity)
-return {'ok', quantity}
-)LUA";
+redis.call('HSET', KEYS[2], 'state', 'canceled')
+return quantity
+)lua";
 
-std::string returnableKey(const std::string& orderLineId) {
-  return "line:" + orderLineId + ":returnable";
+sw::redis::Redis& redis() {
+  static sw::redis::Redis r("tcp://redis:6379");
+  return r;
 }
 
-std::string returnKey(const std::string& returnId) {
-  return "return:" + returnId;
+std::string counterKey(const std::string& order_line_id) { return "line:" + order_line_id + ":returnable"; }
+std::string recordKey(const std::string& return_id) { return "return:" + return_id; }
+
+// The units of the line still returnable.
+long long remaining(const std::string& order_line_id) {
+  const auto value = redis().get(counterKey(order_line_id));
+  return value ? std::stoll(*value) : 0;
 }
 
-std::string newReturnId() {
-  static std::mt19937_64 rng{std::random_device{}()};
-  return "ret_" + std::to_string(rng());
-}
-
-// EVAL's reply is [status, value]: status is "ok" or an error code, value the remaining quantity
-// after a register or the restored quantity after a cancel.
-std::pair<std::string, int> scriptReply(redisReply* reply) {
-  if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
-    return {"script_failed", 0};
+// Take quantity units off the line and record the return, or nothing when fewer remain.
+bool registerReturn(const std::string& order_line_id, const std::string& return_id, long long quantity,
+                    const std::map<std::string, std::string>& fields) {
+  const std::vector<std::string> keys = {counterKey(order_line_id), recordKey(return_id)};
+  std::vector<std::string> args = {std::to_string(quantity), return_id, order_line_id};
+  for (const auto& [name, value] : fields) {
+    args.push_back(name);
+    args.push_back(value);
   }
-  return {std::string(reply->element[0]->str), static_cast<int>(reply->element[1]->integer)};
+  return redis().eval<long long>(kRegisterLua, keys.begin(), keys.end(), args.begin(), args.end()) == 1;
 }
 
-// Reject, decrement and record in one atomic step: {return id, remaining}; the id is empty when the
-// line cannot cover the quantity.
-std::pair<std::string, int> registerReturn(redisContext* ctx, const std::string& orderLineId, int quantity,
-                                           const std::string& reasonCode, const std::string& photoRef) {
-  const std::string counter = returnableKey(orderLineId);
-  const std::string returnId = newReturnId();
-  const std::string record = returnKey(returnId);
-  redisReply* reply = (redisReply*)redisCommand(ctx, "EVAL %s 2 %s %s register %d %s %s %s", kReturnsLua, counter.c_str(),
-                                               record.c_str(), quantity, orderLineId.c_str(), reasonCode.c_str(),
-                                               photoRef.c_str());
-  const auto [status, remaining] = scriptReply(reply);
-  freeReplyObject(reply);
-  if (status != "ok") {
-    std::cerr << "return rejected line=" << orderLineId << " status=" << status << std::endl;
-    return {"", remaining};
-  }
-  std::cerr << "return registered line=" << orderLineId << " return=" << returnId << " qty=" << quantity << std::endl;
-  return {returnId, remaining};
-}
-
-// Give back exactly what this return consumed; a second cancel restores nothing.
-int cancelReturn(redisContext* ctx, const std::string& orderLineId, const std::string& returnId) {
-  const std::string counter = returnableKey(orderLineId);
-  const std::string record = returnKey(returnId);
-  redisReply* reply = (redisReply*)redisCommand(ctx, "EVAL %s 2 %s %s cancel", kReturnsLua, counter.c_str(), record.c_str());
-  const auto [status, restored] = scriptReply(reply);
-  freeReplyObject(reply);
-  if (status != "ok") {
-    std::cerr << "cancel ignored line=" << orderLineId << " return=" << returnId << " status=" << status << std::endl;
-    return 0;
-  }
-  std::cerr << "return canceled line=" << orderLineId << " return=" << returnId << " restored=" << restored << std::endl;
-  return restored;
+// Give the return's own quantity back to the line, once; the units restored.
+long long cancelReturn(const std::string& order_line_id, const std::string& return_id) {
+  return redis().eval<long long>(kCancelLua, {counterKey(order_line_id), recordKey(return_id)}, {});
 }
 `,
     },
   },
+  harness: {
+    python: `FIELDS = {"tenant": "t-1", "reason_code": "changed_mind", "photo_ref": ""}
+
+
+def _units(ctx, n):
+    ctx.redis.set("line:L1:returnable", n)
+
+
+def _left(ctx):
+    return int(ctx.redis.get("line:L1:returnable") or 0)
+
+
+def _settled(probe, what):
+    assert probe.fired, f"nothing touched {what}"
+    if probe.error is not None:
+        raise probe.error
+    return probe.result
+
+
+def check_atomic_register(ctx):
+    m = ctx.load("state")
+    _units(ctx, 1)
+    # A second return for the last unit lands right after this one first touches the counter.
+    rival = ctx.redis_after("line:L1:returnable", lambda: m.register_return("L1", "ret-2", 1, FIELDS))
+    mine = m.register_return("L1", "ret-1", 1, FIELDS)
+    theirs = _settled(rival, "line:L1:returnable")
+    assert [mine, theirs].count(True) == 1, f"two returns raced for the last unit and register_return answered {mine} and {theirs}: exactly one may take it"
+    assert _left(ctx) == 0, f"line:L1:returnable is {_left(ctx)} after the race for its last unit, expected 0"
+    records = [key for key in ("return:ret-1", "return:ret-2") if ctx.redis.exists(key)]
+    assert len(records) == 1, f"the race left the records {records}: the winner has one, the refused return none"
+    record = ctx.redis.hgetall(records[0])
+    want = {"order_line_id": "L1", "quantity": "1", "state": "registered", "tenant": "t-1", "reason_code": "changed_mind"}
+    assert all(record.get(k) == v for k, v in want.items()), f"{records[0]} holds {record}, expected {want}"
+    assert m.register_return("L1", "ret-3", 1, FIELDS) is False, "a return of 1 unit on a line with none left must be refused"
+    assert not ctx.redis.exists("return:ret-3") and _left(ctx) == 0, "a refused return must write nothing"
+
+
+def check_cancel_exact(ctx):
+    m = ctx.load("state")
+    _units(ctx, 5)
+    assert m.register_return("L1", "ret-1", 3, FIELDS) is True, "a return of 3 of 5 units must be registered"
+    assert m.register_return("L1", "ret-2", 1, FIELDS) is True, "a return of 1 of the 2 units left must be registered"
+    restored = m.cancel_return("L1", "ret-1")
+    assert restored == 3 and _left(ctx) == 4, f"canceling the return of 3 units restored {restored} and left the line at {_left(ctx)}, expected 3 restored and 4 left: a cancel gives back exactly what its return took"
+    assert ctx.redis.hget("return:ret-1", "state") == "canceled", f"return:ret-1 is {ctx.redis.hget('return:ret-1', 'state')!r} after its cancel"
+    assert ctx.redis.hget("return:ret-2", "state") == "registered", "canceling ret-1 touched ret-2"
+    restored = m.cancel_return("L1", "ret-404")
+    assert restored == 0 and _left(ctx) == 4, f"canceling a return that does not exist restored {restored} units"
+
+
+def check_cancel_once(ctx):
+    m = ctx.load("state")
+    _units(ctx, 4)
+    m.register_return("L1", "ret-1", 1, FIELDS)
+    first = m.cancel_return("L1", "ret-1")
+    again = m.cancel_return("L1", "ret-1")
+    assert first == 1 and again == 0 and _left(ctx) == 4, f"a cancel and its replay restored {first} and {again}, and the line now has {_left(ctx)} returnable units of the 4 ordered: a return is canceled once"
+    m.register_return("L1", "ret-2", 1, FIELDS)
+    # Two cancels of the same return land together: the second right after the first touches the record.
+    rival = ctx.redis_after("return:ret-2", lambda: m.cancel_return("L1", "ret-2"))
+    mine = m.cancel_return("L1", "ret-2")
+    theirs = _settled(rival, "return:ret-2")
+    assert mine + theirs == 1 and _left(ctx) == 4, f"two concurrent cancels of a return of 1 unit restored {mine} and {theirs}, leaving {_left(ctx)} returnable units of the 4 ordered"
+`,
+    typescript: `const FIELDS = {tenant: 't-1', reason_code: 'changed_mind', photo_ref: ''};
+
+const units = (ctx, n: number): void => {
+  ctx.redis.set('line:L1:returnable', String(n));
+};
+const left = (ctx): number => Number(ctx.redis.get('line:L1:returnable') ?? 0);
+
+async function settled(probe, what: string) {
+  assert(probe.fired, \`nothing touched \${what}\`);
+  if (probe.error !== undefined) throw probe.error;
+  return await probe.result;
+}
+
+export async function check_atomic_register(ctx) {
+  const m = ctx.load('state');
+  units(ctx, 1);
+  // A second return for the last unit lands right after this one first touches the counter.
+  const rival = ctx.redisAfter('line:L1:returnable', () => m.registerReturn('L1', 'ret-2', 1, FIELDS));
+  const mine = await m.registerReturn('L1', 'ret-1', 1, FIELDS);
+  const theirs = await settled(rival, 'line:L1:returnable');
+  assert.equal([mine, theirs].filter(won => won === true).length, 1, \`two returns raced for the last unit and registerReturn answered \${mine} and \${theirs}: exactly one may take it\`);
+  assert.equal(left(ctx), 0, \`line:L1:returnable is \${left(ctx)} after the race for its last unit, expected 0\`);
+  const records = ['return:ret-1', 'return:ret-2'].filter(key => ctx.redis.exists(key) === 1);
+  assert.equal(records.length, 1, \`the race left the records \${JSON.stringify(records)}: the winner has one, the refused return none\`);
+  const record = ctx.redis.hgetall(records[0]);
+  const want = {order_line_id: 'L1', quantity: '1', state: 'registered', tenant: 't-1', reason_code: 'changed_mind'};
+  assert(Object.entries(want).every(([k, v]) => record[k] === v), \`\${records[0]} holds \${JSON.stringify(record)}, expected \${JSON.stringify(want)}\`);
+  assert.equal(await m.registerReturn('L1', 'ret-3', 1, FIELDS), false, 'a return of 1 unit on a line with none left must be refused');
+  assert(ctx.redis.exists('return:ret-3') === 0 && left(ctx) === 0, 'a refused return must write nothing');
+}
+
+export async function check_cancel_exact(ctx) {
+  const m = ctx.load('state');
+  units(ctx, 5);
+  assert.equal(await m.registerReturn('L1', 'ret-1', 3, FIELDS), true, 'a return of 3 of 5 units must be registered');
+  assert.equal(await m.registerReturn('L1', 'ret-2', 1, FIELDS), true, 'a return of 1 of the 2 units left must be registered');
+  let restored = await m.cancelReturn('L1', 'ret-1');
+  assert(restored === 3 && left(ctx) === 4, \`canceling the return of 3 units restored \${restored} and left the line at \${left(ctx)}, expected 3 restored and 4 left: a cancel gives back exactly what its return took\`);
+  assert.equal(ctx.redis.hget('return:ret-1', 'state'), 'canceled', 'return:ret-1 must be canceled');
+  assert.equal(ctx.redis.hget('return:ret-2', 'state'), 'registered', 'canceling ret-1 touched ret-2');
+  restored = await m.cancelReturn('L1', 'ret-404');
+  assert(restored === 0 && left(ctx) === 4, \`canceling a return that does not exist restored \${restored} units\`);
+}
+
+export async function check_cancel_once(ctx) {
+  const m = ctx.load('state');
+  units(ctx, 4);
+  await m.registerReturn('L1', 'ret-1', 1, FIELDS);
+  const first = await m.cancelReturn('L1', 'ret-1');
+  const again = await m.cancelReturn('L1', 'ret-1');
+  assert(first === 1 && again === 0 && left(ctx) === 4, \`a cancel and its replay restored \${first} and \${again}, and the line now has \${left(ctx)} returnable units of the 4 ordered: a return is canceled once\`);
+  await m.registerReturn('L1', 'ret-2', 1, FIELDS);
+  // Two cancels of the same return land together: the second right after the first touches the record.
+  const rival = ctx.redisAfter('return:ret-2', () => m.cancelReturn('L1', 'ret-2'));
+  const mine = await m.cancelReturn('L1', 'ret-2');
+  const theirs = await settled(rival, 'return:ret-2');
+  assert(mine + theirs === 1 && left(ctx) === 4, \`two concurrent cancels of a return of 1 unit restored \${mine} and \${theirs}, leaving \${left(ctx)} returnable units of the 4 ordered\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+var (
+	stateBg     = context.Background()
+	stateFields = map[string]string{"tenant": "t-1", "reason_code": "changed_mind", "photo_ref": ""}
+)
+
+func stateUnits(ctx *harness.Ctx, n int) { ctx.Redis.Set("line:L1:returnable", n) }
+
+func stateLeft(ctx *harness.Ctx) int {
+	v, _ := ctx.Redis.Get("line:L1:returnable")
+	n, _ := strconv.Atoi(v)
+	return n
+}
+
+func mustRegister(ctx *harness.Ctx, returnID string, quantity int64) bool {
+	ok, err := registerReturn(stateBg, "L1", returnID, quantity, stateFields)
+	ctx.NoError(err, "registerReturn(L1, %s, %d) failed", returnID, quantity)
+	return ok
+}
+
+func mustCancel(ctx *harness.Ctx, returnID string) int64 {
+	n, err := cancelReturn(stateBg, "L1", returnID)
+	ctx.NoError(err, "cancelReturn(L1, %s) failed", returnID)
+	return n
+}
+
+func CheckAtomicRegister(ctx *harness.Ctx) {
+	stateUnits(ctx, 1)
+	// A second return for the last unit lands right after this one first touches the counter.
+	rival := ctx.Redis.After("line:L1:returnable", func() any {
+		ok, err := registerReturn(stateBg, "L1", "ret-2", 1, stateFields)
+		ctx.NoError(err, "the rival registerReturn failed")
+		return ok
+	})
+	mine := mustRegister(ctx, "ret-1", 1)
+	ctx.Assert(rival.Fired, "nothing touched line:L1:returnable")
+	theirs, _ := rival.Result.(bool)
+	ctx.Assert(mine != theirs, "two returns raced for the last unit and registerReturn answered %v and %v: exactly one may take it", mine, theirs)
+	ctx.Equal(stateLeft(ctx), 0, "line:L1:returnable after the race for its last unit")
+	var records []string
+	for _, key := range []string{"return:ret-1", "return:ret-2"} {
+		if ctx.Redis.Exists(key) == 1 {
+			records = append(records, key)
+		}
+	}
+	ctx.Equal(len(records), 1, "the race must leave one record, the winner's (records %v)", records)
+	record := ctx.Redis.HGetAll(records[0])
+	ctx.Assert(record["order_line_id"] == "L1" && record["quantity"] == "1" && record["state"] == "registered" && record["tenant"] == "t-1" && record["reason_code"] == "changed_mind", "%s holds %v", records[0], record)
+	ctx.Equal(mustRegister(ctx, "ret-3", 1), false, "a return of 1 unit on a line with none left must be refused; registered")
+	ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && stateLeft(ctx) == 0, "a refused return must write nothing")
+}
+
+func CheckCancelExact(ctx *harness.Ctx) {
+	stateUnits(ctx, 5)
+	ctx.Equal(mustRegister(ctx, "ret-1", 3), true, "a return of 3 of 5 units; registered")
+	ctx.Equal(mustRegister(ctx, "ret-2", 1), true, "a return of 1 of the 2 units left; registered")
+	restored := mustCancel(ctx, "ret-1")
+	ctx.Assert(restored == 3 && stateLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, stateLeft(ctx))
+	state, _ := ctx.Redis.HGet("return:ret-1", "state")
+	ctx.Equal(state, "canceled", "return:ret-1's state after its cancel")
+	state, _ = ctx.Redis.HGet("return:ret-2", "state")
+	ctx.Equal(state, "registered", "return:ret-2's state (canceling ret-1 must not touch it)")
+	restored = mustCancel(ctx, "ret-404")
+	ctx.Assert(restored == 0 && stateLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored)
+}
+
+func CheckCancelOnce(ctx *harness.Ctx) {
+	stateUnits(ctx, 4)
+	mustRegister(ctx, "ret-1", 1)
+	first := mustCancel(ctx, "ret-1")
+	again := mustCancel(ctx, "ret-1")
+	ctx.Assert(first == 1 && again == 0 && stateLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, stateLeft(ctx))
+	mustRegister(ctx, "ret-2", 1)
+	// Two cancels of the same return land together: the second right after the first touches the record.
+	rival := ctx.Redis.After("return:ret-2", func() any {
+		n, err := cancelReturn(stateBg, "L1", "ret-2")
+		ctx.NoError(err, "the rival cancelReturn failed")
+		return n
+	})
+	mine := mustCancel(ctx, "ret-2")
+	ctx.Assert(rival.Fired, "nothing touched return:ret-2")
+	theirs, _ := rival.Result.(int64)
+	ctx.Assert(mine+theirs == 1 && stateLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, theirs, stateLeft(ctx))
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::map<std::string, std::string> kFields = {{"tenant", "t-1"}, {"reason_code", "changed_mind"}, {"photo_ref", ""}};
+
+void units(harness::Ctx& ctx, long long n) { ctx.Redis.Set("line:L1:returnable", std::to_string(n)); }
+
+long long unitsLeft(harness::Ctx& ctx) {
+  const auto v = ctx.Redis.Get("line:L1:returnable");
+  return v ? std::stoll(*v) : 0;
+}
+
+// A probe's outcome: whether it fired, what the rival call returned, what it threw.
+struct Rival {
+  bool fired = false;
+  long long result = 0;
+  std::optional<std::string> err;
+};
+
+template <class F>
+std::shared_ptr<Rival> rival(harness::Ctx& ctx, const std::string& key, F call) {
+  auto out = std::make_shared<Rival>();
+  ctx.Redis.After(key, [out, call] {
+    out->fired = true;
+    try {
+      out->result = call();
+    } catch (const std::exception& e) {
+      out->err = e.what();
+    }
+  });
+  return out;
+}
+
+void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
+  ctx.Assert(r.fired, "nothing touched %s", what);
+  ctx.Assert(!r.err, "the rival call failed: %s", r.err.value_or(""));
+}
+
+}  // namespace
+
+void CheckAtomicRegister(harness::Ctx& ctx) {
+  units(ctx, 1);
+  // A second return for the last unit lands right after this one first touches the counter.
+  const auto other = rival(ctx, "line:L1:returnable", [] { return registerReturn("L1", "ret-2", 1, kFields) ? 1LL : 0LL; });
+  const bool mine = registerReturn("L1", "ret-1", 1, kFields);
+  settled(ctx, *other, "line:L1:returnable");
+  const bool theirs = other->result == 1;
+  ctx.Assert(mine != theirs, "two returns raced for the last unit and registerReturn answered %t and %t: exactly one may take it", mine, theirs);
+  ctx.Equal(unitsLeft(ctx), 0, "line:L1:returnable after the race for its last unit");
+  std::vector<std::string> records;
+  for (const std::string key : {"return:ret-1", "return:ret-2"}) {
+    if (ctx.Redis.Exists(key) == 1) records.push_back(key);
+  }
+  ctx.Equal(records.size(), 1, "the race must leave one record, the winner's (records %q)", records);
+  auto record = ctx.Redis.HGetAll(records[0]);
+  ctx.Assert(record["order_line_id"] == "L1" && record["quantity"] == "1" && record["state"] == "registered" && record["tenant"] == "t-1" && record["reason_code"] == "changed_mind",
+             "%s holds order_line_id %q, quantity %q, state %q, tenant %q", records[0], record["order_line_id"], record["quantity"], record["state"], record["tenant"]);
+  ctx.Equal(registerReturn("L1", "ret-3", 1, kFields), false, "a return of 1 unit on a line with none left must be refused; registered");
+  ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && unitsLeft(ctx) == 0, "a refused return must write nothing");
+}
+
+void CheckCancelExact(harness::Ctx& ctx) {
+  units(ctx, 5);
+  ctx.Equal(registerReturn("L1", "ret-1", 3, kFields), true, "a return of 3 of 5 units; registered");
+  ctx.Equal(registerReturn("L1", "ret-2", 1, kFields), true, "a return of 1 of the 2 units left; registered");
+  long long restored = cancelReturn("L1", "ret-1");
+  ctx.Assert(restored == 3 && unitsLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, unitsLeft(ctx));
+  ctx.Equal(ctx.Redis.HGet("return:ret-1", "state").value_or(""), "canceled", "return:ret-1's state after its cancel");
+  ctx.Equal(ctx.Redis.HGet("return:ret-2", "state").value_or(""), "registered", "return:ret-2's state (canceling ret-1 must not touch it)");
+  restored = cancelReturn("L1", "ret-404");
+  ctx.Assert(restored == 0 && unitsLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored);
+}
+
+void CheckCancelOnce(harness::Ctx& ctx) {
+  units(ctx, 4);
+  registerReturn("L1", "ret-1", 1, kFields);
+  const long long first = cancelReturn("L1", "ret-1");
+  const long long again = cancelReturn("L1", "ret-1");
+  ctx.Assert(first == 1 && again == 0 && unitsLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, unitsLeft(ctx));
+  registerReturn("L1", "ret-2", 1, kFields);
+  // Two cancels of the same return land together: the second right after the first touches the record.
+  const auto other = rival(ctx, "return:ret-2", [] { return cancelReturn("L1", "ret-2"); });
+  const long long mine = cancelReturn("L1", "ret-2");
+  settled(ctx, *other, "return:ret-2");
+  ctx.Assert(mine + other->result == 1 && unitsLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, other->result, unitsLeft(ctx));
+}
+`,
+  },
   hints: [
-    'Under load the counter for a popular line goes negative, support finds returns the counter does not account for, and one canceled return raised a line above its ordered quantity.',
-    'Every path is two round trips: a read in the client, then a write. Between them another request reads the same value. Cancel also trusts the record without checking whether it was already canceled.',
-    'Move each path into one `EVAL` script: compare and `DECRBY` and `HSET` the record together; on cancel, read `quantity` and `state` from the record, `INCRBY` only when state is not `canceled`, then flip it.',
+    'Send two returns for the last unit at the same moment: both get 201. Cancel a return of three units: the line gets one back. Cancel it again: another unit appears.',
+    'Between the client’s `GET` and its `DECRBY` another request can read the same count; the cancel adds a constant, and nothing remembers that the return was already canceled.',
+    'One script for register: GET, compare, `DECRBY`, `HSET` the record. One for cancel: return 0 unless `HGET state` is `registered`, then `INCRBY` by `HGET quantity` and set `canceled`.',
   ],
-  debrief: `The shape of the fix is one script per state change. Redis runs a Lua script without interleaving other commands, so the compare, the decrement and the record write become a single step and the gap the second return used to land in no longer exists. The record has to travel with the decrement: a decrement without a record is a unit nobody can cancel, a record without the decrement is a return that was never counted. Cancel is the same move in reverse with two rules: restore the quantity the record says was taken, and flip the state so a replay restores nothing. What this step leaves out: loading the scripts once with \`SCRIPT LOAD\` and calling \`EVALSHA\`, a reconciliation job that compares counters against return rows, and an audit trail per cancel.`,
+  debrief: `Both scripts follow one rule: the decision and the write it justifies happen in one Redis execution, against values read in that same execution. Register reads the counter it decrements and writes the record that explains the decrement; cancel reads the quantity it restores and the state that says whether it may, then changes that state. That is what makes a double submit, a replayed cancel and two support agents clicking at once harmless without any client-side locking. A returns platform keeps the counter as a cache of the order ledger and reconciles the two nightly, and it records every cancel with who asked and why, so a units count that drifts can be traced to the change that moved it.`,
 };

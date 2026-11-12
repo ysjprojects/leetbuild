@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package priced;
+
+// The demand model step 3 asks for a sku's next price. It answers an estimate and the version of
+// the model that produced it. A sku whose proposal the model's own constraints refuse (a contracted
+// price, a price-matched item) is FAILED_PRECONDITION, with the reason in the details: no retry
+// changes that answer. A model that is overloaded or redeploying is UNAVAILABLE or misses the
+// caller's deadline.
+service DemandModel {
+  rpc Estimate(EstimateRequest) returns (PriceEstimate);
+}
+
+message EstimateRequest {
+  string sku = 1;
+  int64 current_price_cents = 2;
+}
+
+message PriceEstimate {
+  int64 price_cents = 1;
+  string model_version = 2;
+}

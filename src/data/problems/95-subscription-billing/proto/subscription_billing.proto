@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package subbilling;
+
+// The payment processor the billing run charges invoices through. Charge is idempotent on
+// idempotency_key: a repeated key answers the first result and moves no money twice. A card the
+// issuer refuses is an answered call with status "declined" and the issuer's decline_code;
+// DEADLINE_EXCEEDED and UNAVAILABLE say nothing about whether the charge landed. GetInvoice
+// answers what the processor holds for an invoice id, NOT_FOUND when it never charged it.
+service Processor {
+  rpc Charge(ChargeRequest) returns (ChargeResult);
+  rpc GetInvoice(GetInvoiceRequest) returns (ProcessorInvoice);
+}
+
+message ChargeRequest {
+  string invoice_id = 1;
+  string subscription_id = 2;
+  int64 amount_cents = 3;
+  string idempotency_key = 4;
+}
+
+message ChargeResult {
+  // "succeeded" or "declined"
+  string status = 1;
+  // The processor's charge reference, when it succeeded.
+  string reference = 2;
+  // The issuer's reason, when it declined: card_declined, insufficient_funds, expired_card.
+  string decline_code = 3;
+}
+
+message GetInvoiceRequest {
+  string invoice_id = 1;
+}
+
+message ProcessorInvoice {
+  string invoice_id = 1;
+  // "charged"
+  string state = 2;
+  string reference = 3;
+  // Everything the processor charged for the invoice, in cents.
+  int64 total_cents = 4;
+}

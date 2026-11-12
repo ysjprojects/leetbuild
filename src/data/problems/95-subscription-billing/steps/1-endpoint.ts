@@ -2,35 +2,32 @@ import type {Step} from '@/lib/types';
 
 export const changePlanStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/subscriptions: plan changes with an effective date',
+  title: 'POST /v1/subscriptions: plan changes prorated over the real period',
   concept: 'http',
   file: 'api',
   focus: ['client', 'billing', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/subscriptions\`, parses a body of
-\`{"subscription_id", "plan", "effective_date", "proration_policy"}\`, loads the subscription, splits
-the period at the effective date and returns an invoice schedule with a total. It compiles, it serves
-the demo, and it hides four flaws.
+**Starting point.** The starter serves \`POST /v1/subscriptions\` with a body \`{subscription_id, plan,
+effective_date, proration_policy}\`: it loads the subscription (\`billing.store\`, provided), takes
+\`now\` as today (\`billing.dates\`) and any other value as the change date, prices an old-plan line
+and a new-plan line, opens the period's invoice for the total and answers \`{subscription_id, plan,
+effective_at, lines, total_cents, invoice_id}\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Flaws that survive a demo on the first of the month with one
-plan and the caller's own tenant: a fixed 30-day divisor, a double-billed switch day, and an
-endpoint that denies nothing.
+**Failure mode the checks target.** Any caller changes any tenant's plan; a date the period cannot
+place, a policy nobody implemented or a plan with no price reaches an invoice; a 31-day period is
+priced as 30 days; and the switch day is billed on both plans.
 
-- Tenant from \`X-Tenant-Id\` (**401** if missing); another tenant's subscription is **404**.
-- \`plan\` must exist in the catalogue (**400** otherwise).
-- \`proration_policy\` must be one the platform implements, today only \`actual_days\` (**400** otherwise).
-- \`effective_date\` is \`now\` or the next period boundary (\`next_period_start\`, ISO-8601); any other
-  date is **400**.
-- Prorate over the **actual** days: \`period_days = (period_end - period_start).days\`, a line is
-  \`round(price_cents * days / period_days)\`.
-- Charge the switch day **once**: old plan covers \`[period_start, change_at)\`, new plan
-  \`[change_at, period_end)\`, so \`old_days + new_days == period_days\`.
-- The response states the resulting invoice schedule:
-  \`{"subscription_id", "effective_at", "proration_policy", "invoice_schedule": [{"period_start", "period_end", "lines": [{"plan", "days", "amount_cents"}]}], "total_cents"}\`.
-- Log the change with tenant, subscription and plan, no card or processor data.`,
+- \`X-Tenant-Id\` is required (**401**); another tenant's subscription is **404**.
+- \`plan\` must have a price (\`store.plan_price\`), \`proration_policy\` must be in
+  \`PRORATION_POLICIES\`, and \`effective_date\` is \`now\` or the subscription's \`period_end\` (the
+  next period start); anything else is **400**.
+- Prorate over the period's own length, \`period_days = dates.days_between(period_start,
+  period_end)\`: a line is \`round(price * days / period_days)\`.
+- Periods are half-open: the old plan covers \`[period_start, change_at)\`, the new plan
+  \`[change_at, period_end)\`, so the two lines' days add up to the period.`,
   sequence: {
-    participants: ['Client', 'Billing Service', 'billing db'],
+    participants: ['Client', 'Billing Service', 'billing store'],
     messages: [
       {
         from: 'Client',
@@ -38,29 +35,29 @@ endpoint that denies nothing.
         label: 'POST /v1/subscriptions · X-Tenant-Id · plan · effective_date',
         kind: 'sync',
       },
+      {from: 'Billing Service', to: 'billing store', label: 'find_subscription(id) · tenant, period', kind: 'sync'},
       {
         from: 'Billing Service',
         to: 'Billing Service',
-        label: 'validate tenant · plan · policy · effective date',
+        label: 'tenant → 401/404 · plan, policy, date → 400',
         kind: 'sync',
       },
-      {from: 'Billing Service', to: 'billing db', label: 'load subscription period · plan prices', kind: 'sync'},
-      {from: 'billing db', to: 'Billing Service', label: 'current · next period bounds', kind: 'reply'},
       {
         from: 'Billing Service',
         to: 'Billing Service',
-        label: 'prorate over period_days, old_days + new_days == period_days',
+        label: '[start, change) old · [change, end) new · ÷ period_days',
         kind: 'sync',
       },
-      {from: 'Billing Service', to: 'billing db', label: 'store the plan change · invoice schedule', kind: 'async'},
-      {from: 'Billing Service', to: 'Client', label: '200 {invoice_schedule, total_cents}', kind: 'reply'},
+      {from: 'Billing Service', to: 'billing store', label: 'open_invoice(period, total)', kind: 'sync'},
+      {from: 'Billing Service', to: 'Client', label: '200 {lines, total_cents, invoice_id}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/subscriptions',
-      detail: 'Register the plan-change route on `POST /v1/subscriptions`.',
+      title: 'Prices a plan change and opens the invoice',
+      detail:
+        'Register `POST /v1/subscriptions`: a change answers an old-plan line, a new-plan line, their total, and the id of the invoice it opened for that total.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/subscriptions["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/subscriptions['"]/]},
@@ -73,77 +70,66 @@ endpoint that denies nothing.
       id: 'tenant',
       title: 'Authenticates the tenant',
       detail:
-        'A missing `X-Tenant-Id` is **401** and a subscription that belongs to another tenant is **404**. The starter denies nothing: it reads the subscription straight from the body, so any caller can preview — or force — any tenant’s schedule.',
+        "A change without `X-Tenant-Id` is **401**, and a subscription owned by another tenant is **404** with no invoice opened; the starter never reads the header, so any caller re-prices any tenant's subscription.",
       match: {
-        python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/, /status_code\s*=\s*404/]},
-        typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/, /code\(\s*404\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /StatusUnauthorized/, /StatusNotFound/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.Unauthorized/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/X-Tenant-Id/, /res\.status\s*=\s*401/, /res\.status\s*=\s*404/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/, /\[["']tenant["']\]/]},
+        typescript: {all: [/x-tenant-id/i, /\b401\b/, /\.tenant\b/]},
+        go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\b/]},
+        scala: {all: [/X-Tenant-Id/i, /Unauthorized|\b401\b/, /\.tenant\b/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /(->|\.)tenant\b/]},
       },
     },
     {
       id: 'effective-date',
-      title: 'Rejects an unsupported effective date or proration policy',
+      title: 'Rejects a date, policy or plan it cannot price',
       detail:
-        '`effective_date` must be `now` or the next period boundary, and `proration_policy` must be one the platform implements — both **400** otherwise. The starter accepts any string and prorates it anyway, so an uncomputable change reaches an invoice.',
+        "`effective_date` is `now` or the subscription's `period_end`, `proration_policy` is one of `PRORATION_POLICIES` and `plan` has a price; anything else is **400** and opens no invoice. The starter prices whatever it is sent.",
       match: {
-        python: {all: [/EFFECTIVE_NOW/, /next_period_start/, /PRORATION_POLICIES/, /status_code\s*=\s*400/]},
-        typescript: {all: [/EFFECTIVE_NOW/, /nextPeriodStart/, /PRORATION_POLICIES/, /code\(\s*400\s*\)/]},
-        go: {all: [/effectiveNow/, /nextPeriodStart/, /prorationPolicies/, /StatusBadRequest/]},
-        scala: {all: [/EffectiveNow/, /nextPeriodStart/, /ProrationPolicies/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kEffectiveNow/, /nextPeriodStart/, /kProrationPolicies/, /\b400\b/]},
+        python: {all: [/not in PRORATION_POLICIES/, /\b400\b/]},
+        typescript: {all: [/PRORATION_POLICIES\.includes\(/, /\b400\b/]},
+        go: {all: [/prorationPolicies\[/, /StatusBadRequest|\b400\b/]},
+        scala: {all: [/ProrationPolicies\.contains\(/, /BadRequest|\b400\b/]},
+        cpp: {all: [/kProrationPolicies\.(count|find|contains)\(/, /\b400\b/]},
       },
     },
     {
       id: 'actual-days',
       title: 'Prorates over the actual days of the period',
       detail:
-        'The divisor is the period’s real length, computed from its two bounds (`period_days = (period_end - period_start).days`), never a constant thirty-day month. The starter divides by `MONTH_DAYS = 30`, so a 31-day period is under-billed and February is over-billed.',
+        "The divisor is the period's own length, `days_between(period_start, period_end)`: 31 for a 31-day period, 28 for February. The starter divides by `MONTH_DAYS = 30`.",
       match: {
-        python: {
-          all: [/period_days\s*=\s*\(\s*period_end\s*-\s*period_start\s*\)\.days/],
-          none: [/MONTH_DAYS\s*=\s*30/],
-        },
-        typescript: {
-          all: [/periodDays\s*=\s*daysBetween\(\s*periodStart\s*,\s*periodEnd\s*\)/],
-          none: [/MONTH_DAYS\s*=\s*30/],
-        },
-        go: {all: [/periodDays\s*:=\s*daysBetween\(periodStart,\s*periodEnd\)/], none: [/monthDays\s*=\s*30/]},
-        scala: {
-          all: [/periodDays\s*=\s*ChronoUnit\.DAYS\.between\(periodStart,\s*periodEnd\)/],
-          none: [/MonthDays\s*=\s*30/],
-        },
-        cpp: {all: [/periodDays\s*=\s*daysBetween\(periodStart,\s*periodEnd\)/], none: [/kMonthDays\s*=\s*30/]},
+        python: {all: [/days_between\([^,\n]*period_start\s*,[^)\n]*period_end\s*\)/], none: [/MONTH_DAYS/]},
+        typescript: {all: [/daysBetween\([^,\n]*period_start\s*,[^)\n]*period_end\s*\)/], none: [/MONTH_DAYS/]},
+        go: {all: [/DaysBetween\([^,\n]*PeriodStart\s*,[^)\n]*PeriodEnd\s*\)/], none: [/monthDays/]},
+        scala: {all: [/daysBetween\([^,\n]*periodStart\s*,[^)\n]*periodEnd\s*\)/], none: [/MonthDays/]},
+        cpp: {all: [/daysBetween\([^,\n]*period_start\s*,[^)\n]*period_end\s*\)/], none: [/kMonthDays/]},
       },
     },
     {
       id: 'exclusive-day',
       title: 'Charges the switch day exactly once',
       detail:
-        'The old plan covers `[period_start, change_at)` and the new plan `[change_at, period_end)`, with `old_days + new_days == period_days` held as an invariant. The starter bills the old plan for the whole period *and* the new plan from the change day on, charging that day twice.',
+        'The old plan covers `[period_start, change_at)` and the new plan `[change_at, period_end)`, so their days add up to the period. The starter counts the old plan through the switch day (`+ 1`), billing that day on both plans.',
       match: {
-        python: {all: [/old_days\s*\+\s*new_days\s*!=\s*period_days/, /\bchange_at\b/]},
-        typescript: {all: [/oldDays\s*\+\s*newDays\s*!==\s*periodDays/, /\bchangeAt\b/]},
-        go: {all: [/oldDays\+newDays\s*!=\s*periodDays/, /\bchangeAt\b/]},
-        scala: {all: [/oldDays\s*\+\s*newDays\s*==\s*periodDays/, /\bchangeAt\b/]},
-        cpp: {all: [/oldDays\s*\+\s*newDays\s*!=\s*periodDays/, /\bchangeAt\b/]},
+        python: {all: [/days_between\(/], none: [/days_between\([^)\n]*\)\s*\+\s*1\b/]},
+        typescript: {all: [/daysBetween\(/], none: [/daysBetween\([^)\n]*\)\s*\+\s*1\b/]},
+        go: {all: [/DaysBetween\(/], none: [/DaysBetween\([^)\n]*\)\s*\+\s*1\b/]},
+        scala: {all: [/daysBetween\(/], none: [/daysBetween\([^)\n]*\)\s*\+\s*1\b/]},
+        cpp: {all: [/daysBetween\(/], none: [/daysBetween\([^)\n]*\)\s*\+\s*1\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-from datetime import date
-
-from fastapi import FastAPI
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from billing import dates, store  # dates.today, days_between; store.find_subscription, plan_price, open_invoice
+
 app = FastAPI()
-logger = logging.getLogger("billing")
 
 MONTH_DAYS = 30
-PLANS = {"starter-monthly": 1900, "scale-monthly": 9900}
+PRORATION_POLICIES = ("actual_days",)
 
 
 class PlanChange(BaseModel):
@@ -153,58 +139,45 @@ class PlanChange(BaseModel):
     proration_policy: str = "actual_days"
 
 
-class SubscriptionStore:
-    def load(self, subscription_id: str) -> dict:
-        """The subscription row: tenant, plan, current/next period bounds."""
-        raise NotImplementedError
-
-
-store = SubscriptionStore()
-
-
-def change_day(value: str) -> int:
-    if value == "now":
-        return date.today().day
-    return date.fromisoformat(value).day
+def schedule(subscription: dict, plan: str, change_at: str, lines: list[dict]) -> dict:
+    """The answer: the lines, their total, and the period's invoice opened for that total."""
+    total = sum(line["amount_cents"] for line in lines)
+    invoice = store.open_invoice(subscription["subscription_id"], subscription["period_start"], subscription["period_end"], total)
+    return {
+        "subscription_id": subscription["subscription_id"],
+        "plan": plan,
+        "effective_at": change_at,
+        "lines": lines,
+        "total_cents": total,
+        "invoice_id": invoice["invoice_id"],
+    }
 
 
 @app.post("/v1/subscriptions")
-def change_plan(body: PlanChange) -> dict:
+def change_plan(body: PlanChange, request: Request) -> dict:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    subscription = store.load(body.subscription_id)
-    day = change_day(body.effective_date)
-    old_cents = PLANS[subscription["plan"]]
-    new_cents = round(PLANS[body.plan] * (MONTH_DAYS - day) / MONTH_DAYS)
-    logger.info("plan change subscription=%s plan=%s", body.subscription_id, body.plan)
-    return {
-        "subscription_id": body.subscription_id,
-        "effective_at": body.effective_date,
-        "proration_policy": body.proration_policy,
-        "invoice_schedule": [
-            {
-                "period_start": subscription["current_period_start"].isoformat(),
-                "period_end": subscription["current_period_end"].isoformat(),
-                "lines": [
-                    {"plan": subscription["plan"], "days": MONTH_DAYS, "amount_cents": old_cents},
-                    {"plan": body.plan, "days": MONTH_DAYS - day, "amount_cents": new_cents},
-                ],
-            }
-        ],
-        "total_cents": old_cents + new_cents,
-    }
+    subscription = store.find_subscription(body.subscription_id)
+    if subscription is None:
+        raise HTTPException(status_code=404, detail="no such subscription")
+    change_at = dates.today() if body.effective_date == "now" else body.effective_date
+    old_days = dates.days_between(subscription["period_start"], change_at) + 1
+    new_days = dates.days_between(change_at, subscription["period_end"])
+    old_price = store.plan_price(subscription["plan"])
+    new_price = store.plan_price(body.plan)
+    lines = [
+        {"plan": subscription["plan"], "days": old_days, "amount_cents": round(old_price * old_days / MONTH_DAYS)},
+        {"plan": body.plan, "days": new_days, "amount_cents": round(new_price * new_days / MONTH_DAYS)},
+    ]
+    return schedule(subscription, body.plan, change_at, lines)
 `,
-      solution: `import logging
-from datetime import date
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("billing")
+from billing import dates, store  # dates.today, days_between; store.find_subscription, plan_price, open_invoice
 
-EFFECTIVE_NOW = "now"
-PRORATION_POLICIES = {"actual_days"}
-PLANS = {"starter-monthly": 1900, "scale-monthly": 9900}
+app = FastAPI()
+
+PRORATION_POLICIES = ("actual_days",)
 
 
 class PlanChange(BaseModel):
@@ -214,93 +187,60 @@ class PlanChange(BaseModel):
     proration_policy: str = "actual_days"
 
 
-class SubscriptionStore:
-    def load(self, subscription_id: str) -> dict | None:
-        """The subscription row: tenant, plan, current/next period bounds."""
-        raise NotImplementedError
-
-
-store = SubscriptionStore()
-
-
-def days_between(start: date, end: date) -> int:
-    return (end - start).days
-
-
-def prorated_cents(price_cents: int, days: int, period_days: int) -> int:
-    """A line costs the plan price over the days that plan actually covered."""
-    return round(price_cents * days / period_days)
-
-
-def schedule_for(subscription: dict, plan: str, change_at: date) -> dict:
-    if change_at >= subscription["next_period_start"]:
-        period_start, period_end = subscription["next_period_start"], subscription["next_period_end"]
-    else:
-        period_start, period_end = subscription["current_period_start"], subscription["current_period_end"]
-    period_days = (period_end - period_start).days
-    old_days = days_between(period_start, change_at)
-    new_days = days_between(change_at, period_end)
-    if old_days + new_days != period_days:
-        raise ValueError("a plan change must charge every day of the period exactly once")
+def schedule(subscription: dict, plan: str, change_at: str, lines: list[dict]) -> dict:
+    """The answer: the lines, their total, and the period's invoice opened for that total."""
+    total = sum(line["amount_cents"] for line in lines)
+    invoice = store.open_invoice(subscription["subscription_id"], subscription["period_start"], subscription["period_end"], total)
     return {
-        "period_start": period_start.isoformat(),
-        "period_end": period_end.isoformat(),
-        "lines": [
-            {
-                "plan": subscription["plan"],
-                "days": old_days,
-                "amount_cents": prorated_cents(PLANS[subscription["plan"]], old_days, period_days),
-            },
-            {
-                "plan": plan,
-                "days": new_days,
-                "amount_cents": prorated_cents(PLANS[plan], new_days, period_days),
-            },
-        ],
+        "subscription_id": subscription["subscription_id"],
+        "plan": plan,
+        "effective_at": change_at,
+        "lines": lines,
+        "total_cents": total,
+        "invoice_id": invoice["invoice_id"],
     }
 
 
 @app.post("/v1/subscriptions")
-def change_plan(
-    body: PlanChange,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> dict:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if body.plan not in PLANS:
-        raise HTTPException(status_code=400, detail="unknown plan")
-    if body.proration_policy not in PRORATION_POLICIES:
-        raise HTTPException(status_code=400, detail="unsupported proration policy")
-    subscription = store.load(body.subscription_id)
+def change_plan(body: PlanChange, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    subscription = store.find_subscription(body.subscription_id)
     if subscription is None or subscription["tenant"] != tenant:
-        raise HTTPException(status_code=404, detail="unknown subscription")
-    next_period_start = subscription["next_period_start"]
-    if body.effective_date == EFFECTIVE_NOW:
-        change_at = date.today()
-    elif body.effective_date == next_period_start.isoformat():
-        change_at = next_period_start
-    else:
-        raise HTTPException(status_code=400, detail="effective date must be now or the next period boundary")
-    schedule = schedule_for(subscription, body.plan, change_at)
-    total_cents = sum(line["amount_cents"] for line in schedule["lines"])
-    logger.info("plan change tenant=%s subscription=%s plan=%s", tenant, body.subscription_id, body.plan)
-    return {
-        "subscription_id": body.subscription_id,
-        "effective_at": change_at.isoformat(),
-        "proration_policy": body.proration_policy,
-        "invoice_schedule": [schedule],
-        "total_cents": total_cents,
-    }
+        # Another tenant's subscription answers like a missing one: the id is not confirmed.
+        raise HTTPException(status_code=404, detail="no such subscription")
+    period_start, period_end = subscription["period_start"], subscription["period_end"]
+    new_price = store.plan_price(body.plan)
+    if new_price is None:
+        raise HTTPException(status_code=400, detail=f"unknown plan {body.plan}")
+    if body.proration_policy not in PRORATION_POLICIES:
+        raise HTTPException(status_code=400, detail=f"unsupported proration_policy {body.proration_policy}")
+    if body.effective_date not in ("now", period_end):
+        raise HTTPException(status_code=400, detail="effective_date is now or the next period start")
+    change_at = dates.today() if body.effective_date == "now" else period_end
+    # Half-open: the old plan covers [period_start, change_at), the new one [change_at, period_end).
+    period_days = dates.days_between(period_start, period_end)
+    old_days = dates.days_between(period_start, change_at)
+    new_days = dates.days_between(change_at, period_end)
+    old_price = store.plan_price(subscription["plan"])
+    lines = [
+        {"plan": subscription["plan"], "days": old_days, "amount_cents": round(old_price * old_days / period_days)},
+        {"plan": body.plan, "days": new_days, "amount_cents": round(new_price * new_days / period_days)},
+    ]
+    return schedule(subscription, body.plan, change_at, lines)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/subscriptions: the plan-change starter. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {daysBetween, today} from 'billing/dates';
+import {type Subscription, findSubscription, openInvoice, planPrice} from 'billing/store';
 
 export const app = Fastify();
 
-const MONTH_DAYS = 30;
-const PLANS: Record<string, number> = {'starter-monthly': 1900, 'scale-monthly': 9900};
+export const MONTH_DAYS = 30;
+export const PRORATION_POLICIES = ['actual_days'];
 
 interface PlanChange {
   subscription_id: string;
@@ -309,164 +249,92 @@ interface PlanChange {
   proration_policy?: string;
 }
 
-export interface Subscription {
-  id: string;
-  tenant: string;
-  plan: string;
-  currentPeriodStart: string;
-  currentPeriodEnd: string;
-  nextPeriodStart: string;
-  nextPeriodEnd: string;
-}
-
-export const store = {
-  async load(subscriptionId: string): Promise<Subscription | null> {
-    void subscriptionId;
-    return null;
-  },
-};
-
-function changeDay(value: string): number {
-  return value === 'now' ? new Date().getUTCDate() : Number(value.slice(8, 10));
-}
-
-app.post('/v1/subscriptions', async (request, reply) => {
-  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-  const body = request.body as PlanChange;
-  const subscription = (await store.load(body.subscription_id)) as Subscription;
-  const day = changeDay(body.effective_date);
-  const oldCents = PLANS[subscription.plan];
-  const newCents = Math.round((PLANS[body.plan] * (MONTH_DAYS - day)) / MONTH_DAYS);
-  request.log.info({subscription_id: body.subscription_id, plan: body.plan}, 'plan change');
-  return reply.code(200).send({
-    subscription_id: body.subscription_id,
-    effective_at: body.effective_date,
-    proration_policy: body.proration_policy ?? 'actual_days',
-    invoice_schedule: [
-      {
-        period_start: subscription.currentPeriodStart,
-        period_end: subscription.currentPeriodEnd,
-        lines: [
-          {plan: subscription.plan, days: MONTH_DAYS, amount_cents: oldCents},
-          {plan: body.plan, days: MONTH_DAYS - day, amount_cents: newCents},
-        ],
-      },
-    ],
-    total_cents: oldCents + newCents,
-  });
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/subscriptions: plan changes prorated over the actual days of the period. */
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-export const EFFECTIVE_NOW = 'now';
-export const PRORATION_POLICIES: Record<string, true> = {actual_days: true};
-export const PLANS: Record<string, number> = {'starter-monthly': 1900, 'scale-monthly': 9900};
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-interface PlanChange {
-  subscription_id: string;
-  plan: string;
-  effective_date: string;
-  proration_policy?: string;
-}
-
-export interface Subscription {
-  id: string;
-  tenant: string;
-  plan: string;
-  currentPeriodStart: string;
-  currentPeriodEnd: string;
-  nextPeriodStart: string;
-  nextPeriodEnd: string;
-}
-
-export const store = {
-  async load(subscriptionId: string): Promise<Subscription | null> {
-    void subscriptionId;
-    return null;
-  },
-};
-
-interface InvoiceLine {
+interface Line {
   plan: string;
   days: number;
   amount_cents: number;
 }
 
-interface InvoicePeriod {
-  period_start: string;
-  period_end: string;
-  lines: InvoiceLine[];
+/** The answer: the lines, their total, and the period's invoice opened for that total. */
+async function schedule(subscription: Subscription, plan: string, changeAt: string, lines: Line[]) {
+  const total = lines.reduce((sum, line) => sum + line.amount_cents, 0);
+  const invoice = await openInvoice(subscription.subscription_id, subscription.period_start, subscription.period_end, total);
+  return {subscription_id: subscription.subscription_id, plan, effective_at: changeAt, lines, total_cents: total, invoice_id: invoice.invoice_id};
 }
 
-function daysBetween(from: Date, to: Date): number {
-  return Math.round((to.getTime() - from.getTime()) / DAY_MS);
+app.post('/v1/subscriptions', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const body = request.body as PlanChange;
+  const subscription = await findSubscription(body.subscription_id);
+  if (subscription === null) return reply.code(404).send({error: 'no such subscription'});
+  const changeAt = body.effective_date === 'now' ? today() : body.effective_date;
+  const oldDays = daysBetween(subscription.period_start, changeAt) + 1;
+  const newDays = daysBetween(changeAt, subscription.period_end);
+  const oldPrice = planPrice(subscription.plan) ?? 0;
+  const newPrice = planPrice(body.plan) ?? 0;
+  const lines = [
+    {plan: subscription.plan, days: oldDays, amount_cents: Math.round((oldPrice * oldDays) / MONTH_DAYS)},
+    {plan: body.plan, days: newDays, amount_cents: Math.round((newPrice * newDays) / MONTH_DAYS)},
+  ];
+  return schedule(subscription, body.plan, changeAt, lines);
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {daysBetween, today} from 'billing/dates';
+import {type Subscription, findSubscription, openInvoice, planPrice} from 'billing/store';
+
+export const app = Fastify();
+
+export const PRORATION_POLICIES = ['actual_days'];
+
+interface PlanChange {
+  subscription_id: string;
+  plan: string;
+  effective_date: string;
+  proration_policy?: string;
 }
 
-function proratedCents(priceCents: number, days: number, periodDays: number): number {
-  return Math.round((priceCents * days) / periodDays);
+interface Line {
+  plan: string;
+  days: number;
+  amount_cents: number;
 }
 
-function scheduleFor(subscription: Subscription, plan: string, changeAt: Date): InvoicePeriod {
-  const goesToNextPeriod = changeAt.getTime() >= Date.parse(subscription.nextPeriodStart);
-  const periodStart = new Date(goesToNextPeriod ? subscription.nextPeriodStart : subscription.currentPeriodStart);
-  const periodEnd = new Date(goesToNextPeriod ? subscription.nextPeriodEnd : subscription.currentPeriodEnd);
-  const periodDays = daysBetween(periodStart, periodEnd);
-  const oldDays = daysBetween(periodStart, changeAt);
-  const newDays = daysBetween(changeAt, periodEnd);
-  if (oldDays + newDays !== periodDays)
-    throw new Error('a plan change must charge every day of the period exactly once');
-  return {
-    period_start: periodStart.toISOString().slice(0, 10),
-    period_end: periodEnd.toISOString().slice(0, 10),
-    lines: [
-      {
-        plan: subscription.plan,
-        days: oldDays,
-        amount_cents: proratedCents(PLANS[subscription.plan], oldDays, periodDays),
-      },
-      {plan, days: newDays, amount_cents: proratedCents(PLANS[plan], newDays, periodDays)},
-    ],
-  };
+/** The answer: the lines, their total, and the period's invoice opened for that total. */
+async function schedule(subscription: Subscription, plan: string, changeAt: string, lines: Line[]) {
+  const total = lines.reduce((sum, line) => sum + line.amount_cents, 0);
+  const invoice = await openInvoice(subscription.subscription_id, subscription.period_start, subscription.period_end, total);
+  return {subscription_id: subscription.subscription_id, plan, effective_at: changeAt, lines, total_cents: total, invoice_id: invoice.invoice_id};
 }
 
 app.post('/v1/subscriptions', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const body = request.body as Partial<PlanChange> | null;
-  if (body === null || typeof body !== 'object' || typeof body.subscription_id !== 'string')
-    return reply.code(400).send({error: 'subscription_id is required'});
-  if (typeof body.plan !== 'string' || PLANS[body.plan] === undefined)
-    return reply.code(400).send({error: 'unknown plan'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = request.body as PlanChange;
+  const subscription = await findSubscription(body.subscription_id);
+  // Another tenant's subscription answers like a missing one: the id is not confirmed.
+  if (subscription === null || subscription.tenant !== tenant) return reply.code(404).send({error: 'no such subscription'});
+  const {period_start, period_end} = subscription;
+  const newPrice = planPrice(body.plan);
+  if (newPrice === null) return reply.code(400).send({error: \`unknown plan \${body.plan}\`});
   const policy = body.proration_policy ?? 'actual_days';
-  if (PRORATION_POLICIES[policy] !== true) return reply.code(400).send({error: 'unsupported proration policy'});
-  const subscription = await store.load(body.subscription_id);
-  if (subscription === null || subscription.tenant !== tenant)
-    return reply.code(404).send({error: 'unknown subscription'});
-  const nextPeriodStart = new Date(subscription.nextPeriodStart);
-  let changeAt: Date;
-  if (body.effective_date === EFFECTIVE_NOW) changeAt = new Date();
-  else if (body.effective_date === nextPeriodStart.toISOString().slice(0, 10)) changeAt = nextPeriodStart;
-  else return reply.code(400).send({error: 'effective date must be now or the next period boundary'});
-  const schedule = scheduleFor(subscription, body.plan, changeAt);
-  const totalCents = schedule.lines.reduce((sum, line) => sum + line.amount_cents, 0);
-  request.log.info({tenant, subscription_id: body.subscription_id, plan: body.plan}, 'plan change');
-  return reply.code(200).send({
-    subscription_id: body.subscription_id,
-    effective_at: changeAt.toISOString().slice(0, 10),
-    proration_policy: policy,
-    invoice_schedule: [schedule],
-    total_cents: totalCents,
-  });
+  if (!PRORATION_POLICIES.includes(policy)) return reply.code(400).send({error: \`unsupported proration_policy \${policy}\`});
+  if (body.effective_date !== 'now' && body.effective_date !== period_end) {
+    return reply.code(400).send({error: 'effective_date is now or the next period start'});
+  }
+  const changeAt = body.effective_date === 'now' ? today() : period_end;
+  // Half-open: the old plan covers [period_start, changeAt), the new one [changeAt, period_end).
+  const periodDays = daysBetween(period_start, period_end);
+  const oldDays = daysBetween(period_start, changeAt);
+  const newDays = daysBetween(changeAt, period_end);
+  const oldPrice = planPrice(subscription.plan) ?? 0;
+  const lines = [
+    {plan: subscription.plan, days: oldDays, amount_cents: Math.round((oldPrice * oldDays) / periodDays)},
+    {plan: body.plan, days: newDays, amount_cents: Math.round((newPrice * newDays) / periodDays)},
+  ];
+  return schedule(subscription, body.plan, changeAt, lines);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -474,192 +342,145 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"math"
 	"net/http"
-	"time"
+
+	"billing/dates" // dates.Today, DaysBetween
+	"billing/store" // store.FindSubscription, PlanPrice, OpenInvoice
 )
 
 const monthDays = 30
 
-var plans = map[string]int{"starter-monthly": 1900, "scale-monthly": 9900}
+var prorationPolicies = map[string]bool{"actual_days": true}
 
-// PlanChange is the plan-change request body.
-type PlanChange struct {
+type planChange struct {
 	SubscriptionID  string \`json:"subscription_id"\`
 	Plan            string \`json:"plan"\`
 	EffectiveDate   string \`json:"effective_date"\`
 	ProrationPolicy string \`json:"proration_policy"\`
 }
 
-// Subscription is the billing row the store returns.
-type Subscription struct {
-	Tenant             string
-	Plan               string
-	CurrentPeriodStart time.Time
-	CurrentPeriodEnd   time.Time
-	NextPeriodStart    time.Time
-	NextPeriodEnd      time.Time
+type line struct {
+	Plan        string \`json:"plan"\`
+	Days        int    \`json:"days"\`
+	AmountCents int64  \`json:"amount_cents"\`
 }
 
-type SubscriptionStore struct{}
-
-func (s *SubscriptionStore) Load(subscriptionID string) (*Subscription, error) { return nil, nil }
-
-var store = &SubscriptionStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func changeDay(value string) int {
-	if value == "now" {
-		return time.Now().UTC().Day()
+func prorate(price int64, days, over int) int64 {
+	return int64(math.Round(float64(price) * float64(days) / float64(over)))
+}
+
+// schedule answers the lines, their total, and the period's invoice opened for that total.
+func schedule(rw http.ResponseWriter, r *http.Request, sub *store.Subscription, plan, changeAt string, lines []line) {
+	var total int64
+	for _, l := range lines {
+		total += l.AmountCents
 	}
-	parsed, err := time.Parse("2006-01-02", value)
-	if err != nil {
-		return 1
-	}
-	return parsed.Day()
+	invoice := store.OpenInvoice(r.Context(), sub.SubscriptionID, sub.PeriodStart, sub.PeriodEnd, total)
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"subscription_id": sub.SubscriptionID, "plan": plan, "effective_at": changeAt, "lines": lines, "total_cents": total, "invoice_id": invoice.InvoiceID,
+	})
 }
 
 func changePlan(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	var body PlanChange
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	var body planChange
+	json.NewDecoder(r.Body).Decode(&body)
+	sub := store.FindSubscription(r.Context(), body.SubscriptionID)
+	if sub == nil {
+		http.Error(rw, "no such subscription", http.StatusNotFound)
 		return
 	}
-	subscription, _ := store.Load(body.SubscriptionID)
-	day := changeDay(body.EffectiveDate)
-	oldCents := plans[subscription.Plan]
-	newCents := int(math.Round(float64(plans[body.Plan]) * float64(monthDays-day) / float64(monthDays)))
-	log.Printf("plan change subscription=%s plan=%s", body.SubscriptionID, body.Plan)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"subscription_id":  body.SubscriptionID,
-		"effective_at":     body.EffectiveDate,
-		"proration_policy": body.ProrationPolicy,
-		"invoice_schedule": []any{map[string]any{
-			"period_start": subscription.CurrentPeriodStart.Format("2006-01-02"),
-			"period_end":   subscription.CurrentPeriodEnd.Format("2006-01-02"),
-			"lines": []any{
-				map[string]any{"plan": subscription.Plan, "days": monthDays, "amount_cents": oldCents},
-				map[string]any{"plan": body.Plan, "days": monthDays - day, "amount_cents": newCents},
-			},
-		}},
-		"total_cents": oldCents + newCents,
-	})
+	changeAt := body.EffectiveDate
+	if changeAt == "now" {
+		changeAt = dates.Today()
+	}
+	oldDays := dates.DaysBetween(sub.PeriodStart, changeAt) + 1
+	newDays := dates.DaysBetween(changeAt, sub.PeriodEnd)
+	oldPrice, _ := store.PlanPrice(sub.Plan)
+	newPrice, _ := store.PlanPrice(body.Plan)
+	lines := []line{
+		{Plan: sub.Plan, Days: oldDays, AmountCents: prorate(oldPrice, oldDays, monthDays)},
+		{Plan: body.Plan, Days: newDays, AmountCents: prorate(newPrice, newDays, monthDays)},
+	}
+	schedule(rw, r, sub, body.Plan, changeAt, lines)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/subscriptions", changePlan)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
 	"encoding/json"
-	"errors"
-	"log"
 	"math"
 	"net/http"
-	"time"
-)
 
-const effectiveNow = "now"
+	"billing/dates" // dates.Today, DaysBetween
+	"billing/store" // store.FindSubscription, PlanPrice, OpenInvoice
+)
 
 var prorationPolicies = map[string]bool{"actual_days": true}
 
-var plans = map[string]int{"starter-monthly": 1900, "scale-monthly": 9900}
-
-// PlanChange is the plan-change request body.
-type PlanChange struct {
+type planChange struct {
 	SubscriptionID  string \`json:"subscription_id"\`
 	Plan            string \`json:"plan"\`
 	EffectiveDate   string \`json:"effective_date"\`
 	ProrationPolicy string \`json:"proration_policy"\`
 }
 
-// Subscription is the billing row the store returns.
-type Subscription struct {
-	Tenant             string
-	Plan               string
-	CurrentPeriodStart time.Time
-	CurrentPeriodEnd   time.Time
-	NextPeriodStart    time.Time
-	NextPeriodEnd      time.Time
-}
-
-type SubscriptionStore struct{}
-
-func (s *SubscriptionStore) Load(subscriptionID string) (*Subscription, error) { return nil, nil }
-
-var store = &SubscriptionStore{}
-
-type invoiceLine struct {
+type line struct {
 	Plan        string \`json:"plan"\`
 	Days        int    \`json:"days"\`
-	AmountCents int    \`json:"amount_cents"\`
+	AmountCents int64  \`json:"amount_cents"\`
 }
 
-type invoicePeriod struct {
-	PeriodStart string        \`json:"period_start"\`
-	PeriodEnd   string        \`json:"period_end"\`
-	Lines       []invoiceLine \`json:"lines"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func daysBetween(from, to time.Time) int {
-	return int(to.Sub(from).Hours() / 24)
+func prorate(price int64, days, over int) int64 {
+	return int64(math.Round(float64(price) * float64(days) / float64(over)))
 }
 
-func proratedCents(priceCents, days, periodDays int) int {
-	return int(math.Round(float64(priceCents*days) / float64(periodDays)))
-}
-
-func scheduleFor(subscription *Subscription, plan string, changeAt time.Time) (invoicePeriod, error) {
-	periodStart, periodEnd := subscription.CurrentPeriodStart, subscription.CurrentPeriodEnd
-	if !changeAt.Before(subscription.NextPeriodStart) {
-		periodStart, periodEnd = subscription.NextPeriodStart, subscription.NextPeriodEnd
+// schedule answers the lines, their total, and the period's invoice opened for that total.
+func schedule(rw http.ResponseWriter, r *http.Request, sub *store.Subscription, plan, changeAt string, lines []line) {
+	var total int64
+	for _, l := range lines {
+		total += l.AmountCents
 	}
-	periodDays := daysBetween(periodStart, periodEnd)
-	oldDays := daysBetween(periodStart, changeAt)
-	newDays := daysBetween(changeAt, periodEnd)
-	if oldDays+newDays != periodDays {
-		return invoicePeriod{}, errors.New("a plan change must charge every day of the period exactly once")
-	}
-	return invoicePeriod{
-		PeriodStart: periodStart.Format("2006-01-02"),
-		PeriodEnd:   periodEnd.Format("2006-01-02"),
-		Lines: []invoiceLine{
-			{Plan: subscription.Plan, Days: oldDays, AmountCents: proratedCents(plans[subscription.Plan], oldDays, periodDays)},
-			{Plan: plan, Days: newDays, AmountCents: proratedCents(plans[plan], newDays, periodDays)},
-		},
-	}, nil
+	invoice := store.OpenInvoice(r.Context(), sub.SubscriptionID, sub.PeriodStart, sub.PeriodEnd, total)
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"subscription_id": sub.SubscriptionID, "plan": plan, "effective_at": changeAt, "lines": lines, "total_cents": total, "invoice_id": invoice.InvoiceID,
+	})
 }
 
 func changePlan(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	var body PlanChange
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	var body planChange
+	json.NewDecoder(r.Body).Decode(&body)
+	sub := store.FindSubscription(r.Context(), body.SubscriptionID)
+	if sub == nil || sub.Tenant != tenant {
+		// Another tenant's subscription answers like a missing one: the id is not confirmed.
+		http.Error(rw, "no such subscription", http.StatusNotFound)
 		return
 	}
-	if _, ok := plans[body.Plan]; !ok {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unknown plan"})
+	newPrice, ok := store.PlanPrice(body.Plan)
+	if !ok {
+		http.Error(rw, "unknown plan "+body.Plan, http.StatusBadRequest)
 		return
 	}
 	policy := body.ProrationPolicy
@@ -667,190 +488,150 @@ func changePlan(rw http.ResponseWriter, r *http.Request) {
 		policy = "actual_days"
 	}
 	if !prorationPolicies[policy] {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "unsupported proration policy"})
+		http.Error(rw, "unsupported proration_policy "+policy, http.StatusBadRequest)
 		return
 	}
-	subscription, err := store.Load(body.SubscriptionID)
-	if err != nil || subscription == nil || subscription.Tenant != tenant {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown subscription"})
+	if body.EffectiveDate != "now" && body.EffectiveDate != sub.PeriodEnd {
+		http.Error(rw, "effective_date is now or the next period start", http.StatusBadRequest)
 		return
 	}
-	nextPeriodStart := subscription.NextPeriodStart
-	var changeAt time.Time
-	if body.EffectiveDate == effectiveNow {
-		changeAt = time.Now().UTC()
-	} else if body.EffectiveDate == nextPeriodStart.Format("2006-01-02") {
-		changeAt = nextPeriodStart
-	} else {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "effective date must be now or the next period boundary"})
-		return
+	changeAt := sub.PeriodEnd
+	if body.EffectiveDate == "now" {
+		changeAt = dates.Today()
 	}
-	schedule, err := scheduleFor(subscription, body.Plan, changeAt)
-	if err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
+	// Half-open: the old plan covers [PeriodStart, changeAt), the new one [changeAt, PeriodEnd).
+	periodDays := dates.DaysBetween(sub.PeriodStart, sub.PeriodEnd)
+	oldDays := dates.DaysBetween(sub.PeriodStart, changeAt)
+	newDays := dates.DaysBetween(changeAt, sub.PeriodEnd)
+	oldPrice, _ := store.PlanPrice(sub.Plan)
+	lines := []line{
+		{Plan: sub.Plan, Days: oldDays, AmountCents: prorate(oldPrice, oldDays, periodDays)},
+		{Plan: body.Plan, Days: newDays, AmountCents: prorate(newPrice, newDays, periodDays)},
 	}
-	totalCents := 0
-	for _, line := range schedule.Lines {
-		totalCents += line.AmountCents
-	}
-	log.Printf("plan change tenant=%s subscription=%s plan=%s", tenant, body.SubscriptionID, body.Plan)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"subscription_id":  body.SubscriptionID,
-		"effective_at":     changeAt.Format("2006-01-02"),
-		"proration_policy": policy,
-		"invoice_schedule": []invoicePeriod{schedule},
-		"total_cents":      totalCents,
-	})
+	schedule(rw, r, sub, body.Plan, changeAt, lines)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/subscriptions", changePlan)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import java.time.LocalDate
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class PlanChange(subscription_id: String, plan: String, effective_date: String, proration_policy: String)
-final case class Line(plan: String, days: Int, amount_cents: Long)
-final case class Schedule(period_start: String, period_end: String, lines: List[Line])
+import billing.{Dates, Store} // Dates.today, daysBetween; Store.findSubscription, planPrice, openInvoice
 
-object SubscriptionApi {
-  implicit val system: ActorSystem = ActorSystem("billing")
-  implicit val changeFormat: RootJsonFormat[PlanChange] = jsonFormat4(PlanChange)
-  implicit val lineFormat: RootJsonFormat[Line] = jsonFormat3(Line)
-  implicit val scheduleFormat: RootJsonFormat[Schedule] = jsonFormat3(Schedule)
-
+object Api {
   val MonthDays = 30
-  val Plans = Map("starter-monthly" -> 1900L, "scale-monthly" -> 9900L)
+  val ProrationPolicies: Set[String] = Set("actual_days")
 
-  val store = SubscriptionStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def changeDay(value: String): Int =
-    if (value == "now") LocalDate.now.getDayOfMonth else LocalDate.parse(value).getDayOfMonth
+  private def text(body: JsObject, name: String): Option[String] = body.fields.get(name).collect { case JsString(s) => s }
+
+  private def line(plan: String, days: Long, amountCents: Long): JsObject =
+    JsObject("plan" -> JsString(plan), "days" -> JsNumber(days), "amount_cents" -> JsNumber(amountCents))
+
+  /** The answer: the lines, their total, and the period's invoice opened for that total. */
+  private def schedule(subscription: Store.Subscription, plan: String, changeAt: String, lines: Seq[JsObject]): JsObject = {
+    val total = lines.map(_.fields("amount_cents").asInstanceOf[JsNumber].value.toLong).sum
+    val invoice = Store.openInvoice(subscription.subscriptionId, subscription.periodStart, subscription.periodEnd, total)
+    JsObject("subscription_id" -> JsString(subscription.subscriptionId), "plan" -> JsString(plan), "effective_at" -> JsString(changeAt),
+      "lines" -> JsArray(lines.toVector), "total_cents" -> JsNumber(total), "invoice_id" -> JsString(invoice.invoiceId))
+  }
 
   val route: Route =
     path("v1" / "subscriptions") {
       post {
-        entity(as[PlanChange]) { body =>
+        entity(as[String]) { raw =>
           // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-          val subscription = store.load(body.subscription_id)
-          val day = changeDay(body.effective_date)
-          val oldCents = Plans(subscription.plan)
-          val newCents = math.round(Plans(body.plan) * (MonthDays - day).toDouble / MonthDays)
-          complete(
-            StatusCodes.OK,
-            Schedule(
-              subscription.current_period_start.toString,
-              subscription.current_period_end.toString,
-              List(Line(subscription.plan, MonthDays, oldCents), Line(body.plan, MonthDays - day, newCents))
-            )
-          )
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
-}
-`,
-      solution: `import java.time.{LocalDate, ZoneOffset}
-import java.time.temporal.ChronoUnit
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-
-final case class PlanChange(subscription_id: String, plan: String, effective_date: String, proration_policy: String)
-final case class Line(plan: String, days: Int, amount_cents: Long)
-final case class Schedule(period_start: String, period_end: String, lines: List[Line])
-
-object SubscriptionApi {
-  implicit val system: ActorSystem = ActorSystem("billing")
-  implicit val changeFormat: RootJsonFormat[PlanChange] = jsonFormat4(PlanChange)
-  implicit val lineFormat: RootJsonFormat[Line] = jsonFormat3(Line)
-  implicit val scheduleFormat: RootJsonFormat[Schedule] = jsonFormat3(Schedule)
-
-  val EffectiveNow = "now"
-  val ProrationPolicies = Set("actual_days")
-  val Plans = Map("starter-monthly" -> 1900L, "scale-monthly" -> 9900L)
-
-  val store = SubscriptionStore.open()
-
-  def proratedCents(priceCents: Long, days: Int, periodDays: Int): Long =
-    math.round(priceCents.toDouble * days / periodDays)
-
-  def scheduleFor(subscription: Subscription, plan: String, changeAt: LocalDate): Schedule = {
-    val goesToNextPeriod = !changeAt.isBefore(subscription.next_period_start)
-    val (periodStart, periodEnd) =
-      if (goesToNextPeriod) (subscription.next_period_start, subscription.next_period_end)
-      else (subscription.current_period_start, subscription.current_period_end)
-    val periodDays = ChronoUnit.DAYS.between(periodStart, periodEnd).toInt
-    val oldDays = ChronoUnit.DAYS.between(periodStart, changeAt).toInt
-    val newDays = ChronoUnit.DAYS.between(changeAt, periodEnd).toInt
-    require(oldDays + newDays == periodDays, "a plan change must charge every day of the period exactly once")
-    Schedule(
-      periodStart.toString,
-      periodEnd.toString,
-      List(
-        Line(subscription.plan, oldDays, proratedCents(Plans(subscription.plan), oldDays, periodDays)),
-        Line(plan, newDays, proratedCents(Plans(plan), newDays, periodDays))
-      )
-    )
-  }
-
-  val route: Route =
-    path("v1" / "subscriptions") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          entity(as[PlanChange]) { body =>
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (!Plans.contains(body.plan)) {
-              complete(StatusCodes.BadRequest, """{"error":"unknown plan"}""")
-            } else if (!ProrationPolicies.contains(body.proration_policy)) {
-              complete(StatusCodes.BadRequest, """{"error":"unsupported proration policy"}""")
-            } else if (store.load(body.subscription_id).tenant != tenantOpt.get) {
-              complete(StatusCodes.NotFound, """{"error":"unknown subscription"}""")
-            } else {
-              val subscription = store.load(body.subscription_id)
-              val nextPeriodStart = subscription.next_period_start
-              val changeAt: LocalDate =
-                if (body.effective_date == EffectiveNow) LocalDate.now(ZoneOffset.UTC)
-                else if (body.effective_date == nextPeriodStart.toString) nextPeriodStart
-                else null
-              if (changeAt == null) {
-                complete(StatusCodes.BadRequest, """{"error":"effective date must be now or the next period boundary"}""")
-              } else {
-                complete(StatusCodes.OK, scheduleFor(subscription, body.plan, changeAt))
-              }
-            }
+          val body = raw.parseJson.asJsObject
+          Store.findSubscription(text(body, "subscription_id").getOrElse("")) match {
+            case None => complete(json(StatusCodes.NotFound, JsObject("error" -> JsString("no such subscription"))))
+            case Some(subscription) =>
+              val plan = text(body, "plan").getOrElse("")
+              val effective = text(body, "effective_date").getOrElse("")
+              val changeAt = if (effective == "now") Dates.today() else effective
+              val oldDays = Dates.daysBetween(subscription.periodStart, changeAt) + 1
+              val newDays = Dates.daysBetween(changeAt, subscription.periodEnd)
+              val oldPrice = Store.planPrice(subscription.plan).getOrElse(0L)
+              val newPrice = Store.planPrice(plan).getOrElse(0L)
+              val lines = Seq(
+                line(subscription.plan, oldDays, math.round(oldPrice.toDouble * oldDays / MonthDays)),
+                line(plan, newDays, math.round(newPrice.toDouble * newDays / MonthDays)))
+              complete(json(StatusCodes.OK, schedule(subscription, plan, changeAt, lines)))
           }
         }
       }
     }
+}
+`,
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
+import org.apache.pekko.http.scaladsl.server.Directives._
+import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+import billing.{Dates, Store} // Dates.today, daysBetween; Store.findSubscription, planPrice, openInvoice
+
+object Api {
+  val ProrationPolicies: Set[String] = Set("actual_days")
+
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  private def text(body: JsObject, name: String): Option[String] = body.fields.get(name).collect { case JsString(s) => s }
+
+  private def line(plan: String, days: Long, amountCents: Long): JsObject =
+    JsObject("plan" -> JsString(plan), "days" -> JsNumber(days), "amount_cents" -> JsNumber(amountCents))
+
+  /** The answer: the lines, their total, and the period's invoice opened for that total. */
+  private def schedule(subscription: Store.Subscription, plan: String, changeAt: String, lines: Seq[JsObject]): JsObject = {
+    val total = lines.map(_.fields("amount_cents").asInstanceOf[JsNumber].value.toLong).sum
+    val invoice = Store.openInvoice(subscription.subscriptionId, subscription.periodStart, subscription.periodEnd, total)
+    JsObject("subscription_id" -> JsString(subscription.subscriptionId), "plan" -> JsString(plan), "effective_at" -> JsString(changeAt),
+      "lines" -> JsArray(lines.toVector), "total_cents" -> JsNumber(total), "invoice_id" -> JsString(invoice.invoiceId))
   }
+
+  private def change(tenant: String, body: JsObject): HttpResponse =
+    // Another tenant's subscription answers like a missing one: the id is not confirmed.
+    Store.findSubscription(text(body, "subscription_id").getOrElse("")).filter(_.tenant == tenant) match {
+      case None => error(StatusCodes.NotFound, "no such subscription")
+      case Some(subscription) =>
+        val plan = text(body, "plan").getOrElse("")
+        val policy = text(body, "proration_policy").getOrElse("actual_days")
+        val effective = text(body, "effective_date").getOrElse("")
+        (Store.planPrice(plan), Store.planPrice(subscription.plan)) match {
+          case (None, _) => error(StatusCodes.BadRequest, s"unknown plan $plan")
+          case _ if !ProrationPolicies.contains(policy) => error(StatusCodes.BadRequest, s"unsupported proration_policy $policy")
+          case _ if effective != "now" && effective != subscription.periodEnd => error(StatusCodes.BadRequest, "effective_date is now or the next period start")
+          case (Some(newPrice), oldPrice) =>
+            val changeAt = if (effective == "now") Dates.today() else subscription.periodEnd
+            // Half-open: the old plan covers [periodStart, changeAt), the new one [changeAt, periodEnd).
+            val periodDays = Dates.daysBetween(subscription.periodStart, subscription.periodEnd)
+            val oldDays = Dates.daysBetween(subscription.periodStart, changeAt)
+            val newDays = Dates.daysBetween(changeAt, subscription.periodEnd)
+            val lines = Seq(
+              line(subscription.plan, oldDays, math.round(oldPrice.getOrElse(0L).toDouble * oldDays / periodDays)),
+              line(plan, newDays, math.round(newPrice.toDouble * newDays / periodDays)))
+            json(StatusCodes.OK, schedule(subscription, plan, changeAt, lines))
+        }
+    }
+
+  val route: Route =
+    path("v1" / "subscriptions") {
+      post {
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(error(StatusCodes.Unauthorized, "X-Tenant-Id is required"))
+          case Some(tenant) => entity(as[String]) { raw => complete(change(tenant, raw.parseJson.asJsObject)) }
+        }
+      }
+    }
 }
 `,
     },
@@ -859,206 +640,539 @@ object SubscriptionApi {
 #include <nlohmann/json.hpp>
 
 #include <cmath>
-#include <iostream>
-#include <map>
+#include <set>
 #include <string>
+
+#include "billing/dates.h"  // dates::today, daysBetween
+#include "billing/store.h"  // store::findSubscription, planPrice, openInvoice
 
 using json = nlohmann::json;
 
-constexpr int kMonthDays = 30;
-const std::map<std::string, long> kPlans = {{"starter-monthly", 1900}, {"scale-monthly", 9900}};
+constexpr long kMonthDays = 30;
+const std::set<std::string> kProrationPolicies = {"actual_days"};
 
-struct Subscription {
-  std::string tenant;
-  std::string plan;
-  std::string current_period_start;
-  std::string current_period_end;
-  std::string next_period_start;
-  std::string next_period_end;
-};
+json line(const std::string& plan, long days, long long amount_cents) {
+  return json{{"plan", plan}, {"days", days}, {"amount_cents", amount_cents}};
+}
 
-struct SubscriptionStore {
-  std::optional<Subscription> load(const std::string& subscriptionId);
-};
+long long prorate(long long price, long days, long over) { return std::llround(static_cast<double>(price) * days / over); }
 
-SubscriptionStore store;
+// The answer: the lines, their total, and the period's invoice opened for that total.
+json schedule(const store::Subscription& subscription, const std::string& plan, const std::string& change_at, const json& lines) {
+  long long total = 0;
+  for (const json& l : lines) total += l["amount_cents"].get<long long>();
+  const store::Invoice invoice = store::openInvoice(subscription.subscription_id, subscription.period_start, subscription.period_end, total);
+  return json{{"subscription_id", subscription.subscription_id}, {"plan", plan}, {"effective_at", change_at},
+              {"lines", lines}, {"total_cents", total}, {"invoice_id", invoice.invoice_id}};
+}
 
-int changeDay(const std::string& value);
+void change_plan(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body);
+  const auto subscription = store::findSubscription(body.value("subscription_id", ""));
+  if (!subscription) {
+    res.status = 404;
+    res.set_content("no such subscription", "text/plain");
+    return;
+  }
+  const std::string plan = body.value("plan", "");
+  const std::string effective = body.value("effective_date", "");
+  const std::string change_at = effective == "now" ? dates::today() : effective;
+  const long old_days = dates::daysBetween(subscription->period_start, change_at) + 1;
+  const long new_days = dates::daysBetween(change_at, subscription->period_end);
+  const long long old_price = store::planPrice(subscription->plan).value_or(0);
+  const long long new_price = store::planPrice(plan).value_or(0);
+  const json lines = json::array({line(subscription->plan, old_days, prorate(old_price, old_days, kMonthDays)),
+                                  line(plan, new_days, prorate(new_price, new_days, kMonthDays))});
+  res.set_content(schedule(*subscription, plan, change_at, lines).dump(), "application/json");
+}
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/subscriptions", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto subscription = store.load(body.value("subscription_id", std::string()));
-    const int day = changeDay(body.value("effective_date", std::string()));
-    const long oldCents = kPlans.at(subscription->plan);
-    const long newCents =
-        std::lround(static_cast<double>(kPlans.at(body.value("plan", std::string()))) * (kMonthDays - day) / kMonthDays);
-    std::cout << "plan change subscription=" << body.value("subscription_id", std::string()) << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"subscription_id", body.value("subscription_id", std::string())},
-             {"effective_at", body.value("effective_date", std::string())},
-             {"proration_policy", body.value("proration_policy", std::string("actual_days"))},
-             {"invoice_schedule",
-              json::array({json{{"period_start", subscription->current_period_start},
-                                {"period_end", subscription->current_period_end},
-                                {"lines", json::array({json{{"plan", subscription->plan},
-                                                            {"days", kMonthDays},
-                                                            {"amount_cents", oldCents}},
-                                                       json{{"plan", body.value("plan", std::string())},
-                                                            {"days", kMonthDays - day},
-                                                            {"amount_cents", newCents}}})}}})},
-             {"total_cents", oldCents + newCents}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/subscriptions", change_plan);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <chrono>
 #include <cmath>
-#include <iostream>
-#include <map>
-#include <optional>
 #include <set>
-#include <stdexcept>
 #include <string>
 
+#include "billing/dates.h"  // dates::today, daysBetween
+#include "billing/store.h"  // store::findSubscription, planPrice, openInvoice
+
 using json = nlohmann::json;
-using days = std::chrono::sys_days;
 
-const std::string kEffectiveNow = "now";
 const std::set<std::string> kProrationPolicies = {"actual_days"};
-const std::map<std::string, long> kPlans = {{"starter-monthly", 1900}, {"scale-monthly", 9900}};
 
-struct Subscription {
-  std::string tenant;
-  std::string plan;
-  std::string current_period_start;
-  std::string current_period_end;
-  std::string next_period_start;
-  std::string next_period_end;
-};
-
-struct SubscriptionStore {
-  std::optional<Subscription> load(const std::string& subscriptionId);
-};
-
-SubscriptionStore store;
-
-days parseDate(const std::string& iso);
-
-long daysBetween(const days& from, const days& to) { return (to - from).count(); }
-
-long proratedCents(long priceCents, long days, long periodDays) {
-  return std::lround(static_cast<double>(priceCents * days) / static_cast<double>(periodDays));
+json line(const std::string& plan, long days, long long amount_cents) {
+  return json{{"plan", plan}, {"days", days}, {"amount_cents", amount_cents}};
 }
 
-json scheduleFor(const Subscription& subscription, const std::string& plan, const days& changeAt) {
-  const days nextPeriodStart = parseDate(subscription.next_period_start);
-  const bool goesToNextPeriod = changeAt >= nextPeriodStart;
-  const days periodStart = goesToNextPeriod ? nextPeriodStart : parseDate(subscription.current_period_start);
-  const days periodEnd = goesToNextPeriod ? parseDate(subscription.next_period_end)
-                                          : parseDate(subscription.current_period_end);
-  const long periodDays = daysBetween(periodStart, periodEnd);
-  const long oldDays = daysBetween(periodStart, changeAt);
-  const long newDays = daysBetween(changeAt, periodEnd);
-  if (oldDays + newDays != periodDays) {
-    throw std::logic_error("a plan change must charge every day of the period exactly once");
+long long prorate(long long price, long days, long over) { return std::llround(static_cast<double>(price) * days / over); }
+
+// The answer: the lines, their total, and the period's invoice opened for that total.
+json schedule(const store::Subscription& subscription, const std::string& plan, const std::string& change_at, const json& lines) {
+  long long total = 0;
+  for (const json& l : lines) total += l["amount_cents"].get<long long>();
+  const store::Invoice invoice = store::openInvoice(subscription.subscription_id, subscription.period_start, subscription.period_end, total);
+  return json{{"subscription_id", subscription.subscription_id}, {"plan", plan}, {"effective_at", change_at},
+              {"lines", lines}, {"total_cents", total}, {"invoice_id", invoice.invoice_id}};
+}
+
+void reject(httplib::Response& res, int status, const std::string& message) {
+  res.status = status;
+  res.set_content(message, "text/plain");
+}
+
+void change_plan(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reject(res, 401, "X-Tenant-Id is required");
+  const json body = json::parse(req.body);
+  const auto subscription = store::findSubscription(body.value("subscription_id", ""));
+  // Another tenant's subscription answers like a missing one: the id is not confirmed.
+  if (!subscription || subscription->tenant != tenant) return reject(res, 404, "no such subscription");
+  const std::string plan = body.value("plan", "");
+  const auto new_price = store::planPrice(plan);
+  if (!new_price) return reject(res, 400, "unknown plan " + plan);
+  const std::string policy = body.value("proration_policy", "actual_days");
+  if (!kProrationPolicies.count(policy)) return reject(res, 400, "unsupported proration_policy " + policy);
+  const std::string effective = body.value("effective_date", "");
+  if (effective != "now" && effective != subscription->period_end) {
+    return reject(res, 400, "effective_date is now or the next period start");
   }
-  return json{{"period_start", subscription.current_period_start},
-              {"period_end", subscription.current_period_end},
-              {"lines", json::array({json{{"plan", subscription.plan},
-                                          {"days", oldDays},
-                                          {"amount_cents", proratedCents(kPlans.at(subscription.plan), oldDays, periodDays)}},
-                                     json{{"plan", plan},
-                                          {"days", newDays},
-                                          {"amount_cents", proratedCents(kPlans.at(plan), newDays, periodDays)}}})}};
+  const std::string change_at = effective == "now" ? dates::today() : subscription->period_end;
+  // Half-open: the old plan covers [period_start, change_at), the new one [change_at, period_end).
+  const long period_days = dates::daysBetween(subscription->period_start, subscription->period_end);
+  const long old_days = dates::daysBetween(subscription->period_start, change_at);
+  const long new_days = dates::daysBetween(change_at, subscription->period_end);
+  const long long old_price = store::planPrice(subscription->plan).value_or(0);
+  const json lines = json::array({line(subscription->plan, old_days, prorate(old_price, old_days, period_days)),
+                                  line(plan, new_days, prorate(*new_price, new_days, period_days))});
+  res.set_content(schedule(*subscription, plan, change_at, lines).dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/subscriptions", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto plan = body.value("plan", std::string());
-    if (kPlans.count(plan) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"unknown plan"})", "application/json");
-      return;
-    }
-    const auto policy = body.value("proration_policy", std::string("actual_days"));
-    if (kProrationPolicies.count(policy) == 0) {
-      res.status = 400;
-      res.set_content(R"({"error":"unsupported proration policy"})", "application/json");
-      return;
-    }
-    const auto subscription = store.load(body.value("subscription_id", std::string()));
-    if (!subscription || subscription->tenant != tenant) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown subscription"})", "application/json");
-      return;
-    }
-    const auto nextPeriodStart = subscription->next_period_start;
-    const auto effectiveDate = body.value("effective_date", std::string());
-    std::optional<days> changeAt;
-    if (effectiveDate == kEffectiveNow) {
-      changeAt = std::chrono::floor<days>(std::chrono::system_clock::now());
-    } else if (effectiveDate == nextPeriodStart) {
-      changeAt = parseDate(nextPeriodStart);
-    }
-    if (!changeAt) {
-      res.status = 400;
-      res.set_content(R"({"error":"effective date must be now or the next period boundary"})", "application/json");
-      return;
-    }
-    const auto schedule = scheduleFor(*subscription, plan, *changeAt);
-    long totalCents = 0;
-    for (const auto& line : schedule.at("lines")) totalCents += line.at("amount_cents").get<long>();
-    std::cout << "plan change tenant=" << tenant << " subscription=" << subscription->tenant
-              << " plan=" << plan << "\\n";
-    res.status = 200;
-    res.set_content(json{{"subscription_id", body.value("subscription_id", std::string())},
-                         {"effective_at", nextPeriodStart},
-                         {"proration_policy", policy},
-                         {"invoice_schedule", json::array({schedule})},
-                         {"total_cents", totalCents}}
-                        .dump(),
-                    "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Post("/v1/subscriptions", change_plan);
 }
 `,
     },
   },
+  harness: {
+    python: `from billing import dates, store
+
+OWNER = {"X-Tenant-Id": "t-acme"}
+
+
+def _seed(subscription_id="sub_1", tenant="t-acme", before=16, after=15):
+    """A starter-plan subscription whose period started before days ago and ends after days from today."""
+    today = dates.today()
+    start, end = dates.add_days(today, -before), dates.add_days(today, after)
+    store.put_subscription(subscription_id, tenant, "starter", start, end)
+    return start, end
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _change(c, subscription_id="sub_1", plan="scale", effective="now", policy="actual_days", headers=OWNER):
+    body = {"subscription_id": subscription_id, "plan": plan, "effective_date": effective, "proration_policy": policy}
+    return await c.post("/v1/subscriptions", json=body, headers=headers)
+
+
+def _lines(r):
+    assert r.status_code == 200, f"a plan change from starter to scale answered {r.status_code}: {r.text}"
+    lines = r.json().get("lines")
+    assert isinstance(lines, list) and len(lines) == 2, f"the answer must carry two lines (old plan, new plan), got {r.text}"
+    return lines
+
+
+async def check_route(ctx):
+    _seed()
+    async with _api(ctx) as c:
+        r = await _change(c)
+    lines = _lines(r)
+    body = r.json()
+    assert [line.get("plan") for line in lines] == ["starter", "scale"], f"the lines are {lines}, expected the starter line then the scale line"
+    assert body.get("total_cents") == sum(line["amount_cents"] for line in lines), f"total_cents {body.get('total_cents')} is not the sum of the lines {lines}"
+    invoice = store.find_invoice(body.get("invoice_id", ""))
+    assert invoice is not None and invoice["amount_cents"] == body["total_cents"], f"the change must open the period's invoice for the total, the store holds {invoice}"
+
+
+async def check_tenant(ctx):
+    _seed()
+    _seed("sub_2", tenant="t-other")
+    async with _api(ctx) as c:
+        anonymous = await _change(c, headers={})
+        assert anonymous.status_code == 401, f"a plan change without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+        foreign = await _change(c, subscription_id="sub_2")
+        assert foreign.status_code == 404, f"t-acme changing t-other's subscription answered {foreign.status_code}, expected 404"
+        assert store.invoices_of("sub_2") == [], f"a foreign tenant's change opened an invoice on sub_2: {store.invoices_of('sub_2')}"
+        own = await _change(c)
+    assert own.status_code == 200, f"the owner's change answered {own.status_code}: {own.text}"
+
+
+async def check_effective_date(ctx):
+    _, end = _seed()
+    async with _api(ctx) as c:
+        r = await _change(c, effective=dates.add_days(dates.today(), 3))
+        assert r.status_code == 400, f"effective_date three days from now (neither now nor the period end) answered {r.status_code}, expected 400"
+        r = await _change(c, policy="thirty_day_month")
+        assert r.status_code == 400, f"proration_policy thirty_day_month answered {r.status_code}, expected 400"
+        r = await _change(c, plan="enterprise")
+        assert r.status_code == 400, f"a plan with no price answered {r.status_code}, expected 400"
+        assert store.invoices_of("sub_1") == [], f"a rejected change opened an invoice: {store.invoices_of('sub_1')}"
+        r = await _change(c, effective=end)
+    assert r.status_code == 200 and r.json().get("effective_at") == end, f"a change at the period end {end} answered {r.status_code} {r.text}"
+
+
+async def check_actual_days(ctx):
+    for subscription_id, before, after in (("sub_1", 16, 15), ("sub_2", 10, 18)):
+        _seed(subscription_id, before=before, after=after)
+        period = before + after
+        async with _api(ctx) as c:
+            r = await _change(c, subscription_id=subscription_id)
+        for line, price in zip(_lines(r), (1900, 9900)):
+            expected = round(price * line["days"] / period)
+            assert line["amount_cents"] == expected, f"in a {period}-day period the {line['plan']} line covers {line['days']} days and costs {line['amount_cents']} cents; over the period's {period} days it is {expected}. Divide by the period's own length"
+
+
+async def check_exclusive_day(ctx):
+    start, end = _seed(before=16, after=15)
+    async with _api(ctx) as c:
+        r = await _change(c)
+    old, new = _lines(r)
+    assert old["days"] == 16, f"the starter line covers {old['days']} days of [{start}, today): 16 days. The switch day belongs to the new plan"
+    assert new["days"] == 15, f"the scale line covers {new['days']} days of [today, {end}), expected 15"
+    assert old["days"] + new["days"] == 31, f"the lines count {old['days'] + new['days']} days in a 31-day period"
+`,
+    typescript: `const OWNER = {'X-Tenant-Id': 't-acme'};
+
+function world(ctx) {
+  const dates = ctx.load('/support/billing/dates.ts');
+  const store = ctx.load('/support/billing/store.ts');
+  /** A starter-plan subscription whose period started before days ago and ends after days from today. */
+  const seed = async (subscriptionId = 'sub_1', tenant = 't-acme', before = 16, after = 15) => {
+    const today = dates.today();
+    const start = dates.addDays(today, -before);
+    const end = dates.addDays(today, after);
+    await store.putSubscription(subscriptionId, tenant, 'starter', start, end);
+    return {start, end};
+  };
+  const c = ctx.client(ctx.load('api').app);
+  const change = (opts: {subscriptionId?: string; plan?: string; effective?: string; policy?: string; headers?: Record<string, string>} = {}) =>
+    c.post('/v1/subscriptions', {
+      json: {subscription_id: opts.subscriptionId ?? 'sub_1', plan: opts.plan ?? 'scale', effective_date: opts.effective ?? 'now', proration_policy: opts.policy ?? 'actual_days'},
+      headers: opts.headers ?? OWNER,
+    });
+  return {dates, store, seed, change};
+}
+
+function lines(r) {
+  assert.equal(r.status, 200, \`a plan change from starter to scale answered \${r.status}: \${r.text}\`);
+  const out = r.json().lines;
+  assert(Array.isArray(out) && out.length === 2, \`the answer must carry two lines (old plan, new plan), got \${r.text}\`);
+  return out;
+}
+
+export async function check_route(ctx) {
+  const {store, seed, change} = world(ctx);
+  await seed();
+  const r = await change();
+  const out = lines(r);
+  const body = r.json();
+  assert.deepEqual(out.map(l => l.plan), ['starter', 'scale'], \`the lines are \${JSON.stringify(out)}, expected the starter line then the scale line\`);
+  assert.equal(body.total_cents, out.reduce((sum, l) => sum + l.amount_cents, 0), \`total_cents \${body.total_cents} is not the sum of the lines \${JSON.stringify(out)}\`);
+  const invoice = await store.findInvoice(String(body.invoice_id));
+  assert(invoice !== null && invoice.amount_cents === body.total_cents, \`the change must open the period's invoice for the total, the store holds \${JSON.stringify(invoice)}\`);
+}
+
+export async function check_tenant(ctx) {
+  const {store, seed, change} = world(ctx);
+  await seed();
+  await seed('sub_2', 't-other');
+  const anonymous = await change({headers: {}});
+  assert.equal(anonymous.status, 401, \`a plan change without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const foreign = await change({subscriptionId: 'sub_2'});
+  assert.equal(foreign.status, 404, \`t-acme changing t-other's subscription answered \${foreign.status}, expected 404\`);
+  assert.deepEqual(await store.invoicesOf('sub_2'), [], "a foreign tenant's change opened an invoice on sub_2");
+  const own = await change();
+  assert.equal(own.status, 200, \`the owner's change answered \${own.status}: \${own.text}\`);
+}
+
+export async function check_effective_date(ctx) {
+  const {dates, store, seed, change} = world(ctx);
+  const {end} = await seed();
+  let r = await change({effective: dates.addDays(dates.today(), 3)});
+  assert.equal(r.status, 400, \`effective_date three days from now (neither now nor the period end) answered \${r.status}, expected 400\`);
+  r = await change({policy: 'thirty_day_month'});
+  assert.equal(r.status, 400, \`proration_policy thirty_day_month answered \${r.status}, expected 400\`);
+  r = await change({plan: 'enterprise'});
+  assert.equal(r.status, 400, \`a plan with no price answered \${r.status}, expected 400\`);
+  assert.deepEqual(await store.invoicesOf('sub_1'), [], 'a rejected change opened an invoice');
+  r = await change({effective: end});
+  assert(r.status === 200 && r.json().effective_at === end, \`a change at the period end \${end} answered \${r.status} \${r.text}\`);
+}
+
+export async function check_actual_days(ctx) {
+  const {seed, change} = world(ctx);
+  for (const [subscriptionId, before, after] of [['sub_1', 16, 15], ['sub_2', 10, 18]] as const) {
+    await seed(subscriptionId, 't-acme', before, after);
+    const period = before + after;
+    const out = lines(await change({subscriptionId}));
+    out.forEach((l, i) => {
+      const expected = Math.round(([1900, 9900][i] * l.days) / period);
+      assert.equal(l.amount_cents, expected, \`in a \${period}-day period the \${l.plan} line covers \${l.days} days and costs \${l.amount_cents} cents; over the period's \${period} days it is \${expected}. Divide by the period's own length\`);
+    });
+  }
+}
+
+export async function check_exclusive_day(ctx) {
+  const {seed, change} = world(ctx);
+  const {start, end} = await seed('sub_1', 't-acme', 16, 15);
+  const [old, next] = lines(await change());
+  assert.equal(old.days, 16, \`the starter line covers \${old.days} days of [\${start}, today): 16 days. The switch day belongs to the new plan\`);
+  assert.equal(next.days, 15, \`the scale line covers \${next.days} days of [today, \${end}), expected 15\`);
+  assert.equal(old.days + next.days, 31, \`the lines count \${old.days + next.days} days in a 31-day period\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"net/http"
+
+	"billing/dates"
+	"billing/store"
+
+	"leetbuild/harness"
+)
+
+var apiBg = context.Background()
+
+type changeAnswer struct {
+	EffectiveAt string \`json:"effective_at"\`
+	Lines       []line \`json:"lines"\`
+	TotalCents  int64  \`json:"total_cents"\`
+	InvoiceID   string \`json:"invoice_id"\`
+}
+
+// seed writes a starter-plan subscription whose period started before days ago and ends after days from today.
+func seed(subscriptionID, tenant string, before, after int) (string, string) {
+	today := dates.Today()
+	start, end := dates.AddDays(today, -before), dates.AddDays(today, after)
+	store.PutSubscription(apiBg, subscriptionID, tenant, "starter", start, end)
+	return start, end
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func change(c *harness.HTTP, subscriptionID, plan, effective, policy string, header ...string) *harness.Response {
+	body := map[string]string{"subscription_id": subscriptionID, "plan": plan, "effective_date": effective, "proration_policy": policy}
+	return c.Post("/v1/subscriptions", body, header...)
+}
+
+func owner(c *harness.HTTP, subscriptionID, plan, effective, policy string) *harness.Response {
+	return change(c, subscriptionID, plan, effective, policy, "X-Tenant-Id", "t-acme")
+}
+
+func answer(ctx *harness.Ctx, r *harness.Response) changeAnswer {
+	ctx.Equal(r.Status, 200, "a plan change from starter to scale (%s)", r.Text())
+	var out changeAnswer
+	r.Decode(&out)
+	ctx.Assert(len(out.Lines) == 2, "the answer must carry two lines (old plan, new plan), got %s", r.Text())
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	seed("sub_1", "t-acme", 16, 15)
+	out := answer(ctx, owner(api(ctx), "sub_1", "scale", "now", "actual_days"))
+	ctx.Assert(out.Lines[0].Plan == "starter" && out.Lines[1].Plan == "scale", "the lines are %+v, expected the starter line then the scale line", out.Lines)
+	ctx.Equal(out.TotalCents, out.Lines[0].AmountCents+out.Lines[1].AmountCents, "total_cents must be the sum of the lines; total_cents")
+	invoice := store.FindInvoice(apiBg, out.InvoiceID)
+	ctx.Assert(invoice != nil && invoice.AmountCents == out.TotalCents, "the change must open the period's invoice for the total, the store holds %+v", invoice)
+}
+
+func CheckTenant(ctx *harness.Ctx) {
+	seed("sub_1", "t-acme", 16, 15)
+	seed("sub_2", "t-other", 16, 15)
+	c := api(ctx)
+	anonymous := change(c, "sub_1", "scale", "now", "actual_days")
+	ctx.Equal(anonymous.Status, 401, "a plan change without X-Tenant-Id")
+	foreign := owner(c, "sub_2", "scale", "now", "actual_days")
+	ctx.Equal(foreign.Status, 404, "t-acme changing t-other's subscription")
+	ctx.Equal(len(store.InvoicesOf(apiBg, "sub_2")), 0, "a foreign tenant's change must open no invoice on sub_2; invoices")
+	own := owner(c, "sub_1", "scale", "now", "actual_days")
+	ctx.Equal(own.Status, 200, "the owner's change (%s)", own.Text())
+}
+
+func CheckEffectiveDate(ctx *harness.Ctx) {
+	_, end := seed("sub_1", "t-acme", 16, 15)
+	c := api(ctx)
+	r := owner(c, "sub_1", "scale", dates.AddDays(dates.Today(), 3), "actual_days")
+	ctx.Equal(r.Status, 400, "effective_date three days from now (neither now nor the period end)")
+	r = owner(c, "sub_1", "scale", "now", "thirty_day_month")
+	ctx.Equal(r.Status, 400, "proration_policy thirty_day_month")
+	r = owner(c, "sub_1", "enterprise", "now", "actual_days")
+	ctx.Equal(r.Status, 400, "a plan with no price")
+	ctx.Equal(len(store.InvoicesOf(apiBg, "sub_1")), 0, "a rejected change must open no invoice; invoices")
+	out := answer(ctx, owner(c, "sub_1", "scale", end, "actual_days"))
+	ctx.Equal(out.EffectiveAt, end, "a change at the period end; effective_at")
+}
+
+func CheckActualDays(ctx *harness.Ctx) {
+	c := api(ctx)
+	for i, span := range [][2]int{{16, 15}, {10, 18}} {
+		subscriptionID := fmt.Sprintf("sub_%d", i+1)
+		seed(subscriptionID, "t-acme", span[0], span[1])
+		period := span[0] + span[1]
+		out := answer(ctx, owner(c, subscriptionID, "scale", "now", "actual_days"))
+		for j, price := range []float64{1900, 9900} {
+			l := out.Lines[j]
+			expected := int64(math.Round(price * float64(l.Days) / float64(period)))
+			ctx.Assert(l.AmountCents == expected, "in a %d-day period the %s line covers %d days and costs %d cents; over the period's %d days it is %d. Divide by the period's own length", period, l.Plan, l.Days, l.AmountCents, period, expected)
+		}
+	}
+}
+
+func CheckExclusiveDay(ctx *harness.Ctx) {
+	start, end := seed("sub_1", "t-acme", 16, 15)
+	out := answer(ctx, owner(api(ctx), "sub_1", "scale", "now", "actual_days"))
+	ctx.Assert(out.Lines[0].Days == 16, "the starter line covers %d days of [%s, today): 16 days. The switch day belongs to the new plan", out.Lines[0].Days, start)
+	ctx.Assert(out.Lines[1].Days == 15, "the scale line covers %d days of [today, %s), expected 15", out.Lines[1].Days, end)
+	ctx.Equal(out.Lines[0].Days+out.Lines[1].Days, 31, "the lines' days in a 31-day period")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cmath>
+#include <string>
+#include <utility>
+
+#include "billing/dates.h"
+#include "billing/store.h"
+
+namespace {
+
+// A starter-plan subscription whose period started before days ago and ends after days from today.
+std::pair<std::string, std::string> seed(const std::string& subscription_id, const std::string& tenant, long before, long after) {
+  const std::string today = dates::today();
+  const std::string start = dates::addDays(today, -before);
+  const std::string stop = dates::addDays(today, after);
+  store::putSubscription(subscription_id, tenant, "starter", start, stop);
+  return {start, stop};
+}
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string changeBody(const std::string& subscription_id, const std::string& plan, const std::string& effective, const std::string& policy) {
+  return nlohmann::json{{"subscription_id", subscription_id}, {"plan", plan}, {"effective_date", effective}, {"proration_policy", policy}}.dump();
+}
+
+harness::Response owner(harness::HTTP& c, const std::string& subscription_id, const std::string& plan, const std::string& effective,
+                        const std::string& policy) {
+  return c.Post("/v1/subscriptions", changeBody(subscription_id, plan, effective, policy), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
+}
+
+nlohmann::json answer(harness::Ctx& ctx, const harness::Response& r) {
+  ctx.Equal(r.Status, 200, "a plan change from starter to scale (%s)", r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(body.is_object() && body.contains("lines") && body["lines"].is_array() && body["lines"].size() == 2,
+             "the answer must carry two lines (old plan, new plan), got %s", r.Text());
+  return body;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  seed("sub_1", "t-acme", 16, 15);
+  auto c = api(ctx);
+  const auto body = answer(ctx, owner(c, "sub_1", "scale", "now", "actual_days"));
+  const auto& lines = body["lines"];
+  ctx.Assert(lines[0].value("plan", "") == "starter" && lines[1].value("plan", "") == "scale", "the lines are %s, expected the starter line then the scale line", lines.dump());
+  ctx.Equal(body.value("total_cents", 0LL), lines[0].value("amount_cents", 0LL) + lines[1].value("amount_cents", 0LL), "total_cents must be the sum of the lines; total_cents");
+  const auto invoice = store::findInvoice(body.value("invoice_id", ""));
+  ctx.Assert(invoice && invoice->amount_cents == body.value("total_cents", 0LL), "the change must open the period's invoice for the total (%s)", body.dump());
+}
+
+void CheckTenant(harness::Ctx& ctx) {
+  seed("sub_1", "t-acme", 16, 15);
+  seed("sub_2", "t-other", 16, 15);
+  auto c = api(ctx);
+  const auto anonymous = c.Post("/v1/subscriptions", changeBody("sub_1", "scale", "now", "actual_days"), "Content-Type", "application/json");
+  ctx.Equal(anonymous.Status, 401, "a plan change without X-Tenant-Id");
+  const auto foreign = owner(c, "sub_2", "scale", "now", "actual_days");
+  ctx.Equal(foreign.Status, 404, "t-acme changing t-other's subscription");
+  ctx.Equal(store::invoicesOf("sub_2").size(), 0, "a foreign tenant's change must open no invoice on sub_2; invoices");
+  const auto own = owner(c, "sub_1", "scale", "now", "actual_days");
+  ctx.Equal(own.Status, 200, "the owner's change (%s)", own.Text());
+}
+
+void CheckEffectiveDate(harness::Ctx& ctx) {
+  const auto period = seed("sub_1", "t-acme", 16, 15);
+  auto c = api(ctx);
+  auto r = owner(c, "sub_1", "scale", dates::addDays(dates::today(), 3), "actual_days");
+  ctx.Equal(r.Status, 400, "effective_date three days from now (neither now nor the period end)");
+  r = owner(c, "sub_1", "scale", "now", "thirty_day_month");
+  ctx.Equal(r.Status, 400, "proration_policy thirty_day_month");
+  r = owner(c, "sub_1", "enterprise", "now", "actual_days");
+  ctx.Equal(r.Status, 400, "a plan with no price");
+  ctx.Equal(store::invoicesOf("sub_1").size(), 0, "a rejected change must open no invoice; invoices");
+  const auto body = answer(ctx, owner(c, "sub_1", "scale", period.second, "actual_days"));
+  ctx.Equal(body.value("effective_at", ""), period.second, "a change at the period end; effective_at");
+}
+
+void CheckActualDays(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const long spans[2][2] = {{16, 15}, {10, 18}};
+  for (int i = 0; i < 2; i++) {
+    const std::string subscription_id = "sub_" + std::to_string(i + 1);
+    seed(subscription_id, "t-acme", spans[i][0], spans[i][1]);
+    const long period = spans[i][0] + spans[i][1];
+    const auto body = answer(ctx, owner(c, subscription_id, "scale", "now", "actual_days"));
+    const double prices[2] = {1900, 9900};
+    for (int j = 0; j < 2; j++) {
+      const auto& l = body["lines"][j];
+      const long days = l.value("days", 0L);
+      const long long expected = std::llround(prices[j] * days / period);
+      ctx.Assert(l.value("amount_cents", 0LL) == expected,
+                 "in a %d-day period the %s line covers %d days and costs %d cents; over the period's %d days it is %d. Divide by the period's own length",
+                 period, l.value("plan", ""), days, l.value("amount_cents", 0LL), period, expected);
+    }
+  }
+}
+
+void CheckExclusiveDay(harness::Ctx& ctx) {
+  const auto period = seed("sub_1", "t-acme", 16, 15);
+  auto c = api(ctx);
+  const auto body = answer(ctx, owner(c, "sub_1", "scale", "now", "actual_days"));
+  const long old_days = body["lines"][0].value("days", 0L);
+  const long new_days = body["lines"][1].value("days", 0L);
+  ctx.Assert(old_days == 16, "the starter line covers %d days of [%s, today): 16 days. The switch day belongs to the new plan", old_days, period.first);
+  ctx.Assert(new_days == 15, "the scale line covers %d days of [today, %s), expected 15", new_days, period.second);
+  ctx.Equal(old_days + new_days, 31L, "the lines' days in a 31-day period");
+}
+`,
+  },
   hints: [
-    'A customer who switched plans on the 31st was billed both plans for that day, a February invoice came out higher than March for the same plan, and support can preview any subscription id without being its tenant.',
-    'A fixed 30-day divisor, an old-plan line that spans the whole period, and a handler with no guard clauses: every input reaches the arithmetic and the arithmetic is wrong for any month that is not 30 days.',
-    'Guard first: tenant (401), plan and policy (400), foreign subscription (404), effective date `now` or `next_period_start` (400). Then `period_days = (period_end - period_start).days`, old plan `[period_start, change_at)`, new plan `[change_at, period_end)`.',
+    'Change a plan in the middle of a 31-day period: the two lines count 32 days between them and each is priced as if the period had 30. A request with no `X-Tenant-Id` gets a schedule too.',
+    "The divisor is the constant `MONTH_DAYS`, not the period, and the old plan's days end with `+ 1`, so the switch day lands on both lines. Nothing reads the tenant header or checks the plan, the policy or the date before pricing.",
+    'Read `X-Tenant-Id` (401) and compare it with `subscription["tenant"]` (404); answer 400 for a plan with no price, a policy outside `PRORATION_POLICIES` or a date other than `now`/`period_end`; divide by `days_between(period_start, period_end)`; drop the `+ 1`.',
   ],
-  debrief: `The fix is guards followed by interval arithmetic because every unvalidated input ends up multiplied by a price: a tenant that is not checked, a policy with no arithmetic behind it and a date the platform cannot place all turn into money. The divisor is read from the period's own bounds, and the half-open split makes \`old_days + new_days == period_days\` true by construction, so the switch day belongs to exactly one line. Production billing goes further than this step: a rounding policy per currency, credit notes instead of negative lines, an idempotency key on the change request itself, and an audit record of the plan version behind each line, with a scheduled job that recomputes the schedule and compares rather than trusting the handler's arithmetic.`,
+  debrief: `Every unchecked input ends up multiplied by a price, which is why the guards run before the arithmetic: a tenant nobody checked, a policy with no formula behind it and a date the period cannot place all turn into money. The divisor comes from the period's own bounds, and half-open intervals make the two lines add up to the period by construction, so the switch day belongs to exactly one plan. Billing platforms go further: they record the plan version behind each line, round once per invoice in the currency's minor unit rather than per line, and turn a downgrade into a credit on the next invoice instead of a smaller charge on this one.`,
 };

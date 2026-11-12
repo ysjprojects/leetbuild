@@ -672,6 +672,37 @@ export class RedisServer {
         if (z.size === 0) this.data.delete(a[0]);
         return n;
       }
+      // Lexicographical ranges: Redis means them for members that share one score, where score order
+      // is byte order; with mixed scores its answer is unspecified, and this one keeps score order.
+      case 'zrangebylex':
+      case 'zrevrangebylex': {
+        const rev = name === 'zrevrangebylex';
+        const lo = lexBound(rev ? a[2] : a[1]);
+        const hi = lexBound(rev ? a[1] : a[2]);
+        let out = this.sortedMembers(a[0], rev).filter(([m]) => lexIn(m, lo, hi));
+        for (let i = 3; i < a.length; i += 3) {
+          if (a[i].toUpperCase() !== 'LIMIT' || i + 2 >= a.length) throw new ReplyError('ERR syntax error');
+          const offset = int(a[i + 1]);
+          const count = int(a[i + 2]);
+          out = offset < 0 ? [] : out.slice(offset, count < 0 ? undefined : offset + count);
+        }
+        return out.map(([m]) => m);
+      }
+      case 'zlexcount': {
+        const lo = lexBound(a[1]);
+        const hi = lexBound(a[2]);
+        return this.sortedMembers(a[0], false).filter(([m]) => lexIn(m, lo, hi)).length;
+      }
+      case 'zremrangebylex': {
+        const lo = lexBound(a[1]);
+        const hi = lexBound(a[2]);
+        const z = this.zset(a[0], false);
+        if (z === null) return 0;
+        let n = 0;
+        for (const m of [...z.keys()]) if (lexIn(m, lo, hi)) z.delete(m), (n += 1);
+        if (z.size === 0) this.data.delete(a[0]);
+        return n;
+      }
       case 'zremrangebyrank': {
         const sorted = this.sortedMembers(a[0], false);
         const z = this.zset(a[0], false);
@@ -1128,6 +1159,22 @@ const scoreIn = (score: number, lo: string, hi: string): boolean => {
   return bound(lo, true) && bound(hi, false);
 };
 
+/** A lexicographical bound as ZRANGEBYLEX reads it: `-` and `+` are the ends, `[m` includes m, `(m` excludes it. */
+type LexBound = '-' | '+' | {value: string; inclusive: boolean};
+
+const lexBound = (b: string): LexBound => {
+  if (b === '-' || b === '+') return b;
+  if (b.startsWith('[') || b.startsWith('(')) return {value: b.slice(1), inclusive: b.startsWith('[')};
+  throw new ReplyError('ERR min or max not valid string range item');
+};
+
+/** Members compare as byte strings (one char per byte here), as Redis compares them with memcmp. */
+const lexIn = (member: string, lo: LexBound, hi: LexBound): boolean => {
+  const aboveLow = lo === '-' || (lo !== '+' && (lo.inclusive ? member >= lo.value : member > lo.value));
+  const belowHigh = hi === '+' || (hi !== '-' && (hi.inclusive ? member <= hi.value : member < hi.value));
+  return aboveLow && belowHigh;
+};
+
 const globToRegExp = (glob: string): RegExp =>
   new RegExp(
     `^${glob
@@ -1460,6 +1507,10 @@ const KNOWN_COMMANDS = new Set([
   'zcount',
   'zremrangebyscore',
   'zremrangebyrank',
+  'zrangebylex',
+  'zrevrangebylex',
+  'zlexcount',
+  'zremrangebylex',
   'zpopmin',
   'zpopmax',
   'eval',

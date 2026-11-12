@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package uploadd;
+
+// The object store uploadd writes parts to (step 3) and commits finished uploads in (step 4).
+service ObjectStore {
+  // Stores one part's bytes and answers the SHA-256 (lowercase hex) of the bytes it received.
+  rpc WritePart(WritePartRequest) returns (WritePartReply);
+  // Assembles the listed parts, in part-number order, into the upload's object.
+  rpc CommitObject(CommitRequest) returns (CommitReply);
+}
+
+message WritePartRequest {
+  string upload_id = 1;
+  int32 part_number = 2;
+  bytes data = 3;
+}
+
+message WritePartReply {
+  string checksum = 1;
+  int64 size = 2;
+}
+
+message PartRef {
+  int32 part_number = 1;
+  string checksum = 2;
+}
+
+message CommitRequest {
+  string upload_id = 1;
+  repeated PartRef parts = 2;
+}
+
+message CommitReply {
+  string object_key = 1;
+  int64 size = 2;
+}

@@ -8,782 +8,393 @@ export const readStep: Step = {
   focus: ['client', 'api', 'db', 'refunds'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/returns/{return_id}\`, the read behind the
-customer's return page: it loads the row by id and returns \`return_id\`, \`state\`, \`grade\`, a
-\`refund\` object and an \`order_line\` holding the id and quantity it snapshotted at registration.
-It compiles, serves the demo, and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/returns/{return_id}\`, the customer's return page:
+it loads the return (\`store.return_of\`, 404 when unknown) and its refund (\`store.refund_of\`
+when \`refund_id\` is set), and answers \`return_id\`, \`state\` (\`refunded\` as soon as a refund
+record exists), \`grade\`, \`quantity\`, \`refund\` (\`{refund_id, state, amount_cents}\`, null when
+the refund failed) and \`order_line\` (\`{order_line_id, quantity}\` from the return). It serves the
+demo and hides four flaws.
 
-**Failure mode the checks target.** The page says \`refunded\` while the processor is still
-working; when the processor fails the refund, the page shows no refund at all; a customer pasting
-someone else's return id reads their return; the line shown is an id nobody recognizes.
+**Failure mode the checks target.** A customer pastes another merchant's return id and reads it;
+the page says \`refunded\` while the processor is still working, and again after it failed; a failed
+refund disappears from the page, so support cannot see why; the line shows an id nobody recognizes.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when missing). A return that does not exist **or
-  belongs to another tenant** is **404**, not 403, so a caller cannot probe which ids exist.
-- \`state\` follows the refund processor's record: **\`refunded\` requires a confirmed refund**; an
-  initiated refund reads \`awaiting_refund\`; a failed one reads \`refund_failed\`; a return the
-  processor has not seen keeps its stored \`pending\` state.
-- The \`refund\` object \`{"refund_id", "state"}\` is returned for **every** refund the return has,
-  failures included; it is \`null\` only when no refund was ever initiated.
-- \`order_line\` carries the original line's facts, \`order_line_id\`, \`sku\`,
-  \`ordered_quantity\` and \`delivered_at\`, loaded by the return's \`order_line_id\`.
-- Log the read with the tenant and the return id, not the reason code or the photo reference.`,
+- \`X-Tenant-Id\` is required (**401**); a return of another tenant is **404**, the same answer as
+  one that does not exist.
+- \`state\` follows the processor's record through \`REFUND_STATES\`: \`initiated\` →
+  \`refund_pending\`, \`confirmed\` → \`refunded\`, \`failed\` → \`refund_failed\`; with no refund it
+  is the stored state.
+- \`refund\` is there for every refund the return has, failed ones included.
+- \`order_line\` is the line itself (\`store.line_of\`): \`order_line_id\`, \`sku\`,
+  \`ordered_quantity\`, \`delivered_at\`.`,
   sequence: {
-    participants: ['Customer', 'Returns API', 'orders · returns', 'refunds'],
+    participants: ['Customer', 'Returns API', 'returns store'],
     messages: [
-      {from: 'Customer', to: 'Returns API', label: 'GET /v1/returns/ret_91 · X-Tenant-Id', kind: 'sync'},
-      {from: 'Returns API', to: 'orders · returns', label: 'load the return row · tenant_id · refund_id', kind: 'sync'},
-      {from: 'orders · returns', to: 'Returns API', label: 'state · grade · order_line_id', kind: 'reply'},
-      {from: 'Returns API', to: 'orders · returns', label: 'load the original order line', kind: 'sync'},
-      {from: 'orders · returns', to: 'Returns API', label: 'sku · ordered_quantity · delivered_at', kind: 'reply'},
-      {from: 'Returns API', to: 'refunds', label: 'refund by refund_id', kind: 'sync'},
-      {from: 'refunds', to: 'Returns API', label: 'initiated · confirmed · failed', kind: 'reply'},
-      {
-        from: 'Returns API',
-        to: 'Returns API',
-        label: 'foreign or unknown → 404; refunded only once confirmed',
-        kind: 'sync',
-      },
-      {from: 'Returns API', to: 'Customer', label: '200 {state, grade, refund, order_line} · 404', kind: 'reply'},
+      {from: 'Customer', to: 'Returns API', label: 'GET /v1/returns/ret-7 · X-Tenant-Id', kind: 'sync'},
+      {from: 'Returns API', to: 'returns store', label: 'return_of(ret-7) · tenant must match, else 404', kind: 'sync'},
+      {from: 'Returns API', to: 'returns store', label: 'refund_of(refund_id) · the processor’s record', kind: 'sync'},
+      {from: 'Returns API', to: 'returns store', label: 'line_of(order_line_id)', kind: 'sync'},
+      {from: 'Returns API', to: 'Customer', label: '200 {state from the refund, refund, order_line}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'read-route',
-      title: 'Serves GET /v1/returns/{id} with the return and its order line',
+      title: 'Serves GET /v1/returns/{id}',
       detail:
-        'The read is registered on `GET /v1/returns/{id}` and the payload names the return and the order line it was registered against. The starter already answers this route, so this check passes on it — the four below are where it fails.',
+        'Register the read on `GET /v1/returns/{id}`; the owner of a registered return reads its state, quantity and line id.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/returns\/\{return_id\}["']/, /order_line_id/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/returns\/:returnId['"]/, /order_line_id/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/returns\/\{return_id\}"/, /order_line_id/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"returns"\s*\/\s*Segment\s*\)/, /\bget\s*\{/, /order_line_id/]},
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/returns\//, /order_line_id/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/returns\/\{return_id\}["']/, /store\.return_of\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/returns\/:returnId['"]/, /returnOf\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/returns\/\{id\}"/, /store\.ReturnOf\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"returns"\s*\/\s*Segment\s*\)/, /Store\.returnOf\(/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/returns\//, /store::returnOf\(/]},
       },
     },
     {
-      id: 'confirmed-state',
-      title: 'Calls a return refunded only once the processor confirmed',
+      id: 'tenant-scope',
+      title: 'Scopes the read to the caller’s tenant',
       detail:
-        "`state_from_refund()` derives the state from the processor's record: `confirmed` → `refunded`, `failed` → `refund_failed`, an initiated refund → `awaiting_refund`. The starter reports `refunded` the moment a refund exists, so the page promises money that has not moved.",
+        'The tenant comes from `X-Tenant-Id` (401 without it) and a return of another tenant answers 404, like a return that does not exist, so ids cannot be probed. The starter answers any caller.',
       match: {
-        python: {all: [/def state_from_refund\(/, /CONFIRMED/, /"refunded"/, /awaiting_refund/]},
-        typescript: {all: [/function stateFromRefund\(/, /CONFIRMED/, /refunded/, /awaiting_refund/]},
-        go: {all: [/func stateFromRefund\(/, /refundConfirmed/, /"refunded"/, /awaiting_refund/]},
-        scala: {all: [/def stateFromRefund\(/, /\bConfirmed\b/, /"refunded"/, /awaiting_refund/]},
-        cpp: {all: [/stateFromRefund\(/, /kConfirmed/, /"refunded"/, /awaiting_refund/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/, /\[["']tenant["']\]\s*!=\s*tenant/]},
+        typescript: {all: [/x-tenant-id/i, /\b401\b/, /\.tenant\s*!==\s*tenant/]},
+        go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/, /\.Tenant\s*!=\s*tenant/]},
+        scala: {all: [/X-Tenant-Id/i, /Unauthorized/, /_\.tenant\s*==\s*tenant/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/, /->tenant\s*!=\s*tenant/]},
       },
     },
     {
-      id: 'refund-linkage',
-      title: 'Keeps the refund linkage visible when the refund failed',
+      id: 'refund-state',
+      title: '`refunded` means the processor confirmed it',
       detail:
-        '`refund_linkage()` returns `{refund_id, state}` for every refund the return has, failed ones included, and no branch drops it. The starter omits the linkage when the refund state is `failed`, hiding exactly the outcome a support agent opens the return for.',
+        'The state comes from the refund record through `REFUND_STATES` (`initiated` → `refund_pending`, `confirmed` → `refunded`, `failed` → `refund_failed`); the starter says `refunded` once any refund record exists.',
       match: {
-        python: {
-          all: [/def refund_linkage\(/, /refund_id/, /FAILED/],
-          none: [/\[["']state["']\]\s*!=\s*["']failed["']/],
-        },
-        typescript: {
-          all: [/function refundLinkage\(/, /refund_id/, /FAILED/],
-          none: [/\.state\s*!==?\s*['"]failed['"]/],
-        },
-        go: {all: [/func refundLinkage\(/, /refund_id/, /refundFailed/], none: [/\.State\s*!=\s*"failed"/]},
-        scala: {all: [/def refundLinkage\(/, /refund_id/, /\bFailed\b/], none: [/\.state\s*!=\s*"failed"/]},
-        cpp: {all: [/refundLinkage\(/, /refund_id/, /kFailed/], none: [/!=\s*"failed"/]},
+        python: {all: [/REFUND_STATES/, /["']confirmed["']\s*:\s*["']refunded["']/]},
+        typescript: {all: [/REFUND_STATES/, /confirmed:\s*'refunded'/]},
+        go: {all: [/refundStates/, /"confirmed":\s*"refunded"/]},
+        scala: {all: [/RefundStates/, /"confirmed"\s*->\s*"refunded"/]},
+        cpp: {all: [/kRefundStates/, /\{"confirmed",\s*"refunded"\}/]},
       },
     },
     {
-      id: 'owner-scope',
-      title: 'Answers 404 for a return that belongs to another tenant',
+      id: 'failed-refund-visible',
+      title: 'Shows a failed refund with its state',
       detail:
-        "`load_return(return_id, tenant)` returns **404** when the row is missing **or** its `tenant_id` is not the caller's — the same refusal in both cases, so a foreign id cannot be probed. The starter serves any return to any caller.",
+        'The `refund` object is returned for every refund the return has, with the processor’s `state`, so a failed refund reads `failed` instead of vanishing; it is null only when no refund was ever requested.',
       match: {
-        python: {all: [/status_code\s*=\s*404/, /def load_return\(/, /tenant_id/]},
-        typescript: {all: [/\b404\b/, /function loadReturn\(/, /tenant_id/]},
-        go: {all: [/StatusNotFound/, /func loadReturn\(/, /tenant_id/]},
-        scala: {all: [/StatusCodes\.NotFound/, /def loadReturn\(/, /tenant_id/]},
-        cpp: {all: [/\b404\b/, /loadReturn\(/, /tenant_id/]},
+        python: {all: [/store\.refund_of\(/], none: [/!=\s*["']failed["']/]},
+        typescript: {all: [/refundOf\(/], none: [/!==?\s*'failed'/]},
+        go: {all: [/store\.RefundOf\(/], none: [/!=\s*"failed"/]},
+        scala: {all: [/Store\.refundOf\(/], none: [/!=\s*"failed"/]},
+        cpp: {all: [/store::refundOf\(/], none: [/!=\s*"failed"/]},
       },
     },
     {
       id: 'order-line',
-      title: 'Carries the original order line: its id and its facts',
+      title: 'Shows the order line itself',
       detail:
-        "`order_line_facts()` loads the line by `order_line_id` and the payload carries the line's `sku`, `ordered_quantity` and `delivered_at`. The starter echoes the id it snapshotted at registration and nothing the customer can recognize.",
+        '`order_line` is loaded with `line_of`/`lineOf` and carries `order_line_id`, `sku`, `ordered_quantity` and `delivered_at`; the starter echoes the id and the return’s own quantity.',
       match: {
-        python: {all: [/def order_line_facts\(/, /order_line_id/, /"sku"/, /delivered_at/]},
-        typescript: {all: [/function orderLineFacts\(/, /order_line_id/, /sku/, /delivered_at/]},
-        go: {all: [/func orderLineFacts\(/, /order_line_id/, /"sku"/, /delivered_at/]},
-        scala: {all: [/def orderLineFacts\(/, /order_line_id/, /sku/, /delivered_at/]},
-        cpp: {all: [/orderLineFacts\(/, /order_line_id/, /"sku"/, /"delivered_at"/]},
+        python: {all: [/store\.line_of\(/, /["']sku["']/, /["']ordered_quantity["']/, /["']delivered_at["']/]},
+        typescript: {all: [/lineOf\(/, /sku:/, /ordered_quantity:/, /delivered_at:/]},
+        go: {all: [/store\.LineOf\(/, /"sku"/, /"ordered_quantity"/, /"delivered_at"/]},
+        scala: {all: [/Store\.lineOf\(/, /"sku"/, /"ordered_quantity"/, /"delivered_at"/]},
+        cpp: {all: [/store::lineOf\(/, /"sku"/, /"ordered_quantity"/, /"delivered_at"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
+      starter: `from fastapi import FastAPI, HTTPException, Request
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from returns import store  # store.return_of, refund_of, line_of
 
 app = FastAPI()
-logger = logging.getLogger("returns-read")
-
-
-class ReturnsStore:
-    def get(self, return_id: str) -> dict | None:
-        """The return row: state, grade, refund_id and order_line_id."""
-        raise NotImplementedError
-
-    def refund(self, refund_id: str) -> dict | None:
-        """The refund processor's record."""
-        raise NotImplementedError
-
-
-store = ReturnsStore()
 
 
 @app.get("/v1/returns/{return_id}")
-def read_return(return_id: str) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    row = store.get(return_id) or {}
-    refund = store.refund(row["refund_id"]) if "refund_id" in row else None
-    body = {
-        "return_id": row.get("return_id", return_id),
-        "state": "refunded" if refund is not None else row.get("state", "pending"),
-        "grade": row.get("grade"),
-        "order_line": {"order_line_id": row.get("order_line_id"), "quantity": row.get("quantity")},
-    }
-    if refund is not None and refund["state"] != "failed":
-        body["refund"] = {"refund_id": refund["refund_id"], "state": refund["state"]}
-    logger.info("return read return=%s", return_id)
-    return JSONResponse(body, status_code=200)
-`,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-logger = logging.getLogger("returns-read")
-
-CONFIRMED = "confirmed"
-FAILED = "failed"
-
-
-class ReturnsStore:
-    def get(self, return_id: str) -> dict | None:
-        """The return row: tenant_id, state, grade, refund_id and order_line_id."""
-        raise NotImplementedError
-
-    def refund(self, refund_id: str) -> dict | None:
-        """The refund processor's record."""
-        raise NotImplementedError
-
-    def order_line(self, order_line_id: str) -> dict | None:
-        """The original order line the return belongs to."""
-        raise NotImplementedError
-
-
-store = ReturnsStore()
-
-
-def load_return(return_id: str, tenant: str) -> dict:
-    """The return as this tenant may see it; anything else is a 404, never a 403."""
-    row = store.get(return_id)
-    if row is None or row["tenant_id"] != tenant:
-        raise HTTPException(status_code=404, detail="return not found")
-    return row
-
-
-def state_from_refund(refund: dict | None) -> str:
-    """How the return reads now: refunded only once the processor confirmed it."""
-    if refund is None:
-        return "pending"
-    if refund["state"] == CONFIRMED:
-        return "refunded"
-    if refund["state"] == FAILED:
-        return "refund_failed"
-    return "awaiting_refund"
-
-
-def refund_linkage(refund: dict | None) -> dict | None:
-    """The refund the processor owns, however it ended — failures stay visible."""
-    if refund is None:
-        return None
-    return {"refund_id": refund["refund_id"], "state": refund["state"]}
-
-
-def order_line_facts(order_line_id: str) -> dict:
-    """The original line: what was bought and when it landed, loaded by the line id."""
-    line = store.order_line(order_line_id) or {}
+def read_return(return_id: str, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    ret = store.return_of(return_id)
+    if ret is None:
+        raise HTTPException(status_code=404, detail="no such return")
+    refund = store.refund_of(ret["refund_id"]) if ret["refund_id"] else None
+    shown = refund if refund is not None and refund["state"] != "failed" else None
     return {
-        "order_line_id": order_line_id,
-        "sku": line.get("sku"),
-        "ordered_quantity": line.get("ordered_quantity"),
-        "delivered_at": line.get("delivered_at"),
+        "return_id": return_id,
+        "state": "refunded" if refund is not None else ret["state"],
+        "grade": ret["grade"],
+        "quantity": ret["quantity"],
+        "refund": None if shown is None else {"refund_id": shown["refund_id"], "state": shown["state"], "amount_cents": shown["amount_cents"]},
+        "order_line": {"order_line_id": ret["order_line_id"], "quantity": ret["quantity"]},
     }
+`,
+      solution: `from fastapi import FastAPI, HTTPException, Request
+
+from returns import store  # store.return_of, refund_of, line_of
+
+app = FastAPI()
+
+# What the customer is told follows the refund processor's record, not the request that started it.
+REFUND_STATES = {"initiated": "refund_pending", "confirmed": "refunded", "failed": "refund_failed"}
 
 
 @app.get("/v1/returns/{return_id}")
-def read_return(return_id: str, tenant: str | None = Header(default=None, alias="X-Tenant-Id")) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    row = load_return(return_id, tenant)
-    refund = store.refund(row["refund_id"]) if row.get("refund_id") else None
-    body = {
-        "return_id": row["return_id"],
-        "state": state_from_refund(refund),
-        "grade": row.get("grade"),
-        "refund": refund_linkage(refund),
-        "order_line": order_line_facts(row["order_line_id"]),
+def read_return(return_id: str, request: Request) -> dict:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    ret = store.return_of(return_id)
+    if ret is None or ret["tenant"] != tenant:
+        # Another tenant's return is answered like a missing one: ids cannot be probed.
+        raise HTTPException(status_code=404, detail="no such return")
+    refund = store.refund_of(ret["refund_id"]) if ret["refund_id"] else None
+    line = store.line_of(ret["order_line_id"])
+    return {
+        "return_id": return_id,
+        "state": REFUND_STATES.get(refund["state"], ret["state"]) if refund is not None else ret["state"],
+        "grade": ret["grade"],
+        "quantity": ret["quantity"],
+        "refund": None if refund is None else {"refund_id": refund["refund_id"], "state": refund["state"], "amount_cents": refund["amount_cents"]},
+        "order_line": None if line is None else {
+            "order_line_id": line["order_line_id"],
+            "sku": line["sku"],
+            "ordered_quantity": line["ordered_quantity"],
+            "delivered_at": line["delivered_at"],
+        },
     }
-    logger.info("return read return=%s tenant=%s", return_id, tenant)
-    return JSONResponse(body, status_code=200)
 `,
     },
     typescript: {
-      starter: `/** GET /v1/returns/:returnId: the return page read. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {lineOf, refundOf, returnOf} from 'returns/store';
 
 export const app = Fastify();
-
-interface StoredRefund {
-  refund_id: string;
-  state: string;
-}
-
-interface StoredReturn {
-  return_id: string;
-  order_line_id: string;
-  quantity: number;
-  state: string;
-  grade?: string;
-  refund_id?: string;
-}
-
-class ReturnsStore {
-  /** The return row: state, grade, refund_id and order_line_id. */
-  async get(returnId: string): Promise<StoredReturn | null> {
-    throw new Error('not implemented');
-  }
-
-  /** The original order line. */
-  async orderLine(orderLineId: string): Promise<Record<string, unknown> | null> {
-    throw new Error('not implemented');
-  }
-
-  /** The refund processor's record. */
-  async refund(refundId: string): Promise<StoredRefund | null> {
-    throw new Error('not implemented');
-  }
-}
-
-const store = new ReturnsStore();
 
 app.get('/v1/returns/:returnId', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {returnId} = request.params as {returnId: string};
-  const row = (await store.get(returnId)) ?? {};
-  const refund = row.refund_id ? await store.refund(row.refund_id) : null;
-  const body: Record<string, unknown> = {
-    return_id: row.return_id ?? returnId,
-    state: refund !== null ? 'refunded' : (row.state ?? 'pending'),
-    grade: row.grade,
-    order_line: {order_line_id: row.order_line_id, quantity: row.quantity},
+  const ret = await returnOf(returnId);
+  if (ret === null) return reply.code(404).send({error: 'no such return'});
+  const refund = ret.refund_id ? await refundOf(ret.refund_id) : null;
+  const shown = refund !== null && refund.state !== 'failed' ? refund : null;
+  return {
+    return_id: returnId,
+    state: refund !== null ? 'refunded' : ret.state,
+    grade: ret.grade,
+    quantity: ret.quantity,
+    refund: shown && {refund_id: shown.refund_id, state: shown.state, amount_cents: shown.amount_cents},
+    order_line: {order_line_id: ret.order_line_id, quantity: ret.quantity},
   };
-  if (refund !== null && refund.state !== 'failed') {
-    body.refund = {refund_id: refund.refund_id, state: refund.state};
-  }
-  return reply.code(200).send(body);
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/returns/:returnId: confirmed state, linkage kept, owner-scoped. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {lineOf, refundOf, returnOf} from 'returns/store';
 
 export const app = Fastify();
 
-const CONFIRMED = 'confirmed';
-const FAILED = 'failed';
-
-interface StoredRefund {
-  refund_id: string;
-  state: string;
-}
-
-interface StoredReturn {
-  return_id: string;
-  tenant_id: string;
-  order_line_id: string;
-  state: string;
-  grade?: string;
-  refund_id?: string;
-}
-
-class ReturnsStore {
-  /** The return row: tenant_id, state, grade, refund_id and order_line_id. */
-  async get(returnId: string): Promise<StoredReturn | null> {
-    throw new Error('not implemented');
-  }
-
-  /** The original order line. */
-  async orderLine(orderLineId: string): Promise<Record<string, unknown> | null> {
-    throw new Error('not implemented');
-  }
-
-  /** The refund processor's record. */
-  async refund(refundId: string): Promise<StoredRefund | null> {
-    throw new Error('not implemented');
-  }
-}
-
-const store = new ReturnsStore();
-
-class HttpError extends Error {
-  constructor(
-    readonly statusCode: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
-/** The return as this tenant may see it; anything else is a 404, never a 403. */
-async function loadReturn(returnId: string, tenant: string): Promise<StoredReturn> {
-  const row = await store.get(returnId);
-  if (row === null || row.tenant_id !== tenant) throw new HttpError(404, 'return not found');
-  return row;
-}
-
-/** How the return reads now: refunded only once the processor confirmed it. */
-function stateFromRefund(refund: StoredRefund | null): string {
-  if (refund === null) return 'pending';
-  if (refund.state === CONFIRMED) return 'refunded';
-  if (refund.state === FAILED) return 'refund_failed';
-  return 'awaiting_refund';
-}
-
-/** The refund the processor owns, however it ended — a failure stays visible. */
-function refundLinkage(refund: StoredRefund | null): Record<string, unknown> | null {
-  if (refund === null) return null;
-  return {refund_id: refund.refund_id, state: refund.state};
-}
-
-/** The original line: what was bought and when it landed, loaded by the line id. */
-async function orderLineFacts(orderLineId: string): Promise<Record<string, unknown>> {
-  const line = (await store.orderLine(orderLineId)) ?? {};
-  return {
-    order_line_id: orderLineId,
-    sku: line.sku,
-    ordered_quantity: line.ordered_quantity,
-    delivered_at: line.delivered_at,
-  };
-}
+// What the customer is told follows the refund processor's record, not the request that started it.
+const REFUND_STATES: Record<string, string> = {initiated: 'refund_pending', confirmed: 'refunded', failed: 'refund_failed'};
 
 app.get('/v1/returns/:returnId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {returnId} = request.params as {returnId: string};
-  let row: StoredReturn;
-  try {
-    row = await loadReturn(returnId, tenant);
-  } catch (error) {
-    if (error instanceof HttpError) return reply.code(error.statusCode).send({error: error.message});
-    throw error;
-  }
-  const refund = row.refund_id ? await store.refund(row.refund_id) : null;
-  request.log.info({returnId, tenant}, 'return read');
-  return reply.code(200).send({
-    return_id: row.return_id,
-    state: stateFromRefund(refund),
-    grade: row.grade,
-    refund: refundLinkage(refund),
-    order_line: await orderLineFacts(row.order_line_id),
-  });
+  const ret = await returnOf(returnId);
+  // Another tenant's return is answered like a missing one: ids cannot be probed.
+  if (ret === null || ret.tenant !== tenant) return reply.code(404).send({error: 'no such return'});
+  const refund = ret.refund_id ? await refundOf(ret.refund_id) : null;
+  const line = await lineOf(ret.order_line_id);
+  return {
+    return_id: returnId,
+    state: refund !== null ? (REFUND_STATES[refund.state] ?? ret.state) : ret.state,
+    grade: ret.grade,
+    quantity: ret.quantity,
+    refund: refund && {refund_id: refund.refund_id, state: refund.state, amount_cents: refund.amount_cents},
+    order_line: line && {order_line_id: line.order_line_id, sku: line.sku, ordered_quantity: line.ordered_quantity, delivered_at: line.delivered_at},
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
+
+	"returns/store" // store.ReturnOf, RefundOf, LineOf
 )
 
-type Refund struct {
-	RefundID string \`json:"refund_id"\`
-	State    string \`json:"state"\`
-}
-
-type ReturnRow struct {
-	ReturnID    string \`json:"return_id"\`
-	OrderLineID string \`json:"order_line_id"\`
-	Quantity    int    \`json:"quantity"\`
-	State       string \`json:"state"\`
-	Grade       string \`json:"grade"\`
-	RefundID    string \`json:"refund_id"\`
-}
-
-type ReturnsStore struct{}
-
-// Get returns the return row: state, grade, refund_id and order_line_id.
-func (s *ReturnsStore) Get(ctx context.Context, returnID string) (*ReturnRow, error) {
-	return nil, nil
-}
-
-// OrderLine returns the original order line.
-func (s *ReturnsStore) OrderLine(ctx context.Context, orderLineID string) (map[string]any, error) {
-	return nil, nil
-}
-
-// Refund returns the refund processor's record.
-func (s *ReturnsStore) Refund(ctx context.Context, refundID string) (*Refund, error) {
-	return nil, nil
-}
-
-var store = &ReturnsStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readReturn(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	returnID := r.PathValue("return_id")
-	row, _ := store.Get(r.Context(), returnID)
-	if row == nil {
-		row = &ReturnRow{ReturnID: returnID, State: "pending"}
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	ret := store.ReturnOf(r.Context(), r.PathValue("id"))
+	if ret == nil {
+		http.Error(rw, "no such return", http.StatusNotFound)
+		return
 	}
-	var refund *Refund
-	if row.RefundID != "" {
-		refund, _ = store.Refund(r.Context(), row.RefundID)
+	state := ret.State
+	var refund any
+	if ret.RefundID != "" {
+		if rf := store.RefundOf(r.Context(), ret.RefundID); rf != nil {
+			state = "refunded"
+			if rf.State != "failed" {
+				refund = map[string]any{"refund_id": rf.RefundID, "state": rf.State, "amount_cents": rf.AmountCents}
+			}
+		}
 	}
-	state := row.State
-	if refund != nil {
-		state = "refunded"
-	}
-	body := map[string]any{
-		"return_id":  row.ReturnID,
+	writeJSON(rw, http.StatusOK, map[string]any{
+		"return_id":  ret.ReturnID,
 		"state":      state,
-		"grade":      row.Grade,
-		"order_line": map[string]any{"order_line_id": row.OrderLineID, "quantity": row.Quantity},
-	}
-	if refund != nil && refund.State != "failed" {
-		body["refund"] = map[string]any{"refund_id": refund.RefundID, "state": refund.State}
-	}
-	writeJSON(rw, http.StatusOK, body)
+		"grade":      ret.Grade,
+		"quantity":   ret.Quantity,
+		"refund":     refund,
+		"order_line": map[string]any{"order_line_id": ret.OrderLineID, "quantity": ret.Quantity},
+	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/returns/{return_id}", readReturn)
-	_ = http.ListenAndServe(":8080", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/returns/{id}", readReturn)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
+
+	"returns/store" // store.ReturnOf, RefundOf, LineOf
 )
 
-const refundConfirmed = "confirmed"
-const refundFailed = "failed"
+// refundStates: what the customer is told follows the refund processor's record, not the request that started it.
+var refundStates = map[string]string{"initiated": "refund_pending", "confirmed": "refunded", "failed": "refund_failed"}
 
-var errReturnNotFound = errors.New("return not found")
-
-type Refund struct {
-	RefundID string \`json:"refund_id"\`
-	State    string \`json:"state"\`
-}
-
-type ReturnRow struct {
-	ReturnID    string \`json:"return_id"\`
-	TenantID    string \`json:"tenant_id"\`
-	OrderLineID string \`json:"order_line_id"\`
-	State       string \`json:"state"\`
-	Grade       string \`json:"grade"\`
-	RefundID    string \`json:"refund_id"\`
-}
-
-type ReturnsStore struct{}
-
-// Get returns the return row: tenant_id, state, grade, refund_id and order_line_id.
-func (s *ReturnsStore) Get(ctx context.Context, returnID string) (*ReturnRow, error) {
-	return nil, nil
-}
-
-// OrderLine returns the original order line.
-func (s *ReturnsStore) OrderLine(ctx context.Context, orderLineID string) (map[string]any, error) {
-	return nil, nil
-}
-
-// Refund returns the refund processor's record.
-func (s *ReturnsStore) Refund(ctx context.Context, refundID string) (*Refund, error) {
-	return nil, nil
-}
-
-var store = &ReturnsStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	_ = json.NewEncoder(rw).Encode(body)
-}
-
-// loadReturn returns the return as this tenant may see it; anything else is a 404, never a 403.
-func loadReturn(ctx context.Context, returnID, tenant string) (*ReturnRow, error) {
-	row, err := store.Get(ctx, returnID)
-	if err != nil {
-		return nil, err
-	}
-	if row == nil || row.TenantID != tenant {
-		return nil, errReturnNotFound
-	}
-	return row, nil
-}
-
-// stateFromRefund derives the state from the processor's record: refunded only once confirmed.
-func stateFromRefund(refund *Refund) string {
-	if refund == nil {
-		return "pending"
-	}
-	switch refund.State {
-	case refundConfirmed:
-		return "refunded"
-	case refundFailed:
-		return "refund_failed"
-	default:
-		return "awaiting_refund"
-	}
-}
-
-// refundLinkage keeps the refund's identity and state visible, however it ended.
-func refundLinkage(refund *Refund) any {
-	if refund == nil {
-		return nil
-	}
-	return map[string]any{"refund_id": refund.RefundID, "state": refund.State}
-}
-
-// orderLineFacts loads the original line: what was bought and when it landed.
-func orderLineFacts(ctx context.Context, orderLineID string) (map[string]any, error) {
-	line, err := store.OrderLine(ctx, orderLineID)
-	if err != nil {
-		return nil, err
-	}
-	if line == nil {
-		line = map[string]any{}
-	}
-	return map[string]any{
-		"order_line_id":    orderLineID,
-		"sku":              line["sku"],
-		"ordered_quantity": line["ordered_quantity"],
-		"delivered_at":     line["delivered_at"],
-	}, nil
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readReturn(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	returnID := r.PathValue("return_id")
-	row, err := loadReturn(r.Context(), returnID, tenant)
-	if errors.Is(err, errReturnNotFound) {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "return not found"})
+	ret := store.ReturnOf(r.Context(), r.PathValue("id"))
+	if ret == nil || ret.Tenant != tenant {
+		// Another tenant's return is answered like a missing one: ids cannot be probed.
+		http.Error(rw, "no such return", http.StatusNotFound)
 		return
 	}
-	if err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-	var refund *Refund
-	if row.RefundID != "" {
-		refund, err = store.Refund(r.Context(), row.RefundID)
-		if err != nil {
-			writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "internal"})
-			return
+	state := ret.State
+	var refund any
+	if ret.RefundID != "" {
+		if rf := store.RefundOf(r.Context(), ret.RefundID); rf != nil {
+			if shown, ok := refundStates[rf.State]; ok {
+				state = shown
+			}
+			refund = map[string]any{"refund_id": rf.RefundID, "state": rf.State, "amount_cents": rf.AmountCents}
 		}
 	}
-	line, err := orderLineFacts(r.Context(), row.OrderLineID)
-	if err != nil {
-		writeJSON(rw, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
+	var orderLine any
+	if line := store.LineOf(r.Context(), ret.OrderLineID); line != nil {
+		orderLine = map[string]any{"order_line_id": line.OrderLineID, "sku": line.SKU, "ordered_quantity": line.OrderedQuantity, "delivered_at": line.DeliveredAt}
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"return_id":  row.ReturnID,
-		"state":      stateFromRefund(refund),
-		"grade":      row.Grade,
-		"refund":     refundLinkage(refund),
-		"order_line": line,
+		"return_id":  ret.ReturnID,
+		"state":      state,
+		"grade":      ret.Grade,
+		"quantity":   ret.Quantity,
+		"refund":     refund,
+		"order_line": orderLine,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/returns/{return_id}", readReturn)
-	_ = http.ListenAndServe(":8080", mux)
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/returns/{id}", readReturn)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-final case class StoredRefund(refund_id: String, state: String)
+import returns.Store // Store.returnOf, refundOf, lineOf
 
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("returns-read")
-
-  /** The return row: state, grade, refund_id and order_line_id. */
-  def get(returnId: String): Option[Map[String, String]] = None
-
-  /** The original order line. */
-  def orderLine(orderLineId: String): Option[Map[String, String]] = None
-
-  /** The refund processor's record. */
-  def refund(refundId: String): Option[StoredRefund] = None
-
-  def optString(row: Map[String, String], key: String): JsValue =
-    row.get(key).map(JsString(_)).getOrElse(JsNull)
-
+object Read {
   val route: Route =
     path("v1" / "returns" / Segment) { returnId =>
       get {
-        // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-        val row = get(returnId).getOrElse(Map.empty)
-        val refundRecord = row.get("refund_id").flatMap(refund)
-        val state = if (refundRecord.isDefined) "refunded" else row.getOrElse("state", "pending")
-        val body = JsObject(
-          "return_id" -> JsString(row.getOrElse("return_id", returnId)),
-          "state" -> JsString(state),
-          "grade" -> optString(row, "grade"),
-          "order_line" -> JsObject("order_line_id" -> JsString(row.getOrElse("order_line_id", returnId)))
-        )
-        val withRefund = refundRecord match {
-          case Some(r) if r.state != "failed" =>
-            JsObject(
-              body.fields + ("refund" -> JsObject("refund_id" -> JsString(r.refund_id), "state" -> JsString(r.state)))
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+        Store.returnOf(returnId) match {
+          case None => complete(StatusCodes.NotFound -> "no such return")
+          case Some(ret) =>
+            val refund = if (ret.refundId.isEmpty) None else Store.refundOf(ret.refundId)
+            val shown = refund.filter(_.state != "failed")
+            val body = JsObject(
+              "return_id" -> JsString(ret.returnId),
+              "state" -> JsString(if (refund.isDefined) "refunded" else ret.state),
+              "grade" -> JsString(ret.grade),
+              "quantity" -> JsNumber(ret.quantity),
+              "refund" -> shown.map(r => JsObject("refund_id" -> JsString(r.refundId), "state" -> JsString(r.state), "amount_cents" -> JsNumber(r.amountCents))).getOrElse(JsNull),
+              "order_line" -> JsObject("order_line_id" -> JsString(ret.orderLineId), "quantity" -> JsNumber(ret.quantity))
             )
-          case _ => body
+            complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
         }
-        complete(StatusCodes.OK, withRefund.compactPrint)
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 
-final case class StoredRefund(refund_id: String, state: String)
+import returns.Store // Store.returnOf, refundOf, lineOf
 
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("returns-read")
-
-  val Confirmed = "confirmed"
-  val Failed = "failed"
-
-  /** The return row: tenant_id, state, grade, refund_id and order_line_id. */
-  def get(returnId: String): Option[Map[String, String]] = None
-
-  /** The original order line. */
-  def orderLine(orderLineId: String): Option[Map[String, String]] = None
-
-  /** The refund processor's record. */
-  def refund(refundId: String): Option[StoredRefund] = None
-
-  /** The return as this tenant may see it; anything else is a 404, never a 403. */
-  def loadReturn(returnId: String, tenant: String): Either[Int, Map[String, String]] =
-    get(returnId) match {
-      case Some(row) if row.get("tenant_id").contains(tenant) => Right(row)
-      case _ => Left(StatusCodes.NotFound.intValue)
-    }
-
-  /** How the return reads now: refunded only once the processor confirmed it. */
-  def stateFromRefund(record: Option[StoredRefund]): String = record match {
-    case None => "pending"
-    case Some(r) if r.state == Confirmed => "refunded"
-    case Some(r) if r.state == Failed => "refund_failed"
-    case _ => "awaiting_refund"
-  }
-
-  /** The refund the processor owns, however it ended — a failure stays visible. */
-  def refundLinkage(record: Option[StoredRefund]): JsValue = record match {
-    case None => JsNull
-    case Some(r) => JsObject("refund_id" -> JsString(r.refund_id), "state" -> JsString(r.state))
-  }
-
-  def optString(row: Map[String, String], key: String): JsValue =
-    row.get(key).map(JsString(_)).getOrElse(JsNull)
-
-  def optNumber(row: Map[String, String], key: String): JsValue =
-    row.get(key).flatMap(value => scala.util.Try(BigDecimal(value)).toOption).map(JsNumber(_)).getOrElse(JsNull)
-
-  /** The original line: what was bought and when it landed, loaded by the line id. */
-  def orderLineFacts(orderLineId: String): JsValue = {
-    val line = orderLine(orderLineId).getOrElse(Map.empty)
-    JsObject(
-      "order_line_id" -> JsString(orderLineId),
-      "sku" -> optString(line, "sku"),
-      "ordered_quantity" -> optNumber(line, "ordered_quantity"),
-      "delivered_at" -> optString(line, "delivered_at")
-    )
-  }
+object Read {
+  /** What the customer is told follows the refund processor's record, not the request that started it. */
+  val RefundStates: Map[String, String] = Map("initiated" -> "refund_pending", "confirmed" -> "refunded", "failed" -> "refund_failed")
 
   val route: Route =
     path("v1" / "returns" / Segment) { returnId =>
       get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            loadReturn(returnId, tenantOpt.get) match {
-              case Left(_) =>
-                complete(StatusCodes.NotFound, """{"error":"return not found"}""")
-              case Right(row) =>
-                val refundRecord = row.get("refund_id").flatMap(refund)
+        optionalHeaderValueByName("X-Tenant-Id") {
+          case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+          case Some(tenant) =>
+            // Another tenant's return is answered like a missing one: ids cannot be probed.
+            Store.returnOf(returnId).filter(_.tenant == tenant) match {
+              case None => complete(StatusCodes.NotFound -> "no such return")
+              case Some(ret) =>
+                val refund = if (ret.refundId.isEmpty) None else Store.refundOf(ret.refundId)
+                val line = Store.lineOf(ret.orderLineId)
                 val body = JsObject(
-                  "return_id" -> JsString(row.getOrElse("return_id", returnId)),
-                  "state" -> JsString(stateFromRefund(refundRecord)),
-                  "grade" -> optString(row, "grade"),
-                  "refund" -> refundLinkage(refundRecord),
-                  "order_line" -> orderLineFacts(row.getOrElse("order_line_id", returnId))
+                  "return_id" -> JsString(ret.returnId),
+                  "state" -> JsString(refund.flatMap(r => RefundStates.get(r.state)).getOrElse(ret.state)),
+                  "grade" -> JsString(ret.grade),
+                  "quantity" -> JsNumber(ret.quantity),
+                  "refund" -> refund.map(r => JsObject("refund_id" -> JsString(r.refundId), "state" -> JsString(r.state), "amount_cents" -> JsNumber(r.amountCents))).getOrElse(JsNull),
+                  "order_line" -> line.map(l => JsObject(
+                    "order_line_id" -> JsString(l.orderLineId), "sku" -> JsString(l.sku),
+                    "ordered_quantity" -> JsNumber(l.orderedQuantity), "delivered_at" -> JsString(l.deliveredAt))).getOrElse(JsNull)
                 )
-                system.log.info(s"return read return=$returnId tenant=\${tenantOpt.get}")
-                complete(StatusCodes.OK, body.compactPrint)
+                complete(HttpResponse(StatusCodes.OK, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint)))
             }
-          }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
 }
 `,
     },
@@ -791,140 +402,467 @@ object ReadApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
 #include <string>
+
+#include "returns/store.h"  // store::returnOf, refundOf, lineOf
 
 using json = nlohmann::json;
 
-struct ReturnsStore {
-  std::optional<json> get(const std::string& returnId);
-  std::optional<json> orderLine(const std::string& orderLineId);
-  std::optional<json> refund(const std::string& refundId);
-};
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-ReturnsStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/returns/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto returnId = req.matches[1].str();
-    const json row = store.get(returnId).value_or(json::object());
-    std::optional<json> refund;
-    if (row.contains("refund_id")) refund = store.refund(row.value("refund_id", std::string()));
-    const std::string state = refund ? "refunded" : row.value("state", "pending");
-    json body = {
-        {"return_id", row.value("return_id", returnId)},
-        {"state", state},
-        {"grade", row.value("grade", json(nullptr))},
-        {"order_line", json{{"order_line_id", row.value("order_line_id", std::string())},
-                            {"quantity", row.value("quantity", 0)}}},
-    };
-    if (refund && refund->value("state", std::string()) != "failed") {
-      body["refund"] = json{{"refund_id", refund->value("refund_id", std::string())},
-                            {"state", refund->value("state", std::string())}};
+void read_return(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string return_id = req.matches[1];
+  const auto ret = store::returnOf(return_id);
+  if (!ret) return reply(res, 404, {{"error", "no such return"}});
+  std::string state = ret->state;
+  json refund = nullptr;
+  if (!ret->refund_id.empty()) {
+    if (const auto rf = store::refundOf(ret->refund_id)) {
+      state = "refunded";
+      if (rf->state != "failed") refund = json{{"refund_id", rf->refund_id}, {"state", rf->state}, {"amount_cents", rf->amount_cents}};
     }
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
+  }
+  reply(res, 200, {{"return_id", ret->return_id}, {"state", state}, {"grade", ret->grade}, {"quantity", ret->quantity},
+                   {"refund", refund}, {"order_line", {{"order_line_id", ret->order_line_id}, {"quantity", ret->quantity}}}});
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/returns/([\\w-]+))", read_return);
 }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
+#include <map>
 #include <string>
+
+#include "returns/store.h"  // store::returnOf, refundOf, lineOf
 
 using json = nlohmann::json;
 
-const std::string kConfirmed = "confirmed";
-const std::string kFailed = "failed";
+// What the customer is told follows the refund processor's record, not the request that started it.
+const std::map<std::string, std::string> kRefundStates = {{"initiated", "refund_pending"}, {"confirmed", "refunded"}, {"failed", "refund_failed"}};
 
-struct ReturnsStore {
-  std::optional<json> get(const std::string& returnId);
-  std::optional<json> orderLine(const std::string& orderLineId);
-  std::optional<json> refund(const std::string& refundId);
-};
-
-ReturnsStore store;
-
-/** The return as this tenant may see it; anything else is a 404, never a 403. */
-bool loadReturn(const std::string& returnId, const std::string& tenant, json* out) {
-  const auto row = store.get(returnId);
-  if (!row || row->value("tenant_id", std::string()) != tenant) return false;
-  *out = *row;
-  return true;
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-/** How the return reads now: refunded only once the processor confirmed it. */
-std::string stateFromRefund(const std::optional<json>& refund) {
-  if (!refund) return "pending";
-  const auto state = refund->value("state", std::string());
-  if (state == kConfirmed) return "refunded";
-  if (state == kFailed) return "refund_failed";
-  return "awaiting_refund";
-}
-
-/** The refund the processor owns, however it ended — a failure stays visible. */
-json refundLinkage(const std::optional<json>& refund) {
-  if (!refund) return json(nullptr);
-  return json{{"refund_id", refund->value("refund_id", std::string())},
-              {"state", refund->value("state", std::string())}};
-}
-
-/** The original line: what was bought and when it landed, loaded by the line id. */
-json orderLineFacts(const std::string& orderLineId) {
-  const auto line = store.orderLine(orderLineId).value_or(json::object());
-  return json{
-      {"order_line_id", orderLineId},
-      {"sku", line.value("sku", std::string())},
-      {"ordered_quantity", line.value("ordered_quantity", 0)},
-      {"delivered_at", line.value("delivered_at", std::string())},
-  };
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/returns/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
+void read_return(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const std::string return_id = req.matches[1];
+  const auto ret = store::returnOf(return_id);
+  // Another tenant's return is answered like a missing one: ids cannot be probed.
+  if (!ret || ret->tenant != tenant) return reply(res, 404, {{"error", "no such return"}});
+  std::string state = ret->state;
+  json refund = nullptr;
+  if (!ret->refund_id.empty()) {
+    if (const auto rf = store::refundOf(ret->refund_id)) {
+      const auto shown = kRefundStates.find(rf->state);
+      if (shown != kRefundStates.end()) state = shown->second;
+      refund = json{{"refund_id", rf->refund_id}, {"state", rf->state}, {"amount_cents", rf->amount_cents}};
     }
-    const auto returnId = req.matches[1].str();
-    json row;
-    if (!loadReturn(returnId, tenant, &row)) {
-      res.status = 404;
-      res.set_content(R"({"error":"return not found"})", "application/json");
-      return;
-    }
-    std::optional<json> refund;
-    if (row.contains("refund_id")) refund = store.refund(row.value("refund_id", std::string()));
-    const json body = {
-        {"return_id", row.value("return_id", returnId)},
-        {"state", stateFromRefund(refund)},
-        {"grade", row.value("grade", json(nullptr))},
-        {"refund", refundLinkage(refund)},
-        {"order_line", orderLineFacts(row.value("order_line_id", std::string()))},
-    };
-    res.status = 200;
-    res.set_content(body.dump(), "application/json");
-  });
+  }
+  json order_line = nullptr;
+  if (const auto line = store::lineOf(ret->order_line_id)) {
+    order_line = json{{"order_line_id", line->order_line_id}, {"sku", line->sku}, {"ordered_quantity", line->ordered_quantity}, {"delivered_at", line->delivered_at}};
+  }
+  reply(res, 200, {{"return_id", ret->return_id}, {"state", state}, {"grade", ret->grade}, {"quantity", ret->quantity},
+                   {"refund", refund}, {"order_line", order_line}});
+}
 
-  svr.listen("0.0.0.0", 8443);
+void register_routes(httplib::Server& svr) {
+  svr.Get(R"(/v1/returns/([\\w-]+))", read_return);
 }
 `,
     },
   },
+  harness: {
+    python: `from returns import store
+
+TENANT = "t-1"
+LINE = {"order_line_id": "L1", "sku": "KETTLE-2L", "ordered_quantity": 3, "delivered_at": "2026-10-20"}
+
+
+def _api(ctx):
+    store.put_line({**LINE, "tenant": TENANT, "unit_price_cents": 4000, "policy_window": "standard"})
+    return ctx.client(ctx.load("read").app)
+
+
+def _return(return_id, state="registered", grade="", refund=None):
+    """A return of 1 unit of L1 in state; refund (the processor's state) adds a refund of 4000 cents."""
+    fields = {"return_id": return_id, "tenant": TENANT, "order_line_id": "L1", "quantity": 1, "reason_code": "damaged",
+              "photo_ref": "photos/kettle.jpg", "state": state, "grade": grade, "refund_cents": 0, "refund_id": ""}
+    if refund is not None:
+        fields.update(refund_cents=4000, refund_id=f"rf-{return_id}")
+        store.put_refund({"refund_id": f"rf-{return_id}", "return_id": return_id, "amount_cents": 4000, "state": refund})
+    store.update_return(return_id, fields)
+
+
+async def _get(c, return_id, tenant=TENANT):
+    return await c.get(f"/v1/returns/{return_id}", headers={"X-Tenant-Id": tenant} if tenant else {})
+
+
+async def check_read_route(ctx):
+    _return("ret-1")
+    async with _api(ctx) as c:
+        r = await _get(c, "ret-1")
+    assert r.status_code == 200, f"GET /v1/returns/ret-1 by its owner answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("return_id") == "ret-1" and body.get("state") == "registered" and body.get("quantity") == 1, f"the read answered {body}, expected ret-1, registered, quantity 1"
+    assert body.get("refund") is None, f"a return with no refund shows refund {body.get('refund')}"
+    assert (body.get("order_line") or {}).get("order_line_id") == "L1", f"the read's order_line is {body.get('order_line')}"
+
+
+async def check_tenant_scope(ctx):
+    _return("ret-1")
+    async with _api(ctx) as c:
+        anonymous = await _get(c, "ret-1", tenant=None)
+        other = await _get(c, "ret-1", tenant="t-2")
+        unknown = await _get(c, "ret-404")
+    assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert other.status_code == 404, f"tenant t-2 reading t-1's return answered {other.status_code}: {other.text[:120]}. Another tenant's return is 404, like one that does not exist"
+    assert unknown.status_code == 404, f"an unknown return answered {unknown.status_code}, expected 404"
+
+
+async def check_refund_state(ctx):
+    _return("ret-1", "refund_pending", "sellable", refund="initiated")
+    _return("ret-2", "refund_pending", "sellable", refund="confirmed")
+    _return("ret-3", "refund_pending", "damaged", refund="failed")
+    _return("ret-4", "awaiting_inspection")
+    want = {"ret-1": "refund_pending", "ret-2": "refunded", "ret-3": "refund_failed", "ret-4": "awaiting_inspection"}
+    processor = {"ret-1": "initiated", "ret-2": "confirmed", "ret-3": "failed", "ret-4": "no refund"}
+    async with _api(ctx) as c:
+        for return_id, state in want.items():
+            r = await _get(c, return_id)
+            assert r.status_code == 200, f"GET /v1/returns/{return_id} answered {r.status_code}: {r.text}"
+            shown = r.json().get("state")
+            assert shown == state, f"a return whose refund the processor reports as {processor[return_id]} reads {shown!r}, expected {state!r}: refunded means the processor confirmed it"
+
+
+async def check_failed_refund_visible(ctx):
+    _return("ret-1", "refund_pending", "damaged", refund="failed")
+    _return("ret-2")
+    async with _api(ctx) as c:
+        failed = (await _get(c, "ret-1")).json()
+        none = (await _get(c, "ret-2")).json()
+    want = {"refund_id": "rf-ret-1", "state": "failed", "amount_cents": 4000}
+    assert failed.get("refund") == want, f"a return whose refund failed shows refund {failed.get('refund')}, expected {want}: support needs to see it failed"
+    assert none.get("refund") is None, f"a return with no refund shows refund {none.get('refund')}, expected null"
+
+
+async def check_order_line(ctx):
+    _return("ret-1")
+    async with _api(ctx) as c:
+        body = (await _get(c, "ret-1")).json()
+    line = body.get("order_line") or {}
+    assert all(line.get(k) == v for k, v in LINE.items()), f"the read's order_line is {line}, expected the line itself: {LINE}"
+`,
+    typescript: `const TENANT = 't-1';
+const LINE = {order_line_id: 'L1', sku: 'KETTLE-2L', ordered_quantity: 3, delivered_at: '2026-10-20'};
+
+function world(ctx) {
+  const store = ctx.load('/support/returns/store.ts');
+  const ready = store.putLine({...LINE, tenant: TENANT, unit_price_cents: 4000, policy_window: 'standard'});
+  /** A return of 1 unit of L1 in state; refund (the processor's state) adds a refund of 4000 cents. */
+  const open = async (returnId: string, state = 'registered', grade = '', refund: string | null = null) => {
+    await ready;
+    const fields: Record<string, string | number> = {
+      return_id: returnId, tenant: TENANT, order_line_id: 'L1', quantity: 1, reason_code: 'damaged',
+      photo_ref: 'photos/kettle.jpg', state, grade, refund_cents: 0, refund_id: '',
+    };
+    if (refund !== null) {
+      fields.refund_cents = 4000;
+      fields.refund_id = \`rf-\${returnId}\`;
+      await store.putRefund({refund_id: \`rf-\${returnId}\`, return_id: returnId, amount_cents: 4000, state: refund});
+    }
+    await store.updateReturn(returnId, fields);
+  };
+  const c = ctx.client(ctx.load('read').app);
+  const get = (returnId: string, tenant: string | null = TENANT) =>
+    c.get(\`/v1/returns/\${returnId}\`, {headers: tenant === null ? {} : {'X-Tenant-Id': tenant}});
+  return {open, get};
+}
+
+export async function check_read_route(ctx) {
+  const {open, get} = world(ctx);
+  await open('ret-1');
+  const r = await get('ret-1');
+  assert.equal(r.status, 200, \`GET /v1/returns/ret-1 by its owner answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.return_id === 'ret-1' && body.state === 'registered' && body.quantity === 1, \`the read answered \${r.text}, expected ret-1, registered, quantity 1\`);
+  assert.equal(body.refund, null, \`a return with no refund shows refund \${JSON.stringify(body.refund)}\`);
+  assert.equal(body.order_line?.order_line_id, 'L1', \`the read's order_line is \${JSON.stringify(body.order_line)}\`);
+}
+
+export async function check_tenant_scope(ctx) {
+  const {open, get} = world(ctx);
+  await open('ret-1');
+  const anonymous = await get('ret-1', null);
+  assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const other = await get('ret-1', 't-2');
+  assert.equal(other.status, 404, \`tenant t-2 reading t-1's return answered \${other.status}: \${other.text.slice(0, 120)}. Another tenant's return is 404, like one that does not exist\`);
+  const unknown = await get('ret-404');
+  assert.equal(unknown.status, 404, \`an unknown return answered \${unknown.status}, expected 404\`);
+}
+
+export async function check_refund_state(ctx) {
+  const {open, get} = world(ctx);
+  await open('ret-1', 'refund_pending', 'sellable', 'initiated');
+  await open('ret-2', 'refund_pending', 'sellable', 'confirmed');
+  await open('ret-3', 'refund_pending', 'damaged', 'failed');
+  await open('ret-4', 'awaiting_inspection');
+  const want: [string, string, string][] = [
+    ['ret-1', 'refund_pending', 'initiated'],
+    ['ret-2', 'refunded', 'confirmed'],
+    ['ret-3', 'refund_failed', 'failed'],
+    ['ret-4', 'awaiting_inspection', 'no refund'],
+  ];
+  for (const [returnId, state, processor] of want) {
+    const r = await get(returnId);
+    assert.equal(r.status, 200, \`GET /v1/returns/\${returnId} answered \${r.status}: \${r.text}\`);
+    const shown = r.json().state;
+    assert.equal(shown, state, \`a return whose refund the processor reports as \${processor} reads \${JSON.stringify(shown)}, expected \${JSON.stringify(state)}: refunded means the processor confirmed it\`);
+  }
+}
+
+export async function check_failed_refund_visible(ctx) {
+  const {open, get} = world(ctx);
+  await open('ret-1', 'refund_pending', 'damaged', 'failed');
+  await open('ret-2');
+  const failed = (await get('ret-1')).json();
+  const none = (await get('ret-2')).json();
+  const want = {refund_id: 'rf-ret-1', state: 'failed', amount_cents: 4000};
+  assert.deepStrictEqual(failed.refund, want, \`a return whose refund failed shows refund \${JSON.stringify(failed.refund)}, expected \${JSON.stringify(want)}: support needs to see it failed\`);
+  assert.equal(none.refund, null, \`a return with no refund shows refund \${JSON.stringify(none.refund)}, expected null\`);
+}
+
+export async function check_order_line(ctx) {
+  const {open, get} = world(ctx);
+  await open('ret-1');
+  const line = (await get('ret-1')).json().order_line ?? {};
+  assert(Object.entries(LINE).every(([k, v]) => line[k] === v), \`the read's order_line is \${JSON.stringify(line)}, expected the line itself: \${JSON.stringify(LINE)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+
+	"returns/store"
+
+	"leetbuild/harness"
+)
+
+const readTenant = "t-1"
+
+var readBg = context.Background()
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	store.PutLine(readBg, store.OrderLine{OrderLineID: "L1", Tenant: readTenant, SKU: "KETTLE-2L", OrderedQuantity: 3, UnitPriceCents: 4000, DeliveredAt: "2026-10-20", PolicyWindow: "standard"})
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+// readOpen writes a return of 1 unit of L1 in state; a non-empty refund (the processor's state) adds a refund of 4000 cents.
+func readOpen(returnID, state, grade, refund string) {
+	fields := map[string]any{
+		"return_id": returnID, "tenant": readTenant, "order_line_id": "L1", "quantity": 1, "reason_code": "damaged",
+		"photo_ref": "photos/kettle.jpg", "state": state, "grade": grade, "refund_cents": 0, "refund_id": "",
+	}
+	if refund != "" {
+		fields["refund_cents"] = 4000
+		fields["refund_id"] = "rf-" + returnID
+		store.PutRefund(readBg, store.Refund{RefundID: "rf-" + returnID, ReturnID: returnID, AmountCents: 4000, State: refund})
+	}
+	store.UpdateReturn(readBg, returnID, fields)
+}
+
+func readGet(c *harness.HTTP, returnID, tenant string) *harness.Response {
+	if tenant == "" {
+		return c.Get("/v1/returns/" + returnID)
+	}
+	return c.Get("/v1/returns/"+returnID, "X-Tenant-Id", tenant)
+}
+
+func readBody(r *harness.Response) map[string]any {
+	var v map[string]any
+	json.Unmarshal([]byte(r.Text()), &v)
+	return v
+}
+
+func CheckReadRoute(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	readOpen("ret-1", "registered", "", "")
+	r := readGet(c, "ret-1", readTenant)
+	ctx.Equal(r.Status, 200, "GET /v1/returns/ret-1 by its owner (%s)", r.Text())
+	body := readBody(r)
+	ctx.Assert(body["return_id"] == "ret-1" && body["state"] == "registered" && body["quantity"] == float64(1), "the read answered %s, expected ret-1, registered, quantity 1", r.Text())
+	ctx.Assert(body["refund"] == nil, "a return with no refund shows refund %v", body["refund"])
+	line, _ := body["order_line"].(map[string]any)
+	ctx.Assert(line != nil && line["order_line_id"] == "L1", "the read's order_line is %v", body["order_line"])
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	readOpen("ret-1", "registered", "", "")
+	ctx.Equal(readGet(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id")
+	other := readGet(c, "ret-1", "t-2")
+	ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's return must get 404, like a return that does not exist (%.120s)", other.Text())
+	ctx.Equal(readGet(c, "ret-404", readTenant).Status, 404, "an unknown return")
+}
+
+func CheckRefundState(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	readOpen("ret-1", "refund_pending", "sellable", "initiated")
+	readOpen("ret-2", "refund_pending", "sellable", "confirmed")
+	readOpen("ret-3", "refund_pending", "damaged", "failed")
+	readOpen("ret-4", "awaiting_inspection", "", "")
+	for _, tc := range [][3]string{{"ret-1", "refund_pending", "initiated"}, {"ret-2", "refunded", "confirmed"}, {"ret-3", "refund_failed", "failed"}, {"ret-4", "awaiting_inspection", "no refund"}} {
+		r := readGet(c, tc[0], readTenant)
+		ctx.Equal(r.Status, 200, "GET /v1/returns/%s (%s)", tc[0], r.Text())
+		ctx.Equal(readBody(r)["state"], tc[1], "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", tc[2])
+	}
+}
+
+func CheckFailedRefundVisible(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	readOpen("ret-1", "refund_pending", "damaged", "failed")
+	readOpen("ret-2", "registered", "", "")
+	failed := readBody(readGet(c, "ret-1", readTenant))
+	ctx.Equal(failed["refund"], map[string]any{"refund_id": "rf-ret-1", "state": "failed", "amount_cents": float64(4000)}, "a return whose refund failed must show it (support needs to see it failed); the refund")
+	ctx.Assert(readBody(readGet(c, "ret-2", readTenant))["refund"] == nil, "a return with no refund must show refund null")
+}
+
+func CheckOrderLine(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	readOpen("ret-1", "registered", "", "")
+	line, _ := readBody(readGet(c, "ret-1", readTenant))["order_line"].(map[string]any)
+	ctx.Assert(line != nil && line["order_line_id"] == "L1" && line["sku"] == "KETTLE-2L" && line["ordered_quantity"] == float64(3) && line["delivered_at"] == "2026-10-20",
+		"the read's order_line is %v, expected the line itself: order_line_id L1, sku KETTLE-2L, ordered_quantity 3, delivered_at 2026-10-20", line)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <array>
+#include <string>
+
+#include "returns/store.h"
+
+namespace {
+
+const std::string kTenant = "t-1";
+
+harness::HTTP api(harness::Ctx& ctx) {
+  store::putLine(store::OrderLine{"L1", kTenant, "KETTLE-2L", 3, 4000, "2026-10-20", "standard"});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+// A return of 1 unit of L1 in state; a non-empty refund (the processor's state) adds a refund of 4000 cents.
+void open(const std::string& return_id, const std::string& state = "registered", const std::string& grade = "", const std::string& refund = "") {
+  std::map<std::string, std::string> fields = {{"return_id", return_id}, {"tenant", kTenant}, {"order_line_id", "L1"}, {"quantity", "1"},
+                                               {"reason_code", "damaged"}, {"photo_ref", "photos/kettle.jpg"}, {"state", state},
+                                               {"grade", grade}, {"refund_cents", "0"}, {"refund_id", ""}};
+  if (!refund.empty()) {
+    fields["refund_cents"] = "4000";
+    fields["refund_id"] = "rf-" + return_id;
+    store::putRefund(store::Refund{"rf-" + return_id, return_id, 4000, refund});
+  }
+  store::updateReturn(return_id, fields);
+}
+
+harness::Response get(harness::HTTP& c, const std::string& return_id, const std::string& tenant = kTenant) {
+  if (tenant.empty()) return c.Get("/v1/returns/" + return_id);
+  return c.Get("/v1/returns/" + return_id, "X-Tenant-Id", tenant);
+}
+
+nlohmann::json body(const harness::Response& r) {
+  const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
+  return j.is_object() ? j : nlohmann::json::object();
+}
+
+std::string text(const nlohmann::json& j, const char* name) {
+  return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckReadRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  open("ret-1");
+  const auto r = get(c, "ret-1");
+  ctx.Equal(r.Status, 200, "GET /v1/returns/ret-1 by its owner (%s)", r.Text());
+  const auto b = body(r);
+  ctx.Assert(text(b, "return_id") == "ret-1" && text(b, "state") == "registered" && b.value("quantity", 0LL) == 1, "the read answered %s, expected ret-1, registered, quantity 1", r.Text());
+  ctx.Assert(b.contains("refund") && b["refund"].is_null(), "a return with no refund shows refund %s", b.value("refund", nlohmann::json()).dump());
+  ctx.Assert(b.contains("order_line") && text(b["order_line"], "order_line_id") == "L1", "the read's order_line is %s", b.value("order_line", nlohmann::json()).dump());
+}
+
+void CheckTenantScope(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  open("ret-1");
+  ctx.Equal(get(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id");
+  const auto other = get(c, "ret-1", "t-2");
+  ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's return must get 404, like a return that does not exist (%s)", other.Text().substr(0, 120));
+  ctx.Equal(get(c, "ret-404").Status, 404, "an unknown return");
+}
+
+void CheckRefundState(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  open("ret-1", "refund_pending", "sellable", "initiated");
+  open("ret-2", "refund_pending", "sellable", "confirmed");
+  open("ret-3", "refund_pending", "damaged", "failed");
+  open("ret-4", "awaiting_inspection");
+  const std::array<std::array<std::string, 3>, 4> cases = {{{"ret-1", "refund_pending", "initiated"},
+                                                             {"ret-2", "refunded", "confirmed"},
+                                                             {"ret-3", "refund_failed", "failed"},
+                                                             {"ret-4", "awaiting_inspection", "no refund"}}};
+  for (const auto& [return_id, state, processor] : cases) {
+    const auto r = get(c, return_id);
+    ctx.Equal(r.Status, 200, "GET /v1/returns/%s (%s)", return_id, r.Text());
+    ctx.Equal(text(body(r), "state"), state, "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", processor);
+  }
+}
+
+void CheckFailedRefundVisible(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  open("ret-1", "refund_pending", "damaged", "failed");
+  open("ret-2");
+  const auto failed = body(get(c, "ret-1"));
+  const nlohmann::json want = {{"refund_id", "rf-ret-1"}, {"state", "failed"}, {"amount_cents", 4000}};
+  ctx.Assert(failed.contains("refund") && failed["refund"] == want, "a return whose refund failed shows refund %s, expected %s: support needs to see it failed", failed.value("refund", nlohmann::json()).dump(), want.dump());
+  const auto none = body(get(c, "ret-2"));
+  ctx.Assert(none.contains("refund") && none["refund"].is_null(), "a return with no refund shows refund %s, expected null", none.value("refund", nlohmann::json()).dump());
+}
+
+void CheckOrderLine(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  open("ret-1");
+  const auto b = body(get(c, "ret-1"));
+  const auto line = b.contains("order_line") ? b["order_line"] : nlohmann::json();
+  ctx.Assert(text(line, "order_line_id") == "L1" && text(line, "sku") == "KETTLE-2L" && line.value("ordered_quantity", 0LL) == 3 && text(line, "delivered_at") == "2026-10-20",
+             "the read's order_line is %s, expected the line itself: order_line_id L1, sku KETTLE-2L, ordered_quantity 3, delivered_at 2026-10-20", line.dump());
+}
+`,
+  },
   hints: [
-    'Support tickets say "the page said refunded, the bank shows nothing", or "my refund vanished"; one customer reports seeing a return that is not theirs.',
-    'The handler writes `refunded` when a refund id exists, drops the `refund` object in the `failed` branch, loads the row by id alone, and echoes the snapshotted line id.',
-    'Add `load_return(return_id, tenant)` returning 404 on miss or foreign tenant, `state_from_refund()` mapping confirmed/failed/initiated, `refund_linkage()` with no dropping branch, and `order_line_facts()` by `order_line_id`.',
+    'Paste a return id from another merchant: the page opens. Look at a return whose refund the processor has only started: it says `refunded`. Fail that refund: the refund disappears from the page.',
+    'The handler never reads the tenant; the state flips to `refunded` whenever a refund record exists, whatever it says; failed refunds are filtered out; the line is rebuilt from the return.',
+    'Read `X-Tenant-Id` (401), 404 unless `ret["tenant"]` matches; map the refund\'s state through `REFUND_STATES`; return every refund; build `order_line` from `store.line_of`.',
   ],
-  debrief: `A read owes its callers the state the money is in. Initiation is an event and confirmation is the fact, and only the processor can confirm, so the fix derives \`state\` from the refund record at read time instead of trusting what registration wrote. The failed branch is the same argument reversed: hiding a failed refund hides the support ticket, so the linkage travels with the return however the refund ended. The owner check lives in the loader and answers 404 for a foreign id because 403 confirms the id exists. The order line is loaded, not echoed, so the page shows what was bought. What this step leaves out: a refund-status callback from the processor so the read does not query it on the request path, and a cached projection of the return page.`,
+  debrief: `The read answers with the record of whoever owns each fact: the tenant check uses the return's stored tenant, the state follows the refund processor's record, and the line comes from the order line itself. That is why \`refunded\` can be trusted: it is set only when the processor confirmed, so "where is my refund?" never gets an answer the bank will contradict. Answering 404 for another tenant's return keeps ids from becoming a way to probe other merchants. Production return portals also sign the customer's view with the order's own access token rather than a tenant header alone, and show the refund's expected settlement date from the processor so the customer knows when to look again.`,
 };

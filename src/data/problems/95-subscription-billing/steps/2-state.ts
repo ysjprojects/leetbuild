@@ -2,384 +2,216 @@ import type {Step} from '@/lib/types';
 
 export const billingCursorStep: Step = {
   id: 'state',
-  title: 'Redis billing cursors with atomic period idempotency',
+  title: 'Redis run markers: one charge per subscription period',
   concept: 'redis',
   file: 'state',
-  focus: ['billing', 'redis', 'processor', 'db'],
+  focus: ['billing', 'redis', 'processor'],
   task: `## Task
 
-**Starting point.** The starter runs the billing for one \`(subscription, period)\`: it charges the
-period's invoice through the processor stub, writes a run marker in Redis under
-\`billing:run:{subscription_id}:{period_start}\` and returns the charge reference. It compiles, the
-happy path passes, and it hides five flaws.
+**Starting point.** The starter is the billing run for one invoice, \`run_billing(invoice_id)\`: it
+loads the invoice (\`billing.store\`), reads the run marker \`billing:run:{subscription_id}:{period_start}\`,
+answers \`charged\` when one exists, otherwise charges through \`processor.charge_invoice\` (step 3,
+provided as \`billing.processor\`) and writes \`done\` with a 30-day expiry. It returns
+\`{invoice_id, state, reference, reason}\` and hides four flaws.
 
-**Failure mode the checks target.** A crash between charge and marker, two concurrent retries, or a
-late retry weeks later, each charging a customer twice; a demo that runs once shows none of it.
+**Failure mode the checks target.** Two runners for one period both charge; a retry cannot say which
+charge billed the period; a run that crashed after the processor charged is taken for a finished one,
+or a crashed run that charged nothing is never billed; and a retry after the marker expired charges
+again.
 
-- Key the run per subscription **and** per period.
-- Claim the marker **atomically** with \`SET … NX\` **before** the charge; a read then a later write
-  lets two runners both charge.
-- After the charge, **confirm the marker with the invoice reference** (\`charged:{invoice_ref}\`).
-- A claim never confirmed is an **in-flight or crashed run**: the retry calls \`GetInvoice\`, adopts
-  the reference the processor reports and confirms the marker, without charging again.
-- A **closed period** (\`period_end\` in the past) refuses a re-charge with **409** and
-  \`{"action_required": "adjustment"}\` unless the caller passes the explicit adjustment action.
-- The marker carries no TTL, so a late retry cannot mistake a closed period for an unbilled one.
-- Log subscription, period and reference, not payment details.`,
+- **Claim** the marker with one \`SET … NX\` (value \`claimed\`) **before** the charge; the runner that
+  loses the claim does not charge.
+- After a charge, **confirm** the marker as \`charged:{reference}\`; a later run answers that
+  reference without a call.
+- A marker still \`claimed\` belongs to a run in flight or one that crashed: ask
+  \`processor.lookup_invoice\`, adopt and confirm the reference it reports, else answer \`in_flight\`.
+  Never charge on someone else's claim.
+- The marker has **no expiry**: it outlives the period it guards.`,
   sequence: {
-    participants: ['Billing Service', 'Redis', 'billing db', 'Payment processor'],
+    participants: ['Billing run', 'Redis', 'Payment processor'],
     messages: [
+      {from: 'Billing run', to: 'Redis', label: 'SET billing:run:{sub}:{period} claimed NX', kind: 'sync'},
+      {from: 'Redis', to: 'Billing run', label: 'OK → ours · nil → someone else’s', kind: 'reply'},
+      {from: 'Billing run', to: 'Payment processor', label: 'charge_invoice (ours only)', kind: 'sync'},
+      {from: 'Billing run', to: 'Redis', label: 'SET marker charged:{reference} · no expiry', kind: 'sync'},
       {
-        from: 'Billing Service',
-        to: 'Redis',
-        label: 'SET billing:run:{subscription}:{period_start} NX · no expiry',
+        from: 'Billing run',
+        to: 'Payment processor',
+        label: 'lookup_invoice when the marker is still claimed',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Billing Service', label: 'OK (claimed) / nil (already claimed)', kind: 'reply'},
-      {
-        from: 'Billing Service',
-        to: 'billing db',
-        label: 'load the period, the invoice and the marker value',
-        kind: 'sync',
-      },
-      {from: 'billing db', to: 'Billing Service', label: 'period bounds · invoice · charged:{ref}', kind: 'reply'},
-      {from: 'Billing Service', to: 'Payment processor', label: 'Charge(invoice_id, key = invoice id)', kind: 'sync'},
-      {from: 'Payment processor', to: 'Billing Service', label: 'charge reference', kind: 'reply'},
-      {from: 'Billing Service', to: 'Redis', label: 'SET marker charged:{invoice_ref}', kind: 'sync'},
-      {from: 'Billing Service', to: 'Billing Service', label: 'closed period → 409 unless adjustment', kind: 'sync'},
+      {from: 'Payment processor', to: 'Billing run', label: 'reference → confirm · nothing → in_flight', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'atomic-claim',
-      title: 'Claims the run marker atomically before doing anything else',
+      id: 'claim',
+      title: 'Claims the period atomically before charging',
       detail:
-        'The marker is claimed with a single `SET … NX` (one round trip), so exactly one runner per `(subscription, period)` can proceed. The starter has no claim at all — it charges first and writes the marker afterwards, so two retries can both charge.',
+        'Two runners race for one period: exactly one claims the marker with `SET … NX` and charges, the other answers without a `Charge`. The starter reads the marker, charges, then writes it, so both runners charge.',
       match: {
-        python: {all: [/claim_marker\(/, /nx=True/]},
-        typescript: {all: [/claimMarker\(/, /['"]NX['"]/]},
-        go: {all: [/ClaimMarker\(/, /SetNX/]},
-        scala: {all: [/claimMarker\(/, /\.nx\(\)/]},
-        cpp: {all: [/claimMarker\(/, /UpdateType::NOT_EXIST/]},
-      },
-    },
-    {
-      id: 'claim-before-charge',
-      title: 'Claims the marker before the charge',
-      detail:
-        'The claim happens before the processor call in the source order, so a run that cannot claim never charges. The starter charges first and records the marker afterwards.',
-      match: {
-        python: {order: [/claim_marker\(/, /charge_invoice\(/]},
-        typescript: {order: [/claimMarker\(/, /chargeInvoice\(/]},
-        go: {order: [/ClaimMarker\(/, /ChargeInvoice\(/]},
-        scala: {order: [/claimMarker\(/, /chargeInvoice\(/]},
-        cpp: {order: [/claimMarker\(/, /chargeInvoice\(/]},
+        python: {all: [/nx\s*=\s*True/], order: [/nx\s*=\s*True/, /processor\.charge_invoice\(/]},
+        typescript: {all: [/['"]NX['"]/], order: [/['"]NX['"]/, /chargeInvoice\(/]},
+        go: {all: [/\.SetNX\(/], order: [/\.SetNX\(/, /processor\.ChargeInvoice\(/]},
+        scala: {all: [/\.nx\(\)/], order: [/\.nx\(\)/, /Processor\.chargeInvoice\(/]},
+        cpp: {all: [/UpdateType::NOT_EXIST/], order: [/UpdateType::NOT_EXIST/, /processor::chargeInvoice\(/]},
       },
     },
     {
       id: 'confirm-reference',
-      title: 'Confirms the marker with the invoice reference',
+      title: 'Confirms the marker with the charge reference',
       detail:
-        'After the charge the marker records the charge reference (`charged:{invoice_ref}`), so the marker and the charge reconcile. The starter writes a bare `done`, which cannot answer “was this period charged, and under which charge?”.',
+        'After a charge the marker holds `charged:{reference}`, and a second run answers that reference without calling the processor. The starter writes `done`, so a retry answers a charge it cannot name.',
       match: {
-        python: {all: [/confirm_marker\(/, /invoice_ref/], order: [/charge_invoice\(/, /confirm_marker\(/]},
-        typescript: {all: [/confirmMarker\(/, /invoiceRef/], order: [/chargeInvoice\(/, /confirmMarker\(/]},
-        go: {all: [/ConfirmMarker\(/, /invoiceRef/], order: [/ChargeInvoice\(/, /ConfirmMarker\(/]},
-        scala: {all: [/confirmMarker\(/, /invoiceRef/], order: [/chargeInvoice\(/, /confirmMarker\(/]},
-        cpp: {all: [/confirmMarker\(/, /invoice_reference/], order: [/chargeInvoice\(/, /confirmMarker\(/]},
+        python: {all: [/["']charged:/], none: [/["']done["']/]},
+        typescript: {all: [/['"`]charged:/], none: [/['"]done['"]/]},
+        go: {all: [/"charged:"/], none: [/"done"/]},
+        scala: {all: [/"charged:/], none: [/"done"/]},
+        cpp: {all: [/"charged:"/], none: [/"done"/]},
       },
     },
     {
-      id: 'closed-period-guard',
-      title: 'Refuses a closed period without an explicit adjustment',
+      id: 'reconcile-claim',
+      title: 'Reconciles a claim nobody confirmed',
       detail:
-        'A period whose end is in the past answers **409** with `{"action_required": "adjustment"}` unless the caller passes the adjustment action, and an unconfirmed claim is reconciled with the processor instead of being charged again. The starter has neither guard.',
+        'A marker still `claimed` is reconciled with `lookup_invoice`/`lookupInvoice`: a charge the processor holds is adopted and confirmed, no charge answers `in_flight`, and neither path calls `Charge`. The starter treats any marker as a finished run.',
       match: {
-        python: {all: [/PERIOD_CLOSED/, /adjustment/, /409/]},
-        typescript: {all: [/PERIOD_CLOSED/, /adjustment/, /409/]},
-        go: {all: [/periodClosed/, /adjustment/, /StatusConflict/]},
-        scala: {all: [/PeriodClosed/, /adjustment/, /StatusCodes\.Conflict/]},
-        cpp: {all: [/kPeriodClosed/, /adjustment/, /\b409\b/]},
+        python: {all: [/processor\.lookup_invoice\(/, /in_flight/]},
+        typescript: {all: [/lookupInvoice\(/, /in_flight/]},
+        go: {all: [/processor\.LookupInvoice\(/, /in_flight/]},
+        scala: {all: [/Processor\.lookupInvoice\(/, /in_flight/]},
+        cpp: {all: [/processor::lookupInvoice\(/, /in_flight/]},
       },
     },
     {
       id: 'marker-persists',
       title: 'The marker outlives the period it guards',
       detail:
-        'The run marker is keyed by `(subscription, period_start)` and carries no expiry, so a late retry can still see that the period was billed. The starter expires it after a month, and a retry after that expiry recharges a closed period.',
+        'The marker carries no expiry, so a retry weeks later still finds the period charged. The starter writes it with a 30-day TTL (`MONTH_TTL_S`), and the retry after that charges the closed period again.',
       match: {
-        python: {all: [/marker_key\(/, /subscription_id/, /period_start/], none: [/MONTH_TTL_S/]},
-        typescript: {all: [/markerKey\(/, /subscriptionId/, /periodStart/], none: [/MONTH_TTL_S/]},
-        go: {all: [/markerKey\(/, /subscriptionID/, /periodStart/], none: [/monthTTL/]},
-        scala: {all: [/markerKey\(/, /subscriptionId/, /periodStart/], none: [/monthTtl/]},
-        cpp: {all: [/markerKey\(/, /subscription_id/, /period_start/], none: [/kMonthTtl/]},
+        python: {all: [/marker_key\(/], none: [/MONTH_TTL_S/, /\bex\s*=/]},
+        typescript: {all: [/markerKey\(/], none: [/MONTH_TTL_S/, /['"]EX['"]/]},
+        go: {all: [/markerKey\(/], none: [/monthTTL/]},
+        scala: {all: [/markerKey\(/], none: [/MonthTtlSeconds/, /\.ex\(/]},
+        cpp: {all: [/markerKey\(/], none: [/kMonthTtl/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-from datetime import date
+      starter: `import redis
 
-import redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from billing import processor, store  # processor.charge_invoice, lookup_invoice; store.find_invoice
 
-import processor_pb2
-import processor_pb2_grpc
-
-app = FastAPI()
-logger = logging.getLogger("billing")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-processor = processor_pb2_grpc.ProcessorStub(__import__("grpc").insecure_channel("processor:9000"))
 
 MONTH_TTL_S = 30 * 24 * 3600
 
 
-class RunRequest(BaseModel):
-    subscription_id: str
-    period_start: str
-    action: str | None = None
+def marker_key(subscription_id: str, period_start: str) -> str:
+    return f"billing:run:{subscription_id}:{period_start}"
 
 
-def marker_key(subscription_id: str, period_start: date) -> str:
-    return f"billing:run:{subscription_id}:{period_start.isoformat()}"
-
-
-def charge_invoice(invoice) -> str:
-    reply = processor.Charge(
-        processor_pb2.ChargeRequest(invoice_id=invoice.id, amount_cents=invoice.amount_cents),
-        timeout=5.0,
-    )
-    return reply.charge_id
-
-
-def run_billing(subscription_id: str, period, action: str | None = None) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    invoice_ref = charge_invoice(period.invoice)
-    r.set(marker_key(subscription_id, period.period_start), "done", ex=MONTH_TTL_S)
-    logger.info("billed subscription=%s period=%s", subscription_id, period.period_start)
-    return {"status": "charged", "reference": invoice_ref}
-
-
-@app.post("/v1/billing-runs")
-def start_run(body: RunRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    period = load_period(body.subscription_id, body.period_start)
-    return run_billing(body.subscription_id, period, body.action)
+def run_billing(invoice_id: str) -> dict:
+    """Charge the invoice's period once; answers {invoice_id, state, reference, reason}."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    invoice = store.find_invoice(invoice_id)
+    key = marker_key(invoice["subscription_id"], invoice["period_start"])
+    if r.get(key) is not None:
+        return {"invoice_id": invoice_id, "state": "charged", "reference": "", "reason": ""}
+    outcome = processor.charge_invoice(invoice)
+    if outcome["state"] == "charged":
+        r.set(key, "done", ex=MONTH_TTL_S)
+    return {"invoice_id": invoice_id, **outcome}
 `,
-      solution: `import logging
-from datetime import date
+      solution: `import redis
 
-import grpc
-import redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from billing import processor, store  # processor.charge_invoice, lookup_invoice; store.find_invoice
 
-import processor_pb2
-import processor_pb2_grpc
-
-app = FastAPI()
-logger = logging.getLogger("billing")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-processor = processor_pb2_grpc.ProcessorStub(grpc.insecure_channel("processor:9000"))
-
-RUN_KEY = "billing:run:{subscription_id}:{period_start}"
 CLAIMED = "claimed"
-CHARGED = "charged:"
-PERIOD_CLOSED = "period_closed"
-ADJUSTMENT_ACTION = "adjustment"
-PROCESSOR_DEADLINE_S = 5.0
 
 
-class RunRequest(BaseModel):
-    subscription_id: str
-    period_start: str
-    action: str | None = None
+def marker_key(subscription_id: str, period_start: str) -> str:
+    return f"billing:run:{subscription_id}:{period_start}"
 
 
-def marker_key(subscription_id: str, period_start: date) -> str:
-    return RUN_KEY.format(subscription_id=subscription_id, period_start=period_start.isoformat())
-
-
-def claim_marker(subscription_id: str, period_start: date) -> bool:
-    """Claim the run. No TTL: a closed period must stay identifiable months after it ended."""
-    return bool(r.set(marker_key(subscription_id, period_start), CLAIMED, nx=True))
-
-
-def confirm_marker(subscription_id: str, period_start: date, invoice_ref: str) -> None:
-    """Record the charge reference, so the marker and the charge reconcile."""
-    r.set(marker_key(subscription_id, period_start), f"{CHARGED}{invoice_ref}")
-
-
-def charge_invoice(invoice) -> str:
-    reply = processor.Charge(
-        processor_pb2.ChargeRequest(
-            invoice_id=invoice.id,
-            amount_cents=invoice.amount_cents,
-            idempotency_key=invoice.id,
-        ),
-        timeout=PROCESSOR_DEADLINE_S,
-    )
-    return reply.charge_id
-
-
-def run_billing(subscription_id: str, period, action: str | None = None) -> dict:
-    if period.period_end < date.today() and action != ADJUSTMENT_ACTION:
-        return {"status": PERIOD_CLOSED, "action_required": ADJUSTMENT_ACTION}
-    if not claim_marker(subscription_id, period.period_start):
-        stored = r.get(marker_key(subscription_id, period.period_start)) or ""
-        if stored.startswith(CHARGED):
-            return {"status": "already_charged", "reference": stored[len(CHARGED) :]}
-        state = processor.GetInvoice(processor_pb2.GetInvoiceRequest(invoice_id=period.invoice.id))
-        if state.charge_id:
-            confirm_marker(subscription_id, period.period_start, state.charge_id)
-            return {"status": "reconciled", "reference": state.charge_id}
-        return {"status": "in_flight", "action_required": "retry_after_reconcile"}
-    invoice_ref = charge_invoice(period.invoice)
-    confirm_marker(subscription_id, period.period_start, invoice_ref)
-    logger.info("billed subscription=%s period=%s ref=%s", subscription_id, period.period_start, invoice_ref)
-    return {"status": "charged", "reference": invoice_ref}
-
-
-@app.post("/v1/billing-runs")
-def start_run(body: RunRequest, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    period = load_period(body.subscription_id, body.period_start)
-    result = run_billing(body.subscription_id, period, body.action)
-    if result["status"] == PERIOD_CLOSED:
-        raise HTTPException(status_code=409, detail={"action_required": ADJUSTMENT_ACTION})
-    return result
+def run_billing(invoice_id: str) -> dict:
+    """Charge the invoice's period once; answers {invoice_id, state, reference, reason}."""
+    invoice = store.find_invoice(invoice_id)
+    key = marker_key(invoice["subscription_id"], invoice["period_start"])
+    # One atomic claim, no expiry: exactly one runner per period gets past this line.
+    if r.set(key, CLAIMED, nx=True):
+        outcome = processor.charge_invoice(invoice)
+        if outcome["state"] == "charged":
+            r.set(key, f"charged:{outcome['reference']}")
+        return {"invoice_id": invoice_id, **outcome}
+    marker = r.get(key) or ""
+    if marker.startswith("charged:"):
+        return {"invoice_id": invoice_id, "state": "charged", "reference": marker.split(":", 1)[1], "reason": ""}
+    # Claimed and never confirmed: a run in flight, or one that crashed. The processor knows which.
+    found = processor.lookup_invoice(invoice_id)
+    if found is not None and found["state"] == "charged":
+        r.set(key, f"charged:{found['reference']}")
+        return {"invoice_id": invoice_id, "state": "charged", "reference": found["reference"], "reason": ""}
+    return {"invoice_id": invoice_id, "state": "in_flight", "reference": "", "reason": ""}
 `,
     },
     typescript: {
-      starter: `/** The billing run for one (subscription, period): the starter. */
-import {Redis} from 'ioredis';
-import Fastify from 'fastify';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-export const r = new Redis('redis://redis:6379');
+import {chargeInvoice, lookupInvoice} from 'billing/processor';
+import {type Invoice, findInvoice} from 'billing/store';
 
-const MONTH_TTL_S = 30 * 24 * 3600;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface RunRequest {
-  subscription_id: string;
-  period_start: string;
-  action?: string;
+export const MONTH_TTL_S = 30 * 24 * 3600;
+
+export const markerKey = (subscriptionId: string, periodStart: string): string => \`billing:run:\${subscriptionId}:\${periodStart}\`;
+
+/** Charge the invoice's period once; answers {invoice_id, state, reference, reason}. */
+export async function runBilling(invoiceId: string) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const invoice = (await findInvoice(invoiceId)) as Invoice;
+  const key = markerKey(invoice.subscription_id, invoice.period_start);
+  if ((await redis.get(key)) !== null) return {invoice_id: invoiceId, state: 'charged', reference: '', reason: ''};
+  const outcome = await chargeInvoice(invoice);
+  if (outcome.state === 'charged') await redis.set(key, 'done', 'EX', MONTH_TTL_S);
+  return {invoice_id: invoiceId, ...outcome};
 }
-
-interface Period {
-  period_start: string;
-  period_end: string;
-  invoice: {id: string; amount_cents: number};
-}
-
-export function markerKey(subscriptionId: string, periodStart: string): string {
-  return \`billing:run:\${subscriptionId}:\${periodStart}\`;
-}
-
-export async function chargeInvoice(invoice: {id: string; amount_cents: number}): Promise<string> {
-  const reply = await processor.Charge({invoice_id: invoice.id, amount_cents: invoice.amount_cents});
-  return reply.charge_id;
-}
-
-export async function runBilling(
-  subscriptionId: string,
-  period: Period,
-  action?: string,
-): Promise<{status: string; reference?: string}> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const invoiceRef = await chargeInvoice(period.invoice);
-  await r.set(markerKey(subscriptionId, period.period_start), 'done', 'EX', MONTH_TTL_S);
-  return {status: 'charged', reference: invoiceRef};
-}
-
-app.post('/v1/billing-runs', async (request, reply) => {
-  const body = request.body as RunRequest;
-  const period = await loadPeriod(body.subscription_id, body.period_start);
-  return reply.code(200).send(await runBilling(body.subscription_id, period, body.action));
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** The billing run for one (subscription, period): one atomic claim, one charge, one confirmation. */
-import {Redis} from 'ioredis';
-import Fastify from 'fastify';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-export const r = new Redis('redis://redis:6379');
+import {chargeInvoice, lookupInvoice} from 'billing/processor';
+import {type Invoice, findInvoice} from 'billing/store';
 
-const RUN_KEY = (subscriptionId: string, periodStart: string): string =>
-  \`billing:run:\${subscriptionId}:\${periodStart}\`;
-const CLAIMED = 'claimed';
-const CHARGED = 'charged:';
-const PERIOD_CLOSED = 'period_closed';
-const ADJUSTMENT_ACTION = 'adjustment';
-const PROCESSOR_DEADLINE_MS = 5000;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface RunRequest {
-  subscription_id: string;
-  period_start: string;
-  action?: string;
-}
+export const CLAIMED = 'claimed';
 
-interface Period {
-  period_start: string;
-  period_end: string;
-  invoice: {id: string; amount_cents: number};
-}
+export const markerKey = (subscriptionId: string, periodStart: string): string => \`billing:run:\${subscriptionId}:\${periodStart}\`;
 
-export const markerKey = RUN_KEY;
-
-export async function claimMarker(subscriptionId: string, periodStart: string): Promise<boolean> {
-  const claimed = await r.set(markerKey(subscriptionId, periodStart), CLAIMED, 'NX');
-  return claimed === 'OK';
-}
-
-export async function confirmMarker(subscriptionId: string, periodStart: string, invoiceRef: string): Promise<void> {
-  await r.set(markerKey(subscriptionId, periodStart), \`\${CHARGED}\${invoiceRef}\`);
-}
-
-export async function chargeInvoice(invoice: {id: string; amount_cents: number}): Promise<string> {
-  const reply = await processor.Charge(
-    {invoice_id: invoice.id, amount_cents: invoice.amount_cents, idempotency_key: invoice.id},
-    {deadline: Date.now() + PROCESSOR_DEADLINE_MS},
-  );
-  return reply.charge_id;
-}
-
-export async function runBilling(
-  subscriptionId: string,
-  period: Period,
-  action?: string,
-): Promise<{status: string; reference?: string; action_required?: string}> {
-  if (Date.parse(period.period_end) < Date.now() && action !== ADJUSTMENT_ACTION)
-    return {status: PERIOD_CLOSED, action_required: ADJUSTMENT_ACTION};
-  if (!(await claimMarker(subscriptionId, period.period_start))) {
-    const stored = (await r.get(markerKey(subscriptionId, period.period_start))) ?? '';
-    if (stored.startsWith(CHARGED)) return {status: 'already_charged', reference: stored.slice(CHARGED.length)};
-    const state = await processor.GetInvoice({invoice_id: period.invoice.id});
-    if (state.charge_id) {
-      await confirmMarker(subscriptionId, period.period_start, state.charge_id);
-      return {status: 'reconciled', reference: state.charge_id};
-    }
-    return {status: 'in_flight', action_required: 'retry_after_reconcile'};
+/** Charge the invoice's period once; answers {invoice_id, state, reference, reason}. */
+export async function runBilling(invoiceId: string) {
+  const invoice = (await findInvoice(invoiceId)) as Invoice;
+  const key = markerKey(invoice.subscription_id, invoice.period_start);
+  // One atomic claim, no expiry: exactly one runner per period gets past this line.
+  if ((await redis.set(key, CLAIMED, 'NX')) === 'OK') {
+    const outcome = await chargeInvoice(invoice);
+    if (outcome.state === 'charged') await redis.set(key, \`charged:\${outcome.reference}\`);
+    return {invoice_id: invoiceId, ...outcome};
   }
-  const invoiceRef = await chargeInvoice(period.invoice);
-  await confirmMarker(subscriptionId, period.period_start, invoiceRef);
-  return {status: 'charged', reference: invoiceRef};
+  const marker = (await redis.get(key)) ?? '';
+  if (marker.startsWith('charged:')) return {invoice_id: invoiceId, state: 'charged', reference: marker.slice('charged:'.length), reason: ''};
+  // Claimed and never confirmed: a run in flight, or one that crashed. The processor knows which.
+  const found = await lookupInvoice(invoiceId);
+  if (found !== null && found.state === 'charged') {
+    await redis.set(key, \`charged:\${found.reference}\`);
+    return {invoice_id: invoiceId, state: 'charged', reference: found.reference, reason: ''};
+  }
+  return {invoice_id: invoiceId, state: 'in_flight', reference: '', reason: ''};
 }
-
-app.post('/v1/billing-runs', async (request, reply) => {
-  const body = request.body as RunRequest;
-  const period = await loadPeriod(body.subscription_id, body.period_start);
-  const result = await runBilling(body.subscription_id, period, body.action);
-  if (result.status === PERIOD_CLOSED)
-    return reply.code(409).send({status: PERIOD_CLOSED, action_required: ADJUSTMENT_ACTION});
-  return reply.code(200).send(result);
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -387,474 +219,655 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"billing/processor" // processor.ChargeInvoice, LookupInvoice
+	"billing/store"     // store.FindInvoice, store.Outcome
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 const monthTTL = 30 * 24 * time.Hour
 
-type RunRequest struct {
-	SubscriptionID string \`json:"subscription_id"\`
-	PeriodStart    string \`json:"period_start"\`
-	Action         string \`json:"action"\`
-}
-
 func markerKey(subscriptionID, periodStart string) string {
 	return "billing:run:" + subscriptionID + ":" + periodStart
 }
 
-func ChargeInvoice(invoice Invoice) (string, error) {
-	reply, err := processor.Charge(context.Background(), &pb.ChargeRequest{
-		InvoiceId:   invoice.ID,
-		AmountCents: invoice.AmountCents,
-	})
-	if err != nil {
-		return "", err
+// runBilling charges the invoice's period once and answers what came of it.
+func runBilling(ctx context.Context, invoiceID string) (store.Outcome, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	invoice := store.FindInvoice(ctx, invoiceID)
+	key := markerKey(invoice.SubscriptionID, invoice.PeriodStart)
+	if _, err := rdb.Get(ctx, key).Result(); err == nil {
+		return store.Outcome{State: "charged"}, nil
+	} else if err != redis.Nil {
+		return store.Outcome{}, err
 	}
-	return reply.ChargeId, nil
-}
-
-// RunBilling bills one period of one subscription.
-func RunBilling(ctx context.Context, subscriptionID string, period Period, action string) (map[string]any, error) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	invoiceRef, err := ChargeInvoice(period.Invoice)
-	if err != nil {
-		return nil, err
+	outcome := processor.ChargeInvoice(ctx, invoice)
+	if outcome.State == "charged" {
+		if err := rdb.Set(ctx, key, "done", monthTTL).Err(); err != nil {
+			return outcome, err
+		}
 	}
-	rdb.Set(ctx, markerKey(subscriptionID, period.PeriodStart), "done", monthTTL)
-	log.Printf("billed subscription=%s period=%s", subscriptionID, period.PeriodStart)
-	return map[string]any{"status": "charged", "reference": invoiceRef}, nil
-}
-
-func startRun(rw http.ResponseWriter, r *http.Request) {
-	var body RunRequest
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	period := loadPeriod(r.Context(), body.SubscriptionID, body.PeriodStart)
-	result, _ := RunBilling(r.Context(), body.SubscriptionID, period, body.Action)
-	writeJSON(rw, http.StatusOK, result)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/billing-runs", startRun)
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	return outcome, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
 	"strings"
-	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"billing/processor" // processor.ChargeInvoice, LookupInvoice
+	"billing/store"     // store.FindInvoice, store.Outcome
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const (
-	claimed          = "claimed"
-	charged          = "charged:"
-	periodClosed     = "period_closed"
-	adjustmentAction = "adjustment"
-)
-
-type RunRequest struct {
-	SubscriptionID string \`json:"subscription_id"\`
-	PeriodStart    string \`json:"period_start"\`
-	Action         string \`json:"action"\`
-}
+const claimed = "claimed"
 
 func markerKey(subscriptionID, periodStart string) string {
 	return "billing:run:" + subscriptionID + ":" + periodStart
 }
 
-// ClaimMarker claims the run with one SET NX. No TTL: a closed period must stay identifiable.
-func ClaimMarker(ctx context.Context, subscriptionID, periodStart string) (bool, error) {
-	return rdb.SetNX(ctx, markerKey(subscriptionID, periodStart), claimed, 0).Result()
-}
-
-func ConfirmMarker(ctx context.Context, subscriptionID, periodStart, invoiceRef string) error {
-	return rdb.Set(ctx, markerKey(subscriptionID, periodStart), charged+invoiceRef, 0).Err()
-}
-
-func ChargeInvoice(invoice Invoice) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	reply, err := processor.Charge(ctx, &pb.ChargeRequest{
-		InvoiceId:      invoice.ID,
-		AmountCents:    invoice.AmountCents,
-		IdempotencyKey: invoice.ID,
-	})
+// runBilling charges the invoice's period once and answers what came of it.
+func runBilling(ctx context.Context, invoiceID string) (store.Outcome, error) {
+	invoice := store.FindInvoice(ctx, invoiceID)
+	key := markerKey(invoice.SubscriptionID, invoice.PeriodStart)
+	// One atomic claim, no expiry: exactly one runner per period gets past this line.
+	ours, err := rdb.SetNX(ctx, key, claimed, 0).Result()
 	if err != nil {
-		return "", err
+		return store.Outcome{}, err
 	}
-	return reply.ChargeId, nil
-}
-
-// RunBilling bills one period of one subscription exactly once.
-func RunBilling(ctx context.Context, subscriptionID string, period Period, action string) (map[string]any, error) {
-	if period.PeriodEnd.Before(time.Now()) && action != adjustmentAction {
-		return map[string]any{"status": periodClosed, "action_required": adjustmentAction}, nil
-	}
-	ok, err := ClaimMarker(ctx, subscriptionID, period.PeriodStart)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		stored, _ := rdb.Get(ctx, markerKey(subscriptionID, period.PeriodStart)).Result()
-		if strings.HasPrefix(stored, charged) {
-			return map[string]any{"status": "already_charged", "reference": strings.TrimPrefix(stored, charged)}, nil
-		}
-		state, err := processor.GetInvoice(ctx, &pb.GetInvoiceRequest{InvoiceId: period.Invoice.ID})
-		if err != nil {
-			return nil, err
-		}
-		if state.ChargeId != "" {
-			if err := ConfirmMarker(ctx, subscriptionID, period.PeriodStart, state.ChargeId); err != nil {
-				return nil, err
+	if ours {
+		outcome := processor.ChargeInvoice(ctx, invoice)
+		if outcome.State == "charged" {
+			if err := rdb.Set(ctx, key, "charged:"+outcome.Reference, 0).Err(); err != nil {
+				return outcome, err
 			}
-			return map[string]any{"status": "reconciled", "reference": state.ChargeId}, nil
 		}
-		return map[string]any{"status": "in_flight", "action_required": "retry_after_reconcile"}, nil
+		return outcome, nil
 	}
-	invoiceRef, err := ChargeInvoice(period.Invoice)
-	if err != nil {
-		return nil, err
+	marker, err := rdb.Get(ctx, key).Result()
+	if err != nil && err != redis.Nil {
+		return store.Outcome{}, err
 	}
-	if err := ConfirmMarker(ctx, subscriptionID, period.PeriodStart, invoiceRef); err != nil {
-		return nil, err
+	if strings.HasPrefix(marker, "charged:") {
+		return store.Outcome{State: "charged", Reference: strings.TrimPrefix(marker, "charged:")}, nil
 	}
-	log.Printf("billed subscription=%s period=%s ref=%s", subscriptionID, period.PeriodStart, invoiceRef)
-	return map[string]any{"status": "charged", "reference": invoiceRef}, nil
-}
-
-func startRun(rw http.ResponseWriter, r *http.Request) {
-	var body RunRequest
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	period := loadPeriod(r.Context(), body.SubscriptionID, body.PeriodStart)
-	result, err := RunBilling(r.Context(), body.SubscriptionID, period, body.Action)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+	// Claimed and never confirmed: a run in flight, or one that crashed. The processor knows which.
+	if found := processor.LookupInvoice(ctx, invoiceID); found != nil && found.State == "charged" {
+		if err := rdb.Set(ctx, key, "charged:"+found.Reference, 0).Err(); err != nil {
+			return store.Outcome{}, err
+		}
+		return store.Outcome{State: "charged", Reference: found.Reference}, nil
 	}
-	if result["status"] == periodClosed {
-		rw.WriteHeader(http.StatusConflict)
-		writeJSON(rw, http.StatusConflict, map[string]string{"action_required": adjustmentAction})
-		return
-	}
-	writeJSON(rw, http.StatusOK, result)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/billing-runs", startRun)
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	return store.Outcome{State: "in_flight"}, nil
 }
 `,
     },
     scala: {
-      starter: `import java.time.{Duration, LocalDate}
+      starter: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import billing.{Processor, Store} // Processor.chargeInvoice, lookupInvoice; Store.findInvoice, Store.Outcome
 
-final case class RunRequest(subscription_id: String, period_start: String, action: Option[String])
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-object BillingRun {
-  implicit val system: ActorSystem = ActorSystem("billing")
-  implicit val runFormat: RootJsonFormat[RunRequest] = jsonFormat3(RunRequest)
+  val MonthTtlSeconds: Long = 30L * 24 * 3600
 
-  val monthTtl = Duration.ofDays(30).getSeconds
-  val jedis = new Jedis("redis", 6379)
+  def markerKey(subscriptionId: String, periodStart: String): String = s"billing:run:$subscriptionId:$periodStart"
 
-  def markerKey(subscriptionId: String, periodStart: LocalDate): String =
-    s"billing:run:$subscriptionId:$periodStart"
-
-  def chargeInvoice(invoice: Invoice): String =
-    processor.Charge(ChargeRequest(invoice.id, invoice.amount_cents)).chargeId
-
-  def runBilling(subscriptionId: String, period: Period, action: Option[String]): Map[String, String] = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val invoiceRef = chargeInvoice(period.invoice)
-    jedis.setex(markerKey(subscriptionId, period.period_start), monthTtl, "done")
-    Map("status" -> "charged", "reference" -> invoiceRef)
-  }
-
-  val route: Route =
-    path("v1" / "billing-runs") {
-      post {
-        entity(as[RunRequest]) { body =>
-          val period = loadPeriod(body.subscription_id, body.period_start)
-          complete(StatusCodes.OK, runBilling(body.subscription_id, period, body.action))
-        }
-      }
+  /** Charge the invoice's period once and answer what came of it. */
+  def runBilling(invoiceId: String): Store.Outcome = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val invoice = Store.findInvoice(invoiceId).get
+    val key = markerKey(invoice.subscriptionId, invoice.periodStart)
+    if (jedis.get(key) != null) Store.Outcome("charged", "", "")
+    else {
+      val outcome = Processor.chargeInvoice(invoice)
+      if (outcome.state == "charged") jedis.set(key, "done", SetParams.setParams().ex(MonthTtlSeconds))
+      outcome
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.time.{Duration, LocalDate}
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class RunRequest(subscription_id: String, period_start: String, action: Option[String])
+import billing.{Processor, Store} // Processor.chargeInvoice, lookupInvoice; Store.findInvoice, Store.Outcome
 
-object BillingRun {
-  implicit val system: ActorSystem = ActorSystem("billing")
-  implicit val runFormat: RootJsonFormat[RunRequest] = jsonFormat3(RunRequest)
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
   val Claimed = "claimed"
-  val ChargedPrefix = "charged:"
-  val PeriodClosed = "period_closed"
-  val AdjustmentAction = "adjustment"
-  val jedis = new Jedis("redis", 6379)
 
-  def markerKey(subscriptionId: String, periodStart: LocalDate): String =
-    s"billing:run:$subscriptionId:$periodStart"
+  def markerKey(subscriptionId: String, periodStart: String): String = s"billing:run:$subscriptionId:$periodStart"
 
-  // One SET NX, no expiry: a closed period stays identifiable months after it ended.
-  def claimMarker(subscriptionId: String, periodStart: LocalDate): Boolean =
-    jedis.set(markerKey(subscriptionId, periodStart), Claimed, SetParams.setParams().nx()) == "OK"
-
-  def confirmMarker(subscriptionId: String, periodStart: LocalDate, invoiceRef: String): Unit =
-    jedis.set(markerKey(subscriptionId, periodStart), ChargedPrefix + invoiceRef)
-
-  def chargeInvoice(invoice: Invoice): String =
-    processor.Charge(ChargeRequest(invoice.id, invoice.amount_cents, invoice.id)).chargeId
-
-  def runBilling(subscriptionId: String, period: Period, action: Option[String]): Map[String, String] = {
-    if (period.period_end.isBefore(LocalDate.now()) && !action.contains(AdjustmentAction))
-      return Map("status" -> PeriodClosed, "action_required" -> AdjustmentAction)
-    if (!claimMarker(subscriptionId, period.period_start)) {
-      val stored = Option(jedis.get(markerKey(subscriptionId, period.period_start))).getOrElse("")
-      if (stored.startsWith(ChargedPrefix))
-        return Map("status" -> "already_charged", "reference" -> stored.stripPrefix(ChargedPrefix))
-      val state = processor.GetInvoice(GetInvoiceRequest(period.invoice.id))
-      if (state.chargeId.nonEmpty) {
-        confirmMarker(subscriptionId, period.period_start, state.chargeId)
-        return Map("status" -> "reconciled", "reference" -> state.chargeId)
-      }
-      return Map("status" -> "in_flight", "action_required" -> "retry_after_reconcile")
-    }
-    val invoiceRef = chargeInvoice(period.invoice)
-    confirmMarker(subscriptionId, period.period_start, invoiceRef)
-    Map("status" -> "charged", "reference" -> invoiceRef)
-  }
-
-  val route: Route =
-    path("v1" / "billing-runs") {
-      post {
-        entity(as[RunRequest]) { body =>
-          val period = loadPeriod(body.subscription_id, body.period_start)
-          runBilling(body.subscription_id, period, body.action) match {
-            case result if result("status") == PeriodClosed =>
-              complete(
-                StatusCodes.Conflict,
-                """{"status":"period_closed","action_required":"adjustment"}"""
-              )
-            case result => complete(StatusCodes.OK, result)
-          }
+  /** Charge the invoice's period once and answer what came of it. */
+  def runBilling(invoiceId: String): Store.Outcome = {
+    val invoice = Store.findInvoice(invoiceId).get
+    val key = markerKey(invoice.subscriptionId, invoice.periodStart)
+    // One atomic claim, no expiry: exactly one runner per period gets past this line.
+    if (jedis.set(key, Claimed, SetParams.setParams().nx()) == "OK") {
+      val outcome = Processor.chargeInvoice(invoice)
+      if (outcome.state == "charged") jedis.set(key, s"charged:\${outcome.reference}")
+      outcome
+    } else {
+      val marker = Option(jedis.get(key)).getOrElse("")
+      if (marker.startsWith("charged:")) Store.Outcome("charged", marker.stripPrefix("charged:"), "")
+      else
+        // Claimed and never confirmed: a run in flight, or one that crashed. The processor knows which.
+        Processor.lookupInvoice(invoiceId).filter(_.state == "charged") match {
+          case Some(found) =>
+            jedis.set(key, s"charged:\${found.reference}")
+            Store.Outcome("charged", found.reference, "")
+          case None => Store.Outcome("in_flight", "", "")
         }
-      }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <iostream>
 #include <string>
 
-using json = nlohmann::json;
+#include "billing/processor.h"  // processor::chargeInvoice, lookupInvoice
+#include "billing/store.h"      // store::findInvoice, store::Outcome
 
-constexpr long kMonthTtl = 30L * 24L * 3600L;
+sw::redis::Redis redis("tcp://redis:6379");
 
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
-
-struct Period {
-  std::string period_start;
-  std::string period_end;
-  Invoice invoice;
-};
+constexpr std::chrono::hours kMonthTtl{30 * 24};
 
 std::string markerKey(const std::string& subscription_id, const std::string& period_start) {
   return "billing:run:" + subscription_id + ":" + period_start;
 }
 
-std::string chargeInvoice(const Invoice& invoice) {
-  ChargeRequest request;
-  request.set_invoice_id(invoice.id());
-  request.set_amount_cents(invoice.amount_cents());
-  ChargeReply reply;
-  grpc::ClientContext ctx;
-  processor->Charge(&ctx, request, &reply);
-  return reply.charge_id();
-}
-
-// RunBilling bills one period of one subscription.
-json runBilling(const std::string& subscription_id, const Period& period, const std::string& action) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const auto invoice_reference = chargeInvoice(period.invoice);
-  redis->setex(markerKey(subscription_id, period.period_start), kMonthTtl, "done");
-  std::cout << "billed subscription=" << subscription_id << " period=" << period.period_start << "\\n";
-  return json{{"status", "charged"}, {"reference", invoice_reference}};
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/billing-runs", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    const auto subscription_id = body.value("subscription_id", std::string());
-    const auto period = loadPeriod(subscription_id, body.value("period_start", std::string()));
-    res.status = 200;
-    res.set_content(runBilling(subscription_id, period, body.value("action", std::string())).dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Charge the invoice's period once and answer what came of it.
+store::Outcome runBilling(const std::string& invoice_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const store::Invoice invoice = *store::findInvoice(invoice_id);
+  const std::string key = markerKey(invoice.subscription_id, invoice.period_start);
+  if (redis.get(key)) return store::Outcome{"charged", "", ""};
+  const store::Outcome outcome = processor::chargeInvoice(invoice);
+  if (outcome.state == "charged") redis.set(key, "done", kMonthTtl);
+  return outcome;
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <iostream>
 #include <string>
 
-using json = nlohmann::json;
+#include "billing/processor.h"  // processor::chargeInvoice, lookupInvoice
+#include "billing/store.h"      // store::findInvoice, store::Outcome
+
+sw::redis::Redis redis("tcp://redis:6379");
 
 const std::string kClaimed = "claimed";
-const std::string kChargedPrefix = "charged:";
-const std::string kPeriodClosed = "period_closed";
-const std::string kAdjustmentAction = "adjustment";
-
-std::unique_ptr<sw::redis::Redis> redis = std::make_unique<sw::redis::Redis>("tcp://redis:6379");
-
-struct Period {
-  std::string period_start;
-  std::string period_end;
-  Invoice invoice;
-};
+const std::string kCharged = "charged:";
 
 std::string markerKey(const std::string& subscription_id, const std::string& period_start) {
   return "billing:run:" + subscription_id + ":" + period_start;
 }
 
-// One SET NX (UpdateType::NOT_EXIST) and no TTL: a closed period stays identifiable for good.
-bool claimMarker(const std::string& subscription_id, const std::string& period_start) {
-  return redis->set(markerKey(subscription_id, period_start), kClaimed, std::chrono::seconds(0),
-                    sw::redis::UpdateType::NOT_EXIST);
-}
-
-void confirmMarker(const std::string& subscription_id, const std::string& period_start,
-                   const std::string& invoice_reference) {
-  redis->set(markerKey(subscription_id, period_start), kChargedPrefix + invoice_reference);
-}
-
-std::string chargeInvoice(const Invoice& invoice) {
-  ChargeRequest request;
-  request.set_invoice_id(invoice.id());
-  request.set_amount_cents(invoice.amount_cents());
-  request.set_idempotency_key(invoice.id());
-  ChargeReply reply;
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
-  processor->Charge(&ctx, request, &reply);
-  return reply.charge_id();
-}
-
-json runBilling(const std::string& subscription_id, const Period& period, const std::string& action) {
-  if (period.period_end < todayIso() && action != kAdjustmentAction) {
-    return json{{"status", kPeriodClosed}, {"action_required", kAdjustmentAction}};
+// Charge the invoice's period once and answer what came of it.
+store::Outcome runBilling(const std::string& invoice_id) {
+  const store::Invoice invoice = *store::findInvoice(invoice_id);
+  const std::string key = markerKey(invoice.subscription_id, invoice.period_start);
+  // One atomic claim, no expiry: exactly one runner per period gets past this line.
+  if (redis.set(key, kClaimed, std::chrono::milliseconds(0), sw::redis::UpdateType::NOT_EXIST)) {
+    const store::Outcome outcome = processor::chargeInvoice(invoice);
+    if (outcome.state == "charged") redis.set(key, kCharged + outcome.reference);
+    return outcome;
   }
-  if (!claimMarker(subscription_id, period.period_start)) {
-    const auto stored = redis->get(markerKey(subscription_id, period.period_start)).value_or("");
-    if (stored.rfind(kChargedPrefix, 0) == 0) {
-      return json{{"status", "already_charged"}, {"reference", stored.substr(kChargedPrefix.size())}};
-    }
-    grpc::ClientContext rctx;
-    GetInvoiceRequest request;
-    request.set_invoice_id(period.invoice.id());
-    GetInvoiceReply state;
-    processor->GetInvoice(&rctx, request, &state);
-    if (!state.charge_id().empty()) {
-      confirmMarker(subscription_id, period.period_start, state.charge_id());
-      return json{{"status", "reconciled"}, {"reference", state.charge_id()}};
-    }
-    return json{{"status", "in_flight"}, {"action_required", "retry_after_reconcile"}};
+  const std::string marker = redis.get(key).value_or("");
+  if (marker.rfind(kCharged, 0) == 0) return store::Outcome{"charged", marker.substr(kCharged.size()), ""};
+  // Claimed and never confirmed: a run in flight, or one that crashed. The processor knows which.
+  const auto found = processor::lookupInvoice(invoice_id);
+  if (found && found->state == "charged") {
+    redis.set(key, kCharged + found->reference);
+    return store::Outcome{"charged", found->reference, ""};
   }
-  const auto invoice_reference = chargeInvoice(period.invoice);
-  confirmMarker(subscription_id, period.period_start, invoice_reference);
-  std::cout << "billed subscription=" << subscription_id << " period=" << period.period_start
-            << " ref=" << invoice_reference << "\\n";
-  return json{{"status", "charged"}, {"reference", invoice_reference}};
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/billing-runs", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    const auto subscription_id = body.value("subscription_id", std::string());
-    const auto period = loadPeriod(subscription_id, body.value("period_start", std::string()));
-    const auto result = runBilling(subscription_id, period, body.value("action", std::string()));
-    if (result.at("status") == kPeriodClosed) {
-      res.status = 409;
-      res.set_content(
-          json{{"status", kPeriodClosed}, {"action_required", kAdjustmentAction}}.dump(),
-          "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(result.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  return store::Outcome{"in_flight", "", ""};
 }
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import subscription_billing_pb2 as pb
+import subscription_billing_pb2_grpc
+from billing import store
+
+KEY = "billing:run:sub_1:2026-03-01"
+
+
+class Processor(subscription_billing_pb2_grpc.ProcessorServicer):
+    """A processor that keeps what it charged per invoice and answers a repeated idempotency key with the first charge."""
+
+    def __init__(self):
+        self.charged = {}  # invoice_id -> (reference, total_cents)
+        self.keys = {}
+        self.charges = 0
+
+    def Charge(self, request, context):
+        if request.idempotency_key not in self.keys:
+            self.charges += 1
+            reference = f"ch_{self.charges}"
+            _, total = self.charged.get(request.invoice_id, ("", 0))
+            self.charged[request.invoice_id] = (reference, total + request.amount_cents)
+            self.keys[request.idempotency_key] = reference
+        return pb.ChargeResult(status="succeeded", reference=self.keys[request.idempotency_key])
+
+    def GetInvoice(self, request, context):
+        if request.invoice_id not in self.charged:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"no charge for {request.invoice_id}")
+        reference, total = self.charged[request.invoice_id]
+        return pb.ProcessorInvoice(invoice_id=request.invoice_id, state="charged", reference=reference, total_cents=total)
+
+
+def _world(ctx):
+    processor = Processor()
+    ctx.grpc.serve(subscription_billing_pb2_grpc.add_ProcessorServicer_to_server, processor)
+    store.put_subscription("sub_1", "t-acme", "scale", "2026-03-01", "2026-04-01")
+    invoice = store.open_invoice("sub_1", "2026-03-01", "2026-04-01", 9900)
+    return ctx.load("state"), processor, invoice["invoice_id"]
+
+
+def _charges(ctx):
+    return len(ctx.grpc.calls_to("Charge"))
+
+
+def check_claim(ctx):
+    m, processor, invoice_id = _world(ctx)
+    # A second runner for the same period lands right after this run's first marker command.
+    rival = ctx.redis_after(KEY, lambda: m.run_billing(invoice_id))
+    first = m.run_billing(invoice_id)
+    assert rival.fired, f"run_billing never touched the run marker {KEY}"
+    if rival.error is not None:
+        raise rival.error
+    assert _charges(ctx) == 1, f"two runners for one period made {_charges(ctx)} Charge calls: claim the marker with SET NX before charging, and do not charge on a claim you lost"
+    states = sorted([first["state"], rival.result["state"]])
+    assert "charged" in states, f"neither runner reports the charge: {first}, {rival.result}"
+
+
+def check_confirm_reference(ctx):
+    m, processor, invoice_id = _world(ctx)
+    first = m.run_billing(invoice_id)
+    assert first["state"] == "charged" and first["reference"] == "ch_1", f"the first run answered {first}, expected the processor's reference ch_1"
+    marker = ctx.redis.get(KEY)
+    assert marker == "charged:ch_1", f"after the charge the marker holds {marker!r}, expected 'charged:ch_1': the marker must name the charge that billed the period"
+    again = m.run_billing(invoice_id)
+    assert again["state"] == "charged" and again["reference"] == "ch_1", f"a second run answered {again}, expected the recorded reference ch_1"
+    assert _charges(ctx) == 1, f"the second run called Charge again ({_charges(ctx)} calls)"
+
+
+def check_reconcile_claim(ctx):
+    m, processor, invoice_id = _world(ctx)
+    # A run claimed the period, the processor charged, and the run crashed before confirming.
+    ctx.redis.set(KEY, "claimed")
+    processor.charged[invoice_id] = ("ch_crashed", 9900)
+    outcome = m.run_billing(invoice_id)
+    assert outcome["state"] == "charged" and outcome["reference"] == "ch_crashed", f"a claim left by a crashed run answered {outcome}: the processor holds ch_crashed for the invoice, ask lookup_invoice and adopt it"
+    assert ctx.redis.get(KEY) == "charged:ch_crashed", f"the adopted charge must confirm the marker, it holds {ctx.redis.get(KEY)!r}"
+    assert _charges(ctx) == 0, "reconciling a claim must not call Charge"
+    # A run claimed the period and is still waiting on the processor, which holds nothing yet.
+    other = store.open_invoice("sub_1", "2026-04-01", "2026-05-01", 9900)
+    ctx.redis.set("billing:run:sub_1:2026-04-01", "claimed")
+    outcome = m.run_billing(other["invoice_id"])
+    assert outcome["state"] == "in_flight", f"a claim the processor knows nothing about answered {outcome}, expected in_flight: another run owns the period"
+    assert _charges(ctx) == 0, "a runner must not charge on another run's claim"
+
+
+def check_marker_persists(ctx):
+    m, processor, invoice_id = _world(ctx)
+    m.run_billing(invoice_id)
+    ttl = ctx.redis.ttl(KEY)
+    assert ttl == -1, f"the run marker expires in {ttl} s: a retry after that charges the period again. It must not expire"
+    ctx.clock.advance(40 * 24 * 3600)
+    again = m.run_billing(invoice_id)
+    assert _charges(ctx) == 1, f"a retry 40 days later called Charge again and answered {again}"
+`,
+    typescript: `const KEY = 'billing:run:sub_1:2026-03-01';
+
+/** A processor that keeps what it charged per invoice and answers a repeated idempotency key with the first charge. */
+async function world(ctx) {
+  const pkg = ctx.proto('subscription_billing.proto');
+  const charged = new Map<string, {reference: string; total: number}>();
+  const keys = new Map<string, string>();
+  let charges = 0;
+  ctx.grpc.serve(pkg.subbilling.Processor.service, {
+    Charge(call, callback) {
+      const {invoice_id, amount_cents, idempotency_key} = call.request;
+      if (!keys.has(idempotency_key)) {
+        charges += 1;
+        const reference = \`ch_\${charges}\`;
+        charged.set(invoice_id, {reference, total: (charged.get(invoice_id)?.total ?? 0) + Number(amount_cents)});
+        keys.set(idempotency_key, reference);
+      }
+      callback(null, {status: 'succeeded', reference: keys.get(idempotency_key), decline_code: ''});
+    },
+    GetInvoice(call, callback) {
+      const found = charged.get(call.request.invoice_id);
+      if (found === undefined) return callback({code: ctx.grpc.status.NOT_FOUND, details: \`no charge for \${call.request.invoice_id}\`});
+      callback(null, {invoice_id: call.request.invoice_id, state: 'charged', reference: found.reference, total_cents: found.total});
+    },
+  });
+  const store = ctx.load('/support/billing/store.ts');
+  await store.putSubscription('sub_1', 't-acme', 'scale', '2026-03-01', '2026-04-01');
+  const invoice = await store.openInvoice('sub_1', '2026-03-01', '2026-04-01', 9900);
+  return {m: ctx.load('state'), store, charged, invoiceId: invoice.invoice_id};
+}
+
+const charges = ctx => ctx.grpc.callsTo('Charge').length;
+
+export async function check_claim(ctx) {
+  const {m, invoiceId} = await world(ctx);
+  // A second runner for the same period lands right after this run's first marker command.
+  const rival = ctx.redisAfter(KEY, () => m.runBilling(invoiceId));
+  const first = await m.runBilling(invoiceId);
+  assert(rival.fired, \`runBilling never touched the run marker \${KEY}\`);
+  const second = await rival.result;
+  assert.equal(charges(ctx), 1, \`two runners for one period made \${charges(ctx)} Charge calls: claim the marker with SET NX before charging, and do not charge on a claim you lost\`);
+  assert(first.state === 'charged' || second.state === 'charged', \`neither runner reports the charge: \${JSON.stringify(first)}, \${JSON.stringify(second)}\`);
+}
+
+export async function check_confirm_reference(ctx) {
+  const {m, invoiceId} = await world(ctx);
+  const first = await m.runBilling(invoiceId);
+  assert(first.state === 'charged' && first.reference === 'ch_1', \`the first run answered \${JSON.stringify(first)}, expected the processor's reference ch_1\`);
+  const marker = ctx.redis.get(KEY);
+  assert.equal(marker, 'charged:ch_1', \`after the charge the marker holds \${JSON.stringify(marker)}, expected 'charged:ch_1': the marker must name the charge that billed the period\`);
+  const again = await m.runBilling(invoiceId);
+  assert(again.state === 'charged' && again.reference === 'ch_1', \`a second run answered \${JSON.stringify(again)}, expected the recorded reference ch_1\`);
+  assert.equal(charges(ctx), 1, \`the second run called Charge again (\${charges(ctx)} calls)\`);
+}
+
+export async function check_reconcile_claim(ctx) {
+  const {m, store, charged, invoiceId} = await world(ctx);
+  // A run claimed the period, the processor charged, and the run crashed before confirming.
+  ctx.redis.set(KEY, 'claimed');
+  charged.set(invoiceId, {reference: 'ch_crashed', total: 9900});
+  let outcome = await m.runBilling(invoiceId);
+  assert(outcome.state === 'charged' && outcome.reference === 'ch_crashed', \`a claim left by a crashed run answered \${JSON.stringify(outcome)}: the processor holds ch_crashed for the invoice, ask lookupInvoice and adopt it\`);
+  assert.equal(ctx.redis.get(KEY), 'charged:ch_crashed', 'the adopted charge must confirm the marker');
+  assert.equal(charges(ctx), 0, 'reconciling a claim must not call Charge');
+  // A run claimed the period and is still waiting on the processor, which holds nothing yet.
+  const other = await store.openInvoice('sub_1', '2026-04-01', '2026-05-01', 9900);
+  ctx.redis.set('billing:run:sub_1:2026-04-01', 'claimed');
+  outcome = await m.runBilling(other.invoice_id);
+  assert.equal(outcome.state, 'in_flight', \`a claim the processor knows nothing about answered \${JSON.stringify(outcome)}, expected in_flight: another run owns the period\`);
+  assert.equal(charges(ctx), 0, "a runner must not charge on another run's claim");
+}
+
+export async function check_marker_persists(ctx) {
+  const {m, invoiceId} = await world(ctx);
+  await m.runBilling(invoiceId);
+  const ttl = ctx.redis.ttl(KEY);
+  assert.equal(ttl, -1, \`the run marker expires in \${ttl} s: a retry after that charges the period again. It must not expire\`);
+  ctx.clock.advance(40 * 24 * 3600);
+  const again = await m.runBilling(invoiceId);
+  assert.equal(charges(ctx), 1, \`a retry 40 days later called Charge again and answered \${JSON.stringify(again)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "billing/gen/subscription_billing"
+	"billing/store"
+
+	"leetbuild/harness"
+)
+
+const stateKey = "billing:run:sub_1:2026-03-01"
+
+var stateBg = context.Background()
+
+type charge struct {
+	reference string
+	total     int64
+}
+
+// stateProcessor keeps what it charged per invoice and answers a repeated idempotency key with the first charge.
+type stateProcessor struct {
+	pb.UnimplementedProcessorServer
+	charged map[string]charge
+	keys    map[string]string
+	charges int
+}
+
+func (p *stateProcessor) Charge(_ context.Context, req *pb.ChargeRequest) (*pb.ChargeResult, error) {
+	if _, seen := p.keys[req.GetIdempotencyKey()]; !seen {
+		p.charges++
+		reference := fmt.Sprintf("ch_%d", p.charges)
+		p.charged[req.GetInvoiceId()] = charge{reference, p.charged[req.GetInvoiceId()].total + req.GetAmountCents()}
+		p.keys[req.GetIdempotencyKey()] = reference
+	}
+	return &pb.ChargeResult{Status: "succeeded", Reference: p.keys[req.GetIdempotencyKey()]}, nil
+}
+
+func (p *stateProcessor) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*pb.ProcessorInvoice, error) {
+	found, ok := p.charged[req.GetInvoiceId()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no charge for %s", req.GetInvoiceId())
+	}
+	return &pb.ProcessorInvoice{InvoiceId: req.GetInvoiceId(), State: "charged", Reference: found.reference, TotalCents: found.total}, nil
+}
+
+func stateWorld(ctx *harness.Ctx) (*stateProcessor, string) {
+	p := &stateProcessor{charged: map[string]charge{}, keys: map[string]string{}}
+	pb.RegisterProcessorServer(ctx.GRPC.Server(""), p)
+	store.PutSubscription(stateBg, "sub_1", "t-acme", "scale", "2026-03-01", "2026-04-01")
+	return p, store.OpenInvoice(stateBg, "sub_1", "2026-03-01", "2026-04-01", 9900).InvoiceID
+}
+
+func run(ctx *harness.Ctx, invoiceID string) store.Outcome {
+	outcome, err := runBilling(stateBg, invoiceID)
+	ctx.NoError(err, "runBilling(%s)", invoiceID)
+	return outcome
+}
+
+func stateCharges(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Charge", "")) }
+
+func CheckClaim(ctx *harness.Ctx) {
+	_, invoiceID := stateWorld(ctx)
+	// A second runner for the same period lands right after this run's first marker command.
+	rival := ctx.Redis.After(stateKey, func() any {
+		outcome, _ := runBilling(stateBg, invoiceID)
+		return outcome
+	})
+	first := run(ctx, invoiceID)
+	ctx.Assert(rival.Fired, "runBilling never touched the run marker %s", stateKey)
+	ctx.Equal(stateCharges(ctx), 1, "two runners for one period must make one Charge call (claim the marker with SET NX before charging, and do not charge on a claim you lost); Charge calls")
+	second, _ := rival.Result.(store.Outcome)
+	ctx.Assert(first.State == "charged" || second.State == "charged", "neither runner reports the charge: %+v, %+v", first, second)
+}
+
+func CheckConfirmReference(ctx *harness.Ctx) {
+	_, invoiceID := stateWorld(ctx)
+	first := run(ctx, invoiceID)
+	ctx.Assert(first.State == "charged" && first.Reference == "ch_1", "the first run answered %+v, expected the processor's reference ch_1", first)
+	marker, _ := ctx.Redis.Get(stateKey)
+	ctx.Equal(marker, "charged:ch_1", "after the charge the marker must name the charge that billed the period; the marker")
+	again := run(ctx, invoiceID)
+	ctx.Assert(again.State == "charged" && again.Reference == "ch_1", "a second run answered %+v, expected the recorded reference ch_1", again)
+	ctx.Equal(stateCharges(ctx), 1, "the second run must not call Charge again; Charge calls")
+}
+
+func CheckReconcileClaim(ctx *harness.Ctx) {
+	p, invoiceID := stateWorld(ctx)
+	// A run claimed the period, the processor charged, and the run crashed before confirming.
+	ctx.Redis.Set(stateKey, "claimed")
+	p.charged[invoiceID] = charge{"ch_crashed", 9900}
+	outcome := run(ctx, invoiceID)
+	ctx.Assert(outcome.State == "charged" && outcome.Reference == "ch_crashed", "a claim left by a crashed run answered %+v: the processor holds ch_crashed for the invoice, ask LookupInvoice and adopt it", outcome)
+	marker, _ := ctx.Redis.Get(stateKey)
+	ctx.Equal(marker, "charged:ch_crashed", "the adopted charge must confirm the marker; the marker")
+	ctx.Equal(stateCharges(ctx), 0, "reconciling a claim must not call Charge; Charge calls")
+	// A run claimed the period and is still waiting on the processor, which holds nothing yet.
+	other := store.OpenInvoice(stateBg, "sub_1", "2026-04-01", "2026-05-01", 9900)
+	ctx.Redis.Set("billing:run:sub_1:2026-04-01", "claimed")
+	outcome = run(ctx, other.InvoiceID)
+	ctx.Equal(outcome.State, "in_flight", "a claim the processor knows nothing about belongs to another run; the state")
+	ctx.Equal(stateCharges(ctx), 0, "a runner must not charge on another run's claim; Charge calls")
+}
+
+func CheckMarkerPersists(ctx *harness.Ctx) {
+	_, invoiceID := stateWorld(ctx)
+	run(ctx, invoiceID)
+	ttl := ctx.Redis.TTL(stateKey)
+	ctx.Assert(ttl == -1, "the run marker expires in %d s: a retry after that charges the period again. It must not expire", ttl)
+	ctx.Clock.Advance(40 * 24 * 3600)
+	again := run(ctx, invoiceID)
+	ctx.Assert(stateCharges(ctx) == 1, "a retry 40 days later called Charge again and answered %+v", again)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "billing/store.h"
+#include "subscription_billing.grpc.pb.h"
+
+namespace {
+
+const std::string kKey = "billing:run:sub_1:2026-03-01";
+
+struct Landed {
+  std::string reference;
+  long long total = 0;
+};
+
+// A processor that keeps what it charged per invoice and answers a repeated idempotency key with the first charge.
+class ProcessorPeer final : public subbilling::Processor::Service {
+ public:
+  std::map<std::string, Landed> charged;
+  std::map<std::string, std::string> keys;
+  int charges = 0;
+
+  grpc::Status Charge(grpc::ServerContext*, const subbilling::ChargeRequest* req, subbilling::ChargeResult* out) override {
+    if (!keys.count(req->idempotency_key())) {
+      charges++;
+      const std::string reference = "ch_" + std::to_string(charges);
+      charged[req->invoice_id()] = {reference, charged[req->invoice_id()].total + req->amount_cents()};
+      keys[req->idempotency_key()] = reference;
+    }
+    out->set_status("succeeded");
+    out->set_reference(keys[req->idempotency_key()]);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetInvoice(grpc::ServerContext*, const subbilling::GetInvoiceRequest* req, subbilling::ProcessorInvoice* out) override {
+    const auto it = charged.find(req->invoice_id());
+    if (it == charged.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no charge for " + req->invoice_id());
+    out->set_invoice_id(req->invoice_id());
+    out->set_state("charged");
+    out->set_reference(it->second.reference);
+    out->set_total_cents(it->second.total);
+    return grpc::Status::OK;
+  }
+};
+
+ProcessorPeer& world(harness::Ctx& ctx, std::string& invoice_id) {
+  static ProcessorPeer* peer = nullptr;
+  delete peer;
+  peer = new ProcessorPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  store::putSubscription("sub_1", "t-acme", "scale", "2026-03-01", "2026-04-01");
+  invoice_id = store::openInvoice("sub_1", "2026-03-01", "2026-04-01", 9900).invoice_id;
+  return *peer;
+}
+
+size_t charges(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Charge").size(); }
+
+std::string show(const store::Outcome& o) { return o.state + " " + o.reference + " " + o.reason; }
+
+}  // namespace
+
+void CheckClaim(harness::Ctx& ctx) {
+  std::string invoice_id;
+  world(ctx, invoice_id);
+  // Another runner claims the period right after this run's first marker command, if it still can.
+  bool fired = false;
+  bool rival_claimed = false;
+  ctx.Redis.After(kKey, [&] {
+    fired = true;
+    rival_claimed = ctx.Redis.Set(kKey, "claimed", "NX");
+  });
+  const store::Outcome first = runBilling(invoice_id);
+  ctx.Assert(fired, "runBilling never touched the run marker %s", kKey);
+  ctx.Assert(!rival_claimed || charges(ctx) == 0,
+             "another runner claimed the period right after runBilling's first marker command, and runBilling charged anyway (%d Charge calls): claim the marker with SET NX before charging, and do not charge on a claim you lost",
+             charges(ctx));
+  ctx.Equal(charges(ctx), 1, "the runner that holds the claim must charge once; Charge calls");
+  ctx.Equal(first.state, "charged", "the runner that holds the claim; its state");
+}
+
+void CheckConfirmReference(harness::Ctx& ctx) {
+  std::string invoice_id;
+  world(ctx, invoice_id);
+  const store::Outcome first = runBilling(invoice_id);
+  ctx.Assert(first.state == "charged" && first.reference == "ch_1", "the first run answered %s, expected the processor's reference ch_1", show(first));
+  ctx.Equal(ctx.Redis.Get(kKey).value_or(""), "charged:ch_1", "after the charge the marker must name the charge that billed the period; the marker");
+  const store::Outcome again = runBilling(invoice_id);
+  ctx.Assert(again.state == "charged" && again.reference == "ch_1", "a second run answered %s, expected the recorded reference ch_1", show(again));
+  ctx.Equal(charges(ctx), 1, "the second run must not call Charge again; Charge calls");
+}
+
+void CheckReconcileClaim(harness::Ctx& ctx) {
+  std::string invoice_id;
+  ProcessorPeer& peer = world(ctx, invoice_id);
+  // A run claimed the period, the processor charged, and the run crashed before confirming.
+  ctx.Redis.Set(kKey, "claimed");
+  peer.charged[invoice_id] = {"ch_crashed", 9900};
+  store::Outcome outcome = runBilling(invoice_id);
+  ctx.Assert(outcome.state == "charged" && outcome.reference == "ch_crashed",
+             "a claim left by a crashed run answered %s: the processor holds ch_crashed for the invoice, ask lookupInvoice and adopt it", show(outcome));
+  ctx.Equal(ctx.Redis.Get(kKey).value_or(""), "charged:ch_crashed", "the adopted charge must confirm the marker; the marker");
+  ctx.Equal(charges(ctx), 0, "reconciling a claim must not call Charge; Charge calls");
+  // A run claimed the period and is still waiting on the processor, which holds nothing yet.
+  const store::Invoice other = store::openInvoice("sub_1", "2026-04-01", "2026-05-01", 9900);
+  ctx.Redis.Set("billing:run:sub_1:2026-04-01", "claimed");
+  outcome = runBilling(other.invoice_id);
+  ctx.Equal(outcome.state, "in_flight", "a claim the processor knows nothing about belongs to another run; the state");
+  ctx.Equal(charges(ctx), 0, "a runner must not charge on another run's claim; Charge calls");
+}
+
+void CheckMarkerPersists(harness::Ctx& ctx) {
+  std::string invoice_id;
+  world(ctx, invoice_id);
+  runBilling(invoice_id);
+  const long long ttl = ctx.Redis.TTL(kKey);
+  ctx.Assert(ttl == -1, "the run marker expires in %d s: a retry after that charges the period again. It must not expire", ttl);
+  ctx.Clock.Advance(40 * 24 * 3600);
+  const store::Outcome again = runBilling(invoice_id);
+  ctx.Assert(charges(ctx) == 1, "a retry 40 days later called Charge again and answered %s", show(again));
+}
+`,
+  },
   hints: [
-    'A worker crashed after the processor answered; the retry charged the customer again. Weeks later a replayed job charged a period that was already billed and closed, and support cannot say which charge belongs to which marker.',
-    'The marker is written after the charge and with a month-long expiry, so the window before the write and the time after the expiry both look like "unbilled". A bare `done` carries no reference to reconcile against.',
-    'Claim with `SET key claimed NX` before the charge, then `confirm_marker` with `charged:{invoice_ref}` and no TTL. An unconfirmed claim means `GetInvoice` first; a closed period answers 409 without the adjustment action.',
+    'Start two billing runs for the same invoice at once: the customer is charged twice. A retry of a charged period answers `charged` with no reference, and one 40 days later charges again.',
+    'The run reads the marker, charges, and only then writes it, so a second runner between the read and the write sees nothing. The marker says `done`, not which charge, and it expires after 30 days.',
+    'Claim with `SET key claimed NX` (no expiry) before `charge_invoice`; confirm with `charged:{reference}`; on a lost claim, answer a `charged:` marker as is, else ask `lookup_invoice`, adopt and confirm its reference, or answer `in_flight`.',
   ],
-  debrief: `The fix is an ordering: claim, charge, confirm. The claim is one atomic \`SET NX\`, so exactly one runner per \`(subscription, period)\` proceeds and a lost race cannot spend money. The confirmation stores the charge reference, so a claim without one is recognisably an unknown outcome that the retry reconciles with \`GetInvoice\` instead of repeating. The marker has no expiry because a TTL quietly turns idempotency into "idempotent for thirty days", and a closed period needs an explicit adjustment to be touched again. Production billing adds what this step left out: a claim lease with a heartbeat for the in-flight case, an adjustment workflow with its own audit trail, reconciliation jobs that compare markers with processor settlement files, and per-run trace ids so on-call can tell a replay from a first attempt.`,
+  debrief: `The fix is an ordering: claim, charge, confirm. The claim is one atomic \`SET NX\`, so exactly one runner per period proceeds and a lost race spends nothing. The confirmation stores the reference, which turns a claim without one into a recognisable unknown outcome that the next run reconciles with the processor instead of guessing. The marker has no expiry because a TTL quietly turns "charged once" into "charged once a month". Billing systems add a lease to the claim, so a crashed run's period is retried after a timeout instead of waiting for reconciliation, and a nightly job that compares markers with the processor's settlement report.`,
 };

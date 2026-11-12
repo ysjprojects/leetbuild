@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package formd;
+
+// A downstream handler an accepted submission is delivered to: one instance per handler
+// (webhook:9000, crm:9000, queue:9000). A handler upserts on idempotency_key, so a second call
+// with a key it has seen answers the first receipt instead of acting twice.
+service Handler {
+  rpc Deliver(DeliverRequest) returns (DeliverReply);
+}
+
+message DeliverRequest {
+  string handler = 1;
+  string submission_id = 2;
+  string form_id = 3;
+  string idempotency_key = 4;
+  map<string, string> values = 5;
+}
+
+message DeliverReply {
+  string receipt = 1;
+}

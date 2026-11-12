@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package invoicetax;
+
+// The tax service step 3 asks before an invoice is finalized: the tax owed on a draft's subtotal in
+// the customer's jurisdiction, and where the figure comes from ("quote", "exempt",
+// "reverse_charge"). A jurisdiction that refuses the document is FAILED_PRECONDITION, with the
+// jurisdiction in the details; UNAVAILABLE and DEADLINE_EXCEEDED say nothing about the invoice.
+service Tax {
+  rpc Quote(QuoteRequest) returns (TaxQuote);
+}
+
+message QuoteRequest {
+  string invoice_id = 1;
+  string tenant_id = 2;
+  string currency = 3;
+  string jurisdiction = 4;
+  int64 subtotal_cents = 5;
+}
+
+message TaxQuote {
+  int64 tax_cents = 1;
+  string tax_source = 2;
+}

@@ -2,173 +2,104 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Demand calls with a last-approved fallback',
+  title: 'Demand model calls with a last-approved fallback',
   concept: 'grpc',
   file: 'client',
-  focus: ['api', 'demand', 'db'],
+  focus: ['api', 'demand', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter's \`publish_from_demand(store, cache, sku, window, reason, update_id)\`
-calls \`DemandService/Estimate\` up to three times with no deadline, publishes the reply with source
-\`"demand"\`, and keeps the last reply in a module-level \`last_suggestion\`; when every attempt fails
-it republishes that cached suggestion with a fresh timestamp. It compiles, serves the demo and hides
-five flaws.
+**Starting point.** The starter reprices a sku from the demand model:
+\`price_from_demand(sku, reason)\` reads the row (\`store.get_sku\`), calls \`DemandModel/Estimate\` up to
+three times, publishes the estimate with source \`demand-model\` and keeps it in \`last_suggestion\`;
+when every attempt fails it publishes that cached suggestion again. It serves the demo and hides
+four flaws.
 
-**Failure mode the checks target.** A hung model holds the pricing worker open with no deadline.
-When the retries run out, the cached suggestion goes out with \`now()\`, no \`stale\` marker and no
-source, so a broken model freezes an experimental price into production as a fresh computation.
-\`except Exception\` retries a \`FAILED_PRECONDITION\` rejection that no retry can change, and no
-published price names where it came from.
+**Failure mode the checks target.** A model that hangs holds the pricing worker with it; a sku the
+model refuses is asked three times and never reported; an outage republishes an old suggestion
+with a fresh timestamp over a price an operator approved since; and an estimate jumps the price past
+the window budget.
 
-- The \`Estimate\` call carries a **700 ms deadline** (\`DEADLINE_MS = 700\`, \`timeout=DEADLINE_MS\`).
-- On \`DEADLINE_EXCEEDED\` (or \`UNAVAILABLE\`) the client republishes the price store's
-  \`last_approved(sku)\`, tagged \`stale=True\` with \`source="last-approved"\`, keeping that row's
-  original \`updated_at\`. The \`last_suggestion\` cache goes away.
-- Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are in \`RETRYABLE\`; \`FAILED_PRECONDITION\` (the model
-  refusing a proposal its guardrails reject) is terminal and returns to the caller immediately.
-- Every published price names its \`source\` (\`"demand-model"\` or \`"last-approved"\`) and its
-  \`updated_at\`, so the storefront and the audit trail can tell a fresh computation from a fallback.`,
+\`\`\`proto
+service DemandModel { rpc Estimate(EstimateRequest) returns (PriceEstimate); }  // FAILED_PRECONDITION: refused
+\`\`\`
+
+- Every call carries a **\`DEADLINE_S\` = 0.7 s** deadline.
+- \`FAILED_PRECONDITION\` raises \`PriceRejected\` after that one call; the price is untouched.
+- \`DEADLINE_EXCEEDED\` or \`UNAVAILABLE\` keeps the last approved price: \`store.mark_stale(sku)\` (source
+  \`last-approved\`, \`stale\`, its own \`updated_at\`), returned as the row.
+- An estimate moves the price only through \`guard.reserve\` (step 2, provided as \`pricing.guard\`); a
+  refusal leaves the price as it is.`,
   sequence: {
-    participants: ['Pricing API', 'Demand model', 'Price store'],
+    participants: ['Pricing worker', 'Demand model', 'Redis guard', 'Price store'],
     messages: [
-      {from: 'Pricing API', to: 'Demand model', label: 'Estimate(sku, window) · deadline 700 ms', kind: 'sync'},
+      {from: 'Pricing worker', to: 'Demand model', label: 'Estimate(sku, current) · deadline 0.7 s', kind: 'sync'},
       {
         from: 'Demand model',
-        to: 'Pricing API',
-        label: 'EstimateReply{price_cents, model_version, confidence}',
+        to: 'Pricing worker',
+        label: 'PriceEstimate · FAILED_PRECONDITION → PriceRejected',
         kind: 'reply',
       },
-      {from: 'Demand model', to: 'Pricing API', label: 'DEADLINE_EXCEEDED', kind: 'reply'},
-      {from: 'Pricing API', to: 'Price store', label: 'last_approved(sku)', kind: 'sync'},
-      {from: 'Price store', to: 'Pricing API', label: 'price_cents · original updated_at', kind: 'reply'},
+      {from: 'Pricing worker', to: 'Redis guard', label: 'reserve(sku, current, estimate)', kind: 'sync'},
+      {from: 'Pricing worker', to: 'Price store', label: 'publish(…, "demand-model") only when reserved', kind: 'sync'},
       {
-        from: 'Pricing API',
-        to: 'Pricing API',
-        label: 'publish source=last-approved · stale=true · keep updated_at',
+        from: 'Pricing worker',
+        to: 'Price store',
+        label: 'DEADLINE_EXCEEDED / UNAVAILABLE → mark_stale(sku)',
         kind: 'sync',
       },
-      {from: 'Demand model', to: 'Pricing API', label: 'FAILED_PRECONDITION · terminal, no retry', kind: 'reply'},
     ],
   },
-  hints: [
-    'The model deploy stalls at 14:02. Until 15:00 every storefront page shows the price the model suggested at 14:01, timestamped as if it had been computed seconds ago.',
-    'There is no `timeout=` on `demand.Estimate`, so a hung call blocks; `except Exception` retries every status alike; and the fallback path publishes `last_suggestion` with `datetime.now()` and source `"demand"`.',
-    'Add `DEADLINE_MS = 700` and `timeout=DEADLINE_MS`; catch `grpc.RpcError`, retry only codes in `RETRYABLE`; on timeout publish `store.last_approved(sku)` with `stale=True`, `"last-approved"` and `approved["updated_at"]`.',
-  ],
   checks: [
     {
       id: 'deadline',
-      title: 'Every Estimate call carries a 700 ms deadline',
+      title: 'Every Estimate call carries a 0.7-second deadline',
       detail:
-        'The demand call is created with `DEADLINE_MS = 700` as a call timeout: `timeout=`, `{deadline: Date.now() + DEADLINE_MS}`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without it a stuck demand model pins the pricing worker until the caller gives up. The starter sends the call with no deadline.',
+        'The demand call is made with `DEADLINE_S` (0.7 s) as its deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`). The starter sends it with none, so a model that hangs holds the pricing worker with it.',
       match: {
-        python: {all: [/DEADLINE_MS\s*=\s*700/, /timeout\s*=\s*DEADLINE_MS/, /\.Estimate\(/]},
-        typescript: {all: [/DEADLINE_MS\s*=\s*700/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/, /\.Estimate\(/]},
-        go: {all: [/deadlineMS\s*=\s*700/, /context\.WithTimeout|WithDeadline/, /\.Estimate\(/]},
-        scala: {all: [/DeadlineMs\s*=\s*700/, /withDeadlineAfter/, /\.estimate\(/]},
-        cpp: {all: [/kDeadlineMs\s*=\s*700/, /set_deadline\(/, /->Estimate\(/]},
-      },
-    },
-    {
-      id: 'last-approved-fallback',
-      title: 'A timeout republishes the last approved price',
-      detail:
-        'A `DEADLINE_EXCEEDED` (or `UNAVAILABLE`) call falls back to the price store’s `last_approved(sku)` and republishes that row instead of serving a cached suggestion. The starter’s module-level suggestion cache must be gone: a broken model cannot be allowed to keep publishing its last idea.',
-      match: {
-        python: {
-          all: [/StatusCode\.DEADLINE_EXCEEDED/, /store\.last_approved\(/, /store\.publish\(/],
-          none: [/last_suggestion/],
-        },
-        typescript: {
-          all: [/DEADLINE_EXCEEDED/, /store\.last_approved\(/, /store\.publish\(/],
-          none: [/lastSuggestion/],
-        },
-        go: {
-          all: [/codes\.DeadlineExceeded/, /store\.LastApproved\(/, /store\.Publish\(/],
-          none: [/lastSuggestion/],
-        },
-        scala: {
-          all: [/DEADLINE_EXCEEDED/, /store\.lastApproved\(/, /store\.publish\(/],
-          none: [/lastSuggestion/],
-        },
-        cpp: {
-          all: [/StatusCode::DEADLINE_EXCEEDED/, /store->last_approved\(/, /store->publish\(/],
-          none: [/last_suggestion/],
-        },
-      },
-    },
-    {
-      id: 'stale-marker',
-      title: 'The fallback is marked stale and keeps the approved row’s timestamp',
-      detail:
-        'The republished price carries `stale=true` and `source="last-approved"`, and its `updated_at` is the approved row\'s original timestamp, not `now()`. A stale price the reader can see is usable; a frozen experimental price relabelled as freshly computed is not.',
-      match: {
-        python: {all: [/stale\s*=\s*True/, /"last-approved"/, /approved\["updated_at"\]/]},
-        typescript: {all: [/stale\s*:\s*true/, /['"]last-approved['"]/, /approved\.updated_at/]},
-        go: {all: [/Stale\s*:\s*true/, /"last-approved"/, /approved\.UpdatedAt/]},
-        scala: {all: [/stale\s*=\s*true/, /"last-approved"/, /approved\.updatedAt/]},
-        cpp: {all: [/stale\s*=\s*true/, /"last-approved"/, /approved\.updated_at/]},
+        python: {all: [/DEADLINE_S\s*=\s*0\.7\b/, /Estimate\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*700\b/, /Estimate\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
+        go: {all: [/deadline\s*=\s*700\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*deadline\s*\)/]},
+        scala: {all: [/DeadlineMillis\s*=\s*700L?\b/, /withDeadlineAfter\(\s*DeadlineMillis/]},
+        cpp: {all: [/kDeadline\{700\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
     {
       id: 'terminal-rejection',
-      title: 'A constraint rejection is terminal, not retried',
+      title: 'A refusal is raised after one call',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retryable. `FAILED_PRECONDITION` — the model refusing a proposal its guardrails reject — returns to the caller immediately, because a retry cannot change a deterministic answer. The starter retries every error, including the rejection.',
+        '`FAILED_PRECONDITION` raises `PriceRejected` at once: the model refused on its own constraints and asks again get the same answer. The starter retries every error three times and then returns the row as if nothing happened.',
       match: {
-        python: {
-          all: [
-            /StatusCode\.UNAVAILABLE/,
-            /StatusCode\.DEADLINE_EXCEEDED/,
-            /StatusCode\.FAILED_PRECONDITION/,
-            /RETRYABLE/,
-          ],
-          none: [/except Exception/],
-        },
-        typescript: {
-          all: [
-            /grpc\.status\.UNAVAILABLE/,
-            /grpc\.status\.DEADLINE_EXCEEDED/,
-            /grpc\.status\.FAILED_PRECONDITION/,
-            /RETRYABLE/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/, /for\s*\(\s*;\s*;\s*\)/],
-        },
-        go: {
-          all: [/codes\.Unavailable/, /codes\.DeadlineExceeded/, /codes\.FailedPrecondition/, /retryable/],
-          none: [/for\s+attempt\s*:=\s*0;\s*;\s*attempt\+\+/],
-        },
-        scala: {
-          all: [
-            /Status\.Code\.UNAVAILABLE/,
-            /Status\.Code\.DEADLINE_EXCEEDED/,
-            /Status\.Code\.FAILED_PRECONDITION/,
-            /Retryable/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-        cpp: {
-          all: [
-            /StatusCode::UNAVAILABLE/,
-            /StatusCode::DEADLINE_EXCEEDED/,
-            /StatusCode::FAILED_PRECONDITION/,
-            /retryable/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
+        python: {all: [/FAILED_PRECONDITION/, /raise PriceRejected/], none: [/for \w+ in range\(/]},
+        typescript: {all: [/FAILED_PRECONDITION/, /throw new PriceRejected/], none: [/for \(let attempt/]},
+        go: {all: [/codes\.FailedPrecondition/, /ErrPriceRejected/], none: [/for attempt :=/]},
+        scala: {all: [/FAILED_PRECONDITION/, /throw new PriceRejected/], none: [/\(1 to \d\)|while \(attempt/]},
+        cpp: {all: [/FAILED_PRECONDITION/, /throw PriceRejected/], none: [/for \(int attempt/]},
       },
     },
     {
-      id: 'provenance',
-      title: 'Every published price names its source and a timestamp',
+      id: 'last-approved-fallback',
+      title: 'An outage keeps the last approved price, marked stale',
       detail:
-        'A published price carries `source` (`"demand-model"` or `"last-approved"`) and a timestamp (`updated_at`), so the storefront and the audit trail can tell a fresh computation from a fallback. The starter writes the model version with no source and no timestamp.',
+        "`DEADLINE_EXCEEDED` or `UNAVAILABLE` calls `store.mark_stale(sku)`: the published price stays, with source `last-approved`, `stale` set and its own `updated_at`. The starter republishes the model's cached `last_suggestion` with a fresh timestamp, over whatever an operator approved since.",
       match: {
-        python: {all: [/"demand-model"/, /"last-approved"/, /updated_at/]},
-        typescript: {all: [/['"]demand-model['"]/, /['"]last-approved['"]/, /updated_at/]},
-        go: {all: [/"demand-model"/, /"last-approved"/, /UpdatedAt|updated_at/]},
-        scala: {all: [/"demand-model"/, /"last-approved"/, /updatedAt/]},
-        cpp: {all: [/"demand-model"/, /"last-approved"/, /updated_at/]},
+        python: {all: [/store\.mark_stale\(/], none: [/last_suggestion/]},
+        typescript: {all: [/markStale\(/], none: [/lastSuggestion/]},
+        go: {all: [/store\.MarkStale\(/], none: [/lastSuggestion/]},
+        scala: {all: [/Store\.markStale\(/], none: [/lastSuggestion/]},
+        cpp: {all: [/store::markStale\(/], none: [/lastSuggestion|last_suggestion/]},
+      },
+    },
+    {
+      id: 'guarded-estimate',
+      title: 'An estimate moves the price only through the window guard',
+      detail:
+        'The estimate is reserved with `guard.reserve(sku, current, estimate)` before `store.publish`, and a refusal leaves the price alone. The starter publishes whatever the model returns, so one bad estimate can move a price 50 % in a second.',
+      match: {
+        python: {order: [/guard\.reserve\(/, /store\.publish\(/]},
+        typescript: {order: [/reserve\(/, /\bpublish\(/]},
+        go: {order: [/guard\.Reserve\(/, /store\.Publish\(/]},
+        scala: {order: [/Guard\.reserve\(/, /Store\.publish\(/]},
+        cpp: {order: [/guard::reserve\(/, /store::publish\(/]},
       },
     },
   ],
@@ -176,260 +107,166 @@ published price names where it came from.
     python: {
       starter: `import grpc
 
-from datetime import datetime, timezone
+import dynamic_pricing_pb2
+import dynamic_pricing_pb2_grpc
+from pricing import guard, store  # guard.reserve; store.get_sku, publish, mark_stale
 
-import pricing_pb2
-import pricing_pb2_grpc
-
-channel = grpc.insecure_channel("demand:9000")
-demand = pricing_pb2_grpc.DemandServiceStub(channel)
-
-last_suggestion = 0
-last_model_version = ""
+demand = dynamic_pricing_pb2_grpc.DemandModelStub(grpc.insecure_channel("demand:9000"))
 
 
-def publish_from_demand(store, cache, sku: str, window: int, reason: str, update_id: str) -> dict:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    global last_suggestion, last_model_version
-    for _ in range(3):
+class PriceRejected(Exception):
+    """The demand model refused to price the sku."""
+
+
+# The model's latest estimate per sku.
+last_suggestion: dict[str, int] = {}
+
+
+def price_from_demand(sku: str, reason: str) -> dict:
+    """Reprice the sku from the demand model; returns the sku's row afterwards."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    current = store.get_sku(sku)
+    request = dynamic_pricing_pb2.EstimateRequest(sku=sku, current_price_cents=current["price_cents"])
+    for attempt in range(3):
         try:
-            reply = demand.Estimate(pricing_pb2.EstimateRequest(sku=sku, window=window))
-            last_suggestion = reply.price_cents
-            last_model_version = reply.model_version
-            cache.hset(f"price:{sku}", {"price_cents": reply.price_cents, "model_version": reply.model_version})
-            return store.publish(sku, reply.price_cents, reason, "demand", update_id)
-        except Exception:
+            estimate = demand.Estimate(request)
+        except grpc.RpcError:
             continue
-    cache.hset(f"price:{sku}", {
-        "price_cents": last_suggestion,
-        "model_version": last_model_version,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    })
-    return store.publish(sku, last_suggestion, reason, "demand", update_id)
+        last_suggestion[sku] = estimate.price_cents
+        return store.publish(sku, estimate.price_cents, reason, "demand-model")
+    if sku in last_suggestion:
+        return store.publish(sku, last_suggestion[sku], reason, "demand-model")
+    return current
 `,
       solution: `import grpc
 
-from datetime import datetime, timezone
+import dynamic_pricing_pb2
+import dynamic_pricing_pb2_grpc
+from pricing import guard, store  # guard.reserve; store.get_sku, publish, mark_stale
 
-import pricing_pb2
-import pricing_pb2_grpc
+DEADLINE_S = 0.7
 
-DEADLINE_MS = 700
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
-
-channel = grpc.insecure_channel("demand:9000")
-demand = pricing_pb2_grpc.DemandServiceStub(channel)
+demand = dynamic_pricing_pb2_grpc.DemandModelStub(grpc.insecure_channel("demand:9000"))
 
 
-class ConstraintRejected(Exception):
-    """The model refused the proposal: a deterministic answer, so a retry cannot change it."""
+class PriceRejected(Exception):
+    """The demand model refused to price the sku."""
 
 
-def publish_price(store, cache, sku, price_cents, reason, source, update_id, *, stale, updated_at):
-    """Write the storefront cache first, then the durable row; the payload carries the provenance."""
-    cache.hset(f"price:{sku}", {
-        "price_cents": price_cents,
-        "source": source,
-        "updated_at": updated_at,
-        "update_id": update_id,
-        "stale": "true" if stale else "false",
-    })
-    store.publish(sku, price_cents, reason, source, update_id)
-    return {
-        "sku": sku,
-        "price_cents": price_cents,
-        "reason": reason,
-        "source": source,
-        "update_id": update_id,
-        "stale": stale,
-        "updated_at": updated_at,
-    }
-
-
-def publish_from_demand(store, cache, sku: str, window: int, reason: str, update_id: str) -> dict:
+def price_from_demand(sku: str, reason: str) -> dict:
+    """Reprice the sku from the demand model; returns the sku's row afterwards."""
+    current = store.get_sku(sku)
+    request = dynamic_pricing_pb2.EstimateRequest(sku=sku, current_price_cents=current["price_cents"])
     try:
-        reply = demand.Estimate(
-            pricing_pb2.EstimateRequest(sku=sku, window=window),
-            timeout=DEADLINE_MS / 1000.0,
-        )
+        estimate = demand.Estimate(request, timeout=DEADLINE_S)
     except grpc.RpcError as exc:
         if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
-            raise ConstraintRejected(exc.details()) from exc
-        if exc.code() not in RETRYABLE:
-            raise
-        approved = store.last_approved(sku)
-        return publish_price(store, cache, sku, approved["price_cents"], reason, "last-approved",
-                             update_id, stale=True, updated_at=approved["updated_at"])
-    return publish_price(store, cache, sku, reply.price_cents, reason, "demand-model",
-                         update_id, stale=False, updated_at=datetime.now(timezone.utc).isoformat())
+            # The model refused on its own constraints: asking again gets the same answer.
+            raise PriceRejected(exc.details()) from exc
+        # DEADLINE_EXCEEDED, UNAVAILABLE: the approved price stays, labelled for what it is.
+        return store.mark_stale(sku)
+    reservation = guard.reserve(sku, current["price_cents"], estimate.price_cents)
+    if not reservation["ok"]:
+        return current  # the window has no room for this move: the approved price stays
+    return store.publish(sku, estimate.price_cents, reason, "demand-model")
 `,
     },
     typescript: {
-      starter: `/** Demand client. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-interface DemandClient {
-  Estimate(request: {sku: string; window: number}): Promise<{price_cents: number; model_version: string; confidence: number}>;
-}
+import {reserve} from 'pricing/guard';
+import {type Row, getSku, markStale, publish} from 'pricing/store';
 
-interface PriceStore {
-  publish(sku: string, priceCents: number, reason: string, source: string, updateId: string): PublishedPrice;
-  last_approved(sku: string): {price_cents: number; updated_at: string};
-}
-
-interface RedisCache {
-  hset(key: string, fields: Record<string, string>): Promise<void>;
-}
-
-interface PublishedPrice {
+interface EstimateRequest {
   sku: string;
-  price_cents: number;
-  reason: string;
-  source: string;
-  update_id: string;
-  stale: boolean;
-  updated_at: string;
+  current_price_cents: number;
 }
 
-const {pricing} = grpc.loadPackageDefinition(protoLoader.loadSync('pricing.proto')) as unknown as {
-  pricing: {DemandService: new (target: string, credentials: grpc.ChannelCredentials) => DemandClient};
+interface PriceEstimate {
+  price_cents: number | string;
+  model_version: string;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('dynamic_pricing.proto')) as unknown as {
+  priced: {DemandModel: grpc.ServiceClientConstructor};
 };
-const demand = new pricing.DemandService('demand:9000', grpc.credentials.createInsecure());
+const demand = new pkg.priced.DemandModel('demand:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Estimate(request: EstimateRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<PriceEstimate>;
+};
 
-let lastSuggestion = 0;
-let lastModelVersion = '';
+/** The demand model refused to price the sku. */
+export class PriceRejected extends Error {}
 
-export async function publishFromDemand(
-  store: PriceStore,
-  cache: RedisCache,
-  sku: string,
-  window: number,
-  reason: string,
-  updateId: string,
-): Promise<PublishedPrice> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
+/** The model's latest estimate per sku. */
+const lastSuggestion = new Map<string, number>();
+
+/** Reprice the sku from the demand model; resolves to the sku's row afterwards. */
+export async function priceFromDemand(sku: string, reason: string): Promise<Row | null> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const current = (await getSku(sku)) as Row;
+  const request = {sku, current_price_cents: current.price_cents};
   for (let attempt = 0; attempt < 3; attempt++) {
+    let estimate: PriceEstimate;
     try {
-      const reply = await demand.Estimate({sku, window});
-      lastSuggestion = reply.price_cents;
-      lastModelVersion = reply.model_version;
-      await cache.hset('price:' + sku, {price_cents: String(reply.price_cents), model_version: reply.model_version});
-      return store.publish(sku, reply.price_cents, reason, 'demand', updateId);
+      estimate = await demand.Estimate(request, new grpc.Metadata(), {});
     } catch {
       continue;
     }
+    lastSuggestion.set(sku, Number(estimate.price_cents));
+    return publish(sku, Number(estimate.price_cents), reason, 'demand-model');
   }
-  await cache.hset('price:' + sku, {price_cents: String(lastSuggestion), updated_at: new Date().toISOString()});
-  return store.publish(sku, lastSuggestion, reason, 'demand', updateId);
+  const cached = lastSuggestion.get(sku);
+  if (cached !== undefined) return publish(sku, cached, reason, 'demand-model');
+  return current;
 }
 `,
-      solution: `/** Demand client: a 700 ms deadline per Estimate, with the last approved price as the fallback. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const DEADLINE_MS = 700;
-const RETRYABLE: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-};
+import {reserve} from 'pricing/guard';
+import {type Row, getSku, markStale, publish} from 'pricing/store';
 
-interface DemandClient {
-  Estimate(
-    request: {sku: string; window: number},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-  ): Promise<{price_cents: number; model_version: string; confidence: number}>;
-}
+export const DEADLINE_MS = 700;
 
-interface ApprovedPrice {
-  price_cents: number;
-  updated_at: string;
-}
-
-interface PriceStore {
-  publish(sku: string, priceCents: number, reason: string, source: string, updateId: string): PublishedPrice;
-  last_approved(sku: string): ApprovedPrice;
-}
-
-interface RedisCache {
-  hset(key: string, fields: Record<string, string>): Promise<void>;
-}
-
-interface PublishedPrice {
+interface EstimateRequest {
   sku: string;
-  price_cents: number;
-  reason: string;
-  source: 'demand-model' | 'last-approved';
-  update_id: string;
-  stale: boolean;
-  updated_at: string;
+  current_price_cents: number;
 }
 
-const {pricing} = grpc.loadPackageDefinition(protoLoader.loadSync('pricing.proto')) as unknown as {
-  pricing: {DemandService: new (target: string, credentials: grpc.ChannelCredentials) => DemandClient};
+interface PriceEstimate {
+  price_cents: number | string;
+  model_version: string;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('dynamic_pricing.proto')) as unknown as {
+  priced: {DemandModel: grpc.ServiceClientConstructor};
 };
-const demand = new pricing.DemandService('demand:9000', grpc.credentials.createInsecure());
+const demand = new pkg.priced.DemandModel('demand:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Estimate(request: EstimateRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<PriceEstimate>;
+};
 
-export class ConstraintRejected extends Error {}
+/** The demand model refused to price the sku. */
+export class PriceRejected extends Error {}
 
-async function publishPrice(store: PriceStore, cache: RedisCache, published: PublishedPrice): Promise<PublishedPrice> {
-  await cache.hset('price:' + published.sku, {
-    price_cents: String(published.price_cents),
-    source: published.source,
-    updated_at: published.updated_at,
-    update_id: published.update_id,
-    stale: published.stale ? 'true' : 'false',
-  });
-  return store.publish(
-    published.sku,
-    published.price_cents,
-    published.reason,
-    published.source,
-    published.update_id,
-  );
-}
-
-export async function publishFromDemand(
-  store: PriceStore,
-  cache: RedisCache,
-  sku: string,
-  window: number,
-  reason: string,
-  updateId: string,
-): Promise<PublishedPrice> {
+/** Reprice the sku from the demand model; resolves to the sku's row afterwards. */
+export async function priceFromDemand(sku: string, reason: string): Promise<Row | null> {
+  const current = (await getSku(sku)) as Row;
+  const request = {sku, current_price_cents: current.price_cents};
+  let estimate: PriceEstimate;
   try {
-    const reply = await demand.Estimate(
-      {sku, window},
-      new grpc.Metadata(),
-      {deadline: Date.now() + DEADLINE_MS},
-    );
-    return publishPrice(store, cache, {
-      sku,
-      price_cents: reply.price_cents,
-      reason,
-      source: 'demand-model',
-      update_id: updateId,
-      stale: false,
-      updated_at: new Date().toISOString(),
-    });
-  } catch (error) {
-    const serviceError = error as grpc.ServiceError;
-    if (serviceError.code === grpc.status.FAILED_PRECONDITION) {
-      throw new ConstraintRejected(serviceError.details);
-    }
-    if (RETRYABLE[serviceError.code] !== true) throw serviceError;
-    const approved = store.last_approved(sku);
-    return publishPrice(store, cache, {
-      sku,
-      price_cents: approved.price_cents,
-      reason,
-      source: 'last-approved',
-      update_id: updateId,
-      stale: true,
-      updated_at: approved.updated_at,
-    });
+    estimate = await demand.Estimate(request, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+  } catch (e) {
+    const {code, details} = e as grpc.ServiceError;
+    // The model refused on its own constraints: asking again gets the same answer.
+    if (code === grpc.status.FAILED_PRECONDITION) throw new PriceRejected(details);
+    // DEADLINE_EXCEEDED, UNAVAILABLE: the approved price stays, labelled for what it is.
+    return markStale(sku);
   }
+  const target = Number(estimate.price_cents);
+  const reservation = await reserve(sku, current.price_cents, target);
+  if (!reservation.ok) return current; // the window has no room for this move: the approved price stays
+  return publish(sku, target, reason, 'demand-model');
 }
 `,
     },
@@ -438,43 +275,43 @@ export async function publishFromDemand(
 
 import (
 	"context"
-	"strconv"
-	"time"
+	"errors"
 
-	pb "pricing/pricingpb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	pb "pricing/gen/dynamic_pricing"
+	"pricing/store" // store.GetSKU, Publish, MarkStale
 )
 
-var lastSuggestion int64
-var lastModelVersion string
+var (
+	demandConn, _ = grpc.NewClient("demand:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	demand        = pb.NewDemandModelClient(demandConn)
+)
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-func PublishFromDemand(
-	ctx context.Context,
-	demand pb.DemandServiceClient,
-	store PriceStore,
-	cache RedisCache,
-	sku string,
-	window int64,
-	reason, updateID string,
-) (PublishedPrice, error) {
+// ErrPriceRejected: the demand model refused to price the sku.
+var ErrPriceRejected = errors.New("the demand model refused to price the sku")
+
+// lastSuggestion is the model's latest estimate per sku.
+var lastSuggestion = map[string]int64{}
+
+// priceFromDemand reprices the sku from the demand model and returns the sku's row afterwards.
+func priceFromDemand(ctx context.Context, sku, reason string) (*store.Row, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	current := store.GetSKU(ctx, sku)
+	request := &pb.EstimateRequest{Sku: sku, CurrentPriceCents: current.PriceCents}
 	for attempt := 0; attempt < 3; attempt++ {
-		reply, err := demand.Estimate(ctx, &pb.EstimateRequest{Sku: sku, Window: window})
-		if err == nil {
-			lastSuggestion = reply.PriceCents
-			lastModelVersion = reply.ModelVersion
-			cache.HSet(ctx, "price:"+sku, map[string]string{
-				"price_cents":   strconv.FormatInt(reply.PriceCents, 10),
-				"model_version": reply.ModelVersion,
-			})
-			return store.Publish(sku, reply.PriceCents, reason, "demand", updateID)
+		estimate, err := demand.Estimate(ctx, request)
+		if err != nil {
+			continue
 		}
+		lastSuggestion[sku] = estimate.GetPriceCents()
+		return store.Publish(ctx, sku, estimate.GetPriceCents(), reason, "demand-model"), nil
 	}
-	cache.HSet(ctx, "price:"+sku, map[string]string{
-		"price_cents":   strconv.FormatInt(lastSuggestion, 10),
-		"model_version": lastModelVersion,
-		"updated_at":    time.Now().UTC().Format(time.RFC3339),
-	})
-	return store.Publish(sku, lastSuggestion, reason, "demand", updateID)
+	if cached, ok := lastSuggestion[sku]; ok {
+		return store.Publish(ctx, sku, cached, reason, "demand-model"), nil
+	}
+	return current, nil
 }
 `,
       solution: `package main
@@ -482,328 +319,616 @@ func PublishFromDemand(
 import (
 	"context"
 	"errors"
-	"strconv"
+	"fmt"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	pb "pricing/pricingpb"
+	pb "pricing/gen/dynamic_pricing"
+	"pricing/guard" // guard.Reserve
+	"pricing/store" // store.GetSKU, Publish, MarkStale
 )
 
-const deadlineMS = 700
+const deadline = 700 * time.Millisecond
 
-var retryable = map[codes.Code]bool{codes.Unavailable: true, codes.DeadlineExceeded: true}
+var (
+	demandConn, _ = grpc.NewClient("demand:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	demand        = pb.NewDemandModelClient(demandConn)
+)
 
-var errConstraintRejected = errors.New("demand model rejected the proposal")
+// ErrPriceRejected: the demand model refused to price the sku.
+var ErrPriceRejected = errors.New("the demand model refused to price the sku")
 
-func estimate(ctx context.Context, demand pb.DemandServiceClient, sku string, window int64) (*pb.EstimateReply, error) {
-	callCtx, cancel := context.WithTimeout(ctx, deadlineMS*time.Millisecond)
+// priceFromDemand reprices the sku from the demand model and returns the sku's row afterwards.
+func priceFromDemand(ctx context.Context, sku, reason string) (*store.Row, error) {
+	current := store.GetSKU(ctx, sku)
+	request := &pb.EstimateRequest{Sku: sku, CurrentPriceCents: current.PriceCents}
+	callCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
-	return demand.Estimate(callCtx, &pb.EstimateRequest{Sku: sku, Window: window})
-}
-
-func publishPrice(ctx context.Context, store PriceStore, cache RedisCache, published PublishedPrice) (PublishedPrice, error) {
-	if err := cache.HSet(ctx, "price:"+published.Sku, map[string]string{
-		"price_cents": strconv.FormatInt(published.PriceCents, 10),
-		"source":      published.Source,
-		"updated_at":  published.UpdatedAt,
-		"update_id":   published.UpdateID,
-		"stale":       strconv.FormatBool(published.Stale),
-	}); err != nil {
-		return PublishedPrice{}, err
-	}
-	return store.Publish(published.Sku, published.PriceCents, published.Reason, published.Source, published.UpdateID)
-}
-
-func PublishFromDemand(
-	ctx context.Context,
-	demand pb.DemandServiceClient,
-	store PriceStore,
-	cache RedisCache,
-	sku string,
-	window int64,
-	reason, updateID string,
-) (PublishedPrice, error) {
-	reply, err := estimate(ctx, demand, sku, window)
+	estimate, err := demand.Estimate(callCtx, request)
 	if err != nil {
-		switch status.Code(err) {
-		case codes.FailedPrecondition:
-			return PublishedPrice{}, errConstraintRejected
-		case codes.Unavailable, codes.DeadlineExceeded:
-			approved, err := store.LastApproved(ctx, sku)
-			if err != nil {
-				return PublishedPrice{}, err
-			}
-			return publishPrice(ctx, store, cache, PublishedPrice{
-				Sku:        sku,
-				PriceCents: approved.PriceCents,
-				Reason:     reason,
-				Source:     "last-approved",
-				UpdateID:   updateID,
-				Stale:      true,
-				UpdatedAt:  approved.UpdatedAt,
-			})
-		default:
-			return PublishedPrice{}, err
+		if status.Code(err) == codes.FailedPrecondition {
+			// The model refused on its own constraints: asking again gets the same answer.
+			return nil, fmt.Errorf("%w: %s", ErrPriceRejected, status.Convert(err).Message())
 		}
+		// DeadlineExceeded, Unavailable: the approved price stays, labelled for what it is.
+		return store.MarkStale(ctx, sku), nil
 	}
-	return publishPrice(ctx, store, cache, PublishedPrice{
-		Sku:        sku,
-		PriceCents: reply.PriceCents,
-		Reason:     reason,
-		Source:     "demand-model",
-		UpdateID:   updateID,
-		Stale:      false,
-		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
-	})
+	reservation, err := guard.Reserve(ctx, sku, current.PriceCents, estimate.GetPriceCents())
+	if err != nil {
+		return nil, err
+	}
+	if !reservation.OK {
+		return current, nil // the window has no room for this move: the approved price stays
+	}
+	return store.Publish(ctx, sku, estimate.GetPriceCents(), reason, "demand-model"), nil
 }
 `,
     },
     scala: {
       starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-object DemandClient {
-  val stub: DemandServiceGrpc.DemandServiceBlockingStub =
-    DemandServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("demand", 9000).usePlaintext().build())
+import pricing.{Guard, Store} // Guard.reserve; Store.getSku, publish, markStale
+import priced.dynamic_pricing.{DemandModelGrpc, EstimateRequest}
 
-  private var lastSuggestion: Int = 0
-  private var lastModelVersion: String = ""
+/** The demand model refused to price the sku. */
+final class PriceRejected(message: String) extends Exception(message)
 
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  def publishFromDemand(
-      store: PriceStore,
-      cache: RedisCache,
-      sku: String,
-      window: Long,
-      reason: String,
-      updateId: String,
-  ): PublishedPrice = {
+object Client {
+  private val demand = DemandModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("demand", 9000).usePlaintext().build())
+
+  /** The model's latest estimate per sku. */
+  private val lastSuggestion = scala.collection.mutable.Map.empty[String, Long]
+
+  /** Reprice the sku from the demand model; returns the sku's row afterwards. */
+  def priceFromDemand(sku: String, reason: String): Store.Row = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val current = Store.getSku(sku).get
+    val request = EstimateRequest(sku, current.priceCents)
     var attempt = 0
     while (attempt < 3) {
       try {
-        val reply = stub.estimate(EstimateRequest(sku = sku, window = window))
-        lastSuggestion = reply.priceCents
-        lastModelVersion = reply.modelVersion
-        cache.hset("price:" + sku, Map(
-          "price_cents" -> reply.priceCents.toString,
-          "model_version" -> reply.modelVersion,
-        ))
-        return store.publish(sku, reply.priceCents, reason, "demand", updateId)
-      } catch {
-        case _: StatusRuntimeException => ()
-      }
-      attempt += 1
+        val estimate = demand.estimate(request)
+        lastSuggestion(sku) = estimate.priceCents
+        return Store.publish(sku, estimate.priceCents, reason, "demand-model")
+      } catch { case _: StatusRuntimeException => attempt += 1 }
     }
-    cache.hset("price:" + sku, Map(
-      "price_cents" -> lastSuggestion.toString,
-      "model_version" -> lastModelVersion,
-      "updated_at" -> java.time.Instant.now().toString,
-    ))
-    store.publish(sku, lastSuggestion, reason, "demand", updateId)
+    lastSuggestion.get(sku).map(Store.publish(sku, _, reason, "demand-model")).getOrElse(current)
   }
 }
 `,
-      solution: `import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+      solution: `import java.util.concurrent.TimeUnit
 
-object DemandClient {
-  val DeadlineMs = 700
-  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-  val stub: DemandServiceGrpc.DemandServiceBlockingStub =
-    DemandServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("demand", 9000).usePlaintext().build())
+import pricing.{Guard, Store} // Guard.reserve; Store.getSku, publish, markStale
+import priced.dynamic_pricing.{DemandModelGrpc, EstimateRequest}
 
-  class ConstraintRejected(message: String) extends RuntimeException(message)
+/** The demand model refused to price the sku. */
+final class PriceRejected(message: String) extends Exception(message)
 
-  private def publishPrice(store: PriceStore, cache: RedisCache, published: PublishedPrice): PublishedPrice = {
-    cache.hset("price:" + published.sku, Map(
-      "price_cents" -> published.priceCents.toString,
-      "source" -> published.source,
-      "updated_at" -> published.updatedAt,
-      "update_id" -> published.updateId,
-      "stale" -> published.stale.toString,
-    ))
-    store.publish(published.sku, published.priceCents, published.reason, published.source, published.updateId)
+object Client {
+  val DeadlineMillis = 700L
+
+  private val demand = DemandModelGrpc.blockingStub(ManagedChannelBuilder.forAddress("demand", 9000).usePlaintext().build())
+
+  /** Reprice the sku from the demand model; returns the sku's row afterwards. */
+  def priceFromDemand(sku: String, reason: String): Store.Row = {
+    val current = Store.getSku(sku).get
+    val request = EstimateRequest(sku, current.priceCents)
+    val estimate =
+      try demand.withDeadlineAfter(DeadlineMillis, TimeUnit.MILLISECONDS).estimate(request)
+      catch {
+        // The model refused on its own constraints: asking again gets the same answer.
+        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.FAILED_PRECONDITION =>
+          throw new PriceRejected(Option(e.getStatus.getDescription).getOrElse("refused"))
+        // DEADLINE_EXCEEDED, UNAVAILABLE: the approved price stays, labelled for what it is.
+        case _: StatusRuntimeException => return Store.markStale(sku).get
+      }
+    val reservation = Guard.reserve(sku, current.priceCents, estimate.priceCents)
+    if (!reservation.ok) current // the window has no room for this move: the approved price stays
+    else Store.publish(sku, estimate.priceCents, reason, "demand-model")
   }
-
-  def publishFromDemand(
-      store: PriceStore,
-      cache: RedisCache,
-      sku: String,
-      window: Long,
-      reason: String,
-      updateId: String,
-  ): PublishedPrice =
-    try {
-      val reply = stub
-        .withDeadlineAfter(DeadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        .estimate(EstimateRequest(sku = sku, window = window))
-      publishPrice(store, cache, PublishedPrice(
-        sku = sku,
-        priceCents = reply.priceCents,
-        reason = reason,
-        source = "demand-model",
-        updateId = updateId,
-        stale = false,
-        updatedAt = java.time.Instant.now().toString,
-      ))
-    } catch {
-      case exc: StatusRuntimeException =>
-        if (exc.getStatus.getCode == Status.Code.FAILED_PRECONDITION)
-          throw new ConstraintRejected(exc.getStatus.getDescription)
-        if (!Retryable.contains(exc.getStatus.getCode)) throw exc
-        val approved = store.lastApproved(sku)
-        publishPrice(store, cache, PublishedPrice(
-          sku = sku,
-          priceCents = approved.priceCents,
-          reason = reason,
-          source = "last-approved",
-          updateId = updateId,
-          stale = true,
-          updatedAt = approved.updatedAt,
-        ))
-    }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "pricing.grpc.pb.h"
-
-#include <chrono>
-#include <ctime>
+#include <map>
+#include <stdexcept>
 #include <string>
 
-namespace {
+#include "dynamic_pricing.grpc.pb.h"
+#include "pricing/guard.h"  // guard::reserve
+#include "pricing/store.h"  // store::getSku, publish, markStale
 
-int last_suggestion = 0;
-std::string last_model_version;
+auto demand = priced::DemandModel::NewStub(grpc::CreateChannel("demand:9000", grpc::InsecureChannelCredentials()));
 
-std::string NowIso() {
-  const std::time_t stamp = std::time(nullptr);
-  char buffer[32];
-  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&stamp));
-  return buffer;
-}
+// The demand model refused to price the sku.
+struct PriceRejected : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
-}  // namespace
+// The model's latest estimate per sku.
+std::map<std::string, long long> lastSuggestion;
 
-// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-PublishedPrice publish_from_demand(
-    DemandService::Stub* demand,
-    PriceStore* store,
-    RedisCache* cache,
-    const std::string& sku,
-    long window,
-    const std::string& reason,
-    const std::string& update_id) {
-  for (int attempt = 0; attempt < 3; ++attempt) {
+// Reprice the sku from the demand model; returns the sku's row afterwards.
+store::Row priceFromDemand(const std::string& sku, const std::string& reason) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const store::Row current = *store::getSku(sku);
+  priced::EstimateRequest request;
+  request.set_sku(sku);
+  request.set_current_price_cents(current.price_cents);
+  for (int attempt = 0; attempt < 3; attempt++) {
     grpc::ClientContext ctx;
-    EstimateRequest request;
-    request.set_sku(sku);
-    request.set_window(window);
-    EstimateReply reply;
-    const grpc::Status status = demand->Estimate(&ctx, request, &reply);
-    if (status.ok()) {
-      last_suggestion = reply.price_cents();
-      last_model_version = reply.model_version();
-      cache->hset("price:" + sku, {{"price_cents", std::to_string(reply.price_cents())},
-                                   {"model_version", reply.model_version()}});
-      return store->publish(sku, reply.price_cents(), reason, "demand", update_id);
-    }
+    priced::PriceEstimate estimate;
+    if (!demand->Estimate(&ctx, request, &estimate).ok()) continue;
+    lastSuggestion[sku] = estimate.price_cents();
+    return store::publish(sku, estimate.price_cents(), reason, "demand-model");
   }
-  cache->hset("price:" + sku, {{"price_cents", std::to_string(last_suggestion)},
-                               {"model_version", last_model_version},
-                               {"updated_at", NowIso()}});
-  return store->publish(sku, last_suggestion, reason, "demand", update_id);
+  const auto cached = lastSuggestion.find(sku);
+  if (cached != lastSuggestion.end()) return store::publish(sku, cached->second, reason, "demand-model");
+  return current;
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
-#include "pricing.grpc.pb.h"
-
 #include <chrono>
-#include <ctime>
 #include <stdexcept>
 #include <string>
 
-constexpr int kDeadlineMs = 700;
+#include "dynamic_pricing.grpc.pb.h"
+#include "pricing/guard.h"  // guard::reserve
+#include "pricing/store.h"  // store::getSku, publish, markStale
 
-namespace {
+constexpr std::chrono::milliseconds kDeadline{700};
 
-const std::string kDemandModel = "demand-model";
-const std::string kLastApproved = "last-approved";
+auto demand = priced::DemandModel::NewStub(grpc::CreateChannel("demand:9000", grpc::InsecureChannelCredentials()));
 
-std::string NowIso() {
-  const std::time_t stamp = std::time(nullptr);
-  char buffer[32];
-  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&stamp));
-  return buffer;
-}
+// The demand model refused to price the sku.
+struct PriceRejected : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
-PublishedPrice PublishPrice(
-    PriceStore* store,
-    RedisCache* cache,
-    const PublishedPrice& published) {
-  cache->hset("price:" + published.sku, {
-      {"price_cents", std::to_string(published.price_cents)},
-      {"source", published.source},
-      {"updated_at", published.updated_at},
-      {"update_id", published.update_id},
-      {"stale", published.stale ? "true" : "false"},
-  });
-  store->publish(published.sku, published.price_cents, published.reason, published.source, published.update_id);
-  return published;
-}
-
-}  // namespace
-
-PublishedPrice publish_from_demand(
-    DemandService::Stub* demand,
-    PriceStore* store,
-    RedisCache* cache,
-    const std::string& sku,
-    long window,
-    const std::string& reason,
-    const std::string& update_id) {
-  grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kDeadlineMs));
-  EstimateRequest request;
+// Reprice the sku from the demand model; returns the sku's row afterwards.
+store::Row priceFromDemand(const std::string& sku, const std::string& reason) {
+  const store::Row current = *store::getSku(sku);
+  priced::EstimateRequest request;
   request.set_sku(sku);
-  request.set_window(window);
-  EstimateReply reply;
-  const grpc::Status status = demand->Estimate(&ctx, request, &reply);
-  if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
-    throw ConstraintRejected(status.error_message());
+  request.set_current_price_cents(current.price_cents);
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+  priced::PriceEstimate estimate;
+  const grpc::Status status = demand->Estimate(&ctx, request, &estimate);
+  if (!status.ok()) {
+    // The model refused on its own constraints: asking again gets the same answer.
+    if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) throw PriceRejected(status.error_message());
+    // DEADLINE_EXCEEDED, UNAVAILABLE: the approved price stays, labelled for what it is.
+    return *store::markStale(sku);
   }
-  if (status.ok()) {
-    PublishedPrice published;
-    published.sku = sku;
-    published.price_cents = reply.price_cents();
-    published.reason = reason;
-    published.source = kDemandModel;
-    published.update_id = update_id;
-    published.stale = false;
-    published.updated_at = NowIso();
-    return PublishPrice(store, cache, published);
-  }
-  const bool retryable = status.error_code() == grpc::StatusCode::UNAVAILABLE ||
-                         status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
-  if (!retryable) throw std::runtime_error(status.error_message());
-  const auto approved = store->last_approved(sku);
-  PublishedPrice published;
-  published.sku = sku;
-  published.price_cents = approved.price_cents;
-  published.reason = reason;
-  published.source = kLastApproved;
-  published.update_id = update_id;
-  published.stale = true;
-  published.updated_at = approved.updated_at;
-  return PublishPrice(store, cache, published);
+  const guard::Reservation reservation = guard::reserve(sku, current.price_cents, estimate.price_cents());
+  if (!reservation.ok) return current;  // the window has no room for this move: the approved price stays
+  return store::publish(sku, estimate.price_cents(), reason, "demand-model");
 }
 `,
     },
   },
-  debrief: `The fix treats the demand model as an untrusted dependency with a budget. The deadline lives on the call itself because a model that hangs is the normal failure, and 700 ms bounds one stuck call instead of letting it pin the worker. The fallback reads the last price the platform actually approved rather than the model's own last idea, because the approved row has a known provenance and a real timestamp; republishing it with \`stale=true\` and its original \`updated_at\` shows the storefront how old the number is. Retryability is a property of the status code: \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` may change on a second try, \`FAILED_PRECONDITION\` cannot. Production clients also add jittered backoff, a per-sku single-flight so concurrent estimates share one call, and an operator alert when the model stays down.`,
+  harness: {
+    python: `import grpc
+
+import dynamic_pricing_pb2
+import dynamic_pricing_pb2_grpc
+from pricing import guard, store
+
+
+class Demand(dynamic_pricing_pb2_grpc.DemandModelServicer):
+    """Proposes current * pct / 100 (110 unless set per sku); refuses the skus in refused."""
+
+    def __init__(self):
+        self.pct = {}
+        self.refused = set()
+
+    def Estimate(self, request, context):
+        if request.sku in self.refused:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"{request.sku} is price-matched: the model may not move it")
+        price = request.current_price_cents * self.pct.get(request.sku, 110) // 100
+        return dynamic_pricing_pb2.PriceEstimate(price_cents=price, model_version="elasticity-v7")
+
+
+def _client(ctx):
+    peer = Demand()
+    ctx.grpc.serve(dynamic_pricing_pb2_grpc.add_DemandModelServicer_to_server, peer)
+    return ctx.load("client"), peer
+
+
+def check_deadline(ctx):
+    m, _ = _client(ctx)
+    store.seed("SKU-1", 1000)
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    assert row["price_cents"] == 1100 and row["source"] == "demand-model", f"with the model healthy the sku must be repriced to its estimate 1100, got {row}"
+    calls = ctx.grpc.calls_to("Estimate")
+    assert calls, "no Estimate call was made"
+    for call in calls:
+        assert call.timeout is not None, "an Estimate call carries no deadline: a model that hangs holds the pricing worker with it"
+        assert 0.5 <= call.timeout <= 0.9, f"an Estimate call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.7"
+    ctx.grpc.set_latency("Estimate", 5.0)
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    assert row["price_cents"] == 1100, f"a model slower than the deadline changed the price to {row['price_cents']}"
+
+
+def check_terminal_rejection(ctx):
+    m, peer = _client(ctx)
+    store.seed("SKU-7", 2000)
+    peer.refused.add("SKU-7")
+    try:
+        row = m.price_from_demand("SKU-7", "demand refresh")
+    except m.PriceRejected:
+        row = None
+    except Exception as other:
+        raise AssertionError(f"a refused sku raised {type(other).__name__}: {other}, expected PriceRejected")
+    calls = len(ctx.grpc.calls_to("Estimate"))
+    assert calls == 1, f"a sku the model refused was sent to it {calls} times: FAILED_PRECONDITION is an answer, not an outage"
+    assert row is None, f"price_from_demand returned {row} for a sku the model refused, expected PriceRejected"
+    stored = store.get_sku("SKU-7")
+    assert stored["price_cents"] == 2000 and stored["source"] == "seed" and stored["stale"] is False, f"a refusal must leave the price as it was, the store holds {stored}"
+
+
+def check_last_approved_fallback(ctx):
+    m, _ = _client(ctx)
+    store.seed("SKU-1", 1000)
+    m.price_from_demand("SKU-1", "demand refresh")
+    ctx.clock.advance(60)
+    approved = store.publish("SKU-1", 1050, "operator correction", "operator")
+    ctx.clock.advance(60)
+    ctx.grpc.fail("Estimate", grpc.StatusCode.UNAVAILABLE, "model redeploying", times=5)
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    assert row is not None and row["price_cents"] == 1050, f"with the model down the sku is priced {row and row['price_cents']}: an old model estimate went out again over the price the operator approved since, 1050"
+    assert row["stale"] is True and row["source"] == "last-approved", f"the kept price must say what it is (source last-approved, stale true), got {row}"
+    assert row["updated_at"] == approved["updated_at"], f"the kept price is stamped {row['updated_at'] - approved['updated_at']} s after it was approved: it must keep its own updated_at"
+    assert store.get_sku("SKU-1") == row, f"the store holds {store.get_sku('SKU-1')}, the call returned {row}"
+    ctx.grpc.set_latency("Estimate", 5.0)
+    late = m.price_from_demand("SKU-1", "demand refresh")
+    assert late["price_cents"] == 1050 and late["stale"] is True, f"a model slower than the deadline must leave the approved price, marked stale; got {late}"
+
+
+def check_guarded_estimate(ctx):
+    m, peer = _client(ctx)
+    store.seed("SKU-1", 1000)
+    peer.pct["SKU-1"] = 150
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    stored = store.get_sku("SKU-1")
+    assert stored["price_cents"] == 1000 and stored["source"] == "seed", f"the model proposed 1500 for a sku at 1000 and the store now holds {stored['price_cents']}: an estimate moves the price only through guard.reserve"
+    assert row["price_cents"] == 1000, f"a refused estimate must return the unchanged row, got {row}"
+    peer.pct["SKU-1"] = 110
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    assert row["price_cents"] == 1100 and row["source"] == "demand-model", f"a 10 % estimate inside the window must be published, got {row}"
+    spent = guard.window_state("SKU-1")["moved_bp"]
+    assert spent == 1000, f"the published 10 % move spent {spent} bp of the window, expected 1000: reserve the estimate with guard.reserve"
+`,
+    typescript: `/** Proposes current * pct / 100 (110 unless set per sku); refuses the skus in refused. */
+function client(ctx) {
+  const pkg = ctx.proto('dynamic_pricing.proto');
+  const pct = new Map<string, number>();
+  const refused = new Set<string>();
+  ctx.grpc.serve(pkg.priced.DemandModel.service, {
+    Estimate(call, callback) {
+      const {sku, current_price_cents} = call.request;
+      if (refused.has(sku)) return callback({code: ctx.grpc.status.FAILED_PRECONDITION, details: \`\${sku} is price-matched: the model may not move it\`});
+      callback(null, {price_cents: Math.floor((Number(current_price_cents) * (pct.get(sku) ?? 110)) / 100), model_version: 'elasticity-v7'});
+    },
+  });
+  return {
+    m: ctx.load('client'),
+    store: ctx.load('/support/pricing/store.ts'),
+    guard: ctx.load('/support/pricing/guard.ts'),
+    pct,
+    refused,
+  };
+}
+
+export async function check_deadline(ctx) {
+  const {m, store} = client(ctx);
+  await store.seed('SKU-1', 1000);
+  let row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert(row.price_cents === 1100 && row.source === 'demand-model', \`with the model healthy the sku must be repriced to its estimate 1100, got \${JSON.stringify(row)}\`);
+  const calls = ctx.grpc.callsTo('Estimate');
+  assert(calls.length > 0, 'no Estimate call was made');
+  for (const call of calls) {
+    assert(call.timeout !== null, 'an Estimate call carries no deadline: a model that hangs holds the pricing worker with it');
+    assert(0.5 <= call.timeout && call.timeout <= 0.9, \`an Estimate call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 700\`);
+  }
+  ctx.grpc.setLatency('Estimate', 5.0);
+  row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert.equal(row.price_cents, 1100, \`a model slower than the deadline changed the price to \${row.price_cents}\`);
+}
+
+export async function check_terminal_rejection(ctx) {
+  const {m, store, refused} = client(ctx);
+  await store.seed('SKU-7', 2000);
+  refused.add('SKU-7');
+  let row;
+  try {
+    row = await m.priceFromDemand('SKU-7', 'demand refresh');
+  } catch (e) {
+    if (!(e instanceof m.PriceRejected)) assert.fail(\`a refused sku threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected PriceRejected\`);
+    row = null;
+  }
+  const calls = ctx.grpc.callsTo('Estimate').length;
+  assert.equal(calls, 1, \`a sku the model refused was sent to it \${calls} times: FAILED_PRECONDITION is an answer, not an outage\`);
+  assert.equal(row, null, \`priceFromDemand resolved \${JSON.stringify(row)} for a sku the model refused, expected PriceRejected\`);
+  const stored = await store.getSku('SKU-7');
+  assert(stored.price_cents === 2000 && stored.source === 'seed' && stored.stale === false, \`a refusal must leave the price as it was, the store holds \${JSON.stringify(stored)}\`);
+}
+
+export async function check_last_approved_fallback(ctx) {
+  const {m, store} = client(ctx);
+  await store.seed('SKU-1', 1000);
+  await m.priceFromDemand('SKU-1', 'demand refresh');
+  ctx.clock.advance(60);
+  const approved = await store.publish('SKU-1', 1050, 'operator correction', 'operator');
+  ctx.clock.advance(60);
+  ctx.grpc.fail('Estimate', ctx.grpc.status.UNAVAILABLE, 'model redeploying', 5);
+  const row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert(row !== null && row.price_cents === 1050, \`with the model down the sku is priced \${row?.price_cents}: an old model estimate went out again over the price the operator approved since, 1050\`);
+  assert(row.stale === true && row.source === 'last-approved', \`the kept price must say what it is (source last-approved, stale true), got \${JSON.stringify(row)}\`);
+  assert.equal(row.updated_at, approved.updated_at, \`the kept price is stamped \${row.updated_at - approved.updated_at} s after it was approved: it must keep its own updated_at\`);
+  assert.deepStrictEqual(await store.getSku('SKU-1'), row, 'the store must hold the row the call returned');
+  ctx.grpc.clearFailures();
+  ctx.grpc.setLatency('Estimate', 5.0);
+  const late = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert(late.price_cents === 1050 && late.stale === true, \`a model slower than the deadline must leave the approved price, marked stale; got \${JSON.stringify(late)}\`);
+}
+
+export async function check_guarded_estimate(ctx) {
+  const {m, store, guard, pct} = client(ctx);
+  await store.seed('SKU-1', 1000);
+  pct.set('SKU-1', 150);
+  let row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  const stored = await store.getSku('SKU-1');
+  assert(stored.price_cents === 1000 && stored.source === 'seed', \`the model proposed 1500 for a sku at 1000 and the store now holds \${stored.price_cents}: an estimate moves the price only through guard.reserve\`);
+  assert.equal(row.price_cents, 1000, \`a refused estimate must resolve to the unchanged row, got \${JSON.stringify(row)}\`);
+  pct.set('SKU-1', 110);
+  row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert(row.price_cents === 1100 && row.source === 'demand-model', \`a 10 % estimate inside the window must be published, got \${JSON.stringify(row)}\`);
+  const spent = (await guard.windowState('SKU-1')).moved_bp;
+  assert.equal(spent, 1000, \`the published 10 % move spent \${spent} bp of the window, expected 1000: reserve the estimate with reserve\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "pricing/gen/dynamic_pricing"
+	"pricing/guard"
+	"pricing/store"
+
+	"leetbuild/harness"
+)
+
+var clientBg = context.Background()
+
+// demandPeer proposes current * pct / 100 (110 unless set per sku); it refuses the skus in refused.
+type demandPeer struct {
+	pb.UnimplementedDemandModelServer
+	pct     map[string]int64
+	refused map[string]bool
+}
+
+func (d *demandPeer) Estimate(_ context.Context, req *pb.EstimateRequest) (*pb.PriceEstimate, error) {
+	if d.refused[req.GetSku()] {
+		return nil, status.Errorf(codes.FailedPrecondition, "%s is price-matched: the model may not move it", req.GetSku())
+	}
+	pct, ok := d.pct[req.GetSku()]
+	if !ok {
+		pct = 110
+	}
+	return &pb.PriceEstimate{PriceCents: req.GetCurrentPriceCents() * pct / 100, ModelVersion: "elasticity-v7"}, nil
+}
+
+func demandClient(ctx *harness.Ctx) *demandPeer {
+	peer := &demandPeer{pct: map[string]int64{}, refused: map[string]bool{}}
+	pb.RegisterDemandModelServer(ctx.GRPC.Server(""), peer)
+	return peer
+}
+
+func reprice(ctx *harness.Ctx, sku string) *store.Row {
+	row, err := priceFromDemand(clientBg, sku, "demand refresh")
+	ctx.NoError(err, "priceFromDemand(%s)", sku)
+	ctx.Assert(row != nil, "priceFromDemand(%s) returned no row", sku)
+	return row
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	demandClient(ctx)
+	store.Seed(clientBg, "SKU-1", 1000)
+	row := reprice(ctx, "SKU-1")
+	ctx.Assert(row.PriceCents == 1100 && row.Source == "demand-model", "with the model healthy the sku must be repriced to its estimate 1100, got %+v", row)
+	calls := ctx.GRPC.CallsTo("Estimate", "")
+	ctx.Assert(len(calls) > 0, "no Estimate call was made")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline(), "an Estimate call carries no deadline: a model that hangs holds the pricing worker with it")
+		ctx.Assert(call.Timeout.Seconds() >= 0.5 && call.Timeout.Seconds() <= 0.9, "an Estimate call carries a %v deadline, expected 700 ms", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Estimate", 5.0, "")
+	row = reprice(ctx, "SKU-1")
+	ctx.Equal(row.PriceCents, 1100, "a model slower than the deadline must not change the price; the price")
+}
+
+func CheckTerminalRejection(ctx *harness.Ctx) {
+	peer := demandClient(ctx)
+	store.Seed(clientBg, "SKU-7", 2000)
+	peer.refused["SKU-7"] = true
+	row, err := priceFromDemand(clientBg, "SKU-7", "demand refresh")
+	calls := len(ctx.GRPC.CallsTo("Estimate", ""))
+	ctx.Equal(calls, 1, "a sku the model refused must be sent to it once (FAILED_PRECONDITION is an answer, not an outage); the calls")
+	ctx.Assert(err != nil, "priceFromDemand returned %+v for a sku the model refused, expected an error wrapping ErrPriceRejected", row)
+	ctx.ErrorIs(err, ErrPriceRejected, "a refused sku returned %v", err)
+	stored := store.GetSKU(clientBg, "SKU-7")
+	ctx.Assert(stored.PriceCents == 2000 && stored.Source == "seed" && !stored.Stale, "a refusal must leave the price as it was, the store holds %+v", stored)
+}
+
+func CheckLastApprovedFallback(ctx *harness.Ctx) {
+	demandClient(ctx)
+	store.Seed(clientBg, "SKU-1", 1000)
+	reprice(ctx, "SKU-1")
+	ctx.Clock.Advance(60)
+	approved := store.Publish(clientBg, "SKU-1", 1050, "operator correction", "operator")
+	ctx.Clock.Advance(60)
+	ctx.GRPC.Fail("Estimate", codes.Unavailable, "model redeploying", 5, "")
+	row := reprice(ctx, "SKU-1")
+	ctx.Equal(row.PriceCents, 1050, "with the model down an old model estimate must not go out again over the price the operator approved since; the price")
+	ctx.Assert(row.Stale && row.Source == "last-approved", "the kept price must say what it is (source last-approved, stale true), got %+v", row)
+	ctx.Equal(row.UpdatedAt, approved.UpdatedAt, "the kept price must keep its own updated_at (%d s later otherwise); updated_at", row.UpdatedAt-approved.UpdatedAt)
+	ctx.Equal(*store.GetSKU(clientBg, "SKU-1"), *row, "the store must hold the row the call returned")
+	ctx.GRPC.ClearFailures()
+	ctx.GRPC.SetLatency("Estimate", 5.0, "")
+	late := reprice(ctx, "SKU-1")
+	ctx.Assert(late.PriceCents == 1050 && late.Stale, "a model slower than the deadline must leave the approved price, marked stale; got %+v", late)
+}
+
+func CheckGuardedEstimate(ctx *harness.Ctx) {
+	peer := demandClient(ctx)
+	store.Seed(clientBg, "SKU-1", 1000)
+	peer.pct["SKU-1"] = 150
+	row := reprice(ctx, "SKU-1")
+	stored := store.GetSKU(clientBg, "SKU-1")
+	ctx.Assert(stored.PriceCents == 1000 && stored.Source == "seed", "the model proposed 1500 for a sku at 1000 and the store now holds %d: an estimate moves the price only through guard.Reserve", stored.PriceCents)
+	ctx.Equal(row.PriceCents, 1000, "a refused estimate must return the unchanged row; the price")
+	peer.pct["SKU-1"] = 110
+	row = reprice(ctx, "SKU-1")
+	ctx.Assert(row.PriceCents == 1100 && row.Source == "demand-model", "a 10 %% estimate inside the window must be published, got %+v", row)
+	spent := guard.WindowState(clientBg, "SKU-1").MovedBP
+	ctx.Equal(spent, int64(1000), "the published 10 %% move must spend 1000 bp of the window through guard.Reserve; spent")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <set>
+#include <string>
+
+namespace {
+
+// Proposes current * pct / 100 (110 unless set per sku); refuses the skus in refused.
+class DemandPeer final : public priced::DemandModel::Service {
+ public:
+  std::map<std::string, long long> pct;
+  std::set<std::string> refused;
+  grpc::Status Estimate(grpc::ServerContext*, const priced::EstimateRequest* req, priced::PriceEstimate* out) override {
+    if (refused.count(req->sku())) {
+      return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, req->sku() + " is price-matched: the model may not move it");
+    }
+    const long long p = pct.count(req->sku()) ? pct[req->sku()] : 110;
+    out->set_price_cents(req->current_price_cents() * p / 100);
+    out->set_model_version("elasticity-v7");
+    return grpc::Status::OK;
+  }
+};
+
+DemandPeer& demandClient(harness::Ctx& ctx) {
+  static DemandPeer* peer = nullptr;
+  delete peer;
+  peer = new DemandPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  return *peer;
+}
+
+store::Row reprice(harness::Ctx& ctx, const std::string& sku) {
+  try {
+    return priceFromDemand(sku, "demand refresh");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("priceFromDemand(%s) threw %s: %s", sku, harness::CurrentExceptionType(), e.what());
+  }
+}
+
+std::string text(const store::Row& r) {
+  return "{price_cents: " + std::to_string(r.price_cents) + ", source: " + r.source + ", stale: " + (r.stale ? "true" : "false") +
+         ", updated_at: " + std::to_string(r.updated_at) + "}";
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  demandClient(ctx);
+  store::seed("SKU-1", 1000);
+  store::Row row = reprice(ctx, "SKU-1");
+  ctx.Assert(row.price_cents == 1100 && row.source == "demand-model", "with the model healthy the sku must be repriced to its estimate 1100, got %s", text(row));
+  const auto calls = ctx.GRPC.CallsTo("Estimate");
+  ctx.Assert(!calls.empty(), "no Estimate call was made");
+  for (const auto& call : calls) {
+    ctx.Assert(call.HasDeadline(), "an Estimate call carries no deadline: a model that hangs holds the pricing worker with it");
+    const double seconds = std::chrono::duration<double>(call.Timeout).count();
+    ctx.Assert(seconds >= 0.5 && seconds <= 0.9, "an Estimate call carries a %v s deadline, expected 700 ms", seconds);
+  }
+  ctx.GRPC.SetLatency("Estimate", 5.0);
+  row = reprice(ctx, "SKU-1");
+  ctx.Equal(row.price_cents, 1100, "a model slower than the deadline must not change the price; the price");
+}
+
+void CheckTerminalRejection(harness::Ctx& ctx) {
+  DemandPeer& peer = demandClient(ctx);
+  store::seed("SKU-7", 2000);
+  peer.refused.insert("SKU-7");
+  bool rejected = false;
+  try {
+    priceFromDemand("SKU-7", "demand refresh");
+  } catch (const PriceRejected&) {
+    rejected = true;
+  } catch (const std::exception& e) {
+    ctx.Fatalf("a refused sku threw %s: %s, expected PriceRejected", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(ctx.GRPC.CallsTo("Estimate").size(), 1, "a sku the model refused must be sent to it once (FAILED_PRECONDITION is an answer, not an outage); the calls");
+  ctx.Assert(rejected, "priceFromDemand returned a row for a sku the model refused, expected PriceRejected");
+  const store::Row stored = *store::getSku("SKU-7");
+  ctx.Assert(stored.price_cents == 2000 && stored.source == "seed" && !stored.stale, "a refusal must leave the price as it was, the store holds %s", text(stored));
+}
+
+void CheckLastApprovedFallback(harness::Ctx& ctx) {
+  demandClient(ctx);
+  store::seed("SKU-1", 1000);
+  reprice(ctx, "SKU-1");
+  ctx.Clock.Advance(60);
+  const store::Row approved = store::publish("SKU-1", 1050, "operator correction", "operator");
+  ctx.Clock.Advance(60);
+  ctx.GRPC.Fail("Estimate", grpc::StatusCode::UNAVAILABLE, "model redeploying", 5);
+  const store::Row row = reprice(ctx, "SKU-1");
+  ctx.Equal(row.price_cents, 1050, "with the model down an old model estimate must not go out again over the price the operator approved since; the price");
+  ctx.Assert(row.stale && row.source == "last-approved", "the kept price must say what it is (source last-approved, stale true), got %s", text(row));
+  ctx.Equal(row.updated_at, approved.updated_at, "the kept price must keep its own updated_at (%d s later otherwise); updated_at", row.updated_at - approved.updated_at);
+  ctx.Equal(text(*store::getSku("SKU-1")), text(row), "the store must hold the row the call returned");
+  ctx.GRPC.ClearFailures();
+  ctx.GRPC.SetLatency("Estimate", 5.0);
+  const store::Row late = reprice(ctx, "SKU-1");
+  ctx.Assert(late.price_cents == 1050 && late.stale, "a model slower than the deadline must leave the approved price, marked stale; got %s", text(late));
+}
+
+void CheckGuardedEstimate(harness::Ctx& ctx) {
+  DemandPeer& peer = demandClient(ctx);
+  store::seed("SKU-1", 1000);
+  peer.pct["SKU-1"] = 150;
+  store::Row row = reprice(ctx, "SKU-1");
+  const store::Row stored = *store::getSku("SKU-1");
+  ctx.Assert(stored.price_cents == 1000 && stored.source == "seed", "the model proposed 1500 for a sku at 1000 and the store now holds %d: an estimate moves the price only through guard::reserve", stored.price_cents);
+  ctx.Equal(row.price_cents, 1000, "a refused estimate must return the unchanged row; the price");
+  peer.pct["SKU-1"] = 110;
+  row = reprice(ctx, "SKU-1");
+  ctx.Assert(row.price_cents == 1100 && row.source == "demand-model", "a 10 %% estimate inside the window must be published, got %s", text(row));
+  ctx.Equal(guard::windowState("SKU-1").moved_bp, 1000, "the published 10 %% move must spend 1000 bp of the window through guard::reserve; spent");
+}
+`,
+  },
+  hints: [
+    "Stop the demand model after it priced a sku and an operator corrected it: the next run puts the model's old number back with a fresh timestamp. A sku the model refuses is asked three times and nothing is raised.",
+    'The starter retries every gRPC error the same way and keeps a module-level `last_suggestion` as its fallback. Its calls have no deadline, and the estimate goes to `store.publish` without passing the window guard.',
+    'One call with `timeout=DEADLINE_S`; `FAILED_PRECONDITION` → `raise PriceRejected`; any other error → `return store.mark_stale(sku)`; then `guard.reserve(sku, current, estimate)` and publish only when `ok`. Delete `last_suggestion`.',
+  ],
+  debrief: `The fix sorts the model's failures by what they say about the price. A refusal is an answer, so it goes back to the caller after one call; a timeout or an outage says nothing about the price, so the last approved one stays and is labelled stale with its own timestamp, which keeps the audit trail honest about when that number was decided. Routing the estimate through the same window guard as an operator's change means the model gets no larger budget than a person. A 700 ms deadline on one call bounds the worker. Production repricers add a circuit breaker so a dead model is not asked on every tick, and a per-model kill switch that stops its estimates without a deploy.`,
 };

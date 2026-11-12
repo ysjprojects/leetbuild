@@ -8,538 +8,297 @@ export const invoiceStateStep: Step = {
   focus: ['api', 'redis', 'db'],
   task: `## Task
 
-**Starting point.** The starter serves \`POST /v1/invoices/{invoice_id}/finalize\`, the one-way
-transition from a mutable draft to an issued document: it loads the draft, answers 409 if it is not
-one, takes the next number by \`GET\`-ting \`inv:seq:{tenant}\`, adding one in the handler and
-\`SET\`-ting it back, then validates the totals and writes \`finalized\` with the number. The demo
-passes. It hides five flaws.
+**Starting point.** The starter is the numbering every finalize path shares:
+\`claim_number(tenant, invoice_id)\` reads the invoice's \`status\` (\`HGET\`), \`GET\`s the counter
+\`invoice:seq\`, adds one in the client, \`SET\`s it back and writes \`status\` \`finalized\` and the
+number on \`invoice:{id}\`; \`finalize_invoice(tenant, invoice_id)\` claims a number, then runs
+\`validate_totals\` and, on a rejection, reopens the invoice (\`store.reopen\`) and raises
+\`InvoiceRejected\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Two concurrent finalizes both read the same last number and two
-invoices of one tenant share a legal identifier. Every rejected finalize burns a number, because the
-claim comes before the validation. A flushed counter restarts at zero and reissues numbers already
-on issued documents. The status check and the claim are two steps, so a loser can finalize an
-invoice finalized a moment ago. And the store keeps both duplicates.
+**Failure mode the checks target.** Every tenant draws from one counter, so a seller's invoice
+numbers jump; two finalizes racing read the same last number and two invoices share it; a finalize
+racing another on the same invoice spends a second number; and a rejected invoice leaves a hole in
+the series.
 
-- The sequence is per tenant: the key is \`inv:seq:{tenant}\`, incremented inside Redis by one Lua
-  script (\`CLAIM_SCRIPT\`) run with \`EVAL\`.
-- Claim and transition are one atomic step: the script reads the claim's \`status\`, refuses anything
-  that is no longer \`draft\`, \`INCR\`s the sequence and \`HSET\`s \`finalized\` plus the number on
-  the same key, so concurrent finalizes receive distinct numbers and the loser gets a conflict.
-- Validate before you claim: \`validate_totals\` runs before \`claim_number\`.
-- \`reconcile_sequence(tenant)\` compares the counter with \`MAX(number)\` among the tenant's issued
-  invoices and repairs it upward with \`SET\`.
-- The invoice rows carry \`UNIQUE (tenant_id, number)\` and the write path turns an
-  \`IntegrityError\` into a conflict.`,
+- The counter is per tenant: \`seq_key(tenant)\` is \`invoice:seq:{tenant}\`.
+- The claim is **one Lua script** (\`CLAIM_LUA\`, run with \`EVAL\`): it reads the invoice's
+  \`status\` and answers \`0\` unless it is \`draft\`, \`INCR\`s the tenant's counter and \`HSET\`s
+  \`status\` \`finalized\` and the number, so nothing runs between the read and the writes.
+  \`claim_number\` answers \`None\` for a non-draft.
+- \`finalize_invoice\` runs \`validate_totals\` **before** \`claim_number\`: a rejection raises
+  \`InvoiceRejected\` with no number claimed.`,
   sequence: {
-    participants: ['Client', 'Invoice Service', 'Redis', 'Invoice store'],
+    participants: ['Finalize path', 'Redis'],
     messages: [
-      {from: 'Client', to: 'Invoice Service', label: 'POST /v1/invoices/inv_01/finalize', kind: 'sync'},
-      {from: 'Invoice Service', to: 'Invoice store', label: 'load draft inv_01', kind: 'sync'},
       {
-        from: 'Invoice Service',
-        to: 'Invoice Service',
-        label: 'validate_totals(draft) — a rejection here claims nothing',
+        from: 'Finalize path',
+        to: 'Finalize path',
+        label: 'validate_totals(invoice) → InvoiceRejected, nothing claimed',
         kind: 'sync',
       },
-      {from: 'Invoice Service', to: 'Redis', label: 'EVAL claim · KEYS[inv:claim:inv_01, inv:seq:acme]', kind: 'sync'},
-      {from: 'Redis', to: 'Invoice Service', label: '{1, 1042} · draft→finalized in the same script', kind: 'reply'},
       {
-        from: 'Invoice Service',
-        to: 'Invoice store',
-        label: 'UPDATE number 1042 · UNIQUE (tenant_id, number)',
+        from: 'Finalize path',
+        to: 'Redis',
+        label: 'EVAL CLAIM_LUA · KEYS invoice:{id}, invoice:seq:{tenant}',
         kind: 'sync',
       },
-      {from: 'Invoice Service', to: 'Client', label: '201 {status: finalized, number: 1042}', kind: 'reply'},
-      {
-        from: 'Redis',
-        to: 'Invoice Service',
-        label: '{0, 1042} on a concurrent finalize · 409, no new number',
-        kind: 'reply',
-      },
+      {from: 'Redis', to: 'Redis', label: 'HGET status ≠ draft → 0 · INCR · HSET finalized, number', kind: 'sync'},
+      {from: 'Redis', to: 'Finalize path', label: 'number · 0 when no longer a draft', kind: 'reply'},
     ],
   },
-  hints: [
-    'An auditor finds two invoices from one tenant with the same number, and a run of missing numbers that line up with the day a client kept submitting empty drafts.',
-    '`next_number` does `GET`, add one, `SET`, so two handlers read the same last value; it is called before `validate_totals`, so a 422 has already consumed a number; the status check happens outside the claim.',
-    'Run `validate_totals` first, then one `EVAL` of `CLAIM_SCRIPT` that checks `status == draft`, `INCR`s `inv:seq:{tenant}` and `HSET`s finalized plus the number; add `reconcile_sequence` with `MAX(number)` and `UNIQUE (tenant_id, number)`.',
-  ],
   checks: [
     {
       id: 'sequence-key',
-      title: 'Per-tenant key, incremented inside Redis',
+      title: 'Numbers each tenant from its own counter',
       detail:
-        'The counter is `inv:seq:{tenant}`, built from the tenant, and it is incremented by `INCR` **inside** the Lua script the service `EVAL`s. A client-side `GET`-then-`SET` races: two concurrent finalizes read the same last number and both write `last + 1`, so two invoices of one tenant carry the same number.',
+        "The counter key is `invoice:seq:{tenant}` (`seq_key`/`seqKey`); one shared `invoice:seq` makes every seller's series jump whenever another seller issues an invoice.",
       match: {
-        python: {all: [/CLAIM_SCRIPT/, /inv:seq:\{tenant\}/, /\.eval\(/, /INCR/]},
-        typescript: {all: [/CLAIM_SCRIPT/, /inv:seq:\$\{tenant\}/, /\.eval\(/, /INCR/]},
-        go: {all: [/claimScript/, /inv:seq:%s/, /\.Eval\(/, /INCR/]},
-        scala: {all: [/ClaimScript/, /inv:seq:\$tenant/, /\.eval\(/, /INCR/]},
-        cpp: {all: [/kClaimScript/, /"inv:seq:"\)\s*\+/, /\.eval</, /INCR/]},
+        python: {all: [/f["']invoice:seq:\{tenant\}["']/], none: [/["']invoice:seq["']/]},
+        typescript: {all: [/invoice:seq:\$\{tenant\}/], none: [/['"]invoice:seq['"]/]},
+        go: {all: [/"invoice:seq:"\s*\+\s*tenant/], none: [/"invoice:seq"/]},
+        scala: {all: [/s"invoice:seq:\$tenant"/], none: [/"invoice:seq"/]},
+        cpp: {all: [/"invoice:seq:"\s*\+\s*tenant/], none: [/"invoice:seq"/]},
       },
     },
     {
       id: 'atomic-claim',
-      title: 'Claim and finalize in one atomic step',
+      title: 'Takes the next number with INCR inside one script',
       detail:
-        'One script (`EVAL`, or `WATCH`/`MULTI`/`EXEC` on the claim key) reads the claim state, refuses anything that is no longer `draft`, `INCR`s the sequence and `HSET`s the same key to `finalized` with the number it just took. Two concurrent finalizes therefore get distinct numbers instead of the same one, and the loser is told the invoice is already finalized.',
+        'The number comes from `INCR` inside the claim script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`), never from a `GET` and a `SET` in the client, between which another finalize reads the same last number.',
       match: {
-        python: {all: [/CLAIM_SCRIPT/, /'draft'/, /INCR/, /HSET/]},
-        typescript: {all: [/CLAIM_SCRIPT/, /'draft'/, /INCR/, /HSET/]},
-        go: {all: [/claimScript/, /'draft'/, /INCR/, /HSET/]},
-        scala: {all: [/ClaimScript/, /'draft'/, /INCR/, /HSET/]},
-        cpp: {all: [/kClaimScript/, /'draft'/, /INCR/, /HSET/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/],
+          none: [/\br\.get\(/, /\br\.set\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]INCR['"]/],
+          none: [/redis\.get\(/, /redis\.set\(/],
+        },
+        go: {all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/rdb\.Get\(/, /rdb\.Set\(/]},
+        scala: {all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]INCR['"]/], none: [/jedis\.get\(/, /jedis\.set\(/]},
+        cpp: {all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]INCR['"]/], none: [/redis\.get\(/, /redis\.set\(/]},
+      },
+    },
+    {
+      id: 'status-in-claim',
+      title: 'Checks the draft status inside the claim',
+      detail:
+        "The script reads `status` itself (`redis.call('HGET', KEYS[1], 'status')`) and answers 0 for a non-draft; a status read in the client is a separate command, and a finalize of the same invoice landing after it spends a second number.",
+      match: {
+        python: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
+        typescript: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
+        go: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.HGet\(/]},
+        scala: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
+        cpp: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
       },
     },
     {
       id: 'no-burn',
-      title: 'Validation runs before the claim',
+      title: 'Validates before it claims a number',
       detail:
-        "The handler validates the totals (`validate_totals`) **before** it calls the claim, so a rejected finalize consumes no number and leaves no gap in the tenant's sequence. The starter claims first and validates afterwards: every 422 burns a number that no invoice will ever carry, and the sequence is no longer gapless.",
+        '`finalize_invoice`/`finalizeInvoice` runs `validate_totals`/`validateTotals` before the claim and raises `InvoiceRejected` with no number taken; claiming first and reopening on a rejection leaves a hole in the series.',
       match: {
-        python: {order: [/validate_totals\(invoice\)/, /claim_number\(tenant, invoice_id\)/]},
-        typescript: {order: [/validateTotals\(invoice\)/, /claimNumber\(tenant, id\)/]},
-        go: {order: [/validateTotals\(invoice\.Lines\)/, /claimNumber\(r\.Context\(\), tenant, invoice\.ID\)/]},
-        scala: {order: [/validateTotals\(invoice\.lines\)/, /claimNumber\(tenant, invoiceId\)/]},
-        cpp: {order: [/validateTotals\(invoice\["lines"\]\)/, /claimNumber\(redis, tenant, invoiceId\)/]},
-      },
-    },
-    {
-      id: 'reconcile',
-      title: 'The counter reconciles against issued invoices',
-      detail:
-        "`reconcile_sequence(tenant)` asks the invoice store for `MAX(number)` among that tenant's issued invoices and writes the counter back up to it with `SET` when Redis is behind. Without it a flushed counter restarts at zero and reissues numbers that are already printed on issued documents.",
-      match: {
-        python: {all: [/reconcile_sequence/, /MAX\(number\)/i, /\.set\(/, /inv:seq:/]},
-        typescript: {all: [/reconcileSequence/, /MAX\(number\)/i, /\.set\(/, /inv:seq:/]},
-        go: {all: [/reconcileSequence/, /MAX\(number\)/i, /\.Set\(/, /inv:seq:/]},
-        scala: {all: [/reconcileSequence/, /MAX\(number\)/i, /\.set\(/, /inv:seq:/]},
-        cpp: {all: [/reconcileSequence/, /MAX\(number\)/i, /\.set\(/, /inv:seq:/]},
-      },
-    },
-    {
-      id: 'unique-number',
-      title: 'The store rejects a duplicate number per tenant',
-      detail:
-        'The invoice table carries `UNIQUE (tenant_id, number)` and the write path turns a violation into a conflict instead of a second row. Whatever a bug does to the counter, two invoices of one tenant must never persist with the same number — the constraint is the guarantee the sequence cannot give on its own.',
-      match: {
-        python: {all: [/UNIQUE \(tenant_id, number\)/, /IntegrityError/]},
-        typescript: {all: [/UNIQUE \(tenant_id, number\)/, /SQLITE_CONSTRAINT_UNIQUE/]},
-        go: {all: [/UNIQUE \(tenant_id, number\)/, /ErrConstraint|UNIQUE constraint failed/]},
-        scala: {all: [/UNIQUE \(tenant_id, number\)/, /SQLIntegrityConstraintViolationException/]},
-        cpp: {all: [/UNIQUE \(tenant_id, number\)/, /UNIQUE constraint failed/]},
+        python: {order: [/def finalize_invoice\(/, /validate_totals\(/, /claim_number\(/], none: [/store\.reopen\(/]},
+        typescript: {order: [/function finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/\breopen\(/]},
+        go: {order: [/func finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/store\.Reopen\(/]},
+        scala: {order: [/def finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/Store\.reopen\(/]},
+        cpp: {order: [/long finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/store::reopen\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-import sqlite3
+      starter: `import redis
 
-import redis.asyncio as redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from invoice import store  # store.get, invoice_key, subtotal, reopen
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
-db = sqlite3.connect("invoices.db", check_same_thread=False)
 
-SEQUENCE_KEY_PREFIX = "inv:seq:"
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL
-)
-"""
-
-db.execute(SCHEMA)
-db.commit()
+SEQ_KEY = "invoice:seq"
 
 
-class Line(BaseModel):
-    description: str
-    quantity: int
-    unit_cents: int
+class InvoiceRejected(Exception):
+    """The invoice cannot be issued as it stands: the message says why."""
 
 
-def load_draft(invoice_id: str) -> dict:
-    row = db.execute(
-        "SELECT tenant_id, status, lines FROM invoices WHERE id = ?", (invoice_id,)
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
-    return {
-        "id": invoice_id,
-        "tenant_id": row[0],
-        "status": row[1],
-        "lines": [Line(**line) for line in json.loads(row[2])],
-    }
+def claim_number(tenant: str, invoice_id: str) -> int | None:
+    """The invoice's number, claimed and written with status finalized; None when it is no longer a draft."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    key = store.invoice_key(invoice_id)
+    if r.hget(key, "status") != "draft":
+        return None
+    n = int(r.get(SEQ_KEY) or 0) + 1
+    r.set(SEQ_KEY, n)
+    r.hset(key, mapping={"status": "finalized", "number": n})
+    return n
 
 
-def validate_totals(invoice: dict) -> int:
-    lines = invoice["lines"]
-    total = sum(line.quantity * line.unit_cents for line in lines)
-    if not lines or total <= 0:
-        raise HTTPException(status_code=422, detail="invoice has no billable lines")
-    return total
+def validate_totals(invoice: dict) -> str | None:
+    """Why the invoice cannot be issued, or None."""
+    if not invoice["line_items"]:
+        return "an invoice with no line items cannot be finalized"
+    if invoice["subtotal_cents"] != store.subtotal(invoice["line_items"]):
+        return "the subtotal does not match the line items"
+    return None
 
 
-async def next_number(tenant: str) -> int:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = f"{SEQUENCE_KEY_PREFIX}{tenant}"
-    last = int(await r.get(key) or 0)
-    number = last + 1
-    await r.set(key, number)
-    return number
-
-
-@app.post("/v1/invoices/{invoice_id}/finalize")
-async def finalize(invoice_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    invoice = load_draft(invoice_id)
-    if invoice["status"] != "draft":
-        raise HTTPException(status_code=409, detail="invoice is already finalized")
-    number = await next_number(tenant)
-    total = validate_totals(invoice)
-    db.execute(
-        "UPDATE invoices SET status = 'finalized', number = ?, total_cents = ? WHERE id = ?",
-        (number, total, invoice_id),
-    )
-    db.commit()
-    return {"id": invoice_id, "status": "finalized", "number": number}
+def finalize_invoice(tenant: str, invoice_id: str) -> int | None:
+    """Issue the tenant's draft: its number, or None when it is no longer a draft. Raises InvoiceRejected."""
+    invoice = store.get(invoice_id)
+    if invoice is None or invoice["tenant_id"] != tenant:
+        raise InvoiceRejected(f"no invoice {invoice_id}")
+    n = claim_number(tenant, invoice_id)
+    if n is None:
+        return None
+    reason = validate_totals(invoice)
+    if reason is not None:
+        store.reopen(invoice_id)  # back to a draft the issuer can fix
+        raise InvoiceRejected(reason)
+    return n
 `,
-      solution: `import json
-import sqlite3
+      solution: `import redis
 
-import redis.asyncio as redis
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from invoice import store  # store.get, invoice_key, subtotal, reopen
 
-app = FastAPI()
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
-db = sqlite3.connect("invoices.db", check_same_thread=False)
 
-SEQUENCE_KEY_PREFIX = "inv:seq:"
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL,
-  UNIQUE (tenant_id, number)
-)
+# Refuses an invoice that is no longer a draft (0), else takes the tenant's next number and finalizes
+# the invoice. Redis runs the script whole: no other client lands between the read and the writes.
+CLAIM_LUA = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'draft' then return 0 end
+local n = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'status', 'finalized', 'number', n)
+return n
 """
-
-CLAIM_SCRIPT = """
-local status = redis.call('HGET', KEYS[1], 'status')
-if status ~= 'draft' then
-  return {0, tonumber(redis.call('HGET', KEYS[1], 'number') or '0')}
-end
-local number = redis.call('INCR', KEYS[2])
-redis.call('HSET', KEYS[1], 'status', 'finalized')
-redis.call('HSET', KEYS[1], 'number', number)
-return {1, number}
-"""
-
-db.execute(SCHEMA)
-db.commit()
+claim = r.register_script(CLAIM_LUA)
 
 
-class Line(BaseModel):
-    description: str
-    quantity: int
-    unit_cents: int
+class InvoiceRejected(Exception):
+    """The invoice cannot be issued as it stands: the message says why."""
 
 
-def load_draft(invoice_id: str) -> dict:
-    row = db.execute(
-        "SELECT tenant_id, status, lines FROM invoices WHERE id = ?", (invoice_id,)
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="invoice not found")
-    return {
-        "id": invoice_id,
-        "tenant_id": row[0],
-        "status": row[1],
-        "lines": [Line(**line) for line in json.loads(row[2])],
-    }
+def seq_key(tenant: str) -> str:
+    return f"invoice:seq:{tenant}"
 
 
-def sequence_key(tenant: str) -> str:
-    return f"inv:seq:{tenant}"
+def claim_number(tenant: str, invoice_id: str) -> int | None:
+    """The invoice's number, claimed and written with status finalized; None when it is no longer a draft."""
+    n = claim(keys=[store.invoice_key(invoice_id), seq_key(tenant)])
+    return int(n) if n else None
 
 
-def claim_key(invoice_id: str) -> str:
-    return f"inv:claim:{invoice_id}"
+def validate_totals(invoice: dict) -> str | None:
+    """Why the invoice cannot be issued, or None."""
+    if not invoice["line_items"]:
+        return "an invoice with no line items cannot be finalized"
+    if invoice["subtotal_cents"] != store.subtotal(invoice["line_items"]):
+        return "the subtotal does not match the line items"
+    return None
 
 
-async def ensure_claim(invoice_id: str, tenant: str) -> None:
-    # HSETNX, not HSET: replaying finalize must not push a finalized claim back to draft.
-    await r.hsetnx(claim_key(invoice_id), "tenant", tenant)
-    await r.hsetnx(claim_key(invoice_id), "status", "draft")
-
-
-def validate_totals(invoice: dict) -> int:
-    lines = invoice["lines"]
-    total = sum(line.quantity * line.unit_cents for line in lines)
-    if not lines or total <= 0:
-        raise HTTPException(status_code=422, detail="invoice has no billable lines")
-    return total
-
-
-async def claim_number(tenant: str, invoice_id: str) -> tuple[bool, int]:
-    claimed, number = await r.eval(CLAIM_SCRIPT, 2, claim_key(invoice_id), sequence_key(tenant))
-    return bool(claimed), int(number)
-
-
-def persist_final(invoice_id: str, tenant: str, number: int, total: int) -> None:
-    try:
-        db.execute(
-            "UPDATE invoices SET status = 'finalized', number = ?, total_cents = ? WHERE id = ?",
-            (number, total, invoice_id),
-        )
-        db.commit()
-    except sqlite3.IntegrityError as conflict:
-        raise HTTPException(
-            status_code=409, detail=f"number {number} already issued for tenant {tenant}"
-        ) from conflict
-
-
-async def reconcile_sequence(tenant: str) -> int:
-    row = db.execute(
-        "SELECT COALESCE(MAX(number), 0) FROM invoices WHERE tenant_id = ? AND number IS NOT NULL",
-        (tenant,),
-    ).fetchone()
-    highest = int(row[0])
-    current = int(await r.get(sequence_key(tenant)) or 0)
-    if current < highest:
-        # Redis lost the counter: repair it upward instead of reissuing numbers already issued.
-        await r.set(sequence_key(tenant), highest)
-    return max(current, highest)
-
-
-@app.post("/v1/invoices/{invoice_id}/finalize")
-async def finalize(invoice_id: str, tenant: str = Header(alias="X-Tenant-Id")) -> dict:
-    invoice = load_draft(invoice_id)
-    await ensure_claim(invoice_id, tenant)
-    total = validate_totals(invoice)
-    claimed, number = await claim_number(tenant, invoice_id)
-    if not claimed:
-        raise HTTPException(status_code=409, detail="invoice is already finalized")
-    persist_final(invoice_id, tenant, number, total)
-    return {"id": invoice_id, "status": "finalized", "number": number}
+def finalize_invoice(tenant: str, invoice_id: str) -> int | None:
+    """Issue the tenant's draft: its number, or None when it is no longer a draft. Raises InvoiceRejected."""
+    invoice = store.get(invoice_id)
+    if invoice is None or invoice["tenant_id"] != tenant:
+        raise InvoiceRejected(f"no invoice {invoice_id}")
+    # Validate first: a number claimed for a rejected invoice is a hole in the tenant's series.
+    reason = validate_totals(invoice)
+    if reason is not None:
+        raise InvoiceRejected(reason)
+    return claim_number(tenant, invoice_id)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/invoices/:id/finalize: flawed code that counts numbers in the handler. */
-import Database from 'better-sqlite3';
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
-const db = new Database('invoices.db');
+import {type Invoice, get, invoiceKey, reopen, subtotal} from 'invoice/store';
 
-const SEQUENCE_KEY_PREFIX = 'inv:seq:';
+const redis = new Redis({host: 'redis', port: 6379});
 
-const SCHEMA = \`
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL
-)
-\`;
+export const SEQ_KEY = 'invoice:seq';
 
-db.exec(SCHEMA);
+/** The invoice cannot be issued as it stands: the message says why. */
+export class InvoiceRejected extends Error {}
 
-interface Line {
-  description: string;
-  quantity: number;
-  unit_cents: number;
+/** The invoice's number, claimed and written with status finalized; null when it is no longer a draft. */
+export async function claimNumber(tenant: string, invoiceId: string): Promise<number | null> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const key = invoiceKey(invoiceId);
+  if ((await redis.hget(key, 'status')) !== 'draft') return null;
+  const n = Number((await redis.get(SEQ_KEY)) ?? 0) + 1;
+  await redis.set(SEQ_KEY, n);
+  await redis.hset(key, {status: 'finalized', number: String(n)});
+  return n;
 }
 
-interface Invoice {
-  id: string;
-  tenant_id: string;
-  status: string;
-  lines: Line[];
+/** Why the invoice cannot be issued, or null. */
+export function validateTotals(invoice: Invoice): string | null {
+  if (invoice.line_items.length === 0) return 'an invoice with no line items cannot be finalized';
+  if (invoice.subtotal_cents !== subtotal(invoice.line_items)) return 'the subtotal does not match the line items';
+  return null;
 }
 
-function loadDraft(invoiceId: string): Invoice {
-  const row = db
-    .prepare('SELECT tenant_id, status, lines FROM invoices WHERE id = ?')
-    .get(invoiceId) as {tenant_id: string; status: string; lines: string} | undefined;
-  if (row === undefined) throw Object.assign(new Error('invoice not found'), {statusCode: 404});
-  return {id: invoiceId, tenant_id: row.tenant_id, status: row.status, lines: JSON.parse(row.lines)};
+/** Issue the tenant's draft: its number, or null when it is no longer a draft. Throws InvoiceRejected. */
+export async function finalizeInvoice(tenant: string, invoiceId: string): Promise<number | null> {
+  const invoice = await get(invoiceId);
+  if (invoice === null || invoice.tenant_id !== tenant) throw new InvoiceRejected(\`no invoice \${invoiceId}\`);
+  const n = await claimNumber(tenant, invoiceId);
+  if (n === null) return null;
+  const reason = validateTotals(invoice);
+  if (reason !== null) {
+    await reopen(invoiceId); // back to a draft the issuer can fix
+    throw new InvoiceRejected(reason);
+  }
+  return n;
 }
-
-function validateTotals(invoice: Invoice): number {
-  const total = invoice.lines.reduce((sum, line) => sum + line.quantity * line.unit_cents, 0);
-  if (invoice.lines.length === 0 || total <= 0)
-    throw Object.assign(new Error('invoice has no billable lines'), {statusCode: 422});
-  return total;
-}
-
-async function nextNumber(tenant: string): Promise<number> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const key = \`\${SEQUENCE_KEY_PREFIX}\${tenant}\`;
-  const last = Number((await r.get(key)) ?? 0);
-  const number = last + 1;
-  await r.set(key, number);
-  return number;
-}
-
-app.post('/v1/invoices/:id/finalize', async (request, reply) => {
-  const {id} = request.params as {id: string};
-  const tenant = request.headers['x-tenant-id'] as string;
-  const invoice = loadDraft(id);
-  if (invoice.status !== 'draft') return reply.code(409).send({error: 'invoice is already finalized'});
-  const number = await nextNumber(tenant);
-  const total = validateTotals(invoice);
-  db.prepare("UPDATE invoices SET status = 'finalized', number = ?, total_cents = ? WHERE id = ?").run(
-    number,
-    total,
-    id,
-  );
-  return reply.code(201).send({id, status: 'finalized', number});
-});
 `,
-      solution: `/** POST /v1/invoices/:id/finalize: one atomic claim takes the number and moves the draft. */
-import Database from 'better-sqlite3';
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const r = new Redis('redis://redis:6379');
-const db = new Database('invoices.db');
+import {type Invoice, get, invoiceKey, reopen, subtotal} from 'invoice/store';
 
-const SEQUENCE_KEY_PREFIX = 'inv:seq:';
-
-const SCHEMA = \`
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL,
-  UNIQUE (tenant_id, number)
-)
+// Refuses an invoice that is no longer a draft (0), else takes the tenant's next number and finalizes
+// the invoice. Redis runs the script whole: no other client lands between the read and the writes.
+export const CLAIM_LUA = \`
+if redis.call('HGET', KEYS[1], 'status') ~= 'draft' then return 0 end
+local n = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'status', 'finalized', 'number', n)
+return n
 \`;
 
-const CLAIM_SCRIPT = \`
-local status = redis.call('HGET', KEYS[1], 'status')
-if status ~= 'draft' then
-  return {0, tonumber(redis.call('HGET', KEYS[1], 'number') or '0')}
-end
-local number = redis.call('INCR', KEYS[2])
-redis.call('HSET', KEYS[1], 'status', 'finalized')
-redis.call('HSET', KEYS[1], 'number', number)
-return {1, number}
-\`;
-
-db.exec(SCHEMA);
-
-interface Line {
-  description: string;
-  quantity: number;
-  unit_cents: number;
+interface ClaimRedis extends Redis {
+  claim(invoiceKey: string, seqKey: string): Promise<number>;
 }
 
-interface Invoice {
-  id: string;
-  tenant_id: string;
-  status: string;
-  lines: Line[];
+const redis = new Redis({host: 'redis', port: 6379}) as ClaimRedis;
+redis.defineCommand('claim', {numberOfKeys: 2, lua: CLAIM_LUA});
+
+/** The invoice cannot be issued as it stands: the message says why. */
+export class InvoiceRejected extends Error {}
+
+export const seqKey = (tenant: string): string => \`invoice:seq:\${tenant}\`;
+
+/** The invoice's number, claimed and written with status finalized; null when it is no longer a draft. */
+export async function claimNumber(tenant: string, invoiceId: string): Promise<number | null> {
+  const n = Number(await redis.claim(invoiceKey(invoiceId), seqKey(tenant)));
+  return n > 0 ? n : null;
 }
 
-function sequenceKey(tenant: string): string {
-  return \`inv:seq:\${tenant}\`;
+/** Why the invoice cannot be issued, or null. */
+export function validateTotals(invoice: Invoice): string | null {
+  if (invoice.line_items.length === 0) return 'an invoice with no line items cannot be finalized';
+  if (invoice.subtotal_cents !== subtotal(invoice.line_items)) return 'the subtotal does not match the line items';
+  return null;
 }
 
-function claimKey(invoiceId: string): string {
-  return \`inv:claim:\${invoiceId}\`;
+/** Issue the tenant's draft: its number, or null when it is no longer a draft. Throws InvoiceRejected. */
+export async function finalizeInvoice(tenant: string, invoiceId: string): Promise<number | null> {
+  const invoice = await get(invoiceId);
+  if (invoice === null || invoice.tenant_id !== tenant) throw new InvoiceRejected(\`no invoice \${invoiceId}\`);
+  // Validate first: a number claimed for a rejected invoice is a hole in the tenant's series.
+  const reason = validateTotals(invoice);
+  if (reason !== null) throw new InvoiceRejected(reason);
+  return claimNumber(tenant, invoiceId);
 }
-
-function loadDraft(invoiceId: string): Invoice {
-  const row = db
-    .prepare('SELECT tenant_id, status, lines FROM invoices WHERE id = ?')
-    .get(invoiceId) as {tenant_id: string; status: string; lines: string} | undefined;
-  if (row === undefined) throw Object.assign(new Error('invoice not found'), {statusCode: 404});
-  return {id: invoiceId, tenant_id: row.tenant_id, status: row.status, lines: JSON.parse(row.lines)};
-}
-
-async function ensureClaim(invoiceId: string, tenant: string): Promise<void> {
-  // HSETNX, not HSET: replaying finalize must not push a finalized claim back to draft.
-  await r.hsetnx(claimKey(invoiceId), 'tenant', tenant);
-  await r.hsetnx(claimKey(invoiceId), 'status', 'draft');
-}
-
-function validateTotals(invoice: Invoice): number {
-  const total = invoice.lines.reduce((sum, line) => sum + line.quantity * line.unit_cents, 0);
-  if (invoice.lines.length === 0 || total <= 0)
-    throw Object.assign(new Error('invoice has no billable lines'), {statusCode: 422});
-  return total;
-}
-
-async function claimNumber(tenant: string, invoiceId: string): Promise<[boolean, number]> {
-  const reply = (await r.eval(CLAIM_SCRIPT, 2, claimKey(invoiceId), sequenceKey(tenant))) as [
-    number,
-    number,
-  ];
-  return [reply[0] === 1, reply[1]];
-}
-
-function persistFinal(invoiceId: string, tenant: string, number: number, total: number): void {
-  try {
-    db.prepare("UPDATE invoices SET status = 'finalized', number = ?, total_cents = ? WHERE id = ?").run(
-      number,
-      total,
-      invoiceId,
-    );
-  } catch (error) {
-    if ((error as {code?: string}).code === 'SQLITE_CONSTRAINT_UNIQUE')
-      throw Object.assign(new Error(\`number \${number} already issued for tenant \${tenant}\`), {statusCode: 409});
-    throw error;
-  }
-}
-
-async function reconcileSequence(tenant: string): Promise<number> {
-  const row = db
-    .prepare('SELECT COALESCE(MAX(number), 0) AS highest FROM invoices WHERE tenant_id = ? AND number IS NOT NULL')
-    .get(tenant) as {highest: number};
-  const current = Number((await r.get(sequenceKey(tenant))) ?? 0);
-  if (current < row.highest) {
-    // Redis lost the counter: repair it upward instead of reissuing numbers already issued.
-    await r.set(sequenceKey(tenant), String(row.highest));
-  }
-  return Math.max(current, row.highest);
-}
-
-app.post('/v1/invoices/:id/finalize', async (request, reply) => {
-  const {id} = request.params as {id: string};
-  const tenant = request.headers['x-tenant-id'] as string;
-  const invoice = loadDraft(id);
-  await ensureClaim(id, tenant);
-  const total = validateTotals(invoice);
-  const [claimed, number] = await claimNumber(tenant, id);
-  if (!claimed) return reply.code(409).send({error: 'invoice is already finalized'});
-  persistFinal(id, tenant, number, total);
-  return reply.code(201).send({id, status: 'finalized', number});
-});
 `,
     },
     go: {
@@ -547,771 +306,678 @@ app.post('/v1/invoices/:id/finalize', async (request, reply) => {
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
 
 	"github.com/redis/go-redis/v9"
+
+	"invoice/store" // store.Get, InvoiceKey, Subtotal, Reopen
 )
 
-const sequenceKeyPrefix = "inv:seq:"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const schema = \`
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL
-)
-\`
+const seqName = "invoice:seq"
 
-type Line struct {
-	Description string \`json:"description"\`
-	Quantity    int64  \`json:"quantity"\`
-	UnitCents   int64  \`json:"unit_cents"\`
+// ErrInvoiceRejected: the invoice cannot be issued as it stands.
+var ErrInvoiceRejected = errors.New("invoice rejected")
+
+// claimNumber is the invoice's number, claimed and written with status finalized; 0 when it is no
+// longer a draft.
+func claimNumber(ctx context.Context, tenant, invoiceID string) (int64, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	key := store.InvoiceKey(invoiceID)
+	if rdb.HGet(ctx, key, "status").Val() != "draft" {
+		return 0, nil
+	}
+	n, _ := rdb.Get(ctx, seqName).Int64()
+	n++
+	if err := rdb.Set(ctx, seqName, n, 0).Err(); err != nil {
+		return 0, err
+	}
+	return n, rdb.HSet(ctx, key, "status", "finalized", "number", n).Err()
 }
 
-type Invoice struct {
-	ID       string \`json:"id"\`
-	TenantID string \`json:"tenant_id"\`
-	Status   string \`json:"status"\`
-	Lines    []Line \`json:"lines"\`
+// validateTotals is why the invoice cannot be issued, or "".
+func validateTotals(invoice *store.Invoice) string {
+	if len(invoice.LineItems) == 0 {
+		return "an invoice with no line items cannot be finalized"
+	}
+	if invoice.SubtotalCents != store.Subtotal(invoice.LineItems) {
+		return "the subtotal does not match the line items"
+	}
+	return ""
 }
 
-var (
-	rdb *redis.Client
-	db  *sql.DB
-)
-
-func loadDraft(ctx context.Context, invoiceID string) (*Invoice, error) {
-	var (
-		tenantID string
-		status   string
-		lines    string
-	)
-	err := db.QueryRowContext(ctx,
-		"SELECT tenant_id, status, lines FROM invoices WHERE id = ?", invoiceID).Scan(&tenantID, &status, &lines)
-	if err != nil {
-		return nil, err
+// finalizeInvoice issues the tenant's draft: its number, or 0 when it is no longer a draft. A
+// rejection wraps ErrInvoiceRejected.
+func finalizeInvoice(ctx context.Context, tenant, invoiceID string) (int64, error) {
+	invoice := store.Get(ctx, invoiceID)
+	if invoice == nil || invoice.TenantID != tenant {
+		return 0, fmt.Errorf("%w: no invoice %s", ErrInvoiceRejected, invoiceID)
 	}
-	invoice := &Invoice{ID: invoiceID, TenantID: tenantID, Status: status}
-	if err := json.Unmarshal([]byte(lines), &invoice.Lines); err != nil {
-		return nil, err
+	n, err := claimNumber(ctx, tenant, invoiceID)
+	if err != nil || n == 0 {
+		return 0, err
 	}
-	return invoice, nil
+	if reason := validateTotals(invoice); reason != "" {
+		store.Reopen(ctx, invoiceID) // back to a draft the issuer can fix
+		return 0, fmt.Errorf("%w: %s", ErrInvoiceRejected, reason)
+	}
+	return n, nil
 }
-
-func validateTotals(lines []Line) (int64, error) {
-	var total int64
-	for _, line := range lines {
-		total += line.Quantity * line.UnitCents
-	}
-	if len(lines) == 0 || total <= 0 {
-		return 0, fmt.Errorf("invoice has no billable lines")
-	}
-	return total, nil
-}
-
-func nextNumber(ctx context.Context, tenant string) (int64, error) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := fmt.Sprintf("%s%s", sequenceKeyPrefix, tenant)
-	last, _ := rdb.Get(ctx, key).Int64()
-	number := last + 1
-	rdb.Set(ctx, key, number, 0)
-	return number, nil
-}
-
-func finalize(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	invoice, err := loadDraft(r.Context(), r.PathValue("id"))
-	if err != nil {
-		http.Error(rw, \`{"error":"invoice not found"}\`, http.StatusNotFound)
-		return
-	}
-	if invoice.Status != "draft" {
-		http.Error(rw, \`{"error":"invoice is already finalized"}\`, http.StatusConflict)
-		return
-	}
-	number, _ := nextNumber(r.Context(), tenant)
-	total, err := validateTotals(invoice.Lines)
-	if err != nil {
-		http.Error(rw, fmt.Sprintf(\`{"error":%q}\`, err.Error()), http.StatusUnprocessableEntity)
-		return
-	}
-	_, _ = db.ExecContext(r.Context(),
-		"UPDATE invoices SET status = 'finalized', number = ?, total_cents = ? WHERE id = ?",
-		number, total, invoice.ID)
-	rw.Header().Set("Content-Type", "application/json")
-	_, _ = rw.Write([]byte(fmt.Sprintf(\`{"id":%q,"status":"finalized","number":%d}\`, invoice.ID, number)))
-}
-
-func main() {}
 `,
       solution: `package main
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/redis/go-redis/v9"
+
+	"invoice/store" // store.Get, InvoiceKey, Subtotal, Reopen
 )
 
-const sequenceKeyPrefix = "inv:seq:"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const schema = \`
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL,
-  UNIQUE (tenant_id, number)
-)
-\`
+// claim refuses an invoice that is no longer a draft (0), else takes the tenant's next number and
+// finalizes the invoice. Redis runs the script whole: no other client lands between the read and
+// the writes.
+var claim = redis.NewScript(\`
+if redis.call('HGET', KEYS[1], 'status') ~= 'draft' then return 0 end
+local n = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'status', 'finalized', 'number', n)
+return n
+\`)
 
-const claimScript = \`
-local status = redis.call('HGET', KEYS[1], 'status')
-if status ~= 'draft' then
-  return {0, tonumber(redis.call('HGET', KEYS[1], 'number') or '0')}
-end
-local number = redis.call('INCR', KEYS[2])
-redis.call('HSET', KEYS[1], 'status', 'finalized')
-redis.call('HSET', KEYS[1], 'number', number)
-return {1, number}
-\`
+// ErrInvoiceRejected: the invoice cannot be issued as it stands.
+var ErrInvoiceRejected = errors.New("invoice rejected")
 
-type Line struct {
-	Description string \`json:"description"\`
-	Quantity    int64  \`json:"quantity"\`
-	UnitCents   int64  \`json:"unit_cents"\`
+func seqKey(tenant string) string { return "invoice:seq:" + tenant }
+
+// claimNumber is the invoice's number, claimed and written with status finalized; 0 when it is no
+// longer a draft.
+func claimNumber(ctx context.Context, tenant, invoiceID string) (int64, error) {
+	return claim.Run(ctx, rdb, []string{store.InvoiceKey(invoiceID), seqKey(tenant)}).Int64()
 }
 
-type Invoice struct {
-	ID       string \`json:"id"\`
-	TenantID string \`json:"tenant_id"\`
-	Status   string \`json:"status"\`
-	Lines    []Line \`json:"lines"\`
+// validateTotals is why the invoice cannot be issued, or "".
+func validateTotals(invoice *store.Invoice) string {
+	if len(invoice.LineItems) == 0 {
+		return "an invoice with no line items cannot be finalized"
+	}
+	if invoice.SubtotalCents != store.Subtotal(invoice.LineItems) {
+		return "the subtotal does not match the line items"
+	}
+	return ""
 }
 
-var (
-	rdb *redis.Client
-	db  *sql.DB
-)
-
-func loadDraft(ctx context.Context, invoiceID string) (*Invoice, error) {
-	var (
-		tenantID string
-		status   string
-		lines    string
-	)
-	err := db.QueryRowContext(ctx,
-		"SELECT tenant_id, status, lines FROM invoices WHERE id = ?", invoiceID).Scan(&tenantID, &status, &lines)
-	if err != nil {
-		return nil, err
+// finalizeInvoice issues the tenant's draft: its number, or 0 when it is no longer a draft. A
+// rejection wraps ErrInvoiceRejected.
+func finalizeInvoice(ctx context.Context, tenant, invoiceID string) (int64, error) {
+	invoice := store.Get(ctx, invoiceID)
+	if invoice == nil || invoice.TenantID != tenant {
+		return 0, fmt.Errorf("%w: no invoice %s", ErrInvoiceRejected, invoiceID)
 	}
-	invoice := &Invoice{ID: invoiceID, TenantID: tenantID, Status: status}
-	if err := json.Unmarshal([]byte(lines), &invoice.Lines); err != nil {
-		return nil, err
+	// Validate first: a number claimed for a rejected invoice is a hole in the tenant's series.
+	if reason := validateTotals(invoice); reason != "" {
+		return 0, fmt.Errorf("%w: %s", ErrInvoiceRejected, reason)
 	}
-	return invoice, nil
+	return claimNumber(ctx, tenant, invoiceID)
 }
-
-func sequenceKey(tenant string) string {
-	return fmt.Sprintf("inv:seq:%s", tenant)
-}
-
-func claimKey(invoiceID string) string {
-	return "inv:claim:" + invoiceID
-}
-
-func ensureClaim(ctx context.Context, invoiceID string, tenant string) error {
-	// HSetNX, not HSet: replaying finalize must not push a finalized claim back to draft.
-	if err := rdb.HSetNX(ctx, claimKey(invoiceID), "tenant", tenant).Err(); err != nil {
-		return err
-	}
-	return rdb.HSetNX(ctx, claimKey(invoiceID), "status", "draft").Err()
-}
-
-func validateTotals(lines []Line) (int64, error) {
-	var total int64
-	for _, line := range lines {
-		total += line.Quantity * line.UnitCents
-	}
-	if len(lines) == 0 || total <= 0 {
-		return 0, fmt.Errorf("invoice has no billable lines")
-	}
-	return total, nil
-}
-
-func claimNumber(ctx context.Context, tenant string, invoiceID string) (bool, int64, error) {
-	values, err := rdb.Eval(ctx, claimScript, []string{claimKey(invoiceID), sequenceKey(tenant)}).Int64Slice()
-	if err != nil {
-		return false, 0, err
-	}
-	return values[0] == 1, values[1], nil
-}
-
-func persistFinal(ctx context.Context, invoiceID string, tenant string, number int64, total int64) error {
-	_, err := db.ExecContext(ctx,
-		"UPDATE invoices SET status = 'finalized', number = ?, total_cents = ? WHERE id = ?",
-		number, total, invoiceID)
-	var constraint sqlite3.Error
-	if errors.As(err, &constraint) && errors.Is(constraint, sqlite3.ErrConstraint) {
-		return fmt.Errorf("number %d already issued for tenant %s: %w", number, tenant, err)
-	}
-	return err
-}
-
-func reconcileSequence(ctx context.Context, tenant string) (int64, error) {
-	var highest int64
-	err := db.QueryRowContext(ctx,
-		"SELECT COALESCE(MAX(number), 0) FROM invoices WHERE tenant_id = ? AND number IS NOT NULL",
-		tenant).Scan(&highest)
-	if err != nil {
-		return 0, err
-	}
-	current, _ := rdb.Get(ctx, sequenceKey(tenant)).Int64()
-	if current < highest {
-		// Redis lost the counter: repair it upward instead of reissuing numbers already issued.
-		if err := rdb.Set(ctx, sequenceKey(tenant), highest, 0).Err(); err != nil {
-			return 0, err
-		}
-	}
-	if current > highest {
-		return current, nil
-	}
-	return highest, nil
-}
-
-func finalize(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	invoice, err := loadDraft(r.Context(), r.PathValue("id"))
-	if err != nil {
-		http.Error(rw, \`{"error":"invoice not found"}\`, http.StatusNotFound)
-		return
-	}
-	if err := ensureClaim(r.Context(), invoice.ID, tenant); err != nil {
-		http.Error(rw, \`{"error":"claim store unavailable"}\`, http.StatusBadGateway)
-		return
-	}
-	total, err := validateTotals(invoice.Lines)
-	if err != nil {
-		http.Error(rw, fmt.Sprintf(\`{"error":%q}\`, err.Error()), http.StatusUnprocessableEntity)
-		return
-	}
-	claimed, number, err := claimNumber(r.Context(), tenant, invoice.ID)
-	if err != nil {
-		http.Error(rw, \`{"error":"claim store unavailable"}\`, http.StatusBadGateway)
-		return
-	}
-	if !claimed {
-		http.Error(rw, \`{"error":"invoice is already finalized"}\`, http.StatusConflict)
-		return
-	}
-	if err := persistFinal(r.Context(), invoice.ID, tenant, number, total); err != nil {
-		http.Error(rw, fmt.Sprintf(\`{"error":%q}\`, err.Error()), http.StatusConflict)
-		return
-	}
-	rw.Header().Set("Content-Type", "application/json")
-	_, _ = rw.Write([]byte(fmt.Sprintf(\`{"id":%q,"status":"finalized","number":%d}\`, invoice.ID, number)))
-}
-
-func main() {}
 `,
     },
     scala: {
-      starter: `import java.sql.{Connection, DriverManager}
+      starter: `import redis.clients.jedis.JedisPooled
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import spray.json._
+import scala.jdk.CollectionConverters._
 
-final case class Line(description: String, quantity: Int, unit_cents: Int)
+import invoice.Store // Store.get, invoiceKey, subtotal, reopen
 
-final case class Invoice(id: String, tenant_id: String, status: String, lines: List[Line])
+/** The invoice cannot be issued as it stands: the message says why. */
+final class InvoiceRejected(message: String) extends Exception(message)
 
-object InvoiceStateApi {
-  implicit val system: ActorSystem = ActorSystem("invoice-service")
-  implicit val lineFormat: RootJsonFormat[Line] = jsonFormat3(Line)
-  implicit val linesFormat: RootJsonFormat[List[Line]] = listFormat[Line]
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val SequenceKeyPrefix = "inv:seq:"
-  val jedis = new Jedis("redis", 6379)
-  val db: Connection = DriverManager.getConnection("jdbc:sqlite:invoices.db")
+  val SeqKey = "invoice:seq"
 
-  val Schema =
-    """
-      |CREATE TABLE IF NOT EXISTS invoices (
-      |  id TEXT PRIMARY KEY,
-      |  tenant_id TEXT NOT NULL,
-      |  status TEXT NOT NULL,
-      |  number INTEGER,
-      |  currency TEXT NOT NULL,
-      |  total_cents INTEGER NOT NULL,
-      |  lines TEXT NOT NULL
-      |)
-      |""".stripMargin
-
-  db.createStatement().execute(Schema)
-
-  def loadDraft(invoiceId: String): Invoice = {
-    val rs = db
-      .createStatement()
-      .executeQuery(s"SELECT tenant_id, status, lines FROM invoices WHERE id = '$invoiceId'")
-    if (!rs.next()) throw new NoSuchElementException(s"invoice $invoiceId not found")
-    Invoice(invoiceId, rs.getString(1), rs.getString(2), rs.getString(3).parseJson.convertTo[List[Line]])
-  }
-
-  def validateTotals(lines: List[Line]): Long = {
-    val total = lines.map(line => line.quantity.toLong * line.unit_cents).sum
-    if (lines.isEmpty || total <= 0) throw new IllegalArgumentException("invoice has no billable lines")
-    total
-  }
-
-  def nextNumber(tenant: String): Long = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = s"$SequenceKeyPrefix$tenant"
-    val last = Option(jedis.get(key)).map(_.toLong).getOrElse(0L)
-    val number = last + 1
-    jedis.set(key, number.toString)
-    number
-  }
-
-  val route: Route =
-    path("v1" / "invoices" / Segment / "finalize") { invoiceId =>
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          val invoice = loadDraft(invoiceId)
-          if (invoice.status != "draft") {
-            complete(StatusCodes.Conflict, """{"error":"invoice is already finalized"}""")
-          } else {
-            val number = nextNumber(tenant)
-            val total = validateTotals(invoice.lines)
-            db.createStatement().execute(
-              s"UPDATE invoices SET status = 'finalized', number = $number, total_cents = $total WHERE id = '$invoiceId'"
-            )
-            complete(StatusCodes.Created, s"""{"id":"$invoiceId","status":"finalized","number":$number}""")
-          }
-        }
-      }
+  /** The invoice's number, claimed and written with status finalized; None when it is no longer a draft. */
+  def claimNumber(tenant: String, invoiceId: String): Option[Long] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val key = Store.invoiceKey(invoiceId)
+    if (jedis.hget(key, "status") != "draft") None
+    else {
+      val n = Option(jedis.get(SeqKey)).map(_.toLong).getOrElse(0L) + 1
+      jedis.set(SeqKey, n.toString)
+      jedis.hset(key, Map("status" -> "finalized", "number" -> n.toString).asJava)
+      Some(n)
     }
+  }
 
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Why the invoice cannot be issued, if it cannot. */
+  def validateTotals(invoice: Store.Invoice): Option[String] =
+    if (invoice.lineItems.isEmpty) Some("an invoice with no line items cannot be finalized")
+    else if (invoice.subtotalCents != Store.subtotal(invoice.lineItems)) Some("the subtotal does not match the line items")
+    else None
+
+  /** Issue the tenant's draft: its number, or None when it is no longer a draft. Throws InvoiceRejected. */
+  def finalizeInvoice(tenant: String, invoiceId: String): Option[Long] = {
+    val invoice = Store.get(invoiceId).filter(_.tenantId == tenant).getOrElse(throw new InvoiceRejected(s"no invoice $invoiceId"))
+    val n = claimNumber(tenant, invoiceId)
+    if (n.isDefined) validateTotals(invoice).foreach { reason =>
+      Store.reopen(invoiceId) // back to a draft the issuer can fix
+      throw new InvoiceRejected(reason)
+    }
+    n
   }
 }
 `,
-      solution: `import java.sql.{Connection, DriverManager}
+      solution: `import redis.clients.jedis.JedisPooled
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model.StatusCodes
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import spray.json._
+import scala.jdk.CollectionConverters._
 
-final case class Line(description: String, quantity: Int, unit_cents: Int)
+import invoice.Store // Store.get, invoiceKey, subtotal, reopen
 
-final case class Invoice(id: String, tenant_id: String, status: String, lines: List[Line])
+/** The invoice cannot be issued as it stands: the message says why. */
+final class InvoiceRejected(message: String) extends Exception(message)
 
-object InvoiceStateApi {
-  implicit val system: ActorSystem = ActorSystem("invoice-service")
-  implicit val lineFormat: RootJsonFormat[Line] = jsonFormat3(Line)
-  implicit val linesFormat: RootJsonFormat[List[Line]] = listFormat[Line]
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  val SequenceKeyPrefix = "inv:seq:"
-  val jedis = new Jedis("redis", 6379)
-  val db: Connection = DriverManager.getConnection("jdbc:sqlite:invoices.db")
-
-  val Schema =
-    """
-      |CREATE TABLE IF NOT EXISTS invoices (
-      |  id TEXT PRIMARY KEY,
-      |  tenant_id TEXT NOT NULL,
-      |  status TEXT NOT NULL,
-      |  number INTEGER,
-      |  currency TEXT NOT NULL,
-      |  total_cents INTEGER NOT NULL,
-      |  lines TEXT NOT NULL,
-      |  UNIQUE (tenant_id, number)
-      |)
+  /**
+   * Refuses an invoice that is no longer a draft (0), else takes the tenant's next number and
+   * finalizes the invoice. Redis runs the script whole: no other client lands between the read and
+   * the writes.
+   */
+  val ClaimLua: String =
+    """if redis.call('HGET', KEYS[1], 'status') ~= 'draft' then return 0 end
+      |local n = redis.call('INCR', KEYS[2])
+      |redis.call('HSET', KEYS[1], 'status', 'finalized', 'number', n)
+      |return n
       |""".stripMargin
 
-  val ClaimScript =
-    """
-      |local status = redis.call('HGET', KEYS[1], 'status')
-      |if status ~= 'draft' then
-      |  return {0, tonumber(redis.call('HGET', KEYS[1], 'number') or '0')}
-      |end
-      |local number = redis.call('INCR', KEYS[2])
-      |redis.call('HSET', KEYS[1], 'status', 'finalized')
-      |redis.call('HSET', KEYS[1], 'number', number)
-      |return {1, number}
-      |""".stripMargin
+  def seqKey(tenant: String): String = s"invoice:seq:$tenant"
 
-  db.createStatement().execute(Schema)
-
-  def loadDraft(invoiceId: String): Invoice = {
-    val rs = db
-      .createStatement()
-      .executeQuery(s"SELECT tenant_id, status, lines FROM invoices WHERE id = '$invoiceId'")
-    if (!rs.next()) throw new NoSuchElementException(s"invoice $invoiceId not found")
-    Invoice(invoiceId, rs.getString(1), rs.getString(2), rs.getString(3).parseJson.convertTo[List[Line]])
+  /** The invoice's number, claimed and written with status finalized; None when it is no longer a draft. */
+  def claimNumber(tenant: String, invoiceId: String): Option[Long] = {
+    val keys = List(Store.invoiceKey(invoiceId), seqKey(tenant)).asJava
+    val n = jedis.eval(ClaimLua, keys, List.empty[String].asJava).asInstanceOf[java.lang.Long].longValue
+    if (n > 0) Some(n) else None
   }
 
-  def ensureClaim(invoiceId: String, tenant: String): Unit = {
-    // HSETNX, not HSET: replaying finalize must not push a finalized claim back to draft.
-    jedis.hsetnx(s"inv:claim:$invoiceId", "tenant", tenant)
-    jedis.hsetnx(s"inv:claim:$invoiceId", "status", "draft")
-  }
+  /** Why the invoice cannot be issued, if it cannot. */
+  def validateTotals(invoice: Store.Invoice): Option[String] =
+    if (invoice.lineItems.isEmpty) Some("an invoice with no line items cannot be finalized")
+    else if (invoice.subtotalCents != Store.subtotal(invoice.lineItems)) Some("the subtotal does not match the line items")
+    else None
 
-  def validateTotals(lines: List[Line]): Long = {
-    val total = lines.map(line => line.quantity.toLong * line.unit_cents).sum
-    if (lines.isEmpty || total <= 0) throw new IllegalArgumentException("invoice has no billable lines")
-    total
-  }
-
-  def claimNumber(tenant: String, invoiceId: String): (Boolean, Long) = {
-    val result = jedis
-      .eval(ClaimScript, 2, s"inv:claim:$invoiceId", s"inv:seq:$tenant")
-      .asInstanceOf[java.util.List[Long]]
-    (result.get(0) == 1L, result.get(1))
-  }
-
-  def persistFinal(invoiceId: String, tenant: String, number: Long, total: Long): Unit = {
-    try {
-      db.createStatement().execute(
-        s"UPDATE invoices SET status = 'finalized', number = $number, total_cents = $total WHERE id = '$invoiceId'"
-      )
-    } catch {
-      case conflict: java.sql.SQLIntegrityConstraintViolationException =>
-        throw new IllegalStateException(
-          s"number $number already issued for tenant $tenant: " + conflict.getMessage
-        )
-    }
-  }
-
-  def reconcileSequence(tenant: String): Long = {
-    val rs = db.createStatement().executeQuery(
-      s"SELECT COALESCE(MAX(number), 0) FROM invoices WHERE tenant_id = '$tenant' AND number IS NOT NULL"
-    )
-    rs.next()
-    val highest = rs.getLong(1)
-    val current = Option(jedis.get(s"inv:seq:$tenant")).map(_.toLong).getOrElse(0L)
-    if (current < highest) {
-      // Redis lost the counter: repair it upward instead of reissuing numbers already issued.
-      jedis.set(s"inv:seq:$tenant", highest.toString)
-    }
-    math.max(current, highest)
-  }
-
-  val route: Route =
-    path("v1" / "invoices" / Segment / "finalize") { invoiceId =>
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          try {
-            val invoice = loadDraft(invoiceId)
-            ensureClaim(invoiceId, tenant)
-            val total = validateTotals(invoice.lines)
-            val (claimed, number) = claimNumber(tenant, invoiceId)
-            if (!claimed) {
-              complete(StatusCodes.Conflict, """{"error":"invoice is already finalized"}""")
-            } else {
-              persistFinal(invoiceId, tenant, number, total)
-              complete(StatusCodes.Created, s"""{"id":"$invoiceId","status":"finalized","number":$number}""")
-            }
-          } catch {
-            case rejection: IllegalArgumentException =>
-              complete(StatusCodes.UnprocessableEntity, s"""{"error":"\${rejection.getMessage}"}""")
-            case missing: NoSuchElementException =>
-              complete(StatusCodes.NotFound, s"""{"error":"\${missing.getMessage}"}""")
-            case conflict: IllegalStateException =>
-              complete(StatusCodes.Conflict, s"""{"error":"\${conflict.getMessage}"}""")
-          }
-        }
-      }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Issue the tenant's draft: its number, or None when it is no longer a draft. Throws InvoiceRejected. */
+  def finalizeInvoice(tenant: String, invoiceId: String): Option[Long] = {
+    val invoice = Store.get(invoiceId).filter(_.tenantId == tenant).getOrElse(throw new InvoiceRejected(s"no invoice $invoiceId"))
+    // Validate first: a number claimed for a rejected invoice is a hole in the tenant's series.
+    validateTotals(invoice).foreach(reason => throw new InvoiceRejected(reason))
+    claimNumber(tenant, invoiceId)
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sqlite3.h>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <stdexcept>
 #include <string>
 
-using json = nlohmann::json;
+#include "invoice/store.h"  // store::get, invoiceKey, subtotal, reopen
 
-constexpr const char* kSequenceKeyPrefix = "inv:seq:";
+sw::redis::Redis redis("tcp://redis:6379");
 
-const char* kSchema = R"SQL(
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL
-)
-)SQL";
+const std::string kSeqKey = "invoice:seq";
 
-json loadDraft(sqlite3* db, const std::string& invoiceId) {
-  sqlite3_stmt* stmt = nullptr;
-  sqlite3_prepare_v2(db, "SELECT tenant_id, status, lines FROM invoices WHERE id = ?", -1, &stmt, nullptr);
-  sqlite3_bind_text(stmt, 1, invoiceId.c_str(), -1, SQLITE_TRANSIENT);
-  json invoice = json::object();
-  if (sqlite3_step(stmt) == SQLITE_ROW) {
-    invoice["id"] = invoiceId;
-    invoice["tenant_id"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    invoice["status"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    invoice["lines"] = json::parse(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+// The invoice cannot be issued as it stands: the message says why.
+struct InvoiceRejected : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// The invoice's number, claimed and written with status finalized; 0 when it is no longer a draft.
+long claimNumber(const std::string& tenant, const std::string& invoice_id) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string key = store::invoiceKey(invoice_id);
+  if (redis.hget(key, "status").value_or("") != "draft") return 0;
+  const auto last = redis.get(kSeqKey);
+  const long n = (last ? std::stol(*last) : 0) + 1;
+  redis.set(kSeqKey, std::to_string(n));
+  redis.hset(key, {{"status", "finalized"}, {"number", std::to_string(n)}});
+  return n;
+}
+
+// Why the invoice cannot be issued, or "".
+std::string validateTotals(const store::Invoice& invoice) {
+  if (invoice.line_items.empty()) return "an invoice with no line items cannot be finalized";
+  if (invoice.subtotal_cents != store::subtotal(invoice.line_items)) return "the subtotal does not match the line items";
+  return "";
+}
+
+// Issue the tenant's draft: its number, or 0 when it is no longer a draft. Throws InvoiceRejected.
+long finalizeInvoice(const std::string& tenant, const std::string& invoice_id) {
+  const auto invoice = store::get(invoice_id);
+  if (!invoice || invoice->tenant_id != tenant) throw InvoiceRejected("no invoice " + invoice_id);
+  const long n = claimNumber(tenant, invoice_id);
+  if (n == 0) return 0;
+  const std::string reason = validateTotals(*invoice);
+  if (!reason.empty()) {
+    store::reopen(invoice_id);  // back to a draft the issuer can fix
+    throw InvoiceRejected(reason);
   }
-  sqlite3_finalize(stmt);
-  return invoice;
-}
-
-long long validateTotals(const json& lines) {
-  long long total = 0;
-  for (const auto& line : lines) total += line["quantity"].get<long long>() * line["unit_cents"].get<long long>();
-  if (lines.empty() || total <= 0) throw std::runtime_error("invoice has no billable lines");
-  return total;
-}
-
-long long nextNumber(sw::redis::Redis& redis, const std::string& tenant) {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const auto key = std::string(kSequenceKeyPrefix) + tenant;
-  const auto last = redis.get(key);
-  const long long number = (last ? std::stoll(*last) : 0) + 1;
-  redis.set(key, std::to_string(number));
-  return number;
-}
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  sqlite3* db = nullptr;
-  sqlite3_open("invoices.db", &db);
-  sqlite3_exec(db, kSchema, nullptr, nullptr, nullptr);
-
-  httplib::Server svr;
-  svr.Post(R"(/v1/invoices/([^/]+)/finalize)", [&redis, db](const httplib::Request& req, httplib::Response& res) {
-    const auto invoiceId = std::string(req.matches[1]);
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto invoice = loadDraft(db, invoiceId);
-    if (invoice.empty()) {
-      res.status = 404;
-      res.set_content(R"({"error":"invoice not found"})", "application/json");
-      return;
-    }
-    try {
-      const long long number = nextNumber(redis, tenant);
-      const long long total = validateTotals(invoice["lines"]);
-      const auto sql = "UPDATE invoices SET status = 'finalized', number = " + std::to_string(number) +
-                       ", total_cents = " + std::to_string(total) + " WHERE id = '" + invoiceId + "'";
-      sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr);
-      res.status = 201;
-      res.set_content(json{{"id", invoiceId}, {"status", "finalized"}, {"number", number}}.dump(),
-                      "application/json");
-    } catch (const std::exception& error) {
-      res.status = 422;
-      res.set_content(json{{"error", error.what()}}.dump(), "application/json");
-    }
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  return n;
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sqlite3.h>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <algorithm>
 #include <stdexcept>
 #include <string>
-#include <utility>
-#include <vector>
 
-using json = nlohmann::json;
+#include "invoice/store.h"  // store::get, invoiceKey, subtotal, reopen
 
-constexpr const char* kSequenceKeyPrefix = "inv:seq:";
+sw::redis::Redis redis("tcp://redis:6379");
 
-const char* kSchema = R"SQL(
-CREATE TABLE IF NOT EXISTS invoices (
-  id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  number INTEGER,
-  currency TEXT NOT NULL,
-  total_cents INTEGER NOT NULL,
-  lines TEXT NOT NULL,
-  UNIQUE (tenant_id, number)
-)
-)SQL";
+// Refuses an invoice that is no longer a draft (0), else takes the tenant's next number and finalizes
+// the invoice. Redis runs the script whole: no other client lands between the read and the writes.
+const std::string kClaimLua = R"lua(
+if redis.call('HGET', KEYS[1], 'status') ~= 'draft' then return 0 end
+local n = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'status', 'finalized', 'number', n)
+return n
+)lua";
 
-const char* kClaimScript = R"LUA(
-local status = redis.call('HGET', KEYS[1], 'status')
-if status ~= 'draft' then
-  return {0, tonumber(redis.call('HGET', KEYS[1], 'number') or '0')}
-end
-local number = redis.call('INCR', KEYS[2])
-redis.call('HSET', KEYS[1], 'status', 'finalized')
-redis.call('HSET', KEYS[1], 'number', number)
-return {1, number}
-)LUA";
+// The invoice cannot be issued as it stands: the message says why.
+struct InvoiceRejected : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
-json loadDraft(sqlite3* db, const std::string& invoiceId) {
-  sqlite3_stmt* stmt = nullptr;
-  sqlite3_prepare_v2(db, "SELECT tenant_id, status, lines FROM invoices WHERE id = ?", -1, &stmt, nullptr);
-  sqlite3_bind_text(stmt, 1, invoiceId.c_str(), -1, SQLITE_TRANSIENT);
-  json invoice = json::object();
-  if (sqlite3_step(stmt) == SQLITE_ROW) {
-    invoice["id"] = invoiceId;
-    invoice["tenant_id"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    invoice["status"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-    invoice["lines"] = json::parse(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
-  }
-  sqlite3_finalize(stmt);
-  return invoice;
+std::string seqKey(const std::string& tenant) { return "invoice:seq:" + tenant; }
+
+// The invoice's number, claimed and written with status finalized; 0 when it is no longer a draft.
+long claimNumber(const std::string& tenant, const std::string& invoice_id) {
+  return static_cast<long>(redis.eval<long long>(kClaimLua, {store::invoiceKey(invoice_id), seqKey(tenant)}, {}));
 }
 
-std::string sequenceKey(const std::string& tenant) {
-  return std::string("inv:seq:") + tenant;
+// Why the invoice cannot be issued, or "".
+std::string validateTotals(const store::Invoice& invoice) {
+  if (invoice.line_items.empty()) return "an invoice with no line items cannot be finalized";
+  if (invoice.subtotal_cents != store::subtotal(invoice.line_items)) return "the subtotal does not match the line items";
+  return "";
 }
 
-std::string claimKey(const std::string& invoiceId) {
-  return "inv:claim:" + invoiceId;
-}
-
-void ensureClaim(sw::redis::Redis& redis, const std::string& invoiceId, const std::string& tenant) {
-  // HSETNX, not HSET: replaying finalize must not push a finalized claim back to draft.
-  redis.hsetnx(claimKey(invoiceId), "tenant", tenant);
-  redis.hsetnx(claimKey(invoiceId), "status", "draft");
-}
-
-long long validateTotals(const json& lines) {
-  long long total = 0;
-  for (const auto& line : lines) total += line["quantity"].get<long long>() * line["unit_cents"].get<long long>();
-  if (lines.empty() || total <= 0) throw std::runtime_error("invoice has no billable lines");
-  return total;
-}
-
-std::pair<bool, long long> claimNumber(
-    sw::redis::Redis& redis,
-    const std::string& tenant,
-    const std::string& invoiceId) {
-  const auto result = redis.eval<std::vector<long long>>(kClaimScript, {claimKey(invoiceId), sequenceKey(tenant)}, {});
-  return {result[0] == 1, result[1]};
-}
-
-void persistFinal(
-    sqlite3* db,
-    const std::string& invoiceId,
-    const std::string& tenant,
-    long long number,
-    long long total) {
-  const auto sql = "UPDATE invoices SET status = 'finalized', number = " + std::to_string(number) +
-                   ", total_cents = " + std::to_string(total) + " WHERE id = '" + invoiceId + "'";
-  char* error = nullptr;
-  if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &error) != SQLITE_OK) {
-    const std::string message = error == nullptr ? std::string("constraint violation") : std::string(error);
-    sqlite3_free(error);
-    if (message.find("UNIQUE constraint failed") != std::string::npos) {
-      throw std::runtime_error("number " + std::to_string(number) + " already issued for tenant " + tenant);
-    }
-    throw std::runtime_error(message);
-  }
-}
-
-long long reconcileSequence(sw::redis::Redis& redis, sqlite3* db, const std::string& tenant) {
-  sqlite3_stmt* stmt = nullptr;
-  sqlite3_prepare_v2(
-      db,
-      "SELECT COALESCE(MAX(number), 0) FROM invoices WHERE tenant_id = ? AND number IS NOT NULL",
-      -1,
-      &stmt,
-      nullptr);
-  sqlite3_bind_text(stmt, 1, tenant.c_str(), -1, SQLITE_TRANSIENT);
-  long long highest = 0;
-  if (sqlite3_step(stmt) == SQLITE_ROW) highest = sqlite3_column_int64(stmt, 0);
-  sqlite3_finalize(stmt);
-  const auto raw = redis.get(sequenceKey(tenant));
-  const long long current = raw ? std::stoll(*raw) : 0;
-  if (current < highest) {
-    // Redis lost the counter: repair it upward instead of reissuing numbers already issued.
-    redis.set(sequenceKey(tenant), std::to_string(highest));
-  }
-  return std::max(current, highest);
-}
-
-int main() {
-  sw::redis::Redis redis("tcp://redis:6379");
-  sqlite3* db = nullptr;
-  sqlite3_open("invoices.db", &db);
-  sqlite3_exec(db, kSchema, nullptr, nullptr, nullptr);
-
-  httplib::Server svr;
-  svr.Post(R"(/v1/invoices/([^/]+)/finalize)", [&redis, db](const httplib::Request& req, httplib::Response& res) {
-    const auto invoiceId = std::string(req.matches[1]);
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto invoice = loadDraft(db, invoiceId);
-    if (invoice.empty()) {
-      res.status = 404;
-      res.set_content(R"({"error":"invoice not found"})", "application/json");
-      return;
-    }
-    try {
-      ensureClaim(redis, invoiceId, tenant);
-      const long long total = validateTotals(invoice["lines"]);
-      const auto [claimed, number] = claimNumber(redis, tenant, invoiceId);
-      if (!claimed) {
-        res.status = 409;
-        res.set_content(R"({"error":"invoice is already finalized"})", "application/json");
-        return;
-      }
-      persistFinal(db, invoiceId, tenant, number, total);
-      res.status = 201;
-      res.set_content(json{{"id", invoiceId}, {"status", "finalized"}, {"number", number}}.dump(),
-                      "application/json");
-    } catch (const std::exception& error) {
-      res.status = 422;
-      res.set_content(json{{"error", error.what()}}.dump(), "application/json");
-    }
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Issue the tenant's draft: its number, or 0 when it is no longer a draft. Throws InvoiceRejected.
+long finalizeInvoice(const std::string& tenant, const std::string& invoice_id) {
+  const auto invoice = store::get(invoice_id);
+  if (!invoice || invoice->tenant_id != tenant) throw InvoiceRejected("no invoice " + invoice_id);
+  // Validate first: a number claimed for a rejected invoice is a hole in the tenant's series.
+  const std::string reason = validateTotals(*invoice);
+  if (!reason.empty()) throw InvoiceRejected(reason);
+  return claimNumber(tenant, invoice_id);
 }
 `,
     },
   },
-  debrief: `Gapless numbering is a claim about two things at once: no two invoices share a number, and no number is handed out without an invoice. The first is why the claim is also the transition: one script reads the draft state, refuses anything already finalized, takes the number with \`INCR\` and writes \`finalized\` on the same key, so Redis's single-threaded execution orders the claims. The second is why validation comes before the claim: a number burned on a 422 is invisible, since the sequence stays monotonic while the invoices have a hole. Reconcile covers the counter Redis can lose, lifting it to \`MAX(number)\` instead of restarting at one, and the unique constraint makes a duplicate impossible to persist even when both guards are wrong. Production billing systems add fiscal-year resets and an audit table of every claimed number so a gap can be explained rather than only detected.`,
+  harness: {
+    python: `from invoice import store
+
+LINES = [{"description": "Consulting", "quantity": 2, "unit_price_cents": 25000}]
+
+
+def _draft(tenant="t-1", lines=LINES):
+    return store.create(tenant, "usd", lines)["id"]
+
+
+def _counter(ctx):
+    """What the claims spent, whichever key the code counts on."""
+    return ctx.redis.get("invoice:seq:t-1") or ctx.redis.get("invoice:seq")
+
+
+def check_sequence_key(ctx):
+    m = ctx.load("state")
+    a, b, other = _draft(), _draft(), _draft("t-2")
+    got = [m.claim_number("t-1", a), m.claim_number("t-1", b), m.claim_number("t-2", other)]
+    assert got == [1, 2, 1], f"t-1's two invoices and t-2's first got numbers {got}, expected [1, 2, 1]: each tenant's series is its own"
+    seqs = (ctx.redis.get("invoice:seq:t-1"), ctx.redis.get("invoice:seq:t-2"))
+    assert seqs == ("2", "1"), f"invoice:seq:t-1 and invoice:seq:t-2 hold {seqs}, expected ('2', '1') (keys: {sorted(ctx.redis.keys('invoice:seq*'))})"
+
+
+def check_atomic_claim(ctx):
+    m = ctx.load("state")
+    a, b = _draft(), _draft()
+    rival = {}
+
+    def race():
+        # Another worker finalizes invoice b between this claim's commands.
+        if "n" not in rival:
+            rival["n"] = None
+            rival["n"] = m.claim_number("t-1", b)
+        return rival["n"]
+
+    probes = [ctx.redis_after(key, race) for key in ("invoice:seq:t-1", "invoice:seq")]
+    mine = m.claim_number("t-1", a)
+    assert any(p.fired for p in probes), "claim_number never touched the tenant's counter"
+    for p in probes:
+        if p.error is not None:
+            raise p.error
+    numbers = (store.get(a)["number"], store.get(b)["number"])
+    assert sorted([mine, rival["n"]]) == [1, 2] and sorted(numbers) == [1, 2], f"two finalizes racing got numbers {mine} and {rival['n']} (stored {numbers}): both read the same last number. Take it with INCR inside the claim script"
+
+
+def check_status_in_claim(ctx):
+    m = ctx.load("state")
+    a = _draft()
+    # A second finalize of the same invoice lands right after this claim first touches the invoice.
+    rival = ctx.redis_after(store.invoice_key(a), lambda: m.claim_number("t-1", a))
+    mine = m.claim_number("t-1", a)
+    assert rival.fired, "claim_number never touched the invoice"
+    if rival.error is not None:
+        raise rival.error
+    claimed = [n for n in (mine, rival.result) if n is not None]
+    assert len(claimed) == 1, f"two finalizes of one invoice answered {mine} and {rival.result}: exactly one may claim a number, the other must get None. Read the status inside the claim script"
+    assert _counter(ctx) == "1", f"one invoice was finalized and the counter is at {_counter(ctx)}: a number was spent on nothing"
+    assert store.get(a)["number"] == claimed[0], f"the invoice holds number {store.get(a)['number']}, the claim answered {claimed[0]}"
+
+
+def check_no_burn(ctx):
+    m = ctx.load("state")
+    empty = _draft(lines=[])
+    stale = _draft()
+    ctx.redis.hset(store.invoice_key(stale), "subtotal_cents", 1)
+    for invoice_id, what in ((empty, "with no line items"), (stale, "whose subtotal does not match its lines")):
+        try:
+            m.finalize_invoice("t-1", invoice_id)
+        except m.InvoiceRejected:
+            pass
+        else:
+            raise AssertionError(f"finalizing an invoice {what} must raise InvoiceRejected")
+        stored = store.get(invoice_id)
+        assert stored["status"] == "draft" and stored["number"] is None, f"an invoice {what} must stay a draft without a number, the store holds {stored['status']} number {stored['number']}"
+    assert _counter(ctx) in (None, "0"), f"two rejected finalizes left the counter at {_counter(ctx)}: their numbers are holes in the series. Validate before claim_number"
+    good = _draft()
+    n = m.finalize_invoice("t-1", good)
+    assert n == 1, f"the first invoice that validates got number {n}, expected 1"
+`,
+    typescript: `const LINES = [{description: 'Consulting', quantity: 2, unit_price_cents: 25000}];
+
+function state(ctx) {
+  return {m: ctx.load('state'), store: ctx.load('/support/invoice/store.ts')};
+}
+
+async function draft(store, tenant = 't-1', lines = LINES): Promise<string> {
+  return (await store.create(tenant, 'usd', lines)).id;
+}
+
+const counter = ctx => ctx.redis.get('invoice:seq:t-1') ?? ctx.redis.get('invoice:seq');
+
+export async function check_sequence_key(ctx) {
+  const {m, store} = state(ctx);
+  const a = await draft(store);
+  const b = await draft(store);
+  const other = await draft(store, 't-2');
+  const got = [await m.claimNumber('t-1', a), await m.claimNumber('t-1', b), await m.claimNumber('t-2', other)];
+  assert.deepStrictEqual(got, [1, 2, 1], \`t-1's two invoices and t-2's first got numbers \${JSON.stringify(got)}, expected [1, 2, 1]: each tenant's series is its own\`);
+  const seqs = [ctx.redis.get('invoice:seq:t-1'), ctx.redis.get('invoice:seq:t-2')];
+  assert.deepStrictEqual(seqs, ['2', '1'], \`invoice:seq:t-1 and invoice:seq:t-2 hold \${JSON.stringify(seqs)}, expected ["2", "1"] (keys: \${JSON.stringify(ctx.redis.keys('invoice:seq*'))})\`);
+}
+
+export async function check_atomic_claim(ctx) {
+  const {m, store} = state(ctx);
+  const a = await draft(store);
+  const b = await draft(store);
+  let rival: Promise<number | null> | null = null;
+  // Another worker finalizes invoice b between this claim's commands.
+  const race = () => (rival ??= m.claimNumber('t-1', b));
+  const probes = ['invoice:seq:t-1', 'invoice:seq'].map(key => ctx.redisAfter(key, race));
+  const mine = await m.claimNumber('t-1', a);
+  assert(probes.some(p => p.fired), 'claimNumber never touched the tenant\\'s counter');
+  for (const p of probes) if (p.error !== undefined) throw p.error;
+  const theirs = await rival;
+  const numbers = [(await store.get(a)).number, (await store.get(b)).number].sort();
+  assert(JSON.stringify([mine, theirs].sort()) === '[1,2]' && JSON.stringify(numbers) === '[1,2]', \`two finalizes racing got numbers \${mine} and \${theirs} (stored \${JSON.stringify(numbers)}): both read the same last number. Take it with INCR inside the claim script\`);
+}
+
+export async function check_status_in_claim(ctx) {
+  const {m, store} = state(ctx);
+  const a = await draft(store);
+  // A second finalize of the same invoice lands right after this claim first touches the invoice.
+  const rival = ctx.redisAfter(store.invoiceKey(a), () => m.claimNumber('t-1', a));
+  const mine = await m.claimNumber('t-1', a);
+  assert(rival.fired, 'claimNumber never touched the invoice');
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  const claimed = [mine, theirs].filter(n => n !== null);
+  assert.equal(claimed.length, 1, \`two finalizes of one invoice answered \${mine} and \${theirs}: exactly one may claim a number, the other must get null. Read the status inside the claim script\`);
+  assert.equal(counter(ctx), '1', \`one invoice was finalized and the counter is at \${counter(ctx)}: a number was spent on nothing\`);
+  assert.equal((await store.get(a)).number, claimed[0], 'the invoice must hold the number the claim answered');
+}
+
+export async function check_no_burn(ctx) {
+  const {m, store} = state(ctx);
+  const empty = await draft(store, 't-1', []);
+  const stale = await draft(store);
+  ctx.redis.hset(store.invoiceKey(stale), 'subtotal_cents', '1');
+  for (const [invoiceId, what] of [[empty, 'with no line items'], [stale, 'whose subtotal does not match its lines']]) {
+    await assert.rejects(m.finalizeInvoice('t-1', invoiceId), m.InvoiceRejected, \`finalizing an invoice \${what} must throw InvoiceRejected\`);
+    const stored = await store.get(invoiceId);
+    assert(stored.status === 'draft' && stored.number === null, \`an invoice \${what} must stay a draft without a number, the store holds \${stored.status} number \${stored.number}\`);
+  }
+  assert([null, '0'].includes(counter(ctx)), \`two rejected finalizes left the counter at \${counter(ctx)}: their numbers are holes in the series. Validate before claimNumber\`);
+  const good = await draft(store);
+  const n = await m.finalizeInvoice('t-1', good);
+  assert.equal(n, 1, \`the first invoice that validates got number \${n}, expected 1\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+
+	"invoice/store"
+
+	"leetbuild/harness"
+)
+
+var (
+	stateBg    = context.Background()
+	stateLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
+)
+
+func draftOf(tenant string, lines []store.Line) string {
+	return store.Create(stateBg, tenant, "usd", lines, "", "", "").ID
+}
+
+func mustClaim(ctx *harness.Ctx, tenant, invoiceID string) int64 {
+	n, err := claimNumber(stateBg, tenant, invoiceID)
+	ctx.NoError(err, "claimNumber(%s, %s) failed", tenant, invoiceID)
+	return n
+}
+
+// counter is what the claims spent, whichever key the code counts on.
+func counter(ctx *harness.Ctx) string {
+	if v, ok := ctx.Redis.Get("invoice:seq:t-1"); ok {
+		return v
+	}
+	v, _ := ctx.Redis.Get("invoice:seq")
+	return v
+}
+
+func CheckSequenceKey(ctx *harness.Ctx) {
+	a, b, other := draftOf("t-1", stateLines), draftOf("t-1", stateLines), draftOf("t-2", stateLines)
+	got := []int64{mustClaim(ctx, "t-1", a), mustClaim(ctx, "t-1", b), mustClaim(ctx, "t-2", other)}
+	ctx.Equal(got, []int64{1, 2, 1}, "t-1's two invoices and t-2's first must get numbers 1, 2 and 1 (each tenant's series is its own); the numbers")
+	s1, _ := ctx.Redis.Get("invoice:seq:t-1")
+	s2, _ := ctx.Redis.Get("invoice:seq:t-2")
+	ctx.Equal([]string{s1, s2}, []string{"2", "1"}, "invoice:seq:t-1 and invoice:seq:t-2 (keys: %q)", ctx.Redis.Keys("invoice:seq*"))
+}
+
+func CheckAtomicClaim(ctx *harness.Ctx) {
+	a, b := draftOf("t-1", stateLines), draftOf("t-1", stateLines)
+	var theirs int64 = -1
+	// Another worker finalizes invoice b between this claim's commands.
+	race := func() any {
+		if theirs == -1 {
+			theirs = 0
+			n, err := claimNumber(stateBg, "t-1", b)
+			ctx.NoError(err, "the rival claim failed")
+			theirs = n
+		}
+		return theirs
+	}
+	p1 := ctx.Redis.After("invoice:seq:t-1", race)
+	p2 := ctx.Redis.After("invoice:seq", race)
+	mine := mustClaim(ctx, "t-1", a)
+	ctx.Assert(p1.Fired || p2.Fired, "claimNumber never touched the tenant's counter")
+	sa, sb := store.Get(stateBg, a).Number, store.Get(stateBg, b).Number
+	ctx.Assert(mine+theirs == 3 && mine != theirs && sa+sb == 3 && sa != sb, "two finalizes racing got numbers %d and %d (stored %d and %d): both read the same last number. Take it with INCR inside the claim script", mine, theirs, sa, sb)
+}
+
+func CheckStatusInClaim(ctx *harness.Ctx) {
+	a := draftOf("t-1", stateLines)
+	// A second finalize of the same invoice lands right after this claim first touches the invoice.
+	rival := ctx.Redis.After(store.InvoiceKey(a), func() any {
+		n, err := claimNumber(stateBg, "t-1", a)
+		ctx.NoError(err, "the rival claim failed")
+		return n
+	})
+	mine := mustClaim(ctx, "t-1", a)
+	ctx.Assert(rival.Fired, "claimNumber never touched the invoice")
+	theirs, _ := rival.Result.(int64)
+	ctx.Assert((mine == 0) != (theirs == 0), "two finalizes of one invoice answered %d and %d: exactly one may claim a number, the other must get 0. Read the status inside the claim script", mine, theirs)
+	ctx.Equal(counter(ctx), "1", "one invoice was finalized: a number was spent on nothing; the counter")
+	ctx.Equal(store.Get(stateBg, a).Number, mine+theirs, "the invoice must hold the number the claim answered; its number")
+}
+
+func CheckNoBurn(ctx *harness.Ctx) {
+	empty := draftOf("t-1", nil)
+	stale := draftOf("t-1", stateLines)
+	ctx.Redis.Do("HSET", store.InvoiceKey(stale), "subtotal_cents", "1")
+	for _, c := range []struct{ id, what string }{{empty, "with no line items"}, {stale, "whose subtotal does not match its lines"}} {
+		n, err := finalizeInvoice(stateBg, "t-1", c.id)
+		ctx.Assert(errors.Is(err, ErrInvoiceRejected), "finalizing an invoice %s must return an error wrapping ErrInvoiceRejected, got %d, %v", c.what, n, err)
+		stored := store.Get(stateBg, c.id)
+		ctx.Assert(stored.Status == "draft" && stored.Number == 0, "an invoice %s must stay a draft without a number, the store holds %s number %d", c.what, stored.Status, stored.Number)
+	}
+	ctx.Assert(counter(ctx) == "" || counter(ctx) == "0", "two rejected finalizes left the counter at %s: their numbers are holes in the series. Validate before claimNumber", counter(ctx))
+	n, err := finalizeInvoice(stateBg, "t-1", draftOf("t-1", stateLines))
+	ctx.NoError(err, "finalizing a valid invoice failed")
+	ctx.Equal(n, int64(1), "the first invoice that validates; its number")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "invoice/store.h"
+
+namespace {
+
+const std::vector<store::Line> kLines = {{"Consulting", 2, 25000}};
+
+std::string draftOf(const std::string& tenant, const std::vector<store::Line>& lines) { return store::create(tenant, "usd", lines).id; }
+
+// What the claims spent, whichever key the code counts on.
+std::string counter(harness::Ctx& ctx) {
+  if (const auto v = ctx.Redis.Get("invoice:seq:t-1")) return *v;
+  return ctx.Redis.Get("invoice:seq").value_or("");
+}
+
+struct Rival {
+  bool fired = false;
+  long number = -1;
+  std::optional<std::string> err;
+};
+
+}  // namespace
+
+void CheckSequenceKey(harness::Ctx& ctx) {
+  const std::string a = draftOf("t-1", kLines), b = draftOf("t-1", kLines), other = draftOf("t-2", kLines);
+  const std::vector<long> got = {claimNumber("t-1", a), claimNumber("t-1", b), claimNumber("t-2", other)};
+  ctx.Equal(got, {1L, 2L, 1L}, "t-1's two invoices and t-2's first must get numbers 1, 2 and 1 (each tenant's series is its own); the numbers");
+  const std::vector<std::string> seqs = {ctx.Redis.Get("invoice:seq:t-1").value_or(""), ctx.Redis.Get("invoice:seq:t-2").value_or("")};
+  ctx.Equal(seqs, {"2", "1"}, "invoice:seq:t-1 and invoice:seq:t-2 (keys: %q)", ctx.Redis.Keys("invoice:seq*"));
+}
+
+void CheckAtomicClaim(harness::Ctx& ctx) {
+  const std::string a = draftOf("t-1", kLines), b = draftOf("t-1", kLines);
+  auto rival = std::make_shared<Rival>();
+  // Another worker finalizes invoice b between this claim's commands.
+  const auto race = [rival, b] {
+    if (rival->fired) return;
+    rival->fired = true;
+    try {
+      rival->number = claimNumber("t-1", b);
+    } catch (const std::exception& e) {
+      rival->err = e.what();
+    }
+  };
+  ctx.Redis.After("invoice:seq:t-1", race);
+  ctx.Redis.After("invoice:seq", race);
+  const long mine = claimNumber("t-1", a);
+  ctx.Assert(rival->fired, "claimNumber never touched the tenant's counter");
+  ctx.Assert(!rival->err, "the rival claim failed: %s", rival->err.value_or(""));
+  const long sa = store::get(a)->number, sb = store::get(b)->number;
+  ctx.Assert(mine + rival->number == 3 && mine != rival->number && sa + sb == 3 && sa != sb,
+             "two finalizes racing got numbers %d and %d (stored %d and %d): both read the same last number. Take it with INCR inside the claim script", mine,
+             rival->number, sa, sb);
+}
+
+void CheckStatusInClaim(harness::Ctx& ctx) {
+  const std::string a = draftOf("t-1", kLines);
+  auto rival = std::make_shared<Rival>();
+  // A second finalize of the same invoice lands right after this claim first touches the invoice.
+  ctx.Redis.After(store::invoiceKey(a), [rival, a] {
+    rival->fired = true;
+    try {
+      rival->number = claimNumber("t-1", a);
+    } catch (const std::exception& e) {
+      rival->err = e.what();
+    }
+  });
+  const long mine = claimNumber("t-1", a);
+  ctx.Assert(rival->fired, "claimNumber never touched the invoice");
+  ctx.Assert(!rival->err, "the rival claim failed: %s", rival->err.value_or(""));
+  ctx.Assert((mine == 0) != (rival->number == 0),
+             "two finalizes of one invoice answered %d and %d: exactly one may claim a number, the other must get 0. Read the status inside the claim script", mine,
+             rival->number);
+  ctx.Equal(counter(ctx), "1", "one invoice was finalized: a number was spent on nothing; the counter");
+  ctx.Equal(store::get(a)->number, mine + rival->number, "the invoice must hold the number the claim answered; its number");
+}
+
+void CheckNoBurn(harness::Ctx& ctx) {
+  const std::string empty = draftOf("t-1", {});
+  const std::string stale = draftOf("t-1", kLines);
+  ctx.Redis.Do("HSET", store::invoiceKey(stale), "subtotal_cents", "1");
+  for (const auto& [id, what] : std::vector<std::pair<std::string, std::string>>{{empty, "with no line items"}, {stale, "whose subtotal does not match its lines"}}) {
+    bool rejected = false;
+    long n = 0;
+    try {
+      n = finalizeInvoice("t-1", id);
+    } catch (const InvoiceRejected&) {
+      rejected = true;
+    }
+    ctx.Assert(rejected, "finalizing an invoice %s must throw InvoiceRejected, got number %d", what, n);
+    const auto stored = store::get(id);
+    ctx.Assert(stored->status == "draft" && stored->number == 0, "an invoice %s must stay a draft without a number, the store holds %s number %d", what,
+               stored->status, stored->number);
+  }
+  ctx.Assert(counter(ctx).empty() || counter(ctx) == "0", "two rejected finalizes left the counter at %s: their numbers are holes in the series. Validate before claimNumber",
+             counter(ctx));
+  ctx.Equal(finalizeInvoice("t-1", draftOf("t-1", kLines)), 1, "the first invoice that validates; its number");
+}
+`,
+  },
+  hints: [
+    "Finalize two invoices of one tenant at the same moment: both carry the same number. A second tenant's first invoice is not number 1, and an invoice the validation rejects leaves a hole in the series.",
+    'The number is read with GET, incremented in the client and written back with SET, on one key for every tenant; the status is read by a separate command. The finalize claims first, then validates and reopens.',
+    'Key the counter `invoice:seq:{tenant}`; put the status read, `INCR` and `HSET` into one Lua script run with `EVAL` (`register_script`), answering 0 for a non-draft; call `validate_totals` before `claim_number` and drop the `reopen`.',
+  ],
+  debrief: `A gapless series is a promise about numbers that cannot be taken back, so every part of the claim lives in one script: Redis runs it to completion, and the status read, the increment and the status write see no other client in between. The counter is per tenant because each seller's numbering is its own legal series. Validation comes first because reopening an invoice does not return its number; the hole stays, and an auditor asks about it. A billing database keeps the counter in the same transaction as the invoice row and backs it with a unique index on (tenant, number), and some jurisdictions require a separate series per year or per document type, which turns the key into \`invoice:seq:{tenant}:{year}\`.`,
 };

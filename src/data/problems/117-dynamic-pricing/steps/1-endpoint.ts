@@ -5,30 +5,25 @@ export const endpointStep: Step = {
   title: 'POST /v1/prices: guardrails around every change',
   concept: 'http',
   file: 'api',
-  focus: ['api', 'db', 'redis'],
+  focus: ['operator', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/prices\`, reads \`{"sku", "multiplier", "reason"}\`,
-multiplies the sku's current price by the multiplier and upserts the result. It compiles, serves
+**Starting point.** The starter serves \`POST /v1/prices\` with \`{"sku", "price_cents", "reason"}\` on
+the price store (\`pricing.store\`, provided): it calls \`store.publish(sku, price_cents, reason,
+"operator")\` and answers the published row with \`previous_price_cents\` and \`moved_bp\`. It serves
 the demo and hides four flaws.
 
-**Failure mode the checks target.** A multiplier is a change the platform cannot judge against its
-own limits: a client bug that sends \`4.0\` ships a 400 percent spike, and \`0\` drives the price to
-zero. The upsert turns a mistyped sku into a price row the storefront serves. A 409 with no
-\`bound_cents\` leaves the caller to retry the same oversized change.
+**Failure mode the checks target.** A mistyped sku becomes a price row the storefront serves; a
+client bug that sends \`0\` sells the item for free; an extra digit ships a tenfold price; and a
+change with a blank reason leaves the audit trail nothing to explain it with.
 
-The body becomes \`{"sku": "SKU-1", "price_cents": 1299, "reason": "weekend promo"}\`.
-
-- \`X-Caller-Id\` authenticates the caller; missing or unknown is **401**.
-- \`sku\` must already exist (\`store.get_sku\`); unknown is **404** and no row is created.
-- \`price_cents\` is the **target price** in integer cents; a non-integer is **400**.
-- Below \`FLOOR_CENTS\` (50) or above \`CEILING_CENTS\` (500000) is **422**, naming both bounds.
-- The sku may move at most \`MAX_MOVE_BP\` (2000, i.e. 20 %) per hour window. A larger move is
-  **409** with \`bound_cents\`: the furthest price the window still allows, computed from the
-  current price and the remaining headroom.
-- \`reason\` is a non-empty string (**400** otherwise).
-- The response is the published row: \`price_cents\`, \`previous_price_cents\`, \`moved_bp\`,
-  \`headroom_bp\`, \`source\` and \`updated_at\`.`,
+- Look the sku up first (\`store.get_sku\`): an unknown sku is **404** and nothing is written.
+- A price outside \`FLOOR_CENTS\` (50) to \`CEILING_CENTS\` (500000) is **422**, with
+  \`floor_cents\` and \`ceiling_cents\` in the body.
+- One change moves the price at most \`MAX_MOVE_BP\` (2000 basis points, 20 %) from the current
+  price; a larger one is **409** with \`bound_cents\`: the furthest price the limit allows in that
+  direction, clamped to the floor and the ceiling.
+- A blank \`reason\` is **400**.`,
   sequence: {
     participants: ['Operator console', 'Pricing API', 'Price store'],
     messages: [
@@ -39,13 +34,18 @@ The body becomes \`{"sku": "SKU-1", "price_cents": 1299, "reason": "weekend prom
         kind: 'sync',
       },
       {from: 'Pricing API', to: 'Price store', label: 'get_sku(sku)', kind: 'sync'},
-      {from: 'Price store', to: 'Pricing API', label: 'current price / unknown sku', kind: 'reply'},
-      {from: 'Pricing API', to: 'Pricing API', label: 'floor · ceiling · window bound', kind: 'sync'},
-      {from: 'Pricing API', to: 'Price store', label: 'publish(price, reason, source)', kind: 'async'},
+      {from: 'Price store', to: 'Pricing API', label: 'current row · none → 404', kind: 'reply'},
+      {
+        from: 'Pricing API',
+        to: 'Pricing API',
+        label: 'floor · ceiling → 422 · MAX_MOVE_BP → 409 {bound_cents}',
+        kind: 'sync',
+      },
+      {from: 'Pricing API', to: 'Price store', label: 'publish(sku, price_cents, reason, "operator")', kind: 'sync'},
       {
         from: 'Pricing API',
         to: 'Operator console',
-        label: '200 {price_cents, moved_bp, headroom_bp} · 404 · 409 {bound_cents} · 422',
+        label: '200 {price_cents, previous_price_cents, moved_bp}',
         kind: 'reply',
       },
     ],
@@ -54,7 +54,7 @@ The body becomes \`{"sku": "SKU-1", "price_cents": 1299, "reason": "weekend prom
     {
       id: 'route',
       title: 'Handles POST /v1/prices',
-      detail: 'Register the publish route on `POST /v1/prices`.',
+      detail: 'Register the price change route on `POST /v1/prices`.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/prices["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/prices['"]/]},
@@ -65,611 +65,486 @@ The body becomes \`{"sku": "SKU-1", "price_cents": 1299, "reason": "weekend prom
     },
     {
       id: 'known-sku',
-      title: 'Rejects an unknown sku with 404 and writes nothing',
+      title: 'An unknown sku is 404 and writes nothing',
       detail:
-        'The sku is looked up before anything is written; an unknown sku is **404** and no row is created. The starter upserts whatever sku it was handed, so a typo becomes a phantom price row.',
+        'The sku is looked up (`store.get_sku`) before anything is written, and an unknown sku answers **404**. The starter publishes whatever sku it was handed, and the store creates the row.',
       match: {
-        python: {all: [/store\.get_sku\(/, /status_code\s*=\s*404/], none: [/store\.upsert/]},
-        typescript: {all: [/store\.getSku\(/, /code\(\s*404\s*\)/], none: [/store\.upsert/]},
-        go: {all: [/store\.GetSKU\(/, /StatusNotFound/], none: [/store\.Upsert/]},
-        scala: {all: [/store\.getSku\(/, /StatusCodes\.NotFound/], none: [/store\.upsert/]},
-        cpp: {all: [/store\.getSku\(/, /\b404\b/], none: [/store\.upsert/]},
+        python: {all: [/store\.get_sku\(/, /\b404\b/], order: [/store\.get_sku\(/, /store\.publish\(/]},
+        typescript: {all: [/getSku\(/, /\b404\b/], order: [/getSku\(/, /publish\(/]},
+        go: {all: [/store\.GetSKU\(/, /StatusNotFound|\b404\b/], order: [/store\.GetSKU\(/, /store\.Publish\(/]},
+        scala: {all: [/Store\.getSku\(/, /NotFound|\b404\b/], order: [/Store\.getSku\(/, /Store\.publish\(/]},
+        cpp: {all: [/store::getSku\(/, /\b404\b/], order: [/store::getSku\(/, /store::publish\(/]},
       },
     },
     {
       id: 'bounds',
-      title: 'Applies the absolute floor and ceiling',
+      title: 'Applies the floor and the ceiling',
       detail:
-        'A target outside `FLOOR_CENTS`..`CEILING_CENTS` is **422** with the floor and the ceiling named in the body. The starter has neither bound, so a multiplier of zero publishes a free product.',
+        'A price below `FLOOR_CENTS` or above `CEILING_CENTS` answers **422** naming `floor_cents` and `ceiling_cents`, and nothing is published. The starter has no bound, so `0` publishes a free product.',
       match: {
-        python: {all: [/FLOOR_CENTS/, /CEILING_CENTS/, /status_code\s*=\s*422/]},
-        typescript: {all: [/FLOOR_CENTS/, /CEILING_CENTS/, /code\(\s*422\s*\)/]},
-        go: {all: [/floorCents/, /ceilingCents/, /StatusUnprocessableEntity/]},
-        scala: {all: [/FloorCents/, /CeilingCents/, /StatusCodes\.UnprocessableEntity/]},
-        cpp: {all: [/kFloorCents/, /kCeilingCents/, /\b422\b/]},
+        python: {all: [/FLOOR_CENTS\s*=/, /CEILING_CENTS\s*=/, /\b422\b/, /floor_cents/, /ceiling_cents/]},
+        typescript: {all: [/FLOOR_CENTS\s*=/, /CEILING_CENTS\s*=/, /\b422\b/, /floor_cents/, /ceiling_cents/]},
+        go: {all: [/floorCents\s*=/, /ceilingCents\s*=/, /StatusUnprocessableEntity|\b422\b/, /floor_cents/]},
+        scala: {all: [/FloorCents\s*=/, /CeilingCents\s*=/, /UnprocessableEntity|\b422\b/, /floor_cents/]},
+        cpp: {all: [/kFloorCents\s*=/, /kCeilingCents\s*=/, /\b422\b/, /floor_cents/]},
       },
     },
     {
-      id: 'window-limit',
-      title: 'Rejects a move past the window limit with the computed bound',
+      id: 'move-limit',
+      title: 'A move past the limit is 409 with the bound',
       detail:
-        'A move larger than `MAX_MOVE_BP` (20 %) of the current price is **409**, and the response carries `bound_cents` derived from the current price and the remaining headroom. The starter applies whatever it was handed and reports no bound.',
+        'A change of more than `MAX_MOVE_BP` (20 %) from the current price answers **409** with `bound_cents`, the furthest price the limit allows in that direction; nothing is published. The starter publishes any jump it receives.',
       match: {
-        python: {all: [/MAX_MOVE_BP/, /status_code\s*=\s*409/, /bound_cents/]},
-        typescript: {all: [/MAX_MOVE_BP/, /code\(\s*409\s*\)/, /bound_cents/]},
-        go: {all: [/maxMoveBP/, /StatusConflict/, /bound_cents/]},
-        scala: {all: [/MaxMoveBp/, /StatusCodes\.Conflict/, /bound_cents/]},
-        cpp: {all: [/kMaxMoveBp/, /\b409\b/, /bound_cents/]},
+        python: {all: [/MAX_MOVE_BP\s*=/, /\b409\b/, /bound_cents/], order: [/MAX_MOVE_BP/, /store\.publish\(/]},
+        typescript: {all: [/MAX_MOVE_BP\s*=/, /\b409\b/, /bound_cents/]},
+        go: {all: [/maxMoveBP\s*=/, /StatusConflict|\b409\b/, /bound_cents/]},
+        scala: {all: [/MaxMoveBp\s*=/, /Conflict|\b409\b/, /bound_cents/]},
+        cpp: {all: [/kMaxMoveBp\s*=/, /\b409\b/, /bound_cents/]},
       },
     },
     {
-      id: 'target-price',
-      title: 'Takes a target price, not a caller-supplied multiplier',
+      id: 'reason-required',
+      title: 'A blank reason is 400',
       detail:
-        'The body carries `price_cents` and the handler publishes that target; there is no multiplier path at all. The starter multiplies the current price by a caller-supplied factor, which is how a 400 percent spike shipped.',
+        'A change whose `reason` is empty or only spaces answers **400** and publishes nothing: every price in the audit trail carries why it moved. The starter publishes it.',
       match: {
-        python: {all: [/body\.price_cents/], none: [/\bmultiplier\b/]},
-        typescript: {all: [/body\.price_cents/], none: [/\bmultiplier\b/]},
-        go: {all: [/body\.PriceCents/], none: [/\bmultiplier\b/i]},
-        scala: {all: [/body\.price_cents/], none: [/\bmultiplier\b/]},
-        cpp: {all: [/body\[\s*"price_cents"\s*\]/], none: [/\bmultiplier\b/]},
+        python: {all: [/reason\.strip\(\)|reason\.isspace\(\)/, /\b400\b/]},
+        typescript: {all: [/reason\.trim\(\)|reason\s*===\s*''/, /\b400\b/]},
+        go: {all: [/strings\.TrimSpace\([^)\n]*Reason\)|Reason\s*==\s*""/]},
+        scala: {all: [/reason\.trim\.isEmpty|reason\.isBlank|reason\.trim\(\)\.isEmpty/, /BadRequest|\b400\b/]},
+        cpp: {all: [/reason\.find_first_not_of\(|reason\.empty\(\)/, /\b400\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+      starter: `from fastapi import FastAPI
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("priced")
-
-
-class PriceRequest(BaseModel):
-    sku: str
-    multiplier: float
-    reason: str
-
-
-class PriceStore:
-    def current_price(self, sku: str) -> int:
-        """The sku's current price, or a house default for a sku nobody has priced."""
-        raise NotImplementedError
-
-    def upsert(self, sku: str, price_cents: int, reason: str) -> dict:
-        """Write the sku's price, creating the row when the sku is unknown."""
-        raise NotImplementedError
-
-
-store = PriceStore()
-
-
-@app.post("/v1/prices")
-def propose(body: PriceRequest) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    current = store.current_price(body.sku)
-    price_cents = int(current * body.multiplier)
-    row = store.upsert(body.sku, price_cents, body.reason)
-    logger.info("price sku=%s multiplier=%s price_cents=%d", body.sku, body.multiplier, price_cents)
-    return JSONResponse({"sku": body.sku, "price_cents": row["price_cents"]}, status_code=200)
-`,
-      solution: `import logging
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pricing import store  # get_sku, publish
 
 app = FastAPI()
-logger = logging.getLogger("priced")
-
-FLOOR_CENTS = 50
-CEILING_CENTS = 500_000
-MAX_MOVE_BP = 2000
-WINDOW_S = 3600
 
 
-class PriceRequest(BaseModel):
+class PriceChange(BaseModel):
     sku: str
     price_cents: int
     reason: str
 
 
-class PriceStore:
-    def get_sku(self, sku: str) -> dict | None:
-        """The sku's published row, or None when the sku does not exist."""
-        raise NotImplementedError
-
-    def publish(self, sku: str, price_cents: int, reason: str, source: str) -> dict:
-        """Commit the new price and its audit row, returning the published row."""
-        raise NotImplementedError
-
-
-store = PriceStore()
-
-
-def window_bound(current_cents: int, headroom_bp: int, direction: int) -> int:
-    """The furthest price the remaining headroom allows, clamped by floor and ceiling."""
-    delta = current_cents * headroom_bp // 10_000
-    return min(max(current_cents + direction * delta, FLOOR_CENTS), CEILING_CENTS)
-
-
-def moved_bp(current_cents: int, price_cents: int) -> int:
-    return abs(price_cents - current_cents) * 10_000 // max(current_cents, 1)
+def moved_bp(previous_cents: int, price_cents: int) -> int:
+    """The change in basis points of the previous price (100 bp = 1 %)."""
+    return abs(price_cents - previous_cents) * 10_000 // previous_cents
 
 
 @app.post("/v1/prices")
-def propose(body: PriceRequest, caller: str | None = Header(default=None, alias="X-Caller-Id")) -> JSONResponse:
-    if caller is None or caller == "":
-        raise HTTPException(status_code=401, detail="missing X-Caller-Id")
-    if body.reason.strip() == "":
-        raise HTTPException(status_code=400, detail="reason is required")
+def set_price(body: PriceChange) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    row = store.publish(body.sku, body.price_cents, body.reason, "operator")
+    return {
+        "sku": row["sku"],
+        "price_cents": row["price_cents"],
+        "previous_price_cents": row["previous_price_cents"],
+        "moved_bp": moved_bp(row["previous_price_cents"], row["price_cents"]),
+        "source": row["source"],
+        "updated_at": row["updated_at"],
+    }
+`,
+      solution: `from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-    row = store.get_sku(body.sku)
-    if row is None:
-        raise HTTPException(status_code=404, detail="unknown sku")
-    current = int(row["price_cents"])
+from pricing import store  # get_sku, publish
 
-    if body.price_cents < FLOOR_CENTS or body.price_cents > CEILING_CENTS:
-        raise HTTPException(
+app = FastAPI()
+
+FLOOR_CENTS = 50
+CEILING_CENTS = 500_000
+MAX_MOVE_BP = 2000
+
+
+class PriceChange(BaseModel):
+    sku: str
+    price_cents: int
+    reason: str
+
+
+def moved_bp(previous_cents: int, price_cents: int) -> int:
+    """The change in basis points of the previous price (100 bp = 1 %)."""
+    return abs(price_cents - previous_cents) * 10_000 // previous_cents
+
+
+def move_bound(current_cents: int, price_cents: int) -> int:
+    """The furthest price one change may reach from current_cents towards price_cents, inside the floor and the ceiling."""
+    delta = current_cents * MAX_MOVE_BP // 10_000
+    bound = current_cents + delta if price_cents >= current_cents else current_cents - delta
+    return min(max(bound, FLOOR_CENTS), CEILING_CENTS)
+
+
+@app.post("/v1/prices")
+def set_price(body: PriceChange) -> JSONResponse:
+    if not body.reason.strip():
+        return JSONResponse({"error": "reason is required"}, status_code=400)
+    current = store.get_sku(body.sku)
+    if current is None:
+        # A typo must not become a price row the storefront serves.
+        return JSONResponse({"error": f"unknown sku {body.sku}"}, status_code=404)
+    if not FLOOR_CENTS <= body.price_cents <= CEILING_CENTS:
+        return JSONResponse(
+            {"error": "price outside the floor and the ceiling", "floor_cents": FLOOR_CENTS, "ceiling_cents": CEILING_CENTS},
             status_code=422,
-            detail={
-                "error": "price outside the absolute guardrails",
-                "price_cents": body.price_cents,
-                "floor_cents": FLOOR_CENTS,
-                "ceiling_cents": CEILING_CENTS,
-            },
         )
-
-    direction = 1 if body.price_cents >= current else -1
-    bound = window_bound(current, MAX_MOVE_BP, direction)
-    if (direction > 0 and body.price_cents > bound) or (direction < 0 and body.price_cents < bound):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "change exceeds the per-window limit",
+    if moved_bp(current["price_cents"], body.price_cents) > MAX_MOVE_BP:
+        return JSONResponse(
+            {
+                "error": "change exceeds the per-change limit",
                 "limit_bp": MAX_MOVE_BP,
-                "current_price_cents": current,
-                "bound_cents": bound,
+                "bound_cents": move_bound(current["price_cents"], body.price_cents),
             },
+            status_code=409,
         )
-
-    moved = moved_bp(current, body.price_cents)
-    published = store.publish(body.sku, body.price_cents, body.reason, source="operator")
-    logger.info("publish sku=%s moved_bp=%d bound_cents=%d", body.sku, moved, bound)
+    row = store.publish(body.sku, body.price_cents, body.reason, "operator")
     return JSONResponse(
         {
-            "sku": body.sku,
-            "price_cents": published["price_cents"],
-            "previous_price_cents": current,
-            "moved_bp": moved,
-            "headroom_bp": MAX_MOVE_BP - moved,
-            "source": published["source"],
-            "updated_at": published["updated_at"],
-        },
-        status_code=200,
+            "sku": row["sku"],
+            "price_cents": row["price_cents"],
+            "previous_price_cents": row["previous_price_cents"],
+            "moved_bp": moved_bp(row["previous_price_cents"], row["price_cents"]),
+            "source": row["source"],
+            "updated_at": row["updated_at"],
+        }
     )
 `,
     },
     typescript: {
-      starter: `/** POST /v1/prices. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 
-import {store} from './store';
-
-export const app = Fastify();
-
-interface PriceBody {
-  sku: string;
-  multiplier: number;
-  reason: string;
-}
-
-app.post('/v1/prices', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const body = request.body as PriceBody;
-  const current = await store.currentPrice(body.sku);
-  const row = await store.upsert(body.sku, Math.round(current * body.multiplier), body.reason);
-  request.log.info({sku: body.sku, multiplier: body.multiplier}, 'price set');
-  return reply.code(200).send({sku: body.sku, price_cents: row.price_cents});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/prices: floor, ceiling and a computed per-window move bound around every change. */
-import Fastify from 'fastify';
-
-import {store} from './store';
+import {type Row, getSku, publish} from 'pricing/store';
 
 export const app = Fastify();
 
-const FLOOR_CENTS = 50;
-const CEILING_CENTS = 500_000;
-const MAX_MOVE_BP = 2000;
-const WINDOW_S = 3600;
-
-interface PriceBody {
+interface PriceChange {
   sku: string;
   price_cents: number;
   reason: string;
 }
 
-/** The furthest price the remaining headroom allows, clamped by the floor and the ceiling. */
-function windowBound(currentCents: number, headroomBp: number, direction: number): number {
-  const delta = Math.floor((currentCents * headroomBp) / 10_000);
-  return Math.min(Math.max(currentCents + direction * delta, FLOOR_CENTS), CEILING_CENTS);
-}
+/** The change in basis points of the previous price (100 bp = 1 %). */
+const movedBp = (previousCents: number, priceCents: number): number =>
+  Math.floor((Math.abs(priceCents - previousCents) * 10_000) / previousCents);
 
-function movedBp(currentCents: number, priceCents: number): number {
-  return Math.floor((Math.abs(priceCents - currentCents) * 10_000) / Math.max(currentCents, 1));
-}
-
-app.post('/v1/prices', async (request, reply) => {
-  const caller = request.headers['x-caller-id'];
-  if (typeof caller !== 'string' || caller === '') return reply.code(401).send({error: 'missing X-Caller-Id'});
-
-  const body = request.body as Partial<PriceBody> | null;
-  if (body === null || typeof body !== 'object') return reply.code(400).send({error: 'invalid body'});
-  if (typeof body.reason !== 'string' || body.reason.trim() === '')
-    return reply.code(400).send({error: 'reason is required'});
-  if (typeof body.price_cents !== 'number' || !Number.isInteger(body.price_cents))
-    return reply.code(400).send({error: 'price_cents must be an integer'});
-
-  const row = await store.getSku(body.sku);
-  if (row === null) return reply.code(404).send({error: 'unknown sku'});
-  const current = row.price_cents;
-
-  if (body.price_cents < FLOOR_CENTS || body.price_cents > CEILING_CENTS)
-    return reply.code(422).send({
-      error: 'price outside the absolute guardrails',
-      price_cents: body.price_cents,
-      floor_cents: FLOOR_CENTS,
-      ceiling_cents: CEILING_CENTS,
-    });
-
-  const direction = body.price_cents >= current ? 1 : -1;
-  const bound = windowBound(current, MAX_MOVE_BP, direction);
-  if ((direction > 0 && body.price_cents > bound) || (direction < 0 && body.price_cents < bound))
-    return reply.code(409).send({
-      error: 'change exceeds the per-window limit',
-      limit_bp: MAX_MOVE_BP,
-      current_price_cents: current,
-      bound_cents: bound,
-    });
-
-  const moved = movedBp(current, body.price_cents);
-  const published = await store.publish(body.sku, body.price_cents, body.reason, 'operator');
-  request.log.info({sku: body.sku, moved_bp: moved, bound_cents: bound}, 'published');
-  return reply.code(200).send({
-    sku: body.sku,
-    price_cents: published.price_cents,
-    previous_price_cents: current,
-    moved_bp: moved,
-    headroom_bp: MAX_MOVE_BP - moved,
-    source: published.source,
-    updated_at: published.updated_at,
-  });
+const priceResponse = (row: Row) => ({
+  sku: row.sku,
+  price_cents: row.price_cents,
+  previous_price_cents: row.previous_price_cents,
+  moved_bp: movedBp(row.previous_price_cents, row.price_cents),
+  source: row.source,
+  updated_at: row.updated_at,
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.post('/v1/prices', async request => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const body = request.body as PriceChange;
+  const row = await publish(body.sku, body.price_cents, body.reason, 'operator');
+  return priceResponse(row);
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {type Row, getSku, publish} from 'pricing/store';
+
+export const app = Fastify();
+
+export const FLOOR_CENTS = 50;
+export const CEILING_CENTS = 500_000;
+export const MAX_MOVE_BP = 2000;
+
+interface PriceChange {
+  sku: string;
+  price_cents: number;
+  reason: string;
+}
+
+/** The change in basis points of the previous price (100 bp = 1 %). */
+const movedBp = (previousCents: number, priceCents: number): number =>
+  Math.floor((Math.abs(priceCents - previousCents) * 10_000) / previousCents);
+
+/** The furthest price one change may reach from currentCents towards priceCents, inside the floor and the ceiling. */
+function moveBound(currentCents: number, priceCents: number): number {
+  const delta = Math.floor((currentCents * MAX_MOVE_BP) / 10_000);
+  const bound = priceCents >= currentCents ? currentCents + delta : currentCents - delta;
+  return Math.min(Math.max(bound, FLOOR_CENTS), CEILING_CENTS);
+}
+
+const priceResponse = (row: Row) => ({
+  sku: row.sku,
+  price_cents: row.price_cents,
+  previous_price_cents: row.previous_price_cents,
+  moved_bp: movedBp(row.previous_price_cents, row.price_cents),
+  source: row.source,
+  updated_at: row.updated_at,
+});
+
+app.post('/v1/prices', async (request, reply) => {
+  const body = request.body as PriceChange;
+  if (typeof body.reason !== 'string' || body.reason.trim() === '') return reply.code(400).send({error: 'reason is required'});
+  const current = await getSku(body.sku);
+  // A typo must not become a price row the storefront serves.
+  if (current === null) return reply.code(404).send({error: \`unknown sku \${body.sku}\`});
+  if (body.price_cents < FLOOR_CENTS || body.price_cents > CEILING_CENTS) {
+    return reply
+      .code(422)
+      .send({error: 'price outside the floor and the ceiling', floor_cents: FLOOR_CENTS, ceiling_cents: CEILING_CENTS});
+  }
+  if (movedBp(current.price_cents, body.price_cents) > MAX_MOVE_BP) {
+    return reply.code(409).send({
+      error: 'change exceeds the per-change limit',
+      limit_bp: MAX_MOVE_BP,
+      bound_cents: moveBound(current.price_cents, body.price_cents),
+    });
+  }
+  const row = await publish(body.sku, body.price_cents, body.reason, 'operator');
+  return priceResponse(row);
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"pricing/store" // store.GetSKU, store.Publish
 )
 
-type PriceRequest struct {
-	SKU        string  \`json:"sku"\`
-	Multiplier float64 \`json:"multiplier"\`
-	Reason     string  \`json:"reason"\`
+type priceChange struct {
+	SKU        string \`json:"sku"\`
+	PriceCents int64  \`json:"price_cents"\`
+	Reason     string \`json:"reason"\`
 }
 
-type PriceStore struct{}
-
-func (s *PriceStore) CurrentPrice(ctx context.Context, sku string) (int, error) {
-	return 0, nil
-}
-
-func (s *PriceStore) Upsert(ctx context.Context, sku string, priceCents int, reason string) (int, error) {
-	return priceCents, nil
-}
-
-var store = &PriceStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func propose(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	var body PriceRequest
+// movedBP is the change in basis points of the previous price (100 bp = 1 %).
+func movedBP(previousCents, priceCents int64) int64 {
+	delta := priceCents - previousCents
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta * 10_000 / previousCents
+}
+
+func priceResponse(row *store.Row) map[string]any {
+	return map[string]any{
+		"sku": row.SKU, "price_cents": row.PriceCents, "previous_price_cents": row.PreviousPriceCents,
+		"moved_bp": movedBP(row.PreviousPriceCents, row.PriceCents), "source": row.Source, "updated_at": row.UpdatedAt,
+	}
+}
+
+func setPrice(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	var body priceChange
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	current, _ := store.CurrentPrice(r.Context(), body.SKU)
-	priceCents := int(float64(current) * body.Multiplier)
-	published, _ := store.Upsert(r.Context(), body.SKU, priceCents, body.Reason)
-	log.Printf("price sku=%s multiplier=%f price_cents=%d", body.SKU, body.Multiplier, priceCents)
-	writeJSON(rw, http.StatusOK, map[string]any{"sku": body.SKU, "price_cents": published})
+	row := store.Publish(r.Context(), body.SKU, body.PriceCents, body.Reason, "operator")
+	writeJSON(rw, http.StatusOK, priceResponse(row))
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/prices", propose)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/prices", setPrice)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+	"strings"
+
+	"pricing/store" // store.GetSKU, store.Publish
 )
 
 const (
 	floorCents   = 50
-	ceilingCents = 500000
+	ceilingCents = 500_000
 	maxMoveBP    = 2000
-	windowSecs   = 3600
 )
 
-var knownCallers = map[string]bool{"operator": true, "demand-model": true}
-
-type PriceRequest struct {
+type priceChange struct {
 	SKU        string \`json:"sku"\`
-	PriceCents int    \`json:"price_cents"\`
+	PriceCents int64  \`json:"price_cents"\`
 	Reason     string \`json:"reason"\`
 }
 
-type PriceRow struct {
-	PriceCents int    \`json:"price_cents"\`
-	Source     string \`json:"source"\`
-	UpdatedAt  string \`json:"updated_at"\`
-}
-
-type PriceStore struct{}
-
-func (s *PriceStore) GetSKU(ctx context.Context, sku string) (*PriceRow, error) {
-	return nil, nil
-}
-
-func (s *PriceStore) Publish(ctx context.Context, sku string, priceCents int, reason, source string) (*PriceRow, error) {
-	return nil, nil
-}
-
-var store = &PriceStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// windowBound is the furthest price the remaining headroom allows, clamped by floor and ceiling.
-func windowBound(currentCents, headroomBP, direction int) int {
-	delta := currentCents * headroomBP / 10000
-	bound := currentCents + direction*delta
-	if bound < floorCents {
-		return floorCents
+// movedBP is the change in basis points of the previous price (100 bp = 1 %).
+func movedBP(previousCents, priceCents int64) int64 {
+	delta := priceCents - previousCents
+	if delta < 0 {
+		delta = -delta
 	}
-	if bound > ceilingCents {
-		return ceilingCents
-	}
-	return bound
+	return delta * 10_000 / previousCents
 }
 
-func movedBP(currentCents, priceCents int) int {
-	diff := priceCents - currentCents
-	if diff < 0 {
-		diff = -diff
+// moveBound is the furthest price one change may reach from currentCents towards priceCents,
+// inside the floor and the ceiling.
+func moveBound(currentCents, priceCents int64) int64 {
+	delta := currentCents * maxMoveBP / 10_000
+	bound := currentCents - delta
+	if priceCents >= currentCents {
+		bound = currentCents + delta
 	}
-	if currentCents < 1 {
-		currentCents = 1
-	}
-	return diff * 10000 / currentCents
+	return min(max(bound, floorCents), ceilingCents)
 }
 
-func propose(rw http.ResponseWriter, r *http.Request) {
-	if !knownCallers[r.Header.Get("X-Caller-Id")] {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Caller-Id"})
-		return
+func priceResponse(row *store.Row) map[string]any {
+	return map[string]any{
+		"sku": row.SKU, "price_cents": row.PriceCents, "previous_price_cents": row.PreviousPriceCents,
+		"moved_bp": movedBP(row.PreviousPriceCents, row.PriceCents), "source": row.Source, "updated_at": row.UpdatedAt,
 	}
-	var body PriceRequest
+}
+
+func setPrice(rw http.ResponseWriter, r *http.Request) {
+	var body priceChange
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if body.Reason == "" {
+	if strings.TrimSpace(body.Reason) == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "reason is required"})
 		return
 	}
-	row, err := store.GetSKU(r.Context(), body.SKU)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	current := store.GetSKU(r.Context(), body.SKU)
+	if current == nil {
+		// A typo must not become a price row the storefront serves.
+		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown sku " + body.SKU})
 		return
 	}
-	if row == nil {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown sku"})
-		return
-	}
-	current := row.PriceCents
 	if body.PriceCents < floorCents || body.PriceCents > ceilingCents {
 		writeJSON(rw, http.StatusUnprocessableEntity, map[string]any{
-			"error":         "price outside the absolute guardrails",
-			"price_cents":   body.PriceCents,
-			"floor_cents":   floorCents,
-			"ceiling_cents": ceilingCents,
+			"error": "price outside the floor and the ceiling", "floor_cents": floorCents, "ceiling_cents": ceilingCents,
 		})
 		return
 	}
-	direction := 1
-	if body.PriceCents < current {
-		direction = -1
-	}
-	bound := windowBound(current, maxMoveBP, direction)
-	if (direction > 0 && body.PriceCents > bound) || (direction < 0 && body.PriceCents < bound) {
+	if movedBP(current.PriceCents, body.PriceCents) > maxMoveBP {
 		writeJSON(rw, http.StatusConflict, map[string]any{
-			"error":               "change exceeds the per-window limit",
-			"limit_bp":            maxMoveBP,
-			"current_price_cents": current,
-			"bound_cents":         bound,
+			"error": "change exceeds the per-change limit", "limit_bp": maxMoveBP, "bound_cents": moveBound(current.PriceCents, body.PriceCents),
 		})
 		return
 	}
-	moved := movedBP(current, body.PriceCents)
-	published, err := store.Publish(r.Context(), body.SKU, body.PriceCents, body.Reason, "operator")
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("publish sku=%s moved_bp=%d bound_cents=%d", body.SKU, moved, bound)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"sku":                  body.SKU,
-		"price_cents":          published.PriceCents,
-		"previous_price_cents": current,
-		"moved_bp":             moved,
-		"headroom_bp":          maxMoveBP - moved,
-		"source":               published.Source,
-		"updated_at":           published.UpdatedAt,
-	})
+	row := store.Publish(r.Context(), body.SKU, body.PriceCents, body.Reason, "operator")
+	writeJSON(rw, http.StatusOK, priceResponse(row))
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/prices", propose)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/prices", setPrice)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class PriceRequest(sku: String, multiplier: Double, reason: String)
+import pricing.Store // Store.getSku, Store.publish
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("priced")
-  implicit val requestFormat: RootJsonFormat[PriceRequest] = jsonFormat3(PriceRequest)
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val store = PriceStore.open()
+  /** The change in basis points of the previous price (100 bp = 1 %). */
+  private def movedBp(previousCents: Long, priceCents: Long): Long = math.abs(priceCents - previousCents) * 10000 / previousCents
 
-  val route: Route =
-    path("v1" / "prices") {
-      post {
-        entity(as[PriceRequest]) { body =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val current = store.currentPrice(body.sku)
-          val priceCents = (current * body.multiplier).toInt
-          val row = store.upsert(body.sku, priceCents, body.reason)
-          system.log.info(s"price sku=\${body.sku} multiplier=\${body.multiplier}")
-          complete(StatusCodes.OK, s"""{"sku":"\${body.sku}","price_cents":\${row.price_cents}}""")
-        }
+  private def priceResponse(row: Store.Row): JsObject = JsObject(
+    "sku" -> JsString(row.sku), "price_cents" -> JsNumber(row.priceCents), "previous_price_cents" -> JsNumber(row.previousPriceCents),
+    "moved_bp" -> JsNumber(movedBp(row.previousPriceCents, row.priceCents)), "source" -> JsString(row.source),
+    "updated_at" -> JsNumber(row.updatedAt))
+
+  val route: Route = path("v1" / "prices") {
+    post {
+      entity(as[String]) { raw =>
+        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+        val fields = raw.parseJson.asJsObject.fields
+        val sku = fields.get("sku").collect { case JsString(s) => s }.getOrElse("")
+        val priceCents = fields.get("price_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+        val reason = fields.get("reason").collect { case JsString(s) => s }.getOrElse("")
+        val row = Store.publish(sku, priceCents, reason, "operator")
+        complete(json(StatusCodes.OK, priceResponse(row)))
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class PriceRequest(sku: String, price_cents: Int, reason: String)
-final case class PriceRow(price_cents: Int, source: String, updated_at: String)
+import pricing.Store // Store.getSku, Store.publish
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("priced")
-  implicit val requestFormat: RootJsonFormat[PriceRequest] = jsonFormat3(PriceRequest)
+  val FloorCents = 50L
+  val CeilingCents = 500000L
+  val MaxMoveBp = 2000L
 
-  val FloorCents = 50
-  val CeilingCents = 500000
-  val MaxMoveBp = 2000
-  val WindowSeconds = 3600
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val store = PriceStore.open()
+  private def error(status: StatusCode, message: String, extra: (String, JsValue)*): HttpResponse =
+    json(status, JsObject(("error" -> JsString(message)) +: extra: _*))
 
-  /** The furthest price the remaining headroom allows, clamped by floor and ceiling. */
-  def windowBound(currentCents: Int, headroomBp: Int, direction: Int): Int = {
-    val delta = currentCents * headroomBp / 10000
-    math.min(math.max(currentCents + direction * delta, FloorCents), CeilingCents)
+  /** The change in basis points of the previous price (100 bp = 1 %). */
+  private def movedBp(previousCents: Long, priceCents: Long): Long = math.abs(priceCents - previousCents) * 10000 / previousCents
+
+  /** The furthest price one change may reach from currentCents towards priceCents, inside the floor and the ceiling. */
+  private def moveBound(currentCents: Long, priceCents: Long): Long = {
+    val delta = currentCents * MaxMoveBp / 10000
+    val bound = if (priceCents >= currentCents) currentCents + delta else currentCents - delta
+    math.min(math.max(bound, FloorCents), CeilingCents)
   }
 
-  def movedBp(currentCents: Int, priceCents: Int): Int =
-    math.abs(priceCents - currentCents) * 10000 / math.max(currentCents, 1)
+  private def priceResponse(row: Store.Row): JsObject = JsObject(
+    "sku" -> JsString(row.sku), "price_cents" -> JsNumber(row.priceCents), "previous_price_cents" -> JsNumber(row.previousPriceCents),
+    "moved_bp" -> JsNumber(movedBp(row.previousPriceCents, row.priceCents)), "source" -> JsString(row.source),
+    "updated_at" -> JsNumber(row.updatedAt))
 
-  val route: Route =
-    path("v1" / "prices") {
-      post {
-        optionalHeaderValueByName("X-Caller-Id") { callerOpt =>
-          entity(as[PriceRequest]) { body =>
-            if (!callerOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Caller-Id"}""")
-            } else if (body.reason.trim.isEmpty) {
-              complete(StatusCodes.BadRequest, """{"error":"reason is required"}""")
-            } else {
-              store.getSku(body.sku) match {
-                case None =>
-                  complete(StatusCodes.NotFound, """{"error":"unknown sku"}""")
-                case Some(row) =>
-                  val current = row.price_cents
-                  if (body.price_cents < FloorCents || body.price_cents > CeilingCents) {
-                    complete(
-                      StatusCodes.UnprocessableEntity,
-                      s"""{"error":"price outside the absolute guardrails","price_cents":\${body.price_cents},"floor_cents":$FloorCents,"ceiling_cents":$CeilingCents}"""
-                    )
-                  } else {
-                    val direction = if (body.price_cents >= current) 1 else -1
-                    val bound = windowBound(current, MaxMoveBp, direction)
-                    if ((direction > 0 && body.price_cents > bound) || (direction < 0 && body.price_cents < bound)) {
-                      complete(
-                        StatusCodes.Conflict,
-                        s"""{"error":"change exceeds the per-window limit","limit_bp":$MaxMoveBp,"current_price_cents":$current,"bound_cents":$bound}"""
-                      )
-                    } else {
-                      val moved = movedBp(current, body.price_cents)
-                      val published = store.publish(body.sku, body.price_cents, body.reason, "operator")
-                      system.log.info(s"publish sku=\${body.sku} moved_bp=$moved bound_cents=$bound")
-                      complete(
-                        StatusCodes.OK,
-                        s"""{"sku":"\${body.sku}","price_cents":\${published.price_cents},"previous_price_cents":$current,"moved_bp":$moved,"headroom_bp":\${MaxMoveBp - moved},"source":"\${published.source}","updated_at":"\${published.updated_at}"}"""
-                      )
-                    }
-                  }
-              }
-            }
+  val route: Route = path("v1" / "prices") {
+    post {
+      entity(as[String]) { raw =>
+        val fields = raw.parseJson.asJsObject.fields
+        val sku = fields.get("sku").collect { case JsString(s) => s }.getOrElse("")
+        val priceCents = fields.get("price_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+        val reason = fields.get("reason").collect { case JsString(s) => s }.getOrElse("")
+        if (reason.trim.isEmpty) complete(error(StatusCodes.BadRequest, "reason is required"))
+        else
+          Store.getSku(sku) match {
+            // A typo must not become a price row the storefront serves.
+            case None => complete(error(StatusCodes.NotFound, s"unknown sku $sku"))
+            case Some(_) if priceCents < FloorCents || priceCents > CeilingCents =>
+              complete(error(StatusCodes.UnprocessableEntity, "price outside the floor and the ceiling",
+                "floor_cents" -> JsNumber(FloorCents), "ceiling_cents" -> JsNumber(CeilingCents)))
+            case Some(current) if movedBp(current.priceCents, priceCents) > MaxMoveBp =>
+              complete(error(StatusCodes.Conflict, "change exceeds the per-change limit",
+                "limit_bp" -> JsNumber(MaxMoveBp), "bound_cents" -> JsNumber(moveBound(current.priceCents, priceCents))))
+            case Some(_) =>
+              val row = Store.publish(sku, priceCents, reason, "operator")
+              complete(json(StatusCodes.OK, priceResponse(row)))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -678,148 +553,471 @@ object Api {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
+
+#include "pricing/store.h"  // store::getSku, store::publish
 
 using json = nlohmann::json;
 
-struct PriceStore {
-  int currentPrice(const std::string& sku);
-  json upsert(const std::string& sku, int priceCents, const std::string& reason);
-};
-
-PriceStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/prices", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto sku = body.value("sku", std::string());
-    const double multiplier = body.value("multiplier", 1.0);
-    const int current = store.currentPrice(sku);
-    const int priceCents = static_cast<int>(static_cast<double>(current) * multiplier);
-    const auto row = store.upsert(sku, priceCents, body.value("reason", std::string()));
-    std::cerr << "price sku=" << sku << " multiplier=" << multiplier << "\\n";
-    res.status = 200;
-    res.set_content(json{{"sku", sku}, {"price_cents", row["price_cents"]}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// The change in basis points of the previous price (100 bp = 1 %).
+long long movedBp(long long previous_cents, long long price_cents) {
+  const long long delta = price_cents > previous_cents ? price_cents - previous_cents : previous_cents - price_cents;
+  return delta * 10000 / previous_cents;
 }
+
+json priceResponse(const store::Row& row) {
+  return json{{"sku", row.sku},
+              {"price_cents", row.price_cents},
+              {"previous_price_cents", row.previous_price_cents},
+              {"moved_bp", movedBp(row.previous_price_cents, row.price_cents)},
+              {"source", row.source},
+              {"updated_at", row.updated_at}};
+}
+
+void set_price(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const json body = json::parse(req.body);
+  const store::Row row =
+      store::publish(body.value("sku", ""), body.value("price_cents", 0LL), body.value("reason", ""), "operator");
+  res.set_content(priceResponse(row).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/prices", set_price); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cstdlib>
-#include <iostream>
-#include <optional>
 #include <string>
+
+#include "pricing/store.h"  // store::getSku, store::publish
 
 using json = nlohmann::json;
 
-constexpr int kFloorCents = 50;
-constexpr int kCeilingCents = 500000;
-constexpr int kMaxMoveBp = 2000;
+constexpr long long kFloorCents = 50;
+constexpr long long kCeilingCents = 500000;
+constexpr long long kMaxMoveBp = 2000;
 
-struct PriceStore {
-  std::optional<json> getSku(const std::string& sku);
-  json publish(const std::string& sku, int priceCents, const std::string& reason, const std::string& source);
-};
-
-PriceStore store;
-
-/** The furthest price the remaining headroom allows, clamped by floor and ceiling. */
-int windowBound(int currentCents, int headroomBp, int direction) {
-  const int delta = currentCents * headroomBp / 10000;
-  return std::min(std::max(currentCents + direction * delta, kFloorCents), kCeilingCents);
+// The change in basis points of the previous price (100 bp = 1 %).
+long long movedBp(long long previous_cents, long long price_cents) {
+  const long long delta = price_cents > previous_cents ? price_cents - previous_cents : previous_cents - price_cents;
+  return delta * 10000 / previous_cents;
 }
 
-int movedBp(int currentCents, int priceCents) {
-  return std::abs(priceCents - currentCents) * 10000 / std::max(currentCents, 1);
+// The furthest price one change may reach from current_cents towards price_cents, inside the floor
+// and the ceiling.
+long long moveBound(long long current_cents, long long price_cents) {
+  const long long delta = current_cents * kMaxMoveBp / 10000;
+  const long long bound = price_cents >= current_cents ? current_cents + delta : current_cents - delta;
+  return std::min(std::max(bound, kFloorCents), kCeilingCents);
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/prices", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("price_cents") || !body["price_cents"].is_number_integer()) {
-      res.status = 400;
-      res.set_content(R"({"error":"price_cents must be an integer"})", "application/json");
-      return;
-    }
-    const auto reason = body.value("reason", std::string());
-    if (reason.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"reason is required"})", "application/json");
-      return;
-    }
-    const auto sku = body.value("sku", std::string());
-    const auto found = store.getSku(sku);
-    if (!found) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown sku"})", "application/json");
-      return;
-    }
-    const int current = (*found)["price_cents"].get<int>();
-    const int priceCents = body["price_cents"].get<int>();
-    if (priceCents < kFloorCents || priceCents > kCeilingCents) {
-      res.status = 422;
-      res.set_content(
-          json{{"error", "price outside the absolute guardrails"},
-               {"price_cents", priceCents},
-               {"floor_cents", kFloorCents},
-               {"ceiling_cents", kCeilingCents}}
-              .dump(),
-          "application/json");
-      return;
-    }
-    const int direction = priceCents >= current ? 1 : -1;
-    const int bound = windowBound(current, kMaxMoveBp, direction);
-    if ((direction > 0 && priceCents > bound) || (direction < 0 && priceCents < bound)) {
-      res.status = 409;
-      res.set_content(
-          json{{"error", "change exceeds the per-window limit"},
-               {"limit_bp", kMaxMoveBp},
-               {"current_price_cents", current},
-               {"bound_cents", bound}}
-              .dump(),
-          "application/json");
-      return;
-    }
-    const int moved = movedBp(current, priceCents);
-    const auto published = store.publish(sku, priceCents, reason, "operator");
-    std::cerr << "publish sku=" << sku << " moved_bp=" << moved << " bound_cents=" << bound << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"sku", sku},
-             {"price_cents", published["price_cents"]},
-             {"previous_price_cents", current},
-             {"moved_bp", moved},
-             {"headroom_bp", kMaxMoveBp - moved},
-             {"source", published["source"]},
-             {"updated_at", published["updated_at"]}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+json priceResponse(const store::Row& row) {
+  return json{{"sku", row.sku},
+              {"price_cents", row.price_cents},
+              {"previous_price_cents", row.previous_price_cents},
+              {"moved_bp", movedBp(row.previous_price_cents, row.price_cents)},
+              {"source", row.source},
+              {"updated_at", row.updated_at}};
 }
+
+void reject(httplib::Response& res, int status, json body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+void set_price(const httplib::Request& req, httplib::Response& res) {
+  const json body = json::parse(req.body);
+  const std::string sku = body.value("sku", "");
+  const long long price_cents = body.value("price_cents", 0LL);
+  const std::string reason = body.value("reason", "");
+  if (reason.find_first_not_of(" \\t\\n") == std::string::npos) return reject(res, 400, json{{"error", "reason is required"}});
+  const auto current = store::getSku(sku);
+  // A typo must not become a price row the storefront serves.
+  if (!current) return reject(res, 404, json{{"error", "unknown sku " + sku}});
+  if (price_cents < kFloorCents || price_cents > kCeilingCents) {
+    return reject(res, 422, json{{"error", "price outside the floor and the ceiling"}, {"floor_cents", kFloorCents}, {"ceiling_cents", kCeilingCents}});
+  }
+  if (movedBp(current->price_cents, price_cents) > kMaxMoveBp) {
+    return reject(res, 409, json{{"error", "change exceeds the per-change limit"},
+                                 {"limit_bp", kMaxMoveBp},
+                                 {"bound_cents", moveBound(current->price_cents, price_cents)}});
+  }
+  const store::Row row = store::publish(sku, price_cents, reason, "operator");
+  res.set_content(priceResponse(row).dump(), "application/json");
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/prices", set_price); }
 `,
     },
   },
+  harness: {
+    python: `from pricing import store
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _post(c, sku="SKU-1", price_cents=1100, reason="weekend promo"):
+    return await c.post("/v1/prices", json={"sku": sku, "price_cents": price_cents, "reason": reason})
+
+
+async def check_route(ctx):
+    store.seed("SKU-1", 1000)
+    async with _api(ctx) as c:
+        r = await _post(c)
+    assert r.status_code == 200, f"POST /v1/prices answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("price_cents") == 1100 and body.get("previous_price_cents") == 1000, f"a change from 1000 to 1100 answered {body}, expected price_cents 1100 and previous_price_cents 1000"
+    assert body.get("moved_bp") == 1000, f"a 10 % change answered moved_bp {body.get('moved_bp')}, expected 1000"
+    row = store.get_sku("SKU-1")
+    assert row["price_cents"] == 1100 and row["source"] == "operator", f"the store holds {row}, expected 1100 published by the operator"
+
+
+async def check_known_sku(ctx):
+    store.seed("SKU-1", 1000)
+    async with _api(ctx) as c:
+        r = await _post(c, sku="SKU-404")
+        assert r.status_code == 404, f"a change for SKU-404, which does not exist, answered {r.status_code}: {r.text}, expected 404"
+        assert store.get_sku("SKU-404") is None, f"the unknown sku now has a price row {store.get_sku('SKU-404')}: a typo became a price the storefront serves"
+        r = await _post(c)
+    assert r.status_code == 200, f"a change for the known SKU-1 answered {r.status_code}: {r.text}"
+
+
+async def check_bounds(ctx):
+    store.seed("SKU-1", 1000)
+    store.seed("SKU-2", 480_000)
+    store.seed("SKU-3", 55)
+    async with _api(ctx) as c:
+        for sku, price, why in (("SKU-1", 0, "a price of 0"), ("SKU-2", 520_000, "520000, above the ceiling"), ("SKU-3", 45, "45, below the floor")):
+            r = await _post(c, sku=sku, price_cents=price)
+            assert r.status_code == 422, f"{why} for {sku} answered {r.status_code}: {r.text}, expected 422"
+            body = r.json()
+            assert body.get("floor_cents") == 50 and body.get("ceiling_cents") == 500_000, f"the 422 must name floor_cents 50 and ceiling_cents 500000, got {body}"
+        assert [store.get_sku(s)["price_cents"] for s in ("SKU-1", "SKU-2", "SKU-3")] == [1000, 480_000, 55], "a refused price was published anyway"
+        r = await _post(c, price_cents=1100)
+    assert r.status_code == 200, f"a price inside the bounds answered {r.status_code}: {r.text}"
+
+
+async def check_move_limit(ctx):
+    store.seed("SKU-1", 1000)
+    async with _api(ctx) as c:
+        r = await _post(c, price_cents=1300)
+        assert r.status_code == 409, f"a 30 % rise from 1000 to 1300 answered {r.status_code}: {r.text}, expected 409"
+        assert r.json().get("bound_cents") == 1200, f"the 409 must carry bound_cents 1200 (1000 + 20 %), got {r.json()}"
+        assert store.get_sku("SKU-1")["price_cents"] == 1000, f"the refused change was published: {store.get_sku('SKU-1')}"
+        r = await _post(c, price_cents=1200)
+        assert r.status_code == 200, f"a change of exactly MAX_MOVE_BP (1000 to 1200) answered {r.status_code}: {r.text}"
+        r = await _post(c, price_cents=900)
+    assert r.status_code == 409, f"a 25 % cut from 1200 to 900 answered {r.status_code}: {r.text}, expected 409"
+    assert r.json().get("bound_cents") == 960, f"a cut is bounded below: expected bound_cents 960 (1200 - 20 %), got {r.json()}"
+
+
+async def check_reason_required(ctx):
+    store.seed("SKU-1", 1000)
+    async with _api(ctx) as c:
+        for reason in ("", "   "):
+            r = await _post(c, reason=reason)
+            assert r.status_code == 400, f"a change with reason {reason!r} answered {r.status_code}: {r.text}, expected 400"
+        assert store.get_sku("SKU-1")["price_cents"] == 1000, f"a change with no reason was published: {store.get_sku('SKU-1')}"
+        r = await _post(c, reason="competitor match")
+    assert r.status_code == 200, f"a change with a reason answered {r.status_code}: {r.text}"
+    assert store.get_sku("SKU-1")["reason"] == "competitor match", f"the row keeps reason {store.get_sku('SKU-1')['reason']!r}"
+`,
+    typescript: `function api(ctx) {
+  const store = ctx.load('/support/pricing/store.ts');
+  return {c: ctx.client(ctx.load('api').app), store};
+}
+
+const post = (c, sku = 'SKU-1', price_cents = 1100, reason = 'weekend promo') =>
+  c.post('/v1/prices', {json: {sku, price_cents, reason}});
+
+export async function check_route(ctx) {
+  const {c, store} = api(ctx);
+  await store.seed('SKU-1', 1000);
+  const r = await post(c);
+  assert.equal(r.status, 200, \`POST /v1/prices answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.price_cents === 1100 && body.previous_price_cents === 1000, \`a change from 1000 to 1100 answered \${r.text}, expected price_cents 1100 and previous_price_cents 1000\`);
+  assert.equal(body.moved_bp, 1000, \`a 10 % change answered moved_bp \${body.moved_bp}, expected 1000\`);
+  const row = await store.getSku('SKU-1');
+  assert(row.price_cents === 1100 && row.source === 'operator', \`the store holds \${JSON.stringify(row)}, expected 1100 published by the operator\`);
+}
+
+export async function check_known_sku(ctx) {
+  const {c, store} = api(ctx);
+  await store.seed('SKU-1', 1000);
+  let r = await post(c, 'SKU-404');
+  assert.equal(r.status, 404, \`a change for SKU-404, which does not exist, answered \${r.status}: \${r.text}, expected 404\`);
+  const phantom = await store.getSku('SKU-404');
+  assert.equal(phantom, null, \`the unknown sku now has a price row \${JSON.stringify(phantom)}: a typo became a price the storefront serves\`);
+  r = await post(c);
+  assert.equal(r.status, 200, \`a change for the known SKU-1 answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_bounds(ctx) {
+  const {c, store} = api(ctx);
+  await store.seed('SKU-1', 1000);
+  await store.seed('SKU-2', 480_000);
+  await store.seed('SKU-3', 55);
+  for (const [sku, price, why] of [['SKU-1', 0, 'a price of 0'], ['SKU-2', 520_000, '520000, above the ceiling'], ['SKU-3', 45, '45, below the floor']] as const) {
+    const r = await post(c, sku, price);
+    assert.equal(r.status, 422, \`\${why} for \${sku} answered \${r.status}: \${r.text}, expected 422\`);
+    const body = r.json();
+    assert(body.floor_cents === 50 && body.ceiling_cents === 500_000, \`the 422 must name floor_cents 50 and ceiling_cents 500000, got \${r.text}\`);
+  }
+  const prices = [];
+  for (const sku of ['SKU-1', 'SKU-2', 'SKU-3']) prices.push((await store.getSku(sku)).price_cents);
+  assert.deepStrictEqual(prices, [1000, 480_000, 55], 'a refused price was published anyway');
+  const r = await post(c, 'SKU-1', 1100);
+  assert.equal(r.status, 200, \`a price inside the bounds answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_move_limit(ctx) {
+  const {c, store} = api(ctx);
+  await store.seed('SKU-1', 1000);
+  let r = await post(c, 'SKU-1', 1300);
+  assert.equal(r.status, 409, \`a 30 % rise from 1000 to 1300 answered \${r.status}: \${r.text}, expected 409\`);
+  assert.equal(r.json().bound_cents, 1200, \`the 409 must carry bound_cents 1200 (1000 + 20 %), got \${r.text}\`);
+  assert.equal((await store.getSku('SKU-1')).price_cents, 1000, 'the refused change was published');
+  r = await post(c, 'SKU-1', 1200);
+  assert.equal(r.status, 200, \`a change of exactly MAX_MOVE_BP (1000 to 1200) answered \${r.status}: \${r.text}\`);
+  r = await post(c, 'SKU-1', 900);
+  assert.equal(r.status, 409, \`a 25 % cut from 1200 to 900 answered \${r.status}: \${r.text}, expected 409\`);
+  assert.equal(r.json().bound_cents, 960, \`a cut is bounded below: expected bound_cents 960 (1200 - 20 %), got \${r.text}\`);
+}
+
+export async function check_reason_required(ctx) {
+  const {c, store} = api(ctx);
+  await store.seed('SKU-1', 1000);
+  for (const reason of ['', '   ']) {
+    const r = await post(c, 'SKU-1', 1100, reason);
+    assert.equal(r.status, 400, \`a change with reason \${JSON.stringify(reason)} answered \${r.status}: \${r.text}, expected 400\`);
+  }
+  assert.equal((await store.getSku('SKU-1')).price_cents, 1000, 'a change with no reason was published');
+  const r = await post(c, 'SKU-1', 1100, 'competitor match');
+  assert.equal(r.status, 200, \`a change with a reason answered \${r.status}: \${r.text}\`);
+  assert.equal((await store.getSku('SKU-1')).reason, 'competitor match', 'the row must keep the reason');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"pricing/store"
+
+	"leetbuild/harness"
+)
+
+var apiBg = context.Background()
+
+type priceReply struct {
+	PriceCents         int64 \`json:"price_cents"\`
+	PreviousPriceCents int64 \`json:"previous_price_cents"\`
+	MovedBP            int64 \`json:"moved_bp"\`
+	BoundCents         int64 \`json:"bound_cents"\`
+	FloorCents         int64 \`json:"floor_cents"\`
+	CeilingCents       int64 \`json:"ceiling_cents"\`
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func postPrice(c *harness.HTTP, sku string, priceCents int64, reason string) (*harness.Response, priceReply) {
+	r := c.Post("/v1/prices", map[string]any{"sku": sku, "price_cents": priceCents, "reason": reason})
+	var body priceReply
+	r.Decode(&body)
+	return r, body
+}
+
+func priceOf(sku string) int64 {
+	if row := store.GetSKU(apiBg, sku); row != nil {
+		return row.PriceCents
+	}
+	return 0
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	store.Seed(apiBg, "SKU-1", 1000)
+	r, body := postPrice(api(ctx), "SKU-1", 1100, "weekend promo")
+	ctx.Equal(r.Status, 200, "POST /v1/prices (%s)", r.Text())
+	ctx.Assert(body.PriceCents == 1100 && body.PreviousPriceCents == 1000, "a change from 1000 to 1100 answered %s, expected price_cents 1100 and previous_price_cents 1000", r.Text())
+	ctx.Equal(body.MovedBP, 1000, "a 10 %% change; moved_bp")
+	row := store.GetSKU(apiBg, "SKU-1")
+	ctx.Assert(row.PriceCents == 1100 && row.Source == "operator", "the store holds %+v, expected 1100 published by the operator", row)
+}
+
+func CheckKnownSku(ctx *harness.Ctx) {
+	store.Seed(apiBg, "SKU-1", 1000)
+	c := api(ctx)
+	r, _ := postPrice(c, "SKU-404", 1100, "weekend promo")
+	ctx.Equal(r.Status, 404, "a change for SKU-404, which does not exist (%s)", r.Text())
+	phantom := store.GetSKU(apiBg, "SKU-404")
+	ctx.Assert(phantom == nil, "the unknown sku now has a price row %+v: a typo became a price the storefront serves", phantom)
+	r, _ = postPrice(c, "SKU-1", 1100, "weekend promo")
+	ctx.Equal(r.Status, 200, "a change for the known SKU-1 (%s)", r.Text())
+}
+
+func CheckBounds(ctx *harness.Ctx) {
+	store.Seed(apiBg, "SKU-1", 1000)
+	store.Seed(apiBg, "SKU-2", 480_000)
+	store.Seed(apiBg, "SKU-3", 55)
+	c := api(ctx)
+	cases := []struct {
+		sku   string
+		price int64
+		why   string
+	}{{"SKU-1", 0, "a price of 0"}, {"SKU-2", 520_000, "520000, above the ceiling"}, {"SKU-3", 45, "45, below the floor"}}
+	for _, tc := range cases {
+		r, body := postPrice(c, tc.sku, tc.price, "weekend promo")
+		ctx.Equal(r.Status, 422, "%s for %s (%s)", tc.why, tc.sku, r.Text())
+		ctx.Assert(body.FloorCents == 50 && body.CeilingCents == 500_000, "the 422 must name floor_cents 50 and ceiling_cents 500000, got %s", r.Text())
+	}
+	ctx.Equal([]int64{priceOf("SKU-1"), priceOf("SKU-2"), priceOf("SKU-3")}, []int64{1000, 480_000, 55}, "a refused price must not be published; the prices")
+	r, _ := postPrice(c, "SKU-1", 1100, "weekend promo")
+	ctx.Equal(r.Status, 200, "a price inside the bounds (%s)", r.Text())
+}
+
+func CheckMoveLimit(ctx *harness.Ctx) {
+	store.Seed(apiBg, "SKU-1", 1000)
+	c := api(ctx)
+	r, body := postPrice(c, "SKU-1", 1300, "weekend promo")
+	ctx.Equal(r.Status, 409, "a 30 %% rise from 1000 to 1300 (%s)", r.Text())
+	ctx.Equal(body.BoundCents, 1200, "the 409 must carry bound_cents 1000 + 20 %%; bound_cents")
+	ctx.Equal(priceOf("SKU-1"), 1000, "the refused change must not be published; the price")
+	r, _ = postPrice(c, "SKU-1", 1200, "weekend promo")
+	ctx.Equal(r.Status, 200, "a change of exactly MAX_MOVE_BP, 1000 to 1200 (%s)", r.Text())
+	r, body = postPrice(c, "SKU-1", 900, "weekend promo")
+	ctx.Equal(r.Status, 409, "a 25 %% cut from 1200 to 900 (%s)", r.Text())
+	ctx.Equal(body.BoundCents, 960, "a cut is bounded below (1200 - 20 %%); bound_cents")
+}
+
+func CheckReasonRequired(ctx *harness.Ctx) {
+	store.Seed(apiBg, "SKU-1", 1000)
+	c := api(ctx)
+	for _, reason := range []string{"", "   "} {
+		r, _ := postPrice(c, "SKU-1", 1100, reason)
+		ctx.Equal(r.Status, 400, "a change with reason %q (%s)", reason, r.Text())
+	}
+	ctx.Equal(priceOf("SKU-1"), 1000, "a change with no reason must not be published; the price")
+	r, _ := postPrice(c, "SKU-1", 1100, "competitor match")
+	ctx.Equal(r.Status, 200, "a change with a reason (%s)", r.Text())
+	ctx.Equal(store.GetSKU(apiBg, "SKU-1").Reason, "competitor match", "the row's reason")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+harness::HTTP api(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response postPrice(harness::HTTP& c, const std::string& sku, long long price_cents, const std::string& reason = "weekend promo") {
+  const nlohmann::json body{{"sku", sku}, {"price_cents", price_cents}, {"reason", reason}};
+  return c.Post("/v1/prices", body.dump(), "Content-Type", "application/json");
+}
+
+long long field(const harness::Response& r, const std::string& name) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() && body.contains(name) && body[name].is_number() ? body[name].get<long long>() : -1;
+}
+
+long long priceOf(const std::string& sku) {
+  const auto row = store::getSku(sku);
+  return row ? row->price_cents : 0;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  store::seed("SKU-1", 1000);
+  auto c = api(ctx);
+  const auto r = postPrice(c, "SKU-1", 1100);
+  ctx.Equal(r.Status, 200, "POST /v1/prices (%s)", r.Text());
+  ctx.Assert(field(r, "price_cents") == 1100 && field(r, "previous_price_cents") == 1000, "a change from 1000 to 1100 answered %s, expected price_cents 1100 and previous_price_cents 1000", r.Text());
+  ctx.Equal(field(r, "moved_bp"), 1000, "a 10 %% change; moved_bp");
+  const auto row = store::getSku("SKU-1");
+  ctx.Assert(row && row->price_cents == 1100 && row->source == "operator", "the store holds price %d from %q, expected 1100 published by the operator", row ? row->price_cents : 0, row ? row->source : "");
+}
+
+void CheckKnownSku(harness::Ctx& ctx) {
+  store::seed("SKU-1", 1000);
+  auto c = api(ctx);
+  auto r = postPrice(c, "SKU-404", 1100);
+  ctx.Equal(r.Status, 404, "a change for SKU-404, which does not exist (%s)", r.Text());
+  ctx.Assert(!store::getSku("SKU-404"), "the unknown sku now has a price row: a typo became a price the storefront serves");
+  r = postPrice(c, "SKU-1", 1100);
+  ctx.Equal(r.Status, 200, "a change for the known SKU-1 (%s)", r.Text());
+}
+
+void CheckBounds(harness::Ctx& ctx) {
+  store::seed("SKU-1", 1000);
+  store::seed("SKU-2", 480000);
+  store::seed("SKU-3", 55);
+  auto c = api(ctx);
+  struct Case {
+    std::string sku;
+    long long price;
+    std::string why;
+  };
+  for (const Case& tc : std::vector<Case>{{"SKU-1", 0, "a price of 0"}, {"SKU-2", 520000, "520000, above the ceiling"}, {"SKU-3", 45, "45, below the floor"}}) {
+    const auto r = postPrice(c, tc.sku, tc.price);
+    ctx.Equal(r.Status, 422, "%s for %s (%s)", tc.why, tc.sku, r.Text());
+    ctx.Assert(field(r, "floor_cents") == 50 && field(r, "ceiling_cents") == 500000, "the 422 must name floor_cents 50 and ceiling_cents 500000, got %s", r.Text());
+  }
+  ctx.Equal(std::vector<long long>{priceOf("SKU-1"), priceOf("SKU-2"), priceOf("SKU-3")}, std::vector<long long>{1000, 480000, 55}, "a refused price must not be published; the prices");
+  const auto r = postPrice(c, "SKU-1", 1100);
+  ctx.Equal(r.Status, 200, "a price inside the bounds (%s)", r.Text());
+}
+
+void CheckMoveLimit(harness::Ctx& ctx) {
+  store::seed("SKU-1", 1000);
+  auto c = api(ctx);
+  auto r = postPrice(c, "SKU-1", 1300);
+  ctx.Equal(r.Status, 409, "a 30 %% rise from 1000 to 1300 (%s)", r.Text());
+  ctx.Equal(field(r, "bound_cents"), 1200, "the 409 must carry bound_cents 1000 + 20 %%; bound_cents");
+  ctx.Equal(priceOf("SKU-1"), 1000, "the refused change must not be published; the price");
+  r = postPrice(c, "SKU-1", 1200);
+  ctx.Equal(r.Status, 200, "a change of exactly MAX_MOVE_BP, 1000 to 1200 (%s)", r.Text());
+  r = postPrice(c, "SKU-1", 900);
+  ctx.Equal(r.Status, 409, "a 25 %% cut from 1200 to 900 (%s)", r.Text());
+  ctx.Equal(field(r, "bound_cents"), 960, "a cut is bounded below (1200 - 20 %%); bound_cents");
+}
+
+void CheckReasonRequired(harness::Ctx& ctx) {
+  store::seed("SKU-1", 1000);
+  auto c = api(ctx);
+  for (const std::string reason : {"", "   "}) {
+    const auto r = postPrice(c, "SKU-1", 1100, reason);
+    ctx.Equal(r.Status, 400, "a change with reason %q (%s)", reason, r.Text());
+  }
+  ctx.Equal(priceOf("SKU-1"), 1000, "a change with no reason must not be published; the price");
+  const auto r = postPrice(c, "SKU-1", 1100, "competitor match");
+  ctx.Equal(r.Status, 200, "a change with a reason (%s)", r.Text());
+  ctx.Equal(store::getSku("SKU-1")->reason, "competitor match", "the row's reason");
+}
+`,
+  },
   hints: [
-    'Send `{"sku": "SKU-1", "multiplier": 4.0}` and the storefront shows a 400 percent spike; send a sku that does not exist and the catalog gains a row nobody priced.',
-    'The handler trusts the body for the arithmetic: `int(current * body.multiplier)` has no floor, ceiling or move limit to compare against, and `store.upsert` creates the row it was asked for.',
-    'Read `body.price_cents`, `store.get_sku` first (404 when missing), then 422 outside `FLOOR_CENTS`..`CEILING_CENTS`, then 409 past `MAX_MOVE_BP` with `bound_cents = current ± current * headroom_bp / 10_000`, clamped.',
+    'Post a price for `SKU-404` and read it back: the storefront now has a price for a product that does not exist. Post `0` for a real sku and it sells for free.',
+    '`store.publish` writes whatever it is handed and creates a row for a new sku. The handler never reads the current price, so it has nothing to compare a floor, a ceiling or a 20 % move against.',
+    'Answer 400 on a blank reason, call `store.get_sku` (404 on None), 422 outside `FLOOR_CENTS`..`CEILING_CENTS`, 409 when `moved_bp(current, target) > MAX_MOVE_BP` with `bound_cents = current ± current * MAX_MOVE_BP // 10_000`, clamped; publish last.',
   ],
-  debrief: `The fix moves the arithmetic from the caller to the platform. A target price can be compared against a floor, a ceiling and the window's remaining headroom; a multiplier can only be applied, which is why the starter had nothing to reject. The floor and ceiling sit first because they hold even when the window accounting is wrong, which is what happens under concurrency. The lookup replaces the upsert because a write path that creates rows lets a typo become a sku every later read has to reason about. \`bound_cents\` in the 409 body turns a refusal into a retry the caller can compute. Production pricing services go further: per-category guardrail recipes from config, a cost-based sanity check, and a second approver for changes above a threshold.`,
+  debrief: `Every refusal runs before the write, and that order is the fix: the store's publish creates rows and accepts any number, so the handler in front of it is the only place a bad change can stop. The lookup comes first because the floor, the ceiling and the move limit are all relative to a sku that exists, and \`bound_cents\` turns a 409 into a retry the caller can compute. A per-change limit still lets ten small changes compound within an hour; step 2 replaces it with a window budget. Pricing services in production load floors and ceilings per category from configuration, compare a new price with unit cost, and send changes above a threshold to a second approver.`,
 };
