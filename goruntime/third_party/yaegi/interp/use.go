@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"go/constant"
+	"go/token"
 	"log"
 	"math/bits"
 	"os"
@@ -29,18 +30,31 @@ func (interp *Interpreter) Symbols(importPath string) Exports {
 		}
 		syms := map[string]reflect.Value{}
 		for n, s := range v {
-			if !canExport(n) {
-				// Skip private non-exported symbols.
+			if !canExport(n) || !token.IsIdentifier(n) {
+				// Skip private non-exported symbols. LeetBuild: and generic instantiations
+				// the scope keeps under their instance names (Box[string], Map[int,string]).
 				continue
 			}
 			switch s.kind {
 			case constSym:
 				syms[n] = s.rval
 			case funcSym:
+				if isGeneric(s.typ) {
+					// LeetBuild: a generic function has no value until instantiated (Go cannot
+					// take one either); wrapping its declaration panicked in reflect.MakeFunc,
+					// and with it every lookup of the package's symbols (the host's Check<Id>).
+					continue
+				}
 				syms[n] = genFunctionWrapper(s.node)(interp.frame)
 			case varSym:
 				syms[n] = interp.frame.data[s.index]
 			case typeSym:
+				// LeetBuild: as a generic function, a generic type is no type until
+				// instantiated, and a type parameter the package scope holds (T) no complete
+				// one: "incomplete type" and reflect.New(nil) panicked.
+				if s.typ.cat == genericT || s.typ.cat == nilT {
+					continue
+				}
 				syms[n] = reflect.New(s.typ.TypeOf())
 			}
 		}
@@ -155,9 +169,17 @@ func (interp *Interpreter) Use(values Exports) error {
 	if _, ok := values["fmt/fmt"]; ok {
 		fixStdlib(interp)
 
-		// Load stdlib generic source.
+		// Load stdlib generic source. LeetBuild: executed, not only compiled: Compile builds
+		// the CFG but generates no exec closures, so a non-generic function of these sources
+		// (maps.clone, called by maps.Clone) ran no code and returned the zero value ("interface
+		// conversion: interface {} is nil"). Generic functions are instantiated, and generated,
+		// with their caller.
 		for _, s := range gen.Sources {
-			if _, err := interp.Compile(s); err != nil {
+			p, err := interp.Compile(s)
+			if err != nil {
+				return err
+			}
+			if _, err := interp.Execute(p); err != nil {
 				return err
 			}
 		}

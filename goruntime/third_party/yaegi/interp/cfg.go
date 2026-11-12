@@ -1013,9 +1013,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// by constOp and available in n.rval. Nothing else to do at execution.
 				n.gen = nop
 				n.findex = notInFrame
-			case n.anc.kind == assignStmt && n.anc.action == aAssign && n.anc.nleft == 1:
+			case n.anc.kind == assignStmt && n.anc.action == aAssign && n.anc.nleft == 1 && !isInterface(n.anc.child[childPos(n)-n.anc.nright].typ):
 				// To avoid a copy in frame, if the result is to be assigned, store it directly
-				// at the frame location of destination.
+				// at the frame location of destination. LeetBuild: not into an interface (any,
+				// a map[string]any entry), which the operator cannot set (`m[k] = m[k] == "true"`
+				// panicked in SetBool): the assignment converts the result, as for unaryExpr.
 				dest := n.anc.child[childPos(n)-n.anc.nright]
 				n.typ = dest.typ
 				n.findex = dest.findex
@@ -1828,9 +1830,9 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			n.child[1].tnext = n
 			n.typ = n.child[0].typ
 			n.findex = sc.add(n.typ)
-			if n.start.action == aNop {
-				n.start.gen = branch
-			}
+			// LeetBuild: setFNext makes the left operand the branch. Its start, the first step
+			// computing it, is not made one too: that step is not the condition (the first field
+			// of `s == T{A: 1} && ok` was read as the bool, "reflect: call of reflect.Value.Bool").
 
 		case lorExpr:
 			if isBlank(n.child[0]) || isBlank(n.child[1]) {
@@ -1843,9 +1845,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			n.child[1].tnext = n
 			n.typ = n.child[0].typ
 			n.findex = sc.add(n.typ)
-			if n.start.action == aNop {
-				n.start.gen = branch
-			}
+			// LeetBuild: as in landExpr, only the left operand branches, not its first step.
 
 		case parenExpr:
 			wireChild(n)

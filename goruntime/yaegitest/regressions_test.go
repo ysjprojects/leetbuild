@@ -3,6 +3,7 @@ package yaegitest
 import (
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"testing"
 )
 
@@ -957,4 +958,246 @@ func Run() string {
 	rand.Shuffle(len(p), func(i, j int) { p[i], p[j] = p[j], p[i] })
 	return fmt.Sprint(same, n >= 0 && n < 10, len(p))
 }`, "true true 4")
+}
+
+// == and != on comparable structs (value fields, nested structs, arrays, pointer fields, values from
+// a map or a slice) as the left operand of && or ||, in a harness file and in another package. The
+// first step computing the left operand was also made the branch, so with a keyed literal
+// (`got == T{A: 1} && ok`) its first field was read as the condition: "reflect: call of
+// reflect.Value.Bool on string Value".
+func TestStructEqualityInConditions(t *testing.T) {
+	i, err := Compile(map[string]string{
+		"src/refund/refund.go": `package refund
+
+type Claim struct {
+	Accepted       bool
+	RefundedMinor  int64
+	RemainingMinor int64
+}
+
+func Same(a Claim, refunded int64) bool {
+	if a == (Claim{Accepted: true, RefundedMinor: refunded, RemainingMinor: 10000 - refunded}) && refunded > 0 {
+		return true
+	}
+	return false
+}
+`,
+		"src/main/main.go": `package main
+
+import "refund/refund"
+
+func claim(n int64) refund.Claim {
+	return refund.Claim{Accepted: true, RefundedMinor: n, RemainingMinor: 10000 - n}
+}
+`,
+		"src/main/harness_test.go": `package main
+
+import (
+	"fmt"
+
+	"refund/refund"
+)
+
+type inner struct {
+	Name string
+	Dims [2]int
+}
+
+type outer struct {
+	In    inner
+	Owner *int
+	Tags  [2]string
+}
+
+type checker struct{ failed []string }
+
+func (c *checker) Assert(cond bool, format string, args ...any) {
+	if !cond {
+		c.failed = append(c.failed, fmt.Sprintf(format, args...))
+	}
+}
+
+func Run() string {
+	c := &checker{}
+	again, total := claim(3000), 3000
+	c.Assert(again == refund.Claim{Accepted: true, RefundedMinor: 3000, RemainingMinor: 7000} && total == 3000, "and %+v", again)
+	c.Assert(again != refund.Claim{Accepted: true, RefundedMinor: 1} || total == 0, "or %+v", again)
+	c.Assert(!(again == refund.Claim{Accepted: false} && total == 3000), "not")
+	x, y := 1, 1
+	o := outer{In: inner{"a", [2]int{1, 2}}, Owner: &x, Tags: [2]string{"p", "q"}}
+	same := o == outer{In: inner{Name: "a", Dims: [2]int{1, 2}}, Owner: &x, Tags: [2]string{"p", "q"}} && o.In == inner{Name: "a", Dims: [2]int{1, 2}}
+	other := o == outer{In: inner{Name: "a", Dims: [2]int{1, 2}}, Owner: &y, Tags: [2]string{"p", "q"}} || o.Tags != [2]string{"p", "q"}
+	m := map[string]refund.Claim{"a": claim(1)}
+	s := []refund.Claim{claim(1), claim(2)}
+	fromMap := m["a"] == refund.Claim{Accepted: true, RefundedMinor: 1, RemainingMinor: 9999} && m["a"] == s[0] && m["a"] != s[1]
+	missing := m["z"] == refund.Claim{} && true
+	branch := "no"
+	if (again == refund.Claim{Accepted: true, RefundedMinor: 3000, RemainingMinor: 7000}) && o != (outer{}) {
+		branch = "yes"
+	}
+	return fmt.Sprint(c.failed, same, other, fromMap, missing, branch, refund.Same(again, 3000), refund.Same(again, 1))
+}
+`,
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	f, err := i.Func("Run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.Call(nil)[0].String(), "[] true false true trueyestrue false"; got != want {
+		t.Errorf("Run() = %q, want %q", got, want)
+	}
+}
+
+// maps.Clone of a map a function returns, a nil map, a map variable, other map types; the clone is
+// a map of its own. The generic sources were compiled without generating code, so maps.clone,
+// which Clone called, returned nil ("interface conversion: interface {} is nil, not
+// map[string]interface {}"), and it returned m itself rather than a copy.
+func TestMapsClone(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+)
+
+func fields(n int) map[string]any {
+	if n == 0 {
+		return nil
+	}
+	return map[string]any{"status": "in_transit", "n": n}
+}
+
+func labels() map[string]string { return map[string]string{"a": "1"} }
+
+func Run() string {
+	c := maps.Clone(fields(2))
+	c["extra"] = true
+	none := maps.Clone(fields(0))
+	v := fields(3)
+	vc := maps.Clone(v)
+	vc["n"] = 9
+	l := maps.Clone(labels())
+	l["b"] = "2"
+	counts := map[int]int{1: 2}
+	cc := maps.Clone(counts)
+	cc[1]++
+	dst := map[string]any{"x": 1}
+	maps.Copy(dst, fields(4))
+	s0 := []string{"q", "r"}
+	s := slices.Clone(s0)
+	s[0] = "z"
+	return fmt.Sprint(len(c), c["n"], none == nil, v["n"], vc["n"], l, counts[1], cc[1], len(dst), dst["n"], s0, s)
+}`, "3 2 true 3 9 map[a:1 b:2] 2 3 3 4 [q r] [z r]")
+}
+
+// Exported generic functions and types in package main (a step file's helpers): the package's
+// symbols are still exported, without the generic functions, which have no value until
+// instantiated. Wrapping them panicked in reflect.MakeFunc, so the host could look up no Check.
+func TestExportedGenerics(t *testing.T) {
+	i, err := Compile(map[string]string{
+		"src/util/util.go": `package util
+
+func Keys[K comparable, V any](m map[K]V) int { return len(m) }
+`,
+		"src/main/main.go": `package main
+
+import (
+	"fmt"
+	"strings"
+
+	"util/util"
+)
+
+type Number interface{ ~int | ~float64 }
+
+type Box[T any] struct{ V T }
+
+func (b Box[T]) Get() T { return b.V }
+
+func Map[T, U any](xs []T, f func(T) U) []U {
+	out := make([]U, 0, len(xs))
+	for _, x := range xs {
+		out = append(out, f(x))
+	}
+	return out
+}
+
+func Sum[N Number](xs []N) N {
+	var s N
+	for _, x := range xs {
+		s += x
+	}
+	return s
+}
+
+func Run() string {
+	doubled := Map([]int{1, 2}, func(i int) string { return fmt.Sprint(i * 2) })
+	return fmt.Sprintf("%s %v %s %d", strings.Join(doubled, ","), Sum([]float64{1.5, 2}), Box[string]{"b"}.Get(), util.Keys(map[string]int{"a": 1}))
+}
+`,
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	f, err := i.Func("Run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.Call(nil)[0].String(), "2,4 3.5 b 1"; got != want {
+		t.Errorf("Run() = %q, want %q", got, want)
+	}
+	exports := i.Symbols("main")["main"]
+	if _, ok := exports["Run"]; !ok {
+		t.Errorf("main does not export Run")
+	}
+	for name := range exports {
+		if name == "Map" || name == "Sum" || name == "Box" || strings.Contains(name, "[") {
+			t.Errorf("main exports the generic %s", name)
+		}
+	}
+}
+
+// A comparison, or another binary operator, assigned into an interface destination: a map[string]any
+// entry, a []any element, a struct field or a variable of type any, with interface or typed
+// operands. The result was stored in place, where the operator could not set an interface
+// (`attributes["organic"] = attributes["organic"] == "true"` panicked in SetBool).
+func TestBinaryOperatorIntoInterface(t *testing.T) {
+	expect(t, `package main
+
+import "fmt"
+
+type rec struct{ V any }
+
+func Run() string {
+	attributes := map[string]any{"organic": "true", "vegan": "no", "n": 3}
+	attributes["organic"] = attributes["organic"] == "true"
+	attributes["vegan"] = attributes["vegan"] == "true"
+	attributes["big"] = attributes["n"] != 3
+	x, y := 2, 3
+	m := map[string]any{}
+	m["eq"] = x == y
+	m["lt"] = x < y
+	m["sum"] = x + y
+	m["cat"] = "a" + fmt.Sprint(x)
+	var a, b any = "q", "q"
+	v := a == b
+	s := []any{nil, nil, nil}
+	s[0] = a == b
+	s[1] = x != y
+	s[2] = x * y
+	r := rec{}
+	r.V = attributes["organic"] == true
+	mb := map[string]bool{}
+	mb["k"] = a != b
+	var w any
+	w = x >= y
+	var f float64
+	f = float64(x) / 2
+	return fmt.Sprint(attributes, m, v, s, r.V, mb, w, f)
+}
+`, "map[big:false n:3 organic:true vegan:false] map[cat:a2 eq:false lt:true sum:5] true [true true 6] true map[k:false] false 1")
 }
