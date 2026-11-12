@@ -117,6 +117,8 @@ func (c *Conn) Close() error {
 }
 
 // Deadlines are the virtual clock's business (contexts), not the connection's: they are ignored.
+// go-redis sets a blocking command's read deadline in real time (its timeout plus ReadTimeout),
+// which a long block in virtual time would otherwise trip.
 func (c *Conn) SetDeadline(time.Time) error      { return nil }
 func (c *Conn) SetReadDeadline(time.Time) error  { return nil }
 func (c *Conn) SetWriteDeadline(time.Time) error { return nil }
@@ -128,23 +130,34 @@ type addr string
 func (a addr) Network() string { return "tcp" }
 func (a addr) String() string  { return string(a) }
 
-// trip runs one round trip and returns a reply per command written.
+// trip runs one round trip and returns a reply per command written. Outside MULTI, a command that
+// may block (isBlocking) waits for its answer, and holds the commands after it until then.
 func (c *Conn) trip(batch [][][]byte) []world.Reply {
 	replies := make([]world.Reply, 0, len(batch))
 	var run [][][]byte // consecutive ordinary commands: one pipeline
+	blocking := false  // whether run holds a command that may block
 	flush := func() {
-		if len(run) == 0 {
+		switch {
+		case len(run) == 0:
 			return
-		}
-		if len(run) == 1 {
+		case len(run) == 1 && blocking:
+			r, err := c.server.ExecuteBlocking(run[0], true)
+			replies = append(replies, replyOrError(r, err))
+		case len(run) == 1:
 			r, err := c.server.Execute(run[0], true)
 			replies = append(replies, replyOrError(r, err))
-		} else {
-			for _, res := range c.server.Pipeline(run) {
+		default:
+			var results []world.Result
+			if blocking {
+				results = c.server.PipelineBlocking(run)
+			} else {
+				results = c.server.Pipeline(run)
+			}
+			for _, res := range results {
 				replies = append(replies, replyOrError(res.Reply, res.Err))
 			}
 		}
-		run = nil
+		run, blocking = nil, false
 	}
 	for i := 0; i < len(batch); i++ {
 		cmd := batch[i]
@@ -169,6 +182,7 @@ func (c *Conn) trip(batch [][][]byte) []world.Reply {
 			continue
 		}
 		run = append(run, cmd)
+		blocking = blocking || isBlocking(cmd)
 	}
 	flush()
 	return replies
@@ -304,6 +318,30 @@ func (c *Conn) unsubscribe(pattern bool, names [][]byte) world.Reply {
 		out = append(out, []world.Reply{[]byte(kind), nil, int64(len(c.subs))})
 	}
 	return out
+}
+
+// isBlocking is the server's isBlocking (src/lib/runtime/ts/redis.ts): the list pops that block,
+// and XREAD/XREADGROUP with BLOCK among the options before STREAMS, read as the server reads them.
+func isBlocking(cmd [][]byte) bool {
+	switch strings.ToUpper(string(cmd[0])) {
+	case "BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH":
+		return true
+	case "XREAD", "XREADGROUP":
+		for i := 1; i < len(cmd); i++ {
+			more := len(cmd) - 1 - i
+			switch opt := strings.ToUpper(string(cmd[i])); {
+			case opt == "BLOCK" && more > 0:
+				return true
+			case opt == "COUNT" && more > 0:
+				i++
+			case opt == "GROUP" && more >= 2:
+				i += 2
+			case opt != "NOACK":
+				return false
+			}
+		}
+	}
+	return false
 }
 
 func isAny(name []byte, names ...string) bool {

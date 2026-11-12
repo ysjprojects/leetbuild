@@ -1,6 +1,7 @@
 // The redis-plus-plus model's compiled half (cppruntime/include/sw/redis++/redis++.h).
 #include <sw/redis++/redis++.h>
 
+#include <cctype>
 #include <cstdio>
 #include <limits>
 
@@ -77,9 +78,33 @@ lb::Json to_json(const std::vector<std::string>& args) {
   return list;
 }
 
+// As the server's isBlocking (src/lib/runtime/ts/redis.ts) decides, reading XREAD's options as
+// xreadCommand does, up to STREAMS.
+bool blocking(const std::vector<std::string>& args) {
+  if (args.empty()) return false;
+  const auto upper = [](const std::string& s) {
+    std::string out;
+    for (const char ch : s) out += static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return out;
+  };
+  const std::string name = upper(args[0]);
+  if (name == "BLPOP" || name == "BRPOP" || name == "BLMOVE" || name == "BRPOPLPUSH") return true;
+  if (name != "XREAD" && name != "XREADGROUP") return false;
+  for (size_t i = 1; i < args.size(); i++) {
+    const std::string opt = upper(args[i]);
+    const size_t more = args.size() - 1 - i;
+    if (opt == "BLOCK" && more > 0) return true;
+    if (opt == "COUNT" && more > 0) i += 1;
+    else if (opt == "GROUP" && more >= 2) i += 2;
+    else if (opt != "NOACK") return false;
+  }
+  return false;
+}
+
 lb::Json execute(const std::vector<std::string>& args) {
-  const lb::Json reply = from_bridge(
-      lb::call("redis.execute", lb::Json(std::map<std::string, lb::Json>{{"args", to_json(args)}, {"record", true}})));
+  const lb::Json request(std::map<std::string, lb::Json>{{"args", to_json(args)}, {"record", true}});
+  const lb::Json reply = from_bridge(blocking(args) ? lb::call_async("redis.executeBlocking", request)
+                                                    : lb::call("redis.execute", request));
   if (reply.has("e")) throw ReplyError(reply["e"].as_string());
   return reply["r"];
 }
@@ -117,9 +142,16 @@ std::string unit(GeoUnit u) {
 
 QueuedReplies send_queued(const char* op, std::vector<std::vector<std::string>>& queued) {
   lb::Json cmds = lb::Json::array();
-  for (const auto& c : queued) cmds.push(to_json(c));
+  bool waits = false;
+  for (const auto& c : queued) {
+    cmds.push(to_json(c));
+    waits = waits || blocking(c);
+  }
   queued.clear();
-  const lb::Json tagged = from_bridge(lb::call(op, cmds));
+  // A pipeline holding a blocking command waits for it (a transaction's never block, as in MULTI).
+  const lb::Json tagged = from_bridge(waits && std::string_view(op) == "redis.pipeline"
+                                          ? lb::call_async("redis.executePipelineBlocking", cmds)
+                                          : lb::call(op, cmds));
   std::vector<lb::Json> replies;
   std::vector<std::string> errors;
   for (const auto& t : tagged.items()) {

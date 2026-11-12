@@ -49,11 +49,13 @@ interface GoCheckResult {
 
 type Tagged = {r: redis.Reply} | {e: string};
 
+const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
 const tagged = (run: () => redis.Reply): Tagged => {
   try {
     return {r: run()};
   } catch (e) {
-    return {e: e instanceof Error ? e.message : String(e)};
+    return {e: errorMessage(e)};
   }
 };
 
@@ -126,6 +128,25 @@ const makeBridge = (alive: () => boolean): {bridge: object; disable: () => Promi
     redis: {
       execute: (args: string[], record: boolean): Tagged => tagged(() => redis.SERVER.execute(args, record)),
       pipeline: (cmds: string[][]): Tagged[] => each(redis.SERVER.executePipeline(cmds)),
+      /**
+       * A command that may block (BLPOP, XREAD … BLOCK), and a pipeline holding one: `fn` gets the
+       * answer once another client's write or the timeout settles it. Not `tracked`: a blocked client
+       * waits on the world, as a sleeping goroutine does, so settling and ticks do not wait for it.
+       */
+      executeBlocking: (args: string[], record: boolean, fn: (result: Tagged) => void): void => {
+        const done = into(fn);
+        redis.SERVER.executeBlocking(args, record).then(
+          r => done({r}),
+          (e: unknown) => done({e: errorMessage(e)}),
+        );
+      },
+      pipelineBlocking: (cmds: string[][], fn: (results: Tagged[]) => void): void => {
+        const done = into(fn);
+        redis.SERVER.executePipelineBlocking(cmds).then(
+          replies => done(each(replies)),
+          (e: unknown) => done(cmds.map(() => ({e: errorMessage(e)}))),
+        );
+      },
       transaction: (cmds: string[][]): Tagged[] => each(redis.SERVER.executeTransaction(cmds)),
       fingerprint: (key: string): string => redis.SERVER.fingerprint(key),
       probe: (key: string, fn: () => void): void => {

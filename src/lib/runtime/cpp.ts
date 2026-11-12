@@ -686,6 +686,8 @@ class Instance {
         if (handler === undefined) throw new Error(`the C++ runtime has no call ${op}`);
         const self = this.current;
         const reply = await handler(body as never);
+        // A callback the call ran that blocked (a probe after a command that answered at once): the reply waits for it.
+        await Promise.all(self.awaiting.splice(0));
         this.current = self;
         return this.setReply(reply);
       }),

@@ -3,7 +3,9 @@
 // checks share, with Lua scripting — instead of a socket. Each command is one round trip the
 // harness counts; a pipeline or a transaction is one. Replies parse into the types redis++ returns
 // (OptionalString, long long, double, bool, containers through output iterators, ReplyUPtr — a
-// hiredis redisReply — from the generic command()).
+// hiredis redisReply — from the generic command()). A blocking command (blpop, brpop, blmove,
+// brpoplpush, xread and xreadgroup with a timeout, or one sent through command()) waits on the
+// server, in virtual time, for another client's write; a pipeline holding one waits with it.
 //
 // Beyond the real API, a few forms course code reaches for are accepted too, each doing what its
 // call site plainly means: commands that take an output iterator also return their result
@@ -89,7 +91,9 @@ enum class UpdateType { EXIST, NOT_EXIST, ALWAYS, GREATER, LESS };
 enum class BoundType { CLOSED, OPEN, LEFT_OPEN, RIGHT_OPEN };
 enum class GeoUnit { M, KM, MI, FT };
 enum class InsertPosition { BEFORE, AFTER };
+enum class ListWhence { LEFT, RIGHT };
 enum class Aggregation { SUM, MIN, MAX };
+enum class XtrimStrategy { MAXLEN, MINID };
 enum class ConnectionType { TCP = 0, UNIX };
 
 struct ConnectionOptions {
@@ -500,11 +504,72 @@ lb::Json from_bridge(const lb::Json& v);
 
 lb::Json to_json(const std::vector<std::string>& args);
 
+// Whether a command may wait on the server for another client's write (BLPOP, BRPOP, BLMOVE,
+// BRPOPLPUSH, XREAD and XREADGROUP with BLOCK): it goes through redis.executeBlocking, the calling
+// thread waiting on the virtual clock until the server answers.
+bool blocking(const std::vector<std::string>& args);
+
 // One command on the runtime's server: its reply, or a ReplyError with Redis's message.
 lb::Json execute(const std::vector<std::string>& args);
 
 std::string update_flag(UpdateType type);
 std::string unit(GeoUnit u);
+inline const char* whence(ListWhence w) { return w == ListWhence::LEFT ? "LEFT" : "RIGHT"; }
+
+// ZINTERSTORE/ZUNIONSTORE destination numkeys key … [WEIGHTS w …] AGGREGATE type: keys, or (key,
+// weight) pairs, as redis++ takes them.
+template <class Input>
+std::vector<std::string> zstore(const char* name, const StringView& destination, Input first, Input last,
+                                Aggregation type) {
+  std::vector<std::string> args{name, std::string(destination), std::to_string(std::distance(first, last))};
+  if constexpr (reply::is_pair<std::remove_cvref_t<decltype(*first)>>::value) {
+    for (auto it = first; it != last; ++it) add(args, it->first);
+    args.push_back("WEIGHTS");
+    for (auto it = first; it != last; ++it) args.push_back(number(it->second));
+  } else {
+    for (auto it = first; it != last; ++it) add(args, *it);
+  }
+  args.push_back("AGGREGATE");
+  args.push_back(type == Aggregation::MIN ? "MIN" : type == Aggregation::MAX ? "MAX" : "SUM");
+  return args;
+}
+
+// XTRIM key MAXLEN|MINID [~] threshold [LIMIT limit].
+inline std::vector<std::string> xtrim(const StringView& key, const std::string& threshold, bool approx,
+                                      XtrimStrategy strategy, std::optional<long long> limit = std::nullopt) {
+  std::vector<std::string> args = cmd("XTRIM", key, strategy == XtrimStrategy::MINID ? "MINID" : "MAXLEN");
+  if (approx) args.push_back("~");
+  args.push_back(threshold);
+  if (limit) args.insert(args.end(), {"LIMIT", std::to_string(*limit)});
+  return args;
+}
+
+// XREAD COUNT n [BLOCK ms], and XREADGROUP GROUP group consumer COUNT n [BLOCK ms] [NOACK], as redis++
+// sends them (COUNT 0: no limit).
+inline std::vector<std::string> xread(long long count, std::optional<long long> block) {
+  std::vector<std::string> args = cmd("XREAD", "COUNT", count);
+  if (block) args.insert(args.end(), {"BLOCK", std::to_string(*block)});
+  return args;
+}
+inline std::vector<std::string> xreadgroup(const StringView& group, const StringView& consumer, long long count,
+                                           std::optional<long long> block, bool noack) {
+  std::vector<std::string> args = cmd("XREADGROUP", "GROUP", group, consumer, "COUNT", count);
+  if (block) args.insert(args.end(), {"BLOCK", std::to_string(*block)});
+  if (noack) args.push_back("NOACK");
+  return args;
+}
+// STREAMS key … id …, from (key, id) pairs.
+template <class Input>
+std::vector<std::string> streams(std::vector<std::string> args, Input first, Input last) {
+  args.push_back("STREAMS");
+  for (auto it = first; it != last; ++it) add(args, it->first);
+  for (auto it = first; it != last; ++it) add(args, it->second);
+  return args;
+}
+inline std::vector<std::string> streams(std::vector<std::string> args, const StringView& key, const StringView& id) {
+  args.insert(args.end(), {"STREAMS", std::string(key), std::string(id)});
+  return args;
+}
 
 // What a script returned when the caller named no Result: converts to what it is read as,
 // compares with numbers and strings, and like an optional, tests for nil and dereferences.
@@ -726,6 +791,14 @@ class Commands {
     return run<bool>(detail::cmd("RENAMENX", key, newkey));
   }
   Ret<long long> touch(const StringView& key) { return run<long long>(detail::cmd("TOUCH", key)); }
+  template <detail::iterator Input>
+  Ret<long long> touch(Input first, Input last) {
+    return run<long long>(detail::join({"TOUCH"}, detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<long long> touch(std::initializer_list<T> il) {
+    return touch(il.begin(), il.end());
+  }
 
   // ---- strings
   Ret<OptionalString> get(const StringView& key) { return run<OptionalString>(detail::cmd("GET", key)); }
@@ -818,6 +891,16 @@ class Commands {
   template <detail::iterator Input>
   Ret<bool> msetnx(Input first, Input last) {
     return run<bool>(detail::join({"MSETNX"}, detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<bool> msetnx(std::initializer_list<T> il) {
+    return msetnx(il.begin(), il.end());
+  }
+  Ret<long long> bitcount(const StringView& key, long long start = 0, long long end = -1) {
+    return run<long long>(detail::cmd("BITCOUNT", key, start, end));
+  }
+  Ret<long long> getbit(const StringView& key, long long offset) {
+    return run<long long>(detail::cmd("GETBIT", key, offset));
   }
 
   // ---- hashes
@@ -947,6 +1030,45 @@ class Commands {
     return run<void>(detail::cmd("LSET", key, index, val));
   }
 
+  // Blocking pops: (key, element), or nullopt once the timeout (seconds; 0: none) passes with every
+  // list empty. A Redis waits on the server (the virtual clock) for another client's push.
+#define LB_REDIS_BLOCKING_POP(NAME, CMD)                                                                        \
+  Ret<OptionalStringPair> NAME(const StringView& key, long long timeout) {                                      \
+    return run<OptionalStringPair>(detail::cmd(CMD, key, timeout));                                             \
+  }                                                                                                             \
+  Ret<OptionalStringPair> NAME(const StringView& key, const std::chrono::seconds& timeout = std::chrono::seconds{0}) { \
+    return NAME(key, static_cast<long long>(timeout.count()));                                                  \
+  }                                                                                                             \
+  template <detail::iterator Input>                                                                             \
+  Ret<OptionalStringPair> NAME(Input first, Input last, long long timeout) {                                    \
+    return run<OptionalStringPair>(detail::join(detail::join({CMD}, detail::range_args(first, last)),           \
+                                                {std::to_string(timeout)}));                                    \
+  }                                                                                                             \
+  template <class T>                                                                                            \
+  Ret<OptionalStringPair> NAME(std::initializer_list<T> il, long long timeout) {                                \
+    return NAME(il.begin(), il.end(), timeout);                                                                 \
+  }                                                                                                             \
+  template <detail::iterator Input>                                                                             \
+  Ret<OptionalStringPair> NAME(Input first, Input last, const std::chrono::seconds& timeout = std::chrono::seconds{0}) { \
+    return NAME(first, last, static_cast<long long>(timeout.count()));                                          \
+  }                                                                                                             \
+  template <class T>                                                                                            \
+  Ret<OptionalStringPair> NAME(std::initializer_list<T> il,                                                     \
+                               const std::chrono::seconds& timeout = std::chrono::seconds{0}) {                 \
+    return NAME(il.begin(), il.end(), timeout);                                                                 \
+  }
+
+  LB_REDIS_BLOCKING_POP(blpop, "BLPOP")
+  LB_REDIS_BLOCKING_POP(brpop, "BRPOP")
+#undef LB_REDIS_BLOCKING_POP
+  Ret<OptionalString> brpoplpush(const StringView& source, const StringView& destination, long long timeout) {
+    return run<OptionalString>(detail::cmd("BRPOPLPUSH", source, destination, timeout));
+  }
+  Ret<OptionalString> brpoplpush(const StringView& source, const StringView& destination,
+                                 const std::chrono::seconds& timeout = std::chrono::seconds{0}) {
+    return brpoplpush(source, destination, static_cast<long long>(timeout.count()));
+  }
+
   // ---- sets
   Ret<long long> sadd(const StringView& key, const StringView& member) {
     return run<long long>(detail::cmd("SADD", key, member));
@@ -981,6 +1103,24 @@ class Commands {
   Ret<bool> smove(const StringView& source, const StringView& destination, const StringView& member) {
     return run<bool>(detail::cmd("SMOVE", source, destination, member));
   }
+
+#define LB_REDIS_SET_STORE(NAME, CMD)                                                                  \
+  Ret<long long> NAME(const StringView& destination, const StringView& key) {                          \
+    return run<long long>(detail::cmd(CMD, destination, key));                                         \
+  }                                                                                                    \
+  template <detail::iterator Input>                                                                    \
+  Ret<long long> NAME(const StringView& destination, Input first, Input last) {                        \
+    return run<long long>(detail::join(detail::cmd(CMD, destination), detail::range_args(first, last))); \
+  }                                                                                                    \
+  template <class T>                                                                                   \
+  Ret<long long> NAME(const StringView& destination, std::initializer_list<T> il) {                    \
+    return NAME(destination, il.begin(), il.end());                                                    \
+  }
+
+  LB_REDIS_SET_STORE(sdiffstore, "SDIFFSTORE")
+  LB_REDIS_SET_STORE(sinterstore, "SINTERSTORE")
+  LB_REDIS_SET_STORE(sunionstore, "SUNIONSTORE")
+#undef LB_REDIS_SET_STORE
 
   // ---- sorted sets
   Ret<long long> zadd(const StringView& key, const StringView& member, double score,
@@ -1065,6 +1205,35 @@ class Commands {
     return run<std::optional<std::pair<std::string, double>>>(detail::cmd("ZPOPMAX", key));
   }
 
+  // ZINTERSTORE and ZUNIONSTORE: one key with its weight; keys (each weight 1); or (key, weight)
+  // pairs, WEIGHTS then, as in redis++. A plain set's members count with score 1.
+  Ret<long long> zinterstore(const StringView& destination, const StringView& key, double weight) {
+    return run<long long>(detail::cmd("ZINTERSTORE", destination, 1, key, "WEIGHTS", weight));
+  }
+  template <detail::iterator Input>
+  Ret<long long> zinterstore(const StringView& destination, Input first, Input last,
+                             Aggregation type = Aggregation::SUM) {
+    return run<long long>(detail::zstore("ZINTERSTORE", destination, first, last, type));
+  }
+  template <class T>
+  Ret<long long> zinterstore(const StringView& destination, std::initializer_list<T> il,
+                             Aggregation type = Aggregation::SUM) {
+    return zinterstore(destination, il.begin(), il.end(), type);
+  }
+  Ret<long long> zunionstore(const StringView& destination, const StringView& key, double weight) {
+    return run<long long>(detail::cmd("ZUNIONSTORE", destination, 1, key, "WEIGHTS", weight));
+  }
+  template <detail::iterator Input>
+  Ret<long long> zunionstore(const StringView& destination, Input first, Input last,
+                             Aggregation type = Aggregation::SUM) {
+    return run<long long>(detail::zstore("ZUNIONSTORE", destination, first, last, type));
+  }
+  template <class T>
+  Ret<long long> zunionstore(const StringView& destination, std::initializer_list<T> il,
+                             Aggregation type = Aggregation::SUM) {
+    return zunionstore(destination, il.begin(), il.end(), type);
+  }
+
   // ---- HyperLogLog
   Ret<bool> pfadd(const StringView& key, const StringView& element) {
     return run<bool>(detail::cmd("PFADD", key, element));
@@ -1085,6 +1254,17 @@ class Commands {
   template <class T>
   Ret<long long> pfcount(std::initializer_list<T> il) {
     return pfcount(il.begin(), il.end());
+  }
+  Ret<void> pfmerge(const StringView& destination, const StringView& key) {
+    return run<void>(detail::cmd("PFMERGE", destination, key));
+  }
+  template <detail::iterator Input>
+  Ret<void> pfmerge(const StringView& destination, Input first, Input last) {
+    return run<void>(detail::join(detail::cmd("PFMERGE", destination), detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<void> pfmerge(const StringView& destination, std::initializer_list<T> il) {
+    return pfmerge(destination, il.begin(), il.end());
   }
 
   // ---- geo
@@ -1109,6 +1289,74 @@ class Commands {
   Ret<OptionalDouble> geodist(const StringView& key, const StringView& a, const StringView& b,
                               GeoUnit unit = GeoUnit::M) {
     return run<OptionalDouble>(detail::cmd("GEODIST", key, a, b, detail::unit(unit)));
+  }
+
+  // ---- streams. Entries read as redis++'s Item, std::pair<std::string, Optional<Attrs>> with Attrs
+  // a container of (field, value) pairs; XAUTOCLAIM and XINFO, which redis++ has no method for,
+  // through command().
+  Ret<long long> xack(const StringView& key, const StringView& group, const StringView& id) {
+    return run<long long>(detail::cmd("XACK", key, group, id));
+  }
+  template <detail::iterator Input>
+  Ret<long long> xack(const StringView& key, const StringView& group, Input first, Input last) {
+    return run<long long>(detail::join(detail::cmd("XACK", key, group), detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<long long> xack(const StringView& key, const StringView& group, std::initializer_list<T> il) {
+    return xack(key, group, il.begin(), il.end());
+  }
+  // XADD key id field value …: the entry's id.
+  template <detail::iterator Input>
+  Ret<std::string> xadd(const StringView& key, const StringView& id, Input first, Input last) {
+    return run<std::string>(detail::join(detail::cmd("XADD", key, id), detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<std::string> xadd(const StringView& key, const StringView& id, std::initializer_list<T> il) {
+    return xadd(key, id, il.begin(), il.end());
+  }
+  // XADD key MAXLEN [~] count id field value ….
+  template <detail::iterator Input>
+  Ret<std::string> xadd(const StringView& key, const StringView& id, Input first, Input last, long long count,
+                        bool approx = true) {
+    std::vector<std::string> args = detail::cmd("XADD", key, "MAXLEN");
+    if (approx) args.push_back("~");
+    args.push_back(std::to_string(count));
+    args.emplace_back(id);
+    return run<std::string>(detail::join(std::move(args), detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<std::string> xadd(const StringView& key, const StringView& id, std::initializer_list<T> il, long long count,
+                        bool approx = true) {
+    return xadd(key, id, il.begin(), il.end(), count, approx);
+  }
+  Ret<long long> xdel(const StringView& key, const StringView& id) { return run<long long>(detail::cmd("XDEL", key, id)); }
+  template <detail::iterator Input>
+  Ret<long long> xdel(const StringView& key, Input first, Input last) {
+    return run<long long>(detail::join(detail::cmd("XDEL", key), detail::range_args(first, last)));
+  }
+  template <class T>
+  Ret<long long> xdel(const StringView& key, std::initializer_list<T> il) {
+    return xdel(key, il.begin(), il.end());
+  }
+  Ret<void> xgroup_create(const StringView& key, const StringView& group, const StringView& id, bool mkstream = false) {
+    std::vector<std::string> args = detail::cmd("XGROUP", "CREATE", key, group, id);
+    if (mkstream) args.push_back("MKSTREAM");
+    return run<void>(std::move(args));
+  }
+  Ret<void> xgroup_setid(const StringView& key, const StringView& group, const StringView& id) {
+    return run<void>(detail::cmd("XGROUP", "SETID", key, group, id));
+  }
+  Ret<long long> xgroup_destroy(const StringView& key, const StringView& group) {
+    return run<long long>(detail::cmd("XGROUP", "DESTROY", key, group));
+  }
+  Ret<long long> xgroup_delconsumer(const StringView& key, const StringView& group, const StringView& consumer) {
+    return run<long long>(detail::cmd("XGROUP", "DELCONSUMER", key, group, consumer));
+  }
+  Ret<long long> xlen(const StringView& key) { return run<long long>(detail::cmd("XLEN", key)); }
+  // XTRIM key MAXLEN|MINID [~] threshold: how many entries went.
+  Ret<long long> xtrim(const StringView& key, long long threshold, bool approx = true,
+                       XtrimStrategy strategy = XtrimStrategy::MAXLEN) {
+    return run<long long>(detail::xtrim(key, std::to_string(threshold), approx, strategy));
   }
 
   // ---- pub/sub
@@ -1445,6 +1693,196 @@ class Redis : public Commands<Redis, Immediate> {
     return out;
   }
 
+  // LMOVE and BLMOVE (seconds; 0: no timeout): the element moved, or nullopt.
+  OptionalString lmove(const StringView& src, const StringView& dest, ListWhence src_whence, ListWhence dest_whence) {
+    return reply::parse<OptionalString>(
+        detail::execute(detail::cmd("LMOVE", src, dest, detail::whence(src_whence), detail::whence(dest_whence))));
+  }
+  OptionalString blmove(const StringView& src, const StringView& dest, ListWhence src_whence, ListWhence dest_whence,
+                        const std::chrono::seconds& timeout = std::chrono::seconds{0}) {
+    return reply::parse<OptionalString>(detail::execute(detail::cmd(
+        "BLMOVE", src, dest, detail::whence(src_whence), detail::whence(dest_whence), static_cast<long long>(timeout.count()))));
+  }
+
+  // ---- streams, with an output iterator as redis++ takes them. XREAD and XREADGROUP write
+  // (key, entries) pairs (an inserter into std::unordered_map<std::string, ItemStream>, …), nothing
+  // when the reply is nil; with a timeout (milliseconds; 0: none) they wait on the server.
+  using Base::xtrim;
+  long long xtrim(const StringView& key, long long threshold, XtrimStrategy strategy, long long limit) {
+    return reply::parse<long long>(detail::execute(detail::xtrim(key, std::to_string(threshold), true, strategy, limit)));
+  }
+  long long xtrim(const StringView& key, const StringView& threshold, bool approx = true,
+                  XtrimStrategy strategy = XtrimStrategy::MAXLEN) {
+    return reply::parse<long long>(detail::execute(detail::xtrim(key, std::string(threshold), approx, strategy)));
+  }
+  long long xtrim(const StringView& key, const StringView& threshold, XtrimStrategy strategy, long long limit) {
+    return reply::parse<long long>(detail::execute(detail::xtrim(key, std::string(threshold), true, strategy, limit)));
+  }
+  template <detail::output Output>
+  void xclaim(const StringView& key, const StringView& group, const StringView& consumer,
+              const std::chrono::milliseconds& min_idle_time, const StringView& id, Output output) {
+    reply::to_output(detail::execute(detail::cmd("XCLAIM", key, group, consumer,
+                                                 static_cast<long long>(min_idle_time.count()), id)),
+                     output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xclaim(const StringView& key, const StringView& group, const StringView& consumer,
+              const std::chrono::milliseconds& min_idle_time, Input first, Input last, Output output) {
+    reply::to_output(
+        detail::execute(detail::join(
+            detail::cmd("XCLAIM", key, group, consumer, static_cast<long long>(min_idle_time.count())),
+            detail::range_args(first, last))),
+        output);
+  }
+  template <class T, detail::output Output>
+  void xclaim(const StringView& key, const StringView& group, const StringView& consumer,
+              const std::chrono::milliseconds& min_idle_time, std::initializer_list<T> il, Output output) {
+    xclaim(key, group, consumer, min_idle_time, il.begin(), il.end(), output);
+  }
+  // XPENDING's summary: (pending count, smallest id, greatest id), each consumer's (name, count) to output.
+  template <detail::output Output>
+  std::tuple<long long, OptionalString, OptionalString> xpending(const StringView& key, const StringView& group,
+                                                                 Output output) {
+    const lb::Json r = detail::execute(detail::cmd("XPENDING", key, group));
+    if (!r.is_array() || r.size() != 4) throw ProtoError("expect array reply with 4 elements");
+    reply::to_output(r[3], output);
+    return {reply::parse<long long>(r[0]), reply::parse<OptionalString>(r[1]), reply::parse<OptionalString>(r[2])};
+  }
+  // The extended form: (id, consumer, idle ms, deliveries) per entry.
+  template <detail::output Output>
+  void xpending(const StringView& key, const StringView& group, const StringView& start, const StringView& end,
+                long long count, Output output) {
+    reply::to_output(detail::execute(detail::cmd("XPENDING", key, group, start, end, count)), output);
+  }
+  template <detail::output Output>
+  void xpending(const StringView& key, const StringView& group, const StringView& start, const StringView& end,
+                long long count, const StringView& consumer, Output output) {
+    reply::to_output(detail::execute(detail::cmd("XPENDING", key, group, start, end, count, consumer)), output);
+  }
+  template <detail::output Output>
+  void xrange(const StringView& key, const StringView& start, const StringView& end, Output output) {
+    reply::to_output(detail::execute(detail::cmd("XRANGE", key, start, end)), output);
+  }
+  template <detail::output Output>
+  void xrange(const StringView& key, const StringView& start, const StringView& end, long long count, Output output) {
+    reply::to_output(detail::execute(detail::cmd("XRANGE", key, start, end, "COUNT", count)), output);
+  }
+  template <detail::output Output>
+  void xrevrange(const StringView& key, const StringView& end, const StringView& start, Output output) {
+    reply::to_output(detail::execute(detail::cmd("XREVRANGE", key, end, start)), output);
+  }
+  template <detail::output Output>
+  void xrevrange(const StringView& key, const StringView& end, const StringView& start, long long count,
+                 Output output) {
+    reply::to_output(detail::execute(detail::cmd("XREVRANGE", key, end, start, "COUNT", count)), output);
+  }
+  template <detail::output Output>
+  void xread(const StringView& key, const StringView& id, long long count, Output output) {
+    reply::to_output(detail::execute(detail::streams(detail::xread(count, std::nullopt), key, id)), output);
+  }
+  template <detail::output Output>
+  void xread(const StringView& key, const StringView& id, Output output) {
+    xread(key, id, 0, output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xread(Input first, Input last, long long count, Output output) {
+    reply::to_output(detail::execute(detail::streams(detail::xread(count, std::nullopt), first, last)), output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xread(Input first, Input last, Output output) {
+    xread(first, last, 0, output);
+  }
+  template <detail::output Output>
+  void xread(const StringView& key, const StringView& id, const std::chrono::milliseconds& timeout, long long count,
+             Output output) {
+    reply::to_output(
+        detail::execute(detail::streams(detail::xread(count, static_cast<long long>(timeout.count())), key, id)),
+        output);
+  }
+  template <detail::output Output>
+  void xread(const StringView& key, const StringView& id, const std::chrono::milliseconds& timeout, Output output) {
+    xread(key, id, timeout, 0, output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xread(Input first, Input last, const std::chrono::milliseconds& timeout, long long count, Output output) {
+    reply::to_output(
+        detail::execute(detail::streams(detail::xread(count, static_cast<long long>(timeout.count())), first, last)),
+        output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xread(Input first, Input last, const std::chrono::milliseconds& timeout, Output output) {
+    xread(first, last, timeout, 0, output);
+  }
+  template <detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                  long long count, bool noack, Output output) {
+    reply::to_output(
+        detail::execute(detail::streams(detail::xreadgroup(group, consumer, count, std::nullopt, noack), key, id)),
+        output);
+  }
+  template <detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                  long long count, Output output) {
+    xreadgroup(group, consumer, key, id, count, false, output);
+  }
+  template <detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                  Output output) {
+    xreadgroup(group, consumer, key, id, 0, false, output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last, long long count,
+                  bool noack, Output output) {
+    reply::to_output(
+        detail::execute(detail::streams(detail::xreadgroup(group, consumer, count, std::nullopt, noack), first, last)),
+        output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last, long long count,
+                  Output output) {
+    xreadgroup(group, consumer, first, last, count, false, output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last, Output output) {
+    xreadgroup(group, consumer, first, last, 0, false, output);
+  }
+  template <detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                  const std::chrono::milliseconds& timeout, long long count, bool noack, Output output) {
+    reply::to_output(detail::execute(detail::streams(
+                         detail::xreadgroup(group, consumer, count, static_cast<long long>(timeout.count()), noack),
+                         key, id)),
+                     output);
+  }
+  template <detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                  const std::chrono::milliseconds& timeout, long long count, Output output) {
+    xreadgroup(group, consumer, key, id, timeout, count, false, output);
+  }
+  template <detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                  const std::chrono::milliseconds& timeout, Output output) {
+    xreadgroup(group, consumer, key, id, timeout, 0, false, output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last,
+                  const std::chrono::milliseconds& timeout, long long count, bool noack, Output output) {
+    reply::to_output(detail::execute(detail::streams(
+                         detail::xreadgroup(group, consumer, count, static_cast<long long>(timeout.count()), noack),
+                         first, last)),
+                     output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last,
+                  const std::chrono::milliseconds& timeout, long long count, Output output) {
+    xreadgroup(group, consumer, first, last, timeout, count, false, output);
+  }
+  template <detail::iterator Input, detail::output Output>
+  void xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last,
+                  const std::chrono::milliseconds& timeout, Output output) {
+    xreadgroup(group, consumer, first, last, timeout, 0, false, output);
+  }
+
   // ---- geo: GEORADIUS's WITHDIST/WITHHASH/WITHCOORD follow the output's element type, as in
   // redis++: std::string, or a tuple of the member and any of double (distance), long long
   // (geohash), std::pair<double, double> (longitude, latitude).
@@ -1739,6 +2177,34 @@ class Queued : public Commands<Self, Deferred<Self>> {
   Self& zpopmin(const StringView& key, long long count) { return dispatch<void>(detail::cmd("ZPOPMIN", key, count)); }
   Self& zpopmax(const StringView& key, long long count) { return dispatch<void>(detail::cmd("ZPOPMAX", key, count)); }
   Self& spop(const StringView& key, long long count) { return dispatch<void>(detail::cmd("SPOP", key, count)); }
+  using Commands<Self, Deferred<Self>>::srandmember;
+  Self& srandmember(const StringView& key, long long count) {
+    return dispatch<void>(detail::cmd("SRANDMEMBER", key, count));
+  }
+  template <detail::iterator Input>
+  Self& sdiff(Input first, Input last) {
+    return dispatch<void>(detail::join({"SDIFF"}, detail::range_args(first, last)));
+  }
+  template <class T>
+  Self& sdiff(std::initializer_list<T> il) {
+    return sdiff(il.begin(), il.end());
+  }
+  template <detail::iterator Input>
+  Self& sinter(Input first, Input last) {
+    return dispatch<void>(detail::join({"SINTER"}, detail::range_args(first, last)));
+  }
+  template <class T>
+  Self& sinter(std::initializer_list<T> il) {
+    return sinter(il.begin(), il.end());
+  }
+  template <detail::iterator Input>
+  Self& sunion(Input first, Input last) {
+    return dispatch<void>(detail::join({"SUNION"}, detail::range_args(first, last)));
+  }
+  template <class T>
+  Self& sunion(std::initializer_list<T> il) {
+    return sunion(il.begin(), il.end());
+  }
   Self& scan(long long cursor, const StringView& pattern = "*", long long count = 10) {
     return dispatch<void>(detail::cmd("SCAN", cursor, "MATCH", pattern, "COUNT", count));
   }
@@ -1775,6 +2241,125 @@ class Queued : public Commands<Self, Deferred<Self>> {
   template <class T>
   Self& geopos(const StringView& key, std::initializer_list<T> il) {
     return geopos(key, il.begin(), il.end());
+  }
+
+  // ---- streams: XCLAIM, XPENDING, XRANGE, XREAD, XREADGROUP and XREVRANGE as redis++ queues them.
+  Self& xclaim(const StringView& key, const StringView& group, const StringView& consumer,
+               const std::chrono::milliseconds& min_idle_time, const StringView& id) {
+    return dispatch<void>(
+        detail::cmd("XCLAIM", key, group, consumer, static_cast<long long>(min_idle_time.count()), id));
+  }
+  template <detail::iterator Input>
+  Self& xclaim(const StringView& key, const StringView& group, const StringView& consumer,
+               const std::chrono::milliseconds& min_idle_time, Input first, Input last) {
+    return dispatch<void>(
+        detail::join(detail::cmd("XCLAIM", key, group, consumer, static_cast<long long>(min_idle_time.count())),
+                     detail::range_args(first, last)));
+  }
+  template <class T>
+  Self& xclaim(const StringView& key, const StringView& group, const StringView& consumer,
+               const std::chrono::milliseconds& min_idle_time, std::initializer_list<T> il) {
+    return xclaim(key, group, consumer, min_idle_time, il.begin(), il.end());
+  }
+  Self& xpending(const StringView& key, const StringView& group) {
+    return dispatch<void>(detail::cmd("XPENDING", key, group));
+  }
+  Self& xpending(const StringView& key, const StringView& group, const StringView& start, const StringView& end,
+                 long long count) {
+    return dispatch<void>(detail::cmd("XPENDING", key, group, start, end, count));
+  }
+  Self& xpending(const StringView& key, const StringView& group, const StringView& start, const StringView& end,
+                 long long count, const StringView& consumer) {
+    return dispatch<void>(detail::cmd("XPENDING", key, group, start, end, count, consumer));
+  }
+  Self& xrange(const StringView& key, const StringView& start, const StringView& end) {
+    return dispatch<void>(detail::cmd("XRANGE", key, start, end));
+  }
+  Self& xrange(const StringView& key, const StringView& start, const StringView& end, long long count) {
+    return dispatch<void>(detail::cmd("XRANGE", key, start, end, "COUNT", count));
+  }
+  Self& xrevrange(const StringView& key, const StringView& end, const StringView& start) {
+    return dispatch<void>(detail::cmd("XREVRANGE", key, end, start));
+  }
+  Self& xrevrange(const StringView& key, const StringView& end, const StringView& start, long long count) {
+    return dispatch<void>(detail::cmd("XREVRANGE", key, end, start, "COUNT", count));
+  }
+  Self& xread(const StringView& key, const StringView& id, long long count) {
+    return dispatch<void>(detail::streams(detail::xread(count, std::nullopt), key, id));
+  }
+  Self& xread(const StringView& key, const StringView& id) { return xread(key, id, 0); }
+  template <detail::iterator Input>
+  Self& xread(Input first, Input last, long long count) {
+    return dispatch<void>(detail::streams(detail::xread(count, std::nullopt), first, last));
+  }
+  template <detail::iterator Input>
+  Self& xread(Input first, Input last) {
+    return xread(first, last, 0);
+  }
+  Self& xread(const StringView& key, const StringView& id, const std::chrono::milliseconds& timeout, long long count) {
+    return dispatch<void>(detail::streams(detail::xread(count, static_cast<long long>(timeout.count())), key, id));
+  }
+  Self& xread(const StringView& key, const StringView& id, const std::chrono::milliseconds& timeout) {
+    return xread(key, id, timeout, 0);
+  }
+  template <detail::iterator Input>
+  Self& xread(Input first, Input last, const std::chrono::milliseconds& timeout, long long count) {
+    return dispatch<void>(detail::streams(detail::xread(count, static_cast<long long>(timeout.count())), first, last));
+  }
+  template <detail::iterator Input>
+  Self& xread(Input first, Input last, const std::chrono::milliseconds& timeout) {
+    return xread(first, last, timeout, 0);
+  }
+  Self& xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                   long long count, bool noack) {
+    return dispatch<void>(detail::streams(detail::xreadgroup(group, consumer, count, std::nullopt, noack), key, id));
+  }
+  Self& xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                   long long count) {
+    return xreadgroup(group, consumer, key, id, count, false);
+  }
+  template <detail::iterator Input>
+  Self& xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last, long long count,
+                   bool noack) {
+    return dispatch<void>(
+        detail::streams(detail::xreadgroup(group, consumer, count, std::nullopt, noack), first, last));
+  }
+  template <detail::iterator Input>
+  Self& xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last, long long count) {
+    return xreadgroup(group, consumer, first, last, count, false);
+  }
+  template <detail::iterator Input>
+  Self& xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last) {
+    return xreadgroup(group, consumer, first, last, 0, false);
+  }
+  Self& xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                   const std::chrono::milliseconds& timeout, long long count, bool noack) {
+    return dispatch<void>(detail::streams(
+        detail::xreadgroup(group, consumer, count, static_cast<long long>(timeout.count()), noack), key, id));
+  }
+  Self& xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                   const std::chrono::milliseconds& timeout, long long count) {
+    return xreadgroup(group, consumer, key, id, timeout, count, false);
+  }
+  Self& xreadgroup(const StringView& group, const StringView& consumer, const StringView& key, const StringView& id,
+                   const std::chrono::milliseconds& timeout) {
+    return xreadgroup(group, consumer, key, id, timeout, 0, false);
+  }
+  template <detail::iterator Input>
+  Self& xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last,
+                   const std::chrono::milliseconds& timeout, long long count, bool noack) {
+    return dispatch<void>(detail::streams(
+        detail::xreadgroup(group, consumer, count, static_cast<long long>(timeout.count()), noack), first, last));
+  }
+  template <detail::iterator Input>
+  Self& xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last,
+                   const std::chrono::milliseconds& timeout, long long count) {
+    return xreadgroup(group, consumer, first, last, timeout, count, false);
+  }
+  template <detail::iterator Input>
+  Self& xreadgroup(const StringView& group, const StringView& consumer, Input first, Input last,
+                   const std::chrono::milliseconds& timeout) {
+    return xreadgroup(group, consumer, first, last, timeout, 0, false);
   }
 
   Self& script_load(const StringView& script) { return dispatch<void>(detail::cmd("SCRIPT", "LOAD", script)); }

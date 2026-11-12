@@ -17,6 +17,13 @@ type Redis interface {
 	Execute(args [][]byte, record bool) (Reply, error)
 	// Pipeline runs commands sent in one round trip, each observed as it runs.
 	Pipeline(cmds [][][]byte) []Result
+	// ExecuteBlocking is Execute for a command that may block (BLPOP, XREAD … BLOCK): it blocks the
+	// calling goroutine on the virtual clock until another client's write answers it or its timeout
+	// passes (nil). Any other command answers at once, as Execute.
+	ExecuteBlocking(args [][]byte, record bool) (Reply, error)
+	// PipelineBlocking is Pipeline for a trip holding a blocking command: the commands after it wait
+	// until it answers.
+	PipelineBlocking(cmds [][][]byte) []Result
 	// Transaction runs a MULTI/EXEC block back to back.
 	Transaction(cmds [][][]byte) []Result
 	// Fingerprint is a stable rendering of key's value and expiry ("" when absent), for WATCH.

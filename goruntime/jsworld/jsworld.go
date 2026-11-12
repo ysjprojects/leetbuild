@@ -259,6 +259,33 @@ func (r *jsRedis) Pipeline(cmds [][][]byte) []world.Result {
 	return results(r.b.Call("pipeline", commands(cmds)))
 }
 
+// awaitBridge calls the bridge's method with args and a completion callback, and blocks the calling
+// goroutine until JavaScript calls back; decode reads the callback's argument. The goroutine waits
+// as a sleeping one does: once every goroutine is blocked the clock may jump to the next sleep.
+func awaitBridge[T any](b js.Value, method string, decode func(js.Value) T, args ...any) T {
+	done := make(chan T, 1)
+	var cb js.Func
+	cb = js.FuncOf(func(_ js.Value, in []js.Value) any {
+		cb.Release()
+		done <- decode(in[0])
+		return nil
+	})
+	b.Call(method, append(args, cb)...)
+	return <-done
+}
+
+func (r *jsRedis) ExecuteBlocking(args [][]byte, record bool) (world.Reply, error) {
+	res := awaitBridge(r.b, "executeBlocking", func(v js.Value) world.Result {
+		reply, err := result(v)
+		return world.Result{Reply: reply, Err: err}
+	}, command(args), record)
+	return res.Reply, res.Err
+}
+
+func (r *jsRedis) PipelineBlocking(cmds [][][]byte) []world.Result {
+	return awaitBridge(r.b, "pipelineBlocking", results, commands(cmds))
+}
+
 func (r *jsRedis) Transaction(cmds [][][]byte) []world.Result {
 	return results(r.b.Call("transaction", commands(cmds)))
 }

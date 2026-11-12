@@ -1,7 +1,8 @@
 /**
  * Redis for the TypeScript runtime: one in-memory server (strings, hashes, lists, sets, sorted
- * sets, expiry on the virtual clock, MULTI/EXEC, Lua through the host's VM) behind an ioredis-shaped
- * client — `new Redis(…)`, `redis.set(key, v, 'EX', 60, 'NX')`, `redis.pipeline()…exec()`,
+ * sets, streams with consumer groups, expiry on the virtual clock, MULTI/EXEC, Lua through the
+ * host's VM, blocking commands that wait on the virtual clock) behind an ioredis-shaped client —
+ * `new Redis(…)`, `redis.set(key, v, 'EX', 60, 'NX')`, `redis.pipeline()…exec()`,
  * `redis.eval(script, numkeys, …)`, `redis.defineCommand`. The learner's clients and the harness
  * share the SERVER, so the harness reads state and lands probes between commands exactly as another
  * worker's request would land.
@@ -20,11 +21,442 @@ export class ReplyError extends Error {
 }
 
 type Value =
-  | {kind: 'string'; value: string}
+  /** `raw`: written in place (APPEND, SETRANGE, SETBIT, HyperLogLog), which leaves Redis's raw encoding. */
+  | {kind: 'string'; value: string; raw?: boolean}
   | {kind: 'hash'; value: Map<string, string>}
   | {kind: 'list'; value: string[]}
   | {kind: 'set'; value: Set<string>}
-  | {kind: 'zset'; value: Map<string, number>};
+  | {kind: 'zset'; value: Map<string, number>}
+  | {kind: 'stream'; value: Stream};
+
+// ---- streams: entries in radix-tree nodes, consumer groups with their pending entries ----------------
+
+/** A stream ID, `<ms>-<seq>`, as one 128-bit number: ms in the high 64 bits, so ID order is number order. */
+type StreamId = bigint;
+
+interface StreamEntry {
+  readonly id: StreamId;
+  readonly fields: string[];
+}
+
+/** A radix-tree node's listpack: its live entries, and the slots it has used (deleted entries keep theirs). */
+interface StreamNode {
+  entries: StreamEntry[];
+  slots: number;
+}
+
+/** A pending entry: delivered to `consumer` (null only while XCLAIM FORCE creates it), not yet acknowledged. */
+interface StreamNack {
+  consumer: StreamConsumer | null;
+  /** Last delivery, on the virtual clock (ms). */
+  time: number;
+  count: number;
+}
+
+interface StreamConsumer {
+  readonly name: string;
+  /** Last attempted interaction (XREADGROUP, XCLAIM, XAUTOCLAIM), and last successful one (-1: none yet). */
+  seen: number;
+  active: number;
+  readonly pel: Map<StreamId, StreamNack>;
+}
+
+interface StreamGroup {
+  lastId: StreamId;
+  /** Logical reads counter; -1 when it is not known (Redis's SCG_INVALID_ENTRIES_READ). */
+  entriesRead: number;
+  readonly pel: Map<StreamId, StreamNack>;
+  readonly consumers: Map<string, StreamConsumer>;
+}
+
+interface Stream {
+  nodes: StreamNode[];
+  length: number;
+  lastId: StreamId;
+  maxDeletedId: StreamId;
+  entriesAdded: number;
+  readonly groups: Map<string, StreamGroup>;
+}
+
+const U64 = (1n << 64n) - 1n;
+const MAX_ID: StreamId = (U64 << 64n) | U64;
+/** stream-node-max-entries: a node takes this many entries (deleted ones included) before a new one starts. */
+const STREAM_NODE_ENTRIES = 100;
+
+const formatId = (id: StreamId): string => `${id >> 64n}-${id & U64}`;
+
+/** Pending entries in ID order, as Redis's radix tree iterates them. */
+const byId = (pel: Map<StreamId, StreamNack>): [StreamId, StreamNack][] =>
+  [...pel].sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+
+/** Consumers in name order (byte order), as Redis's radix tree iterates them. */
+const byName = (consumers: Map<string, StreamConsumer>): StreamConsumer[] =>
+  [...consumers.values()].sort((x, y) => (x.name < y.name ? -1 : 1));
+
+const newStream = (): Stream => ({
+  nodes: [],
+  length: 0,
+  lastId: 0n,
+  maxDeletedId: 0n,
+  entriesAdded: 0,
+  groups: new Map(),
+});
+
+const streamEntries = (s: Stream): StreamEntry[] => s.nodes.flatMap(n => n.entries);
+
+/** The first live entry's ID, 0-0 when empty: Redis's `first_id`. */
+const firstId = (s: Stream): StreamId => s.nodes[0]?.entries[0]?.id ?? 0n;
+
+const findEntry = (s: Stream, id: StreamId): StreamEntry | undefined => {
+  for (const node of s.nodes) {
+    const last = node.entries[node.entries.length - 1];
+    if (last.id >= id) return node.entries.find(e => e.id === id);
+  }
+  return undefined;
+};
+
+const appendEntry = (s: Stream, id: StreamId, fields: string[]): void => {
+  let tail = s.nodes[s.nodes.length - 1];
+  if (tail === undefined || tail.slots >= STREAM_NODE_ENTRIES) {
+    tail = {entries: [], slots: 0};
+    s.nodes.push(tail);
+  }
+  tail.entries.push({id, fields});
+  tail.slots += 1;
+  s.length += 1;
+  s.entriesAdded += 1;
+  s.lastId = id;
+};
+
+/** XDEL one entry: a node whose last live entry goes is freed, as Redis frees its listpack. */
+const deleteEntry = (s: Stream, id: StreamId): boolean => {
+  for (let n = 0; n < s.nodes.length; n++) {
+    const node = s.nodes[n];
+    const i = node.entries.findIndex(e => e.id === id);
+    if (i === -1) continue;
+    node.entries.splice(i, 1);
+    if (node.entries.length === 0) s.nodes.splice(n, 1);
+    s.length -= 1;
+    return true;
+  }
+  return false;
+};
+
+/** The trimming options of XADD and XTRIM, as streamParseAddOrTrimArgsOrReply reads them. */
+interface TrimArgs {
+  strategy: 'none' | 'maxlen' | 'minid';
+  approx: boolean;
+  maxlen: number;
+  minid: StreamId;
+  /** Most entries one trim deletes; 0 for no limit. */
+  limit: number;
+  noMkStream: boolean;
+  /** XADD's explicit ID, null for `*`. */
+  id: {id: StreamId; seqGiven: boolean} | null;
+  /** Index of XADD's ID argument. */
+  next: number;
+}
+
+/**
+ * Trim from the oldest entries, as streamTrim does: whole nodes go while they fit; `~` stops at the
+ * first node it cannot drop whole, exact trimming goes on inside it. Returns the entries deleted.
+ */
+const trimStream = (s: Stream, t: TrimArgs): number => {
+  if (t.strategy === 'none') return 0;
+  let deleted = 0;
+  while (s.nodes.length > 0) {
+    if (t.strategy === 'maxlen' && s.length <= t.maxlen) break;
+    const node = s.nodes[0];
+    const entries = node.entries.length;
+    if (t.limit && deleted + entries > t.limit) break;
+    const whole = t.strategy === 'maxlen' ? s.length - entries >= t.maxlen : node.entries[entries - 1].id < t.minid;
+    if (whole) {
+      s.nodes.shift();
+      s.length -= entries;
+      deleted += entries;
+      continue;
+    }
+    if (t.approx) break;
+    while (t.strategy === 'maxlen' ? s.length > t.maxlen : node.entries[0].id < t.minid) {
+      node.entries.shift();
+      s.length -= 1;
+      deleted += 1;
+    }
+    break;
+  }
+  return deleted;
+};
+
+/** Whether a deleted entry may lie in [start, end]: Redis tracks only the greatest deleted ID. */
+const rangeHasTombstones = (s: Stream, start: StreamId, end: StreamId = MAX_ID): boolean =>
+  s.length > 0 &&
+  s.maxDeletedId !== 0n &&
+  firstId(s) <= s.maxDeletedId &&
+  start <= s.maxDeletedId &&
+  s.maxDeletedId <= end;
+
+/** An ID's logical read counter where it can be known (streamEstimateDistanceFromFirstEverEntry), else -1. */
+const estimateEntriesRead = (s: Stream, id: StreamId): number => {
+  if (s.entriesAdded === 0) return 0;
+  if (s.length === 0 && id <= s.lastId) return s.entriesAdded;
+  if (id !== 0n && id < s.maxDeletedId) return -1;
+  if (id === s.lastId) return s.entriesAdded;
+  if (id > s.lastId) return -1;
+  const first = firstId(s);
+  if (s.maxDeletedId === 0n || s.maxDeletedId < first) {
+    if (id < first) return s.entriesAdded - s.length;
+    if (id === first) return s.entriesAdded - s.length + 1;
+  }
+  return -1;
+};
+
+/** A group's lag (entries not yet delivered to it), null where fragmentation hides it (streamReplyWithCGLag). */
+const groupLag = (s: Stream, g: StreamGroup): number | null => {
+  if (s.entriesAdded === 0 || s.length === 0) return 0;
+  const first = firstId(s);
+  if (g.lastId < first && s.maxDeletedId < first) return s.length;
+  if (g.entriesRead !== -1 && !rangeHasTombstones(s, g.lastId)) return s.entriesAdded - g.entriesRead;
+  const read = estimateEntriesRead(s, g.lastId);
+  return read === -1 ? null : s.entriesAdded - read;
+};
+
+const INVALID_ID = 'ERR Invalid stream ID specified as stream command argument';
+
+/** An unsigned 64-bit decimal, as string2ull reads one; null when it is not. */
+const u64 = (s: string): bigint | null => (/^\d{1,20}$/.test(s) && BigInt(s) <= U64 ? BigInt(s) : null);
+
+/**
+ * A stream ID argument (streamGenericParseIDOrReply): `<ms>-<seq>`; `<ms>` with the sequence
+ * `missingSeq`; `-` and `+` for the least and greatest IDs unless `strict`; `<ms>-*` (seqGiven
+ * false) where `seqStar`, for XADD.
+ */
+const parseStreamId = (
+  arg: string,
+  missingSeq: bigint,
+  strict: boolean,
+  seqStar = false,
+): {id: StreamId; seqGiven: boolean} => {
+  if (arg.length > 127) throw new ReplyError(INVALID_ID);
+  if (arg === '-' || arg === '+') {
+    if (strict) throw new ReplyError(INVALID_ID);
+    return {id: arg === '-' ? 0n : MAX_ID, seqGiven: true};
+  }
+  const dash = arg.indexOf('-');
+  const ms = u64(dash === -1 ? arg : arg.slice(0, dash));
+  if (ms === null) throw new ReplyError(INVALID_ID);
+  if (dash === -1) return {id: (ms << 64n) | missingSeq, seqGiven: true};
+  if (seqStar && arg.slice(dash + 1) === '*') return {id: ms << 64n, seqGiven: false};
+  const seq = u64(arg.slice(dash + 1));
+  if (seq === null) throw new ReplyError(INVALID_ID);
+  return {id: (ms << 64n) | seq, seqGiven: true};
+};
+
+/** One end of an XRANGE/XPENDING/XAUTOCLAIM interval: `(` makes it exclusive, which moves it one ID inward. */
+const parseInterval = (arg: string, end: boolean): StreamId => {
+  const exclusive = arg.length > 1 && arg[0] === '(';
+  const {id} = parseStreamId(exclusive ? arg.slice(1) : arg, end ? U64 : 0n, exclusive);
+  if (!exclusive) return id;
+  if (end ? id === 0n : id === MAX_ID) throw new ReplyError(`ERR invalid ${end ? 'end' : 'start'} ID for the interval`);
+  return end ? id - 1n : id + 1n;
+};
+
+/** An entry as stream commands reply with it: `[id, [field, value, …]]`. */
+const entryReply = (e: StreamEntry): Reply => [formatId(e.id), e.fields];
+
+/** XADD/XTRIM options (streamParseAddOrTrimArgsOrReply), from `a[1]` on. */
+const parseAddOrTrim = (a: string[], xadd: boolean): TrimArgs => {
+  const t: TrimArgs = {
+    strategy: 'none',
+    approx: false,
+    maxlen: 0,
+    minid: 0n,
+    limit: 0,
+    noMkStream: false,
+    id: null,
+    next: 0,
+  };
+  let limitGiven = false;
+  let i = 1;
+  for (; i < a.length; i++) {
+    const more = a.length - 1 - i;
+    const opt = a[i].toUpperCase();
+    if (xadd && a[i] === '*') break;
+    if ((opt === 'MAXLEN' || opt === 'MINID') && more) {
+      if (t.strategy !== 'none')
+        throw new ReplyError('ERR syntax error, MAXLEN and MINID options at the same time are not compatible');
+      t.approx = false;
+      if (more >= 2 && a[i + 1] === '~') (t.approx = true), (i += 1);
+      else if (more >= 2 && a[i + 1] === '=') i += 1;
+      if (opt === 'MAXLEN') {
+        t.maxlen = int(a[i + 1]);
+        if (t.maxlen < 0) throw new ReplyError('ERR The MAXLEN argument must be >= 0.');
+        t.strategy = 'maxlen';
+      } else {
+        t.minid = parseStreamId(a[i + 1], 0n, true).id;
+        t.strategy = 'minid';
+      }
+      i += 1;
+    } else if (opt === 'LIMIT' && more) {
+      t.limit = int(a[i + 1]);
+      if (t.limit < 0) throw new ReplyError('ERR The LIMIT argument must be >= 0.');
+      limitGiven = true;
+      i += 1;
+    } else if (xadd && opt === 'NOMKSTREAM') t.noMkStream = true;
+    else if (xadd) {
+      t.id = parseStreamId(a[i], 0n, true, true);
+      break;
+    } else throw new ReplyError('ERR syntax error');
+  }
+  if (t.limit && t.strategy === 'none')
+    throw new ReplyError('ERR syntax error, LIMIT cannot be used without specifying a trimming strategy');
+  if (!xadd && t.strategy === 'none')
+    throw new ReplyError('ERR syntax error, XTRIM must be called with a trimming strategy');
+  if (limitGiven && !t.approx)
+    throw new ReplyError('ERR syntax error, LIMIT cannot be used without the special ~ option');
+  // `~` without LIMIT trims at most 100 nodes' worth, as Redis does.
+  if (!limitGiven) t.limit = t.approx ? 100 * STREAM_NODE_ENTRIES : 0;
+  t.next = i;
+  return t;
+};
+
+const cloneStream = (s: Stream): Stream => {
+  const groups = new Map<string, StreamGroup>();
+  for (const [name, g] of s.groups) {
+    const consumers = new Map<string, StreamConsumer>();
+    for (const [cname, c] of g.consumers)
+      consumers.set(cname, {name: cname, seen: c.seen, active: c.active, pel: new Map()});
+    const pel = new Map<StreamId, StreamNack>();
+    for (const [id, nack] of g.pel) {
+      const owner = nack.consumer === null ? null : consumers.get(nack.consumer.name) ?? null;
+      const copy = {consumer: owner, time: nack.time, count: nack.count};
+      pel.set(id, copy);
+      owner?.pel.set(id, copy);
+    }
+    groups.set(name, {lastId: g.lastId, entriesRead: g.entriesRead, pel, consumers});
+  }
+  return {
+    nodes: s.nodes.map(n => ({entries: [...n.entries], slots: n.slots})),
+    length: s.length,
+    lastId: s.lastId,
+    maxDeletedId: s.maxDeletedId,
+    entriesAdded: s.entriesAdded,
+    groups,
+  };
+};
+
+const cloneValue = (v: Value): Value => {
+  switch (v.kind) {
+    case 'string':
+      return {...v};
+    case 'hash':
+      return {kind: 'hash', value: new Map(v.value)};
+    case 'list':
+      return {kind: 'list', value: [...v.value]};
+    case 'set':
+      return {kind: 'set', value: new Set(v.value)};
+    case 'zset':
+      return {kind: 'zset', value: new Map(v.value)};
+    case 'stream':
+      return {kind: 'stream', value: cloneStream(v.value)};
+  }
+};
+
+// ---- the keyspace -------------------------------------------------------------------------------------
+
+/** The keys, stamping each key's last access on lookup as Redis's LRU clock does (OBJECT IDLETIME). */
+class Keyspace extends Map<string, Value> {
+  private readonly accessed = new Map<string, number>();
+
+  get(key: string): Value | undefined {
+    const v = super.get(key);
+    if (v !== undefined) this.accessed.set(key, CLOCK.now());
+    return v;
+  }
+
+  set(key: string, value: Value): this {
+    this.accessed.set(key, CLOCK.now());
+    return super.set(key, value);
+  }
+
+  delete(key: string): boolean {
+    this.accessed.delete(key);
+    return super.delete(key);
+  }
+
+  clear(): void {
+    this.accessed.clear();
+    super.clear();
+  }
+
+  /** The value without stamping an access, as TYPE, OBJECT and WATCH look keys up. */
+  peek(key: string): Value | undefined {
+    return super.get(key);
+  }
+
+  /** Whole seconds since the last access, on the LRU clock's one-second resolution. */
+  idleSeconds(key: string): number {
+    return Math.floor(CLOCK.now() / 1000) - Math.floor((this.accessed.get(key) ?? CLOCK.now()) / 1000);
+  }
+}
+
+// ---- blocking -----------------------------------------------------------------------------------------
+
+/** Thrown by a blocking command with nothing to serve a client that may block: the server parks the client. */
+class WouldBlock {
+  constructor(
+    /** The command to run again when a key is ready (XREAD's `$` replaced by the ID it stood for). */
+    readonly args: string[],
+    readonly keys: string[],
+    readonly type: 'list' | 'stream',
+    /** Milliseconds, 0 for none. */
+    readonly timeout: number,
+    /** XREADGROUP: deleting or replacing the key answers it too (with the NOGROUP error). */
+    readonly unblockOnNokey: boolean,
+  ) {}
+}
+
+/** A client blocked on keys: the command to run again, and where its answer goes. */
+interface Waiter {
+  readonly args: string[];
+  readonly keys: string[];
+  readonly type: 'list' | 'stream';
+  readonly unblockOnNokey: boolean;
+  timer: number | null;
+  readonly done: (reply: Reply | ReplyError) => void;
+}
+
+/** Whether the command waits for data when there is none: B(L|R)POP, BLMOVE, BRPOPLPUSH, and XREAD(GROUP) with BLOCK. */
+export function isBlocking(args: string[]): boolean {
+  const name = args[0]?.toLowerCase();
+  if (name === 'blpop' || name === 'brpop' || name === 'blmove' || name === 'brpoplpush') return true;
+  if (name !== 'xread' && name !== 'xreadgroup') return false;
+  // The options as xreadCommand reads them, up to STREAMS.
+  for (let i = 1; i < args.length; i++) {
+    const opt = args[i].toUpperCase();
+    const more = args.length - 1 - i;
+    if (opt === 'BLOCK' && more) return true;
+    if (opt === 'COUNT' && more) i += 1;
+    else if (opt === 'GROUP' && more >= 2) i += 2;
+    else if (opt !== 'NOACK') return false;
+  }
+  return false;
+}
+
+/** A blocking command's timeout (getTimeoutFromObjectOrReply): seconds as a float, or milliseconds; 0 waits for good. */
+const blockTimeout = (arg: string, seconds: boolean): number => {
+  let ms: number;
+  if (seconds) {
+    const value = parseDouble(arg);
+    if (value === null) throw new ReplyError('ERR timeout is not a float or out of range');
+    if (value * 1000 >= 2 ** 63) throw new ReplyError('ERR timeout is out of range');
+    ms = Math.ceil(value * 1000);
+  } else {
+    if (!/^-?\d+$/.test(arg)) throw new ReplyError('ERR timeout is not an integer or out of range');
+    ms = Number(arg);
+  }
+  if (ms < 0) throw new ReplyError('ERR timeout is negative');
+  return ms;
+};
 
 export interface Probe {
   key: string;
@@ -71,9 +503,16 @@ export const toByteString = (v: string | number | boolean | Uint8Array): string 
 
 export const fromByteString = (s: string): string => (isAscii(s) ? s : decoder.decode(byteStringToBytes(s)));
 
-const int = (v: string): number => {
-  if (!/^-?\d+$/.test(v)) throw new ReplyError(NOT_INT);
+/** An integer argument; `error` replaces the generic message where the command has its own. */
+const int = (v: string, error = NOT_INT): number => {
+  if (!/^-?\d+$/.test(v)) throw new ReplyError(error);
   return Number(v);
+};
+
+/** A double as Redis's strtod-based parsers read it (`inf` included, NaN not); null when it is not one. */
+const parseDouble = (v: string): number | null => {
+  if (!/^[+-]?((\d+\.?\d*|\.\d+)(e[+-]?\d+)?|inf(inity)?)$/i.test(v)) return null;
+  return /inf/i.test(v) ? (v[0] === '-' ? -Infinity : Infinity) : Number(v);
 };
 
 const float = (v: string): number => {
@@ -112,6 +551,9 @@ const STATUS_REPLIES = new Set([
   'hmset',
   'rename',
   'select',
+  'lset',
+  'pfmerge',
+  'xgroup',
 ]);
 
 /** A script's SHA-1 as Redis names it (lower-case hex of its bytes). */
@@ -149,18 +591,26 @@ export class RedisServer {
   /** Every round trip a client made, as upper-case command names: `['GET']`, a pipeline `['GET', 'GET']`, a transaction `['MULTI', 'HSET', 'EXEC']`. */
   readonly trips: string[][] = [];
   lua: LuaEval | null = null;
-  private data = new Map<string, Value>();
+  private readonly data = new Keyspace();
   private expires = new Map<string, number>();
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly patternSubscribers = new Map<string, Set<PatternSubscriber>>();
   /** Scripts by SHA-1 (hex): EVAL and SCRIPT LOAD cache them, EVALSHA runs them. */
   private readonly scripts = new Map<string, string>();
+  /** Who runs the command: a client that may block, a plain call or transaction (blocking answers as a timeout), or a script. */
+  private caller: 'blocking' | 'nonblocking' | 'script' = 'nonblocking';
+  /** Clients blocked on each key, in the order they blocked. */
+  private readonly waiters = new Map<string, Waiter[]>();
+  /** Keys a write made ready for their blocked clients (Redis's ready_keys). */
+  private readonly readyKeys = new Set<string>();
+  private serving = false;
 
   flushall(): void {
     this.data.clear();
     this.expires.clear();
   }
 
+  /** A clean server for the next check; clients still blocked are dropped unanswered. */
   reset(): void {
     this.flushall();
     this.probes.length = 0;
@@ -168,6 +618,9 @@ export class RedisServer {
     this.subscribers.clear();
     this.patternSubscribers.clear();
     this.scripts.clear();
+    for (const queue of this.waiters.values()) for (const w of queue) if (w.timer !== null) CLOCK.clearTimer(w.timer);
+    this.waiters.clear();
+    this.readyKeys.clear();
   }
 
   // ---- pub/sub: a connection's subscriptions, delivered asynchronously as replies would arrive ----------
@@ -225,13 +678,16 @@ export class RedisServer {
   /** A stable rendering of the key's value and expiry ('' when absent): WATCH compares it at EXEC. */
   fingerprint(key: string): string {
     this.sweep();
-    const v = this.data.get(key);
+    const v = this.data.peek(key);
     if (v === undefined) return '';
+    // A stream's entries and last ID: what XADD, XDEL and XTRIM change (group state does not touch WATCH in Redis).
     const body =
       v.kind === 'string' || v.kind === 'list'
         ? v.value
         : v.kind === 'set'
         ? [...v.value].sort()
+        : v.kind === 'stream'
+        ? [streamEntries(v.value).map(entryReply), formatId(v.value.lastId)]
         : [...v.value.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     return JSON.stringify([v.kind, body, this.expires.get(key) ?? null]);
   }
@@ -242,42 +698,214 @@ export class RedisServer {
    * Run one command as the server would, probes included: a probe on a key fires right after the
    * first command touching it, before the caller sees the reply. MULTI/EXEC and EVAL run atomically
    * and are observed as one unit. `record: false` keeps the harness's own reads out of `trips`.
+   * A blocking command run here does not block: it answers as a timeout would.
    */
   execute(args: string[], record = true): Reply {
     const name = args[0]?.toLowerCase();
     if (record) this.trips.push([name.toUpperCase()]);
-    const result = this.run(name, args.slice(1));
+    let result: Reply;
+    try {
+      result = this.watching(() => this.run(name, args.slice(1)));
+    } catch (e) {
+      this.serveReady();
+      throw e;
+    }
     this.fireProbes(args.slice(1));
+    this.serveReady();
     return result;
+  }
+
+  /**
+   * `execute` for a client that may block: BLPOP, BRPOP, BLMOVE, BRPOPLPUSH, and XREAD/XREADGROUP
+   * with BLOCK, finding nothing, wait for another client's write (served in the order they blocked)
+   * or their timeout on the virtual clock (nil). Error replies reject with ReplyError.
+   */
+  executeBlocking(args: string[], record = true): Promise<Reply> {
+    const {promise, resolve, reject} = Promise.withResolvers<Reply>();
+    if (!isBlocking(args)) {
+      try {
+        resolve(this.execute(args, record));
+      } catch (e) {
+        reject(e);
+      }
+      return promise;
+    }
+    if (record) this.trips.push([args[0].toUpperCase()]);
+    this.attempt(args, reply => (reply instanceof ReplyError ? reject(reply) : resolve(reply)));
+    return promise;
   }
 
   /** A MULTI/EXEC block: every queued command runs back to back; probes fire once, afterwards. */
   executeTransaction(commands: string[][]): (Reply | ReplyError)[] {
     this.trips.push(['MULTI', ...commands.map(c => c[0].toUpperCase()), 'EXEC']);
-    const replies = commands.map(c => {
-      try {
-        return this.run(c[0].toLowerCase(), c.slice(1));
-      } catch (e) {
-        return e instanceof ReplyError ? e : new ReplyError(String(e));
-      }
-    });
+    const replies = this.watching(() =>
+      commands.map(c => {
+        try {
+          return this.run(c[0].toLowerCase(), c.slice(1));
+        } catch (e) {
+          return e instanceof ReplyError ? e : new ReplyError(String(e));
+        }
+      }),
+    );
     this.fireProbes(commands.flatMap(c => c.slice(1)));
+    this.serveReady();
     return replies;
   }
 
   /** A pipeline: the commands go to the server in one round trip and run back to back, each observed as it runs. */
   executePipeline(commands: string[][]): (Reply | ReplyError)[] {
     this.trips.push(commands.map(c => c[0].toUpperCase()));
-    return commands.map(c => {
-      try {
-        const reply = this.run(c[0].toLowerCase(), c.slice(1));
-        this.fireProbes(c.slice(1));
-        return reply;
-      } catch (e) {
-        this.fireProbes(c.slice(1));
-        return e instanceof ReplyError ? e : new ReplyError(String(e));
+    return commands.map(c => this.pipelined(c));
+  }
+
+  /** A pipeline whose blocking commands may block: one that waits holds the commands after it, as in Redis. */
+  executePipelineBlocking(commands: string[][]): Promise<(Reply | ReplyError)[]> {
+    this.trips.push(commands.map(c => c[0].toUpperCase()));
+    const {promise, resolve} = Promise.withResolvers<(Reply | ReplyError)[]>();
+    const replies: (Reply | ReplyError)[] = [];
+    const from = (start: number): void => {
+      for (let i = start; i < commands.length; i++) {
+        if (!isBlocking(commands[i])) {
+          replies.push(this.pipelined(commands[i]));
+          continue;
+        }
+        let parked = false;
+        let answered = false;
+        this.attempt(commands[i], reply => {
+          replies.push(reply);
+          // Answered later, by another client's write: the rest runs once that write is done.
+          if (parked) queueMicrotask(() => from(i + 1));
+          else answered = true;
+        });
+        if (!answered) {
+          parked = true;
+          return;
+        }
       }
-    });
+      resolve(replies);
+    };
+    from(0);
+    return promise;
+  }
+
+  private pipelined(c: string[]): Reply | ReplyError {
+    let reply: Reply | ReplyError;
+    try {
+      reply = this.watching(() => this.run(c[0].toLowerCase(), c.slice(1)));
+    } catch (e) {
+      reply = e instanceof ReplyError ? e : new ReplyError(String(e));
+    }
+    this.fireProbes(c.slice(1));
+    this.serveReady();
+    return reply;
+  }
+
+  // ---- blocked clients: parked per key, served in order when a write readies the key -------------------
+
+  /**
+   * Run a blocking command for a client that may block: `done` gets the answer now, or the client
+   * parks until a write serves it or its timeout passes. `parked`: the client running it again after a
+   * write, which keeps its timeout.
+   */
+  private attempt(args: string[], done: (reply: Reply | ReplyError) => void, parked?: Waiter): void {
+    const caller = this.caller;
+    this.caller = 'blocking';
+    let reply: Reply | ReplyError;
+    try {
+      reply = this.watching(() => this.run(args[0].toLowerCase(), args.slice(1)));
+    } catch (e) {
+      if (e instanceof WouldBlock) {
+        const waiter = parked ?? {...e, timer: null, done};
+        for (const key of new Set(waiter.keys)) this.waiters.set(key, [...(this.waiters.get(key) ?? []), waiter]);
+        if (parked === undefined && e.timeout > 0)
+          waiter.timer = CLOCK.setTimeout(() => this.timeOut(waiter), e.timeout);
+        return;
+      }
+      reply = e instanceof ReplyError ? e : new ReplyError(String(e));
+    } finally {
+      this.caller = caller;
+    }
+    if (parked?.timer != null) CLOCK.clearTimer(parked.timer);
+    this.fireProbes(args.slice(1));
+    this.serveReady();
+    done(reply);
+  }
+
+  /** Take a blocked client off every key it waits on. */
+  private unpark(waiter: Waiter): void {
+    for (const key of new Set(waiter.keys)) {
+      const queue = (this.waiters.get(key) ?? []).filter(w => w !== waiter);
+      if (queue.length === 0) this.waiters.delete(key);
+      else this.waiters.set(key, queue);
+    }
+  }
+
+  private timeOut(waiter: Waiter): void {
+    if (!this.waiters.get(waiter.keys[0])?.includes(waiter)) return;
+    this.unpark(waiter);
+    this.fireProbes(waiter.args.slice(1));
+    waiter.done(null);
+  }
+
+  /** Run `fn` (a command, a transaction, a script) and mark ready the waited-on keys it created, replaced or deleted. */
+  private watching<T>(fn: () => T): T {
+    if (this.waiters.size === 0) return fn();
+    const before = new Map([...this.waiters.keys()].map(k => [k, this.data.peek(k)]));
+    try {
+      return fn();
+    } finally {
+      for (const [key, value] of before) if (this.data.peek(key) !== value) this.readyKeys.add(key);
+    }
+  }
+
+  /** Mark a key ready for the clients blocked on it, as Redis's signalKeyAsReady (XADD, XGROUP DESTROY). */
+  private signal(key: string): void {
+    if (this.waiters.has(key)) this.readyKeys.add(key);
+  }
+
+  /** Serve the clients blocked on ready keys until none is ready (serving a BLMOVE can ready another key). */
+  private serveReady(): void {
+    if (this.serving) return;
+    this.serving = true;
+    try {
+      while (this.readyKeys.size > 0) {
+        const keys = [...this.readyKeys];
+        this.readyKeys.clear();
+        for (const key of keys) this.serveKey(key);
+      }
+    } finally {
+      this.serving = false;
+    }
+  }
+
+  /**
+   * The clients blocked on `key`, first blocked first, each running its command again
+   * (handleClientsBlockedOnKey): one that finds data is answered, one that does not stays blocked.
+   */
+  private serveKey(key: string): void {
+    for (let n = this.waiters.get(key)?.length ?? 0; n > 0; n--) {
+      const queue = this.waiters.get(key);
+      const waiter = queue?.[0];
+      if (queue === undefined || waiter === undefined) return;
+      // Rotate first: a client that blocks again goes behind the others, keeping their order.
+      queue.push(queue.shift() ?? waiter);
+      this.sweep();
+      if (this.data.peek(key)?.kind !== waiter.type && !waiter.unblockOnNokey) continue;
+      this.unpark(waiter);
+      this.attempt(waiter.args, waiter.done, waiter);
+    }
+  }
+
+  /** A blocking command found nothing: a client that may block parks; anyone else gets the timeout answer, nil. */
+  private block(
+    args: string[],
+    keys: string[],
+    type: 'list' | 'stream',
+    timeout: number,
+    unblockOnNokey = false,
+  ): null {
+    if (this.caller !== 'blocking') return null;
+    throw new WouldBlock(args, keys, type, timeout, unblockOnNokey);
   }
 
   private fireProbes(args: string[]): void {
@@ -297,6 +925,10 @@ export class RedisServer {
 
   private run(name: string, a: string[]): Reply {
     this.sweep();
+    if (Object.hasOwn(ARITY, name)) {
+      const arity = ARITY[name];
+      if (arity > 0 ? a.length + 1 !== arity : a.length + 1 < -arity) throw arityError(name);
+    }
     switch (name) {
       case 'ping':
         return 'PONG';
@@ -328,7 +960,7 @@ export class RedisServer {
         return n;
       }
       case 'type': {
-        const v = this.data.get(a[0]);
+        const v = this.data.peek(a[0]);
         return v === undefined ? 'none' : v.kind;
       }
       case 'expire':
@@ -353,6 +985,42 @@ export class RedisServer {
         if (at === undefined) return -1;
         const left = at - CLOCK.now();
         return name === 'ttl' ? Math.ceil(left / 1000) : Math.ceil(left);
+      }
+      case 'touch':
+        return a.filter(k => this.data.get(k) !== undefined).length;
+      case 'copy': {
+        let replace = false;
+        for (let i = 2; i < a.length; i++) {
+          const opt = a[i].toUpperCase();
+          if (opt === 'REPLACE') replace = true;
+          else if (opt === 'DB' && i + 1 < a.length) {
+            // One database, as a server run with `databases 1`: any other index does not exist.
+            if (int(a[++i]) !== 0) throw new ReplyError('ERR DB index is out of range');
+          } else throw new ReplyError(SYNTAX);
+        }
+        if (a[0] === a[1]) throw new ReplyError('ERR source and destination objects are the same');
+        const v = this.data.get(a[0]);
+        if (v === undefined || (this.data.get(a[1]) !== undefined && !replace)) return 0;
+        const at = this.expires.get(a[0]);
+        this.data.set(a[1], cloneValue(v));
+        if (at === undefined) this.expires.delete(a[1]);
+        else this.expires.set(a[1], at);
+        return 1;
+      }
+      case 'object': {
+        const sub = subcommand('object', a, {encoding: 3, refcount: 3, idletime: 3, freq: 3, help: 2});
+        if (sub === 'help') return help('OBJECT', OBJECT_HELP);
+        // OBJECT looks the key up without counting as an access.
+        const v = this.data.peek(a[1]);
+        if (v === undefined) return null;
+        if (sub === 'encoding') return encoding(v);
+        // Integers 0 to 9999 are Redis's shared objects (refcount INT_MAX); every other value is its key's alone.
+        if (sub === 'refcount')
+          return v.kind === 'string' && encoding(v) === 'int' && /^\d{1,4}$/.test(v.value) ? 2147483647 : 1;
+        if (sub === 'idletime') return this.data.idleSeconds(a[1]);
+        throw new ReplyError(
+          'ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.',
+        );
       }
       // ---- strings -------------------------------------------------------------------------------
       case 'get':
@@ -424,7 +1092,7 @@ export class RedisServer {
       }
       case 'append': {
         const current = this.string(a[0]) ?? '';
-        this.data.set(a[0], {kind: 'string', value: current + a[1]});
+        this.data.set(a[0], {kind: 'string', value: current + a[1], raw: true});
         return current.length + a[1].length;
       }
       case 'strlen':
@@ -439,8 +1107,88 @@ export class RedisServer {
         const offset = int(a[1]);
         const padded = s.length < offset ? s + '\0'.repeat(offset - s.length) : s;
         const next = padded.slice(0, offset) + a[2] + padded.slice(offset + a[2].length);
-        this.data.set(a[0], {kind: 'string', value: next});
+        this.data.set(a[0], {kind: 'string', value: next, raw: true});
         return next.length;
+      }
+      case 'getex': {
+        let unit: 'EX' | 'PX' | 'EXAT' | 'PXAT' | 'PERSIST' | null = null;
+        let expire = '';
+        for (let i = 1; i < a.length; i++) {
+          const opt = a[i].toUpperCase();
+          // One expiry option, possibly repeated (the last value wins), or PERSIST.
+          if (opt === 'PERSIST' && (unit === null || unit === opt)) unit = opt;
+          else if (
+            (opt === 'EX' || opt === 'PX' || opt === 'EXAT' || opt === 'PXAT') &&
+            i + 1 < a.length &&
+            (unit === null || unit === opt)
+          ) {
+            unit = opt;
+            expire = a[++i];
+          } else throw new ReplyError(SYNTAX);
+        }
+        const v = this.string(a[0]);
+        if (v === null || unit === null) return v;
+        if (unit === 'PERSIST') {
+          this.expires.delete(a[0]);
+          return v;
+        }
+        let at = int(expire);
+        if (at <= 0) throw new ReplyError("ERR invalid expire time in 'getex' command");
+        if (unit === 'EX' || unit === 'EXAT') at *= 1000;
+        if (unit === 'EX' || unit === 'PX') at += CLOCK.now();
+        // An absolute time already past deletes the key.
+        if (at <= CLOCK.now()) this.drop(a[0]);
+        else this.expires.set(a[0], at);
+        return v;
+      }
+      case 'msetnx': {
+        if (a.length % 2 === 1) throw arityError(name);
+        for (let i = 0; i < a.length; i += 2) if (this.data.get(a[i]) !== undefined) return 0;
+        for (let i = 0; i < a.length; i += 2) this.run('set', [a[i], a[i + 1]]);
+        return 1;
+      }
+      case 'getbit':
+      case 'setbit': {
+        // Offsets reach 2^32 - 1 (a 512 MB string), past what JavaScript's bit operators take.
+        const offset = /^(0|[1-9]\d{0,9})$/.test(a[1]) ? Number(a[1]) : -1;
+        if (offset < 0 || offset >= 2 ** 32) throw new ReplyError('ERR bit offset is not an integer or out of range');
+        const byte = Math.floor(offset / 8);
+        const mask = 0x80 >> offset % 8;
+        if (name === 'getbit') return (this.string(a[0]) ?? '').charCodeAt(byte) & mask ? 1 : 0;
+        if (a[2] !== '0' && a[2] !== '1') throw new ReplyError('ERR bit is not an integer or out of range');
+        const s = (this.string(a[0]) ?? '').padEnd(byte + 1, '\0');
+        const old = s.charCodeAt(byte);
+        const next = String.fromCharCode(a[2] === '1' ? old | mask : old & ~mask);
+        this.data.set(a[0], {kind: 'string', value: s.slice(0, byte) + next + s.slice(byte + 1), raw: true});
+        return old & mask ? 1 : 0;
+      }
+      case 'bitcount': {
+        const s = this.string(a[0]);
+        if (s === null) return 0;
+        let start = 0;
+        let end = s.length - 1;
+        let bits = false;
+        if (a.length === 3 || a.length === 4) {
+          start = int(a[1]);
+          end = int(a[2]);
+          if (start < 0 && end < 0 && start > end) return 0;
+          if (a.length === 4) {
+            const unit = a[3].toUpperCase();
+            if (unit !== 'BIT' && unit !== 'BYTE') throw new ReplyError(SYNTAX);
+            bits = unit === 'BIT';
+          }
+          const total = bits ? s.length * 8 : s.length;
+          if (start < 0) start += total;
+          if (end < 0) end += total;
+          start = Math.max(0, start);
+          end = Math.min(Math.max(0, end), total - 1);
+        } else if (a.length !== 1) throw new ReplyError(SYNTAX);
+        let count = 0;
+        for (let i = start; i <= end; i++) {
+          if (bits) count += (s.charCodeAt(Math.floor(i / 8)) >> (7 - (i % 8))) & 1;
+          else for (let byte = s.charCodeAt(i); byte; byte &= byte - 1) count += 1;
+        }
+        return count;
       }
       // ---- hashes --------------------------------------------------------------------------------
       case 'hset': {
@@ -466,6 +1214,18 @@ export class RedisServer {
       case 'hmget': {
         const h = this.hash(a[0], false);
         return a.slice(1).map(f => h?.get(f) ?? null);
+      }
+      case 'hstrlen':
+        return this.hash(a[0], false)?.get(a[1])?.length ?? 0;
+      case 'hrandfield': {
+        if (a.length === 1) {
+          const h = this.hash(a[0], false);
+          return h === null ? null : h.keys().next().value ?? null;
+        }
+        const count = randomCount(a, 'WITHVALUES');
+        const h = this.hash(a[0], false);
+        if (h === null || count === 0) return [];
+        return pick([...h.entries()], count).flatMap(([f, v]) => (a.length === 3 ? [f, v] : [f]));
       }
       case 'hgetall': {
         const h = this.hash(a[0], false);
@@ -554,6 +1314,100 @@ export class RedisServer {
         else this.data.set(a[0], {kind: 'list', value: next});
         return removed;
       }
+      case 'lpushx':
+      case 'rpushx': {
+        const l = this.list(a[0], false);
+        if (l === null) return 0;
+        for (const v of a.slice(1)) name === 'lpushx' ? l.unshift(v) : l.push(v);
+        return l.length;
+      }
+      case 'linsert': {
+        const where = a[1].toUpperCase();
+        if (where !== 'BEFORE' && where !== 'AFTER') throw new ReplyError(SYNTAX);
+        const l = this.list(a[0], false);
+        if (l === null) return 0;
+        const i = l.indexOf(a[2]);
+        if (i === -1) return -1;
+        l.splice(where === 'BEFORE' ? i : i + 1, 0, a[3]);
+        return l.length;
+      }
+      case 'lset': {
+        const l = this.list(a[0], false);
+        if (l === null) throw new ReplyError('ERR no such key');
+        const i = int(a[1]);
+        const at = i < 0 ? l.length + i : i;
+        if (at < 0 || at >= l.length) throw new ReplyError('ERR index out of range');
+        l[at] = a[2];
+        return 'OK';
+      }
+      case 'lpos': {
+        let rank = 1;
+        let count = -1;
+        let maxlen = 0;
+        const positive = (v: string, what: string): number => {
+          const n = /^-?\d+$/.test(v) ? Number(v) : -1;
+          if (n < 0) throw new ReplyError(`ERR ${what} can't be negative`);
+          return n;
+        };
+        for (let j = 2; j < a.length; j++) {
+          const opt = a[j].toUpperCase();
+          const more = j + 1 < a.length;
+          if (opt === 'RANK' && more) {
+            rank = int(a[++j]);
+            if (rank === 0)
+              throw new ReplyError(
+                "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list",
+              );
+          } else if (opt === 'COUNT' && more) count = positive(a[++j], 'COUNT');
+          else if (opt === 'MAXLEN' && more) maxlen = positive(a[++j], 'MAXLEN');
+          else throw new ReplyError(SYNTAX);
+        }
+        const l = this.list(a[0], false);
+        if (l === null) return count === -1 ? null : [];
+        // A negative rank scans from the tail; MAXLEN caps the elements compared.
+        const order = rank < 0 ? [...l.keys()].reverse() : [...l.keys()];
+        const scanned = maxlen === 0 ? order : order.slice(0, maxlen);
+        const matches: number[] = [];
+        let seen = 0;
+        for (const i of scanned) {
+          if (l[i] !== a[1] || ++seen < Math.abs(rank)) continue;
+          matches.push(i);
+          if (count === -1 || matches.length === count) break;
+        }
+        return count === -1 ? matches[0] ?? null : matches;
+      }
+      case 'lmove':
+      case 'blmove': {
+        const from = listEnd(a[2]);
+        const to = listEnd(a[3]);
+        if (name === 'blmove') {
+          const timeout = blockTimeout(a[4], true);
+          if (this.list(a[0], false) === null) return this.block([name, ...a], [a[0]], 'list', timeout);
+        }
+        return this.lmove(a[0], a[1], from, to);
+      }
+      case 'rpoplpush':
+      case 'brpoplpush': {
+        if (name === 'brpoplpush') {
+          const timeout = blockTimeout(a[2], true);
+          if (this.list(a[0], false) === null) return this.block([name, ...a], [a[0]], 'list', timeout);
+        }
+        return this.lmove(a[0], a[1], 'RIGHT', 'LEFT');
+      }
+      case 'blpop':
+      case 'brpop': {
+        const timeout = blockTimeout(a[a.length - 1], true);
+        const keys = a.slice(0, -1);
+        // The first key holding a non-empty list answers; a wrong type before it is an error.
+        for (const key of keys) {
+          const l = this.list(key, false);
+          if (l === null || l.length === 0) continue;
+          const v = (name === 'blpop' ? l.shift() : l.pop()) ?? '';
+          if (l.length === 0) this.drop(key);
+          return [key, v];
+        }
+        return this.block([name, ...a], keys, 'list', timeout);
+      }
       // ---- sets ----------------------------------------------------------------------------------
       case 'sadd': {
         const s = this.set(a[0], true);
@@ -575,6 +1429,44 @@ export class RedisServer {
         return this.set(a[0], false)?.has(a[1]) ? 1 : 0;
       case 'scard':
         return this.set(a[0], false)?.size ?? 0;
+      case 'smismember': {
+        const s = this.set(a[0], false);
+        return a.slice(1).map(m => (s?.has(m) ? 1 : 0));
+      }
+      case 'smove': {
+        // A missing source answers 0 before the destination's type is looked at.
+        const source = this.set(a[0], false);
+        if (source === null) return 0;
+        const target = this.set(a[1], false);
+        if (a[0] === a[1]) return source.has(a[2]) ? 1 : 0;
+        if (!source.delete(a[2])) return 0;
+        if (source.size === 0) this.drop(a[0]);
+        (target ?? this.set(a[1], true)).add(a[2]);
+        return 1;
+      }
+      case 'srandmember': {
+        if (a.length > 2) throw new ReplyError(SYNTAX);
+        const count = a.length === 2 ? int(a[1]) : null;
+        const members = [...(this.set(a[0], false) ?? [])].sort();
+        if (count === null) return members[0] ?? null;
+        return count === 0 || members.length === 0 ? [] : pick(members, count);
+      }
+      case 'sinter':
+      case 'sinterstore':
+      case 'sunion':
+      case 'sunionstore':
+      case 'sdiff':
+      case 'sdiffstore': {
+        const store = name.endsWith('store');
+        // Every key is type-checked first; a missing one is an empty set.
+        const [first, ...rest] = (store ? a.slice(1) : a).map(k => this.set(k, false));
+        const op = name.slice(1, store ? -5 : undefined);
+        const result = new Set(op === 'union' ? [first, ...rest].flatMap(s => [...(s ?? [])]) : first ?? []);
+        if (op === 'inter') for (const m of result) if (!rest.every(s => s?.has(m))) result.delete(m);
+        if (op === 'diff') for (const s of rest) for (const m of s ?? []) result.delete(m);
+        if (!store) return [...result].sort();
+        return this.store(a[0], {kind: 'set', value: result}, result.size);
+      }
       // ---- sorted sets ---------------------------------------------------------------------------
       case 'zadd': {
         const z = this.zset(a[0], true);
@@ -724,6 +1616,78 @@ export class RedisServer {
         if (z.size === 0) this.data.delete(a[0]);
         return popped.flatMap(([m, s]) => [m, String(s)]);
       }
+      case 'zmscore': {
+        const z = this.zset(a[0], false);
+        return a.slice(1).map(m => {
+          const score = z?.get(m);
+          return score === undefined ? null : scoreString(score);
+        });
+      }
+      case 'zrandmember': {
+        if (a.length === 1) return this.sortedMembers(a[0], false)[0]?.[0] ?? null;
+        const count = randomCount(a, 'WITHSCORES');
+        const members = this.sortedMembers(a[0], false);
+        if (members.length === 0 || count === 0) return [];
+        return pick(members, count).flatMap(([m, s]) => (a.length === 3 ? [m, scoreString(s)] : [m]));
+      }
+      case 'zunionstore':
+      case 'zinterstore': {
+        const numkeys = int(a[1]);
+        if (numkeys < 1) throw new ReplyError(`ERR at least 1 input key is needed for '${name}' command`);
+        if (numkeys > a.length - 2) throw new ReplyError(SYNTAX);
+        // Sorted sets, and plain sets as members scored 1; a missing key is empty.
+        const inputs = a.slice(2, 2 + numkeys).map(k => {
+          const v = this.data.get(k);
+          if (v === undefined) return new Map<string, number>();
+          if (v.kind === 'zset') return v.value;
+          if (v.kind === 'set') return new Map([...v.value].map(m => [m, 1]));
+          throw new ReplyError(WRONGTYPE);
+        });
+        const weights = inputs.map(() => 1);
+        let aggregate = 'SUM';
+        for (let j = 2 + numkeys; j < a.length; ) {
+          const opt = a[j].toUpperCase();
+          if (opt === 'WEIGHTS' && a.length - j > numkeys) {
+            for (let i = 0; i < numkeys; i++) {
+              const w = parseDouble(a[j + 1 + i]);
+              if (w === null) throw new ReplyError('ERR weight value is not a float');
+              weights[i] = w;
+            }
+            j += numkeys + 1;
+          } else if (opt === 'AGGREGATE' && a.length - j >= 2) {
+            aggregate = a[j + 1].toUpperCase();
+            if (aggregate !== 'SUM' && aggregate !== 'MIN' && aggregate !== 'MAX') throw new ReplyError(SYNTAX);
+            j += 2;
+          } else throw new ReplyError(SYNTAX);
+        }
+        // Smallest input first, as Redis iterates them; 0 * inf and inf - inf count as 0.
+        const order = inputs.map((_, i) => i).sort((x, y) => inputs[x].size - inputs[y].size);
+        const weighted = (i: number, score: number): number =>
+          Number.isNaN(weights[i] * score) ? 0 : weights[i] * score;
+        const combine = (x: number, y: number): number => {
+          if (aggregate === 'MIN') return Math.min(x, y);
+          if (aggregate === 'MAX') return Math.max(x, y);
+          return Number.isNaN(x + y) ? 0 : x + y;
+        };
+        const out = new Map<string, number>();
+        if (name === 'zunionstore') {
+          for (const i of order)
+            for (const [m, s] of inputs[i]) {
+              const prev = out.get(m);
+              out.set(m, prev === undefined ? weighted(i, s) : combine(prev, weighted(i, s)));
+            }
+        } else {
+          const [smallest, ...others] = order;
+          for (const [m, s] of inputs[smallest]) {
+            if (!others.every(i => inputs[i].has(m))) continue;
+            out.set(
+              m,
+              others.reduce((acc, i) => combine(acc, weighted(i, inputs[i].get(m) ?? 0)), weighted(smallest, s)),
+            );
+          }
+        }
+        return this.store(a[0], {kind: 'zset', value: out}, out.size);
+      }
       // ---- keyspace: SCAN, RENAME, EXPIREAT ------------------------------------------------------
       case 'scan': {
         // The cursor is a position in the sorted live keys; MATCH filters each batch, as in Redis.
@@ -782,7 +1746,8 @@ export class RedisServer {
         return many ? popped : popped[0] ?? null;
       }
       case 'pfadd':
-      case 'pfcount': {
+      case 'pfcount':
+      case 'pfmerge': {
         // A HyperLogLog is a string (as in Redis) holding its distinct elements here: counts are exact.
         const read = (key: string): Set<string> | null => {
           const raw = this.string(key);
@@ -790,18 +1755,19 @@ export class RedisServer {
           if (!raw.startsWith('HYLL')) throw new ReplyError('WRONGTYPE Key is not a valid HyperLogLog string value.');
           return new Set(JSON.parse(raw.slice(4)) as string[]);
         };
-        if (name === 'pfcount') {
+        if (name !== 'pfadd') {
+          // PFMERGE folds the destination in with the sources and writes it in place (its TTL stays).
           const union = new Set<string>();
           for (const k of a) for (const m of read(k) ?? []) union.add(m);
-          return union.size;
+          if (name === 'pfcount') return union.size;
+          this.data.set(a[0], {kind: 'string', value: 'HYLL' + JSON.stringify([...union].sort()), raw: true});
+          return 'OK';
         }
         const existing = read(a[0]);
         const hll = existing ?? new Set<string>();
         const before = hll.size;
         for (const m of a.slice(1)) hll.add(m);
-        const at = this.expires.get(a[0]);
-        this.data.set(a[0], {kind: 'string', value: 'HYLL' + JSON.stringify([...hll].sort())});
-        if (at !== undefined) this.expires.set(a[0], at);
+        this.data.set(a[0], {kind: 'string', value: 'HYLL' + JSON.stringify([...hll].sort()), raw: true});
         return existing === null || hll.size !== before ? 1 : 0;
       }
       // ---- scripting -----------------------------------------------------------------------------
@@ -820,6 +1786,9 @@ export class RedisServer {
         const argv = a.slice(2 + numkeys);
         const statusCommand = (cmd: string): boolean => STATUS_REPLIES.has(cmd);
         let out: string;
+        // Commands from the script never block (XREAD with BLOCK is an error there, as in Redis).
+        const caller = this.caller;
+        this.caller = 'script';
         try {
           out = this.lua(source, JSON.stringify(keys), JSON.stringify(argv), argsJson => {
             const args = (JSON.parse(argsJson) as (string | number)[]).map(String);
@@ -832,6 +1801,8 @@ export class RedisServer {
           });
         } catch (e) {
           throw new ReplyError(e instanceof Error ? e.message : String(e));
+        } finally {
+          this.caller = caller;
         }
         return untag(JSON.parse(out) as Tagged);
       }
@@ -851,8 +1822,596 @@ export class RedisServer {
       }
       default:
         if (GEO_COMMANDS.has(name)) return this.geo(name, a);
+        if (STREAM_COMMANDS.has(name)) return this.streamCommand(name, a);
         throw new ReplyError(`ERR unknown command '${name}'`);
     }
+  }
+
+  // ---- streams ------------------------------------------------------------------------------------------
+
+  private streamCommand(name: string, a: string[]): Reply {
+    const now = Math.floor(CLOCK.now());
+    switch (name) {
+      case 'xadd': {
+        const t = parseAddOrTrim(a, true);
+        const fields = a.slice(t.next + 1);
+        if (fields.length < 2 || fields.length % 2 === 1) throw arityError(name);
+        if (t.id?.seqGiven && t.id.id === 0n)
+          throw new ReplyError('ERR The ID specified in XADD must be greater than 0-0');
+        const existing = this.stream(a[0], false);
+        if (existing === null && t.noMkStream) return null;
+        const s = existing ?? this.stream(a[0], true);
+        if (s.lastId === MAX_ID)
+          throw new ReplyError('ERR The stream has exhausted the last possible ID, unable to add more items');
+        const tooSmall = new ReplyError(
+          'ERR The ID specified in XADD is equal or smaller than the target stream top item',
+        );
+        let id: StreamId;
+        if (t.id === null) {
+          // `*`: the clock's milliseconds, or the next sequence when the clock has not passed the last ID.
+          const ms = BigInt(now);
+          id = ms > s.lastId >> 64n ? ms << 64n : s.lastId + 1n;
+        } else if (t.id.seqGiven || t.id.id >> 64n !== s.lastId >> 64n) id = t.id.id;
+        else if ((s.lastId & U64) === U64) throw tooSmall;
+        else id = s.lastId + 1n;
+        if (id <= s.lastId) throw tooSmall;
+        appendEntry(s, id, fields);
+        trimStream(s, t);
+        this.signal(a[0]);
+        return formatId(id);
+      }
+      case 'xlen':
+        return this.stream(a[0], false)?.length ?? 0;
+      case 'xrange':
+      case 'xrevrange': {
+        const rev = name === 'xrevrange';
+        const start = parseInterval(rev ? a[2] : a[1], false);
+        const end = parseInterval(rev ? a[1] : a[2], true);
+        let count = -1;
+        for (let j = 3; j < a.length; j++) {
+          if (a[j].toUpperCase() !== 'COUNT' || j + 1 >= a.length) throw new ReplyError(SYNTAX);
+          count = Math.max(0, int(a[++j]));
+        }
+        const s = this.stream(a[0], false);
+        if (s === null) return [];
+        if (count === 0) return null;
+        const within = streamEntries(s).filter(e => e.id >= start && e.id <= end);
+        if (rev) within.reverse();
+        return (count > 0 ? within.slice(0, count) : within).map(entryReply);
+      }
+      case 'xdel': {
+        const s = this.stream(a[0], false);
+        if (s === null) return 0;
+        // Every ID is parsed before any is deleted.
+        const ids = a.slice(1).map(arg => parseStreamId(arg, 0n, true).id);
+        let deleted = 0;
+        for (const id of ids) {
+          if (!deleteEntry(s, id)) continue;
+          deleted += 1;
+          if (id > s.maxDeletedId) s.maxDeletedId = id;
+        }
+        return deleted;
+      }
+      case 'xtrim': {
+        const t = parseAddOrTrim(a, false);
+        const s = this.stream(a[0], false);
+        return s === null ? 0 : trimStream(s, t);
+      }
+      case 'xread':
+      case 'xreadgroup':
+        return this.xread(name, a, now);
+      case 'xack': {
+        const g = this.stream(a[0], false)?.groups.get(a[1]);
+        if (g === undefined) return 0;
+        const ids = a.slice(2).map(arg => parseStreamId(arg, 0n, true).id);
+        let acked = 0;
+        for (const id of ids) {
+          const nack = g.pel.get(id);
+          if (nack === undefined) continue;
+          g.pel.delete(id);
+          nack.consumer?.pel.delete(id);
+          acked += 1;
+        }
+        return acked;
+      }
+      case 'xpending': {
+        if (a.length !== 2 && (a.length < 5 || a.length > 8)) throw new ReplyError(SYNTAX);
+        let start = 0n;
+        let end = MAX_ID;
+        let count = 0;
+        let minIdle = 0;
+        let consumerName: string | null = null;
+        if (a.length >= 5) {
+          let at = 2;
+          if (a[2].toUpperCase() === 'IDLE') {
+            minIdle = int(a[3]);
+            if (a.length < 7) throw new ReplyError(SYNTAX);
+            at = 4;
+          }
+          count = Math.max(0, int(a[at + 2]));
+          start = parseInterval(a[at], false);
+          end = parseInterval(a[at + 1], true);
+          consumerName = a[at + 3] ?? null;
+        }
+        const g = this.stream(a[0], false)?.groups.get(a[1]);
+        if (g === undefined) throw new ReplyError(`NOGROUP No such key '${a[0]}' or consumer group '${a[1]}'`);
+        if (a.length === 2) {
+          if (g.pel.size === 0) return [0, null, null, null];
+          const ids = byId(g.pel);
+          const owners = byName(g.consumers)
+            .filter(c => c.pel.size > 0)
+            .map(c => [c.name, String(c.pel.size)]);
+          return [g.pel.size, formatId(ids[0][0]), formatId(ids[ids.length - 1][0]), owners];
+        }
+        const pel = consumerName === null ? g.pel : g.consumers.get(consumerName)?.pel;
+        if (pel === undefined) return [];
+        const out: Reply[] = [];
+        for (const [id, nack] of byId(pel)) {
+          if (out.length >= count || id > end) break;
+          if (id < start || (minIdle && now - nack.time < minIdle)) continue;
+          out.push([formatId(id), nack.consumer?.name ?? '', Math.max(0, now - nack.time), nack.count]);
+        }
+        return out;
+      }
+      case 'xclaim': {
+        const s = this.stream(a[0], false);
+        const g = s?.groups.get(a[1]);
+        if (s === null || g === undefined)
+          throw new ReplyError(`NOGROUP No such key '${a[0]}' or consumer group '${a[1]}'`);
+        const minIdle = Math.max(0, int(a[3], 'ERR Invalid min-idle-time argument for XCLAIM'));
+        // IDs up to the first argument that is not one; options follow.
+        const ids: StreamId[] = [];
+        let j = 4;
+        for (; j < a.length; j++) {
+          try {
+            ids.push(parseStreamId(a[j], 0n, true).id);
+          } catch {
+            break;
+          }
+        }
+        let force = false;
+        let justId = false;
+        let retries = -1;
+        let delivered = -1;
+        let lastId = 0n;
+        for (; j < a.length; j++) {
+          const opt = a[j].toUpperCase();
+          const more = j + 1 < a.length;
+          if (opt === 'FORCE') force = true;
+          else if (opt === 'JUSTID') justId = true;
+          else if (opt === 'IDLE' && more) delivered = now - int(a[++j], 'ERR Invalid IDLE option argument for XCLAIM');
+          else if (opt === 'TIME' && more) delivered = int(a[++j], 'ERR Invalid TIME option argument for XCLAIM');
+          else if (opt === 'RETRYCOUNT' && more)
+            retries = int(a[++j], 'ERR Invalid RETRYCOUNT option argument for XCLAIM');
+          else if (opt === 'LASTID' && more) lastId = parseStreamId(a[++j], 0n, true).id;
+          else throw new ReplyError(`ERR Unrecognized XCLAIM option '${a[j]}'`);
+        }
+        if (lastId > g.lastId) g.lastId = lastId;
+        // A delivery time in the future or before the epoch is taken as now.
+        if (delivered < 0 || delivered > now) delivered = now;
+        const consumer = this.consumer(g, a[2], now);
+        const out: Reply[] = [];
+        for (const id of ids) {
+          let nack = g.pel.get(id);
+          const entry = findEntry(s, id);
+          if (entry === undefined) {
+            // Deleted from the stream: its pending entry goes too.
+            if (nack !== undefined) {
+              g.pel.delete(id);
+              nack.consumer?.pel.delete(id);
+            }
+            continue;
+          }
+          if (force && nack === undefined) {
+            nack = {consumer: null, time: now, count: 1};
+            g.pel.set(id, nack);
+          }
+          if (nack === undefined || (nack.consumer !== null && minIdle && now - nack.time < minIdle)) continue;
+          nack.time = delivered;
+          if (retries >= 0) nack.count = retries;
+          else if (!justId) nack.count += 1;
+          if (nack.consumer !== consumer) {
+            nack.consumer?.pel.delete(id);
+            consumer.pel.set(id, nack);
+            nack.consumer = consumer;
+          }
+          out.push(justId ? formatId(id) : entryReply(entry));
+          consumer.active = now;
+        }
+        return out;
+      }
+      case 'xautoclaim': {
+        const minIdle = Math.max(0, int(a[3], 'ERR Invalid min-idle-time argument for XAUTOCLAIM'));
+        const start = parseInterval(a[4], false);
+        let count = 100;
+        let justId = false;
+        for (let j = 5; j < a.length; j++) {
+          const opt = a[j].toUpperCase();
+          if (opt === 'COUNT' && j + 1 < a.length) {
+            count = int(a[++j], 'ERR COUNT must be > 0');
+            // At most LONG_MAX / 10, so that 10 × COUNT attempts fit.
+            if (count < 1 || count > 2 ** 63 / 10) throw new ReplyError('ERR COUNT must be > 0');
+          } else if (opt === 'JUSTID') justId = true;
+          else throw new ReplyError(SYNTAX);
+        }
+        const s = this.stream(a[0], false);
+        const g = s?.groups.get(a[1]);
+        if (s === null || g === undefined)
+          throw new ReplyError(`NOGROUP No such key '${a[0]}' or consumer group '${a[1]}'`);
+        const consumer = this.consumer(g, a[2], now);
+        // Pending entries from `start` on: at most `count` claimed or dropped, at most 10 × `count` looked at.
+        const pending = byId(g.pel).filter(([id]) => id >= start);
+        const claimed: Reply[] = [];
+        const deleted: Reply[] = [];
+        let attempts = count * 10;
+        let left = count;
+        let next = 0;
+        while (attempts-- > 0 && left > 0 && next < pending.length) {
+          const [id, nack] = pending[next++];
+          const entry = findEntry(s, id);
+          if (entry === undefined) {
+            g.pel.delete(id);
+            nack.consumer?.pel.delete(id);
+            deleted.push(formatId(id));
+            left -= 1;
+            continue;
+          }
+          if (minIdle && now - nack.time < minIdle) continue;
+          if (nack.consumer !== consumer) {
+            nack.consumer?.pel.delete(id);
+            consumer.pel.set(id, nack);
+            nack.consumer = consumer;
+          }
+          nack.time = now;
+          if (!justId) nack.count += 1;
+          claimed.push(justId ? formatId(id) : entryReply(entry));
+          left -= 1;
+          consumer.active = now;
+        }
+        // The cursor: the next pending entry to look at, 0-0 when the scan reached the end.
+        return [formatId(pending[next]?.[0] ?? 0n), claimed, deleted];
+      }
+      case 'xgroup':
+        return this.xgroup(a, now);
+      case 'xinfo':
+        return this.xinfo(a, now);
+      default:
+        throw new ReplyError(`ERR unknown command '${name}'`);
+    }
+  }
+
+  /** XREAD and XREADGROUP (xreadCommand): serve what is there, else block or answer nil. */
+  private xread(name: string, a: string[], now: number): Reply {
+    const xreadgroup = name === 'xreadgroup';
+    let timeout = -1;
+    let count = 0;
+    let streamsAt = 0;
+    let groupName: string | null = null;
+    let consumerName = '';
+    let noack = false;
+    for (let i = 0; i < a.length; i++) {
+      const opt = a[i].toUpperCase();
+      const more = a.length - 1 - i;
+      if (opt === 'BLOCK' && more) {
+        if (this.caller === 'script')
+          throw new ReplyError(`ERR ${name} command is not allowed with BLOCK option from scripts`);
+        timeout = blockTimeout(a[++i], false);
+      } else if (opt === 'COUNT' && more) count = Math.max(0, int(a[++i]));
+      else if (opt === 'STREAMS' && more) {
+        streamsAt = i + 1;
+        if ((a.length - streamsAt) % 2 !== 0)
+          throw new ReplyError(
+            `ERR Unbalanced '${name}' list of streams: for each stream key an ID or '${
+              xreadgroup ? '>' : '$'
+            }' must be specified.`,
+          );
+        break;
+      } else if (opt === 'GROUP' && more >= 2) {
+        if (!xreadgroup)
+          throw new ReplyError('ERR The GROUP option is only supported by XREADGROUP. You called XREAD instead.');
+        groupName = a[i + 1];
+        consumerName = a[i + 2];
+        i += 2;
+      } else if (opt === 'NOACK') {
+        if (!xreadgroup)
+          throw new ReplyError('ERR The NOACK option is only supported by XREADGROUP. You called XREAD instead.');
+        noack = true;
+      } else throw new ReplyError(SYNTAX);
+    }
+    if (streamsAt === 0) throw new ReplyError(SYNTAX);
+    if (xreadgroup && groupName === null) throw new ReplyError('ERR Missing GROUP option for XREADGROUP');
+    const n = (a.length - streamsAt) / 2;
+    const keys = a.slice(streamsAt, streamsAt + n);
+    const idArgs = a.slice(streamsAt + n);
+    // Entries after these IDs; MAX_ID stands for `>`, the group's next undelivered entries.
+    const after: StreamId[] = [];
+    const groups: (StreamGroup | null)[] = [];
+    for (let i = 0; i < n; i++) {
+      const s = this.stream(keys[i], false);
+      const g = groupName === null ? null : s?.groups.get(groupName) ?? null;
+      if (groupName !== null && g === null)
+        throw new ReplyError(
+          `NOGROUP No such key '${keys[i]}' or consumer group '${groupName}' in XREADGROUP with GROUP option`,
+        );
+      groups.push(g);
+      if (idArgs[i] === '$') {
+        if (xreadgroup)
+          throw new ReplyError(
+            'ERR The $ ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The $ ID would just return an empty result set.',
+          );
+        after.push(s?.lastId ?? 0n);
+      } else if (idArgs[i] === '>') {
+        if (!xreadgroup)
+          throw new ReplyError(
+            'ERR The > ID can be specified only when calling XREADGROUP using the GROUP <group> <consumer> option.',
+          );
+        after.push(MAX_ID);
+      } else after.push(parseStreamId(idArgs[i], 0n, true).id);
+    }
+    const out: Reply[] = [];
+    for (let i = 0; i < n; i++) {
+      const s = this.stream(keys[i], false);
+      if (s === null) continue;
+      const g = groups[i];
+      const last = s.nodes[s.nodes.length - 1]?.entries.at(-1)?.id ?? 0n;
+      if (g === null) {
+        if (s.length > 0 && last > after[i]) out.push([keys[i], this.readEntries(s, after[i] + 1n, count, null, now)]);
+        continue;
+      }
+      const consumer = this.consumer(g, consumerName, now);
+      if (after[i] !== MAX_ID) {
+        // An explicit ID reads the consumer's own pending entries after it, its history.
+        out.push([keys[i], this.readHistory(s, consumer, after[i] + 1n, count, now)]);
+      } else if (s.length > 0 && last > g.lastId) {
+        const start = g.lastId === MAX_ID ? 0n : g.lastId + 1n;
+        out.push([keys[i], this.readEntries(s, start, count, {group: g, consumer, noack}, now)]);
+      }
+    }
+    if (out.length > 0) return out;
+    if (timeout === -1) return null;
+    // Blocked, `$` stands for the last ID now: run again, the command serves only what comes after it.
+    const args = [
+      name,
+      ...a.slice(0, streamsAt + n),
+      ...idArgs.map((arg, i) => (arg === '$' ? formatId(after[i]) : arg)),
+    ];
+    return this.block(args, keys, 'stream', timeout, xreadgroup);
+  }
+
+  /**
+   * Entries from `start` on, at most `count` (0: all). Read through a group (streamReplyWithRange),
+   * each advances the group's last-delivered ID and read counter and, without NOACK, enters the
+   * consumer's pending list (taken from another consumer if XGROUP SETID moved the group back).
+   */
+  private readEntries(
+    s: Stream,
+    start: StreamId,
+    count: number,
+    read: {group: StreamGroup; consumer: StreamConsumer; noack: boolean} | null,
+    now: number,
+  ): Reply[] {
+    const out: Reply[] = [];
+    for (const e of streamEntries(s)) {
+      if (e.id < start) continue;
+      if (read !== null) {
+        const {group: g, consumer} = read;
+        if (e.id > g.lastId) {
+          if (g.entriesRead !== -1 && g.lastId >= firstId(s) && !rangeHasTombstones(s, g.lastId)) g.entriesRead += 1;
+          else if (s.entriesAdded) g.entriesRead = estimateEntriesRead(s, e.id);
+          g.lastId = e.id;
+        }
+        if (!read.noack) {
+          const nack = g.pel.get(e.id) ?? {consumer, time: now, count: 1};
+          if (nack.consumer !== consumer) nack.consumer?.pel.delete(e.id);
+          Object.assign(nack, {consumer, time: now, count: 1});
+          g.pel.set(e.id, nack);
+          consumer.pel.set(e.id, nack);
+          consumer.active = now;
+        }
+      }
+      out.push(entryReply(e));
+      if (count && out.length === count) break;
+    }
+    return out;
+  }
+
+  /** A consumer's pending entries from `start` on: each delivered again (an entry since deleted shows as nil). */
+  private readHistory(s: Stream, consumer: StreamConsumer, start: StreamId, count: number, now: number): Reply[] {
+    const out: Reply[] = [];
+    for (const [id, nack] of byId(consumer.pel)) {
+      if (id < start) continue;
+      if (count && out.length >= count) break;
+      const entry = findEntry(s, id);
+      if (entry === undefined) {
+        out.push([formatId(id), null]);
+        continue;
+      }
+      out.push(entryReply(entry));
+      nack.time = now;
+      nack.count += 1;
+    }
+    return out;
+  }
+
+  /** The group's consumer by that name, created if new; either way it was just seen. */
+  private consumer(g: StreamGroup, name: string, now: number): StreamConsumer {
+    const consumer = g.consumers.get(name) ?? {name, seen: now, active: -1, pel: new Map()};
+    g.consumers.set(name, consumer);
+    consumer.seen = now;
+    return consumer;
+  }
+
+  private xgroup(a: string[], now: number): Reply {
+    const sub = subcommand('xgroup', a, {
+      create: -5,
+      setid: -5,
+      destroy: 4,
+      createconsumer: 5,
+      delconsumer: 5,
+      help: 2,
+    });
+    if (sub === 'help') return help('XGROUP', XGROUP_HELP);
+    let mkstream = false;
+    let entriesRead = -1;
+    for (let i = 4; i < a.length; ) {
+      const opt = a[i].toUpperCase();
+      if (sub === 'create' && opt === 'MKSTREAM') {
+        mkstream = true;
+        i += 1;
+      } else if ((sub === 'create' || sub === 'setid') && opt === 'ENTRIESREAD' && i + 1 < a.length) {
+        entriesRead = int(a[i + 1]);
+        if (entriesRead < -1) throw new ReplyError('ERR value for ENTRIESREAD must be positive or -1');
+        i += 2;
+      } else throw subcommandSyntax('XGROUP', a[0]);
+    }
+    const s = this.stream(a[1], false);
+    if (s === null && !mkstream)
+      throw new ReplyError(
+        'ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.',
+      );
+    const g = s?.groups.get(a[2]);
+    if (sub === 'create') {
+      if (a.length > 7) throw subcommandSyntax('XGROUP', a[0]);
+      const id = a[3] === '$' ? s?.lastId ?? 0n : parseStreamId(a[3], 0n, true).id;
+      const target = s ?? this.stream(a[1], true);
+      if (target.groups.has(a[2])) throw new ReplyError('BUSYGROUP Consumer Group name already exists');
+      target.groups.set(a[2], {lastId: id, entriesRead, pel: new Map(), consumers: new Map()});
+      return 'OK';
+    }
+    if (sub === 'destroy') {
+      if (s === null || g === undefined) return 0;
+      s.groups.delete(a[2]);
+      // Clients blocked in XREADGROUP on this group get their NOGROUP error.
+      this.signal(a[1]);
+      return 1;
+    }
+    if (s === null || g === undefined)
+      throw new ReplyError(`NOGROUP No such consumer group '${a[2]}' for key name '${a[1]}'`);
+    if (sub === 'setid') {
+      g.lastId = a[3] === '$' ? s.lastId : parseStreamId(a[3], 0n, false).id;
+      g.entriesRead = entriesRead;
+      return 'OK';
+    }
+    if (sub === 'createconsumer') {
+      if (g.consumers.has(a[3])) return 0;
+      g.consumers.set(a[3], {name: a[3], seen: now, active: -1, pel: new Map()});
+      return 1;
+    }
+    // DELCONSUMER: its pending entries leave the group too; the reply counts them.
+    const consumer = g.consumers.get(a[3]);
+    if (consumer === undefined) return 0;
+    for (const id of consumer.pel.keys()) g.pel.delete(id);
+    g.consumers.delete(a[3]);
+    return consumer.pel.size;
+  }
+
+  private xinfo(a: string[], now: number): Reply {
+    const sub = subcommand('xinfo', a, {consumers: 4, groups: 3, stream: -3, help: 2});
+    if (sub === 'help') return help('XINFO', XINFO_HELP);
+    const s = this.stream(a[1], false);
+    if (s === null) throw new ReplyError('ERR no such key');
+    const groups = [...s.groups].sort(([x], [y]) => (x < y ? -1 : 1));
+    if (sub === 'consumers') {
+      const g = s.groups.get(a[2]);
+      if (g === undefined) throw new ReplyError(`NOGROUP No such consumer group '${a[2]}' for key name '${a[1]}'`);
+      return byName(g.consumers).map(c => [
+        'name',
+        c.name,
+        'pending',
+        c.pel.size,
+        'idle',
+        Math.max(0, now - c.seen),
+        'inactive',
+        c.active === -1 ? -1 : now - c.active,
+      ]);
+    }
+    const lag = (g: StreamGroup): Reply[] => [
+      'entries-read',
+      g.entriesRead === -1 ? null : g.entriesRead,
+      'lag',
+      groupLag(s, g),
+    ];
+    if (sub === 'groups')
+      return groups.map(([name, g]) => [
+        'name',
+        name,
+        'consumers',
+        g.consumers.size,
+        'pending',
+        g.pel.size,
+        'last-delivered-id',
+        formatId(g.lastId),
+        ...lag(g),
+      ]);
+    // STREAM [FULL [COUNT n]]
+    const opts = a.slice(2);
+    if (
+      (opts.length !== 0 && opts.length !== 1 && opts.length !== 3) ||
+      (opts.length > 0 && opts[0].toUpperCase() !== 'FULL') ||
+      (opts.length === 3 && opts[1].toUpperCase() !== 'COUNT')
+    )
+      throw subcommandSyntax('XINFO', a[0]);
+    const count = opts.length === 3 ? int(opts[2]) : 10;
+    const limit = <T>(items: T[]): T[] =>
+      count > 0 ? items.slice(0, count) : count === 0 ? items : items.slice(0, 10);
+    const entries = streamEntries(s);
+    // The radix tree's node count is approximated as one more than its keys (the listpacks).
+    const head: Reply[] = [
+      'length',
+      s.length,
+      'radix-tree-keys',
+      s.nodes.length,
+      'radix-tree-nodes',
+      s.nodes.length + 1,
+      'last-generated-id',
+      formatId(s.lastId),
+      'max-deleted-entry-id',
+      formatId(s.maxDeletedId),
+      'entries-added',
+      s.entriesAdded,
+      'recorded-first-entry-id',
+      formatId(firstId(s)),
+    ];
+    if (opts.length === 0)
+      return [
+        ...head,
+        'groups',
+        s.groups.size,
+        'first-entry',
+        entries.length > 0 ? entryReply(entries[0]) : null,
+        'last-entry',
+        entries.length > 0 ? entryReply(entries[entries.length - 1]) : null,
+      ];
+    return [
+      ...head,
+      'entries',
+      limit(entries).map(entryReply),
+      'groups',
+      groups.map(([name, g]) => [
+        'name',
+        name,
+        'last-delivered-id',
+        formatId(g.lastId),
+        ...lag(g),
+        'pel-count',
+        g.pel.size,
+        'pending',
+        limit(byId(g.pel)).map(([id, nack]) => [formatId(id), nack.consumer?.name ?? '', nack.time, nack.count]),
+        'consumers',
+        byName(g.consumers).map(c => [
+          'name',
+          c.name,
+          'seen-time',
+          c.seen,
+          'active-time',
+          c.active,
+          'pel-count',
+          c.pel.size,
+          'pending',
+          limit(byId(c.pel)).map(([id, nack]) => [formatId(id), nack.time, nack.count]),
+        ]),
+      ]),
+    ];
   }
 
   // ---- storage helpers ------------------------------------------------------------------------------
@@ -865,6 +2424,49 @@ export class RedisServer {
         this.data.delete(k);
       }
     }
+  }
+
+  /** Delete a key and its expiry. */
+  private drop(key: string): void {
+    this.data.delete(key);
+    this.expires.delete(key);
+  }
+
+  /** A *STORE command's result: written over the destination (its TTL gone), or the destination deleted when empty. */
+  private store(key: string, value: Value, size: number): number {
+    if (size === 0) {
+      this.drop(key);
+      return 0;
+    }
+    this.data.set(key, value);
+    this.expires.delete(key);
+    return size;
+  }
+
+  /** LMOVE: the destination's type is checked before anything moves; a source left empty is deleted. */
+  private lmove(src: string, dst: string, from: 'LEFT' | 'RIGHT', to: 'LEFT' | 'RIGHT'): string | null {
+    const source = this.list(src, false);
+    if (source === null) return null;
+    const target = this.list(dst, false);
+    const v = (from === 'LEFT' ? source.shift() : source.pop()) ?? '';
+    const into = target ?? this.list(dst, true);
+    to === 'LEFT' ? into.unshift(v) : into.push(v);
+    if (source.length === 0) this.drop(src);
+    return v;
+  }
+
+  private stream(key: string, create: true): Stream;
+  private stream(key: string, create: false): Stream | null;
+  private stream(key: string, create: boolean): Stream | null {
+    const v = this.data.get(key);
+    if (v === undefined) {
+      if (!create) return null;
+      const s = newStream();
+      this.data.set(key, {kind: 'stream', value: s});
+      return s;
+    }
+    if (v.kind !== 'stream') throw new ReplyError(WRONGTYPE);
+    return v.value;
   }
 
   private string(key: string): string | null {
@@ -1088,6 +2690,201 @@ export class RedisServer {
 
 const GEO_COMMANDS = new Set(['geoadd', 'geopos', 'geodist', 'geosearch', 'georadius', 'georadiusbymember']);
 
+const STREAM_COMMANDS = new Set([
+  'xadd',
+  'xlen',
+  'xrange',
+  'xrevrange',
+  'xdel',
+  'xtrim',
+  'xread',
+  'xreadgroup',
+  'xack',
+  'xpending',
+  'xclaim',
+  'xautoclaim',
+  'xgroup',
+  'xinfo',
+]);
+
+const SYNTAX = 'ERR syntax error';
+
+/** Arity from Redis 7.2's command table, for the commands checked before they run: exact when positive, a minimum when negative. */
+const ARITY: Record<string, number> = {
+  xadd: -5,
+  xlen: 2,
+  xrange: -4,
+  xrevrange: -4,
+  xdel: -3,
+  xtrim: -4,
+  xread: -4,
+  xreadgroup: -7,
+  xack: -4,
+  xpending: -3,
+  xclaim: -6,
+  xautoclaim: -6,
+  xgroup: -2,
+  xinfo: -2,
+  linsert: 5,
+  lset: 4,
+  lpushx: -3,
+  rpushx: -3,
+  lmove: 5,
+  rpoplpush: 3,
+  lpos: -3,
+  blpop: -3,
+  brpop: -3,
+  blmove: 6,
+  brpoplpush: 4,
+  sinter: -2,
+  sunion: -2,
+  sdiff: -2,
+  sinterstore: -3,
+  sunionstore: -3,
+  sdiffstore: -3,
+  smove: 4,
+  srandmember: -2,
+  smismember: -3,
+  zunionstore: -4,
+  zinterstore: -4,
+  zrandmember: -2,
+  zmscore: -3,
+  getex: -2,
+  msetnx: -3,
+  getbit: 3,
+  setbit: 4,
+  bitcount: -2,
+  pfmerge: -2,
+  hstrlen: 3,
+  hrandfield: -2,
+  touch: -2,
+  copy: -3,
+  object: -2,
+};
+
+const arityError = (command: string): ReplyError =>
+  new ReplyError(`ERR wrong number of arguments for '${command}' command`);
+
+/** A container command's subcommand (XGROUP, XINFO, OBJECT), lower-cased, after Redis's lookup and arity errors. */
+const subcommand = (container: string, a: string[], arities: Record<string, number>): string => {
+  const sub = a[0].toLowerCase();
+  if (!Object.hasOwn(arities, sub))
+    throw new ReplyError(`ERR unknown subcommand '${a[0]}'. Try ${container.toUpperCase()} HELP.`);
+  const arity = arities[sub];
+  if (arity > 0 ? a.length + 1 !== arity : a.length + 1 < -arity) throw arityError(`${container}|${sub}`);
+  return sub;
+};
+
+const subcommandSyntax = (container: string, sub: string): ReplyError =>
+  new ReplyError(`ERR unknown subcommand or wrong number of arguments for '${sub}'. Try ${container} HELP.`);
+
+/** A container command's HELP reply (addReplyHelp). */
+const help = (container: string, lines: string[]): Reply => [
+  `${container} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:`,
+  ...lines,
+  'HELP',
+  '    Print this help.',
+];
+
+const XGROUP_HELP = [
+  'CREATE <key> <groupname> <id|$> [option]',
+  '    Create a new consumer group. Options are:',
+  '    * MKSTREAM',
+  '      Create the empty stream if it does not exist.',
+  '    * ENTRIESREAD entries_read',
+  "      Set the group's entries_read counter (internal use).",
+  'CREATECONSUMER <key> <groupname> <consumer>',
+  '    Create a new consumer in the specified group.',
+  'DELCONSUMER <key> <groupname> <consumer>',
+  '    Remove the specified consumer.',
+  'DESTROY <key> <groupname>',
+  '    Remove the specified group.',
+  'SETID <key> <groupname> <id|$> [ENTRIESREAD entries_read]',
+  '    Set the current group ID and entries_read counter.',
+];
+
+const XINFO_HELP = [
+  'CONSUMERS <key> <groupname>',
+  '    Show consumers of <groupname>.',
+  'GROUPS <key>',
+  '    Show the stream consumer groups.',
+  'STREAM <key> [FULL [COUNT <count>]',
+  '    Show information about the stream.',
+];
+
+const OBJECT_HELP = [
+  'ENCODING <key>',
+  '    Return the kind of internal representation used in order to store the value',
+  '    associated with a <key>.',
+  'FREQ <key>',
+  '    Return the access frequency index of the <key>. The returned integer is',
+  '    proportional to the logarithm of the recent access frequency of the key.',
+  'IDLETIME <key>',
+  '    Return the idle time of the <key>, that is the approximated number of',
+  '    seconds elapsed since the last access to the key.',
+  'REFCOUNT <key>',
+  '    Return the number of references of the value associated with the specified',
+  '    <key>.',
+];
+
+/** A string Redis would store as a 64-bit integer (string2ll: no sign but `-`, no leading zeros). */
+const isInt64 = (s: string): boolean =>
+  /^(0|-?[1-9]\d{0,18})$/.test(s) && BigInt(s) >= -(2n ** 63n) && BigInt(s) < 2n ** 63n;
+
+/**
+ * OBJECT ENCODING, from the value's contents and Redis 7.2's default thresholds. Redis does not
+ * convert a value back when it shrinks below them again; this answers from the contents now.
+ */
+const encoding = (v: Value): string => {
+  switch (v.kind) {
+    case 'string':
+      if (v.raw) return 'raw';
+      return isInt64(v.value) ? 'int' : v.value.length <= 44 ? 'embstr' : 'raw';
+    case 'list':
+      // list-max-listpack-size -2: one listpack of up to 8 KB, about two bytes of overhead per element.
+      return v.value.reduce((n, e) => n + e.length + 2, 7) <= 8192 ? 'listpack' : 'quicklist';
+    case 'set': {
+      const members = [...v.value];
+      if (members.length <= 512 && members.every(isInt64)) return 'intset';
+      return members.length <= 128 && members.every(m => m.length <= 64) ? 'listpack' : 'hashtable';
+    }
+    case 'hash':
+      return v.value.size <= 128 && [...v.value].every(([f, x]) => f.length <= 64 && x.length <= 64)
+        ? 'listpack'
+        : 'hashtable';
+    case 'zset':
+      return v.value.size <= 128 && [...v.value.keys()].every(m => m.length <= 64) ? 'listpack' : 'skiplist';
+    case 'stream':
+      return 'stream';
+  }
+};
+
+/** SRANDMEMBER/ZRANDMEMBER/HRANDFIELD's count, and their one optional flag (WITHSCORES, WITHVALUES). */
+const randomCount = (a: string[], flag: string): number => {
+  const count = int(a[1]);
+  if (a.length > 3 || (a.length === 3 && a[2].toUpperCase() !== flag)) throw new ReplyError(SYNTAX);
+  // WITHSCORES doubles the reply: Redis takes at most LONG_MAX / 2.
+  if (a.length === 3 && Math.abs(count) >= 2 ** 62) throw new ReplyError('ERR value is out of range');
+  return count;
+};
+
+/**
+ * Random members, picked deterministically: the first `count` in order (Redis picks at random; a fixed
+ * order keeps checks repeatable), and for a negative count, -count picks that repeat in turn.
+ */
+const pick = <T>(items: T[], count: number): T[] =>
+  count >= 0 ? items.slice(0, count) : Array.from({length: -count}, (_, i) => items[i % items.length]);
+
+const listEnd = (arg: string): 'LEFT' | 'RIGHT' => {
+  const end = arg.toUpperCase();
+  if (end !== 'LEFT' && end !== 'RIGHT') throw new ReplyError(SYNTAX);
+  return end;
+};
+
+/** A score as Redis replies with it (d2string): shortest round-trip digits, `inf`, `-inf`, `-0`. */
+const scoreString = (score: number): string =>
+  score === Infinity ? 'inf' : score === -Infinity ? '-inf' : Object.is(score, -0) ? '-0' : String(score);
+
 /** The unit given after BYRADIUS/BYBOX in a GEOSEARCH, for WITHDIST. */
 const searchUnit = (a: string[]): string => {
   const i = a.findIndex(t => t.toUpperCase() === 'BYRADIUS');
@@ -1243,15 +3040,11 @@ export class Redis {
     });
   }
 
-  /** `redis.call('set', key, value, 'EX', 60)`: any command by name. */
-  call(command: string, ...args: Arg[]): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      try {
-        resolve(shapeReply(command, SERVER.execute([wireCommand(command), ...flatten(args)])));
-      } catch (e) {
-        reject(e);
-      }
-    });
+  /** `redis.call('set', key, value, 'EX', 60)`: any command by name. Blocking ones (BLPOP, XREAD BLOCK …) wait. */
+  async call(command: string, ...args: Arg[]): Promise<unknown> {
+    const wire = [wireCommand(command), ...flatten(args)];
+    const reply = isBlocking(wire) ? await SERVER.executeBlocking(wire) : SERVER.execute(wire);
+    return shapeReply(command, reply);
   }
 
   /** ioredis's `defineCommand`: a Lua script callable as `redis.<name>(key…, arg…)`. */
@@ -1417,19 +3210,19 @@ export class Pipeline {
     return this.queue.length;
   }
 
-  /** `[error, reply]` per command, as ioredis does. A MULTI pipeline runs atomically on the server. */
+  /**
+   * `[error, reply]` per command, as ioredis does. A MULTI pipeline runs atomically on the server
+   * (a blocking command there answers at once); in a plain one, a blocking command that waits holds the rest.
+   */
   async exec(): Promise<[Error | null, unknown][]> {
     const commands = this.queue.splice(0);
-    const run = (c: string[]): string[] => [wireCommand(c[0]), ...c.slice(1)];
-    const shaped = (r: Reply, i: number): unknown => shapeReply(commands[i][0], r);
-    if (this.transactional) {
-      return SERVER.executeTransaction(commands.map(run)).map((r, i) =>
-        r instanceof ReplyError ? [r, null] : [null, shaped(r, i)],
-      );
-    }
-    return SERVER.executePipeline(commands.map(run)).map((r, i) =>
-      r instanceof ReplyError ? [r, null] : [null, shaped(r, i)],
-    );
+    const wire = commands.map(c => [wireCommand(c[0]), ...c.slice(1)]);
+    const replies = this.transactional
+      ? SERVER.executeTransaction(wire)
+      : wire.some(isBlocking)
+      ? await SERVER.executePipelineBlocking(wire)
+      : SERVER.executePipeline(wire);
+    return replies.map((r, i) => (r instanceof ReplyError ? [r, null] : [null, shapeReply(commands[i][0], r)]));
   }
 }
 
@@ -1524,6 +3317,64 @@ const KNOWN_COMMANDS = new Set([
   'hmset',
   'publish',
   'pubsub',
+  'script',
+  'scan',
+  'rename',
+  'renamenx',
+  'expireat',
+  'pexpireat',
+  'touch',
+  'copy',
+  'object',
+  'getex',
+  'msetnx',
+  'getbit',
+  'setbit',
+  'bitcount',
+  'pfadd',
+  'pfcount',
+  'pfmerge',
+  'hstrlen',
+  'hrandfield',
+  'lpushx',
+  'rpushx',
+  'linsert',
+  'lset',
+  'lpos',
+  'lmove',
+  'rpoplpush',
+  'blpop',
+  'brpop',
+  'blmove',
+  'brpoplpush',
+  'spop',
+  'srandmember',
+  'smismember',
+  'smove',
+  'sinter',
+  'sinterstore',
+  'sunion',
+  'sunionstore',
+  'sdiff',
+  'sdiffstore',
+  'zmscore',
+  'zrandmember',
+  'zunionstore',
+  'zinterstore',
+  'xadd',
+  'xlen',
+  'xrange',
+  'xrevrange',
+  'xdel',
+  'xtrim',
+  'xread',
+  'xreadgroup',
+  'xack',
+  'xpending',
+  'xclaim',
+  'xautoclaim',
+  'xgroup',
+  'xinfo',
 ]);
 
 export default Redis;

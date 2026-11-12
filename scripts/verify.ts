@@ -56,6 +56,7 @@ import {clangVersion, CPP_RUNTIME_MANIFEST, cppPackFromSources, cppRuntimeFresh}
 import {fetchCpp} from './fetch-cpp';
 import {fetchTorch} from './fetch-torch';
 import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
+import {redisSelfTest} from './redis-selftest';
 import {renderSummaries} from './summaries';
 
 const args = process.argv.slice(2);
@@ -780,8 +781,16 @@ function protoCollisions(problems: Problem[], only: Problem[] | null): string[] 
 }
 
 async function main(): Promise<void> {
-  const errors: string[] = [...judgeSelfTest(), ...goRuntimeFreshness(), ...cppRuntimeFreshness()];
-  console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests, Go and C++ runtimes built from these sources`);
+  // The Redis self-test moves the shared virtual clock (and resets it): it runs before any runtime boots.
+  const errors: string[] = [
+    ...judgeSelfTest(),
+    ...(await redisSelfTest()),
+    ...goRuntimeFreshness(),
+    ...cppRuntimeFreshness(),
+  ];
+  console.log(
+    `${errors.length === 0 ? '✓' : '✗'} judge and Redis self-tests, Go and C++ runtimes built from these sources`,
+  );
   const problems = await loadProblems();
   // `--file` verifies a course the index may not import yet; the summaries are of the index.
   if (onlyFile === null) {

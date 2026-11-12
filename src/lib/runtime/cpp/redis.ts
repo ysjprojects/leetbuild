@@ -1,7 +1,8 @@
 /**
  * Redis for the C++ runtime: the server every language's checks share (../ts/redis.ts), as the
  * redis-plus-plus model (cppruntime/include/sw/redis++/redis++.h) and the harness's own client
- * reach it. A reply crosses as `{r: reply}`, or `{e: message}` for an error reply.
+ * reach it. A reply crosses as `{r: reply}`, or `{e: message}` for an error reply. Blocking commands
+ * come through the asynchronous calls, the calling thread waiting while the server holds them.
  */
 import * as redis from '../ts/redis';
 import type {Bridge, BridgeWorld} from './bridge';
@@ -56,6 +57,18 @@ export function redisBridge(world: BridgeWorld): Bridge {
         subscriptions.get(handle)?.();
         subscriptions.delete(handle);
       },
+    },
+    asyncCalls: {
+      // A blocking command (BLPOP, BLMOVE, XREAD … BLOCK, …): the calling thread waits on the virtual
+      // clock until another client's write answers it, or its timeout does.
+      'redis.executeBlocking': ({args, record}: {args: string[]; record: boolean}): Promise<Tagged> =>
+        redis.SERVER.executeBlocking(args, record).then(
+          r => ({r}),
+          (e: unknown) => ({e: e instanceof Error ? e.message : String(e)}),
+        ),
+      // A pipeline holding one: its later commands run once the blocking one answers.
+      'redis.executePipelineBlocking': async (commands: string[][]): Promise<Tagged[]> =>
+        each(await redis.SERVER.executePipelineBlocking(commands)),
     },
   };
 }
