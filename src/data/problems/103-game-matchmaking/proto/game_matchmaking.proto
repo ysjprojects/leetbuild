@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package matchmakerd;
+
+// The game server allocator step 3 calls once a roster is claimed: it reserves a dedicated server
+// for the match and answers where the players connect. UNAVAILABLE and DEADLINE_EXCEEDED say
+// nothing about the match (try again shortly); RESOURCE_EXHAUSTED means the fleet has no free
+// server, which another attempt a second later will not change.
+service Allocator {
+  rpc Allocate(AllocateRequest) returns (Allocation);
+}
+
+message AllocateRequest {
+  string match_id = 1;
+  repeated string players = 2;
+}
+
+message Allocation {
+  string server_id = 1;
+  string address = 2;
+}

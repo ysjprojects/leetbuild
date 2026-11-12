@@ -8,348 +8,248 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'policy'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/requests\` with body
-\`{"chain_id": "spend", "why": "new laptop", "amount_cents": 420000, "approvers": [...]}\`, reads the
-tenant from \`X-Tenant-Id\` and the requester from \`X-User-Id\`, stores the request under a fresh
-uuid and answers **201** with the request id. It serves the demo and hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/requests\` with body
+\`{"chain_id", "why", "amount_cents", "approvers"}\`, the tenant from \`X-Tenant-Id\` and the requester
+from \`X-User-Id\` (401 without them, 400 on a malformed \`chain_id\`). It resolves the chain with
+\`policy.resolve_approvers\` (404 for an unknown one), uses the body's \`approvers\` when there are
+any, stores the request with \`store.put\`, opens it with \`chain.start_chain\` and answers **201**
+\`{request_id, chain_version, approvers, replayed}\`. It serves the demo and hides 4 flaws.
 
-**Failure mode the checks target.** An approver list taken from the body makes the chain a
-formality: the requester names a friendly colleague, or themselves, and the chain approves
-whatever it is handed. An uncapped \`why\` turns the audit field into a blob that outlives the
-request, and an un-keyed submit turns every client retry into a second request with a second chain.
+**Failure mode the checks target.** A requester who names their own approvers, or who sits on the
+policy's chain, signs off their own spend; an unbounded \`why\` turns an audit field into a blob; a
+client retry opens a second request with a second chain.
 
-- Either identity header missing is **401**; \`chain_id\` must match
-  \`^[a-z0-9][a-z0-9_-]{1,31}$\` (**400** otherwise); an unknown chain id is the policy store's
-  answer, not a reason to invent a chain.
-- \`why\` is a non-empty string of at most **4 KiB** (\`1 << 12\` bytes) of UTF-8; larger is **413**.
-- Approvers are **resolved from the chain policy at submit time** and the chain definition
-  **version is pinned** on the stored request (\`chain_version\`). The body's \`approvers\` array is
-  accepted and discarded.
-- **Self-approval is rejected at resolution time**: when the requester appears in the resolved
-  chain the submit is **409** (\`requester_cannot_approve\`) and nothing is stored.
-- \`Idempotency-Key\` is required (**400** when missing). A replay with the same \`(tenant, key)\`
-  returns the **original** \`request_id\` with \`"replayed": true\` instead of creating a second
-  request with its own chain.`,
+- Approvers come from the policy only, its \`version\` pinned as \`chain_version\`; the body's
+  \`approvers\` is ignored.
+- A requester on the resolved chain is **409** \`requester_cannot_approve\` and nothing is stored.
+- \`why\` is non-empty (**400**) and at most \`MAX_WHY_BYTES\` = 4096 bytes of UTF-8 (**413**).
+- \`Idempotency-Key\` is required (**400**). Look up \`store.get(tenant, key)\` before resolving and
+  answer a replay with the stored request: **200**, \`"replayed": true\`.`,
   sequence: {
-    participants: ['Client', 'Approval API', 'chain policy', 'request store'],
+    participants: ['Client', 'Approval API', 'request store', 'chain policy'],
     messages: [
-      {from: 'Client', to: 'Approval API', label: 'POST /v1/requests · X-Tenant-Id · X-User-Id', kind: 'sync'},
       {
-        from: 'Approval API',
+        from: 'Client',
         to: 'Approval API',
-        label: 'validate tenant · requester · chain id · why ≤ 4 KiB',
+        label: 'POST /v1/requests · X-Tenant-Id · X-User-Id · Idempotency-Key',
         kind: 'sync',
       },
-      {from: 'Approval API', to: 'request store', label: 'get(tenant, Idempotency-Key)', kind: 'sync'},
-      {from: 'request store', to: 'Approval API', label: 'stored request / none', kind: 'reply'},
-      {from: 'Approval API', to: 'chain policy', label: 'chains.get(chain_id) · pin version', kind: 'sync'},
+      {from: 'Approval API', to: 'Approval API', label: 'chain_id · why ≤ 4096 bytes', kind: 'sync'},
+      {from: 'Approval API', to: 'request store', label: 'get(tenant, key)', kind: 'sync'},
+      {from: 'request store', to: 'Approval API', label: 'stored request → 200 replayed', kind: 'reply'},
+      {from: 'Approval API', to: 'chain policy', label: 'resolve_approvers(chain_id)', kind: 'sync'},
       {from: 'chain policy', to: 'Approval API', label: '{version, approvers}', kind: 'reply'},
-      {from: 'Approval API', to: 'Approval API', label: 'requester in approvers → 409, nothing stored', kind: 'sync'},
-      {from: 'Approval API', to: 'request store', label: 'put(tenant, key, request)', kind: 'async'},
+      {from: 'Approval API', to: 'Approval API', label: 'requester on the chain → 409', kind: 'sync'},
+      {from: 'Approval API', to: 'request store', label: 'put(request, key) · start_chain', kind: 'sync'},
       {from: 'Approval API', to: 'Client', label: '201 {request_id, chain_version, approvers}', kind: 'reply'},
     ],
   },
   hints: [
-    'Submit a request whose `approvers` lists the requester, then post the same body twice with one `Idempotency-Key`: both land as 201 with two different request ids, and the requester is on their own chain.',
-    'The handler copies `body.approvers` straight into the stored request and mints `uuid4()` before looking at any header, so the policy store (`chains.get(chain_id)`) and the idempotency lookup are both bypassed.',
-    'Look up `(tenant, Idempotency-Key)` first and replay the stored id; then `resolve_approvers(chain_id)` for `(version, approvers)`, 409 when the requester is in it, 413 past `MAX_WHY_BYTES`, and store `chain_version`.',
+    'Submit as the director with `"approvers": ["u-friend"]`: the request is accepted and u-friend is the only approver. Post the same body twice with one `Idempotency-Key`: two request ids, two chains.',
+    'The handler prefers `body.approvers` over the policy, never compares the requester with the chain it resolved, measures nothing about `why`, and writes the key with `store.put` without ever reading it back.',
+    'Read the key first (400 without it) and replay `store.get(tenant, key)` with 200; then 400/413 on `why` by UTF-8 bytes; approvers from `resolve_approvers` only; 409 `requester_cannot_approve` when the requester is on them.',
   ],
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/requests',
-      detail: 'Register the submit route on `POST /v1/requests`.',
+      detail: 'Register the submit route on `POST /v1/requests`, store the request and open its chain.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/requests["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/requests['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/v1\/requests"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"requests"\s*\)/, /\bpost\s*\{/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"requests"\s*\)/, /\bpost\b/]},
         cpp: {all: [/svr\.Post\(\s*"\/v1\/requests"/]},
       },
     },
     {
       id: 'policy-approvers',
-      title: 'Resolves the approvers from the pinned chain policy',
+      title: 'Takes the approvers from the policy only',
       detail:
-        'Approvers come from `resolve_approvers(chain_id)`, the policy store’s chain definition, and its `version` is pinned on the request as `chain_version`. The caller’s `approvers` array is not read.',
+        'The approvers are the ones `resolve_approvers` returns and its version is pinned as `chain_version`; the body’s `approvers` is never read. The starter lets the caller name the chain.',
       match: {
         python: {all: [/resolve_approvers\(/, /chain_version/], none: [/body\.approvers/]},
         typescript: {all: [/resolveApprovers\(/, /chain_version/], none: [/body\.approvers/]},
-        go: {all: [/resolveApprovers\(/, /chainVersion/], none: [/body\.Approvers/]},
-        scala: {all: [/resolveApprovers\(/, /chainVersion/], none: [/body\.approvers/]},
-        cpp: {all: [/resolve_approvers\(/, /chain_version/], none: [/body\["approvers"\]/]},
+        go: {all: [/policy\.ResolveApprovers\(/, /ChainVersion/], none: [/body\.Approvers/]},
+        scala: {all: [/Policy\.resolveApprovers\(/, /chainVersion/], none: [/"approvers"\)/]},
+        cpp: {all: [/policy::resolveApprovers\(/, /version/], none: [/body(\.value\(|\[)\s*"approvers"/]},
       },
     },
     {
       id: 'self-approval',
-      title: 'Rejects a chain the requester appears in',
+      title: 'Rejects a requester who is on their own chain',
       detail:
-        'When the requester is one of the resolved approvers, the submit is **409** with reason `requester_cannot_approve` and nothing is stored. The starter accepts whatever list it is given.',
+        'When the requester is one of the resolved approvers the submit is **409** `requester_cannot_approve` and nothing is stored, no request and no chain.',
       match: {
-        python: {all: [/requester_cannot_approve/, /status_code\s*=\s*409/]},
-        typescript: {all: [/requester_cannot_approve/, /code\(\s*409\s*\)/]},
-        go: {all: [/requesterCannotApprove/, /StatusConflict/]},
-        scala: {all: [/RequesterCannotApprove/, /StatusCodes\.Conflict/]},
+        python: {all: [/requester_cannot_approve/, /\b409\b/]},
+        typescript: {all: [/requester_cannot_approve/, /\b409\b/]},
+        go: {all: [/requester_cannot_approve/, /StatusConflict|\b409\b/]},
+        scala: {all: [/requester_cannot_approve/, /Conflict|\b409\b/]},
         cpp: {all: [/requester_cannot_approve/, /\b409\b/]},
       },
     },
     {
       id: 'why-cap',
-      title: 'Caps the why field at 4 KiB',
+      title: 'Caps why at 4096 bytes of UTF-8',
       detail:
-        '`why` is measured in bytes against a 4 KiB (`1 << 12`) cap and answered with **413** when it is larger. The starter stores whatever length arrives.',
+        '`why` is required (400 when empty) and measured in UTF-8 bytes against 4096 (`MAX_WHY_BYTES`): larger is **413** and nothing is stored. A character count lets 2049 two-byte characters through.',
       match: {
-        python: {all: [/MAX_WHY_BYTES/, /status_code\s*=\s*413/]},
-        typescript: {all: [/MAX_WHY_BYTES/, /code\(\s*413\s*\)/]},
-        go: {all: [/maxWhyBytes/, /StatusRequestEntityTooLarge/]},
-        scala: {all: [/MaxWhyBytes/, /StatusCodes\.RequestEntityTooLarge/]},
-        cpp: {all: [/kMaxWhyBytes/, /\b413\b/]},
+        python: {all: [/4096|1\s*<<\s*12/, /\.encode\(/, /\b413\b/]},
+        typescript: {all: [/4096|1\s*<<\s*12/, /byteLength\(/, /\b413\b/]},
+        go: {all: [/4096|1\s*<<\s*12/, /StatusRequestEntityTooLarge|\b413\b/]},
+        scala: {all: [/4096|1\s*<<\s*12/, /getBytes\(/, /PayloadTooLarge|RequestEntityTooLarge|\b413\b/]},
+        cpp: {all: [/4096|1\s*<<\s*12/, /\b413\b/]},
       },
     },
     {
       id: 'idempotency',
-      title: 'Replays return the original request id',
+      title: 'Replays a retried submit',
       detail:
-        '`Idempotency-Key` is required and the request is looked up under `(tenant, key)` before resolution; a replay answers with the stored `request_id` and `"replayed": true`. The starter ignores the header and mints a new request per call.',
+        '`Idempotency-Key` is required (400) and looked up with `store.get(tenant, key)` before the chain is resolved; a hit answers the stored request with `"replayed": true` instead of storing a second one.',
       match: {
-        python: {all: [/Idempotency-Key/, /store\.get\(/, /replayed/]},
-        typescript: {all: [/idempotency-key/, /store\.get\(/, /replayed/]},
-        go: {all: [/Idempotency-Key/, /store\.Get\(/, /replayed/]},
-        scala: {all: [/Idempotency-Key/, /store\.get\(/, /replayed/]},
-        cpp: {all: [/Idempotency-Key/, /store\.get\(/, /replayed/]},
+        python: {all: [/idempotency-key/i], order: [/store\.get\(/, /resolve_approvers\(/]},
+        typescript: {all: [/idempotency-key/i], order: [/store\.get\(/, /resolveApprovers\(/]},
+        go: {all: [/Idempotency-Key/i], order: [/store\.Get\(/, /policy\.ResolveApprovers\(/]},
+        scala: {all: [/Idempotency-Key/i], order: [/Store\.get\(/, /Policy\.resolveApprovers\(/]},
+        cpp: {all: [/Idempotency-Key/i], order: [/store::get\(/, /policy::resolveApprovers\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import uuid
+      starter: `import re
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-
-
-class SubmitRequest(BaseModel):
-    chain_id: str
-    why: str
-    amount_cents: int = 0
-    approvers: list[str] = []
-
-
-class Chains:
-    def get(self, chain_id: str) -> dict:
-        """The chain definition: {"version": int, "approvers": [actor ids]}."""
-        raise NotImplementedError
-
-
-class RequestStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The request stored under (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, request: dict) -> None:
-        """Store the request under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-chains = Chains()
-store = RequestStore()
-
-
-@app.post("/v1/requests")
-def submit(
-    body: SubmitRequest,
-    tenant: str = Header(alias="X-Tenant-Id"),
-    requester: str = Header(alias="X-User-Id"),
-) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    request_id = str(uuid.uuid4())
-    request = {
-        "request_id": request_id,
-        "tenant": tenant,
-        "requester": requester,
-        "chain_id": body.chain_id,
-        "approvers": body.approvers,
-        "why": body.why,
-    }
-    store.put(tenant, request_id, request)
-    return JSONResponse({"request_id": request_id, "approvers": body.approvers}, status_code=201)
-`,
-      solution: `import re
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from approvals import chain, policy, store  # resolve_approvers · new_request_id, get, put · start_chain
 
 app = FastAPI()
 
 CHAIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
-MAX_WHY_BYTES = 1 << 12
 
 
-class SubmitRequest(BaseModel):
+class SubmitBody(BaseModel):
     chain_id: str
     why: str
     amount_cents: int = 0
     approvers: list[str] = []
 
 
-class Chains:
-    def get(self, chain_id: str) -> dict:
-        """The chain definition: {"version": int, "approvers": [actor ids]}."""
-        raise NotImplementedError
-
-
-class RequestStore:
-    def get(self, tenant: str, idem_key: str) -> dict | None:
-        """The request stored under (tenant, idem_key), if any."""
-        raise NotImplementedError
-
-    def put(self, tenant: str, idem_key: str, request: dict) -> None:
-        """Store the request under (tenant, idem_key)."""
-        raise NotImplementedError
-
-
-chains = Chains()
-store = RequestStore()
-
-
-def resolve_approvers(chain_id: str) -> tuple[int, list[str]]:
-    """The approvers of the pinned chain version, resolved at submit time."""
-    chain = chains.get(chain_id)
-    return int(chain["version"]), list(chain["approvers"])
+def error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
 
 
 @app.post("/v1/requests")
-def submit(
-    body: SubmitRequest,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-    requester: str | None = Header(default=None, alias="X-User-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    if requester is None or requester == "":
-        raise HTTPException(status_code=401, detail="missing X-User-Id")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if not CHAIN_ID_RE.match(body.chain_id):
-        raise HTTPException(status_code=400, detail="invalid chain_id")
-    if body.why == "":
-        raise HTTPException(status_code=400, detail="why must be a non-empty string")
-    why_bytes = len(body.why.encode("utf-8"))
-    if why_bytes > MAX_WHY_BYTES:
-        raise HTTPException(status_code=413, detail="why exceeds 4 KiB")
-
-    stored = store.get(tenant, idem_key)
-    if stored is not None:
-        return JSONResponse({"request_id": stored["request_id"], "replayed": True}, status_code=200)
-
-    # The caller's approvers are the one field of the body this endpoint never reads.
-    chain_version, approvers = resolve_approvers(body.chain_id)
-    if requester in approvers:
-        raise HTTPException(status_code=409, detail="requester_cannot_approve")
-
-    request = {
-        "request_id": str(uuid.uuid4()),
+def submit(body: SubmitBody, request: Request) -> JSONResponse:
+    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    requester = request.headers.get("x-user-id", "")
+    if not tenant or not requester:
+        return error(401, "X-Tenant-Id and X-User-Id are required")
+    if not CHAIN_ID_RE.fullmatch(body.chain_id):
+        return error(400, "invalid chain_id")
+    resolved = policy.resolve_approvers(body.chain_id)
+    if resolved is None:
+        return error(404, "unknown chain")
+    approvers = body.approvers or resolved["approvers"]  # the requester may narrow the chain for their request
+    record = {
+        "request_id": store.new_request_id(),
         "tenant": tenant,
         "requester": requester,
         "chain_id": body.chain_id,
-        "chain_version": chain_version,
+        "chain_version": resolved["version"],
         "approvers": approvers,
-        "why_bytes": why_bytes,
+        "why": body.why,
+        "amount_cents": body.amount_cents,
     }
-    store.put(tenant, idem_key, request)
-    return JSONResponse({"request_id": request["request_id"], "chain_version": chain_version}, status_code=201)
+    store.put(record, request.headers.get("idempotency-key", ""))
+    chain.start_chain(record["request_id"], approvers)
+    return JSONResponse(
+        {"request_id": record["request_id"], "chain_version": record["chain_version"], "approvers": approvers, "replayed": False},
+        status_code=201,
+    )
+`,
+      solution: `import re
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from approvals import chain, policy, store  # resolve_approvers · new_request_id, get, put · start_chain
+
+app = FastAPI()
+
+CHAIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,31}$")
+MAX_WHY_BYTES = 4096
+
+
+class SubmitBody(BaseModel):
+    chain_id: str
+    why: str
+    amount_cents: int = 0
+    approvers: list[str] = []  # accepted for old clients, never read
+
+
+def error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
+
+
+def answer(record: dict, status: int, replayed: bool) -> JSONResponse:
+    body = {"request_id": record["request_id"], "chain_version": record["chain_version"], "approvers": record["approvers"], "replayed": replayed}
+    return JSONResponse(body, status_code=status)
+
+
+@app.post("/v1/requests")
+def submit(body: SubmitBody, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    requester = request.headers.get("x-user-id", "")
+    if not tenant or not requester:
+        return error(401, "X-Tenant-Id and X-User-Id are required")
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return error(400, "Idempotency-Key is required")
+    if not CHAIN_ID_RE.fullmatch(body.chain_id):
+        return error(400, "invalid chain_id")
+    if not body.why:
+        return error(400, "why is required")
+    if len(body.why.encode("utf-8")) > MAX_WHY_BYTES:
+        return error(413, f"why is longer than {MAX_WHY_BYTES} bytes")
+    stored = store.get(tenant, key)
+    if stored is not None:
+        return answer(stored, 200, True)  # a retry gets the request its first attempt created
+    resolved = policy.resolve_approvers(body.chain_id)
+    if resolved is None:
+        return error(404, "unknown chain")
+    # The policy decides who approves; the version is pinned so a later edit cannot reshape this chain.
+    if requester in resolved["approvers"]:
+        return error(409, "requester_cannot_approve")
+    record = {
+        "request_id": store.new_request_id(),
+        "tenant": tenant,
+        "requester": requester,
+        "chain_id": body.chain_id,
+        "chain_version": resolved["version"],
+        "approvers": resolved["approvers"],
+        "why": body.why,
+        "amount_cents": body.amount_cents,
+    }
+    store.put(record, key)
+    chain.start_chain(record["request_id"], record["approvers"])
+    return answer(record, 201, False)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/requests. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
-
-export const app = Fastify();
-
-export interface ChainDefinition {
-  version: number;
-  approvers: string[];
-}
-
-export interface StoredRequest {
-  request_id: string;
-  tenant: string;
-  requester: string;
-  chain_id: string;
-  approvers: string[];
-}
-
-interface SubmitBody {
-  chain_id: string;
-  why: string;
-  amount_cents?: number;
-  approvers?: string[];
-}
-
-export const chains = {
-  async get(chainId: string): Promise<ChainDefinition> {
-    throw new Error(\`chains.get(\${chainId}) is not wired up\`);
-  },
-};
-
-export const store = {
-  async get(tenant: string, idemKey: string): Promise<StoredRequest | null> {
-    throw new Error(\`store.get(\${tenant}, \${idemKey}) is not wired up\`);
-  },
-  async put(tenant: string, idemKey: string, request: StoredRequest): Promise<void> {
-    throw new Error(\`store.put(\${tenant}, \${idemKey}) is not wired up\`);
-  },
-};
-
-app.post('/v1/requests', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const requester = request.headers['x-user-id'] as string;
-  const body = request.body as SubmitBody;
-  const stored: StoredRequest = {
-    request_id: randomUUID(),
-    tenant,
-    requester,
-    chain_id: body.chain_id,
-    approvers: body.approvers ?? [],
-  };
-  await store.put(tenant, stored.request_id, stored);
-  return reply.code(201).send({request_id: stored.request_id, approvers: stored.approvers});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** POST /v1/requests: resolve the chain from the pinned policy, never from the caller. */
-import {randomUUID} from 'node:crypto';
-
-import Fastify from 'fastify';
+import * as chain from 'approvals/chain'; // startChain
+import * as policy from 'approvals/policy'; // resolveApprovers
+import * as store from 'approvals/store'; // newRequestId, get, put
 
 export const app = Fastify();
 
 const CHAIN_ID_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
-const MAX_WHY_BYTES = 1 << 12;
-
-export interface ChainDefinition {
-  version: number;
-  approvers: string[];
-}
-
-export interface StoredRequest {
-  request_id: string;
-  tenant: string;
-  requester: string;
-  chain_id: string;
-  chain_version: number;
-  approvers: string[];
-}
 
 interface SubmitBody {
   chain_id: string;
@@ -358,440 +258,405 @@ interface SubmitBody {
   approvers?: string[];
 }
 
-export const chains = {
-  async get(chainId: string): Promise<ChainDefinition> {
-    throw new Error(\`chains.get(\${chainId}) is not wired up\`);
-  },
-};
-
-export const store = {
-  async get(tenant: string, idemKey: string): Promise<StoredRequest | null> {
-    throw new Error(\`store.get(\${tenant}, \${idemKey}) is not wired up\`);
-  },
-  async put(tenant: string, idemKey: string, request: StoredRequest): Promise<void> {
-    throw new Error(\`store.put(\${tenant}, \${idemKey}) is not wired up\`);
-  },
-};
-
-/** The approvers of the pinned chain version, resolved at submit time. */
-async function resolveApprovers(chainId: string): Promise<[number, string[]]> {
-  const chain = await chains.get(chainId);
-  return [chain.version, [...chain.approvers]];
-}
-
 app.post('/v1/requests', async (request, reply) => {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
   const requester = request.headers['x-user-id'];
-  if (typeof requester !== 'string' || requester === '')
-    return reply.code(401).send({error: 'missing X-User-Id'});
-  const idemKey = request.headers['idempotency-key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<SubmitBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.chain_id !== 'string')
-    return reply.code(400).send({error: 'chain_id is required'});
-  if (!CHAIN_ID_RE.test(body.chain_id)) return reply.code(400).send({error: 'invalid chain_id'});
-  if (typeof body.why !== 'string' || body.why === '')
-    return reply.code(400).send({error: 'why must be a non-empty string'});
-  const whyBytes = Buffer.byteLength(body.why, 'utf8');
-  if (whyBytes > MAX_WHY_BYTES) return reply.code(413).send({error: 'why exceeds 4 KiB'});
-
-  const stored = await store.get(tenant, idemKey);
-  if (stored !== null) return reply.code(200).send({request_id: stored.request_id, replayed: true});
-
-  // The caller's approvers are the one field of the body this endpoint never reads.
-  const [chainVersion, approvers] = await resolveApprovers(body.chain_id);
-  if (approvers.includes(requester))
-    return reply.code(409).send({error: 'requester_cannot_approve'});
-
-  const created: StoredRequest = {
-    request_id: randomUUID(),
+  if (typeof tenant !== 'string' || tenant === '' || typeof requester !== 'string' || requester === '') {
+    return reply.code(401).send({error: 'X-Tenant-Id and X-User-Id are required'});
+  }
+  const body = request.body as SubmitBody;
+  if (!CHAIN_ID_RE.test(body.chain_id ?? '')) return reply.code(400).send({error: 'invalid chain_id'});
+  const resolved = await policy.resolveApprovers(body.chain_id);
+  if (resolved === null) return reply.code(404).send({error: 'unknown chain'});
+  // the requester may narrow the chain for their request
+  const approvers = body.approvers !== undefined && body.approvers.length > 0 ? body.approvers : resolved.approvers;
+  const record: store.ApprovalRequest = {
+    request_id: await store.newRequestId(),
     tenant,
     requester,
     chain_id: body.chain_id,
-    chain_version: chainVersion,
+    chain_version: resolved.version,
     approvers,
+    why: body.why,
+    amount_cents: body.amount_cents ?? 0,
   };
-  await store.put(tenant, idemKey, created);
-  return reply.code(201).send({request_id: created.request_id, chain_version: chainVersion});
+  const key = request.headers['idempotency-key'];
+  await store.put(record, typeof key === 'string' ? key : '');
+  await chain.startChain(record.request_id, approvers);
+  return reply.code(201).send({request_id: record.request_id, chain_version: record.chain_version, approvers, replayed: false});
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import * as chain from 'approvals/chain'; // startChain
+import * as policy from 'approvals/policy'; // resolveApprovers
+import * as store from 'approvals/store'; // newRequestId, get, put
+
+export const app = Fastify();
+
+const CHAIN_ID_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
+export const MAX_WHY_BYTES = 4096;
+
+interface SubmitBody {
+  chain_id: string;
+  why: string;
+  amount_cents?: number;
+  approvers?: string[]; // accepted for old clients, never read
+}
+
+const answer = (record: store.ApprovalRequest, replayed: boolean) => ({
+  request_id: record.request_id,
+  chain_version: record.chain_version,
+  approvers: record.approvers,
+  replayed,
 });
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+app.post('/v1/requests', async (request, reply) => {
+  const tenant = request.headers['x-tenant-id'];
+  const requester = request.headers['x-user-id'];
+  if (typeof tenant !== 'string' || tenant === '' || typeof requester !== 'string' || requester === '') {
+    return reply.code(401).send({error: 'X-Tenant-Id and X-User-Id are required'});
+  }
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const body = request.body as SubmitBody;
+  if (!CHAIN_ID_RE.test(body.chain_id ?? '')) return reply.code(400).send({error: 'invalid chain_id'});
+  if (typeof body.why !== 'string' || body.why === '') return reply.code(400).send({error: 'why is required'});
+  if (Buffer.byteLength(body.why, 'utf8') > MAX_WHY_BYTES) {
+    return reply.code(413).send({error: \`why is longer than \${MAX_WHY_BYTES} bytes\`});
+  }
+  const stored = await store.get(tenant, key);
+  if (stored !== null) return reply.code(200).send(answer(stored, true)); // a retry gets the request its first attempt created
+  const resolved = await policy.resolveApprovers(body.chain_id);
+  if (resolved === null) return reply.code(404).send({error: 'unknown chain'});
+  // The policy decides who approves; the version is pinned so a later edit cannot reshape this chain.
+  if (resolved.approvers.includes(requester)) return reply.code(409).send({error: 'requester_cannot_approve'});
+  const record: store.ApprovalRequest = {
+    request_id: await store.newRequestId(),
+    tenant,
+    requester,
+    chain_id: body.chain_id,
+    chain_version: resolved.version,
+    approvers: resolved.approvers,
+    why: body.why,
+    amount_cents: body.amount_cents ?? 0,
+  };
+  await store.put(record, key);
+  await chain.startChain(record.request_id, record.approvers);
+  return reply.code(201).send(answer(record, false));
+});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
-	"net/http"
-
-	"github.com/google/uuid"
-)
-
-type SubmitRequest struct {
-	ChainID    string   \`json:"chain_id"\`
-	Why        string   \`json:"why"\`
-	AmountCents int64   \`json:"amount_cents"\`
-	Approvers  []string \`json:"approvers"\`
-}
-
-type Chains struct{}
-
-func (c *Chains) Get(ctx context.Context, chainID string) (map[string]any, error) { return nil, nil }
-
-type RequestStore struct{}
-
-func (s *RequestStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *RequestStore) Put(ctx context.Context, tenant, idemKey string, request map[string]any) error {
-	return nil
-}
-
-var (
-	chains = &Chains{}
-	store  = &RequestStore{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func submit(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	tenant := r.Header.Get("X-Tenant-Id")
-	requester := r.Header.Get("X-User-Id")
-	var body SubmitRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	requestID := uuid.NewString()
-	request := map[string]any{
-		"request_id": requestID,
-		"tenant":     tenant,
-		"requester":  requester,
-		"chain_id":   body.ChainID,
-		"approvers":  body.Approvers,
-	}
-	if err := store.Put(r.Context(), tenant, requestID, request); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	writeJSON(rw, http.StatusCreated, map[string]any{"request_id": requestID, "approvers": body.Approvers})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/requests", submit)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
-}
-`,
-      solution: `package main
-
-import (
-	"context"
-	"encoding/json"
-	"log"
 	"net/http"
 	"regexp"
 
-	"github.com/google/uuid"
+	"approvals/chain"  // chain.StartChain
+	"approvals/policy" // policy.ResolveApprovers
+	"approvals/store"  // store.NewRequestID, Get, Put
 )
-
-const maxWhyBytes = 1 << 12
-
-const requesterCannotApprove = "requester_cannot_approve"
 
 var chainIDRe = regexp.MustCompile(\`^[a-z0-9][a-z0-9_-]{1,31}$\`)
 
-type SubmitRequest struct {
+type submitBody struct {
 	ChainID     string   \`json:"chain_id"\`
 	Why         string   \`json:"why"\`
 	AmountCents int64    \`json:"amount_cents"\`
 	Approvers   []string \`json:"approvers"\`
 }
 
-type Chains struct{}
-
-func (c *Chains) Get(ctx context.Context, chainID string) (map[string]any, error) { return nil, nil }
-
-type RequestStore struct{}
-
-func (s *RequestStore) Get(ctx context.Context, tenant, idemKey string) (map[string]any, error) {
-	return nil, nil
+type submitted struct {
+	RequestID    string   \`json:"request_id"\`
+	ChainVersion int      \`json:"chain_version"\`
+	Approvers    []string \`json:"approvers"\`
+	Replayed     bool     \`json:"replayed"\`
 }
 
-func (s *RequestStore) Put(ctx context.Context, tenant, idemKey string, request map[string]any) error {
-	return nil
-}
-
-var (
-	chains = &Chains{}
-	store  = &RequestStore{}
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-// resolveApprovers returns the approvers of the pinned chain version.
-func resolveApprovers(ctx context.Context, chainID string) (int, []string) {
-	chain, _ := chains.Get(ctx, chainID)
-	version, _ := chain["version"].(float64)
-	raw, _ := chain["approvers"].([]any)
-	approvers := make([]string, 0, len(raw))
-	for _, a := range raw {
-		approvers = append(approvers, a.(string))
-	}
-	return int(version), approvers
+func fail(rw http.ResponseWriter, status int, message string) {
+	writeJSON(rw, status, map[string]string{"error": message})
 }
 
 func submit(rw http.ResponseWriter, r *http.Request) {
-	tenant := r.Header.Get("X-Tenant-Id")
-	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+	ctx := r.Context()
+	tenant, requester := r.Header.Get("X-Tenant-Id"), r.Header.Get("X-User-Id")
+	if tenant == "" || requester == "" {
+		fail(rw, http.StatusUnauthorized, "X-Tenant-Id and X-User-Id are required")
 		return
 	}
-	requester := r.Header.Get("X-User-Id")
-	if requester == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-User-Id"})
+	var body submitBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !chainIDRe.MatchString(body.ChainID) {
+		fail(rw, http.StatusBadRequest, "invalid chain_id")
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
+	resolved, err := policy.ResolveApprovers(ctx, body.ChainID)
+	if err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
 		return
 	}
-	var body SubmitRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if resolved == nil {
+		fail(rw, http.StatusNotFound, "unknown chain")
 		return
 	}
-	if !chainIDRe.MatchString(body.ChainID) {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid chain_id"})
+	approvers := body.Approvers // the requester may narrow the chain for their request
+	if len(approvers) == 0 {
+		approvers = resolved.Approvers
+	}
+	requestID, err := store.NewRequestID(ctx)
+	if err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
+		return
+	}
+	record := &store.Request{RequestID: requestID, Tenant: tenant, Requester: requester, ChainID: body.ChainID,
+		ChainVersion: resolved.Version, Approvers: approvers, Why: body.Why, AmountCents: body.AmountCents}
+	if err := store.Put(ctx, record, r.Header.Get("Idempotency-Key")); err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := chain.StartChain(ctx, requestID, approvers); err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(rw, http.StatusCreated, submitted{RequestID: requestID, ChainVersion: record.ChainVersion, Approvers: approvers})
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/requests", submit)
+}
+`,
+      solution: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"regexp"
+	"slices"
+
+	"approvals/chain"  // chain.StartChain
+	"approvals/policy" // policy.ResolveApprovers
+	"approvals/store"  // store.NewRequestID, Get, Put
+)
+
+var chainIDRe = regexp.MustCompile(\`^[a-z0-9][a-z0-9_-]{1,31}$\`)
+
+const maxWhyBytes = 4096
+
+type submitBody struct {
+	ChainID     string   \`json:"chain_id"\`
+	Why         string   \`json:"why"\`
+	AmountCents int64    \`json:"amount_cents"\`
+	Approvers   []string \`json:"approvers"\` // accepted for old clients, never read
+}
+
+type submitted struct {
+	RequestID    string   \`json:"request_id"\`
+	ChainVersion int      \`json:"chain_version"\`
+	Approvers    []string \`json:"approvers"\`
+	Replayed     bool     \`json:"replayed"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func fail(rw http.ResponseWriter, status int, message string) {
+	writeJSON(rw, status, map[string]string{"error": message})
+}
+
+func submit(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	tenant, requester := r.Header.Get("X-Tenant-Id"), r.Header.Get("X-User-Id")
+	if tenant == "" || requester == "" {
+		fail(rw, http.StatusUnauthorized, "X-Tenant-Id and X-User-Id are required")
+		return
+	}
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		fail(rw, http.StatusBadRequest, "Idempotency-Key is required")
+		return
+	}
+	var body submitBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !chainIDRe.MatchString(body.ChainID) {
+		fail(rw, http.StatusBadRequest, "invalid chain_id")
 		return
 	}
 	if body.Why == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "why must be a non-empty string"})
+		fail(rw, http.StatusBadRequest, "why is required")
 		return
 	}
-	if len([]byte(body.Why)) > maxWhyBytes {
-		writeJSON(rw, http.StatusRequestEntityTooLarge, map[string]string{"error": "why exceeds 4 KiB"})
+	if len(body.Why) > maxWhyBytes { // len counts the UTF-8 bytes
+		fail(rw, http.StatusRequestEntityTooLarge, fmt.Sprintf("why is longer than %d bytes", maxWhyBytes))
 		return
 	}
-	stored, err := store.Get(r.Context(), tenant, idemKey)
+	stored, err := store.Get(ctx, tenant, key)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		fail(rw, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if stored != nil {
-		writeJSON(rw, http.StatusOK, map[string]any{"request_id": stored["request_id"], "replayed": true})
+	if stored != nil { // a retry gets the request its first attempt created
+		writeJSON(rw, http.StatusOK, submitted{RequestID: stored.RequestID, ChainVersion: stored.ChainVersion, Approvers: stored.Approvers, Replayed: true})
 		return
 	}
-
-	// The caller's approvers are the one field of the body this endpoint never reads.
-	chainVersion, approvers := resolveApprovers(r.Context(), body.ChainID)
-	for _, a := range approvers {
-		if a == requester {
-			writeJSON(rw, http.StatusConflict, map[string]string{"error": requesterCannotApprove})
-			return
-		}
-	}
-	requestID := uuid.NewString()
-	request := map[string]any{
-		"request_id":    requestID,
-		"tenant":        tenant,
-		"requester":     requester,
-		"chain_id":      body.ChainID,
-		"chain_version": chainVersion,
-		"approvers":     approvers,
-	}
-	if err := store.Put(r.Context(), tenant, idemKey, request); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	resolved, err := policy.ResolveApprovers(ctx, body.ChainID)
+	if err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(rw, http.StatusCreated, map[string]any{"request_id": requestID, "chain_version": chainVersion})
+	if resolved == nil {
+		fail(rw, http.StatusNotFound, "unknown chain")
+		return
+	}
+	// The policy decides who approves; the version is pinned so a later edit cannot reshape this chain.
+	if slices.Contains(resolved.Approvers, requester) {
+		fail(rw, http.StatusConflict, "requester_cannot_approve")
+		return
+	}
+	requestID, err := store.NewRequestID(ctx)
+	if err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
+		return
+	}
+	record := &store.Request{RequestID: requestID, Tenant: tenant, Requester: requester, ChainID: body.ChainID,
+		ChainVersion: resolved.Version, Approvers: resolved.Approvers, Why: body.Why, AmountCents: body.AmountCents}
+	if err := store.Put(ctx, record, key); err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := chain.StartChain(ctx, requestID, record.Approvers); err != nil {
+		fail(rw, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(rw, http.StatusCreated, submitted{RequestID: requestID, ChainVersion: record.ChainVersion, Approvers: record.Approvers})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/requests", submit)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-import java.util.UUID
-
-final case class SubmitRequest(chain_id: String, why: String, amount_cents: Long, approvers: List[String])
-final case class ChainDefinition(version: Int, approvers: List[String])
-final case class StoredRequest(
-    request_id: String,
-    tenant: String,
-    requester: String,
-    chain_id: String,
-    approvers: List[String]
-)
+import approvals.{Chain, Policy, Store} // Policy.resolveApprovers · Store.newRequestId, get, put · Chain.startChain
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("approval-workflow")
-  implicit val submitFormat: RootJsonFormat[SubmitRequest] = jsonFormat4(SubmitRequest)
-  implicit val storedFormat: RootJsonFormat[StoredRequest] = jsonFormat5(StoredRequest)
+  val ChainIdRe = "^[a-z0-9][a-z0-9_-]{1,31}$".r
 
-  class Chains {
-    def get(chainId: String): ChainDefinition = throw new NotImplementedError("chains.get")
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  def submit(tenant: String, requester: String, idemKey: String, raw: String): HttpResponse = {
+    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+    if (tenant.isEmpty || requester.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id and X-User-Id are required")
+    val fields = raw.parseJson.asJsObject.fields
+    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+    val chainId = text("chain_id")
+    if (!ChainIdRe.matches(chainId)) return error(StatusCodes.BadRequest, "invalid chain_id")
+    Policy.resolveApprovers(chainId) match {
+      case None => error(StatusCodes.NotFound, "unknown chain")
+      case Some(resolved) =>
+        // the requester may narrow the chain for their request
+        val named = fields.get("approvers").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
+        val approvers = if (named.nonEmpty) named else resolved.approvers
+        val amount = fields.get("amount_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+        val record = Store.Request(Store.newRequestId(), tenant, requester, chainId, resolved.version, approvers, text("why"), amount)
+        Store.put(record, idemKey)
+        Chain.startChain(record.requestId, approvers)
+        json(StatusCodes.Created, JsObject(
+          "request_id" -> JsString(record.requestId), "chain_version" -> JsNumber(record.chainVersion),
+          "approvers" -> JsArray(approvers.map(JsString(_)).toVector), "replayed" -> JsBoolean(false)))
+    }
   }
 
-  class RequestStore {
-    def get(tenant: String, idemKey: String): Option[StoredRequest] = throw new NotImplementedError("store.get")
-    def put(tenant: String, idemKey: String, request: StoredRequest): Unit = throw new NotImplementedError("store.put")
-  }
-
-  val chains = new Chains
-  val store = new RequestStore
-
-  val route: Route =
-    path("v1" / "requests") {
-      post {
-        headerValueByName("X-Tenant-Id") { tenant =>
-          headerValueByName("X-User-Id") { requester =>
-            entity(as[SubmitRequest]) { body =>
-              // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-              val request = StoredRequest(UUID.randomUUID().toString, tenant, requester, body.chain_id, body.approvers)
-              store.put(tenant, request.request_id, request)
-              complete(StatusCodes.Created, request)
-            }
+  val route: Route = path("v1" / "requests") {
+    post {
+      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("X-User-Id") & optionalHeaderValueByName("Idempotency-Key")) {
+        (tenant, requester, idemKey) =>
+          entity(as[String]) { raw =>
+            complete(submit(tenant.getOrElse(""), requester.getOrElse(""), idemKey.getOrElse(""), raw))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import java.nio.charset.StandardCharsets.UTF_8
+
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-import java.nio.charset.StandardCharsets
-import java.util.UUID
-
-final case class SubmitRequest(chain_id: String, why: String, amount_cents: Long, approvers: List[String])
-final case class ChainDefinition(version: Int, approvers: List[String])
-final case class StoredRequest(
-    request_id: String,
-    tenant: String,
-    requester: String,
-    chain_id: String,
-    chain_version: Int,
-    approvers: List[String]
-)
+import approvals.{Chain, Policy, Store} // Policy.resolveApprovers · Store.newRequestId, get, put · Chain.startChain
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("approval-workflow")
-  implicit val submitFormat: RootJsonFormat[SubmitRequest] = jsonFormat4(SubmitRequest)
-  implicit val storedFormat: RootJsonFormat[StoredRequest] = jsonFormat6(StoredRequest)
-
   val ChainIdRe = "^[a-z0-9][a-z0-9_-]{1,31}$".r
-  val MaxWhyBytes = 1 << 12
-  val RequesterCannotApprove = "requester_cannot_approve"
+  val MaxWhyBytes = 4096
 
-  class Chains {
-    def get(chainId: String): ChainDefinition = throw new NotImplementedError("chains.get")
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  private def answer(status: StatusCode, record: Store.Request, replayed: Boolean): HttpResponse =
+    json(status, JsObject(
+      "request_id" -> JsString(record.requestId), "chain_version" -> JsNumber(record.chainVersion),
+      "approvers" -> JsArray(record.approvers.map(JsString(_)).toVector), "replayed" -> JsBoolean(replayed)))
+
+  def submit(tenant: String, requester: String, idemKey: String, raw: String): HttpResponse = {
+    if (tenant.isEmpty || requester.isEmpty) return error(StatusCodes.Unauthorized, "X-Tenant-Id and X-User-Id are required")
+    if (idemKey.isEmpty) return error(StatusCodes.BadRequest, "Idempotency-Key is required")
+    val fields = raw.parseJson.asJsObject.fields
+    def text(name: String): String = fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+    val chainId = text("chain_id")
+    val why = text("why")
+    if (!ChainIdRe.matches(chainId)) return error(StatusCodes.BadRequest, "invalid chain_id")
+    if (why.isEmpty) return error(StatusCodes.BadRequest, "why is required")
+    if (why.getBytes(UTF_8).length > MaxWhyBytes) return error(StatusCodes.PayloadTooLarge, s"why is longer than $MaxWhyBytes bytes")
+    // a retry gets the request its first attempt created
+    val stored = Store.get(tenant, idemKey)
+    if (stored.isDefined) return answer(StatusCodes.OK, stored.get, replayed = true)
+    Policy.resolveApprovers(chainId) match {
+      case None => error(StatusCodes.NotFound, "unknown chain")
+      // The policy decides who approves; the version is pinned so a later edit cannot reshape this chain.
+      case Some(resolved) if resolved.approvers.contains(requester) => error(StatusCodes.Conflict, "requester_cannot_approve")
+      case Some(resolved) =>
+        val amount = fields.get("amount_cents").collect { case JsNumber(n) => n.toLong }.getOrElse(0L)
+        val record = Store.Request(Store.newRequestId(), tenant, requester, chainId, resolved.version, resolved.approvers, why, amount)
+        Store.put(record, idemKey)
+        Chain.startChain(record.requestId, record.approvers)
+        answer(StatusCodes.Created, record, replayed = false)
+    }
   }
 
-  class RequestStore {
-    def get(tenant: String, idemKey: String): Option[StoredRequest] = throw new NotImplementedError("store.get")
-    def put(tenant: String, idemKey: String, request: StoredRequest): Unit = throw new NotImplementedError("store.put")
-  }
-
-  val chains = new Chains
-  val store = new RequestStore
-
-  /** The approvers of the pinned chain version, resolved at submit time. */
-  def resolveApprovers(chainId: String): (Int, List[String]) = {
-    val chain = chains.get(chainId)
-    (chain.version, chain.approvers)
-  }
-
-  val route: Route =
-    path("v1" / "requests") {
-      post {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          optionalHeaderValueByName("X-User-Id") { requesterOpt =>
-            optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-              entity(as[SubmitRequest]) { body =>
-                if (!tenantOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-                } else if (!requesterOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.Unauthorized, """{"error":"missing X-User-Id"}""")
-                } else if (!idemOpt.exists(_.nonEmpty)) {
-                  complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-                } else if (ChainIdRe.findFirstIn(body.chain_id).isEmpty) {
-                  complete(StatusCodes.BadRequest, """{"error":"invalid chain_id"}""")
-                } else if (body.why.isEmpty) {
-                  complete(StatusCodes.BadRequest, """{"error":"why must be a non-empty string"}""")
-                } else if (body.why.getBytes(StandardCharsets.UTF_8).length > MaxWhyBytes) {
-                  complete(StatusCodes.RequestEntityTooLarge, """{"error":"why exceeds 4 KiB"}""")
-                } else {
-                  val tenant = tenantOpt.get
-                  val requester = requesterOpt.get
-                  val idemKey = idemOpt.get
-                  store.get(tenant, idemKey) match {
-                    case Some(stored) =>
-                      complete(StatusCodes.OK, s"""{"request_id":"\${stored.request_id}","replayed":true}""")
-                    case None =>
-                      // The caller's approvers are the one field of the body this endpoint never reads.
-                      val (chainVersion, approvers) = resolveApprovers(body.chain_id)
-                      if (approvers.contains(requester)) {
-                        complete(StatusCodes.Conflict, s"""{"error":"$RequesterCannotApprove"}""")
-                      } else {
-                        val request =
-                          StoredRequest(UUID.randomUUID().toString, tenant, requester, body.chain_id, chainVersion, approvers)
-                        store.put(tenant, idemKey, request)
-                        complete(
-                          StatusCodes.Created,
-                          s"""{"request_id":"\${request.request_id}","chain_version":$chainVersion}"""
-                        )
-                      }
-                  }
-                }
-              }
-            }
+  val route: Route = path("v1" / "requests") {
+    post {
+      (optionalHeaderValueByName("X-Tenant-Id") & optionalHeaderValueByName("X-User-Id") & optionalHeaderValueByName("Idempotency-Key")) {
+        (tenant, requester, idemKey) =>
+          entity(as[String]) { raw =>
+            complete(submit(tenant.getOrElse(""), requester.getOrElse(""), idemKey.getOrElse(""), raw))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -800,160 +665,519 @@ object Api {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <string>
-#include <vector>
-
-using json = nlohmann::json;
-
-struct Chains {
-  std::optional<json> get(const std::string& chainId);
-};
-
-struct RequestStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& request);
-};
-
-Chains chains;
-RequestStore store;
-std::string uuidString();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/requests", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto requester = req.get_header_value("X-User-Id");
-    const json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto requestId = uuidString();
-    const json request = {
-        {"request_id", requestId},
-        {"tenant", tenant},
-        {"requester", requester},
-        {"chain_id", body.value("chain_id", std::string())},
-        {"approvers", body.value("approvers", std::vector<std::string>())},
-    };
-    store.put(tenant, requestId, request);
-    res.status = 201;
-    res.set_content(json{{"request_id", requestId}, {"approvers", request["approvers"]}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
-`,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-
-#include <optional>
 #include <regex>
 #include <string>
 #include <vector>
 
+#include "approvals/chain.h"   // chain::startChain
+#include "approvals/policy.h"  // policy::resolveApprovers
+#include "approvals/store.h"   // store::newRequestId, get, put
+
 using json = nlohmann::json;
 
-constexpr std::size_t kMaxWhyBytes = 1 << 12;
 const std::regex kChainIdRe("^[a-z0-9][a-z0-9_-]{1,31}$");
 
-struct Chains {
-  std::optional<json> get(const std::string& chainId);
-};
-
-struct RequestStore {
-  std::optional<json> get(const std::string& tenant, const std::string& idemKey);
-  void put(const std::string& tenant, const std::string& idemKey, const json& request);
-};
-
-Chains chains;
-RequestStore store;
-std::string uuidString();
-
-/** The approvers of the pinned chain version, resolved at submit time. */
-std::pair<int, std::vector<std::string>> resolve_approvers(const std::string& chainId) {
-  const auto chain = chains.get(chainId);
-  if (!chain) return {0, {}};
-  return {chain->value("version", 0), chain->value("approvers", std::vector<std::string>{})};
+void send_json(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/requests", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto requester = req.get_header_value("X-User-Id");
-    if (requester.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-User-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    const json body = json::parse(req.body, nullptr, false);
-    const auto chainId = body.is_object() ? body.value("chain_id", std::string()) : std::string();
-    if (!std::regex_match(chainId, kChainIdRe)) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid chain_id"})", "application/json");
-      return;
-    }
-    const auto why = body.value("why", std::string());
-    if (why.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"why must be a non-empty string"})", "application/json");
-      return;
-    }
-    if (why.size() > kMaxWhyBytes) {
-      res.status = 413;
-      res.set_content(R"({"error":"why exceeds 4 KiB"})", "application/json");
-      return;
-    }
-    const auto stored = store.get(tenant, idemKey);
-    if (stored) {
-      res.status = 200;
-      res.set_content(json{{"request_id", (*stored)["request_id"]}, {"replayed", true}}.dump(), "application/json");
-      return;
-    }
-
-    // The caller's approvers are the one field of the body this endpoint never reads.
-    const auto [chainVersion, approvers] = resolve_approvers(chainId);
-    for (const auto& approver : approvers) {
-      if (approver == requester) {
-        res.status = 409;
-        res.set_content(R"({"error":"requester_cannot_approve"})", "application/json");
-        return;
-      }
-    }
-    const auto requestId = uuidString();
-    const json request = {
-        {"request_id", requestId},
-        {"tenant", tenant},
-        {"requester", requester},
-        {"chain_id", chainId},
-        {"chain_version", chainVersion},
-        {"approvers", approvers},
-    };
-    store.put(tenant, idemKey, request);
-    res.status = 201;
-    res.set_content(json{{"request_id", requestId}, {"chain_version", chainVersion}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void submit(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const std::string requester = req.get_header_value("X-User-Id");
+  if (tenant.empty() || requester.empty()) return send_json(res, 401, {{"error", "X-Tenant-Id and X-User-Id are required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !std::regex_match(body.value("chain_id", ""), kChainIdRe)) {
+    return send_json(res, 400, {{"error", "invalid chain_id"}});
+  }
+  const std::string chain_id = body["chain_id"];
+  const auto resolved = policy::resolveApprovers(chain_id);
+  if (!resolved) return send_json(res, 404, {{"error", "unknown chain"}});
+  // the requester may narrow the chain for their request
+  std::vector<std::string> approvers = body.value("approvers", std::vector<std::string>{});
+  if (approvers.empty()) approvers = resolved->approvers;
+  const store::Request record{store::newRequestId(), tenant,  requester, chain_id, resolved->version,
+                              approvers,             body.value("why", ""), body.value("amount_cents", 0LL)};
+  store::put(record, req.get_header_value("Idempotency-Key"));
+  chain::startChain(record.request_id, approvers);
+  send_json(res, 201, {{"request_id", record.request_id}, {"chain_version", record.chain_version}, {"approvers", approvers}, {"replayed", false}});
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/requests", submit); }
+`,
+      solution: `#include <httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <regex>
+#include <string>
+#include <vector>
+
+#include "approvals/chain.h"   // chain::startChain
+#include "approvals/policy.h"  // policy::resolveApprovers
+#include "approvals/store.h"   // store::newRequestId, get, put
+
+using json = nlohmann::json;
+
+const std::regex kChainIdRe("^[a-z0-9][a-z0-9_-]{1,31}$");
+constexpr size_t kMaxWhyBytes = 4096;
+
+void send_json(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
+
+json answer(const store::Request& record, bool replayed) {
+  return {{"request_id", record.request_id}, {"chain_version", record.chain_version}, {"approvers", record.approvers}, {"replayed", replayed}};
+}
+
+void submit(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  const std::string requester = req.get_header_value("X-User-Id");
+  if (tenant.empty() || requester.empty()) return send_json(res, 401, {{"error", "X-Tenant-Id and X-User-Id are required"}});
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return send_json(res, 400, {{"error", "Idempotency-Key is required"}});
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object() || !std::regex_match(body.value("chain_id", ""), kChainIdRe)) {
+    return send_json(res, 400, {{"error", "invalid chain_id"}});
+  }
+  const std::string chain_id = body["chain_id"];
+  const std::string why = body.value("why", "");
+  if (why.empty()) return send_json(res, 400, {{"error", "why is required"}});
+  // size() counts the UTF-8 bytes
+  if (why.size() > kMaxWhyBytes) return send_json(res, 413, {{"error", "why is longer than 4096 bytes"}});
+  // a retry gets the request its first attempt created
+  if (const auto stored = store::get(tenant, key)) return send_json(res, 200, answer(*stored, true));
+  const auto resolved = policy::resolveApprovers(chain_id);
+  if (!resolved) return send_json(res, 404, {{"error", "unknown chain"}});
+  // The policy decides who approves; the version is pinned so a later edit cannot reshape this chain.
+  const auto& approvers = resolved->approvers;
+  if (std::find(approvers.begin(), approvers.end(), requester) != approvers.end()) {
+    return send_json(res, 409, {{"error", "requester_cannot_approve"}});
+  }
+  const store::Request record{store::newRequestId(), tenant, requester, chain_id, resolved->version, approvers, why, body.value("amount_cents", 0LL)};
+  store::put(record, key);
+  chain::startChain(record.request_id, record.approvers);
+  send_json(res, 201, answer(record, false));
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/requests", submit); }
 `,
     },
   },
-  debrief: `The fix moves the trust boundary of the submit endpoint: the caller supplies a chain id, a reason and a key, and everything that decides who signs off comes from the system. Resolving approvers from the policy and pinning \`chain_version\` means an edit to the chain next week cannot re-route a request that is already in flight. The self-approval check sits at resolution time because that is the first moment the resolved list exists and the last moment before anything is stored. The idempotency lookup runs before resolution so a replay costs one read. Production approval services go further: they resolve approvers by role through a directory lookup rather than a fixed actor list, hash the pinned chain into the event trail, and expire unused idempotency keys.`,
+  harness: {
+    python: `from approvals import policy, store
+
+BODY = {"chain_id": "spend", "why": "new laptop", "amount_cents": 420000}
+
+
+def _api(ctx):
+    policy.define_chain("spend", 3, ["u-mgr", "u-dir"])
+    return ctx.client(ctx.load("api").app)
+
+
+def _headers(user="u-req", tenant="t-acme", key="k-1"):
+    headers = {"X-Tenant-Id": tenant, "X-User-Id": user}
+    if key:
+        headers["Idempotency-Key"] = key
+    return headers
+
+
+def _stored(ctx):
+    return sorted(ctx.redis.keys("request:r-*"))
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/requests", json=BODY, headers=_headers())
+        anonymous = await c.post("/v1/requests", json=BODY, headers={"Idempotency-Key": "k-2"})
+    assert r.status_code == 201, f"POST /v1/requests answered {r.status_code}: {r.text}"
+    request_id = r.json().get("request_id")
+    stored = store.load(request_id) if request_id else None
+    assert stored is not None, f"the submit answered {r.text} but no request {request_id!r} is in the store"
+    assert (stored["tenant"], stored["requester"], stored["why"]) == ("t-acme", "u-req", "new laptop"), f"the stored request is {stored}"
+    current = ctx.redis.hget(f"approval:{request_id}:state", "current_approver")
+    assert current == "u-mgr", f"the chain of {request_id} waits on {current!r}, expected its first approver u-mgr"
+    assert anonymous.status_code == 401, f"a submit without X-Tenant-Id and X-User-Id answered {anonymous.status_code}, expected 401"
+
+
+async def check_policy_approvers(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/requests", json={**BODY, "approvers": ["u-friend"]}, headers=_headers())
+        assert r.status_code == 201, f"a submit naming its own approvers answered {r.status_code}: {r.text}"
+        stored = store.load(r.json()["request_id"])
+        assert stored["approvers"] == ["u-mgr", "u-dir"], f"the stored chain is {stored['approvers']}: the requester named it. The approvers come from the policy (u-mgr, u-dir)"
+        assert stored["chain_version"] == 3, f"the stored chain_version is {stored['chain_version']}, expected the policy's version 3"
+        current = ctx.redis.hget(f"approval:{stored['request_id']}:state", "current_approver")
+        assert current == "u-mgr", f"the chain waits on {current!r}, expected the policy's first approver u-mgr"
+        policy.define_chain("spend", 4, ["u-mgr", "u-cfo"])
+        assert store.load(stored["request_id"])["chain_version"] == 3, "a policy edit after the submit changed the pinned request"
+        unknown = await c.post("/v1/requests", json={**BODY, "chain_id": "travel"}, headers=_headers(key="k-2"))
+    assert unknown.status_code == 404, f"a submit on an unknown chain answered {unknown.status_code}, expected 404"
+
+
+async def check_self_approval(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/requests", json=BODY, headers=_headers(user="u-dir"))
+        assert r.status_code == 409, f"the director submitted a request on a chain they approve and got {r.status_code}, expected 409"
+        assert "requester_cannot_approve" in r.text, f"the 409 must say requester_cannot_approve, got {r.text}"
+        assert _stored(ctx) == [] and ctx.redis.keys("approval:*") == [], f"a refused submit stored {_stored(ctx)} {ctx.redis.keys('approval:*')}"
+        r = await c.post("/v1/requests", json={**BODY, "approvers": ["u-friend"]}, headers=_headers(user="u-dir", key="k-2"))
+        assert r.status_code == 409, f"the director naming u-friend as approver got {r.status_code}: the policy's chain still holds the director, expected 409"
+        ok = await c.post("/v1/requests", json=BODY, headers=_headers(key="k-3"))
+    assert ok.status_code == 201, f"a requester who is not on the chain got {ok.status_code}: {ok.text}"
+
+
+async def check_why_cap(ctx):
+    async with _api(ctx) as c:
+        at_cap = await c.post("/v1/requests", json={**BODY, "why": "x" * 4096}, headers=_headers(key="k-1"))
+        assert at_cap.status_code == 201, f"a why of exactly 4096 bytes answered {at_cap.status_code}, expected 201"
+        over = await c.post("/v1/requests", json={**BODY, "why": "x" * 4097}, headers=_headers(key="k-2"))
+        assert over.status_code == 413, f"a why of 4097 bytes answered {over.status_code}, expected 413"
+        wide = await c.post("/v1/requests", json={**BODY, "why": "é" * 2049}, headers=_headers(key="k-3"))
+        assert wide.status_code == 413, f"a why of 2049 two-byte characters (4098 bytes) answered {wide.status_code}: measure UTF-8 bytes, not characters"
+        empty = await c.post("/v1/requests", json={**BODY, "why": ""}, headers=_headers(key="k-4"))
+        assert empty.status_code == 400, f"an empty why answered {empty.status_code}, expected 400"
+    assert len(_stored(ctx)) == 1, f"only the 4096-byte request may be stored, the store holds {_stored(ctx)}"
+
+
+async def check_idempotency(ctx):
+    async with _api(ctx) as c:
+        first = await c.post("/v1/requests", json=BODY, headers=_headers(key="k-1"))
+        assert first.status_code == 201, f"the first submit answered {first.status_code}: {first.text}"
+        replay = await c.post("/v1/requests", json=BODY, headers=_headers(key="k-1"))
+        assert replay.status_code == 200, f"a replay of Idempotency-Key k-1 answered {replay.status_code}, expected 200"
+        body = replay.json()
+        assert body.get("request_id") == first.json()["request_id"] and body.get("replayed") is True, f"the replay answered {body}, expected the original request_id {first.json()['request_id']} with replayed true"
+        assert len(_stored(ctx)) == 1, f"two submits with one Idempotency-Key stored {_stored(ctx)}: a retry opened a second chain"
+        other = await c.post("/v1/requests", json=BODY, headers=_headers(tenant="t-globex", key="k-1"))
+        assert other.status_code == 201 and other.json().get("request_id") != first.json()["request_id"], f"the same key from another tenant answered {other.status_code} {other.text}: keys are per tenant"
+        missing = await c.post("/v1/requests", json=BODY, headers=_headers(key=""))
+    assert missing.status_code == 400, f"a submit without Idempotency-Key answered {missing.status_code}, expected 400"
+`,
+    typescript: `const BODY = {chain_id: 'spend', why: 'new laptop', amount_cents: 420000};
+
+async function api(ctx) {
+  const policy = ctx.load('/support/approvals/policy.ts');
+  await policy.defineChain('spend', 3, ['u-mgr', 'u-dir']);
+  return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/approvals/store.ts'), policy};
+}
+
+function headers(user = 'u-req', tenant = 't-acme', key = 'k-1'): Record<string, string> {
+  const out: Record<string, string> = {'X-Tenant-Id': tenant, 'X-User-Id': user};
+  if (key !== '') out['Idempotency-Key'] = key;
+  return out;
+}
+
+const stored = ctx => (ctx.redis.keys('request:r-*') as string[]).sort();
+
+export async function check_route(ctx) {
+  const {c, store} = await api(ctx);
+  const r = await c.post('/v1/requests', {json: BODY, headers: headers()});
+  assert.equal(r.status, 201, \`POST /v1/requests answered \${r.status}: \${r.text}\`);
+  const requestId = r.json().request_id;
+  const record = requestId ? await store.load(requestId) : null;
+  assert(record !== null, \`the submit answered \${r.text} but no request \${requestId} is in the store\`);
+  assert(record.tenant === 't-acme' && record.requester === 'u-req' && record.why === 'new laptop', \`the stored request is \${JSON.stringify(record)}\`);
+  const current = ctx.redis.hget(\`approval:\${requestId}:state\`, 'current_approver');
+  assert.equal(current, 'u-mgr', \`the chain of \${requestId} waits on \${current}, expected its first approver u-mgr\`);
+  const anonymous = await c.post('/v1/requests', {json: BODY, headers: {'Idempotency-Key': 'k-2'}});
+  assert.equal(anonymous.status, 401, \`a submit without X-Tenant-Id and X-User-Id answered \${anonymous.status}, expected 401\`);
+}
+
+export async function check_policy_approvers(ctx) {
+  const {c, store, policy} = await api(ctx);
+  const r = await c.post('/v1/requests', {json: {...BODY, approvers: ['u-friend']}, headers: headers()});
+  assert.equal(r.status, 201, \`a submit naming its own approvers answered \${r.status}: \${r.text}\`);
+  const record = await store.load(r.json().request_id);
+  assert.deepEqual(record.approvers, ['u-mgr', 'u-dir'], \`the stored chain is \${JSON.stringify(record.approvers)}: the requester named it. The approvers come from the policy (u-mgr, u-dir)\`);
+  assert.equal(record.chain_version, 3, \`the stored chain_version is \${record.chain_version}, expected the policy's version 3\`);
+  const current = ctx.redis.hget(\`approval:\${record.request_id}:state\`, 'current_approver');
+  assert.equal(current, 'u-mgr', \`the chain waits on \${current}, expected the policy's first approver u-mgr\`);
+  await policy.defineChain('spend', 4, ['u-mgr', 'u-cfo']);
+  assert.equal((await store.load(record.request_id)).chain_version, 3, 'a policy edit after the submit changed the pinned request');
+  const unknown = await c.post('/v1/requests', {json: {...BODY, chain_id: 'travel'}, headers: headers('u-req', 't-acme', 'k-2')});
+  assert.equal(unknown.status, 404, \`a submit on an unknown chain answered \${unknown.status}, expected 404\`);
+}
+
+export async function check_self_approval(ctx) {
+  const {c} = await api(ctx);
+  let r = await c.post('/v1/requests', {json: BODY, headers: headers('u-dir')});
+  assert.equal(r.status, 409, \`the director submitted a request on a chain they approve and got \${r.status}, expected 409\`);
+  assert(r.text.includes('requester_cannot_approve'), \`the 409 must say requester_cannot_approve, got \${r.text}\`);
+  assert(stored(ctx).length === 0 && ctx.redis.keys('approval:*').length === 0, \`a refused submit stored \${JSON.stringify(stored(ctx))} \${JSON.stringify(ctx.redis.keys('approval:*'))}\`);
+  r = await c.post('/v1/requests', {json: {...BODY, approvers: ['u-friend']}, headers: headers('u-dir', 't-acme', 'k-2')});
+  assert.equal(r.status, 409, \`the director naming u-friend as approver got \${r.status}: the policy's chain still holds the director, expected 409\`);
+  const ok = await c.post('/v1/requests', {json: BODY, headers: headers('u-req', 't-acme', 'k-3')});
+  assert.equal(ok.status, 201, \`a requester who is not on the chain got \${ok.status}: \${ok.text}\`);
+}
+
+export async function check_why_cap(ctx) {
+  const {c} = await api(ctx);
+  const atCap = await c.post('/v1/requests', {json: {...BODY, why: 'x'.repeat(4096)}, headers: headers('u-req', 't-acme', 'k-1')});
+  assert.equal(atCap.status, 201, \`a why of exactly 4096 bytes answered \${atCap.status}, expected 201\`);
+  const over = await c.post('/v1/requests', {json: {...BODY, why: 'x'.repeat(4097)}, headers: headers('u-req', 't-acme', 'k-2')});
+  assert.equal(over.status, 413, \`a why of 4097 bytes answered \${over.status}, expected 413\`);
+  const wide = await c.post('/v1/requests', {json: {...BODY, why: 'é'.repeat(2049)}, headers: headers('u-req', 't-acme', 'k-3')});
+  assert.equal(wide.status, 413, \`a why of 2049 two-byte characters (4098 bytes) answered \${wide.status}: measure UTF-8 bytes, not characters\`);
+  const empty = await c.post('/v1/requests', {json: {...BODY, why: ''}, headers: headers('u-req', 't-acme', 'k-4')});
+  assert.equal(empty.status, 400, \`an empty why answered \${empty.status}, expected 400\`);
+  assert.equal(stored(ctx).length, 1, \`only the 4096-byte request may be stored, the store holds \${JSON.stringify(stored(ctx))}\`);
+}
+
+export async function check_idempotency(ctx) {
+  const {c} = await api(ctx);
+  const first = await c.post('/v1/requests', {json: BODY, headers: headers()});
+  assert.equal(first.status, 201, \`the first submit answered \${first.status}: \${first.text}\`);
+  const replay = await c.post('/v1/requests', {json: BODY, headers: headers()});
+  assert.equal(replay.status, 200, \`a replay of Idempotency-Key k-1 answered \${replay.status}, expected 200\`);
+  const body = replay.json();
+  assert(body.request_id === first.json().request_id && body.replayed === true, \`the replay answered \${replay.text}, expected the original request_id \${first.json().request_id} with replayed true\`);
+  assert.equal(stored(ctx).length, 1, \`two submits with one Idempotency-Key stored \${JSON.stringify(stored(ctx))}: a retry opened a second chain\`);
+  const other = await c.post('/v1/requests', {json: BODY, headers: headers('u-req', 't-globex', 'k-1')});
+  assert(other.status === 201 && other.json().request_id !== first.json().request_id, \`the same key from another tenant answered \${other.status} \${other.text}: keys are per tenant\`);
+  const missing = await c.post('/v1/requests', {json: BODY, headers: headers('u-req', 't-acme', '')});
+  assert.equal(missing.status, 400, \`a submit without Idempotency-Key answered \${missing.status}, expected 400\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"approvals/policy"
+	"approvals/store"
+
+	"leetbuild/harness"
+)
+
+var apiBg = context.Background()
+
+var apiBody = map[string]any{"chain_id": "spend", "why": "new laptop", "amount_cents": 420000}
+
+type apiAnswer struct {
+	RequestID    string   \`json:"request_id"\`
+	ChainVersion int      \`json:"chain_version"\`
+	Approvers    []string \`json:"approvers"\`
+	Replayed     bool     \`json:"replayed"\`
+}
+
+func apiServe(ctx *harness.Ctx) *harness.HTTP {
+	ctx.NoError(policy.DefineChain(apiBg, "spend", 3, []string{"u-mgr", "u-dir"}), "defining the spend chain")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func apiWith(field string, value any) map[string]any {
+	out := map[string]any{}
+	for k, v := range apiBody {
+		out[k] = v
+	}
+	out[field] = value
+	return out
+}
+
+func apiSubmit(c *harness.HTTP, body map[string]any, user, tenant, key string) *harness.Response {
+	header := []string{"X-Tenant-Id", tenant, "X-User-Id", user}
+	if key != "" {
+		header = append(header, "Idempotency-Key", key)
+	}
+	return c.Post("/v1/requests", body, header...)
+}
+
+func apiDecode(r *harness.Response) apiAnswer {
+	var a apiAnswer
+	r.Decode(&a)
+	return a
+}
+
+func apiLoad(ctx *harness.Ctx, requestID string) *store.Request {
+	record, err := store.Load(apiBg, requestID)
+	ctx.NoError(err, "store.Load(%s)", requestID)
+	return record
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := apiServe(ctx)
+	r := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	ctx.Equal(r.Status, 201, "POST /v1/requests (%s)", r.Text())
+	requestID := apiDecode(r).RequestID
+	record := apiLoad(ctx, requestID)
+	ctx.Assert(record != nil, "the submit answered %s but no request %q is in the store", r.Text(), requestID)
+	ctx.Assert(record.Tenant == "t-acme" && record.Requester == "u-req" && record.Why == "new laptop", "the stored request is %+v", record)
+	current, _ := ctx.Redis.HGet("approval:"+requestID+":state", "current_approver")
+	ctx.Equal(current, "u-mgr", "the chain of %s must wait on its first approver; current_approver", requestID)
+	anonymous := c.Post("/v1/requests", apiBody, "Idempotency-Key", "k-2")
+	ctx.Equal(anonymous.Status, 401, "a submit without X-Tenant-Id and X-User-Id")
+}
+
+func CheckPolicyApprovers(ctx *harness.Ctx) {
+	c := apiServe(ctx)
+	r := apiSubmit(c, apiWith("approvers", []string{"u-friend"}), "u-req", "t-acme", "k-1")
+	ctx.Equal(r.Status, 201, "a submit naming its own approvers (%s)", r.Text())
+	record := apiLoad(ctx, apiDecode(r).RequestID)
+	ctx.Assert(record != nil, "no request stored for %s", r.Text())
+	ctx.Equal(record.Approvers, []string{"u-mgr", "u-dir"}, "the requester named the chain; the approvers come from the policy. The stored approvers")
+	ctx.Equal(record.ChainVersion, 3, "the stored chain_version must be the policy's version 3")
+	current, _ := ctx.Redis.HGet("approval:"+record.RequestID+":state", "current_approver")
+	ctx.Equal(current, "u-mgr", "the chain must wait on the policy's first approver; current_approver")
+	ctx.NoError(policy.DefineChain(apiBg, "spend", 4, []string{"u-mgr", "u-cfo"}), "redefining the spend chain")
+	ctx.Equal(apiLoad(ctx, record.RequestID).ChainVersion, 3, "a policy edit after the submit must not change the pinned request; chain_version")
+	unknown := apiSubmit(c, apiWith("chain_id", "travel"), "u-req", "t-acme", "k-2")
+	ctx.Equal(unknown.Status, 404, "a submit on an unknown chain")
+}
+
+func CheckSelfApproval(ctx *harness.Ctx) {
+	c := apiServe(ctx)
+	r := apiSubmit(c, apiBody, "u-dir", "t-acme", "k-1")
+	ctx.Equal(r.Status, 409, "the director submitted a request on a chain they approve")
+	ctx.Assert(strings.Contains(r.Text(), "requester_cannot_approve"), "the 409 must say requester_cannot_approve, got %s", r.Text())
+	ctx.Assert(len(ctx.Redis.Keys("request:r-*")) == 0 && len(ctx.Redis.Keys("approval:*")) == 0, "a refused submit stored %q %q", ctx.Redis.Keys("request:r-*"), ctx.Redis.Keys("approval:*"))
+	r = apiSubmit(c, apiWith("approvers", []string{"u-friend"}), "u-dir", "t-acme", "k-2")
+	ctx.Equal(r.Status, 409, "the director naming u-friend as approver: the policy's chain still holds the director")
+	ok := apiSubmit(c, apiBody, "u-req", "t-acme", "k-3")
+	ctx.Equal(ok.Status, 201, "a requester who is not on the chain (%s)", ok.Text())
+}
+
+func CheckWhyCap(ctx *harness.Ctx) {
+	c := apiServe(ctx)
+	ctx.Equal(apiSubmit(c, apiWith("why", strings.Repeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes")
+	ctx.Equal(apiSubmit(c, apiWith("why", strings.Repeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes")
+	ctx.Equal(apiSubmit(c, apiWith("why", strings.Repeat("é", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters")
+	ctx.Equal(apiSubmit(c, apiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why")
+	ctx.Equal(len(ctx.Redis.Keys("request:r-*")), 1, "only the 4096-byte request may be stored; the stored requests")
+}
+
+func CheckIdempotency(ctx *harness.Ctx) {
+	c := apiServe(ctx)
+	first := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text())
+	replay := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1")
+	answer := apiDecode(replay)
+	ctx.Assert(answer.RequestID == apiDecode(first).RequestID && answer.Replayed, "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), apiDecode(first).RequestID)
+	ctx.Equal(len(ctx.Redis.Keys("request:r-*")), 1, "two submits with one Idempotency-Key must store one request (a retry opened a second chain); the stored requests")
+	other := apiSubmit(c, apiBody, "u-req", "t-globex", "k-1")
+	ctx.Assert(other.Status == 201 && apiDecode(other).RequestID != apiDecode(first).RequestID, "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text())
+	missing := apiSubmit(c, apiBody, "u-req", "t-acme", "")
+	ctx.Equal(missing.Status, 400, "a submit without Idempotency-Key")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "approvals/policy.h"
+#include "approvals/store.h"
+
+namespace {
+
+const nlohmann::json kBody = {{"chain_id", "spend"}, {"why", "new laptop"}, {"amount_cents", 420000}};
+
+harness::HTTP apiServe(harness::Ctx& ctx) {
+  policy::defineChain("spend", 3, {"u-mgr", "u-dir"});
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+nlohmann::json apiWith(const std::string& field, const nlohmann::json& value) {
+  nlohmann::json out = kBody;
+  out[field] = value;
+  return out;
+}
+
+harness::Response apiSubmit(harness::HTTP& c, const nlohmann::json& body, const std::string& user, const std::string& tenant, const std::string& key) {
+  if (key.empty()) return c.Post("/v1/requests", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "X-User-Id", user);
+  return c.Post("/v1/requests", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "X-User-Id", user, "Idempotency-Key", key);
+}
+
+std::string apiRequestId(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body.value("request_id", "") : "";
+}
+
+std::string repeat(const std::string& unit, int n) {
+  std::string out;
+  for (int i = 0; i < n; i++) out += unit;
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = apiServe(ctx);
+  const auto r = apiSubmit(c, kBody, "u-req", "t-acme", "k-1");
+  ctx.Equal(r.Status, 201, "POST /v1/requests (%s)", r.Text());
+  const std::string request_id = apiRequestId(r);
+  const auto record = store::load(request_id);
+  ctx.Assert(record.has_value(), "the submit answered %s but no request %q is in the store", r.Text(), request_id);
+  ctx.Assert(record->tenant == "t-acme" && record->requester == "u-req" && record->why == "new laptop", "the stored request is tenant %q requester %q why %q", record->tenant, record->requester, record->why);
+  ctx.Equal(ctx.Redis.HGet("approval:" + request_id + ":state", "current_approver"), std::optional<std::string>("u-mgr"), "the chain of %s must wait on its first approver; current_approver", request_id);
+  const auto anonymous = c.Post("/v1/requests", kBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
+  ctx.Equal(anonymous.Status, 401, "a submit without X-Tenant-Id and X-User-Id");
+}
+
+void CheckPolicyApprovers(harness::Ctx& ctx) {
+  auto c = apiServe(ctx);
+  const auto r = apiSubmit(c, apiWith("approvers", {"u-friend"}), "u-req", "t-acme", "k-1");
+  ctx.Equal(r.Status, 201, "a submit naming its own approvers (%s)", r.Text());
+  const auto record = store::load(apiRequestId(r));
+  ctx.Assert(record.has_value(), "no request stored for %s", r.Text());
+  ctx.Equal(record->approvers, std::vector<std::string>{"u-mgr", "u-dir"}, "the requester named the chain; the approvers come from the policy. The stored approvers");
+  ctx.Equal(record->chain_version, 3, "the stored chain_version must be the policy's version 3");
+  ctx.Equal(ctx.Redis.HGet("approval:" + record->request_id + ":state", "current_approver"), std::optional<std::string>("u-mgr"), "the chain must wait on the policy's first approver; current_approver");
+  policy::defineChain("spend", 4, {"u-mgr", "u-cfo"});
+  ctx.Equal(store::load(record->request_id)->chain_version, 3, "a policy edit after the submit must not change the pinned request; chain_version");
+  const auto unknown = apiSubmit(c, apiWith("chain_id", "travel"), "u-req", "t-acme", "k-2");
+  ctx.Equal(unknown.Status, 404, "a submit on an unknown chain");
+}
+
+void CheckSelfApproval(harness::Ctx& ctx) {
+  auto c = apiServe(ctx);
+  auto r = apiSubmit(c, kBody, "u-dir", "t-acme", "k-1");
+  ctx.Equal(r.Status, 409, "the director submitted a request on a chain they approve");
+  ctx.Assert(r.Text().find("requester_cannot_approve") != std::string::npos, "the 409 must say requester_cannot_approve, got %s", r.Text());
+  ctx.Assert(ctx.Redis.Keys("request:r-*").empty() && ctx.Redis.Keys("approval:*").empty(), "a refused submit stored %q %q", ctx.Redis.Keys("request:r-*"), ctx.Redis.Keys("approval:*"));
+  r = apiSubmit(c, apiWith("approvers", {"u-friend"}), "u-dir", "t-acme", "k-2");
+  ctx.Equal(r.Status, 409, "the director naming u-friend as approver: the policy's chain still holds the director");
+  const auto ok = apiSubmit(c, kBody, "u-req", "t-acme", "k-3");
+  ctx.Equal(ok.Status, 201, "a requester who is not on the chain (%s)", ok.Text());
+}
+
+void CheckWhyCap(harness::Ctx& ctx) {
+  auto c = apiServe(ctx);
+  ctx.Equal(apiSubmit(c, apiWith("why", repeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes");
+  ctx.Equal(apiSubmit(c, apiWith("why", repeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes");
+  ctx.Equal(apiSubmit(c, apiWith("why", repeat("\\u00e9", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters");
+  ctx.Equal(apiSubmit(c, apiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why");
+  ctx.Equal(ctx.Redis.Keys("request:r-*").size(), 1, "only the 4096-byte request may be stored; the stored requests");
+}
+
+void CheckIdempotency(harness::Ctx& ctx) {
+  auto c = apiServe(ctx);
+  const auto first = apiSubmit(c, kBody, "u-req", "t-acme", "k-1");
+  ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text());
+  const auto replay = apiSubmit(c, kBody, "u-req", "t-acme", "k-1");
+  ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1");
+  const auto body = nlohmann::json::parse(replay.Text(), nullptr, false);
+  ctx.Assert(apiRequestId(replay) == apiRequestId(first) && body.is_object() && body.value("replayed", false),
+             "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), apiRequestId(first));
+  ctx.Equal(ctx.Redis.Keys("request:r-*").size(), 1, "two submits with one Idempotency-Key must store one request (a retry opened a second chain); the stored requests");
+  const auto other = apiSubmit(c, kBody, "u-req", "t-globex", "k-1");
+  ctx.Assert(other.Status == 201 && apiRequestId(other) != apiRequestId(first), "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text());
+  ctx.Equal(apiSubmit(c, kBody, "u-req", "t-acme", "").Status, 400, "a submit without Idempotency-Key");
+}
+`,
+  },
+  debrief: `Every rule here protects the record an auditor reads later. The approvers come from the policy and the version is pinned because a chain is a statement about who had authority when the request was made; a caller-supplied list or a policy edit mid-flight would make that statement false. Self-approval is refused at resolution time, before anything is stored, so no half-made request exists to clean up. The key is read before the chain is resolved: a retry must find the first request, not compete with it. Production approval systems also expand group approvers and managers from a directory at that same moment, keep the idempotency record with an expiry, and apply separation-of-duties rules across chains, not just within one.`,
 };

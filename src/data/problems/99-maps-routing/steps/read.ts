@@ -2,56 +2,36 @@ import type {Step} from '@/lib/types';
 
 export const readStep: Step = {
   id: 'read',
-  title: 'GET /v1/routes/{id}: a route with provenance',
+  title: 'GET /v1/routes/{id}: a stored route with its provenance',
   concept: 'http',
   file: 'read',
   focus: ['client', 'api', 'store'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/routes/{id}\`, the read that hands one stored
-route back: it parses the route id, loads the record from the store, answers 404 when there is
-none, and otherwise returns the stored \`geometry\` and \`engine_version\` with the current traffic
-epoch stamped on. It compiles, it serves the demo, and it hides four flaws.
+**Starting point.** The starter serves \`GET /v1/routes/{route_id}\`, the read a reopened or shared
+trip uses: it loads the stored route with \`routes.load_route(route_id)\` (\`mapsd.routes\`: the route's
+fields and the \`tenant\` that computed it), answers **404** when there is none, and otherwise returns
+\`route_id\`, \`distance_m\`, \`duration_s\`, \`geometry\`, \`engine_version\` and
+\`epoch: current_epoch()\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** The current epoch stamped on stale geometry hides that the
-route was computed at rush hour, a dropped \`degraded\` dresses a straight-line fallback up as a
-road route, and a read that trusts only the id is a cross-tenant enumeration oracle.
+**Failure mode the checks target.** Any caller reads any tenant's routes by counting up ids (\`r-1\`,
+\`r-2\`, ...); a route solved at rush hour reads as solved a minute ago; and a straight-line estimate
+reads as a road route.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- A route is visible only to the tenant that computed it. An unknown id and another tenant's id
-  answer the same **404** with the same body, so the read cannot confirm that a foreign route exists.
-- The response carries the stored \`geometry\`, the \`epoch\` the geometry was computed in, the
-  \`engine_version\` that produced it, and the \`degraded\` marker when the fallback answered with a
-  straight-line estimate instead of a road route.
-- The reported \`epoch\` is the geometry's epoch, not the current traffic epoch stamped on old
-  geometry. \`stale\` is true whenever the geometry's epoch differs from the current epoch
-  (floor(now / 300)), so the caller can tell the snapshot from a fresh computation.
-- The read answers from the store or answers 404: it does not call the routing engine and does
-  not recompute.`,
+- No \`X-Tenant-Id\` is **401**.
+- Another tenant's route answers the same **404** and body as an unknown id.
+- \`epoch\` is the stored route's epoch, and \`stale\` is \`true\` when it differs from
+  \`current_epoch()\`.
+- \`degraded\` is the stored marker.`,
   sequence: {
     participants: ['Client', 'Maps API', 'Route store'],
     messages: [
       {from: 'Client', to: 'Maps API', label: 'GET /v1/routes/{id} · X-Tenant-Id', kind: 'sync'},
-      {from: 'Maps API', to: 'Maps API', label: 'tenant missing → 401', kind: 'sync'},
-      {from: 'Maps API', to: 'Route store', label: 'get(route_id)', kind: 'sync'},
-      {
-        from: 'Route store',
-        to: 'Maps API',
-        label: 'record {tenant, geometry, epoch, engine_version, degraded} / none',
-        kind: 'reply',
-      },
-      {
-        from: 'Maps API',
-        to: 'Maps API',
-        label: 'record.tenant ≠ tenant → 404 · stale = record.epoch ≠ floor(now / 300)',
-        kind: 'sync',
-      },
-      {
-        from: 'Maps API',
-        to: 'Client',
-        label: '200 {geometry, epoch, engine_version, degraded, stale}',
-        kind: 'reply',
-      },
+      {from: 'Maps API', to: 'Maps API', label: 'no tenant → 401', kind: 'sync'},
+      {from: 'Maps API', to: 'Route store', label: 'load_route(id)', kind: 'sync'},
+      {from: 'Route store', to: 'Maps API', label: '{tenant, geometry, epoch, degraded, …} / none', kind: 'reply'},
+      {from: 'Maps API', to: 'Maps API', label: 'none or another tenant → the same 404', kind: 'sync'},
+      {from: 'Maps API', to: 'Client', label: '200 {geometry, epoch (stored), stale, degraded, …}', kind: 'reply'},
     ],
   },
   checks: [
@@ -59,89 +39,67 @@ road route, and a read that trusts only the id is a cross-tenant enumeration ora
       id: 'route-read',
       title: 'Answers GET /v1/routes/{id} with the stored route',
       detail:
-        'The read is registered on `GET /v1/routes/{route_id}` (the language’s path-parameter route) and its response carries the stored `geometry` together with `epoch`, `engine_version` and the `degraded` marker. The starter already answers this route, so this check passes on it — the four below are where it fails.',
+        'A stored route is read back with its `geometry`, `distance_m` and `engine_version`; an unknown id is **404**.',
       match: {
-        python: {
-          all: [
-            /@app\.get\(\s*["']\/v1\/routes\/\{route_id\}["']/,
-            /["']geometry["']/,
-            /["']epoch["']/,
-            /["']engine_version["']/,
-          ],
-        },
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/routes\/:routeId['"]/, /geometry/, /epoch/, /engine_version/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/routes\/\{route_id\}"/, /"geometry"/, /"epoch"/, /"engine_version"/]},
-        scala: {
-          all: [/path\(\s*"v1"\s*\/\s*"routes"\s*\/\s*Segment\s*\)/, /\bgeometry\b/, /\bepoch\b/, /\bengine_version\b/],
-        },
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/routes\//, /"geometry"/, /"epoch"/, /"engine_version"/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/routes\/\{route_id\}["']/, /load_route\(/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/routes\/:routeId['"]/, /loadRoute\(/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/routes\/\{id\}"/, /routes\.LoadRoute\(/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"routes"\s*\/\s*Segment\s*\)/, /Routes\.loadRoute\(/]},
+        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/routes\//, /routes::loadRoute\(/]},
       },
     },
     {
       id: 'tenant-required',
-      title: 'Requires the tenant, 401 without it',
-      detail:
-        'The read is a tenant surface: no `X-Tenant-Id` is **401**, before the store is touched. The starter has no tenant gate at all, so a request with no credential is served like any other.',
+      title: 'A read without a tenant is 401',
+      detail: 'No `X-Tenant-Id` answers **401** before the store is read; the starter has no tenant gate at all.',
       match: {
-        python: {all: [/X-Tenant-Id/, /status_code\s*=\s*401/]},
-        typescript: {all: [/x-tenant-id/, /code\(\s*401\s*\)/]},
-        go: {all: [/X-Tenant-Id/, /StatusUnauthorized/]},
-        scala: {all: [/X-Tenant-Id/, /StatusCodes\.Unauthorized/]},
-        cpp: {all: [/X-Tenant-Id/, /\b401\b/]},
+        python: {all: [/x-tenant-id/i, /\b401\b/]},
+        typescript: {all: [/x-tenant-id/i, /\b401\b/]},
+        go: {all: [/X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
+        scala: {all: [/X-Tenant-Id/i, /StatusCodes\.Unauthorized|\b401\b/]},
+        cpp: {all: [/X-Tenant-Id/i, /\b401\b/]},
       },
     },
     {
       id: 'ownership-scope',
-      title: 'Foreign route ids answer 404, same as unknown ones',
+      title: "Another tenant's route is the same 404 as an unknown id",
       detail:
-        'The stored record carries its `tenant`, and the read returns it only to that tenant: an unknown id and a foreign id get the same **404** body, so the endpoint never confirms that another tenant’s route exists. The starter reads by id alone and hands any record to any caller.',
+        "The stored route's `tenant` must be the caller's, and a foreign id answers exactly like a missing one, so counting up ids reveals nothing; the starter hands any route to any caller.",
       match: {
-        python: {all: [/route\[["']tenant["']\]\s*!=\s*tenant/, /status_code\s*=\s*404/]},
-        typescript: {all: [/route\.tenant\s*!==\s*tenant/, /code\(\s*404\s*\)/]},
-        go: {all: [/route\.Tenant\s*!=\s*tenant/, /StatusNotFound/]},
-        scala: {all: [/stored\.tenant\s*==\s*tenant/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/routeVisibleTo\(/, /\b404\b/]},
+        python: {all: [/\["tenant"\]\s*!=\s*tenant|tenant\s*!=\s*stored\["tenant"\]/]},
+        typescript: {all: [/stored\.tenant\s*!==\s*tenant|tenant\s*!==\s*stored\.tenant/]},
+        go: {all: [/stored\.Tenant\s*!=\s*tenant|tenant\s*!=\s*stored\.Tenant/]},
+        scala: {all: [/\.tenant\s*(!=|==)\s*tenant/]},
+        cpp: {all: [/->tenant\s*!=\s*tenant|tenant\s*!=\s*stored->tenant/]},
       },
     },
     {
       id: 'epoch-provenance',
-      title: 'Reports the geometry’s real epoch, never the current clock',
+      title: "Reports the route's own epoch, and whether it is stale",
       detail:
-        'The response `epoch` is the epoch the geometry was computed in, read from the record; the current traffic epoch is used only to compute `stale`, true whenever they differ, so a stored route is never sold as a fresh computation. The starter stamps `current_epoch()` on geometry from an older epoch, so a rush-hour route reads as freshly computed forever.',
+        "`epoch` is the stored route's, and `stale` says whether that epoch has passed; the starter stamps `current_epoch()` on stored geometry, so a rush-hour route reads as solved now.",
       match: {
-        python: {
-          all: [/route\[["']epoch["']\]/, /stale/, /current_epoch\(\)/],
-          none: [/["']epoch["']\s*:\s*current_epoch\(\)/],
-        },
-        typescript: {all: [/route\.epoch/, /stale/, /currentEpoch\(\)/], none: [/epoch:\s*currentEpoch\(\)/]},
-        go: {
-          all: [/route\.Epoch/, /stale/, /currentEpoch\(\)/],
-          none: [/["']epoch["']\s*:\s*currentEpoch\(\)/],
-        },
+        python: {all: [/"epoch":\s*stored\["epoch"\]/, /"stale":/], none: [/"epoch":\s*current_epoch\(\)/]},
+        typescript: {all: [/epoch:\s*stored\.epoch/, /stale:/], none: [/epoch:\s*currentEpoch\(\)/]},
+        go: {all: [/"epoch":\s*stored\.Route\.Epoch/, /"stale":/], none: [/"epoch":\s*geo\.CurrentEpoch\(\)/]},
         scala: {
-          all: [/stored\.epoch/, /stale/, /currentEpoch\(\)/],
-          none: [/currentEpoch\(\),\s*stored\.engine_version/],
+          all: [/"epoch"\s*->\s*JsNumber\(stored\.route\.epoch\)/, /"stale"/],
+          none: [/"epoch"\s*->\s*JsNumber\(Geo\.currentEpoch\(\)\)/],
         },
-        cpp: {
-          all: [/stored->value\("epoch"/, /stale/, /currentEpoch\(\)/],
-          none: [/["']epoch["']\s*,\s*currentEpoch\(\)/],
-        },
+        cpp: {all: [/\{"epoch",\s*stored->route\.epoch\}/, /"stale"/], none: [/\{"epoch",\s*geo::currentEpoch\(\)\}/]},
       },
     },
     {
       id: 'degraded-marker',
-      title: 'Serves the stored geometry with its degraded marker intact',
+      title: 'A straight-line estimate stays marked degraded',
       detail:
-        'The record’s `geometry` is returned verbatim and `degraded` travels with it: a straight-line estimate produced by the fallback stays marked instead of being dressed up as a road route, and a marker is never replaced by a hardcoded healthy default. The starter drops `degraded` from the response entirely, so the marker is hidden.',
+        'The response carries the stored `degraded` marker, so a client can tell an estimate from a road route; the starter leaves it out.',
       match: {
-        python: {
-          all: [/route\[["']geometry["']\]/, /route\[["']degraded["']\]/],
-          none: [/["']degraded["']\s*:\s*(False|None)/],
-        },
-        typescript: {all: [/route\.geometry/, /route\.degraded/], none: [/degraded:\s*(false|null)/]},
-        go: {all: [/route\.Geometry/, /route\.Degraded/], none: [/["']degraded["']\s*:\s*false/]},
-        scala: {all: [/stored\.geometry/, /stored\.degraded/], none: [/degraded\s*=\s*false/]},
-        cpp: {all: [/stored->value\("geometry"/, /stored->value\("degraded"/], none: [/["']degraded["']\s*,\s*false/]},
+        python: {all: [/"degraded":\s*stored\["degraded"\]/]},
+        typescript: {all: [/degraded:\s*stored\.degraded/]},
+        go: {all: [/"degraded":\s*stored\.Route\.Degraded/]},
+        scala: {all: [/"degraded"\s*->\s*JsBoolean\(stored\.route\.degraded\)/]},
+        cpp: {all: [/\{"degraded",\s*stored->route\.degraded\}/]},
       },
     },
   ],
@@ -150,437 +108,278 @@ road route, and a read that trusts only the id is a cross-tenant enumeration ora
       starter: `from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from mapsd import routes  # load_route
+from mapsd.geo import current_epoch
+
 app = FastAPI()
-
-
-class RouteStore:
-    def get(self, route_id: str):
-        """The stored route record for route_id, if any."""
-        raise NotImplementedError
-
-
-store = RouteStore()
-
-
-def current_epoch() -> int:
-    """The traffic epoch, bumped every five minutes."""
-    raise NotImplementedError
 
 
 @app.get("/v1/routes/{route_id}")
 def read_route(route_id: str) -> JSONResponse:
     # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    route = store.get(route_id)
-    if route is None:
+    stored = routes.load_route(route_id)
+    if stored is None:
         return JSONResponse({"error": "route not found"}, status_code=404)
     return JSONResponse(
         {
             "route_id": route_id,
-            "geometry": route["geometry"],
+            "distance_m": stored["distance_m"],
+            "duration_s": stored["duration_s"],
+            "geometry": stored["geometry"],
+            "engine_version": stored["engine_version"],
             "epoch": current_epoch(),
-            "engine_version": route["engine_version"],
-        },
-        status_code=200,
+        }
     )
 `,
-      solution: `from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from mapsd import routes  # load_route
+from mapsd.geo import current_epoch
 
 app = FastAPI()
 
 
-class RouteStore:
-    def get(self, route_id: str) -> dict | None:
-        """The stored route record for route_id, if any."""
-        raise NotImplementedError
-
-
-store = RouteStore()
-
-
-def current_epoch() -> int:
-    """The traffic epoch, bumped every five minutes."""
-    raise NotImplementedError
-
-
 @app.get("/v1/routes/{route_id}")
-def read_route(
-    route_id: str,
-    tenant: str | None = Header(default=None, alias="X-Tenant-Id"),
-) -> JSONResponse:
-    if tenant is None or tenant == "":
-        raise HTTPException(status_code=401, detail="missing X-Tenant-Id")
-    route = store.get(route_id)
-    if route is None or route["tenant"] != tenant:
-        # A foreign route id is indistinguishable from a missing one.
-        raise HTTPException(status_code=404, detail="route not found")
+def read_route(route_id: str, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    stored = routes.load_route(route_id)
+    # Another tenant's route answers exactly like a missing one: the read confirms nothing.
+    if stored is None or stored["tenant"] != tenant:
+        return JSONResponse({"error": "route not found"}, status_code=404)
     return JSONResponse(
         {
-            "route_id": route["route_id"],
-            "geometry": route["geometry"],
-            "epoch": route["epoch"],
-            "engine_version": route["engine_version"],
-            "degraded": route["degraded"],
-            "stale": route["epoch"] != current_epoch(),
-        },
-        status_code=200,
+            "route_id": route_id,
+            "distance_m": stored["distance_m"],
+            "duration_s": stored["duration_s"],
+            "geometry": stored["geometry"],
+            "engine_version": stored["engine_version"],
+            # The epoch the geometry was solved under; the current one only decides whether it is stale.
+            "epoch": stored["epoch"],
+            "stale": stored["epoch"] != current_epoch(),
+            "degraded": stored["degraded"],
+        }
     )
 `,
     },
     typescript: {
-      starter: `/** GET /v1/routes/{id}. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {currentEpoch} from 'mapsd/geo';
+import {loadRoute} from 'mapsd/routes';
 
 export const app = Fastify();
-
-interface StoredRoute {
-  route_id: string;
-  tenant: string;
-  geometry: string;
-  epoch: number;
-  engine_version: string;
-  degraded: boolean;
-}
-
-const store = {
-  /** The stored route record for routeId, if any. */
-  async get(routeId: string): Promise<StoredRoute | null> {
-    throw new Error(\`the route store is not wired up (\${routeId})\`);
-  },
-};
-
-/** The traffic epoch, bumped every five minutes: floor(now / 300). */
-function currentEpoch(): number {
-  return Math.floor(Date.now() / 300_000);
-}
 
 app.get('/v1/routes/:routeId', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   const {routeId} = request.params as {routeId: string};
-  const route = await store.get(routeId);
-  if (route === null) return reply.code(404).send({error: 'route not found'});
-  return reply.code(200).send({
+  const stored = await loadRoute(routeId);
+  if (stored === null) return reply.code(404).send({error: 'route not found'});
+  return {
     route_id: routeId,
-    geometry: route.geometry,
+    distance_m: stored.distance_m,
+    duration_s: stored.duration_s,
+    geometry: stored.geometry,
+    engine_version: stored.engine_version,
     epoch: currentEpoch(),
-    engine_version: route.engine_version,
-  });
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/routes/{id}: the stored route, handed back with its real provenance. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
+
+import {currentEpoch} from 'mapsd/geo';
+import {loadRoute} from 'mapsd/routes';
 
 export const app = Fastify();
 
-interface StoredRoute {
-  route_id: string;
-  tenant: string;
-  geometry: string;
-  epoch: number;
-  engine_version: string;
-  degraded: boolean;
-}
-
-const store = {
-  /** The stored route record for routeId, if any. */
-  async get(routeId: string): Promise<StoredRoute | null> {
-    throw new Error(\`the route store is not wired up (\${routeId})\`);
-  },
-};
-
-/** The traffic epoch, bumped every five minutes: floor(now / 300). */
-function currentEpoch(): number {
-  return Math.floor(Date.now() / 300_000);
-}
-
 app.get('/v1/routes/:routeId', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '')
-    return reply.code(401).send({error: 'missing X-Tenant-Id'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const {routeId} = request.params as {routeId: string};
-  const route = await store.get(routeId);
-  if (route === null || route.tenant !== tenant)
-    // A foreign route id is indistinguishable from a missing one.
-    return reply.code(404).send({error: 'route not found'});
-  return reply.code(200).send({
-    route_id: route.route_id,
-    geometry: route.geometry,
-    epoch: route.epoch,
-    engine_version: route.engine_version,
-    degraded: route.degraded,
-    stale: route.epoch !== currentEpoch(),
-  });
+  const stored = await loadRoute(routeId);
+  // Another tenant's route answers exactly like a missing one: the read confirms nothing.
+  if (stored === null || stored.tenant !== tenant) return reply.code(404).send({error: 'route not found'});
+  return {
+    route_id: routeId,
+    distance_m: stored.distance_m,
+    duration_s: stored.duration_s,
+    geometry: stored.geometry,
+    engine_version: stored.engine_version,
+    // The epoch the geometry was solved under; the current one only decides whether it is stale.
+    epoch: stored.epoch,
+    stale: stored.epoch !== currentEpoch(),
+    degraded: stored.degraded,
+  };
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"time"
+
+	"mapsd/geo"    // geo.CurrentEpoch
+	"mapsd/routes" // routes.LoadRoute(ctx, id) *routes.Stored
 )
 
-type StoredRoute struct {
-	RouteID       string \`json:"route_id"\`
-	Tenant        string \`json:"tenant"\`
-	Geometry      string \`json:"geometry"\`
-	Epoch         int64  \`json:"epoch"\`
-	EngineVersion string \`json:"engine_version"\`
-	Degraded      bool   \`json:"degraded"\`
-}
-
-type RouteStore struct{}
-
-// Get returns the stored route record for routeID, if any.
-func (s *RouteStore) Get(ctx context.Context, routeID string) (*StoredRoute, error) {
-	return nil, nil
-}
-
-var store = &RouteStore{}
-
-// currentEpoch is the traffic epoch, bumped every five minutes: now / 300.
-func currentEpoch() int64 { return time.Now().Unix() / 300 }
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readRoute(rw http.ResponseWriter, r *http.Request) {
 	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	routeID := r.PathValue("route_id")
-	route, err := store.Get(r.Context(), routeID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if route == nil {
+	routeID := r.PathValue("id")
+	stored := routes.LoadRoute(r.Context(), routeID)
+	if stored == nil {
 		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "route not found"})
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{
 		"route_id":       routeID,
-		"geometry":       route.Geometry,
-		"epoch":          currentEpoch(),
-		"engine_version": route.EngineVersion,
+		"distance_m":     stored.Route.DistanceM,
+		"duration_s":     stored.Route.DurationS,
+		"geometry":       stored.Route.Geometry,
+		"engine_version": stored.Route.EngineVersion,
+		"epoch":          geo.CurrentEpoch(),
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/routes/{route_id}", readRoute)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/routes/{id}", readRoute)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"time"
+
+	"mapsd/geo"    // geo.CurrentEpoch
+	"mapsd/routes" // routes.LoadRoute(ctx, id) *routes.Stored
 )
 
-type StoredRoute struct {
-	RouteID       string \`json:"route_id"\`
-	Tenant        string \`json:"tenant"\`
-	Geometry      string \`json:"geometry"\`
-	Epoch         int64  \`json:"epoch"\`
-	EngineVersion string \`json:"engine_version"\`
-	Degraded      bool   \`json:"degraded"\`
-}
-
-type RouteStore struct{}
-
-// Get returns the stored route record for routeID, if any.
-func (s *RouteStore) Get(ctx context.Context, routeID string) (*StoredRoute, error) {
-	return nil, nil
-}
-
-var store = &RouteStore{}
-
-// currentEpoch is the traffic epoch, bumped every five minutes: now / 300.
-func currentEpoch() int64 { return time.Now().Unix() / 300 }
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readRoute(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Tenant-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
-	routeID := r.PathValue("route_id")
-	route, err := store.Get(r.Context(), routeID)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if route == nil || route.Tenant != tenant {
-		// A foreign route id is indistinguishable from a missing one.
+	routeID := r.PathValue("id")
+	stored := routes.LoadRoute(r.Context(), routeID)
+	// Another tenant's route answers exactly like a missing one: the read confirms nothing.
+	if stored == nil || stored.Tenant != tenant {
 		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "route not found"})
 		return
 	}
 	writeJSON(rw, http.StatusOK, map[string]any{
-		"route_id":       route.RouteID,
-		"geometry":       route.Geometry,
-		"epoch":          route.Epoch,
-		"engine_version": route.EngineVersion,
-		"degraded":       route.Degraded,
-		"stale":          route.Epoch != currentEpoch(),
+		"route_id":       routeID,
+		"distance_m":     stored.Route.DistanceM,
+		"duration_s":     stored.Route.DurationS,
+		"geometry":       stored.Route.Geometry,
+		"engine_version": stored.Route.EngineVersion,
+		// The epoch the geometry was solved under; the current one only decides whether it is stale.
+		"epoch":    stored.Route.Epoch,
+		"stale":    stored.Route.Epoch != geo.CurrentEpoch(),
+		"degraded": stored.Route.Degraded,
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/routes/{route_id}", readRoute)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/routes/{id}", readRoute)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class StoredRoute(
-    route_id: String,
-    tenant: String,
-    geometry: String,
-    epoch: Long,
-    engine_version: String,
-    degraded: Boolean,
-)
-
-final case class RouteRead(route_id: String, geometry: String, epoch: Long, engine_version: String)
+import mapsd.{Geo, Routes} // Routes.loadRoute, Geo.currentEpoch
 
 object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("maps-routing")
-  implicit val storedFormat: RootJsonFormat[StoredRoute] = jsonFormat6(StoredRoute)
-  implicit val readFormat: RootJsonFormat[RouteRead] = jsonFormat4(RouteRead)
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  final class RouteStore {
-    /** The stored route record for routeId, if any. */
-    def get(routeId: String): Option[StoredRoute] =
-      throw new UnsupportedOperationException("the route store is not wired up")
-  }
+  private val notFound = json(StatusCodes.NotFound, JsObject("error" -> JsString("route not found")))
 
-  val store = new RouteStore()
-
-  // The traffic epoch, bumped every five minutes: now / 300000.
-  def currentEpoch(): Long = System.currentTimeMillis() / 300000L
-
-  val route: Route =
-    path("v1" / "routes" / Segment) { routeId =>
-      get {
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        store.get(routeId) match {
-          case None => complete(StatusCodes.NotFound, """{"error":"route not found"}""")
-          case Some(stored) =>
-            complete(StatusCodes.OK, RouteRead(routeId, stored.geometry, currentEpoch(), stored.engine_version))
-        }
+  val route: Route = path("v1" / "routes" / Segment) { routeId =>
+    get {
+      // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+      Routes.loadRoute(routeId) match {
+        case None => complete(notFound)
+        case Some(stored) =>
+          complete(
+            json(
+              StatusCodes.OK,
+              JsObject(
+                "route_id" -> JsString(routeId),
+                "distance_m" -> JsNumber(stored.route.distanceM),
+                "duration_s" -> JsNumber(stored.route.durationS),
+                "geometry" -> JsString(stored.route.geometry),
+                "engine_version" -> JsString(stored.route.engineVersion),
+                "epoch" -> JsNumber(Geo.currentEpoch()),
+              ),
+            ),
+          )
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class StoredRoute(
-    route_id: String,
-    tenant: String,
-    geometry: String,
-    epoch: Long,
-    engine_version: String,
-    degraded: Boolean,
-)
-
-final case class RouteRead(
-    route_id: String,
-    geometry: String,
-    epoch: Long,
-    engine_version: String,
-    degraded: Boolean,
-    stale: Boolean,
-)
+import mapsd.{Geo, Routes} // Routes.loadRoute, Geo.currentEpoch
 
 object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("maps-routing")
-  implicit val storedFormat: RootJsonFormat[StoredRoute] = jsonFormat6(StoredRoute)
-  implicit val readFormat: RootJsonFormat[RouteRead] = jsonFormat6(RouteRead)
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  final class RouteStore {
-    /** The stored route record for routeId, if any. */
-    def get(routeId: String): Option[StoredRoute] =
-      throw new UnsupportedOperationException("the route store is not wired up")
-  }
+  private val notFound = json(StatusCodes.NotFound, JsObject("error" -> JsString("route not found")))
 
-  val store = new RouteStore()
-
-  // The traffic epoch, bumped every five minutes: now / 300000.
-  def currentEpoch(): Long = System.currentTimeMillis() / 300000L
-
-  val route: Route =
-    path("v1" / "routes" / Segment) { routeId =>
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          if (!tenantOpt.exists(_.nonEmpty)) {
-            complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-          } else {
-            val tenant = tenantOpt.get
-            store.get(routeId) match {
-              case Some(stored) if stored.tenant == tenant =>
-                complete(
+  val route: Route = path("v1" / "routes" / Segment) { routeId =>
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant) =>
+          // Another tenant's route answers exactly like a missing one: the read confirms nothing.
+          Routes.loadRoute(routeId).filter(_.tenant == tenant) match {
+            case None => complete(notFound)
+            case Some(stored) =>
+              complete(
+                json(
                   StatusCodes.OK,
-                  RouteRead(
-                    stored.route_id,
-                    stored.geometry,
-                    stored.epoch,
-                    stored.engine_version,
-                    stored.degraded,
-                    stored.epoch != currentEpoch(),
+                  JsObject(
+                    "route_id" -> JsString(routeId),
+                    "distance_m" -> JsNumber(stored.route.distanceM),
+                    "duration_s" -> JsNumber(stored.route.durationS),
+                    "geometry" -> JsString(stored.route.geometry),
+                    "engine_version" -> JsString(stored.route.engineVersion),
+                    // The epoch the geometry was solved under; the current one only decides whether it is stale.
+                    "epoch" -> JsNumber(stored.route.epoch),
+                    "stale" -> JsBoolean(stored.route.epoch != Geo.currentEpoch()),
+                    "degraded" -> JsBoolean(stored.route.degraded),
                   ),
-                )
-              case _ =>
-                // A foreign route id is indistinguishable from a missing one.
-                complete(StatusCodes.NotFound, """{"error":"route not found"}""")
-            }
+                ),
+              )
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -589,109 +388,391 @@ object ReadApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
 #include <string>
+
+#include "mapsd/geo.h"     // geo::currentEpoch
+#include "mapsd/routes.h"  // routes::loadRoute(id) -> std::optional<routes::Stored>
 
 using json = nlohmann::json;
 
-struct RouteStore {
-  /** The stored route record for route_id, if any. */
-  std::optional<json> get(const std::string& route_id);
-};
-
-RouteStore store;
-
-// The traffic epoch, bumped every five minutes: floor(now / 300).
-long long currentEpoch();
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/routes/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const std::string route_id = req.matches[1];
-    const auto stored = store.get(route_id);
-    if (!stored) {
-      res.status = 404;
-      res.set_content(R"({"error":"route not found"})", "application/json");
-      return;
-    }
-    res.status = 200;
-    res.set_content(
-        json{{"route_id", route_id},
-             {"geometry", stored->value("geometry", std::string())},
-             {"epoch", currentEpoch()},
-             {"engine_version", stored->value("engine_version", std::string())}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void read_route(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string route_id = req.matches[1];
+  const auto stored = routes::loadRoute(route_id);
+  if (!stored) {
+    res.status = 404;
+    res.set_content(json{{"error", "route not found"}}.dump(), "application/json");
+    return;
+  }
+  const json body = {{"route_id", route_id},
+                     {"distance_m", stored->route.distance_m},
+                     {"duration_s", stored->route.duration_s},
+                     {"geometry", stored->route.geometry},
+                     {"engine_version", stored->route.engine_version},
+                     {"epoch", geo::currentEpoch()}};
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/routes/([\\w-]+))", read_route); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <optional>
 #include <string>
+
+#include "mapsd/geo.h"     // geo::currentEpoch
+#include "mapsd/routes.h"  // routes::loadRoute(id) -> std::optional<routes::Stored>
 
 using json = nlohmann::json;
 
-struct RouteStore {
-  /** The stored route record for route_id, if any. */
-  std::optional<json> get(const std::string& route_id);
-};
-
-RouteStore store;
-
-// The traffic epoch, bumped every five minutes: floor(now / 300).
-long long currentEpoch();
-
-// routeVisibleTo: a stored route is only readable by the tenant that computed it.
-bool routeVisibleTo(const json& stored, const std::string& tenant) {
-  return stored.value("tenant", std::string()) == tenant;
+void read_route(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content(json{{"error", "X-Tenant-Id is required"}}.dump(), "application/json");
+    return;
+  }
+  const std::string route_id = req.matches[1];
+  const auto stored = routes::loadRoute(route_id);
+  // Another tenant's route answers exactly like a missing one: the read confirms nothing.
+  if (!stored || stored->tenant != tenant) {
+    res.status = 404;
+    res.set_content(json{{"error", "route not found"}}.dump(), "application/json");
+    return;
+  }
+  const json body = {{"route_id", route_id},
+                     {"distance_m", stored->route.distance_m},
+                     {"duration_s", stored->route.duration_s},
+                     {"geometry", stored->route.geometry},
+                     {"engine_version", stored->route.engine_version},
+                     // The epoch the geometry was solved under; the current one only decides whether it is stale.
+                     {"epoch", stored->route.epoch},
+                     {"stale", stored->route.epoch != geo::currentEpoch()},
+                     {"degraded", stored->route.degraded}};
+  res.set_content(body.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/routes/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const std::string route_id = req.matches[1];
-    const auto stored = store.get(route_id);
-    if (!stored || !routeVisibleTo(*stored, tenant)) {
-      // A foreign route id is indistinguishable from a missing one.
-      res.status = 404;
-      res.set_content(R"({"error":"route not found"})", "application/json");
-      return;
-    }
-    const long long epoch = stored->value("epoch", 0LL);
-    res.status = 200;
-    res.set_content(
-        json{{"route_id", route_id},
-             {"geometry", stored->value("geometry", std::string())},
-             {"epoch", epoch},
-             {"engine_version", stored->value("engine_version", std::string())},
-             {"degraded", stored->value("degraded", true)},
-             {"stale", epoch != currentEpoch()}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/routes/([\\w-]+))", read_route); }
 `,
     },
   },
+  harness: {
+    python: `from mapsd.geo import current_epoch
+from mapsd.routes import save_route
+
+ACME = {"X-Tenant-Id": "acme"}
+
+
+def _route(epoch=None, degraded=False):
+    return {
+        "distance_m": 2715.4 if degraded else 18842.5,
+        "duration_s": 195.4 if degraded else 1713.0,
+        "geometry": "" if degraded else "poly:2",
+        "epoch": current_epoch() if epoch is None else epoch,
+        "engine_version": "straight-line" if degraded else "osrm-v26.9",
+        "degraded": degraded,
+    }
+
+
+def _read(ctx):
+    return ctx.client(ctx.load("read").app)
+
+
+async def check_route_read(ctx):
+    route_id = save_route("acme", _route())
+    async with _read(ctx) as c:
+        r = await c.get(f"/v1/routes/{route_id}", headers=ACME)
+        missing = await c.get("/v1/routes/r-404", headers=ACME)
+    assert r.status_code == 200, f"GET /v1/routes/{route_id} answered {r.status_code}: {r.text}"
+    body = r.json()
+    for name, value in (("geometry", "poly:2"), ("distance_m", 18842.5), ("engine_version", "osrm-v26.9")):
+        assert body.get(name) == value, f"the read's {name} is {body.get(name)!r}, the stored route's is {value!r}"
+    assert missing.status_code == 404, f"an unknown route id answered {missing.status_code}, expected 404"
+
+
+async def check_tenant_required(ctx):
+    route_id = save_route("acme", _route())
+    async with _read(ctx) as c:
+        r = await c.get(f"/v1/routes/{route_id}")
+    assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
+
+
+async def check_ownership_scope(ctx):
+    route_id = save_route("acme", _route())
+    async with _read(ctx) as c:
+        foreign = await c.get(f"/v1/routes/{route_id}", headers={"X-Tenant-Id": "beta"})
+        missing = await c.get("/v1/routes/r-404", headers={"X-Tenant-Id": "beta"})
+        own = await c.get(f"/v1/routes/{route_id}", headers=ACME)
+    assert foreign.status_code == 404, f"tenant beta read acme's route {route_id}: {foreign.status_code} {foreign.text}"
+    assert foreign.text == missing.text, f"a foreign id must answer exactly like an unknown one: {foreign.text!r} vs {missing.text!r}"
+    assert own.status_code == 200, f"acme reading its own route answered {own.status_code}"
+
+
+async def check_epoch_provenance(ctx):
+    old = current_epoch() - 12
+    old_id = save_route("acme", _route(epoch=old))
+    fresh_id = save_route("acme", _route())
+    async with _read(ctx) as c:
+        stale = (await c.get(f"/v1/routes/{old_id}", headers=ACME)).json()
+        fresh = (await c.get(f"/v1/routes/{fresh_id}", headers=ACME)).json()
+    assert stale.get("epoch") == old, f"a route solved in epoch {old} reads as epoch {stale.get('epoch')}: the read must report the epoch it was solved under, not the current one"
+    assert stale.get("stale") is True, f"a route from an hour ago must read stale: true, got {stale.get('stale')!r}"
+    assert fresh.get("epoch") == current_epoch() and fresh.get("stale") is False, f"a route from this epoch must read epoch {current_epoch()} and stale: false, got {fresh}"
+
+
+async def check_degraded_marker(ctx):
+    estimate_id = save_route("acme", _route(degraded=True))
+    road_id = save_route("acme", _route())
+    async with _read(ctx) as c:
+        estimate = (await c.get(f"/v1/routes/{estimate_id}", headers=ACME)).json()
+        road = (await c.get(f"/v1/routes/{road_id}", headers=ACME)).json()
+    assert estimate.get("degraded") is True, f"a straight-line estimate must read degraded: true, got {estimate}"
+    assert road.get("degraded") is False, f"a road route must read degraded: false, got {road}"
+`,
+    typescript: `const ACME = {'X-Tenant-Id': 'acme'};
+
+function read(ctx) {
+  const {currentEpoch} = ctx.load('/support/mapsd/geo.ts');
+  const {saveRoute} = ctx.load('/support/mapsd/routes.ts');
+  const route = (epoch: number | null = null, degraded = false) => ({
+    distance_m: degraded ? 2715.4 : 18842.5,
+    duration_s: degraded ? 195.4 : 1713.0,
+    geometry: degraded ? '' : 'poly:2',
+    epoch: epoch ?? currentEpoch(),
+    engine_version: degraded ? 'straight-line' : 'osrm-v26.9',
+    degraded,
+  });
+  return {c: ctx.client(ctx.load('read').app), currentEpoch, saveRoute, route};
+}
+
+export async function check_route_read(ctx) {
+  const {c, saveRoute, route} = read(ctx);
+  const routeId = await saveRoute('acme', route());
+  const r = await c.get(\`/v1/routes/\${routeId}\`, {headers: ACME});
+  assert.equal(r.status, 200, \`GET /v1/routes/\${routeId} answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  for (const [name, value] of [['geometry', 'poly:2'], ['distance_m', 18842.5], ['engine_version', 'osrm-v26.9']] as const) {
+    assert.equal(body[name], value, \`the read's \${name} is \${JSON.stringify(body[name])}, the stored route's is \${JSON.stringify(value)}\`);
+  }
+  const missing = await c.get('/v1/routes/r-404', {headers: ACME});
+  assert.equal(missing.status, 404, \`an unknown route id answered \${missing.status}, expected 404\`);
+}
+
+export async function check_tenant_required(ctx) {
+  const {c, saveRoute, route} = read(ctx);
+  const routeId = await saveRoute('acme', route());
+  const r = await c.get(\`/v1/routes/\${routeId}\`);
+  assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
+}
+
+export async function check_ownership_scope(ctx) {
+  const {c, saveRoute, route} = read(ctx);
+  const routeId = await saveRoute('acme', route());
+  const foreign = await c.get(\`/v1/routes/\${routeId}\`, {headers: {'X-Tenant-Id': 'beta'}});
+  const missing = await c.get('/v1/routes/r-404', {headers: {'X-Tenant-Id': 'beta'}});
+  const own = await c.get(\`/v1/routes/\${routeId}\`, {headers: ACME});
+  assert.equal(foreign.status, 404, \`tenant beta read acme's route \${routeId}: \${foreign.status} \${foreign.text}\`);
+  assert.equal(foreign.text, missing.text, \`a foreign id must answer exactly like an unknown one: \${foreign.text} vs \${missing.text}\`);
+  assert.equal(own.status, 200, \`acme reading its own route answered \${own.status}\`);
+}
+
+export async function check_epoch_provenance(ctx) {
+  const {c, currentEpoch, saveRoute, route} = read(ctx);
+  const old = currentEpoch() - 12;
+  const oldId = await saveRoute('acme', route(old));
+  const freshId = await saveRoute('acme', route());
+  const stale = (await c.get(\`/v1/routes/\${oldId}\`, {headers: ACME})).json();
+  const fresh = (await c.get(\`/v1/routes/\${freshId}\`, {headers: ACME})).json();
+  assert.equal(stale.epoch, old, \`a route solved in epoch \${old} reads as epoch \${stale.epoch}: the read must report the epoch it was solved under, not the current one\`);
+  assert.equal(stale.stale, true, \`a route from an hour ago must read stale: true, got \${JSON.stringify(stale.stale)}\`);
+  assert(fresh.epoch === currentEpoch() && fresh.stale === false, \`a route from this epoch must read epoch \${currentEpoch()} and stale: false, got \${JSON.stringify(fresh)}\`);
+}
+
+export async function check_degraded_marker(ctx) {
+  const {c, saveRoute, route} = read(ctx);
+  const estimateId = await saveRoute('acme', route(null, true));
+  const roadId = await saveRoute('acme', route());
+  const estimate = (await c.get(\`/v1/routes/\${estimateId}\`, {headers: ACME})).json();
+  const road = (await c.get(\`/v1/routes/\${roadId}\`, {headers: ACME})).json();
+  assert.equal(estimate.degraded, true, \`a straight-line estimate must read degraded: true, got \${JSON.stringify(estimate)}\`);
+  assert.equal(road.degraded, false, \`a road route must read degraded: false, got \${JSON.stringify(road)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"mapsd/geo"
+	"mapsd/routes"
+
+	"leetbuild/harness"
+)
+
+var readBg = context.Background()
+
+func storedRoute(epoch int64, degraded bool) geo.Route {
+	if degraded {
+		return geo.Route{DistanceM: 2715.4, DurationS: 195.4, Epoch: epoch, EngineVersion: "straight-line", Degraded: true}
+	}
+	return geo.Route{DistanceM: 18842.5, DurationS: 1713.0, Geometry: "poly:2", Epoch: epoch, EngineVersion: "osrm-v26.9"}
+}
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readJSON(ctx *harness.Ctx, c *harness.HTTP, routeID string) map[string]any {
+	r := c.Get("/v1/routes/"+routeID, "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/routes/%s (%s)", routeID, r.Text())
+	body, _ := r.JSON().(map[string]any)
+	return body
+}
+
+func CheckRouteRead(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	routeID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
+	body := readJSON(ctx, c, routeID)
+	ctx.Equal(body["geometry"], "poly:2", "the read's geometry")
+	ctx.Equal(body["distance_m"], 18842.5, "the read's distance_m")
+	ctx.Equal(body["engine_version"], "osrm-v26.9", "the read's engine_version")
+	ctx.Equal(c.Get("/v1/routes/r-404", "X-Tenant-Id", "acme").Status, 404, "an unknown route id")
+}
+
+func CheckTenantRequired(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	routeID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
+	ctx.Equal(c.Get("/v1/routes/"+routeID).Status, 401, "a read without X-Tenant-Id")
+}
+
+func CheckOwnershipScope(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	routeID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
+	foreign := c.Get("/v1/routes/"+routeID, "X-Tenant-Id", "beta")
+	missing := c.Get("/v1/routes/r-404", "X-Tenant-Id", "beta")
+	ctx.Equal(foreign.Status, 404, "tenant beta reading acme's route %s (%s)", routeID, foreign.Text())
+	ctx.Equal(foreign.Text(), missing.Text(), "a foreign id must answer exactly like an unknown one; the body")
+	ctx.Equal(c.Get("/v1/routes/"+routeID, "X-Tenant-Id", "acme").Status, 200, "acme reading its own route")
+}
+
+func CheckEpochProvenance(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	now := geo.CurrentEpoch()
+	oldID := routes.SaveRoute(readBg, "acme", storedRoute(now-12, false))
+	freshID := routes.SaveRoute(readBg, "acme", storedRoute(now, false))
+	stale := readJSON(ctx, c, oldID)
+	fresh := readJSON(ctx, c, freshID)
+	ctx.Equal(stale["epoch"], float64(now-12), "a route solved an hour ago must report the epoch it was solved under, not the current one; its epoch")
+	ctx.Equal(stale["stale"], true, "a route from an hour ago must read stale")
+	ctx.Equal(fresh["epoch"], float64(now), "a route from this epoch, its epoch")
+	ctx.Equal(fresh["stale"], false, "a route from this epoch must not read stale")
+}
+
+func CheckDegradedMarker(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	estimateID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), true))
+	roadID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
+	ctx.Equal(readJSON(ctx, c, estimateID)["degraded"], true, "a straight-line estimate must read degraded")
+	ctx.Equal(readJSON(ctx, c, roadID)["degraded"], false, "a road route must read degraded: false")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+
+#include "mapsd/geo.h"
+#include "mapsd/routes.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+geo::Route storedRoute(long long epoch, bool degraded) {
+  geo::Route r;
+  r.distance_m = degraded ? 2715.4 : 18842.5;
+  r.duration_s = degraded ? 195.4 : 1713.0;
+  r.geometry = degraded ? "" : "poly:2";
+  r.epoch = epoch;
+  r.engine_version = degraded ? "straight-line" : "osrm-v26.9";
+  r.degraded = degraded;
+  return r;
+}
+
+harness::HTTP readApi(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+json readJson(harness::Ctx& ctx, harness::HTTP& c, const std::string& route_id) {
+  const auto r = c.Get("/v1/routes/" + route_id, "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/routes/%s (%s)", route_id, r.Text());
+  return json::parse(r.Text());
+}
+
+}  // namespace
+
+void CheckRouteRead(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const std::string route_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
+  const json body = readJson(ctx, c, route_id);
+  ctx.Equal(body.value("geometry", ""), "poly:2", "the read's geometry");
+  ctx.Equal(body.value("distance_m", 0.0), 18842.5, "the read's distance_m");
+  ctx.Equal(body.value("engine_version", ""), "osrm-v26.9", "the read's engine_version");
+  ctx.Equal(c.Get("/v1/routes/r-404", "X-Tenant-Id", "acme").Status, 404, "an unknown route id");
+}
+
+void CheckTenantRequired(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const std::string route_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
+  ctx.Equal(c.Get("/v1/routes/" + route_id).Status, 401, "a read without X-Tenant-Id");
+}
+
+void CheckOwnershipScope(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const std::string route_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
+  const auto foreign = c.Get("/v1/routes/" + route_id, "X-Tenant-Id", "beta");
+  const auto missing = c.Get("/v1/routes/r-404", "X-Tenant-Id", "beta");
+  ctx.Equal(foreign.Status, 404, "tenant beta reading acme's route %s (%s)", route_id, foreign.Text());
+  ctx.Equal(foreign.Text(), missing.Text(), "a foreign id must answer exactly like an unknown one; the body");
+  ctx.Equal(c.Get("/v1/routes/" + route_id, "X-Tenant-Id", "acme").Status, 200, "acme reading its own route");
+}
+
+void CheckEpochProvenance(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const long long now = geo::currentEpoch();
+  const std::string old_id = routes::saveRoute("acme", storedRoute(now - 12, false));
+  const std::string fresh_id = routes::saveRoute("acme", storedRoute(now, false));
+  const json stale = readJson(ctx, c, old_id);
+  const json fresh = readJson(ctx, c, fresh_id);
+  ctx.Equal(stale.value("epoch", 0LL), now - 12, "a route solved an hour ago must report the epoch it was solved under, not the current one; its epoch");
+  ctx.Assert(stale.contains("stale") && stale["stale"] == true, "a route from an hour ago must read stale: true, got %s", stale.dump());
+  ctx.Equal(fresh.value("epoch", 0LL), now, "a route from this epoch, its epoch");
+  ctx.Assert(fresh.contains("stale") && fresh["stale"] == false, "a route from this epoch must read stale: false, got %s", fresh.dump());
+}
+
+void CheckDegradedMarker(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const std::string estimate_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), true));
+  const std::string road_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
+  const json estimate = readJson(ctx, c, estimate_id);
+  const json road = readJson(ctx, c, road_id);
+  ctx.Assert(estimate.contains("degraded") && estimate["degraded"] == true, "a straight-line estimate must read degraded: true, got %s", estimate.dump());
+  ctx.Assert(road.contains("degraded") && road["degraded"] == false, "a road route must read degraded: false, got %s", road.dump());
+}
+`,
+  },
   hints: [
-    "A driver reopens yesterday's trip and the app shows it as computed just now; a fallback estimate renders as a road; and any tenant that guesses a route id can read another tenant's trip.",
-    'The handler reads no header, so there is no tenant to scope by; the response builds `epoch` from `current_epoch()` instead of the record; and `degraded` is left out of the response dict.',
-    'Require `X-Tenant-Id` (401), answer 404 when `route["tenant"] != tenant`, return `route["epoch"]` with `"stale": route["epoch"] != current_epoch()`, and pass `route["geometry"]` and `route["degraded"]` through unchanged.',
+    'Save a route as acme and read it as beta, or with no tenant at all: both get it. Save one solved an hour ago and read it back: its `epoch` is the current one. Save a straight-line estimate: nothing in the response says so.',
+    'The handler reads by id alone and never compares `stored["tenant"]` with the request\'s tenant. It writes `current_epoch()` where the stored epoch belongs and leaves `degraded` out of the body.',
+    '401 on an empty `X-Tenant-Id`; the not-found 404 when `stored is None or stored["tenant"] != tenant`; answer `"epoch": stored["epoch"]`, `"stale": stored["epoch"] != current_epoch()` and `"degraded": stored["degraded"]`.',
   ],
-  debrief: `The fix has its shape because a read is only useful if the caller can tell what it is holding. Ownership comes from the record's own \`tenant\`, and a foreign id answers the same 404 as an unknown one, so the read cannot be used to enumerate another tenant's routes. Provenance comes from the record too: the response \`epoch\` is the epoch the geometry was computed in, and the current traffic epoch is used only to say \`stale\`, not to relabel old geometry as fresh. The \`degraded\` marker travels with the geometry so a straight-line estimate is not mistaken for a road route. Production read paths add a signed route token so a client can prove what it was served, per-epoch labels on read metrics, and a reaper that deletes routes past the retention window instead of serving them forever.`,
+  debrief: `A read hands back a claim, and the claim needs its provenance: the epoch the geometry was solved under, whether that epoch is over, and whether an engine produced it at all. Stamping the current epoch on stored geometry is the most convincing way to mislead, because the field is real and the value plausible. The tenant check compares the record with the caller, and a foreign id answers exactly like a missing one, so sequential ids reveal nothing about which routes exist. Production APIs also issue unguessable ids, return an ETag of the stored version so clients can revalidate, and offer to recompute a stale shared route rather than serve it as current.`,
 };

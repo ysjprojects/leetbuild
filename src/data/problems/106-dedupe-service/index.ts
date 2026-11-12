@@ -1,67 +1,71 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Deduplication: the course is not "call a similarity API", it is the debugging you owe a dedupe
- * layer before it merges a tenant's records. A tenant-scoped check, one atomic Redis
- * insert-and-check per key set, a similarity call with a deadline that degrades to exact-only,
- * dataset-keyed events carrying key hashes with an outbox, and a cluster read that refuses to bridge
- * weak pairs without review and returns evidence for every link.
+ * layer before it merges a tenant's records. An exact-key check inside the caller's tenant → one
+ * Lua claim per key in a per-tenant index → a fuzzy pass under a 200 ms deadline that says when it
+ * did not run → dataset-keyed events carrying digests, with an outbox → a cluster read that links
+ * members over strong pairs only and answers its evidence.
  */
 export const dedupeServiceProblem: Problem = {
   id: 'dedupe-service',
   title: 'Deduplication',
-  tagline: 'Tenant-scoped exact and fuzzy duplicate checks with evidence behind every merge.',
+  tagline: 'Per-tenant key indexes in Redis and duplicate clusters that show the evidence for every merge.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Deduplication
 
-Deduplication decides whether a record a caller is about to create already exists and, when it
-might, whether the records should be merged. The visible part is a boolean in a response.
+Deduplication decides whether a record a caller is about to create already exists and, when two
+records might be one customer, whether to merge them. The visible part is a boolean in a response;
+the rest is isolation between tenants, a race between two creates, and evidence for every merge.
 
 ## The real system
 
-Zingg, the open source entity-resolution engine, shows what the read side of this service owes its
-operators: every cluster it emits carries a \`Z_MINSCORE\`, the score of the weakest pair in the
-cluster, and its documentation tells you to gate automation on it. Clusters whose weakest link clears
-the floor flow into a golden record; clusters with a low \`Z_MINSCORE\` go to a human review queue,
-because A matching B and B matching C does not mean A matches C. Step 5 here is that rule as a
-handler: a weak pair cannot bridge two clusters on its own, and the evidence per pair is part of the
-response.
+Zingg, the open source entity-resolution engine, puts a \`Z_MINSCORE\` on every cluster it emits:
+the score of the weakest pair in the cluster. Its documentation tells you to gate automation on it,
+auto-merging clusters whose weakest link is strong and sending the rest to a human review queue,
+because A matching B and B matching C does not make A match C. Step 5 is that rule as a handler.
 
 ## What you build here
 
-One service, **dedupd**, with five pieces:
+One service, **dedupd**, on one Redis and four provided modules in the \`dedupe\` package:
+\`records\` (the durable record store: \`record:{id}\` with the tenant, dataset, contents and key
+digests), \`exact\` (the per-tenant key index as step 2 builds it), \`outbox\` (the list a relay
+publishes) and \`clusters\` (scored pairs and merge history).
 
-1. \`POST /v1/dedupe/check\`: an authenticated tenant, validated key types and hashed values, and a
-   comparison scoped to the caller's tenant. A check must not reveal whether another tenant holds
-   the same record, nor name another tenant's record id.
-2. A **Redis** exact-key index: per-tenant sets where one atomic Lua script inserts a key and returns
-   whether it already existed, rebuildable from the durable record store.
-3. A **gRPC** similarity client: a 200 ms deadline per attempt, no retry inside the request path, and
-   a failure that degrades to exact-only comparison, marked as such.
-4. A **Kafka** dedupe path: one \`dedupe.event\` per check or merge keyed by dataset id, carrying key
-   hashes and outcomes rather than record contents or raw keys, with an outbox row when the broker
-   rejects the produce.
-5. \`GET /v1/clusters/{id}\`: the member records, the per-pair merge evidence and the merge history,
-   where a weak pair cannot bridge clusters without review and a foreign cluster is **404**.
+1. \`POST /v1/dedupe/check\` with \`{"keys": [{"type", "value"}]}\`: the \`X-Tenant-Id\` tenant,
+   key types and SHA-256 digests validated, every key looked up with \`exact.lookup\`; it answers
+   \`{"duplicate", "match": {"record_id", "key_type"}}\`.
+2. A **Redis** index \`t:{tenant}:exact:{key_type}\` (digest → record id): \`claim\` is one Lua script
+   answering \`winner\` or \`existing\` with the holder, and \`rebuild\` restores it from \`records\`.
+3. A **gRPC** fuzzy pass, \`Similarity.Resolve\` under a 200 ms deadline, one attempt, answering
+   \`{"match", "exact_only"}\` with a 0.9 score floor.
+4. A **Kafka** \`dedupe.event\` per claim, keyed by dataset id, carrying the outcome and the key
+   digests, from an idempotent producer with \`acks=all\`; a failed delivery leaves an outbox row.
+5. \`GET /v1/clusters/{id}\`: members linked by pairs scoring at least 0.85, the \`evidence\`, the
+   weak pairs under \`review\` and the \`history\`; another tenant's cluster is **404**.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. Debug it, fix it, and prove the fix with checks
-that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Key extraction and normalization per record type, the similarity model itself, merge conflict
-resolution for field values, GDPR erasure propagation, per-tenant quotas, and a review UI. The five
-pieces above are the ones that decide whether dedupe is correct, isolated and shippable.`,
+resolution for field values, erasure propagation, per-tenant quotas and a review UI. The five
+pieces above decide whether a check is isolated, a create is counted once, and a merge can be
+explained.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'check · cluster read', x: 8, y: 50},
@@ -85,4 +89,11 @@ pieces above are the ones that decide whether dedupe is correct, isolated and sh
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

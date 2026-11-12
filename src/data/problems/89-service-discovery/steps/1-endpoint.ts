@@ -2,147 +2,148 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/instances: registration that is real and scoped',
+  title: 'POST /v1/instances: registration that is scoped and expires',
   concept: 'http',
   file: 'api',
   focus: ['client', 'discovery', 'db', 'redis'],
   task: `## Task
 
 **Starting point.** The starter serves \`POST /v1/instances\` with body
-\`{"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}\`:
-it reads \`X-Client-Id\`, builds the record, writes it to Redis with \`HSET\` under
-\`sd:{service}:{instance_id}\` and answers **200** with \`{"ok": true}\`. It compiles, serves the demo
-and hides five flaws.
+\`{"service", "instance_id", "address", "port", "heartbeat_interval", "metadata_version"}\`: it reads
+\`X-Client-Id\`, writes the record hash \`sd:{service}:{instance_id}\` with \`HSET\`, adds the id to
+\`sd:members:{service}\` and answers **201** with the record and \`ttl_seconds\`. It serves the demo
+and hides four flaws.
 
-**Failure mode the checks target.** An instance whose address is a laptop or another cluster's
-range is registered and routed to, because the address is not tested against the deployment CIDR. A
-token scoped to checkout registers into payments. A crashed instance stays routable for good,
-because the hash has no expiry. A port of 0 or a 24-hour heartbeat interval becomes a routing entry.
-And the caller cannot see the TTL it must beat, because the response is a bare 200.
+**Failure mode the checks target.** An agent scoped to checkout registers an instance into
+payments; an address on a laptop or in another cluster's range becomes a routing target; a port of 0
+or a one-hour heartbeat interval is stored; and a crashed instance stays registered for good,
+because the record has no expiry, whatever \`ttl_seconds\` says.
 
-- The caller is identified by the mesh-authenticated \`X-Client-Id\` header; missing is **401**.
-- \`service\` must exist in the registry: **404** when \`registry.deployment_cidr(service)\` is None.
-- The caller must be scoped to that service (\`registry.allowed_services(client_id)\`): else **403**.
-- \`instance_id\` is a non-empty slug of at most 63 characters (**400**).
-- \`address\` must parse as an IP literal (**400**) and lie inside the deployment CIDR (**422**
-  outside it).
-- \`port\` is in \`1..65535\`, \`heartbeat_interval\` in \`2..60\` seconds, \`metadata_version\` at
-  least 1; each failure is **400**.
-- Store the record as JSON under \`sd:{service}:{instance_id}\` with the expiry in the same write:
-  \`SET key value EX 3 * heartbeat_interval\`.
-- Answer **201** with \`instance_id\`, \`service\`, \`address\`, \`port\`, \`metadata_version\`,
-  \`heartbeat_interval\`, \`ttl_seconds\` and the Redis \`key\`.`,
+- \`X-Client-Id\` names the caller (missing: **401**). A service with no deployment
+  (\`registry.deployment_cidr\` is None) is **404**; a service outside
+  \`registry.allowed_services(client_id)\` is **403**.
+- \`port\` is \`1..65535\` and \`heartbeat_interval\` \`2..60\` seconds, else **400**.
+- The address lies inside the deployment CIDR (\`registry.in_cidr\`), else **422**.
+- The hash, its expiry (\`TTL_INTERVALS * heartbeat_interval\` seconds) and the membership go in one
+  \`MULTI\` (\`pipeline(transaction=True)\`); a refused registration writes nothing.`,
   sequence: {
-    participants: ['Instance agent', 'Discovery API', 'service registry', 'Redis'],
+    participants: ['Instance agent', 'Discovery API', 'deployment registry', 'Redis'],
     messages: [
       {from: 'Instance agent', to: 'Discovery API', label: 'POST /v1/instances · X-Client-Id', kind: 'sync'},
       {
         from: 'Discovery API',
-        to: 'service registry',
-        label: 'deployment_cidr(service) · allowed_services',
+        to: 'deployment registry',
+        label: 'deployment_cidr(service) · allowed_services(client)',
         kind: 'sync',
       },
-      {from: 'service registry', to: 'Discovery API', label: '10.4.0.0/16 · {checkout}', kind: 'reply'},
+      {from: 'deployment registry', to: 'Discovery API', label: '10.4.0.0/16 · {checkout}', kind: 'reply'},
       {
         from: 'Discovery API',
         to: 'Discovery API',
-        label: '422 outside the CIDR · 403 outside the scope · 400 bad port or interval',
+        label: '401 · 404 · 403 · 400 port or interval · 422 outside the CIDR',
         kind: 'sync',
       },
       {
         from: 'Discovery API',
         to: 'Redis',
-        label: 'SET sd:checkout:checkout-3 {…} EX 3 · heartbeat_interval',
+        label: 'MULTI · HSET sd:checkout:checkout-3 · EXPIRE 15 · SADD sd:members:checkout · EXEC',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Discovery API', label: 'OK', kind: 'reply'},
-      {from: 'Discovery API', to: 'Instance agent', label: '201 {instance_id, ttl_seconds, key}', kind: 'reply'},
+      {from: 'Discovery API', to: 'Instance agent', label: '201 {instance_id, ttl_seconds}', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'cidr',
-      title: 'The address must be inside the deployment CIDR',
+      id: 'scope',
+      title: 'Registers only into the services the caller is granted',
       detail:
-        'The address is parsed as an IP and tested for membership in `registry.deployment_cidr(service)`; an address outside it answers **422 Unprocessable Entity**. The starter accepts any address, so a registration can point routing at a host that is not ours.',
+        'A request without `X-Client-Id` is **401** and a service outside `allowed_services(client_id)` is **403**, both before anything is written. The starter reads the header and registers into any service.',
       match: {
-        python: {all: [/ipaddress/, /cidr/, /422/]},
-        typescript: {all: [/inCidr/, /cidr/, /422/]},
-        go: {all: [/net\.ParseCIDR/, /cidr/, /422|StatusUnprocessableEntity/]},
-        scala: {all: [/inCidr/, /cidr/, /422|UnprocessableEntity/]},
-        cpp: {all: [/inCidr/, /cidr/, /422/]},
+        python: {
+          all: [/x-client-id/i, /status_code=401/, /registry\.allowed_services\(/, /status_code=403/],
+          order: [/registry\.allowed_services\(/, /\.execute\(\)|instances\.register_instance\(/],
+        },
+        typescript: {
+          all: [/x-client-id/i, /code\(401\)/, /registry\.allowedServices\(/, /code\(403\)/],
+          order: [/registry\.allowedServices\(/, /\.exec\(\)|instances\.registerInstance\(/],
+        },
+        go: {
+          all: [/X-Client-Id/i, /StatusUnauthorized/, /registry\.AllowedServices\(/, /StatusForbidden/],
+          order: [/registry\.AllowedServices\(/, /TxPipelined\(|instances\.RegisterInstance\(/],
+        },
+        scala: {
+          all: [/X-Client-Id/i, /Unauthorized/, /Registry\.allowedServices\(/, /Forbidden/],
+          order: [/Registry\.allowedServices\(/, /\.exec\(\)|Instances\.registerInstance\(/],
+        },
+        cpp: {
+          all: [/X-Client-Id/i, /\b401\b/, /registry::allowedServices\(/, /\b403\b/],
+          order: [/registry::allowedServices\(/, /\.exec\(\)|instances::registerInstance\(/],
+        },
       },
     },
     {
-      id: 'scope',
-      title: 'Cross-service registration is 403',
+      id: 'cidr',
+      title: 'The address must lie inside the deployment CIDR',
       detail:
-        'The caller comes from `X-Client-Id` and its allowed services are checked against the requested service: a scoped client may register only into its own service (**403** otherwise). The starter accepts a service name from any caller.',
+        'An unknown service (`deployment_cidr` is None) is **404**, and an address `in_cidr`/`inCidr` rejects for the deployment CIDR is **422**, with nothing written. The starter stores any address under any service name.',
       match: {
-        python: {all: [/X-Client-Id/, /403/, /allowed_services/]},
-        typescript: {all: [/x-client-id/, /403/, /allowedServices/]},
-        go: {all: [/X-Client-Id/, /403|StatusForbidden/, /[Aa]llowedServices/]},
-        scala: {all: [/X-Client-Id/, /403|Forbidden/, /allowedServices/]},
-        cpp: {all: [/X-Client-Id/, /403/, /allowedServices/]},
+        python: {
+          all: [
+            /registry\.deployment_cidr\(/,
+            /registry\.in_cidr\(|ip_network\(/,
+            /status_code=404/,
+            /status_code=422/,
+          ],
+        },
+        typescript: {all: [/registry\.deploymentCidr\(/, /registry\.inCidr\(/, /code\(404\)/, /code\(422\)/]},
+        go: {all: [/registry\.DeploymentCIDR\(/, /registry\.InCIDR\(/, /StatusNotFound/, /StatusUnprocessableEntity/]},
+        scala: {all: [/Registry\.deploymentCidr\(/, /Registry\.inCidr\(/, /NotFound/, /UnprocessableEntity/]},
+        cpp: {all: [/registry::deploymentCidr\(/, /registry::inCidr\(/, /\b404\b/, /\b422\b/]},
       },
     },
     {
       id: 'ttl',
-      title: 'The registration carries the heartbeat expiry',
+      title: 'The record expires three heartbeat intervals after it is written',
       detail:
-        'The record is written with an explicit expiry of three heartbeat intervals (`SET … EX`, `SetParams.ex`, `time.Second`, `std::chrono::seconds`). The starter uses a plain hash write, so the registration outlives every heartbeat it will never receive.',
+        'The hash, its `EXPIRE` of `TTL_INTERVALS * heartbeat_interval` seconds and the `SADD` to the members set run in one MULTI (or through `register_instance`). The starter writes the hash without a TTL, so a crashed instance stays registered.',
       match: {
-        python: {all: [/\.set\(/, /ex=/, /heartbeat_interval/]},
-        typescript: {all: [/redis\.set\(/, /'EX'/, /heartbeatInterval/]},
-        go: {all: [/\.Set\([^;]*Context/, /time\.Second/, /heartbeatInterval|HeartbeatInterval/]},
-        scala: {all: [/SetParams/, /ex\(/, /heartbeatInterval|heartbeat_interval/]},
-        cpp: {all: [/\.set\(/, /std::chrono::seconds/, /heartbeat/]},
+        python: {all: [/\.expire\(|instances\.register_instance\(/, /\.pipeline\(|instances\.register_instance\(/]},
+        typescript: {all: [/\.expire\(|instances\.registerInstance\(/, /\.multi\(\)|instances\.registerInstance\(/]},
+        go: {all: [/\.Expire\(|instances\.RegisterInstance\(/, /TxPipelined\(|instances\.RegisterInstance\(/]},
+        scala: {all: [/\.expire\(|Instances\.registerInstance\(/, /\.multi\(\)|Instances\.registerInstance\(/]},
+        cpp: {all: [/\.expire\(|instances::registerInstance\(/, /\.transaction\(|instances::registerInstance\(/]},
       },
     },
     {
       id: 'bounds',
       title: 'Port and heartbeat interval are bounded',
       detail:
-        '`port` is validated against `1..65535` and `heartbeat_interval` against `2..60` seconds, both answering **400**. The starter validates neither, so a port of 0 or a 24-hour interval becomes a routing entry that is wrong in a way only traffic reveals.',
+        '`port` outside `1..65535` or `heartbeat_interval` outside `2..60` seconds answers **400** and writes nothing. The starter stores a port of 0 and an hour-long interval as routing entries.',
       match: {
-        python: {all: [/65535/, /heartbeat_interval/, /400/]},
-        typescript: {all: [/65535/, /heartbeatInterval/, /reply\.code\(400\)/]},
-        go: {all: [/65535/, /heartbeatInterval|HeartbeatInterval/, /StatusBadRequest|400/]},
-        scala: {all: [/65535/, /heartbeatInterval|heartbeat_interval/, /BadRequest|400/]},
-        cpp: {all: [/65535/, /heartbeatInterval/, /400/]},
-      },
-    },
-    {
-      id: 'response',
-      title: 'Answers 201 with the identity and the derived TTL',
-      detail:
-        'The response is **201 Created** and carries `instance_id`, `metadata_version` and `ttl_seconds` — the caller must be able to read back the TTL it will have to beat. The starter answers 200 with `{"ok": true}`.',
-      match: {
-        python: {all: [/status_code=201/, /metadata_version/, /ttl_seconds/]},
-        typescript: {all: [/reply\.code\(201\)/, /metadata_version/, /ttl_seconds/]},
-        go: {all: [/StatusCreated/, /metadata_version/, /ttl_seconds/]},
-        scala: {all: [/Created/, /metadata_version/, /ttl_seconds/]},
-        cpp: {all: [/201/, /metadata_version/, /ttl_seconds/]},
+        python: {all: [/65535/, /MAX_HEARTBEAT_S|\b60\b/, /status_code=400/]},
+        typescript: {all: [/65535/, /MAX_HEARTBEAT_S|\b60\b/, /code\(400\)/]},
+        go: {all: [/65535/, /maxHeartbeat|\b60\b/, /StatusBadRequest/]},
+        scala: {all: [/65535/, /MaxHeartbeatS|\b60\b/, /BadRequest/]},
+        cpp: {all: [/65535/, /kMaxHeartbeatS|\b60\b/, /\b400\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-import logging
-import time
+      starter: `import time
 
 import redis
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
+from discovery import instances  # record_key, members_key, TTL_INTERVALS, register_instance
+from discovery import registry  # deployment_cidr, allowed_services, in_cidr
+
 app = FastAPI()
-logger = logging.getLogger("discovery")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 
-class RegisterRequest(BaseModel):
+class Registration(BaseModel):
     service: str
     instance_id: str
     address: str
@@ -151,59 +152,42 @@ class RegisterRequest(BaseModel):
     metadata_version: int = 1
 
 
-class Registry:
-    def deployment_cidr(self, service: str) -> str | None:
-        """The CIDR the service's deployment declared, or None when the service is unknown."""
-        raise NotImplementedError
-
-    def allowed_services(self, client_id: str) -> set[str]:
-        """The services client_id may register into."""
-        raise NotImplementedError
-
-
-registry = Registry()
-
-
-@app.post("/v1/instances")
-def register(body: RegisterRequest, client_id: str = Header(default="", alias="X-Client-Id")) -> JSONResponse:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = f"sd:{body.service}:{body.instance_id}"
-    record = {
-        "service": body.service,
-        "instance_id": body.instance_id,
+@app.post("/v1/instances", status_code=201)
+def register(body: Registration, request: Request) -> dict:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    client_id = request.headers.get("x-client-id", "")
+    key = instances.record_key(body.service, body.instance_id)
+    r.hset(key, mapping={
         "address": body.address,
         "port": body.port,
         "heartbeat_interval": body.heartbeat_interval,
         "metadata_version": body.metadata_version,
         "last_heartbeat": int(time.time()),
+    })
+    r.sadd(instances.members_key(body.service), body.instance_id)
+    return {
+        **body.model_dump(),
+        "ttl_seconds": instances.TTL_INTERVALS * body.heartbeat_interval,
+        "registered_by": client_id,
     }
-    r.hset(key, mapping={k: str(v) for k, v in record.items()})
-    logger.info("registered %s", key)
-    return JSONResponse({"instance_id": body.instance_id, "ok": True}, status_code=200)
 `,
-      solution: `import json
-import logging
-import time
+      solution: `import time
 
-import ipaddress
 import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from discovery import instances  # record_key, members_key, TTL_INTERVALS, register_instance
+from discovery import registry  # deployment_cidr, allowed_services, in_cidr
+
 app = FastAPI()
-logger = logging.getLogger("discovery")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-TTL_INTERVALS = 3
-MIN_HEARTBEAT_S = 2
-MAX_HEARTBEAT_S = 60
-MIN_PORT = 1
-MAX_PORT = 65535
-MAX_INSTANCE_ID = 63
+MIN_PORT, MAX_PORT = 1, 65535
+MIN_HEARTBEAT_S, MAX_HEARTBEAT_S = 2, 60
 
 
-class RegisterRequest(BaseModel):
+class Registration(BaseModel):
     service: str
     instance_id: str
     address: str
@@ -212,83 +196,51 @@ class RegisterRequest(BaseModel):
     metadata_version: int = 1
 
 
-class Registry:
-    def deployment_cidr(self, service: str) -> str | None:
-        """The CIDR the service's deployment declared, or None when the service is unknown."""
-        raise NotImplementedError
-
-    def allowed_services(self, client_id: str) -> set[str]:
-        """The services client_id may register into."""
-        raise NotImplementedError
-
-
-registry = Registry()
-
-
-@app.post("/v1/instances")
-def register(body: RegisterRequest, client_id: str | None = Header(default=None, alias="X-Client-Id")) -> JSONResponse:
-    if client_id is None or client_id == "":
-        raise HTTPException(status_code=401, detail="missing X-Client-Id")
-
+@app.post("/v1/instances", status_code=201)
+def register(body: Registration, request: Request) -> dict:
+    client_id = request.headers.get("x-client-id", "")
+    if not client_id:
+        raise HTTPException(status_code=401, detail="X-Client-Id is required")
     cidr = registry.deployment_cidr(body.service)
     if cidr is None:
-        raise HTTPException(status_code=404, detail="unknown service")
+        raise HTTPException(status_code=404, detail=f"no deployment for service {body.service}")
     if body.service not in registry.allowed_services(client_id):
-        raise HTTPException(status_code=403, detail="client is not scoped to this service")
-
-    if not body.instance_id or len(body.instance_id) > MAX_INSTANCE_ID or not body.instance_id[0].isalnum():
-        raise HTTPException(status_code=400, detail="invalid instance_id")
-    try:
-        address = ipaddress.ip_address(body.address)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="address must be an IP literal")
-    if not address.is_private and not address.is_loopback:
-        raise HTTPException(status_code=422, detail="address is not routable inside the deployment")
-    if address not in ipaddress.ip_network(cidr):
-        raise HTTPException(status_code=422, detail="address is outside the deployment CIDR")
+        raise HTTPException(status_code=403, detail=f"{client_id} may not register into {body.service}")
     if not MIN_PORT <= body.port <= MAX_PORT:
         raise HTTPException(status_code=400, detail="port must be 1..65535")
     if not MIN_HEARTBEAT_S <= body.heartbeat_interval <= MAX_HEARTBEAT_S:
-        raise HTTPException(status_code=400, detail="heartbeat_interval must be 2..60")
-    if body.metadata_version < 1:
-        raise HTTPException(status_code=400, detail="metadata_version must be >= 1")
+        raise HTTPException(status_code=400, detail="heartbeat_interval must be 2..60 seconds")
+    if not registry.in_cidr(body.address, cidr):
+        raise HTTPException(status_code=422, detail=f"{body.address} is outside the deployment CIDR {cidr}")
 
-    ttl_seconds = TTL_INTERVALS * body.heartbeat_interval
-    key = f"sd:{body.service}:{body.instance_id}"
-    record = {
-        "service": body.service,
-        "instance_id": body.instance_id,
-        "address": str(address),
+    ttl_seconds = instances.TTL_INTERVALS * body.heartbeat_interval
+    key = instances.record_key(body.service, body.instance_id)
+    # The record, its expiry and the membership land together: the TTL is the only failure detector.
+    pipe = r.pipeline(transaction=True)
+    pipe.hset(key, mapping={
+        "address": body.address,
         "port": body.port,
         "heartbeat_interval": body.heartbeat_interval,
         "metadata_version": body.metadata_version,
         "last_heartbeat": int(time.time()),
-    }
-    r.set(key, json.dumps(record), ex=ttl_seconds)
-    logger.info("register service=%s instance=%s address=%s ttl=%d", body.service, body.instance_id, address, ttl_seconds)
-    return JSONResponse({**record, "ttl_seconds": ttl_seconds, "key": key}, status_code=201)
+    })
+    pipe.expire(key, ttl_seconds)
+    pipe.sadd(instances.members_key(body.service), body.instance_id)
+    pipe.execute()
+    return {**body.model_dump(), "ttl_seconds": ttl_seconds, "registered_by": client_id}
 `,
     },
     typescript: {
-      starter: `/** POST /v1/instances: flawed code that trusts its caller. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
 import Redis from 'ioredis';
 
+import * as instances from 'discovery/instances'; // recordKey, membersKey, TTL_INTERVALS, registerInstance
+import * as registry from 'discovery/registry'; // deploymentCidr, allowedServices, inCidr
+
 export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-export const registry = {
-  /** The CIDR the service's deployment declared, or null when the service is unknown. */
-  deploymentCidr(service: string): string | null {
-    throw new Error('not implemented');
-  },
-  /** The services clientId may register into. */
-  allowedServices(clientId: string): Set<string> {
-    throw new Error('not implemented');
-  },
-};
-
-interface RegisterBody {
+interface Registration {
   service: string;
   instance_id: string;
   address: string;
@@ -298,52 +250,42 @@ interface RegisterBody {
 }
 
 app.post('/v1/instances', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const body = request.body as RegisterBody;
-  const key = \`sd:\${body.service}:\${body.instance_id}\`;
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const clientId = request.headers['x-client-id'];
+  const body = request.body as Registration;
+  const metadataVersion = body.metadata_version ?? 1;
+  const key = instances.recordKey(body.service, body.instance_id);
   await redis.hset(key, {
-    service: body.service,
-    instance_id: body.instance_id,
     address: body.address,
     port: String(body.port),
     heartbeat_interval: String(body.heartbeat_interval),
-    metadata_version: String(body.metadata_version ?? 1),
+    metadata_version: String(metadataVersion),
     last_heartbeat: String(Math.floor(Date.now() / 1000)),
   });
-  request.log.info({key}, 'registered');
-  return reply.code(200).send({instance_id: body.instance_id, ok: true});
+  await redis.sadd(instances.membersKey(body.service), body.instance_id);
+  return reply.code(201).send({
+    ...body,
+    metadata_version: metadataVersion,
+    ttl_seconds: instances.TTL_INTERVALS * body.heartbeat_interval,
+    registered_by: clientId ?? '',
+  });
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/instances: registration scoped to the caller, inside the deployment CIDR, with a TTL. */
-import {isIP} from 'node:net';
-
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 import Redis from 'ioredis';
 
+import * as instances from 'discovery/instances'; // recordKey, membersKey, TTL_INTERVALS, registerInstance
+import * as registry from 'discovery/registry'; // deploymentCidr, allowedServices, inCidr
+
 export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
+const redis = new Redis({host: 'redis', port: 6379});
 
-export const registry = {
-  /** The CIDR the service's deployment declared, or null when the service is unknown. */
-  deploymentCidr(service: string): string | null {
-    throw new Error('not implemented');
-  },
-  /** The services clientId may register into. */
-  allowedServices(clientId: string): Set<string> {
-    throw new Error('not implemented');
-  },
-};
-
-const TTL_INTERVALS = 3;
-const MIN_HEARTBEAT_S = 2;
-const MAX_HEARTBEAT_S = 60;
 const MIN_PORT = 1;
 const MAX_PORT = 65535;
-const MAX_INSTANCE_ID = 63;
+const MIN_HEARTBEAT_S = 2;
+const MAX_HEARTBEAT_S = 60;
 
-interface RegisterBody {
+interface Registration {
   service: string;
   instance_id: string;
   address: string;
@@ -352,86 +294,62 @@ interface RegisterBody {
   metadata_version?: number;
 }
 
-function ipv4ToInt(address: string): number | null {
-  if (isIP(address) !== 4) return null;
-  const parts = address.split('.').map(Number);
-  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return null;
-  return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
-}
-
-/** True when the address is a literal inside the CIDR; a host outside it is not ours. */
-function inCidr(address: string, cidr: string): boolean {
-  const [network, prefixRaw] = cidr.split('/');
-  const prefix = Number(prefixRaw);
-  const ip = ipv4ToInt(address);
-  const net = ipv4ToInt(network ?? '');
-  if (ip === null || net === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
-  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
-  return (((ip & mask) >>> 0) === ((net & mask) >>> 0));
-}
+const within = (n: unknown, low: number, high: number): boolean => Number.isInteger(n) && (n as number) >= low && (n as number) <= high;
 
 app.post('/v1/instances', async (request, reply) => {
   const clientId = request.headers['x-client-id'];
-  if (typeof clientId !== 'string' || clientId === '') return reply.code(401).send({error: 'missing X-Client-Id'});
+  if (typeof clientId !== 'string' || clientId === '') return reply.code(401).send({error: 'X-Client-Id is required'});
+  const body = request.body as Registration;
+  const cidr = await registry.deploymentCidr(body.service);
+  if (cidr === null) return reply.code(404).send({error: \`no deployment for service \${body.service}\`});
+  if (!(await registry.allowedServices(clientId)).has(body.service)) {
+    return reply.code(403).send({error: \`\${clientId} may not register into \${body.service}\`});
+  }
+  if (!within(body.port, MIN_PORT, MAX_PORT)) return reply.code(400).send({error: 'port must be 1..65535'});
+  if (!within(body.heartbeat_interval, MIN_HEARTBEAT_S, MAX_HEARTBEAT_S)) {
+    return reply.code(400).send({error: 'heartbeat_interval must be 2..60 seconds'});
+  }
+  if (!registry.inCidr(body.address, cidr)) {
+    return reply.code(422).send({error: \`\${body.address} is outside the deployment CIDR \${cidr}\`});
+  }
 
-  const body = request.body as Partial<RegisterBody> | null;
-  if (body === null || typeof body !== 'object' || typeof body.service !== 'string')
-    return reply.code(400).send({error: 'invalid body'});
-  const cidr = registry.deploymentCidr(body.service);
-  if (cidr === null) return reply.code(404).send({error: 'unknown service'});
-  if (!registry.allowedServices(clientId).has(body.service))
-    return reply.code(403).send({error: 'client is not scoped to this service'});
-
-  const instanceId = body.instance_id;
-  if (typeof instanceId !== 'string' || instanceId === '' || instanceId.length > MAX_INSTANCE_ID)
-    return reply.code(400).send({error: 'invalid instance_id'});
-  if (typeof body.address !== 'string') return reply.code(400).send({error: 'address must be an IP literal'});
-  if (isIP(body.address) !== 4) return reply.code(400).send({error: 'address must be an IP literal'});
-  if (!inCidr(body.address, cidr))
-    return reply.code(422).send({error: 'address is outside the deployment CIDR'});
-  const port = body.port;
-  if (!Number.isInteger(port) || (port as number) < MIN_PORT || (port as number) > MAX_PORT)
-    return reply.code(400).send({error: 'port must be 1..65535'});
-  const heartbeatInterval = body.heartbeat_interval;
-  if (!Number.isInteger(heartbeatInterval) || (heartbeatInterval as number) < MIN_HEARTBEAT_S || (heartbeatInterval as number) > MAX_HEARTBEAT_S)
-    return reply.code(400).send({error: 'heartbeat_interval must be 2..60'});
   const metadataVersion = body.metadata_version ?? 1;
-  if (!Number.isInteger(metadataVersion) || metadataVersion < 1)
-    return reply.code(400).send({error: 'metadata_version must be >= 1'});
-
-  const ttlSeconds = TTL_INTERVALS * (heartbeatInterval as number);
-  const key = \`sd:\${body.service}:\${instanceId}\`;
-  const record = {
-    service: body.service,
-    instance_id: instanceId,
-    address: body.address,
-    port,
-    heartbeat_interval: heartbeatInterval,
-    metadata_version: metadataVersion,
-    last_heartbeat: Math.floor(Date.now() / 1000),
-  };
-  await redis.set(key, JSON.stringify(record), 'EX', ttlSeconds);
-  request.log.info({service: body.service, instance_id: instanceId, ttl_seconds: ttlSeconds}, 'registered');
-  return reply.code(201).send({...record, ttl_seconds: ttlSeconds, key});
+  const ttlSeconds = instances.TTL_INTERVALS * body.heartbeat_interval;
+  const key = instances.recordKey(body.service, body.instance_id);
+  // The record, its expiry and the membership land together: the TTL is the only failure detector.
+  await redis
+    .multi()
+    .hset(key, {
+      address: body.address,
+      port: String(body.port),
+      heartbeat_interval: String(body.heartbeat_interval),
+      metadata_version: String(metadataVersion),
+      last_heartbeat: String(Math.floor(Date.now() / 1000)),
+    })
+    .expire(key, ttlSeconds)
+    .sadd(instances.membersKey(body.service), body.instance_id)
+    .exec();
+  return reply.code(201).send({...body, metadata_version: metadataVersion, ttl_seconds: ttlSeconds, registered_by: clientId});
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"discovery/instances" // instances.RecordKey, MembersKey, TTLIntervals, RegisterInstance
+	"discovery/registry"  // registry.DeploymentCIDR, AllowedServices, InCIDR
 )
 
-type RegisterRequest struct {
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+type registration struct {
 	Service           string \`json:"service"\`
 	InstanceID        string \`json:"instance_id"\`
 	Address           string \`json:"address"\`
@@ -440,75 +358,73 @@ type RegisterRequest struct {
 	MetadataVersion   int    \`json:"metadata_version"\`
 }
 
-type Registry struct{}
-
-func (r *Registry) DeploymentCIDR(service string) (string, error) { return "", nil }
-
-func (r *Registry) AllowedServices(clientID string) (map[string]bool, error) { return nil, nil }
-
-var (
-	registry = &Registry{}
-	rdb      = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func register(rw http.ResponseWriter, r *http.Request) {
-	var body RegisterRequest
+func answer(body registration, ttl int, clientID string) map[string]any {
+	return map[string]any{
+		"service": body.Service, "instance_id": body.InstanceID, "address": body.Address, "port": body.Port,
+		"heartbeat_interval": body.HeartbeatInterval, "metadata_version": body.MetadataVersion,
+		"ttl_seconds": ttl, "registered_by": clientID,
+	}
+}
+
+func handleRegister(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	ctx := r.Context()
+	clientID := r.Header.Get("X-Client-Id")
+	body := registration{MetadataVersion: 1}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "the body is not a registration", http.StatusBadRequest)
 		return
 	}
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := "sd:" + body.Service + ":" + body.InstanceID
-	record := map[string]any{
-		"service":            body.Service,
-		"instance_id":        body.InstanceID,
+	key := instances.RecordKey(body.Service, body.InstanceID)
+	err := rdb.HSet(ctx, key, map[string]any{
 		"address":            body.Address,
 		"port":               body.Port,
 		"heartbeat_interval": body.HeartbeatInterval,
 		"metadata_version":   body.MetadataVersion,
 		"last_heartbeat":     time.Now().Unix(),
+	}).Err()
+	if err == nil {
+		err = rdb.SAdd(ctx, instances.MembersKey(body.Service), body.InstanceID).Err()
 	}
-	payload, _ := json.Marshal(record)
-	rdb.HSet(r.Context(), key, "record", payload)
-	log.Printf("registered %s", key)
-	writeJSON(rw, http.StatusOK, map[string]any{"instance_id": body.InstanceID, "ok": true})
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, http.StatusCreated, answer(body, instances.TTLIntervals*body.HeartbeatInterval, clientID))
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/instances", register)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func routes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/instances", handleRegister)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
-	"net"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"discovery/instances" // instances.RecordKey, MembersKey, TTLIntervals, RegisterInstance
+	"discovery/registry"  // registry.DeploymentCIDR, AllowedServices, InCIDR
 )
+
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 const (
-	ttlIntervals       = 3
-	minHeartbeatSecs   = 2
-	maxHeartbeatSecs   = 60
-	minPort            = 1
-	maxPort            = 65535
-	maxInstanceIDBytes = 63
+	minPort, maxPort           = 1, 65535
+	minHeartbeat, maxHeartbeat = 2, 60
 )
 
-type RegisterRequest struct {
+type registration struct {
 	Service           string \`json:"service"\`
 	InstanceID        string \`json:"instance_id"\`
 	Address           string \`json:"address"\`
@@ -517,307 +433,216 @@ type RegisterRequest struct {
 	MetadataVersion   int    \`json:"metadata_version"\`
 }
 
-type Registry struct{}
-
-func (r *Registry) DeploymentCIDR(ctx context.Context, service string) (string, error) { return "", nil }
-
-func (r *Registry) AllowedServices(ctx context.Context, clientID string) (map[string]bool, error) {
-	return nil, nil
-}
-
-var (
-	registry = &Registry{}
-	rdb      = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-/** inCidr reports whether address is an IP literal inside cidr; anything else is not ours. */
-func inCidr(address, cidr string) bool {
-	ip := net.ParseIP(address)
-	if ip == nil {
-		return false
+func answer(body registration, ttl int, clientID string) map[string]any {
+	return map[string]any{
+		"service": body.Service, "instance_id": body.InstanceID, "address": body.Address, "port": body.Port,
+		"heartbeat_interval": body.HeartbeatInterval, "metadata_version": body.MetadataVersion,
+		"ttl_seconds": ttl, "registered_by": clientID,
 	}
-	_, network, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-	return network.Contains(ip)
 }
 
-func register(rw http.ResponseWriter, r *http.Request) {
+func handleRegister(rw http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	clientID := r.Header.Get("X-Client-Id")
 	if clientID == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Client-Id"})
+		http.Error(rw, "X-Client-Id is required", http.StatusUnauthorized)
 		return
 	}
-	var body RegisterRequest
+	body := registration{MetadataVersion: 1}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "the body is not a registration", http.StatusBadRequest)
 		return
 	}
-	cidr, err := registry.DeploymentCIDR(r.Context(), body.Service)
-	if err != nil || cidr == "" {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown service"})
-		return
-	}
-	allowed, err := registry.AllowedServices(r.Context(), clientID)
+	cidr, deployed, err := registry.DeploymentCIDR(ctx, body.Service)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !deployed {
+		http.Error(rw, "no deployment for service "+body.Service, http.StatusNotFound)
+		return
+	}
+	allowed, err := registry.AllowedServices(ctx, clientID)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if !allowed[body.Service] {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "client is not scoped to this service"})
-		return
-	}
-	if body.InstanceID == "" || len(body.InstanceID) > maxInstanceIDBytes {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid instance_id"})
-		return
-	}
-	if net.ParseIP(body.Address) == nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "address must be an IP literal"})
-		return
-	}
-	if !inCidr(body.Address, cidr) {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "address is outside the deployment CIDR"})
+		http.Error(rw, fmt.Sprintf("%s may not register into %s", clientID, body.Service), http.StatusForbidden)
 		return
 	}
 	if body.Port < minPort || body.Port > maxPort {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "port must be 1..65535"})
+		http.Error(rw, "port must be 1..65535", http.StatusBadRequest)
 		return
 	}
-	if body.HeartbeatInterval < minHeartbeatSecs || body.HeartbeatInterval > maxHeartbeatSecs {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "heartbeat_interval must be 2..60"})
+	if body.HeartbeatInterval < minHeartbeat || body.HeartbeatInterval > maxHeartbeat {
+		http.Error(rw, "heartbeat_interval must be 2..60 seconds", http.StatusBadRequest)
 		return
 	}
-	if body.MetadataVersion < 1 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "metadata_version must be >= 1"})
+	if !registry.InCIDR(body.Address, cidr) {
+		http.Error(rw, fmt.Sprintf("%s is outside the deployment CIDR %s", body.Address, cidr), http.StatusUnprocessableEntity)
 		return
 	}
 
-	ttlSeconds := ttlIntervals * body.HeartbeatInterval
-	key := "sd:" + body.Service + ":" + body.InstanceID
-	record := map[string]any{
-		"service":            body.Service,
-		"instance_id":        body.InstanceID,
-		"address":            body.Address,
-		"port":               body.Port,
-		"heartbeat_interval": body.HeartbeatInterval,
-		"metadata_version":   body.MetadataVersion,
-		"last_heartbeat":     time.Now().Unix(),
-	}
-	payload, _ := json.Marshal(record)
-	if err := rdb.Set(r.Context(), key, payload, time.Duration(ttlIntervals*body.HeartbeatInterval)*time.Second).Err(); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
+	ttl := instances.TTLIntervals * body.HeartbeatInterval
+	key := instances.RecordKey(body.Service, body.InstanceID)
+	// The record, its expiry and the membership land together: the TTL is the only failure detector.
+	_, err = rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.HSet(ctx, key, map[string]any{
+			"address":            body.Address,
+			"port":               body.Port,
+			"heartbeat_interval": body.HeartbeatInterval,
+			"metadata_version":   body.MetadataVersion,
+			"last_heartbeat":     time.Now().Unix(),
+		})
+		pipe.Expire(ctx, key, time.Duration(ttl)*time.Second)
+		pipe.SAdd(ctx, instances.MembersKey(body.Service), body.InstanceID)
+		return nil
+	})
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Printf("register service=%s instance=%s address=%s ttl=%d", body.Service, body.InstanceID, body.Address, ttlSeconds)
-	writeJSON(rw, http.StatusCreated, map[string]any{
-		"service":            body.Service,
-		"instance_id":        body.InstanceID,
-		"address":            body.Address,
-		"port":               body.Port,
-		"heartbeat_interval": body.HeartbeatInterval,
-		"metadata_version":   body.MetadataVersion,
-		"ttl_seconds":        ttlSeconds,
-		"key":                key,
-	})
+	writeJSON(rw, http.StatusCreated, answer(body, ttl, clientID))
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/instances", register)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+func routes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/instances", handleRegister)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.JedisPooled
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-import java.time.Instant
+import scala.jdk.CollectionConverters._
 
-final case class RegisterRequest(
-    service: String,
-    instance_id: String,
-    address: String,
-    port: Int,
-    heartbeat_interval: Int,
-    metadata_version: Int)
-
-final case class RegistryDeployment(cidr: String)
-
-trait Registry {
-  def deploymentCidr(service: String): Option[RegistryDeployment]
-  def allowedServices(clientId: String): Set[String]
-}
+import discovery.{Instances, Registry} // Instances.recordKey, membersKey, TtlIntervals · Registry.deploymentCidr, allowedServices, inCidr
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("discovery")
-  implicit val registerFormat: RootJsonFormat[RegisterRequest] = jsonFormat6(RegisterRequest)
+  val jedis = new JedisPooled("redis", 6379)
 
-  val registry: Registry = ???
-  val jedis = new Jedis("redis", 6379)
+  final case class Registration(service: String, instanceId: String, address: String, port: Int, heartbeatInterval: Int, metadataVersion: Long)
 
-  val route: Route =
-    path("v1" / "instances") {
-      post {
-        optionalHeaderValueByName("X-Client-Id") { _ =>
-          entity(as[RegisterRequest]) { body =>
-            // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-            val key = "sd:" + body.service + ":" + body.instance_id
-            jedis.hset(
-              key,
-              Map(
-                "service" -> body.service,
-                "instance_id" -> body.instance_id,
-                "address" -> body.address,
-                "port" -> body.port.toString,
-                "heartbeat_interval" -> body.heartbeat_interval.toString,
-                "metadata_version" -> body.metadata_version.toString,
-                "last_heartbeat" -> Instant.now().getEpochSecond.toString).asJava)
-            system.log.info("registered " + key)
-            complete(StatusCodes.OK, s"""{"instance_id":"\${body.instance_id}","ok":true}""")
-          }
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def parse(raw: String): Registration = {
+    val f = raw.parseJson.asJsObject.fields
+    Registration(
+      f("service").convertTo[String], f("instance_id").convertTo[String], f("address").convertTo[String],
+      f("port").convertTo[Int], f("heartbeat_interval").convertTo[Int], f.get("metadata_version").map(_.convertTo[Long]).getOrElse(1L))
+  }
+
+  private def answer(body: Registration, ttl: Int, clientId: String): JsObject = JsObject(
+    "service" -> JsString(body.service), "instance_id" -> JsString(body.instanceId), "address" -> JsString(body.address),
+    "port" -> JsNumber(body.port), "heartbeat_interval" -> JsNumber(body.heartbeatInterval),
+    "metadata_version" -> JsNumber(body.metadataVersion), "ttl_seconds" -> JsNumber(ttl), "registered_by" -> JsString(clientId))
+
+  val route: Route = path("v1" / "instances") {
+    post {
+      optionalHeaderValueByName("X-Client-Id") { clientId =>
+        entity(as[String]) { raw =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          val body = parse(raw)
+          val key = Instances.recordKey(body.service, body.instanceId)
+          jedis.hset(key, Map(
+            "address" -> body.address, "port" -> body.port.toString, "heartbeat_interval" -> body.heartbeatInterval.toString,
+            "metadata_version" -> body.metadataVersion.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
+          jedis.sadd(Instances.membersKey(body.service), body.instanceId)
+          complete(json(StatusCodes.Created, answer(body, Instances.TtlIntervals * body.heartbeatInterval, clientId.getOrElse(""))))
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import redis.clients.jedis.params.SetParams
+import redis.clients.jedis.JedisPooled
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-import java.net.Inet4Address
-import java.net.InetAddress
-import java.nio.charset.StandardCharsets
-import java.time.Instant
+import scala.jdk.CollectionConverters._
 
-final case class RegisterRequest(
-    service: String,
-    instance_id: String,
-    address: String,
-    port: Int,
-    heartbeat_interval: Int,
-    metadata_version: Int)
-
-final case class RegistryDeployment(cidr: String)
-
-trait Registry {
-  def deploymentCidr(service: String): Option[RegistryDeployment]
-  def allowedServices(clientId: String): Set[String]
-}
+import discovery.{Instances, Registry} // Instances.recordKey, membersKey, TtlIntervals · Registry.deploymentCidr, allowedServices, inCidr
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("discovery")
-  implicit val registerFormat: RootJsonFormat[RegisterRequest] = jsonFormat6(RegisterRequest)
+  val jedis = new JedisPooled("redis", 6379)
 
-  val TtlIntervals = 3
-  val MinHeartbeatSecs = 2
-  val MaxHeartbeatSecs = 60
   val MinPort = 1
   val MaxPort = 65535
-  val MaxInstanceIdLength = 63
+  val MinHeartbeatS = 2
+  val MaxHeartbeatS = 60
 
-  val registry: Registry = ???
-  val jedis = new Jedis("redis", 6379)
+  final case class Registration(service: String, instanceId: String, address: String, port: Int, heartbeatInterval: Int, metadataVersion: Long)
 
-  private def ipv4(address: String): Option[Long] =
-    try {
-      InetAddress.getByName(address) match {
-        case v4: Inet4Address =>
-          Some(v4.getAddress.foldLeft(0L)((acc, byte) => (acc << 8) | (byte & 0xff)))
-        case _ => None
-      }
-    } catch {
-      case _: Exception => None
-    }
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  /** inCidr is true only for an address literal inside the deployment range: 422 otherwise. */
-  def inCidr(address: String, cidr: String): Boolean = {
-    val parts = cidr.split("/", 2)
-    if (parts.length != 2) false
-    else {
-      val prefix = parts(1).toInt
-      val ip = ipv4(address)
-      val network = ipv4(parts(0))
-      if (ip.isEmpty || network.isEmpty || prefix < 0 || prefix > 32) false
-      else {
-        val mask = if (prefix == 0) 0L else (0xffffffffL << (32 - prefix)) & 0xffffffffL
-        (ip.get & mask) == (network.get & mask)
-      }
-    }
+  private def parse(raw: String): Registration = {
+    val f = raw.parseJson.asJsObject.fields
+    Registration(
+      f("service").convertTo[String], f("instance_id").convertTo[String], f("address").convertTo[String],
+      f("port").convertTo[Int], f("heartbeat_interval").convertTo[Int], f.get("metadata_version").map(_.convertTo[Long]).getOrElse(1L))
   }
 
-  val route: Route =
-    path("v1" / "instances") {
-      post {
-        optionalHeaderValueByName("X-Client-Id") { clientIdOpt =>
-          entity(as[RegisterRequest]) { body =>
-            val clientId = clientIdOpt.filter(_.nonEmpty)
-            if (clientId.isEmpty) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Client-Id"}""")
-            } else {
-              registry.deploymentCidr(body.service) match {
-                case None =>
-                  complete(StatusCodes.NotFound, """{"error":"unknown service"}""")
-                case Some(deployment) =>
-                  if (!registry.allowedServices(clientId.get).contains(body.service)) {
-                    complete(StatusCodes.Forbidden, """{"error":"client is not scoped to this service"}""")
-                  } else if (body.instance_id.isEmpty || body.instance_id.length > MaxInstanceIdLength) {
-                    complete(StatusCodes.BadRequest, """{"error":"invalid instance_id"}""")
-                  } else if (ipv4(body.address).isEmpty) {
-                    complete(StatusCodes.BadRequest, """{"error":"address must be an IP literal"}""")
-                  } else if (!inCidr(body.address, deployment.cidr)) {
-                    complete(StatusCodes.UnprocessableEntity, """{"error":"address is outside the deployment CIDR"}""")
-                  } else if (body.port < MinPort || body.port > MaxPort) {
-                    complete(StatusCodes.BadRequest, """{"error":"port must be 1..65535"}""")
-                  } else if (body.heartbeat_interval < MinHeartbeatSecs || body.heartbeat_interval > MaxHeartbeatSecs) {
-                    complete(StatusCodes.BadRequest, """{"error":"heartbeat_interval must be 2..60"}""")
-                  } else if (body.metadata_version < 1) {
-                    complete(StatusCodes.BadRequest, """{"error":"metadata_version must be >= 1"}""")
-                  } else {
-                    val ttlSeconds = TtlIntervals * body.heartbeat_interval
-                    val key = "sd:" + body.service + ":" + body.instance_id
-                    val payload =
-                      s"""{"service":"\${body.service}","instance_id":"\${body.instance_id}","address":"\${body.address}","port":\${body.port},"heartbeat_interval":\${body.heartbeat_interval},"metadata_version":\${body.metadata_version},"last_heartbeat":\${Instant.now().getEpochSecond}}"""
-                    jedis.set(key, payload, SetParams.setParams().ex(ttlSeconds.toLong))
-                    system.log.info(s"register service=\${body.service} instance=\${body.instance_id} ttl=$ttlSeconds")
-                    complete(
-                      StatusCodes.Created,
-                      s"""{"service":"\${body.service}","instance_id":"\${body.instance_id}","address":"\${body.address}","port":\${body.port},"heartbeat_interval":\${body.heartbeat_interval},"metadata_version":\${body.metadata_version},"ttl_seconds":$ttlSeconds,"key":"$key"}""")
-                  }
-              }
-            }
+  private def answer(body: Registration, ttl: Int, clientId: String): JsObject = JsObject(
+    "service" -> JsString(body.service), "instance_id" -> JsString(body.instanceId), "address" -> JsString(body.address),
+    "port" -> JsNumber(body.port), "heartbeat_interval" -> JsNumber(body.heartbeatInterval),
+    "metadata_version" -> JsNumber(body.metadataVersion), "ttl_seconds" -> JsNumber(ttl), "registered_by" -> JsString(clientId))
+
+  /** The first guard the registration fails, as a status and a reason. */
+  private def refusal(clientId: String, body: Registration): Option[(StatusCode, String)] =
+    if (clientId.isEmpty) Some(StatusCodes.Unauthorized -> "X-Client-Id is required")
+    else
+      Registry.deploymentCidr(body.service) match {
+        case None => Some(StatusCodes.NotFound -> s"no deployment for service \${body.service}")
+        case Some(_) if !Registry.allowedServices(clientId).contains(body.service) =>
+          Some(StatusCodes.Forbidden -> s"$clientId may not register into \${body.service}")
+        case Some(_) if body.port < MinPort || body.port > MaxPort => Some(StatusCodes.BadRequest -> "port must be 1..65535")
+        case Some(_) if body.heartbeatInterval < MinHeartbeatS || body.heartbeatInterval > MaxHeartbeatS =>
+          Some(StatusCodes.BadRequest -> "heartbeat_interval must be 2..60 seconds")
+        case Some(cidr) if !Registry.inCidr(body.address, cidr) =>
+          Some(StatusCodes.UnprocessableEntity -> s"\${body.address} is outside the deployment CIDR $cidr")
+        case Some(_) => None
+      }
+
+  val route: Route = path("v1" / "instances") {
+    post {
+      optionalHeaderValueByName("X-Client-Id") { header =>
+        entity(as[String]) { raw =>
+          val clientId = header.getOrElse("")
+          val body = parse(raw)
+          refusal(clientId, body) match {
+            case Some((status, reason)) => complete(status -> reason)
+            case None =>
+              val ttl = Instances.TtlIntervals * body.heartbeatInterval
+              val key = Instances.recordKey(body.service, body.instanceId)
+              // The record, its expiry and the membership land together: the TTL is the only failure detector.
+              val tx = jedis.multi()
+              tx.hset(key, Map(
+                "address" -> body.address, "port" -> body.port.toString, "heartbeat_interval" -> body.heartbeatInterval.toString,
+                "metadata_version" -> body.metadataVersion.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
+              tx.expire(key, ttl.toLong)
+              tx.sadd(Instances.membersKey(body.service), body.instanceId)
+              tx.exec()
+              complete(json(StatusCodes.Created, answer(body, ttl, clientId)))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -827,197 +652,457 @@ object Api {
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <iostream>
-#include <optional>
-#include <set>
 #include <string>
+#include <unordered_map>
+
+#include "discovery/instances.h"  // instances::recordKey, membersKey, kTtlIntervals, nowSeconds, registerInstance
+#include "discovery/registry.h"   // registry::deploymentCidr, allowedServices, inCidr
 
 using json = nlohmann::json;
 
-struct Registry {
-  std::optional<std::string> deploymentCidr(const std::string& service);
-  std::set<std::string> allowedServices(const std::string& clientId);
-};
-
-Registry registry;
 sw::redis::Redis redis("tcp://redis:6379");
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/instances", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const auto service = body.value("service", std::string());
-    const auto instanceId = body.value("instance_id", std::string());
-    const auto key = "sd:" + service + ":" + instanceId;
-    const auto record = json{
-        {"service", service},
-        {"instance_id", instanceId},
-        {"address", body.value("address", std::string())},
-        {"port", body.value("port", 0)},
-        {"heartbeat_interval", body.value("heartbeat_interval", 0)},
-        {"metadata_version", body.value("metadata_version", 1)},
-    };
-    redis.hset(key, "record", record.dump());
-    std::cout << "registered " << key << "\\n";
-    res.status = 200;
-    res.set_content(json{{"instance_id", instanceId}, {"ok", true}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void handle_register(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string client_id = req.get_header_value("X-Client-Id");
+  json body = json::parse(req.body);
+  const std::string service = body.value("service", "");
+  const std::string instance_id = body.value("instance_id", "");
+  const long interval = body.value("heartbeat_interval", 0L);
+  if (!body.contains("metadata_version")) body["metadata_version"] = 1;
+  const std::string key = instances::recordKey(service, instance_id);
+  const std::unordered_map<std::string, std::string> fields = {
+      {"address", body.value("address", "")},
+      {"port", std::to_string(body.value("port", 0L))},
+      {"heartbeat_interval", std::to_string(interval)},
+      {"metadata_version", std::to_string(body.value("metadata_version", 1L))},
+      {"last_heartbeat", std::to_string(instances::nowSeconds())}};
+  redis.hset(key, fields.begin(), fields.end());
+  redis.sadd(instances::membersKey(service), instance_id);
+  body["ttl_seconds"] = instances::kTtlIntervals * interval;
+  body["registered_by"] = client_id;
+  res.status = 201;
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/instances", handle_register); }
 `,
-      solution: `#include <arpa/inet.h>
-#include <httplib.h>
+      solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <cstdint>
-#include <iostream>
-#include <optional>
-#include <set>
 #include <string>
+#include <unordered_map>
+
+#include "discovery/instances.h"  // instances::recordKey, membersKey, kTtlIntervals, nowSeconds, registerInstance
+#include "discovery/registry.h"   // registry::deploymentCidr, allowedServices, inCidr
 
 using json = nlohmann::json;
 
-constexpr int kTtlIntervals = 3;
-constexpr int kMinHeartbeatSecs = 2;
-constexpr int kMaxHeartbeatSecs = 60;
-constexpr int kMinPort = 1;
-constexpr int kMaxPort = 65535;
-constexpr std::size_t kMaxInstanceId = 63;
-
-struct Registry {
-  std::optional<std::string> deploymentCidr(const std::string& service);
-  std::set<std::string> allowedServices(const std::string& clientId);
-};
-
-Registry registry;
 sw::redis::Redis redis("tcp://redis:6379");
-long unixSeconds();
 
-/** inCidr is true only for an address literal inside the deployment range: 422 otherwise. */
-bool inCidr(const std::string& address, const std::string& cidr) {
-  const auto slash = cidr.find('/');
-  if (slash == std::string::npos) return false;
-  in_addr ip{};
-  in_addr network{};
-  if (inet_pton(AF_INET, address.c_str(), &ip) != 1) return false;
-  if (inet_pton(AF_INET, cidr.substr(0, slash).c_str(), &network) != 1) return false;
-  const auto prefix = std::stoi(cidr.substr(slash + 1));
-  if (prefix < 0 || prefix > 32) return false;
-  const uint32_t mask = prefix == 0 ? 0u : htonl(~uint32_t{0} << (32 - prefix));
-  return (ip.s_addr & mask) == (network.s_addr & mask);
+constexpr long kMinPort = 1;
+constexpr long kMaxPort = 65535;
+constexpr long kMinHeartbeatS = 2;
+constexpr long kMaxHeartbeatS = 60;
+
+void refuse(httplib::Response& res, int status, const std::string& reason) {
+  res.status = status;
+  res.set_content(json{{"error", reason}}.dump(), "application/json");
 }
 
-int main() {
-  httplib::Server svr;
+void handle_register(const httplib::Request& req, httplib::Response& res) {
+  const std::string client_id = req.get_header_value("X-Client-Id");
+  if (client_id.empty()) return refuse(res, 401, "X-Client-Id is required");
+  json body = json::parse(req.body);
+  const std::string service = body.value("service", "");
+  const std::string instance_id = body.value("instance_id", "");
+  const std::string address = body.value("address", "");
+  const long port = body.value("port", 0L);
+  const long interval = body.value("heartbeat_interval", 0L);
+  if (!body.contains("metadata_version")) body["metadata_version"] = 1;
+  const auto cidr = registry::deploymentCidr(service);
+  if (!cidr) return refuse(res, 404, "no deployment for service " + service);
+  if (!registry::allowedServices(client_id).count(service)) return refuse(res, 403, client_id + " may not register into " + service);
+  if (port < kMinPort || port > kMaxPort) return refuse(res, 400, "port must be 1..65535");
+  if (interval < kMinHeartbeatS || interval > kMaxHeartbeatS) return refuse(res, 400, "heartbeat_interval must be 2..60 seconds");
+  if (!registry::inCidr(address, *cidr)) return refuse(res, 422, address + " is outside the deployment CIDR " + *cidr);
 
-  svr.Post("/v1/instances", [](const httplib::Request& req, httplib::Response& res) {
-    const auto clientId = req.get_header_value("X-Client-Id");
-    if (clientId.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Client-Id"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("service") || !body["service"].is_string()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto service = body["service"].get<std::string>();
-    const auto cidr = registry.deploymentCidr(service);
-    if (!cidr) {
-      res.status = 404;
-      res.set_content(R"({"error":"unknown service"})", "application/json");
-      return;
-    }
-    if (registry.allowedServices(clientId).count(service) == 0) {
-      res.status = 403;
-      res.set_content(R"({"error":"client is not scoped to this service"})", "application/json");
-      return;
-    }
-    const auto instanceId = body.value("instance_id", std::string());
-    if (instanceId.empty() || instanceId.size() > kMaxInstanceId) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid instance_id"})", "application/json");
-      return;
-    }
-    const auto address = body.value("address", std::string());
-    in_addr parsed{};
-    if (inet_pton(AF_INET, address.c_str(), &parsed) != 1) {
-      res.status = 400;
-      res.set_content(R"({"error":"address must be an IP literal"})", "application/json");
-      return;
-    }
-    if (!inCidr(address, *cidr)) {
-      res.status = 422;
-      res.set_content(R"({"error":"address is outside the deployment CIDR"})", "application/json");
-      return;
-    }
-    const int port = body.value("port", 0);
-    if (port < kMinPort || port > kMaxPort) {
-      res.status = 400;
-      res.set_content(R"({"error":"port must be 1..65535"})", "application/json");
-      return;
-    }
-    const int heartbeatInterval = body.value("heartbeat_interval", 0);
-    if (heartbeatInterval < kMinHeartbeatSecs || heartbeatInterval > kMaxHeartbeatSecs) {
-      res.status = 400;
-      res.set_content(R"({"error":"heartbeat_interval must be 2..60"})", "application/json");
-      return;
-    }
-    const int metadataVersion = body.value("metadata_version", 1);
-    if (metadataVersion < 1) {
-      res.status = 400;
-      res.set_content(R"({"error":"metadata_version must be >= 1"})", "application/json");
-      return;
-    }
-
-    const int ttlSeconds = kTtlIntervals * heartbeatInterval;
-    const auto key = "sd:" + service + ":" + instanceId;
-    const auto record = json{
-        {"service", service},
-        {"instance_id", instanceId},
-        {"address", address},
-        {"port", port},
-        {"heartbeat_interval", heartbeatInterval},
-        {"metadata_version", metadataVersion},
-        {"last_heartbeat", unixSeconds()},
-    };
-    redis.set(key, record.dump(), std::chrono::seconds(ttlSeconds));
-    std::cout << "register service=" << service << " instance=" << instanceId << " ttl=" << ttlSeconds << "\\n";
-    res.status = 201;
-    res.set_content(
-        json{{"service", service},
-             {"instance_id", instanceId},
-             {"address", address},
-             {"port", port},
-             {"heartbeat_interval", heartbeatInterval},
-             {"metadata_version", metadataVersion},
-             {"ttl_seconds", ttlSeconds},
-             {"key", key}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+  const long ttl = instances::kTtlIntervals * interval;
+  const std::string key = instances::recordKey(service, instance_id);
+  const std::unordered_map<std::string, std::string> fields = {
+      {"address", address},
+      {"port", std::to_string(port)},
+      {"heartbeat_interval", std::to_string(interval)},
+      {"metadata_version", std::to_string(body.value("metadata_version", 1L))},
+      {"last_heartbeat", std::to_string(instances::nowSeconds())}};
+  // The record, its expiry and the membership land together: the TTL is the only failure detector.
+  auto tx = redis.transaction();
+  tx.hset(key, fields.begin(), fields.end()).expire(key, std::chrono::seconds(ttl)).sadd(instances::membersKey(service), instance_id).exec();
+  body["ttl_seconds"] = ttl;
+  body["registered_by"] = client_id;
+  res.status = 201;
+  res.set_content(body.dump(), "application/json");
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/instances", handle_register); }
 `,
     },
   },
+  harness: {
+    python: `from discovery import instances, registry
+
+INSTANCE = {"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}
+AGENT = {"X-Client-Id": "checkout-agent"}
+
+
+def _api(ctx):
+    registry.define_service("checkout", "10.4.0.0/16")
+    registry.define_service("payments", "10.9.0.0/16")
+    registry.grant("checkout-agent", "checkout")
+    return ctx.client(ctx.load("api").app)
+
+
+def _nothing_written(ctx, service, instance_id, why):
+    key = instances.record_key(service, instance_id)
+    assert ctx.redis.exists(key) == 0, f"{why}, yet {key} was written: a refused registration must leave nothing a router can read"
+    assert not ctx.redis.sismember(instances.members_key(service), instance_id), f"{why}, yet {instance_id} was added to sd:members:{service}"
+
+
+async def check_scope(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/instances", json=INSTANCE)
+        assert r.status_code == 401, f"a registration without X-Client-Id answered {r.status_code}, expected 401"
+        _nothing_written(ctx, "checkout", "checkout-3", "the caller was anonymous")
+        rogue = {**INSTANCE, "service": "payments", "instance_id": "payments-1", "address": "10.9.0.4"}
+        r = await c.post("/v1/instances", json=rogue, headers=AGENT)
+        assert r.status_code == 403, f"checkout-agent registering into payments answered {r.status_code}, expected 403: its grants name checkout only"
+        _nothing_written(ctx, "payments", "payments-1", "checkout-agent has no grant for payments")
+        r = await c.post("/v1/instances", json=INSTANCE, headers=AGENT)
+    assert r.status_code == 201, f"checkout-agent registering checkout-3 into checkout answered {r.status_code}: {r.text}"
+    assert ctx.redis.exists("sd:checkout:checkout-3") == 1, "a granted registration must write sd:checkout:checkout-3"
+
+
+async def check_cidr(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/instances", json={**INSTANCE, "service": "inventory", "instance_id": "inventory-1"}, headers=AGENT)
+        assert r.status_code == 404, f"a registration into inventory, which has no deployment, answered {r.status_code}, expected 404"
+        _nothing_written(ctx, "inventory", "inventory-1", "inventory has no deployment")
+        for address in ("10.5.0.9", "192.168.1.20", "laptop.local"):
+            r = await c.post("/v1/instances", json={**INSTANCE, "address": address}, headers=AGENT)
+            assert r.status_code == 422, f"checkout-3 at {address}, outside checkout's CIDR 10.4.0.0/16, answered {r.status_code}, expected 422"
+            _nothing_written(ctx, "checkout", "checkout-3", f"{address} is outside 10.4.0.0/16")
+        r = await c.post("/v1/instances", json=INSTANCE, headers=AGENT)
+    assert r.status_code == 201, f"checkout-3 at 10.4.2.7, inside 10.4.0.0/16, answered {r.status_code}: {r.text}"
+    assert ctx.redis.hget("sd:checkout:checkout-3", "address") == "10.4.2.7", f"sd:checkout:checkout-3 holds {ctx.redis.hgetall('sd:checkout:checkout-3')}"
+
+
+async def check_ttl(ctx):
+    async with _api(ctx) as c:
+        r = await c.post("/v1/instances", json=INSTANCE, headers=AGENT)
+    assert r.status_code == 201, f"the registration answered {r.status_code}: {r.text}"
+    assert r.json().get("ttl_seconds") == 15, f"ttl_seconds is {r.json().get('ttl_seconds')!r}, expected 3 intervals of 5 s = 15"
+    ttl = ctx.redis.ttl("sd:checkout:checkout-3")
+    assert 14 <= ttl <= 15, f"sd:checkout:checkout-3 has TTL {ttl}: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered"
+    assert ctx.redis.sismember("sd:members:checkout", "checkout-3"), "checkout-3 must be in sd:members:checkout"
+    ctx.clock.advance(16)
+    assert ctx.redis.exists("sd:checkout:checkout-3") == 0, "16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 still exists: a crashed instance stays routable"
+
+
+async def check_bounds(ctx):
+    async with _api(ctx) as c:
+        for change, why in (({"port": 0}, "port 0"), ({"port": 70000}, "port 70000"), ({"heartbeat_interval": 1}, "a 1 s heartbeat interval"), ({"heartbeat_interval": 3600}, "a 3600 s heartbeat interval")):
+            r = await c.post("/v1/instances", json={**INSTANCE, **change}, headers=AGENT)
+            assert r.status_code == 400, f"a registration with {why} answered {r.status_code}, expected 400"
+            _nothing_written(ctx, "checkout", "checkout-3", f"the registration had {why}")
+        r = await c.post("/v1/instances", json={**INSTANCE, "port": 65535, "heartbeat_interval": 60}, headers=AGENT)
+    assert r.status_code == 201, f"port 65535 with a 60 s interval is inside the bounds and answered {r.status_code}: {r.text}"
+`,
+    typescript: `const INSTANCE = {service: 'checkout', instance_id: 'checkout-3', address: '10.4.2.7', port: 8080, heartbeat_interval: 5, metadata_version: 12};
+const AGENT = {'X-Client-Id': 'checkout-agent'};
+
+function api(ctx) {
+  ctx.redis.set('sd:deploy:checkout', '10.4.0.0/16');
+  ctx.redis.set('sd:deploy:payments', '10.9.0.0/16');
+  ctx.redis.sadd('sd:grants:checkout-agent', 'checkout');
+  return ctx.client(ctx.load('api').app);
+}
+
+function nothingWritten(ctx, service: string, instanceId: string, why: string): void {
+  const key = 'sd:' + service + ':' + instanceId;
+  assert.equal(ctx.redis.exists(key), 0, why + ', yet ' + key + ' was written: a refused registration must leave nothing a router can read');
+  assert.equal(ctx.redis.sismember('sd:members:' + service, instanceId), 0, why + ', yet ' + instanceId + ' was added to sd:members:' + service);
+}
+
+export async function check_scope(ctx) {
+  const c = api(ctx);
+  let r = await c.post('/v1/instances', {json: INSTANCE});
+  assert.equal(r.status, 401, \`a registration without X-Client-Id answered \${r.status}, expected 401\`);
+  nothingWritten(ctx, 'checkout', 'checkout-3', 'the caller was anonymous');
+  const rogue = {...INSTANCE, service: 'payments', instance_id: 'payments-1', address: '10.9.0.4'};
+  r = await c.post('/v1/instances', {json: rogue, headers: AGENT});
+  assert.equal(r.status, 403, \`checkout-agent registering into payments answered \${r.status}, expected 403: its grants name checkout only\`);
+  nothingWritten(ctx, 'payments', 'payments-1', 'checkout-agent has no grant for payments');
+  r = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
+  assert.equal(r.status, 201, \`checkout-agent registering checkout-3 into checkout answered \${r.status}: \${r.text}\`);
+  assert.equal(ctx.redis.exists('sd:checkout:checkout-3'), 1, 'a granted registration must write sd:checkout:checkout-3');
+}
+
+export async function check_cidr(ctx) {
+  const c = api(ctx);
+  let r = await c.post('/v1/instances', {json: {...INSTANCE, service: 'inventory', instance_id: 'inventory-1'}, headers: AGENT});
+  assert.equal(r.status, 404, \`a registration into inventory, which has no deployment, answered \${r.status}, expected 404\`);
+  nothingWritten(ctx, 'inventory', 'inventory-1', 'inventory has no deployment');
+  for (const address of ['10.5.0.9', '192.168.1.20', 'laptop.local']) {
+    r = await c.post('/v1/instances', {json: {...INSTANCE, address}, headers: AGENT});
+    assert.equal(r.status, 422, \`checkout-3 at \${address}, outside checkout's CIDR 10.4.0.0/16, answered \${r.status}, expected 422\`);
+    nothingWritten(ctx, 'checkout', 'checkout-3', address + ' is outside 10.4.0.0/16');
+  }
+  r = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
+  assert.equal(r.status, 201, \`checkout-3 at 10.4.2.7, inside 10.4.0.0/16, answered \${r.status}: \${r.text}\`);
+  assert.equal(ctx.redis.hget('sd:checkout:checkout-3', 'address'), '10.4.2.7', 'sd:checkout:checkout-3 must hold the address 10.4.2.7');
+}
+
+export async function check_ttl(ctx) {
+  const c = api(ctx);
+  const r = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
+  assert.equal(r.status, 201, \`the registration answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().ttl_seconds, 15, \`ttl_seconds is \${JSON.stringify(r.json().ttl_seconds)}, expected 3 intervals of 5 s = 15\`);
+  const ttl = ctx.redis.ttl('sd:checkout:checkout-3');
+  assert(14 <= ttl && ttl <= 15, \`sd:checkout:checkout-3 has TTL \${ttl}: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered\`);
+  assert.equal(ctx.redis.sismember('sd:members:checkout', 'checkout-3'), 1, 'checkout-3 must be in sd:members:checkout');
+  ctx.clock.advance(16);
+  assert.equal(ctx.redis.exists('sd:checkout:checkout-3'), 0, '16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 still exists: a crashed instance stays routable');
+}
+
+export async function check_bounds(ctx) {
+  const c = api(ctx);
+  const cases: [Record<string, number>, string][] = [
+    [{port: 0}, 'port 0'],
+    [{port: 70000}, 'port 70000'],
+    [{heartbeat_interval: 1}, 'a 1 s heartbeat interval'],
+    [{heartbeat_interval: 3600}, 'a 3600 s heartbeat interval'],
+  ];
+  for (const [change, why] of cases) {
+    const r = await c.post('/v1/instances', {json: {...INSTANCE, ...change}, headers: AGENT});
+    assert.equal(r.status, 400, \`a registration with \${why} answered \${r.status}, expected 400\`);
+    nothingWritten(ctx, 'checkout', 'checkout-3', 'the registration had ' + why);
+  }
+  const r = await c.post('/v1/instances', {json: {...INSTANCE, port: 65535, heartbeat_interval: 60}, headers: AGENT});
+  assert.equal(r.status, 201, \`port 65535 with a 60 s interval is inside the bounds and answered \${r.status}: \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"net/http"
+
+	"leetbuild/harness"
+)
+
+var instance = map[string]any{"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16")
+	ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16")
+	ctx.Redis.Do("SADD", "sd:grants:checkout-agent", "checkout")
+	mux := http.NewServeMux()
+	routes(mux)
+	return ctx.HTTP(mux)
+}
+
+func with(changes map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range instance {
+		out[k] = v
+	}
+	for k, v := range changes {
+		out[k] = v
+	}
+	return out
+}
+
+func register(c *harness.HTTP, body map[string]any) *harness.Response {
+	return c.Post("/v1/instances", body, "X-Client-Id", "checkout-agent")
+}
+
+func nothingWritten(ctx *harness.Ctx, service, instanceID, why string) {
+	key := "sd:" + service + ":" + instanceID
+	ctx.Equal(ctx.Redis.Exists(key), 0, "%s, yet %s was written: a refused registration must leave nothing a router can read; exists", why, key)
+	ctx.Assert(!ctx.Redis.SIsMember("sd:members:"+service, instanceID), "%s, yet %s was added to sd:members:%s", why, instanceID, service)
+}
+
+func CheckScope(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := c.Post("/v1/instances", instance)
+	ctx.Equal(r.Status, 401, "a registration without X-Client-Id")
+	nothingWritten(ctx, "checkout", "checkout-3", "the caller was anonymous")
+	r = register(c, with(map[string]any{"service": "payments", "instance_id": "payments-1", "address": "10.9.0.4"}))
+	ctx.Equal(r.Status, 403, "checkout-agent registering into payments (its grants name checkout only)")
+	nothingWritten(ctx, "payments", "payments-1", "checkout-agent has no grant for payments")
+	r = register(c, instance)
+	ctx.Equal(r.Status, 201, "checkout-agent registering checkout-3 into checkout (%s)", r.Text())
+	ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 1, "a granted registration must write sd:checkout:checkout-3; exists")
+}
+
+func CheckCidr(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := register(c, with(map[string]any{"service": "inventory", "instance_id": "inventory-1"}))
+	ctx.Equal(r.Status, 404, "a registration into inventory, which has no deployment")
+	nothingWritten(ctx, "inventory", "inventory-1", "inventory has no deployment")
+	for _, address := range []string{"10.5.0.9", "192.168.1.20", "laptop.local"} {
+		r = register(c, with(map[string]any{"address": address}))
+		ctx.Equal(r.Status, 422, "checkout-3 at %s, outside checkout's CIDR 10.4.0.0/16", address)
+		nothingWritten(ctx, "checkout", "checkout-3", address+" is outside 10.4.0.0/16")
+	}
+	r = register(c, instance)
+	ctx.Equal(r.Status, 201, "checkout-3 at 10.4.2.7, inside 10.4.0.0/16 (%s)", r.Text())
+	address, _ := ctx.Redis.HGet("sd:checkout:checkout-3", "address")
+	ctx.Equal(address, "10.4.2.7", "the address in sd:checkout:checkout-3")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	c := api(ctx)
+	r := register(c, instance)
+	ctx.Equal(r.Status, 201, "the registration (%s)", r.Text())
+	var body struct {
+		TTLSeconds int \`json:"ttl_seconds"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.TTLSeconds, 15, "ttl_seconds (3 intervals of 5 s)")
+	ttl := ctx.Redis.TTL("sd:checkout:checkout-3")
+	ctx.Assert(14 <= ttl && ttl <= 15, "sd:checkout:checkout-3 has TTL %d: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered", ttl)
+	ctx.Assert(ctx.Redis.SIsMember("sd:members:checkout", "checkout-3"), "checkout-3 must be in sd:members:checkout")
+	ctx.Clock.Advance(16)
+	ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 0, "16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 must be gone, or a crashed instance stays routable; exists")
+}
+
+func CheckBounds(ctx *harness.Ctx) {
+	c := api(ctx)
+	cases := []struct {
+		change map[string]any
+		why    string
+	}{
+		{map[string]any{"port": 0}, "port 0"},
+		{map[string]any{"port": 70000}, "port 70000"},
+		{map[string]any{"heartbeat_interval": 1}, "a 1 s heartbeat interval"},
+		{map[string]any{"heartbeat_interval": 3600}, "a 3600 s heartbeat interval"},
+	}
+	for _, tc := range cases {
+		r := register(c, with(tc.change))
+		ctx.Equal(r.Status, 400, "a registration with %s", tc.why)
+		nothingWritten(ctx, "checkout", "checkout-3", "the registration had "+tc.why)
+	}
+	r := register(c, with(map[string]any{"port": 65535, "heartbeat_interval": 60}))
+	ctx.Equal(r.Status, 201, "port 65535 with a 60 s interval is inside the bounds (%s)", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "discovery/instances.h"
+
+namespace {
+
+const nlohmann::json kInstance = {{"service", "checkout"}, {"instance_id", "checkout-3"}, {"address", "10.4.2.7"},
+                                  {"port", 8080},          {"heartbeat_interval", 5},     {"metadata_version", 12}};
+
+harness::HTTP api(harness::Ctx& ctx) {
+  ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16");
+  ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16");
+  ctx.Redis.Do("SADD", "sd:grants:checkout-agent", "checkout");
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+nlohmann::json with(const nlohmann::json& changes) {
+  nlohmann::json out = kInstance;
+  out.update(changes);
+  return out;
+}
+
+harness::Response registerAs(harness::HTTP& c, const nlohmann::json& body) {
+  return c.Post("/v1/instances", body.dump(), "Content-Type", "application/json", "X-Client-Id", "checkout-agent");
+}
+
+void nothingWritten(harness::Ctx& ctx, const std::string& service, const std::string& instance_id, const std::string& why) {
+  const std::string key = "sd:" + service + ":" + instance_id;
+  ctx.Equal(ctx.Redis.Exists(key), 0, "%s, yet %s was written: a refused registration must leave nothing a router can read; exists", why, key);
+  ctx.Assert(!ctx.Redis.SIsMember("sd:members:" + service, instance_id), "%s, yet %s was added to sd:members:%s", why, instance_id, service);
+}
+
+}  // namespace
+
+void CheckScope(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = c.Post("/v1/instances", kInstance.dump(), "Content-Type", "application/json");
+  ctx.Equal(r.Status, 401, "a registration without X-Client-Id");
+  nothingWritten(ctx, "checkout", "checkout-3", "the caller was anonymous");
+  r = registerAs(c, with({{"service", "payments"}, {"instance_id", "payments-1"}, {"address", "10.9.0.4"}}));
+  ctx.Equal(r.Status, 403, "checkout-agent registering into payments (its grants name checkout only)");
+  nothingWritten(ctx, "payments", "payments-1", "checkout-agent has no grant for payments");
+  r = registerAs(c, kInstance);
+  ctx.Equal(r.Status, 201, "checkout-agent registering checkout-3 into checkout (%s)", r.Text());
+  ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 1, "a granted registration must write sd:checkout:checkout-3; exists");
+}
+
+void CheckCidr(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = registerAs(c, with({{"service", "inventory"}, {"instance_id", "inventory-1"}}));
+  ctx.Equal(r.Status, 404, "a registration into inventory, which has no deployment");
+  nothingWritten(ctx, "inventory", "inventory-1", "inventory has no deployment");
+  for (const std::string address : {"10.5.0.9", "192.168.1.20", "laptop.local"}) {
+    r = registerAs(c, with({{"address", address}}));
+    ctx.Equal(r.Status, 422, "checkout-3 at %s, outside checkout's CIDR 10.4.0.0/16", address);
+    nothingWritten(ctx, "checkout", "checkout-3", address + " is outside 10.4.0.0/16");
+  }
+  r = registerAs(c, kInstance);
+  ctx.Equal(r.Status, 201, "checkout-3 at 10.4.2.7, inside 10.4.0.0/16 (%s)", r.Text());
+  ctx.Equal(ctx.Redis.HGet("sd:checkout:checkout-3", "address").value_or(""), "10.4.2.7", "the address in sd:checkout:checkout-3");
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = registerAs(c, kInstance);
+  ctx.Equal(r.Status, 201, "the registration (%s)", r.Text());
+  ctx.Equal(nlohmann::json::parse(r.Text()).value("ttl_seconds", 0L), 15, "ttl_seconds (3 intervals of 5 s)");
+  const long long ttl = ctx.Redis.TTL("sd:checkout:checkout-3");
+  ctx.Assert(14 <= ttl && ttl <= 15, "sd:checkout:checkout-3 has TTL %d: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered", ttl);
+  ctx.Assert(ctx.Redis.SIsMember("sd:members:checkout", "checkout-3"), "checkout-3 must be in sd:members:checkout");
+  ctx.Clock.Advance(16);
+  ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 0, "16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 must be gone, or a crashed instance stays routable; exists");
+}
+
+void CheckBounds(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::vector<std::pair<nlohmann::json, std::string>> cases = {
+      {{{"port", 0}}, "port 0"},
+      {{{"port", 70000}}, "port 70000"},
+      {{{"heartbeat_interval", 1}}, "a 1 s heartbeat interval"},
+      {{{"heartbeat_interval", 3600}}, "a 3600 s heartbeat interval"}};
+  for (const auto& [change, why] : cases) {
+    const auto r = registerAs(c, with(change));
+    ctx.Equal(r.Status, 400, "a registration with %s", why);
+    nothingWritten(ctx, "checkout", "checkout-3", "the registration had " + why);
+  }
+  const auto r = registerAs(c, with({{"port", 65535}, {"heartbeat_interval", 60}}));
+  ctx.Equal(r.Status, 201, "port 65535 with a 60 s interval is inside the bounds (%s)", r.Text());
+}
+`,
+  },
   hints: [
-    "Traffic for checkout is being routed to an engineer's laptop, and a pod that was OOM-killed yesterday is still in the routing table this morning.",
-    'The handler builds the record and calls `HSET` straight away: no `registry.deployment_cidr` test on `address`, no `registry.allowed_services` test on the caller, and a hash with no expiry.',
-    'Guard 401, 404, 403, then the body (slug, `ip_address`, CIDR membership → 422, `port`, `heartbeat_interval`, `metadata_version`); write `SET key json EX 3 * heartbeat_interval`; answer 201 with `ttl_seconds`.',
+    'An instance the checkout agent registered shows up under payments, and a pod killed an hour ago is still listed in sd:members:checkout with its record intact.',
+    'The handler writes before it checks anything: no grant lookup, no CIDR test, no bounds. And HSET creates a hash with no TTL, so the ttl_seconds in the answer is a promise nobody keeps.',
+    'Guard in order: 401, `deployment_cidr` None → 404, `allowed_services` → 403, port and interval → 400, `in_cidr` → 422. Then one `pipeline(transaction=True)` with `hset`, `expire(key, TTL_INTERVALS * heartbeat_interval)` and `sadd`.',
   ],
-  debrief: `Every guard runs before the write because a rejected registration must leave no key behind. The address check has two steps with two codes: a literal that does not parse is a bad request, a literal that parses but lies outside the deployment CIDR is unprocessable, because the request is well formed and the instance is simply not ours. The scope check exists because the mesh tells you who called and the registry tells you what they may register. The TTL in the same \`SET\` is the registry's entire expiry mechanism: the heartbeat renews the same key, and an entry without one survives every crash, deploy and decommission. Production discovery services add a registration audit trail and a two-phase drain, so a departing instance stops receiving traffic before its key disappears.`,
+  debrief: `Every guard runs before the write, so a refused registration leaves nothing a router could read. The order follows what each answer tells the agent: 401 is a missing identity, 404 a mistyped service, 403 a grant problem, 400 a malformed body, 422 a well-formed address that is simply not this deployment's. The expiry rides in the same MULTI as the hash because the TTL is the registry's only failure detector: a record written without one outlives every crash. Production registries prove the caller with mTLS instead of trusting a header the mesh set, and stamp each registration with the deploy that made it, so an operator can tell an instance from a stray process.`,
 };

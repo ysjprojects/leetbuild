@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package devicegw;
+
+// The device gateway step 3 delivers commands through. Deliver pushes the command to a connected
+// device and answers DELIVERED once the device acknowledged it. For a device that is offline the
+// gateway keeps the command in its queue until expires_at_ms and answers QUEUED (accepted, not yet
+// executed); a command whose window has closed is dropped and answered EXPIRED. accepted is true
+// whenever the gateway took the command (DELIVERED or QUEUED). An unknown device is NOT_FOUND.
+service DeviceGateway {
+  rpc Deliver(DeliverRequest) returns (DeliverReply);
+}
+
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  QUEUED = 1;
+  DELIVERED = 2;
+  EXPIRED = 3;
+}
+
+message DeliverRequest {
+  string command_id = 1;
+  string device_id = 2;
+  string action = 3;
+  // The action's parameters as a JSON object.
+  string params_json = 4;
+  // The end of the command's validity window, milliseconds since the epoch: the gateway queues the
+  // command for an offline device until then and drops it after. 0 means no window was sent.
+  int64 expires_at_ms = 5;
+}
+
+message DeliverReply {
+  DeliveryStatus status = 1;
+  bool accepted = 2;
+}

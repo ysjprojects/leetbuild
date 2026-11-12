@@ -2,107 +2,118 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis suggestion cache behind GET /v1/autocomplete',
+  title: 'Redis suggestion cache: per tenant, per catalog version, with a TTL and a cap',
   concept: 'redis',
-  file: 'state',
-  focus: ['api', 'redis', 'store'],
+  file: 'cache',
+  focus: ['api', 'redis', 'terms'],
   task: `## Task
 
-**Starting point.** The starter reads and writes cached top suggestions under
-\`autocomplete:{prefix}\` with a plain \`SET\`, and the lookup behind \`GET /v1/autocomplete\` goes
-through it. It compiles, it improves the demo latency, and it hides 5 flaws.
+**Starting point.** The starter is the suggestion cache step 3 reads before it calls the suggester:
+\`put_suggestions(tenant, prefix, suggestions)\` writes the list as JSON with
+\`SET suggest:cache:{prefix}\`, and \`get_suggestions(tenant, prefix)\` reads it back (\`None\` on a
+miss). It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** With no cap, a bot walking the keyspace fills Redis until
-eviction destroys everyone's hit rate. No TTL and no catalog version keep a retracted term
-"popular". A key without the tenant answers one tenant with another's suggestions the first time
-two tenants type the same prefix.
+**Failure mode the checks target.** Two tenants typing \`ke\` share one tenant's completions; a
+catalog change leaves retired terms in the dropdown; an entry written once is served forever; and a
+bot walking prefixes grows one tenant's cache until Redis evicts everyone's.
 
-- Top suggestions are cached per **\`(tenant, prefix)\`** under a key that also carries the
-  **catalog version**, so a catalog change moves reads to a new key instead of serving stale terms.
-- Every cached entry has a **5-minute TTL** (\`TTL_SECONDS = 300\`). A prefix that is never requested
-  again expires on its own.
-- A tenant may hold at most **\`MAX_PREFIXES_PER_TENANT\` distinct cached prefixes**. When the cap is
-  hit the **coldest** prefix (least recently read or written) is evicted first, so a flood of
-  prefixes cannot grow memory without bound.
-- Reads are tenant-scoped: one tenant can never read another tenant's cached suggestions, even when
-  the prefix text is identical.
-- The cap and the eviction are per tenant; one tenant's flood must not evict another tenant's hot
-  prefixes.`,
+- Key an entry \`suggest:cache:{tenant}:v{version}:{prefix}\`, the version from
+  \`terms.catalog_version(tenant)\`, so a catalog change moves reads to a fresh key.
+- Write it with a \`TTL_SECONDS\` = 300 expiry.
+- Keep at most \`MAX_PREFIXES_PER_TENANT\` = 100 prefixes per tenant: score each prefix in
+  \`suggest:recent:{tenant}\` by its last read or write (\`ZADD\`), and past the cap pop the coldest
+  (\`ZPOPMIN\`) and delete its entry.`,
   sequence: {
-    participants: ['Autocomplete API', 'Suggestion cache', 'Catalog'],
+    participants: ['suggestd', 'Redis'],
     messages: [
-      {from: 'Autocomplete API', to: 'Suggestion cache', label: 'GET autocomplete:{tenant}:{v}:{prefix}', kind: 'sync'},
-      {from: 'Suggestion cache', to: 'Autocomplete API', label: 'top suggestions / miss', kind: 'reply'},
-      {from: 'Autocomplete API', to: 'Catalog', label: 'matching(tenant, prefix) on miss', kind: 'sync'},
-      {from: 'Catalog', to: 'Autocomplete API', label: 'ranked terms', kind: 'reply'},
-      {from: 'Autocomplete API', to: 'Suggestion cache', label: 'SETEX 300 · ZADD coldest', kind: 'async'},
-      {from: 'Suggestion cache', to: 'Suggestion cache', label: 'ZPOPMIN when over the cap', kind: 'sync'},
+      {from: 'suggestd', to: 'Redis', label: 'GET suggest:cache:acme:v7:ke', kind: 'sync'},
+      {from: 'Redis', to: 'suggestd', label: '["kettle", …] · ZADD suggest:recent:acme now ke', kind: 'reply'},
+      {from: 'suggestd', to: 'Redis', label: 'SET suggest:cache:acme:v7:kett … EX 300', kind: 'sync'},
+      {from: 'suggestd', to: 'Redis', label: 'ZADD suggest:recent:acme now kett · ZCARD', kind: 'sync'},
+      {from: 'suggestd', to: 'Redis', label: '> 100: ZPOPMIN → DEL the coldest entry', kind: 'sync'},
     ],
   },
   checks: [
     {
-      id: 'ttl',
-      title: 'Cached prefix entries carry the 5-minute TTL',
+      id: 'tenant-key',
+      title: 'Keys every entry by tenant',
       detail:
-        'Every cached prefix is written with `TTL_SECONDS = 300` so it expires on its own. The starter writes with no expiry, so stale suggestions outlive a catalog change.',
+        "The cache key starts `suggest:cache:{tenant}:`, so two tenants typing the same prefix read their own completions; a key of the prefix alone answers one tenant with another's terms.",
       match: {
-        python: {all: [/TTL_SECONDS/, /ex\s*=\s*TTL_SECONDS/]},
-        typescript: {all: [/TTL_SECONDS/, /['"]EX['"]\s*,\s*TTL_SECONDS/]},
-        go: {all: [/ttlSeconds/, /time\.Second/]},
-        scala: {all: [/TtlSeconds/, /setEx\(/]},
-        cpp: {all: [/kTtlSeconds/, /setex\(/]},
-      },
-    },
-    {
-      id: 'tenant-scope',
-      title: 'Cache keys are scoped to the tenant and the prefix',
-      detail:
-        'The key builder takes the tenant and the prefix, so two tenants that type the same prefix never share an entry. The starter keys by prefix text alone.',
-      match: {
-        python: {all: [/def cache_key\(/, /tenant/]},
-        typescript: {all: [/cacheKey\(/, /tenant/]},
-        go: {all: [/func cacheKey\(/, /tenant/]},
-        scala: {all: [/def cacheKey\(/, /tenant/]},
-        cpp: {all: [/cacheKey\(/, /tenant/]},
-      },
-    },
-    {
-      id: 'prefix-cap',
-      title: 'A per-tenant cap bounds distinct cached prefixes',
-      detail:
-        'A tenant may hold at most `MAX_PREFIXES_PER_TENANT` distinct cached prefixes; the count is tracked per tenant. The starter has no cap, so a prefix flood grows memory until eviction pressure destroys the hit rate.',
-      match: {
-        python: {all: [/MAX_PREFIXES_PER_TENANT/, /zcard\(/]},
-        typescript: {all: [/MAX_PREFIXES_PER_TENANT/, /zcard\(/]},
-        go: {all: [/maxPrefixesPerTenant/, /ZCard\(/]},
-        scala: {all: [/MaxPrefixesPerTenant/, /zcard\(/]},
-        cpp: {all: [/kMaxPrefixesPerTenant/, /zcard\(/]},
-      },
-    },
-    {
-      id: 'evict-coldest',
-      title: 'Evicts the coldest prefix when the cap is hit',
-      detail:
-        'When the per-tenant cap is exceeded, the coldest prefix is evicted first (least recently used), so hot prefixes survive a flood. The starter never evicts anything.',
-      match: {
-        python: {all: [/evict_coldest/, /zpopmin\(/]},
-        typescript: {all: [/evictColdest\(/, /zpopmin\(/]},
-        go: {all: [/evictColdest\(/, /ZPopMin\(/]},
-        scala: {all: [/evictColdest\(/, /zpopmin\(/]},
-        cpp: {all: [/evictColdest\(/, /zpopmin\(/]},
+        python: {all: [/suggest:cache:\{tenant\}/]},
+        typescript: {all: [/suggest:cache:\$\{tenant\}/]},
+        go: {all: [/"suggest:cache:%s[^"]*",\s*tenant\b|"suggest:cache:"\s*\+\s*tenant\b/]},
+        scala: {all: [/s"suggest:cache:\$\{?tenant\b/]},
+        cpp: {all: [/"suggest:cache:"\s*\+\s*tenant\b/]},
       },
     },
     {
       id: 'catalog-version',
-      title: 'A catalog change refreshes cached suggestions',
+      title: 'Puts the catalog version in the key',
       detail:
-        'The key carries the catalog version, so a catalog change reads a fresh key and refreshes within the TTL. The starter key never changes, so a retracted term stays cached.',
+        'The key carries `v{terms.catalog_version(tenant)}`, so after a catalog change reads miss and refill instead of serving retired terms until they expire.',
       match: {
-        python: {all: [/CATALOG_VERSION/, /def cache_key\(/]},
-        typescript: {all: [/CATALOG_VERSION/, /cacheKey\(/]},
-        go: {all: [/catalogVersion/, /cacheKey\(/]},
-        scala: {all: [/CatalogVersion/, /cacheKey\(/]},
-        cpp: {all: [/kCatalogVersion/, /cacheKey\(/]},
+        python: {all: [/terms\.catalog_version\(\s*tenant/]},
+        typescript: {all: [/catalogVersion\(\s*tenant/]},
+        go: {all: [/terms\.CatalogVersion\(\s*ctx,\s*tenant/]},
+        scala: {all: [/Terms\.catalogVersion\(\s*tenant/]},
+        cpp: {all: [/terms::catalogVersion\(\s*tenant/]},
+      },
+    },
+    {
+      id: 'ttl',
+      title: 'Expires every entry after 300 seconds',
+      detail:
+        'The entry is written with a `TTL_SECONDS` (300 s) expiry in the same `SET`; a plain `SET` keeps it forever.',
+      match: {
+        python: {all: [/TTL_SECONDS\s*=\s*300\b/, /ex\s*=\s*TTL_SECONDS|setex\(|\.expire\(/]},
+        typescript: {all: [/TTL_SECONDS\s*=\s*300\b/, /['"]EX['"],\s*TTL_SECONDS|setex\(|\.expire\(/]},
+        go: {all: [/ttl\s*=\s*300\s*\*\s*time\.Second/, /\.Set\([^\n]*,\s*ttl\)|\.SetEx\(|\.Expire\(/]},
+        scala: {all: [/TtlSeconds\s*=\s*300L?\b/, /setex\(|\.expire\(|SetParams/]},
+        cpp: {all: [/kTtlSeconds\s*=\s*300\b/, /\.set\([^\n]*kTtlSeconds|\.setex\(|\.expire\(/]},
+      },
+    },
+    {
+      id: 'coldest-cap',
+      title: 'Caps each tenant at 100 prefixes, coldest out first',
+      detail:
+        'A read or a write scores the prefix in `suggest:recent:{tenant}`; past `MAX_PREFIXES_PER_TENANT` (100) the lowest score is popped and its entry deleted, so a flood of prefixes from one tenant stays bounded and evicts its own coldest prefix, not the one just read.',
+      match: {
+        python: {
+          all: [
+            /MAX_PREFIXES_PER_TENANT\s*=\s*100\b/,
+            /zpopmin\(|zremrangebyrank\(/,
+            /def get_suggestions(?:(?!\ndef )[\s\S])*?zadd\(/,
+          ],
+        },
+        typescript: {
+          all: [
+            /MAX_PREFIXES_PER_TENANT\s*=\s*100\b/,
+            /zpopmin\(|zremrangebyrank\(|['"]ZPOPMIN['"]/i,
+            /function getSuggestions(?:(?!\nexport )[\s\S])*?zadd\(/,
+          ],
+        },
+        go: {
+          all: [
+            /maxPrefixesPerTenant\s*=\s*100\b/,
+            /ZPopMin\(|ZRemRangeByRank\(/,
+            /func getSuggestions(?:(?!\n\})[\s\S])*?ZAdd\(/,
+          ],
+        },
+        scala: {
+          all: [
+            /MaxPrefixesPerTenant\s*=\s*100L?\b/,
+            /zpopmin\(|zremrangeByRank\(/,
+            /def getSuggestions(?:(?!\n {2}def )[\s\S])*?zadd\(/,
+          ],
+        },
+        cpp: {
+          all: [
+            /kMaxPrefixesPerTenant\s*=\s*100\b/,
+            /zpopmin\(|zremrangebyrank\(/,
+            /getSuggestions\((?:(?!\n\})[\s\S])*?zadd\(/,
+          ],
+        },
       },
     },
   ],
@@ -110,126 +121,120 @@ two tenants type the same prefix.
     python: {
       starter: `import json
 
+import redis
 
-class SuggestionCache:
-    def __init__(self, redis):
-        self.redis = redis
+from suggest import terms  # catalog_version
 
-    def get(self, tenant: str, prefix: str):
-        # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-        raw = self.redis.get(f"autocomplete:{prefix}")
-        if raw is None:
-            return None
-        return json.loads(raw)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-    def remember(self, tenant: str, prefix: str, suggestions) -> None:
-        self.redis.set(f"autocomplete:{prefix}", json.dumps(suggestions))
+
+def cache_key(tenant: str, prefix: str) -> str:
+    return f"suggest:cache:{prefix}"
+
+
+def get_suggestions(tenant: str, prefix: str) -> list[str] | None:
+    """The cached completions of the tenant's folded prefix, or None on a miss."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    raw = r.get(cache_key(tenant, prefix))
+    return None if raw is None else json.loads(raw)
+
+
+def put_suggestions(tenant: str, prefix: str, suggestions: list[str]) -> None:
+    """Cache the completions of the tenant's folded prefix."""
+    r.set(cache_key(tenant, prefix), json.dumps(suggestions))
 `,
       solution: `import json
 import time
 
+import redis
+
+from suggest import terms  # catalog_version
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
 TTL_SECONDS = 300
-MAX_PREFIXES_PER_TENANT = 1000
-CATALOG_VERSION = "2026-10-21"
+MAX_PREFIXES_PER_TENANT = 100
 
 
 def cache_key(tenant: str, prefix: str) -> str:
-    return f"autocomplete:{tenant}:{CATALOG_VERSION}:{prefix}"
+    # Tenant first, then the catalog version: a catalog change moves every read to a fresh key.
+    return f"suggest:cache:{tenant}:v{terms.catalog_version(tenant)}:{prefix}"
 
 
-def cold_key(tenant: str) -> str:
-    return f"autocomplete:coldest:{tenant}"
+def recent_key(tenant: str) -> str:
+    return f"suggest:recent:{tenant}"
 
 
-class SuggestionCache:
-    def __init__(self, redis):
-        self.redis = redis
+def get_suggestions(tenant: str, prefix: str) -> list[str] | None:
+    """The cached completions of the tenant's folded prefix, or None on a miss."""
+    raw = r.get(cache_key(tenant, prefix))
+    if raw is None:
+        return None
+    r.zadd(recent_key(tenant), {prefix: time.time()})  # a hit warms the prefix
+    return json.loads(raw)
 
-    def get(self, tenant: str, prefix: str):
-        raw = self.redis.get(cache_key(tenant, prefix))
-        if raw is None:
-            return None
-        self.redis.zadd(cold_key(tenant), {prefix: time.time()})
-        return json.loads(raw)
 
-    def remember(self, tenant: str, prefix: str, suggestions) -> None:
-        pipe = self.redis.pipeline()
-        pipe.set(cache_key(tenant, prefix), json.dumps(suggestions), ex=TTL_SECONDS)
-        pipe.zadd(cold_key(tenant), {prefix: time.time()})
-        pipe.expire(cold_key(tenant), TTL_SECONDS)
-        pipe.execute()
-        if self.redis.zcard(cold_key(tenant)) > MAX_PREFIXES_PER_TENANT:
-            self.evict_coldest(tenant)
-
-    def evict_coldest(self, tenant: str) -> None:
-        while self.redis.zcard(cold_key(tenant)) > MAX_PREFIXES_PER_TENANT:
-            coldest = self.redis.zpopmin(cold_key(tenant), count=1)
-            if not coldest:
-                return
-            prefix = coldest[0][0]
-            if isinstance(prefix, bytes):
-                prefix = prefix.decode()
-            self.redis.delete(cache_key(tenant, prefix))
+def put_suggestions(tenant: str, prefix: str, suggestions: list[str]) -> None:
+    """Cache the completions of the tenant's folded prefix."""
+    r.set(cache_key(tenant, prefix), json.dumps(suggestions), ex=TTL_SECONDS)
+    r.zadd(recent_key(tenant), {prefix: time.time()})
+    # Over the cap, this tenant's coldest prefixes go first; other tenants are untouched.
+    while r.zcard(recent_key(tenant)) > MAX_PREFIXES_PER_TENANT:
+        for coldest, _ in r.zpopmin(recent_key(tenant)):
+            r.delete(cache_key(tenant, coldest))
 `,
     },
     typescript: {
-      starter: `import type {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export class SuggestionCache {
-  constructor(private readonly redis: Redis) {}
+import {catalogVersion} from 'suggest/terms';
 
-  async get(tenant: string, prefix: string): Promise<string[] | null> {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    const raw = await this.redis.get(\`autocomplete:\${prefix}\`);
-    if (raw === null) return null;
-    return JSON.parse(raw) as string[];
-  }
+const redis = new Redis({host: 'redis', port: 6379});
 
-  async remember(tenant: string, prefix: string, suggestions: string[]): Promise<void> {
-    await this.redis.set(\`autocomplete:\${prefix}\`, JSON.stringify(suggestions));
-  }
+export const cacheKey = async (tenant: string, prefix: string): Promise<string> => \`suggest:cache:\${prefix}\`;
+
+/** The cached completions of the tenant's folded prefix, or null on a miss. */
+export async function getSuggestions(tenant: string, prefix: string): Promise<string[] | null> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const raw = await redis.get(await cacheKey(tenant, prefix));
+  return raw === null ? null : (JSON.parse(raw) as string[]);
+}
+
+/** Cache the completions of the tenant's folded prefix. */
+export async function putSuggestions(tenant: string, prefix: string, suggestions: string[]): Promise<void> {
+  await redis.set(await cacheKey(tenant, prefix), JSON.stringify(suggestions));
 }
 `,
-      solution: `import type {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
+
+import {catalogVersion} from 'suggest/terms';
+
+const redis = new Redis({host: 'redis', port: 6379});
 
 export const TTL_SECONDS = 300;
-export const MAX_PREFIXES_PER_TENANT = 1000;
-export const CATALOG_VERSION = '2026-10-21';
+export const MAX_PREFIXES_PER_TENANT = 100;
 
-export function cacheKey(tenant: string, prefix: string): string {
-  return \`autocomplete:\${tenant}:\${CATALOG_VERSION}:\${prefix}\`;
+// Tenant first, then the catalog version: a catalog change moves every read to a fresh key.
+export const cacheKey = async (tenant: string, prefix: string): Promise<string> =>
+  \`suggest:cache:\${tenant}:v\${await catalogVersion(tenant)}:\${prefix}\`;
+export const recentKey = (tenant: string): string => \`suggest:recent:\${tenant}\`;
+
+/** The cached completions of the tenant's folded prefix, or null on a miss. */
+export async function getSuggestions(tenant: string, prefix: string): Promise<string[] | null> {
+  const raw = await redis.get(await cacheKey(tenant, prefix));
+  if (raw === null) return null;
+  await redis.zadd(recentKey(tenant), Date.now(), prefix); // a hit warms the prefix
+  return JSON.parse(raw) as string[];
 }
 
-export function coldKey(tenant: string): string {
-  return \`autocomplete:coldest:\${tenant}\`;
-}
-
-export class SuggestionCache {
-  constructor(private readonly redis: Redis) {}
-
-  async get(tenant: string, prefix: string): Promise<string[] | null> {
-    const raw = await this.redis.get(cacheKey(tenant, prefix));
-    if (raw === null) return null;
-    await this.redis.zadd(coldKey(tenant), Date.now(), prefix);
-    return JSON.parse(raw) as string[];
-  }
-
-  async remember(tenant: string, prefix: string, suggestions: string[]): Promise<void> {
-    await this.redis
-      .multi()
-      .set(cacheKey(tenant, prefix), JSON.stringify(suggestions), 'EX', TTL_SECONDS)
-      .zadd(coldKey(tenant), Date.now(), prefix)
-      .expire(coldKey(tenant), TTL_SECONDS)
-      .exec();
-    if ((await this.redis.zcard(coldKey(tenant))) > MAX_PREFIXES_PER_TENANT) await this.evictColdest(tenant);
-  }
-
-  async evictColdest(tenant: string): Promise<void> {
-    while ((await this.redis.zcard(coldKey(tenant))) > MAX_PREFIXES_PER_TENANT) {
-      const coldest = await this.redis.zpopmin(coldKey(tenant), 1);
-      if (coldest.length === 0) return;
-      await this.redis.del(cacheKey(tenant, coldest[0]));
-    }
+/** Cache the completions of the tenant's folded prefix. */
+export async function putSuggestions(tenant: string, prefix: string, suggestions: string[]): Promise<void> {
+  await redis.set(await cacheKey(tenant, prefix), JSON.stringify(suggestions), 'EX', TTL_SECONDS);
+  await redis.zadd(recentKey(tenant), Date.now(), prefix);
+  // Over the cap, this tenant's coldest prefixes go first; other tenants are untouched.
+  while ((await redis.zcard(recentKey(tenant))) > MAX_PREFIXES_PER_TENANT) {
+    const [coldest] = (await redis.call('ZPOPMIN', recentKey(tenant))) as string[];
+    await redis.del(await cacheKey(tenant, coldest));
   }
 }
 `,
@@ -244,26 +249,28 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type SuggestionCache struct {
-	redis *redis.Client
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+func cacheKey(ctx context.Context, tenant, prefix string) string {
+	return "suggest:cache:" + prefix
 }
 
-func (c *SuggestionCache) Get(ctx context.Context, tenant, prefix string) ([]string, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	raw, err := c.redis.Get(ctx, "autocomplete:"+prefix).Result()
+// getSuggestions is the cached completions of the tenant's folded prefix, and whether there were any.
+func getSuggestions(ctx context.Context, tenant, prefix string) ([]string, bool) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	raw, err := rdb.Get(ctx, cacheKey(ctx, tenant, prefix)).Result()
 	if err != nil {
-		return nil, err
+		return nil, false
 	}
 	var suggestions []string
-	if err := json.Unmarshal([]byte(raw), &suggestions); err != nil {
-		return nil, err
-	}
-	return suggestions, nil
+	json.Unmarshal([]byte(raw), &suggestions)
+	return suggestions, true
 }
 
-func (c *SuggestionCache) Remember(ctx context.Context, tenant, prefix string, suggestions []string) error {
-	payload, _ := json.Marshal(suggestions)
-	return c.redis.Set(ctx, "autocomplete:"+prefix, payload, 0).Err()
+// putSuggestions caches the completions of the tenant's folded prefix.
+func putSuggestions(ctx context.Context, tenant, prefix string, suggestions []string) {
+	raw, _ := json.Marshal(suggestions)
+	rdb.Set(ctx, cacheKey(ctx, tenant, prefix), raw, 0)
 }
 `,
       solution: `package main
@@ -271,187 +278,435 @@ func (c *SuggestionCache) Remember(ctx context.Context, tenant, prefix string, s
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"suggest/terms" // terms.CatalogVersion
 )
+
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 const (
-	ttlSeconds           = 300
-	maxPrefixesPerTenant = 1000
-	catalogVersion       = "2026-10-21"
+	ttl                  = 300 * time.Second
+	maxPrefixesPerTenant = 100
 )
 
-func cacheKey(tenant, prefix string) string {
-	return "autocomplete:" + tenant + ":" + catalogVersion + ":" + prefix
+// cacheKey puts the tenant first, then the catalog version: a catalog change moves every read to a fresh key.
+func cacheKey(ctx context.Context, tenant, prefix string) string {
+	return fmt.Sprintf("suggest:cache:%s:v%d:%s", tenant, terms.CatalogVersion(ctx, tenant), prefix)
 }
 
-func coldKey(tenant string) string {
-	return "autocomplete:coldest:" + tenant
-}
+func recentKey(tenant string) string { return "suggest:recent:" + tenant }
 
-type SuggestionCache struct {
-	redis *redis.Client
-}
-
-func (c *SuggestionCache) Remember(ctx context.Context, tenant, prefix string, suggestions []string) error {
-	payload, err := json.Marshal(suggestions)
+// getSuggestions is the cached completions of the tenant's folded prefix, and whether there were any.
+func getSuggestions(ctx context.Context, tenant, prefix string) ([]string, bool) {
+	raw, err := rdb.Get(ctx, cacheKey(ctx, tenant, prefix)).Result()
 	if err != nil {
-		return err
+		return nil, false
 	}
-	pipe := c.redis.TxPipeline()
-	pipe.Set(ctx, cacheKey(tenant, prefix), payload, ttlSeconds*time.Second)
-	pipe.ZAdd(ctx, coldKey(tenant), redis.Z{Score: float64(time.Now().Unix()), Member: prefix})
-	pipe.Expire(ctx, coldKey(tenant), ttlSeconds*time.Second)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return err
-	}
-	size, err := c.redis.ZCard(ctx, coldKey(tenant)).Result()
-	if err != nil {
-		return err
-	}
-	if size > maxPrefixesPerTenant {
-		return c.evictColdest(ctx, tenant)
-	}
-	return nil
+	rdb.ZAdd(ctx, recentKey(tenant), redis.Z{Score: float64(time.Now().UnixMilli()), Member: prefix}) // a hit warms the prefix
+	var suggestions []string
+	json.Unmarshal([]byte(raw), &suggestions)
+	return suggestions, true
 }
 
-func (c *SuggestionCache) evictColdest(ctx context.Context, tenant string) error {
-	for {
-		size, err := c.redis.ZCard(ctx, coldKey(tenant)).Result()
-		if err != nil {
-			return err
-		}
-		if size <= maxPrefixesPerTenant {
-			return nil
-		}
-		popped, err := c.redis.ZPopMin(ctx, coldKey(tenant), 1).Result()
-		if err != nil {
-			return err
-		}
-		if len(popped) == 0 {
-			return nil
-		}
-		member, _ := popped[0].Member.(string)
-		if err := c.redis.Del(ctx, cacheKey(tenant, member)).Err(); err != nil {
-			return err
+// putSuggestions caches the completions of the tenant's folded prefix.
+func putSuggestions(ctx context.Context, tenant, prefix string, suggestions []string) {
+	raw, _ := json.Marshal(suggestions)
+	rdb.Set(ctx, cacheKey(ctx, tenant, prefix), raw, ttl)
+	rdb.ZAdd(ctx, recentKey(tenant), redis.Z{Score: float64(time.Now().UnixMilli()), Member: prefix})
+	// Over the cap, this tenant's coldest prefixes go first; other tenants are untouched.
+	for rdb.ZCard(ctx, recentKey(tenant)).Val() > maxPrefixesPerTenant {
+		for _, coldest := range rdb.ZPopMin(ctx, recentKey(tenant)).Val() {
+			rdb.Del(ctx, cacheKey(ctx, tenant, coldest.Member.(string)))
 		}
 	}
 }
 `,
     },
     scala: {
-      starter: `trait Redis {
-  def get(key: String): Option[String]
-  def set(key: String, value: String): Unit
-}
+      starter: `import redis.clients.jedis.JedisPooled
+import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-object State {
-  def remember(redis: Redis, tenant: String, prefix: String, suggestions: List[String]): Unit = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    redis.set(s"autocomplete:$prefix", suggestions.mkString("[", ",", "]"))
+import suggest.Terms // Terms.catalogVersion
+
+object SuggestionCache {
+  val jedis = new JedisPooled("redis", 6379)
+
+  def cacheKey(tenant: String, prefix: String): String = s"suggest:cache:$prefix"
+
+  /** The cached completions of the tenant's folded prefix, or None on a miss. */
+  def getSuggestions(tenant: String, prefix: String): Option[Seq[String]] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    Option(jedis.get(cacheKey(tenant, prefix))).map(_.parseJson.convertTo[Seq[String]])
   }
+
+  /** Cache the completions of the tenant's folded prefix. */
+  def putSuggestions(tenant: String, prefix: String, suggestions: Seq[String]): Unit =
+    jedis.set(cacheKey(tenant, prefix), suggestions.toJson.compactPrint)
 }
 `,
-      solution: `import java.time.Instant
+      solution: `import redis.clients.jedis.JedisPooled
+import spray.json._
+import spray.json.DefaultJsonProtocol._
 
-trait Redis {
-  def get(key: String): Option[String]
-  def set(key: String, value: String): Unit
-  def setEx(key: String, seconds: Long, value: String): Unit
-  def expire(key: String, seconds: Long): Unit
-  def zadd(key: String, score: Double, member: String): Unit
-  def zcard(key: String): Long
-  def zpopmin(key: String, count: Int): List[String]
-  def del(key: String): Unit
-}
+import suggest.Terms // Terms.catalogVersion
 
-object State {
-  val TtlSeconds: Long = 300
-  val MaxPrefixesPerTenant: Long = 1000
-  val CatalogVersion = "2026-10-21"
+object SuggestionCache {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def cacheKey(tenant: String, prefix: String): String =
-    s"autocomplete:$tenant:$CatalogVersion:$prefix"
+  val TtlSeconds = 300L
+  val MaxPrefixesPerTenant = 100L
 
-  def coldKey(tenant: String): String = s"autocomplete:coldest:$tenant"
+  // Tenant first, then the catalog version: a catalog change moves every read to a fresh key.
+  def cacheKey(tenant: String, prefix: String): String = s"suggest:cache:$tenant:v\${Terms.catalogVersion(tenant)}:$prefix"
+  def recentKey(tenant: String): String = s"suggest:recent:$tenant"
 
-  def evictColdest(redis: Redis, tenant: String): Unit = {
-    while (redis.zcard(coldKey(tenant)) > MaxPrefixesPerTenant) {
-      redis.zpopmin(coldKey(tenant), 1).headOption match {
-        case Some(member) => redis.del(cacheKey(tenant, member))
-        case None => return
-      }
+  /** The cached completions of the tenant's folded prefix, or None on a miss. */
+  def getSuggestions(tenant: String, prefix: String): Option[Seq[String]] =
+    Option(jedis.get(cacheKey(tenant, prefix))).map { raw =>
+      jedis.zadd(recentKey(tenant), System.currentTimeMillis().toDouble, prefix) // a hit warms the prefix
+      raw.parseJson.convertTo[Seq[String]]
     }
-  }
 
-  def remember(redis: Redis, tenant: String, prefix: String, suggestions: List[String]): Unit = {
-    redis.setEx(cacheKey(tenant, prefix), TtlSeconds, suggestions.mkString("[", ",", "]"))
-    redis.zadd(coldKey(tenant), Instant.now().toEpochMilli.toDouble, prefix)
-    redis.expire(coldKey(tenant), TtlSeconds)
-    if (redis.zcard(coldKey(tenant)) > MaxPrefixesPerTenant) evictColdest(redis, tenant)
+  /** Cache the completions of the tenant's folded prefix. */
+  def putSuggestions(tenant: String, prefix: String, suggestions: Seq[String]): Unit = {
+    jedis.setex(cacheKey(tenant, prefix), TtlSeconds, suggestions.toJson.compactPrint)
+    jedis.zadd(recentKey(tenant), System.currentTimeMillis().toDouble, prefix)
+    // Over the cap, this tenant's coldest prefixes go first; other tenants are untouched.
+    while (jedis.zcard(recentKey(tenant)) > MaxPrefixesPerTenant) {
+      val coldest = jedis.zpopmin(recentKey(tenant))
+      if (coldest != null) jedis.del(cacheKey(tenant, coldest.getElement))
+    }
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <string>
-#include <vector>
+      starter: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
 
-#include <redis++/redis++.h>
-
-using namespace sw::redis;
-
-std::string join(const std::vector<std::string>& values);
-
-void remember(Redis& redis, const std::string& tenant, const std::string& prefix, const std::vector<std::string>& suggestions) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  redis.set("autocomplete:" + prefix, join(suggestions));
-}
-`,
-      solution: `#include <ctime>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include <redis++/redis++.h>
+#include "suggest/terms.h"  // terms::catalogVersion
 
-using namespace sw::redis;
+sw::redis::Redis redis("tcp://redis:6379");
 
-constexpr long kTtlSeconds = 300;
-constexpr long kMaxPrefixesPerTenant = 1000;
-const std::string kCatalogVersion = "2026-10-21";
+std::string cacheKey(const std::string& tenant, const std::string& prefix) { return "suggest:cache:" + prefix; }
 
-std::string join(const std::vector<std::string>& values);
+// The cached completions of the tenant's folded prefix, or none on a miss.
+std::optional<std::vector<std::string>> getSuggestions(const std::string& tenant, const std::string& prefix) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto raw = redis.get(cacheKey(tenant, prefix));
+  if (!raw) return std::nullopt;
+  return nlohmann::json::parse(*raw).get<std::vector<std::string>>();
+}
 
+// Cache the completions of the tenant's folded prefix.
+void putSuggestions(const std::string& tenant, const std::string& prefix, const std::vector<std::string>& suggestions) {
+  redis.set(cacheKey(tenant, prefix), nlohmann::json(suggestions).dump());
+}
+`,
+      solution: `#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
+
+#include <chrono>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "suggest/terms.h"  // terms::catalogVersion
+
+constexpr long long kTtlSeconds = 300;
+constexpr long long kMaxPrefixesPerTenant = 100;
+
+sw::redis::Redis redis("tcp://redis:6379");
+
+// Tenant first, then the catalog version: a catalog change moves every read to a fresh key.
 std::string cacheKey(const std::string& tenant, const std::string& prefix) {
-  return "autocomplete:" + tenant + ":" + kCatalogVersion + ":" + prefix;
+  return "suggest:cache:" + tenant + ":v" + std::to_string(terms::catalogVersion(tenant)) + ":" + prefix;
 }
 
-std::string coldKey(const std::string& tenant) {
-  return "autocomplete:coldest:" + tenant;
+std::string recentKey(const std::string& tenant) { return "suggest:recent:" + tenant; }
+
+double lastUse() {
+  return static_cast<double>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-void evictColdest(Redis& redis, const std::string& tenant) {
-  while (redis.zcard(coldKey(tenant)) > kMaxPrefixesPerTenant) {
-    const auto coldest = redis.zpopmin(coldKey(tenant), 1);
-    if (coldest.empty()) return;
-    redis.del(cacheKey(tenant, coldest.front()));
+// The cached completions of the tenant's folded prefix, or none on a miss.
+std::optional<std::vector<std::string>> getSuggestions(const std::string& tenant, const std::string& prefix) {
+  const auto raw = redis.get(cacheKey(tenant, prefix));
+  if (!raw) return std::nullopt;
+  redis.zadd(recentKey(tenant), prefix, lastUse());  // a hit warms the prefix
+  return nlohmann::json::parse(*raw).get<std::vector<std::string>>();
+}
+
+// Cache the completions of the tenant's folded prefix.
+void putSuggestions(const std::string& tenant, const std::string& prefix, const std::vector<std::string>& suggestions) {
+  redis.set(cacheKey(tenant, prefix), nlohmann::json(suggestions).dump(), std::chrono::seconds(kTtlSeconds));
+  redis.zadd(recentKey(tenant), prefix, lastUse());
+  // Over the cap, this tenant's coldest prefixes go first; other tenants are untouched.
+  while (redis.zcard(recentKey(tenant)) > kMaxPrefixesPerTenant) {
+    const auto coldest = redis.zpopmin(recentKey(tenant));
+    if (!coldest) break;
+    redis.del(cacheKey(tenant, coldest->first));
   }
-}
-
-void remember(Redis& redis, const std::string& tenant, const std::string& prefix, const std::vector<std::string>& suggestions) {
-  redis.setex(cacheKey(tenant, prefix), kTtlSeconds, join(suggestions));
-  redis.zadd(coldKey(tenant), static_cast<double>(std::time(nullptr)), prefix);
-  redis.expire(coldKey(tenant), kTtlSeconds);
-  if (redis.zcard(coldKey(tenant)) > kMaxPrefixesPerTenant) evictColdest(redis, tenant);
 }
 `,
     },
   },
+  harness: {
+    python: `def check_tenant_key(ctx):
+    m = ctx.load("cache")
+    m.put_suggestions("acme", "ke", ["kettle", "kettlebell"])
+    seen = m.get_suggestions("globex", "ke")
+    assert seen is None, f"globex read {seen} for ke: acme's completions, cached under a key without the tenant"
+    m.put_suggestions("globex", "ke", ["kebab"])
+    assert m.get_suggestions("acme", "ke") == ["kettle", "kettlebell"], f"acme reads {m.get_suggestions('acme', 'ke')} for ke after globex cached its own"
+    assert m.get_suggestions("globex", "ke") == ["kebab"], f"globex reads {m.get_suggestions('globex', 'ke')} for ke"
+    keys = sorted(ctx.redis.keys("suggest:cache:*"))
+    assert len(keys) == 2 and keys[0].startswith("suggest:cache:acme:") and keys[1].startswith("suggest:cache:globex:"), f"the cache holds {keys}: every key must start suggest:cache:{{tenant}}:"
+
+
+def check_catalog_version(ctx):
+    m = ctx.load("cache")
+    m.put_suggestions("acme", "ke", ["kettle"])
+    assert m.get_suggestions("acme", "ke") == ["kettle"], f"a fresh entry reads back as {m.get_suggestions('acme', 'ke')}"
+    ctx.redis.incr("suggest:catalog:acme")  # a catalog change: version 0 → 1
+    got = m.get_suggestions("acme", "ke")
+    assert got is None, f"after acme's catalog moved to version 1 the cache still answered {got}: the version belongs in the key, so the old entry is not read"
+    m.put_suggestions("acme", "ke", ["kettle pro"])
+    assert m.get_suggestions("acme", "ke") == ["kettle pro"], f"the refill under version 1 reads back as {m.get_suggestions('acme', 'ke')}"
+    assert ctx.redis.exists("suggest:cache:acme:v1:ke") == 1, f"no suggest:cache:acme:v1:ke; the cache holds {sorted(ctx.redis.keys('suggest:cache:*'))}"
+
+
+def check_ttl(ctx):
+    m = ctx.load("cache")
+    m.put_suggestions("acme", "ke", ["kettle"])
+    ctx.clock.advance(299)
+    assert m.get_suggestions("acme", "ke") == ["kettle"], "an entry must still be served 299 s after it was written"
+    ctx.clock.advance(2)
+    got = m.get_suggestions("acme", "ke")
+    assert got is None, f"301 s after it was written the entry is still served ({got}): write it with a 300 s expiry (TTL_SECONDS)"
+
+
+def check_coldest_cap(ctx):
+    m = ctx.load("cache")
+    m.put_suggestions("acme", "kettle", ["kettle"])
+    for n in range(100):
+        m.put_suggestions("globex", f"p{n:03d}", [f"t{n}"])
+        ctx.clock.advance(1)
+    assert m.get_suggestions("globex", "p000") == ["t0"], "at the cap of 100 prefixes every entry must still be cached"
+    ctx.clock.advance(1)
+    m.put_suggestions("globex", "p100", ["t100"])
+    cached = ctx.redis.keys("suggest:cache:*")
+    assert len(cached) == 101, f"Redis holds {len(cached)} cache entries after acme's one and globex's 101 writes, expected 101: globex capped at 100"
+    assert m.get_suggestions("globex", "p001") is None, "p001 was the coldest prefix when the 101st arrived and must have been evicted"
+    assert m.get_suggestions("globex", "p000") == ["t0"], "p000 was read just before the cap was crossed and was evicted: the coldest prefix is the least recently read or written, not the oldest written"
+    assert m.get_suggestions("globex", "p100") == ["t100"], "the newest prefix must be cached"
+    assert m.get_suggestions("acme", "kettle") == ["kettle"], "globex's flood evicted acme's entry: the cap is per tenant"
+`,
+    typescript: `export async function check_tenant_key(ctx) {
+  const m = ctx.load('cache');
+  await m.putSuggestions('acme', 'ke', ['kettle', 'kettlebell']);
+  const seen = await m.getSuggestions('globex', 'ke');
+  assert.equal(seen, null, \`globex read \${JSON.stringify(seen)} for ke: acme's completions, cached under a key without the tenant\`);
+  await m.putSuggestions('globex', 'ke', ['kebab']);
+  assert.deepStrictEqual(await m.getSuggestions('acme', 'ke'), ['kettle', 'kettlebell'], "acme must read its own completions for ke after globex cached its own");
+  assert.deepStrictEqual(await m.getSuggestions('globex', 'ke'), ['kebab'], 'globex must read its own completions for ke');
+  const keys = (ctx.redis.keys('suggest:cache:*') as string[]).sort();
+  assert(keys.length === 2 && keys[0].startsWith('suggest:cache:acme:') && keys[1].startsWith('suggest:cache:globex:'), \`the cache holds \${JSON.stringify(keys)}: every key must start suggest:cache:{tenant}:\`);
+}
+
+export async function check_catalog_version(ctx) {
+  const m = ctx.load('cache');
+  await m.putSuggestions('acme', 'ke', ['kettle']);
+  assert.deepStrictEqual(await m.getSuggestions('acme', 'ke'), ['kettle'], 'a fresh entry must read back');
+  ctx.redis.incr('suggest:catalog:acme'); // a catalog change: version 0 → 1
+  const got = await m.getSuggestions('acme', 'ke');
+  assert.equal(got, null, \`after acme's catalog moved to version 1 the cache still answered \${JSON.stringify(got)}: the version belongs in the key, so the old entry is not read\`);
+  await m.putSuggestions('acme', 'ke', ['kettle pro']);
+  assert.deepStrictEqual(await m.getSuggestions('acme', 'ke'), ['kettle pro'], 'the refill under version 1 must read back');
+  assert.equal(ctx.redis.exists('suggest:cache:acme:v1:ke'), 1, \`no suggest:cache:acme:v1:ke; the cache holds \${JSON.stringify(ctx.redis.keys('suggest:cache:*'))}\`);
+}
+
+export async function check_ttl(ctx) {
+  const m = ctx.load('cache');
+  await m.putSuggestions('acme', 'ke', ['kettle']);
+  ctx.clock.advance(299);
+  assert.deepStrictEqual(await m.getSuggestions('acme', 'ke'), ['kettle'], 'an entry must still be served 299 s after it was written');
+  ctx.clock.advance(2);
+  const got = await m.getSuggestions('acme', 'ke');
+  assert.equal(got, null, \`301 s after it was written the entry is still served (\${JSON.stringify(got)}): write it with a 300 s expiry (TTL_SECONDS)\`);
+}
+
+export async function check_coldest_cap(ctx) {
+  const m = ctx.load('cache');
+  await m.putSuggestions('acme', 'kettle', ['kettle']);
+  const name = (n: number) => \`p\${String(n).padStart(3, '0')}\`;
+  for (let n = 0; n < 100; n++) {
+    await m.putSuggestions('globex', name(n), [\`t\${n}\`]);
+    ctx.clock.advance(1);
+  }
+  assert.deepStrictEqual(await m.getSuggestions('globex', 'p000'), ['t0'], 'at the cap of 100 prefixes every entry must still be cached');
+  ctx.clock.advance(1);
+  await m.putSuggestions('globex', 'p100', ['t100']);
+  const cached = ctx.redis.keys('suggest:cache:*') as string[];
+  assert.equal(cached.length, 101, \`Redis holds \${cached.length} cache entries after acme's one and globex's 101 writes, expected 101: globex capped at 100\`);
+  assert.equal(await m.getSuggestions('globex', 'p001'), null, 'p001 was the coldest prefix when the 101st arrived and must have been evicted');
+  assert.deepStrictEqual(await m.getSuggestions('globex', 'p000'), ['t0'], 'p000 was read just before the cap was crossed and was evicted: the coldest prefix is the least recently read or written, not the oldest written');
+  assert.deepStrictEqual(await m.getSuggestions('globex', 'p100'), ['t100'], 'the newest prefix must be cached');
+  assert.deepStrictEqual(await m.getSuggestions('acme', 'kettle'), ['kettle'], "globex's flood evicted acme's entry: the cap is per tenant");
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+var cacheBg = context.Background()
+
+func cacheRead(ctx *harness.Ctx, tenant, prefix string) []string {
+	got, hit := getSuggestions(cacheBg, tenant, prefix)
+	if !hit {
+		return nil
+	}
+	if got == nil {
+		got = []string{}
+	}
+	return got
+}
+
+func CheckTenantKey(ctx *harness.Ctx) {
+	putSuggestions(cacheBg, "acme", "ke", []string{"kettle", "kettlebell"})
+	seen := cacheRead(ctx, "globex", "ke")
+	ctx.Assert(seen == nil, "globex read %q for ke: acme's completions, cached under a key without the tenant", seen)
+	putSuggestions(cacheBg, "globex", "ke", []string{"kebab"})
+	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle", "kettlebell"}, "acme's completions for ke after globex cached its own")
+	ctx.Equal(cacheRead(ctx, "globex", "ke"), []string{"kebab"}, "globex's completions for ke")
+	keys := ctx.Redis.Keys("suggest:cache:*")
+	ctx.Assert(len(keys) == 2 && strings.HasPrefix(keys[0], "suggest:cache:acme:") && strings.HasPrefix(keys[1], "suggest:cache:globex:"), "the cache holds %q: every key must start suggest:cache:{tenant}:", keys)
+}
+
+func CheckCatalogVersion(ctx *harness.Ctx) {
+	putSuggestions(cacheBg, "acme", "ke", []string{"kettle"})
+	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle"}, "a fresh entry must read back")
+	ctx.Redis.Do("INCR", "suggest:catalog:acme") // a catalog change: version 0 → 1
+	got := cacheRead(ctx, "acme", "ke")
+	ctx.Assert(got == nil, "after acme's catalog moved to version 1 the cache still answered %q: the version belongs in the key, so the old entry is not read", got)
+	putSuggestions(cacheBg, "acme", "ke", []string{"kettle pro"})
+	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle pro"}, "the refill under version 1 must read back")
+	ctx.Equal(ctx.Redis.Exists("suggest:cache:acme:v1:ke"), 1, "suggest:cache:acme:v1:ke must exist (the cache holds %q)", ctx.Redis.Keys("suggest:cache:*"))
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	putSuggestions(cacheBg, "acme", "ke", []string{"kettle"})
+	ctx.Clock.Advance(299)
+	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle"}, "an entry must still be served 299 s after it was written")
+	ctx.Clock.Advance(2)
+	got := cacheRead(ctx, "acme", "ke")
+	ctx.Assert(got == nil, "301 s after it was written the entry is still served (%q): write it with a 300 s expiry (ttl)", got)
+}
+
+func CheckColdestCap(ctx *harness.Ctx) {
+	putSuggestions(cacheBg, "acme", "kettle", []string{"kettle"})
+	for n := 0; n < 100; n++ {
+		putSuggestions(cacheBg, "globex", fmt.Sprintf("p%03d", n), []string{fmt.Sprintf("t%d", n)})
+		ctx.Clock.Advance(1)
+	}
+	ctx.Equal(cacheRead(ctx, "globex", "p000"), []string{"t0"}, "at the cap of 100 prefixes every entry must still be cached")
+	ctx.Clock.Advance(1)
+	putSuggestions(cacheBg, "globex", "p100", []string{"t100"})
+	ctx.Equal(len(ctx.Redis.Keys("suggest:cache:*")), 101, "the cache entries after acme's one and globex's 101 writes (globex capped at 100)")
+	ctx.Assert(cacheRead(ctx, "globex", "p001") == nil, "p001 was the coldest prefix when the 101st arrived and must have been evicted")
+	ctx.Equal(cacheRead(ctx, "globex", "p000"), []string{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000")
+	ctx.Equal(cacheRead(ctx, "globex", "p100"), []string{"t100"}, "the newest prefix must be cached")
+	ctx.Equal(cacheRead(ctx, "acme", "kettle"), []string{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cstdio>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+using Strings = std::vector<std::string>;
+
+std::string cacheName(const char* format, int n) {
+  char out[16];
+  std::snprintf(out, sizeof out, format, n);
+  return out;
+}
+
+}  // namespace
+
+void CheckTenantKey(harness::Ctx& ctx) {
+  putSuggestions("acme", "ke", {"kettle", "kettlebell"});
+  const auto seen = getSuggestions("globex", "ke");
+  ctx.Assert(!seen, "globex read %q for ke: acme's completions, cached under a key without the tenant", seen.value_or(Strings{}));
+  putSuggestions("globex", "ke", {"kebab"});
+  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle", "kettlebell"}, "acme's completions for ke after globex cached its own");
+  ctx.Equal(getSuggestions("globex", "ke"), Strings{"kebab"}, "globex's completions for ke");
+  const auto keys = ctx.Redis.Keys("suggest:cache:*");
+  ctx.Assert(keys.size() == 2 && keys[0].rfind("suggest:cache:acme:", 0) == 0 && keys[1].rfind("suggest:cache:globex:", 0) == 0,
+             "the cache holds %q: every key must start suggest:cache:{tenant}:", keys);
+}
+
+void CheckCatalogVersion(harness::Ctx& ctx) {
+  putSuggestions("acme", "ke", {"kettle"});
+  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle"}, "a fresh entry must read back");
+  ctx.Redis.Must({"INCR", "suggest:catalog:acme"});  // a catalog change: version 0 → 1
+  const auto got = getSuggestions("acme", "ke");
+  ctx.Assert(!got, "after acme's catalog moved to version 1 the cache still answered %q: the version belongs in the key, so the old entry is not read", got.value_or(Strings{}));
+  putSuggestions("acme", "ke", {"kettle pro"});
+  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle pro"}, "the refill under version 1 must read back");
+  ctx.Equal(ctx.Redis.Exists("suggest:cache:acme:v1:ke"), 1, "suggest:cache:acme:v1:ke must exist (the cache holds %q)", ctx.Redis.Keys("suggest:cache:*"));
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  putSuggestions("acme", "ke", {"kettle"});
+  ctx.Clock.Advance(299);
+  ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle"}, "an entry must still be served 299 s after it was written");
+  ctx.Clock.Advance(2);
+  const auto got = getSuggestions("acme", "ke");
+  ctx.Assert(!got, "301 s after it was written the entry is still served (%q): write it with a 300 s expiry (kTtlSeconds)", got.value_or(Strings{}));
+}
+
+void CheckColdestCap(harness::Ctx& ctx) {
+  putSuggestions("acme", "kettle", {"kettle"});
+  for (int n = 0; n < 100; ++n) {
+    putSuggestions("globex", cacheName("p%03d", n), {cacheName("t%d", n)});
+    ctx.Clock.Advance(1);
+  }
+  ctx.Equal(getSuggestions("globex", "p000"), Strings{"t0"}, "at the cap of 100 prefixes every entry must still be cached");
+  ctx.Clock.Advance(1);
+  putSuggestions("globex", "p100", {"t100"});
+  ctx.Equal(ctx.Redis.Keys("suggest:cache:*").size(), 101, "the cache entries after acme's one and globex's 101 writes (globex capped at 100)");
+  ctx.Assert(!getSuggestions("globex", "p001"), "p001 was the coldest prefix when the 101st arrived and must have been evicted");
+  ctx.Equal(getSuggestions("globex", "p000"), Strings{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000");
+  ctx.Equal(getSuggestions("globex", "p100"), Strings{"t100"}, "the newest prefix must be cached");
+  ctx.Equal(getSuggestions("acme", "kettle"), Strings{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)");
+}
+`,
+  },
   hints: [
-    'Two tenants type "caf" and the second one sees the first one\'s suggestions; a retracted term keeps showing up days after the catalog changed.',
-    'The key is the prefix text alone, written with a bare SET: nothing scopes it to a tenant or a catalog version, nothing expires it, and nothing counts how many prefixes a tenant holds.',
-    'Key by (tenant, catalog version, prefix), SETEX with TTL_SECONDS, ZADD the prefix into a per-tenant sorted set scored by time, and ZPOPMIN plus DEL when ZCARD passes MAX_PREFIXES_PER_TENANT.',
+    "Cache `ke` for one tenant and read it as another: the second tenant sees the first one's terms. Bump the catalog version: the old terms stay. Write a prefix and wait ten minutes: it is still there.",
+    'The key is the prefix alone, so tenants and catalog versions share entries; the `SET` has no expiry; and nothing counts how many prefixes a tenant holds, so a walk over the keyspace only grows it.',
+    "Key `suggest:cache:{tenant}:v{terms.catalog_version(tenant)}:{prefix}`, `SET … EX 300`; `ZADD suggest:recent:{tenant} now prefix` on every hit and write; while `ZCARD` > 100, `ZPOPMIN` and `DEL` that prefix's entry.",
   ],
-  debrief: `The key carries the tenant first so a read can never cross a tenant boundary by construction, and the catalog version next so a catalog change moves reads to a fresh key instead of needing a flush. The TTL goes in the same pipeline as the payload so a crash between the two cannot leave an entry without its expiry. The cap is per tenant, tracked in a sorted set scored by last use, because a global cap lets one tenant's flood evict everyone's hot prefixes; evicting the coldest first is what keeps the hit rate for real users intact during the flood. Production caches go further: a hot-prefix prewarm after a catalog change, a cap that scales with plan size, and an eviction counter per tenant so a flood is visible before the hit rate drops.`,
+  debrief: `The key is the isolation boundary and the invalidation rule at once: with the tenant in it nobody reads another tenant's terms, and with the catalog version in it a catalog change is a new namespace, so nothing has to find and delete stale entries. The TTL bounds how long any mistake is served. The per-tenant cap bounds memory per tenant rather than per cluster, so one tenant's bot evicts its own coldest prefixes and not another tenant's hot ones; scoring reads as well as writes is what makes the eviction "coldest" instead of "oldest". Production caches also expire the recency set, sample eviction instead of walking it, and run the cap check in a Lua script so two writers cannot each evict.`,
 };

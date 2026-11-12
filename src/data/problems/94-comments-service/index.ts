@@ -1,93 +1,102 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Comments service: the course is not "write a CRUD endpoint", it is the debugging you owe a
- * comment service before real threads scroll through it. Validated, idempotent replies → Redis
- * counters committed atomically with the write → a moderation and notification fan-out with a
- * deadline and one token per comment → comment events keyed by thread, published after the commit,
- * without bodies → a keyset-paginated read that yields every comment exactly once while the thread
- * keeps moving.
+ * comment service before real threads scroll through it. Idempotent, size-capped replies that stay
+ * in their thread, rendered from escaped text → the comment and its counters in one Lua script →
+ * moderation first under a deadline, one request id per comment → thread-keyed events after the
+ * commit, without text → a cursor page that holds while the thread keeps moving.
  */
 export const commentsServiceProblem: Problem = {
   id: 'comments-service',
   title: 'Comments Service',
-  tagline: 'Threaded comments with idempotent replies, atomic counters and cursor pagination.',
+  tagline: 'Threaded comments with idempotent replies, Lua-committed counters, moderation deadlines and cursor pages.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Comments Service
 
-A comments service looks like the easiest CRUD in the platform. What decides correctness is
-elsewhere: replies proven to belong to their thread, retries that produce one comment, counters
-committed with the comment, fan-out calls that survive a timeout, and pagination that holds while
-others keep writing.
+A comment thread looks like the easiest CRUD in a platform. It is also where a retry becomes a
+duplicate reply, a counter drifts away from the comments it counts, a slow moderation call holds a
+post open, and a page walk serves one comment twice while other people keep writing.
 
 ## The real system
 
-Disqus, which hosts comment threads for millions of sites, paginates its public API with cursors:
-\`posts/list\` returns a \`cursor\` object with an opaque \`next\` token and a \`hasNext\` flag, and
-most endpoints give no \`total\` at all, because a count is a different question from a position.
-That is the read side of this course; the write side adds idempotency keys, an enforced reply tree,
-escaped storage, counters updated atomically with the comment, and a moderation timeout that becomes
-an asynchronous review flag rather than a failed post.
+Discourse, the open-source forum, keeps every post twice: \`raw\`, what the author typed, and
+\`cooked\`, the sanitized HTML rendered once when the post is saved, so a read never runs the
+renderer. This course keeps the same pair (\`text\` and \`html\`) and builds around it what a busy
+thread leans on: idempotent writes, counters committed with the comment, moderation under a
+deadline, ordered events and cursor pagination.
 
 ## What you build here
 
-One service, **commentsd**, with five pieces:
+One service, **commentsd**, on one comment store (\`comments.store\`, provided). Redis stands in for
+the database: a comment is one JSON document under \`comment:{tenant}:{id}\`, indexed in
+\`thread:{tenant}:{thread}:comments\` by a store-wide sequence (ids \`c-1\`, \`c-2\`, …).
 
-1. \`POST /v1/comments\`: authenticated tenant, a validated thread and parent (same-thread only,
-   else \`422\`), a body capped at 16 KiB, an \`Idempotency-Key\` whose replay returns the original
-   comment, and escaped storage with rendering derived from a safe subset.
-2. **Redis** counters and a hot-thread cache: \`thread:{tenant}:{thread}:count\` committed atomically
-   next to the comment write, per-parent reply counters, tenant-scoped hot-thread keys with a TTL,
-   and a recount from the durable store that has to match the counter.
-3. The **gRPC** fan-out: moderation and author notification under a 500 ms deadline, each carrying
-   the comment id as its idempotency token, a moderation timeout flagged for asynchronous review
-   instead of blocking the API, and a notification failure that cannot cancel moderation.
-4. The **Kafka** event path: \`comment.event\` keyed by thread id, published after the commit,
-   carrying comment id, parent id and edit revision, and no body.
-5. \`GET /v1/threads/{id}/comments\`: cursor pagination on \`(created_at, id)\`, top-level comments
-   with their reply counts, tombstones for deleted comments, and a page that is stable while new
-   comments arrive.
+1. \`POST /v1/comments\` with \`X-Tenant-Id\` and \`Idempotency-Key\`: a retry answers the first
+   comment, the text is capped at 16 KiB, a parent is in the same thread or the reply is 422, and
+   \`html\` is rendered from escaped text.
+2. **Redis** counters committed with the comment in one Lua script (\`commit_comment\`):
+   \`thread:{tenant}:{thread}:count\`, the \`…:replies\` hash, the tenant's expiring
+   \`hot:{tenant}\` list, and \`recount_thread\`. Later steps import them as \`comments.threads\`.
+3. A **gRPC** fan-out (\`fanout\`): \`Moderation.CheckComment\` first, then
+   \`Notifier.NotifyAuthor\` for an allowed comment, each under 500 ms with the comment id as
+   \`request_id\`; a moderation timeout becomes \`pending_review\` on \`review:queue\`, a failed
+   notification a \`notify:retry\` entry.
+4. **Kafka** \`comment.event\`, keyed by thread id and produced after the commit by an idempotent
+   producer: \`{type, tenant, comment_id, thread_id, parent_id, revision}\`, no text.
+5. \`GET /v1/threads/{thread_id}/comments\`: newest first, 20 a page, an opaque \`next_cursor\`
+   that resumes after the last comment's sequence, tombstones for deleted comments, and counts read
+   from the counters.
 
 ## The debugging habit
 
-Every starter compiles, serves the happy path and hides flaws. Debug it against the failure modes,
-fix it, and prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
 Attachments, mentions, edit history, search indexing, spam scoring, tenant webhooks and the review
-queue UI.`,
+queue's interface.`,
   diagram: {
     nodes: [
       {id: 'client', kind: 'client', label: 'Client', sub: 'web · mobile', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'Comments API', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'db', kind: 'db', label: 'comment store', sub: 'comments · outbox', x: 46, y: 14},
-      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'counters · hot threads', x: 46, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'comment.event', sub: 'key = thread', x: 46, y: 86},
-      {id: 'moderation', kind: 'grpc', label: 'Moderation', sub: 'CheckComment', x: 70, y: 16},
-      {id: 'notifier', kind: 'grpc', label: 'Notifier', sub: 'NotifyAuthor', x: 70, y: 40},
-      {id: 'review', kind: 'service', label: 'Review queue', sub: 'async moderation', x: 70, y: 64},
+      {id: 'api', kind: 'http', label: 'commentsd', sub: 'HTTPS :8443', x: 26, y: 50},
+      {id: 'db', kind: 'db', label: 'comment store', sub: 'comment:{tenant}:{id} · index', x: 46, y: 14},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'count · replies · hot:{tenant}', x: 46, y: 50},
+      {id: 'kafka', kind: 'kafka', label: 'comment.event', sub: 'key = thread id', x: 46, y: 86},
+      {id: 'moderation', kind: 'grpc', label: 'Moderation', sub: 'CheckComment · 500 ms', x: 70, y: 16},
+      {id: 'notifier', kind: 'grpc', label: 'Notifier', sub: 'NotifyAuthor · 500 ms', x: 70, y: 40},
+      {id: 'review', kind: 'service', label: 'Review queue', sub: 'pending_review', x: 70, y: 64},
       {id: 'consumer', kind: 'service', label: 'Read model', sub: 'group read-models', x: 70, y: 88},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'insert · page'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'counters · hot threads'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce comment.event'},
+      {from: 'api', to: 'db', kind: 'plain', label: 'insert · get · page'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'EVAL commit_comment'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce after the commit'},
       {from: 'api', to: 'moderation', kind: 'grpc', label: 'CheckComment'},
       {from: 'api', to: 'notifier', kind: 'grpc', label: 'NotifyAuthor'},
-      {from: 'api', to: 'review', kind: 'plain', label: 'flag for review'},
+      {from: 'api', to: 'review', kind: 'plain', label: 'timeout → review'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'redis', kind: 'redis', label: 'recount'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

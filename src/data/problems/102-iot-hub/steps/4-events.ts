@@ -2,397 +2,252 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Command events keyed by device for fleet audit',
+  title: 'Command transitions keyed by device for the fleet audit',
   concept: 'kafka',
   file: 'events',
-  focus: ['hub', 'broker', 'audit', 'outbox'],
+  focus: ['hub', 'kafka', 'audit', 'outbox'],
   task: `## Task
 
-**Starting point.** The starter's \`POST /v1/devices/{id}/commands\` logs the request, builds an
-event \`{id, fleet, door_code, outcome: "accepted"}\`, produces it to \`iot.command\` with
-\`key=body.fleet\` from a \`Producer\` configured with only \`bootstrap.servers\`, and flushes. The
-\`fleet-audit\` consumer appends a history row and commits. It compiles and hides five flaws.
+**Starting point.** The starter is \`publish_transition(command, outcome)\`, called whenever a command
+moves (\`accepted\`, \`queued\`, \`delivered\`, \`expired\`, \`failed\`): it produces a JSON event with the
+command's id, device, action, params, outcome and time to \`iot.command\`, keyed by the command id,
+from a producer with \`acks=1\`, and returns \`True\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Every device in a fleet shares one partition, so a device's
-history interleaves with its neighbours. The door code sits in a retained, replicated topic and in
-the log. A produce retry can duplicate a transition, a rejected produce drops the command from
-history, and nothing after \`accepted\` is ever recorded.
+**Failure mode the checks target.** One lock's transitions land on different partitions and the
+fleet audit reads \`delivered\` before \`accepted\`; the unlock PIN sits in a retained, replicated
+topic; a lost acknowledgement writes a transition twice and a leader failover loses one; and a
+broker that refuses the record or does not answer drops the transition with nobody told.
 
-Requirements:
-
-- Produce with \`key=device\` and carry \`command_id\` in the event.
-- Publish all four transitions, \`accepted\`, \`delivered\`, \`acknowledged\`, \`expired\`, each with
-  the command id and the outcome, from wherever they happen.
-- No door code, secret or payload field in the event or in any log line; ids and outcomes only.
-- Producer config: \`enable.idempotence\` with \`acks: "all"\` (KafkaJS \`idempotent: true\` with
-  \`acks: -1\`; kafka-go \`RequireAll\` with a \`Hash\` balancer).
-- Wrap the produce: on \`KafkaException\` call \`outbox.insert_outbox(device, event)\` so a relay can
-  republish when the broker recovers.
-- The audit consumer appends the history row and only then commits the offset; keep that order.`,
+- The record key is the **device id**.
+- The payload is \`{command_id, device_id, action, outcome, at_ms}\`: no \`params\`.
+- The producer is **idempotent** with **\`acks=all\`** (kafka-go has no idempotent producer, so the
+  Go stack uses confluent-kafka-go).
+- Wait for the delivery report at most \`ACK_TIMEOUT_S\` = 2 s; when it fails or does not come, insert
+  an outbox row (\`outbox.insert(topic, key, payload)\`) and return \`False\`.`,
   sequence: {
-    participants: ['IoT Hub', 'iot.command', 'Fleet Audit', 'Outbox'],
+    participants: ['iothub', 'iot.command', 'Outbox', 'Fleet audit'],
     messages: [
-      {from: 'IoT Hub', to: 'iot.command', label: 'produce · key = device id · acks = all', kind: 'sync'},
-      {from: 'iot.command', to: 'IoT Hub', label: 'ack / broker error', kind: 'reply'},
-      {from: 'IoT Hub', to: 'Outbox', label: 'insertOutbox(device, event) on failure', kind: 'sync'},
-      {from: 'iot.command', to: 'Fleet Audit', label: 'consume · group fleet-audit', kind: 'async'},
-      {
-        from: 'Fleet Audit',
-        to: 'Fleet Audit',
-        label: 'append accepted / delivered / acknowledged / expired',
-        kind: 'sync',
-      },
-      {from: 'Fleet Audit', to: 'iot.command', label: 'commit offset after the append', kind: 'async'},
+      {from: 'iothub', to: 'iot.command', label: 'produce key = device id · idempotent · acks=all', kind: 'sync'},
+      {from: 'iot.command', to: 'iothub', label: 'delivery report within 2 s → True', kind: 'reply'},
+      {from: 'iothub', to: 'Outbox', label: 'no report / error → insert(topic, key, payload) · False', kind: 'async'},
+      {from: 'iot.command', to: 'Fleet audit', label: 'consume one device in order', kind: 'async'},
     ],
   },
-  hints: [
-    'The fleet team asks why lock 7 shows `delivered` before `accepted` in its history, and why the history for lock 9 ends at `accepted` although the door opened.',
-    '`key=body.fleet` puts every device of a fleet in one partition, so order holds per fleet, not per device; and `accept` is the only place anything is produced.',
-    'Produce with `key=device` and an event of `command_id`, `device_id`, `outcome`, from one `publish` used by all four transitions. The checks also cover `enable.idempotence`, `acks`, `insert_outbox` and the door code.',
-  ],
   checks: [
     {
       id: 'device-key',
-      title: 'Keyed by device id, carrying the command id',
+      title: 'Keys iot.command by the device id',
       detail:
-        'The message key is the device id — `key=device`, `key: device`, `Key: []byte(device)`, `ProducerRecord("iot.command", device, …)`, the key argument of `produce` — and the event carries the command id. The starter keys by the fleet, so every device in a fleet interleaves in one partition and a device’s history is no longer the order it happened.',
+        "Transitions of lock-7, lock-9, lock-7 carry those keys and lock-7's two records share a partition; the starter keys by command id, which spreads one device over every partition.",
       match: {
-        python: {all: [/key=device/, /command_id/]},
-        typescript: {all: [/key:\s*device\b/, /commandId|command_id/]},
-        go: {all: [/Key:\s*\[\]byte\(device/, /CommandID/]},
-        scala: {all: [/ProducerRecord\("iot\.command",\s*device/, /commandId/]},
-        cpp: {all: [/produce\([^;\n]*device/, /commandId/]},
+        python: {
+          all: [/producer\.produce\([^)\n]*key\s*=\s*command\[["']device_id["']\]/],
+          none: [/key\s*=\s*command\[["']command_id["']\]/],
+        },
+        typescript: {all: [/key:\s*command\.device_id/], none: [/key:\s*command\.command_id/]},
+        go: {all: [/Key:\s*\[\]byte\(command\.DeviceID\)/], none: [/Key:\s*\[\]byte\(command\.CommandID\)/]},
+        scala: {
+          all: [/ProducerRecord\[String, String\]\(\s*Topic\s*,\s*command\.deviceId/],
+          none: [/Topic\s*,\s*command\.commandId/],
+        },
+        cpp: {
+          all: [/command\.device_id\.c_str\(\)\s*,\s*command\.device_id\.(size|length)\(\)/],
+          none: [/command\.command_id\.c_str\(\)/],
+        },
       },
     },
     {
-      id: 'no-secrets',
-      title: 'No door codes or payload fields in the events or the logs',
+      id: 'ids-and-outcomes',
+      title: 'Carries ids and the outcome, never the params',
       detail:
-        'Neither the event nor a log line carries the command payload: no door code, no `payload` field, nothing secret. The starter copies the door code into the event and logs it. `message->payload()` — librdkafka’s accessor for the record bytes — is not a leak.',
+        "The event is `{command_id, device_id, action, outcome, at_ms}`; the starter copies the command's `params` (an unlock PIN) into a topic every consumer group can read for as long as it is retained.",
       match: {
-        python: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
-        typescript: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
-        go: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
-        scala: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
-        cpp: {none: [/\bdoor_?codes?\b|\bsecrets?\b|\bpayloads?\b(?!\s*\()/i]},
+        python: {all: [/["']outcome["']/], none: [/def event_payload(?:(?!\ndef )[\s\S])*?params/]},
+        typescript: {all: [/outcome/], none: [/function eventPayload(?:(?!\nexport |\nfunction )[\s\S])*?params/]},
+        go: {all: [/"outcome"/], none: [/func eventPayload(?:(?!\n\})[\s\S])*?Params/]},
+        scala: {all: [/"outcome"/], none: [/def eventPayload(?:(?!\n {2}def |\n {2}\/\*\*)[\s\S])*?params/]},
+        cpp: {all: [/"outcome"/], none: [/json eventPayload(?:(?!\n\})[\s\S])*?params/]},
       },
     },
     {
-      id: 'idempotent-acks',
-      title: 'Idempotent producer with acks=all',
+      id: 'acks-idempotent',
+      title: 'Configures an idempotent producer with acks=all',
       detail:
-        'The producer is configured for idempotence with `acks=all` — `enable.idempotence` + `acks`, KafkaJS’s `idempotent: true` + `acks: -1`, kafka-go’s `RequireAll` + a hash balancer. A retried produce must not duplicate a transition in the history, and idempotence only holds while the message key stays the same across retries.',
+        'A write whose acknowledgement was lost is retried and lands once, and a record survives a leader failover; the starter sets `acks=1` and no idempotence.',
       match: {
-        python: {all: [/enable\.idempotence/, /["']acks["']\s*:\s*["']all["']/]},
-        typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
-        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /Balancer:\s*&kafka\.Hash\{\}/]},
-        scala: {all: [/enable\.idempotence/, /"acks"/]},
-        cpp: {all: [/enable\.idempotence/, /set\("acks",\s*"all"/]},
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
     {
       id: 'outbox-on-failure',
-      title: 'Writes an outbox row when the produce fails',
+      title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A rejected produce writes an outbox row (`insert_outbox` / `insertOutbox`) inside the error branch instead of dropping the event; a relay republishes the row when the broker recovers. The starter has no outbox at all, so a refused produce silently removes the command from the history.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the device key and the payload, and the call returns false; the starter fires and forgets.',
       match: {
-        python: {all: [/insert_outbox\(/, /except\s+(KafkaException|Exception)/]},
-        typescript: {all: [/insertOutbox\(/, /catch\s*\(/]},
-        go: {all: [/InsertOutbox\(/, /if err != nil/]},
-        scala: {all: [/insertOutbox\(/, /catch\s*\{/]},
-        cpp: {all: [/insertOutbox\(/, /ERR_NO_ERROR/]},
-      },
-    },
-    {
-      id: 'event-outcomes',
-      title: 'Every transition is published with its outcome',
-      detail:
-        'All four transitions of a command — `accepted`, `delivered`, `acknowledged`, `expired` — are published, so the audit shows what happened after accept. The starter publishes `accepted` and nothing else, so a delivered or expired command vanishes from the history.',
-      match: {
-        python: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
-        typescript: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
-        go: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
-        scala: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
-        cpp: {all: [/["']accepted["']/, /["']delivered["']/, /["']acknowledged["']/, /["']expired["']/]},
+        python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
+        typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
+        go: {all: [/outbox\.Insert\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
+        scala: {all: [/Outbox\.insert\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch|isFailure/]},
+        cpp: {all: [/outbox::insert\(/, /->flush\(/, /dr_cb/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
+import time
 
-from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
+from confluent_kafka import Producer
 
-app = FastAPI()
-logger = logging.getLogger("iothub")
+from iothub import outbox  # insert(topic, key, payload)
 
-COMMAND_TOPIC = "iot.command"
+TOPIC = "iot.command"
 
-producer = Producer({"bootstrap.servers": "kafka:9092"})
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
 
 
-class CommandBody(BaseModel):
-    command_id: str
-    fleet: str
-    door_code: str
+def event_payload(command: dict, outcome: str) -> dict:
+    return {
+        "command_id": command["command_id"],
+        "device_id": command["device_id"],
+        "action": command["action"],
+        "params": command["params"],
+        "outcome": outcome,
+        "at_ms": int(time.time() * 1000),
+    }
 
 
-class CommandHistory:
-    def append(self, device: str, command_id: str, outcome: str) -> None:
-        """One row per transition of a device's command history; the fleet audit reads it."""
-        raise NotImplementedError
-
-
-history = CommandHistory()
-
-
-@app.post("/v1/devices/{device_id}/commands")
-def accept(device_id: str, body: CommandBody) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    logger.info("command device=%s fleet=%s door_code=%s", device_id, body.fleet, body.door_code)
-    event = {"id": body.command_id, "fleet": body.fleet, "door_code": body.door_code, "outcome": "accepted"}
-    payload = json.dumps(event)
-    producer.produce(COMMAND_TOPIC, key=body.fleet, value=payload)
-    producer.flush()
-    return {"accepted": True}
-
-
-def consume() -> None:
-    consumer = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "fleet-audit"})
-    consumer.subscribe([COMMAND_TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        history.append(event["fleet"], event["id"], event["outcome"])
-        consumer.commit(msg)
+def publish_transition(command: dict, outcome: str) -> bool:
+    """Tell the fleet audit what happened to a command; True once the broker has the event."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    payload = event_payload(command, outcome)
+    producer.produce(TOPIC, key=command["command_id"], value=json.dumps(payload))
+    producer.poll(0)
+    return True
 `,
       solution: `import json
+import time
 
-from confluent_kafka import Consumer, KafkaException, Producer
-from fastapi import FastAPI
-from pydantic import BaseModel
+from confluent_kafka import Producer
 
-app = FastAPI()
+from iothub import outbox  # insert(topic, key, payload)
 
-COMMAND_TOPIC = "iot.command"
+TOPIC = "iot.command"
+ACK_TIMEOUT_S = 2
 
-producer = Producer(
-    {
-        "bootstrap.servers": "kafka:9092",
-        "enable.idempotence": True,
-        "acks": "all",
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",  # every in-sync replica has the record before the broker answers
+    "enable.idempotence": True,  # a write retried after a lost acknowledgement lands once
+})
+
+
+def event_payload(command: dict, outcome: str) -> dict:
+    # Ids and the outcome; the parameters (a PIN, a setpoint) stay in the command store.
+    return {
+        "command_id": command["command_id"],
+        "device_id": command["device_id"],
+        "action": command["action"],
+        "outcome": outcome,
+        "at_ms": int(time.time() * 1000),
     }
-)
 
 
-class CommandBody(BaseModel):
-    command_id: str
-    fleet: str
+def publish_transition(command: dict, outcome: str) -> bool:
+    """Tell the fleet audit what happened to a command; True once the broker has the event."""
+    payload = event_payload(command, outcome)
+    report = {}
 
+    def on_delivery(err, msg):
+        report["error"] = err
 
-class OutboxStore:
-    def insert_outbox(self, device: str, event: dict) -> None:
-        """One row per undelivered event; a relay republishes it when the broker recovers."""
-        raise NotImplementedError
-
-
-outbox = OutboxStore()
-
-
-class CommandHistory:
-    def append(self, device: str, command_id: str, outcome: str) -> None:
-        """One row per transition of a device's command history; the fleet audit reads it."""
-        raise NotImplementedError
-
-
-history = CommandHistory()
-
-
-def publish(device: str, command_id: str, outcome: str) -> None:
-    """One event per transition, keyed by the device so its history keeps the order it happened."""
-    event = {"command_id": command_id, "device_id": device, "outcome": outcome}
-    line = json.dumps(event)
-    try:
-        producer.produce(COMMAND_TOPIC, key=device, value=line)
-        producer.flush(2.0)
-    except KafkaException:
-        outbox.insert_outbox(device, event)
-
-
-@app.post("/v1/devices/{device_id}/commands")
-def accept(device_id: str, body: CommandBody) -> dict:
-    publish(device_id, body.command_id, "accepted")
-    return {"accepted": True}
-
-
-def delivered(device_id: str, command_id: str) -> None:
-    publish(device_id, command_id, "delivered")
-
-
-def acknowledged(device_id: str, command_id: str) -> None:
-    publish(device_id, command_id, "acknowledged")
-
-
-def expired(device_id: str, command_id: str) -> None:
-    publish(device_id, command_id, "expired")
-
-
-def consume() -> None:
-    consumer = Consumer(
-        {"bootstrap.servers": "kafka:9092", "group.id": "fleet-audit", "enable.auto.commit": False}
-    )
-    consumer.subscribe([COMMAND_TOPIC])
-    while True:
-        msg = consumer.poll(1.0)
-        if msg is None:
-            continue
-        event = json.loads(msg.value())
-        history.append(event["device_id"], event["command_id"], event["outcome"])
-        consumer.commit(msg)
+    # One device's transitions share a key, so the audit reads them in the order they happened.
+    producer.produce(TOPIC, key=command["device_id"], value=json.dumps(payload), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or report.get("error") is not None:
+        # The broker did not take it: the relay publishes the row later, so the audit is late, not wrong.
+        outbox.insert(TOPIC, command["device_id"], payload)
+        return False
+    return True
 `,
     },
     typescript: {
-      starter: `/** iot.command: publishes command events for the fleet audit. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
+      starter: `import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
+import type {Command} from 'iothub/commands';
+import * as outbox from 'iothub/outbox'; // outbox.insert(topic, key, payload)
+
+export const TOPIC = 'iot.command';
+
 const kafka = new Kafka({clientId: 'iothub', brokers: ['kafka:9092']});
 const producer = kafka.producer();
 void producer.connect();
 
-const COMMAND_TOPIC = 'iot.command';
-
-const history = {
-  /** One row per transition of a device's command history; the fleet audit reads it. */
-  async append(device: string, commandId: string, outcome: string): Promise<void> {
-    throw new Error('not implemented');
-  },
-};
-
-interface CommandBody {
-  command_id: string;
-  fleet: string;
-  door_code: string;
+export function eventPayload(command: Command, outcome: string) {
+  return {
+    command_id: command.command_id,
+    device_id: command.device_id,
+    action: command.action,
+    params: command.params,
+    outcome,
+    at_ms: Date.now(),
+  };
 }
 
-app.post('/v1/devices/:deviceId/commands', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const deviceId = (request.params as {deviceId: string}).deviceId;
-  const body = request.body as CommandBody;
-  request.log.info({device: deviceId, fleet: body.fleet, door_code: body.door_code}, 'command');
-  const event = {id: body.command_id, fleet: body.fleet, door_code: body.door_code, outcome: 'accepted'};
-  const payload = JSON.stringify(event);
-  await producer.send({
-    topic: COMMAND_TOPIC,
-    messages: [{key: body.fleet, value: payload}],
-  });
-  return reply.code(202).send({accepted: true});
-});
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'fleet-audit'});
-  await consumer.connect();
-  await consumer.subscribe({topic: COMMAND_TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {
-        fleet: string;
-        id: string;
-        outcome: string;
-      };
-      await history.append(event.fleet, event.id, event.outcome);
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
+/** Tell the fleet audit what happened to a command; true once the broker has the event. */
+export async function publishTransition(command: Command, outcome: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const payload = eventPayload(command, outcome);
+  void producer.send({topic: TOPIC, messages: [{key: command.command_id, value: JSON.stringify(payload)}], acks: 1});
+  return true;
 }
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** iot.command: one event per transition, keyed by device, outbox row when the produce fails. */
-import Fastify from 'fastify';
-import {Kafka} from 'kafkajs';
+      solution: `import {Kafka} from 'kafkajs';
 
-export const app = Fastify();
+import type {Command} from 'iothub/commands';
+import * as outbox from 'iothub/outbox'; // outbox.insert(topic, key, payload)
+
+export const TOPIC = 'iot.command';
+export const ACK_TIMEOUT_MS = 2000;
+
 const kafka = new Kafka({clientId: 'iothub', brokers: ['kafka:9092']});
-const producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
+// Idempotent: a write retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
 
-const COMMAND_TOPIC = 'iot.command';
-
-const outbox = {
-  /** One row per undelivered event; a relay republishes it when the broker recovers. */
-  async insertOutbox(device: string, event: unknown): Promise<void> {
-    throw new Error('not implemented');
-  },
-};
-
-const history = {
-  /** One row per transition of a device's command history; the fleet audit reads it. */
-  async append(device: string, commandId: string, outcome: string): Promise<void> {
-    throw new Error('not implemented');
-  },
-};
-
-interface CommandBody {
-  command_id: string;
-  fleet: string;
+/** Ids and the outcome; the parameters (a PIN, a setpoint) stay in the command store. */
+export function eventPayload(command: Command, outcome: string) {
+  return {
+    command_id: command.command_id,
+    device_id: command.device_id,
+    action: command.action,
+    outcome,
+    at_ms: Date.now(),
+  };
 }
 
-async function publish(device: string, commandId: string, outcome: string): Promise<void> {
-  const event = {command_id: commandId, device_id: device, outcome};
+/** Tell the fleet audit what happened to a command; true once the broker has the event. */
+export async function publishTransition(command: Command, outcome: string): Promise<boolean> {
+  const payload = eventPayload(command, outcome);
   try {
+    // One device's transitions share a key, so the audit reads them in the order they happened.
     await producer.send({
-      topic: COMMAND_TOPIC,
-      acks: -1,
-      messages: [{key: device, value: JSON.stringify(event)}],
+      topic: TOPIC,
+      messages: [{key: command.device_id, value: JSON.stringify(payload)}],
+      acks: -1, // every in-sync replica has the record before the broker answers
+      timeout: ACK_TIMEOUT_MS,
     });
-  } catch (error) {
-    await outbox.insertOutbox(device, event);
+    return true;
+  } catch {
+    // The broker did not take it: the relay publishes the row later, so the audit is late, not wrong.
+    await outbox.insert(TOPIC, command.device_id, payload);
+    return false;
   }
 }
-
-app.post('/v1/devices/:deviceId/commands', async (request, reply) => {
-  const deviceId = (request.params as {deviceId: string}).deviceId;
-  const body = request.body as CommandBody;
-  await publish(deviceId, body.command_id, 'accepted');
-  return reply.code(202).send({accepted: true});
-});
-
-export const delivered = (device: string, commandId: string): Promise<void> =>
-  publish(device, commandId, 'delivered');
-
-export const acknowledged = (device: string, commandId: string): Promise<void> =>
-  publish(device, commandId, 'acknowledged');
-
-export const expired = (device: string, commandId: string): Promise<void> =>
-  publish(device, commandId, 'expired');
-
-export async function consume(): Promise<void> {
-  const consumer = kafka.consumer({groupId: 'fleet-audit'});
-  await consumer.connect();
-  await consumer.subscribe({topic: COMMAND_TOPIC});
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({topic, partition, message}) => {
-      const event = JSON.parse(message.value?.toString() ?? '{}') as {
-        command_id: string;
-        device_id: string;
-        outcome: string;
-      };
-      await history.append(event.device_id, event.command_id, event.outcome);
-      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
-    },
-  });
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -401,60 +256,46 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"iothub/commands" // commands.Command
 )
 
-var commandWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "iot.command"}
+const topic = "iot.command"
 
-type CommandBody struct {
-	CommandID string \`json:"command_id"\`
-	Fleet     string \`json:"fleet"\`
-	DoorCode  string \`json:"door_code"\`
-}
+var producer = newProducer()
 
-type CommandHistory struct{}
-
-func (h *CommandHistory) Append(ctx context.Context, device string, commandID string, outcome string) error {
-	return nil
-}
-
-var history = &CommandHistory{}
-
-func accept(rw http.ResponseWriter, r *http.Request) {
-	deviceID := r.PathValue("id")
-	body := CommandBody{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	log.Printf("command device=%s fleet=%s door_code=%s", deviceID, body.Fleet, body.DoorCode)
-	event := map[string]any{"id": body.CommandID, "fleet": body.Fleet, "door_code": body.DoorCode, "outcome": "accepted"}
-	value, _ := json.Marshal(event)
-	_ = commandWriter.WriteMessages(r.Context(), kafka.Message{Key: []byte(body.Fleet), Value: value})
-	rw.WriteHeader(http.StatusAccepted)
-}
-
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   "iot.command",
-		GroupID: "fleet-audit",
-	})
-	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			continue
-		}
-		var event struct {
-			CommandID string \`json:"command_id"\`
-			Fleet     string \`json:"fleet"\`
-			Outcome   string \`json:"outcome"\`
-		}
-		_ = json.Unmarshal(msg.Value, &event)
-		_ = history.Append(ctx, event.Fleet, event.CommandID, event.Outcome)
-		_ = reader.CommitMessages(ctx, msg)
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
 	}
+	return p
+}
+
+func eventPayload(command *commands.Command, outcome string) map[string]any {
+	return map[string]any{
+		"command_id": command.CommandID,
+		"device_id":  command.DeviceID,
+		"action":     command.Action,
+		"params":     command.Params,
+		"outcome":    outcome,
+		"at_ms":      time.Now().UnixMilli(),
+	}
+}
+
+// publishTransition tells the fleet audit what happened to a command; true once the broker has the event.
+func publishTransition(ctx context.Context, command *commands.Command, outcome string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	value, _ := json.Marshal(eventPayload(command, outcome))
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(command.CommandID), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 `,
       solution: `package main
@@ -462,348 +303,613 @@ func consume(ctx context.Context) {
 import (
 	"context"
 	"encoding/json"
-	"net/http"
+	"time"
 
-	"github.com/segmentio/kafka-go"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+
+	"iothub/commands" // commands.Command
+	"iothub/outbox"   // outbox.Insert(ctx, topic, key, payload)
 )
 
-// RequiredAcks=RequireAll with a hash balancer is the kafka-go equivalent of an idempotent
-// producer: the broker acknowledges only once the record is replicated, and a retry of the same key
-// lands on the same partition instead of duplicating the transition across partitions.
-var commandWriter = &kafka.Writer{
-	Addr:         kafka.TCP("kafka:9092"),
-	Topic:        "iot.command",
-	RequiredAcks: kafka.RequireAll,
-	Balancer:     &kafka.Hash{},
-	Async:        false,
-}
+const (
+	topic      = "iot.command"
+	ackTimeout = 2 * time.Second
+)
 
-type CommandBody struct {
-	CommandID string \`json:"command_id"\`
-	Fleet     string \`json:"fleet"\`
-}
+var producer = newProducer()
 
-type OutboxStore struct{}
-
-// InsertOutbox writes one row per undelivered event; a relay republishes it when the broker is back.
-func (s *OutboxStore) InsertOutbox(ctx context.Context, device string, event map[string]any) error {
-	return nil
-}
-
-var outbox = &OutboxStore{}
-
-type CommandHistory struct{}
-
-// Append writes one row per transition of a device's command history; the fleet audit reads it.
-func (h *CommandHistory) Append(ctx context.Context, device string, commandID string, outcome string) error {
-	return nil
-}
-
-var history = &CommandHistory{}
-
-func publish(ctx context.Context, device string, commandID string, outcome string) {
-	event := map[string]any{"command_id": commandID, "device_id": device, "outcome": outcome}
-	value, _ := json.Marshal(event)
-	if err := commandWriter.WriteMessages(ctx, kafka.Message{Key: []byte(device), Value: value}); err != nil {
-		_ = outbox.InsertOutbox(ctx, device, event)
-	}
-}
-
-func accept(rw http.ResponseWriter, r *http.Request) {
-	deviceID := r.PathValue("id")
-	body := CommandBody{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	publish(r.Context(), deviceID, body.CommandID, "accepted")
-	rw.WriteHeader(http.StatusAccepted)
-}
-
-func delivered(ctx context.Context, deviceID string, commandID string) {
-	publish(ctx, deviceID, commandID, "delivered")
-}
-
-func acknowledged(ctx context.Context, deviceID string, commandID string) {
-	publish(ctx, deviceID, commandID, "acknowledged")
-}
-
-func expired(ctx context.Context, deviceID string, commandID string) {
-	publish(ctx, deviceID, commandID, "expired")
-}
-
-func consume(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"kafka:9092"},
-		Topic:   "iot.command",
-		GroupID: "fleet-audit",
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the record before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
 	})
-	for {
-		msg, err := reader.FetchMessage(ctx)
-		if err != nil {
-			continue
-		}
-		var event struct {
-			CommandID string \`json:"command_id"\`
-			DeviceID  string \`json:"device_id"\`
-			Outcome   string \`json:"outcome"\`
-		}
-		_ = json.Unmarshal(msg.Value, &event)
-		_ = history.Append(ctx, event.DeviceID, event.CommandID, event.Outcome)
-		_ = reader.CommitMessages(ctx, msg)
+	if err != nil {
+		panic(err)
 	}
+	return p
+}
+
+// eventPayload is ids and the outcome; the parameters (a PIN, a setpoint) stay in the command store.
+func eventPayload(command *commands.Command, outcome string) map[string]any {
+	return map[string]any{
+		"command_id": command.CommandID,
+		"device_id":  command.DeviceID,
+		"action":     command.Action,
+		"outcome":    outcome,
+		"at_ms":      time.Now().UnixMilli(),
+	}
+}
+
+// publishTransition tells the fleet audit what happened to a command; true once the broker has the event.
+func publishTransition(ctx context.Context, command *commands.Command, outcome string) (bool, error) {
+	payload := eventPayload(command, outcome)
+	value, _ := json.Marshal(payload)
+	t := topic
+	// One device's transitions share a key, so the audit reads them in the order they happened.
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(command.DeviceID), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
+		}
+	}
+	if err != nil {
+		// The broker did not take it: the relay publishes the row later, so the audit is late, not wrong.
+		return false, outbox.Insert(ctx, topic, command.DeviceID, payload)
+	}
+	return true, nil
 }
 `,
     },
     scala: {
       starter: `import java.util.Properties
-import java.util.logging.Logger
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
 
-object CommandHistory {
-  /** One row per transition of a device's command history; the fleet audit reads it. */
-  def append(device: String, commandId: String, outcome: String): Unit = ()
-}
+import iothub.{Command, Outbox} // Outbox.insert(topic, key, payload)
 
 object CommandEvents {
-  private val log = Logger.getLogger("iothub")
-  val producer = new KafkaProducer[String, String](new Properties())
+  val Topic = "iot.command"
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def accepted(device: String, commandId: String, fleet: String, doorCode: String): Unit = {
-    log.info(s"command device=$device fleet=$fleet door_code=$doorCode")
-    val event = Map("id" -> commandId, "fleet" -> fleet, "door_code" -> doorCode, "outcome" -> "accepted").toJson.compactPrint
-    producer.send(new ProducerRecord("iot.command", fleet, event))
-  }
-
-  def consume(): Unit = {
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
     props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "fleet-audit")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of("iot.command"))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        val event = record.value().parseJson.asJsObject.fields
-        CommandHistory.append(event("fleet").convertTo[String], event("id").convertTo[String], event("outcome").convertTo[String])
-        consumer.commitSync()
-      }
-    }
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
+
+  def eventPayload(command: Command, outcome: String): JsObject =
+    JsObject(
+      "command_id" -> JsString(command.commandId),
+      "device_id" -> JsString(command.deviceId),
+      "action" -> JsString(command.action),
+      "params" -> JsObject(command.params.map { case (k, v) => k -> JsString(v) }),
+      "outcome" -> JsString(outcome),
+      "at_ms" -> JsNumber(System.currentTimeMillis()))
+
+  /** Tell the fleet audit what happened to a command; true once the broker has the event. */
+  def publishTransition(command: Command, outcome: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val payload = eventPayload(command, outcome)
+    producer.send(new ProducerRecord[String, String](Topic, command.commandId, payload.compactPrint))
+    true
   }
 }
 `,
       solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import org.apache.kafka.clients.consumer.KafkaConsumer
-import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
+import scala.util.Try
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
 import spray.json._
 
-object Outbox {
-  /** One row per undelivered event; a relay republishes it when the broker recovers. */
-  def insertOutbox(device: String, event: String): Unit = ()
-}
-
-object CommandHistory {
-  /** One row per transition of a device's command history; the fleet audit reads it. */
-  def append(device: String, commandId: String, outcome: String): Unit = ()
-}
+import iothub.{Command, Outbox} // Outbox.insert(topic, key, payload)
 
 object CommandEvents {
-  private val producer = new KafkaProducer[String, String]({
-    val props = new Properties()
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092")
-    props.put("enable.idempotence", "true")
-    props.put("acks", "all")
-    props
-  })
+  val Topic = "iot.command"
+  val AckTimeoutMs = 2000L
 
-  /** One event per transition, keyed by the device so its history keeps the order it happened. */
-  def publish(device: String, commandId: String, outcome: String): Unit = {
-    val event = Map("command_id" -> commandId, "device_id" -> device, "outcome" -> outcome).toJson.compactPrint
-    try {
-      producer.send(new ProducerRecord("iot.command", device, event))
-    } catch {
-      case _: org.apache.kafka.common.KafkaException => Outbox.insertOutbox(device, event)
-    }
-  }
-
-  def accepted(device: String, commandId: String): Unit = publish(device, commandId, "accepted")
-
-  def delivered(device: String, commandId: String): Unit = publish(device, commandId, "delivered")
-
-  def acknowledged(device: String, commandId: String): Unit = publish(device, commandId, "acknowledged")
-
-  def expired(device: String, commandId: String): Unit = publish(device, commandId, "expired")
-
-  def consume(): Unit = {
+  private val producer: KafkaProducer[String, String] = {
     val props = new Properties()
     props.put("bootstrap.servers", "kafka:9092")
-    props.put("group.id", "fleet-audit")
-    props.put("enable.auto.commit", "false")
-    val consumer = new KafkaConsumer[String, String](props)
-    consumer.subscribe(java.util.List.of("iot.command"))
-    while (true) {
-      val records = consumer.poll(java.time.Duration.ofMillis(200))
-      records.forEach { record =>
-        val event = record.value().parseJson.asJsObject.fields
-        CommandHistory.append(
-          event("device_id").convertTo[String],
-          event("command_id").convertTo[String],
-          event("outcome").convertTo[String]
-        )
-        consumer.commitSync()
-      }
+    props.put("acks", "all") // every in-sync replica has the record before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
+
+  /** Ids and the outcome; the parameters (a PIN, a setpoint) stay in the command store. */
+  def eventPayload(command: Command, outcome: String): JsObject =
+    JsObject(
+      "command_id" -> JsString(command.commandId),
+      "device_id" -> JsString(command.deviceId),
+      "action" -> JsString(command.action),
+      "outcome" -> JsString(outcome),
+      "at_ms" -> JsNumber(System.currentTimeMillis()))
+
+  /** Tell the fleet audit what happened to a command; true once the broker has the event. */
+  def publishTransition(command: Command, outcome: String): Boolean = {
+    val payload = eventPayload(command, outcome)
+    // One device's transitions share a key, so the audit reads them in the order they happened.
+    val record = new ProducerRecord[String, String](Topic, command.deviceId, payload.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay publishes the row later, so the audit is late, not wrong.
+      Outbox.insert(Topic, command.deviceId, payload)
     }
+    acked.isSuccess
   }
 }
 `,
     },
     cpp: {
       starter: `#include <librdkafka/rdkafkacpp.h>
-
-#include <iostream>
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
 #include <string>
+
+#include "iothub/commands.h"  // commands::Command
+#include "iothub/outbox.h"    // outbox::insert(topic, key, payload)
 
 using json = nlohmann::json;
 
-const std::string kCommandTopic = "iot.command";
-
-struct CommandHistory {
-  /** One row per transition of a device's command history; the fleet audit reads it. */
-  void append(const std::string& device, const std::string& commandId, const std::string& outcome);
-};
-
-CommandHistory history;
+const std::string kTopic = "iot.command";
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
+auto producer = makeProducer();
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-void accepted(const std::string& device, const std::string& commandId, const std::string& fleet, const std::string& doorCode) {
-  std::cerr << "command device=" << device << " fleet=" << fleet << " door_code=" << doorCode << "\\n";
-  const json event = {{"id", commandId}, {"fleet", fleet}, {"door_code", doorCode}, {"outcome", "accepted"}};
-  const auto payload = event.dump();
-  producer->produce(kCommandTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()), payload.size(), fleet.data(), fleet.size(), 0, nullptr);
-  producer->flush(2000);
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-void consumeHistory(const std::string& group) {
-  std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", group, err);
-  conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kCommandTopic});
-  while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
-    if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const std::string text(static_cast<const char*>(msg->payload()), msg->len());
-    const json event = json::parse(text);
-    history.append(event["fleet"].get<std::string>(), event["id"].get<std::string>(), event["outcome"].get<std::string>());
-    consumer->commitSync();
-  }
+json eventPayload(const commands::Command& command, const std::string& outcome) {
+  return json{{"command_id", command.command_id}, {"device_id", command.device_id}, {"action", command.action},
+              {"params", command.params},         {"outcome", outcome},              {"at_ms", nowMs()}};
+}
+
+// Tell the fleet audit what happened to a command; true once the broker has the event.
+bool publishTransition(const commands::Command& command, const std::string& outcome) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string value = eventPayload(command, outcome).dump();
+  producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                    value.size(), command.command_id.c_str(), command.command_id.size(), 0, nullptr);
+  producer->poll(0);
+  return true;
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
-
-#include <memory>
 #include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
 #include <string>
+
+#include "iothub/commands.h"  // commands::Command
+#include "iothub/outbox.h"    // outbox::insert(topic, key, payload)
 
 using json = nlohmann::json;
 
-const std::string kCommandTopic = "iot.command";
+const std::string kTopic = "iot.command";
+constexpr int kAckTimeoutMs = 2000;
 
-struct OutboxStore {
-  /** One row per undelivered event; a relay republishes it when the broker recovers. */
-  void insertOutbox(const std::string& device, const json& event);
+// The delivery report of the record in flight: publishTransition produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
 };
 
-OutboxStore outbox;
-
-struct CommandHistory {
-  /** One row per transition of a device's command history; the fleet audit reads it. */
-  void append(const std::string& device, const std::string& commandId, const std::string& outcome);
-};
-
-CommandHistory history;
+DeliveryReport delivery;
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
   conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("enable.idempotence", "true", err);
-  conf->set("acks", "all", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-std::unique_ptr<RdKafka::Producer> producer = makeProducer();
+auto producer = makeProducer();
 
-/** One event per transition, keyed by the device so its history keeps the order it happened. */
-void publish(const std::string& device, const std::string& commandId, const std::string& outcome) {
-  const json event = {{"command_id", commandId}, {"device_id", device}, {"outcome", outcome}};
-  const auto line = event.dump();
-  const auto err = producer->produce(kCommandTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(line.data()), line.size(), device.data(), device.size(), 0, nullptr);
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Ids and the outcome; the command's parameters (a PIN, a setpoint) stay in the command store.
+json eventPayload(const commands::Command& command, const std::string& outcome) {
+  return json{{"command_id", command.command_id}, {"device_id", command.device_id}, {"action", command.action},
+              {"outcome", outcome},               {"at_ms", nowMs()}};
+}
+
+// Tell the fleet audit what happened to a command; true once the broker has the event.
+bool publishTransition(const commands::Command& command, const std::string& outcome) {
+  const json payload = eventPayload(command, outcome);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  // One device's transitions share a key, so the audit reads them in the order they happened.
+  RdKafka::ErrorCode err =
+      producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), command.device_id.c_str(), command.device_id.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+  }
   if (err != RdKafka::ERR_NO_ERROR) {
-    outbox.insertOutbox(device, event);
+    // The broker did not take it: the relay publishes the row later, so the audit is late, not wrong.
+    outbox::insert(kTopic, command.device_id, payload);
+    return false;
   }
-  producer->flush(2000);
-}
-
-void accepted(const std::string& device, const std::string& commandId) {
-  publish(device, commandId, "accepted");
-}
-
-void delivered(const std::string& device, const std::string& commandId) {
-  publish(device, commandId, "delivered");
-}
-
-void acknowledged(const std::string& device, const std::string& commandId) {
-  publish(device, commandId, "acknowledged");
-}
-
-void expired(const std::string& device, const std::string& commandId) {
-  publish(device, commandId, "expired");
-}
-
-void consumeHistory(const std::string& group) {
-  std::string err;
-  std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
-  conf->set("bootstrap.servers", "kafka:9092", err);
-  conf->set("group.id", group, err);
-  conf->set("enable.auto.commit", "false", err);
-  std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kCommandTopic});
-  while (true) {
-    std::unique_ptr<RdKafka::Message> msg(consumer->consume(200));
-    if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
-    const std::string text(static_cast<const char*>(msg->payload()), msg->len());
-    const json event = json::parse(text);
-    history.append(event["device_id"].get<std::string>(), event["command_id"].get<std::string>(), event["outcome"].get<std::string>());
-    consumer->commitSync();
-  }
+  return true;
 }
 `,
     },
   },
-  debrief: `The message key is an ordering contract, which is why the fix keys by device: Kafka orders
-within a partition, and the audit needs one device's transitions in sequence, not one fleet's. The
-event shrinks to \`command_id\`, \`device_id\` and \`outcome\` because the topic retains and
-replicates whatever it is given, so a door code written there has the topic's retention.
-\`enable.idempotence\` with \`acks=all\` lets the producer retry a transient broker error without a
-duplicate transition, and the outbox row in the \`KafkaException\` branch is the durable path when
-the broker refuses outright. One \`publish\` serving all four transitions keeps the audit from ending
-at \`accepted\`. A production platform also registers the event shape in a schema registry and
-compacts the topic so the last outcome per command survives retention.`,
+  harness: {
+    python: `import json
+
+TOPIC = "iot.command"
+
+
+def _command(n, device="lock-7"):
+    return {
+        "command_id": f"cmd-{n}",
+        "device_id": device,
+        "action": "unlock",
+        "params": {"pin": "4711"},
+        "state": "pending_ack",
+        "expires_at_ms": 0,
+        "ack_required": True,
+    }
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
+
+
+def check_device_key(ctx):
+    m = ctx.load("events")
+    m.publish_transition(_command(1, "lock-7"), "accepted")
+    m.publish_transition(_command(2, "lock-9"), "accepted")
+    m.publish_transition(_command(1, "lock-7"), "delivered")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three transitions produced {len(records)} records on iot.command (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"lock-7", b"lock-9", b"lock-7"], f"the records are keyed {keys}, expected the device ids lock-7, lock-9, lock-7"
+    assert records[0].partition == records[2].partition, "lock-7's accepted and delivered landed on two partitions: the fleet audit can read delivered before accepted"
+
+
+def check_ids_and_outcomes(ctx):
+    m = ctx.load("events")
+    m.publish_transition(_command(1), "accepted")
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one transition produced {len(records)} records"
+    raw = records[0].value.decode()
+    value = json.loads(raw)
+    assert (value.get("command_id"), value.get("device_id"), value.get("action"), value.get("outcome")) == ("cmd-1", "lock-7", "unlock", "accepted"), f"the event is {raw}, expected command_id, device_id, action and outcome"
+    assert "params" not in value and "4711" not in raw, f"the event carries the command's params ({raw}): the unlock PIN now sits in a retained, replicated topic every consumer group can read"
+
+
+def check_acks_idempotent(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_transition(_command(1), "accepted")
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the transition twice. Enable idempotence"
+    m.publish_transition(_command(1), "delivered")
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost the transition the leader alone had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox_on_failure(ctx):
+    m = ctx.load("events")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_transition(_command(1), "accepted")
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the transition vanishes from the fleet audit"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "lock-7" and rows[0].get("payload", {}).get("command_id") == "cmd-1", f"the outbox row is {rows[0]}, expected the topic, the key lock-7 and the payload"
+    assert ok is False, f"publish_transition returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_transition(_command(2), "accepted")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_transition waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("command_id") == "cmd-2", f"no delivery report within the window and the outbox holds {rows}"
+    assert ok is False, f"publish_transition returned {ok!r} without a delivery report, expected False"
+`,
+    typescript: `const TOPIC = 'iot.command';
+
+const command = (n: number, device = 'lock-7') => ({
+  command_id: \`cmd-\${n}\`,
+  device_id: device,
+  action: 'unlock',
+  params: {pin: '4711'},
+  state: 'pending_ack',
+  expires_at_ms: 0,
+  ack_required: true,
+});
+
+const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+export async function check_device_key(ctx) {
+  const m = ctx.load('events');
+  await m.publishTransition(command(1, 'lock-7'), 'accepted');
+  await m.publishTransition(command(2, 'lock-9'), 'accepted');
+  await m.publishTransition(command(1, 'lock-7'), 'delivered');
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three transitions produced \${records.length} records on iot.command\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['lock-7', 'lock-9', 'lock-7'], \`the records are keyed \${JSON.stringify(keys)}, expected the device ids lock-7, lock-9, lock-7\`);
+  assert.equal(records[0].partition, records[2].partition, "lock-7's accepted and delivered landed on two partitions: the fleet audit can read delivered before accepted");
+}
+
+export async function check_ids_and_outcomes(ctx) {
+  const m = ctx.load('events');
+  await m.publishTransition(command(1), 'accepted');
+  await settle();
+  const values = ctx.kafka.values(TOPIC);
+  assert.equal(values.length, 1, \`one transition produced \${values.length} records\`);
+  const value = JSON.parse(values[0]);
+  assert(value.command_id === 'cmd-1' && value.device_id === 'lock-7' && value.action === 'unlock' && value.outcome === 'accepted', \`the event is \${values[0]}, expected command_id, device_id, action and outcome\`);
+  assert(!('params' in value) && !values[0].includes('4711'), \`the event carries the command's params (\${values[0]}): the unlock PIN now sits in a retained, replicated topic every consumer group can read\`);
+}
+
+export async function check_acks_idempotent(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishTransition(command(1), 'accepted');
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the transition twice. Enable idempotence\`);
+  await m.publishTransition(command(1), 'delivered');
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost the transition the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox_on_failure(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishTransition(command(1), 'accepted');
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the transition vanishes from the fleet audit\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'lock-7' && rows[0].payload?.command_id === 'cmd-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key lock-7 and the payload\`);
+  assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.publishTransition(command(2), 'accepted');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishTransition waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].payload?.command_id === 'cmd-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"iothub/commands"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "iot.command"
+
+func eventsCommand(n int, device string) *commands.Command {
+	return &commands.Command{
+		CommandID: fmt.Sprintf("cmd-%d", n), DeviceID: device, Action: "unlock", Params: map[string]string{"pin": "4711"},
+		State: "pending_ack", AckRequired: true,
+	}
+}
+
+func eventsPublish(ctx *harness.Ctx, c *commands.Command, outcome string) bool {
+	ok, err := publishTransition(context.Background(), c, outcome)
+	ctx.NoError(err, "publishTransition")
+	return ok
+}
+
+type eventsRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func eventsOutbox(ctx *harness.Ctx) []eventsRow {
+	var rows []eventsRow
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		var row eventsRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckDeviceKey(ctx *harness.Ctx) {
+	eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
+	eventsPublish(ctx, eventsCommand(2, "lock-9"), "accepted")
+	eventsPublish(ctx, eventsCommand(1, "lock-7"), "delivered")
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three transitions must produce three records on iot.command; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"lock-7", "lock-9", "lock-7"}, "the records must be keyed by the device ids")
+	ctx.Equal(records[0].Partition, records[2].Partition, "lock-7's accepted and delivered must share a partition, or the fleet audit can read delivered before accepted; the partitions")
+}
+
+func CheckIdsAndOutcomes(ctx *harness.Ctx) {
+	eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
+	ctx.Settle()
+	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 1, "one transition must produce one record; the records")
+	var value map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
+	ctx.Assert(value["command_id"] == "cmd-1" && value["device_id"] == "lock-7" && value["action"] == "unlock" && value["outcome"] == "accepted", "the event is %s, expected command_id, device_id, action and outcome", values[0])
+	_, hasParams := value["params"]
+	ctx.Assert(!hasParams && !strings.Contains(values[0], "4711"), "the event carries the command's params (%s): the unlock PIN now sits in a retained, replicated topic every consumer group can read", values[0])
+}
+
+func CheckAcksIdempotent(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records")
+	eventsPublish(ctx, eventsCommand(1, "lock-7"), "delivered")
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a transition (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
+	ctx.Settle()
+	rows := eventsOutbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition vanishes from the fleet audit; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "lock-7" && rows[0].Payload["command_id"] == "cmd-1", "the outbox row is %v, expected the topic, the key lock-7 and the payload", rows[0])
+	ctx.Equal(ok, false, "publishTransition's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = eventsPublish(ctx, eventsCommand(2, "lock-7"), "accepted")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	rows = eventsOutbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["command_id"] == "cmd-2", "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(ok, false, "publishTransition's result without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "iothub/commands.h"
+
+namespace {
+
+const std::string kEventsTopic = "iot.command";
+
+commands::Command eventsCommand(int n, const std::string& device = "lock-7") {
+  commands::Command c;
+  c.command_id = "cmd-" + std::to_string(n);
+  c.device_id = device;
+  c.action = "unlock";
+  c.params = {{"pin", "4711"}};
+  c.state = "pending_ack";
+  c.ack_required = true;
+  return c;
+}
+
+std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string eventsField(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckDeviceKey(harness::Ctx& ctx) {
+  publishTransition(eventsCommand(1, "lock-7"), "accepted");
+  publishTransition(eventsCommand(2, "lock-9"), "accepted");
+  publishTransition(eventsCommand(1, "lock-7"), "delivered");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three transitions must produce three records on iot.command; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"lock-7", "lock-9", "lock-7"}, "the records must be keyed by the device ids");
+  ctx.Equal(records[0].Partition, records[2].Partition,
+            "lock-7's accepted and delivered must share a partition, or the fleet audit can read delivered before accepted; the partitions");
+}
+
+void CheckIdsAndOutcomes(harness::Ctx& ctx) {
+  publishTransition(eventsCommand(1), "accepted");
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(values.size(), 1, "one transition must produce one record; the records");
+  const auto value = nlohmann::json::parse(values[0], nullptr, false);
+  ctx.Assert(eventsField(value, "command_id") == "cmd-1" && eventsField(value, "device_id") == "lock-7" && eventsField(value, "action") == "unlock" &&
+                 eventsField(value, "outcome") == "accepted",
+             "the event is %s, expected command_id, device_id, action and outcome", values[0]);
+  ctx.Assert(!(value.is_object() && value.contains("params")) && values[0].find("4711") == std::string::npos,
+             "the event carries the command's params (%s): the unlock PIN now sits in a retained, replicated topic every consumer group can read", values[0]);
+}
+
+void CheckAcksIdempotent(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishTransition(eventsCommand(1), "accepted");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+            "after one lost acknowledgement the producer's retry must not write the transition twice (enable.idempotence); the records");
+  publishTransition(eventsCommand(1), "delivered");
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a transition (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishTransition(eventsCommand(1), "accepted");
+  ctx.Settle();
+  auto rows = eventsOutbox(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition vanishes from the fleet audit; the rows");
+  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "lock-7" && rows[0].contains("payload") &&
+                 eventsField(rows[0]["payload"], "command_id") == "cmd-1",
+             "the outbox row is %s, expected the topic, the key lock-7 and the payload", rows[0].dump());
+  ctx.Equal(ok, false, "publishTransition's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = publishTransition(eventsCommand(2), "accepted");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  rows = eventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "command_id") == "cmd-2",
+             "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "publishTransition's result without a delivery report");
+}
+`,
+  },
+  hints: [
+    "Publish `accepted` and then `delivered` for one lock: the two records carry different keys and can land on different partitions. Read one record's value: the PIN is in it.",
+    'The key is the command id, which spreads one device over every partition; the payload copies `params` whole; `acks=1` without idempotence lets a retry duplicate and a failover lose; nothing reads the delivery report, so the call answers `True` whatever the broker did.',
+    '`key=command["device_id"]`; drop `params` from `event_payload`; `enable.idempotence: True` with `acks: all`; produce with `on_delivery`, `flush(ACK_TIMEOUT_S)`, and on an error or a record still in flight `outbox.insert(TOPIC, device_id, payload)` and return `False`.',
+  ],
+  debrief: `The key is an ordering contract: Kafka keeps order within a partition and the audit needs one device's history in order, so the device id is the key and the command id is a field. The topic outlives the request and every consumer group can read it, which is why the event carries ids and the outcome while the parameters stay in the command store. Idempotence and \`acks=all\` cover what a retry and a failover do to the log; the delivery report is what makes \`True\` mean something, and the outbox turns an outage into a delay. Production pipelines write the outbox row in the same transaction as the state change and let a relay publish it, so no transition depends on the broker being up at that moment.`,
 };

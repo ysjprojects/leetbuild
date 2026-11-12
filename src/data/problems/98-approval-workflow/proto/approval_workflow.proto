@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package approvalwf;
+
+// The eligibility service the decision path asks before a decision is recorded: whether the actor
+// is still employed (active), whether they may decide this request (eligible), and whether they
+// have handed their approvals to somebody else (delegated_to, empty when they have not).
+service Eligibility {
+  rpc CheckEligibility(EligibilityRequest) returns (EligibilityReply);
+}
+
+message EligibilityRequest {
+  string actor = 1;
+  string request_id = 2;
+}
+
+message EligibilityReply {
+  bool active = 1;
+  bool eligible = 2;
+  string delegated_to = 3;
+}

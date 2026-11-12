@@ -1,92 +1,101 @@
 import type {Problem} from '@/lib/types';
 
-import {dependencyStep} from './steps/dependency';
-import {endpointStep} from './steps/endpoint';
-import {eventsStep} from './steps/events';
-import {readStep} from './steps/read';
-import {stateStep} from './steps/state';
+import {protoFiles, protoModules} from './proto';
+import {endpointStep} from './steps/1-endpoint';
+import {stateStep} from './steps/2-state';
+import {dependencyStep} from './steps/3-dependency';
+import {eventsStep} from './steps/4-events';
+import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
- * Identity service: the course is not "store a user row", it is the debugging you owe a signup
- * path before it hands accounts to people who never proved they own the address. Normalized,
- * idempotent signup → one atomic Redis claim per identity handle → a gRPC verification call with a
- * deadline and a queued retry → user-keyed lifecycle events with minimal PII published after the
- * commit → a profile read that scopes the owner, the public projection and the audited support
- * path.
+ * Identity service: the course is not "store a user row", it is the debugging you owe a signup path
+ * before it hands out accounts. Canonical handles and an idempotent signup → one atomic Redis claim
+ * per handle → a verification round trip that only a confirmed token completes → user-keyed
+ * lifecycle events with no contact data, produced after the commit → a profile read that decides
+ * per caller what it discloses and what a cache may keep.
  */
 export const identityServiceProblem: Problem = {
   id: 'identity-service',
   title: 'Identity Service',
-  tagline: 'Signup, Redis handle claims, a verification round trip and a profile read with one owner.',
+  tagline: 'Canonical handles, Redis claims, gRPC verification, user-keyed events and a per-caller profile read.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Identity Service
 
-An identity service decides who a person is, whether two signups are the same human, whether an
-address is really theirs, and what the rest of the platform may know about them.
+An identity service decides who a person is to the rest of a platform: whether two signups are one
+human, whether an address really belongs to the account that claims it, and what other services
+and other users may learn about them.
 
 ## The real system
 
-Keycloak, the open source identity provider, lowercases every username and email before it stores
-them, so \`Alice@x.com\` and \`alice@x.com\` are one account and the uniqueness index compares
-canonical forms. Production services go further: phone numbers are canonicalized to E.164,
-uniqueness is an atomic claim per handle rather than a read then a write, verification is a round
-trip under a deadline, lifecycle events carry reason codes rather than contact data, and support
-staff read records only through an audited tool.
+Keycloak, the open source identity provider, stores every username and email lowercased, so
+\`Ada@Example.com\` and \`ada@example.com\` are one account. Some rules belong to the mailbox
+provider instead: Gmail ignores dots in the local part, so \`a.da@gmail.com\` and \`ada@gmail.com\`
+reach one inbox, while other domains make no such promise. Around that canonical form sit an
+atomic uniqueness claim, a verification round trip, lifecycle events and a read that projects
+differently for the owner, the public and support staff.
 
 ## What you build here
 
-One service, **identityd**, with five pieces:
+One service, **identityd**, with five pieces that share one accounts store (\`identityd.accounts\`,
+provided: \`account:{id}\` hashes, signup records, the verification retry queue, the suppression
+list, the audit trail) and one claim store (\`claim_handles\` / \`release_handles\` / \`owner_of\`,
+built in step 2 and provided to the other steps as \`identityd.handles\`):
 
-1. \`POST /v1/users\`: a normalized email (case folding, dot handling for the domain's policy,
-   plus-alias policy) and phone, an \`Idempotency-Key\` so a retried signup returns the original
-   account, and a response that never confirms to an unauthenticated caller whether an address
-   already exists.
-2. A **Redis** claim: one set-if-absent key per handle in a durable namespace, so email and phone
-   each have their own claim, a concurrent signup for one handle loses cleanly, and an aborted
-   signup releases every key it claimed.
-3. A **gRPC** verification client: a 3-second deadline per send, a timeout that queues a retry and
-   leaves the account unverified, a hard bounce that is terminal and suppresses the address, and a
-   verification granted only from the provider's confirmation.
-4. A **Kafka** event path: \`identity.event\` keyed by user id, carrying the event kind and a reason
-   code but no email, phone or name, produced after the account write commits, with an idempotent
-   producer and \`acks=all\`.
-5. \`GET /v1/users/{id}\`: the owner's full record, a public projection with no contact data and
-   always a verification state, and a support path that reads only through an audit record.
+1. \`POST /v1/users\` \`{email, phone, name}\`: canonical email and E.164 phone, an
+   \`Idempotency-Key\` that answers a retry with the first result, one neutral 409.
+2. A **Redis** claim per handle, \`handle:{kind}:{value}\` → user id: one \`SET NX\`, a
+   compare-and-delete release, no expiry.
+3. **gRPC** \`Verification\`: \`SendVerification\` under a 3-second deadline, an outage queued, a hard
+   bounce suppressed, and \`verified\` only from a \`ConfirmVerification\` that says \`confirmed\`.
+4. A **Kafka** \`identity.event\` stream keyed by user id, \`{type, user_id, reason}\`, produced after
+   \`accounts.transition\` commits, by an idempotent producer with \`acks=all\`.
+5. \`GET /v1/users/{id}\`: the whole account for its owner, \`PUBLIC_FIELDS\` for everyone else,
+   support reads only with a reason and an audit record, cache headers that keep contact data out
+   of shared caches.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path. Debug it against the failure modes, fix it, and
-prove the fix with checks that fail on the starter and pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Password and passkey storage, session and token issuance, OAuth and social login, account deletion
-and data export workflows, carrier phone verification, multi-region replication of the account store,
-and admin tooling. The five pieces above are the ones that decide whether identities are unique,
-deliberately verified and minimally exposed.`,
+Passwords and passkeys, sessions and tokens, social login, account deletion and data export,
+carrier phone verification, and multi-region replication of the accounts store. The five pieces
+above decide whether identities are unique, proven and disclosed to the right callers.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Client', sub: 'signup / profile', x: 6, y: 40},
-      {id: 'api', kind: 'http', label: 'identityd', sub: ':8443', x: 28, y: 40},
-      {id: 'redis', kind: 'redis', label: 'Handle claims', sub: 'identity:handle:*', x: 52, y: 8},
-      {id: 'db', kind: 'db', label: 'Accounts', sub: 'users', x: 52, y: 40},
-      {id: 'provider', kind: 'grpc', label: 'Verification provider', sub: ':443', x: 78, y: 8},
-      {id: 'retry', kind: 'service', label: 'Verification queue', sub: 'retry', x: 78, y: 40},
-      {id: 'kafka', kind: 'kafka', label: 'identity.event', sub: 'topic', x: 78, y: 72},
-      {id: 'support', kind: 'external', label: 'Support console', sub: 'audited lookup', x: 28, y: 78},
+      {id: 'client', kind: 'client', label: 'Client', sub: 'signup · profile', x: 6, y: 44},
+      {id: 'api', kind: 'http', label: 'identityd', sub: 'HTTPS :8443', x: 26, y: 44},
+      {id: 'redis', kind: 'redis', label: 'Redis claims', sub: 'handle:{kind}:{value} → user', x: 50, y: 10},
+      {id: 'db', kind: 'db', label: 'accounts store', sub: 'account:{id} · audit · retries', x: 50, y: 44},
+      {id: 'provider', kind: 'grpc', label: 'Verification provider', sub: 'Send · Confirm · 3 s', x: 76, y: 10},
+      {id: 'retry', kind: 'service', label: 'Retry queue', sub: 'verify:retry', x: 76, y: 44},
+      {id: 'kafka', kind: 'kafka', label: 'identity.event', sub: 'key = user id', x: 50, y: 80},
+      {id: 'consumer', kind: 'service', label: 'Platform consumers', sub: 'mailer · risk · search', x: 76, y: 80},
+      {id: 'support', kind: 'external', label: 'Support console', sub: 'X-Support-Reason', x: 6, y: 80},
     ],
     edges: [
-      {from: 'client', to: 'api', kind: 'http', label: 'POST /v1/users'},
-      {from: 'client', to: 'api', kind: 'http', label: 'GET /v1/users/{id}'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'SET NX handle'},
-      {from: 'api', to: 'db', kind: 'plain', label: 'commit account'},
-      {from: 'api', to: 'provider', kind: 'grpc', label: 'SendVerification'},
-      {from: 'api', to: 'retry', kind: 'plain', label: 'queue on timeout'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'publish after commit'},
+      {from: 'client', to: 'api', kind: 'http', label: 'POST /v1/users · GET /v1/users/{id}'},
       {from: 'support', to: 'api', kind: 'http', label: 'audited read'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'claim_handles · SET NX'},
+      {from: 'api', to: 'db', kind: 'plain', label: 'create · transition · record_audit'},
+      {from: 'api', to: 'provider', kind: 'grpc', label: 'SendVerification · ConfirmVerification'},
+      {from: 'api', to: 'retry', kind: 'plain', label: 'queue on outage'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce after the commit'},
+      {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

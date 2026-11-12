@@ -8,56 +8,66 @@ export const endpointStep: Step = {
   focus: ['client', 'api', 'catalog', 'store'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/roles/assignments\` with body
-\`{"subject": "user:ada", "role": "team_admin", "scope": "team:eng"}\` and the \`X-Assigner-Id\`
-header, checks that the assigner holds an admin role somewhere, writes the assignment and answers
-\`200\`. It compiles, serves the demo, and hides 4 flaws.
+**Starting point.** The starter serves \`POST /v1/roles/assignments\` with body
+\`{"subject": "cyd", "role": "viewer", "scope": "team:eng"}\` and the \`X-Assigner-Id\` header (401
+when missing). It answers 403 unless the assigner holds \`org_admin\` or \`team_admin\` somewhere,
+then writes the grant with \`grants.add\` and answers \`201\` with it. It serves the demo and hides
+three flaws.
 
-**Failure mode the checks target.** "Is this caller an admin?" is not "does this caller hold what
-they are handing out?", which is how a team admin grants \`org_admin\` at \`org\`. Any scope string
-is accepted, so a grant can land on \`*\`. An un-keyed endpoint re-grants on every retry.
+**Failure mode the checks target.** A team admin grants \`org_admin\` at \`org\`; a grant lands on
+\`scope: "*"\`, a scope no role defines; and a client that times out and retries gets a second grant.
 
-- A missing or empty \`X-Assigner-Id\` is **401**; \`subject\`, \`role\` and \`scope\` are required
-  (**400**).
-- **No escalation.** The assigner must already hold **every** permission the role confers, at a
-  scope covering the target. Compare permission sets, not role names. Otherwise **403** with
-  \`{"error": "insufficient_permissions", "missing_permission": "org:write"}\`.
-- **Scope containment.** \`org\` covers everything, a team covers a project inside it, and a narrow
-  holding does not authorize a broader grant.
-- **The catalog decides.** \`role\` must exist in the catalog and \`scope\` must be of a kind it
-  allows for that role, otherwise **422**. \`scope: "*"\` is **422**.
-- **Idempotency.** \`Idempotency-Key\` is required (**400**). A replay of the same
-  \`(Idempotency-Key, subject, role, scope)\` returns the stored assignment, writing nothing.
-- Log the assignment id with subject, role, scope and assigner, ids only.`,
+- **The catalog decides.** \`role\` must be in \`catalog.ROLES\` and
+  \`catalog.scope_kind(scope)\` one of its \`scope_kinds\`, otherwise **422**.
+- **No escalation.** The assigner must hold \`roles:assign\` and every permission in
+  \`catalog.permissions_of(role)\` at the target scope (\`grants.effective(assigner, scope)\`, which
+  applies \`catalog.covers\`). The first one missing is **403** with
+  \`{"error": "insufficient_permissions", "missing_permission": "code:write"}\`.
+- **Idempotency.** \`Idempotency-Key\` is required (**400**). Look \`(assigner, key)\` up with
+  \`grants.assignment\` before writing and answer the recorded grant on a replay; record a new one
+  with \`grants.record_assignment\`.`,
   sequence: {
     participants: ['Client', 'Permission Service', 'Role catalog', 'Grant store'],
     messages: [
-      {from: 'Client', to: 'Permission Service', label: 'POST /v1/roles/assignments · X-Assigner-Id', kind: 'sync'},
-      {from: 'Permission Service', to: 'Permission Service', label: 'validate ids · Idempotency-Key', kind: 'sync'},
-      {from: 'Permission Service', to: 'Role catalog', label: 'role → permissions · scope kinds', kind: 'sync'},
-      {from: 'Role catalog', to: 'Permission Service', label: 'catalog entry / none', kind: 'reply'},
-      {from: 'Permission Service', to: 'Grant store', label: 'holdings(assigner)', kind: 'sync'},
-      {from: 'Grant store', to: 'Permission Service', label: 'scope → permissions', kind: 'reply'},
+      {
+        from: 'Client',
+        to: 'Permission Service',
+        label: 'POST /v1/roles/assignments · X-Assigner-Id · Idempotency-Key',
+        kind: 'sync',
+      },
+      {
+        from: 'Permission Service',
+        to: 'Grant store',
+        label: 'assignment(assigner, key) → recorded / none',
+        kind: 'sync',
+      },
+      {from: 'Permission Service', to: 'Role catalog', label: 'ROLES[role] · scope_kind(scope) → 422', kind: 'sync'},
+      {from: 'Permission Service', to: 'Grant store', label: 'effective(assigner, scope)', kind: 'sync'},
       {
         from: 'Permission Service',
         to: 'Permission Service',
-        label: 'every permission covered by a covering scope?',
+        label: 'roles:assign + permissions_of(role) all held? → 403 missing_permission',
         kind: 'sync',
       },
-      {from: 'Permission Service', to: 'Grant store', label: 'put(key, assignment)', kind: 'async'},
-      {from: 'Permission Service', to: 'Client', label: '200 assignment · 403 missing_permission · 422', kind: 'reply'},
+      {
+        from: 'Permission Service',
+        to: 'Grant store',
+        label: 'add · record_assignment(assigner, key, grant)',
+        kind: 'sync',
+      },
+      {
+        from: 'Permission Service',
+        to: 'Client',
+        label: '201 {grant_id, subject, role, scope, assigner}',
+        kind: 'reply',
+      },
     ],
   },
-  hints: [
-    'A team admin at `team:eng` posts `role: org_admin, scope: "*"` and gets `200`. Retrying the same request after a timeout grants it a second time.',
-    'The starter asks `store.admin_roles(assigner)` and accepts any admin role anywhere, so the target role and scope are not compared with anything the assigner holds. The catalog and `Idempotency-Key` are not read.',
-    'Look up `ROLE_CATALOG[role]` (422 on miss or a disallowed scope kind), compare its permissions with `store.holdings(assigner)` under `scope_covers` using `SCOPE_RANK` (403 naming the first gap), then `store.assignment(key, …)` before `store.put`.',
-  ],
   checks: [
     {
       id: 'route',
-      title: 'Handles POST /v1/roles/assignments',
-      detail: 'Register the assignment route on `POST /v1/roles/assignments` with the `X-Assigner-Id` header.',
+      title: 'Registers POST /v1/roles/assignments',
+      detail: 'Register `POST /v1/roles/assignments`; an assignment an org admin makes answers 201 with the grant.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/roles\/assignments["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/roles\/assignments['"]/]},
@@ -68,68 +78,71 @@ is accepted, so a grant can land on \`*\`. An un-keyed endpoint re-grants on eve
     },
     {
       id: 'catalog',
-      title: 'Validates role and scope against the catalog with 422',
+      title: 'Validates the role and the scope kind against the catalog with 422',
       detail:
-        '`role` must exist in the role catalog and `scope` must have a kind the catalog allows for it, else **422**. The starter never opens the catalog, so it accepts `scope: "*"` — a scope no policy defines.',
+        'The role is looked up in the catalog and the scope kind must be one the catalog allows for it, else **422**; the starter writes whatever role and scope it is sent, `"*"` included.',
       match: {
-        python: {all: [/ROLE_CATALOG/, /status_code\s*=\s*422/]},
-        typescript: {all: [/ROLE_CATALOG/, /code\(\s*422\s*\)/]},
-        go: {all: [/roleCatalog/, /StatusUnprocessableEntity/]},
-        scala: {all: [/RoleCatalog/, /StatusCodes\.UnprocessableEntity/]},
-        cpp: {all: [/kRoleCatalog/, /\b422\b/]},
+        python: {all: [/catalog\.ROLES\b/, /catalog\.scope_kind\(/, /\b422\b/]},
+        typescript: {all: [/ROLES\[/, /scopeKind\(/, /\b422\b/]},
+        go: {all: [/catalog\.Roles\[/, /catalog\.ScopeKind\(/, /StatusUnprocessableEntity|\b422\b/]},
+        scala: {all: [/Catalog\.Roles\.get\(|Catalog\.Roles\(/, /Catalog\.scopeKind\(/, /UnprocessableEntity|\b422\b/]},
+        cpp: {all: [/catalog::kRoles\.find\(|catalog::kRoles\.at\(/, /catalog::scopeKind\(/, /\b422\b/]},
       },
     },
     {
       id: 'no-escalation',
       title: 'Refuses a grant that exceeds the assigner, naming the permission',
       detail:
-        'Every permission the role confers must already be held by the assigner at a covering scope; the first one that is not is **403** and named as `missing_permission` in the body. The starter only checks that the assigner is an admin somewhere, so a team admin can grant `org_admin` at `org`.',
+        'The assigner must hold `roles:assign` and every permission of the role at the target scope (`effective`, scope containment included); the first gap is **403** naming `missing_permission`. The starter only asks whether the assigner is an admin somewhere.',
       match: {
-        python: {all: [/status_code\s*=\s*403/, /missing_permission/]},
-        typescript: {all: [/code\(\s*403\s*\)/, /missing_permission/]},
-        go: {all: [/StatusForbidden/, /missing_permission/]},
-        scala: {all: [/StatusCodes\.Forbidden/, /missing_permission/]},
-        cpp: {all: [/\b403\b/, /missing_permission/]},
-      },
-    },
-    {
-      id: 'scope-containment',
-      title: 'Compares scopes by containment, not by string equality',
-      detail:
-        'A holding covers the target scope only when it is the same scope, `org`, or a broader kind; a holding at a narrow scope never authorizes a wider grant. The starter compares nothing. Both a `scope_covers`/`scopeCovers` helper and the rank table must be present.',
-      match: {
-        python: {all: [/def scope_covers\(/, /SCOPE_RANK/]},
-        typescript: {all: [/function scopeCovers\(/, /SCOPE_RANK/]},
-        go: {all: [/func scopeCovers\(/, /scopeRank/]},
-        scala: {all: [/def scopeCovers\(/, /ScopeRank/]},
-        cpp: {all: [/scopeCovers\(/, /kScopeRank/]},
+        python: {all: [/grants\.effective\(/, /catalog\.permissions_of\(/, /roles:assign/, /missing_permission/]},
+        typescript: {all: [/\beffective\(/, /permissionsOf\(/, /roles:assign/, /missing_permission/]},
+        go: {all: [/grants\.Effective\(/, /catalog\.PermissionsOf\(/, /roles:assign/, /missing_permission/]},
+        scala: {all: [/Grants\.effective\(/, /Catalog\.permissionsOf\(/, /roles:assign/, /missing_permission/]},
+        cpp: {all: [/grants::effective\(/, /catalog::permissionsOf\(/, /roles:assign/, /missing_permission/]},
       },
     },
     {
       id: 'idempotent',
-      title: 'Replays an assignment instead of granting twice',
+      title: 'Answers a retried assignment with the recorded grant',
       detail:
-        '`Idempotency-Key` is required and the assignment is stored under `(key, subject, role, scope)`; a replay returns the stored assignment instead of writing again. The starter ignores the header entirely.',
+        '`Idempotency-Key` is required (400) and `(assigner, key)` is looked up (`assignment`) before the grant is written; a replay answers the recorded grant and a new assignment is recorded (`record_assignment`/`recordAssignment`).',
       match: {
-        python: {all: [/Idempotency-Key/, /store\.assignment\(/, /store\.put\(/]},
-        typescript: {all: [/Idempotency-Key/, /store\.assignment\(/, /store\.put\(/]},
-        go: {all: [/Idempotency-Key/, /store\.Assignment\(/, /store\.Put\(/]},
-        scala: {all: [/Idempotency-Key/, /store\.assignment\(/, /store\.put\(/]},
-        cpp: {all: [/Idempotency-Key/, /store\.assignment\(/, /store\.put\(/]},
+        python: {
+          all: [/idempotency-key/i, /grants\.assignment\(/, /grants\.record_assignment\(/, /\b400\b/],
+          order: [/grants\.assignment\(/, /grants\.add\(/],
+        },
+        typescript: {
+          all: [/idempotency-key/i, /\bassignment\(/, /recordAssignment\(/, /\b400\b/],
+          order: [/\bassignment\(/, /\badd\(/],
+        },
+        go: {
+          all: [/Idempotency-Key/i, /grants\.Assignment\(/, /grants\.RecordAssignment\(/, /StatusBadRequest|\b400\b/],
+          order: [/grants\.Assignment\(/, /grants\.Add\(/],
+        },
+        scala: {
+          all: [/Idempotency-Key/i, /Grants\.assignment\(/, /Grants\.recordAssignment\(/, /BadRequest|\b400\b/],
+          order: [/Grants\.assignment\(/, /Grants\.add\(/],
+        },
+        cpp: {
+          all: [/Idempotency-Key/i, /grants::assignment\(/, /grants::recordAssignment\(/, /\b400\b/],
+          order: [/grants::assignment\(/, /grants::add\(/],
+        },
       },
     },
   ],
   code: {
     python: {
-      starter: `"""POST /v1/roles/assignments: assign a role to a subject at a scope."""
-import logging
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from permz import catalog  # ROLES, scope_kind, covers, permissions_of
+from permz import grants  # grants_of, effective, add, assignment, record_assignment
+
 app = FastAPI()
-logger = logging.getLogger("permissions")
+
+ADMIN_ROLES = ("org_admin", "team_admin")
 
 
 class Assignment(BaseModel):
@@ -138,47 +151,24 @@ class Assignment(BaseModel):
     scope: str
 
 
-class GrantStore:
-    def admin_roles(self, subject: str) -> set[str]:
-        """Roles the subject holds at any scope — used here as a rough admin check."""
-        raise NotImplementedError
-
-    def put(self, assignment: dict) -> None:
-        """Persist the assignment."""
-        raise NotImplementedError
-
-
-store = GrantStore()
-
-
-@app.post("/v1/roles/assignments")
-def assign(body: Assignment, assigner: str = Header(alias="X-Assigner-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    roles = store.admin_roles(assigner)
-    if "org_admin" not in roles and "team_admin" not in roles:
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-    assignment = {"subject": body.subject, "role": body.role, "scope": body.scope}
-    store.put(assignment)
-    logger.info("assigned subject=%s role=%s scope=%s", body.subject, body.role, body.scope)
-    return JSONResponse(assignment, status_code=200)
+@app.post("/v1/roles/assignments", status_code=201)
+def assign(body: Assignment, request: Request):
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    assigner = request.headers.get("x-assigner-id", "")
+    if not assigner:
+        return JSONResponse({"error": "X-Assigner-Id is required"}, status_code=401)
+    if not any(grant["role"] in ADMIN_ROLES for grant in grants.grants_of(assigner)):
+        return JSONResponse({"error": "insufficient_permissions"}, status_code=403)
+    return grants.add(body.subject, body.role, body.scope, assigner)
 `,
-      solution: `"""POST /v1/roles/assignments: no escalation, catalog-validated scopes, idempotent replay."""
-import logging
-import uuid
-
-from fastapi import FastAPI, Header, HTTPException
+      solution: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("permissions")
+from permz import catalog  # ROLES, scope_kind, covers, permissions_of
+from permz import grants  # grants_of, effective, add, assignment, record_assignment
 
-ROLE_CATALOG = {
-    "org_admin": {"scope_kinds": {"org"}, "permissions": {"org:read", "org:write", "roles:assign"}},
-    "team_admin": {"scope_kinds": {"team", "project"}, "permissions": {"team:read", "team:write", "members:invite"}},
-    "viewer": {"scope_kinds": {"team", "project"}, "permissions": {"team:read"}},
-}
-SCOPE_RANK = {"org": 0, "team": 1, "project": 2}
+app = FastAPI()
 
 
 class Assignment(BaseModel):
@@ -187,105 +177,39 @@ class Assignment(BaseModel):
     scope: str
 
 
-class GrantStore:
-    def holdings(self, subject: str) -> dict[str, set[str]]:
-        """scope → the permissions the subject holds there."""
-        raise NotImplementedError
-
-    def assignment(self, key: str) -> dict | None:
-        """The assignment stored under the idempotency key, if any."""
-        raise NotImplementedError
-
-    def put(self, key: str, assignment: dict) -> None:
-        """Persist the assignment under the idempotency key."""
-        raise NotImplementedError
-
-
-store = GrantStore()
-
-
-def scope_kind(scope: str) -> str:
-    return scope.split(":", 1)[0]
-
-
-def scope_covers(held: str, target: str) -> bool:
-    """A grant held at \`held\` authorizes an assignment at \`target\`."""
-    if held == target or held == "org":
-        return True
-    held_rank = SCOPE_RANK.get(scope_kind(held))
-    target_rank = SCOPE_RANK.get(scope_kind(target))
-    if held_rank is None or target_rank is None:
-        return False
-    return held_rank < target_rank
-
-
-def missing_permission(assigner: str, role: str, scope: str) -> str | None:
-    """The first permission the role confers that the assigner does not hold at a covering scope."""
-    held = store.holdings(assigner)
-    for permission in sorted(ROLE_CATALOG[role]["permissions"]):
-        covered = any(
-            permission in permissions and scope_covers(held_scope, scope) for held_scope, permissions in held.items()
-        )
-        if not covered:
-            return permission
-    return None
-
-
-@app.post("/v1/roles/assignments")
-def assign(
-    body: Assignment,
-    assigner: str | None = Header(default=None, alias="X-Assigner-Id"),
-    idem_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> JSONResponse:
-    if assigner is None or assigner == "":
-        raise HTTPException(status_code=401, detail="missing X-Assigner-Id")
-    if idem_key is None or idem_key == "":
-        raise HTTPException(status_code=400, detail="Idempotency-Key is required")
-    if body.subject == "" or body.role == "" or body.scope == "":
-        raise HTTPException(status_code=400, detail="subject, role and scope are required")
-
-    entry = ROLE_CATALOG.get(body.role)
-    if entry is None:
-        raise HTTPException(status_code=422, detail=f"unknown role {body.role}")
-    if scope_kind(body.scope) not in entry["scope_kinds"]:
-        raise HTTPException(status_code=422, detail=f"scope {body.scope} is outside the catalog for {body.role}")
-
-    key = f"{idem_key}:{body.role}:{body.subject}:{body.scope}"
-    stored = store.assignment(key)
-    if stored is not None:
-        return JSONResponse(stored, status_code=200)
-
-    missing = missing_permission(assigner, body.role, body.scope)
-    if missing is not None:
-        raise HTTPException(
-            status_code=403,
-            detail={"error": "insufficient_permissions", "missing_permission": missing, "scope": body.scope},
-        )
-
-    assignment = {
-        "id": str(uuid.uuid4()),
-        "subject": body.subject,
-        "role": body.role,
-        "scope": body.scope,
-        "assigner": assigner,
-    }
-    store.put(key, assignment)
-    logger.info(
-        "assigned id=%s subject=%s role=%s scope=%s assigner=%s",
-        assignment["id"],
-        body.subject,
-        body.role,
-        body.scope,
-        assigner,
-    )
-    return JSONResponse(assignment, status_code=200)
+@app.post("/v1/roles/assignments", status_code=201)
+def assign(body: Assignment, request: Request):
+    assigner = request.headers.get("x-assigner-id", "")
+    if not assigner:
+        return JSONResponse({"error": "X-Assigner-Id is required"}, status_code=401)
+    key = request.headers.get("idempotency-key", "")
+    if not key:
+        return JSONResponse({"error": "Idempotency-Key is required"}, status_code=400)
+    recorded = grants.assignment(assigner, key)
+    if recorded is not None:
+        return recorded  # a replay answers what the first attempt answered
+    role = catalog.ROLES.get(body.role)
+    if role is None or catalog.scope_kind(body.scope) not in role["scope_kinds"]:
+        return JSONResponse({"error": "not in the role catalog", "role": body.role, "scope": body.scope}, status_code=422)
+    # Hand out only what the assigner holds at the target scope: the right to assign, and every permission of the role.
+    held = grants.effective(assigner, body.scope)
+    for permission in ["roles:assign", *catalog.permissions_of(body.role)]:
+        if permission not in held:
+            return JSONResponse({"error": "insufficient_permissions", "missing_permission": permission}, status_code=403)
+    grant = grants.add(body.subject, body.role, body.scope, assigner)
+    grants.record_assignment(assigner, key, grant)
+    return grant
 `,
     },
     typescript: {
-      starter: `/** POST /v1/roles/assignments: assign a role to a subject at a scope. */
-import Fastify from 'fastify';
+      starter: `import Fastify from 'fastify';
+
+import {ROLES, permissionsOf, scopeKind} from 'permz/catalog';
+import {add, assignment, effective, grantsOf, recordAssignment} from 'permz/grants';
 
 export const app = Fastify();
+
+const ADMIN_ROLES = ['org_admin', 'team_admin'];
 
 interface AssignmentBody {
   subject: string;
@@ -293,48 +217,22 @@ interface AssignmentBody {
   scope: string;
 }
 
-export interface GrantStore {
-  adminRoles(subject: string): Promise<string[]>;
-  put(assignment: Record<string, string>): Promise<void>;
-}
-
-export const store: GrantStore = {
-  async adminRoles() {
-    throw new Error('not wired');
-  },
-  async put() {
-    throw new Error('not wired');
-  },
-};
-
 app.post('/v1/roles/assignments', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const assigner = request.headers['x-assigner-id'] as string;
-  const body = request.body as AssignmentBody;
-  const roles = await store.adminRoles(assigner);
-  if (!roles.includes('org_admin') && !roles.includes('team_admin'))
-    return reply.code(403).send({error: 'forbidden'});
-  const assignment = {subject: body.subject, role: body.role, scope: body.scope};
-  await store.put(assignment);
-  request.log.info({subject: body.subject, role: body.role, scope: body.scope}, 'assigned');
-  return reply.code(200).send(assignment);
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const assigner = request.headers['x-assigner-id'];
+  if (typeof assigner !== 'string' || assigner === '') return reply.code(401).send({error: 'X-Assigner-Id is required'});
+  const {subject, role, scope} = request.body as AssignmentBody;
+  const held = await grantsOf(assigner);
+  if (!held.some(grant => ADMIN_ROLES.includes(grant.role))) return reply.code(403).send({error: 'insufficient_permissions'});
+  return reply.code(201).send(await add(subject, role, scope, assigner));
 });
-
-void app.listen({port: 8444, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/roles/assignments: no escalation, catalog-validated scopes, idempotent replay. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {ROLES, permissionsOf, scopeKind} from 'permz/catalog';
+import {add, assignment, effective, grantsOf, recordAssignment} from 'permz/grants';
 
 export const app = Fastify();
-
-const ROLE_CATALOG: Record<string, {scope_kinds: string[]; permissions: string[]}> = {
-  org_admin: {scope_kinds: ['org'], permissions: ['org:read', 'org:write', 'roles:assign']},
-  team_admin: {scope_kinds: ['team', 'project'], permissions: ['team:read', 'team:write', 'members:invite']},
-  viewer: {scope_kinds: ['team', 'project'], permissions: ['team:read']},
-};
-const SCOPE_RANK: Record<string, number> = {org: 0, team: 1, project: 2};
 
 interface AssignmentBody {
   subject: string;
@@ -342,473 +240,240 @@ interface AssignmentBody {
   scope: string;
 }
 
-interface Holding {
-  scope: string;
-  permissions: string[];
-}
-
-interface Assignment {
-  id: string;
-  subject: string;
-  role: string;
-  scope: string;
-  assigner: string;
-}
-
-export interface GrantStore {
-  holdings(subject: string): Promise<Holding[]>;
-  assignment(key: string): Promise<Assignment | null>;
-  put(key: string, assignment: Assignment): Promise<void>;
-}
-
-export const store: GrantStore = {
-  async holdings() {
-    throw new Error('not wired');
-  },
-  async assignment() {
-    throw new Error('not wired');
-  },
-  async put() {
-    throw new Error('not wired');
-  },
-};
-
-const scopeKind = (scope: string): string => scope.split(':', 1)[0];
-
-/** A grant held at \`held\` authorizes an assignment at \`target\`: same scope, org, or a broader kind. */
-function scopeCovers(held: string, target: string): boolean {
-  if (held === target || held === 'org') return true;
-  const heldRank = SCOPE_RANK[scopeKind(held)];
-  const targetRank = SCOPE_RANK[scopeKind(target)];
-  if (heldRank === undefined || targetRank === undefined) return false;
-  return heldRank < targetRank;
-}
-
-/** The first permission the role confers that the assigner does not hold at a covering scope. */
-function missingPermission(held: Holding[], role: string, scope: string): string | null {
-  for (const permission of [...ROLE_CATALOG[role].permissions].sort()) {
-    const covered = held.some(h => h.permissions.includes(permission) && scopeCovers(h.scope, scope));
-    if (!covered) return permission;
-  }
-  return null;
-}
-
 app.post('/v1/roles/assignments', async (request, reply) => {
-  const assigner = request.headers['X-Assigner-Id'];
-  if (typeof assigner !== 'string' || assigner === '') return reply.code(401).send({error: 'missing X-Assigner-Id'});
-  const idemKey = request.headers['Idempotency-Key'];
-  if (typeof idemKey !== 'string' || idemKey === '')
-    return reply.code(400).send({error: 'Idempotency-Key is required'});
-
-  const body = request.body as Partial<AssignmentBody> | null;
-  if (body === null || typeof body !== 'object' || !body.subject || !body.role || !body.scope)
-    return reply.code(400).send({error: 'subject, role and scope are required'});
-
-  const entry = ROLE_CATALOG[body.role];
-  if (entry === undefined) return reply.code(422).send({error: \`unknown role \${body.role}\`});
-  if (!entry.scope_kinds.includes(scopeKind(body.scope)))
-    return reply.code(422).send({error: \`scope \${body.scope} is outside the catalog for \${body.role}\`});
-
-  const key = \`\${idemKey}:\${body.role}:\${body.subject}:\${body.scope}\`;
-  const stored = await store.assignment(key);
-  if (stored !== null) return reply.code(200).send(stored);
-
-  const missing = missingPermission(await store.holdings(assigner), body.role, body.scope);
-  if (missing !== null)
-    return reply.code(403).send({error: 'insufficient_permissions', missing_permission: missing, scope: body.scope});
-
-  const assignment: Assignment = {
-    id: randomUUID(),
-    subject: body.subject,
-    role: body.role,
-    scope: body.scope,
-    assigner,
-  };
-  await store.put(key, assignment);
-  request.log.info(
-    {id: assignment.id, subject: body.subject, role: body.role, scope: body.scope, assigner},
-    'assigned',
-  );
-  return reply.code(200).send(assignment);
+  const assigner = request.headers['x-assigner-id'];
+  if (typeof assigner !== 'string' || assigner === '') return reply.code(401).send({error: 'X-Assigner-Id is required'});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key is required'});
+  const recorded = await assignment(assigner, key);
+  if (recorded !== null) return reply.code(201).send(recorded); // a replay answers what the first attempt answered
+  const {subject, role, scope} = request.body as AssignmentBody;
+  const entry = Object.hasOwn(ROLES, role) ? ROLES[role] : undefined;
+  if (entry === undefined || !entry.scope_kinds.includes(scopeKind(scope))) {
+    return reply.code(422).send({error: 'not in the role catalog', role, scope});
+  }
+  // Hand out only what the assigner holds at the target scope: the right to assign, and every permission of the role.
+  const held = await effective(assigner, scope);
+  const missing = ['roles:assign', ...permissionsOf(role)].find(permission => !held.includes(permission));
+  if (missing !== undefined) return reply.code(403).send({error: 'insufficient_permissions', missing_permission: missing});
+  const grant = await add(subject, role, scope, assigner);
+  await recordAssignment(assigner, key, grant);
+  return reply.code(201).send(grant);
 });
-
-void app.listen({port: 8444, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+
+	"permz/grants" // grants.GrantsOf, Effective, Add, Assignment, RecordAssignment; catalog: permz/catalog
 )
 
-type AssignmentRequest struct {
+var adminRoles = map[string]bool{"org_admin": true, "team_admin": true}
+
+type assignmentBody struct {
 	Subject string \`json:"subject"\`
 	Role    string \`json:"role"\`
 	Scope   string \`json:"scope"\`
 }
 
-type GrantStore struct{}
-
-func (s *GrantStore) AdminRoles(ctx context.Context, subject string) ([]string, error) {
-	return nil, nil
-}
-
-func (s *GrantStore) Put(ctx context.Context, assignment map[string]any) error { return nil }
-
-var store = &GrantStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func assign(rw http.ResponseWriter, r *http.Request) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
 	assigner := r.Header.Get("X-Assigner-Id")
-	var body AssignmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if assigner == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Assigner-Id is required"})
 		return
 	}
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	roles, _ := store.AdminRoles(r.Context(), assigner)
+	var body assignmentBody
+	json.NewDecoder(r.Body).Decode(&body)
 	admin := false
-	for _, role := range roles {
-		if role == "org_admin" || role == "team_admin" {
-			admin = true
-		}
+	for _, g := range grants.GrantsOf(r.Context(), assigner) {
+		admin = admin || adminRoles[g.Role]
 	}
 	if !admin {
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "insufficient_permissions"})
 		return
 	}
-	assignment := map[string]any{"subject": body.Subject, "role": body.Role, "scope": body.Scope}
-	_ = store.Put(r.Context(), assignment)
-	log.Printf("assigned subject=%s role=%s scope=%s", body.Subject, body.Role, body.Scope)
-	writeJSON(rw, http.StatusOK, assignment)
+	writeJSON(rw, http.StatusCreated, grants.Add(r.Context(), body.Subject, body.Role, body.Scope, assigner))
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/roles/assignments", assign)
-	log.Fatal(http.ListenAndServeTLS(":8444", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
-	"sort"
 
-	"github.com/google/uuid"
+	"permz/catalog" // catalog.Roles, ScopeKind, Covers, PermissionsOf
+	"permz/grants"  // grants.GrantsOf, Effective, Add, Assignment, RecordAssignment
 )
 
-var roleCatalog = map[string]struct {
-	ScopeKinds  []string
-	Permissions []string
-}{
-	"org_admin":  {[]string{"org"}, []string{"org:read", "org:write", "roles:assign"}},
-	"team_admin": {[]string{"team", "project"}, []string{"team:read", "team:write", "members:invite"}},
-	"viewer":     {[]string{"team", "project"}, []string{"team:read"}},
-}
-
-var scopeRank = map[string]int{"org": 0, "team": 1, "project": 2}
-
-type AssignmentRequest struct {
+type assignmentBody struct {
 	Subject string \`json:"subject"\`
 	Role    string \`json:"role"\`
 	Scope   string \`json:"scope"\`
 }
 
-type GrantStore struct{}
-
-func (s *GrantStore) Holdings(ctx context.Context, subject string) (map[string][]string, error) {
-	return nil, nil
-}
-
-func (s *GrantStore) Assignment(ctx context.Context, key string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *GrantStore) Put(ctx context.Context, key string, assignment map[string]any) error { return nil }
-
-var store = &GrantStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func scopeKind(scope string) string {
-	for i, c := range scope {
-		if c == ':' {
-			return scope[:i]
+// allowedAt reports whether the catalog lets role be granted at a scope of this kind.
+func allowedAt(role catalog.Role, kind string) bool {
+	for _, k := range role.ScopeKinds {
+		if k == kind {
+			return true
 		}
 	}
-	return scope
-}
-
-// scopeCovers reports whether a grant held at held authorizes an assignment at target.
-func scopeCovers(held, target string) bool {
-	if held == target || held == "org" {
-		return true
-	}
-	heldRank, heldOK := scopeRank[scopeKind(held)]
-	targetRank, targetOK := scopeRank[scopeKind(target)]
-	if !heldOK || !targetOK {
-		return false
-	}
-	return heldRank < targetRank
-}
-
-// missingPermission is the first permission of role the assigner does not hold at a covering scope.
-func missingPermission(held map[string][]string, role, scope string) string {
-	permissions := append([]string(nil), roleCatalog[role].Permissions...)
-	sort.Strings(permissions)
-	for _, permission := range permissions {
-		covered := false
-		for heldScope, heldPermissions := range held {
-			if !scopeCovers(heldScope, scope) {
-				continue
-			}
-			for _, p := range heldPermissions {
-				if p == permission {
-					covered = true
-				}
-			}
-		}
-		if !covered {
-			return permission
-		}
-	}
-	return ""
+	return false
 }
 
 func assign(rw http.ResponseWriter, r *http.Request) {
 	assigner := r.Header.Get("X-Assigner-Id")
 	if assigner == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Assigner-Id"})
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Assigner-Id is required"})
 		return
 	}
-	idemKey := r.Header.Get("Idempotency-Key")
-	if idemKey == "" {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
 		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "Idempotency-Key is required"})
 		return
 	}
-	var body AssignmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	if recorded := grants.Assignment(r.Context(), assigner, key); recorded != nil {
+		writeJSON(rw, http.StatusCreated, recorded) // a replay answers what the first attempt answered
 		return
 	}
-	if body.Subject == "" || body.Role == "" || body.Scope == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "subject, role and scope are required"})
+	var body assignmentBody
+	json.NewDecoder(r.Body).Decode(&body)
+	role, known := catalog.Roles[body.Role]
+	if !known || !allowedAt(role, catalog.ScopeKind(body.Scope)) {
+		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "not in the role catalog", "role": body.Role, "scope": body.Scope})
 		return
 	}
-	entry, ok := roleCatalog[body.Role]
-	if !ok {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "unknown role"})
-		return
+	// Hand out only what the assigner holds at the target scope: the right to assign, and every permission of the role.
+	held := map[string]bool{}
+	for _, p := range grants.Effective(r.Context(), assigner, body.Scope) {
+		held[p] = true
 	}
-	allowed := false
-	for _, kind := range entry.ScopeKinds {
-		if kind == scopeKind(body.Scope) {
-			allowed = true
+	for _, p := range append([]string{"roles:assign"}, catalog.PermissionsOf(body.Role)...) {
+		if !held[p] {
+			writeJSON(rw, http.StatusForbidden, map[string]string{"error": "insufficient_permissions", "missing_permission": p})
+			return
 		}
 	}
-	if !allowed {
-		writeJSON(rw, http.StatusUnprocessableEntity, map[string]string{"error": "scope is outside the catalog"})
-		return
-	}
-	key := idemKey + ":" + body.Role + ":" + body.Subject + ":" + body.Scope
-	if stored, err := store.Assignment(r.Context(), key); err == nil && stored != nil {
-		writeJSON(rw, http.StatusOK, stored)
-		return
-	}
-	held, err := store.Holdings(r.Context(), assigner)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if missing := missingPermission(held, body.Role, body.Scope); missing != "" {
-		writeJSON(rw, http.StatusForbidden, map[string]any{
-			"error":              "insufficient_permissions",
-			"missing_permission": missing,
-			"scope":              body.Scope,
-		})
-		return
-	}
-	assignment := map[string]any{
-		"id":       uuid.NewString(),
-		"subject":  body.Subject,
-		"role":     body.Role,
-		"scope":    body.Scope,
-		"assigner": assigner,
-	}
-	if err := store.Put(r.Context(), key, assignment); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("assigned id=%s subject=%s role=%s scope=%s assigner=%s",
-		assignment["id"], body.Subject, body.Role, body.Scope, assigner)
-	writeJSON(rw, http.StatusOK, assignment)
+	grant := grants.Add(r.Context(), body.Subject, body.Role, body.Scope, assigner)
+	grants.RecordAssignment(r.Context(), assigner, key, grant)
+	writeJSON(rw, http.StatusCreated, grant)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/roles/assignments", assign)
-	log.Fatal(http.ListenAndServeTLS(":8444", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class AssignmentRequest(subject: String, role: String, scope: String)
+import permz.Catalog // Catalog.Roles, scopeKind, covers, permissionsOf
+import permz.Grants // Grants.grantsOf, effective, add, assignment, recordAssignment
 
-object AssignmentApi {
-  implicit val system: ActorSystem = ActorSystem("permission-service")
-  implicit val requestFormat: RootJsonFormat[AssignmentRequest] = jsonFormat3(AssignmentRequest)
+object Api {
+  val AdminRoles: Set[String] = Set("org_admin", "team_admin")
 
-  val store = GrantStore.open()
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "roles" / "assignments") {
-      post {
-        headerValueByName("X-Assigner-Id") { assigner =>
-          entity(as[AssignmentRequest]) { body =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val roles = store.adminRoles(assigner)
-            if (!roles.contains("org_admin") && !roles.contains("team_admin")) {
-              complete(StatusCodes.Forbidden, """{"error":"forbidden"}""")
-            } else {
-              store.put(body.subject, body.role, body.scope)
-              system.log.info(s"assigned subject=\${body.subject} role=\${body.role} scope=\${body.scope}")
-              complete(
-                StatusCodes.OK,
-                s"""{"subject":"\${body.subject}","role":"\${body.role}","scope":"\${body.scope}"}""",
-              )
-            }
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
+
+  val route: Route = path("v1" / "roles" / "assignments") {
+    post {
+      optionalHeaderValueByName("X-Assigner-Id") { assignerHeader =>
+        entity(as[String]) { raw =>
+          // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+          val body = raw.parseJson.asJsObject.fields
+          def text(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
+          assignerHeader.filter(_.nonEmpty) match {
+            case None => complete(error(StatusCodes.Unauthorized, "X-Assigner-Id is required"))
+            case Some(assigner) =>
+              if (!Grants.grantsOf(assigner).exists(grant => AdminRoles.contains(grant.role)))
+                complete(error(StatusCodes.Forbidden, "insufficient_permissions"))
+              else complete(json(StatusCodes.Created, Grants.add(text("subject"), text("role"), text("scope"), assigner).toJson))
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8444).bind(route)
   }
 }
 `,
-      solution: `import java.util.UUID
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-final case class AssignmentRequest(subject: String, role: String, scope: String)
+import permz.Catalog // Catalog.Roles, scopeKind, covers, permissionsOf
+import permz.Grants // Grants.grantsOf, effective, add, assignment, recordAssignment
 
-object AssignmentApi {
-  implicit val system: ActorSystem = ActorSystem("permission-service")
-  implicit val requestFormat: RootJsonFormat[AssignmentRequest] = jsonFormat3(AssignmentRequest)
+object Api {
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val RoleCatalog: Map[String, (Set[String], Set[String])] = Map(
-    "org_admin" -> (Set("org"), Set("org:read", "org:write", "roles:assign")),
-    "team_admin" -> (Set("team", "project"), Set("team:read", "team:write", "members:invite")),
-    "viewer" -> (Set("team", "project"), Set("team:read")),
-  )
-  val ScopeRank: Map[String, Int] = Map("org" -> 0, "team" -> 1, "project" -> 2)
+  private def error(status: StatusCode, message: String): HttpResponse = json(status, JsObject("error" -> JsString(message)))
 
-  val store = GrantStore.open()
-
-  def scopeKind(scope: String): String = scope.split(":", 2).head
-
-  /** A grant held at \`held\` authorizes an assignment at \`target\`: same scope, org, or a broader kind. */
-  def scopeCovers(held: String, target: String): Boolean =
-    held == target || held == "org" || (
-      for {
-        heldRank <- ScopeRank.get(scopeKind(held))
-        targetRank <- ScopeRank.get(scopeKind(target))
-      } yield heldRank < targetRank
-    ).getOrElse(false)
-
-  /** The first permission of \`role\` the assigner does not hold at a covering scope, if any. */
-  def missingPermission(held: Map[String, Set[String]], role: String, scope: String): Option[String] =
-    RoleCatalog(role)._2.toSeq.sorted.find { permission =>
-      !held.exists { case (heldScope, permissions) =>
-        permissions.contains(permission) && scopeCovers(heldScope, scope)
-      }
-    }
-
-  val route: Route =
-    path("v1" / "roles" / "assignments") {
-      post {
-        optionalHeaderValueByName("X-Assigner-Id") { assignerOpt =>
-          optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
-            entity(as[AssignmentRequest]) { body =>
-              if (!assignerOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.Unauthorized, """{"error":"missing X-Assigner-Id"}""")
-              } else if (!idemOpt.exists(_.nonEmpty)) {
-                complete(StatusCodes.BadRequest, """{"error":"Idempotency-Key is required"}""")
-              } else if (body.subject.isEmpty || body.role.isEmpty || body.scope.isEmpty) {
-                complete(StatusCodes.BadRequest, """{"error":"subject, role and scope are required"}""")
-              } else if (!RoleCatalog.contains(body.role)) {
-                complete(StatusCodes.UnprocessableEntity, """{"error":"unknown role"}""")
-              } else if (!RoleCatalog(body.role)._1.contains(scopeKind(body.scope))) {
-                complete(StatusCodes.UnprocessableEntity, """{"error":"scope is outside the catalog"}""")
-              } else {
-                val assigner = assignerOpt.get
-                val idemKey = idemOpt.get
-                val key = s"$idemKey:\${body.role}:\${body.subject}:\${body.scope}"
-                store.assignment(key) match {
-                  case Some(stored) =>
-                    complete(StatusCodes.OK, stored)
-                  case None =>
-                    missingPermission(store.holdings(assigner), body.role, body.scope) match {
-                      case Some(missing) =>
-                        complete(
-                          StatusCodes.Forbidden,
-                          s"""{"error":"insufficient_permissions","missing_permission":"$missing","scope":"\${body.scope}"}""",
-                        )
-                      case None =>
-                        val id = UUID.randomUUID().toString
-                        val assignment =
-                          s"""{"id":"$id","subject":"\${body.subject}","role":"\${body.role}","scope":"\${body.scope}","assigner":"$assigner"}"""
-                        store.put(key, assignment)
-                        system.log.info(
-                          s"assigned id=$id subject=\${body.subject} role=\${body.role} scope=\${body.scope} assigner=$assigner",
-                        )
-                        complete(StatusCodes.OK, assignment)
-                    }
+  val route: Route = path("v1" / "roles" / "assignments") {
+    post {
+      optionalHeaderValueByName("X-Assigner-Id") { assignerHeader =>
+        optionalHeaderValueByName("Idempotency-Key") { keyHeader =>
+          entity(as[String]) { raw =>
+            val body = raw.parseJson.asJsObject.fields
+            def text(name: String): String = body.get(name).collect { case JsString(s) => s }.getOrElse("")
+            (assignerHeader.filter(_.nonEmpty), keyHeader.filter(_.nonEmpty)) match {
+              case (None, _) => complete(error(StatusCodes.Unauthorized, "X-Assigner-Id is required"))
+              case (_, None) => complete(error(StatusCodes.BadRequest, "Idempotency-Key is required"))
+              case (Some(assigner), Some(key)) =>
+                Grants.assignment(assigner, key) match {
+                  case Some(recorded) => complete(json(StatusCodes.Created, recorded.toJson)) // a replay answers what the first attempt answered
+                  case None => complete(assignOnce(assigner, key, text("subject"), text("role"), text("scope")))
                 }
-              }
             }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8444).bind(route)
   }
+
+  /** The response to a valid, not yet recorded assignment by assigner. */
+  private def assignOnce(assigner: String, key: String, subject: String, role: String, scope: String): HttpResponse =
+    Catalog.Roles.get(role) match {
+      case Some(entry) if entry.scopeKinds.contains(Catalog.scopeKind(scope)) =>
+        // Hand out only what the assigner holds at the target scope: the right to assign, and every permission of the role.
+        val held = Grants.effective(assigner, scope).toSet
+        ("roles:assign" +: Catalog.permissionsOf(role)).find(p => !held.contains(p)) match {
+          case Some(missing) =>
+            json(StatusCodes.Forbidden, JsObject("error" -> JsString("insufficient_permissions"), "missing_permission" -> JsString(missing)))
+          case None =>
+            val grant = Grants.add(subject, role, scope, assigner)
+            Grants.recordAssignment(assigner, key, grant)
+            json(StatusCodes.Created, grant.toJson)
+        }
+      case _ => error(StatusCodes.UnprocessableEntity, "not in the role catalog")
+    }
 }
 `,
     },
@@ -816,183 +481,444 @@ object AssignmentApi {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
+#include <set>
 #include <string>
-#include <vector>
+
+#include "permz/grants.h"  // grants::grantsOf, effective, add, assignment, recordAssignment, toJson; catalog: permz/catalog.h
 
 using json = nlohmann::json;
 
-struct GrantStore {
-  std::vector<std::string> adminRoles(const std::string& assigner);
-  void put(const json& assignment);
-};
+const std::set<std::string> kAdminRoles = {"org_admin", "team_admin"};
 
-GrantStore store;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/roles/assignments", [](const httplib::Request& req, httplib::Response& res) {
-    const auto assigner = req.get_header_value("X-Assigner-Id");
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    bool admin = false;
-    for (const auto& role : store.adminRoles(assigner)) {
-      if (role == "org_admin" || role == "team_admin") admin = true;
-    }
-    if (!admin) {
-      res.status = 403;
-      res.set_content(R"({"error":"forbidden"})", "application/json");
-      return;
-    }
-    const json assignment = {
-        {"subject", body.value("subject", std::string())},
-        {"role", body.value("role", std::string())},
-        {"scope", body.value("scope", std::string())},
-    };
-    store.put(assignment);
-    std::cerr << "assigned subject=" << assignment["subject"] << " role=" << assignment["role"] << "\\n";
-    res.status = 200;
-    res.set_content(assignment.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8444);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void assign(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string assigner = req.get_header_value("X-Assigner-Id");
+  if (assigner.empty()) return reply(res, 401, json{{"error", "X-Assigner-Id is required"}});
+  const json body = json::parse(req.body);
+  bool admin = false;
+  for (const grants::Grant& g : grants::grantsOf(assigner)) admin = admin || kAdminRoles.count(g.role) > 0;
+  if (!admin) return reply(res, 403, json{{"error", "insufficient_permissions"}});
+  const grants::Grant grant = grants::add(body.value("subject", ""), body.value("role", ""), body.value("scope", ""), assigner);
+  reply(res, 201, grants::toJson(grant));
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/roles/assignments", assign); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <iostream>
-#include <map>
-#include <optional>
-#include <set>
 #include <string>
+#include <vector>
+
+#include "permz/catalog.h"  // catalog::kRoles, scopeKind, covers, permissionsOf
+#include "permz/grants.h"   // grants::grantsOf, effective, add, assignment, recordAssignment, toJson
 
 using json = nlohmann::json;
 
-const std::map<std::string, std::pair<std::set<std::string>, std::set<std::string>>> kRoleCatalog = {
-    {"org_admin", {{"org"}, {"org:read", "org:write", "roles:assign"}}},
-    {"team_admin", {{"team", "project"}, {"team:read", "team:write", "members:invite"}}},
-    {"viewer", {{"team", "project"}, {"team:read"}}},
-};
-const std::map<std::string, int> kScopeRank = {{"org", 0}, {"team", 1}, {"project", 2}};
-
-struct GrantStore {
-  std::map<std::string, std::set<std::string>> holdings(const std::string& assigner);
-  std::optional<json> assignment(const std::string& key);
-  void put(const std::string& key, const json& assignment);
-};
-
-GrantStore store;
-std::string uuidString();
-
-std::string scopeKind(const std::string& scope) {
-  const auto colon = scope.find(':');
-  return colon == std::string::npos ? scope : scope.substr(0, colon);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
 
-// scopeCovers reports whether a grant held at held authorizes an assignment at target.
-bool scopeCovers(const std::string& held, const std::string& target) {
-  if (held == target || held == "org") return true;
-  const auto heldRank = kScopeRank.find(scopeKind(held));
-  const auto targetRank = kScopeRank.find(scopeKind(target));
-  if (heldRank == kScopeRank.end() || targetRank == kScopeRank.end()) return false;
-  return heldRank->second < targetRank->second;
-}
-
-// missing_permission is the first permission of role the assigner does not hold at a covering scope.
-std::string missingPermission(const std::map<std::string, std::set<std::string>>& held, const std::string& role,
-                              const std::string& scope) {
-  std::vector<std::string> permissions(kRoleCatalog.at(role).second.begin(), kRoleCatalog.at(role).second.end());
-  std::sort(permissions.begin(), permissions.end());
-  for (const auto& permission : permissions) {
-    bool covered = false;
-    for (const auto& [heldScope, heldPermissions] : held) {
-      if (scopeCovers(heldScope, scope) && heldPermissions.count(permission) == 1) covered = true;
-    }
-    if (!covered) return permission;
+void assign(const httplib::Request& req, httplib::Response& res) {
+  const std::string assigner = req.get_header_value("X-Assigner-Id");
+  if (assigner.empty()) return reply(res, 401, json{{"error", "X-Assigner-Id is required"}});
+  const std::string key = req.get_header_value("Idempotency-Key");
+  if (key.empty()) return reply(res, 400, json{{"error", "Idempotency-Key is required"}});
+  if (const auto recorded = grants::assignment(assigner, key)) {
+    return reply(res, 201, grants::toJson(*recorded));  // a replay answers what the first attempt answered
   }
-  return std::string();
+  const json body = json::parse(req.body);
+  const std::string subject = body.value("subject", ""), role = body.value("role", ""), scope = body.value("scope", "");
+  const auto entry = catalog::kRoles.find(role);
+  if (entry == catalog::kRoles.end() || std::find(entry->second.scope_kinds.begin(), entry->second.scope_kinds.end(),
+                                                  catalog::scopeKind(scope)) == entry->second.scope_kinds.end()) {
+    return reply(res, 422, json{{"error", "not in the role catalog"}, {"role", role}, {"scope", scope}});
+  }
+  // Hand out only what the assigner holds at the target scope: the right to assign, and every permission of the role.
+  const std::vector<std::string> held = grants::effective(assigner, scope);
+  std::vector<std::string> needed = {"roles:assign"};
+  for (const std::string& p : catalog::permissionsOf(role)) needed.push_back(p);
+  for (const std::string& p : needed) {
+    if (std::find(held.begin(), held.end(), p) == held.end()) {
+      return reply(res, 403, json{{"error", "insufficient_permissions"}, {"missing_permission", p}});
+    }
+  }
+  const grants::Grant grant = grants::add(subject, role, scope, assigner);
+  grants::recordAssignment(assigner, key, grant);
+  reply(res, 201, grants::toJson(grant));
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/roles/assignments", [](const httplib::Request& req, httplib::Response& res) {
-    const auto assigner = req.get_header_value("X-Assigner-Id");
-    if (assigner.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Assigner-Id"})", "application/json");
-      return;
-    }
-    const auto idemKey = req.get_header_value("Idempotency-Key");
-    if (idemKey.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"Idempotency-Key is required"})", "application/json");
-      return;
-    }
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object() || !body.contains("subject") || !body.contains("role") || !body.contains("scope")) {
-      res.status = 400;
-      res.set_content(R"({"error":"subject, role and scope are required"})", "application/json");
-      return;
-    }
-    const auto role = body["role"].get<std::string>();
-    const auto scope = body["scope"].get<std::string>();
-    const auto subject = body["subject"].get<std::string>();
-    if (subject.empty() || role.empty() || scope.empty()) {
-      res.status = 400;
-      res.set_content(R"({"error":"subject, role and scope are required"})", "application/json");
-      return;
-    }
-    const auto entry = kRoleCatalog.find(role);
-    if (entry == kRoleCatalog.end()) {
-      res.status = 422;
-      res.set_content(R"({"error":"unknown role"})", "application/json");
-      return;
-    }
-    if (entry->second.first.count(scopeKind(scope)) == 0) {
-      res.status = 422;
-      res.set_content(R"({"error":"scope is outside the catalog"})", "application/json");
-      return;
-    }
-    const std::string key = idemKey + ":" + role + ":" + subject + ":" + scope;
-    if (auto stored = store.assignment(key)) {
-      res.status = 200;
-      res.set_content(stored->dump(), "application/json");
-      return;
-    }
-    const auto missing = missingPermission(store.holdings(assigner), role, scope);
-    if (!missing.empty()) {
-      res.status = 403;
-      res.set_content(
-          json{{"error", "insufficient_permissions"}, {"missing_permission", missing}, {"scope", scope}}.dump(),
-          "application/json");
-      return;
-    }
-    const json assignment = {
-        {"id", uuidString()},
-        {"subject", subject},
-        {"role", role},
-        {"scope", scope},
-        {"assigner", assigner},
-    };
-    store.put(key, assignment);
-    std::cerr << "assigned id=" << assignment["id"] << " subject=" << subject << " role=" << role << "\\n";
-    res.status = 200;
-    res.set_content(assignment.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8444);
-}
+void register_routes(httplib::Server& svr) { svr.Post("/v1/roles/assignments", assign); }
 `,
     },
   },
-  debrief: `The fix has its shape because authorization and assignment are one question: to hand out a permission you must hold it, at a scope that covers the one you are writing to. That is why the check is a set comparison over the catalog's permissions rather than an "is admin" flag, why scope containment is a rank comparison rather than string equality, and why the catalog is the only source of valid scopes, so \`*\` is a 422 instead of a super-grant. The Idempotency-Key sits in front of the write because a retried assignment must be the same assignment. Production systems go further: approval workflows for privileged roles, grant expiry, and an append-only audit log of assigner, role and scope that an access review can read directly.`,
+  harness: {
+    python: `from permz import grants
+
+
+def _seed():
+    grants.add("olu", "org_admin", "org", "root")
+    grants.add("ada", "team_admin", "team:eng", "olu")
+    grants.add("bob", "viewer", "team:eng", "ada")
+
+
+def _api(ctx):
+    _seed()
+    return ctx.client(ctx.load("api").app)
+
+
+async def _assign(c, assigner, role, scope, key=None):
+    headers = {"X-Assigner-Id": assigner, "Idempotency-Key": key or f"{assigner}/{role}/{scope}"}
+    return await c.post("/v1/roles/assignments", json={"subject": "cyd", "role": role, "scope": scope}, headers=headers)
+
+
+def _held():
+    return [(g["role"], g["scope"]) for g in grants.grants_of("cyd")]
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _assign(c, "olu", "viewer", "team:eng")
+    assert r.status_code == 201, f"olu (org_admin at org) assigning viewer at team:eng answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("subject") == "cyd" and body.get("role") == "viewer" and body.get("scope") == "team:eng" and body.get("grant_id"), f"the 201 must carry the grant (grant_id, subject, role, scope), got {body}"
+    assert _held() == [("viewer", "team:eng")], f"after the assignment cyd holds {_held()}"
+
+
+async def check_catalog(ctx):
+    async with _api(ctx) as c:
+        for role, scope, what in (
+            ("superuser", "org", "a role the catalog does not define"),
+            ("viewer", "*", 'viewer at scope "*"'),
+            ("viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"),
+            ("team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"),
+        ):
+            r = await _assign(c, "olu", role, scope)
+            assert r.status_code == 422, f"olu assigning {what} answered {r.status_code}, expected 422: the catalog is the only source of roles and of the scope kinds each may be granted at"
+        r = await _assign(c, "olu", "developer", "project:eng/api")
+        assert r.status_code == 201, f"olu assigning developer at project:eng/api answered {r.status_code}: {r.text}"
+    assert _held() == [("developer", "project:eng/api")], f"cyd holds {_held()}: only the assignment the catalog allows may be written"
+
+
+async def check_no_escalation(ctx):
+    async with _api(ctx) as c:
+        r = await _assign(c, "ada", "org_admin", "org")
+        assert r.status_code == 403, f"ada (team_admin at team:eng) granting org_admin at org answered {r.status_code}, expected 403: an assigner hands out only what it holds"
+        assert r.json().get("missing_permission"), f"the 403 must name the missing permission (missing_permission), got {r.text}"
+        r = await _assign(c, "ada", "team_admin", "team:ops")
+        assert r.status_code == 403, f"ada granting team_admin at team:ops answered {r.status_code}, expected 403: team:eng does not cover team:ops"
+        r = await _assign(c, "ada", "developer", "project:eng/api")
+        assert r.status_code == 403 and r.json().get("missing_permission") == "code:write", f"ada granting developer (code:write, team:read) at project:eng/api answered {r.status_code} {r.text}, expected 403 naming code:write, which ada does not hold"
+        r = await _assign(c, "bob", "viewer", "team:eng")
+        assert r.status_code == 403 and r.json().get("missing_permission") == "roles:assign", f"bob (viewer at team:eng) granting viewer answered {r.status_code} {r.text}, expected 403 naming roles:assign"
+        r = await _assign(c, "ada", "viewer", "project:eng/api")
+        assert r.status_code == 201, f"ada granting viewer at project:eng/api answered {r.status_code} {r.text}, expected 201: team:eng covers its projects"
+    assert _held() == [("viewer", "project:eng/api")], f"cyd holds {_held()}: a refused assignment was written"
+
+
+async def check_idempotent(ctx):
+    async with _api(ctx) as c:
+        none = await c.post("/v1/roles/assignments", json={"subject": "cyd", "role": "viewer", "scope": "team:eng"}, headers={"X-Assigner-Id": "olu"})
+        assert none.status_code == 400, f"an assignment without Idempotency-Key answered {none.status_code}, expected 400"
+        assert _held() == [], f"an assignment without Idempotency-Key wrote {_held()}"
+        first = await _assign(c, "olu", "viewer", "team:eng", "k-1")
+        replay = await _assign(c, "olu", "viewer", "team:eng", "k-1")
+        assert first.status_code == 201 and replay.status_code in (200, 201), f"the assignment answered {first.status_code}, its replay {replay.status_code}"
+        assert replay.json().get("grant_id") == first.json().get("grant_id"), f"a replay of Idempotency-Key k-1 answered grant {replay.json().get('grant_id')}, the first attempt {first.json().get('grant_id')}: a retry must answer the recorded grant"
+        assert len(_held()) == 1, f"a retried assignment wrote {len(_held())} grants for cyd, expected 1"
+        other = await _assign(c, "olu", "viewer", "team:ops", "k-2")
+    assert other.status_code == 201 and len(_held()) == 2, f"an assignment with a new key answered {other.status_code}; cyd holds {_held()}"
+`,
+    typescript: `function api(ctx) {
+  const grants = ctx.load('/support/permz/grants.ts');
+  const c = ctx.client(ctx.load('api').app);
+  const seed = async () => {
+    await grants.add('olu', 'org_admin', 'org', 'root');
+    await grants.add('ada', 'team_admin', 'team:eng', 'olu');
+    await grants.add('bob', 'viewer', 'team:eng', 'ada');
+  };
+  const held = async (): Promise<string[]> => (await grants.grantsOf('cyd')).map(g => \`\${g.role}@\${g.scope}\`);
+  return {c, seed, held};
+}
+
+const assign = (c, assigner: string, role: string, scope: string, key?: string) =>
+  c.post('/v1/roles/assignments', {
+    json: {subject: 'cyd', role, scope},
+    headers: {'X-Assigner-Id': assigner, 'Idempotency-Key': key ?? \`\${assigner}/\${role}/\${scope}\`},
+  });
+
+export async function check_route(ctx) {
+  const {c, seed, held} = api(ctx);
+  await seed();
+  const r = await assign(c, 'olu', 'viewer', 'team:eng');
+  assert.equal(r.status, 201, \`olu (org_admin at org) assigning viewer at team:eng answered \${r.status}: \${r.text}\`);
+  const body = r.json();
+  assert(body.subject === 'cyd' && body.role === 'viewer' && body.scope === 'team:eng' && body.grant_id, \`the 201 must carry the grant (grant_id, subject, role, scope), got \${r.text}\`);
+  assert.deepStrictEqual(await held(), ['viewer@team:eng'], 'after the assignment cyd must hold viewer at team:eng');
+}
+
+export async function check_catalog(ctx) {
+  const {c, seed, held} = api(ctx);
+  await seed();
+  const invalid = [
+    ['superuser', 'org', 'a role the catalog does not define'],
+    ['viewer', '*', 'viewer at scope "*"'],
+    ['viewer', 'org', 'viewer at org (the catalog allows viewer at team and project scopes)'],
+    ['team_admin', 'project:eng/api', 'team_admin at a project (the catalog allows it at team scopes)'],
+  ];
+  for (const [role, scope, what] of invalid) {
+    const r = await assign(c, 'olu', role, scope);
+    assert.equal(r.status, 422, \`olu assigning \${what} answered \${r.status}, expected 422: the catalog is the only source of roles and of the scope kinds each may be granted at\`);
+  }
+  const r = await assign(c, 'olu', 'developer', 'project:eng/api');
+  assert.equal(r.status, 201, \`olu assigning developer at project:eng/api answered \${r.status}: \${r.text}\`);
+  assert.deepStrictEqual(await held(), ['developer@project:eng/api'], 'only the assignment the catalog allows may be written');
+}
+
+export async function check_no_escalation(ctx) {
+  const {c, seed, held} = api(ctx);
+  await seed();
+  let r = await assign(c, 'ada', 'org_admin', 'org');
+  assert.equal(r.status, 403, \`ada (team_admin at team:eng) granting org_admin at org answered \${r.status}, expected 403: an assigner hands out only what it holds\`);
+  assert(r.json().missing_permission, \`the 403 must name the missing permission (missing_permission), got \${r.text}\`);
+  r = await assign(c, 'ada', 'team_admin', 'team:ops');
+  assert.equal(r.status, 403, \`ada granting team_admin at team:ops answered \${r.status}, expected 403: team:eng does not cover team:ops\`);
+  r = await assign(c, 'ada', 'developer', 'project:eng/api');
+  assert(r.status === 403 && r.json().missing_permission === 'code:write', \`ada granting developer (code:write, team:read) at project:eng/api answered \${r.status} \${r.text}, expected 403 naming code:write, which ada does not hold\`);
+  r = await assign(c, 'bob', 'viewer', 'team:eng');
+  assert(r.status === 403 && r.json().missing_permission === 'roles:assign', \`bob (viewer at team:eng) granting viewer answered \${r.status} \${r.text}, expected 403 naming roles:assign\`);
+  r = await assign(c, 'ada', 'viewer', 'project:eng/api');
+  assert.equal(r.status, 201, \`ada granting viewer at project:eng/api answered \${r.status} \${r.text}, expected 201: team:eng covers its projects\`);
+  assert.deepStrictEqual(await held(), ['viewer@project:eng/api'], 'a refused assignment was written');
+}
+
+export async function check_idempotent(ctx) {
+  const {c, seed, held} = api(ctx);
+  await seed();
+  const none = await c.post('/v1/roles/assignments', {json: {subject: 'cyd', role: 'viewer', scope: 'team:eng'}, headers: {'X-Assigner-Id': 'olu'}});
+  assert.equal(none.status, 400, \`an assignment without Idempotency-Key answered \${none.status}, expected 400\`);
+  assert.deepStrictEqual(await held(), [], 'an assignment without Idempotency-Key must write nothing');
+  const first = await assign(c, 'olu', 'viewer', 'team:eng', 'k-1');
+  const replay = await assign(c, 'olu', 'viewer', 'team:eng', 'k-1');
+  assert(first.status === 201 && (replay.status === 200 || replay.status === 201), \`the assignment answered \${first.status}, its replay \${replay.status}\`);
+  assert.equal(replay.json().grant_id, first.json().grant_id, \`a replay of Idempotency-Key k-1 answered \${replay.text}, the first attempt \${first.text}: a retry must answer the recorded grant\`);
+  assert.equal((await held()).length, 1, \`a retried assignment wrote \${(await held()).length} grants for cyd, expected 1\`);
+  const other = await assign(c, 'olu', 'viewer', 'team:ops', 'k-2');
+  assert(other.status === 201 && (await held()).length === 2, \`an assignment with a new key answered \${other.status}; cyd holds \${JSON.stringify(await held())}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+
+	"permz/grants"
+
+	"leetbuild/harness"
+)
+
+type assignReply struct {
+	GrantID           string \`json:"grant_id"\`
+	Subject           string \`json:"subject"\`
+	Role              string \`json:"role"\`
+	Scope             string \`json:"scope"\`
+	MissingPermission string \`json:"missing_permission"\`
+}
+
+func api(ctx *harness.Ctx) *harness.HTTP {
+	bg := context.Background()
+	grants.Add(bg, "olu", "org_admin", "org", "root")
+	grants.Add(bg, "ada", "team_admin", "team:eng", "olu")
+	grants.Add(bg, "bob", "viewer", "team:eng", "ada")
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func assignAs(c *harness.HTTP, assigner, role, scope, key string) (*harness.Response, assignReply) {
+	if key == "" {
+		key = assigner + "/" + role + "/" + scope
+	}
+	r := c.Post("/v1/roles/assignments", map[string]string{"subject": "cyd", "role": role, "scope": scope}, "X-Assigner-Id", assigner, "Idempotency-Key", key)
+	var body assignReply
+	r.Decode(&body)
+	return r, body
+}
+
+func heldByCyd() []string {
+	out := []string{}
+	for _, g := range grants.GrantsOf(context.Background(), "cyd") {
+		out = append(out, g.Role+"@"+g.Scope)
+	}
+	return out
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := api(ctx)
+	r, body := assignAs(c, "olu", "viewer", "team:eng", "")
+	ctx.Equal(r.Status, 201, "olu (org_admin at org) assigning viewer at team:eng (%s)", r.Text())
+	ctx.Assert(body.Subject == "cyd" && body.Role == "viewer" && body.Scope == "team:eng" && body.GrantID != "", "the 201 must carry the grant (grant_id, subject, role, scope), got %s", r.Text())
+	ctx.Equal(heldByCyd(), []string{"viewer@team:eng"}, "after the assignment, cyd's grants")
+}
+
+func CheckCatalog(ctx *harness.Ctx) {
+	c := api(ctx)
+	for _, tc := range [][3]string{
+		{"superuser", "org", "a role the catalog does not define"},
+		{"viewer", "*", "viewer at scope \\"*\\""},
+		{"viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"},
+		{"team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"},
+	} {
+		r, _ := assignAs(c, "olu", tc[0], tc[1], "")
+		ctx.Equal(r.Status, 422, "olu assigning %s must be refused: the catalog is the only source of roles and of the scope kinds each may be granted at; the status", tc[2])
+	}
+	r, _ := assignAs(c, "olu", "developer", "project:eng/api", "")
+	ctx.Equal(r.Status, 201, "olu assigning developer at project:eng/api (%s)", r.Text())
+	ctx.Equal(heldByCyd(), []string{"developer@project:eng/api"}, "only the assignment the catalog allows may be written; cyd's grants")
+}
+
+func CheckNoEscalation(ctx *harness.Ctx) {
+	c := api(ctx)
+	r, body := assignAs(c, "ada", "org_admin", "org", "")
+	ctx.Equal(r.Status, 403, "ada (team_admin at team:eng) granting org_admin at org must be refused: an assigner hands out only what it holds; the status")
+	ctx.Assert(body.MissingPermission != "", "the 403 must name the missing permission (missing_permission), got %s", r.Text())
+	r, _ = assignAs(c, "ada", "team_admin", "team:ops", "")
+	ctx.Equal(r.Status, 403, "ada granting team_admin at team:ops must be refused (team:eng does not cover team:ops); the status")
+	r, body = assignAs(c, "ada", "developer", "project:eng/api", "")
+	ctx.Assert(r.Status == 403 && body.MissingPermission == "code:write", "ada granting developer (code:write, team:read) at project:eng/api answered %d %s, expected 403 naming code:write, which ada does not hold", r.Status, r.Text())
+	r, body = assignAs(c, "bob", "viewer", "team:eng", "")
+	ctx.Assert(r.Status == 403 && body.MissingPermission == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text())
+	r, _ = assignAs(c, "ada", "viewer", "project:eng/api", "")
+	ctx.Equal(r.Status, 201, "ada granting viewer at project:eng/api must succeed, team:eng covers its projects (%s); the status", r.Text())
+	ctx.Equal(heldByCyd(), []string{"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants")
+}
+
+func CheckIdempotent(ctx *harness.Ctx) {
+	c := api(ctx)
+	none := c.Post("/v1/roles/assignments", map[string]string{"subject": "cyd", "role": "viewer", "scope": "team:eng"}, "X-Assigner-Id", "olu")
+	ctx.Equal(none.Status, 400, "an assignment without Idempotency-Key")
+	ctx.Equal(heldByCyd(), []string{}, "an assignment without Idempotency-Key must write nothing; cyd's grants")
+	first, a := assignAs(c, "olu", "viewer", "team:eng", "k-1")
+	replay, b := assignAs(c, "olu", "viewer", "team:eng", "k-1")
+	ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the assignment answered %d, its replay %d", first.Status, replay.Status)
+	ctx.Equal(b.GrantID, a.GrantID, "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id")
+	ctx.Equal(len(heldByCyd()), 1, "a retried assignment must write one grant; cyd's grants")
+	other, _ := assignAs(c, "olu", "viewer", "team:ops", "k-2")
+	ctx.Assert(other.Status == 201 && len(heldByCyd()) == 2, "an assignment with a new key answered %d; cyd holds %v", other.Status, heldByCyd())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <vector>
+
+#include "permz/grants.h"
+
+namespace {
+
+harness::HTTP api(harness::Ctx& ctx) {
+  grants::add("olu", "org_admin", "org", "root");
+  grants::add("ada", "team_admin", "team:eng", "olu");
+  grants::add("bob", "viewer", "team:eng", "ada");
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response assignAs(harness::HTTP& c, const std::string& assigner, const std::string& role, const std::string& scope,
+                           std::string key = "") {
+  if (key.empty()) key = assigner + "/" + role + "/" + scope;
+  const std::string body = nlohmann::json{{"subject", "cyd"}, {"role", role}, {"scope", scope}}.dump();
+  return c.Post("/v1/roles/assignments", body, "Content-Type", "application/json", "X-Assigner-Id", assigner, "Idempotency-Key", key);
+}
+
+std::string field(const harness::Response& r, const std::string& name) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() && body.contains(name) && body[name].is_string() ? body[name].get<std::string>() : "";
+}
+
+std::vector<std::string> heldByCyd() {
+  std::vector<std::string> out;
+  for (const grants::Grant& g : grants::grantsOf("cyd")) out.push_back(g.role + "@" + g.scope);
+  return out;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto r = assignAs(c, "olu", "viewer", "team:eng");
+  ctx.Equal(r.Status, 201, "olu (org_admin at org) assigning viewer at team:eng (%s)", r.Text());
+  ctx.Assert(field(r, "subject") == "cyd" && field(r, "role") == "viewer" && field(r, "scope") == "team:eng" && !field(r, "grant_id").empty(),
+             "the 201 must carry the grant (grant_id, subject, role, scope), got %s", r.Text());
+  ctx.Equal(heldByCyd(), {"viewer@team:eng"}, "after the assignment, cyd's grants");
+}
+
+void CheckCatalog(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const std::vector<std::vector<std::string>> invalid = {
+      {"superuser", "org", "a role the catalog does not define"},
+      {"viewer", "*", "viewer at scope \\"*\\""},
+      {"viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"},
+      {"team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"},
+  };
+  for (const auto& tc : invalid) {
+    const auto r = assignAs(c, "olu", tc[0], tc[1]);
+    ctx.Equal(r.Status, 422, "olu assigning %s must be refused: the catalog is the only source of roles and of the scope kinds each may be granted at; the status", tc[2]);
+  }
+  const auto r = assignAs(c, "olu", "developer", "project:eng/api");
+  ctx.Equal(r.Status, 201, "olu assigning developer at project:eng/api (%s)", r.Text());
+  ctx.Equal(heldByCyd(), {"developer@project:eng/api"}, "only the assignment the catalog allows may be written; cyd's grants");
+}
+
+void CheckNoEscalation(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  auto r = assignAs(c, "ada", "org_admin", "org");
+  ctx.Equal(r.Status, 403, "ada (team_admin at team:eng) granting org_admin at org must be refused: an assigner hands out only what it holds; the status");
+  ctx.Assert(!field(r, "missing_permission").empty(), "the 403 must name the missing permission (missing_permission), got %s", r.Text());
+  r = assignAs(c, "ada", "team_admin", "team:ops");
+  ctx.Equal(r.Status, 403, "ada granting team_admin at team:ops must be refused (team:eng does not cover team:ops); the status");
+  r = assignAs(c, "ada", "developer", "project:eng/api");
+  ctx.Assert(r.Status == 403 && field(r, "missing_permission") == "code:write",
+             "ada granting developer (code:write, team:read) at project:eng/api answered %d %s, expected 403 naming code:write, which ada does not hold", r.Status, r.Text());
+  r = assignAs(c, "bob", "viewer", "team:eng");
+  ctx.Assert(r.Status == 403 && field(r, "missing_permission") == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text());
+  r = assignAs(c, "ada", "viewer", "project:eng/api");
+  ctx.Equal(r.Status, 201, "ada granting viewer at project:eng/api must succeed, team:eng covers its projects (%s); the status", r.Text());
+  ctx.Equal(heldByCyd(), {"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants");
+}
+
+void CheckIdempotent(harness::Ctx& ctx) {
+  auto c = api(ctx);
+  const auto none = c.Post("/v1/roles/assignments", R"({"subject": "cyd", "role": "viewer", "scope": "team:eng"})", "Content-Type", "application/json", "X-Assigner-Id", "olu");
+  ctx.Equal(none.Status, 400, "an assignment without Idempotency-Key");
+  ctx.Equal(heldByCyd(), std::vector<std::string>{}, "an assignment without Idempotency-Key must write nothing; cyd's grants");
+  const auto first = assignAs(c, "olu", "viewer", "team:eng", "k-1");
+  const auto replay = assignAs(c, "olu", "viewer", "team:eng", "k-1");
+  ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the assignment answered %d, its replay %d", first.Status, replay.Status);
+  ctx.Equal(field(replay, "grant_id"), field(first, "grant_id"), "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id");
+  ctx.Equal(heldByCyd().size(), 1, "a retried assignment must write one grant; cyd's grants");
+  const auto other = assignAs(c, "olu", "viewer", "team:ops", "k-2");
+  ctx.Assert(other.Status == 201 && heldByCyd().size() == 2, "an assignment with a new key answered %d; cyd holds %d grants", other.Status, heldByCyd().size());
+}
+`,
+  },
+  hints: [
+    'Log in as a team admin of `team:eng` and grant yourself `org_admin` at `org`: the request answers 201. A grant at `scope: "*"` goes through too, and a retried request after a timeout writes a second grant.',
+    'The starter asks only whether the assigner holds an admin role anywhere; it never compares the role being handed out, or its scope, with anything in the catalog or in what the assigner holds, and it never reads `Idempotency-Key`.',
+    'Answer `grants.assignment(assigner, key)` when recorded; 422 unless `catalog.ROLES[role]` allows `catalog.scope_kind(scope)`; 403 on the first of `roles:assign` + `permissions_of(role)` missing from `grants.effective(assigner, scope)`; then `add` and `record_assignment`.',
+  ],
+  debrief: `Authorization and assignment are one question here: to hand out a permission you must hold it, at a scope that covers the one you write to. That is why the check is a set comparison over the catalog's permissions instead of an "is admin" flag, why it goes through \`effective\` (which already applies scope containment), and why the catalog alone defines valid roles and scopes, so \`*\` is a 422 instead of a grant nobody can reason about. The idempotency record sits in the grant store, so a retry reads the first answer. Production systems also expire grants, route privileged roles through an approval, and keep an append-only log of who assigned what, which access reviews read.`,
 };

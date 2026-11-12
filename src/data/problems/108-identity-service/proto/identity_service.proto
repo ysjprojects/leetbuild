@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package idverify;
+
+// The verification provider step 3 calls. SendVerification mails a one-time link to the address;
+// a mail server that refused the address for good (a hard bounce) is INVALID_ARGUMENT, with the
+// bounce in the details. ConfirmVerification answers whether the token the user clicked proves
+// that they own the address the link was sent to.
+service Verification {
+  rpc SendVerification(SendRequest) returns (SendReply);
+  rpc ConfirmVerification(ConfirmRequest) returns (ConfirmReply);
+}
+
+message SendRequest {
+  string user_id = 1;
+  string email = 2;
+}
+
+message SendReply {
+  string message_id = 1;
+}
+
+message ConfirmRequest {
+  string user_id = 1;
+  string token = 2;
+}
+
+message ConfirmReply {
+  bool confirmed = 1;
+}

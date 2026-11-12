@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package transcoderd;
+
+// The encoder workers step 3 calls once per segment attempt: encode the span [start_s, start_s +
+// duration_s) of the source with the preset's arguments and store it under the job's output prefix.
+// Bytes the decoder cannot read are INVALID_ARGUMENT (terminal); a worker that is gone or drained
+// is UNAVAILABLE (another worker may succeed).
+service Encoder {
+  rpc EncodeSegment(SegmentRequest) returns (SegmentResult);
+}
+
+message SegmentRequest {
+  string job_id = 1;
+  int32 index = 2;
+  string source_uri = 3;
+  double start_s = 4;
+  double duration_s = 5;
+  string preset = 6;
+  repeated string encoder_args = 7;
+}
+
+message SegmentResult {
+  int32 index = 1;
+  string output_key = 2;
+  double duration_s = 3;
+}

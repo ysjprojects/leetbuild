@@ -2,1136 +2,785 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
+  title: 'Redis permission cache invalidated by a version bump',
   concept: 'redis',
   file: 'state',
-  title: 'Redis permission cache invalidated by version bump',
   focus: ['api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter caches the effective permission set per \`(subject, scope)\` under
-\`perm:{subject}:{scope}\` in Redis with a 300 s TTL; on every assignment change it writes the grant
-and deletes the cached key, so the demo (assign, then read) shows the new set. It compiles, serves
-the demo, and hides 5 flaws.
+**Starting point.** The starter caches the effective permission set of a \`(subject, scope)\`:
+\`effective_permissions(subject, scope)\` serves \`perm:{subject}:{scope}\` (a JSON list, 300 s TTL)
+or derives it with \`grants.effective\` and stores it. \`grant_role\` and \`revoke_grant\` delete that
+one key, then write the grant (\`grants.add\` / \`grants.revoke\`). It serves the demo and hides three
+flaws.
 
-**Failure mode the checks target.** Delete-after-write looks like invalidation and is only a hint. A
-read that lands between the \`DEL\` and the re-derive repopulates the pre-change set, so a revoked
-contractor keeps access for the rest of the TTL.
+**Failure mode the checks target.** A revoked team admin keeps \`team:write\` at the team's
+projects; a read that lands between the delete and the write re-caches the old set; and a read that
+was deriving when a revocation committed caches what it derived, for the rest of the TTL.
 
-- The key stays \`perm:{subject}:{scope}\` with a **300 s** TTL. The TTL bounds memory, not truth.
-- One global counter \`perm:grant_version\` is the invalidation clock. Every assignment change bumps
-  it with an atomic **\`INCR\`** *after* the grant store records the change and *before* the ack.
-  Keys are not deleted.
-- A read loads the current version, then the entry, and serves the entry only while its stamped
-  version equals the one just read; a mismatch recomputes.
-- The recompute is **single-flight** behind a \`SET NX\` lock at \`perm:lock:{subject}:{scope}\`
-  with a **2000 ms** TTL, so concurrent misses cannot stampede the policy engine or stamp the entry
-  from a stale snapshot.
-- The fresh entry is written with the current version stamp and the 300 s TTL, so a revocation is
-  visible within one second.`,
+- \`perm:grant_version\` (\`VERSION_KEY\`) is the invalidation clock. \`grant_role\` and
+  \`revoke_grant\` write the grant first, then \`INCR\` it. No key is deleted.
+- An entry is a hash \`{permissions, version}\` under \`perm:{subject}:{scope}\` with a **300 s** TTL.
+- A read takes the version **before** it derives, serves an entry only while its stamp equals that
+  version, and stamps a derived set with the version it took.`,
   sequence: {
-    participants: ['Permission Service', 'Redis', 'Grant store', 'Policy engine'],
+    participants: ['Permission Service', 'Redis', 'Grant store'],
     messages: [
-      {from: 'Permission Service', to: 'Redis', label: 'GET perm:grant_version', kind: 'sync'},
-      {from: 'Redis', to: 'Permission Service', label: '4', kind: 'reply'},
-      {from: 'Permission Service', to: 'Redis', label: 'HGETALL perm:user:ada:team:eng', kind: 'sync'},
-      {from: 'Redis', to: 'Permission Service', label: '{perms, version=3} / (nil)', kind: 'reply'},
-      {from: 'Permission Service', to: 'Permission Service', label: 'stamp 3 ≠ current 4 → recompute', kind: 'sync'},
+      {from: 'Permission Service', to: 'Redis', label: 'GET perm:grant_version → 4', kind: 'sync'},
       {
         from: 'Permission Service',
         to: 'Redis',
-        label: 'SET NX perm:lock:user:ada:team:eng · px 2000',
+        label: 'HGETALL perm:ada:team:eng → {permissions, version: 3}',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Permission Service', label: 'OK — one rebuild', kind: 'reply'},
-      {from: 'Permission Service', to: 'Policy engine', label: 'derive the effective permission set', kind: 'sync'},
-      {from: 'Policy engine', to: 'Permission Service', label: 'CheckReply{permissions}', kind: 'reply'},
-      {from: 'Permission Service', to: 'Redis', label: 'HSET {perms, version=4} · EXPIRE 300', kind: 'async'},
-      {from: 'Permission Service', to: 'Grant store', label: 'record_change(subject, scope)', kind: 'async'},
-      {from: 'Permission Service', to: 'Redis', label: 'INCR perm:grant_version → 5', kind: 'async'},
+      {from: 'Permission Service', to: 'Grant store', label: 'stamp 3 ≠ 4 → effective(ada, team:eng)', kind: 'sync'},
+      {from: 'Permission Service', to: 'Redis', label: 'HSET {permissions, version: 4} · EXPIRE 300', kind: 'sync'},
+      {from: 'Permission Service', to: 'Grant store', label: 'revoke_grant: grants.revoke(g-1)', kind: 'sync'},
       {
         from: 'Permission Service',
-        to: 'Permission Service',
-        label: 'ack only after the bump: every entry stamped before it is now stale',
+        to: 'Redis',
+        label: 'INCR perm:grant_version → 5: every entry is stale',
         kind: 'sync',
       },
     ],
   },
-  hints: [
-    'Revoke a contractor, then read their permissions from a second connection a moment later: the old set is back, with a fresh 300 s TTL, and stays until it expires.',
-    'The starter deletes `perm:{subject}:{scope}` after the write. A reader that missed just before the delete re-derives from pre-change grants and stores that set; nothing in the entry says which change it predates.',
-    'Add `GRANT_VERSION_KEY`, stamp entries with `CACHE_VERSION_FIELD`, gate reads on `cache_is_current`, replace the delete with `bump_version` (`INCR` after `store.record_change`), and rebuild under a `LOCK_KEY_PREFIX` `SET NX` lock.',
-  ],
   checks: [
     {
-      id: 'version-stamp',
-      title: 'Cache entries carry the grant version',
+      id: 'every-scope',
+      title: 'A grant change reaches every cached scope',
       detail:
-        'Every cached entry is stamped with the value of the global `grant_version` counter at write time. The starter stores the set under a TTL and no version, so a reader cannot tell a fresh entry from one written before the last revocation.',
+        'A change bumps the shared `perm:grant_version` counter (`INCR`), which outdates every entry at once; deleting the one `perm:{subject}:{scope}` key of the changed grant leaves the entries of the scopes it covers (a team grant at its projects) serving the old set.',
       match: {
-        python: {all: [/GRANT_VERSION_KEY/, /CACHE_VERSION_FIELD/]},
-        typescript: {all: [/GRANT_VERSION_KEY/, /CACHE_VERSION_FIELD/]},
-        go: {all: [/grantVersionKey/, /cacheVersionField/]},
-        scala: {all: [/GrantVersionKey/, /CacheVersionField/]},
-        cpp: {all: [/kGrantVersionKey/, /kCacheVersionField/]},
+        python: {
+          all: [/VERSION_KEY\s*=\s*["']perm:grant_version["']/, /\.incr\(\s*VERSION_KEY\s*\)/],
+          none: [/\.delete\(\s*cache_key\(/],
+        },
+        typescript: {
+          all: [/VERSION_KEY\s*=\s*['"]perm:grant_version['"]/, /\.incr\(\s*VERSION_KEY\s*\)/],
+          none: [/\.del\(\s*cacheKey\(/],
+        },
+        go: {
+          all: [/versionKey\s*=\s*"perm:grant_version"/, /\.Incr\(\s*ctx,\s*versionKey\s*\)/],
+          none: [/\.Del\(\s*ctx,\s*cacheKey\(/],
+        },
+        scala: {
+          all: [/VersionKey\s*=\s*"perm:grant_version"/, /\.incr\(\s*VersionKey\s*\)/],
+          none: [/\.del\(\s*cacheKey\(/],
+        },
+        cpp: {
+          all: [/kVersionKey\s*=\s*"perm:grant_version"/, /\.incr\(\s*kVersionKey\s*\)/],
+          none: [/\.del\(\s*cacheKey\(/],
+        },
       },
     },
     {
-      id: 'version-mismatch',
-      title: 'A version mismatch forces recomputation',
+      id: 'after-commit',
+      title: 'Invalidates after the grant store committed the change',
       detail:
-        'The read compares the stamped version with the current `grant_version` and recomputes when they differ instead of serving the entry; a TTL alone cannot make a revocation immediate.',
+        'The grant is written (`add`/`revoke`) before the cache is invalidated; the starter deletes first, so a read landing in between derives the set the change was about to remove and caches it.',
       match: {
-        python: {all: [/CACHE_VERSION_FIELD/, /cache_is_current\(/]},
-        typescript: {all: [/CACHE_VERSION_FIELD/, /cacheIsCurrent\(/]},
-        go: {all: [/cacheVersionField/, /cacheIsCurrent\(/]},
-        scala: {all: [/CacheVersionField/, /cacheIsCurrent\(/]},
-        cpp: {all: [/kCacheVersionField/, /cacheIsCurrent\(/]},
+        python: {order: [/grants\.add\(/, /\.incr\(\s*VERSION_KEY/, /grants\.revoke\(/, /\.incr\(\s*VERSION_KEY/]},
+        typescript: {order: [/\badd\(/, /\.incr\(\s*VERSION_KEY/, /\brevoke\(/, /\.incr\(\s*VERSION_KEY/]},
+        go: {
+          order: [/grants\.Add\(/, /\.Incr\(\s*ctx,\s*versionKey/, /grants\.Revoke\(/, /\.Incr\(\s*ctx,\s*versionKey/],
+        },
+        scala: {order: [/Grants\.add\(/, /\.incr\(\s*VersionKey/, /Grants\.revoke\(/, /\.incr\(\s*VersionKey/]},
+        cpp: {order: [/grants::add\(/, /\.incr\(\s*kVersionKey/, /grants::revoke\(/, /\.incr\(\s*kVersionKey/]},
       },
     },
     {
-      id: 'bump-not-delete',
-      title: 'Invalidates by bumping the counter, never by deleting keys',
+      id: 'stamp-before-derive',
+      title: 'Stamps an entry with the version read before deriving it',
       detail:
-        'Every assignment change bumps the shared counter with an atomic `INCR`, so an old entry dies the moment the bump lands. Deleting keys is not the mechanism: a concurrent read between the delete and the re-derive repopulates the pre-change set.',
+        'The read takes `perm:grant_version` before `effective`, writes the entry with that stamp, and serves an entry only while its stamp is current; a set derived while a change committed then carries an old stamp and is recomputed on the next read.',
       match: {
-        python: {all: [/def bump_version\(/, /\.incr\(/], none: [/redis\.delete\(/]},
-        typescript: {all: [/function bumpVersion\(/, /\.incr\(/], none: [/redis\.del\(/]},
-        go: {all: [/func bumpVersion\(/, /\.Incr\(/], none: [/\.Del\(/]},
-        scala: {all: [/def bumpVersion\(/, /\.incr\(/], none: [/\.del\(/]},
-        cpp: {all: [/bumpVersion\(/, /\.incr\(|->incr\(/], none: [/\.del\(|->del\(/]},
-      },
-    },
-    {
-      id: 'single-flight',
-      title: 'Collapses concurrent misses behind one recompute',
-      detail:
-        'A miss recomputes under a short-lived `SET NX` lock, so two concurrent misses cannot both rebuild and neither can repopulate the entry from a stale snapshot.',
-      match: {
-        python: {all: [/LOCK_KEY_PREFIX/, /nx=True|\.lock\(/]},
-        typescript: {all: [/LOCK_KEY_PREFIX/, /'NX'|"NX"/]},
-        go: {all: [/lockKeyPrefix/, /SetNX\(/]},
-        scala: {all: [/LockKeyPrefix/, /nx\(\)/]},
-        cpp: {all: [/kLockKeyPrefix/, /NOT_EXIST/]},
-      },
-    },
-    {
-      id: 'bump-after-commit',
-      title: 'Bumps the version after the grant commits and before the ack',
-      detail:
-        'The bump happens after the grant store records the change and before the response is acked, so no read can serve an entry older than the bump. The starter never bumps at all.',
-      match: {
-        python: {order: [/store\.record_change\(/, /\.incr\(/]},
-        typescript: {order: [/store\.recordChange\(/, /\.incr\(/]},
-        go: {order: [/store\.RecordChange\(/, /\.Incr\(/]},
-        scala: {order: [/store\.recordChange\(/, /\.incr\(/]},
-        cpp: {order: [/store\.recordChange\(/, /\.incr\(|->incr\(/]},
+        python: {order: [/\.get\(\s*VERSION_KEY/, /["']version["']\)?\s*==|==\s*version\b/, /grants\.effective\(/]},
+        typescript: {
+          order: [/\.get\(\s*VERSION_KEY/, /\.version\s*===\s*version|version\s*===\s*\w+\.version/, /\beffective\(/],
+        },
+        go: {order: [/\.Get\(\s*ctx,\s*versionKey/, /==\s*version\b/, /grants\.Effective\(/]},
+        scala: {order: [/\.get\(\s*VersionKey/, /contains\(\s*version\s*\)|==\s*version\b/, /Grants\.effective\(/]},
+        cpp: {order: [/\.get\(\s*kVersionKey/, /==\s*version\b/, /grants::effective\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""Effective-permission cache in Redis, refreshed on assignment changes."""
-import logging
+      starter: `import json
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from redis import Redis
+import redis
 
-app = FastAPI()
-logger = logging.getLogger("permissions")
+from permz import grants  # effective, add, revoke, by_id
 
-redis = Redis(host="redis", port=6379, decode_responses=True)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 CACHE_TTL_S = 300
-
-
-class GrantStore:
-    def effective(self, subject: str, scope: str) -> set[str]:
-        """Derive the effective permission set from the grants and the role catalog."""
-        raise NotImplementedError
-
-    def put(self, subject: str, scope: str, role: str) -> None:
-        """Persist an assignment."""
-        raise NotImplementedError
-
-
-store = GrantStore()
-
-
-class Assignment(BaseModel):
-    subject: str
-    role: str
-    scope: str
 
 
 def cache_key(subject: str, scope: str) -> str:
     return f"perm:{subject}:{scope}"
 
 
-def effective_permissions(subject: str, scope: str) -> set[str]:
-    key = cache_key(subject, scope)
-    entry = redis.hgetall(key)
-    if entry:
-        return set(filter(None, entry.get("perms", "").split(",")))
-    perms = store.effective(subject, scope)
-    redis.hset(key, "perms", ",".join(sorted(perms)))
-    redis.expire(key, CACHE_TTL_S)
-    return perms
+def effective_permissions(subject: str, scope: str) -> list[str]:
+    """The permissions the subject holds at scope, sorted."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    raw = r.get(cache_key(subject, scope))
+    if raw is not None:
+        return json.loads(raw)
+    permissions = grants.effective(subject, scope)
+    r.set(cache_key(subject, scope), json.dumps(permissions), ex=CACHE_TTL_S)
+    return permissions
 
 
-@app.get("/v1/users/{subject}/permissions")
-def get_permissions(subject: str, scope: str = "org") -> JSONResponse:
-    perms = effective_permissions(subject, scope)
-    return JSONResponse({"subject": subject, "scope": scope, "permissions": sorted(perms)})
+def grant_role(subject: str, role: str, scope: str, assigner: str) -> dict:
+    r.delete(cache_key(subject, scope))
+    return grants.add(subject, role, scope, assigner)
 
 
-@app.post("/v1/roles/assignments")
-def assign(body: Assignment) -> JSONResponse:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    store.put(body.subject, body.scope, body.role)
-    redis.delete(cache_key(body.subject, body.scope))
-    logger.info("assigned subject=%s role=%s scope=%s", body.subject, body.role, body.scope)
-    return JSONResponse({"subject": body.subject, "role": body.role, "scope": body.scope}, status_code=200)
+def revoke_grant(grant_id: str) -> dict | None:
+    grant = grants.by_id(grant_id)
+    if grant is None:
+        return None
+    r.delete(cache_key(grant["subject"], grant["scope"]))
+    return grants.revoke(grant_id)
 `,
-      solution: `"""Effective-permission cache: version-stamped entries invalidated by bumping a global counter."""
-import logging
-from uuid import uuid4
+      solution: `import redis
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from redis import Redis
+from permz import grants  # effective, add, revoke, by_id
 
-app = FastAPI()
-logger = logging.getLogger("permissions")
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-redis = Redis(host="redis", port=6379, decode_responses=True)
-
-GRANT_VERSION_KEY = "perm:grant_version"
-CACHE_VERSION_FIELD = "version"
-CACHE_PERMS_FIELD = "perms"
+VERSION_KEY = "perm:grant_version"
 CACHE_TTL_S = 300
-LOCK_KEY_PREFIX = "perm:lock:"
-LOCK_TTL_MS = 2000
-
-# Compare-and-delete: a slow worker must not release the lock a younger worker now owns.
-RELEASE_LOCK_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end"
-
-
-class GrantStore:
-    def effective(self, subject: str, scope: str) -> set[str]:
-        """Derive the effective permission set from the grants and the role catalog."""
-        raise NotImplementedError
-
-    def record_change(self, subject: str, scope: str) -> None:
-        """Persist the assignment change before anything derived from it becomes visible."""
-        raise NotImplementedError
-
-
-store = GrantStore()
-
-
-class Assignment(BaseModel):
-    subject: str
-    role: str
-    scope: str
 
 
 def cache_key(subject: str, scope: str) -> str:
     return f"perm:{subject}:{scope}"
 
 
-def lock_key(subject: str, scope: str) -> str:
-    return f"{LOCK_KEY_PREFIX}{subject}:{scope}"
+def effective_permissions(subject: str, scope: str) -> list[str]:
+    """The permissions the subject holds at scope, sorted."""
+    # The version first: a set derived after it is stamped with it, so a change that commits meanwhile outdates it.
+    version = r.get(VERSION_KEY) or "0"
+    entry = r.hgetall(cache_key(subject, scope))
+    if entry and entry.get("version") == version:
+        return entry["permissions"].split(",") if entry["permissions"] else []
+    permissions = grants.effective(subject, scope)
+    r.hset(cache_key(subject, scope), mapping={"permissions": ",".join(permissions), "version": version})
+    r.expire(cache_key(subject, scope), CACHE_TTL_S)
+    return permissions
 
 
-def current_version() -> int:
-    return int(redis.get(GRANT_VERSION_KEY) or 0)
+def grant_role(subject: str, role: str, scope: str, assigner: str) -> dict:
+    grant = grants.add(subject, role, scope, assigner)
+    r.incr(VERSION_KEY)  # after the commit: every entry stamped before it is stale, at every scope
+    return grant
 
 
-def cache_is_current(entry: dict[str, str], version: int) -> bool:
-    """An entry is trustworthy only while its stamp equals the counter read this request."""
-    return entry.get(CACHE_VERSION_FIELD) == str(version)
-
-
-def recompute_effective(subject: str, scope: str, version: int) -> set[str]:
-    key = cache_key(subject, scope)
-    lock = lock_key(subject, scope)
-    token = uuid4().hex
-    if redis.set(lock, token, nx=True, px=LOCK_TTL_MS):
-        try:
-            perms = store.effective(subject, scope)
-            pipe = redis.pipeline()
-            pipe.hset(key, mapping={CACHE_PERMS_FIELD: ",".join(sorted(perms)), CACHE_VERSION_FIELD: str(version)})
-            pipe.expire(key, CACHE_TTL_S)
-            pipe.execute()
-            return perms
-        finally:
-            redis.eval(RELEASE_LOCK_LUA, 1, lock, token)
-    # Another worker holds the lock: serve what it wrote, and derive locally only if it has not
-    # finished — the 2000 ms lock TTL bounds that wait.
-    entry = redis.hgetall(key)
-    if entry and cache_is_current(entry, version):
-        return set(filter(None, entry[CACHE_PERMS_FIELD].split(",")))
-    return store.effective(subject, scope)
-
-
-def effective_permissions(subject: str, scope: str) -> set[str]:
-    version = current_version()
-    entry = redis.hgetall(cache_key(subject, scope))
-    if entry and cache_is_current(entry, version):
-        return set(filter(None, entry[CACHE_PERMS_FIELD].split(",")))
-    return recompute_effective(subject, scope, version)
-
-
-@app.get("/v1/users/{subject}/permissions")
-def get_permissions(subject: str, scope: str = "org") -> JSONResponse:
-    perms = effective_permissions(subject, scope)
-    return JSONResponse({"subject": subject, "scope": scope, "permissions": sorted(perms)})
-
-
-@app.post("/v1/roles/assignments")
-def assign(body: Assignment) -> JSONResponse:
-    # The grant is durable first; only then does the clock move, so a read that raced the
-    # assignment either served the old version (and recomputed) or the new one.
-    store.record_change(body.subject, body.scope)
-    bump_version()
-    logger.info("assigned subject=%s role=%s scope=%s", body.subject, body.role, body.scope)
-    return JSONResponse({"subject": body.subject, "role": body.role, "scope": body.scope}, status_code=200)
-
-
-def bump_version() -> int:
-    """Move the invalidation clock: every entry stamped before this read is now stale."""
-    return int(redis.incr(GRANT_VERSION_KEY))
+def revoke_grant(grant_id: str) -> dict | None:
+    grant = grants.revoke(grant_id)
+    if grant is not None:
+        r.incr(VERSION_KEY)
+    return grant
 `,
     },
     typescript: {
-      starter: `/** Effective-permission cache in Redis, refreshed on assignment changes. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-const redis = new Redis('redis://redis:6379');
+import {type Grant, add, byId, effective, revoke} from 'permz/grants';
 
-const CACHE_TTL_S = 300;
+const redis = new Redis({host: 'redis', port: 6379});
 
-export interface GrantStore {
-  effective(subject: string, scope: string): Promise<string[]>;
-  put(subject: string, scope: string, role: string): Promise<void>;
+export const CACHE_TTL_S = 300;
+
+export const cacheKey = (subject: string, scope: string): string => \`perm:\${subject}:\${scope}\`;
+
+/** The permissions the subject holds at scope, sorted. */
+export async function effectivePermissions(subject: string, scope: string): Promise<string[]> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const raw = await redis.get(cacheKey(subject, scope));
+  if (raw !== null) return JSON.parse(raw) as string[];
+  const permissions = await effective(subject, scope);
+  await redis.set(cacheKey(subject, scope), JSON.stringify(permissions), 'EX', CACHE_TTL_S);
+  return permissions;
 }
 
-export const store: GrantStore = {
-  async effective() {
-    throw new Error('not wired');
-  },
-  async put() {
-    throw new Error('not wired');
-  },
-};
-
-const cacheKey = (subject: string, scope: string): string => \`perm:\${subject}:\${scope}\`;
-
-async function effectivePermissions(subject: string, scope: string): Promise<string[]> {
-  const key = cacheKey(subject, scope);
-  const entry = await redis.hgetall(key);
-  if (Object.keys(entry).length > 0) return entry.perms.split(',').filter(Boolean);
-  const perms = await store.effective(subject, scope);
-  await redis.hset(key, 'perms', perms.join(','));
-  await redis.expire(key, CACHE_TTL_S);
-  return perms;
+export async function grantRole(subject: string, role: string, scope: string, assigner: string): Promise<Grant> {
+  await redis.del(cacheKey(subject, scope));
+  return add(subject, role, scope, assigner);
 }
 
-app.get('/v1/users/:subject/permissions', async (request, reply) => {
-  const {subject} = request.params as {subject: string};
-  const scope = (request.query as {scope?: string}).scope ?? 'org';
-  return reply.code(200).send({subject, scope, permissions: await effectivePermissions(subject, scope)});
-});
-
-app.post('/v1/roles/assignments', async (request, reply) => {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const body = request.body as {subject: string; role: string; scope: string};
-  await store.put(body.subject, body.scope, body.role);
-  await redis.del(cacheKey(body.subject, body.scope));
-  request.log.info({subject: body.subject, role: body.role, scope: body.scope}, 'assigned');
-  return reply.code(200).send({subject: body.subject, role: body.role, scope: body.scope});
-});
-
-void app.listen({port: 8444, host: '0.0.0.0'});
+export async function revokeGrant(grantId: string): Promise<Grant | null> {
+  const grant = await byId(grantId);
+  if (grant === null) return null;
+  await redis.del(cacheKey(grant.subject, grant.scope));
+  return revoke(grantId);
+}
 `,
-      solution: `/** Effective-permission cache: version-stamped entries invalidated by bumping a global counter. */
-import {randomUUID} from 'node:crypto';
+      solution: `import Redis from 'ioredis';
 
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+import {type Grant, add, byId, effective, revoke} from 'permz/grants';
 
-export const app = Fastify();
-const redis = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const GRANT_VERSION_KEY = 'perm:grant_version';
-const CACHE_VERSION_FIELD = 'version';
-const CACHE_PERMS_FIELD = 'perms';
-const CACHE_TTL_S = 300;
-const LOCK_KEY_PREFIX = 'perm:lock:';
-const LOCK_TTL_MS = 2000;
+export const VERSION_KEY = 'perm:grant_version';
+export const CACHE_TTL_S = 300;
 
-// Compare-and-delete: a slow worker must not release the lock a younger worker now owns.
-const RELEASE_LOCK_LUA =
-  "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end";
+export const cacheKey = (subject: string, scope: string): string => \`perm:\${subject}:\${scope}\`;
 
-export interface GrantStore {
-  effective(subject: string, scope: string): Promise<string[]>;
-  recordChange(subject: string, scope: string): Promise<void>;
-}
-
-export const store: GrantStore = {
-  async effective() {
-    throw new Error('not wired');
-  },
-  async recordChange() {
-    throw new Error('not wired');
-  },
-};
-
-const cacheKey = (subject: string, scope: string): string => \`perm:\${subject}:\${scope}\`;
-const lockKey = (subject: string, scope: string): string => \`\${LOCK_KEY_PREFIX}\${subject}:\${scope}\`;
-
-const currentVersion = async (): Promise<number> => Number((await redis.get(GRANT_VERSION_KEY)) ?? 0);
-
-/** An entry is trustworthy only while its stamp equals the counter read this request. */
-function cacheIsCurrent(entry: Record<string, string>, version: number): boolean {
-  return entry[CACHE_VERSION_FIELD] === String(version);
-}
-
-async function recomputeEffective(subject: string, scope: string, version: number): Promise<string[]> {
-  const key = cacheKey(subject, scope);
-  const lock = lockKey(subject, scope);
-  const token = randomUUID();
-  if ((await redis.set(lock, token, 'PX', LOCK_TTL_MS, 'NX')) === 'OK') {
-    try {
-      const perms = await store.effective(subject, scope);
-      await redis
-        .multi()
-        .hset(key, CACHE_PERMS_FIELD, perms.join(','), CACHE_VERSION_FIELD, String(version))
-        .expire(key, CACHE_TTL_S)
-        .exec();
-      return perms;
-    } finally {
-      await redis.eval(RELEASE_LOCK_LUA, 1, lock, token);
-    }
-  }
-  const entry = await redis.hgetall(key);
-  if (Object.keys(entry).length > 0 && cacheIsCurrent(entry, version))
-    return entry[CACHE_PERMS_FIELD].split(',').filter(Boolean);
-  return store.effective(subject, scope);
-}
-
-async function effectivePermissions(subject: string, scope: string): Promise<string[]> {
-  const version = await currentVersion();
+/** The permissions the subject holds at scope, sorted. */
+export async function effectivePermissions(subject: string, scope: string): Promise<string[]> {
+  // The version first: a set derived after it is stamped with it, so a change that commits meanwhile outdates it.
+  const version = (await redis.get(VERSION_KEY)) ?? '0';
   const entry = await redis.hgetall(cacheKey(subject, scope));
-  if (Object.keys(entry).length > 0 && cacheIsCurrent(entry, version))
-    return entry[CACHE_PERMS_FIELD].split(',').filter(Boolean);
-  return recomputeEffective(subject, scope, version);
+  if (entry.version === version) return entry.permissions === '' ? [] : entry.permissions.split(',');
+  const permissions = await effective(subject, scope);
+  await redis.hset(cacheKey(subject, scope), {permissions: permissions.join(','), version});
+  await redis.expire(cacheKey(subject, scope), CACHE_TTL_S);
+  return permissions;
 }
 
-app.get('/v1/users/:subject/permissions', async (request, reply) => {
-  const {subject} = request.params as {subject: string};
-  const scope = (request.query as {scope?: string}).scope ?? 'org';
-  return reply.code(200).send({subject, scope, permissions: await effectivePermissions(subject, scope)});
-});
+export async function grantRole(subject: string, role: string, scope: string, assigner: string): Promise<Grant> {
+  const grant = await add(subject, role, scope, assigner);
+  await redis.incr(VERSION_KEY); // after the commit: every entry stamped before it is stale, at every scope
+  return grant;
+}
 
-app.post('/v1/roles/assignments', async (request, reply) => {
-  const body = request.body as {subject: string; role: string; scope: string};
-  // The grant is durable first; only then does the clock move, and only then is the call acked.
-  await store.recordChange(body.subject, body.scope);
-  await bumpVersion();
-  request.log.info({subject: body.subject, role: body.role, scope: body.scope}, 'assigned');
-  return reply.code(200).send({subject: body.subject, role: body.role, scope: body.scope});
-});
-
-/** Move the invalidation clock: every entry stamped before this call is now stale. */
-async function bumpVersion(): Promise<number> {
-  return await redis.incr(GRANT_VERSION_KEY);
+export async function revokeGrant(grantId: string): Promise<Grant | null> {
+  const grant = await revoke(grantId);
+  if (grant !== null) await redis.incr(VERSION_KEY);
+  return grant;
 }
 `,
     },
     go: {
-      starter: `// Effective-permission cache in Redis, refreshed on assignment changes.
-package main
+      starter: `package main
 
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
-	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
-)
 
-var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	"permz/grants" // grants.Effective, Add, Revoke, ByID
+)
 
 const cacheTTL = 300 * time.Second
 
-type GrantStore struct{}
-
-func (s *GrantStore) Effective(ctx context.Context, subject, scope string) ([]string, error) {
-	return nil, nil
-}
-
-func (s *GrantStore) Put(ctx context.Context, subject, scope, role string) error { return nil }
-
-var store = &GrantStore{}
-
-type AssignmentRequest struct {
-	Subject string \`json:"subject"\`
-	Role    string \`json:"role"\`
-	Scope   string \`json:"scope"\`
-}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 func cacheKey(subject, scope string) string { return "perm:" + subject + ":" + scope }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+// effectivePermissions is the permissions the subject holds at scope, sorted.
+func effectivePermissions(ctx context.Context, subject, scope string) []string {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	if raw, err := rdb.Get(ctx, cacheKey(subject, scope)).Result(); err == nil {
+		var cached []string
+		json.Unmarshal([]byte(raw), &cached)
+		return cached
+	}
+	permissions := grants.Effective(ctx, subject, scope)
+	raw, _ := json.Marshal(permissions)
+	rdb.Set(ctx, cacheKey(subject, scope), raw, cacheTTL)
+	return permissions
 }
 
-func effectivePermissions(ctx context.Context, subject, scope string) ([]string, error) {
-	key := cacheKey(subject, scope)
-	entry, err := rdb.HGetAll(ctx, key).Result()
-	if err != nil {
-		return nil, err
-	}
-	if len(entry) > 0 {
-		return strings.Split(entry["perms"], ","), nil
-	}
-	perms, err := store.Effective(ctx, subject, scope)
-	if err != nil {
-		return nil, err
-	}
-	rdb.HSet(ctx, key, "perms", strings.Join(perms, ","))
-	rdb.Expire(ctx, key, cacheTTL)
-	return perms, nil
+func grantRole(ctx context.Context, subject, role, scope, assigner string) grants.Grant {
+	rdb.Del(ctx, cacheKey(subject, scope))
+	return grants.Add(ctx, subject, role, scope, assigner)
 }
 
-func getPermissions(rw http.ResponseWriter, r *http.Request) {
-	scope := r.URL.Query().Get("scope")
-	if scope == "" {
-		scope = "org"
+func revokeGrant(ctx context.Context, grantID string) *grants.Grant {
+	g := grants.ByID(ctx, grantID)
+	if g == nil {
+		return nil
 	}
-	perms, err := effectivePermissions(r.Context(), r.PathValue("subject"), scope)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{"subject": r.PathValue("subject"), "scope": scope, "permissions": perms})
-}
-
-func assign(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	var body AssignmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	_ = store.Put(r.Context(), body.Subject, body.Scope, body.Role)
-	rdb.Del(r.Context(), cacheKey(body.Subject, body.Scope))
-	log.Printf("assigned subject=%s role=%s scope=%s", body.Subject, body.Role, body.Scope)
-	writeJSON(rw, http.StatusOK, body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/users/{subject}/permissions", getPermissions)
-	mux.HandleFunc("POST /v1/roles/assignments", assign)
-	log.Fatal(http.ListenAndServe(":8444", mux))
+	rdb.Del(ctx, cacheKey(g.Subject, g.Scope))
+	return grants.Revoke(ctx, grantID)
 }
 `,
-      solution: `// Effective-permission cache: version-stamped entries invalidated by bumping a global counter.
-package main
+      solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"permz/grants" // grants.Effective, Add, Revoke, ByID
+)
+
+const (
+	versionKey = "perm:grant_version"
+	cacheTTL   = 300 * time.Second
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-const (
-	grantVersionKey   = "perm:grant_version"
-	cacheVersionField = "version"
-	cachePermsField   = "perms"
-	cacheTTL          = 300 * time.Second
-	lockKeyPrefix     = "perm:lock:"
-	lockTTL           = 2 * time.Second
-)
-
-// Compare-and-delete: a slow worker must not release the lock a younger worker now owns.
-const releaseLockLua = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end"
-
-type GrantStore struct{}
-
-func (s *GrantStore) Effective(ctx context.Context, subject, scope string) ([]string, error) {
-	return nil, nil
-}
-
-func (s *GrantStore) RecordChange(ctx context.Context, subject, scope, role string) error { return nil }
-
-var store = &GrantStore{}
-
-type AssignmentRequest struct {
-	Subject string \`json:"subject"\`
-	Role    string \`json:"role"\`
-	Scope   string \`json:"scope"\`
-}
-
 func cacheKey(subject, scope string) string { return "perm:" + subject + ":" + scope }
 
-func lockKey(subject, scope string) string { return lockKeyPrefix + subject + ":" + scope }
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func currentVersion(ctx context.Context) int64 {
-	value, err := rdb.Get(ctx, grantVersionKey).Int64()
+// effectivePermissions is the permissions the subject holds at scope, sorted.
+func effectivePermissions(ctx context.Context, subject, scope string) []string {
+	// The version first: a set derived after it is stamped with it, so a change that commits meanwhile outdates it.
+	version, err := rdb.Get(ctx, versionKey).Result()
 	if err != nil {
-		return 0
+		version = "0"
 	}
-	return value
-}
-
-// cacheIsCurrent reports whether entry was stamped with the counter read this request.
-func cacheIsCurrent(entry map[string]string, version int64) bool {
-	stamped, err := strconv.ParseInt(entry[cacheVersionField], 10, 64)
-	return err == nil && stamped == version
-}
-
-func recomputeEffective(ctx context.Context, subject, scope string, version int64) ([]string, error) {
-	key, lock := cacheKey(subject, scope), lockKey(subject, scope)
-	token := uuid.NewString()
-	acquired, err := rdb.SetNX(ctx, lock, token, lockTTL).Result()
-	if err != nil {
-		return nil, err
-	}
-	if acquired {
-		defer func() { _ = rdb.Eval(ctx, releaseLockLua, []string{lock}, token) }()
-		perms, err := store.Effective(ctx, subject, scope)
-		if err != nil {
-			return nil, err
+	entry := rdb.HGetAll(ctx, cacheKey(subject, scope)).Val()
+	if stamp, ok := entry["version"]; ok && stamp == version {
+		if entry["permissions"] == "" {
+			return []string{}
 		}
-		pipe := rdb.TxPipeline()
-		pipe.HSet(ctx, key, cachePermsField, strings.Join(perms, ","), cacheVersionField, strconv.FormatInt(version, 10))
-		pipe.Expire(ctx, key, cacheTTL)
-		if _, err := pipe.Exec(ctx); err != nil {
-			return nil, err
-		}
-		return perms, nil
+		return strings.Split(entry["permissions"], ",")
 	}
-	entry, err := rdb.HGetAll(ctx, key).Result()
-	if err != nil {
-		return nil, err
-	}
-	if len(entry) > 0 && cacheIsCurrent(entry, version) {
-		return strings.Split(entry[cachePermsField], ","), nil
-	}
-	return store.Effective(ctx, subject, scope)
+	permissions := grants.Effective(ctx, subject, scope)
+	rdb.HSet(ctx, cacheKey(subject, scope), map[string]any{"permissions": strings.Join(permissions, ","), "version": version})
+	rdb.Expire(ctx, cacheKey(subject, scope), cacheTTL)
+	return permissions
 }
 
-func effectivePermissions(ctx context.Context, subject, scope string) ([]string, error) {
-	version := currentVersion(ctx)
-	entry, err := rdb.HGetAll(ctx, cacheKey(subject, scope)).Result()
-	if err != nil {
-		return nil, err
-	}
-	if len(entry) > 0 && cacheIsCurrent(entry, version) {
-		return strings.Split(entry[cachePermsField], ","), nil
-	}
-	return recomputeEffective(ctx, subject, scope, version)
+func grantRole(ctx context.Context, subject, role, scope, assigner string) grants.Grant {
+	g := grants.Add(ctx, subject, role, scope, assigner)
+	rdb.Incr(ctx, versionKey) // after the commit: every entry stamped before it is stale, at every scope
+	return g
 }
 
-func getPermissions(rw http.ResponseWriter, r *http.Request) {
-	scope := r.URL.Query().Get("scope")
-	if scope == "" {
-		scope = "org"
+func revokeGrant(ctx context.Context, grantID string) *grants.Grant {
+	g := grants.Revoke(ctx, grantID)
+	if g != nil {
+		rdb.Incr(ctx, versionKey)
 	}
-	perms, err := effectivePermissions(r.Context(), r.PathValue("subject"), scope)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	writeJSON(rw, http.StatusOK, map[string]any{"subject": r.PathValue("subject"), "scope": scope, "permissions": perms})
-}
-
-func assign(rw http.ResponseWriter, r *http.Request) {
-	var body AssignmentRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	// The grant is durable first; only then does the clock move, and only then is the call acked.
-	if err := store.RecordChange(r.Context(), body.Subject, body.Scope, body.Role); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	bumpVersion(r.Context())
-	log.Printf("assigned subject=%s role=%s scope=%s", body.Subject, body.Role, body.Scope)
-	writeJSON(rw, http.StatusOK, body)
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/users/{subject}/permissions", getPermissions)
-	mux.HandleFunc("POST /v1/roles/assignments", assign)
-	log.Fatal(http.ListenAndServe(":8444", mux))
-}
-
-// bumpVersion moves the invalidation clock: every entry stamped before this call is now stale.
-func bumpVersion(ctx context.Context) int64 {
-	version, err := rdb.Incr(ctx, grantVersionKey).Result()
-	if err != nil {
-		return 0
-	}
-	return version
+	return g
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
+import spray.json._
 import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
 
-final case class AssignmentRequest(subject: String, role: String, scope: String)
+import permz.Grants // Grants.effective, add, revoke, byId
 
-object StateCache {
-  implicit val system: ActorSystem = ActorSystem("permission-service")
-  implicit val requestFormat: RootJsonFormat[AssignmentRequest] = jsonFormat3(AssignmentRequest)
+object State {
+  val CacheTtlS = 300L
 
-  val jedis = new Jedis("redis", 6379)
-  val CacheTtlS = 300
-
-  val store = GrantStore.open()
+  val jedis = new JedisPooled("redis", 6379)
 
   def cacheKey(subject: String, scope: String): String = s"perm:$subject:$scope"
 
-  def effectivePermissions(subject: String, scope: String): Set[String] = {
-    val key = cacheKey(subject, scope)
-    val cached = jedis.hgetAll(key)
-    if (!cached.isEmpty) cached.get("perms").split(",").filter(_.nonEmpty).toSet
-    else {
-      val perms = store.effective(subject, scope)
-      jedis.hset(key, "perms", perms.mkString(","))
-      jedis.expire(key, CacheTtlS)
-      perms
+  /** The permissions the subject holds at scope, sorted. */
+  def effectivePermissions(subject: String, scope: String): Seq[String] = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    Option(jedis.get(cacheKey(subject, scope))) match {
+      case Some(raw) => raw.parseJson.convertTo[Seq[String]]
+      case None =>
+        val permissions = Grants.effective(subject, scope)
+        jedis.set(cacheKey(subject, scope), permissions.toJson.compactPrint, SetParams.setParams().ex(CacheTtlS))
+        permissions
     }
   }
 
-  def jsonArray(values: Set[String]): String =
-    values.toSeq.sorted.map(p => """ + p + """).mkString("[", ",", "]")
-
-  val route: Route =
-    path("v1" / "users" / Segment / "permissions") { subject =>
-      get {
-        parameter("scope".?) { scopeOpt =>
-          val scope = scopeOpt.getOrElse("org")
-          complete(
-            StatusCodes.OK,
-            s"""{"subject":"$subject","scope":"$scope","permissions":\${jsonArray(effectivePermissions(subject, scope))}}""",
-          )
-        }
-      }
-    } ~
-      path("v1" / "roles" / "assignments") {
-        post {
-          entity(as[AssignmentRequest]) { body =>
-            // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-            store.put(body.subject, body.scope, body.role)
-            jedis.del(cacheKey(body.subject, body.scope))
-            system.log.info(s"assigned subject=\${body.subject} role=\${body.role} scope=\${body.scope}")
-            complete(
-              StatusCodes.OK,
-              s"""{"subject":"\${body.subject}","role":"\${body.role}","scope":"\${body.scope}"}""",
-            )
-          }
-        }
-      }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8444).bind(route)
+  def grantRole(subject: String, role: String, scope: String, assigner: String): Grants.Grant = {
+    jedis.del(cacheKey(subject, scope))
+    Grants.add(subject, role, scope, assigner)
   }
+
+  def revokeGrant(grantId: String): Option[Grants.Grant] =
+    Grants.byId(grantId).flatMap { grant =>
+      jedis.del(cacheKey(grant.subject, grant.scope))
+      Grants.revoke(grantId)
+    }
 }
 `,
-      solution: `import java.util.UUID
+      solution: `import redis.clients.jedis.JedisPooled
 
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.{Jedis, SetParams}
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import scala.jdk.CollectionConverters._
 
-final case class AssignmentRequest(subject: String, role: String, scope: String)
+import permz.Grants // Grants.effective, add, revoke, byId
 
-object StateCache {
-  implicit val system: ActorSystem = ActorSystem("permission-service")
-  implicit val requestFormat: RootJsonFormat[AssignmentRequest] = jsonFormat3(AssignmentRequest)
+object State {
+  val VersionKey = "perm:grant_version"
+  val CacheTtlS = 300L
 
-  val jedis = new Jedis("redis", 6379)
-
-  val GrantVersionKey = "perm:grant_version"
-  val CacheVersionField = "version"
-  val CachePermsField = "perms"
-  val CacheTtlS = 300
-  val LockKeyPrefix = "perm:lock:"
-  val LockTtlMs = 2000
-
-  // Compare-and-delete: a slow worker must not release the lock a younger worker now owns.
-  val ReleaseLockLua = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end"
-
-  val store = GrantStore.open()
+  val jedis = new JedisPooled("redis", 6379)
 
   def cacheKey(subject: String, scope: String): String = s"perm:$subject:$scope"
 
-  def lockKey(subject: String, scope: String): String = s"$LockKeyPrefix$subject:$scope"
-
-  def currentVersion(): Long = Option(jedis.get(GrantVersionKey)).map(_.toLong).getOrElse(0L)
-
-  /** An entry is trustworthy only while its stamp equals the counter read this request. */
-  def cacheIsCurrent(entry: java.util.Map[String, String], version: Long): Boolean =
-    Option(entry.get(CacheVersionField)).contains(version.toString)
-
-  def recomputeEffective(subject: String, scope: String, version: Long): Set[String] = {
-    val key = cacheKey(subject, scope)
-    val lock = lockKey(subject, scope)
-    val token = UUID.randomUUID().toString
-    if (jedis.set(lock, token, SetParams.setParams().nx().px(LockTtlMs)) == "OK") {
-      try {
-        val perms = store.effective(subject, scope)
-        jedis.hset(key, CachePermsField, perms.mkString(","))
-        jedis.hset(key, CacheVersionField, version.toString)
-        jedis.expire(key, CacheTtlS)
-        perms
-      } finally {
-        jedis.eval(ReleaseLockLua, 1, lock, token)
-      }
-    } else {
-      val entry = jedis.hgetAll(key)
-      if (!entry.isEmpty && cacheIsCurrent(entry, version))
-        entry.get(CachePermsField).split(",").filter(_.nonEmpty).toSet
-      else store.effective(subject, scope)
+  /** The permissions the subject holds at scope, sorted. */
+  def effectivePermissions(subject: String, scope: String): Seq[String] = {
+    // The version first: a set derived after it is stamped with it, so a change that commits meanwhile outdates it.
+    val version = Option(jedis.get(VersionKey)).getOrElse("0")
+    val entry = jedis.hgetAll(cacheKey(subject, scope)).asScala
+    if (entry.get("version").contains(version)) entry.getOrElse("permissions", "").split(",").toSeq.filter(_.nonEmpty)
+    else {
+      val permissions = Grants.effective(subject, scope)
+      jedis.hset(cacheKey(subject, scope), Map("permissions" -> permissions.mkString(","), "version" -> version).asJava)
+      jedis.expire(cacheKey(subject, scope), CacheTtlS)
+      permissions
     }
   }
 
-  def effectivePermissions(subject: String, scope: String): Set[String] = {
-    val version = currentVersion()
-    val entry = jedis.hgetAll(cacheKey(subject, scope))
-    if (!entry.isEmpty && cacheIsCurrent(entry, version))
-      entry.get(CachePermsField).split(",").filter(_.nonEmpty).toSet
-    else recomputeEffective(subject, scope, version)
+  def grantRole(subject: String, role: String, scope: String, assigner: String): Grants.Grant = {
+    val grant = Grants.add(subject, role, scope, assigner)
+    jedis.incr(VersionKey) // after the commit: every entry stamped before it is stale, at every scope
+    grant
   }
 
-  def jsonArray(values: Set[String]): String =
-    values.toSeq.sorted.map(p => """ + p + """).mkString("[", ",", "]")
-
-  val route: Route =
-    path("v1" / "users" / Segment / "permissions") { subject =>
-      get {
-        parameter("scope".?) { scopeOpt =>
-          val scope = scopeOpt.getOrElse("org")
-          complete(
-            StatusCodes.OK,
-            s"""{"subject":"$subject","scope":"$scope","permissions":\${jsonArray(effectivePermissions(subject, scope))}}""",
-          )
-        }
-      }
-    } ~
-      path("v1" / "roles" / "assignments") {
-        post {
-          entity(as[AssignmentRequest]) { body =>
-            // The grant is durable first; only then does the clock move, and only then is the call acked.
-            store.recordChange(body.subject, body.scope)
-            bumpVersion()
-            system.log.info(s"assigned subject=\${body.subject} role=\${body.role} scope=\${body.scope}")
-            complete(
-              StatusCodes.OK,
-              s"""{"subject":"\${body.subject}","role":"\${body.role}","scope":"\${body.scope}"}""",
-            )
-          }
-        }
-      }
-
-  /** Move the invalidation clock: every entry stamped before this call is now stale. */
-  def bumpVersion(): Long = jedis.incr(GrantVersionKey)
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8444).bind(route)
+  def revokeGrant(grantId: String): Option[Grants.Grant] = {
+    val grant = Grants.revoke(grantId)
+    if (grant.isDefined) jedis.incr(VersionKey)
+    grant
   }
 }
 `,
     },
     cpp: {
-      starter: `// Effective-permission cache in Redis, refreshed on assignment changes.
-#include <httplib.h>
-#include <nlohmann/json.hpp>
+      starter: `#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <iostream>
-#include <iterator>
+#include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-using json = nlohmann::json;
+#include "permz/grants.h"  // grants::effective, add, revoke, byId
 
-const int kCacheTtlS = 300;
-
-struct GrantStore {
-  std::vector<std::string> effective(const std::string& subject, const std::string& scope);
-  void put(const std::string& subject, const std::string& scope, const std::string& role);
-};
-
-GrantStore store;
+constexpr long long kCacheTtlS = 300;
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-std::string cacheKey(const std::string& subject, const std::string& scope) {
-  return "perm:" + subject + ":" + scope;
-}
+std::string cacheKey(const std::string& subject, const std::string& scope) { return "perm:" + subject + ":" + scope; }
 
-std::string joinPerms(const std::vector<std::string>& perms) {
-  std::string joined;
-  for (const auto& perm : perms) {
-    if (!joined.empty()) joined += ",";
-    joined += perm;
-  }
-  return joined;
-}
-
-std::vector<std::string> splitPerms(const std::string& joined) {
-  std::vector<std::string> out;
-  std::stringstream stream(joined);
-  std::string part;
-  while (std::getline(stream, part, ',')) {
-    if (!part.empty()) out.push_back(part);
-  }
-  return out;
-}
-
+// The permissions the subject holds at scope, sorted.
 std::vector<std::string> effectivePermissions(const std::string& subject, const std::string& scope) {
-  std::unordered_map<std::string, std::string> entry;
-  redis.hgetall(cacheKey(subject, scope), std::inserter(entry, entry.end()));
-  if (!entry.empty()) return splitPerms(entry.at("perms"));
-  const auto perms = store.effective(subject, scope);
-  redis.hset(cacheKey(subject, scope), "perms", joinPerms(perms));
-  redis.expire(cacheKey(subject, scope), std::chrono::seconds(kCacheTtlS));
-  return perms;
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  if (const auto raw = redis.get(cacheKey(subject, scope))) return nlohmann::json::parse(*raw).get<std::vector<std::string>>();
+  const std::vector<std::string> permissions = grants::effective(subject, scope);
+  redis.set(cacheKey(subject, scope), nlohmann::json(permissions).dump(), std::chrono::seconds(kCacheTtlS));
+  return permissions;
 }
 
-int main() {
-  httplib::Server svr;
+grants::Grant grantRole(const std::string& subject, const std::string& role, const std::string& scope, const std::string& assigner) {
+  redis.del(cacheKey(subject, scope));
+  return grants::add(subject, role, scope, assigner);
+}
 
-  svr.Get("/v1/users/:subject/permissions", [](const httplib::Request& req, httplib::Response& res) {
-    const auto subject = req.path_params.at("subject");
-    const auto scope = req.has_param("scope") ? req.get_param_value("scope") : std::string("org");
-    json permissions = json::array();
-    for (const auto& perm : effectivePermissions(subject, scope)) permissions.push_back(perm);
-    res.status = 200;
-    res.set_content(json{{"subject", subject}, {"scope", scope}, {"permissions", permissions}}.dump(),
-                    "application/json");
-  });
-
-  svr.Post("/v1/roles/assignments", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto subject = body.value("subject", std::string());
-    const auto role = body.value("role", std::string());
-    const auto scope = body.value("scope", std::string());
-    store.put(subject, scope, role);
-    redis.del(cacheKey(subject, scope));
-    std::cerr << "assigned subject=" << subject << " role=" << role << " scope=" << scope << "\\n";
-    res.status = 200;
-    res.set_content(json{{"subject", subject}, {"role", role}, {"scope", scope}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8444);
+std::optional<grants::Grant> revokeGrant(const std::string& grant_id) {
+  const auto g = grants::byId(grant_id);
+  if (!g) return std::nullopt;
+  redis.del(cacheKey(g->subject, g->scope));
+  return grants::revoke(grant_id);
 }
 `,
-      solution: `// Effective-permission cache: version-stamped entries invalidated by bumping a global counter.
-#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <chrono>
-#include <iostream>
-#include <iterator>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-using json = nlohmann::json;
+#include "permz/grants.h"  // grants::effective, add, revoke, byId
 
-const std::string kGrantVersionKey = "perm:grant_version";
-const std::string kCacheVersionField = "version";
-const std::string kCachePermsField = "perms";
-const int kCacheTtlS = 300;
-const std::string kLockKeyPrefix = "perm:lock:";
-const int kLockTtlMs = 2000;
-
-// Compare-and-delete: a slow worker must not release the lock a younger worker now owns.
-const std::string kReleaseLockLua =
-    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end";
-
-struct GrantStore {
-  std::vector<std::string> effective(const std::string& subject, const std::string& scope);
-  void recordChange(const std::string& subject, const std::string& scope, const std::string& role);
-};
-
-GrantStore store;
+const std::string kVersionKey = "perm:grant_version";
+constexpr long long kCacheTtlS = 300;
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-long bumpVersion();
-std::string uuidString();
+std::string cacheKey(const std::string& subject, const std::string& scope) { return "perm:" + subject + ":" + scope; }
 
-std::string cacheKey(const std::string& subject, const std::string& scope) {
-  return "perm:" + subject + ":" + scope;
-}
-
-std::string lockKey(const std::string& subject, const std::string& scope) {
-  return kLockKeyPrefix + subject + ":" + scope;
-}
-
-long currentVersion() {
-  auto value = redis.get(kGrantVersionKey);
-  return value ? std::stol(*value) : 0L;
-}
-
-// cacheIsCurrent reports whether entry was stamped with the counter read this request.
-bool cacheIsCurrent(const std::unordered_map<std::string, std::string>& entry, long version) {
-  auto stamped = entry.find(kCacheVersionField);
-  return stamped != entry.end() && stamped->second == std::to_string(version);
-}
-
-std::string joinPerms(const std::vector<std::string>& perms) {
-  std::string joined;
-  for (const auto& perm : perms) {
-    if (!joined.empty()) joined += ",";
-    joined += perm;
-  }
-  return joined;
-}
-
-std::vector<std::string> splitPerms(const std::string& joined) {
-  std::vector<std::string> out;
-  std::stringstream stream(joined);
-  std::string part;
-  while (std::getline(stream, part, ',')) {
-    if (!part.empty()) out.push_back(part);
-  }
-  return out;
-}
-
-std::vector<std::string> recomputeEffective(const std::string& subject, const std::string& scope, long version) {
-  const auto key = cacheKey(subject, scope);
-  const auto lock = lockKey(subject, scope);
-  const auto token = uuidString();
-  if (redis.set(lock, token, std::chrono::milliseconds(kLockTtlMs), sw::redis::UpdateType::NOT_EXIST)) {
-    try {
-      const auto perms = store.effective(subject, scope);
-      redis.hset(key, kCachePermsField, joinPerms(perms));
-      redis.hset(key, kCacheVersionField, std::to_string(version));
-      redis.expire(key, std::chrono::seconds(kCacheTtlS));
-      return perms;
-    } catch (...) {
-      redis.eval(kReleaseLockLua, {lock}, {token});
-      throw;
-    }
-  }
-  std::unordered_map<std::string, std::string> entry;
-  redis.hgetall(key, std::inserter(entry, entry.end()));
-  if (!entry.empty() && cacheIsCurrent(entry, version)) return splitPerms(entry.at(kCachePermsField));
-  return store.effective(subject, scope);
-}
-
+// The permissions the subject holds at scope, sorted.
 std::vector<std::string> effectivePermissions(const std::string& subject, const std::string& scope) {
-  const auto version = currentVersion();
-  std::unordered_map<std::string, std::string> entry;
-  redis.hgetall(cacheKey(subject, scope), std::inserter(entry, entry.end()));
-  if (!entry.empty() && cacheIsCurrent(entry, version)) return splitPerms(entry.at(kCachePermsField));
-  return recomputeEffective(subject, scope, version);
+  // The version first: a set derived after it is stamped with it, so a change that commits meanwhile outdates it.
+  const std::string version = redis.get(kVersionKey).value_or("0");
+  const std::unordered_map<std::string, std::string> entry = redis.hgetall(cacheKey(subject, scope));
+  if (entry.count("version") && entry.at("version") == version) {
+    std::vector<std::string> out;
+    std::stringstream joined(entry.count("permissions") ? entry.at("permissions") : "");
+    for (std::string p; std::getline(joined, p, ',');) out.push_back(p);
+    return out;
+  }
+  const std::vector<std::string> permissions = grants::effective(subject, scope);
+  std::string joined;
+  for (const std::string& p : permissions) joined += (joined.empty() ? "" : ",") + p;
+  redis.hset(cacheKey(subject, scope), {{"permissions", joined}, {"version", version}});
+  redis.expire(cacheKey(subject, scope), kCacheTtlS);
+  return permissions;
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/users/:subject/permissions", [](const httplib::Request& req, httplib::Response& res) {
-    const auto subject = req.path_params.at("subject");
-    const auto scope = req.has_param("scope") ? req.get_param_value("scope") : std::string("org");
-    json permissions = json::array();
-    for (const auto& perm : effectivePermissions(subject, scope)) permissions.push_back(perm);
-    res.status = 200;
-    res.set_content(json{{"subject", subject}, {"scope", scope}, {"permissions", permissions}}.dump(),
-                    "application/json");
-  });
-
-  svr.Post("/v1/roles/assignments", [](const httplib::Request& req, httplib::Response& res) {
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto subject = body.value("subject", std::string());
-    const auto role = body.value("role", std::string());
-    const auto scope = body.value("scope", std::string());
-    // The grant is durable first; only then does the clock move, and only then is the call acked.
-    store.recordChange(subject, scope, role);
-    bumpVersion();
-    std::cerr << "assigned subject=" << subject << " role=" << role << " scope=" << scope << "\\n";
-    res.status = 200;
-    res.set_content(json{{"subject", subject}, {"role", role}, {"scope", scope}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8444);
+grants::Grant grantRole(const std::string& subject, const std::string& role, const std::string& scope, const std::string& assigner) {
+  const grants::Grant g = grants::add(subject, role, scope, assigner);
+  redis.incr(kVersionKey);  // after the commit: every entry stamped before it is stale, at every scope
+  return g;
 }
 
-// bumpVersion moves the invalidation clock: every entry stamped before this call is now stale.
-long bumpVersion() { return redis.incr(kGrantVersionKey); }
-
-std::string uuidString() {
-  static int counter = 0;
-  return "lock-" + std::to_string(++counter);
+std::optional<grants::Grant> revokeGrant(const std::string& grant_id) {
+  const auto g = grants::revoke(grant_id);
+  if (g) redis.incr(kVersionKey);
+  return g;
 }
 `,
     },
   },
-  debrief: `The fix is a counter rather than a delete because a delete carries no information about time. Once the key is gone, the next reader rebuilds it, and a reader that sampled the grants before the change rebuilds the old set with a fresh TTL. A version stamp turns "is this entry fresh?" into a comparison the read makes on every request: the entry carries the counter value it was derived at, and the mutation path (record the grant, then \`INCR\`, then ack) makes the mismatch visible to the very next read. The \`SET NX\` lock keeps concurrent misses from racing to write an older snapshot last. Production services also carry the version through the event stream so the counter survives a Redis loss, and warm the entry on write.`,
+  harness: {
+    python: `def _revoke_elsewhere(ctx):
+    """Another replica revokes g-1 the way the task asks: the grant store commits, then the version moves (and the key goes)."""
+    ctx.redis.delete("grant:g-1")
+    ctx.redis.srem("grants:ada", "g-1")
+    ctx.redis.incr("perm:grant_version")
+    ctx.redis.delete("perm:ada:team:eng")
+
+
+def check_every_scope(ctx):
+    m = ctx.load("state")
+    grant = m.grant_role("ada", "team_admin", "team:eng", "olu")
+    assert "team:write" in m.effective_permissions("ada", "team:eng"), "a team_admin at team:eng must hold team:write there"
+    assert "team:write" in m.effective_permissions("ada", "project:eng/api"), "team:eng covers project:eng/api: ada must hold team:write there"
+    ttl = ctx.redis.ttl("perm:ada:team:eng")
+    assert 0 < ttl <= 300, f"perm:ada:team:eng has a TTL of {ttl} s, expected at most 300"
+    m.revoke_grant(grant["grant_id"])
+    for scope in ("team:eng", "project:eng/api"):
+        seen = m.effective_permissions("ada", scope)
+        assert "team:write" not in seen, f"after ada's team_admin grant at team:eng was revoked, a read at {scope} still answers {seen}: the invalidation must reach every cached scope the grant covered"
+    m.grant_role("ada", "developer", "team:eng", "olu")
+    seen = m.effective_permissions("ada", "project:eng/api")
+    assert "code:write" in seen, f"after developer was granted at team:eng, a read at project:eng/api answers {seen}"
+
+
+def check_after_commit(ctx):
+    m = ctx.load("state")
+    grant = m.grant_role("ada", "team_admin", "team:eng", "olu")
+    assert "team:write" in m.effective_permissions("ada", "team:eng"), "a team_admin at team:eng must hold team:write there"
+    # What a read landing at the moment the revocation first touches the cache would find in the grant store.
+    seen = []
+
+    def at_invalidation():
+        if not seen:
+            seen.append(ctx.redis.exists("grant:g-1") == 1)
+
+    ctx.redis_after("perm:ada:team:eng", at_invalidation)
+    ctx.redis_after("perm:grant_version", at_invalidation)
+    m.revoke_grant(grant["grant_id"])
+    assert seen, "revoke_grant touched neither perm:ada:team:eng nor perm:grant_version: nothing invalidates the cached set"
+    assert seen[0] is False, "revoke_grant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate"
+    after = m.effective_permissions("ada", "team:eng")
+    assert "team:write" not in after, f"after the revocation ada still holds {after}"
+
+
+def check_stamp_before_derive(ctx):
+    m = ctx.load("state")
+    m.grant_role("ada", "team_admin", "team:eng", "olu")
+    # A read misses and derives ada's set; another replica revokes g-1 right after the read loaded it.
+    probe = ctx.redis_after("grant:g-1", lambda: _revoke_elsewhere(ctx))
+    first = m.effective_permissions("ada", "team:eng")
+    assert probe.fired, "the read never loaded ada's grant g-1 from the grant store"
+    if probe.error is not None:
+        raise probe.error
+    after = m.effective_permissions("ada", "team:eng")
+    assert "team:write" not in after, f"the read that was deriving when the revocation committed cached {first}, and the next read still answers {after}: stamp the entry with the version read before deriving, and serve it only while that version is current"
+`,
+    typescript: `function revokeElsewhere(ctx): void {
+  // Another replica revokes g-1 the way the task asks: the grant store commits, then the version moves (and the key goes).
+  ctx.redis.del('grant:g-1');
+  ctx.redis.srem('grants:ada', 'g-1');
+  ctx.redis.incr('perm:grant_version');
+  ctx.redis.del('perm:ada:team:eng');
+}
+
+export async function check_every_scope(ctx) {
+  const m = ctx.load('state');
+  const grant = await m.grantRole('ada', 'team_admin', 'team:eng', 'olu');
+  assert((await m.effectivePermissions('ada', 'team:eng')).includes('team:write'), 'a team_admin at team:eng must hold team:write there');
+  assert((await m.effectivePermissions('ada', 'project:eng/api')).includes('team:write'), 'team:eng covers project:eng/api: ada must hold team:write there');
+  const ttl = ctx.redis.ttl('perm:ada:team:eng');
+  assert(ttl > 0 && ttl <= 300, \`perm:ada:team:eng has a TTL of \${ttl} s, expected at most 300\`);
+  await m.revokeGrant(grant.grant_id);
+  for (const scope of ['team:eng', 'project:eng/api']) {
+    const seen = await m.effectivePermissions('ada', scope);
+    assert(!seen.includes('team:write'), \`after ada's team_admin grant at team:eng was revoked, a read at \${scope} still answers \${JSON.stringify(seen)}: the invalidation must reach every cached scope the grant covered\`);
+  }
+  await m.grantRole('ada', 'developer', 'team:eng', 'olu');
+  const seen = await m.effectivePermissions('ada', 'project:eng/api');
+  assert(seen.includes('code:write'), \`after developer was granted at team:eng, a read at project:eng/api answers \${JSON.stringify(seen)}\`);
+}
+
+export async function check_after_commit(ctx) {
+  const m = ctx.load('state');
+  const grant = await m.grantRole('ada', 'team_admin', 'team:eng', 'olu');
+  assert((await m.effectivePermissions('ada', 'team:eng')).includes('team:write'), 'a team_admin at team:eng must hold team:write there');
+  // What a read landing at the moment the revocation first touches the cache would find in the grant store.
+  const seen: boolean[] = [];
+  const atInvalidation = () => {
+    if (seen.length === 0) seen.push(ctx.redis.exists('grant:g-1') === 1);
+  };
+  ctx.redisAfter('perm:ada:team:eng', atInvalidation);
+  ctx.redisAfter('perm:grant_version', atInvalidation);
+  await m.revokeGrant(grant.grant_id);
+  assert(seen.length > 0, 'revokeGrant touched neither perm:ada:team:eng nor perm:grant_version: nothing invalidates the cached set');
+  assert.equal(seen[0], false, 'revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate');
+  const after = await m.effectivePermissions('ada', 'team:eng');
+  assert(!after.includes('team:write'), \`after the revocation ada still holds \${JSON.stringify(after)}\`);
+}
+
+export async function check_stamp_before_derive(ctx) {
+  const m = ctx.load('state');
+  await m.grantRole('ada', 'team_admin', 'team:eng', 'olu');
+  // A read misses and derives ada's set; another replica revokes g-1 right after the read loaded it.
+  const probe = ctx.redisAfter('grant:g-1', () => revokeElsewhere(ctx));
+  const first = await m.effectivePermissions('ada', 'team:eng');
+  assert(probe.fired, "the read never loaded ada's grant g-1 from the grant store");
+  if (probe.error !== undefined) throw probe.error;
+  const after = await m.effectivePermissions('ada', 'team:eng');
+  assert(!after.includes('team:write'), \`the read that was deriving when the revocation committed cached \${JSON.stringify(first)}, and the next read still answers \${JSON.stringify(after)}: stamp the entry with the version read before deriving, and serve it only while that version is current\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"slices"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+// revokeElsewhere is another replica revoking g-1 the way the task asks: the grant store commits, then the version moves (and the key goes).
+func revokeElsewhere(ctx *harness.Ctx) {
+	ctx.Redis.Do("DEL", "grant:g-1")
+	ctx.Redis.Do("SREM", "grants:ada", "g-1")
+	ctx.Redis.Do("INCR", "perm:grant_version")
+	ctx.Redis.Do("DEL", "perm:ada:team:eng")
+}
+
+func CheckEveryScope(ctx *harness.Ctx) {
+	g := grantRole(stateBg, "ada", "team_admin", "team:eng", "olu")
+	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
+	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there")
+	ttl := ctx.Redis.TTL("perm:ada:team:eng")
+	ctx.Assert(ttl > 0 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected at most 300", ttl)
+	revokeGrant(stateBg, g.GrantID)
+	for _, scope := range []string{"team:eng", "project:eng/api"} {
+		seen := effectivePermissions(stateBg, "ada", scope)
+		ctx.Assert(!slices.Contains(seen, "team:write"), "after ada's team_admin grant at team:eng was revoked, a read at %s still answers %v: the invalidation must reach every cached scope the grant covered", scope, seen)
+	}
+	grantRole(stateBg, "ada", "developer", "team:eng", "olu")
+	seen := effectivePermissions(stateBg, "ada", "project:eng/api")
+	ctx.Assert(slices.Contains(seen, "code:write"), "after developer was granted at team:eng, a read at project:eng/api answers %v", seen)
+}
+
+func CheckAfterCommit(ctx *harness.Ctx) {
+	g := grantRole(stateBg, "ada", "team_admin", "team:eng", "olu")
+	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
+	// What a read landing at the moment the revocation first touches the cache would find in the grant store.
+	var seen []bool
+	atInvalidation := func() any {
+		if len(seen) == 0 {
+			seen = append(seen, ctx.Redis.Exists("grant:g-1") == 1)
+		}
+		return nil
+	}
+	ctx.Redis.After("perm:ada:team:eng", atInvalidation)
+	ctx.Redis.After("perm:grant_version", atInvalidation)
+	revokeGrant(stateBg, g.GrantID)
+	ctx.Assert(len(seen) > 0, "revokeGrant touched neither perm:ada:team:eng nor perm:grant_version: nothing invalidates the cached set")
+	ctx.Assert(!seen[0], "revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate")
+	after := effectivePermissions(stateBg, "ada", "team:eng")
+	ctx.Assert(!slices.Contains(after, "team:write"), "after the revocation ada still holds %v", after)
+}
+
+func CheckStampBeforeDerive(ctx *harness.Ctx) {
+	grantRole(stateBg, "ada", "team_admin", "team:eng", "olu")
+	// A read misses and derives ada's set; another replica revokes g-1 right after the read loaded it.
+	probe := ctx.Redis.After("grant:g-1", func() any {
+		revokeElsewhere(ctx)
+		return nil
+	})
+	first := effectivePermissions(stateBg, "ada", "team:eng")
+	ctx.Assert(probe.Fired, "the read never loaded ada's grant g-1 from the grant store")
+	after := effectivePermissions(stateBg, "ada", "team:eng")
+	ctx.Assert(!slices.Contains(after, "team:write"), "the read that was deriving when the revocation committed cached %v, and the next read still answers %v: stamp the entry with the version read before deriving, and serve it only while that version is current", first, after)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "permz/grants.h"
+
+namespace {
+
+bool holds(const std::vector<std::string>& permissions, const std::string& p) {
+  return std::find(permissions.begin(), permissions.end(), p) != permissions.end();
+}
+
+// Another replica revoking g-1 the way the task asks: the grant store commits, then the version moves (and the key goes).
+void revokeElsewhere(harness::Ctx& ctx) {
+  ctx.Redis.Do("DEL", "grant:g-1");
+  ctx.Redis.Do("SREM", "grants:ada", "g-1");
+  ctx.Redis.Do("INCR", "perm:grant_version");
+  ctx.Redis.Do("DEL", "perm:ada:team:eng");
+}
+
+}  // namespace
+
+void CheckEveryScope(harness::Ctx& ctx) {
+  const grants::Grant g = grantRole("ada", "team_admin", "team:eng", "olu");
+  ctx.Assert(holds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
+  ctx.Assert(holds(effectivePermissions("ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there");
+  const long long ttl = ctx.Redis.TTL("perm:ada:team:eng");
+  ctx.Assert(ttl > 0 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected at most 300", ttl);
+  revokeGrant(g.grant_id);
+  for (const std::string scope : {"team:eng", "project:eng/api"}) {
+    const auto seen = effectivePermissions("ada", scope);
+    ctx.Assert(!holds(seen, "team:write"), "after ada's team_admin grant at team:eng was revoked, a read at %s still answers %v: the invalidation must reach every cached scope the grant covered", scope, seen);
+  }
+  grantRole("ada", "developer", "team:eng", "olu");
+  const auto seen = effectivePermissions("ada", "project:eng/api");
+  ctx.Assert(holds(seen, "code:write"), "after developer was granted at team:eng, a read at project:eng/api answers %v", seen);
+}
+
+void CheckAfterCommit(harness::Ctx& ctx) {
+  const grants::Grant g = grantRole("ada", "team_admin", "team:eng", "olu");
+  ctx.Assert(holds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
+  // What a read landing at the moment the revocation first touches the cache would find in the grant store.
+  std::vector<bool> seen;
+  const auto atInvalidation = [&ctx, &seen] {
+    if (seen.empty()) seen.push_back(ctx.Redis.Exists("grant:g-1") == 1);
+  };
+  ctx.Redis.After("perm:ada:team:eng", atInvalidation);
+  ctx.Redis.After("perm:grant_version", atInvalidation);
+  revokeGrant(g.grant_id);
+  ctx.Assert(!seen.empty(), "revokeGrant touched neither perm:ada:team:eng nor perm:grant_version: nothing invalidates the cached set");
+  ctx.Assert(!seen[0], "revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate");
+  const auto after = effectivePermissions("ada", "team:eng");
+  ctx.Assert(!holds(after, "team:write"), "after the revocation ada still holds %v", after);
+}
+
+void CheckStampBeforeDerive(harness::Ctx& ctx) {
+  grantRole("ada", "team_admin", "team:eng", "olu");
+  // A read misses and derives ada's set; another replica revokes g-1 right after the read loaded it.
+  bool fired = false;
+  ctx.Redis.After("grant:g-1", [&ctx, &fired] {
+    fired = true;
+    revokeElsewhere(ctx);
+  });
+  const auto first = effectivePermissions("ada", "team:eng");
+  ctx.Assert(fired, "the read never loaded ada's grant g-1 from the grant store");
+  const auto after = effectivePermissions("ada", "team:eng");
+  ctx.Assert(!holds(after, "team:write"), "the read that was deriving when the revocation committed cached %v, and the next read still answers %v: stamp the entry with the version read before deriving, and serve it only while that version is current", first, after);
+}
+`,
+  },
+  hints: [
+    "Revoke a team admin, then read their permissions at one of the team's projects: `team:write` is still there. Revoke again while another request is reading, and the old set comes back with a fresh TTL.",
+    'Deleting `perm:{subject}:{scope}` reaches one key, before the grant store changes, and an entry records nothing about when it was derived, so a read that derived the old set can store it after any delete.',
+    'Write the grant, then `INCR perm:grant_version`; drop the deletes. In the read, `GET` the version first, serve the hash only when its `version` equals it, else derive and `HSET {permissions, version}` with `EXPIRE 300`.',
+  ],
+  debrief: `A delete carries no information about time: once the key is gone, any reader can put back whatever it derived, including a set from before the change. A version counter turns "is this entry fresh?" into a comparison every read makes, and one \`INCR\` outdates every scope a grant covered without knowing which keys exist. The order matters twice: the change commits before the bump, so a read after the bump sees the new grants, and the read takes the version before deriving, so a set derived during a change carries the older stamp. Production services also collapse concurrent misses behind a short lock and carry the version in the event stream, so the counter can be rebuilt after a Redis loss.`,
 };

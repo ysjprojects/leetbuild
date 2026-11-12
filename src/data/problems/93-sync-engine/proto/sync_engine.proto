@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package syncd;
+
+// The merge service step 3 asks when a push landed on a stale base: a three-way merge of the body
+// at the device's base revision (base), the device's body (local) and the current body (remote).
+// Edits that overlap are FAILED_PRECONDITION (not mergeable), with the reason in the details; an
+// overloaded or restarting merger answers UNAVAILABLE.
+service Merger {
+  rpc ThreeWayMerge(MergeRequest) returns (MergeResult);
+}
+
+message MergeRequest {
+  string doc_id = 1;
+  int64 base_revision = 2;
+  string base = 3;
+  string local = 4;
+  string remote = 5;
+}
+
+message MergeResult {
+  string body = 1;
+}

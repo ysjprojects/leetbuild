@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package mapsrouting;
+
+// The routing engine mapsd calls (engine:9000): one solve per route request. NOT_FOUND means no
+// road connects the points (OSRM's NoRoute) and is terminal; UNAVAILABLE and DEADLINE_EXCEEDED say
+// nothing about the trip and may be retried.
+service RoutingEngine {
+  rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRouteReply);
+}
+
+message LatLng {
+  double lat = 1;
+  double lng = 2;
+}
+
+message ComputeRouteRequest {
+  LatLng origin = 1;
+  LatLng destination = 2;
+  repeated LatLng waypoints = 3;
+  // The traffic epoch the route is solved for: floor(unix seconds / 300).
+  int64 epoch = 4;
+}
+
+message ComputeRouteReply {
+  double distance_m = 1;
+  double duration_s = 2;
+  // The route's polyline.
+  string geometry = 3;
+  // The engine build and map extract that solved it.
+  string engine_version = 4;
+}

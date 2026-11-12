@@ -2,487 +2,234 @@ import type {Step} from '@/lib/types';
 
 export const stateStep: Step = {
   id: 'state',
-  title: 'Redis registry with TTL heartbeats and atomic replace',
+  title: 'Heartbeats that renew metadata and expiry in one script',
   concept: 'redis',
   file: 'state',
   focus: ['discovery', 'redis', 'reaper'],
   task: `## Task
 
-**Starting point.** The starter serves the two writes that keep a registry entry true, under
-\`sd:{service}:{instance_id}\`. \`POST /v1/instances/{service}/{instance_id}/heartbeat\` (body
-\`{"address", "port", "metadata_version", "heartbeat_interval"}\`) \`GET\`s the record, overwrites
-address and port, \`SET\`s it back and calls \`EXPIRE\` with a constant \`TTL_SECONDS\`;
-\`POST …/replace\` writes the replacement and then deletes a \`sd:previous:…\` key. It serves the demo,
-which never restarts an instance or deploys, and hides five flaws.
+**Starting point.** The starter is the heartbeat every registered instance sends each
+\`heartbeat_interval\` seconds: \`heartbeat(service, instance_id, address, port, metadata_version,
+heartbeat_interval)\` checks that \`sd:{service}:{instance_id}\` exists (\`gone\` otherwise, and the
+agent re-registers), \`HSET\`s the address, port, version, interval and \`last_heartbeat\`, then
+\`EXPIRE\`s the key after \`TTL_SECONDS\` and answers \`renewed\`. It serves the demo and hides three
+flaws.
 
-**Failure mode the checks target.** A restarted instance with a new address keeps receiving traffic
-at its old one, because the key stays warm while its metadata rots, and two heartbeats can
-interleave between the \`GET\`, the \`SET\` and the \`EXPIRE\`. A lagging old replica rolls a
-rollout back by overwriting a newer \`metadata_version\`. During every deploy window two live
-addresses claim \`checkout-3\`. The TTL is a constant that ignores the promised interval.
+**Failure mode the checks target.** A heartbeat that lands as the record lapses writes it back after
+the sweep announced the instance expired, so the agent heartbeats into a record no read lists; a
+lagging replica's older \`metadata_version\` rolls a rollout back; and the expiry ignores the interval
+the instance just promised.
 
-- The heartbeat renews an instance that is already registered; a missing key is **410 Gone**.
-- Everything moves in one atomic script (\`RENEW_LUA\`, \`register_script\`): the new address, port,
-  \`metadata_version\`, the \`last_heartbeat\` stamp from \`redis.call('TIME')\` and the key's expiry.
-  No client-side \`expire\` on the renewal path.
-- An incoming \`metadata_version\` below the stored one is **409 Conflict** and writes nothing.
-- The expiry is \`TTL_INTERVALS * heartbeat_interval\` seconds (three intervals), set inside the same
-  script with \`'EX'\`.
-- \`replace\` moves one identity to a new address inside one script (\`REPLACE_LUA\`): \`DEL\` the old
-  record when its address differs, then \`SET\` the replacement with its own TTL, and answer **200**
-  with the address it installed.`,
+- The existence check, the version comparison, the write and the expiry run as one Lua script
+  (\`register_script\`), so nothing lands between them.
+- A \`metadata_version\` below the stored one answers \`stale\` and writes nothing; an equal or higher
+  one renews.
+- The expiry is \`TTL_INTERVALS * heartbeat_interval\` seconds from this heartbeat
+  (\`instances.TTL_INTERVALS\`).`,
   sequence: {
     participants: ['Instance', 'Discovery API', 'Redis'],
     messages: [
-      {
-        from: 'Instance',
-        to: 'Discovery API',
-        label: 'POST /v1/instances/checkout/checkout-3/heartbeat {version 13, interval 5}',
-        kind: 'sync',
-      },
+      {from: 'Instance', to: 'Discovery API', label: 'heartbeat checkout-3 · version 14 · interval 5', kind: 'sync'},
       {
         from: 'Discovery API',
         to: 'Redis',
-        label: 'EVAL RENEW_LUA KEYS[sd:checkout:checkout-3] ARGV[address, port, 13, 5, 15]',
+        label: 'EVALSHA renew sd:checkout:checkout-3 · 10.4.2.7 8080 14 5 now 15',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Discovery API', label: '1 renewed · 0 no such instance · -1 stale version', kind: 'reply'},
-      {from: 'Discovery API', to: 'Instance', label: '200 {metadata_version, ttl_seconds} · 409 · 410', kind: 'reply'},
-      {from: 'Instance', to: 'Discovery API', label: 'POST …/replace {address 10.4.9.4, version 14}', kind: 'sync'},
       {
-        from: 'Discovery API',
+        from: 'Redis',
         to: 'Redis',
-        label: 'EVAL REPLACE_LUA — DEL sd:checkout:checkout-3, then SET address 10.4.9.4 EX 15',
+        label: 'HGET version · nil → gone · 14 < stored → stale · HSET · EXPIRE 15',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Discovery API', label: 'OK', kind: 'reply'},
-      {
-        from: 'Discovery API',
-        to: 'Instance',
-        label: '200 {address 10.4.9.4} — one identity, one address',
-        kind: 'reply',
-      },
+      {from: 'Redis', to: 'Discovery API', label: 'renewed · stale · gone', kind: 'reply'},
+      {from: 'Discovery API', to: 'Instance', label: 'renewed · stale (stop) · gone (re-register)', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'atomic-renew',
-      title: 'Metadata and TTL are renewed by one atomic script',
+      title: 'Existence, write and expiry are one script',
       detail:
-        'The renewal reads, clears the version guard, rewrites the record and sets the expiry inside a single `EVAL` (`register_script`, `NewScript`, `eval`), so metadata and liveness can never move apart.',
+        'The renewal runs in one Lua script (`register_script`, `defineCommand`, `NewScript`, `eval`) that reads the record, writes it and sets its `EXPIRE`; there is no client-side `EXISTS`, `HSET` or `EXPIRE` on the path. The starter sends three commands, so a record that lapses between them is written back.',
       match: {
-        python: {all: [/RENEW_LUA/, /register_script\(/, /'EX'/]},
-        typescript: {all: [/RENEW_LUA/, /\.eval\(/, /'EX'/]},
-        go: {all: [/renewScript/, /\.Run\(/, /'EX'/]},
-        scala: {all: [/RenewLua/, /\.eval\(/, /'EX'/]},
-        cpp: {all: [/kRenewLua/, /\.eval/, /'EX'/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/r\.exists\(/, /r\.expire\(/, /r\.hset\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/redis\.exists\(/, /redis\.expire\(/, /redis\.hset\(/],
+        },
+        go: {
+          all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/rdb\.Exists\(/, /rdb\.Expire\(/, /rdb\.HSet\(/],
+        },
+        scala: {
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/jedis\.exists\(/, /jedis\.expire\(/, /jedis\.hset\(/],
+        },
+        cpp: {
+          all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]EXPIRE['"]/],
+          none: [/redis\.exists\(/, /redis\.expire\(/, /redis\.hset\(/],
+        },
       },
     },
     {
       id: 'version-guard',
       title: 'An older metadata version is refused',
       detail:
-        'A heartbeat carrying a `metadata_version` below the stored one answers **409 Conflict** and writes nothing, so a restarted or lagging replica cannot undo a rollout. The starter overwrites the version with whatever arrives.',
+        'Inside the script the incoming `metadata_version` is compared with the stored one (`tonumber`), and a lower one returns `stale` without writing. The starter overwrites the version with whatever arrives.',
       match: {
-        python: {all: [/metadata_version/, /409/]},
-        typescript: {all: [/metadata_version/, /409/]},
-        go: {all: [/metadata_version/, /409|StatusConflict/]},
-        scala: {all: [/metadata_version/, /409|Conflict/]},
-        cpp: {all: [/metadata_version/, /409/]},
-      },
-    },
-    {
-      id: 'identity-swap',
-      title: 'One identity, one address across a replace',
-      detail:
-        'The replace script removes the old record (`DEL`) before it writes the replacement inside the same `EVAL`, so no reader sees two addresses for one identity during a deploy. The starter registers the replacement first and removes the original afterwards.',
-      match: {
-        python: {all: [/REPLACE_LUA/, /DEL/, /SET/]},
-        typescript: {all: [/REPLACE_LUA/, /DEL/, /SET/]},
-        go: {all: [/replaceScript/, /DEL/, /SET/]},
-        scala: {all: [/ReplaceLua/, /DEL/, /SET/]},
-        cpp: {all: [/kReplaceLua/, /DEL/, /SET/]},
+        python: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
+        typescript: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
+        go: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
+        scala: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
+        cpp: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
       },
     },
     {
       id: 'expiry-derived',
-      title: 'Expiry is three heartbeat intervals',
+      title: 'The expiry is three of the promised intervals',
       detail:
-        'The TTL written by the script is `3 * heartbeat_interval` seconds, derived from the interval the instance promised in the same request — not a constant. A hardcoded TTL either declares a healthy instance dead or keeps a ghost alive for minutes.',
+        'The TTL the script sets is `TTL_INTERVALS * heartbeat_interval` from the same heartbeat, not a constant: a constant declares a fast-heartbeating instance dead late and a slow one dead early.',
       match: {
-        python: {all: [/TTL_INTERVALS/, /heartbeat_interval/, /'EX'/]},
-        typescript: {all: [/TTL_INTERVALS/, /heartbeat_interval|heartbeatInterval/, /'EX'/]},
-        go: {all: [/ttlIntervals/, /heartbeatInterval|HeartbeatInterval/, /'EX'/]},
-        scala: {all: [/TtlIntervals/, /heartbeat_interval|heartbeatInterval/, /'EX'/]},
-        cpp: {all: [/kTtlIntervals/, /heartbeatInterval/, /'EX'/]},
-      },
-    },
-    {
-      id: 'no-bare-expire',
-      title: 'No client-side EXPIRE on the renewal path',
-      detail:
-        'The renewal never calls `EXPIRE` from the client: a bare expiry refresh is the starter’s signature bug, because it renews liveness without renewing the metadata that liveness is supposed to certify.',
-      match: {
-        python: {all: [/RENEW_LUA/], none: [/\.expire\(/]},
-        typescript: {all: [/RENEW_LUA/], none: [/\.expire\(/]},
-        go: {all: [/renewScript/], none: [/\.Expire\(ctx/]},
-        scala: {all: [/RenewLua/], none: [/\.expire\(/]},
-        cpp: {all: [/kRenewLua/], none: [/\.expire\(/]},
+        python: {all: [/TTL_INTERVALS\s*\*\s*heartbeat_interval/], none: [/TTL_SECONDS/]},
+        typescript: {all: [/TTL_INTERVALS\s*\*\s*heartbeatInterval/], none: [/TTL_SECONDS/]},
+        go: {all: [/TTLIntervals\s*\*\s*heartbeatInterval/], none: [/ttlSeconds/]},
+        scala: {all: [/TtlIntervals\s*\*\s*heartbeatInterval/], none: [/TtlSeconds/]},
+        cpp: {all: [/kTtlIntervals\s*\*\s*heartbeat_interval/], none: [/kTtlSeconds/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-import logging
-import time
+      starter: `import time
 
 import redis
-from fastapi import FastAPI
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("discovery")
+from discovery import instances  # record_key, members_key, TTL_INTERVALS
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 TTL_SECONDS = 30
 
 
-class RenewRequest(BaseModel):
-    address: str
-    port: int
-    metadata_version: int
-    heartbeat_interval: int
-
-
-def key_of(service: str, instance_id: str) -> str:
-    return f"sd:{service}:{instance_id}"
-
-
-@app.post("/v1/instances/{service}/{instance_id}/heartbeat")
-def heartbeat(service: str, instance_id: str, body: RenewRequest) -> dict:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = key_of(service, instance_id)
-    raw = r.get(key)
-    if raw is None:
-        return {"status": "unregistered"}
-    record = json.loads(raw)
-    record["address"] = body.address
-    record["port"] = body.port
-    record["last_heartbeat"] = int(time.time())
-    r.set(key, json.dumps(record))
+def heartbeat(service: str, instance_id: str, address: str, port: int, metadata_version: int, heartbeat_interval: int) -> str:
+    """Renew a registered instance: renewed, or gone when its record lapsed (the agent re-registers)."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    key = instances.record_key(service, instance_id)
+    if not r.exists(key):
+        return "gone"
+    r.hset(key, mapping={
+        "address": address,
+        "port": port,
+        "metadata_version": metadata_version,
+        "heartbeat_interval": heartbeat_interval,
+        "last_heartbeat": int(time.time()),
+    })
     r.expire(key, TTL_SECONDS)
-    logger.info("renew %s", key)
-    return {"status": "renewed"}
-
-
-@app.post("/v1/instances/{service}/{instance_id}/replace")
-def replace(service: str, instance_id: str, body: RenewRequest) -> dict:
-    key = key_of(service, instance_id)
-    record = {"address": body.address, "port": body.port, "metadata_version": body.metadata_version}
-    r.set(key, json.dumps(record))
-    r.expire(key, TTL_SECONDS)
-    previous = f"sd:previous:{service}:{instance_id}"
-    if r.exists(previous):
-        r.delete(previous)
-    return {"status": "replaced", "address": body.address}
+    return "renewed"
 `,
-      solution: `import json
-import logging
+      solution: `import time
 
 import redis
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
-app = FastAPI()
-logger = logging.getLogger("discovery")
+from discovery import instances  # record_key, members_key, TTL_INTERVALS
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-TTL_INTERVALS = 3
-
-# Renew a live instance in one round trip: the address, the metadata version, the heartbeat stamp
-# and the expiry move together, so a restarted instance can never keep stale metadata routable.
+# KEYS[1] the record; ARGV address, port, metadata_version, heartbeat_interval, now, ttl.
+# Only registration creates a record: a lapsed one stays gone, and versions only move forward.
 RENEW_LUA = """
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return 0
-end
-local current = cjson.decode(raw)
-if tonumber(ARGV[3]) < tonumber(current['metadata_version']) then
-  return -1
-end
-current['address'] = ARGV[1]
-current['port'] = tonumber(ARGV[2])
-current['metadata_version'] = tonumber(ARGV[3])
-current['heartbeat_interval'] = tonumber(ARGV[4])
-current['last_heartbeat'] = tonumber(redis.call('TIME')[1])
-redis.call('SET', KEYS[1], cjson.encode(current), 'EX', ARGV[5])
-return 1
+local stored = redis.call('HGET', KEYS[1], 'metadata_version')
+if not stored then return 'gone' end
+if tonumber(ARGV[3]) < tonumber(stored) then return 'stale' end
+redis.call('HSET', KEYS[1], 'address', ARGV[1], 'port', ARGV[2], 'metadata_version', ARGV[3],
+  'heartbeat_interval', ARGV[4], 'last_heartbeat', ARGV[5])
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+return 'renewed'
 """
-
-# A deploy moves one identity to one address. The previous record is removed inside the same
-# script, before the replacement exists, so no reader ever sees two addresses for one identity.
-REPLACE_LUA = """
-local raw = redis.call('GET', KEYS[1])
-if raw then
-  local current = cjson.decode(raw)
-  if current['address'] ~= ARGV[1] then
-    redis.call('DEL', KEYS[1])
-  end
-end
-redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[5])
-return 1
-"""
-
-renew_script = r.register_script(RENEW_LUA)
-replace_script = r.register_script(REPLACE_LUA)
+renew = r.register_script(RENEW_LUA)
 
 
-class RenewRequest(BaseModel):
-    address: str
-    port: int
-    metadata_version: int
-    heartbeat_interval: int
-
-
-def key_of(service: str, instance_id: str) -> str:
-    return f"sd:{service}:{instance_id}"
-
-
-@app.post("/v1/instances/{service}/{instance_id}/heartbeat")
-def heartbeat(service: str, instance_id: str, body: RenewRequest) -> dict:
-    key = key_of(service, instance_id)
-    ttl_seconds = TTL_INTERVALS * body.heartbeat_interval
-    outcome = renew_script(
-        keys=[key],
-        args=[body.address, body.port, body.metadata_version, body.heartbeat_interval, ttl_seconds],
+def heartbeat(service: str, instance_id: str, address: str, port: int, metadata_version: int, heartbeat_interval: int) -> str:
+    """Renew a registered instance: renewed, stale (an older metadata_version, nothing written) or gone (re-register)."""
+    ttl = instances.TTL_INTERVALS * heartbeat_interval
+    return renew(
+        keys=[instances.record_key(service, instance_id)],
+        args=[address, port, metadata_version, heartbeat_interval, int(time.time()), ttl],
     )
-    if outcome == 0:
-        raise HTTPException(status_code=410, detail="instance is not registered; register again")
-    if outcome == -1:
-        raise HTTPException(status_code=409, detail="metadata_version is older than the stored one")
-    logger.info("renew service=%s instance=%s version=%d ttl=%d", service, instance_id, body.metadata_version, ttl_seconds)
-    return {
-        "service": service,
-        "instance_id": instance_id,
-        "address": body.address,
-        "metadata_version": body.metadata_version,
-        "ttl_seconds": ttl_seconds,
-        "key": key,
-    }
-
-
-@app.post("/v1/instances/{service}/{instance_id}/replace")
-def replace(service: str, instance_id: str, body: RenewRequest) -> dict:
-    key = key_of(service, instance_id)
-    ttl_seconds = TTL_INTERVALS * body.heartbeat_interval
-    record = json.dumps({
-        "service": service,
-        "instance_id": instance_id,
-        "address": body.address,
-        "port": body.port,
-        "heartbeat_interval": body.heartbeat_interval,
-        "metadata_version": body.metadata_version,
-    })
-    replace_script(
-        keys=[key],
-        args=[body.address, body.port, body.metadata_version, body.heartbeat_interval, ttl_seconds, record],
-    )
-    logger.info("replace service=%s instance=%s address=%s ttl=%d", service, instance_id, body.address, ttl_seconds)
-    return {
-        "service": service,
-        "instance_id": instance_id,
-        "address": body.address,
-        "metadata_version": body.metadata_version,
-        "ttl_seconds": ttl_seconds,
-    }
 `,
     },
     typescript: {
-      starter: `/** Heartbeat and replace for the Redis registry: flawed code. */
-import Fastify from 'fastify';
-import Redis from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
+import * as instances from 'discovery/instances'; // recordKey, membersKey, TTL_INTERVALS
 
-const TTL_SECONDS = 30;
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface RenewBody {
-  address: string;
-  port: number;
-  metadata_version: number;
-  heartbeat_interval: number;
-}
+export const TTL_SECONDS = 30;
 
-const keyOf = (service: string, instanceId: string): string => \`sd:\${service}:\${instanceId}\`;
-
-interface InstanceRecord {
-  service: string;
-  instance_id: string;
-  address: string;
-  port: number;
-  metadata_version: number;
-  heartbeat_interval: number;
-  last_heartbeat: number;
-}
-
-app.post('/v1/instances/:service/:instanceId/heartbeat', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const {service, instanceId} = request.params as {service: string; instanceId: string};
-  const body = request.body as RenewBody;
-  const key = keyOf(service, instanceId);
-  const raw = await redis.get(key);
-  if (raw === null) return reply.code(200).send({status: 'unregistered'});
-  const record = JSON.parse(raw) as InstanceRecord;
-  record.address = body.address;
-  record.port = body.port;
-  record.last_heartbeat = Math.floor(Date.now() / 1000);
-  await redis.set(key, JSON.stringify(record));
+/** Renew a registered instance: renewed, or gone when its record lapsed (the agent re-registers). */
+export async function heartbeat(
+  service: string,
+  instanceId: string,
+  address: string,
+  port: number,
+  metadataVersion: number,
+  heartbeatInterval: number,
+): Promise<string> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const key = instances.recordKey(service, instanceId);
+  if ((await redis.exists(key)) === 0) return 'gone';
+  await redis.hset(key, {
+    address,
+    port: String(port),
+    metadata_version: String(metadataVersion),
+    heartbeat_interval: String(heartbeatInterval),
+    last_heartbeat: String(Math.floor(Date.now() / 1000)),
+  });
   await redis.expire(key, TTL_SECONDS);
-  request.log.info({key}, 'renewed');
-  return reply.code(200).send({status: 'renewed'});
-});
-
-app.post('/v1/instances/:service/:instanceId/replace', async (request, reply) => {
-  const {service, instanceId} = request.params as {service: string; instanceId: string};
-  const body = request.body as RenewBody;
-  const key = keyOf(service, instanceId);
-  const record: InstanceRecord = {
-    service,
-    instance_id: instanceId,
-    address: body.address,
-    port: body.port,
-    metadata_version: body.metadata_version,
-    heartbeat_interval: body.heartbeat_interval,
-    last_heartbeat: Math.floor(Date.now() / 1000),
-  };
-  await redis.set(key, JSON.stringify(record));
-  await redis.expire(key, TTL_SECONDS);
-  await redis.del(\`sd:previous:\${service}:\${instanceId}\`);
-  return reply.code(200).send({status: 'replaced', address: body.address});
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+  return 'renewed';
+}
 `,
-      solution: `/** Heartbeat and replace for the Redis registry: atomic, versioned, TTL-derived. */
-import Fastify from 'fastify';
-import Redis from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
+import * as instances from 'discovery/instances'; // recordKey, membersKey, TTL_INTERVALS
 
-const TTL_INTERVALS = 3;
-
-// Renew a live instance in one round trip: the address, the metadata version, the heartbeat stamp
-// and the expiry move together, so a restarted instance can never keep stale metadata routable.
-const RENEW_LUA = \`
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return 0
-end
-local current = cjson.decode(raw)
-if tonumber(ARGV[3]) < tonumber(current['metadata_version']) then
-  return -1
-end
-current['address'] = ARGV[1]
-current['port'] = tonumber(ARGV[2])
-current['metadata_version'] = tonumber(ARGV[3])
-current['heartbeat_interval'] = tonumber(ARGV[4])
-current['last_heartbeat'] = tonumber(redis.call('TIME')[1])
-redis.call('SET', KEYS[1], cjson.encode(current), 'EX', ARGV[5])
-return 1
+// KEYS[1] the record; ARGV address, port, metadata_version, heartbeat_interval, now, ttl.
+// Only registration creates a record: a lapsed one stays gone, and versions only move forward.
+export const RENEW_LUA = \`
+local stored = redis.call('HGET', KEYS[1], 'metadata_version')
+if not stored then return 'gone' end
+if tonumber(ARGV[3]) < tonumber(stored) then return 'stale' end
+redis.call('HSET', KEYS[1], 'address', ARGV[1], 'port', ARGV[2], 'metadata_version', ARGV[3],
+  'heartbeat_interval', ARGV[4], 'last_heartbeat', ARGV[5])
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+return 'renewed'
 \`;
 
-// A deploy moves one identity to one address: the previous record is removed inside the same
-// script, before the replacement exists, so no reader sees two addresses for one identity.
-const REPLACE_LUA = \`
-local raw = redis.call('GET', KEYS[1])
-if raw then
-  local current = cjson.decode(raw)
-  if current['address'] ~= ARGV[1] then
-    redis.call('DEL', KEYS[1])
-  end
-end
-redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[5])
-return 1
-\`;
-
-interface RenewBody {
-  address: string;
-  port: number;
-  metadata_version: number;
-  heartbeat_interval: number;
+interface RenewRedis extends Redis {
+  renew(key: string, ...args: (string | number)[]): Promise<string>;
 }
 
-const keyOf = (service: string, instanceId: string): string => \`sd:\${service}:\${instanceId}\`;
+const redis = new Redis({host: 'redis', port: 6379}) as RenewRedis;
+redis.defineCommand('renew', {numberOfKeys: 1, lua: RENEW_LUA});
 
-app.post('/v1/instances/:service/:instanceId/heartbeat', async (request, reply) => {
-  const {service, instanceId} = request.params as {service: string; instanceId: string};
-  const body = request.body as RenewBody;
-  const key = keyOf(service, instanceId);
-  const ttlSeconds = TTL_INTERVALS * body.heartbeat_interval;
-  const outcome = Number(
-    await redis.eval(
-      RENEW_LUA,
-      1,
-      key,
-      body.address,
-      String(body.port),
-      String(body.metadata_version),
-      String(body.heartbeat_interval),
-      String(ttlSeconds),
-    ),
-  );
-  if (outcome === 0) return reply.code(410).send({error: 'instance is not registered; register again'});
-  if (outcome === -1) return reply.code(409).send({error: 'metadata_version is older than the stored one'});
-  request.log.info({service, instanceId, metadata_version: body.metadata_version, ttl_seconds: ttlSeconds}, 'renewed');
-  return reply.code(200).send({
-    service,
-    instance_id: instanceId,
-    address: body.address,
-    metadata_version: body.metadata_version,
-    ttl_seconds: ttlSeconds,
-    key,
-  });
-});
-
-app.post('/v1/instances/:service/:instanceId/replace', async (request, reply) => {
-  const {service, instanceId} = request.params as {service: string; instanceId: string};
-  const body = request.body as RenewBody;
-  const key = keyOf(service, instanceId);
-  const ttlSeconds = TTL_INTERVALS * body.heartbeat_interval;
-  const record = JSON.stringify({
-    service,
-    instance_id: instanceId,
-    address: body.address,
-    port: body.port,
-    heartbeat_interval: body.heartbeat_interval,
-    metadata_version: body.metadata_version,
-    last_heartbeat: Math.floor(Date.now() / 1000),
-  });
-  await redis.eval(
-    REPLACE_LUA,
-    1,
-    key,
-    body.address,
-    String(body.port),
-    String(body.metadata_version),
-    String(body.heartbeat_interval),
-    String(ttlSeconds),
-    record,
-  );
-  request.log.info({service, instanceId, address: body.address, ttl_seconds: ttlSeconds}, 'replaced');
-  return reply.code(200).send({
-    service,
-    instance_id: instanceId,
-    address: body.address,
-    metadata_version: body.metadata_version,
-    ttl_seconds: ttlSeconds,
-  });
-});
-
-void app.listen({port: 8443, host: '0.0.0.0'});
+/** Renew a registered instance: renewed, stale (an older metadata_version, nothing written) or gone (re-register). */
+export async function heartbeat(
+  service: string,
+  instanceId: string,
+  address: string,
+  port: number,
+  metadataVersion: number,
+  heartbeatInterval: number,
+): Promise<string> {
+  const ttl = instances.TTL_INTERVALS * heartbeatInterval;
+  const now = Math.floor(Date.now() / 1000);
+  return redis.renew(instances.recordKey(service, instanceId), address, port, metadataVersion, heartbeatInterval, now, ttl);
+}
 `,
     },
     go: {
@@ -490,686 +237,501 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"discovery/instances" // instances.RecordKey, MembersKey, TTLIntervals
 )
-
-const ttlSeconds = 30
-
-type RenewRequest struct {
-	Address           string \`json:"address"\`
-	Port              int    \`json:"port"\`
-	MetadataVersion   int    \`json:"metadata_version"\`
-	HeartbeatInterval int    \`json:"heartbeat_interval"\`
-}
-
-type InstanceRecord struct {
-	Service           string \`json:"service"\`
-	InstanceID        string \`json:"instance_id"\`
-	Address           string \`json:"address"\`
-	Port              int    \`json:"port"\`
-	MetadataVersion   int    \`json:"metadata_version"\`
-	HeartbeatInterval int    \`json:"heartbeat_interval"\`
-	LastHeartbeat     int64  \`json:"last_heartbeat"\`
-}
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
+const ttlSeconds = 30 * time.Second
 
-func keyOf(service, instanceID string) string { return "sd:" + service + ":" + instanceID }
-
-func heartbeat(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	service := r.PathValue("service")
-	instanceID := r.PathValue("instance")
-	var body RenewRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
+// heartbeat renews a registered instance: "renewed", or "gone" when its record lapsed (the agent re-registers).
+func heartbeat(ctx context.Context, service, instanceID, address string, port, metadataVersion, heartbeatInterval int) (string, error) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	key := instances.RecordKey(service, instanceID)
+	n, err := rdb.Exists(ctx, key).Result()
+	if err != nil {
+		return "", err
 	}
-	key := keyOf(service, instanceID)
-	raw, err := rdb.Get(r.Context(), key).Result()
-	if err == redis.Nil {
-		writeJSON(rw, http.StatusOK, map[string]string{"status": "unregistered"})
-		return
+	if n == 0 {
+		return "gone", nil
 	}
-	var record InstanceRecord
-	json.Unmarshal([]byte(raw), &record)
-	record.Address = body.Address
-	record.LastHeartbeat = time.Now().Unix()
-	payload, _ := json.Marshal(record)
-	rdb.Set(r.Context(), key, payload, 0)
-	rdb.Expire(r.Context(), key, time.Duration(ttlSeconds)*time.Second)
-	log.Printf("renewed %s", key)
-	writeJSON(rw, http.StatusOK, map[string]string{"status": "renewed"})
-}
-
-func replace(rw http.ResponseWriter, r *http.Request) {
-	service := r.PathValue("service")
-	instanceID := r.PathValue("instance")
-	var body RenewRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
+	err = rdb.HSet(ctx, key, map[string]any{
+		"address":            address,
+		"port":               port,
+		"metadata_version":   metadataVersion,
+		"heartbeat_interval": heartbeatInterval,
+		"last_heartbeat":     time.Now().Unix(),
+	}).Err()
+	if err != nil {
+		return "", err
 	}
-	key := keyOf(service, instanceID)
-	record := InstanceRecord{
-		Service:         service,
-		InstanceID:      instanceID,
-		Address:         body.Address,
-		Port:            body.Port,
-		MetadataVersion: body.MetadataVersion,
-		LastHeartbeat:   time.Now().Unix(),
-	}
-	payload, _ := json.Marshal(record)
-	rdb.Set(r.Context(), key, payload, 0)
-	rdb.Del(r.Context(), "sd:previous:"+key)
-	rdb.Expire(r.Context(), key, time.Duration(ttlSeconds)*time.Second)
-	writeJSON(rw, http.StatusOK, map[string]any{"status": "replaced", "address": body.Address})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/instances/{service}/{instance}/heartbeat", heartbeat)
-	mux.HandleFunc("POST /v1/instances/{service}/{instance}/replace", replace)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return "renewed", rdb.Expire(ctx, key, ttlSeconds).Err()
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"discovery/instances" // instances.RecordKey, MembersKey, TTLIntervals
 )
 
-const ttlIntervals = 3
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// Renew a live instance in one round trip: address, metadata version, heartbeat stamp and expiry
-// move together, so a restarted instance can never keep stale metadata routable.
-const renewLua = \`
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return 0
-end
-local current = cjson.decode(raw)
-if tonumber(ARGV[3]) < tonumber(current['metadata_version']) then
-  return -1
-end
-current['address'] = ARGV[1]
-current['port'] = tonumber(ARGV[2])
-current['metadata_version'] = tonumber(ARGV[3])
-current['heartbeat_interval'] = tonumber(ARGV[4])
-current['last_heartbeat'] = tonumber(redis.call('TIME')[1])
-redis.call('SET', KEYS[1], cjson.encode(current), 'EX', ARGV[5])
-return 1
-\`
+// renewScript: KEYS[1] the record; ARGV address, port, metadata_version, heartbeat_interval, now, ttl.
+// Only registration creates a record: a lapsed one stays gone, and versions only move forward.
+var renewScript = redis.NewScript(\`
+local stored = redis.call('HGET', KEYS[1], 'metadata_version')
+if not stored then return 'gone' end
+if tonumber(ARGV[3]) < tonumber(stored) then return 'stale' end
+redis.call('HSET', KEYS[1], 'address', ARGV[1], 'port', ARGV[2], 'metadata_version', ARGV[3],
+  'heartbeat_interval', ARGV[4], 'last_heartbeat', ARGV[5])
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+return 'renewed'
+\`)
 
-// A deploy moves one identity to one address: the previous record is removed inside the same
-// script, before the replacement exists, so no reader sees two addresses for one identity.
-const replaceLua = \`
-local raw = redis.call('GET', KEYS[1])
-if raw then
-  local current = cjson.decode(raw)
-  if current['address'] ~= ARGV[1] then
-    redis.call('DEL', KEYS[1])
-  end
-end
-redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[5])
-return 1
-\`
-
-type RenewRequest struct {
-	Address           string \`json:"address"\`
-	Port              int    \`json:"port"\`
-	MetadataVersion   int    \`json:"metadata_version"\`
-	HeartbeatInterval int    \`json:"heartbeat_interval"\`
-}
-
-type InstanceRecord struct {
-	Service           string \`json:"service"\`
-	InstanceID        string \`json:"instance_id"\`
-	Address           string \`json:"address"\`
-	Port              int    \`json:"port"\`
-	MetadataVersion   int    \`json:"metadata_version"\`
-	HeartbeatInterval int    \`json:"heartbeat_interval"\`
-	LastHeartbeat     int64  \`json:"last_heartbeat"\`
-}
-
-var (
-	rdb          = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-	renewScript  = redis.NewScript(renewLua)
-	replaceScript = redis.NewScript(replaceLua)
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func keyOf(service, instanceID string) string { return "sd:" + service + ":" + instanceID }
-
-func heartbeat(rw http.ResponseWriter, r *http.Request) {
-	service := r.PathValue("service")
-	instanceID := r.PathValue("instance")
-	var body RenewRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	key := keyOf(service, instanceID)
-	ttlSeconds := ttlIntervals * body.HeartbeatInterval
-	outcome, err := renewScript.Run(
-		r.Context(), rdb, []string{key},
-		body.Address, body.Port, body.MetadataVersion, body.HeartbeatInterval, ttlSeconds,
-	).Int()
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if outcome == 0 {
-		writeJSON(rw, http.StatusGone, map[string]string{"error": "instance is not registered; register again"})
-		return
-	}
-	if outcome == -1 {
-		writeJSON(rw, http.StatusConflict, map[string]string{"error": "metadata_version is older than the stored one"})
-		return
-	}
-	log.Printf("renew service=%s instance=%s version=%d ttl=%d", service, instanceID, body.MetadataVersion, ttlSeconds)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"service":          service,
-		"instance_id":      instanceID,
-		"address":          body.Address,
-		"metadata_version": body.MetadataVersion,
-		"ttl_seconds":      ttlSeconds,
-		"key":              key,
-	})
-}
-
-func replace(rw http.ResponseWriter, r *http.Request) {
-	service := r.PathValue("service")
-	instanceID := r.PathValue("instance")
-	var body RenewRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	key := keyOf(service, instanceID)
-	ttlSeconds := ttlIntervals * body.HeartbeatInterval
-	record := InstanceRecord{
-		Service:           service,
-		InstanceID:        instanceID,
-		Address:           body.Address,
-		Port:              body.Port,
-		HeartbeatInterval: body.HeartbeatInterval,
-		MetadataVersion:   body.MetadataVersion,
-		LastHeartbeat:     time.Now().Unix(),
-	}
-	payload, _ := json.Marshal(record)
-	if err := replaceScript.Run(
-		r.Context(), rdb, []string{key},
-		body.Address, body.Port, body.MetadataVersion, body.HeartbeatInterval, ttlSeconds, string(payload),
-	).Err(); err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	log.Printf("replace service=%s instance=%s address=%s ttl=%d", service, instanceID, body.Address, ttlSeconds)
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"service":          service,
-		"instance_id":      instanceID,
-		"address":          body.Address,
-		"metadata_version": body.MetadataVersion,
-		"ttl_seconds":      ttlSeconds,
-	})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/instances/{service}/{instance}/heartbeat", heartbeat)
-	mux.HandleFunc("POST /v1/instances/{service}/{instance}/replace", replace)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+// heartbeat renews a registered instance: "renewed", "stale" (an older metadata_version, nothing written) or "gone" (re-register).
+func heartbeat(ctx context.Context, service, instanceID, address string, port, metadataVersion, heartbeatInterval int) (string, error) {
+	ttl := instances.TTLIntervals * heartbeatInterval
+	key := instances.RecordKey(service, instanceID)
+	return renewScript.Run(ctx, rdb, []string{key}, address, port, metadataVersion, heartbeatInterval, time.Now().Unix(), ttl).Text()
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      starter: `import redis.clients.jedis.JedisPooled
 
-import java.time.Instant
+import scala.jdk.CollectionConverters._
 
-final case class RenewRequest(
-    address: String,
-    port: Int,
-    metadata_version: Int,
-    heartbeat_interval: Int)
+import discovery.Instances // Instances.recordKey, membersKey, TtlIntervals
 
 object State {
-  implicit val system: ActorSystem = ActorSystem("discovery")
-  implicit val renewFormat: RootJsonFormat[RenewRequest] = jsonFormat4(RenewRequest)
+  val jedis = new JedisPooled("redis", 6379)
 
-  val TtlSeconds = 30
-  val jedis = new Jedis("redis", 6379)
+  val TtlSeconds = 30L
 
-  private def keyOf(service: String, instanceId: String): String = "sd:" + service + ":" + instanceId
-
-  val route: Route =
-    path("v1" / "instances" / Segment / Segment / "heartbeat") { (service, instanceId) =>
-      post {
-        entity(as[RenewRequest]) { body =>
-          // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-          val key = keyOf(service, instanceId)
-          Option(jedis.get(key)) match {
-            case None => complete(StatusCodes.OK, """{"status":"unregistered"}""")
-            case Some(raw) =>
-              val updated = raw.replaceAll("\\"address\\":\\"[^\\"]*\\"", "\\"address\\":\\"" + body.address + "\\"")
-              jedis.set(key, updated)
-              jedis.expire(key, TtlSeconds.toLong)
-              complete(StatusCodes.OK, """{"status":"renewed"}""")
-          }
-        }
-      }
-    } ~
-      path("v1" / "instances" / Segment / Segment / "replace") { (service, instanceId) =>
-        post {
-          entity(as[RenewRequest]) { body =>
-            val key = keyOf(service, instanceId)
-            val record =
-              s"""{"service":"$service","instance_id":"$instanceId","address":"\${body.address}","metadata_version":\${body.metadata_version}}"""
-            jedis.set(key, record)
-            jedis.expire(key, TtlSeconds.toLong)
-            jedis.del("sd:previous:" + service + ":" + instanceId)
-            complete(StatusCodes.OK, s"""{"status":"replaced","address":"\${body.address}"}""")
-          }
-        }
-      }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Renew a registered instance: renewed, or gone when its record lapsed (the agent re-registers). */
+  def heartbeat(service: String, instanceId: String, address: String, port: Int, metadataVersion: Long, heartbeatInterval: Int): String = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    val key = Instances.recordKey(service, instanceId)
+    if (!jedis.exists(key)) "gone"
+    else {
+      jedis.hset(key, Map(
+        "address" -> address, "port" -> port.toString, "metadata_version" -> metadataVersion.toString,
+        "heartbeat_interval" -> heartbeatInterval.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
+      jedis.expire(key, TtlSeconds)
+      "renewed"
+    }
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      solution: `import redis.clients.jedis.JedisPooled
 
-import java.time.Instant
+import scala.jdk.CollectionConverters._
 
-final case class RenewRequest(
-    address: String,
-    port: Int,
-    metadata_version: Int,
-    heartbeat_interval: Int)
+import discovery.Instances // Instances.recordKey, membersKey, TtlIntervals
 
 object State {
-  implicit val system: ActorSystem = ActorSystem("discovery")
-  implicit val renewFormat: RootJsonFormat[RenewRequest] = jsonFormat4(RenewRequest)
+  val jedis = new JedisPooled("redis", 6379)
 
-  val TtlIntervals = 3
+  /**
+   * KEYS[1] the record; ARGV address, port, metadata_version, heartbeat_interval, now, ttl.
+   * Only registration creates a record: a lapsed one stays gone, and versions only move forward.
+   */
+  val RenewLua: String =
+    """local stored = redis.call('HGET', KEYS[1], 'metadata_version')
+      |if not stored then return 'gone' end
+      |if tonumber(ARGV[3]) < tonumber(stored) then return 'stale' end
+      |redis.call('HSET', KEYS[1], 'address', ARGV[1], 'port', ARGV[2], 'metadata_version', ARGV[3],
+      |  'heartbeat_interval', ARGV[4], 'last_heartbeat', ARGV[5])
+      |redis.call('EXPIRE', KEYS[1], ARGV[6])
+      |return 'renewed'
+      |""".stripMargin
 
-  // Renew a live instance in one round trip: address, metadata version, heartbeat stamp and
-  // expiry move together, so a restarted instance never keeps stale metadata routable.
-  val RenewLua = """
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return 0
-end
-local current = cjson.decode(raw)
-if tonumber(ARGV[3]) < tonumber(current['metadata_version']) then
-  return -1
-end
-current['address'] = ARGV[1]
-current['port'] = tonumber(ARGV[2])
-current['metadata_version'] = tonumber(ARGV[3])
-current['heartbeat_interval'] = tonumber(ARGV[4])
-current['last_heartbeat'] = tonumber(redis.call('TIME')[1])
-redis.call('SET', KEYS[1], cjson.encode(current), 'EX', ARGV[5])
-return 1
-"""
-
-  // A deploy moves one identity to one address: the previous record is removed inside the same
-  // script, before the replacement exists, so no reader sees two addresses for one identity.
-  val ReplaceLua = """
-local raw = redis.call('GET', KEYS[1])
-if raw then
-  local current = cjson.decode(raw)
-  if current['address'] ~= ARGV[1] then
-    redis.call('DEL', KEYS[1])
-  end
-end
-redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[5])
-return 1
-"""
-
-  val jedis = new Jedis("redis", 6379)
-
-  private def keyOf(service: String, instanceId: String): String = "sd:" + service + ":" + instanceId
-
-  private def payload(service: String, instanceId: String, body: RenewRequest): String =
-    s"""{"service":"$service","instance_id":"$instanceId","address":"\${body.address}","port":\${body.port},"heartbeat_interval":\${body.heartbeat_interval},"metadata_version":\${body.metadata_version},"last_heartbeat":\${Instant.now().getEpochSecond}}"""
-
-  val route: Route =
-    path("v1" / "instances" / Segment / Segment / "heartbeat") { (service, instanceId) =>
-      post {
-        entity(as[RenewRequest]) { body =>
-          val key = keyOf(service, instanceId)
-          val ttlSeconds = TtlIntervals * body.heartbeat_interval
-          val outcome = jedis.eval(
-            RenewLua,
-            1,
-            key,
-            body.address,
-            body.port.toString,
-            body.metadata_version.toString,
-            body.heartbeat_interval.toString,
-            ttlSeconds.toString).toLong
-          if (outcome == 0L) {
-            complete(StatusCodes.Gone, """{"error":"instance is not registered; register again"}""")
-          } else if (outcome == -1L) {
-            complete(StatusCodes.Conflict, """{"error":"metadata_version is older than the stored one"}""")
-          } else {
-            system.log.info(s"renew service=$service instance=$instanceId ttl=$ttlSeconds")
-            complete(
-              StatusCodes.OK,
-              s"""{"service":"$service","instance_id":"$instanceId","address":"\${body.address}","metadata_version":\${body.metadata_version},"ttl_seconds":$ttlSeconds,"key":"$key"}""")
-          }
-        }
-      }
-    } ~
-      path("v1" / "instances" / Segment / Segment / "replace") { (service, instanceId) =>
-        post {
-          entity(as[RenewRequest]) { body =>
-            val key = keyOf(service, instanceId)
-            val ttlSeconds = TtlIntervals * body.heartbeat_interval
-            jedis.eval(
-              ReplaceLua,
-              1,
-              key,
-              body.address,
-              body.port.toString,
-              body.metadata_version.toString,
-              body.heartbeat_interval.toString,
-              ttlSeconds.toString,
-              payload(service, instanceId, body))
-            system.log.info(s"replace service=$service instance=$instanceId address=\${body.address}")
-            complete(
-              StatusCodes.OK,
-              s"""{"service":"$service","instance_id":"$instanceId","address":"\${body.address}","metadata_version":\${body.metadata_version},"ttl_seconds":$ttlSeconds}""")
-          }
-        }
-      }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+  /** Renew a registered instance: renewed, stale (an older metadata_version, nothing written) or gone (re-register). */
+  def heartbeat(service: String, instanceId: String, address: String, port: Int, metadataVersion: Long, heartbeatInterval: Int): String = {
+    val ttl = Instances.TtlIntervals * heartbeatInterval
+    val args = List(address, port.toString, metadataVersion.toString, heartbeatInterval.toString, (System.currentTimeMillis() / 1000).toString, ttl.toString)
+    jedis.eval(RenewLua, List(Instances.recordKey(service, instanceId)).asJava, args.asJava).asInstanceOf[String]
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <iostream>
 #include <string>
+#include <unordered_map>
 
-using json = nlohmann::json;
-
-constexpr int kTtlSeconds = 30;
+#include "discovery/instances.h"  // instances::recordKey, membersKey, kTtlIntervals, nowSeconds
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-std::string keyOf(const std::string& service, const std::string& instanceId) {
-  return "sd:" + service + ":" + instanceId;
-}
+constexpr std::chrono::seconds kTtlSeconds{30};
 
-long unixSeconds() {
-  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/instances/([^/]+)/([^/]+)/heartbeat)", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const auto service = req.matches[1].str();
-    const auto instanceId = req.matches[2].str();
-    const auto key = keyOf(service, instanceId);
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto raw = redis.get(key);
-    if (!raw) {
-      res.status = 200;
-      res.set_content(R"({"status":"unregistered"})", "application/json");
-      return;
-    }
-    json record = json::parse(*raw, nullptr, false);
-    record["address"] = body.value("address", std::string());
-    record["metadata_version"] = body.value("metadata_version", 1);
-    record["last_heartbeat"] = unixSeconds();
-    redis.set(key, record.dump());
-    redis.expire(key, std::chrono::seconds(kTtlSeconds));
-    res.status = 200;
-    res.set_content(R"({"status":"renewed"})", "application/json");
-  });
-
-  svr.Post(R"(/v1/instances/([^/]+)/([^/]+)/replace)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto service = req.matches[1].str();
-    const auto instanceId = req.matches[2].str();
-    const auto key = keyOf(service, instanceId);
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto address = body.value("address", std::string());
-    const json record = {
-        {"service", service},
-        {"instance_id", instanceId},
-        {"address", address},
-        {"metadata_version", body.value("metadata_version", 1)},
-        {"last_heartbeat", unixSeconds()},
-    };
-    redis.set(key, record.dump());
-    redis.expire(key, std::chrono::seconds(kTtlSeconds));
-    redis.del("sd:previous:" + service + ":" + instanceId);
-    res.status = 200;
-    res.set_content(json{{"status", "replaced"}, {"address", address}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Renew a registered instance: "renewed", or "gone" when its record lapsed (the agent re-registers).
+std::string heartbeat(const std::string& service, const std::string& instance_id, const std::string& address, long port,
+                      long metadata_version, long heartbeat_interval) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const std::string key = instances::recordKey(service, instance_id);
+  if (redis.exists(key) == 0) return "gone";
+  const std::unordered_map<std::string, std::string> fields = {
+      {"address", address},
+      {"port", std::to_string(port)},
+      {"metadata_version", std::to_string(metadata_version)},
+      {"heartbeat_interval", std::to_string(heartbeat_interval)},
+      {"last_heartbeat", std::to_string(instances::nowSeconds())}};
+  redis.hset(key, fields.begin(), fields.end());
+  redis.expire(key, kTtlSeconds);
+  return "renewed";
 }
 `,
-      solution: `#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
-#include <chrono>
-#include <iostream>
 #include <string>
-#include <vector>
 
-using json = nlohmann::json;
-
-constexpr int kTtlIntervals = 3;
-
-// Renew a live instance in one round trip: address, metadata version, heartbeat stamp and expiry
-// move together, so a restarted instance can never keep stale metadata routable.
-const std::string kRenewLua = R"LUA(
-local raw = redis.call('GET', KEYS[1])
-if not raw then
-  return 0
-end
-local current = cjson.decode(raw)
-if tonumber(ARGV[3]) < tonumber(current['metadata_version']) then
-  return -1
-end
-current['address'] = ARGV[1]
-current['port'] = tonumber(ARGV[2])
-current['metadata_version'] = tonumber(ARGV[3])
-current['heartbeat_interval'] = tonumber(ARGV[4])
-current['last_heartbeat'] = tonumber(redis.call('TIME')[1])
-redis.call('SET', KEYS[1], cjson.encode(current), 'EX', ARGV[5])
-return 1
-)LUA";
-
-// A deploy moves one identity to one address: the previous record is removed inside the same
-// script, before the replacement exists, so no reader sees two addresses for one identity.
-const std::string kReplaceLua = R"LUA(
-local raw = redis.call('GET', KEYS[1])
-if raw then
-  local current = cjson.decode(raw)
-  if current['address'] ~= ARGV[1] then
-    redis.call('DEL', KEYS[1])
-  end
-end
-redis.call('SET', KEYS[1], ARGV[6], 'EX', ARGV[5])
-return 1
-)LUA";
+#include "discovery/instances.h"  // instances::recordKey, membersKey, kTtlIntervals, nowSeconds
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-std::string keyOf(const std::string& service, const std::string& instanceId) {
-  return "sd:" + service + ":" + instanceId;
-}
+// KEYS[1] the record; ARGV address, port, metadata_version, heartbeat_interval, now, ttl.
+// Only registration creates a record: a lapsed one stays gone, and versions only move forward.
+const std::string kRenewLua = R"lua(
+local stored = redis.call('HGET', KEYS[1], 'metadata_version')
+if not stored then return 'gone' end
+if tonumber(ARGV[3]) < tonumber(stored) then return 'stale' end
+redis.call('HSET', KEYS[1], 'address', ARGV[1], 'port', ARGV[2], 'metadata_version', ARGV[3],
+  'heartbeat_interval', ARGV[4], 'last_heartbeat', ARGV[5])
+redis.call('EXPIRE', KEYS[1], ARGV[6])
+return 'renewed'
+)lua";
 
-long unixSeconds() {
-  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post(R"(/v1/instances/([^/]+)/([^/]+)/heartbeat)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto service = req.matches[1].str();
-    const auto instanceId = req.matches[2].str();
-    const auto key = keyOf(service, instanceId);
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const int heartbeatInterval = body.value("heartbeat_interval", 5);
-    const int metadataVersion = body.value("metadata_version", 1);
-    const int ttlSeconds = kTtlIntervals * heartbeatInterval;
-    const auto outcome = redis.eval<long>(
-        kRenewLua,
-        {key},
-        {body.value("address", std::string()),
-         std::to_string(body.value("port", 0)),
-         std::to_string(metadataVersion),
-         std::to_string(heartbeatInterval),
-         std::to_string(ttlSeconds)});
-    if (outcome == 0) {
-      res.status = 410;
-      res.set_content(R"({"error":"instance is not registered; register again"})", "application/json");
-      return;
-    }
-    if (outcome == -1) {
-      res.status = 409;
-      res.set_content(R"({"error":"metadata_version is older than the stored one"})", "application/json");
-      return;
-    }
-    std::cout << "renew service=" << service << " instance=" << instanceId << " ttl=" << ttlSeconds << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"service", service},
-             {"instance_id", instanceId},
-             {"metadata_version", metadataVersion},
-             {"ttl_seconds", ttlSeconds},
-             {"key", key}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.Post(R"(/v1/instances/([^/]+)/([^/]+)/replace)", [](const httplib::Request& req, httplib::Response& res) {
-    const auto service = req.matches[1].str();
-    const auto instanceId = req.matches[2].str();
-    const auto key = keyOf(service, instanceId);
-    json body = json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const auto address = body.value("address", std::string());
-    const int heartbeatInterval = body.value("heartbeat_interval", 5);
-    const int metadataVersion = body.value("metadata_version", 1);
-    const int ttlSeconds = kTtlIntervals * heartbeatInterval;
-    const json record = {
-        {"service", service},
-        {"instance_id", instanceId},
-        {"address", address},
-        {"port", body.value("port", 0)},
-        {"heartbeat_interval", heartbeatInterval},
-        {"metadata_version", metadataVersion},
-        {"last_heartbeat", unixSeconds()},
-    };
-    redis.eval<long>(
-        kReplaceLua,
-        {key},
-        {address,
-         std::to_string(body.value("port", 0)),
-         std::to_string(metadataVersion),
-         std::to_string(heartbeatInterval),
-         std::to_string(ttlSeconds),
-         record.dump()});
-    std::cout << "replace service=" << service << " instance=" << instanceId << " address=" << address << "\\n";
-    res.status = 200;
-    res.set_content(
-        json{{"service", service},
-             {"instance_id", instanceId},
-             {"address", address},
-             {"metadata_version", metadataVersion},
-             {"ttl_seconds", ttlSeconds}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+// Renew a registered instance: "renewed", "stale" (an older metadata_version, nothing written) or "gone" (re-register).
+std::string heartbeat(const std::string& service, const std::string& instance_id, const std::string& address, long port,
+                      long metadata_version, long heartbeat_interval) {
+  const long ttl = instances::kTtlIntervals * heartbeat_interval;
+  const std::string result = redis.eval<std::string>(
+      kRenewLua, {instances::recordKey(service, instance_id)},
+      {address, std::to_string(port), std::to_string(metadata_version), std::to_string(heartbeat_interval),
+       std::to_string(instances::nowSeconds()), std::to_string(ttl)});
+  return result;
 }
 `,
     },
   },
+  harness: {
+    python: `from discovery import instances
+
+KEY = "sd:checkout:checkout-3"
+
+
+def _registered(ctx, version=13, interval=5):
+    m = ctx.load("state")
+    instances.register_instance("checkout", "checkout-3", "10.4.2.7", 8080, interval, version)
+    return m
+
+
+def _settled(probe, what):
+    assert probe.fired, f"the heartbeat never touched {what}"
+    if probe.error is not None:
+        raise probe.error
+    return probe.result
+
+
+def check_atomic_renew(ctx):
+    m = _registered(ctx)
+
+    def lapse():  # the record expires and the sweep drops the member, right as the heartbeat lands
+        ctx.redis.delete(KEY)
+        ctx.redis.srem("sd:members:checkout", "checkout-3")
+
+    probe = ctx.redis_after(KEY, lapse)
+    first = m.heartbeat("checkout", "checkout-3", "10.4.2.7", 8080, 13, 5)
+    _settled(probe, KEY)
+    assert first in ("gone", "renewed"), f"the heartbeat answered {first!r}"
+    assert ctx.redis.exists(KEY) == 0, f"the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back ({ctx.redis.hgetall(KEY)}): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script"
+    again = m.heartbeat("checkout", "checkout-3", "10.4.2.7", 8080, 13, 5)
+    assert again == "gone", f"a heartbeat for a lapsed record answered {again!r}, expected gone so the agent re-registers"
+    assert ctx.redis.exists(KEY) == 0, f"a heartbeat recreated the lapsed record {ctx.redis.hgetall(KEY)}: only registration may create one"
+    instances.register_instance("checkout", "checkout-3", "10.4.2.7", 8080, 5, 13)
+    renewed = m.heartbeat("checkout", "checkout-3", "10.4.2.8", 8081, 13, 5)
+    assert renewed == "renewed", f"a heartbeat for a live record answered {renewed!r}, expected renewed"
+    record = ctx.redis.hgetall(KEY)
+    assert record.get("address") == "10.4.2.8" and record.get("port") == "8081", f"the renewal must write the new address and port, the record is {record}"
+
+
+def check_version_guard(ctx):
+    m = _registered(ctx, version=13)
+    stale = m.heartbeat("checkout", "checkout-3", "10.4.9.9", 8080, 12, 5)
+    assert stale == "stale", f"a heartbeat with metadata_version 12 under a stored 13 answered {stale!r}, expected stale"
+    record = ctx.redis.hgetall(KEY)
+    assert record.get("metadata_version") == "13" and record.get("address") == "10.4.2.7", f"a lagging replica's version 12 rolled the record back to {record}"
+    same = m.heartbeat("checkout", "checkout-3", "10.4.2.7", 8080, 13, 5)
+    assert same == "renewed", f"a heartbeat with the stored version 13 answered {same!r}, expected renewed"
+    # Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
+    rival = ctx.redis_after(KEY, lambda: m.heartbeat("checkout", "checkout-3", "10.4.3.3", 8080, 15, 5))
+    m.heartbeat("checkout", "checkout-3", "10.4.2.8", 8080, 14, 5)
+    _settled(rival, KEY)
+    record = ctx.redis.hgetall(KEY)
+    assert record.get("metadata_version") == "15" and record.get("address") == "10.4.3.3", f"version 15 landed while version 14 was in flight and the record ends at {record}: the comparison and the write must be one script"
+
+
+def check_expiry_derived(ctx):
+    m = _registered(ctx, interval=5)
+    assert m.heartbeat("checkout", "checkout-3", "10.4.2.7", 8080, 13, 2) == "renewed", "a heartbeat for a live record must renew it"
+    ttl = ctx.redis.ttl(KEY)
+    assert 5 <= ttl <= 6, f"after a heartbeat promising a 2 s interval the record's TTL is {ttl}, expected 3 x 2 = 6 s"
+    assert ctx.redis.hget(KEY, "heartbeat_interval") == "2", "the record must store the interval the heartbeat promised"
+    ctx.clock.advance(7)
+    assert ctx.redis.exists(KEY) == 0, "7 s after a heartbeat promising 2 s intervals the record is still there: three missed heartbeats must expire it"
+    instances.register_instance("checkout", "checkout-3", "10.4.2.7", 8080, 5, 13)
+    m.heartbeat("checkout", "checkout-3", "10.4.2.7", 8080, 13, 20)
+    ttl = ctx.redis.ttl(KEY)
+    assert 59 <= ttl <= 60, f"after a heartbeat promising a 20 s interval the record's TTL is {ttl}, expected 3 x 20 = 60 s"
+`,
+    typescript: `const KEY = 'sd:checkout:checkout-3';
+
+async function registered(ctx, version = 13, interval = 5) {
+  const m = ctx.load('state');
+  const instances = ctx.load('/support/discovery/instances.ts');
+  await instances.registerInstance('checkout', 'checkout-3', '10.4.2.7', 8080, interval, version);
+  return {m, instances};
+}
+
+async function settled(probe, what: string) {
+  assert(probe.fired, \`the heartbeat never touched \${what}\`);
+  if (probe.error !== undefined) throw probe.error;
+  return await probe.result;
+}
+
+export async function check_atomic_renew(ctx) {
+  const {m, instances} = await registered(ctx);
+  // The record expires and the sweep drops the member, right as the heartbeat lands.
+  const probe = ctx.redisAfter(KEY, () => {
+    ctx.redis.del(KEY);
+    ctx.redis.srem('sd:members:checkout', 'checkout-3');
+  });
+  const first = await m.heartbeat('checkout', 'checkout-3', '10.4.2.7', 8080, 13, 5);
+  await settled(probe, KEY);
+  assert(first === 'gone' || first === 'renewed', \`the heartbeat answered \${JSON.stringify(first)}\`);
+  assert.equal(ctx.redis.exists(KEY), 0, \`the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back (\${JSON.stringify(ctx.redis.hgetall(KEY))}): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script\`);
+  const again = await m.heartbeat('checkout', 'checkout-3', '10.4.2.7', 8080, 13, 5);
+  assert.equal(again, 'gone', \`a heartbeat for a lapsed record answered \${JSON.stringify(again)}, expected gone so the agent re-registers\`);
+  assert.equal(ctx.redis.exists(KEY), 0, 'a heartbeat recreated the lapsed record: only registration may create one');
+  await instances.registerInstance('checkout', 'checkout-3', '10.4.2.7', 8080, 5, 13);
+  const renewed = await m.heartbeat('checkout', 'checkout-3', '10.4.2.8', 8081, 13, 5);
+  assert.equal(renewed, 'renewed', \`a heartbeat for a live record answered \${JSON.stringify(renewed)}, expected renewed\`);
+  const record = ctx.redis.hgetall(KEY);
+  assert(record.address === '10.4.2.8' && record.port === '8081', \`the renewal must write the new address and port, the record is \${JSON.stringify(record)}\`);
+}
+
+export async function check_version_guard(ctx) {
+  const {m} = await registered(ctx, 13);
+  const stale = await m.heartbeat('checkout', 'checkout-3', '10.4.9.9', 8080, 12, 5);
+  assert.equal(stale, 'stale', \`a heartbeat with metadata_version 12 under a stored 13 answered \${JSON.stringify(stale)}, expected stale\`);
+  let record = ctx.redis.hgetall(KEY);
+  assert(record.metadata_version === '13' && record.address === '10.4.2.7', \`a lagging replica's version 12 rolled the record back to \${JSON.stringify(record)}\`);
+  const same = await m.heartbeat('checkout', 'checkout-3', '10.4.2.7', 8080, 13, 5);
+  assert.equal(same, 'renewed', \`a heartbeat with the stored version 13 answered \${JSON.stringify(same)}, expected renewed\`);
+  // Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
+  const rival = ctx.redisAfter(KEY, () => m.heartbeat('checkout', 'checkout-3', '10.4.3.3', 8080, 15, 5));
+  await m.heartbeat('checkout', 'checkout-3', '10.4.2.8', 8080, 14, 5);
+  await settled(rival, KEY);
+  record = ctx.redis.hgetall(KEY);
+  assert(record.metadata_version === '15' && record.address === '10.4.3.3', \`version 15 landed while version 14 was in flight and the record ends at \${JSON.stringify(record)}: the comparison and the write must be one script\`);
+}
+
+export async function check_expiry_derived(ctx) {
+  const {m, instances} = await registered(ctx, 13, 5);
+  assert.equal(await m.heartbeat('checkout', 'checkout-3', '10.4.2.7', 8080, 13, 2), 'renewed', 'a heartbeat for a live record must renew it');
+  let ttl = ctx.redis.ttl(KEY);
+  assert(5 <= ttl && ttl <= 6, \`after a heartbeat promising a 2 s interval the record's TTL is \${ttl}, expected 3 x 2 = 6 s\`);
+  assert.equal(ctx.redis.hget(KEY, 'heartbeat_interval'), '2', 'the record must store the interval the heartbeat promised');
+  ctx.clock.advance(7);
+  assert.equal(ctx.redis.exists(KEY), 0, '7 s after a heartbeat promising 2 s intervals the record is still there: three missed heartbeats must expire it');
+  await instances.registerInstance('checkout', 'checkout-3', '10.4.2.7', 8080, 5, 13);
+  await m.heartbeat('checkout', 'checkout-3', '10.4.2.7', 8080, 13, 20);
+  ttl = ctx.redis.ttl(KEY);
+  assert(59 <= ttl && ttl <= 60, \`after a heartbeat promising a 20 s interval the record's TTL is \${ttl}, expected 3 x 20 = 60 s\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"discovery/instances"
+
+	"leetbuild/harness"
+)
+
+const stateKey = "sd:checkout:checkout-3"
+
+var stateBg = context.Background()
+
+func registered(ctx *harness.Ctx, version, interval int) {
+	_, err := instances.RegisterInstance(stateBg, "checkout", "checkout-3", "10.4.2.7", 8080, interval, version)
+	ctx.NoError(err, "registering checkout-3")
+}
+
+func beat(ctx *harness.Ctx, address string, port, version, interval int) string {
+	result, err := heartbeat(stateBg, "checkout", "checkout-3", address, port, version, interval)
+	ctx.NoError(err, "heartbeat(checkout, checkout-3, %s, %d, %d, %d) failed", address, port, version, interval)
+	return result
+}
+
+func CheckAtomicRenew(ctx *harness.Ctx) {
+	registered(ctx, 13, 5)
+	// The record expires and the sweep drops the member, right as the heartbeat lands.
+	probe := ctx.Redis.After(stateKey, func() any {
+		ctx.Redis.Del(stateKey)
+		ctx.Redis.Do("SREM", "sd:members:checkout", "checkout-3")
+		return nil
+	})
+	first := beat(ctx, "10.4.2.7", 8080, 13, 5)
+	ctx.Assert(probe.Fired, "the heartbeat never touched %s", stateKey)
+	ctx.Assert(first == "gone" || first == "renewed", "the heartbeat answered %q", first)
+	ctx.Equal(ctx.Redis.Exists(stateKey), 0, "the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back (%v): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script; exists", ctx.Redis.HGetAll(stateKey))
+	ctx.Equal(beat(ctx, "10.4.2.7", 8080, 13, 5), "gone", "a heartbeat for a lapsed record must answer gone so the agent re-registers")
+	ctx.Equal(ctx.Redis.Exists(stateKey), 0, "a heartbeat recreated the lapsed record: only registration may create one; exists")
+	registered(ctx, 13, 5)
+	ctx.Equal(beat(ctx, "10.4.2.8", 8081, 13, 5), "renewed", "a heartbeat for a live record")
+	record := ctx.Redis.HGetAll(stateKey)
+	ctx.Assert(record["address"] == "10.4.2.8" && record["port"] == "8081", "the renewal must write the new address and port, the record is %v", record)
+}
+
+func CheckVersionGuard(ctx *harness.Ctx) {
+	registered(ctx, 13, 5)
+	ctx.Equal(beat(ctx, "10.4.9.9", 8080, 12, 5), "stale", "a heartbeat with metadata_version 12 under a stored 13")
+	record := ctx.Redis.HGetAll(stateKey)
+	ctx.Assert(record["metadata_version"] == "13" && record["address"] == "10.4.2.7", "a lagging replica's version 12 rolled the record back to %v", record)
+	ctx.Equal(beat(ctx, "10.4.2.7", 8080, 13, 5), "renewed", "a heartbeat with the stored version 13")
+	// Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
+	rival := ctx.Redis.After(stateKey, func() any {
+		result, err := heartbeat(stateBg, "checkout", "checkout-3", "10.4.3.3", 8080, 15, 5)
+		ctx.NoError(err, "the rival heartbeat failed")
+		return result
+	})
+	beat(ctx, "10.4.2.8", 8080, 14, 5)
+	ctx.Assert(rival.Fired, "the heartbeat never touched %s", stateKey)
+	ctx.Assert(rival.Err == nil, "the rival heartbeat failed: %v", rival.Err)
+	record = ctx.Redis.HGetAll(stateKey)
+	ctx.Assert(record["metadata_version"] == "15" && record["address"] == "10.4.3.3", "version 15 landed while version 14 was in flight and the record ends at %v: the comparison and the write must be one script", record)
+}
+
+func CheckExpiryDerived(ctx *harness.Ctx) {
+	registered(ctx, 13, 5)
+	ctx.Equal(beat(ctx, "10.4.2.7", 8080, 13, 2), "renewed", "a heartbeat for a live record")
+	ttl := ctx.Redis.TTL(stateKey)
+	ctx.Assert(5 <= ttl && ttl <= 6, "after a heartbeat promising a 2 s interval the record's TTL is %d, expected 3 x 2 = 6 s", ttl)
+	interval, _ := ctx.Redis.HGet(stateKey, "heartbeat_interval")
+	ctx.Equal(interval, "2", "the record must store the interval the heartbeat promised")
+	ctx.Clock.Advance(7)
+	ctx.Equal(ctx.Redis.Exists(stateKey), 0, "7 s after a heartbeat promising 2 s intervals the record must be gone (three missed heartbeats); exists")
+	registered(ctx, 13, 5)
+	beat(ctx, "10.4.2.7", 8080, 13, 20)
+	ttl = ctx.Redis.TTL(stateKey)
+	ctx.Assert(59 <= ttl && ttl <= 60, "after a heartbeat promising a 20 s interval the record's TTL is %d, expected 3 x 20 = 60 s", ttl)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+
+#include "discovery/instances.h"
+
+namespace {
+
+const std::string kKey = "sd:checkout:checkout-3";
+
+void registered(long version, long interval) { instances::registerInstance("checkout", "checkout-3", "10.4.2.7", 8080, interval, version); }
+
+std::string beat(const std::string& address, long port, long version, long interval) {
+  return heartbeat("checkout", "checkout-3", address, port, version, interval);
+}
+
+std::string field(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
+
+std::string shown(harness::Ctx& ctx) {
+  std::string out;
+  for (const auto& [name, value] : ctx.Redis.HGetAll(kKey)) out += name + "=" + value + " ";
+  return out;
+}
+
+}  // namespace
+
+void CheckAtomicRenew(harness::Ctx& ctx) {
+  registered(13, 5);
+  bool fired = false;
+  // The record expires and the sweep drops the member, right as the heartbeat lands.
+  ctx.Redis.After(kKey, [&] {
+    fired = true;
+    ctx.Redis.Del(kKey);
+    ctx.Redis.Do("SREM", "sd:members:checkout", "checkout-3");
+  });
+  const std::string first = beat("10.4.2.7", 8080, 13, 5);
+  ctx.Assert(fired, "the heartbeat never touched %s", kKey);
+  ctx.Assert(first == "gone" || first == "renewed", "the heartbeat answered %q", first);
+  ctx.Equal(ctx.Redis.Exists(kKey), 0, "the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back (%s): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script; exists", shown(ctx));
+  ctx.Equal(beat("10.4.2.7", 8080, 13, 5), "gone", "a heartbeat for a lapsed record must answer gone so the agent re-registers");
+  ctx.Equal(ctx.Redis.Exists(kKey), 0, "a heartbeat recreated the lapsed record: only registration may create one; exists");
+  registered(13, 5);
+  ctx.Equal(beat("10.4.2.8", 8081, 13, 5), "renewed", "a heartbeat for a live record");
+  ctx.Assert(field(ctx, "address") == "10.4.2.8" && field(ctx, "port") == "8081", "the renewal must write the new address and port, the record is %s", shown(ctx));
+}
+
+void CheckVersionGuard(harness::Ctx& ctx) {
+  registered(13, 5);
+  ctx.Equal(beat("10.4.9.9", 8080, 12, 5), "stale", "a heartbeat with metadata_version 12 under a stored 13");
+  ctx.Assert(field(ctx, "metadata_version") == "13" && field(ctx, "address") == "10.4.2.7", "a lagging replica's version 12 rolled the record back to %s", shown(ctx));
+  ctx.Equal(beat("10.4.2.7", 8080, 13, 5), "renewed", "a heartbeat with the stored version 13");
+  // Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
+  auto fired = std::make_shared<bool>(false);
+  auto err = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After(kKey, [fired, err] {
+    *fired = true;
+    try {
+      heartbeat("checkout", "checkout-3", "10.4.3.3", 8080, 15, 5);
+    } catch (const std::exception& e) {
+      *err = e.what();
+    }
+  });
+  beat("10.4.2.8", 8080, 14, 5);
+  ctx.Assert(*fired, "the heartbeat never touched %s", kKey);
+  ctx.Assert(!*err, "the rival heartbeat failed: %s", err->value_or(""));
+  ctx.Assert(field(ctx, "metadata_version") == "15" && field(ctx, "address") == "10.4.3.3", "version 15 landed while version 14 was in flight and the record ends at %s: the comparison and the write must be one script", shown(ctx));
+}
+
+void CheckExpiryDerived(harness::Ctx& ctx) {
+  registered(13, 5);
+  ctx.Equal(beat("10.4.2.7", 8080, 13, 2), "renewed", "a heartbeat for a live record");
+  long long ttl = ctx.Redis.TTL(kKey);
+  ctx.Assert(5 <= ttl && ttl <= 6, "after a heartbeat promising a 2 s interval the record's TTL is %d, expected 3 x 2 = 6 s", ttl);
+  ctx.Equal(field(ctx, "heartbeat_interval"), "2", "the record must store the interval the heartbeat promised");
+  ctx.Clock.Advance(7);
+  ctx.Equal(ctx.Redis.Exists(kKey), 0, "7 s after a heartbeat promising 2 s intervals the record must be gone (three missed heartbeats); exists");
+  registered(13, 5);
+  beat("10.4.2.7", 8080, 13, 20);
+  ttl = ctx.Redis.TTL(kKey);
+  ctx.Assert(59 <= ttl && ttl <= 60, "after a heartbeat promising a 20 s interval the record's TTL is %d, expected 3 x 20 = 60 s", ttl);
+}
+`,
+  },
   hints: [
-    'After a rolling deploy, 5xx rates climb for minutes: callers reach the old address of a restarted pod, and for a while both the old and the new pod answer as checkout-3.',
-    '`r.set` then `r.expire(key, TTL_SECONDS)` leaves a window between them and ignores the interval; `metadata_version` is never compared; `replace` writes the new record before anything old is removed.',
-    'Put `GET`, the version compare, `SET … EX 3 * heartbeat_interval` and `TIME` in `RENEW_LUA`; answer 409 when the stored version is newer; in `REPLACE_LUA` `DEL` the old record before the `SET`.',
+    "An instance that came back from a long GC pause heartbeats renewed for hours while no router lists it, and a replica still on yesterday's build flips metadata_version back after a rollout.",
+    'EXISTS, HSET and EXPIRE are three commands: the record can lapse and the sweep drop the member between the first two, and HSET recreates the hash. Nothing compares versions, and the TTL is a constant.',
+    'One `register_script`: HGET `metadata_version` (nil → `gone`), `tonumber(ARGV[3])` below it → `stale`, else HSET the fields and EXPIRE `TTL_INTERVALS * heartbeat_interval` seconds; return `renewed`.',
   ],
-  debrief: `Two writes can make a registry lie, and the fix removes both. A bare \`EXPIRE\` looks like liveness: the key keeps its TTL, the instance keeps heartbeating, and the address inside belongs to a process that no longer exists. Putting the read, the version compare, the rewrite and the expiry in one script makes metadata and liveness move together, and deriving the TTL from the interval the instance promised makes a missed heartbeat indistinguishable from a crash. A deploy swap that writes first and cleans up later is observable by every reader for as long as the cleanup takes, so the swap deletes before it writes inside one script and the identity, not the address, is the unit of consistency. Production registries add drain states and a periodic reconcile that compares Redis against the deployments table.`,
+  debrief: `The script is the unit of truth: existence, version and expiry are one decision, so it runs where nothing can interleave. Answering \`gone\` instead of recreating the record keeps the members set and the records in agreement, because only registration adds a member. The version comparison makes heartbeats monotonic per identity, which is what lets a rollout survive a replica that lags. Deriving the TTL from the interval in the same request keeps the failure detector proportional: a 2 s heartbeat is declared dead after 6 s, a 20 s one after a minute. Production registries stamp the heartbeat with the server's clock (Redis \`TIME\`) so a skewed host cannot claim freshness it does not have.`,
 };

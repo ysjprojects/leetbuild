@@ -1,92 +1,102 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {endpointStep} from './steps/1-endpoint';
 import {stateStep} from './steps/2-state';
 import {dependencyStep} from './steps/3-dependency';
 import {eventsStep} from './steps/4-events';
 import {readStep} from './steps/5-read';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * IoT hub: the debugging a device-management layer needs before it unlocks a door twice. Commands
- * that carry an idempotency id, a validity window and an acknowledgment, a Redis shadow whose
- * desired and reported documents keep independent versions, gRPC delivery to the device gateway
- * with a deadline and queue-only-until-expiry semantics, command events keyed by device with an
- * outbox, and a shadow read that shows desired, reported and their divergence.
+ * recorded under the caller's idempotency id with a validity window → a Redis shadow whose desired
+ * and reported documents keep their own versions → gRPC delivery under a deadline where only the
+ * device's acknowledgement counts → command transitions keyed by device with an outbox → a shadow
+ * read that shows both documents and the delta.
  */
 export const iotHubProblem: Problem = {
   id: 'iot-hub',
   title: 'IoT Hub',
-  tagline: 'A device shadow that shows where the device is behind, fed by commands that execute once.',
+  tagline: 'Door-lock commands that run once, and a device shadow that shows where the device is behind.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# IoT Hub
 
-An IoT hub stands between operators and the devices in the field. It accepts commands and runs each
-one once, keeps a **device shadow** so desired and reported state can disagree without either being
-lost, delivers commands to a device gateway that may be offline for days, and publishes a command
-history the fleet team can audit.
+An IoT hub stands between operators and devices in the field. It accepts a command and runs it
+once, hands it to a gateway that may not reach the device for hours, records what happened to it,
+and keeps a **device shadow**: what the operator wants the device to be (desired) next to what the
+device last said it is (reported).
 
 ## The real system
 
-AWS IoT Core's Device Shadow service stores a JSON document with separate \`desired\` and
-\`reported\` sections, publishes a \`/delta\` document listing the fields where the two differ, and
-rejects an update whose \`version\` does not match the latest one it holds, so a stale writer cannot
-overwrite a newer document. This course keeps the same shape: two documents, two counters, a
-divergence list computed from the documents, and a report that is not newer changes nothing. On the
-command side, production hubs attach an identity and a validity window to every command, deliver
-through a gateway under a deadline, and require the device's acknowledgment before calling a command
-delivered. Command events are keyed by device so one device's history stays ordered and carry ids
-and outcomes rather than payload secrets.
+AWS IoT Core's Device Shadow service keeps one JSON document per device with a \`desired\` and a
+\`reported\` section, publishes a \`delta\` listing the desired fields the device has not reached yet,
+and rejects an update whose \`version\` does not match the stored one with a 409, so a stale writer
+cannot overwrite a newer document. This course keeps that shape in Redis, with one difference: the
+two sections carry their own versions, because the operator and the device write them at different
+times.
 
 ## What you build here
 
-One service, **iothub**, with five pieces:
+One service, **iothub**, on one provided package (\`iothub\`): \`commands\` (the command store),
+\`shadow\` (step 2's functions as later steps use them), \`registry\` (which tenant owns a device)
+and \`outbox\`.
 
-1. \`POST /v1/devices/{id}/commands\`: a per-device idempotency id so a replay executes once, a
-   validity window, an expected acknowledgment, and a per-device command rate limit.
-2. A **Redis** shadow: desired and reported documents with independent versions, a reported update
-   that merges by version, and a reconciliation that converges on the desired document.
-3. A **gRPC** device gateway client: a 5-second deadline per delivery, an offline queue that lasts
-   only until the validity window, and "delivered" meaning the device acknowledged.
-4. A **Kafka** command event path: one \`iot.command\` event keyed by device id, ids and outcomes
-   without payload secrets, an idempotent producer with \`acks=all\`, and an outbox row when the
-   produce fails.
-5. \`GET /v1/devices/{id}/shadow\`: both documents, both versions, a divergence list, and **404**
-   for a device the caller does not own.
+1. \`POST /v1/devices/{device_id}/commands\` with \`{idempotency_id, action, params, validity_s,
+   ack_required}\`: one command per \`(device, idempotency_id)\` in \`command:{device}:{idempotency_id}\`,
+   an \`expires_at_ms\` window, at most 10 commands per device per minute, and a \`pending_ack\` state
+   until the device answers.
+2. A **Redis** shadow: \`shadow:{device}:desired\` and \`shadow:{device}:reported\` hashes and their
+   versions in \`shadow:{device}\`. \`update_desired\` merges, \`apply_report\` keeps only a newer report
+   in one Lua script, \`read_shadow\` returns both.
+3. A **gRPC** \`DeviceGateway.Deliver\` client: \`deliver(command)\` answers \`delivered\`, \`queued\`,
+   \`expired\` or \`failed\` under a 5-second deadline, at most three attempts, inside the window.
+4. A **Kafka** \`iot.command\` stream: \`publish_transition(command, outcome)\` keyed by device id,
+   ids and outcome only, idempotent with \`acks=all\`, an outbox row when the broker does not
+   acknowledge.
+5. \`GET /v1/devices/{device_id}/shadow\`: both documents, both versions and the \`delta\`, **404**
+   for a device the caller's \`X-Tenant-Id\` does not own.
 
 ## The debugging habit
 
-Every starter in this course compiles and serves the happy path. In each step you debug it against
-the failure modes the task names, fix it, and prove the fix with checks that fail on the starter and
-pass on your version.
+Every starter in this course is working code with flaws: it compiles, it serves the happy path, and
+it looks right. In every step, debug it against the failure modes the task names, fix it, and prove
+the fix with checks that fail on the starter and pass on your version.
 
 ## Left out on purpose
 
-Device provisioning and certificates, firmware updates, MQTT and CoAP transports, command payload
-schemas per device model, time-series telemetry storage, multi-region device routing, and operator
-RBAC.`,
+Device provisioning and certificates, MQTT and CoAP transports, firmware updates, per-model payload
+schemas, telemetry storage and the relay that drains the outbox.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Operator', sub: 'HTTPS', x: 0, y: 50},
-      {id: 'hub', kind: 'service', label: 'IoT Hub', sub: 'api · read', x: 25, y: 50},
-      {id: 'shadow', kind: 'redis', label: 'Shadow', sub: 'desired/reported', x: 25, y: 20},
-      {id: 'gateway', kind: 'grpc', label: 'Device Gateway', sub: 'gRPC :50051', x: 55, y: 50},
-      {id: 'device', kind: 'external', label: 'Device', sub: 'reported state', x: 80, y: 50},
-      {id: 'broker', kind: 'kafka', label: 'iot.command', sub: 'keyed by device', x: 55, y: 20},
-      {id: 'audit', kind: 'service', label: 'Fleet Audit', sub: 'consumer group', x: 80, y: 20},
-      {id: 'outbox', kind: 'db', label: 'Outbox', sub: 'undelivered events', x: 25, y: 80},
+      {id: 'client', kind: 'client', label: 'Operator', sub: 'commands · shadow read', x: 6, y: 50},
+      {id: 'hub', kind: 'http', label: 'iothub', sub: 'HTTPS :8443', x: 26, y: 50},
+      {id: 'redis', kind: 'redis', label: 'Redis', sub: 'command:* · shadow:*', x: 46, y: 14},
+      {id: 'gateway', kind: 'grpc', label: 'Device gateway', sub: 'Deliver · 5 s', x: 52, y: 50},
+      {id: 'device', kind: 'external', label: 'Device', sub: 'acks · reports', x: 76, y: 50},
+      {id: 'kafka', kind: 'kafka', label: 'iot.command', sub: 'key = device id', x: 46, y: 86},
+      {id: 'audit', kind: 'service', label: 'Fleet audit', sub: 'consumer group', x: 72, y: 86},
+      {id: 'outbox', kind: 'db', label: 'Outbox', sub: 'unacknowledged events', x: 24, y: 86},
     ],
     edges: [
-      {from: 'client', to: 'hub', kind: 'http', label: 'commands · shadow read'},
-      {from: 'hub', to: 'shadow', kind: 'redis', label: 'desired/reported versions'},
-      {from: 'hub', to: 'gateway', kind: 'grpc', label: 'Deliver · deadline 5 s'},
-      {from: 'gateway', to: 'device', kind: 'grpc', label: 'push command'},
-      {from: 'device', to: 'hub', kind: 'http', label: 'reported state'},
-      {from: 'hub', to: 'broker', kind: 'kafka', label: 'produce iot.command'},
-      {from: 'broker', to: 'audit', kind: 'kafka', label: 'consume'},
-      {from: 'hub', to: 'outbox', kind: 'plain', label: 'outbox row on failure'},
+      {from: 'client', to: 'hub', kind: 'http', label: 'POST commands · GET shadow'},
+      {from: 'hub', to: 'redis', kind: 'redis', label: 'commands · desired/reported'},
+      {from: 'hub', to: 'gateway', kind: 'grpc', label: 'Deliver · expires_at_ms'},
+      {from: 'gateway', to: 'device', kind: 'plain', label: 'push · ack'},
+      {from: 'device', to: 'hub', kind: 'plain', label: 'reported state'},
+      {from: 'hub', to: 'kafka', kind: 'kafka', label: 'publish_transition'},
+      {from: 'kafka', to: 'audit', kind: 'kafka', label: 'consume'},
+      {from: 'hub', to: 'outbox', kind: 'plain', label: 'no ack → row'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

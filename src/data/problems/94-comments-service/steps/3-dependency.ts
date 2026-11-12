@@ -2,135 +2,108 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Moderation and notification calls that apply once',
+  title: 'Moderation first, under a deadline, one request id per comment',
   concept: 'grpc',
   file: 'client',
   focus: ['api', 'moderation', 'notifier', 'review'],
   task: `## Task
 
-**Starting point.** The starter's \`fanout\` calls the notifier first with a fresh \`uuid4\` as its
-\`idempotency-token\`, queues a retry entry with another fresh UUID when that call raises, and
-otherwise calls moderation with no deadline and returns \`allowed\` or \`blocked\`. It compiles, the
-happy path answers correctly, and it hides five flaws.
+**Starting point.** The starter is \`fanout(tenant, comment)\`, which the write path runs for each new
+comment: it calls \`Notifier.NotifyAuthor\`, then \`Moderation.CheckComment\`, records \`allowed\`
+or \`blocked\` with \`store.set_status\` and returns it; when the notification fails it calls
+\`store.enqueue_notify_retry\` and returns \`allowed\`. Every request carries a fresh random
+\`request_id\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A single comment eventually rings the author twice, because the
-retry carries a token neither service has seen; a slow moderation service holds the write open
-instead of flagging the comment for review; and a notifier exception returns before moderation runs,
-so a failed ping ships an unchecked comment.
+**Failure mode the checks target.** A slow moderation service holds the comment's POST open; a
+redelivered job notifies the thread twice because each attempt looks new; a notifier outage
+publishes comments moderation never saw, and blocked comments still ping the thread; a moderation
+timeout fails the write.
 
-- Both calls run under a **500 ms deadline** (\`FANOUT_DEADLINE_MS = 500\`, applied as the call
-  timeout / \`withDeadlineAfter\` / \`set_deadline\`).
-- Every attempt of one comment's fan-out carries the **same idempotency token**, derived from the
-  comment id by one function (\`idempotency_token(comment_id)\` → \`comment:{id}\`) and sent as the
-  \`idempotency-token\` metadata on the moderation call, the notification call and any retry.
-- **Moderation runs first**; a notification failure cannot cancel it. Moderation is the decision
-  the product depends on; the ping is best-effort.
-- A moderation call that hits the deadline is **not** a failed post: flag the comment
-  \`pending_review\`, enqueue it on the review queue, and answer the write successfully. Other
-  moderation failures still surface as errors.
-- When the notification call fails, enqueue a retry entry that carries the **same token**
-  (\`token: idempotency_token(comment_id)\` / \`Token: idempotencyToken(commentID)\`).
-- Return the moderation outcome (\`allowed\` / \`blocked\` / \`pending_review\`) to the caller.`,
+\`\`\`proto
+service Moderation { rpc CheckComment(CheckRequest) returns (Verdict); }   // allowed or not
+service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
+\`\`\`
+
+- Both calls run under \`FANOUT_DEADLINE_S\` = 0.5 s.
+- \`request_id\` is the comment id, on every call and on the \`notify:retry\` entry.
+- Moderation runs first. Only an \`allowed\` comment is announced; a failed announcement goes to
+  \`store.enqueue_notify_retry\`.
+- \`DEADLINE_EXCEEDED\` from moderation means \`pending_review\`: \`store.set_status\`,
+  \`store.enqueue_review\`, return it. Any other moderation error raises.`,
   sequence: {
-    participants: ['Comments API', 'Moderation', 'Notifier', 'Review queue'],
+    participants: ['Comments API', 'Moderation', 'Notifier', 'Redis queues'],
     messages: [
-      {
-        from: 'Comments API',
-        to: 'Moderation',
-        label: 'CheckComment · metadata idempotency-token = comment:{id} · deadline 500 ms',
-        kind: 'sync',
-      },
+      {from: 'Comments API', to: 'Moderation', label: 'CheckComment · request_id = comment id · 500 ms', kind: 'sync'},
       {from: 'Moderation', to: 'Comments API', label: 'allowed / blocked', kind: 'reply'},
       {from: 'Moderation', to: 'Comments API', label: 'DEADLINE_EXCEEDED → pending_review', kind: 'reply'},
-      {from: 'Comments API', to: 'Review queue', label: 'enqueue(comment_id)', kind: 'async'},
+      {from: 'Comments API', to: 'Redis queues', label: 'enqueue_review(tenant, id)', kind: 'async'},
       {
         from: 'Comments API',
         to: 'Notifier',
-        label: 'NotifyAuthor · same idempotency-token · deadline 500 ms',
+        label: 'NotifyAuthor (allowed only) · same request_id · 500 ms',
         kind: 'sync',
       },
-      {from: 'Comments API', to: 'Comments API', label: 'retry entry carries the same token', kind: 'async'},
+      {
+        from: 'Comments API',
+        to: 'Redis queues',
+        label: 'on failure: enqueue_notify_retry(tenant, id, request_id)',
+        kind: 'async',
+      },
     ],
   },
   checks: [
     {
       id: 'deadline',
-      title: 'Bounds every fan-out call with a 500 ms deadline',
+      title: 'Both fan-out calls carry a 500 ms deadline',
       detail:
-        'Both calls run under `FANOUT_DEADLINE_MS = 500`, applied as the call deadline. The starter calls moderation with no deadline at all, so a slow moderation service holds the write open.',
+        '`CheckComment` and `NotifyAuthor` are made with `FANOUT_DEADLINE_S` (0.5 s), so a stalled dependency costs the write at most half a second. The starter sets no deadline at all.',
       match: {
-        python: {all: [/FANOUT_DEADLINE_MS = 500/, /timeout=FANOUT_DEADLINE_S/]},
-        typescript: {all: [/FANOUT_DEADLINE_MS = 500/, /deadline: Date\.now\(\) \+ FANOUT_DEADLINE_MS/]},
-        go: {all: [/fanoutDeadlineMS = 500/, /context\.WithTimeout\(/]},
-        scala: {all: [/FanoutDeadlineMs = 500/, /withDeadlineAfter\(/]},
-        cpp: {all: [/kFanoutDeadlineMs = 500/, /set_deadline\(/]},
+        python: {all: [/FANOUT_DEADLINE_S\s*=\s*0\.5\b/, /timeout\s*=\s*FANOUT_DEADLINE_S/]},
+        typescript: {all: [/FANOUT_DEADLINE_MS\s*=\s*500\b/, /deadline:\s*Date\.now\(\)\s*\+\s*FANOUT_DEADLINE_MS/]},
+        go: {
+          all: [/fanoutDeadline\s*=\s*500\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*fanoutDeadline\)/],
+        },
+        scala: {all: [/FanoutDeadlineMs\s*=\s*500L?\b/, /withDeadlineAfter\(\s*FanoutDeadlineMs/]},
+        cpp: {all: [/kFanoutDeadline\{500\}|kFanoutDeadline\(500\)/, /set_deadline\([^\n]*kFanoutDeadline\)/]},
       },
     },
     {
-      id: 'shared-token',
-      title: 'Derives one token from the comment id and reuses it',
+      id: 'request-id',
+      title: 'Every attempt about one comment carries its id',
       detail:
-        '`idempotency_token(comment_id)` returns `comment:{id}` and that same value is sent as the `idempotency-token` metadata on every attempt, including retries. The starter mints a fresh UUID per attempt.',
+        '`request_id` is the comment id on both calls and on the `notify:retry` entry, so moderation and the notifier recognise a redelivered job; the starter generates a random id per call, so every retry is a new request.',
       match: {
-        python: {
-          all: [/def idempotency_token\(/, /"idempotency-token"/, /idempotency_token\(comment_id\)/],
-          none: [/uuid\.uuid4\(\)/],
-        },
-        typescript: {
-          all: [/function idempotencyToken\(/, /'idempotency-token'/, /idempotencyToken\(commentId\)/],
-          none: [/randomUUID\(\)/],
-        },
-        go: {
-          all: [/func idempotencyToken\(/, /"idempotency-token"/, /idempotencyToken\(commentID\)/],
-          none: [/uuid\.NewString\(\)/],
-        },
-        scala: {
-          all: [/def idempotencyToken\(/, /"idempotency-token"/, /idempotencyToken\(commentId\)/],
-          none: [/UUID\.randomUUID\(\)/],
-        },
-        cpp: {
-          all: [/idempotencyToken\(/, /"idempotency-token"/, /idempotencyToken\(commentId\)/],
-          none: [/uuidString\(\)/],
-        },
+        python: {all: [/request_id\s*=\s*comment\[["']id["']\]/], none: [/uuid/]},
+        typescript: {all: [/requestId\s*=\s*comment\.id|request_id:\s*comment\.id/], none: [/randomUUID/]},
+        go: {all: [/requestID\s*:?=\s*c\.ID|RequestId:\s*c\.ID/], none: [/uuid\./]},
+        scala: {all: [/requestId\s*=\s*comment\.id/], none: [/randomUUID/]},
+        cpp: {all: [/request_id\s*=\s*c\.id|set_request_id\(\s*c\.id\s*\)/], none: [/uuid_generate/]},
+      },
+    },
+    {
+      id: 'moderation-first',
+      title: 'Moderation decides before anything is announced',
+      detail:
+        '`CheckComment` runs before `NotifyAuthor`, a notifier failure only queues a retry, and a blocked comment is never announced. The starter notifies first and returns `allowed` when the notifier fails, so the comment ships unmoderated.',
+      match: {
+        python: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
+        typescript: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
+        go: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
+        scala: {order: [/\.checkComment\(/, /\.notifyAuthor\(/]},
+        cpp: {order: [/moderation->CheckComment\(/, /notifier->NotifyAuthor\(/]},
       },
     },
     {
       id: 'timeout-review',
-      title: 'Flags a moderation timeout for asynchronous review',
+      title: 'A moderation timeout becomes a review, not a failed post',
       detail:
-        'A `DEADLINE_EXCEEDED` from moderation sets the status to `pending_review` and enqueues the comment on `review_queue` instead of failing the write. The starter lets the timeout surface as a failed post.',
+        '`DEADLINE_EXCEEDED` from moderation sets `pending_review`, queues the comment with `store.enqueue_review` and returns the status; any other moderation failure still raises. The starter lets the timeout escape.',
       match: {
-        python: {all: [/DEADLINE_EXCEEDED/, /pending_review/, /review_queue\.enqueue\(/]},
-        typescript: {all: [/DEADLINE_EXCEEDED/, /pending_review/, /reviewQueue\.enqueue\(/]},
-        go: {all: [/codes\.DeadlineExceeded/, /pending_review/, /reviewQueue\.Enqueue\(/]},
-        scala: {all: [/DEADLINE_EXCEEDED/, /pending_review/, /reviewQueue\.enqueue\(/]},
-        cpp: {all: [/DEADLINE_EXCEEDED/, /pending_review/, /review_queue\.enqueue\(/]},
-      },
-    },
-    {
-      id: 'isolate',
-      title: 'Moderation survives a notification failure',
-      detail:
-        'Moderation is called before the notification, so a notifier exception cannot skip it. The starter notifies first and returns from the catch block, shipping an unchecked comment.',
-      match: {
-        python: {order: [/moderation\.Check\(/, /notifier\.Notify\(/]},
-        typescript: {order: [/moderation\.Check\(/, /notifier\.Notify\(/]},
-        go: {order: [/moderation\.Check\(/, /notifier\.Notify\(/]},
-        scala: {order: [/\.check\(/, /\.notify\(/]},
-        cpp: {order: [/moderation->Check\(/, /notifier->Notify\(/]},
-      },
-    },
-    {
-      id: 'retry-token',
-      title: 'Queues the retry with the same token',
-      detail:
-        'The retry entry written when the notification fails carries `idempotency_token(comment_id)`, the same token as the attempt that failed, so the replay pings the author once.',
-      match: {
-        python: {all: [/retry_queue\.put\(/, /"token": idempotency_token\(comment_id\)/]},
-        typescript: {all: [/retryQueue\.put\(/, /token: idempotencyToken\(commentId\)/]},
-        go: {all: [/retryQueue\.Put\(/, /Token: idempotencyToken\(commentID\)/]},
-        scala: {all: [/retryQueue\.put\(/, /"token" -> idempotencyToken\(commentId\)/]},
-        cpp: {all: [/retryQueue\.put\(/, /RetryEntry\{[^}]*idempotencyToken\(commentId\)[^}]*\}/]},
+        python: {all: [/DEADLINE_EXCEEDED/, /["']pending_review["']/, /store\.enqueue_review\(/]},
+        typescript: {all: [/DEADLINE_EXCEEDED/, /['"]pending_review['"]/, /enqueueReview\(/]},
+        go: {all: [/codes\.DeadlineExceeded/, /"pending_review"/, /store\.EnqueueReview\(/]},
+        scala: {all: [/DEADLINE_EXCEEDED/, /"pending_review"/, /Store\.enqueueReview\(/]},
+        cpp: {all: [/DEADLINE_EXCEEDED/, /"pending_review"/, /store::enqueueReview\(/]},
       },
     },
   ],
@@ -139,240 +112,200 @@ so a failed ping ships an unchecked comment.
       starter: `import uuid
 
 import grpc
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-import moderation_pb2
-import notification_pb2
+import comments_service_pb2 as pb
+import comments_service_pb2_grpc as pb_grpc
+from comments import store  # store.set_status, enqueue_review, enqueue_notify_retry
 
-app = FastAPI()
-
-
-class CommentRequest(BaseModel):
-    comment_id: str
-    thread_id: str
-    author_id: str
+moderation = pb_grpc.ModerationStub(grpc.insecure_channel("moderation:9000"))
+notifier = pb_grpc.NotifierStub(grpc.insecure_channel("notifier:9000"))
 
 
-class ReviewQueue:
-    def enqueue(self, comment_id: str) -> None:
-        raise NotImplementedError
-
-
-class RetryQueue:
-    def put(self, entry: dict) -> None:
-        raise NotImplementedError
-
-
-review_queue = ReviewQueue()
-retry_queue = RetryQueue()
-moderation = moderation_pb2.ModerationStub()
-notifier = notification_pb2.NotifierStub()
-
-
-def fanout(comment_id: str, thread_id: str, author_id: str) -> str:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
+def fanout(tenant: str, comment: dict) -> str:
+    """Moderate a new comment and tell the thread about it; returns the comment's status."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
     try:
-        notifier.Notify(
-            notification_pb2.NotifyRequest(comment_id=comment_id, author_id=author_id),
-            metadata=(("idempotency-token", str(uuid.uuid4())),),
+        notifier.NotifyAuthor(
+            pb.NotifyRequest(
+                tenant=tenant,
+                comment_id=comment["id"],
+                thread_id=comment["thread_id"],
+                parent_id=comment["parent_id"],
+                request_id=uuid.uuid4().hex,
+            )
         )
     except grpc.RpcError:
-        retry_queue.put({"comment_id": comment_id, "token": str(uuid.uuid4())})
-        return "pending"
-    reply = moderation.Check(moderation_pb2.CheckRequest(comment_id=comment_id, thread_id=thread_id))
-    return "allowed" if reply.allowed else "blocked"
-
-
-@app.post("/v1/comments")
-def create_comment(body: CommentRequest, tenant: str = Header(default="", alias="X-Tenant-Id")) -> JSONResponse:
-    return JSONResponse({"id": body.comment_id, "moderation": fanout(body.comment_id, body.thread_id, body.author_id)})
+        store.enqueue_notify_retry(tenant, comment["id"], uuid.uuid4().hex)
+        return "allowed"
+    verdict = moderation.CheckComment(
+        pb.CheckRequest(tenant=tenant, comment_id=comment["id"], thread_id=comment["thread_id"], text=comment["text"], request_id=uuid.uuid4().hex)
+    )
+    status = "allowed" if verdict.allowed else "blocked"
+    store.set_status(tenant, comment["id"], status)
+    return status
 `,
       solution: `import grpc
-from fastapi import FastAPI, Header
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-import moderation_pb2
-import notification_pb2
+import comments_service_pb2 as pb
+import comments_service_pb2_grpc as pb_grpc
+from comments import store  # store.set_status, enqueue_review, enqueue_notify_retry
 
-app = FastAPI()
+moderation = pb_grpc.ModerationStub(grpc.insecure_channel("moderation:9000"))
+notifier = pb_grpc.NotifierStub(grpc.insecure_channel("notifier:9000"))
 
-FANOUT_DEADLINE_MS = 500
-FANOUT_DEADLINE_S = FANOUT_DEADLINE_MS / 1000
+FANOUT_DEADLINE_S = 0.5
 
 
-class CommentRequest(BaseModel):
-    comment_id: str
-    thread_id: str
-    author_id: str
-
-
-class ReviewQueue:
-    def enqueue(self, comment_id: str) -> None:
-        raise NotImplementedError
-
-
-class RetryQueue:
-    def put(self, entry: dict) -> None:
-        raise NotImplementedError
-
-
-review_queue = ReviewQueue()
-retry_queue = RetryQueue()
-moderation = moderation_pb2.ModerationStub()
-notifier = notification_pb2.NotifierStub()
-
-
-def idempotency_token(comment_id: str) -> str:
-    """The token every attempt of one comment's fan-out carries: derived from the comment id."""
-    return f"comment:{comment_id}"
-
-
-def fanout(comment_id: str, thread_id: str, author_id: str) -> str:
-    """Moderation first, notification after: a ping that fails must never cancel moderation."""
-    status = "allowed"
+def fanout(tenant: str, comment: dict) -> str:
+    """Moderate a new comment and tell the thread about it; returns the comment's status."""
+    request_id = comment["id"]  # the same on every attempt about this comment
     try:
-        reply = moderation.Check(
-            moderation_pb2.CheckRequest(comment_id=comment_id, thread_id=thread_id),
+        verdict = moderation.CheckComment(
+            pb.CheckRequest(tenant=tenant, comment_id=comment["id"], thread_id=comment["thread_id"], text=comment["text"], request_id=request_id),
             timeout=FANOUT_DEADLINE_S,
-            metadata=(("idempotency-token", idempotency_token(comment_id)),),
         )
-        status = "allowed" if reply.allowed else "blocked"
-    except grpc.RpcError as exc:
-        if exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
-            status = "pending_review"
-            review_queue.enqueue(comment_id)
-        else:
+        status = "allowed" if verdict.allowed else "blocked"
+    except grpc.RpcError as err:
+        if err.code() != grpc.StatusCode.DEADLINE_EXCEEDED:
             raise
-    try:
-        notifier.Notify(
-            notification_pb2.NotifyRequest(comment_id=comment_id, author_id=author_id),
-            timeout=FANOUT_DEADLINE_S,
-            metadata=(("idempotency-token", idempotency_token(comment_id)),),
-        )
-    except grpc.RpcError:
-        retry_queue.put(
-            {"comment_id": comment_id, "author_id": author_id, "token": idempotency_token(comment_id)}
-        )
+        # Moderation did not decide in time: a human does, and the post still succeeds.
+        status = "pending_review"
+        store.enqueue_review(tenant, comment["id"])
+    store.set_status(tenant, comment["id"], status)
+    if status == "allowed":
+        try:
+            notifier.NotifyAuthor(
+                pb.NotifyRequest(
+                    tenant=tenant,
+                    comment_id=comment["id"],
+                    thread_id=comment["thread_id"],
+                    parent_id=comment["parent_id"],
+                    request_id=request_id,
+                ),
+                timeout=FANOUT_DEADLINE_S,
+            )
+        except grpc.RpcError:
+            store.enqueue_notify_retry(tenant, comment["id"], request_id)  # best effort: retried later, same id
     return status
-
-
-@app.post("/v1/comments")
-def create_comment(body: CommentRequest, tenant: str = Header(default="", alias="X-Tenant-Id")) -> JSONResponse:
-    return JSONResponse({"id": body.comment_id, "moderation": fanout(body.comment_id, body.thread_id, body.author_id)})
 `,
     },
     typescript: {
-      starter: `/** Comment fan-out. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import {randomUUID} from 'node:crypto';
 
-const {comments} = grpc.loadPackageDefinition(protoLoader.loadSync('comments.proto')) as unknown as {
-  comments: {
-    Moderation: new (target: string, credentials: grpc.ChannelCredentials) => ModerationClient;
-    Notifier: new (target: string, credentials: grpc.ChannelCredentials) => NotifierClient;
-  };
+import {type Comment, enqueueNotifyRetry, enqueueReview, setStatus} from 'comments/store';
+
+interface CheckRequest {
+  tenant: string;
+  comment_id: string;
+  thread_id: string;
+  text: string;
+  request_id: string;
+}
+
+interface NotifyRequest {
+  tenant: string;
+  comment_id: string;
+  thread_id: string;
+  parent_id: string;
+  request_id: string;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('comments_service.proto')) as unknown as {
+  commentsd: {Moderation: grpc.ServiceClientConstructor; Notifier: grpc.ServiceClientConstructor};
+};
+const moderation = new pkg.commentsd.Moderation('moderation:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  CheckComment(request: CheckRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{allowed: boolean; reason: string}>;
+};
+const notifier = new pkg.commentsd.Notifier('notifier:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  NotifyAuthor(request: NotifyRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{queued: boolean}>;
 };
 
-interface ModerationClient {
-  Check(request: {comment_id: string; thread_id: string}, metadata: grpc.Metadata): Promise<{allowed: boolean}>;
-}
-
-interface NotifierClient {
-  Notify(request: {comment_id: string; author_id: string}, metadata: grpc.Metadata): Promise<unknown>;
-}
-
-export const moderation = new comments.Moderation('moderation:9000', grpc.credentials.createInsecure());
-export const notifier = new comments.Notifier('notifier:9000', grpc.credentials.createInsecure());
-
-export const reviewQueue = {enqueue: async (_commentId: string): Promise<void> => {}};
-export const retryQueue = {put: async (_entry: {comment_id: string; author_id: string; token: string}): Promise<void> => {}};
-
-export async function fanout(commentId: string, threadId: string, authorId: string): Promise<string> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const meta = new grpc.Metadata();
-  meta.set('idempotency-token', randomUUID());
+/** Moderate a new comment and tell the thread about it; resolves the comment's status. */
+export async function fanout(tenant: string, comment: Comment): Promise<string> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   try {
-    await notifier.Notify({comment_id: commentId, author_id: authorId}, meta);
+    await notifier.NotifyAuthor(
+      {tenant, comment_id: comment.id, thread_id: comment.thread_id, parent_id: comment.parent_id, request_id: randomUUID()},
+      new grpc.Metadata(),
+      {},
+    );
   } catch {
-    await retryQueue.put({comment_id: commentId, author_id: authorId, token: randomUUID()});
-    return 'pending';
+    await enqueueNotifyRetry(tenant, comment.id, randomUUID());
+    return 'allowed';
   }
-  const reply = await moderation.Check({comment_id: commentId, thread_id: threadId}, meta);
-  return reply.allowed ? 'allowed' : 'blocked';
+  const verdict = await moderation.CheckComment(
+    {tenant, comment_id: comment.id, thread_id: comment.thread_id, text: comment.text, request_id: randomUUID()},
+    new grpc.Metadata(),
+    {},
+  );
+  const status = verdict.allowed ? 'allowed' : 'blocked';
+  await setStatus(tenant, comment.id, status);
+  return status;
 }
 `,
-      solution: `/** Comment fan-out: one token per comment, a deadline on every call, moderation first. */
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-const FANOUT_DEADLINE_MS = 500;
+import {type Comment, enqueueNotifyRetry, enqueueReview, setStatus} from 'comments/store';
 
-const {comments} = grpc.loadPackageDefinition(protoLoader.loadSync('comments.proto')) as unknown as {
-  comments: {
-    Moderation: new (target: string, credentials: grpc.ChannelCredentials) => ModerationClient;
-    Notifier: new (target: string, credentials: grpc.ChannelCredentials) => NotifierClient;
-  };
+export const FANOUT_DEADLINE_MS = 500;
+
+interface CheckRequest {
+  tenant: string;
+  comment_id: string;
+  thread_id: string;
+  text: string;
+  request_id: string;
+}
+
+interface NotifyRequest {
+  tenant: string;
+  comment_id: string;
+  thread_id: string;
+  parent_id: string;
+  request_id: string;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('comments_service.proto')) as unknown as {
+  commentsd: {Moderation: grpc.ServiceClientConstructor; Notifier: grpc.ServiceClientConstructor};
+};
+const moderation = new pkg.commentsd.Moderation('moderation:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  CheckComment(request: CheckRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{allowed: boolean; reason: string}>;
+};
+const notifier = new pkg.commentsd.Notifier('notifier:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  NotifyAuthor(request: NotifyRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{queued: boolean}>;
 };
 
-interface ModerationClient {
-  Check(
-    request: {comment_id: string; thread_id: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-  ): Promise<{allowed: boolean}>;
-}
-
-interface NotifierClient {
-  Notify(
-    request: {comment_id: string; author_id: string},
-    metadata: grpc.Metadata,
-    options: {deadline?: number},
-  ): Promise<unknown>;
-}
-
-export const moderation = new comments.Moderation('moderation:9000', grpc.credentials.createInsecure());
-export const notifier = new comments.Notifier('notifier:9000', grpc.credentials.createInsecure());
-
-export const reviewQueue = {enqueue: async (_commentId: string): Promise<void> => {}};
-export const retryQueue = {
-  put: async (_entry: {comment_id: string; author_id: string; token: string}): Promise<void> => {},
-};
-
-/** The token every attempt of one comment's fan-out carries: derived from the comment id. */
-function idempotencyToken(commentId: string): string {
-  return \`comment:\${commentId}\`;
-}
-
-function metadataFor(commentId: string): grpc.Metadata {
-  const meta = new grpc.Metadata();
-  meta.set('idempotency-token', idempotencyToken(commentId));
-  return meta;
-}
-
-/** Moderation first, notification after: a ping that fails must never cancel moderation. */
-export async function fanout(commentId: string, threadId: string, authorId: string): Promise<string> {
-  let status = 'allowed';
+/** Moderate a new comment and tell the thread about it; resolves the comment's status. */
+export async function fanout(tenant: string, comment: Comment): Promise<string> {
+  const requestId = comment.id; // the same on every attempt about this comment
+  let status: string;
   try {
-    const reply = await moderation.Check({comment_id: commentId, thread_id: threadId}, metadataFor(commentId), {
-      deadline: Date.now() + FANOUT_DEADLINE_MS,
-    });
-    status = reply.allowed ? 'allowed' : 'blocked';
-  } catch (error) {
-    const serviceError = error as grpc.ServiceError;
-    if (serviceError.code !== grpc.status.DEADLINE_EXCEEDED) throw serviceError;
+    const verdict = await moderation.CheckComment(
+      {tenant, comment_id: comment.id, thread_id: comment.thread_id, text: comment.text, request_id: requestId},
+      new grpc.Metadata(),
+      {deadline: Date.now() + FANOUT_DEADLINE_MS},
+    );
+    status = verdict.allowed ? 'allowed' : 'blocked';
+  } catch (e) {
+    if ((e as grpc.ServiceError).code !== grpc.status.DEADLINE_EXCEEDED) throw e;
+    // Moderation did not decide in time: a human does, and the post still succeeds.
     status = 'pending_review';
-    await reviewQueue.enqueue(commentId);
+    await enqueueReview(tenant, comment.id);
   }
-  try {
-    await notifier.Notify({comment_id: commentId, author_id: authorId}, metadataFor(commentId), {
-      deadline: Date.now() + FANOUT_DEADLINE_MS,
-    });
-  } catch {
-    await retryQueue.put({comment_id: commentId, author_id: authorId, token: idempotencyToken(commentId)});
+  await setStatus(tenant, comment.id, status);
+  if (status === 'allowed') {
+    try {
+      await notifier.NotifyAuthor(
+        {tenant, comment_id: comment.id, thread_id: comment.thread_id, parent_id: comment.parent_id, request_id: requestId},
+        new grpc.Metadata(),
+        {deadline: Date.now() + FANOUT_DEADLINE_MS},
+      );
+    } catch {
+      await enqueueNotifyRetry(tenant, comment.id, requestId); // best effort: retried later, same id
+    }
   }
   return status;
 }
@@ -385,36 +318,38 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"google.golang.org/grpc/metadata"
-)
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-type RetryEntry struct {
-	CommentID string
-	AuthorID  string
-	Token     string
-}
+	pb "comments/gen/comments_service"
+	"comments/store" // store.Comment, SetStatus, EnqueueReview, EnqueueNotifyRetry
+)
 
 var (
-	moderation ModerationClient
-	notifier   NotifierClient
-	retryQueue RetryQueue
+	moderationConn, _ = grpc.NewClient("moderation:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	notifierConn, _   = grpc.NewClient("notifier:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	moderation        = pb.NewModerationClient(moderationConn)
+	notifier          = pb.NewNotifierClient(notifierConn)
 )
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-func Fanout(ctx context.Context, commentID, threadID, authorID string) (string, error) {
-	ctx = metadata.AppendToOutgoingContext(ctx, "idempotency-token", uuid.NewString())
-	if _, err := notifier.Notify(ctx, &NotifyRequest{CommentId: commentID, AuthorId: authorID}); err != nil {
-		retryQueue.Put(ctx, RetryEntry{CommentID: commentID, AuthorID: authorID, Token: uuid.NewString()})
-		return "pending", nil
+// fanout moderates a new comment and tells the thread about it; it returns the comment's status.
+func fanout(ctx context.Context, tenant string, c store.Comment) (string, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	_, err := notifier.NotifyAuthor(ctx, &pb.NotifyRequest{Tenant: tenant, CommentId: c.ID, ThreadId: c.ThreadID, ParentId: c.ParentID, RequestId: uuid.NewString()})
+	if err != nil {
+		store.EnqueueNotifyRetry(ctx, tenant, c.ID, uuid.NewString())
+		return "allowed", nil
 	}
-	reply, err := moderation.Check(ctx, &CheckRequest{CommentId: commentID, ThreadId: threadID})
+	verdict, err := moderation.CheckComment(ctx, &pb.CheckRequest{Tenant: tenant, CommentId: c.ID, ThreadId: c.ThreadID, Text: c.Text, RequestId: uuid.NewString()})
 	if err != nil {
 		return "", err
 	}
-	if reply.Allowed {
-		return "allowed", nil
+	outcome := "blocked"
+	if verdict.GetAllowed() {
+		outcome = "allowed"
 	}
-	return "blocked", nil
+	store.SetStatus(ctx, tenant, c.ID, outcome)
+	return outcome, nil
 }
 `,
       solution: `package main
@@ -423,257 +358,719 @@ import (
 	"context"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	pb "comments/gen/comments_service"
+	"comments/store" // store.Comment, SetStatus, EnqueueReview, EnqueueNotifyRetry
 )
 
-const fanoutDeadlineMS = 500
-
-type RetryEntry struct {
-	CommentID string
-	AuthorID  string
-	Token     string
-}
+const fanoutDeadline = 500 * time.Millisecond
 
 var (
-	moderation  ModerationClient
-	notifier    NotifierClient
-	retryQueue  RetryQueue
-	reviewQueue ReviewQueue
+	moderationConn, _ = grpc.NewClient("moderation:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	notifierConn, _   = grpc.NewClient("notifier:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	moderation        = pb.NewModerationClient(moderationConn)
+	notifier          = pb.NewNotifierClient(notifierConn)
 )
 
-// idempotencyToken is the token every attempt of one comment's fan-out carries.
-func idempotencyToken(commentID string) string {
-	return "comment:" + commentID
-}
-
-func tokenContext(ctx context.Context, commentID string) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, "idempotency-token", idempotencyToken(commentID))
-}
-
-// Fanout calls moderation first and the notifier after: a ping that fails must never cancel
-// moderation, and a retry reuses the token of the attempt that failed.
-func Fanout(ctx context.Context, commentID, threadID, authorID string) (string, error) {
-	callCtx, cancel := context.WithTimeout(ctx, fanoutDeadlineMS*time.Millisecond)
-	defer cancel()
-	callCtx = tokenContext(callCtx, commentID)
-
-	verdict := "allowed"
-	reply, err := moderation.Check(callCtx, &CheckRequest{CommentId: commentID, ThreadId: threadID})
-	switch status.Code(err) {
-	case codes.OK:
-		if reply.Allowed {
-			verdict = "allowed"
-		} else {
-			verdict = "blocked"
-		}
-	case codes.DeadlineExceeded:
-		verdict = "pending_review"
-		reviewQueue.Enqueue(callCtx, commentID)
+// fanout moderates a new comment and tells the thread about it; it returns the comment's status.
+func fanout(ctx context.Context, tenant string, c store.Comment) (string, error) {
+	requestID := c.ID // the same on every attempt about this comment
+	checkCtx, cancel := context.WithTimeout(ctx, fanoutDeadline)
+	verdict, err := moderation.CheckComment(checkCtx, &pb.CheckRequest{Tenant: tenant, CommentId: c.ID, ThreadId: c.ThreadID, Text: c.Text, RequestId: requestID})
+	cancel()
+	outcome := "blocked"
+	switch {
+	case err == nil && verdict.GetAllowed():
+		outcome = "allowed"
+	case err == nil:
+	case status.Code(err) == codes.DeadlineExceeded:
+		// Moderation did not decide in time: a human does, and the post still succeeds.
+		outcome = "pending_review"
+		store.EnqueueReview(ctx, tenant, c.ID)
 	default:
 		return "", err
 	}
-	if _, err := notifier.Notify(callCtx, &NotifyRequest{CommentId: commentID, AuthorId: authorID}); err != nil {
-		retryQueue.Put(callCtx, RetryEntry{CommentID: commentID, AuthorID: authorID, Token: idempotencyToken(commentID)})
+	store.SetStatus(ctx, tenant, c.ID, outcome)
+	if outcome == "allowed" {
+		notifyCtx, cancel := context.WithTimeout(ctx, fanoutDeadline)
+		_, err := notifier.NotifyAuthor(notifyCtx, &pb.NotifyRequest{Tenant: tenant, CommentId: c.ID, ThreadId: c.ThreadID, ParentId: c.ParentID, RequestId: requestID})
+		cancel()
+		if err != nil {
+			store.EnqueueNotifyRetry(ctx, tenant, c.ID, requestID) // best effort: retried later, same id
+		}
 	}
-	return verdict, nil
+	return outcome, nil
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException, Metadata}
+      starter: `import java.util.UUID
 
-object CommentFanout {
-  val moderation = ModerationGrpc.blockingStub(ManagedChannelBuilder.forAddress("moderation", 9000).usePlaintext().build())
-  val notifier = NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build())
-  val reviewQueue = ReviewQueue()
-  val retryQueue = RetryQueue()
+import scala.util.Try
 
-  def metadataWith(token: String): Metadata = {
-    val meta = new Metadata()
-    meta.put(Metadata.Key.of("idempotency-token", Metadata.ASCII_STRING_MARSHALLER), token)
-    meta
-  }
+import io.grpc.ManagedChannelBuilder
 
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  def fanout(commentId: String, threadId: String, authorId: String): String = {
-    try {
-      notifier.notify(
-        NotifyRequest(commentId = commentId, authorId = authorId),
-        metadataWith(java.util.UUID.randomUUID().toString)
-      )
-    } catch {
-      case _: StatusRuntimeException =>
-        retryQueue.put(Map("comment_id" -> commentId, "token" -> java.util.UUID.randomUUID().toString))
-        return "pending"
+import comments.Store // Store.Comment, setStatus, enqueueReview, enqueueNotifyRetry
+import commentsd.comments_service.{CheckRequest, ModerationGrpc, NotifierGrpc, NotifyRequest}
+
+object Client {
+  private val moderation = ModerationGrpc.blockingStub(ManagedChannelBuilder.forAddress("moderation", 9000).usePlaintext().build())
+  private val notifier = NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build())
+
+  /** Moderate a new comment and tell the thread about it; returns the comment's status. */
+  def fanout(tenant: String, comment: Store.Comment): String = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val notified = Try(notifier.notifyAuthor(NotifyRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, parentId = comment.parentId, requestId = UUID.randomUUID().toString)))
+    if (notified.isFailure) {
+      Store.enqueueNotifyRetry(tenant, comment.id, UUID.randomUUID().toString)
+      "allowed"
+    } else {
+      val verdict = moderation.checkComment(CheckRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, text = comment.text, requestId = UUID.randomUUID().toString))
+      val status = if (verdict.allowed) "allowed" else "blocked"
+      Store.setStatus(tenant, comment.id, status)
+      status
     }
-    val reply = moderation.check(CheckRequest(commentId = commentId, threadId = threadId))
-    if (reply.allowed) "allowed" else "blocked"
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
-import io.grpc.{ManagedChannelBuilder, Metadata, Status, StatusRuntimeException}
+import scala.util.Try
 
-object CommentFanout {
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+
+import comments.Store // Store.Comment, setStatus, enqueueReview, enqueueNotifyRetry
+import commentsd.comments_service.{CheckRequest, ModerationGrpc, NotifierGrpc, NotifyRequest}
+
+object Client {
   val FanoutDeadlineMs = 500L
 
-  val moderation = ModerationGrpc.blockingStub(ManagedChannelBuilder.forAddress("moderation", 9000).usePlaintext().build())
-  val notifier = NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build())
-  val reviewQueue = ReviewQueue()
-  val retryQueue = RetryQueue()
+  private val moderation = ModerationGrpc.blockingStub(ManagedChannelBuilder.forAddress("moderation", 9000).usePlaintext().build())
+  private val notifier = NotifierGrpc.blockingStub(ManagedChannelBuilder.forAddress("notifier", 9000).usePlaintext().build())
 
-  /** The token every attempt of one comment's fan-out carries: derived from the comment id. */
-  def idempotencyToken(commentId: String): String = s"comment:$commentId"
-
-  def metadataFor(commentId: String): Metadata = {
-    val meta = new Metadata()
-    meta.put(Metadata.Key.of("idempotency-token", Metadata.ASCII_STRING_MARSHALLER), idempotencyToken(commentId))
-    meta
-  }
-
-  /** Moderation first, notification after: a ping that fails must never cancel moderation. */
-  def fanout(commentId: String, threadId: String, authorId: String): String = {
-    var verdict = "allowed"
-    try {
-      val reply = moderation
-        .withDeadlineAfter(FanoutDeadlineMs, TimeUnit.MILLISECONDS)
-        .check(CheckRequest(commentId = commentId, threadId = threadId), metadataFor(commentId))
-      verdict = if (reply.allowed) "allowed" else "blocked"
-    } catch {
-      case exc: StatusRuntimeException if exc.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
-        verdict = "pending_review"
-        reviewQueue.enqueue(commentId)
+  /** Moderate a new comment and tell the thread about it; returns the comment's status. */
+  def fanout(tenant: String, comment: Store.Comment): String = {
+    val requestId = comment.id // the same on every attempt about this comment
+    val status =
+      try {
+        val verdict = moderation
+          .withDeadlineAfter(FanoutDeadlineMs, TimeUnit.MILLISECONDS)
+          .checkComment(CheckRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, text = comment.text, requestId = requestId))
+        if (verdict.allowed) "allowed" else "blocked"
+      } catch {
+        case e: StatusRuntimeException if e.getStatus.getCode == Status.Code.DEADLINE_EXCEEDED =>
+          // Moderation did not decide in time: a human does, and the post still succeeds.
+          Store.enqueueReview(tenant, comment.id)
+          "pending_review"
+      }
+    Store.setStatus(tenant, comment.id, status)
+    if (status == "allowed") {
+      val notified = Try(
+        notifier
+          .withDeadlineAfter(FanoutDeadlineMs, TimeUnit.MILLISECONDS)
+          .notifyAuthor(NotifyRequest(tenant = tenant, commentId = comment.id, threadId = comment.threadId, parentId = comment.parentId, requestId = requestId)))
+      if (notified.isFailure) Store.enqueueNotifyRetry(tenant, comment.id, requestId) // best effort: retried later, same id
     }
-    try {
-      notifier
-        .withDeadlineAfter(FanoutDeadlineMs, TimeUnit.MILLISECONDS)
-        .notify(NotifyRequest(commentId = commentId, authorId = authorId), metadataFor(commentId))
-    } catch {
-      case _: StatusRuntimeException =>
-        retryQueue.put(Map("comment_id" -> commentId, "author_id" -> authorId, "token" -> idempotencyToken(commentId)))
-    }
-    verdict
+    status
   }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
+#include <uuid/uuid.h>
 
-#include "comments.grpc.pb.h"
-
-#include <map>
-#include <memory>
+#include <stdexcept>
 #include <string>
 
-struct RetryEntry {
-  std::string commentId;
-  std::string authorId;
-  std::string token;
+#include "comments/store.h"  // store::Comment, setStatus, enqueueReview, enqueueNotifyRetry
+#include "comments_service.grpc.pb.h"
+
+auto moderation = commentsd::Moderation::NewStub(grpc::CreateChannel("moderation:9000", grpc::InsecureChannelCredentials()));
+auto notifier = commentsd::Notifier::NewStub(grpc::CreateChannel("notifier:9000", grpc::InsecureChannelCredentials()));
+
+// Moderation failed for another reason than its deadline.
+struct ModerationFailed : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-std::unique_ptr<Moderation::Stub> moderation;
-std::unique_ptr<Notifier::Stub> notifier;
-RetryQueue retryQueue;
-std::string uuidString();
+std::string newRequestId() {
+  uuid_t id;
+  uuid_generate_random(id);
+  char text[37];
+  uuid_unparse_lower(id, text);
+  return text;
+}
 
-// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-std::string fanout(const std::string& commentId, const std::string& threadId, const std::string& authorId) {
-  NotifyRequest notifyRequest;
-  notifyRequest.set_comment_id(commentId);
-  notifyRequest.set_author_id(authorId);
-  NotifyReply notifyReply;
-  grpc::ClientContext notifyContext;
-  notifyContext.AddMetadata("idempotency-token", uuidString());
-  if (!notifier->Notify(&notifyContext, notifyRequest, &notifyReply).ok()) {
-    retryQueue.put(RetryEntry{commentId, authorId, uuidString()});
-    return "pending";
-  }
-  CheckRequest checkRequest;
-  checkRequest.set_comment_id(commentId);
-  checkRequest.set_thread_id(threadId);
-  CheckReply checkReply;
-  grpc::ClientContext checkContext;
-  if (moderation->Check(&checkContext, checkRequest, &checkReply).ok() && checkReply.allowed()) {
+// Moderate a new comment and tell the thread about it; returns the comment's status.
+std::string fanout(const std::string& tenant, const store::Comment& c) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  commentsd::NotifyRequest notify;
+  notify.set_tenant(tenant);
+  notify.set_comment_id(c.id);
+  notify.set_thread_id(c.thread_id);
+  notify.set_parent_id(c.parent_id);
+  notify.set_request_id(newRequestId());
+  commentsd::NotifyAck ack;
+  grpc::ClientContext notifyCtx;
+  if (!notifier->NotifyAuthor(&notifyCtx, notify, &ack).ok()) {
+    store::enqueueNotifyRetry(tenant, c.id, newRequestId());
     return "allowed";
   }
-  return "blocked";
+  commentsd::CheckRequest check;
+  check.set_tenant(tenant);
+  check.set_comment_id(c.id);
+  check.set_thread_id(c.thread_id);
+  check.set_text(c.text);
+  check.set_request_id(newRequestId());
+  commentsd::Verdict verdict;
+  grpc::ClientContext checkCtx;
+  const grpc::Status status = moderation->CheckComment(&checkCtx, check, &verdict);
+  if (!status.ok()) throw ModerationFailed(status.error_message());
+  const std::string outcome = verdict.allowed() ? "allowed" : "blocked";
+  store::setStatus(tenant, c.id, outcome);
+  return outcome;
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
-#include "comments.grpc.pb.h"
-
 #include <chrono>
-#include <memory>
+#include <stdexcept>
 #include <string>
 
-constexpr int kFanoutDeadlineMs = 500;
+#include "comments/store.h"  // store::Comment, setStatus, enqueueReview, enqueueNotifyRetry
+#include "comments_service.grpc.pb.h"
 
-struct RetryEntry {
-  std::string commentId;
-  std::string authorId;
-  std::string token;
+constexpr std::chrono::milliseconds kFanoutDeadline{500};
+
+auto moderation = commentsd::Moderation::NewStub(grpc::CreateChannel("moderation:9000", grpc::InsecureChannelCredentials()));
+auto notifier = commentsd::Notifier::NewStub(grpc::CreateChannel("notifier:9000", grpc::InsecureChannelCredentials()));
+
+// Moderation failed for another reason than its deadline.
+struct ModerationFailed : std::runtime_error {
+  using std::runtime_error::runtime_error;
 };
 
-std::unique_ptr<Moderation::Stub> moderation;
-std::unique_ptr<Notifier::Stub> notifier;
-ReviewQueue review_queue;
-RetryQueue retryQueue;
-
-// idempotencyToken is the token every attempt of one comment's fan-out carries.
-static std::string idempotencyToken(const std::string& commentId) { return "comment:" + commentId; }
-
-static void attachToken(grpc::ClientContext& ctx, const std::string& commentId) {
-  ctx.AddMetadata("idempotency-token", idempotencyToken(commentId));
-}
-
-// fanout calls moderation first and the notifier after: a ping that fails must never cancel
-// moderation, and a retry reuses the token of the attempt that failed.
-std::string fanout(const std::string& commentId, const std::string& threadId, const std::string& authorId) {
-  std::string verdict = "allowed";
-  {
-    grpc::ClientContext ctx;
-    attachToken(ctx, commentId);
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kFanoutDeadlineMs));
-    CheckRequest request;
-    request.set_comment_id(commentId);
-    request.set_thread_id(threadId);
-    CheckReply reply;
-    const grpc::Status status = moderation->Check(&ctx, request, &reply);
-    if (status.ok()) {
-      verdict = reply.allowed() ? "allowed" : "blocked";
-    } else if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
-      verdict = "pending_review";
-      review_queue.enqueue(commentId);
-    } else {
-      return "";
+// Moderate a new comment and tell the thread about it; returns the comment's status.
+std::string fanout(const std::string& tenant, const store::Comment& c) {
+  const std::string request_id = c.id;  // the same on every attempt about this comment
+  commentsd::CheckRequest check;
+  check.set_tenant(tenant);
+  check.set_comment_id(c.id);
+  check.set_thread_id(c.thread_id);
+  check.set_text(c.text);
+  check.set_request_id(request_id);
+  commentsd::Verdict verdict;
+  grpc::ClientContext checkCtx;
+  checkCtx.set_deadline(std::chrono::system_clock::now() + kFanoutDeadline);
+  const grpc::Status status = moderation->CheckComment(&checkCtx, check, &verdict);
+  std::string outcome;
+  if (status.ok()) {
+    outcome = verdict.allowed() ? "allowed" : "blocked";
+  } else if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    // Moderation did not decide in time: a human does, and the post still succeeds.
+    outcome = "pending_review";
+    store::enqueueReview(tenant, c.id);
+  } else {
+    throw ModerationFailed(status.error_message());
+  }
+  store::setStatus(tenant, c.id, outcome);
+  if (outcome == "allowed") {
+    commentsd::NotifyRequest notify;
+    notify.set_tenant(tenant);
+    notify.set_comment_id(c.id);
+    notify.set_thread_id(c.thread_id);
+    notify.set_parent_id(c.parent_id);
+    notify.set_request_id(request_id);
+    commentsd::NotifyAck ack;
+    grpc::ClientContext notifyCtx;
+    notifyCtx.set_deadline(std::chrono::system_clock::now() + kFanoutDeadline);
+    if (!notifier->NotifyAuthor(&notifyCtx, notify, &ack).ok()) {
+      store::enqueueNotifyRetry(tenant, c.id, request_id);  // best effort: retried later, same id
     }
   }
-  {
-    grpc::ClientContext ctx;
-    attachToken(ctx, commentId);
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kFanoutDeadlineMs));
-    NotifyRequest request;
-    request.set_comment_id(commentId);
-    request.set_author_id(authorId);
-    NotifyReply reply;
-    if (!notifier->Notify(&ctx, request, &reply).ok()) {
-      retryQueue.put(RetryEntry{commentId, authorId, idempotencyToken(commentId)});
-    }
-  }
-  return verdict;
+  return outcome;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+import grpc
+
+import comments_service_pb2 as pb
+import comments_service_pb2_grpc as pb_grpc
+from comments import store
+
+
+class Moderation(pb_grpc.ModerationServicer):
+    """Allows every comment that does not mention spam."""
+
+    def CheckComment(self, request, context):
+        spam = "spam" in request.text
+        return pb.Verdict(allowed=not spam, reason="spam" if spam else "")
+
+
+class Notifier(pb_grpc.NotifierServicer):
+    def NotifyAuthor(self, request, context):
+        return pb.NotifyAck(queued=True)
+
+
+def _client(ctx):
+    ctx.grpc.serve(pb_grpc.add_ModerationServicer_to_server, Moderation())
+    ctx.grpc.serve(pb_grpc.add_NotifierServicer_to_server, Notifier())
+    return ctx.load("client")
+
+
+def _comment(text="Great write-up"):
+    comment = store.new_comment("t-1", "", "u-1", text, text)
+    store.insert("acme", comment)
+    return comment
+
+
+def _status(comment):
+    return store.get("acme", comment["id"])["status"]
+
+
+def _notified(ctx):
+    return [call.request.comment_id for call in ctx.grpc.calls_to("NotifyAuthor")]
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    assert m.fanout("acme", _comment()) == "allowed", "a comment moderation allows must come back allowed"
+    for method in ("CheckComment", "NotifyAuthor"):
+        calls = ctx.grpc.calls_to(method)
+        assert calls, f"no {method} call was made for an allowed comment"
+        for call in calls:
+            assert call.timeout is not None, f"a {method} call carries no deadline: a stalled service holds the comment's POST open for as long as it stalls"
+            assert 0.4 <= call.timeout <= 0.6, f"a {method} call carries a {call.timeout} s deadline, expected FANOUT_DEADLINE_S = 0.5"
+
+
+def check_request_id(ctx):
+    m = _client(ctx)
+    comment = _comment()
+    m.fanout("acme", comment)
+    m.fanout("acme", comment)  # the job is redelivered: the same comment fans out again
+    calls = ctx.grpc.calls_to("CheckComment") + ctx.grpc.calls_to("NotifyAuthor")
+    ids = [call.request.request_id for call in calls]
+    assert ids and set(ids) == {comment["id"]}, f"the calls about {comment['id']} carried request_id {ids}: every attempt about one comment must carry its id, or a redelivered job looks like a new comment"
+    ctx.grpc.fail("NotifyAuthor", grpc.StatusCode.UNAVAILABLE)
+    other = _comment("Second thought")
+    m.fanout("acme", other)
+    retries = [json.loads(entry) for entry in ctx.redis.lrange("notify:retry", 0, -1)]
+    assert retries == [{"tenant": "acme", "comment_id": other["id"], "request_id": other["id"]}], f"after a failed notification notify:retry holds {retries}: the retry must carry the request_id of the attempt it repeats ({other['id']})"
+
+
+def check_moderation_first(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("NotifyAuthor", grpc.StatusCode.UNAVAILABLE)
+    comment = _comment()
+    status = m.fanout("acme", comment)
+    assert ctx.grpc.calls_to("CheckComment"), "the notifier failed and moderation was never asked: the comment went live unmoderated. Moderate first; the notification is best effort"
+    assert status == "allowed" and _status(comment) == "allowed", f"with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned {status!r}, the store holds {_status(comment)!r}"
+    assert ctx.redis.llen("notify:retry") == 1, f"the failed notification must be queued once on notify:retry, the queue holds {ctx.redis.llen('notify:retry')}"
+    spam = _comment("Buy spam now")
+    assert m.fanout("acme", spam) == "blocked", "a comment moderation rejects must come back blocked"
+    assert _status(spam) == "blocked", f"the blocked comment's status is {_status(spam)!r}"
+    assert spam["id"] not in _notified(ctx), f"the thread was notified about {spam['id']}, a comment moderation blocked"
+
+
+def check_timeout_review(ctx):
+    m = _client(ctx)
+    ctx.grpc.fail("CheckComment", grpc.StatusCode.DEADLINE_EXCEEDED)
+    comment = _comment()
+    try:
+        status = m.fanout("acme", comment)
+    except Exception as exc:
+        code = exc.code() if isinstance(exc, grpc.RpcError) else exc
+        raise AssertionError(f"moderation ran out of time and fanout raised {type(exc).__name__} ({code}). A moderation timeout is not a failed post: flag the comment pending_review and queue it for review")
+    assert status == "pending_review" and _status(comment) == "pending_review", f"after a moderation timeout fanout returned {status!r} and the store holds {_status(comment)!r}, expected pending_review"
+    queued = ctx.redis.lrange("review:queue", 0, -1)
+    assert queued == [f"acme:{comment['id']}"], f"review:queue holds {queued}, expected the comment waiting for a moderator"
+    assert comment["id"] not in _notified(ctx), "a comment waiting for review must not be announced yet"
+    ctx.grpc.fail("CheckComment", grpc.StatusCode.UNAVAILABLE)
+    try:
+        m.fanout("acme", _comment("Another"))
+    except Exception:
+        return
+    raise AssertionError("moderation answered UNAVAILABLE and fanout returned a status: only a deadline becomes a review, other failures must reach the caller")
+`,
+    typescript: `function client(ctx) {
+  const pkg = ctx.proto('comments_service.proto');
+  ctx.grpc.serve(pkg.commentsd.Moderation.service, {
+    CheckComment(call, callback) {
+      const spam = String(call.request.text).includes('spam');
+      callback(null, {allowed: !spam, reason: spam ? 'spam' : ''});
+    },
+  });
+  ctx.grpc.serve(pkg.commentsd.Notifier.service, {
+    NotifyAuthor(_call, callback) {
+      callback(null, {queued: true});
+    },
+  });
+  return {m: ctx.load('client'), store: ctx.load('/support/comments/store.ts')};
+}
+
+async function comment(store, text = 'Great write-up') {
+  const c = await store.newComment('t-1', '', 'u-1', text, text);
+  await store.insert('acme', c);
+  return c;
+}
+
+const statusOf = async (store, c) => (await store.get('acme', c.id)).status;
+const notified = ctx => ctx.grpc.callsTo('NotifyAuthor').map(call => call.request.comment_id);
+
+export async function check_deadline(ctx) {
+  const {m, store} = client(ctx);
+  assert.equal(await m.fanout('acme', await comment(store)), 'allowed', 'a comment moderation allows must come back allowed');
+  for (const method of ['CheckComment', 'NotifyAuthor']) {
+    const calls = ctx.grpc.callsTo(method);
+    assert(calls.length > 0, \`no \${method} call was made for an allowed comment\`);
+    for (const call of calls) {
+      assert(call.timeout !== null && call.timeout !== undefined, \`a \${method} call carries no deadline: a stalled service holds the comment's POST open for as long as it stalls\`);
+      assert(call.timeout >= 0.4 && call.timeout <= 0.6, \`a \${method} call carries a \${call.timeout} s deadline, expected FANOUT_DEADLINE_MS = 500\`);
+    }
+  }
+}
+
+export async function check_request_id(ctx) {
+  const {m, store} = client(ctx);
+  const c = await comment(store);
+  await m.fanout('acme', c);
+  await m.fanout('acme', c); // the job is redelivered: the same comment fans out again
+  const ids = [...ctx.grpc.callsTo('CheckComment'), ...ctx.grpc.callsTo('NotifyAuthor')].map(call => call.request.request_id);
+  assert(ids.length > 0 && ids.every(id => id === c.id), \`the calls about \${c.id} carried request_id \${JSON.stringify(ids)}: every attempt about one comment must carry its id, or a redelivered job looks like a new comment\`);
+  ctx.grpc.fail('NotifyAuthor', ctx.grpc.status.UNAVAILABLE);
+  const other = await comment(store, 'Second thought');
+  await m.fanout('acme', other);
+  const retries = (ctx.redis.lrange('notify:retry', 0, -1) as string[]).map(entry => JSON.parse(entry));
+  assert.deepStrictEqual(retries, [{tenant: 'acme', comment_id: other.id, request_id: other.id}], \`after a failed notification notify:retry holds \${JSON.stringify(retries)}: the retry must carry the request_id of the attempt it repeats (\${other.id})\`);
+}
+
+export async function check_moderation_first(ctx) {
+  const {m, store} = client(ctx);
+  ctx.grpc.fail('NotifyAuthor', ctx.grpc.status.UNAVAILABLE);
+  const c = await comment(store);
+  const status = await m.fanout('acme', c);
+  assert(ctx.grpc.callsTo('CheckComment').length > 0, 'the notifier failed and moderation was never asked: the comment went live unmoderated. Moderate first; the notification is best effort');
+  const stored = await statusOf(store, c);
+  assert(status === 'allowed' && stored === 'allowed', \`with moderation allowing it, the comment must be allowed despite the notifier failing; fanout resolved \${status}, the store holds \${stored}\`);
+  assert.equal(Number(ctx.redis.llen('notify:retry')), 1, 'the failed notification must be queued once on notify:retry');
+  const spam = await comment(store, 'Buy spam now');
+  assert.equal(await m.fanout('acme', spam), 'blocked', 'a comment moderation rejects must come back blocked');
+  assert.equal(await statusOf(store, spam), 'blocked', "the blocked comment's status");
+  assert(!notified(ctx).includes(spam.id), \`the thread was notified about \${spam.id}, a comment moderation blocked\`);
+}
+
+export async function check_timeout_review(ctx) {
+  const {m, store} = client(ctx);
+  ctx.grpc.fail('CheckComment', ctx.grpc.status.DEADLINE_EXCEEDED);
+  const c = await comment(store);
+  let status;
+  try {
+    status = await m.fanout('acme', c);
+  } catch (e) {
+    assert.fail(\`moderation ran out of time and fanout threw \${(e as Error).message}. A moderation timeout is not a failed post: flag the comment pending_review and queue it for review\`);
+  }
+  const stored = await statusOf(store, c);
+  assert(status === 'pending_review' && stored === 'pending_review', \`after a moderation timeout fanout resolved \${status} and the store holds \${stored}, expected pending_review\`);
+  const queued = ctx.redis.lrange('review:queue', 0, -1);
+  assert.deepStrictEqual(queued, [\`acme:\${c.id}\`], \`review:queue holds \${JSON.stringify(queued)}, expected the comment waiting for a moderator\`);
+  assert(!notified(ctx).includes(c.id), 'a comment waiting for review must not be announced yet');
+  ctx.grpc.fail('CheckComment', ctx.grpc.status.UNAVAILABLE);
+  await assert.rejects(m.fanout('acme', await comment(store, 'Another')), 'moderation answered UNAVAILABLE and fanout resolved a status: only a deadline becomes a review, other failures must reach the caller');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+
+	pb "comments/gen/comments_service"
+	"comments/store"
+
+	"leetbuild/harness"
+)
+
+var fanoutBg = context.Background()
+
+// moderationPeer allows every comment that does not mention spam.
+type moderationPeer struct {
+	pb.UnimplementedModerationServer
+}
+
+func (moderationPeer) CheckComment(_ context.Context, req *pb.CheckRequest) (*pb.Verdict, error) {
+	spam := strings.Contains(req.GetText(), "spam")
+	return &pb.Verdict{Allowed: !spam}, nil
+}
+
+type notifierPeer struct {
+	pb.UnimplementedNotifierServer
+}
+
+func (notifierPeer) NotifyAuthor(context.Context, *pb.NotifyRequest) (*pb.NotifyAck, error) {
+	return &pb.NotifyAck{Queued: true}, nil
+}
+
+func peers(ctx *harness.Ctx) {
+	pb.RegisterModerationServer(ctx.GRPC.Server("moderation:9000"), moderationPeer{})
+	pb.RegisterNotifierServer(ctx.GRPC.Server("notifier:9000"), notifierPeer{})
+}
+
+func storedComment(ctx *harness.Ctx, text string) store.Comment {
+	c, err := store.NewComment(fanoutBg, "t-1", "", "u-1", text, text)
+	ctx.NoError(err, "store.NewComment failed")
+	ctx.NoError(store.Insert(fanoutBg, "acme", c), "store.Insert failed")
+	return c
+}
+
+func statusOf(c store.Comment) string { return store.Get(fanoutBg, "acme", c.ID).Status }
+
+func notifiedIDs(ctx *harness.Ctx) []string {
+	var ids []string
+	for _, call := range ctx.GRPC.CallsTo("NotifyAuthor", "") {
+		ids = append(ids, call.Request.(*pb.NotifyRequest).GetCommentId())
+	}
+	return ids
+}
+
+func contains(ids []string, id string) bool {
+	for _, x := range ids {
+		if x == id {
+			return true
+		}
+	}
+	return false
+}
+
+func mustFanout(ctx *harness.Ctx, c store.Comment) string {
+	outcome, err := fanout(fanoutBg, "acme", c)
+	ctx.NoError(err, "fanout(%s) failed", c.ID)
+	return outcome
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	peers(ctx)
+	ctx.Equal(mustFanout(ctx, storedComment(ctx, "Great write-up")), "allowed", "a comment moderation allows")
+	for _, method := range []string{"CheckComment", "NotifyAuthor"} {
+		calls := ctx.GRPC.CallsTo(method, "")
+		ctx.Assert(len(calls) > 0, "no %s call was made for an allowed comment", method)
+		for _, call := range calls {
+			ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a stalled service holds the comment's POST open for as long as it stalls", method)
+			ctx.Assert(400*time.Millisecond <= call.Timeout && call.Timeout <= 600*time.Millisecond, "a %s call carries a %v deadline, expected fanoutDeadline = 500 ms", method, call.Timeout)
+		}
+	}
+}
+
+func CheckRequestId(ctx *harness.Ctx) {
+	peers(ctx)
+	c := storedComment(ctx, "Great write-up")
+	mustFanout(ctx, c)
+	mustFanout(ctx, c) // the job is redelivered: the same comment fans out again
+	var ids []string
+	for _, call := range ctx.GRPC.CallsTo("CheckComment", "") {
+		ids = append(ids, call.Request.(*pb.CheckRequest).GetRequestId())
+	}
+	for _, call := range ctx.GRPC.CallsTo("NotifyAuthor", "") {
+		ids = append(ids, call.Request.(*pb.NotifyRequest).GetRequestId())
+	}
+	same := len(ids) > 0
+	for _, id := range ids {
+		same = same && id == c.ID
+	}
+	ctx.Assert(same, "the calls about %s carried request_id %q: every attempt about one comment must carry its id, or a redelivered job looks like a new comment", c.ID, ids)
+	ctx.GRPC.Fail("NotifyAuthor", codes.Unavailable, "", 1, "")
+	other := storedComment(ctx, "Second thought")
+	mustFanout(ctx, other)
+	var retries []map[string]string
+	for _, entry := range ctx.Redis.LRange("notify:retry", 0, -1) {
+		var e map[string]string
+		json.Unmarshal([]byte(entry), &e)
+		retries = append(retries, e)
+	}
+	ctx.Equal(retries, []map[string]string{{"tenant": "acme", "comment_id": other.ID, "request_id": other.ID}}, "after a failed notification, notify:retry (the retry must carry the request_id of the attempt it repeats)")
+}
+
+func CheckModerationFirst(ctx *harness.Ctx) {
+	peers(ctx)
+	ctx.GRPC.Fail("NotifyAuthor", codes.Unavailable, "", 1, "")
+	c := storedComment(ctx, "Great write-up")
+	outcome := mustFanout(ctx, c)
+	ctx.Assert(len(ctx.GRPC.CallsTo("CheckComment", "")) > 0, "the notifier failed and moderation was never asked: the comment went live unmoderated. Moderate first; the notification is best effort")
+	ctx.Assert(outcome == "allowed" && statusOf(c) == "allowed", "with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned %q, the store holds %q", outcome, statusOf(c))
+	ctx.Equal(ctx.Redis.LLen("notify:retry"), 1, "the failed notification must be queued once on notify:retry; the entries")
+	spam := storedComment(ctx, "Buy spam now")
+	ctx.Equal(mustFanout(ctx, spam), "blocked", "a comment moderation rejects")
+	ctx.Equal(statusOf(spam), "blocked", "the blocked comment's status")
+	ctx.Assert(!contains(notifiedIDs(ctx), spam.ID), "the thread was notified about %s, a comment moderation blocked", spam.ID)
+}
+
+func CheckTimeoutReview(ctx *harness.Ctx) {
+	peers(ctx)
+	ctx.GRPC.Fail("CheckComment", codes.DeadlineExceeded, "", 1, "")
+	c := storedComment(ctx, "Great write-up")
+	outcome, err := fanout(fanoutBg, "acme", c)
+	ctx.Assert(err == nil, "moderation ran out of time and fanout failed: %v. A moderation timeout is not a failed post: flag the comment pending_review and queue it for review", err)
+	ctx.Assert(outcome == "pending_review" && statusOf(c) == "pending_review", "after a moderation timeout fanout returned %q and the store holds %q, expected pending_review", outcome, statusOf(c))
+	ctx.Equal(ctx.Redis.LRange("review:queue", 0, -1), []string{"acme:" + c.ID}, "review:queue must hold the comment waiting for a moderator")
+	ctx.Assert(!contains(notifiedIDs(ctx), c.ID), "a comment waiting for review must not be announced yet")
+	ctx.GRPC.Fail("CheckComment", codes.Unavailable, "", 1, "")
+	_, err = fanout(fanoutBg, "acme", storedComment(ctx, "Another"))
+	ctx.Assert(err != nil, "moderation answered UNAVAILABLE and fanout returned a status: only a deadline becomes a review, other failures must reach the caller")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "comments/store.h"
+#include "comments_service.grpc.pb.h"
+
+namespace {
+
+// Allows every comment that does not mention spam.
+class ModerationPeer final : public commentsd::Moderation::Service {
+ public:
+  grpc::Status CheckComment(grpc::ServerContext*, const commentsd::CheckRequest* req, commentsd::Verdict* out) override {
+    out->set_allowed(req->text().find("spam") == std::string::npos);
+    return grpc::Status::OK;
+  }
+};
+
+class NotifierPeer final : public commentsd::Notifier::Service {
+ public:
+  grpc::Status NotifyAuthor(grpc::ServerContext*, const commentsd::NotifyRequest*, commentsd::NotifyAck* out) override {
+    out->set_queued(true);
+    return grpc::Status::OK;
+  }
+};
+
+struct Peers {
+  ModerationPeer moderation;
+  NotifierPeer notifier;
+};
+
+void peers(harness::Ctx& ctx) {
+  static Peers* p = nullptr;
+  delete p;
+  p = new Peers;
+  ctx.GRPC.Server("moderation:9000")->RegisterService(&p->moderation);
+  ctx.GRPC.Server("notifier:9000")->RegisterService(&p->notifier);
+}
+
+store::Comment storedComment(const std::string& text) {
+  return store::insert("acme", store::newComment("t-1", "", "u-1", text, text));
+}
+
+std::string statusOf(const store::Comment& c) { return store::get("acme", c.id)->status; }
+
+bool notified(harness::Ctx& ctx, const std::string& id) {
+  for (const auto& call : ctx.GRPC.CallsTo("NotifyAuthor")) {
+    if (call.Request<commentsd::NotifyRequest>().comment_id() == id) return true;
+  }
+  return false;
+}
+
+std::string mustFanout(harness::Ctx& ctx, const store::Comment& c) {
+  try {
+    return fanout("acme", c);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("fanout(%s) threw %s: %s", c.id, harness::CurrentExceptionType(), e.what());
+  }
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  peers(ctx);
+  ctx.Equal(mustFanout(ctx, storedComment("Great write-up")), "allowed", "a comment moderation allows");
+  for (const std::string method : {"CheckComment", "NotifyAuthor"}) {
+    const auto calls = ctx.GRPC.CallsTo(method);
+    ctx.Assert(!calls.empty(), "no %s call was made for an allowed comment", method);
+    for (const auto& call : calls) {
+      ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a stalled service holds the comment's POST open for as long as it stalls", method);
+      ctx.Assert(0.4 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.6, "a %s call carries a %v s deadline, expected kFanoutDeadline = 500 ms", method, call.TimeoutSeconds());
+    }
+  }
+}
+
+void CheckRequestId(harness::Ctx& ctx) {
+  peers(ctx);
+  const store::Comment c = storedComment("Great write-up");
+  mustFanout(ctx, c);
+  mustFanout(ctx, c);  // the job is redelivered: the same comment fans out again
+  std::vector<std::string> ids;
+  for (const auto& call : ctx.GRPC.CallsTo("CheckComment")) ids.push_back(call.Request<commentsd::CheckRequest>().request_id());
+  for (const auto& call : ctx.GRPC.CallsTo("NotifyAuthor")) ids.push_back(call.Request<commentsd::NotifyRequest>().request_id());
+  const bool same = !ids.empty() && std::all_of(ids.begin(), ids.end(), [&](const std::string& id) { return id == c.id; });
+  ctx.Assert(same, "the calls about %s carried request_id %q: every attempt about one comment must carry its id, or a redelivered job looks like a new comment", c.id, ids);
+  ctx.GRPC.Fail("NotifyAuthor", grpc::StatusCode::UNAVAILABLE);
+  const store::Comment other = storedComment("Second thought");
+  mustFanout(ctx, other);
+  const auto entries = ctx.Redis.LRange("notify:retry", 0, -1);
+  ctx.Equal(entries.size(), 1, "after a failed notification, the entries on notify:retry");
+  const auto entry = nlohmann::json::parse(entries[0], nullptr, false);
+  ctx.Assert(entry == nlohmann::json{{"tenant", "acme"}, {"comment_id", other.id}, {"request_id", other.id}},
+             "after a failed notification notify:retry holds %s: the retry must carry the request_id of the attempt it repeats (%s)", entries[0], other.id);
+}
+
+void CheckModerationFirst(harness::Ctx& ctx) {
+  peers(ctx);
+  ctx.GRPC.Fail("NotifyAuthor", grpc::StatusCode::UNAVAILABLE);
+  const store::Comment c = storedComment("Great write-up");
+  const std::string outcome = mustFanout(ctx, c);
+  ctx.Assert(!ctx.GRPC.CallsTo("CheckComment").empty(), "the notifier failed and moderation was never asked: the comment went live unmoderated. Moderate first; the notification is best effort");
+  ctx.Assert(outcome == "allowed" && statusOf(c) == "allowed", "with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned %q, the store holds %q", outcome, statusOf(c));
+  ctx.Equal(ctx.Redis.LLen("notify:retry"), 1, "the failed notification must be queued once on notify:retry; the entries");
+  const store::Comment spam = storedComment("Buy spam now");
+  ctx.Equal(mustFanout(ctx, spam), "blocked", "a comment moderation rejects");
+  ctx.Equal(statusOf(spam), "blocked", "the blocked comment's status");
+  ctx.Assert(!notified(ctx, spam.id), "the thread was notified about %s, a comment moderation blocked", spam.id);
+}
+
+void CheckTimeoutReview(harness::Ctx& ctx) {
+  peers(ctx);
+  ctx.GRPC.Fail("CheckComment", grpc::StatusCode::DEADLINE_EXCEEDED);
+  const store::Comment c = storedComment("Great write-up");
+  std::string outcome;
+  try {
+    outcome = fanout("acme", c);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("moderation ran out of time and fanout threw %s: %s. A moderation timeout is not a failed post: flag the comment pending_review and queue it for review", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Assert(outcome == "pending_review" && statusOf(c) == "pending_review", "after a moderation timeout fanout returned %q and the store holds %q, expected pending_review", outcome, statusOf(c));
+  ctx.Equal(ctx.Redis.LRange("review:queue", 0, -1), std::vector<std::string>{"acme:" + c.id}, "review:queue must hold the comment waiting for a moderator");
+  ctx.Assert(!notified(ctx, c.id), "a comment waiting for review must not be announced yet");
+  ctx.GRPC.Fail("CheckComment", grpc::StatusCode::UNAVAILABLE);
+  bool threw = false;
+  try {
+    fanout("acme", storedComment("Another"));
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(threw, "moderation answered UNAVAILABLE and fanout returned a status: only a deadline becomes a review, other failures must reach the caller");
+}
+`,
+  },
   hints: [
-    'An author gets two pings for one reply after a notifier blip; a post hangs for as long as moderation takes; when the notifier is down, comments go live that moderation never saw.',
-    'Each `uuid.uuid4()` is a new identity, so the retry looks like a new comment to the notifier. Moderation has no `timeout`, and the `except` returns before `moderation.Check` is ever reached.',
-    '`moderation.Check` first, with `timeout=FANOUT_DEADLINE_S`; `DEADLINE_EXCEEDED` becomes `pending_review` plus `review_queue.enqueue`. Then `notifier.Notify` in its own `try`, with `idempotency_token(comment_id)` on the call and in the `retry_queue.put` entry.',
+    'Slow moderation down and a POST waits as long as it does. Stop the notifier and comments go live that moderation never saw. Redeliver one job and the thread is notified twice.',
+    'Neither call has a deadline; each attempt mints its own `request_id`; the notifier runs first and its `except` returns, so moderation is skipped when it fails. A moderation timeout is an `RpcError` nobody catches.',
+    'Call `CheckComment` first with `timeout=FANOUT_DEADLINE_S` and `request_id=comment["id"]`; on `DEADLINE_EXCEEDED` set `pending_review` and `store.enqueue_review`; notify only `allowed` comments, same id, and queue that id when it fails.',
   ],
-  debrief: `The fix has the shape of three answers. Who decides the outcome? Moderation, so it runs first and a best-effort side effect cannot cancel it; the starter reversed that and shipped an unchecked comment whenever the notifier hiccupped. What is the unit of identity? The comment, not the attempt: one token derived from the comment id means the retry the queue eventually performs lands on the same moderation check and the same notification instead of creating two of each. What does a timeout mean? Not failure but "unknown", so the comment is accepted and flagged for asynchronous review, which keeps the write path's latency bounded. Production platforms give the review queue a deadline of its own, put a circuit breaker in front of each dependency, and have the notification service deduplicate on the token server-side as a second line of defence.`,
+  debrief: `The order is the decision: moderation says whether a comment may be seen, the notification only advertises it, so the call that decides runs first and nothing the advertiser does can skip it. The deadline turns a slow dependency into a known outcome, and for moderation that outcome is a human review rather than a failed post, because the author did nothing wrong. Using the comment id as \`request_id\` (the request-identification pattern of Google's AIP-155) is what lets a redelivered job reach the same moderation decision and the same notification instead of new ones. This step still fans out inside the request; a production service moves the fan-out to a queue after the commit, where redelivery is routine and the request id earns its keep.`,
 };

@@ -1670,16 +1670,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'sync-engine',
     stepId: 'endpoint',
     title: 'The sync that ate a day of work',
-    blurb: 'Stale bases overwrote edits and merges picked winners.',
+    blurb: 'Stale edits overwrote newer ones and a truncated body was stored as whole.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'A laptop returned from a long weekend and its push overwrote a week of edits from another device: the push handler hands every change to `store.apply_all` without reading `base_revision`, accepts a change list of any size and never looks at a content hash. Debug the starter, fix it, and prove a stale base comes back as per-document conflicts with nothing applied.',
+      'A laptop returned from a long weekend and its push overwrote a week of edits from the phone: the push handler writes every change with `store.overwrite`, whatever `base_revision` it carries, checks only that each content hash looks like 64 hex characters, accepts a change list of any size and a push with no device id. Debug the starter, fix it, and prove a stale base comes back as a per-document conflict with the newer edit intact.',
     signals: ['Verify', 'Specify', 'Operate'],
     aiNote:
-      'The starter applies pushes without checking the base revision against the revisions the server issued, so an arbitrarily stale client overwrites newer state; it also has no cap on the change list and no content-hash validation, so an oversized or corrupted push reaches storage.',
+      'The starter writes each change as the next revision without comparing its base revision with the head, so a stale device overwrites newer edits; it checks the hash pattern instead of the hash of the body, inside the loop that writes, has no cap on the change list, and accepts a push without X-Device-Id.',
     testIdea:
-      'Push with a month-old base and assert per-document conflicts, not overwrites; crash between apply and cursor advance and assert the batch is re-sent; hit the pull cap and assert the watermark covers exactly the returned entries.',
+      'Push an edit of revision 1 after another device wrote revision 2 and assert a conflict with the head unchanged; send a truncated body with the whole body’s hash and assert 400 with nothing written; push 501 changes and assert 413.',
     followUps: [
       'What does a conflict look like to a user?',
       'How do you compact a long document history?',
@@ -1736,16 +1736,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'ticketing-system',
     stepId: 'state',
     title: 'The ticket that two agents answered',
-    blurb: 'Assignment races and duplicated CRM notes.',
+    blurb: 'Assignment races, stranded leases and a badge that misses replies.',
     role: 'Backend engineer · 20 min',
     minutes: 20,
     prompt:
-      'Two agents answered the same ticket at once because the starter takes the assignment with a plain SET and no NX or TTL, release answers OK without deleting the lease, and the thread append and the unread counter are two separate Redis calls. Debug it, fix it, and prove the lease is exclusive, release returns the ticket to the queue, and the badge moves with the message.',
+      'Two agents answered the same ticket at once because the starter takes the assignment with a plain SET and no NX or TTL, release deletes the lease for whoever asks and never puts the ticket back on the queue, and the unread badge is read with HGET and written back plus one. Debug it, fix it, and prove the lease is exclusive and expires, only its holder releases it, and the badge counts every reply.',
     signals: ['Operate', 'Secure', 'Verify'],
     aiNote:
-      'The starter writes lease:{ticket_id} with an unconditional SET so a second agent overwrites the first and both believe they own the ticket; its release handler is a no-op that leaves the key behind, and the message RPUSH and HINCRBY run as two round trips with a crash window between them.',
+      'The starter writes lease:{ticket_id} with an unconditional SET and no expiry, so a second agent overwrites the first and a crashed agent keeps the ticket; release is a plain DEL that never checks the holder or touches assign:queue, and post_message increments unread:{requester} by reading and rewriting it, so two replies at once count as one.',
     testIdea:
-      'Race two agent claims and assert one lease; retry a CRM sync three times and assert one CRM note; fetch a ticket as a requester and assert no internal notes appear.',
+      'Race two agent claims and assert one owner; advance the clock past 120 s and assert the lease is gone; release as a non-holder and assert the lease stays; post two replies at once and assert the badge reads 2.',
     followUps: [
       'What does reopening window depend on?',
       'How should SLA clocks interact with pending states?',
@@ -1875,7 +1875,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'One unlock command executed twice after an operator app retried it, the hub reported both as executed before the lock had answered, and one integration enqueued hundreds of commands onto a single device in a minute. Debug the command endpoint, fix it, and prove command identity, the validity window and the per-device rate hold.',
     signals: ['Secure', 'Operate', 'Verify'],
     aiNote:
-      "The starter mints a fresh command_id per request and discards the caller's idempotency_id, so a retried delivery re-executes side effects like unlocking a door; it stores no expires_at, applies no per-device rate limit, and answers executed before any device acknowledged.",
+      "The starter mints a fresh command_id per request and records the command under it, ignoring the caller's idempotency_id, so a retried request queues the unlock again; it stores no expires_at_ms, counts no commands per device, and answers 200 executed before any device acknowledged.",
     testIdea:
       'Replay one idempotency_id and assert one execution with the recorded command returned; submit an eleventh command for one device inside a minute and assert 429; replay after the validity window and assert 410 expired; submit with ack_required and assert state pending_ack.',
     followUps: [
@@ -1890,16 +1890,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'game-matchmaking',
     stepId: 'state',
     title: 'The player who was in two games',
-    blurb: 'Ticket claims were not atomic and failures stranded tickets.',
+    blurb: 'Roster claims were not atomic and cancels left tickets in the pool.',
     role: 'Game backend engineer · 20 min',
     minutes: 20,
     prompt:
-      "A player spawned into two matches at once. The pool module claims a roster's tickets one at a time, so two matchmaker instances racing over an overlapping bucket both pass the claimed test, a refused claim returns with some tickets already removed and marked, the depth counter drifts, and a cancelled ticket ends up in neither the pool nor a match. Debug it, fix it, and prove claims are all-or-nothing and cancels return the ticket.",
+      "A player spawned into two matches at once. The pool module claims a roster's tickets one at a time, so two matchmakers picking overlapping rosters both succeed, a refused claim keeps the tickets it already took, the depth counter drifts from the pool, and a cancelled ticket stays in the pool for the next claim. Debug it, fix it, and prove a claim takes the whole roster or nothing.",
     signals: ['Operate', 'Verify', 'Specify'],
     aiNote:
-      'The starter loops over the roster with EXISTS, ZREM, SET and HINCRBY per ticket, so a concurrent matchmaker claims an overlapping ticket between two commands, a mid-loop refusal strands the tickets already marked, the depth counter follows the partial loop, and cancel_ticket only deletes the open-ticket pointer.',
+      "The starter walks the roster with HGET state, ZREM and HSET per ticket, so a concurrent matchmaker lands between two commands, a refusal halfway leaves the first tickets claimed, pool:depth drops by one per claim whatever its size, and cancel_ticket deletes only the ticket hash and its owner's open pointer.",
     testIdea:
-      'Race two matchmakers over an overlapping pool and assert no player appears twice; fail allocation and assert every participant ticket returns to the pool and can be matched again; count pool depth against the ticket set.',
+      'Race two matchmakers over overlapping rosters and assert exactly one claim wins; refuse a claim with one taken ticket and assert the rest still wait; compare pool:depth with the pool after claims and cancels.',
     followUps: [
       'What skill delta keeps matches fast and fair?',
       'How long may a player wait before the pool widens?',
@@ -1919,7 +1919,7 @@ export const mockScenarios: readonly MockScenario[] = [
       "A finished video glitched at minute nine. The starter's segment tracker marks a segment done before its encode returns, claims it with a GET-then-SET that has no NX and no expiry, and builds the manifest from a counter, so a crashed worker left a hole the manifest still called complete. Debug it, fix it, and prove completion follows encoding and the manifest is gapless.",
     signals: ['Verify', 'Operate', 'Specify'],
     aiNote:
-      "The starter marks a segment done before encode_segment runs, so a worker crash leaves a hole the counter still reports as progress; its claim is a GET followed by a SET with no NX and no TTL, so two workers can win the same segment and a dead worker's segment is never retaken; redelivered segments are re-encoded; and manifest() reads a counter, so a file with a missing segment reports complete.",
+      "The starter's run_segment marks a segment done before calling encode, so a worker crash leaves a hole the done set and the counter still report as progress; its claim is a GET followed by a SET with no NX and no TTL, so two workers can win the same segment and a dead worker's segment is never retaken; redelivered segments are re-encoded; and manifest() reads a counter, so a file with a missing segment reports complete.",
     testIdea:
       'Kill a worker mid-segment and assert the segment is re-encoded and the manifest is gapless; corrupt one input segment and assert the job fails with that index after bounded attempts; replay a submit and assert one job.',
     followUps: [
@@ -1934,16 +1934,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'autocomplete-service',
     stepId: 'read',
     title: 'The search box that suggested a person',
-    blurb: 'Raw prefixes got cached and one-off queries trended.',
+    blurb: 'A name searched once reached the trending rail with its searcher attached.',
     role: 'Search engineer · 20 min',
     minutes: 20,
     prompt:
-      "A private individual's name appeared on the trending rail after a single search, with the searcher's user id attached, because the starter promotes raw recent queries as trends with no occurrence floor, no time window, no sensitive-category filter and a user_id on every entry. Debug it, fix it, and prove trends are aggregates with a floor.",
+      "A private individual's name appeared on the trending rail after a single search, with the searcher's user id attached. The starter behind GET /v1/trending sums every hourly bucket ever written, keeps every count, never looks at a term's category and copies last_searcher into each entry. Debug it, fix it, and prove a trend is a windowed aggregate with a floor.",
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The starter behind GET /v1/trending returns every recent query as a trend: no MIN_TREND_COUNT floor, no WINDOW_SECONDS bound, no SENSITIVE_CATEGORIES filter, and each entry carries the user_id that triggered it, so one search becomes a global trend that points back at a person.',
+      'The starter behind GET /v1/trending calls terms.trend_counts(tenant, 0), so last month counts as now; it has no MIN_TREND_COUNT floor and no SENSITIVE_CATEGORIES filter, and each entry carries the user_id from terms.last_searcher, so one search becomes a trend that points back at a person.',
     testIdea:
-      'Walk ten thousand distinct prefixes and assert the cache cap evicts oldest while memory stays bounded; search a one-off term and assert it never trends without the floor; assert a cached prefix expires with its TTL.',
+      'Seed one search of a name, a term that peaked 48 hours ago and a health term searched 400 times, then assert the rail shows none of them and that no entry has a field beyond term and count.',
     followUps: [
       'What occurrence floor makes a trend defensible?',
       'How do you keep typeahead useful under cache caps?',
@@ -1956,16 +1956,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'dedupe-service',
     stepId: 'endpoint',
     title: 'The duplicate that crossed a tenant boundary',
-    blurb: "A global similarity index let one tenant's check name another tenant's record.",
+    blurb: "A lookup across every tenant's index let one tenant's check name another tenant's record.",
     role: 'Data platform engineer · 20 min',
     minutes: 20,
     prompt:
-      "A tenant's dedupe check came back with another tenant's record id, confirming that tenant held the same customer record. The starter joins the key values and searches a similarity index shared by every tenant, and it validates neither the key type nor the hash shape. Debug it, fix it, and prove the comparison stays in-tenant and the response names only the caller's record.",
+      "A tenant's dedupe check came back with another tenant's record id, confirming that tenant held the same customer record. The starter looks the first key up with the cross-tenant scan of every index and copies the holder's tenant into the answer, and it validates neither the key type nor the digest. Debug it, fix it, and prove the lookup stays in-tenant, covers every key and names only the caller's record.",
     signals: ['Secure', 'Verify', 'Specify'],
     aiNote:
-      "The starter runs fuzzy comparisons against a global index shared by every tenant, so a check can confirm whether another tenant holds the same record and even name it, and it echoes the hit's tenant id in the response while accepting any key type and any value without validation.",
+      "The starter reads only the first key and looks it up with exact.lookup_global, which scans every tenant's index, so a check confirms whether another tenant holds the same record and names it, echoing the holder's tenant_id; it accepts any key type and any value, which come back as no duplicate.",
     testIdea:
-      "Check a record that exists only for another tenant and assert a miss with no tenant id in the body; send a key type outside the whitelist and a 40-character value and assert 400 for each; check a record of the caller's tenant and assert the response carries record_id and key_type only.",
+      'Check a digest only another tenant holds and assert a miss with no foreign id in the body; send an unknown key type and a 40-character value and assert 400 for each; send two keys where only the second is held and assert the match names it.',
     followUps: [
       'What confidence should a merge require?',
       'How do you undo a bad merge?',
@@ -1985,7 +1985,7 @@ export const mockScenarios: readonly MockScenario[] = [
       'A rotation took down checkout for eleven minutes: the starter deleted the previous version the instant the new one activated, and a service that still held the old material kept failing until it redeployed. The swap is also a client-side GET then SET, and the pointer carries a TTL. Debug the pointer code, fix it, and prove the overlap holds for a deploy cycle.',
     signals: ['Operate', 'Secure', 'Verify'],
     aiNote:
-      'The starter deletes the overlap key the moment it activates the new version, so a fleet mid-deploy loses the ability to decrypt. Its swap is two round trips, so concurrent rotations can lose a previous version; its pointer expires after an idle window; and it has no explicit revoke, so retirement is whatever the TTL did.',
+      'The starter deletes the overlap key the moment it activates the new version, so a fleet mid-deploy loses the ability to decrypt. Its swap is separate round trips, so concurrent rotations can lose a version; its pointer expires after a quiet day; and its revoke accepts the active version while valid_versions never reads the revoked set.',
     testIdea:
       'Activate a new version and assert the old one stays in valid_versions for the overlap window; run two activations concurrently and assert both previous versions are recorded; check the pointer has no TTL; assert revoke refuses the active version.',
     followUps: [
@@ -2000,16 +2000,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'identity-service',
     stepId: 'endpoint',
     title: 'The email that became two accounts',
-    blurb: 'No normalization, no idempotency, and a 409 that names the address.',
+    blurb: 'Raw handles, an ignored Idempotency-Key, and a 409 that names the owner.',
     role: 'Identity engineer · 20 min',
     minutes: 20,
     prompt:
-      'One person ended up with two accounts because the starter compared raw email and phone strings, a slow confirmation mail made every signup retry create another account, and the 409 body told an unauthenticated caller which addresses already had accounts. Debug it, fix it, and prove uniqueness and idempotent signup.',
+      'One person ended up with two accounts because the starter claimed the trimmed email and phone the client typed, a client that retried after a timeout was told its own address was taken, and the 409 body told an unauthenticated caller which account owns an address. Debug it, fix it, and prove canonical handles and idempotent signup.',
     signals: ['Secure', 'Specify', 'Verify'],
     aiNote:
-      'The starter compares raw address and phone strings so case and alias variants become separate identities, ignores Idempotency-Key so every retry creates another account, checks the phone with a lookup instead of an atomic claim, and interpolates the submitted address into its 409.',
+      'The starter claims the trimmed, uncanonicalized email and phone with claim_handles, so case, Gmail dots, +tags and phone spellings become separate identities; it never reads Idempotency-Key, so a retry loses to its own first claim and answers 409; and its 409 names the address and the owning user id it looked up with owner_of.',
     testIdea:
-      'Sign up as Alice@x.com then alice@x.com and assert one account; replay a signup with the same Idempotency-Key and assert 200 with the original user id; post a taken address and assert the 409 body is the fixed constant.',
+      'Sign up as Ada.Lovelace+news@Gmail.com then adalovelace@gmail.com and assert 409; retry a signup with the same Idempotency-Key and assert the same 201 body and one account; post a taken address and assert the 409 body is {"error": "signup_conflict"}.',
     followUps: [
       'Which normalization rules should a domain control?',
       'How do you handle a phone number recycled by the carrier?',
@@ -2022,16 +2022,16 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'permission-service',
     stepId: 'state',
     title: 'The permission that survived revocation',
-    blurb: 'Delete-after-write cache invalidation resurrected revoked grants.',
+    blurb: 'Delete-before-write cache invalidation kept a revoked grant alive.',
     role: 'Security engineer · 20 min',
     minutes: 20,
     prompt:
-      'A removed contractor kept access for five minutes: a concurrent read repopulated the permission cache right after the starter deleted the key, and the 300 s TTL was the only thing that eventually expired it. Debug the cache, fix it, and prove a revocation reaches every reader within a second.',
+      'A removed team admin kept team:write at every project of the team, and a read that landed during the revocation re-cached the old set for the rest of the 300 s TTL. Debug the cache, fix it, and prove a revocation reaches every scope and every reader.',
     signals: ['Secure', 'Verify', 'Operate'],
     aiNote:
-      'The starter invalidates the cache by deleting perm:{subject}:{scope} after a grant change and leans on a 300 s TTL. A read that misses between the delete and the re-derive stores the pre-change set, and nothing in the entry records which change it predates: no version stamp, no counter bump, no lock around the rebuild.',
+      'The starter deletes the one perm:{subject}:{scope} key of the changed grant, before the grant store writes the change, and stores derived sets as plain JSON. Entries at the scopes the grant covered keep the old set, a read between the delete and the write re-caches it, and nothing in an entry records the grant version it was derived at.',
     testIdea:
-      'Revoke a permission and immediately read the same (subject, scope) from a second connection and assert the old set is gone; fire ten concurrent misses and assert one recompute; assert the version bump lands after the grant record and before the 200.',
+      'Revoke a team grant and read at one of its projects; land a read between the invalidation and the grant write; land a revocation while a read is deriving, and assert the next read no longer lists the permission.',
     followUps: [
       'What does fail closed cost during a policy outage?',
       'How do you audit who could grant what?',

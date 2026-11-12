@@ -5,858 +5,573 @@ export const readStep: Step = {
   title: 'GET /v1/users/{id}/permissions: an explanation, not a blob',
   concept: 'http',
   file: 'read',
-  focus: ['client', 'api', 'redis', 'engine'],
+  focus: ['client', 'api', 'redis', 'store'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/users/{id}/permissions\` with the \`X-Caller-Id\`
-header, merges every permission the subject holds into one sorted list, caches it under
-\`perms:{id}\` for 600 seconds and answers. It compiles, serves the demo, and hides 4 flaws.
+**Starting point.** The starter serves \`GET /v1/users/{id}/permissions?scope=team:eng\` (scope
+defaults to \`org\`) with the \`X-Caller-Id\` header (401 when missing). It answers
+\`{"subject", "scope", "permissions": ["team:read", …]}\`: the permissions of every grant whose
+scope equals the asked one, merged, cached under \`perm:explain:{id}:{scope}\` for 600 s. It serves
+the demo and hides four flaws.
 
-**Failure mode the checks target.** A merged list cannot answer *who granted this?*, and with no
-live check beside it the console and the enforcement point drift apart. A 600-second cache with no
-version keeps a revoked contractor's access for up to ten minutes. And without an ownership check,
-any authenticated caller enumerates any user's access.
+**Failure mode the checks target.** Any caller lists anyone's access; nobody can say which grant a
+permission comes from; a team grant does not show at the team's projects; and a revoked permission
+stays listed for ten minutes.
 
-- A missing \`X-Caller-Id\` is **401**. \`X-Caller-Id\` must equal \`{id}\` unless the caller holds
-  \`permissions:read:any\`, which the policy engine decides; a denial is **403**.
-- Every entry is an explanation:
-  \`{"permission": "team:read", "granted_by": [{"role_id": "team_admin", "scope": "team:eng", "grant_id": "g-17"}]}\`.
-  A permission produced by two grants lists both derivations, in a deterministic order.
-- \`POST /v1/permissions/check\` takes \`{"subject": "user:ada", "permission": "team:read", "scope": "team:eng"}\`
-  and answers the same \`effective_permissions\` computation live, so the list and the check agree
-  bit-for-bit. A derivation covers the asked scope when it is the same scope, \`org\`, or a broader
-  kind.
-- The read is served from the version-stamped cache: the entry's \`grant_version\` is compared with
-  the current one and the entry is recomputed whenever they differ.
-- Respond \`{"subject": …, "grant_version": …, "permissions": […]}\`, and log the subject, the caller
-  and the entry count, not the permission set.`,
+- A caller other than \`{id}\` needs \`permissions:read_any\` at \`org\`
+  (\`cache.effective_permissions(caller, "org")\`), otherwise **403**.
+- Each entry is \`{"permission": "team:read", "granted_by": [{"grant_id", "role", "scope"}]}\`,
+  sorted by permission, with every grant that confers it, oldest first.
+- A grant counts when \`catalog.covers(grant_scope, scope)\`.
+- The body carries \`grant_version\`; a cached body is served only while it equals the current
+  \`perm:grant_version\`, read before deriving.`,
   sequence: {
-    participants: ['Client', 'Permission Service', 'Redis', 'Policy engine', 'Grant store'],
+    participants: ['Client', 'Permission Service', 'Redis', 'Grant store'],
     messages: [
-      {from: 'Client', to: 'Permission Service', label: 'GET /v1/users/{id}/permissions · X-Caller-Id', kind: 'sync'},
       {
-        from: 'Permission Service',
+        from: 'Client',
         to: 'Permission Service',
-        label: 'ownership check: X-Caller-Id == {id}?',
+        label: 'GET /v1/users/ada/permissions?scope=project:eng/api · X-Caller-Id',
         kind: 'sync',
       },
-      {from: 'Permission Service', to: 'Policy engine', label: 'permissions:read:any for a foreign id', kind: 'sync'},
-      {from: 'Policy engine', to: 'Permission Service', label: 'deny → 403 · allow → continue', kind: 'reply'},
-      {from: 'Permission Service', to: 'Redis', label: 'GET perms:{id} · entry + grant_version', kind: 'sync'},
-      {from: 'Redis', to: 'Permission Service', label: 'current entry / stale entry / miss', kind: 'reply'},
-      {from: 'Permission Service', to: 'Grant store', label: 'grant_version() · grants({id}) when stale', kind: 'sync'},
-      {from: 'Grant store', to: 'Permission Service', label: 'role_id, scope, grant_id, permissions', kind: 'reply'},
       {
         from: 'Permission Service',
-        to: 'Permission Service',
-        label: 'attach granted_by to each permission',
+        to: 'Redis',
+        label: 'caller ≠ id → effective_permissions(caller, org) ∋ permissions:read_any?',
         kind: 'sync',
       },
-      {from: 'Permission Service', to: 'Redis', label: 'SET perms:{id} · stamped with grant_version', kind: 'async'},
-      {from: 'Permission Service', to: 'Client', label: '200 {permission, granted_by[]}', kind: 'reply'},
-      {from: 'Client', to: 'Permission Service', label: 'POST /v1/permissions/check · same subject', kind: 'sync'},
+      {from: 'Permission Service', to: 'Redis', label: 'GET perm:grant_version · GET perm:explain:ada:…', kind: 'sync'},
       {
         from: 'Permission Service',
         to: 'Grant store',
-        label: 'effective_permissions({id}) live · no cache',
+        label: 'stale → grants_of(ada) · covers(grant scope, scope)',
         kind: 'sync',
       },
-      {from: 'Permission Service', to: 'Client', label: 'allowed · identical to the list', kind: 'reply'},
+      {
+        from: 'Permission Service',
+        to: 'Redis',
+        label: 'SET perm:explain:… {grant_version, permissions} EX 600',
+        kind: 'sync',
+      },
+      {
+        from: 'Permission Service',
+        to: 'Client',
+        label: '200 [{permission, granted_by: [{grant_id, role, scope}]}] · 403',
+        kind: 'reply',
+      },
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/users/{id}/permissions',
-      detail: 'Register the effective-permissions read on `GET /v1/users/{id}/permissions`.',
+      title: 'Registers GET /v1/users/{id}/permissions',
+      detail:
+        'Register `GET /v1/users/{id}/permissions`; a subject reading its own permissions gets 200, a request without `X-Caller-Id` 401.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{id\}\/permissions["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:id\/permissions['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/users\/\{id\}\/permissions"/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{\w+\}\/permissions["']/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:\w+\/permissions['"]/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/users\/\{\w+\}\/permissions"/]},
         scala: {all: [/path\(\s*"v1"\s*\/\s*"users"\s*\/\s*Segment\s*\/\s*"permissions"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*R"\(\/v1\/users\/\(\\d\+\)\/permissions\)"/]},
-      },
-    },
-    {
-      id: 'provenance',
-      title: 'Every permission carries its derivation',
-      detail:
-        'Each entry names the roles and grants that produce it in `granted_by`, instead of a bare merged set. The starter returns the merged permissions with no provenance at all.',
-      match: {
-        python: {all: [/granted_by/, /def explain_permissions\(/]},
-        typescript: {all: [/granted_by/, /function explainPermissions\(/]},
-        go: {all: [/granted_by/, /func explainPermissions\(/]},
-        scala: {all: [/granted_by/, /def explainPermissions\(/]},
-        cpp: {all: [/granted_by/, /explainPermissions\(/]},
-      },
-    },
-    {
-      id: 'live-parity',
-      title: 'The list and the live check share one computation',
-      detail:
-        '`POST /v1/permissions/check` and the read both call the same `effective_permissions` computation, so a revoked permission is absent from the list and denied by the check in the same pass. The starter has no check endpoint at all.',
-      match: {
-        python: {all: [/effective_permissions\(/, /@app\.post\(\s*["']\/v1\/permissions\/check["']/]},
-        typescript: {all: [/effectivePermissions\(/, /app\.post\(\s*['"]\/v1\/permissions\/check['"]/]},
-        go: {all: [/effectivePermissions\(/, /"POST \/v1\/permissions\/check"/]},
-        scala: {all: [/effectivePermissions\(/, /path\(\s*"v1"\s*\/\s*"permissions"\s*\/\s*"check"\s*\)/]},
-        cpp: {all: [/effectivePermissions\(/, /svr\.Post\(\s*"\/v1\/permissions\/check"/]},
-      },
-    },
-    {
-      id: 'fresh-cache',
-      title: 'Serves only cache entries that match the grant version',
-      detail:
-        'The read is served from the version-stamped cache and recomputes when the entry’s version differs from the current `grant_version`, so the list cannot outlive a revocation. The starter serves a 600-second cache with no version at all.',
-      match: {
-        python: {all: [/cache_is_current\(/, /grant_version/]},
-        typescript: {all: [/cacheIsCurrent\(/, /grant_version/]},
-        go: {all: [/cacheIsCurrent\(/, /grant_version/]},
-        scala: {all: [/cacheIsCurrent\(/, /grant_version/]},
-        cpp: {all: [/cacheIsCurrent\(/, /grant_version/]},
+        cpp: {all: [/svr\.Get\([^\n]*\/v1\/users\/[^\n]*\/permissions/]},
       },
     },
     {
       id: 'foreign-403',
-      title: 'Refuses to read another subject without the audit permission',
+      title: "Refuses another subject's permissions without permissions:read_any",
       detail:
-        'A caller may read only its own permissions unless it holds `permissions:read:any`; a foreign `id` is `403`. The starter answers for any caller, so one subject can enumerate another’s access.',
+        "A caller reading someone else must hold `permissions:read_any` at `org`, asked through the cache (`effective_permissions` of the caller); otherwise **403**. The starter answers any caller, so one user can enumerate everyone's access.",
       match: {
-        python: {all: [/permissions:read:any/, /status_code\s*=\s*403/]},
-        typescript: {all: [/permissions:read:any/, /code\(\s*403\s*\)/]},
-        go: {all: [/permissions:read:any/, /StatusForbidden/]},
-        scala: {all: [/permissions:read:any/, /StatusCodes\.Forbidden/]},
-        cpp: {all: [/permissions:read:any/, /\b403\b/]},
+        python: {all: [/permissions:read_any/, /cache\.effective_permissions\(\s*caller/, /\b403\b/]},
+        typescript: {all: [/permissions:read_any/, /effectivePermissions\(\s*caller/, /\b403\b/]},
+        go: {all: [/permissions:read_any/, /cache\.EffectivePermissions\([^\n]*caller/, /StatusForbidden|\b403\b/]},
+        scala: {all: [/permissions:read_any/, /Cache\.effectivePermissions\(\s*caller/, /Forbidden|\b403\b/]},
+        cpp: {all: [/permissions:read_any/, /cache::effectivePermissions\(\s*caller/, /\b403\b/]},
+      },
+    },
+    {
+      id: 'provenance',
+      title: 'Every permission names the grants it comes from',
+      detail:
+        'Each entry carries `granted_by`, the grants (`grant_id`, `role`, `scope`) that confer the permission; the starter merges every permission into one list, so nobody can say which grant to revoke.',
+      match: {
+        python: {all: [/granted_by/, /["']grant_id["']/]},
+        typescript: {all: [/granted_by/, /grant_id/]},
+        go: {all: [/granted_by/, /grant_id/]},
+        scala: {all: [/granted_by/, /grant_id/]},
+        cpp: {all: [/granted_by/, /grant_id/]},
+      },
+    },
+    {
+      id: 'covering-scopes',
+      title: 'Counts every grant whose scope covers the asked one',
+      detail:
+        "A grant counts when `covers(grant scope, asked scope)`: `org` everywhere, a team at its projects. The starter compares scope strings, so a team grant is missing at the team's projects and an org grant everywhere below it.",
+      match: {
+        python: {all: [/catalog\.covers\(/], none: [/\[["']scope["']\]\s*==\s*scope/]},
+        typescript: {all: [/\bcovers\(/], none: [/\.scope\s*===\s*scope/]},
+        go: {all: [/catalog\.Covers\(/], none: [/\.Scope\s*==\s*scope/]},
+        scala: {all: [/Catalog\.covers\(/], none: [/\.scope\s*==\s*scope/]},
+        cpp: {all: [/catalog::covers\(/], none: [/\.scope\s*==\s*scope/]},
+      },
+    },
+    {
+      id: 'fresh-cache',
+      title: 'Serves a cached body only at the current grant version',
+      detail:
+        'The body is stamped with `grant_version`, read before deriving, and a cached body is served only while it equals `perm:grant_version`; the starter serves its copy for 600 s whatever changed.',
+      match: {
+        python: {all: [/\.get\(\s*VERSION_KEY/, /grant_version/]},
+        typescript: {all: [/\.get\(\s*VERSION_KEY/, /grant_version/]},
+        go: {all: [/\.Get\(\s*\w+(\.Context\(\))?,\s*versionKey/, /grant_version/]},
+        scala: {all: [/\.get\(\s*VersionKey/, /grant_version/]},
+        cpp: {all: [/\.get\(\s*kVersionKey/, /grant_version/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""GET /v1/users/{id}/permissions: the effective permissions of one subject."""
-import json
-import logging
+      starter: `import json
 
 import redis
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-app = FastAPI()
-logger = logging.getLogger("permz")
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-CACHE_TTL_S = 600
-
-
-class GrantStore:
-    def permissions(self, subject: str) -> list[str]:
-        """Every permission the subject holds, merged across roles and scopes."""
-        raise NotImplementedError
-
-
-store = GrantStore()
-
-
-@app.get("/v1/users/{id}/permissions")
-def read_permissions(id: str, caller: str = Header(alias="X-Caller-Id")) -> JSONResponse:
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    key = f"perms:{id}"
-    cached = r.get(key)
-    if cached is not None:
-        return JSONResponse({"subject": id, "permissions": json.loads(cached)}, status_code=200)
-    permissions = sorted(store.permissions(id))
-    r.set(key, json.dumps(permissions), ex=CACHE_TTL_S)
-    logger.info("permissions id=%s caller=%s count=%d", id, caller, len(permissions))
-    return JSONResponse({"subject": id, "permissions": permissions}, status_code=200)
-`,
-      solution: `"""GET /v1/users/{id}/permissions: an explanation, and the live check that agrees with it."""
-import json
-import logging
-
-import redis
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from permz import cache  # effective_permissions
+from permz import catalog  # covers, permissions_of
+from permz import grants  # grants_of
 
 app = FastAPI()
-logger = logging.getLogger("permz")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-AUDIT_PERMISSION = "permissions:read:any"
-SCOPE_RANK = {"org": 0, "team": 1, "project": 2}
+EXPLAIN_TTL_S = 600
 
 
-class CheckRequest(BaseModel):
-    subject: str
-    permission: str
-    scope: str
+def explain_key(subject: str, scope: str) -> str:
+    return f"perm:explain:{subject}:{scope}"
 
 
-class GrantStore:
-    def grants(self, subject: str) -> list[dict]:
-        """The subject's grants: grant_id, role_id, scope, permissions."""
-        raise NotImplementedError
-
-    def grant_version(self) -> int:
-        """The global grant version; every assignment change bumps it."""
-        raise NotImplementedError
-
-
-class PolicyEngine:
-    def allow(self, caller: str, permission: str, scope: str) -> bool:
-        """Deny when the engine cannot verify: an outage must never widen access."""
-        raise NotImplementedError
-
-
-store = GrantStore()
-engine = PolicyEngine()
-
-
-def scope_covers(held: str, target: str) -> bool:
-    if held == target or held == "org":
-        return True
-    held_kind, target_kind = held.split(":", 1)[0], target.split(":", 1)[0]
-    return SCOPE_RANK.get(held_kind, 9) < SCOPE_RANK.get(target_kind, -1)
-
-
-def effective_permissions(subject: str) -> list[dict]:
-    """One entry per permission, carrying the roles and grants that produce it."""
-    by_permission: dict[str, list[dict]] = {}
-    for grant in store.grants(subject):
-        for permission in grant["permissions"]:
-            by_permission.setdefault(permission, []).append(
-                {"role_id": grant["role_id"], "scope": grant["scope"], "grant_id": grant["grant_id"]}
-            )
-    return [{"permission": p, "granted_by": by_permission[p]} for p in sorted(by_permission)]
-
-
-def cache_is_current(entry: dict | None, version: int) -> bool:
-    return entry is not None and entry["grant_version"] == version
-
-
-def explain_permissions(subject: str) -> dict:
-    """The version-stamped cache: an entry survives only while its grant_version is current."""
-    version = store.grant_version()
-    cached = r.get(f"perms:{subject}")
-    entry = json.loads(cached) if cached is not None else None
-    if not cache_is_current(entry, version):
-        entry = {"grant_version": version, "entries": effective_permissions(subject)}
-        r.set(f"perms:{subject}", json.dumps(entry))
-    return {"subject": subject, "grant_version": version, "permissions": entry["entries"]}
-
-
-def guard(caller: str | None, subject: str) -> None:
+@app.get("/v1/users/{subject}/permissions")
+def read_permissions(subject: str, request: Request):
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    caller = request.headers.get("x-caller-id", "")
     if not caller:
-        raise HTTPException(status_code=401, detail="missing X-Caller-Id")
-    if caller != subject and not engine.allow(caller, AUDIT_PERMISSION, "org"):
-        raise HTTPException(status_code=403, detail="needs permissions:read:any")
+        return JSONResponse({"error": "X-Caller-Id is required"}, status_code=401)
+    scope = request.query_params.get("scope", "org")
+    raw = r.get(explain_key(subject, scope))
+    if raw is not None:
+        return json.loads(raw)
+    permissions = sorted({p for grant in grants.grants_of(subject) if grant["scope"] == scope for p in catalog.permissions_of(grant["role"])})
+    body = {"subject": subject, "scope": scope, "permissions": permissions}
+    r.set(explain_key(subject, scope), json.dumps(body), ex=EXPLAIN_TTL_S)
+    return body
+`,
+      solution: `import json
+
+import redis
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from permz import cache  # effective_permissions
+from permz import catalog  # covers, permissions_of
+from permz import grants  # grants_of
+
+app = FastAPI()
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+VERSION_KEY = "perm:grant_version"
+EXPLAIN_TTL_S = 600
 
 
-@app.get("/v1/users/{id}/permissions")
-def read_permissions(id: str, caller: str | None = Header(default=None, alias="X-Caller-Id")) -> JSONResponse:
-    guard(caller, id)
-    body = explain_permissions(id)
-    logger.info("permissions id=%s caller=%s permissions=%d", id, caller, len(body["permissions"]))
-    return JSONResponse(body, status_code=200)
+def explain_key(subject: str, scope: str) -> str:
+    return f"perm:explain:{subject}:{scope}"
 
 
-@app.post("/v1/permissions/check")
-def check(body: CheckRequest, caller: str | None = Header(default=None, alias="X-Caller-Id")) -> JSONResponse:
-    guard(caller, body.subject)
-    allowed = any(
-        entry["permission"] == body.permission
-        and any(scope_covers(d["scope"], body.scope) for d in entry["granted_by"])
-        for entry in effective_permissions(body.subject)
-    )
-    return JSONResponse(
-        {"subject": body.subject, "permission": body.permission, "scope": body.scope, "allowed": allowed},
-        status_code=200,
-    )
+def explain(subject: str, scope: str) -> list[dict]:
+    """Every permission subject holds at scope, sorted, each with the grants that confer it."""
+    granted_by: dict[str, list[dict]] = {}
+    for grant in grants.grants_of(subject):
+        if not catalog.covers(grant["scope"], scope):
+            continue
+        for permission in catalog.permissions_of(grant["role"]):
+            granted_by.setdefault(permission, []).append({"grant_id": grant["grant_id"], "role": grant["role"], "scope": grant["scope"]})
+    return [{"permission": p, "granted_by": granted_by[p]} for p in sorted(granted_by)]
+
+
+@app.get("/v1/users/{subject}/permissions")
+def read_permissions(subject: str, request: Request):
+    caller = request.headers.get("x-caller-id", "")
+    if not caller:
+        return JSONResponse({"error": "X-Caller-Id is required"}, status_code=401)
+    if caller != subject and "permissions:read_any" not in cache.effective_permissions(caller, "org"):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    scope = request.query_params.get("scope", "org")
+    version = int(r.get(VERSION_KEY) or 0)  # before deriving: a change meanwhile outdates what is derived
+    raw = r.get(explain_key(subject, scope))
+    if raw is not None and json.loads(raw).get("grant_version") == version:
+        return json.loads(raw)
+    body = {"subject": subject, "scope": scope, "grant_version": version, "permissions": explain(subject, scope)}
+    r.set(explain_key(subject, scope), json.dumps(body), ex=EXPLAIN_TTL_S)
+    return body
 `,
     },
     typescript: {
-      starter: `/** GET /v1/users/:id/permissions: the effective permissions of one subject. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {effectivePermissions} from 'permz/cache';
+import {covers, permissionsOf} from 'permz/catalog';
+import {grantsOf} from 'permz/grants';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const CACHE_TTL_S = 600;
+export const EXPLAIN_TTL_S = 600;
 
-export interface GrantStore {
-  permissions(subject: string): Promise<string[]>;
-}
+const explainKey = (subject: string, scope: string): string => \`perm:explain:\${subject}:\${scope}\`;
 
-export const store: GrantStore = {
-  async permissions() {
-    throw new Error('not wired');
-  },
-};
-
-app.get('/v1/users/:id/permissions', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const {id} = request.params as {id: string};
-  const caller = request.headers['X-Caller-Id'];
-  const key = \`perms:\${id}\`;
-  const cached = await r.get(key);
-  if (cached !== null) return reply.code(200).send({subject: id, permissions: JSON.parse(cached)});
-  const permissions = (await store.permissions(id)).sort();
-  await r.set(key, JSON.stringify(permissions), 'EX', CACHE_TTL_S);
-  request.log.info({id, caller, count: permissions.length}, 'read permissions');
-  return reply.code(200).send({subject: id, permissions});
+app.get('/v1/users/:subject/permissions', async (request, reply) => {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const {subject} = request.params as {subject: string};
+  const caller = request.headers['x-caller-id'];
+  if (typeof caller !== 'string' || caller === '') return reply.code(401).send({error: 'X-Caller-Id is required'});
+  const scope = (request.query as {scope?: string}).scope ?? 'org';
+  const raw = await redis.get(explainKey(subject, scope));
+  if (raw !== null) return JSON.parse(raw);
+  const permissions = new Set<string>();
+  for (const grant of await grantsOf(subject)) {
+    if (grant.scope === scope) for (const p of permissionsOf(grant.role)) permissions.add(p);
+  }
+  const body = {subject, scope, permissions: [...permissions].sort()};
+  await redis.set(explainKey(subject, scope), JSON.stringify(body), 'EX', EXPLAIN_TTL_S);
+  return body;
 });
-
-void app.listen({port: 8445, host: '0.0.0.0'});
 `,
-      solution: `/** GET /v1/users/:id/permissions: an explanation, and the live check that agrees with it. */
-import Fastify from 'fastify';
-import {Redis} from 'ioredis';
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {effectivePermissions} from 'permz/cache';
+import {covers, permissionsOf} from 'permz/catalog';
+import {grantsOf} from 'permz/grants';
 
 export const app = Fastify();
-const r = new Redis('redis://redis:6379');
+const redis = new Redis({host: 'redis', port: 6379});
 
-const AUDIT_PERMISSION = 'permissions:read:any';
-const SCOPE_RANK: Record<string, number> = {org: 0, team: 1, project: 2};
-
-interface CheckBody {
-  subject: string;
-  permission: string;
-  scope: string;
-}
-
-interface Grant {
-  grant_id: string;
-  role_id: string;
-  scope: string;
-  permissions: string[];
-}
+export const VERSION_KEY = 'perm:grant_version';
+export const EXPLAIN_TTL_S = 600;
 
 interface Derivation {
-  role_id: string;
-  scope: string;
   grant_id: string;
+  role: string;
+  scope: string;
 }
 
-interface Entry {
-  permission: string;
-  granted_by: Derivation[];
-}
+const explainKey = (subject: string, scope: string): string => \`perm:explain:\${subject}:\${scope}\`;
 
-export interface GrantStore {
-  grants(subject: string): Promise<Grant[]>;
-  grantVersion(): Promise<number>;
-}
-
-export interface PolicyEngine {
-  allow(caller: string, permission: string, scope: string): Promise<boolean>;
-}
-
-export const store: GrantStore = {
-  async grants() {
-    throw new Error('not wired');
-  },
-  async grantVersion() {
-    throw new Error('not wired');
-  },
-};
-
-export const engine: PolicyEngine = {
-  async allow() {
-    throw new Error('not wired');
-  },
-};
-
-function scopeCovers(held: string, target: string): boolean {
-  if (held === target || held === 'org') return true;
-  const heldRank = SCOPE_RANK[held.split(':', 1)[0]];
-  const targetRank = SCOPE_RANK[target.split(':', 1)[0]];
-  return heldRank !== undefined && targetRank !== undefined && heldRank < targetRank;
-}
-
-async function effectivePermissions(subject: string): Promise<Entry[]> {
-  const byPermission = new Map<string, Derivation[]>();
-  for (const grant of await store.grants(subject)) {
-    for (const permission of grant.permissions) {
-      const derivation = {role_id: grant.role_id, scope: grant.scope, grant_id: grant.grant_id};
-      byPermission.set(permission, [...(byPermission.get(permission) ?? []), derivation]);
+/** Every permission subject holds at scope, sorted, each with the grants that confer it. */
+async function explain(subject: string, scope: string): Promise<{permission: string; granted_by: Derivation[]}[]> {
+  const grantedBy = new Map<string, Derivation[]>();
+  for (const grant of await grantsOf(subject)) {
+    if (!covers(grant.scope, scope)) continue;
+    for (const permission of permissionsOf(grant.role)) {
+      grantedBy.set(permission, [...(grantedBy.get(permission) ?? []), {grant_id: grant.grant_id, role: grant.role, scope: grant.scope}]);
     }
   }
-  return [...byPermission.keys()]
-    .sort()
-    .map(permission => ({permission, granted_by: byPermission.get(permission) ?? []}));
+  return [...grantedBy.keys()].sort().map(permission => ({permission, granted_by: grantedBy.get(permission) ?? []}));
 }
 
-function cacheIsCurrent(entry: {grant_version: number} | null, version: number): boolean {
-  return entry !== null && entry.grant_version === version;
-}
-
-/** The version-stamped cache: an entry survives only while its grant_version is current. */
-async function explainPermissions(subject: string): Promise<Record<string, unknown>> {
-  const version = await store.grantVersion();
-  const raw = await r.get(\`perms:\${subject}\`);
-  const entry = raw === null ? null : (JSON.parse(raw) as {grant_version: number; entries: Entry[]});
-  let entries = entry?.entries ?? null;
-  if (!cacheIsCurrent(entry, version)) {
-    entries = await effectivePermissions(subject);
-    await r.set(\`perms:\${subject}\`, JSON.stringify({grant_version: version, entries}));
+app.get('/v1/users/:subject/permissions', async (request, reply) => {
+  const {subject} = request.params as {subject: string};
+  const caller = request.headers['x-caller-id'];
+  if (typeof caller !== 'string' || caller === '') return reply.code(401).send({error: 'X-Caller-Id is required'});
+  if (caller !== subject && !(await effectivePermissions(caller, 'org')).includes('permissions:read_any')) {
+    return reply.code(403).send({error: 'forbidden'});
   }
-  return {subject, grant_version: version, permissions: entries};
-}
-
-app.get('/v1/users/:id/permissions', async (request, reply) => {
-  const {id} = request.params as {id: string};
-  const caller = request.headers['X-Caller-Id'];
-  if (typeof caller !== 'string' || caller === '') return reply.code(401).send({error: 'missing X-Caller-Id'});
-  if (caller !== id && !(await engine.allow(caller, AUDIT_PERMISSION, 'org')))
-    return reply.code(403).send({error: 'needs permissions:read:any'});
-  const body = await explainPermissions(id);
-  request.log.info({id, caller, permissions: (body.permissions as Entry[]).length}, 'permissions read');
-  return reply.code(200).send(body);
+  const scope = (request.query as {scope?: string}).scope ?? 'org';
+  const version = Number((await redis.get(VERSION_KEY)) ?? '0'); // before deriving: a change meanwhile outdates what is derived
+  const raw = await redis.get(explainKey(subject, scope));
+  if (raw !== null && JSON.parse(raw).grant_version === version) return JSON.parse(raw);
+  const body = {subject, scope, grant_version: version, permissions: await explain(subject, scope)};
+  await redis.set(explainKey(subject, scope), JSON.stringify(body), 'EX', EXPLAIN_TTL_S);
+  return body;
 });
-
-app.post('/v1/permissions/check', async (request, reply) => {
-  const body = request.body as Partial<CheckBody> | null;
-  if (body === null || typeof body !== 'object' || !body.subject || !body.permission || !body.scope)
-    return reply.code(400).send({error: 'subject, permission and scope are required'});
-  const caller = request.headers['X-Caller-Id'];
-  if (typeof caller !== 'string' || caller === '') return reply.code(401).send({error: 'missing X-Caller-Id'});
-  if (caller !== body.subject && !(await engine.allow(caller, AUDIT_PERMISSION, 'org')))
-    return reply.code(403).send({error: 'needs permissions:read:any'});
-  const entries = await effectivePermissions(body.subject);
-  const allowed = entries.some(
-    entry =>
-      entry.permission === body.permission &&
-      entry.granted_by.some(derivation => scopeCovers(derivation.scope, body.scope as string)),
-  );
-  return reply.code(200).send({subject: body.subject, permission: body.permission, scope: body.scope, allowed});
-});
-
-void app.listen({port: 8445, host: '0.0.0.0'});
 `,
     },
     go: {
       starter: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sort"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"permz/catalog" // catalog.Covers, PermissionsOf
+	"permz/grants"  // grants.GrantsOf; the cache is permz/cache (cache.EffectivePermissions)
 )
 
-const cacheTTL = 600 * time.Second
+const explainTTL = 600 * time.Second
 
-type GrantStore struct{}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-// Permissions is every permission the subject holds, merged across roles and scopes.
-func (s *GrantStore) Permissions(ctx context.Context, subject string) ([]string, error) {
-	return nil, nil
+type permissionsBody struct {
+	Subject     string   \`json:"subject"\`
+	Scope       string   \`json:"scope"\`
+	Permissions []string \`json:"permissions"\`
 }
 
-var (
-	store = &GrantStore{}
-	rdb   = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
+func explainKey(subject, scope string) string { return "perm:explain:" + subject + ":" + scope }
 
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func readPermissions(rw http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	subject := r.PathValue("subject")
 	caller := r.Header.Get("X-Caller-Id")
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	key := "perms:" + id
-	if cached, err := rdb.Get(r.Context(), key).Bytes(); err == nil {
-		var permissions []string
-		_ = json.Unmarshal(cached, &permissions)
-		writeJSON(rw, http.StatusOK, map[string]any{"subject": id, "permissions": permissions})
+	if caller == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Caller-Id is required"})
 		return
 	}
-	permissions, _ := store.Permissions(r.Context(), id)
-	sort.Strings(permissions)
-	payload, _ := json.Marshal(permissions)
-	rdb.Set(r.Context(), key, payload, cacheTTL)
-	log.Printf("permissions id=%s caller=%s count=%d", id, caller, len(permissions))
-	writeJSON(rw, http.StatusOK, map[string]any{"subject": id, "permissions": permissions})
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "org"
+	}
+	if raw, err := rdb.Get(r.Context(), explainKey(subject, scope)).Result(); err == nil {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write([]byte(raw))
+		return
+	}
+	held := map[string]bool{}
+	for _, g := range grants.GrantsOf(r.Context(), subject) {
+		if g.Scope == scope {
+			for _, p := range catalog.PermissionsOf(g.Role) {
+				held[p] = true
+			}
+		}
+	}
+	body := permissionsBody{Subject: subject, Scope: scope, Permissions: []string{}}
+	for p := range held {
+		body.Permissions = append(body.Permissions, p)
+	}
+	sort.Strings(body.Permissions)
+	raw, _ := json.Marshal(body)
+	rdb.Set(r.Context(), explainKey(subject, scope), raw, explainTTL)
+	writeJSON(rw, http.StatusOK, body)
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/users/{id}/permissions", readPermissions)
-	log.Fatal(http.ListenAndServeTLS(":8445", "cert.pem", "key.pem", mux))
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/users/{subject}/permissions", readPermissions)
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
 	"net/http"
+	"slices"
 	"sort"
+	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"permz/cache"   // cache.EffectivePermissions
+	"permz/catalog" // catalog.Covers, PermissionsOf
+	"permz/grants"  // grants.GrantsOf
 )
 
-const auditPermission = "permissions:read:any"
+const (
+	versionKey = "perm:grant_version"
+	explainTTL = 600 * time.Second
+)
 
-var scopeRank = map[string]int{"org": 0, "team": 1, "project": 2}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Grant struct {
-	GrantID     string   \`json:"grant_id"\`
-	RoleID      string   \`json:"role_id"\`
-	Scope       string   \`json:"scope"\`
-	Permissions []string \`json:"permissions"\`
-}
-
-type Derivation struct {
+type derivation struct {
 	GrantID string \`json:"grant_id"\`
-	RoleID  string \`json:"role_id"\`
+	Role    string \`json:"role"\`
 	Scope   string \`json:"scope"\`
 }
 
-type EffectivePermission struct {
+type entry struct {
 	Permission string       \`json:"permission"\`
-	GrantedBy  []Derivation \`json:"granted_by"\`
+	GrantedBy  []derivation \`json:"granted_by"\`
 }
 
-type CacheEntry struct {
-	GrantVersion int64                 \`json:"grant_version"\`
-	Entries      []EffectivePermission \`json:"entries"\`
+type permissionsBody struct {
+	Subject      string  \`json:"subject"\`
+	Scope        string  \`json:"scope"\`
+	GrantVersion int64   \`json:"grant_version"\`
+	Permissions  []entry \`json:"permissions"\`
 }
 
-type CheckRequest struct {
-	Subject    string \`json:"subject"\`
-	Permission string \`json:"permission"\`
-	Scope      string \`json:"scope"\`
-}
+func explainKey(subject, scope string) string { return "perm:explain:" + subject + ":" + scope }
 
-type GrantStore struct{}
-
-func (s *GrantStore) Grants(ctx context.Context, subject string) ([]Grant, error) { return nil, nil }
-
-// GrantVersion is the global grant version; every assignment change bumps it.
-func (s *GrantStore) GrantVersion(ctx context.Context) (int64, error) { return 0, nil }
-
-type PolicyEngine struct{}
-
-// Allow is the engine's decision: a timeout or a rejection is a deny, never an allow.
-func (e *PolicyEngine) Allow(ctx context.Context, caller, permission, scope string) (bool, error) {
-	return false, nil
-}
-
-var (
-	store  = &GrantStore{}
-	engine = &PolicyEngine{}
-	rdb    = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
 }
 
-func scopeKind(scope string) string {
-	for i, c := range scope {
-		if c == ':' {
-			return scope[:i]
-		}
-	}
-	return scope
-}
-
-func scopeCovers(held, target string) bool {
-	if held == target || held == "org" {
-		return true
-	}
-	heldRank, heldOK := scopeRank[scopeKind(held)]
-	targetRank, targetOK := scopeRank[scopeKind(target)]
-	return heldOK && targetOK && heldRank < targetRank
-}
-
-// effectivePermissions is one entry per permission, carrying the roles and grants that produce it.
-func effectivePermissions(ctx context.Context, subject string) ([]EffectivePermission, error) {
-	grants, err := store.Grants(ctx, subject)
-	if err != nil {
-		return nil, err
-	}
-	byPermission := map[string][]Derivation{}
-	for _, grant := range grants {
-		for _, permission := range grant.Permissions {
-			byPermission[permission] = append(byPermission[permission], Derivation{
-				GrantID: grant.GrantID, RoleID: grant.RoleID, Scope: grant.Scope,
-			})
-		}
-	}
-	permissions := make([]string, 0, len(byPermission))
-	for permission := range byPermission {
-		permissions = append(permissions, permission)
-	}
-	sort.Strings(permissions)
-	entries := make([]EffectivePermission, 0, len(permissions))
-	for _, permission := range permissions {
-		entries = append(entries, EffectivePermission{Permission: permission, GrantedBy: byPermission[permission]})
-	}
-	return entries, nil
-}
-
-func cacheIsCurrent(entry CacheEntry, version int64) bool { return entry.GrantVersion == version }
-
-// explain loads the version-stamped cache: an entry survives only while grant_version matches.
-func explain(ctx context.Context, subject string) (CacheEntry, error) {
-	version, err := store.GrantVersion(ctx)
-	if err != nil {
-		return CacheEntry{}, err
-	}
-	key := "perms:" + subject
-	if raw, err := rdb.Get(ctx, key).Bytes(); err == nil {
-		var entry CacheEntry
-		if json.Unmarshal(raw, &entry) == nil && cacheIsCurrent(entry, version) {
-			return entry, nil
-		}
-	}
-	entries, err := effectivePermissions(ctx, subject)
-	if err != nil {
-		return CacheEntry{}, err
-	}
-	entry := CacheEntry{GrantVersion: version, Entries: entries}
-	payload, _ := json.Marshal(entry)
-	rdb.Set(ctx, key, payload, 0)
-	return entry, nil
-}
-
-// guard lets a caller read its own permissions, or another subject with permissions:read:any.
-func guard(rw http.ResponseWriter, ctx context.Context, caller, subject string) bool {
-	if caller == "" {
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "missing X-Caller-Id"})
-		return false
-	}
-	if caller != subject {
-		allowed, err := engine.Allow(ctx, caller, auditPermission, "org")
-		if err != nil || !allowed {
-			writeJSON(rw, http.StatusForbidden, map[string]string{"error": "needs permissions:read:any"})
-			return false
-		}
-	}
-	return true
-}
-
-func explainPermissions(rw http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !guard(rw, r.Context(), r.Header.Get("X-Caller-Id"), id) {
-		return
-	}
-	entry, err := explain(r.Context(), id)
-	if err != nil {
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "grant store unavailable"})
-		return
-	}
-	log.Printf("permissions id=%s grant_version=%d count=%d", id, entry.GrantVersion, len(entry.Entries))
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"subject": id, "grant_version": entry.GrantVersion, "permissions": entry.Entries,
-	})
-}
-
-func checkPermissions(rw http.ResponseWriter, r *http.Request) {
-	var body CheckRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Subject == "" || body.Permission == "" || body.Scope == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "subject, permission and scope are required"})
-		return
-	}
-	if !guard(rw, r.Context(), r.Header.Get("X-Caller-Id"), body.Subject) {
-		return
-	}
-	entries, err := effectivePermissions(r.Context(), body.Subject)
-	if err != nil {
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "grant store unavailable"})
-		return
-	}
-	allowed := false
-	for _, entry := range entries {
-		if entry.Permission != body.Permission {
+// explain is every permission subject holds at scope, sorted, each with the grants that confer it.
+func explain(r *http.Request, subject, scope string) []entry {
+	grantedBy := map[string][]derivation{}
+	for _, g := range grants.GrantsOf(r.Context(), subject) {
+		if !catalog.Covers(g.Scope, scope) {
 			continue
 		}
-		for _, derivation := range entry.GrantedBy {
-			if scopeCovers(derivation.Scope, body.Scope) {
-				allowed = true
-			}
+		for _, p := range catalog.PermissionsOf(g.Role) {
+			grantedBy[p] = append(grantedBy[p], derivation{GrantID: g.GrantID, Role: g.Role, Scope: g.Scope})
 		}
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{
-		"subject": body.Subject, "permission": body.Permission, "scope": body.Scope, "allowed": allowed,
-	})
+	out := []entry{}
+	for p, by := range grantedBy {
+		out = append(out, entry{Permission: p, GrantedBy: by})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Permission < out[j].Permission })
+	return out
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/users/{id}/permissions", explainPermissions)
-	mux.HandleFunc("POST /v1/permissions/check", checkPermissions)
-	log.Fatal(http.ListenAndServeTLS(":8445", "cert.pem", "key.pem", mux))
+func readPermissions(rw http.ResponseWriter, r *http.Request) {
+	subject := r.PathValue("subject")
+	caller := r.Header.Get("X-Caller-Id")
+	if caller == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Caller-Id is required"})
+		return
+	}
+	if caller != subject && !slices.Contains(cache.EffectivePermissions(r.Context(), caller, "org"), "permissions:read_any") {
+		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return
+	}
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "org"
+	}
+	version, _ := rdb.Get(r.Context(), versionKey).Int64() // before deriving: a change meanwhile outdates what is derived
+	if raw, err := rdb.Get(r.Context(), explainKey(subject, scope)).Result(); err == nil {
+		var cached permissionsBody
+		if json.Unmarshal([]byte(raw), &cached) == nil && cached.GrantVersion == version {
+			writeJSON(rw, http.StatusOK, cached)
+			return
+		}
+	}
+	body := permissionsBody{Subject: subject, Scope: scope, GrantVersion: version, Permissions: explain(r, subject, scope)}
+	raw, _ := json.Marshal(body)
+	rdb.Set(r.Context(), explainKey(subject, scope), raw, explainTTL)
+	writeJSON(rw, http.StatusOK, body)
+}
+
+func register(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/users/{subject}/permissions", readPermissions)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
+import spray.json._
 
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("permz")
+import permz.{Cache, Catalog, Grants} // Cache.effectivePermissions; Catalog.covers, permissionsOf; Grants.grantsOf
 
-  val CacheTtlSeconds = 600
-  val jedis = new Jedis("redis", 6379)
-  val store = GrantStore.open()
+object Read {
+  val ExplainTtlS = 600L
 
-  val route: Route =
-    path("v1" / "users" / Segment / "permissions") { id =>
-      get {
-        optionalHeaderValueByName("X-Caller-Id") { caller =>
-          // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-          val key = s"perms:$id"
-          Option(jedis.get(key)) match {
-            case Some(cached) =>
-              complete(StatusCodes.OK, s"""{"subject":"$id","permissions":$cached}""")
-            case None =>
-              val permissions = store.permissions(id).sorted.map(p => """ + p + """).mkString(",")
-              jedis.setex(key, CacheTtlSeconds, "[" + permissions + "]")
-              system.log.info(s"permissions id=$id caller=$caller count=\${store.permissions(id).size}")
-              complete(StatusCodes.OK, s"""{"subject":"$id","permissions":[$permissions]}""")
+  val jedis = new JedisPooled("redis", 6379)
+
+  def explainKey(subject: String, scope: String): String = s"perm:explain:$subject:$scope"
+
+  private def json(status: StatusCode, body: String): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
+
+  val route: Route = path("v1" / "users" / Segment / "permissions") { subject =>
+    get {
+      optionalHeaderValueByName("X-Caller-Id") { callerHeader =>
+        parameter("scope".optional) { scopeParam =>
+          // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+          callerHeader.filter(_.nonEmpty) match {
+            case None => complete(json(StatusCodes.Unauthorized, """{"error":"X-Caller-Id is required"}"""))
+            case Some(_) =>
+              val scope = scopeParam.getOrElse("org")
+              Option(jedis.get(explainKey(subject, scope))) match {
+                case Some(raw) => complete(json(StatusCodes.OK, raw))
+                case None =>
+                  val permissions = Grants.grantsOf(subject).filter(_.scope == scope).flatMap(g => Catalog.permissionsOf(g.role)).distinct.sorted
+                  val body = JsObject("subject" -> JsString(subject), "scope" -> JsString(scope), "permissions" -> JsArray(permissions.map(JsString(_)).toVector)).compactPrint
+                  jedis.set(explainKey(subject, scope), body, SetParams.setParams().ex(ExplainTtlS))
+                  complete(json(StatusCodes.OK, body))
+              }
           }
         }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8445).bind(route)
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
 import spray.json._
-import spray.json.DefaultJsonProtocol._
 
-final case class CheckRequest(subject: String, permission: String, scope: String)
-final case class Derivation(grant_id: String, role_id: String, scope: String)
-final case class Entry(permission: String, granted_by: List[Derivation])
+import permz.{Cache, Catalog, Grants} // Cache.effectivePermissions; Catalog.covers, permissionsOf; Grants.grantsOf
 
-object ReadApi {
-  implicit val system: ActorSystem = ActorSystem("permz")
-  implicit val requestFormat: RootJsonFormat[CheckRequest] = jsonFormat3(CheckRequest)
-  implicit val derivationFormat: RootJsonFormat[Derivation] = jsonFormat3(Derivation)
-  implicit val entryFormat: RootJsonFormat[Entry] = jsonFormat2(Entry)
+object Read {
+  val VersionKey = "perm:grant_version"
+  val ExplainTtlS = 600L
 
-  val AuditPermission = "permissions:read:any"
-  val ScopeRank: Map[String, Int] = Map("org" -> 0, "team" -> 1, "project" -> 2)
-  val jedis = new Jedis("redis", 6379)
-  val store = GrantStore.open()
-  val engine = PolicyEngine.open()
+  val jedis = new JedisPooled("redis", 6379)
 
-  def cacheKey(subject: String): String = s"perms:$subject"
+  def explainKey(subject: String, scope: String): String = s"perm:explain:$subject:$scope"
 
-  def scopeCovers(held: String, target: String): Boolean =
-    held == target || held == "org" || (
-      for {
-        heldRank <- ScopeRank.get(held.split(":", 2).head)
-        targetRank <- ScopeRank.get(target.split(":", 2).head)
-      } yield heldRank < targetRank
-    ).getOrElse(false)
+  private def json(status: StatusCode, body: String): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body))
 
-  /** One entry per permission, carrying the roles and grants that produce it. */
-  def effectivePermissions(subject: String): List[Entry] =
-    store
-      .grants(subject)
-      .flatMap(g => g.permissions.map(p => p -> Derivation(g.grant_id, g.role_id, g.scope)))
-      .groupBy(_._1)
-      .toList
-      .sortBy(_._1)
-      .map { case (permission, pairs) => Entry(permission, pairs.map(_._2)) }
-
-  /** The version-stamped cache: an entry survives only while its grant_version is current. */
-  def cacheIsCurrent(entry: JsValue, version: Long): Boolean =
-    entry.asJsObject.fields.get("grant_version").contains(JsNumber(version))
-
-  def explainPermissions(subject: String): HttpResponse = {
-    val version = store.grantVersion()
-    system.log.info(s"permissions subject=$subject grant_version=$version")
-    val cached = Option(jedis.get(cacheKey(subject))).map(_.parseJson)
-    val entries = cached match {
-      case Some(entry) if cacheIsCurrent(entry, version) => entry.asJsObject.fields("entries")
-      case _ =>
-        val fresh = JsArray(effectivePermissions(subject).map(_.toJson))
-        jedis.set(cacheKey(subject), JsObject("grant_version" -> JsNumber(version), "entries" -> fresh).compactPrint)
-        fresh
-    }
-    val body = JsObject(
-      "subject" -> JsString(subject),
-      "grant_version" -> JsNumber(version),
-      "permissions" -> entries,
-    )
-    HttpResponse(
-      StatusCodes.OK,
-      entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint),
-    )
+  /** Every permission subject holds at scope, sorted, each with the grants that confer it. */
+  def explain(subject: String, scope: String): JsArray = {
+    val derivations = for {
+      grant <- Grants.grantsOf(subject) if Catalog.covers(grant.scope, scope)
+      permission <- Catalog.permissionsOf(grant.role)
+    } yield permission -> JsObject("grant_id" -> JsString(grant.grantId), "role" -> JsString(grant.role), "scope" -> JsString(grant.scope))
+    val byPermission = derivations.groupBy(_._1)
+    JsArray(byPermission.keys.toVector.sorted.map { permission =>
+      JsObject("permission" -> JsString(permission), "granted_by" -> JsArray(byPermission(permission).map(_._2).toVector))
+    })
   }
 
-  def guard(caller: String, subject: String): Option[HttpResponse] =
-    if (caller.isEmpty) {
-      Some(HttpResponse(StatusCodes.Unauthorized, entity = """{"error":"missing X-Caller-Id"}"""))
-    } else if (caller != subject && !engine.allow(caller, AuditPermission, "org")) {
-      Some(HttpResponse(StatusCodes.Forbidden, entity = """{"error":"needs permissions:read:any"}"""))
-    } else {
-      None
-    }
-
-  val route: Route =
-    path("v1" / "users" / Segment / "permissions") { id =>
-      get {
-        optionalHeaderValueByName("X-Caller-Id") { caller =>
-          guard(caller.getOrElse(""), id) match {
-            case Some(denied) => complete(denied)
-            case None         => complete(explainPermissions(id))
-          }
-        }
-      }
-    } ~
-      path("v1" / "permissions" / "check") {
-        post {
-          optionalHeaderValueByName("X-Caller-Id") { caller =>
-            entity(as[CheckRequest]) { body =>
-              guard(caller.getOrElse(""), body.subject) match {
-                case Some(denied) => complete(denied)
+  val route: Route = path("v1" / "users" / Segment / "permissions") { subject =>
+    get {
+      optionalHeaderValueByName("X-Caller-Id") { callerHeader =>
+        parameter("scope".optional) { scopeParam =>
+          callerHeader.filter(_.nonEmpty) match {
+            case None => complete(json(StatusCodes.Unauthorized, """{"error":"X-Caller-Id is required"}"""))
+            case Some(caller) if caller != subject && !Cache.effectivePermissions(caller, "org").contains("permissions:read_any") =>
+              complete(json(StatusCodes.Forbidden, """{"error":"forbidden"}"""))
+            case Some(_) =>
+              val scope = scopeParam.getOrElse("org")
+              val version = Option(jedis.get(VersionKey)).getOrElse("0").toLong // before deriving: a change meanwhile outdates what is derived
+              val cached = Option(jedis.get(explainKey(subject, scope)))
+                .filter(raw => raw.parseJson.asJsObject.fields.get("grant_version").contains(JsNumber(version)))
+              cached match {
+                case Some(raw) => complete(json(StatusCodes.OK, raw))
                 case None =>
-                  val allowed = effectivePermissions(body.subject).exists(entry =>
-                    entry.permission == body.permission &&
-                      entry.granted_by.exists(d => scopeCovers(d.scope, body.scope))
-                  )
-                  complete(
-                    StatusCodes.OK,
-                    s"""{"subject":"\${body.subject}","permission":"\${body.permission}","scope":"\${body.scope}","allowed":$allowed}""",
-                  )
+                  val body = JsObject(
+                    "subject" -> JsString(subject), "scope" -> JsString(scope), "grant_version" -> JsNumber(version),
+                    "permissions" -> explain(subject, scope)).compactPrint
+                  jedis.set(explainKey(subject, scope), body, SetParams.setParams().ex(ExplainTtlS))
+                  complete(json(StatusCodes.OK, body))
               }
-            }
           }
         }
       }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8445).bind(route)
+    }
   }
 }
 `,
@@ -866,194 +581,475 @@ object ReadApi {
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <iostream>
+#include <chrono>
+#include <set>
 #include <string>
-#include <vector>
+
+#include "permz/catalog.h"  // catalog::covers, permissionsOf
+#include "permz/grants.h"   // grants::grantsOf; the cache is permz/cache.h (cache::effectivePermissions)
 
 using json = nlohmann::json;
 
-constexpr int kCacheTtlSeconds = 600;
+constexpr long long kExplainTtlS = 600;
 
-struct GrantStore {
-  std::vector<std::string> permissions(const std::string& subject);
-};
-
-GrantStore store;
 sw::redis::Redis redis("tcp://redis:6379");
 
-void readPermissions(const httplib::Request& req, httplib::Response& res) {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const std::string id = req.matches[1];
+std::string explainKey(const std::string& subject, const std::string& scope) { return "perm:explain:" + subject + ":" + scope; }
+
+void reply(httplib::Response& res, int status, const std::string& body) {
+  res.status = status;
+  res.set_content(body, "application/json");
+}
+
+void read_permissions(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string subject = req.matches[1];
   const std::string caller = req.get_header_value("X-Caller-Id");
-  const std::string key = "perms:" + id;
-  if (auto cached = redis.get(key)) {
-    res.status = 200;
-    res.set_content(json{{"subject", id}, {"permissions", json::parse(*cached)}}.dump(), "application/json");
-    return;
+  if (caller.empty()) return reply(res, 401, R"({"error":"X-Caller-Id is required"})");
+  const std::string scope = req.has_param("scope") ? req.get_param_value("scope") : "org";
+  if (const auto raw = redis.get(explainKey(subject, scope))) return reply(res, 200, *raw);
+  std::set<std::string> held;
+  for (const grants::Grant& g : grants::grantsOf(subject)) {
+    if (g.scope != scope) continue;
+    for (const std::string& p : catalog::permissionsOf(g.role)) held.insert(p);
   }
-  const auto permissions = store.permissions(id);
-  redis.setex(key, kCacheTtlSeconds, json(permissions).dump());
-  std::cerr << "permissions id=" << id << " caller=" << caller << "\\n";
-  res.status = 200;
-  res.set_content(json{{"subject", id}, {"permissions", permissions}}.dump(), "application/json");
+  const std::string body = json{{"subject", subject}, {"scope", scope}, {"permissions", held}}.dump();
+  redis.set(explainKey(subject, scope), body, std::chrono::seconds(kExplainTtlS));
+  reply(res, 200, body);
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/users/(\\d+)/permissions)", readPermissions);
-
-  svr.listen("0.0.0.0", 8445);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/users/([^/]+)/permissions)", read_permissions); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <iostream>
+#include <algorithm>
+#include <chrono>
 #include <map>
-#include <optional>
 #include <string>
-#include <utility>
 #include <vector>
+
+#include "permz/cache.h"    // cache::effectivePermissions
+#include "permz/catalog.h"  // catalog::covers, permissionsOf
+#include "permz/grants.h"   // grants::grantsOf
 
 using json = nlohmann::json;
 
-const std::string kAuditPermission = "permissions:read:any";
-const std::map<std::string, int> kScopeRank = {{"org", 0}, {"team", 1}, {"project", 2}};
+const std::string kVersionKey = "perm:grant_version";
+constexpr long long kExplainTtlS = 600;
 
-struct Grant {
-  std::string grant_id;
-  std::string role_id;
-  std::string scope;
-  std::vector<std::string> permissions;
-};
-
-struct GrantStore {
-  std::vector<Grant> grants(const std::string& subject);
-  long long grantVersion();
-};
-
-struct PolicyEngine {
-  bool allow(const std::string& caller, const std::string& permission, const std::string& scope);
-};
-
-GrantStore store;
-PolicyEngine engine;
 sw::redis::Redis redis("tcp://redis:6379");
 
-std::string scopeKind(const std::string& scope) {
-  const auto colon = scope.find(':');
-  return colon == std::string::npos ? scope : scope.substr(0, colon);
+std::string explainKey(const std::string& subject, const std::string& scope) { return "perm:explain:" + subject + ":" + scope; }
+
+void reply(httplib::Response& res, int status, const std::string& body) {
+  res.status = status;
+  res.set_content(body, "application/json");
 }
 
-bool scopeCovers(const std::string& held, const std::string& target) {
-  if (held == target || held == "org") return true;
-  const auto heldRank = kScopeRank.find(scopeKind(held));
-  const auto targetRank = kScopeRank.find(scopeKind(target));
-  if (heldRank == kScopeRank.end() || targetRank == kScopeRank.end()) return false;
-  return heldRank->second < targetRank->second;
-}
-
-// effectivePermissions is one entry per permission, carrying the roles and grants that produce it.
-std::vector<json> effectivePermissions(const std::string& subject) {
-  std::map<std::string, json> byPermission;
-  for (const auto& grant : store.grants(subject)) {
-    const json derivation = {{"role_id", grant.role_id}, {"scope", grant.scope}, {"grant_id", grant.grant_id}};
-    for (const auto& permission : grant.permissions) {
-      if (byPermission.count(permission) == 0) byPermission[permission] = json::array();
-      byPermission[permission].push_back(derivation);
+// Every permission subject holds at scope, sorted, each with the grants that confer it.
+json explain(const std::string& subject, const std::string& scope) {
+  std::map<std::string, json> granted_by;
+  for (const grants::Grant& g : grants::grantsOf(subject)) {
+    if (!catalog::covers(g.scope, scope)) continue;
+    for (const std::string& p : catalog::permissionsOf(g.role)) {
+      granted_by[p].push_back(json{{"grant_id", g.grant_id}, {"role", g.role}, {"scope", g.scope}});
     }
   }
-  std::vector<json> entries;
-  for (const auto& [permission, derivations] : byPermission) {
-    entries.push_back(json{{"permission", permission}, {"granted_by", derivations}});
-  }
-  return entries;
+  json out = json::array();
+  for (const auto& [permission, by] : granted_by) out.push_back(json{{"permission", permission}, {"granted_by", by}});
+  return out;
 }
 
-// cacheIsCurrent: an entry survives only while its grant_version is the current one.
-bool cacheIsCurrent(const std::optional<json>& entry, long long version) {
-  return entry.has_value() && entry->value("grant_version", -1LL) == version;
-}
-
-std::string explainPermissions(const std::string& subject) {
-  const long long version = store.grantVersion();
-  std::optional<json> cached;
-  if (auto raw = redis.get("perms:" + subject)) cached = json::parse(*raw, nullptr, false);
-  json entries;
-  if (cacheIsCurrent(cached, version)) {
-    entries = (*cached)["entries"];
-  } else {
-    entries = effectivePermissions(subject);
-    redis.set("perms:" + subject, json{{"grant_version", version}, {"entries", entries}}.dump());
-  }
-  return json{{"subject", subject}, {"grant_version", version}, {"permissions", entries}}.dump();
-}
-
-std::optional<std::pair<int, std::string>> guard(const std::string& caller, const std::string& subject) {
-  if (caller.empty()) return std::make_pair(401, R"({"error":"missing X-Caller-Id"})");
-  if (caller != subject && !engine.allow(caller, kAuditPermission, "org"))
-    return std::make_pair(403, R"({"error":"needs permissions:read:any"})");
-  return std::nullopt;
-}
-
-void readPermissions(const httplib::Request& req, httplib::Response& res) {
-  const std::string id = req.matches[1];
+void read_permissions(const httplib::Request& req, httplib::Response& res) {
+  const std::string subject = req.matches[1];
   const std::string caller = req.get_header_value("X-Caller-Id");
-  if (auto denied = guard(caller, id)) {
-    res.status = denied->first;
-    res.set_content(denied->second, "application/json");
-    return;
+  if (caller.empty()) return reply(res, 401, R"({"error":"X-Caller-Id is required"})");
+  if (caller != subject) {
+    const std::vector<std::string> held = cache::effectivePermissions(caller, "org");
+    if (std::find(held.begin(), held.end(), "permissions:read_any") == held.end()) return reply(res, 403, R"({"error":"forbidden"})");
   }
-  std::cerr << "permissions id=" << id << " caller=" << caller << "\\n";
-  res.status = 200;
-  res.set_content(explainPermissions(id), "application/json");
+  const std::string scope = req.has_param("scope") ? req.get_param_value("scope") : "org";
+  const long long version = std::stoll(redis.get(kVersionKey).value_or("0"));  // before deriving: a change meanwhile outdates what is derived
+  if (const auto raw = redis.get(explainKey(subject, scope))) {
+    const json cached = json::parse(*raw);
+    if (cached.value("grant_version", -1LL) == version) return reply(res, 200, *raw);
+  }
+  const std::string body = json{{"subject", subject}, {"scope", scope}, {"grant_version", version}, {"permissions", explain(subject, scope)}}.dump();
+  redis.set(explainKey(subject, scope), body, std::chrono::seconds(kExplainTtlS));
+  reply(res, 200, body);
 }
 
-void checkPermissions(const httplib::Request& req, httplib::Response& res) {
-  const json body = json::parse(req.body, nullptr, false);
-  if (!body.is_object() || !body.contains("subject") || !body.contains("permission") || !body.contains("scope")) {
-    res.status = 400;
-    res.set_content(R"({"error":"subject, permission and scope are required"})", "application/json");
-    return;
-  }
-  const auto subject = body["subject"].get<std::string>();
-  if (auto denied = guard(req.get_header_value("X-Caller-Id"), subject)) {
-    res.status = denied->first;
-    res.set_content(denied->second, "application/json");
-    return;
-  }
-  const auto asked = body["permission"].get<std::string>();
-  const auto scope = body["scope"].get<std::string>();
-  bool allowed = false;
-  for (const auto& entry : effectivePermissions(subject)) {
-    if (entry["permission"] != asked) continue;
-    for (const auto& derivation : entry["granted_by"]) {
-      if (scopeCovers(derivation["scope"].get<std::string>(), scope)) allowed = true;
-    }
-  }
-  res.status = 200;
-  res.set_content(
-      json{{"subject", subject}, {"permission", asked}, {"scope", scope}, {"allowed", allowed}}.dump(),
-      "application/json");
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/users/(\\d+)/permissions)", readPermissions);
-  svr.Post("/v1/permissions/check", checkPermissions);
-
-  svr.listen("0.0.0.0", 8445);
-}
+void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/users/([^/]+)/permissions)", read_permissions); }
 `,
     },
   },
+  harness: {
+    python: `from permz import cache
+
+
+def _api(ctx):
+    cache.grant_role("olu", "org_admin", "org", "root")  # g-1
+    cache.grant_role("ada", "viewer", "team:eng", "olu")  # g-2
+    cache.grant_role("ada", "developer", "team:eng", "olu")  # g-3
+    cache.grant_role("bob", "viewer", "team:ops", "olu")  # g-4
+    return ctx.client(ctx.load("read").app)
+
+
+async def _read(c, subject, caller, scope):
+    return await c.get(f"/v1/users/{subject}/permissions", params={"scope": scope}, headers={"X-Caller-Id": caller})
+
+
+def _names(body):
+    return [e.get("permission") if isinstance(e, dict) else e for e in body.get("permissions", [])]
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _read(c, "ada", "ada", "team:eng")
+        assert r.status_code == 200, f"ada reading her own permissions answered {r.status_code}: {r.text}"
+        assert r.json().get("subject") == "ada", f"the body must name the subject, got {r.text}"
+        anonymous = await c.get("/v1/users/ada/permissions")
+    assert anonymous.status_code == 401, f"a read without X-Caller-Id answered {anonymous.status_code}, expected 401"
+
+
+async def check_foreign_403(ctx):
+    async with _api(ctx) as c:
+        r = await _read(c, "ada", "bob", "team:eng")
+        assert r.status_code == 403, f"bob (viewer at team:ops) reading ada's permissions answered {r.status_code}, expected 403: only a caller with permissions:read_any may read another subject"
+        r = await _read(c, "ada", "olu", "team:eng")
+        assert r.status_code == 200, f"olu (org_admin, which confers permissions:read_any) reading ada answered {r.status_code}: {r.text}"
+        r = await _read(c, "bob", "bob", "team:ops")
+    assert r.status_code == 200, f"bob reading his own permissions answered {r.status_code}: {r.text}"
+
+
+async def check_provenance(ctx):
+    async with _api(ctx) as c:
+        r = await _read(c, "ada", "ada", "team:eng")
+    assert r.status_code == 200, f"ada reading her own permissions answered {r.status_code}: {r.text}"
+    want = [
+        {"permission": "code:write", "granted_by": [{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]},
+        {"permission": "team:read", "granted_by": [{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}, {"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]},
+    ]
+    got = r.json().get("permissions")
+    assert got == want, f"ada's permissions at team:eng are {got}, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first: {want}"
+
+
+async def check_covering_scopes(ctx):
+    async with _api(ctx) as c:
+        cache.grant_role("ada", "viewer", "project:eng/web", "olu")  # g-5, narrower than team:eng
+        r = await _read(c, "ada", "ada", "project:eng/api")
+        names = _names(r.json())
+        assert names == ["code:write", "team:read"], f"ada's permissions at project:eng/api are {names}: her grants at team:eng cover the team's projects, expected code:write and team:read"
+        r = await _read(c, "olu", "olu", "team:ops")
+        assert "team:write" in _names(r.json()), f"olu's permissions at team:ops are {_names(r.json())}: an org grant covers every team"
+        r = await _read(c, "ada", "ada", "team:ops")
+        assert _names(r.json()) == [], f"ada's permissions at team:ops are {_names(r.json())}: team:eng does not cover team:ops"
+        r = await _read(c, "ada", "ada", "team:eng")
+    listed = str(r.json())
+    assert "g-5" not in listed, f"ada's read at team:eng lists g-5, a grant at project:eng/web: a project grant does not reach its team ({listed})"
+
+
+async def check_fresh_cache(ctx):
+    async with _api(ctx) as c:
+        r = await _read(c, "ada", "ada", "team:eng")
+        assert "code:write" in _names(r.json()), f"ada (developer at team:eng) must hold code:write there, got {r.text}"
+        cache.revoke_grant("g-3")  # writes the grant store, then bumps perm:grant_version
+        r = await _read(c, "ada", "ada", "team:eng")
+    names = _names(r.json())
+    assert "code:write" not in names, f"after ada's developer grant was revoked her permissions still list {names}: a cached body counts only at the grant version it was derived at"
+    assert names == ["team:read"], f"after the revocation ada's permissions at team:eng are {names}, expected team:read"
+`,
+    typescript: `async function api(ctx) {
+  const cache = ctx.load('/support/permz/cache.ts');
+  await cache.grantRole('olu', 'org_admin', 'org', 'root'); // g-1
+  await cache.grantRole('ada', 'viewer', 'team:eng', 'olu'); // g-2
+  await cache.grantRole('ada', 'developer', 'team:eng', 'olu'); // g-3
+  await cache.grantRole('bob', 'viewer', 'team:ops', 'olu'); // g-4
+  return {c: ctx.client(ctx.load('read').app), cache};
+}
+
+const read = (c, subject: string, caller: string, scope: string) =>
+  c.get(\`/v1/users/\${subject}/permissions?scope=\${encodeURIComponent(scope)}\`, {headers: {'X-Caller-Id': caller}});
+
+const names = (r): string[] => (r.json().permissions ?? []).map(e => (typeof e === 'string' ? e : e.permission));
+
+export async function check_route(ctx) {
+  const {c} = await api(ctx);
+  const r = await read(c, 'ada', 'ada', 'team:eng');
+  assert.equal(r.status, 200, \`ada reading her own permissions answered \${r.status}: \${r.text}\`);
+  assert.equal(r.json().subject, 'ada', \`the body must name the subject, got \${r.text}\`);
+  const anonymous = await c.get('/v1/users/ada/permissions');
+  assert.equal(anonymous.status, 401, \`a read without X-Caller-Id answered \${anonymous.status}, expected 401\`);
+}
+
+export async function check_foreign_403(ctx) {
+  const {c} = await api(ctx);
+  let r = await read(c, 'ada', 'bob', 'team:eng');
+  assert.equal(r.status, 403, \`bob (viewer at team:ops) reading ada's permissions answered \${r.status}, expected 403: only a caller with permissions:read_any may read another subject\`);
+  r = await read(c, 'ada', 'olu', 'team:eng');
+  assert.equal(r.status, 200, \`olu (org_admin, which confers permissions:read_any) reading ada answered \${r.status}: \${r.text}\`);
+  r = await read(c, 'bob', 'bob', 'team:ops');
+  assert.equal(r.status, 200, \`bob reading his own permissions answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_provenance(ctx) {
+  const {c} = await api(ctx);
+  const r = await read(c, 'ada', 'ada', 'team:eng');
+  assert.equal(r.status, 200, \`ada reading her own permissions answered \${r.status}: \${r.text}\`);
+  const want = [
+    {permission: 'code:write', granted_by: [{grant_id: 'g-3', role: 'developer', scope: 'team:eng'}]},
+    {permission: 'team:read', granted_by: [{grant_id: 'g-2', role: 'viewer', scope: 'team:eng'}, {grant_id: 'g-3', role: 'developer', scope: 'team:eng'}]},
+  ];
+  const got = r.json().permissions;
+  assert.deepStrictEqual(got, want, \`ada's permissions at team:eng are \${JSON.stringify(got)}, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first\`);
+}
+
+export async function check_covering_scopes(ctx) {
+  const {c, cache} = await api(ctx);
+  await cache.grantRole('ada', 'viewer', 'project:eng/web', 'olu'); // g-5, narrower than team:eng
+  let r = await read(c, 'ada', 'ada', 'project:eng/api');
+  assert.deepStrictEqual(names(r), ['code:write', 'team:read'], \`ada's permissions at project:eng/api are \${JSON.stringify(names(r))}: her grants at team:eng cover the team's projects, expected code:write and team:read\`);
+  r = await read(c, 'olu', 'olu', 'team:ops');
+  assert(names(r).includes('team:write'), \`olu's permissions at team:ops are \${JSON.stringify(names(r))}: an org grant covers every team\`);
+  r = await read(c, 'ada', 'ada', 'team:ops');
+  assert.deepStrictEqual(names(r), [], \`ada's permissions at team:ops are \${JSON.stringify(names(r))}: team:eng does not cover team:ops\`);
+  r = await read(c, 'ada', 'ada', 'team:eng');
+  assert(!r.text.includes('g-5'), \`ada's read at team:eng lists g-5, a grant at project:eng/web: a project grant does not reach its team (\${r.text})\`);
+}
+
+export async function check_fresh_cache(ctx) {
+  const {c, cache} = await api(ctx);
+  let r = await read(c, 'ada', 'ada', 'team:eng');
+  assert(names(r).includes('code:write'), \`ada (developer at team:eng) must hold code:write there, got \${r.text}\`);
+  await cache.revokeGrant('g-3'); // writes the grant store, then bumps perm:grant_version
+  r = await read(c, 'ada', 'ada', 'team:eng');
+  assert(!names(r).includes('code:write'), \`after ada's developer grant was revoked her permissions still list \${JSON.stringify(names(r))}: a cached body counts only at the grant version it was derived at\`);
+  assert.deepStrictEqual(names(r), ['team:read'], \`after the revocation ada's permissions at team:eng are \${JSON.stringify(names(r))}, expected team:read\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"permz/cache"
+
+	"leetbuild/harness"
+)
+
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
+	bg := context.Background()
+	cache.GrantRole(bg, "olu", "org_admin", "org", "root")    // g-1
+	cache.GrantRole(bg, "ada", "viewer", "team:eng", "olu")   // g-2
+	cache.GrantRole(bg, "ada", "developer", "team:eng", "olu") // g-3
+	cache.GrantRole(bg, "bob", "viewer", "team:ops", "olu")   // g-4
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func readAs(c *harness.HTTP, subject, caller, scope string) *harness.Response {
+	return c.Get("/v1/users/"+subject+"/permissions?scope="+url.QueryEscape(scope), "X-Caller-Id", caller)
+}
+
+type readBody struct {
+	Subject     string            \`json:"subject"\`
+	Permissions []json.RawMessage \`json:"permissions"\`
+}
+
+// permissionNames lists the permissions of a body whose entries are names or {permission, …} objects.
+func permissionNames(r *harness.Response) []string {
+	var body readBody
+	r.Decode(&body)
+	out := []string{}
+	for _, raw := range body.Permissions {
+		var name string
+		if json.Unmarshal(raw, &name) == nil {
+			out = append(out, name)
+			continue
+		}
+		var e struct {
+			Permission string \`json:"permission"\`
+		}
+		json.Unmarshal(raw, &e)
+		out = append(out, e.Permission)
+	}
+	return out
+}
+
+func has(names []string, p string) bool {
+	for _, n := range names {
+		if n == p {
+			return true
+		}
+	}
+	return false
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	r := readAs(c, "ada", "ada", "team:eng")
+	ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text())
+	var body readBody
+	r.Decode(&body)
+	ctx.Equal(body.Subject, "ada", "the body must name the subject (%s)", r.Text())
+	ctx.Equal(c.Get("/v1/users/ada/permissions").Status, 401, "a read without X-Caller-Id")
+}
+
+func CheckForeign403(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	ctx.Equal(readAs(c, "ada", "bob", "team:eng").Status, 403, "bob (viewer at team:ops) reading ada's permissions must be refused: only a caller with permissions:read_any may read another subject; the status")
+	r := readAs(c, "ada", "olu", "team:eng")
+	ctx.Equal(r.Status, 200, "olu (org_admin, which confers permissions:read_any) reading ada (%s)", r.Text())
+	r = readAs(c, "bob", "bob", "team:ops")
+	ctx.Equal(r.Status, 200, "bob reading his own permissions (%s)", r.Text())
+}
+
+func CheckProvenance(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	r := readAs(c, "ada", "ada", "team:eng")
+	ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text())
+	var body struct {
+		Permissions any \`json:"permissions"\`
+	}
+	r.Decode(&body)
+	want := []any{
+		map[string]any{"permission": "code:write", "granted_by": []any{map[string]any{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}}},
+		map[string]any{"permission": "team:read", "granted_by": []any{
+			map[string]any{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"},
+			map[string]any{"grant_id": "g-3", "role": "developer", "scope": "team:eng"},
+		}},
+	}
+	ctx.Equal(body.Permissions, want, "ada's permissions at team:eng must each name the grants that confer them (granted_by: grant_id, role, scope), oldest first")
+}
+
+func CheckCoveringScopes(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	cache.GrantRole(context.Background(), "ada", "viewer", "project:eng/web", "olu") // g-5, narrower than team:eng
+	ctx.Equal(permissionNames(readAs(c, "ada", "ada", "project:eng/api")), []string{"code:write", "team:read"}, "ada's grants at team:eng cover the team's projects; her permissions at project:eng/api")
+	names := permissionNames(readAs(c, "olu", "olu", "team:ops"))
+	ctx.Assert(has(names, "team:write"), "olu's permissions at team:ops are %v: an org grant covers every team", names)
+	ctx.Equal(permissionNames(readAs(c, "ada", "ada", "team:ops")), []string{}, "team:eng does not cover team:ops; ada's permissions there")
+	r := readAs(c, "ada", "ada", "team:eng")
+	ctx.Assert(!strings.Contains(r.Text(), "g-5"), "ada's read at team:eng lists g-5, a grant at project:eng/web: a project grant does not reach its team (%s)", r.Text())
+}
+
+func CheckFreshCache(ctx *harness.Ctx) {
+	c := readAPI(ctx)
+	r := readAs(c, "ada", "ada", "team:eng")
+	ctx.Assert(has(permissionNames(r), "code:write"), "ada (developer at team:eng) must hold code:write there, got %s", r.Text())
+	cache.RevokeGrant(context.Background(), "g-3") // writes the grant store, then bumps perm:grant_version
+	names := permissionNames(readAs(c, "ada", "ada", "team:eng"))
+	ctx.Assert(!has(names, "code:write"), "after ada's developer grant was revoked her permissions still list %v: a cached body counts only at the grant version it was derived at", names)
+	ctx.Equal(names, []string{"team:read"}, "after the revocation, ada's permissions at team:eng")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "permz/cache.h"
+
+namespace {
+
+harness::HTTP readApi(harness::Ctx& ctx) {
+  cache::grantRole("olu", "org_admin", "org", "root");     // g-1
+  cache::grantRole("ada", "viewer", "team:eng", "olu");    // g-2
+  cache::grantRole("ada", "developer", "team:eng", "olu");  // g-3
+  cache::grantRole("bob", "viewer", "team:ops", "olu");    // g-4
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response readAs(harness::HTTP& c, const std::string& subject, const std::string& caller, const std::string& scope) {
+  return c.Get("/v1/users/" + subject + "/permissions?scope=" + scope, "X-Caller-Id", caller);
+}
+
+nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+// The permissions of a body whose entries are names or {permission, …} objects.
+std::vector<std::string> permissionNames(const harness::Response& r) {
+  const auto body = bodyOf(r);
+  std::vector<std::string> out;
+  if (!body.is_object() || !body.contains("permissions") || !body["permissions"].is_array()) return out;
+  for (const auto& e : body["permissions"]) out.push_back(e.is_string() ? e.get<std::string>() : e.value("permission", ""));
+  return out;
+}
+
+bool has(const std::vector<std::string>& names, const std::string& p) { return std::find(names.begin(), names.end(), p) != names.end(); }
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const auto r = readAs(c, "ada", "ada", "team:eng");
+  ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text());
+  const auto body = bodyOf(r);
+  ctx.Assert(body.is_object() && body.value("subject", "") == "ada", "the body must name the subject, got %s", r.Text());
+  ctx.Equal(c.Get("/v1/users/ada/permissions").Status, 401, "a read without X-Caller-Id");
+}
+
+void CheckForeign403(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  ctx.Equal(readAs(c, "ada", "bob", "team:eng").Status, 403, "bob (viewer at team:ops) reading ada's permissions must be refused: only a caller with permissions:read_any may read another subject; the status");
+  auto r = readAs(c, "ada", "olu", "team:eng");
+  ctx.Equal(r.Status, 200, "olu (org_admin, which confers permissions:read_any) reading ada (%s)", r.Text());
+  r = readAs(c, "bob", "bob", "team:ops");
+  ctx.Equal(r.Status, 200, "bob reading his own permissions (%s)", r.Text());
+}
+
+void CheckProvenance(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const auto r = readAs(c, "ada", "ada", "team:eng");
+  ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text());
+  const nlohmann::json want = nlohmann::json::parse(R"([
+    {"permission": "code:write", "granted_by": [{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]},
+    {"permission": "team:read", "granted_by": [{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}, {"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]}
+  ])");
+  const auto body = bodyOf(r);
+  const nlohmann::json got = body.is_object() && body.contains("permissions") ? body["permissions"] : nlohmann::json();
+  ctx.Assert(got == want, "ada's permissions at team:eng are %s, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first: %s", got.dump(), want.dump());
+}
+
+void CheckCoveringScopes(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  cache::grantRole("ada", "viewer", "project:eng/web", "olu");  // g-5, narrower than team:eng
+  ctx.Equal(permissionNames(readAs(c, "ada", "ada", "project:eng/api")), {"code:write", "team:read"}, "ada's grants at team:eng cover the team's projects; her permissions at project:eng/api");
+  const auto names = permissionNames(readAs(c, "olu", "olu", "team:ops"));
+  ctx.Assert(has(names, "team:write"), "olu's permissions at team:ops are %v: an org grant covers every team", names);
+  ctx.Equal(permissionNames(readAs(c, "ada", "ada", "team:ops")), std::vector<std::string>{}, "team:eng does not cover team:ops; ada's permissions there");
+  const auto r = readAs(c, "ada", "ada", "team:eng");
+  ctx.Assert(r.Text().find("g-5") == std::string::npos, "ada's read at team:eng lists g-5, a grant at project:eng/web: a project grant does not reach its team (%s)", r.Text());
+}
+
+void CheckFreshCache(harness::Ctx& ctx) {
+  auto c = readApi(ctx);
+  const auto r = readAs(c, "ada", "ada", "team:eng");
+  ctx.Assert(has(permissionNames(r), "code:write"), "ada (developer at team:eng) must hold code:write there, got %s", r.Text());
+  cache::revokeGrant("g-3");  // writes the grant store, then bumps perm:grant_version
+  const auto names = permissionNames(readAs(c, "ada", "ada", "team:eng"));
+  ctx.Assert(!has(names, "code:write"), "after ada's developer grant was revoked her permissions still list %v: a cached body counts only at the grant version it was derived at", names);
+  ctx.Equal(names, {"team:read"}, "after the revocation, ada's permissions at team:eng");
+}
+`,
+  },
   hints: [
-    'Any signed-in user can fetch `/v1/users/user:ada/permissions` and sees a flat list of strings. Revoke one of them; the list keeps showing it for up to ten minutes.',
-    'The starter reads `caller` and only logs it, returns `sorted(store.permissions(id))` with no roles or grants attached, and trusts `perms:{id}` until `CACHE_TTL_S` expires with no version to compare against.',
-    'Compare `X-Caller-Id` with `{id}` (403 unless `permissions:read:any`), fold grants into `granted_by` in `explain_permissions`, share `effective_permissions` with `POST /v1/permissions/check`, and gate the cache on `cache_is_current` against `grant_version`.',
+    "Ask for someone else's permissions with your own `X-Caller-Id`: they come back. Ask a team developer's permissions at one of the team's projects: the list is empty. Revoke a grant: the list keeps it for ten minutes.",
+    'The handler never compares the caller with the subject, keeps only grants whose scope string equals the asked one, merges every permission into one set (losing the grant behind each), and serves its copy until the TTL ends.',
+    'Return 403 unless `caller == id` or `cache.effective_permissions(caller, "org")` has `permissions:read_any`; keep grants where `catalog.covers(grant_scope, scope)`; build `{permission, granted_by: [{grant_id, role, scope}]}`; stamp `grant_version` read first and serve a copy only when equal.',
   ],
-  debrief: `The read is shaped like an authorization decision because that is what it is. Provenance comes out of the same fold that decides the answer, so when a permission is wrong someone can say which role or grant produced it, and the live check calls that fold instead of re-deriving it, so the list and the enforcement point cannot drift. The cache is stamped with \`grant_version\` and a mismatch recomputes, because a TTL is a deadline a revocation has to wait out. The ownership check runs before any subject data is loaded, since a permissions read is the endpoint an attacker would enumerate. Production systems add an audit record of every read with the caller's identity, and pagination for subjects with thousands of grants.`,
+  debrief: `The read is shaped like an authorization decision because it is one. Provenance comes out of the same fold over grants that decides the answer, so when a permission is wrong someone can name the grant to revoke, and \`covers\` is the same containment rule the write path enforces, so the list and the enforcement point cannot disagree about scopes. The ownership check runs before any data is loaded, since this is the endpoint an attacker would enumerate. Stamping the copy with \`grant_version\` makes a revocation visible on the next read instead of after the TTL. Production systems audit every foreign read with the caller's identity and page the list for subjects with thousands of grants.`,
 };

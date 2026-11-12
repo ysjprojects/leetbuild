@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package usagemeter;
+
+// The billing service step 3 hands a closed usage window to. It dedupes on close_id: a second
+// ClosePeriod with an id it has seen answers what the first one billed and bills nothing new.
+service Billing {
+  rpc ClosePeriod(ClosePeriodRequest) returns (ClosePeriodReply);
+}
+
+message ClosePeriodRequest {
+  string close_id = 1;
+  string account = 2;
+  int64 window = 3;
+  int64 total_units = 4;
+}
+
+message ClosePeriodReply {
+  string close_id = 1;
+  int64 billed_units = 2;
+}

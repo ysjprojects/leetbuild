@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package ticketcrm;
+
+// The CRM step 3 pushes every committed note to: SyncNote records the note against the customer's
+// CRM record. A request whose idempotency_key the CRM has seen updates that record instead of
+// adding one (duplicate = true). A note the CRM's schema refuses is INVALID_ARGUMENT.
+service Crm {
+  rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply);
+}
+
+message SyncNoteRequest {
+  string note_id = 1;
+  string ticket_id = 2;
+  string author = 3;
+  string body = 4;
+  string idempotency_key = 5;
+}
+
+message SyncNoteReply {
+  string crm_note_id = 1;
+  bool duplicate = 2;
+}

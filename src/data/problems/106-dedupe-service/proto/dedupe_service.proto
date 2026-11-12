@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package dedupd;
+
+// The similarity service step 3 asks for fuzzy candidates: records of one tenant whose text resembles
+// the candidate text, best first, each with a score in [0, 1].
+service Similarity {
+  rpc Resolve(ResolveRequest) returns (ResolveReply);
+}
+
+message ResolveRequest {
+  string tenant = 1;
+  string text = 2;
+  int32 limit = 3;
+}
+
+message Candidate {
+  string record_id = 1;
+  double score = 2;
+}
+
+message ResolveReply {
+  repeated Candidate candidates = 1;
+}

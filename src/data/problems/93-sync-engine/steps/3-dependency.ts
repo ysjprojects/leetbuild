@@ -4,360 +4,256 @@ export const mergeClientStep: Step = {
   id: 'dependency',
   concept: 'grpc',
   file: 'client',
-  title: 'Merge calls that surface conflicts instead of picking winners',
-  focus: ['sync', 'merger', 'revisions'],
+  title: 'Three-way merges over gRPC that keep both edits when they fail',
+  focus: ['sync', 'merger', 'redis'],
   task: `## Task
 
-**Starting point.** The starter's \`three_way_merge\` builds a \`MergeRequest\`, calls the merge
-service in a \`while True\` loop with no deadline, returns the merged body on success and, when the
-call raises, returns whichever of local and remote has the later \`uploaded_at\`. It compiles, the
-demo merge succeeds, and it hides five flaws.
+**Starting point.** The starter's \`resolve_conflict(doc_id, base_revision, body, device)\` runs for
+each conflict a push answered: it reads the head and the body at \`base_revision\`, asks
+\`Merger.ThreeWayMerge(doc_id, base_revision, base, local, remote)\` at \`merger:9000\`, applies the
+merged body against the head's revision and answers \`{"status": "merged", "revision"}\`. On any
+error it sleeps a second and asks again, five times, then applies the device's body. It merges the
+demo edits and hides four flaws.
 
-**Failure mode the checks target.** The merge service hangs and every push on the box stays open
-behind it. The service rejects three revisions as unmergeable and the client asks again, forever.
-When a call finally fails, the client picks the newer upload and the other edit vanishes while the
-user sees a synced document.
+**Failure mode the checks target.** The merger hangs and the push behind it stays open. The merger
+refuses two edits of the same line and is asked four more times. It restarts for a minute, and the
+laptop's edit is written over the phone's while both users are told the document merged.
 
-Requirements:
-
-- The merge runs over gRPC as \`ThreeWayMerge(doc_id, base_revision, local_revision, remote_revision)\`
-  with a **2-second deadline** per attempt (\`MERGE_DEADLINE_S\`). A merge that has not answered in
-  two seconds is a failed merge, not a request to hold the push open.
-- At most **two attempts** (\`MAX_MERGE_ATTEMPTS\`), and only \`UNAVAILABLE\` and
-  \`DEADLINE_EXCEEDED\` are retried: those are the failures where trying again can change the answer.
-- A rejection is terminal. \`FAILED_PRECONDITION\` (\`REJECTED\`) means the service has decided these
-  revisions are not mergeable; retrying it burns the push worker and returns nothing.
-- A failed merge marks the document conflicted (\`conflicted(...)\`) and retains both the local and
-  the remote revision for the user to resolve. There is no winner.
-- No failure path picks a side by upload time.`,
+- Every call carries a **2-second deadline** (\`MERGE_DEADLINE_S\`).
+- At most **\`MAX_MERGE_ATTEMPTS\` (2)** calls, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`
+  are retried.
+- Any other error, \`FAILED_PRECONDITION\` included, is final: no retry, no sleep.
+- When the merge fails the head stays as it is: keep the device's edit with
+  \`store.mark_conflicted(doc_id, device, base_revision, body)\` and answer
+  \`{"status": "conflicted", "revision"}\` with the head's revision.`,
   sequence: {
-    participants: ['Sync Engine', 'Merge service', 'revisions'],
+    participants: ['syncd', 'Redis', 'Merger'],
     messages: [
-      {from: 'Sync Engine', to: 'Merge service', label: 'ThreeWayMerge · deadline 2 s', kind: 'sync'},
-      {from: 'Merge service', to: 'Sync Engine', label: 'OK {revision, body}', kind: 'reply'},
-      {from: 'Merge service', to: 'Sync Engine', label: 'UNAVAILABLE / DEADLINE_EXCEEDED → one retry', kind: 'reply'},
-      {from: 'Merge service', to: 'Sync Engine', label: 'FAILED_PRECONDITION → terminal', kind: 'reply'},
-      {from: 'Sync Engine', to: 'revisions', label: 'record conflicted(base, local, remote)', kind: 'sync'},
-      {
-        from: 'revisions',
-        to: 'Sync Engine',
-        label: 'conflicted document · both revisions retained',
-        kind: 'reply',
-      },
+      {from: 'syncd', to: 'Redis', label: 'head(doc) · body_at(doc, base)', kind: 'sync'},
+      {from: 'syncd', to: 'Merger', label: 'ThreeWayMerge(base, local, remote) · 2 s', kind: 'sync'},
+      {from: 'Merger', to: 'syncd', label: 'body · UNAVAILABLE (retry once) · FAILED_PRECONDITION', kind: 'reply'},
+      {from: 'syncd', to: 'Redis', label: 'apply_change(merged, head revision) → merged', kind: 'sync'},
+      {from: 'syncd', to: 'Redis', label: 'failed: mark_conflicted(doc, device, base, body)', kind: 'async'},
     ],
   },
   checks: [
     {
       id: 'deadline',
-      title: 'Every merge attempt carries a 2-second deadline',
+      title: 'Every merge call carries a 2-second deadline',
       detail:
-        'The call is created with a 2 s deadline: `timeout=MERGE_DEADLINE_S`, `deadline: Date.now() + MERGE_DEADLINE_MS`, a context with timeout, `withDeadlineAfter` or `set_deadline`. The starter has no deadline, so one stuck merge holds the push open.',
+        'Each `ThreeWayMerge` call carries `MERGE_DEADLINE_S` (2 s) as its deadline, so a merger that hangs costs the push two seconds per attempt instead of holding it open.',
       match: {
-        python: {all: [/MERGE_DEADLINE_S\s*=\s*2\.0/, /timeout=MERGE_DEADLINE_S/]},
-        typescript: {all: [/MERGE_DEADLINE_MS\s*=\s*2000/, /deadline:\s*Date\.now\(\)\s*\+\s*MERGE_DEADLINE_MS/]},
-        go: {all: [/mergeDeadline\s*=\s*2\s*\*\s*time\.Second/, /context\.WithTimeout\(ctx, mergeDeadline\)/]},
-        scala: {all: [/MergeDeadlineMs\s*=\s*2000/, /withDeadlineAfter\(/]},
-        cpp: {all: [/kMergeDeadlineMs\s*=\s*2000/, /set_deadline\(/]},
+        python: {all: [/timeout\s*=\s*MERGE_DEADLINE_S/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*MERGE_DEADLINE_MS/]},
+        go: {all: [/context\.WithTimeout\([^)]*mergeDeadline/]},
+        scala: {all: [/withDeadlineAfter\(\s*MergeDeadlineMs/]},
+        cpp: {all: [/set_deadline\([^;]*kMergeDeadline/]},
       },
     },
     {
-      id: 'bounded-retries',
-      title: 'At most two attempts, only the two retryable codes',
+      id: 'retry-transient',
+      title: 'Retries UNAVAILABLE and DEADLINE_EXCEEDED, at most twice in all',
       detail:
-        'Attempts are bounded by `MAX_MERGE_ATTEMPTS = 2` and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; there is no unbounded retry loop. The starter retries every failure forever.',
+        'A merger that did not answer is asked again, up to `MAX_MERGE_ATTEMPTS` (2) calls in all; one that stays down is given up on after the second.',
       match: {
-        python: {
-          all: [
-            /MAX_MERGE_ATTEMPTS\s*=\s*2/,
-            /range\(MAX_MERGE_ATTEMPTS\)/,
-            /StatusCode\.UNAVAILABLE/,
-            /StatusCode\.DEADLINE_EXCEEDED/,
-          ],
-          none: [/while\s+True/],
-        },
-        typescript: {
-          all: [
-            /MAX_MERGE_ATTEMPTS\s*=\s*2/,
-            /attempt\s*<\s*MAX_MERGE_ATTEMPTS/,
-            /grpc\.status\.UNAVAILABLE/,
-            /grpc\.status\.DEADLINE_EXCEEDED/,
-          ],
-          none: [/for\s*\(\s*;\s*;\s*\)/],
-        },
-        go: {
-          all: [
-            /maxMergeAttempts\s*=\s*2/,
-            /attempt\s*<\s*maxMergeAttempts/,
-            /codes\.Unavailable/,
-            /codes\.DeadlineExceeded/,
-          ],
-          none: [/for\s*\{/],
-        },
-        scala: {
-          all: [/MaxMergeAttempts\s*=\s*2/, /attempt\s*<\s*MaxMergeAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
-        cpp: {
-          all: [
-            /kMaxMergeAttempts\s*=\s*2/,
-            /attempt\s*<\s*kMaxMergeAttempts/,
-            /StatusCode::UNAVAILABLE/,
-            /StatusCode::DEADLINE_EXCEEDED/,
-          ],
-          none: [/while\s*\(\s*true\s*\)/],
-        },
+        python: {all: [/MAX_MERGE_ATTEMPTS/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        typescript: {all: [/MAX_MERGE_ATTEMPTS/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        go: {all: [/maxMergeAttempts/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
+        scala: {all: [/MaxMergeAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
+        cpp: {all: [/kMaxMergeAttempts/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
       },
     },
     {
       id: 'rejection-terminal',
-      title: 'A merge rejection is terminal',
+      title: 'A refused merge is final',
       detail:
-        '`FAILED_PRECONDITION`, the service’s "these revisions are not mergeable", stops the retry loop instead of being retried. The starter treats every failure as retryable and loops forever on a rejection.',
+        'The status code decides: `FAILED_PRECONDITION` (edits that overlap) and every code other than the two transient ones end the merge at once, with no sleep and no second call.',
       match: {
-        python: {all: [/REJECTED\s*=\s*grpc\.StatusCode\.FAILED_PRECONDITION/, /error\.code\(\)\s*==\s*REJECTED/]},
-        typescript: {all: [/REJECTED\s*=\s*grpc\.status\.FAILED_PRECONDITION/, /code === REJECTED/]},
-        go: {all: [/rejectedStatus\s*=\s*codes\.FailedPrecondition/, /code == rejectedStatus/]},
-        scala: {all: [/Rejected\s*=\s*Status\.Code\.FAILED_PRECONDITION/, /code == Rejected/]},
-        cpp: {all: [/kRejected\s*=\s*grpc::StatusCode::FAILED_PRECONDITION/, /error_code\(\)\s*==\s*kRejected/]},
+        python: {all: [/\.code\(\)/], none: [/time\.sleep\(/]},
+        typescript: {all: [/ServiceError/], none: [/setTimeout\(/]},
+        go: {all: [/status\.Code\(/], none: [/time\.Sleep\(/]},
+        scala: {all: [/getStatus\.getCode/], none: [/Thread\.sleep\(/]},
+        cpp: {all: [/error_code\(\)/], none: [/sleep_for\(/]},
       },
     },
     {
-      id: 'conflicted-retains-both',
-      title: 'A failed merge keeps both revisions',
+      id: 'keep-both',
+      title: 'A failed merge keeps the head and the device’s edit',
       detail:
-        'The failure path records a conflicted document that carries the local **and** the remote revision; nothing is discarded. The starter returns the winner it picked and never records a conflict.',
+        'When the merge fails the head is left as it is and the device’s edit is kept with `mark_conflicted`/`markConflicted`; nothing applies the device’s body over the head.',
       match: {
-        python: {all: [/def conflicted\(/, /"conflicted"/, /\blocal\b/, /\bremote\b/]},
-        typescript: {all: [/function conflicted\(/, /'conflicted'/, /local, remote/]},
-        go: {all: [/func conflicted\(/, /"conflicted"/, /Local: local/, /Remote: remote/]},
-        scala: {all: [/def conflicted\(/, /"conflicted"/, /localRevision = local/, /remoteRevision = remote/]},
-        cpp: {all: [/MergeOutcome conflicted\(/, /"conflicted"/, /outcome\.local = local/, /outcome\.remote = remote/]},
-      },
-    },
-    {
-      id: 'no-last-write-wins',
-      title: 'No failure path resolves by upload time',
-      detail:
-        'Nothing in the client compares upload times to pick a side: a merge failure is a conflict, not a winner. The starter compares `uploaded_at` and silently drops the losing edit.',
-      match: {
-        python: {all: [/conflicted\(/], none: [/uploaded_at/]},
-        typescript: {all: [/conflicted\(/], none: [/uploaded_at/]},
-        go: {all: [/conflicted\(/], none: [/UploadedAt/]},
-        scala: {all: [/conflicted\(/], none: [/uploadedAt/]},
-        cpp: {all: [/conflicted\(/], none: [/uploadedAt/]},
+        python: {all: [/store\.mark_conflicted\(/], none: [/store\.content_hash\(body\)/]},
+        typescript: {all: [/markConflicted\(/], none: [/contentHash\(body\)/]},
+        go: {all: [/store\.MarkConflicted\(/], none: [/store\.ContentHash\(body\)/]},
+        scala: {all: [/Store\.markConflicted\(/], none: [/Store\.contentHash\(body\)/]},
+        cpp: {all: [/store::markConflicted\(/], none: [/store::contentHash\(body\)/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import grpc
+      starter: `import time
 
-import merge_pb2
-import merge_pb2_grpc
+import grpc
 
-stub = merge_pb2_grpc.MergeServiceStub(grpc.insecure_channel("merger:9000"))
+import sync_engine_pb2
+import sync_engine_pb2_grpc
+from docsync import store  # head, body_at, content_hash, mark_conflicted
+from docsync.revisions import apply_change
+
+merger = sync_engine_pb2_grpc.MergerStub(grpc.insecure_channel("merger:9000"))
 
 
-def three_way_merge(doc_id: str, base: dict, local: dict, remote: dict) -> dict:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    request = merge_pb2.MergeRequest(
-        doc_id=doc_id,
-        base_revision=base["revision"],
-        local_revision=local["revision"],
-        remote_revision=remote["revision"],
+def resolve_conflict(doc_id: str, base_revision: int, body: str, device: str) -> dict:
+    """Merge the device's edit of base_revision into the head: {"status": "merged" | "conflicted", "revision"}."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    head = store.head(doc_id)
+    request = sync_engine_pb2.MergeRequest(
+        doc_id=doc_id, base_revision=base_revision, base=store.body_at(doc_id, base_revision) or "", local=body, remote=head["body"]
     )
-    while True:
+    for attempt in range(5):
         try:
-            reply = stub.ThreeWayMerge(request)
-            return {"status": "merged", "revision": reply.revision, "body": reply.body}
+            merged = merger.ThreeWayMerge(request)
+            outcome = apply_change(doc_id, head["revision"], store.content_hash(merged.body), merged.body, device)
+            return {"status": "merged", "revision": outcome["revision"]}
         except grpc.RpcError:
-            if local["uploaded_at"] > remote["uploaded_at"]:
-                return {"status": "merged", "revision": local["revision"], "body": local["body"]}
-            return {"status": "merged", "revision": remote["revision"], "body": remote["body"]}
+            time.sleep(1.0)  # the merger is busy: give it a moment
+    # The merger is down: the device's edit is the newest, keep it.
+    outcome = apply_change(doc_id, head["revision"], store.content_hash(body), body, device)
+    return {"status": "merged", "revision": outcome["revision"]}
 `,
       solution: `import grpc
 
-import merge_pb2
-import merge_pb2_grpc
+import sync_engine_pb2
+import sync_engine_pb2_grpc
+from docsync import store  # head, body_at, content_hash, mark_conflicted
+from docsync.revisions import apply_change
 
-MERGE_DEADLINE_S = 2.0
+MERGE_DEADLINE_S = 2
 MAX_MERGE_ATTEMPTS = 2
-RETRYABLE = {grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED}
-REJECTED = grpc.StatusCode.FAILED_PRECONDITION
+RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
 
-stub = merge_pb2_grpc.MergeServiceStub(grpc.insecure_channel("merger:9000"))
-
-
-def conflicted(doc_id: str, base_revision: int, local: dict, remote: dict) -> dict:
-    """A conflicted document keeps both revisions: the user resolves it, not the server."""
-    return {
-        "status": "conflicted",
-        "doc_id": doc_id,
-        "base_revision": base_revision,
-        "local": local,
-        "remote": remote,
-    }
+merger = sync_engine_pb2_grpc.MergerStub(grpc.insecure_channel("merger:9000"))
 
 
-def record_conflict(doc_id: str, outcome: dict) -> None:
-    """Persist the conflict so both devices can fetch it and let the user resolve it."""
-    raise NotImplementedError
-
-
-def three_way_merge(doc_id: str, base: dict, local: dict, remote: dict) -> dict:
-    request = merge_pb2.MergeRequest(
-        doc_id=doc_id,
-        base_revision=base["revision"],
-        local_revision=local["revision"],
-        remote_revision=remote["revision"],
+def resolve_conflict(doc_id: str, base_revision: int, body: str, device: str) -> dict:
+    """Merge the device's edit of base_revision into the head: {"status": "merged" | "conflicted", "revision"}."""
+    head = store.head(doc_id)
+    request = sync_engine_pb2.MergeRequest(
+        doc_id=doc_id, base_revision=base_revision, base=store.body_at(doc_id, base_revision) or "", local=body, remote=head["body"]
     )
-    for _ in range(MAX_MERGE_ATTEMPTS):
+    for attempt in range(1, MAX_MERGE_ATTEMPTS + 1):
         try:
-            reply = stub.ThreeWayMerge(request, timeout=MERGE_DEADLINE_S)
-            return {"status": "merged", "revision": reply.revision, "body": reply.body}
-        except grpc.RpcError as error:
-            if error.code() == REJECTED:
-                # Terminal: these revisions are not mergeable, and a retry cannot change that.
-                break
-            if error.code() not in RETRYABLE:
-                break
-    outcome = conflicted(doc_id, base["revision"], local, remote)
-    record_conflict(doc_id, outcome)
-    return outcome
+            merged = merger.ThreeWayMerge(request, timeout=MERGE_DEADLINE_S)
+            break
+        except grpc.RpcError as exc:
+            # Only a merger that did not answer may answer differently next time; a refusal is final.
+            if exc.code() in RETRYABLE and attempt < MAX_MERGE_ATTEMPTS:
+                continue
+            store.mark_conflicted(doc_id, device, base_revision, body)
+            return {"status": "conflicted", "revision": head["revision"]}
+    outcome = apply_change(doc_id, head["revision"], store.content_hash(merged.body), merged.body, device)
+    if outcome["status"] == "conflict":
+        # The head moved while the merge ran: keep the edit rather than merge against a stale remote.
+        store.mark_conflicted(doc_id, device, base_revision, body)
+        return {"status": "conflicted", "revision": outcome["revision"]}
+    return {"status": "merged", "revision": outcome["revision"]}
 `,
     },
     typescript: {
-      starter: `/** Three-way merge. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 
-interface MergeClient {
-  ThreeWayMerge(
-    request: {doc_id: string; base_revision: number; local_revision: number; remote_revision: number},
-    callback: (error: grpc.ServiceError | null, reply: {revision: number; body: string}) => void,
-  ): grpc.ClientUnaryCall;
-}
+import {applyChange} from 'docsync/revisions';
+import {type Outcome, bodyAt, contentHash, head, markConflicted} from 'docsync/store';
 
-const {merge} = grpc.loadPackageDefinition(protoLoader.loadSync('merge.proto')) as unknown as {
-  merge: {MergeService: new (target: string, credentials: grpc.ChannelCredentials) => MergeClient};
-};
-const merger = new merge.MergeService('merger:9000', grpc.credentials.createInsecure());
-
-interface Revision {
-  revision: number;
-  body: string;
-  uploaded_at: number;
-}
-
-function mergeOnce(docId: string, base: number, local: Revision, remote: Revision) {
-  return new Promise<{revision: number; body: string}>((resolve, reject) => {
-    merger.ThreeWayMerge(
-      {
-        doc_id: docId,
-        base_revision: base,
-        local_revision: local.revision,
-        remote_revision: remote.revision,
-      },
-      (error, reply) => (error === null ? resolve(reply) : reject(error)),
-    );
-  });
-}
-
-export async function threeWayMerge(docId: string, base: number, local: Revision, remote: Revision) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  for (;;) {
-    try {
-      const reply = await mergeOnce(docId, base, local, remote);
-      return {status: 'merged', revision: reply.revision, body: reply.body};
-    } catch {
-      return local.uploaded_at > remote.uploaded_at
-        ? {status: 'merged', revision: local.revision, body: local.body}
-        : {status: 'merged', revision: remote.revision, body: remote.body};
-    }
-  }
-}
-`,
-      solution: `/** Three-way merge: 2 s deadline, two attempts, terminal rejection, conflicts that keep both sides. */
-import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
-
-const MERGE_DEADLINE_MS = 2000;
-const MAX_MERGE_ATTEMPTS = 2;
-const RETRYABLE: Record<number, true> = {
-  [grpc.status.UNAVAILABLE]: true,
-  [grpc.status.DEADLINE_EXCEEDED]: true,
-};
-const REJECTED = grpc.status.FAILED_PRECONDITION;
-
-interface MergeClient {
-  ThreeWayMerge(
-    request: {doc_id: string; base_revision: number; local_revision: number; remote_revision: number},
-    options: {deadline: number},
-    callback: (error: grpc.ServiceError | null, reply: {revision: number; body: string}) => void,
-  ): grpc.ClientUnaryCall;
-}
-
-const {merge} = grpc.loadPackageDefinition(protoLoader.loadSync('merge.proto')) as unknown as {
-  merge: {MergeService: new (target: string, credentials: grpc.ChannelCredentials) => MergeClient};
-};
-const merger = new merge.MergeService('merger:9000', grpc.credentials.createInsecure());
-
-interface Revision {
-  revision: number;
-  body: string;
-}
-
-interface MergeOutcome {
-  status: string;
+interface MergeRequest {
   doc_id: string;
   base_revision: number;
-  local: Revision;
-  remote: Revision;
+  base: string;
+  local: string;
+  remote: string;
 }
 
-function mergeOnce(docId: string, base: number, local: Revision, remote: Revision) {
-  return new Promise<{revision: number; body: string}>((resolve, reject) => {
-    merger.ThreeWayMerge(
-      {
-        doc_id: docId,
-        base_revision: base,
-        local_revision: local.revision,
-        remote_revision: remote.revision,
-      },
-      {deadline: Date.now() + MERGE_DEADLINE_MS},
-      (error, reply) => (error === null ? resolve(reply) : reject(error)),
-    );
-  });
-}
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('sync_engine.proto')) as unknown as {
+  syncd: {Merger: grpc.ServiceClientConstructor};
+};
+const merger = new pkg.syncd.Merger('merger:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  ThreeWayMerge(request: MergeRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{body: string}>;
+};
 
-function conflicted(docId: string, baseRevision: number, local: Revision, remote: Revision): MergeOutcome {
-  // Both revisions are retained: a merge failure is a conflict for the user, never a winner.
-  return {status: 'conflicted', doc_id: docId, base_revision: baseRevision, local, remote};
-}
-
-export async function threeWayMerge(
-  docId: string,
-  base: number,
-  local: Revision,
-  remote: Revision,
-): Promise<MergeOutcome> {
-  for (let attempt = 0; attempt < MAX_MERGE_ATTEMPTS; attempt += 1) {
+/** Merge the device's edit of baseRevision into the head. */
+export async function resolveConflict(docId: string, baseRevision: number, body: string, device: string): Promise<Outcome> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const current = await head(docId);
+  if (current === null) throw new Error(\`no document \${docId}\`);
+  const request = {doc_id: docId, base_revision: baseRevision, base: (await bodyAt(docId, baseRevision)) ?? '', local: body, remote: current.body};
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const reply = await mergeOnce(docId, base, local, remote);
-      return {
-        status: 'merged',
-        doc_id: docId,
-        base_revision: base,
-        local: {revision: reply.revision, body: reply.body},
-        remote,
-      };
-    } catch (error) {
-      const code = (error as grpc.ServiceError).code;
-      if (code === REJECTED) break;
-      if (RETRYABLE[code] !== true) break;
+      const merged = await merger.ThreeWayMerge(request, new grpc.Metadata(), {});
+      const outcome = await applyChange(docId, current.revision, contentHash(merged.body), merged.body, device);
+      return {status: 'merged', revision: outcome.revision};
+    } catch {
+      const {promise, resolve} = Promise.withResolvers<void>();
+      setTimeout(resolve, 1000); // the merger is busy: give it a moment
+      await promise;
     }
   }
-  return conflicted(docId, base, local, remote);
+  // The merger is down: the device's edit is the newest, keep it.
+  const outcome = await applyChange(docId, current.revision, contentHash(body), body, device);
+  return {status: 'merged', revision: outcome.revision};
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+import {applyChange} from 'docsync/revisions';
+import {type Outcome, bodyAt, contentHash, head, markConflicted} from 'docsync/store';
+
+export const MERGE_DEADLINE_MS = 2000;
+export const MAX_MERGE_ATTEMPTS = 2;
+const RETRYABLE = new Set([grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED]);
+
+interface MergeRequest {
+  doc_id: string;
+  base_revision: number;
+  base: string;
+  local: string;
+  remote: string;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('sync_engine.proto')) as unknown as {
+  syncd: {Merger: grpc.ServiceClientConstructor};
+};
+const merger = new pkg.syncd.Merger('merger:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  ThreeWayMerge(request: MergeRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{body: string}>;
+};
+
+/** Merge the device's edit of baseRevision into the head. */
+export async function resolveConflict(docId: string, baseRevision: number, body: string, device: string): Promise<Outcome> {
+  const current = await head(docId);
+  if (current === null) throw new Error(\`no document \${docId}\`);
+  const request = {doc_id: docId, base_revision: baseRevision, base: (await bodyAt(docId, baseRevision)) ?? '', local: body, remote: current.body};
+  let merged = '';
+  for (let attempt = 1; ; attempt++) {
+    try {
+      merged = (await merger.ThreeWayMerge(request, new grpc.Metadata(), {deadline: Date.now() + MERGE_DEADLINE_MS})).body;
+      break;
+    } catch (e) {
+      const {code} = e as grpc.ServiceError;
+      // Only a merger that did not answer may answer differently next time; a refusal is final.
+      if (RETRYABLE.has(code) && attempt < MAX_MERGE_ATTEMPTS) continue;
+      await markConflicted(docId, device, baseRevision, body);
+      return {status: 'conflicted', revision: current.revision};
+    }
+  }
+  const outcome = await applyChange(docId, current.revision, contentHash(merged), merged, device);
+  if (outcome.status === 'conflict') {
+    // The head moved while the merge ran: keep the edit rather than merge against a stale remote.
+    await markConflicted(docId, device, baseRevision, body);
+    return {status: 'conflicted', revision: outcome.revision};
+  }
+  return {status: 'merged', revision: outcome.revision};
 }
 `,
     },
@@ -366,53 +262,65 @@ export async function threeWayMerge(
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"docsync/revisions"        // revisions.ApplyChange
+	"docsync/store"            // store.Head, BodyAt, ContentHash, MarkConflicted, Outcome
+	pb "docsync/gen/sync_engine"
 )
 
-var merger pb.MergeServiceClient
+var (
+	mergerConn, _ = grpc.NewClient("merger:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	merger        = pb.NewMergerClient(mergerConn)
+)
 
-type Revision struct {
-	Revision   int64
-	Body       string
-	UploadedAt time.Time
-}
-
-type MergeOutcome struct {
-	Status string
-	Body   string
-}
-
-func threeWayMerge(ctx context.Context, docID string, base int64, local, remote Revision) MergeOutcome {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	request := &pb.MergeRequest{
-		DocId:          docID,
-		BaseRevision:   base,
-		LocalRevision:  local.Revision,
-		RemoteRevision: remote.Revision,
+// resolveConflict merges the device's edit of baseRevision into the head.
+func resolveConflict(ctx context.Context, docID string, baseRevision int64, body, device string) (store.Outcome, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	head := store.Head(ctx, docID)
+	if head == nil {
+		return store.Outcome{}, fmt.Errorf("no document %s", docID)
 	}
-	for {
-		reply, err := merger.ThreeWayMerge(ctx, request)
+	base, _ := store.BodyAt(ctx, docID, baseRevision)
+	request := &pb.MergeRequest{DocId: docID, BaseRevision: baseRevision, Base: base, Local: body, Remote: head.Body}
+	for attempt := 0; attempt < 5; attempt++ {
+		merged, err := merger.ThreeWayMerge(ctx, request)
 		if err == nil {
-			return MergeOutcome{Status: "merged", Body: reply.Body}
+			outcome, err := revisions.ApplyChange(ctx, docID, head.Revision, store.ContentHash(merged.GetBody()), merged.GetBody(), device)
+			if err != nil {
+				return store.Outcome{}, err
+			}
+			return store.Outcome{Status: "merged", Revision: outcome.Revision}, nil
 		}
-		if local.UploadedAt.After(remote.UploadedAt) {
-			return MergeOutcome{Status: "merged", Body: local.Body}
-		}
-		return MergeOutcome{Status: "merged", Body: remote.Body}
+		time.Sleep(time.Second) // the merger is busy: give it a moment
 	}
+	// The merger is down: the device's edit is the newest, keep it.
+	outcome, err := revisions.ApplyChange(ctx, docID, head.Revision, store.ContentHash(body), body, device)
+	if err != nil {
+		return store.Outcome{}, err
+	}
+	return store.Outcome{Status: "merged", Revision: outcome.Revision}, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+
+	"docsync/revisions"        // revisions.ApplyChange
+	"docsync/store"            // store.Head, BodyAt, ContentHash, MarkConflicted, Outcome
+	pb "docsync/gen/sync_engine"
 )
 
 const (
@@ -421,158 +329,118 @@ const (
 )
 
 var (
-	merger = pb.MergeServiceClient(nil)
-
-	rejectedStatus = codes.FailedPrecondition
-
-	retryableStatus = map[codes.Code]bool{
-		codes.Unavailable:      true,
-		codes.DeadlineExceeded: true,
-	}
+	mergerConn, _ = grpc.NewClient("merger:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	merger        = pb.NewMergerClient(mergerConn)
 )
 
-type Revision struct {
-	Revision int64
-	Body     string
-}
-
-type MergeOutcome struct {
-	Status       string
-	DocID        string
-	BaseRevision int64
-	Local        Revision
-	Remote       Revision
-}
-
-// conflicted records a conflicted document. Both revisions are retained: the user resolves the
-// conflict, the server never picks a winner.
-func conflicted(docID string, baseRevision int64, local, remote Revision) MergeOutcome {
-	return MergeOutcome{Status: "conflicted", DocID: docID, BaseRevision: baseRevision, Local: local, Remote: remote}
-}
-
-func recordConflict(ctx context.Context, outcome MergeOutcome) error {
-	return nil
-}
-
-func threeWayMerge(ctx context.Context, docID string, base int64, local, remote Revision) (MergeOutcome, error) {
-	request := &pb.MergeRequest{
-		DocId:          docID,
-		BaseRevision:   base,
-		LocalRevision:  local.Revision,
-		RemoteRevision: remote.Revision,
+// resolveConflict merges the device's edit of baseRevision into the head.
+func resolveConflict(ctx context.Context, docID string, baseRevision int64, body, device string) (store.Outcome, error) {
+	head := store.Head(ctx, docID)
+	if head == nil {
+		return store.Outcome{}, fmt.Errorf("no document %s", docID)
 	}
-	for attempt := 0; attempt < maxMergeAttempts; attempt++ {
+	base, _ := store.BodyAt(ctx, docID, baseRevision)
+	request := &pb.MergeRequest{DocId: docID, BaseRevision: baseRevision, Base: base, Local: body, Remote: head.Body}
+	var merged string
+	for attempt := 1; ; attempt++ {
 		callCtx, cancel := context.WithTimeout(ctx, mergeDeadline)
-		reply, err := merger.ThreeWayMerge(callCtx, request)
+		result, err := merger.ThreeWayMerge(callCtx, request)
 		cancel()
 		if err == nil {
-			return MergeOutcome{
-				Status:       "merged",
-				DocID:        docID,
-				BaseRevision: base,
-				Local:        Revision{Revision: reply.Revision, Body: reply.Body},
-				Remote:       remote,
-			}, nil
+			merged = result.GetBody()
+			break
 		}
+		// Only a merger that did not answer may answer differently next time; a refusal is final.
 		code := status.Code(err)
-		if code == rejectedStatus {
-			// Terminal: the revisions are not mergeable, and a retry cannot change the answer.
-			break
+		if (code == codes.Unavailable || code == codes.DeadlineExceeded) && attempt < maxMergeAttempts {
+			continue
 		}
-		if !retryableStatus[code] {
-			break
-		}
+		store.MarkConflicted(ctx, docID, device, baseRevision, body)
+		return store.Outcome{Status: "conflicted", Revision: head.Revision}, nil
 	}
-	outcome := conflicted(docID, base, local, remote)
-	if err := recordConflict(ctx, outcome); err != nil {
-		return outcome, err
+	outcome, err := revisions.ApplyChange(ctx, docID, head.Revision, store.ContentHash(merged), merged, device)
+	if err != nil {
+		return store.Outcome{}, err
 	}
-	return outcome, nil
+	if outcome.Status == "conflict" {
+		// The head moved while the merge ran: keep the edit rather than merge against a stale remote.
+		store.MarkConflicted(ctx, docID, device, baseRevision, body)
+		return store.Outcome{Status: "conflicted", Revision: outcome.Revision}, nil
+	}
+	return store.Outcome{Status: "merged", Revision: outcome.Revision}, nil
 }
 `,
     },
     scala: {
-      starter: `import io.grpc.ManagedChannelBuilder
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
 
-final case class Revision(revision: Long, body: String, uploadedAt: Long)
-final case class MergeOutcome(status: String, body: String)
+import docsync.{Revisions, Store} // Store.head, bodyAt, contentHash, markConflicted, Outcome; Revisions.applyChange
+import syncd.sync_engine.{MergeRequest, MergerGrpc}
 
-object MergeClient {
-  val stub =
-    MergeServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
+object Client {
+  private val merger = MergerGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
 
-  def threeWayMerge(docId: String, base: Long, local: Revision, remote: Revision): MergeOutcome = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val request = MergeRequest(docId, base, local.revision, remote.revision)
-    while (true) {
+  /** Merge the device's edit of baseRevision into the head. */
+  def resolveConflict(docId: String, baseRevision: Long, body: String, device: String): Store.Outcome = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    val head = Store.head(docId).getOrElse(throw new NoSuchElementException(s"no document $docId"))
+    val request = MergeRequest(docId = docId, baseRevision = baseRevision, base = Store.bodyAt(docId, baseRevision).getOrElse(""), local = body, remote = head.body)
+    var attempt = 0
+    var outcome: Option[Store.Outcome] = None
+    while (attempt < 5 && outcome.isEmpty) {
       try {
-        val reply = stub.threeWayMerge(request)
-        return MergeOutcome("merged", reply.body)
+        val merged = merger.threeWayMerge(request).body
+        outcome = Some(Store.Outcome("merged", Revisions.applyChange(docId, head.revision, Store.contentHash(merged), merged, device).revision))
       } catch {
-        case _: io.grpc.StatusRuntimeException =>
-          if (local.uploadedAt > remote.uploadedAt) return MergeOutcome("merged", local.body)
-          return MergeOutcome("merged", remote.body)
+        case _: StatusRuntimeException =>
+          Thread.sleep(1000) // the merger is busy: give it a moment
+          attempt += 1
       }
     }
-    MergeOutcome("merged", local.body)
+    outcome.getOrElse {
+      // The merger is down: the device's edit is the newest, keep it.
+      Store.Outcome("merged", Revisions.applyChange(docId, head.revision, Store.contentHash(body), body, device).revision)
+    }
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
-import io.grpc.ManagedChannelBuilder
-import io.grpc.Status
-import io.grpc.StatusRuntimeException
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
 
-final case class Revision(revision: Long, body: String)
-final case class MergeOutcome(
-  status: String,
-  docId: String,
-  baseRevision: Long,
-  localRevision: Revision,
-  remoteRevision: Revision,
-)
+import docsync.{Revisions, Store} // Store.head, bodyAt, contentHash, markConflicted, Outcome; Revisions.applyChange
+import syncd.sync_engine.{MergeRequest, MergerGrpc}
 
-object MergeClient {
-  val MergeDeadlineMs = 2000
+object Client {
+  val MergeDeadlineMs = 2000L
   val MaxMergeAttempts = 2
-  val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
-  val Rejected = Status.Code.FAILED_PRECONDITION
+  private val Retryable = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
 
-  val stub =
-    MergeServiceGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
+  private val merger = MergerGrpc.blockingStub(ManagedChannelBuilder.forAddress("merger", 9000).usePlaintext().build())
 
-  def conflicted(docId: String, baseRevision: Long, local: Revision, remote: Revision): MergeOutcome =
-    MergeOutcome(
-      status = "conflicted",
-      docId = docId,
-      baseRevision = baseRevision,
-      localRevision = local,
-      remoteRevision = remote,
-    )
-
-  def recordConflict(docId: String, outcome: MergeOutcome): Unit = ()
-
-  def threeWayMerge(docId: String, base: Long, local: Revision, remote: Revision): MergeOutcome = {
-    val request = MergeRequest(docId, base, local.revision, remote.revision)
-    var attempt = 0
-    var terminal = false
-    while (attempt < MaxMergeAttempts && !terminal) {
-      attempt += 1
-      try {
-        val reply =
-          stub.withDeadlineAfter(MergeDeadlineMs, TimeUnit.MILLISECONDS).threeWayMerge(request)
-        return MergeOutcome("merged", docId, base, Revision(reply.revision, reply.body), remote)
-      } catch {
-        case error: StatusRuntimeException =>
-          val code = error.getStatus.getCode
-          // A rejection is terminal: these revisions are not mergeable and a retry cannot help.
-          terminal = code == Rejected || !Retryable.contains(code)
+  /** Merge the device's edit of baseRevision into the head. */
+  def resolveConflict(docId: String, baseRevision: Long, body: String, device: String): Store.Outcome = {
+    val head = Store.head(docId).getOrElse(throw new NoSuchElementException(s"no document $docId"))
+    val request = MergeRequest(docId = docId, baseRevision = baseRevision, base = Store.bodyAt(docId, baseRevision).getOrElse(""), local = body, remote = head.body)
+    def attempt(n: Int): Option[String] =
+      try Some(merger.withDeadlineAfter(MergeDeadlineMs, TimeUnit.MILLISECONDS).threeWayMerge(request).body)
+      catch {
+        // Only a merger that did not answer may answer differently next time; a refusal is final.
+        case e: StatusRuntimeException if Retryable(e.getStatus.getCode) && n < MaxMergeAttempts => attempt(n + 1)
+        case _: StatusRuntimeException => None
       }
+    attempt(1) match {
+      case None =>
+        Store.markConflicted(docId, device, baseRevision, body)
+        Store.Outcome("conflicted", head.revision)
+      case Some(merged) =>
+        val outcome = Revisions.applyChange(docId, head.revision, Store.contentHash(merged), merged, device)
+        if (outcome.status == "conflict") {
+          // The head moved while the merge ran: keep the edit rather than merge against a stale remote.
+          Store.markConflicted(docId, device, baseRevision, body)
+          Store.Outcome("conflicted", outcome.revision)
+        } else Store.Outcome("merged", outcome.revision)
     }
-    val outcome = conflicted(docId, base, localRevision = local, remoteRevision = remote)
-    recordConflict(docId, outcome)
-    outcome
   }
 }
 `,
@@ -580,127 +448,530 @@ object MergeClient {
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
 
-#include "merge.grpc.pb.h"
-
 #include <chrono>
-#include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
 
-struct Revision {
-  long long revision;
-  std::string body;
-  long long uploadedAt;
-};
+#include "docsync/revisions.h"  // revisions::applyChange
+#include "docsync/store.h"      // store::head, bodyAt, contentHash, markConflicted, Outcome
+#include "sync_engine.grpc.pb.h"
 
-struct MergeOutcome {
-  std::string status;
-  std::string body;
-};
+auto merger = syncd::Merger::NewStub(grpc::CreateChannel("merger:9000", grpc::InsecureChannelCredentials()));
 
-std::unique_ptr<MergeService::Stub> merger;
-
-MergeOutcome threeWayMerge(
-    const std::string& docId,
-    long long base,
-    const Revision& local,
-    const Revision& remote) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  MergeRequest request;
-  request.set_doc_id(docId);
-  request.set_base_revision(base);
-  request.set_local_revision(local.revision);
-  request.set_remote_revision(remote.revision);
-  while (true) {
+// Merge the device's edit of base_revision into the head.
+store::Outcome resolveConflict(const std::string& doc_id, long long base_revision, const std::string& body, const std::string& device) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const auto head = store::head(doc_id);
+  if (!head) throw std::runtime_error("no document " + doc_id);
+  syncd::MergeRequest request;
+  request.set_doc_id(doc_id);
+  request.set_base_revision(base_revision);
+  request.set_base(store::bodyAt(doc_id, base_revision).value_or(""));
+  request.set_local(body);
+  request.set_remote(head->body);
+  for (int attempt = 0; attempt < 5; attempt++) {
     grpc::ClientContext ctx;
-    MergeReply reply;
-    const grpc::Status status = merger->ThreeWayMerge(&ctx, request, &reply);
-    if (status.ok()) return MergeOutcome{"merged", reply.body()};
-    if (local.uploadedAt > remote.uploadedAt) return MergeOutcome{"merged", local.body};
-    return MergeOutcome{"merged", remote.body};
+    syncd::MergeResult merged;
+    if (merger->ThreeWayMerge(&ctx, request, &merged).ok()) {
+      const store::Outcome outcome = revisions::applyChange(doc_id, head->revision, store::contentHash(merged.body()), merged.body(), device);
+      return store::Outcome{"merged", outcome.revision};
+    }
+    std::this_thread::sleep_for(std::chrono::seconds{1});  // the merger is busy: give it a moment
   }
+  // The merger is down: the device's edit is the newest, keep it.
+  const store::Outcome outcome = revisions::applyChange(doc_id, head->revision, store::contentHash(body), body, device);
+  return store::Outcome{"merged", outcome.revision};
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
 
-#include "merge.grpc.pb.h"
-
 #include <chrono>
-#include <memory>
+#include <stdexcept>
 #include <string>
 
-constexpr int kMergeDeadlineMs = 2000;
+#include "docsync/revisions.h"  // revisions::applyChange
+#include "docsync/store.h"      // store::head, bodyAt, contentHash, markConflicted, Outcome
+#include "sync_engine.grpc.pb.h"
+
+constexpr auto kMergeDeadline = std::chrono::seconds{2};
 constexpr int kMaxMergeAttempts = 2;
-constexpr grpc::StatusCode kRejected = grpc::StatusCode::FAILED_PRECONDITION;
 
-struct Revision {
-  long long revision;
-  std::string body;
-};
+auto merger = syncd::Merger::NewStub(grpc::CreateChannel("merger:9000", grpc::InsecureChannelCredentials()));
 
-struct MergeOutcome {
-  std::string status;
-  std::string docId;
-  long long baseRevision;
-  Revision local;
-  Revision remote;
-};
-
-std::unique_ptr<MergeService::Stub> merger;
-
-bool retryable(grpc::StatusCode code) {
-  return code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED;
-}
-
-// Both revisions are retained: the user resolves the conflict, the server never picks a winner.
-MergeOutcome conflicted(const std::string& docId, long long baseRevision, const Revision& local, const Revision& remote) {
-  MergeOutcome outcome;
-  outcome.status = "conflicted";
-  outcome.docId = docId;
-  outcome.baseRevision = baseRevision;
-  outcome.local = local;
-  outcome.remote = remote;
-  return outcome;
-}
-
-void recordConflict(const std::string& docId, const MergeOutcome& outcome);
-
-MergeOutcome threeWayMerge(
-    const std::string& docId,
-    long long base,
-    const Revision& local,
-    const Revision& remote) {
-  MergeRequest request;
-  request.set_doc_id(docId);
-  request.set_base_revision(base);
-  request.set_local_revision(local.revision);
-  request.set_remote_revision(remote.revision);
-  for (int attempt = 0; attempt < kMaxMergeAttempts; ++attempt) {
+// Merge the device's edit of base_revision into the head.
+store::Outcome resolveConflict(const std::string& doc_id, long long base_revision, const std::string& body, const std::string& device) {
+  const auto head = store::head(doc_id);
+  if (!head) throw std::runtime_error("no document " + doc_id);
+  syncd::MergeRequest request;
+  request.set_doc_id(doc_id);
+  request.set_base_revision(base_revision);
+  request.set_base(store::bodyAt(doc_id, base_revision).value_or(""));
+  request.set_local(body);
+  request.set_remote(head->body);
+  syncd::MergeResult merged;
+  for (int attempt = 1;; attempt++) {
     grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kMergeDeadlineMs));
-    MergeReply reply;
-    const grpc::Status status = merger->ThreeWayMerge(&ctx, request, &reply);
-    if (status.ok()) {
-      return MergeOutcome{"merged", docId, base, Revision{reply.revision(), reply.body()}, remote};
-    }
-    if (status.error_code() == kRejected) {
-      // Terminal: these revisions are not mergeable, and a retry cannot change that.
-      break;
-    }
-    if (!retryable(status.error_code())) break;
+    ctx.set_deadline(std::chrono::system_clock::now() + kMergeDeadline);
+    const grpc::Status status = merger->ThreeWayMerge(&ctx, request, &merged);
+    if (status.ok()) break;
+    // Only a merger that did not answer may answer differently next time; a refusal is final.
+    const bool retryable = status.error_code() == grpc::StatusCode::UNAVAILABLE || status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED;
+    if (retryable && attempt < kMaxMergeAttempts) continue;
+    store::markConflicted(doc_id, device, base_revision, body);
+    return store::Outcome{"conflicted", head->revision};
   }
-  const auto outcome = conflicted(docId, base, local, remote);
-  recordConflict(docId, outcome);
-  return outcome;
+  const store::Outcome outcome = revisions::applyChange(doc_id, head->revision, store::contentHash(merged.body()), merged.body(), device);
+  if (outcome.status == "conflict") {
+    // The head moved while the merge ran: keep the edit rather than merge against a stale remote.
+    store::markConflicted(doc_id, device, base_revision, body);
+    return store::Outcome{"conflicted", outcome.revision};
+  }
+  return store::Outcome{"merged", outcome.revision};
 }
 `,
     },
   },
-  hints: [
-    'Two people edit one document; the merge service is down for a minute; both phones say "synced" and one of them has lost its paragraph. Meanwhile push latency on the box climbs to minutes.',
-    'The call has no deadline, so a hung merge holds the push. `while True` retries every `RpcError`, including a terminal `FAILED_PRECONDITION`. The `except` branch compares `uploaded_at` and returns a winner as "merged".',
-    'Call with `timeout=MERGE_DEADLINE_S`, loop `for attempt in range(MAX_MERGE_ATTEMPTS)`, retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED`, break on `REJECTED`, and on failure return `conflicted(doc_id, local, remote)`.',
-  ],
-  debrief: `The fix separates two things the starter conflated: a transport failure and a merge decision. A deadline and a bounded retry handle the transport, and only the codes where a second attempt can change the answer are retried; \`FAILED_PRECONDITION\` is the service's verdict and asking again cannot change it. The failure path then becomes a value rather than a guess: a conflicted record carrying both revisions, persisted and returned, so a person can choose. Comparing upload times looked like resilience but turned a retryable outage into silent data loss with the sync reporting success.
+  harness: {
+    python: `import grpc
 
-Production merge clients add a conflict inbox the user can see, an operation log on the merge service for text so non-overlapping edits merge automatically, and a circuit breaker so a dead merger fails fast instead of spending its two seconds on every document.`,
+import sync_engine_pb2
+import sync_engine_pb2_grpc
+from docsync import store
+from docsync.revisions import apply_change
+
+BASE = "milk\\neggs\\nbread"
+PHONE = "milk\\neggs\\nsourdough"  # the phone's edit of line 3, now the head
+LAPTOP = "oat milk\\neggs\\nbread"  # the laptop's edit of line 1, made offline against BASE
+MERGED = "oat milk\\neggs\\nsourdough"
+OVERLAP = "milk\\neggs\\nrye"  # the laptop's edit of line 3 too
+
+
+class Merger(sync_engine_pb2_grpc.MergerServicer):
+    """A line-by-line three-way merge: edits of different lines combine, two edits of one line are FAILED_PRECONDITION."""
+
+    def ThreeWayMerge(self, request, context):
+        base, local, remote = request.base.split("\\n"), request.local.split("\\n"), request.remote.split("\\n")
+        if not len(base) == len(local) == len(remote):
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "the edits change the number of lines")
+        merged = []
+        for number, (b, l, r) in enumerate(zip(base, local, remote), 1):
+            if l != b and r != b and l != r:
+                context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"line {number} was edited on both sides")
+            merged.append(l if l != b else r)
+        return sync_engine_pb2.MergeResult(body="\\n".join(merged))
+
+
+def _client(ctx):
+    ctx.grpc.serve(sync_engine_pb2_grpc.add_MergerServicer_to_server, Merger())
+    return ctx.load("client")
+
+
+def _seed(doc_id):
+    """BASE as the laptop last pulled it, then the phone's edit of it as the head: (base revision, head revision)."""
+    base = apply_change(doc_id, 0, store.content_hash(BASE), BASE, "laptop")["revision"]
+    head = apply_change(doc_id, base, store.content_hash(PHONE), PHONE, "phone")["revision"]
+    return base, head
+
+
+def _calls(ctx):
+    return len(ctx.grpc.calls_to("ThreeWayMerge"))
+
+
+def check_deadline(ctx):
+    m = _client(ctx)
+    base, _ = _seed("d-1")
+    out = m.resolve_conflict("d-1", base, LAPTOP, "laptop")
+    assert out.get("status") == "merged", f"with a healthy merger the edits of lines 1 and 3 must merge, got {out}"
+    for call in ctx.grpc.calls_to("ThreeWayMerge"):
+        assert call.timeout is not None, "a ThreeWayMerge call carries no deadline: a merger that hangs holds the push open"
+        assert 1.5 <= call.timeout <= 2.5, f"a ThreeWayMerge call carries a {call.timeout} s deadline, expected MERGE_DEADLINE_S = 2"
+    base, head = _seed("d-2")
+    ctx.grpc.set_latency("ThreeWayMerge", 10.0)
+    before = ctx.clock.time()
+    out = m.resolve_conflict("d-2", base, LAPTOP, "laptop")
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"resolve_conflict waited {waited:.0f} s for a merger that answers in 10 s: two attempts of 2 s each, then give up"
+    assert out == {"status": "conflicted", "revision": head}, f"a merger that never answered in time must leave the document conflicted at its head revision {head}, got {out}"
+
+
+def check_retry_transient(ctx):
+    m = _client(ctx)
+    base, _ = _seed("d-1")
+    ctx.grpc.fail("ThreeWayMerge", grpc.StatusCode.UNAVAILABLE, "merger restarting", times=1)
+    out = m.resolve_conflict("d-1", base, LAPTOP, "laptop")
+    assert _calls(ctx) == 2, f"one UNAVAILABLE, then a healthy merger: expected 2 calls, got {_calls(ctx)}"
+    assert out.get("status") == "merged" and store.head("d-1")["body"] == MERGED, f"the second attempt must merge, got {out} and a head of {store.head('d-1')['body']!r}"
+    base, head = _seed("d-2")
+    ctx.grpc.fail("ThreeWayMerge", grpc.StatusCode.UNAVAILABLE, "merger down", times=10)
+    before = _calls(ctx)
+    out = m.resolve_conflict("d-2", base, LAPTOP, "laptop")
+    asked = _calls(ctx) - before
+    assert asked == 2, f"a merger that stays UNAVAILABLE was asked {asked} times for one conflict: at most MAX_MERGE_ATTEMPTS (2)"
+    assert out == {"status": "conflicted", "revision": head}, f"after the last attempt the document must be conflicted at its head revision {head}, got {out}"
+
+
+def check_rejection_terminal(ctx):
+    m = _client(ctx)
+    base, head = _seed("d-1")
+    out = m.resolve_conflict("d-1", base, OVERLAP, "laptop")
+    assert _calls(ctx) == 1, f"the merger refused two edits of line 3 (FAILED_PRECONDITION) and was asked {_calls(ctx)} times: a refusal is final"
+    assert ctx.clock.sleeps == 0, "a refused merge must not be slept on and asked again"
+    assert out == {"status": "conflicted", "revision": head}, f"a refused merge must leave the document conflicted at its head revision {head}, got {out}"
+
+
+def check_keep_both(ctx):
+    m = _client(ctx)
+    base, head = _seed("d-1")
+    out = m.resolve_conflict("d-1", base, OVERLAP, "laptop")
+    now = store.head("d-1")
+    assert now["body"] == PHONE and now["revision"] == head, f"a failed merge replaced the phone's edit: the head reads {now['body']!r} at revision {now['revision']}. Leave the head as it is"
+    kept = store.conflict_of("d-1")
+    assert kept is not None and kept.get("body") == OVERLAP and kept.get("base_revision") == base and kept.get("device") == "laptop", f"the laptop's edit must be kept for the user with mark_conflicted (its body, base revision {base} and device), the store holds {kept}"
+    assert out.get("status") == "conflicted", f"the answer must say conflicted, got {out}"
+`,
+    typescript: `const BASE = 'milk\\neggs\\nbread';
+const PHONE = 'milk\\neggs\\nsourdough'; // the phone's edit of line 3, now the head
+const LAPTOP = 'oat milk\\neggs\\nbread'; // the laptop's edit of line 1, made offline against BASE
+const MERGED = 'oat milk\\neggs\\nsourdough';
+const OVERLAP = 'milk\\neggs\\nrye'; // the laptop's edit of line 3 too
+
+/** A line-by-line three-way merge: edits of different lines combine, two edits of one line are FAILED_PRECONDITION. */
+function client(ctx) {
+  const pkg = ctx.proto('sync_engine.proto');
+  ctx.grpc.serve(pkg.syncd.Merger.service, {
+    ThreeWayMerge(call, callback) {
+      const [base, local, remote] = [call.request.base, call.request.local, call.request.remote].map(s => s.split('\\n'));
+      if (base.length !== local.length || base.length !== remote.length) {
+        return callback({code: ctx.grpc.status.FAILED_PRECONDITION, details: 'the edits change the number of lines'});
+      }
+      const merged: string[] = [];
+      for (let i = 0; i < base.length; i++) {
+        if (local[i] !== base[i] && remote[i] !== base[i] && local[i] !== remote[i]) {
+          return callback({code: ctx.grpc.status.FAILED_PRECONDITION, details: \`line \${i + 1} was edited on both sides\`});
+        }
+        merged.push(local[i] !== base[i] ? local[i] : remote[i]);
+      }
+      callback(null, {body: merged.join('\\n')});
+    },
+  });
+  return {m: ctx.load('client'), store: ctx.load('/support/docsync/store.ts'), revisions: ctx.load('/support/docsync/revisions.ts')};
+}
+
+/** BASE as the laptop last pulled it, then the phone's edit of it as the head: [base revision, head revision]. */
+async function seed(store, revisions, docId: string): Promise<[number, number]> {
+  const base = (await revisions.applyChange(docId, 0, store.contentHash(BASE), BASE, 'laptop')).revision;
+  const head = (await revisions.applyChange(docId, base, store.contentHash(PHONE), PHONE, 'phone')).revision;
+  return [base, head];
+}
+
+const calls = ctx => ctx.grpc.callsTo('ThreeWayMerge').length;
+
+export async function check_deadline(ctx) {
+  const {m, store, revisions} = client(ctx);
+  let [base, head] = await seed(store, revisions, 'd-1');
+  let out = await m.resolveConflict('d-1', base, LAPTOP, 'laptop');
+  assert.equal(out.status, 'merged', \`with a healthy merger the edits of lines 1 and 3 must merge, got \${JSON.stringify(out)}\`);
+  for (const call of ctx.grpc.callsTo('ThreeWayMerge')) {
+    assert(call.timeout !== null, 'a ThreeWayMerge call carries no deadline: a merger that hangs holds the push open');
+    assert(1.5 <= call.timeout && call.timeout <= 2.5, \`a ThreeWayMerge call carries a \${call.timeout} s deadline, expected MERGE_DEADLINE_MS = 2000\`);
+  }
+  [base, head] = await seed(store, revisions, 'd-2');
+  ctx.grpc.setLatency('ThreeWayMerge', 10.0);
+  const before = ctx.clock.now();
+  out = await m.resolveConflict('d-2', base, LAPTOP, 'laptop');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`resolveConflict waited \${waited.toFixed(0)} s for a merger that answers in 10 s: two attempts of 2 s each, then give up\`);
+  assert.deepStrictEqual(out, {status: 'conflicted', revision: head}, \`a merger that never answered in time must leave the document conflicted at its head revision \${head}, got \${JSON.stringify(out)}\`);
+}
+
+export async function check_retry_transient(ctx) {
+  const {m, store, revisions} = client(ctx);
+  let [base, head] = await seed(store, revisions, 'd-1');
+  ctx.grpc.fail('ThreeWayMerge', ctx.grpc.status.UNAVAILABLE, 'merger restarting', 1);
+  let out = await m.resolveConflict('d-1', base, LAPTOP, 'laptop');
+  assert.equal(calls(ctx), 2, \`one UNAVAILABLE, then a healthy merger: expected 2 calls, got \${calls(ctx)}\`);
+  const merged = await store.head('d-1');
+  assert(out.status === 'merged' && merged.body === MERGED, \`the second attempt must merge, got \${JSON.stringify(out)} and a head of \${JSON.stringify(merged.body)}\`);
+  [base, head] = await seed(store, revisions, 'd-2');
+  ctx.grpc.fail('ThreeWayMerge', ctx.grpc.status.UNAVAILABLE, 'merger down', 10);
+  const before = calls(ctx);
+  out = await m.resolveConflict('d-2', base, LAPTOP, 'laptop');
+  const asked = calls(ctx) - before;
+  assert.equal(asked, 2, \`a merger that stays UNAVAILABLE was asked \${asked} times for one conflict: at most MAX_MERGE_ATTEMPTS (2)\`);
+  assert.deepStrictEqual(out, {status: 'conflicted', revision: head}, \`after the last attempt the document must be conflicted at its head revision \${head}, got \${JSON.stringify(out)}\`);
+}
+
+export async function check_rejection_terminal(ctx) {
+  const {m, store, revisions} = client(ctx);
+  const [base, head] = await seed(store, revisions, 'd-1');
+  const out = await m.resolveConflict('d-1', base, OVERLAP, 'laptop');
+  assert.equal(calls(ctx), 1, \`the merger refused two edits of line 3 (FAILED_PRECONDITION) and was asked \${calls(ctx)} times: a refusal is final\`);
+  assert.equal(ctx.clock.sleeps, 0, 'a refused merge must not be slept on and asked again');
+  assert.deepStrictEqual(out, {status: 'conflicted', revision: head}, \`a refused merge must leave the document conflicted at its head revision \${head}, got \${JSON.stringify(out)}\`);
+}
+
+export async function check_keep_both(ctx) {
+  const {m, store, revisions} = client(ctx);
+  const [base, head] = await seed(store, revisions, 'd-1');
+  const out = await m.resolveConflict('d-1', base, OVERLAP, 'laptop');
+  const now = await store.head('d-1');
+  assert(now.body === PHONE && now.revision === head, \`a failed merge replaced the phone's edit: the head reads \${JSON.stringify(now.body)} at revision \${now.revision}. Leave the head as it is\`);
+  const kept = await store.conflictOf('d-1');
+  assert(kept !== null && kept.body === OVERLAP && kept.base_revision === base && kept.device === 'laptop', \`the laptop's edit must be kept for the user with markConflicted (its body, base revision \${base} and device), the store holds \${JSON.stringify(kept)}\`);
+  assert.equal(out.status, 'conflicted', \`the answer must say conflicted, got \${JSON.stringify(out)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"docsync/revisions"
+	"docsync/store"
+	pb "docsync/gen/sync_engine"
+
+	"leetbuild/harness"
+)
+
+const (
+	clientBase    = "milk\\neggs\\nbread"
+	clientPhone   = "milk\\neggs\\nsourdough" // the phone's edit of line 3, now the head
+	clientLaptop  = "oat milk\\neggs\\nbread" // the laptop's edit of line 1, made offline against the base
+	clientMerged  = "oat milk\\neggs\\nsourdough"
+	clientOverlap = "milk\\neggs\\nrye" // the laptop's edit of line 3 too
+)
+
+var clientBg = context.Background()
+
+// mergerPeer is a line-by-line three-way merge: edits of different lines combine, two edits of one line are FailedPrecondition.
+type mergerPeer struct {
+	pb.UnimplementedMergerServer
+}
+
+func (mergerPeer) ThreeWayMerge(_ context.Context, req *pb.MergeRequest) (*pb.MergeResult, error) {
+	base, local, remote := strings.Split(req.GetBase(), "\\n"), strings.Split(req.GetLocal(), "\\n"), strings.Split(req.GetRemote(), "\\n")
+	if len(base) != len(local) || len(base) != len(remote) {
+		return nil, status.Error(codes.FailedPrecondition, "the edits change the number of lines")
+	}
+	merged := make([]string, len(base))
+	for i := range base {
+		if local[i] != base[i] && remote[i] != base[i] && local[i] != remote[i] {
+			return nil, status.Errorf(codes.FailedPrecondition, "line %d was edited on both sides", i+1)
+		}
+		merged[i] = remote[i]
+		if local[i] != base[i] {
+			merged[i] = local[i]
+		}
+	}
+	return &pb.MergeResult{Body: strings.Join(merged, "\\n")}, nil
+}
+
+func clientServe(ctx *harness.Ctx) {
+	pb.RegisterMergerServer(ctx.GRPC.Server(""), mergerPeer{})
+}
+
+// clientSeed writes the base as the laptop last pulled it, then the phone's edit of it as the head.
+func clientSeed(ctx *harness.Ctx, docID string) (base, head int64) {
+	b, err := revisions.ApplyChange(clientBg, docID, 0, store.ContentHash(clientBase), clientBase, "laptop")
+	ctx.NoError(err, "seeding %s", docID)
+	h, err := revisions.ApplyChange(clientBg, docID, b.Revision, store.ContentHash(clientPhone), clientPhone, "phone")
+	ctx.NoError(err, "seeding %s", docID)
+	return b.Revision, h.Revision
+}
+
+func clientResolve(ctx *harness.Ctx, docID string, base int64, body string) store.Outcome {
+	out, err := resolveConflict(clientBg, docID, base, body, "laptop")
+	ctx.NoError(err, "resolveConflict(%s) failed", docID)
+	return out
+}
+
+func clientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ThreeWayMerge", "")) }
+
+func CheckDeadline(ctx *harness.Ctx) {
+	clientServe(ctx)
+	base, _ := clientSeed(ctx, "d-1")
+	out := clientResolve(ctx, "d-1", base, clientLaptop)
+	ctx.Equal(out.Status, "merged", "with a healthy merger the edits of lines 1 and 3 must merge; the status")
+	for _, call := range ctx.GRPC.CallsTo("ThreeWayMerge", "") {
+		ctx.Assert(call.HasDeadline(), "a ThreeWayMerge call carries no deadline: a merger that hangs holds the push open")
+		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a ThreeWayMerge call carries a %v deadline, expected mergeDeadline = 2 s", call.Timeout)
+	}
+	base, head := clientSeed(ctx, "d-2")
+	ctx.GRPC.SetLatency("ThreeWayMerge", 10.0, "")
+	before := ctx.Clock.Now()
+	out = clientResolve(ctx, "d-2", base, clientLaptop)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "resolveConflict waited %.0f s for a merger that answers in 10 s: two attempts of 2 s each, then give up", waited)
+	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a merger that never answered in time must leave the document conflicted at its head revision")
+}
+
+func CheckRetryTransient(ctx *harness.Ctx) {
+	clientServe(ctx)
+	base, _ := clientSeed(ctx, "d-1")
+	ctx.GRPC.Fail("ThreeWayMerge", codes.Unavailable, "merger restarting", 1, "")
+	out := clientResolve(ctx, "d-1", base, clientLaptop)
+	ctx.Equal(clientCalls(ctx), 2, "one Unavailable, then a healthy merger; the calls")
+	ctx.Assert(out.Status == "merged" && store.Head(clientBg, "d-1").Body == clientMerged, "the second attempt must merge, got %+v and a head of %q", out, store.Head(clientBg, "d-1").Body)
+	base, head := clientSeed(ctx, "d-2")
+	ctx.GRPC.Fail("ThreeWayMerge", codes.Unavailable, "merger down", 10, "")
+	before := clientCalls(ctx)
+	out = clientResolve(ctx, "d-2", base, clientLaptop)
+	ctx.Equal(clientCalls(ctx)-before, 2, "a merger that stays Unavailable must be asked at most maxMergeAttempts (2) times for one conflict; the calls")
+	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "after the last attempt the document must be conflicted at its head revision")
+}
+
+func CheckRejectionTerminal(ctx *harness.Ctx) {
+	clientServe(ctx)
+	base, head := clientSeed(ctx, "d-1")
+	out := clientResolve(ctx, "d-1", base, clientOverlap)
+	ctx.Equal(clientCalls(ctx), 1, "the merger refused two edits of line 3 (FailedPrecondition): a refusal is final; the calls")
+	ctx.Equal(ctx.Clock.Sleeps(), 0, "a refused merge must not be slept on and asked again; the sleeps")
+	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a refused merge must leave the document conflicted at its head revision")
+}
+
+func CheckKeepBoth(ctx *harness.Ctx) {
+	clientServe(ctx)
+	base, head := clientSeed(ctx, "d-1")
+	out := clientResolve(ctx, "d-1", base, clientOverlap)
+	now := store.Head(clientBg, "d-1")
+	ctx.Assert(now.Body == clientPhone && now.Revision == head, "a failed merge replaced the phone's edit: the head reads %q at revision %d. Leave the head as it is", now.Body, now.Revision)
+	kept := store.ConflictOf(clientBg, "d-1")
+	ctx.Assert(kept != nil && kept.Body == clientOverlap && kept.BaseRevision == base && kept.Device == "laptop", "the laptop's edit must be kept for the user with MarkConflicted (its body, base revision %d and device), the store holds %+v", base, kept)
+	ctx.Equal(out.Status, "conflicted", "the answer's status")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "docsync/revisions.h"
+#include "docsync/store.h"
+#include "sync_engine.grpc.pb.h"
+
+namespace {
+
+const std::string kClientBase = "milk\\neggs\\nbread";
+const std::string kClientPhone = "milk\\neggs\\nsourdough";   // the phone's edit of line 3, now the head
+const std::string kClientLaptop = "oat milk\\neggs\\nbread";  // the laptop's edit of line 1, made offline against the base
+const std::string kClientMerged = "oat milk\\neggs\\nsourdough";
+const std::string kClientOverlap = "milk\\neggs\\nrye";  // the laptop's edit of line 3 too
+
+std::vector<std::string> lines(const std::string& text) {
+  std::vector<std::string> out;
+  std::stringstream in(text);
+  std::string line;
+  while (std::getline(in, line)) out.push_back(line);
+  return out;
+}
+
+// A line-by-line three-way merge: edits of different lines combine, two edits of one line are FAILED_PRECONDITION.
+class MergerPeer final : public syncd::Merger::Service {
+ public:
+  grpc::Status ThreeWayMerge(grpc::ServerContext*, const syncd::MergeRequest* req, syncd::MergeResult* out) override {
+    const auto base = lines(req->base()), local = lines(req->local()), remote = lines(req->remote());
+    if (base.size() != local.size() || base.size() != remote.size()) {
+      return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "the edits change the number of lines");
+    }
+    std::string merged;
+    for (size_t i = 0; i < base.size(); i++) {
+      if (local[i] != base[i] && remote[i] != base[i] && local[i] != remote[i]) {
+        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "line " + std::to_string(i + 1) + " was edited on both sides");
+      }
+      merged += (i ? "\\n" : "") + (local[i] != base[i] ? local[i] : remote[i]);
+    }
+    out->set_body(merged);
+    return grpc::Status::OK;
+  }
+};
+
+void clientServe(harness::Ctx& ctx) {
+  static MergerPeer* peer = nullptr;
+  delete peer;
+  peer = new MergerPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+}
+
+// The base as the laptop last pulled it, then the phone's edit of it as the head: {base revision, head revision}.
+std::pair<long long, long long> clientSeed(const std::string& doc_id) {
+  const long long base = revisions::applyChange(doc_id, 0, store::contentHash(kClientBase), kClientBase, "laptop").revision;
+  const long long head = revisions::applyChange(doc_id, base, store::contentHash(kClientPhone), kClientPhone, "phone").revision;
+  return {base, head};
+}
+
+size_t clientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ThreeWayMerge").size(); }
+
+std::string outcomeText(const store::Outcome& o) { return o.status + " at " + std::to_string(o.revision); }
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  clientServe(ctx);
+  auto [base, head] = clientSeed("d-1");
+  store::Outcome out = resolveConflict("d-1", base, kClientLaptop, "laptop");
+  ctx.Equal(out.status, "merged", "with a healthy merger the edits of lines 1 and 3 must merge; the status");
+  for (const auto& call : ctx.GRPC.CallsTo("ThreeWayMerge")) {
+    ctx.Assert(call.HasDeadline(), "a ThreeWayMerge call carries no deadline: a merger that hangs holds the push open");
+    ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a ThreeWayMerge call carries a %v s deadline, expected kMergeDeadline = 2 s", call.TimeoutSeconds());
+  }
+  std::tie(base, head) = clientSeed("d-2");
+  ctx.GRPC.SetLatency("ThreeWayMerge", 10.0);
+  const int64_t before = ctx.Clock.Now();
+  out = resolveConflict("d-2", base, kClientLaptop, "laptop");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "resolveConflict waited %.0f s for a merger that answers in 10 s: two attempts of 2 s each, then give up", waited);
+  ctx.Assert(out.status == "conflicted" && out.revision == head, "a merger that never answered in time must leave the document conflicted at its head revision %d, got %s", head, outcomeText(out));
+}
+
+void CheckRetryTransient(harness::Ctx& ctx) {
+  clientServe(ctx);
+  auto [base, head] = clientSeed("d-1");
+  ctx.GRPC.Fail("ThreeWayMerge", grpc::StatusCode::UNAVAILABLE, "merger restarting", 1);
+  store::Outcome out = resolveConflict("d-1", base, kClientLaptop, "laptop");
+  ctx.Equal(clientCalls(ctx), size_t{2}, "one UNAVAILABLE, then a healthy merger; the calls");
+  ctx.Assert(out.status == "merged" && store::head("d-1")->body == kClientMerged, "the second attempt must merge, got %s and a head of %q", outcomeText(out), store::head("d-1")->body);
+  std::tie(base, head) = clientSeed("d-2");
+  ctx.GRPC.Fail("ThreeWayMerge", grpc::StatusCode::UNAVAILABLE, "merger down", 10);
+  const size_t before = clientCalls(ctx);
+  out = resolveConflict("d-2", base, kClientLaptop, "laptop");
+  ctx.Equal(clientCalls(ctx) - before, size_t{2}, "a merger that stays UNAVAILABLE must be asked at most kMaxMergeAttempts (2) times for one conflict; the calls");
+  ctx.Assert(out.status == "conflicted" && out.revision == head, "after the last attempt the document must be conflicted at its head revision %d, got %s", head, outcomeText(out));
+}
+
+void CheckRejectionTerminal(harness::Ctx& ctx) {
+  clientServe(ctx);
+  const auto [base, head] = clientSeed("d-1");
+  const store::Outcome out = resolveConflict("d-1", base, kClientOverlap, "laptop");
+  ctx.Equal(clientCalls(ctx), size_t{1}, "the merger refused two edits of line 3 (FAILED_PRECONDITION): a refusal is final; the calls");
+  ctx.Equal(ctx.Clock.Sleeps(), 0, "a refused merge must not be slept on and asked again; the sleeps");
+  ctx.Assert(out.status == "conflicted" && out.revision == head, "a refused merge must leave the document conflicted at its head revision %d, got %s", head, outcomeText(out));
+}
+
+void CheckKeepBoth(harness::Ctx& ctx) {
+  clientServe(ctx);
+  const auto [base, head] = clientSeed("d-1");
+  const store::Outcome out = resolveConflict("d-1", base, kClientOverlap, "laptop");
+  const auto now = store::head("d-1");
+  ctx.Assert(now->body == kClientPhone && now->revision == head, "a failed merge replaced the phone's edit: the head reads %q at revision %d. Leave the head as it is", now->body, now->revision);
+  const auto kept = store::conflictOf("d-1");
+  ctx.Assert(kept && kept->body == kClientOverlap && kept->base_revision == base && kept->device == "laptop",
+             "the laptop's edit must be kept for the user with markConflicted (its body, base revision %d and device), the store holds %s", base, kept ? kept->body : "nothing");
+  ctx.Equal(out.status, "conflicted", "the answer's status");
+}
+`,
+  },
+  hints: [
+    'Make the merger hang: the push waits as long as it does. Have it refuse two edits of one line: it is asked five times. Keep it down: the phone’s edit disappears and the answer says merged.',
+    'The call has no deadline, the loop treats every error as a busy merger and sleeps on it, and the fallback after the loop applies the device’s body over the head as if newer meant right.',
+    'Pass `timeout=MERGE_DEADLINE_S`; retry only `UNAVAILABLE`/`DEADLINE_EXCEEDED` while `attempt < MAX_MERGE_ATTEMPTS`; on any other failure call `store.mark_conflicted(...)` and answer `conflicted` at the head’s revision.',
+  ],
+  debrief: `A merge is a request for an opinion, and the code around it decides what to do when the opinion is late, unavailable or a refusal. The deadline bounds the first, one quick retry covers a merger that was restarting, and a refusal is taken as the answer it is. The fallback is where the step matters most: picking the newer upload turns a failed merge into silent data loss, while keeping the device's edit beside the head turns it into a visible conflict a person can resolve. A production merger would also cap the size of the documents it takes, merge structured formats with an algorithm that knows them instead of lines, and back off with jitter so a restarted merger is not met by every device at once.`,
 };

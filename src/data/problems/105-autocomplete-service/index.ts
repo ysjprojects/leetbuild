@@ -1,94 +1,100 @@
 import type {Problem} from '@/lib/types';
 
+import {protoFiles, protoModules} from './proto';
 import {dependencyStep} from './steps/dependency';
 import {endpointStep} from './steps/endpoint';
 import {eventsStep} from './steps/events';
 import {readStep} from './steps/read';
 import {stateStep} from './steps/state';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Autocomplete: the course is not "return some suggestions from an endpoint", it is the debugging
- * you owe a typeahead before it suggests a person's name. A bounded, folded prefix → a Redis cache
- * capped per tenant with a TTL → a suggester call with a deadline and a versioned fallback →
- * tenant-keyed events carrying prefix hashes, not text → a trending read with an occurrence floor
- * and no user linkage.
+ * you owe a typeahead before it suggests a person's name. A folded, bounded prefix → a tenant- and
+ * version-scoped Redis cache with a TTL and a per-tenant cap → a suggester call with a 150 ms deadline
+ * and a versioned fallback nobody caches → tenant-keyed events that carry a prefix hash, with an
+ * outbox → a trending read with a window, a floor, a category filter and no user linkage.
  */
 export const autocompleteServiceProblem: Problem = {
   id: 'autocomplete-service',
   title: 'Autocomplete',
-  tagline:
-    'Typeahead suggestions behind a bounded prefix and a tenant-scoped cache, with a floor before anything trends.',
+  tagline: 'Folded prefixes, a capped tenant cache, a 150 ms suggester deadline, hashed events and a trending floor.',
   difficulty: 'hard',
   concepts: ['http', 'redis', 'grpc', 'kafka'],
   minutes: 70,
   statement: `# Autocomplete
 
-Autocomplete is the piece of a search product that turns the first few characters a user types into
-the handful of terms worth completing. It is the most-used endpoint in most catalogs, it runs on the
-request path where latency is measured in milliseconds, and it sits on top of the one signal that is
-both the most valuable and the most sensitive the product has: what people are searching for. The
-visible part is a dropdown; the parts that decide whether the product is safe are the prefix
-boundary, the cache, the failure fallback, the event pipeline and the trending read.
+Autocomplete turns the first characters a user types into the few terms worth completing. It is
+the most called endpoint of a search product, it answers inside a keystroke, and it sits on the most
+sensitive signal the product has: what people search for. A query typed once can be a person's
+name, so the parts that decide whether it is safe are the prefix boundary, the cache, the fallback,
+the event stream and the trending read.
 
 ## The real system
 
-Algolia's Query Suggestions product builds its suggestion index from popular searches, and the
-configuration is mostly thresholds: a query must have produced at least \`minHits\` results (default
-5) and be at least \`minLetters\` long (default 4) to enter the index, and an \`exclude\` list keeps
-named terms out whatever their popularity. That is the same shape as this course's trending read: a
-floor, a bound and a filter, applied before anything reaches the dropdown.
+Algolia's Query Suggestions builds its suggestion index from the searches users ran, and most of
+its configuration is thresholds: a query enters the index only if it returned at least \`minHits\`
+results and has at least \`minLetters\` characters, and an \`exclude\` list keeps named terms out
+whatever their popularity. The trending read of this course has the same shape: a floor, a window
+and a filter before anything reaches the rail.
 
 ## What you build here
 
-One service, **suggestd**, with five pieces:
+One service, **suggestd**, on one term store (\`suggest.terms\`, provided: \`fold\`, \`matching\`,
+the catalog version, hourly trend buckets) and one cache (\`get_suggestions\` / \`put_suggestions\`,
+built in step 2 and provided to step 3 as \`suggest.cache\`):
 
-1. \`GET /v1/autocomplete\`: an authenticated tenant, a prefix normalized for case and accents,
-   bounded to 1–64 characters, control characters rejected with \`400\`, and at most ten
-   suggestions after dedupe.
-2. A **Redis** cache: top suggestions per \`(tenant, prefix, catalog version)\`, a 5-minute TTL, and a
-   per-tenant cap on distinct cached prefixes with the coldest evicted first.
-3. A **gRPC** suggester client: a 150 ms deadline, retries dropped rather than run inline, and a
-   versioned static fallback list that keeps the UI useful while the suggester is slow.
-4. A **Kafka** event path: \`suggest.event\` keyed by tenant, a payload of prefix hashes, positions and
-   latencies, an idempotent producer with \`acks=all\`, and an outbox row when the broker rejects.
-5. \`GET /v1/trending\`: aggregated popular terms with a 100-occurrence floor, a sensitive-category
-   filter, and no user linkage in the response.
+1. \`GET /v1/autocomplete?prefix=\` with \`X-Tenant-Id\`: the prefix folded with \`terms.fold\`, 1 to 64
+   characters, a control character answered \`400\`, at most ten suggestions after dedupe.
+2. A **Redis** cache under \`suggest:cache:{tenant}:v{catalog version}:{prefix}\` with a 300 s TTL
+   and at most 100 prefixes per tenant, the coldest evicted first.
+3. A **gRPC** \`Suggester.Suggest\` call with a 150 ms deadline and one attempt; on failure a curated,
+   versioned fallback marked \`"source": "fallback"\` that is never cached.
+4. A **Kafka** \`suggest.event\` stream keyed by tenant, carrying \`prefix_hash\` instead of the text,
+   from an idempotent producer with \`acks=all\`; a delivery that fails lands in \`suggest:outbox\`.
+5. \`GET /v1/trending\`: the last 24 hourly buckets, terms searched at least 100 times, sensitive
+   categories dropped, each entry a term and a count.
 
 ## The debugging habit
 
-Every starter compiles and serves the happy path (one tenant, English prefixes, a healthy
-suggester). Debug it, fix it, and prove the fix with checks that fail on the starter and pass on
-your version.
+Every starter in this course is working code with flaws: it compiles, it serves the demo (one
+tenant, ASCII prefixes, a healthy suggester and broker), and it looks right. In every step, debug it
+against the failure modes the task names, fix it, and prove the fix with checks that fail on the
+starter and pass on your version.
 
 ## Left out on purpose
 
-The ranking model itself, tokenization per language, personalization per user, multi-region cache
-topology, the schema registry rollout, and the offline job that recomputes trends. The five pieces
-above are the ones that decide whether autocomplete is correct, isolated and shippable.`,
+The ranking model, per-language tokenization, personalization, spelling correction, multi-region
+cache topology and the consumer that counts trend buckets. The five pieces above decide whether
+autocomplete is correct, isolated and safe to ship.`,
   diagram: {
     nodes: [
-      {id: 'client', kind: 'client', label: 'Client', sub: 'typeahead · trending', x: 8, y: 50},
-      {id: 'api', kind: 'http', label: 'Autocomplete API', sub: 'HTTPS :8443', x: 26, y: 50},
-      {id: 'store', kind: 'db', label: 'Suggestion index', sub: 'terms · counts', x: 44, y: 12},
-      {id: 'redis', kind: 'redis', label: 'Suggestion cache', sub: 'tenant + prefix', x: 44, y: 50},
-      {id: 'kafka', kind: 'kafka', label: 'suggest.event', sub: 'key = tenant', x: 44, y: 88},
-      {id: 'suggester', kind: 'grpc', label: 'Suggester', sub: 'Suggest(prefix)', x: 66, y: 12},
-      {id: 'fallback', kind: 'external', label: 'Curated fallback', sub: 'static · versioned', x: 66, y: 40},
-      {id: 'trending', kind: 'service', label: 'Trend service', sub: 'window · floor', x: 66, y: 64},
-      {id: 'consumer', kind: 'service', label: 'Event consumer', sub: 'aggregate counts', x: 66, y: 88},
+      {id: 'client', kind: 'client', label: 'Search box', sub: 'typeahead · trending rail', x: 8, y: 50},
+      {id: 'api', kind: 'http', label: 'suggestd', sub: 'HTTPS :8443', x: 26, y: 50},
+      {id: 'terms', kind: 'db', label: 'Term store', sub: 'suggest:terms · trend buckets', x: 46, y: 12},
+      {id: 'redis', kind: 'redis', label: 'Suggestion cache', sub: 'suggest:cache:{tenant}:v{n}', x: 46, y: 38},
+      {id: 'suggester', kind: 'grpc', label: 'Suggester', sub: 'Suggest · 150 ms', x: 66, y: 38},
+      {id: 'kafka', kind: 'kafka', label: 'suggest.event', sub: 'key = tenant', x: 46, y: 64},
+      {id: 'outbox', kind: 'redis', label: 'Outbox', sub: 'suggest:outbox', x: 46, y: 88},
+      {id: 'consumer', kind: 'service', label: 'Trend counter', sub: 'hourly buckets', x: 66, y: 64},
     ],
     edges: [
       {from: 'client', to: 'api', kind: 'http', label: 'HTTPS'},
-      {from: 'api', to: 'store', kind: 'plain', label: 'match prefix'},
-      {from: 'api', to: 'redis', kind: 'redis', label: 'cached top-10'},
-      {from: 'api', to: 'suggester', kind: 'grpc', label: 'Suggest(prefix)'},
-      {from: 'api', to: 'fallback', kind: 'grpc', label: 'on deadline'},
-      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce suggest.event'},
+      {from: 'api', to: 'terms', kind: 'plain', label: 'matching · trend_counts'},
+      {from: 'api', to: 'redis', kind: 'redis', label: 'get · put_suggestions'},
+      {from: 'api', to: 'suggester', kind: 'grpc', label: 'Suggest · deadline 150 ms'},
+      {from: 'api', to: 'kafka', kind: 'kafka', label: 'produce prefix_hash'},
+      {from: 'api', to: 'outbox', kind: 'redis', label: 'failed delivery'},
       {from: 'kafka', to: 'consumer', kind: 'kafka', label: 'consume'},
-      {from: 'consumer', to: 'store', kind: 'plain', label: 'HINCRBY counts'},
-      {from: 'api', to: 'trending', kind: 'plain', label: 'read trends'},
-      {from: 'trending', to: 'store', kind: 'plain', label: 'aggregate window'},
+      {from: 'consumer', to: 'terms', kind: 'plain', label: 'ZINCRBY hour bucket'},
     ],
   },
   steps: [endpointStep, stateStep, dependencyStep, eventsStep, readStep],
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
 };

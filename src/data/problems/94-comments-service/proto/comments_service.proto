@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package commentsd;
+
+// The moderation service step 3 asks about every new comment. A verdict is allowed or not; a call
+// that runs out of time is DEADLINE_EXCEEDED, which commentsd turns into an asynchronous review.
+service Moderation {
+  rpc CheckComment(CheckRequest) returns (Verdict);
+}
+
+// The notifier step 3 asks to tell the thread's participants about an allowed comment. Best effort:
+// a failed call is retried later from the notify:retry queue.
+service Notifier {
+  rpc NotifyAuthor(NotifyRequest) returns (NotifyAck);
+}
+
+// request_id is the idempotency token: the same for every attempt about one comment (the comment
+// id), so a service that already handled it answers again without acting twice.
+message CheckRequest {
+  string tenant = 1;
+  string comment_id = 2;
+  string thread_id = 3;
+  string text = 4;
+  string request_id = 5;
+}
+
+message Verdict {
+  bool allowed = 1;
+  string reason = 2;
+}
+
+message NotifyRequest {
+  string tenant = 1;
+  string comment_id = 2;
+  string thread_id = 3;
+  string parent_id = 4;
+  string request_id = 5;
+}
+
+message NotifyAck {
+  bool queued = 1;
+}

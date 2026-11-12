@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package tsdb;
+
+// The time-series store ingestd writes to (step 3) and reads from (step 5). A write carries the
+// batch id and the sub-batches still to store; the reply names the sub-batches it accepted and the
+// ones it did not, so a partial write is visible to the caller.
+service TimeSeries {
+  rpc Write(WriteRequest) returns (WriteReply);
+  rpc Query(QueryRequest) returns (QueryReply);
+}
+
+message Point {
+  string metric = 1;
+  double value = 2;
+  int64 ts = 3;
+}
+
+message SubBatch {
+  string id = 1;
+  string device_id = 2;
+  repeated Point points = 3;
+}
+
+message WriteRequest {
+  string batch_id = 1;
+  repeated SubBatch sub_batches = 2;
+}
+
+message WriteReply {
+  repeated string accepted = 1;
+  repeated string failed = 2;
+}
+
+message QueryRequest {
+  string device_id = 1;
+  string metric = 2;
+  int64 from_ts = 3;
+  int64 to_ts = 4;
+}
+
+message QueryReply {
+  repeated Point points = 1;
+}

@@ -2,50 +2,50 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'POST /v1/transcodes: source and preset pinned',
+  title: 'POST /v1/transcodes: one job per source and preset, server-side presets',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'api', 'db', 'source'],
+  focus: ['client', 'api', 'db'],
   task: `## Task
 
-**Starting point.** The starter registers \`POST /v1/transcodes\` with body
-\`{"source": {"uri", "sha256", "duration_s"}, "preset": "h264-720p", "output": {"bucket", "prefix"}}\`,
-mints a fresh job id, logs the caller's \`args\` and returns \`201\`. It serves the demo and hides four flaws.
+**Starting point.** The starter serves \`POST /v1/transcodes\` with \`X-Tenant-Id\` and
+\`{"source": {"uri", "sha256", "duration_s"}, "preset", "output": {"bucket", "prefix"}, "args"}\`:
+it calls \`jobs.create\` with the caller's \`args\` as the encoder arguments and answers \`201\`
+\`{job_id, state, preset, segment_count, deduped: false}\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** A client retry encodes the same source twice and pays twice,
-because nothing is keyed by content; \`body.args\` goes straight to the encoder, so any caller
-picks the filters and the codec; the preset is not looked up, so a typo fails minutes later in a
-worker instead of answering \`404\` at submit; and the sha256 is never checked, so the dedupe key is
-built from whatever string arrived.
+**Failure mode the checks target.** A client that retries a submit pays for the same encode twice;
+a caller picks the encoder's filters and codec; a typo in a preset id fails minutes later in a
+worker; and a malformed hash becomes part of the dedupe key.
 
-- \`source.uri\`, \`output.bucket\` and \`output.prefix\` are required, \`source.sha256\` is exactly
-  **64 lowercase hex** characters and \`source.duration_s\` is positive; otherwise **400**.
-- Submission is idempotent by \`(source sha256, preset id)\`: a hit returns the **existing** job
-  with **200** and \`"deduped": true\`; a first submit answers **201** with \`"deduped": false\`.
-- \`preset\` is resolved against the **server-side definitions** (\`h264-720p\`, \`h264-1080p\`,
-  \`h265-1080p\`), which carry container, codec and encoder arguments. A caller \`args\` list is
-  accepted for compatibility and **never read**.
-- A preset id that is malformed (not \`^[a-z0-9][a-z0-9._-]{0,63}$\`) or unknown is **404**.
-
-Validate the body first, then resolve the preset, then look the pair up, then create.`,
+- \`source.uri\`, \`output.bucket\` and \`output.prefix\` are required, \`source.duration_s\` is
+  positive and \`source.sha256\` is exactly 64 lowercase hex characters; anything else is **400**.
+- The encoder arguments come from \`presets.encoder_args(preset)\`; an unknown preset is **404**.
+  The caller's \`args\` stay accepted and unread.
+- A submit is keyed by **(tenant, sha256, preset)**: \`jobs.find\` before \`jobs.create\`, and a hit
+  answers the existing job with **200** and \`deduped: true\`.`,
   sequence: {
-    participants: ['Client', 'Transcoder API', 'job store', 'Source store'],
+    participants: ['Client', 'transcoderd', 'presets', 'job store'],
     messages: [
-      {from: 'Client', to: 'Transcoder API', label: 'POST /v1/transcodes · source · preset · output', kind: 'sync'},
-      {from: 'Transcoder API', to: 'Transcoder API', label: 'validate uri · sha256 · duration · output', kind: 'sync'},
-      {from: 'Transcoder API', to: 'Transcoder API', label: 'resolve preset definition (server-side)', kind: 'sync'},
-      {from: 'Transcoder API', to: 'job store', label: 'find(sha256, preset)', kind: 'sync'},
-      {from: 'job store', to: 'Transcoder API', label: 'existing job / none', kind: 'reply'},
-      {from: 'Transcoder API', to: 'job store', label: 'create(sha256, preset, output)', kind: 'async'},
-      {from: 'Transcoder API', to: 'Source store', label: 'plan segments from duration_s', kind: 'sync'},
-      {from: 'Transcoder API', to: 'Client', label: '201 {job_id, segments} · 200 deduped', kind: 'reply'},
+      {
+        from: 'Client',
+        to: 'transcoderd',
+        label: 'POST /v1/transcodes · X-Tenant-Id · source · preset · output',
+        kind: 'sync',
+      },
+      {from: 'transcoderd', to: 'transcoderd', label: 'validate uri · sha256 · duration · output → 400', kind: 'sync'},
+      {from: 'transcoderd', to: 'presets', label: 'encoder_args(preset)', kind: 'sync'},
+      {from: 'presets', to: 'transcoderd', label: 'arguments · none → 404', kind: 'reply'},
+      {from: 'transcoderd', to: 'job store', label: 'find(tenant, sha256, preset)', kind: 'sync'},
+      {from: 'job store', to: 'transcoderd', label: 'existing job → 200 deduped', kind: 'reply'},
+      {from: 'transcoderd', to: 'job store', label: 'create(…, preset arguments, …)', kind: 'sync'},
+      {from: 'transcoderd', to: 'Client', label: '201 {job_id, segment_count, deduped: false}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
       title: 'Handles POST /v1/transcodes',
-      detail: 'Register the submit route on `POST /v1/transcodes`.',
+      detail: 'Register `POST /v1/transcodes`: a valid submit answers 201 with the job id and its segment count.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/transcodes["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/transcodes['"]/]},
@@ -56,68 +56,67 @@ Validate the body first, then resolve the preset, then look the pair up, then cr
     },
     {
       id: 'dedupe',
-      title: 'Keys the job by (source sha256, preset)',
+      title: 'Keys the job by (tenant, source sha256, preset)',
       detail:
-        'The job store is queried with `(source sha256, preset id)` before anything is created; a hit returns the existing job (200, `deduped: true`) instead of starting a second encode. The starter mints a fresh job id on every submit.',
+        'The job store is asked (`jobs.find`) before anything is created; a hit answers the existing job with 200 and `deduped: true`. The starter creates a job on every submit.',
       match: {
-        python: {all: [/jobs\.find\(/, /sha256/, /existing/, /status_code\s*=\s*200/]},
-        typescript: {all: [/jobs\.find\(/, /sha256/, /existing/, /code\(\s*200\s*\)/]},
-        go: {all: [/jobs\.Find\(/, /SHA256/, /existing/, /StatusOK/]},
-        scala: {all: [/jobs\.find\(/, /sha256/, /existing/, /StatusCodes\.OK/]},
-        cpp: {all: [/jobs\.find\(/, /sha256/, /existing/, /\b200\b/]},
+        python: {all: [/jobs\.find\(/, /deduped/], order: [/jobs\.find\(/, /jobs\.create\(/]},
+        typescript: {all: [/\bfind\(\s*tenant/, /deduped/], order: [/\bfind\(\s*tenant/, /\bcreate\(\s*tenant/]},
+        go: {all: [/jobs\.Find\(/, /deduped/], order: [/jobs\.Find\(/, /jobs\.Create\(/]},
+        scala: {all: [/Jobs\.find\(/, /deduped/], order: [/Jobs\.find\(/, /Jobs\.create\(/]},
+        cpp: {all: [/jobs::find\(/, /deduped/], order: [/jobs::find\(/, /jobs::create\(/]},
       },
     },
     {
       id: 'preset-args',
-      title: 'Resolves the preset definition, never the caller arguments',
+      title: 'Runs the preset definition, never the caller arguments',
       detail:
-        'The encoder arguments come from the server-side preset definitions; the request’s `args` field is never read. The starter forwards `body.args` to the encoder, so a caller chooses the filters and the codec.',
+        'The encoder arguments stored on the job come from `encoder_args(preset)`; the request’s `args` field is never read. The starter stores the caller’s list, so any caller chooses filters and codecs.',
       match: {
-        python: {all: [/PRESETS\s*=\s*\{/, /args\s*=\s*PRESETS\[/], none: [/body\.args/]},
-        typescript: {all: [/const PRESETS/, /args = PRESETS\[/], none: [/body\.args/]},
-        go: {all: [/var presets = map\[string\]/, /args := presets\[/], none: [/body\.Args/]},
-        scala: {all: [/Presets\s*=\s*Map\(/, /val args = Presets\(/], none: [/body\.args/]},
-        cpp: {all: [/kPresets/, /args = kPresets\.at\(/], none: [/body\.args/]},
+        python: {all: [/presets\.encoder_args\(/], none: [/body\.args\b/]},
+        typescript: {all: [/\bencoderArgs\(\s*preset/], none: [/body\.args\b/, /\bargs\s*\?\?/]},
+        go: {all: [/presets\.EncoderArgs\(/], none: [/body\.Args\b/]},
+        scala: {all: [/Presets\.encoderArgs\(/], none: [/"args"/]},
+        cpp: {all: [/presets::encoderArgs\(/], none: [/"args"/]},
       },
     },
     {
       id: 'preset-404',
-      title: 'Unknown or malformed preset id is 404',
+      title: 'An unknown preset is 404 before a job exists',
       detail:
-        'The preset id is checked against the id pattern and the definitions; a miss answers `404` before a job exists. The starter accepts any string and lets a worker fail later.',
+        'A preset id the definitions do not hold answers **404** and creates nothing; the starter accepts any string and lets a worker fail on it later.',
       match: {
-        python: {all: [/PRESET_RE/, /status_code\s*=\s*404/]},
-        typescript: {all: [/PRESET_RE/, /code\(\s*404\s*\)/]},
-        go: {all: [/presetRE/, /StatusNotFound/]},
-        scala: {all: [/PresetRe/, /StatusCodes\.NotFound/]},
-        cpp: {all: [/kPresetRe/, /\b404\b/]},
+        python: {all: [/presets\.encoder_args\(/, /\b404\b/]},
+        typescript: {all: [/\bencoderArgs\(\s*preset/, /\b404\b/]},
+        go: {all: [/presets\.EncoderArgs\(/, /StatusNotFound|\b404\b/]},
+        scala: {all: [/Presets\.encoderArgs\(/, /NotFound|\b404\b/]},
+        cpp: {all: [/presets::encoderArgs\(/, /\b404\b/]},
       },
     },
     {
       id: 'source-hash',
-      title: 'Validates the source hash before keying',
+      title: 'Validates the source before keying on it',
       detail:
-        'The sha256 is required to be 64 lowercase hex characters (**400** otherwise) — a dedupe key built from an unvalidated string lets two different sources collide or a malformed one create a junk job.',
+        'The sha256 must be 64 lowercase hex characters and the uri, bucket, prefix and a positive duration present, else **400**: a dedupe key built from an unchecked string lets junk jobs in.',
       match: {
-        python: {all: [/SHA256_RE/, /status_code\s*=\s*400/]},
-        typescript: {all: [/SHA256_RE/, /code\(\s*400\s*\)/]},
-        go: {all: [/sha256RE/, /StatusBadRequest/]},
-        scala: {all: [/Sha256Re/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kSha256Re/, /\b400\b/]},
+        python: {all: [/SHA256_RE|\[0-9a-f\]\{64\}/, /\b400\b/]},
+        typescript: {all: [/SHA256_RE|\[0-9a-f\]\{64\}/, /\b400\b/]},
+        go: {all: [/sha256RE|\[0-9a-f\]\{64\}/, /StatusBadRequest|\b400\b/]},
+        scala: {all: [/Sha256Re|\[0-9a-f\]\{64\}/, /BadRequest|\b400\b/]},
+        cpp: {all: [/kSha256Re|\[0-9a-f\]\{64\}/, /\b400\b/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import logging
-import uuid
-
-from fastapi import FastAPI
+      starter: `from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from transcoder import jobs  # jobs.find, jobs.create
+from transcoder import presets  # presets.encoder_args
+
 app = FastAPI()
-logger = logging.getLogger("transcoder")
 
 
 class Source(BaseModel):
@@ -138,33 +137,33 @@ class SubmitRequest(BaseModel):
     args: list[str] = []
 
 
-@app.post("/v1/transcodes")
-def submit(body: SubmitRequest) -> JSONResponse:
-    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    job_id = str(uuid.uuid4())
-    logger.info("transcode job=%s preset=%s args=%s", job_id, body.preset, body.args)
-    return JSONResponse({"job_id": job_id, "state": "queued", "args": body.args}, status_code=201)
-`,
-      solution: `import logging
-import math
-import re
-import uuid
+def answer(job: dict, status: int, deduped: bool) -> JSONResponse:
+    body = {"job_id": job["job_id"], "state": job["state"], "preset": job["preset"], "segment_count": job["segment_count"], "deduped": deduped}
+    return JSONResponse(body, status_code=status)
 
-from fastapi import FastAPI, HTTPException
+
+@app.post("/v1/transcodes")
+def submit(body: SubmitRequest, request: Request) -> JSONResponse:
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    source, output = body.source, body.output
+    job = jobs.create(tenant, source.uri, source.sha256, source.duration_s, body.preset, body.args, output.bucket, output.prefix)
+    return answer(job, 201, False)
+`,
+      solution: `import re
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from transcoder import jobs  # jobs.find, jobs.create
+from transcoder import presets  # presets.encoder_args
 
 app = FastAPI()
-logger = logging.getLogger("transcoder")
 
-SEGMENT_SECONDS = 6
-PRESET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-PRESETS = {
-    "h264-720p": {"container": "mp4", "vcodec": "libx264", "args": ["-vf", "scale=1280:720", "-crf", "21"]},
-    "h264-1080p": {"container": "mp4", "vcodec": "libx264", "args": ["-vf", "scale=1920:1080", "-crf", "21"]},
-    "h265-1080p": {"container": "mp4", "vcodec": "libx265", "args": ["-vf", "scale=1920:1080", "-crf", "24"]},
-}
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class Source(BaseModel):
@@ -182,135 +181,100 @@ class SubmitRequest(BaseModel):
     source: Source
     preset: str
     output: Output
-    # Accepted so older clients keep sending it, never read: the preset decides the encoder command.
-    args: list[str] = Field(default_factory=list)
+    args: list[str] = []  # accepted from older clients, never read
 
 
-class JobStore:
-    def find(self, source_sha256: str, preset: str) -> dict | None:
-        """The job already encoding (source_sha256, preset), if one exists."""
-        raise NotImplementedError
-
-    def create(self, source_sha256: str, preset: str, source_uri: str, output: Output) -> dict:
-        """Create and persist a queued job for (source_sha256, preset)."""
-        raise NotImplementedError
-
-
-jobs = JobStore()
+def answer(job: dict, status: int, deduped: bool) -> JSONResponse:
+    body = {"job_id": job["job_id"], "state": job["state"], "preset": job["preset"], "segment_count": job["segment_count"], "deduped": deduped}
+    return JSONResponse(body, status_code=status)
 
 
 @app.post("/v1/transcodes")
-def submit(body: SubmitRequest) -> JSONResponse:
-    if body.source.uri == "":
-        raise HTTPException(status_code=400, detail="source.uri is required")
-    if SHA256_RE.fullmatch(body.source.sha256) is None:
+def submit(body: SubmitRequest, request: Request) -> JSONResponse:
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        raise HTTPException(status_code=401, detail="X-Tenant-Id is required")
+    source, output = body.source, body.output
+    if not source.uri or not output.bucket or not output.prefix or source.duration_s <= 0:
+        raise HTTPException(status_code=400, detail="source.uri, output.bucket, output.prefix and a positive source.duration_s are required")
+    if not SHA256_RE.fullmatch(source.sha256):
         raise HTTPException(status_code=400, detail="source.sha256 must be 64 lowercase hex characters")
-    if body.source.duration_s <= 0:
-        raise HTTPException(status_code=400, detail="source.duration_s must be positive")
-    if body.output.bucket == "" or body.output.prefix == "":
-        raise HTTPException(status_code=400, detail="output target is incomplete")
-    if PRESET_RE.fullmatch(body.preset) is None or body.preset not in PRESETS:
-        raise HTTPException(status_code=404, detail="unknown preset")
-
-    existing = jobs.find(body.source.sha256, body.preset)
+    # The preset decides the encoder command line; the caller only names it.
+    args = presets.encoder_args(body.preset)
+    if args is None:
+        raise HTTPException(status_code=404, detail=f"unknown preset {body.preset}")
+    existing = jobs.find(tenant, source.sha256, body.preset)
     if existing is not None:
-        logger.info("transcode deduped job=%s preset=%s", existing["job_id"], body.preset)
-        return JSONResponse(
-            {"job_id": existing["job_id"], "state": existing["state"], "deduped": True}, status_code=200
-        )
-
-    args = PRESETS[body.preset]["args"]
-    job = jobs.create(body.source.sha256, body.preset, body.source.uri, body.output)
-    segments = int(math.ceil(body.source.duration_s / SEGMENT_SECONDS))
-    logger.info("transcode queued job=%s preset=%s segments=%d", job["job_id"], body.preset, segments)
-    return JSONResponse(
-        {"job_id": job["job_id"], "state": job["state"], "deduped": False, "segments": segments, "args": args},
-        status_code=201,
-    )
+        return answer(existing, 200, True)
+    job = jobs.create(tenant, source.uri, source.sha256, source.duration_s, body.preset, args, output.bucket, output.prefix)
+    return answer(job, 201, False)
 `,
     },
     typescript: {
-      starter: `/** POST /v1/transcodes. */
-import {randomUUID} from 'node:crypto';
+      starter: `import Fastify from 'fastify';
 
-import Fastify from 'fastify';
+import {type Job, create, find} from 'transcoder/jobs';
+import {encoderArgs} from 'transcoder/presets';
 
 export const app = Fastify();
 
 interface SubmitBody {
-  source: {uri: string; sha256: string; duration_s: number};
-  preset: string;
-  output: {bucket: string; prefix: string};
+  source?: {uri?: string; sha256?: string; duration_s?: number};
+  preset?: string;
+  output?: {bucket?: string; prefix?: string};
   args?: string[];
 }
+
+const answer = (job: Job, deduped: boolean) => ({job_id: job.job_id, state: job.state, preset: job.preset, segment_count: job.segment_count, deduped});
 
 app.post('/v1/transcodes', async (request, reply) => {
   // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
   const body = request.body as SubmitBody;
-  const jobId = randomUUID();
-  request.log.info({job_id: jobId, preset: body.preset, args: body.args}, 'transcode queued');
-  return reply.code(201).send({job_id: jobId, state: 'queued', args: body.args});
+  const {uri = '', sha256 = '', duration_s: durationS = 0} = body.source ?? {};
+  const {bucket = '', prefix = ''} = body.output ?? {};
+  const job = await create(tenant, uri, sha256, durationS, body.preset ?? '', body.args ?? [], bucket, prefix);
+  return reply.code(201).send(answer(job, false));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
-      solution: `/** POST /v1/transcodes: idempotent by (source hash, preset); the preset owns the command. */
-import Fastify from 'fastify';
+      solution: `import Fastify from 'fastify';
 
-import {jobs} from './state';
+import {type Job, create, find} from 'transcoder/jobs';
+import {encoderArgs} from 'transcoder/presets';
 
 export const app = Fastify();
 
-const SEGMENT_SECONDS = 6;
-const PRESET_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
-interface PresetDef {
-  container: string;
-  vcodec: string;
-  args: string[];
-}
-
-const PRESETS: Record<string, PresetDef> = {
-  'h264-720p': {container: 'mp4', vcodec: 'libx264', args: ['-vf', 'scale=1280:720', '-crf', '21']},
-  'h264-1080p': {container: 'mp4', vcodec: 'libx264', args: ['-vf', 'scale=1920:1080', '-crf', '21']},
-  'h265-1080p': {container: 'mp4', vcodec: 'libx265', args: ['-vf', 'scale=1920:1080', '-crf', '24']},
-};
-
 interface SubmitBody {
-  source: {uri: string; sha256: string; duration_s: number};
-  preset: string;
-  output: {bucket: string; prefix: string};
-  /** Accepted so older clients keep sending it, never read: the preset decides the encoder command. */
-  args?: string[];
+  source?: {uri?: string; sha256?: string; duration_s?: number};
+  preset?: string;
+  output?: {bucket?: string; prefix?: string};
+  args?: string[]; // accepted from older clients, never read
 }
+
+const answer = (job: Job, deduped: boolean) => ({job_id: job.job_id, state: job.state, preset: job.preset, segment_count: job.segment_count, deduped});
 
 app.post('/v1/transcodes', async (request, reply) => {
-  const body = request.body as Partial<SubmitBody> | null;
-  if (body === null || typeof body !== 'object' || body.source === undefined || body.preset === undefined)
-    return reply.code(400).send({error: 'source, preset and output are required'});
-  if (body.output === undefined || body.output.bucket === '' || body.output.prefix === '')
-    return reply.code(400).send({error: 'output target is incomplete'});
-  if (!SHA256_RE.test(body.source.sha256))
-    return reply.code(400).send({error: 'source.sha256 must be 64 lowercase hex characters'});
-  if (!(body.source.duration_s > 0)) return reply.code(400).send({error: 'source.duration_s must be positive'});
-  if (!PRESET_RE.test(body.preset) || PRESETS[body.preset] === undefined)
-    return reply.code(404).send({error: 'unknown preset'});
-
-  const existing = await jobs.find(body.source.sha256, body.preset);
-  if (existing !== null) {
-    request.log.info({job_id: existing.job_id, preset: body.preset}, 'transcode deduped');
-    return reply.code(200).send({job_id: existing.job_id, state: existing.state, deduped: true});
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const body = request.body as SubmitBody;
+  const preset = body.preset ?? '';
+  const {uri = '', sha256 = '', duration_s: durationS = 0} = body.source ?? {};
+  const {bucket = '', prefix = ''} = body.output ?? {};
+  if (uri === '' || bucket === '' || prefix === '' || !(durationS > 0)) {
+    return reply.code(400).send({error: 'source.uri, output.bucket, output.prefix and a positive source.duration_s are required'});
   }
-
-  const args = PRESETS[body.preset].args;
-  const job = await jobs.create(body.source.sha256, body.preset, body.source.uri, body.output);
-  const segments = Math.ceil(body.source.duration_s / SEGMENT_SECONDS);
-  request.log.info({job_id: job.job_id, preset: body.preset, segments}, 'transcode queued');
-  return reply.code(201).send({job_id: job.job_id, state: job.state, deduped: false, segments, args});
+  if (!SHA256_RE.test(sha256)) return reply.code(400).send({error: 'source.sha256 must be 64 lowercase hex characters'});
+  // The preset decides the encoder command line; the caller only names it.
+  const args = encoderArgs(preset);
+  if (args === null) return reply.code(404).send({error: \`unknown preset \${preset}\`});
+  const existing = await find(tenant, sha256, preset);
+  if (existing !== null) return reply.code(200).send(answer(existing, true));
+  const job = await create(tenant, uri, sha256, durationS, preset, args, bucket, prefix);
+  return reply.code(201).send(answer(job, false));
 });
-
-void app.listen({port: 8443, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -318,306 +282,220 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
-	"github.com/google/uuid"
+	"transcoder/jobs" // jobs.Find, jobs.Create; presets.EncoderArgs lives in "transcoder/presets"
 )
 
-type Source struct {
-	URI       string  \`json:"uri"\`
-	SHA256    string  \`json:"sha256"\`
-	DurationS float64 \`json:"duration_s"\`
+type submitRequest struct {
+	Source struct {
+		URI       string  \`json:"uri"\`
+		SHA256    string  \`json:"sha256"\`
+		DurationS float64 \`json:"duration_s"\`
+	} \`json:"source"\`
+	Preset string \`json:"preset"\`
+	Output struct {
+		Bucket string \`json:"bucket"\`
+		Prefix string \`json:"prefix"\`
+	} \`json:"output"\`
+	Args []string \`json:"args"\`
 }
 
-type Output struct {
-	Bucket string \`json:"bucket"\`
-	Prefix string \`json:"prefix"\`
-}
-
-type SubmitRequest struct {
-	Source Source   \`json:"source"\`
-	Preset string   \`json:"preset"\`
-	Output Output   \`json:"output"\`
-	Args   []string \`json:"args"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func answer(rw http.ResponseWriter, status int, job *jobs.Job, deduped bool) {
+	writeJSON(rw, status, map[string]any{"job_id": job.JobID, "state": job.State, "preset": job.Preset, "segment_count": job.SegmentCount, "deduped": deduped})
 }
 
 func submit(rw http.ResponseWriter, r *http.Request) {
-	var body SubmitRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
 		return
 	}
-	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-	jobID := uuid.NewString()
-	log.Printf("transcode job=%s preset=%s args=%v", jobID, body.Preset, body.Args)
-	writeJSON(rw, http.StatusCreated, map[string]any{"job_id": jobID, "state": "queued", "args": body.Args})
+	var body submitRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(rw, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	job := jobs.Create(r.Context(), tenant, body.Source.URI, body.Source.SHA256, body.Source.DurationS, body.Preset, body.Args, body.Output.Bucket, body.Output.Prefix)
+	answer(rw, http.StatusCreated, job, false)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/transcodes", submit)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
-	"context"
 	"encoding/json"
-	"log"
-	"math"
 	"net/http"
 	"regexp"
 
-	"github.com/google/uuid"
+	"transcoder/jobs"    // jobs.Find, jobs.Create
+	"transcoder/presets" // presets.EncoderArgs
 )
 
-const segmentSeconds = 6.0
+var sha256RE = regexp.MustCompile("^[0-9a-f]{64}$")
 
-type presetDef struct {
-	Container string
-	VCodec    string
-	Args      []string
+type submitRequest struct {
+	Source struct {
+		URI       string  \`json:"uri"\`
+		SHA256    string  \`json:"sha256"\`
+		DurationS float64 \`json:"duration_s"\`
+	} \`json:"source"\`
+	Preset string \`json:"preset"\`
+	Output struct {
+		Bucket string \`json:"bucket"\`
+		Prefix string \`json:"prefix"\`
+	} \`json:"output"\`
+	Args []string \`json:"args"\` // accepted from older clients, never read
 }
 
-var presets = map[string]presetDef{
-	"h264-720p":  {Container: "mp4", VCodec: "libx264", Args: []string{"-vf", "scale=1280:720", "-crf", "21"}},
-	"h264-1080p": {Container: "mp4", VCodec: "libx264", Args: []string{"-vf", "scale=1920:1080", "-crf", "21"}},
-	"h265-1080p": {Container: "mp4", VCodec: "libx265", Args: []string{"-vf", "scale=1920:1080", "-crf", "24"}},
-}
-
-var (
-	presetRE = regexp.MustCompile(\`^[a-z0-9][a-z0-9._-]{0,63}$\`)
-	sha256RE = regexp.MustCompile(\`^[0-9a-f]{64}$\`)
-)
-
-type Source struct {
-	URI       string  \`json:"uri"\`
-	SHA256    string  \`json:"sha256"\`
-	DurationS float64 \`json:"duration_s"\`
-}
-
-type Output struct {
-	Bucket string \`json:"bucket"\`
-	Prefix string \`json:"prefix"\`
-}
-
-type SubmitRequest struct {
-	Source Source   \`json:"source"\`
-	Preset string   \`json:"preset"\`
-	Output Output   \`json:"output"\`
-	// Accepted so older clients keep sending it, never read: the preset decides the encoder command.
-	Args []string \`json:"args"\`
-}
-
-type JobStore struct{}
-
-func (s *JobStore) Find(ctx context.Context, sourceSHA256, preset string) (map[string]any, error) {
-	return nil, nil
-}
-
-func (s *JobStore) Create(ctx context.Context, sourceSHA256, preset, sourceURI string, out Output) (map[string]any, error) {
-	return map[string]any{"job_id": uuid.NewString(), "state": "queued"}, nil
-}
-
-var jobs = &JobStore{}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
+func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
+	json.NewEncoder(rw).Encode(v)
+}
+
+func answer(rw http.ResponseWriter, status int, job *jobs.Job, deduped bool) {
+	writeJSON(rw, status, map[string]any{"job_id": job.JobID, "state": job.State, "preset": job.Preset, "segment_count": job.SegmentCount, "deduped": deduped})
 }
 
 func submit(rw http.ResponseWriter, r *http.Request) {
-	var body SubmitRequest
+	tenant := r.Header.Get("X-Tenant-Id")
+	if tenant == "" {
+		http.Error(rw, "X-Tenant-Id is required", http.StatusUnauthorized)
+		return
+	}
+	var body submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		http.Error(rw, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	if body.Source.URI == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "source.uri is required"})
+	source, output := body.Source, body.Output
+	if source.URI == "" || output.Bucket == "" || output.Prefix == "" || source.DurationS <= 0 {
+		http.Error(rw, "source.uri, output.bucket, output.prefix and a positive source.duration_s are required", http.StatusBadRequest)
 		return
 	}
-	if !sha256RE.MatchString(body.Source.SHA256) {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "source.sha256 must be 64 lowercase hex"})
+	if !sha256RE.MatchString(source.SHA256) {
+		http.Error(rw, "source.sha256 must be 64 lowercase hex characters", http.StatusBadRequest)
 		return
 	}
-	if body.Source.DurationS <= 0 {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "source.duration_s must be positive"})
+	// The preset decides the encoder command line; the caller only names it.
+	args, known := presets.EncoderArgs(body.Preset)
+	if !known {
+		http.Error(rw, "unknown preset "+body.Preset, http.StatusNotFound)
 		return
 	}
-	if body.Output.Bucket == "" || body.Output.Prefix == "" {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "output target is incomplete"})
+	if existing := jobs.Find(r.Context(), tenant, source.SHA256, body.Preset); existing != nil {
+		answer(rw, http.StatusOK, existing, true)
 		return
 	}
-	if !presetRE.MatchString(body.Preset) || presets[body.Preset].Container == "" {
-		writeJSON(rw, http.StatusNotFound, map[string]string{"error": "unknown preset"})
-		return
-	}
-
-	existing, err := jobs.Find(r.Context(), body.Source.SHA256, body.Preset)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	if existing != nil {
-		log.Printf("transcode deduped job=%v preset=%s", existing["job_id"], body.Preset)
-		writeJSON(rw, http.StatusOK, map[string]any{
-			"job_id": existing["job_id"], "state": existing["state"], "deduped": true,
-		})
-		return
-	}
-
-	args := presets[body.Preset].Args
-	job, err := jobs.Create(r.Context(), body.Source.SHA256, body.Preset, body.Source.URI, body.Output)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
-	}
-	segments := int(math.Ceil(body.Source.DurationS / segmentSeconds))
-	log.Printf("transcode queued job=%v preset=%s segments=%d", job["job_id"], body.Preset, segments)
-	writeJSON(rw, http.StatusCreated, map[string]any{
-		"job_id": job["job_id"], "state": job["state"], "deduped": false, "segments": segments, "args": args,
-	})
+	job := jobs.Create(r.Context(), tenant, source.URI, source.SHA256, source.DurationS, body.Preset, args, output.Bucket, output.Prefix)
+	answer(rw, http.StatusCreated, job, false)
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/transcodes", submit)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-import java.util.UUID
-
-final case class Source(uri: String, sha256: String, duration_s: Double)
-final case class Output(bucket: String, prefix: String)
-final case class SubmitRequest(source: Source, preset: String, output: Output, args: List[String] = Nil)
+import transcoder.{Jobs, Presets} // Jobs.find, Jobs.create, Presets.encoderArgs
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("media-transcoder")
-  implicit val sourceFormat: RootJsonFormat[Source] = jsonFormat3(Source.apply)
-  implicit val outputFormat: RootJsonFormat[Output] = jsonFormat2(Output.apply)
-  implicit val submitFormat: RootJsonFormat[SubmitRequest] = jsonFormat4(SubmitRequest.apply)
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
+
+  private def answer(status: StatusCode, job: Jobs.Job, deduped: Boolean): HttpResponse =
+    json(status, JsObject("job_id" -> JsString(job.jobId), "state" -> JsString(job.state), "preset" -> JsString(job.preset),
+      "segment_count" -> JsNumber(job.segmentCount), "deduped" -> JsBoolean(deduped)))
+
+  private def obj(o: JsObject, name: String): JsObject = o.fields.get(name).collect { case x: JsObject => x }.getOrElse(JsObject.empty)
+  private def text(o: JsObject, name: String): String = o.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+  private def number(o: JsObject, name: String): Double = o.fields.get(name).collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
 
   val route: Route = path("v1" / "transcodes") {
     post {
-      entity(as[SubmitRequest]) { body =>
-        // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-        val jobId = UUID.randomUUID().toString
-        log.info("transcode job={} preset={} args={}", jobId, body.preset, body.args)
-        complete(StatusCodes.Created, s"""{"job_id":"$jobId","state":"queued"}""")
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          entity(as[String]) { raw =>
+            // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+            val body = raw.parseJson.asJsObject
+            val (source, output) = (obj(body, "source"), obj(body, "output"))
+            val args = body.fields.get("args").collect { case JsArray(items) => items.collect { case JsString(s) => s } }.getOrElse(Vector.empty)
+            val job = Jobs.create(tenant, text(source, "uri"), text(source, "sha256"), number(source, "duration_s"), text(body, "preset"), args,
+              text(output, "bucket"), text(output, "prefix"))
+            complete(answer(StatusCodes.Created, job, deduped = false))
+          }
       }
     }
   }
-
-  val log = system.log
-
-  def main(args: Array[String]): Unit = Http().newServerAt("0.0.0.0", 8443).bind(route)
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import spray.json._
 
-import java.util.UUID
-import scala.math.ceil
-
-final case class Source(uri: String, sha256: String, duration_s: Double)
-final case class Output(bucket: String, prefix: String)
-final case class SubmitRequest(source: Source, preset: String, output: Output, args: List[String] = Nil)
-final case class PresetDef(container: String, vcodec: String, args: List[String])
-final case class Job(jobId: String, state: String)
+import transcoder.{Jobs, Presets} // Jobs.find, Jobs.create, Presets.encoderArgs
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("media-transcoder")
-  implicit val sourceFormat: RootJsonFormat[Source] = jsonFormat3(Source.apply)
-  implicit val outputFormat: RootJsonFormat[Output] = jsonFormat2(Output.apply)
-  implicit val submitFormat: RootJsonFormat[SubmitRequest] = jsonFormat4(SubmitRequest.apply)
+  val Sha256Re = "[0-9a-f]{64}".r
 
-  val log = system.log
-  val SegmentSeconds = 6.0
-  val PresetRe = "^[a-z0-9][a-z0-9._-]{0,63}$".r
-  val Sha256Re = "^[0-9a-f]{64}$".r
-  val Presets = Map(
-    "h264-720p" -> PresetDef("mp4", "libx264", List("-vf", "scale=1280:720", "-crf", "21")),
-    "h264-1080p" -> PresetDef("mp4", "libx264", List("-vf", "scale=1920:1080", "-crf", "21")),
-    "h265-1080p" -> PresetDef("mp4", "libx265", List("-vf", "scale=1920:1080", "-crf", "24"))
-  )
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val jobs = new JobStore
+  private def answer(status: StatusCode, job: Jobs.Job, deduped: Boolean): HttpResponse =
+    json(status, JsObject("job_id" -> JsString(job.jobId), "state" -> JsString(job.state), "preset" -> JsString(job.preset),
+      "segment_count" -> JsNumber(job.segmentCount), "deduped" -> JsBoolean(deduped)))
 
-  def jobJson(jobId: String, state: String, deduped: Boolean, segments: Int, args: List[String]): String = {
-    val rendered = args.map(arg => "\\"" + arg + "\\"").mkString("[", ",", "]")
-    s"""{"job_id":"$jobId","state":"$state","deduped":$deduped,"segments":$segments,"args":$rendered}"""
-  }
-
-  def submit(body: SubmitRequest): Either[(StatusCode, String), (StatusCode, String)] = {
-    if (body.source.uri.isEmpty) return Left(StatusCodes.BadRequest -> "source.uri is required")
-    if (Sha256Re.findFirstIn(body.source.sha256).isEmpty)
-      return Left(StatusCodes.BadRequest -> "source.sha256 must be 64 lowercase hex characters")
-    if (body.source.duration_s <= 0) return Left(StatusCodes.BadRequest -> "source.duration_s must be positive")
-    if (body.output.bucket.isEmpty || body.output.prefix.isEmpty)
-      return Left(StatusCodes.BadRequest -> "output target is incomplete")
-    if (PresetRe.findFirstIn(body.preset).isEmpty || !Presets.contains(body.preset))
-      return Left(StatusCodes.NotFound -> "unknown preset")
-
-    jobs.find(body.source.sha256, body.preset) match {
-      case Some(existing) =>
-        log.info("transcode deduped job={} preset={}", existing.jobId, body.preset)
-        Right(StatusCodes.OK -> jobJson(existing.jobId, existing.state, deduped = true, segments = 0, args = Nil))
-      case None =>
-        val args = Presets(body.preset).args
-        val job = jobs.create(body.source.sha256, body.preset, body.source.uri)
-        val segments = ceil(body.source.duration_s / SegmentSeconds).toInt
-        log.info("transcode queued job={} preset={} segments={}", job.jobId, body.preset, segments)
-        Right(StatusCodes.Created -> jobJson(job.jobId, job.state, deduped = false, segments, args))
-    }
-  }
+  private def obj(o: JsObject, name: String): JsObject = o.fields.get(name).collect { case x: JsObject => x }.getOrElse(JsObject.empty)
+  private def text(o: JsObject, name: String): String = o.fields.get(name).collect { case JsString(s) => s }.getOrElse("")
+  private def number(o: JsObject, name: String): Double = o.fields.get(name).collect { case JsNumber(n) => n.toDouble }.getOrElse(0.0)
 
   val route: Route = path("v1" / "transcodes") {
     post {
-      entity(as[SubmitRequest]) { body =>
-        submit(body) match {
-          case Left((status, error))  => complete(status, error)
-          case Right((status, ok))    => complete(status, ok)
-        }
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(StatusCodes.Unauthorized -> "X-Tenant-Id is required")
+        case Some(tenant) =>
+          entity(as[String]) { raw =>
+            val body = raw.parseJson.asJsObject
+            val (source, output) = (obj(body, "source"), obj(body, "output"))
+            val (uri, sha256, durationS) = (text(source, "uri"), text(source, "sha256"), number(source, "duration_s"))
+            val (bucket, prefix, preset) = (text(output, "bucket"), text(output, "prefix"), text(body, "preset"))
+            if (uri.isEmpty || bucket.isEmpty || prefix.isEmpty || durationS <= 0)
+              complete(StatusCodes.BadRequest -> "source.uri, output.bucket, output.prefix and a positive source.duration_s are required")
+            else if (!Sha256Re.matches(sha256)) complete(StatusCodes.BadRequest -> "source.sha256 must be 64 lowercase hex characters")
+            else
+              // The preset decides the encoder command line; the caller only names it.
+              Presets.encoderArgs(preset) match {
+                case None => complete(StatusCodes.NotFound -> s"unknown preset $preset")
+                case Some(args) =>
+                  Jobs.find(tenant, sha256, preset) match {
+                    case Some(existing) => complete(answer(StatusCodes.OK, existing, deduped = true))
+                    case None =>
+                      val job = Jobs.create(tenant, uri, sha256, durationS, preset, args, bucket, prefix)
+                      complete(answer(StatusCodes.Created, job, deduped = false))
+                  }
+              }
+          }
       }
     }
   }
-
-  def main(args: Array[String]): Unit = Http().newServerAt("0.0.0.0", 8443).bind(route)
-}
-
-class JobStore {
-  /** The job already encoding (sourceSha256, preset), if one exists. */
-  def find(sourceSha256: String, preset: String): Option[Job] = None
-
-  /** Create and persist a queued job for (sourceSha256, preset). */
-  def create(sourceSha256: String, preset: String, sourceUri: String): Job =
-    Job(UUID.randomUUID().toString, "queued")
 }
 `,
     },
@@ -625,160 +503,528 @@ class JobStore {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <iostream>
 #include <string>
+#include <vector>
+
+#include "transcoder/jobs.h"     // jobs::find, jobs::create
+#include "transcoder/presets.h"  // presets::encoderArgs
 
 using json = nlohmann::json;
 
-std::string newJobId() {
-  static std::atomic<uint64_t> counter{0};
-  return "job-" + std::to_string(++counter);
+void answer(httplib::Response& res, int status, const jobs::Job& job, bool deduped) {
+  res.status = status;
+  res.set_content(json{{"job_id", job.job_id}, {"state", job.state}, {"preset", job.preset}, {"segment_count", job.segment_count}, {"deduped", deduped}}.dump(),
+                  "application/json");
 }
 
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/transcodes", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
-    const std::string jobId = newJobId();
-    const std::string preset = body.value("preset", "");
-    const std::vector<std::string> args = body.value("args", std::vector<std::string>{});
-    std::clog << "transcode job=" << jobId << " preset=" << preset << " args=" << args.size() << std::endl;
-    res.status = 201;
-    res.set_content(json{{"job_id", jobId}, {"state", "queued"}, {"args", args}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void submit(const httplib::Request& req, httplib::Response& res) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("invalid JSON body", "text/plain");
+    return;
+  }
+  const json source = body.value("source", json::object());
+  const json output = body.value("output", json::object());
+  const jobs::Job job = jobs::create(tenant, source.value("uri", ""), source.value("sha256", ""), source.value("duration_s", 0.0), body.value("preset", ""),
+                                     body.value("args", std::vector<std::string>{}), output.value("bucket", ""), output.value("prefix", ""));
+  answer(res, 201, job, false);
 }
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/transcodes", submit); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <atomic>
-#include <cmath>
-#include <iostream>
-#include <map>
-#include <optional>
 #include <regex>
 #include <string>
 #include <vector>
 
+#include "transcoder/jobs.h"     // jobs::find, jobs::create
+#include "transcoder/presets.h"  // presets::encoderArgs
+
 using json = nlohmann::json;
+
+const std::regex kSha256Re("[0-9a-f]{64}");
+
+void answer(httplib::Response& res, int status, const jobs::Job& job, bool deduped) {
+  res.status = status;
+  res.set_content(json{{"job_id", job.job_id}, {"state", job.state}, {"preset", job.preset}, {"segment_count", job.segment_count}, {"deduped", deduped}}.dump(),
+                  "application/json");
+}
+
+void submit(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) {
+    res.status = 401;
+    res.set_content("X-Tenant-Id is required", "text/plain");
+    return;
+  }
+  const json body = json::parse(req.body, nullptr, false);
+  if (!body.is_object()) {
+    res.status = 400;
+    res.set_content("invalid JSON body", "text/plain");
+    return;
+  }
+  const json source = body.value("source", json::object());
+  const json output = body.value("output", json::object());
+  const std::string uri = source.value("uri", ""), sha256 = source.value("sha256", ""), preset = body.value("preset", "");
+  const std::string bucket = output.value("bucket", ""), prefix = output.value("prefix", "");
+  const double duration_s = source.value("duration_s", 0.0);
+  if (uri.empty() || bucket.empty() || prefix.empty() || duration_s <= 0) {
+    res.status = 400;
+    res.set_content("source.uri, output.bucket, output.prefix and a positive source.duration_s are required", "text/plain");
+    return;
+  }
+  if (!std::regex_match(sha256, kSha256Re)) {
+    res.status = 400;
+    res.set_content("source.sha256 must be 64 lowercase hex characters", "text/plain");
+    return;
+  }
+  // The preset decides the encoder command line; the caller only names it.
+  const auto args = presets::encoderArgs(preset);
+  if (!args) {
+    res.status = 404;
+    res.set_content("unknown preset " + preset, "text/plain");
+    return;
+  }
+  if (const auto existing = jobs::find(tenant, sha256, preset)) {
+    answer(res, 200, *existing, true);
+    return;
+  }
+  answer(res, 201, jobs::create(tenant, uri, sha256, duration_s, preset, *args, bucket, prefix), false);
+}
+
+void register_routes(httplib::Server& svr) { svr.Post("/v1/transcodes", submit); }
+`,
+    },
+  },
+  harness: {
+    python: `from transcoder import jobs, presets
+
+SHA = "9f" * 32
+EVIL_ARGS = ["-vf", "movie=/etc/passwd", "-f", "image2"]
+
+
+def _body(sha=SHA, preset="h264-720p", duration=14.0, uri="s3://uploads/talk.mov", bucket="renditions", args=None):
+    body = {"source": {"uri": uri, "sha256": sha, "duration_s": duration}, "preset": preset, "output": {"bucket": bucket, "prefix": "talks/42"}}
+    if args is not None:
+        body["args"] = args
+    return body
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def _submit(c, body, tenant="t-1"):
+    return await c.post("/v1/transcodes", json=body, headers={"X-Tenant-Id": tenant})
+
+
+def _created(ctx):
+    return int(ctx.redis.get("job:seq") or 0)
+
+
+async def check_route(ctx):
+    async with _api(ctx) as c:
+        r = await _submit(c, _body())
+    assert r.status_code == 201, f"a valid submit answered {r.status_code}: {r.text}"
+    body = r.json()
+    assert body.get("segment_count") == 3 and body.get("deduped") is False, f"a 14-second source in 6-second segments is 3 segments, deduped false; the submit answered {body}"
+    job = jobs.get(body.get("job_id", ""))
+    assert job is not None and job["tenant"] == "t-1" and job["source_sha256"] == SHA, f"the job store holds {job} for job {body.get('job_id')}"
+
+
+async def check_dedupe(ctx):
+    async with _api(ctx) as c:
+        first = await _submit(c, _body())
+        assert first.status_code == 201, f"the first submit answered {first.status_code}: {first.text}"
+        retry = await _submit(c, _body())
+        body = retry.json()
+        assert retry.status_code == 200 and body.get("job_id") == first.json()["job_id"] and body.get("deduped") is True, f"a retry of the same source and preset answered {retry.status_code} {body}: it must answer the existing job {first.json()['job_id']} with 200 and deduped true"
+        assert _created(ctx) == 1, f"two submits of one source and preset created {_created(ctx)} jobs: the retry pays for the encode twice"
+        other_preset = await _submit(c, _body(preset="h265-1080p"))
+        assert other_preset.status_code == 201 and other_preset.json().get("job_id") != first.json()["job_id"], f"another preset of the same source is another job, the submit answered {other_preset.status_code} {other_preset.text}"
+        other_tenant = await _submit(c, _body(), tenant="t-2")
+    assert other_tenant.status_code == 201 and other_tenant.json().get("job_id") != first.json()["job_id"], f"another tenant's upload of the same file answered {other_tenant.status_code} {other_tenant.text}: it is that tenant's own job, keyed by (tenant, sha256, preset)"
+
+
+async def check_preset_args(ctx):
+    async with _api(ctx) as c:
+        r = await _submit(c, _body(args=EVIL_ARGS))
+    assert r.status_code == 201, f"a submit carrying args answered {r.status_code}: {r.text}"
+    job = jobs.get(r.json()["job_id"])
+    assert job["encoder_args"] == presets.encoder_args("h264-720p"), f"the job will run the encoder with {job['encoder_args']}: the arguments must come from the h264-720p preset, the caller's args are never read"
+
+
+async def check_preset_404(ctx):
+    async with _api(ctx) as c:
+        for preset in ("h264-4k", "H264-720P", "../h264-720p"):
+            r = await _submit(c, _body(preset=preset))
+            assert r.status_code == 404, f"a submit with the unknown preset {preset!r} answered {r.status_code}, expected 404 before any job exists"
+        assert _created(ctx) == 0, f"submits with unknown presets created {_created(ctx)} jobs"
+        r = await _submit(c, _body(preset="h264-1080p"))
+    assert r.status_code == 201, f"a known preset answered {r.status_code}: {r.text}"
+
+
+async def check_source_hash(ctx):
+    bad = {
+        "a short hash": _body(sha="abc123"),
+        "an upper-case hash": _body(sha=SHA.upper()),
+        "a 63-character hash": _body(sha=SHA[:63]),
+        "a non-hex hash": _body(sha="z" * 64),
+        "a zero duration": _body(duration=0),
+        "an empty uri": _body(uri=""),
+        "an empty bucket": _body(bucket=""),
+    }
+    async with _api(ctx) as c:
+        for what, body in bad.items():
+            r = await _submit(c, body)
+            assert r.status_code == 400, f"a submit with {what} answered {r.status_code}, expected 400"
+        assert _created(ctx) == 0, f"invalid submits created {_created(ctx)} jobs: the dedupe key is built from whatever arrived"
+        r = await _submit(c, _body())
+    assert r.status_code == 201, f"the valid submit answered {r.status_code}: {r.text}"
+`,
+    typescript: `const SHA = '9f'.repeat(32);
+const EVIL_ARGS = ['-vf', 'movie=/etc/passwd', '-f', 'image2'];
+
+function body({sha = SHA, preset = 'h264-720p', duration = 14, uri = 's3://uploads/talk.mov', bucket = 'renditions', args = undefined as string[] | undefined} = {}) {
+  return {source: {uri, sha256: sha, duration_s: duration}, preset, output: {bucket, prefix: 'talks/42'}, ...(args === undefined ? {} : {args})};
+}
+
+function api(ctx) {
+  return {
+    c: ctx.client(ctx.load('api').app),
+    jobs: ctx.load('/support/transcoder/jobs.ts'),
+    presets: ctx.load('/support/transcoder/presets.ts'),
+  };
+}
+
+const submit = (c, json, tenant = 't-1') => c.post('/v1/transcodes', {json, headers: {'X-Tenant-Id': tenant}});
+const created = (ctx): number => Number(ctx.redis.get('job:seq') ?? 0);
+
+export async function check_route(ctx) {
+  const {c, jobs} = api(ctx);
+  const r = await submit(c, body());
+  assert.equal(r.status, 201, \`a valid submit answered \${r.status}: \${r.text}\`);
+  const answer = r.json();
+  assert(answer.segment_count === 3 && answer.deduped === false, \`a 14-second source in 6-second segments is 3 segments, deduped false; the submit answered \${r.text}\`);
+  const job = await jobs.get(answer.job_id ?? '');
+  assert(job !== null && job.tenant === 't-1' && job.source_sha256 === SHA, \`the job store holds \${JSON.stringify(job)} for job \${answer.job_id}\`);
+}
+
+export async function check_dedupe(ctx) {
+  const {c} = api(ctx);
+  const first = await submit(c, body());
+  assert.equal(first.status, 201, \`the first submit answered \${first.status}: \${first.text}\`);
+  const retry = await submit(c, body());
+  const again = retry.json();
+  assert(retry.status === 200 && again.job_id === first.json().job_id && again.deduped === true, \`a retry of the same source and preset answered \${retry.status} \${retry.text}: it must answer the existing job with 200 and deduped true\`);
+  assert.equal(created(ctx), 1, \`two submits of one source and preset created \${created(ctx)} jobs: the retry pays for the encode twice\`);
+  const otherPreset = await submit(c, body({preset: 'h265-1080p'}));
+  assert(otherPreset.status === 201 && otherPreset.json().job_id !== first.json().job_id, \`another preset of the same source is another job, the submit answered \${otherPreset.status} \${otherPreset.text}\`);
+  const otherTenant = await submit(c, body(), 't-2');
+  assert(otherTenant.status === 201 && otherTenant.json().job_id !== first.json().job_id, \`another tenant's upload of the same file answered \${otherTenant.status} \${otherTenant.text}: it is that tenant's own job, keyed by (tenant, sha256, preset)\`);
+}
+
+export async function check_preset_args(ctx) {
+  const {c, jobs, presets} = api(ctx);
+  const r = await submit(c, body({args: EVIL_ARGS}));
+  assert.equal(r.status, 201, \`a submit carrying args answered \${r.status}: \${r.text}\`);
+  const job = await jobs.get(r.json().job_id);
+  assert.deepStrictEqual(job.encoder_args, presets.encoderArgs('h264-720p'), \`the job will run the encoder with \${JSON.stringify(job.encoder_args)}: the arguments must come from the h264-720p preset, the caller's args are never read\`);
+}
+
+export async function check_preset_404(ctx) {
+  const {c} = api(ctx);
+  for (const preset of ['h264-4k', 'H264-720P', '../h264-720p', 'constructor']) {
+    const r = await submit(c, body({preset}));
+    assert.equal(r.status, 404, \`a submit with the unknown preset \${JSON.stringify(preset)} answered \${r.status}, expected 404 before any job exists\`);
+  }
+  assert.equal(created(ctx), 0, \`submits with unknown presets created \${created(ctx)} jobs\`);
+  const r = await submit(c, body({preset: 'h264-1080p'}));
+  assert.equal(r.status, 201, \`a known preset answered \${r.status}: \${r.text}\`);
+}
+
+export async function check_source_hash(ctx) {
+  const {c} = api(ctx);
+  const bad: [string, object][] = [
+    ['a short hash', body({sha: 'abc123'})],
+    ['an upper-case hash', body({sha: SHA.toUpperCase()})],
+    ['a 63-character hash', body({sha: SHA.slice(0, 63)})],
+    ['a non-hex hash', body({sha: 'z'.repeat(64)})],
+    ['a zero duration', body({duration: 0})],
+    ['an empty uri', body({uri: ''})],
+    ['an empty bucket', body({bucket: ''})],
+  ];
+  for (const [what, json] of bad) {
+    const r = await submit(c, json);
+    assert.equal(r.status, 400, \`a submit with \${what} answered \${r.status}, expected 400\`);
+  }
+  assert.equal(created(ctx), 0, \`invalid submits created \${created(ctx)} jobs: the dedupe key is built from whatever arrived\`);
+  const r = await submit(c, body());
+  assert.equal(r.status, 201, \`the valid submit answered \${r.status}: \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"transcoder/jobs"
+	"transcoder/presets"
+
+	"leetbuild/harness"
+)
+
+var (
+	sourceSHA = strings.Repeat("9f", 32)
+	evilArgs  = []string{"-vf", "movie=/etc/passwd", "-f", "image2"}
+)
+
+type jobAnswer struct {
+	JobID        string \`json:"job_id"\`
+	SegmentCount int    \`json:"segment_count"\`
+	Deduped      bool   \`json:"deduped"\`
+}
+
+func transcodeBody(sha, preset string, duration float64, uri, bucket string, args []string) map[string]any {
+	body := map[string]any{
+		"source": map[string]any{"uri": uri, "sha256": sha, "duration_s": duration},
+		"preset": preset,
+		"output": map[string]any{"bucket": bucket, "prefix": "talks/42"},
+	}
+	if args != nil {
+		body["args"] = args
+	}
+	return body
+}
+
+func validBody() map[string]any {
+	return transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)
+}
+
+func submitter(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func postJob(c *harness.HTTP, body any, tenant string) *harness.Response {
+	return c.Post("/v1/transcodes", body, "X-Tenant-Id", tenant)
+}
+
+func decodeJob(r *harness.Response) jobAnswer {
+	var a jobAnswer
+	r.Decode(&a)
+	return a
+}
+
+func jobsCreated(ctx *harness.Ctx) int {
+	raw, _ := ctx.Redis.Get("job:seq")
+	n, _ := strconv.Atoi(raw)
+	return n
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := submitter(ctx)
+	r := postJob(c, validBody(), "t-1")
+	ctx.Equal(r.Status, 201, "a valid submit (%s)", r.Text())
+	a := decodeJob(r)
+	ctx.Assert(a.SegmentCount == 3 && !a.Deduped, "a 14-second source in 6-second segments is 3 segments, deduped false; the submit answered %s", r.Text())
+	job := jobs.Get(context.Background(), a.JobID)
+	ctx.Assert(job != nil && job.Tenant == "t-1" && job.SourceSHA256 == sourceSHA, "the job store holds %+v for job %s", job, a.JobID)
+}
+
+func CheckDedupe(ctx *harness.Ctx) {
+	c := submitter(ctx)
+	first := postJob(c, validBody(), "t-1")
+	ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text())
+	firstID := decodeJob(first).JobID
+	retry := postJob(c, validBody(), "t-1")
+	again := decodeJob(retry)
+	ctx.Assert(retry.Status == 200 && again.JobID == firstID && again.Deduped, "a retry of the same source and preset answered %d %s: it must answer the existing job %s with 200 and deduped true", retry.Status, retry.Text(), firstID)
+	ctx.Equal(jobsCreated(ctx), 1, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created")
+	otherPreset := postJob(c, transcodeBody(sourceSHA, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Assert(otherPreset.Status == 201 && decodeJob(otherPreset).JobID != firstID, "another preset of the same source is another job, the submit answered %d %s", otherPreset.Status, otherPreset.Text())
+	otherTenant := postJob(c, validBody(), "t-2")
+	ctx.Assert(otherTenant.Status == 201 && decodeJob(otherTenant).JobID != firstID, "another tenant's upload of the same file answered %d %s: it is that tenant's own job, keyed by (tenant, sha256, preset)", otherTenant.Status, otherTenant.Text())
+}
+
+func CheckPresetArgs(ctx *harness.Ctx) {
+	c := submitter(ctx)
+	r := postJob(c, transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "renditions", evilArgs), "t-1")
+	ctx.Equal(r.Status, 201, "a submit carrying args (%s)", r.Text())
+	job := jobs.Get(context.Background(), decodeJob(r).JobID)
+	want, _ := presets.EncoderArgs("h264-720p")
+	ctx.Assert(job != nil, "the job store holds no job %s", decodeJob(r).JobID)
+	ctx.Equal(job.EncoderArgs, want, "the job's encoder arguments must come from the h264-720p preset, the caller's args are never read")
+}
+
+func CheckPreset404(ctx *harness.Ctx) {
+	c := submitter(ctx)
+	for _, preset := range []string{"h264-4k", "H264-720P", "../h264-720p"} {
+		r := postJob(c, transcodeBody(sourceSHA, preset, 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+		ctx.Equal(r.Status, 404, "a submit with the unknown preset %q must answer 404 before any job exists; the status", preset)
+	}
+	ctx.Equal(jobsCreated(ctx), 0, "submits with unknown presets must create nothing; jobs created")
+	r := postJob(c, transcodeBody(sourceSHA, "h264-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Equal(r.Status, 201, "a known preset (%s)", r.Text())
+}
+
+func CheckSourceHash(ctx *harness.Ctx) {
+	c := submitter(ctx)
+	bad := []struct {
+		what string
+		body map[string]any
+	}{
+		{"a short hash", transcodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"an upper-case hash", transcodeBody(strings.ToUpper(sourceSHA), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a 63-character hash", transcodeBody(sourceSHA[:63], "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a non-hex hash", transcodeBody(strings.Repeat("z", 64), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a zero duration", transcodeBody(sourceSHA, "h264-720p", 0, "s3://uploads/talk.mov", "renditions", nil)},
+		{"an empty uri", transcodeBody(sourceSHA, "h264-720p", 14, "", "renditions", nil)},
+		{"an empty bucket", transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "", nil)},
+	}
+	for _, b := range bad {
+		r := postJob(c, b.body, "t-1")
+		ctx.Equal(r.Status, 400, "a submit with %s; the status", b.what)
+	}
+	ctx.Equal(jobsCreated(ctx), 0, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created")
+	r := postJob(c, validBody(), "t-1")
+	ctx.Equal(r.Status, 201, "the valid submit (%s)", r.Text())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cctype>
+#include <string>
+#include <vector>
+
+#include "transcoder/jobs.h"
+#include "transcoder/presets.h"
 
 namespace {
 
-struct PresetDef {
-  std::string container;
-  std::string vcodec;
-  std::vector<std::string> args;
-};
+const std::string kSha(64, 'f');
+const std::vector<std::string> kEvilArgs = {"-vf", "movie=/etc/passwd", "-f", "image2"};
 
-const std::map<std::string, PresetDef> kPresets = {
-    {"h264-720p", {"mp4", "libx264", {"-vf", "scale=1280:720", "-crf", "21"}}},
-    {"h264-1080p", {"mp4", "libx264", {"-vf", "scale=1920:1080", "-crf", "21"}}},
-    {"h265-1080p", {"mp4", "libx265", {"-vf", "scale=1920:1080", "-crf", "24"}}},
-};
+nlohmann::json transcodeBody(const std::string& sha, const std::string& preset, double duration, const std::string& uri, const std::string& bucket) {
+  return {{"source", {{"uri", uri}, {"sha256", sha}, {"duration_s", duration}}}, {"preset", preset}, {"output", {{"bucket", bucket}, {"prefix", "talks/42"}}}};
+}
 
-const std::regex kPresetRe(R"(^[a-z0-9][a-z0-9._-]{0,63}$)");
-const std::regex kSha256Re(R"(^[0-9a-f]{64}$)");
-const double kSegmentSeconds = 6.0;
+nlohmann::json validBody() { return transcodeBody(kSha, "h264-720p", 14, "s3://uploads/talk.mov", "renditions"); }
 
-std::string newJobId() {
-  static std::atomic<uint64_t> counter{0};
-  return "job-" + std::to_string(++counter);
+harness::HTTP submitter(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+harness::Response postJob(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant) {
+  return c.Post("/v1/transcodes", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
+}
+
+nlohmann::json answerOf(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() ? body : nlohmann::json::object();
+}
+
+long jobsCreated(harness::Ctx& ctx) {
+  const auto raw = ctx.Redis.Get("job:seq");
+  return raw ? std::stol(*raw) : 0L;
 }
 
 }  // namespace
 
-class JobStore {
- public:
-  /** The job already encoding (source_sha256, preset), if one exists. */
-  std::optional<json> find(const std::string& source_sha256, const std::string& preset) { return std::nullopt; }
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = submitter(ctx);
+  const auto r = postJob(c, validBody(), "t-1");
+  ctx.Equal(r.Status, 201, "a valid submit (%s)", r.Text());
+  const auto a = answerOf(r);
+  ctx.Assert(a.value("segment_count", 0) == 3 && a.value("deduped", true) == false, "a 14-second source in 6-second segments is 3 segments, deduped false; the submit answered %s", r.Text());
+  const auto job = jobs::get(a.value("job_id", ""));
+  ctx.Assert(job && job->tenant == "t-1" && job->source_sha256 == kSha, "the job store holds no job of t-1 for this source under %s", a.value("job_id", ""));
+}
 
-  /** Create and persist a queued job for (source_sha256, preset). */
-  json create(const std::string& source_sha256, const std::string& preset, const std::string& source_uri) {
-    return json{{"job_id", newJobId()}, {"state", "queued"}};
+void CheckDedupe(harness::Ctx& ctx) {
+  auto c = submitter(ctx);
+  const auto first = postJob(c, validBody(), "t-1");
+  ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text());
+  const std::string first_id = answerOf(first).value("job_id", "");
+  const auto retry = postJob(c, validBody(), "t-1");
+  const auto again = answerOf(retry);
+  ctx.Assert(retry.Status == 200 && again.value("job_id", "") == first_id && again.value("deduped", false), "a retry of the same source and preset answered %d %s: it must answer the existing job %s with 200 and deduped true", retry.Status, retry.Text(), first_id);
+  ctx.Equal(jobsCreated(ctx), 1L, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created");
+  const auto other_preset = postJob(c, transcodeBody(kSha, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Assert(other_preset.Status == 201 && answerOf(other_preset).value("job_id", "") != first_id, "another preset of the same source is another job, the submit answered %d %s", other_preset.Status, other_preset.Text());
+  const auto other_tenant = postJob(c, validBody(), "t-2");
+  ctx.Assert(other_tenant.Status == 201 && answerOf(other_tenant).value("job_id", "") != first_id, "another tenant's upload of the same file answered %d %s: it is that tenant's own job, keyed by (tenant, sha256, preset)", other_tenant.Status, other_tenant.Text());
+}
+
+void CheckPresetArgs(harness::Ctx& ctx) {
+  auto c = submitter(ctx);
+  nlohmann::json body = validBody();
+  body["args"] = kEvilArgs;
+  const auto r = postJob(c, body, "t-1");
+  ctx.Equal(r.Status, 201, "a submit carrying args (%s)", r.Text());
+  const auto job = jobs::get(answerOf(r).value("job_id", ""));
+  ctx.Assert(job.has_value(), "the job store holds no job for %s", r.Text());
+  ctx.Equal(job->encoder_args, *presets::encoderArgs("h264-720p"), "the job's encoder arguments must come from the h264-720p preset, the caller's args are never read");
+}
+
+void CheckPreset404(harness::Ctx& ctx) {
+  auto c = submitter(ctx);
+  for (const std::string preset : {"h264-4k", "H264-720P", "../h264-720p"}) {
+    const auto r = postJob(c, transcodeBody(kSha, preset, 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+    ctx.Equal(r.Status, 404, "a submit with the unknown preset %q must answer 404 before any job exists; the status", preset);
   }
-};
+  ctx.Equal(jobsCreated(ctx), 0L, "submits with unknown presets must create nothing; jobs created");
+  const auto r = postJob(c, transcodeBody(kSha, "h264-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Equal(r.Status, 201, "a known preset (%s)", r.Text());
+}
 
-JobStore jobs;
-
-int main() {
-  httplib::Server svr;
-
-  svr.Post("/v1/transcodes", [](const httplib::Request& req, httplib::Response& res) {
-    const json body = json::parse(req.body, nullptr, false);
-    if (body.is_discarded() || !body.contains("source") || !body.contains("preset") || !body.contains("output")) {
-      res.status = 400;
-      res.set_content(json{{"error", "source, preset and output are required"}}.dump(), "application/json");
-      return;
-    }
-    const json source = body.at("source");
-    const std::string preset = body.at("preset").get<std::string>();
-    const json out = body.at("output");
-    if (source.value("uri", "").empty()) {
-      res.status = 400;
-      res.set_content(json{{"error", "source.uri is required"}}.dump(), "application/json");
-      return;
-    }
-    const std::string sha256 = source.value("sha256", "");
-    if (!std::regex_match(sha256, kSha256Re)) {
-      res.status = 400;
-      res.set_content(json{{"error", "source.sha256 must be 64 lowercase hex characters"}}.dump(), "application/json");
-      return;
-    }
-    if (!(source.value("duration_s", 0.0) > 0.0)) {
-      res.status = 400;
-      res.set_content(json{{"error", "source.duration_s must be positive"}}.dump(), "application/json");
-      return;
-    }
-    if (out.value("bucket", "").empty() || out.value("prefix", "").empty()) {
-      res.status = 400;
-      res.set_content(json{{"error", "output target is incomplete"}}.dump(), "application/json");
-      return;
-    }
-    if (!std::regex_match(preset, kPresetRe) || kPresets.count(preset) == 0) {
-      res.status = 404;
-      res.set_content(json{{"error", "unknown preset"}}.dump(), "application/json");
-      return;
-    }
-
-    // The preset decides the encoder command; a caller-supplied args list is never read.
-    if (auto existing = jobs.find(sha256, preset); existing.has_value()) {
-      std::clog << "transcode deduped job=" << existing->at("job_id") << " preset=" << preset << std::endl;
-      res.status = 200;
-      res.set_content(
-          json{{"job_id", existing->at("job_id")}, {"state", existing->at("state")}, {"deduped", true}}.dump(),
-          "application/json");
-      return;
-    }
-
-    const std::vector<std::string> args = kPresets.at(preset).args;
-    const json job = jobs.create(sha256, preset, source.value("uri", ""));
-    const int segments = static_cast<int>(std::ceil(source.value("duration_s", 0.0) / kSegmentSeconds));
-    std::clog << "transcode queued job=" << job.at("job_id") << " preset=" << preset << " segments=" << segments
-              << std::endl;
-    res.status = 201;
-    res.set_content(
-        json{{"job_id", job.at("job_id")},
-             {"state", job.at("state")},
-             {"deduped", false},
-             {"segments", segments},
-             {"args", args}}
-            .dump(),
-        "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void CheckSourceHash(harness::Ctx& ctx) {
+  auto c = submitter(ctx);
+  std::string upper = kSha;
+  for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  const std::vector<std::pair<std::string, nlohmann::json>> bad = {
+      {"a short hash", transcodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"an upper-case hash", transcodeBody(upper, "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a 63-character hash", transcodeBody(kSha.substr(0, 63), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a non-hex hash", transcodeBody(std::string(64, 'z'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a zero duration", transcodeBody(kSha, "h264-720p", 0, "s3://uploads/talk.mov", "renditions")},
+      {"an empty uri", transcodeBody(kSha, "h264-720p", 14, "", "renditions")},
+      {"an empty bucket", transcodeBody(kSha, "h264-720p", 14, "s3://uploads/talk.mov", "")},
+  };
+  for (const auto& [what, body] : bad) {
+    const auto r = postJob(c, body, "t-1");
+    ctx.Equal(r.Status, 400, "a submit with %s; the status", what);
+  }
+  ctx.Equal(jobsCreated(ctx), 0L, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created");
+  const auto r = postJob(c, validBody(), "t-1");
+  ctx.Equal(r.Status, 201, "the valid submit (%s)", r.Text());
 }
 `,
-    },
   },
   hints: [
-    'The bill shows the same movie encoded twice after one client retry, and a support ticket reports a job that "queued fine" and then died in a worker with an unknown preset.',
-    'Every submit mints a new UUID and nothing queries the job store by content, so a replay is a new job; `body.args` and an unchecked `preset` string reach the encoder untouched.',
-    'Validate uri, 64-hex sha256, duration and output (400), resolve `preset` in `PRESETS` (404), then `find(sha256, preset)`: hit answers 200 `deduped: true`, miss creates and answers 201. Ignore `args`.',
+    'Submit the same upload twice with a client retry: two job ids come back and two encodes run. Submit with an `args` list naming a file on the worker: the job stores it as its encoder command.',
+    'The handler hands `body.args` to `jobs.create` and never asks the job store or the preset table anything first, so nothing stops a duplicate, a made-up preset or a hash like "abc" from becoming a job.',
+    'Answer 400 unless the sha256 matches `^[0-9a-f]{64}$` and uri, bucket, prefix and a positive duration are present; take `presets.encoder_args(preset)` (404 when None); return `jobs.find(tenant, sha256, preset)` with 200 and `deduped: true` before `jobs.create`.',
   ],
-  debrief: `The fix is ordered by trust: cheap shape checks first, then the preset lookup, then the content-keyed lookup, and only then a write. That order makes the handler idempotent for free: the pair \`(sha256, preset)\` names the work, so a retry finds the row the first attempt created instead of minting another UUID. Hash validation matters for the same reason; a key built from an unvalidated string lets two sources collide. Keeping the encoder command inside \`PRESETS\` removes the only path by which a caller could run arbitrary filters on your workers. What this step did not do: a real submit endpoint also checks that the source object exists before planning segments, so a dead URI fails here rather than in the first worker.`,
+  debrief: `The order of the handler is the fix: validate what arrived, resolve the preset, look the key up, and only then create. The dedupe key includes the tenant because two tenants uploading the same file own two jobs; sharing one would hand the second tenant an id it may not read. The preset table is the only source of encoder arguments, so the command a worker runs is something the service chose, and a caller's list is accepted for compatibility and dropped. A real submit path also closes the race between two concurrent first submits (a \`SET NX\` on the source key, or a unique index), and checks that the source object exists and that its hash matches before queueing any work.`,
 };

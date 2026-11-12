@@ -2,341 +2,308 @@ import type {Step} from '@/lib/types';
 
 export const eventsStep: Step = {
   id: 'events',
-  title: 'Discovery events keyed by service',
+  title: 'Membership events keyed by service, published on the real expiry',
   concept: 'kafka',
   file: 'events',
   focus: ['discovery', 'kafka', 'consumer', 'reaper'],
   task: `## Task
 
-**Starting point.** The starter is the membership publisher for \`discovery.event\`: \`publish\`
-produces \`{"stage", "service", "instance_id", "address"}\` keyed by the instance id from a default
-producer, and \`heartbeat\` calls \`EXPIRE\` on the registry key and then publishes \`expired\` for
-the instance it just renewed. It serves the demo, which shows events in the topic, and hides five
-flaws.
+**Starting point.** The starter produces the \`discovery.event\` membership stream routers and caches
+consume: \`publish_event(event)\` produces \`{"kind", "service", "instance_id", "reason"}\` keyed by the
+instance id from a producer with \`acks=1\`, and writes the outbox (\`outbox.write\`) when \`produce\`
+raises; \`sweep_expired(service)\` announces \`expired\` for every member whose record TTL is below
+\`EXPIRY_MARGIN_S\` and drops it from \`sd:members:{service}\`. It serves the demo and hides four flaws.
 
-**Failure mode the checks target.** Consumers drop a live, healthy instance from their caches,
-because the stream announces an expiry every time a heartbeat prevents one. One service's
-\`registered → excluded → readmitted\` sequence is scattered across partitions and applied out of
-order. A broker hiccup is a silent hole in membership history. The payload cannot explain a change
-without reading an instance that may already be gone, and a producer retry can duplicate or reorder
-a transition.
+**Failure mode the checks target.** One service's changes land on several partitions and a cache
+applies them out of order; a live instance with two seconds left on its record is announced expired;
+a broker that lost an acknowledgement gets the event twice; and a delivery that fails after
+\`produce\` returned is lost, because only a local enqueue error raises.
 
-- One event per transition: \`kind\` is \`registered\`, \`expired\`, \`excluded\` or \`readmitted\`;
-  the payload carries \`service\`, \`instance_id\`, \`address\`, \`metadata_version\` and a \`reason\`.
-- The message key is the service name (\`key=service\`).
-- Publish at the actual transition: \`expired\` is emitted by the reaper (\`sweep_expired\`) when the
-  registry key's \`TTL\` has lapsed, not from the heartbeat path that just extended it; \`excluded\`
-  and \`readmitted\` are published at the probe transition with the reason.
-- When the broker rejects the produce, write a row to the outbox (\`class Outbox\`, \`outbox.write\`)
-  keyed by the service, with the payload and an attempt counter.
-- The producer is idempotent with \`acks=all\` (\`RequireAll\` and \`MaxAttempts\` in kafka-go).`,
+- The record key is the **service name**.
+- \`sweep_expired\` announces an instance once its record is gone, and once: the existence check and
+  the \`SREM\` are one Lua script, and only the sweeper whose \`SREM\` removed the member publishes.
+- The producer is **idempotent** with **\`acks=all\`** (in Go, confluent-kafka-go: kafka-go has no
+  idempotent producer).
+- Wait for the delivery report at most \`ACK_TIMEOUT_S\` (2 s); when it fails or does not come, write
+  the outbox row \`(topic, service, event)\` and return \`False\`.`,
   sequence: {
-    participants: ['Discovery API', 'discovery.event', 'Membership consumer', 'Outbox'],
+    participants: ['Expiry sweep', 'Redis', 'discovery.event', 'Outbox', 'Membership cache'],
     messages: [
       {
-        from: 'Discovery API',
-        to: 'discovery.event',
-        label: 'produce key=checkout {kind registered, instance_id, metadata_version, reason}',
-        kind: 'async',
-      },
-      {from: 'discovery.event', to: 'Discovery API', label: 'ack=all · error when the broker is down', kind: 'reply'},
-      {
-        from: 'Discovery API',
-        to: 'Outbox',
-        label: 'INSERT (service, payload, next_attempt) when the produce is rejected',
+        from: 'Expiry sweep',
+        to: 'Redis',
+        label: 'EVAL claim: EXISTS sd:checkout:checkout-1 → 0 · SREM sd:members:checkout → 1',
         kind: 'sync',
       },
-      {from: 'Outbox', to: 'Discovery API', label: '1 row — membership history is safe', kind: 'reply'},
       {
-        from: 'discovery.event',
-        to: 'Membership consumer',
-        label: 'consume key=checkout — one partition per service, ordered',
+        from: 'Expiry sweep',
+        to: 'discovery.event',
+        label: 'produce key=checkout {kind expired} · idempotent · acks=all',
+        kind: 'sync',
+      },
+      {from: 'discovery.event', to: 'Expiry sweep', label: 'delivery report within 2 s', kind: 'reply'},
+      {
+        from: 'Expiry sweep',
+        to: 'Outbox',
+        label: 'no report or an error: write (topic, service, event)',
         kind: 'async',
       },
-      {
-        from: 'Membership consumer',
-        to: 'discovery.event',
-        label: 'commit only after the membership cache is updated',
-        kind: 'reply',
-      },
+      {from: 'discovery.event', to: 'Membership cache', label: 'one partition per service, in order', kind: 'async'},
     ],
   },
   checks: [
     {
       id: 'service-key',
-      title: 'Events are keyed by service',
+      title: 'Membership events are keyed by service',
       detail:
-        "Every discovery event is produced with the **service name as the message key**, so one service's transitions land in one partition and arrive in order. The starter keys by instance id and scatters the membership stream.",
+        "Three events for checkout, payments, checkout carry those keys and the two checkout events share a partition. The starter keys by instance id, which spreads one service's changes over every partition.",
       match: {
-        python: {all: [/discovery\.event/, /key=service/]},
-        typescript: {all: [/discovery\.event/, /key:\s*service\b/]},
-        go: {all: [/discovery\.event|discoveryEventTopic/, /Key:\s*\[\]byte\(service\)/]},
-        scala: {all: [/DiscoveryEventTopic|discovery\.event/, /ProducerRecord\[[^\]]*\]\([^,]+,\s*service/]},
-        cpp: {all: [/discovery\.event|kDiscoveryEventTopic/, /RD_KAFKA_V_KEY\(service/]},
+        python: {all: [/producer\.produce\(\s*[^\n]*key\s*=\s*event\[["']service["']\]/]},
+        typescript: {all: [/key:\s*event\.service\b/]},
+        go: {all: [/Key:\s*\[\]byte\(\s*event\.Service\s*\)/]},
+        scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*event\.service\s*,/]},
+        cpp: {all: [/event\.service\.c_str\(\)\s*,\s*event\.service\.(size|length)\(\)/]},
       },
     },
     {
-      id: 'transition',
-      title: 'Expiry is published at the real transition',
+      id: 'real-expiry',
+      title: 'Expired is published once the record is gone, once',
       detail:
-        'The `expired` event comes from the reaper after the heartbeat TTL has actually lapsed (`TTL < 0` on the registry key), not from the heartbeat that just renewed it. The starter publishes an expiry that has not happened.',
+        'The sweep claims a member in one script (`EXISTS` on the record, then `SREM` from the members set) and publishes only when the claim returns 1. The starter reads the TTL and announces an instance that still has seconds left.',
       match: {
-        python: {all: [/sweep_expired/, /\.ttl\(/]},
-        typescript: {all: [/sweepExpired/, /\.ttl\(/]},
-        go: {all: [/sweepExpired/, /TTL\(ctx/]},
-        scala: {all: [/sweepExpired/, /\.ttl\(/]},
-        cpp: {all: [/sweepExpired/, /ttl\(/]},
+        python: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/r\.ttl\(/]},
+        typescript: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/redis\.ttl\(/]},
+        go: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/rdb\.TTL\(/]},
+        scala: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/jedis\.ttl\(/]},
+        cpp: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/redis\.ttl\(/]},
       },
     },
     {
-      id: 'reason',
-      title: 'The payload names the instance and the reason',
+      id: 'acks-idempotent',
+      title: 'Idempotent producer with acks=all',
       detail:
-        'The event carries `kind`, `instance_id`, `metadata_version` and `reason`, so a consumer can explain a membership change without reading a registry entry that may already be gone. The starter ships `{"stage", "instance_id", "address"}`.',
+        'A write whose acknowledgement was lost is retried and lands once, and a record survives a leader failover. The starter sets `acks=1` and no idempotence.',
       match: {
-        python: {all: [/kind/, /reason/, /metadata_version/]},
-        typescript: {all: [/kind/, /reason/, /metadata_version/]},
-        go: {all: [/kind/, /reason/, /metadata_version/]},
-        scala: {all: [/kind/, /reason/, /metadata_version/]},
-        cpp: {all: [/kind/, /reason/, /metadata_version/]},
+        python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
+        go: {all: [/"acks":\s*"(all|-1)"/, /"enable\.idempotence":\s*true/]},
+        scala: {all: [/put\("acks",\s*"(all|-1)"\)/, /put\("enable\.idempotence",\s*"true"\)/]},
+        cpp: {all: [/set\("acks",\s*"(all|-1)"/, /set\("enable\.idempotence",\s*"true"/]},
       },
     },
     {
-      id: 'outbox',
-      title: 'A rejected produce lands in the outbox',
+      id: 'outbox-on-failure',
+      title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'When the broker refuses the produce, the event is written to the outbox keyed by the service with its payload and attempt counter instead of being dropped. The starter has no outbox at all.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the service and the event, and the call returns false. The starter only catches the errors `produce` raises locally, so a failed delivery vanishes.',
       match: {
-        python: {all: [/class Outbox/, /outbox\.write\(/]},
-        typescript: {all: [/class Outbox/, /outbox\.write\(/]},
-        go: {all: [/type Outbox/, /outbox\.Write\(/]},
-        scala: {all: [/object Outbox/, /Outbox\.write\(/]},
-        cpp: {all: [/struct Outbox/, /outbox\.write\(/]},
-      },
-    },
-    {
-      id: 'durable-producer',
-      title: 'The producer is idempotent and acks all',
-      detail:
-        'The producer is configured for durability — idempotence on and `acks=all` (`RequireAll`, `MaxAttempts` in kafka-go) — so a retry cannot duplicate or reorder a membership transition. The starter runs on defaults.',
-      match: {
-        python: {all: [/enable\.idempotence/, /acks/]},
-        typescript: {all: [/idempotent/, /acks/]},
-        go: {all: [/kafka\.RequireAll/, /MaxAttempts/]},
-        scala: {all: [/enable\.idempotence/, /acks/]},
-        cpp: {all: [/enable\.idempotence/, /acks/]},
+        python: {
+          all: [/outbox\.write\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
+          none: [/except\s+KafkaException/],
+        },
+        typescript: {all: [/outbox\.write\(/, /await producer\.send\(/, /catch/], none: [/void producer\.send\(/]},
+        go: {all: [/outbox\.Write\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
+        scala: {all: [/Outbox\.write\(/, /\.get\(\s*[^\n]*TimeUnit/], none: [/case _: KafkaException/]},
+        cpp: {all: [/outbox::write\(/, /->flush\(/, /dr_cb/]},
       },
     },
   ],
   code: {
     python: {
       starter: `import json
-import logging
-
-import redis
-from confluent_kafka import Producer
-
-logger = logging.getLogger("discovery")
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-TOPIC = "discovery.event"
-TTL_SECONDS = 30
-producer = Producer({"bootstrap.servers": "kafka:9092"})
-
-
-def publish(service: str, stage: str, instance: dict) -> None:
-    payload = json.dumps({
-        "stage": stage,
-        "service": service,
-        "instance_id": instance["instance_id"],
-        "address": instance["address"],
-    })
-    producer.produce(TOPIC, key=instance["instance_id"], value=payload)
-    producer.flush(2)
-
-
-def heartbeat(service: str, instance: dict) -> None:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    key = f"sd:{service}:{instance['instance_id']}"
-    r.expire(key, TTL_SECONDS)
-    publish(service, "expired", instance)
-    logger.info("heartbeat service=%s instance=%s", service, instance["instance_id"])
-`,
-      solution: `import json
-import logging
 
 import redis
 from confluent_kafka import KafkaException, Producer
 
-logger = logging.getLogger("discovery")
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
+from discovery import instances  # members, record_key, members_key
+from discovery import outbox  # write(topic, key, payload)
 
 TOPIC = "discovery.event"
+EXPIRY_MARGIN_S = 5
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "1"})
+
+
+def publish_event(event: dict) -> bool:
+    """Produce one membership event {kind, service, instance_id, reason}; True when it is on its way."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    try:
+        producer.produce(TOPIC, key=event["instance_id"], value=json.dumps(event))
+        producer.poll(0)
+    except KafkaException:
+        outbox.write(TOPIC, event["instance_id"], event)
+        return False
+    return True
+
+
+def sweep_expired(service: str) -> list[str]:
+    """Announce the members of service whose record has lapsed; returns their ids."""
+    expired = []
+    for instance_id in instances.members(service):
+        if r.ttl(instances.record_key(service, instance_id)) < EXPIRY_MARGIN_S:
+            r.srem(instances.members_key(service), instance_id)
+            publish_event({"kind": "expired", "service": service, "instance_id": instance_id, "reason": "heartbeat TTL lapsed"})
+            expired.append(instance_id)
+    return expired
+`,
+      solution: `import json
+
+import redis
+from confluent_kafka import Producer
+
+from discovery import instances  # members, record_key, members_key
+from discovery import outbox  # write(topic, key, payload)
+
+TOPIC = "discovery.event"
+ACK_TIMEOUT_S = 2
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
 producer = Producer({
     "bootstrap.servers": "kafka:9092",
-    "enable.idempotence": True,
-    "acks": "all",
+    "acks": "all",  # every in-sync replica has the event before the broker answers
+    "enable.idempotence": True,  # a write retried after a lost acknowledgement lands once
 })
 
-
-class Outbox:
-    def write(self, service: str, event: dict) -> None:
-        """Persist a membership event the broker refused, keyed by the service, for replay."""
-        raise NotImplementedError
-
-
-outbox = Outbox()
-
-
-def publish(service: str, kind: str, instance: dict, reason: str) -> None:
-    event = {
-        "kind": kind,
-        "service": service,
-        "instance_id": instance["instance_id"],
-        "address": instance["address"],
-        "metadata_version": instance.get("metadata_version", 0),
-        "reason": reason,
-    }
-    try:
-        producer.produce(TOPIC, key=service, value=json.dumps(event))
-        producer.flush(2)
-    except KafkaException:
-        logger.warning("outbox service=%s instance=%s kind=%s", service, instance["instance_id"], kind)
-        outbox.write(service, event)
+# KEYS[1] the record, KEYS[2] the members set, ARGV[1] the instance id. The expiry is claimed only
+# while the record is gone, and only by the sweeper whose SREM removed the member.
+CLAIM_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+return redis.call('SREM', KEYS[2], ARGV[1])
+"""
+claim = r.register_script(CLAIM_LUA)
 
 
-def sweep_expired(service: str) -> None:
-    """Reap instances whose heartbeat TTL has actually lapsed and publish that transition."""
-    for key in r.scan_iter(f"sd:{service}:*"):
-        if r.ttl(key) < 0:
-            instance = json.loads(r.get(key) or "{}")
-            publish(service, "expired", instance, "heartbeat lapsed")
+def publish_event(event: dict) -> bool:
+    """Produce one membership event {kind, service, instance_id, reason}; True once the broker acknowledged it."""
+    outcome = {}
+
+    def on_delivery(err, msg):
+        outcome["error"] = err
+
+    # Keyed by service: one service's changes share a partition, so caches apply them in order.
+    producer.produce(TOPIC, key=event["service"], value=json.dumps(event), on_delivery=on_delivery)
+    in_flight = producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    if in_flight > 0 or outcome.get("error") is not None:
+        # The broker did not take it: the relay republishes the row, so the change is late, not lost.
+        outbox.write(TOPIC, event["service"], event)
+        return False
+    return True
 
 
-def on_probe(service: str, instance: dict, healthy: bool) -> None:
-    """A probe transition publishes readmitted or excluded — never before the verdict exists."""
-    publish(
-        service,
-        "readmitted" if healthy else "excluded",
-        instance,
-        "probe passed" if healthy else "probe failed",
-    )
+def sweep_expired(service: str) -> list[str]:
+    """Announce the members of service whose record has lapsed; returns their ids."""
+    expired = []
+    for instance_id in instances.members(service):
+        keys = [instances.record_key(service, instance_id), instances.members_key(service)]
+        if claim(keys=keys, args=[instance_id]) != 1:
+            continue  # still alive, re-registered, or another sweeper announced it
+        publish_event({"kind": "expired", "service": service, "instance_id": instance_id, "reason": "heartbeat TTL lapsed"})
+        expired.append(instance_id)
+    return expired
 `,
     },
     typescript: {
-      starter: `/** discovery.event: flawed code that fires events and forgets them. */
+      starter: `import Redis from 'ioredis';
 import {Kafka} from 'kafkajs';
-import Redis from 'ioredis';
 
-export const redis = new Redis({host: 'redis', port: 6379});
+import * as instances from 'discovery/instances'; // members, recordKey, membersKey
+import * as outbox from 'discovery/outbox'; // write(topic, key, payload)
 
-const TOPIC = 'discovery.event';
-const kafka = new Kafka({clientId: 'discovery', brokers: ['kafka:9092']});
+export const TOPIC = 'discovery.event';
+export const EXPIRY_MARGIN_S = 5;
+
+export type MembershipEvent = {kind: string; service: string; instance_id: string; reason: string};
+
+const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'discoveryd', brokers: ['kafka:9092']});
 const producer = kafka.producer();
-
-interface InstanceRecord {
-  instance_id: string;
-  address: string;
-  metadata_version: number;
-}
-
-async function publish(service: string, stage: string, instance: InstanceRecord): Promise<void> {
-  const payload = JSON.stringify({
-    stage,
-    service,
-    instance_id: instance.instance_id,
-    address: instance.address,
-  });
-  await producer.send({topic: TOPIC, messages: [{key: instance.instance_id, value: payload}]});
-}
-
-export async function heartbeat(service: string, instance: InstanceRecord): Promise<void> {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const key = \`sd:\${service}:\${instance.instance_id}\`;
-  await redis.expire(key, 30);
-  await publish(service, 'expired', instance);
-  return Promise.resolve();
-}
-
 void producer.connect();
-`,
-      solution: `/** discovery.event: one ordered membership stream per service, with an outbox on rejection. */
-import {Kafka, type Producer} from 'kafkajs';
-import Redis from 'ioredis';
 
-export const redis = new Redis({host: 'redis', port: 6379});
-
-const TOPIC = 'discovery.event';
-const kafka = new Kafka({clientId: 'discovery', brokers: ['kafka:9092']});
-const producer: Producer = kafka.producer({idempotent: true, maxInFlightRequests: 1});
-
-interface InstanceRecord {
-  instance_id: string;
-  address: string;
-  metadata_version: number;
-}
-
-interface DiscoveryEvent {
-  kind: 'registered' | 'expired' | 'excluded' | 'readmitted';
-  service: string;
-  instance_id: string;
-  address: string;
-  metadata_version: number;
-  reason: string;
-}
-
-class Outbox {
-  /** Persist a membership event the broker refused, keyed by the service, for replay. */
-  write(service: string, event: DiscoveryEvent): void {
-    void redis.hset(\`sd:outbox:\${service}\`, event.instance_id, JSON.stringify(event));
-  }
-}
-
-export const outbox = new Outbox();
-
-export async function publish(
-  service: string,
-  kind: DiscoveryEvent['kind'],
-  instance: InstanceRecord,
-  reason: string,
-): Promise<void> {
-  const event: DiscoveryEvent = {
-    kind,
-    service,
-    instance_id: instance.instance_id,
-    address: instance.address,
-    metadata_version: instance.metadata_version,
-    reason,
-  };
+/** Produce one membership event; true when it is on its way. */
+export async function publishEvent(event: MembershipEvent): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
   try {
-    await producer.send({
-      topic: TOPIC,
-      acks: -1,
-      messages: [{key: service, value: JSON.stringify(event)}],
-    });
+    void producer.send({topic: TOPIC, messages: [{key: event.instance_id, value: JSON.stringify(event)}], acks: 1});
   } catch {
-    outbox.write(service, event);
+    await outbox.write(TOPIC, event.instance_id, event);
+    return false;
   }
+  return true;
 }
 
-/** sweepExpired reaps instances whose TTL has really lapsed and publishes that transition. */
-export async function sweepExpired(service: string): Promise<void> {
-  const stream = redis.scanStream({match: \`sd:\${service}:*\`}) as AsyncIterable<string[]>;
-  for await (const batch of stream) {
-    for (const name of batch) {
-      if ((await redis.ttl(name)) < 0) {
-        const raw = await redis.get(name);
-        if (raw !== null) await publish(service, 'expired', JSON.parse(raw) as InstanceRecord, 'heartbeat lapsed');
-      }
+/** Announce the members of service whose record has lapsed; returns their ids. */
+export async function sweepExpired(service: string): Promise<string[]> {
+  const expired: string[] = [];
+  for (const instanceId of await instances.members(service)) {
+    if ((await redis.ttl(instances.recordKey(service, instanceId))) < EXPIRY_MARGIN_S) {
+      await redis.srem(instances.membersKey(service), instanceId);
+      await publishEvent({kind: 'expired', service, instance_id: instanceId, reason: 'heartbeat TTL lapsed'});
+      expired.push(instanceId);
     }
   }
+  return expired;
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+import * as instances from 'discovery/instances'; // members, recordKey, membersKey
+import * as outbox from 'discovery/outbox'; // write(topic, key, payload)
+
+export const TOPIC = 'discovery.event';
+export const ACK_TIMEOUT_MS = 2000;
+
+export type MembershipEvent = {kind: string; service: string; instance_id: string; reason: string};
+
+// KEYS[1] the record, KEYS[2] the members set, ARGV[1] the instance id. The expiry is claimed only
+// while the record is gone, and only by the sweeper whose SREM removed the member.
+export const CLAIM_LUA = \`
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+return redis.call('SREM', KEYS[2], ARGV[1])
+\`;
+
+interface ClaimRedis extends Redis {
+  claimExpired(record: string, members: string, instanceId: string): Promise<number>;
 }
 
-export async function onProbe(service: string, instance: InstanceRecord, healthy: boolean): Promise<void> {
-  await publish(service, healthy ? 'readmitted' : 'excluded', instance, healthy ? 'probe passed' : 'probe failed');
-}
+const redis = new Redis({host: 'redis', port: 6379}) as ClaimRedis;
+redis.defineCommand('claimExpired', {numberOfKeys: 2, lua: CLAIM_LUA});
 
+const kafka = new Kafka({clientId: 'discoveryd', brokers: ['kafka:9092']});
+// Idempotent: a write retried after a lost acknowledgement lands once (and needs acks: -1).
+const producer = kafka.producer({idempotent: true});
 void producer.connect();
+
+/** Produce one membership event; true once the broker acknowledged it. */
+export async function publishEvent(event: MembershipEvent): Promise<boolean> {
+  try {
+    // Keyed by service: one service's changes share a partition, so caches apply them in order.
+    await producer.send({
+      topic: TOPIC,
+      messages: [{key: event.service, value: JSON.stringify(event)}],
+      acks: -1, // every in-sync replica has the event before the broker answers
+      timeout: ACK_TIMEOUT_MS,
+    });
+    return true;
+  } catch {
+    // The broker did not take it: the relay republishes the row, so the change is late, not lost.
+    await outbox.write(TOPIC, event.service, event);
+    return false;
+  }
+}
+
+/** Announce the members of service whose record has lapsed; returns their ids. */
+export async function sweepExpired(service: string): Promise<string[]> {
+  const expired: string[] = [];
+  for (const instanceId of await instances.members(service)) {
+    const claimed = await redis.claimExpired(instances.recordKey(service, instanceId), instances.membersKey(service), instanceId);
+    if (claimed !== 1) continue; // still alive, re-registered, or another sweeper announced it
+    await publishEvent({kind: 'expired', service, instance_id: instanceId, reason: 'heartbeat TTL lapsed'});
+    expired.push(instanceId);
+  }
+  return expired;
+}
 `,
     },
     go: {
@@ -345,57 +312,73 @@ void producer.connect();
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+
+	"discovery/instances" // instances.Members, RecordKey, MembersKey
+	"discovery/outbox"    // outbox.Write(ctx, topic, key, payload)
 )
 
-const discoveryEventTopic = "discovery.event"
+const (
+	topic        = "discovery.event"
+	expiryMargin = 5 * time.Second
+)
 
-var redisClient = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type InstanceRecord struct {
-	InstanceID      string \`json:"instance_id"\`
-	Address         string \`json:"address"\`
-	MetadataVersion int    \`json:"metadata_version"\`
+var producer = newProducer()
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "1"})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
-type Event struct {
-	Stage      string \`json:"stage"\`
+type membershipEvent struct {
+	Kind       string \`json:"kind"\`
 	Service    string \`json:"service"\`
 	InstanceID string \`json:"instance_id"\`
-	Address    string \`json:"address"\`
+	Reason     string \`json:"reason"\`
 }
 
-var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: discoveryEventTopic}
-
-func publish(ctx context.Context, service, stage string, instance InstanceRecord) error {
-	payload, _ := json.Marshal(Event{
-		Stage:      stage,
-		Service:    service,
-		InstanceID: instance.InstanceID,
-		Address:    instance.Address,
-	})
-	return writer.WriteMessages(ctx, kafka.Message{
-		Topic: discoveryEventTopic,
-		Key:   []byte(instance.InstanceID),
-		Value: payload,
-	})
-}
-
-func heartbeat(ctx context.Context, service string, instance InstanceRecord) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	key := "sd:" + service + ":" + instance.InstanceID
-	redisClient.Expire(ctx, key, 30*time.Second)
-	if err := publish(ctx, service, "expired", instance); err != nil {
-		log.Printf("produce failed %v", err)
+// publishEvent produces one membership event; true when it is on its way.
+func publishEvent(ctx context.Context, event membershipEvent) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	value, _ := json.Marshal(event)
+	t := topic
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(event.InstanceID), Value: value}
+	if err := producer.Produce(msg, nil); err != nil {
+		return false, outbox.Write(ctx, topic, event.InstanceID, event)
 	}
+	return true, nil
 }
 
-func main() {
-	heartbeat(context.Background(), "checkout", InstanceRecord{InstanceID: "checkout-3", Address: "10.4.2.7"})
+// sweepExpired announces the members of service whose record has lapsed and returns their ids.
+func sweepExpired(ctx context.Context, service string) ([]string, error) {
+	ids, err := instances.Members(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	expired := []string{}
+	for _, id := range ids {
+		ttl, err := rdb.TTL(ctx, instances.RecordKey(service, id)).Result()
+		if err != nil {
+			return nil, err
+		}
+		if ttl >= expiryMargin {
+			continue
+		}
+		rdb.SRem(ctx, instances.MembersKey(service), id)
+		if _, err := publishEvent(ctx, membershipEvent{Kind: "expired", Service: service, InstanceID: id, Reason: "heartbeat TTL lapsed"}); err != nil {
+			return nil, err
+		}
+		expired = append(expired, id)
+	}
+	return expired, nil
 }
 `,
       solution: `package main
@@ -403,332 +386,730 @@ func main() {
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/redis/go-redis/v9"
-	"github.com/segmentio/kafka-go"
+
+	"discovery/instances" // instances.Members, RecordKey, MembersKey
+	"discovery/outbox"    // outbox.Write(ctx, topic, key, payload)
 )
 
-const discoveryEventTopic = "discovery.event"
-
-var redisClient = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-
-type InstanceRecord struct {
-	InstanceID      string \`json:"instance_id"\`
-	Address         string \`json:"address"\`
-	MetadataVersion int    \`json:"metadata_version"\`
-}
-
-type Event struct {
-	Kind            string \`json:"kind"\`
-	Service         string \`json:"service"\`
-	InstanceID      string \`json:"instance_id"\`
-	Address         string \`json:"address"\`
-	MetadataVersion int    \`json:"metadata_version"\`
-	Reason          string \`json:"reason"\`
-}
-
-type Outbox struct{}
-
-/** Write persists a membership event the broker refused, keyed by the service, for replay. */
-func (o *Outbox) Write(ctx context.Context, service string, event Event) error {
-	payload, _ := json.Marshal(event)
-	return redisClient.HSet(ctx, "sd:outbox:"+service, event.InstanceID, payload).Err()
-}
-
-var (
-	outbox = &Outbox{}
-	writer = &kafka.Writer{
-		Addr:         kafka.TCP("kafka:9092"),
-		Topic:        discoveryEventTopic,
-		RequiredAcks: kafka.RequireAll,
-		MaxAttempts:  5,
-	}
+const (
+	topic      = "discovery.event"
+	ackTimeout = 2 * time.Second
 )
 
-func publish(ctx context.Context, service, kind string, instance InstanceRecord, reason string) error {
-	event := Event{
-		Kind:            kind,
-		Service:         service,
-		InstanceID:      instance.InstanceID,
-		Address:         instance.Address,
-		MetadataVersion: instance.MetadataVersion,
-		Reason:          reason,
-	}
-	payload, _ := json.Marshal(event)
-	err := writer.WriteMessages(ctx, kafka.Message{
-		Topic: discoveryEventTopic,
-		Key:   []byte(service),
-		Value: payload,
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+// claimScript: KEYS[1] the record, KEYS[2] the members set, ARGV[1] the instance id. The expiry is
+// claimed only while the record is gone, and only by the sweeper whose SREM removed the member.
+var claimScript = redis.NewScript(\`
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+return redis.call('SREM', KEYS[2], ARGV[1])
+\`)
+
+var producer = newProducer()
+
+func newProducer() *kafka.Producer {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers":  "kafka:9092",
+		"acks":               "all", // every in-sync replica has the event before the broker answers
+		"enable.idempotence": true,  // a write retried after a lost acknowledgement lands once
 	})
 	if err != nil {
-		log.Printf("outbox service=%s instance=%s kind=%s", service, instance.InstanceID, kind)
-		return outbox.Write(ctx, service, event)
+		panic(err)
 	}
-	return nil
+	return p
 }
 
-/** sweepExpired reaps instances whose heartbeat TTL has really lapsed. */
-func sweepExpired(ctx context.Context, service string) {
-	keys, _ := redisClient.Keys(ctx, "sd:"+service+":*").Result()
-	for _, key := range keys {
-		ttl, err := redisClient.TTL(ctx, key).Result()
-		if err != nil || ttl >= 0 {
-			continue
+type membershipEvent struct {
+	Kind       string \`json:"kind"\`
+	Service    string \`json:"service"\`
+	InstanceID string \`json:"instance_id"\`
+	Reason     string \`json:"reason"\`
+}
+
+// publishEvent produces one membership event; true once the broker acknowledged it.
+func publishEvent(ctx context.Context, event membershipEvent) (bool, error) {
+	value, _ := json.Marshal(event)
+	t := topic
+	// Keyed by service: one service's changes share a partition, so caches apply them in order.
+	msg := &kafka.Message{TopicPartition: kafka.TopicPartition{Topic: &t, Partition: kafka.PartitionAny}, Key: []byte(event.Service), Value: value}
+	deliveries := make(chan kafka.Event, 1)
+	err := producer.Produce(msg, deliveries)
+	if err == nil {
+		select {
+		case e := <-deliveries:
+			err = e.(*kafka.Message).TopicPartition.Error
+		case <-time.After(ackTimeout):
+			err = context.DeadlineExceeded // no delivery report within the window
 		}
-		raw, err := redisClient.Get(ctx, key).Result()
+	}
+	if err != nil {
+		// The broker did not take it: the relay republishes the row, so the change is late, not lost.
+		return false, outbox.Write(ctx, topic, event.Service, event)
+	}
+	return true, nil
+}
+
+// sweepExpired announces the members of service whose record has lapsed and returns their ids.
+func sweepExpired(ctx context.Context, service string) ([]string, error) {
+	ids, err := instances.Members(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	expired := []string{}
+	for _, id := range ids {
+		claimed, err := claimScript.Run(ctx, rdb, []string{instances.RecordKey(service, id), instances.MembersKey(service)}, id).Int()
 		if err != nil {
-			continue
+			return nil, err
 		}
-		var instance InstanceRecord
-		if json.Unmarshal([]byte(raw), &instance) != nil {
-			continue
+		if claimed != 1 {
+			continue // still alive, re-registered, or another sweeper announced it
 		}
-		publish(ctx, service, "expired", instance, "heartbeat lapsed")
+		if _, err := publishEvent(ctx, membershipEvent{Kind: "expired", Service: service, InstanceID: id, Reason: "heartbeat TTL lapsed"}); err != nil {
+			return nil, err
+		}
+		expired = append(expired, id)
 	}
-}
-
-func main() {
-	sweepExpired(context.Background(), "checkout")
+	return expired, nil
 }
 `,
     },
     scala: {
-      starter: `import org.apache.kafka.clients.producer.KafkaProducer
-import org.apache.kafka.clients.producer.ProducerRecord
-import redis.clients.jedis.Jedis
+      starter: `import java.util.Properties
 
-import java.util.Properties
-import scala.jdk.CollectionConverters._
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.KafkaException
+import org.apache.kafka.common.serialization.StringSerializer
+import redis.clients.jedis.JedisPooled
+import spray.json._
+
+import discovery.{Instances, Outbox} // Instances.members, recordKey, membersKey · Outbox.write(topic, key, payload)
 
 object Events {
-  val DiscoveryEventTopic = "discovery.event"
-  val TtlSeconds = 30
+  val Topic = "discovery.event"
+  val ExpiryMarginS = 5L
 
-  val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  val producer = new KafkaProducer[String, String](props)
-  val jedis = new Jedis("redis", 6379)
-
-  final case class InstanceRecord(instance_id: String, address: String, metadata_version: Int)
-
-  private def payload(service: String, stage: String, instance: InstanceRecord): String =
-    s"""{"stage":"$stage","service":"$service","instance_id":"\${instance.instance_id}","address":"\${instance.address}"}"""
-
-  def heartbeat(service: String, instance: InstanceRecord): Unit = {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    val key = "sd:" + service + ":" + instance.instance_id
-    jedis.expire(key, TtlSeconds.toLong)
-    producer.send(new ProducerRecord[String, String](DiscoveryEventTopic, instance.instance_id, payload(service, "expired", instance)))
+  final case class MembershipEvent(kind: String, service: String, instanceId: String, reason: String) {
+    def toJson: JsObject =
+      JsObject("kind" -> JsString(kind), "service" -> JsString(service), "instance_id" -> JsString(instanceId), "reason" -> JsString(reason))
   }
+
+  val jedis = new JedisPooled("redis", 6379)
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "1")
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
+
+  /** Produce one membership event; true when it is on its way. */
+  def publishEvent(event: MembershipEvent): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    try {
+      producer.send(new ProducerRecord[String, String](Topic, event.instanceId, event.toJson.compactPrint))
+      true
+    } catch {
+      case _: KafkaException =>
+        Outbox.write(Topic, event.instanceId, event.toJson)
+        false
+    }
+  }
+
+  /** Announce the members of service whose record has lapsed; returns their ids. */
+  def sweepExpired(service: String): Seq[String] =
+    Instances.members(service).filter { instanceId =>
+      val lapsing = jedis.ttl(Instances.recordKey(service, instanceId)) < ExpiryMarginS
+      if (lapsing) {
+        jedis.srem(Instances.membersKey(service), instanceId)
+        publishEvent(MembershipEvent("expired", service, instanceId, "heartbeat TTL lapsed"))
+      }
+      lapsing
+    }
 }
 `,
-      solution: `import org.apache.kafka.clients.producer.KafkaProducer
-import org.apache.kafka.clients.producer.ProducerRecord
-import redis.clients.jedis.Jedis
+      solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
 
-import java.util.Properties
 import scala.jdk.CollectionConverters._
+import scala.util.Try
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+import redis.clients.jedis.JedisPooled
+import spray.json._
+
+import discovery.{Instances, Outbox} // Instances.members, recordKey, membersKey · Outbox.write(topic, key, payload)
 
 object Events {
-  val DiscoveryEventTopic = "discovery.event"
+  val Topic = "discovery.event"
+  val AckTimeoutMs = 2000L
 
-  val props = new Properties()
-  props.put("bootstrap.servers", "kafka:9092")
-  props.put("enable.idempotence", "true")
-  props.put("acks", "all")
-  val producer = new KafkaProducer[String, String](props)
-  val jedis = new Jedis("redis", 6379)
-
-  final case class InstanceRecord(instance_id: String, address: String, metadata_version: Int)
-
-  /** Persists a membership event the broker refused, keyed by the service, for replay. */
-  object Outbox {
-    def write(service: String, payload: String): Unit =
-      jedis.hset("sd:outbox:" + service, service, payload)
+  final case class MembershipEvent(kind: String, service: String, instanceId: String, reason: String) {
+    def toJson: JsObject =
+      JsObject("kind" -> JsString(kind), "service" -> JsString(service), "instance_id" -> JsString(instanceId), "reason" -> JsString(reason))
   }
 
-  private def payload(service: String, kind: String, instance: InstanceRecord, reason: String): String =
-    s"""{"kind":"$kind","service":"$service","instance_id":"\${instance.instance_id}","address":"\${instance.address}","metadata_version":\${instance.metadata_version},"reason":"$reason"}"""
+  val jedis = new JedisPooled("redis", 6379)
 
-  def publish(service: String, kind: String, instance: InstanceRecord, reason: String): Unit = {
-    val event = payload(service, kind, instance, reason)
-    try {
-      producer.send(new ProducerRecord[String, String](DiscoveryEventTopic, service, event))
-    } catch {
-      case _: Exception => Outbox.write(service, event)
+  /**
+   * KEYS[1] the record, KEYS[2] the members set, ARGV[1] the instance id. The expiry is claimed only
+   * while the record is gone, and only by the sweeper whose SREM removed the member.
+   */
+  val ClaimLua: String =
+    """if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+      |return redis.call('SREM', KEYS[2], ARGV[1])
+      |""".stripMargin
+
+  private val producer: KafkaProducer[String, String] = {
+    val props = new Properties()
+    props.put("bootstrap.servers", "kafka:9092")
+    props.put("acks", "all") // every in-sync replica has the event before the broker answers
+    props.put("enable.idempotence", "true") // a write retried after a lost acknowledgement lands once
+    new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+  }
+
+  /** Produce one membership event; true once the broker acknowledged it. */
+  def publishEvent(event: MembershipEvent): Boolean = {
+    // Keyed by service: one service's changes share a partition, so caches apply them in order.
+    val record = new ProducerRecord[String, String](Topic, event.service, event.toJson.compactPrint)
+    val acked = Try(producer.send(record).get(AckTimeoutMs, TimeUnit.MILLISECONDS))
+    if (acked.isFailure) {
+      // The broker did not take it: the relay republishes the row, so the change is late, not lost.
+      Outbox.write(Topic, event.service, event.toJson)
     }
+    acked.isSuccess
   }
 
-  /** sweepExpired reaps instances whose heartbeat TTL has really lapsed. */
-  def sweepExpired(service: String): Unit = {
-    val keys = jedis.keys("sd:" + service + ":*").asScala
-    keys.foreach { key =>
-      if (jedis.ttl(key) < 0) {
-        val body = Option(jedis.get(key)).map(ujson.read(_)).getOrElse(ujson.Obj())
-        val instance = InstanceRecord(
-          body.obj.get("instance_id").map(_.str).getOrElse("unknown"),
-          body.obj.get("address").map(_.str).getOrElse(""),
-          body.obj.get("metadata_version").map(_.num.toInt).getOrElse(0))
-        publish(service, "expired", instance, "heartbeat lapsed")
-      }
+  /** Announce the members of service whose record has lapsed; returns their ids. */
+  def sweepExpired(service: String): Seq[String] =
+    Instances.members(service).filter { instanceId =>
+      val keys = List(Instances.recordKey(service, instanceId), Instances.membersKey(service)).asJava
+      // Still alive, re-registered, or another sweeper announced it: the claim returns 0.
+      val claimed = jedis.eval(ClaimLua, keys, List(instanceId).asJava).asInstanceOf[java.lang.Long] == 1L
+      if (claimed) publishEvent(MembershipEvent("expired", service, instanceId, "heartbeat TTL lapsed"))
+      claimed
     }
-  }
-
-  def onProbe(service: String, instance: InstanceRecord, healthy: Boolean): Unit =
-    publish(service, if (healthy) "readmitted" else "excluded", instance, if (healthy) "probe passed" else "probe failed")
 }
 `,
     },
     cpp: {
-      starter: `#include <librdkafka/rdkafka.h>
+      starter: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <chrono>
-#include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
+
+#include "discovery/instances.h"  // instances::members, recordKey, membersKey
+#include "discovery/outbox.h"     // outbox::write(topic, key, payload)
 
 using json = nlohmann::json;
 
-const std::string kDiscoveryEventTopic = "discovery.event";
-constexpr int kTtlSeconds = 30;
+const std::string kTopic = "discovery.event";
+constexpr long long kExpiryMarginS = 5;
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-struct InstanceRecord {
-  std::string instance_id;
-  std::string address;
-  int metadata_version;
+struct MembershipEvent {
+  std::string kind, service, instance_id, reason;
 };
 
-rd_kafka_t* producer() {
-  char errstr[512];
-  auto* conf = rd_kafka_conf_new();
-  rd_kafka_conf_set(conf, "bootstrap.servers", "kafka:9092", errstr, sizeof(errstr));
-  return rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+json toJson(const MembershipEvent& e) {
+  return json{{"kind", e.kind}, {"service", e.service}, {"instance_id", e.instance_id}, {"reason", e.reason}};
 }
 
-void publish(rd_kafka_t* producer, const std::string& service, const std::string& stage, const InstanceRecord& instance) {
-  const auto payload = json{{"stage", stage},
-                            {"service", service},
-                            {"instance_id", instance.instance_id},
-                            {"address", instance.address}}
-                             .dump();
-  rd_kafka_producev(producer,
-                    RD_KAFKA_V_TOPIC(kDiscoveryEventTopic.c_str()),
-                    RD_KAFKA_V_KEY(instance.instance_id.data(), instance.instance_id.size()),
-                    RD_KAFKA_V_VALUE(payload.data(), payload.size()),
-                    RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
-                    RD_KAFKA_V_END);
-  rd_kafka_flush(producer, 2000);
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "1", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-int main() {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  auto* kafka = producer();
-  const InstanceRecord instance{"checkout-3", "10.4.2.7", 12};
-  redis.expire("sd:checkout:checkout-3", std::chrono::seconds(kTtlSeconds));
-  publish(kafka, "checkout", "expired", instance);
-  return 0;
+auto producer = makeProducer();
+
+// Produce one membership event; true when it is on its way.
+bool publishEvent(const MembershipEvent& event) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const std::string value = toJson(event).dump();
+  const RdKafka::ErrorCode err =
+      producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), event.instance_id.c_str(), event.instance_id.size(), 0, nullptr);
+  producer->poll(0);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    outbox::write(kTopic, event.instance_id, toJson(event));
+    return false;
+  }
+  return true;
+}
+
+// Announce the members of service whose record has lapsed; returns their ids.
+std::vector<std::string> sweepExpired(const std::string& service) {
+  std::vector<std::string> expired;
+  for (const std::string& instance_id : instances::members(service)) {
+    if (redis.ttl(instances::recordKey(service, instance_id)) >= kExpiryMarginS) continue;
+    redis.srem(instances::membersKey(service), instance_id);
+    publishEvent({"expired", service, instance_id, "heartbeat TTL lapsed"});
+    expired.push_back(instance_id);
+  }
+  return expired;
 }
 `,
-      solution: `#include <librdkafka/rdkafka.h>
+      solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
-#include <chrono>
-#include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
+
+#include "discovery/instances.h"  // instances::members, recordKey, membersKey
+#include "discovery/outbox.h"     // outbox::write(topic, key, payload)
 
 using json = nlohmann::json;
 
-const std::string kDiscoveryEventTopic = "discovery.event";
+const std::string kTopic = "discovery.event";
+constexpr int kAckTimeoutMs = 2000;
 
 sw::redis::Redis redis("tcp://redis:6379");
 
-struct InstanceRecord {
-  std::string instance_id;
-  std::string address;
-  int metadata_version;
+// KEYS[1] the record, KEYS[2] the members set, ARGV[1] the instance id. The expiry is claimed only
+// while the record is gone, and only by the sweeper whose SREM removed the member.
+const std::string kClaimLua = R"lua(
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+return redis.call('SREM', KEYS[2], ARGV[1])
+)lua";
+
+struct MembershipEvent {
+  std::string kind, service, instance_id, reason;
 };
 
-/** Persists a membership event the broker refused, keyed by the service, for replay. */
-struct Outbox {
-  void write(const std::string& service, const std::string& event) {
-    redis.hset("sd:outbox:" + service, service, event);
-  }
+json toJson(const MembershipEvent& e) {
+  return json{{"kind", e.kind}, {"service", e.service}, {"instance_id", e.instance_id}, {"reason", e.reason}};
+}
+
+// The delivery report of the record in flight: publishEvent produces one record and waits for it.
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
 };
 
-Outbox outbox;
+DeliveryReport delivery;
 
-rd_kafka_t* producer() {
-  char errstr[512];
-  auto* conf = rd_kafka_conf_new();
-  rd_kafka_conf_set(conf, "bootstrap.servers", "kafka:9092", errstr, sizeof(errstr));
-  rd_kafka_conf_set(conf, "enable.idempotence", "true", errstr, sizeof(errstr));
-  rd_kafka_conf_set(conf, "acks", "all", errstr, sizeof(errstr));
-  return rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+std::unique_ptr<RdKafka::Producer> makeProducer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);                // every in-sync replica has the event before the broker answers
+  conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
-void publish(rd_kafka_t* kafka,
-             const std::string& service,
-             const std::string& kind,
-             const InstanceRecord& instance,
-             const std::string& reason) {
-  const auto payload = json{{"kind", kind},
-                            {"service", service},
-                            {"instance_id", instance.instance_id},
-                            {"address", instance.address},
-                            {"metadata_version", instance.metadata_version},
-                            {"reason", reason}}
-                             .dump();
-  const auto outcome = rd_kafka_producev(kafka,
-                                         RD_KAFKA_V_TOPIC(kDiscoveryEventTopic.c_str()),
-                                         RD_KAFKA_V_KEY(service.data(), service.size()),
-                                         RD_KAFKA_V_VALUE(payload.data(), payload.size()),
-                                         RD_KAFKA_V_MSGFLAGS(RD_KAFKA_MSG_F_COPY),
-                                         RD_KAFKA_V_END);
-  if (outcome != RD_KAFKA_RESP_ERR_NO_ERROR || rd_kafka_flush(kafka, 2000) != RD_KAFKA_RESP_ERR_NO_ERROR) {
-    std::cout << "outbox service=" << service << " instance=" << instance.instance_id << " kind=" << kind << "\\n";
-    outbox.write(service, payload);
+auto producer = makeProducer();
+
+// Produce one membership event; true once the broker acknowledged it.
+bool publishEvent(const MembershipEvent& event) {
+  const json payload = toJson(event);
+  const std::string value = payload.dump();
+  delivery.error = RdKafka::ERR_NO_ERROR;
+  // Keyed by service: one service's changes share a partition, so caches apply them in order.
+  RdKafka::ErrorCode err =
+      producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
+                        value.size(), event.service.c_str(), event.service.size(), 0, nullptr);
+  if (err == RdKafka::ERR_NO_ERROR) {
+    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
   }
+  if (err != RdKafka::ERR_NO_ERROR) {
+    // The broker did not take it: the relay republishes the row, so the change is late, not lost.
+    outbox::write(kTopic, event.service, payload);
+    return false;
+  }
+  return true;
 }
 
-/** sweepExpired reaps instances whose heartbeat TTL has really lapsed and publishes it. */
-void sweepExpired(rd_kafka_t* kafka, const std::string& service) {
-  long long cursor = 0;
-  do {
-    const auto page = redis.scan(cursor, "sd:" + service + ":*", 100);
-    cursor = page.first;
-    for (const auto& key : page.second) {
-      if (redis.ttl(key) < 0) {
-        const auto raw = redis.get(key);
-        if (!raw) continue;
-        const auto parsed = json::parse(*raw, nullptr, false);
-        if (!parsed.is_object()) continue;
-        const InstanceRecord instance{parsed.value("instance_id", std::string()),
-                                      parsed.value("address", std::string()),
-                                      parsed.value("metadata_version", 0)};
-        publish(kafka, service, "expired", instance, "heartbeat lapsed");
-      }
-    }
-  } while (cursor != 0);
-}
-
-int main() {
-  auto* kafka = producer();
-  sweepExpired(kafka, "checkout");
-  return 0;
+// Announce the members of service whose record has lapsed; returns their ids.
+std::vector<std::string> sweepExpired(const std::string& service) {
+  std::vector<std::string> expired;
+  for (const std::string& instance_id : instances::members(service)) {
+    const bool claimed =
+        redis.eval<long long>(kClaimLua, {instances::recordKey(service, instance_id), instances::membersKey(service)}, {instance_id}) == 1;
+    if (!claimed) continue;  // still alive, re-registered, or another sweeper announced it
+    publishEvent({"expired", service, instance_id, "heartbeat TTL lapsed"});
+    expired.push_back(instance_id);
+  }
+  return expired;
 }
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from discovery import instances
+
+TOPIC = "discovery.event"
+
+
+def _event(instance_id, service="checkout", kind="registered"):
+    return {"kind": kind, "service": service, "instance_id": instance_id, "reason": "registered by checkout-agent"}
+
+
+def _outbox(ctx):
+    return [json.loads(row) for row in ctx.redis.lrange("sd:outbox", 0, -1)]
+
+
+def check_service_key(ctx):
+    m = ctx.load("events")
+    m.publish_event(_event("checkout-1"))
+    m.publish_event(_event("payments-1", "payments"))
+    m.publish_event(_event("checkout-2"))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three publish_event calls produced {len(records)} records on discovery.event"
+    keys = [r.key for r in records]
+    assert keys == [b"checkout", b"payments", b"checkout"], f"the records are keyed {keys}, expected the service names checkout, payments, checkout"
+    assert records[0].partition == records[2].partition, "both checkout events must land on one partition, or a cache applies checkout's changes out of order"
+
+
+def check_real_expiry(ctx):
+    m = ctx.load("events")
+    instances.register_instance("checkout", "checkout-1", "10.4.2.1", 8080, 2, 1)  # expires after 6 s
+    instances.register_instance("checkout", "checkout-2", "10.4.2.2", 8080, 3, 1)  # expires after 9 s
+    instances.register_instance("checkout", "checkout-3", "10.4.2.3", 8080, 10, 1)  # expires after 30 s
+    ctx.clock.advance(7)
+    expired = m.sweep_expired("checkout")
+    assert sorted(expired) == ["checkout-1"], f"7 s in, only checkout-1's record has lapsed and the sweep announced {expired}: checkout-2 has 2 s left and is alive"
+    events = [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
+    assert [(e.get("kind"), e.get("instance_id")) for e in events] == [("expired", "checkout-1")], f"the sweep produced {events}, expected one expired event for checkout-1"
+    members = sorted(ctx.redis.smembers("sd:members:checkout"))
+    assert members == ["checkout-2", "checkout-3"], f"sd:members:checkout holds {members} after the sweep, expected the live checkout-2 and checkout-3"
+    again = m.sweep_expired("checkout")
+    assert again == [] and len(ctx.kafka.records(TOPIC)) == 1, f"a second sweep announced {again}: an expiry is announced once"
+
+
+def check_acks_idempotent(ctx):
+    m = ctx.load("events")
+    ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
+    m.publish_event(_event("checkout-1"))
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the event twice. Enable idempotence"
+    m.publish_event(_event("checkout-2"))
+    ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
+    assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost the event the leader alone had acknowledged: acks=all waits for every in-sync replica"
+
+
+def check_outbox_on_failure(ctx):
+    m = ctx.load("events")
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_event(_event("checkout-1"))
+    rows = _outbox(ctx)
+    assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the change never reaches a membership cache"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "checkout" and rows[0].get("payload", {}).get("instance_id") == "checkout-1", f"the outbox row is {rows[0]}, expected the topic, the key checkout and the event"
+    assert ok is False, f"publish_event returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.publish_event(_event("checkout-2"))
+    waited = ctx.clock.time() - before
+    assert waited <= 5, f"publish_event waited {waited:.0f} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("instance_id") == "checkout-2", f"no delivery report within the window and the outbox holds {rows}"
+    assert ok is False, f"publish_event returned {ok!r} without a delivery report, expected False"
+`,
+    typescript: `const TOPIC = 'discovery.event';
+
+const event = (instanceId: string, service = 'checkout', kind = 'registered') => ({kind, service, instance_id: instanceId, reason: 'registered by checkout-agent'});
+
+const outboxRows = ctx => (ctx.redis.lrange('sd:outbox', 0, -1) as string[]).map(row => JSON.parse(row));
+
+/** A real macrotask: every pending promise continuation has run. */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+export async function check_service_key(ctx) {
+  const m = ctx.load('events');
+  await m.publishEvent(event('checkout-1'));
+  await m.publishEvent(event('payments-1', 'payments'));
+  await m.publishEvent(event('checkout-2'));
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three publishEvent calls produced \${records.length} records on discovery.event\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['checkout', 'payments', 'checkout'], \`the records are keyed \${JSON.stringify(keys)}, expected the service names checkout, payments, checkout\`);
+  assert.equal(records[0].partition, records[2].partition, "both checkout events must land on one partition, or a cache applies checkout's changes out of order");
+}
+
+export async function check_real_expiry(ctx) {
+  const m = ctx.load('events');
+  const instances = ctx.load('/support/discovery/instances.ts');
+  await instances.registerInstance('checkout', 'checkout-1', '10.4.2.1', 8080, 2, 1); // expires after 6 s
+  await instances.registerInstance('checkout', 'checkout-2', '10.4.2.2', 8080, 3, 1); // expires after 9 s
+  await instances.registerInstance('checkout', 'checkout-3', '10.4.2.3', 8080, 10, 1); // expires after 30 s
+  ctx.clock.advance(7);
+  const expired = await m.sweepExpired('checkout');
+  await settle();
+  assert.deepEqual([...expired].sort(), ['checkout-1'], \`7 s in, only checkout-1's record has lapsed and the sweep announced \${JSON.stringify(expired)}: checkout-2 has 2 s left and is alive\`);
+  const events = ctx.kafka.values(TOPIC).map(v => JSON.parse(v));
+  assert.deepEqual(events.map(e => [e.kind, e.instance_id]), [['expired', 'checkout-1']], \`the sweep produced \${JSON.stringify(events)}, expected one expired event for checkout-1\`);
+  const members = (ctx.redis.smembers('sd:members:checkout') as string[]).sort();
+  assert.deepEqual(members, ['checkout-2', 'checkout-3'], \`sd:members:checkout holds \${JSON.stringify(members)} after the sweep, expected the live checkout-2 and checkout-3\`);
+  const again = await m.sweepExpired('checkout');
+  await settle();
+  assert(again.length === 0 && ctx.kafka.records(TOPIC).length === 1, \`a second sweep announced \${JSON.stringify(again)}: an expiry is announced once\`);
+}
+
+export async function check_acks_idempotent(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
+  await m.publishEvent(event('checkout-1'));
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the event twice. Enable idempotence\`);
+  await m.publishEvent(event('checkout-2'));
+  await settle();
+  ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
+  assert.equal(ctx.kafka.records(TOPIC).length, 2, 'a leader failover lost the event the leader alone had acknowledged: acks: -1 (all) waits for every in-sync replica');
+}
+
+export async function check_outbox_on_failure(ctx) {
+  const m = ctx.load('events');
+  ctx.kafka.failNext(TOPIC, 1);
+  let ok = await m.publishEvent(event('checkout-1'));
+  await settle();
+  let rows = outboxRows(ctx);
+  assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the change never reaches a membership cache\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'checkout' && rows[0].payload?.instance_id === 'checkout-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key checkout and the event\`);
+  assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.publishEvent(event('checkout-2'));
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 5, \`publishEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row\`);
+  rows = outboxRows(ctx);
+  assert(rows.length === 2 && rows[1].payload?.instance_id === 'checkout-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+
+	"discovery/instances"
+
+	"leetbuild/harness"
+)
+
+const eventsTopic = "discovery.event"
+
+var eventsBg = context.Background()
+
+func eventFor(instanceID, service string) membershipEvent {
+	return membershipEvent{Kind: "registered", Service: service, InstanceID: instanceID, Reason: "registered by checkout-agent"}
+}
+
+func eventsPublish(ctx *harness.Ctx, event membershipEvent) bool {
+	ok, err := publishEvent(eventsBg, event)
+	ctx.NoError(err, "publishEvent")
+	return ok
+}
+
+type eventsRow struct {
+	Topic   string         \`json:"topic"\`
+	Key     string         \`json:"key"\`
+	Payload map[string]any \`json:"payload"\`
+}
+
+func eventsOutbox(ctx *harness.Ctx) []eventsRow {
+	var rows []eventsRow
+	for _, text := range ctx.Redis.LRange("sd:outbox", 0, -1) {
+		var row eventsRow
+		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func CheckServiceKey(ctx *harness.Ctx) {
+	eventsPublish(ctx, eventFor("checkout-1", "checkout"))
+	eventsPublish(ctx, eventFor("payments-1", "payments"))
+	eventsPublish(ctx, eventFor("checkout-2", "checkout"))
+	ctx.Settle()
+	records := ctx.Kafka.Records(eventsTopic)
+	ctx.Equal(len(records), 3, "three publishEvent calls must produce three records on discovery.event; the records")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"checkout", "payments", "checkout"}, "the records must be keyed by the service names")
+	ctx.Equal(records[0].Partition, records[2].Partition, "both checkout events must land on one partition, or a cache applies checkout's changes out of order; the partitions")
+}
+
+func CheckRealExpiry(ctx *harness.Ctx) {
+	for _, r := range []struct {
+		id       string
+		interval int
+	}{{"checkout-1", 2}, {"checkout-2", 3}, {"checkout-3", 10}} { // expiring after 6, 9 and 30 s
+		_, err := instances.RegisterInstance(eventsBg, "checkout", r.id, "10.4.2.1", 8080, r.interval, 1)
+		ctx.NoError(err, "registering %s", r.id)
+	}
+	ctx.Clock.Advance(7)
+	expired, err := sweepExpired(eventsBg, "checkout")
+	ctx.NoError(err, "sweepExpired(checkout)")
+	sort.Strings(expired)
+	ctx.Equal(expired, []string{"checkout-1"}, "7 s in, only checkout-1's record has lapsed (checkout-2 has 2 s left and is alive); the sweep announced")
+	var kinds []string
+	for _, v := range ctx.Kafka.Values(eventsTopic) {
+		var e map[string]any
+		ctx.NoError(json.Unmarshal([]byte(v), &e), "an event must be JSON")
+		kinds = append(kinds, e["kind"].(string)+" "+e["instance_id"].(string))
+	}
+	ctx.Equal(kinds, []string{"expired checkout-1"}, "the sweep must produce one expired event for checkout-1; the events")
+	ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), []string{"checkout-2", "checkout-3"}, "sd:members:checkout after the sweep must hold the live checkout-2 and checkout-3")
+	again, err := sweepExpired(eventsBg, "checkout")
+	ctx.NoError(err, "the second sweepExpired(checkout)")
+	ctx.Assert(len(again) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "a second sweep announced %v: an expiry is announced once", again)
+}
+
+func CheckAcksIdempotent(ctx *harness.Ctx) {
+	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	eventsPublish(ctx, eventFor("checkout-1", "checkout"))
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	eventsPublish(ctx, eventFor("checkout-2", "checkout"))
+	ctx.Settle()
+	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+}
+
+func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok := eventsPublish(ctx, eventFor("checkout-1", "checkout"))
+	ctx.Settle()
+	rows := eventsOutbox(ctx)
+	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the change never reaches a membership cache; the rows")
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "checkout" && rows[0].Payload["instance_id"] == "checkout-1", "the outbox row is %v, expected the topic, the key checkout and the event", rows[0])
+	ctx.Equal(ok, false, "publishEvent's result after a failed delivery")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = eventsPublish(ctx, eventFor("checkout-2", "checkout"))
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited)
+	rows = eventsOutbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["instance_id"] == "checkout-2", "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "discovery/instances.h"
+
+namespace {
+
+const std::string kEventsTopic = "discovery.event";
+
+MembershipEvent eventFor(const std::string& instance_id, const std::string& service = "checkout") {
+  return MembershipEvent{"registered", service, instance_id, "registered by checkout-agent"};
+}
+
+std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> rows;
+  for (const auto& text : ctx.Redis.LRange("sd:outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(text, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+std::string eventsField(const nlohmann::json& j, const std::string& field) {
+  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckServiceKey(harness::Ctx& ctx) {
+  publishEvent(eventFor("checkout-1"));
+  publishEvent(eventFor("payments-1", "payments"));
+  publishEvent(eventFor("checkout-2"));
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kEventsTopic);
+  ctx.Equal(records.size(), 3, "three publishEvent calls must produce three records on discovery.event; the records");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"checkout", "payments", "checkout"}, "the records must be keyed by the service names");
+  ctx.Equal(records[0].Partition, records[2].Partition,
+            "both checkout events must land on one partition, or a cache applies checkout's changes out of order; the partitions");
+}
+
+void CheckRealExpiry(harness::Ctx& ctx) {
+  // Expiring after 6, 9 and 30 s.
+  for (const auto& [instance_id, interval] : std::vector<std::pair<std::string, long>>{{"checkout-1", 2}, {"checkout-2", 3}, {"checkout-3", 10}}) {
+    instances::registerInstance("checkout", instance_id, "10.4.2.1", 8080, interval, 1);
+  }
+  ctx.Clock.Advance(7);
+  auto expired = sweepExpired("checkout");
+  std::sort(expired.begin(), expired.end());
+  ctx.Equal(expired, {"checkout-1"}, "7 s in, only checkout-1's record has lapsed (checkout-2 has 2 s left and is alive); the sweep announced");
+  std::vector<std::string> kinds;
+  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
+    const auto e = nlohmann::json::parse(v, nullptr, false);
+    kinds.push_back(eventsField(e, "kind") + " " + eventsField(e, "instance_id"));
+  }
+  ctx.Equal(kinds, {"expired checkout-1"}, "the sweep must produce one expired event for checkout-1; the events");
+  ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), {"checkout-2", "checkout-3"}, "sd:members:checkout after the sweep must hold the live checkout-2 and checkout-3");
+  const auto again = sweepExpired("checkout");
+  ctx.Assert(again.empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "a second sweep announced %q: an expiry is announced once", again);
+}
+
+void CheckAcksIdempotent(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishEvent(eventFor("checkout-1"));
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+            "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publishEvent(eventFor("checkout-2"));
+  ctx.Settle();
+  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+}
+
+void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  bool ok = publishEvent(eventFor("checkout-1"));
+  ctx.Settle();
+  auto rows = eventsOutbox(ctx);
+  ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the change never reaches a membership cache; the rows");
+  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "checkout" && rows[0].contains("payload") &&
+                 eventsField(rows[0]["payload"], "instance_id") == "checkout-1",
+             "the outbox row is %s, expected the topic, the key checkout and the event", rows[0].dump());
+  ctx.Equal(ok, false, "publishEvent's result after a failed delivery");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ok = publishEvent(eventFor("checkout-2"));
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited);
+  rows = eventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "instance_id") == "checkout-2",
+             "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(ok, false, "publishEvent's result without a delivery report");
+}
+`,
+  },
   hints: [
-    'A membership cache built from the topic shows checkout with zero instances while every pod is healthy and heartbeating; after a broker restart it never recovers on its own.',
-    '`heartbeat` runs `r.expire` and then `publish(service, "expired", …)`, so the event contradicts the renewal; `key=instance["instance_id"]` splits one service across partitions; a rejected produce is not caught.',
-    'Move `expired` into `sweep_expired`, published only when `r.ttl(key) < 0`; produce with `key=service` and a `kind`/`reason` payload; catch `KafkaException` and `outbox.write`; set `enable.idempotence` and `acks=all`.',
+    "A router's cache shows checkout-2 removed and then re-added in the wrong order, a healthy pod drops out of it every few seconds, and after a broker restart some membership changes never arrive.",
+    'The key decides the partition, and it is the instance id. The sweep treats "expires soon" as expired. The `except KafkaException` around `produce` only sees local enqueue errors: the delivery is reported later, to a callback nobody registered.',
+    'Key by `event["service"]`; claim each member with one script (`EXISTS` on the record → 0, else `SREM`) and publish only on 1; set `enable.idempotence` and `acks=all`; on a failed `on_delivery` or anything left after `flush(ACK_TIMEOUT_S)`, `outbox.write` and return False.',
   ],
-  debrief: `A change feed is the input to a state machine, not a log, and the fix follows from that. The key is the service because the consumer applies one service's transitions in order, and keying by instance scatters them. The expiry is published by the reaper after it observes a lapsed TTL because an event announces what happened, and the heartbeat path has just made the expiry not happen. The payload carries the reason so a consumer can explain a change without reading an instance the transition removed. The outbox exists because membership history rebuilds every consumer's cache, so a rejected produce must become a row rather than a log line, and the idempotent producer keeps a retry from duplicating a transition. Production systems replay the outbox in service order and alert per service on consumer lag.`,
+  debrief: `The key is an ordering contract: a cache rebuilds a service's membership by applying its events in order, and Kafka orders only within a partition. An \`expired\` event states a fact, so it follows the record's disappearance instead of a prediction, and the claim script makes it happen once across every sweeper: the \`SREM\`'s return value says who won. Waiting for the delivery report is what gives the return value a meaning, and the outbox turns a broker outage into a delay instead of a hole in membership history; idempotence closes the gap waiting opens, a retry after a lost acknowledgement. Production registries also publish periodic full snapshots of each service, so a cache that missed events can resynchronise without replaying the topic.`,
 };

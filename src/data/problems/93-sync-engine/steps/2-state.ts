@@ -1,105 +1,94 @@
 import type {Step} from '@/lib/types';
 
-export const cursorStateStep: Step = {
+export const applyStateStep: Step = {
   id: 'state',
   concept: 'redis',
   file: 'state',
-  title: 'Redis per-device cursors with a monotonic watermark',
+  title: 'One Lua apply: compare the base, take a server-wide revision',
   focus: ['sync', 'redis'],
   task: `## Task
 
-**Starting point.** The starter keeps a cursor per device under \`cursor:{device}\` in Redis, a
-watermark under a literal \`"watermark"\` key, and in \`push\` commits the cursor, applies the batch,
-then writes the watermark with a plain \`SET\`. It compiles, a happy-path client resumes exactly where
-it stopped, and it hides five flaws. They only show on a crash, a replay or a quiet week.
+**Starting point.** The starter is \`apply_change(doc_id, base_revision, content_hash, body, device)\`,
+the apply every other step calls. It reads the head's revision (\`HGET doc:{id} revision\`), answers
+\`{"status": "conflict", "revision": current}\` when that is not the base, and otherwise writes
+revision \`current + 1\` into the head, keeps it under \`doc:{id}:r{n}\` and scores the document in
+\`changes\`. It applies the demo pushes and hides three flaws.
 
-**Failure mode the checks target.** A worker dies between the cursor write and the apply, and the
-device is told "you already sent this" while its batch was never applied. A laptop closed for eight
-days comes back to an expired cursor. Two concurrent pushes leave the watermark moving backwards.
+**Failure mode the checks target.** A laptop and a phone push edits of the same revision a moment
+apart and both are applied, so one edit vanishes. Two documents get the same revision, and a device
+whose pull cursor sits on it never sees the second. Two devices that saved the same file conflict
+with each other, and a device pushing back the body it just pulled mints a revision every round trip.
 
-- Each device has its own cursor key (\`cursor:{device}\`); the watermark lives under
-  \`WATERMARK_KEY\`.
-- The cursor advances only after its batch is applied (\`apply_batch\`, then \`commit_cursor\`), so a
-  crash in between replays the batch instead of losing it.
-- A cursor does not expire.
-- The cursor does not move backwards: the advance is a compare-and-set (\`CURSOR_LUA\`) that keeps the
-  higher value.
-- The server watermark only moves forward under concurrent advances (\`WATERMARK_LUA\`).`,
+- The compare and every write run in **one Lua script** (\`register_script\`/\`eval\`), so no other
+  client's command lands between them.
+- Revisions come from **\`INCR rev:seq\`** (\`store.REVISION_KEY\`), server-wide, so the change log
+  orders every document.
+- A body whose hash equals the head's \`content_hash\` is **\`unchanged\`** whatever the base: no
+  new revision, answered with the head's revision.
+- Return \`{"status": "applied" | "unchanged" | "conflict", "revision"}\`: the new revision, or the
+  head's when nothing was written.`,
   sequence: {
-    participants: ['Sync Engine', 'revisions', 'Redis'],
+    participants: ['syncd', 'Redis'],
     messages: [
-      {from: 'Sync Engine', to: 'revisions', label: 'apply_batch(device, changes)', kind: 'sync'},
-      {from: 'revisions', to: 'Sync Engine', label: '{applied, conflicts, revision}', kind: 'reply'},
-      {from: 'Sync Engine', to: 'Redis', label: 'EVAL cursor · KEYS[cursor:{device}] ARGV[revision]', kind: 'sync'},
-      {from: 'Redis', to: 'Sync Engine', label: 'cursor (never lower, never expiring)', kind: 'reply'},
-      {from: 'Sync Engine', to: 'Redis', label: 'EVAL watermark · KEYS[watermark] ARGV[revision]', kind: 'sync'},
-      {from: 'Redis', to: 'Sync Engine', label: 'watermark (monotonic)', kind: 'reply'},
+      {from: 'syncd', to: 'Redis', label: 'EVAL apply doc:{id} rev:seq changes · base, hash, body', kind: 'sync'},
+      {from: 'Redis', to: 'Redis', label: 'same hash → unchanged · base ≠ revision → conflict', kind: 'sync'},
+      {from: 'Redis', to: 'Redis', label: 'INCR rev:seq · HSET head · HSET doc:{id}:r{n} · ZADD changes', kind: 'sync'},
+      {from: 'Redis', to: 'syncd', label: '{1, n} applied · {2, head} unchanged · {0, head} conflict', kind: 'reply'},
     ],
   },
   checks: [
     {
-      id: 'cursor-after-apply',
-      title: 'Advances the cursor after the batch is applied',
+      id: 'atomic-apply',
+      title: 'Compares the base and writes in one script',
       detail:
-        'The batch is applied first and the cursor is committed second; a crash between them replays the batch instead of losing it. The starter commits the cursor before `apply_batch` runs.',
+        'The read of the head revision and the writes run in one Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`); a separate `HGET` then `HSET` lets a second push of the same base land in between, and both apply.',
       match: {
-        python: {order: [/apply_batch\(device, changes\)/, /commit_cursor\(device, revision\)/]},
-        typescript: {order: [/applyBatch\(device, changes\)/, /commitCursor\(device, revision\)/]},
-        go: {order: [/applyBatch\(ctx, device, changes\)/, /commitCursor\(ctx, device, revision\)/]},
-        scala: {order: [/applyBatch\(device, changes\)/, /commitCursor\(device, revision\)/]},
-        cpp: {order: [/applyBatch\(device, changes\)/, /commitCursor\(redis, device, revision\)/]},
+        python: {
+          all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/],
+          none: [/\br\.hget\(/, /\br\.hset\(/],
+        },
+        typescript: {
+          all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/],
+          none: [/redis\.hget\(/, /redis\.hset\(/],
+        },
+        go: {
+          all: [/redis\.NewScript\(|\.Eval\(/, /redis\.call\(\s*['"]HGET['"]/],
+          none: [/rdb\.HGet\(/, /rdb\.HSet\(/],
+        },
+        scala: {
+          all: [/jedis\.eval(sha)?\(/, /redis\.call\(\s*['"]HGET['"]/],
+          none: [/jedis\.hget\(/, /jedis\.hset\(/],
+        },
+        cpp: {
+          all: [/redis\.eval(sha)?[<(]/, /redis\.call\(\s*['"]HGET['"]/],
+          none: [/redis\.hget\(/, /redis\.hset\(/],
+        },
       },
     },
     {
-      id: 'cursor-monotonic',
-      title: 'Advances the cursor with one compare-and-set script',
+      id: 'global-revision',
+      title: 'Takes every revision from INCR rev:seq',
       detail:
-        'The cursor advance is a Lua script (`CURSOR_LUA`) that keeps the higher revision, so a replayed or out-of-order batch cannot move a device backwards. The starter writes the value it was given with a plain `SET`.',
+        'The script takes the next revision with `INCR` on `rev:seq`, server-wide; `current + 1` numbers each document on its own, so two documents share revisions and a cursor skips one of them.',
       match: {
-        python: {all: [/CURSOR_LUA/, /\.eval\(/, /SET/]},
-        typescript: {all: [/CURSOR_LUA/, /\.eval\(/, /SET/]},
-        go: {all: [/cursorScript/, /\.Run\(/, /SET/]},
-        scala: {all: [/CursorLua/, /\.eval\(/, /SET/]},
-        cpp: {all: [/kCursorLua/, /\.eval</, /SET/]},
+        python: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
+        typescript: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
+        go: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
+        scala: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
+        cpp: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
       },
     },
     {
-      id: 'cursor-no-ttl',
-      title: 'Cursors never expire',
+      id: 'same-content',
+      title: 'A body the head already has is unchanged, not a new revision or a conflict',
       detail:
-        'The cursor key is written without an expiry, so a device idle for a week comes back to the cursor it left. The starter stores the cursor with a one-week TTL.',
+        'Before the base is compared, the script compares the change’s hash (`ARGV[3]`) with the head’s `content_hash` and answers `unchanged` at the head’s revision when they match.',
       match: {
-        python: {all: [/cursor_key\(device\)/], none: [/cursor[^\n]*\bex\s*=/]},
-        typescript: {all: [/cursorKey\(device\)/], none: [/cursorKey\(device\)[^\n]*'EX'/]},
-        go: {all: [/cursorKey\(device\)/], none: [/cursorTTL/]},
-        scala: {all: [/cursorKey\(device\)/], none: [/CursorTtlSeconds/]},
-        cpp: {all: [/cursorKey\(device\)/], none: [/kCursorTtlSeconds/]},
-      },
-    },
-    {
-      id: 'watermark-monotonic',
-      title: 'The server watermark only moves forward',
-      detail:
-        'The watermark advance is one atomic script (`WATERMARK_LUA`) that ignores a lower revision, so two concurrent advances cannot move it backwards. The starter overwrites the key with whatever the last write carried.',
-      match: {
-        python: {all: [/WATERMARK_LUA/, /\.eval\(/, /SET/]},
-        typescript: {all: [/WATERMARK_LUA/, /\.eval\(/, /SET/]},
-        go: {all: [/watermarkScript/, /\.Run\(/, /SET/]},
-        scala: {all: [/WatermarkLua/, /\.eval\(/, /SET/]},
-        cpp: {all: [/kWatermarkLua/, /\.eval</, /SET/]},
-      },
-    },
-    {
-      id: 'device-key-watermark-key',
-      title: 'One cursor key per device, one shared watermark key',
-      detail:
-        'The cursor is keyed by the device (`cursor:{device}`) and the watermark is a single well-known key named by `WATERMARK_KEY`. The starter spells the watermark key as a bare string literal.',
-      match: {
-        python: {all: [/cursor:\{device\}/, /WATERMARK_KEY/]},
-        typescript: {all: [/'cursor:'/, /WATERMARK_KEY/]},
-        go: {all: [/"cursor:"/, /watermarkKey/]},
-        scala: {all: [/cursor:\$device/, /WatermarkKey/]},
-        cpp: {all: [/"cursor:"/, /kWatermarkKey/]},
+        python: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
+        typescript: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
+        go: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
+        scala: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
+        cpp: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
       },
     },
   ],
@@ -107,192 +96,101 @@ days comes back to an expired cursor. Two concurrent pushes leave the watermark 
     python: {
       starter: `import redis
 
+from docsync import store  # doc_key, history_key, REVISION_KEY, CHANGES_KEY
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-CURSOR_TTL_S = 7 * 24 * 3600
 
-
-def cursor_key(device: str) -> str:
-    return f"cursor:{device}"
-
-
-def apply_batch(device: str, changes: list[dict]) -> dict:
-    """Apply one batch and return {applied, statuses, revision}."""
-    raise NotImplementedError
-
-
-def commit_cursor(device: str, revision: int) -> int:
-    """Advance the device's cursor to the revision of the batch it just sent."""
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    r.set(cursor_key(device), revision, ex=CURSOR_TTL_S)
-    return revision
-
-
-def watermark() -> int:
-    """The watermark a device compares against its cursor to detect gaps."""
-    return int(r.get("watermark") or 0)
-
-
-def push(device: str, changes: list[dict], revision: int) -> dict:
-    cursor = commit_cursor(device, revision)
-    outcome = apply_batch(device, changes)
-    r.set("watermark", revision)
-    return {"applied": outcome["applied"], "cursor": cursor, "watermark": watermark()}
+def apply_change(doc_id: str, base_revision: int, content_hash: str, body: str, device: str) -> dict:
+    """Apply the change only against the revision the device edited: {"status", "revision"}."""
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    current = int(r.hget(store.doc_key(doc_id), "revision") or 0)
+    if current != base_revision:
+        return {"status": "conflict", "revision": current}
+    revision = current + 1
+    r.hset(store.doc_key(doc_id), mapping={"doc_id": doc_id, "revision": revision, "content_hash": content_hash, "body": body, "device": device})
+    r.hset(store.history_key(doc_id, revision), mapping={"content_hash": content_hash, "body": body})
+    r.zadd(store.CHANGES_KEY, {doc_id: revision})
+    return {"status": "applied", "revision": revision}
 `,
       solution: `import redis
 
+from docsync import store  # doc_key, history_key, REVISION_KEY, CHANGES_KEY
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-WATERMARK_KEY = "watermark"
-
-CURSOR_LUA = """
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  current = next_revision
-end
-return current
+# KEYS: doc:{id}, rev:seq, changes. ARGV: doc_id, base_revision, content_hash, body, device.
+APPLY_LUA = """
+local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+if redis.call('HGET', KEYS[1], 'content_hash') == ARGV[3] then return {2, current} end
+if current ~= tonumber(ARGV[2]) then return {0, current} end
+local revision = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'doc_id', ARGV[1], 'revision', tostring(revision), 'content_hash', ARGV[3], 'body', ARGV[4], 'device', ARGV[5])
+redis.call('HSET', KEYS[1] .. ':r' .. revision, 'content_hash', ARGV[3], 'body', ARGV[4])
+redis.call('ZADD', KEYS[3], revision, ARGV[1])
+return {1, revision}
 """
+apply_script = r.register_script(APPLY_LUA)
 
-WATERMARK_LUA = """
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  return next_revision
-end
-return current
-"""
+STATUSES = ("conflict", "applied", "unchanged")
 
 
-def cursor_key(device: str) -> str:
-    return f"cursor:{device}"
-
-
-def apply_batch(device: str, changes: list[dict]) -> dict:
-    """Apply one batch and return {applied, statuses, revision}."""
-    raise NotImplementedError
-
-
-def commit_cursor(device: str, revision: int) -> int:
-    """Advance the device's cursor, never backwards and without any expiry."""
-    # No TTL on purpose: a cursor is the device's receipt. Expiring it makes a device that was
-    # closed for a week resync from zero and take a full snapshot on its next pull.
-    return int(r.eval(CURSOR_LUA, 1, cursor_key(device), revision))
-
-
-def advance_watermark(revision: int) -> int:
-    """Move the server watermark forward atomically; a lower revision is ignored."""
-    return int(r.eval(WATERMARK_LUA, 1, WATERMARK_KEY, revision))
-
-
-def watermark() -> int:
-    """The watermark a device compares against its cursor to detect gaps."""
-    return int(r.get(WATERMARK_KEY) or 0)
-
-
-def push(device: str, changes: list[dict], revision: int) -> dict:
-    # The cursor is a receipt: it may only move once the batch it names is durable.
-    outcome = apply_batch(device, changes)
-    cursor = commit_cursor(device, revision)
-    mark = advance_watermark(outcome["revision"])
-    return {"applied": outcome["applied"], "cursor": cursor, "watermark": mark}
+def apply_change(doc_id: str, base_revision: int, content_hash: str, body: str, device: str) -> dict:
+    """Apply the change only against the revision the device edited: {"status", "revision"}."""
+    # One script: the compare, the next revision and every write run with no command in between.
+    code, revision = apply_script(keys=[store.doc_key(doc_id), store.REVISION_KEY, store.CHANGES_KEY], args=[doc_id, base_revision, content_hash, body, device])
+    return {"status": STATUSES[int(code)], "revision": int(revision)}
 `,
     },
     typescript: {
-      starter: `/** Cursors and the server watermark: a version that writes the receipt first. */
-import {Redis} from 'ioredis';
+      starter: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+import {CHANGES_KEY, type Outcome, REVISION_KEY, docKey, historyKey} from 'docsync/store';
 
-const CURSOR_TTL_S = 7 * 24 * 3600;
+const redis = new Redis({host: 'redis', port: 6379});
 
-export function cursorKey(device: string): string {
-  return 'cursor:' + device;
-}
-
-export async function applyBatch(
-  device: string,
-  changes: unknown[],
-): Promise<{applied: string[]; revision: number}> {
-  throw new Error('not implemented');
-}
-
-export async function commitCursor(device: string, revision: number): Promise<number> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  await r.set(cursorKey(device), String(revision), 'EX', CURSOR_TTL_S);
-  return revision;
-}
-
-export async function watermark(): Promise<number> {
-  return Number((await r.get('watermark')) ?? 0);
-}
-
-export async function push(device: string, changes: unknown[], revision: number): Promise<unknown> {
-  const cursor = await commitCursor(device, revision);
-  const outcome = await applyBatch(device, changes);
-  await r.set('watermark', String(revision));
-  return {applied: outcome.applied, cursor, watermark: await watermark()};
+/** Apply the change only against the revision the device edited. */
+export async function applyChange(docId: string, baseRevision: number, contentHash: string, body: string, device: string): Promise<Outcome> {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const current = Number((await redis.hget(docKey(docId), 'revision')) ?? 0);
+  if (current !== baseRevision) return {status: 'conflict', revision: current};
+  const revision = current + 1;
+  await redis.hset(docKey(docId), {doc_id: docId, revision, content_hash: contentHash, body, device});
+  await redis.hset(historyKey(docId, revision), {content_hash: contentHash, body});
+  await redis.zadd(CHANGES_KEY, revision, docId);
+  return {status: 'applied', revision};
 }
 `,
-      solution: `/** Cursors and the server watermark: the receipt follows the apply, and only moves forward. */
-import {Redis} from 'ioredis';
+      solution: `import Redis from 'ioredis';
 
-const r = new Redis('redis://redis:6379');
+import {CHANGES_KEY, type Outcome, REVISION_KEY, docKey, historyKey} from 'docsync/store';
 
-const WATERMARK_KEY = 'watermark';
-
-const CURSOR_LUA = \`
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  current = next_revision
-end
-return current
+// KEYS: doc:{id}, rev:seq, changes. ARGV: doc_id, base_revision, content_hash, body, device.
+export const APPLY_LUA = \`
+local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+if redis.call('HGET', KEYS[1], 'content_hash') == ARGV[3] then return {2, current} end
+if current ~= tonumber(ARGV[2]) then return {0, current} end
+local revision = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'doc_id', ARGV[1], 'revision', tostring(revision), 'content_hash', ARGV[3], 'body', ARGV[4], 'device', ARGV[5])
+redis.call('HSET', KEYS[1] .. ':r' .. revision, 'content_hash', ARGV[3], 'body', ARGV[4])
+redis.call('ZADD', KEYS[3], revision, ARGV[1])
+return {1, revision}
 \`;
 
-const WATERMARK_LUA = \`
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  return next_revision
-end
-return current
-\`;
-
-export function cursorKey(device: string): string {
-  return 'cursor:' + device;
+interface ApplyRedis extends Redis {
+  applyChange(docKey: string, revisionKey: string, changesKey: string, ...args: (string | number)[]): Promise<[number, number]>;
 }
 
-export async function applyBatch(
-  device: string,
-  changes: unknown[],
-): Promise<{applied: string[]; revision: number}> {
-  throw new Error('not implemented');
-}
+const redis = new Redis({host: 'redis', port: 6379}) as ApplyRedis;
+redis.defineCommand('applyChange', {numberOfKeys: 3, lua: APPLY_LUA});
 
-export async function commitCursor(device: string, revision: number): Promise<number> {
-  // No expiry: the cursor is the device's receipt. Expire it and a device that was closed for a
-  // week resyncs from zero, paying for a full snapshot every time it wakes up.
-  return Number(await r.eval(CURSOR_LUA, 1, cursorKey(device), String(revision)));
-}
+const STATUSES = ['conflict', 'applied', 'unchanged'];
 
-export async function advanceWatermark(revision: number): Promise<number> {
-  return Number(await r.eval(WATERMARK_LUA, 1, WATERMARK_KEY, String(revision)));
-}
-
-export async function watermark(): Promise<number> {
-  return Number((await r.get(WATERMARK_KEY)) ?? 0);
-}
-
-export async function push(device: string, changes: unknown[], revision: number): Promise<unknown> {
-  const outcome = await applyBatch(device, changes);
-  const cursor = await commitCursor(device, revision);
-  const mark = await advanceWatermark(outcome.revision);
-  return {applied: outcome.applied, cursor, watermark: mark};
+/** Apply the change only against the revision the device edited. */
+export async function applyChange(docId: string, baseRevision: number, contentHash: string, body: string, device: string): Promise<Outcome> {
+  // One script: the compare, the next revision and every write run with no command in between.
+  const [code, revision] = await redis.applyChange(docKey(docId), REVISION_KEY, CHANGES_KEY, docId, baseRevision, contentHash, body, device);
+  return {status: STATUSES[Number(code)], revision: Number(revision)};
 }
 `,
     },
@@ -301,46 +199,29 @@ export async function push(device: string, changes: unknown[], revision: number)
 
 import (
 	"context"
-	"time"
+	"strconv"
 
 	"github.com/redis/go-redis/v9"
+
+	"docsync/store" // store.DocKey, HistoryKey, RevisionKey, ChangesKey, Outcome
 )
 
-const cursorTTL = 7 * 24 * time.Hour
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
-
-func cursorKey(device string) string {
-	return "cursor:" + device
-}
-
-func applyBatch(ctx context.Context, device string, changes []Change) (map[string]any, error) {
-	return nil, nil
-}
-
-func commitCursor(ctx context.Context, device string, revision int64) (int64, error) {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	return revision, rdb.Set(ctx, cursorKey(device), revision, cursorTTL).Err()
-}
-
-func watermark(ctx context.Context) int64 {
-	value, _ := rdb.Get(ctx, "watermark").Int64()
-	return value
-}
-
-func push(ctx context.Context, device string, changes []Change, revision int64) (map[string]any, error) {
-	cursor, err := commitCursor(ctx, device, revision)
-	if err != nil {
-		return nil, err
+// applyChange applies the change only against the revision the device edited.
+func applyChange(ctx context.Context, docID string, baseRevision int64, contentHash, body, device string) (store.Outcome, error) {
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	current, _ := strconv.ParseInt(rdb.HGet(ctx, store.DocKey(docID), "revision").Val(), 10, 64)
+	if current != baseRevision {
+		return store.Outcome{Status: "conflict", Revision: current}, nil
 	}
-	outcome, err := applyBatch(ctx, device, changes)
-	if err != nil {
-		return nil, err
+	revision := current + 1
+	if err := rdb.HSet(ctx, store.DocKey(docID), map[string]any{"doc_id": docID, "revision": revision, "content_hash": contentHash, "body": body, "device": device}).Err(); err != nil {
+		return store.Outcome{}, err
 	}
-	if err := rdb.Set(ctx, "watermark", revision, 0).Err(); err != nil {
-		return nil, err
-	}
-	return map[string]any{"applied": outcome["applied"], "cursor": cursor, "watermark": watermark(ctx)}, nil
+	rdb.HSet(ctx, store.HistoryKey(docID, revision), map[string]any{"content_hash": contentHash, "body": body})
+	rdb.ZAdd(ctx, store.ChangesKey, redis.Z{Score: float64(revision), Member: docID})
+	return store.Outcome{Status: "applied", Revision: revision}, nil
 }
 `,
       solution: `package main
@@ -349,253 +230,400 @@ import (
 	"context"
 
 	"github.com/redis/go-redis/v9"
+
+	"docsync/store" // store.DocKey, HistoryKey, RevisionKey, ChangesKey, Outcome
 )
 
-const watermarkKey = "watermark"
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-var rdb *redis.Client
+// KEYS: doc:{id}, rev:seq, changes. ARGV: doc_id, base_revision, content_hash, body, device.
+const applyLua = \`
+local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+if redis.call('HGET', KEYS[1], 'content_hash') == ARGV[3] then return {2, current} end
+if current ~= tonumber(ARGV[2]) then return {0, current} end
+local revision = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'doc_id', ARGV[1], 'revision', tostring(revision), 'content_hash', ARGV[3], 'body', ARGV[4], 'device', ARGV[5])
+redis.call('HSET', KEYS[1] .. ':r' .. revision, 'content_hash', ARGV[3], 'body', ARGV[4])
+redis.call('ZADD', KEYS[3], revision, ARGV[1])
+return {1, revision}
+\`
 
-var cursorScript = redis.NewScript(\`
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  current = next_revision
-end
-return current
-\`)
+var (
+	applyScript = redis.NewScript(applyLua)
+	statuses    = []string{"conflict", "applied", "unchanged"}
+)
 
-var watermarkScript = redis.NewScript(\`
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  return next_revision
-end
-return current
-\`)
-
-func cursorKey(device string) string {
-	return "cursor:" + device
-}
-
-func applyBatch(ctx context.Context, device string, changes []Change) (map[string]any, error) {
-	return nil, nil
-}
-
-func commitCursor(ctx context.Context, device string, revision int64) (int64, error) {
-	// No expiry: a cursor is the receipt a device resumes from. Expiring it makes a device that
-	// was closed for a week resync from zero on its next pull.
-	return cursorScript.Run(ctx, rdb, []string{cursorKey(device)}, revision).Int64()
-}
-
-func advanceWatermark(ctx context.Context, revision int64) (int64, error) {
-	return watermarkScript.Run(ctx, rdb, []string{watermarkKey}, revision).Int64()
-}
-
-func watermark(ctx context.Context) int64 {
-	value, _ := rdb.Get(ctx, watermarkKey).Int64()
-	return value
-}
-
-func push(ctx context.Context, device string, changes []Change, revision int64) (map[string]any, error) {
-	// The cursor follows the apply: a crash between the two replays the batch instead of losing it.
-	outcome, err := applyBatch(ctx, device, changes)
+// applyChange applies the change only against the revision the device edited.
+func applyChange(ctx context.Context, docID string, baseRevision int64, contentHash, body, device string) (store.Outcome, error) {
+	// One script: the compare, the next revision and every write run with no command in between.
+	keys := []string{store.DocKey(docID), store.RevisionKey, store.ChangesKey}
+	reply, err := applyScript.Run(ctx, rdb, keys, docID, baseRevision, contentHash, body, device).Int64Slice()
 	if err != nil {
-		return nil, err
+		return store.Outcome{}, err
 	}
-	cursor, err := commitCursor(ctx, device, revision)
-	if err != nil {
-		return nil, err
-	}
-	mark, err := advanceWatermark(ctx, revision)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"applied": outcome["applied"], "cursor": cursor, "watermark": mark}, nil
+	return store.Outcome{Status: statuses[reply[0]], Revision: reply[1]}, nil
 }
 `,
     },
     scala: {
-      starter: `import redis.clients.jedis.Jedis
+      starter: `import redis.clients.jedis.JedisPooled
 
-object CursorStore {
-  val CursorTtlSeconds = 7L * 24 * 60 * 60
-  val jedis = new Jedis("redis", 6379)
+import scala.jdk.CollectionConverters._
 
-  def cursorKey(device: String): String = s"cursor:$device"
+import docsync.Store // Store.docKey, historyKey, RevisionKey, ChangesKey, Outcome
 
-  def applyBatch(device: String, changes: List[Change]): BatchOutcome = ???
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def commitCursor(device: String, revision: Long): Long = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    jedis.setex(cursorKey(device), CursorTtlSeconds, revision.toString)
-    revision
-  }
-
-  def watermark(): Long = Option(jedis.get("watermark")).map(_.toLong).getOrElse(0L)
-
-  def push(device: String, changes: List[Change], revision: Long): Map[String, Any] = {
-    val cursor = commitCursor(device, revision)
-    val outcome = applyBatch(device, changes)
-    jedis.set("watermark", revision.toString)
-    Map("applied" -> outcome.applied, "cursor" -> cursor, "watermark" -> watermark())
+  /** Apply the change only against the revision the device edited. */
+  def applyChange(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Store.Outcome = {
+    // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    val current = Option(jedis.hget(Store.docKey(docId), "revision")).map(_.toLong).getOrElse(0L)
+    if (current != baseRevision) Store.Outcome("conflict", current)
+    else {
+      val revision = current + 1
+      jedis.hset(Store.docKey(docId), Map("doc_id" -> docId, "revision" -> revision.toString, "content_hash" -> contentHash, "body" -> body, "device" -> device).asJava)
+      jedis.hset(Store.historyKey(docId, revision), Map("content_hash" -> contentHash, "body" -> body).asJava)
+      jedis.zadd(Store.ChangesKey, revision.toDouble, docId)
+      Store.Outcome("applied", revision)
+    }
   }
 }
 `,
-      solution: `import redis.clients.jedis.Jedis
+      solution: `import redis.clients.jedis.JedisPooled
 
-object CursorStore {
-  val WatermarkKey = "watermark"
-  val jedis = new Jedis("redis", 6379)
+import scala.jdk.CollectionConverters._
 
-  val CursorLua =
-    """
-      |local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local next_revision = tonumber(ARGV[1])
-      |if next_revision > current then
-      |  redis.call('SET', KEYS[1], next_revision)
-      |  current = next_revision
-      |end
-      |return current
-      |""".stripMargin
+import docsync.Store // Store.docKey, historyKey, RevisionKey, ChangesKey, Outcome
 
-  val WatermarkLua =
-    """
-      |local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-      |local next_revision = tonumber(ARGV[1])
-      |if next_revision > current then
-      |  redis.call('SET', KEYS[1], next_revision)
-      |  return next_revision
-      |end
-      |return current
-      |""".stripMargin
+object State {
+  val jedis = new JedisPooled("redis", 6379)
 
-  def cursorKey(device: String): String = s"cursor:$device"
+  // KEYS: doc:{id}, rev:seq, changes. ARGV: doc_id, base_revision, content_hash, body, device.
+  val ApplyLua: String = """
+local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+if redis.call('HGET', KEYS[1], 'content_hash') == ARGV[3] then return {2, current} end
+if current ~= tonumber(ARGV[2]) then return {0, current} end
+local revision = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'doc_id', ARGV[1], 'revision', tostring(revision), 'content_hash', ARGV[3], 'body', ARGV[4], 'device', ARGV[5])
+redis.call('HSET', KEYS[1] .. ':r' .. revision, 'content_hash', ARGV[3], 'body', ARGV[4])
+redis.call('ZADD', KEYS[3], revision, ARGV[1])
+return {1, revision}
+"""
 
-  def applyBatch(device: String, changes: List[Change]): BatchOutcome = ???
+  private val Statuses = Vector("conflict", "applied", "unchanged")
 
-  def commitCursor(device: String, revision: Long): Long = {
-    // No expiry: a cursor is the receipt a device resumes from. Expire it and a device that was
-    // closed for a week resyncs from zero, paying for a full snapshot every time it wakes up.
-    jedis.eval(CursorLua, 1, cursorKey(device), revision.toString).asInstanceOf[java.lang.Long].longValue()
-  }
-
-  def advanceWatermark(revision: Long): Long =
-    jedis.eval(WatermarkLua, 1, WatermarkKey, revision.toString).asInstanceOf[java.lang.Long].longValue()
-
-  def watermark(): Long = Option(jedis.get(WatermarkKey)).map(_.toLong).getOrElse(0L)
-
-  def push(device: String, changes: List[Change], revision: Long): Map[String, Any] = {
-    val outcome = applyBatch(device, changes)
-    val cursor = commitCursor(device, revision)
-    val mark = advanceWatermark(outcome.revision)
-    Map("applied" -> outcome.applied, "cursor" -> cursor, "watermark" -> mark)
+  /** Apply the change only against the revision the device edited. */
+  def applyChange(docId: String, baseRevision: Long, contentHash: String, body: String, device: String): Store.Outcome = {
+    // One script: the compare, the next revision and every write run with no command in between.
+    val keys = List(Store.docKey(docId), Store.RevisionKey, Store.ChangesKey).asJava
+    val args = List(docId, baseRevision.toString, contentHash, body, device).asJava
+    val reply = jedis.eval(ApplyLua, keys, args).asInstanceOf[java.util.List[java.lang.Long]]
+    Store.Outcome(Statuses(reply.get(0).toInt), reply.get(1).longValue)
   }
 }
 `,
     },
     cpp: {
-      starter: `#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      starter: `#include <sw/redis++/redis++.h>
 
 #include <string>
 
-using json = nlohmann::json;
+#include "docsync/store.h"  // store::docKey, historyKey, kRevisionKey, kChangesKey, Outcome
 
-constexpr long long kCursorTtlSeconds = 7 * 24 * 60 * 60;
+sw::redis::Redis redis("tcp://redis:6379");
 
-std::string cursorKey(const std::string& device) {
-  return "cursor:" + device;
-}
-
-json applyBatch(const std::string& device, const json& changes);
-
-long long commitCursor(sw::redis::Redis& redis, const std::string& device, long long revision) {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  redis.setex(cursorKey(device), kCursorTtlSeconds, std::to_string(revision));
-  return revision;
-}
-
-long long watermark(sw::redis::Redis& redis) {
-  auto value = redis.get("watermark");
-  return value ? std::stoll(*value) : 0;
-}
-
-json push(sw::redis::Redis& redis, const std::string& device, const json& changes, long long revision) {
-  const auto cursor = commitCursor(redis, device, revision);
-  const auto outcome = applyBatch(device, changes);
-  redis.set("watermark", std::to_string(revision));
-  return json{{"applied", outcome["applied"]}, {"cursor", cursor}, {"watermark", watermark(redis)}};
+// Apply the change only against the revision the device edited.
+store::Outcome applyChange(const std::string& doc_id, long long base_revision, const std::string& content_hash, const std::string& body,
+                           const std::string& device) {
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const auto raw = redis.hget(store::docKey(doc_id), "revision");
+  const long long current = raw ? std::stoll(*raw) : 0;
+  if (current != base_revision) return store::Outcome{"conflict", current};
+  const long long revision = current + 1;
+  redis.hset(store::docKey(doc_id), {{"doc_id", doc_id}, {"revision", std::to_string(revision)}, {"content_hash", content_hash}, {"body", body}, {"device", device}});
+  redis.hset(store::historyKey(doc_id, revision), {{"content_hash", content_hash}, {"body", body}});
+  redis.zadd(store::kChangesKey, doc_id, static_cast<double>(revision));
+  return store::Outcome{"applied", revision};
 }
 `,
-      solution: `#include <nlohmann/json.hpp>
-#include <sw/redis++/redis++.h>
+      solution: `#include <sw/redis++/redis++.h>
 
+#include <iterator>
 #include <string>
 #include <vector>
 
-using json = nlohmann::json;
+#include "docsync/store.h"  // store::docKey, historyKey, kRevisionKey, kChangesKey, Outcome
 
-const std::string kWatermarkKey = "watermark";
+sw::redis::Redis redis("tcp://redis:6379");
 
-const char* kCursorLua = R"LUA(
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  current = next_revision
-end
-return current
-)LUA";
+// KEYS: doc:{id}, rev:seq, changes. ARGV: doc_id, base_revision, content_hash, body, device.
+const std::string kApplyLua = R"(
+local current = tonumber(redis.call('HGET', KEYS[1], 'revision') or '0')
+if redis.call('HGET', KEYS[1], 'content_hash') == ARGV[3] then return {2, current} end
+if current ~= tonumber(ARGV[2]) then return {0, current} end
+local revision = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'doc_id', ARGV[1], 'revision', tostring(revision), 'content_hash', ARGV[3], 'body', ARGV[4], 'device', ARGV[5])
+redis.call('HSET', KEYS[1] .. ':r' .. revision, 'content_hash', ARGV[3], 'body', ARGV[4])
+redis.call('ZADD', KEYS[3], revision, ARGV[1])
+return {1, revision}
+)";
 
-const char* kWatermarkLua = R"LUA(
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local next_revision = tonumber(ARGV[1])
-if next_revision > current then
-  redis.call('SET', KEYS[1], next_revision)
-  return next_revision
-end
-return current
-)LUA";
-
-std::string cursorKey(const std::string& device) {
-  return "cursor:" + device;
-}
-
-json applyBatch(const std::string& device, const json& changes);
-
-long long commitCursor(sw::redis::Redis& redis, const std::string& device, long long revision) {
-  // No expiry: a cursor is the receipt a device resumes from, and an expired one means a full
-  // snapshot every time a device comes back from a week away.
-  return redis.eval<long long>(kCursorLua, {cursorKey(device)}, {revision});
-}
-
-long long advanceWatermark(sw::redis::Redis& redis, long long revision) {
-  return redis.eval<long long>(kWatermarkLua, {kWatermarkKey}, {revision});
-}
-
-long long watermark(sw::redis::Redis& redis) {
-  auto value = redis.get(kWatermarkKey);
-  return value ? std::stoll(*value) : 0;
-}
-
-json push(sw::redis::Redis& redis, const std::string& device, const json& changes, long long revision) {
-  // The cursor is a receipt, so it moves after the batch it names is durable.
-  const auto outcome = applyBatch(device, changes);
-  const auto cursor = commitCursor(redis, device, revision);
-  const auto mark = advanceWatermark(redis, revision);
-  return json{{"applied", outcome["applied"]}, {"cursor", cursor}, {"watermark", mark}};
+// Apply the change only against the revision the device edited.
+store::Outcome applyChange(const std::string& doc_id, long long base_revision, const std::string& content_hash, const std::string& body,
+                           const std::string& device) {
+  // One script: the compare, the next revision and every write run with no command in between.
+  const std::vector<std::string> keys = {store::docKey(doc_id), store::kRevisionKey, store::kChangesKey};
+  const std::vector<std::string> args = {doc_id, std::to_string(base_revision), content_hash, body, device};
+  std::vector<long long> reply;
+  redis.eval(kApplyLua, keys.begin(), keys.end(), args.begin(), args.end(), std::back_inserter(reply));
+  static const char* kStatuses[] = {"conflict", "applied", "unchanged"};
+  return store::Outcome{kStatuses[reply.at(0)], reply.at(1)};
 }
 `,
     },
   },
-  hints: [
-    'A user edits on the train, the worker restarts mid-push, and the phone reports "up to date" while the document on the server does not have the edits. Nothing was logged.',
-    '`push` writes the cursor before `apply_batch`, so the receipt exists for work that never happened. The key also carries `ex=CURSOR_TTL_S`, and `r.set("watermark", ...)` lets the slower of two writers win.',
-    'Reorder to `apply_batch` then `commit_cursor`, drop the TTL, and make both advances a Lua compare-and-set (`CURSOR_LUA`, `WATERMARK_LUA` via `r.eval`) that only `SET`s a higher value; name the key with `WATERMARK_KEY`.',
-  ],
-  debrief: `A cursor is a receipt for work the server has durably done, which is why the fix is an ordering rather than a new data structure: apply, then commit. With that order a crash leaves a device that retries a batch the apply can deduplicate; the other order leaves a device whose own batch is skipped forever. The expiry goes for the same reason: a cursor exists to survive an idle week. Both advances become a Lua compare-and-set because two writers racing on a plain SET end on whichever landed last, and a watermark every device compares against must not go backwards.
+  harness: {
+    python: `from docsync import store
 
-Production cursor stores also record the batch id with the cursor, keep a per-document high-water mark, and add a snapshot path for a device whose cursor is older than the retention window.`,
+
+def _apply(m, doc_id, base, body, device="laptop"):
+    return m.apply_change(doc_id, base, store.content_hash(body), body, device)
+
+
+def check_atomic_apply(ctx):
+    m = ctx.load("state")
+    first = _apply(m, "d-1", 0, "draft agenda")
+    assert first == {"status": "applied", "revision": 1}, f"the first apply of d-1 answered {first}, expected applied at revision 1"
+    # The phone's edit of revision 1 lands while the laptop's edit of revision 1 is being applied.
+    rival = ctx.redis_after("doc:d-1", lambda: _apply(m, "d-1", 1, "agenda: budget", "phone"))
+    mine = _apply(m, "d-1", 1, "agenda: offsite", "laptop")
+    assert rival.fired, "the apply never touched doc:d-1"
+    if rival.error is not None:
+        raise rival.error
+    theirs = rival.result
+    statuses = sorted([theirs["status"], mine["status"]])
+    assert statuses == ["applied", "conflict"], f"two edits of revision 1 landed together and were answered {theirs} (phone) and {mine} (laptop): exactly one may apply, the other is a conflict. Run the compare and the writes in one script"
+    winner = "agenda: budget" if theirs["status"] == "applied" else "agenda: offsite"
+    head = store.head("d-1")
+    assert head["body"] == winner, f"d-1 reads {head['body']!r}, expected the applied edit {winner!r}"
+
+
+def check_global_revision(ctx):
+    m = ctx.load("state")
+    a = _apply(m, "d-1", 0, "groceries")
+    b = _apply(m, "d-2", 0, "call the plumber")
+    c = _apply(m, "d-1", a["revision"], "groceries: milk")
+    revisions = [a["revision"], b["revision"], c["revision"]]
+    assert revisions == [1, 2, 3], f"three applies across two documents got revisions {revisions}: when d-2 shares a revision with d-1, a device whose cursor is on it never sees one of them. Take every revision from INCR rev:seq"
+    assert ctx.redis.get("rev:seq") == "3", f"rev:seq is {ctx.redis.get('rev:seq')!r} after three applies, expected '3'"
+    log = ctx.redis.zrange("changes", 0, -1, withscores=True)
+    assert log == [("d-2", 2.0), ("d-1", 3.0)], f"the change log holds {log}, expected d-2 at 2 and d-1 at 3"
+
+
+def check_same_content(ctx):
+    m = ctx.load("state")
+    first = _apply(m, "d-1", 0, "flight AF123, seat 14C", "laptop")
+    # The phone saved the same confirmation before it heard of the laptop's revision.
+    twin = _apply(m, "d-1", 0, "flight AF123, seat 14C", "phone")
+    assert twin == {"status": "unchanged", "revision": first["revision"]}, f"the phone pushed the body the head already has (base 0) and got {twin}: identical edits converge. Answer unchanged at the head's revision"
+    echo = _apply(m, "d-1", first["revision"], "flight AF123, seat 14C", "laptop")
+    assert echo == {"status": "unchanged", "revision": first["revision"]}, f"the laptop pushed back the body it just wrote and got {echo}: an echo must not mint a revision every device downloads again"
+    assert store.head("d-1")["revision"] == first["revision"], f"d-1 moved to revision {store.head('d-1')['revision']} without a change of content"
+    changed = _apply(m, "d-1", first["revision"], "flight AF123, seat 15A")
+    assert changed["status"] == "applied" and changed["revision"] > first["revision"], f"a real edit after the echoes must apply, got {changed}"
+`,
+    typescript: `function state(ctx) {
+  return {m: ctx.load('state'), store: ctx.load('/support/docsync/store.ts')};
+}
+
+const apply = (m, store, docId: string, base: number, body: string, device = 'laptop') => m.applyChange(docId, base, store.contentHash(body), body, device);
+
+async function settled(probe, what: string) {
+  assert(probe.fired, \`nothing touched \${what}\`);
+  if (probe.error !== undefined) throw probe.error;
+  return await probe.result;
+}
+
+export async function check_atomic_apply(ctx) {
+  const {m, store} = state(ctx);
+  const first = await apply(m, store, 'd-1', 0, 'draft agenda');
+  assert.deepStrictEqual(first, {status: 'applied', revision: 1}, \`the first apply of d-1 answered \${JSON.stringify(first)}, expected applied at revision 1\`);
+  // The phone's edit of revision 1 lands while the laptop's edit of revision 1 is being applied.
+  const rival = ctx.redisAfter('doc:d-1', () => apply(m, store, 'd-1', 1, 'agenda: budget', 'phone'));
+  const mine = await apply(m, store, 'd-1', 1, 'agenda: offsite', 'laptop');
+  const theirs = await settled(rival, 'doc:d-1');
+  const statuses = [theirs.status, mine.status].sort();
+  assert.deepStrictEqual(statuses, ['applied', 'conflict'], \`two edits of revision 1 landed together and were answered \${JSON.stringify(theirs)} (phone) and \${JSON.stringify(mine)} (laptop): exactly one may apply, the other is a conflict. Run the compare and the writes in one script\`);
+  const winner = theirs.status === 'applied' ? 'agenda: budget' : 'agenda: offsite';
+  const head = await store.head('d-1');
+  assert.equal(head.body, winner, \`d-1 reads \${JSON.stringify(head.body)}, expected the applied edit\`);
+}
+
+export async function check_global_revision(ctx) {
+  const {m, store} = state(ctx);
+  const a = await apply(m, store, 'd-1', 0, 'groceries');
+  const b = await apply(m, store, 'd-2', 0, 'call the plumber');
+  const c = await apply(m, store, 'd-1', a.revision, 'groceries: milk');
+  const revisions = [a.revision, b.revision, c.revision];
+  assert.deepStrictEqual(revisions, [1, 2, 3], \`three applies across two documents got revisions \${JSON.stringify(revisions)}: when d-2 shares a revision with d-1, a device whose cursor is on it never sees one of them. Take every revision from INCR rev:seq\`);
+  assert.equal(ctx.redis.get('rev:seq'), '3', \`rev:seq is \${JSON.stringify(ctx.redis.get('rev:seq'))} after three applies, expected '3'\`);
+  const log = ctx.redis.zrange('changes', 0, -1, 'WITHSCORES');
+  assert.deepStrictEqual(log, ['d-2', '2', 'd-1', '3'], \`the change log holds \${JSON.stringify(log)}, expected d-2 at 2 and d-1 at 3\`);
+}
+
+export async function check_same_content(ctx) {
+  const {m, store} = state(ctx);
+  const first = await apply(m, store, 'd-1', 0, 'flight AF123, seat 14C', 'laptop');
+  // The phone saved the same confirmation before it heard of the laptop's revision.
+  const twin = await apply(m, store, 'd-1', 0, 'flight AF123, seat 14C', 'phone');
+  assert.deepStrictEqual(twin, {status: 'unchanged', revision: first.revision}, \`the phone pushed the body the head already has (base 0) and got \${JSON.stringify(twin)}: identical edits converge. Answer unchanged at the head's revision\`);
+  const echo = await apply(m, store, 'd-1', first.revision, 'flight AF123, seat 14C', 'laptop');
+  assert.deepStrictEqual(echo, {status: 'unchanged', revision: first.revision}, \`the laptop pushed back the body it just wrote and got \${JSON.stringify(echo)}: an echo must not mint a revision every device downloads again\`);
+  assert.equal((await store.head('d-1')).revision, first.revision, 'd-1 moved to a new revision without a change of content');
+  const changed = await apply(m, store, 'd-1', first.revision, 'flight AF123, seat 15A');
+  assert(changed.status === 'applied' && changed.revision > first.revision, \`a real edit after the echoes must apply, got \${JSON.stringify(changed)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"docsync/store"
+
+	"leetbuild/harness"
+)
+
+var stateBg = context.Background()
+
+func stateApply(ctx *harness.Ctx, docID string, base int64, body, device string) store.Outcome {
+	outcome, err := applyChange(stateBg, docID, base, store.ContentHash(body), body, device)
+	ctx.NoError(err, "applyChange(%s, %d) failed", docID, base)
+	return outcome
+}
+
+func CheckAtomicApply(ctx *harness.Ctx) {
+	first := stateApply(ctx, "d-1", 0, "draft agenda", "laptop")
+	ctx.Equal(first, store.Outcome{Status: "applied", Revision: 1}, "the first apply of d-1")
+	// The phone's edit of revision 1 lands while the laptop's edit of revision 1 is being applied.
+	rival := ctx.Redis.After("doc:d-1", func() any {
+		outcome, err := applyChange(stateBg, "d-1", 1, store.ContentHash("agenda: budget"), "agenda: budget", "phone")
+		if err != nil {
+			panic(err)
+		}
+		return outcome
+	})
+	mine := stateApply(ctx, "d-1", 1, "agenda: offsite", "laptop")
+	ctx.Assert(rival.Fired, "the apply never touched doc:d-1")
+	ctx.Assert(rival.Err == nil, "the phone's apply failed: %v", rival.Err)
+	theirs, _ := rival.Result.(store.Outcome)
+	applied := (theirs.Status == "applied") != (mine.Status == "applied")
+	ctx.Assert(applied && (theirs.Status == "conflict" || mine.Status == "conflict"),
+		"two edits of revision 1 landed together and were answered %+v (phone) and %+v (laptop): exactly one may apply, the other is a conflict. Run the compare and the writes in one script", theirs, mine)
+	winner := "agenda: offsite"
+	if theirs.Status == "applied" {
+		winner = "agenda: budget"
+	}
+	ctx.Equal(store.Head(stateBg, "d-1").Body, winner, "d-1 must hold the applied edit; its body")
+}
+
+func CheckGlobalRevision(ctx *harness.Ctx) {
+	a := stateApply(ctx, "d-1", 0, "groceries", "laptop")
+	b := stateApply(ctx, "d-2", 0, "call the plumber", "laptop")
+	c := stateApply(ctx, "d-1", a.Revision, "groceries: milk", "laptop")
+	revisions := []int64{a.Revision, b.Revision, c.Revision}
+	ctx.Equal(revisions, []int64{1, 2, 3}, "three applies across two documents: when d-2 shares a revision with d-1, a device whose cursor is on it never sees one of them. Take every revision from INCR rev:seq; the revisions")
+	seq, _ := ctx.Redis.Get("rev:seq")
+	ctx.Equal(seq, "3", "rev:seq after three applies")
+	ctx.Equal(ctx.Redis.ZRangeWithScores("changes", 0, -1), []harness.Z{{Member: "d-2", Score: 2}, {Member: "d-1", Score: 3}}, "the change log (d-2 at 2, d-1 at 3)")
+}
+
+func CheckSameContent(ctx *harness.Ctx) {
+	first := stateApply(ctx, "d-1", 0, "flight AF123, seat 14C", "laptop")
+	// The phone saved the same confirmation before it heard of the laptop's revision.
+	twin := stateApply(ctx, "d-1", 0, "flight AF123, seat 14C", "phone")
+	ctx.Equal(twin, store.Outcome{Status: "unchanged", Revision: first.Revision}, "the phone pushed the body the head already has (base 0): identical edits converge, answered unchanged at the head's revision")
+	echo := stateApply(ctx, "d-1", first.Revision, "flight AF123, seat 14C", "laptop")
+	ctx.Equal(echo, store.Outcome{Status: "unchanged", Revision: first.Revision}, "the laptop pushed back the body it just wrote: an echo must not mint a revision every device downloads again")
+	ctx.Equal(store.Head(stateBg, "d-1").Revision, first.Revision, "d-1 must stay at its revision without a change of content; its revision")
+	changed := stateApply(ctx, "d-1", first.Revision, "flight AF123, seat 15A", "laptop")
+	ctx.Assert(changed.Status == "applied" && changed.Revision > first.Revision, "a real edit after the echoes must apply, got %+v", changed)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <optional>
+#include <string>
+
+#include "docsync/store.h"
+
+namespace {
+
+store::Outcome stateApply(const std::string& doc_id, long long base, const std::string& body, const std::string& device = "laptop") {
+  return applyChange(doc_id, base, store::contentHash(body), body, device);
+}
+
+std::string outcomeText(const store::Outcome& o) { return o.status + " at " + std::to_string(o.revision); }
+
+}  // namespace
+
+void CheckAtomicApply(harness::Ctx& ctx) {
+  const store::Outcome first = stateApply("d-1", 0, "draft agenda");
+  ctx.Assert(first.status == "applied" && first.revision == 1, "the first apply of d-1 answered %s, expected applied at revision 1", outcomeText(first));
+  // The phone's edit of revision 1 lands while the laptop's edit of revision 1 is being applied.
+  std::optional<store::Outcome> theirs;
+  std::optional<std::string> failed;
+  ctx.Redis.After("doc:d-1", [&] {
+    try {
+      theirs = stateApply("d-1", 1, "agenda: budget", "phone");
+    } catch (const std::exception& e) {
+      failed = e.what();
+    }
+  });
+  const store::Outcome mine = stateApply("d-1", 1, "agenda: offsite", "laptop");
+  ctx.Assert(!failed, "the phone's apply failed: %s", failed.value_or(""));
+  ctx.Assert(theirs.has_value(), "the apply never touched doc:d-1");
+  const bool one = (theirs->status == "applied") != (mine.status == "applied");
+  ctx.Assert(one && (theirs->status == "conflict" || mine.status == "conflict"),
+             "two edits of revision 1 landed together and were answered %s (phone) and %s (laptop): exactly one may apply, the other is a conflict. Run the compare and the writes in one script",
+             outcomeText(*theirs), outcomeText(mine));
+  const std::string winner = theirs->status == "applied" ? "agenda: budget" : "agenda: offsite";
+  ctx.Equal(store::head("d-1")->body, winner, "d-1 must hold the applied edit; its body");
+}
+
+void CheckGlobalRevision(harness::Ctx& ctx) {
+  const store::Outcome a = stateApply("d-1", 0, "groceries");
+  const store::Outcome b = stateApply("d-2", 0, "call the plumber");
+  const store::Outcome c = stateApply("d-1", a.revision, "groceries: milk");
+  ctx.Assert(a.revision == 1 && b.revision == 2 && c.revision == 3,
+             "three applies across two documents got revisions %d, %d, %d: when d-2 shares a revision with d-1, a device whose cursor is on it never sees one of them. Take every revision from INCR rev:seq",
+             a.revision, b.revision, c.revision);
+  ctx.Equal(ctx.Redis.Get("rev:seq"), std::optional<std::string>("3"), "rev:seq after three applies");
+  const auto log = ctx.Redis.ZRangeWithScores("changes", 0, -1);
+  ctx.Assert(log.size() == 2 && log[0].Member == "d-2" && log[0].Score == 2 && log[1].Member == "d-1" && log[1].Score == 3,
+             "the change log must hold d-2 at 2 and d-1 at 3, got %v", log);
+}
+
+void CheckSameContent(harness::Ctx& ctx) {
+  const store::Outcome first = stateApply("d-1", 0, "flight AF123, seat 14C", "laptop");
+  // The phone saved the same confirmation before it heard of the laptop's revision.
+  const store::Outcome twin = stateApply("d-1", 0, "flight AF123, seat 14C", "phone");
+  ctx.Assert(twin.status == "unchanged" && twin.revision == first.revision,
+             "the phone pushed the body the head already has (base 0) and got %s: identical edits converge. Answer unchanged at the head's revision", outcomeText(twin));
+  const store::Outcome echo = stateApply("d-1", first.revision, "flight AF123, seat 14C", "laptop");
+  ctx.Assert(echo.status == "unchanged" && echo.revision == first.revision,
+             "the laptop pushed back the body it just wrote and got %s: an echo must not mint a revision every device downloads again", outcomeText(echo));
+  ctx.Equal(store::head("d-1")->revision, first.revision, "d-1 must stay at its revision without a change of content; its revision");
+  const store::Outcome changed = stateApply("d-1", first.revision, "flight AF123, seat 15A");
+  ctx.Assert(changed.status == "applied" && changed.revision > first.revision, "a real edit after the echoes must apply, got %s", outcomeText(changed));
+}
+`,
+  },
+  hints: [
+    'Fire two pushes of the same base at once: both answer applied and one edit is gone. Create two documents: both are at revision 1. Push back an unchanged body: the revision climbs anyway.',
+    'The `HGET` and the `HSET`s are separate commands, so another push can land between them. `current + 1` numbers each document on its own, and nothing looks at `content_hash` before a revision is minted.',
+    'Move the logic into one Lua script: compare `ARGV[3]` with the head’s `content_hash` (`{2, current}`), the base with the revision (`{0, current}`), then `INCR rev:seq`, `HSET` head and `doc:{id}:r{n}`, `ZADD changes`.',
+  ],
+  debrief: `Redis runs a script without interleaving another client's command, so putting the compare and every write inside one script turns check-then-write into a single step, and the only answer a racing push can get is a conflict. A server-wide revision makes the change log a total order, which is what lets a pull cursor be a single number. Comparing content before the base is what keeps identical edits and echoes from becoming conflicts or churn, since the base says what a device saw while the hash says what it wants. A larger system shards documents across Redis nodes with hash tags, keeps the counter per shard with a shard-qualified cursor, and trims kept revisions once every device has pulled past them.`,
 };

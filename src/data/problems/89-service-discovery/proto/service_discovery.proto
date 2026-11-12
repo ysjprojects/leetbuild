@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package discoveryd;
+
+// The health protocol every registered instance serves, shaped like grpc.health.v1: step 3 asks it
+// before an instance is routable. A reply can succeed and still say NOT_SERVING (draining,
+// dependencies down); a hung or stopped instance answers DEADLINE_EXCEEDED or UNAVAILABLE.
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}

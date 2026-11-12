@@ -2,470 +2,326 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
+  title: 'Policy engine calls that deny when they cannot verify',
   concept: 'grpc',
   file: 'client',
-  title: 'Policy engine calls that deny when unverifiable',
   focus: ['api', 'engine', 'redis'],
   task: `## Task
 
-**Starting point.** The starter registers the check route, reads a cached allow from Redis, calls
-\`PolicyEngine.Decide\` over gRPC (a unary call taking \`subject\`, \`permission\` and \`scope\`,
-answering \`ALLOW\` or \`DENY\`), caches the answer under \`perm:allow:{subject}:{permission}:{scope}\`
-for 60 s and returns it. It compiles, serves the demo, and hides 5 flaws.
+**Starting point.** The starter is \`authorize(subject, permission, scope)\`, the check every
+request makes: it serves a cached allow from \`perm:allow:{subject}:{permission}:{scope}\` (60 s
+TTL), else calls \`PolicyEngine.Check\` up to three times with a 200 ms sleep after any error, caches
+an allow, and when every attempt failed returns the engine's last allow, kept for an hour. With a
+healthy engine it answers correctly, and it hides four flaws.
 
-**Failure mode the checks target.** The starter fails open. One hung call is one hung request; every
-RPC error is retried three times, a rejection status included, and once the attempts are gone the
-last cached allow is served, so an engine outage becomes platform-wide access; and the cache trusts
-a timer instead of a version, so a revocation waits for the TTL.
+**Failure mode the checks target.** A stalled engine holds every request open; an unknown permission
+is asked three times; an engine outage turns into the allows of the last hour; and a revoked grant
+keeps its cached allow for a minute.
 
-- **Deadline.** Every attempt carries a **400 ms** deadline on the call itself: \`timeout=\`,
-  \`deadline:\`, \`context.WithTimeout\`, \`withDeadlineAfter\`, \`context->set_deadline\`.
-- **At most two attempts.** Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, after a
-  jittered backoff. Every other status is the engine's answer.
-- **A timeout denies.** When the attempts are exhausted the caller gets a retriable **503** with
-  \`Retry-After: 1\`, not the cached allow.
-- **A \`DENY\` is terminal.** One call, no retry, **403**, no cached allow consulted behind it.
-- **A cached allow is only as good as its version.** It counts only while its stored
-  \`grant_version\` matches the current counter; otherwise the engine is asked again.`,
+\`\`\`proto
+service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decision{allowed, reason}
+\`\`\`
+
+- Every call carries a **400 ms** deadline (\`DEADLINE_S\`).
+- At most **two** attempts (\`MAX_ATTEMPTS\`), 100 ms apart, and only after \`UNAVAILABLE\` or
+  \`DEADLINE_EXCEEDED\`. Any other status is the engine's answer: deny, no retry.
+- When both attempts fail, raise \`PolicyUnavailable\` (the route answers 503): never an old allow.
+- A cached allow is a hash stamped with \`perm:grant_version\` and counts only while the stamp equals
+  the current version.`,
   sequence: {
-    participants: ['Permission Service', 'Policy engine', 'Redis', 'Client'],
+    participants: ['Permission Service', 'Redis', 'Policy engine'],
     messages: [
-      {from: 'Client', to: 'Permission Service', label: 'POST /v1/check · subject · permission · scope', kind: 'sync'},
       {
         from: 'Permission Service',
         to: 'Redis',
-        label: 'hgetall perm:allow:{subject}:{permission}:{scope}',
+        label: 'GET perm:grant_version · HGET perm:allow:… version',
         kind: 'sync',
       },
-      {from: 'Redis', to: 'Permission Service', label: 'stored allow + grant_version / none', kind: 'reply'},
+      {from: 'Redis', to: 'Permission Service', label: 'stamp = current → allow', kind: 'reply'},
+      {from: 'Permission Service', to: 'Policy engine', label: 'Check · deadline 400 ms', kind: 'sync'},
+      {
+        from: 'Policy engine',
+        to: 'Permission Service',
+        label: 'UNAVAILABLE → 100 ms → one more attempt',
+        kind: 'reply',
+      },
+      {
+        from: 'Policy engine',
+        to: 'Permission Service',
+        label: 'Decision{allowed} · INVALID_ARGUMENT → deny',
+        kind: 'reply',
+      },
+      {from: 'Permission Service', to: 'Redis', label: 'HSET allow {version} · EXPIRE 60', kind: 'sync'},
       {
         from: 'Permission Service',
-        to: 'Policy engine',
-        label: 'Decide(subject, permission, scope) · 400 ms deadline',
+        to: 'Permission Service',
+        label: 'two attempts failed → PolicyUnavailable (503)',
         kind: 'sync',
       },
-      {from: 'Policy engine', to: 'Permission Service', label: 'ALLOW', kind: 'reply'},
-      {from: 'Permission Service', to: 'Redis', label: 'hset allow · grant_version · effect', kind: 'async'},
-      {from: 'Permission Service', to: 'Policy engine', label: 'Decide · DENY', kind: 'sync'},
-      {from: 'Permission Service', to: 'Client', label: '403 policy_denied · one call · no retry', kind: 'reply'},
-      {from: 'Permission Service', to: 'Policy engine', label: 'Decide · deadline expires, retry once', kind: 'sync'},
-      {from: 'Permission Service', to: 'Client', label: '503 policy_unavailable · Retry-After: 1', kind: 'reply'},
     ],
   },
-  hints: [
-    'Stop the policy engine. Checks hang for as long as the engine stays silent, then start answering `allowed` for anyone who was allowed in the last minute.',
-    'The starter calls `Decide` with no deadline, treats every `RpcError` as retryable for `RETRY_LIMIT` rounds, then falls through to the cached allow, which was stored with a 60 s TTL and no version.',
-    'Pass `timeout=POLICY_TIMEOUT_MS`, loop `MAX_ATTEMPTS` times only on `UNAVAILABLE`/`DEADLINE_EXCEEDED`, return 403 when `is_terminal`, 503 with `Retry-After` on exhaustion, and serve the cache only when `allow_is_current` against `grant_version`.',
-  ],
   checks: [
     {
       id: 'deadline',
       title: 'Calls the policy engine under a 400 ms deadline',
       detail:
-        'The decision call carries a 400 ms deadline, so an unresponsive engine cannot pin a request open. The starter calls the engine with no deadline at all.',
+        'Every `Check` carries a 400 ms deadline, so a stalled engine costs two short attempts and a `PolicyUnavailable`; the starter calls with no deadline and waits as long as the engine does.',
       match: {
-        python: {all: [/POLICY_TIMEOUT_MS/, /timeout\s*=\s*POLICY_TIMEOUT_MS/]},
-        typescript: {all: [/POLICY_TIMEOUT_MS/, /deadline/]},
-        go: {all: [/policyTimeoutMs/, /context\.WithTimeout/]},
-        scala: {all: [/PolicyTimeoutMs/, /deadlineAfter|withDeadline/]},
-        cpp: {all: [/kPolicyTimeoutMs/, /set_deadline/]},
-      },
-    },
-    {
-      id: 'fail-closed',
-      title: 'Denies with a retriable error when the engine cannot be reached',
-      detail:
-        'A `DEADLINE_EXCEEDED` denies the request: the caller gets a retriable `503` with `Retry-After` and never the last cached allow. The starter falls back to the cached allow, so an outage turns into broad access.',
-      match: {
-        python: {all: [/DEADLINE_EXCEEDED/, /Retry-After/, /status_code\s*=\s*503/]},
-        typescript: {all: [/DEADLINE_EXCEEDED/, /Retry-After/, /code\(\s*503\s*\)/]},
-        go: {all: [/DeadlineExceeded/, /Retry-After/, /StatusServiceUnavailable/]},
-        scala: {all: [/DEADLINE_EXCEEDED/, /Retry-After/, /StatusCodes\.ServiceUnavailable/]},
-        cpp: {all: [/DEADLINE_EXCEEDED/, /Retry-After/, /\b503\b/]},
-      },
-    },
-    {
-      id: 'terminal-deny',
-      title: 'Treats a policy rejection as terminal',
-      detail:
-        'A `DENY` from the engine is final: `403`, one call, no retry, no cache consultation. The starter retries a rejection as if the engine were merely flaky, and only then denies.',
-      match: {
-        python: {all: [/is_terminal\(/, /status_code\s*=\s*403/]},
-        typescript: {all: [/isTerminal\(/, /code\(\s*403\s*\)/]},
-        go: {all: [/isTerminal\(/, /StatusForbidden/]},
-        scala: {all: [/isTerminal\(/, /StatusCodes\.Forbidden/]},
-        cpp: {all: [/isTerminal\(/, /\b403\b/]},
+        python: {all: [/DEADLINE_S\s*=\s*0?\.4\b/, /Check\([^)]*timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
+        go: {
+          all: [/policyDeadline\s*=\s*400\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*policyDeadline\)/],
+        },
+        scala: {all: [/DeadlineMs\s*=\s*400L?\b/, /withDeadlineAfter\(\s*DeadlineMs/]},
+        cpp: {all: [/kDeadline\{400\}/, /set_deadline\([^\n]*kDeadline\)/]},
       },
     },
     {
       id: 'retry-transient',
-      title: 'Retries only transport failures, and only twice',
+      title: 'Retries only a transport failure, and only once',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, at most twice with backoff; every other status fails fast. The starter retries any error, including a rejection.',
+        'Two attempts at most, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`; any other status (an unknown permission is `INVALID_ARGUMENT`) is a denial after one call. The starter retries every error three times.',
       match: {
-        python: {all: [/MAX_ATTEMPTS/, /UNAVAILABLE/]},
-        typescript: {all: [/MAX_ATTEMPTS/, /UNAVAILABLE/]},
-        go: {all: [/maxAttempts/, /Unavailable/]},
-        scala: {all: [/MaxAttempts/, /UNAVAILABLE/]},
-        cpp: {all: [/kMaxAttempts/, /UNAVAILABLE/]},
+        python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/]},
+        typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/, /status\.DEADLINE_EXCEEDED/]},
+        go: {all: [/maxAttempts\s*=\s*2\b/, /codes\.Unavailable/, /codes\.DeadlineExceeded/]},
+        scala: {all: [/MaxAttempts\s*=\s*2\b/, /Code\.UNAVAILABLE/, /Code\.DEADLINE_EXCEEDED/]},
+        cpp: {all: [/kMaxAttempts\s*=\s*2\b/, /StatusCode::UNAVAILABLE/, /StatusCode::DEADLINE_EXCEEDED/]},
+      },
+    },
+    {
+      id: 'fail-closed',
+      title: 'Denies with PolicyUnavailable when the engine cannot be asked',
+      detail:
+        'When both attempts fail the call raises `PolicyUnavailable` (503 with `Retry-After` at the route); it never falls back to an allow the engine gave earlier, as the starter does with its one-hour copy.',
+      match: {
+        python: {all: [/raise PolicyUnavailable/], none: [/last_allow/]},
+        typescript: {all: [/throw new PolicyUnavailable/], none: [/lastAllow/]},
+        go: {all: [/return false,[^\n]*ErrPolicyUnavailable/], none: [/lastAllow/]},
+        scala: {all: [/throw new PolicyUnavailable/], none: [/lastAllow/]},
+        cpp: {all: [/throw PolicyUnavailable/], none: [/lastAllow/]},
       },
     },
     {
       id: 'cached-allow-version',
-      title: 'Never serves a cached allow past its version',
+      title: 'Serves a cached allow only at the grant version it was given at',
       detail:
-        'A cached allow counts only while its stored version matches the current `grant_version`; otherwise the engine is asked again. The starter serves its cached allow on a TTL and never checks a version.',
+        'The cached allow is stamped with `perm:grant_version` and served only while the stamp equals the current version; any grant change asks the engine again. The starter trusts the TTL.',
       match: {
-        python: {all: [/def allow_is_current\(/, /grant_version/]},
-        typescript: {all: [/function allowIsCurrent\(/, /grant_version/]},
-        go: {all: [/func allowIsCurrent\(/, /grant_version/]},
-        scala: {all: [/def allowIsCurrent\(/, /grant_version/]},
-        cpp: {all: [/allowIsCurrent\(/, /grant_version/]},
+        python: {
+          all: [/VERSION_KEY\s*=\s*["']perm:grant_version["']/, /\.get\(\s*VERSION_KEY/],
+          none: [/==\s*["']1["']/],
+        },
+        typescript: {
+          all: [/VERSION_KEY\s*=\s*['"]perm:grant_version['"]/, /\.get\(\s*VERSION_KEY/],
+          none: [/===\s*['"]1['"]/],
+        },
+        go: {all: [/versionKey\s*=\s*"perm:grant_version"/, /\.Get\(\s*ctx,\s*versionKey/], none: [/==\s*"1"/]},
+        scala: {all: [/VersionKey\s*=\s*"perm:grant_version"/, /\.get\(\s*VersionKey/], none: [/==\s*"1"/]},
+        cpp: {all: [/kVersionKey\s*=\s*"perm:grant_version"/, /\.get\(\s*kVersionKey/], none: [/==\s*"1"/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `"""Policy-engine client for the effective-permission check."""
+      starter: `import time
+
 import grpc
-from fastapi import FastAPI, HTTPException
-from redis import Redis
+import redis
 
-import policy_pb2
-import policy_pb2_grpc
+import permission_service_pb2 as pb
+import permission_service_pb2_grpc as pb_grpc
 
-app = FastAPI()
-redis = Redis.from_url("redis://perm-cache:6379", decode_responses=True)
-channel = grpc.insecure_channel("policy-engine:50051")
-stub = policy_pb2_grpc.PolicyEngineStub(channel)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+engine = pb_grpc.PolicyEngineStub(grpc.insecure_channel("policy-engine:9000"))
 
-RETRY_LIMIT = 3
-ALLOW_TTL_SECONDS = 60
-ALLOW_KEY = "perm:allow:{subject}:{permission}:{scope}"
+RETRIES = 3
+ALLOW_TTL_S = 60
+LAST_ALLOW_TTL_S = 3600
+
+
+class PolicyUnavailable(Exception):
+    """The engine could not be asked: the route answers 503 with Retry-After."""
 
 
 def allow_key(subject: str, permission: str, scope: str) -> str:
-    """The cache key of the allow for exactly this (subject, permission, scope) triple."""
-    return ALLOW_KEY.format(subject=subject, permission=permission, scope=scope)
+    return f"perm:allow:{subject}:{permission}:{scope}"
 
 
-def decide(subject: str, permission: str, scope: str) -> str:
-    # TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    cached = redis.get(allow_key(subject, permission, scope))
-    request = policy_pb2.DecideRequest(subject=subject, permission=permission, scope=scope)
-    for _ in range(RETRY_LIMIT):
+def last_allow_key(subject: str, permission: str, scope: str) -> str:
+    return f"perm:last_allow:{subject}:{permission}:{scope}"
+
+
+def authorize(subject: str, permission: str, scope: str) -> bool:
+    """Whether the policy engine allows subject to use permission at scope."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    if r.get(allow_key(subject, permission, scope)) == "1":
+        return True
+    request = pb.CheckRequest(subject=subject, permission=permission, scope=scope)
+    for attempt in range(RETRIES):
         try:
-            reply = stub.Decide(request)
+            decision = engine.Check(request)
         except grpc.RpcError:
+            time.sleep(0.2)  # the engine is flaky: ask again
             continue
-        if reply.effect == "DENY":
-            return "DENY"
-        redis.set(allow_key(subject, permission, scope), "ALLOW", ex=ALLOW_TTL_SECONDS)
-        return "ALLOW"
-    if cached is not None:
-        return "ALLOW"
-    return "UNVERIFIED"
-
-
-@app.post("/v1/check")
-def check(subject: str, permission: str, scope: str) -> dict:
-    verdict = decide(subject, permission, scope)
-    if verdict == "ALLOW":
-        return {"allowed": True, "subject": subject, "permission": permission, "scope": scope}
-    if verdict == "DENY":
-        raise HTTPException(status_code=403, detail={"error": "policy_denied"})
-    raise HTTPException(status_code=503, detail={"error": "policy_unavailable"})
+        if decision.allowed:
+            r.set(allow_key(subject, permission, scope), "1", ex=ALLOW_TTL_S)
+            r.set(last_allow_key(subject, permission, scope), "1", ex=LAST_ALLOW_TTL_S)
+        return decision.allowed
+    return r.get(last_allow_key(subject, permission, scope)) == "1"  # the engine is down: keep serving what it last said
 `,
-      solution: `"""Policy-engine client for the effective-permission check."""
-import random
-import time
+      solution: `import time
 
 import grpc
-from fastapi import FastAPI, HTTPException
-from redis import Redis
+import redis
 
-import policy_pb2
-import policy_pb2_grpc
+import permission_service_pb2 as pb
+import permission_service_pb2_grpc as pb_grpc
 
-app = FastAPI()
-redis = Redis.from_url("redis://perm-cache:6379", decode_responses=True)
-channel = grpc.insecure_channel("policy-engine:50051")
-stub = policy_pb2_grpc.PolicyEngineStub(channel)
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+engine = pb_grpc.PolicyEngineStub(grpc.insecure_channel("policy-engine:9000"))
 
-POLICY_TIMEOUT_MS = 400
+VERSION_KEY = "perm:grant_version"
+DEADLINE_S = 0.4
 MAX_ATTEMPTS = 2
-BACKOFF_MS = 50
-TRANSIENT_CODES = {"UNAVAILABLE", "DEADLINE_EXCEEDED"}
-TERMINAL_CODES = {"PERMISSION_DENIED", "UNAUTHENTICATED"}
-GRANT_VERSION_KEY = "perm:grant_version"
-ALLOW_KEY = "perm:allow:{subject}:{permission}:{scope}"
+BACKOFF_S = 0.1
+ALLOW_TTL_S = 60
+RETRYABLE = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+
+
+class PolicyUnavailable(Exception):
+    """The engine could not be asked: the route answers 503 with Retry-After."""
 
 
 def allow_key(subject: str, permission: str, scope: str) -> str:
-    """The cache key of the allow for exactly this (subject, permission, scope) triple."""
-    return ALLOW_KEY.format(subject=subject, permission=permission, scope=scope)
+    return f"perm:allow:{subject}:{permission}:{scope}"
 
 
-def current_grant_version() -> int:
-    """The global counter every cached allow is stamped with."""
-    value = redis.get(GRANT_VERSION_KEY)
-    return int(value) if value is not None else 0
-
-
-def allow_is_current(subject: str, permission: str, scope: str, version: int) -> bool:
-    """A cached allow counts only while its stored version matches the current counter."""
-    cached = redis.hgetall(allow_key(subject, permission, scope))
-    if not cached:
-        return False
-    return int(cached.get("grant_version", -1)) == version
-
-
-def is_terminal(code: str) -> bool:
-    """A rejection is the engine's answer; retrying it changes nothing."""
-    return code in TERMINAL_CODES
-
-
-def backoff_seconds(attempt: int) -> float:
-    """50 ms doubling per attempt, with jitter so retries do not synchronise."""
-    return (BACKOFF_MS * 2 ** (attempt - 1) + random.randint(0, BACKOFF_MS)) / 1000.0
-
-
-def decide(subject: str, permission: str, scope: str) -> str:
-    """Ask the engine for one verdict: "ALLOW", "DENY" (terminal) or "UNAVAILABLE" (retriable)."""
-    version = current_grant_version()
-    if allow_is_current(subject, permission, scope, version):
-        return "ALLOW"
-
-    request = policy_pb2.DecideRequest(subject=subject, permission=permission, scope=scope)
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+def authorize(subject: str, permission: str, scope: str) -> bool:
+    """Whether the policy engine allows subject to use permission at scope."""
+    version = r.get(VERSION_KEY) or "0"
+    if r.hget(allow_key(subject, permission, scope), "version") == version:
+        return True  # the engine allowed this at the current grant version
+    request = pb.CheckRequest(subject=subject, permission=permission, scope=scope)
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            reply = stub.Decide(request, timeout=POLICY_TIMEOUT_MS)
+            decision = engine.Check(request, timeout=DEADLINE_S)
         except grpc.RpcError as exc:
-            code = exc.code().name
-            if is_terminal(code):
-                return "DENY"
-            if code not in TRANSIENT_CODES or attempt == MAX_ATTEMPTS:
-                break
-            time.sleep(backoff_seconds(attempt))
+            if exc.code() not in RETRYABLE:
+                return False  # the engine answered: a rejection is a denial, not a reason to ask again
+            if attempt + 1 < MAX_ATTEMPTS:
+                time.sleep(BACKOFF_S)
             continue
-        if reply.effect == "DENY":
-            return "DENY"
-        redis.hset(
-            allow_key(subject, permission, scope),
-            mapping={"grant_version": version, "effect": "ALLOW"},
-        )
-        return "ALLOW"
-    return "UNAVAILABLE"
-
-
-@app.post("/v1/check")
-def check(subject: str, permission: str, scope: str) -> dict:
-    verdict = decide(subject, permission, scope)
-    if verdict == "ALLOW":
-        return {"allowed": True, "subject": subject, "permission": permission, "scope": scope}
-    if verdict == "DENY":
-        raise HTTPException(status_code=403, detail={"error": "policy_denied"})
-    raise HTTPException(
-        status_code=503,
-        headers={"Retry-After": "1"},
-        detail={"error": "policy_unavailable"},
-    )
+        if decision.allowed:
+            r.hset(allow_key(subject, permission, scope), "version", version)
+            r.expire(allow_key(subject, permission, scope), ALLOW_TTL_S)
+        return decision.allowed
+    # Nothing verified this request: deny it, and let the client retry.
+    raise PolicyUnavailable(f"policy engine: no answer in {MAX_ATTEMPTS} attempts")
 `,
     },
     typescript: {
-      starter: `/** Policy-engine client for the effective-permission check. */
-import * as grpc from '@grpc/grpc-js';
+      starter: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
-import Fastify from 'fastify';
 import Redis from 'ioredis';
 
-export const app = Fastify();
-const redis = new Redis('redis://perm-cache:6379');
-
-const packageDefinition = protoLoader.loadSync('proto/policy.proto', {keepCase: true});
-const proto = grpc.loadPackageDefinition(packageDefinition) as {
-  policy: {PolicyEngine: new (address: string, credentials: grpc.ChannelCredentials) => PolicyEngineClient};
-};
-const engine = new proto.policy.PolicyEngine('policy-engine:50051', grpc.credentials.createInsecure());
-
-const RETRY_LIMIT = 3;
-const ALLOW_TTL_SECONDS = 60;
-const allowKey = (subject: string, permission: string, scope: string) =>
-  \`perm:allow:\${subject}:\${permission}:\${scope}\`;
-
-interface CheckBody {
+interface CheckRequest {
   subject: string;
   permission: string;
   scope: string;
 }
 
-interface DecideReply {
-  effect: string;
-}
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('permission_service.proto')) as unknown as {
+  policyd: {PolicyEngine: grpc.ServiceClientConstructor};
+};
+const engine = new pkg.policyd.PolicyEngine('policy-engine:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Check(request: CheckRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{allowed: boolean; reason: string}>;
+};
+const redis = new Redis({host: 'redis', port: 6379});
 
-interface PolicyEngineClient extends grpc.Client {
-  decide(request: CheckBody, callback: (error: Error | null, reply: DecideReply) => void): grpc.ClientUnaryCall;
-}
+export const RETRIES = 3;
+export const ALLOW_TTL_S = 60;
+export const LAST_ALLOW_TTL_S = 3600;
 
-function callEngine(subject: string, permission: string, scope: string): Promise<string> {
-  const {promise, resolve, reject} = Promise.withResolvers<string>();
-  engine.decide({subject, permission, scope}, (error, reply) => {
-    if (error) reject(error);
-    else resolve(reply.effect);
-  });
-  return promise;
-}
+/** The engine could not be asked: the route answers 503 with Retry-After. */
+export class PolicyUnavailable extends Error {}
 
-export async function decide(subject: string, permission: string, scope: string): Promise<string> {
-  // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-  const cached = await redis.get(allowKey(subject, permission, scope));
-  for (let attempt = 0; attempt < RETRY_LIMIT; attempt += 1) {
+const allowKey = (subject: string, permission: string, scope: string): string => \`perm:allow:\${subject}:\${permission}:\${scope}\`;
+const lastAllowKey = (subject: string, permission: string, scope: string): string => \`perm:last_allow:\${subject}:\${permission}:\${scope}\`;
+
+/** Whether the policy engine allows subject to use permission at scope. */
+export async function authorize(subject: string, permission: string, scope: string): Promise<boolean> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  if ((await redis.get(allowKey(subject, permission, scope))) === '1') return true;
+  for (let attempt = 0; attempt < RETRIES; attempt++) {
+    let decision;
     try {
-      const effect = await callEngine(subject, permission, scope);
-      if (effect === 'DENY') return 'DENY';
-      await redis.set(allowKey(subject, permission, scope), 'ALLOW', 'EX', ALLOW_TTL_SECONDS);
-      return 'ALLOW';
+      decision = await engine.Check({subject, permission, scope}, new grpc.Metadata(), {});
     } catch {
-      // the starter treats a rejection and a transport failure the same way
+      await new Promise(resolve => setTimeout(resolve, 200)); // the engine is flaky: ask again
+      continue;
     }
+    if (decision.allowed) {
+      await redis.set(allowKey(subject, permission, scope), '1', 'EX', ALLOW_TTL_S);
+      await redis.set(lastAllowKey(subject, permission, scope), '1', 'EX', LAST_ALLOW_TTL_S);
+    }
+    return decision.allowed;
   }
-  if (cached !== null) return 'ALLOW';
-  return 'UNVERIFIED';
+  return (await redis.get(lastAllowKey(subject, permission, scope))) === '1'; // the engine is down: keep serving what it last said
 }
-
-app.post('/v1/check', async (request, reply) => {
-  const {subject, permission, scope} = request.body as CheckBody;
-  const verdict = await decide(subject, permission, scope);
-  if (verdict === 'ALLOW') return reply.code(200).send({allowed: true, subject, permission, scope});
-  if (verdict === 'DENY') return reply.code(403).send({error: 'policy_denied'});
-  return reply.code(503).send({error: 'policy_unavailable'});
-});
-
-void app.listen({port: 8445, host: '0.0.0.0'});
 `,
-      solution: `/** Policy-engine client for the effective-permission check. */
-import {status as grpcStatus, type ClientUnaryCall, type ServiceError} from '@grpc/grpc-js';
-import * as grpc from '@grpc/grpc-js';
+      solution: `import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
-import Fastify from 'fastify';
 import Redis from 'ioredis';
 
-export const app = Fastify();
-const redis = new Redis('redis://perm-cache:6379');
-
-const POLICY_TIMEOUT_MS = 400;
-const MAX_ATTEMPTS = 2;
-const BACKOFF_MS = 50;
-const GRANT_VERSION_KEY = 'perm:grant_version';
-
-interface DecideRequest {
+interface CheckRequest {
   subject: string;
   permission: string;
   scope: string;
 }
 
-interface DecideReply {
-  effect: 'ALLOW' | 'DENY';
-}
-
-interface PolicyEngineClient extends grpc.Client {
-  decide(
-    request: DecideRequest,
-    options: grpc.CallOptions,
-    callback: (error: ServiceError | null, reply: DecideReply) => void,
-  ): ClientUnaryCall;
-}
-
-const packageDefinition = protoLoader.loadSync('proto/policy.proto', {keepCase: true});
-const proto = grpc.loadPackageDefinition(packageDefinition) as {
-  policy: {PolicyEngine: new (address: string, credentials: grpc.ChannelCredentials) => PolicyEngineClient};
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('permission_service.proto')) as unknown as {
+  policyd: {PolicyEngine: grpc.ServiceClientConstructor};
 };
-const engine = new proto.policy.PolicyEngine('policy-engine:50051', grpc.credentials.createInsecure());
-
-const allowKey = (subject: string, permission: string, scope: string) =>
-  \`perm:allow:\${subject}:\${permission}:\${scope}\`;
-
-/** \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are the only statuses worth another attempt. */
-const RETRYABLE: Record<number, true> = {
-  [grpcStatus.UNAVAILABLE]: true,
-  [grpcStatus.DEADLINE_EXCEEDED]: true,
+const engine = new pkg.policyd.PolicyEngine('policy-engine:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  Check(request: CheckRequest, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<{allowed: boolean; reason: string}>;
 };
+const redis = new Redis({host: 'redis', port: 6379});
 
-/** A rejection is the engine's answer; retrying it changes nothing. */
-function isTerminal(code: number): boolean {
-  return code === grpcStatus.PERMISSION_DENIED || code === grpcStatus.UNAUTHENTICATED;
-}
+export const VERSION_KEY = 'perm:grant_version';
+export const DEADLINE_MS = 400;
+export const MAX_ATTEMPTS = 2;
+export const BACKOFF_MS = 100;
+export const ALLOW_TTL_S = 60;
+const RETRYABLE: number[] = [grpc.status.UNAVAILABLE, grpc.status.DEADLINE_EXCEEDED];
 
-async function sleep(ms: number): Promise<void> {
-  const {promise, resolve} = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
+/** The engine could not be asked: the route answers 503 with Retry-After. */
+export class PolicyUnavailable extends Error {}
 
-function callEngine(subject: string, permission: string, scope: string): Promise<'ALLOW' | 'DENY'> {
-  const {promise, resolve, reject} = Promise.withResolvers<'ALLOW' | 'DENY'>();
-  engine.decide({subject, permission, scope}, {deadline: Date.now() + POLICY_TIMEOUT_MS}, (error, reply) => {
-    if (error) reject(error);
-    else resolve(reply.effect);
-  });
-  return promise;
-}
+const allowKey = (subject: string, permission: string, scope: string): string => \`perm:allow:\${subject}:\${permission}:\${scope}\`;
 
-async function currentGrantVersion(): Promise<number> {
-  const value = await redis.get(GRANT_VERSION_KEY);
-  return value === null ? 0 : Number.parseInt(value, 10);
-}
-
-/** A cached allow counts only while its stored version matches the current counter. */
-export async function allowIsCurrent(
-  subject: string,
-  permission: string,
-  scope: string,
-  version: number,
-): Promise<boolean> {
-  const stored = await redis.hget(allowKey(subject, permission, scope), 'grant_version');
-  return stored !== null && Number.parseInt(stored, 10) === version;
-}
-
-export async function decide(
-  subject: string,
-  permission: string,
-  scope: string,
-): Promise<'ALLOW' | 'DENY' | 'UNAVAILABLE'> {
-  const version = await currentGrantVersion();
-  if (await allowIsCurrent(subject, permission, scope, version)) return 'ALLOW';
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+/** Whether the policy engine allows subject to use permission at scope. */
+export async function authorize(subject: string, permission: string, scope: string): Promise<boolean> {
+  const version = (await redis.get(VERSION_KEY)) ?? '0';
+  if ((await redis.hget(allowKey(subject, permission, scope), 'version')) === version) return true; // allowed at the current grant version
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let decision;
     try {
-      const effect = await callEngine(subject, permission, scope);
-      if (effect === 'DENY') return 'DENY';
-      await redis.hset(allowKey(subject, permission, scope), 'grant_version', String(version), 'effect', 'ALLOW');
-      return 'ALLOW';
-    } catch (error) {
-      const code = (error as ServiceError).code;
-      if (isTerminal(code)) return 'DENY';
-      if (RETRYABLE[code] !== true || attempt === MAX_ATTEMPTS) break;
-      await sleep(BACKOFF_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * BACKOFF_MS));
+      decision = await engine.Check({subject, permission, scope}, new grpc.Metadata(), {deadline: Date.now() + DEADLINE_MS});
+    } catch (e) {
+      if (!RETRYABLE.includes((e as grpc.ServiceError).code)) return false; // the engine answered: a rejection is a denial
+      if (attempt + 1 < MAX_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, BACKOFF_MS));
+      continue;
     }
+    if (decision.allowed) {
+      await redis.hset(allowKey(subject, permission, scope), 'version', version);
+      await redis.expire(allowKey(subject, permission, scope), ALLOW_TTL_S);
+    }
+    return decision.allowed;
   }
-  return 'UNAVAILABLE';
+  // Nothing verified this request: deny it, and let the client retry.
+  throw new PolicyUnavailable(\`policy engine: no answer in \${MAX_ATTEMPTS} attempts\`);
 }
-
-interface CheckBody {
-  subject: string;
-  permission: string;
-  scope: string;
-}
-
-app.post('/v1/check', async (request, reply) => {
-  const {subject, permission, scope} = request.body as CheckBody;
-  const verdict = await decide(subject, permission, scope);
-  if (verdict === 'ALLOW') return reply.code(200).send({allowed: true, subject, permission, scope});
-  if (verdict === 'DENY') return reply.code(403).send({error: 'policy_denied'});
-  return reply.code(503).header('Retry-After', '1').send({error: 'policy_unavailable'});
-});
-
-void app.listen({port: 8445, host: '0.0.0.0'});
 `,
     },
     go: {
@@ -473,103 +329,68 @@ void app.listen({port: 8445, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	policyv1 "permz/gen/policy/v1"
+	pb "permz/gen/permission_service"
 )
 
 const (
-	retryLimit  = 3
-	allowTTL    = 60 * time.Second
-	allowKeyFmt = "perm:allow:%s:%s:%s"
+	retries       = 3
+	allowTTL      = 60 * time.Second
+	lastAllowTTL  = time.Hour
+	policyAddress = "policy-engine:9000"
 )
 
-var cache = redis.NewClient(&redis.Options{Addr: "perm-cache:6379"})
-var engine policyv1.PolicyEngineClient
+var (
+	rdb          = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	engineConn, _ = grpc.NewClient(policyAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	engine       = pb.NewPolicyEngineClient(engineConn)
+)
 
-type CheckRequest struct {
-	Subject    string \`json:"subject"\`
-	Permission string \`json:"permission"\`
-	Scope      string \`json:"scope"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
+// ErrPolicyUnavailable: the engine could not be asked, the route answers 503 with Retry-After.
+var ErrPolicyUnavailable = errors.New("policy engine unavailable")
 
 func allowKey(subject, permission, scope string) string {
-	return fmt.Sprintf(allowKeyFmt, subject, permission, scope)
+	return "perm:allow:" + subject + ":" + permission + ":" + scope
 }
 
-func decide(ctx context.Context, subject, permission, scope string) string {
-	// TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-	key := allowKey(subject, permission, scope)
-	cached, _ := cache.Get(ctx, key).Result()
-	req := &policyv1.DecideRequest{Subject: subject, Permission: permission, Scope: scope}
-	for attempt := 0; attempt < retryLimit; attempt++ {
-		reply, err := engine.Decide(ctx, req)
+func lastAllowKey(subject, permission, scope string) string {
+	return "perm:last_allow:" + subject + ":" + permission + ":" + scope
+}
+
+// authorize reports whether the policy engine allows subject to use permission at scope.
+func authorize(ctx context.Context, subject, permission, scope string) (bool, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	if rdb.Get(ctx, allowKey(subject, permission, scope)).Val() == "1" {
+		return true, nil
+	}
+	request := &pb.CheckRequest{Subject: subject, Permission: permission, Scope: scope}
+	for attempt := 0; attempt < retries; attempt++ {
+		decision, err := engine.Check(ctx, request)
 		if err != nil {
+			time.Sleep(200 * time.Millisecond) // the engine is flaky: ask again
 			continue
 		}
-		if reply.GetEffect() == "DENY" {
-			return "DENY"
+		if decision.GetAllowed() {
+			rdb.Set(ctx, allowKey(subject, permission, scope), "1", allowTTL)
+			rdb.Set(ctx, lastAllowKey(subject, permission, scope), "1", lastAllowTTL)
 		}
-		cache.Set(ctx, key, "ALLOW", allowTTL)
-		return "ALLOW"
+		return decision.GetAllowed(), nil
 	}
-	if cached != "" {
-		return "ALLOW"
-	}
-	return "UNVERIFIED"
-}
-
-func check(rw http.ResponseWriter, r *http.Request) {
-	var body CheckRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	switch decide(r.Context(), body.Subject, body.Permission, body.Scope) {
-	case "ALLOW":
-		writeJSON(rw, http.StatusOK, map[string]any{"allowed": true, "subject": body.Subject})
-	case "DENY":
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "policy_denied"})
-	default:
-		writeJSON(rw, http.StatusBadGateway, map[string]string{"error": "policy_unavailable"})
-	}
-}
-
-func main() {
-	conn, err := grpc.NewClient("policy-engine:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("policy engine: %v", err)
-	}
-	engine = policyv1.NewPolicyEngineClient(conn)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/check", check)
-	log.Fatal(http.ListenAndServeTLS(":8445", "cert.pem", "key.pem", mux))
+	return rdb.Get(ctx, lastAllowKey(subject, permission, scope)).Val() == "1", nil // the engine is down: keep serving what it last said
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
-	"math/rand"
-	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -578,509 +399,664 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	policyv1 "permz/gen/policy/v1"
+	pb "permz/gen/permission_service"
 )
 
 const (
-	policyTimeoutMs = 400
-	maxAttempts     = 2
-	backoffMs       = 50
-	grantVersionKey = "perm:grant_version"
-	allowKeyFmt     = "perm:allow:%s:%s:%s"
-
-	verdictAllow      = "ALLOW"
-	verdictDeny       = "DENY"
-	verdictUnverified = "UNVERIFIED"
+	versionKey     = "perm:grant_version"
+	policyDeadline = 400 * time.Millisecond
+	maxAttempts    = 2
+	backoff        = 100 * time.Millisecond
+	allowTTL       = 60 * time.Second
+	policyAddress  = "policy-engine:9000"
 )
 
-var cache = redis.NewClient(&redis.Options{Addr: "perm-cache:6379"})
-var engine policyv1.PolicyEngineClient
+var (
+	rdb           = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	engineConn, _ = grpc.NewClient(policyAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	engine        = pb.NewPolicyEngineClient(engineConn)
+)
 
-type CheckRequest struct {
-	Subject    string \`json:"subject"\`
-	Permission string \`json:"permission"\`
-	Scope      string \`json:"scope"\`
-}
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
+// ErrPolicyUnavailable: the engine could not be asked, the route answers 503 with Retry-After.
+var ErrPolicyUnavailable = errors.New("policy engine unavailable")
 
 func allowKey(subject, permission, scope string) string {
-	return fmt.Sprintf(allowKeyFmt, subject, permission, scope)
+	return "perm:allow:" + subject + ":" + permission + ":" + scope
 }
 
-func grantVersion(ctx context.Context) int64 {
-	value, err := cache.Get(ctx, grantVersionKey).Int64()
+// authorize reports whether the policy engine allows subject to use permission at scope.
+func authorize(ctx context.Context, subject, permission, scope string) (bool, error) {
+	version, err := rdb.Get(ctx, versionKey).Result()
 	if err != nil {
-		return 0
+		version = "0"
 	}
-	return value
-}
-
-// allowIsCurrent reports whether the cached allow carries the current grant_version.
-func allowIsCurrent(ctx context.Context, subject, permission, scope string, version int64) bool {
-	stored, err := cache.HGet(ctx, allowKey(subject, permission, scope), "grant_version").Int64()
-	if err != nil {
-		return false
+	if stamp, err := rdb.HGet(ctx, allowKey(subject, permission, scope), "version").Result(); err == nil && stamp == version {
+		return true, nil // the engine allowed this at the current grant version
 	}
-	return stored == version
-}
-
-// isTerminal reports whether the status is the engine's answer rather than a transport failure.
-func isTerminal(code codes.Code) bool {
-	return code == codes.PermissionDenied || code == codes.Unauthenticated
-}
-
-func isTransient(code codes.Code) bool {
-	return code == codes.Unavailable || code == codes.DeadlineExceeded
-}
-
-func backoff(attempt int) time.Duration {
-	return time.Duration(backoffMs*(1<<(attempt-1))+rand.IntN(backoffMs)) * time.Millisecond
-}
-
-// decide asks the engine for one verdict: ALLOW, DENY or UNVERIFIED (retriable, never an allow).
-func decide(ctx context.Context, subject, permission, scope string) string {
-	version := grantVersion(ctx)
-	if allowIsCurrent(ctx, subject, permission, scope, version) {
-		return verdictAllow
-	}
-	req := &policyv1.DecideRequest{Subject: subject, Permission: permission, Scope: scope}
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, policyTimeoutMs*time.Millisecond)
-		reply, err := engine.Decide(callCtx, req)
+	request := &pb.CheckRequest{Subject: subject, Permission: permission, Scope: scope}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, policyDeadline)
+		decision, err := engine.Check(callCtx, request)
 		cancel()
-		if err == nil {
-			if reply.GetEffect() == verdictDeny {
-				return verdictDeny
+		if err != nil {
+			if code := status.Code(err); code != codes.Unavailable && code != codes.DeadlineExceeded {
+				return false, nil // the engine answered: a rejection is a denial, not a reason to ask again
 			}
-			cache.HSet(ctx, allowKey(subject, permission, scope), "grant_version", version, "effect", "ALLOW")
-			return verdictAllow
+			if attempt+1 < maxAttempts {
+				time.Sleep(backoff)
+			}
+			continue
 		}
-		code := status.Code(err)
-		if isTerminal(code) {
-			return verdictDeny
+		if decision.GetAllowed() {
+			rdb.HSet(ctx, allowKey(subject, permission, scope), "version", version)
+			rdb.Expire(ctx, allowKey(subject, permission, scope), allowTTL)
 		}
-		if !isTransient(code) || attempt == maxAttempts {
-			break
-		}
-		time.Sleep(backoff(attempt))
+		return decision.GetAllowed(), nil
 	}
-	return verdictUnverified
-}
-
-func check(rw http.ResponseWriter, r *http.Request) {
-	var body CheckRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	switch decide(r.Context(), body.Subject, body.Permission, body.Scope) {
-	case verdictAllow:
-		writeJSON(rw, http.StatusOK, map[string]any{"allowed": true, "subject": body.Subject})
-	case verdictDeny:
-		writeJSON(rw, http.StatusForbidden, map[string]string{"error": "policy_denied"})
-	default:
-		rw.Header().Set("Retry-After", "1")
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "policy_unavailable"})
-	}
-}
-
-func main() {
-	conn, err := grpc.NewClient("policy-engine:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("policy engine: %v", err)
-	}
-	engine = policyv1.NewPolicyEngineClient(conn)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/check", check)
-	log.Fatal(http.ListenAndServeTLS(":8445", "cert.pem", "key.pem", mux))
+	// Nothing verified this request: deny it, and let the client retry.
+	return false, fmt.Errorf("%w: no answer in %d attempts", ErrPolicyUnavailable, maxAttempts)
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
 
-final case class CheckRequest(subject: String, permission: String, scope: String)
+import policyd.permission_service.{CheckRequest, PolicyEngineGrpc}
 
-sealed trait Verdict
-case object Allow extends Verdict
-case object Deny extends Verdict
-case object Unverified extends Verdict
+/** The engine could not be asked: the route answers 503 with Retry-After. */
+final class PolicyUnavailable(message: String) extends Exception(message)
 
-object PermissionCheck {
-  implicit val system: ActorSystem = ActorSystem("permission-service")
-  implicit val requestFormat: RootJsonFormat[CheckRequest] = jsonFormat3(CheckRequest)
+object Client {
+  val Retries = 3
+  val AllowTtlS = 60L
+  val LastAllowTtlS = 3600L
 
-  val RetryLimit = 3
-  val AllowTtlSeconds = 60L
+  private val engine = PolicyEngineGrpc.blockingStub(ManagedChannelBuilder.forAddress("policy-engine", 9000).usePlaintext().build())
+  val jedis = new JedisPooled("redis", 6379)
 
-  val cache = AllowCache.open()
-  val engine = PolicyEngineClient.open("policy-engine:50051")
+  def allowKey(subject: String, permission: String, scope: String): String = s"perm:allow:$subject:$permission:$scope"
+  def lastAllowKey(subject: String, permission: String, scope: String): String = s"perm:last_allow:$subject:$permission:$scope"
 
-  def allowKey(subject: String, permission: String, scope: String): String =
-    s"perm:allow:\${subject}:\${permission}:\${scope}"
-
-  def decide(subject: String, permission: String, scope: String): Verdict = {
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    val cached = cache.get(allowKey(subject, permission, scope))
-    var attempt = 0
-    while (attempt < RetryLimit) {
+  /** Whether the policy engine allows subject to use permission at scope. */
+  def authorize(subject: String, permission: String, scope: String): Boolean = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    if (jedis.get(allowKey(subject, permission, scope)) == "1") return true
+    val request = CheckRequest(subject, permission, scope)
+    for (_ <- 1 to Retries) {
       try {
-        val reply = engine.decide(subject, permission, scope)
-        if (reply.effect == "DENY") return Deny
-        cache.set(allowKey(subject, permission, scope), "ALLOW", AllowTtlSeconds)
-        return Allow
-      } catch {
-        case _: io.grpc.StatusRuntimeException => attempt += 1
-      }
-    }
-    if (cached.isDefined) Allow else Unverified
-  }
-
-  val route: Route =
-    path("v1" / "check") {
-      post {
-        entity(as[CheckRequest]) { req =>
-          decide(req.subject, req.permission, req.scope) match {
-            case Allow => complete(StatusCodes.OK, """{"allowed":true}""")
-            case Deny => complete(StatusCodes.Forbidden, """{"error":"policy_denied"}""")
-            case Unverified => complete(StatusCodes.BadGateway, """{"error":"policy_unavailable"}""")
-          }
+        val decision = engine.check(request)
+        if (decision.allowed) {
+          jedis.set(allowKey(subject, permission, scope), "1", SetParams.setParams().ex(AllowTtlS))
+          jedis.set(lastAllowKey(subject, permission, scope), "1", SetParams.setParams().ex(LastAllowTtlS))
         }
+        return decision.allowed
+      } catch {
+        case _: StatusRuntimeException => Thread.sleep(200) // the engine is flaky: ask again
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8445).bind(route)
+    jedis.get(lastAllowKey(subject, permission, scope)) == "1" // the engine is down: keep serving what it last said
   }
 }
 `,
       solution: `import java.util.concurrent.TimeUnit
 
-import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration._
-import scala.util.Random
+import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
 
-import io.grpc.{Status, StatusRuntimeException}
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.model.headers.RawHeader
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import org.apache.pekko.pattern.after
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+import policyd.permission_service.{CheckRequest, PolicyEngineGrpc}
 
-final case class CheckRequest(subject: String, permission: String, scope: String)
-final case class EngineReply(effect: String)
+/** The engine could not be asked: the route answers 503 with Retry-After. */
+final class PolicyUnavailable(message: String) extends Exception(message)
 
-sealed trait Verdict
-case object Allow extends Verdict
-case object Deny extends Verdict
-case object Unverified extends Verdict
-
-object PermissionCheck {
-  implicit val system: ActorSystem = ActorSystem("permission-service")
-  implicit val ec: ExecutionContext = system.dispatcher
-  implicit val requestFormat: RootJsonFormat[CheckRequest] = jsonFormat3(CheckRequest)
-
-  val PolicyTimeoutMs = 400
+object Client {
+  val VersionKey = "perm:grant_version"
+  val DeadlineMs = 400L
   val MaxAttempts = 2
-  val BackoffMs = 50L
-  val GrantVersionKey = "perm:grant_version"
+  val BackoffMs = 100L
+  val AllowTtlS = 60L
+  val Retryable: Set[Status.Code] = Set(Status.Code.UNAVAILABLE, Status.Code.DEADLINE_EXCEEDED)
 
-  val cache = AllowCache.open()
-  val engine = PolicyEngineClient.open("policy-engine:50051")
+  private val engine = PolicyEngineGrpc.blockingStub(ManagedChannelBuilder.forAddress("policy-engine", 9000).usePlaintext().build())
+  val jedis = new JedisPooled("redis", 6379)
 
-  def allowKey(subject: String, permission: String, scope: String): String =
-    s"perm:allow:\${subject}:\${permission}:\${scope}"
+  def allowKey(subject: String, permission: String, scope: String): String = s"perm:allow:$subject:$permission:$scope"
 
-  def currentGrantVersion(): Future[Long] =
-    cache.get(GrantVersionKey).map(_.map(_.toLong).getOrElse(0L))
-
-  /** A cached allow counts only while its stored version matches the current counter. */
-  def allowIsCurrent(subject: String, permission: String, scope: String, version: Long): Future[Boolean] =
-    cache.hget(allowKey(subject, permission, scope), "grant_version").map(_.exists(_ == version.toString))
-
-  /** A rejection is the engine's answer; retrying it changes nothing. */
-  def isTerminal(code: Status.Code): Boolean =
-    code == Status.PERMISSION_DENIED || code == Status.UNAUTHENTICATED
-
-  def isTransient(code: Status.Code): Boolean =
-    code == Status.UNAVAILABLE || code == Status.DEADLINE_EXCEEDED
-
-  private def callEngine(subject: String, permission: String, scope: String): Future[EngineReply] =
-    engine.withDeadlineAfter(PolicyTimeoutMs, TimeUnit.MILLISECONDS).decide(subject, permission, scope)
-
-  private def backoff(attempt: Int): FiniteDuration =
-    (BackoffMs * math.pow(2, attempt - 1).toLong + Random.nextLong(BackoffMs)).millis
-
-  private def attempt(
-    subject: String,
-    permission: String,
-    scope: String,
-    version: Long,
-    n: Int,
-  ): Future[Verdict] =
-    callEngine(subject, permission, scope)
-      .flatMap { reply =>
-        if (reply.effect == "DENY") Future.successful(Deny)
-        else
-          cache
-            .hset(allowKey(subject, permission, scope), "grant_version", version.toString, "effect", "ALLOW")
-            .map(_ => Allow)
-      }
-      .recoverWith {
-        case e: StatusRuntimeException =>
-          val code = e.getStatus.getCode
-          if (isTerminal(code)) Future.successful(Deny)
-          else if (isTransient(code) && n < MaxAttempts)
-            after(backoff(n), system.scheduler)(attempt(subject, permission, scope, version, n + 1))
-          else Future.successful(Unverified)
-      }
-
-  def decide(subject: String, permission: String, scope: String): Future[Verdict] =
-    currentGrantVersion().flatMap { version =>
-      allowIsCurrent(subject, permission, scope, version).flatMap { current =>
-        if (current) Future.successful(Allow)
-        else attempt(subject, permission, scope, version, n = 1)
-      }
-    }
-
-  val route: Route =
-    path("v1" / "check") {
-      post {
-        entity(as[CheckRequest]) { req =>
-          onSuccess(decide(req.subject, req.permission, req.scope)) {
-            case Allow => complete(StatusCodes.OK, """{"allowed":true}""")
-            case Deny => complete(StatusCodes.Forbidden, """{"error":"policy_denied"}""")
-            case Unverified =>
-              respondWithHeader(RawHeader("Retry-After", "1")) {
-                complete(StatusCodes.ServiceUnavailable, """{"error":"policy_unavailable"}""")
-              }
-          }
+  /** Whether the policy engine allows subject to use permission at scope. */
+  def authorize(subject: String, permission: String, scope: String): Boolean = {
+    val version = Option(jedis.get(VersionKey)).getOrElse("0")
+    if (Option(jedis.hget(allowKey(subject, permission, scope), "version")).contains(version)) return true // allowed at the current grant version
+    val request = CheckRequest(subject, permission, scope)
+    for (attempt <- 0 until MaxAttempts) {
+      try {
+        val decision = engine.withDeadlineAfter(DeadlineMs, TimeUnit.MILLISECONDS).check(request)
+        if (decision.allowed) {
+          jedis.hset(allowKey(subject, permission, scope), "version", version)
+          jedis.expire(allowKey(subject, permission, scope), AllowTtlS)
         }
+        return decision.allowed
+      } catch {
+        case e: StatusRuntimeException if !Retryable.contains(e.getStatus.getCode) => return false // the engine answered: a rejection is a denial
+        case _: StatusRuntimeException => if (attempt + 1 < MaxAttempts) Thread.sleep(BackoffMs)
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8445).bind(route)
+    // Nothing verified this request: deny it, and let the client retry.
+    throw new PolicyUnavailable(s"policy engine: no answer in $MaxAttempts attempts")
   }
 }
 `,
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <redis++/redis++.h>
+#include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <string>
-
-#include "policy.grpc.pb.h"
-
-namespace {
-
-constexpr int kRetryLimit = 3;
-constexpr int kAllowTtlSeconds = 60;
-
-std::string allowKey(const std::string& subject, const std::string& permission, const std::string& scope) {
-  return "perm:allow:" + subject + ":" + permission + ":" + scope;
-}
-
-}  // namespace
-
-int main() {
-  auto redis = sw::redis::Redis("tcp://perm-cache:6379");
-  auto channel = grpc::CreateChannel("policy-engine:50051", grpc::InsecureChannelCredentials());
-  auto engine = policy::PolicyEngine::NewStub(channel);
-
-  httplib::Server svr;
-
-  svr.Post("/v1/check", [&](const httplib::Request& req, httplib::Response& res) {
-    const auto body = nlohmann::json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
-    }
-    const std::string subject = body.value("subject", std::string());
-    const std::string permission = body.value("permission", std::string());
-    const std::string scope = body.value("scope", std::string());
-    const std::string key = allowKey(subject, permission, scope);
-    const auto cached = redis.get(key);
-
-    // TODO: this starter has 5 flaws. The task says where to look; the checks say what must change.
-    policy::DecideRequest request;
-    request.set_subject(subject);
-    request.set_permission(permission);
-    request.set_scope(scope);
-
-    policy::DecideReply reply;
-    grpc::Status status;
-    for (int attempt = 0; attempt < kRetryLimit; ++attempt) {
-      grpc::ClientContext context;
-      status = engine->Decide(&context, request, &reply);
-      if (status.ok()) break;
-    }
-    if (!status.ok()) {
-      if (cached) {
-        res.status = 200;
-        res.set_content(R"({"allowed":true,"source":"cache"})", "application/json");
-        return;
-      }
-      res.status = 502;
-      res.set_content(R"({"error":"policy_unavailable"})", "application/json");
-      return;
-    }
-    if (reply.effect() == "DENY") {
-      res.status = 403;
-      res.set_content(R"({"error":"policy_denied"})", "application/json");
-      return;
-    }
-    redis->set(key, "ALLOW", std::chrono::milliseconds(kAllowTtlSeconds * 1000));
-    res.status = 200;
-    res.set_content(R"({"allowed":true})", "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8445);
-}
-`,
-      solution: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <redis++/redis++.h>
-
-#include <chrono>
-#include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
-#include "policy.grpc.pb.h"
+#include "permission_service.grpc.pb.h"
 
-namespace {
+constexpr int kRetries = 3;
+constexpr long long kAllowTtlS = 60;
+constexpr long long kLastAllowTtlS = 3600;
 
-constexpr int kPolicyTimeoutMs = 400;
-constexpr int kMaxAttempts = 2;
-constexpr int kBackoffMs = 50;
-const std::string kGrantVersionKey = "perm:grant_version";
+sw::redis::Redis redis("tcp://redis:6379");
+auto engine = policyd::PolicyEngine::NewStub(grpc::CreateChannel("policy-engine:9000", grpc::InsecureChannelCredentials()));
+
+// The engine could not be asked: the route answers 503 with Retry-After.
+struct PolicyUnavailable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 std::string allowKey(const std::string& subject, const std::string& permission, const std::string& scope) {
   return "perm:allow:" + subject + ":" + permission + ":" + scope;
 }
 
-// A rejection is the engine's answer; retrying it changes nothing.
-bool isTerminal(grpc::StatusCode code) {
-  return code == grpc::StatusCode::PERMISSION_DENIED || code == grpc::StatusCode::UNAUTHENTICATED;
+std::string lastAllowKey(const std::string& subject, const std::string& permission, const std::string& scope) {
+  return "perm:last_allow:" + subject + ":" + permission + ":" + scope;
 }
 
-bool isTransient(grpc::StatusCode code) {
-  return code == grpc::StatusCode::UNAVAILABLE || code == grpc::StatusCode::DEADLINE_EXCEEDED;
+// Whether the policy engine allows subject to use permission at scope.
+bool authorize(const std::string& subject, const std::string& permission, const std::string& scope) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  if (redis.get(allowKey(subject, permission, scope)).value_or("") == "1") return true;
+  policyd::CheckRequest request;
+  request.set_subject(subject);
+  request.set_permission(permission);
+  request.set_scope(scope);
+  for (int attempt = 0; attempt < kRetries; attempt++) {
+    grpc::ClientContext ctx;
+    policyd::Decision decision;
+    if (!engine->Check(&ctx, request, &decision).ok()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));  // the engine is flaky: ask again
+      continue;
+    }
+    if (decision.allowed()) {
+      redis.set(allowKey(subject, permission, scope), "1", std::chrono::seconds(kAllowTtlS));
+      redis.set(lastAllowKey(subject, permission, scope), "1", std::chrono::seconds(kLastAllowTtlS));
+    }
+    return decision.allowed();
+  }
+  return redis.get(lastAllowKey(subject, permission, scope)).value_or("") == "1";  // the engine is down: keep serving what it last said
+}
+`,
+      solution: `#include <grpcpp/grpcpp.h>
+#include <sw/redis++/redis++.h>
+
+#include <chrono>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+#include "permission_service.grpc.pb.h"
+
+const std::string kVersionKey = "perm:grant_version";
+constexpr std::chrono::milliseconds kDeadline{400};
+constexpr int kMaxAttempts = 2;
+constexpr std::chrono::milliseconds kBackoff{100};
+constexpr long long kAllowTtlS = 60;
+
+sw::redis::Redis redis("tcp://redis:6379");
+auto engine = policyd::PolicyEngine::NewStub(grpc::CreateChannel("policy-engine:9000", grpc::InsecureChannelCredentials()));
+
+// The engine could not be asked: the route answers 503 with Retry-After.
+struct PolicyUnavailable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+std::string allowKey(const std::string& subject, const std::string& permission, const std::string& scope) {
+  return "perm:allow:" + subject + ":" + permission + ":" + scope;
 }
 
-std::chrono::milliseconds backoff(int attempt) {
-  static std::mt19937 rng(std::random_device{}());
-  std::uniform_int_distribution<int> jitter(0, kBackoffMs);
-  return std::chrono::milliseconds(kBackoffMs * (1 << (attempt - 1)) + jitter(rng));
-}
-
-enum class Verdict { kAllow, kDeny, kUnverified };
-
-}  // namespace
-
-int main() {
-  auto redis = sw::redis::Redis("tcp://perm-cache:6379");
-  auto channel = grpc::CreateChannel("policy-engine:50051", grpc::InsecureChannelCredentials());
-  auto engine = policy::PolicyEngine::NewStub(channel);
-
-  const auto grantVersion = [&]() -> long long {
-    const auto value = redis->get(kGrantVersionKey);
-    return value ? std::stoll(*value) : 0LL;
-  };
-
-  // allowIsCurrent reports whether the cached allow carries the current grant_version.
-  const auto allowIsCurrent = [&](const std::string& subject, const std::string& permission, const std::string& scope,
-                                  long long version) -> bool {
-    const auto stored = redis->hget(allowKey(subject, permission, scope), "grant_version");
-    return stored && std::stoll(*stored) == version;
-  };
-
-  const auto decide = [&](const std::string& subject, const std::string& permission,
-                          const std::string& scope) -> Verdict {
-    const long long version = grantVersion();
-    if (allowIsCurrent(subject, permission, scope, version)) return Verdict::kAllow;
-
-    policy::DecideRequest request;
-    request.set_subject(subject);
-    request.set_permission(permission);
-    request.set_scope(scope);
-
-    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-      grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kPolicyTimeoutMs));
-      policy::DecideReply reply;
-      const grpc::Status status = engine->Decide(&context, request, &reply);
-      if (status.ok()) {
-        if (reply.effect() == "DENY") return Verdict::kDeny;
-        redis->hset(allowKey(subject, permission, scope), "grant_version", std::to_string(version));
-        return Verdict::kAllow;
+// Whether the policy engine allows subject to use permission at scope.
+bool authorize(const std::string& subject, const std::string& permission, const std::string& scope) {
+  const std::string version = redis.get(kVersionKey).value_or("0");
+  const auto stamp = redis.hget(allowKey(subject, permission, scope), "version");
+  if (stamp && *stamp == version) return true;  // the engine allowed this at the current grant version
+  policyd::CheckRequest request;
+  request.set_subject(subject);
+  request.set_permission(permission);
+  request.set_scope(scope);
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + kDeadline);
+    policyd::Decision decision;
+    const grpc::Status status = engine->Check(&ctx, request, &decision);
+    if (!status.ok()) {
+      if (status.error_code() != grpc::StatusCode::UNAVAILABLE && status.error_code() != grpc::StatusCode::DEADLINE_EXCEEDED) {
+        return false;  // the engine answered: a rejection is a denial, not a reason to ask again
       }
-      if (isTerminal(status.error_code())) return Verdict::kDeny;
-      if (!isTransient(status.error_code()) || attempt == kMaxAttempts) break;
-      std::this_thread::sleep_for(backoff(attempt));
+      if (attempt + 1 < kMaxAttempts) std::this_thread::sleep_for(kBackoff);
+      continue;
     }
-    return Verdict::kUnverified;
-  };
-
-  httplib::Server svr;
-
-  svr.Post("/v1/check", [&](const httplib::Request& req, httplib::Response& res) {
-    const auto body = nlohmann::json::parse(req.body, nullptr, false);
-    if (!body.is_object()) {
-      res.status = 400;
-      res.set_content(R"({"error":"invalid json"})", "application/json");
-      return;
+    if (decision.allowed()) {
+      redis.hset(allowKey(subject, permission, scope), "version", version);
+      redis.expire(allowKey(subject, permission, scope), kAllowTtlS);
     }
-    const std::string subject = body.value("subject", std::string());
-    const std::string permission = body.value("permission", std::string());
-    const std::string scope = body.value("scope", std::string());
-
-    switch (decide(subject, permission, scope)) {
-      case Verdict::kAllow:
-        res.status = 200;
-        res.set_content(R"({"allowed":true})", "application/json");
-        return;
-      case Verdict::kDeny:
-        res.status = 403;
-        res.set_content(R"({"error":"policy_denied"})", "application/json");
-        return;
-      case Verdict::kUnverified:
-        res.status = 503;
-        res.set_header("Retry-After", "1");
-        res.set_content(R"({"error":"policy_unavailable"})", "application/json");
-        return;
-    }
-  });
-
-  svr.listen("0.0.0.0", 8445);
+    return decision.allowed();
+  }
+  // Nothing verified this request: deny it, and let the client retry.
+  throw PolicyUnavailable("policy engine: no answer in " + std::to_string(kMaxAttempts) + " attempts");
 }
 `,
     },
   },
-  debrief: `Every piece of the fix answers one question: what does the service do when the component that decides permissions does not answer? The starter answers "allow", so every failure of the policy engine becomes a grant. A deadline bounds one attempt and a two-attempt budget bounds the call, so a wedged engine costs bounded latency and then a 503 the client can retry. The retryable set is two transport codes and nothing else, so a deliberate \`DENY\` is final rather than re-rolled. The cached allow is keyed to the grant version, so an allow cannot outlive the revocation behind it. Production deployments add a concurrency cap or circuit breaker around the engine so a slow engine cannot drain the request pool, and a counter on the deny-by-outage path, because that is how you learn the safety property is carrying traffic.`,
+  harness: {
+    python: `import grpc
+
+import permission_service_pb2 as pb
+import permission_service_pb2_grpc as pb_grpc
+
+
+class Engine(pb_grpc.PolicyEngineServicer):
+    """Allows what is in allowed; a permission without a "kind:" prefix is unknown (INVALID_ARGUMENT)."""
+
+    def __init__(self):
+        self.allowed = {("ada", "team:read", "team:eng"), ("ada", "team:write", "team:eng")}
+
+    def Check(self, request, context):
+        if ":" not in request.permission:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"unknown permission {request.permission!r}")
+        allowed = (request.subject, request.permission, request.scope) in self.allowed
+        return pb.Decision(allowed=allowed, reason="granted" if allowed else "no grant")
+
+
+def _client(ctx):
+    engine = Engine()
+    ctx.grpc.serve(pb_grpc.add_PolicyEngineServicer_to_server, engine)
+    return ctx.load("client"), engine
+
+
+def _unavailable(m, ctx, permission, why):
+    try:
+        verdict = m.authorize("ada", permission, "team:eng")
+    except m.PolicyUnavailable:
+        return
+    raise AssertionError(f"{why}: authorize answered {verdict!r}, expected PolicyUnavailable (the route answers 503): nothing verified this request")
+
+
+def check_deadline(ctx):
+    m, _ = _client(ctx)
+    assert m.authorize("ada", "team:read", "team:eng") is True, "with a healthy engine ada must be allowed team:read at team:eng"
+    for call in ctx.grpc.calls_to("Check"):
+        assert call.timeout is not None, "a Check call carries no deadline: a stalled engine holds the request open as long as it stalls"
+        assert 0.35 <= call.timeout <= 0.45, f"a Check call carries a {call.timeout} s deadline, expected 400 ms"
+    ctx.grpc.set_latency("Check", 5.0)
+    before = ctx.clock.time()
+    _unavailable(m, ctx, "team:write", "with the engine taking 5 s per call")
+    waited = ctx.clock.time() - before
+    assert waited <= 1.5, f"authorize waited {waited:.1f} s for a stalled engine, expected two 400 ms attempts"
+
+
+def check_retry_transient(ctx):
+    m, _ = _client(ctx)
+    ctx.grpc.fail("Check", grpc.StatusCode.UNAVAILABLE, "engine restarting", times=1)
+    assert m.authorize("ada", "team:read", "team:eng") is True, "one UNAVAILABLE is a transport failure: the second attempt must get the engine's allow"
+    assert len(ctx.grpc.calls_to("Check")) == 2, f"one UNAVAILABLE took {len(ctx.grpc.calls_to('Check'))} calls, expected 2"
+    before = len(ctx.grpc.calls_to("Check"))
+    verdict = m.authorize("ada", "deploy", "team:eng")
+    calls = len(ctx.grpc.calls_to("Check")) - before
+    assert verdict is False, f"an unknown permission (INVALID_ARGUMENT) answered {verdict!r}, expected a denial"
+    assert calls == 1, f"an unknown permission was asked {calls} times: INVALID_ARGUMENT is the engine's answer, not a transport failure"
+    ctx.grpc.fail("Check", grpc.StatusCode.UNAVAILABLE, "engine down", times=10)
+    before = len(ctx.grpc.calls_to("Check"))
+    try:
+        m.authorize("ada", "team:write", "team:eng")
+    except m.PolicyUnavailable:
+        pass
+    calls = len(ctx.grpc.calls_to("Check")) - before
+    assert calls == 2, f"an engine that stays UNAVAILABLE was asked {calls} times, expected MAX_ATTEMPTS = 2"
+
+
+def check_fail_closed(ctx):
+    m, _ = _client(ctx)
+    assert m.authorize("ada", "team:read", "team:eng") is True, "with a healthy engine ada must be allowed team:read at team:eng"
+    ctx.clock.advance(61)  # the 60 s allow has lapsed
+    ctx.redis.incr("perm:grant_version")  # and a grant changed since
+    ctx.grpc.fail("Check", grpc.StatusCode.UNAVAILABLE, "engine down", times=10)
+    _unavailable(m, ctx, "team:read", "with the engine down after the cached allow lapsed")
+
+
+def check_cached_allow_version(ctx):
+    m, engine = _client(ctx)
+    assert m.authorize("ada", "team:write", "team:eng") is True, "with a healthy engine ada must be allowed team:write at team:eng"
+    assert m.authorize("ada", "team:write", "team:eng") is True, "the same check again must be allowed"
+    assert len(ctx.grpc.calls_to("Check")) == 1, f"the same check at the same grant version made {len(ctx.grpc.calls_to('Check'))} calls: the allow must be cached"
+    engine.allowed.discard(("ada", "team:write", "team:eng"))
+    ctx.redis.incr("perm:grant_version")  # ada's team_admin grant was revoked
+    verdict = m.authorize("ada", "team:write", "team:eng")
+    assert verdict is False, f"after ada's grant was revoked (perm:grant_version moved) authorize still answered {verdict!r} from the cached allow: an allow counts only at the grant version it was given at"
+    assert len(ctx.grpc.calls_to("Check")) == 2, "after the grant version moved the engine must be asked again"
+`,
+    typescript: `/** Allows what is in allowed; a permission without a "kind:" prefix is unknown (INVALID_ARGUMENT). */
+function client(ctx) {
+  const pkg = ctx.proto('permission_service.proto');
+  const allowed = new Set(['ada|team:read|team:eng', 'ada|team:write|team:eng']);
+  ctx.grpc.serve(pkg.policyd.PolicyEngine.service, {
+    Check(call, callback) {
+      const {subject, permission, scope} = call.request;
+      if (!permission.includes(':')) return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: \`unknown permission "\${permission}"\`});
+      const ok = allowed.has(\`\${subject}|\${permission}|\${scope}\`);
+      callback(null, {allowed: ok, reason: ok ? 'granted' : 'no grant'});
+    },
+  });
+  return {m: ctx.load('client'), allowed};
+}
+
+async function unavailable(m, permission: string, why: string): Promise<void> {
+  let verdict;
+  try {
+    verdict = await m.authorize('ada', permission, 'team:eng');
+  } catch (e) {
+    if (e instanceof m.PolicyUnavailable) return;
+    throw e;
+  }
+  assert.fail(\`\${why}: authorize answered \${verdict}, expected PolicyUnavailable (the route answers 503): nothing verified this request\`);
+}
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  assert.equal(await m.authorize('ada', 'team:read', 'team:eng'), true, 'with a healthy engine ada must be allowed team:read at team:eng');
+  for (const call of ctx.grpc.callsTo('Check')) {
+    assert(call.timeout !== null, 'a Check call carries no deadline: a stalled engine holds the request open as long as it stalls');
+    assert(call.timeout >= 0.35 && call.timeout <= 0.45, \`a Check call carries a \${call.timeout} s deadline, expected 400 ms\`);
+  }
+  ctx.grpc.setLatency('Check', 5.0);
+  const before = ctx.clock.now();
+  await unavailable(m, 'team:write', 'with the engine taking 5 s per call');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 1.5, \`authorize waited \${waited.toFixed(1)} s for a stalled engine, expected two 400 ms attempts\`);
+}
+
+export async function check_retry_transient(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Check', ctx.grpc.status.UNAVAILABLE, 'engine restarting', 1);
+  assert.equal(await m.authorize('ada', 'team:read', 'team:eng'), true, "one UNAVAILABLE is a transport failure: the second attempt must get the engine's allow");
+  assert.equal(ctx.grpc.callsTo('Check').length, 2, \`one UNAVAILABLE took \${ctx.grpc.callsTo('Check').length} calls, expected 2\`);
+  let before = ctx.grpc.callsTo('Check').length;
+  const verdict = await m.authorize('ada', 'deploy', 'team:eng');
+  let calls = ctx.grpc.callsTo('Check').length - before;
+  assert.equal(verdict, false, \`an unknown permission (INVALID_ARGUMENT) answered \${verdict}, expected a denial\`);
+  assert.equal(calls, 1, \`an unknown permission was asked \${calls} times: INVALID_ARGUMENT is the engine's answer, not a transport failure\`);
+  ctx.grpc.fail('Check', ctx.grpc.status.UNAVAILABLE, 'engine down', 10);
+  before = ctx.grpc.callsTo('Check').length;
+  try {
+    await m.authorize('ada', 'team:write', 'team:eng');
+  } catch (e) {
+    if (!(e instanceof m.PolicyUnavailable)) throw e;
+  }
+  calls = ctx.grpc.callsTo('Check').length - before;
+  assert.equal(calls, 2, \`an engine that stays UNAVAILABLE was asked \${calls} times, expected MAX_ATTEMPTS = 2\`);
+}
+
+export async function check_fail_closed(ctx) {
+  const {m} = client(ctx);
+  assert.equal(await m.authorize('ada', 'team:read', 'team:eng'), true, 'with a healthy engine ada must be allowed team:read at team:eng');
+  ctx.clock.advance(61); // the 60 s allow has lapsed
+  ctx.redis.incr('perm:grant_version'); // and a grant changed since
+  ctx.grpc.fail('Check', ctx.grpc.status.UNAVAILABLE, 'engine down', 10);
+  await unavailable(m, 'team:read', 'with the engine down after the cached allow lapsed');
+}
+
+export async function check_cached_allow_version(ctx) {
+  const {m, allowed} = client(ctx);
+  assert.equal(await m.authorize('ada', 'team:write', 'team:eng'), true, 'with a healthy engine ada must be allowed team:write at team:eng');
+  assert.equal(await m.authorize('ada', 'team:write', 'team:eng'), true, 'the same check again must be allowed');
+  assert.equal(ctx.grpc.callsTo('Check').length, 1, 'the same check at the same grant version must be served from the cached allow');
+  allowed.delete('ada|team:write|team:eng');
+  ctx.redis.incr('perm:grant_version'); // ada's team_admin grant was revoked
+  const verdict = await m.authorize('ada', 'team:write', 'team:eng');
+  assert.equal(verdict, false, \`after ada's grant was revoked (perm:grant_version moved) authorize still answered \${verdict} from the cached allow: an allow counts only at the grant version it was given at\`);
+  assert.equal(ctx.grpc.callsTo('Check').length, 2, 'after the grant version moved the engine must be asked again');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "permz/gen/permission_service"
+
+	"leetbuild/harness"
+)
+
+var clientBg = context.Background()
+
+// enginePeer allows what is in allowed; a permission without a "kind:" prefix is unknown (InvalidArgument).
+type enginePeer struct {
+	pb.UnimplementedPolicyEngineServer
+	allowed map[string]bool
+}
+
+func (e *enginePeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Decision, error) {
+	if !strings.Contains(req.GetPermission(), ":") {
+		return nil, status.Errorf(codes.InvalidArgument, "unknown permission %q", req.GetPermission())
+	}
+	ok := e.allowed[req.GetSubject()+"|"+req.GetPermission()+"|"+req.GetScope()]
+	reason := "no grant"
+	if ok {
+		reason = "granted"
+	}
+	return &pb.Decision{Allowed: ok, Reason: reason}, nil
+}
+
+func startEngine(ctx *harness.Ctx) *enginePeer {
+	e := &enginePeer{allowed: map[string]bool{"ada|team:read|team:eng": true, "ada|team:write|team:eng": true}}
+	pb.RegisterPolicyEngineServer(ctx.GRPC.Server(""), e)
+	return e
+}
+
+func mustAllow(ctx *harness.Ctx, permission, why string) {
+	ok, err := authorize(clientBg, "ada", permission, "team:eng")
+	ctx.NoError(err, "%s: authorize failed", why)
+	ctx.Equal(ok, true, "%s: ada must be allowed %s at team:eng; allowed", why, permission)
+}
+
+func mustBeUnavailable(ctx *harness.Ctx, permission, why string) {
+	ok, err := authorize(clientBg, "ada", permission, "team:eng")
+	ctx.Assert(errors.Is(err, ErrPolicyUnavailable), "%s: authorize answered %v (error %v), expected an error wrapping ErrPolicyUnavailable (the route answers 503): nothing verified this request", why, ok, err)
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	startEngine(ctx)
+	mustAllow(ctx, "team:read", "with a healthy engine")
+	for _, call := range ctx.GRPC.CallsTo("Check", "") {
+		ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a stalled engine holds the request open as long as it stalls")
+		ctx.Assert(350*time.Millisecond <= call.Timeout && call.Timeout <= 450*time.Millisecond, "a Check call carries a %v deadline, expected 400 ms", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Check", 5.0, "")
+	before := ctx.Clock.Now()
+	mustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 1.5, "authorize waited %.1f s for a stalled engine, expected two 400 ms attempts", waited)
+}
+
+func CheckRetryTransient(ctx *harness.Ctx) {
+	startEngine(ctx)
+	ctx.GRPC.Fail("Check", codes.Unavailable, "engine restarting", 1, "")
+	mustAllow(ctx, "team:read", "one UNAVAILABLE is a transport failure, the second attempt gets the engine's answer")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 2, "one UNAVAILABLE must take two calls; the calls")
+	before := len(ctx.GRPC.CallsTo("Check", ""))
+	ok, err := authorize(clientBg, "ada", "deploy", "team:eng")
+	ctx.Assert(!ok && err == nil, "an unknown permission (InvalidArgument) answered %v, %v, expected a denial", ok, err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", ""))-before, 1, "an unknown permission is the engine's answer, not a transport failure; the calls it took")
+	ctx.GRPC.Fail("Check", codes.Unavailable, "engine down", 10, "")
+	before = len(ctx.GRPC.CallsTo("Check", ""))
+	authorize(clientBg, "ada", "team:write", "team:eng")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", ""))-before, 2, "an engine that stays UNAVAILABLE must be asked maxAttempts = 2 times; the calls")
+}
+
+func CheckFailClosed(ctx *harness.Ctx) {
+	startEngine(ctx)
+	mustAllow(ctx, "team:read", "with a healthy engine")
+	ctx.Clock.Advance(61)                     // the 60 s allow has lapsed
+	ctx.Redis.Do("INCR", "perm:grant_version") // and a grant changed since
+	ctx.GRPC.Fail("Check", codes.Unavailable, "engine down", 10, "")
+	mustBeUnavailable(ctx, "team:read", "with the engine down after the cached allow lapsed")
+}
+
+func CheckCachedAllowVersion(ctx *harness.Ctx) {
+	e := startEngine(ctx)
+	mustAllow(ctx, "team:write", "with a healthy engine")
+	mustAllow(ctx, "team:write", "the same check again")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 1, "the same check at the same grant version must be served from the cached allow; the calls")
+	delete(e.allowed, "ada|team:write|team:eng")
+	ctx.Redis.Do("INCR", "perm:grant_version") // ada's team_admin grant was revoked
+	ok, err := authorize(clientBg, "ada", "team:write", "team:eng")
+	ctx.Assert(!ok && err == nil, "after ada's grant was revoked (perm:grant_version moved) authorize answered %v, %v from the cached allow: an allow counts only at the grant version it was given at", ok, err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 2, "after the grant version moved the engine must be asked again; the calls")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <set>
+#include <string>
+
+#include "permission_service.grpc.pb.h"
+
+namespace {
+
+// Allows what is in allowed; a permission without a "kind:" prefix is unknown (INVALID_ARGUMENT).
+class EnginePeer final : public policyd::PolicyEngine::Service {
+ public:
+  std::set<std::string> allowed = {"ada|team:read|team:eng", "ada|team:write|team:eng"};
+  grpc::Status Check(grpc::ServerContext*, const policyd::CheckRequest* req, policyd::Decision* out) override {
+    if (req->permission().find(':') == std::string::npos) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "unknown permission " + req->permission());
+    }
+    const bool ok = allowed.count(req->subject() + "|" + req->permission() + "|" + req->scope()) > 0;
+    out->set_allowed(ok);
+    out->set_reason(ok ? "granted" : "no grant");
+    return grpc::Status::OK;
+  }
+};
+
+EnginePeer& startEngine(harness::Ctx& ctx) {
+  static EnginePeer* peer = nullptr;
+  delete peer;
+  peer = new EnginePeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  return *peer;
+}
+
+void mustAllow(harness::Ctx& ctx, const std::string& permission, const std::string& why) {
+  bool ok = false;
+  try {
+    ok = authorize("ada", permission, "team:eng");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: authorize threw %s: %s", why, harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(ok, true, "%s: ada must be allowed %s at team:eng; allowed", why, permission);
+}
+
+void mustBeUnavailable(harness::Ctx& ctx, const std::string& permission, const std::string& why) {
+  bool ok = false;
+  try {
+    ok = authorize("ada", permission, "team:eng");
+  } catch (const PolicyUnavailable&) {
+    return;
+  }
+  ctx.Fatalf("%s: authorize answered %t, expected PolicyUnavailable (the route answers 503): nothing verified this request", why, ok);
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  startEngine(ctx);
+  mustAllow(ctx, "team:read", "with a healthy engine");
+  for (const auto& call : ctx.GRPC.CallsTo("Check")) {
+    ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a stalled engine holds the request open as long as it stalls");
+    ctx.Assert(0.35 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.45, "a Check call carries a %v s deadline, expected 400 ms", call.TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("Check", 5.0);
+  const int64_t before = ctx.Clock.Now();
+  mustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 1.5, "authorize waited %.1f s for a stalled engine, expected two 400 ms attempts", waited);
+}
+
+void CheckRetryTransient(harness::Ctx& ctx) {
+  startEngine(ctx);
+  ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "engine restarting", 1);
+  mustAllow(ctx, "team:read", "one UNAVAILABLE is a transport failure, the second attempt gets the engine's answer");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 2, "one UNAVAILABLE must take two calls; the calls");
+  size_t before = ctx.GRPC.CallsTo("Check").size();
+  bool ok = true;
+  try {
+    ok = authorize("ada", "deploy", "team:eng");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("an unknown permission (INVALID_ARGUMENT) threw %s: %s, expected a denial", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(ok, false, "an unknown permission (INVALID_ARGUMENT) must be denied; allowed");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size() - before, 1, "an unknown permission is the engine's answer, not a transport failure; the calls it took");
+  ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "engine down", 10);
+  before = ctx.GRPC.CallsTo("Check").size();
+  try {
+    authorize("ada", "team:write", "team:eng");
+  } catch (const PolicyUnavailable&) {
+  }
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size() - before, 2, "an engine that stays UNAVAILABLE must be asked kMaxAttempts = 2 times; the calls");
+}
+
+void CheckFailClosed(harness::Ctx& ctx) {
+  startEngine(ctx);
+  mustAllow(ctx, "team:read", "with a healthy engine");
+  ctx.Clock.Advance(61);                      // the 60 s allow has lapsed
+  ctx.Redis.Do("INCR", "perm:grant_version");  // and a grant changed since
+  ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "engine down", 10);
+  mustBeUnavailable(ctx, "team:read", "with the engine down after the cached allow lapsed");
+}
+
+void CheckCachedAllowVersion(harness::Ctx& ctx) {
+  EnginePeer& engine_peer = startEngine(ctx);
+  mustAllow(ctx, "team:write", "with a healthy engine");
+  mustAllow(ctx, "team:write", "the same check again");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 1, "the same check at the same grant version must be served from the cached allow; the calls");
+  engine_peer.allowed.erase("ada|team:write|team:eng");
+  ctx.Redis.Do("INCR", "perm:grant_version");  // ada's team_admin grant was revoked
+  bool ok = true;
+  try {
+    ok = authorize("ada", "team:write", "team:eng");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("after ada's grant was revoked authorize threw %s: %s", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(ok, false, "after ada's grant was revoked (perm:grant_version moved) authorize must not answer from the cached allow, which counts only at the grant version it was given at; allowed");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 2, "after the grant version moved the engine must be asked again; the calls");
+}
+`,
+  },
+  hints: [
+    'Stop the policy engine for a minute: checks hang, then start answering "allowed" for anyone who was allowed in the last hour. Revoke a grant and the old allow keeps working until its TTL runs out.',
+    'The call has no deadline, every `RpcError` is retried (a rejection included), exhausted retries fall through to the one-hour copy, and the cached allow records nothing about the grants it was given under.',
+    'Pass `timeout=DEADLINE_S` (0.4), loop `MAX_ATTEMPTS` = 2 and continue only on UNAVAILABLE/DEADLINE_EXCEEDED, else return False; raise `PolicyUnavailable` after the loop; cache `HSET allow version=<perm:grant_version>` and serve it only when equal.',
+  ],
+  debrief: `Every piece of the fix answers one question: what does the service say when the component that decides cannot answer? The starter said "yes", so every outage became a grant. A deadline bounds one attempt and the attempt budget bounds the call, so a stalled engine costs under a second and a 503 the client can retry. The retryable set is two transport codes, so an answer from the engine, even an error, is final. Stamping the cached allow with \`grant_version\` ties it to the grants it was given under, so a revocation outdates it at once. Production deployments put a concurrency limit or circuit breaker in front of the engine and count denials caused by outages separately from policy denials.`,
 };

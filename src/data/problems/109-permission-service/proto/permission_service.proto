@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package policyd;
+
+// The policy engine step 3 asks before an action goes ahead. It evaluates the subject's grants and
+// the conditions attached to them (working hours, network, resource tags). A denial is an answer
+// (allowed = false, with the reason); a permission the engine does not know is INVALID_ARGUMENT;
+// an engine that is down or shedding load answers UNAVAILABLE.
+service PolicyEngine {
+  rpc Check(CheckRequest) returns (Decision);
+}
+
+message CheckRequest {
+  string subject = 1;
+  string permission = 2;
+  string scope = 3;
+}
+
+message Decision {
+  bool allowed = 1;
+  string reason = 2;
+}

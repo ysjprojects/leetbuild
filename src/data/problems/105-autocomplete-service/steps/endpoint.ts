@@ -2,250 +2,232 @@ import type {Step} from '@/lib/types';
 
 export const endpointStep: Step = {
   id: 'endpoint',
-  title: 'GET /v1/autocomplete: prefixes with boundaries',
+  title: 'GET /v1/autocomplete: a folded, bounded prefix and ten distinct suggestions',
   concept: 'http',
   file: 'api',
-  focus: ['client', 'api', 'store'],
+  focus: ['client', 'api', 'terms'],
   task: `## Task
 
-**Starting point.** The starter registers \`GET /v1/autocomplete\`, reads \`prefix\` from the query
-string, lowercases it, asks the index for matches and returns every one of them. It compiles, it
-serves the demo (a three-letter ASCII prefix from one tenant), and it hides 4 flaws.
+**Starting point.** The starter registers \`GET /v1/autocomplete\`: it answers **401** without
+\`X-Tenant-Id\`, trims and lowercases \`prefix\`, and returns the first ten terms
+\`terms.matching(tenant, prefix)\` ranks, as \`{"prefix", "suggestions"}\`. It serves the demo and
+hides three flaws.
 
-**Failure mode the checks target.** An unbounded raw prefix lets one request walk the whole index
-(\`prefix=\` empty returns thousands of terms) and carries control characters into cache keys and
-logs. \`str.lower()\` does not fold accents, so \`Café\` and \`cafe\` survive as two suggestions.
+**Failure mode the checks target.** \`CRÈME\` finds nothing although \`creme fraiche\` is in the
+store; an empty prefix walks the tenant's whole index and an escape sequence goes through to the
+store; and \`Café Noir\`, \`cafe noir\` and \`CAFÉ NOIR\` take three of the ten slots.
 
-- The tenant comes from the authenticated \`X-Tenant-Id\` header; a missing tenant is **401**.
-- \`prefix\` is normalized before it is used: case is folded and accents are folded to their base
-  letter, so \`Café\`, \`cafe\` and \`CAFÉ\` are one prefix. Whitespace is collapsed.
-- After normalization the prefix must be **1 to 64 characters** (**400** when empty or longer), so
-  an oversized raw prefix cannot slip through as a shorter one.
-- A prefix containing a **control character** (any C0 control or DEL) is **400**, before any index
-  work.
-- The response carries **at most 10 suggestions**, deduplicated by the normalized term, in the
-  index's ranking order; the cap is applied after dedupe.
-- The response shape is \`{"prefix": <normalized>, "suggestions": [...]}\`.`,
+- Normalize the prefix with \`terms.fold\` (case, Latin accents, whitespace) and answer the folded
+  prefix.
+- A raw prefix with a control character (U+0000 to U+001F, U+007F) is **400** before any lookup;
+  so is a folded prefix outside 1 to \`MAX_PREFIX_CHARS\` = 64 characters.
+- Dedupe the ranked terms by their folded form, keeping the first spelling, then cap at
+  \`MAX_SUGGESTIONS\` = 10.`,
   sequence: {
-    participants: ['Client', 'Autocomplete API', 'Suggestion index'],
+    participants: ['Search box', 'suggestd', 'Term store'],
     messages: [
-      {from: 'Client', to: 'Autocomplete API', label: 'GET /v1/autocomplete?prefix=caf · X-Tenant-Id', kind: 'sync'},
-      {from: 'Autocomplete API', to: 'Autocomplete API', label: 'normalize · bounds · control chars', kind: 'sync'},
-      {from: 'Autocomplete API', to: 'Suggestion index', label: 'matching(tenant, "caf")', kind: 'sync'},
-      {from: 'Suggestion index', to: 'Autocomplete API', label: 'ranked terms', kind: 'reply'},
-      {from: 'Autocomplete API', to: 'Autocomplete API', label: 'fold · dedupe · take 10', kind: 'sync'},
-      {from: 'Autocomplete API', to: 'Client', label: '200 {prefix, suggestions[≤10]}', kind: 'reply'},
+      {from: 'Search box', to: 'suggestd', label: 'GET /v1/autocomplete?prefix=CRÈME · X-Tenant-Id', kind: 'sync'},
+      {from: 'suggestd', to: 'suggestd', label: 'control character → 400 · fold → "creme" · 1..64', kind: 'sync'},
+      {from: 'suggestd', to: 'Term store', label: 'matching(tenant, "creme")', kind: 'sync'},
+      {from: 'Term store', to: 'suggestd', label: 'ranked terms, every spelling', kind: 'reply'},
+      {from: 'suggestd', to: 'suggestd', label: 'dedupe by fold(term) · first 10', kind: 'sync'},
+      {from: 'suggestd', to: 'Search box', label: '200 {prefix: "creme", suggestions}', kind: 'reply'},
     ],
   },
   checks: [
     {
       id: 'route',
-      title: 'Handles GET /v1/autocomplete',
-      detail: 'Register the typeahead route on `GET /v1/autocomplete`.',
+      title: 'Serves GET /v1/autocomplete per tenant',
+      detail:
+        'Register `GET /v1/autocomplete`; a request without `X-Tenant-Id` is **401**, and a tenant sees its own ranked terms as `{"prefix", "suggestions"}`.',
       match: {
-        python: {all: [/@app\.get\(\s*["']\/v1\/autocomplete["']/]},
-        typescript: {all: [/app\.get\(\s*['"]\/v1\/autocomplete['"]/]},
-        go: {all: [/HandleFunc\(\s*"GET \/v1\/autocomplete"/]},
-        scala: {all: [/path\(\s*"v1"\s*\/\s*"autocomplete"\s*\)/, /\bget\s*\{/]},
-        cpp: {all: [/svr\.Get\(\s*"\/v1\/autocomplete"/]},
+        python: {all: [/@app\.get\(\s*["']\/v1\/autocomplete["']/, /x-tenant-id/i, /\b401\b/]},
+        typescript: {all: [/app\.get\(\s*['"]\/v1\/autocomplete['"]/, /x-tenant-id/i, /\b401\b/]},
+        go: {all: [/HandleFunc\(\s*"GET \/v1\/autocomplete"/, /X-Tenant-Id/i, /StatusUnauthorized|\b401\b/]},
+        scala: {all: [/path\(\s*"v1"\s*\/\s*"autocomplete"\s*\)/, /X-Tenant-Id/i, /Unauthorized|\b401\b/]},
+        cpp: {all: [/svr\.Get\(\s*"\/v1\/autocomplete"/, /X-Tenant-Id/i, /\b401\b/]},
       },
     },
     {
-      id: 'prefix-bounds',
-      title: 'Bounds the normalized prefix at 64 characters',
+      id: 'fold-prefix',
+      title: 'Folds the prefix the way the store folds terms',
       detail:
-        'The normalized prefix must be 1..64 characters; an empty or oversized prefix is **400**. The starter matches on the raw prefix with no bound, so `prefix=` returns the whole index.',
+        'The prefix goes through `terms.fold` before the lookup, so `CRÈME`, `crème` and `  creme ` are one prefix; lowercasing leaves the accent and matches nothing.',
       match: {
-        python: {all: [/MIN_PREFIX_CHARS/, /MAX_PREFIX_CHARS/, /status_code\s*=\s*400/]},
-        typescript: {all: [/MIN_PREFIX_CHARS/, /MAX_PREFIX_CHARS/, /code\(\s*400\s*\)/]},
-        go: {all: [/minPrefixChars/, /maxPrefixChars/, /StatusBadRequest/]},
-        scala: {all: [/MinPrefixChars/, /MaxPrefixChars/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kMinPrefixChars/, /kMaxPrefixChars/, /\b400\b/]},
+        python: {all: [/terms\.fold\(/], none: [/\.lower\(\)/]},
+        typescript: {all: [/\bfold\(/], none: [/toLowerCase\(/]},
+        go: {all: [/terms\.Fold\(/], none: [/strings\.ToLower\(/]},
+        scala: {all: [/Terms\.fold\(|Terms\.fold\b/], none: [/toLowerCase/]},
+        cpp: {all: [/terms::fold\(/], none: [/tolower/]},
       },
     },
     {
-      id: 'control-chars',
-      title: 'Rejects control characters in the prefix',
+      id: 'bounded-prefix',
+      title: 'Rejects empty, oversized and control-character prefixes',
       detail:
-        'A prefix containing a control character is **400** before any index work. The starter forwards the raw prefix to the index and the cache key.',
+        'A raw prefix with a C0 control character or DEL is **400**, and so is a folded prefix shorter than 1 or longer than `MAX_PREFIX_CHARS` (64) characters, before any lookup.',
       match: {
-        python: {all: [/CONTROL_CHARS/, /status_code\s*=\s*400/]},
-        typescript: {all: [/CONTROL_CHARS/, /code\(\s*400\s*\)/]},
-        go: {all: [/controlChars/, /StatusBadRequest/]},
-        scala: {all: [/ControlChars/, /StatusCodes\.BadRequest/]},
-        cpp: {all: [/kControlChars/, /\b400\b/]},
+        python: {
+          all: [
+            /MAX_PREFIX_CHARS\s*=\s*64\b/,
+            /\b400\b/,
+            /0x20|0x1[fF]|\b3[12]\b|\\x1[fF]|0x7[fF]|\\x7[fF]|\b127\b|isprintable/,
+          ],
+        },
+        typescript: {
+          all: [
+            /MAX_PREFIX_CHARS\s*=\s*64\b/,
+            /\b400\b/,
+            /0x20|0x1[fF]|\b3[12]\b|\\x1[fF]|0x7[fF]|\\x7[fF]|\\u007[fF]|\b127\b|\\p\{Cc\}/,
+          ],
+        },
+        go: {
+          all: [
+            /maxPrefixChars\s*=\s*64\b/,
+            /StatusBadRequest|\b400\b/,
+            /0x20|0x1[fF]|\b3[12]\b|0x7[fF]|\b127\b|unicode\.IsControl/,
+          ],
+        },
+        scala: {
+          all: [
+            /MaxPrefixChars\s*=\s*64\b/,
+            /BadRequest|\b400\b/,
+            /0x20|0x1[fF]|\b3[12]\b|0x7[fF]|\b127\b|isControl|isISOControl/,
+          ],
+        },
+        cpp: {
+          all: [
+            /kMaxPrefixChars\{?\s*=?\s*64\b|kMaxPrefixChars\s*=\s*64\b/,
+            /\b400\b/,
+            /0x20|0x1[fF]|\b3[12]\b|0x7[fF]|\b127\b|iscntrl/,
+          ],
+        },
       },
     },
     {
-      id: 'suggestion-cap',
-      title: 'Returns at most 10 suggestions',
+      id: 'dedupe-then-cap',
+      title: 'Dedupes by folded term before capping at ten',
       detail:
-        'The endpoint owns the contract: it folds, dedupes by the normalized term, and returns at most 10. The starter returns every match in the index, thousands for a short prefix.',
+        'Spellings that fold alike are one suggestion (the first, highest ranked, is kept), and the cap of `MAX_SUGGESTIONS` applies after the dedupe; slicing the ranked list first lets duplicates take the slots.',
       match: {
-        python: {all: [/MAX_SUGGESTIONS/, /\[:MAX_SUGGESTIONS\]/]},
-        typescript: {all: [/MAX_SUGGESTIONS/, /slice\(\s*0\s*,\s*MAX_SUGGESTIONS\s*\)/]},
-        go: {all: [/maxSuggestions/, /\[\s*:\s*maxSuggestions\s*\]/]},
-        scala: {all: [/MaxSuggestions/, /take\(\s*MaxSuggestions\s*\)/]},
-        cpp: {all: [/kMaxSuggestions/, /resize\(/]},
-      },
-    },
-    {
-      id: 'normalize',
-      title: 'Folds case and accents so duplicates collapse',
-      detail:
-        'Normalization folds case *and* accents, and suggestions are deduplicated by the normalized term. The starter calls `lower()` only, so `Café` and `cafe` both appear.',
-      match: {
-        python: {all: [/def fold\(/, /unicodedata/, /seen\s*=\s*set\(/]},
-        typescript: {all: [/function fold\(/, /\.normalize\(/, /new Set\b/]},
-        go: {all: [/func fold\(/, /norm\.NFD/, /seen\s*:?=/]},
-        scala: {all: [/def fold\(/, /Normalizer/, /mutable\.Set/]},
-        cpp: {all: [/fold\(/, /kAccentMap/, /std::set/]},
+        python: {
+          all: [/\bseen\b|dedup|unique|distinct|set\(\)|dict\.fromkeys/],
+          none: [/matching\([^)]*\)\s*\[\s*:\s*MAX_SUGGESTIONS/],
+        },
+        typescript: {all: [/\bseen\b|dedup|unique|distinct|new Set/], none: [/matching\([^)]*\)\)?\.slice\(/]},
+        go: {
+          all: [/\bseen\b|dedup|unique|distinct|map\[string\]bool|map\[string\]struct/],
+          none: [/suggestions\[:maxSuggestions\]/],
+        },
+        scala: {all: [/distinctBy|\.distinct\b|\bseen\b/], none: [/matching\([^)]*\)\.take\(/]},
+        cpp: {all: [/\bseen\b|dedup|unique|distinct|std::(unordered_)?set/], none: [/suggestions\.resize\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `from fastapi import FastAPI, Header
-
-app = FastAPI()
-
-
-class SuggestionIndex:
-    def matching(self, tenant: str, prefix: str):
-        """Terms whose text starts with the prefix, ranked by count."""
-        raise NotImplementedError
-
-
-index = SuggestionIndex()
-
-
-@app.get("/v1/autocomplete")
-def autocomplete(prefix: str = "", x_tenant_id: str = Header(default="")):
-    # TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    return {"prefix": prefix.lower(), "suggestions": index.matching(x_tenant_id, prefix.lower())}
-`,
-      solution: `import unicodedata
-
-from fastapi import FastAPI, Header
+      starter: `from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from suggest import terms  # fold, matching
+
 app = FastAPI()
 
-MIN_PREFIX_CHARS = 1
-MAX_PREFIX_CHARS = 64
 MAX_SUGGESTIONS = 10
-CONTROL_CHARS = frozenset(chr(code) for code in range(32)) | {"\\x7f"}
-
-
-class SuggestionIndex:
-    def matching(self, tenant: str, prefix: str):
-        """Terms whose text starts with the prefix, ranked by count."""
-        raise NotImplementedError
-
-
-index = SuggestionIndex()
-
-
-def fold(text: str) -> str:
-    """Case- and accent-fold so "Café" and "cafe" collapse to one key."""
-    decomposed = unicodedata.normalize("NFKD", text)
-    base = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return base.casefold()
-
-
-def normalize(prefix: str) -> str:
-    return " ".join(fold(prefix).split())
 
 
 @app.get("/v1/autocomplete")
-def autocomplete(prefix: str = "", x_tenant_id: str = Header(default="")):
-    if not x_tenant_id:
-        return JSONResponse({"error": "missing X-Tenant-Id"}, status_code=401)
-    if any(ch in CONTROL_CHARS for ch in prefix):
-        return JSONResponse({"error": "prefix contains control characters"}, status_code=400)
-    normalized = normalize(prefix)
-    if len(normalized) < MIN_PREFIX_CHARS or len(normalized) > MAX_PREFIX_CHARS:
-        return JSONResponse({"error": "prefix must be 1..64 characters"}, status_code=400)
-    ranked = []
-    seen = set()
-    for term in index.matching(x_tenant_id, normalized):
-        key = normalize(term)
+def autocomplete(request: Request):
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    # TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+    prefix = request.query_params.get("prefix", "").strip().lower()
+    return {"prefix": prefix, "suggestions": terms.matching(tenant, prefix)[:MAX_SUGGESTIONS]}
+`,
+      solution: `from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from suggest import terms  # fold, matching
+
+app = FastAPI()
+
+MAX_PREFIX_CHARS = 64
+MAX_SUGGESTIONS = 10
+
+
+@app.get("/v1/autocomplete")
+def autocomplete(request: Request):
+    tenant = request.headers.get("x-tenant-id", "")
+    if not tenant:
+        return JSONResponse({"error": "X-Tenant-Id is required"}, status_code=401)
+    raw = request.query_params.get("prefix", "")
+    # Rejected before any lookup: a control character never reaches a key or a log line.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+        return JSONResponse({"error": "prefix contains a control character"}, status_code=400)
+    prefix = terms.fold(raw)
+    if not 1 <= len(prefix) <= MAX_PREFIX_CHARS:
+        return JSONResponse({"error": "prefix must be 1 to 64 characters"}, status_code=400)
+    # Dedupe on the folded form first, then cap: duplicates must not take the ten slots.
+    suggestions, seen = [], set()
+    for term in terms.matching(tenant, prefix):
+        key = terms.fold(term)
         if key in seen:
             continue
         seen.add(key)
-        ranked.append(term)
-    return {"prefix": normalized, "suggestions": ranked[:MAX_SUGGESTIONS]}
+        suggestions.append(term)
+        if len(suggestions) == MAX_SUGGESTIONS:
+            break
+    return {"prefix": prefix, "suggestions": suggestions}
 `,
     },
     typescript: {
       starter: `import Fastify from 'fastify';
 
+import {fold, matching} from 'suggest/terms';
+
 export const app = Fastify();
 
-interface SuggestionIndex {
-  matching(tenant: string, prefix: string): Promise<string[]>;
-}
-
-const index: SuggestionIndex = {
-  async matching(tenant, prefix) {
-    throw new Error('not implemented');
-  },
-};
+export const MAX_SUGGESTIONS = 10;
 
 app.get('/v1/autocomplete', async (request, reply) => {
-  // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-  const tenant = request.headers['x-tenant-id'] as string;
-  const prefix = String((request.query as Record<string, unknown>).prefix ?? '');
-  return {prefix: prefix.toLowerCase(), suggestions: await index.matching(tenant, prefix.toLowerCase())};
+  const tenant = request.headers['x-tenant-id'];
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  const prefix = ((request.query as {prefix?: string}).prefix ?? '').trim().toLowerCase();
+  const suggestions = (await matching(tenant, prefix)).slice(0, MAX_SUGGESTIONS);
+  return {prefix, suggestions};
 });
 `,
       solution: `import Fastify from 'fastify';
 
+import {fold, matching} from 'suggest/terms';
+
 export const app = Fastify();
 
-const MIN_PREFIX_CHARS = 1;
-const MAX_PREFIX_CHARS = 64;
-const MAX_SUGGESTIONS = 10;
-const CONTROL_CHARS = /[\\u0000-\\u001f\\u007f]/;
-
-interface SuggestionIndex {
-  matching(tenant: string, prefix: string): Promise<string[]>;
-}
-
-const index: SuggestionIndex = {
-  async matching(tenant, prefix) {
-    throw new Error('not implemented');
-  },
-};
-
-function fold(text: string): string {
-  return text
-    .normalize('NFKD')
-    .replace(/[\\u0300-\\u036f]/g, '')
-    .toLowerCase();
-}
-
-function normalize(prefix: string): string {
-  return fold(prefix).trim().replace(/\\s+/g, ' ');
-}
+export const MAX_PREFIX_CHARS = 64;
+export const MAX_SUGGESTIONS = 10;
 
 app.get('/v1/autocomplete', async (request, reply) => {
   const tenant = request.headers['x-tenant-id'];
-  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'missing X-Tenant-Id'});
-  const raw = String((request.query as Record<string, unknown>).prefix ?? '');
-  if (CONTROL_CHARS.test(raw)) return reply.code(400).send({error: 'prefix contains control characters'});
-  const normalized = normalize(raw);
-  if (normalized.length < MIN_PREFIX_CHARS || normalized.length > MAX_PREFIX_CHARS)
-    return reply.code(400).send({error: 'prefix must be 1..64 characters'});
+  if (typeof tenant !== 'string' || tenant === '') return reply.code(401).send({error: 'X-Tenant-Id is required'});
+  const raw = (request.query as {prefix?: string}).prefix ?? '';
+  // Rejected before any lookup: a control character never reaches a key or a log line.
+  if ([...raw].some(ch => ch < ' ' || ch === '\\x7f')) return reply.code(400).send({error: 'prefix contains a control character'});
+  const prefix = fold(raw);
+  const length = [...prefix].length;
+  if (length < 1 || length > MAX_PREFIX_CHARS) return reply.code(400).send({error: 'prefix must be 1 to 64 characters'});
+  // Dedupe on the folded form first, then cap: duplicates must not take the ten slots.
   const seen = new Set<string>();
-  const ranked: string[] = [];
-  for (const term of await index.matching(tenant, normalized)) {
-    const key = normalize(term);
+  const suggestions: string[] = [];
+  for (const term of await matching(tenant, prefix)) {
+    const key = fold(term);
     if (seen.has(key)) continue;
     seen.add(key);
-    ranked.push(term);
+    suggestions.push(term);
+    if (suggestions.length === MAX_SUGGESTIONS) break;
   }
-  return {prefix: normalized, suggestions: ranked.slice(0, MAX_SUGGESTIONS)};
+  return {prefix, suggestions};
 });
 `,
     },
@@ -254,234 +236,181 @@ app.get('/v1/autocomplete', async (request, reply) => {
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
+	"strings"
+
+	"suggest/terms" // terms.Fold, terms.Matching
 )
 
-type SuggestionIndex interface {
-	Matching(tenant, prefix string) ([]string, error)
+const maxSuggestions = 10
+
+type answer struct {
+	Prefix      string   \`json:"prefix"\`
+	Suggestions []string \`json:"suggestions"\`
+}
+
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func autocomplete(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
-	prefix := r.URL.Query().Get("prefix")
-	// TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-	terms, _ := index.Matching(tenant, strings.ToLower(prefix))
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]any{"prefix": strings.ToLower(prefix), "suggestions": terms})
+	if tenant == "" {
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
+		return
+	}
+	// TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+	prefix := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("prefix")))
+	suggestions := append([]string{}, terms.Matching(r.Context(), tenant, prefix)...)
+	if len(suggestions) > maxSuggestions {
+		suggestions = suggestions[:maxSuggestions]
+	}
+	writeJSON(rw, http.StatusOK, answer{Prefix: prefix, Suggestions: suggestions})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/autocomplete", autocomplete)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
       solution: `package main
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
-	"unicode"
+	"unicode/utf8"
 
-	"golang.org/x/text/unicode/norm"
+	"suggest/terms" // terms.Fold, terms.Matching
 )
 
 const (
-	minPrefixChars = 1
 	maxPrefixChars = 64
 	maxSuggestions = 10
 )
 
-var controlChars = func() map[rune]bool {
-	m := map[rune]bool{}
-	for r := rune(0); r < 32; r++ {
-		m[r] = true
-	}
-	m[127] = true
-	return m
-}()
-
-type SuggestionIndex interface {
-	Matching(tenant, prefix string) ([]string, error)
+type answer struct {
+	Prefix      string   \`json:"prefix"\`
+	Suggestions []string \`json:"suggestions"\`
 }
 
-func fold(text string) string {
-	var b strings.Builder
-	for _, r := range norm.NFD.String(text) {
-		if unicode.Is(unicode.Mn, r) {
-			continue
-		}
-		b.WriteRune(unicode.ToLower(r))
-	}
-	return b.String()
-}
-
-func normalize(prefix string) string {
-	return strings.Join(strings.Fields(fold(prefix)), " ")
-}
-
-func hasControlChars(prefix string) bool {
-	for _, r := range prefix {
-		if controlChars[r] {
-			return true
-		}
-	}
-	return false
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
 }
 
 func autocomplete(rw http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-Id")
 	if tenant == "" {
-		writeError(rw, http.StatusUnauthorized, "missing X-Tenant-Id")
+		writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "X-Tenant-Id is required"})
 		return
 	}
 	raw := r.URL.Query().Get("prefix")
-	if hasControlChars(raw) {
-		writeError(rw, http.StatusBadRequest, "prefix contains control characters")
+	// Rejected before any lookup: a control character never reaches a key or a log line.
+	if strings.IndexFunc(raw, func(ch rune) bool { return ch < 0x20 || ch == 0x7f }) >= 0 {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "prefix contains a control character"})
 		return
 	}
-	normalized := normalize(raw)
-	if len([]rune(normalized)) < minPrefixChars || len([]rune(normalized)) > maxPrefixChars {
-		writeError(rw, http.StatusBadRequest, "prefix must be 1..64 characters")
+	prefix := terms.Fold(raw)
+	if n := utf8.RuneCountInString(prefix); n < 1 || n > maxPrefixChars {
+		writeJSON(rw, http.StatusBadRequest, map[string]string{"error": "prefix must be 1 to 64 characters"})
 		return
 	}
-	terms, err := index.Matching(tenant, normalized)
-	if err != nil {
-		writeError(rw, http.StatusServiceUnavailable, "index unavailable")
-		return
-	}
+	// Dedupe on the folded form first, then cap: duplicates must not take the ten slots.
+	suggestions := []string{}
 	seen := map[string]bool{}
-	ranked := []string{}
-	for _, term := range terms {
-		key := normalize(term)
+	for _, term := range terms.Matching(r.Context(), tenant, prefix) {
+		key := terms.Fold(term)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		ranked = append(ranked, term)
+		suggestions = append(suggestions, term)
+		if len(suggestions) == maxSuggestions {
+			break
+		}
 	}
-	if len(ranked) > maxSuggestions {
-		ranked = ranked[:maxSuggestions]
-	}
-	rw.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(rw).Encode(map[string]any{"prefix": normalized, "suggestions": ranked})
+	writeJSON(rw, http.StatusOK, answer{Prefix: prefix, Suggestions: suggestions})
 }
 
-func main() {
-	mux := http.NewServeMux()
+func register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/autocomplete", autocomplete)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      starter: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-trait SuggestionIndex {
-  def matching(tenant: String, prefix: String): List[String]
-}
+import suggest.Terms // Terms.fold, Terms.matching
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("autocomplete")
+  val MaxSuggestions = 10
 
-  val index: SuggestionIndex = new SuggestionIndex {
-    def matching(tenant: String, prefix: String): List[String] = throw new NotImplementedError()
-  }
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  val route: Route =
-    path("v1" / "autocomplete") {
-      get {
-        parameter("prefix".?) { prefixOpt =>
-          headerValueByName("X-Tenant-Id") { tenant =>
-            // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-            val prefix = prefixOpt.getOrElse("").toLowerCase
-            complete(StatusCodes.OK, s"""{"prefix":"$prefix","suggestions":[]}""")
+  private def answer(prefix: String, suggestions: Seq[String]): JsObject =
+    JsObject("prefix" -> JsString(prefix), "suggestions" -> JsArray(suggestions.map(JsString(_)).toVector))
+
+  val route: Route = path("v1" / "autocomplete") {
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant) =>
+          parameter("prefix".optional) { raw =>
+            // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+            val prefix = raw.getOrElse("").trim.toLowerCase
+            complete(json(StatusCodes.OK, answer(prefix, Terms.matching(tenant, prefix).take(MaxSuggestions))))
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
-      solution: `import java.text.Normalizer
-
-import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model._
+      solution: `import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCode, StatusCodes}
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
+import spray.json._
 
-trait SuggestionIndex {
-  def matching(tenant: String, prefix: String): List[String]
-}
+import suggest.Terms // Terms.fold, Terms.matching
 
 object Api {
-  implicit val system: ActorSystem = ActorSystem("autocomplete")
-
-  val MinPrefixChars = 1
   val MaxPrefixChars = 64
   val MaxSuggestions = 10
-  val ControlChars: Set[Char] = (0.toChar to 31.toChar).toSet + 127.toChar
 
-  val index: SuggestionIndex = new SuggestionIndex {
-    def matching(tenant: String, prefix: String): List[String] = throw new NotImplementedError()
-  }
+  private def json(status: StatusCode, body: JsObject): HttpResponse =
+    HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body.compactPrint))
 
-  def fold(text: String): String =
-    Normalizer
-      .normalize(text, Normalizer.Form.NFKD)
-      .replaceAll("\\\\p{M}", "")
-      .toLowerCase
+  private def answer(prefix: String, suggestions: Seq[String]): JsObject =
+    JsObject("prefix" -> JsString(prefix), "suggestions" -> JsArray(suggestions.map(JsString(_)).toVector))
 
-  def normalize(prefix: String): String =
-    fold(prefix).trim.replaceAll("\\\\s+", " ")
+  private def badRequest(message: String): HttpResponse = json(StatusCodes.BadRequest, JsObject("error" -> JsString(message)))
 
-  val route: Route =
-    path("v1" / "autocomplete") {
-      get {
-        optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
-          parameter("prefix".?) { prefixOpt =>
-            val raw = prefixOpt.getOrElse("")
-            if (!tenantOpt.exists(_.nonEmpty)) {
-              complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
-            } else if (raw.exists(ControlChars.contains)) {
-              complete(StatusCodes.BadRequest, """{"error":"prefix contains control characters"}""")
-            } else {
-              val normalized = normalize(raw)
-              if (normalized.length < MinPrefixChars || normalized.length > MaxPrefixChars) {
-                complete(StatusCodes.BadRequest, """{"error":"prefix must be 1..64 characters"}""")
-              } else {
-                val seen = scala.collection.mutable.Set.empty[String]
-                val ranked = scala.collection.mutable.ListBuffer.empty[String]
-                for (term <- index.matching(tenantOpt.get, normalized)) {
-                  val key = normalize(term)
-                  if (!seen.contains(key)) {
-                    seen += key
-                    ranked += term
-                  }
-                }
-                val capped = ranked.take(MaxSuggestions)
-                val body = capped.map(t => "\\"" + t.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"") + "\\"").mkString(",")
-                complete(StatusCodes.OK, s"""{"prefix":"$normalized","suggestions":[$body]}""")
-              }
+  val route: Route = path("v1" / "autocomplete") {
+    get {
+      optionalHeaderValueByName("X-Tenant-Id") {
+        case None | Some("") => complete(json(StatusCodes.Unauthorized, JsObject("error" -> JsString("X-Tenant-Id is required"))))
+        case Some(tenant) =>
+          parameter("prefix".optional) { raw =>
+            val text = raw.getOrElse("")
+            val prefix = Terms.fold(text)
+            val length = prefix.codePointCount(0, prefix.length)
+            // Rejected before any lookup: a control character never reaches a key or a log line.
+            if (text.exists(ch => ch < 0x20 || ch == 0x7f)) complete(badRequest("prefix contains a control character"))
+            else if (length < 1 || length > MaxPrefixChars) complete(badRequest("prefix must be 1 to 64 characters"))
+            else {
+              // Dedupe on the folded form first, then cap: duplicates must not take the ten slots.
+              val suggestions = Terms.matching(tenant, prefix).distinctBy(Terms.fold).take(MaxSuggestions)
+              complete(json(StatusCodes.OK, answer(prefix, suggestions)))
             }
           }
-        }
       }
     }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
   }
 }
 `,
@@ -490,153 +419,417 @@ object Api {
       starter: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 
+#include "suggest/terms.h"  // terms::fold, terms::matching
+
 using json = nlohmann::json;
 
-std::vector<std::string> matching(const std::string& tenant, const std::string& prefix);
+constexpr size_t kMaxSuggestions = 10;
 
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/autocomplete", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    const auto prefix = req.get_param_value("prefix");
-    // TODO: this starter has 4 flaws. The task says where to look; the checks say what must change.
-    const auto terms = matching(tenant, prefix);
-    res.status = 200;
-    res.set_content(json{{"prefix", prefix}, {"suggestions", terms}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
 }
+
+void autocomplete(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
+  std::string prefix = req.get_param_value("prefix");
+  prefix.erase(0, prefix.find_first_not_of(' '));
+  prefix.erase(prefix.find_last_not_of(' ') + 1);
+  std::transform(prefix.begin(), prefix.end(), prefix.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::vector<std::string> suggestions = terms::matching(tenant, prefix);
+  if (suggestions.size() > kMaxSuggestions) suggestions.resize(kMaxSuggestions);
+  reply(res, 200, {{"prefix", prefix}, {"suggestions", suggestions}});
+}
+
+void register_routes(httplib::Server& svr) { svr.Get("/v1/autocomplete", autocomplete); }
 `,
       solution: `#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
+
+#include "suggest/terms.h"  // terms::fold, terms::matching
 
 using json = nlohmann::json;
 
-constexpr std::size_t kMinPrefixChars = 1;
-constexpr std::size_t kMaxPrefixChars = 64;
-constexpr std::size_t kMaxSuggestions = 10;
+constexpr size_t kMaxPrefixChars = 64;
+constexpr size_t kMaxSuggestions = 10;
 
-const std::set<char> kControlChars = [] {
-  std::set<char> s;
-  for (int code = 0; code < 32; ++code) s.insert(static_cast<char>(code));
-  s.insert(127);
-  return s;
-}();
+void reply(httplib::Response& res, int status, const json& body) {
+  res.status = status;
+  res.set_content(body.dump(), "application/json");
+}
 
-const std::unordered_map<std::string, std::string> kAccentMap = {
-    {"á", "a"}, {"à", "a"}, {"â", "a"}, {"ä", "a"}, {"ã", "a"}, {"é", "e"}, {"è", "e"},
-    {"ê", "e"}, {"ë", "e"}, {"í", "i"}, {"ì", "i"}, {"î", "i"}, {"ï", "i"}, {"ó", "o"},
-    {"ò", "o"}, {"ô", "o"}, {"ö", "o"}, {"õ", "o"}, {"ú", "u"}, {"ù", "u"}, {"û", "u"},
-    {"ü", "u"}, {"ñ", "n"}, {"ç", "c"}, {"Á", "a"}, {"É", "e"}, {"Í", "i"}, {"Ó", "o"},
-    {"Ú", "u"}, {"Ñ", "n"}, {"Ç", "c"},
-};
-
-std::vector<std::string> matching(const std::string& tenant, const std::string& prefix);
-
-std::string fold(const std::string& text) {
-  std::string out;
-  for (std::size_t i = 0; i < text.size();) {
-    bool matched = false;
-    for (std::size_t len = 2; len <= 2; ++len) {
-      if (i + len <= text.size()) {
-        const auto slice = text.substr(i, len);
-        const auto it = kAccentMap.find(slice);
-        if (it != kAccentMap.end()) {
-          out += it->second;
-          i += len;
-          matched = true;
-          break;
-        }
-      }
-    }
-    if (matched) continue;
-    const unsigned char ch = static_cast<unsigned char>(text[i]);
-    out += static_cast<char>(std::tolower(ch));
-    i += 1;
+void autocomplete(const httplib::Request& req, httplib::Response& res) {
+  const std::string tenant = req.get_header_value("X-Tenant-Id");
+  if (tenant.empty()) return reply(res, 401, {{"error", "X-Tenant-Id is required"}});
+  const std::string raw = req.get_param_value("prefix");
+  // Rejected before any lookup: a control character never reaches a key or a log line.
+  if (std::any_of(raw.begin(), raw.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; })) {
+    return reply(res, 400, {{"error", "prefix contains a control character"}});
   }
-  return out;
-}
-
-std::string normalize(const std::string& prefix) {
-  const auto folded = fold(prefix);
-  std::string out;
-  bool pending = false;
-  for (const char ch : folded) {
-    if (std::isspace(static_cast<unsigned char>(ch))) {
-      pending = !out.empty();
-      continue;
-    }
-    if (pending) {
-      out += ' ';
-      pending = false;
-    }
-    out += ch;
+  const std::string prefix = terms::fold(raw);
+  // Characters, not bytes: a UTF-8 continuation byte is 10xxxxxx.
+  const auto length = static_cast<size_t>(std::count_if(prefix.begin(), prefix.end(), [](unsigned char c) { return (c & 0xC0) != 0x80; }));
+  if (length < 1 || length > kMaxPrefixChars) return reply(res, 400, {{"error", "prefix must be 1 to 64 characters"}});
+  // Dedupe on the folded form first, then cap: duplicates must not take the ten slots.
+  std::vector<std::string> suggestions;
+  std::set<std::string> seen;
+  for (const std::string& term : terms::matching(tenant, prefix)) {
+    if (!seen.insert(terms::fold(term)).second) continue;
+    suggestions.push_back(term);
+    if (suggestions.size() == kMaxSuggestions) break;
   }
-  return out;
+  reply(res, 200, {{"prefix", prefix}, {"suggestions", suggestions}});
 }
 
-bool hasControlChars(const std::string& prefix) {
-  for (const char ch : prefix) {
-    if (kControlChars.count(ch) != 0) return true;
-  }
-  return false;
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get("/v1/autocomplete", [](const httplib::Request& req, httplib::Response& res) {
-    const auto tenant = req.get_header_value("X-Tenant-Id");
-    if (tenant.empty()) {
-      res.status = 401;
-      res.set_content(R"({"error":"missing X-Tenant-Id"})", "application/json");
-      return;
-    }
-    const auto raw = req.get_param_value("prefix");
-    if (hasControlChars(raw)) {
-      res.status = 400;
-      res.set_content(R"({"error":"prefix contains control characters"})", "application/json");
-      return;
-    }
-    const auto normalized = normalize(raw);
-    if (normalized.size() < kMinPrefixChars || normalized.size() > kMaxPrefixChars) {
-      res.status = 400;
-      res.set_content(R"({"error":"prefix must be 1..64 characters"})", "application/json");
-      return;
-    }
-    const auto terms = matching(tenant, normalized);
-    std::set<std::string> seen;
-    std::vector<std::string> ranked;
-    for (const auto& term : terms) {
-      const auto key = normalize(term);
-      if (seen.count(key) != 0) continue;
-      seen.insert(key);
-      ranked.push_back(term);
-    }
-    ranked.resize(std::min(ranked.size(), kMaxSuggestions));
-    res.status = 200;
-    res.set_content(json{{"prefix", normalized}, {"suggestions", ranked}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
-}
+void register_routes(httplib::Server& svr) { svr.Get("/v1/autocomplete", autocomplete); }
 `,
     },
   },
+  harness: {
+    python: `def _seed(ctx, tenant, counts):
+    ctx.redis.zadd(f"suggest:terms:{tenant}", counts)
+
+
+async def _ask(c, prefix, tenant="acme"):
+    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    return await c.get("/v1/autocomplete", params={"prefix": prefix}, headers=headers)
+
+
+def _api(ctx):
+    return ctx.client(ctx.load("api").app)
+
+
+async def check_route(ctx):
+    _seed(ctx, "acme", {"kettle": 50, "kettlebell": 40, "keyboard": 30, "lamp": 20})
+    _seed(ctx, "globex", {"kebab": 90})
+    async with _api(ctx) as c:
+        r = await _ask(c, "ke")
+        assert r.status_code == 200, f"GET /v1/autocomplete?prefix=ke answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body == {"prefix": "ke", "suggestions": ["kettle", "kettlebell", "keyboard"]}, f"acme's completions for ke are {body}, expected kettle, kettlebell, keyboard (globex's kebab is not acme's)"
+        r = await _ask(c, "ke", tenant=None)
+    assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
+
+
+async def check_fold_prefix(ctx):
+    _seed(ctx, "acme", {"Crème brûlée": 60, "creme fraiche": 50, "cream": 40, "crepe": 30})
+    async with _api(ctx) as c:
+        for raw in ("CRÈME", "crème", "Creme", "  crème  "):
+            r = await _ask(c, raw)
+            assert r.status_code == 200, f"prefix {raw!r} answered {r.status_code}: {r.text}"
+            body = r.json()
+            assert body.get("prefix") == "creme", f"prefix {raw!r} was answered as {body.get('prefix')!r}, expected the folded prefix 'creme'"
+            assert body.get("suggestions") == ["Crème brûlée", "creme fraiche"], f"prefix {raw!r} found {body.get('suggestions')}: the store folds every term, so the prefix must be folded the same way (terms.fold)"
+        r = await _ask(c, "crème   BR")
+    body = r.json()
+    assert body.get("prefix") == "creme br" and body.get("suggestions") == ["Crème brûlée"], f"prefix 'crème   BR' gave {body}, expected 'creme br' and Crème brûlée"
+
+
+async def check_bounded_prefix(ctx):
+    _seed(ctx, "acme", {"kettle": 50, "kettlebell": 40, "lamp": 20})
+    async with _api(ctx) as c:
+        for raw, what in (("", "an empty prefix"), ("   ", "a prefix of spaces"), ("k" * 65, "a 65-character prefix")):
+            r = await _ask(c, raw)
+            assert r.status_code == 400, f"{what} answered {r.status_code} {r.text[:120]}, expected 400: an empty prefix walks the tenant's whole index"
+        r = await _ask(c, "k" * 64)
+        assert r.status_code == 200, f"a 64-character prefix answered {r.status_code}, expected 200"
+        for raw in ("ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp"):
+            r = await _ask(c, raw)
+            assert r.status_code == 400, f"prefix {raw!r} answered {r.status_code}, expected 400: a control character must be rejected before any lookup"
+
+
+async def check_dedupe_then_cap(ctx):
+    counts = {"Café Noir": 200, "cafe noir": 199, "CAFÉ NOIR": 198}
+    counts.update({f"cafe {n:02d}": 150 - n for n in range(1, 13)})
+    _seed(ctx, "acme", counts)
+    async with _api(ctx) as c:
+        r = await _ask(c, "caf")
+    assert r.status_code == 200, f"prefix caf answered {r.status_code}: {r.text}"
+    got = r.json().get("suggestions")
+    want = ["Café Noir"] + [f"cafe {n:02d}" for n in range(1, 10)]
+    assert got == want, f"prefix caf answered {got}, expected {want}: spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe"
+`,
+    typescript: `function api(ctx) {
+  return ctx.client(ctx.load('api').app);
+}
+
+function seed(ctx, tenant: string, counts: Record<string, number>): void {
+  for (const [term, count] of Object.entries(counts)) ctx.redis.zadd(\`suggest:terms:\${tenant}\`, count, term);
+}
+
+const ask = (c, prefix: string, tenant: string | null = 'acme') =>
+  c.get(\`/v1/autocomplete?prefix=\${encodeURIComponent(prefix)}\`, {headers: tenant === null ? {} : {'X-Tenant-Id': tenant}});
+
+export async function check_route(ctx) {
+  seed(ctx, 'acme', {kettle: 50, kettlebell: 40, keyboard: 30, lamp: 20});
+  seed(ctx, 'globex', {kebab: 90});
+  const c = api(ctx);
+  let r = await ask(c, 'ke');
+  assert.equal(r.status, 200, \`GET /v1/autocomplete?prefix=ke answered \${r.status}: \${r.text}\`);
+  assert.deepStrictEqual(r.json(), {prefix: 'ke', suggestions: ['kettle', 'kettlebell', 'keyboard']}, \`acme's completions for ke are \${r.text}, expected kettle, kettlebell, keyboard (globex's kebab is not acme's)\`);
+  r = await ask(c, 'ke', null);
+  assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
+}
+
+export async function check_fold_prefix(ctx) {
+  seed(ctx, 'acme', {'Crème brûlée': 60, 'creme fraiche': 50, cream: 40, crepe: 30});
+  const c = api(ctx);
+  for (const raw of ['CRÈME', 'crème', 'Creme', '  crème  ']) {
+    const r = await ask(c, raw);
+    assert.equal(r.status, 200, \`prefix \${JSON.stringify(raw)} answered \${r.status}: \${r.text}\`);
+    const body = r.json();
+    assert.equal(body.prefix, 'creme', \`prefix \${JSON.stringify(raw)} was answered as \${JSON.stringify(body.prefix)}, expected the folded prefix "creme"\`);
+    assert.deepStrictEqual(body.suggestions, ['Crème brûlée', 'creme fraiche'], \`prefix \${JSON.stringify(raw)} found \${JSON.stringify(body.suggestions)}: the store folds every term, so the prefix must be folded the same way (fold)\`);
+  }
+  const body = (await ask(c, 'crème   BR')).json();
+  assert(body.prefix === 'creme br' && JSON.stringify(body.suggestions) === JSON.stringify(['Crème brûlée']), \`prefix "crème   BR" gave \${JSON.stringify(body)}, expected "creme br" and Crème brûlée\`);
+}
+
+export async function check_bounded_prefix(ctx) {
+  seed(ctx, 'acme', {kettle: 50, kettlebell: 40, lamp: 20});
+  const c = api(ctx);
+  for (const [raw, what] of [['', 'an empty prefix'], ['   ', 'a prefix of spaces'], ['k'.repeat(65), 'a 65-character prefix']]) {
+    const r = await ask(c, raw);
+    assert.equal(r.status, 400, \`\${what} answered \${r.status} \${r.text.slice(0, 120)}, expected 400: an empty prefix walks the tenant's whole index\`);
+  }
+  const r = await ask(c, 'k'.repeat(64));
+  assert.equal(r.status, 200, \`a 64-character prefix answered \${r.status}, expected 200\`);
+  for (const raw of ['ke\\x00', 'ke\\x1b[2J', 'ke\\x7f', 'ke\\nlamp']) {
+    const bad = await ask(c, raw);
+    assert.equal(bad.status, 400, \`prefix \${JSON.stringify(raw)} answered \${bad.status}, expected 400: a control character must be rejected before any lookup\`);
+  }
+}
+
+export async function check_dedupe_then_cap(ctx) {
+  const counts: Record<string, number> = {'Café Noir': 200, 'cafe noir': 199, 'CAFÉ NOIR': 198};
+  const numbered = Array.from({length: 12}, (_, i) => \`cafe \${String(i + 1).padStart(2, '0')}\`);
+  numbered.forEach((term, i) => (counts[term] = 149 - i));
+  seed(ctx, 'acme', counts);
+  const r = await ask(api(ctx), 'caf');
+  assert.equal(r.status, 200, \`prefix caf answered \${r.status}: \${r.text}\`);
+  const want = ['Café Noir', ...numbered.slice(0, 9)];
+  assert.deepStrictEqual(r.json().suggestions, want, \`prefix caf answered \${JSON.stringify(r.json().suggestions)}, expected \${JSON.stringify(want)}: spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe\`);
+}
+`,
+    go: `package main
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+type acBody struct {
+	Prefix      string   \`json:"prefix"\`
+	Suggestions []string \`json:"suggestions"\`
+}
+
+func acSeed(ctx *harness.Ctx, tenant string, counts map[string]int) {
+	for term, n := range counts {
+		ctx.Redis.Do("ZADD", "suggest:terms:"+tenant, n, term)
+	}
+}
+
+func acAPI(ctx *harness.Ctx) *harness.HTTP {
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func acAsk(c *harness.HTTP, prefix string) *harness.Response {
+	return c.Get("/v1/autocomplete?prefix="+url.QueryEscape(prefix), "X-Tenant-Id", "acme")
+}
+
+func acDecode(r *harness.Response) acBody {
+	var body acBody
+	r.Decode(&body)
+	return body
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	acSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "keyboard": 30, "lamp": 20})
+	acSeed(ctx, "globex", map[string]int{"kebab": 90})
+	c := acAPI(ctx)
+	r := acAsk(c, "ke")
+	ctx.Equal(r.Status, 200, "GET /v1/autocomplete?prefix=ke (%s)", r.Text())
+	body := acDecode(r)
+	ctx.Equal(body.Prefix, "ke", "the answered prefix")
+	ctx.Equal(body.Suggestions, []string{"kettle", "kettlebell", "keyboard"}, "acme's completions for ke (globex's kebab is not acme's)")
+	r = c.Get("/v1/autocomplete?prefix=ke")
+	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
+}
+
+func CheckFoldPrefix(ctx *harness.Ctx) {
+	acSeed(ctx, "acme", map[string]int{"Crème brûlée": 60, "creme fraiche": 50, "cream": 40, "crepe": 30})
+	c := acAPI(ctx)
+	for _, raw := range []string{"CRÈME", "crème", "Creme", "  crème  "} {
+		r := acAsk(c, raw)
+		ctx.Equal(r.Status, 200, "prefix %q (%s)", raw, r.Text())
+		body := acDecode(r)
+		ctx.Equal(body.Prefix, "creme", "prefix %q must be answered as the folded prefix", raw)
+		ctx.Equal(body.Suggestions, []string{"Crème brûlée", "creme fraiche"}, "prefix %q: the store folds every term, so the prefix must be folded the same way (terms.Fold); the suggestions", raw)
+	}
+	body := acDecode(acAsk(c, "crème   BR"))
+	ctx.Assert(body.Prefix == "creme br" && fmt.Sprint(body.Suggestions) == "[Crème brûlée]", "prefix \\"crème   BR\\" gave %q %q, expected \\"creme br\\" and Crème brûlée", body.Prefix, body.Suggestions)
+}
+
+func CheckBoundedPrefix(ctx *harness.Ctx) {
+	acSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "lamp": 20})
+	c := acAPI(ctx)
+	for _, raw := range []string{"", "   ", strings.Repeat("k", 65)} {
+		r := acAsk(c, raw)
+		ctx.Equal(r.Status, 400, "prefix %q (%d characters) must be 400: an empty prefix walks the tenant's whole index", raw, len(raw))
+	}
+	ctx.Equal(acAsk(c, strings.Repeat("k", 64)).Status, 200, "a 64-character prefix")
+	for _, raw := range []string{"ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp"} {
+		ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character)", raw)
+	}
+}
+
+func CheckDedupeThenCap(ctx *harness.Ctx) {
+	counts := map[string]int{"Café Noir": 200, "cafe noir": 199, "CAFÉ NOIR": 198}
+	want := []string{"Café Noir"}
+	for n := 1; n <= 12; n++ {
+		term := fmt.Sprintf("cafe %02d", n)
+		counts[term] = 150 - n
+		if n <= 9 {
+			want = append(want, term)
+		}
+	}
+	acSeed(ctx, "acme", counts)
+	r := acAsk(acAPI(ctx), "caf")
+	ctx.Equal(r.Status, 200, "prefix caf (%s)", r.Text())
+	ctx.Equal(acDecode(r).Suggestions, want, "spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe; prefix caf")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <cctype>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+void acSeed(harness::Ctx& ctx, const std::string& tenant, const std::map<std::string, int>& counts) {
+  for (const auto& [term, n] : counts) ctx.Redis.Must({"ZADD", "suggest:terms:" + tenant, std::to_string(n), term});
+}
+
+harness::HTTP acAPI(harness::Ctx& ctx) {
+  static httplib::Server* svr = nullptr;
+  delete svr;
+  svr = new httplib::Server;
+  register_routes(*svr);
+  return ctx.HTTP(*svr);
+}
+
+std::string acEscape(const std::string& text) {
+  std::string out;
+  char hex[4];
+  for (const unsigned char c : text) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+    } else {
+      std::snprintf(hex, sizeof hex, "%%%02X", c);
+      out += hex;
+    }
+  }
+  return out;
+}
+
+harness::Response acAsk(harness::HTTP& c, const std::string& prefix) {
+  return c.Get("/v1/autocomplete?prefix=" + acEscape(prefix), "X-Tenant-Id", "acme");
+}
+
+nlohmann::json acBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+std::vector<std::string> acSuggestions(const harness::Response& r) {
+  const auto body = acBody(r);
+  return body.is_object() && body.contains("suggestions") ? body["suggestions"].get<std::vector<std::string>>() : std::vector<std::string>{};
+}
+
+std::string acPrefix(const harness::Response& r) {
+  const auto body = acBody(r);
+  return body.is_object() ? body.value("prefix", "") : "";
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  acSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"keyboard", 30}, {"lamp", 20}});
+  acSeed(ctx, "globex", {{"kebab", 90}});
+  auto c = acAPI(ctx);
+  const auto r = acAsk(c, "ke");
+  ctx.Equal(r.Status, 200, "GET /v1/autocomplete?prefix=ke (%s)", r.Text());
+  ctx.Equal(acPrefix(r), "ke", "the answered prefix");
+  ctx.Equal(acSuggestions(r), {"kettle", "kettlebell", "keyboard"}, "acme's completions for ke (globex's kebab is not acme's)");
+  ctx.Equal(c.Get("/v1/autocomplete?prefix=ke").Status, 401, "a request without X-Tenant-Id");
+}
+
+void CheckFoldPrefix(harness::Ctx& ctx) {
+  acSeed(ctx, "acme", {{"Crème brûlée", 60}, {"creme fraiche", 50}, {"cream", 40}, {"crepe", 30}});
+  auto c = acAPI(ctx);
+  for (const std::string raw : {"CRÈME", "crème", "Creme", "  crème  "}) {
+    const auto r = acAsk(c, raw);
+    ctx.Equal(r.Status, 200, "prefix %q (%s)", raw, r.Text());
+    ctx.Equal(acPrefix(r), "creme", "prefix %q must be answered as the folded prefix", raw);
+    ctx.Equal(acSuggestions(r), {"Crème brûlée", "creme fraiche"}, "prefix %q: the store folds every term, so the prefix must be folded the same way (terms::fold); the suggestions", raw);
+  }
+  const auto r = acAsk(c, "crème   BR");
+  ctx.Assert(acPrefix(r) == "creme br" && acSuggestions(r) == std::vector<std::string>{"Crème brûlée"}, "prefix \\"crème   BR\\" gave %s, expected \\"creme br\\" and Crème brûlée", r.Text());
+}
+
+void CheckBoundedPrefix(harness::Ctx& ctx) {
+  acSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"lamp", 20}});
+  auto c = acAPI(ctx);
+  for (const std::string raw : {std::string(), std::string("   "), std::string(65, 'k')}) {
+    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q (%d characters) must be 400: an empty prefix walks the tenant's whole index", raw, raw.size());
+  }
+  ctx.Equal(acAsk(c, std::string(64, 'k')).Status, 200, "a 64-character prefix");
+  for (const std::string raw : {std::string("ke\\0", 3), std::string("ke\\x1b[2J"), std::string("ke\\x7f"), std::string("ke\\nlamp")}) {
+    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character)", raw);
+  }
+}
+
+void CheckDedupeThenCap(harness::Ctx& ctx) {
+  std::map<std::string, int> counts = {{"Café Noir", 200}, {"cafe noir", 199}, {"CAFÉ NOIR", 198}};
+  std::vector<std::string> want = {"Café Noir"};
+  char term[16];
+  for (int n = 1; n <= 12; ++n) {
+    std::snprintf(term, sizeof term, "cafe %02d", n);
+    counts[term] = 150 - n;
+    if (n <= 9) want.push_back(term);
+  }
+  acSeed(ctx, "acme", counts);
+  auto c = acAPI(ctx);
+  const auto r = acAsk(c, "caf");
+  ctx.Equal(r.Status, 200, "prefix caf (%s)", r.Text());
+  ctx.Equal(acSuggestions(r), want, "spellings that fold alike are one suggestion (the first is kept), and the cap of 10 applies after the dedupe; prefix caf");
+}
+`,
+  },
   hints: [
-    'Send prefix= with nothing after it, or type "Café": the first returns the whole index, the second lists the same term twice.',
-    'The handler passes the raw prefix straight to the index: no length check, no control-character check, and lower() leaves accents in place.',
-    'Fold case and accents (NFKD, strip combining marks), reject control characters, enforce 1..64 on the folded string, dedupe by the folded term, then slice to 10.',
+    "Type `CRÈME` into the box: the dropdown stays empty while `creme fraiche` is in the store. Type `caf`: `Café Noir` shows three times. Clear the box: the tenant's top terms come back anyway.",
+    'The store compares the folded form of every term with the prefix it is given, and lowercasing keeps the accent. Nothing measures the prefix or looks at its bytes, and the slice to ten runs before any duplicate is dropped.',
+    'Answer 400 when the raw prefix has a character below U+0020 or U+007F; fold it with `terms.fold`; 400 unless it is 1 to 64 characters; walk `matching`, skip a term whose `fold` was seen, stop at ten.',
   ],
-  debrief: `The fix is an ordering: normalize, reject, bound, look up, dedupe, cap. Normalizing first means the length limit and the dedupe key both see the same string the cache and the index will see, so an oversized raw prefix that folds to 64 characters still passes and a 65-character folded one does not. Rejecting control characters before the lookup keeps them out of every cache key and log line downstream. The cap is applied after dedupe because truncating the raw list first lets two spellings of one term crowd out a ninth and tenth suggestion. Production typeaheads go further: the ranking stays server-side and stable between keystrokes, the folding table is shared with the indexer so both sides agree on what one term is, and the length bound is enforced in the client too so the request is not sent at all.`,
+  debrief: `Folding once, at the boundary, is what makes every later key agree: the cache of step 2, the suggester of step 3 and the prefix hash of step 4 all see one string for \`Crème\`, \`creme\` and \`CREME\`. The bound and the control-character check run on the request before any store work, so an empty prefix cannot turn a keystroke into a scan of the tenant's index and an escape sequence cannot reach a key or a log line. Dedupe before the cap is an ordering rule: cap first and duplicates spend the slots. Production typeaheads fold with full Unicode normalization and locale-aware case folding (Turkish dotless i, German ß), and debounce keystrokes in the client so the server sees one request per pause.`,
 };

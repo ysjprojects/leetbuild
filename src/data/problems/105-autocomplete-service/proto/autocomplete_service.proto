@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package suggestd;
+
+// The ranking suggester step 3 asks for a tenant's completions: the top terms for a folded prefix.
+// In this course it is a stand-in served by the harness at suggester:9000; during a deploy it is
+// slow or UNAVAILABLE.
+service Suggester {
+  rpc Suggest(SuggestRequest) returns (SuggestReply);
+}
+
+message SuggestRequest {
+  string tenant = 1;
+  string prefix = 2;
+  int32 limit = 3;
+}
+
+message SuggestReply {
+  repeated string terms = 1;
+  string model_version = 2;
+}

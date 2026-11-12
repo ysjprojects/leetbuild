@@ -2,367 +2,335 @@ import type {Step} from '@/lib/types';
 
 export const dependencyStep: Step = {
   id: 'dependency',
-  title: 'Health checks before traffic, not after',
+  title: 'Health probes with a deadline and a shared verdict',
   concept: 'grpc',
-  file: 'client',
+  file: 'probe',
   focus: ['discovery', 'instances', 'redis'],
   task: `## Task
 
-**Starting point.** The starter serves \`GET /v1/routable/{service}\`, the read every router makes
-before it picks a backend: it calls \`registry.candidates(service)\` and returns the list as
-\`instances\`. Its only health signal is \`note_complaint\`, a log line written after a client
-reports a failed request. It serves the demo, which never kills a process, and hides five flaws.
+**Starting point.** The starter is the probe round every discovery replica runs before it answers a
+read: \`probe_service(service)\` walks \`instances.members(service)\`, calls \`Health/Check\` on each
+live instance at \`{address}:{port}\`, stores the verdict under \`sd:probe:{service}:{instance_id}\`,
+removes an instance whose probe fails from the registry and returns \`{instance_id: verdict}\`. With
+every instance healthy it answers the demo, and it hides four flaws.
 
-**Failure mode the checks target.** A backend that crashed a second ago stays in the routing set
-for a full heartbeat interval while users see 503s from it. Nothing probes an instance before
-returning it, so a hung process holds a request for as long as the client waits. Each router would
-have to form its own opinion, so two routers can disagree about one backend. A failing instance is
-either routed to or silently dropped, with no recorded reason, and a recovered one needs an operator
-to come back.
+**Failure mode the checks target.** A hung instance holds the round for as long as it hangs and is
+then called healthy; an instance that answers \`NOT_SERVING\` while it drains is routed to; every
+router probes every instance on every round; and one failed probe deregisters an instance that is
+back a second later, so it never returns.
 
-- Candidates come from the registry (\`sd:{service}:*\`). Each candidate is probed over gRPC before
-  it is returned: the \`Health/Check\` RPC with a **200 ms** deadline (\`PROBE_DEADLINE_MS\`).
-- Probe verdicts are shared: cache \`SERVING\` / \`NOT_SERVING\` in Redis under
-  \`sd:probe:{service}:{instance_id}\` with a 5-second TTL (\`PROBE_TTL_S\`), and read the cache
-  before probing.
-- A candidate that fails its probe is excluded and stays registered: write \`instance_id → {"reason"}\`
-  into the hash \`sd:excluded:{service}\`.
-- A passing probe readmits the instance: \`hdel\` the exclusion and write the fresh \`SERVING\` verdict.
-- Answer \`{"instances": […], "excluded": [{"instance_id", "address", "reason"}]}\`; only \`SERVING\`
-  instances appear in \`instances\`, with \`instance_id\`, \`address\`, \`port\` and \`metadata_version\`.`,
+\`\`\`proto
+service Health { rpc Check(HealthCheckRequest) returns (HealthCheckResponse); }  // status: SERVING, NOT_SERVING
+\`\`\`
+
+- Every \`Check\` carries a **200 ms** deadline (\`PROBE_DEADLINE_S = 0.2\`); an error of any code is
+  \`NOT_SERVING\`.
+- An instance is \`SERVING\` only when the reply's \`status\` is \`SERVING\`.
+- Read the shared verdict first and probe only when it is absent; write it with a
+  \`PROBE_TTL_S = 5\` second TTL.
+- A failing instance stays registered: its verdict excludes it, and a passing probe after the TTL
+  readmits it.`,
   sequence: {
-    participants: ['Router', 'Discovery client', 'Redis', 'Instance'],
+    participants: ['Probe round', 'Redis', 'Instance'],
     messages: [
-      {from: 'Router', to: 'Discovery client', label: 'GET /v1/routable/checkout', kind: 'sync'},
+      {from: 'Probe round', to: 'Redis', label: 'SMEMBERS sd:members:checkout · HGETALL each record', kind: 'sync'},
+      {from: 'Probe round', to: 'Redis', label: 'GET sd:probe:checkout:checkout-3', kind: 'sync'},
+      {from: 'Redis', to: 'Probe round', label: 'nil: no verdict in the last 5 s', kind: 'reply'},
+      {from: 'Probe round', to: 'Instance', label: 'Health/Check · deadline 200 ms', kind: 'sync'},
       {
-        from: 'Discovery client',
-        to: 'Redis',
-        label: 'GET sd:probe:checkout:checkout-3 (shared verdict)',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Discovery client', label: 'nil — verdict is stale or never taken', kind: 'reply'},
-      {from: 'Discovery client', to: 'Instance', label: 'Health/Check · deadline 200 ms', kind: 'sync'},
-      {from: 'Instance', to: 'Discovery client', label: 'SERVING · UNAVAILABLE · DEADLINE_EXCEEDED', kind: 'reply'},
-      {
-        from: 'Discovery client',
-        to: 'Redis',
-        label: 'SET sd:probe:checkout:checkout-3 SERVING EX 5 · HSET sd:excluded:checkout on failure',
-        kind: 'sync',
-      },
-      {from: 'Redis', to: 'Discovery client', label: 'OK', kind: 'reply'},
-      {
-        from: 'Discovery client',
-        to: 'Router',
-        label: '200 {instances: [probed SERVING], excluded: [{reason: "probe failed"}]}',
+        from: 'Instance',
+        to: 'Probe round',
+        label: 'SERVING · NOT_SERVING · DEADLINE_EXCEEDED · UNAVAILABLE',
         kind: 'reply',
       },
+      {from: 'Probe round', to: 'Redis', label: 'SET sd:probe:checkout:checkout-3 verdict EX 5', kind: 'sync'},
     ],
   },
   checks: [
     {
       id: 'probe-deadline',
-      title: 'The probe carries a 200 ms deadline',
+      title: 'Every probe carries a 200 ms deadline',
       detail:
-        'The gRPC `Health/Check` is issued with a **200 ms** deadline (`timeout`, `withDeadlineAfter`, `context.WithTimeout`, `set_deadline`). The starter issues no probe at all, so a hung instance holds routing decisions for as long as the client waits.',
+        'The `Check` call is made with `PROBE_DEADLINE_S` (0.2 s; `PROBE_DEADLINE_MS`, `probeDeadline`, `ProbeDeadlineMs`, `kProbeDeadline`), so a hung instance is `NOT_SERVING` after 200 ms. The starter waits as long as the instance hangs and then calls it healthy.',
       match: {
-        python: {all: [/PROBE_DEADLINE_MS/, /timeout=/, /200/]},
-        typescript: {all: [/PROBE_DEADLINE_MS/, /deadline/, /200/]},
-        go: {all: [/probeDeadlineMs/, /context\.WithTimeout/, /200/]},
-        scala: {all: [/ProbeDeadlineMs/, /withDeadlineAfter|deadline/, /200/]},
-        cpp: {all: [/kProbeDeadlineMs/, /deadline/, /200/]},
+        python: {all: [/PROBE_DEADLINE_S\s*=\s*0\.2\b/, /\.Check\([\s\S]{0,200}?timeout\s*=\s*PROBE_DEADLINE_S/]},
+        typescript: {all: [/PROBE_DEADLINE_MS\s*=\s*200\b/, /deadline:\s*Date\.now\(\)\s*\+\s*PROBE_DEADLINE_MS/]},
+        go: {all: [/probeDeadline\s*=\s*200\s*\*\s*time\.Millisecond/, /context\.WithTimeout\([^\n]*probeDeadline\)/]},
+        scala: {all: [/ProbeDeadlineMs\s*=\s*200L?\b/, /withDeadlineAfter\(\s*ProbeDeadlineMs/]},
+        cpp: {all: [/kProbeDeadline\{200\}/, /set_deadline\([^\n]*kProbeDeadline\)/]},
       },
     },
     {
-      id: 'probe-before-return',
-      title: 'Instances are probed before they are returned',
+      id: 'serving-status',
+      title: 'SERVING only when the instance says so',
       detail:
-        'The candidate loop consults the shared probe state (`sd:probe:`) and splits the result into `instances` and `excluded`. The starter returns what the registry holds, so failures are discovered by the caller.',
+        'The verdict reads the reply: `status` equal to `SERVING` is `SERVING`, a reply of `NOT_SERVING` and any error are `NOT_SERVING`. The starter calls every reply healthy, including a draining instance that says it is not.',
       match: {
-        python: {all: [/sd:probe:/, /for instance in/, /excluded/]},
-        typescript: {all: [/sd:probe:/, /for \(const instance/, /excluded/]},
-        go: {all: [/probeKey|sd:probe:/, /for _, instance/, /excluded/]},
-        scala: {all: [/sd:probe:/, /\.foreach|for \(/, /excluded/]},
-        cpp: {all: [/kProbeKey|sd:probe:/, /for \(const auto&/, /excluded/]},
+        python: {all: [/HealthCheckResponse\.SERVING/]},
+        typescript: {all: [/\.status\s*===\s*['"]SERVING['"]/]},
+        go: {all: [/HealthCheckResponse_SERVING/]},
+        scala: {all: [/ServingStatus\.SERVING/]},
+        cpp: {all: [/HealthCheckResponse::SERVING/]},
       },
     },
     {
       id: 'shared-verdict',
-      title: 'Probe verdicts are cached and shared',
+      title: 'The verdict is read before probing and expires after 5 s',
       detail:
-        'The verdict is written to Redis under `sd:probe:{service}:{instance_id}` with a short TTL, so every caller reads one observation instead of probing per request — and no caller invents its own answer.',
+        'The round reads `sd:probe:{service}:{instance_id}` first and probes only on a miss, then writes the verdict with a `PROBE_TTL_S` expiry, so all routers share one call per instance per 5 s. The starter probes on every round and stores a verdict that never expires.',
       match: {
-        python: {all: [/sd:probe:/, /ex=/, /PROBE_TTL_S/], none: [/random\./]},
-        typescript: {all: [/sd:probe:/, /'EX'/, /PROBE_TTL_S/], none: [/Math\.random/]},
-        go: {all: [/probeKey/, /time\.Second/, /probeTtl/], none: [/rand\./]},
-        scala: {all: [/sd:probe:/, /ex\(/, /ProbeTtl/]},
-        cpp: {all: [/sd:probe:/, /std::chrono::seconds/, /kProbeTtlSeconds/]},
+        python: {all: [/r\.get\(|instances\.verdict\(/, /ex\s*=\s*PROBE_TTL_S/]},
+        typescript: {all: [/redis\.get\(|instances\.verdict\(/, /['"]EX['"]\s*,\s*PROBE_TTL_S/]},
+        go: {all: [/rdb\.Get\(|instances\.Verdict\(/, /rdb\.Set\([^\n]*probeTTL\)/]},
+        scala: {all: [/jedis\.get\(|Instances\.verdict\(/, /\.ex\(\s*ProbeTtlS/]},
+        cpp: {all: [/redis\.get\(|instances::verdict\(/, /redis\.set\([^\n]*kProbeTtl\)/]},
       },
     },
     {
-      id: 'excluded-stays-registered',
+      id: 'keep-registered',
       title: 'A failing instance is excluded, not deregistered',
       detail:
-        'A failed probe writes the instance into `sd:excluded:{service}` with a `reason` and leaves the registry entry alone, so the instance can be probed again. The starter never records why routing skipped a backend.',
+        'A failed probe writes a `NOT_SERVING` verdict and leaves the record and the members set alone, so the next round after the TTL can readmit it. The starter deletes the record and the member, and a recovered instance never comes back.',
       match: {
-        python: {all: [/sd:excluded:/, /reason/, /SERVING/]},
-        typescript: {all: [/sd:excluded:/, /reason/, /SERVING/]},
-        go: {all: [/sd:excluded:/, /reason/, /SERVING/]},
-        scala: {all: [/sd:excluded:/, /reason/, /SERVING/]},
-        cpp: {all: [/sd:excluded:/, /reason/, /SERVING/]},
-      },
-    },
-    {
-      id: 'recovery-readmit',
-      title: 'A passing probe readmits the instance',
-      detail:
-        'A `SERVING` verdict removes the exclusion (`HDEL`) and writes the fresh verdict, so a recovered instance returns to routing without an operator. The starter only re-probes after a client complains.',
-      match: {
-        python: {all: [/hdel/, /sd:excluded:/, /SERVING/]},
-        typescript: {all: [/hdel/, /sd:excluded:/, /SERVING/]},
-        go: {all: [/HDel/, /sd:excluded:/, /SERVING/]},
-        scala: {all: [/hdel/, /sd:excluded:/, /SERVING/]},
-        cpp: {all: [/hdel/, /sd:excluded:/, /SERVING/]},
+        python: {all: [/instances\.members\(/], none: [/\.delete\(/, /\.srem\(/]},
+        typescript: {all: [/instances\.members\(/], none: [/redis\.del\(/, /redis\.srem\(/]},
+        go: {all: [/instances\.Members\(/], none: [/rdb\.Del\(/, /rdb\.SRem\(/]},
+        scala: {all: [/Instances\.members\(/], none: [/jedis\.del\(/, /jedis\.srem\(/]},
+        cpp: {all: [/instances::members\(/], none: [/redis\.del\(/, /redis\.srem\(/]},
       },
     },
   ],
   code: {
     python: {
-      starter: `import json
-import logging
-
+      starter: `import grpc
 import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
-app = FastAPI()
-logger = logging.getLogger("discovery")
+import service_discovery_pb2 as pb
+import service_discovery_pb2_grpc as pb_grpc
+from discovery import instances  # members, lookup, record_key, members_key, verdict_key
+
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-
-class Registry:
-    def candidates(self, service: str) -> list[dict]:
-        """Every instance key the registry still holds for this service."""
-        raise NotImplementedError
+_stubs: dict[str, pb_grpc.HealthStub] = {}
 
 
-registry = Registry()
+def _stub(target: str) -> pb_grpc.HealthStub:
+    if target not in _stubs:
+        _stubs[target] = pb_grpc.HealthStub(grpc.insecure_channel(target))
+    return _stubs[target]
 
 
-@app.get("/v1/routable/{service}")
-def routable(service: str) -> JSONResponse:
-    # TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    instances = registry.candidates(service)
-    logger.info("routable service=%s instances=%d", service, len(instances))
-    return JSONResponse({"service": service, "instances": instances}, status_code=200)
-
-
-def note_complaint(service: str, instance_id: str) -> None:
-    """The starter's only health signal: a client told us a request failed."""
-    logger.warning("complaint service=%s instance=%s", service, instance_id)
-`,
-      solution: `import json
-import logging
-
-import grpc
-import health_pb2
-import health_pb2_grpc
-import redis
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-logger = logging.getLogger("discovery")
-r = redis.Redis(host="redis", port=6379, decode_responses=True)
-
-PROBE_DEADLINE_MS = 200
-PROBE_TTL_S = 5
-SERVING = "SERVING"
-NOT_SERVING = "NOT_SERVING"
-
-
-class Registry:
-    def candidates(self, service: str) -> list[dict]:
-        """Every instance the registry still holds for this service."""
-        raise NotImplementedError
-
-
-registry = Registry()
-
-
-def health_check(instance: dict) -> bool:
-    """One Health/Check with a hard deadline: a hung process fails instead of delaying routing."""
-    target = f"{instance['address']}:{instance['port']}"
+def check_health(service: str, instance: dict) -> str:
+    """Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING."""
     try:
-        with grpc.insecure_channel(target) as channel:
-            stub = health_pb2_grpc.HealthStub(channel)
-            reply = stub.Check(health_pb2.HealthCheckRequest(service=""), timeout=PROBE_DEADLINE_MS / 1000)
-            return reply.status == health_pb2.HealthCheckResponse.SERVING
+        _stub(f"{instance['address']}:{instance['port']}").Check(pb.HealthCheckRequest(service=service))
     except grpc.RpcError:
-        return False
+        return "NOT_SERVING"
+    return "SERVING"
 
 
-def probe_key(service: str, instance_id: str) -> str:
-    return f"sd:probe:{service}:{instance_id}"
+def probe_service(service: str) -> dict[str, str]:
+    """The verdict for every live member of service."""
+    # TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    verdicts = {}
+    for instance_id in instances.members(service):
+        instance = instances.lookup(service, instance_id)
+        if instance is None:
+            continue
+        verdict = check_health(service, instance)
+        r.set(instances.verdict_key(service, instance_id), verdict)
+        if verdict != "SERVING":
+            r.delete(instances.record_key(service, instance_id))
+            r.srem(instances.members_key(service), instance_id)
+        verdicts[instance_id] = verdict
+    return verdicts
+`,
+      solution: `import grpc
+import redis
+
+import service_discovery_pb2 as pb
+import service_discovery_pb2_grpc as pb_grpc
+from discovery import instances  # members, lookup, record_key, members_key, verdict_key
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+PROBE_DEADLINE_S = 0.2
+PROBE_TTL_S = 5
+
+_stubs: dict[str, pb_grpc.HealthStub] = {}
 
 
-def excluded_key(service: str) -> str:
-    return f"sd:excluded:{service}"
+def _stub(target: str) -> pb_grpc.HealthStub:
+    if target not in _stubs:
+        _stubs[target] = pb_grpc.HealthStub(grpc.insecure_channel(target))
+    return _stubs[target]
 
 
-def probe_and_share(service: str, instance: dict) -> str:
-    """Probe once and share the verdict: every router reads the same observation for 5 seconds."""
-    healthy = health_check(instance)
-    verdict = SERVING if healthy else NOT_SERVING
-    r.set(probe_key(service, instance["instance_id"]), verdict, ex=PROBE_TTL_S)
-    if healthy:
-        r.hdel(excluded_key(service), instance["instance_id"])
-    else:
-        r.hset(excluded_key(service), instance["instance_id"], json.dumps({"reason": "probe failed"}))
-        logger.warning("excluded service=%s instance=%s", service, instance["instance_id"])
-    return verdict
+def check_health(service: str, instance: dict) -> str:
+    """Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING."""
+    try:
+        reply = _stub(f"{instance['address']}:{instance['port']}").Check(
+            pb.HealthCheckRequest(service=service), timeout=PROBE_DEADLINE_S
+        )
+    except grpc.RpcError:
+        return "NOT_SERVING"  # DEADLINE_EXCEEDED, UNAVAILABLE: a hung or stopped process
+    # Alive is not ready: a draining instance answers, and answers NOT_SERVING.
+    return "SERVING" if reply.status == pb.HealthCheckResponse.SERVING else "NOT_SERVING"
 
 
-@app.get("/v1/routable/{service}")
-def routable(service: str) -> JSONResponse:
-    instances = []
-    excluded = []
-    for instance in registry.candidates(service):
-        instance_id = instance["instance_id"]
-        verdict = r.get(probe_key(service, instance_id))
+def probe_service(service: str) -> dict[str, str]:
+    """The verdict for every live member of service."""
+    verdicts = {}
+    for instance_id in instances.members(service):
+        instance = instances.lookup(service, instance_id)
+        if instance is None:
+            continue  # lapsed: the expiry sweep announces it, there is nobody to ask
+        key = instances.verdict_key(service, instance_id)
+        verdict = r.get(key)
         if verdict is None:
-            verdict = probe_and_share(service, instance)
-        if verdict == SERVING:
-            instances.append({field: instance[field] for field in ("instance_id", "address", "port", "metadata_version")})
-        else:
-            excluded.append({"instance_id": instance_id, "address": instance["address"], "reason": "probe failed"})
-    return JSONResponse({"service": service, "instances": instances, "excluded": excluded}, status_code=200)
+            # One probe per instance per PROBE_TTL_S for every router; the TTL is also the retry.
+            verdict = check_health(service, instance)
+            r.set(key, verdict, ex=PROBE_TTL_S)
+        verdicts[instance_id] = verdict
+    return verdicts
 `,
     },
     typescript: {
-      starter: `/** GET /v1/routable/{service}: flawed code that trusts the registry. */
-import Fastify from 'fastify';
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
 import Redis from 'ioredis';
 
-export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
+import * as instances from 'discovery/instances'; // members, lookup, recordKey, membersKey, verdictKey
 
-export const registry = {
-  /** Every instance the registry still holds for this service. */
-  candidates(service: string): Promise<InstanceRecord[]> {
-    throw new Error('not implemented');
-  },
-};
-
-interface InstanceRecord {
-  instance_id: string;
-  address: string;
-  port: number;
-  metadata_version: number;
+interface HealthReply {
+  status: string;
 }
 
-app.get('/v1/routable/:service', async (request, reply) => {
-  // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-  const {service} = request.params as {service: string};
-  const instances = await registry.candidates(service);
-  request.log.info({service, instances: instances.length}, 'routable');
-  return reply.code(200).send({service, instances});
-});
-
-export function noteComplaint(service: string, instanceId: string): void {
-  app.log.warn({service, instance_id: instanceId}, 'complaint');
-}
-
-void app.listen({port: 8443, host: '0.0.0.0'});
-`,
-      solution: `/** GET /v1/routable/{service}: probed, cached, explainable routing sets. */
-import * as grpc from '@grpc/grpc-js';
-
-import Fastify from 'fastify';
-import Redis from 'ioredis';
-
-export const app = Fastify();
-export const redis = new Redis({host: 'redis', port: 6379});
-
-export const registry = {
-  /** Every instance the registry still holds for this service. */
-  candidates(service: string): Promise<InstanceRecord[]> {
-    throw new Error('not implemented');
-  },
-};
-
-interface InstanceRecord {
-  instance_id: string;
-  address: string;
-  port: number;
-  metadata_version: number;
-}
-
-interface HealthClient {
+interface HealthClient extends grpc.Client {
   Check(
     request: {service: string},
     metadata: grpc.Metadata,
-    options: {deadline: number},
-    callback: (error: grpc.ServiceError | null, reply?: {status: string}) => void,
+    options: grpc.CallOptions,
+    callback: (err: grpc.ServiceError | null, reply?: HealthReply) => void,
   ): void;
 }
 
-const PROBE_DEADLINE_MS = 200;
-const PROBE_TTL_S = 5;
-const SERVING = 'SERVING';
-const NOT_SERVING = 'NOT_SERVING';
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('service_discovery.proto', {enums: String})) as unknown as {
+  discoveryd: {Health: grpc.ServiceClientConstructor};
+};
+const redis = new Redis({host: 'redis', port: 6379});
+const stubs = new Map<string, HealthClient>();
 
-const probeKey = (service: string, instanceId: string): string => \`sd:probe:\${service}:\${instanceId}\`;
-const excludedKey = (service: string): string => \`sd:excluded:\${service}\`;
-
-function healthCheck(instance: InstanceRecord, stubFactory: (target: string) => HealthClient): Promise<boolean> {
-  const {promise, resolve} = Promise.withResolvers<boolean>();
-  const client = stubFactory(\`\${instance.address}:\${instance.port}\`);
-  client.Check(
-    {service: ''},
-    new grpc.Metadata(),
-    {deadline: Date.now() + PROBE_DEADLINE_MS},
-    (error, reply) => resolve(error === null && reply !== undefined && reply.status === SERVING),
-  );
-  return promise;
-}
-
-/** Probe once and share the verdict: every router reads the same observation for 5 seconds. */
-async function probeAndShare(
-  service: string,
-  instance: InstanceRecord,
-  stubFactory: (target: string) => HealthClient,
-): Promise<string> {
-  const healthy = await healthCheck(instance, stubFactory);
-  const verdict = healthy ? SERVING : NOT_SERVING;
-  await redis.set(probeKey(service, instance.instance_id), verdict, 'EX', PROBE_TTL_S);
-  if (healthy) {
-    await redis.hdel(excludedKey(service), instance.instance_id);
-  } else {
-    await redis.hset(excludedKey(service), instance.instance_id, JSON.stringify({reason: 'probe failed'}));
-    app.log.warn({service, instance_id: instance.instance_id}, 'excluded');
+function stub(target: string): HealthClient {
+  let client = stubs.get(target);
+  if (client === undefined) {
+    client = new pkg.discoveryd.Health(target, grpc.credentials.createInsecure()) as HealthClient;
+    stubs.set(target, client);
   }
-  return verdict;
+  return client;
 }
 
-app.get('/v1/routable/:service', async (request, reply) => {
-  const {service} = request.params as {service: string};
-  const instances: InstanceRecord[] = [];
-  const excluded: {instance_id: string; address: string; reason: string}[] = [];
-  for (const instance of await registry.candidates(service)) {
-    let verdict = await redis.get(probeKey(service, instance.instance_id));
-    if (verdict === null) verdict = await probeAndShare(service, instance, () => {
-      throw new Error('no health stub configured');
-    });
-    if (verdict === SERVING) {
-      instances.push(instance);
-    } else {
-      excluded.push({instance_id: instance.instance_id, address: instance.address, reason: 'probe failed'});
+/** Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING. */
+export async function checkHealth(service: string, instance: instances.Instance): Promise<string> {
+  const client = stub(\`\${instance.address}:\${instance.port}\`);
+  try {
+    await new Promise<HealthReply | undefined>((resolve, reject) =>
+      client.Check({service}, new grpc.Metadata(), {}, (err, reply) => (err ? reject(err) : resolve(reply))),
+    );
+    return 'SERVING';
+  } catch {
+    return 'NOT_SERVING';
+  }
+}
+
+/** The verdict for every live member of service. */
+export async function probeService(service: string): Promise<Record<string, string>> {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  const verdicts: Record<string, string> = {};
+  for (const instanceId of await instances.members(service)) {
+    const instance = await instances.lookup(service, instanceId);
+    if (instance === null) continue;
+    const verdict = await checkHealth(service, instance);
+    await redis.set(instances.verdictKey(service, instanceId), verdict);
+    if (verdict !== 'SERVING') {
+      await redis.del(instances.recordKey(service, instanceId));
+      await redis.srem(instances.membersKey(service), instanceId);
     }
+    verdicts[instanceId] = verdict;
   }
-  return reply.code(200).send({service, instances, excluded});
-});
+  return verdicts;
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
 
-void app.listen({port: 8443, host: '0.0.0.0'});
+import * as instances from 'discovery/instances'; // members, lookup, recordKey, membersKey, verdictKey
+
+export const PROBE_DEADLINE_MS = 200;
+export const PROBE_TTL_S = 5;
+
+interface HealthReply {
+  status: string;
+}
+
+interface HealthClient extends grpc.Client {
+  Check(
+    request: {service: string},
+    metadata: grpc.Metadata,
+    options: grpc.CallOptions,
+    callback: (err: grpc.ServiceError | null, reply?: HealthReply) => void,
+  ): void;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('service_discovery.proto', {enums: String})) as unknown as {
+  discoveryd: {Health: grpc.ServiceClientConstructor};
+};
+const redis = new Redis({host: 'redis', port: 6379});
+const stubs = new Map<string, HealthClient>();
+
+function stub(target: string): HealthClient {
+  let client = stubs.get(target);
+  if (client === undefined) {
+    client = new pkg.discoveryd.Health(target, grpc.credentials.createInsecure()) as HealthClient;
+    stubs.set(target, client);
+  }
+  return client;
+}
+
+/** Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING. */
+export async function checkHealth(service: string, instance: instances.Instance): Promise<string> {
+  const client = stub(\`\${instance.address}:\${instance.port}\`);
+  try {
+    const reply = await new Promise<HealthReply | undefined>((resolve, reject) =>
+      client.Check({service}, new grpc.Metadata(), {deadline: Date.now() + PROBE_DEADLINE_MS}, (err, res) =>
+        err ? reject(err) : resolve(res),
+      ),
+    );
+    // Alive is not ready: a draining instance answers, and answers NOT_SERVING.
+    return reply?.status === 'SERVING' ? 'SERVING' : 'NOT_SERVING';
+  } catch {
+    return 'NOT_SERVING'; // DEADLINE_EXCEEDED, UNAVAILABLE: a hung or stopped process
+  }
+}
+
+/** The verdict for every live member of service. */
+export async function probeService(service: string): Promise<Record<string, string>> {
+  const verdicts: Record<string, string> = {};
+  for (const instanceId of await instances.members(service)) {
+    const instance = await instances.lookup(service, instanceId);
+    if (instance === null) continue; // lapsed: the expiry sweep announces it, there is nobody to ask
+    const key = instances.verdictKey(service, instanceId);
+    let verdict = await redis.get(key);
+    if (verdict === null) {
+      // One probe per instance per PROBE_TTL_S for every router; the TTL is also the retry.
+      verdict = await checkHealth(service, instance);
+      await redis.set(key, verdict, 'EX', PROBE_TTL_S);
+    }
+    verdicts[instanceId] = verdict;
+  }
+  return verdicts;
+}
 `,
     },
     go: {
@@ -370,470 +338,736 @@ void app.listen({port: 8443, host: '0.0.0.0'});
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net/http"
+	"fmt"
 
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"discovery/instances" // instances.Members, Lookup, RecordKey, MembersKey, VerdictKey
+	pb "discovery/gen/service_discovery"
 )
 
-type InstanceRecord struct {
-	InstanceID      string \`json:"instance_id"\`
-	Address         string \`json:"address"\`
-	Port            int    \`json:"port"\`
-	MetadataVersion int    \`json:"metadata_version"\`
-}
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
-type Registry struct{}
+var stubs = map[string]pb.HealthClient{}
 
-func (r *Registry) Candidates(ctx context.Context, service string) ([]InstanceRecord, error) {
-	return nil, nil
-}
-
-var (
-	registry = &Registry{}
-	rdb      = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func routable(rw http.ResponseWriter, r *http.Request) {
-	// TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-	service := r.PathValue("service")
-	instances, err := registry.Candidates(r.Context(), service)
-	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+func stub(target string) (pb.HealthClient, error) {
+	if client, ok := stubs[target]; ok {
+		return client, nil
 	}
-	log.Printf("routable service=%s instances=%d", service, len(instances))
-	writeJSON(rw, http.StatusOK, map[string]any{"service": service, "instances": instances})
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	stubs[target] = pb.NewHealthClient(conn)
+	return stubs[target], nil
 }
 
-func noteComplaint(service, instanceID string) {
-	log.Printf("complaint service=%s instance=%s", service, instanceID)
+// checkHealth asks the instance at address:port whether it can take traffic: "SERVING" or "NOT_SERVING".
+func checkHealth(ctx context.Context, service string, inst *instances.Instance) string {
+	client, err := stub(fmt.Sprintf("%s:%d", inst.Address, inst.Port))
+	if err != nil {
+		return "NOT_SERVING"
+	}
+	if _, err := client.Check(ctx, &pb.HealthCheckRequest{Service: service}); err != nil {
+		return "NOT_SERVING"
+	}
+	return "SERVING"
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/routable/{service}", routable)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+// probeService is the verdict for every live member of service.
+func probeService(ctx context.Context, service string) (map[string]string, error) {
+	// TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+	ids, err := instances.Members(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	verdicts := map[string]string{}
+	for _, id := range ids {
+		inst, err := instances.Lookup(ctx, service, id)
+		if err != nil {
+			return nil, err
+		}
+		if inst == nil {
+			continue
+		}
+		verdict := checkHealth(ctx, service, inst)
+		if err := rdb.Set(ctx, instances.VerdictKey(service, id), verdict, 0).Err(); err != nil {
+			return nil, err
+		}
+		if verdict != "SERVING" {
+			rdb.Del(ctx, instances.RecordKey(service, id))
+			rdb.SRem(ctx, instances.MembersKey(service), id)
+		}
+		verdicts[id] = verdict
+	}
+	return verdicts, nil
 }
 `,
       solution: `package main
 
 import (
 	"context"
-	"encoding/json"
-	"log"
-	"net"
-	"net/http"
-	"strconv"
+	"fmt"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+
+	"discovery/instances" // instances.Members, Lookup, RecordKey, MembersKey, VerdictKey
+	pb "discovery/gen/service_discovery"
 )
 
 const (
-	probeDeadlineMs = 200
-	probeTtlSeconds = 5
-	serving         = "SERVING"
-	notServing      = "NOT_SERVING"
+	probeDeadline = 200 * time.Millisecond
+	probeTTL      = 5 * time.Second
 )
 
-type InstanceRecord struct {
-	InstanceID      string \`json:"instance_id"\`
-	Address         string \`json:"address"\`
-	Port            int    \`json:"port"\`
-	MetadataVersion int    \`json:"metadata_version"\`
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+var stubs = map[string]pb.HealthClient{}
+
+func stub(target string) (pb.HealthClient, error) {
+	if client, ok := stubs[target]; ok {
+		return client, nil
+	}
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	stubs[target] = pb.NewHealthClient(conn)
+	return stubs[target], nil
 }
 
-type Registry struct{}
-
-func (r *Registry) Candidates(ctx context.Context, service string) ([]InstanceRecord, error) {
-	return nil, nil
-}
-
-var (
-	registry = &Registry{}
-	rdb      = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-)
-
-func writeJSON(rw http.ResponseWriter, status int, body any) {
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(status)
-	json.NewEncoder(rw).Encode(body)
-}
-
-func probeKey(service, instanceID string) string { return "sd:probe:" + service + ":" + instanceID }
-
-func excludedKey(service string) string { return "sd:excluded:" + service }
-
-/** healthCheck is one Health/Check with a hard deadline: a hung process fails it. */
-func healthCheck(instance InstanceRecord) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), probeDeadlineMs*time.Millisecond)
+// checkHealth asks the instance at address:port whether it can take traffic: "SERVING" or "NOT_SERVING".
+func checkHealth(ctx context.Context, service string, inst *instances.Instance) string {
+	client, err := stub(fmt.Sprintf("%s:%d", inst.Address, inst.Port))
+	if err != nil {
+		return "NOT_SERVING"
+	}
+	callCtx, cancel := context.WithTimeout(ctx, probeDeadline)
 	defer cancel()
-	target := net.JoinHostPort(instance.Address, strconv.Itoa(instance.Port))
-	conn, err := grpc.DialContext(ctx, target, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-	if err != nil {
-		return false
+	reply, err := client.Check(callCtx, &pb.HealthCheckRequest{Service: service})
+	// DeadlineExceeded, Unavailable: a hung or stopped process. Alive is not ready: a draining
+	// instance answers, and answers NOT_SERVING.
+	if err != nil || reply.GetStatus() != pb.HealthCheckResponse_SERVING {
+		return "NOT_SERVING"
 	}
-	defer conn.Close()
-	reply, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{Service: ""})
-	if err != nil {
-		return false
-	}
-	return reply.GetStatus() == healthpb.HealthCheckResponse_SERVING
+	return "SERVING"
 }
 
-/** probeAndShare probes once and shares the verdict: every router reads one observation for 5 s. */
-func probeAndShare(ctx context.Context, service string, instance InstanceRecord) string {
-	verdict := notServing
-	if healthCheck(instance) {
-		verdict = serving
-	}
-	rdb.Set(ctx, probeKey(service, instance.InstanceID), verdict, time.Duration(probeTtlSeconds)*time.Second)
-	if verdict == serving {
-		rdb.HDel(ctx, excludedKey(service), instance.InstanceID)
-	} else {
-		reason, _ := json.Marshal(map[string]string{"reason": "probe failed"})
-		rdb.HSet(ctx, excludedKey(service), instance.InstanceID, reason)
-		log.Printf("excluded service=%s instance=%s", service, instance.InstanceID)
-	}
-	return verdict
-}
-
-func routable(rw http.ResponseWriter, r *http.Request) {
-	service := r.PathValue("service")
-	candidates, err := registry.Candidates(r.Context(), service)
+// probeService is the verdict for every live member of service.
+func probeService(ctx context.Context, service string) (map[string]string, error) {
+	ids, err := instances.Members(ctx, service)
 	if err != nil {
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "TRY_AGAIN"})
-		return
+		return nil, err
 	}
-	instances := make([]InstanceRecord, 0, len(candidates))
-	excluded := make([]map[string]any, 0)
-	for _, instance := range candidates {
-		verdict, err := rdb.Get(r.Context(), probeKey(service, instance.InstanceID)).Result()
+	verdicts := map[string]string{}
+	for _, id := range ids {
+		inst, err := instances.Lookup(ctx, service, id)
+		if err != nil {
+			return nil, err
+		}
+		if inst == nil {
+			continue // lapsed: the expiry sweep announces it, there is nobody to ask
+		}
+		key := instances.VerdictKey(service, id)
+		verdict, err := rdb.Get(ctx, key).Result()
 		if err == redis.Nil {
-			verdict = probeAndShare(r.Context(), service, instance)
+			// One probe per instance per probeTTL for every router; the TTL is also the retry.
+			verdict = checkHealth(ctx, service, inst)
+			err = rdb.Set(ctx, key, verdict, probeTTL).Err()
 		}
-		if verdict == serving {
-			instances = append(instances, instance)
-		} else {
-			excluded = append(excluded, map[string]any{
-				"instance_id": instance.InstanceID,
-				"address":     instance.Address,
-				"reason":      "probe failed",
-			})
+		if err != nil {
+			return nil, err
 		}
+		verdicts[id] = verdict
 	}
-	writeJSON(rw, http.StatusOK, map[string]any{"service": service, "instances": instances, "excluded": excluded})
-}
-
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/routable/{service}", routable)
-	log.Fatal(http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", mux))
+	return verdicts, nil
 }
 `,
     },
     scala: {
-      starter: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
+      starter: `import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
 
-final case class InstanceRecord(instance_id: String, address: String, port: Int, metadata_version: Int)
+import discovery.Instances // Instances.members, lookup, recordKey, membersKey, verdictKey
+import discoveryd.service_discovery.{HealthCheckRequest, HealthGrpc}
 
-trait Registry {
-  def candidates(service: String): List[InstanceRecord]
-}
+object Probe {
+  val jedis = new JedisPooled("redis", 6379)
 
-object Client {
-  implicit val system: ActorSystem = ActorSystem("discovery")
-  implicit val instanceFormat: RootJsonFormat[InstanceRecord] = jsonFormat4(InstanceRecord)
+  private val stubs = scala.collection.mutable.Map.empty[String, HealthGrpc.HealthBlockingStub]
 
-  val registry: Registry = ???
+  private def stub(target: String): HealthGrpc.HealthBlockingStub =
+    stubs.getOrElseUpdate(target, HealthGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
 
-  val route: Route =
-    path("v1" / "routable" / Segment) { service =>
-      get {
-        // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-        val instances = registry.candidates(service)
-        system.log.info(s"routable service=$service instances=\${instances.size}")
-        complete(StatusCodes.OK, instances)
+  /** Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING. */
+  def checkHealth(service: String, instance: Instances.Instance): String =
+    try {
+      stub(s"\${instance.address}:\${instance.port}").check(HealthCheckRequest(service))
+      "SERVING"
+    } catch { case _: StatusRuntimeException => "NOT_SERVING" }
+
+  /** The verdict for every live member of service. */
+  def probeService(service: String): Map[String, String] = {
+    // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+    Instances.members(service).flatMap { instanceId =>
+      Instances.lookup(service, instanceId).map { instance =>
+        val verdict = checkHealth(service, instance)
+        jedis.set(Instances.verdictKey(service, instanceId), verdict)
+        if (verdict != "SERVING") {
+          jedis.del(Instances.recordKey(service, instanceId))
+          jedis.srem(Instances.membersKey(service), instanceId)
+        }
+        instanceId -> verdict
       }
-    }
-
-  /** The starter's only health signal: a client told us a request failed. */
-  def noteComplaint(service: String, instanceId: String): Unit =
-    system.log.warning(s"complaint service=$service instance=$instanceId")
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
+    }.toMap
   }
 }
 `,
-      solution: `import org.apache.pekko.actor.ActorSystem
-import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import org.apache.pekko.http.scaladsl.model._
-import org.apache.pekko.http.scaladsl.server.Directives._
-import org.apache.pekko.http.scaladsl.server.Route
-import io.grpc.ManagedChannelBuilder
-import io.grpc.StatusRuntimeException
-import io.grpc.health.v1.HealthCheckRequest
-import io.grpc.health.v1.HealthCheckResponse
-import io.grpc.health.v1.HealthGrpc
-import redis.clients.jedis.Jedis
+      solution: `import java.util.concurrent.TimeUnit
+
+import io.grpc.{ManagedChannelBuilder, StatusRuntimeException}
+import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
-import spray.json.DefaultJsonProtocol._
-import spray.json.RootJsonFormat
-import spray.json._
 
-import java.util.concurrent.TimeUnit
-import scala.jdk.CollectionConverters._
+import discovery.Instances // Instances.members, lookup, recordKey, membersKey, verdictKey
+import discoveryd.service_discovery.{HealthCheckRequest, HealthCheckResponse, HealthGrpc}
 
-final case class InstanceRecord(instance_id: String, address: String, port: Int, metadata_version: Int)
+object Probe {
+  val ProbeDeadlineMs = 200L
+  val ProbeTtlS = 5L
 
-trait Registry {
-  def candidates(service: String): List[InstanceRecord]
-}
+  val jedis = new JedisPooled("redis", 6379)
 
-object Client {
-  implicit val system: ActorSystem = ActorSystem("discovery")
-  implicit val instanceFormat: RootJsonFormat[InstanceRecord] = jsonFormat4(InstanceRecord)
+  private val stubs = scala.collection.mutable.Map.empty[String, HealthGrpc.HealthBlockingStub]
 
-  val ProbeDeadlineMs = 200
-  val ProbeTtlSeconds = 5
-  val Serving = "SERVING"
-  val NotServing = "NOT_SERVING"
+  private def stub(target: String): HealthGrpc.HealthBlockingStub =
+    stubs.getOrElseUpdate(target, HealthGrpc.blockingStub(ManagedChannelBuilder.forTarget(target).usePlaintext().build()))
 
-  val registry: Registry = ???
-  val jedis = new Jedis("redis", 6379)
-
-  private def probeKey(service: String, instanceId: String): String = "sd:probe:" + service + ":" + instanceId
-
-  private def excludedKey(service: String): String = "sd:excluded:" + service
-
-  /** healthCheck is one Health/Check with a hard deadline: a hung process fails it. */
-  def healthCheck(instance: InstanceRecord): Boolean = {
-    val channel = ManagedChannelBuilder.forAddress(instance.address, instance.port).usePlaintext().build()
+  /** Ask the instance at address:port whether it can take traffic: SERVING or NOT_SERVING. */
+  def checkHealth(service: String, instance: Instances.Instance): String =
     try {
-      val stub = HealthGrpc.newBlockingStub(channel).withDeadlineAfter(ProbeDeadlineMs.toLong, TimeUnit.MILLISECONDS)
-      val reply = stub.check(HealthCheckRequest.newBuilder().setService("").build())
-      reply.getStatus == HealthCheckResponse.ServingStatus.SERVING
-    } catch {
-      case _: StatusRuntimeException => false
-    } finally {
-      channel.shutdownNow()
-    }
-  }
+      val reply = stub(s"\${instance.address}:\${instance.port}")
+        .withDeadlineAfter(ProbeDeadlineMs, TimeUnit.MILLISECONDS)
+        .check(HealthCheckRequest(service))
+      // Alive is not ready: a draining instance answers, and answers NOT_SERVING.
+      if (reply.status == HealthCheckResponse.ServingStatus.SERVING) "SERVING" else "NOT_SERVING"
+    } catch { case _: StatusRuntimeException => "NOT_SERVING" } // DEADLINE_EXCEEDED, UNAVAILABLE
 
-  /** probeAndShare probes once and shares the verdict: every router reads one observation for 5 s. */
-  def probeAndShare(service: String, instance: InstanceRecord): String = {
-    val healthy = healthCheck(instance)
-    val verdict = if (healthy) Serving else NotServing
-    jedis.set(probeKey(service, instance.instance_id), verdict, SetParams.setParams().ex(ProbeTtlSeconds.toLong))
-    if (healthy) {
-      jedis.hdel(excludedKey(service), instance.instance_id)
-    } else {
-      jedis.hset(excludedKey(service), instance.instance_id, """{"reason":"probe failed"}""")
-      system.log.warning(s"excluded service=$service instance=\${instance.instance_id}")
-    }
-    verdict
-  }
-
-  val route: Route =
-    path("v1" / "routable" / Segment) { service =>
-      get {
-        val instances = scala.collection.mutable.ListBuffer.empty[InstanceRecord]
-        val excluded = scala.collection.mutable.ListBuffer.empty[Map[String, String]]
-        registry.candidates(service).foreach { instance =>
-          val cached = Option(jedis.get(probeKey(service, instance.instance_id)))
-          val verdict = cached.getOrElse(probeAndShare(service, instance))
-          if (verdict == Serving) {
-            instances += instance
-          } else {
-            excluded += Map(
-              "instance_id" -> instance.instance_id,
-              "address" -> instance.address,
-              "reason" -> "probe failed")
-          }
+  /** The verdict for every live member of service. */
+  def probeService(service: String): Map[String, String] =
+    Instances.members(service).flatMap { instanceId =>
+      // A lapsed record has nobody to ask: the expiry sweep announces it.
+      Instances.lookup(service, instanceId).map { instance =>
+        val key = Instances.verdictKey(service, instanceId)
+        val verdict = Option(jedis.get(key)).getOrElse {
+          // One probe per instance per ProbeTtlS for every router; the TTL is also the retry.
+          val fresh = checkHealth(service, instance)
+          jedis.set(key, fresh, SetParams.setParams().ex(ProbeTtlS))
+          fresh
         }
-        val body = JsObject(
-          "service" -> JsString(service),
-          "instances" -> instances.toList.toJson,
-          "excluded" -> excluded.toList.toJson)
-        complete(StatusCodes.OK, body)
+        instanceId -> verdict
       }
-    }
-
-  def main(args: Array[String]): Unit = {
-    Http().newServerAt("0.0.0.0", 8443).bind(route)
-  }
+    }.toMap
 }
 `,
     },
     cpp: {
-      starter: `#include <httplib.h>
-#include <nlohmann/json.hpp>
+      starter: `#include <grpcpp/grpcpp.h>
 #include <sw/redis++/redis++.h>
 
-#include <iostream>
+#include <map>
+#include <memory>
 #include <string>
-#include <vector>
 
-using json = nlohmann::json;
+#include "discovery/instances.h"  // instances::members, lookup, recordKey, membersKey, verdictKey
+#include "service_discovery.grpc.pb.h"
 
-struct InstanceRecord {
-  std::string instance_id;
-  std::string address;
-  int port;
-  int metadata_version;
-};
-
-struct Registry {
-  std::vector<InstanceRecord> candidates(const std::string& service);
-};
-
-Registry registry;
 sw::redis::Redis redis("tcp://redis:6379");
 
-int main() {
-  httplib::Server svr;
+std::map<std::string, std::unique_ptr<discoveryd::Health::Stub>> stubs;
 
-  svr.Get(R"(/v1/routable/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    // TODO: this starter has five flaws. The task says where to look; the checks say what must change.
-    const auto service = req.matches[1].str();
-    const auto candidates = registry.candidates(service);
-    json instances = json::array();
-    for (const auto& instance : candidates) {
-      instances.push_back(json{{"instance_id", instance.instance_id},
-                               {"address", instance.address},
-                               {"port", instance.port},
-                               {"metadata_version", instance.metadata_version}});
+discoveryd::Health::Stub& stub(const std::string& target) {
+  auto& slot = stubs[target];
+  if (!slot) slot = discoveryd::Health::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+  return *slot;
+}
+
+// Ask the instance at address:port whether it can take traffic: "SERVING" or "NOT_SERVING".
+std::string checkHealth(const std::string& service, const instances::Instance& instance) {
+  grpc::ClientContext ctx;
+  discoveryd::HealthCheckRequest request;
+  request.set_service(service);
+  discoveryd::HealthCheckResponse reply;
+  const grpc::Status status = stub(instance.address + ":" + std::to_string(instance.port)).Check(&ctx, request, &reply);
+  return status.ok() ? "SERVING" : "NOT_SERVING";
+}
+
+// The verdict for every live member of service.
+std::map<std::string, std::string> probeService(const std::string& service) {
+  // TODO: this starter has four flaws. The task says where to look; the checks say what must change.
+  std::map<std::string, std::string> verdicts;
+  for (const std::string& instance_id : instances::members(service)) {
+    const auto instance = instances::lookup(service, instance_id);
+    if (!instance) continue;
+    const std::string verdict = checkHealth(service, *instance);
+    redis.set(instances::verdictKey(service, instance_id), verdict);
+    if (verdict != "SERVING") {
+      redis.del(instances::recordKey(service, instance_id));
+      redis.srem(instances::membersKey(service), instance_id);
     }
-    std::cout << "routable service=" << service << " instances=" << instances.size() << "\\n";
-    res.status = 200;
-    res.set_content(json{{"service", service}, {"instances", instances}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+    verdicts[instance_id] = verdict;
+  }
+  return verdicts;
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
-#include <httplib.h>
-#include <nlohmann/json.hpp>
 #include <sw/redis++/redis++.h>
 
 #include <chrono>
-#include <iostream>
+#include <map>
+#include <memory>
 #include <string>
-#include <vector>
 
-#include "grpc/health/v1/health.grpc.pb.h"
+#include "discovery/instances.h"  // instances::members, lookup, recordKey, membersKey, verdictKey
+#include "service_discovery.grpc.pb.h"
 
-using json = nlohmann::json;
-
-constexpr int kProbeDeadlineMs = 200;
-constexpr int kProbeTtlSeconds = 5;
-const std::string kServing = "SERVING";
-const std::string kNotServing = "NOT_SERVING";
-
-struct InstanceRecord {
-  std::string instance_id;
-  std::string address;
-  int port;
-  int metadata_version;
-};
-
-struct Registry {
-  std::vector<InstanceRecord> candidates(const std::string& service);
-};
-
-Registry registry;
 sw::redis::Redis redis("tcp://redis:6379");
 
-std::string probeKey(const std::string& service, const std::string& instanceId) {
-  return "sd:probe:" + service + ":" + instanceId;
+constexpr std::chrono::milliseconds kProbeDeadline{200};
+constexpr std::chrono::seconds kProbeTtl{5};
+
+std::map<std::string, std::unique_ptr<discoveryd::Health::Stub>> stubs;
+
+discoveryd::Health::Stub& stub(const std::string& target) {
+  auto& slot = stubs[target];
+  if (!slot) slot = discoveryd::Health::NewStub(grpc::CreateChannel(target, grpc::InsecureChannelCredentials()));
+  return *slot;
 }
 
-std::string excludedKey(const std::string& service) { return "sd:excluded:" + service; }
-
-/** healthCheck is one Health/Check with a hard deadline: a hung process fails it. */
-bool healthCheck(const InstanceRecord& instance) {
-  auto channel = grpc::CreateChannel(instance.address + ":" + std::to_string(instance.port),
-                                    grpc::InsecureChannelCredentials());
-  auto stub = grpc::health::v1::Health::NewStub(channel);
+// Ask the instance at address:port whether it can take traffic: "SERVING" or "NOT_SERVING".
+std::string checkHealth(const std::string& service, const instances::Instance& instance) {
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kProbeDeadlineMs));
-  grpc::health::v1::HealthCheckRequest request;
-  request.set_service("");
-  grpc::health::v1::HealthCheckResponse reply;
-  const auto status = stub->Check(&ctx, request, &reply);
-  return status.ok() && reply.status() == grpc::health::v1::HealthCheckResponse::SERVING;
+  ctx.set_deadline(std::chrono::system_clock::now() + kProbeDeadline);
+  discoveryd::HealthCheckRequest request;
+  request.set_service(service);
+  discoveryd::HealthCheckResponse reply;
+  const grpc::Status status = stub(instance.address + ":" + std::to_string(instance.port)).Check(&ctx, request, &reply);
+  // DEADLINE_EXCEEDED, UNAVAILABLE: a hung or stopped process. Alive is not ready: a draining
+  // instance answers, and answers NOT_SERVING.
+  return status.ok() && reply.status() == discoveryd::HealthCheckResponse::SERVING ? "SERVING" : "NOT_SERVING";
 }
 
-/** probeAndShare probes once and shares the verdict: every router reads one observation for 5 s. */
-std::string probeAndShare(const std::string& service, const InstanceRecord& instance) {
-  const bool healthy = healthCheck(instance);
-  const std::string verdict = healthy ? kServing : kNotServing;
-  redis.set(probeKey(service, instance.instance_id), verdict, std::chrono::seconds(kProbeTtlSeconds));
-  if (healthy) {
-    redis.hdel(excludedKey(service), instance.instance_id);
-  } else {
-    redis.hset(excludedKey(service), instance.instance_id, json{{"reason", "probe failed"}}.dump());
-    std::cout << "excluded service=" << service << " instance=" << instance.instance_id << "\\n";
-  }
-  return verdict;
-}
-
-int main() {
-  httplib::Server svr;
-
-  svr.Get(R"(/v1/routable/([^/]+))", [](const httplib::Request& req, httplib::Response& res) {
-    const auto service = req.matches[1].str();
-    json instances = json::array();
-    json excluded = json::array();
-    for (const auto& instance : registry.candidates(service)) {
-      auto cached = redis.get(probeKey(service, instance.instance_id));
-      const auto verdict = cached ? *cached : probeAndShare(service, instance);
-      if (verdict == kServing) {
-        instances.push_back(json{{"instance_id", instance.instance_id},
-                                 {"address", instance.address},
-                                 {"port", instance.port},
-                                 {"metadata_version", instance.metadata_version}});
-      } else {
-        excluded.push_back(json{{"instance_id", instance.instance_id},
-                                {"address", instance.address},
-                                {"reason", "probe failed"}});
-      }
+// The verdict for every live member of service.
+std::map<std::string, std::string> probeService(const std::string& service) {
+  std::map<std::string, std::string> verdicts;
+  for (const std::string& instance_id : instances::members(service)) {
+    const auto instance = instances::lookup(service, instance_id);
+    if (!instance) continue;  // lapsed: the expiry sweep announces it, there is nobody to ask
+    const std::string key = instances::verdictKey(service, instance_id);
+    const auto cached = redis.get(key);
+    std::string verdict;
+    if (cached) {
+      verdict = *cached;
+    } else {
+      // One probe per instance per kProbeTtl for every router; the TTL is also the retry.
+      verdict = checkHealth(service, *instance);
+      redis.set(key, verdict, kProbeTtl);
     }
-    res.status = 200;
-    res.set_content(
-        json{{"service", service}, {"instances", instances}, {"excluded", excluded}}.dump(), "application/json");
-  });
-
-  svr.listen("0.0.0.0", 8443);
+    verdicts[instance_id] = verdict;
+  }
+  return verdicts;
 }
 `,
     },
   },
+  harness: {
+    python: `import service_discovery_pb2 as pb
+import service_discovery_pb2_grpc as pb_grpc
+from discovery import instances
+
+FLEET = {"checkout-1": "10.4.2.1:8080", "checkout-2": "10.4.2.2:8080", "checkout-3": "10.4.2.3:8080"}
+
+
+class Peer(pb_grpc.HealthServicer):
+    """One instance's health endpoint: it answers with whatever status it holds."""
+
+    def __init__(self, status="SERVING"):
+        self.status = status
+
+    def Check(self, request, context):
+        return pb.HealthCheckResponse(status=getattr(pb.HealthCheckResponse, self.status))
+
+
+def _serve(ctx, instance_id, status="SERVING"):
+    peer = Peer(status)
+    ctx.grpc.serve(pb_grpc.add_HealthServicer_to_server, peer, target=FLEET[instance_id])
+    return peer
+
+
+def _fleet(ctx, statuses=None):
+    """checkout-1..3 registered with 5 s heartbeats; statuses maps an id to its answer, None for no process at all."""
+    for instance_id, target in FLEET.items():
+        address, port = target.split(":")
+        instances.register_instance("checkout", instance_id, address, int(port), 5, 1)
+        status = (statuses or {}).get(instance_id, "SERVING")
+        if status is not None:
+            _serve(ctx, instance_id, status)
+    return ctx.load("probe")
+
+
+def check_probe_deadline(ctx):
+    m = _fleet(ctx)
+    ctx.grpc.set_latency("Check", 2.0, target=FLEET["checkout-3"])  # checkout-3 is hung
+    before = ctx.clock.time()
+    verdicts = m.probe_service("checkout")
+    waited = ctx.clock.time() - before
+    assert verdicts.get("checkout-3") == "NOT_SERVING", f"checkout-3 takes 2 s to answer its health check and was judged {verdicts.get('checkout-3')!r}: past the 200 ms deadline it is NOT_SERVING"
+    assert verdicts.get("checkout-1") == "SERVING" and verdicts.get("checkout-2") == "SERVING", f"the healthy instances were judged {verdicts}"
+    for call in ctx.grpc.calls_to("Check"):
+        assert call.timeout is not None, f"the Check call to {call.target} carries no deadline: a hung instance holds the whole round"
+        assert call.timeout <= 0.25, f"the Check call to {call.target} carries a {call.timeout} s deadline, expected PROBE_DEADLINE_S = 0.2"
+    assert waited < 1.0, f"one probe round over three instances took {waited:.1f} s because one of them hung"
+
+
+def check_serving_status(ctx):
+    m = _fleet(ctx, {"checkout-2": "NOT_SERVING", "checkout-3": None})
+    verdicts = m.probe_service("checkout")
+    assert verdicts.get("checkout-2") == "NOT_SERVING", f"checkout-2 answered status NOT_SERVING (it is draining) and was judged {verdicts.get('checkout-2')!r}: read the reply's status, not only whether the call returned"
+    assert verdicts.get("checkout-3") == "NOT_SERVING", f"checkout-3 has no process listening and was judged {verdicts.get('checkout-3')!r}"
+    assert verdicts.get("checkout-1") == "SERVING", f"checkout-1 answered SERVING and was judged {verdicts.get('checkout-1')!r}"
+    assert ctx.redis.get("sd:probe:checkout:checkout-2") == "NOT_SERVING", f"sd:probe:checkout:checkout-2 holds {ctx.redis.get('sd:probe:checkout:checkout-2')!r}, expected the shared verdict NOT_SERVING"
+
+
+def check_shared_verdict(ctx):
+    m = _fleet(ctx)
+    m.probe_service("checkout")
+    assert len(ctx.grpc.calls_to("Check")) == 3, f"the first round over three instances made {len(ctx.grpc.calls_to('Check'))} Check calls"
+    ttl = ctx.redis.ttl("sd:probe:checkout:checkout-1")
+    assert 0 < ttl <= 5, f"sd:probe:checkout:checkout-1 has TTL {ttl}: the shared verdict expires after PROBE_TTL_S = 5 s, or a recovered instance is judged on a stale answer"
+    ctx.clock.advance(1)
+    other = ctx.reload("probe")  # a second router, a second later
+    verdicts = other.probe_service("checkout")
+    assert verdicts == {"checkout-1": "SERVING", "checkout-2": "SERVING", "checkout-3": "SERVING"}, f"the second router judged {verdicts}"
+    assert len(ctx.grpc.calls_to("Check")) == 3, f"a second router within the verdicts' 5 s made {len(ctx.grpc.calls_to('Check')) - 3} more Check calls: read sd:probe:{{service}}:{{instance_id}} before probing"
+    ctx.clock.advance(5)
+    other.probe_service("checkout")
+    assert len(ctx.grpc.calls_to("Check")) == 6, f"after the verdicts lapsed the next round made {len(ctx.grpc.calls_to('Check')) - 3} Check calls, expected one per instance"
+
+
+def check_keep_registered(ctx):
+    m = _fleet(ctx, {"checkout-2": None})
+    verdicts = m.probe_service("checkout")
+    assert verdicts.get("checkout-2") == "NOT_SERVING", f"checkout-2 has no process listening and was judged {verdicts.get('checkout-2')!r}"
+    assert ctx.redis.exists("sd:checkout:checkout-2") == 1 and ctx.redis.sismember("sd:members:checkout", "checkout-2"), "one failed probe deregistered checkout-2: a failing instance is excluded by its verdict and stays registered, so a later probe can readmit it"
+    _serve(ctx, "checkout-2")  # the process is back
+    ctx.clock.advance(6)
+    verdicts = m.probe_service("checkout")
+    assert verdicts.get("checkout-2") == "SERVING", f"checkout-2 is serving again and its old verdict lapsed, yet the round judged it {verdicts.get('checkout-2')!r}: a passing probe readmits it"
+`,
+    typescript: `const FLEET: Record<string, string> = {'checkout-1': '10.4.2.1:8080', 'checkout-2': '10.4.2.2:8080', 'checkout-3': '10.4.2.3:8080'};
+
+/** One instance's health endpoint: it answers with whatever status it holds. */
+function serve(ctx, instanceId: string, status = 'SERVING') {
+  const pkg = ctx.proto('service_discovery.proto');
+  const peer = {status};
+  ctx.grpc.serve(pkg.discoveryd.Health.service, {Check: (_call, callback) => callback(null, {status: peer.status})}, FLEET[instanceId]);
+  return peer;
+}
+
+/** checkout-1..3 registered with 5 s heartbeats; statuses maps an id to its answer, null for no process at all. */
+async function fleet(ctx, statuses: Record<string, string | null> = {}) {
+  const instances = ctx.load('/support/discovery/instances.ts');
+  for (const [instanceId, target] of Object.entries(FLEET)) {
+    const [address, port] = target.split(':');
+    await instances.registerInstance('checkout', instanceId, address, Number(port), 5, 1);
+    const status = instanceId in statuses ? statuses[instanceId] : 'SERVING';
+    if (status !== null) serve(ctx, instanceId, status);
+  }
+  return ctx.load('probe');
+}
+
+export async function check_probe_deadline(ctx) {
+  const m = await fleet(ctx);
+  ctx.grpc.setLatency('Check', 2.0, FLEET['checkout-3']); // checkout-3 is hung
+  const before = ctx.clock.now();
+  const verdicts = await m.probeService('checkout');
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert.equal(verdicts['checkout-3'], 'NOT_SERVING', \`checkout-3 takes 2 s to answer its health check and was judged \${JSON.stringify(verdicts['checkout-3'])}: past the 200 ms deadline it is NOT_SERVING\`);
+  assert(verdicts['checkout-1'] === 'SERVING' && verdicts['checkout-2'] === 'SERVING', \`the healthy instances were judged \${JSON.stringify(verdicts)}\`);
+  for (const call of ctx.grpc.callsTo('Check')) {
+    assert(call.timeout !== null, \`the Check call to \${call.target} carries no deadline: a hung instance holds the whole round\`);
+    assert(call.timeout <= 0.25, \`the Check call to \${call.target} carries a \${call.timeout} s deadline, expected PROBE_DEADLINE_MS = 200\`);
+  }
+  assert(waited < 1.0, \`one probe round over three instances took \${waited.toFixed(1)} s because one of them hung\`);
+}
+
+export async function check_serving_status(ctx) {
+  const m = await fleet(ctx, {'checkout-2': 'NOT_SERVING', 'checkout-3': null});
+  const verdicts = await m.probeService('checkout');
+  assert.equal(verdicts['checkout-2'], 'NOT_SERVING', \`checkout-2 answered status NOT_SERVING (it is draining) and was judged \${JSON.stringify(verdicts['checkout-2'])}: read the reply's status, not only whether the call returned\`);
+  assert.equal(verdicts['checkout-3'], 'NOT_SERVING', \`checkout-3 has no process listening and was judged \${JSON.stringify(verdicts['checkout-3'])}\`);
+  assert.equal(verdicts['checkout-1'], 'SERVING', \`checkout-1 answered SERVING and was judged \${JSON.stringify(verdicts['checkout-1'])}\`);
+  assert.equal(ctx.redis.get('sd:probe:checkout:checkout-2'), 'NOT_SERVING', 'sd:probe:checkout:checkout-2 must hold the shared verdict NOT_SERVING');
+}
+
+export async function check_shared_verdict(ctx) {
+  const m = await fleet(ctx);
+  await m.probeService('checkout');
+  assert.equal(ctx.grpc.callsTo('Check').length, 3, \`the first round over three instances made \${ctx.grpc.callsTo('Check').length} Check calls\`);
+  const ttl = ctx.redis.ttl('sd:probe:checkout:checkout-1');
+  assert(0 < ttl && ttl <= 5, \`sd:probe:checkout:checkout-1 has TTL \${ttl}: the shared verdict expires after PROBE_TTL_S = 5 s, or a recovered instance is judged on a stale answer\`);
+  ctx.clock.advance(1);
+  const other = ctx.load('probe'); // a second router, a second later
+  const verdicts = await other.probeService('checkout');
+  assert.deepEqual(verdicts, {'checkout-1': 'SERVING', 'checkout-2': 'SERVING', 'checkout-3': 'SERVING'}, \`the second router judged \${JSON.stringify(verdicts)}\`);
+  assert.equal(ctx.grpc.callsTo('Check').length, 3, \`a second router within the verdicts' 5 s made \${ctx.grpc.callsTo('Check').length - 3} more Check calls: read sd:probe:{service}:{instance_id} before probing\`);
+  ctx.clock.advance(5);
+  await other.probeService('checkout');
+  assert.equal(ctx.grpc.callsTo('Check').length, 6, \`after the verdicts lapsed the next round made \${ctx.grpc.callsTo('Check').length - 3} Check calls, expected one per instance\`);
+}
+
+export async function check_keep_registered(ctx) {
+  const m = await fleet(ctx, {'checkout-2': null});
+  let verdicts = await m.probeService('checkout');
+  assert.equal(verdicts['checkout-2'], 'NOT_SERVING', \`checkout-2 has no process listening and was judged \${JSON.stringify(verdicts['checkout-2'])}\`);
+  assert(ctx.redis.exists('sd:checkout:checkout-2') === 1 && ctx.redis.sismember('sd:members:checkout', 'checkout-2') === 1, 'one failed probe deregistered checkout-2: a failing instance is excluded by its verdict and stays registered, so a later probe can readmit it');
+  serve(ctx, 'checkout-2'); // the process is back
+  ctx.clock.advance(6);
+  verdicts = await m.probeService('checkout');
+  assert.equal(verdicts['checkout-2'], 'SERVING', \`checkout-2 is serving again and its old verdict lapsed, yet the round judged it \${JSON.stringify(verdicts['checkout-2'])}: a passing probe readmits it\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"time"
+
+	"discovery/instances"
+	pb "discovery/gen/service_discovery"
+
+	"leetbuild/harness"
+)
+
+var (
+	probeBg = context.Background()
+	fleet   = map[string]string{"checkout-1": "10.4.2.1:8080", "checkout-2": "10.4.2.2:8080", "checkout-3": "10.4.2.3:8080"}
+	fleetIDs = []string{"checkout-1", "checkout-2", "checkout-3"}
+)
+
+// healthPeer is one instance's health endpoint: it answers with whatever status it holds.
+type healthPeer struct {
+	pb.UnimplementedHealthServer
+	status pb.HealthCheckResponse_ServingStatus
+}
+
+func (p *healthPeer) Check(context.Context, *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
+	return &pb.HealthCheckResponse{Status: p.status}, nil
+}
+
+func serveHealth(ctx *harness.Ctx, instanceID string, status pb.HealthCheckResponse_ServingStatus) {
+	pb.RegisterHealthServer(ctx.GRPC.Server(fleet[instanceID]), &healthPeer{status: status})
+}
+
+// startFleet registers checkout-1..3 with 5 s heartbeats; down lists the ids with no process at all.
+func startFleet(ctx *harness.Ctx, statuses map[string]pb.HealthCheckResponse_ServingStatus, down ...string) {
+	for _, id := range fleetIDs {
+		address, port, _ := strings.Cut(fleet[id], ":")
+		n, _ := strconv.Atoi(port)
+		_, err := instances.RegisterInstance(probeBg, "checkout", id, address, n, 5, 1)
+		ctx.NoError(err, "registering %s", id)
+		skip := false
+		for _, d := range down {
+			skip = skip || d == id
+		}
+		if skip {
+			continue
+		}
+		status, ok := statuses[id]
+		if !ok {
+			status = pb.HealthCheckResponse_SERVING
+		}
+		serveHealth(ctx, id, status)
+	}
+}
+
+func round(ctx *harness.Ctx) map[string]string {
+	verdicts, err := probeService(probeBg, "checkout")
+	ctx.NoError(err, "probeService(checkout) failed")
+	return verdicts
+}
+
+func CheckProbeDeadline(ctx *harness.Ctx) {
+	startFleet(ctx, nil)
+	ctx.GRPC.SetLatency("Check", 2.0, fleet["checkout-3"]) // checkout-3 is hung
+	before := ctx.Clock.Now()
+	verdicts := round(ctx)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Equal(verdicts["checkout-3"], "NOT_SERVING", "checkout-3 takes 2 s to answer its health check: past the 200 ms deadline it is NOT_SERVING; its verdict")
+	ctx.Assert(verdicts["checkout-1"] == "SERVING" && verdicts["checkout-2"] == "SERVING", "the healthy instances were judged %v", verdicts)
+	for _, call := range ctx.GRPC.CallsTo("Check", "") {
+		ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a hung instance holds the whole round")
+		ctx.Assert(call.Timeout <= 250*time.Millisecond, "a Check call carries a %v deadline, expected probeDeadline = 200 ms", call.Timeout)
+	}
+	ctx.Assert(waited < 1.0, "one probe round over three instances took %.1f s because one of them hung", waited)
+}
+
+func CheckServingStatus(ctx *harness.Ctx) {
+	startFleet(ctx, map[string]pb.HealthCheckResponse_ServingStatus{"checkout-2": pb.HealthCheckResponse_NOT_SERVING}, "checkout-3")
+	verdicts := round(ctx)
+	ctx.Equal(verdicts["checkout-2"], "NOT_SERVING", "checkout-2 answered status NOT_SERVING (it is draining): read the reply's status, not only whether the call returned; its verdict")
+	ctx.Equal(verdicts["checkout-3"], "NOT_SERVING", "checkout-3 has no process listening; its verdict")
+	ctx.Equal(verdicts["checkout-1"], "SERVING", "checkout-1 answered SERVING; its verdict")
+	shared, _ := ctx.Redis.Get("sd:probe:checkout:checkout-2")
+	ctx.Equal(shared, "NOT_SERVING", "the shared verdict in sd:probe:checkout:checkout-2")
+}
+
+func CheckSharedVerdict(ctx *harness.Ctx) {
+	startFleet(ctx, nil)
+	round(ctx)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 3, "the first round over three instances; Check calls")
+	ttl := ctx.Redis.TTL("sd:probe:checkout:checkout-1")
+	ctx.Assert(0 < ttl && ttl <= 5, "sd:probe:checkout:checkout-1 has TTL %d: the shared verdict expires after 5 s, or a recovered instance is judged on a stale answer", ttl)
+	ctx.Clock.Advance(1)
+	verdicts := round(ctx) // another round a second later, as a second router would run it
+	ctx.Equal(verdicts, map[string]string{"checkout-1": "SERVING", "checkout-2": "SERVING", "checkout-3": "SERVING"}, "the verdicts of the second round")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 3, "a second round within the verdicts' 5 s must read sd:probe:{service}:{instance_id} before probing; Check calls")
+	ctx.Clock.Advance(5)
+	round(ctx)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 6, "after the verdicts lapsed the next round must probe each instance once; Check calls")
+}
+
+func CheckKeepRegistered(ctx *harness.Ctx) {
+	startFleet(ctx, nil, "checkout-2")
+	verdicts := round(ctx)
+	ctx.Equal(verdicts["checkout-2"], "NOT_SERVING", "checkout-2 has no process listening; its verdict")
+	ctx.Assert(ctx.Redis.Exists("sd:checkout:checkout-2") == 1 && ctx.Redis.SIsMember("sd:members:checkout", "checkout-2"), "one failed probe deregistered checkout-2: a failing instance is excluded by its verdict and stays registered, so a later probe can readmit it")
+	serveHealth(ctx, "checkout-2", pb.HealthCheckResponse_SERVING) // the process is back
+	ctx.Clock.Advance(6)
+	verdicts = round(ctx)
+	ctx.Equal(verdicts["checkout-2"], "SERVING", "checkout-2 is serving again and its old verdict lapsed: a passing probe readmits it; its verdict")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "discovery/instances.h"
+#include "service_discovery.grpc.pb.h"
+
+namespace {
+
+using Status = discoveryd::HealthCheckResponse::ServingStatus;
+
+const std::map<std::string, std::string> kFleet = {
+    {"checkout-1", "10.4.2.1"}, {"checkout-2", "10.4.2.2"}, {"checkout-3", "10.4.2.3"}};
+
+std::string target(const std::string& instance_id) { return kFleet.at(instance_id) + ":8080"; }
+
+// One instance's health endpoint: it answers with whatever status it holds.
+class HealthPeer final : public discoveryd::Health::Service {
+ public:
+  explicit HealthPeer(Status s) : status(s) {}
+  Status status;
+  grpc::Status Check(grpc::ServerContext*, const discoveryd::HealthCheckRequest*, discoveryd::HealthCheckResponse* out) override {
+    out->set_status(status);
+    return grpc::Status::OK;
+  }
+};
+
+std::vector<std::unique_ptr<HealthPeer>>& peers() {
+  static std::vector<std::unique_ptr<HealthPeer>> all;
+  return all;
+}
+
+void serveHealth(harness::Ctx& ctx, const std::string& instance_id, Status status) {
+  peers().push_back(std::make_unique<HealthPeer>(status));
+  ctx.GRPC.Server(target(instance_id))->RegisterService(peers().back().get());
+}
+
+// checkout-1..3 registered with 5 s heartbeats; down lists the ids with no process at all.
+void startFleet(harness::Ctx& ctx, const std::map<std::string, Status>& statuses, const std::set<std::string>& down = {}) {
+  for (const auto& [instance_id, address] : kFleet) {
+    instances::registerInstance("checkout", instance_id, address, 8080, 5, 1);
+    if (down.count(instance_id)) continue;
+    const auto it = statuses.find(instance_id);
+    serveHealth(ctx, instance_id, it == statuses.end() ? discoveryd::HealthCheckResponse::SERVING : it->second);
+  }
+}
+
+std::string verdictOf(const std::map<std::string, std::string>& verdicts, const std::string& instance_id) {
+  const auto it = verdicts.find(instance_id);
+  return it == verdicts.end() ? "" : it->second;
+}
+
+}  // namespace
+
+void CheckProbeDeadline(harness::Ctx& ctx) {
+  startFleet(ctx, {});
+  ctx.GRPC.SetLatency("Check", 2.0, target("checkout-3"));  // checkout-3 is hung
+  const int64_t before = ctx.Clock.Now();
+  const auto verdicts = probeService("checkout");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Equal(verdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 takes 2 s to answer its health check: past the 200 ms deadline it is NOT_SERVING; its verdict");
+  ctx.Assert(verdictOf(verdicts, "checkout-1") == "SERVING" && verdictOf(verdicts, "checkout-2") == "SERVING", "the healthy instances must be SERVING");
+  for (const auto& call : ctx.GRPC.CallsTo("Check")) {
+    ctx.Assert(call.HasDeadline(), "a Check call carries no deadline: a hung instance holds the whole round");
+    ctx.Assert(call.TimeoutSeconds() <= 0.25, "a Check call carries a %v s deadline, expected kProbeDeadline = 200 ms", call.TimeoutSeconds());
+  }
+  ctx.Assert(waited < 1.0, "one probe round over three instances took %.1f s because one of them hung", waited);
+}
+
+void CheckServingStatus(harness::Ctx& ctx) {
+  startFleet(ctx, {{"checkout-2", discoveryd::HealthCheckResponse::NOT_SERVING}}, {"checkout-3"});
+  const auto verdicts = probeService("checkout");
+  ctx.Equal(verdictOf(verdicts, "checkout-2"), "NOT_SERVING", "checkout-2 answered status NOT_SERVING (it is draining): read the reply's status, not only whether the call returned; its verdict");
+  ctx.Equal(verdictOf(verdicts, "checkout-3"), "NOT_SERVING", "checkout-3 has no process listening; its verdict");
+  ctx.Equal(verdictOf(verdicts, "checkout-1"), "SERVING", "checkout-1 answered SERVING; its verdict");
+  ctx.Equal(ctx.Redis.Get("sd:probe:checkout:checkout-2").value_or(""), "NOT_SERVING", "the shared verdict in sd:probe:checkout:checkout-2");
+}
+
+void CheckSharedVerdict(harness::Ctx& ctx) {
+  startFleet(ctx, {});
+  probeService("checkout");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 3, "the first round over three instances; Check calls");
+  const long long ttl = ctx.Redis.TTL("sd:probe:checkout:checkout-1");
+  ctx.Assert(0 < ttl && ttl <= 5, "sd:probe:checkout:checkout-1 has TTL %d: the shared verdict expires after 5 s, or a recovered instance is judged on a stale answer", ttl);
+  ctx.Clock.Advance(1);
+  const auto verdicts = probeService("checkout");  // another round a second later, as a second router would run it
+  ctx.Assert(verdicts.size() == 3 && verdictOf(verdicts, "checkout-1") == "SERVING" && verdictOf(verdicts, "checkout-2") == "SERVING" && verdictOf(verdicts, "checkout-3") == "SERVING", "the second round must judge all three SERVING");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 3, "a second round within the verdicts' 5 s must read sd:probe:{service}:{instance_id} before probing; Check calls");
+  ctx.Clock.Advance(5);
+  probeService("checkout");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 6, "after the verdicts lapsed the next round must probe each instance once; Check calls");
+}
+
+void CheckKeepRegistered(harness::Ctx& ctx) {
+  startFleet(ctx, {}, {"checkout-2"});
+  auto verdicts = probeService("checkout");
+  ctx.Equal(verdictOf(verdicts, "checkout-2"), "NOT_SERVING", "checkout-2 has no process listening; its verdict");
+  ctx.Assert(ctx.Redis.Exists("sd:checkout:checkout-2") == 1 && ctx.Redis.SIsMember("sd:members:checkout", "checkout-2"), "one failed probe deregistered checkout-2: a failing instance is excluded by its verdict and stays registered, so a later probe can readmit it");
+  serveHealth(ctx, "checkout-2", discoveryd::HealthCheckResponse::SERVING);  // the process is back
+  ctx.Clock.Advance(6);
+  verdicts = probeService("checkout");
+  ctx.Equal(verdictOf(verdicts, "checkout-2"), "SERVING", "checkout-2 is serving again and its old verdict lapsed: a passing probe readmits it; its verdict");
+}
+`,
+  },
   hints: [
-    'A checkout pod is OOM-killed and for the next five seconds a third of checkout requests fail, while the discovery dashboard shows every instance green.',
-    '`routable` returns `registry.candidates(service)` as is: a heartbeat says a process was alive at its last beat, not that it can serve now, and `note_complaint` only runs after a user has already failed.',
-    'In the candidate loop read `sd:probe:{service}:{id}`; on a miss call `Health/Check` with `timeout=0.2`, cache the verdict with `ex=PROBE_TTL_S`; `NOT_SERVING` → `hset sd:excluded:{service}` with a reason; `SERVING` → `hdel` it.',
+    'Freeze one checkout pod: every probe round stalls for as long as it is frozen and then marks it SERVING. A pod that is draining answers NOT_SERVING and still gets traffic.',
+    'The Check call has no deadline, and only whether it raised is looked at, not the reply. The verdict is written without a TTL and never read back, and a failure deletes the record and the member.',
+    'Pass `timeout=PROBE_DEADLINE_S` to `Check` and compare `reply.status` with `HealthCheckResponse.SERVING`; `r.get` the verdict key first and `set(key, verdict, ex=PROBE_TTL_S)` on a miss; drop the `delete` and the `srem`.',
   ],
-  debrief: `Registration is a claim made by a process; health is an observation made by the platform, and only the observation may influence routing. That is why the probe runs inside the loop that builds the answer and carries a deadline: a connect that hangs is a failure, not a slow success. The observation lives in Redis rather than in each router because probing per caller multiplies load on a struggling instance and lets two routers disagree about one backend; a shared verdict with a short TTL gives every caller the same answer and bounds the probe rate. The exclusion hash keeps failure and registration apart, so the instance stays registered for its recovery probe and the read API can explain why it was skipped. Production systems jitter the probe schedule and give an instance a drain state that fails its probe on purpose before a shutdown.`,
+  debrief: `A probe is a question with a time limit: an instance that cannot answer its health check in 200 ms cannot answer a user either, so the deadline turns a hang into a verdict. The status field matters because a process can be alive and still refuse traffic, which is what a drain looks like. Sharing the verdict in Redis with a short TTL bounds the load to one call per instance per five seconds for every router, and the TTL is also the retry: the verdict lapses, the next round asks again, and a recovered instance comes back without re-registering. Production health checkers spread probes with jitter and want a few consecutive failures before excluding an instance, so one lost packet does not flap the routing table.`,
 };

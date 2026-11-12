@@ -1460,6 +1460,8 @@ const KNOWN_COMMANDS = new Set([
   'zcount',
   'zremrangebyscore',
   'zremrangebyrank',
+  'zpopmin',
+  'zpopmax',
   'eval',
   'evalsha',
   'geoadd',
