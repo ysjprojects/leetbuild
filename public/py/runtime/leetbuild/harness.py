@@ -25,6 +25,7 @@ import traceback
 from typing import Any, Awaitable, Callable, Sequence
 
 import fakeredis
+from fakeredis._helpers import SimpleError
 from fakeredis._socket._base import BaseFakeSocket
 import httpx
 
@@ -55,21 +56,49 @@ class RedisProbe:
 
 _PROBES: list[RedisProbe] = []
 _process_command = BaseFakeSocket._process_command
+_run_command = BaseFakeSocket._run_command
+# Commands whose own arguments are not what they touch: a script touches the keys of its redis.calls,
+# EXEC those of the commands it runs.
+_CONTAINERS = {"eval", "evalsha", "eval_ro", "evalsha_ro", "exec"}
+
+
+def _run_command_noting_keys(self, func, sig, args, from_script):  # type: ignore[no-untyped-def]
+    """fakeredis's command execution, noting what a successful command touched while a probe waits:
+    its arguments, or for a script the keys its redis.calls touched (kept only if the script succeeds)."""
+    touched: set[bytes] | None = getattr(self, "_probe_touched", None)
+    if touched is None:
+        return _run_command(self, func, sig, args, from_script)
+    container = sig.name.lower() in _CONTAINERS
+    inner: set[bytes] = set()
+    if container:
+        self._probe_touched = inner
+    try:
+        result = _run_command(self, func, sig, args, from_script)
+    finally:
+        self._probe_touched = touched
+    if isinstance(result, SimpleError):
+        return result
+    if container:
+        touched |= inner
+    else:
+        touched.update(bytes(a) for a in args if isinstance(a, (bytes, bytearray, memoryview)))
+    return result
 
 
 def _process_command_with_probes(self, fields: list[bytes]) -> None:
-    """The server's dispatch with probes: they fire after a command — or a whole MULTI/EXEC, or a Lua
-    script, which run atomically — has executed, before its client reads the reply."""
+    """The server's dispatch with probes: they fire after the first successful command touching their
+    key — or a whole MULTI/EXEC, or a Lua script (touching the keys its redis.calls use), which run
+    atomically — before its client reads the reply. A command that failed (NOSCRIPT, WRONGTYPE …)
+    fires none."""
     if not _PROBES or not fields:
         return _process_command(self, fields)
-    if getattr(self, "_queueing", False):
-        if bytes(fields[0]).lower() != b"exec":
-            return _process_command(self, fields)  # queued: it runs, and is observed, at EXEC
-        queued = getattr(self, "_transaction", None) or []
-        touched = {bytes(a) for _func, _sig, args in queued for a in args if isinstance(a, (bytes, bytearray, memoryview))}
-    else:
-        touched = {bytes(a) for a in fields[1:] if isinstance(a, (bytes, bytearray, memoryview))}
-    _process_command(self, fields)
+    outer = getattr(self, "_probe_touched", None)
+    touched: set[bytes] = set()
+    self._probe_touched = touched
+    try:
+        _process_command(self, fields)
+    finally:
+        self._probe_touched = outer
     for probe in [p for p in _PROBES if not p.fired and p.key in touched]:
         probe.fired = True
         try:
@@ -79,6 +108,7 @@ def _process_command_with_probes(self, fields: list[bytes]) -> None:
 
 
 BaseFakeSocket._process_command = _process_command_with_probes
+BaseFakeSocket._run_command = _run_command_noting_keys
 
 
 class HarnessDb:
@@ -120,11 +150,13 @@ class Ctx:
 
     def redis_after(self, key: str, fn: Callable[[], Any]) -> "RedisProbe":
         """
-        Run `fn` once, right after the first command that touches `key` has executed on the Redis
-        server — from any client, a pipeline's EXEC or a Lua script included — and before that client
-        reads its reply: another worker's request landing between two of the learner's commands (a
-        race, the way two app servers produce one), or a snapshot of the world at that instant. The
-        probe records whether `key` was touched at all (`fired`), and what `fn` returned or raised.
+        Run `fn` once, right after the first successful command that touches `key` has executed on
+        the Redis server — from any client, a whole MULTI/EXEC or a Lua script included, a script
+        touching the keys its `redis.call`s use — and before that client reads its reply: another
+        worker's request landing between two of the learner's commands (a race, the way two app
+        servers produce one), or a snapshot of the world at that instant. A command answering an
+        error (NOSCRIPT, WRONGTYPE …) fires nothing. The probe records whether `key` was touched at
+        all (`fired`), and what `fn` returned or raised.
         """
         probe = RedisProbe(key.encode(), fn)
         _PROBES.append(probe)

@@ -147,8 +147,18 @@ const makeBridge = (alive: () => boolean): {bridge: object; disable: () => Promi
           (e: unknown) => done(cmds.map(() => ({e: errorMessage(e)}))),
         );
       },
-      transaction: (cmds: string[][]): Tagged[] => each(redis.SERVER.executeTransaction(cmds)),
-      fingerprint: (key: string): string => redis.SERVER.fingerprint(key),
+      connect: (): number => redis.SERVER.connect(),
+      watch: (conn: number, keys: string[]): void => {
+        redis.SERVER.watch(conn, keys);
+      },
+      unwatch: (conn: number, record: boolean): void => {
+        redis.SERVER.unwatch(conn, record);
+      },
+      /** MULTI/EXEC from connection `conn`: null when its WATCH aborted the block. */
+      exec: (conn: number, cmds: string[][]): Tagged[] | null => {
+        const replies = redis.SERVER.exec(conn, cmds);
+        return replies === null ? null : each(replies);
+      },
       probe: (key: string, fn: () => void): void => {
         redis.SERVER.probes.push({key, fn: into(fn), fired: false, result: undefined, error: undefined});
       },

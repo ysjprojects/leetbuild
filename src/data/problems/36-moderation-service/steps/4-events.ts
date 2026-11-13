@@ -25,9 +25,10 @@ after its commit loses the removal.
   \`tenant\`, \`action\`, \`label\`, \`confidence\`, \`model_version\` and \`actor\`.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\`; the Go stack uses
   confluent-kafka-go, which has an idempotent producer).
-- A delivery the broker refuses goes to the outbox (\`store.insert_outbox(topic, key, payload)\`)
-  from the delivery report, and \`publish_action\` answers false.
-- \`consume_actions\` persists the action before it commits the offset.`,
+- \`publish_action\` waits for the delivery report at most **2 s**. A delivery
+  the broker refuses, or one with no report within the window, goes to the outbox
+  (\`store.insert_outbox(topic, key, payload)\`), and \`publish_action\` answers false.
+- \`consume_actions\` commits an offset only once the action is persisted.`,
   sequence: {
     participants: ['Moderation API', 'moderation.action', 'Moderation consumer', 'case store'],
     messages: [
@@ -112,7 +113,7 @@ after its commit loses the removal.
       id: 'outbox',
       title: 'A refused delivery leaves an outbox row',
       detail:
-        'Where the broker answers (the delivery callback, the rejected send, the delivery report’s error), a refusal writes `insert_outbox(topic, key, payload)` and the call answers false; the starter logs the refusal and answers true.',
+        'Where the broker answers (the delivery callback, the rejected send, the delivery report’s error), a refusal writes `insert_outbox(topic, key, payload)` and the call answers false; with the broker stalled, no report within 2 s does the same, and the call returns within 2.5 s. The starter logs the refusal and answers true.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /\bcatch\b/]},
@@ -125,7 +126,7 @@ after its commit loses the removal.
       id: 'persist-before-commit',
       title: 'Persists the action before committing the offset',
       detail:
-        'The consumer writes the action (`put_action`/`putAction`) and only then commits the record’s offset; the starter commits first, so a crash between the two skips the action for good.',
+        'The consumer writes the action (`put_action`/`putAction`) and only then commits the record’s offset: at every commit the store holds every committed action, and a record whose write the store refuses stays uncommitted. The starter commits first, so a crash between the two skips the action for good.',
       match: {
         python: {order: [/def consume_actions/, /store\.put_action\(/, /consumer\.commit\(/]},
         typescript: {order: [/function consumeActions/, /putAction\(/, /commitOffsets\(/]},
@@ -224,18 +225,20 @@ def publish_action(report_case: dict, action: dict) -> bool:
     """One record on moderation.action; True once the broker acknowledged it, False when it went to the outbox."""
     key = report_case["content_id"]
     payload = json.dumps(build_event(report_case, action))
-    delivered = []
+    outcome = {}
 
     def on_delivery(err, msg) -> None:
-        if err is not None:
-            # The broker said no: the relay publishes the row later, so the action is late, not lost.
-            store.insert_outbox(TOPIC, key, payload)
-            log.warning("moderation action for %s not delivered: %s", key, err)
-        delivered.append(err is None)
+        outcome["error"] = err
 
     producer.produce(TOPIC, key=key, value=payload, on_delivery=on_delivery)
-    producer.flush(ACK_TIMEOUT_S)  # the delivery report fires here, delivered or refused
-    return delivered == [True]
+    producer.flush(ACK_TIMEOUT_S)  # serves the delivery report, or gives up after the window
+    err = outcome.get("error", "no delivery report within ACK_TIMEOUT_S")
+    if err is not None:
+        # Refused or unanswered: the relay publishes the row later, so the action is late, not lost.
+        store.insert_outbox(TOPIC, key, payload)
+        log.warning("moderation action for %s not delivered: %s", key, err)
+        return False
+    return True
 
 
 def consume_actions() -> None:
@@ -315,6 +318,7 @@ import {type Case, insertOutbox, putAction} from 'moderation/store';
 
 export const TOPIC = 'moderation.action';
 export const GROUP = 'moderation-actions';
+export const ACK_TIMEOUT_MS = 2000;
 
 /** What was decided about a case and the evidence behind it. */
 export interface ModerationAction {
@@ -348,7 +352,8 @@ export function buildEvent(reportCase: Case, action: ModerationAction): Record<s
 export async function publishAction(reportCase: Case, action: ModerationAction): Promise<boolean> {
   const payload = JSON.stringify(buildEvent(reportCase, action));
   try {
-    await producer.send({topic: TOPIC, messages: [{key: reportCase.content_id, value: payload}], acks: -1});
+    // timeout: no acknowledgement within the window rejects the send, as a refusal does.
+    await producer.send({topic: TOPIC, messages: [{key: reportCase.content_id, value: payload}], acks: -1, timeout: ACK_TIMEOUT_MS});
     return true;
   } catch (e) {
     // The broker said no: the relay publishes the row later, so the action is late, not lost.
@@ -454,7 +459,9 @@ func consumeActions(ctx context.Context) error {
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			return err
 		}
-		store.PutAction(ctx, event)
+		if _, err := store.PutAction(ctx, event); err != nil {
+			return err
+		}
 	}
 }
 `,
@@ -554,7 +561,9 @@ func consumeActions(ctx context.Context) error {
 			return err
 		}
 		// Written first: a crash before the commit replays the record, and PutAction ignores the replay.
-		store.PutAction(ctx, event)
+		if _, err := store.PutAction(ctx, event); err != nil {
+			return err // not committed: the record is read again once the store answers
+		}
 		if _, err := consumer.CommitMessage(msg); err != nil {
 			return err
 		}
@@ -684,13 +693,18 @@ object Events {
     val report: Callback = new Callback {
       override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
         // The broker said no: the relay publishes the row later, so the action is late, not lost.
-        if (exception != null) Store.insertOutbox(Topic, reportCase.contentId, payload)
-        delivered.success(exception == null)
+        if (exception != null && delivered.trySuccess(false)) Store.insertOutbox(Topic, reportCase.contentId, payload)
+        else delivered.trySuccess(exception == null)
       }
     }
     producer.send(new ProducerRecord[String, String](Topic, reportCase.contentId, payload), report)
-    producer.flush()
-    Await.result(delivered.future, 2.seconds)
+    try Await.result(delivered.future, 2.seconds)
+    catch {
+      // No report within the window is a refusal too.
+      case _: java.util.concurrent.TimeoutException =>
+        if (delivered.trySuccess(false)) Store.insertOutbox(Topic, reportCase.contentId, payload)
+        false
+    }
   }
 
   /** Persist every action on the topic, in order per partition. */
@@ -876,7 +890,11 @@ bool publishAction(const store::Case& report_case, const ModerationAction& actio
     store::insertOutbox(kTopic, report_case.content_id, payload);
     return false;
   }
-  producer->flush(kAckTimeoutMs);  // the delivery report fires here, delivered or refused
+  producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
+  if (producer->outq_len() > 0) {  // no report within the window is a refusal too
+    store::insertOutbox(kTopic, report_case.content_id, payload);
+    return false;
+  }
   return deliveries.delivered;
 }
 
@@ -974,21 +992,52 @@ def check_outbox(ctx):
     assert ctx.kafka.records(TOPIC) == [], "a refused produce cannot be on the topic"
     assert m.publish_action(report_case, RESTORE) is True, "once the broker answers again publish_action must answer True"
     assert len(_outbox(ctx)) == 1, "a delivered action leaves no outbox row"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    delivered = m.publish_action(report_case, {**REMOVE, "action": "escalate"})
+    waited = ctx.clock.time() - before
+    assert waited <= 2.5, f"publish_action waited {waited:.1f} s for a broker that does not answer: wait for the delivery report at most 2 s"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and json.loads(rows[1].get("payload", "{}")).get("action_id") == f"{report_case['case_id']}:escalate", f"no delivery report within 2 s and the outbox holds {rows}: an unanswered produce is a refusal"
+    assert delivered is False, f"publish_action answered {delivered!r} without a delivery report, expected False"
+
+
+def _seed_actions(ctx, content_id, *case_actions):
+    for case_id, action in case_actions:
+        event = {"action_id": f"{case_id}:{action}", "case_id": case_id, "content_id": content_id, "tenant": "acme", "action": action, "label": "harassment", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "moderator"}
+        ctx.kafka.seed(TOPIC, key=content_id, value=json.dumps(event))
 
 
 def check_persist_before_commit(ctx):
     m = ctx.load("events")
-    for n, action in ((1, "remove"), (2, "restore")):
-        event = {"action_id": f"case-{n}:{action}", "case_id": f"case-{n}", "content_id": "c-1", "tenant": "acme", "action": action, "label": "harassment", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "moderator"}
-        ctx.kafka.seed(TOPIC, key="c-1", value=json.dumps(event))
-    persisted = []
-    ctx.kafka.on_commit(lambda group, offsets: persisted.append(ctx.redis.llen("actions:c-1")))
+    _seed_actions(ctx, "c-1", ("case-1", "remove"), ("case-2", "restore"))
+    commits, early = [], []
+
+    def at_commit(group, offsets):
+        committed = len(ctx.kafka.records(TOPIC)) - ctx.kafka.lag(GROUP, TOPIC)
+        stored = ctx.redis.llen("actions:c-1") + ctx.redis.llen("actions:c-2")
+        commits.append(committed)
+        if stored < committed:
+            early.append(f"{committed} records committed with {stored} actions stored")
+
+    ctx.kafka.on_commit(at_commit)
     ctx.drain(m.consume_actions)
-    assert persisted, "the consumer committed nothing"
-    assert persisted == [1, 2], f"at each commit the store held {persisted} actions on c-1, expected [1, 2]: an offset committed before its action is written loses the action if the consumer crashes in between"
+    assert commits, "the consumer committed nothing"
+    assert not early, f"{early[0]}: an offset committed before its action is written loses the action if the consumer crashes in between"
     actions = [a["action"] for a in store.actions_of("c-1")]
     assert actions == ["remove", "restore"], f"the store holds {actions} for c-1, expected remove then restore"
     assert ctx.kafka.lag(GROUP, TOPIC) == 0, f"the consumer left {ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted"
+    # The store refuses the second action on c-2 (its id set is no longer a set): that record must stay uncommitted.
+    _seed_actions(ctx, "c-2", ("case-3", "remove"), ("case-4", "restore"))
+    broken = ctx.redis_after("actions:c-2", lambda: ctx.redis.set("actions:c-2:ids", "unreadable"))
+    try:
+        ctx.drain(m.consume_actions)
+    except Exception:
+        pass  # a consumer may stop on a failed write; it may not commit it
+    assert broken.fired, "the first action on c-2 was never stored"
+    assert not early, f"{early[0]}: the store refused the second action on c-2 and its offset was committed anyway, so it is never retried"
+    lag = ctx.kafka.lag(GROUP, TOPIC)
+    assert lag == 1, f"after the store refused the second action on c-2 the group has {lag} record(s) uncommitted, expected 1: only a written action may be committed"
 `,
     typescript: `const TOPIC = 'moderation.action';
 const GROUP = 'moderation-actions';
@@ -1064,22 +1113,55 @@ export async function check_outbox(ctx) {
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'a refused produce cannot be on the topic');
   assert.equal(await m.publishAction(reportCase, RESTORE), true, 'once the broker answers again publishAction must answer true');
   assert.equal(outbox(ctx).length, 1, 'a delivered action leaves no outbox row');
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  const unanswered = await m.publishAction(reportCase, {...REMOVE, action: 'escalate'});
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 2.5, \`publishAction waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the delivery report at most 2 s\`);
+  const later = outbox(ctx);
+  assert(
+    later.length === 2 && JSON.parse(later[1].payload ?? '{}').action_id === \`\${reportCase.case_id}:escalate\`,
+    \`no delivery report within 2 s and the outbox holds \${JSON.stringify(later)}: an unanswered produce is a refusal\`,
+  );
+  assert.equal(unanswered, false, \`publishAction answered \${unanswered} without a delivery report, expected false\`);
+}
+
+function seedActions(ctx, contentId: string, ...caseActions: [string, string][]) {
+  for (const [caseId, action] of caseActions) {
+    const event = {action_id: \`\${caseId}:\${action}\`, case_id: caseId, content_id: contentId, tenant: 'acme', action, label: 'harassment', confidence: 0.99, model_version: 'clf-2026-10', actor: 'moderator'};
+    ctx.kafka.seed(TOPIC, {key: contentId, value: JSON.stringify(event)});
+  }
 }
 
 export async function check_persist_before_commit(ctx) {
   const {m, store} = events(ctx);
-  for (const [n, action] of [[1, 'remove'], [2, 'restore']]) {
-    const event = {action_id: \`case-\${n}:\${action}\`, case_id: \`case-\${n}\`, content_id: 'c-1', tenant: 'acme', action, label: 'harassment', confidence: 0.99, model_version: 'clf-2026-10', actor: 'moderator'};
-    ctx.kafka.seed(TOPIC, {key: 'c-1', value: JSON.stringify(event)});
-  }
-  const persisted: number[] = [];
-  ctx.kafka.onCommit(() => persisted.push(ctx.redis.llen('actions:c-1')));
+  seedActions(ctx, 'c-1', ['case-1', 'remove'], ['case-2', 'restore']);
+  const commits: number[] = [];
+  const early: string[] = [];
+  ctx.kafka.onCommit(() => {
+    const committed = ctx.kafka.records(TOPIC).length - ctx.kafka.lag(GROUP, TOPIC);
+    const stored = Number(ctx.redis.llen('actions:c-1')) + Number(ctx.redis.llen('actions:c-2'));
+    commits.push(committed);
+    if (stored < committed) early.push(\`\${committed} records committed with \${stored} actions stored\`);
+  });
   await ctx.drain(m.consumeActions());
-  assert(persisted.length > 0, 'the consumer committed nothing');
-  assert.deepStrictEqual(persisted, [1, 2], \`at each commit the store held \${JSON.stringify(persisted)} actions on c-1, expected [1, 2]: an offset committed before its action is written loses the action if the consumer crashes in between\`);
+  assert(commits.length > 0, 'the consumer committed nothing');
+  assert.equal(early.length, 0, \`\${early[0]}: an offset committed before its action is written loses the action if the consumer crashes in between\`);
   const actions = (await store.actionsOf('c-1')).map(a => a.action);
   assert.deepStrictEqual(actions, ['remove', 'restore'], \`the store holds \${JSON.stringify(actions)} for c-1, expected remove then restore\`);
   assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, \`the consumer left \${ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted\`);
+  // The store refuses the second action on c-2 (its id set is no longer a set): that record must stay uncommitted.
+  seedActions(ctx, 'c-2', ['case-3', 'remove'], ['case-4', 'restore']);
+  const broken = ctx.redisAfter('actions:c-2', () => ctx.redis.set('actions:c-2:ids', 'unreadable'));
+  try {
+    await ctx.drain(m.consumeActions());
+  } catch {
+    // a consumer may stop on a failed write; it may not commit it
+  }
+  assert(broken.fired, 'the first action on c-2 was never stored');
+  assert.equal(early.length, 0, \`\${early[0]}: the store refused the second action on c-2 and its offset was committed anyway, so it is never retried\`);
+  const lag = ctx.kafka.lag(GROUP, TOPIC);
+  assert.equal(lag, 1, \`after the store refused the second action on c-2 the group has \${lag} record(s) uncommitted, expected 1: only a written action may be committed\`);
 }
 `,
     go: `package main
@@ -1183,28 +1265,59 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Equal(publishAction(eventsBg, reportCase, eventsRestore), true, "once the broker answers again, publishAction")
 	ctx.Settle()
 	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered action leaves no outbox row; rows")
+	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	escalate := eventsRemove
+	escalate.Action = "escalate"
+	unanswered := publishAction(eventsBg, reportCase, escalate)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 2.5, "publishAction waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited)
+	ctx.Settle()
+	rows = eventsOutbox(ctx)
+	var later map[string]any
+	if len(rows) == 2 {
+		json.Unmarshal([]byte(rows[1]["payload"]), &later)
+	}
+	ctx.Assert(len(rows) == 2 && later["action_id"] == reportCase.CaseID+":escalate", "no delivery report within 2 s and the outbox holds %v: an unanswered produce is a refusal", rows)
+	ctx.Equal(unanswered, false, "publishAction without a delivery report")
+}
+
+func eventsSeedActions(ctx *harness.Ctx, contentID string, caseActions ...[2]string) {
+	for _, ca := range caseActions {
+		event := map[string]any{"action_id": ca[0] + ":" + ca[1], "case_id": ca[0], "content_id": contentID, "tenant": "acme", "action": ca[1], "label": "harassment", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "moderator"}
+		raw, _ := json.Marshal(event)
+		ctx.Kafka.Seed(eventsTopic, contentID, string(raw))
+	}
 }
 
 func CheckPersistBeforeCommit(ctx *harness.Ctx) {
-	for n, action := range []string{"remove", "restore"} {
-		caseID := fmt.Sprintf("case-%d", n+1)
-		event := map[string]any{"action_id": caseID + ":" + action, "case_id": caseID, "content_id": "c-1", "tenant": "acme", "action": action, "label": "harassment", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "moderator"}
-		raw, _ := json.Marshal(event)
-		ctx.Kafka.Seed(eventsTopic, "c-1", string(raw))
-	}
-	var persisted []int64
+	eventsSeedActions(ctx, "c-1", [2]string{"case-1", "remove"}, [2]string{"case-2", "restore"})
+	commits := 0
+	var early []string
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
-		persisted = append(persisted, ctx.Redis.LLen("actions:c-1"))
+		committed := int64(len(ctx.Kafka.Records(eventsTopic))) - ctx.Kafka.Lag("moderation-actions", eventsTopic)
+		stored := ctx.Redis.LLen("actions:c-1") + ctx.Redis.LLen("actions:c-2")
+		commits++
+		if stored < committed {
+			early = append(early, fmt.Sprintf("%d records committed with %d actions stored", committed, stored))
+		}
 	})
 	ctx.Drain(func() { consumeActions(eventsBg) })
-	ctx.Assert(len(persisted) > 0, "the consumer committed nothing")
-	ctx.Equal(persisted, []int64{1, 2}, "at each commit the store must already hold the committed action (an offset committed before its action is written loses the action if the consumer crashes in between); the actions on c-1 at each commit")
+	ctx.Assert(commits > 0, "the consumer committed nothing")
+	ctx.Assert(len(early) == 0, "%v: an offset committed before its action is written loses the action if the consumer crashes in between", early)
 	var actions []string
 	for _, a := range store.ActionsOf(eventsBg, "c-1") {
 		actions = append(actions, fmt.Sprint(a["action"]))
 	}
 	ctx.Equal(actions, []string{"remove", "restore"}, "the actions stored for c-1")
 	ctx.Equal(ctx.Kafka.Lag("moderation-actions", eventsTopic), int64(0), "records the consumer left uncommitted")
+	// The store refuses the second action on c-2 (its id set is no longer a set): that record must stay uncommitted.
+	eventsSeedActions(ctx, "c-2", [2]string{"case-3", "remove"}, [2]string{"case-4", "restore"})
+	broken := ctx.Redis.After("actions:c-2", func() any { return ctx.Redis.Set("actions:c-2:ids", "unreadable") })
+	ctx.Drain(func() { consumeActions(eventsBg) }) // a consumer may stop on a failed write; it may not commit it
+	ctx.Assert(broken.Fired, "the first action on c-2 was never stored")
+	ctx.Assert(len(early) == 0, "%v: the store refused the second action on c-2 and its offset was committed anyway, so it is never retried", early)
+	ctx.Equal(ctx.Kafka.Lag("moderation-actions", eventsTopic), int64(1), "after the store refused the second action on c-2, only a written action may be committed; records left uncommitted")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1297,34 +1410,75 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(publishAction(report_case, kRestore), true, "once the broker answers again, publishAction");
   ctx.Settle();
   ctx.Equal(eventsOutbox(ctx).size(), 1, "a delivered action leaves no outbox row; rows");
+  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const int64_t before = ctx.Clock.Now();
+  ModerationAction escalate = kRemove;
+  escalate.action = "escalate";
+  const bool unanswered = publishAction(report_case, escalate);
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 2.5, "publishAction waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited);
+  ctx.Settle();
+  const auto later = eventsOutbox(ctx);
+  const auto escalated = later.size() == 2 && later[1].is_object() ? nlohmann::json::parse(later[1].value("payload", "{}"), nullptr, false) : nlohmann::json();
+  ctx.Assert(escalated.is_object() && escalated.value("action_id", "") == report_case.case_id + ":escalate",
+             "no delivery report within 2 s and the outbox holds %d rows: an unanswered produce is a refusal", later.size());
+  ctx.Equal(unanswered, false, "publishAction without a delivery report");
 }
 
-void CheckPersistBeforeCommit(harness::Ctx& ctx) {
-  int n = 0;
-  for (const std::string action : {"remove", "restore"}) {
-    const std::string case_id = "case-" + std::to_string(++n);
-    const nlohmann::json event = {{"action_id", case_id + ":" + action}, {"case_id", case_id},  {"content_id", "c-1"},
+namespace {
+
+void seedActions(harness::Ctx& ctx, const std::string& content_id, const std::vector<std::pair<std::string, std::string>>& case_actions) {
+  for (const auto& [case_id, action] : case_actions) {
+    const nlohmann::json event = {{"action_id", case_id + ":" + action}, {"case_id", case_id},  {"content_id", content_id},
                                   {"tenant", "acme"},                    {"action", action},    {"label", "harassment"},
                                   {"confidence", 0.99},                  {"model_version", "clf-2026-10"}, {"actor", "moderator"}};
-    ctx.Kafka.Seed(kEventsTopic, std::string("c-1"), event.dump());
+    ctx.Kafka.Seed(kEventsTopic, content_id, event.dump());
   }
-  auto persisted = std::make_shared<std::vector<long long>>();
-  ctx.Kafka.OnCommit([&ctx, persisted](const std::string&, const harness::KafkaOffsets&) { persisted->push_back(ctx.Redis.LLen("actions:c-1")); });
+}
+
+}  // namespace
+
+void CheckPersistBeforeCommit(harness::Ctx& ctx) {
+  seedActions(ctx, "c-1", {{"case-1", "remove"}, {"case-2", "restore"}});
+  auto commits = std::make_shared<int>(0);
+  auto early = std::make_shared<std::vector<std::string>>();
+  ctx.Kafka.OnCommit([&ctx, commits, early](const std::string&, const harness::KafkaOffsets&) {
+    const int64_t committed = static_cast<int64_t>(ctx.Kafka.Records(kEventsTopic).size()) - ctx.Kafka.Lag("moderation-actions", kEventsTopic);
+    const int64_t stored = ctx.Redis.LLen("actions:c-1") + ctx.Redis.LLen("actions:c-2");
+    ++*commits;
+    if (stored < committed) early->push_back(std::to_string(committed) + " records committed with " + std::to_string(stored) + " actions stored");
+  });
   ctx.Drain([] { consumeActions(); });
-  ctx.Assert(!persisted->empty(), "the consumer committed nothing");
-  ctx.Equal(*persisted, std::vector<long long>{1, 2},
-            "at each commit the store must already hold the committed action (an offset committed before its action is written loses the action if the consumer crashes in between); the actions on c-1 at each commit");
+  ctx.Assert(*commits > 0, "the consumer committed nothing");
+  ctx.Assert(early->empty(), "%s: an offset committed before its action is written loses the action if the consumer crashes in between", early->empty() ? "" : early->front());
   std::vector<std::string> actions;
   for (const auto& a : store::actionsOf("c-1")) actions.push_back(a.value("action", ""));
   ctx.Equal(actions, std::vector<std::string>{"remove", "restore"}, "the actions stored for c-1");
   ctx.Equal(ctx.Kafka.Lag("moderation-actions", kEventsTopic), 0, "records the consumer left uncommitted");
+  // The store refuses the second action on c-2 (its id set is no longer a set): that record must stay uncommitted.
+  seedActions(ctx, "c-2", {{"case-3", "remove"}, {"case-4", "restore"}});
+  auto broken = std::make_shared<bool>(false);
+  ctx.Redis.After("actions:c-2", [&ctx, broken] {
+    *broken = true;
+    ctx.Redis.Set("actions:c-2:ids", "unreadable");
+  });
+  try {
+    ctx.Drain([] { consumeActions(); });
+  } catch (const std::exception&) {
+    // a consumer may stop on a failed write; it may not commit it
+  }
+  ctx.Assert(*broken, "the first action on c-2 was never stored");
+  ctx.Assert(early->empty(), "%s: the store refused the second action on c-2 and its offset was committed anyway, so it is never retried",
+             early->empty() ? "" : early->front());
+  ctx.Equal(ctx.Kafka.Lag("moderation-actions", kEventsTopic), 1,
+            "after the store refused the second action on c-2, only a written action may be committed; records left uncommitted");
 }
 `,
   },
   hints: [
     'Remove a post on one report and restore it on another: the consumer can apply the restore first. Read a record off the topic: it names the reporter. Make the broker refuse a produce: `publish_action` still answers true, and nothing records the removal.',
     'The key is the case id, and two reports on one post are two cases; `build_event` spreads the whole case; the producer acknowledges on the leader alone and retries blind; the delivery callback only logs; the consumer commits before it writes.',
-    'Key by `report_case["content_id"]`; name the nine event fields one by one; `enable.idempotence: True` with `acks: all`; in the delivery callback call `store.insert_outbox(TOPIC, key, payload)` on an error and answer false; `store.put_action`, then `consumer.commit`.',
+    'Key by `report_case["content_id"]`; name the nine event fields one by one; `enable.idempotence: True` with `acks: all`; record the delivery callback’s error, and after `flush(2.0)` call `store.insert_outbox(TOPIC, key, payload)` and answer false when it holds an error or never ran; `store.put_action`, then `consumer.commit`, so a write that raises is never committed.',
   ],
   debrief: `The key is the content id because a partition is the only unit Kafka keeps in order, and every action on one post must be applied in the order it was decided, whichever report it came from. The event carries ids and evidence because the topic is retained and copied to every consumer; the reporter's identity and words stay in the case store, behind the case file's access rules. Idempotence with \`acks=all\` makes a retried produce land once on every replica, and the outbox row written from the delivery report makes a refused one late instead of lost. Persisting before committing turns a crash into a replay, which \`put_action\` absorbs by action id. Production pipelines also version the event schema and relay the outbox in order per key.`,
 };

@@ -20,8 +20,8 @@ user's id in the body; a request with thousands of candidates, or none, goes str
 the response grows with the request and says nothing about where each item sits; and a list from the
 popularity fallback looks the same as the model's.
 
-- The user is the authenticated \`X-User-Id\` header only; a missing \`X-Tenant-Id\` or \`X-User-Id\` is
-  **401** before anything is ranked.
+- The user is the authenticated \`X-User-Id\` header only, whether or not the body names a \`user_id\`; a
+  missing \`X-Tenant-Id\` or \`X-User-Id\` is **401** before anything is ranked.
 - \`candidate_ids\` holds 1 to \`MAX_CANDIDATES\` = 500 ids; otherwise **400**, before the ranker is
   called.
 - Answer at most \`MAX_ITEMS\` = 30 items, the top of the ranked order, each \`{id, score, position}\`
@@ -74,7 +74,7 @@ popularity fallback looks the same as the model's.
       id: 'auth-user',
       title: 'Ranks for the X-User-Id caller, never a body user',
       detail:
-        'The user comes from the authenticated `X-User-Id` header and a missing header is **401**; the starter prefers a `user_id` in the body, so any caller can request any user’s personalized list.',
+        'The user comes from the authenticated `X-User-Id` header and a missing header is **401**, even when the body names a `user_id`; a body `user_id` may be ignored or refused with 400 or 422, but never ranked for. The starter prefers a `user_id` in the body, so any caller can request any user’s personalized list.',
       match: {
         python: {all: [/x-user-id/i, /\b401\b/], none: [/body\.user_id/]},
         typescript: {all: [/x-user-id/i, /code\(\s*401\s*\)/], none: [/body\.user_id/]},
@@ -552,7 +552,7 @@ def _score(item_id):
 
 class Ranker(ranking_pb2_grpc.RankerServicer):
     def Rank(self, request, context):
-        items = sorted(request.candidate_ids, key=lambda c: -_score(c))
+        items = _model_order(request.candidate_ids, request.surface)
         return ranking_pb2.RankResponse(items=[ranking_pb2.ScoredItem(id=c, score=_score(c)) for c in items], model_version="ranker-v7")
 
 
@@ -571,8 +571,10 @@ def _candidates(n):
     return [f"c-{i}" for i in range(1, n + 1)]
 
 
-def _model_order(ids):
-    return sorted(ids, key=lambda c: -_score(c))
+def _model_order(ids, surface="home"):
+    order = sorted(ids, key=lambda c: -_score(c))
+    # On the promo surface the ranker pins its lowest-scored candidate, a sponsored slot, on top.
+    return order[-1:] + order[:-1] if surface == "promo" else order
 
 
 async def _post(c, body, user="u-1", tenant="t1"):
@@ -587,20 +589,27 @@ async def _post(c, body, user="u-1", tenant="t1"):
 async def check_route(ctx):
     async with _api(ctx) as c:
         r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5)})
-    assert r.status_code == 200, f"POST /v1/recommendations answered {r.status_code}: {r.text}"
+        assert r.status_code == 200, f"POST /v1/recommendations answered {r.status_code}: {r.text}"
+        ids = [item.get("id") for item in r.json().get("items", [])]
+        assert ids == _model_order(_candidates(5)), f"the response lists {ids}, expected the ranker's order {_model_order(_candidates(5))}"
+        r = await _post(c, {"surface": "promo", "candidate_ids": _candidates(5)})
     ids = [item.get("id") for item in r.json().get("items", [])]
-    assert ids == _model_order(_candidates(5)), f"the response lists {ids}, expected the ranker's order {_model_order(_candidates(5))}"
+    assert ids == _model_order(_candidates(5), "promo"), f"on the promo surface the response lists {ids}, expected the ranker's order {_model_order(_candidates(5), 'promo')}: the ranker's order is not always by score, so keep it as rank returns it"
 
 
 async def check_auth_user(ctx):
     async with _api(ctx) as c:
         r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5), "user_id": "u-2"}, user="u-1")
-        assert r.status_code == 200, f"a request from u-1 answered {r.status_code}: {r.text}"
+        refused = r.status_code in (400, 422)
+        assert r.status_code == 200 or refused, f"a request from u-1 carrying a body user_id answered {r.status_code}: {r.text}. Rank it for u-1, or refuse the field with 400 or 422"
         ranked_for = [call.request.user_id for call in ctx.grpc.calls_to("Rank")]
-        assert ranked_for == ["u-1"], f"the list was ranked for {ranked_for}: the body's user_id chose whose personalization came back. The user is the authenticated X-User-Id"
+        assert ranked_for == ([] if refused else ["u-1"]), f"the list was ranked for {ranked_for}: the body's user_id chose whose personalization came back. The user is the authenticated X-User-Id"
+        r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5), "user_id": "u-2"}, user=None)
+        assert r.status_code == 401 or (refused and r.status_code in (400, 422)), f"a request without X-User-Id naming user_id u-2 in its body answered {r.status_code}, expected 401: a caller without the header must not choose the user"
         r = await _post(c, {"surface": "home", "candidate_ids": _candidates(5)}, user=None)
         assert r.status_code == 401, f"a request without X-User-Id answered {r.status_code}, expected 401"
-        assert len(ctx.grpc.calls_to("Rank")) == 1, "a request without X-User-Id reached the ranker"
+        ranked_for = [call.request.user_id for call in ctx.grpc.calls_to("Rank")]
+        assert ranked_for == ([] if refused else ["u-1"]), f"a request without X-User-Id reached the ranker (ranked for {ranked_for})"
 
 
 async def check_candidate_cap(ctx):
@@ -636,13 +645,17 @@ async def check_model_version(ctx):
 `,
     typescript: `const score = (id: string): number => ((Number(id.split('-')[1]) * 37) % 101) / 100;
 const candidates = (n: number): string[] => Array.from({length: n}, (_, i) => \`c-\${i + 1}\`);
-const modelOrder = (ids: string[]): string[] => [...ids].sort((a, b) => score(b) - score(a));
+const modelOrder = (ids: string[], surface = 'home'): string[] => {
+  const order = [...ids].sort((a, b) => score(b) - score(a));
+  // On the promo surface the ranker pins its lowest-scored candidate, a sponsored slot, on top.
+  return surface === 'promo' ? [...order.slice(-1), ...order.slice(0, -1)] : order;
+};
 
 function api(ctx) {
   const pkg = ctx.proto('ranking.proto');
   ctx.grpc.serve(pkg.recsys.Ranker.service, {
     Rank(call, callback) {
-      const items = modelOrder(call.request.candidate_ids).map(id => ({id, score: score(id)}));
+      const items = modelOrder(call.request.candidate_ids, call.request.surface).map(id => ({id, score: score(id)}));
       callback(null, {items, model_version: 'ranker-v7'});
     },
   });
@@ -662,21 +675,28 @@ function post(c, body, user: string | null = 'u-1') {
 
 export async function check_route(ctx) {
   const c = api(ctx);
-  const r = await post(c, {surface: 'home', candidate_ids: candidates(5)});
+  let r = await post(c, {surface: 'home', candidate_ids: candidates(5)});
   assert.equal(r.status, 200, \`POST /v1/recommendations answered \${r.status}: \${r.text}\`);
-  const ids = (r.json().items ?? []).map(item => item.id);
+  let ids = (r.json().items ?? []).map(item => item.id);
   assert.deepStrictEqual(ids, modelOrder(candidates(5)), \`the response lists \${JSON.stringify(ids)}, expected the ranker's order\`);
+  r = await post(c, {surface: 'promo', candidate_ids: candidates(5)});
+  ids = (r.json().items ?? []).map(item => item.id);
+  assert.deepStrictEqual(ids, modelOrder(candidates(5), 'promo'), \`on the promo surface the response lists \${JSON.stringify(ids)}, expected the ranker's order: the ranker's order is not always by score, so keep it as rank returns it\`);
 }
 
 export async function check_auth_user(ctx) {
   const c = api(ctx);
   let r = await post(c, {surface: 'home', candidate_ids: candidates(5), user_id: 'u-2'}, 'u-1');
-  assert.equal(r.status, 200, \`a request from u-1 answered \${r.status}: \${r.text}\`);
-  const rankedFor = ctx.grpc.callsTo('Rank').map(call => call.request.user_id);
-  assert.deepStrictEqual(rankedFor, ['u-1'], \`the list was ranked for \${JSON.stringify(rankedFor)}: the body's user_id chose whose personalization came back. The user is the authenticated X-User-Id\`);
+  const refused = r.status === 400 || r.status === 422;
+  assert(r.status === 200 || refused, \`a request from u-1 carrying a body user_id answered \${r.status}: \${r.text}. Rank it for u-1, or refuse the field with 400 or 422\`);
+  let rankedFor = ctx.grpc.callsTo('Rank').map(call => call.request.user_id);
+  assert.deepStrictEqual(rankedFor, refused ? [] : ['u-1'], \`the list was ranked for \${JSON.stringify(rankedFor)}: the body's user_id chose whose personalization came back. The user is the authenticated X-User-Id\`);
+  r = await post(c, {surface: 'home', candidate_ids: candidates(5), user_id: 'u-2'}, null);
+  assert(r.status === 401 || (refused && (r.status === 400 || r.status === 422)), \`a request without X-User-Id naming user_id u-2 in its body answered \${r.status}, expected 401: a caller without the header must not choose the user\`);
   r = await post(c, {surface: 'home', candidate_ids: candidates(5)}, null);
   assert.equal(r.status, 401, \`a request without X-User-Id answered \${r.status}, expected 401\`);
-  assert.equal(ctx.grpc.callsTo('Rank').length, 1, 'a request without X-User-Id reached the ranker');
+  rankedFor = ctx.grpc.callsTo('Rank').map(call => call.request.user_id);
+  assert.deepStrictEqual(rankedFor, refused ? [] : ['u-1'], \`a request without X-User-Id reached the ranker (ranked for \${JSON.stringify(rankedFor)})\`);
 }
 
 export async function check_candidate_cap(ctx) {
@@ -745,9 +765,13 @@ func candidates(n int) []string {
 	return out
 }
 
-func modelOrder(ids []string) []string {
+func modelOrder(ids []string, surface string) []string {
 	out := append([]string{}, ids...)
 	sort.SliceStable(out, func(i, j int) bool { return modelScore(out[i]) > modelScore(out[j]) })
+	// On the promo surface the ranker pins its lowest-scored candidate, a sponsored slot, on top.
+	if surface == "promo" && len(out) > 0 {
+		out = append([]string{out[len(out)-1]}, out[:len(out)-1]...)
+	}
 	return out
 }
 
@@ -758,7 +782,7 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 		rankedFor = append(rankedFor, userID)
 		ids := candidateIDs
 		if !rankerDown {
-			ids = modelOrder(candidateIDs)
+			ids = modelOrder(candidateIDs, surface)
 		}
 		items := []types.Item{}
 		for _, id := range ids {
@@ -811,17 +835,26 @@ func CheckRoute(ctx *harness.Ctx) {
 	c := api(ctx)
 	r, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
 	ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text())
-	ctx.Equal(idsOf(rec), modelOrder(candidates(5)), "the response must list the ranker's order; it lists")
+	ctx.Equal(idsOf(rec), modelOrder(candidates(5), "home"), "the response must list the ranker's order; it lists")
+	_, rec = recommendFor(c, "u-1", map[string]any{"surface": "promo", "candidate_ids": candidates(5)})
+	ctx.Equal(idsOf(rec), modelOrder(candidates(5), "promo"), "on the promo surface the ranker's order is not by score: the response must keep it as rank returns it; it lists")
 }
 
 func CheckAuthUser(ctx *harness.Ctx) {
 	c := api(ctx)
 	r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5), "user_id": "u-2"})
-	ctx.Equal(r.Status, 200, "a request from u-1 (%s)", r.Text())
-	ctx.Equal(rankedFor, []string{"u-1"}, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for")
+	refused := r.Status == 400 || r.Status == 422
+	ctx.Assert(r.Status == 200 || refused, "a request from u-1 carrying a body user_id answered %d (%s): rank it for u-1, or refuse the field with 400 or 422", r.Status, r.Text())
+	want := []string{"u-1"}
+	if refused {
+		want = []string{}
+	}
+	ctx.Equal(rankedFor, want, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for")
+	r, _ = recommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": candidates(5), "user_id": "u-2"})
+	ctx.Assert(r.Status == 401 || (refused && (r.Status == 400 || r.Status == 422)), "a request without X-User-Id naming user_id u-2 in its body answered %d, expected 401: a caller without the header must not choose the user", r.Status)
 	r, _ = recommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
 	ctx.Equal(r.Status, 401, "a request without X-User-Id")
-	ctx.Equal(len(rankedFor), 1, "a request without X-User-Id must not reach the ranker; the rank calls")
+	ctx.Equal(rankedFor, want, "a request without X-User-Id must not reach the ranker; the list was ranked for")
 }
 
 func CheckCandidateCap(ctx *harness.Ctx) {
@@ -840,7 +873,7 @@ func CheckTopK(ctx *harness.Ctx) {
 	r, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(100)})
 	ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text())
 	ctx.Equal(len(rec.Items), 30, "a request with 100 candidates must answer the top maxItems = 30, not grow with the request; the items")
-	ctx.Equal(idsOf(rec), modelOrder(candidates(100))[:30], "the 30 items must be the top of the ranked order; they are")
+	ctx.Equal(idsOf(rec), modelOrder(candidates(100), "home")[:30], "the 30 items must be the top of the ranked order; they are")
 	for i, item := range rec.Items {
 		ctx.Assert(item.Position != nil && *item.Position == i, "item %d (%s) carries position %v, expected %d: each item carries its zero-based position in served order", i, item.ID, item.Position, i)
 	}
@@ -878,8 +911,10 @@ std::vector<std::string> candidates(int n) {
   return out;
 }
 
-std::vector<std::string> modelOrder(std::vector<std::string> ids) {
+std::vector<std::string> modelOrder(std::vector<std::string> ids, const std::string& surface = "home") {
   std::stable_sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return modelScore(a) > modelScore(b); });
+  // On the promo surface the ranker pins its lowest-scored candidate, a sponsored slot, on top.
+  if (surface == "promo" && !ids.empty()) std::rotate(ids.begin(), ids.end() - 1, ids.end());
   return ids;
 }
 
@@ -913,10 +948,10 @@ std::vector<std::string> idsOf(const nlohmann::json& body) {
 
 }  // namespace
 
-recs::Ranked rank(const std::string&, const std::string& user_id, const std::string&, const std::vector<std::string>& candidate_ids) {
+recs::Ranked rank(const std::string&, const std::string& user_id, const std::string& surface, const std::vector<std::string>& candidate_ids) {
   rankedFor.push_back(user_id);
   recs::Ranked out;
-  for (const auto& id : rankerDown ? candidate_ids : modelOrder(candidate_ids)) out.items.push_back(recs::Item{id, modelScore(id)});
+  for (const auto& id : rankerDown ? candidate_ids : modelOrder(candidate_ids, surface)) out.items.push_back(recs::Item{id, modelScore(id)});
   out.model_version = rankerDown ? "popularity-v1" : "ranker-v7";
   out.fallback = rankerDown;
   return out;
@@ -924,19 +959,25 @@ recs::Ranked rank(const std::string&, const std::string& user_id, const std::str
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = api(ctx);
-  const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}});
+  auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}});
   ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text());
   ctx.Equal(idsOf(parsed(r)), modelOrder(candidates(5)), "the response must list the ranker's order; it lists");
+  r = post(c, {{"surface", "promo"}, {"candidate_ids", candidates(5)}});
+  ctx.Equal(idsOf(parsed(r)), modelOrder(candidates(5), "promo"), "on the promo surface the ranker's order is not by score: the response must keep it as rank returns it; it lists");
 }
 
 void CheckAuthUser(harness::Ctx& ctx) {
   auto c = api(ctx);
   auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}, {"user_id", "u-2"}}, "u-1");
-  ctx.Equal(r.Status, 200, "a request from u-1 (%s)", r.Text());
-  ctx.Equal(rankedFor, {"u-1"}, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for");
+  const bool refused = r.Status == 400 || r.Status == 422;
+  ctx.Assert(r.Status == 200 || refused, "a request from u-1 carrying a body user_id answered %d (%s): rank it for u-1, or refuse the field with 400 or 422", r.Status, r.Text());
+  const std::vector<std::string> want = refused ? std::vector<std::string>{} : std::vector<std::string>{"u-1"};
+  ctx.Equal(rankedFor, want, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for");
+  r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}, {"user_id", "u-2"}}, "");
+  ctx.Assert(r.Status == 401 || (refused && (r.Status == 400 || r.Status == 422)), "a request without X-User-Id naming user_id u-2 in its body answered %d, expected 401: a caller without the header must not choose the user", r.Status);
   r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}, "");
   ctx.Equal(r.Status, 401, "a request without X-User-Id");
-  ctx.Equal(rankedFor.size(), 1, "a request without X-User-Id must not reach the ranker; the rank calls");
+  ctx.Equal(rankedFor, want, "a request without X-User-Id must not reach the ranker; the list was ranked for");
 }
 
 void CheckCandidateCap(harness::Ctx& ctx) {

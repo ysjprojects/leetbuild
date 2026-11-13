@@ -19,14 +19,16 @@ request without a policy silently gets last-write-wins; last-write-wins is accep
 clocks disagree by seconds; and a \`PATCH\` changes the policy of a running replication, so rows merged
 under the old rule stay as they were.
 
-- \`(source_region, target_region)\` must be in \`APPROVED_REGION_PAIRS\` (the pair is ordered); any
-  other pair is **400** and nothing is stored.
+- \`(source_region, target_region)\` must be in \`APPROVED_REGION_PAIRS\`, the ordered pairs \`us-east-1 →
+  eu-west-1\`, \`eu-west-1 → us-east-1\` and \`us-east-1 → us-west-2\` (the pair is ordered); any other pair
+  is **400** and nothing is stored.
 - \`conflict_policy\` is required and one of \`CONFLICT_POLICIES\` (\`source-wins\`, \`version-vector\`,
-  \`manual\`, \`last-write-wins\`); absent or unknown is **400**.
+  \`manual\`, \`last-write-wins\`, spelled exactly so); absent or unknown is **400**.
 - \`last-write-wins\` orders writes by wall clock: refuse it with **400** when
-  \`regions.clock_skew_ms(source, target)\` exceeds \`SKEW_BOUND_MS\` (250).
-- The policy is frozen: a \`PATCH\` with another policy is **409** naming the policy immutable; the same
-  policy answers the replication unchanged.`,
+  \`regions.clock_skew_ms(source, target)\` exceeds \`SKEW_BOUND_MS\` (250); a skew of exactly 250 ms is
+  still accepted.
+- The policy is frozen, whichever policy the replication started with: a \`PATCH\` with another policy is
+  **409** naming the policy immutable; the same policy answers the replication unchanged.`,
   sequence: {
     participants: ['Operator', 'replicatord', 'Region clocks', 'replications store'],
     messages: [
@@ -61,7 +63,7 @@ under the old rule stay as they were.
       id: 'approved-regions',
       title: 'Only an approved ordered region pair starts a replication',
       detail:
-        'The ordered pair `(source_region, target_region)` is looked up in the approved set before anything is stored; any other pair is **400**.',
+        'The ordered pair `(source_region, target_region)` is looked up in the approved set (`us-east-1 → eu-west-1`, `eu-west-1 → us-east-1`, `us-east-1 → us-west-2`) before anything is stored; any other pair is **400**.',
       match: {
         python: {all: [/APPROVED_REGION_PAIRS\s*=/, /not in APPROVED_REGION_PAIRS/]},
         typescript: {
@@ -76,7 +78,7 @@ under the old rule stay as they were.
       id: 'conflict-policy',
       title: 'The conflict policy is required and comes from the documented set',
       detail:
-        '`conflict_policy` is checked against `CONFLICT_POLICIES` and an absent or unknown one is **400**; nothing defaults it to `last-write-wins`.',
+        '`conflict_policy` is checked against `CONFLICT_POLICIES` and an absent or unknown one is **400** (`newest-wins`, `toString`); nothing defaults it to `last-write-wins`, and `Last-Write-Wins` never slips past the skew bound.',
       match: {
         python: {all: [/CONFLICT_POLICIES\s*=/, /not in CONFLICT_POLICIES/], none: [/or\s*["']last-write-wins["']/]},
         typescript: {
@@ -98,7 +100,7 @@ under the old rule stay as they were.
       id: 'skew-bound',
       title: 'Last-write-wins is refused when the clocks disagree',
       detail:
-        'For `last-write-wins` the measured skew (`clock_skew_ms`/`clockSkewMs`) is compared with `SKEW_BOUND_MS` (250 ms) and a larger skew is **400**.',
+        'For `last-write-wins` the measured skew (`clock_skew_ms`/`clockSkewMs`) is compared with `SKEW_BOUND_MS` (250 ms): a larger skew is **400**, exactly 250 ms is accepted.',
       match: {
         python: {all: [/SKEW_BOUND_MS\s*=\s*250/, /regions\.clock_skew_ms\(/]},
         typescript: {all: [/SKEW_BOUND_MS\s*=\s*250/, /clockSkewMs\(/]},
@@ -111,7 +113,7 @@ under the old rule stay as they were.
       id: 'policy-immutable',
       title: 'The conflict policy is frozen once the replication exists',
       detail:
-        '`PATCH` compares the requested policy with the stored one and answers **409** (`immutable`) when they differ; it never rewrites the policy (`set_policy`/`setPolicy`).',
+        '`PATCH` compares the requested policy with the stored one and answers **409** (`immutable`) when they differ, `manual` included; it never rewrites the policy (`set_policy`/`setPolicy`).',
       match: {
         python: {all: [/\b409\b/, /immutable/], none: [/store\.set_policy\(/]},
         typescript: {all: [/\b409\b/, /immutable/], none: [/setPolicy\(/]},
@@ -847,6 +849,11 @@ async def check_conflict_policy(ctx):
         assert r.status_code == 400, f"a create without conflict_policy answered {r.status_code} ({r.text}), expected 400: no policy may be chosen for the operator"
         r = await c.post("/v1/replications", json=_body(policy="newest-wins"), headers=OPS)
         assert r.status_code == 400, f"the unknown policy newest-wins answered {r.status_code}, expected 400"
+        r = await c.post("/v1/replications", json=_body(policy="toString"), headers=OPS)
+        assert r.status_code == 400, f"the unknown policy toString answered {r.status_code}, expected 400"
+        ctx.redis.set("skew:us-east-1:eu-west-1", 400)
+        r = await c.post("/v1/replications", json=_body(policy="Last-Write-Wins"), headers=OPS)
+        assert r.status_code == 400, f"conflict_policy Last-Write-Wins with the clocks 400 ms apart answered {r.status_code}, expected 400: it is not a documented policy, and as last-write-wins the skew refuses it"
         assert _stored(ctx) == [], f"refused requests stored {_stored(ctx)}"
         r = await c.post("/v1/replications", json=_body(policy="manual"), headers=OPS)
     assert r.status_code == 201 and r.json().get("conflict_policy") == "manual", f"a create with manual answered {r.status_code} {r.text}"
@@ -860,9 +867,12 @@ async def check_skew_bound(ctx):
         assert _stored(ctx) == [], f"a refused last-write-wins stored {_stored(ctx)}"
         r = await c.post("/v1/replications", json=_body(policy="source-wins"), headers=OPS)
         assert r.status_code == 201, f"source-wins reads no clock and must be accepted at any skew, got {r.status_code} {r.text}"
-        ctx.redis.set("skew:us-east-1:eu-west-1", 100)
+        ctx.redis.set("skew:us-east-1:eu-west-1", 250)
         r = await c.post("/v1/replications", json=_body(policy="last-write-wins"), headers=OPS)
-    assert r.status_code == 201, f"last-write-wins with the clocks 100 ms apart answered {r.status_code} {r.text}, expected 201"
+        assert r.status_code == 201, f"last-write-wins with the clocks exactly 250 ms apart answered {r.status_code} {r.text}, expected 201: only a skew above SKEW_BOUND_MS is refused"
+        ctx.redis.set("skew:us-east-1:eu-west-1", 251)
+        r = await c.post("/v1/replications", json=_body(policy="last-write-wins"), headers=OPS)
+    assert r.status_code == 400, f"last-write-wins with the clocks 251 ms apart answered {r.status_code}, expected 400 (SKEW_BOUND_MS is 250)"
 
 
 async def check_policy_immutable(ctx):
@@ -874,7 +884,12 @@ async def check_policy_immutable(ctx):
         stored = store.get(created["id"])
         assert stored["conflict_policy"] == "source-wins", f"the stored policy became {stored['conflict_policy']}: a refused PATCH must not write"
         r = await c.patch(f"/v1/replications/{created['id']}", json={"conflict_policy": "source-wins"}, headers=OPS)
-    assert r.status_code == 200 and r.json().get("conflict_policy") == "source-wins", f"a PATCH with the same policy answered {r.status_code} {r.text}"
+        assert r.status_code == 200 and r.json().get("conflict_policy") == "source-wins", f"a PATCH with the same policy answered {r.status_code} {r.text}"
+        manual = (await c.post("/v1/replications", json=_body(policy="manual"), headers=OPS)).json()
+        r = await c.patch(f"/v1/replications/{manual['id']}", json={"conflict_policy": "last-write-wins"}, headers=OPS)
+    assert r.status_code == 409, f"switching a manual replication to last-write-wins answered {r.status_code}, expected 409: manual is a policy like any other and is frozen too"
+    stored = store.get(manual["id"])
+    assert stored["conflict_policy"] == "manual", f"the stored policy of the manual replication became {stored['conflict_policy']}: a refused PATCH must not write"
 `,
     typescript: `const OPS = {'X-Operator-Id': 'ops-a'};
 
@@ -920,6 +935,11 @@ export async function check_conflict_policy(ctx) {
   assert.equal(r.status, 400, \`a create without conflict_policy answered \${r.status} (\${r.text}), expected 400: no policy may be chosen for the operator\`);
   r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'newest-wins'), headers: OPS});
   assert.equal(r.status, 400, \`the unknown policy newest-wins answered \${r.status}, expected 400\`);
+  r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'toString'), headers: OPS});
+  assert.equal(r.status, 400, \`the unknown policy toString answered \${r.status}, expected 400\`);
+  ctx.redis.set('skew:us-east-1:eu-west-1', '400');
+  r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'Last-Write-Wins'), headers: OPS});
+  assert.equal(r.status, 400, \`conflict_policy Last-Write-Wins with the clocks 400 ms apart answered \${r.status}, expected 400: it is not a documented policy, and as last-write-wins the skew refuses it\`);
   assert.deepStrictEqual(stored(ctx), [], \`refused requests stored \${JSON.stringify(stored(ctx))}\`);
   r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'manual'), headers: OPS});
   assert(r.status === 201 && r.json().conflict_policy === 'manual', \`a create with manual answered \${r.status} \${r.text}\`);
@@ -933,9 +953,12 @@ export async function check_skew_bound(ctx) {
   assert.deepStrictEqual(stored(ctx), [], \`a refused last-write-wins stored \${JSON.stringify(stored(ctx))}\`);
   r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'source-wins'), headers: OPS});
   assert.equal(r.status, 201, \`source-wins reads no clock and must be accepted at any skew, got \${r.status} \${r.text}\`);
-  ctx.redis.set('skew:us-east-1:eu-west-1', '100');
+  ctx.redis.set('skew:us-east-1:eu-west-1', '250');
   r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'last-write-wins'), headers: OPS});
-  assert.equal(r.status, 201, \`last-write-wins with the clocks 100 ms apart answered \${r.status} \${r.text}, expected 201\`);
+  assert.equal(r.status, 201, \`last-write-wins with the clocks exactly 250 ms apart answered \${r.status} \${r.text}, expected 201: only a skew above SKEW_BOUND_MS is refused\`);
+  ctx.redis.set('skew:us-east-1:eu-west-1', '251');
+  r = await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'last-write-wins'), headers: OPS});
+  assert.equal(r.status, 400, \`last-write-wins with the clocks 251 ms apart answered \${r.status}, expected 400 (SKEW_BOUND_MS is 250)\`);
 }
 
 export async function check_policy_immutable(ctx) {
@@ -948,6 +971,11 @@ export async function check_policy_immutable(ctx) {
   assert.equal(row.conflict_policy, 'source-wins', \`the stored policy became \${row.conflict_policy}: a refused PATCH must not write\`);
   r = await c.patch(\`/v1/replications/\${created.id}\`, {json: {conflict_policy: 'source-wins'}, headers: OPS});
   assert(r.status === 200 && r.json().conflict_policy === 'source-wins', \`a PATCH with the same policy answered \${r.status} \${r.text}\`);
+  const manual = (await c.post('/v1/replications', {json: body('us-east-1', 'eu-west-1', 'manual'), headers: OPS})).json();
+  r = await c.patch(\`/v1/replications/\${manual.id}\`, {json: {conflict_policy: 'last-write-wins'}, headers: OPS});
+  assert.equal(r.status, 409, \`switching a manual replication to last-write-wins answered \${r.status}, expected 409: manual is a policy like any other and is frozen too\`);
+  const manualRow = await store.get(manual.id);
+  assert.equal(manualRow.conflict_policy, 'manual', \`the stored policy of the manual replication became \${manualRow.conflict_policy}: a refused PATCH must not write\`);
 }
 `,
     go: `package main
@@ -1029,6 +1057,11 @@ func CheckConflictPolicy(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 400, "a create without conflict_policy (%s): no policy may be chosen for the operator", r.Text())
 	r = create(c, "us-east-1", "eu-west-1", "newest-wins")
 	ctx.Equal(r.Status, 400, "the unknown policy newest-wins")
+	r = create(c, "us-east-1", "eu-west-1", "toString")
+	ctx.Equal(r.Status, 400, "the unknown policy toString")
+	ctx.Redis.Set("skew:us-east-1:eu-west-1", "400")
+	r = create(c, "us-east-1", "eu-west-1", "Last-Write-Wins")
+	ctx.Equal(r.Status, 400, "conflict_policy Last-Write-Wins with the clocks 400 ms apart: it is not a documented policy, and as last-write-wins the skew refuses it")
 	ctx.Equal(stored(ctx), []string{}, "refused requests must store nothing; stored")
 	r = create(c, "us-east-1", "eu-west-1", "manual")
 	ctx.Assert(r.Status == 201 && strings.Contains(r.Text(), \`"manual"\`), "a create with manual answered %d %s", r.Status, r.Text())
@@ -1042,9 +1075,12 @@ func CheckSkewBound(ctx *harness.Ctx) {
 	ctx.Equal(stored(ctx), []string{}, "a refused last-write-wins must store nothing; stored")
 	r = create(c, "us-east-1", "eu-west-1", "source-wins")
 	ctx.Equal(r.Status, 201, "source-wins reads no clock and must be accepted at any skew (%s)", r.Text())
-	ctx.Redis.Set("skew:us-east-1:eu-west-1", "100")
+	ctx.Redis.Set("skew:us-east-1:eu-west-1", "250")
 	r = create(c, "us-east-1", "eu-west-1", "last-write-wins")
-	ctx.Equal(r.Status, 201, "last-write-wins with the clocks 100 ms apart (%s)", r.Text())
+	ctx.Equal(r.Status, 201, "last-write-wins with the clocks exactly 250 ms apart (%s): only a skew above skewBoundMS is refused", r.Text())
+	ctx.Redis.Set("skew:us-east-1:eu-west-1", "251")
+	r = create(c, "us-east-1", "eu-west-1", "last-write-wins")
+	ctx.Equal(r.Status, 400, "last-write-wins with the clocks 251 ms apart (skewBoundMS is 250)")
 }
 
 func CheckPolicyImmutable(ctx *harness.Ctx) {
@@ -1057,6 +1093,11 @@ func CheckPolicyImmutable(ctx *harness.Ctx) {
 	ctx.Equal(row.ConflictPolicy, "source-wins", "a refused PATCH must not write; the stored policy")
 	r = c.Patch("/v1/replications/"+id, map[string]string{"conflict_policy": "source-wins"}, "X-Operator-Id", "ops-a")
 	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"source-wins"\`), "a PATCH with the same policy answered %d %s", r.Status, r.Text())
+	manual := idOf(create(c, "us-east-1", "eu-west-1", "manual"))
+	r = c.Patch("/v1/replications/"+manual, map[string]string{"conflict_policy": "last-write-wins"}, "X-Operator-Id", "ops-a")
+	ctx.Equal(r.Status, 409, "switching a manual replication to last-write-wins: manual is a policy like any other and is frozen too")
+	row, _ = store.Get(context.Background(), manual)
+	ctx.Equal(row.ConflictPolicy, "manual", "a refused PATCH must not write; the stored policy of the manual replication")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1136,6 +1177,11 @@ void CheckConflictPolicy(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 400, "a create without conflict_policy (%s): no policy may be chosen for the operator", r.Text());
   r = create(c, "us-east-1", "eu-west-1", "newest-wins");
   ctx.Equal(r.Status, 400, "the unknown policy newest-wins");
+  r = create(c, "us-east-1", "eu-west-1", "toString");
+  ctx.Equal(r.Status, 400, "the unknown policy toString");
+  ctx.Redis.Set("skew:us-east-1:eu-west-1", "400");
+  r = create(c, "us-east-1", "eu-west-1", "Last-Write-Wins");
+  ctx.Equal(r.Status, 400, "conflict_policy Last-Write-Wins with the clocks 400 ms apart: it is not a documented policy, and as last-write-wins the skew refuses it");
   ctx.Equal(stored(ctx), std::vector<std::string>{}, "refused requests must store nothing; stored");
   r = create(c, "us-east-1", "eu-west-1", "manual");
   ctx.Assert(r.Status == 201 && field(r, "conflict_policy") == "manual", "a create with manual answered %d %s", r.Status, r.Text());
@@ -1149,9 +1195,12 @@ void CheckSkewBound(harness::Ctx& ctx) {
   ctx.Equal(stored(ctx), std::vector<std::string>{}, "a refused last-write-wins must store nothing; stored");
   r = create(c, "us-east-1", "eu-west-1", "source-wins");
   ctx.Equal(r.Status, 201, "source-wins reads no clock and must be accepted at any skew (%s)", r.Text());
-  ctx.Redis.Set("skew:us-east-1:eu-west-1", "100");
+  ctx.Redis.Set("skew:us-east-1:eu-west-1", "250");
   r = create(c, "us-east-1", "eu-west-1", "last-write-wins");
-  ctx.Equal(r.Status, 201, "last-write-wins with the clocks 100 ms apart (%s)", r.Text());
+  ctx.Equal(r.Status, 201, "last-write-wins with the clocks exactly 250 ms apart (%s): only a skew above kSkewBoundMs is refused", r.Text());
+  ctx.Redis.Set("skew:us-east-1:eu-west-1", "251");
+  r = create(c, "us-east-1", "eu-west-1", "last-write-wins");
+  ctx.Equal(r.Status, 400, "last-write-wins with the clocks 251 ms apart (kSkewBoundMs is 250)");
 }
 
 void CheckPolicyImmutable(harness::Ctx& ctx) {
@@ -1163,6 +1212,10 @@ void CheckPolicyImmutable(harness::Ctx& ctx) {
   ctx.Equal(store::get(id)->conflict_policy, "source-wins", "a refused PATCH must not write; the stored policy");
   r = patch(c, id, "source-wins");
   ctx.Assert(r.Status == 200 && field(r, "conflict_policy") == "source-wins", "a PATCH with the same policy answered %d %s", r.Status, r.Text());
+  const std::string manual = field(create(c, "us-east-1", "eu-west-1", "manual"), "id");
+  r = patch(c, manual, "last-write-wins");
+  ctx.Equal(r.Status, 409, "switching a manual replication to last-write-wins: manual is a policy like any other and is frozen too");
+  ctx.Equal(store::get(manual)->conflict_policy, "manual", "a refused PATCH must not write; the stored policy of the manual replication");
 }
 `,
   },

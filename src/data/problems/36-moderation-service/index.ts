@@ -57,8 +57,9 @@ queue intake (\`moderation.queue.enqueue\`, on \`moderation:pending\` and \`mode
    **400 ms** deadline, retries only on \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, \`auto_remove\` only
    at **0.98** with a corroborating signal, everything else queued for people.
 4. A **Kafka** \`moderation.action\` topic: \`publish_action(report_case, action)\` keyed by content id,
-   idempotent with \`acks=all\`, no reporter identity or report text in the event, an outbox row from
-   the delivery report; \`consume_actions()\` persists with \`store.put_action\` before it commits.
+   idempotent with \`acks=all\`, no reporter identity or report text in the event, an outbox row when
+   the delivery report refuses the record or does not come within **2 s**; \`consume_actions()\`
+   persists with \`store.put_action\` before it commits.
 5. \`GET /v1/moderation/items/{case_id}\`: the case file (status, actions, links) scoped to the
    case's tenant (**404** otherwise), \`reporter_id\` only for the \`surveyor\` role, the detail cut to
    280 characters and escaped.

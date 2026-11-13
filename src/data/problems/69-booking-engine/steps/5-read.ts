@@ -97,7 +97,7 @@ guest in Tokyo asking for Tuesday, and a request for two years of slots.
       id: 'timezone-echo',
       title: 'Resolves the zone, names it, rejects an unknown one',
       detail:
-        'Without `tz` the day is Berlin’s and the response says so; `tz=Asia/Tokyo` moves the day’s slots nine hours and is echoed; an unknown zone is **400** `unknown_timezone`. The starter uses UTC and names nothing.',
+        'Without `tz` the day is Berlin’s and the response says so; `tz=Asia/Tokyo` moves the day’s slots nine hours and is echoed; an unknown zone, `constructor` included, is **400** `unknown_timezone`. The starter uses UTC and names nothing.',
       match: {
         python: {all: [/["']timezone["']\s*:/, /unknown_timezone/, /zone_known\(/, /day_fields\(/]},
         typescript: {all: [/timezone:/, /unknown_timezone/, /zoneKnown\(/, /dayFields\(/]},
@@ -650,8 +650,10 @@ async def check_route(ctx):
 
 async def check_range_cap(ctx):
     m = ctx.load("read")
+    probe = ctx.redis_after(slots_key("r1"), lambda: None)
     r = await _get(ctx, m, to="2026-06-09")  # 91 days
     assert r.status_code == 400 and r.json().get("error") == "range_too_long", f"a 91-day span answered {r.status_code} {r.text}, expected 400 range_too_long"
+    assert not probe.fired, "a 91-day span was refused only after reading resource:r1:slots: refuse it before any slot work"
     r = await _get(ctx, m, to="2026-06-08")  # 90 days
     assert r.status_code == 200, f"a 90-day span answered {r.status_code}: {r.text}"
     assert len(_slots(r)) == 91 * len(BERLIN), f"a 90-day span of free days lists {len(_slots(r))} slots, expected {91 * len(BERLIN)}"
@@ -703,6 +705,8 @@ async def check_timezone_echo(ctx):
     assert _slots(r) == _instants(TOKYO[1:]), f"Tokyo's day starts at 23:00Z the day before and its 08:00 slot is booked, got {_slots(r)[:1]} … {_slots(r)[-1:]} ({len(_slots(r))} slots)"
     r = await _get(ctx, m, tz="Mars/Olympus")
     assert r.status_code == 400 and r.json().get("error") == "unknown_timezone", f"an unknown zone answered {r.status_code} {r.text}, expected 400 unknown_timezone"
+    r = await _get(ctx, m, tz="constructor")
+    assert r.status_code == 400 and r.json().get("error") == "unknown_timezone", f"tz=constructor answered {r.status_code} {r.text}, expected 400 unknown_timezone: only the zones booking/tz lists are known"
 `,
     typescript: `import {dayFields, holdKey, slotsKey} from 'booking/slots';
 import {formatInstant} from 'booking/tz';
@@ -733,8 +737,10 @@ export async function check_route(ctx) {
 
 export async function check_range_cap(ctx) {
   const c = read(ctx);
+  const probe = ctx.redisAfter(slotsKey('r1'), () => undefined);
   let r = await get(c, {to: '2026-06-09'}); // 91 days
   assert(r.status === 400 && r.json().error === 'range_too_long', \`a 91-day span answered \${r.status} \${r.text}, expected 400 range_too_long\`);
+  assert(!probe.fired, 'a 91-day span was refused only after reading resource:r1:slots: refuse it before any slot work');
   r = await get(c, {to: '2026-06-08'}); // 90 days
   assert.equal(r.status, 200, \`a 90-day span answered \${r.status}: \${r.text}\`);
   assert.equal(slotsOf(r).length, 91 * BERLIN.length, \`a 90-day span of free days lists \${slotsOf(r).length} slots, expected \${91 * BERLIN.length}\`);
@@ -787,6 +793,8 @@ export async function check_timezone_echo(ctx) {
   assert.deepEqual(slotsOf(r), instants(TOKYO.slice(1)), \`Tokyo's day starts at 23:00Z the day before and its 08:00 slot is booked, got \${slotsOf(r)[0]} … \${slotsOf(r).at(-1)} (\${slotsOf(r).length} slots)\`);
   r = await get(c, {tz: 'Mars/Olympus'});
   assert(r.status === 400 && r.json().error === 'unknown_timezone', \`an unknown zone answered \${r.status} \${r.text}, expected 400 unknown_timezone\`);
+  r = await get(c, {tz: 'constructor'});
+  assert(r.status === 400 && r.json().error === 'unknown_timezone', \`tz=constructor answered \${r.status} \${r.text}, expected 400 unknown_timezone: only the zones booking/tz lists are known\`);
 }
 `,
     go: `package main
@@ -866,8 +874,10 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckRangeCap(ctx *harness.Ctx) {
 	c := readClient(ctx)
+	probe := ctx.Redis.After(slots.Key("r1"), func() any { return nil })
 	r := c.Get("/v1/resources/r1/availability?from=" + readDay + "&to=2026-06-09") // 91 days
 	ctx.Assert(r.Status == 400 && readDecode(ctx, r).Error == "range_too_long", "a 91-day span answered %d %s, expected 400 range_too_long", r.Status, r.Text())
+	ctx.Assert(!probe.Fired, "a 91-day span was refused only after reading resource:r1:slots: refuse it before any slot work")
 	r = c.Get("/v1/resources/r1/availability?from=" + readDay + "&to=2026-06-08") // 90 days
 	ctx.Equal(r.Status, 200, "a 90-day span (%s)", r.Text())
 	ctx.Equal(len(readSlots(ctx, r)), 91*len(readBerlin), "a 90-day span of free days; its slots")
@@ -921,6 +931,8 @@ func CheckTimezoneEcho(ctx *harness.Ctx) {
 	ctx.Equal(readSlots(ctx, r), readInstants(readTokyo[1:]), "Tokyo's day starts at 23:00Z the day before and its 08:00 slot is booked")
 	r = readGet(c, "&tz=Mars/Olympus")
 	ctx.Assert(r.Status == 400 && readDecode(ctx, r).Error == "unknown_timezone", "an unknown zone answered %d %s, expected 400 unknown_timezone", r.Status, r.Text())
+	r = readGet(c, "&tz=constructor")
+	ctx.Assert(r.Status == 400 && readDecode(ctx, r).Error == "unknown_timezone", "tz=constructor answered %d %s, expected 400 unknown_timezone: only the zones booking/tz lists are known", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -985,9 +997,12 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckRangeCap(harness::Ctx& ctx) {
   auto c = readClient(ctx);
+  bool touched = false;
+  ctx.Redis.After(booking::slots::Key("r1"), [&] { touched = true; });
   auto r = c.Get("/v1/resources/r1/availability?from=" + kReadDay + "&to=2026-06-09");  // 91 days
   ctx.Assert(r.Status == 400 && readField(readBody(ctx, r), "error") == "range_too_long",
              "a 91-day span answered %d %s, expected 400 range_too_long", r.Status, r.Text());
+  ctx.Assert(!touched, "a 91-day span was refused only after reading resource:r1:slots: refuse it before any slot work");
   r = c.Get("/v1/resources/r1/availability?from=" + kReadDay + "&to=2026-06-08");  // 90 days
   ctx.Equal(r.Status, 200, "a 90-day span (%s)", r.Text());
   ctx.Equal(readSlots(ctx, r).size(), 91 * kReadBerlin.size(), "a 90-day span of free days; its slots");
@@ -1045,6 +1060,10 @@ void CheckTimezoneEcho(harness::Ctx& ctx) {
   r = readGet(c, "&tz=Mars/Olympus");
   ctx.Assert(r.Status == 400 && readField(readBody(ctx, r), "error") == "unknown_timezone",
              "an unknown zone answered %d %s, expected 400 unknown_timezone", r.Status, r.Text());
+  r = readGet(c, "&tz=constructor");
+  ctx.Assert(r.Status == 400 && readField(readBody(ctx, r), "error") == "unknown_timezone",
+             "tz=constructor answered %d %s, expected 400 unknown_timezone: only the zones booking/tz lists are known", r.Status,
+             r.Text());
 }
 `,
   },

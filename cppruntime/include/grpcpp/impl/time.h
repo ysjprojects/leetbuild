@@ -1,5 +1,6 @@
-// Deadlines as the runtime's virtual time: milliseconds since the epoch (infinity: none). A
-// system_clock or steady_clock time point reads the same virtual clock here.
+// Deadlines as the runtime's virtual time: milliseconds since the epoch (infinity: none). As in
+// grpc++, a deadline is a std::chrono::system_clock::time_point: grpc::TimePoint<T> has no
+// specialization for another clock, so a steady_clock deadline does not compile.
 #pragma once
 
 #include <chrono>
@@ -7,9 +8,18 @@
 
 namespace grpc::internal {
 
-template <class C, class D>
-double to_ms(const std::chrono::time_point<C, D>& t) {
-  if (t == std::chrono::time_point<C, D>::max()) return std::numeric_limits<double>::infinity();
+template <class T>
+inline constexpr bool kSystemTimePoint = false;
+template <class D>
+inline constexpr bool kSystemTimePoint<std::chrono::time_point<std::chrono::system_clock, D>> = true;
+
+template <class T>
+double to_ms(const T& t) {
+  static_assert(kSystemTimePoint<T>,
+                "grpc::TimePoint<T> has no specialization for this type: a gRPC deadline is a "
+                "std::chrono::system_clock::time_point (std::chrono::system_clock::now() + timeout); "
+                "steady_clock and other clocks do not convert");
+  if (t == T::max()) return std::numeric_limits<double>::infinity();
   return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count();
 }
 

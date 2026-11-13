@@ -7,6 +7,7 @@
  * query log a DBA would read and lands harness probes right after a matching statement.
  */
 import type {DbBridge} from '../db';
+import {CLOCK} from './clock';
 
 export class DatabaseError extends Error {
   constructor(message: string) {
@@ -95,9 +96,13 @@ export class Db {
     this.learnerStatements = 0;
   }
 
-  /** One statement with autocommit, from the harness; rows as objects keyed by column name. */
+  /**
+   * One statement with autocommit, from the harness; rows as objects keyed by column name. The
+   * harness is a client like any other: its reply, too, arrives on a later macrotask, so a harness
+   * that polls the database gives the learner's clients their turns.
+   */
   async execute<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R[]> {
-    const {rows} = await this.run<R>(sql, params, false, false);
+    const {rows} = await overTheWire(() => this.run<R>(sql, params, false, false));
     return rows;
   }
 
@@ -239,6 +244,19 @@ const textOf = (q: QueryArg): string => (typeof q === 'string' ? q : q.text);
 const valuesOf = (q: QueryArg, values: unknown[] | undefined): unknown[] =>
   typeof q === 'string' ? values ?? [] : q.values ?? values ?? [];
 
+/**
+ * node-postgres settles a query when the server's reply is read off the socket: on a later
+ * macrotask, so work the caller never awaited is still in flight when the code that moved on
+ * finishes. The statement itself runs on the server when it is sent.
+ */
+const overTheWire = async <T>(statement: () => Promise<T>): Promise<T> => {
+  try {
+    return await statement();
+  } finally {
+    await CLOCK.reply();
+  }
+};
+
 /** A client checked out of the pool: holds the connection until `release()`. */
 export class PoolClient {
   /** @internal resolves when the connection is held. */
@@ -263,7 +281,7 @@ export class PoolClient {
   async query<R = Record<string, unknown>>(q: QueryArg, values?: unknown[]): Promise<QueryResult<R>> {
     if (this.released) throw new DatabaseError('Client was released back to the pool: query after release()');
     await this.connected;
-    return DB.run<R>(textOf(q), valuesOf(q, values), true);
+    return overTheWire(() => DB.run<R>(textOf(q), valuesOf(q, values), true));
   }
 
   release(): void {
@@ -291,13 +309,14 @@ export class Pool {
 
   /** One statement on a pooled connection (autocommit). */
   async query<R = Record<string, unknown>>(q: QueryArg, values?: unknown[]): Promise<QueryResult<R>> {
-    return DB.run<R>(textOf(q), valuesOf(q, values));
+    return overTheWire(() => DB.run<R>(textOf(q), valuesOf(q, values)));
   }
 
   /** Check out a client; `BEGIN`…`COMMIT` on it is a transaction. Release it, or the pool is empty. */
   async connect(): Promise<PoolClient> {
     const client = new PoolClient();
     await client.connected;
+    await CLOCK.reply();
     return client;
   }
 
@@ -318,6 +337,7 @@ export class Client {
     if (this.client !== null) return;
     this.client = new PoolClient();
     await this.client.connected;
+    await CLOCK.reply();
   }
 
   async query<R = Record<string, unknown>>(q: QueryArg, values?: unknown[]): Promise<QueryResult<R>> {

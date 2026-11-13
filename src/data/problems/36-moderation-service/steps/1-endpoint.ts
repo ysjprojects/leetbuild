@@ -21,9 +21,10 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
 
 - The content must belong to the calling tenant: a foreign id answers exactly as an unknown one,
   **404**.
-- \`reason\` is one of \`ALLOWED_REASONS\` (\`spam\`, \`harassment\`, \`hate\`, \`self_harm\`, \`csam\`);
-  anything else is **400**.
+- \`reason\` is one of \`ALLOWED_REASONS\` (\`spam\`, \`harassment\`, \`hate\`, \`self_harm\`, \`csam\`),
+  matched exactly; anything else is **400**.
 - \`detail\` (default \`""\`) is at most \`MAX_DETAIL_BYTES\` = **4096 bytes** of UTF-8; more is **413**.
+- Both rules hold for every report, a repeat included: a refused report changes nothing.
 - A repeat report from the same reporter on the same content updates that case
   (\`store.find_case\`, \`store.update_case\`) and answers **200** \`{case_id, status: "updated"}\`.`,
   sequence: {
@@ -67,7 +68,8 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
     {
       id: 'reason-allowlist',
       title: 'Rejects a reason outside the allowlist',
-      detail: 'A reason outside `ALLOWED_REASONS` is **400** and opens nothing; the starter files it under `other`.',
+      detail:
+        'A reason outside `ALLOWED_REASONS` (`spamm`, `other`, `SPAM`, empty) is **400** and opens nothing, and a repeat report with such a reason is **400** and leaves the case as it was; the starter files it under `other`.',
       match: {
         python: {all: [/ALLOWED_REASONS/, /status_code\s*=\s*400/], none: [/["']other["']/]},
         typescript: {all: [/ALLOWED_REASONS/, /code\(\s*400\s*\)/], none: [/['"]other['"]/]},
@@ -80,7 +82,7 @@ the 4 KiB cap; and a reporter who reports the same post twice opens two cases.
       id: 'detail-bytes',
       title: 'Caps the detail at 4096 bytes of UTF-8',
       detail:
-        'The detail is measured in UTF-8 bytes against `MAX_DETAIL_BYTES` and a larger one is **413**; the starter counts characters, so accented or emoji text passes at twice to four times the cap.',
+        'The detail is measured in UTF-8 bytes against `MAX_DETAIL_BYTES`: 3,000 `é` or 2,000 CJK characters are **413**, while 4,096 bytes of `é` and 3,000 ASCII characters open a case, and a repeat report over the cap is **413** and leaves the case as it was; the starter counts characters, so accented or emoji text passes at twice to four times the cap.',
       match: {
         python: {all: [/MAX_DETAIL_BYTES/, /len\([^)\n]*\.encode\(/], none: [/len\(body\.detail\)\s*>/]},
         typescript: {
@@ -639,24 +641,37 @@ async def check_tenant_scope(ctx):
 
 async def check_reason_allowlist(ctx):
     async with _api(ctx) as c:
-        for reason in ("spamm", "other", ""):
+        for reason in ("spamm", "other", "SPAM", ""):
             r = await _report(c, reason=reason)
             assert r.status_code == 400, f"a report with reason {reason!r} answered {r.status_code}, expected 400"
         assert _cases(ctx) == [], f"rejected reasons opened {_cases(ctx)}"
         r = await _report(c, reason="self_harm")
-    assert r.status_code == 201, f"a report with reason 'self_harm' answered {r.status_code}: {r.text}"
-    assert store.get_case(r.json()["case_id"])["reason"] == "self_harm", "the case must keep the reason the reporter chose"
+        assert r.status_code == 201, f"a report with reason 'self_harm' answered {r.status_code}: {r.text}"
+        case_id = r.json()["case_id"]
+        assert store.get_case(case_id)["reason"] == "self_harm", "the case must keep the reason the reporter chose"
+        repeat = await _report(c, reason="spamm")
+    assert repeat.status_code == 400, f"u-17 reporting c-1 again with reason 'spamm' answered {repeat.status_code}, expected 400: a repeat report is held to the same allowlist"
+    case = store.get_case(case_id)
+    assert case["reason"] == "self_harm" and case["reports"] == 1, f"a rejected repeat report changed the case: {case}"
 
 
 async def check_detail_bytes(ctx):
     async with _api(ctx) as c:
         accented = await _report(c, detail="é" * 3000)
         long = await _report(c, detail="a" * 4097)
+        cjk = await _report(c, detail="界" * 2000)
         exact = await _report(c, detail="é" * 2048)
+        ascii_ = await _report(c, detail="a" * 3000, headers={"X-Tenant-Id": "acme", "X-Reporter-Id": "u-18"})
+        repeat = await _report(c, detail="é" * 3000)
     assert accented.status_code == 413, f"a detail of 3000 accented characters (6000 bytes of UTF-8) answered {accented.status_code}, expected 413: the cap is in bytes"
     assert long.status_code == 413, f"a detail of 4097 bytes answered {long.status_code}, expected 413"
+    assert cjk.status_code == 413, f"a detail of 2000 CJK characters (6000 bytes of UTF-8) answered {cjk.status_code}, expected 413: the cap is in bytes"
     assert exact.status_code == 201, f"a detail of exactly 4096 bytes answered {exact.status_code}: {exact.text}"
-    assert len(_cases(ctx)) == 1, f"only the report within the cap may open a case, Redis holds {_cases(ctx)}"
+    assert ascii_.status_code == 201, f"a detail of 3000 ASCII characters (3000 bytes) answered {ascii_.status_code}: {ascii_.text}"
+    assert repeat.status_code == 413, f"u-17 reporting c-1 again with a 6000-byte detail answered {repeat.status_code}, expected 413: a repeat report is held to the same cap"
+    assert len(_cases(ctx)) == 2, f"only the reports within the cap may open a case, Redis holds {_cases(ctx)}"
+    case = store.get_case(exact.json()["case_id"])
+    assert case["detail"] == "é" * 2048 and case["reports"] == 1, f"a rejected repeat report changed the case: it holds {case['reports']} reports and a {len(case['detail'].encode('utf-8'))}-byte detail"
 
 
 async def check_dedupe(ctx):
@@ -713,25 +728,41 @@ export async function check_tenant_scope(ctx) {
 
 export async function check_reason_allowlist(ctx) {
   const {c, store} = api(ctx);
-  for (const reason of ['spamm', 'other', '']) {
+  for (const reason of ['spamm', 'other', 'SPAM', '']) {
     const r = await report(c, {reason});
     assert.equal(r.status, 400, \`a report with reason \${JSON.stringify(reason)} answered \${r.status}, expected 400\`);
   }
   assert.deepStrictEqual(cases(ctx), [], \`rejected reasons opened \${JSON.stringify(cases(ctx))}\`);
   const r = await report(c, {reason: 'self_harm'});
   assert.equal(r.status, 201, \`a report with reason 'self_harm' answered \${r.status}: \${r.text}\`);
-  assert.equal((await store.getCase(r.json().case_id)).reason, 'self_harm', 'the case must keep the reason the reporter chose');
+  const caseId = r.json().case_id;
+  assert.equal((await store.getCase(caseId)).reason, 'self_harm', 'the case must keep the reason the reporter chose');
+  const repeat = await report(c, {reason: 'spamm'});
+  assert.equal(repeat.status, 400, \`u-17 reporting c-1 again with reason 'spamm' answered \${repeat.status}, expected 400: a repeat report is held to the same allowlist\`);
+  const stored = await store.getCase(caseId);
+  assert(stored.reason === 'self_harm' && stored.reports === 1, \`a rejected repeat report changed the case: \${JSON.stringify(stored)}\`);
 }
 
 export async function check_detail_bytes(ctx) {
-  const {c} = api(ctx);
+  const {c, store} = api(ctx);
   const accented = await report(c, {detail: 'é'.repeat(3000)});
   const long = await report(c, {detail: 'a'.repeat(4097)});
+  const cjk = await report(c, {detail: '界'.repeat(2000)});
   const exact = await report(c, {detail: 'é'.repeat(2048)});
+  const ascii = await report(c, {detail: 'a'.repeat(3000), headers: {'X-Tenant-Id': 'acme', 'X-Reporter-Id': 'u-18'}});
+  const repeat = await report(c, {detail: 'é'.repeat(3000)});
   assert.equal(accented.status, 413, \`a detail of 3000 accented characters (6000 bytes of UTF-8) answered \${accented.status}, expected 413: the cap is in bytes\`);
   assert.equal(long.status, 413, \`a detail of 4097 bytes answered \${long.status}, expected 413\`);
+  assert.equal(cjk.status, 413, \`a detail of 2000 CJK characters (6000 bytes of UTF-8) answered \${cjk.status}, expected 413: the cap is in bytes\`);
   assert.equal(exact.status, 201, \`a detail of exactly 4096 bytes answered \${exact.status}: \${exact.text}\`);
-  assert.equal(cases(ctx).length, 1, \`only the report within the cap may open a case, Redis holds \${JSON.stringify(cases(ctx))}\`);
+  assert.equal(ascii.status, 201, \`a detail of 3000 ASCII characters (3000 bytes) answered \${ascii.status}: \${ascii.text}\`);
+  assert.equal(repeat.status, 413, \`u-17 reporting c-1 again with a 6000-byte detail answered \${repeat.status}, expected 413: a repeat report is held to the same cap\`);
+  assert.equal(cases(ctx).length, 2, \`only the reports within the cap may open a case, Redis holds \${JSON.stringify(cases(ctx))}\`);
+  const stored = await store.getCase(exact.json().case_id);
+  assert(
+    stored.detail === 'é'.repeat(2048) && stored.reports === 1,
+    \`a rejected repeat report changed the case: it holds \${stored.reports} reports and a \${Buffer.byteLength(stored.detail)}-byte detail\`,
+  );
 }
 
 export async function check_dedupe(ctx) {
@@ -811,25 +842,38 @@ func CheckTenantScope(ctx *harness.Ctx) {
 
 func CheckReasonAllowlist(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	for _, reason := range []string{"spamm", "other", ""} {
+	for _, reason := range []string{"spamm", "other", "SPAM", ""} {
 		r := apiReport(c, "c-1", reason, "")
 		ctx.Equal(r.Status, 400, "a report with reason %q", reason)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 0, "rejected reasons must open no case; cases")
 	r := apiReport(c, "c-1", "self_harm", "")
 	ctx.Equal(r.Status, 201, "a report with reason self_harm (%s)", r.Text())
-	ctx.Equal(store.GetCase(apiBg, apiField(r, "case_id")).Reason, "self_harm", "the case must keep the reason the reporter chose")
+	caseID := apiField(r, "case_id")
+	ctx.Equal(store.GetCase(apiBg, caseID).Reason, "self_harm", "the case must keep the reason the reporter chose")
+	repeat := apiReport(c, "c-1", "spamm", "")
+	ctx.Equal(repeat.Status, 400, "u-17 reporting c-1 again with reason spamm: a repeat report is held to the same allowlist")
+	stored := store.GetCase(apiBg, caseID)
+	ctx.Assert(stored.Reason == "self_harm" && stored.Reports == 1, "a rejected repeat report changed the case: %+v", stored)
 }
 
 func CheckDetailBytes(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	accented := apiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
 	long := apiReport(c, "c-1", "spam", strings.Repeat("a", 4097))
+	cjk := apiReport(c, "c-1", "spam", strings.Repeat("界", 2000))
 	exact := apiReport(c, "c-1", "spam", strings.Repeat("é", 2048))
+	ascii := apiReport(c, "c-1", "spam", strings.Repeat("a", 3000), "X-Tenant-Id", "acme", "X-Reporter-Id", "u-18")
+	repeat := apiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
 	ctx.Equal(accented.Status, 413, "a detail of 3000 accented characters (6000 bytes of UTF-8): the cap is in bytes")
 	ctx.Equal(long.Status, 413, "a detail of 4097 bytes")
+	ctx.Equal(cjk.Status, 413, "a detail of 2000 CJK characters (6000 bytes of UTF-8): the cap is in bytes")
 	ctx.Equal(exact.Status, 201, "a detail of exactly 4096 bytes (%s)", exact.Text())
-	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 1, "only the report within the cap may open a case; cases")
+	ctx.Equal(ascii.Status, 201, "a detail of 3000 ASCII characters (3000 bytes) (%s)", ascii.Text())
+	ctx.Equal(repeat.Status, 413, "u-17 reporting c-1 again with a 6000-byte detail: a repeat report is held to the same cap")
+	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 2, "only the reports within the cap may open a case; cases")
+	stored := store.GetCase(apiBg, apiField(exact, "case_id"))
+	ctx.Assert(stored != nil && stored.Detail == strings.Repeat("é", 2048) && stored.Reports == 1, "a rejected repeat report changed the case: it holds %d reports and a %d-byte detail", stored.Reports, len(stored.Detail))
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
@@ -914,26 +958,42 @@ void CheckTenantScope(harness::Ctx& ctx) {
 
 void CheckReasonAllowlist(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
-  for (const std::string reason : {"spamm", "other", ""}) {
+  for (const std::string reason : {"spamm", "other", "SPAM", ""}) {
     const auto r = apiReport(c, "c-1", reason, "");
     ctx.Equal(r.Status, 400, "a report with reason %q", reason);
   }
   ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 0, "rejected reasons must open no case; cases");
   const auto r = apiReport(c, "c-1", "self_harm", "");
   ctx.Equal(r.Status, 201, "a report with reason self_harm (%s)", r.Text());
-  const auto stored = store::getCase(apiField(r, "case_id"));
+  const std::string case_id = apiField(r, "case_id");
+  const auto stored = store::getCase(case_id);
   ctx.Equal(stored ? stored->reason : "", "self_harm", "the case must keep the reason the reporter chose");
+  const auto again = apiReport(c, "c-1", "spamm", "");
+  ctx.Equal(again.Status, 400, "u-17 reporting c-1 again with reason spamm: a repeat report is held to the same allowlist");
+  const auto after = store::getCase(case_id);
+  ctx.Assert(after && after->reason == "self_harm" && after->reports == 1, "a rejected repeat report changed the case: reports %v, reason %q",
+             after ? after->reports : 0L, after ? after->reason : "");
 }
 
 void CheckDetailBytes(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
   const auto accented = apiReport(c, "c-1", "spam", repeat("é", 3000));
   const auto long_detail = apiReport(c, "c-1", "spam", repeat("a", 4097));
+  const auto cjk = apiReport(c, "c-1", "spam", repeat("界", 2000));
   const auto exact = apiReport(c, "c-1", "spam", repeat("é", 2048));
+  const auto ascii = apiReport(c, "c-1", "spam", repeat("a", 3000), "u-18");
+  const auto again = apiReport(c, "c-1", "spam", repeat("é", 3000));
   ctx.Equal(accented.Status, 413, "a detail of 3000 accented characters (6000 bytes of UTF-8): the cap is in bytes");
   ctx.Equal(long_detail.Status, 413, "a detail of 4097 bytes");
+  ctx.Equal(cjk.Status, 413, "a detail of 2000 CJK characters (6000 bytes of UTF-8): the cap is in bytes");
   ctx.Equal(exact.Status, 201, "a detail of exactly 4096 bytes (%s)", exact.Text());
-  ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 1, "only the report within the cap may open a case; cases");
+  ctx.Equal(ascii.Status, 201, "a detail of 3000 ASCII characters (3000 bytes) (%s)", ascii.Text());
+  ctx.Equal(again.Status, 413, "u-17 reporting c-1 again with a 6000-byte detail: a repeat report is held to the same cap");
+  ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 2, "only the reports within the cap may open a case; cases");
+  const auto stored = store::getCase(apiField(exact, "case_id"));
+  ctx.Assert(stored && stored->detail == repeat("é", 2048) && stored->reports == 1,
+             "a rejected repeat report changed the case: it holds %v reports and a %v-byte detail", stored ? stored->reports : 0L,
+             stored ? static_cast<long>(stored->detail.size()) : 0L);
 }
 
 void CheckDedupe(harness::Ctx& ctx) {

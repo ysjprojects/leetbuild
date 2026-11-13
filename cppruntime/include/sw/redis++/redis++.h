@@ -235,7 +235,8 @@ Tuple parse_tuple(const lb::Json& r, std::index_sequence<I...>) {
   return Tuple(parse<std::tuple_element_t<I, Tuple>>(I < r.size() ? r[I] : nil)...);
 }
 
-// A reply as T, the way redis++ converts: integers and strings either way, nil to an empty optional.
+// A reply as T, the way redis++ converts (reply.cpp): a string only from a STRING or STATUS reply
+// and an integer only from an INTEGER reply, ProtoError otherwise; nil to an empty optional.
 template <class T>
 T parse(const lb::Json& r) {
   if constexpr (std::is_same_v<T, void>) {
@@ -248,14 +249,13 @@ T parse(const lb::Json& r) {
     if (r.is_null()) return std::nullopt;
     return parse<typename T::value_type>(r);
   } else if constexpr (std::is_same_v<T, std::string>) {
-    if (r.is_null()) throw ProtoError("expect STRING reply");
-    if (r.is_number()) return std::to_string(r.as_int());
+    if (!r.is_string()) throw ProtoError("Expect STRING reply");
     return r.as_string();
   } else if constexpr (std::is_same_v<T, bool>) {
     if (r.is_string()) return r.as_string() == "OK" || r.as_string() == "1";
     return r.as_int() != 0;
   } else if constexpr (std::is_integral_v<T>) {
-    if (r.is_string()) return static_cast<T>(std::stoll(r.as_string()));
+    if (!r.is_number()) throw ProtoError("Expect INTEGER reply");
     return static_cast<T>(r.as_int());
   } else if constexpr (std::is_floating_point_v<T>) {
     if (r.is_string()) {
@@ -578,13 +578,20 @@ class ScriptReply {
   ScriptReply() = default;
   explicit ScriptReply(lb::Json r) : r_(std::move(r)) {}
   explicit operator bool() const { return !r_.is_null(); }
-  std::string operator*() const { return r_.is_null() ? std::string() : reply::parse<std::string>(r_); }
+  // Read as text: a number prints as its digits (a convenience of the model, which redis++ lacks).
+  std::string operator*() const {
+    if (r_.is_null()) return std::string();
+    return r_.is_number() ? std::to_string(r_.as_int()) : reply::parse<std::string>(r_);
+  }
   template <class T>
   T as() const {
     return reply::parse<T>(r_);
   }
   operator std::string() const { return **this; }
-  operator long long() const { return r_.is_null() ? 0 : reply::parse<long long>(r_); }
+  operator long long() const {
+    if (r_.is_null()) return 0;
+    return r_.is_string() ? std::stoll(r_.as_string()) : r_.as_int();
+  }
   const lb::Json& raw() const { return r_; }
   template <class I>
     requires std::is_integral_v<I>
@@ -690,13 +697,16 @@ namespace detail {
 // The queued commands, sent in one round trip (op: redis.pipeline or redis.transaction); the queue empties.
 QueuedReplies send_queued(const char* op, std::vector<std::vector<std::string>>& queued);
 
-// WATCHed keys and what they held, checked when the transaction runs.
+// A connection's WATCH, kept by the server (per connection, as Redis keeps a client's watched keys):
+// the connection's id there, taken at its first WATCH.
 struct WatchState {
-  std::vector<std::pair<std::string, std::string>> keys;
+  long long conn = 0;
 };
 void watch(WatchState& state, const std::vector<std::string>& keys);
-// Whether every watched key still holds what it held (the watch list empties either way).
-bool watch_intact(WatchState& state);
+void unwatch(WatchState& state);
+// MULTI … EXEC on the connection: WatchError, and nothing runs, when a key it WATCHed was written,
+// deleted or expired since; the WATCH ends either way. The queue empties.
+QueuedReplies exec_transaction(WatchState& state, std::vector<std::vector<std::string>>& queued);
 
 }  // namespace detail
 
@@ -1569,7 +1579,7 @@ class Redis : public Commands<Redis, Immediate> {
   long long scan(long long cursor, const StringView& pattern, long long count, Output output) {
     const lb::Json r = detail::execute(detail::cmd("SCAN", cursor, "MATCH", pattern, "COUNT", count));
     reply::to_output(r[1], output);
-    return reply::parse<long long>(r[0]);
+    return std::stoll(r[0].as_string());  // the cursor is a bulk string, which redis++ reads with stoll
   }
   template <detail::output Output>
   long long scan(long long cursor, const StringView& pattern, Output output) {
@@ -1601,7 +1611,7 @@ class Redis : public Commands<Redis, Immediate> {
   long long hscan(const StringView& key, long long cursor, const StringView& pattern, long long count, Output output) {
     const lb::Json r = detail::execute(detail::cmd("HSCAN", key, cursor, "MATCH", pattern, "COUNT", count));
     reply::to_output(r[1], output);
-    return reply::parse<long long>(r[0]);
+    return std::stoll(r[0].as_string());
   }
   template <detail::output Output>
   long long hscan(const StringView& key, long long cursor, Output output) {
@@ -1611,7 +1621,7 @@ class Redis : public Commands<Redis, Immediate> {
   long long sscan(const StringView& key, long long cursor, const StringView& pattern, long long count, Output output) {
     const lb::Json r = detail::execute(detail::cmd("SSCAN", key, cursor, "MATCH", pattern, "COUNT", count));
     reply::to_output(r[1], output);
-    return reply::parse<long long>(r[0]);
+    return std::stoll(r[0].as_string());
   }
   template <detail::output Output>
   long long sscan(const StringView& key, long long cursor, Output output) {
@@ -2012,7 +2022,7 @@ class Redis : public Commands<Redis, Immediate> {
 #undef LB_REDIS_SCRIPT
 
   // ---- transactions: WATCH keys, then a transaction's exec() throws WatchError (and runs
-  // nothing) if any of them changed in between.
+  // nothing) if any of them was written in between.
   void watch(const StringView& key) { detail::watch(*watch_, {std::string(key)}); }
   template <detail::iterator Input>
   void watch(Input first, Input last) {
@@ -2022,7 +2032,7 @@ class Redis : public Commands<Redis, Immediate> {
   void watch(std::initializer_list<T> il) {
     watch(il.begin(), il.end());
   }
-  void unwatch() { watch_->keys.clear(); }
+  void unwatch() { detail::unwatch(*watch_); }
 
   Pipeline pipeline(bool new_connection = true);
   Transaction transaction(bool piped = false, bool new_connection = true);
@@ -2424,7 +2434,7 @@ class Transaction : public Queued<Transaction> {
                        std::shared_ptr<detail::WatchState> watch = std::make_shared<detail::WatchState>())
       : options_(std::move(options)), watch_(std::move(watch)) {}
   // MULTI … EXEC in one round trip; WatchError (nothing ran) if a key WATCHed through this
-  // transaction's connection changed since.
+  // transaction's connection was written since.
   QueuedReplies exec();
   // A Redis on the transaction's connection: WATCH and read through it before queueing.
   Redis redis() { return Redis(options_, watch_); }

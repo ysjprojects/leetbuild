@@ -25,7 +25,8 @@ connecting; an abandoned match reads as \`allocating\` forever.
 - \`players\` lists **every** participant in roster order, each with \`join_state\` \`joined\` or
   \`pending\`.
 - \`state\` follows the joins: \`abandoned\` for an abandoned match, \`allocating\` without a server,
-  \`joining\` while anyone is pending, \`in_game\` once every participant has joined.`,
+  \`joining\` while anyone is pending, \`in_game\` once every participant has joined. \`joined\` can
+  hold a client that is not on the roster; it does not stand in for a participant.`,
   sequence: {
     participants: ['Game client', 'Matchmaking API', 'Redis'],
     messages: [
@@ -76,7 +77,7 @@ connecting; an abandoned match reads as \`allocating\` forever.
       id: 'pending-visible',
       title: 'Every participant is listed, pending ones as pending',
       detail:
-        '`players` is built from the whole roster (`players`), each with `join_state` `joined` or `pending`; the starter lists the joined set only.',
+        '`players` is built from the whole roster (`players`), in roster order, each with `join_state` `joined` or `pending`; the starter lists the joined set only.',
       match: {
         python: {
           all: [/["']pending["']/, /for \w+ in match\[["']players["']\]/],
@@ -92,7 +93,7 @@ connecting; an abandoned match reads as \`allocating\` forever.
       id: 'state-from-joins',
       title: 'in_game only once every participant has joined',
       detail:
-        '`state` is `abandoned` for an abandoned match, `allocating` before a server, `joining` while anyone is pending and `in_game` once every participant has joined; the starter derives it from the server id alone.',
+        '`state` is `abandoned` for an abandoned match (whoever joined), `allocating` before a server, `joining` while any participant is pending and `in_game` once every participant has joined, a join from someone off the roster counting for nothing; the starter derives it from the server id alone.',
       match: {
         python: {all: [/["']joining["']/, /["']abandoned["']/, /["']in_game["']/]},
         typescript: {all: [/'joining'/, /'abandoned'/, /'in_game'/]},
@@ -531,17 +532,17 @@ async def check_participant_scope(ctx):
 async def check_pending_visible(ctx):
     _match()
     store.set_server("m-1", "gs-m-1")
-    store.confirm_join("m-1", "p1")
+    store.confirm_join("m-1", "p3")
     async with _api(ctx) as c:
         r = await _read(c, "p2")
     assert r.status_code == 200, f"p2 reading its own match answered {r.status_code}: {r.text}"
     players = r.json().get("players")
     expected = [
-        {"player_id": "p1", "join_state": "joined"},
+        {"player_id": "p1", "join_state": "pending"},
         {"player_id": "p2", "join_state": "pending"},
-        {"player_id": "p3", "join_state": "pending"},
+        {"player_id": "p3", "join_state": "joined"},
     ]
-    assert players == expected, f"the roster is {players}, expected every participant with its join state {expected}: a lobby cannot show who it is waiting for"
+    assert players == expected, f"the roster is {players}, expected every participant in roster order with its join state {expected}: a lobby cannot show who it is waiting for"
 
 
 async def check_state_from_joins(ctx):
@@ -552,14 +553,17 @@ async def check_state_from_joins(ctx):
         states.append((await _read(c, "p1")).json().get("state"))
         store.confirm_join("m-1", "p1")
         store.confirm_join("m-1", "p2")
+        store.confirm_join("m-1", "p9")  # a stray join from a client that is not on the roster
         states.append((await _read(c, "p1")).json().get("state"))
         store.confirm_join("m-1", "p3")
+        states.append((await _read(c, "p1")).json().get("state"))
+        store.abandon("m-1", "server_lost")
         states.append((await _read(c, "p1")).json().get("state"))
         store.enqueue("t4", "p4", 1520, ["p4"])
         store.create_match("m-2", 15, ["t4"])
         store.abandon("m-2", "allocation_failed")
         abandoned = (await _read(c, "p4", "m-2")).json().get("state")
-    assert states == ["allocating", "joining", "joining", "in_game"], f"through allocation and the joins the state read {states}, expected allocating, joining, joining, in_game: in_game sends every client out of the lobby"
+    assert states == ["allocating", "joining", "joining", "in_game", "abandoned"], f"through allocation, the joins (p9, not on the roster, among them) and an abandon the state read {states}, expected allocating, joining, joining, in_game, abandoned: in_game sends every client out of the lobby, and only the roster's joins count"
     assert abandoned == "abandoned", f"an abandoned match reads {abandoned!r}, expected 'abandoned'"
 `,
     typescript: `async function match(store) {
@@ -605,15 +609,15 @@ export async function check_pending_visible(ctx) {
   const {c, store} = api(ctx);
   await match(store);
   await store.setServer('m-1', 'gs-m-1');
-  await store.confirmJoin('m-1', 'p1');
+  await store.confirmJoin('m-1', 'p3');
   const r = await read(c, 'p2');
   assert.equal(r.status, 200, \`p2 reading its own match answered \${r.status}: \${r.text}\`);
   const expected = [
-    {player_id: 'p1', join_state: 'joined'},
+    {player_id: 'p1', join_state: 'pending'},
     {player_id: 'p2', join_state: 'pending'},
-    {player_id: 'p3', join_state: 'pending'},
+    {player_id: 'p3', join_state: 'joined'},
   ];
-  assert.deepStrictEqual(r.json().players, expected, \`the roster is \${JSON.stringify(r.json().players)}, expected every participant with its join state: a lobby cannot show who it is waiting for\`);
+  assert.deepStrictEqual(r.json().players, expected, \`the roster is \${JSON.stringify(r.json().players)}, expected every participant in roster order with its join state: a lobby cannot show who it is waiting for\`);
 }
 
 export async function check_state_from_joins(ctx) {
@@ -624,14 +628,17 @@ export async function check_state_from_joins(ctx) {
   states.push((await read(c, 'p1')).json().state);
   await store.confirmJoin('m-1', 'p1');
   await store.confirmJoin('m-1', 'p2');
+  await store.confirmJoin('m-1', 'p9'); // a stray join from a client that is not on the roster
   states.push((await read(c, 'p1')).json().state);
   await store.confirmJoin('m-1', 'p3');
+  states.push((await read(c, 'p1')).json().state);
+  await store.abandon('m-1', 'server_lost');
   states.push((await read(c, 'p1')).json().state);
   await store.enqueue('t4', 'p4', 1520, ['p4']);
   await store.createMatch('m-2', 15, ['t4']);
   await store.abandon('m-2', 'allocation_failed');
   const abandoned = (await read(c, 'p4', 'm-2')).json().state;
-  assert.deepStrictEqual(states, ['allocating', 'joining', 'joining', 'in_game'], \`through allocation and the joins the state read \${JSON.stringify(states)}, expected allocating, joining, joining, in_game: in_game sends every client out of the lobby\`);
+  assert.deepStrictEqual(states, ['allocating', 'joining', 'joining', 'in_game', 'abandoned'], \`through allocation, the joins (p9, not on the roster, among them) and an abandon the state read \${JSON.stringify(states)}, expected allocating, joining, joining, in_game, abandoned: in_game sends every client out of the lobby, and only the roster's joins count\`);
   assert.equal(abandoned, 'abandoned', \`an abandoned match reads \${JSON.stringify(abandoned)}, expected "abandoned"\`);
 }
 `,
@@ -721,12 +728,12 @@ func CheckParticipantScope(ctx *harness.Ctx) {
 func CheckPendingVisible(ctx *harness.Ctx) {
 	readSetup()
 	store.SetServer(readBg, "m-1", "gs-m-1")
-	store.ConfirmJoin(readBg, "m-1", "p1")
+	store.ConfirmJoin(readBg, "m-1", "p3")
 	c := readClient(ctx)
 	r := readAs(c, "p2", "m-1")
 	ctx.Equal(r.Status, 200, "p2 reading its own match (%s)", r.Text())
-	want := []readPlayer{{"p1", "joined"}, {"p2", "pending"}, {"p3", "pending"}}
-	ctx.Equal(readDecode(r).Players, want, "the roster must list every participant with its join state (a lobby cannot show who it is waiting for)")
+	want := []readPlayer{{"p1", "pending"}, {"p2", "pending"}, {"p3", "joined"}}
+	ctx.Equal(readDecode(r).Players, want, "the roster must list every participant in roster order with its join state (a lobby cannot show who it is waiting for)")
 }
 
 func CheckStateFromJoins(ctx *harness.Ctx) {
@@ -737,14 +744,17 @@ func CheckStateFromJoins(ctx *harness.Ctx) {
 	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
 	store.ConfirmJoin(readBg, "m-1", "p1")
 	store.ConfirmJoin(readBg, "m-1", "p2")
+	store.ConfirmJoin(readBg, "m-1", "p9") // a stray join from a client that is not on the roster
 	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
 	store.ConfirmJoin(readBg, "m-1", "p3")
+	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
+	store.Abandon(readBg, "m-1", "server_lost")
 	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
 	store.Enqueue(readBg, "t4", "p4", 1520, []string{"p4"})
 	store.CreateMatch(readBg, "m-2", 15, []string{"t4"})
 	store.Abandon(readBg, "m-2", "allocation_failed")
 	abandoned := readDecode(readAs(c, "p4", "m-2")).State
-	ctx.Equal(states, []string{"allocating", "joining", "joining", "in_game"}, "through allocation and the joins the state must read allocating, joining, joining, in_game (in_game sends every client out of the lobby)")
+	ctx.Equal(states, []string{"allocating", "joining", "joining", "in_game", "abandoned"}, "through allocation, the joins (p9, not on the roster, among them) and an abandon the state must read allocating, joining, joining, in_game, abandoned (in_game sends every client out of the lobby, and only the roster's joins count)")
 	ctx.Equal(abandoned, "abandoned", "an abandoned match's state")
 }
 `,
@@ -822,13 +832,13 @@ void CheckParticipantScope(harness::Ctx& ctx) {
 void CheckPendingVisible(harness::Ctx& ctx) {
   readSetup();
   store::setServer("m-1", "gs-m-1");
-  store::confirmJoin("m-1", "p1");
+  store::confirmJoin("m-1", "p3");
   auto c = readClient(ctx);
   const auto r = readAs(c, "p2", "m-1");
   ctx.Equal(r.Status, 200, "p2 reading its own match (%s)", r.Text());
-  const nlohmann::json want = nlohmann::json::array({{{"player_id", "p1"}, {"join_state", "joined"}}, {{"player_id", "p2"}, {"join_state", "pending"}}, {{"player_id", "p3"}, {"join_state", "pending"}}});
+  const nlohmann::json want = nlohmann::json::array({{{"player_id", "p1"}, {"join_state", "pending"}}, {{"player_id", "p2"}, {"join_state", "pending"}}, {{"player_id", "p3"}, {"join_state", "joined"}}});
   const auto body = bodyOf(r);
-  ctx.Assert(body.is_object() && body.value("players", nlohmann::json()) == want, "the roster is %s, expected every participant with its join state: a lobby cannot show who it is waiting for", body.is_object() ? body.value("players", nlohmann::json()).dump() : r.Text());
+  ctx.Assert(body.is_object() && body.value("players", nlohmann::json()) == want, "the roster is %s, expected every participant in roster order with its join state: a lobby cannot show who it is waiting for", body.is_object() ? body.value("players", nlohmann::json()).dump() : r.Text());
 }
 
 void CheckStateFromJoins(harness::Ctx& ctx) {
@@ -839,14 +849,17 @@ void CheckStateFromJoins(harness::Ctx& ctx) {
   states.push_back(stateOf(readAs(c, "p1", "m-1")));
   store::confirmJoin("m-1", "p1");
   store::confirmJoin("m-1", "p2");
+  store::confirmJoin("m-1", "p9");  // a stray join from a client that is not on the roster
   states.push_back(stateOf(readAs(c, "p1", "m-1")));
   store::confirmJoin("m-1", "p3");
+  states.push_back(stateOf(readAs(c, "p1", "m-1")));
+  store::abandon("m-1", "server_lost");
   states.push_back(stateOf(readAs(c, "p1", "m-1")));
   store::enqueue("t4", "p4", 1520, {"p4"});
   store::createMatch("m-2", 15, {"t4"});
   store::abandon("m-2", "allocation_failed");
   const std::string abandoned = stateOf(readAs(c, "p4", "m-2"));
-  ctx.Equal(states, std::vector<std::string>{"allocating", "joining", "joining", "in_game"}, "through allocation and the joins the state must read allocating, joining, joining, in_game (in_game sends every client out of the lobby)");
+  ctx.Equal(states, std::vector<std::string>{"allocating", "joining", "joining", "in_game", "abandoned"}, "through allocation, the joins (p9, not on the roster, among them) and an abandon the state must read allocating, joining, joining, in_game, abandoned (in_game sends every client out of the lobby, and only the roster's joins count)");
   ctx.Equal(abandoned, "abandoned", "an abandoned match's state");
 }
 `,

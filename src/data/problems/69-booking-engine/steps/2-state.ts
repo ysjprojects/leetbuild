@@ -70,7 +70,7 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
       id: 'hold-ttl',
       title: 'Expires the hold after the 900 s payment window, never the map',
       detail:
-        'The hold key is written with `EX` and the 900-second window; the slot map gets no `EXPIRE`, or confirmed bookings would vanish with it. The starter writes a hold key that never expires.',
+        'The hold key is written with `EX` and the 900-second window, by the same script that writes the slots, so no request ever sees a slot owned by a hold key that does not exist yet; the slot map gets no `EXPIRE`, or confirmed bookings would vanish with it. The starter writes a hold key that never expires.',
       match: {
         python: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
         typescript: {all: [/redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/redis\.call\(\s*'EXPIRE'/]},
@@ -96,7 +96,7 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
       id: 'release-guarded',
       title: 'Frees a slot only while it still points at this hold',
       detail:
-        'The release compares each slot’s owner with the hold id inside the script and deletes only matches, so a slot a later request re-took stays taken. The starter deletes every slot it is handed.',
+        'The release compares each slot’s owner with the hold id inside the script and deletes only matches, so a slot a later request re-took stays taken, even one taken while the release runs; the hold key goes too. The starter deletes every slot it is handed.',
       match: {
         python: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/\.hdel\(/]},
         typescript: {all: [/redis\.call\(\s*'HGET'[^\n]*\)\s*[=~]=/, /redis\.call\(\s*'HDEL'/], none: [/\.hdel\(/]},
@@ -109,7 +109,7 @@ abandoned, a payment that completes, and a sweeper that runs after the slot chan
       id: 'confirm-converts',
       title: 'Converts a confirmed hold without re-entering the free set',
       detail:
-        'Confirmation rewrites each slot the hold owns to `booked:{booking_id}`; the map has no TTL, so the payment window cannot expire a booking. The starter only deletes the hold key, so the slots are free an hour later.',
+        'Confirmation rewrites each slot the hold still owns to `booked:{booking_id}`, and a late confirmation leaves a slot another hold re-took alone; the map has no TTL, so the payment window cannot expire a booking. The starter only deletes the hold key, so the slots are free an hour later.',
       match: {
         python: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
         typescript: {all: [/'booked:'\s*\.\./], none: [/redis\.call\(\s*'EXPIRE'/]},
@@ -773,10 +773,14 @@ def check_atomic_hold(ctx):
 
 def check_hold_ttl(ctx):
     m = ctx.load("state")
+    # A rival request reads the map right after the learner's first command on it: every slot it
+    # finds written must point at a hold whose key already exists, or the rival sees the slot free.
+    probe = ctx.redis_after(slots_key(R), lambda: {f: ctx.redis.exists(hold_key(o)) for f in F[:2] if (o := ctx.redis.hget(slots_key(R), f))})
     hold = m.take_hold(R, F[:2])
     assert hold is not None, "take_hold refused a free range"
     ttl = ctx.redis.ttl(hold_key(hold["hold_id"]))
     assert 850 <= ttl <= 900, f"hold:{{id}} has TTL {ttl}, expected the 900 s payment window (SET … EX 900 in the script)"
+    assert probe.fired and probe.result == {F[0]: 1, F[1]: 1}, f"right after take_hold's first command on resource:r1:slots, a rival request found {probe.result} (written slot: 1 if its hold:{{id}} key exists), expected both slots written and their hold key alive: in that gap the rival sees the slots free and takes them. Write the hold key in the same script as the slots"
     assert ctx.redis.ttl(slots_key(R)) == -1, f"resource:r1:slots has TTL {ctx.redis.ttl(slots_key(R))}: the map carries confirmed bookings and must never expire"
     ctx.clock.advance(901)
     assert ctx.redis.exists(hold_key(hold["hold_id"])) == 0, "hold:{id} is still there after the payment window"
@@ -806,6 +810,26 @@ def check_release_guarded(ctx):
     assert _owner(ctx, F[2]) == second["hold_id"], f"the sweeper freed slot {F[2]} (owner now {_owner(ctx, F[2])!r}) which a later request holds: release only the slots still pointing at this hold"
     assert _owner(ctx, F[1]) is None, f"slot {F[1]} still points at {_owner(ctx, F[1])!r} after its hold was released"
     assert freed == 1, f"release_hold reported {freed} freed slots, expected 1"
+    # Another abandoned checkout: while the sweeper releases it, a new request takes the free slot the
+    # moment the release first touches the map. The comparison and the delete must not let it in between.
+    third = m.take_hold(R, [F[0]])
+    assert third is not None, "take_hold refused a free range"
+    ctx.clock.advance(901)
+
+    def new_request():
+        owner = ctx.redis.hget(slots_key(R), F[0])
+        if owner is None or not ctx.redis.exists(hold_key(owner)):
+            ctx.redis.hset(slots_key(R), F[0], "h-other")
+            ctx.redis.set(hold_key("h-other"), "held", ex=900)
+
+    ctx.redis_after(slots_key(R), new_request)
+    m.release_hold(R, [F[0]], third["hold_id"])
+    assert _owner(ctx, F[0]) == "h-other", f"a new request took slot {F[0]} while the release ran, and the release then deleted it (owner now {_owner(ctx, F[0])!r}): compare and delete inside one script"
+    # The rejection path releases a hold that is still alive: its key goes with its slot.
+    fourth = m.take_hold(R, [F[1]])
+    assert fourth is not None, "take_hold refused a free range"
+    assert m.release_hold(R, [F[1]], fourth["hold_id"]) == 1, "releasing a live hold must free its slot"
+    assert ctx.redis.exists(hold_key(fourth["hold_id"])) == 0, "release_hold left hold:{id} behind: it must delete the hold key too"
 
 
 def check_confirm_converts(ctx):
@@ -820,6 +844,14 @@ def check_confirm_converts(ctx):
     assert owners == ["booked:b-1", "booked:b-1"], f"an hour after confirmation the slots point at {owners}: a confirmed booking must never expire back into the free set"
     assert m.take_hold(R, [F[0]]) is None, "a confirmed slot was granted to a new hold"
     assert ctx.redis.ttl(slots_key(R)) == -1, f"resource:r1:slots has TTL {ctx.redis.ttl(slots_key(R))}: the map must never expire"
+    # A payment that completes after its window: the hold expired and a new request took one of its slots.
+    late = m.take_hold(R, [F[2], F[3]])
+    assert late is not None, "take_hold refused a free range"
+    ctx.clock.advance(901)
+    newer = m.take_hold(R, [F[3]])
+    assert newer is not None, f"slot {F[3]} points at an expired hold and must be free again"
+    m.confirm_hold(R, [F[2], F[3]], late["hold_id"], "b-2")
+    assert _owner(ctx, F[3]) == newer["hold_id"], f"a late confirmation rewrote slot {F[3]} to {_owner(ctx, F[3])!r}, which another hold had taken: a double booking. Convert only the slots this hold still owns"
 `,
     typescript: `import {holdKey, slotsKey} from 'booking/slots';
 
@@ -847,10 +879,21 @@ export async function check_atomic_hold(ctx) {
 
 export async function check_hold_ttl(ctx) {
   const m = ctx.load('state');
+  // A rival request reads the map right after the learner's first command on it: every slot it
+  // finds written must point at a hold whose key already exists, or the rival sees the slot free.
+  const probe = ctx.redisAfter(slotsKey(R), () => {
+    const seen: Record<string, number> = {};
+    for (const f of F.slice(0, 2)) {
+      const o = owner(ctx, f);
+      if (o !== null) seen[f] = Number(ctx.redis.exists(holdKey(o)));
+    }
+    return seen;
+  });
   const hold = await m.takeHold(R, F.slice(0, 2));
   assert(hold !== null, 'takeHold refused a free range');
   const ttl = ctx.redis.ttl(holdKey(hold.hold_id));
   assert(850 <= ttl && ttl <= 900, \`hold:{id} has TTL \${ttl}, expected the 900 s payment window (SET … EX 900 in the script)\`);
+  assert(probe.fired && JSON.stringify(probe.result) === JSON.stringify({[F[0]]: 1, [F[1]]: 1}), \`right after takeHold's first command on resource:r1:slots, a rival request found \${JSON.stringify(probe.result)} (written slot: 1 if its hold:{id} key exists), expected both slots written and their hold key alive: in that gap the rival sees the slots free and takes them. Write the hold key in the same script as the slots\`);
   assert.equal(ctx.redis.ttl(slotsKey(R)), -1, \`resource:r1:slots has TTL \${ctx.redis.ttl(slotsKey(R))}: the map carries confirmed bookings and must never expire\`);
   ctx.clock.advance(901);
   assert.equal(ctx.redis.exists(holdKey(hold.hold_id)), 0, 'hold:{id} is still there after the payment window');
@@ -880,6 +923,25 @@ export async function check_release_guarded(ctx) {
   assert.equal(owner(ctx, F[2]), second.hold_id, \`the sweeper freed slot \${F[2]} (owner now \${JSON.stringify(owner(ctx, F[2]))}) which a later request holds: release only the slots still pointing at this hold\`);
   assert.equal(owner(ctx, F[1]), null, \`slot \${F[1]} still points at \${JSON.stringify(owner(ctx, F[1]))} after its hold was released\`);
   assert.equal(freed, 1, \`releaseHold reported \${freed} freed slots, expected 1\`);
+  // Another abandoned checkout: while the sweeper releases it, a new request takes the free slot the
+  // moment the release first touches the map. The comparison and the delete must not let it in between.
+  const third = await m.takeHold(R, [F[0]]);
+  assert(third !== null, 'takeHold refused a free range');
+  ctx.clock.advance(901);
+  ctx.redisAfter(slotsKey(R), () => {
+    const o = owner(ctx, F[0]);
+    if (o === null || Number(ctx.redis.exists(holdKey(o))) === 0) {
+      ctx.redis.hset(slotsKey(R), F[0], 'h-other');
+      ctx.redis.set(holdKey('h-other'), 'held', 'EX', 900);
+    }
+  });
+  await m.releaseHold(R, [F[0]], third.hold_id);
+  assert.equal(owner(ctx, F[0]), 'h-other', \`a new request took slot \${F[0]} while the release ran, and the release then deleted it (owner now \${JSON.stringify(owner(ctx, F[0]))}): compare and delete inside one script\`);
+  // The rejection path releases a hold that is still alive: its key goes with its slot.
+  const fourth = await m.takeHold(R, [F[1]]);
+  assert(fourth !== null, 'takeHold refused a free range');
+  assert.equal(await m.releaseHold(R, [F[1]], fourth.hold_id), 1, 'releasing a live hold must free its slot');
+  assert.equal(ctx.redis.exists(holdKey(fourth.hold_id)), 0, 'releaseHold left hold:{id} behind: it must delete the hold key too');
 }
 
 export async function check_confirm_converts(ctx) {
@@ -894,6 +956,14 @@ export async function check_confirm_converts(ctx) {
   assert.deepEqual(owners, ['booked:b-1', 'booked:b-1'], \`an hour after confirmation the slots point at \${JSON.stringify(owners)}: a confirmed booking must never expire back into the free set\`);
   assert.equal(await m.takeHold(R, [F[0]]), null, 'a confirmed slot was granted to a new hold');
   assert.equal(ctx.redis.ttl(slotsKey(R)), -1, \`resource:r1:slots has TTL \${ctx.redis.ttl(slotsKey(R))}: the map must never expire\`);
+  // A payment that completes after its window: the hold expired and a new request took one of its slots.
+  const late = await m.takeHold(R, [F[2], F[3]]);
+  assert(late !== null, 'takeHold refused a free range');
+  ctx.clock.advance(901);
+  const newer = await m.takeHold(R, [F[3]]);
+  assert(newer !== null, \`slot \${F[3]} points at an expired hold and must be free again\`);
+  await m.confirmHold(R, [F[2], F[3]], late.hold_id, 'b-2');
+  assert.equal(owner(ctx, F[3]), newer.hold_id, \`a late confirmation rewrote slot \${F[3]} to \${JSON.stringify(owner(ctx, F[3]))}, which another hold had taken: a double booking. Convert only the slots this hold still owns\`);
 }
 `,
     go: `package main
@@ -950,10 +1020,22 @@ func CheckAtomicHold(ctx *harness.Ctx) {
 }
 
 func CheckHoldTtl(ctx *harness.Ctx) {
+	// A rival request reads the map right after the learner's first command on it: every slot it
+	// finds written must point at a hold whose key already exists, or the rival sees the slot free.
+	seen := map[string]int64{}
+	probe := ctx.Redis.After(slots.Key(stateResource), func() any {
+		for _, f := range stateFields[:2] {
+			if owner, ok := stateOwner(ctx, f); ok {
+				seen[f] = ctx.Redis.Exists(slots.HoldKey(owner))
+			}
+		}
+		return nil
+	})
 	hold := stateHold(ctx, stateFields[:2])
 	ctx.Assert(hold != nil, "takeHold refused a free range")
 	ttl := ctx.Redis.TTL(slots.HoldKey(hold.HoldID))
 	ctx.Assert(850 <= ttl && ttl <= 900, "hold:{id} has TTL %d, expected the 900 s payment window (SET … EX 900 in the script)", ttl)
+	ctx.Assert(probe.Fired && len(seen) == 2 && seen[stateFields[0]] == 1 && seen[stateFields[1]] == 1, "right after takeHold's first command on resource:r1:slots, a rival request found %v (written slot: 1 if its hold:{id} key exists), expected both slots written and their hold key alive: in that gap the rival sees the slots free and takes them. Write the hold key in the same script as the slots", seen)
 	ctx.Equal(ctx.Redis.TTL(slots.Key(stateResource)), -1, "resource:r1:slots carries confirmed bookings and must never expire; its TTL")
 	ctx.Clock.Advance(901)
 	ctx.Equal(ctx.Redis.Exists(slots.HoldKey(hold.HoldID)), 0, "hold:{id} after the payment window")
@@ -984,6 +1066,29 @@ func CheckReleaseGuarded(ctx *harness.Ctx) {
 	owner, written := stateOwner(ctx, stateFields[1])
 	ctx.Assert(!written, "slot %s still points at %q after its hold was released", stateFields[1], owner)
 	ctx.Equal(freed, 1, "releaseHold's count of freed slots")
+	// Another abandoned checkout: while the sweeper releases it, a new request takes the free slot the
+	// moment the release first touches the map. The comparison and the delete must not let it in between.
+	third := stateHold(ctx, stateFields[:1])
+	ctx.Assert(third != nil, "takeHold refused a free range")
+	ctx.Clock.Advance(901)
+	ctx.Redis.After(slots.Key(stateResource), func() any {
+		if owner, ok := stateOwner(ctx, stateFields[0]); !ok || ctx.Redis.Exists(slots.HoldKey(owner)) == 0 {
+			ctx.Redis.Do("HSET", slots.Key(stateResource), stateFields[0], "h-other")
+			ctx.Redis.Do("SET", slots.HoldKey("h-other"), "held", "EX", 900)
+		}
+		return nil
+	})
+	_, err = releaseHold(context.Background(), stateResource, stateFields[:1], third.HoldID)
+	ctx.NoError(err, "releaseHold")
+	owner, _ = stateOwner(ctx, stateFields[0])
+	ctx.Assert(owner == "h-other", "a new request took slot %s while the release ran, and the release then deleted it (owner now %q): compare and delete inside one script", stateFields[0], owner)
+	// The rejection path releases a hold that is still alive: its key goes with its slot.
+	fourth := stateHold(ctx, []string{stateFields[1]})
+	ctx.Assert(fourth != nil, "takeHold refused a free range")
+	freed, err = releaseHold(context.Background(), stateResource, []string{stateFields[1]}, fourth.HoldID)
+	ctx.NoError(err, "releaseHold")
+	ctx.Equal(freed, 1, "releasing a live hold must free its slot; the count of freed slots")
+	ctx.Equal(ctx.Redis.Exists(slots.HoldKey(fourth.HoldID)), 0, "releaseHold must delete the hold key too; hold:{id} after the release")
 }
 
 func CheckConfirmConverts(ctx *harness.Ctx) {
@@ -1001,6 +1106,16 @@ func CheckConfirmConverts(ctx *harness.Ctx) {
 	ctx.Equal(owners(), []string{"booked:b-1", "booked:b-1"}, "the slots an hour after confirmation (a confirmed booking must never expire back into the free set)")
 	ctx.Assert(stateHold(ctx, stateFields[:1]) == nil, "a confirmed slot was granted to a new hold")
 	ctx.Equal(ctx.Redis.TTL(slots.Key(stateResource)), -1, "resource:r1:slots must never expire; its TTL")
+	// A payment that completes after its window: the hold expired and a new request took one of its slots.
+	late := stateHold(ctx, stateFields[2:])
+	ctx.Assert(late != nil, "takeHold refused a free range")
+	ctx.Clock.Advance(901)
+	newer := stateHold(ctx, stateFields[3:])
+	ctx.Assert(newer != nil, "slot %s points at an expired hold and must be free again", stateFields[3])
+	_, err = confirmHold(context.Background(), stateResource, stateFields[2:], late.HoldID, "b-2")
+	ctx.NoError(err, "confirmHold")
+	owner, _ := stateOwner(ctx, stateFields[3])
+	ctx.Assert(owner == newer.HoldID, "a late confirmation rewrote slot %s to %q, which another hold had taken: a double booking. Convert only the slots this hold still owns", stateFields[3], owner)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1040,10 +1155,30 @@ void CheckAtomicHold(harness::Ctx& ctx) {
 }
 
 void CheckHoldTtl(harness::Ctx& ctx) {
+  // A rival request reads the map right after the learner's first command on it: every slot it
+  // finds written must point at a hold whose key already exists, or the rival sees the slot free.
+  bool fired = false;
+  std::string seen;
+  int live = 0;
+  ctx.Redis.After(booking::slots::Key(kStateResource), [&] {
+    fired = true;
+    for (size_t i = 0; i < 2; ++i) {
+      const auto owner = stateOwner(ctx, kStateFields[i]);
+      if (!owner) continue;
+      const long long exists = ctx.Redis.Exists(booking::slots::HoldKey(*owner));
+      seen += kStateFields[i] + ":" + std::to_string(exists) + " ";
+      live += exists == 1 ? 1 : 0;
+    }
+  });
   const auto hold = takeHold(kStateResource, {kStateFields[0], kStateFields[1]});
   ctx.Assert(hold.has_value(), "takeHold refused a free range");
   const long long ttl = ctx.Redis.TTL(booking::slots::HoldKey(hold->hold_id));
   ctx.Assert(850 <= ttl && ttl <= 900, "hold:{id} has TTL %d, expected the 900 s payment window (SET … EX 900 in the script)", ttl);
+  ctx.Assert(fired && live == 2,
+             "right after takeHold's first command on resource:r1:slots, a rival request found {%s} (written slot: 1 if "
+             "its hold:{id} key exists), expected both slots written and their hold key alive: in that gap the rival "
+             "sees the slots free and takes them. Write the hold key in the same script as the slots",
+             seen);
   ctx.Equal(ctx.Redis.TTL(booking::slots::Key(kStateResource)), -1,
             "resource:r1:slots carries confirmed bookings and must never expire; its TTL");
   ctx.Clock.Advance(901);
@@ -1081,6 +1216,31 @@ void CheckReleaseGuarded(harness::Ctx& ctx) {
   const auto freedOwner = stateOwner(ctx, kStateFields[1]);
   ctx.Assert(!freedOwner.has_value(), "slot %s still points at %q after its hold was released", kStateFields[1], freedOwner);
   ctx.Equal(freed, 1, "releaseHold's count of freed slots");
+  // Another abandoned checkout: while the sweeper releases it, a new request takes the free slot the
+  // moment the release first touches the map. The comparison and the delete must not let it in between.
+  const auto third = takeHold(kStateResource, {kStateFields[0]});
+  ctx.Assert(third.has_value(), "takeHold refused a free range");
+  ctx.Clock.Advance(901);
+  ctx.Redis.After(booking::slots::Key(kStateResource), [&] {
+    const auto current = stateOwner(ctx, kStateFields[0]);
+    if (!current || ctx.Redis.Exists(booking::slots::HoldKey(*current)) == 0) {
+      ctx.Redis.Do("HSET", booking::slots::Key(kStateResource), kStateFields[0], "h-other");
+      ctx.Redis.Do("SET", booking::slots::HoldKey("h-other"), "held", "EX", 900);
+    }
+  });
+  releaseHold(kStateResource, {kStateFields[0]}, third->hold_id);
+  const auto retaken = stateOwner(ctx, kStateFields[0]);
+  ctx.Assert(retaken == std::string("h-other"),
+             "a new request took slot %s while the release ran, and the release then deleted it (owner now %q): "
+             "compare and delete inside one script",
+             kStateFields[0], retaken);
+  // The rejection path releases a hold that is still alive: its key goes with its slot.
+  const auto fourth = takeHold(kStateResource, {kStateFields[1]});
+  ctx.Assert(fourth.has_value(), "takeHold refused a free range");
+  ctx.Equal(releaseHold(kStateResource, {kStateFields[1]}, fourth->hold_id), 1LL,
+            "releasing a live hold must free its slot; the count of freed slots");
+  ctx.Equal(ctx.Redis.Exists(booking::slots::HoldKey(fourth->hold_id)), 0LL,
+            "releaseHold must delete the hold key too; hold:{id} after the release");
 }
 
 void CheckConfirmConverts(harness::Ctx& ctx) {
@@ -1097,6 +1257,18 @@ void CheckConfirmConverts(harness::Ctx& ctx) {
             "the slots an hour after confirmation (a confirmed booking must never expire back into the free set)");
   ctx.Assert(!takeHold(kStateResource, {kStateFields[0]}).has_value(), "a confirmed slot was granted to a new hold");
   ctx.Equal(ctx.Redis.TTL(booking::slots::Key(kStateResource)), -1, "resource:r1:slots must never expire; its TTL");
+  // A payment that completes after its window: the hold expired and a new request took one of its slots.
+  const auto late = takeHold(kStateResource, {kStateFields[2], kStateFields[3]});
+  ctx.Assert(late.has_value(), "takeHold refused a free range");
+  ctx.Clock.Advance(901);
+  const auto newer = takeHold(kStateResource, {kStateFields[3]});
+  ctx.Assert(newer.has_value(), "slot %s points at an expired hold and must be free again", kStateFields[3]);
+  confirmHold(kStateResource, {kStateFields[2], kStateFields[3]}, late->hold_id, "b-2");
+  const auto lateOwner = stateOwner(ctx, kStateFields[3]);
+  ctx.Assert(lateOwner == newer->hold_id,
+             "a late confirmation rewrote slot %s to %q, which another hold had taken: a double booking. Convert only "
+             "the slots this hold still owns",
+             kStateFields[3], lateOwner);
 }
 `,
   },

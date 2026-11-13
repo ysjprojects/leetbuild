@@ -166,6 +166,10 @@ func RunCheck(job *Job, id string) Result {
 			return nil, "the runtime could not load its libraries: " + err.Error()
 		}
 		if err := compile(in); err != nil {
+			var startup interp.InitPanic
+			if errors.As(err, &startup) {
+				return nil, "your program failed at start-up: " + startupMessage(startup.Value) + learnerLocation(stderr.String(), job.Entry)
+			}
 			return nil, explainCompile(err, job.Entry)
 		}
 		return in, ""
@@ -293,13 +297,27 @@ func netTable() map[string]reflect.Value {
 	}
 }
 
+// compile compiles the program and runs its initialisation; an interp.InitPanic error is a panic
+// in a package-level variable's initializer or an init function.
 func compile(i *interp.Interpreter) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			if startup, ok := r.(interp.InitPanic); ok {
+				err = startup
+				return
+			}
 			err = fmt.Errorf("%v", r)
 		}
 	}()
 	return i.EvalTest("main")
+}
+
+// startupMessage says what initialisation panicked with, as run does for a check.
+func startupMessage(r any) string {
+	if exit, ok := overrides.IsExit(r); ok {
+		return "the program exited: " + exit.Error()
+	}
+	return fmt.Sprintf("panic: %v", r)
 }
 
 // sourceTree lays the job out as the interpreter's source tree, and the course's other files

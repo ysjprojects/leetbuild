@@ -72,7 +72,7 @@ replication overwrite each other's progress.
       id: 'atomic-advance',
       title: 'The advance is one compare-and-set in Lua',
       detail:
-        'Read, compare and write run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`) that `SET`s only a larger offset; a client-side `GET` then `SET` lets a confirmation that lands in between be overwritten by an older one.',
+        'Read, compare and write run in one script (`register_script`/`eval`, `defineCommand`, `NewScript`, `jedis.eval`, `redis.eval`) that `SET`s only a larger offset; a client-side `GET` then `SET` lets a confirmation that lands in between be overwritten by an older one, and a compare-and-set that gives up when another worker wrote first drops the larger confirmation.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/\br\.set\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/], none: [/redis\.set\(/]},
@@ -465,6 +465,18 @@ def check_atomic_advance(ctx):
     resumed = m.resume_offset("rep-1", 0)
     assert resumed == 20, f"a worker confirmed 20 while this one advanced to 15, and the shard ended at {resumed}: read, compare and write must run in one script, or the older confirmation wins"
 
+    def rival(key):
+        def advance():  # another worker's forward-only advance to 30
+            if int(ctx.redis.get(key) or 0) < 30:
+                ctx.redis.set(key, 30)
+        return advance
+
+    for key in ("offset:rep-1:0", "offset:rep-1"):
+        ctx.redis_after(key, rival(key))
+    after = m.advance_offset("rep-1", 0, 40)
+    resumed = m.resume_offset("rep-1", 0)
+    assert resumed == 40 and after == 40, f"another worker advanced the shard to 30 while this one confirmed 40, and the shard ended at {resumed} (advance returned {after}): the larger confirmation must win, so a compare-and-set that lost the race retries"
+
 
 def check_shard_key(ctx):
     m = ctx.load("state")
@@ -506,8 +518,17 @@ export async function check_atomic_advance(ctx) {
   assert(fired.length > 0, 'advanceOffset never touched the shard offset key');
   if (fired[0].error !== undefined) throw fired[0].error;
   await fired[0].result;
-  const resumed = await m.resumeOffset('rep-1', 0);
+  let resumed = await m.resumeOffset('rep-1', 0);
   assert.equal(resumed, 20, \`a worker confirmed 20 while this one advanced to 15, and the shard ended at \${resumed}: read, compare and write must run in one script, or the older confirmation wins\`);
+  for (const key of ['offset:rep-1:0', 'offset:rep-1']) {
+    ctx.redisAfter(key, () => {
+      // another worker's forward-only advance to 30
+      if (Number(ctx.redis.get(key) ?? 0) < 30) ctx.redis.set(key, '30');
+    });
+  }
+  const after = await m.advanceOffset('rep-1', 0, 40);
+  resumed = await m.resumeOffset('rep-1', 0);
+  assert(resumed === 40 && after === 40, \`another worker advanced the shard to 30 while this one confirmed 40, and the shard ended at \${resumed} (advance returned \${after}): the larger confirmation must win, so a compare-and-set that lost the race retries\`);
 }
 
 export async function check_shard_key(ctx) {
@@ -524,6 +545,7 @@ export async function check_shard_key(ctx) {
 
 import (
 	"context"
+	"strconv"
 
 	"leetbuild/harness"
 )
@@ -576,6 +598,20 @@ func CheckAtomicAdvance(ctx *harness.Ctx) {
 	mustAdvance(ctx, 0, 15)
 	ctx.Assert(fired, "advanceOffset never touched the shard's offset key")
 	ctx.Equal(mustResume(ctx, 0), int64(20), "a worker confirmed 20 while this one advanced to 15: read, compare and write must run in one script, or the older confirmation wins; the shard's offset")
+	for _, rivalKey := range []string{"offset:rep-1:0", "offset:rep-1"} {
+		key := rivalKey
+		ctx.Redis.After(key, func() any {
+			// another worker's forward-only advance to 30
+			current, _ := ctx.Redis.Get(key)
+			if n, err := strconv.ParseInt(current, 10, 64); err != nil || n < 30 {
+				ctx.Redis.Set(key, "30")
+			}
+			return nil
+		})
+	}
+	after := mustAdvance(ctx, 0, 40)
+	resumed := mustResume(ctx, 0)
+	ctx.Assert(resumed == 40 && after == 40, "another worker advanced the shard to 30 while this one confirmed 40, and the shard ended at %d (advance returned %d): the larger confirmation must win, so a compare-and-set that lost the race retries", resumed, after)
 }
 
 func CheckShardKey(ctx *harness.Ctx) {
@@ -644,6 +680,16 @@ void CheckAtomicAdvance(harness::Ctx& ctx) {
   ctx.Assert(shardKey->fired || sharedKey->fired, "advanceOffset never touched the shard's offset key");
   ctx.Assert(!shardKey->err && !sharedKey->err, "the rival advance failed: %s", shardKey->err.value_or(sharedKey->err.value_or("")));
   ctx.Equal(resumeOffset("rep-1", 0), 20, "a worker confirmed 20 while this one advanced to 15: read, compare and write must run in one script, or the older confirmation wins; the shard's offset");
+  for (const std::string key : {"offset:rep-1:0", "offset:rep-1"}) {
+    ctx.Redis.After(key, [&ctx, key] {
+      // another worker's forward-only advance to 30
+      const auto current = ctx.Redis.Get(key);
+      if (!current || std::stoll(*current) < 30) ctx.Redis.Set(key, "30");
+    });
+  }
+  const long long after = advanceOffset("rep-1", 0, 40);
+  const long long resumed = resumeOffset("rep-1", 0);
+  ctx.Assert(resumed == 40 && after == 40, "another worker advanced the shard to 30 while this one confirmed 40, and the shard ended at %d (advance returned %d): the larger confirmation must win, so a compare-and-set that lost the race retries", resumed, after);
 }
 
 void CheckShardKey(harness::Ctx& ctx) {

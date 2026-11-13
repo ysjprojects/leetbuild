@@ -286,11 +286,19 @@ func (r *jsRedis) PipelineBlocking(cmds [][][]byte) []world.Result {
 	return awaitBridge(r.b, "pipelineBlocking", results, commands(cmds))
 }
 
-func (r *jsRedis) Transaction(cmds [][][]byte) []world.Result {
-	return results(r.b.Call("transaction", commands(cmds)))
-}
+func (r *jsRedis) Connect() int { return r.b.Call("connect").Int() }
 
-func (r *jsRedis) Fingerprint(key []byte) string { return r.b.Call("fingerprint", ToJS(key)).String() }
+func (r *jsRedis) Watch(conn int, keys [][]byte) { r.b.Call("watch", conn, command(keys)) }
+
+func (r *jsRedis) Unwatch(conn int, record bool) { r.b.Call("unwatch", conn, record) }
+
+func (r *jsRedis) Exec(conn int, cmds [][][]byte) ([]world.Result, bool) {
+	v := r.b.Call("exec", conn, commands(cmds))
+	if v.IsNull() {
+		return nil, true
+	}
+	return results(v), false
+}
 
 func (r *jsRedis) Probe(key []byte, fn func() (any, error)) *world.Probe {
 	p := &world.Probe{}

@@ -20,8 +20,8 @@ compares, then \`INCR\`s. On one process it serves the demo, and it hides 4 flaw
 subagent again; two subagents finishing together lose one result; checkpoints of abandoned jobs stay
 in Redis forever; two concurrent tool calls on the last unit of budget both get it.
 
-- The plan is the JSON field \`plan\` of \`research:{job_id}\` (\`HSET\`), so any process can
-  \`resume\`.
+- The plan is the JSON field \`plan\` of \`research:{job_id}\` (\`HSET\`), next to \`status\` \`running\`,
+  so any process can \`resume\`; a checkpoint write that fails reaches the caller.
 - A result is one field of the hash \`research:{job_id}:results\`: \`HSET … {task_id} {findings}\`;
   \`resume\` reads it with \`HGETALL\`.
 - Every write refreshes a **24 h** expiry (\`CHECKPOINT_TTL_S\` = 86400) on the key it wrote.
@@ -49,7 +49,7 @@ in Redis forever; two concurrent tool calls on the last unit of budget both get 
       id: 'resume',
       title: 'Another process resumes the job from Redis',
       detail:
-        '`start_job` writes the plan into `research:{job_id}` and `resume` reads it back from there, so a lead restarted on another process gets the pending tasks and the results in hand.',
+        '`start_job` writes the plan and `status` `running` into `research:{job_id}`, and a write that fails reaches the caller; `resume` reads the plan back from there, so a lead restarted on another process gets the pending tasks and the results in hand.',
       match: {
         python: {all: [/["']plan["']/, /json\.loads\(/], none: [/\bPLANS\b/]},
         typescript: {all: [/['"]plan['"]|\bplan:/, /JSON\.parse\(/], none: [/\bplans\b/]},
@@ -666,6 +666,16 @@ def check_resume(ctx):
     m.start_job("job-1", PLAN)
     raw = ctx.redis.hget("research:job-1", "plan")
     assert raw is not None and json.loads(raw) == PLAN, f"after start_job the field plan of research:job-1 is {raw!r}: a plan kept in this process is gone when the lead restarts. Write it into research:{{job_id}}"
+    status = ctx.redis.hget("research:job-1", "status")
+    assert status == "running", f"after start_job the field status of research:job-1 is {status!r}, expected running"
+    # research:job-9 holds a string, so saving its plan fails (WRONGTYPE): the lead must hear about it.
+    ctx.redis.set("research:job-9", "not a hash")
+    try:
+        m.start_job("job-9", PLAN)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("start_job returned although writing research:job-9 failed (WRONGTYPE): a checkpoint write that fails must reach the caller, or the lead believes a plan is saved that is not")
     # The lead that started job-7 crashed after t-1 came back; a restarted process resumes it.
     ctx.redis.hset("research:job-7", mapping={"status": "running", "plan": json.dumps(PLAN)})
     m.save_result("job-7", "t-1", "chair: A. Jones")
@@ -697,6 +707,11 @@ def check_ttl(ctx):
     for key in ("research:job-1", "research:job-1:results", "research:job-1:tools"):
         ttl = ctx.redis.ttl(key)
         assert 86000 < ttl <= 86400, f"{key} has a TTL of {ttl}: every checkpoint key must expire CHECKPOINT_TTL_S = 86400 s after its last write"
+    # The counter's expiry is part of the reservation: written in a second command, a crash in between leaves a counter that never expires.
+    seen = ctx.redis_after("research:job-2:tools", lambda: ctx.redis.ttl("research:job-2:tools"))
+    m.reserve_tool_call("job-2", 10)
+    ttl = _settled(seen, "research:job-2:tools")
+    assert 86000 < ttl <= 86400, f"right after the reservation's first command touched research:job-2:tools its TTL was {ttl}: refresh the expiry inside RESERVE_LUA, in the same step as the INCR"
     ctx.clock.advance(3600)
     m.save_result("job-1", "t-2", "CFO: B. Smith")
     m.reserve_tool_call("job-1", 10)
@@ -718,6 +733,12 @@ def check_atomic_reserve(ctx):
     grants = [mine, theirs].count(True)
     assert grants == 1, f"two concurrent reservations for the last tool call of the budget were both granted ({mine}, {theirs}): count and compare in one Lua script"
     assert ctx.redis.get("research:job-2:tools") == "10", f"research:job-2:tools is {ctx.redis.get('research:job-2:tools')!r}, expected 10"
+    # job-3 has spent its 10 tool calls: a refused reservation must never leave the counter over budget, even for a moment.
+    ctx.redis.set("research:job-3:tools", 10)
+    seen = ctx.redis_after("research:job-3:tools", lambda: ctx.redis.get("research:job-3:tools"))
+    assert not m.reserve_tool_call("job-3", 10), "a reservation on a spent budget of 10 was granted"
+    used = _settled(seen, "research:job-3:tools")
+    assert used == "10", f"right after the refused reservation's first command research:job-3:tools read {used!r}: a subagent reading it then sees the budget overspent. Count, compare and roll back in one Lua script"
 `,
     typescript: `const PLAN = [1, 2, 3].map(i => ({
   id: \`t-\${i}\`,
@@ -738,6 +759,17 @@ export async function check_resume(ctx) {
   await m.startJob('job-1', PLAN);
   const raw = ctx.redis.hget('research:job-1', 'plan');
   assert(raw !== null && JSON.stringify(JSON.parse(raw)) === JSON.stringify(PLAN), \`after startJob the field plan of research:job-1 is \${JSON.stringify(raw)}: a plan kept in this process is gone when the lead restarts. Write it into research:{jobId}\`);
+  const status = ctx.redis.hget('research:job-1', 'status');
+  assert.equal(status, 'running', \`after startJob the field status of research:job-1 is \${JSON.stringify(status)}, expected running\`);
+  // research:job-9 holds a string, so saving its plan fails (WRONGTYPE): the lead must hear about it.
+  ctx.redis.set('research:job-9', 'not a hash');
+  let failed = false;
+  try {
+    await m.startJob('job-9', PLAN);
+  } catch {
+    failed = true;
+  }
+  assert(failed, 'startJob resolved although writing research:job-9 failed (WRONGTYPE): await every checkpoint write, so a failure reaches the caller instead of a lead that believes a plan is saved');
   // The lead that started job-7 crashed after t-1 came back; a restarted process resumes it.
   ctx.redis.hset('research:job-7', {status: 'running', plan: JSON.stringify(PLAN)});
   await m.saveResult('job-7', 't-1', 'chair: A. Jones');
@@ -770,6 +802,11 @@ export async function check_ttl(ctx) {
     const ttl = ctx.redis.ttl(key);
     assert(86000 < ttl && ttl <= 86400, \`\${key} has a TTL of \${ttl}: every checkpoint key must expire CHECKPOINT_TTL_S = 86400 s after its last write\`);
   }
+  // The counter's expiry is part of the reservation: written in a second command, a crash in between leaves a counter that never expires.
+  const seen = ctx.redisAfter('research:job-2:tools', () => ctx.redis.ttl('research:job-2:tools'));
+  await m.reserveToolCall('job-2', 10);
+  const ttl = await settled(seen, 'research:job-2:tools');
+  assert(86000 < ttl && ttl <= 86400, \`right after the reservation's first command touched research:job-2:tools its TTL was \${ttl}: refresh the expiry inside RESERVE_LUA, in the same step as the INCR\`);
   ctx.clock.advance(3600);
   await m.saveResult('job-1', 't-2', 'CFO: B. Smith');
   await m.reserveToolCall('job-1', 10);
@@ -792,6 +829,12 @@ export async function check_atomic_reserve(ctx) {
   const theirs = await settled(rival, 'research:job-2:tools');
   assert.equal([mine, theirs].filter(Boolean).length, 1, \`two concurrent reservations for the last tool call of the budget were both granted (\${mine}, \${theirs}): count and compare in one Lua script\`);
   assert.equal(ctx.redis.get('research:job-2:tools'), '10', 'research:job-2:tools after the race');
+  // job-3 has spent its 10 tool calls: a refused reservation must never leave the counter over budget, even for a moment.
+  ctx.redis.set('research:job-3:tools', '10');
+  const seen = ctx.redisAfter('research:job-3:tools', () => ctx.redis.get('research:job-3:tools'));
+  assert.equal(await m.reserveToolCall('job-3', 10), false, 'a reservation on a spent budget of 10 must be refused');
+  const used = await settled(seen, 'research:job-3:tools');
+  assert.equal(used, '10', \`right after the refused reservation's first command research:job-3:tools read \${JSON.stringify(used)}: a subagent reading it then sees the budget overspent. Count, compare and roll back in one Lua script\`);
 }
 `,
     go: `package main
@@ -844,6 +887,11 @@ func CheckResume(ctx *harness.Ctx) {
 	var stored []jobs.Task
 	json.Unmarshal([]byte(raw), &stored)
 	ctx.Equal(stored, plan, "after startJob the field plan of research:job-1 (%q): a plan kept in this process is gone when the lead restarts. Write it into research:{job_id}", raw)
+	status, _ := ctx.Redis.HGet("research:job-1", "status")
+	ctx.Equal(status, "running", "after startJob the field status of research:job-1")
+	// research:job-9 holds a string, so saving its plan fails (WRONGTYPE): the lead must hear about it.
+	ctx.Redis.Set("research:job-9", "not a hash")
+	ctx.Assert(startJob(cpBg, "job-9", plan) != nil, "startJob returned no error although writing research:job-9 failed (WRONGTYPE): a checkpoint write that fails must reach the caller, or the lead believes a plan is saved that is not")
 	// The lead that started job-7 crashed after t-1 came back; a restarted process resumes it.
 	data, _ := json.Marshal(plan)
 	ctx.Redis.Do("HSET", "research:job-7", "status", "running", "plan", string(data))
@@ -874,6 +922,15 @@ func CheckTtl(ctx *harness.Ctx) {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(86000 < ttl && ttl <= 86400, "%s has a TTL of %d: every checkpoint key must expire checkpointTTL = 24 h after its last write", key, ttl)
 	}
+	// The counter's expiry is part of the reservation: written in a second command, a crash in between leaves a counter that never expires.
+	var ttl int64
+	seen := ctx.Redis.After("research:job-2:tools", func() any {
+		ttl = ctx.Redis.TTL("research:job-2:tools")
+		return nil
+	})
+	mustReserve(ctx, "job-2", 10)
+	ctx.Assert(seen.Fired, "nothing touched research:job-2:tools")
+	ctx.Assert(86000 < ttl && ttl <= 86400, "right after the reservation's first command touched research:job-2:tools its TTL was %d: refresh the expiry inside the reservation script, in the same step as the INCR", ttl)
 	ctx.Clock.Advance(3600)
 	ctx.NoError(saveResult(cpBg, "job-1", "t-2", "CFO: B. Smith"), "saveResult failed")
 	mustReserve(ctx, "job-1", 10)
@@ -904,6 +961,16 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 	ctx.Assert(mine || theirs, "neither of two reservations for the last tool call was granted")
 	used, _ = ctx.Redis.Get("research:job-2:tools")
 	ctx.Equal(used, "10", "research:job-2:tools after the race")
+	// job-3 has spent its 10 tool calls: a refused reservation must never leave the counter over budget, even for a moment.
+	ctx.Redis.Set("research:job-3:tools", "10")
+	var seenUsed string
+	seen := ctx.Redis.After("research:job-3:tools", func() any {
+		seenUsed, _ = ctx.Redis.Get("research:job-3:tools")
+		return nil
+	})
+	ctx.Assert(!mustReserve(ctx, "job-3", 10), "a reservation on a spent budget of 10 was granted")
+	ctx.Assert(seen.Fired, "nothing touched research:job-3:tools")
+	ctx.Equal(seenUsed, "10", "a subagent reading the counter must never see the budget overspent (count, compare and roll back in one Lua script); research:job-3:tools right after the refused reservation's first command")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -940,6 +1007,16 @@ void CheckResume(harness::Ctx& ctx) {
   const auto raw = ctx.Redis.HGet("research:job-1", "plan");
   ctx.Assert(raw && nlohmann::json::parse(*raw, nullptr, false) == nlohmann::json(plan),
              "after startJob the field plan of research:job-1 is %q: a plan kept in this process is gone when the lead restarts. Write it into research:{job_id}", raw.value_or("(none)"));
+  ctx.Equal(ctx.Redis.HGet("research:job-1", "status"), std::optional<std::string>("running"), "after startJob the field status of research:job-1");
+  // research:job-9 holds a string, so saving its plan fails (WRONGTYPE): the lead must hear about it.
+  ctx.Redis.Set("research:job-9", "not a hash");
+  bool failed = false;
+  try {
+    startJob("job-9", plan);
+  } catch (const std::exception&) {
+    failed = true;
+  }
+  ctx.Assert(failed, "startJob returned although writing research:job-9 failed (WRONGTYPE): a checkpoint write that fails must reach the caller, or the lead believes a plan is saved that is not");
   // The lead that started job-7 crashed after t-1 came back; a restarted process resumes it.
   ctx.Redis.Do("HSET", "research:job-7", "status", "running", "plan", nlohmann::json(plan).dump());
   saveResult("job-7", "t-1", "chair: A. Jones");
@@ -974,6 +1051,17 @@ void CheckTtl(harness::Ctx& ctx) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(86000 < ttl && ttl <= 86400, "%s has a TTL of %d: every checkpoint key must expire kCheckpointTtlS = 86400 s after its last write", key, ttl);
   }
+  // The counter's expiry is part of the reservation: written in a second command, a crash in between leaves a counter that never expires.
+  bool fired = false;
+  long long seen_ttl = 0;
+  ctx.Redis.After("research:job-2:tools", [&ctx, &fired, &seen_ttl] {
+    fired = true;
+    seen_ttl = ctx.Redis.TTL("research:job-2:tools");
+  });
+  reserveToolCall("job-2", 10);
+  ctx.Assert(fired, "nothing touched research:job-2:tools");
+  ctx.Assert(86000 < seen_ttl && seen_ttl <= 86400,
+             "right after the reservation's first command touched research:job-2:tools its TTL was %d: refresh the expiry inside kReserveLua, in the same step as the INCR", seen_ttl);
   ctx.Clock.Advance(3600);
   saveResult("job-1", "t-2", "CFO: B. Smith");
   reserveToolCall("job-1", 10);
@@ -1001,6 +1089,18 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
   ctx.Assert(!(mine && theirs), "two concurrent reservations for the last tool call of the budget were both granted: count and compare in one Lua script");
   ctx.Assert(mine || theirs, "neither of two reservations for the last tool call was granted");
   ctx.Equal(ctx.Redis.Get("research:job-2:tools"), std::optional<std::string>("10"), "research:job-2:tools after the race");
+  // job-3 has spent its 10 tool calls: a refused reservation must never leave the counter over budget, even for a moment.
+  ctx.Redis.Set("research:job-3:tools", "10");
+  bool seen = false;
+  std::optional<std::string> used;
+  ctx.Redis.After("research:job-3:tools", [&ctx, &seen, &used] {
+    seen = true;
+    used = ctx.Redis.Get("research:job-3:tools");
+  });
+  ctx.Assert(!reserveToolCall("job-3", 10), "a reservation on a spent budget of 10 was granted");
+  ctx.Assert(seen, "nothing touched research:job-3:tools");
+  ctx.Equal(used, std::optional<std::string>("10"),
+            "a subagent reading the counter must never see the budget overspent (count, compare and roll back in one Lua script); research:job-3:tools right after the refused reservation's first command");
 }
 `,
   },

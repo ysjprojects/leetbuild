@@ -634,7 +634,9 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 				action = aCallSlice
 			}
 
-			st.push(addChild(&root, anc, pos, callExpr, action), nod)
+			call := addChild(&root, anc, pos, callExpr, action)
+			call.call = a
+			st.push(call, nod)
 
 		case *ast.CaseClause:
 			st.push(addChild(&root, anc, pos, caseClause, aCase), nod)

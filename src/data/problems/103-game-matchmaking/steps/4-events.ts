@@ -429,6 +429,7 @@ bool publishEvent(const std::string& match_id, const std::string& kind) {
       solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -440,11 +441,23 @@ using json = nlohmann::json;
 const std::string kTopic = "match.event";
 constexpr int kAckTimeoutMs = 2000;
 
-// The delivery report of the record in flight: publishEvent produces one record and waits for it.
+// One record's delivery outcome. Each produce passes its own slot as the msg_opaque, so concurrent
+// publishers never read each other's report.
+struct Outcome {
+  std::atomic<bool> reported{false};
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;  // written before reported is set
+};
+
+// librdkafka reports every produced record exactly once (delivered, refused or timed out), on
+// whichever thread serves the producer; the report owns the heap reference it was handed.
 class DeliveryReport : public RdKafka::DeliveryReportCb {
  public:
-  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
-  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+  void dr_cb(RdKafka::Message& message) override {
+    std::unique_ptr<std::shared_ptr<Outcome>> slot(static_cast<std::shared_ptr<Outcome>*>(message.msg_opaque()));
+    if (!slot) return;
+    (*slot)->error = message.err();
+    (*slot)->reported.store(true, std::memory_order_release);
+  }
 };
 
 DeliveryReport delivery;
@@ -473,13 +486,17 @@ bool publishEvent(const std::string& match_id, const std::string& kind) {
                         {"server_id", nullable(m->server_id)},
                         {"reason", nullable(m->reason)}};
   const std::string value = payload.dump();
-  delivery.error = RdKafka::ERR_NO_ERROR;
+  auto outcome = std::make_shared<Outcome>();
+  // The report may come after the window: its own reference keeps the slot alive until then.
+  auto* slot = new std::shared_ptr<Outcome>(outcome);
   // Keyed by the match: its found, started and abandoned events share a partition, in order.
   RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
-                                             value.size(), match_id.c_str(), match_id.size(), 0, nullptr);
-  if (err == RdKafka::ERR_NO_ERROR) {
-    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
-    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+                                             value.size(), match_id.c_str(), match_id.size(), 0, slot);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    delete slot;  // a refused produce is never reported
+  } else {
+    producer->flush(kAckTimeoutMs);  // serves the delivery reports, or gives up after the window
+    err = outcome->reported.load(std::memory_order_acquire) ? outcome->error : RdKafka::ERR__TIMED_OUT;
   }
   if (err != RdKafka::ERR_NO_ERROR) {
     store::insertOutbox(kTopic, match_id, payload);  // the relay publishes it once the broker is back
@@ -582,7 +599,7 @@ def check_outbox(ctx):
     before = ctx.clock.time()
     ok = m.publish_event("m-1", "found")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_event waited {waited:.0f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S"
+    assert waited <= 2.5, f"publish_event waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S (2 s)"
     assert len(_outbox(ctx)) == 2, f"no delivery report within the window and the outbox holds {_outbox(ctx)}"
     assert ok is False, f"publish_event returned {ok!r} without a delivery report, expected False"
 `,
@@ -680,7 +697,7 @@ export async function check_outbox(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishEvent('m-1', 'found');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS\`);
+  assert(waited <= 2.5, \`publishEvent waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS (2000 ms)\`);
   assert.equal(outbox(ctx).length, 2, \`no delivery report within the window and the outbox holds \${JSON.stringify(outbox(ctx))}\`);
   assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
 }
@@ -826,7 +843,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, "m-1", "found")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the report at most ackTimeout", waited)
+	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s)", waited)
 	ctx.Equal(len(eventsOutbox(ctx)), 2, "no delivery report within the window; the outbox rows")
 	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
 }
@@ -954,7 +971,7 @@ void CheckOutbox(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publishEvent("m-1", "found");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the report at most kAckTimeoutMs", waited);
+  ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s)", waited);
   ctx.Equal(eventsOutbox(ctx).size(), 2, "no delivery report within the window; the outbox rows");
   ctx.Equal(ok, false, "publishEvent's result without a delivery report");
 }

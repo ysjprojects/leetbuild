@@ -199,6 +199,7 @@ func copyNode(n, anc *node, recursive bool) *node {
 		rval:   n.rval,
 		ident:  n.ident,
 		meta:   n.meta,
+		call:   n.call,
 	}
 	nod.start = nod
 	if recursive {

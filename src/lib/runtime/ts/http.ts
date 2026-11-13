@@ -5,13 +5,16 @@
  * `onSend`, `onResponse`, `onError`), encapsulated `register(plugin, {prefix})`, decorators,
  * content-type parsers (`addContentTypeParser('application/octet-stream', {parseAs: 'buffer'}, …)`,
  * the body arriving as the exact bytes sent), pino's logger for `Fastify({logger: true})` (JSON lines
- * on stdout, `request.log` a child carrying `reqId`, the automatic request lines) and
+ * on stdout, `request.log` a child carrying `reqId`, the automatic request lines), route `schema`
+ * validation of params, body, querystring and headers with Fastify's default Ajv options (`schema.ts`;
+ * a 400 `FST_ERR_VALIDATION`, or `request.validationError` with `attachValidation`) and
  * `app.inject(…)` — Fastify's own in-process request, which is also how the harness's `ctx.client`
  * drives the app. No sockets: `listen()` resolves with an address and nothing else happens.
  */
 import {type Bytes, Buffer} from './buffer';
 import {CLOCK} from './clock';
 import {os, PROCESS} from './node';
+import {type Validate, compileSchema, isObject} from './schema';
 
 export const STATUS_TEXT: Record<number, string> = {
   200: 'OK',
@@ -233,6 +236,17 @@ const statusOf = (error: Error): number | null => {
   return typeof candidate === 'number' && candidate >= 400 && candidate <= 599 ? candidate : null;
 };
 
+/** Fastify's default error reply: `{statusCode, code, error, message}`, `code` only when the error carries one (`FST_ERR_VALIDATION`). */
+const errorPayload = (statusCode: number, error: Error): Record<string, unknown> => {
+  const code: unknown = 'code' in error ? error.code : undefined;
+  return {
+    statusCode,
+    ...(code === undefined || code === null ? {} : {code: String(code)}),
+    error: STATUS_TEXT[statusCode] ?? 'Error',
+    message: error.message,
+  };
+};
+
 export interface FastifyRequest<P = Record<string, string>, Q = Record<string, string | string[]>, B = unknown> {
   [decorated: string]: unknown;
   id: string;
@@ -249,6 +263,8 @@ export interface FastifyRequest<P = Record<string, string>, Q = Record<string, s
   hostname: string;
   protocol: string;
   log: Logger;
+  /** With the route's `attachValidation: true`, the schema validation's error (the handler runs anyway). */
+  validationError?: Error;
 }
 
 /** Fastify's `req` log serializer; light-my-request's socket has no remote port, so `remotePort` is left out. */
@@ -421,10 +437,120 @@ export interface RouteOptions {
   preValidation?: Hook | Hook[];
   preHandler?: Hook | Hook[];
   schema?: unknown;
+  /** Fastify's `attachValidation`: a request failing the schema reaches the handler with `request.validationError`. */
+  attachValidation?: boolean;
   config?: unknown;
   /** Bytes this route accepts, overriding the server's and the parser's limit. */
   bodyLimit?: number;
 }
+
+/** A route's compiled schema, one validator per request part (null: the part is not validated). */
+interface RouteValidators {
+  params: Validate | null;
+  body: Validate | null;
+  querystring: Validate | null;
+  headers: Validate | null;
+}
+
+/** Route `schema` properties Fastify (and @fastify/swagger) read as documentation: they validate nothing there either. */
+const SCHEMA_DOCS = new Set([
+  'summary',
+  'description',
+  'tags',
+  'operationId',
+  'hide',
+  'security',
+  'consumes',
+  'produces',
+  'deprecated',
+  'externalDocs',
+]);
+
+/**
+ * Fastify's route schema, compiled at registration as Fastify does: `query` is `querystring`, a part
+ * without `type` or `properties` is the shorthand for an object's properties, header names are
+ * lower-cased, and a body schema on GET or HEAD is refused. What this runtime cannot enforce (a
+ * `response` serializer, a keyword `schema.ts` does not model) is refused here too, never ignored.
+ */
+const compileRouteSchema = (method: string, url: string, schema: unknown): RouteValidators | null => {
+  if (schema === undefined || schema === null) return null;
+  if (!isObject(schema)) throw new Error(`${method}:${url}: the route's schema must be an object`);
+  const parts: Record<string, unknown> = {...schema};
+  if (parts.query !== undefined) {
+    if (parts.querystring !== undefined)
+      throw Object.assign(new Error(`Schema with 'querystring' already present!`), {code: 'FST_ERR_SCH_DUPLICATE'});
+    parts.querystring = parts.query;
+    delete parts.query;
+  }
+  for (const key of Object.keys(parts)) {
+    if (key === 'response')
+      throw new Error(
+        `${method}:${url}: schema.response (Fastify's reply serializer, which drops undeclared fields) is not modelled by this runtime: remove it and shape the reply in the handler`,
+      );
+    if (!['params', 'body', 'querystring', 'headers'].includes(key) && !SCHEMA_DOCS.has(key))
+      throw new Error(
+        `${method}:${url}: schema.${key} is not a part Fastify validates (params, body, querystring, headers)`,
+      );
+  }
+  if ((method === 'GET' || method === 'HEAD') && parts.body)
+    throw Object.assign(new Error(`Body validation schema for ${method}:${url} route is not supported!`), {
+      code: 'FST_ERR_ROUTE_BODY_VALIDATION_SCHEMA_NOT_SUPPORTED',
+      statusCode: 500,
+    });
+  const compile = (part: 'params' | 'body' | 'querystring' | 'headers'): Validate | null => {
+    let partSchema = parts[part];
+    if (!partSchema) return null;
+    if (isObject(partSchema)) {
+      if (part === 'body' && partSchema.content !== undefined)
+        throw new Error(
+          `${method}:${url}: schema.body.content (a schema per content type) is not modelled by this runtime`,
+        );
+      if (partSchema.type === undefined && partSchema.properties === undefined)
+        partSchema = {type: 'object', properties: partSchema};
+      if (part === 'headers' && isObject(partSchema)) {
+        const headers: Record<string, unknown> = {...partSchema};
+        if (Array.isArray(headers.required)) headers.required = headers.required.map(h => String(h).toLowerCase());
+        if (isObject(headers.properties))
+          headers.properties = Object.fromEntries(
+            Object.entries(headers.properties).map(([k, v]) => [k.toLowerCase(), v]),
+          );
+        partSchema = headers;
+      }
+    }
+    return compileSchema(partSchema, `${method}:${url} schema.${part}`);
+  };
+  return {
+    params: compile('params'),
+    body: compile('body'),
+    querystring: compile('querystring'),
+    headers: compile('headers'),
+  };
+};
+
+/**
+ * Fastify's validation step (after preValidation): params, body, querystring, headers, in that
+ * order; the first failure as Fastify's error — `body/duration_s must be <= 14400`, status 400, code
+ * FST_ERR_VALIDATION, the Ajv error on `validation` — or null.
+ */
+const validateRequest = (validators: RouteValidators, request: FastifyRequest): Error | null => {
+  const parts: [Validate | null, unknown, string][] = [
+    [validators.params, request.params, 'params'],
+    [validators.body, request.body, 'body'],
+    [validators.querystring, request.query, 'querystring'],
+    [validators.headers, request.headers, 'headers'],
+  ];
+  for (const [validate, value, dataVar] of parts) {
+    const failed = validate?.(value === undefined ? null : value) ?? null;
+    if (failed !== null)
+      return Object.assign(new Error(`${dataVar}${failed.instancePath} ${failed.message}`), {
+        statusCode: 400,
+        code: 'FST_ERR_VALIDATION',
+        validation: [failed],
+        validationContext: dataVar,
+      });
+  }
+  return null;
+};
 
 interface Route {
   method: string;
@@ -434,6 +560,8 @@ interface Route {
   bodyLimit: number | undefined;
   hooks: Hooks;
   owner: FastifyInstance;
+  validators: RouteValidators | null;
+  attachValidation: boolean;
 }
 
 interface Hooks {
@@ -544,14 +672,17 @@ export class FastifyInstance {
     hooks.preHandler = asArray(options.preHandler);
     for (const method of asArray(options.method)) {
       const pattern = joinPath(this.prefix, options.url);
+      const upper = method.toUpperCase();
       this.routes.push({
-        method: method.toUpperCase(),
+        method: upper,
         pattern,
         segments: pattern.split('/').filter(s => s !== ''),
         handler: options.handler,
         bodyLimit: options.bodyLimit,
         hooks,
         owner: this,
+        validators: compileRouteSchema(upper, pattern, options.schema),
+        attachValidation: options.attachValidation === true,
       });
     }
     return this;
@@ -872,6 +1003,11 @@ export class FastifyInstance {
       const serverLimit = this.initialConfig.bodyLimit ?? 1048576;
       request.body = await parseBody(request, bodyBytes, owner.parsers, serverLimit, route.bodyLimit);
       if (await this.runHooks([...owner.hooks.preValidation, ...route.hooks.preValidation], request, reply)) return;
+      const invalid = route.validators === null ? null : validateRequest(route.validators, request);
+      if (invalid !== null) {
+        if (!route.attachValidation) throw invalid;
+        request.validationError = invalid;
+      }
       if (await this.runHooks([...owner.hooks.preHandler, ...route.hooks.preHandler], request, reply)) return;
       await this.runHandler(route.handler, request, reply);
     } catch (e) {
@@ -924,7 +1060,7 @@ export class FastifyInstance {
       } catch (inner) {
         const again = inner instanceof Error ? inner : new Error(String(inner));
         const code = statusOf(again) ?? 500;
-        reply.code(code).send({statusCode: code, error: STATUS_TEXT[code] ?? 'Error', message: again.message});
+        reply.code(code).send(errorPayload(code, again));
         return;
       }
     }
@@ -932,7 +1068,7 @@ export class FastifyInstance {
     if (!reply.sent && statusCode >= 500)
       reply.log.error({req: serializeRequest(request), res: {statusCode}, err: error}, error.message);
     else if (!reply.sent) reply.log.info({res: {statusCode}, err: error}, error.message);
-    if (!reply.sent) reply.send({statusCode, error: STATUS_TEXT[statusCode] ?? 'Error', message: error.message});
+    if (!reply.sent) reply.send(errorPayload(statusCode, error));
   }
 
   private async finish(
@@ -946,7 +1082,7 @@ export class FastifyInstance {
       const error = payload as Error & {statusCode?: number};
       const statusCode = error.statusCode ?? (reply.statusCode >= 400 ? reply.statusCode : 500);
       reply.code(statusCode);
-      payload = {statusCode, error: STATUS_TEXT[statusCode] ?? 'Error', message: error.message};
+      payload = errorPayload(statusCode, error);
     }
     for (const hook of owner.hooks.preSerialization) {
       const out = await runHook(hook, request, reply, payload);

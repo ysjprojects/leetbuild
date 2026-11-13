@@ -22,10 +22,12 @@ spoken; and a four-hour recording stops at the 100th segment.
 
 - Another tenant's job is **404**, the same answer as a missing id (a 403 would confirm it exists).
 - \`status\` is \`done\` only when the job record says so (\`jobs.mark_done\`, step 2), and then
-  \`completed_chunks\` is \`total_chunks\`; otherwise it is \`partial\`, with the ledger's count.
-- \`segments\` are ordered by \`start_ms\`.
-- \`?cursor=N\` starts the page at segment N; \`next_cursor\` is the next page's cursor while segments
-  remain and \`null\` on the last page.`,
+  \`completed_chunks\` is \`total_chunks\`; otherwise it is \`partial\`, with the ledger's count, even when
+  that count has reached \`total_chunks\`.
+- \`segments\` are ordered by \`start_ms\` across the whole transcript.
+- \`?cursor=N\` starts the page at segment N (any N, not only one a page handed out); \`next_cursor\`
+  is the next page's cursor while segments remain and \`null\` on the last page, so 200 segments are
+  two pages. A negative cursor is **400**.`,
   sequence: {
     participants: ['Client', 'Transcription API', 'jobs store', 'Redis ledger'],
     messages: [
@@ -77,7 +79,7 @@ spoken; and a four-hour recording stops at the 100th segment.
       id: 'honest-status',
       title: 'done comes from the job record, not from the segments',
       detail:
-        "`status` is `done` only when the job record is (every chunk finished, step 2), with `completed_chunks` equal to `total_chunks`; otherwise `partial` with the ledger's count. The starter answers `done` whenever a segment exists and reads the count from a ledger that expires.",
+        "`status` is `done` only when the job record is (every chunk finished, step 2), with `completed_chunks` equal to `total_chunks`; otherwise `partial` with the ledger's count, even a ledger that counts every chunk done. The starter answers `done` whenever a segment exists and reads the count from a ledger that expires.",
       match: {
         python: {all: [/job\[["']status["']\]\s*==\s*["']done["']/], none: [/["']done["']\s+if\s+segments\b/]},
         typescript: {all: [/job\.status\s*===\s*['"]done['"]/], none: [/segments\.length\s*>\s*0\s*\?\s*['"]done['"]/]},
@@ -103,7 +105,7 @@ spoken; and a four-hour recording stops at the 100th segment.
       id: 'cursor-pagination',
       title: 'A cursor walks past the first page',
       detail:
-        '`?cursor=N` starts the page at segment N and `next_cursor` names the next page while segments remain; the starter always answers the first 100 with `next_cursor: null`, so a long recording is cut off.',
+        "`?cursor=N` starts the page at segment N (`?cursor=150` reads segments 150 to 249) and `next_cursor` names the next page while segments remain, `null` on the last (200 segments are two pages); a negative cursor is **400** (FastAPI's 422 too). The starter always answers the first 100 with `next_cursor: null`, so a long recording is cut off.",
       match: {
         python: {all: [/query_params\.get\(\s*["']cursor["']/], none: [/["']next_cursor["']\s*:\s*None/]},
         typescript: {all: [/cursor\?*\s*:\s*string|query[^\n]*cursor/], none: [/next_cursor:\s*null\b/]},
@@ -584,13 +586,19 @@ async def check_tenant_scope(ctx):
 async def check_honest_status(ctx):
     job = _job(total=3)
     jobs.save_segments(job, [_segment(0, 0), _segment(0, 10000)])
-    ctx.redis.hset(f"job:{job}:chunks", mapping={"0": "done", "1": "failed"})
+    ledger = f"job:{job}:chunks"
+    # The ledger counts every chunk done, but the job record has not been marked done yet.
+    ctx.redis.hset(ledger, mapping={"0": "done", "1": "done", "2": "done"})
     async with _api(ctx) as c:
+        unmarked = (await _read(c, job)).json()
+        assert unmarked.get("status") == "partial" and unmarked.get("completed_chunks") == 3, f"a job whose ledger counts 3 of 3 chunks done but whose record is still queued reads {unmarked.get('status')!r} with {unmarked.get('completed_chunks')} chunks completed, expected partial with 3: only the job record says it is done"
+        ctx.redis.delete(ledger)
+        ctx.redis.hset(ledger, mapping={"0": "done", "1": "failed"})
         partial = (await _read(c, job)).json()
         assert partial.get("status") == "partial" and partial.get("completed_chunks") == 1, f"a job with chunk 1 failed and chunk 2 pending reads {partial.get('status')!r} with {partial.get('completed_chunks')} chunks completed, expected partial with 1"
         # Every chunk finished, and 24 hours later the ledger has expired.
         jobs.mark_done(job)
-        ctx.redis.delete(f"job:{job}:chunks")
+        ctx.redis.delete(ledger)
         done = (await _read(c, job)).json()
     assert done.get("status") == "done" and done.get("completed_chunks") == 3, f"a finished job whose ledger expired reads {done.get('status')!r} with {done.get('completed_chunks')} of 3 chunks completed, expected done with 3: the job record is what says it finished"
 
@@ -601,26 +609,47 @@ async def check_segment_order(ctx):
     jobs.save_segments(job, [_segment(2, 60000), _segment(2, 70000)])
     jobs.save_segments(job, [_segment(0, 0), _segment(0, 10000)])
     jobs.save_segments(job, [_segment(1, 30000)])
+    # 150 segments whose chunks finish last to first: the first page is the first 100 spoken.
+    long = _job(ref="s3://calls/b.wav", total=50)
+    for chunk in reversed(range(50)):
+        jobs.save_segments(long, [_segment(chunk, (chunk * 3 + k) * 10000) for k in range(3)])
     async with _api(ctx) as c:
         body = (await _read(c, job)).json()
+        first = (await _read(c, long)).json()
     starts = [s["start_ms"] for s in body.get("segments", [])]
     assert starts == [0, 10000, 30000, 60000, 70000], f"the transcript must read in the order it was spoken, got segments starting at {starts}"
+    page = [s["start_ms"] for s in first.get("segments", [])]
+    assert page == [i * 10000 for i in range(100)], f"the first page of 150 segments saved last chunk first starts at {page[:3]} and ends at {page[-3:]} ({len(page)} segments), expected the first 100 spoken, 0 to 990 000 ms: sort the whole transcript before cutting the page"
+
+
+async def _walk(c, job):
+    seen, cursor, pages = [], None, 0
+    while pages < 5:
+        body = (await _read(c, job, cursor=cursor)).json()
+        pages += 1
+        seen += [s["start_ms"] for s in body.get("segments", [])]
+        cursor = body.get("next_cursor")
+        if cursor is None:
+            break
+    return seen, pages
 
 
 async def check_cursor_pagination(ctx):
     job = _job(total=84)
     jobs.save_segments(job, [_segment(i // 3, i * 10000) for i in range(250)])
-    seen, cursor, pages = [], None, 0
+    exact = _job(ref="s3://calls/b.wav", total=67)
+    jobs.save_segments(exact, [_segment(i // 3, i * 10000) for i in range(200)])
     async with _api(ctx) as c:
-        while pages < 5:
-            body = (await _read(c, job, cursor=cursor)).json()
-            pages += 1
-            seen += [s["start_ms"] for s in body.get("segments", [])]
-            cursor = body.get("next_cursor")
-            if cursor is None:
-                break
-    assert seen == [i * 10000 for i in range(250)], f"walking next_cursor returned {len(seen)} of 250 segments in {pages} pages: a long recording must be readable past the first page"
-    assert pages == 3, f"250 segments at 100 a page are 3 pages, the walk took {pages}"
+        seen, pages = await _walk(c, job)
+        assert seen == [i * 10000 for i in range(250)], f"walking next_cursor returned {len(seen)} of 250 segments in {pages} pages: a long recording must be readable past the first page"
+        assert pages == 3, f"250 segments at 100 a page are 3 pages, the walk took {pages}"
+        seen, pages = await _walk(c, exact)
+        assert seen == [i * 10000 for i in range(200)] and pages == 2, f"200 segments are 2 pages, the second with next_cursor null; walking next_cursor took {pages} pages for {len(seen)} segments"
+        middle = (await _read(c, job, cursor=150)).json()
+        negative = await _read(c, job, cursor=-1)
+    starts = [s["start_ms"] for s in middle.get("segments", [])]
+    assert starts == [i * 10000 for i in range(150, 250)] and middle.get("next_cursor") is None, f"?cursor=150 starts the page at segment 150: got {len(starts)} segments from {starts[:1]} ms with next_cursor {middle.get('next_cursor')!r}, expected the 100 from 1 500 000 ms and null"
+    assert 400 <= negative.status_code < 500, f"?cursor=-1 answered {negative.status_code}, expected 400 (or FastAPI's 422): a cursor is a segment offset, and a negative one is the client's error"
 `,
     typescript: `const T1 = {'X-Tenant-Id': 't-1'};
 
@@ -667,12 +696,18 @@ export async function check_honest_status(ctx) {
   const {c, jobs} = world(ctx);
   const job = await newJob(jobs);
   await jobs.saveSegments(job, [segmentOf(0, 0), segmentOf(0, 10000)]);
-  ctx.redis.hset(\`job:\${job}:chunks\`, '0', 'done', '1', 'failed');
+  const ledger = \`job:\${job}:chunks\`;
+  // The ledger counts every chunk done, but the job record has not been marked done yet.
+  ctx.redis.hset(ledger, '0', 'done', '1', 'done', '2', 'done');
+  const unmarked = (await read(c, job)).json();
+  assert(unmarked.status === 'partial' && unmarked.completed_chunks === 3, \`a job whose ledger counts 3 of 3 chunks done but whose record is still queued reads \${unmarked.status} with \${unmarked.completed_chunks} chunks completed, expected partial with 3: only the job record says it is done\`);
+  ctx.redis.del(ledger);
+  ctx.redis.hset(ledger, '0', 'done', '1', 'failed');
   const partial = (await read(c, job)).json();
   assert(partial.status === 'partial' && partial.completed_chunks === 1, \`a job with chunk 1 failed and chunk 2 pending reads \${partial.status} with \${partial.completed_chunks} chunks completed, expected partial with 1\`);
   // Every chunk finished, and 24 hours later the ledger has expired.
   await jobs.markDone(job);
-  ctx.redis.del(\`job:\${job}:chunks\`);
+  ctx.redis.del(ledger);
   const done = (await read(c, job)).json();
   assert(done.status === 'done' && done.completed_chunks === 3, \`a finished job whose ledger expired reads \${done.status} with \${done.completed_chunks} of 3 chunks completed, expected done with 3: the job record is what says it finished\`);
 }
@@ -684,15 +719,19 @@ export async function check_segment_order(ctx) {
   await jobs.saveSegments(job, [segmentOf(2, 60000), segmentOf(2, 70000)]);
   await jobs.saveSegments(job, [segmentOf(0, 0), segmentOf(0, 10000)]);
   await jobs.saveSegments(job, [segmentOf(1, 30000)]);
+  // 150 segments whose chunks finish last to first: the first page is the first 100 spoken.
+  const long = await newJob(jobs, 't-1', 's3://calls/b.wav', 50);
+  for (let chunk = 49; chunk >= 0; chunk--) {
+    await jobs.saveSegments(long, [0, 1, 2].map(k => segmentOf(chunk, (chunk * 3 + k) * 10000)));
+  }
   const body = (await read(c, job)).json();
   const starts = (body.segments ?? []).map(s => s.start_ms);
   assert.deepStrictEqual(starts, [0, 10000, 30000, 60000, 70000], \`the transcript must read in the order it was spoken, got segments starting at \${JSON.stringify(starts)}\`);
+  const page = ((await read(c, long)).json().segments ?? []).map(s => s.start_ms);
+  assert.deepStrictEqual(page, Array.from({length: 100}, (_, i) => i * 10000), \`the first page of 150 segments saved last chunk first starts at \${JSON.stringify(page.slice(0, 3))} and ends at \${JSON.stringify(page.slice(-3))} (\${page.length} segments), expected the first 100 spoken, 0 to 990 000 ms: sort the whole transcript before cutting the page\`);
 }
 
-export async function check_cursor_pagination(ctx) {
-  const {c, jobs} = world(ctx);
-  const job = await newJob(jobs, 't-1', 's3://calls/a.wav', 84);
-  await jobs.saveSegments(job, Array.from({length: 250}, (_, i) => segmentOf(Math.floor(i / 3), i * 10000)));
+async function walk(c, job: string): Promise<{seen: number[]; pages: number}> {
   const seen: number[] = [];
   let cursor: string | null = null;
   let pages = 0;
@@ -703,14 +742,32 @@ export async function check_cursor_pagination(ctx) {
     cursor = body.next_cursor ?? null;
     if (cursor === null) break;
   }
-  assert.deepStrictEqual(seen, Array.from({length: 250}, (_, i) => i * 10000), \`walking next_cursor returned \${seen.length} of 250 segments in \${pages} pages: a long recording must be readable past the first page\`);
-  assert.equal(pages, 3, \`250 segments at 100 a page are 3 pages, the walk took \${pages}\`);
+  return {seen, pages};
+}
+
+export async function check_cursor_pagination(ctx) {
+  const {c, jobs} = world(ctx);
+  const job = await newJob(jobs, 't-1', 's3://calls/a.wav', 84);
+  await jobs.saveSegments(job, Array.from({length: 250}, (_, i) => segmentOf(Math.floor(i / 3), i * 10000)));
+  const exact = await newJob(jobs, 't-1', 's3://calls/b.wav', 67);
+  await jobs.saveSegments(exact, Array.from({length: 200}, (_, i) => segmentOf(Math.floor(i / 3), i * 10000)));
+  const long = await walk(c, job);
+  assert.deepStrictEqual(long.seen, Array.from({length: 250}, (_, i) => i * 10000), \`walking next_cursor returned \${long.seen.length} of 250 segments in \${long.pages} pages: a long recording must be readable past the first page\`);
+  assert.equal(long.pages, 3, \`250 segments at 100 a page are 3 pages, the walk took \${long.pages}\`);
+  const even = await walk(c, exact);
+  assert(even.pages === 2 && even.seen.length === 200, \`200 segments are 2 pages, the second with next_cursor null; walking next_cursor took \${even.pages} pages for \${even.seen.length} segments\`);
+  const middle = (await read(c, job, 't-1', '150')).json();
+  const starts = (middle.segments ?? []).map(s => s.start_ms);
+  assert(starts.length === 100 && starts[0] === 1500000 && middle.next_cursor === null, \`?cursor=150 starts the page at segment 150: got \${starts.length} segments from \${JSON.stringify(starts.slice(0, 1))} ms with next_cursor \${JSON.stringify(middle.next_cursor)}, expected the 100 from 1 500 000 ms and null\`);
+  const negative = await read(c, job, 't-1', '-1');
+  assert(negative.status >= 400 && negative.status < 500, \`?cursor=-1 answered \${negative.status}, expected 400: a cursor is a segment offset, and a negative one is the client's error\`);
 }
 `,
     go: `package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"transcribe/jobs"
@@ -726,7 +783,7 @@ type readView struct {
 	CompletedChunks int            \`json:"completed_chunks"\`
 	TotalChunks     int            \`json:"total_chunks"\`
 	Segments        []jobs.Segment \`json:"segments"\`
-	NextCursor      *string        \`json:"next_cursor"\`
+	NextCursor      any            \`json:"next_cursor"\` // a string, or a number
 }
 
 func readSegment(index, startMs int, text string) jobs.Segment {
@@ -790,12 +847,18 @@ func CheckHonestStatus(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	job := readJob("t-1", 3)
 	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
-	ctx.Redis.Do("HSET", "job:"+job+":chunks", "0", "done", "1", "failed")
+	ledger := "job:" + job + ":chunks"
+	// The ledger counts every chunk done, but the job record has not been marked done yet.
+	ctx.Redis.Do("HSET", ledger, "0", "done", "1", "done", "2", "done")
+	_, unmarked := readOne(c, job, "t-1", "")
+	ctx.Assert(unmarked.Status == "partial" && unmarked.CompletedChunks == 3, "a job whose ledger counts 3 of 3 chunks done but whose record is still queued reads %q with %d chunks completed, expected partial with 3: only the job record says it is done", unmarked.Status, unmarked.CompletedChunks)
+	ctx.Redis.Del(ledger)
+	ctx.Redis.Do("HSET", ledger, "0", "done", "1", "failed")
 	_, partial := readOne(c, job, "t-1", "")
 	ctx.Assert(partial.Status == "partial" && partial.CompletedChunks == 1, "a job with chunk 1 failed and chunk 2 pending reads %q with %d chunks completed, expected partial with 1", partial.Status, partial.CompletedChunks)
 	// Every chunk finished, and 24 hours later the ledger has expired.
 	jobs.MarkDone(readBg, job)
-	ctx.Redis.Del("job:" + job + ":chunks")
+	ctx.Redis.Del(ledger)
 	_, done := readOne(c, job, "t-1", "")
 	ctx.Assert(done.Status == "done" && done.CompletedChunks == 3, "a finished job whose ledger expired reads %q with %d of 3 chunks completed, expected done with 3: the job record is what says it finished", done.Status, done.CompletedChunks)
 }
@@ -807,8 +870,36 @@ func CheckSegmentOrder(ctx *harness.Ctx) {
 	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(2, 60000, "words"), readSegment(2, 70000, "words")})
 	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
 	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(1, 30000, "words")})
+	// 150 segments whose chunks finish last to first: the first page is the first 100 spoken.
+	long := readJob("t-1", 50)
+	for chunk := 49; chunk >= 0; chunk-- {
+		jobs.SaveSegments(readBg, long, []jobs.Segment{readSegment(chunk, chunk*30000, "words"), readSegment(chunk, chunk*30000+10000, "words"), readSegment(chunk, chunk*30000+20000, "words")})
+	}
 	_, v := readOne(c, job, "t-1", "")
 	ctx.Equal(startsIn(v.Segments), []int{0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts")
+	_, first := readOne(c, long, "t-1", "")
+	want := []int{}
+	for i := 0; i < 100; i++ {
+		want = append(want, i*10000)
+	}
+	ctx.Equal(startsIn(first.Segments), want, "the first page of 150 segments saved last chunk first must be the first 100 spoken, 0 to 990 000 ms (sort the whole transcript before cutting the page); the segment starts")
+}
+
+// readWalk follows next_cursor from the first page: every segment start it saw, and the pages it took.
+func readWalk(c *harness.HTTP, job string) ([]int, int) {
+	seen := []int{}
+	cursor := ""
+	pages := 0
+	for pages < 5 {
+		_, v := readOne(c, job, "t-1", cursor)
+		pages++
+		seen = append(seen, startsIn(v.Segments)...)
+		if v.NextCursor == nil {
+			break
+		}
+		cursor = fmt.Sprint(v.NextCursor)
+	}
+	return seen, pages
 }
 
 func CheckCursorPagination(ctx *harness.Ctx) {
@@ -821,21 +912,19 @@ func CheckCursorPagination(ctx *harness.Ctx) {
 		want = append(want, i*10000)
 	}
 	jobs.SaveSegments(readBg, job, all)
-	seen := []int{}
-	cursor := ""
-	pages := 0
-	for pages < 5 {
-		_, v := readOne(c, job, "t-1", cursor)
-		pages++
-		seen = append(seen, startsIn(v.Segments)...)
-		if v.NextCursor == nil {
-			break
-		}
-		cursor = *v.NextCursor
-	}
+	exact := readJob("t-1", 67)
+	jobs.SaveSegments(readBg, exact, all[:200])
+	seen, pages := readWalk(c, job)
 	ctx.Assert(len(seen) == 250, "walking next_cursor returned %d of 250 segments in %d pages: a long recording must be readable past the first page", len(seen), pages)
 	ctx.Equal(seen, want, "every segment once, in order, across the pages")
 	ctx.Equal(pages, 3, "250 segments at 100 a page; pages")
+	seen, pages = readWalk(c, exact)
+	ctx.Assert(pages == 2 && len(seen) == 200, "200 segments are 2 pages, the second with next_cursor null; walking next_cursor took %d pages for %d segments", pages, len(seen))
+	_, middle := readOne(c, job, "t-1", "150")
+	starts := startsIn(middle.Segments)
+	ctx.Assert(len(starts) == 100 && starts[0] == 1500000 && middle.NextCursor == nil, "?cursor=150 starts the page at segment 150: got %d segments from %v ms with next_cursor %v, expected the 100 from 1 500 000 ms and null", len(starts), starts[:min(1, len(starts))], middle.NextCursor)
+	negative, _ := readOne(c, job, "t-1", "-1")
+	ctx.Assert(negative.Status >= 400 && negative.Status < 500, "?cursor=-1 answered %d, expected 400: a cursor is a segment offset, and a negative one is the client's error", negative.Status)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -843,6 +932,7 @@ func CheckCursorPagination(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -873,6 +963,30 @@ std::vector<int> startsIn(const nlohmann::json& body) {
   return out;
 }
 
+// The cursor a page names for the next one (a string, or a number), empty on the last page.
+std::string nextCursor(const nlohmann::json& body) {
+  if (!body.is_object() || !body.contains("next_cursor")) return "";
+  const auto& next = body["next_cursor"];
+  if (next.is_string()) return next.get<std::string>();
+  if (next.is_number_integer()) return std::to_string(next.get<long long>());
+  return "";
+}
+
+// Follow next_cursor from the first page: every segment start seen, and the pages it took.
+std::pair<std::vector<int>, int> readWalk(harness::HTTP& c, const std::string& job) {
+  std::vector<int> seen;
+  std::string cursor;
+  int pages = 0;
+  while (pages < 5) {
+    const auto body = bodyOf(readOne(c, job, "t-1", cursor));
+    pages++;
+    for (int s : startsIn(body)) seen.push_back(s);
+    cursor = nextCursor(body);
+    if (cursor.empty()) break;
+  }
+  return {seen, pages};
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -900,12 +1014,18 @@ void CheckHonestStatus(harness::Ctx& ctx) {
   auto c = readAPI(ctx);
   const std::string job = readJob("t-1", 3);
   jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
-  ctx.Redis.Do("HSET", "job:" + job + ":chunks", "0", "done", "1", "failed");
+  const std::string ledger = "job:" + job + ":chunks";
+  // The ledger counts every chunk done, but the job record has not been marked done yet.
+  ctx.Redis.Do("HSET", ledger, "0", "done", "1", "done", "2", "done");
+  const auto unmarked = bodyOf(readOne(c, job, "t-1"));
+  ctx.Assert(unmarked.is_object() && unmarked.value("status", "") == "partial" && unmarked.value("completed_chunks", -1) == 3, "a job whose ledger counts 3 of 3 chunks done but whose record is still queued must read partial with 3 chunks completed (only the job record says it is done), got %s", unmarked.dump());
+  ctx.Redis.Del(ledger);
+  ctx.Redis.Do("HSET", ledger, "0", "done", "1", "failed");
   const auto partial = bodyOf(readOne(c, job, "t-1"));
   ctx.Assert(partial.is_object() && partial.value("status", "") == "partial" && partial.value("completed_chunks", -1) == 1, "a job with chunk 1 failed and chunk 2 pending must read partial with 1 chunk completed, got %s", partial.dump());
   // Every chunk finished, and 24 hours later the ledger has expired.
   jobs::markDone(job);
-  ctx.Redis.Del("job:" + job + ":chunks");
+  ctx.Redis.Del(ledger);
   const auto done = bodyOf(readOne(c, job, "t-1"));
   ctx.Assert(done.is_object() && done.value("status", "") == "done" && done.value("completed_chunks", -1) == 3, "a finished job whose ledger expired must read done with 3 of 3 chunks completed (the job record is what says it finished), got %s", done.dump());
 }
@@ -917,7 +1037,15 @@ void CheckSegmentOrder(harness::Ctx& ctx) {
   jobs::saveSegments(job, {readSegment(2, 60000), readSegment(2, 70000)});
   jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
   jobs::saveSegments(job, {readSegment(1, 30000)});
+  // 150 segments whose chunks finish last to first: the first page is the first 100 spoken.
+  const std::string long_job = readJob("t-1", 50);
+  for (int chunk = 49; chunk >= 0; chunk--) {
+    jobs::saveSegments(long_job, {readSegment(chunk, chunk * 30000), readSegment(chunk, chunk * 30000 + 10000), readSegment(chunk, chunk * 30000 + 20000)});
+  }
   ctx.Equal(startsIn(bodyOf(readOne(c, job, "t-1"))), {0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts");
+  std::vector<int> want;
+  for (int i = 0; i < 100; i++) want.push_back(i * 10000);
+  ctx.Equal(startsIn(bodyOf(readOne(c, long_job, "t-1"))), want, "the first page of 150 segments saved last chunk first must be the first 100 spoken, 0 to 990 000 ms (sort the whole transcript before cutting the page); the segment starts");
 }
 
 void CheckCursorPagination(harness::Ctx& ctx) {
@@ -930,19 +1058,20 @@ void CheckCursorPagination(harness::Ctx& ctx) {
     want.push_back(i * 10000);
   }
   jobs::saveSegments(job, all);
-  std::vector<int> seen;
-  std::string cursor;
-  int pages = 0;
-  while (pages < 5) {
-    const auto body = bodyOf(readOne(c, job, "t-1", cursor));
-    pages++;
-    for (int s : startsIn(body)) seen.push_back(s);
-    if (!body.is_object() || !body.contains("next_cursor") || !body["next_cursor"].is_string()) break;
-    cursor = body["next_cursor"].get<std::string>();
-  }
+  const std::string exact = readJob("t-1", 67);
+  jobs::saveSegments(exact, std::vector<jobs::Segment>(all.begin(), all.begin() + 200));
+  const auto [seen, pages] = readWalk(c, job);
   ctx.Assert(seen.size() == 250, "walking next_cursor returned %d of 250 segments in %d pages: a long recording must be readable past the first page", seen.size(), pages);
   ctx.Equal(seen, want, "every segment once, in order, across the pages");
   ctx.Equal(pages, 3, "250 segments at 100 a page; pages");
+  const auto [even, evenPages] = readWalk(c, exact);
+  ctx.Assert(evenPages == 2 && even.size() == 200, "200 segments are 2 pages, the second with next_cursor null; walking next_cursor took %d pages for %d segments", evenPages, even.size());
+  const auto middle = bodyOf(readOne(c, job, "t-1", "150"));
+  const auto starts = startsIn(middle);
+  const bool last = middle.is_object() && middle.contains("next_cursor") && middle["next_cursor"].is_null();
+  ctx.Assert(starts.size() == 100 && starts[0] == 1500000 && last, "?cursor=150 starts the page at segment 150, expected the 100 from 1 500 000 ms and next_cursor null, got %d segments: %s", starts.size(), middle.is_object() && middle.contains("next_cursor") ? middle["next_cursor"].dump() : middle.dump());
+  const auto negative = readOne(c, job, "t-1", "-1");
+  ctx.Assert(negative.Status >= 400 && negative.Status < 500, "?cursor=-1 answered %d, expected 400: a cursor is a segment offset, and a negative one is the client's error", negative.Status);
 }
 `,
   },

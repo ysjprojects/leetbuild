@@ -73,7 +73,7 @@ headers to the message.
       id: 'idempotency-key',
       title: 'Keys a retry by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required (**400** without it); `find_send`/`findSend` answers a replay with the first message id before anything is queued, and a fresh send records its id with `remember_send`/`rememberSend`.',
+        '`Idempotency-Key` is required (**400** without it); `find_send`/`findSend` answers a replay with the first message id before the gate is asked or anything is queued (a retry after the recipient unsubscribed still answers **202** with that id), and a fresh send records its id with `remember_send`/`rememberSend`.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.find_send\(/, /store\.remember_send\(/, /\b400\b/],
@@ -674,8 +674,11 @@ async def check_idempotency_key(ctx):
         other = await c.post("/v1/emails", json=VALID, headers=_headers("k-1", tenant="t-2"))
         assert other.status_code == 202 and other.json().get("message_id") != first.json().get("message_id"), f"another tenant using the same key is another send, got {other.status_code} {other.text}"
         missing = await c.post("/v1/emails", json=VALID, headers={"X-Tenant-Id": "t-1"})
-    assert missing.status_code == 400, f"a send without Idempotency-Key answered {missing.status_code}, expected 400"
-    assert len(_queue(ctx)) == 2, f"mail:queue holds {_queue(ctx)}, expected the two distinct sends"
+        assert missing.status_code == 400, f"a send without Idempotency-Key answered {missing.status_code}, expected 400"
+        assert len(_queue(ctx)) == 2, f"mail:queue holds {_queue(ctx)}, expected the two distinct sends"
+        ctx.redis.sadd("mail:suppressed", "ana@example.com")
+        late = await c.post("/v1/emails", json=VALID, headers=_headers("k-1"))
+    assert late.status_code == 202 and late.json().get("message_id") == first.json().get("message_id"), f"ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered {late.status_code} {late.text}: the first message is already queued, so the retry must answer its id (202) before the gate is asked"
 
 
 async def check_validate_template_variables(ctx):
@@ -684,6 +687,10 @@ async def check_validate_template_variables(ctx):
         assert r.status_code == 400, f"an unknown template_id answered {r.status_code}, expected 400"
         r = await c.post("/v1/emails", json={**VALID, "variables": {"note": "x" * 9000}}, headers=_headers("k-2"))
         assert r.status_code == 413, f"9 KB of variables answered {r.status_code}, expected 413"
+        r = await c.post("/v1/emails", json={**VALID, "variables": {"n" * 9000: ""}}, headers=_headers("k-4"))
+        assert r.status_code == 413, f"a 9000-byte variable name with an empty value answered {r.status_code}, expected 413: the cap counts names and values"
+        r = await c.post("/v1/emails", json={**VALID, "variables": {"note": "é" * 4500}}, headers=_headers("k-5"))
+        assert r.status_code == 413, f"4500 'é' (4500 characters, 9000 bytes of UTF-8) answered {r.status_code}, expected 413: the cap counts UTF-8 bytes, not characters"
         assert _queue(ctx) == [], f"refused sends were queued: {_queue(ctx)}"
         r = await c.post("/v1/emails", json={**VALID, "variables": {"note": "x" * (8192 - 4)}}, headers=_headers("k-3"))
     assert r.status_code == 202, f"exactly 8 KiB of variables (name and value) answered {r.status_code}, expected 202"
@@ -694,6 +701,8 @@ async def check_reject_crlf(ctx):
     async with _api(ctx) as c:
         r = await c.post("/v1/emails", json={**VALID, "subject": "Welcome\\r\\nBcc: list@example.net"}, headers=_headers("k-1"))
         assert r.status_code == 400, f"a subject with CRLF answered {r.status_code}, expected 400: the relay writes it into a header line"
+        r = await c.post("/v1/emails", json={**VALID, "subject": "Welcome\\rBcc: list@example.net"}, headers=_headers("k-4"))
+        assert r.status_code == 400, f"a subject with a bare carriage return answered {r.status_code}, expected 400: a lone \\\\r ends a header line too"
         r = await c.post("/v1/emails", json={**VALID, "variables": {"first_name": "Ana\\nBcc: list@example.net"}}, headers=_headers("k-2"))
         assert r.status_code == 400, f"a variable value with a line feed answered {r.status_code}, expected 400"
         assert _queue(ctx) == [], f"sends carrying header injections were queued: {_queue(ctx)}"
@@ -749,6 +758,9 @@ export async function check_idempotency_key(ctx) {
   const missing = await c.post('/v1/emails', {json: VALID, headers: {'X-Tenant-Id': 't-1'}});
   assert.equal(missing.status, 400, \`a send without Idempotency-Key answered \${missing.status}, expected 400\`);
   assert.equal(queue().length, 2, \`mail:queue holds \${JSON.stringify(queue())}, expected the two distinct sends\`);
+  ctx.redis.sadd('mail:suppressed', 'ana@example.com');
+  const late = await send(VALID, 'k-1');
+  assert(late.status === 202 && late.json().message_id === first.json().message_id, \`ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered \${late.status} \${late.text}: the first message is already queued, so the retry must answer its id (202) before the gate is asked\`);
 }
 
 export async function check_validate_template_variables(ctx) {
@@ -757,6 +769,10 @@ export async function check_validate_template_variables(ctx) {
   assert.equal(r.status, 400, \`an unknown template_id answered \${r.status}, expected 400\`);
   r = await send({...VALID, variables: {note: 'x'.repeat(9000)}}, 'k-2');
   assert.equal(r.status, 413, \`9 KB of variables answered \${r.status}, expected 413\`);
+  r = await send({...VALID, variables: {['n'.repeat(9000)]: ''}}, 'k-4');
+  assert.equal(r.status, 413, \`a 9000-byte variable name with an empty value answered \${r.status}, expected 413: the cap counts names and values\`);
+  r = await send({...VALID, variables: {note: 'é'.repeat(4500)}}, 'k-5');
+  assert.equal(r.status, 413, \`4500 'é' (4500 characters, 9000 bytes of UTF-8) answered \${r.status}, expected 413: the cap counts UTF-8 bytes, not characters\`);
   assert.deepStrictEqual(queue(), [], \`refused sends were queued: \${JSON.stringify(queue())}\`);
   r = await send({...VALID, variables: {note: 'x'.repeat(8192 - 4)}}, 'k-3');
   assert.equal(r.status, 202, \`exactly 8 KiB of variables (name and value) answered \${r.status}, expected 202\`);
@@ -767,6 +783,8 @@ export async function check_reject_crlf(ctx) {
   const {queue, send} = api(ctx);
   let r = await send({...VALID, subject: 'Welcome\\r\\nBcc: list@example.net'}, 'k-1');
   assert.equal(r.status, 400, \`a subject with CRLF answered \${r.status}, expected 400: the relay writes it into a header line\`);
+  r = await send({...VALID, subject: 'Welcome\\rBcc: list@example.net'}, 'k-4');
+  assert.equal(r.status, 400, \`a subject with a bare carriage return answered \${r.status}, expected 400: a lone \\\\r ends a header line too\`);
   r = await send({...VALID, variables: {first_name: 'Ana\\nBcc: list@example.net'}}, 'k-2');
   assert.equal(r.status, 400, \`a variable value with a line feed answered \${r.status}, expected 400\`);
   assert.deepStrictEqual(queue(), [], \`sends carrying header injections were queued: \${JSON.stringify(queue())}\`);
@@ -855,6 +873,9 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	missing := post(c, validBody(), "", "t-1")
 	ctx.Equal(missing.Status, 400, "a send without Idempotency-Key")
 	ctx.Equal(len(queue(ctx)), 2, "the two distinct sends on mail:queue")
+	ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com")
+	late := post(c, validBody(), "k-1", "t-1")
+	ctx.Assert(late.Status == 202 && idOf(late) == idOf(first), "ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered %d %s: the first message is already queued, so the retry must answer its id (202) before the gate is asked", late.Status, late.Text())
 }
 
 func CheckValidateTemplateVariables(ctx *harness.Ctx) {
@@ -863,6 +884,10 @@ func CheckValidateTemplateVariables(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 400, "an unknown template_id")
 	r = post(c, withField("variables", map[string]string{"note": strings.Repeat("x", 9000)}), "k-2", "t-1")
 	ctx.Equal(r.Status, 413, "9 KB of variables")
+	r = post(c, withField("variables", map[string]string{strings.Repeat("n", 9000): ""}), "k-4", "t-1")
+	ctx.Equal(r.Status, 413, "a 9000-byte variable name with an empty value (the cap counts names and values)")
+	r = post(c, withField("variables", map[string]string{"note": strings.Repeat("é", 4500)}), "k-5", "t-1")
+	ctx.Equal(r.Status, 413, "4500 'é' (4500 characters, 9000 bytes of UTF-8; the cap counts bytes, not characters)")
 	ctx.Assert(len(queue(ctx)) == 0, "refused sends were queued: %q", queue(ctx))
 	r = post(c, withField("variables", map[string]string{"note": strings.Repeat("x", 8192-4)}), "k-3", "t-1")
 	ctx.Equal(r.Status, 202, "exactly 8 KiB of variables (name and value)")
@@ -873,6 +898,8 @@ func CheckRejectCrlf(ctx *harness.Ctx) {
 	c := api(ctx)
 	r := post(c, withField("subject", "Welcome\\r\\nBcc: list@example.net"), "k-1", "t-1")
 	ctx.Equal(r.Status, 400, "a subject with CRLF (the relay writes it into a header line)")
+	r = post(c, withField("subject", "Welcome\\rBcc: list@example.net"), "k-4", "t-1")
+	ctx.Equal(r.Status, 400, "a subject with a bare carriage return (a lone \\\\r ends a header line too)")
 	r = post(c, withField("variables", map[string]string{"first_name": "Ana\\nBcc: list@example.net"}), "k-2", "t-1")
 	ctx.Equal(r.Status, 400, "a variable value with a line feed")
 	ctx.Assert(len(queue(ctx)) == 0, "sends carrying header injections were queued: %q", queue(ctx))
@@ -958,6 +985,11 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   const auto missing = post(c, validBody(), "", "t-1");
   ctx.Equal(missing.Status, 400, "a send without Idempotency-Key");
   ctx.Equal(queue(ctx).size(), 2, "the two distinct sends on mail:queue");
+  ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com");
+  const auto late = post(c, validBody(), "k-1", "t-1");
+  ctx.Assert(late.Status == 202 && idOf(late) == idOf(first),
+             "ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered %d %s: the first message is already queued, so the retry must answer its id (202) before the gate is asked",
+             late.Status, late.Text());
 }
 
 void CheckValidateTemplateVariables(harness::Ctx& ctx) {
@@ -966,6 +998,12 @@ void CheckValidateTemplateVariables(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 400, "an unknown template_id");
   r = post(c, withField("variables", {{"note", std::string(9000, 'x')}}), "k-2", "t-1");
   ctx.Equal(r.Status, 413, "9 KB of variables");
+  r = post(c, withField("variables", {{std::string(9000, 'n'), ""}}), "k-4", "t-1");
+  ctx.Equal(r.Status, 413, "a 9000-byte variable name with an empty value (the cap counts names and values)");
+  std::string accents;
+  for (int n = 0; n < 4500; n++) accents += "é";
+  r = post(c, withField("variables", {{"note", accents}}), "k-5", "t-1");
+  ctx.Equal(r.Status, 413, "4500 'é' (4500 characters, 9000 bytes of UTF-8; the cap counts bytes, not characters)");
   ctx.Assert(queue(ctx).empty(), "refused sends were queued: %q", queue(ctx));
   r = post(c, withField("variables", {{"note", std::string(8192 - 4, 'x')}}), "k-3", "t-1");
   ctx.Equal(r.Status, 202, "exactly 8 KiB of variables (name and value)");
@@ -976,6 +1014,8 @@ void CheckRejectCrlf(harness::Ctx& ctx) {
   auto c = api(ctx);
   auto r = post(c, withField("subject", "Welcome\\r\\nBcc: list@example.net"), "k-1", "t-1");
   ctx.Equal(r.Status, 400, "a subject with CRLF (the relay writes it into a header line)");
+  r = post(c, withField("subject", "Welcome\\rBcc: list@example.net"), "k-4", "t-1");
+  ctx.Equal(r.Status, 400, "a subject with a bare carriage return (a lone \\\\r ends a header line too)");
   r = post(c, withField("variables", {{"first_name", "Ana\\nBcc: list@example.net"}}), "k-2", "t-1");
   ctx.Equal(r.Status, 400, "a variable value with a line feed");
   ctx.Assert(queue(ctx).empty(), "sends carrying header injections were queued: %q", queue(ctx));

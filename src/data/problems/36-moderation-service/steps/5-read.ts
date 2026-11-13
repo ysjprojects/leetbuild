@@ -75,7 +75,7 @@ of 5,000 characters fills every view.
       id: 'surveyor-only',
       title: 'Shows the reporter only to the surveyor role',
       detail:
-        '`reporter_id` is added to the body only when the caller’s role equals `SURVEYOR_ROLE`; the starter puts it in every answer.',
+        '`reporter_id` is added to the body only when the caller’s role equals `SURVEYOR_ROLE`; a moderator, a caller with no role, `not-surveyor` and `surveyor-trainee` do not see it. The starter puts it in every answer.',
       match: {
         python: {all: [/SURVEYOR_ROLE\s*=\s*["']surveyor["']/, /==\s*SURVEYOR_ROLE|SURVEYOR_ROLE\s*==/]},
         typescript: {all: [/SURVEYOR_ROLE\s*=\s*['"]surveyor['"]/, /===?\s*SURVEYOR_ROLE|SURVEYOR_ROLE\s*===?/]},
@@ -88,7 +88,7 @@ of 5,000 characters fills every view.
       id: 'detail-escaped',
       title: 'Escapes the free-text detail',
       detail:
-        'The detail is HTML-escaped before it is returned, so a report cannot plant markup that runs in a moderator’s console; the starter returns it raw.',
+        'The detail is HTML-escaped before it is returned (`&`, `<`, `>` and both quotes, and it unescapes to what the reporter wrote), so a report cannot plant markup or close an attribute in a moderator’s console; the starter returns it raw.',
       match: {
         python: {all: [/html\.escape\(/]},
         typescript: {all: [/&lt;/]},
@@ -101,7 +101,7 @@ of 5,000 characters fills every view.
       id: 'detail-bounded',
       title: 'Cuts the detail to 280 characters before escaping it',
       detail:
-        'The detail is cut to its first `MAX_DETAIL_CHARS` characters and then escaped, so a cut cannot split `&lt;`; the starter returns the whole field.',
+        'The detail is cut to its first `MAX_DETAIL_CHARS` characters (code points: an emoji is one, and 200 `é` come back whole) and then escaped, so a cut cannot split `&lt;`; the starter returns the whole field.',
       match: {
         python: {
           all: [/MAX_DETAIL_CHARS\s*=\s*280\b/, /\[:\s*MAX_DETAIL_CHARS\s*\]/],
@@ -571,10 +571,15 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/moderation/items/([\
     },
   },
   harness: {
-    python: `from moderation import store
+    python: `import html
+import re
+
+from moderation import store
 
 MODERATOR = {"X-Tenant-Id": "acme", "X-Reviewer-Role": "moderator"}
 SURVEYOR = {"X-Tenant-Id": "acme", "X-Reviewer-Role": "surveyor"}
+QUOTED = "Tom & Jerry said \\"hi\\" & 'bye' &amp; <b>"
+RAW_AMPERSAND = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#34|#39|#x27|#x22);)")
 
 
 def _seed(detail="Spam link in bio", reporter="u-17"):
@@ -614,35 +619,54 @@ async def check_tenant_scope(ctx):
 async def check_surveyor_only(ctx):
     case_id = _seed()
     async with _api(ctx) as c:
-        moderator = await c.get(f"/v1/moderation/items/{case_id}", headers=MODERATOR)
-        no_role = await c.get(f"/v1/moderation/items/{case_id}", headers={"X-Tenant-Id": "acme"})
+        readers = [
+            ("a moderator", await c.get(f"/v1/moderation/items/{case_id}", headers=MODERATOR)),
+            ("a caller with no role", await c.get(f"/v1/moderation/items/{case_id}", headers={"X-Tenant-Id": "acme"})),
+        ]
+        for role in ("not-surveyor", "surveyor-trainee"):
+            readers.append((f"the role {role!r}", await c.get(f"/v1/moderation/items/{case_id}", headers={"X-Tenant-Id": "acme", "X-Reviewer-Role": role})))
         surveyor = await c.get(f"/v1/moderation/items/{case_id}", headers=SURVEYOR)
-    for who, r in (("a moderator", moderator), ("a caller with no role", no_role)):
+    for who, r in readers:
         assert r.status_code == 200, f"{who} got {r.status_code}: {r.text}"
-        assert "reporter_id" not in r.json() and "u-17" not in r.text, f"{who} was shown the reporter: {r.text}"
+        assert "reporter_id" not in r.json() and "u-17" not in r.text, f"{who} was shown the reporter: {r.text}. Only the role equal to SURVEYOR_ROLE sees it"
     assert surveyor.status_code == 200 and surveyor.json().get("reporter_id") == "u-17", f"a surveyor must see reporter_id u-17, got {surveyor.text}"
 
 
 async def check_detail_escaped(ctx):
     case_id = _seed(detail='<img src=x onerror="alert(1)">')
+    quoted_case = _seed(detail=QUOTED, reporter="u-18")
     async with _api(ctx) as c:
         r = await c.get(f"/v1/moderation/items/{case_id}", headers=MODERATOR)
+        quoted = (await c.get(f"/v1/moderation/items/{quoted_case}", headers=MODERATOR)).json().get("detail", "")
     detail = r.json().get("detail", "")
     assert "<img" not in detail, f"the case file returned the detail as markup: {detail!r}. It runs in the moderator's console"
     assert detail.startswith("&lt;img src=x onerror=") and detail.endswith("&gt;"), f"the detail must come back HTML-escaped, got {detail!r}"
+    raw = [ch for ch in "<>\\"'" if ch in quoted]
+    assert not raw and not RAW_AMPERSAND.search(quoted), f"the detail {QUOTED!r} came back as {quoted!r}: {raw or ['&']} left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in"
+    assert html.unescape(quoted) == QUOTED, f"the detail {QUOTED!r} came back as {quoted!r}, which does not unescape to what the reporter wrote"
 
 
 async def check_detail_bounded(ctx):
     long_case = _seed(detail="a" * 279 + "<b>" + "x" * 5000)
     accented_case = _seed(detail="é" * 300, reporter="u-18")
+    short_case = _seed(detail="é" * 200, reporter="u-19")
+    emoji_case = _seed(detail="a" * 279 + "😀" + "b" * 10, reporter="u-20")
     async with _api(ctx) as c:
         long = (await c.get(f"/v1/moderation/items/{long_case}", headers=MODERATOR)).json().get("detail", "")
         accented = (await c.get(f"/v1/moderation/items/{accented_case}", headers=MODERATOR)).json().get("detail", "")
+        short = await c.get(f"/v1/moderation/items/{short_case}", headers=MODERATOR)
+        emoji = (await c.get(f"/v1/moderation/items/{emoji_case}", headers=MODERATOR)).json().get("detail", "")
     assert long == "a" * 279 + "&lt;", f"a 5282-character detail came back as {len(long)} characters ending {long[-12:]!r}, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)"
     assert accented == "é" * 280, f"300 accented characters came back as {len(accented)} characters, expected the first 280"
+    assert short.status_code == 200 and short.json().get("detail") == "é" * 200, f"200 accented characters (400 bytes, under 280 characters) answered {short.status_code} with {len(short.json().get('detail', '')) if short.status_code == 200 else short.text}: a detail within the limit comes back whole"
+    assert emoji == "a" * 279 + "😀", f"279 a's, an emoji and 10 b's came back ending {emoji[-4:]!r} ({len(emoji)} characters), expected the first 280 characters: the emoji is one character"
 `,
     typescript: `const MODERATOR = {'X-Tenant-Id': 'acme', 'X-Reviewer-Role': 'moderator'};
 const SURVEYOR = {'X-Tenant-Id': 'acme', 'X-Reviewer-Role': 'surveyor'};
+const QUOTED = \`Tom & Jerry said "hi" & 'bye' &amp; <b>\`;
+const RAW_AMPERSAND = /&(?!(?:amp|lt|gt|quot|apos|#34|#39|#x27|#x22);)/;
+const ENTITIES: Record<string, string> = {amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#34': '"', '#39': "'", '#x27': "'", '#x22': '"'};
+const unescapeHtml = (text: string): string => text.replace(/&(amp|lt|gt|quot|apos|#34|#39|#x27|#x22);/g, (_, name: string) => ENTITIES[name]);
 
 async function read(ctx, detail = 'Spam link in bio', reporter = 'u-17') {
   const store = ctx.load('/support/moderation/store.ts');
@@ -675,37 +699,58 @@ export async function check_tenant_scope(ctx) {
 
 export async function check_surveyor_only(ctx) {
   const {c, caseId} = await read(ctx);
-  const moderator = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: MODERATOR});
-  const noRole = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: {'X-Tenant-Id': 'acme'}});
+  const readers: [string, any][] = [
+    ['a moderator', await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: MODERATOR})],
+    ['a caller with no role', await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: {'X-Tenant-Id': 'acme'}})],
+  ];
+  for (const role of ['not-surveyor', 'surveyor-trainee']) {
+    readers.push([\`the role '\${role}'\`, await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: {'X-Tenant-Id': 'acme', 'X-Reviewer-Role': role}})]);
+  }
   const surveyor = await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: SURVEYOR});
-  for (const [who, r] of [['a moderator', moderator], ['a caller with no role', noRole]] as const) {
+  for (const [who, r] of readers) {
     assert.equal(r.status, 200, \`\${who} got \${r.status}: \${r.text}\`);
-    assert(!('reporter_id' in r.json()) && !r.text.includes('u-17'), \`\${who} was shown the reporter: \${r.text}\`);
+    assert(!('reporter_id' in r.json()) && !r.text.includes('u-17'), \`\${who} was shown the reporter: \${r.text}. Only the role equal to SURVEYOR_ROLE sees it\`);
   }
   assert(surveyor.status === 200 && surveyor.json().reporter_id === 'u-17', \`a surveyor must see reporter_id u-17, got \${surveyor.text}\`);
 }
 
 export async function check_detail_escaped(ctx) {
   const {c, caseId} = await read(ctx, '<img src=x onerror="alert(1)">');
+  const store = ctx.load('/support/moderation/store.ts');
+  const quotedCase = (await store.insertCase('acme', 'c-1', 'u-18', 'spam', QUOTED)).case_id;
   const detail: string = (await c.get(\`/v1/moderation/items/\${caseId}\`, {headers: MODERATOR})).json().detail ?? '';
+  const quoted: string = (await c.get(\`/v1/moderation/items/\${quotedCase}\`, {headers: MODERATOR})).json().detail ?? '';
   assert(!detail.includes('<img'), \`the case file returned the detail as markup: \${JSON.stringify(detail)}. It runs in the moderator's console\`);
   assert(detail.startsWith('&lt;img src=x onerror=') && detail.endsWith('&gt;'), \`the detail must come back HTML-escaped, got \${JSON.stringify(detail)}\`);
+  const raw = [...'<>"\\''].filter(ch => quoted.includes(ch));
+  assert(
+    raw.length === 0 && !RAW_AMPERSAND.test(quoted),
+    \`the detail \${JSON.stringify(QUOTED)} came back as \${JSON.stringify(quoted)}: \${JSON.stringify(raw.length ? raw : ['&'])} left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in\`,
+  );
+  assert.equal(unescapeHtml(quoted), QUOTED, \`the detail \${JSON.stringify(QUOTED)} came back as \${JSON.stringify(quoted)}, which does not unescape to what the reporter wrote\`);
 }
 
 export async function check_detail_bounded(ctx) {
   const {c, caseId: longCase} = await read(ctx, 'a'.repeat(279) + '<b>' + 'x'.repeat(5000));
   const store = ctx.load('/support/moderation/store.ts');
   const accentedCase = (await store.insertCase('acme', 'c-1', 'u-18', 'spam', 'é'.repeat(300))).case_id;
+  const shortCase = (await store.insertCase('acme', 'c-1', 'u-19', 'spam', 'é'.repeat(200))).case_id;
+  const emojiCase = (await store.insertCase('acme', 'c-1', 'u-20', 'spam', 'a'.repeat(279) + '😀' + 'b'.repeat(10))).case_id;
   const long: string = (await c.get(\`/v1/moderation/items/\${longCase}\`, {headers: MODERATOR})).json().detail ?? '';
   const accented: string = (await c.get(\`/v1/moderation/items/\${accentedCase}\`, {headers: MODERATOR})).json().detail ?? '';
+  const short = await c.get(\`/v1/moderation/items/\${shortCase}\`, {headers: MODERATOR});
+  const emoji: string = (await c.get(\`/v1/moderation/items/\${emojiCase}\`, {headers: MODERATOR})).json().detail ?? '';
   assert.equal(long, 'a'.repeat(279) + '&lt;', \`a 5282-character detail came back as \${long.length} characters ending \${JSON.stringify(long.slice(-12))}, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)\`);
   assert.equal(accented, 'é'.repeat(280), \`300 accented characters came back as \${[...accented].length} characters, expected the first 280\`);
+  assert(short.status === 200 && short.json().detail === 'é'.repeat(200), \`200 accented characters (400 bytes, under 280 characters) answered \${short.status} \${short.text.slice(0, 80)}: a detail within the limit comes back whole\`);
+  assert.equal(emoji, 'a'.repeat(279) + '😀', \`279 a's, an emoji and 10 b's came back ending \${JSON.stringify(emoji.slice(-4))} (\${[...emoji].length} characters), expected the first 280 characters: the emoji is one character\`);
 }
 `,
     go: `package main
 
 import (
 	"context"
+	"html"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -714,6 +759,24 @@ import (
 
 	"leetbuild/harness"
 )
+
+const readQuoted = \`Tom & Jerry said "hi" & 'bye' &amp; <b>\`
+
+// readRawAmpersand reports whether s holds an & that starts no entity.
+func readRawAmpersand(s string) bool {
+	for i := strings.IndexByte(s, '&'); i >= 0; i = strings.IndexByte(s, '&') {
+		s = s[i:]
+		entity := false
+		for _, e := range []string{"&amp;", "&lt;", "&gt;", "&quot;", "&apos;", "&#34;", "&#39;", "&#x27;", "&#x22;"} {
+			entity = entity || strings.HasPrefix(s, e)
+		}
+		if !entity {
+			return true
+		}
+		s = s[1:]
+	}
+	return false
+}
 
 var readBg = context.Background()
 
@@ -765,12 +828,14 @@ func CheckSurveyorOnly(ctx *harness.Ctx) {
 	caseID := readSeed("Spam link in bio", "u-17")
 	c := readClient(ctx)
 	for who, r := range map[string]*harness.Response{
-		"a moderator":           c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"),
-		"a caller with no role": c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme"),
+		"a moderator":                 c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"),
+		"a caller with no role":       c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme"),
+		"the role 'not-surveyor'":     c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "not-surveyor"),
+		"the role 'surveyor-trainee'": c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor-trainee"),
 	} {
 		ctx.Equal(r.Status, 200, "%s (%s)", who, r.Text())
 		_, shown := readBody(r)["reporter_id"]
-		ctx.Assert(!shown && !strings.Contains(r.Text(), "u-17"), "%s was shown the reporter: %s", who, r.Text())
+		ctx.Assert(!shown && !strings.Contains(r.Text(), "u-17"), "%s was shown the reporter: %s. Only the role equal to surveyorRole sees it", who, r.Text())
 	}
 	surveyor := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor")
 	ctx.Assert(surveyor.Status == 200 && readBody(surveyor)["reporter_id"] == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text())
@@ -778,26 +843,42 @@ func CheckSurveyorOnly(ctx *harness.Ctx) {
 
 func CheckDetailEscaped(ctx *harness.Ctx) {
 	caseID := readSeed(\`<img src=x onerror="alert(1)">\`, "u-17")
-	detail := readDetail(readClient(ctx), caseID)
+	quotedCase := readSeed(readQuoted, "u-18")
+	c := readClient(ctx)
+	detail := readDetail(c, caseID)
 	ctx.Assert(!strings.Contains(detail, "<img"), "the case file returned the detail as markup: %q. It runs in the moderator's console", detail)
 	ctx.Assert(strings.HasPrefix(detail, "&lt;img src=x onerror=") && strings.HasSuffix(detail, "&gt;"), "the detail must come back HTML-escaped, got %q", detail)
+	quoted := readDetail(c, quotedCase)
+	ctx.Assert(!strings.ContainsAny(quoted, "<>\\"'") && !readRawAmpersand(quoted), "the detail %q came back as %q: a character is left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in", readQuoted, quoted)
+	ctx.Equal(html.UnescapeString(quoted), readQuoted, "the detail must unescape to what the reporter wrote (it came back as %q)", quoted)
 }
 
 func CheckDetailBounded(ctx *harness.Ctx) {
 	longCase := readSeed(strings.Repeat("a", 279)+"<b>"+strings.Repeat("x", 5000), "u-17")
 	accentedCase := readSeed(strings.Repeat("é", 300), "u-18")
+	shortCase := readSeed(strings.Repeat("é", 200), "u-19")
+	emojiCase := readSeed(strings.Repeat("a", 279)+"😀"+strings.Repeat("b", 10), "u-20")
 	c := readClient(ctx)
 	long := readDetail(c, longCase)
 	ctx.Assert(long == strings.Repeat("a", 279)+"&lt;", "a 5282-character detail came back as %d characters ending %q, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)", utf8.RuneCountInString(long), long[max(0, len(long)-12):])
 	accented := readDetail(c, accentedCase)
 	ctx.Equal(accented, strings.Repeat("é", 280), "300 accented characters must come back as the first 280; got %d characters", utf8.RuneCountInString(accented))
+	short := c.Get("/v1/moderation/items/"+shortCase, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")
+	ctx.Equal(short.Status, 200, "200 accented characters (400 bytes, under 280 characters) must come back whole")
+	whole, _ := readBody(short)["detail"].(string)
+	ctx.Equal(whole, strings.Repeat("é", 200), "200 accented characters (400 bytes, under 280 characters) must come back whole; got %d characters", utf8.RuneCountInString(whole))
+	emoji := readDetail(c, emojiCase)
+	ctx.Equal(emoji, strings.Repeat("a", 279)+"😀", "279 a's, an emoji and 10 b's must come back as the first 280 characters (the emoji is one character); got %d characters", utf8.RuneCountInString(emoji))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -831,6 +912,32 @@ std::string repeat(const std::string& s, int n) {
   return out;
 }
 
+const std::string kQuoted = R"text(Tom & Jerry said "hi" & 'bye' &amp; <b>)text";
+const std::vector<std::pair<std::string, std::string>> kEntities = {{"&amp;", "&"}, {"&lt;", "<"},  {"&gt;", ">"},   {"&quot;", "\\""}, {"&apos;", "'"},
+                                                                    {"&#34;", "\\""}, {"&#39;", "'"}, {"&#x27;", "'"}, {"&#x22;", "\\""}};
+
+// The text with every entity of kEntities decoded; nullopt when an & starts none of them.
+std::optional<std::string> unescapeHtml(const std::string& text) {
+  std::string out;
+  for (size_t i = 0; i < text.size();) {
+    if (text[i] != '&') {
+      out += text[i++];
+      continue;
+    }
+    bool entity = false;
+    for (const auto& [name, ch] : kEntities) {
+      if (text.compare(i, name.size(), name) == 0) {
+        out += ch;
+        i += name.size();
+        entity = true;
+        break;
+      }
+    }
+    if (!entity) return std::nullopt;
+  }
+  return out;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -859,11 +966,16 @@ void CheckTenantScope(harness::Ctx& ctx) {
 void CheckSurveyorOnly(harness::Ctx& ctx) {
   const std::string case_id = readSeed("Spam link in bio");
   auto c = readClient(ctx);
-  const auto moderator = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator");
-  const auto no_role = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme");
-  for (const auto* r : {&moderator, &no_role}) {
-    ctx.Equal(r->Status, 200, "a reader without the surveyor role (%s)", r->Text());
-    ctx.Assert(!readBody(*r).contains("reporter_id") && r->Text().find("u-17") == std::string::npos, "a reader without the surveyor role was shown the reporter: %s", r->Text());
+  std::vector<std::pair<std::string, harness::Response>> readers;
+  readers.emplace_back("a moderator", c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"));
+  readers.emplace_back("a caller with no role", c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme"));
+  for (const std::string role : {"not-surveyor", "surveyor-trainee"}) {
+    readers.emplace_back("the role '" + role + "'", c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", role));
+  }
+  for (const auto& [who, r] : readers) {
+    ctx.Equal(r.Status, 200, "%s (%s)", who, r.Text());
+    ctx.Assert(!readBody(r).contains("reporter_id") && r.Text().find("u-17") == std::string::npos,
+               "%s was shown the reporter: %s. Only the role equal to kSurveyorRole sees it", who, r.Text());
   }
   const auto surveyor = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor");
   ctx.Assert(surveyor.Status == 200 && readBody(surveyor).value("reporter_id", "") == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text());
@@ -871,22 +983,34 @@ void CheckSurveyorOnly(harness::Ctx& ctx) {
 
 void CheckDetailEscaped(harness::Ctx& ctx) {
   const std::string case_id = readSeed(R"html(<img src=x onerror="alert(1)">)html");
+  const std::string quoted_case = readSeed(kQuoted, "u-18");
   auto c = readClient(ctx);
   const std::string detail = readDetail(c, case_id);
   ctx.Assert(detail.find("<img") == std::string::npos, "the case file returned the detail as markup: %q. It runs in the moderator's console", detail);
   ctx.Assert(detail.rfind("&lt;img src=x onerror=", 0) == 0 && detail.size() >= 4 && detail.substr(detail.size() - 4) == "&gt;",
              "the detail must come back HTML-escaped, got %q", detail);
+  const std::string quoted = readDetail(c, quoted_case);
+  const auto decoded = unescapeHtml(quoted);
+  ctx.Assert(quoted.find_first_of("<>\\"'") == std::string::npos && decoded,
+             "the detail %q came back as %q: a character is left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in", kQuoted, quoted);
+  ctx.Equal(decoded.value_or(""), kQuoted, "the detail must unescape to what the reporter wrote (it came back as %q)", quoted);
 }
 
 void CheckDetailBounded(harness::Ctx& ctx) {
   const std::string long_case = readSeed(repeat("a", 279) + "<b>" + repeat("x", 5000));
   const std::string accented_case = readSeed(repeat("é", 300), "u-18");
+  const std::string short_case = readSeed(repeat("é", 200), "u-19");
+  const std::string emoji_case = readSeed(repeat("a", 279) + "😀" + repeat("b", 10), "u-20");
   auto c = readClient(ctx);
   const std::string long_detail = readDetail(c, long_case);
   ctx.Assert(long_detail == repeat("a", 279) + "&lt;",
              "a 5282-character detail came back as %d bytes ending %q, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)",
              long_detail.size(), long_detail.substr(long_detail.size() > 12 ? long_detail.size() - 12 : 0));
   ctx.Equal(readDetail(c, accented_case), repeat("é", 280), "300 accented characters must come back as the first 280");
+  const auto short_read = c.Get("/v1/moderation/items/" + short_case, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator");
+  ctx.Equal(short_read.Status, 200, "200 accented characters (400 bytes, under 280 characters) must come back whole");
+  ctx.Equal(readBody(short_read).value("detail", ""), repeat("é", 200), "200 accented characters (400 bytes, under 280 characters) must come back whole");
+  ctx.Equal(readDetail(c, emoji_case), repeat("a", 279) + "😀", "279 a's, an emoji and 10 b's must come back as the first 280 characters (the emoji is one character)");
 }
 `,
   },

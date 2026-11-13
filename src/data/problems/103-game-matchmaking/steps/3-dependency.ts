@@ -25,7 +25,7 @@ release that runs twice (a retry, a second matchmaker cleaning up) counts the ti
 service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RESOURCE_EXHAUSTED: no free server
 \`\`\`
 
-- Every call carries \`ALLOCATOR_DEADLINE_S\` (3 s).
+- Every call, a retry included, carries its own \`ALLOCATOR_DEADLINE_S\` (3 s).
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, after \`BACKOFF_BASE_S\` (0.25 s) ×
   2^attempt; any other code ends the attempts.
 - No server: \`release_roster\`, then \`store.abandon(match_id, "allocation_failed")\`, return \`None\`.
@@ -53,7 +53,7 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
       id: 'deadline',
       title: 'Every Allocate call carries a 3-second deadline',
       detail:
-        "Each attempt is made with `ALLOCATOR_DEADLINE_S` (3 s), so an allocator that does not answer costs the matchmaker seconds, not the allocator's whole stall.",
+        "Each attempt, a retry included, is made with a full `ALLOCATOR_DEADLINE_S` (3 s) of its own, so an allocator that does not answer costs the matchmaker seconds, not the allocator's whole stall, and a retry after a timeout still has time to succeed.",
       match: {
         python: {
           all: [/ALLOCATOR_DEADLINE_S\s*=\s*3\b/, /\.Allocate\([\s\S]{0,120}?timeout\s*=\s*ALLOCATOR_DEADLINE_S/],
@@ -86,7 +86,7 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
       id: 'release-on-failure',
       title: 'No server: the roster goes back to the pool',
       detail:
-        'When the attempts end without a server, `allocate_match` calls `release_roster` and `store.abandon(match_id, "allocation_failed")`, so every player waits in the pool again.',
+        'When the attempts end without a server, whether retries ran out or a code such as `RESOURCE_EXHAUSTED` ended them at once, `allocate_match` calls `release_roster` and `store.abandon(match_id, "allocation_failed")`, so every player waits in the pool again.',
       match: {
         python: {order: [/def allocate_match/, /release_roster\(/, /store\.abandon\(/]},
         typescript: {order: [/function allocateMatch/, /releaseRoster\(/, /abandon\(/]},
@@ -99,7 +99,7 @@ service Allocator { rpc Allocate(AllocateRequest) returns (Allocation); }  // RE
       id: 'idempotent-release',
       title: 'A roster is released once',
       detail:
-        '`release_roster` is one script guarded by `SET released:{match_id} … NX`, returning only tickets this match still holds; a second release answers `False` and changes nothing.',
+        '`release_roster` is one script that takes the guard `SET released:{match_id} … NX EX 3600` in the same step as it returns the tickets, and returns only tickets whose `match_id` is still this match, even once the guard has expired; a second release answers `False` and changes nothing.',
       match: {
         python: {all: [/released:/, /['"]NX['"]/, /register_script\(|\.eval\(/], none: [/\br\.(zadd|hincrby)\(/]},
         typescript: {all: [/released:/, /['"]NX['"]/, /\.eval\(|defineCommand\(/], none: [/redis\.(zadd|hincrby)\(/]},
@@ -784,6 +784,10 @@ def check_deadline(ctx):
     m.allocate_match("m-2")
     waited = ctx.clock.time() - before
     assert waited < 12, f"allocate_match waited {waited:.0f} s on an allocator that answers after 30 s: three 3-second attempts and their backoff end well before that"
+    stalled = ctx.grpc.calls_to("Allocate")[1:]
+    assert len(stalled) == 3, f"an allocator that never answers in time got {len(stalled)} Allocate calls, expected 3: DEADLINE_EXCEEDED is retried"
+    for n, call in enumerate(stalled, 1):
+        assert call.timeout is not None and 2.5 <= call.timeout <= 3.5, f"attempt {n} on a stalled allocator carried a {call.timeout} s deadline, expected ALLOCATOR_DEADLINE_S = 3: each attempt gets its own deadline, one shared by every attempt leaves the retries none"
 
 
 def check_retry_policy(ctx):
@@ -816,13 +820,30 @@ def check_release_on_failure(ctx):
     match = store.get_match("m-1")
     assert match["state"] == "abandoned" and match["reason"] == "allocation_failed", f"the match must be abandoned with reason allocation_failed, it is {match}"
     assert claims.claim_tickets("m-2", 15, ["t1", "t2"]), "the released tickets must be claimable by the next match"
+    # A full fleet ends the attempts at once: the roster goes back all the same.
+    _claimed("m-3", ["t3"])
+    ctx.grpc.fail("Allocate", grpc.StatusCode.RESOURCE_EXHAUSTED, "no free server", times=3)
+    assert m.allocate_match("m-3") is None, "a fleet with no free server cannot place m-3"
+    t3 = store.get_ticket("t3")
+    assert t3["state"] == "waiting" and t3["match_id"] is None, f"RESOURCE_EXHAUSTED ended the attempts and t3 is {t3}: a full fleet leaves the roster claimed by a match that never starts. Release it whatever code ended the attempts"
+    assert _pool(ctx).get("t3") == 1503, f"t3 is not back in pool:15 at its skill 1503: {_pool(ctx)}"
+    assert _depth(ctx) == 2, f"pool:depth is {_depth(ctx)} with t9 and t3 waiting"
+    match = store.get_match("m-3")
+    assert match["state"] == "abandoned" and match["reason"] == "allocation_failed", f"m-3 could not be placed and must be abandoned with reason allocation_failed, it is {match}"
 
 
 def check_idempotent_release(ctx):
     m = _client(ctx)
     store.enqueue("t9", "p9", 1590, ["p9"])
     _claimed("m-1", ["t1", "t2"])
+    # What pool:15 holds the moment released:m-1 is first touched, if the guard is set by then.
+    at_guard = ctx.redis_after("released:m-1", lambda: (ctx.redis.exists("released:m-1"), sorted(ctx.redis.zrange("pool:15", 0, -1))))
     assert m.release_roster("m-1") is True, "the first release of m-1 must release it"
+    assert at_guard.fired, "release_roster never touched released:m-1"
+    guarded, pooled = at_guard.result
+    assert not guarded or pooled == ["t1", "t2", "t9"], f"released:m-1 was set while pool:15 held only {pooled}: the guard and the tickets moved in separate steps, so a crash between them leaves the roster claimed and every later release refused. Set the guard in the script that returns the tickets"
+    ttl = ctx.redis.ttl("released:m-1")
+    assert 0 < ttl <= 3600, f"released:m-1 has TTL {ttl}, expected at most 3600 s: a guard without an expiry stays in Redis for every match ever released"
     assert m.release_roster("m-1") is False, "the second release of m-1 must answer False: the roster was already returned"
     assert _depth(ctx) == 3 and len(_pool(ctx)) == 3, f"after a release that ran twice pool:depth is {_depth(ctx)} for {len(_pool(ctx))} waiting tickets: the tickets were counted back twice"
     assert claims.claim_tickets("m-2", 15, ["t1", "t2"]), "the released tickets must be claimable by m-2"
@@ -831,6 +852,11 @@ def check_idempotent_release(ctx):
     for ticket_id in ("t1", "t2"):
         assert store.get_ticket(ticket_id)["match_id"] == "m-2", f"a late release of m-1 took {ticket_id} out of m-2: {store.get_ticket(ticket_id)}"
     assert _depth(ctx) == 1, f"a late release of m-1 moved pool:depth to {_depth(ctx)}"
+    ctx.clock.advance(3601)  # the guard has expired when a sweeper releases m-1 again
+    m.release_roster("m-1")
+    for ticket_id in ("t1", "t2"):
+        assert store.get_ticket(ticket_id)["match_id"] == "m-2", f"a release of m-1 after its guard expired took {ticket_id} out of m-2: {store.get_ticket(ticket_id)}. Return only the tickets whose match_id is still this match"
+    assert _depth(ctx) == 1 and len(_pool(ctx)) == 1, f"a release of m-1 after its guard expired moved pool:depth to {_depth(ctx)} with pool:15 holding {sorted(_pool(ctx))}"
 `,
     typescript: `function client(ctx) {
   const pkg = ctx.proto('game_matchmaking.proto');
@@ -878,6 +904,11 @@ export async function check_deadline(ctx) {
   await m.allocateMatch('m-2');
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited < 12, \`allocateMatch waited \${waited.toFixed(0)} s on an allocator that answers after 30 s: three 3-second attempts and their backoff end well before that\`);
+  const stalled = ctx.grpc.callsTo('Allocate').slice(1);
+  assert.equal(stalled.length, 3, \`an allocator that never answers in time got \${stalled.length} Allocate calls, expected 3: DEADLINE_EXCEEDED is retried\`);
+  stalled.forEach((call, i) => {
+    assert(call.timeout !== null && 2.5 <= call.timeout && call.timeout <= 3.5, \`attempt \${i + 1} on a stalled allocator carried a \${call.timeout} s deadline, expected ALLOCATOR_DEADLINE_MS = 3000: each attempt gets its own deadline, one shared by every attempt leaves the retries none\`);
+  });
 }
 
 export async function check_retry_policy(ctx) {
@@ -911,13 +942,31 @@ export async function check_release_on_failure(ctx) {
   const match = await store.getMatch('m-1');
   assert(match.state === 'abandoned' && match.reason === 'allocation_failed', \`the match must be abandoned with reason allocation_failed, it is \${JSON.stringify(match)}\`);
   assert(await claims.claimTickets('m-2', 15, ['t1', 't2']), 'the released tickets must be claimable by the next match');
+  // A full fleet ends the attempts at once: the roster goes back all the same.
+  await claimed(store, claims, 'm-3', ['t3']);
+  ctx.grpc.fail('Allocate', ctx.grpc.status.RESOURCE_EXHAUSTED, 'no free server', 3);
+  assert.equal(await m.allocateMatch('m-3'), null, 'a fleet with no free server cannot place m-3');
+  const t3 = await store.getTicket('t3');
+  assert(t3.state === 'waiting' && t3.match_id === null, \`RESOURCE_EXHAUSTED ended the attempts and t3 is \${JSON.stringify(t3)}: a full fleet leaves the roster claimed by a match that never starts. Release it whatever code ended the attempts\`);
+  assert.equal(score(ctx, 't3'), 1503, 't3 is not back in pool:15 at its skill 1503');
+  assert.equal(depth(ctx), 2, \`pool:depth is \${depth(ctx)} with t9 and t3 waiting\`);
+  const m3 = await store.getMatch('m-3');
+  assert(m3.state === 'abandoned' && m3.reason === 'allocation_failed', \`m-3 could not be placed and must be abandoned with reason allocation_failed, it is \${JSON.stringify(m3)}\`);
 }
 
 export async function check_idempotent_release(ctx) {
   const {m, store, claims} = client(ctx);
   await store.enqueue('t9', 'p9', 1590, ['p9']);
   await claimed(store, claims, 'm-1', ['t1', 't2']);
+  // What pool:15 holds the moment released:m-1 is first touched, if the guard is set by then.
+  const atGuard = ctx.redisAfter('released:m-1', () => [ctx.redis.exists('released:m-1'), (ctx.redis.zrange('pool:15', 0, -1) as string[]).slice().sort()]);
   assert.equal(await m.releaseRoster('m-1'), true, 'the first release of m-1 must release it');
+  assert(atGuard.fired, 'releaseRoster never touched released:m-1');
+  if (atGuard.error !== undefined) throw atGuard.error;
+  const [guarded, pooled] = atGuard.result as [number, string[]];
+  assert(guarded === 0 || JSON.stringify(pooled) === '["t1","t2","t9"]', \`released:m-1 was set while pool:15 held only \${JSON.stringify(pooled)}: the guard and the tickets moved in separate steps, so a crash between them leaves the roster claimed and every later release refused. Set the guard in the script that returns the tickets\`);
+  const ttl = ctx.redis.ttl('released:m-1');
+  assert(ttl > 0 && ttl <= 3600, \`released:m-1 has TTL \${ttl}, expected at most 3600 s: a guard without an expiry stays in Redis for every match ever released\`);
   assert.equal(await m.releaseRoster('m-1'), false, 'the second release of m-1 must answer false: the roster was already returned');
   const waiting = ctx.redis.zcard('pool:15');
   assert(depth(ctx) === 3 && waiting === 3, \`after a release that ran twice pool:depth is \${depth(ctx)} for \${waiting} waiting tickets: the tickets were counted back twice\`);
@@ -929,6 +978,13 @@ export async function check_idempotent_release(ctx) {
     assert.equal(t.match_id, 'm-2', \`a late release of m-1 took \${ticketId} out of m-2: \${JSON.stringify(t)}\`);
   }
   assert.equal(depth(ctx), 1, \`a late release of m-1 moved pool:depth to \${depth(ctx)}\`);
+  ctx.clock.advance(3601); // the guard has expired when a sweeper releases m-1 again
+  await m.releaseRoster('m-1');
+  for (const ticketId of ['t1', 't2']) {
+    const t = await store.getTicket(ticketId);
+    assert.equal(t.match_id, 'm-2', \`a release of m-1 after its guard expired took \${ticketId} out of m-2: \${JSON.stringify(t)}. Return only the tickets whose match_id is still this match\`);
+  }
+  assert(depth(ctx) === 1 && ctx.redis.zcard('pool:15') === 1, \`a release of m-1 after its guard expired moved pool:depth to \${depth(ctx)} with \${ctx.redis.zcard('pool:15')} tickets in pool:15\`);
 }
 `,
     go: `package main
@@ -1010,6 +1066,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	allocate(ctx, "m-2")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 12, "allocateMatch waited %.0f s on an allocator that answers after 30 s: three 3-second attempts and their backoff end well before that", waited)
+	stalled := ctx.GRPC.CallsTo("Allocate", "")[1:]
+	ctx.Equal(len(stalled), 3, "Allocate calls to an allocator that never answers in time (DEADLINE_EXCEEDED is retried)")
+	for n, call := range stalled {
+		ctx.Assert(call.HasDeadline() && 2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "attempt %d on a stalled allocator carried a %v deadline, expected allocatorDeadline = 3 s: each attempt gets its own deadline, one shared by every attempt leaves the retries none", n+1, call.Timeout)
+	}
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
@@ -1045,13 +1106,36 @@ func CheckReleaseOnFailure(ctx *harness.Ctx) {
 	ctx.Assert(m.State == "abandoned" && m.Reason == "allocation_failed", "the match must be abandoned with reason allocation_failed, it is %+v", m)
 	ok, _ := claims.ClaimTickets(allocBg, "m-2", 15, []string{"t1", "t2"})
 	ctx.Assert(ok, "the released tickets must be claimable by the next match")
+	// A full fleet ends the attempts at once: the roster goes back all the same.
+	allocClaimed(ctx, "m-3", "t3")
+	ctx.GRPC.Fail("Allocate", codes.ResourceExhausted, "no free server", 3, "")
+	ctx.Equal(allocate(ctx, "m-3"), "", "a fleet with no free server cannot place m-3; the server")
+	t3 := store.GetTicket(allocBg, "t3")
+	ctx.Assert(t3.State == "waiting" && t3.MatchID == "", "RESOURCE_EXHAUSTED ended the attempts and t3 is %+v: a full fleet leaves the roster claimed by a match that never starts. Release it whatever code ended the attempts", t3)
+	got, inPool := ctx.Redis.ZScore("pool:15", "t3")
+	ctx.Assert(inPool && got == 1503, "t3 is not back in pool:15 at its skill 1503")
+	ctx.Equal(allocDepth(ctx), 2, "pool:depth with t9 and t3 waiting")
+	m3 := store.GetMatch(allocBg, "m-3")
+	ctx.Assert(m3.State == "abandoned" && m3.Reason == "allocation_failed", "m-3 could not be placed and must be abandoned with reason allocation_failed, it is %+v", m3)
 }
 
 func CheckIdempotentRelease(ctx *harness.Ctx) {
 	allocServe(ctx)
 	store.Enqueue(allocBg, "t9", "p9", 1590, []string{"p9"})
 	allocClaimed(ctx, "m-1", "t1", "t2")
+	// Whether the guard is already set while the roster is still claimed, the moment released:m-1 is first touched.
+	atGuard := ctx.Redis.After("released:m-1", func() any {
+		_, t1Back := ctx.Redis.ZScore("pool:15", "t1")
+		_, t2Back := ctx.Redis.ZScore("pool:15", "t2")
+		return ctx.Redis.Exists("released:m-1") == 1 && !(t1Back && t2Back)
+	})
 	ctx.Equal(release(ctx, "m-1"), true, "the first release of m-1 must release it")
+	ctx.Assert(atGuard.Fired, "releaseRoster never touched released:m-1")
+	ctx.Assert(atGuard.Err == nil, "the snapshot at released:m-1 failed: %v", atGuard.Err)
+	early, _ := atGuard.Result.(bool)
+	ctx.Assert(!early, "released:m-1 was set while t1 and t2 were still claimed: the guard and the tickets moved in separate steps, so a crash between them leaves the roster claimed and every later release refused. Set the guard in the script that returns the tickets")
+	ttl := ctx.Redis.TTL("released:m-1")
+	ctx.Assert(ttl > 0 && ttl <= 3600, "released:m-1 has TTL %d, expected at most 3600 s: a guard without an expiry stays in Redis for every match ever released", ttl)
 	ctx.Equal(release(ctx, "m-1"), false, "the second release of m-1 must answer false: the roster was already returned")
 	ctx.Assert(allocDepth(ctx) == 3 && ctx.Redis.ZCard("pool:15") == 3, "after a release that ran twice pool:depth is %d for %d waiting tickets: the tickets were counted back twice", allocDepth(ctx), ctx.Redis.ZCard("pool:15"))
 	ok, _ := claims.ClaimTickets(allocBg, "m-2", 15, []string{"t1", "t2"})
@@ -1062,10 +1146,17 @@ func CheckIdempotentRelease(ctx *harness.Ctx) {
 		ctx.Equal(store.GetTicket(allocBg, ticketID).MatchID, "m-2", "a late release of m-1 must not take %s out of m-2; its match", ticketID)
 	}
 	ctx.Equal(allocDepth(ctx), 1, "a late release of m-1 must not move pool:depth")
+	ctx.Clock.Advance(3601) // the guard has expired when a sweeper releases m-1 again
+	release(ctx, "m-1")
+	for _, ticketID := range []string{"t1", "t2"} {
+		ctx.Equal(store.GetTicket(allocBg, ticketID).MatchID, "m-2", "a release of m-1 after its guard expired must not take %s out of m-2 (return only the tickets whose match_id is still this match); its match", ticketID)
+	}
+	ctx.Assert(allocDepth(ctx) == 1 && ctx.Redis.ZCard("pool:15") == 1, "a release of m-1 after its guard expired moved pool:depth to %d with %d tickets in pool:15", allocDepth(ctx), ctx.Redis.ZCard("pool:15"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1126,6 +1217,11 @@ void CheckDeadline(harness::Ctx& ctx) {
   allocateMatch("m-2");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited < 12, "allocateMatch waited %.0f s on an allocator that answers after 30 s: three 3-second attempts and their backoff end well before that", waited);
+  const auto calls = ctx.GRPC.CallsTo("Allocate");
+  ctx.Equal(calls.size(), 4, "Allocate calls: one for m-1, then three to an allocator that never answers in time (DEADLINE_EXCEEDED is retried)");
+  for (size_t n = 1; n < calls.size(); n++) {
+    ctx.Assert(calls[n].HasDeadline() && 2.5 <= calls[n].TimeoutSeconds() && calls[n].TimeoutSeconds() <= 3.5, "attempt %d on a stalled allocator carried a %v s deadline, expected kAllocatorDeadline = 3 s: each attempt gets its own deadline, one shared by every attempt leaves the retries none", n, calls[n].TimeoutSeconds());
+  }
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
@@ -1159,13 +1255,35 @@ void CheckReleaseOnFailure(harness::Ctx& ctx) {
   const auto m = store::getMatch("m-1");
   ctx.Assert(m && m->state == "abandoned" && m->reason == "allocation_failed", "the match must be abandoned with reason allocation_failed, it is %s (%s)", m ? m->state : "gone", m ? m->reason : "");
   ctx.Assert(claims::claimTickets("m-2", 15, {"t1", "t2"}), "the released tickets must be claimable by the next match");
+  // A full fleet ends the attempts at once: the roster goes back all the same.
+  allocClaimed(ctx, "m-3", {"t3"});
+  ctx.GRPC.Fail("Allocate", grpc::StatusCode::RESOURCE_EXHAUSTED, "no free server", 3);
+  ctx.Equal(serverOf(allocateMatch("m-3")), "(none)", "a fleet with no free server cannot place m-3; the server");
+  const auto t3 = store::getTicket("t3");
+  ctx.Assert(t3 && t3->state == "waiting" && t3->match_id.empty(), "RESOURCE_EXHAUSTED ended the attempts and t3 is %s (match %s): a full fleet leaves the roster claimed by a match that never starts. Release it whatever code ended the attempts", t3 ? t3->state : "gone", t3 ? t3->match_id : "");
+  ctx.Equal(ctx.Redis.ZScore("pool:15", "t3"), std::optional<double>(1503), "t3 back in pool:15 at its skill");
+  ctx.Equal(allocDepth(ctx), 2, "pool:depth with t9 and t3 waiting");
+  const auto m3 = store::getMatch("m-3");
+  ctx.Assert(m3 && m3->state == "abandoned" && m3->reason == "allocation_failed", "m-3 could not be placed and must be abandoned with reason allocation_failed, it is %s (%s)", m3 ? m3->state : "gone", m3 ? m3->reason : "");
 }
 
 void CheckIdempotentRelease(harness::Ctx& ctx) {
   allocServe(ctx);
   store::enqueue("t9", "p9", 1590, {"p9"});
   allocClaimed(ctx, "m-1", {"t1", "t2"});
+  // Whether the guard is already set while the roster is still claimed, the moment released:m-1 is first touched.
+  auto fired = std::make_shared<bool>(false);
+  auto early = std::make_shared<bool>(false);
+  ctx.Redis.After("released:m-1", [&ctx, fired, early] {
+    *fired = true;
+    const bool back = ctx.Redis.ZScore("pool:15", "t1").has_value() && ctx.Redis.ZScore("pool:15", "t2").has_value();
+    *early = ctx.Redis.Exists("released:m-1") == 1 && !back;
+  });
   ctx.Equal(releaseRoster("m-1"), true, "the first release of m-1 must release it");
+  ctx.Assert(*fired, "releaseRoster never touched released:m-1");
+  ctx.Assert(!*early, "released:m-1 was set while t1 and t2 were still claimed: the guard and the tickets moved in separate steps, so a crash between them leaves the roster claimed and every later release refused. Set the guard in the script that returns the tickets");
+  const long long ttl = ctx.Redis.TTL("released:m-1");
+  ctx.Assert(ttl > 0 && ttl <= 3600, "released:m-1 has TTL %d, expected at most 3600 s: a guard without an expiry stays in Redis for every match ever released", ttl);
   ctx.Equal(releaseRoster("m-1"), false, "the second release of m-1 must answer false: the roster was already returned");
   ctx.Assert(allocDepth(ctx) == 3 && ctx.Redis.ZCard("pool:15") == 3, "after a release that ran twice pool:depth is %d for %d waiting tickets: the tickets were counted back twice", allocDepth(ctx), ctx.Redis.ZCard("pool:15"));
   ctx.Assert(claims::claimTickets("m-2", 15, {"t1", "t2"}), "the released tickets must be claimable by m-2");
@@ -1176,6 +1294,13 @@ void CheckIdempotentRelease(harness::Ctx& ctx) {
     ctx.Equal(t ? t->match_id : "", "m-2", "a late release of m-1 must not take %s out of m-2; its match", ticket_id);
   }
   ctx.Equal(allocDepth(ctx), 1, "a late release of m-1 must not move pool:depth");
+  ctx.Clock.Advance(3601);  // the guard has expired when a sweeper releases m-1 again
+  releaseRoster("m-1");
+  for (const std::string ticket_id : {"t1", "t2"}) {
+    const auto t = store::getTicket(ticket_id);
+    ctx.Equal(t ? t->match_id : "", "m-2", "a release of m-1 after its guard expired must not take %s out of m-2 (return only the tickets whose match_id is still this match); its match", ticket_id);
+  }
+  ctx.Assert(allocDepth(ctx) == 1 && ctx.Redis.ZCard("pool:15") == 1, "a release of m-1 after its guard expired moved pool:depth to %d with %d tickets in pool:15", allocDepth(ctx), ctx.Redis.ZCard("pool:15"));
 }
 `,
   },

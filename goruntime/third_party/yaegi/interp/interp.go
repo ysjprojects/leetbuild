@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/build"
 	"go/scanner"
 	"go/token"
@@ -53,6 +54,7 @@ type node struct {
 	ident      string         // set if node is a var or func
 	redeclared bool           // set if node is a redeclared variable (CFG)
 	meta       interface{}    // meta stores meta information between gta runs, like errors
+	call       *ast.CallExpr  // LeetBuild: a call's source, for the compile errors that quote it
 }
 
 func (n *node) shouldBreak() bool {

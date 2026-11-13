@@ -7,7 +7,8 @@
  *
  *   ctx.load(stem)           the learner's module `/work/<stem>.ts` (fresh per check)
  *   ctx.redis                the server, synchronously: `ctx.redis.get(key)`, `.ttl`, `.keys()`, `.hgetall` …
- *   ctx.redisAfter(key, fn)  run `fn` right after the first command touching `key`, before its caller sees the reply
+ *   ctx.redisAfter(key, fn)  run `fn` right after the first successful command, MULTI/EXEC block or script touching
+ *                            `key` (a script: the keys its redis.calls use), before its caller sees the reply
  *   ctx.db                   Postgres: `await ctx.db.execute(sql, params)`, `await ctx.db.reset(schema)`, `.events`, `.queries`
  *   ctx.dbAfter(pattern, fn) run `fn` right after the first statement containing `pattern`
  *   ctx.kafka                the broker: seed, records, values, keys, lag, commits, committedOffset, onCommit,
@@ -202,7 +203,10 @@ export class Ctx {
     return this.modules.load(path);
   }
 
-  /** Run `fn` once right after the first command touching `key`; the probe records `fired`, `result`, `error`. */
+  /**
+   * Run `fn` once right after the first successful command, MULTI/EXEC block or script touching `key`
+   * (a script: the keys its redis.calls use); the probe records `fired`, `result`, `error`.
+   */
   redisAfter(key: string, fn: () => unknown): Probe {
     const probe: Probe = {key: toByteString(key), fn, fired: false, result: undefined, error: undefined};
     SERVER.probes.push(probe);

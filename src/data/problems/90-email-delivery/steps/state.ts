@@ -559,6 +559,8 @@ def check_durable_suppression(ctx):
     assert verdict == "suppressed", f"two hours after the unsubscribe admit answered {verdict!r}: the suppression expired and the customer is mailed again. Keep suppressed addresses in a set with no expiry"
     assert m.is_suppressed(ADDR) is True, "is_suppressed must still answer True two hours later"
     assert ctx.redis.sismember("mail:suppressed", ADDR), f"mail:suppressed does not hold {ADDR}; Redis holds {sorted(ctx.redis.keys('mail:*'))}"
+    ttl = ctx.redis.ttl("mail:suppressed")
+    assert ttl == -1, f"mail:suppressed has TTL {ttl}: when it runs out every unsubscribe lapses at once. The set never expires"
 
 
 def check_atomic_admission(ctx):
@@ -572,15 +574,29 @@ def check_atomic_admission(ctx):
     rival = ctx.redis_after(keys[0], lambda: m.admit(ADDR))
     fifth = m.admit(ADDR)
     racing = _settled(rival, keys[0])
+    assert not (fifth == racing == "rate_limited"), "the fifth send of the minute and a send racing it were both refused: the limit admits RATE_LIMIT (5) sends a minute, so only the sixth is rate_limited"
     assert sorted([fifth, racing]) == ["ok", "rate_limited"], f"the fifth send and a send racing it were answered {fifth!r} and {racing!r}: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script"
+    # An unsubscribe lands right after admission reads the set.
+    seen = ctx.redis_after("mail:suppressed", lambda: (ctx.redis.keys("mail:rate:*cy@example.com*"), ctx.redis.sadd("mail:suppressed", "cy@example.com"))[0])
+    verdict = m.admit("cy@example.com")
+    if seen.fired:
+        counted = _settled(seen, "mail:suppressed")
+        assert counted or verdict == "suppressed", f"an unsubscribe landed after admission read mail:suppressed and before it counted the send, and the send was answered {verdict!r}: the check and the count are separate commands, so a customer who just unsubscribed is mailed. Check the set and count in one Lua script"
 
 
 def check_rate_window(ctx):
     m = ctx.load("admission")
+    assert m.admit("lee@example.com") == "ok", "the first send to lee@example.com must be admitted"
+    first = ctx.redis.keys("mail:rate:*")
+    assert len(first) == 1, f"one send left the counters {first}, expected one mail:rate:{{address}}:{{window}}"
+    created = first[0].replace("lee@example.com", ADDR)
+    # A snapshot of the counter's TTL right after the command that creates it.
+    snapshot = ctx.redis_after(created, lambda: ctx.redis.ttl(created))
     verdicts = [m.admit(ADDR) for _ in range(6)]
     assert verdicts == ["ok"] * 5 + ["rate_limited"], f"six sends in one minute answered {verdicts}, expected five ok and rate_limited"
+    ttl = _settled(snapshot, created)
+    assert 0 < ttl <= 60, f"right after the command that created {created}, its TTL was {ttl}: the EXPIRE comes in a later command, and a crash in between leaves a counter that never expires. EXPIRE it in the script that increments it"
     keys = ctx.redis.keys("mail:rate:*")
-    assert keys, "no mail:rate:* counter in Redis"
     for key in keys:
         ttl = ctx.redis.ttl(key)
         assert 0 < ttl <= 60, f"{key} has TTL {ttl}: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window"
@@ -617,6 +633,8 @@ export async function check_durable_suppression(ctx) {
   assert.equal(verdict, 'suppressed', \`two hours after the unsubscribe admit answered \${verdict}: the suppression expired and the customer is mailed again. Keep suppressed addresses in a set with no expiry\`);
   assert.equal(await m.isSuppressed(ADDR), true, 'isSuppressed must still answer true two hours later');
   assert.equal(ctx.redis.sismember('mail:suppressed', ADDR), 1, \`mail:suppressed does not hold \${ADDR}; Redis holds \${JSON.stringify(ctx.redis.keys('mail:*'))}\`);
+  const ttl = ctx.redis.ttl('mail:suppressed');
+  assert.equal(ttl, -1, \`mail:suppressed has TTL \${ttl}: when it runs out every unsubscribe lapses at once. The set never expires\`);
 }
 
 export async function check_atomic_admission(ctx) {
@@ -628,16 +646,35 @@ export async function check_atomic_admission(ctx) {
   const rival = ctx.redisAfter(keys[0], () => m.admit(ADDR));
   const fifth = await m.admit(ADDR);
   const racing = await settled(rival, keys[0]);
+  assert(!(fifth === 'rate_limited' && racing === 'rate_limited'), 'the fifth send of the minute and a send racing it were both refused: the limit admits RATE_LIMIT (5) sends a minute, so only the sixth is rate_limited');
   assert.deepStrictEqual([fifth, racing].sort(), ['ok', 'rate_limited'], \`the fifth send and a send racing it were answered \${fifth} and \${racing}: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script\`);
+  // An unsubscribe lands right after admission reads the set.
+  const seen = ctx.redisAfter('mail:suppressed', () => {
+    const counters = ctx.redis.keys('mail:rate:*cy@example.com*');
+    ctx.redis.sadd('mail:suppressed', 'cy@example.com');
+    return counters;
+  });
+  const verdict = await m.admit('cy@example.com');
+  if (seen.fired) {
+    const counted = await settled(seen, 'mail:suppressed');
+    assert(counted.length > 0 || verdict === 'suppressed', \`an unsubscribe landed after admission read mail:suppressed and before it counted the send, and the send was answered \${verdict}: the check and the count are separate commands, so a customer who just unsubscribed is mailed. Check the set and count in one Lua script\`);
+  }
 }
 
 export async function check_rate_window(ctx) {
   const m = ctx.load('admission');
+  assert.equal(await m.admit('lee@example.com'), 'ok', 'the first send to lee@example.com must be admitted');
+  const first = ctx.redis.keys('mail:rate:*');
+  assert.equal(first.length, 1, \`one send left the counters \${JSON.stringify(first)}, expected one mail:rate:{address}:{window}\`);
+  const created = first[0].replace('lee@example.com', ADDR);
+  // A snapshot of the counter's TTL right after the command that creates it.
+  const snapshot = ctx.redisAfter(created, () => ctx.redis.ttl(created));
   const verdicts: string[] = [];
   for (let n = 0; n < 6; n++) verdicts.push(await m.admit(ADDR));
   assert.deepStrictEqual(verdicts, ['ok', 'ok', 'ok', 'ok', 'ok', 'rate_limited'], \`six sends in one minute answered \${JSON.stringify(verdicts)}\`);
+  const createdTtl = await settled(snapshot, created);
+  assert(createdTtl > 0 && createdTtl <= 60, \`right after the command that created \${created}, its TTL was \${createdTtl}: the EXPIRE comes in a later command, and a crash in between leaves a counter that never expires. EXPIRE it in the script that increments it\`);
   const keys = ctx.redis.keys('mail:rate:*');
-  assert(keys.length > 0, 'no mail:rate:* counter in Redis');
   for (const key of keys) {
     const ttl = ctx.redis.ttl(key);
     assert(ttl > 0 && ttl <= 60, \`\${key} has TTL \${ttl}: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window\`);
@@ -661,6 +698,7 @@ export async function check_normalized_address(ctx) {
 
 import (
 	"context"
+	"strings"
 
 	"leetbuild/harness"
 )
@@ -684,6 +722,7 @@ func CheckDurableSuppression(ctx *harness.Ctx) {
 	ctx.NoError(err, "isSuppressed failed")
 	ctx.Equal(suppressed, true, "isSuppressed two hours later")
 	ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", harnessAddr), "mail:suppressed does not hold %s; Redis holds %q", harnessAddr, ctx.Redis.Keys("mail:*"))
+	ctx.Equal(ctx.Redis.TTL("mail:suppressed"), int64(-1), "the TTL of mail:suppressed (when it runs out every unsubscribe lapses at once; the set never expires)")
 }
 
 func CheckAtomicAdmission(ctx *harness.Ctx) {
@@ -700,18 +739,38 @@ func CheckAtomicAdmission(ctx *harness.Ctx) {
 	fifth := mustAdmit(ctx, harnessAddr)
 	ctx.Assert(rival.Fired, "nothing touched %s", keys[0])
 	racing, _ := rival.Result.(string)
+	ctx.Assert(!(fifth == "rate_limited" && racing == "rate_limited"), "the fifth send of the minute and a send racing it were both refused: the limit admits RATE_LIMIT (5) sends a minute, so only the sixth is rate_limited")
 	ctx.Assert((fifth == "ok" && racing == "rate_limited") || (fifth == "rate_limited" && racing == "ok"),
 		"the fifth send and a send racing it were answered %q and %q: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script", fifth, racing)
+	// An unsubscribe lands right after admission reads the set.
+	seen := ctx.Redis.After("mail:suppressed", func() any {
+		counters := ctx.Redis.Keys("mail:rate:*cy@example.com*")
+		ctx.Redis.Do("SADD", "mail:suppressed", "cy@example.com")
+		return counters
+	})
+	verdict := mustAdmit(ctx, "cy@example.com")
+	if seen.Fired {
+		counted, _ := seen.Result.([]string)
+		ctx.Assert(len(counted) > 0 || verdict == "suppressed", "an unsubscribe landed after admission read mail:suppressed and before it counted the send, and the send was answered %q: the check and the count are separate commands, so a customer who just unsubscribed is mailed. Check the set and count in one Lua script", verdict)
+	}
 }
 
 func CheckRateWindow(ctx *harness.Ctx) {
+	ctx.Equal(mustAdmit(ctx, "lee@example.com"), "ok", "the first send to lee@example.com")
+	first := ctx.Redis.Keys("mail:rate:*")
+	ctx.Equal(len(first), 1, "one send must leave one mail:rate:{address}:{window} counter (%q); counters", first)
+	created := strings.ReplaceAll(first[0], "lee@example.com", harnessAddr)
+	// A snapshot of the counter's TTL right after the command that creates it.
+	snapshot := ctx.Redis.After(created, func() any { return ctx.Redis.TTL(created) })
 	var verdicts []string
 	for n := 0; n < 6; n++ {
 		verdicts = append(verdicts, mustAdmit(ctx, harnessAddr))
 	}
 	ctx.Equal(verdicts, []string{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends in one minute")
+	ctx.Assert(snapshot.Fired, "nothing touched %s", created)
+	createdTTL, _ := snapshot.Result.(int64)
+	ctx.Assert(createdTTL > 0 && createdTTL <= 60, "right after the command that created %s, its TTL was %d: the EXPIRE comes in a later command, and a crash in between leaves a counter that never expires. EXPIRE it in the script that increments it", created, createdTTL)
 	keys := ctx.Redis.Keys("mail:rate:*")
-	ctx.Assert(len(keys) > 0, "no mail:rate:* counter in Redis")
 	for _, key := range keys {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window", key, ttl)
@@ -735,6 +794,7 @@ func CheckNormalizedAddress(ctx *harness.Ctx) {
     cpp: `#include <leetbuild/harness.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -751,6 +811,7 @@ void CheckDurableSuppression(harness::Ctx& ctx) {
   ctx.Equal(admit(kAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit");
   ctx.Equal(isSuppressed(kAddr), true, "isSuppressed two hours later");
   ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", kAddr), "mail:suppressed does not hold %s; Redis holds %q", kAddr, ctx.Redis.Keys("mail:*"));
+  ctx.Equal(ctx.Redis.TTL("mail:suppressed"), -1LL, "the TTL of mail:suppressed (when it runs out every unsubscribe lapses at once; the set never expires)");
 }
 
 void CheckAtomicAdmission(harness::Ctx& ctx) {
@@ -762,17 +823,43 @@ void CheckAtomicAdmission(harness::Ctx& ctx) {
   ctx.Redis.After(keys[0], [racing] { *racing = admit(kAddr); });
   const std::string fifth = admit(kAddr);
   ctx.Assert(!racing->empty(), "nothing touched %s", keys[0]);
+  ctx.Assert(!(fifth == "rate_limited" && *racing == "rate_limited"),
+             "the fifth send of the minute and a send racing it were both refused: the limit admits RATE_LIMIT (5) sends a minute, so only the sixth is rate_limited");
   ctx.Assert((fifth == "ok" && *racing == "rate_limited") || (fifth == "rate_limited" && *racing == "ok"),
              "the fifth send and a send racing it were answered %q and %q: both read the count before either incremented it, so six emails went out under a limit of five. Decide in one Lua script",
              fifth, *racing);
+  // An unsubscribe lands right after admission reads the set.
+  auto counted = std::make_shared<std::optional<bool>>();
+  ctx.Redis.After("mail:suppressed", [&ctx, counted] {
+    *counted = !ctx.Redis.Keys("mail:rate:*cy@example.com*").empty();
+    ctx.Redis.Do("SADD", "mail:suppressed", "cy@example.com");
+  });
+  const std::string verdict = admit("cy@example.com");
+  if (counted->has_value()) {
+    ctx.Assert(**counted || verdict == "suppressed",
+               "an unsubscribe landed after admission read mail:suppressed and before it counted the send, and the send was answered %q: the check and the count are separate commands, so a customer who just unsubscribed is mailed. Check the set and count in one Lua script",
+               verdict);
+  }
 }
 
 void CheckRateWindow(harness::Ctx& ctx) {
+  ctx.Equal(admit("lee@example.com"), "ok", "the first send to lee@example.com");
+  const auto first = ctx.Redis.Keys("mail:rate:*");
+  ctx.Equal(first.size(), 1, "one send must leave one mail:rate:{address}:{window} counter (%q); counters", first);
+  std::string created = first[0];
+  if (const auto at = created.find("lee@example.com"); at != std::string::npos) created.replace(at, std::string("lee@example.com").size(), kAddr);
+  // A snapshot of the counter's TTL right after the command that creates it.
+  auto snapshot = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After(created, [&ctx, created, snapshot] { *snapshot = ctx.Redis.TTL(created); });
   std::vector<std::string> verdicts;
   for (int n = 0; n < 6; n++) verdicts.push_back(admit(kAddr));
   ctx.Equal(verdicts, std::vector<std::string>{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends in one minute");
+  ctx.Assert(snapshot->has_value(), "nothing touched %s", created);
+  const long long created_ttl = snapshot->value_or(0);
+  ctx.Assert(created_ttl > 0 && created_ttl <= 60,
+             "right after the command that created %s, its TTL was %d: the EXPIRE comes in a later command, and a crash in between leaves a counter that never expires. EXPIRE it in the script that increments it",
+             created, created_ttl);
   const auto keys = ctx.Redis.Keys("mail:rate:*");
-  ctx.Assert(!keys.empty(), "no mail:rate:* counter in Redis");
   for (const auto& key : keys) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window", key, ttl);

@@ -26,7 +26,8 @@ no features at all.
   nothing (\`None\`, \`null\`, \`nil\`). Release the lock in \`finally\` (\`defer\`, a scope guard), on
   the failure path too.
 - Every refresh also writes \`features:stale:{tenant}:{user_id}\` with \`EX 86400\` (\`STALE_TTL_S\`);
-  when the feature service fails, answer that copy as \`{values, stale: true}\`.`,
+  when the feature service fails, with an error or past its 300 ms deadline, answer that copy as
+  \`{values, stale: true}\`.`,
   sequence: {
     participants: ['Ranking client', 'Concurrent request', 'Redis', 'Feature service'],
     messages: [
@@ -75,7 +76,7 @@ no features at all.
       id: 'single-flight',
       title: 'One refresh per miss, under a lock released on every path',
       detail:
-        'A miss takes `lock:features:{tenant}:{user_id}` with `NX` and a 5-second expiry before it calls the feature service; a caller that finds it taken answers the stale copy instead of calling too; the lock is released in `finally`/`defer`/a scope guard.',
+        'A miss takes `lock:features:{tenant}:{user_id}` with `NX` and a 5-second expiry, in the same command, before it calls the feature service; a caller that finds it taken answers the stale copy when there is one instead of calling too; the lock is released in `finally`/`defer`/a scope guard.',
       match: {
         python: {
           all: [/lock:features:/, /nx=True/, /finally:/, /\.delete\(\s*lock/],
@@ -103,7 +104,7 @@ no features at all.
       id: 'stale-fallback',
       title: 'Answers the stale copy when the feature service fails',
       detail:
-        'Every refresh writes `features:stale:{tenant}:{user_id}` for a day; a failed `UserFeatures` call answers that copy marked `stale`, where the starter lets the error through and ranking gets no features.',
+        'Every refresh writes `features:stale:{tenant}:{user_id}` for a day, replacing the previous copy; a failed `UserFeatures` call, an error status or its 300 ms deadline passing, answers that copy marked `stale`, where the starter lets the error through and ranking gets no features.',
       match: {
         python: {all: [/features:stale:/, /ex=STALE_TTL_S/, /except grpc\.RpcError/, /"stale":\s*True/]},
         typescript: {all: [/features:stale:/, /'EX',\s*STALE_TTL_S/, /catch/, /stale:\s*true/]},
@@ -563,16 +564,19 @@ import ranking_pb2_grpc
 
 T1 = [0.25, 0.375]  # every user of tenant t1
 T2 = [0.75, 0.875]  # every user of tenant t2
+T1_LATER = [0.5, 0.625]  # tenant t1 once its users' behaviour changed
 
 
 class FeatureService(ranking_pb2_grpc.FeatureServiceServicer):
+    shift = 0.0
+
     def UserFeatures(self, request, context):
-        base = 0.25 if request.tenant == "t1" else 0.75
+        base = (0.25 if request.tenant == "t1" else 0.75) + self.shift
         return ranking_pb2.FeatureVector(values=[base, base + 0.125])
 
 
-def _state(ctx):
-    ctx.grpc.serve(ranking_pb2_grpc.add_FeatureServiceServicer_to_server, FeatureService())
+def _state(ctx, peer=None):
+    ctx.grpc.serve(ranking_pb2_grpc.add_FeatureServiceServicer_to_server, peer or FeatureService())
     return ctx.load("state")
 
 
@@ -611,15 +615,26 @@ def check_ttl(ctx):
 def check_single_flight(ctx):
     m = _state(ctx)
     # A second request for the same cold user lands right after this one took the refresh lock.
-    rival = ctx.redis_after("lock:features:t1:u-1", lambda: m.load_features("t1", "u-1"))
+    rival = ctx.redis_after("lock:features:t1:u-1", lambda: (ctx.redis.ttl("lock:features:t1:u-1"), m.load_features("t1", "u-1")))
     first = m.load_features("t1", "u-1")
     assert rival.fired, "nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing"
     if rival.error is not None:
         raise rival.error
+    lock_ttl, rival_result = rival.result
+    assert 0 < lock_ttl <= 5, f"right after the refresh lock was taken it had TTL {lock_ttl}: a refresher that dies before its next command leaves the lock forever and the user is never refreshed again. Take it with its expiry in the same SET (NX EX 5)"
     assert _calls(ctx) == 1, f"two requests for one cold user made {_calls(ctx)} feature-service calls: the one that finds the lock taken must not refresh too"
-    assert rival.result is None, f"the request that found the lock taken answered {rival.result}: with no stale copy yet it has nothing to give"
+    assert rival_result in (None, {"values": T1, "stale": True}), f"the request that found the lock taken answered {rival_result}: with no stale copy yet it has nothing to give"
     assert first == {"values": T1, "stale": False}, f"the request holding the lock answered {first}"
     assert ctx.redis.exists("lock:features:t1:u-1") == 0, "the lock outlived the refresh: release it once the vector is written"
+    # Once a stale copy exists, the request that finds the lock taken answers it.
+    ctx.clock.advance(301)  # the cached vector expired; the stale copy has not
+    rival = ctx.redis_after("lock:features:t1:u-1", lambda: m.load_features("t1", "u-1"))
+    m.load_features("t1", "u-1")
+    assert rival.fired, "the second refresh of u-1 took no lock:features:t1:u-1"
+    if rival.error is not None:
+        raise rival.error
+    assert _calls(ctx) == 2, f"a cold read racing a refresh made {_calls(ctx) - 1} feature-service calls, expected 1"
+    assert rival.result == {"values": T1, "stale": True}, f"the request that found the lock taken answered {rival.result} while u-1 had a stale copy: answer {{'values': {T1}, 'stale': True}}"
     # A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
     ctx.grpc.fail("UserFeatures", grpc.StatusCode.UNAVAILABLE, "restarting")
     try:
@@ -632,27 +647,35 @@ def check_single_flight(ctx):
 
 
 def check_stale_fallback(ctx):
-    m = _state(ctx)
+    peer = FeatureService()
+    m = _state(ctx, peer)
     m.load_features("t1", "u-1")
     stale_ttl = ctx.redis.ttl("features:stale:t1:u-1")
     assert stale_ttl != -2, "the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to"
     assert stale_ttl > 300, f"features:stale:t1:u-1 has TTL {stale_ttl}: the stale copy must outlive the cached vector (EX 86400)"
+    # The user's behaviour changes: the next refresh must replace the stale copy too.
+    ctx.clock.advance(301)
+    peer.shift = 0.25
+    got = m.load_features("t1", "u-1")
+    assert got == {"values": T1_LATER, "stale": False}, f"301 s later the refresh answered {got}, expected {{'values': {T1_LATER}, 'stale': False}}"
     ctx.clock.advance(301)  # the cached vector expired
-    ctx.grpc.fail("UserFeatures", grpc.StatusCode.UNAVAILABLE, "restarting")
-    try:
-        got = m.load_features("t1", "u-1")
-    except Exception as exc:
-        raise AssertionError(f"with the feature service down load_features raised {type(exc).__name__}: {exc}. Answer the stale copy instead")
-    assert got == {"values": T1, "stale": True}, f"with the feature service down load_features answered {got}, expected the stale copy {{'values': {T1}, 'stale': True}}"
+    for failure, outage in (("UNAVAILABLE", lambda: ctx.grpc.fail("UserFeatures", grpc.StatusCode.UNAVAILABLE, "restarting")), ("past its 300 ms deadline", lambda: ctx.grpc.set_latency("UserFeatures", 1.0))):
+        outage()
+        try:
+            got = m.load_features("t1", "u-1")
+        except Exception as exc:
+            raise AssertionError(f"with the feature service {failure} load_features raised {type(exc).__name__}: {exc}. Answer the stale copy instead")
+        assert got == {"values": T1_LATER, "stale": True}, f"with the feature service {failure} load_features answered {got}, expected the stale copy of the last refresh {{'values': {T1_LATER}, 'stale': True}}"
 `,
     typescript: `const T1 = [0.25, 0.375]; // every user of tenant t1
 const T2 = [0.75, 0.875]; // every user of tenant t2
+const T1_LATER = [0.5, 0.625]; // tenant t1 once its users' behaviour changed
 
-function state(ctx) {
+function state(ctx, peer = {shift: 0}) {
   const pkg = ctx.proto('ranking.proto');
   ctx.grpc.serve(pkg.recsys.FeatureService.service, {
     UserFeatures(call, callback) {
-      const base = call.request.tenant === 't1' ? 0.25 : 0.75;
+      const base = (call.request.tenant === 't1' ? 0.25 : 0.75) + peer.shift;
       callback(null, {values: [base, base + 0.125]});
     },
   });
@@ -690,15 +713,27 @@ export async function check_ttl(ctx) {
 export async function check_single_flight(ctx) {
   const m = state(ctx);
   // A second request for the same cold user lands right after this one took the refresh lock.
-  const rival = ctx.redisAfter('lock:features:t1:u-1', () => m.loadFeatures('t1', 'u-1'));
+  let rival = ctx.redisAfter('lock:features:t1:u-1', () => ({lockTtl: Number(ctx.redis.ttl('lock:features:t1:u-1')), features: m.loadFeatures('t1', 'u-1')}));
   const first = await m.loadFeatures('t1', 'u-1');
   assert(rival.fired, 'nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing');
   if (rival.error !== undefined) throw rival.error;
-  const rivalResult = await rival.result;
+  const {lockTtl, features} = rival.result;
+  const rivalResult = await features;
+  assert(lockTtl > 0 && lockTtl <= 5, \`right after the refresh lock was taken it had TTL \${lockTtl}: a refresher that dies before its next command leaves the lock forever and the user is never refreshed again. Take it with its expiry in the same SET (NX EX 5)\`);
   assert.equal(calls(ctx), 1, \`two requests for one cold user made \${calls(ctx)} feature-service calls: the one that finds the lock taken must not refresh too\`);
-  assert.equal(rivalResult, null, \`the request that found the lock taken answered \${show(rivalResult)}: with no stale copy yet it has nothing to give\`);
+  // The rival reads the stale copy after the lock: none yet, or the one this refresh just wrote.
+  assert(rivalResult === null || show(rivalResult) === show({values: T1, stale: true}), \`the request that found the lock taken answered \${show(rivalResult)}: with no stale copy yet it has nothing to give\`);
   assert.deepStrictEqual(first, {values: T1, stale: false}, \`the request holding the lock answered \${show(first)}\`);
   assert.equal(ctx.redis.exists('lock:features:t1:u-1'), 0, 'the lock outlived the refresh: release it once the vector is written');
+  // Once a stale copy exists, the request that finds the lock taken answers it.
+  ctx.clock.advance(301); // the cached vector expired; the stale copy has not
+  rival = ctx.redisAfter('lock:features:t1:u-1', () => m.loadFeatures('t1', 'u-1'));
+  await m.loadFeatures('t1', 'u-1');
+  assert(rival.fired, 'the second refresh of u-1 took no lock:features:t1:u-1');
+  if (rival.error !== undefined) throw rival.error;
+  const raced = await rival.result;
+  assert.equal(calls(ctx), 2, \`a cold read racing a refresh made \${calls(ctx) - 1} feature-service calls, expected 1\`);
+  assert.deepStrictEqual(raced, {values: T1, stale: true}, \`the request that found the lock taken answered \${show(raced)} while u-1 had a stale copy: answer {values: \${show(T1)}, stale: true}\`);
   // A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
   ctx.grpc.fail('UserFeatures', ctx.grpc.status.UNAVAILABLE, 'restarting');
   await m.loadFeatures('t1', 'u-2').catch(() => null);
@@ -708,20 +743,31 @@ export async function check_single_flight(ctx) {
 }
 
 export async function check_stale_fallback(ctx) {
-  const m = state(ctx);
+  const peer = {shift: 0};
+  const m = state(ctx, peer);
   await m.loadFeatures('t1', 'u-1');
   const staleTtl = Number(ctx.redis.ttl('features:stale:t1:u-1'));
   assert(staleTtl !== -2, 'the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to');
   assert(staleTtl > 300, \`features:stale:t1:u-1 has TTL \${staleTtl}: the stale copy must outlive the cached vector (EX 86400)\`);
+  // The user's behaviour changes: the next refresh must replace the stale copy too.
+  ctx.clock.advance(301);
+  peer.shift = 0.25;
+  let got = await m.loadFeatures('t1', 'u-1');
+  assert.deepStrictEqual(got, {values: T1_LATER, stale: false}, \`301 s later the refresh answered \${show(got)}, expected {values: \${show(T1_LATER)}, stale: false}\`);
   ctx.clock.advance(301); // the cached vector expired
-  ctx.grpc.fail('UserFeatures', ctx.grpc.status.UNAVAILABLE, 'restarting');
-  let got;
-  try {
-    got = await m.loadFeatures('t1', 'u-1');
-  } catch (e) {
-    assert.fail(\`with the feature service down loadFeatures threw \${(e as Error).message}. Answer the stale copy instead\`);
+  const outages: [string, () => void][] = [
+    ['UNAVAILABLE', () => ctx.grpc.fail('UserFeatures', ctx.grpc.status.UNAVAILABLE, 'restarting')],
+    ['past its 300 ms deadline', () => ctx.grpc.setLatency('UserFeatures', 1.0)],
+  ];
+  for (const [failure, outage] of outages) {
+    outage();
+    try {
+      got = await m.loadFeatures('t1', 'u-1');
+    } catch (e) {
+      assert.fail(\`with the feature service \${failure} loadFeatures threw \${(e as Error).message}. Answer the stale copy instead\`);
+    }
+    assert.deepStrictEqual(got, {values: T1_LATER, stale: true}, \`with the feature service \${failure} loadFeatures answered \${show(got)}, expected the stale copy of the last refresh {values: \${show(T1_LATER)}, stale: true}\`);
   }
-  assert.deepStrictEqual(got, {values: T1, stale: true}, \`with the feature service down loadFeatures answered \${show(got)}, expected the stale copy\`);
 }
 `,
     go: `package main
@@ -745,6 +791,9 @@ var (
 	t2      = []float64{0.75, 0.875} // every user of tenant t2
 )
 
+// featureShift moves every vector, as a change in the users' behaviour would.
+var featureShift float64
+
 type featurePeer struct {
 	pb.UnimplementedFeatureServiceServer
 }
@@ -754,10 +803,12 @@ func (featurePeer) UserFeatures(_ context.Context, req *pb.FeaturesRequest) (*pb
 	if req.GetTenant() == "t1" {
 		base = 0.25
 	}
+	base += featureShift
 	return &pb.FeatureVector{Values: []float64{base, base + 0.125}}, nil
 }
 
 func serveFeatures(ctx *harness.Ctx) {
+	featureShift = 0
 	pb.RegisterFeatureServiceServer(ctx.GRPC.Server(""), featurePeer{})
 }
 
@@ -808,18 +859,36 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Equal(featureCalls(ctx), 2, "301 s after the refresh the vector must have expired and been refreshed; the feature-service calls")
 }
 
+type rivalRead struct {
+	lockTTL  int64
+	features *types.Features
+}
+
 func CheckSingleFlight(ctx *harness.Ctx) {
 	serveFeatures(ctx)
 	// A second request for the same cold user lands right after this one took the refresh lock.
-	rival := ctx.Redis.After("lock:features:t1:u-1", func() any { return loadFeatures(stateBg, "t1", "u-1") })
+	rival := ctx.Redis.After("lock:features:t1:u-1", func() any {
+		return rivalRead{ctx.Redis.TTL("lock:features:t1:u-1"), loadFeatures(stateBg, "t1", "u-1")}
+	})
 	first := loadFeatures(stateBg, "t1", "u-1")
 	ctx.Assert(rival.Fired, "nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing")
 	ctx.Assert(rival.Err == nil, "the concurrent request failed: %v", rival.Err)
+	read, _ := rival.Result.(rivalRead)
+	ctx.Assert(read.lockTTL > 0 && read.lockTTL <= 5, "right after the refresh lock was taken it had TTL %d: a refresher that dies before its next command leaves the lock forever and the user is never refreshed again. Take it with its expiry in the same SET (NX EX 5)", read.lockTTL)
 	ctx.Equal(featureCalls(ctx), 1, "two requests for one cold user: the one that finds the lock taken must not refresh too; the feature-service calls")
-	rivalFeatures, _ := rival.Result.(*types.Features)
-	ctx.Assert(rivalFeatures == nil, "the request that found the lock taken answered %s: with no stale copy yet it has nothing to give", show(rivalFeatures))
+	// The rival reads the stale copy after the lock: none yet, or the one this refresh just wrote.
+	ctx.Assert(read.features == nil || sameValues(read.features, t1, true), "the request that found the lock taken answered %s: with no stale copy yet it has nothing to give", show(read.features))
 	ctx.Assert(sameValues(first, t1, false), "the request holding the lock answered %s", show(first))
 	ctx.Equal(ctx.Redis.Exists("lock:features:t1:u-1"), int64(0), "the lock outlived the refresh: release it once the vector is written; the lock keys")
+	// Once a stale copy exists, the request that finds the lock taken answers it.
+	ctx.Clock.Advance(301) // the cached vector expired; the stale copy has not
+	rival = ctx.Redis.After("lock:features:t1:u-1", func() any { return loadFeatures(stateBg, "t1", "u-1") })
+	loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(rival.Fired, "the second refresh of u-1 took no lock:features:t1:u-1")
+	ctx.Assert(rival.Err == nil, "the concurrent request failed: %v", rival.Err)
+	ctx.Equal(featureCalls(ctx), 2, "a cold read racing a refresh must make one feature-service call; the calls so far")
+	raced, _ := rival.Result.(*types.Features)
+	ctx.Assert(sameValues(raced, t1, true), "the request that found the lock taken answered %s while u-1 had a stale copy: answer {values %v, stale true}", show(raced), t1)
 	// A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
 	ctx.GRPC.Fail("UserFeatures", codes.Unavailable, "restarting", 1, "")
 	loadFeatures(stateBg, "t1", "u-2")
@@ -834,10 +903,19 @@ func CheckStaleFallback(ctx *harness.Ctx) {
 	staleTTL := ctx.Redis.TTL("features:stale:t1:u-1")
 	ctx.Assert(staleTTL != -2, "the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to")
 	ctx.Assert(staleTTL > 300, "features:stale:t1:u-1 has TTL %d: the stale copy must outlive the cached vector (EX 86400)", staleTTL)
+	// The user's behaviour changes: the next refresh must replace the stale copy too.
+	ctx.Clock.Advance(301)
+	featureShift = 0.25
+	later := []float64{0.5, 0.625}
+	got := loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(sameValues(got, later, false), "301 s later the refresh answered %s, expected {values %v, stale false}", show(got), later)
 	ctx.Clock.Advance(301) // the cached vector expired
 	ctx.GRPC.Fail("UserFeatures", codes.Unavailable, "restarting", 1, "")
-	got := loadFeatures(stateBg, "t1", "u-1")
-	ctx.Assert(sameValues(got, t1, true), "with the feature service down loadFeatures answered %s, expected the stale copy {values %v, stale true}", show(got), t1)
+	got = loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(sameValues(got, later, true), "with the feature service UNAVAILABLE loadFeatures answered %s, expected the stale copy of the last refresh {values %v, stale true}", show(got), later)
+	ctx.GRPC.SetLatency("UserFeatures", 1.0, "")
+	got = loadFeatures(stateBg, "t1", "u-1")
+	ctx.Assert(sameValues(got, later, true), "with the feature service past its 300 ms deadline loadFeatures answered %s, expected the stale copy of the last refresh {values %v, stale true}", show(got), later)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -853,10 +931,13 @@ namespace {
 const std::vector<double> kT1{0.25, 0.375};  // every user of tenant t1
 const std::vector<double> kT2{0.75, 0.875};  // every user of tenant t2
 
+// featureShift moves every vector, as a change in the users' behaviour would.
+double featureShift = 0;
+
 class FeaturePeer final : public recsys::FeatureService::Service {
  public:
   grpc::Status UserFeatures(grpc::ServerContext*, const recsys::FeaturesRequest* req, recsys::FeatureVector* out) override {
-    const double base = req->tenant() == "t1" ? 0.25 : 0.75;
+    const double base = (req->tenant() == "t1" ? 0.25 : 0.75) + featureShift;
     out->add_values(base);
     out->add_values(base + 0.125);
     return grpc::Status::OK;
@@ -867,6 +948,7 @@ void serveFeatures(harness::Ctx& ctx) {
   static FeaturePeer* peer = nullptr;
   delete peer;
   peer = new FeaturePeer;
+  featureShift = 0;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
@@ -923,10 +1005,12 @@ void CheckSingleFlight(harness::Ctx& ctx) {
   serveFeatures(ctx);
   // A second request for the same cold user lands right after this one took the refresh lock.
   auto fired = std::make_shared<bool>(false);
+  auto lockTtl = std::make_shared<long long>(0);
   auto seen = std::make_shared<std::optional<recs::Features>>();
   auto err = std::make_shared<std::string>();
-  ctx.Redis.After("lock:features:t1:u-1", [fired, seen, err] {
+  ctx.Redis.After("lock:features:t1:u-1", [&ctx, fired, lockTtl, seen, err] {
     *fired = true;
+    *lockTtl = ctx.Redis.TTL("lock:features:t1:u-1");
     try {
       *seen = loadFeatures("t1", "u-1");
     } catch (const std::exception& e) {
@@ -936,10 +1020,29 @@ void CheckSingleFlight(harness::Ctx& ctx) {
   const auto first = loadFeatures("t1", "u-1");
   ctx.Assert(*fired, "nothing took lock:features:t1:u-1: every request that misses calls the feature service. Take SET lock:features:{tenant}:{user_id} 1 NX EX 5 before refreshing");
   ctx.Assert(err->empty(), "the concurrent request failed: %s", *err);
+  ctx.Assert(*lockTtl > 0 && *lockTtl <= 5, "right after the refresh lock was taken it had TTL %d: a refresher that dies before its next command leaves the lock forever and the user is never refreshed again. Take it with its expiry in the same SET (NX EX 5)", *lockTtl);
   ctx.Equal(featureCalls(ctx), 1, "two requests for one cold user: the one that finds the lock taken must not refresh too; the feature-service calls");
-  ctx.Assert(!seen->has_value(), "the request that found the lock taken answered %s: with no stale copy yet it has nothing to give", show(*seen));
+  // The rival reads the stale copy after the lock: none yet, or the one this refresh just wrote.
+  ctx.Assert(!seen->has_value() || same(*seen, kT1, true), "the request that found the lock taken answered %s: with no stale copy yet it has nothing to give", show(*seen));
   ctx.Assert(same(first, kT1, false), "the request holding the lock answered %s", show(first));
   ctx.Equal(ctx.Redis.Exists("lock:features:t1:u-1"), 0, "the lock outlived the refresh: release it once the vector is written; the lock keys");
+  // Once a stale copy exists, the request that finds the lock taken answers it.
+  ctx.Clock.Advance(301);  // the cached vector expired; the stale copy has not
+  *fired = false;
+  seen->reset();
+  ctx.Redis.After("lock:features:t1:u-1", [fired, seen, err] {
+    *fired = true;
+    try {
+      *seen = loadFeatures("t1", "u-1");
+    } catch (const std::exception& e) {
+      *err = e.what();
+    }
+  });
+  loadFeatures("t1", "u-1");
+  ctx.Assert(*fired, "the second refresh of u-1 took no lock:features:t1:u-1");
+  ctx.Assert(err->empty(), "the concurrent request failed: %s", *err);
+  ctx.Equal(featureCalls(ctx), 2, "a cold read racing a refresh must make one feature-service call; the calls so far");
+  ctx.Assert(same(*seen, kT1, true), "the request that found the lock taken answered %s while u-1 had a stale copy: answer {values [0.25 0.375], stale true}", show(*seen));
   // A refresh that fails releases the lock, so the next request refreshes instead of waiting out its TTL.
   ctx.GRPC.Fail("UserFeatures", grpc::StatusCode::UNAVAILABLE, "restarting");
   loadFeatures("t1", "u-2");
@@ -954,10 +1057,19 @@ void CheckStaleFallback(harness::Ctx& ctx) {
   const long long staleTtl = ctx.Redis.TTL("features:stale:t1:u-1");
   ctx.Assert(staleTtl != -2, "the refresh kept no copy at features:stale:t1:u-1: when the feature service is down there is nothing to fall back to");
   ctx.Assert(staleTtl > 300, "features:stale:t1:u-1 has TTL %d: the stale copy must outlive the cached vector (EX 86400)", staleTtl);
+  // The user's behaviour changes: the next refresh must replace the stale copy too.
+  ctx.Clock.Advance(301);
+  featureShift = 0.25;
+  const std::vector<double> later{0.5, 0.625};
+  auto got = loadFeatures("t1", "u-1");
+  ctx.Assert(same(got, later, false), "301 s later the refresh answered %s, expected {values [0.5 0.625], stale false}", show(got));
   ctx.Clock.Advance(301);  // the cached vector expired
   ctx.GRPC.Fail("UserFeatures", grpc::StatusCode::UNAVAILABLE, "restarting");
-  const auto got = loadFeatures("t1", "u-1");
-  ctx.Assert(same(got, kT1, true), "with the feature service down loadFeatures answered %s, expected the stale copy {values [0.25 0.375], stale true}", show(got));
+  got = loadFeatures("t1", "u-1");
+  ctx.Assert(same(got, later, true), "with the feature service UNAVAILABLE loadFeatures answered %s, expected the stale copy of the last refresh {values [0.5 0.625], stale true}", show(got));
+  ctx.GRPC.SetLatency("UserFeatures", 1.0);
+  got = loadFeatures("t1", "u-1");
+  ctx.Assert(same(got, later, true), "with the feature service past its 300 ms deadline loadFeatures answered %s, expected the stale copy of the last refresh {values [0.5 0.625], stale true}", show(got));
 }
 `,
   },

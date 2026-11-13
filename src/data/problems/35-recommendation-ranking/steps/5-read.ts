@@ -19,11 +19,12 @@ its own version with \`?model_version=\`; a config that names a version nobody p
 if it shipped; and the per-process copy keeps serving the old version after a rollback until the
 process restarts.
 
-- \`model_version\` comes from the surface's config; a query parameter does not change it.
+- \`model_version\` comes from the surface's config; a query parameter does not change it, whatever
+  version it names.
 - A config whose version was never promoted (\`store.is_promoted(surface, version)\` is false) is
   **404**.
-- Keep a surface's config for at most \`CONFIG_TTL_S\` = **5 s**, measured on the clock, then read it
-  again.`,
+- Keep what a surface's read found, a config or nothing, for at most \`CONFIG_TTL_S\` = **5 s** from
+  when it was read, measured on the clock, then read it again.`,
   sequence: {
     participants: ['Client', 'Recommendation API', 'Redis'],
     messages: [
@@ -44,7 +45,7 @@ process restarts.
       id: 'route',
       title: 'Serves GET /v1/surfaces/{surface}/config',
       detail:
-        'Register `GET /v1/surfaces/{surface}/config`, answering the surface config and 404 for an unknown surface.',
+        'Register `GET /v1/surfaces/{surface}/config`, answering the surface config and 404 for an unknown surface; a surface created later is served once the 404 is 5 s old.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/surfaces\/\{surface\}\/config["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/surfaces\/:surface\/config['"]/]},
@@ -57,7 +58,7 @@ process restarts.
       id: 'no-query-version',
       title: 'Serves the configured version, whatever the query says',
       detail:
-        "`model_version` comes from the surface's config; the starter lets `?model_version=` override it, so any caller can serve any version to the users behind it.",
+        "`model_version` comes from the surface's config, whatever version `?model_version=` names, a version the surface ran before included; the starter lets the query override it, so any caller can serve any version to the users behind it.",
       match: {
         python: {all: [/\["model_version"\]/], none: [/query_params/]},
         typescript: {all: [/model_version:\s*config\.model_version/], none: [/request\.query/]},
@@ -70,7 +71,7 @@ process restarts.
       id: 'promoted-only',
       title: 'A version that was never promoted is 404',
       detail:
-        'The configured version is checked against the promotion record (`is_promoted`/`isPromoted`); a config naming a version that was never promoted answers **404** instead of sending readers to a model nobody shipped.',
+        'The configured version is checked against the promotion record (`is_promoted`/`isPromoted`) on every read of the config; a config naming a version that was never promoted answers **404**, even after an earlier config was served, instead of sending readers to a model nobody shipped.',
       match: {
         python: {all: [/store\.is_promoted\(/, /\b404\b/]},
         typescript: {all: [/isPromoted\(/, /code\(\s*404\s*\)/]},
@@ -83,7 +84,7 @@ process restarts.
       id: 'live-config',
       title: 'Caches the config for at most 5 seconds',
       detail:
-        'A cached config is used for at most `CONFIG_TTL_S` (5 s) on the clock, then read again, so a rollback reaches every reader within seconds; the starter keeps the first copy for the life of the process.',
+        'A cached config is used for at most `CONFIG_TTL_S` (5 s) from when it was read, however often it is used, then read again, so a rollback reaches every reader within seconds; the starter keeps the first copy for the life of the process.',
       match: {
         python: {all: [/CONFIG_TTL_S\s*=\s*5\b/, /time\.(monotonic|time)\(\)/]},
         typescript: {all: [/CONFIG_TTL_MS\s*=\s*5000\b/, /Date\.now\(\)|performance\.now\(\)/]},
@@ -420,28 +421,36 @@ object Read {
 #include <nlohmann/json.hpp>
 
 #include <map>
+#include <mutex>
+#include <optional>
 #include <string>
 
 #include "recs/store.h"  // store::surfaceConfig(surface), store::isPromoted(surface, model_version)
 
 using json = nlohmann::json;
 
+std::mutex configsMu;  // httplib serves requests on several threads
 std::map<std::string, store::Config> configs;  // surface -> its config, read once per process
 
 void get_surface_config(const httplib::Request& req, httplib::Response& res) {
   // TODO: this starter has three flaws. The task says where to look; the checks say what must change.
   const std::string surface = req.matches[1];
-  auto it = configs.find(surface);
-  if (it == configs.end()) {
-    const auto loaded = store::surfaceConfig(surface);
-    if (!loaded) {
+  std::optional<store::Config> cached;
+  {
+    const std::lock_guard<std::mutex> guard(configsMu);
+    if (const auto it = configs.find(surface); it != configs.end()) cached = it->second;
+  }
+  if (!cached) {
+    cached = store::surfaceConfig(surface);
+    if (!cached) {
       res.status = 404;
       res.set_content("unknown surface", "text/plain");
       return;
     }
-    it = configs.emplace(surface, *loaded).first;
+    const std::lock_guard<std::mutex> guard(configsMu);
+    configs.emplace(surface, *cached);
   }
-  const store::Config& config = it->second;
+  const store::Config& config = *cached;
   const std::string version = req.has_param("model_version") ? req.get_param_value("model_version") : config.model_version;
   res.set_content(json{{"surface", surface}, {"model_version", version}, {"fallback_policy", config.fallback_policy}}.dump(), "application/json");
 }
@@ -453,6 +462,7 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/surfaces/([\\w-]+)/c
 
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -467,15 +477,22 @@ struct CachedConfig {
   store::Config config;
 };
 
+std::mutex configsMu;  // httplib serves requests on several threads
 std::map<std::string, CachedConfig> configs;  // surface -> when it was read, its config
 
 // The surface's config, at most kConfigTtl old: a rollback reaches every reader within seconds.
 std::optional<store::Config> activeConfig(const std::string& surface) {
   const auto now = std::chrono::steady_clock::now();
-  const auto it = configs.find(surface);
-  if (it != configs.end() && now - it->second.at < kConfigTtl) return it->second.config;
-  const auto config = store::surfaceConfig(surface);
-  if (config) configs[surface] = CachedConfig{now, *config};
+  {
+    const std::lock_guard<std::mutex> guard(configsMu);
+    const auto it = configs.find(surface);
+    if (it != configs.end() && now - it->second.at < kConfigTtl) return it->second.config;
+  }
+  const auto config = store::surfaceConfig(surface);  // read outside the lock: Redis is a round trip
+  if (config) {
+    const std::lock_guard<std::mutex> guard(configsMu);
+    configs[surface] = CachedConfig{now, *config};
+  }
   return config;
 }
 
@@ -516,25 +533,35 @@ async def check_route(ctx):
     store.promote("home", "ranker-v7")
     async with _api(ctx) as c:
         r = await _config(c)
-        unknown = await _config(c, "nowhere")
-    assert r.status_code == 200, f"GET /v1/surfaces/home/config answered {r.status_code}: {r.text}"
-    assert r.json() == {"surface": "home", "model_version": "ranker-v7", "fallback_policy": "popularity"}, f"the home config is {r.json()}, expected ranker-v7 with the popularity fallback"
-    assert unknown.status_code == 404, f"an unknown surface answered {unknown.status_code}, expected 404"
+        unknown = await _config(c, "search")
+        assert r.status_code == 200, f"GET /v1/surfaces/home/config answered {r.status_code}: {r.text}"
+        assert r.json() == {"surface": "home", "model_version": "ranker-v7", "fallback_policy": "popularity"}, f"the home config is {r.json()}, expected ranker-v7 with the popularity fallback"
+        assert unknown.status_code == 404, f"an unknown surface answered {unknown.status_code}, expected 404"
+        store.promote("search", "ranker-v7")  # the surface launches
+        ctx.clock.advance(6)
+        launched = await _config(c, "search")
+    assert launched.status_code == 200, f"6 s after the search surface was created its config answered {launched.status_code} {launched.text}: an unknown surface was remembered as unknown. Keep a surface's answer at most CONFIG_TTL_S = 5 s, missing ones too"
 
 
 async def check_no_query_version(ctx):
     store.promote("home", "ranker-v7")
+    store.promote("home", "ranker-v8")  # the rollout: ranker-v7 was promoted once, and is no longer active
     async with _api(ctx) as c:
         r = await _config(c, model_version="ranker-v9")
-    assert r.status_code == 200 and r.json().get("model_version") == "ranker-v7", f"GET /v1/surfaces/home/config?model_version=ranker-v9 answered {r.status_code} {r.text}: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v7"
+        assert r.status_code == 200 and r.json().get("model_version") == "ranker-v8", f"GET /v1/surfaces/home/config?model_version=ranker-v9 answered {r.status_code} {r.text}: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8"
+        r = await _config(c, model_version="ranker-v7")
+    assert r.status_code == 200 and r.json().get("model_version") == "ranker-v8", f"after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered {r.status_code} {r.text}: a caller pinned a version the surface has moved off. Serve the configured ranker-v8"
 
 
 async def check_promoted_only(ctx):
     store.promote("home", "ranker-v7")
-    ctx.redis.hset("surface:home", "model_version", "ranker-v9")  # edited by hand, never promoted
     async with _api(ctx) as c:
         r = await _config(c)
-        assert r.status_code == 404, f"the config names ranker-v9, which was never promoted, and the read answered {r.status_code} {r.text}: expected 404"
+        assert r.status_code == 200 and r.json().get("model_version") == "ranker-v7", f"the home config is {r.status_code} {r.text}, expected ranker-v7"
+        ctx.redis.hset("surface:home", "model_version", "ranker-v9")  # edited by hand, never promoted
+        ctx.clock.advance(6)
+        r = await _config(c)
+        assert r.status_code == 404, f"the config names ranker-v9, which was never promoted, and the read answered {r.status_code} {r.text}: expected 404, not the version it last served"
         store.promote("home", "ranker-v8")
         ctx.clock.advance(6)
         r = await _config(c)
@@ -547,10 +574,12 @@ async def check_live_config(ctx):
     async with _api(ctx) as c:
         first = await _config(c)
         assert first.status_code == 200 and first.json().get("model_version") == "ranker-v8", f"the home config is {first.status_code} {first.text}, expected ranker-v8"
+        ctx.clock.advance(4)
+        await _config(c)  # a read inside the window: the copy is 4 s old
         store.promote("home", "ranker-v7")  # the rollback
-        ctx.clock.advance(6)
+        ctx.clock.advance(4)
         after = await _config(c)
-    assert after.json().get("model_version") == "ranker-v7", f"6 s after the rollback to ranker-v7 the read still answers {after.json().get('model_version')}: a config kept for the life of the process turns a rollback into a deploy. Keep it at most CONFIG_TTL_S = 5 s"
+    assert after.json().get("model_version") == "ranker-v7", f"8 s after the config was read, and 4 s after the rollback to ranker-v7, the read still answers {after.json().get('model_version')}: the copy must be read again once it is CONFIG_TTL_S = 5 s old, however often it is used"
 `,
     typescript: `function api(ctx) {
   const m = ctx.load('read');
@@ -565,23 +594,33 @@ export async function check_route(ctx) {
   const r = await config(c);
   assert.equal(r.status, 200, \`GET /v1/surfaces/home/config answered \${r.status}: \${r.text}\`);
   assert.deepStrictEqual(r.json(), {surface: 'home', model_version: 'ranker-v7', fallback_policy: 'popularity'}, \`the home config is \${r.text}, expected ranker-v7 with the popularity fallback\`);
-  const unknown = await config(c, 'nowhere');
+  const unknown = await config(c, 'search');
   assert.equal(unknown.status, 404, \`an unknown surface answered \${unknown.status}, expected 404\`);
+  await store.promote('search', 'ranker-v7'); // the surface launches
+  ctx.clock.advance(6);
+  const launched = await config(c, 'search');
+  assert.equal(launched.status, 200, \`6 s after the search surface was created its config answered \${launched.status} \${launched.text}: an unknown surface was remembered as unknown. Keep a surface's answer at most CONFIG_TTL_MS = 5000, missing ones too\`);
 }
 
 export async function check_no_query_version(ctx) {
   const {c, store} = api(ctx);
   await store.promote('home', 'ranker-v7');
-  const r = await config(c, 'home', {model_version: 'ranker-v9'});
-  assert(r.status === 200 && r.json().model_version === 'ranker-v7', \`GET /v1/surfaces/home/config?model_version=ranker-v9 answered \${r.status} \${r.text}: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v7\`);
+  await store.promote('home', 'ranker-v8'); // the rollout: ranker-v7 was promoted once, and is no longer active
+  let r = await config(c, 'home', {model_version: 'ranker-v9'});
+  assert(r.status === 200 && r.json().model_version === 'ranker-v8', \`GET /v1/surfaces/home/config?model_version=ranker-v9 answered \${r.status} \${r.text}: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8\`);
+  r = await config(c, 'home', {model_version: 'ranker-v7'});
+  assert(r.status === 200 && r.json().model_version === 'ranker-v8', \`after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered \${r.status} \${r.text}: a caller pinned a version the surface has moved off. Serve the configured ranker-v8\`);
 }
 
 export async function check_promoted_only(ctx) {
   const {c, store} = api(ctx);
   await store.promote('home', 'ranker-v7');
-  ctx.redis.hset('surface:home', 'model_version', 'ranker-v9'); // edited by hand, never promoted
   let r = await config(c);
-  assert.equal(r.status, 404, \`the config names ranker-v9, which was never promoted, and the read answered \${r.status} \${r.text}: expected 404\`);
+  assert(r.status === 200 && r.json().model_version === 'ranker-v7', \`the home config is \${r.status} \${r.text}, expected ranker-v7\`);
+  ctx.redis.hset('surface:home', 'model_version', 'ranker-v9'); // edited by hand, never promoted
+  ctx.clock.advance(6);
+  r = await config(c);
+  assert.equal(r.status, 404, \`the config names ranker-v9, which was never promoted, and the read answered \${r.status} \${r.text}: expected 404, not the version it last served\`);
   await store.promote('home', 'ranker-v8');
   ctx.clock.advance(6);
   r = await config(c);
@@ -594,10 +633,12 @@ export async function check_live_config(ctx) {
   await store.promote('home', 'ranker-v8');
   const first = await config(c);
   assert(first.status === 200 && first.json().model_version === 'ranker-v8', \`the home config is \${first.status} \${first.text}, expected ranker-v8\`);
+  ctx.clock.advance(4);
+  await config(c); // a read inside the window: the copy is 4 s old
   await store.promote('home', 'ranker-v7'); // the rollback
-  ctx.clock.advance(6);
+  ctx.clock.advance(4);
   const after = await config(c);
-  assert.equal(after.json().model_version, 'ranker-v7', \`6 s after the rollback to ranker-v7 the read still answers \${after.json().model_version}: a config kept for the life of the process turns a rollback into a deploy. Keep it at most CONFIG_TTL_MS = 5000\`);
+  assert.equal(after.json().model_version, 'ranker-v7', \`8 s after the config was read, and 4 s after the rollback to ranker-v7, the read still answers \${after.json().model_version}: the copy must be read again once it is CONFIG_TTL_MS = 5000 old, however often it is used\`);
 }
 `,
     go: `package main
@@ -619,8 +660,8 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func promote(ctx *harness.Ctx, version string) {
-	ctx.NoError(store.Promote(readBg, "home", version, "popularity"), "promote %s", version)
+func promote(ctx *harness.Ctx, surface, version string) {
+	ctx.NoError(store.Promote(readBg, surface, version, "popularity"), "promote %s on %s", version, surface)
 }
 
 func versionOf(r *harness.Response) string {
@@ -632,44 +673,57 @@ func versionOf(r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	promote(ctx, "ranker-v7")
+	promote(ctx, "home", "ranker-v7")
 	c := api(ctx)
 	r := c.Get("/v1/surfaces/home/config")
 	ctx.Equal(r.Status, 200, "GET /v1/surfaces/home/config (%s)", r.Text())
 	var body map[string]string
 	r.Decode(&body)
 	ctx.Equal(body, map[string]string{"surface": "home", "model_version": "ranker-v7", "fallback_policy": "popularity"}, "the home config")
-	ctx.Equal(c.Get("/v1/surfaces/nowhere/config").Status, 404, "an unknown surface")
+	ctx.Equal(c.Get("/v1/surfaces/search/config").Status, 404, "an unknown surface")
+	promote(ctx, "search", "ranker-v7") // the surface launches
+	ctx.Clock.Advance(6)
+	launched := c.Get("/v1/surfaces/search/config")
+	ctx.Assert(launched.Status == 200, "6 s after the search surface was created its config answered %d %s: an unknown surface was remembered as unknown. Keep a surface's answer at most configTTL = 5 s, missing ones too", launched.Status, launched.Text())
 }
 
 func CheckNoQueryVersion(ctx *harness.Ctx) {
-	promote(ctx, "ranker-v7")
-	r := api(ctx).Get("/v1/surfaces/home/config?model_version=ranker-v9")
-	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v7", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v7", r.Status, r.Text())
+	promote(ctx, "home", "ranker-v7")
+	promote(ctx, "home", "ranker-v8") // the rollout: ranker-v7 was promoted once, and is no longer active
+	c := api(ctx)
+	r := c.Get("/v1/surfaces/home/config?model_version=ranker-v9")
+	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8", r.Status, r.Text())
+	r = c.Get("/v1/surfaces/home/config?model_version=ranker-v7")
+	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered %d %s: a caller pinned a version the surface has moved off. Serve the configured ranker-v8", r.Status, r.Text())
 }
 
 func CheckPromotedOnly(ctx *harness.Ctx) {
-	promote(ctx, "ranker-v7")
-	ctx.Redis.Do("HSET", "surface:home", "model_version", "ranker-v9") // edited by hand, never promoted
+	promote(ctx, "home", "ranker-v7")
 	c := api(ctx)
 	r := c.Get("/v1/surfaces/home/config")
-	ctx.Equal(r.Status, 404, "the config names ranker-v9, which was never promoted (%s)", r.Text())
-	promote(ctx, "ranker-v8")
+	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v7", "the home config is %d %s, expected ranker-v7", r.Status, r.Text())
+	ctx.Redis.Do("HSET", "surface:home", "model_version", "ranker-v9") // edited by hand, never promoted
+	ctx.Clock.Advance(6)
+	r = c.Get("/v1/surfaces/home/config")
+	ctx.Equal(r.Status, 404, "the config names ranker-v9, which was never promoted: expected 404, not the version it last served (%s)", r.Text())
+	promote(ctx, "home", "ranker-v8")
 	ctx.Clock.Advance(6)
 	r = c.Get("/v1/surfaces/home/config")
 	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after ranker-v8 was promoted the read answered %d %s", r.Status, r.Text())
 }
 
 func CheckLiveConfig(ctx *harness.Ctx) {
-	promote(ctx, "ranker-v7")
-	promote(ctx, "ranker-v8")
+	promote(ctx, "home", "ranker-v7")
+	promote(ctx, "home", "ranker-v8")
 	c := api(ctx)
 	first := c.Get("/v1/surfaces/home/config")
 	ctx.Assert(first.Status == 200 && versionOf(first) == "ranker-v8", "the home config is %d %s, expected ranker-v8", first.Status, first.Text())
-	promote(ctx, "ranker-v7") // the rollback
-	ctx.Clock.Advance(6)
+	ctx.Clock.Advance(4)
+	c.Get("/v1/surfaces/home/config") // a read inside the window: the copy is 4 s old
+	promote(ctx, "home", "ranker-v7") // the rollback
+	ctx.Clock.Advance(4)
 	after := c.Get("/v1/surfaces/home/config")
-	ctx.Equal(versionOf(after), "ranker-v7", "6 s after the rollback a config kept for the life of the process turns a rollback into a deploy (keep it at most configTTL = 5 s); the version served")
+	ctx.Equal(versionOf(after), "ranker-v7", "8 s after the config was read, and 4 s after the rollback, the copy must have been read again once it was configTTL = 5 s old, however often it was used; the version served")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -702,22 +756,32 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 200, "GET /v1/surfaces/home/config (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body == nlohmann::json{{"surface", "home"}, {"model_version", "ranker-v7"}, {"fallback_policy", "popularity"}}, "the home config is %s, expected ranker-v7 with the popularity fallback", r.Text());
-  ctx.Equal(c.Get("/v1/surfaces/nowhere/config").Status, 404, "an unknown surface");
+  ctx.Equal(c.Get("/v1/surfaces/search/config").Status, 404, "an unknown surface");
+  store::promote("search", "ranker-v7");  // the surface launches
+  ctx.Clock.Advance(6);
+  const auto launched = c.Get("/v1/surfaces/search/config");
+  ctx.Assert(launched.Status == 200, "6 s after the search surface was created its config answered %d %s: an unknown surface was remembered as unknown. Keep a surface's answer at most kConfigTtl = 5 s, missing ones too", launched.Status, launched.Text());
 }
 
 void CheckNoQueryVersion(harness::Ctx& ctx) {
   store::promote("home", "ranker-v7");
+  store::promote("home", "ranker-v8");  // the rollout: ranker-v7 was promoted once, and is no longer active
   auto c = api(ctx);
-  const auto r = c.Get("/v1/surfaces/home/config?model_version=ranker-v9");
-  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v7", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v7", r.Status, r.Text());
+  auto r = c.Get("/v1/surfaces/home/config?model_version=ranker-v9");
+  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8", r.Status, r.Text());
+  r = c.Get("/v1/surfaces/home/config?model_version=ranker-v7");
+  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered %d %s: a caller pinned a version the surface has moved off. Serve the configured ranker-v8", r.Status, r.Text());
 }
 
 void CheckPromotedOnly(harness::Ctx& ctx) {
   store::promote("home", "ranker-v7");
-  ctx.Redis.Do("HSET", "surface:home", "model_version", "ranker-v9");  // edited by hand, never promoted
   auto c = api(ctx);
   auto r = c.Get("/v1/surfaces/home/config");
-  ctx.Equal(r.Status, 404, "the config names ranker-v9, which was never promoted (%s)", r.Text());
+  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v7", "the home config is %d %s, expected ranker-v7", r.Status, r.Text());
+  ctx.Redis.Do("HSET", "surface:home", "model_version", "ranker-v9");  // edited by hand, never promoted
+  ctx.Clock.Advance(6);
+  r = c.Get("/v1/surfaces/home/config");
+  ctx.Equal(r.Status, 404, "the config names ranker-v9, which was never promoted: expected 404, not the version it last served (%s)", r.Text());
   store::promote("home", "ranker-v8");
   ctx.Clock.Advance(6);
   r = c.Get("/v1/surfaces/home/config");
@@ -730,10 +794,12 @@ void CheckLiveConfig(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto first = c.Get("/v1/surfaces/home/config");
   ctx.Assert(first.Status == 200 && versionOf(first) == "ranker-v8", "the home config is %d %s, expected ranker-v8", first.Status, first.Text());
+  ctx.Clock.Advance(4);
+  c.Get("/v1/surfaces/home/config");  // a read inside the window: the copy is 4 s old
   store::promote("home", "ranker-v7");  // the rollback
-  ctx.Clock.Advance(6);
+  ctx.Clock.Advance(4);
   const auto after = c.Get("/v1/surfaces/home/config");
-  ctx.Equal(versionOf(after), "ranker-v7", "6 s after the rollback a config kept for the life of the process turns a rollback into a deploy (keep it at most kConfigTtl = 5 s); the version served");
+  ctx.Equal(versionOf(after), "ranker-v7", "8 s after the config was read, and 4 s after the rollback, the copy must have been read again once it was kConfigTtl = 5 s old, however often it was used; the version served");
 }
 `,
   },

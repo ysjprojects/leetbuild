@@ -25,7 +25,7 @@ service Classifier { rpc Classify(ClassifyRequest) returns (Verdict); }
 request is sent three times; an ordinary post scoring 0.6 is removed; a confident score with
 nothing to back it is removed; and an outage lets reported content through untouched.
 
-- Every call carries a **\`DEADLINE_S\` = 0.4 s** deadline.
+- Every call carries its own **\`DEADLINE_S\` = 0.4 s** deadline, a retry included.
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, **\`MAX_ATTEMPTS\` = 2** calls in all.
 - \`auto_remove\` needs a confidence of at least **0.98** and one of \`CORROBORATING_SIGNALS\`
   (\`hash_match\`, \`trusted_flagger\`) in \`signals\`.
@@ -61,7 +61,7 @@ nothing to back it is removed; and an outage lets reported content through untou
       id: 'deadline',
       title: 'Calls the classifier under a 400 ms deadline',
       detail:
-        'Every `Classify` carries `DEADLINE_S` (0.4 s); the starter sets none, so a stalled classifier holds the report for as long as it stalls.',
+        'Every `Classify`, a retry after a slow failure included, carries its own `DEADLINE_S` (0.4 s); the starter sets none, so a stalled classifier holds the report for as long as it stalls.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.4\b/, /Classify\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /Classify\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -74,7 +74,7 @@ nothing to back it is removed; and an outage lets reported content through untou
       id: 'retry-policy',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED, twice in all',
       detail:
-        'A transient code (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) is retried up to `MAX_ATTEMPTS` = 2 calls; any other code is final. The starter retries every failure three times, so a request the classifier rejects is sent again unchanged.',
+        'A transient code (`UNAVAILABLE`, `DEADLINE_EXCEEDED`) is retried up to `MAX_ATTEMPTS` = 2 calls; any other code (`INVALID_ARGUMENT`, `PERMISSION_DENIED`) is final and the case is queued for people. The starter retries every failure three times, so a request the classifier rejects is sent again unchanged.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*2\b/], none: [/\n\s*continue\b/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*2\b/], none: [/\bcontinue;/]},
@@ -90,7 +90,7 @@ nothing to back it is removed; and an outage lets reported content through untou
       id: 'auto-threshold',
       title: 'Requires 0.98 confidence to act alone',
       detail:
-        'An automatic removal needs a confidence of at least `AUTO_REMOVE_CONFIDENCE` = 0.98; the starter acts at 0.6, inside the classifier’s noise, so ordinary posts are removed.',
+        'An automatic removal needs a confidence of at least `AUTO_REMOVE_CONFIDENCE` = 0.98 (exactly 0.98 acts); the starter acts at 0.6, inside the classifier’s noise, so ordinary posts are removed.',
       match: {
         python: {all: [/AUTO_REMOVE_CONFIDENCE\s*=\s*0\.98\b/], none: [/0\.6\b/]},
         typescript: {all: [/AUTO_REMOVE_CONFIDENCE\s*=\s*0\.98\b/], none: [/0\.6\b/]},
@@ -765,15 +765,21 @@ PENDING = "moderation:pending"
 class Classifier(moderation_service_pb2_grpc.ClassifierServicer):
     """Labels everything spam, with the confidence the check set per content id (0.5 by default)."""
 
-    def __init__(self):
+    def __init__(self, ctx):
+        self.ctx = ctx
         self.scores = {}
+        self.restarting = False  # the next call takes 0.3 s and then fails UNAVAILABLE
 
     def Classify(self, request, context):
+        if self.restarting:
+            self.restarting = False
+            self.ctx.clock.advance(0.3)
+            context.abort(grpc.StatusCode.UNAVAILABLE, "classifier restarting")
         return moderation_service_pb2.Verdict(label="spam", confidence=self.scores.get(request.content_id, 0.5), model_version="clf-2026-10")
 
 
 def _client(ctx):
-    peer = Classifier()
+    peer = Classifier(ctx)
     ctx.grpc.serve(moderation_service_pb2_grpc.add_ClassifierServicer_to_server, peer)
     return ctx.load("client"), peer
 
@@ -783,13 +789,19 @@ def _queued(ctx):
 
 
 def check_deadline(ctx):
-    m, _ = _client(ctx)
+    m, peer = _client(ctx)
     m.triage("case-1", "c-1", "Buy followers now", [])
     calls = ctx.grpc.calls_to("Classify")
     assert calls, "no Classify call was made"
     for call in calls:
         assert call.timeout is not None, "a Classify call carries no deadline: a stalled classifier holds the report open as long as it stalls"
         assert 0.35 <= call.timeout <= 0.45, f"a Classify call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.4"
+    peer.scores["c-3"] = 0.3
+    peer.restarting = True
+    d = m.triage("case-3", "c-3", "hello", [])
+    retry = ctx.grpc.calls_to("Classify")[-1]
+    assert retry.timeout is not None and 0.35 <= retry.timeout <= 0.45, f"after a first attempt that failed UNAVAILABLE at 0.3 s, the retry carries a {retry.timeout} s deadline: every attempt gets its own DEADLINE_S = 0.4"
+    assert d["confidence"] == 0.3 and d["reason"] == "below_threshold", f"the retry's verdict must decide case-3, got {d}"
     ctx.grpc.set_latency("Classify", 5.0)
     d = m.triage("case-2", "c-2", "Buy followers now", ["hash_match"])
     assert d["route"] == "human_review" and d["reason"] == "classifier_unavailable", f"with the classifier taking 5 s triage answered {d}, expected human_review for classifier_unavailable"
@@ -802,27 +814,35 @@ def check_retry_policy(ctx):
     calls = len(ctx.grpc.calls_to("Classify"))
     assert calls == 1, f"a request the classifier answered INVALID_ARGUMENT was sent {calls} times: the code says the request is wrong, a retry gets the same answer"
     assert d["route"] == "human_review", f"an unclassifiable item was routed {d['route']}, expected human_review"
+    assert _queued(ctx) == ["case-1"], f"an unclassifiable item answered human_review must be queued for people, moderation:pending holds {_queued(ctx)}"
+    ctx.grpc.fail("Classify", grpc.StatusCode.PERMISSION_DENIED, "caller not allowed")
+    d = m.triage("case-4", "c-4", "hello", [])
+    calls = len(ctx.grpc.calls_to("Classify"))
+    assert calls == 2, f"a request the classifier answered PERMISSION_DENIED was sent {calls - 1} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+    assert d["route"] == "human_review" and _queued(ctx) == ["case-1", "case-4"], f"case-4, refused with PERMISSION_DENIED, answered {d} and moderation:pending holds {_queued(ctx)}: it must be queued for people"
     peer.scores["c-2"] = 0.3
     ctx.grpc.fail("Classify", grpc.StatusCode.UNAVAILABLE)
     d = m.triage("case-2", "c-2", "hello", [])
     calls = len(ctx.grpc.calls_to("Classify"))
-    assert calls == 3, f"one UNAVAILABLE must be retried once: {calls - 1} calls were made for case-2, expected 2"
+    assert calls == 4, f"one UNAVAILABLE must be retried once: {calls - 2} calls were made for case-2, expected 2"
     assert d["confidence"] == 0.3 and d["reason"] == "below_threshold", f"the retry's verdict must decide case-2, got {d}"
     ctx.grpc.fail("Classify", grpc.StatusCode.UNAVAILABLE, times=5)
     m.triage("case-3", "c-3", "hello", [])
     calls = len(ctx.grpc.calls_to("Classify"))
-    assert calls == 5, f"a classifier that stays unavailable must be asked MAX_ATTEMPTS = 2 times, it was asked {calls - 3}"
+    assert calls == 6, f"a classifier that stays unavailable must be asked MAX_ATTEMPTS = 2 times, it was asked {calls - 4}"
 
 
 def check_auto_threshold(ctx):
     m, peer = _client(ctx)
-    peer.scores.update({"c-1": 0.9, "c-2": 0.985})
+    peer.scores.update({"c-1": 0.9, "c-2": 0.985, "c-3": 0.98})
     d = m.triage("case-1", "c-1", "Buy followers now", ["hash_match"])
     assert d["route"] == "human_review", f"a 0.9 score with a hash match was routed {d['route']}: an automatic removal needs at least 0.98"
     assert _queued(ctx) == ["case-1"], f"case-1 must wait for a person, moderation:pending holds {_queued(ctx)}"
     d = m.triage("case-2", "c-2", "Buy followers now", ["hash_match"])
     assert d["route"] == "auto_remove", f"a 0.985 score with a hash match was routed {d['route']}, expected auto_remove"
     assert (d["label"], d["confidence"], d["model_version"]) == ("spam", 0.985, "clf-2026-10"), f"an automatic removal must carry the verdict as its evidence, got {d}"
+    d = m.triage("case-3", "c-3", "Buy followers now", ["hash_match"])
+    assert d["route"] == "auto_remove", f"a score of exactly 0.98 with a hash match was routed {d['route']}: at least 0.98 acts"
     assert _queued(ctx) == ["case-1"], f"an automatic removal must not also be queued, moderation:pending holds {_queued(ctx)}"
 
 
@@ -848,22 +868,32 @@ def check_unavailable_to_human(ctx):
 `,
     typescript: `const PENDING = 'moderation:pending';
 
-/** The classifier labels everything spam, with the confidence the check set per content id (0.5 by default). */
+/**
+ * The classifier labels everything spam, with the confidence the check set per content id (0.5 by
+ * default); while \`peer.restarting\` is set, the next call takes 0.3 s and then fails UNAVAILABLE.
+ */
 function client(ctx) {
   const pkg = ctx.proto('moderation_service.proto');
   const scores = new Map<string, number>();
+  const peer = {restarting: false};
   ctx.grpc.serve(pkg.moderated.Classifier.service, {
     Classify(call, callback) {
+      if (peer.restarting) {
+        peer.restarting = false;
+        ctx.clock.advance(0.3);
+        callback({code: ctx.grpc.status.UNAVAILABLE, details: 'classifier restarting'});
+        return;
+      }
       callback(null, {label: 'spam', confidence: scores.get(call.request.content_id) ?? 0.5, model_version: 'clf-2026-10'});
     },
   });
-  return {m: ctx.load('client'), scores};
+  return {m: ctx.load('client'), scores, peer};
 }
 
 const queued = (ctx): string[] => ctx.redis.zrange(PENDING, 0, -1);
 
 export async function check_deadline(ctx) {
-  const {m} = client(ctx);
+  const {m, scores, peer} = client(ctx);
   await m.triage('case-1', 'c-1', 'Buy followers now', []);
   const calls = ctx.grpc.callsTo('Classify');
   assert(calls.length > 0, 'no Classify call was made');
@@ -871,8 +901,17 @@ export async function check_deadline(ctx) {
     assert(call.timeout !== null, 'a Classify call carries no deadline: a stalled classifier holds the report open as long as it stalls');
     assert(0.35 <= call.timeout && call.timeout <= 0.45, \`a Classify call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 400\`);
   }
+  scores.set('c-3', 0.3);
+  peer.restarting = true;
+  let d = await m.triage('case-3', 'c-3', 'hello', []);
+  const retry = ctx.grpc.callsTo('Classify').at(-1);
+  assert(
+    retry.timeout !== null && 0.35 <= retry.timeout && retry.timeout <= 0.45,
+    \`after a first attempt that failed UNAVAILABLE at 0.3 s, the retry carries a \${retry.timeout} s deadline: every attempt gets its own DEADLINE_MS = 400\`,
+  );
+  assert(d.confidence === 0.3 && d.reason === 'below_threshold', \`the retry's verdict must decide case-3, got \${JSON.stringify(d)}\`);
   ctx.grpc.setLatency('Classify', 5.0);
-  const d = await m.triage('case-2', 'c-2', 'Buy followers now', ['hash_match']);
+  d = await m.triage('case-2', 'c-2', 'Buy followers now', ['hash_match']);
   assert(d.route === 'human_review' && d.reason === 'classifier_unavailable', \`with the classifier taking 5 s triage answered \${JSON.stringify(d)}, expected human_review for classifier_unavailable\`);
 }
 
@@ -883,28 +922,40 @@ export async function check_retry_policy(ctx) {
   let calls = ctx.grpc.callsTo('Classify').length;
   assert.equal(calls, 1, \`a request the classifier answered INVALID_ARGUMENT was sent \${calls} times: the code says the request is wrong, a retry gets the same answer\`);
   assert.equal(d.route, 'human_review', \`an unclassifiable item was routed \${d.route}, expected human_review\`);
+  assert.deepStrictEqual(queued(ctx), ['case-1'], \`an unclassifiable item answered human_review must be queued for people, moderation:pending holds \${JSON.stringify(queued(ctx))}\`);
+  ctx.grpc.fail('Classify', ctx.grpc.status.PERMISSION_DENIED, 'caller not allowed');
+  d = await m.triage('case-4', 'c-4', 'hello', []);
+  calls = ctx.grpc.callsTo('Classify').length;
+  assert.equal(calls, 2, \`a request the classifier answered PERMISSION_DENIED was sent \${calls - 1} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+  assert(
+    d.route === 'human_review' && JSON.stringify(queued(ctx)) === JSON.stringify(['case-1', 'case-4']),
+    \`case-4, refused with PERMISSION_DENIED, answered \${JSON.stringify(d)} and moderation:pending holds \${JSON.stringify(queued(ctx))}: it must be queued for people\`,
+  );
   scores.set('c-2', 0.3);
   ctx.grpc.fail('Classify', ctx.grpc.status.UNAVAILABLE);
   d = await m.triage('case-2', 'c-2', 'hello', []);
   calls = ctx.grpc.callsTo('Classify').length;
-  assert.equal(calls, 3, \`one UNAVAILABLE must be retried once: \${calls - 1} calls were made for case-2, expected 2\`);
+  assert.equal(calls, 4, \`one UNAVAILABLE must be retried once: \${calls - 2} calls were made for case-2, expected 2\`);
   assert(d.confidence === 0.3 && d.reason === 'below_threshold', \`the retry's verdict must decide case-2, got \${JSON.stringify(d)}\`);
   ctx.grpc.fail('Classify', ctx.grpc.status.UNAVAILABLE, '', 5);
   await m.triage('case-3', 'c-3', 'hello', []);
   calls = ctx.grpc.callsTo('Classify').length;
-  assert.equal(calls, 5, \`a classifier that stays unavailable must be asked MAX_ATTEMPTS = 2 times, it was asked \${calls - 3}\`);
+  assert.equal(calls, 6, \`a classifier that stays unavailable must be asked MAX_ATTEMPTS = 2 times, it was asked \${calls - 4}\`);
 }
 
 export async function check_auto_threshold(ctx) {
   const {m, scores} = client(ctx);
   scores.set('c-1', 0.9);
   scores.set('c-2', 0.985);
+  scores.set('c-3', 0.98);
   let d = await m.triage('case-1', 'c-1', 'Buy followers now', ['hash_match']);
   assert.equal(d.route, 'human_review', \`a 0.9 score with a hash match was routed \${d.route}: an automatic removal needs at least 0.98\`);
   assert.deepStrictEqual(queued(ctx), ['case-1'], \`case-1 must wait for a person, moderation:pending holds \${JSON.stringify(queued(ctx))}\`);
   d = await m.triage('case-2', 'c-2', 'Buy followers now', ['hash_match']);
   assert.equal(d.route, 'auto_remove', \`a 0.985 score with a hash match was routed \${d.route}, expected auto_remove\`);
   assert(d.label === 'spam' && d.confidence === 0.985 && d.model_version === 'clf-2026-10', \`an automatic removal must carry the verdict as its evidence, got \${JSON.stringify(d)}\`);
+  d = await m.triage('case-3', 'c-3', 'Buy followers now', ['hash_match']);
+  assert.equal(d.route, 'auto_remove', \`a score of exactly 0.98 with a hash match was routed \${d.route}: at least 0.98 acts\`);
   assert.deepStrictEqual(queued(ctx), ['case-1'], \`an automatic removal must not also be queued, moderation:pending holds \${JSON.stringify(queued(ctx))}\`);
 }
 
@@ -936,6 +987,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "moderation/gen/moderation_service"
 
@@ -944,13 +996,21 @@ import (
 
 var clientBg = context.Background()
 
-// classifierPeer labels everything spam, with the confidence the check set per content id (0.5 by default).
+// classifierPeer labels everything spam, with the confidence the check set per content id (0.5 by
+// default); while restarting is set, the next call takes 0.3 s and then fails UNAVAILABLE.
 type classifierPeer struct {
 	pb.UnimplementedClassifierServer
-	scores map[string]float64
+	ctx        *harness.Ctx
+	scores     map[string]float64
+	restarting bool
 }
 
 func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.Verdict, error) {
+	if p.restarting {
+		p.restarting = false
+		p.ctx.Clock.Advance(0.3)
+		return nil, status.Error(codes.Unavailable, "classifier restarting")
+	}
 	score, ok := p.scores[req.GetContentId()]
 	if !ok {
 		score = 0.5
@@ -959,7 +1019,7 @@ func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*
 }
 
 func clientPeer(ctx *harness.Ctx) *classifierPeer {
-	peer := &classifierPeer{scores: map[string]float64{}}
+	peer := &classifierPeer{ctx: ctx, scores: map[string]float64{}}
 	pb.RegisterClassifierServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
@@ -973,7 +1033,7 @@ func clientQueued(ctx *harness.Ctx) []string {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	peer := clientPeer(ctx)
 	triage(clientBg, "case-1", "c-1", "Buy followers now", nil)
 	calls := ctx.GRPC.CallsTo("Classify", "")
 	ctx.Assert(len(calls) > 0, "no Classify call was made")
@@ -981,8 +1041,15 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(call.HasDeadline(), "a Classify call carries no deadline: a stalled classifier holds the report open as long as it stalls")
 		ctx.Assert(350*time.Millisecond <= call.Timeout && call.Timeout <= 450*time.Millisecond, "a Classify call carries a %v deadline, expected 400 ms", call.Timeout)
 	}
+	peer.scores["c-3"] = 0.3
+	peer.restarting = true
+	d := triage(clientBg, "case-3", "c-3", "hello", nil)
+	calls = ctx.GRPC.CallsTo("Classify", "")
+	retry := calls[len(calls)-1]
+	ctx.Assert(retry.HasDeadline() && 350*time.Millisecond <= retry.Timeout && retry.Timeout <= 450*time.Millisecond, "after a first attempt that failed UNAVAILABLE at 0.3 s, the retry carries a %v deadline: every attempt gets its own 400 ms", retry.Timeout)
+	ctx.Assert(d.Confidence == 0.3 && d.Reason == "below_threshold", "the retry's verdict must decide case-3, got %+v", d)
 	ctx.GRPC.SetLatency("Classify", 5.0, "")
-	d := triage(clientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
+	d = triage(clientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
 	ctx.Assert(d.Route == "human_review" && d.Reason == "classifier_unavailable", "with the classifier taking 5 s triage answered %+v, expected human_review for classifier_unavailable", d)
 }
 
@@ -993,28 +1060,38 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	calls := len(ctx.GRPC.CallsTo("Classify", ""))
 	ctx.Equal(calls, 1, "a request the classifier answered INVALID_ARGUMENT must be sent once: the code says the request is wrong, a retry gets the same answer; the calls")
 	ctx.Equal(d.Route, "human_review", "an unclassifiable item's route")
+	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "an unclassifiable item answered human_review must be queued for people; moderation:pending")
+	ctx.GRPC.Fail("Classify", codes.PermissionDenied, "caller not allowed", 1, "")
+	d = triage(clientBg, "case-4", "c-4", "hello", nil)
+	calls = len(ctx.GRPC.CallsTo("Classify", ""))
+	ctx.Equal(calls-1, 1, "a request the classifier answered PERMISSION_DENIED must be sent once: only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for case-4")
+	ctx.Equal(d.Route, "human_review", "case-4, refused with PERMISSION_DENIED; the route")
+	ctx.Equal(clientQueued(ctx), []string{"case-1", "case-4"}, "case-4, refused with PERMISSION_DENIED, must be queued for people; moderation:pending")
 	peer.scores["c-2"] = 0.3
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "", 1, "")
 	d = triage(clientBg, "case-2", "c-2", "hello", nil)
 	calls = len(ctx.GRPC.CallsTo("Classify", ""))
-	ctx.Equal(calls-1, 2, "one UNAVAILABLE must be retried once; the calls for case-2")
+	ctx.Equal(calls-2, 2, "one UNAVAILABLE must be retried once; the calls for case-2")
 	ctx.Assert(d.Confidence == 0.3 && d.Reason == "below_threshold", "the retry's verdict must decide case-2, got %+v", d)
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "", 5, "")
 	triage(clientBg, "case-3", "c-3", "hello", nil)
 	calls = len(ctx.GRPC.CallsTo("Classify", ""))
-	ctx.Equal(calls-3, 2, "a classifier that stays unavailable must be asked maxAttempts = 2 times; the calls for case-3")
+	ctx.Equal(calls-4, 2, "a classifier that stays unavailable must be asked maxAttempts = 2 times; the calls for case-3")
 }
 
 func CheckAutoThreshold(ctx *harness.Ctx) {
 	peer := clientPeer(ctx)
 	peer.scores["c-1"] = 0.9
 	peer.scores["c-2"] = 0.985
+	peer.scores["c-3"] = 0.98
 	d := triage(clientBg, "case-1", "c-1", "Buy followers now", []string{"hash_match"})
 	ctx.Equal(d.Route, "human_review", "a 0.9 score with a hash match: an automatic removal needs at least 0.98; the route")
 	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "case-1 must wait for a person; moderation:pending")
 	d = triage(clientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
 	ctx.Equal(d.Route, "auto_remove", "a 0.985 score with a hash match; the route")
 	ctx.Assert(d.Label == "spam" && d.Confidence == 0.985 && d.ModelVersion == "clf-2026-10", "an automatic removal must carry the verdict as its evidence, got %+v", d)
+	d = triage(clientBg, "case-3", "c-3", "Buy followers now", []string{"hash_match"})
+	ctx.Equal(d.Route, "auto_remove", "a score of exactly 0.98 with a hash match: at least 0.98 acts; the route")
 	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "an automatic removal must not also be queued; moderation:pending")
 }
 
@@ -1048,22 +1125,33 @@ func CheckUnavailableToHuman(ctx *harness.Ctx) {
 
 namespace {
 
-// Labels everything spam, with the confidence the check set per content id (0.5 by default).
+// Labels everything spam, with the confidence the check set per content id (0.5 by default); while
+// restarting is set, the next call takes 0.3 s and then fails UNAVAILABLE.
 class ClassifierPeer final : public moderated::Classifier::Service {
  public:
+  explicit ClassifierPeer(harness::Ctx& ctx) : ctx_(ctx) {}
   std::map<std::string, double> scores;
+  bool restarting = false;
   grpc::Status Classify(grpc::ServerContext*, const moderated::ClassifyRequest* req, moderated::Verdict* out) override {
+    if (restarting) {
+      restarting = false;
+      ctx_.Clock.Advance(0.3);
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "classifier restarting");
+    }
     out->set_label("spam");
     out->set_confidence(scores.count(req->content_id()) ? scores.at(req->content_id()) : 0.5);
     out->set_model_version("clf-2026-10");
     return grpc::Status::OK;
   }
+
+ private:
+  harness::Ctx& ctx_;
 };
 
 ClassifierPeer& clientPeer(harness::Ctx& ctx) {
   static ClassifierPeer* peer = nullptr;
   delete peer;
-  peer = new ClassifierPeer;
+  peer = new ClassifierPeer(ctx);
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
@@ -1077,7 +1165,7 @@ std::vector<std::string> clientQueued(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  ClassifierPeer& peer = clientPeer(ctx);
   triage("case-1", "c-1", "Buy followers now", {});
   const auto calls = ctx.GRPC.CallsTo("Classify");
   ctx.Assert(!calls.empty(), "no Classify call was made");
@@ -1085,8 +1173,15 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(call.HasDeadline(), "a Classify call carries no deadline: a stalled classifier holds the report open as long as it stalls");
     ctx.Assert(0.35 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.45, "a Classify call carries a %v s deadline, expected kDeadline = 400 ms", call.TimeoutSeconds());
   }
+  peer.scores["c-3"] = 0.3;
+  peer.restarting = true;
+  Decision d = triage("case-3", "c-3", "hello", {});
+  const auto retry = ctx.GRPC.CallsTo("Classify").back();
+  ctx.Assert(retry.HasDeadline() && 0.35 <= retry.TimeoutSeconds() && retry.TimeoutSeconds() <= 0.45,
+             "after a first attempt that failed UNAVAILABLE at 0.3 s, the retry carries a %v s deadline: every attempt gets its own kDeadline = 400 ms", retry.TimeoutSeconds());
+  ctx.Assert(d.confidence == 0.3 && d.reason == "below_threshold", "the retry's verdict must decide case-3, got confidence %v reason %q", d.confidence, d.reason);
   ctx.GRPC.SetLatency("Classify", 5.0);
-  const Decision d = triage("case-2", "c-2", "Buy followers now", {"hash_match"});
+  d = triage("case-2", "c-2", "Buy followers now", {"hash_match"});
   ctx.Assert(d.route == "human_review" && d.reason == "classifier_unavailable",
              "with the classifier taking 5 s triage answered route %q reason %q, expected human_review for classifier_unavailable", d.route, d.reason);
 }
@@ -1098,22 +1193,30 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   size_t calls = ctx.GRPC.CallsTo("Classify").size();
   ctx.Equal(calls, 1, "a request the classifier answered INVALID_ARGUMENT must be sent once: the code says the request is wrong, a retry gets the same answer; the calls");
   ctx.Equal(d.route, "human_review", "an unclassifiable item's route");
+  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "an unclassifiable item answered human_review must be queued for people; moderation:pending");
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::PERMISSION_DENIED, "caller not allowed");
+  d = triage("case-4", "c-4", "hello", {});
+  calls = ctx.GRPC.CallsTo("Classify").size();
+  ctx.Equal(calls - 1, 1, "a request the classifier answered PERMISSION_DENIED must be sent once: only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for case-4");
+  ctx.Equal(d.route, "human_review", "case-4, refused with PERMISSION_DENIED; the route");
+  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1", "case-4"}, "case-4, refused with PERMISSION_DENIED, must be queued for people; moderation:pending");
   peer.scores["c-2"] = 0.3;
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE);
   d = triage("case-2", "c-2", "hello", {});
   calls = ctx.GRPC.CallsTo("Classify").size();
-  ctx.Equal(calls - 1, 2, "one UNAVAILABLE must be retried once; the calls for case-2");
+  ctx.Equal(calls - 2, 2, "one UNAVAILABLE must be retried once; the calls for case-2");
   ctx.Assert(d.confidence == 0.3 && d.reason == "below_threshold", "the retry's verdict must decide case-2, got confidence %v reason %q", d.confidence, d.reason);
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "", 5);
   triage("case-3", "c-3", "hello", {});
   calls = ctx.GRPC.CallsTo("Classify").size();
-  ctx.Equal(calls - 3, 2, "a classifier that stays unavailable must be asked kMaxAttempts = 2 times; the calls for case-3");
+  ctx.Equal(calls - 4, 2, "a classifier that stays unavailable must be asked kMaxAttempts = 2 times; the calls for case-3");
 }
 
 void CheckAutoThreshold(harness::Ctx& ctx) {
   ClassifierPeer& peer = clientPeer(ctx);
   peer.scores["c-1"] = 0.9;
   peer.scores["c-2"] = 0.985;
+  peer.scores["c-3"] = 0.98;
   Decision d = triage("case-1", "c-1", "Buy followers now", {"hash_match"});
   ctx.Equal(d.route, "human_review", "a 0.9 score with a hash match: an automatic removal needs at least 0.98; the route");
   ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "case-1 must wait for a person; moderation:pending");
@@ -1121,6 +1224,8 @@ void CheckAutoThreshold(harness::Ctx& ctx) {
   ctx.Equal(d.route, "auto_remove", "a 0.985 score with a hash match; the route");
   ctx.Assert(d.label == "spam" && d.confidence == 0.985 && d.model_version == "clf-2026-10",
              "an automatic removal must carry the verdict as its evidence, got label %q confidence %v model %q", d.label, d.confidence, d.model_version);
+  d = triage("case-3", "c-3", "Buy followers now", {"hash_match"});
+  ctx.Equal(d.route, "auto_remove", "a score of exactly 0.98 with a hash match: at least 0.98 acts; the route");
   ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "an automatic removal must not also be queued; moderation:pending");
 }
 

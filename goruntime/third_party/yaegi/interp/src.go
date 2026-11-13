@@ -159,7 +159,7 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
 	if err != nil {
 		return "", err
 	}
-	interp.run(n, nil)
+	interp.runInit(n, nil)
 
 	// Add main to list of functions to run, after all inits.
 	if m := gs.sym[mainID]; pkgName == mainID && m != nil && skipTest {
@@ -167,10 +167,30 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
 	}
 
 	for _, n := range initNodes {
-		interp.run(n, interp.frame)
+		interp.runInit(n, interp.frame)
 	}
 
 	return pkgName, nil
+}
+
+// InitPanic is what a package's initialisation panicked with (a package-level variable's
+// initializer or an init function): the program compiled and then failed at start-up. LeetBuild.
+type InitPanic struct{ Value any }
+
+func (p InitPanic) Error() string { return fmt.Sprint(p.Value) }
+
+// runInit runs initialisation code, re-raising a panic as an InitPanic (once, for the package
+// whose initialisation failed first). LeetBuild.
+func (interp *Interpreter) runInit(n *node, f *frame) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(InitPanic); ok {
+				panic(r)
+			}
+			panic(InitPanic{Value: r})
+		}
+	}()
+	interp.run(n, f)
 }
 
 // rootFromSourceLocation returns the path to the directory containing the input

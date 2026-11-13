@@ -30,7 +30,19 @@ export function redisBridge(world: BridgeWorld): Bridge {
         tagged(() => redis.SERVER.execute(args, record)),
       'redis.pipeline': (commands: string[][]): Tagged[] => each(redis.SERVER.executePipeline(commands)),
       'redis.transaction': (commands: string[][]): Tagged[] => each(redis.SERVER.executeTransaction(commands)),
-      'redis.fingerprint': (key: string): string => redis.SERVER.fingerprint(key),
+      // WATCH per connection (a redis++ Redis and its transactions share one): EXEC on a connection
+      // whose watched key was written since answers null and runs nothing.
+      'redis.connect': (): number => redis.SERVER.connect(),
+      'redis.watch': ({conn, keys}: {conn: number; keys: string[]}): void => {
+        redis.SERVER.watch(conn, keys);
+      },
+      'redis.unwatch': (conn: number): void => {
+        redis.SERVER.unwatch(conn);
+      },
+      'redis.exec': ({conn, commands}: {conn: number; commands: string[][]}): Tagged[] | null => {
+        const replies = redis.SERVER.exec(conn, commands);
+        return replies === null ? null : each(replies);
+      },
       'redis.trips': (): string[][] => redis.SERVER.trips,
       'redis.probe': ({key, handle}: {key: string; handle: number}): void => {
         redis.SERVER.probes.push({

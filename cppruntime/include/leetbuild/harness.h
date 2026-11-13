@@ -475,8 +475,9 @@ class Redis {
   long long ZCard(const std::string& key);
   long long Publish(const std::string& channel, const std::string& message);
 
-  // Run fn right after the first command of the learner's that touches key, before that command's
-  // reply reaches the learner: another client racing between two of the learner's commands. fn
+  // Run fn right after the first successful command of the learner's that touches key (a whole
+  // MULTI/EXEC, or a script: the keys its redis.calls use), before that command's reply reaches
+  // the learner: another client racing between two of the learner's commands. fn
   // runs at once on a thread of its own and may block (call the learner's gRPC client, sleep, take
   // a lock): the command's reply waits until fn returns. In a pipeline, a fn that blocks lets the
   // pipeline's later commands run before it resumes.

@@ -1,7 +1,8 @@
 // Package goredis connects the real go-redis client to the runtime's Redis server: NewClient (and
 // its siblings) dial a Conn that speaks RESP to go-redis and runs each round trip on the shared
-// server, so a pipeline is one trip, MULTI/EXEC runs as a block, WATCH aborts a transaction whose
-// keys changed, and SUBSCRIBE receives the server's publishes.
+// server, so a pipeline is one trip, MULTI/EXEC runs as a block, WATCH aborts a transaction once a
+// watched key is written (per connection, on the server), and SUBSCRIBE receives the server's
+// publishes.
 package goredis
 
 import (
@@ -21,20 +22,20 @@ import (
 // the server when the client reads.
 type Conn struct {
 	server world.Redis
+	id     int // the connection on the server: what it WATCHes is its own
 
-	mu      sync.Mutex
-	in      []byte     // bytes written, not yet parsed
-	queued  [][][]byte // commands of the trip in progress
-	out     bytes.Buffer
-	wake    chan struct{}
-	closed  bool
-	watched map[string]string // WATCHed key → its fingerprint when watched
-	subs    map[string]func() // "c:<channel>" / "p:<pattern>" → unsubscribe
+	mu     sync.Mutex
+	in     []byte     // bytes written, not yet parsed
+	queued [][][]byte // commands of the trip in progress
+	out    bytes.Buffer
+	wake   chan struct{}
+	closed bool
+	subs   map[string]func() // "c:<channel>" / "p:<pattern>" → unsubscribe
 }
 
 // NewConn is a connection to server.
 func NewConn(server world.Redis) *Conn {
-	return &Conn{server: server, wake: make(chan struct{}, 1)}
+	return &Conn{server: server, id: server.Connect(), wake: make(chan struct{}, 1)}
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
@@ -112,6 +113,7 @@ func (c *Conn) Close() error {
 	for _, stop := range subs {
 		stop()
 	}
+	c.server.Unwatch(c.id, false) // a closed connection's WATCH ends, as Redis frees the client's
 	c.signal()
 	return nil
 }
@@ -194,18 +196,15 @@ func (c *Conn) transaction(cmds [][][]byte, exec bool) []world.Reply {
 	for range cmds {
 		out = append(out, world.Status("QUEUED"))
 	}
-	watched := c.watched
-	c.watched = nil
 	if !exec {
+		c.server.Unwatch(c.id, false) // DISCARD ends the WATCH too
 		return append(out, world.Status("OK"))
 	}
-	for key, before := range watched {
-		if c.server.Fingerprint([]byte(key)) != before {
-			// A watched key changed: EXEC returns a null array and nothing runs.
-			return append(out, nilArray{})
-		}
+	results, aborted := c.server.Exec(c.id, cmds)
+	if aborted {
+		// A watched key was written: EXEC returns a null array and nothing runs.
+		return append(out, nilArray{})
 	}
-	results := c.server.Transaction(cmds)
 	block := make([]world.Reply, len(results))
 	for i, r := range results {
 		block[i] = replyOrError(r.Reply, r.Err)
@@ -235,17 +234,13 @@ func (c *Conn) local(name string, cmd [][]byte) (world.Reply, bool) {
 	case "QUIT":
 		return world.Status("OK"), true
 	case "WATCH":
-		if c.watched == nil {
-			c.watched = map[string]string{}
+		if len(cmd) < 2 {
+			return &world.ReplyError{Message: "ERR wrong number of arguments for 'watch' command"}, true
 		}
-		for _, k := range cmd[1:] {
-			if _, ok := c.watched[string(k)]; !ok {
-				c.watched[string(k)] = c.server.Fingerprint(k)
-			}
-		}
+		c.server.Watch(c.id, cmd[1:])
 		return world.Status("OK"), true
 	case "UNWATCH":
-		c.watched = nil
+		c.server.Unwatch(c.id, true)
 		return world.Status("OK"), true
 	case "SUBSCRIBE", "PSUBSCRIBE":
 		return c.subscribe(name == "PSUBSCRIBE", cmd[1:]), true

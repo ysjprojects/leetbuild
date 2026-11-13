@@ -154,10 +154,11 @@ func (r *Redis) Publish(channel, message string) int64 {
 	return r.Do("PUBLISH", channel, message).(int64)
 }
 
-// After runs fn right after the first command touching key, before its caller sees the reply (a
-// competing client landing in a race window). The probe reports whether it fired, what fn
-// returned, and what it failed with: fn runs inside the server's command, so a failing assertion
-// there is recorded on the probe (Err) rather than ending the check at once.
+// After runs fn right after the first successful command, MULTI/EXEC block or script touching key
+// (a script touches the keys its redis.calls use), before its caller sees the reply (a competing
+// client landing in a race window). The probe reports whether it fired, what fn returned, and what
+// it failed with: fn runs inside the server's command, so a failing assertion there is recorded on
+// the probe (Err) rather than ending the check at once.
 func (r *Redis) After(key string, fn func() any) *world.Probe {
 	return r.server().Probe([]byte(key), func() (result any, err error) {
 		defer func() {

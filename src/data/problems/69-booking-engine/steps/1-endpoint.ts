@@ -70,7 +70,8 @@ Rules, in this order, before any hold is taken:
     {
       id: 'past-start',
       title: 'Rejects a start in the past with 422',
-      detail: 'A `start` before now is **422** `range_in_past`, and nothing is held. The starter books it.',
+      detail:
+        'A `start` before now, even by two minutes, is **422** `range_in_past`, and nothing is held. The starter books it.',
       match: {
         python: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
         typescript: {all: [/range_in_past/, /start\s*<\s*now|now\s*>\s*start/]},
@@ -83,7 +84,7 @@ Rules, in this order, before any hold is taken:
       id: 'horizon',
       title: 'Rejects a range past the 90-day horizon',
       detail:
-        'An `end` more than 90 days from now is **422** `beyond_horizon`; 89 days out is booked. The starter accepts any end.',
+        'An `end` more than 90 days from now is **422** `beyond_horizon`, including a range that starts inside the horizon and ends past it; 89 days out is booked. The starter accepts any end.',
       match: {
         python: {all: [/beyond_horizon/, /MAX_HORIZON_DAYS|\b90\b/]},
         typescript: {all: [/beyond_horizon/, /MAX_HORIZON_DAYS|\b90\b/]},
@@ -96,7 +97,7 @@ Rules, in this order, before any hold is taken:
       id: 'replay',
       title: 'Returns the first booking for a replayed Idempotency-Key',
       detail:
-        'A missing key is **400**; a replayed key answers the stored booking with **200**, the same `booking_id`, and takes no second hold. The starter reads the header and ignores it.',
+        'A missing key is **400** `missing_idempotency_key`, ahead of every other rule; a replayed key answers the stored booking with **200**, the same `booking_id`, and takes no second hold, also when the retry arrives after the first hold expired and its slots are free again. The starter reads the header and ignores it.',
       match: {
         python: {all: [/missing_idempotency_key/], order: [/store\.get_by_key\(/, /take_hold\(/]},
         typescript: {all: [/missing_idempotency_key/], order: [/store\.getByKey\(/, /takeHold\(/]},
@@ -801,6 +802,9 @@ async def check_past_start(ctx):
     r = await _post(ctx, m, _body(ctx, -3600, length_s=7200))
     assert r.status_code == 422 and r.json().get("error") == "range_in_past", f"a range starting an hour ago answered {r.status_code} {r.text}, expected 422 range_in_past"
     _nothing_held(ctx, "a range in the past")
+    r = await _post(ctx, m, _body(ctx, -120))
+    assert r.status_code == 422 and r.json().get("error") == "range_in_past", f"a range that started two minutes ago answered {r.status_code} {r.text}, expected 422 range_in_past"
+    _nothing_held(ctx, "a range in the past")
     r = await _post(ctx, m, _body(ctx, 60))
     assert r.status_code == 201, f"a range starting in a minute answered {r.status_code}: {r.text}"
 
@@ -809,6 +813,9 @@ async def check_horizon(ctx):
     m = ctx.load("api")
     r = await _post(ctx, m, _body(ctx, 91 * 86400))
     assert r.status_code == 422 and r.json().get("error") == "beyond_horizon", f"a range 91 days out answered {r.status_code} {r.text}, expected 422 beyond_horizon"
+    _nothing_held(ctx, "a range beyond the horizon")
+    r = await _post(ctx, m, _body(ctx, 89 * 86400 + 23 * 3600, length_s=2 * 3600))
+    assert r.status_code == 422 and r.json().get("error") == "beyond_horizon", f"a range that starts inside the horizon but ends 90 days and an hour out answered {r.status_code} {r.text}, expected 422 beyond_horizon"
     _nothing_held(ctx, "a range beyond the horizon")
     r = await _post(ctx, m, _body(ctx, 89 * 86400))
     assert r.status_code == 201, f"a range 89 days out answered {r.status_code}: {r.text}"
@@ -819,6 +826,8 @@ async def check_replay(ctx):
     body = _body(ctx, 3600)
     r = await _post(ctx, m, body, {"X-Tenant-Id": "t1"})
     assert r.status_code == 400 and r.json().get("error") == "missing_idempotency_key", f"a request without Idempotency-Key answered {r.status_code} {r.text}, expected 400 missing_idempotency_key"
+    r = await _post(ctx, m, _body(ctx, -3600, length_s=7200), {"X-Tenant-Id": "t1"})
+    assert r.status_code == 400 and r.json().get("error") == "missing_idempotency_key", f"a past range without Idempotency-Key answered {r.status_code} {r.text}, expected 400 missing_idempotency_key: the key is the first rule"
     first = await _post(ctx, m, body)
     assert first.status_code == 201, f"the first booking answered {first.status_code}: {first.text}"
     again = await _post(ctx, m, body)  # the client timed out and retried with the same key
@@ -828,6 +837,11 @@ async def check_replay(ctx):
     assert holds == [hold_key(first.json()["hold_id"])], f"after a replay the hold keys are {holds}: a replay must not take a second hold"
     other = await _post(ctx, m, body, {"X-Tenant-Id": "t1", "Idempotency-Key": "k2"})
     assert other.status_code == 409, f"a different key for the held range answered {other.status_code}, expected 409 slot_taken"
+    # The first hold expired unpaid and the sweeper freed its slots; only now does the retry arrive.
+    ctx.redis.delete(slots_key("r1"), hold_key(first.json()["hold_id"]))
+    late = await _post(ctx, m, body)
+    assert late.status_code == 200 and late.json().get("booking_id") == first.json()["booking_id"], f"a replay after the first hold expired answered {late.status_code} {late.text}, expected 200 with booking {first.json()['booking_id']}"
+    assert ctx.redis.keys("hold:*") == [] and ctx.redis.hgetall(slots_key("r1")) == {}, f"a replay after the first hold expired took a new hold ({ctx.redis.keys('hold:*')}): the key decides a replay before any hold is taken"
 `,
     typescript: `import {holdKey, slotFields, slotsKey} from 'booking/slots';
 import {formatInstant, parseInstant} from 'booking/tz';
@@ -880,6 +894,9 @@ export async function check_past_start(ctx) {
   let r = await c.post('/v1/bookings', {json: body(-3600, 7200), headers: H});
   assert(r.status === 422 && r.json().error === 'range_in_past', \`a range starting an hour ago answered \${r.status} \${r.text}, expected 422 range_in_past\`);
   nothingHeld(ctx, 'a range in the past');
+  r = await c.post('/v1/bookings', {json: body(-120), headers: H});
+  assert(r.status === 422 && r.json().error === 'range_in_past', \`a range that started two minutes ago answered \${r.status} \${r.text}, expected 422 range_in_past\`);
+  nothingHeld(ctx, 'a range in the past');
   r = await c.post('/v1/bookings', {json: body(60), headers: H});
   assert.equal(r.status, 201, \`a range starting in a minute answered \${r.status}: \${r.text}\`);
 }
@@ -888,6 +905,9 @@ export async function check_horizon(ctx) {
   const c = api(ctx);
   let r = await c.post('/v1/bookings', {json: body(91 * 86400), headers: H});
   assert(r.status === 422 && r.json().error === 'beyond_horizon', \`a range 91 days out answered \${r.status} \${r.text}, expected 422 beyond_horizon\`);
+  nothingHeld(ctx, 'a range beyond the horizon');
+  r = await c.post('/v1/bookings', {json: body(89 * 86400 + 23 * 3600, 2 * 3600), headers: H});
+  assert(r.status === 422 && r.json().error === 'beyond_horizon', \`a range that starts inside the horizon but ends 90 days and an hour out answered \${r.status} \${r.text}, expected 422 beyond_horizon\`);
   nothingHeld(ctx, 'a range beyond the horizon');
   r = await c.post('/v1/bookings', {json: body(89 * 86400), headers: H});
   assert.equal(r.status, 201, \`a range 89 days out answered \${r.status}: \${r.text}\`);
@@ -898,6 +918,8 @@ export async function check_replay(ctx) {
   const b = body(3600);
   let r = await c.post('/v1/bookings', {json: b, headers: {'X-Tenant-Id': 't1'}});
   assert(r.status === 400 && r.json().error === 'missing_idempotency_key', \`a request without Idempotency-Key answered \${r.status} \${r.text}, expected 400 missing_idempotency_key\`);
+  r = await c.post('/v1/bookings', {json: body(-3600, 7200), headers: {'X-Tenant-Id': 't1'}});
+  assert(r.status === 400 && r.json().error === 'missing_idempotency_key', \`a past range without Idempotency-Key answered \${r.status} \${r.text}, expected 400 missing_idempotency_key: the key is the first rule\`);
   const first = await c.post('/v1/bookings', {json: b, headers: H});
   assert.equal(first.status, 201, \`the first booking answered \${first.status}: \${first.text}\`);
   const again = await c.post('/v1/bookings', {json: b, headers: H}); // the client timed out and retried with the same key
@@ -907,6 +929,12 @@ export async function check_replay(ctx) {
   assert.deepEqual(holds, [holdKey(first.json().hold_id)], \`after a replay the hold keys are \${JSON.stringify(holds)}: a replay must not take a second hold\`);
   r = await c.post('/v1/bookings', {json: b, headers: {'X-Tenant-Id': 't1', 'Idempotency-Key': 'k2'}});
   assert.equal(r.status, 409, \`a different key for the held range answered \${r.status}, expected 409 slot_taken\`);
+  // The first hold expired unpaid and the sweeper freed its slots; only now does the retry arrive.
+  ctx.redis.del(slotsKey('r1'), holdKey(first.json().hold_id));
+  const late = await c.post('/v1/bookings', {json: b, headers: H});
+  assert(late.status === 200 && late.json().booking_id === first.json().booking_id, \`a replay after the first hold expired answered \${late.status} \${late.text}, expected 200 with booking \${first.json().booking_id}\`);
+  const retaken = ctx.redis.keys('hold:*');
+  assert(retaken.length === 0 && Object.keys(ctx.redis.hgetall(slotsKey('r1'))).length === 0, \`a replay after the first hold expired took a new hold (\${JSON.stringify(retaken)}): the key decides a replay before any hold is taken\`);
 }
 `,
     go: `package main
@@ -1017,6 +1045,9 @@ func CheckPastStart(ctx *harness.Ctx) {
 	r := apiPost(c, apiBody(-time.Hour, 2*time.Hour))
 	ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past", "a range starting an hour ago answered %d %s, expected 422 range_in_past", r.Status, r.Text())
 	apiNothingHeld(ctx, "a range in the past")
+	r = apiPost(c, apiBody(-2*time.Minute, time.Hour))
+	ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past", "a range that started two minutes ago answered %d %s, expected 422 range_in_past", r.Status, r.Text())
+	apiNothingHeld(ctx, "a range in the past")
 	r = apiPost(c, apiBody(time.Minute, time.Hour))
 	ctx.Equal(r.Status, 201, "a range starting in a minute (%s)", r.Text())
 }
@@ -1025,6 +1056,9 @@ func CheckHorizon(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	r := apiPost(c, apiBody(91*24*time.Hour, time.Hour))
 	ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon", "a range 91 days out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text())
+	apiNothingHeld(ctx, "a range beyond the horizon")
+	r = apiPost(c, apiBody(89*24*time.Hour+23*time.Hour, 2*time.Hour))
+	ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon", "a range that starts inside the horizon but ends 90 days and an hour out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text())
 	apiNothingHeld(ctx, "a range beyond the horizon")
 	r = apiPost(c, apiBody(89*24*time.Hour, time.Hour))
 	ctx.Equal(r.Status, 201, "a range 89 days out (%s)", r.Text())
@@ -1035,6 +1069,8 @@ func CheckReplay(ctx *harness.Ctx) {
 	body := apiBody(time.Hour, time.Hour)
 	r := apiPost(c, body, "X-Tenant-Id", "t1")
 	ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key", "a request without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key", r.Status, r.Text())
+	r = apiPost(c, apiBody(-time.Hour, 2*time.Hour), "X-Tenant-Id", "t1")
+	ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key", "a past range without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key: the key is the first rule", r.Status, r.Text())
 	first := apiPost(c, body)
 	ctx.Equal(first.Status, 201, "the first booking (%s)", first.Text())
 	again := apiPost(c, body) // the client timed out and retried with the same key
@@ -1044,6 +1080,12 @@ func CheckReplay(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.Keys("hold:*"), []string{slots.HoldKey(holdID)}, "a replay must not take a second hold; the hold keys")
 	other := apiPost(c, body, "X-Tenant-Id", "t1", "Idempotency-Key", "k2")
 	ctx.Equal(other.Status, 409, "a different key for the held range (slot_taken)")
+	// The first hold expired unpaid and the sweeper freed its slots; only now does the retry arrive.
+	ctx.Redis.Del(slots.Key("r1"), slots.HoldKey(holdID))
+	late := apiPost(c, body)
+	ctx.Assert(late.Status == 200 && apiField(late, "booking_id") == apiField(first, "booking_id"), "a replay after the first hold expired answered %d %s, expected 200 with booking %s", late.Status, late.Text(), apiField(first, "booking_id"))
+	retaken := ctx.Redis.Keys("hold:*")
+	ctx.Assert(len(retaken) == 0 && len(ctx.Redis.HGetAll(slots.Key("r1"))) == 0, "a replay after the first hold expired took a new hold (%q): the key decides a replay before any hold is taken", retaken)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1131,6 +1173,10 @@ void CheckPastStart(harness::Ctx& ctx) {
   ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past",
              "a range starting an hour ago answered %d %s, expected 422 range_in_past", r.Status, r.Text());
   apiNothingHeld(ctx, "a range in the past");
+  r = apiPost(c, apiBody(-120));
+  ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past",
+             "a range that started two minutes ago answered %d %s, expected 422 range_in_past", r.Status, r.Text());
+  apiNothingHeld(ctx, "a range in the past");
   r = apiPost(c, apiBody(60));
   ctx.Equal(r.Status, 201, "a range starting in a minute (%s)", r.Text());
 }
@@ -1140,6 +1186,12 @@ void CheckHorizon(harness::Ctx& ctx) {
   auto r = apiPost(c, apiBody(91LL * 86400));
   ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon",
              "a range 91 days out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text());
+  apiNothingHeld(ctx, "a range beyond the horizon");
+  r = apiPost(c, apiBody(89LL * 86400 + 23 * 3600, 2 * 3600));
+  ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon",
+             "a range that starts inside the horizon but ends 90 days and an hour out answered %d %s, expected 422 "
+             "beyond_horizon",
+             r.Status, r.Text());
   apiNothingHeld(ctx, "a range beyond the horizon");
   r = apiPost(c, apiBody(89LL * 86400));
   ctx.Equal(r.Status, 201, "a range 89 days out (%s)", r.Text());
@@ -1151,6 +1203,10 @@ void CheckReplay(harness::Ctx& ctx) {
   auto r = apiPost(c, body, "t1", "");
   ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key",
              "a request without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key", r.Status, r.Text());
+  r = apiPost(c, apiBody(-3600, 7200), "t1", "");
+  ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key",
+             "a past range without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key: the key is the first rule",
+             r.Status, r.Text());
   const auto first = apiPost(c, body);
   ctx.Equal(first.Status, 201, "the first booking (%s)", first.Text());
   const auto again = apiPost(c, body);  // the client timed out and retried with the same key
@@ -1163,6 +1219,18 @@ void CheckReplay(harness::Ctx& ctx) {
             "a replay must not take a second hold; the hold keys");
   const auto other = apiPost(c, body, "t1", "k2");
   ctx.Equal(other.Status, 409, "a different key for the held range (slot_taken)");
+  // The first hold expired unpaid and the sweeper freed its slots; only now does the retry arrive.
+  ctx.Redis.Del(booking::slots::Key("r1"), booking::slots::HoldKey(firstBooking.value("hold_id", "")));
+  const auto late = apiPost(c, body);
+  const auto lateBooking = nlohmann::json::parse(late.Text(), nullptr, false);
+  ctx.Assert(late.Status == 200 && lateBooking.is_object() &&
+                 lateBooking.value("booking_id", "") == firstBooking.value("booking_id", ""),
+             "a replay after the first hold expired answered %d %s, expected 200 with booking %s", late.Status, late.Text(),
+             firstBooking.value("booking_id", ""));
+  const auto retaken = ctx.Redis.Keys("hold:*");
+  ctx.Assert(retaken.empty() && ctx.Redis.HGetAll(booking::slots::Key("r1")).empty(),
+             "a replay after the first hold expired took a new hold (%q): the key decides a replay before any hold is taken",
+             retaken);
 }
 `,
   },

@@ -19,11 +19,12 @@ hides four flaws.
 request that should be refused has already paid for the download; and a client that retries its
 submit gets a second job for the same audio, transcribed and billed twice.
 
-- \`duration_seconds\` is 1 to \`MAX_DURATION_SECONDS\` (14 400, four hours) and \`language\` is one of
-  \`ALLOWED_LANGUAGES\` (\`en\`, \`es\`, \`fr\`, \`de\`, \`ja\`); anything else is **400**.
+- \`duration_seconds\` is 1 to \`MAX_DURATION_SECONDS\` (14 400, four hours) and \`language\` is exactly one
+  of \`ALLOWED_LANGUAGES\` (\`en\`, \`es\`, \`fr\`, \`de\`, \`ja\`); anything else is **400**.
 - Both are decided from the metadata, before \`audio.stage\`: a refused request stages nothing.
-- Before creating a job, look up \`jobs.find_by_audio(tenant, audio_hash)\`: a replay answers **200**
-  with that job and stages nothing. Another tenant's identical audio is a job of its own.`,
+- Before creating a job, look up \`jobs.find_by_audio(tenant, audio_hash)\`: a replay of the same
+  \`audio_ref\`, whatever its language hint, answers **200** with that job and stages nothing. Another
+  tenant's identical audio is a job of its own.`,
   sequence: {
     participants: ['Client', 'Transcription API', 'jobs store', 'audio store'],
     messages: [
@@ -69,7 +70,7 @@ submit gets a second job for the same audio, transcribed and billed twice.
       id: 'duration-cap',
       title: 'Refuses a file over four hours',
       detail:
-        '`duration_seconds` outside 1 to `MAX_DURATION_SECONDS` (14 400) is **400**; the starter accepts any duration, so a five-hour file starts a job.',
+        '`duration_seconds` outside 1 to `MAX_DURATION_SECONDS` (14 400) is **400**: a five-hour file, 0, a negative duration and half a second alike. The starter accepts any duration, so a five-hour file starts a job.',
       match: {
         python: {
           all: [
@@ -112,7 +113,7 @@ submit gets a second job for the same audio, transcribed and billed twice.
       id: 'language-allowlist',
       title: 'Accepts only the allowlisted languages',
       detail:
-        '`language` is checked against `ALLOWED_LANGUAGES` (`en`, `es`, `fr`, `de`, `ja`) and anything else is **400**; the starter passes any hint through to the job.',
+        '`language` is checked against `ALLOWED_LANGUAGES` (`en`, `es`, `fr`, `de`, `ja`), exactly, and anything else is **400**: `xx`, `EN`, `english` and an empty hint alike. The starter passes any hint through to the job.',
       match: {
         python: {all: [/ALLOWED_LANGUAGES\s*=/, /not in ALLOWED_LANGUAGES/]},
         typescript: {
@@ -146,7 +147,7 @@ submit gets a second job for the same audio, transcribed and billed twice.
       id: 'audio-dedupe',
       title: 'A retried submit lands on the job that exists',
       detail:
-        'The job is looked up by `(tenant, sha256(audio_ref))` through `find_by_audio`/`findByAudio` before anything is staged or created; a replay answers that job. The starter creates a job on every submit.',
+        'The job is looked up by `(tenant, sha256(audio_ref))` through `find_by_audio`/`findByAudio` before anything is staged or created; a replay answers **200** with that job, whatever its language hint. The starter creates a job on every submit.',
       match: {
         python: {order: [/jobs\.find_by_audio\(/, /audio\.stage\(/, /jobs\.create\(/]},
         typescript: {order: [/findByAudio\(\s*tenant/, /\bstage\(/, /\bcreate\(\s*tenant/]},
@@ -674,17 +675,26 @@ async def check_duration_cap(ctx):
     async with _api(ctx) as c:
         over = await c.post("/v1/transcriptions", json=_body(ref="s3://calls/five-hours.wav", duration=14401), headers=T1)
         zero = await c.post("/v1/transcriptions", json=_body(ref="s3://calls/empty.wav", duration=0), headers=T1)
+        negative = await c.post("/v1/transcriptions", json=_body(ref="s3://calls/negative.wav", duration=-30), headers=T1)
+        half = await c.post("/v1/transcriptions", json=_body(ref="s3://calls/half-second.wav", duration=0.5), headers=T1)
         cap = await c.post("/v1/transcriptions", json=_body(ref="s3://calls/four-hours.wav", duration=14400), headers=T1)
     assert over.status_code == 400, f"a 14 401-second file answered {over.status_code}, expected 400: the cap is four hours"
     assert zero.status_code == 400, f"a 0-second file answered {zero.status_code}, expected 400"
+    assert negative.status_code == 400, f"a -30-second file answered {negative.status_code}, expected 400: the duration is 1 to 14 400 seconds"
+    # The request model's int refuses a fraction before the handler runs: FastAPI answers 422 for it.
+    assert half.status_code in (400, 422), f"a 0.5-second file answered {half.status_code}, expected 400: the duration is 1 to 14 400 seconds"
     assert cap.status_code == 202 and cap.json().get("total_chunks") == 480, f"a file of exactly four hours is accepted as 480 chunks, got {cap.status_code} {cap.text}"
 
 
 async def check_language_allowlist(ctx):
     async with _api(ctx) as c:
-        bad = await c.post("/v1/transcriptions", json=_body(language="xx"), headers=T1)
+        refused = {}
+        for language in ("xx", "", "e", "EN", "english", "constructor"):
+            r = await c.post("/v1/transcriptions", json=_body(ref=f"s3://calls/lang-{language}.wav", language=language), headers=T1)
+            refused[language] = r.status_code
         ok = await c.post("/v1/transcriptions", json=_body(ref="s3://calls/tokyo.wav", language="ja"), headers=T1)
-    assert bad.status_code == 400, f"language 'xx' answered {bad.status_code}, expected 400"
+    accepted = {language: status for language, status in refused.items() if status != 400}
+    assert not accepted, f"languages outside en, es, fr, de, ja must be 400, got {accepted}"
     assert ok.status_code == 202, f"language 'ja' is allowlisted, the request answered {ok.status_code}: {ok.text}"
 
 
@@ -703,13 +713,15 @@ async def check_audio_dedupe(ctx):
     async with _api(ctx) as c:
         first = await c.post("/v1/transcriptions", json=_body(), headers=T1)
         replay = await c.post("/v1/transcriptions", json=_body(), headers=T1)
+        hinted = await c.post("/v1/transcriptions", json=_body(language="es"), headers=T1)
         other = await c.post("/v1/transcriptions", json=_body(), headers=T2)
     assert first.status_code == 202, f"the first submit answered {first.status_code}: {first.text}"
-    assert replay.status_code in (200, 202), f"the retried submit answered {replay.status_code}: {replay.text}"
     job_id = first.json().get("job_id")
+    assert replay.status_code == 200, f"the retried submit answered {replay.status_code}, expected 200 with the job that exists: {replay.text}"
     assert replay.json().get("job_id") == job_id, f"a retried submit of the same audio created job {replay.json().get('job_id')} beside {job_id}: the audio is transcribed and billed twice"
+    assert hinted.status_code == 200 and hinted.json().get("job_id") == job_id, f"the same audio_ref with another language hint answered {hinted.status_code} {hinted.text}, expected 200 with job {job_id}: the job is keyed by sha256(audio_ref)"
     assert other.status_code == 202 and other.json().get("job_id") != job_id, f"tenant t-2 submitting the same audio must get a job of its own, got {other.status_code} {other.text}"
-    assert _staged(ctx) == [REF, REF], f"one staging per job: audio:staged holds {_staged(ctx)} after a submit, its retry and another tenant's submit"
+    assert _staged(ctx) == [REF, REF], f"one staging per job: audio:staged holds {_staged(ctx)} after a submit, its retries and another tenant's submit"
 `,
     typescript: `const REF = 's3://calls/2026-11-02/support-0412.wav';
 const T1 = {'X-Tenant-Id': 't-1'};
@@ -739,17 +751,25 @@ export async function check_duration_cap(ctx) {
   const {c} = api(ctx);
   const over = await c.post('/v1/transcriptions', {json: body('s3://calls/five-hours.wav', 14401), headers: T1});
   const zero = await c.post('/v1/transcriptions', {json: body('s3://calls/empty.wav', 0), headers: T1});
+  const negative = await c.post('/v1/transcriptions', {json: body('s3://calls/negative.wav', -30), headers: T1});
+  const half = await c.post('/v1/transcriptions', {json: body('s3://calls/half-second.wav', 0.5), headers: T1});
   const cap = await c.post('/v1/transcriptions', {json: body('s3://calls/four-hours.wav', 14400), headers: T1});
   assert.equal(over.status, 400, \`a 14 401-second file answered \${over.status}, expected 400: the cap is four hours\`);
   assert.equal(zero.status, 400, \`a 0-second file answered \${zero.status}, expected 400\`);
+  assert.equal(negative.status, 400, \`a -30-second file answered \${negative.status}, expected 400: the duration is 1 to 14 400 seconds\`);
+  assert.equal(half.status, 400, \`a 0.5-second file answered \${half.status}, expected 400: the duration is 1 to 14 400 seconds\`);
   assert(cap.status === 202 && cap.json().total_chunks === 480, \`a file of exactly four hours is accepted as 480 chunks, got \${cap.status} \${cap.text}\`);
 }
 
 export async function check_language_allowlist(ctx) {
   const {c} = api(ctx);
-  const bad = await c.post('/v1/transcriptions', {json: body(REF, 95, 'xx'), headers: T1});
+  const accepted: Record<string, number> = {};
+  for (const language of ['xx', '', 'e', 'EN', 'english', 'constructor']) {
+    const r = await c.post('/v1/transcriptions', {json: body(\`s3://calls/lang-\${language}.wav\`, 95, language), headers: T1});
+    if (r.status !== 400) accepted[language] = r.status;
+  }
   const ok = await c.post('/v1/transcriptions', {json: body('s3://calls/tokyo.wav', 95, 'ja'), headers: T1});
-  assert.equal(bad.status, 400, \`language 'xx' answered \${bad.status}, expected 400\`);
+  assert.deepStrictEqual(accepted, {}, \`languages outside en, es, fr, de, ja must be 400, got \${JSON.stringify(accepted)}\`);
   assert.equal(ok.status, 202, \`language 'ja' is allowlisted, the request answered \${ok.status}: \${ok.text}\`);
 }
 
@@ -767,13 +787,15 @@ export async function check_audio_dedupe(ctx) {
   const {c} = api(ctx);
   const first = await c.post('/v1/transcriptions', {json: body(), headers: T1});
   const replay = await c.post('/v1/transcriptions', {json: body(), headers: T1});
+  const hinted = await c.post('/v1/transcriptions', {json: body(REF, 95, 'es'), headers: T1});
   const other = await c.post('/v1/transcriptions', {json: body(), headers: T2});
   assert.equal(first.status, 202, \`the first submit answered \${first.status}: \${first.text}\`);
-  assert(replay.status === 200 || replay.status === 202, \`the retried submit answered \${replay.status}: \${replay.text}\`);
   const jobId = first.json().job_id;
+  assert.equal(replay.status, 200, \`the retried submit answered \${replay.status}, expected 200 with the job that exists: \${replay.text}\`);
   assert.equal(replay.json().job_id, jobId, \`a retried submit of the same audio created job \${replay.json().job_id} beside \${jobId}: the audio is transcribed and billed twice\`);
+  assert(hinted.status === 200 && hinted.json().job_id === jobId, \`the same audio_ref with another language hint answered \${hinted.status} \${hinted.text}, expected 200 with job \${jobId}: the job is keyed by sha256(audio_ref)\`);
   assert(other.status === 202 && other.json().job_id !== jobId, \`tenant t-2 submitting the same audio must get a job of its own, got \${other.status} \${other.text}\`);
-  assert.deepStrictEqual(staged(ctx), [REF, REF], \`one staging per job: audio:staged holds \${JSON.stringify(staged(ctx))} after a submit, its retry and another tenant's submit\`);
+  assert.deepStrictEqual(staged(ctx), [REF, REF], \`one staging per job: audio:staged holds \${JSON.stringify(staged(ctx))} after a submit, its retries and another tenant's submit\`);
 }
 `,
     go: `package main
@@ -801,7 +823,8 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiBody(ref string, duration int, language string) map[string]any {
+// apiBody is a submit's JSON body; duration is a number of seconds, whole or not.
+func apiBody(ref string, duration any, language string) map[string]any {
 	return map[string]any{"audio_ref": ref, "duration_seconds": duration, "language": language}
 }
 
@@ -830,17 +853,26 @@ func CheckDurationCap(ctx *harness.Ctx) {
 	c := api(ctx)
 	over, _ := submit(c, apiBody("s3://calls/five-hours.wav", 14401, "en"), "t-1")
 	zero, _ := submit(c, apiBody("s3://calls/empty.wav", 0, "en"), "t-1")
+	negative, _ := submit(c, apiBody("s3://calls/negative.wav", -30, "en"), "t-1")
+	half, _ := submit(c, apiBody("s3://calls/half-second.wav", 0.5, "en"), "t-1")
 	capped, v := submit(c, apiBody("s3://calls/four-hours.wav", 14400, "en"), "t-1")
 	ctx.Equal(over.Status, 400, "a 14 401-second file (the cap is four hours)")
 	ctx.Equal(zero.Status, 400, "a 0-second file")
+	ctx.Equal(negative.Status, 400, "a -30-second file (the duration is 1 to 14 400 seconds)")
+	ctx.Equal(half.Status, 400, "a 0.5-second file (the duration is 1 to 14 400 seconds)")
 	ctx.Assert(capped.Status == 202 && v.TotalChunks == 480, "a file of exactly four hours is accepted as 480 chunks, got %d %s", capped.Status, capped.Text())
 }
 
 func CheckLanguageAllowlist(ctx *harness.Ctx) {
 	c := api(ctx)
-	bad, _ := submit(c, apiBody(apiRef, 95, "xx"), "t-1")
+	accepted := map[string]int{}
+	for _, language := range []string{"xx", "", "e", "EN", "english", "constructor"} {
+		if r, _ := submit(c, apiBody("s3://calls/lang-"+language+".wav", 95, language), "t-1"); r.Status != 400 {
+			accepted[language] = r.Status
+		}
+	}
 	ok, _ := submit(c, apiBody("s3://calls/tokyo.wav", 95, "ja"), "t-1")
-	ctx.Equal(bad.Status, 400, "language xx")
+	ctx.Equal(accepted, map[string]int{}, "languages outside en, es, fr, de, ja must be 400; the languages accepted, with their status")
 	ctx.Equal(ok.Status, 202, "language ja is allowlisted (%s)", ok.Text())
 }
 
@@ -859,12 +891,14 @@ func CheckAudioDedupe(ctx *harness.Ctx) {
 	c := api(ctx)
 	first, v1 := submit(c, apiBody(apiRef, 95, "en"), "t-1")
 	replay, v2 := submit(c, apiBody(apiRef, 95, "en"), "t-1")
+	hinted, v4 := submit(c, apiBody(apiRef, 95, "es"), "t-1")
 	other, v3 := submit(c, apiBody(apiRef, 95, "en"), "t-2")
 	ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text())
-	ctx.Assert(replay.Status == 200 || replay.Status == 202, "the retried submit answered %d: %s", replay.Status, replay.Text())
+	ctx.Equal(replay.Status, 200, "the retried submit must answer 200 with the job that exists (%s)", replay.Text())
 	ctx.Equal(v2.JobID, v1.JobID, "a retried submit of the same audio must answer the job that exists, not a second job transcribed and billed twice; the job id")
+	ctx.Assert(hinted.Status == 200 && v4.JobID == v1.JobID, "the same audio_ref with another language hint answered %d %s, expected 200 with job %s: the job is keyed by sha256(audio_ref)", hinted.Status, hinted.Text(), v1.JobID)
 	ctx.Assert(other.Status == 202 && v3.JobID != v1.JobID, "tenant t-2 submitting the same audio must get a job of its own, got %d %s", other.Status, other.Text())
-	ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), []string{apiRef, apiRef}, "one staging per job after a submit, its retry and another tenant's submit; audio:staged")
+	ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), []string{apiRef, apiRef}, "one staging per job after a submit, its retries and another tenant's submit; audio:staged")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -887,7 +921,8 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string apiBody(const std::string& ref, long duration, const std::string& language) {
+// A submit's JSON body; duration is a number of seconds, whole or not.
+std::string apiBody(const std::string& ref, const nlohmann::json& duration, const std::string& language) {
   return nlohmann::json{{"audio_ref", ref}, {"duration_seconds", duration}, {"language", language}}.dump();
 }
 
@@ -916,17 +951,25 @@ void CheckDurationCap(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto over = submit(c, apiBody("s3://calls/five-hours.wav", 14401, "en"), "t-1").first;
   const auto zero = submit(c, apiBody("s3://calls/empty.wav", 0, "en"), "t-1").first;
+  const auto negative = submit(c, apiBody("s3://calls/negative.wav", -30, "en"), "t-1").first;
+  const auto half = submit(c, apiBody("s3://calls/half-second.wav", 0.5, "en"), "t-1").first;
   const auto [capped, body] = submit(c, apiBody("s3://calls/four-hours.wav", 14400, "en"), "t-1");
   ctx.Equal(over.Status, 400, "a 14 401-second file (the cap is four hours)");
   ctx.Equal(zero.Status, 400, "a 0-second file");
+  ctx.Equal(negative.Status, 400, "a -30-second file (the duration is 1 to 14 400 seconds)");
+  ctx.Equal(half.Status, 400, "a 0.5-second file (the duration is 1 to 14 400 seconds)");
   ctx.Assert(capped.Status == 202 && body.is_object() && body.value("total_chunks", 0) == 480, "a file of exactly four hours is accepted as 480 chunks, got %d %s", capped.Status, capped.Text());
 }
 
 void CheckLanguageAllowlist(harness::Ctx& ctx) {
   auto c = api(ctx);
-  const auto bad = submit(c, apiBody(kRef, 95, "xx"), "t-1").first;
+  std::vector<std::string> accepted;
+  for (const std::string language : {"xx", "", "e", "EN", "english", "constructor"}) {
+    const auto r = submit(c, apiBody("s3://calls/lang-" + language + ".wav", 95, language), "t-1").first;
+    if (r.Status != 400) accepted.push_back(language + " answered " + std::to_string(r.Status));
+  }
   const auto ok = submit(c, apiBody("s3://calls/tokyo.wav", 95, "ja"), "t-1").first;
-  ctx.Equal(bad.Status, 400, "language xx");
+  ctx.Assert(accepted.empty(), "languages outside en, es, fr, de, ja must be 400, got %q", accepted);
   ctx.Equal(ok.Status, 202, "language ja is allowlisted (%s)", ok.Text());
 }
 
@@ -945,12 +988,14 @@ void CheckAudioDedupe(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto [first, b1] = submit(c, apiBody(kRef, 95, "en"), "t-1");
   const auto [replay, b2] = submit(c, apiBody(kRef, 95, "en"), "t-1");
+  const auto [hinted, b4] = submit(c, apiBody(kRef, 95, "es"), "t-1");
   const auto [other, b3] = submit(c, apiBody(kRef, 95, "en"), "t-2");
   ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text());
-  ctx.Assert(replay.Status == 200 || replay.Status == 202, "the retried submit answered %d: %s", replay.Status, replay.Text());
+  ctx.Equal(replay.Status, 200, "the retried submit must answer 200 with the job that exists (%s)", replay.Text());
   ctx.Equal(jobIdOf(b2), jobIdOf(b1), "a retried submit of the same audio must answer the job that exists, not a second job transcribed and billed twice; the job id");
+  ctx.Assert(hinted.Status == 200 && jobIdOf(b4) == jobIdOf(b1), "the same audio_ref with another language hint answered %d %s, expected 200 with job %s: the job is keyed by sha256(audio_ref)", hinted.Status, hinted.Text(), jobIdOf(b1));
   ctx.Assert(other.Status == 202 && jobIdOf(b3) != jobIdOf(b1), "tenant t-2 submitting the same audio must get a job of its own, got %d %s", other.Status, other.Text());
-  ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), {kRef, kRef}, "one staging per job after a submit, its retry and another tenant's submit; audio:staged");
+  ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), {kRef, kRef}, "one staging per job after a submit, its retries and another tenant's submit; audio:staged");
 }
 `,
   },

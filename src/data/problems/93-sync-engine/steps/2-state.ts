@@ -22,8 +22,9 @@ with each other, and a device pushing back the body it just pulled mints a revis
 
 - The compare and every write run in **one Lua script** (\`register_script\`/\`eval\`), so no other
   client's command lands between them.
-- Revisions come from **\`INCR rev:seq\`** (\`store.REVISION_KEY\`), server-wide, so the change log
-  orders every document.
+- Revisions come from **\`INCR rev:seq\`** (\`store.REVISION_KEY\`), server-wide and inside the
+  script that writes them, so the change log orders every document and \`rev:seq\` moves only when
+  a revision is written. Every revision is kept under \`doc:{id}:r{n}\`.
 - A body whose hash equals the head's \`content_hash\` is **\`unchanged\`** whatever the base: no
   new revision, answered with the head's revision.
 - Return \`{"status": "applied" | "unchanged" | "conflict", "revision"}\`: the new revision, or the
@@ -70,7 +71,7 @@ with each other, and a device pushing back the body it just pulled mints a revis
       id: 'global-revision',
       title: 'Takes every revision from INCR rev:seq',
       detail:
-        'The script takes the next revision with `INCR` on `rev:seq`, server-wide; `current + 1` numbers each document on its own, so two documents share revisions and a cursor skips one of them.',
+        'The script takes the next revision with `INCR` on `rev:seq`, server-wide, and writes it in the same step, so no revision is committed after a higher one and `doc:{id}:r{n}` keeps every one. `current + 1` numbers each document on its own, so two documents share revisions and a cursor skips one of them.',
       match: {
         python: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
         typescript: {all: [/redis\.call\(\s*['"]INCR['"]/], none: [/current\s*\+\s*1/]},
@@ -83,7 +84,7 @@ with each other, and a device pushing back the body it just pulled mints a revis
       id: 'same-content',
       title: 'A body the head already has is unchanged, not a new revision or a conflict',
       detail:
-        'Before the base is compared, the script compares the change’s hash (`ARGV[3]`) with the head’s `content_hash` and answers `unchanged` at the head’s revision when they match.',
+        'Before the base is compared, the script compares the change’s hash (`ARGV[3]`) with the head’s `content_hash` and answers `unchanged` at the head’s revision when they match, without moving `rev:seq`.',
       match: {
         python: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
         typescript: {all: [/==\s*ARGV\[3\]|ARGV\[3\]\s*==/, /unchanged/]},
@@ -420,6 +421,17 @@ def check_global_revision(ctx):
     assert ctx.redis.get("rev:seq") == "3", f"rev:seq is {ctx.redis.get('rev:seq')!r} after three applies, expected '3'"
     log = ctx.redis.zrange("changes", 0, -1, withscores=True)
     assert log == [("d-2", 2.0), ("d-1", 3.0)], f"the change log holds {log}, expected d-2 at 2 and d-1 at 3"
+    kept = [ctx.redis.hget(f"doc:d-1:r{n}", "body") for n in (1, 3)]
+    assert kept == ["groceries", "groceries: milk"], f"doc:d-1:r1 and doc:d-1:r3 hold bodies {kept}: keep every revision under doc:{{id}}:r{{n}}, a merge reads the base a device edited from it"
+    assert ctx.redis.hget("doc:d-1:r3", "content_hash") == store.content_hash("groceries: milk"), "doc:d-1:r3 must keep the revision's content_hash"
+    # Another worker applies d-3 right after this apply takes rev:seq.
+    rival = ctx.redis_after("rev:seq", lambda: (_apply(m, "d-3", 0, "concert tickets", "phone"), ctx.redis.zscore("changes", "d-2")))
+    mine = _apply(m, "d-2", b["revision"], "call the plumber at 9")
+    assert rival.fired, "the apply never touched rev:seq"
+    if rival.error is not None:
+        raise rival.error
+    theirs, seen = rival.result
+    assert seen == mine["revision"] and theirs["revision"] > mine["revision"], f"d-3 committed revision {theirs['revision']} while d-2's revision {mine['revision']} was not yet in the change log (d-2 scored {seen}): a device pulling from cursor {theirs['revision']} never sees d-2. Take the revision inside the script that writes it"
 
 
 def check_same_content(ctx):
@@ -431,6 +443,7 @@ def check_same_content(ctx):
     echo = _apply(m, "d-1", first["revision"], "flight AF123, seat 14C", "laptop")
     assert echo == {"status": "unchanged", "revision": first["revision"]}, f"the laptop pushed back the body it just wrote and got {echo}: an echo must not mint a revision every device downloads again"
     assert store.head("d-1")["revision"] == first["revision"], f"d-1 moved to revision {store.head('d-1')['revision']} without a change of content"
+    assert ctx.redis.get("rev:seq") == str(first["revision"]), f"rev:seq is {ctx.redis.get('rev:seq')!r} after one applied revision and two unchanged pushes: rev:seq moves only when a revision is written"
     changed = _apply(m, "d-1", first["revision"], "flight AF123, seat 15A")
     assert changed["status"] == "applied" and changed["revision"] > first["revision"], f"a real edit after the echoes must apply, got {changed}"
 `,
@@ -471,6 +484,17 @@ export async function check_global_revision(ctx) {
   assert.equal(ctx.redis.get('rev:seq'), '3', \`rev:seq is \${JSON.stringify(ctx.redis.get('rev:seq'))} after three applies, expected '3'\`);
   const log = ctx.redis.zrange('changes', 0, -1, 'WITHSCORES');
   assert.deepStrictEqual(log, ['d-2', '2', 'd-1', '3'], \`the change log holds \${JSON.stringify(log)}, expected d-2 at 2 and d-1 at 3\`);
+  const kept = [ctx.redis.hget('doc:d-1:r1', 'body'), ctx.redis.hget('doc:d-1:r3', 'body')];
+  assert.deepStrictEqual(kept, ['groceries', 'groceries: milk'], \`doc:d-1:r1 and doc:d-1:r3 hold bodies \${JSON.stringify(kept)}: keep every revision under doc:{id}:r{n}, a merge reads the base a device edited from it\`);
+  assert.equal(ctx.redis.hget('doc:d-1:r3', 'content_hash'), store.contentHash('groceries: milk'), "doc:d-1:r3 must keep the revision's content_hash");
+  // Another worker applies d-3 right after this apply takes rev:seq.
+  const rival = ctx.redisAfter('rev:seq', async () => {
+    const theirs = await apply(m, store, 'd-3', 0, 'concert tickets', 'phone');
+    return {theirs, seen: ctx.redis.zscore('changes', 'd-2')};
+  });
+  const mine = await apply(m, store, 'd-2', b.revision, 'call the plumber at 9');
+  const {theirs, seen} = await settled(rival, 'rev:seq');
+  assert(Number(seen) === mine.revision && theirs.revision > mine.revision, \`d-3 committed revision \${theirs.revision} while d-2's revision \${mine.revision} was not yet in the change log (d-2 scored \${seen}): a device pulling from cursor \${theirs.revision} never sees d-2. Take the revision inside the script that writes it\`);
 }
 
 export async function check_same_content(ctx) {
@@ -482,6 +506,7 @@ export async function check_same_content(ctx) {
   const echo = await apply(m, store, 'd-1', first.revision, 'flight AF123, seat 14C', 'laptop');
   assert.deepStrictEqual(echo, {status: 'unchanged', revision: first.revision}, \`the laptop pushed back the body it just wrote and got \${JSON.stringify(echo)}: an echo must not mint a revision every device downloads again\`);
   assert.equal((await store.head('d-1')).revision, first.revision, 'd-1 moved to a new revision without a change of content');
+  assert.equal(ctx.redis.get('rev:seq'), String(first.revision), \`rev:seq is \${JSON.stringify(ctx.redis.get('rev:seq'))} after one applied revision and two unchanged pushes: rev:seq moves only when a revision is written\`);
   const changed = await apply(m, store, 'd-1', first.revision, 'flight AF123, seat 15A');
   assert(changed.status === 'applied' && changed.revision > first.revision, \`a real edit after the echoes must apply, got \${JSON.stringify(changed)}\`);
 }
@@ -490,6 +515,7 @@ export async function check_same_content(ctx) {
 
 import (
 	"context"
+	"fmt"
 
 	"docsync/store"
 
@@ -538,6 +564,31 @@ func CheckGlobalRevision(ctx *harness.Ctx) {
 	seq, _ := ctx.Redis.Get("rev:seq")
 	ctx.Equal(seq, "3", "rev:seq after three applies")
 	ctx.Equal(ctx.Redis.ZRangeWithScores("changes", 0, -1), []harness.Z{{Member: "d-2", Score: 2}, {Member: "d-1", Score: 3}}, "the change log (d-2 at 2, d-1 at 3)")
+	r1, _ := ctx.Redis.HGet("doc:d-1:r1", "body")
+	r3, _ := ctx.Redis.HGet("doc:d-1:r3", "body")
+	ctx.Equal([]string{r1, r3}, []string{"groceries", "groceries: milk"}, "keep every revision under doc:{id}:r{n}, a merge reads the base a device edited from it; the bodies of doc:d-1:r1 and doc:d-1:r3")
+	r3Hash, _ := ctx.Redis.HGet("doc:d-1:r3", "content_hash")
+	ctx.Equal(r3Hash, store.ContentHash("groceries: milk"), "doc:d-1:r3 must keep the revision's content_hash; its content_hash")
+	// Another worker applies d-3 right after this apply takes rev:seq.
+	type rivalResult struct {
+		theirs store.Outcome
+		seen   float64
+	}
+	rival := ctx.Redis.After("rev:seq", func() any {
+		theirs, err := applyChange(stateBg, "d-3", 0, store.ContentHash("concert tickets"), "concert tickets", "phone")
+		if err != nil {
+			panic(err)
+		}
+		seen, _ := ctx.Redis.ZScore("changes", "d-2")
+		return rivalResult{theirs, seen}
+	})
+	mine := stateApply(ctx, "d-2", b.Revision, "call the plumber at 9", "laptop")
+	ctx.Assert(rival.Fired, "the apply never touched rev:seq")
+	ctx.Assert(rival.Err == nil, "d-3's apply failed: %v", rival.Err)
+	got, _ := rival.Result.(rivalResult)
+	ctx.Assert(got.seen == float64(mine.Revision) && got.theirs.Revision > mine.Revision,
+		"d-3 committed revision %d while d-2's revision %d was not yet in the change log (d-2 scored %v): a device pulling from cursor %d never sees d-2. Take the revision inside the script that writes it",
+		got.theirs.Revision, mine.Revision, got.seen, got.theirs.Revision)
 }
 
 func CheckSameContent(ctx *harness.Ctx) {
@@ -548,6 +599,8 @@ func CheckSameContent(ctx *harness.Ctx) {
 	echo := stateApply(ctx, "d-1", first.Revision, "flight AF123, seat 14C", "laptop")
 	ctx.Equal(echo, store.Outcome{Status: "unchanged", Revision: first.Revision}, "the laptop pushed back the body it just wrote: an echo must not mint a revision every device downloads again")
 	ctx.Equal(store.Head(stateBg, "d-1").Revision, first.Revision, "d-1 must stay at its revision without a change of content; its revision")
+	seq, _ := ctx.Redis.Get("rev:seq")
+	ctx.Equal(seq, fmt.Sprint(first.Revision), "rev:seq moves only when a revision is written; rev:seq after one applied revision and two unchanged pushes")
 	changed := stateApply(ctx, "d-1", first.Revision, "flight AF123, seat 15A", "laptop")
 	ctx.Assert(changed.Status == "applied" && changed.Revision > first.Revision, "a real edit after the echoes must apply, got %+v", changed)
 }
@@ -604,6 +657,27 @@ void CheckGlobalRevision(harness::Ctx& ctx) {
   const auto log = ctx.Redis.ZRangeWithScores("changes", 0, -1);
   ctx.Assert(log.size() == 2 && log[0].Member == "d-2" && log[0].Score == 2 && log[1].Member == "d-1" && log[1].Score == 3,
              "the change log must hold d-2 at 2 and d-1 at 3, got %v", log);
+  ctx.Assert(ctx.Redis.HGet("doc:d-1:r1", "body") == std::optional<std::string>("groceries") && ctx.Redis.HGet("doc:d-1:r3", "body") == std::optional<std::string>("groceries: milk"),
+             "doc:d-1:r1 and doc:d-1:r3 must hold the bodies of revisions 1 and 3: keep every revision under doc:{id}:r{n}, a merge reads the base a device edited from it");
+  ctx.Equal(ctx.Redis.HGet("doc:d-1:r3", "content_hash"), std::optional<std::string>(store::contentHash("groceries: milk")), "doc:d-1:r3 must keep the revision's content_hash; its content_hash");
+  // Another worker applies d-3 right after this apply takes rev:seq.
+  std::optional<store::Outcome> theirs;
+  std::optional<double> seen;
+  std::optional<std::string> failed;
+  ctx.Redis.After("rev:seq", [&] {
+    try {
+      theirs = stateApply("d-3", 0, "concert tickets", "phone");
+      seen = ctx.Redis.ZScore("changes", "d-2");
+    } catch (const std::exception& e) {
+      failed = e.what();
+    }
+  });
+  const store::Outcome mine = stateApply("d-2", b.revision, "call the plumber at 9");
+  ctx.Assert(!failed, "d-3's apply failed: %s", failed.value_or(""));
+  ctx.Assert(theirs.has_value(), "the apply never touched rev:seq");
+  ctx.Assert(seen == std::optional<double>(static_cast<double>(mine.revision)) && theirs->revision > mine.revision,
+             "d-3 committed revision %d while d-2's revision %d was not yet in the change log (d-2 scored %v): a device pulling from cursor %d never sees d-2. Take the revision inside the script that writes it",
+             theirs->revision, mine.revision, seen.value_or(0), theirs->revision);
 }
 
 void CheckSameContent(harness::Ctx& ctx) {
@@ -616,6 +690,7 @@ void CheckSameContent(harness::Ctx& ctx) {
   ctx.Assert(echo.status == "unchanged" && echo.revision == first.revision,
              "the laptop pushed back the body it just wrote and got %s: an echo must not mint a revision every device downloads again", outcomeText(echo));
   ctx.Equal(store::head("d-1")->revision, first.revision, "d-1 must stay at its revision without a change of content; its revision");
+  ctx.Equal(ctx.Redis.Get("rev:seq"), std::optional<std::string>(std::to_string(first.revision)), "rev:seq moves only when a revision is written; rev:seq after one applied revision and two unchanged pushes");
   const store::Outcome changed = stateApply("d-1", first.revision, "flight AF123, seat 15A");
   ctx.Assert(changed.status == "applied" && changed.revision > first.revision, "a real edit after the echoes must apply, got %s", outcomeText(changed));
 }

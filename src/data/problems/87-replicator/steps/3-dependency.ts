@@ -12,8 +12,8 @@ export const dependencyStep: Step = {
 **Starting point.** The starter is \`replicate_change(replication_id, shard, change)\`: it advances the
 shard's offset with \`advance_offset\` (\`replication.offsets\`), then sends \`ApplyChange\` to the target
 region with a fresh request id per attempt, sleeping and retrying any error up to eight times; it
-returns the shard's offset or raises \`ApplyFailed\`. With a healthy target the demo converges, and it
-hides five flaws.
+returns the shard's offset as \`advance_offset\` leaves it, or raises \`ApplyFailed\`. With a healthy
+target the demo converges, and it hides five flaws.
 
 **Failure mode the checks target.** A wedged target holds the worker forever; a lost reply makes the
 retry apply the same change twice; a schema the target lacks is retried eight times; and a change
@@ -21,15 +21,18 @@ the target never applied is marked done, so a restart skips it.
 
 \`\`\`proto
 service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeReply); }
-// dedupes by change_id · FAILED_PRECONDITION: schema mismatch, the named diff in the details
+// dedupes by change_id · FAILED_PRECONDITION: schema mismatch, the named diff as the status message
 \`\`\`
 
-- Every attempt carries a **3 s** deadline (\`DEADLINE_S\`).
+- Every attempt carries its own **3 s** deadline (\`DEADLINE_S\`), counted from that attempt.
 - At most \`MAX_ATTEMPTS\` = **3** attempts, retrying only \`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\` and
-  \`RESOURCE_EXHAUSTED\`; any other code, or the last attempt, raises \`ApplyFailed\`.
+  \`RESOURCE_EXHAUSTED\`; any other code (\`ABORTED\`, \`INTERNAL\` and \`UNKNOWN\` included), or the last
+  attempt, raises \`ApplyFailed\`.
 - Every attempt sends the change's own \`change_id\`: build the request once, before the loop.
-- \`FAILED_PRECONDITION\` raises \`SchemaMismatch\` with the target's diff, without a retry.
-- \`advance_offset\` runs only after the target confirmed.`,
+- \`FAILED_PRECONDITION\` raises \`SchemaMismatch\` with the target's diff, the status's text (\`details()\`
+  in Python, \`error_message()\` in C++), without a retry.
+- \`advance_offset\` runs only after the target confirmed, and its result is what \`replicate_change\`
+  returns: a shard that already moved past the change stays where it is.`,
   sequence: {
     participants: ['Replication worker', 'Target region', 'Redis'],
     messages: [
@@ -66,7 +69,7 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
       id: 'deadline',
       title: 'Every attempt carries a 3-second deadline',
       detail:
-        'Each `ApplyChange` call is made with `DEADLINE_S` (3 s): `timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without one, a target that stops answering holds the worker.',
+        'Each `ApplyChange` attempt is made with its own `DEADLINE_S` (3 s) counted from that attempt: `timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter` or `set_deadline`. Without one, a target that stops answering holds the worker; with one deadline shared by all attempts, the retries after a timeout start already expired.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*3\b/, /ApplyChange\([^\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -79,7 +82,7 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
       id: 'bounded-attempts',
       title: 'At most three attempts, and only on retryable codes',
       detail:
-        'The loop runs `MAX_ATTEMPTS` (3) times and retries only `UNAVAILABLE`, `DEADLINE_EXCEEDED` and `RESOURCE_EXHAUSTED`; any other code, or the third failure, raises `ApplyFailed`.',
+        'The loop runs `MAX_ATTEMPTS` (3) times and retries only `UNAVAILABLE`, `DEADLINE_EXCEEDED` and `RESOURCE_EXHAUSTED`; any other code (`INVALID_ARGUMENT`, `ABORTED`, `INTERNAL`, `UNKNOWN`), or the third failure, raises `ApplyFailed`.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /range\(MAX_ATTEMPTS\)/, /RESOURCE_EXHAUSTED/], none: [/range\(8\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /<\s*MAX_ATTEMPTS/, /RESOURCE_EXHAUSTED/], none: [/<\s*8\b/]},
@@ -138,7 +141,7 @@ service TargetRegion { rpc ApplyChange(ApplyChangeRequest) returns (ApplyChangeR
       id: 'advance-after-confirm',
       title: 'The offset advances only after the target confirmed',
       detail:
-        '`advance_offset`/`advanceOffset` is called after the `ApplyChange` loop succeeded, never before it: an offset that names a change the target does not hold makes a restart skip that change.',
+        '`advance_offset`/`advanceOffset` is called after the `ApplyChange` loop succeeded, never before it, and its result is returned: an offset that names a change the target does not hold makes a restart skip that change, and a late change returns the offset the shard already holds.',
       match: {
         python: {order: [/\.ApplyChange\(/, /advance_offset\(/]},
         typescript: {order: [/\.ApplyChange\(/, /advanceOffset\(/]},
@@ -697,7 +700,7 @@ long long replicateChange(const std::string& replication_id, int shard, const Ch
 
 import replicator_pb2
 import replicator_pb2_grpc
-from replication.offsets import resume_offset
+from replication.offsets import advance_offset, resume_offset
 
 DIFF = "orders.discount_code: text at the source, missing at the target"
 
@@ -751,8 +754,10 @@ def check_deadline(ctx):
     ctx.grpc.set_latency("ApplyChange", 10.0)
     before = len(ctx.grpc.calls_to("ApplyChange"))
     _raises(m, m.ApplyFailed, _change(2), "with a target slower than the deadline")
-    made = len(ctx.grpc.calls_to("ApplyChange")) - before
-    assert made <= 3, f"a target slower than the deadline was called {made} times, expected at most 3"
+    slow = ctx.grpc.calls_to("ApplyChange")[before:]
+    assert len(slow) == 3, f"a target slower than the deadline was called {len(slow)} times, expected MAX_ATTEMPTS = 3 (DEADLINE_EXCEEDED is retried)"
+    for n, call in enumerate(slow, 1):
+        assert call.timeout is not None and 2.5 <= call.timeout <= 3.5, f"attempt {n} against a slow target carried a {call.timeout} s deadline, expected DEADLINE_S = 3: each attempt gets its own deadline, not what is left of the first"
 
 
 def check_bounded_attempts(ctx):
@@ -761,9 +766,21 @@ def check_bounded_attempts(ctx):
     _raises(m, m.ApplyFailed, _change(1), "with a request the target rejects (INVALID_ARGUMENT)")
     calls = len(ctx.grpc.calls_to("ApplyChange"))
     assert calls == 1, f"INVALID_ARGUMENT was retried: {calls} calls, expected 1 (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are retried)"
+    for code in (grpc.StatusCode.ABORTED, grpc.StatusCode.INTERNAL, grpc.StatusCode.UNKNOWN):
+        before = len(ctx.grpc.calls_to("ApplyChange"))
+        ctx.grpc.fail("ApplyChange", code, "the target refused the change", times=1)
+        _raises(m, m.ApplyFailed, _change(3), f"with the target answering {code.name}")
+        made = len(ctx.grpc.calls_to("ApplyChange")) - before
+        assert made == 1, f"{code.name} was retried: {made} calls, expected 1 (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are retried)"
+    before = len(ctx.grpc.calls_to("ApplyChange"))
+    ctx.grpc.fail("ApplyChange", grpc.StatusCode.RESOURCE_EXHAUSTED, "target busy", times=1)
+    offset = m.replicate_change("rep-1", 0, _change(4))
+    made = len(ctx.grpc.calls_to("ApplyChange")) - before
+    assert made == 2 and offset == 4, f"after one RESOURCE_EXHAUSTED replicate_change made {made} calls and returned {offset}, expected 2 calls and the offset 4: RESOURCE_EXHAUSTED is retried"
+    before = len(ctx.grpc.calls_to("ApplyChange"))
     ctx.grpc.fail("ApplyChange", grpc.StatusCode.UNAVAILABLE, times=10)
     _raises(m, m.ApplyFailed, _change(2), "with the target unavailable")
-    calls = len(ctx.grpc.calls_to("ApplyChange")) - 1
+    calls = len(ctx.grpc.calls_to("ApplyChange")) - before
     assert calls == 3, f"an unavailable target was called {calls} times for one change, expected MAX_ATTEMPTS = 3"
 
 
@@ -790,6 +807,10 @@ def check_schema_mismatch(ctx):
 
 def check_advance_after_confirm(ctx):
     m, _ = _client(ctx)
+    advance_offset("rep-1", 1, 10)
+    offset = m.replicate_change("rep-1", 1, _change(7))
+    assert offset == 10, f"shard 1 already stood at 10 and replicating the late change c-7 returned {offset}, expected 10: return the shard's offset as advance_offset leaves it"
+    assert resume_offset("rep-1", 1) == 10, f"a late change moved shard 1 back to {resume_offset('rep-1', 1)}"
     m.replicate_change("rep-1", 0, _change(1))
     ctx.grpc.fail("ApplyChange", grpc.StatusCode.UNAVAILABLE, times=20)
     try:
@@ -846,8 +867,11 @@ export async function check_deadline(ctx) {
   ctx.grpc.setLatency('ApplyChange', 10.0);
   const before = ctx.grpc.callsTo('ApplyChange').length;
   await raises(m, m.ApplyFailed, change(2), 'with a target slower than the deadline');
-  const made = ctx.grpc.callsTo('ApplyChange').length - before;
-  assert(made <= 3, \`a target slower than the deadline was called \${made} times, expected at most 3\`);
+  const slow = ctx.grpc.callsTo('ApplyChange').slice(before);
+  assert.equal(slow.length, 3, \`a target slower than the deadline was called \${slow.length} times, expected MAX_ATTEMPTS = 3 (DEADLINE_EXCEEDED is retried)\`);
+  slow.forEach((call, i) => {
+    assert(call.timeout !== null && 2.5 <= call.timeout && call.timeout <= 3.5, \`attempt \${i + 1} against a slow target carried a \${call.timeout} s deadline, expected DEADLINE_MS = 3000: each attempt gets its own deadline, not what is left of the first\`);
+  });
 }
 
 export async function check_bounded_attempts(ctx) {
@@ -856,9 +880,22 @@ export async function check_bounded_attempts(ctx) {
   await raises(m, m.ApplyFailed, change(1), 'with a request the target rejects (INVALID_ARGUMENT)');
   let calls = ctx.grpc.callsTo('ApplyChange').length;
   assert.equal(calls, 1, \`INVALID_ARGUMENT was retried: \${calls} calls, expected 1 (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are retried)\`);
+  for (const code of ['ABORTED', 'INTERNAL', 'UNKNOWN']) {
+    const before = ctx.grpc.callsTo('ApplyChange').length;
+    ctx.grpc.fail('ApplyChange', ctx.grpc.status[code], 'the target refused the change', 1);
+    await raises(m, m.ApplyFailed, change(3), \`with the target answering \${code}\`);
+    const made = ctx.grpc.callsTo('ApplyChange').length - before;
+    assert.equal(made, 1, \`\${code} was retried: \${made} calls, expected 1 (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are retried)\`);
+  }
+  let before = ctx.grpc.callsTo('ApplyChange').length;
+  ctx.grpc.fail('ApplyChange', ctx.grpc.status.RESOURCE_EXHAUSTED, 'target busy', 1);
+  const offset = await m.replicateChange('rep-1', 0, change(4));
+  const made = ctx.grpc.callsTo('ApplyChange').length - before;
+  assert(made === 2 && offset === 4, \`after one RESOURCE_EXHAUSTED replicateChange made \${made} calls and resolved \${offset}, expected 2 calls and the offset 4: RESOURCE_EXHAUSTED is retried\`);
+  before = ctx.grpc.callsTo('ApplyChange').length;
   ctx.grpc.fail('ApplyChange', ctx.grpc.status.UNAVAILABLE, '', 10);
   await raises(m, m.ApplyFailed, change(2), 'with the target unavailable');
-  calls = ctx.grpc.callsTo('ApplyChange').length - 1;
+  calls = ctx.grpc.callsTo('ApplyChange').length - before;
   assert.equal(calls, 3, \`an unavailable target was called \${calls} times for one change, expected MAX_ATTEMPTS = 3\`);
 }
 
@@ -886,6 +923,11 @@ export async function check_schema_mismatch(ctx) {
 
 export async function check_advance_after_confirm(ctx) {
   const {m, offsets} = client(ctx);
+  await offsets.advanceOffset('rep-1', 1, 10);
+  const offset = await m.replicateChange('rep-1', 1, change(7));
+  assert.equal(offset, 10, \`shard 1 already stood at 10 and replicating the late change c-7 resolved \${offset}, expected 10: return the shard offset as advanceOffset leaves it\`);
+  const shard1 = await offsets.resumeOffset('rep-1', 1);
+  assert.equal(shard1, 10, \`a late change moved shard 1 back to \${shard1}\`);
   await m.replicateChange('rep-1', 0, change(1));
   ctx.grpc.fail('ApplyChange', ctx.grpc.status.UNAVAILABLE, '', 20);
   let returned = false;
@@ -981,8 +1023,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("ApplyChange", 10.0, "")
 	before := len(ctx.GRPC.CallsTo("ApplyChange", ""))
 	mustFail(ctx, change(2), ErrApplyFailed, "with a target slower than the deadline")
-	made := len(ctx.GRPC.CallsTo("ApplyChange", "")) - before
-	ctx.Assert(made <= 3, "a target slower than the deadline was called %d times, expected at most 3", made)
+	slow := ctx.GRPC.CallsTo("ApplyChange", "")[before:]
+	ctx.Equal(len(slow), 3, "a target slower than the deadline must be called maxAttempts = 3 times (DeadlineExceeded is retried); the calls")
+	for n, call := range slow {
+		ctx.Assert(call.HasDeadline() && 2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "attempt %d against a slow target carried a %v deadline, expected 3 s: each attempt gets its own deadline, not what is left of the first", n+1, call.Timeout)
+	}
 }
 
 func CheckBoundedAttempts(ctx *harness.Ctx) {
@@ -990,9 +1035,21 @@ func CheckBoundedAttempts(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("ApplyChange", codes.InvalidArgument, "offset is not an integer", 1, "")
 	mustFail(ctx, change(1), ErrApplyFailed, "with a request the target rejects (InvalidArgument)")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", "")), 1, "InvalidArgument must not be retried (only Unavailable, DeadlineExceeded and ResourceExhausted are); the calls")
+	for _, code := range []codes.Code{codes.Aborted, codes.Internal, codes.Unknown} {
+		before := len(ctx.GRPC.CallsTo("ApplyChange", ""))
+		ctx.GRPC.Fail("ApplyChange", code, "the target refused the change", 1, "")
+		mustFail(ctx, change(3), ErrApplyFailed, fmt.Sprintf("with the target answering %v", code))
+		ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", ""))-before, 1, "%v must not be retried (only Unavailable, DeadlineExceeded and ResourceExhausted are); the calls", code)
+	}
+	before := len(ctx.GRPC.CallsTo("ApplyChange", ""))
+	ctx.GRPC.Fail("ApplyChange", codes.ResourceExhausted, "target busy", 1, "")
+	offset, err := replicateChange(clientBg, "rep-1", 0, change(4))
+	ctx.NoError(err, "after one ResourceExhausted replicateChange failed: ResourceExhausted is retried")
+	ctx.Assert(len(ctx.GRPC.CallsTo("ApplyChange", ""))-before == 2 && offset == 4, "after one ResourceExhausted replicateChange made %d calls and returned %d, expected 2 calls and the offset 4: ResourceExhausted is retried", len(ctx.GRPC.CallsTo("ApplyChange", ""))-before, offset)
+	before = len(ctx.GRPC.CallsTo("ApplyChange", ""))
 	ctx.GRPC.Fail("ApplyChange", codes.Unavailable, "", 10, "")
 	mustFail(ctx, change(2), ErrApplyFailed, "with the target unavailable")
-	ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", ""))-1, 3, "an unavailable target must be called maxAttempts = 3 times for one change; the calls")
+	ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", ""))-before, 3, "an unavailable target must be called maxAttempts = 3 times for one change; the calls")
 }
 
 func CheckChangeId(ctx *harness.Ctx) {
@@ -1021,7 +1078,15 @@ func CheckSchemaMismatch(ctx *harness.Ctx) {
 
 func CheckAdvanceAfterConfirm(ctx *harness.Ctx) {
 	client(ctx)
-	_, err := replicateChange(clientBg, "rep-1", 0, change(1))
+	_, err := offsets.AdvanceOffset(clientBg, "rep-1", 1, 10)
+	ctx.NoError(err, "AdvanceOffset")
+	offset, err := replicateChange(clientBg, "rep-1", 1, change(7))
+	ctx.NoError(err, "replicateChange(c-7) with a healthy target")
+	ctx.Equal(offset, int64(10), "shard 1 already stood at 10 and replicating the late change c-7 must return the shard's offset as AdvanceOffset leaves it")
+	shard1, err := offsets.ResumeOffset(clientBg, "rep-1", 1)
+	ctx.NoError(err, "ResumeOffset")
+	ctx.Equal(shard1, int64(10), "a late change must not move shard 1 back; its offset")
+	_, err = replicateChange(clientBg, "rep-1", 0, change(1))
 	ctx.NoError(err, "replicateChange(c-1) with a healthy target")
 	ctx.GRPC.Fail("ApplyChange", codes.Unavailable, "", 20, "")
 	_, err = replicateChange(clientBg, "rep-1", 0, change(2))
@@ -1100,8 +1165,13 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("ApplyChange", 10.0);
   const std::size_t before = ctx.GRPC.CallsTo("ApplyChange").size();
   mustThrow<ApplyFailed>(ctx, change(2), "ApplyFailed", "with a target slower than the deadline");
-  const std::size_t made = ctx.GRPC.CallsTo("ApplyChange").size() - before;
-  ctx.Assert(made <= 3, "a target slower than the deadline was called %d times, expected at most 3", made);
+  const auto calls = ctx.GRPC.CallsTo("ApplyChange");
+  ctx.Equal(calls.size() - before, 3, "a target slower than the deadline must be called kMaxAttempts = 3 times (DEADLINE_EXCEEDED is retried); the calls");
+  for (std::size_t n = before; n < calls.size(); n++) {
+    ctx.Assert(calls[n].HasDeadline() && 2.5 <= calls[n].TimeoutSeconds() && calls[n].TimeoutSeconds() <= 3.5,
+               "attempt %d against a slow target carried a %v s deadline, expected kApplyDeadline = 3 s: each attempt gets its own deadline, not what is left of the first",
+               n - before + 1, calls[n].TimeoutSeconds());
+  }
 }
 
 void CheckBoundedAttempts(harness::Ctx& ctx) {
@@ -1109,9 +1179,23 @@ void CheckBoundedAttempts(harness::Ctx& ctx) {
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::INVALID_ARGUMENT, "offset is not an integer", 1);
   mustThrow<ApplyFailed>(ctx, change(1), "ApplyFailed", "with a request the target rejects (INVALID_ARGUMENT)");
   ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size(), 1, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are); the calls");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> refused = {
+      {grpc::StatusCode::ABORTED, "ABORTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNKNOWN, "UNKNOWN"}};
+  for (const auto& [code, name] : refused) {
+    const std::size_t before = ctx.GRPC.CallsTo("ApplyChange").size();
+    ctx.GRPC.Fail("ApplyChange", code, "the target refused the change", 1);
+    mustThrow<ApplyFailed>(ctx, change(3), "ApplyFailed", "with the target answering " + name);
+    ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size() - before, 1, "%s must not be retried (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are); the calls", name);
+  }
+  std::size_t before = ctx.GRPC.CallsTo("ApplyChange").size();
+  ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::RESOURCE_EXHAUSTED, "target busy", 1);
+  const long long offset = replicateChange("rep-1", 0, change(4));
+  const std::size_t made = ctx.GRPC.CallsTo("ApplyChange").size() - before;
+  ctx.Assert(made == 2 && offset == 4, "after one RESOURCE_EXHAUSTED replicateChange made %d calls and returned %d, expected 2 calls and the offset 4: RESOURCE_EXHAUSTED is retried", made, offset);
+  before = ctx.GRPC.CallsTo("ApplyChange").size();
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::UNAVAILABLE, "", 10);
   mustThrow<ApplyFailed>(ctx, change(2), "ApplyFailed", "with the target unavailable");
-  ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size() - 1, 3, "an unavailable target must be called kMaxAttempts = 3 times for one change; the calls");
+  ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size() - before, 3, "an unavailable target must be called kMaxAttempts = 3 times for one change; the calls");
 }
 
 void CheckChangeId(harness::Ctx& ctx) {
@@ -1137,6 +1221,10 @@ void CheckSchemaMismatch(harness::Ctx& ctx) {
 
 void CheckAdvanceAfterConfirm(harness::Ctx& ctx) {
   client(ctx);
+  offsets::advanceOffset("rep-1", 1, 10);
+  const long long offset = replicateChange("rep-1", 1, change(7));
+  ctx.Equal(offset, 10, "shard 1 already stood at 10 and replicating the late change c-7 must return the shard's offset as advanceOffset leaves it");
+  ctx.Equal(offsets::resumeOffset("rep-1", 1), 10, "a late change must not move shard 1 back; its offset");
   replicateChange("rep-1", 0, change(1));
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::UNAVAILABLE, "", 20);
   bool returned = false;

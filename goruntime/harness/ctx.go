@@ -9,8 +9,9 @@
 //
 //	ctx.Fatalf / Assert / Equal / NoError / ErrorIs   fail the check with a message
 //	ctx.Redis      the server, synchronously: Get, Set, PTTL, Keys("*"), HGetAll, Do("CMD", args…) …;
-//	               After(key, fn) runs fn right after the first command touching key, before its
-//	               caller sees the reply; Subscribe; RoundTrips
+//	               After(key, fn) runs fn right after the first successful command, MULTI/EXEC
+//	               block or script touching key, before its caller sees the reply; Subscribe;
+//	               RoundTrips
 //	ctx.Kafka      the broker: CreateTopic, Seed, SeedPartition, Records, Values, Keys, EndOffset, Lag,
 //	               Committed, CommittedOffset, Commits, Commit, OnCommit, OnSubscribe, FailNext, Stall,
 //	               StallFor, Resume, LoseAcks, Failover, Events, EventsOf, Consumers, Flushes

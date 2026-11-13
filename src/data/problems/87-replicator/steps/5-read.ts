@@ -21,9 +21,11 @@ shard whose rows differ between the regions reports healthy, because nothing com
 - \`X-Operator-Id\` is required (**401**); a replication the caller does not own is **404**.
 - \`shards\`: one entry per shard with \`shard\`, \`offset\`, \`source_head_offset\` and \`lag_changes\` =
   head − offset, never below 0.
-- Per shard, take \`regions.sample_keys(source_region, shard, SAMPLE_KEYS)\` (256) and compare
-  \`regions.key_digest\` in both regions; list the differing keys as the shard's \`divergent_keys\`, name
-  the shard in \`divergent_shards\`, and report \`sampled_keys\`. A shard at zero lag can diverge.`,
+- Per shard, take \`regions.sample_keys(source_region, shard, SAMPLE_KEYS)\` (256: the first 256 keys
+  of a larger shard) and compare \`regions.key_digest\` in both regions; list the differing keys as the
+  shard's \`divergent_keys\` and name the shard in \`divergent_shards\`. Report \`sampled_keys\` as
+  \`SAMPLE_KEYS\`, the sample size asked of each shard. A shard can diverge whatever its lag, at zero
+  lag or behind.`,
   sequence: {
     participants: ['Operator', 'replicatord', 'Redis', 'Source region', 'Target region'],
     messages: [
@@ -85,7 +87,7 @@ shard whose rows differ between the regions reports healthy, because nothing com
       id: 'divergent-shards',
       title: 'Samples digests in both regions and names the divergent shards',
       detail:
-        "Each shard's sampled keys (`SAMPLE_KEYS` = 256) are digested in the source and the target region; differing keys are listed and their shards named in `divergent_shards`, whatever the shard's lag. The starter reports `healthy: true` without looking.",
+        "Each shard's sampled keys (`SAMPLE_KEYS` = 256, the first 256 of a larger shard) are digested in the source and the target region; differing keys are listed and their shards named in `divergent_shards`, whatever the shard's lag, and `sampled_keys` reports `SAMPLE_KEYS`. The starter reports `healthy: true` without looking.",
       match: {
         python: {
           all: [/SAMPLE_KEYS\s*=\s*256/, /regions\.sample_keys\(/, /regions\.key_digest\(/, /divergent_shards/],
@@ -597,8 +599,9 @@ async def check_per_shard_lag(ctx):
 
 
 async def check_divergent_shards(ctx):
-    rid = _replication(ctx, [0, 1, 2])
-    for shard in (0, 1, 2):
+    rid = _replication(ctx, [0, 1, 2, 3])
+    _shard(ctx, rid, 0, 30, 40)  # shard 0 is behind and holds a stale row
+    for shard in (1, 2, 3):
         _shard(ctx, rid, shard, 40, 40)
     rows = {"orders/a": "d1", "orders/b": "d2", "orders/c": "d3"}
     _rows(ctx, "us-east-1", 0, rows)
@@ -607,14 +610,19 @@ async def check_divergent_shards(ctx):
     _rows(ctx, "eu-west-1", 1, rows)
     _rows(ctx, "us-east-1", 2, rows)
     _rows(ctx, "eu-west-1", 2, {"orders/a": "d1", "orders/b": "d2"})
+    many = {f"orders/k{i:03d}": f"d{i}" for i in range(300)}
+    _rows(ctx, "us-east-1", 3, many)
+    _rows(ctx, "eu-west-1", 3, {**many, "orders/k100": "stale", "orders/k299": "stale"})
     r = await _lag(ctx, rid)
     body = r.json()
-    assert body.get("divergent_shards") == [0, 2], f"divergent_shards is {body.get('divergent_shards')!r}, expected [0, 2]: shard 0 holds a stale row and shard 2 misses one, both at zero lag ({r.text})"
+    assert body.get("divergent_shards") == [0, 2, 3], f"divergent_shards is {body.get('divergent_shards')!r}, expected [0, 2, 3]: shard 0 holds a stale row 10 changes behind, shard 2 misses one at zero lag, shard 3 differs at its 101st key ({r.text})"
     assert body.get("sampled_keys") == 256, f"sampled_keys is {body.get('sampled_keys')!r}, expected SAMPLE_KEYS = 256"
     by_shard = {s.get("shard"): s for s in body.get("shards") or []}
-    assert (by_shard.get(0) or {}).get("divergent_keys") == ["orders/b"], f"shard 0 must list orders/b as divergent, got {by_shard.get(0)}"
+    assert (by_shard.get(0) or {}).get("divergent_keys") == ["orders/b"], f"shard 0 must list orders/b as divergent whatever its lag, got {by_shard.get(0)}"
     assert (by_shard.get(2) or {}).get("divergent_keys") == ["orders/c"], f"shard 2 must list orders/c (missing at the target), got {by_shard.get(2)}"
     assert (by_shard.get(1) or {}).get("divergent_keys") == [], f"shard 1 is identical in both regions, got {by_shard.get(1)}"
+    keys3 = (by_shard.get(3) or {}).get("divergent_keys")
+    assert keys3 == ["orders/k100"], f"shard 3 holds 300 rows and differs at orders/k100 (inside the first SAMPLE_KEYS = 256) and orders/k299 (outside them); its divergent_keys are {keys3}, expected ['orders/k100']"
 `,
     typescript: `function setup(ctx, shards: number[]) {
   return ctx.load('/support/replication/store.ts').create('ops-a', 'us-east-1', 'eu-west-1', shards, 'source-wins');
@@ -666,8 +674,9 @@ export async function check_per_shard_lag(ctx) {
 }
 
 export async function check_divergent_shards(ctx) {
-  const {id} = await setup(ctx, [0, 1, 2]);
-  for (const n of [0, 1, 2]) shard(ctx, id, n, 40, 40);
+  const {id} = await setup(ctx, [0, 1, 2, 3]);
+  shard(ctx, id, 0, 30, 40); // shard 0 is behind and holds a stale row
+  for (const n of [1, 2, 3]) shard(ctx, id, n, 40, 40);
   const rows = {'orders/a': 'd1', 'orders/b': 'd2', 'orders/c': 'd3'};
   ctx.redis.hset('digest:us-east-1:0', rows);
   ctx.redis.hset('digest:eu-west-1:0', {...rows, 'orders/b': 'd2-stale'});
@@ -675,14 +684,18 @@ export async function check_divergent_shards(ctx) {
   ctx.redis.hset('digest:eu-west-1:1', rows);
   ctx.redis.hset('digest:us-east-1:2', rows);
   ctx.redis.hset('digest:eu-west-1:2', {'orders/a': 'd1', 'orders/b': 'd2'});
+  const many = Object.fromEntries(Array.from({length: 300}, (_, i) => [\`orders/k\${String(i).padStart(3, '0')}\`, \`d\${i}\`]));
+  ctx.redis.hset('digest:us-east-1:3', many);
+  ctx.redis.hset('digest:eu-west-1:3', {...many, 'orders/k100': 'stale', 'orders/k299': 'stale'});
   const r = await lag(ctx, id);
   const body = r.json();
-  assert.deepStrictEqual(body.divergent_shards, [0, 2], \`divergent_shards is \${JSON.stringify(body.divergent_shards)}, expected [0, 2]: shard 0 holds a stale row and shard 2 misses one, both at zero lag (\${r.text})\`);
+  assert.deepStrictEqual(body.divergent_shards, [0, 2, 3], \`divergent_shards is \${JSON.stringify(body.divergent_shards)}, expected [0, 2, 3]: shard 0 holds a stale row 10 changes behind, shard 2 misses one at zero lag, shard 3 differs at its 101st key (\${r.text})\`);
   assert.equal(body.sampled_keys, 256, \`sampled_keys is \${JSON.stringify(body.sampled_keys)}, expected SAMPLE_KEYS = 256\`);
   const byShard = Object.fromEntries((body.shards ?? []).map(s => [s.shard, s]));
-  assert.deepStrictEqual(byShard[0]?.divergent_keys, ['orders/b'], \`shard 0 must list orders/b as divergent, got \${JSON.stringify(byShard[0])}\`);
+  assert.deepStrictEqual(byShard[0]?.divergent_keys, ['orders/b'], \`shard 0 must list orders/b as divergent whatever its lag, got \${JSON.stringify(byShard[0])}\`);
   assert.deepStrictEqual(byShard[2]?.divergent_keys, ['orders/c'], \`shard 2 must list orders/c (missing at the target), got \${JSON.stringify(byShard[2])}\`);
   assert.deepStrictEqual(byShard[1]?.divergent_keys, [], \`shard 1 is identical in both regions, got \${JSON.stringify(byShard[1])}\`);
+  assert.deepStrictEqual(byShard[3]?.divergent_keys, ['orders/k100'], \`shard 3 holds 300 rows and differs at orders/k100 (inside the first SAMPLE_KEYS = 256) and orders/k299 (outside them); its divergent_keys are \${JSON.stringify(byShard[3]?.divergent_keys)}, expected ["orders/k100"]\`);
 }
 `,
     go: `package main
@@ -774,8 +787,9 @@ func CheckPerShardLag(ctx *harness.Ctx) {
 }
 
 func CheckDivergentShards(ctx *harness.Ctx) {
-	rid := setup(ctx, []int{0, 1, 2})
-	for _, shard := range []int{0, 1, 2} {
+	rid := setup(ctx, []int{0, 1, 2, 3})
+	shardAt(ctx, rid, 0, 30, 40) // shard 0 is behind and holds a stale row
+	for _, shard := range []int{1, 2, 3} {
 		shardAt(ctx, rid, shard, 40, 40)
 	}
 	rows(ctx, "us-east-1", 0, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
@@ -784,18 +798,25 @@ func CheckDivergentShards(ctx *harness.Ctx) {
 	rows(ctx, "eu-west-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
 	rows(ctx, "us-east-1", 2, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
 	rows(ctx, "eu-west-1", 2, "orders/a", "d1", "orders/b", "d2")
+	var many []string
+	for i := 0; i < 300; i++ {
+		many = append(many, fmt.Sprintf("orders/k%03d", i), fmt.Sprintf("d%d", i))
+	}
+	rows(ctx, "us-east-1", 3, many...)
+	rows(ctx, "eu-west-1", 3, append(many, "orders/k100", "stale", "orders/k299", "stale")...)
 	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
 	var body lagBody
 	r.Decode(&body)
-	ctx.Equal(body.DivergentShards, []int{0, 2}, "shard 0 holds a stale row and shard 2 misses one, both at zero lag (%s); divergent_shards", r.Text())
-	ctx.Equal(body.SampledKeys, 256, "sampled_keys must be the sample size")
+	ctx.Equal(body.DivergentShards, []int{0, 2, 3}, "shard 0 holds a stale row 10 changes behind, shard 2 misses one at zero lag, shard 3 differs at its 101st key (%s); divergent_shards", r.Text())
+	ctx.Equal(body.SampledKeys, 256, "sampled_keys must be SAMPLE_KEYS, the sample size")
 	keys := map[int][]string{}
 	for _, s := range body.Shards {
 		keys[s.Shard] = s.DivergentKeys
 	}
-	ctx.Equal(keys[0], []string{"orders/b"}, "shard 0's divergent_keys")
+	ctx.Equal(keys[0], []string{"orders/b"}, "shard 0 is behind and still diverged; its divergent_keys")
 	ctx.Equal(keys[2], []string{"orders/c"}, "shard 2's divergent_keys (missing at the target)")
 	ctx.Equal(keys[1], []string{}, "shard 1 is identical in both regions; its divergent_keys")
+	ctx.Equal(keys[3], []string{"orders/k100"}, "shard 3 holds 300 rows and differs at orders/k100 (inside the first sampleKeys = 256) and orders/k299 (outside them); its divergent_keys")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -882,8 +903,9 @@ void CheckPerShardLag(harness::Ctx& ctx) {
 }
 
 void CheckDivergentShards(harness::Ctx& ctx) {
-  const std::string rid = setup({0, 1, 2});
-  for (const int shard : {0, 1, 2}) shardAt(ctx, rid, shard, 40, 40);
+  const std::string rid = setup({0, 1, 2, 3});
+  shardAt(ctx, rid, 0, 30, 40);  // shard 0 is behind and holds a stale row
+  for (const int shard : {1, 2, 3}) shardAt(ctx, rid, shard, 40, 40);
   const std::vector<std::string> all = {"orders/a", "d1", "orders/b", "d2", "orders/c", "d3"};
   rows(ctx, "us-east-1", 0, all);
   rows(ctx, "eu-west-1", 0, {"orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3"});
@@ -891,14 +913,26 @@ void CheckDivergentShards(harness::Ctx& ctx) {
   rows(ctx, "eu-west-1", 1, all);
   rows(ctx, "us-east-1", 2, all);
   rows(ctx, "eu-west-1", 2, {"orders/a", "d1", "orders/b", "d2"});
+  std::vector<std::string> many;
+  for (int i = 0; i < 300; i++) {
+    const std::string n = std::to_string(i);
+    many.push_back("orders/k" + std::string(3 - n.size(), '0') + n);
+    many.push_back("d" + n);
+  }
+  rows(ctx, "us-east-1", 3, many);
+  many.insert(many.end(), {"orders/k100", "stale", "orders/k299", "stale"});
+  rows(ctx, "eu-west-1", 3, many);
   const auto r = lag(ctx, rid, "ops-a");
   const auto body = bodyOf(r);
-  ctx.Assert(body.is_object() && body.contains("divergent_shards") && body["divergent_shards"] == nlohmann::json::array({0, 2}),
-             "divergent_shards must be [0, 2]: shard 0 holds a stale row and shard 2 misses one, both at zero lag (%s)", r.Text());
-  ctx.Equal(body.value("sampled_keys", 0), 256, "sampled_keys must be the sample size");
-  ctx.Assert(shardEntry(body, 0).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/b"}), "shard 0 must list orders/b as divergent, got %s", shardEntry(body, 0).dump());
+  ctx.Assert(body.is_object() && body.contains("divergent_shards") && body["divergent_shards"] == nlohmann::json::array({0, 2, 3}),
+             "divergent_shards must be [0, 2, 3]: shard 0 holds a stale row 10 changes behind, shard 2 misses one at zero lag, shard 3 differs at its 101st key (%s)", r.Text());
+  ctx.Equal(body.value("sampled_keys", 0), 256, "sampled_keys must be kSampleKeys, the sample size");
+  ctx.Assert(shardEntry(body, 0).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/b"}), "shard 0 must list orders/b as divergent whatever its lag, got %s", shardEntry(body, 0).dump());
   ctx.Assert(shardEntry(body, 2).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/c"}), "shard 2 must list orders/c (missing at the target), got %s", shardEntry(body, 2).dump());
   ctx.Assert(shardEntry(body, 1).contains("divergent_keys") && shardEntry(body, 1)["divergent_keys"].empty(), "shard 1 is identical in both regions, got %s", shardEntry(body, 1).dump());
+  ctx.Assert(shardEntry(body, 3).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/k100"}),
+             "shard 3 holds 300 rows and differs at orders/k100 (inside the first kSampleKeys = 256) and orders/k299 (outside them); its divergent_keys are %s, expected [\\"orders/k100\\"]",
+             shardEntry(body, 3).value("divergent_keys", nlohmann::json::array()).dump());
 }
 `,
   },

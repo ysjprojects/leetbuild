@@ -140,18 +140,9 @@ std::string unit(GeoUnit u) {
   }
 }
 
-QueuedReplies send_queued(const char* op, std::vector<std::vector<std::string>>& queued) {
-  lb::Json cmds = lb::Json::array();
-  bool waits = false;
-  for (const auto& c : queued) {
-    cmds.push(to_json(c));
-    waits = waits || blocking(c);
-  }
-  queued.clear();
-  // A pipeline holding a blocking command waits for it (a transaction's never block, as in MULTI).
-  const lb::Json tagged = from_bridge(waits && std::string_view(op) == "redis.pipeline"
-                                          ? lb::call_async("redis.executePipelineBlocking", cmds)
-                                          : lb::call(op, cmds));
+namespace {
+
+QueuedReplies replies_of(const lb::Json& tagged) {
   std::vector<lb::Json> replies;
   std::vector<std::string> errors;
   for (const auto& t : tagged.items()) {
@@ -161,25 +152,43 @@ QueuedReplies send_queued(const char* op, std::vector<std::vector<std::string>>&
   return QueuedReplies(std::move(replies), std::move(errors));
 }
 
-namespace {
-
-std::string fingerprint(const std::string& key) {
-  return lb::call("redis.fingerprint", lb::Json(to_bridge(key))).as_string();
+lb::Json commands_json(std::vector<std::vector<std::string>>& queued, bool* waits) {
+  lb::Json cmds = lb::Json::array();
+  for (const auto& c : queued) {
+    cmds.push(to_json(c));
+    if (waits != nullptr) *waits = *waits || blocking(c);
+  }
+  queued.clear();
+  return cmds;
 }
 
 }  // namespace
 
-void watch(WatchState& state, const std::vector<std::string>& keys) {
-  for (const auto& k : keys) state.keys.emplace_back(k, fingerprint(k));
+QueuedReplies send_queued(const char* op, std::vector<std::vector<std::string>>& queued) {
+  bool waits = false;
+  const lb::Json cmds = commands_json(queued, &waits);
+  // A pipeline holding a blocking command waits for it (a transaction's never block, as in MULTI).
+  return replies_of(from_bridge(waits && std::string_view(op) == "redis.pipeline"
+                                    ? lb::call_async("redis.executePipelineBlocking", cmds)
+                                    : lb::call(op, cmds)));
 }
 
-bool watch_intact(WatchState& state) {
-  bool intact = true;
-  for (const auto& [k, seen] : state.keys) {
-    if (fingerprint(k) != seen) intact = false;
-  }
-  state.keys.clear();
-  return intact;
+void watch(WatchState& state, const std::vector<std::string>& keys) {
+  if (state.conn == 0) state.conn = lb::call("redis.connect").as_int();
+  lb::call("redis.watch", lb::Json(std::map<std::string, lb::Json>{{"conn", state.conn}, {"keys", to_json(keys)}}));
+}
+
+void unwatch(WatchState& state) {
+  if (state.conn != 0) lb::call("redis.unwatch", lb::Json(state.conn));
+}
+
+QueuedReplies exec_transaction(WatchState& state, std::vector<std::vector<std::string>>& queued) {
+  if (state.conn == 0) return send_queued("redis.transaction", queued);
+  const lb::Json cmds = commands_json(queued, nullptr);
+  const lb::Json tagged =
+      lb::call("redis.exec", lb::Json(std::map<std::string, lb::Json>{{"conn", state.conn}, {"commands", cmds}}));
+  if (tagged.is_null()) throw WatchError();
+  return replies_of(from_bridge(tagged));
 }
 
 }  // namespace detail
@@ -215,13 +224,7 @@ redisReply& QueuedReplies::get(std::size_t idx) {
   return *raw_[idx];
 }
 
-QueuedReplies Transaction::exec() {
-  if (!watch_->keys.empty() && !detail::watch_intact(*watch_)) {
-    queued_.clear();
-    throw WatchError();
-  }
-  return send("redis.transaction");
-}
+QueuedReplies Transaction::exec() { return detail::exec_transaction(*watch_, queued_); }
 
 void Subscriber::consume() {
   while (state_->inbox.empty()) {

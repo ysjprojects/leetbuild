@@ -26,7 +26,8 @@ done, and a finished job's ledger stays in Redis for good.
   \`done\` answers \`duplicate\`; one with no state, or \`failed\`, becomes \`running\`.
 - A \`transcribe()\` that raises writes \`failed\` and answers \`failed\`, so a redelivery can claim
   the chunk again.
-- When the last chunk is \`done\`, \`EXPIRE\` the ledger for \`LEDGER_TTL_S\` = 86 400 s.`,
+- When every chunk of the job is \`done\` (a \`failed\` or \`running\` one is not), \`EXPIRE\` the ledger
+  for \`LEDGER_TTL_S\` = 86 400 s and mark the job done.`,
   sequence: {
     participants: ['Chunk worker', 'Redis ledger', 'ASR provider', 'jobs store'],
     messages: [
@@ -74,7 +75,7 @@ done, and a finished job's ledger stays in Redis for good.
       id: 'atomic-claim',
       title: 'The claim is one Lua script',
       detail:
-        'Reading the chunk state and writing `running` happen in one script (`register_script`/`eval`/`NewScript`), so two deliveries racing on the ledger cannot both win; an `HGET` followed by an `HSET` leaves a gap another worker lands in.',
+        'Reading the chunk state and writing `running` happen in one script (`register_script`/`eval`/`NewScript`), so two deliveries racing on the ledger cannot both win, whether the chunk is new or `failed`; an `HGET` followed by an `HSET` leaves a gap another worker lands in.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /redis\.call\(\s*['"]HSET['"]/],
@@ -115,7 +116,7 @@ done, and a finished job's ledger stays in Redis for good.
       id: 'ledger-ttl',
       title: "A finished job's ledger expires in 24 hours",
       detail:
-        'Once the last chunk is `done` the ledger gets an `EXPIRE` of `LEDGER_TTL_S` (86 400 s), and not before; the starter never sets one, so every finished job keeps its ledger in Redis.',
+        'Once every chunk is `done` the job is marked done and the ledger gets an `EXPIRE` of `LEDGER_TTL_S` (86 400 s), and not before: a `failed` chunk keeps the job queued and its ledger alive. The starter never sets one, so every finished job keeps its ledger in Redis.',
       match: {
         python: {all: [/LEDGER_TTL_S\s*=\s*(?:86_?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
         typescript: {all: [/LEDGER_TTL_S\s*=\s*(?:86_?400|24\s*\*\s*60\s*\*\s*60)\b/, /\.expire\(/]},
@@ -652,6 +653,10 @@ def check_claim_before_transcribe(ctx):
     assert seen[0] == "running", f"while the chunk is at the provider job:{job}:chunks holds {seen[0]!r} for it, expected 'running'"
 
 
+def _broken():
+    raise RuntimeError("ASR: the span could not be decoded")
+
+
 def check_atomic_claim(ctx):
     m = ctx.load("state")
     job = _job()
@@ -664,16 +669,24 @@ def check_atomic_claim(ctx):
         raise rival.error
     statuses = sorted([mine["status"], rival.result["status"]])
     assert len(calls) == 1 and statuses == ["done", "duplicate"], f"two deliveries racing on the ledger transcribed chunk 0 {len(calls)} times ({statuses}): reading the state and writing running must be one Lua script"
+    # Two redeliveries of a failed chunk: the second lands right after the first one's second command on the ledger.
+    m.run_chunk(job, 1, 3, _broken)
+    again = []
+    armed = ctx.redis_after(f"job:{job}:chunks", lambda: ctx.redis_after(f"job:{job}:chunks", lambda: m.run_chunk(job, 1, 3, _asr(again, 1))))
+    mine = m.run_chunk(job, 1, 3, _asr(again, 1))
+    if armed.error is not None:
+        raise armed.error
+    rival = armed.result
+    if rival is not None and rival.error is not None:
+        raise rival.error
+    theirs = rival.result["status"] if rival is not None and rival.fired else None
+    assert len(again) <= 1, f"two redeliveries racing on failed chunk 1 transcribed it {len(again)} times ({mine['status']}, {theirs}): reclaiming a failed chunk must be the same one Lua script"
 
 
 def check_failure_releases(ctx):
     m = ctx.load("state")
     job = _job()
-
-    def broken():
-        raise RuntimeError("ASR: the span could not be decoded")
-
-    result = m.run_chunk(job, 1, 3, broken)
+    result = m.run_chunk(job, 1, 3, _broken)
     assert result["status"] == "failed", f"a chunk whose transcription raised answered {result}: a failure is not progress"
     state = ctx.redis.hget(f"job:{job}:chunks", "1")
     assert state == "failed", f"after a failed transcription job:{job}:chunks holds {state!r} for chunk 1, expected 'failed'"
@@ -697,6 +710,16 @@ def check_ledger_ttl(ctx):
     ttl = ctx.redis.ttl(key)
     assert 86000 < ttl <= 86400, f"after the last chunk {key} has a TTL of {ttl}, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good"
     assert jobs.get(job)["status"] == "done", f"after the last chunk the job is {jobs.get(job)['status']!r}, expected done"
+    # Chunk 1 of another job fails while chunks 0 and 2 are done: three fields, two of them done.
+    other = _job("s3://calls/b.wav")
+    key = f"job:{other}:chunks"
+    m.run_chunk(other, 0, 3, _asr(calls, 0))
+    m.run_chunk(other, 1, 3, _broken)
+    m.run_chunk(other, 2, 3, _asr(calls, 2))
+    status = jobs.get(other)["status"]
+    assert status == "queued" and ctx.redis.ttl(key) == -1, f"with chunk 1 failed and chunks 0 and 2 done the job is {status!r} and {key} has a TTL of {ctx.redis.ttl(key)} s: a failed chunk is not done, the job is still queued and its ledger must not expire"
+    m.run_chunk(other, 1, 3, _asr(calls, 1))
+    assert jobs.get(other)["status"] == "done" and 86000 < ctx.redis.ttl(key) <= 86400, f"once the failed chunk is redelivered and done, the job is {jobs.get(other)['status']!r} and {key} has a TTL of {ctx.redis.ttl(key)} s, expected done and 86 400 s"
 `,
     typescript: `function world(ctx) {
   return {m: ctx.load('state'), jobs: ctx.load('/support/transcribe/jobs.ts')};
@@ -749,6 +772,10 @@ export async function check_claim_before_transcribe(ctx) {
   assert.equal(seen[0], 'running', \`while the chunk is at the provider job:\${job}:chunks holds \${JSON.stringify(seen[0])} for it, expected running\`);
 }
 
+const broken = async () => {
+  throw new Error('ASR: the span could not be decoded');
+};
+
 export async function check_atomic_claim(ctx) {
   const {m, jobs} = world(ctx);
   const job = await newJob(jobs);
@@ -761,14 +788,22 @@ export async function check_atomic_claim(ctx) {
   const theirs = await rival.result;
   const statuses = [mine.status, theirs.status].sort();
   assert(calls.length === 1 && statuses[0] === 'done' && statuses[1] === 'duplicate', \`two deliveries racing on the ledger transcribed chunk 0 \${calls.length} times (\${statuses}): reading the state and writing running must be one Lua script\`);
+  // Two redeliveries of a failed chunk: the second lands right after the first one's second command on the ledger.
+  await m.runChunk(job, 1, 3, broken);
+  const again: number[] = [];
+  const armed = ctx.redisAfter(\`job:\${job}:chunks\`, () => ctx.redisAfter(\`job:\${job}:chunks\`, () => m.runChunk(job, 1, 3, asr(again, 1))));
+  const mineAgain = await m.runChunk(job, 1, 3, asr(again, 1));
+  if (armed.error !== undefined) throw armed.error;
+  const second = armed.result;
+  if (second?.error !== undefined) throw second.error;
+  const theirsAgain = second?.fired ? (await second.result)?.status : null;
+  assert(again.length <= 1, \`two redeliveries racing on failed chunk 1 transcribed it \${again.length} times (\${mineAgain.status}, \${theirsAgain}): reclaiming a failed chunk must be the same one Lua script\`);
 }
 
 export async function check_failure_releases(ctx) {
   const {m, jobs} = world(ctx);
   const job = await newJob(jobs);
-  const result = await m.runChunk(job, 1, 3, async () => {
-    throw new Error('ASR: the span could not be decoded');
-  });
+  const result = await m.runChunk(job, 1, 3, broken);
   assert.equal(result.status, 'failed', \`a chunk whose transcription threw answered \${JSON.stringify(result)}: a failure is not progress\`);
   const state = ctx.redis.hget(\`job:\${job}:chunks\`, '1');
   assert.equal(state, 'failed', \`after a failed transcription job:\${job}:chunks holds \${JSON.stringify(state)} for chunk 1, expected failed\`);
@@ -791,6 +826,18 @@ export async function check_ledger_ttl(ctx) {
   const ttl = Number(ctx.redis.ttl(key));
   assert(86000 < ttl && ttl <= 86400, \`after the last chunk \${key} has a TTL of \${ttl}, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good\`);
   assert.equal((await jobs.get(job)).status, 'done', 'after the last chunk the job must be done');
+  // Chunk 1 of another job fails while chunks 0 and 2 are done: three fields, two of them done.
+  const other = await newJob(jobs, 's3://calls/b.wav');
+  const otherKey = \`job:\${other}:chunks\`;
+  await m.runChunk(other, 0, 3, asr(calls, 0));
+  await m.runChunk(other, 1, 3, broken);
+  await m.runChunk(other, 2, 3, asr(calls, 2));
+  const status = (await jobs.get(other)).status;
+  assert(status === 'queued' && Number(ctx.redis.ttl(otherKey)) === -1, \`with chunk 1 failed and chunks 0 and 2 done the job is \${status} and \${otherKey} has a TTL of \${ctx.redis.ttl(otherKey)} s: a failed chunk is not done, the job is still queued and its ledger must not expire\`);
+  await m.runChunk(other, 1, 3, asr(calls, 1));
+  const finished = (await jobs.get(other)).status;
+  const otherTtl = Number(ctx.redis.ttl(otherKey));
+  assert(finished === 'done' && 86000 < otherTtl && otherTtl <= 86400, \`once the failed chunk is redelivered and done, the job is \${finished} and \${otherKey} has a TTL of \${otherTtl} s, expected done and 86 400 s\`);
 }
 `,
     go: `package main
@@ -880,11 +927,29 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	statuses := []string{mine.Status, fmt.Sprint(rival.Result)}
 	sort.Strings(statuses)
 	ctx.Assert(len(calls) == 1 && statuses[0] == "done" && statuses[1] == "duplicate", "two deliveries racing on the ledger transcribed chunk 0 %d times (%v): reading the state and writing running must be one Lua script", len(calls), statuses)
+	// Two redeliveries of a failed chunk: the second lands right after the first one's second command on the ledger.
+	mustRun(ctx, job, 1, stateBroken)
+	var again []int
+	theirs := "no rival"
+	var rivalErr error
+	ctx.Redis.After("job:"+job+":chunks", func() any {
+		ctx.Redis.After("job:"+job+":chunks", func() any {
+			r, err := runChunk(stateBg, job, 1, 3, stateAsr(&again, 1))
+			theirs, rivalErr = r.Status, err
+			return nil
+		})
+		return nil
+	})
+	mineAgain := mustRun(ctx, job, 1, stateAsr(&again, 1))
+	ctx.NoError(rivalErr, "the rival redelivery of failed chunk 1 failed")
+	ctx.Assert(len(again) <= 1, "two redeliveries racing on failed chunk 1 transcribed it %d times (%s, %s): reclaiming a failed chunk must be the same one Lua script", len(again), mineAgain.Status, theirs)
 }
+
+func stateBroken() ([]jobs.Segment, error) { return nil, errors.New("ASR: the span could not be decoded") }
 
 func CheckFailureReleases(ctx *harness.Ctx) {
 	job := stateJob("s3://calls/a.wav")
-	result := mustRun(ctx, job, 1, func() ([]jobs.Segment, error) { return nil, errors.New("ASR: the span could not be decoded") })
+	result := mustRun(ctx, job, 1, stateBroken)
 	ctx.Equal(result.Status, "failed", "a chunk whose transcription failed is not progress; the status")
 	state, _ := ctx.Redis.HGet("job:"+job+":chunks", "1")
 	ctx.Equal(state, "failed", "after a failed transcription, job:%s:chunks for chunk 1", job)
@@ -909,6 +974,17 @@ func CheckLedgerTtl(ctx *harness.Ctx) {
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(86000 < ttl && ttl <= 86400, "after the last chunk %s has a TTL of %d, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good", key, ttl)
 	ctx.Equal(jobs.Get(stateBg, job).Status, "done", "the job after its last chunk")
+	// Chunk 1 of another job fails while chunks 0 and 2 are done: three fields, two of them done.
+	other := stateJob("s3://calls/b.wav")
+	key = "job:" + other + ":chunks"
+	mustRun(ctx, other, 0, stateAsr(&calls, 0))
+	mustRun(ctx, other, 1, stateBroken)
+	mustRun(ctx, other, 2, stateAsr(&calls, 2))
+	status := jobs.Get(stateBg, other).Status
+	ctx.Assert(status == "queued" && ctx.Redis.TTL(key) == -1, "with chunk 1 failed and chunks 0 and 2 done the job is %q and %s has a TTL of %d s: a failed chunk is not done, the job is still queued and its ledger must not expire", status, key, ctx.Redis.TTL(key))
+	mustRun(ctx, other, 1, stateAsr(&calls, 1))
+	status, ttl = jobs.Get(stateBg, other).Status, ctx.Redis.TTL(key)
+	ctx.Assert(status == "done" && 86000 < ttl && ttl <= 86400, "once the failed chunk is redelivered and done, the job is %q and %s has a TTL of %d s, expected done and 86 400 s", status, key, ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -934,6 +1010,9 @@ std::function<std::vector<jobs::Segment>()> stateAsr(std::shared_ptr<std::vector
     return std::vector<jobs::Segment>{stateSegment(index)};
   };
 }
+
+// A transcribe() whose provider cannot decode the span.
+std::vector<jobs::Segment> stateBroken() { throw std::runtime_error("ASR: the span could not be decoded"); }
 
 }  // namespace
 
@@ -990,11 +1069,28 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   std::vector<std::string> statuses = {mine.status, *theirs};
   std::sort(statuses.begin(), statuses.end());
   ctx.Assert(calls->size() == 1 && statuses[0] == "done" && statuses[1] == "duplicate", "two deliveries racing on the ledger transcribed chunk 0 %d times (%q): reading the state and writing running must be one Lua script", calls->size(), statuses);
+  // Two redeliveries of a failed chunk: the second lands right after the first one's second command on the ledger.
+  runChunk(job, 1, 3, stateBroken);
+  auto again = std::make_shared<std::vector<int>>();
+  auto theirsAgain = std::make_shared<std::string>("no rival");
+  harness::Ctx* probes = &ctx;
+  ctx.Redis.After("job:" + job + ":chunks", [=] {
+    probes->Redis.After("job:" + job + ":chunks", [=] {
+      try {
+        *theirsAgain = runChunk(job, 1, 3, stateAsr(again, 1)).status;
+      } catch (const std::exception& e) {
+        *error = e.what();
+      }
+    });
+  });
+  const auto mineAgain = runChunk(job, 1, 3, stateAsr(again, 1));
+  ctx.Assert(!error->has_value(), "the rival redelivery of failed chunk 1 failed: %s", error->value_or(""));
+  ctx.Assert(again->size() <= 1, "two redeliveries racing on failed chunk 1 transcribed it %d times (%s, %s): reclaiming a failed chunk must be the same one Lua script", again->size(), mineAgain.status, *theirsAgain);
 }
 
 void CheckFailureReleases(harness::Ctx& ctx) {
   const std::string job = stateJob("s3://calls/a.wav");
-  const auto result = runChunk(job, 1, 3, []() -> std::vector<jobs::Segment> { throw std::runtime_error("ASR: the span could not be decoded"); });
+  const auto result = runChunk(job, 1, 3, stateBroken);
   ctx.Equal(result.status, "failed", "a chunk whose transcription threw is not progress; the status");
   ctx.Equal(ctx.Redis.HGet("job:" + job + ":chunks", "1").value_or(""), "failed", "after a failed transcription, job:%s:chunks for chunk 1", job);
   auto calls = std::make_shared<std::vector<int>>();
@@ -1015,6 +1111,18 @@ void CheckLedgerTtl(harness::Ctx& ctx) {
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(86000 < ttl && ttl <= 86400, "after the last chunk %s has a TTL of %d, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good", key, ttl);
   ctx.Equal(jobs::get(job)->status, "done", "the job after its last chunk");
+  // Chunk 1 of another job fails while chunks 0 and 2 are done: three fields, two of them done.
+  const std::string other = stateJob("s3://calls/b.wav");
+  const std::string otherKey = "job:" + other + ":chunks";
+  runChunk(other, 0, 3, stateAsr(calls, 0));
+  runChunk(other, 1, 3, stateBroken);
+  runChunk(other, 2, 3, stateAsr(calls, 2));
+  const std::string status = jobs::get(other)->status;
+  ctx.Assert(status == "queued" && ctx.Redis.TTL(otherKey) == -1, "with chunk 1 failed and chunks 0 and 2 done the job is %q and %s has a TTL of %d s: a failed chunk is not done, the job is still queued and its ledger must not expire", status, otherKey, ctx.Redis.TTL(otherKey));
+  runChunk(other, 1, 3, stateAsr(calls, 1));
+  const std::string finished = jobs::get(other)->status;
+  const long long otherTtl = ctx.Redis.TTL(otherKey);
+  ctx.Assert(finished == "done" && 86000 < otherTtl && otherTtl <= 86400, "once the failed chunk is redelivered and done, the job is %q and %s has a TTL of %d s, expected done and 86 400 s", finished, otherKey, otherTtl);
 }
 `,
   },

@@ -1201,3 +1201,292 @@ func Run() string {
 }
 `, "map[big:false n:3 organic:true vegan:false] map[cat:a2 eq:false lt:true sum:5] true [true true 6] true map[k:false] false 1")
 }
+
+// A tagless switch whose case lists several conditions: the case matches when any of them is true,
+// not only the first, with constants, variables, calls and an init statement.
+func TestTaglessSwitchCaseList(t *testing.T) {
+	expect(t, `package main
+
+import "fmt"
+
+func yes() bool { return true }
+
+func pick(a, b bool) string {
+	switch {
+	case a, b:
+		return "hit"
+	}
+	return "miss"
+}
+
+func Run() string {
+	out := ""
+	switch {
+	case false, true:
+		out += "list"
+	}
+	switch x := 3; {
+	case x == 1, x == 3:
+		out += "+init"
+	default:
+		out += "+default"
+	}
+	switch {
+	case false, false, yes():
+		out += "+third"
+	case true:
+		out += "+wrong"
+	}
+	n := 2
+	switch n {
+	case 1, 2:
+		out += "+tagged"
+	}
+	count := 0
+	for attempt := 0; attempt < 3; attempt++ {
+		count++
+		switch {
+		case attempt == 5, attempt == 1:
+			attempt = 9
+		}
+	}
+	return fmt.Sprint(out, " ", pick(false, true), pick(true, false), pick(false, false), " ", count)
+}
+`, "list+init+third+tagged hithitmiss 2")
+}
+
+// Ranging over a string yields the byte offset of each rune as the index, not its ordinal, in
+// every form: index only, index and rune, assigned to existing variables, under a label and over
+// a constant.
+func TestRangeStringByteOffsets(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"fmt"
+	"strings"
+)
+
+const word = "aéb"
+
+func Run() string {
+	s := strings.Repeat("é", 3)
+	var a []int
+	for i := range s {
+		a = append(a, i)
+	}
+	var b []string
+	for i, r := range "xé€y" {
+		b = append(b, fmt.Sprintf("%d:%c", i, r))
+	}
+	var c []int
+	var i int
+	var r rune
+	for i, r = range s {
+		c = append(c, i+int(r)-'é')
+	}
+	var d []int
+outer:
+	for j := range s + s {
+		if j > 6 {
+			break outer
+		}
+		d = append(d, j)
+	}
+	var e []int
+	for k := range word {
+		e = append(e, k)
+	}
+	long := strings.Repeat("é", 300)
+	n := 0
+	for k := range long {
+		if n == 280 {
+			long = long[:k]
+			break
+		}
+		n++
+	}
+	var f []int
+	for k, ch := range "a\xffb" {
+		f = append(f, k, int(ch))
+	}
+	type label string
+	var g []int
+	for k, _ := range label("éa") {
+		g = append(g, k)
+	}
+	h := "éé"
+	var hs []string
+	for _, ch := range h {
+		h = "z"
+		hs = append(hs, string(ch))
+	}
+	return fmt.Sprint(a, b, c, d, e, len([]rune(long)), f, g, hs)
+}
+`, "[0 2 4] [0:x 1:é 3:€ 6:y] [0 2 4] [0 2 4 6] [0 1 3] 280 [0 97 1 65533 2 98] [0 2] [é é]")
+}
+
+// A three-clause for loop whose body assigns its variable: the next iteration starts from the
+// body's value, at the body's end and on continue (labelled too), while closures still capture
+// one variable per iteration.
+func TestForLoopVarAssignedInBody(t *testing.T) {
+	expect(t, `package main
+
+import "fmt"
+
+func Run() string {
+	count := 0
+	for attempt := 0; attempt < 3; attempt++ {
+		count++
+		if attempt == 1 {
+			attempt = 9
+		}
+	}
+	c := 0
+	n := 0
+outer:
+	for i := 0; i < 3; i++ {
+		n++
+		for j := 0; j < 4; j++ {
+			if j == 1 {
+				j++
+				continue
+			}
+			c++
+		}
+		if i == 0 {
+			i++
+			continue outer
+		}
+	}
+	var fns []func() int
+	for i := 0; i < 3; i++ {
+		fns = append(fns, func() int { return i })
+	}
+	var skip []int
+	for i := 0; i < 6; i++ {
+		if i%2 == 0 {
+			i++
+		}
+		skip = append(skip, i)
+	}
+	return fmt.Sprint(count, c, n, fns[0](), fns[1](), fns[2](), skip)
+}
+`, "2 4 2 0 1 2 [1 3 5]")
+}
+
+// html/template and text/template are in the standard library: the escapers, and templates
+// executed over interpreted maps and structs.
+func TestTemplates(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"fmt"
+	"html/template"
+	"strings"
+	ttemplate "text/template"
+)
+
+type card struct {
+	Name string
+	Tags []string
+}
+
+func Run() string {
+	esc := template.HTMLEscapeString("<a href='x'>Tom & \"Jerry\"</a>")
+	page := template.Must(template.New("p").Parse("<p title={{.Name}}>{{.Name}}{{range .Tags}} #{{.}}{{end}}</p>"))
+	var b strings.Builder
+	if err := page.Execute(&b, card{Name: "<b>&", Tags: []string{"x<y"}}); err != nil {
+		return err.Error()
+	}
+	plain := ttemplate.Must(ttemplate.New("t").Funcs(ttemplate.FuncMap{"up": strings.ToUpper}).Parse("{{up .who}}!"))
+	var c strings.Builder
+	if err := plain.Execute(&c, map[string]string{"who": "<ana>"}); err != nil {
+		return err.Error()
+	}
+	return fmt.Sprint(esc, " ", b.String(), " ", c.String(), " ", template.JSEscapeString("'a'"))
+}
+`, "&lt;a href=&#39;x&#39;&gt;Tom &amp; &#34;Jerry&#34;&lt;/a&gt; <p title=&lt;b&gt;&amp;>&lt;b&gt;&amp; #x&lt;y</p> <ANA>! \\'a\\'")
+}
+
+// A call yields exactly one value where one is needed, with go1.27's (types2) messages at the
+// call: `x := f()` with f returning (T, error) compiled and failed at run time
+// ("reflect: call of reflect.Value.Field on zero Value"). Every expectation is native go1.27.2's.
+func TestCallResultCountChecked(t *testing.T) {
+	const prelude = `package main
+
+import (
+	"m/store"
+	"strconv"
+)
+
+var _, _ = strconv.Itoa, store.Enqueue
+
+type S struct{}
+
+func (S) Get() (int, bool)            { return 1, true }
+func none()                           {}
+func one() int                        { return 1 }
+func two() (int, error)               { return 1, nil }
+func three() (int, int, int)          { return 1, 2, 3 }
+`
+	const storeSrc = "package store\n\ntype Ticket struct{ ID string }\n\nfunc Enqueue(p string) (*Ticket, error) { return &Ticket{p}, nil }\n"
+	compile := func(src string) (*Interpreter, error) {
+		return Compile(map[string]string{"src/main/main.go": src, "src/m/store/store.go": storeSrc})
+	}
+	for _, c := range []struct {
+		code, want string
+		global     bool
+	}{
+		{"x := two()", "19:6: assignment mismatch: 1 variable but two returns 2 values", false},
+		{"ticket := store.Enqueue(\"p\")", "19:11: assignment mismatch: 1 variable but store.Enqueue returns 2 values", false},
+		{"x := strconv.Atoi(\"1\")", "19:6: assignment mismatch: 1 variable but strconv.Atoi returns 2 values", false},
+		{"var s S\nx := s.Get()", "20:6: assignment mismatch: 1 variable but s.Get returns 2 values", false},
+		{"f := func() (int, int) { return 1, 2 }\nx := f()", "20:6: assignment mismatch: 1 variable but f returns 2 values", false},
+		{"var x int\nx = two()", "20:5: assignment mismatch: 1 variable but two returns 2 values", false},
+		{"a, b := one()", "19:9: assignment mismatch: 2 variables but one returns 1 value", false},
+		{"a, b := three()", "19:9: assignment mismatch: 2 variables but three returns 3 values", false},
+		{"var a, b int\na, b = three()", "20:8: assignment mismatch: 2 variables but three returns 3 values", false},
+		{"var x, y, z = two()", "19:15: assignment mismatch: 3 variables but two returns 2 values", false},
+		{"var x = two()", "19:9: multiple-value two() (value of type (int, error)) in single-value context", false},
+		{"var x int = two()", "19:13: multiple-value two() (value of type (int, error)) in single-value context", false},
+		{"var t = store.Enqueue(\"p\")", "19:9: multiple-value store.Enqueue(\"p\") (value of type (*store.Ticket, error)) in single-value context", false},
+		{"x, y := 1, two()", "19:12: multiple-value two() (value of type (int, error)) in single-value context", false},
+		{"x := 1\nx += two()", "20:6: multiple-value two() (value of type (int, error)) in single-value context", false},
+		{"x := none()", "19:6: none() (no value) used as value", false},
+		{"a, b := none()", "19:9: none() (no value) used as value", false},
+		{"var a, b = none()", "19:12: none() (no value) used as value", false},
+		{"var g = two()", "18:9: multiple-value two() (value of type (int, error)) in single-value context", true},
+	} {
+		src := prelude + "\nfunc Run() {\n" + c.code + "\n}\n"
+		if c.global {
+			src = prelude + "\n" + c.code + "\n\nfunc Run() {}\n"
+		}
+		_, err := compile(src)
+		if want := "src/main/main.go:" + c.want; err == nil || err.Error() != want {
+			t.Errorf("%q: got %v, want %s", c.code, err, want)
+		}
+	}
+	// Single values, conversions and builtins compile.
+	i, err := compile(prelude + `
+func Run() string {
+	a, b := two()
+	m := map[string]int{"a": 1}
+	n, k, y := len(m), min(1, 2), int64(one())
+	v, ok := m["a"]
+	var s S
+	g, found := s.Get()
+	t, _ := store.Enqueue("p")
+	return strconv.Itoa(a+n+k+int(y)+v+g) + strconv.FormatBool(b == nil && ok && found) + t.ID
+}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := i.Func("Run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Call(nil)[0].String(); got != "6truep" {
+		t.Errorf("Run() = %q, want 6truep", got)
+	}
+}

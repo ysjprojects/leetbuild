@@ -1,7 +1,8 @@
 /**
  * A self-test of the runtimes' Redis model (src/lib/runtime/ts/redis.ts): command sequences with
  * the replies Redis 7.2 gives, each run on a fresh server with the virtual clock frozen at a known
- * instant, then the blocking commands, woken by other clients' writes or timed out on the clock.
+ * instant, then the blocking commands, woken by other clients' writes or timed out on the clock,
+ * and scenarios for Lua 5.1's globals, WATCH per connection and when a probe fires.
  * `redisSelfTest()` returns the failures, none when the model holds. Random picks (SRANDMEMBER,
  * ZRANDMEMBER, HRANDFIELD) are checked on one-member values, where Redis's answer is fixed too.
  */
@@ -521,6 +522,41 @@ export const CASES: Record<string, Step[]> = {
     ['ZRANDMEMBER solo x', NOT_INT],
     ['ZRANDMEMBER str', WRONGTYPE],
   ],
+  'zrange unified syntax': [
+    ['ZADD z 1 a 2 b 3 c 4 d', 4],
+    ['ZRANGE z 0 -1', ['a', 'b', 'c', 'd']],
+    ['ZRANGE z 0 1 REV WITHSCORES', ['d', '4', 'c', '3']],
+    ['ZRANGE z (1 +inf BYSCORE', ['b', 'c', 'd']],
+    ['ZRANGE z (1 +inf BYSCORE LIMIT 0 2', ['b', 'c']],
+    ['ZRANGE z (1 +inf BYSCORE LIMIT 1 -1 WITHSCORES', ['c', '3', 'd', '4']],
+    ['ZRANGE z (1 +inf BYSCORE LIMIT -1 2', []],
+    ['ZRANGE z +inf 2 BYSCORE REV LIMIT 0 2', ['d', 'c']],
+    ['ZRANGE z 2 +inf BYSCORE REV', []],
+    ['ZRANGE z x 1 BYSCORE', err('ERR min or max is not a float')],
+    [
+      'ZRANGE z 0 -1 LIMIT 0 1',
+      err('ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX'),
+    ],
+    ['ZRANGE z 0 1 BYSCORE BYLEX', SYNTAX],
+    ['ZRANGE z 0 1 BYSCORE LIMIT 0', SYNTAX],
+    ['ZREVRANGE z 0 1 BYSCORE', SYNTAX],
+    ['ZRANGE missing 0 -1 BYSCORE', []],
+    ['ZADD l 0 a 0 b 0 c', 3],
+    ['ZRANGE l [b + BYLEX', ['b', 'c']],
+    ['ZRANGE l + (a BYLEX REV', ['c', 'b']],
+    ['ZRANGE l - + BYLEX LIMIT 1 1', ['b']],
+    ['ZRANGE l - + BYLEX WITHSCORES', err('ERR syntax error, WITHSCORES not supported in combination with BYLEX')],
+    ['ZRANGE l b + BYLEX', err('ERR min or max not valid string range item')],
+    ['ZRANGESTORE dst z (1 +inf BYSCORE LIMIT 0 2', 2],
+    ['ZRANGE dst 0 -1 WITHSCORES', ['b', '2', 'c', '3']],
+    ['ZRANGESTORE dst z 0 0 REV', 1],
+    ['ZRANGE dst 0 -1 WITHSCORES', ['d', '4']],
+    ['ZRANGESTORE dst z 0 -1 WITHSCORES', SYNTAX],
+    ['ZRANGESTORE dst z 5 +inf BYSCORE', 0],
+    ['EXISTS dst', 0],
+    ['SET str x', 'OK'],
+    ['ZRANGE str 0 -1', WRONGTYPE],
+  ],
   'strings and bits': [
     ['SET k v', 'OK'],
     ['GETEX k EX 10', 'v'],
@@ -868,6 +904,101 @@ const BLOCKING: Record<string, (s: RedisServer, check: Check) => Promise<void>> 
   },
 };
 
+/** A probe on `key`, as the harnesses arm one: whether it fired. */
+const probe = (s: RedisServer, key: string): {fired: boolean} => {
+  const p = {key, fn: () => undefined, fired: false, result: undefined, error: undefined};
+  s.probes.push(p);
+  return p;
+};
+
+/** Scripts, WATCH and probes: `check(label, actual, expected)` records a mismatch. */
+const SCENARIOS: Record<string, (s: RedisServer, check: Check) => void> = {
+  "Lua 5.1's global unpack": (s, check) => {
+    check('unpack', s.execute(['eval', 'return {unpack(ARGV)}', '0', 'a', 'b']), ['a', 'b']);
+    check(
+      'into a call',
+      s.execute(['eval', "return redis.call('rpush', KEYS[1], unpack(ARGV))", '1', 'l', 'x', 'y']),
+      2,
+    );
+    check('no table.unpack', s.execute(['eval', 'return type(table.unpack)', '0']), 'nil');
+  },
+  'WATCH aborts EXEC after another client writes the key': (s, check) => {
+    const conn = s.connect();
+    s.execute(['set', 'k', 'v']);
+    check('watch', s.watch(conn, ['k']), 'OK');
+    s.execute(['set', 'k', 'other']);
+    check('exec', s.exec(conn, [['set', 'k', 'mine']]), null);
+    check('kept', s.execute(['get', 'k']), 'other');
+    check('watch ended', s.exec(conn, [['set', 'k', 'mine']]), ['OK']);
+  },
+  'WATCH counts a write of the same value, an expiry and a change undone': (s, check) => {
+    const conn = s.connect();
+    s.execute(['set', 'k', 'v']);
+    s.watch(conn, ['k']);
+    s.execute(['set', 'k', 'v']);
+    check('same value', s.exec(conn, [['incr', 'n']]), null);
+    s.execute(['set', 'k', 'v', 'PX', '100']);
+    s.watch(conn, ['k']);
+    CLOCK.advance(200);
+    check('expired', s.exec(conn, [['incr', 'n']]), null);
+    s.watch(conn, ['l']);
+    s.execute(['rpush', 'l', 'x']);
+    s.execute(['rpop', 'l']);
+    check('undone', s.exec(conn, [['incr', 'n']]), null);
+    check('nothing ran', s.execute(['exists', 'n']), 0);
+  },
+  'WATCH is per connection, and UNWATCH ends it': (s, check) => {
+    const [mine, theirs] = [s.connect(), s.connect()];
+    s.watch(mine, ['k']);
+    s.watch(theirs, ['other']);
+    s.execute(['set', 'other', '1']);
+    check('unrelated write', s.exec(mine, [['set', 'k', 'mine']]), ['OK']);
+    check('their watch', s.exec(theirs, [['incr', 'n']]), null);
+    s.watch(mine, ['k']);
+    check('unwatch', s.unwatch(mine), 'OK');
+    s.execute(['set', 'k', 'x']);
+    check('after unwatch', s.exec(mine, [['incr', 'n']]), [1]);
+    check('trips', s.trips.slice(0, 3), [['WATCH'], ['WATCH'], ['SET']]);
+  },
+  'a probe fires after a successful command only': (s, check) => {
+    s.execute(['set', 'k', 'v']);
+    const p = probe(s, 'k');
+    check(
+      'noscript',
+      outcome(() => s.execute(['evalsha', 'ffffffffffffffffffffffffffffffffffffffff', '1', 'k'])),
+      {
+        error: 'NOSCRIPT No matching script. Please use EVAL.',
+      },
+    );
+    check(
+      'wrongtype',
+      outcome(() => s.execute(['hget', 'k', 'f'])),
+      WRONGTYPE,
+    );
+    check('not after errors', p.fired, false);
+    s.execute(['get', 'k']);
+    check('after a success', p.fired, true);
+  },
+  'a script touches the keys its redis.calls use': (s, check) => {
+    const built = probe(s, 'ticket:t2');
+    const named = probe(s, 'counters');
+    s.execute(['eval', "return redis.call('get', 'ticket:' .. ARGV[1])", '1', 'counters', 't2']);
+    check('built in Lua', built.fired, true);
+    check('named, untouched', named.fired, false);
+    const failed = probe(s, 'h');
+    outcome(() =>
+      s.execute(['eval', "redis.call('set', KEYS[1], 'x'); return redis.call('hget', KEYS[1], 'f')", '1', 'h']),
+    );
+    check('a failing script', failed.fired, false);
+    const queued = probe(s, 'q');
+    s.executeTransaction([
+      ['hget', 'q', 'f'],
+      ['eval', "return redis.call('lpush', 'q', 'a')", '0'],
+    ]);
+    check('in MULTI', queued.fired, true);
+  },
+};
+
 /** Run the table and the blocking scenarios; the failures, none when the model holds. */
 export async function redisSelfTest(): Promise<string[]> {
   const failures: string[] = [];
@@ -885,7 +1016,7 @@ export async function redisSelfTest(): Promise<string[]> {
           failures.push(`${name}: ${command} → ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
       }
     }
-    for (const [name, scenario] of Object.entries(BLOCKING)) {
+    for (const [name, scenario] of Object.entries({...BLOCKING, ...SCENARIOS})) {
       const check: Check = (label, actual, expected) => {
         if (JSON.stringify(actual) !== JSON.stringify(expected))
           failures.push(`${name}: ${label} → ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);

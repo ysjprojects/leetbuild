@@ -338,15 +338,18 @@ func UpdateCase(ctx context.Context, caseID, reason, detail string) *Case {
 }
 
 // PutAction persists one moderation action (an event with action_id and content_id); a replay is
-// a no-op. It reports whether the action was new.
-func PutAction(ctx context.Context, event map[string]any) bool {
+// a no-op. It reports whether the action was new, or the Redis error that kept it from being stored.
+func PutAction(ctx context.Context, event map[string]any) (bool, error) {
 	contentID := fmt.Sprint(event["content_id"])
-	if rdb.SAdd(ctx, "actions:"+contentID+":ids", fmt.Sprint(event["action_id"])).Val() == 0 {
-		return false
+	added, err := rdb.SAdd(ctx, "actions:"+contentID+":ids", fmt.Sprint(event["action_id"])).Result()
+	if err != nil || added == 0 {
+		return false, err
 	}
 	raw, _ := json.Marshal(event)
-	rdb.RPush(ctx, "actions:"+contentID, string(raw))
-	return true
+	if err := rdb.RPush(ctx, "actions:"+contentID, string(raw)).Err(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ActionsOf lists the persisted actions on the content, oldest first.

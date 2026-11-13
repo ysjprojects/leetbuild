@@ -24,11 +24,19 @@ type Redis interface {
 	// PipelineBlocking is Pipeline for a trip holding a blocking command: the commands after it wait
 	// until it answers.
 	PipelineBlocking(cmds [][][]byte) []Result
-	// Transaction runs a MULTI/EXEC block back to back.
-	Transaction(cmds [][][]byte) []Result
-	// Fingerprint is a stable rendering of key's value and expiry ("" when absent), for WATCH.
-	Fingerprint(key []byte) string
-	// Probe runs fn right after the first command touching key, before its caller sees the reply.
+	// Connect is a new client connection's id: each connection WATCHes its own keys.
+	Connect() int
+	// Watch is WATCH on connection conn: its next Exec aborts if any of keys is written, deleted or
+	// expires before it.
+	Watch(conn int, keys [][]byte)
+	// Unwatch is UNWATCH on connection conn; record is false when the connection closing ends its
+	// WATCH (no round trip).
+	Unwatch(conn int, record bool)
+	// Exec runs a MULTI/EXEC block sent by connection conn; aborted is true, and nothing ran, when a
+	// key conn WATCHed was written since. The connection's WATCH ends either way.
+	Exec(conn int, cmds [][][]byte) (results []Result, aborted bool)
+	// Probe runs fn right after the first successful command, MULTI/EXEC block or script touching
+	// key (a script touches the keys its redis.calls use), before its caller sees the reply.
 	Probe(key []byte, fn func() (any, error)) *Probe
 	// Subscribe delivers every PUBLISH on channel (pattern: a PSUBSCRIBE glob) until unsubscribed.
 	Subscribe(channel []byte, pattern bool, fn func(pattern, channel, message []byte)) (unsubscribe func())

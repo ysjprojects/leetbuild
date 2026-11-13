@@ -20,13 +20,14 @@ demo edits and hides four flaws.
 refuses two edits of the same line and is asked four more times. It restarts for a minute, and the
 laptop's edit is written over the phone's while both users are told the document merged.
 
-- Every call carries a **2-second deadline** (\`MERGE_DEADLINE_S\`).
+- Every call carries its own **2-second deadline** (\`MERGE_DEADLINE_S\`).
 - At most **\`MAX_MERGE_ATTEMPTS\` (2)** calls, and only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`
   are retried.
 - Any other error, \`FAILED_PRECONDITION\` included, is final: no retry, no sleep.
 - When the merge fails the head stays as it is: keep the device's edit with
   \`store.mark_conflicted(doc_id, device, base_revision, body)\` and answer
-  \`{"status": "conflicted", "revision"}\` with the head's revision.`,
+  \`{"status": "conflicted", "revision"}\` with the head's revision. A merged body whose apply is a
+  \`conflict\` (the head moved while the merger ran) is a failed merge too.`,
   sequence: {
     participants: ['syncd', 'Redis', 'Merger'],
     messages: [
@@ -42,7 +43,7 @@ laptop's edit is written over the phone's while both users are told the document
       id: 'deadline',
       title: 'Every merge call carries a 2-second deadline',
       detail:
-        'Each `ThreeWayMerge` call carries `MERGE_DEADLINE_S` (2 s) as its deadline, so a merger that hangs costs the push two seconds per attempt instead of holding it open.',
+        'Each `ThreeWayMerge` call carries `MERGE_DEADLINE_S` (2 s) as its own deadline, the retry included, so a merger that hangs costs the push two seconds per attempt instead of holding it open.',
       match: {
         python: {all: [/timeout\s*=\s*MERGE_DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*MERGE_DEADLINE_MS/]},
@@ -81,7 +82,7 @@ laptop's edit is written over the phone's while both users are told the document
       id: 'keep-both',
       title: 'A failed merge keeps the head and the device’s edit',
       detail:
-        'When the merge fails the head is left as it is and the device’s edit is kept with `mark_conflicted`/`markConflicted`; nothing applies the device’s body over the head.',
+        'When the merge fails, or its merged body meets a head that moved meanwhile, the head is left as it is, the device’s edit is kept with `mark_conflicted`/`markConflicted` and the answer is `conflicted` at the head’s revision; nothing applies the device’s body over the head.',
       match: {
         python: {all: [/store\.mark_conflicted\(/], none: [/store\.content_hash\(body\)/]},
         typescript: {all: [/markConflicted\(/], none: [/contentHash\(body\)/]},
@@ -546,6 +547,7 @@ PHONE = "milk\\neggs\\nsourdough"  # the phone's edit of line 3, now the head
 LAPTOP = "oat milk\\neggs\\nbread"  # the laptop's edit of line 1, made offline against BASE
 MERGED = "oat milk\\neggs\\nsourdough"
 OVERLAP = "milk\\neggs\\nrye"  # the laptop's edit of line 3 too
+LATER = "milk\\neggs\\nsourdough loaf"  # the phone's next edit, landing while the laptop's edit is merged
 
 
 class Merger(sync_engine_pb2_grpc.MergerServicer):
@@ -589,11 +591,15 @@ def check_deadline(ctx):
         assert 1.5 <= call.timeout <= 2.5, f"a ThreeWayMerge call carries a {call.timeout} s deadline, expected MERGE_DEADLINE_S = 2"
     base, head = _seed("d-2")
     ctx.grpc.set_latency("ThreeWayMerge", 10.0)
-    before = ctx.clock.time()
+    before, start = ctx.clock.time(), _calls(ctx)
     out = m.resolve_conflict("d-2", base, LAPTOP, "laptop")
     waited = ctx.clock.time() - before
     assert waited <= 5, f"resolve_conflict waited {waited:.0f} s for a merger that answers in 10 s: two attempts of 2 s each, then give up"
     assert out == {"status": "conflicted", "revision": head}, f"a merger that never answered in time must leave the document conflicted at its head revision {head}, got {out}"
+    slow = ctx.grpc.calls_to("ThreeWayMerge")[start:]
+    assert len(slow) == 2, f"a merger that answers in 10 s was asked {len(slow)} times for one conflict, expected MAX_MERGE_ATTEMPTS (2) attempts"
+    timeouts = [call.timeout for call in slow]
+    assert all(t is not None and 1.5 <= t <= 2.5 for t in timeouts), f"the two attempts carried deadlines of {timeouts} s: each attempt gets its own MERGE_DEADLINE_S, and a deadline shared by both leaves the retry no time"
 
 
 def check_retry_transient(ctx):
@@ -619,6 +625,14 @@ def check_rejection_terminal(ctx):
     assert _calls(ctx) == 1, f"the merger refused two edits of line 3 (FAILED_PRECONDITION) and was asked {_calls(ctx)} times: a refusal is final"
     assert ctx.clock.sleeps == 0, "a refused merge must not be slept on and asked again"
     assert out == {"status": "conflicted", "revision": head}, f"a refused merge must leave the document conflicted at its head revision {head}, got {out}"
+    base, head = _seed("d-2")
+    ctx.grpc.fail("ThreeWayMerge", grpc.StatusCode.INVALID_ARGUMENT, "the request is malformed", times=1)
+    before = _calls(ctx)
+    out = m.resolve_conflict("d-2", base, LAPTOP, "laptop")
+    asked = _calls(ctx) - before
+    assert asked == 1, f"the merger answered INVALID_ARGUMENT and was asked {asked} times: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again"
+    assert out == {"status": "conflicted", "revision": head}, f"a merge that failed with INVALID_ARGUMENT must leave the document conflicted at its head revision {head}, got {out}"
+    assert ctx.clock.sleeps == 0, "a failed merge that is not retried must not be slept on"
 
 
 def check_keep_both(ctx):
@@ -630,12 +644,26 @@ def check_keep_both(ctx):
     kept = store.conflict_of("d-1")
     assert kept is not None and kept.get("body") == OVERLAP and kept.get("base_revision") == base and kept.get("device") == "laptop", f"the laptop's edit must be kept for the user with mark_conflicted (its body, base revision {base} and device), the store holds {kept}"
     assert out.get("status") == "conflicted", f"the answer must say conflicted, got {out}"
+    # The phone edits d-2 again while the laptop's edit of it is being merged.
+    base, head = _seed("d-2")
+    rival = ctx.redis_after("doc:d-2", lambda: apply_change("d-2", head, store.content_hash(LATER), LATER, "phone"))
+    out = m.resolve_conflict("d-2", base, LAPTOP, "laptop")
+    assert rival.fired, "resolve_conflict never read d-2's head"
+    if rival.error is not None:
+        raise rival.error
+    moved = rival.result["revision"]
+    now = store.head("d-2")
+    assert now["body"] == LATER and now["revision"] == moved, f"the phone's edit that landed during the merge was replaced: the head reads {now['body']!r} at revision {now['revision']}"
+    assert out == {"status": "conflicted", "revision": moved}, f"the head moved to revision {moved} while the merge ran, so the merged body was not applied: answer conflicted at revision {moved}, got {out}"
+    kept = store.conflict_of("d-2")
+    assert kept is not None and kept.get("body") == LAPTOP and kept.get("base_revision") == base and kept.get("device") == "laptop", f"the merged body did not apply, so the laptop's edit must be kept with mark_conflicted (its body, base revision {base} and device), the store holds {kept}"
 `,
     typescript: `const BASE = 'milk\\neggs\\nbread';
 const PHONE = 'milk\\neggs\\nsourdough'; // the phone's edit of line 3, now the head
 const LAPTOP = 'oat milk\\neggs\\nbread'; // the laptop's edit of line 1, made offline against BASE
 const MERGED = 'oat milk\\neggs\\nsourdough';
 const OVERLAP = 'milk\\neggs\\nrye'; // the laptop's edit of line 3 too
+const LATER = 'milk\\neggs\\nsourdough loaf'; // the phone's next edit, landing while the laptop's edit is merged
 
 /** A line-by-line three-way merge: edits of different lines combine, two edits of one line are FAILED_PRECONDITION. */
 function client(ctx) {
@@ -680,10 +708,15 @@ export async function check_deadline(ctx) {
   [base, head] = await seed(store, revisions, 'd-2');
   ctx.grpc.setLatency('ThreeWayMerge', 10.0);
   const before = ctx.clock.now();
+  const start = calls(ctx);
   out = await m.resolveConflict('d-2', base, LAPTOP, 'laptop');
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited <= 5, \`resolveConflict waited \${waited.toFixed(0)} s for a merger that answers in 10 s: two attempts of 2 s each, then give up\`);
   assert.deepStrictEqual(out, {status: 'conflicted', revision: head}, \`a merger that never answered in time must leave the document conflicted at its head revision \${head}, got \${JSON.stringify(out)}\`);
+  const slow = ctx.grpc.callsTo('ThreeWayMerge').slice(start);
+  assert.equal(slow.length, 2, \`a merger that answers in 10 s was asked \${slow.length} times for one conflict, expected MAX_MERGE_ATTEMPTS (2) attempts\`);
+  const timeouts = slow.map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && 1.5 <= t && t <= 2.5), \`the two attempts carried deadlines of \${JSON.stringify(timeouts)} s: each attempt gets its own MERGE_DEADLINE_MS, and a deadline shared by both leaves the retry no time\`);
 }
 
 export async function check_retry_transient(ctx) {
@@ -710,6 +743,14 @@ export async function check_rejection_terminal(ctx) {
   assert.equal(calls(ctx), 1, \`the merger refused two edits of line 3 (FAILED_PRECONDITION) and was asked \${calls(ctx)} times: a refusal is final\`);
   assert.equal(ctx.clock.sleeps, 0, 'a refused merge must not be slept on and asked again');
   assert.deepStrictEqual(out, {status: 'conflicted', revision: head}, \`a refused merge must leave the document conflicted at its head revision \${head}, got \${JSON.stringify(out)}\`);
+  const [base2, head2] = await seed(store, revisions, 'd-2');
+  ctx.grpc.fail('ThreeWayMerge', ctx.grpc.status.INVALID_ARGUMENT, 'the request is malformed', 1);
+  const before = calls(ctx);
+  const out2 = await m.resolveConflict('d-2', base2, LAPTOP, 'laptop');
+  const asked = calls(ctx) - before;
+  assert.equal(asked, 1, \`the merger answered INVALID_ARGUMENT and was asked \${asked} times: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again\`);
+  assert.deepStrictEqual(out2, {status: 'conflicted', revision: head2}, \`a merge that failed with INVALID_ARGUMENT must leave the document conflicted at its head revision \${head2}, got \${JSON.stringify(out2)}\`);
+  assert.equal(ctx.clock.sleeps, 0, 'a failed merge that is not retried must not be slept on');
 }
 
 export async function check_keep_both(ctx) {
@@ -721,6 +762,18 @@ export async function check_keep_both(ctx) {
   const kept = await store.conflictOf('d-1');
   assert(kept !== null && kept.body === OVERLAP && kept.base_revision === base && kept.device === 'laptop', \`the laptop's edit must be kept for the user with markConflicted (its body, base revision \${base} and device), the store holds \${JSON.stringify(kept)}\`);
   assert.equal(out.status, 'conflicted', \`the answer must say conflicted, got \${JSON.stringify(out)}\`);
+  // The phone edits d-2 again while the laptop's edit of it is being merged.
+  const [base2, head2] = await seed(store, revisions, 'd-2');
+  const rival = ctx.redisAfter('doc:d-2', () => revisions.applyChange('d-2', head2, store.contentHash(LATER), LATER, 'phone'));
+  const out2 = await m.resolveConflict('d-2', base2, LAPTOP, 'laptop');
+  assert(rival.fired, "resolveConflict never read d-2's head");
+  if (rival.error !== undefined) throw rival.error;
+  const moved = (await rival.result).revision;
+  const now2 = await store.head('d-2');
+  assert(now2.body === LATER && now2.revision === moved, \`the phone's edit that landed during the merge was replaced: the head reads \${JSON.stringify(now2.body)} at revision \${now2.revision}\`);
+  assert.deepStrictEqual(out2, {status: 'conflicted', revision: moved}, \`the head moved to revision \${moved} while the merge ran, so the merged body was not applied: answer conflicted at revision \${moved}, got \${JSON.stringify(out2)}\`);
+  const kept2 = await store.conflictOf('d-2');
+  assert(kept2 !== null && kept2.body === LAPTOP && kept2.base_revision === base2 && kept2.device === 'laptop', \`the merged body did not apply, so the laptop's edit must be kept with markConflicted (its body, base revision \${base2} and device), the store holds \${JSON.stringify(kept2)}\`);
 }
 `,
     go: `package main
@@ -746,6 +799,7 @@ const (
 	clientLaptop  = "oat milk\\neggs\\nbread" // the laptop's edit of line 1, made offline against the base
 	clientMerged  = "oat milk\\neggs\\nsourdough"
 	clientOverlap = "milk\\neggs\\nrye" // the laptop's edit of line 3 too
+	clientLater   = "milk\\neggs\\nsourdough loaf" // the phone's next edit, landing while the laptop's edit is merged
 )
 
 var clientBg = context.Background()
@@ -805,11 +859,17 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	base, head := clientSeed(ctx, "d-2")
 	ctx.GRPC.SetLatency("ThreeWayMerge", 10.0, "")
-	before := ctx.Clock.Now()
+	before, start := ctx.Clock.Now(), clientCalls(ctx)
 	out = clientResolve(ctx, "d-2", base, clientLaptop)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 5, "resolveConflict waited %.0f s for a merger that answers in 10 s: two attempts of 2 s each, then give up", waited)
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a merger that never answered in time must leave the document conflicted at its head revision")
+	slow := ctx.GRPC.CallsTo("ThreeWayMerge", "")[start:]
+	ctx.Equal(len(slow), 2, "a merger that answers in 10 s must be asked maxMergeAttempts (2) times for one conflict; the calls")
+	for _, call := range slow {
+		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond,
+			"an attempt carried a %v deadline: each attempt gets its own mergeDeadline (2 s), and a deadline shared by both leaves the retry no time", call.Timeout)
+	}
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
@@ -834,6 +894,13 @@ func CheckRejectionTerminal(ctx *harness.Ctx) {
 	ctx.Equal(clientCalls(ctx), 1, "the merger refused two edits of line 3 (FailedPrecondition): a refusal is final; the calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a refused merge must not be slept on and asked again; the sleeps")
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a refused merge must leave the document conflicted at its head revision")
+	base, head = clientSeed(ctx, "d-2")
+	ctx.GRPC.Fail("ThreeWayMerge", codes.InvalidArgument, "the request is malformed", 1, "")
+	before := clientCalls(ctx)
+	out = clientResolve(ctx, "d-2", base, clientLaptop)
+	ctx.Equal(clientCalls(ctx)-before, 1, "the merger answered InvalidArgument: only Unavailable and DeadlineExceeded are asked again; the calls")
+	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a merge that failed with InvalidArgument must leave the document conflicted at its head revision")
+	ctx.Equal(ctx.Clock.Sleeps(), 0, "a failed merge that is not retried must not be slept on; the sleeps")
 }
 
 func CheckKeepBoth(ctx *harness.Ctx) {
@@ -845,10 +912,29 @@ func CheckKeepBoth(ctx *harness.Ctx) {
 	kept := store.ConflictOf(clientBg, "d-1")
 	ctx.Assert(kept != nil && kept.Body == clientOverlap && kept.BaseRevision == base && kept.Device == "laptop", "the laptop's edit must be kept for the user with MarkConflicted (its body, base revision %d and device), the store holds %+v", base, kept)
 	ctx.Equal(out.Status, "conflicted", "the answer's status")
+	// The phone edits d-2 again while the laptop's edit of it is being merged.
+	base2, head2 := clientSeed(ctx, "d-2")
+	rival := ctx.Redis.After("doc:d-2", func() any {
+		outcome, err := revisions.ApplyChange(clientBg, "d-2", head2, store.ContentHash(clientLater), clientLater, "phone")
+		if err != nil {
+			panic(err)
+		}
+		return outcome
+	})
+	out = clientResolve(ctx, "d-2", base2, clientLaptop)
+	ctx.Assert(rival.Fired, "resolveConflict never read d-2's head")
+	ctx.Assert(rival.Err == nil, "the phone's apply failed: %v", rival.Err)
+	moved := rival.Result.(store.Outcome).Revision
+	now2 := store.Head(clientBg, "d-2")
+	ctx.Assert(now2.Body == clientLater && now2.Revision == moved, "the phone's edit that landed during the merge was replaced: the head reads %q at revision %d", now2.Body, now2.Revision)
+	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: moved}, "the head moved while the merge ran, so the merged body was not applied: the answer must be conflicted at the new head revision")
+	kept2 := store.ConflictOf(clientBg, "d-2")
+	ctx.Assert(kept2 != nil && kept2.Body == clientLaptop && kept2.BaseRevision == base2 && kept2.Device == "laptop", "the merged body did not apply, so the laptop's edit must be kept with MarkConflicted (its body, base revision %d and device), the store holds %+v", base2, kept2)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -865,6 +951,7 @@ const std::string kClientPhone = "milk\\neggs\\nsourdough";   // the phone's edi
 const std::string kClientLaptop = "oat milk\\neggs\\nbread";  // the laptop's edit of line 1, made offline against the base
 const std::string kClientMerged = "oat milk\\neggs\\nsourdough";
 const std::string kClientOverlap = "milk\\neggs\\nrye";  // the laptop's edit of line 3 too
+const std::string kClientLater = "milk\\neggs\\nsourdough loaf";  // the phone's next edit, landing while the laptop's edit is merged
 
 std::vector<std::string> lines(const std::string& text) {
   std::vector<std::string> out;
@@ -926,10 +1013,17 @@ void CheckDeadline(harness::Ctx& ctx) {
   std::tie(base, head) = clientSeed("d-2");
   ctx.GRPC.SetLatency("ThreeWayMerge", 10.0);
   const int64_t before = ctx.Clock.Now();
+  const size_t start = clientCalls(ctx);
   out = resolveConflict("d-2", base, kClientLaptop, "laptop");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 5, "resolveConflict waited %.0f s for a merger that answers in 10 s: two attempts of 2 s each, then give up", waited);
   ctx.Assert(out.status == "conflicted" && out.revision == head, "a merger that never answered in time must leave the document conflicted at its head revision %d, got %s", head, outcomeText(out));
+  const auto all = ctx.GRPC.CallsTo("ThreeWayMerge");
+  ctx.Equal(all.size() - start, size_t{2}, "a merger that answers in 10 s must be asked kMaxMergeAttempts (2) times for one conflict; the calls");
+  for (size_t i = start; i < all.size(); i++) {
+    ctx.Assert(all[i].HasDeadline() && 1.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 2.5,
+               "an attempt carried a %v s deadline: each attempt gets its own kMergeDeadline (2 s), and a deadline shared by both leaves the retry no time", all[i].TimeoutSeconds());
+  }
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
@@ -954,6 +1048,13 @@ void CheckRejectionTerminal(harness::Ctx& ctx) {
   ctx.Equal(clientCalls(ctx), size_t{1}, "the merger refused two edits of line 3 (FAILED_PRECONDITION): a refusal is final; the calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a refused merge must not be slept on and asked again; the sleeps");
   ctx.Assert(out.status == "conflicted" && out.revision == head, "a refused merge must leave the document conflicted at its head revision %d, got %s", head, outcomeText(out));
+  const auto [base2, head2] = clientSeed("d-2");
+  ctx.GRPC.Fail("ThreeWayMerge", grpc::StatusCode::INVALID_ARGUMENT, "the request is malformed", 1);
+  const size_t before = clientCalls(ctx);
+  const store::Outcome out2 = resolveConflict("d-2", base2, kClientLaptop, "laptop");
+  ctx.Equal(clientCalls(ctx) - before, size_t{1}, "the merger answered INVALID_ARGUMENT: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the calls");
+  ctx.Assert(out2.status == "conflicted" && out2.revision == head2, "a merge that failed with INVALID_ARGUMENT must leave the document conflicted at its head revision %d, got %s", head2, outcomeText(out2));
+  ctx.Equal(ctx.Clock.Sleeps(), 0, "a failed merge that is not retried must not be slept on; the sleeps");
 }
 
 void CheckKeepBoth(harness::Ctx& ctx) {
@@ -966,6 +1067,27 @@ void CheckKeepBoth(harness::Ctx& ctx) {
   ctx.Assert(kept && kept->body == kClientOverlap && kept->base_revision == base && kept->device == "laptop",
              "the laptop's edit must be kept for the user with markConflicted (its body, base revision %d and device), the store holds %s", base, kept ? kept->body : "nothing");
   ctx.Equal(out.status, "conflicted", "the answer's status");
+  // The phone edits d-2 again while the laptop's edit of it is being merged.
+  const auto [base2, head2] = clientSeed("d-2");
+  std::optional<store::Outcome> rival;
+  std::optional<std::string> failed;
+  ctx.Redis.After("doc:d-2", [&, head2 = head2] {
+    try {
+      rival = revisions::applyChange("d-2", head2, store::contentHash(kClientLater), kClientLater, "phone");
+    } catch (const std::exception& e) {
+      failed = e.what();
+    }
+  });
+  const store::Outcome out2 = resolveConflict("d-2", base2, kClientLaptop, "laptop");
+  ctx.Assert(!failed, "the phone's apply failed: %s", failed.value_or(""));
+  ctx.Assert(rival.has_value(), "resolveConflict never read d-2's head");
+  const long long moved = rival->revision;
+  const auto now2 = store::head("d-2");
+  ctx.Assert(now2->body == kClientLater && now2->revision == moved, "the phone's edit that landed during the merge was replaced: the head reads %q at revision %d", now2->body, now2->revision);
+  ctx.Assert(out2.status == "conflicted" && out2.revision == moved, "the head moved to revision %d while the merge ran, so the merged body was not applied: answer conflicted at revision %d, got %s", moved, moved, outcomeText(out2));
+  const auto kept2 = store::conflictOf("d-2");
+  ctx.Assert(kept2 && kept2->body == kClientLaptop && kept2->base_revision == base2 && kept2->device == "laptop",
+             "the merged body did not apply, so the laptop's edit must be kept with markConflicted (its body, base revision %d and device), the store holds %s", base2, kept2 ? kept2->body : "nothing");
 }
 `,
   },

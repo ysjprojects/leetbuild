@@ -17,6 +17,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <limits>
@@ -329,6 +330,16 @@ void serve(const std::shared_ptr<Rpc>& rpc, const std::shared_ptr<ServerState>& 
 // way to the server's handler.
 std::shared_ptr<Rpc> start(ChannelInterface* channel, const char* method, ClientContext* context, bool client_streams,
                            bool server_streams, const std::string* request) {
+  // grpc++ binds a context to one call (ClientContext::set_call checks call_ == nullptr) and aborts
+  // the process when a used one is passed to another call.
+  if (internal::Access::rpc(*context) != nullptr) {
+    std::fprintf(stderr,
+                 "client_context.cc: Check failed: call_ == nullptr (a ClientContext used for a second call: "
+                 "%s; each call needs a ClientContext of its own)\n",
+                 method);
+    std::fflush(stderr);
+    std::abort();
+  }
   Registry& r = reg();
   auto rpc = std::make_shared<Rpc>();
   rpc->method = method;

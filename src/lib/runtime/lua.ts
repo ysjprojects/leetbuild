@@ -125,6 +125,14 @@ export function luaEval(
 ): string {
   const L = lauxlib.luaL_newstate();
   lualib.luaL_openlibs(L);
+  // Redis embeds Lua 5.1, where `unpack` is a global and `table.unpack` does not exist; fengari is
+  // Lua 5.3, which has it the other way round.
+  lua.lua_getglobal(L, bytes('table'));
+  lua.lua_getfield(L, -1, bytes('unpack'));
+  lua.lua_setglobal(L, bytes('unpack'));
+  lua.lua_pushnil(L);
+  lua.lua_setfield(L, -2, bytes('unpack'));
+  lua.lua_pop(L, 1);
   const call =
     (pcall: boolean) =>
     (S: LuaState): number => {

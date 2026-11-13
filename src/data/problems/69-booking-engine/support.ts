@@ -350,13 +350,15 @@ export const store = {
     const bookingId = await redis.get(\`idem:\${tenant}:\${idempotencyKey}\`);
     return bookingId === null ? null : store.get(bookingId);
   },
-  /** Commit the booking: write it and index it under its idempotency key. */
+  /** Commit the booking: write it and index it under its idempotency key; rejects when Redis refused either write. */
   async put(booking: Booking): Promise<void> {
-    await redis
+    const replies = await redis
       .multi()
       .hset(\`booking:\${booking.booking_id}\`, {...booking, event_id: booking.event_id ?? ''})
       .set(\`idem:\${booking.tenant}:\${booking.idempotency_key}\`, booking.booking_id)
       .exec();
+    const failed = replies?.find(([err]) => err !== null)?.[0];
+    if (failed) throw failed;
   },
   async setState(bookingId: string, state: string, eventId?: string): Promise<void> {
     await redis.hset(\`booking:\${bookingId}\`, eventId === undefined ? {state} : {state, event_id: eventId});
@@ -933,20 +935,21 @@ inline std::optional<Booking> GetByKey(const std::string& tenant, const std::str
   return Get(*booking_id);
 }
 
-// Commit the booking: write it and index it under its idempotency key.
+// Commit the booking: write it and index it under its idempotency key; throws when Redis refused either write.
 inline void Put(const Booking& b) {
   auto tx = client().transaction();
-  tx.hset("booking:" + b.booking_id, {std::pair<std::string, std::string>{"booking_id", b.booking_id},
-                                      {"tenant", b.tenant},
-                                      {"resource_id", b.resource_id},
-                                      {"start", b.start},
-                                      {"end", b.end},
-                                      {"hold_id", b.hold_id},
-                                      {"idempotency_key", b.idempotency_key},
-                                      {"state", b.state},
-                                      {"event_id", b.event_id}})
-      .set("idem:" + b.tenant + ":" + b.idempotency_key, b.booking_id)
-      .exec();
+  auto replies = tx.hset("booking:" + b.booking_id, {std::pair<std::string, std::string>{"booking_id", b.booking_id},
+                                                     {"tenant", b.tenant},
+                                                     {"resource_id", b.resource_id},
+                                                     {"start", b.start},
+                                                     {"end", b.end},
+                                                     {"hold_id", b.hold_id},
+                                                     {"idempotency_key", b.idempotency_key},
+                                                     {"state", b.state},
+                                                     {"event_id", b.event_id}})
+                     .set("idem:" + b.tenant + ":" + b.idempotency_key, b.booking_id)
+                     .exec();
+  for (std::size_t i = 0; i < replies.size(); ++i) replies.get(i);  // an error reply throws ReplyError
 }
 
 // Record the booking's state, and its calendar event id when event_id is not empty.

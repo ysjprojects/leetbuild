@@ -26,8 +26,8 @@ so that segment comes back twice; a stalled provider holds the worker with no de
 provider cannot decode is sent five times.
 
 - A chunk is \`CHUNK_MS\` = 30 000 ms from \`index * CHUNK_MS\`: send that \`offset_ms\` and \`duration_ms\`.
-- Every attempt carries a \`DEADLINE_S\` = 60 s deadline; after \`MAX_ATTEMPTS\` = 2, raise
-  \`AsrUnavailable\`.
+- Every attempt carries a \`DEADLINE_S\` = 60 s deadline of its own; after \`MAX_ATTEMPTS\` = 2 that
+  did not finish the chunk, raise \`AsrUnavailable\`, even if some segments arrived.
 - A retry resumes at the \`end_ms\` of the last segment received, for the rest of the chunk, and keeps
   what already arrived.
 - \`INVALID_ARGUMENT\` raises \`CorruptAudio\` at once.`,
@@ -70,7 +70,7 @@ provider cannot decode is sent five times.
       id: 'deadline',
       title: 'Every attempt carries a 60-second deadline',
       detail:
-        'Each `TranscribeChunk` stream is opened with `DEADLINE_S` (60 s: `timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`); the starter sets none, so a stalled provider holds the worker and the chunk indefinitely.',
+        'Each `TranscribeChunk` stream is opened with a `DEADLINE_S` (60 s) deadline of its own (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), the retry included, even when the first attempt took 59 s; the starter sets none, so a stalled provider holds the worker and the chunk indefinitely.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*60\b/, /TranscribeChunk\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*60_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -83,7 +83,7 @@ provider cannot decode is sent five times.
       id: 'max-attempts',
       title: 'At most two attempts per chunk',
       detail:
-        'A chunk gets `MAX_ATTEMPTS` (2) streams, then `AsrUnavailable`, and the ledger records the chunk failed for a later redelivery; the starter tries five times, each one billed.',
+        'A chunk gets `MAX_ATTEMPTS` (2) streams, then `AsrUnavailable`, even when each stream delivered part of the chunk: a chunk with a hole is not transcribed, and the ledger records it failed for a later redelivery. The starter tries five times, each one billed.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*2\b/, /range\(\s*MAX_ATTEMPTS\s*\)/],
@@ -661,21 +661,26 @@ SEGMENT_MS = 10_000
 
 class Asr(transcription_pb2_grpc.AsrServicer):
     """Ninety seconds of audio, one 10-second segment after another; with break_after set, the next
-    stream fails UNAVAILABLE after that many segments."""
+    stream fails UNAVAILABLE after that many segments (with break_always, every stream fails, even
+    one that reached the end of its span)."""
 
     def __init__(self):
         self.break_after = None
+        self.break_always = False
 
     def TranscribeChunk(self, request, context):
         end = AUDIO_MS if request.duration_ms == 0 else min(AUDIO_MS, request.offset_ms + request.duration_ms)
         t, sent = request.offset_ms, 0
         while t < end:
             if self.break_after is not None and sent == self.break_after:
-                self.break_after = None
+                if not self.break_always:
+                    self.break_after = None
                 context.abort(grpc.StatusCode.UNAVAILABLE, "asr worker restarted mid-stream")
             yield transcription_pb2.Segment(start_ms=t, end_ms=min(t + SEGMENT_MS, end), speaker="AB"[(t // SEGMENT_MS) % 2], text=f"words at {t // 1000} s")
             t += SEGMENT_MS
             sent += 1
+        if self.break_always:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "asr worker restarted mid-stream")
 
 
 def _client(ctx):
@@ -713,7 +718,7 @@ def check_chunk_span(ctx):
 
 
 def check_deadline(ctx):
-    m, _ = _client(ctx)
+    m, peer = _client(ctx)
     m.transcribe_chunk("tr-1", REF, 0)
     call = _calls(ctx)[0]
     assert call.timeout is not None, "the TranscribeChunk stream carries no deadline: a stalled provider holds the worker and its chunk indefinitely"
@@ -721,13 +726,29 @@ def check_deadline(ctx):
     ctx.grpc.set_latency("TranscribeChunk", 120.0)
     _raises(m, "AsrUnavailable", "with the provider stalled past the deadline")
     assert len(_calls(ctx)) == 3, f"a stalled provider gets its two attempts, then the chunk is given up: {len(_calls(ctx)) - 1} attempts were made"
+    # A slow provider answers 59 s into each stream, and the first stream breaks after one segment.
+    ctx.grpc.set_latency("TranscribeChunk", 59.0)
+    peer.break_after = 1
+    try:
+        m.transcribe_chunk("tr-1", REF, 1)
+    except Exception as e:  # noqa: BLE001
+        timeouts = [c.timeout for c in _calls(ctx)[3:]]
+        raise AssertionError(f"a first stream that broke 59 s in left the retry nothing: transcribe_chunk raised {type(e).__name__}: {e}; the streams carried deadlines of {timeouts} s, expected DEADLINE_S = 60 on each attempt") from e
+    timeouts = [c.timeout for c in _calls(ctx)[3:]]
+    assert len(timeouts) == 2 and all(t is not None and 59 <= t <= 61 for t in timeouts), f"the broken stream and its retry carried deadlines of {timeouts} s: each attempt gets DEADLINE_S = 60 of its own"
 
 
 def check_max_attempts(ctx):
-    m, _ = _client(ctx)
+    m, peer = _client(ctx)
+    # Every stream breaks after one segment: the chunk is never whole.
+    peer.break_after, peer.break_always = 1, True
+    _raises(m, "AsrUnavailable", "with every stream breaking after one segment (the chunk is never complete)")
+    attempts = len(_calls(ctx))
+    assert attempts == 2, f"a provider whose streams keep breaking was asked {attempts} times for one chunk, expected MAX_ATTEMPTS = 2"
+    peer.break_after, peer.break_always = None, False
     ctx.grpc.fail("TranscribeChunk", grpc.StatusCode.UNAVAILABLE, "asr overloaded", times=10)
     _raises(m, "AsrUnavailable", "with the provider unavailable")
-    attempts = len(_calls(ctx))
+    attempts = len(_calls(ctx)) - 2
     assert attempts == 2, f"an unavailable provider was asked {attempts} times for one chunk, expected MAX_ATTEMPTS = 2: each attempt is billed"
 
 
@@ -753,10 +774,10 @@ def check_corrupt_terminal(ctx):
 const AUDIO_MS = 90_000;
 const SEGMENT_MS = 10_000;
 
-/** Ninety seconds of audio, one 10-second segment after another; with breakAfter set, the next stream fails UNAVAILABLE after that many segments. */
+/** Ninety seconds of audio, one 10-second segment after another; with breakAfter set, the next stream fails UNAVAILABLE after that many segments (with breakAlways, every stream fails, even one that reached the end of its span). */
 function client(ctx) {
   const pkg = ctx.proto('transcription.proto');
-  const peer = {breakAfter: null as number | null};
+  const peer = {breakAfter: null as number | null, breakAlways: false};
   ctx.grpc.serve(pkg.transcribe.Asr.service, {
     TranscribeChunk(call) {
       const offset = Number(call.request.offset_ms ?? 0);
@@ -765,12 +786,16 @@ function client(ctx) {
       let sent = 0;
       for (let t = offset; t < end; t += SEGMENT_MS) {
         if (peer.breakAfter !== null && sent === peer.breakAfter) {
-          peer.breakAfter = null;
+          if (!peer.breakAlways) peer.breakAfter = null;
           call.emit('error', Object.assign(new Error('asr worker restarted mid-stream'), {code: ctx.grpc.status.UNAVAILABLE}));
           return;
         }
         call.write({start_ms: t, end_ms: Math.min(t + SEGMENT_MS, end), speaker: (t / SEGMENT_MS) % 2 === 0 ? 'A' : 'B', text: \`words at \${t / 1000} s\`});
         sent += 1;
+      }
+      if (peer.breakAlways) {
+        call.emit('error', Object.assign(new Error('asr worker restarted mid-stream'), {code: ctx.grpc.status.UNAVAILABLE}));
+        return;
       }
       call.end();
     },
@@ -802,7 +827,7 @@ export async function check_chunk_span(ctx) {
 }
 
 export async function check_deadline(ctx) {
-  const {m} = client(ctx);
+  const {m, peer} = client(ctx);
   await m.transcribeChunk('tr-1', REF, 0);
   const call = calls(ctx)[0];
   assert(call.timeout !== null, 'the TranscribeChunk stream carries no deadline: a stalled provider holds the worker and its chunk indefinitely');
@@ -810,13 +835,30 @@ export async function check_deadline(ctx) {
   ctx.grpc.setLatency('TranscribeChunk', 120.0);
   await raises(m, 'AsrUnavailable', 'with the provider stalled past the deadline');
   assert.equal(calls(ctx).length, 3, \`a stalled provider gets its two attempts, then the chunk is given up: \${calls(ctx).length - 1} attempts were made\`);
+  // A slow provider answers 59 s into each stream, and the first stream breaks after one segment.
+  ctx.grpc.setLatency('TranscribeChunk', 59.0);
+  peer.breakAfter = 1;
+  const timeouts = () => calls(ctx).slice(3).map(c => c.timeout);
+  try {
+    await m.transcribeChunk('tr-1', REF, 1);
+  } catch (e) {
+    assert.fail(\`a first stream that broke 59 s in left the retry nothing: transcribeChunk threw \${(e as Error).constructor.name}: \${(e as Error).message}; the streams carried deadlines of \${JSON.stringify(timeouts())} s, expected DEADLINE_MS = 60000 on each attempt\`);
+  }
+  assert(timeouts().length === 2 && timeouts().every(t => t !== null && 59 <= t && t <= 61), \`the broken stream and its retry carried deadlines of \${JSON.stringify(timeouts())} s: each attempt gets DEADLINE_MS = 60000 of its own\`);
 }
 
 export async function check_max_attempts(ctx) {
-  const {m} = client(ctx);
+  const {m, peer} = client(ctx);
+  // Every stream breaks after one segment: the chunk is never whole.
+  peer.breakAfter = 1;
+  peer.breakAlways = true;
+  await raises(m, 'AsrUnavailable', 'with every stream breaking after one segment (the chunk is never complete)');
+  assert.equal(calls(ctx).length, 2, \`a provider whose streams keep breaking was asked \${calls(ctx).length} times for one chunk, expected MAX_ATTEMPTS = 2\`);
+  peer.breakAfter = null;
+  peer.breakAlways = false;
   ctx.grpc.fail('TranscribeChunk', ctx.grpc.status.UNAVAILABLE, 'asr overloaded', 10);
   await raises(m, 'AsrUnavailable', 'with the provider unavailable');
-  assert.equal(calls(ctx).length, 2, \`an unavailable provider was asked \${calls(ctx).length} times for one chunk, expected MAX_ATTEMPTS = 2: each attempt is billed\`);
+  assert.equal(calls(ctx).length - 2, 2, \`an unavailable provider was asked \${calls(ctx).length - 2} times for one chunk, expected MAX_ATTEMPTS = 2: each attempt is billed\`);
 }
 
 export async function check_resume_offset(ctx) {
@@ -861,10 +903,12 @@ const (
 )
 
 // asrPeer is ninety seconds of audio, one 10-second segment after another; with breakAfter >= 0,
-// the next stream fails UNAVAILABLE after that many segments.
+// the next stream fails UNAVAILABLE after that many segments (with breakAlways, every stream
+// fails, even one that reached the end of its span).
 type asrPeer struct {
 	pb.UnimplementedAsrServer
-	breakAfter int
+	breakAfter  int
+	breakAlways bool
 }
 
 func (p *asrPeer) TranscribeChunk(req *pb.ChunkRequest, srv pb.Asr_TranscribeChunkServer) error {
@@ -875,7 +919,9 @@ func (p *asrPeer) TranscribeChunk(req *pb.ChunkRequest, srv pb.Asr_TranscribeChu
 	sent := 0
 	for t := int(req.GetOffsetMs()); t < end; t += segmentMs {
 		if p.breakAfter >= 0 && sent == p.breakAfter {
-			p.breakAfter = noBreaking
+			if !p.breakAlways {
+				p.breakAfter = noBreaking
+			}
 			return status.Error(codes.Unavailable, "asr worker restarted mid-stream")
 		}
 		seg := &pb.Segment{StartMs: int32(t), EndMs: int32(min(t+segmentMs, end)), Speaker: string(speakers[(t/segmentMs)%2]), Text: fmt.Sprintf("words at %d s", t/1000)}
@@ -883,6 +929,9 @@ func (p *asrPeer) TranscribeChunk(req *pb.ChunkRequest, srv pb.Asr_TranscribeChu
 			return err
 		}
 		sent++
+	}
+	if p.breakAlways {
+		return status.Error(codes.Unavailable, "asr worker restarted mid-stream")
 	}
 	return nil
 }
@@ -927,7 +976,7 @@ func CheckChunkSpan(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	asrWorld(ctx)
+	peer := asrWorld(ctx)
 	mustTranscribe(ctx, 0)
 	call := asrCalls(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "the TranscribeChunk stream carries no deadline: a stalled provider holds the worker and its chunk indefinitely")
@@ -935,13 +984,30 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("TranscribeChunk", 120.0, "")
 	mustFail(ctx, ErrAsrUnavailable, "with the provider stalled past the deadline")
 	ctx.Equal(len(asrCalls(ctx))-1, 2, "a stalled provider gets its two attempts, then the chunk is given up; attempts")
+	// A slow provider answers 59 s into each stream, and the first stream breaks after one segment.
+	ctx.GRPC.SetLatency("TranscribeChunk", 59.0, "")
+	peer.breakAfter = 1
+	_, err := transcribeChunk(context.Background(), "tr-1", clientRef, 1)
+	var timeouts []time.Duration
+	ok := true
+	for _, c := range asrCalls(ctx)[3:] {
+		timeouts = append(timeouts, c.Timeout)
+		ok = ok && c.HasDeadline() && 59*time.Second <= c.Timeout && c.Timeout <= 61*time.Second
+	}
+	ctx.Assert(err == nil, "a first stream that broke 59 s in left the retry nothing: transcribeChunk returned %v; the streams carried deadlines of %v, expected 60 s on each attempt", err, timeouts)
+	ctx.Assert(len(timeouts) == 2 && ok, "the broken stream and its retry carried deadlines of %v: each attempt gets 60 s of its own", timeouts)
 }
 
 func CheckMaxAttempts(ctx *harness.Ctx) {
-	asrWorld(ctx)
+	peer := asrWorld(ctx)
+	// Every stream breaks after one segment: the chunk is never whole.
+	peer.breakAfter, peer.breakAlways = 1, true
+	mustFail(ctx, ErrAsrUnavailable, "with every stream breaking after one segment (the chunk is never complete)")
+	ctx.Equal(len(asrCalls(ctx)), 2, "a provider whose streams keep breaking is asked MAX_ATTEMPTS = 2 times for one chunk; attempts")
+	peer.breakAfter, peer.breakAlways = noBreaking, false
 	ctx.GRPC.Fail("TranscribeChunk", codes.Unavailable, "asr overloaded", 10, "")
 	mustFail(ctx, ErrAsrUnavailable, "with the provider unavailable")
-	ctx.Equal(len(asrCalls(ctx)), 2, "an unavailable provider is asked MAX_ATTEMPTS = 2 times for one chunk (each attempt is billed); attempts")
+	ctx.Equal(len(asrCalls(ctx))-2, 2, "an unavailable provider is asked MAX_ATTEMPTS = 2 times for one chunk (each attempt is billed); attempts")
 }
 
 func CheckResumeOffset(ctx *harness.Ctx) {
@@ -976,17 +1042,19 @@ constexpr int kAudioMs = 90000;
 constexpr int kSegmentMs = 10000;
 
 // Ninety seconds of audio, one 10-second segment after another; with break_after >= 0, the next
-// stream fails UNAVAILABLE after that many segments.
+// stream fails UNAVAILABLE after that many segments (with break_always, every stream fails, even
+// one that reached the end of its span).
 class AsrPeer final : public transcribe::Asr::Service {
  public:
   int break_after = -1;
+  bool break_always = false;
 
   grpc::Status TranscribeChunk(grpc::ServerContext*, const transcribe::ChunkRequest* req, grpc::ServerWriter<transcribe::Segment>* srv) override {
     const int end = req->duration_ms() == 0 ? kAudioMs : std::min(kAudioMs, req->offset_ms() + req->duration_ms());
     int sent = 0;
     for (int t = req->offset_ms(); t < end; t += kSegmentMs) {
       if (break_after >= 0 && sent == break_after) {
-        break_after = -1;
+        if (!break_always) break_after = -1;
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "asr worker restarted mid-stream");
       }
       transcribe::Segment seg;
@@ -997,6 +1065,7 @@ class AsrPeer final : public transcribe::Asr::Service {
       if (!srv->Write(seg)) return grpc::Status::CANCELLED;
       sent++;
     }
+    if (break_always) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "asr worker restarted mid-stream");
     return grpc::Status::OK;
   }
 };
@@ -1049,7 +1118,7 @@ void CheckChunkSpan(harness::Ctx& ctx) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  asrWorld(ctx);
+  AsrPeer& peer = asrWorld(ctx);
   mustTranscribe(ctx, 0);
   const auto call = ctx.GRPC.CallsTo("TranscribeChunk")[0];
   ctx.Assert(call.HasDeadline(), "the TranscribeChunk stream carries no deadline: a stalled provider holds the worker and its chunk indefinitely");
@@ -1057,13 +1126,38 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("TranscribeChunk", 120.0);
   mustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with the provider stalled past the deadline");
   ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size() - 1, 2, "a stalled provider gets its two attempts, then the chunk is given up; attempts");
+  // A slow provider answers 59 s into each stream, and the first stream breaks after one segment.
+  ctx.GRPC.SetLatency("TranscribeChunk", 59.0);
+  peer.break_after = 1;
+  std::string error;
+  try {
+    transcribeChunk("tr-1", kClientRef, 1);
+  } catch (const std::exception& e) {
+    error = std::string(harness::CurrentExceptionType()) + ": " + e.what();
+  }
+  const auto calls = ctx.GRPC.CallsTo("TranscribeChunk");
+  std::vector<double> timeouts;
+  bool each = true;
+  for (size_t i = 3; i < calls.size(); i++) {
+    timeouts.push_back(calls[i].HasDeadline() ? calls[i].TimeoutSeconds() : -1);
+    each = each && calls[i].HasDeadline() && 59 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 61;
+  }
+  ctx.Assert(error.empty(), "a first stream that broke 59 s in left the retry nothing: transcribeChunk threw %s; the streams carried deadlines of %v s (-1: none), expected kDeadline = 60 s on each attempt", error, timeouts);
+  ctx.Assert(timeouts.size() == 2 && each, "the broken stream and its retry carried deadlines of %v s (-1: none): each attempt gets kDeadline = 60 s of its own", timeouts);
 }
 
 void CheckMaxAttempts(harness::Ctx& ctx) {
-  asrWorld(ctx);
+  AsrPeer& peer = asrWorld(ctx);
+  // Every stream breaks after one segment: the chunk is never whole.
+  peer.break_after = 1;
+  peer.break_always = true;
+  mustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with every stream breaking after one segment (the chunk is never complete)");
+  ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size(), 2, "a provider whose streams keep breaking is asked kMaxAttempts = 2 times for one chunk; attempts");
+  peer.break_after = -1;
+  peer.break_always = false;
   ctx.GRPC.Fail("TranscribeChunk", grpc::StatusCode::UNAVAILABLE, "asr overloaded", 10);
   mustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with the provider unavailable");
-  ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size(), 2, "an unavailable provider is asked kMaxAttempts = 2 times for one chunk (each attempt is billed); attempts");
+  ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size() - 2, 2, "an unavailable provider is asked kMaxAttempts = 2 times for one chunk (each attempt is billed); attempts");
 }
 
 void CheckResumeOffset(harness::Ctx& ctx) {

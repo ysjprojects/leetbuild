@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // bltn type defines functions which run at CFG execution.
@@ -3245,7 +3246,12 @@ func compositeLitKeyedNotype(n *node) { doCompositeLitKeyed(n, false) }
 
 func empty(n *node) {}
 
-var rat = reflect.ValueOf((*[]rune)(nil)).Type().Elem() // runes array type
+// rangeStringValue evaluates the ranged string once, as a copy: the body may assign the variable
+// it was read from without changing the iteration.
+func rangeStringValue(n *node) func(*frame) reflect.Value {
+	value := genValue(n)
+	return func(f *frame) reflect.Value { return reflect.ValueOf(value(f).String()) }
+}
 
 func _range(n *node) {
 	index0 := n.child[0].findex // array index location in frame
@@ -3258,47 +3264,62 @@ func _range(n *node) {
 	var an *node
 	if len(n.child) == 4 {
 		an = n.child[2]
-		index1 := n.child[1].findex // array value location in frame
-		if isString(an.typ.TypeOf()) {
-			// Special variant of "range" for string, where the index indicates the byte position
-			// of the rune in the string, rather than the index of the rune in array.
-			stringType := reflect.TypeOf("")
-			value = genValueAs(an, rat) // range on string iterates over runes
-			n.exec = func(f *frame) bltn {
-				a := f.data[index2]
-				v0 := f.data[index3]
-				v0.SetInt(v0.Int() + 1)
-				i := int(v0.Int())
-				if i >= a.Len() {
-					return fnext
-				}
-				// Compute byte position of the rune in string
-				pos := a.Slice(0, i).Convert(stringType).Len()
-				f.data[index0].SetInt(int64(pos))
-				f.data[index1].Set(a.Index(i))
-				return tnext
-			}
-		} else {
-			value = genValueRangeArray(an)
-			n.exec = func(f *frame) bltn {
-				a := f.data[index2]
-				v0 := f.data[index0]
-				v0.SetInt(v0.Int() + 1)
-				i := int(v0.Int())
-				if i >= a.Len() {
-					return fnext
-				}
-				f.data[index1].Set(a.Index(i))
-				return tnext
-			}
-		}
 	} else {
 		an = n.child[1]
-		if isString(an.typ.TypeOf()) {
-			value = genValueAs(an, rat) // range on string iterates over runes
-		} else {
-			value = genValueRangeArray(an)
+	}
+	ranged := isString(an.typ.TypeOf())
+	// A blank value (`for k, _ := range x`) has no frame slot: n.child[1].findex is not its own.
+	valued := len(n.child) == 4 && !isBlank(n.child[1])
+	switch {
+	case ranged && valued:
+		// LeetBuild: range over a string decodes UTF-8 in place. The key is the byte offset of
+		// each rune and the value the rune, U+FFFD for an invalid byte, which advances by one
+		// byte (Go spec, "For statements with range clause"). index3 holds the next offset.
+		index1 := n.child[1].findex // rune value location in frame
+		value = rangeStringValue(an)
+		n.exec = func(f *frame) bltn {
+			s := f.data[index2].String()
+			next := f.data[index3]
+			pos := int(next.Int())
+			if pos >= len(s) {
+				return fnext
+			}
+			r, w := utf8.DecodeRuneInString(s[pos:])
+			next.SetInt(int64(pos + w))
+			f.data[index0].SetInt(int64(pos))
+			f.data[index1].Set(reflect.ValueOf(r))
+			return tnext
 		}
+	case ranged:
+		value = rangeStringValue(an)
+		n.exec = func(f *frame) bltn {
+			s := f.data[index2].String()
+			next := f.data[index3]
+			pos := int(next.Int())
+			if pos >= len(s) {
+				return fnext
+			}
+			_, w := utf8.DecodeRuneInString(s[pos:])
+			next.SetInt(int64(pos + w))
+			f.data[index0].SetInt(int64(pos))
+			return tnext
+		}
+	case valued:
+		index1 := n.child[1].findex // array value location in frame
+		value = genValueRangeArray(an)
+		n.exec = func(f *frame) bltn {
+			a := f.data[index2]
+			v0 := f.data[index0]
+			v0.SetInt(v0.Int() + 1)
+			i := int(v0.Int())
+			if i >= a.Len() {
+				return fnext
+			}
+			f.data[index1].Set(a.Index(i))
+			return tnext
+		}
+	default:
+		value = genValueRangeArray(an)
 		n.exec = func(f *frame) bltn {
 			v0 := f.data[index0]
 			v0.SetInt(v0.Int() + 1)
@@ -3311,13 +3332,17 @@ func _range(n *node) {
 
 	// Init sequence
 	next := n.exec
-	index := index0
-	if isString(an.typ.TypeOf()) && len(n.child) == 4 {
-		index = index3
+	if ranged {
+		n.child[0].exec = func(f *frame) bltn {
+			f.data[index2] = value(f) // the string, evaluated once
+			f.data[index3].SetInt(0)  // byte offset of the first rune
+			return next
+		}
+		return
 	}
 	n.child[0].exec = func(f *frame) bltn {
 		f.data[index2] = value(f) // set array shallow copy for range
-		f.data[index].SetInt(-1)  // assing index value
+		f.data[index0].SetInt(-1) // assing index value
 		return next
 	}
 }
@@ -3383,6 +3408,19 @@ func loopVarFor(n *node) {
 		nv := reflect.New(fv.Type()).Elem()
 		nv.Set(fv)
 		f.data[n.findex] = nv
+		return next
+	}
+}
+
+// loopVarForEnd ends an iteration of `for i := init; cond; post {}`, at the body's end or on a
+// continue: the next iteration's variable starts from this iteration's value (Go spec, "For
+// statements with for clause"), so it is copied back to where post and cond read it.
+func loopVarForEnd(n *node) {
+	ixn := n.anc.child[0].child[0]
+	lv := n.child[0]
+	next := getExec(n.tnext)
+	n.exec = func(f *frame) bltn {
+		f.data[ixn.findex].Set(f.data[lv.findex])
 		return next
 	}
 }

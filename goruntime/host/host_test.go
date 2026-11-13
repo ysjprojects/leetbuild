@@ -89,6 +89,32 @@ func TestRunCheckReportsCompileErrorsAtTheLearnersLine(t *testing.T) {
 	}
 }
 
+// A panic while package-level variables initialise is the program failing at start-up, not a
+// compile error, and names the learner's line.
+func TestRunCheckReportsStartupPanics(t *testing.T) {
+	job := &Job{
+		Entry: "app.go",
+		Files: map[string]string{"app.go": `package main
+
+import "errors"
+
+var client = newClient()
+
+func newClient() int {
+	panic(errors.New("Failed to create producer: bad config"))
+}
+
+func main() {}
+`},
+		Harness: "package main\n\nimport \"leetbuild/harness\"\n\nfunc CheckX(ctx *harness.Ctx) {}\n",
+	}
+	res := RunCheck(job, "x")
+	want := "your program failed at start-up: panic: Failed to create producer: bad config (app.go:8)"
+	if res.Passed || res.Message != want {
+		t.Fatalf("start-up panic: %q, want %q", res.Message, want)
+	}
+}
+
 // A check's program ends with the check: main, blocked in a server the next check's reset stops,
 // must not go on to log.Fatal (an exit) or listen again in that next check's world.
 func TestRunCheckEndsTheProgramWithTheCheck(t *testing.T) {

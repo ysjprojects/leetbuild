@@ -71,6 +71,10 @@ export class Clock {
   private frozenAt: number | null = null;
   /** Holds on the pump (`hold`): while any is held, idle turns do not jump to pending sleeps. */
   private holds = 0;
+  /** Replies (`deliver`) not landed yet: idle turns wait for them too. */
+  private inFlight = 0;
+  /** Bumped by `reset`: what was in flight for an earlier check no longer holds this one's pump. */
+  private epoch = 0;
 
   now(): number {
     return (this.frozenAt ?? realNow()) + this.offset;
@@ -85,6 +89,8 @@ export class Clock {
     this.timers = [];
     this.frozenAt = null;
     this.holds = 0;
+    this.inFlight = 0;
+    this.epoch += 1;
   }
 
   /**
@@ -162,6 +168,28 @@ export class Clock {
     this.timers = this.timers.filter(t => t.id !== id);
   }
 
+  /**
+   * Run `fn` on a later macrotask, as a reply read off a socket arrives: work its caller never
+   * awaited (a fire-and-forget write, an `async` forEach) is still in flight when the code that
+   * moved on finishes, as against a real server. Idle turns do not jump virtual time while a reply
+   * is in flight: a reply never loses a race to a sleep it beats in production.
+   */
+  deliver(fn: () => void): void {
+    const epoch = this.epoch;
+    this.inFlight += 1;
+    nextMacrotask(() => {
+      this.landed(epoch);
+      fn();
+    });
+  }
+
+  /** `await CLOCK.reply()`: resume on a later macrotask, as a client library does when its reply arrives (`deliver`). */
+  reply(): Promise<void> {
+    const {promise, resolve} = Promise.withResolvers<void>();
+    this.deliver(resolve);
+    return promise;
+  }
+
   // ---- the globals the learner's code sees -------------------------------------------------------
 
   /** Replace `Date.now`, `performance.now`, `setTimeout`/`setInterval` (and their clears) with virtual ones. */
@@ -171,15 +199,17 @@ export class Clock {
     Date.now = () => this.now();
     const perf = globalThis.performance;
     if (perf !== undefined) perf.now = () => this.now();
-    GLOBALS.setTimeout = (fn: () => void, ms?: number): number => this.setTimeout(fn, ms);
+    // Node hands a timer's extra arguments to its callback: `setTimeout(resolve, 2000, false)`.
+    GLOBALS.setTimeout = (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): number =>
+      this.setTimeout(args.length === 0 ? fn : () => fn(...args), ms);
     GLOBALS.clearTimeout = (id?: number): void => {
       if (id === 0 || id === undefined) return;
       this.clearTimer(id);
     };
-    GLOBALS.setInterval = (fn: () => void, ms?: number): number => {
+    GLOBALS.setInterval = (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): number => {
       const every = Math.max(1, Number(ms) || 1);
       const id = this.nextTimer++;
-      this.timers.push({id, at: this.now() + every, fn, interval: every});
+      this.timers.push({id, at: this.now() + every, fn: args.length === 0 ? fn : () => fn(...args), interval: every});
       return id;
     };
     GLOBALS.clearInterval = (id?: number): void => {
@@ -238,6 +268,13 @@ export class Clock {
     this.schedulePump();
     return id;
   }
+
+  /** Something in flight landed: the last one lets idle turns jump to pending sleeps again. */
+  private landed(epoch: number): void {
+    if (epoch !== this.epoch) return;
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    if (this.inFlight === 0 && this.holds === 0 && this.hasPendingSleeps()) this.schedulePump();
+  }
   private fire(): void {
     for (const fn of [...this.advanceListeners]) fn();
     // Timers fire in due order; a callback may schedule more.
@@ -262,8 +299,8 @@ export class Clock {
     this.pumpScheduled = true;
     nextMacrotask(() => {
       this.pumpScheduled = false;
-      // Held (a tick in progress): release schedules the turn again.
-      if (!this.installed || this.holds > 0) return;
+      // Held (a tick in progress, a reply in flight): whatever releases it schedules the turn again.
+      if (!this.installed || this.holds > 0 || this.inFlight > 0) return;
       const sleeps = this.timers.filter(t => t.interval === null).sort((a, b) => a.at - b.at);
       if (sleeps.length === 0) return;
       if (this.sleepLimit !== null && this.sleeps >= this.sleepLimit) {

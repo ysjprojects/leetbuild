@@ -68,7 +68,8 @@ invisible.
     {
       id: 'bounce-category',
       title: 'Carries the bounce category',
-      detail: 'The response always has `bounce_category`, the relay\'s reason for a bounce (`""` without one).',
+      detail:
+        'The response always has `bounce_category`, the relay\'s reason for a bounce (`""` without one), and `suppressed`, the gate\'s answer for the recipient at the time of the read (an address suppressed after its message was sent reads `true`).',
       match: {
         python: {all: [/["']bounce_category["']\s*:/]},
         typescript: {all: [/bounce_category:/]},
@@ -81,7 +82,7 @@ invisible.
       id: 'foreign-404',
       title: "Answers another tenant's message with 404",
       detail:
-        "The message's tenant is compared with the caller's `X-Tenant-Id`; a mismatch answers the same **404** as a missing id, so ids confirm nothing.",
+        "The message's tenant is compared exactly with the caller's `X-Tenant-Id`; a mismatch answers the same **404**, body included, as a missing id, so ids confirm nothing.",
       match: {
         python: {
           all: [/x-tenant-id/i, /message\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*message\[["']tenant["']\]/],
@@ -445,16 +446,24 @@ async def check_bounce_category(ctx):
     assert body.get("bounce_category") == "mailbox_unknown", f"a bounced message reads {body}: without bounce_category support cannot tell a dead mailbox from a full one"
     assert body.get("suppressed") is True, f"the bounced address is suppressed, the read says {body.get('suppressed')!r}"
     assert clean.get("bounce_category") == "" and clean.get("suppressed") is False, f"a sent message must carry an empty bounce_category and suppressed false, got {clean}"
+    ctx.redis.sadd("mail:suppressed", "ana@example.com")
+    async with _api(ctx) as c:
+        later = (await _read(c, sent)).json()
+    assert later.get("suppressed") is True, f"ana unsubscribed after her message was sent, and the read says suppressed {later.get('suppressed')!r}: suppressed is the gate's answer for the recipient now, not a property of the message's state"
 
 
 async def check_foreign_404(ctx):
     message_id = _message("sent")
     async with _api(ctx) as c:
         foreign = await _read(c, message_id, tenant="t-2")
+        missing = await _read(c, "m-404", tenant="t-2")
+        shouted = await _read(c, message_id, tenant="T-1")
         anonymous = await _read(c, message_id, tenant=None)
         own = await _read(c, message_id)
     assert foreign.status_code == 404, f"tenant t-2 read t-1's message {message_id}: {foreign.status_code} {foreign.text}. Compare the message's tenant with X-Tenant-Id and answer 404"
     assert "ana@example.com" not in foreign.text, f"the answer to another tenant carries the recipient: {foreign.text}"
+    assert foreign.text.replace(message_id, "{id}") == missing.text.replace("m-404", "{id}"), f"another tenant's message answers {foreign.text} and a missing id {missing.text}: the difference confirms the id exists. Answer the same 404"
+    assert shouted.status_code == 404, f"tenant T-1 read t-1's message: {shouted.status_code}. Tenant ids are compared exactly"
     assert anonymous.status_code == 404, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 404"
     assert own.status_code == 200, f"the owning tenant's read answered {own.status_code}"
 
@@ -517,6 +526,9 @@ export async function check_bounce_category(ctx) {
   assert.equal(body.bounce_category, 'mailbox_unknown', \`a bounced message reads \${JSON.stringify(body)}: without bounce_category support cannot tell a dead mailbox from a full one\`);
   assert.equal(body.suppressed, true, \`the bounced address is suppressed, the read says \${body.suppressed}\`);
   assert(clean.bounce_category === '' && clean.suppressed === false, \`a sent message must carry an empty bounce_category and suppressed false, got \${JSON.stringify(clean)}\`);
+  ctx.redis.sadd('mail:suppressed', 'ana@example.com');
+  const later = (await read(sent)).json();
+  assert.equal(later.suppressed, true, \`ana unsubscribed after her message was sent, and the read says suppressed \${later.suppressed}: suppressed is the gate's answer for the recipient now, not a property of the message's state\`);
 }
 
 export async function check_foreign_404(ctx) {
@@ -525,6 +537,10 @@ export async function check_foreign_404(ctx) {
   const foreign = await read(id, 't-2');
   assert.equal(foreign.status, 404, \`tenant t-2 read t-1's message \${id}: \${foreign.status} \${foreign.text}. Compare the message's tenant with X-Tenant-Id and answer 404\`);
   assert(!foreign.text.includes('ana@example.com'), \`the answer to another tenant carries the recipient: \${foreign.text}\`);
+  const missing = await read('m-404', 't-2');
+  assert.equal(foreign.text.replaceAll(id, '{id}'), missing.text.replaceAll('m-404', '{id}'), \`another tenant's message answers \${foreign.text} and a missing id \${missing.text}: the difference confirms the id exists. Answer the same 404\`);
+  const shouted = await read(id, 'T-1');
+  assert.equal(shouted.status, 404, \`tenant T-1 read t-1's message: \${shouted.status}. Tenant ids are compared exactly\`);
   const anonymous = await read(id, null);
   assert.equal(anonymous.status, 404, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 404\`);
   assert.equal((await read(id)).status, 200, "the owning tenant's read must answer 200");
@@ -617,6 +633,8 @@ func CheckBounceCategory(ctx *harness.Ctx) {
 	ctx.Equal(body["bounce_category"], "mailbox_unknown", "without bounce_category support cannot tell a dead mailbox from a full one; a bounced message's bounce_category")
 	ctx.Equal(body["suppressed"], true, "the bounced address is suppressed; the read's suppressed")
 	ctx.Assert(clean["bounce_category"] == "" && clean["suppressed"] == false, "a sent message must carry an empty bounce_category and suppressed false, got %v", clean)
+	ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com")
+	ctx.Equal(bodyOf(ctx, readAs(c, sent, "t-1"))["suppressed"], true, "ana unsubscribed after her message was sent (suppressed is the gate's answer for the recipient now, not a property of the message's state); the read's suppressed")
 }
 
 func CheckForeign404(ctx *harness.Ctx) {
@@ -625,6 +643,9 @@ func CheckForeign404(ctx *harness.Ctx) {
 	foreign := readAs(c, id, "t-2")
 	ctx.Equal(foreign.Status, 404, "tenant t-2 read t-1's message %s (%s): compare the message's tenant with X-Tenant-Id and answer 404", id, foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), "ana@example.com"), "the answer to another tenant carries the recipient: %s", foreign.Text())
+	missing := readAs(c, "m-404", "t-2")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), id, "{id}"), strings.ReplaceAll(missing.Text(), "m-404", "{id}"), "another tenant's message must answer the same 404 as a missing id (a difference confirms the id exists); the bodies")
+	ctx.Equal(readAs(c, id, "T-1").Status, 404, "tenant T-1 reading t-1's message (tenant ids are compared exactly)")
 	ctx.Equal(readAs(c, id, "").Status, 404, "a read without X-Tenant-Id")
 	ctx.Equal(readAs(c, id, "t-1").Status, 200, "the owning tenant's read")
 }
@@ -713,6 +734,9 @@ void CheckBounceCategory(harness::Ctx& ctx) {
   ctx.Equal(body.value("bounce_category", "(missing)"), "mailbox_unknown", "without bounce_category support cannot tell a dead mailbox from a full one; a bounced message's bounce_category");
   ctx.Equal(body.value("suppressed", false), true, "the bounced address is suppressed; the read's suppressed");
   ctx.Assert(clean.value("bounce_category", "(missing)").empty() && clean.value("suppressed", true) == false, "a sent message must carry an empty bounce_category and suppressed false, got %s", clean.dump());
+  ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com");
+  ctx.Equal(bodyOf(ctx, readAs(c, sent, "t-1")).value("suppressed", false), true,
+            "ana unsubscribed after her message was sent (suppressed is the gate's answer for the recipient now, not a property of the message's state); the read's suppressed");
 }
 
 void CheckForeign404(harness::Ctx& ctx) {
@@ -721,6 +745,13 @@ void CheckForeign404(harness::Ctx& ctx) {
   const auto foreign = readAs(c, id, "t-2");
   ctx.Equal(foreign.Status, 404, "tenant t-2 read t-1's message %s (%s): compare the message's tenant with X-Tenant-Id and answer 404", id, foreign.Text());
   ctx.Assert(foreign.Text().find("ana@example.com") == std::string::npos, "the answer to another tenant carries the recipient: %s", foreign.Text());
+  const auto masked = [](std::string text, const std::string& id_in_text) {
+    for (auto at = text.find(id_in_text); at != std::string::npos; at = text.find(id_in_text, at + 4)) text.replace(at, id_in_text.size(), "{id}");
+    return text;
+  };
+  ctx.Equal(masked(foreign.Text(), id), masked(readAs(c, "m-404", "t-2").Text(), "m-404"),
+            "another tenant's message must answer the same 404 as a missing id (a difference confirms the id exists); the bodies");
+  ctx.Equal(readAs(c, id, "T-1").Status, 404, "tenant T-1 reading t-1's message (tenant ids are compared exactly)");
   ctx.Equal(readAs(c, id, "").Status, 404, "a read without X-Tenant-Id");
   ctx.Equal(readAs(c, id, "t-1").Status, 200, "the owning tenant's read");
 }

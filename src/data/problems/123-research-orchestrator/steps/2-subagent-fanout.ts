@@ -22,11 +22,12 @@ searches; and every page a subagent read lands in the lead's context window.
 
 - Run only the first \`budget.max_subagents\` tasks, **in parallel**, in batches of
   \`min(MAX_PARALLEL_SUBAGENTS, max_subagents)\` with \`MAX_PARALLEL_SUBAGENTS\` = 5.
-- Every \`Run\` carries a **120 s** deadline (\`SUBAGENT_DEADLINE_S\`); a call that fails or times
-  out is a "no result" note and the batch goes on.
+- Every \`Run\` carries a **120 s** deadline of its own (\`SUBAGENT_DEADLINE_S\`;
+  \`SUBAGENT_DEADLINE_MS\` = 120 000 in TypeScript), whatever batch it is in; a call that fails or
+  times out is a "no result" note and the rest of its batch goes on.
 - The request carries the whole task description: objective, output format, tools, boundaries.
-- A note carries \`findings\` cut to \`MAX_FINDINGS_CHARS\` = 4000 characters; the transcript stays
-  with the subagent. Notes keep the plan's order.`,
+- A note carries \`findings\` cut to \`MAX_FINDINGS_CHARS\` = 4000 characters (not bytes); the
+  transcript stays with the subagent. Notes keep the plan's order, whichever subagent answers first.`,
   sequence: {
     participants: ['Lead agent', 'Subagent A', 'Subagent B'],
     messages: [
@@ -78,7 +79,7 @@ searches; and every page a subagent read lands in the lead's context window.
       id: 'deadline',
       title: 'Every Subagent.Run carries a 120 s deadline',
       detail:
-        'The call is made with `SUBAGENT_DEADLINE_S` = 120 (a call timeout, a context with a timeout, `withDeadlineAfter`, `set_deadline`); a subagent that does not answer in time is a "no result" note.',
+        'Each call is made with a 120 s deadline of its own (`SUBAGENT_DEADLINE_S`, `SUBAGENT_DEADLINE_MS` in TypeScript: a call timeout, a context with a timeout, `withDeadlineAfter`, `set_deadline`), in the second batch as in the first; a subagent that fails or does not answer in time is a "no result" note and its siblings keep their findings.',
       match: {
         python: {all: [/SUBAGENT_DEADLINE_S\s*=\s*120\b/, /timeout\s*=\s*SUBAGENT_DEADLINE_S/]},
         typescript: {
@@ -106,7 +107,7 @@ searches; and every page a subagent read lands in the lead's context window.
       id: 'condense',
       title: 'Keeps the condensed findings, not the transcript',
       detail:
-        'A note carries the reply’s `findings`, cut to `MAX_FINDINGS_CHARS` = 4000; the `transcript` is never read.',
+        'A note carries the reply’s `findings`, cut to `MAX_FINDINGS_CHARS` = 4000 characters; the `transcript` is never read, even when the findings are empty; the notes keep the plan’s order whichever subagent answers first.',
       match: {
         python: {all: [/MAX_FINDINGS_CHARS\s*=\s*4000\b/, /\.findings\b/], none: [/\.transcript\b/]},
         typescript: {all: [/MAX_FINDINGS_CHARS\s*=\s*4000\b/, /\.findings\b/], none: [/\.transcript\b/]},
@@ -360,11 +361,11 @@ func runSubagent(ctx context.Context, jobID string, task jobs.Task) string {
 		return fmt.Sprintf("[%s] no result: %v", task.ID, status.Code(err))
 	}
 	// The condensed answer only: the transcript would fill the lead's context window.
-	findings := reply.GetFindings()
+	findings := []rune(reply.GetFindings()) // characters, not bytes: a byte cut can split one in two
 	if len(findings) > maxFindingsChars {
 		findings = findings[:maxFindingsChars]
 	}
-	return fmt.Sprintf("[%s] %s", task.ID, findings)
+	return fmt.Sprintf("[%s] %s", task.ID, string(findings))
 }
 
 // runSubagents runs the plan's tasks on subagents: one note per task run, in the plan's order.
@@ -499,6 +500,16 @@ constexpr size_t kMaxFindingsChars = 4000;
 
 auto subagents = researchd::Subagent::NewStub(grpc::CreateChannel("subagents:9000", grpc::InsecureChannelCredentials()));
 
+// The first n characters of UTF-8 text: a byte cut can split one in two (a continuation byte is 10xxxxxx).
+std::string firstChars(const std::string& text, size_t n) {
+  size_t end = 0;
+  for (size_t chars = 0; end < text.size() && chars < n; chars++) {
+    end++;
+    while (end < text.size() && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) end++;
+  }
+  return text.substr(0, end);
+}
+
 std::string runSubagent(const std::string& job_id, const jobs::Task& task) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kSubagentDeadlineS));
@@ -513,7 +524,7 @@ std::string runSubagent(const std::string& job_id, const jobs::Task& task) {
   const grpc::Status status = subagents->Run(&ctx, request, &reply);
   if (!status.ok()) return "[" + task.id + "] no result: " + status.error_message();
   // The condensed answer only: the transcript would fill the lead's context window.
-  return "[" + task.id + "] " + reply.findings().substr(0, kMaxFindingsChars);
+  return "[" + task.id + "] " + firstChars(reply.findings(), kMaxFindingsChars);
 }
 
 // Run the plan's tasks on subagents; one note per task run, in the plan's order.
@@ -535,6 +546,8 @@ std::vector<std::string> runSubagents(const std::string& job_id, const std::vect
   },
   harness: {
     python: `import asyncio
+
+import grpc
 
 import research_orchestrator_pb2 as pb
 import research_orchestrator_pb2_grpc as pb_grpc
@@ -559,23 +572,29 @@ def _plan(n):
 
 
 def _findings(task_id, size=120):
-    return (f"{task_id}: chair, CEO and nine non-executive directors; " * 200)[:size]
+    return (f"{task_id}: présidente, CEO and nine non-executive directors; " * 200)[:size]
 
 
 class Subagents(pb_grpc.SubagentServicer):
-    """Answers every task after a second of work; counts how many runs are in flight at once."""
+    """Answers every task after a second of work, plus its delay; counts how many runs are in flight at once."""
 
     def __init__(self, findings_size=120):
         self.active = 0
         self.peak = 0
         self.findings_size = findings_size
+        self.delays = {}  # task id -> extra seconds of work
+        self.crash = set()  # task ids whose subagent fails UNAVAILABLE
+        self.empty = set()  # task ids whose subagent found nothing
 
     async def Run(self, request, context):
         self.active += 1
         self.peak = max(self.peak, self.active)
-        await asyncio.sleep(1)
+        await asyncio.sleep(1 + self.delays.get(request.task_id, 0))
         self.active -= 1
-        return pb.RunReply(findings=_findings(request.task_id, self.findings_size), transcript=TRANSCRIPT, tokens=1200)
+        if request.task_id in self.crash:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "subagent crashed")
+        found = "" if request.task_id in self.empty else _findings(request.task_id, self.findings_size)
+        return pb.RunReply(findings=found, transcript=TRANSCRIPT, tokens=1200)
 
 
 def _lead(ctx, findings_size=120):
@@ -609,7 +628,7 @@ async def check_fanout_cap(ctx):
 
 
 async def check_deadline(ctx):
-    m, _ = _lead(ctx)
+    m, peer = _lead(ctx)
     await m.run_subagents("job-1", _plan(3), COMPARE)
     for call in ctx.grpc.calls_to("Run"):
         assert call.timeout is not None, "a Subagent.Run call carries no deadline: one hung subagent holds the whole job"
@@ -620,6 +639,20 @@ async def check_deadline(ctx):
     waited = ctx.clock.time() - started
     assert all("no result" in note for note in notes), f"two subagents that hang for 600 s gave the notes {[n[:60] for n in notes]}: after 120 s each must be a 'no result' note"
     assert waited <= 250, f"the lead waited {waited:.0f} s for two hung subagents, expected about 120 s"
+    # A deep job of two batches whose subagents each work for 100 s; t-3's subagent crashes.
+    ctx.grpc.set_latency("Run", 100)
+    peer.crash = {"t-3"}
+    before = len(ctx.grpc.calls_to("Run"))
+    plan = _plan(10)
+    notes = await m.run_subagents("job-3", plan, DEEP)
+    for call in ctx.grpc.calls_to("Run")[before:]:
+        assert call.timeout is not None and 119 <= call.timeout <= 121, f"on a deep job of two batches Subagent.Run for {call.request.task_id} carried a {call.timeout} s deadline: every call gets SUBAGENT_DEADLINE_S of its own, not what is left of one deadline for the fan-out"
+    assert len(notes) == 10, f"a deep job over a plan of 10 tasks returned {len(notes)} notes"
+    for task, note in zip(plan, notes):
+        if task["id"] == "t-3":
+            assert note.startswith("[t-3] no result"), f"the subagent for t-3 failed UNAVAILABLE but its note is {note[:60]!r}, expected a 'no result' note"
+        else:
+            assert note == f"[{task['id']}] {_findings(task['id'])}", f"the note for {task['id']} is {note[:60]!r}, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did"
 
 
 async def check_task_spec(ctx):
@@ -637,13 +670,19 @@ async def check_task_spec(ctx):
 
 
 async def check_condense(ctx):
-    m, _ = _lead(ctx, findings_size=6000)
-    plan = _plan(2)
+    m, peer = _lead(ctx, findings_size=6000)
+    # t-1 works longest and t-4 answers first; t-2's subagent found nothing.
+    peer.delays = {"t-1": 30, "t-2": 20, "t-3": 10}
+    peer.empty = {"t-2"}
+    plan = _plan(4)
     notes = await m.run_subagents("job-1", plan, COMPARE)
+    assert len(notes) == 4, f"a compare job over a plan of 4 tasks returned {len(notes)} notes"
     for task, note in zip(plan, notes):
         assert "PAGE-DUMP" not in note, f"the note for {task['id']} carries the subagent's transcript ({len(note)} characters): keep only the condensed findings"
-        expected = f"[{task['id']}] {_findings(task['id'], 6000)[:4000]}"
-        assert note == expected, f"the note for {task['id']} is {len(note)} characters starting {note[:50]!r}, expected '[{task['id']}] ' and the findings cut to MAX_FINDINGS_CHARS = 4000"
+    assert [note[:5] for note in notes] == ["[t-1]", "[t-2]", "[t-3]", "[t-4]"], f"the notes came in the order {[note[:5] for note in notes]}: keep the plan's order, not the order the subagents answered in"
+    for task, note in zip(plan, notes):
+        found = "" if task["id"] == "t-2" else _findings(task["id"], 6000)[:4000]
+        assert note == f"[{task['id']}] {found}", f"the note for {task['id']} is {len(note)} characters starting {note[:50]!r}, expected '[{task['id']}] ' and the findings cut to MAX_FINDINGS_CHARS = 4000 characters"
 `,
     typescript: `const FACT = {max_subagents: 1, max_tool_calls: 10, token_budget: 50000};
 const COMPARE = {max_subagents: 4, max_tool_calls: 60, token_budget: 250000};
@@ -659,14 +698,28 @@ const plan = (n: number) =>
     boundaries: 'annual reports from 2024 on; skip news coverage',
   }));
 
-const findings = (taskId: string, size = 120): string => \`\${taskId}: chair, CEO and nine non-executive directors; \`.repeat(200).slice(0, size);
+const findings = (taskId: string, size = 120): string => \`\${taskId}: présidente, CEO and nine non-executive directors; \`.repeat(200).slice(0, size);
 
-/** Every task answered after 10 s of latency; the calls' start times show how many ran together. */
-function lead(ctx, findingsSize = 120) {
+/** How the subagents behave per task: extra seconds of work, a crash (UNAVAILABLE), nothing found. */
+interface Peer {
+  delays?: Record<string, number>;
+  crash?: string[];
+  empty?: string[];
+}
+
+/** Every task answered after 10 s of latency plus its delay; the calls' start times show how many ran together. */
+function lead(ctx, findingsSize = 120, peer: Peer = {}) {
   const pkg = ctx.proto('research_orchestrator.proto');
   ctx.grpc.serve(pkg.researchd.Subagent.service, {
     Run(call, callback) {
-      callback(null, {findings: findings(call.request.task_id, findingsSize), transcript: TRANSCRIPT, tokens: 1200});
+      const id = call.request.task_id;
+      const answer = () => {
+        if (peer.crash?.includes(id)) callback({code: ctx.grpc.status.UNAVAILABLE, details: 'subagent crashed'});
+        else callback(null, {findings: peer.empty?.includes(id) ? '' : findings(id, findingsSize), transcript: TRANSCRIPT, tokens: 1200});
+      };
+      const delay = peer.delays?.[id] ?? 0;
+      if (delay > 0) setTimeout(answer, delay * 1000);
+      else answer();
     },
   });
   ctx.grpc.setLatency('Run', 10);
@@ -702,7 +755,8 @@ export async function check_fanout_cap(ctx) {
 }
 
 export async function check_deadline(ctx) {
-  const m = lead(ctx);
+  const peer: Peer = {};
+  const m = lead(ctx, 120, peer);
   await m.runSubagents('job-1', plan(3), COMPARE);
   for (const call of ctx.grpc.callsTo('Run')) {
     assert(call.timeout !== null, 'a Subagent.Run call carries no deadline: one hung subagent holds the whole job');
@@ -710,10 +764,25 @@ export async function check_deadline(ctx) {
   }
   ctx.grpc.setLatency('Run', 600);
   const started = ctx.clock.now();
-  const notes = await m.runSubagents('job-2', plan(2), COMPARE);
+  let notes = await m.runSubagents('job-2', plan(2), COMPARE);
   const waited = (ctx.clock.now() - started) / 1000;
   assert(notes.every(n => n.includes('no result')), \`two subagents that hang for 600 s gave the notes \${JSON.stringify(notes.map(n => n.slice(0, 60)))}: after 120 s each must be a 'no result' note\`);
   assert(waited <= 250, \`the lead waited \${waited} s for two hung subagents, expected about 120 s\`);
+  // A deep job of two batches whose subagents each work for 100 s; t-3's subagent crashes.
+  ctx.grpc.setLatency('Run', 100);
+  peer.crash = ['t-3'];
+  const before = ctx.grpc.callsTo('Run').length;
+  const tasks = plan(10);
+  notes = await m.runSubagents('job-3', tasks, DEEP);
+  for (const call of ctx.grpc.callsTo('Run').slice(before)) {
+    assert(call.timeout !== null && 119 <= call.timeout && call.timeout <= 121, \`on a deep job of two batches Subagent.Run for \${call.request.task_id} carried a \${call.timeout} s deadline: every call gets SUBAGENT_DEADLINE_MS of its own, not what is left of one deadline for the fan-out\`);
+  }
+  assert.equal(notes.length, 10, \`a deep job over a plan of 10 tasks returned \${notes.length} notes\`);
+  tasks.forEach((task, i) => {
+    const note = notes[i] ?? '';
+    if (task.id === 't-3') assert(note.startsWith('[t-3] no result'), \`the subagent for t-3 failed UNAVAILABLE but its note is \${JSON.stringify(note.slice(0, 60))}, expected a 'no result' note\`);
+    else assert.equal(note, \`[\${task.id}] \${findings(task.id)}\`, \`the note for \${task.id} is \${JSON.stringify(note.slice(0, 60))}, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did\`);
+  });
 }
 
 export async function check_task_spec(ctx) {
@@ -732,14 +801,20 @@ export async function check_task_spec(ctx) {
 }
 
 export async function check_condense(ctx) {
-  const m = lead(ctx, 6000);
-  const tasks = plan(2);
-  const notes = await m.runSubagents('job-1', tasks, COMPARE);
-  tasks.forEach((task, i) => {
-    const note = notes[i] ?? '';
-    assert(!note.includes('PAGE-DUMP'), \`the note for \${task.id} carries the subagent's transcript (\${note.length} characters): keep only the condensed findings\`);
-    assert.equal(note, \`[\${task.id}] \${findings(task.id, 6000).slice(0, 4000)}\`, \`the note for \${task.id} is \${note.length} characters, expected '[\${task.id}] ' and the findings cut to MAX_FINDINGS_CHARS = 4000\`);
-  });
+  // t-1 works longest and t-4 answers first; t-2's subagent found nothing.
+  const m = lead(ctx, 6000, {delays: {'t-1': 30, 't-2': 20, 't-3': 10}, empty: ['t-2']});
+  const tasks = plan(4);
+  const notes: string[] = await m.runSubagents('job-1', tasks, COMPARE);
+  assert.equal(notes.length, 4, \`a compare job over a plan of 4 tasks returned \${notes.length} notes\`);
+  for (const [i, task] of tasks.entries()) {
+    assert(!notes[i].includes('PAGE-DUMP'), \`the note for \${task.id} carries the subagent's transcript (\${notes[i].length} characters): keep only the condensed findings\`);
+  }
+  const order = notes.map(n => n.slice(0, 5));
+  assert.deepStrictEqual(order, ['[t-1]', '[t-2]', '[t-3]', '[t-4]'], \`the notes came in the order \${JSON.stringify(order)}: keep the plan's order, not the order the subagents answered in\`);
+  for (const [i, task] of tasks.entries()) {
+    const found = task.id === 't-2' ? '' : findings(task.id, 6000).slice(0, 4000);
+    assert.equal(notes[i], \`[\${task.id}] \${found}\`, \`the note for \${task.id} is \${notes[i].length} characters, expected '[\${task.id}] ' and the findings cut to MAX_FINDINGS_CHARS = 4000 characters\`);
+  }
 }
 `,
     go: `package main
@@ -750,6 +825,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "research/gen/research_orchestrator"
 	"research/jobs"
@@ -777,23 +856,37 @@ func testPlan(n int) []jobs.Task {
 	return plan
 }
 
-func findingsOf(taskID string, size int) string {
-	return strings.Repeat(taskID+": chair, CEO and nine non-executive directors; ", 200)[:size]
+func findingsOf(taskID string, chars int) string {
+	return string([]rune(strings.Repeat(taskID+": présidente, CEO and nine non-executive directors; ", 200))[:chars])
 }
 
-// subagentPeer answers every task; a 10 s latency makes the calls' start times show how many ran together.
+// subagentPeer answers every task after its delay; a 10 s latency makes the calls' start times show
+// how many ran together.
 type subagentPeer struct {
 	pb.UnimplementedSubagentServer
-	size int
+	size   int
+	delays map[string]time.Duration // extra work per task
+	crash  map[string]bool          // tasks whose subagent fails Unavailable
+	empty  map[string]bool          // tasks whose subagent found nothing
 }
 
 func (p *subagentPeer) Run(_ context.Context, req *pb.RunRequest) (*pb.RunReply, error) {
-	return &pb.RunReply{Findings: findingsOf(req.GetTaskId(), p.size), Transcript: transcript, Tokens: 1200}, nil
+	id := req.GetTaskId()
+	time.Sleep(p.delays[id])
+	if p.crash[id] {
+		return nil, status.Error(codes.Unavailable, "subagent crashed")
+	}
+	if p.empty[id] {
+		return &pb.RunReply{Transcript: transcript, Tokens: 1200}, nil
+	}
+	return &pb.RunReply{Findings: findingsOf(id, p.size), Transcript: transcript, Tokens: 1200}, nil
 }
 
-func lead(ctx *harness.Ctx, size int) {
-	pb.RegisterSubagentServer(ctx.GRPC.Server(""), &subagentPeer{size: size})
+func lead(ctx *harness.Ctx, size int) *subagentPeer {
+	peer := &subagentPeer{size: size}
+	pb.RegisterSubagentServer(ctx.GRPC.Server(""), peer)
 	ctx.GRPC.SetLatency("Run", 10, "")
+	return peer
 }
 
 // peak is the most calls (from the n-th on) that started at the same instant.
@@ -836,7 +929,7 @@ func CheckFanoutCap(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	lead(ctx, 120)
+	peer := lead(ctx, 120)
 	runSubagents(leadBg, "job-1", testPlan(3), compareBudget)
 	for _, call := range ctx.GRPC.CallsTo("Run", "") {
 		ctx.Assert(call.HasDeadline(), "a Subagent.Run call carries no deadline: one hung subagent holds the whole job")
@@ -850,6 +943,25 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(strings.Contains(note, "no result"), "a subagent that hangs for 600 s gave the note %.60q: after 120 s it must be a 'no result' note", note)
 	}
 	ctx.Assert(waited <= 250, "the lead waited %.0f s for two hung subagents, expected about 120 s", waited)
+	// A deep job of two batches whose subagents each work for 100 s; t-3's subagent crashes.
+	ctx.GRPC.SetLatency("Run", 100, "")
+	peer.crash = map[string]bool{"t-3": true}
+	before := len(ctx.GRPC.CallsTo("Run", ""))
+	plan := testPlan(10)
+	notes = runSubagents(leadBg, "job-3", plan, deepBudget)
+	for _, call := range ctx.GRPC.CallsTo("Run", "")[before:] {
+		ctx.Assert(call.HasDeadline() && 119*time.Second <= call.Timeout && call.Timeout <= 121*time.Second,
+			"on a deep job of two batches Subagent.Run for %s carried a %v deadline: every call gets subagentDeadline of its own, not what is left of one deadline for the fan-out",
+			call.Request.(*pb.RunRequest).GetTaskId(), call.Timeout)
+	}
+	ctx.Equal(len(notes), 10, "a deep job over a plan of 10 tasks; the notes")
+	for i, task := range plan {
+		if task.ID == "t-3" {
+			ctx.Assert(strings.HasPrefix(notes[i], "[t-3] no result"), "the subagent for t-3 failed Unavailable but its note is %.60q, expected a 'no result' note", notes[i])
+			continue
+		}
+		ctx.Assert(notes[i] == "["+task.ID+"] "+findingsOf(task.ID, 120), "the note for %s is %.60q, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did", task.ID, notes[i])
+	}
 }
 
 func CheckTaskSpec(ctx *harness.Ctx) {
@@ -871,13 +983,25 @@ func CheckTaskSpec(ctx *harness.Ctx) {
 }
 
 func CheckCondense(ctx *harness.Ctx) {
-	lead(ctx, 6000)
-	plan := testPlan(2)
+	peer := lead(ctx, 6000)
+	// t-1 works longest and t-4 answers first; t-2's subagent found nothing.
+	peer.delays = map[string]time.Duration{"t-1": 30 * time.Second, "t-2": 20 * time.Second, "t-3": 10 * time.Second}
+	peer.empty = map[string]bool{"t-2": true}
+	plan := testPlan(4)
 	notes := runSubagents(leadBg, "job-1", plan, compareBudget)
-	ctx.Equal(len(notes), 2, "the notes")
+	ctx.Equal(len(notes), 4, "a compare job over a plan of 4 tasks; the notes")
+	order := []string{}
 	for i, task := range plan {
 		ctx.Assert(!strings.Contains(notes[i], "PAGE-DUMP"), "the note for %s carries the subagent's transcript (%d characters): keep only the condensed findings", task.ID, len(notes[i]))
-		ctx.Assert(notes[i] == "["+task.ID+"] "+findingsOf(task.ID, 6000)[:4000], "the note for %s is %d characters, expected '[%s] ' and the findings cut to maxFindingsChars = 4000", task.ID, len(notes[i]), task.ID)
+		order = append(order, notes[i][:min(5, len(notes[i]))])
+	}
+	ctx.Equal(order, []string{"[t-1]", "[t-2]", "[t-3]", "[t-4]"}, "keep the plan's order, not the order the subagents answered in; the notes' order")
+	for i, task := range plan {
+		found := findingsOf(task.ID, 4000)
+		if task.ID == "t-2" {
+			found = ""
+		}
+		ctx.Assert(notes[i] == "["+task.ID+"] "+found, "the note for %s is %d characters, expected '[%s] ' and the findings cut to maxFindingsChars = 4000 characters", task.ID, utf8.RuneCountInString(notes[i]), task.ID)
 	}
 }
 `,
@@ -886,7 +1010,9 @@ func CheckCondense(ctx *harness.Ctx) {
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "research/jobs.h"
@@ -915,29 +1041,46 @@ std::vector<jobs::Task> testPlan(int n) {
   return plan;
 }
 
-std::string findingsOf(const std::string& task_id, size_t size) {
-  return repeat(task_id + ": chair, CEO and nine non-executive directors; ", 200).substr(0, size);
+// The first n characters of UTF-8 text (a continuation byte is 10xxxxxx).
+std::string utf8Prefix(const std::string& s, size_t n) {
+  size_t end = 0;
+  for (size_t chars = 0; end < s.size() && chars < n; chars++) {
+    end++;
+    while (end < s.size() && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) end++;
+  }
+  return s.substr(0, end);
 }
 
-// Answers every task; a 10 s latency makes the calls' start times show how many ran together.
+std::string findingsOf(const std::string& task_id, size_t chars) {
+  return utf8Prefix(repeat(task_id + ": présidente, CEO and nine non-executive directors; ", 200), chars);
+}
+
+// Answers every task after its delay; a 10 s latency makes the calls' start times show how many ran together.
 class SubagentPeer final : public researchd::Subagent::Service {
  public:
   size_t size = 120;
+  std::map<std::string, int> delay_s;  // extra work per task
+  std::set<std::string> crash;         // tasks whose subagent fails UNAVAILABLE
+  std::set<std::string> empty;         // tasks whose subagent found nothing
   grpc::Status Run(grpc::ServerContext*, const researchd::RunRequest* req, researchd::RunReply* out) override {
-    out->set_findings(findingsOf(req->task_id(), size));
+    const auto delay = delay_s.find(req->task_id());
+    if (delay != delay_s.end()) std::this_thread::sleep_for(std::chrono::seconds(delay->second));
+    if (crash.count(req->task_id())) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "subagent crashed");
+    if (!empty.count(req->task_id())) out->set_findings(findingsOf(req->task_id(), size));
     out->set_transcript(kTranscript);
     out->set_tokens(1200);
     return grpc::Status::OK;
   }
 };
 
-void lead(harness::Ctx& ctx, size_t size) {
+SubagentPeer& lead(harness::Ctx& ctx, size_t size) {
   static SubagentPeer* peer = nullptr;
   delete peer;
   peer = new SubagentPeer;
   peer->size = size;
   ctx.GRPC.Server("")->RegisterService(peer);
   ctx.GRPC.SetLatency("Run", 10);
+  return *peer;
 }
 
 // The most calls (from the n-th on) that started at the same instant.
@@ -980,7 +1123,7 @@ void CheckFanoutCap(harness::Ctx& ctx) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  lead(ctx, 120);
+  SubagentPeer& peer = lead(ctx, 120);
   runSubagents("job-1", testPlan(3), kCompare);
   for (const auto& call : ctx.GRPC.CallsTo("Run")) {
     ctx.Assert(call.HasDeadline(), "a Subagent.Run call carries no deadline: one hung subagent holds the whole job");
@@ -988,12 +1131,33 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Run", 600);
   const int64_t started = ctx.Clock.Now();
-  const auto notes = runSubagents("job-2", testPlan(2), kCompare);
+  auto notes = runSubagents("job-2", testPlan(2), kCompare);
   const double waited = (ctx.Clock.Now() - started) / 1000.0;
   for (const auto& note : notes) {
     ctx.Assert(note.find("no result") != std::string::npos, "a subagent that hangs for 600 s gave the note %q: after 120 s it must be a 'no result' note", note.substr(0, 60));
   }
   ctx.Assert(waited <= 250, "the lead waited %v s for two hung subagents, expected about 120 s", waited);
+  // A deep job of two batches whose subagents each work for 100 s; t-3's subagent crashes.
+  ctx.GRPC.SetLatency("Run", 100);
+  peer.crash = {"t-3"};
+  const size_t before = ctx.GRPC.CallsTo("Run").size();
+  const auto plan = testPlan(10);
+  notes = runSubagents("job-3", plan, kDeep);
+  const auto calls = ctx.GRPC.CallsTo("Run");
+  for (size_t i = before; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 119 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 121,
+               "on a deep job of two batches Subagent.Run for %s carried a %v s deadline: every call gets kSubagentDeadlineS of its own, not what is left of one deadline for the fan-out",
+               calls[i].Request<researchd::RunRequest>().task_id(), calls[i].TimeoutSeconds());
+  }
+  ctx.Equal(notes.size(), 10, "a deep job over a plan of 10 tasks; the notes");
+  for (size_t i = 0; i < plan.size(); i++) {
+    if (plan[i].id == "t-3") {
+      ctx.Assert(notes[i].rfind("[t-3] no result", 0) == 0, "the subagent for t-3 failed UNAVAILABLE but its note is %q, expected a 'no result' note", notes[i].substr(0, 60));
+    } else {
+      ctx.Assert(notes[i] == "[" + plan[i].id + "] " + findingsOf(plan[i].id, 120),
+                 "the note for %s is %q, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did", plan[i].id, notes[i].substr(0, 60));
+    }
+  }
 }
 
 void CheckTaskSpec(harness::Ctx& ctx) {
@@ -1017,14 +1181,23 @@ void CheckTaskSpec(harness::Ctx& ctx) {
 }
 
 void CheckCondense(harness::Ctx& ctx) {
-  lead(ctx, 6000);
-  const auto plan = testPlan(2);
+  SubagentPeer& peer = lead(ctx, 6000);
+  // t-1 works longest and t-4 answers first; t-2's subagent found nothing.
+  peer.delay_s = {{"t-1", 30}, {"t-2", 20}, {"t-3", 10}};
+  peer.empty = {"t-2"};
+  const auto plan = testPlan(4);
   const auto notes = runSubagents("job-1", plan, kCompare);
-  ctx.Equal(notes.size(), 2, "the notes");
+  ctx.Equal(notes.size(), 4, "a compare job over a plan of 4 tasks; the notes");
+  std::vector<std::string> order;
   for (size_t i = 0; i < plan.size(); i++) {
     ctx.Assert(notes[i].find("PAGE-DUMP") == std::string::npos, "the note for %s carries the subagent's transcript (%d characters): keep only the condensed findings", plan[i].id, notes[i].size());
-    ctx.Assert(notes[i] == "[" + plan[i].id + "] " + findingsOf(plan[i].id, 6000).substr(0, 4000),
-               "the note for %s is %d characters, expected '[%s] ' and the findings cut to kMaxFindingsChars = 4000", plan[i].id, notes[i].size(), plan[i].id);
+    order.push_back(notes[i].substr(0, 5));
+  }
+  ctx.Equal(order, {"[t-1]", "[t-2]", "[t-3]", "[t-4]"}, "keep the plan's order, not the order the subagents answered in; the notes' order");
+  for (size_t i = 0; i < plan.size(); i++) {
+    const std::string found = plan[i].id == "t-2" ? "" : findingsOf(plan[i].id, 4000);
+    ctx.Assert(notes[i] == "[" + plan[i].id + "] " + found,
+               "the note for %s is %d bytes, expected '[%s] ' and the findings cut to kMaxFindingsChars = 4000 characters (not bytes: a byte cut splits a character)", plan[i].id, notes[i].size(), plan[i].id);
   }
 }
 `,
@@ -1032,7 +1205,7 @@ void CheckCondense(harness::Ctx& ctx) {
   hints: [
     'A deep job takes ten times as long as one subagent, a planner that returns twelve tasks spends twelve subagents on a budget of four, and one subagent that hangs holds the whole job.',
     'The loop awaits each `Run` before starting the next, walks the whole plan, passes no timeout, fills only `objective`, and appends `reply.transcript`, everything the subagent read, to the lead’s notes.',
-    'Cut the plan to `budget["max_subagents"]`; for each batch of `min(MAX_PARALLEL_SUBAGENTS, max_subagents)` run `asyncio.gather` over `Run(…, timeout=SUBAGENT_DEADLINE_S)` with all four task fields; keep `reply.findings[:MAX_FINDINGS_CHARS]`.',
+    'Cut the plan to `max_subagents`; for each batch of `min(MAX_PARALLEL_SUBAGENTS, max_subagents)` run the calls together (`asyncio.gather`, `Promise.all`, goroutines and a `WaitGroup`, threads), each with its own deadline set when it starts (`timeout=` in Python, `{deadline: Date.now() + SUBAGENT_DEADLINE_MS}` in TypeScript) and all four task fields; place each note at its task’s index and keep only the findings, cut to `MAX_FINDINGS_CHARS` characters.',
   ],
   debrief: `Fan-out is where a multi-agent system earns its speed and its bill at once, so the budget's \`max_subagents\` caps the plan before anything runs and the batch width caps how much is in flight. Batching in parallel turns ten subagent latencies into two; the deadline turns a hung subagent into a "no result" note the lead can plan around, instead of a job that never ends. The four-part task description is what keeps subagents from duplicating each other's searches. The findings cap is a context-window budget: the lead synthesises from what subagents condensed, never from what they read. Production orchestrators add per-subagent token accounting, cancel the rest of a batch when the job is cancelled, and let the lead spawn a follow-up subagent for a "no result".`,
 };

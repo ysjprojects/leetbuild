@@ -5,6 +5,8 @@
  * `assert` with the usual methods, a small `EventEmitter`, `promisify` and `inspect`.
  */
 
+import {Buffer} from './buffer';
+
 // ---- crypto ----------------------------------------------------------------------------------------
 
 const encoder = new TextEncoder();
@@ -172,8 +174,9 @@ const md5 = (message: Uint8Array): Uint8Array => {
 
 const DIGESTS: Record<string, (m: Uint8Array) => Uint8Array> = {sha256, sha1, md5};
 
+/** Node's `digest()` and `digest('buffer')` answer a Buffer (`.subarray(0, 8).toString('hex')` works on it). */
 const encode = (bytes: Uint8Array, encoding?: string): string | Uint8Array => {
-  if (encoding === undefined || encoding === 'buffer') return bytes;
+  if (encoding === undefined || encoding === 'buffer') return Buffer.from(bytes);
   if (encoding === 'hex') return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
   if (encoding === 'base64') return btoa(String.fromCharCode(...bytes));
   if (encoding === 'base64url')
@@ -241,7 +244,8 @@ export class Hmac {
   }
 }
 
-export const randomBytes = (size: number): Uint8Array => globalThis.crypto.getRandomValues(new Uint8Array(size));
+export const randomBytes = (size: number): Uint8Array =>
+  Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(size)));
 
 export const randomUUID = (): string => globalThis.crypto.randomUUID();
 

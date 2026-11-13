@@ -75,6 +75,15 @@ func report(t *testing.T, ch chan kafka.Event) *kafka.Message {
 	return nil
 }
 
+func noReport(t *testing.T, ch chan kafka.Event, what string) {
+	t.Helper()
+	select {
+	case ev := <-ch:
+		t.Fatalf("%s: unexpected report %v", what, ev)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 func TestProduceReportsAndPartitions(t *testing.T) {
 	b, clock := world(t)
 	p := producer(t, kafka.ConfigMap{"bootstrap.servers": "kafka:9092", "acks": "all"})
@@ -117,8 +126,7 @@ func TestFlushWaitsForAStalledBrokerBoundedly(t *testing.T) {
 	var left int
 	within(t, "Flush", func() { left = p.Flush(5000) })
 	if left != 1 {
-		// the report sits unread in Events(): the real Flush counts it
-		t.Logf("left %d", left)
+		t.Fatalf("the report sits unread in Events(): the real Flush counts it (Len includes len(Events())), got %d", left)
 	}
 	if got := len(b.Records("orders")); got != 1 {
 		t.Fatalf("the stall ended after 2 s: %d records", got)
@@ -160,6 +168,82 @@ func TestOrderSurvivesAStall(t *testing.T) {
 	vals := b.Records("t")
 	if len(vals) != 2 || string(vals[0].Value) != "1" || string(vals[1].Value) != "2" {
 		t.Fatalf("records keep the produce order: %+v", vals)
+	}
+}
+
+// The poller hands reports out one at a time with a blocking send, as confluent-kafka-go's
+// eventPoll does (`*ch <- msg`): a report on an unbuffered channel nobody reads holds back every
+// later report, the ones for other channels too, and counts in Len and Flush until it is taken.
+func TestUnreadDeliveryChannelBlocksThePoller(t *testing.T) {
+	b, _ := world(t)
+	p := producer(t, kafka.ConfigMap{"acks": "all"})
+	abandoned := make(chan kafka.Event)
+	produce(t, p, "t", "a", "1", abandoned)
+	later := make(chan kafka.Event, 1)
+	produce(t, p, "t", "b", "2", later)
+	noReport(t, later, "a report behind one nobody reads")
+	var left int
+	within(t, "Flush", func() { left = p.Flush(1000) })
+	if left != 2 {
+		t.Fatalf("both reports are still queued for the application: Flush returns 2, got %d", left)
+	}
+	<-abandoned
+	report(t, later)
+	within(t, "Flush", func() { left = p.Flush(1000) })
+	if left != 0 {
+		t.Fatalf("every report taken: Flush returns 0, got %d", left)
+	}
+
+	// The caller gave up on a stalled broker: its report arrives once the broker answers, and
+	// blocks the poller from then on.
+	b.Stall("s", 0)
+	gaveUp := make(chan kafka.Event)
+	produce(t, p, "s", "c", "3", gaveUp)
+	b.Resume("s")
+	next := make(chan kafka.Event, 1)
+	produce(t, p, "s", "d", "4", next)
+	noReport(t, next, "a report behind one whose caller timed out")
+	if m := report(t, gaveUp); m.TopicPartition.Error != nil {
+		t.Fatal(m.TopicPartition.Error)
+	}
+	report(t, next)
+}
+
+// Flush returns Len once the timeout passes: messages not yet delivered plus delivery reports
+// queued for the application (unread in Events() or not yet handed to their channel). A delivered
+// or refused message whose report the application has taken is no longer counted.
+func TestFlushCountsReportsQueuedForTheApplication(t *testing.T) {
+	b, clock := world(t)
+	p := producer(t, kafka.ConfigMap{"acks": "all"})
+	var left int
+	b.FailNext("t", 1)
+	ch := make(chan kafka.Event, 1)
+	produce(t, p, "t", "a", "1", ch)
+	start := clock.Now()
+	within(t, "Flush", func() { left = p.Flush(2000) })
+	if left != 0 || clock.Now() != start {
+		t.Fatalf("a refused message whose report reached its channel is not pending: Flush %d after %v", left, clock.Now().Sub(start))
+	}
+	if m := report(t, ch); m.TopicPartition.Error == nil {
+		t.Fatal("FailNext refuses the message")
+	}
+	for _, fail := range []bool{false, true} {
+		if fail {
+			b.FailNext("t", 1)
+		}
+		produce(t, p, "t", "b", "2", nil)
+		start = clock.Now()
+		within(t, "Flush", func() { left = p.Flush(2000) })
+		if left != 1 || clock.Now().Sub(start) != 2*time.Second {
+			t.Fatalf("refused %v, report unread in Events(): Flush(2000) returns 1 after 2 s, got %d after %v", fail, left, clock.Now().Sub(start))
+		}
+		if m := report(t, p.Events()); (m.TopicPartition.Error != nil) != fail {
+			t.Fatalf("refused %v: report error %v", fail, m.TopicPartition.Error)
+		}
+	}
+	within(t, "Flush", func() { left = p.Flush(2000) })
+	if left != 0 {
+		t.Fatalf("every report read: Flush returns 0, got %d", left)
 	}
 }
 

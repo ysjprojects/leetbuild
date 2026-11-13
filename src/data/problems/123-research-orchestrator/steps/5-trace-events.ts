@@ -25,7 +25,8 @@ a decision twice; a consumer crash between commit and write leaves a finished jo
 - The event carries \`TRACE_FIELDS\` (\`job_id\`, \`agent_id\`, \`tool\`, \`latency_ms\`, \`tokens\`,
   \`outcome\`) and \`version\`, nothing else.
 - The producer is **idempotent** with \`acks=all\` (kafka-go has no idempotent mode: \`RequireAll\`).
-- \`run_eval\` writes the evaluation **before** it commits the offset.`,
+- \`run_eval\` writes the evaluation **before** it commits the offset, and commits a record only once
+  its write succeeded.`,
   sequence: {
     participants: ['Lead agent', 'research.trace', 'End-state eval', 'Redis'],
     messages: [
@@ -84,7 +85,7 @@ a decision twice; a consumer crash between commit and write leaves a finished jo
       id: 'commit-after-write',
       title: 'Writes the evaluation before committing the offset',
       detail:
-        '`run_eval` writes `research:{job_id}:eval` and only then commits; a crash between a commit and the write loses the evaluation for good.',
+        '`run_eval` writes `research:{job_id}:eval` and only then commits: no commit, explicit or automatic, covers a record whose evaluation is not written yet, and a record whose write fails stays uncommitted, so it is delivered again. A crash between a commit and the write loses the evaluation for good.',
       match: {
         python: {order: [/\.hset\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hset\(/, /commitOffsets\(/]},
@@ -835,6 +836,8 @@ def _decision(agent_id, outcome="tool.call", job_id="job-1"):
         "outcome": outcome,
         "query": "CANARY-QUERY board members of every bank in the index",
         "findings": "CANARY-FINDINGS chair: A. Jones",
+        # A field added to decisions later: the event picks TRACE_FIELDS rather than dropping a known list.
+        "prompt": "CANARY-PROMPT summarise every board member",
     }
 
 
@@ -857,8 +860,10 @@ def check_job_key(ctx):
 def check_no_content(ctx):
     m = ctx.load("trace_events")
     event = _trace(m, _decision("sub-1"))[0]
-    value = ctx.kafka.records(TOPIC)[0].value.decode()
-    assert "CANARY" not in value, f"the trace event carries the query or the findings: {value}"
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 1, f"one decision produced {len(records)} records on {TOPIC}"
+    value = records[0].value.decode()
+    assert "CANARY" not in value, f"the trace event carries the query, the findings or the prompt: {value}"
     payload = json.loads(value)
     assert sorted(payload) == FIELDS, f"the event carries the fields {sorted(payload)}, expected TRACE_FIELDS and version: {FIELDS}"
     assert payload["version"] == "2.3.0" and payload["latency_ms"] == 840 and payload["agent_id"] == "sub-1", f"the event must keep the ids, the numbers and the version, got {payload}"
@@ -880,18 +885,29 @@ def check_commit_after_write(ctx):
     ctx.redis.hset("research:job-1", mapping={"status": "running", "plan": json.dumps(PLAN)})
     ctx.redis.hset("research:job-1:results", mapping={"t-1": "a", "t-2": "b", "t-3": "c"})
     ctx.redis.set("research:job-1:tools", 7)
-    for outcome in ("tool.call", "job.completed"):
-        event = {"job_id": "job-1", "agent_id": "lead", "tool": "", "latency_ms": 10, "tokens": 0, "outcome": outcome, "version": "2.3.0"}
+    # job-2's evaluation key holds a string, so writing its evaluation fails (WRONGTYPE).
+    ctx.redis.set("research:job-2:eval", "not a hash")
+    for job_id, outcome in (("job-1", "tool.call"), ("job-1", "job.completed"), ("job-2", "job.completed")):
+        event = {"job_id": job_id, "agent_id": "lead", "tool": "", "latency_ms": 10, "tokens": 0, "outcome": outcome, "version": "2.3.0"}
         ctx.kafka.seed(TOPIC, key="job-1", value=json.dumps(event))
     at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.hgetall("research:job-1:eval")))
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((ctx.kafka.lag("end-state-eval", TOPIC), ctx.redis.hgetall("research:job-1:eval"))))
+    # Six seconds pass while job-1 is evaluated: any timer-driven commit fires before the write.
+    ctx.redis_after("research:job-1", lambda: ctx.clock.advance(6))
     m = ctx.load("trace_events")
-    ctx.drain(m.run_eval)
+    try:
+        ctx.drain(m.run_eval)
+    except Exception:
+        pass  # job-2's failed write may end the loop; the record must then stay uncommitted
     assert at_commit, "the consumer never committed an offset"
-    assert at_commit[-1].get("completeness") == "0.75", f"when the job.completed record was committed research:job-1:eval held {at_commit[-1]}: write the evaluation first, or a crash between the two loses it"
+    for lag, evaluation in at_commit:
+        if lag <= 1:
+            assert evaluation.get("completeness") == "0.75", f"when job-1's job.completed record was committed research:job-1:eval held {evaluation}: write the evaluation first, then commit, or a crash between the two loses it"
     evaluation = ctx.redis.hgetall("research:job-1:eval")
     assert evaluation == {"completeness": "0.75", "tool_calls": "7", "version": "2.3.0"}, f"research:job-1:eval is {evaluation}"
-    assert ctx.kafka.lag("end-state-eval", TOPIC) == 0, "every record must be committed once handled"
+    lag = ctx.kafka.lag("end-state-eval", TOPIC)
+    assert lag >= 1, "job-2's job.completed record was committed although writing its evaluation failed (WRONGTYPE): commit only after the write succeeded, so the record is delivered again"
+    assert lag == 1, f"{lag} records are left uncommitted, expected only job-2's whose evaluation write failed: commit every record once handled"
 `,
     typescript: `const TOPIC = 'research.trace';
 const FIELDS = ['agent_id', 'job_id', 'latency_ms', 'outcome', 'tokens', 'tool', 'version'];
@@ -906,6 +922,8 @@ const decision = (agentId: string, outcome = 'tool.call') => ({
   outcome,
   query: 'CANARY-QUERY board members of every bank in the index',
   findings: 'CANARY-FINDINGS chair: A. Jones',
+  // A field added to decisions later: the event picks TRACE_FIELDS rather than dropping a known list.
+  prompt: 'CANARY-PROMPT summarise every board member',
 });
 
 /** A real macrotask: every pending promise continuation has run. */
@@ -930,8 +948,10 @@ export async function check_no_content(ctx) {
   const m = ctx.load('trace_events');
   const event = await m.trace(decision('sub-1'));
   await settle();
-  const value = ctx.kafka.records(TOPIC)[0].value.toString();
-  assert(!value.includes('CANARY'), \`the trace event carries the query or the findings: \${value}\`);
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 1, \`one decision produced \${records.length} records on \${TOPIC}\`);
+  const value = records[0].value.toString();
+  assert(!value.includes('CANARY'), \`the trace event carries the query, the findings or the prompt: \${value}\`);
   const payload = JSON.parse(value);
   assert.deepStrictEqual(Object.keys(payload).sort(), FIELDS, \`the event carries the fields \${JSON.stringify(Object.keys(payload).sort())}, expected TRACE_FIELDS and version\`);
   assert(payload.version === '2.3.0' && payload.latency_ms === 840 && payload.agent_id === 'sub-1', \`the event must keep the ids, the numbers and the version, got \${value}\`);
@@ -954,19 +974,30 @@ export async function check_commit_after_write(ctx) {
   ctx.redis.hset('research:job-1', {status: 'running', plan: JSON.stringify(PLAN)});
   ctx.redis.hset('research:job-1:results', {'t-1': 'a', 't-2': 'b', 't-3': 'c'});
   ctx.redis.set('research:job-1:tools', '7');
-  for (const outcome of ['tool.call', 'job.completed']) {
-    const event = {job_id: 'job-1', agent_id: 'lead', tool: '', latency_ms: 10, tokens: 0, outcome, version: '2.3.0'};
+  // job-2's evaluation key holds a string, so writing its evaluation fails (WRONGTYPE).
+  ctx.redis.set('research:job-2:eval', 'not a hash');
+  for (const [jobId, outcome] of [['job-1', 'tool.call'], ['job-1', 'job.completed'], ['job-2', 'job.completed']]) {
+    const event = {job_id: jobId, agent_id: 'lead', tool: '', latency_ms: 10, tokens: 0, outcome, version: '2.3.0'};
     ctx.kafka.seed(TOPIC, {key: 'job-1', value: JSON.stringify(event)});
   }
-  const atCommit: Record<string, string>[] = [];
-  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hgetall('research:job-1:eval')));
+  const atCommit: {lag: number; evaluation: Record<string, string>}[] = [];
+  ctx.kafka.onCommit(() => atCommit.push({lag: ctx.kafka.lag('end-state-eval', TOPIC), evaluation: {...ctx.redis.hgetall('research:job-1:eval')}}));
+  // Six seconds pass while job-1 is evaluated: any timer-driven commit fires before the write.
+  ctx.redisAfter('research:job-1', () => ctx.clock.advance(6));
   const m = ctx.load('trace_events');
-  await ctx.drain(m.runEval());
+  try {
+    await ctx.drain(m.runEval());
+  } catch {
+    // job-2's failed write may end the consumer; the record must then stay uncommitted
+  }
   assert(atCommit.length > 0, 'the consumer never committed an offset');
-  const last = atCommit[atCommit.length - 1];
-  assert.equal(last.completeness, '0.75', \`when the job.completed record was committed research:job-1:eval held \${JSON.stringify(last)}: write the evaluation first, or a crash between the two loses it\`);
+  for (const {lag, evaluation} of atCommit) {
+    if (lag <= 1) assert.equal(evaluation.completeness, '0.75', \`when job-1's job.completed record was committed research:job-1:eval held \${JSON.stringify(evaluation)}: write the evaluation first, then commit, or a crash between the two loses it\`);
+  }
   assert.deepStrictEqual({...ctx.redis.hgetall('research:job-1:eval')}, {completeness: '0.75', tool_calls: '7', version: '2.3.0'}, 'research:job-1:eval');
-  assert.equal(ctx.kafka.lag('end-state-eval', TOPIC), 0, 'every record must be committed once handled');
+  const lag = ctx.kafka.lag('end-state-eval', TOPIC);
+  assert(lag >= 1, "job-2's job.completed record was committed although writing its evaluation failed (WRONGTYPE): commit only after the write succeeded, so the record is delivered again");
+  assert.equal(lag, 1, \`\${lag} records are left uncommitted, expected only job-2's whose evaluation write failed: commit every record once handled\`);
 }
 `,
     go: `package main
@@ -1016,7 +1047,9 @@ func CheckJobKey(ctx *harness.Ctx) {
 
 func CheckNoContent(ctx *harness.Ctx) {
 	event := mustTrace(ctx, "sub-1")
-	value := string(ctx.Kafka.Records(traceTopic)[0].Value)
+	records := ctx.Kafka.Records(traceTopic)
+	ctx.Equal(len(records), 1, "one decision; the records on %s", traceTopic)
+	value := string(records[0].Value)
 	ctx.Assert(!strings.Contains(value, "CANARY"), "the trace event carries the query or the findings: %s", value)
 	var payload map[string]any
 	ctx.NoError(json.Unmarshal([]byte(value), &payload), "the event is not JSON: %s", value)
@@ -1038,18 +1071,36 @@ func CheckCommitAfterWrite(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "research:job-1", "status", "running", "plan", string(plan))
 	ctx.Redis.Do("HSET", "research:job-1:results", "t-1", "a", "t-2", "b", "t-3", "c")
 	ctx.Redis.Set("research:job-1:tools", "7")
-	for _, outcome := range []string{"tool.call", "job.completed"} {
-		value, _ := json.Marshal(map[string]any{"job_id": "job-1", "agent_id": "lead", "tool": "", "latency_ms": 10, "tokens": 0, "outcome": outcome, "version": "2.3.0"})
+	// job-2's evaluation key holds a string, so writing its evaluation fails (WRONGTYPE).
+	ctx.Redis.Set("research:job-2:eval", "not a hash")
+	for _, seed := range [][2]string{{"job-1", "tool.call"}, {"job-1", "job.completed"}, {"job-2", "job.completed"}} {
+		value, _ := json.Marshal(map[string]any{"job_id": seed[0], "agent_id": "lead", "tool": "", "latency_ms": 10, "tokens": 0, "outcome": seed[1], "version": "2.3.0"})
 		ctx.Kafka.Seed(traceTopic, "job-1", string(value))
 	}
-	var atCommit []map[string]string
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.HGetAll("research:job-1:eval")) })
-	ctx.Drain(func() { runEval(traceBg) })
+	type snapshot struct {
+		lag        int64
+		evaluation map[string]string
+	}
+	var atCommit []snapshot
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		atCommit = append(atCommit, snapshot{ctx.Kafka.Lag("end-state-eval", traceTopic), ctx.Redis.HGetAll("research:job-1:eval")})
+	})
+	// Six seconds pass while job-1 is evaluated: any timer-driven commit fires before the write.
+	ctx.Redis.After("research:job-1", func() any {
+		ctx.Clock.Advance(6)
+		return nil
+	})
+	ctx.Drain(func() { runEval(traceBg) }) // job-2's failed write may end the loop; the record must then stay uncommitted
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
-	last := atCommit[len(atCommit)-1]
-	ctx.Equal(last["completeness"], "0.75", "when the job.completed record was committed research:job-1:eval held %v: write the evaluation first, or a crash between the two loses it; its completeness", last)
+	for _, at := range atCommit {
+		if at.lag <= 1 {
+			ctx.Equal(at.evaluation["completeness"], "0.75", "when job-1's job.completed record was committed research:job-1:eval held %v: write the evaluation first, then commit, or a crash between the two loses it; its completeness", at.evaluation)
+		}
+	}
 	ctx.Equal(ctx.Redis.HGetAll("research:job-1:eval"), map[string]string{"completeness": "0.75", "tool_calls": "7", "version": "2.3.0"}, "research:job-1:eval")
-	ctx.Equal(ctx.Kafka.Lag("end-state-eval", traceTopic), 0, "every record must be committed once handled; the lag")
+	lag := ctx.Kafka.Lag("end-state-eval", traceTopic)
+	ctx.Assert(lag >= 1, "job-2's job.completed record was committed although writing its evaluation failed (WRONGTYPE): commit only after the write succeeded, so the record is delivered again")
+	ctx.Equal(lag, int64(1), "only job-2's record, whose evaluation write failed, may stay uncommitted: commit every record once handled; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1069,7 +1120,9 @@ const std::vector<std::string> kFields = {"agent_id", "job_id", "latency_ms", "o
 
 json decisionOf(const std::string& agent_id) {
   return {{"job_id", "job-1"}, {"agent_id", agent_id}, {"tool", "fetch"}, {"latency_ms", 840}, {"tokens", 1200}, {"outcome", "tool.call"},
-          {"query", "CANARY-QUERY board members of every bank in the index"}, {"findings", "CANARY-FINDINGS chair: A. Jones"}};
+          {"query", "CANARY-QUERY board members of every bank in the index"}, {"findings", "CANARY-FINDINGS chair: A. Jones"},
+          // A field added to decisions later: the event picks kTraceFields rather than dropping a known list.
+          {"prompt", "CANARY-PROMPT summarise every board member"}};
 }
 
 json traced(harness::Ctx& ctx, const std::string& agent_id) {
@@ -1099,8 +1152,10 @@ void CheckJobKey(harness::Ctx& ctx) {
 
 void CheckNoContent(harness::Ctx& ctx) {
   const json event = traced(ctx, "sub-1");
-  const std::string value = ctx.Kafka.Records(kTopic)[0].Value.value_or("");
-  ctx.Assert(value.find("CANARY") == std::string::npos, "the trace event carries the query or the findings: %s", value);
+  const auto records = ctx.Kafka.Records(kTopic);
+  ctx.Equal(records.size(), 1, "one decision; the records on %s", kTopic);
+  const std::string value = records[0].Value.value_or("");
+  ctx.Assert(value.find("CANARY") == std::string::npos, "the trace event carries the query, the findings or the prompt: %s", value);
   const json payload = json::parse(value, nullptr, false);
   ctx.Assert(payload.is_object(), "the event is not JSON: %s", value);
   ctx.Equal(keysOf(payload), kFields, "the event must carry kTraceFields and version only; its fields");
@@ -1122,27 +1177,43 @@ void CheckCommitAfterWrite(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "research:job-1", "status", "running", "plan", R"([{"id":"t-1"},{"id":"t-2"},{"id":"t-3"},{"id":"t-4"}])");
   ctx.Redis.Do("HSET", "research:job-1:results", "t-1", "a", "t-2", "b", "t-3", "c");
   ctx.Redis.Set("research:job-1:tools", "7");
-  for (const std::string outcome : {"tool.call", "job.completed"}) {
-    const json event = {{"job_id", "job-1"}, {"agent_id", "lead"}, {"tool", ""}, {"latency_ms", 10}, {"tokens", 0}, {"outcome", outcome}, {"version", "2.3.0"}};
+  // job-2's evaluation key holds a string, so writing its evaluation fails (WRONGTYPE).
+  ctx.Redis.Set("research:job-2:eval", "not a hash");
+  for (const auto& [job_id, outcome] : std::vector<std::pair<std::string, std::string>>{{"job-1", "tool.call"}, {"job-1", "job.completed"}, {"job-2", "job.completed"}}) {
+    const json event = {{"job_id", job_id}, {"agent_id", "lead"}, {"tool", ""}, {"latency_ms", 10}, {"tokens", 0}, {"outcome", outcome}, {"version", "2.3.0"}};
     ctx.Kafka.Seed(kTopic, "job-1", event.dump());
   }
-  std::vector<std::map<std::string, std::string>> atCommit;
-  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HGetAll("research:job-1:eval")); });
-  ctx.Drain([] { runEval(); });
+  std::vector<std::pair<int64_t, std::map<std::string, std::string>>> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    atCommit.emplace_back(ctx.Kafka.Lag("end-state-eval", kTopic), ctx.Redis.HGetAll("research:job-1:eval"));
+  });
+  // Six seconds pass while job-1 is evaluated: any timer-driven commit fires before the write.
+  ctx.Redis.After("research:job-1", [&ctx] { ctx.Clock.Advance(6); });
+  ctx.Drain([] {
+    try {
+      runEval();
+    } catch (const std::exception&) {
+      // job-2's failed write may end the loop; the record must then stay uncommitted
+    }
+  });
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
-  const auto& last = atCommit.back();
-  ctx.Assert(last.count("completeness") && last.at("completeness") == "0.75",
-             "when the job.completed record was committed research:job-1:eval held %v: write the evaluation first, or a crash between the two loses it", last);
+  for (const auto& [lag, evaluation] : atCommit) {
+    if (lag > 1) continue;
+    ctx.Assert(evaluation.count("completeness") && evaluation.at("completeness") == "0.75",
+               "when job-1's job.completed record was committed research:job-1:eval held %v: write the evaluation first, then commit, or a crash between the two loses it", evaluation);
+  }
   ctx.Equal(ctx.Redis.HGetAll("research:job-1:eval"), std::map<std::string, std::string>{{"completeness", "0.75"}, {"tool_calls", "7"}, {"version", "2.3.0"}},
             "research:job-1:eval");
-  ctx.Equal(ctx.Kafka.Lag("end-state-eval", kTopic), 0, "every record must be committed once handled; the lag");
+  const int64_t lag = ctx.Kafka.Lag("end-state-eval", kTopic);
+  ctx.Assert(lag >= 1, "job-2's job.completed record was committed although writing its evaluation failed (WRONGTYPE): commit only after the write succeeded, so the record is delivered again");
+  ctx.Equal(lag, 1, "only job-2's record, whose evaluation write failed, may stay uncommitted: commit every record once handled; the lag");
 }
 `,
   },
   hints: [
     'Replay one job from the trace topic: its decisions come back from three partitions in the wrong order, a customer’s query is right there in the payload, and a job that finished during a consumer restart has no evaluation.',
     'The key is the agent id, so the partition follows the agent; the event is the whole decision plus a version; the producer has neither idempotence nor `acks=all`; `run_eval` commits each record before it writes the evaluation.',
-    'Key by `decision["job_id"]`; build the event from `TRACE_FIELDS` plus `version`; configure `enable.idempotence` with `acks=all`; in `run_eval`, `hset` the evaluation first and commit after it.',
+    'Key by the decision’s job id; build the event from `TRACE_FIELDS` plus `version`; configure `enable.idempotence` with `acks=all`; in `run_eval`, write the evaluation first and commit after it has succeeded.',
   ],
   debrief: `A trace is for explaining a run after the fact, so it is keyed by the thing you replay, the job, and it carries the decisions as ids and numbers: which agent, which tool, how long, how many tokens. The query and the findings stay out because a topic is retained, replicated and readable by more teams than the job store is. Idempotence with \`acks=all\` makes a retried send land once and survive a leader change. The evaluator writes before it commits, so a crash costs one repeated evaluation instead of a missing one, and the evaluation is computed from the end state in Redis, not from anything the trace carried. Production systems add a judge model that scores the final report against a rubric, and sample traces rather than evaluate every job.`,
 };

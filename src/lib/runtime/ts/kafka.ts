@@ -5,9 +5,12 @@
  * BROKER semantics the Python runtime models, so a check grades the same property in both.
  *
  * kafkajs as the courses meet it: `new Kafka({brokers})`, `producer.connect()/send({topic, messages,
- * acks})`, `consumer.subscribe({topic, fromBeginning})`, `consumer.run({eachMessage, autoCommit})`,
- * `consumer.commitOffsets([...])`, `heartbeat`, `pause/resume`. `send` resolves when the broker has
- * acknowledged every record (or rejects after `timeout`); with `acks: 0` it resolves at once.
+ * acks})`, `consumer.subscribe({topic, fromBeginning})`, `consumer.run({eachMessage | eachBatch,
+ * eachBatchAutoResolve, autoCommit, autoCommitInterval})`, `consumer.commitOffsets([...])`, `seek`,
+ * `pause/resume`. `send` resolves when the broker has acknowledged every record (or rejects after
+ * `timeout`); with `acks: 0` it does not wait for the broker. A producer's (and the admin's)
+ * requests take effect on the broker when they are made and their responses settle on a later
+ * macrotask, as one read off a socket does.
  */
 import {type Bytes, Buffer} from './buffer';
 import {CLOCK} from './clock';
@@ -301,26 +304,32 @@ export class Kafka {
   }
 }
 
+/** kafkajs's admin client: each request applies on the broker when made and answers on a later macrotask. */
 export class Admin {
   async connect(): Promise<void> {
-    // the broker is in this process: nothing to connect to
+    await CLOCK.reply();
   }
   async disconnect(): Promise<void> {
-    // nothing was connected
+    await CLOCK.reply();
   }
   async createTopics(options: {topics: {topic: string; numPartitions?: number}[]}): Promise<boolean> {
     for (const t of options.topics) BROKER.createTopic(t.topic, t.numPartitions);
+    await CLOCK.reply();
     return true;
   }
   async listTopics(): Promise<string[]> {
-    return [...BROKER.topics.keys()];
+    const topics = [...BROKER.topics.keys()];
+    await CLOCK.reply();
+    return topics;
   }
   /** kafkajs: every partition's end offset (`offset` and `high`, as strings) and its first (`low`). */
   async fetchTopicOffsets(topic: string): Promise<{partition: number; offset: string; high: string; low: string}[]> {
-    return BROKER.partitions(topic).map((_, partition) => {
+    const offsets = BROKER.partitions(topic).map((_, partition) => {
       const end = String(BROKER.endOffset(topic, partition));
       return {partition, offset: end, high: end, low: '0'};
     });
+    await CLOCK.reply();
+    return offsets;
   }
 }
 
@@ -328,9 +337,11 @@ export class Admin {
  * kafkajs's producer: `send` resolves once every record is acknowledged. While the broker is stalled
  * it waits on the virtual clock — `timeout` (default 30 s) then rejects with a retriable
  * KafkaJSError, as kafkajs's request timeout does — so a send without a deadline on a dead broker
- * costs what it costs in production. `acks: 0` resolves immediately and the record is gone;
- * `acks: 1` survives a lost ack but not a leader failover; `acks: -1` (all, the default) survives.
- * `idempotent: true` requires acks all and makes a lost-ack retry write once instead of twice.
+ * costs what it costs in production. `acks: 0` resolves without waiting for the broker and the
+ * record is gone; `acks: 1` survives a lost ack but not a leader failover; `acks: -1` (all, the
+ * default) survives. `idempotent: true` requires acks all and makes a lost-ack retry write once
+ * instead of twice. A record lands on the broker when it is sent; the acknowledgement (or the
+ * error) settles on a later macrotask, as a response read off a socket does.
  */
 export class Producer {
   private connected = false;
@@ -345,16 +356,26 @@ export class Producer {
   async connect(): Promise<void> {
     this.connected = true;
     BROKER.events.push(['producer', this.idempotent]);
+    await CLOCK.reply();
   }
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    await CLOCK.reply();
   }
 
   async send(input: ProducerRecordInput): Promise<RecordMetadata[]> {
     if (!this.connected) throw new KafkaJSError('The producer is disconnected');
     const acks = input.acks ?? -1;
     if (this.idempotent && acks !== -1) throw new KafkaJSError('Idempotent producer requires acks: -1 (all)');
+    try {
+      return await this.produce(input, acks);
+    } finally {
+      await CLOCK.reply();
+    }
+  }
+
+  private async produce(input: ProducerRecordInput, acks: number): Promise<RecordMetadata[]> {
     const timeout = input.timeout ?? this.messageTimeoutMs;
     const out: RecordMetadata[] = [];
     for (const message of input.messages) {
@@ -441,21 +462,72 @@ export interface EachMessagePayload {
   pause: () => () => void;
 }
 
-export interface RunConfig {
-  eachMessage: (payload: EachMessagePayload) => Promise<void>;
-  /** kafkajs's default is true: offsets are committed on a timer (autoCommitInterval, 5 s) and after each message batch resolves. */
-  autoCommit?: boolean;
-  autoCommitInterval?: number | null;
-  autoCommitThreshold?: number | null;
+/** kafkajs's `{topics: [{topic, partitions: [{partition, offset}]}]}`, offsets being the next to read. */
+export interface OffsetsByTopicPartition {
+  topics: {topic: string; partitions: {partition: number; offset: string}[]}[];
 }
 
+/** The records one fetch returned for one partition, as kafkajs's `Batch` hands them to `eachBatch`. */
+export interface Batch {
+  topic: string;
+  partition: number;
+  highWatermark: string;
+  messages: KafkaMessage[];
+  isEmpty: () => boolean;
+  firstOffset: () => string | null;
+  lastOffset: () => string;
+  offsetLag: () => string;
+  offsetLagLow: () => string;
+}
+
+export interface EachBatchPayload {
+  batch: Batch;
+  /** Mark `offset` processed: the next fetch, and the next commit of resolved offsets, start after it. */
+  resolveOffset: (offset: string) => void;
+  heartbeat: () => Promise<void>;
+  pause: () => () => void;
+  /** With offsets, commit them; without, commit the resolved offsets once `autoCommitInterval` has passed since the last commit. */
+  commitOffsetsIfNecessary: (offsets?: OffsetsByTopicPartition) => Promise<void>;
+  uncommittedOffsets: () => OffsetsByTopicPartition;
+  /** False once the consumer stops: a long batch should end early. */
+  isRunning: () => boolean;
+  /** True once `seek` moved this partition: the rest of the batch is stale. */
+  isStale: () => boolean;
+}
+
+export interface RunConfig {
+  eachMessage?: (payload: EachMessagePayload) => Promise<void>;
+  eachBatch?: (payload: EachBatchPayload) => Promise<void>;
+  /** kafkajs's default is true: once `eachBatch` resolves, the batch's last offset is resolved. */
+  eachBatchAutoResolve?: boolean;
+  /** kafkajs's default is true: resolved offsets are committed on a timer (autoCommitInterval, 5 s here), when `run` ends, and after each `eachBatch` batch. */
+  autoCommit?: boolean;
+  autoCommitInterval?: number | null;
+  partitionsConsumedConcurrently?: number;
+}
+
+const toMessage = (record: KafkaRecord): KafkaMessage => ({
+  key: record.key,
+  value: record.value,
+  headers: record.headers,
+  offset: String(record.offset),
+  timestamp: String(record.timestamp),
+  partition: record.partition,
+});
+
 /**
- * kafkajs's consumer. `run()` delivers every record of the subscribed topics to `eachMessage`, one
- * at a time per the broker's round-robin, and returns when the topics are drained (the runtime stops
- * the loop the way `yarn verify` and the harness expect). With `autoCommit` (the default) the offset
- * of a delivered message is *resolved* and committed on the interval timer and when `run` finishes —
- * so a slow failing handler can have its message committed underneath it, as in production. With
- * `autoCommit: false` only `commitOffsets` commits.
+ * kafkajs's consumer. `run()` delivers the subscribed topics' records and returns when the topics are
+ * drained (the runtime stops the loop the way `yarn verify` and the harness expect). `eachMessage`
+ * gets one record at a time, per the broker's round-robin over the partitions; `eachBatch` gets what
+ * one partition holds past the consumer's position, partitions in turn, with kafkajs's
+ * `resolveOffset`, `heartbeat`, `pause`, `commitOffsetsIfNecessary`, `uncommittedOffsets`,
+ * `isRunning` and `isStale`: once it resolves, the batch's last offset is resolved
+ * (`eachBatchAutoResolve`, the default) and the next fetch of the partition starts at the resolved
+ * offset, so records it left unresolved are delivered again. With `autoCommit` (the default) the
+ * resolved offsets are committed on the interval timer, when `run` finishes, after each batch
+ * `eachBatch` handled and before a handler's error is rethrown — so a slow failing handler can have
+ * earlier messages committed underneath it, as in production. With `autoCommit: false` only
+ * `commitOffsets` (and `commitOffsetsIfNecessary(offsets)`) commits.
  */
 export class Consumer {
   readonly groupId: string;
@@ -465,6 +537,8 @@ export class Consumer {
   private assignment: {topic: string; partition: number}[] = [];
   private positions = new Map<string, number>();
   private resolved = new Map<string, number>();
+  /** Partitions `seek` moved since their batch was fetched: that batch is stale. */
+  private seeked = new Set<string>();
   private lastAutoCommit = CLOCK.now();
   private running = false;
   private closed = false;
@@ -513,41 +587,25 @@ export class Consumer {
 
   /** Deliver until the subscribed topics are drained (or `stop()`); rejects with the handler's error. */
   async run(config: RunConfig): Promise<void> {
+    const {eachMessage, eachBatch} = config;
+    if (eachMessage === undefined && eachBatch === undefined)
+      throw new KafkaJSError('consumer.run needs an eachMessage or an eachBatch handler');
     this.autoCommit = config.autoCommit !== false;
     if (typeof config.autoCommitInterval === 'number') this.autoCommitInterval = config.autoCommitInterval;
     this.running = true;
     this.lastAutoCommit = CLOCK.now();
     try {
       while (this.running && !this.closed) {
-        const next = this.next();
-        if (next === null) {
-          if (BROKER.stopWhenDrained) break;
-          await CLOCK.sleep(100);
-          continue;
-        }
-        const {topic, partition, record} = next;
-        this.positions.set(`${topic}|${partition}`, record.offset + 1);
-        BROKER.events.push(['deliver', this.groupId, topic, partition, record.offset]);
-        await config.eachMessage({
-          topic,
-          partition,
-          message: {
-            key: record.key,
-            value: record.value,
-            headers: record.headers,
-            offset: String(record.offset),
-            timestamp: String(record.timestamp),
-            partition,
-          },
-          heartbeat: async () => undefined,
-          pause: () => {
-            this.paused.add(`${topic}|${partition}`);
-            return () => this.paused.delete(`${topic}|${partition}`);
-          },
-        });
-        // kafkajs resolves the offset once eachMessage resolves; auto-commit commits resolved offsets.
-        if (this.autoCommit) this.resolved.set(`${topic}|${partition}`, record.offset + 1);
-        await new Promise<void>(resolve => queueMicrotask(resolve));
+        const delivered =
+          eachMessage !== undefined
+            ? await this.deliverMessage(eachMessage)
+            : await this.deliverBatch(
+                eachBatch as (payload: EachBatchPayload) => Promise<void>,
+                config.eachBatchAutoResolve !== false,
+              );
+        if (delivered) continue;
+        if (BROKER.stopWhenDrained) break;
+        await CLOCK.sleep(100);
       }
     } finally {
       if (this.autoCommit) this.doAutoCommit();
@@ -589,7 +647,9 @@ export class Consumer {
   }
 
   seek(options: {topic: string; partition: number; offset: string | number}): void {
-    this.positions.set(`${options.topic}|${options.partition}`, Number(options.offset));
+    const key = `${options.topic}|${options.partition}`;
+    this.positions.set(key, Number(options.offset));
+    this.seeked.add(key);
   }
 
   on(): void {
@@ -600,6 +660,105 @@ export class Consumer {
   tick(): void {
     if (!this.autoCommit || !this.running || this.closed) return;
     if (CLOCK.now() - this.lastAutoCommit >= this.autoCommitInterval) this.doAutoCommit();
+  }
+
+  /** One record, the next in the round-robin, to `eachMessage`; false when nothing is left to deliver. */
+  private async deliverMessage(handler: (payload: EachMessagePayload) => Promise<void>): Promise<boolean> {
+    const next = this.next();
+    if (next === null) return false;
+    const {topic, partition, records} = next;
+    const record = records[0];
+    this.positions.set(`${topic}|${partition}`, record.offset + 1);
+    BROKER.events.push(['deliver', this.groupId, topic, partition, record.offset]);
+    await handler({
+      topic,
+      partition,
+      message: toMessage(record),
+      heartbeat: async () => undefined,
+      pause: () => this.pausePartition(topic, partition),
+    });
+    // kafkajs resolves the offset once eachMessage resolves; auto-commit commits resolved offsets.
+    if (this.autoCommit) this.resolved.set(`${topic}|${partition}`, record.offset + 1);
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+    return true;
+  }
+
+  /** What the next partition in turn holds past its position, to `eachBatch`, as kafkajs's runner hands a batch over. */
+  private async deliverBatch(
+    handler: (payload: EachBatchPayload) => Promise<void>,
+    autoResolve: boolean,
+  ): Promise<boolean> {
+    const next = this.next();
+    if (next === null) return false;
+    const {topic, partition, records} = next;
+    const key = `${topic}|${partition}`;
+    const from = records[0].offset;
+    const highWatermark = BROKER.endOffset(topic, partition);
+    const last = records[records.length - 1].offset;
+    const messages = records.map(toMessage);
+    this.seeked.delete(key);
+    this.positions.set(key, last + 1);
+    for (const record of records) BROKER.events.push(['deliver', this.groupId, topic, partition, record.offset]);
+    try {
+      await handler({
+        batch: {
+          topic,
+          partition,
+          highWatermark: String(highWatermark),
+          messages,
+          isEmpty: () => messages.length === 0,
+          firstOffset: () => String(from),
+          lastOffset: () => String(last),
+          offsetLag: () => String(highWatermark - 1 - last),
+          offsetLagLow: () => String(highWatermark - 1 - from),
+        },
+        resolveOffset: offset => void this.resolved.set(key, Number(offset) + 1),
+        heartbeat: async () => undefined,
+        pause: () => this.pausePartition(topic, partition),
+        commitOffsetsIfNecessary: async offsets => {
+          if (offsets !== undefined) this.commitGiven(offsets);
+          else if (CLOCK.now() - this.lastAutoCommit >= this.autoCommitInterval) this.doAutoCommit();
+        },
+        uncommittedOffsets: () => this.uncommittedOffsets(),
+        isRunning: () => this.running && !this.closed,
+        isStale: () => this.seeked.has(key),
+      });
+    } catch (e) {
+      // kafkajs commits what was resolved before it rethrows the handler's error.
+      if (this.autoCommit) this.doAutoCommit();
+      throw e;
+    }
+    if (autoResolve) this.resolved.set(key, last + 1);
+    // The next fetch starts at the resolved offset: what the handler left unresolved comes again.
+    if (!this.seeked.has(key)) this.positions.set(key, this.resolved.get(key) ?? from);
+    if (this.autoCommit) this.doAutoCommit();
+    await new Promise<void>(resolve => queueMicrotask(resolve));
+    return true;
+  }
+
+  private pausePartition(topic: string, partition: number): () => void {
+    this.paused.add(`${topic}|${partition}`);
+    return () => this.paused.delete(`${topic}|${partition}`);
+  }
+
+  /** `commitOffsetsIfNecessary(offsets)`: the given offsets, committed as given. */
+  private commitGiven(offsets: OffsetsByTopicPartition): void {
+    const target = new Map<string, number>();
+    for (const {topic, partitions} of offsets.topics)
+      for (const {partition, offset} of partitions) target.set(`${topic}|${partition}`, Number(offset));
+    if (target.size === 0) return;
+    BROKER.commit(this.groupId, target);
+    BROKER.events.push(['manual-commit', this.groupId]);
+  }
+
+  private uncommittedOffsets(): OffsetsByTopicPartition {
+    const byTopic = new Map<string, {partition: number; offset: string}[]>();
+    for (const [tp, offset] of this.resolved) {
+      const [topic, partition] = tp.split('|');
+      if (BROKER.committedOffset(this.groupId, topic, Number(partition)) === offset) continue;
+      byTopic.set(topic, [...(byTopic.get(topic) ?? []), {partition: Number(partition), offset: String(offset)}]);
+    }
+    return {topics: [...byTopic].map(([topic, partitions]) => ({topic, partitions}))};
   }
 
   private doAutoCommit(): void {
@@ -615,7 +774,8 @@ export class Consumer {
     }
   }
 
-  private next(): {topic: string; partition: number; record: KafkaRecord} | null {
+  /** The next partition in turn holding records past its position, and those records. */
+  private next(): {topic: string; partition: number; records: KafkaRecord[]} | null {
     const n = this.assignment.length;
     for (let i = 0; i < n; i++) {
       const tp = this.assignment[(this.rr + i) % n];
@@ -625,7 +785,7 @@ export class Consumer {
       const log = BROKER.partitions(tp.topic)[tp.partition];
       if (pos < log.length) {
         this.rr = (this.rr + i + 1) % n;
-        return {topic: tp.topic, partition: tp.partition, record: log[pos]};
+        return {topic: tp.topic, partition: tp.partition, records: log.slice(pos)};
       }
     }
     return null;

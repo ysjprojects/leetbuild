@@ -109,12 +109,22 @@ def _caller_is_harness() -> bool:
     return False
 
 
+def _sent(request):
+    """The request as it went out: gRPC serialises a message when the call is made, so one the caller
+    mutates afterwards (reused across retries) leaves what was sent as it was."""
+    if not hasattr(request, "CopyFrom"):  # not a protobuf message (None on a streaming call)
+        return request
+    snapshot = type(request)()
+    snapshot.CopyFrom(request)
+    return snapshot
+
+
 class Call:
     """One invocation as the registry saw it."""
 
     def __init__(self, path: str, request, metadata, timeout, target: str | None = None) -> None:
         self.path = path
-        self.request = request
+        self.request = _sent(request)
         self.metadata = tuple(metadata or ())
         self.timeout = timeout
         # The address the caller dialled: which instance a routed call reached.
@@ -484,7 +494,7 @@ class AioStream:
         self._responses: asyncio.Queue = asyncio.Queue()
         self._requests: asyncio.Queue | None = asyncio.Queue() if request_streaming and request_iterator is None else None
         self._request_iterator = request_iterator
-        self._request = request
+        self._request = _sent(request)
         self._timeout = timeout
         self._metadata = metadata
         self._request_streaming = request_streaming
@@ -623,7 +633,7 @@ class AioStream:
         if self._requests is None:
             raise RuntimeError("write() is only available on calls that stream requests without an iterator")
         self._ensure_started()
-        self._requests.put_nowait(message)
+        self._requests.put_nowait(_sent(message))
         await asyncio.sleep(0)
 
     async def done_writing(self) -> None:

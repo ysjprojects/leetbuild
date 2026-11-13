@@ -18,7 +18,8 @@ owner's \`open:{player}\`. It passes the one-matchmaker demo and hides 4 flaws.
 **Failure mode the checks target.** Two matchmakers pick overlapping rosters from one pool, and
 every command of the walk is a window for the other: one player is claimed into two matches. A
 refused claim leaves the tickets it already took claimed by a match that never forms, the depth
-counter drifts away from the pool, and a cancelled ticket stays in the pool for the next claim.
+counter drifts away from the pool, a cancelled ticket stays in the pool for the next claim, and a
+cancel that lands while a matchmaker claims the ticket leaves a match waiting for a player who left.
 
 - Claim the roster in **one Lua script**: check that every ticket is \`waiting\` first; if one is
   not, return 0 and touch nothing.
@@ -91,7 +92,7 @@ counter drifts away from the pool, and a cancelled ticket stays in the pool for 
       id: 'cancel-leaves-pool',
       title: 'A cancelled ticket leaves the pool, the counter and every pointer',
       detail:
-        "`cancel_ticket` refuses a ticket that is not `waiting` and otherwise removes it from `pool:{bucket}`, decrements `pool:depth` and deletes every participant's `open:{player}`, in one script; the starter deletes the ticket hash and the owner's pointer only.",
+        "`cancel_ticket` refuses a ticket that is not `waiting`, even one a matchmaker claims while the cancel runs, and otherwise removes it from `pool:{bucket}`, decrements `pool:depth` and deletes every participant's `open:{player}` that still holds it, with the ticket, in one script; the starter deletes the ticket hash and the owner's pointer only.",
       match: {
         python: {all: [/\[["']participants["']\]/, /register_script\(|\.eval\(/], none: [/\br\.delete\(/]},
         typescript: {all: [/\.participants\b/, /\.eval\(|defineCommand\(/], none: [/redis\.del\(/]},
@@ -535,7 +536,7 @@ bool cancelTicket(const std::string& ticket_id) {
     },
   },
   harness: {
-    python: `from matchmaking import store
+    python: `from matchmaking import claims, store
 
 
 def _setup(ctx, n=3):
@@ -599,18 +600,41 @@ def check_depth_counter(ctx):
 
 def check_cancel_leaves_pool(ctx):
     m = ctx.load("state")
-    store.enqueue("t1", "p1", 1501, ["p1", "p2"])
+    store.enqueue("t1", "p1", 1501, ["p1", "p2", "p5"])
     ctx.redis.set("open:p1", "t1")
-    ctx.redis.set("open:p2", "t1")
+    ctx.redis.set("open:p2", "t7")  # p2's pointer to t1 expired and p2 queued again on t7
+    ctx.redis.set("open:p5", "t1")
     store.enqueue("t2", "p3", 1502, ["p3"])
     ctx.redis.set("open:p3", "t2")
+    store.enqueue("t4", "p4", 1504, ["p4"])
+    ctx.redis.set("open:p4", "t4")
     assert m.claim_tickets("m-1", 15, ["t2"]) is True, "claiming t2 must succeed"
+    # What the world looks like the moment the cancel first touches open:p1.
+    at_pointer = ctx.redis_after("open:p1", lambda: (ctx.redis.exists("ticket:t1"), ctx.redis.get("open:p1")))
     assert m.cancel_ticket("t1") is True, "cancelling the waiting ticket t1 must succeed"
     assert "t1" not in _pool(ctx), f"the cancelled t1 still waits in pool:15 {_pool(ctx)}: the next matchmaker claims a ticket nobody is behind"
     assert _depth(ctx) == len(_pool(ctx)), f"after the cancel pool:depth is {_depth(ctx)}, pool:15 holds {_pool(ctx)}"
     assert ctx.redis.exists("ticket:t1") == 0, "the cancelled ticket's hash must be gone"
-    left = [p for p in ("open:p1", "open:p2") if ctx.redis.exists(p)]
-    assert not left, f"{left} still point at the cancelled ticket: those players cannot queue again until it expires"
+    assert ctx.redis.exists("open:p1") == 0, "open:p1 still points at the cancelled ticket: p1 cannot queue again until it expires"
+    assert ctx.redis.exists("open:p5") == 0, "open:p5, a party member's pointer, still points at the cancelled ticket: p5 cannot queue again until it expires. Every participant's pointer that holds the ticket goes"
+    assert ctx.redis.get("open:p2") == "t7", f"open:p2 held p2's newer ticket t7 and the cancel of t1 left it {ctx.redis.get('open:p2')!r}: p2 can now queue a second ticket. Delete only the pointers that still hold the cancelled ticket"
+    assert at_pointer.fired, "cancel_ticket never touched open:p1"
+    if at_pointer.error is not None:
+        raise at_pointer.error
+    assert at_pointer.result != (0, "t1"), "when cancel_ticket first touched open:p1, ticket:t1 was already deleted and open:p1 still pointed at it: a crash there leaves p1 holding a pointer to a ticket that no longer exists. The pointers go in the same script as the ticket"
+    # A matchmaker claims t4 into m-2 the moment the cancel of t4 first touches the ticket.
+    rival = ctx.redis_after("ticket:t4", lambda: claims.claim_tickets("m-2", 15, ["t4"]))
+    cancelled = m.cancel_ticket("t4")
+    assert rival.fired, "cancel_ticket never touched ticket:t4"
+    if rival.error is not None:
+        raise rival.error
+    if rival.result:
+        t4 = store.get_ticket("t4")
+        assert cancelled is False, f"a matchmaker claimed t4 into m-2 while cancel_ticket(t4) ran, and the cancel still answered True (t4 is now {t4}): m-2 waits for a player who left. The state check and the cleanup must be one script"
+        assert t4 is not None and t4["match_id"] == "m-2" and ctx.redis.get("open:p4") == "t4", f"the refused cancel changed t4, claimed by m-2: {t4}, open:p4 = {ctx.redis.get('open:p4')}"
+    else:
+        assert cancelled is True and ctx.redis.exists("ticket:t4") == 0, f"cancel_ticket(t4) ran before any claim and answered {cancelled}"
+    assert _depth(ctx) == len(_pool(ctx)), f"after the cancel of t4 pool:depth is {_depth(ctx)}, pool:15 holds {_pool(ctx)}"
     assert m.cancel_ticket("t2") is False, "t2 is in match m-1: cancelling it must be refused"
     assert store.get_ticket("t2")["match_id"] == "m-1" and ctx.redis.get("open:p3") == "t2", f"a refused cancel changed t2: {store.get_ticket('t2')}, open:p3 = {ctx.redis.get('open:p3')}"
 `,
@@ -630,7 +654,7 @@ async function waiting(store, ticketId: string): Promise<boolean> {
 }
 
 function load(ctx) {
-  return {m: ctx.load('state'), store: ctx.load('/support/matchmaking/store.ts')};
+  return {m: ctx.load('state'), store: ctx.load('/support/matchmaking/store.ts'), claims: ctx.load('/support/matchmaking/claims.ts')};
 }
 
 export async function check_atomic_claim(ctx) {
@@ -673,19 +697,42 @@ export async function check_depth_counter(ctx) {
 }
 
 export async function check_cancel_leaves_pool(ctx) {
-  const {m, store} = load(ctx);
-  await store.enqueue('t1', 'p1', 1501, ['p1', 'p2']);
+  const {m, store, claims} = load(ctx);
+  await store.enqueue('t1', 'p1', 1501, ['p1', 'p2', 'p5']);
   ctx.redis.set('open:p1', 't1');
-  ctx.redis.set('open:p2', 't1');
+  ctx.redis.set('open:p2', 't7'); // p2's pointer to t1 expired and p2 queued again on t7
+  ctx.redis.set('open:p5', 't1');
   await store.enqueue('t2', 'p3', 1502, ['p3']);
   ctx.redis.set('open:p3', 't2');
+  await store.enqueue('t4', 'p4', 1504, ['p4']);
+  ctx.redis.set('open:p4', 't4');
   assert.equal(await m.claimTickets('m-1', 15, ['t2']), true, 'claiming t2 must succeed');
+  // What the world looks like the moment the cancel first touches open:p1.
+  const atPointer = ctx.redisAfter('open:p1', () => [ctx.redis.exists('ticket:t1'), ctx.redis.get('open:p1')]);
   assert.equal(await m.cancelTicket('t1'), true, 'cancelling the waiting ticket t1 must succeed');
   assert(!pool(ctx).includes('t1'), \`the cancelled t1 still waits in pool:15 \${JSON.stringify(pool(ctx))}: the next matchmaker claims a ticket nobody is behind\`);
   assert.equal(depth(ctx), pool(ctx).length, \`after the cancel pool:depth is \${depth(ctx)}, pool:15 holds \${JSON.stringify(pool(ctx))}\`);
   assert.equal(ctx.redis.exists('ticket:t1'), 0, "the cancelled ticket's hash must be gone");
-  const left = ['open:p1', 'open:p2'].filter(k => ctx.redis.exists(k));
-  assert.deepStrictEqual(left, [], \`\${JSON.stringify(left)} still point at the cancelled ticket: those players cannot queue again until it expires\`);
+  assert.equal(ctx.redis.exists('open:p1'), 0, 'open:p1 still points at the cancelled ticket: p1 cannot queue again until it expires');
+  assert.equal(ctx.redis.exists('open:p5'), 0, "open:p5, a party member's pointer, still points at the cancelled ticket: p5 cannot queue again until it expires. Every participant's pointer that holds the ticket goes");
+  assert.equal(ctx.redis.get('open:p2'), 't7', \`open:p2 held p2's newer ticket t7 and the cancel of t1 left it \${ctx.redis.get('open:p2')}: p2 can now queue a second ticket. Delete only the pointers that still hold the cancelled ticket\`);
+  assert(atPointer.fired, 'cancelTicket never touched open:p1');
+  if (atPointer.error !== undefined) throw atPointer.error;
+  const [existedThen, pointerThen] = atPointer.result as [number, string | null];
+  assert(!(existedThen === 0 && pointerThen === 't1'), 'when cancelTicket first touched open:p1, ticket:t1 was already deleted and open:p1 still pointed at it: a crash there leaves p1 holding a pointer to a ticket that no longer exists. The pointers go in the same script as the ticket');
+  // A matchmaker claims t4 into m-2 the moment the cancel of t4 first touches the ticket.
+  const rival = ctx.redisAfter('ticket:t4', () => claims.claimTickets('m-2', 15, ['t4']));
+  const cancelled = await m.cancelTicket('t4');
+  assert(rival.fired, 'cancelTicket never touched ticket:t4');
+  if (rival.error !== undefined) throw rival.error;
+  if (await rival.result) {
+    const t4 = await store.getTicket('t4');
+    assert.equal(cancelled, false, \`a matchmaker claimed t4 into m-2 while cancelTicket(t4) ran, and the cancel still answered \${cancelled} (t4 is now \${JSON.stringify(t4)}): m-2 waits for a player who left. The state check and the cleanup must be one script\`);
+    assert(t4 !== null && t4.match_id === 'm-2' && ctx.redis.get('open:p4') === 't4', \`the refused cancel changed t4, claimed by m-2: \${JSON.stringify(t4)}, open:p4 = \${ctx.redis.get('open:p4')}\`);
+  } else {
+    assert(cancelled === true && ctx.redis.exists('ticket:t4') === 0, \`cancelTicket(t4) ran before any claim and answered \${cancelled}\`);
+  }
+  assert.equal(depth(ctx), pool(ctx).length, \`after the cancel of t4 pool:depth is \${depth(ctx)}, pool:15 holds \${JSON.stringify(pool(ctx))}\`);
   assert.equal(await m.cancelTicket('t2'), false, 't2 is in match m-1: cancelling it must be refused');
   const t2 = await store.getTicket('t2');
   assert(t2.match_id === 'm-1' && ctx.redis.get('open:p3') === 't2', \`a refused cancel changed t2: \${JSON.stringify(t2)}, open:p3 = \${ctx.redis.get('open:p3')}\`);
@@ -699,6 +746,7 @@ import (
 	"sort"
 	"strconv"
 
+	"matchmaking/claims"
 	"matchmaking/store"
 
 	"leetbuild/harness"
@@ -789,25 +837,53 @@ func CheckDepthCounter(ctx *harness.Ctx) {
 }
 
 func CheckCancelLeavesPool(ctx *harness.Ctx) {
-	store.Enqueue(poolBg, "t1", "p1", 1501, []string{"p1", "p2"})
+	store.Enqueue(poolBg, "t1", "p1", 1501, []string{"p1", "p2", "p5"})
 	ctx.Redis.Set("open:p1", "t1")
-	ctx.Redis.Set("open:p2", "t1")
+	ctx.Redis.Set("open:p2", "t7") // p2's pointer to t1 expired and p2 queued again on t7
+	ctx.Redis.Set("open:p5", "t1")
 	store.Enqueue(poolBg, "t2", "p3", 1502, []string{"p3"})
 	ctx.Redis.Set("open:p3", "t2")
+	store.Enqueue(poolBg, "t4", "p4", 1504, []string{"p4"})
+	ctx.Redis.Set("open:p4", "t4")
 	ctx.Equal(mustClaim(ctx, "m-1", "t2"), true, "claiming t2")
+	// What the world looks like the moment the cancel first touches open:p1.
+	atPointer := ctx.Redis.After("open:p1", func() any {
+		pointer, _ := ctx.Redis.Get("open:p1")
+		return ctx.Redis.Exists("ticket:t1") == 0 && pointer == "t1"
+	})
 	ok, err := cancelTicket(poolBg, "t1")
 	ctx.NoError(err, "cancelTicket(t1)")
 	ctx.Equal(ok, true, "cancelling the waiting ticket t1")
 	ctx.Assert(!poolHas(ctx, "t1"), "the cancelled t1 still waits in pool:15 %v: the next matchmaker claims a ticket nobody is behind", poolMembers(ctx))
 	ctx.Equal(poolDepth(ctx), len(poolMembers(ctx)), "after the cancel pool:depth must equal what waits in pool:15 %v; the depth", poolMembers(ctx))
 	ctx.Equal(ctx.Redis.Exists("ticket:t1"), 0, "the cancelled ticket's hash must be gone")
-	left := []string{}
-	for _, k := range []string{"open:p1", "open:p2"} {
-		if ctx.Redis.Exists(k) == 1 {
-			left = append(left, k)
-		}
+	ctx.Equal(ctx.Redis.Exists("open:p1"), 0, "open:p1 still points at the cancelled ticket (p1 cannot queue again until it expires); open:p1 exists")
+	ctx.Equal(ctx.Redis.Exists("open:p5"), 0, "open:p5, a party member's pointer, still points at the cancelled ticket (p5 cannot queue again until it expires; every participant's pointer that holds the ticket goes); open:p5 exists")
+	p2Open, _ := ctx.Redis.Get("open:p2")
+	ctx.Assert(p2Open == "t7", "open:p2 held p2's newer ticket t7 and the cancel of t1 left it %q: p2 can now queue a second ticket. Delete only the pointers that still hold the cancelled ticket", p2Open)
+	ctx.Assert(atPointer.Fired, "cancelTicket never touched open:p1")
+	ctx.Assert(atPointer.Err == nil, "the snapshot at open:p1 failed: %v", atPointer.Err)
+	dangling, _ := atPointer.Result.(bool)
+	ctx.Assert(!dangling, "when cancelTicket first touched open:p1, ticket:t1 was already deleted and open:p1 still pointed at it: a crash there leaves p1 holding a pointer to a ticket that no longer exists. The pointers go in the same script as the ticket")
+	// A matchmaker claims t4 into m-2 the moment the cancel of t4 first touches the ticket.
+	rival := ctx.Redis.After("ticket:t4", func() any {
+		won, err := claims.ClaimTickets(poolBg, "m-2", 15, []string{"t4"})
+		ctx.NoError(err, "the rival claim")
+		return won
+	})
+	cancelled, err := cancelTicket(poolBg, "t4")
+	ctx.NoError(err, "cancelTicket(t4)")
+	ctx.Assert(rival.Fired, "cancelTicket never touched ticket:t4")
+	ctx.Assert(rival.Err == nil, "the rival claim failed: %v", rival.Err)
+	if claimed, _ := rival.Result.(bool); claimed {
+		t4 := store.GetTicket(poolBg, "t4")
+		ctx.Assert(!cancelled, "a matchmaker claimed t4 into m-2 while cancelTicket(t4) ran, and the cancel still answered true (t4 is now %+v): m-2 waits for a player who left. The state check and the cleanup must be one script", t4)
+		p4Open, _ := ctx.Redis.Get("open:p4")
+		ctx.Assert(t4 != nil && t4.MatchID == "m-2" && p4Open == "t4", "the refused cancel changed t4, claimed by m-2: %+v, open:p4 = %q", t4, p4Open)
+	} else {
+		ctx.Assert(cancelled && ctx.Redis.Exists("ticket:t4") == 0, "cancelTicket(t4) ran before any claim and answered %t", cancelled)
 	}
-	ctx.Assert(len(left) == 0, "%v still point at the cancelled ticket: those players cannot queue again until it expires", left)
+	ctx.Equal(poolDepth(ctx), len(poolMembers(ctx)), "after the cancel of t4 pool:depth must equal what waits in pool:15 %v; the depth", poolMembers(ctx))
 	ok, err = cancelTicket(poolBg, "t2")
 	ctx.NoError(err, "cancelTicket(t2)")
 	ctx.Equal(ok, false, "t2 is in match m-1: cancelling it must be refused")
@@ -823,6 +899,7 @@ func CheckCancelLeavesPool(ctx *harness.Ctx) {
 #include <string>
 #include <vector>
 
+#include "matchmaking/claims.h"
 #include "matchmaking/store.h"
 
 namespace {
@@ -908,21 +985,54 @@ void CheckDepthCounter(harness::Ctx& ctx) {
 }
 
 void CheckCancelLeavesPool(harness::Ctx& ctx) {
-  store::enqueue("t1", "p1", 1501, {"p1", "p2"});
+  store::enqueue("t1", "p1", 1501, {"p1", "p2", "p5"});
   ctx.Redis.Set("open:p1", "t1");
-  ctx.Redis.Set("open:p2", "t1");
+  ctx.Redis.Set("open:p2", "t7");  // p2's pointer to t1 expired and p2 queued again on t7
+  ctx.Redis.Set("open:p5", "t1");
   store::enqueue("t2", "p3", 1502, {"p3"});
   ctx.Redis.Set("open:p3", "t2");
+  store::enqueue("t4", "p4", 1504, {"p4"});
+  ctx.Redis.Set("open:p4", "t4");
   ctx.Equal(claimTickets("m-1", 15, {"t2"}), true, "claiming t2");
+  // What the world looks like the moment the cancel first touches open:p1.
+  auto pointer_fired = std::make_shared<bool>(false);
+  auto dangling = std::make_shared<bool>(false);
+  ctx.Redis.After("open:p1", [&ctx, pointer_fired, dangling] {
+    *pointer_fired = true;
+    *dangling = ctx.Redis.Exists("ticket:t1") == 0 && ctx.Redis.Get("open:p1") == std::optional<std::string>("t1");
+  });
   ctx.Equal(cancelTicket("t1"), true, "cancelling the waiting ticket t1");
   ctx.Assert(!poolHas(ctx, "t1"), "the cancelled t1 still waits in pool:15 %q: the next matchmaker claims a ticket nobody is behind", poolMembers(ctx));
   ctx.Equal(poolDepth(ctx), static_cast<long>(poolMembers(ctx).size()), "after the cancel pool:depth must equal what waits in pool:15 %q; the depth", poolMembers(ctx));
   ctx.Equal(ctx.Redis.Exists("ticket:t1"), 0, "the cancelled ticket's hash must be gone");
-  std::vector<std::string> left;
-  for (const std::string k : {"open:p1", "open:p2"}) {
-    if (ctx.Redis.Exists(k) == 1) left.push_back(k);
+  ctx.Equal(ctx.Redis.Exists("open:p1"), 0, "open:p1 still points at the cancelled ticket (p1 cannot queue again until it expires); open:p1 exists");
+  ctx.Equal(ctx.Redis.Exists("open:p5"), 0, "open:p5, a party member's pointer, still points at the cancelled ticket (p5 cannot queue again until it expires; every participant's pointer that holds the ticket goes); open:p5 exists");
+  const std::string p2_open = ctx.Redis.Get("open:p2").value_or("(deleted)");
+  ctx.Assert(p2_open == "t7", "open:p2 held p2's newer ticket t7 and the cancel of t1 left it %s: p2 can now queue a second ticket. Delete only the pointers that still hold the cancelled ticket", p2_open);
+  ctx.Assert(*pointer_fired, "cancelTicket never touched open:p1");
+  ctx.Assert(!*dangling, "when cancelTicket first touched open:p1, ticket:t1 was already deleted and open:p1 still pointed at it: a crash there leaves p1 holding a pointer to a ticket that no longer exists. The pointers go in the same script as the ticket");
+  // A matchmaker claims t4 into m-2 the moment the cancel of t4 first touches the ticket.
+  auto fired = std::make_shared<bool>(false);
+  auto claimed = std::make_shared<bool>(false);
+  auto failed = std::make_shared<std::string>();
+  ctx.Redis.After("ticket:t4", [fired, claimed, failed] {
+    *fired = true;
+    try {
+      *claimed = claims::claimTickets("m-2", 15, {"t4"});
+    } catch (const std::exception& e) {
+      *failed = e.what();
+    }
+  });
+  const bool cancelled = cancelTicket("t4");
+  ctx.Assert(*fired, "cancelTicket never touched ticket:t4");
+  ctx.Assert(failed->empty(), "the rival claim failed: %s", *failed);
+  if (*claimed) {
+    ctx.Assert(!cancelled, "a matchmaker claimed t4 into m-2 while cancelTicket(t4) ran, and the cancel still answered true (t4's match is now %s): m-2 waits for a player who left. The state check and the cleanup must be one script", matchOf("t4"));
+    ctx.Assert(matchOf("t4") == "m-2" && ctx.Redis.Get("open:p4") == std::optional<std::string>("t4"), "the refused cancel changed t4, claimed by m-2 (match %s) or open:p4", matchOf("t4"));
+  } else {
+    ctx.Assert(cancelled && ctx.Redis.Exists("ticket:t4") == 0, "cancelTicket(t4) ran before any claim and answered %t", cancelled);
   }
-  ctx.Assert(left.empty(), "%q still point at the cancelled ticket: those players cannot queue again until it expires", left);
+  ctx.Equal(poolDepth(ctx), static_cast<long>(poolMembers(ctx).size()), "after the cancel of t4 pool:depth must equal what waits in pool:15 %q; the depth", poolMembers(ctx));
   ctx.Equal(cancelTicket("t2"), false, "t2 is in match m-1: cancelling it must be refused");
   ctx.Assert(matchOf("t2") == "m-1" && ctx.Redis.Get("open:p3") == std::optional<std::string>("t2"), "a refused cancel changed t2 (match %s) or open:p3", matchOf("t2"));
 }

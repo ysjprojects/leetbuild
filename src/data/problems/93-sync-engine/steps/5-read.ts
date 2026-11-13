@@ -21,9 +21,11 @@ to the end of the log and a resuming device skips the one that slid into its pla
 asks for a million entries gets them.
 
 - Read the documents changed **after** the cursor, by revision: \`ZRANGEBYSCORE changes (cursor +inf\`.
-- \`cursor\` is the revision of the **last entry returned** (the request's cursor when there are
-  none), and \`has_more\` is true only when changes remain after the page: read one entry past it.
-- \`limit\` defaults to \`DEFAULT_LIMIT\` (100) and is capped at \`MAX_LIMIT\` (1000).`,
+- \`cursor\` is the revision the log scored the **last entry returned** at (the request's cursor
+  when there are none), and \`has_more\` is true only when changes remain after the page: read one
+  entry past it.
+- \`limit\` defaults to \`DEFAULT_LIMIT\` (100) and is clamped to 1 through \`MAX_LIMIT\` (1000):
+  a larger one reads 1000, a zero or negative one reads 1.`,
   sequence: {
     participants: ['Device', 'syncd', 'Redis'],
     messages: [
@@ -65,7 +67,7 @@ asks for a million entries gets them.
       id: 'page-cursor',
       title: 'The cursor is the last revision returned, and has_more is exact',
       detail:
-        'The answered cursor is the revision of the last entry in the page, not the newest revision in `rev:seq`; one entry read past the page (or a count) decides `has_more`.',
+        'The answered cursor is the log score of the last entry in the page (the request’s cursor for an empty page), not the newest revision in `rev:seq` nor a head read afterwards, which an edit may have moved on; one entry read past the page (or a count) decides `has_more`.',
       match: {
         python: {all: [/limit\s*\+\s*1|zcount/i], none: [/REVISION_KEY/]},
         typescript: {all: [/limit\s*\+\s*1|zcount/i], none: [/REVISION_KEY/]},
@@ -76,8 +78,9 @@ asks for a million entries gets them.
     },
     {
       id: 'limit-cap',
-      title: 'Caps a page at 1000 entries',
-      detail: 'The requested `limit` is capped at `MAX_LIMIT` (1000), so one request cannot read the whole log.',
+      title: 'Bounds a page between 1 and 1000 entries',
+      detail:
+        'The requested `limit` is clamped to 1 through `MAX_LIMIT` (1000), so one request cannot read the whole log and a zero or negative limit still returns a page a device can move past.',
       match: {
         python: {all: [/MAX_LIMIT/, /min\(/]},
         typescript: {all: [/MAX_LIMIT/, /Math\.min\(/]},
@@ -132,7 +135,7 @@ def pull(request: Request):
     if not request.headers.get("x-device-id"):
         return JSONResponse({"error": "missing_device"}, status_code=401)
     cursor = int(request.query_params.get("cursor", "0"))
-    limit = min(int(request.query_params.get("limit", DEFAULT_LIMIT)), MAX_LIMIT)
+    limit = max(1, min(int(request.query_params.get("limit", DEFAULT_LIMIT)), MAX_LIMIT))
     # By revision, not by position: an edit moves a document to the end of the log, a revision stays put.
     # One row past the page says whether there is more.
     rows = r.zrangebyscore(store.CHANGES_KEY, f"({cursor}", "+inf", start=0, num=limit + 1, withscores=True)
@@ -186,7 +189,7 @@ app.get('/v1/sync/pull', async (request, reply) => {
   if (!request.headers['x-device-id']) return reply.code(401).send({error: 'missing_device'});
   const query = request.query as {cursor?: string; limit?: string};
   const cursor = Number(query.cursor ?? 0);
-  const limit = Math.min(Number(query.limit ?? DEFAULT_LIMIT), MAX_LIMIT);
+  const limit = Math.max(1, Math.min(Number(query.limit ?? DEFAULT_LIMIT), MAX_LIMIT));
   // By revision, not by position: an edit moves a document to the end of the log, a revision stays put.
   // One row past the page says whether there is more.
   const rows = await redis.zrangebyscore(CHANGES_KEY, \`(\${cursor}\`, '+inf', 'WITHSCORES', 'LIMIT', 0, limit + 1);
@@ -317,6 +320,9 @@ func pull(rw http.ResponseWriter, r *http.Request) {
 	if limit > maxLimit {
 		limit = maxLimit
 	}
+	if limit < 1 {
+		limit = 1 // a page of nothing would leave the cursor where it is and has_more true forever
+	}
 	// By revision, not by position: an edit moves a document to the end of the log, a revision stays put.
 	// One row past the page says whether there is more.
 	rows, err := rdb.ZRangeByScoreWithScores(r.Context(), store.ChangesKey, &redis.ZRangeBy{Min: fmt.Sprintf("(%d", cursor), Max: "+inf", Count: limit + 1}).Result()
@@ -414,7 +420,7 @@ object Read {
         case Some(_) =>
           parameterMap { params =>
             val cursor = params.get("cursor").flatMap(_.toLongOption).getOrElse(0L)
-            val limit = math.min(params.get("limit").flatMap(_.toIntOption).getOrElse(DefaultLimit), MaxLimit)
+            val limit = math.max(1, math.min(params.get("limit").flatMap(_.toIntOption).getOrElse(DefaultLimit), MaxLimit))
             // By revision, not by position: an edit moves a document to the end of the log, a revision stays put.
             // One row past the page says whether there is more.
             val rows = jedis.zrangeByScoreWithScores(Store.ChangesKey, s"($cursor", "+inf", 0, limit + 1).asScala.toVector
@@ -513,7 +519,7 @@ void pull(const httplib::Request& req, httplib::Response& res) {
     return;
   }
   const long long cursor = queryInt(req, "cursor", 0);
-  const long long limit = std::min(queryInt(req, "limit", kDefaultLimit), kMaxLimit);
+  const long long limit = std::max(1LL, std::min(queryInt(req, "limit", kDefaultLimit), kMaxLimit));
   // By revision, not by position: an edit moves a document to the end of the log, a revision stays put.
   // One row past the page says whether there is more.
   std::vector<std::pair<std::string, double>> rows;
@@ -596,6 +602,21 @@ async def check_page_cursor(ctx):
         second = await _pull(c, cursor=first["cursor"], limit=2)
     assert _ids(second) == ["d-3", "d-4"] and second.get("cursor") == 4, f"resuming from cursor 2 must give d-3, d-4 and cursor 4, got {_ids(second)} and cursor {second.get('cursor')}"
     assert second.get("has_more") is False, f"the second page returned the last two changes and answered has_more {second.get('has_more')}: the device asks again for nothing. Read one row past the page"
+    async with _api(ctx) as c:
+        caught_up = await _pull(c, cursor=4, limit=2)
+        assert _ids(caught_up) == [] and caught_up.get("cursor") == 4 and caught_up.get("has_more") is False, f"a device caught up at cursor 4 must get no entries, cursor 4 and has_more false, got {caught_up}: any other cursor makes it pull everything again or skip what comes next"
+        for n in range(5, 8):
+            _write(f"d-{n}", 0, f"note {n}")
+        # The laptop edits d-6 (revision 8) while the phone's pull is between reading the log and reading the heads.
+        ctx.redis_after("changes", lambda: _write("d-6", 6, "note 6: edited"))
+        seen, cursor = set(), 4
+        for _ in range(4):
+            page = await _pull(c, cursor=cursor, limit=2)
+            seen.update(_ids(page))
+            cursor = page.get("cursor")
+            if not page.get("has_more"):
+                break
+    assert seen >= {"d-5", "d-6", "d-7"} and cursor == 8, f"paging from cursor 4 while d-6 was edited returned {sorted(seen)} and ended at cursor {cursor}: every document changed after the cursor must arrive, ending at revision 8. The cursor is the score of the last entry in the log page, not its head's revision"
 
 
 async def check_limit_cap(ctx):
@@ -611,6 +632,11 @@ async def check_limit_cap(ctx):
     count = len(page.get("entries", []))
     assert count == 1000, f"a pull asking for 5000 entries got {count}: cap a page at MAX_LIMIT (1000)"
     assert page.get("cursor") == 1000 and page.get("has_more") is True, f"a capped page must answer cursor 1000 and has_more true, got cursor {page.get('cursor')} has_more {page.get('has_more')}"
+    async with _api(ctx) as c:
+        for cursor, limit in ((1000, 0), (1001, -5)):
+            page = await _pull(c, cursor=cursor, limit=limit)
+            want = f"d-{cursor + 1}"
+            assert _ids(page) == [want] and page.get("cursor") == cursor + 1 and page.get("has_more") is True, f"a pull at cursor {cursor} with limit={limit} must read one entry ({want}, cursor {cursor + 1}, has_more true), got {_ids(page)}, cursor {page.get('cursor')}, has_more {page.get('has_more')}: an empty page that says has_more keeps a device asking forever. Clamp the limit to at least 1"
 `,
     typescript: `function api(ctx) {
   const m = ctx.load('read');
@@ -661,6 +687,20 @@ export async function check_page_cursor(ctx) {
   const second = await pull(c, \`cursor=\${first.cursor}&limit=2\`);
   assert(JSON.stringify(ids(second)) === '["d-3","d-4"]' && second.cursor === 4, \`resuming from cursor 2 must give d-3, d-4 and cursor 4, got \${JSON.stringify(ids(second))} and cursor \${second.cursor}\`);
   assert.equal(second.has_more, false, \`the second page returned the last two changes and answered has_more \${second.has_more}: the device asks again for nothing. Read one row past the page\`);
+  const caughtUp = await pull(c, 'cursor=4&limit=2');
+  assert(ids(caughtUp).length === 0 && caughtUp.cursor === 4 && caughtUp.has_more === false, \`a device caught up at cursor 4 must get no entries, cursor 4 and has_more false, got \${JSON.stringify(caughtUp)}: any other cursor makes it pull everything again or skip what comes next\`);
+  for (let n = 5; n <= 7; n++) await write(store, revisions, \`d-\${n}\`, 0, \`note \${n}\`);
+  // The laptop edits d-6 (revision 8) while the phone's pull is between reading the log and reading the heads.
+  ctx.redisAfter('changes', () => write(store, revisions, 'd-6', 6, 'note 6: edited'));
+  const seen = new Set<string>();
+  let cursor = 4;
+  for (let i = 0; i < 4; i++) {
+    const page = await pull(c, \`cursor=\${cursor}&limit=2\`);
+    for (const id of ids(page)) seen.add(id);
+    cursor = page.cursor;
+    if (!page.has_more) break;
+  }
+  assert(['d-5', 'd-6', 'd-7'].every(id => seen.has(id)) && cursor === 8, \`paging from cursor 4 while d-6 was edited returned \${JSON.stringify([...seen].sort())} and ended at cursor \${cursor}: every document changed after the cursor must arrive, ending at revision 8. The cursor is the score of the last entry in the log page, not its head's revision\`);
 }
 
 export async function check_limit_cap(ctx) {
@@ -674,6 +714,11 @@ export async function check_limit_cap(ctx) {
   const page = await pull(c, 'cursor=0&limit=5000');
   assert.equal(page.entries.length, 1000, \`a pull asking for 5000 entries got \${page.entries.length}: cap a page at MAX_LIMIT (1000)\`);
   assert(page.cursor === 1000 && page.has_more === true, \`a capped page must answer cursor 1000 and has_more true, got cursor \${page.cursor} has_more \${page.has_more}\`);
+  for (const [cursor, limit] of [[1000, 0], [1001, -5]]) {
+    const small = await pull(c, \`cursor=\${cursor}&limit=\${limit}\`);
+    const want = \`d-\${cursor + 1}\`;
+    assert(JSON.stringify(ids(small)) === JSON.stringify([want]) && small.cursor === cursor + 1 && small.has_more === true, \`a pull at cursor \${cursor} with limit=\${limit} must read one entry (\${want}, cursor \${cursor + 1}, has_more true), got \${JSON.stringify(ids(small))}, cursor \${small.cursor}, has_more \${small.has_more}: an empty page that says has_more keeps a device asking forever. Clamp the limit to at least 1\`);
+  }
 }
 `,
     go: `package main
@@ -765,6 +810,30 @@ func CheckPageCursor(ctx *harness.Ctx) {
 	second := readPull(ctx, c, fmt.Sprintf("cursor=%d&limit=2", first.Cursor))
 	ctx.Assert(len(second.Entries) == 2 && second.Entries[0].DocID == "d-3" && second.Entries[1].DocID == "d-4" && second.Cursor == 4, "resuming from cursor 2 must give d-3, d-4 and cursor 4, got %v and cursor %d", readIDs(second), second.Cursor)
 	ctx.Equal(second.HasMore, false, "the second page returned the last two changes (the device would ask again for nothing: read one row past the page); has_more")
+	caughtUp := readPull(ctx, c, "cursor=4&limit=2")
+	ctx.Assert(len(caughtUp.Entries) == 0 && caughtUp.Cursor == 4 && !caughtUp.HasMore, "a device caught up at cursor 4 must get no entries, cursor 4 and has_more false, got %+v: any other cursor makes it pull everything again or skip what comes next", caughtUp)
+	for n := 5; n <= 7; n++ {
+		readWrite(ctx, fmt.Sprintf("d-%d", n), 0, fmt.Sprintf("note %d", n))
+	}
+	// The laptop edits d-6 (revision 8) while the phone's pull is between reading the log and reading the heads.
+	ctx.Redis.After("changes", func() any {
+		readWrite(ctx, "d-6", 6, "note 6: edited")
+		return nil
+	})
+	seen := map[string]bool{}
+	cursor := int64(4)
+	for i := 0; i < 4; i++ {
+		page := readPull(ctx, c, fmt.Sprintf("cursor=%d&limit=2", cursor))
+		for _, id := range readIDs(page) {
+			seen[id] = true
+		}
+		cursor = page.Cursor
+		if !page.HasMore {
+			break
+		}
+	}
+	ctx.Assert(seen["d-5"] && seen["d-6"] && seen["d-7"] && cursor == 8,
+		"paging from cursor 4 while d-6 was edited returned %v and ended at cursor %d: every document changed after the cursor must arrive, ending at revision 8. The cursor is the score of the last entry in the log page, not its head's revision", seen, cursor)
 }
 
 func CheckLimitCap(ctx *harness.Ctx) {
@@ -778,13 +847,23 @@ func CheckLimitCap(ctx *harness.Ctx) {
 	page := readPull(ctx, c, "cursor=0&limit=5000")
 	ctx.Equal(len(page.Entries), 1000, "a pull asking for 5000 entries must be capped at MAX_LIMIT (1000); the entries")
 	ctx.Assert(page.Cursor == 1000 && page.HasMore, "a capped page must answer cursor 1000 and has_more true, got cursor %d has_more %v", page.Cursor, page.HasMore)
+	for _, tc := range [][2]int64{{1000, 0}, {1001, -5}} {
+		cursor, limit := tc[0], tc[1]
+		small := readPull(ctx, c, fmt.Sprintf("cursor=%d&limit=%d", cursor, limit))
+		want := fmt.Sprintf("d-%d", cursor+1)
+		ctx.Assert(len(small.Entries) == 1 && small.Entries[0].DocID == want && small.Cursor == cursor+1 && small.HasMore,
+			"a pull at cursor %d with limit=%d must read one entry (%s, cursor %d, has_more true), got %v, cursor %d, has_more %v: an empty page that says has_more keeps a device asking forever. Clamp the limit to at least 1",
+			cursor, limit, want, cursor+1, readIDs(small), small.Cursor, small.HasMore)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "docsync/revisions.h"
@@ -854,6 +933,23 @@ void CheckPageCursor(harness::Ctx& ctx) {
   const Json second = readPull(ctx, c, "cursor=" + std::to_string(first.value("cursor", 0LL)) + "&limit=2");
   ctx.Assert(readIds(second) == std::vector<std::string>{"d-3", "d-4"} && second.value("cursor", 0LL) == 4, "resuming from cursor 2 must give d-3, d-4 and cursor 4, got %s", second.dump());
   ctx.Equal(second.value("has_more", true), false, "the second page returned the last two changes (the device would ask again for nothing: read one row past the page); has_more");
+  const Json caughtUp = readPull(ctx, c, "cursor=4&limit=2");
+  ctx.Assert(readIds(caughtUp).empty() && caughtUp.value("cursor", 0LL) == 4 && caughtUp.value("has_more", true) == false,
+             "a device caught up at cursor 4 must get no entries, cursor 4 and has_more false, got %s: any other cursor makes it pull everything again or skip what comes next", caughtUp.dump());
+  for (int n = 5; n <= 7; n++) readWrite("d-" + std::to_string(n), 0, "note " + std::to_string(n));
+  // The laptop edits d-6 (revision 8) while the phone's pull is between reading the log and reading the heads.
+  ctx.Redis.After("changes", [] { readWrite("d-6", 6, "note 6: edited"); });
+  std::set<std::string> seen;
+  long long cursor = 4;
+  for (int i = 0; i < 4; i++) {
+    const Json page = readPull(ctx, c, "cursor=" + std::to_string(cursor) + "&limit=2");
+    for (const auto& id : readIds(page)) seen.insert(id);
+    cursor = page.value("cursor", 0LL);
+    if (!page.value("has_more", false)) break;
+  }
+  ctx.Assert(seen.count("d-5") && seen.count("d-6") && seen.count("d-7") && cursor == 8,
+             "paging from cursor 4 while d-6 was edited saw %d documents and ended at cursor %d: every document changed after the cursor must arrive, ending at revision 8. The cursor is the score of the last entry in the log page, not its head's revision",
+             seen.size(), cursor);
 }
 
 void CheckLimitCap(harness::Ctx& ctx) {
@@ -867,6 +963,13 @@ void CheckLimitCap(harness::Ctx& ctx) {
   const Json page = readPull(ctx, c, "cursor=0&limit=5000");
   ctx.Equal(page.value("entries", Json::array()).size(), size_t{1000}, "a pull asking for 5000 entries must be capped at MAX_LIMIT (1000); the entries");
   ctx.Assert(page.value("cursor", 0LL) == 1000 && page.value("has_more", false), "a capped page must answer cursor 1000 and has_more true, got cursor %d", page.value("cursor", 0LL));
+  for (const auto& [cursor, limit] : std::vector<std::pair<long long, long long>>{{1000, 0}, {1001, -5}}) {
+    const Json small = readPull(ctx, c, "cursor=" + std::to_string(cursor) + "&limit=" + std::to_string(limit));
+    const std::string want = "d-" + std::to_string(cursor + 1);
+    ctx.Assert(readIds(small) == std::vector<std::string>{want} && small.value("cursor", 0LL) == cursor + 1 && small.value("has_more", false),
+               "a pull at cursor %d with limit=%d must read one entry (%s, cursor %d, has_more true), got %s: an empty page that says has_more keeps a device asking forever. Clamp the limit to at least 1",
+               cursor, limit, want, cursor + 1, small.dump());
+  }
 }
 `,
   },

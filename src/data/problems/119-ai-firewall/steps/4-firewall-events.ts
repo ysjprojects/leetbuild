@@ -92,7 +92,7 @@ long tail; an unscanned response hands the asker a card number or a leaked key.
       id: 'no-text',
       title: 'No user or model text in the event or the logs',
       detail:
-        'Neither the payload nor a log line carries the model’s answer: the event has `latency_ms` and the counts, not the text. The starter copies the response into the event and prints it.',
+        'Neither the payload nor a log line carries the model’s answer, redacted or not, and no log line carries the API key itself: the event has `latency_ms` and the counts, not the text. The starter copies the response into the event and prints it.',
       match: {
         python: {all: [/latency_ms/], none: [/["']text["']\s*:/, /logger\.\w+\([^\n]*response_text/]},
         typescript: {all: [/latency_ms/], none: [/\btext:\s*responseText/, /(console|log)\.\w+\([^\n]*responseText/]},
@@ -105,7 +105,7 @@ long tail; an unscanned response hands the asker a card number or a leaked key.
       id: 'redact',
       title: 'Redacts card numbers and API keys before the client sees the answer',
       detail:
-        '`redact(text)` applies `CARD_PATTERN` and `API_KEY_PATTERN`, replaces hits with `[REDACTED]` and counts them; `finish` returns the redacted text and puts the count in the event as `redactions`. The starter returns the response untouched.',
+        '`redact(text)` applies `CARD_PATTERN` (every card length from 13 to 19 digits) and `API_KEY_PATTERN` (`sk-` and `key-` keys), replaces each hit with `[REDACTED]` and counts the hits; `finish` returns the redacted text and puts the count in the event as `redactions`. The starter returns the response untouched.',
       match: {
         python: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /["']redactions["']\s*:/]},
         typescript: {all: [/CARD_PATTERN/, /API_KEY_PATTERN/, /\[REDACTED\]/, /=\s*redact\(/, /redactions[,:\s}]/]},
@@ -653,7 +653,16 @@ TOPIC = "ai.firewall.events"
 KEY = "key-7f3a"
 KEY_HASH = hashlib.sha256(KEY.encode()).hexdigest()[:16]
 ANSWER = "The zebra-pangolin tunnel opens at dawn."
-LEAKY = "Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done."
+LEAKY = (
+    "Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card"
+    " 6011-0009-9013-9424-123 expired. Use sk-AbCdEfGhIjKlMnOpQrStUv123456 or key-ABCDEFGHIJKLMNOPQRSTUV12"
+    " for the API, done."
+)
+REDACTED_LEAKY = (
+    "Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired."
+    " Use [REDACTED] or [REDACTED] for the API, done."
+)
+SECRETS = ("4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC")
 FIELDS = ("request_id", "key_hash", "action", "score", "tags", "reason", "latency_ms", "redactions")
 
 
@@ -675,8 +684,10 @@ def _events(ctx):
     return m, capture
 
 
-def _allow(m):
-    return m.Decision("allow", 90, ["travel"], "")
+def _allow():
+    from detect import Decision  # step 3 declares it; events.py need not re-export it
+
+    return Decision("allow", 90, ["travel"], "")
 
 
 def _event(ctx, i=0):
@@ -691,9 +702,9 @@ def _event(ctx, i=0):
 def check_key_hash(ctx):
     m, _ = _events(ctx)
     now = time.monotonic()
-    m.finish(KEY, "r-1", _allow(m), ANSWER, now)
-    m.finish(KEY, "r-2", _allow(m), ANSWER, now)
-    m.finish("key-b2c9", "r-3", _allow(m), ANSWER, now)
+    m.finish(KEY, "r-1", _allow(), ANSWER, now)
+    m.finish(KEY, "r-2", _allow(), ANSWER, now)
+    m.finish("key-b2c9", "r-3", _allow(), ANSWER, now)
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 3, f"three finish() calls produced {len(records)} records on {TOPIC}"
     keys = [(r.key or b"").decode() for r in records]
@@ -711,24 +722,33 @@ def check_key_hash(ctx):
 def check_idempotent_acks(ctx):
     m, _ = _events(ctx)
     ctx.kafka.lose_acks(TOPIC, 1)
-    m.finish(KEY, "r-1", _allow(m), ANSWER, time.monotonic())
+    m.finish(KEY, "r-1", _allow(), ANSWER, time.monotonic())
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one finish() whose acknowledgement was lost left {len(records)} records on the topic: the producer retried and the broker wrote it again. enable.idempotence makes the retry a no-op (it needs acks=all)"
     ctx.kafka.failover(TOPIC)
     assert len(ctx.kafka.records(TOPIC)) == 1, "after a leader failover the event is gone: it was acknowledged by the leader alone, the producer needs acks=all"
-    m.finish(KEY, "r-2", _allow(m), ANSWER, time.monotonic())
+    m.finish(KEY, "r-2", _allow(), ANSWER, time.monotonic())
     assert len(ctx.kafka.records(TOPIC)) == 2, "after the failover the producer must keep producing"
+
+
+def _leak(text, logged):
+    """The first 8-character piece of the text found in the log, or None."""
+    return next((text[i : i + 8] for i in range(len(text) - 7) if text[i : i + 8] in logged), None)
 
 
 def check_no_text(ctx):
     m, capture = _events(ctx)
     started = time.monotonic()
     ctx.clock.advance(0.25)
-    m.finish(KEY, "r-1", _allow(m), ANSWER, started)
+    m.finish(KEY, "r-1", _allow(), ANSWER, started)
     event, record = _event(ctx)
     assert "zebra-pangolin" not in record.value.decode(), f"the event carries the model's answer: {record.value!r}. The topic is retained and replicated; the answer stays out"
+    m.finish(KEY, "r-2", _allow(), LEAKY, time.monotonic())
     logged = "\\n".join(capture.lines)
-    assert "zebra-pangolin" not in logged, f"a log line carries the model's answer: {logged!r}. Log the request id, the action and the counts"
+    for what, text in (("the model's answer", ANSWER), ("an answer that needed redacting, before or after", LEAKY)):
+        piece = _leak(text, logged)
+        assert piece is None, f"a log line carries {what} ({piece!r} of it): {logged!r}. Log the request id, the action and the counts"
+    assert KEY not in logged, f"a log line carries the API key itself: {logged!r}. The key appears nowhere; its key_hash identifies the caller"
     latency = event.get("latency_ms")
     assert isinstance(latency, int) and 200 <= latency <= 2000, f"latency_ms is {latency!r} for a request started 250 ms ago, expected an integer around 250"
     assert event.get("action") == "allow" and event.get("score") == 90 and event.get("tags") == ["travel"], f"the payload must carry the decision's action, score and tags: {event}"
@@ -736,18 +756,18 @@ def check_no_text(ctx):
 
 def check_redact(ctx):
     m, _ = _events(ctx)
-    out = m.finish(KEY, "r-1", _allow(m), LEAKY, time.monotonic())
-    assert "4111" not in out and "sk-abcdef" not in out, f"the response reached the client with the card number or the key still in it: {out!r}"
-    assert out.count("[REDACTED]") == 2, f"expected the card number and the key both replaced with [REDACTED], got {out!r}"
-    assert out.startswith("Card [REDACTED] is on file") and out.endswith("for the API, done."), f"the rest of the text must come through untouched: {out!r}"
+    out = m.finish(KEY, "r-1", _allow(), LEAKY, time.monotonic())
+    left = [s for s in SECRETS if s in out]
+    assert not left, f"the response reached the client with {left} still in it: {out!r}. CARD_PATTERN covers 13 to 19 digits, API_KEY_PATTERN sk- and key- keys of any case"
+    assert out == REDACTED_LEAKY, f"expected every card number and key replaced with [REDACTED] and the rest untouched: got {out!r}, expected {REDACTED_LEAKY!r}"
     event, record = _event(ctx)
-    assert event.get("redactions") == 2, f"the event's redactions is {event.get('redactions')!r}, expected 2"
+    assert event.get("redactions") == 6, f"the event's redactions is {event.get('redactions')!r}, expected 6: four card numbers and two keys, one per hit"
     assert "4111" not in record.value.decode(), f"the card number is in the event: {record.value!r}"
-    clean = m.finish(KEY, "r-2", _allow(m), ANSWER, time.monotonic())
+    clean = m.finish(KEY, "r-2", _allow(), ANSWER, time.monotonic())
     assert clean == ANSWER, f"a clean answer must come through unchanged, got {clean!r}"
     event, _ = _event(ctx, 1)
     assert event.get("redactions") == 0, f"a clean answer's event has redactions {event.get('redactions')!r}, expected 0"
-    dashed = m.finish(KEY, "r-3", _allow(m), "Try 4111-1111-1111-1111 next.", time.monotonic())
+    dashed = m.finish(KEY, "r-3", _allow(), "Try 4111-1111-1111-1111 next.", time.monotonic())
     assert dashed == "Try [REDACTED] next.", f"a dashed card number must be redacted too, got {dashed!r}"
 `,
     typescript: `import {createHash} from 'node:crypto';
@@ -756,7 +776,14 @@ const TOPIC = 'ai.firewall.events';
 const KEY = 'key-7f3a';
 const KEY_HASH = createHash('sha256').update(KEY).digest('hex').slice(0, 16);
 const ANSWER = 'The zebra-pangolin tunnel opens at dawn.';
-const LEAKY = 'Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done.';
+const LEAKY =
+  'Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card' +
+  ' 6011-0009-9013-9424-123 expired. Use sk-AbCdEfGhIjKlMnOpQrStUv123456 or key-ABCDEFGHIJKLMNOPQRSTUV12' +
+  ' for the API, done.';
+const REDACTED_LEAKY =
+  'Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired.' +
+  ' Use [REDACTED] or [REDACTED] for the API, done.';
+const SECRETS = ['4111', '3782', '10005', '4222222222222', '6011', 'sk-AbC', 'key-ABC'];
 const FIELDS = ['request_id', 'key_hash', 'action', 'score', 'tags', 'reason', 'latency_ms', 'redactions'];
 
 /** The learner's module, with every console line captured. */
@@ -815,6 +842,12 @@ export async function check_idempotent_acks(ctx) {
   assert.equal(ctx.kafka.records(TOPIC).length, 2, 'after the failover the producer must keep producing');
 }
 
+/** The first 8-character piece of the text found in the log, or null. */
+function leak(text: string, logged: string): string | null {
+  for (let i = 0; i + 8 <= text.length; i += 1) if (logged.includes(text.slice(i, i + 8))) return text.slice(i, i + 8);
+  return null;
+}
+
 export async function check_no_text(ctx) {
   const {m, lines} = events(ctx);
   const started = Date.now();
@@ -822,8 +855,13 @@ export async function check_no_text(ctx) {
   await m.finish(KEY, 'r-1', allow(), ANSWER, started);
   const {event: e, value} = event(ctx);
   assert(!value.includes('zebra-pangolin'), \`the event carries the model's answer: \${value}. The topic is retained and replicated; the answer stays out\`);
+  await m.finish(KEY, 'r-2', allow(), LEAKY, Date.now());
   const logged = lines.join('\\n');
-  assert(!logged.includes('zebra-pangolin'), \`a log line carries the model's answer: \${JSON.stringify(logged)}. Log the request id, the action and the counts\`);
+  for (const [what, text] of [["the model's answer", ANSWER], ['an answer that needed redacting, before or after', LEAKY]]) {
+    const piece = leak(text, logged);
+    assert(piece === null, \`a log line carries \${what} (\${JSON.stringify(piece)} of it): \${JSON.stringify(logged)}. Log the request id, the action and the counts\`);
+  }
+  assert(!logged.includes(KEY), \`a log line carries the API key itself: \${JSON.stringify(logged)}. The key appears nowhere; its key_hash identifies the caller\`);
   assert(Number.isInteger(e.latency_ms) && e.latency_ms >= 200 && e.latency_ms <= 2000, \`latency_ms is \${JSON.stringify(e.latency_ms)} for a request started 250 ms ago, expected an integer around 250\`);
   assert(e.action === 'allow' && e.score === 90 && JSON.stringify(e.tags) === '["travel"]', \`the payload must carry the decision's action, score and tags: \${value}\`);
 }
@@ -831,11 +869,11 @@ export async function check_no_text(ctx) {
 export async function check_redact(ctx) {
   const {m} = events(ctx);
   const out = await m.finish(KEY, 'r-1', allow(), LEAKY, Date.now());
-  assert(!out.includes('4111') && !out.includes('sk-abcdef'), \`the response reached the client with the card number or the key still in it: \${JSON.stringify(out)}\`);
-  assert.equal(out.split('[REDACTED]').length - 1, 2, \`expected the card number and the key both replaced with [REDACTED], got \${JSON.stringify(out)}\`);
-  assert(out.startsWith('Card [REDACTED] is on file') && out.endsWith('for the API, done.'), \`the rest of the text must come through untouched: \${JSON.stringify(out)}\`);
+  const left = SECRETS.filter(s => out.includes(s));
+  assert.equal(left.length, 0, \`the response reached the client with \${JSON.stringify(left)} still in it: \${JSON.stringify(out)}. CARD_PATTERN covers 13 to 19 digits, API_KEY_PATTERN sk- and key- keys of any case\`);
+  assert.equal(out, REDACTED_LEAKY, \`expected every card number and key replaced with [REDACTED] and the rest untouched: got \${JSON.stringify(out)}, expected \${JSON.stringify(REDACTED_LEAKY)}\`);
   const first = event(ctx);
-  assert.equal(first.event.redactions, 2, \`the event's redactions is \${JSON.stringify(first.event.redactions)}, expected 2\`);
+  assert.equal(first.event.redactions, 6, \`the event's redactions is \${JSON.stringify(first.event.redactions)}, expected 6: four card numbers and two keys, one per hit\`);
   assert(!first.value.includes('4111'), \`the card number is in the event: \${first.value}\`);
   const clean = await m.finish(KEY, 'r-2', allow(), ANSWER, Date.now());
   assert.equal(clean, ANSWER, \`a clean answer must come through unchanged, got \${JSON.stringify(clean)}\`);
@@ -863,8 +901,14 @@ const (
 	eventsTopicName = "ai.firewall.events"
 	eventsKey       = "key-7f3a"
 	eventsAnswer    = "The zebra-pangolin tunnel opens at dawn."
-	eventsLeaky     = "Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done."
+	eventsLeaky     = "Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card" +
+		" 6011-0009-9013-9424-123 expired. Use sk-AbCdEfGhIjKlMnOpQrStUv123456 or key-ABCDEFGHIJKLMNOPQRSTUV12" +
+		" for the API, done."
+	eventsRedactedLeaky = "Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired." +
+		" Use [REDACTED] or [REDACTED] for the API, done."
 )
+
+var eventsSecrets = []string{"4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC"}
 
 var eventsFields = []string{"request_id", "key_hash", "action", "score", "tags", "reason", "latency_ms", "redactions"}
 
@@ -926,6 +970,16 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopicName)), 2, "after the failover the writer must keep producing; the records")
 }
 
+// textLeak is the first 8-byte piece of text found in the log, or "".
+func textLeak(text, logged string) string {
+	for i := 0; i+8 <= len(text); i++ {
+		if strings.Contains(logged, text[i:i+8]) {
+			return text[i : i+8]
+		}
+	}
+	return ""
+}
+
 func CheckNoText(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
@@ -934,7 +988,12 @@ func CheckNoText(ctx *harness.Ctx) {
 	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, started)
 	event, record := eventAt(ctx, 0)
 	ctx.Assert(!strings.Contains(string(record.Value), "zebra-pangolin"), "the event carries the model's answer: %s. The topic is retained and replicated; the answer stays out", record.Value)
-	ctx.Assert(!strings.Contains(logged.String(), "zebra-pangolin"), "a log line carries the model's answer: %q. Log the request id, the action and the counts", logged.String())
+	finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsLeaky, time.Now())
+	for _, tc := range []struct{ what, text string }{{"the model's answer", eventsAnswer}, {"an answer that needed redacting, before or after", eventsLeaky}} {
+		piece := textLeak(tc.text, logged.String())
+		ctx.Assert(piece == "", "a log line carries %s (%q of it): %q. Log the request id, the action and the counts", tc.what, piece, logged.String())
+	}
+	ctx.Assert(!strings.Contains(logged.String(), eventsKey), "a log line carries the API key itself: %q. The key appears nowhere; its key_hash identifies the caller", logged.String())
 	latency, _ := event["latency_ms"].(float64)
 	ctx.Assert(latency >= 200 && latency <= 2000, "latency_ms is %v for a request started 250 ms ago, expected around 250", event["latency_ms"])
 	ctx.Assert(event["action"] == "allow" && event["score"] == float64(90), "the payload must carry the decision's action and score: %s", record.Value)
@@ -943,11 +1002,16 @@ func CheckNoText(ctx *harness.Ctx) {
 
 func CheckRedact(ctx *harness.Ctx) {
 	out := finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsLeaky, time.Now())
-	ctx.Assert(!strings.Contains(out, "4111") && !strings.Contains(out, "sk-abcdef"), "the response reached the client with the card number or the key still in it: %q", out)
-	ctx.Equal(strings.Count(out, "[REDACTED]"), 2, "the card number and the key must both be replaced with [REDACTED] (%q); the replacements", out)
-	ctx.Assert(strings.HasPrefix(out, "Card [REDACTED] is on file") && strings.HasSuffix(out, "for the API, done."), "the rest of the text must come through untouched: %q", out)
+	var left []string
+	for _, secret := range eventsSecrets {
+		if strings.Contains(out, secret) {
+			left = append(left, secret)
+		}
+	}
+	ctx.Assert(len(left) == 0, "the response reached the client with %q still in it: %q. cardPattern covers 13 to 19 digits, apiKeyPattern sk- and key- keys of any case", left, out)
+	ctx.Equal(out, eventsRedactedLeaky, "the response (every card number and key replaced with [REDACTED], the rest untouched)")
 	event, record := eventAt(ctx, 0)
-	ctx.Equal(event["redactions"], 2, "the event's redactions")
+	ctx.Equal(event["redactions"], 6, "the event's redactions (four card numbers and two keys, one per hit)")
 	ctx.Assert(!strings.Contains(string(record.Value), "4111"), "the card number is in the event: %s", record.Value)
 	clean := finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, time.Now())
 	ctx.Equal(clean, eventsAnswer, "a clean answer must come through unchanged")
@@ -975,7 +1039,13 @@ const std::string kEventsTopicName = "ai.firewall.events";
 const std::string kEventsKey = "key-7f3a";
 const std::string kEventsAnswer = "The zebra-pangolin tunnel opens at dawn.";
 const std::string kEventsLeaky =
-    "Card 4111 1111 1111 1111 is on file; use sk-abcdefghijklmnopqrstuvwxyz123456 for the API, done.";
+    "Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card"
+    " 6011-0009-9013-9424-123 expired. Use sk-AbCdEfGhIjKlMnOpQrStUv123456 or key-ABCDEFGHIJKLMNOPQRSTUV12"
+    " for the API, done.";
+const std::string kEventsRedactedLeaky =
+    "Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired."
+    " Use [REDACTED] or [REDACTED] for the API, done.";
+const std::vector<std::string> kEventsSecrets = {"4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC"};
 const std::vector<std::string> kEventsFields = {"request_id", "key_hash", "action", "score",
                                                 "tags",       "reason",   "latency_ms", "redactions"};
 
@@ -989,10 +1059,12 @@ std::string eventsKeyHash() {
 
 Decision allowDecision() { return Decision{"allow", 90, {"travel"}, ""}; }
 
-int count(const std::string& text, const std::string& needle) {
-  int n = 0;
-  for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) n++;
-  return n;
+// The first 8-byte piece of text found in the log, or "".
+std::string textLeak(const std::string& text, const std::string& logged) {
+  for (size_t i = 0; i + 8 <= text.size(); i++) {
+    if (logged.find(text.substr(i, 8)) != std::string::npos) return text.substr(i, 8);
+  }
+  return "";
 }
 
 // The i-th record's payload.
@@ -1071,14 +1143,23 @@ void CheckNoText(harness::Ctx& ctx) {
   {
     CaptureLogs capture;
     finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, started);
+    finish(kEventsKey, "r-2", allowDecision(), kEventsLeaky, std::chrono::steady_clock::now());
     logged = capture.lines.str();
   }
   const auto [event, record] = eventAt(ctx, 0);
   ctx.Assert(record.Value.value_or("").find("zebra-pangolin") == std::string::npos,
              "the event carries the model's answer: %s. The topic is retained and replicated; the answer stays out",
              record.Value.value_or(""));
-  ctx.Assert(logged.find("zebra-pangolin") == std::string::npos,
-             "a log line carries the model's answer: %q. Log the request id, the action and the counts", logged);
+  const std::pair<std::string, std::string> texts[] = {
+      {"the model's answer", kEventsAnswer}, {"an answer that needed redacting, before or after", kEventsLeaky}};
+  for (const auto& [what, text] : texts) {
+    const std::string piece = textLeak(text, logged);
+    ctx.Assert(piece.empty(), "a log line carries %s (%q of it): %q. Log the request id, the action and the counts", what,
+               piece, logged);
+  }
+  ctx.Assert(logged.find(kEventsKey) == std::string::npos,
+             "a log line carries the API key itself: %q. The key appears nowhere; its key_hash identifies the caller",
+             logged);
   const double latency = event.value("latency_ms", -1.0);
   ctx.Assert(latency >= 200 && latency <= 2000, "latency_ms is %v for a request started 250 ms ago, expected around 250",
              latency);
@@ -1090,15 +1171,17 @@ void CheckNoText(harness::Ctx& ctx) {
 
 void CheckRedact(harness::Ctx& ctx) {
   const std::string out = finish(kEventsKey, "r-1", allowDecision(), kEventsLeaky, std::chrono::steady_clock::now());
-  ctx.Assert(out.find("4111") == std::string::npos && out.find("sk-abcdef") == std::string::npos,
-             "the response reached the client with the card number or the key still in it: %q", out);
-  ctx.Equal(count(out, "[REDACTED]"), 2,
-            "the card number and the key must both be replaced with [REDACTED] (%q); the replacements", out);
-  ctx.Assert(out.rfind("Card [REDACTED] is on file", 0) == 0 &&
-                 out.size() >= 18 && out.compare(out.size() - 18, 18, "for the API, done.") == 0,
-             "the rest of the text must come through untouched: %q", out);
+  std::vector<std::string> left;
+  for (const auto& secret : kEventsSecrets)
+    if (out.find(secret) != std::string::npos) left.push_back(secret);
+  ctx.Assert(left.empty(),
+             "the response reached the client with %v still in it: %q. kCardPattern covers 13 to 19 digits, "
+             "kApiKeyPattern sk- and key- keys of any case",
+             left, out);
+  ctx.Equal(out, kEventsRedactedLeaky,
+            "the response (every card number and key replaced with [REDACTED], the rest untouched)");
   const auto [event, record] = eventAt(ctx, 0);
-  ctx.Equal(event.value("redactions", -1), 2, "the event's redactions");
+  ctx.Equal(event.value("redactions", -1), 6, "the event's redactions (four card numbers and two keys, one per hit)");
   ctx.Assert(record.Value.value_or("").find("4111") == std::string::npos, "the card number is in the event: %s",
              record.Value.value_or(""));
   const std::string clean = finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());

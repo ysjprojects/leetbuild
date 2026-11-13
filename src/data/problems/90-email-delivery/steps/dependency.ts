@@ -74,7 +74,7 @@ service Relay {
       id: 'same-message-id',
       title: "Retries carry the message's own id",
       detail:
-        'Every SendMail carries the message id the store assigned, so the relay can answer a retry with its first verdict; the starter appends the attempt number, which makes each retry a new email.',
+        'Every SendMail carries the message id the store assigned, so the relay can answer a retry with its first verdict, and a retry after `UNAVAILABLE` waits `BACKOFF_S` first; the starter appends the attempt number, which makes each retry a new email.',
       match: {
         python: {all: [/message_id\s*=\s*message_id\b/], none: [/f["']\{message_id\}-/, /uuid/]},
         typescript: {all: [/message_id:\s*messageId\b/], none: [/\$\{messageId\}-/, /randomUUID/]},
@@ -87,7 +87,7 @@ service Relay {
       id: 'terminal-outcomes',
       title: 'A hard bounce is recorded and suppressed, not retried',
       detail:
-        '`hard_bounce` ends the message in `bounced` with its `bounce_category` and suppresses the recipient through the gate; `suppressed` ends it too. Neither is sent again.',
+        '`hard_bounce` ends the message in `bounced` with its `bounce_category` and suppresses the recipient through the gate; `suppressed` ends it too. Neither is sent again. A `soft_bounce` is retried after `BACKOFF_S` and can still end `sent`; an error other than `UNAVAILABLE` or `DEADLINE_EXCEEDED` is not retried.',
       match: {
         python: {all: [/["']hard_bounce["']/, /gate\.suppress\(/, /bounce_category/]},
         typescript: {all: [/['"]hard_bounce['"]/, /\bsuppress\(/, /bounce_category/]},
@@ -748,16 +748,21 @@ from mail import store
 
 
 class Relay(pb_grpc.RelayServicer):
-    """Accepts every recipient but bounce@ (hard bounce, mailbox_unknown) and blocked@ (on the relay's
-    own list). A message id it already took answers its first verdict and is not mailed again; the
-    first lose_replies replies are lost after the relay took the message."""
+    """Accepts every recipient but bounce@ (hard bounce, mailbox_unknown), blocked@ (on the relay's
+    own list) and soft@ (a soft bounce on the first try of each message, accepted after). A message id
+    it already took answers its first verdict and is not mailed again; the first lose_replies replies
+    are lost after the relay took the message."""
 
     def __init__(self):
         self.verdicts = {}
+        self.soft_bounced = set()
         self.mailed = []
         self.lose_replies = 0
 
     def SendMail(self, request, context):
+        if request.recipient.startswith("soft@") and request.message_id not in self.soft_bounced:
+            self.soft_bounced.add(request.message_id)
+            return pb.Delivery(outcome="soft_bounce", bounce_category="mailbox_full")
         verdict = self.verdicts.get(request.message_id)
         if verdict is None:
             if request.recipient.startswith("bounce@"):
@@ -788,15 +793,20 @@ def _message(recipient="ana@example.com"):
 
 
 def check_deadline(ctx):
-    m, _ = _setup(ctx)
-    message_id = _message()
-    state = m.deliver(message_id)
+    m, relay = _setup(ctx)
+    state = m.deliver(_message())
     assert state == "sent", f"with a healthy relay deliver answered {state!r}, expected sent"
-    calls = ctx.grpc.calls_to("SendMail")
-    assert calls, "no SendMail call was made"
-    for call in calls:
-        assert call.timeout is not None, "a SendMail call carries no deadline: a stalled relay holds the worker"
-        assert 9.5 <= call.timeout <= 10.5, f"a SendMail call carries a {call.timeout} s deadline, expected DEADLINE_S = 10: a stalled relay holds a worker that long per attempt"
+    # A lost reply: the GetStatus that follows carries the deadline too.
+    relay.lose_replies = 1
+    try:
+        m.deliver(_message("bo@example.com"))
+    except grpc.RpcError:
+        pass  # how the timeout is settled is reconcile-timeout's concern; this check reads the deadlines
+    assert ctx.grpc.calls_to("SendMail"), "no SendMail call was made"
+    for method in ("SendMail", "GetStatus"):
+        for call in ctx.grpc.calls_to(method):
+            assert call.timeout is not None, f"a {method} call carries no deadline: a stalled relay holds the worker"
+            assert 9.5 <= call.timeout <= 10.5, f"a {method} call carries a {call.timeout} s deadline, expected DEADLINE_S = 10: a stalled relay holds a worker that long per call"
 
 
 def check_same_message_id(ctx):
@@ -805,6 +815,7 @@ def check_same_message_id(ctx):
     message_id = _message()
     state = m.deliver(message_id)
     assert state == "sent", f"after one UNAVAILABLE deliver answered {state!r}, expected sent"
+    assert ctx.clock.sleeps >= 1, "after UNAVAILABLE deliver sent again at once: a relay that is restarting is hit again before it is back. Sleep BACKOFF_S before the retry"
     ids = [c.request.message_id for c in ctx.grpc.calls_to("SendMail")]
     assert ids == [message_id, message_id], f"the two attempts carried message ids {ids}, expected {message_id!r} twice: a new id per attempt is a new email to the relay, which cannot tell a retry from a second message"
     outcomes = [a["outcome"] for a in store.attempts(message_id)]
@@ -826,6 +837,19 @@ def check_terminal_outcomes(ctx):
     blocked = _message("blocked@example.com")
     state = m.deliver(blocked)
     assert state == "suppressed" and len(ctx.grpc.calls_to("SendMail")) == 2, f"a recipient on the relay's own list answered {state!r} after {len(ctx.grpc.calls_to('SendMail')) - 1} call(s), expected suppressed after one"
+    # A soft bounce is not terminal: the mailbox may take the message after the backoff.
+    soft = _message("soft@example.com")
+    state = m.deliver(soft)
+    calls = len(ctx.grpc.calls_to("SendMail")) - 2
+    assert state == "sent" and calls == 2 and ctx.clock.sleeps >= 1, f"a soft bounce followed by accepted answered {state!r} after {calls} SendMail call(s) and {ctx.clock.sleeps} sleep(s), expected sent after a backoff and a second call: a full mailbox is retried, not given up on"
+    # Any other error is not retried: sending again cannot fix it.
+    ctx.grpc.fail("SendMail", grpc.StatusCode.INVALID_ARGUMENT, "template rejected")
+    try:
+        state = m.deliver(_message("cy@example.com"))
+    except grpc.RpcError:
+        state = "raised"
+    calls = len(ctx.grpc.calls_to("SendMail")) - 4
+    assert calls == 1 and state != "sent", f"after INVALID_ARGUMENT SendMail was called {calls} time(s) and deliver answered {state!r}: only UNAVAILABLE and soft bounces are retried"
 
 
 def check_reconcile_timeout(ctx):
@@ -843,13 +867,17 @@ def check_reconcile_timeout(ctx):
     state = m.deliver(second)
     assert state == "sent" and relay.mailed.count("bo@example.com") == 1, f"after a timeout the relay never saw, deliver answered {state!r} and the relay mailed {relay.mailed}"
 `,
-    typescript: `/** The relay stand-in: accepts every recipient but bounce@ (hard bounce) and blocked@ (on its own list); an id it took answers its first verdict. */
+    typescript: `/** The relay stand-in: accepts every recipient but bounce@ (hard bounce), blocked@ (on its own list) and soft@ (a soft bounce on each message's first try, accepted after); an id it took answers its first verdict. */
 function setup(ctx) {
   const pkg = ctx.proto('email_delivery.proto');
-  const relay = {verdicts: new Map<string, {outcome: string; bounce_category: string}>(), mailed: [] as string[], loseReplies: 0};
+  const relay = {verdicts: new Map<string, {outcome: string; bounce_category: string}>(), softBounced: new Set<string>(), mailed: [] as string[], loseReplies: 0};
   ctx.grpc.serve(pkg.smtprelay.Relay.service, {
     SendMail(call, callback) {
       const {message_id, recipient} = call.request;
+      if (recipient.startsWith('soft@') && !relay.softBounced.has(message_id)) {
+        relay.softBounced.add(message_id);
+        return callback(null, {outcome: 'soft_bounce', bounce_category: 'mailbox_full'});
+      }
       let verdict = relay.verdicts.get(message_id);
       if (verdict === undefined) {
         if (recipient.startsWith('bounce@')) verdict = {outcome: 'hard_bounce', bounce_category: 'mailbox_unknown'};
@@ -876,14 +904,22 @@ function setup(ctx) {
 }
 
 export async function check_deadline(ctx) {
-  const {m, message} = setup(ctx);
+  const {m, relay, message} = setup(ctx);
   const state = await m.deliver(await message());
   assert.equal(state, 'sent', \`with a healthy relay deliver answered \${state}\`);
-  const calls = ctx.grpc.callsTo('SendMail');
-  assert(calls.length > 0, 'no SendMail call was made');
-  for (const call of calls) {
-    assert(call.timeout !== null, 'a SendMail call carries no deadline: a stalled relay holds the worker');
-    assert(call.timeout >= 9.5 && call.timeout <= 10.5, \`a SendMail call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 10000: a stalled relay holds a worker that long per attempt\`);
+  // A lost reply: the GetStatus that follows carries the deadline too.
+  relay.loseReplies = 1;
+  try {
+    await m.deliver(await message('bo@example.com'));
+  } catch {
+    // how the timeout is settled is reconcile-timeout's concern; this check reads the deadlines
+  }
+  assert(ctx.grpc.callsTo('SendMail').length > 0, 'no SendMail call was made');
+  for (const method of ['SendMail', 'GetStatus']) {
+    for (const call of ctx.grpc.callsTo(method)) {
+      assert(call.timeout !== null, \`a \${method} call carries no deadline: a stalled relay holds the worker\`);
+      assert(call.timeout >= 9.5 && call.timeout <= 10.5, \`a \${method} call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 10000: a stalled relay holds a worker that long per call\`);
+    }
   }
 }
 
@@ -893,6 +929,7 @@ export async function check_same_message_id(ctx) {
   const messageId = await message();
   const state = await m.deliver(messageId);
   assert.equal(state, 'sent', \`after one UNAVAILABLE deliver answered \${state}\`);
+  assert(ctx.clock.sleeps >= 1, 'after UNAVAILABLE deliver sent again at once: a relay that is restarting is hit again before it is back. Sleep BACKOFF_MS before the retry');
   const ids = ctx.grpc.callsTo('SendMail').map(c => c.request.message_id);
   assert.deepStrictEqual(ids, [messageId, messageId], \`the two attempts carried message ids \${JSON.stringify(ids)}, expected \${messageId} twice: a new id per attempt is a new email to the relay, which cannot tell a retry from a second message\`);
   const outcomes = (await store.attempts(messageId)).map(a => a.outcome);
@@ -913,6 +950,19 @@ export async function check_terminal_outcomes(ctx) {
   assert.equal(ctx.redis.sismember('mail:suppressed', 'bounce@example.com'), 1, 'after a hard bounce the address is not in mail:suppressed: the next send mails a mailbox that does not exist. Suppress it through the gate');
   state = await m.deliver(await message('blocked@example.com'));
   assert(state === 'suppressed' && ctx.grpc.callsTo('SendMail').length === 2, \`a recipient on the relay's own list answered \${state} after \${ctx.grpc.callsTo('SendMail').length - 1} call(s), expected suppressed after one\`);
+  // A soft bounce is not terminal: the mailbox may take the message after the backoff.
+  state = await m.deliver(await message('soft@example.com'));
+  let sent = ctx.grpc.callsTo('SendMail').length - 2;
+  assert(state === 'sent' && sent === 2 && ctx.clock.sleeps >= 1, \`a soft bounce followed by accepted answered \${state} after \${sent} SendMail call(s) and \${ctx.clock.sleeps} sleep(s), expected sent after a backoff and a second call: a full mailbox is retried, not given up on\`);
+  // Any other error is not retried: sending again cannot fix it.
+  ctx.grpc.fail('SendMail', ctx.grpc.status.INVALID_ARGUMENT, 'template rejected');
+  try {
+    state = await m.deliver(await message('cy@example.com'));
+  } catch {
+    state = 'threw';
+  }
+  sent = ctx.grpc.callsTo('SendMail').length - 4;
+  assert(sent === 1 && state !== 'sent', \`after INVALID_ARGUMENT SendMail was called \${sent} time(s) and deliver answered \${state}: only UNAVAILABLE and soft bounces are retried\`);
 }
 
 export async function check_reconcile_timeout(ctx) {
@@ -947,16 +997,22 @@ import (
 
 var dispatchBg = context.Background()
 
-// relayPeer accepts every recipient but bounce@ (hard bounce) and blocked@ (on its own list); an id
-// it took answers its first verdict, and the first loseReplies replies are lost after it took the message.
+// relayPeer accepts every recipient but bounce@ (hard bounce), blocked@ (on its own list) and soft@ (a
+// soft bounce on each message's first try, accepted after); an id it took answers its first verdict,
+// and the first loseReplies replies are lost after it took the message.
 type relayPeer struct {
 	pb.UnimplementedRelayServer
 	verdicts    map[string]*pb.Delivery
+	softBounced map[string]bool
 	mailed      []string
 	loseReplies int
 }
 
 func (p *relayPeer) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.Delivery, error) {
+	if strings.HasPrefix(req.GetRecipient(), "soft@") && !p.softBounced[req.GetMessageId()] {
+		p.softBounced[req.GetMessageId()] = true
+		return &pb.Delivery{Outcome: "soft_bounce", BounceCategory: "mailbox_full"}, nil
+	}
 	verdict, seen := p.verdicts[req.GetMessageId()]
 	if !seen {
 		switch {
@@ -985,7 +1041,7 @@ func (p *relayPeer) GetStatus(_ context.Context, req *pb.StatusRequest) (*pb.Del
 }
 
 func serveRelay(ctx *harness.Ctx) *relayPeer {
-	peer := &relayPeer{verdicts: map[string]*pb.Delivery{}}
+	peer := &relayPeer{verdicts: map[string]*pb.Delivery{}, softBounced: map[string]bool{}}
 	pb.RegisterRelayServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
@@ -1011,13 +1067,18 @@ func countOf(list []string, item string) int {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveRelay(ctx)
+	relay := serveRelay(ctx)
 	ctx.Equal(mustDeliver(ctx, newMessage("ana@example.com")), "sent", "with a healthy relay, deliver")
-	calls := ctx.GRPC.CallsTo("SendMail", "")
-	ctx.Assert(len(calls) > 0, "no SendMail call was made")
-	for _, call := range calls {
-		ctx.Assert(call.HasDeadline(), "a SendMail call carries no deadline: a stalled relay holds the worker")
-		ctx.Assert(9500*time.Millisecond <= call.Timeout && call.Timeout <= 10500*time.Millisecond, "a SendMail call carries a %v deadline, expected 10 s: a stalled relay holds a worker that long per attempt", call.Timeout)
+	// A lost reply: the GetStatus that follows carries the deadline too. How the timeout is settled
+	// is reconcile-timeout's concern; this check reads the deadlines.
+	relay.loseReplies = 1
+	_, _ = deliver(dispatchBg, newMessage("bo@example.com"))
+	ctx.Assert(len(ctx.GRPC.CallsTo("SendMail", "")) > 0, "no SendMail call was made")
+	for _, method := range []string{"SendMail", "GetStatus"} {
+		for _, call := range ctx.GRPC.CallsTo(method, "") {
+			ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a stalled relay holds the worker", method)
+			ctx.Assert(9500*time.Millisecond <= call.Timeout && call.Timeout <= 10500*time.Millisecond, "a %s call carries a %v deadline, expected 10 s: a stalled relay holds a worker that long per call", method, call.Timeout)
+		}
 	}
 }
 
@@ -1026,6 +1087,7 @@ func CheckSameMessageId(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("SendMail", codes.Unavailable, "relay restarting", 1, "")
 	messageID := newMessage("ana@example.com")
 	ctx.Equal(mustDeliver(ctx, messageID), "sent", "after one UNAVAILABLE, deliver")
+	ctx.Assert(ctx.Clock.Sleeps() >= 1, "after UNAVAILABLE deliver sent again at once: a relay that is restarting is hit again before it is back. Sleep the backoff before the retry")
 	var ids []string
 	for _, c := range ctx.GRPC.CallsTo("SendMail", "") {
 		ids = append(ids, c.Request.(*pb.SendMailRequest).GetMessageId())
@@ -1048,6 +1110,15 @@ func CheckTerminalOutcomes(ctx *harness.Ctx) {
 	ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", "bounce@example.com"), "after a hard bounce the address is not in mail:suppressed: the next send mails a mailbox that does not exist. Suppress it through the gate")
 	state = mustDeliver(ctx, newMessage("blocked@example.com"))
 	ctx.Assert(state == "suppressed" && len(ctx.GRPC.CallsTo("SendMail", "")) == 2, "a recipient on the relay's own list answered %q after %d call(s), expected suppressed after one", state, len(ctx.GRPC.CallsTo("SendMail", ""))-1)
+	// A soft bounce is not terminal: the mailbox may take the message after the backoff.
+	state = mustDeliver(ctx, newMessage("soft@example.com"))
+	sent := len(ctx.GRPC.CallsTo("SendMail", "")) - 2
+	ctx.Assert(state == "sent" && sent == 2 && ctx.Clock.Sleeps() >= 1, "a soft bounce followed by accepted answered %q after %d SendMail call(s) and %d sleep(s), expected sent after a backoff and a second call: a full mailbox is retried, not given up on", state, sent, ctx.Clock.Sleeps())
+	// Any other error is not retried: sending again cannot fix it.
+	ctx.GRPC.Fail("SendMail", codes.InvalidArgument, "template rejected", 1, "")
+	state, err := deliver(dispatchBg, newMessage("cy@example.com"))
+	sent = len(ctx.GRPC.CallsTo("SendMail", "")) - 4
+	ctx.Assert(sent == 1 && (err != nil || state != "sent"), "after INVALID_ARGUMENT SendMail was called %d time(s) and deliver answered %q (error %v): only UNAVAILABLE and soft bounces are retried", sent, state, err)
 }
 
 func CheckReconcileTimeout(ctx *harness.Ctx) {
@@ -1067,6 +1138,7 @@ func CheckReconcileTimeout(ctx *harness.Ctx) {
     cpp: `#include <leetbuild/harness.h>
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1075,15 +1147,22 @@ func CheckReconcileTimeout(ctx *harness.Ctx) {
 
 namespace {
 
-// Accepts every recipient but bounce@ (hard bounce) and blocked@ (on its own list); an id it took
-// answers its first verdict, and the first lose_replies replies are lost after it took the message.
+// Accepts every recipient but bounce@ (hard bounce), blocked@ (on its own list) and soft@ (a soft
+// bounce on each message's first try, accepted after); an id it took answers its first verdict, and
+// the first lose_replies replies are lost after it took the message.
 class RelayPeer final : public smtprelay::Relay::Service {
  public:
   std::map<std::string, smtprelay::Delivery> verdicts;
+  std::set<std::string> soft_bounced;
   std::vector<std::string> mailed;
   int lose_replies = 0;
 
   grpc::Status SendMail(grpc::ServerContext*, const smtprelay::SendMailRequest* req, smtprelay::Delivery* out) override {
+    if (req->recipient().rfind("soft@", 0) == 0 && soft_bounced.insert(req->message_id()).second) {
+      out->set_outcome("soft_bounce");
+      out->set_bounce_category("mailbox_full");
+      return grpc::Status::OK;
+    }
     auto seen = verdicts.find(req->message_id());
     if (seen == verdicts.end()) {
       smtprelay::Delivery verdict;
@@ -1146,13 +1225,22 @@ long countOf(const std::vector<std::string>& list, const std::string& item) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveRelay(ctx);
+  RelayPeer& relay = serveRelay(ctx);
   ctx.Equal(mustDeliver(ctx, newMessage("ana@example.com")), "sent", "with a healthy relay, deliver");
-  const auto calls = ctx.GRPC.CallsTo("SendMail");
-  ctx.Assert(!calls.empty(), "no SendMail call was made");
-  for (const auto& call : calls) {
-    ctx.Assert(call.HasDeadline(), "a SendMail call carries no deadline: a stalled relay holds the worker");
-    ctx.Assert(9.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 10.5, "a SendMail call carries a %v s deadline, expected kDeadline = 10 s: a stalled relay holds a worker that long per attempt", call.TimeoutSeconds());
+  // A lost reply: the GetStatus that follows carries the deadline too.
+  relay.lose_replies = 1;
+  try {
+    deliver(newMessage("bo@example.com"));
+  } catch (const std::exception&) {
+    // how the timeout is settled is reconcile-timeout's concern; this check reads the deadlines
+  }
+  ctx.Assert(!ctx.GRPC.CallsTo("SendMail").empty(), "no SendMail call was made");
+  for (const std::string method : {"SendMail", "GetStatus"}) {
+    for (const auto& call : ctx.GRPC.CallsTo(method)) {
+      ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a stalled relay holds the worker", method);
+      ctx.Assert(9.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 10.5, "a %s call carries a %v s deadline, expected kDeadline = 10 s: a stalled relay holds a worker that long per call", method,
+                 call.TimeoutSeconds());
+    }
   }
 }
 
@@ -1161,6 +1249,7 @@ void CheckSameMessageId(harness::Ctx& ctx) {
   ctx.GRPC.Fail("SendMail", grpc::StatusCode::UNAVAILABLE, "relay restarting", 1);
   const std::string message_id = newMessage("ana@example.com");
   ctx.Equal(mustDeliver(ctx, message_id), "sent", "after one UNAVAILABLE, deliver");
+  ctx.Assert(ctx.Clock.Sleeps() >= 1, "after UNAVAILABLE deliver sent again at once: a relay that is restarting is hit again before it is back. Sleep kBackoff before the retry");
   std::vector<std::string> ids;
   for (const auto& c : ctx.GRPC.CallsTo("SendMail")) ids.push_back(c.Request<smtprelay::SendMailRequest>().message_id());
   ctx.Equal(ids, std::vector<std::string>{message_id, message_id}, "the two attempts must carry the message's own id (a new id per attempt is a new email to the relay, which cannot tell a retry from a second message); the ids");
@@ -1183,6 +1272,21 @@ void CheckTerminalOutcomes(harness::Ctx& ctx) {
   state = mustDeliver(ctx, newMessage("blocked@example.com"));
   ctx.Assert(state == "suppressed" && ctx.GRPC.CallsTo("SendMail").size() == 2, "a recipient on the relay's own list answered %q after %d call(s), expected suppressed after one", state,
              static_cast<int>(ctx.GRPC.CallsTo("SendMail").size()) - 1);
+  // A soft bounce is not terminal: the mailbox may take the message after the backoff.
+  state = mustDeliver(ctx, newMessage("soft@example.com"));
+  int sent = static_cast<int>(ctx.GRPC.CallsTo("SendMail").size()) - 2;
+  ctx.Assert(state == "sent" && sent == 2 && ctx.Clock.Sleeps() >= 1,
+             "a soft bounce followed by accepted answered %q after %d SendMail call(s) and %d sleep(s), expected sent after a backoff and a second call: a full mailbox is retried, not given up on", state, sent,
+             ctx.Clock.Sleeps());
+  // Any other error is not retried: sending again cannot fix it.
+  ctx.GRPC.Fail("SendMail", grpc::StatusCode::INVALID_ARGUMENT, "template rejected", 1);
+  try {
+    state = deliver(newMessage("cy@example.com"));
+  } catch (const std::exception&) {
+    state = "threw";
+  }
+  sent = static_cast<int>(ctx.GRPC.CallsTo("SendMail").size()) - 4;
+  ctx.Assert(sent == 1 && state != "sent", "after INVALID_ARGUMENT SendMail was called %d time(s) and deliver answered %q: only UNAVAILABLE and soft bounces are retried", sent, state);
 }
 
 void CheckReconcileTimeout(harness::Ctx& ctx) {

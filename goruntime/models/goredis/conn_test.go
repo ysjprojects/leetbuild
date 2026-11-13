@@ -27,6 +27,8 @@ type fake struct {
 	parked  chan struct{} // receives once per wait of a blocking command
 	// blockingTrips counts the trips through ExecuteBlocking and PipelineBlocking.
 	blockingTrips int
+	conns         int
+	watches       map[int]map[string]string // connection → WATCHed key → its value when watched
 }
 
 type stream struct {
@@ -224,17 +226,55 @@ func names(cmds [][][]byte) []string {
 
 func (f *fake) Pipeline(cmds [][][]byte) []world.Result { return f.batch(cmds, names(cmds)) }
 
-func (f *fake) Transaction(cmds [][][]byte) []world.Result {
-	return f.batch(cmds, append(append([]string{"MULTI"}, names(cmds)...), "EXEC"))
-}
-
-func (f *fake) Fingerprint(key []byte) string {
+func (f *fake) Connect() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if v, ok := f.data[string(key)]; ok {
+	f.conns++
+	return f.conns
+}
+
+// held renders key's value, "" when absent; the caller holds f.mu.
+func (f *fake) held(key string) string {
+	if v, ok := f.data[key]; ok {
 		return "s:" + v
 	}
 	return ""
+}
+
+func (f *fake) Watch(conn int, keys [][]byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.watches == nil {
+		f.watches = map[int]map[string]string{}
+	}
+	if f.watches[conn] == nil {
+		f.watches[conn] = map[string]string{}
+	}
+	for _, k := range keys {
+		if _, ok := f.watches[conn][string(k)]; !ok {
+			f.watches[conn][string(k)] = f.held(string(k))
+		}
+	}
+}
+
+func (f *fake) Unwatch(conn int, _ bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.watches, conn)
+}
+
+func (f *fake) Exec(conn int, cmds [][][]byte) ([]world.Result, bool) {
+	f.mu.Lock()
+	watched := f.watches[conn]
+	delete(f.watches, conn)
+	for k, before := range watched {
+		if f.held(k) != before {
+			f.mu.Unlock()
+			return nil, true
+		}
+	}
+	f.mu.Unlock()
+	return f.batch(cmds, append(append([]string{"MULTI"}, names(cmds)...), "EXEC")), false
 }
 
 func (f *fake) Probe([]byte, func() (any, error)) *world.Probe { return &world.Probe{} }

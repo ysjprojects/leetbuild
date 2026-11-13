@@ -67,7 +67,7 @@ loses an acknowledgement gets the event twice.
       id: 'outcome-after-relay',
       title: "Publishes the relay's outcome, after the relay answered",
       detail:
-        '`dispatch` calls `deliver` first and maps the state it returns through `EVENT_TYPES`; the starter publishes `email.accepted` before the relay was asked, whatever it answers.',
+        '`dispatch` calls `deliver` first and maps the state it returns through `EVENT_TYPES`, so a sent, bounced, suppressed and deferred message each publish their own type; the starter publishes `email.accepted` before the relay was asked, whatever it answers.',
       match: {
         python: {all: [/EVENT_TYPES\[/], order: [/def dispatch\(/, /deliver\(/, /publish_event\(/]},
         typescript: {all: [/EVENT_TYPES\[/], order: [/function dispatch\(/, /\bdeliver\(/, /publishEvent\(/]},
@@ -80,7 +80,7 @@ loses an acknowledgement gets the event twice.
       id: 'hashed-payload',
       title: 'Carries the recipient hash, never the address',
       detail:
-        "The value names the recipient only as `recipient_hash`: the topic is retained and every consumer reads it, so an address there outlives the customer's right to be forgotten.",
+        "The value names the recipient only as `recipient_hash`, with neither the address nor its domain: the topic is retained and every consumer reads it, so an address there outlives the customer's right to be forgotten.",
       match: {
         python: {all: [/["']recipient_hash["']\s*:/], none: [/["']recipient["']\s*:/]},
         typescript: {all: [/recipient_hash:/], none: [/\brecipient:\s*message\.recipient/]},
@@ -613,7 +613,8 @@ def _hash(address):
 
 
 class Relay(pb_grpc.RelayServicer):
-    """Accepts every recipient but bounce@ (a hard bounce); notes how many events were on the topic at each call."""
+    """Accepts every recipient but bounce@ (a hard bounce), blocked@ (on the relay's own list) and
+    full@ (a soft bounce every time); notes how many events were on the topic at each call."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -623,6 +624,10 @@ class Relay(pb_grpc.RelayServicer):
         self.events_at_call.append(len(self.ctx.kafka.records(TOPIC)))
         if request.recipient.startswith("bounce@"):
             return pb.Delivery(outcome="hard_bounce", bounce_category="mailbox_unknown")
+        if request.recipient.startswith("blocked@"):
+            return pb.Delivery(outcome="suppressed")
+        if request.recipient.startswith("full@"):
+            return pb.Delivery(outcome="soft_bounce", bounce_category="mailbox_full")
         return pb.Delivery(outcome="accepted")
 
     def GetStatus(self, request, context):
@@ -669,18 +674,20 @@ def check_outcome_after_relay(ctx):
     assert types == ["email.bounced"], f"a message the relay hard-bounced produced events {types}, expected one email.bounced"
     assert _payload(records[0]).get("bounce_category") == "mailbox_unknown", f"the bounce event carries {_payload(records[0])}, expected bounce_category mailbox_unknown"
     _dispatch(m, "ana@example.com")
+    _dispatch(m, "blocked@example.com")
+    _dispatch(m, "full@example.com")
     types = [_payload(r).get("type") for r in ctx.kafka.records(TOPIC)]
-    assert types == ["email.bounced", "email.accepted"], f"after an accepted message the topic holds {types}, expected email.bounced then email.accepted"
+    assert types == ["email.bounced", "email.accepted", "email.suppressed", "email.deferred"], f"a bounced, an accepted, a suppressed and a deferred message left the types {types} on the topic, expected email.bounced, email.accepted, email.suppressed, email.deferred: each state publishes its own type"
 
 
 def check_hashed_payload(ctx):
     m, _ = _setup(ctx)
-    _dispatch(m, "Ana@Example.com")
+    _dispatch(m, "Ana@Lindqvist.example")
     record = ctx.kafka.records(TOPIC)[0]
     text = record.value.decode()
-    assert "ana@example.com" not in text.lower(), f"the event carries the address: {text}. The topic is retained and every consumer reads it; carry recipient_hash"
+    assert "lindqvist" not in text.lower(), f"the event carries the address or its domain: {text}. The topic is retained and every consumer reads it; carry recipient_hash alone"
     payload = _payload(record)
-    assert payload.get("recipient_hash") == _hash("ana@example.com"), f"recipient_hash is {payload.get('recipient_hash')!r}, expected the SHA-256 of the normalized address"
+    assert payload.get("recipient_hash") == _hash("ana@lindqvist.example"), f"recipient_hash is {payload.get('recipient_hash')!r}, expected the SHA-256 of the normalized address"
     assert payload.get("message_id") and payload.get("tenant") == "t-1", f"the event must carry message_id and tenant, got {payload}"
 
 
@@ -700,7 +707,7 @@ const TOPIC = 'email.event';
 
 const hashOf = (address: string): string => createHash('sha256').update(address.trim().toLowerCase()).digest('hex');
 
-/** The relay stand-in: accepts every recipient but bounce@ (a hard bounce), noting how many events were on the topic at each call. */
+/** The relay stand-in: accepts every recipient but bounce@ (a hard bounce), blocked@ (on its own list) and full@ (a soft bounce every time), noting how many events were on the topic at each call. */
 function setup(ctx) {
   const pkg = ctx.proto('email_delivery.proto');
   const eventsAtCall: number[] = [];
@@ -708,6 +715,8 @@ function setup(ctx) {
     SendMail(call, callback) {
       eventsAtCall.push(ctx.kafka.records(TOPIC).length);
       if (call.request.recipient.startsWith('bounce@')) return callback(null, {outcome: 'hard_bounce', bounce_category: 'mailbox_unknown'});
+      if (call.request.recipient.startsWith('blocked@')) return callback(null, {outcome: 'suppressed', bounce_category: ''});
+      if (call.request.recipient.startsWith('full@')) return callback(null, {outcome: 'soft_bounce', bounce_category: 'mailbox_full'});
       callback(null, {outcome: 'accepted', bounce_category: ''});
     },
     GetStatus(call, callback) {
@@ -751,18 +760,20 @@ export async function check_outcome_after_relay(ctx) {
   assert.deepStrictEqual(types, ['email.bounced'], \`a message the relay hard-bounced produced events \${JSON.stringify(types)}, expected one email.bounced\`);
   assert.equal(payload(records[0]).bounce_category, 'mailbox_unknown', \`the bounce event carries \${records[0].value}, expected bounce_category mailbox_unknown\`);
   await dispatch('ana@example.com');
+  await dispatch('blocked@example.com');
+  await dispatch('full@example.com');
   types = ctx.kafka.records(TOPIC).map(r => payload(r).type);
-  assert.deepStrictEqual(types, ['email.bounced', 'email.accepted'], \`after an accepted message the topic holds \${JSON.stringify(types)}\`);
+  assert.deepStrictEqual(types, ['email.bounced', 'email.accepted', 'email.suppressed', 'email.deferred'], \`a bounced, an accepted, a suppressed and a deferred message left the types \${JSON.stringify(types)} on the topic, expected email.bounced, email.accepted, email.suppressed, email.deferred: each state publishes its own type\`);
 }
 
 export async function check_hashed_payload(ctx) {
   const {dispatch} = setup(ctx);
-  await dispatch('Ana@Example.com');
+  await dispatch('Ana@Lindqvist.example');
   const record = ctx.kafka.records(TOPIC)[0];
   const text = record.value.toString();
-  assert(!text.toLowerCase().includes('ana@example.com'), \`the event carries the address: \${text}. The topic is retained and every consumer reads it; carry recipient_hash\`);
+  assert(!text.toLowerCase().includes('lindqvist'), \`the event carries the address or its domain: \${text}. The topic is retained and every consumer reads it; carry recipient_hash alone\`);
   const p = payload(record);
-  assert.equal(p.recipient_hash, hashOf('ana@example.com'), 'recipient_hash must be the SHA-256 of the normalized address');
+  assert.equal(p.recipient_hash, hashOf('ana@lindqvist.example'), 'recipient_hash must be the SHA-256 of the normalized address');
   assert(p.message_id && p.tenant === 't-1', \`the event must carry message_id and tenant, got \${text}\`);
 }
 
@@ -795,7 +806,8 @@ const topicName = "email.event"
 
 var eventsBg = context.Background()
 
-// eventsRelay accepts every recipient but bounce@ (a hard bounce), noting how many events were on the topic at each call.
+// eventsRelay accepts every recipient but bounce@ (a hard bounce), blocked@ (on its own list) and
+// full@ (a soft bounce every time), noting how many events were on the topic at each call.
 type eventsRelay struct {
 	pb.UnimplementedRelayServer
 	ctx          *harness.Ctx
@@ -804,8 +816,13 @@ type eventsRelay struct {
 
 func (p *eventsRelay) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.Delivery, error) {
 	p.eventsAtCall = append(p.eventsAtCall, len(p.ctx.Kafka.Records(topicName)))
-	if strings.HasPrefix(req.GetRecipient(), "bounce@") {
+	switch {
+	case strings.HasPrefix(req.GetRecipient(), "bounce@"):
 		return &pb.Delivery{Outcome: "hard_bounce", BounceCategory: "mailbox_unknown"}, nil
+	case strings.HasPrefix(req.GetRecipient(), "blocked@"):
+		return &pb.Delivery{Outcome: "suppressed"}, nil
+	case strings.HasPrefix(req.GetRecipient(), "full@"):
+		return &pb.Delivery{Outcome: "soft_bounce", BounceCategory: "mailbox_full"}, nil
 	}
 	return &pb.Delivery{Outcome: "accepted"}, nil
 }
@@ -859,22 +876,24 @@ func CheckOutcomeAfterRelay(ctx *harness.Ctx) {
 	ctx.Equal(types, []string{"email.bounced"}, "a message the relay hard-bounced must produce one email.bounced; the types")
 	ctx.Equal(payloadOf(ctx, records[0].Value)["bounce_category"], "mailbox_unknown", "the bounce event's bounce_category")
 	dispatchTo(ctx, "ana@example.com", "t-1")
+	dispatchTo(ctx, "blocked@example.com", "t-1")
+	dispatchTo(ctx, "full@example.com", "t-1")
 	types = nil
 	for _, r := range ctx.Kafka.Records(topicName) {
 		t, _ := payloadOf(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
-	ctx.Equal(types, []string{"email.bounced", "email.accepted"}, "after an accepted message, the types on the topic")
+	ctx.Equal(types, []string{"email.bounced", "email.accepted", "email.suppressed", "email.deferred"}, "a bounced, an accepted, a suppressed and a deferred message must each publish their own type; the types on the topic")
 }
 
 func CheckHashedPayload(ctx *harness.Ctx) {
 	serveEventsRelay(ctx)
-	dispatchTo(ctx, "Ana@Example.com", "t-1")
+	dispatchTo(ctx, "Ana@Lindqvist.example", "t-1")
 	record := ctx.Kafka.Records(topicName)[0]
 	text := string(record.Value)
-	ctx.Assert(!strings.Contains(strings.ToLower(text), "ana@example.com"), "the event carries the address: %s. The topic is retained and every consumer reads it; carry recipient_hash", text)
+	ctx.Assert(!strings.Contains(strings.ToLower(text), "lindqvist"), "the event carries the address or its domain: %s. The topic is retained and every consumer reads it; carry recipient_hash alone", text)
 	p := payloadOf(ctx, record.Value)
-	ctx.Equal(p["recipient_hash"], address.RecipientHash("ana@example.com"), "recipient_hash must be the SHA-256 of the normalized address")
+	ctx.Equal(p["recipient_hash"], address.RecipientHash("ana@lindqvist.example"), "recipient_hash must be the SHA-256 of the normalized address")
 	ctx.Assert(p["message_id"] != nil && p["tenant"] == "t-1", "the event must carry message_id and tenant, got %s", text)
 }
 
@@ -904,7 +923,8 @@ namespace {
 
 const std::string kTopic = "email.event";
 
-// Accepts every recipient but bounce@ (a hard bounce), noting how many events were on the topic at each call.
+// Accepts every recipient but bounce@ (a hard bounce), blocked@ (on its own list) and full@ (a soft
+// bounce every time), noting how many events were on the topic at each call.
 class EventsRelay final : public smtprelay::Relay::Service {
  public:
   harness::Ctx* ctx = nullptr;
@@ -915,6 +935,11 @@ class EventsRelay final : public smtprelay::Relay::Service {
     if (req->recipient().rfind("bounce@", 0) == 0) {
       out->set_outcome("hard_bounce");
       out->set_bounce_category("mailbox_unknown");
+    } else if (req->recipient().rfind("blocked@", 0) == 0) {
+      out->set_outcome("suppressed");
+    } else if (req->recipient().rfind("full@", 0) == 0) {
+      out->set_outcome("soft_bounce");
+      out->set_bounce_category("mailbox_full");
     } else {
       out->set_outcome("accepted");
     }
@@ -979,18 +1004,21 @@ void CheckOutcomeAfterRelay(harness::Ctx& ctx) {
   ctx.Equal(typesOn(ctx), std::vector<std::string>{"email.bounced"}, "a message the relay hard-bounced must produce one email.bounced; the types");
   ctx.Equal(payloadOf(ctx, ctx.Kafka.Records(kTopic)[0]).value("bounce_category", ""), "mailbox_unknown", "the bounce event's bounce_category");
   dispatchTo(ctx, "ana@example.com", "t-1");
-  ctx.Equal(typesOn(ctx), std::vector<std::string>{"email.bounced", "email.accepted"}, "after an accepted message, the types on the topic");
+  dispatchTo(ctx, "blocked@example.com", "t-1");
+  dispatchTo(ctx, "full@example.com", "t-1");
+  ctx.Equal(typesOn(ctx), std::vector<std::string>{"email.bounced", "email.accepted", "email.suppressed", "email.deferred"},
+            "a bounced, an accepted, a suppressed and a deferred message must each publish their own type; the types on the topic");
 }
 
 void CheckHashedPayload(harness::Ctx& ctx) {
   serveEventsRelay(ctx);
-  dispatchTo(ctx, "Ana@Example.com", "t-1");
+  dispatchTo(ctx, "Ana@Lindqvist.example", "t-1");
   const auto record = ctx.Kafka.Records(kTopic)[0];
   std::string lower = record.Value.value_or("");
   std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  ctx.Assert(lower.find("ana@example.com") == std::string::npos, "the event carries the address: %s. The topic is retained and every consumer reads it; carry recipient_hash", record.Value.value_or(""));
+  ctx.Assert(lower.find("lindqvist") == std::string::npos, "the event carries the address or its domain: %s. The topic is retained and every consumer reads it; carry recipient_hash alone", record.Value.value_or(""));
   const auto p = payloadOf(ctx, record);
-  ctx.Equal(p.value("recipient_hash", ""), mail::address::recipientHash("ana@example.com"), "recipient_hash must be the SHA-256 of the normalized address");
+  ctx.Equal(p.value("recipient_hash", ""), mail::address::recipientHash("ana@lindqvist.example"), "recipient_hash must be the SHA-256 of the normalized address");
   ctx.Assert(!p.value("message_id", "").empty() && p.value("tenant", "") == "t-1", "the event must carry message_id and tenant, got %s", p.dump());
 }
 

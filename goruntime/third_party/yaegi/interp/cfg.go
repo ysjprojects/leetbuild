@@ -2,7 +2,10 @@ package interp
 
 import (
 	"fmt"
+	"go/ast"
 	"go/constant"
+	"go/printer"
+	"go/token"
 	"log"
 	"math"
 	"path"
@@ -728,6 +731,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				return
 			}
 
+			// LeetBuild: each call on the right yields exactly one value, as Go checks.
+			if n.nright > 0 {
+				for _, src := range n.child[sbase:] {
+					if err = singleValue(n, src, sc); err != nil {
+						return
+					}
+				}
+			}
+
 			wireChild(n)
 			for i := 0; i < n.nleft; i++ {
 				dest, src := n.child[i], n.child[sbase+i]
@@ -917,7 +929,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					l--
 				}
 				if r := lc.child[0].typ.numOut(); r != l {
-					err = n.cfgErrorf("assignment mismatch: %d variables but %s returns %d values", l, lc.child[0].name(), r)
+					err = resultsMismatch(lc, l, r)
 				}
 				if isBinCall(lc, sc) {
 					n.gen = nop
@@ -1654,6 +1666,11 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			cond.tnext = body.start
 			setFNext(cond, n)
 			body.tnext = post.start
+			if init.kind == defineStmt && len(init.child) >= 2 && init.child[0].kind == identExpr {
+				// LeetBuild: the body's per-iteration copy of the loop variable (loopVarFor)
+				// carries its value into post and cond, so `i++` or `i = n` in the body counts.
+				body.gen = loopVarForEnd
+			}
 			sc = sc.pop()
 
 		case forRangeStmt:
@@ -2212,15 +2229,23 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					c.fnext = n
 				} else {
 					body := c.lastChild()
-					if len(c.child) > 1 {
-						cond := c.child[0]
+					// LeetBuild: `case a, b:` tests each condition in order; the first true one
+					// enters the body, and when all are false the next clause is tried.
+					conds := c.child[:len(c.child)-1]
+					for j := len(conds) - 1; j >= 0; j-- {
+						cond := conds[j]
 						cond.tnext = body.start
-						if i == l-1 {
+						switch {
+						case j < len(conds)-1:
+							setFNext(cond, conds[j+1].start)
+						case i == l-1:
 							setFNext(cond, n)
-						} else {
+						default:
 							setFNext(cond, clauses[i+1].start)
 						}
-						c.start = cond.start
+					}
+					if len(conds) > 0 {
+						c.start = conds[0].start
 					} else {
 						c.start = body.start
 					}
@@ -2404,7 +2429,7 @@ func compDefineX(sc *scope, n *node) error {
 			l--
 		}
 		if len(types) != l {
-			return n.cfgErrorf("assignment mismatch: %d variables but %s returns %d values", l, src.child[0].name(), len(types))
+			return resultsMismatch(src, l, len(types))
 		}
 		if isBinCall(src, sc) {
 			n.gen = nop
@@ -2942,6 +2967,93 @@ func jumpsOut(n *node) bool {
 
 func isCall(n *node) bool {
 	return n.action == aCall || n.action == aCallSlice
+}
+
+// callResults is the result types of the call n, and false when n is not a call of a function
+// (a conversion, a builtin) or its function type is not known as such. LeetBuild.
+func callResults(n *node, sc *scope) ([]*itype, bool) {
+	if n.kind != callExpr || len(n.child) == 0 || n.child[0].isType(sc) {
+		return nil, false
+	}
+	t := n.child[0].typ
+	for t != nil && t.cat == valueT && t.val != nil {
+		t = t.val // a function wrapped as a value keeps its interpreter type in val
+	}
+	switch {
+	case t == nil:
+	case t.cat == funcT:
+		return t.ret, true
+	case t.cat == valueT && t.rtype != nil && t.rtype.Kind() == reflect.Func:
+		ret := make([]*itype, t.rtype.NumOut())
+		for i := range ret {
+			ret[i] = valueTOf(t.rtype.Out(i))
+		}
+		return ret, true
+	}
+	return nil, false
+}
+
+// singleValue checks that src, a source of assignment or definition n, is not a call of a function
+// returning other than one value, with Go's (types2) messages at the call. LeetBuild.
+func singleValue(n, src *node, sc *scope) error {
+	ret, ok := callResults(src, sc)
+	if !ok || len(ret) == 1 {
+		return nil
+	}
+	if len(ret) == 0 {
+		return src.cfgErrorf("%s (no value) used as value", src.callString())
+	}
+	if n.nleft == 1 && n.nright == 1 && (n.kind == defineStmt || n.action == aAssign) && n.anc.kind != varDecl {
+		return resultsMismatch(src, 1, len(ret))
+	}
+	types := make([]string, len(ret))
+	for i, t := range ret {
+		types[i] = t.str
+		if types[i] == "" {
+			types[i] = t.TypeOf().String()
+		}
+	}
+	return src.cfgErrorf("multiple-value %s (value of type (%s)) in single-value context", src.callString(), strings.Join(types, ", "))
+}
+
+// resultsMismatch is Go's error for vars variables assigned from call, which returns results values.
+// LeetBuild.
+func resultsMismatch(call *node, vars, results int) error {
+	if results == 0 {
+		return call.cfgErrorf("%s (no value) used as value", call.callString())
+	}
+	return call.cfgErrorf("assignment mismatch: %s but %s returns %s", plural(vars, "variable"), call.funString(), plural(results, "value"))
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
+// callString is the call's source, as Go's messages quote it. LeetBuild.
+func (n *node) callString() string {
+	if n.call == nil {
+		return n.funString() + "()"
+	}
+	return exprString(n.call)
+}
+
+// funString is the called function's source (two, strconv.Atoi, s.Get). LeetBuild.
+func (n *node) funString() string {
+	if n.call == nil {
+		return n.child[0].name()
+	}
+	return exprString(n.call.Fun)
+}
+
+func exprString(e ast.Expr) string {
+	var b strings.Builder
+	if err := printer.Fprint(&b, token.NewFileSet(), e); err != nil {
+		return "the call"
+	}
+	return b.String()
 }
 
 // returnsInPlace reports whether call n, an operand of a return statement, can store its results

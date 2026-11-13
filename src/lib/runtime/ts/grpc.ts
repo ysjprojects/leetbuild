@@ -808,17 +808,23 @@ function invoke(
   } catch (e) {
     const err = translate(e);
     client._attach(new ServerCall(null, metadata, timeout, {push: () => undefined, end: () => undefined}), null, null);
-    queueMicrotask(() => finish(err));
+    // The status comes back over the connection: a later macrotask, as any reply.
+    CLOCK.deliver(() => finish(err));
     return client;
   }
   const {call, installed, latency} = begun;
   const wireIn = (m: unknown): unknown => roundtrip(types, method.requestType, pkg, m);
   const wireOut = (m: unknown): unknown => roundtrip(types, method.responseType, pkg, m);
+  // What the server writes reaches the client on a later macrotask, in order, as frames read off a
+  // socket do: work the caller never awaited is still in flight when the code that moved on finishes.
   const serverCall = new ServerCall(requestStream ? undefined : wireIn(request), metadata.clone(), timeout, {
-    push: m => client._push(wireOut(m)),
+    push: m => {
+      const out = wireOut(m);
+      CLOCK.deliver(() => client._push(out));
+    },
     end: error => {
       call.code = error?.code ?? status.OK;
-      finish(error);
+      CLOCK.deliver(() => finish(error));
     },
   });
   // Request-stream events written before the handler runs (latency, or a quick writer) wait for it.
@@ -861,10 +867,11 @@ function invoke(
     for (const fn of pendingRequests.splice(0)) fn();
   };
   // Latency elapses on the virtual clock while the caller waits: an awaited call pays for it, a
-  // fire-and-forget one does not. A deadline shorter than the latency fails without reaching the handler.
+  // fire-and-forget one does not. A deadline shorter than the latency fails without reaching the
+  // handler. Without latency the request still crosses the connection: the handler starts on a later macrotask.
   if (timeout === null || latency <= timeout) {
     if (latency > 0) void CLOCK.sleep(latency * 1000).then(start);
-    else queueMicrotask(start);
+    else CLOCK.deliver(start);
   }
   // grpc-js's deadline timer: a call still unfinished when the deadline passes (a slow handler, a
   // stream mid-way) is cancelled on the server and fails DEADLINE_EXCEEDED for the caller. A call

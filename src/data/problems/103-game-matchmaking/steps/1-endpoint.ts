@@ -17,16 +17,20 @@ skill, bucket and participants. It serves the demo and hides 4 flaws.
 
 **Failure mode the checks target.** The starter queues whatever arrives: a ticket nobody owns, a
 party of six, a rating of -50 in a bucket where nobody else waits, and a second ticket for a player
-who is already waiting, which is how one player ends up in two games.
+who is already waiting or is being queued by another request at the same moment, which is how one
+player ends up in two games.
 
 - A missing or empty \`X-Player-Id\` is **401**.
 - \`party\` holds at most \`MAX_PARTY_SIZE\` (5) members; more, or a player listed twice (the owner
   included), is **400**.
-- \`skill\` is clamped to \`SKILL_MIN\`..\`SKILL_MAX\` (0..4000) before the bucket is derived.
+- \`skill\` is clamped to \`SKILL_MIN\`..\`SKILL_MAX\` (0..4000) before the bucket is derived; an
+  explicit 0 is a valid rating.
 - One open ticket per player: \`SET open:{player} <ticket_id> NX EX 900\` (\`store.open_key\`) for
   every participant before the enqueue. A player who already holds one makes the request **409**
-  with \`{"ticket_id": <the open ticket>}\`, and the pointers this request took are deleted again.
-- A refused request writes nothing.`,
+  with \`{"ticket_id": <the open ticket>}\`, and the pointers this request took, and only those, are
+  deleted again.
+- A refused request writes nothing. If \`store.enqueue\` fails after the pointers were taken, they are
+  deleted too and the request answers **503**, so the players can queue again at once.`,
   sequence: {
     participants: ['Game client', 'Matchmaking API', 'Redis'],
     messages: [
@@ -91,7 +95,7 @@ who is already waiting, which is how one player ends up in two games.
       id: 'skill-band',
       title: 'Clamps the rating to the supported band',
       detail:
-        '`skill` is clamped to `SKILL_MIN`..`SKILL_MAX` before the bucket is derived, so -50 waits in bucket 0 and 9000 in bucket 40.',
+        '`skill` is clamped to `SKILL_MIN`..`SKILL_MAX` before the bucket is derived, so -50 waits in bucket 0 and 9000 in bucket 40; a rating of exactly 0 is a rating, not a missing one.',
       match: {
         python: {all: [/SKILL_MIN\s*=\s*0\b/, /SKILL_MAX\s*=\s*4000\b/, /max\(|min\(/]},
         typescript: {all: [/SKILL_MIN\s*=\s*0\b/, /SKILL_MAX\s*=\s*4000\b/, /Math\.(max|min)\(/]},
@@ -104,7 +108,7 @@ who is already waiting, which is how one player ends up in two games.
       id: 'one-open-ticket',
       title: 'One open ticket per player: 409 with the original id',
       detail:
-        'Every participant takes `open:{player}` with `SET … NX EX` before the enqueue; a player who already holds one answers **409** with that ticket id, and the pointers the refused request took are deleted.',
+        'Every participant takes `open:{player}` with `SET … NX EX` before the enqueue, so two requests racing for one player leave one ticket and every pointer expires from the moment it is set; a player who already holds one answers **409** with that ticket id, and only the pointers the refused request took are deleted, never one another ticket holds. A failed enqueue deletes the pointers it took and answers **503**.',
       match: {
         python: {all: [/store\.open_key\(/, /nx\s*=\s*True/, /\b409\b/]},
         typescript: {all: [/openKey\(/, /['"]NX['"]/, /code\(\s*409\s*\)/]},
@@ -191,7 +195,13 @@ def create_ticket(body: TicketRequest, request: Request) -> JSONResponse:
             return JSONResponse({"error": f"{pid} already has an open ticket", "ticket_id": existing}, status_code=409)
         taken.append(pid)
 
-    ticket = store.enqueue(ticket_id, player, skill, participants)
+    try:
+        ticket = store.enqueue(ticket_id, player, skill, participants)
+    except redis.RedisError:
+        # The ticket never reached the pool: free the players this request held.
+        for pid in participants:
+            r.delete(store.open_key(pid))
+        return JSONResponse({"error": "the ticket could not be queued"}, status_code=503)
     return JSONResponse(
         {
             "ticket_id": ticket_id,
@@ -265,7 +275,12 @@ app.post('/v1/matchmaking/tickets', async (request, reply) => {
     taken.push(pid);
   }
 
-  const ticket = await enqueue(ticketId, player, skill, participants);
+  const ticket = await enqueue(ticketId, player, skill, participants).catch(() => null);
+  if (ticket === null) {
+    // The ticket never reached the pool: free the players this request held.
+    for (const pid of participants) await redis.del(openKey(pid));
+    return reply.code(503).send({error: 'the ticket could not be queued'});
+  }
   return reply.code(201).send({ticket_id: ticketId, player_id: player, skill: ticket.skill, bucket: ticket.bucket, participants});
 });
 `,
@@ -309,7 +324,7 @@ func createTicket(rw http.ResponseWriter, r *http.Request) {
 		skill = *body.Skill
 	}
 	participants := append([]string{player}, body.Party...)
-	ticket := store.Enqueue(r.Context(), store.NextTicketID(r.Context()), player, skill, participants)
+	ticket, _ := store.Enqueue(r.Context(), store.NextTicketID(r.Context()), player, skill, participants)
 	writeJSON(rw, http.StatusCreated, ticketResponse{TicketID: ticket.TicketID, PlayerID: player, Skill: ticket.Skill, Bucket: ticket.Bucket, Participants: participants})
 }
 
@@ -411,7 +426,15 @@ func createTicket(rw http.ResponseWriter, r *http.Request) {
 		taken = append(taken, pid)
 	}
 
-	ticket := store.Enqueue(ctx, ticketID, player, skill, participants)
+	ticket, err := store.Enqueue(ctx, ticketID, player, skill, participants)
+	if err != nil {
+		// The ticket never reached the pool: free the players this request held.
+		for _, pid := range participants {
+			rdb.Del(ctx, store.OpenKey(pid))
+		}
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{"error": "the ticket could not be queued"})
+		return
+	}
 	writeJSON(rw, http.StatusCreated, ticketResponse{TicketID: ticketID, PlayerID: player, Skill: ticket.Skill, Bucket: ticket.Bucket, Participants: participants})
 }
 
@@ -459,6 +482,7 @@ object Api {
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.exceptions.JedisException
 import redis.clients.jedis.params.SetParams
 import spray.json._
 
@@ -516,8 +540,15 @@ object Api {
               case Some((pid, existing)) =>
                 complete(json(StatusCodes.Conflict, JsObject("error" -> JsString(s"$pid already has an open ticket"), "ticket_id" -> JsString(existing))))
               case None =>
-                val ticket = Store.enqueue(ticketId, player, skill.max(SkillMin).min(SkillMax), participants)
-                complete(created(ticket, player, participants))
+                try {
+                  val ticket = Store.enqueue(ticketId, player, skill.max(SkillMin).min(SkillMax), participants)
+                  complete(created(ticket, player, participants))
+                } catch {
+                  case _: JedisException =>
+                    // The ticket never reached the pool: free the players this request held.
+                    participants.foreach(pid => jedis.del(Store.openKey(pid)))
+                    complete(error(StatusCodes.ServiceUnavailable, "the ticket could not be queued"))
+                }
             }
           }
         }
@@ -559,6 +590,7 @@ void register_routes(httplib::Server& svr) { svr.Post("/v1/matchmaking/tickets",
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -604,8 +636,15 @@ void create_ticket(const httplib::Request& req, httplib::Response& res) {
     taken.push_back(pid);
   }
 
-  const store::Ticket ticket = store::enqueue(ticket_id, player, skill, participants);
-  reply(res, 201, json{{"ticket_id", ticket_id}, {"player_id", player}, {"skill", ticket.skill}, {"bucket", ticket.bucket}, {"participants", participants}});
+  std::optional<store::Ticket> ticket;
+  try {
+    ticket = store::enqueue(ticket_id, player, skill, participants);
+  } catch (const sw::redis::Error&) {
+    // The ticket never reached the pool: free the players this request held.
+    for (const std::string& pid : participants) redis.del(store::openKey(pid));
+    return reply(res, 503, json{{"error", "the ticket could not be queued"}});
+  }
+  reply(res, 201, json{{"ticket_id", ticket_id}, {"player_id", player}, {"skill", ticket->skill}, {"bucket", ticket->bucket}, {"participants", participants}});
 }
 
 void register_routes(httplib::Server& svr) { svr.Post("/v1/matchmaking/tickets", create_ticket); }
@@ -671,9 +710,11 @@ async def check_skill_band(ctx):
     async with _api(ctx) as c:
         low = await _queue(c, "p1", -50)
         high = await _queue(c, "p2", 9000)
+        zero = await _queue(c, "p3", 0)
     assert low.status_code == 201 and high.status_code == 201, f"out-of-band ratings are clamped, not refused: {low.status_code} {high.status_code}"
     assert low.json().get("skill") == 0 and low.json().get("bucket") == 0, f"a rating of -50 must be clamped to 0 in bucket 0, the response is {low.json()}"
     assert high.json().get("skill") == 4000 and high.json().get("bucket") == 40, f"a rating of 9000 must be clamped to 4000 in bucket 40, the response is {high.json()}"
+    assert zero.status_code == 201 and zero.json().get("skill") == 0 and zero.json().get("bucket") == 0, f"a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is {zero.status_code} {zero.text}"
     stray = sorted(k for k in ctx.redis.keys("pool:*") if k not in ("pool:0", "pool:40", "pool:depth"))
     assert not stray, f"tickets wait in {stray}, buckets no opponent rating reaches"
 
@@ -692,9 +733,42 @@ async def check_one_open_ticket(ctx):
         assert alone.status_code == 201, f"p9 alone answered {alone.status_code} {alone.text}: the refused party request left open:p9 behind"
         party = await _queue(c, "p5", 1500, ["p6"])
         later = await _queue(c, "p6", 1500)
+        own = await _queue(c, "p7", 1500)
+        # p8's party names p1, who waits on the original ticket, and p7, who waits on a ticket of their own.
+        refused = await _queue(c, "p8", 1500, ["p1", "p7"])
+        # Another API replica takes open:r1 for its own request right after this request's first command on it.
+        rival = ctx.redis_after("open:r1", lambda: (bool(ctx.redis.set("open:r1", "t-rival", nx=True, ex=900)), ctx.redis.ttl("open:r1")))
+        raced = await _queue(c, "r1", 1500)
+        # pool:25 is not a sorted set, so the enqueue fails after the pointers were taken.
+        ctx.redis.set("pool:25", "not-a-pool")
+        try:
+            failed_status = (await _queue(c, "q1", 2500, ["q2"])).status_code
+        except Exception as exc:  # the handler let the Redis error escape: a 500
+            failed_status = f"500 ({exc!r})"
+        held = {k: ctx.redis.get(k) for k in ("open:q1", "open:q2") if ctx.redis.exists(k)}
+        ctx.redis.delete("pool:25")
+        retry = await _queue(c, "q1", 2500, ["q2"])
     assert later.status_code == 409 and later.json().get("ticket_id") == party.json()["ticket_id"], f"p6 is queued in p5's party, yet a ticket of p6's own answered {later.status_code} {later.text}"
     assert 0 < ctx.redis.ttl("open:p1") <= 900, f"open:p1 has TTL {ctx.redis.ttl('open:p1')}: the pointer must expire with the ticket (EX 900)"
-    assert sorted(_queued(ctx)) == sorted([original, alone.json()["ticket_id"], party.json()["ticket_id"]]), f"the pool holds {_queued(ctx)}"
+    assert own.status_code == 201, f"p7 alone answered {own.status_code} {own.text}"
+    assert refused.status_code == 409 and refused.json().get("ticket_id") == original, f"p8's party with p1, who waits on {original}, answered {refused.status_code} {refused.text}, expected 409 with {original}"
+    assert ctx.redis.get("open:p7") == own.json()["ticket_id"] and ctx.redis.get("open:p1") == original, f"after the refused request for p8's party open:p1 is {ctx.redis.get('open:p1')} and open:p7 is {ctx.redis.get('open:p7')}, expected {original} and {own.json()['ticket_id']}: a refused request deleted pointers it never took, so those players can queue a second ticket"
+    assert ctx.redis.get("open:p8") is None, f"the refused request left open:p8 = {ctx.redis.get('open:p8')} behind"
+    assert rival.fired, "the request for r1 never touched open:r1"
+    if rival.error is not None:
+        raise rival.error
+    rival_won, ttl_then = rival.result
+    if rival_won:
+        assert raced.status_code == 409 and raced.json().get("ticket_id") == "t-rival", f"another request took open:r1 between this request's first command on it and its write, yet this one answered {raced.status_code} {raced.text}, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command"
+        mine = []
+    else:
+        assert raced.status_code == 201, f"r1's request took open:r1 first, yet it answered {raced.status_code} {raced.text}"
+        assert 0 < ttl_then <= 900, f"right after r1's request took open:r1 its TTL was {ttl_then}: a crash before the expiry is set leaves r1 unable to queue again. Set the pointer and its expiry in one command"
+        mine = [raced.json()["ticket_id"]]
+    assert failed_status != 201, "the enqueue into pool:25 failed, yet the request answered 201"
+    assert not held, f"the enqueue failed and the request answered {failed_status}, yet it left {held} behind: q1 and q2 cannot queue again until the pointers expire. Delete the pointers the request took when the enqueue fails"
+    assert retry.status_code == 201, f"q1 queued again once the pool was back, and the request answered {retry.status_code} {retry.text}"
+    assert sorted(_queued(ctx)) == sorted([original, alone.json()["ticket_id"], party.json()["ticket_id"], own.json()["ticket_id"], *mine, retry.json()["ticket_id"]]), f"the pool holds {_queued(ctx)}"
 `,
     typescript: `function api(ctx) {
   return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/matchmaking/store.ts')};
@@ -746,9 +820,11 @@ export async function check_skill_band(ctx) {
   const {c} = api(ctx);
   const low = await queue(c, 'p1', -50);
   const high = await queue(c, 'p2', 9000);
+  const zero = await queue(c, 'p3', 0);
   assert(low.status === 201 && high.status === 201, \`out-of-band ratings are clamped, not refused: \${low.status} \${high.status}\`);
   assert(low.json().skill === 0 && low.json().bucket === 0, \`a rating of -50 must be clamped to 0 in bucket 0, the response is \${low.text}\`);
   assert(high.json().skill === 4000 && high.json().bucket === 40, \`a rating of 9000 must be clamped to 4000 in bucket 40, the response is \${high.text}\`);
+  assert(zero.status === 201 && zero.json().skill === 0 && zero.json().bucket === 0, \`a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is \${zero.status} \${zero.text}\`);
   const stray = (ctx.redis.keys('pool:*') as string[]).filter(k => !['pool:0', 'pool:40', 'pool:depth'].includes(k));
   assert.deepStrictEqual(stray, [], \`tickets wait in \${JSON.stringify(stray)}, buckets no opponent rating reaches\`);
 }
@@ -770,7 +846,37 @@ export async function check_one_open_ticket(ctx) {
   assert(later.status === 409 && later.json().ticket_id === party.json().ticket_id, \`p6 is queued in p5's party, yet a ticket of p6's own answered \${later.status} \${later.text}\`);
   const ttl = ctx.redis.ttl('open:p1');
   assert(ttl > 0 && ttl <= 900, \`open:p1 has TTL \${ttl}: the pointer must expire with the ticket (EX 900)\`);
-  assert.deepStrictEqual(queued(ctx), [original, alone.json().ticket_id, party.json().ticket_id].sort(), \`the pool holds \${JSON.stringify(queued(ctx))}\`);
+  const own = await queue(c, 'p7', 1500);
+  assert.equal(own.status, 201, \`p7 alone answered \${own.status} \${own.text}\`);
+  // p8's party names p1, who waits on the original ticket, and p7, who waits on a ticket of their own.
+  const refused = await queue(c, 'p8', 1500, ['p1', 'p7']);
+  assert(refused.status === 409 && refused.json().ticket_id === original, \`p8's party with p1, who waits on \${original}, answered \${refused.status} \${refused.text}, expected 409 with \${original}\`);
+  assert(ctx.redis.get('open:p7') === own.json().ticket_id && ctx.redis.get('open:p1') === original, \`after the refused request for p8's party open:p1 is \${ctx.redis.get('open:p1')} and open:p7 is \${ctx.redis.get('open:p7')}, expected \${original} and \${own.json().ticket_id}: a refused request deleted pointers it never took, so those players can queue a second ticket\`);
+  assert.equal(ctx.redis.get('open:p8'), null, \`the refused request left open:p8 = \${ctx.redis.get('open:p8')} behind\`);
+  // Another API replica takes open:r1 for its own request right after this request's first command on it.
+  const rival = ctx.redisAfter('open:r1', () => [ctx.redis.set('open:r1', 't-rival', 'EX', 900, 'NX') !== null, ctx.redis.ttl('open:r1')]);
+  const raced = await queue(c, 'r1', 1500);
+  assert(rival.fired, 'the request for r1 never touched open:r1');
+  if (rival.error !== undefined) throw rival.error;
+  const [rivalWon, ttlThen] = rival.result as [boolean, number];
+  const mine: string[] = [];
+  if (rivalWon) {
+    assert(raced.status === 409 && raced.json().ticket_id === 't-rival', \`another request took open:r1 between this request's first command on it and its write, yet this one answered \${raced.status} \${raced.text}, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command\`);
+  } else {
+    assert.equal(raced.status, 201, \`r1's request took open:r1 first, yet it answered \${raced.status} \${raced.text}\`);
+    assert(ttlThen > 0 && ttlThen <= 900, \`right after r1's request took open:r1 its TTL was \${ttlThen}: a crash before the expiry is set leaves r1 unable to queue again. Set the pointer and its expiry in one command\`);
+    mine.push(raced.json().ticket_id);
+  }
+  // pool:25 is not a sorted set, so the enqueue fails after the pointers were taken.
+  ctx.redis.set('pool:25', 'not-a-pool');
+  const failed = await queue(c, 'q1', 2500, ['q2']);
+  const held = ['open:q1', 'open:q2'].filter(k => ctx.redis.exists(k));
+  ctx.redis.del('pool:25');
+  assert.notEqual(failed.status, 201, 'the enqueue into pool:25 failed, yet the request answered 201');
+  assert.deepStrictEqual(held, [], \`the enqueue failed and the request answered \${failed.status}, yet it left \${JSON.stringify(held)} behind: q1 and q2 cannot queue again until the pointers expire. Delete the pointers the request took when the enqueue fails\`);
+  const retry = await queue(c, 'q1', 2500, ['q2']);
+  assert.equal(retry.status, 201, \`q1 queued again once the pool was back, and the request answered \${retry.status} \${retry.text}\`);
+  assert.deepStrictEqual(queued(ctx), [original, alone.json().ticket_id, party.json().ticket_id, own.json().ticket_id, ...mine, retry.json().ticket_id].sort(), \`the pool holds \${JSON.stringify(queued(ctx))}\`);
 }
 `,
     go: `package main
@@ -868,10 +974,12 @@ func CheckSkillBand(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	low := queue(c, "p1", -50, nil)
 	high := queue(c, "p2", 9000, nil)
+	zero := queue(c, "p3", 0, nil)
 	ctx.Assert(low.Status == 201 && high.Status == 201, "out-of-band ratings are clamped, not refused: %d %d", low.Status, high.Status)
-	l, h := decodeTicket(low), decodeTicket(high)
+	l, h, z := decodeTicket(low), decodeTicket(high), decodeTicket(zero)
 	ctx.Assert(l.Skill == 0 && l.Bucket == 0, "a rating of -50 must be clamped to 0 in bucket 0, the response is %s", low.Text())
 	ctx.Assert(h.Skill == 4000 && h.Bucket == 40, "a rating of 9000 must be clamped to 4000 in bucket 40, the response is %s", high.Text())
+	ctx.Assert(zero.Status == 201 && z.Skill == 0 && z.Bucket == 0, "a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is %d %s", zero.Status, zero.Text())
 	stray := []string{}
 	for _, k := range ctx.Redis.Keys("pool:*") {
 		if k != "pool:0" && k != "pool:40" && k != "pool:depth" {
@@ -898,7 +1006,50 @@ func CheckOneOpenTicket(ctx *harness.Ctx) {
 	ctx.Assert(later.Status == 409 && decodeTicket(later).TicketID == decodeTicket(party).TicketID, "p6 is queued in p5's party, yet a ticket of p6's own answered %d %s", later.Status, later.Text())
 	ttl := ctx.Redis.TTL("open:p1")
 	ctx.Assert(ttl > 0 && ttl <= 900, "open:p1 has TTL %d: the pointer must expire with the ticket (EX 900)", ttl)
-	want := []string{original, decodeTicket(alone).TicketID, decodeTicket(party).TicketID}
+	own := queue(c, "p7", 1500, nil)
+	ctx.Equal(own.Status, 201, "p7 alone (%s)", own.Text())
+	ownID := decodeTicket(own).TicketID
+	// p8's party names p1, who waits on the original ticket, and p7, who waits on a ticket of their own.
+	refused := queue(c, "p8", 1500, []string{"p1", "p7"})
+	ctx.Assert(refused.Status == 409 && decodeTicket(refused).TicketID == original, "p8's party with p1, who waits on %s, answered %d %s, expected 409 with %s", original, refused.Status, refused.Text(), original)
+	p1Open, _ := ctx.Redis.Get("open:p1")
+	p7Open, _ := ctx.Redis.Get("open:p7")
+	ctx.Assert(p1Open == original && p7Open == ownID, "after the refused request for p8's party open:p1 is %q and open:p7 is %q, expected %q and %q: a refused request deleted pointers it never took, so those players can queue a second ticket", p1Open, p7Open, original, ownID)
+	p8Open, p8Held := ctx.Redis.Get("open:p8")
+	ctx.Assert(!p8Held, "the refused request left open:p8 = %q behind", p8Open)
+	// Another API replica takes open:r1 for its own request right after this request's first command on it.
+	rival := ctx.Redis.After("open:r1", func() any {
+		return []any{ctx.Redis.Set("open:r1", "t-rival", "EX", 900, "NX"), ctx.Redis.TTL("open:r1")}
+	})
+	raced := queue(c, "r1", 1500, nil)
+	ctx.Assert(rival.Fired, "the request for r1 never touched open:r1")
+	ctx.Assert(rival.Err == nil, "the rival request failed: %v", rival.Err)
+	got, _ := rival.Result.([]any)
+	rivalWon, _ := got[0].(bool)
+	ttlThen, _ := got[1].(int64)
+	want := []string{original, decodeTicket(alone).TicketID, decodeTicket(party).TicketID, ownID}
+	if rivalWon {
+		ctx.Assert(raced.Status == 409 && decodeTicket(raced).TicketID == "t-rival", "another request took open:r1 between this request's first command on it and its write, yet this one answered %d %s, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command", raced.Status, raced.Text())
+	} else {
+		ctx.Equal(raced.Status, 201, "r1's request took open:r1 first; its answer (%s)", raced.Text())
+		ctx.Assert(ttlThen > 0 && ttlThen <= 900, "right after r1's request took open:r1 its TTL was %d: a crash before the expiry is set leaves r1 unable to queue again. Set the pointer and its expiry in one command", ttlThen)
+		want = append(want, decodeTicket(raced).TicketID)
+	}
+	// pool:25 is not a sorted set, so the enqueue fails after the pointers were taken.
+	ctx.Redis.Set("pool:25", "not-a-pool")
+	failed := queue(c, "q1", 2500, []string{"q2"})
+	held := []string{}
+	for _, k := range []string{"open:q1", "open:q2"} {
+		if ctx.Redis.Exists(k) == 1 {
+			held = append(held, k)
+		}
+	}
+	ctx.Redis.Del("pool:25")
+	ctx.Assert(failed.Status != 201, "the enqueue into pool:25 failed, yet the request answered 201")
+	ctx.Assert(len(held) == 0, "the enqueue failed and the request answered %d, yet it left %v behind: q1 and q2 cannot queue again until the pointers expire. Delete the pointers the request took when the enqueue fails", failed.Status, held)
+	retry := queue(c, "q1", 2500, []string{"q2"})
+	ctx.Equal(retry.Status, 201, "q1 queued again once the pool was back; the answer (%s)", retry.Text())
+	want = append(want, decodeTicket(retry).TicketID)
 	sort.Strings(want)
 	ctx.Equal(queued(ctx), want, "the pool")
 }
@@ -908,6 +1059,7 @@ func CheckOneOpenTicket(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -994,9 +1146,11 @@ void CheckSkillBand(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
   const auto low = queue(c, "p1", -50);
   const auto high = queue(c, "p2", 9000);
+  const auto zero = queue(c, "p3", 0);
   ctx.Assert(low.Status == 201 && high.Status == 201, "out-of-band ratings are clamped, not refused: %d %d", low.Status, high.Status);
   ctx.Assert(numberOf(low, "skill") == 0 && numberOf(low, "bucket") == 0, "a rating of -50 must be clamped to 0 in bucket 0, the response is %s", low.Text());
   ctx.Assert(numberOf(high, "skill") == 4000 && numberOf(high, "bucket") == 40, "a rating of 9000 must be clamped to 4000 in bucket 40, the response is %s", high.Text());
+  ctx.Assert(zero.Status == 201 && numberOf(zero, "skill") == 0 && numberOf(zero, "bucket") == 0, "a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is %d %s", zero.Status, zero.Text());
   std::vector<std::string> stray;
   for (const auto& k : ctx.Redis.Keys("pool:*")) {
     if (k != "pool:0" && k != "pool:40" && k != "pool:depth") stray.push_back(k);
@@ -1021,7 +1175,54 @@ void CheckOneOpenTicket(harness::Ctx& ctx) {
   ctx.Assert(later.Status == 409 && ticketIdOf(later) == ticketIdOf(party), "p6 is queued in p5's party, yet a ticket of p6's own answered %d %s", later.Status, later.Text());
   const long long ttl = ctx.Redis.TTL("open:p1");
   ctx.Assert(ttl > 0 && ttl <= 900, "open:p1 has TTL %d: the pointer must expire with the ticket (EX 900)", ttl);
-  std::vector<std::string> want = {original, ticketIdOf(alone), ticketIdOf(party)};
+  const auto own = queue(c, "p7", 1500);
+  ctx.Equal(own.Status, 201, "p7 alone (%s)", own.Text());
+  const std::string own_id = ticketIdOf(own);
+  // p8's party names p1, who waits on the original ticket, and p7, who waits on a ticket of their own.
+  const auto refused = queue(c, "p8", 1500, {"p1", "p7"});
+  ctx.Assert(refused.Status == 409 && ticketIdOf(refused) == original, "p8's party with p1, who waits on %s, answered %d %s, expected 409 with %s", original, refused.Status, refused.Text(), original);
+  const std::string p1_open = ctx.Redis.Get("open:p1").value_or("");
+  const std::string p7_open = ctx.Redis.Get("open:p7").value_or("");
+  ctx.Assert(p1_open == original && p7_open == own_id, "after the refused request for p8's party open:p1 is %s and open:p7 is %s, expected %s and %s: a refused request deleted pointers it never took, so those players can queue a second ticket", p1_open, p7_open, original, own_id);
+  ctx.Assert(!ctx.Redis.Get("open:p8").has_value(), "the refused request left open:p8 = %s behind", ctx.Redis.Get("open:p8").value_or(""));
+  // Another API replica takes open:r1 for its own request right after this request's first command on it.
+  auto fired = std::make_shared<bool>(false);
+  auto rival_won = std::make_shared<bool>(false);
+  auto ttl_then = std::make_shared<long long>(0);
+  auto failed = std::make_shared<std::string>();
+  ctx.Redis.After("open:r1", [&ctx, fired, rival_won, ttl_then, failed] {
+    *fired = true;
+    try {
+      *rival_won = ctx.Redis.Set("open:r1", "t-rival", "EX", "900", "NX");
+      *ttl_then = ctx.Redis.TTL("open:r1");
+    } catch (const std::exception& e) {
+      *failed = e.what();
+    }
+  });
+  const auto raced = queue(c, "r1", 1500);
+  ctx.Assert(*fired, "the request for r1 never touched open:r1");
+  ctx.Assert(failed->empty(), "the rival request failed: %s", *failed);
+  std::vector<std::string> want = {original, ticketIdOf(alone), ticketIdOf(party), own_id};
+  if (*rival_won) {
+    ctx.Assert(raced.Status == 409 && ticketIdOf(raced) == "t-rival", "another request took open:r1 between this request's first command on it and its write, yet this one answered %d %s, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command", raced.Status, raced.Text());
+  } else {
+    ctx.Equal(raced.Status, 201, "r1's request took open:r1 first; its answer (%s)", raced.Text());
+    ctx.Assert(*ttl_then > 0 && *ttl_then <= 900, "right after r1's request took open:r1 its TTL was %d: a crash before the expiry is set leaves r1 unable to queue again. Set the pointer and its expiry in one command", *ttl_then);
+    want.push_back(ticketIdOf(raced));
+  }
+  // pool:25 is not a sorted set, so the enqueue fails after the pointers were taken.
+  ctx.Redis.Set("pool:25", "not-a-pool");
+  const auto refused_enqueue = queue(c, "q1", 2500, {"q2"});
+  std::vector<std::string> held;
+  for (const std::string k : {"open:q1", "open:q2"}) {
+    if (ctx.Redis.Exists(k) == 1) held.push_back(k);
+  }
+  ctx.Redis.Del("pool:25");
+  ctx.Assert(refused_enqueue.Status != 201, "the enqueue into pool:25 failed, yet the request answered 201");
+  ctx.Assert(held.empty(), "the enqueue failed and the request answered %d, yet it left %q behind: q1 and q2 cannot queue again until the pointers expire. Delete the pointers the request took when the enqueue fails", refused_enqueue.Status, held);
+  const auto retry = queue(c, "q1", 2500, {"q2"});
+  ctx.Equal(retry.Status, 201, "q1 queued again once the pool was back; the answer (%s)", retry.Text());
+  want.push_back(ticketIdOf(retry));
   std::sort(want.begin(), want.end());
   ctx.Equal(queued(ctx), want, "the pool");
 }

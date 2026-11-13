@@ -465,6 +465,7 @@ std::optional<json> applyAndPublish(const std::string& doc_id, long long base_re
       solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
@@ -477,14 +478,25 @@ using json = nlohmann::json;
 const std::string kTopic = "sync.change";
 constexpr int kAckTimeoutMs = 2000;
 
-// The delivery report of the record in flight: applyAndPublish produces one record and waits for it.
-class DeliveryReport : public RdKafka::DeliveryReportCb {
- public:
+// One record's delivery report. Each produce passes its own as msg_opaque, so two requests publishing
+// at once never read each other's outcome; whichever thread's poll serves the report fills it in.
+struct Delivery {
   RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
-  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+  std::atomic<bool> done{false};
 };
 
-DeliveryReport delivery;
+class DeliveryReport : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override {
+    // The report owns the reference produce handed over: a request that stopped waiting has let go of its own.
+    std::unique_ptr<std::shared_ptr<Delivery>> report(static_cast<std::shared_ptr<Delivery>*>(message.msg_opaque()));
+    if (!report) return;
+    (*report)->error = message.err();
+    (*report)->done.store(true);
+  }
+};
+
+DeliveryReport reports;
 
 std::unique_ptr<RdKafka::Producer> makeProducer() {
   std::string err;
@@ -492,7 +504,7 @@ std::unique_ptr<RdKafka::Producer> makeProducer() {
   conf->set("bootstrap.servers", "kafka:9092", err);
   conf->set("acks", "all", err);                // every in-sync replica has the record before the broker answers
   conf->set("enable.idempotence", "true", err);  // a write retried after a lost acknowledgement lands once
-  conf->set("dr_cb", &delivery, err);
+  conf->set("dr_cb", &reports, err);
   return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
 }
 
@@ -507,12 +519,16 @@ std::optional<json> applyAndPublish(const std::string& doc_id, long long base_re
   // The revision and the hash identify the state; the body stays in the store.
   const json event = {{"doc_id", doc_id}, {"revision", outcome.revision}, {"content_hash", content_hash}, {"device", device}};
   const std::string value = event.dump();
-  delivery.error = RdKafka::ERR_NO_ERROR;
+  auto delivery = std::make_shared<Delivery>();
+  auto* report = new std::shared_ptr<Delivery>(delivery);  // released by dr_cb when the report arrives
   RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
-                                             value.size(), doc_id.c_str(), doc_id.size(), 0, nullptr);
-  if (err == RdKafka::ERR_NO_ERROR) {
-    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
-    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+                                             value.size(), doc_id.c_str(), doc_id.size(), 0, report);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    delete report;  // never enqueued, so no report will come
+  } else {
+    // Serve delivery reports until this record's arrives, or give up after the window.
+    for (int waited = 0; !delivery->done.load() && waited < kAckTimeoutMs; waited += 50) producer->poll(50);
+    err = delivery->done.load() ? delivery->error : RdKafka::ERR__TIMED_OUT;
   }
   if (err != RdKafka::ERR_NO_ERROR) {
     // The broker did not take it: the relay publishes the row later, so devices hear late, not never.
@@ -527,6 +543,7 @@ std::optional<json> applyAndPublish(const std::string& doc_id, long long base_re
     python: `import json
 
 from docsync import store
+from docsync.revisions import apply_change
 
 TOPIC = "sync.change"
 
@@ -553,6 +570,8 @@ def check_doc_key(ctx):
 
 def check_event_payload(ctx):
     m = ctx.load("events")
+    # Another device's note takes revision 1 first, so d-1's revision is not its base plus one.
+    apply_change("d-9", 0, store.content_hash("packing list"), "packing list", "phone")
     event = _publish(m, "d-1", 0, "salary review: draft", "laptop")
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one apply produced {len(records)} records"
@@ -574,6 +593,10 @@ def check_apply_before_produce(ctx):
     stale = _publish(m, "d-1", 0, "agenda: offsite", "phone")
     assert stale is None, f"an edit of a stale base is a conflict and must answer None, got {stale}"
     assert len(ctx.kafka.records(TOPIC)) == 1, f"a conflict produced an event: the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 1"
+    head = store.head("d-1")
+    echo = _publish(m, "d-1", head["revision"], "draft agenda", "phone")
+    assert echo is None, f"a push of the body d-1 already holds is unchanged and must answer None, got {echo}"
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"an unchanged body produced an event: the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 1. Every device would fetch a revision that is not new"
 
 
 def check_idempotent_producer(ctx):
@@ -600,14 +623,14 @@ def check_outbox(ctx):
     before = ctx.clock.time()
     _publish(m, "d-2", 0, "call the plumber")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"apply_and_publish waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"apply_and_publish waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S (2 s), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("key") == "d-2", f"no delivery report within the window and the outbox holds {rows}"
 `,
     typescript: `const TOPIC = 'sync.change';
 
 function events(ctx) {
-  return {m: ctx.load('events'), store: ctx.load('/support/docsync/store.ts')};
+  return {m: ctx.load('events'), store: ctx.load('/support/docsync/store.ts'), revisions: ctx.load('/support/docsync/revisions.ts')};
 }
 
 const publish = (m, store, docId: string, base: number, body: string, device = 'laptop') => m.applyAndPublish(docId, base, store.contentHash(body), body, device);
@@ -635,7 +658,9 @@ export async function check_doc_key(ctx) {
 }
 
 export async function check_event_payload(ctx) {
-  const {m, store} = events(ctx);
+  const {m, store, revisions} = events(ctx);
+  // Another device's note takes revision 1 first, so d-1's revision is not its base plus one.
+  await revisions.applyChange('d-9', 0, store.contentHash('packing list'), 'packing list', 'phone');
   const event = await publish(m, store, 'd-1', 0, 'salary review: draft', 'laptop');
   await settle();
   const values = ctx.kafka.values(TOPIC);
@@ -659,6 +684,11 @@ export async function check_apply_before_produce(ctx) {
   await settle();
   assert.equal(stale, null, \`an edit of a stale base is a conflict and must answer null, got \${JSON.stringify(stale)}\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 1, \`a conflict produced an event: the topic holds \${ctx.kafka.records(TOPIC).length} records, expected 1\`);
+  const head = await store.head('d-1');
+  const echo = await publish(m, store, 'd-1', head.revision, 'draft agenda', 'phone');
+  await settle();
+  assert.equal(echo, null, \`a push of the body d-1 already holds is unchanged and must answer null, got \${JSON.stringify(echo)}\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`an unchanged body produced an event: the topic holds \${ctx.kafka.records(TOPIC).length} records, expected 1. Every device would fetch a revision that is not new\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -687,7 +717,7 @@ export async function check_outbox(ctx) {
   const before = ctx.clock.now();
   await publish(m, store, 'd-2', 0, 'call the plumber');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`applyAndPublish waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`applyAndPublish waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS (2 s), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].key === 'd-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
 }
@@ -699,6 +729,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"docsync/revisions"
 	"docsync/store"
 
 	"leetbuild/harness"
@@ -749,6 +780,9 @@ func CheckDocKey(ctx *harness.Ctx) {
 }
 
 func CheckEventPayload(ctx *harness.Ctx) {
+	// Another device's note takes revision 1 first, so d-1's revision is not its base plus one.
+	_, err := revisions.ApplyChange(eventsBg, "d-9", 0, store.ContentHash("packing list"), "packing list", "phone")
+	ctx.NoError(err, "seeding d-9")
 	event := eventsPublish(ctx, "d-1", 0, "salary review: draft", "laptop")
 	ctx.Settle()
 	values := ctx.Kafka.Values(eventsTopic)
@@ -775,6 +809,11 @@ func CheckApplyBeforeProduce(ctx *harness.Ctx) {
 	ctx.Settle()
 	ctx.Assert(stale == nil, "an edit of a stale base is a conflict and must answer nil, got %v", stale)
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a conflict must not produce an event; the records")
+	head := store.Head(eventsBg, "d-1")
+	echo := eventsPublish(ctx, "d-1", head.Revision, "draft agenda", "phone")
+	ctx.Settle()
+	ctx.Assert(echo == nil, "a push of the body d-1 already holds is unchanged and must answer nil, got %v", echo)
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "an unchanged body must not produce an event (every device would fetch a revision that is not new); the records")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
@@ -801,7 +840,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	eventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "applyAndPublish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "applyAndPublish waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == "d-2", "no delivery report within the window and the outbox holds %+v", rows)
 }
@@ -814,6 +853,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 #include <string>
 #include <vector>
 
+#include "docsync/revisions.h"
 #include "docsync/store.h"
 
 namespace {
@@ -857,6 +897,8 @@ void CheckDocKey(harness::Ctx& ctx) {
 }
 
 void CheckEventPayload(harness::Ctx& ctx) {
+  // Another device's note takes revision 1 first, so d-1's revision is not its base plus one.
+  revisions::applyChange("d-9", 0, store::contentHash("packing list"), "packing list", "phone");
   const auto event = eventsPublish("d-1", 0, "salary review: draft", "laptop");
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
@@ -887,6 +929,11 @@ void CheckApplyBeforeProduce(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Assert(!stale, "an edit of a stale base is a conflict and must answer nothing, got %s", stale ? stale->dump() : "");
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{1}, "a conflict must not produce an event; the records");
+  const auto head = store::head("d-1");
+  const auto echo = eventsPublish("d-1", head->revision, "draft agenda", "phone");
+  ctx.Settle();
+  ctx.Assert(!echo, "a push of the body d-1 already holds is unchanged and must answer nothing, got %s", echo ? echo->dump() : "");
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{1}, "an unchanged body must not produce an event (every device would fetch a revision that is not new); the records");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
@@ -915,7 +962,7 @@ void CheckOutbox(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   eventsPublish("d-2", 0, "call the plumber");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "applyAndPublish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "applyAndPublish waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && eventsText(rows[1], "key") == "d-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
 }

@@ -73,7 +73,7 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
       id: 'publish-after-commit',
       title: 'Commits the booking before producing its event',
       detail:
-        'When the booking hash is written the topic is still empty: the event follows the commit. The starter produces first.',
+        'When the booking hash is written the topic is still empty: the event follows the commit. A commit Redis refuses produces no event and no outbox row. The starter produces first.',
       match: {
         python: {order: [/store\.put\(/, /producer\.produce\(/]},
         typescript: {order: [/await store\.put\(/, /producer\.send\(/]},
@@ -99,13 +99,13 @@ lost an acknowledgement, a leader that failed over, and a broker that does not a
       id: 'outbox-on-failure',
       title: 'Waits for the ack and falls back to the outbox',
       detail:
-        'A failed delivery, or no acknowledgement within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter fires and forgets.',
+        'A delivered event returns true and writes no outbox row. A failed delivery, or no acknowledgement within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
         go: {all: [/store\.InsertOutbox\(/, /time\.After\(|Flush\(/, /TopicPartition\.Error/]},
         scala: {all: [/Store\.insertOutbox\(/, /\.get\(\s*[^\n]*TimeUnit/, /Failure|catch/]},
-        cpp: {all: [/outbox::Insert\(/, /->flush\(/, /dr_cb/]},
+        cpp: {all: [/outbox::Insert\(/, /->(flush|poll)\(/, /dr_cb/]},
       },
     },
   ],
@@ -512,6 +512,8 @@ bool publishEvent(const booking::Booking& b, const std::string& event_type) {
       solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -522,11 +524,24 @@ using json = nlohmann::json;
 const std::string kTopic = "booking.event";
 constexpr int kAckTimeoutMs = 2000;
 
-// The delivery report of the record in flight: publishEvent produces one record and waits for it.
+// One record's delivery outcome. Its report may arrive on any thread that polls the producer, so
+// each record carries its own (as msg_opaque) and two requests publishing at once never share one.
+struct Outcome {
+  std::atomic<bool> done{false};
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+};
+
 class DeliveryReport : public RdKafka::DeliveryReportCb {
  public:
-  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
-  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+  void dr_cb(RdKafka::Message& message) override {
+    // The opaque is a heap copy of the record's shared_ptr: a report arriving after its publisher
+    // gave up still writes to a live Outcome, and frees the copy.
+    auto* outcome = static_cast<std::shared_ptr<Outcome>*>(message.msg_opaque());
+    if (outcome == nullptr) return;
+    (*outcome)->error = message.err();
+    (*outcome)->done.store(true, std::memory_order_release);
+    delete outcome;
+  }
 };
 
 DeliveryReport delivery;
@@ -558,13 +573,18 @@ bool publishEvent(const booking::Booking& b, const std::string& event_type) {
   booking::store::Put(b);
   const json payload = eventPayload(b, event_type);
   const std::string value = payload.dump();
-  delivery.error = RdKafka::ERR_NO_ERROR;
+  auto outcome = std::make_shared<Outcome>();
+  auto* opaque = new std::shared_ptr<Outcome>(outcome);
   RdKafka::ErrorCode err =
       producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
-                        value.size(), b.resource_id.c_str(), b.resource_id.size(), 0, nullptr);
-  if (err == RdKafka::ERR_NO_ERROR) {
-    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
-    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+                        value.size(), b.resource_id.c_str(), b.resource_id.size(), 0, opaque);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    delete opaque;  // never queued: no report will come for it
+  } else {
+    // Serve delivery reports until this record's arrives, or give up after the window.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(kAckTimeoutMs);
+    while (!outcome->done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) producer->poll(100);
+    err = outcome->done.load(std::memory_order_acquire) ? outcome->error : RdKafka::ERR__TIMED_OUT;
   }
   if (err != RdKafka::ERR_NO_ERROR) {
     // The broker did not take it: the relay publishes the row later, so the schedule is late, not wrong.
@@ -629,6 +649,15 @@ def check_publish_after_commit(ctx):
     assert probe.fired, "publish_event never committed the booking (no write to booking:b-1)"
     assert probe.result == 0, f"when the booking was committed the topic already held {probe.result} record(s): an event for a booking nobody can read yet is a phantom. Commit first, then produce"
     assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the commit"
+    # The store refuses the next commit (booking:b-2 holds a value of another type): no event may go out.
+    ctx.redis.set("booking:b-2", "not a booking")
+    records, rows = len(ctx.kafka.records(TOPIC)), len(_outbox(ctx))
+    try:
+        m.publish_event(_booking(2), "created")
+    except Exception:
+        pass  # the commit's error reaching the caller is fine
+    produced, queued = len(ctx.kafka.records(TOPIC)) - records, len(_outbox(ctx)) - rows
+    assert produced == 0 and queued == 0, f"a booking whose commit failed still produced an event ({produced} record(s), {queued} outbox row(s)): produce only once the commit has succeeded"
 
 
 def check_acks_idempotent(ctx):
@@ -643,6 +672,8 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_event(_booking(3), "created")
+    assert ok is True and _outbox(ctx) == [], f"a delivered event returned {ok!r} and left the outbox {_outbox(ctx)}, expected True and no row: only a failed or unacknowledged delivery goes to the outbox"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_event(_booking(1), "created")
     rows = _outbox(ctx)
@@ -654,7 +685,7 @@ def check_outbox_on_failure(ctx):
     before = ctx.clock.time()
     ok = m.publish_event(_booking(2), "created")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_event waited {waited:.0f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_event waited {waited:.1f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("booking_id") == "b-2", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish_event returned {ok!r} without an acknowledgement, expected False"
@@ -715,6 +746,15 @@ export async function check_publish_after_commit(ctx) {
   assert(probe.fired, 'publishEvent never committed the booking (no write to booking:b-1)');
   assert.equal(probe.result, 0, \`when the booking was committed the topic already held \${probe.result} record(s): an event for a booking nobody can read yet is a phantom. Commit first, then produce\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the commit');
+  // The store refuses the next commit (booking:b-2 holds a value of another type): no event may go out.
+  ctx.redis.set('booking:b-2', 'not a booking');
+  const records = ctx.kafka.records(TOPIC).length;
+  const rows = outboxRows(ctx).length;
+  await m.publishEvent(booking(2), 'created').catch(() => undefined); // the commit's error reaching the caller is fine
+  await settle();
+  const produced = ctx.kafka.records(TOPIC).length - records;
+  const queued = outboxRows(ctx).length - rows;
+  assert(produced === 0 && queued === 0, \`a booking whose commit failed still produced an event (\${produced} record(s), \${queued} outbox row(s)): produce only once the commit has succeeded\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -731,8 +771,11 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  let ok = await m.publishEvent(booking(3), 'created');
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`a delivered event resolved \${JSON.stringify(ok)} and left the outbox \${JSON.stringify(outboxRows(ctx))}, expected true and no row: only a failed or unacknowledged delivery goes to the outbox\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishEvent(booking(1), 'created');
+  ok = await m.publishEvent(booking(1), 'created');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the booking vanishes from every downstream calendar\`);
@@ -743,7 +786,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishEvent(booking(2), 'created');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishEvent waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.booking_id === 'b-2', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -822,6 +865,13 @@ func CheckPublishAfterCommit(ctx *harness.Ctx) {
 	ctx.Assert(probe.Fired, "publishEvent never committed the booking (no write to booking:b-1)")
 	ctx.Equal(probe.Result, 0, "when the booking was committed the topic already held records: an event for a booking nobody can read yet is a phantom. Commit first, then produce; the records at commit time")
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
+	// The store refuses the next commit (booking:b-2 holds a value of another type): no event may go out.
+	ctx.Redis.Set("booking:b-2", "not a booking")
+	records, rows := len(ctx.Kafka.Records(eventsTopic)), len(eventsOutbox(ctx))
+	_, _ = publishEvent(context.Background(), eventsBooking(2, "r1"), "created") // the commit's error reaching the caller is fine
+	ctx.Settle()
+	produced, queued := len(ctx.Kafka.Records(eventsTopic))-records, len(eventsOutbox(ctx))-rows
+	ctx.Assert(produced == 0 && queued == 0, "a booking whose commit failed still produced an event (%d record(s), %d outbox row(s)): produce only once the commit has succeeded", produced, queued)
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -836,8 +886,11 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := eventsPublish(ctx, eventsBooking(3, "r1"))
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered event returned %v and left the outbox %v, expected true and no row: only a failed or unacknowledged delivery goes to the outbox", ok, eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsBooking(1, "r1"))
+	ok = eventsPublish(ctx, eventsBooking(1, "r1"))
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the booking vanishes from every downstream calendar; the rows")
@@ -848,7 +901,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsBooking(2, "r1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["booking_id"] == "b-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishEvent's result without an acknowledgement")
@@ -925,6 +978,22 @@ void CheckPublishAfterCommit(harness::Ctx& ctx) {
             "when the booking was committed the topic already held records: an event for a booking nobody can read yet is a "
             "phantom. Commit first, then produce; the records at commit time");
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  // The store refuses the next commit (booking:b-2 holds a value of another type): no event may go out.
+  ctx.Redis.Do("SET", "booking:b-2", "not a booking");
+  const size_t records = ctx.Kafka.Records(kEventsTopic).size();
+  const size_t rows = eventsOutbox(ctx).size();
+  try {
+    publishEvent(eventsBooking(2), "created");
+  } catch (const std::exception&) {
+    // the commit's error reaching the caller is fine
+  }
+  ctx.Settle();
+  const size_t produced = ctx.Kafka.Records(kEventsTopic).size() - records;
+  const size_t queued = eventsOutbox(ctx).size() - rows;
+  ctx.Assert(produced == 0 && queued == 0,
+             "a booking whose commit failed still produced an event (%d record(s), %d outbox row(s)): produce only once the "
+             "commit has succeeded",
+             produced, queued);
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -941,8 +1010,14 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publishEvent(eventsBooking(3), "created");
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty(),
+             "a delivered event returned %v and left %d outbox rows, expected true and no row: only a failed or "
+             "unacknowledged delivery goes to the outbox",
+             ok, eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishEvent(eventsBooking(1), "created");
+  ok = publishEvent(eventsBooking(1), "created");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the booking vanishes from every downstream calendar; the rows");
@@ -955,7 +1030,7 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publishEvent(eventsBooking(2), "created");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "booking_id") == "b-2",
              "no acknowledgement within the window and the outbox holds %d rows", rows.size());

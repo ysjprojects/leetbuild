@@ -3,7 +3,8 @@
  * (`message.value?.toString()`), grpc-js does the same for `bytes` fields, and learner code reaches
  * for `Buffer.from(...)`. Node already has one (`yarn verify`); the browser gets this subset —
  * `from`, `alloc`, `concat`, `isBuffer`, `byteLength`, `toString` (utf8/hex/base64/base64url/latin1),
- * `equals`, `toJSON`, `write`, 32-bit reads and writes — installed as the global when none exists.
+ * `equals`, `toJSON`, `write`, `subarray`/`slice` (views, as Node's), 32-bit reads and writes —
+ * installed as the global when none exists.
  */
 
 const encoder = new TextEncoder();
@@ -59,6 +60,11 @@ class BufferImpl extends Uint8Array {
       default:
         return decoder.decode(view);
     }
+  }
+
+  /** Node's `buf.slice` is a view on the same bytes, as `subarray` (both Buffers), not a copy as `Uint8Array.prototype.slice`. */
+  slice(start?: number, end?: number): BufferImpl {
+    return wrap(this.subarray(start, end));
   }
 
   toJSON(): {type: 'Buffer'; data: number[]} {

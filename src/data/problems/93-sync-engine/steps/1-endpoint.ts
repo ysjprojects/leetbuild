@@ -27,7 +27,7 @@ client with no device id is accepted.
 - \`content_hash\` must equal \`store.content_hash(body)\`: a mismatch is **400** naming the
   \`doc_id\`, checked for every change before any is applied.
 - More than \`MAX_CHANGES\` (500) changes is **413**, before any apply.
-- A missing \`X-Device-Id\` is **401**.`,
+- A missing or empty \`X-Device-Id\` is **401**.`,
   sequence: {
     participants: ['Device', 'syncd', 'Redis'],
     messages: [
@@ -56,7 +56,7 @@ client with no device id is accepted.
       id: 'stale-base',
       title: 'A stale base is a per-document conflict, not an overwrite',
       detail:
-        'Each change goes through `apply_change`/`applyChange`, which writes only against the revision the device edited; a `conflict` outcome is answered in `conflicts` with the head revision. Nothing calls `overwrite`, which writes the next revision whatever the device saw.',
+        'Each change goes through `apply_change`/`applyChange`, which writes only against the revision the device edited; a `conflict` outcome is answered in `conflicts` with the head revision, and an `unchanged` one (the body the head already holds) in `applied` at the head revision. Nothing calls `overwrite`, which writes the next revision whatever the device saw.',
       match: {
         python: {all: [/apply_change\(/, /current_revision/], none: [/store\.overwrite\(/]},
         typescript: {all: [/applyChange\(/, /current_revision/], none: [/\boverwrite\(/]},
@@ -99,7 +99,8 @@ client with no device id is accepted.
     {
       id: 'device-auth',
       title: 'A push without X-Device-Id is 401',
-      detail: 'The device is read from `X-Device-Id`; a push without it is **401** and writes nothing.',
+      detail:
+        'The device is read from `X-Device-Id`; a push without it, or with an empty one, is **401** and writes nothing.',
       match: {
         python: {all: [/\b401\b/]},
         typescript: {all: [/\b401\b/]},
@@ -616,7 +617,7 @@ def _api(ctx):
 
 
 async def _push(c, changes, device="laptop"):
-    headers = {"X-Device-Id": device} if device else {}
+    headers = {"X-Device-Id": device} if device is not None else {}
     return await c.post("/v1/sync/push", json={"changes": changes}, headers=headers)
 
 
@@ -641,11 +642,14 @@ async def check_stale_base(ctx):
         rev2 = _ok(await _push(c, [_change("d-1", rev1, "agenda: budget, hiring")], device="phone"), "the phone's edit of revision 1")["applied"][0]["revision"]
         # The laptop was offline: it still edits revision 1, and it brings a new note along.
         stale = _ok(await _push(c, [_change("d-1", rev1, "agenda: offsite"), _change("d-9", 0, "packing list")]), "the laptop's push of a stale edit")
+        # The laptop pulled the phone's text and pushes it back unedited: nothing new, but the device is told where d-1 stands.
+        echo = _ok(await _push(c, [_change("d-1", rev2, "agenda: budget, hiring")]), "the laptop's push of d-1's current body")
     conflicts = stale.get("conflicts")
     assert conflicts == [{"doc_id": "d-1", "base_revision": rev1, "current_revision": rev2}], f"the laptop edited revision {rev1} of d-1 while its head is at {rev2}: the push must answer that conflict, got conflicts {conflicts}"
     head = store.head("d-1")
     assert head["body"] == "agenda: budget, hiring", f"the stale edit was written over the phone's: d-1 reads {head['body']!r}. Apply only against the revision the device edited"
     assert [a.get("doc_id") for a in stale.get("applied", [])] == ["d-9"], f"the rest of the batch must still apply, got applied {stale.get('applied')}"
+    assert echo.get("applied") == [{"doc_id": "d-1", "revision": rev2}] and echo.get("conflicts") == [], f"a push of the body d-1 already holds is an unchanged outcome and must be answered in applied at revision {rev2}, got {echo}"
 
 
 async def check_content_hash(ctx):
@@ -675,7 +679,9 @@ async def check_batch_cap(ctx):
 async def check_device_auth(ctx):
     async with _api(ctx) as c:
         r = await _push(c, [_change("d-1", 0, "shopping list")], device=None)
+        empty = await _push(c, [_change("d-1", 0, "shopping list")], device="")
     assert r.status_code == 401, f"a push without X-Device-Id answered {r.status_code}, expected 401: {r.text}"
+    assert empty.status_code == 401, f"a push with an empty X-Device-Id answered {empty.status_code}, expected 401: {empty.text}"
     assert store.head("d-1") is None, "a push without a device must write nothing"
 `,
     typescript: `function api(ctx) {
@@ -709,10 +715,13 @@ export async function check_stale_base(ctx) {
   const rev2 = ok(await push(c, [change(store, 'd-1', rev1, 'agenda: budget, hiring')], 'phone'), "the phone's edit of revision 1").applied[0].revision;
   // The laptop was offline: it still edits revision 1, and it brings a new note along.
   const stale = ok(await push(c, [change(store, 'd-1', rev1, 'agenda: offsite'), change(store, 'd-9', 0, 'packing list')]), "the laptop's push of a stale edit");
+  // The laptop pulled the phone's text and pushes it back unedited: nothing new, but the device is told where d-1 stands.
+  const echo = ok(await push(c, [change(store, 'd-1', rev2, 'agenda: budget, hiring')]), "the laptop's push of d-1's current body");
   assert.deepStrictEqual(stale.conflicts, [{doc_id: 'd-1', base_revision: rev1, current_revision: rev2}], \`the laptop edited revision \${rev1} of d-1 while its head is at \${rev2}: the push must answer that conflict, got conflicts \${JSON.stringify(stale.conflicts)}\`);
   const head = await store.head('d-1');
   assert.equal(head.body, 'agenda: budget, hiring', \`the stale edit was written over the phone's: d-1 reads \${JSON.stringify(head.body)}. Apply only against the revision the device edited\`);
   assert.deepStrictEqual((stale.applied ?? []).map(a => a.doc_id), ['d-9'], \`the rest of the batch must still apply, got applied \${JSON.stringify(stale.applied)}\`);
+  assert(JSON.stringify(echo.applied) === JSON.stringify([{doc_id: 'd-1', revision: rev2}]) && JSON.stringify(echo.conflicts) === '[]', \`a push of the body d-1 already holds is an unchanged outcome and must be answered in applied at revision \${rev2}, got \${JSON.stringify(echo)}\`);
 }
 
 export async function check_content_hash(ctx) {
@@ -742,7 +751,9 @@ export async function check_batch_cap(ctx) {
 export async function check_device_auth(ctx) {
   const {c, store} = api(ctx);
   const r = await push(c, [change(store, 'd-1', 0, 'shopping list')], null);
+  const empty = await push(c, [change(store, 'd-1', 0, 'shopping list')], '');
   assert.equal(r.status, 401, \`a push without X-Device-Id answered \${r.status}, expected 401: \${r.text}\`);
+  assert.equal(empty.status, 401, \`a push with an empty X-Device-Id answered \${empty.status}, expected 401: \${empty.text}\`);
   assert.equal(await store.head('d-1'), null, 'a push without a device must write nothing');
 }
 `,
@@ -817,11 +828,15 @@ func CheckStaleBase(ctx *harness.Ctx) {
 	rev2 := pushOK(ctx, pushAs(c, "phone", pushChange("d-1", rev1, "agenda: budget, hiring")), "the phone's edit of revision 1").Applied[0].Revision
 	// The laptop was offline: it still edits revision 1, and it brings a new note along.
 	stale := pushOK(ctx, pushAs(c, "laptop", pushChange("d-1", rev1, "agenda: offsite"), pushChange("d-9", 0, "packing list")), "the laptop's push of a stale edit")
+	// The laptop pulled the phone's text and pushes it back unedited: nothing new, but the device is told where d-1 stands.
+	echo := pushOK(ctx, pushAs(c, "laptop", pushChange("d-1", rev2, "agenda: budget, hiring")), "the laptop's push of d-1's current body")
 	ctx.Assert(len(stale.Conflicts) == 1 && stale.Conflicts[0].DocID == "d-1" && stale.Conflicts[0].BaseRevision == rev1 && stale.Conflicts[0].CurrentRevision == rev2,
 		"the laptop edited revision %d of d-1 while its head is at %d: the push must answer that conflict, got conflicts %+v", rev1, rev2, stale.Conflicts)
 	head := store.Head(pushBg, "d-1")
 	ctx.Equal(head.Body, "agenda: budget, hiring", "the stale edit was written over the phone's (apply only against the revision the device edited); d-1's body")
 	ctx.Assert(len(stale.Applied) == 1 && stale.Applied[0].DocID == "d-9", "the rest of the batch must still apply, got applied %+v", stale.Applied)
+	ctx.Assert(len(echo.Applied) == 1 && echo.Applied[0].DocID == "d-1" && echo.Applied[0].Revision == rev2 && len(echo.Conflicts) == 0,
+		"a push of the body d-1 already holds is an unchanged outcome and must be answered in applied at revision %d, got %+v", rev2, echo)
 }
 
 func CheckContentHash(ctx *harness.Ctx) {
@@ -855,6 +870,8 @@ func CheckDeviceAuth(ctx *harness.Ctx) {
 	c := pushAPI(ctx)
 	r := pushAs(c, "", pushChange("d-1", 0, "shopping list"))
 	ctx.Equal(r.Status, 401, "a push without X-Device-Id (%s)", r.Text())
+	empty := c.Post("/v1/sync/push", map[string]any{"changes": []map[string]any{pushChange("d-1", 0, "shopping list")}}, "X-Device-Id", "")
+	ctx.Equal(empty.Status, 401, "a push with an empty X-Device-Id (%s)", empty.Text())
 	ctx.Assert(store.Head(pushBg, "d-1") == nil, "a push without a device must write nothing")
 }
 `,
@@ -921,11 +938,15 @@ void CheckStaleBase(harness::Ctx& ctx) {
   const long long rev2 = firstRevision(pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", rev1, "agenda: budget, hiring")}), "phone"), "the phone's edit of revision 1"));
   // The laptop was offline: it still edits revision 1, and it brings a new note along.
   const Json stale = pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", rev1, "agenda: offsite"), pushChange("d-9", 0, "packing list")})), "the laptop's push of a stale edit");
+  // The laptop pulled the phone's text and pushes it back unedited: nothing new, but the device is told where d-1 stands.
+  const Json echo = pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", rev2, "agenda: budget, hiring")})), "the laptop's push of d-1's current body");
   const Json want = Json::array({Json{{"doc_id", "d-1"}, {"base_revision", rev1}, {"current_revision", rev2}}});
   ctx.Assert(stale.value("conflicts", Json::array()) == want, "the laptop edited revision %d of d-1 while its head is at %d: the push must answer that conflict, got %s", rev1, rev2, stale.dump());
   ctx.Equal(store::head("d-1")->body, "agenda: budget, hiring", "the stale edit was written over the phone's (apply only against the revision the device edited); d-1's body");
   const Json applied = stale.value("applied", Json::array());
   ctx.Assert(applied.size() == 1 && applied[0].value("doc_id", "") == "d-9", "the rest of the batch must still apply, got applied %s", applied.dump());
+  const Json echoWant = Json::array({Json{{"doc_id", "d-1"}, {"revision", rev2}}});
+  ctx.Assert(echo.value("applied", Json::array()) == echoWant && echo.value("conflicts", Json::array()).empty(), "a push of the body d-1 already holds is an unchanged outcome and must be answered in applied at revision %d, got %s", rev2, echo.dump());
 }
 
 void CheckContentHash(harness::Ctx& ctx) {
@@ -958,6 +979,9 @@ void CheckDeviceAuth(harness::Ctx& ctx) {
   auto c = pushApi(ctx);
   const auto r = pushAs(c, Json::array({pushChange("d-1", 0, "shopping list")}), "");
   ctx.Equal(r.Status, 401, "a push without X-Device-Id (%s)", r.Text());
+  const std::string payload = Json{{"changes", Json::array({pushChange("d-1", 0, "shopping list")})}}.dump();
+  const auto empty = c.Post("/v1/sync/push", payload, "Content-Type", "application/json", "X-Device-Id", "");
+  ctx.Equal(empty.Status, 401, "a push with an empty X-Device-Id (%s)", empty.Text());
   ctx.Assert(!store::head("d-1"), "a push without a device must write nothing");
 }
 `,

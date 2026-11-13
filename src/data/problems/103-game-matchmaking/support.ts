@@ -490,15 +490,22 @@ func NextTicketID(ctx context.Context) string {
 }
 
 // Enqueue writes the ticket and puts it in its skill pool: ZADD pool:{bucket}, HINCRBY pool:depth +1.
-func Enqueue(ctx context.Context, ticketID, owner string, skill int, participants []string) *Ticket {
+// A Redis error stops it there and is returned, as the other languages' enqueue raises it.
+func Enqueue(ctx context.Context, ticketID, owner string, skill int, participants []string) (*Ticket, error) {
 	bucket := BucketOf(skill)
-	rdb.HSet(ctx, TicketKey(ticketID), map[string]any{
+	if err := rdb.HSet(ctx, TicketKey(ticketID), map[string]any{
 		"ticket_id": ticketID, "owner": owner, "skill": strconv.Itoa(skill), "bucket": strconv.Itoa(bucket),
 		"participants": strings.Join(participants, ","), "state": "waiting", "match_id": "",
-	})
-	rdb.ZAdd(ctx, PoolKey(bucket), redis.Z{Score: float64(skill), Member: ticketID})
-	rdb.HIncrBy(ctx, DepthKey, strconv.Itoa(bucket), 1)
-	return GetTicket(ctx, ticketID)
+	}).Err(); err != nil {
+		return nil, err
+	}
+	if err := rdb.ZAdd(ctx, PoolKey(bucket), redis.Z{Score: float64(skill), Member: ticketID}).Err(); err != nil {
+		return nil, err
+	}
+	if err := rdb.HIncrBy(ctx, DepthKey, strconv.Itoa(bucket), 1).Err(); err != nil {
+		return nil, err
+	}
+	return GetTicket(ctx, ticketID), nil
 }
 
 // GetTicket is the ticket, or nil.

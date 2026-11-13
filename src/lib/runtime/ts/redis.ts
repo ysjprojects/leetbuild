@@ -604,6 +604,14 @@ export class RedisServer {
   /** Keys a write made ready for their blocked clients (Redis's ready_keys). */
   private readonly readyKeys = new Set<string>();
   private serving = false;
+  /**
+   * Each connection's WATCH (Redis's per-client watched_keys): the watched keys with what each held,
+   * and whether a write touched one since, which makes the connection's next EXEC abort.
+   */
+  private readonly watches = new Map<number, {keys: Map<string, string>; dirty: boolean}>();
+  private connections = 0;
+  /** The keys the commands of the unit running now touched (null outside one): what its probes fire on. */
+  private touched: Set<string> | null = null;
 
   flushall(): void {
     this.data.clear();
@@ -621,6 +629,7 @@ export class RedisServer {
     for (const queue of this.waiters.values()) for (const w of queue) if (w.timer !== null) CLOCK.clearTimer(w.timer);
     this.waiters.clear();
     this.readyKeys.clear();
+    this.watches.clear();
   }
 
   // ---- pub/sub: a connection's subscriptions, delivered asynchronously as replies would arrive ----------
@@ -675,42 +684,27 @@ export class RedisServer {
     return [...this.data.keys()].filter(k => re.test(k)).sort();
   }
 
-  /** A stable rendering of the key's value and expiry ('' when absent): WATCH compares it at EXEC. */
-  fingerprint(key: string): string {
-    this.sweep();
-    const v = this.data.peek(key);
-    if (v === undefined) return '';
-    // A stream's entries and last ID: what XADD, XDEL and XTRIM change (group state does not touch WATCH in Redis).
-    const body =
-      v.kind === 'string' || v.kind === 'list'
-        ? v.value
-        : v.kind === 'set'
-        ? [...v.value].sort()
-        : v.kind === 'stream'
-        ? [streamEntries(v.value).map(entryReply), formatId(v.value.lastId)]
-        : [...v.value.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-    return JSON.stringify([v.kind, body, this.expires.get(key) ?? null]);
-  }
-
   // ---- dispatch ----------------------------------------------------------------------------------
 
   /**
    * Run one command as the server would, probes included: a probe on a key fires right after the
-   * first command touching it, before the caller sees the reply. MULTI/EXEC and EVAL run atomically
-   * and are observed as one unit. `record: false` keeps the harness's own reads out of `trips`.
+   * first successful command, MULTI/EXEC block or script touching it, before the caller sees the
+   * reply. A script touches the keys its `redis.call`s use; MULTI/EXEC and EVAL run atomically and
+   * are observed as one unit. `record: false` keeps the harness's own reads out of `trips`.
    * A blocking command run here does not block: it answers as a timeout would.
    */
   execute(args: string[], record = true): Reply {
     const name = args[0]?.toLowerCase();
     if (record) this.trips.push([name.toUpperCase()]);
     let result: Reply;
+    let touched: Set<string>;
     try {
-      result = this.watching(() => this.run(name, args.slice(1)));
+      [result, touched] = this.observe(() => this.run(name, args.slice(1)));
     } catch (e) {
       this.serveReady();
       throw e;
     }
-    this.fireProbes(args.slice(1));
+    this.fireProbes(touched);
     this.serveReady();
     return result;
   }
@@ -738,7 +732,7 @@ export class RedisServer {
   /** A MULTI/EXEC block: every queued command runs back to back; probes fire once, afterwards. */
   executeTransaction(commands: string[][]): (Reply | ReplyError)[] {
     this.trips.push(['MULTI', ...commands.map(c => c[0].toUpperCase()), 'EXEC']);
-    const replies = this.watching(() =>
+    const [replies, touched] = this.observe(() =>
       commands.map(c => {
         try {
           return this.run(c[0].toLowerCase(), c.slice(1));
@@ -747,9 +741,48 @@ export class RedisServer {
         }
       }),
     );
-    this.fireProbes(commands.flatMap(c => c.slice(1)));
+    this.fireProbes(touched);
     this.serveReady();
     return replies;
+  }
+
+  // ---- WATCH: optimistic locking per client connection ----------------------------------------------
+
+  /** A new client connection's id: each connection WATCHes its own keys. */
+  connect(): number {
+    this.connections += 1;
+    return this.connections;
+  }
+
+  /** WATCH on `conn`: its next EXEC aborts if any of `keys` is written, deleted or expires before it. */
+  watch(conn: number, keys: string[], record = true): 'OK' {
+    if (record) this.trips.push(['WATCH']);
+    if (keys.length === 0) throw arityError('watch');
+    const state = this.watches.get(conn) ?? {keys: new Map<string, string>(), dirty: false};
+    for (const key of keys) if (!state.keys.has(key)) state.keys.set(key, this.fingerprint(key));
+    this.watches.set(conn, state);
+    return 'OK';
+  }
+
+  /** UNWATCH on `conn` (EXEC and DISCARD unwatch too). */
+  unwatch(conn: number, record = true): 'OK' {
+    if (record) this.trips.push(['UNWATCH']);
+    this.watches.delete(conn);
+    return 'OK';
+  }
+
+  /**
+   * MULTI … EXEC sent by connection `conn`: null, and nothing runs, when a key the connection
+   * WATCHed was written since (as EXEC's null reply); the connection's WATCH ends either way.
+   */
+  exec(conn: number, commands: string[][]): (Reply | ReplyError)[] | null {
+    const state = this.watches.get(conn);
+    this.watches.delete(conn);
+    if (state !== undefined && !this.watchIntact(state)) {
+      this.trips.push(['MULTI', ...commands.map(c => c[0].toUpperCase()), 'EXEC']);
+      return null;
+    }
+    return this.executeTransaction(commands);
   }
 
   /** A pipeline: the commands go to the server in one round trip and run back to back, each observed as it runs. */
@@ -788,14 +821,57 @@ export class RedisServer {
     return promise;
   }
 
+  /** A stable rendering of the key's value and expiry ('' when absent): what a WATCH compares. */
+  private fingerprint(key: string): string {
+    this.sweep();
+    const v = this.data.peek(key);
+    if (v === undefined) return '';
+    // A stream's entries and last ID: what XADD, XDEL and XTRIM change (group state does not touch WATCH in Redis).
+    const body =
+      v.kind === 'string' || v.kind === 'list'
+        ? v.value
+        : v.kind === 'set'
+        ? [...v.value].sort()
+        : v.kind === 'stream'
+        ? [streamEntries(v.value).map(entryReply), formatId(v.value.lastId)]
+        : [...v.value.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return JSON.stringify([v.kind, body, this.expires.get(key) ?? null]);
+  }
+
+  /** Whether no write touched the watched keys: none marked dirty, and each still holds what it held (expiry included). */
+  private watchIntact(state: {keys: Map<string, string>; dirty: boolean}): boolean {
+    if (state.dirty) return false;
+    for (const [key, held] of state.keys) if (this.fingerprint(key) !== held) return false;
+    return true;
+  }
+
+  /**
+   * After a successful command: mark dirty every WATCH on a key it changed, or wrote at all
+   * (Redis's signalModifiedKey: SET of the same value, HSET, INCRBY 0 and EXPIRE count too).
+   */
+  private signalWatches(name: string, a: string[], reply: Reply): void {
+    if (this.watches.size === 0) return;
+    const written = WRITES_ALWAYS_SIGNAL[name]?.(a, reply) ?? [];
+    for (const state of this.watches.values()) {
+      if (state.dirty) continue;
+      for (const [key, held] of state.keys) {
+        if (written.includes(key) || this.fingerprint(key) !== held) {
+          state.dirty = true;
+          break;
+        }
+      }
+    }
+  }
+
   private pipelined(c: string[]): Reply | ReplyError {
     let reply: Reply | ReplyError;
+    let touched = new Set<string>();
     try {
-      reply = this.watching(() => this.run(c[0].toLowerCase(), c.slice(1)));
+      [reply, touched] = this.observe(() => this.run(c[0].toLowerCase(), c.slice(1)));
     } catch (e) {
       reply = e instanceof ReplyError ? e : new ReplyError(String(e));
     }
-    this.fireProbes(c.slice(1));
+    this.fireProbes(touched);
     this.serveReady();
     return reply;
   }
@@ -811,8 +887,9 @@ export class RedisServer {
     const caller = this.caller;
     this.caller = 'blocking';
     let reply: Reply | ReplyError;
+    let touched = new Set<string>();
     try {
-      reply = this.watching(() => this.run(args[0].toLowerCase(), args.slice(1)));
+      [reply, touched] = this.observe(() => this.run(args[0].toLowerCase(), args.slice(1)));
     } catch (e) {
       if (e instanceof WouldBlock) {
         const waiter = parked ?? {...e, timer: null, done};
@@ -826,7 +903,7 @@ export class RedisServer {
       this.caller = caller;
     }
     if (parked?.timer != null) CLOCK.clearTimer(parked.timer);
-    this.fireProbes(args.slice(1));
+    this.fireProbes(touched);
     this.serveReady();
     done(reply);
   }
@@ -843,7 +920,7 @@ export class RedisServer {
   private timeOut(waiter: Waiter): void {
     if (!this.waiters.get(waiter.keys[0])?.includes(waiter)) return;
     this.unpark(waiter);
-    this.fireProbes(waiter.args.slice(1));
+    this.fireProbes(new Set(waiter.args.slice(1)));
     waiter.done(null);
   }
 
@@ -855,6 +932,18 @@ export class RedisServer {
       return fn();
     } finally {
       for (const [key, value] of before) if (this.data.peek(key) !== value) this.readyKeys.add(key);
+    }
+  }
+
+  /** Run `fn` (a command, a transaction) under `watching`, with the keys its successful commands touched. */
+  private observe<T>(fn: () => T): [T, Set<string>] {
+    const outer = this.touched;
+    const touched = new Set<string>();
+    this.touched = touched;
+    try {
+      return [this.watching(fn), touched];
+    } finally {
+      this.touched = outer;
     }
   }
 
@@ -908,9 +997,8 @@ export class RedisServer {
     throw new WouldBlock(args, keys, type, timeout, unblockOnNokey);
   }
 
-  private fireProbes(args: string[]): void {
+  private fireProbes(touched: Set<string>): void {
     if (this.probes.length === 0) return;
-    const touched = new Set(args);
     // A snapshot: a probe armed by a probe's fn waits for the next command touching its key.
     for (const probe of [...this.probes]) {
       if (probe.fired || !touched.has(probe.key)) continue;
@@ -923,7 +1011,29 @@ export class RedisServer {
     }
   }
 
+  /**
+   * Run one command. A successful one adds its arguments to the keys the running unit touched;
+   * a script adds the keys of its `redis.call`s instead, and only if it succeeds.
+   */
   private run(name: string, a: string[]): Reply {
+    const outer = this.touched;
+    const script = name === 'eval' || name === 'evalsha';
+    if (script) this.touched = new Set();
+    let reply: Reply;
+    let inner: Set<string> | null;
+    try {
+      reply = this.dispatch(name, a);
+    } finally {
+      inner = this.touched;
+      this.touched = outer;
+    }
+    if (script) for (const key of inner ?? []) outer?.add(key);
+    else for (const arg of a) outer?.add(arg);
+    this.signalWatches(name, a, reply);
+    return reply;
+  }
+
+  private dispatch(name: string, a: string[]): Reply {
     this.sweep();
     if (Object.hasOwn(ARITY, name)) {
       const arity = ARITY[name];
@@ -1528,12 +1638,65 @@ export class RedisServer {
         const i = sorted.findIndex(([m]) => m === a[1]);
         return i === -1 ? null : i;
       }
+      // ZRANGE's unified syntax (Redis 6.2): by rank, BYSCORE or BYLEX, REV, LIMIT offset count,
+      // WITHSCORES (zrangeGenericCommand); ZRANGESTORE writes the selection to its destination.
       case 'zrange':
-      case 'zrevrange': {
-        const withScores = a[3]?.toUpperCase() === 'WITHSCORES';
-        const sorted = this.sortedMembers(a[0], name === 'zrevrange');
-        const [start, end] = this.range(sorted.length, a[1], a[2]);
-        return sorted.slice(start, end + 1).flatMap(([m, s]) => (withScores ? [m, String(s)] : [m]));
+      case 'zrevrange':
+      case 'zrangestore': {
+        const store = name === 'zrangestore';
+        if (a.length < (store ? 4 : 3)) throw arityError(name);
+        const [key, startArg, stopArg, ...options] = store ? a.slice(1) : a;
+        let by: 'rank' | 'score' | 'lex' | null = name === 'zrevrange' ? 'rank' : null;
+        let rev: boolean | null = name === 'zrevrange' ? true : null;
+        let withScores = false;
+        let offset = 0;
+        let count = -1;
+        for (let i = 0; i < options.length; i++) {
+          const o = options[i].toUpperCase();
+          if (!store && o === 'WITHSCORES') withScores = true;
+          else if (o === 'LIMIT' && i + 2 < options.length) {
+            offset = int(options[i + 1]);
+            count = int(options[i + 2]);
+            i += 2;
+          } else if (rev === null && o === 'REV') rev = true;
+          else if (by === null && o === 'BYLEX') by = 'lex';
+          else if (by === null && o === 'BYSCORE') by = 'score';
+          else throw new ReplyError(SYNTAX);
+        }
+        by ??= 'rank';
+        rev ??= false;
+        if (count !== -1 && by === 'rank')
+          throw new ReplyError('ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX');
+        if (withScores && by === 'lex')
+          throw new ReplyError('ERR syntax error, WITHSCORES not supported in combination with BYLEX');
+        // BYSCORE and BYLEX with REV take the range as max then min.
+        const [lo, hi] = rev && by !== 'rank' ? [stopArg, startArg] : [startArg, stopArg];
+        let out: [string, number][];
+        if (by === 'rank') {
+          const sorted = this.sortedMembers(key, rev);
+          const [from, to] = this.range(sorted.length, lo, hi);
+          out = sorted.slice(from, to + 1);
+        } else {
+          let within: (m: string, s: number) => boolean;
+          if (by === 'score') {
+            const bound = (b: string): [number, boolean] => {
+              const exclusive = b.startsWith('(');
+              const value = parseDouble(exclusive ? b.slice(1) : b);
+              if (value === null) throw new ReplyError('ERR min or max is not a float');
+              return [value, exclusive];
+            };
+            const [min, minEx] = bound(lo);
+            const [max, maxEx] = bound(hi);
+            within = (_m, s) => (minEx ? s > min : s >= min) && (maxEx ? s < max : s <= max);
+          } else {
+            const [min, max] = [lexBound(lo), lexBound(hi)];
+            within = m => lexIn(m, min, max);
+          }
+          const matched = this.sortedMembers(key, rev).filter(([m, s]) => within(m, s));
+          out = offset < 0 ? [] : matched.slice(offset, count < 0 ? undefined : offset + count);
+        }
+        if (store) return this.store(a[0], {kind: 'zset', value: new Map(out)}, out.length);
+        return out.flatMap(([m, s]) => (withScores ? [m, scoreString(s)] : [m]));
       }
       case 'zrangebyscore':
       case 'zrevrangebyscore': {
@@ -2709,6 +2872,44 @@ const STREAM_COMMANDS = new Set([
 
 const SYNTAX = 'ERR syntax error';
 
+const keyArg = (a: string[]): string[] => [a[0]];
+const keyArgIfOne = (a: string[], reply: Reply): string[] => (reply === 1 ? [a[0]] : []);
+const pairKeys = (a: string[]): string[] => a.filter((_, i) => i % 2 === 0);
+
+/**
+ * Writes Redis signals to WATCH even when they leave the value as it was (signalModifiedKey on SET of
+ * the same value, HSET, INCRBY 0, EXPIRE …): the keys each wrote, from its arguments and reply. Any
+ * other write is seen by the change it makes.
+ */
+const WRITES_ALWAYS_SIGNAL: Record<string, (a: string[], reply: Reply) => string[]> = {
+  // SET answers nil when NX or XX kept it from writing (and GET is absent).
+  set: (a, reply) => (reply === null && !a.some(o => o.toUpperCase() === 'GET') ? [] : [a[0]]),
+  setex: keyArg,
+  psetex: keyArg,
+  getset: keyArg,
+  setrange: keyArg,
+  append: keyArg,
+  mset: pairKeys,
+  msetnx: (a, reply) => (reply === 1 ? pairKeys(a) : []),
+  hset: keyArg,
+  hmset: keyArg,
+  hsetnx: keyArgIfOne,
+  incr: keyArg,
+  decr: keyArg,
+  incrby: keyArg,
+  decrby: keyArg,
+  incrbyfloat: keyArg,
+  hincrby: keyArg,
+  hincrbyfloat: keyArg,
+  lset: keyArg,
+  expire: keyArgIfOne,
+  pexpire: keyArgIfOne,
+  expireat: keyArgIfOne,
+  pexpireat: keyArgIfOne,
+  rename: a => [a[0], a[1]],
+  renamenx: (a, reply) => (reply === 1 ? [a[0], a[1]] : []),
+};
+
 /** Arity from Redis 7.2's command table, for the commands checked before they run: exact when positive, a minimum when negative. */
 const ARITY: Record<string, number> = {
   xadd: -5,
@@ -3010,13 +3211,18 @@ export const flatten = (args: Arg[]): string[] => {
 /**
  * ioredis's client: every command is a method returning a Promise of the reply, with the same
  * reply shapes (`set` → 'OK' | null, `get` → string | null, `hgetall` → object, `exec` → [err, reply]
- * tuples). Connection options are accepted and ignored — the server is in this process.
+ * tuples). Connection options are accepted and ignored — the server is in this process. A command
+ * runs on the server when it is called (ioredis writes it to the socket at once), and its reply
+ * settles on a later macrotask, as one read off a socket does: work the caller never awaits is
+ * still in flight when the code that moved on finishes.
  */
 export class Redis {
   readonly options: Record<string, unknown>;
   private readonly scripts = new Map<string, {numberOfKeys: number; lua: string}>();
   private readonly subscriptions = new Map<string, () => void>();
   private readonly listeners = new Map<string, ((...args: string[]) => void)[]>();
+  /** This client's connection on the server: what it WATCHes is its own. */
+  private readonly connection = SERVER.connect();
 
   constructor(
     portOrOptions?: number | string | Record<string, unknown>,
@@ -3043,8 +3249,19 @@ export class Redis {
   /** `redis.call('set', key, value, 'EX', 60)`: any command by name. Blocking ones (BLPOP, XREAD BLOCK …) wait. */
   async call(command: string, ...args: Arg[]): Promise<unknown> {
     const wire = [wireCommand(command), ...flatten(args)];
-    const reply = isBlocking(wire) ? await SERVER.executeBlocking(wire) : SERVER.execute(wire);
-    return shapeReply(command, reply);
+    try {
+      const reply =
+        wire[0] === 'watch'
+          ? SERVER.watch(this.connection, wire.slice(1))
+          : wire[0] === 'unwatch'
+          ? SERVER.unwatch(this.connection)
+          : isBlocking(wire)
+          ? await SERVER.executeBlocking(wire)
+          : SERVER.execute(wire);
+      return shapeReply(command, reply);
+    } finally {
+      await CLOCK.reply();
+    }
   }
 
   /** ioredis's `defineCommand`: a Lua script callable as `redis.<name>(key…, arg…)`. */
@@ -3056,8 +3273,9 @@ export class Redis {
     return new Pipeline(false);
   }
 
+  /** MULTI … EXEC: `exec()` resolves null, running nothing, when a key this client WATCHed was written since. */
   multi(): Pipeline {
-    return new Pipeline(true);
+    return new Pipeline(true, this.connection);
   }
 
   duplicate(): Redis {
@@ -3066,6 +3284,7 @@ export class Redis {
 
   async quit(): Promise<'OK'> {
     this.disconnect();
+    await CLOCK.reply();
     return 'OK';
   }
 
@@ -3084,10 +3303,11 @@ export class Redis {
       this.subscriptions.set(
         `c:${channel}`,
         SERVER.subscribe(toByteString(channel), (ch, message) =>
-          this.emit('message', fromByteString(ch), fromByteString(message)),
+          CLOCK.deliver(() => this.emit('message', fromByteString(ch), fromByteString(message))),
         ),
       );
     }
+    await CLOCK.reply();
     return this.subscriptions.size;
   }
 
@@ -3100,6 +3320,7 @@ export class Redis {
       this.subscriptions.get(key)?.();
       this.subscriptions.delete(key);
     }
+    await CLOCK.reply();
     return this.subscriptions.size;
   }
 
@@ -3110,10 +3331,11 @@ export class Redis {
       this.subscriptions.set(
         `p:${pattern}`,
         SERVER.psubscribe(toByteString(pattern), (p, ch, message) =>
-          this.emit('pmessage', fromByteString(p), fromByteString(ch), fromByteString(message)),
+          CLOCK.deliver(() => this.emit('pmessage', fromByteString(p), fromByteString(ch), fromByteString(message))),
         ),
       );
     }
+    await CLOCK.reply();
     return this.subscriptions.size;
   }
 
@@ -3126,6 +3348,7 @@ export class Redis {
       this.subscriptions.get(key)?.();
       this.subscriptions.delete(key);
     }
+    await CLOCK.reply();
     return this.subscriptions.size;
   }
 
@@ -3193,7 +3416,7 @@ const wireCommand = (method: string): string => {
 export class Pipeline {
   private readonly queue: string[][] = [];
 
-  constructor(private readonly transactional: boolean) {
+  constructor(private readonly transactional: boolean, private readonly connection?: number) {
     return new Proxy(this, {
       get: (target, prop, receiver) => {
         if (typeof prop === 'string' && !(prop in target) && KNOWN_COMMANDS.has(wireCommand(prop)))
@@ -3212,17 +3435,23 @@ export class Pipeline {
 
   /**
    * `[error, reply]` per command, as ioredis does. A MULTI pipeline runs atomically on the server
-   * (a blocking command there answers at once); in a plain one, a blocking command that waits holds the rest.
+   * (a blocking command there answers at once), and resolves null when its client's WATCH aborted
+   * it; in a plain one, a blocking command that waits holds the rest.
    */
-  async exec(): Promise<[Error | null, unknown][]> {
+  async exec(): Promise<[Error | null, unknown][] | null> {
     const commands = this.queue.splice(0);
     const wire = commands.map(c => [wireCommand(c[0]), ...c.slice(1)]);
-    const replies = this.transactional
-      ? SERVER.executeTransaction(wire)
-      : wire.some(isBlocking)
-      ? await SERVER.executePipelineBlocking(wire)
-      : SERVER.executePipeline(wire);
-    return replies.map((r, i) => (r instanceof ReplyError ? [r, null] : [null, shapeReply(commands[i][0], r)]));
+    try {
+      const replies = this.transactional
+        ? SERVER.exec(this.connection ?? SERVER.connect(), wire)
+        : wire.some(isBlocking)
+        ? await SERVER.executePipelineBlocking(wire)
+        : SERVER.executePipeline(wire);
+      if (replies === null) return null;
+      return replies.map((r, i) => (r instanceof ReplyError ? [r, null] : [null, shapeReply(commands[i][0], r)]));
+    } finally {
+      await CLOCK.reply();
+    }
   }
 }
 
@@ -3294,6 +3523,9 @@ const KNOWN_COMMANDS = new Set([
   'zrank',
   'zrevrank',
   'zrange',
+  'zrangestore',
+  'watch',
+  'unwatch',
   'zrevrange',
   'zrangebyscore',
   'zrevrangebyscore',

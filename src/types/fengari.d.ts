@@ -25,6 +25,7 @@ declare module 'fengari' {
     lua_setfield(L: LuaState, idx: number, k: Uint8Array): void;
     lua_getfield(L: LuaState, idx: number, k: Uint8Array): number;
     lua_setglobal(L: LuaState, name: Uint8Array): void;
+    lua_getglobal(L: LuaState, name: Uint8Array): number;
     lua_tonumber(L: LuaState, idx: number): number;
     lua_toboolean(L: LuaState, idx: number): boolean;
     lua_tolstring(L: LuaState, idx: number): Uint8Array | null;

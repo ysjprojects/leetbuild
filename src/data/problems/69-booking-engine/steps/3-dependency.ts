@@ -31,7 +31,8 @@ service Calendar {
 - \`INVALID_ARGUMENT\` and \`PERMISSION_DENIED\` are verdicts: \`release_hold\`, state \`rejected\`.
 - When every attempt failed the event may exist: record \`sync_unknown\`, then \`GetEvent\` by the same
   key. Found: confirm with its event id and return \`reconciled\`. Not found: release the hold, state
-  \`cancelled\`.`,
+  \`cancelled\`. A \`GetEvent\` that fails answers neither: the booking stays \`sync_unknown\` with its
+  hold, for a sweeper to reconcile later.`,
   sequence: {
     participants: ['Booking API', 'Calendar service'],
     messages: [
@@ -46,7 +47,7 @@ service Calendar {
       {
         from: 'Calendar service',
         to: 'Booking API',
-        label: 'INVALID_ARGUMENT → release the hold, rejected',
+        label: 'INVALID_ARGUMENT / PERMISSION_DENIED → release the hold, rejected',
         kind: 'reply',
       },
       {from: 'Booking API', to: 'Booking API', label: 'every attempt failed → sync_unknown', kind: 'sync'},
@@ -59,7 +60,7 @@ service Calendar {
       id: 'deadline',
       title: 'Bounds every attempt with a 3000 ms deadline',
       detail:
-        'A calendar that answers in two seconds confirms the booking; each Sync carries a deadline of about 3 s. The starter gives every attempt one second.',
+        'A calendar that answers in two seconds confirms the booking; each Sync carries a deadline of about 3 s, and so does every retry against a calendar that never answers in time. The starter gives every attempt one second.',
       match: {
         python: {all: [/stub\.Sync\([\s\S]{0,300}?timeout\s*=\s*(SYNC_DEADLINE_MS\s*\/\s*1000|3(\.0)?)\b/]},
         typescript: {all: [/\.Sync\([\s\S]{0,300}?deadline:\s*Date\.now\(\)\s*\+\s*(SYNC_DEADLINE_MS|3000)\b/]},
@@ -89,7 +90,7 @@ service Calendar {
       id: 'timeout-reconcile',
       title: 'Records an unknown state and reconciles before cancelling',
       detail:
-        'When every attempt timed out the booking is marked `sync_unknown`, `GetEvent` is asked, and an event that exists confirms the booking as `reconciled`. The starter cancels on the first timeout.',
+        'When all 3 attempts timed out the booking is marked `sync_unknown`, `GetEvent` is asked, and an event that exists confirms the booking as `reconciled`. A `GetEvent` that fails cancels nothing: the booking stays `sync_unknown` and keeps its hold. The starter cancels on the first timeout.',
       match: {
         python: {
           all: [/sync_unknown/, /stub\.GetEvent\(/],
@@ -108,20 +109,20 @@ service Calendar {
       id: 'non-retryable-release',
       title: 'Releases the hold when the calendar refuses the booking',
       detail:
-        'INVALID_ARGUMENT is not retried: one Sync call, the slots freed, the booking `rejected`. The starter retries it like any other error.',
+        'INVALID_ARGUMENT and PERMISSION_DENIED are not retried: one Sync call each, the slots freed, the booking `rejected`. The starter retries them like any other error.',
       match: {
-        python: {all: [/INVALID_ARGUMENT/, /release_hold\(/, /["']rejected["']/]},
-        typescript: {all: [/INVALID_ARGUMENT/, /releaseHold\(/, /['"]rejected['"]/]},
-        go: {all: [/codes\.InvalidArgument/, /releaseHold\(/, /"rejected"/]},
-        scala: {all: [/INVALID_ARGUMENT/, /releaseHold\(/, /"rejected"/]},
-        cpp: {all: [/INVALID_ARGUMENT/, /releaseHold\(/, /"rejected"/]},
+        python: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /release_hold\(/, /["']rejected["']/]},
+        typescript: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /releaseHold\(/, /['"]rejected['"]/]},
+        go: {all: [/codes\.InvalidArgument/, /codes\.PermissionDenied/, /releaseHold\(/, /"rejected"/]},
+        scala: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /releaseHold\(/, /"rejected"/]},
+        cpp: {all: [/INVALID_ARGUMENT/, /PERMISSION_DENIED/, /releaseHold\(/, /"rejected"/]},
       },
     },
     {
       id: 'bounded-retry',
       title: 'Retries only retryable failures, at most 3 times',
       detail:
-        'A calendar that stays UNAVAILABLE gets exactly 3 Sync calls, then the booking goes through reconciliation. The starter loops until something works.',
+        'A calendar that stays UNAVAILABLE gets exactly 3 Sync calls, then the booking is marked `sync_unknown` and `GetEvent` decides; with no event it is `cancelled`. An INTERNAL failure gets one call: only DEADLINE_EXCEEDED and UNAVAILABLE are retried. The starter loops until something works.',
       match: {
         python: {all: [/MAX_SYNC_ATTEMPTS\s*=\s*3|range\(\s*3\s*\)/, /UNAVAILABLE/], none: [/while\s+True/]},
         typescript: {
@@ -826,7 +827,8 @@ grpc::Status syncEvent(const booking::Booking& b, std::string& event_id) {
   return status;
 }
 
-// The event the calendar holds under the key, if any: asked before the booking is touched.
+// The event the calendar holds under the key, if any: asked before the booking is touched. A failed
+// GetEvent answers neither found nor not found, so it throws and the booking stays sync_unknown.
 std::optional<std::string> reconcileEvent(const std::string& idempotency_key) {
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() + kSyncDeadline);
@@ -834,7 +836,8 @@ std::optional<std::string> reconcileEvent(const std::string& idempotency_key) {
   request.set_idempotency_key(idempotency_key);
   booking::GetEventReply reply;
   const grpc::Status status = stub->GetEvent(&ctx, request, &reply);
-  if (!status.ok() || !reply.found()) return std::nullopt;
+  if (!status.ok()) throw std::runtime_error(status.error_message());
+  if (!reply.found()) return std::nullopt;
   return reply.event_id();
 }
 
@@ -918,14 +921,19 @@ class FakeCalendar(calendar_pb2_grpc.CalendarServicer):
         return calendar_pb2.GetEventReply(found=event_id is not None, event_id=event_id or "")
 
 
-def _world(ctx):
-    """A held booking in the store and the map, and the calendar the harness serves."""
-    calendar = FakeCalendar(ctx)
-    ctx.grpc.serve(calendar_pb2_grpc.add_CalendarServicer_to_server, calendar)
+def _hold(ctx):
+    """The booking held again: its slots in the map, its hold key alive, its row in the store."""
     for f in FIELDS:
         ctx.redis.hset(slots_key("r1"), f, "h-1")
     ctx.redis.set(hold_key("h-1"), "held", ex=900)
     store.put(BOOKING)
+
+
+def _world(ctx):
+    """A held booking in the store and the map, and the calendar the harness serves."""
+    calendar = FakeCalendar(ctx)
+    ctx.grpc.serve(calendar_pb2_grpc.add_CalendarServicer_to_server, calendar)
+    _hold(ctx)
     return ctx.load("client"), calendar
 
 
@@ -953,6 +961,12 @@ def check_deadline(ctx):
     assert 2.5 <= call.timeout <= 3.5, f"the Sync deadline is {call.timeout} s, expected about 3 s"
     assert _state(ctx).get("state") == "confirmed" and _state(ctx).get("event_id") == "evt-1", f"the stored booking is {_state(ctx)}, expected state confirmed with event_id evt-1"
     assert _owners(ctx) == ["booked:b-1"] * len(FIELDS), f"after confirmation the slots point at {_owners(ctx)}, expected booked:b-1"
+    # A calendar that never answers in time: every attempt, the retries included, gets its own 3 s.
+    _hold(ctx)
+    ctx.grpc.set_latency("Sync", 5.0)
+    ctx.drain(m.confirm_booking, dict(BOOKING))
+    timeouts = [c.timeout for c in ctx.grpc.calls_to("Sync")[1:]]
+    assert all(t is not None and 2.5 <= t <= 3.5 for t in timeouts), f"against a calendar that never answers in time the Sync deadlines were {timeouts} s, expected about 3 s on every attempt: a retry needs a deadline of its own, not what is left of the first one's"
 
 
 def check_idempotency_key(ctx):
@@ -975,11 +989,22 @@ def check_timeout_reconcile(ctx):
     result = _confirm(ctx, m)
     assert result != "cancelled", "every attempt timed out and the booking was cancelled: the calendar has the event, the guest will arrive to a booking the system forgot. Ask GetEvent first"
     assert result == "reconciled", f"confirm_booking returned {result!r}, expected reconciled"
+    calls = len(ctx.grpc.calls_to("Sync"))
+    assert calls == 3, f"every Sync timed out and {calls} were made, expected 3 attempts, each with a deadline of its own"
     gets = ctx.grpc.calls_to("GetEvent")
     assert len(gets) == 1 and gets[0].request.idempotency_key == "k-1", f"GetEvent must be asked once by the booking's key, got {[(c.request.idempotency_key) for c in gets]}"
     assert calendar.state_at_get_event == "sync_unknown", f"when GetEvent was asked the booking's state was {calendar.state_at_get_event!r}, expected sync_unknown: record the unknown state before reconciling, so a crash mid-way leaves a booking a sweeper can find"
     assert _state(ctx).get("state") == "confirmed" and _state(ctx).get("event_id") == "evt-7", f"the stored booking is {_state(ctx)}, expected confirmed with the calendar's event evt-7"
     assert _owners(ctx) == ["booked:b-1"] * len(FIELDS), f"the slots point at {_owners(ctx)}, expected booked:b-1"
+    # Every attempt times out again, and GetEvent itself fails: the event may or may not exist.
+    _hold(ctx)
+    ctx.grpc.fail("GetEvent", grpc.StatusCode.UNAVAILABLE, "calendar down", times=10)
+    try:
+        result = ctx.drain(m.confirm_booking, dict(BOOKING))
+    except Exception:
+        result = None  # the error reaching the caller is fine
+    assert result != "cancelled" and _state(ctx).get("state") == "sync_unknown", f"GetEvent failed and the booking ended {result!r} with state {_state(ctx).get('state')!r}: a failed GetEvent says nothing about the event, so the booking stays sync_unknown for a sweeper"
+    assert _owners(ctx) == ["h-1"] * len(FIELDS) and ctx.redis.exists(hold_key("h-1")) == 1, f"GetEvent failed and the slots point at {_owners(ctx)}: the hold must stay until the calendar answers"
 
 
 def check_non_retryable_release(ctx):
@@ -991,15 +1016,35 @@ def check_non_retryable_release(ctx):
     assert ctx.redis.hgetall(slots_key("r1")) == {}, f"the refused booking still holds {ctx.redis.hgetall(slots_key('r1'))}: release the hold, or the slots stay blocked for the rest of the payment window"
     assert ctx.redis.exists(hold_key("h-1")) == 0, "the hold key must be gone after the release"
     assert _state(ctx).get("state") == "rejected", f"the stored booking is {_state(ctx)}, expected state rejected"
+    # PERMISSION_DENIED is the calendar's other verdict.
+    _hold(ctx)
+    ctx.grpc.fail("Sync", grpc.StatusCode.PERMISSION_DENIED, "calendar not shared with this tenant", times=1)
+    result = _confirm(ctx, m)
+    assert len(ctx.grpc.calls_to("Sync")) == 2, f"PERMISSION_DENIED is a verdict, not a retryable failure: {len(ctx.grpc.calls_to('Sync')) - 1} Sync calls were made for it"
+    assert result == "rejected", f"after PERMISSION_DENIED confirm_booking returned {result!r}, expected rejected"
+    assert ctx.redis.hgetall(slots_key("r1")) == {}, f"the booking refused with PERMISSION_DENIED still holds {ctx.redis.hgetall(slots_key('r1'))}: release the hold"
+    assert _state(ctx).get("state") == "rejected", f"after PERMISSION_DENIED the stored booking is {_state(ctx)}, expected state rejected"
 
 
 def check_bounded_retry(ctx):
     m, calendar = _world(ctx)
+    # Only DEADLINE_EXCEEDED and UNAVAILABLE are retried: an INTERNAL error is not.
+    ctx.grpc.fail("Sync", grpc.StatusCode.INTERNAL, "calendar bug", times=1)
+    try:
+        ctx.drain(m.confirm_booking, dict(BOOKING))
+    except Exception:
+        pass  # the error reaching the caller is fine
+    made = len(ctx.grpc.calls_to("Sync"))
+    assert made == 1, f"an INTERNAL failure got {made} Sync calls, expected 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried"
+    _hold(ctx)
+    gets_before = len(ctx.grpc.calls_to("GetEvent"))
     ctx.grpc.fail("Sync", grpc.StatusCode.UNAVAILABLE, "calendar down", times=10)
     result = _confirm(ctx, m)
-    calls = len(ctx.grpc.calls_to("Sync"))
+    calls = len(ctx.grpc.calls_to("Sync")) - made
     assert calls == 3, f"a calendar that stays UNAVAILABLE got {calls} Sync calls, expected exactly 3 attempts"
     assert result == "cancelled", f"confirm_booking returned {result!r}, expected cancelled: GetEvent found no event"
+    gets = len(ctx.grpc.calls_to("GetEvent")) - gets_before
+    assert gets == 1 and calendar.state_at_get_event == "sync_unknown", f"after three UNAVAILABLE attempts GetEvent was asked {gets} times with the booking {calendar.state_at_get_event!r}, expected once with sync_unknown: an earlier attempt may have reached the calendar before the connection dropped"
     assert ctx.redis.hgetall(slots_key("r1")) == {}, f"the cancelled booking still holds {ctx.redis.hgetall(slots_key('r1'))}"
     assert _state(ctx).get("state") == "cancelled", f"the stored booking is {_state(ctx)}, expected state cancelled"
 `,
@@ -1038,10 +1083,15 @@ async function world(ctx) {
       callback(null, {found: eventId !== undefined, event_id: eventId ?? ''});
     },
   });
+  await hold(ctx);
+  return {m: ctx.load('client'), calendar};
+}
+
+/** The booking held again: its slots in the map, its hold key alive, its row in the store. */
+async function hold(ctx) {
   for (const f of FIELDS) ctx.redis.hset(slotsKey('r1'), f, 'h-1');
   ctx.redis.set(holdKey('h-1'), 'held', 'EX', 900);
   await store.put({...BOOKING});
-  return {m: ctx.load('client'), calendar};
 }
 
 async function confirm(ctx, m): Promise<string> {
@@ -1064,6 +1114,12 @@ export async function check_deadline(ctx) {
   assert(2.5 <= call.timeout && call.timeout <= 3.5, \`the Sync deadline is \${call.timeout} s, expected about 3 s\`);
   assert(state(ctx).state === 'confirmed' && state(ctx).event_id === 'evt-1', \`the stored booking is \${JSON.stringify(state(ctx))}, expected state confirmed with event_id evt-1\`);
   assert.deepEqual(owners(ctx), booked(), \`after confirmation the slots point at \${JSON.stringify(owners(ctx))}, expected booked:b-1\`);
+  // A calendar that never answers in time: every attempt, the retries included, gets its own 3 s.
+  await hold(ctx);
+  ctx.grpc.setLatency('Sync', 5.0);
+  await ctx.drain(m.confirmBooking({...BOOKING}));
+  const timeouts = ctx.grpc.callsTo('Sync').slice(1).map(c => c.timeout);
+  assert(timeouts.every(t => t !== null && 2.5 <= t && t <= 3.5), \`against a calendar that never answers in time the Sync deadlines were \${JSON.stringify(timeouts)} s, expected about 3 s on every attempt: a retry needs a deadline of its own, not what is left of the first one's\`);
 }
 
 export async function check_idempotency_key(ctx) {
@@ -1086,11 +1142,19 @@ export async function check_timeout_reconcile(ctx) {
   const result = await confirm(ctx, m);
   assert(result !== 'cancelled', 'every attempt timed out and the booking was cancelled: the calendar has the event, the guest will arrive to a booking the system forgot. Ask GetEvent first');
   assert.equal(result, 'reconciled', \`confirmBooking resolved \${JSON.stringify(result)}, expected reconciled\`);
+  const calls = ctx.grpc.callsTo('Sync').length;
+  assert.equal(calls, 3, \`every Sync timed out and \${calls} were made, expected 3 attempts, each with a deadline of its own\`);
   const gets = ctx.grpc.callsTo('GetEvent');
   assert(gets.length === 1 && gets[0].request.idempotency_key === 'k-1', \`GetEvent must be asked once by the booking's key, got \${JSON.stringify(gets.map(c => c.request.idempotency_key))}\`);
   assert.equal(calendar.stateAtGetEvent, 'sync_unknown', \`when GetEvent was asked the booking's state was \${JSON.stringify(calendar.stateAtGetEvent)}, expected sync_unknown: record the unknown state before reconciling, so a crash mid-way leaves a booking a sweeper can find\`);
   assert(state(ctx).state === 'confirmed' && state(ctx).event_id === 'evt-7', \`the stored booking is \${JSON.stringify(state(ctx))}, expected confirmed with the calendar's event evt-7\`);
   assert.deepEqual(owners(ctx), booked(), \`the slots point at \${JSON.stringify(owners(ctx))}, expected booked:b-1\`);
+  // Every attempt times out again, and GetEvent itself fails: the event may or may not exist.
+  await hold(ctx);
+  ctx.grpc.fail('GetEvent', ctx.grpc.status.UNAVAILABLE, 'calendar down', 10);
+  const unknown = await ctx.drain(m.confirmBooking({...BOOKING})).catch(() => null); // the error reaching the caller is fine
+  assert(unknown !== 'cancelled' && state(ctx).state === 'sync_unknown', \`GetEvent failed and the booking ended \${JSON.stringify(unknown)} with state \${JSON.stringify(state(ctx).state)}: a failed GetEvent says nothing about the event, so the booking stays sync_unknown for a sweeper\`);
+  assert(owners(ctx).every(o => o === 'h-1') && ctx.redis.exists(holdKey('h-1')) === 1, \`GetEvent failed and the slots point at \${JSON.stringify(owners(ctx))}: the hold must stay until the calendar answers\`);
 }
 
 export async function check_non_retryable_release(ctx) {
@@ -1102,15 +1166,32 @@ export async function check_non_retryable_release(ctx) {
   assert.deepEqual(ctx.redis.hgetall(slotsKey('r1')), {}, \`the refused booking still holds \${JSON.stringify(ctx.redis.hgetall(slotsKey('r1')))}: release the hold, or the slots stay blocked for the rest of the payment window\`);
   assert.equal(ctx.redis.exists(holdKey('h-1')), 0, 'the hold key must be gone after the release');
   assert.equal(state(ctx).state, 'rejected', \`the stored booking is \${JSON.stringify(state(ctx))}, expected state rejected\`);
+  // PERMISSION_DENIED is the calendar's other verdict.
+  await hold(ctx);
+  ctx.grpc.fail('Sync', ctx.grpc.status.PERMISSION_DENIED, 'calendar not shared with this tenant', 1);
+  const denied = await confirm(ctx, m);
+  assert.equal(ctx.grpc.callsTo('Sync').length, 2, \`PERMISSION_DENIED is a verdict, not a retryable failure: \${ctx.grpc.callsTo('Sync').length - 1} Sync calls were made for it\`);
+  assert.equal(denied, 'rejected', \`after PERMISSION_DENIED confirmBooking resolved \${JSON.stringify(denied)}, expected rejected\`);
+  assert.deepEqual(ctx.redis.hgetall(slotsKey('r1')), {}, \`the booking refused with PERMISSION_DENIED still holds \${JSON.stringify(ctx.redis.hgetall(slotsKey('r1')))}: release the hold\`);
+  assert.equal(state(ctx).state, 'rejected', \`after PERMISSION_DENIED the stored booking is \${JSON.stringify(state(ctx))}, expected state rejected\`);
 }
 
 export async function check_bounded_retry(ctx) {
-  const {m} = await world(ctx);
+  const {m, calendar} = await world(ctx);
+  // Only DEADLINE_EXCEEDED and UNAVAILABLE are retried: an INTERNAL error is not.
+  ctx.grpc.fail('Sync', ctx.grpc.status.INTERNAL, 'calendar bug', 1);
+  await ctx.drain(m.confirmBooking({...BOOKING})).catch(() => undefined); // the error reaching the caller is fine
+  const made = ctx.grpc.callsTo('Sync').length;
+  assert.equal(made, 1, \`an INTERNAL failure got \${made} Sync calls, expected 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried\`);
+  await hold(ctx);
+  const getsBefore = ctx.grpc.callsTo('GetEvent').length;
   ctx.grpc.fail('Sync', ctx.grpc.status.UNAVAILABLE, 'calendar down', 10);
   const result = await confirm(ctx, m);
-  const calls = ctx.grpc.callsTo('Sync').length;
+  const calls = ctx.grpc.callsTo('Sync').length - made;
   assert.equal(calls, 3, \`a calendar that stays UNAVAILABLE got \${calls} Sync calls, expected exactly 3 attempts\`);
   assert.equal(result, 'cancelled', \`confirmBooking resolved \${JSON.stringify(result)}, expected cancelled: GetEvent found no event\`);
+  const gets = ctx.grpc.callsTo('GetEvent').length - getsBefore;
+  assert(gets === 1 && calendar.stateAtGetEvent === 'sync_unknown', \`after three UNAVAILABLE attempts GetEvent was asked \${gets} times with the booking \${JSON.stringify(calendar.stateAtGetEvent)}, expected once with sync_unknown: an earlier attempt may have reached the calendar before the connection dropped\`);
   assert.deepEqual(ctx.redis.hgetall(slotsKey('r1')), {}, \`the cancelled booking still holds \${JSON.stringify(ctx.redis.hgetall(slotsKey('r1')))}\`);
   assert.equal(state(ctx).state, 'cancelled', \`the stored booking is \${JSON.stringify(state(ctx))}, expected state cancelled\`);
 }
@@ -1174,12 +1255,7 @@ func (c *calendarPeer) GetEvent(_ context.Context, req *pb.GetEventRequest) (*pb
 func clientWorld(ctx *harness.Ctx) *calendarPeer {
 	calendar := &calendarPeer{ctx: ctx, events: map[string]string{}}
 	pb.RegisterCalendarServer(ctx.GRPC.Server(""), calendar)
-	for _, f := range clientFields() {
-		ctx.Redis.Do("HSET", slots.Key("r1"), f, "h-1")
-	}
-	ctx.Redis.Set(slots.HoldKey("h-1"), "held", "EX", 900)
-	b := clientBooking
-	ctx.NoError(store.Put(context.Background(), &b), "storing the booking")
+	clientHold(ctx)
 	confirmHold = func(_ context.Context, resourceID string, fields []string, holdID, bookingID string) (int, error) {
 		n := 0
 		for _, f := range fields {
@@ -1203,6 +1279,16 @@ func clientWorld(ctx *harness.Ctx) *calendarPeer {
 		return n, nil
 	}
 	return calendar
+}
+
+// clientHold holds the booking again: its slots in the map, its hold key alive, its row in the store.
+func clientHold(ctx *harness.Ctx) {
+	for _, f := range clientFields() {
+		ctx.Redis.Do("HSET", slots.Key("r1"), f, "h-1")
+	}
+	ctx.Redis.Set(slots.HoldKey("h-1"), "held", "EX", 900)
+	b := clientBooking
+	ctx.NoError(store.Put(context.Background(), &b), "storing the booking")
 }
 
 func clientConfirm(ctx *harness.Ctx) string {
@@ -1246,6 +1332,20 @@ func CheckDeadline(ctx *harness.Ctx) {
 	s := clientState(ctx)
 	ctx.Assert(s["state"] == "confirmed" && s["event_id"] == "evt-1", "the stored booking is %v, expected state confirmed with event_id evt-1", s)
 	ctx.Equal(clientOwners(ctx), clientBooked(), "the slots after confirmation")
+	// A calendar that never answers in time: every attempt, the retries included, gets its own 3 s.
+	clientHold(ctx)
+	ctx.GRPC.SetLatency("Sync", 5.0, "")
+	ctx.Drain(func() {
+		b := clientBooking
+		_, _ = confirmBooking(context.Background(), &b)
+	})
+	var timeouts []time.Duration
+	ok := true
+	for _, c := range ctx.GRPC.CallsTo("Sync", "")[1:] {
+		timeouts = append(timeouts, c.Timeout)
+		ok = ok && c.HasDeadline() && 2500*time.Millisecond <= c.Timeout && c.Timeout <= 3500*time.Millisecond
+	}
+	ctx.Assert(ok, "against a calendar that never answers in time the Sync deadlines were %v, expected about 3 s on every attempt: a retry needs a deadline of its own, not what is left of the first one's", timeouts)
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
@@ -1272,6 +1372,7 @@ func CheckTimeoutReconcile(ctx *harness.Ctx) {
 	result := clientConfirm(ctx)
 	ctx.Assert(result != "cancelled", "every attempt timed out and the booking was cancelled: the calendar has the event, the guest will arrive to a booking the system forgot. Ask GetEvent first")
 	ctx.Equal(result, "reconciled", "confirmBooking's result")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Sync", "")), 3, "every Sync timed out: 3 attempts, each with a deadline of its own; the Sync calls")
 	gets := ctx.GRPC.CallsTo("GetEvent", "")
 	ctx.Equal(len(gets), 1, "GetEvent must be asked once by the booking's key; the calls")
 	req, _ := gets[0].Request.(*pb.GetEventRequest)
@@ -1280,6 +1381,21 @@ func CheckTimeoutReconcile(ctx *harness.Ctx) {
 	s := clientState(ctx)
 	ctx.Assert(s["state"] == "confirmed" && s["event_id"] == "evt-7", "the stored booking is %v, expected confirmed with the calendar's event evt-7", s)
 	ctx.Equal(clientOwners(ctx), clientBooked(), "the slots")
+	// Every attempt times out again, and GetEvent itself fails: the event may or may not exist.
+	clientHold(ctx)
+	ctx.GRPC.Fail("GetEvent", codes.Unavailable, "calendar down", 10, "")
+	unknown := ""
+	ctx.Drain(func() {
+		b := clientBooking
+		unknown, _ = confirmBooking(context.Background(), &b) // the error reaching the caller is fine
+	})
+	state := clientState(ctx)["state"]
+	ctx.Assert(unknown != "cancelled" && state == "sync_unknown", "GetEvent failed and the booking ended %q with state %q: a failed GetEvent says nothing about the event, so the booking stays sync_unknown for a sweeper", unknown, state)
+	held := true
+	for _, o := range clientOwners(ctx) {
+		held = held && o == "h-1"
+	}
+	ctx.Assert(held && ctx.Redis.Exists(slots.HoldKey("h-1")) == 1, "GetEvent failed and the slots point at %v: the hold must stay until the calendar answers", clientOwners(ctx))
 }
 
 func CheckNonRetryableRelease(ctx *harness.Ctx) {
@@ -1291,14 +1407,34 @@ func CheckNonRetryableRelease(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.HGetAll(slots.Key("r1")), map[string]string{}, "the refused booking's slots (release the hold, or they stay blocked for the rest of the payment window)")
 	ctx.Equal(ctx.Redis.Exists(slots.HoldKey("h-1")), 0, "the hold key after the release")
 	ctx.Equal(clientState(ctx)["state"], "rejected", "the stored booking's state")
+	// PERMISSION_DENIED is the calendar's other verdict.
+	clientHold(ctx)
+	ctx.GRPC.Fail("Sync", codes.PermissionDenied, "calendar not shared with this tenant", 1, "")
+	result = clientConfirm(ctx)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Sync", ""))-1, 1, "PERMISSION_DENIED is a verdict, not a retryable failure; the Sync calls made for it")
+	ctx.Equal(result, "rejected", "confirmBooking's result after PERMISSION_DENIED")
+	ctx.Equal(ctx.Redis.HGetAll(slots.Key("r1")), map[string]string{}, "the slots of the booking refused with PERMISSION_DENIED (release the hold)")
+	ctx.Equal(clientState(ctx)["state"], "rejected", "the stored booking's state after PERMISSION_DENIED")
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	calendar := clientWorld(ctx)
+	// Only DEADLINE_EXCEEDED and UNAVAILABLE are retried: an INTERNAL error is not.
+	ctx.GRPC.Fail("Sync", codes.Internal, "calendar bug", 1, "")
+	ctx.Drain(func() {
+		b := clientBooking
+		_, _ = confirmBooking(context.Background(), &b) // the error reaching the caller is fine
+	})
+	made := len(ctx.GRPC.CallsTo("Sync", ""))
+	ctx.Equal(made, 1, "an INTERNAL failure is not retried (only DEADLINE_EXCEEDED and UNAVAILABLE are); the Sync calls")
+	clientHold(ctx)
+	getsBefore := len(ctx.GRPC.CallsTo("GetEvent", ""))
 	ctx.GRPC.Fail("Sync", codes.Unavailable, "calendar down", 10, "")
 	result := clientConfirm(ctx)
-	ctx.Equal(len(ctx.GRPC.CallsTo("Sync", "")), 3, "a calendar that stays UNAVAILABLE gets exactly 3 attempts; the Sync calls")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Sync", ""))-made, 3, "a calendar that stays UNAVAILABLE gets exactly 3 attempts; the Sync calls")
 	ctx.Equal(result, "cancelled", "confirmBooking's result (GetEvent found no event)")
+	gets := len(ctx.GRPC.CallsTo("GetEvent", "")) - getsBefore
+	ctx.Assert(gets == 1 && calendar.stateAtGetEvent == "sync_unknown", "after three UNAVAILABLE attempts GetEvent was asked %d times with the booking %q, expected once with sync_unknown: an earlier attempt may have reached the calendar before the connection dropped", gets, calendar.stateAtGetEvent)
 	ctx.Equal(ctx.Redis.HGetAll(slots.Key("r1")), map[string]string{}, "the cancelled booking's slots")
 	ctx.Equal(clientState(ctx)["state"], "cancelled", "the stored booking's state")
 }
@@ -1352,15 +1488,20 @@ class CalendarPeer final : public booking::Calendar::Service {
   harness::Ctx& ctx_;
 };
 
+// The booking held again: its slots in the map, its hold key alive, its row in the store.
+void clientHold(harness::Ctx& ctx) {
+  for (const auto& f : clientFields()) ctx.Redis.Do("HSET", booking::slots::Key("r1"), f, "h-1");
+  ctx.Redis.Do("SET", booking::slots::HoldKey("h-1"), "held", "EX", 900);
+  booking::store::Put(kClientBooking);
+}
+
 // A held booking in the store and the map, and the calendar the harness serves.
 CalendarPeer* clientWorld(harness::Ctx& ctx) {
   static CalendarPeer* calendar = nullptr;
   delete calendar;
   calendar = new CalendarPeer(ctx);
   ctx.GRPC.Server("")->RegisterService(calendar);
-  for (const auto& f : clientFields()) ctx.Redis.Do("HSET", booking::slots::Key("r1"), f, "h-1");
-  ctx.Redis.Do("SET", booking::slots::HoldKey("h-1"), "held", "EX", 900);
-  booking::store::Put(kClientBooking);
+  clientHold(ctx);
   return calendar;
 }
 
@@ -1395,6 +1536,21 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(s.count("state") && s.at("state") == "confirmed" && s.count("event_id") && s.at("event_id") == "evt-1",
              "the stored booking is %v, expected state confirmed with event_id evt-1", s);
   ctx.Equal(clientOwners(ctx), clientBooked(), "the slots after confirmation");
+  // A calendar that never answers in time: every attempt, the retries included, gets its own 3 s.
+  clientHold(ctx);
+  ctx.GRPC.SetLatency("Sync", 5.0);
+  ctx.Drain([&] { confirmBooking(kClientBooking); });
+  const auto calls = ctx.GRPC.CallsTo("Sync");
+  std::vector<double> timeouts;
+  bool fresh = true;
+  for (size_t i = 1; i < calls.size(); ++i) {
+    timeouts.push_back(calls[i].HasDeadline() ? calls[i].TimeoutSeconds() : -1);
+    fresh = fresh && calls[i].HasDeadline() && 2.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 3.5;
+  }
+  ctx.Assert(fresh,
+             "against a calendar that never answers in time the Sync deadlines were %v s, expected about 3 s on every "
+             "attempt: a retry needs a deadline of its own, not what is left of the first one's",
+             timeouts);
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
@@ -1421,6 +1577,7 @@ void CheckTimeoutReconcile(harness::Ctx& ctx) {
              "every attempt timed out and the booking was cancelled: the calendar has the event, the guest will arrive to a "
              "booking the system forgot. Ask GetEvent first");
   ctx.Equal(result, "reconciled", "confirmBooking's result");
+  ctx.Equal(ctx.GRPC.CallsTo("Sync").size(), 3, "every Sync timed out: 3 attempts, each with a deadline of its own; the Sync calls");
   const auto gets = ctx.GRPC.CallsTo("GetEvent");
   ctx.Equal(gets.size(), 1, "GetEvent must be asked once by the booking's key; the calls");
   ctx.Equal(gets[0].Request<booking::GetEventRequest>().idempotency_key(), "k-1", "GetEvent's key");
@@ -1431,6 +1588,25 @@ void CheckTimeoutReconcile(harness::Ctx& ctx) {
   ctx.Assert(s.count("state") && s.at("state") == "confirmed" && s.count("event_id") && s.at("event_id") == "evt-7",
              "the stored booking is %v, expected confirmed with the calendar's event evt-7", s);
   ctx.Equal(clientOwners(ctx), clientBooked(), "the slots");
+  // Every attempt times out again, and GetEvent itself fails: the event may or may not exist.
+  clientHold(ctx);
+  ctx.GRPC.Fail("GetEvent", grpc::StatusCode::UNAVAILABLE, "calendar down", 10);
+  std::string unknown;
+  ctx.Drain([&] {
+    try {
+      unknown = confirmBooking(kClientBooking);
+    } catch (const std::exception&) {
+      // the error reaching the caller is fine
+    }
+  });
+  const std::string unknownState = clientState(ctx)["state"];
+  ctx.Assert(unknown != "cancelled" && unknownState == "sync_unknown",
+             "GetEvent failed and the booking ended %q with state %q: a failed GetEvent says nothing about the event, so the "
+             "booking stays sync_unknown for a sweeper",
+             unknown, unknownState);
+  ctx.Assert(clientOwners(ctx) == std::vector<std::string>(clientFields().size(), "h-1") &&
+                 ctx.Redis.Exists(booking::slots::HoldKey("h-1")) == 1,
+             "GetEvent failed and the slots point at %v: the hold must stay until the calendar answers", clientOwners(ctx));
 }
 
 void CheckNonRetryableRelease(harness::Ctx& ctx) {
@@ -1443,14 +1619,41 @@ void CheckNonRetryableRelease(harness::Ctx& ctx) {
             "the refused booking's slots (release the hold, or they stay blocked for the rest of the payment window)");
   ctx.Equal(ctx.Redis.Exists(booking::slots::HoldKey("h-1")), 0, "the hold key after the release");
   ctx.Equal(clientState(ctx)["state"], "rejected", "the stored booking's state");
+  // PERMISSION_DENIED is the calendar's other verdict.
+  clientHold(ctx);
+  ctx.GRPC.Fail("Sync", grpc::StatusCode::PERMISSION_DENIED, "calendar not shared with this tenant", 1);
+  const std::string denied = clientConfirm(ctx);
+  ctx.Equal(ctx.GRPC.CallsTo("Sync").size() - 1, 1, "PERMISSION_DENIED is a verdict, not a retryable failure; the Sync calls made for it");
+  ctx.Equal(denied, "rejected", "confirmBooking's result after PERMISSION_DENIED");
+  ctx.Equal(ctx.Redis.HGetAll(booking::slots::Key("r1")), std::map<std::string, std::string>{},
+            "the slots of the booking refused with PERMISSION_DENIED (release the hold)");
+  ctx.Equal(clientState(ctx)["state"], "rejected", "the stored booking's state after PERMISSION_DENIED");
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  auto* calendar = clientWorld(ctx);
+  // Only DEADLINE_EXCEEDED and UNAVAILABLE are retried: an INTERNAL error is not.
+  ctx.GRPC.Fail("Sync", grpc::StatusCode::INTERNAL, "calendar bug", 1);
+  ctx.Drain([&] {
+    try {
+      confirmBooking(kClientBooking);
+    } catch (const std::exception&) {
+      // the error reaching the caller is fine
+    }
+  });
+  const size_t made = ctx.GRPC.CallsTo("Sync").size();
+  ctx.Equal(made, 1, "an INTERNAL failure is not retried (only DEADLINE_EXCEEDED and UNAVAILABLE are); the Sync calls");
+  clientHold(ctx);
+  const size_t getsBefore = ctx.GRPC.CallsTo("GetEvent").size();
   ctx.GRPC.Fail("Sync", grpc::StatusCode::UNAVAILABLE, "calendar down", 10);
   const std::string result = clientConfirm(ctx);
-  ctx.Equal(ctx.GRPC.CallsTo("Sync").size(), 3, "a calendar that stays UNAVAILABLE gets exactly 3 attempts; the Sync calls");
+  ctx.Equal(ctx.GRPC.CallsTo("Sync").size() - made, 3, "a calendar that stays UNAVAILABLE gets exactly 3 attempts; the Sync calls");
   ctx.Equal(result, "cancelled", "confirmBooking's result (GetEvent found no event)");
+  const size_t gets = ctx.GRPC.CallsTo("GetEvent").size() - getsBefore;
+  ctx.Assert(gets == 1 && calendar->stateAtGetEvent == "sync_unknown",
+             "after three UNAVAILABLE attempts GetEvent was asked %d times with the booking %q, expected once with "
+             "sync_unknown: an earlier attempt may have reached the calendar before the connection dropped",
+             gets, calendar->stateAtGetEvent);
   ctx.Equal(ctx.Redis.HGetAll(booking::slots::Key("r1")), std::map<std::string, std::string>{}, "the cancelled booking's slots");
   ctx.Equal(clientState(ctx)["state"], "cancelled", "the stored booking's state");
 }
@@ -1459,7 +1662,7 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   hints: [
     'Guests find two invitations for one booking in their calendar, and after a slow afternoon at the calendar vendor a room shows free while its booking is on the vendor side.',
     'A retry is only safe when the calendar can tell it is the same booking; without the key each attempt is a new event. A timeout says nothing about whether the event exists: it may have been created.',
-    'Send `idempotency_key` and a 3000 ms deadline on every attempt; retry `DEADLINE_EXCEEDED`/`UNAVAILABLE` at most 3 times; release on `INVALID_ARGUMENT`; after the last failure record `sync_unknown`, then `GetEvent` decides.',
+    'Send `idempotency_key` and a 3000 ms deadline on every attempt; retry `DEADLINE_EXCEEDED`/`UNAVAILABLE` at most 3 times; release on `INVALID_ARGUMENT` or `PERMISSION_DENIED`; after the last failure record `sync_unknown`, then `GetEvent` decides.',
   ],
   debrief: `The sync is written around one fact about the network: a call that did not answer is not a call that did not happen. The idempotency key makes the retry safe, the attempt cap makes the failure finite, and the reconciliation step turns "unknown" into "known" before the booking is touched. The permanent-rejection path exists because a hold that is not released costs the slot for the whole payment window, which for a refused booking is pure loss. The recorded \`sync_unknown\` state is what a crash in the middle of all this leaves behind for a sweeper to pick up. Production systems run that sweeper on a schedule, back the retries off with jitter, put a circuit breaker in front of each calendar vendor, and send a delete to the external calendar when a reconciled booking is later cancelled.`,
 };

@@ -129,7 +129,7 @@ client that times out and retries starts a second job and a second bill; a reque
       id: 'idempotency-key',
       title: 'A retry with the same Idempotency-Key answers the first job',
       detail:
-        '`Idempotency-Key` is required (**400**); `job_for_key`/`jobForKey` is asked before a job is created, a new job is recorded with `remember_key`/`rememberKey`, and only the job the key belongs to is enqueued.',
+        '`Idempotency-Key` is required (**400**); `job_for_key`/`jobForKey` is asked before a job is created, so a retry creates no second job; a new job is recorded with `remember_key`/`rememberKey`, and a start that loses the key to a concurrent retry answers that retry’s job and enqueues nothing.',
       match: {
         python: {
           all: [/idempotency-key/i, /jobs\.job_for_key\(/, /jobs\.remember_key\(/, /\b400\b/],
@@ -743,6 +743,8 @@ async def check_validate(ctx):
         assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
         r = await _start(c, key="k-2", effort="exhaustive")
         assert r.status_code == 400, f"an effort outside fact, compare and deep answered {r.status_code}, expected 400"
+        r = await _start(c, key="k-6", effort="constructor")
+        assert r.status_code == 400, f"the effort 'constructor' answered {r.status_code}, expected 400: only fact, compare and deep are efforts"
         r = await _start(c, key="k-3", query="é" * 4097)
         assert r.status_code == 413, f"a query of 8194 bytes (4097 characters of UTF-8) answered {r.status_code}, expected 413: the cap counts bytes"
         r = await _start(c, key="k-4", query="")
@@ -761,8 +763,8 @@ async def check_budget_table(ctx):
         assert job.get("budget") == FACT, f"a fact job asking for 100000 tool calls got the budget {job.get('budget')}: the budget comes from EFFORT_BUDGETS, not the body"
         stored = jobs.get_job(job["job_id"])
         assert stored["budget"] == FACT, f"the stored job's budget is {stored['budget']}, expected {FACT}"
-        deep = (await _start(c, key="k-2", effort="deep")).json()
-        assert deep.get("budget") == DEEP, f"a deep job got {deep.get('budget')}, expected {DEEP}"
+        deep = (await _start(c, key="k-2", effort="deep", max_subagents=1, max_tool_calls=3)).json()
+        assert deep.get("budget") == DEEP, f"a deep job asking for 3 tool calls got {deep.get('budget')}, expected {DEEP}: a budget field in the body is ignored, larger or smaller"
         compare = (await _start(c, key="k-3")).json()
         assert compare.get("budget") == COMPARE, f"a compare job got {compare.get('budget')}, expected {COMPARE}"
         r = await c.post("/v1/research", json={"query": QUERY}, headers={"X-Tenant-Id": "acme", "Idempotency-Key": "k-4"})
@@ -776,6 +778,15 @@ async def check_idempotency_key(ctx):
         replay = await _start(c, key="k-1")
         assert replay.status_code == 202 and replay.json().get("job_id") == first.json()["job_id"], f"a retry with the same Idempotency-Key started {replay.json().get('job_id')}, expected the first job {first.json()['job_id']}"
         assert _queue(ctx) == [first.json()["job_id"]], f"research:queue holds {_queue(ctx)}: a retry must not enqueue a second job"
+        stored = sorted(ctx.redis.keys("research:job-*"))
+        assert stored == [f"research:{first.json()['job_id']}"], f"after a start and its retry Redis holds the jobs {stored}: a retry must find its job with job_for_key, not create another"
+        # A concurrent retry with key k-9 records its job between this request's lookup and its own record.
+        rival = jobs.create_job("acme", QUERY, "compare", COMPARE)["job_id"]
+        probe = ctx.redis_after("research:idem:acme:k-9", lambda: ctx.redis.set("research:idem:acme:k-9", rival))
+        lost = await _start(c, key="k-9")
+        assert probe.fired, "the start with Idempotency-Key k-9 never looked the key up"
+        assert lost.status_code == 202 and lost.json().get("job_id") == rival, f"a concurrent retry recorded {rival} under the key first, but the start answered {lost.status_code} {lost.text}: answer the job remember_key says the key belongs to"
+        assert _queue(ctx) == [first.json()["job_id"]], f"research:queue holds {_queue(ctx)} after a start lost the key to a concurrent retry: enqueue only your own job, and only when the key is yours"
         other = await _start(c, tenant="beta", key="k-1")
         assert other.status_code == 202 and other.json().get("job_id") != first.json()["job_id"], "the same key from another tenant is another request: it must start its own job"
         none = await _start(c, key=None)
@@ -832,6 +843,8 @@ export async function check_validate(ctx) {
   assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
   r = await start(c, {key: 'k-2', effort: 'exhaustive'});
   assert.equal(r.status, 400, \`an effort outside fact, compare and deep answered \${r.status}, expected 400\`);
+  r = await start(c, {key: 'k-6', effort: 'constructor'});
+  assert.equal(r.status, 400, \`the effort 'constructor' answered \${r.status}, expected 400: only fact, compare and deep are efforts\`);
   r = await start(c, {key: 'k-3', query: 'é'.repeat(4097)});
   assert.equal(r.status, 413, \`a query of 8194 bytes (4097 characters of UTF-8) answered \${r.status}, expected 413: the cap counts bytes\`);
   r = await start(c, {key: 'k-4', query: ''});
@@ -849,19 +862,29 @@ export async function check_budget_table(ctx) {
   const job = r.json();
   assert.deepStrictEqual(job.budget, FACT, \`a fact job asking for 100000 tool calls got the budget \${JSON.stringify(job.budget)}: the budget comes from EFFORT_BUDGETS, not the body\`);
   assert.deepStrictEqual((await jobs.getJob(job.job_id)).budget, FACT, 'the stored job must carry the fact budget');
-  assert.deepStrictEqual((await start(c, {key: 'k-2', effort: 'deep'})).json().budget, DEEP, 'a deep job must get the deep budget');
+  const deep = (await start(c, {key: 'k-2', effort: 'deep', max_subagents: 1, max_tool_calls: 3})).json();
+  assert.deepStrictEqual(deep.budget, DEEP, \`a deep job asking for 3 tool calls got \${JSON.stringify(deep.budget)}: a budget field in the body is ignored, larger or smaller\`);
   assert.deepStrictEqual((await start(c, {key: 'k-3'})).json().budget, COMPARE, 'a compare job must get the compare budget');
   r = await c.post('/v1/research', {json: {query: QUERY}, headers: {'X-Tenant-Id': 'acme', 'Idempotency-Key': 'k-4'}});
   assert(r.status === 202 && JSON.stringify(r.json().budget) === JSON.stringify(FACT), \`a request without an effort must get the fact budget, got \${r.status} \${r.text}\`);
 }
 
 export async function check_idempotency_key(ctx) {
-  const {c} = api(ctx);
+  const {c, jobs} = api(ctx);
   const first = await start(c, {key: 'k-1'});
   assert.equal(first.status, 202, \`the first start answered \${first.status}: \${first.text}\`);
   const replay = await start(c, {key: 'k-1'});
   assert(replay.status === 202 && replay.json().job_id === first.json().job_id, \`a retry with the same Idempotency-Key started \${replay.json().job_id}, expected the first job \${first.json().job_id}\`);
   assert.deepStrictEqual(queue(ctx), [first.json().job_id], \`research:queue holds \${JSON.stringify(queue(ctx))}: a retry must not enqueue a second job\`);
+  const stored = ctx.redis.keys('research:job-*').sort();
+  assert.deepStrictEqual(stored, [\`research:\${first.json().job_id}\`], \`after a start and its retry Redis holds the jobs \${JSON.stringify(stored)}: a retry must find its job with jobForKey, not create another\`);
+  // A concurrent retry with key k-9 records its job between this request's lookup and its own record.
+  const rival = (await jobs.createJob('acme', QUERY, 'compare', COMPARE)).job_id;
+  const probe = ctx.redisAfter('research:idem:acme:k-9', () => ctx.redis.set('research:idem:acme:k-9', rival));
+  const lost = await start(c, {key: 'k-9'});
+  assert(probe.fired, 'the start with Idempotency-Key k-9 never looked the key up');
+  assert(lost.status === 202 && lost.json().job_id === rival, \`a concurrent retry recorded \${rival} under the key first, but the start answered \${lost.status} \${lost.text}: answer the job rememberKey says the key belongs to\`);
+  assert.deepStrictEqual(queue(ctx), [first.json().job_id], \`research:queue holds \${JSON.stringify(queue(ctx))} after a start lost the key to a concurrent retry: enqueue only your own job, and only when the key is yours\`);
   const other = await start(c, {tenant: 'beta', key: 'k-1'});
   assert(other.status === 202 && other.json().job_id !== first.json().job_id, 'the same key from another tenant is another request: it must start its own job');
   const none = await start(c, {key: null});
@@ -888,6 +911,7 @@ export async function check_tenant_scope(ctx) {
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 
 	"research/jobs"
@@ -949,6 +973,7 @@ func CheckValidate(ctx *harness.Ctx) {
 	c := api(ctx)
 	ctx.Equal(start(c, "", "k-1", nil).Status, 401, "a request without X-Tenant-Id")
 	ctx.Equal(start(c, "acme", "k-2", map[string]any{"effort": "exhaustive"}).Status, 400, "an effort outside fact, compare and deep")
+	ctx.Equal(start(c, "acme", "k-6", map[string]any{"effort": "constructor"}).Status, 400, "the effort 'constructor' (only fact, compare and deep are efforts)")
 	ctx.Equal(start(c, "acme", "k-3", map[string]any{"query": strings.Repeat("é", 4097)}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)")
 	ctx.Equal(start(c, "acme", "k-4", map[string]any{"query": ""}).Status, 400, "an empty query")
 	ctx.Equal(len(queue(ctx)), 0, "refused requests must not enqueue a job; research:queue length")
@@ -964,7 +989,7 @@ func CheckBudgetTable(ctx *harness.Ctx) {
 	job := jobOf(r)
 	ctx.Equal(job.Budget, factBudget, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from effortBudgets, not the body")
 	ctx.Equal(jobs.GetJob(context.Background(), job.JobID).Budget, factBudget, "the stored job's budget")
-	ctx.Equal(jobOf(start(c, "acme", "k-2", map[string]any{"effort": "deep"})).Budget, deepBudget, "a deep job's budget")
+	ctx.Equal(jobOf(start(c, "acme", "k-2", map[string]any{"effort": "deep", "max_subagents": 1, "max_tool_calls": 3})).Budget, deepBudget, "a deep job asking for 3 tool calls must get the deep budget: a budget field in the body is ignored, larger or smaller")
 	ctx.Equal(jobOf(start(c, "acme", "k-3", nil)).Budget, compareBudget, "a compare job's budget")
 	r = c.Post("/v1/research", map[string]any{"query": apiQuery}, "X-Tenant-Id", "acme", "Idempotency-Key", "k-4")
 	ctx.Equal(r.Status, 202, "a request without an effort (%s)", r.Text())
@@ -978,6 +1003,16 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	replay := start(c, "acme", "k-1", nil)
 	ctx.Equal(jobOf(replay).JobID, jobOf(first).JobID, "a retry with the same Idempotency-Key must answer the first job; the job_id")
 	ctx.Equal(queue(ctx), []string{jobOf(first).JobID}, "a retry must not enqueue a second job; research:queue")
+	stored := ctx.Redis.Keys("research:job-*")
+	sort.Strings(stored)
+	ctx.Equal(stored, []string{jobs.JobKey(jobOf(first).JobID)}, "a retry must find its job with JobForKey, not create another; the job hashes after a start and its retry")
+	// A concurrent retry with key k-9 records its job between this request's lookup and its own record.
+	rival := jobs.CreateJob(context.Background(), "acme", apiQuery, "compare", compareBudget).JobID
+	probe := ctx.Redis.After("research:idem:acme:k-9", func() any { return ctx.Redis.Set("research:idem:acme:k-9", rival) })
+	lost := start(c, "acme", "k-9", nil)
+	ctx.Assert(probe.Fired, "the start with Idempotency-Key k-9 never looked the key up")
+	ctx.Assert(lost.Status == 202 && jobOf(lost).JobID == rival, "a concurrent retry recorded %s under the key first, but the start answered %d %s: answer the job RememberKey says the key belongs to", rival, lost.Status, lost.Text())
+	ctx.Equal(queue(ctx), []string{jobOf(first).JobID}, "after a start lost the key to a concurrent retry, enqueue only your own job and only when the key is yours; research:queue")
 	other := start(c, "beta", "k-1", nil)
 	ctx.Assert(other.Status == 202 && jobOf(other).JobID != jobOf(first).JobID, "the same key from another tenant is another request: it must start its own job, got %s", other.Text())
 	ctx.Equal(start(c, "acme", "", nil).Status, 400, "a start without Idempotency-Key")
@@ -1000,6 +1035,7 @@ func CheckTenantScope(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -1056,6 +1092,7 @@ void CheckValidate(harness::Ctx& ctx) {
   auto c = api(ctx);
   ctx.Equal(start(c, "", "k-1").Status, 401, "a request without X-Tenant-Id");
   ctx.Equal(start(c, "acme", "k-2", {{"effort", "exhaustive"}}).Status, 400, "an effort outside fact, compare and deep");
+  ctx.Equal(start(c, "acme", "k-6", {{"effort", "constructor"}}).Status, 400, "the effort 'constructor' (only fact, compare and deep are efforts)");
   std::string wide;
   for (int i = 0; i < 4097; i++) wide += "é";
   ctx.Equal(start(c, "acme", "k-3", {{"query", wide}}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)");
@@ -1073,7 +1110,8 @@ void CheckBudgetTable(harness::Ctx& ctx) {
   const auto job = jobOf(r);
   ctx.Equal(job.value("budget", nlohmann::json()), kFact, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from kEffortBudgets, not the body");
   ctx.Equal(jobs::getJob(job.value("job_id", ""))->budget.max_tool_calls, 10, "the stored job's max_tool_calls");
-  ctx.Equal(jobOf(start(c, "acme", "k-2", {{"effort", "deep"}})).value("budget", nlohmann::json()), kDeep, "a deep job's budget");
+  ctx.Equal(jobOf(start(c, "acme", "k-2", {{"effort", "deep"}, {"max_subagents", 1}, {"max_tool_calls", 3}})).value("budget", nlohmann::json()), kDeep,
+            "a deep job asking for 3 tool calls must get the deep budget: a budget field in the body is ignored, larger or smaller");
   ctx.Equal(jobOf(start(c, "acme", "k-3")).value("budget", nlohmann::json()), kCompare, "a compare job's budget");
   r = c.Post("/v1/research", nlohmann::json{{"query", kQuery}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "Idempotency-Key", "k-4");
   ctx.Equal(r.Status, 202, "a request without an effort (%s)", r.Text());
@@ -1088,6 +1126,21 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   const auto replay = start(c, "acme", "k-1");
   ctx.Equal(jobOf(replay).value("job_id", ""), first_id, "a retry with the same Idempotency-Key must answer the first job; the job_id");
   ctx.Equal(queue(ctx), {first_id}, "a retry must not enqueue a second job; research:queue");
+  auto stored = ctx.Redis.Keys("research:job-*");
+  std::sort(stored.begin(), stored.end());
+  ctx.Equal(stored, {jobs::jobKey(first_id)}, "a retry must find its job with jobs::jobForKey, not create another; the job hashes after a start and its retry");
+  // A concurrent retry with key k-9 records its job between this request's lookup and its own record.
+  const std::string rival = jobs::createJob("acme", kQuery, "compare", {4, 60, 250000}).job_id;
+  bool fired = false;
+  ctx.Redis.After("research:idem:acme:k-9", [&ctx, &fired, rival] {
+    fired = true;
+    ctx.Redis.Set("research:idem:acme:k-9", rival);
+  });
+  const auto lost = start(c, "acme", "k-9");
+  ctx.Assert(fired, "the start with Idempotency-Key k-9 never looked the key up");
+  ctx.Assert(lost.Status == 202 && jobOf(lost).value("job_id", "") == rival,
+             "a concurrent retry recorded %s under the key first, but the start answered %d %s: answer the job jobs::rememberKey says the key belongs to", rival, lost.Status, lost.Text());
+  ctx.Equal(queue(ctx), {first_id}, "after a start lost the key to a concurrent retry, enqueue only your own job and only when the key is yours; research:queue");
   const auto other = start(c, "beta", "k-1");
   ctx.Assert(other.Status == 202 && jobOf(other).value("job_id", "") != first_id, "the same key from another tenant is another request: it must start its own job, got %s", other.Text());
   ctx.Equal(start(c, "acme", "").Status, 400, "a start without Idempotency-Key");

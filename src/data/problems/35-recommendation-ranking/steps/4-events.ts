@@ -94,7 +94,7 @@ error reaches the outbox.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'The outcome comes from the delivery report (`on_delivery`, an awaited `send`, the delivery channel, `dr_cb`, the send future), waited for at most 2 s; a failure or no report writes the outbox row. The starter catches only the local enqueue error, which a broker rejection never raises.',
+        'The outcome comes from the request’s own delivery report (`on_delivery`, an awaited `send`, the delivery channel, `dr_cb`, the send future), waited for at most 2 s; a failure or no report writes the outbox row. A report that arrives after its request gave up must neither be read as a later request’s outcome nor hold up the reports after it. The starter catches only the local enqueue error, which a broker rejection never raises.',
       match: {
         python: {
           all: [/store\.outbox_insert\(/, /on_delivery\s*=/, /producer\.flush\(/],
@@ -503,6 +503,7 @@ bool publishImpression(const std::string& tenant, const std::string& user_id, co
       solution: `#include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -514,11 +515,22 @@ using json = nlohmann::json;
 const std::string kTopic = "recsys.impression";
 constexpr int kAckTimeoutMs = 2000;
 
-// The delivery report of the record in flight: publishImpression produces one record and waits for it.
+// One record's delivery outcome. Its report may be served by another publisher's flush, or arrive
+// after this publisher gave up waiting.
+struct Delivery {
+  std::atomic<bool> reported{false};
+  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
+};
+
+// Hands each delivery report to its own record: the record's msg_opaque owns a reference to its outcome.
 class DeliveryReport : public RdKafka::DeliveryReportCb {
  public:
-  RdKafka::ErrorCode error = RdKafka::ERR_NO_ERROR;
-  void dr_cb(RdKafka::Message& message) override { error = message.err(); }
+  void dr_cb(RdKafka::Message& message) override {
+    auto* delivery = static_cast<std::shared_ptr<Delivery>*>(message.msg_opaque());
+    (*delivery)->error = message.err();
+    (*delivery)->reported.store(true, std::memory_order_release);
+    delete delivery;
+  }
 };
 
 DeliveryReport delivery;
@@ -549,12 +561,15 @@ json impressionPayload(const std::string& tenant, const std::string& user_id, co
 bool publishImpression(const std::string& tenant, const std::string& user_id, const std::string& surface, const recs::Ranked& ranked) {
   const json payload = impressionPayload(tenant, user_id, surface, ranked);
   const std::string value = payload.dump();
-  delivery.error = RdKafka::ERR_NO_ERROR;
+  auto outcome = std::make_shared<Delivery>();
+  auto* opaque = new std::shared_ptr<Delivery>(outcome);
   RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()),
-                                             value.size(), user_id.c_str(), user_id.size(), 0, nullptr);
-  if (err == RdKafka::ERR_NO_ERROR) {
-    producer->flush(kAckTimeoutMs);  // serves the delivery report, or gives up after the window
-    err = producer->outq_len() > 0 ? RdKafka::ERR__TIMED_OUT : delivery.error;
+                                             value.size(), user_id.c_str(), user_id.size(), 0, opaque);
+  if (err != RdKafka::ERR_NO_ERROR) {
+    delete opaque;  // never enqueued: no report will come for it
+  } else {
+    producer->flush(kAckTimeoutMs);  // serves the delivery reports, or gives up after the window
+    err = outcome->reported.load(std::memory_order_acquire) ? outcome->error : RdKafka::ERR__TIMED_OUT;
   }
   if (err != RdKafka::ERR_NO_ERROR) {
     // The broker did not take it: the relay produces the row later, so the impression is late, not lost.
@@ -628,10 +643,21 @@ def check_outbox_on_failure(ctx):
     before = ctx.clock.time()
     ok = m.publish_impression("t1", "u-2", "home", RANKED)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_impression waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_impression waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("user_id") == "u-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_impression returned {ok!r} without a delivery report, expected False"
+    # The broker answers again: the abandoned delivery report arrives, and must neither stall the
+    # producer nor be read as another request's outcome.
+    ctx.kafka.resume(TOPIC)
+    ctx.kafka.fail_next(TOPIC, 1)
+    ok = m.publish_impression("t1", "u-3", "home", RANKED)
+    rows = _outbox(ctx)
+    assert len(rows) == 3 and rows[2].get("payload", {}).get("user_id") == "u-3" and ok is False, f"after the broker came back, u-3's delivery failed and publish_impression returned {ok!r} with the outbox holding {rows}: each request must read its own delivery report, not one left over from an earlier request"
+    before = ctx.clock.time()
+    ok = m.publish_impression("t1", "u-4", "home", RANKED)
+    waited = ctx.clock.time() - before
+    assert ok is True and len(_outbox(ctx)) == 3, f"after the broker came back, a healthy delivery of u-4 returned {ok!r} after {waited:.1f} s: an earlier request's abandoned delivery report must not block the producer's later reports"
 `,
     typescript: `const TOPIC = 'recsys.impression';
 const RANKED = {
@@ -711,10 +737,23 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishImpression('t1', 'u-2', 'home', RANKED);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishImpression waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishImpression waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.user_id === 'u-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishImpression resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+  // The broker answers again: the abandoned delivery report arrives, and must neither stall the
+  // producer nor be read as another request's outcome.
+  ctx.kafka.resume(TOPIC);
+  await settle();
+  ctx.kafka.failNext(TOPIC, 1);
+  ok = await m.publishImpression('t1', 'u-3', 'home', RANKED);
+  await settle();
+  rows = outboxRows(ctx);
+  assert(rows.length === 3 && rows[2].payload?.user_id === 'u-3' && ok === false, \`after the broker came back, u-3's delivery failed and publishImpression resolved \${JSON.stringify(ok)} with the outbox holding \${JSON.stringify(rows)}: each request must read its own delivery report, not one left over from an earlier request\`);
+  const resumed = ctx.clock.now();
+  ok = await m.publishImpression('t1', 'u-4', 'home', RANKED);
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 3, \`after the broker came back, a healthy delivery of u-4 resolved \${JSON.stringify(ok)} after \${((ctx.clock.now() - resumed) / 1000).toFixed(1)} s: an earlier request's abandoned delivery report must not block the producer's later reports\`);
 }
 `,
     go: `package main
@@ -805,10 +844,22 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = publish(ctx, "u-2", ranked)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishImpression waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishImpression waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
 	rows = outboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["user_id"] == "u-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishImpression's result without a delivery report")
+	// The broker answers again: the abandoned delivery report arrives, and must neither stall the
+	// producer nor be read as another request's outcome.
+	ctx.Kafka.Resume(eventsTopic)
+	ctx.Settle()
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok = publish(ctx, "u-3", ranked)
+	rows = outboxRows(ctx)
+	ctx.Assert(len(rows) == 3 && rows[2].Payload["user_id"] == "u-3" && !ok, "after the broker came back, u-3's delivery failed and publishImpression answered %t with the outbox holding %v: each request must read its own delivery report, not one left over from an earlier request", ok, rows)
+	before = ctx.Clock.Now()
+	ok = publish(ctx, "u-4", ranked)
+	waited = float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(ok && len(outboxRows(ctx)) == 3, "after the broker came back, a healthy delivery of u-4 answered %t after %.1f s: an earlier request's abandoned delivery report must not block the producer's later reports", ok, waited)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -889,10 +940,25 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publishImpression("t1", "u-2", "home", kRanked);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishImpression waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishImpression waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeout = 2 s, then write the outbox row", waited);
   rows = outboxRows(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "user_id") == "u-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishImpression's result without a delivery report");
+  // The broker answers again: the abandoned delivery report arrives, and must neither stall the
+  // producer nor be read as another request's outcome.
+  ctx.Kafka.Resume(kEventsTopic);
+  ctx.Settle();
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ok = publishImpression("t1", "u-3", "home", kRanked);
+  ctx.Settle();
+  rows = outboxRows(ctx);
+  ctx.Assert(rows.size() == 3 && rows[2].contains("payload") && field(rows[2]["payload"], "user_id") == "u-3" && !ok,
+             "after the broker came back, u-3's delivery failed and publishImpression answered %t with the outbox holding %d rows: each request must read its own delivery report, not one left over from an earlier request", ok, rows.size());
+  const int64_t resumed = ctx.Clock.Now();
+  ok = publishImpression("t1", "u-4", "home", kRanked);
+  ctx.Settle();
+  ctx.Assert(ok && outboxRows(ctx).size() == 3, "after the broker came back, a healthy delivery of u-4 answered %t after %.1f s: an earlier request's abandoned delivery report must not block the producer's later reports", ok,
+             static_cast<double>(ctx.Clock.Now() - resumed) / 1000);
 }
 `,
   },

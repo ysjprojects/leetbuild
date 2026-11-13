@@ -59,7 +59,7 @@ after the handler ran has already paid for the detector and the model on the req
       id: 'window-ttl',
       title: 'Keys by window and expires the key when it is created',
       detail:
-        'The key is `aifw:rl:{api_key}:{window}` with the window from `WINDOW_S`, and the script sets `EXPIRE` on the count it created and returns its `TTL`. The starter keys by API key alone and sets no expiry, so the count only grows.',
+        'The key is `aifw:rl:{api_key}:{window}` with the window from `WINDOW_S`, and the same script that creates the count sets its `EXPIRE` and returns its `TTL`, so the key never exists without an expiry. The starter keys by API key alone and sets no expiry, so the count only grows.',
       match: {
         python: {all: [/aifw:rl:\{[^}]+\}:\{[^}]+\}/, /WINDOW_S/, /EXPIRE/, /TTL/]},
         typescript: {all: [/aifw:rl:\$\{[^}]+\}:\$\{[^}]+\}/, /WINDOW_S/, /EXPIRE/, /TTL/]},
@@ -85,7 +85,7 @@ after the handler ran has already paid for the detector and the model on the req
       id: 'limit-first',
       title: 'Refuses before the handler runs',
       detail:
-        'The limit is consulted before the request reaches the handler, so a refused request costs no detector call and no model call. The starter lets the handler run first and refuses afterwards.',
+        'The limit is consulted before the request reaches the handler, so a refused request costs no detector call and no model call; a request without a key goes straight to the route’s 401 and opens no window. The starter lets the handler run first and refuses afterwards.',
       match: {
         python: {order: [/=\s*check_limit\(/, /call_next\(/]},
         typescript: {
@@ -580,10 +580,9 @@ class Assistant(firewall_pb2_grpc.AssistantServicer):
 
 def _aifw(ctx):
     """Step 1's app with the limit installed on it: the app rate_limit imported, not a fresh one."""
-    # Start at least 40 s before the next minute boundary, so the window does not roll over mid-check.
-    remaining = 60 - ctx.clock.time() % 60
-    if remaining < 40:
-        ctx.clock.advance(remaining + 1)
+    # Start 15 s into a minute: the window cannot roll over mid-check, and a window's TTL (60 s from
+    # its first request) outlasts the minute it counts, so Retry-After is the TTL, not the minute's rest.
+    ctx.clock.advance(75 - ctx.clock.time() % 60)
     ctx.grpc.serve(firewall_pb2_grpc.add_PromptGuardServicer_to_server, Guard())
     ctx.grpc.serve(firewall_pb2_grpc.add_AssistantServicer_to_server, Assistant())
     ctx.load("rate_limit")
@@ -634,14 +633,17 @@ async def check_atomic(ctx):
 
 async def check_window_ttl(ctx):
     app = _aifw(ctx)
+    window_key = _window_key(ctx)
+    # The key's TTL the moment the first command that touched it has run: one script has already set it.
+    born = ctx.redis_after(window_key, lambda: ctx.redis.ttl(window_key))
     async with ctx.client(app) as c:
         statuses = await _burst(c, LIMIT + 1)
         assert statuses == [200] * LIMIT + [429], f"a fresh key gets {LIMIT} requests, then 429: got {statuses.count(200)} x 200 and {statuses.count(429)} x 429 (last: {statuses[-1]})"
         keys = _window_keys(ctx)
-        window_key = _window_key(ctx)
         assert keys == [window_key], f"the window keys are {keys}, expected [{window_key!r}]: aifw:rl:{{api_key}}:{{window}} with window = floor(now / 60)"
         ttl = ctx.redis.ttl(window_key)
         assert 0 < ttl <= 60, f"{window_key} has TTL {ttl}: the script must EXPIRE the key it created (60 s), or the count lives forever"
+        assert born.fired and born.result is not None and 0 < born.result <= 60, f"right after the first command that touched {window_key} its TTL was {born.result}: EXPIRE ran in a command of its own, so a replica that dies in between leaves a count that never expires. The script sets EXPIRE when it creates the key"
         ctx.clock.advance(61)
         r = await c.post("/v1/chat", json=BODY, headers=K)
         assert r.status_code == 200, f"61 s later, in a new window, the caller answered {r.status_code}, expected 200: the window must reset"
@@ -675,8 +677,10 @@ async def check_limit_first(ctx):
         chats = len(ctx.grpc.calls_to("Chat"))
         assert detects == LIMIT, f"{LIMIT + 1} requests made {detects} Detect calls: the refused request was scored before the limit answered. The limit runs before the handler; a refused request costs nothing"
         assert chats == LIMIT, f"{LIMIT + 1} requests made {chats} Chat calls: the refused request reached the application"
+        before = _window_keys(ctx)
         r = await c.post("/v1/chat", json=BODY)
         assert r.status_code == 401, f"a request without a key answered {r.status_code}, expected the route's 401"
+        assert _window_keys(ctx) == before, f"a request without a key left the window keys {_window_keys(ctx)} (before: {before}): it is the route's 401, not a window of its own"
 `,
     typescript: `const K = {'X-Api-Key': 'key-7f3a'};
 const BODY = {model: 'assistant-v2', input: {prompt: 'What is the capital of France?'}};
@@ -686,9 +690,9 @@ const windowKey = ctx => \`aifw:rl:key-7f3a:\${Math.floor(ctx.clock.now() / 6000
 
 /** Step 1's app with the limit installed on it (the instance rate_limit imported). */
 function aifw(ctx) {
-  // Start at least 40 s before the next minute boundary, so the window does not roll over mid-check.
-  const remaining = 60 - (ctx.clock.now() / 1000) % 60;
-  if (remaining < 40) ctx.clock.advance(remaining + 1);
+  // Start 15 s into a minute: the window cannot roll over mid-check, and a window's TTL (60 s from
+  // its first request) outlasts the minute it counts, so Retry-After is the TTL, not the minute's rest.
+  ctx.clock.advance(75 - (ctx.clock.now() / 1000) % 60);
   const pkg = ctx.proto('firewall.proto');
   ctx.grpc.serve(pkg.firewall.PromptGuard.service, {
     Detect(_call, callback) {
@@ -741,12 +745,16 @@ export async function check_atomic(ctx) {
 
 export async function check_window_ttl(ctx) {
   const c = aifw(ctx);
+  const key = windowKey(ctx);
+  // The key's TTL the moment the first command that touched it has run: one script has already set it.
+  const born = ctx.redisAfter(key, () => Number(ctx.redis.ttl(key)));
   const statuses = await burst(c, LIMIT + 1);
   assert.deepEqual(statuses, [...Array(LIMIT).fill(200), 429], \`a fresh key gets \${LIMIT} requests, then 429: got \${statuses.filter(s => s === 200).length} x 200 and \${statuses.filter(s => s === 429).length} x 429 (last: \${statuses.at(-1)})\`);
   let keys = windowKeys(ctx);
-  assert.deepEqual(keys, [windowKey(ctx)], \`the window keys are \${JSON.stringify(keys)}, expected ["\${windowKey(ctx)}"]: aifw:rl:\\\${apiKey}:\\\${window} with window = floor(now / 60)\`);
-  const ttl = Number(ctx.redis.ttl(windowKey(ctx)));
-  assert(ttl > 0 && ttl <= 60, \`\${windowKey(ctx)} has TTL \${ttl}: the script must EXPIRE the key it created (60 s), or the count lives forever\`);
+  assert.deepEqual(keys, [key], \`the window keys are \${JSON.stringify(keys)}, expected ["\${key}"]: aifw:rl:\\\${apiKey}:\\\${window} with window = floor(now / 60)\`);
+  const ttl = Number(ctx.redis.ttl(key));
+  assert(ttl > 0 && ttl <= 60, \`\${key} has TTL \${ttl}: the script must EXPIRE the key it created (60 s), or the count lives forever\`);
+  assert(born.fired && born.result > 0 && born.result <= 60, \`right after the first command that touched \${key} its TTL was \${born.result}: EXPIRE ran in a command of its own, so a replica that dies in between leaves a count that never expires. The script sets EXPIRE when it creates the key\`);
   ctx.clock.advance(61);
   const r = await c.post('/v1/chat', {json: BODY, headers: K});
   assert.equal(r.status, 200, \`61 s later, in a new window, the caller answered \${r.status}, expected 200: the window must reset\`);
@@ -778,8 +786,10 @@ export async function check_limit_first(ctx) {
   const chats = ctx.grpc.callsTo('Chat').length;
   assert.equal(detects, LIMIT, \`\${LIMIT + 1} requests made \${detects} Detect calls: the refused request was scored before the limit answered. The limit runs before the handler (an onRequest hook); a refused request costs nothing\`);
   assert.equal(chats, LIMIT, \`\${LIMIT + 1} requests made \${chats} Chat calls: the refused request reached the application\`);
+  const before = windowKeys(ctx);
   const r = await c.post('/v1/chat', {json: BODY});
   assert.equal(r.status, 401, \`a request without a key answered \${r.status}, expected the route's 401\`);
+  assert.deepEqual(windowKeys(ctx), before, \`a request without a key left the window keys \${JSON.stringify(windowKeys(ctx))} (before: \${JSON.stringify(before)}): it is the route's 401, not a window of its own\`);
 }
 `,
     go: `package main
@@ -825,10 +835,9 @@ func (limitAssistant) Chat(_ context.Context, _ *pb.ChatRequest) (*pb.ChatReply,
 // limitedProxy is rateLimit wrapped around step 1's handler. The Go runtime compiles one step's
 // file at a time, so the handler is stood in here: a key check, the detector, the application.
 func limitedProxy(ctx *harness.Ctx) *harness.HTTP {
-	// Start at least 40 s before the next minute boundary, so the window does not roll over mid-check.
-	if remaining := 60 - float64(ctx.Clock.Now()%60000)/1000; remaining < 40 {
-		ctx.Clock.Advance(remaining + 1)
-	}
+	// Start 15 s into a minute: the window cannot roll over mid-check, and a window's TTL (60 s from
+	// its first request) outlasts the minute it counts, so Retry-After is the TTL, not the minute's rest.
+	ctx.Clock.Advance(75 - float64(ctx.Clock.Now()%60000)/1000)
 	pb.RegisterPromptGuardServer(ctx.GRPC.Server(""), &limitGuard{})
 	pb.RegisterAssistantServer(ctx.GRPC.Server(""), &limitAssistant{})
 	guardConn, _ := grpc.NewClient("promptguard:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -917,11 +926,18 @@ func CheckAtomic(ctx *harness.Ctx) {
 
 func CheckWindowTtl(ctx *harness.Ctx) {
 	c := limitedProxy(ctx)
-	ctx.Equal(limitBurst(c, limitCheckCount+1), limitStatuses(limitCheckCount, 200, 429), "a fresh key gets %d requests, then 429", limitCheckCount)
 	windowKey := limitWindowKey(ctx)
+	// The key's TTL the moment the first command that touched it has run: one script has already set it.
+	bornTTL := int64(0)
+	born := ctx.Redis.After(windowKey, func() any {
+		bornTTL = ctx.Redis.TTL(windowKey)
+		return nil
+	})
+	ctx.Equal(limitBurst(c, limitCheckCount+1), limitStatuses(limitCheckCount, 200, 429), "a fresh key gets %d requests, then 429", limitCheckCount)
 	ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), []string{windowKey}, "the window keys (aifw:rl:%%s:%%d with window = floor(now / 60))")
 	ttl := ctx.Redis.TTL(windowKey)
 	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the script must EXPIRE the key it created (60 s), or the count lives forever", windowKey, ttl)
+	ctx.Assert(born.Fired && bornTTL > 0 && bornTTL <= 60, "right after the first command that touched %s its TTL was %d: EXPIRE ran in a command of its own, so a replica that dies in between leaves a count that never expires. The script sets EXPIRE when it creates the key", windowKey, bornTTL)
 	ctx.Clock.Advance(61)
 	r := limitPost(c, "X-Api-Key", limitKeyName)
 	ctx.Equal(r.Status, 200, "61 s later, in a new window, the caller (the window must reset)")
@@ -952,8 +968,10 @@ func CheckLimitFirst(ctx *harness.Ctx) {
 	chats := len(ctx.GRPC.CallsTo("Chat", ""))
 	ctx.Equal(detects, limitCheckCount, "%d requests' Detect calls: the refused request was scored before the limit answered. The limit runs before next.ServeHTTP; a refused request costs nothing", limitCheckCount+1)
 	ctx.Equal(chats, limitCheckCount, "%d requests' Chat calls: the refused request reached the application", limitCheckCount+1)
+	before := ctx.Redis.Keys("aifw:rl:*")
 	r := limitPost(c)
 	ctx.Equal(r.Status, 401, "a request without a key (the route's 401)")
+	ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), before, "the window keys after a request without a key (it is the route's 401, not a window of its own)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -999,9 +1017,9 @@ struct LimitedProxy {
 LimitedProxy* proxy = nullptr;
 
 harness::HTTP limitedProxy(harness::Ctx& ctx) {
-  // Start at least 40 s before the next minute boundary, so the window does not roll over mid-check.
-  const double remaining = 60 - static_cast<double>(ctx.Clock.Now() % 60000) / 1000;
-  if (remaining < 40) ctx.Clock.Advance(remaining + 1);
+  // Start 15 s into a minute: the window cannot roll over mid-check, and a window's TTL (60 s from
+  // its first request) outlasts the minute it counts, so Retry-After is the TTL, not the minute's rest.
+  ctx.Clock.Advance(75 - static_cast<double>(ctx.Clock.Now() % 60000) / 1000);
   delete proxy;
   proxy = new LimitedProxy;
   ctx.GRPC.Server("")->RegisterService(&proxy->guard);
@@ -1072,14 +1090,26 @@ void CheckAtomic(harness::Ctx& ctx) {
 
 void CheckWindowTtl(harness::Ctx& ctx) {
   auto c = limitedProxy(ctx);
+  const std::string windowKey = limitWindowKey(ctx);
+  // The key's TTL the moment the first command that touched it has run: one script has already set it.
+  bool born = false;
+  long long bornTtl = 0;
+  ctx.Redis.After(windowKey, [&ctx, &born, &bornTtl, windowKey] {
+    born = true;
+    bornTtl = ctx.Redis.TTL(windowKey);
+  });
   ctx.Equal(limitBurst(c, kLimitCount + 1), limitStatuses(kLimitCount, 200, {429}), "a fresh key gets %d requests, then 429",
             kLimitCount);
-  const std::string windowKey = limitWindowKey(ctx);
   ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), {windowKey},
             "the window keys (aifw:rl:{api_key}:{window} with window = floor(now / 60))");
   const long long ttl = ctx.Redis.TTL(windowKey);
   ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the script must EXPIRE the key it created (60 s), or the count lives forever",
              windowKey, ttl);
+  ctx.Assert(born && bornTtl > 0 && bornTtl <= 60,
+             "right after the first command that touched %s its TTL was %d: EXPIRE ran in a command of its own, so a "
+             "replica that dies in between leaves a count that never expires. The script sets EXPIRE when it creates "
+             "the key",
+             windowKey, bornTtl);
   ctx.Clock.Advance(61);
   const auto r = limitPost(c, "X-Api-Key", kLimitKeyName);
   ctx.Equal(r.Status, 200, "61 s later, in a new window, the caller (the window must reset)");
@@ -1114,8 +1144,11 @@ void CheckLimitFirst(harness::Ctx& ctx) {
             "pre-routing handler; a refused request costs nothing",
             kLimitCount + 1);
   ctx.Equal(chats, kLimitCount, "%d requests' Chat calls: the refused request reached the application", kLimitCount + 1);
+  const auto before = ctx.Redis.Keys("aifw:rl:*");
   const auto r = limitPost(c);
   ctx.Equal(r.Status, 401, "a request without a key (the route's 401)");
+  ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), before,
+            "the window keys after a request without a key (it is the route's 401, not a window of its own)");
 }
 `,
   },

@@ -21,11 +21,13 @@ carries no timestamps or speaker; a record the broker refuses is lost, because t
 the delivery report, not from \`produce\`; and a lost acknowledgement or a leader failover duplicates
 or drops a segment.
 
-- The record key is the **job id**.
+- The record key is the **job id**, and a chunk's segments are produced in the order they were spoken.
 - Redact first: the topic, the outbox and the saved transcript only ever see \`redact(text)\`.
 - The payload is \`{job_id, chunk_index, start_ms, end_ms, speaker, text}\`.
 - A refused record goes to \`jobs.insert_outbox(topic, job_id, payload)\` from the delivery report
-  (callback, rejected \`send\`, returned \`WriteMessages\` error); \`publish_segments\` does not raise.
+  (callback, rejected \`send\`, returned \`WriteMessages\` error): every refused record and no accepted
+  one. \`publish_segments\` does not raise, and returns only once every report is in (the worker marks
+  the chunk done then): each segment is on the topic or in the outbox, once.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent\` with \`acks: -1\`; kafka-go has no
   idempotent producer, so its writer uses \`RequireAll\`).`,
   sequence: {
@@ -48,7 +50,7 @@ or drops a segment.
       id: 'job-key',
       title: 'Keyed by job id',
       detail:
-        "The record key is the job id (`key=job_id`, `key: jobId`, `[]byte(jobID)`, `ProducerRecord(Topic, jobId, …)`), so one job's segments land on one partition in order; the starter keys by chunk index.",
+        "The record key is the job id (`key=job_id`, `key: jobId`, `[]byte(jobID)`, `ProducerRecord(Topic, jobId, …)`), so one job's segments land on one partition, each chunk's in the order they were spoken; the starter keys by chunk index.",
       match: {
         python: {all: [/produce\([^\n]*key=job_id/], none: [/key\s*=\s*str\(/]},
         typescript: {all: [/key:\s*jobId\b/], none: [/key\s*=\s*String\(/]},
@@ -87,7 +89,7 @@ or drops a segment.
       id: 'outbox-from-delivery',
       title: 'Writes the outbox row from the delivery report',
       detail:
-        'A record the broker refuses becomes an outbox row where the broker answers: the delivery callback, the rejected `send`, the returned `WriteMessages` error, `dr_cb`, a producer `Callback`. A `try` around `produce` catches only a full local queue.',
+        'A record the broker refuses becomes an outbox row, with its redacted payload, where the broker answers: the delivery callback, the rejected `send`, the returned `WriteMessages` error, `dr_cb`, a producer `Callback`. Every refused record gets a row and no accepted one does (a batch the broker refuses whole is outboxed whole), and all of it before `publish_segments` returns, so each segment lands once. A `try` around `produce` catches only a full local queue.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /jobs\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {
@@ -526,6 +528,8 @@ def check_job_key(ctx):
     keys = sorted(r.key for r in records)
     assert keys == [b"tr-1"] * 4 + [b"tr-2"] * 2, f"records must be keyed by the job id, got {keys}: keyed by chunk, one job's segments spread over partitions and reach the captions out of order"
     assert len({r.partition for r in records if r.key == b"tr-1"}) == 1, "every segment of job tr-1 must land on one partition"
+    starts = [json.loads(r.value).get("start_ms") for r in records if r.key == b"tr-1"]
+    assert starts == [30000, 40000, 0, 10000], f"job tr-1's records sit on its partition in the order start_ms {starts}, expected {[30000, 40000, 0, 10000]}: each chunk's segments in the order they were spoken, one chunk after the other"
 
 
 def check_redact_before_publish(ctx):
@@ -552,16 +556,24 @@ def check_segment_payload(ctx):
 
 def check_outbox_from_delivery(ctx):
     m = ctx.load("events")
+    # The broker refuses the first record, the one with the phone number and the e-mail address.
+    segments = _segments(1)
+    segments[0]["text"], segments[1]["text"] = RAW, "Thanks for holding."
     ctx.kafka.fail_next(TOPIC, 1)
     try:
-        m.publish_segments("tr-1", _segments(1))
+        m.publish_segments("tr-1", segments)
     except Exception as e:  # noqa: BLE001
         raise AssertionError(f"publish_segments raised when the broker refused a record: {e!r}; the record goes to the outbox, the worker goes on") from e
     rows = _outbox(ctx)
-    assert len(rows) == 1, f"the broker refused one record and the outbox holds {len(rows)} rows: the refusal arrives in the delivery report, which must write the row"
-    row = rows[0]
-    assert row.get("topic") == TOPIC and row.get("key") == "tr-1" and row.get("payload", {}).get("start_ms") == 30000, f"the outbox row must hold the topic, the job id and the refused payload, got {row}"
-    assert len(ctx.kafka.records(TOPIC)) == 1, "the segment the broker accepted reached the topic"
+    refused = [row for row in rows if row.get("payload", {}).get("start_ms") == 30000]
+    assert refused, f"the broker refused the record of start_ms 30000 and the outbox holds {rows}: the refusal arrives in the delivery report, which must write the row"
+    for row in rows:
+        assert row.get("topic") == TOPIC and row.get("key") == "tr-1", f"an outbox row must hold the topic, the job id and the refused payload, got {row}"
+        assert "415-555-0199" not in json.dumps(row) and "ana@example.com" not in json.dumps(row), f"an outbox row carries a phone number or an e-mail address: {row}; the outbox only ever sees the redacted text"
+    assert refused[0]["payload"].get("text") == REDACTED, f"the refused payload's text is {refused[0]['payload'].get('text')!r}, expected {REDACTED!r}"
+    published = sorted(json.loads(v).get("start_ms") for v in ctx.kafka.values(TOPIC))
+    outboxed = sorted(row.get("payload", {}).get("start_ms") for row in rows)
+    assert sorted(published + outboxed) == [30000, 40000], f"each segment once, on the topic or in the outbox: the topic holds start_ms {published}, the outbox {outboxed}"
 
 
 def check_idempotent_producer(ctx):
@@ -615,6 +627,8 @@ export async function check_job_key(ctx) {
   const keys = records.map(r => r.key?.toString() ?? null).sort();
   assert.deepStrictEqual(keys, ['tr-1', 'tr-1', 'tr-1', 'tr-1', 'tr-2', 'tr-2'], \`records must be keyed by the job id, got \${JSON.stringify(keys)}: keyed by chunk, one job's segments spread over partitions and reach the captions out of order\`);
   assert.equal(new Set(records.filter(r => r.key?.toString() === 'tr-1').map(r => r.partition)).size, 1, 'every segment of job tr-1 must land on one partition');
+  const starts = records.filter(r => r.key?.toString() === 'tr-1').map(r => JSON.parse(r.value.toString()).start_ms);
+  assert.deepStrictEqual(starts, [30000, 40000, 0, 10000], \`job tr-1's records sit on its partition in the order start_ms \${JSON.stringify(starts)}, expected [30000,40000,0,10000]: each chunk's segments in the order they were spoken, one chunk after the other\`);
 }
 
 export async function check_redact_before_publish(ctx) {
@@ -643,16 +657,31 @@ export async function check_segment_payload(ctx) {
 
 export async function check_outbox_from_delivery(ctx) {
   const m = ctx.load('events');
+  // The broker refuses the first record, the one with the phone number and the e-mail address.
+  const [first, second] = segmentsOf(1);
+  const segments = [{...first, text: RAW}, {...second, text: 'Thanks for holding.'}];
   ctx.kafka.failNext(TOPIC, 1);
   try {
-    await publish(m, 'tr-1', segmentsOf(1));
+    // No settle: the worker marks the chunk done as soon as publishSegments resolves.
+    await m.publishSegments('tr-1', segments);
   } catch (e) {
     assert.fail(\`publishSegments rejected when the broker refused a record: \${e}; the record goes to the outbox, the worker goes on\`);
   }
   const rows = outboxRows(ctx);
-  assert.equal(rows.length, 1, \`the broker refused one record and the outbox holds \${rows.length} rows: the refusal arrives as the rejected send, which must write the row\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'tr-1' && rows[0].payload?.start_ms === 30000, \`the outbox row must hold the topic, the job id and the refused payload, got \${JSON.stringify(rows[0])}\`);
-  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the segment the broker accepted reached the topic');
+  const refused = rows.filter(row => row.payload?.start_ms === 30000);
+  assert(refused.length > 0, \`the broker refused the record of start_ms 30000 and when publishSegments resolved the outbox held \${JSON.stringify(rows)}: the refusal arrives as the rejected send, which must write the row before publishSegments resolves (the worker marks the chunk done then)\`);
+  for (const row of rows) {
+    assert(row.topic === TOPIC && row.key === 'tr-1', \`an outbox row must hold the topic, the job id and the refused payload, got \${JSON.stringify(row)}\`);
+    const text = JSON.stringify(row);
+    assert(!text.includes('415-555-0199') && !text.includes('ana@example.com'), \`an outbox row carries a phone number or an e-mail address: \${text}; the outbox only ever sees the redacted text\`);
+  }
+  assert.equal(refused[0].payload.text, REDACTED, \`the refused payload's text is \${JSON.stringify(refused[0].payload.text)}, expected \${JSON.stringify(REDACTED)}\`);
+  const published = ctx.kafka.values(TOPIC).map(v => JSON.parse(v.toString()).start_ms);
+  const outboxed = rows.map(row => row.payload?.start_ms);
+  assert.deepStrictEqual([...published, ...outboxed].sort((a, b) => a - b), [30000, 40000], \`each segment once, on the topic or in the outbox, when publishSegments resolved: the topic held start_ms \${JSON.stringify(published)}, the outbox \${JSON.stringify(outboxed)}\`);
+  await settle();
+  const later = [...ctx.kafka.values(TOPIC).map(v => JSON.parse(v.toString()).start_ms), ...outboxRows(ctx).map(row => row.payload?.start_ms)];
+  assert.deepStrictEqual(later.sort((a, b) => a - b), [30000, 40000], \`after publishSegments resolved, more landed: the topic and the outbox now hold start_ms \${JSON.stringify(later)}, expected each segment once\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -738,6 +767,17 @@ func CheckJobKey(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(len(partitions), 1, "every segment of job tr-1 must land on one partition; partitions")
+	starts := []int{}
+	for _, r := range records {
+		if string(r.Key) == "tr-1" {
+			var e struct {
+				StartMs int \`json:"start_ms"\`
+			}
+			json.Unmarshal(r.Value, &e)
+			starts = append(starts, e.StartMs)
+		}
+	}
+	ctx.Equal(starts, []int{30000, 40000, 0, 10000}, "job tr-1's records on its partition, each chunk's segments in the order they were spoken, one chunk after the other; start_ms in partition order")
 }
 
 func CheckRedactBeforePublish(ctx *harness.Ctx) {
@@ -767,6 +807,9 @@ func CheckSegmentPayload(ctx *harness.Ctx) {
 }
 
 func CheckOutboxFromDelivery(ctx *harness.Ctx) {
+	// The broker refuses the first record, the one with the phone number and the e-mail address.
+	segments := eventsSegments(1)
+	segments[0].Text, segments[1].Text = eventsRaw, "Thanks for holding."
 	ctx.Kafka.FailNext(topic, 1)
 	func() {
 		defer func() {
@@ -774,13 +817,46 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 				ctx.Fatalf("publishSegments panicked when the broker refused a record: %v; the record goes to the outbox, the worker goes on", e)
 			}
 		}()
-		eventsPublish(ctx, "tr-1", eventsSegments(1))
+		// No Settle: the worker marks the chunk done as soon as publishSegments returns.
+		publishSegments(context.Background(), "tr-1", segments)
 	}()
 	rows := eventsOutbox(ctx)
-	ctx.Equal(len(rows), 1, "the broker refused one record: the refusal arrives as the returned write error, which must write the row; outbox rows")
-	payload, _ := rows[0]["payload"].(map[string]any)
-	ctx.Assert(rows[0]["topic"] == topic && rows[0]["key"] == "tr-1" && payload != nil && payload["start_ms"] == float64(30000), "the outbox row must hold the topic, the job id and the refused payload, got %v", rows[0])
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "the segment the broker accepted reached the topic; records")
+	var refused map[string]any
+	outboxed := []int{}
+	for _, row := range rows {
+		payload, _ := row["payload"].(map[string]any)
+		ctx.Assert(row["topic"] == topic && row["key"] == "tr-1" && payload != nil, "an outbox row must hold the topic, the job id and the refused payload, got %v", row)
+		text, _ := json.Marshal(row)
+		ctx.Assert(!strings.Contains(string(text), "415-555-0199") && !strings.Contains(string(text), "ana@example.com"), "an outbox row carries a phone number or an e-mail address: %s; the outbox only ever sees the redacted text", text)
+		start, _ := payload["start_ms"].(float64)
+		outboxed = append(outboxed, int(start))
+		if start == 30000 {
+			refused = payload
+		}
+	}
+	ctx.Assert(refused != nil, "the broker refused the record of start_ms 30000 and when publishSegments returned the outbox held %v: the refusal arrives as the returned write error, which must write the row before publishSegments returns (the worker marks the chunk done then)", rows)
+	ctx.Equal(refused["text"], eventsRedacted, "the refused payload's text")
+	published := []int{}
+	for _, e := range eventsAll(ctx) {
+		start, _ := e["start_ms"].(float64)
+		published = append(published, int(start))
+	}
+	all := append(append([]int{}, published...), outboxed...)
+	sort.Ints(all)
+	ctx.Equal(all, []int{30000, 40000}, "each segment once, on the topic (start_ms %v) or in the outbox (start_ms %v), when publishSegments returned; every start_ms", published, outboxed)
+	ctx.Settle()
+	later := []int{}
+	for _, e := range eventsAll(ctx) {
+		start, _ := e["start_ms"].(float64)
+		later = append(later, int(start))
+	}
+	for _, row := range eventsOutbox(ctx) {
+		payload, _ := row["payload"].(map[string]any)
+		start, _ := payload["start_ms"].(float64)
+		later = append(later, int(start))
+	}
+	sort.Ints(later)
+	ctx.Equal(later, []int{30000, 40000}, "after publishSegments returned, more landed; each segment once, on the topic or in the outbox; every start_ms")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
@@ -845,6 +921,13 @@ void CheckJobKey(harness::Ctx& ctx) {
     if (r.Key.value_or("") == "tr-1") partitions.insert(r.Partition);
   }
   ctx.Equal(partitions.size(), 1, "every segment of job tr-1 must land on one partition; partitions");
+  std::vector<int> starts;
+  for (const auto& r : records) {
+    if (r.Key.value_or("") != "tr-1") continue;
+    const auto e = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
+    starts.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
+  }
+  ctx.Equal(starts, {30000, 40000, 0, 10000}, "job tr-1's records on its partition, each chunk's segments in the order they were spoken, one chunk after the other; start_ms in partition order");
 }
 
 void CheckRedactBeforePublish(harness::Ctx& ctx) {
@@ -873,17 +956,45 @@ void CheckSegmentPayload(harness::Ctx& ctx) {
 }
 
 void CheckOutboxFromDelivery(harness::Ctx& ctx) {
+  // The broker refuses the first record, the one with the phone number and the e-mail address.
+  auto segments = eventsSegments(1);
+  segments[0].text = kRaw;
+  segments[1].text = "Thanks for holding.";
   ctx.Kafka.FailNext(kTopic, 1);
   try {
-    eventsPublish(ctx, "tr-1", eventsSegments(1));
+    // No Settle: the worker marks the chunk done as soon as publishSegments returns.
+    publishSegments("tr-1", segments);
   } catch (const std::exception& e) {
     ctx.Fatalf("publishSegments threw when the broker refused a record: %s; the record goes to the outbox, the worker goes on", e.what());
   }
   const auto rows = eventsOutbox(ctx);
-  ctx.Equal(rows.size(), 1, "the broker refused one record: the refusal arrives in the delivery report (dr_cb), which must write the row; outbox rows");
-  const nlohmann::json row = rows.empty() ? nlohmann::json() : rows[0];
-  ctx.Assert(row.is_object() && row.value("topic", "") == kTopic && row.value("key", "") == "tr-1" && row.contains("payload") && row["payload"].value("start_ms", 0) == 30000, "the outbox row must hold the topic, the job id and the refused payload, got %s", row.dump());
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the segment the broker accepted reached the topic; records");
+  nlohmann::json refused;
+  std::vector<int> outboxed;
+  for (const auto& row : rows) {
+    const bool shaped = row.is_object() && row.value("topic", "") == kTopic && row.value("key", "") == "tr-1" && row.contains("payload") && row["payload"].is_object();
+    ctx.Assert(shaped, "an outbox row must hold the topic, the job id and the refused payload, got %s", row.dump());
+    const std::string text = row.dump();
+    ctx.Assert(text.find("415-555-0199") == std::string::npos && text.find("ana@example.com") == std::string::npos, "an outbox row carries a phone number or an e-mail address: %s; the outbox only ever sees the redacted text", text);
+    const int start = row["payload"].value("start_ms", -1);
+    outboxed.push_back(start);
+    if (start == 30000) refused = row["payload"];
+  }
+  ctx.Assert(refused.is_object(), "the broker refused the record of start_ms 30000 and when publishSegments returned the outbox held %s: the refusal arrives in the delivery report (dr_cb), which must write the row before publishSegments returns (the worker marks the chunk done then)", nlohmann::json(rows).dump());
+  ctx.Equal(refused.value("text", ""), kRedacted, "the refused payload's text");
+  std::vector<int> published;
+  for (const auto& e : eventsAll(ctx)) published.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
+  std::vector<int> all = published;
+  all.insert(all.end(), outboxed.begin(), outboxed.end());
+  std::sort(all.begin(), all.end());
+  ctx.Equal(all, {30000, 40000}, "each segment once, on the topic (start_ms %v) or in the outbox (start_ms %v), when publishSegments returned; every start_ms", published, outboxed);
+  ctx.Settle();
+  std::vector<int> later;
+  for (const auto& e : eventsAll(ctx)) later.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
+  for (const auto& row : eventsOutbox(ctx)) {
+    later.push_back(row.is_object() && row.contains("payload") && row["payload"].is_object() ? row["payload"].value("start_ms", -1) : -1);
+  }
+  std::sort(later.begin(), later.end());
+  ctx.Equal(later, {30000, 40000}, "after publishSegments returned, more landed; each segment once, on the topic or in the outbox; every start_ms");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
