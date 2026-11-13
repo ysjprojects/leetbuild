@@ -4,10 +4,12 @@ Virtual clock for the runtime: `time.time()`, `time.monotonic()`, `time.perf_cou
 clock: `time.gmtime()`, `time.localtime()`, `time.strftime(fmt)` (no tuple given), and in the
 learner's and the harness's code `datetime.now()` (with or without a tz), `datetime.utcnow()`,
 `datetime.today()`, `date.today()`. The machine's timezone stays the one the host reports (as
-`datetime.fromtimestamp` and `time.mktime` see it). Sleeping advances the clock instead of
-blocking, so TTLs, rate-limit windows and backoffs are testable in milliseconds; after
-`sleep_limit` positive sleeps a KeyboardInterrupt ends `while True:` loops the way Ctrl-C would.
-A harness check runs it frozen (`freeze`): time moves only when advanced or slept, never with real time.
+`datetime.fromtimestamp` and `time.mktime` see it). `time.sleep()` advances the clock at once, as a
+blocking sleep holds the whole program; `asyncio.sleep()` waits on the event loop, whose timers run
+on this clock while it is frozen (`loop.py`), so concurrent waits overlap. Either way TTLs, rate-limit
+windows and backoffs are testable in milliseconds; after `sleep_limit` positive sleeps a
+KeyboardInterrupt ends `while True:` loops the way Ctrl-C would. A harness check runs it frozen
+(`freeze`): time moves only when advanced, slept or waited, never with real time.
 """
 import asyncio
 import builtins
@@ -117,8 +119,10 @@ class Clock:
         self.task: asyncio.Task | None = None
         # Background timers (Kafka's auto-commit) — they outlive `reset`, which only rewinds time.
         self._listeners: list = []
+        self._installed = False
 
     def install(self) -> None:
+        self._installed = True
         time.time = self.time
         time.monotonic = self.monotonic
         time.perf_counter = self.monotonic
@@ -134,6 +138,7 @@ class Clock:
 
     def uninstall(self) -> None:
         """Give the real clock back: a program run (`python file.py`) times itself in real time."""
+        self._installed = False
         time.time = self._real_time
         time.monotonic = self._real_monotonic
         time.perf_counter = self._real_perf_counter
@@ -158,6 +163,11 @@ class Clock:
         checks run this way). It stops on a whole second, as the TypeScript clock does; a `reset` in
         the middle of a check rewinds to that instant and stays frozen."""
         self._frozen = (float(math.floor(self._real_time())), self._real_monotonic())
+
+    @property
+    def virtual(self) -> bool:
+        """Whether the event loop's timers wait on this clock rather than in real time: installed and frozen, as while a check runs."""
+        return self._installed and self._frozen is not None
 
     def time(self) -> float:
         return (self._real_time() if self._frozen is None else self._frozen[0]) + self.offset
@@ -198,21 +208,31 @@ class Clock:
         self._tick(seconds)
 
     async def async_sleep(self, delay: float, result=None):
-        self._tick(delay)
-        await self._real_async_sleep(0)
-        return result
+        """`asyncio.sleep`: counted like `time.sleep`, then a timer on the event loop, which waits on this clock."""
+        self._count(delay)
+        return await self._real_async_sleep(delay, result)
 
-    def _tick(self, seconds: float) -> None:
+    async def wait(self, seconds: float) -> None:
+        """Wait on the event loop without counting a sleep: a call's latency, not the learner's backoff."""
+        await self._real_async_sleep(seconds)
+
+    def _count(self, seconds: float) -> float:
+        """Count a positive sleep in `sleeps` and `slept`; past `sleep_limit` the check's own sleeps raise."""
         seconds = float(seconds)
         if seconds <= 0:
-            return
+            return 0.0
         self.sleeps += 1
         if self.sleep_limit is not None and self.sleeps > self.sleep_limit:
             if self.task is None or asyncio.current_task() is self.task:
                 raise KeyboardInterrupt(f"stopped after {self.sleep_limit} sleeps")
         self.slept += seconds
-        self.offset += seconds
-        self._fire()
+        return seconds
+
+    def _tick(self, seconds: float) -> None:
+        seconds = self._count(seconds)
+        if seconds:
+            self.offset += seconds
+            self._fire()
 
     def _fire(self) -> None:
         for fn in list(self._listeners):

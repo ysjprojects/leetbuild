@@ -14,6 +14,7 @@ import json
 import re
 from typing import Any, Callable, Sequence
 
+from .loop import host_request
 from .metrics import METRICS
 
 _PLACEHOLDER = re.compile(r"%(%|s)")
@@ -137,7 +138,8 @@ class Db:
         self.statements = []
         self.queries = []
         try:
-            await leetbuild_host.db_exec("DROP SCHEMA public CASCADE; CREATE SCHEMA public;" + schema)
+            with host_request():
+                await leetbuild_host.db_exec("DROP SCHEMA public CASCADE; CREATE SCHEMA public;" + schema)
         except Exception as exc:
             raise DbError(_message(exc)) from None
 
@@ -149,7 +151,8 @@ class Db:
         self.statements.append(sql)
         self.queries.append((sql, list(params)))
         try:
-            out = await leetbuild_host.db_query(dollarize(sql), json.dumps([_plain(p) for p in params]))
+            with host_request():
+                out = await leetbuild_host.db_query(dollarize(sql), json.dumps([_plain(p) for p in params]))
         except Exception as exc:
             self._fire(sql)
             raise DbError(_message(exc)) from None

@@ -647,11 +647,9 @@ async def _settle():
 async def _upload(m, stub, fake, *args):
     """upload(stub, "up-1", CHUNKS, *args) to the end: (returned, error, finished_at). Sets fake.acked_on_return."""
     task = asyncio.ensure_future(m.upload(stub, "up-1", list(CHUNKS), *args))
-    for _ in range(5000):  # event-loop turns; a correct upload needs a few hundred at most
-        if task.done():
-            break
-        await asyncio.sleep(0)
-    else:
+    # The backoffs pass on the virtual clock; a minute of it bounds an upload stuck on the stream.
+    await asyncio.wait({task}, timeout=60)
+    if not task.done():
         task.cancel()
         await _settle()
         raise AssertionError("upload() never returned: it is still waiting on the stream. Send every seq from next_seq to the last and finish on Ack{seq: 7}")

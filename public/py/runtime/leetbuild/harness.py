@@ -29,6 +29,7 @@ from fakeredis._helpers import SimpleError
 from fakeredis._socket._base import BaseFakeSocket
 import httpx
 
+from . import loop
 from .clock import CLOCK
 from .db import DB
 from .grpcsim import REGISTRY
@@ -200,6 +201,8 @@ def _purge_modules() -> None:
 def reset_world() -> None:
     CLOCK.reset(SLEEP_LIMIT)
     CLOCK.freeze()
+    if loop.LOOP is not None:
+        loop.LOOP.reset()
     fakeredis.FakeRedis(server=SERVER).flushall()
     BROKER.reset()
     REGISTRY.reset()
@@ -257,7 +260,12 @@ def _metrics() -> dict:
     }
 
 
-async def run_checks(harness_src: str, check_ids: list[str], files: dict[str, str]) -> list[dict]:
+def run_checks(harness_src: str, check_ids: list[str], files: dict[str, str]) -> asyncio.Task:
+    """Run the checks as a task on the virtual-time loop, whichever loop last ran: the host awaits it."""
+    return loop.LOOP.create_task(_run_checks(harness_src, check_ids, files))
+
+
+async def _run_checks(harness_src: str, check_ids: list[str], files: dict[str, str]) -> list[dict]:
     namespace: dict[str, Any] = {"__name__": "harness"}
     try:
         exec(compile(harness_src, "<harness>", "exec"), namespace)

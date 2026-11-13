@@ -1,10 +1,10 @@
 """
 The LeetBuild Python runtime: boots once per Pyodide instance and turns the learner's code into
-something that runs without a network. `boot()` installs the virtual clock, makes FastAPI run its
-sync endpoints inline (Pyodide has no threads), points `redis` at a shared fakeredis server with
-Lua scripting restored, and puts the learner's files (/work) and the course's support modules
-(/support) on the import path. `confluent_kafka`, `grpc` and `uvicorn` are packages of this
-runtime; they need no patching.
+something that runs without a network. `boot()` installs the virtual clock and the event loop whose
+timers run on it, makes FastAPI run its sync endpoints inline (Pyodide has no threads), points
+`redis` at a shared fakeredis server with Lua scripting restored, and puts the learner's files
+(/work) and the course's support modules (/support) on the import path. `confluent_kafka`, `grpc`
+and `uvicorn` are packages of this runtime; they need no patching.
 """
 from __future__ import annotations
 
@@ -117,9 +117,11 @@ def _patch_redis() -> None:
 
 
 def boot() -> None:
+    from . import loop
     from .clock import CLOCK
 
     CLOCK.install()
+    loop.install()
     _inline_threadpools()
     _patch_redis()
     from . import lua

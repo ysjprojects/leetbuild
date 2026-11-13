@@ -525,6 +525,83 @@ const EXECUTING: {
   },
 ];
 
+/**
+ * The Python runtime's event loop keeps its timers on the virtual clock (leetbuild/loop.py), as the
+ * TypeScript and Go clocks do: waits in flight together overlap and wake in deadline order,
+ * `asyncio.wait_for` expires on that clock, and a gRPC call's latency is a wait that is not counted
+ * as the caller's sleep. Run through the check runner, as a course's harness is.
+ */
+const PYTHON_CLOCK_HARNESS = String.raw`
+import asyncio
+import time
+
+import grpc
+
+
+async def check_overlap(ctx):
+    t0 = time.monotonic()
+    await asyncio.gather(asyncio.sleep(0.3), asyncio.sleep(0.5), asyncio.sleep(0.2))
+    took = time.monotonic() - t0
+    assert abs(took - 0.5) < 1e-6, f"gathered sleeps of 0.3, 0.5 and 0.2 s took {took:.3f} s, expected 0.5"
+    assert ctx.clock.sleeps == 3, f"three sleeps counted as {ctx.clock.sleeps}"
+
+
+async def check_wake_order(ctx):
+    t0, woke = time.monotonic(), []
+
+    async def nap(name, seconds):
+        await asyncio.sleep(seconds)
+        woke.append((name, round(time.monotonic() - t0, 6)))
+
+    await asyncio.gather(nap("slow", 2.0), nap("fast", 0.5), nap("mid", 1.0))
+    assert woke == [("fast", 0.5), ("mid", 1.0), ("slow", 2.0)], f"woke {woke}"
+
+
+async def check_wait_for(ctx):
+    t0 = time.monotonic()
+    try:
+        await asyncio.wait_for(asyncio.sleep(10), 1.0)
+    except TimeoutError:
+        took = time.monotonic() - t0
+        assert abs(took - 1.0) < 1e-6, f"wait_for expired after {took:.3f} s, expected 1.0"
+    else:
+        raise AssertionError("wait_for(sleep(10), 1.0) completed instead of timing out")
+
+
+async def check_grpc_latency(ctx):
+    async def echo(request, context):
+        return request
+
+    ctx.grpc.register("probe.Echo", "Say", grpc.unary_unary_rpc_method_handler(echo))
+    ctx.grpc.set_latency("/probe.Echo/Say", 0.4)
+    say = grpc.aio.insecure_channel("probe:1").unary_unary("/probe.Echo/Say")
+    t0 = time.monotonic()
+    got = await asyncio.gather(say(b"a"), say(b"b"), say(b"c"))
+    took = time.monotonic() - t0
+    assert got == [b"a", b"b", b"c"], f"answered {got}"
+    assert abs(took - 0.4) < 1e-6, f"three calls of 0.4 s in flight together took {took:.3f} s, expected 0.4"
+    assert ctx.clock.sleeps == 0, f"the calls' latency counted as {ctx.clock.sleeps} sleeps of the caller's"
+    t0 = time.monotonic()
+    try:
+        await say(b"d", timeout=0.1)
+    except grpc.aio.AioRpcError as exc:
+        took = time.monotonic() - t0
+        assert exc.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"a 0.1 s deadline on a 0.4 s call ended {exc.code()}"
+        assert abs(took - 0.1) < 1e-6, f"the deadline ended the call after {took:.3f} s, expected 0.1"
+    else:
+        raise AssertionError("a 0.1 s deadline on a 0.4 s call returned an answer")
+`;
+
+async function pythonClockSelfTest(runtime: NodeRuntime): Promise<string[]> {
+  const checks = ['overlap', 'wake-order', 'wait-for', 'grpc-latency'];
+  const run = await runtime.run({files: {}, support: {}, harness: PYTHON_CLOCK_HARNESS, checks});
+  if (run.error !== undefined) return [`python clock self-test: ${run.error}`];
+  return checks
+    .map(id => [id, run.checks.find(c => c.id === id)] as const)
+    .filter(([, c]) => c?.passed !== true)
+    .map(([id, c]) => `python clock self-test ${id}: ${c?.message ?? 'did not run'}`);
+}
+
 /** A run's ending, for a message: the runtime failure, or the exit status and the last lines it printed to stderr. */
 const describeProgram = (run: RunResult): string =>
   run.error ??
@@ -821,8 +898,14 @@ async function main(): Promise<void> {
       if (!programsHere && !selected.some(p => p.steps.some(s => s.harness?.[language] !== undefined))) continue;
       if (programsHere) await fetchTorch();
       const started = Date.now();
-      runtimes[language] = await boot();
+      const runtime = await boot();
+      runtimes[language] = runtime;
       console.log(`✓ ${language} runtime booted (${Date.now() - started} ms)`);
+      if (language === 'python') {
+        const clock = await pythonClockSelfTest(runtime);
+        console.log(`${clock.length === 0 ? '✓' : '✗'} python event loop on the virtual clock`);
+        errors.push(...clock);
+      }
     }
   if (runtimes.cpp !== undefined) await precompileCpp(selected);
   for (const problem of problems) {

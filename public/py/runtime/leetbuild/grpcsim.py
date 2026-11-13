@@ -381,7 +381,10 @@ def _roundtrip(message, serializer, deserializer):
     return deserializer(serializer(message))
 
 
-def _begin(path: str, request, timeout, metadata, target: str | None = None) -> tuple[Call, RpcMethodHandler]:
+def _admit(path: str, request, timeout, metadata, target: str | None) -> tuple[Call, float, bool]:
+    """Record the call and apply its faults: an injected failure raises; otherwise how long the call
+    waits before it reaches a handler (its latency, or its deadline when the latency is longer) and
+    whether the deadline ends it."""
     call = Call(path, request, metadata, timeout, target)
     REGISTRY.calls.append(call)
     failure = REGISTRY._pop(path, target)
@@ -390,16 +393,39 @@ def _begin(path: str, request, timeout, metadata, target: str | None = None) -> 
         raise CallError(failure[0], failure[1] or failure[0].value[1])
     latency = REGISTRY._lookup(path, target)
     if timeout is not None and latency > timeout:
-        CLOCK.advance(timeout)
+        return call, timeout, True
+    return call, latency, False
+
+
+def _connect(call: Call, path: str, target: str | None, expired: bool) -> tuple[Call, RpcMethodHandler]:
+    if expired:
         call.code = StatusCode.DEADLINE_EXCEEDED
         raise CallError(StatusCode.DEADLINE_EXCEEDED, "Deadline Exceeded")
-    CLOCK.advance(latency)
     handler = REGISTRY.find(path, target)
     if handler is None:
         call.code = StatusCode.UNAVAILABLE
         where = f" at {target}" if target else ""
         raise CallError(StatusCode.UNAVAILABLE, f"failed to connect to all addresses; nothing serves {path}{where}")
     return call, handler
+
+
+def _begin(path: str, request, timeout, metadata, target: str | None = None) -> tuple[Call, RpcMethodHandler]:
+    """A blocking call: the calling thread waits out the latency, so the clock moves at once."""
+    call, wait, expired = _admit(path, request, timeout, metadata, target)
+    CLOCK.advance(wait)
+    return _connect(call, path, target, expired)
+
+
+async def _begin_aio(path: str, request, timeout, metadata, target: str | None = None) -> tuple[Call, RpcMethodHandler]:
+    """A grpc.aio call: the latency is a wait on the event loop, so calls in flight together overlap."""
+    call, wait, expired = _admit(path, request, timeout, metadata, target)
+    if wait > 0:
+        try:
+            await CLOCK.wait(wait)
+        except asyncio.CancelledError:
+            call.code = StatusCode.CANCELLED
+            raise
+    return _connect(call, path, target, expired)
 
 
 def _translate(exc: BaseException, ctx: ServicerContext, call: Call) -> CallError:
@@ -458,7 +484,7 @@ def invoke_sync_stream(path, request, timeout, metadata, serializer, deserialize
 
 
 async def invoke_aio(path, request, timeout, metadata, serializer, deserializer, target=None):
-    call, handler = _begin(path, request, timeout, metadata, target)
+    call, handler = await _begin_aio(path, request, timeout, metadata, target)
     ctx = AioServicerContext(metadata, timeout)
     try:
         req = _roundtrip(request, serializer, handler.request_deserializer)
@@ -529,12 +555,14 @@ class AioStream:
 
     async def _run(self) -> None:
         try:
-            self._call, handler = _begin(self._path, self._request, self._timeout, self._metadata, self._target)
-        except CallError as exc:
-            self._error = exc
-            self._code = exc.code()
-            self._details = exc.details()
-            self._responses.put_nowait(exc)
+            self._call, handler = await _begin_aio(self._path, self._request, self._timeout, self._metadata, self._target)
+        except (CallError, asyncio.CancelledError) as exc:
+            # Cancelled while the call was still on its way: readers get CANCELLED, as from a handler.
+            error = exc if isinstance(exc, CallError) else CallError(StatusCode.CANCELLED, "Locally cancelled by application!")
+            self._error = error
+            self._code = error.code()
+            self._details = error.details()
+            self._responses.put_nowait(error)
             self._fire_done()
             return
         ctx = self._ctx = AioServicerContext(self._metadata, self._timeout)

@@ -29,6 +29,7 @@ export const TORCH_PACKAGES = ['numpy', 'typing-extensions', 'sympy', 'networkx'
 export const RUNTIME_FILES = [
   'leetbuild/__init__.py',
   'leetbuild/clock.py',
+  'leetbuild/loop.py',
   'leetbuild/metrics.py',
   'leetbuild/kafka.py',
   'leetbuild/grpcsim.py',

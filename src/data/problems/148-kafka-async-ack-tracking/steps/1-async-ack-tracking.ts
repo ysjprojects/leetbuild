@@ -1220,7 +1220,8 @@ async def start(ctx, gates):
 
 async def stop(ctx, m, task):
     await m.shutdown()
-    await tick()
+    # run() sees the stop when its idle sleep ends: it has the shutdown bound to return.
+    await asyncio.wait({task}, timeout=5)
     assert task.done(), "run() must return once shutdown() has stopped it"
     task.result()
     assert any(e[0] == "close" for e in ctx.kafka.events), "shutdown() must close the consumer"
@@ -1307,7 +1308,7 @@ async def check_shutdown(ctx):
     assert committed(ctx) == 6, f"after shutdown the committed offset must equal the contiguous frontier, 6; got {committed(ctx)}"
     assert any(e[0] == "close" for e in ctx.kafka.events), "shutdown() must close the consumer"
     assert m.stats()["in_flight"] == 0, f"nothing may be in flight after shutdown, stats() says {m.stats()}"
-    await tick()
+    await asyncio.wait({task}, timeout=5)
     assert task.done(), "run() must return once shutdown() has stopped it"
 
 
