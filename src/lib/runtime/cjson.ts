@@ -26,8 +26,8 @@ const fail = (L: LuaState, message: string): never => {
   throw new Error(message); // lua_error does not return
 };
 
-/** C's `%.14g`, what lua-cjson's fpconv_g_fmt prints a number with. */
-const formatG14 = (n: number): string => {
+/** C's `%.14g`: what lua-cjson's fpconv_g_fmt prints a number with, and Lua 5.1's `LUAI_NUMFFORMAT`. */
+export const formatG14 = (n: number): string => {
   if (n === 0) return Object.is(n, -0) ? '-0' : '0';
   const [mantissa, e] = n.toExponential(13).split('e');
   const exp = Number(e);
@@ -461,12 +461,8 @@ class Parser {
         lua.lua_pushstring(this.L, token.string as Uint8Array);
         return;
       case T.NUMBER: {
-        // Lua 5.1 has one number type; fengari's integers (32-bit) print as 5.1 prints an integral
-        // double ("3", not "3.0"), so an integral value in their range is pushed as one.
-        const n = token.number as number;
-        if (Number.isInteger(n) && n >= -2147483648 && n <= 2147483647 && !Object.is(n, -0))
-          lua.lua_pushinteger(this.L, n);
-        else lua.lua_pushnumber(this.L, n);
+        // Lua 5.1 has one number type, the double: a JSON integer decodes to one too.
+        lua.lua_pushnumber(this.L, token.number as number);
         return;
       }
       case T.BOOLEAN:

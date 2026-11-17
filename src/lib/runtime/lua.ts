@@ -3,10 +3,17 @@
  * fengari VM; `redis.call`/`redis.pcall` go back into the fake server through a callback. Values
  * cross as tagged JSON with Redis' own conversion rules (RESP2 ↔ Lua), so a script written against
  * real Redis behaves the same here. One fresh state per script: nothing leaks between calls.
+ *
+ * Numbers are Lua 5.1's, as Redis embeds it: every number is a double. fengari is Lua 5.3 with
+ * 32-bit integers, whose arithmetic wraps (`1794890484 * 1000` would be negative), so the module
+ * hooks below make every numeral and string → number conversion a float, print numbers with
+ * `%.14g` ("5", not "5.0"), and the library functions a script multiplies answer floats too.
  */
-import {type LuaState, lauxlib, lua, lualib} from 'fengari';
+import {type LuaCFunction, type LuaState, lauxlib, lua, lualib} from 'fengari';
+import lobject, {type TValue} from 'fengari/src/lobject.js';
+import lstring from 'fengari/src/lstring.js';
 
-import {openCjson} from './cjson';
+import {formatG14, openCjson} from './cjson';
 
 /** RESP2 reply / Lua value as JSON: `{t:'int'|'str'|'nil'|'arr'|'ok'|'err', v}`; strings are latin-1 (byte-safe). */
 export type Tagged =
@@ -30,11 +37,154 @@ const str = (b: Uint8Array | null): string => {
   return s;
 };
 
+/** A number as Lua 5.1 prints it: `LUAI_NUMFFORMAT` ("%.14g"), glibc's spelling of the non-finite. */
+const formatNumber = (n: number): string =>
+  Number.isFinite(n) ? formatG14(n) : Number.isNaN(n) ? 'nan' : n > 0 ? 'inf' : '-inf';
+
+/**
+ * The double Lua 5.1 reads from numeral `s`, which fengari parsed as the integer `value`: the same
+ * value, except a hexadecimal one (fengari's wraps at 32 bits) and `-0`.
+ */
+const numeralValue = (s: Uint8Array, value: number): number => {
+  let i = 0;
+  while (s[i] === 32 || (s[i] >= 9 && s[i] <= 13)) i++;
+  const negative = s[i] === 45;
+  if (negative || s[i] === 43) i++;
+  if (s[i] !== 48 || (s[i + 1] | 32) !== 120) return negative && value === 0 ? -0 : value;
+  let v = 0;
+  for (i += 2; i < s.length; i++) {
+    const c = s[i] | 32;
+    if (c >= 48 && c <= 57) v = v * 16 + c - 48;
+    else if (c >= 97 && c <= 102) v = v * 16 + c - 87;
+    else break;
+  }
+  return negative ? -v : v;
+};
+
+// fengari's lexer (numerals), its VM (string arithmetic) and `lua_stringtonumber` (`tonumber`) all
+// parse through `luaO_str2num`: a numeral that reads as an integer is stored as a float instead.
+const str2num = lobject.luaO_str2num;
+lobject.luaO_str2num = (s: Uint8Array, o: TValue): number => {
+  const size = str2num(s, o);
+  if (size !== 0 && o.ttisinteger()) o.setfltvalue(numeralValue(s, o.value));
+  return size;
+};
+// Number → string coercion (`lua_tolstring`, `..`).
+lobject.luaO_tostring = (L: LuaState, o: TValue): void => {
+  o.setsvalue(lstring.luaS_bless(L, bytes(formatNumber(o.value))));
+};
+// `tostring` and `%s` print a float through `lua_pushfstring('%f')`, whose formatter calls fengari's
+// own `luaO_tostring`: a `%f` item is handed to it as `%s` of the number's 5.1 text.
+const pushvfstring = lobject.luaO_pushvfstring;
+lobject.luaO_pushvfstring = (L: LuaState, fmt: Uint8Array, argp: unknown[]): Uint8Array => {
+  if (!fmt.includes(102)) return pushvfstring(L, fmt, argp);
+  const spec = Uint8Array.from(fmt);
+  const args = [...argp];
+  for (let i = 0, a = 0; i < spec.length - 1; i++) {
+    if (spec[i] !== 37) continue;
+    i++;
+    if (spec[i] === 37) continue;
+    if (spec[i] === 102) {
+      spec[i] = 115;
+      args[a] = bytes(formatNumber(args[a] as number));
+    }
+    a++;
+  }
+  return pushvfstring(L, spec, args);
+};
+
+/** C's `%d` of `n` cast to a long (truncated), with `string.format`'s flags, width and precision. */
+const formatLong = (flags: string, width: string, precision: string | undefined, n: number): string => {
+  const v = BigInt(Math.trunc(n));
+  let digits = (v < 0n ? -v : v).toString();
+  if (precision !== undefined)
+    digits = v === 0n && Number(precision) === 0 ? '' : digits.padStart(Number(precision), '0');
+  const sign = v < 0n ? '-' : flags.includes('+') ? '+' : flags.includes(' ') ? ' ' : '';
+  const w = Number(width);
+  if (flags.includes('-')) return (sign + digits).padEnd(w);
+  if (flags.includes('0') && precision === undefined) return sign + digits.padStart(w - sign.length, '0');
+  return (sign + digits).padStart(w);
+};
+
+/** A `string.format` item as its `scanformat` reads it: flags, two-digit width and precision, conversion. */
+const FORMAT_ITEM = /%([-+ #0]*)(\d{0,2})(?:\.(\d{0,2}))?([\s\S])/g;
+
+/**
+ * `string.format`'s `%d`/`%i` as Lua 5.1 has them, for the numbers Lua 5.3 refuses (a fraction, or
+ * beyond 32 bits): 5.1 casts to a C long. Each such item is formatted here and handed on as `%s`.
+ */
+const lua51Format =
+  (format: LuaCFunction): LuaCFunction =>
+  (S: LuaState): number => {
+    const fmt = str(lauxlib.luaL_checklstring(S, 1));
+    const top = lua.lua_gettop(S);
+    let arg = 1;
+    let changed = false;
+    const rewritten = fmt.replace(
+      FORMAT_ITEM,
+      (item, flags: string, width: string, precision: string | undefined, conv: string) => {
+        if (item === '%%') return item;
+        arg++;
+        if ((conv !== 'd' && conv !== 'i') || arg > top || !lua.lua_isnumber(S, arg)) return item;
+        const n = lua.lua_tonumber(S, arg);
+        if (!Number.isFinite(n) || (Number.isInteger(n) && n >= -0x80000000 && n < 0x80000000)) return item;
+        lua.lua_pushstring(S, bytes(formatLong(flags, width, precision, n)));
+        lua.lua_replace(S, arg);
+        changed = true;
+        return '%s';
+      },
+    );
+    if (changed) {
+      lua.lua_pushstring(S, bytes(rewritten));
+      lua.lua_replace(S, 1);
+    }
+    return format(S);
+  };
+
+/** Replace the C function `name` of the table on top of the stack with `wrap(original)`. */
+const rewrap = (L: LuaState, name: string, wrap: (original: LuaCFunction) => LuaCFunction): void => {
+  lua.lua_getfield(L, -1, bytes(name));
+  const original = lua.lua_tocfunction(L, -1);
+  lua.lua_pop(L, 1);
+  if (original === null) throw new Error(`${name} is not a C function`);
+  lua.lua_pushcfunction(L, wrap(original));
+  lua.lua_setfield(L, -2, bytes(name));
+};
+
+/** Lua 5.1's answers where Lua 5.3's library gives an integer: doubles, so arithmetic on them cannot wrap. */
+const openLua51Numbers = (L: LuaState): void => {
+  lua.lua_getglobal(L, bytes('math'));
+  for (const [name, round] of [
+    ['floor', Math.floor],
+    ['ceil', Math.ceil],
+  ] as const) {
+    rewrap(L, name, () => S => {
+      lua.lua_pushnumber(S, round(lauxlib.luaL_checknumber(S, 1)));
+      return 1;
+    });
+  }
+  lua.lua_pop(L, 1);
+  lua.lua_getglobal(L, bytes('string'));
+  rewrap(L, 'len', () => S => {
+    lua.lua_pushnumber(S, lauxlib.luaL_checklstring(S, 1).length);
+    return 1;
+  });
+  rewrap(L, 'format', lua51Format);
+  lua.lua_pop(L, 1);
+  lua.lua_getglobal(L, bytes('_G'));
+  rewrap(L, 'select', select => S => {
+    if (lua.lua_type(S, 1) !== lua.LUA_TSTRING || lua.lua_tolstring(S, 1)?.[0] !== 35) return select(S);
+    lua.lua_pushnumber(S, lua.lua_gettop(S) - 1);
+    return 1;
+  });
+  lua.lua_pop(L, 1);
+};
+
 /** Push a Redis reply onto the Lua stack (RESP2 → Lua). */
 const pushReply = (L: LuaState, value: Tagged): void => {
   switch (value.t) {
     case 'int':
-      lua.lua_pushinteger(L, value.v);
+      lua.lua_pushnumber(L, value.v);
       return;
     case 'str':
       lua.lua_pushstring(L, bytes(value.v));
@@ -135,6 +285,7 @@ export function luaEval(
   lua.lua_pushnil(L);
   lua.lua_setfield(L, -2, bytes('unpack'));
   lua.lua_pop(L, 1);
+  openLua51Numbers(L);
   // Redis loads lua-cjson as the global `cjson` (cmsgpack, bit and struct are not modelled).
   openCjson(L);
   const call =
@@ -175,7 +326,7 @@ export function luaEval(
   lua.lua_pushcfunction(L, () => 0);
   lua.lua_setfield(L, -2, bytes('setresp'));
   (['LOG_DEBUG', 'LOG_VERBOSE', 'LOG_NOTICE', 'LOG_WARNING'] as const).forEach((name, i) => {
-    lua.lua_pushinteger(L, i);
+    lua.lua_pushnumber(L, i);
     lua.lua_setfield(L, -2, bytes(name));
   });
   lua.lua_setglobal(L, bytes('redis'));

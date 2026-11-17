@@ -12,8 +12,10 @@ declare module 'fengari' {
     lua_gettop(L: LuaState): number;
     lua_pop(L: LuaState, n: number): void;
     lua_type(L: LuaState, idx: number): number;
-    lua_pushinteger(L: LuaState, n: number): void;
     lua_pushnumber(L: LuaState, n: number): void;
+    lua_isnumber(L: LuaState, idx: number): boolean;
+    lua_replace(L: LuaState, idx: number): void;
+    lua_tocfunction(L: LuaState, idx: number): LuaCFunction | null;
     lua_pushstring(L: LuaState, s: Uint8Array): void;
     lua_pushboolean(L: LuaState, b: boolean): void;
     lua_pushnil(L: LuaState): void;
@@ -50,6 +52,7 @@ declare module 'fengari' {
     luaL_loadstring(L: LuaState, s: Uint8Array): number;
     luaL_argcheck(L: LuaState, cond: boolean, arg: number, extramsg: Uint8Array): void;
     luaL_checklstring(L: LuaState, arg: number): Uint8Array;
+    luaL_checknumber(L: LuaState, arg: number): number;
   };
 
   export const lualib: {
@@ -58,4 +61,40 @@ declare module 'fengari' {
 
   export function to_luastring(s: string): Uint8Array;
   export function to_jsstring(b: Uint8Array): string;
+}
+
+/**
+ * fengari's internals that Lua 5.1's numbers hook into: fengari calls these through the module
+ * object, so replacing an export changes what the lexer, the VM and the API do.
+ */
+declare module 'fengari/src/lobject.js' {
+  import type {LuaState} from 'fengari';
+
+  /** A stack slot or constant; the hooks only see numbers through it. */
+  export interface TValue {
+    ttisinteger(): boolean;
+    setfltvalue(n: number): void;
+    setsvalue(ts: unknown): void;
+    readonly value: number;
+  }
+
+  const lobject: {
+    /** Parse a numeral into `o`: its length + 1, or 0 when `s` is not one. */
+    luaO_str2num(s: Uint8Array, o: TValue): number;
+    /** Replace the number in `o` with its string (number → string coercion). */
+    luaO_tostring(L: LuaState, o: TValue): void;
+    /** `lua_pushfstring`'s formatter (`%s %d %I %f %p %c %U %%`). */
+    luaO_pushvfstring(L: LuaState, fmt: Uint8Array, argp: unknown[]): Uint8Array;
+  };
+  export default lobject;
+}
+
+declare module 'fengari/src/lstring.js' {
+  import type {LuaState} from 'fengari';
+
+  const lstring: {
+    /** Intern `s` as a Lua string object. */
+    luaS_bless(L: LuaState, s: Uint8Array): unknown;
+  };
+  export default lstring;
 }

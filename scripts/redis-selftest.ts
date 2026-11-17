@@ -922,6 +922,30 @@ const SCENARIOS: Record<string, (s: RedisServer, check: Check) => void> = {
     );
     check('no table.unpack', s.execute(['eval', 'return type(table.unpack)', '0']), 'nil');
   },
+  "Lua 5.1's numbers are doubles": (s, check) => {
+    const run = (script: string, ...rest: string[]) => s.execute(['eval', script, ...rest]);
+    const at = '1794890484';
+    check('no 32-bit wrap', run('return tonumber(ARGV[1]) * 1000 == 1794890484000', '0', at), 1);
+    check('as a reply', run('return tonumber(ARGV[1]) * 1000', '0', at), 1794890484000);
+    s.execute(['set', 'k', 'v']);
+    check('pexpireat', run("return redis.call('pexpireat', KEYS[1], tonumber(ARGV[1]) * 1000)", '1', 'k', at), 1);
+    check('key kept', s.execute(['pttl', 'k']), 1794890484000 - T0);
+    check('tostring', run('return tostring(10/2)', '0'), '5');
+    check('%.14g', run('return {tostring(1e15), tostring(0.1), tostring(2^53)}', '0'), [
+      '1e+15',
+      '0.1',
+      '9.007199254741e+15',
+    ]);
+    check('concat', run("return 'k:' .. 3", '0'), 'k:3');
+    check('%d', run("return string.format('%d', 3)", '0'), '3');
+    check('%d of a long', run("return string.format('%d', tonumber(ARGV[1]) * 1000)", '0', at), '1794890484000');
+    check('one slot', run("local t = {}; t[1] = 'a'; t[1.0] = 'b'; return {t[1], #t}", '0'), ['b', 1]);
+    s.execute(['set', 'n', '2000000']);
+    check('incr reply', run("return tostring(redis.call('incr', KEYS[1]) * 1000000)", '1', 'n'), '2000001000000');
+    check('math.floor', run('return tostring(math.floor(ARGV[1] / 10) * 10000)', '0', at), '1794890480000');
+    check('cjson', run('return tostring(cjson.decode(ARGV[1]).at * 1000)', '0', `{"at":${at}}`), '1794890484000');
+    check('truncated reply', run('return 3.7', '0'), 3);
+  },
   'WATCH aborts EXEC after another client writes the key': (s, check) => {
     const conn = s.connect();
     s.execute(['set', 'k', 'v']);
