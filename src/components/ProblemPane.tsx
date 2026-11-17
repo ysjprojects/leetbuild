@@ -4,6 +4,7 @@ import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from '
 import {GUIDES} from '@/data/guides/meta';
 import {guidePath, learnPath} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
+import {scrollBehavior} from '@/lib/motion';
 import {runtimeHarness} from '@/lib/runtime/client';
 import {CPP_UNSUPPORTED} from '@/lib/runtime/cpp/support';
 import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
@@ -23,6 +24,7 @@ import {
   GUIDE_IDS,
   isArchitectureFigure,
   LANGUAGE_LABEL,
+  LANGUAGE_STACK,
   runsAsProgram,
   sourceCredit,
   stepKey,
@@ -224,6 +226,7 @@ const Solution: FC<{
         <>
           <StepEditor
             className="border-ink-700 mt-2 h-[46vh] overflow-hidden rounded-lg border"
+            label={`${fileName(step.file, language)}, reference solution`}
             language={language}
             original={diff ? userCode : null}
             readOnly
@@ -243,7 +246,72 @@ const Solution: FC<{
 });
 Solution.displayName = 'Solution';
 
+/**
+ * The address names a step that is not unlocked yet (a guide's "Practise it" link): its title, why it
+ * waits, the way to the first open step, and a skip ahead that reveals the steps before it.
+ */
+const LockedStep: FC<{
+  problem: Problem;
+  locked: Step;
+  /** The first open step: where the learner goes next. */
+  open: Step;
+  onGoTo: (id: string) => void;
+  onRevealUpTo: (id: string) => void;
+}> = memo(({problem, locked, open, onGoTo, onRevealUpTo}) => {
+  const lockedNumber = problem.steps.indexOf(locked) + 1;
+  const openNumber = problem.steps.indexOf(open) + 1;
+  const previous = lockedNumber - 1;
+  const one = openNumber === previous;
+  const span = one ? `step ${openNumber}` : `steps ${openNumber} to ${previous}`;
+  const [dialog, openDialog] = useDialog();
+  const onGoClick = useCallback(() => onGoTo(open.id), [onGoTo, open.id]);
+  const onRevealClick = useCallback(() => {
+    void openDialog({
+      title: `Reveal ${span}?`,
+      body: `${
+        one ? 'It counts as done but scores' : 'They count as done but score'
+      } 0 points, and step ${lockedNumber} opens. You can still study each solution and load it into the editor.`,
+      confirm: `Reveal and open step ${lockedNumber}`,
+    }).then(ok => {
+      if (ok) onRevealUpTo(locked.id);
+    });
+  }, [openDialog, onRevealUpTo, locked.id, lockedNumber, one, span]);
+  return (
+    <div className="mt-3">
+      <p className="text-ink-300 flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
+        <span>step {lockedNumber} · locked</span>
+        <ConceptChip concept={locked.concept} />
+      </p>
+      <h1 className="text-ink-50 mt-1 text-xl font-extrabold leading-tight">{locked.title}</h1>
+      <section className="border-ink-700 bg-ink-850 mt-4 rounded-xl border p-3">
+        <p className="text-ink-200 text-[13px]">
+          {one
+            ? `Step ${lockedNumber} unlocks when step ${previous} is accepted or its solution revealed.`
+            : `Step ${lockedNumber} unlocks when steps ${openNumber} to ${previous} are each accepted or their solutions revealed.`}
+        </p>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <button className={primaryButtonClass} onClick={onGoClick} title={open.title} type="button">
+            Go to step {openNumber}
+          </button>
+          <button className={`${linkClass} text-[12px]`} onClick={onRevealClick} type="button">
+            Reveal {span} and skip ahead
+          </button>
+        </div>
+        <p className="text-ink-300 mt-2 text-[11px]">Revealed steps count as done and score 0 points.</p>
+      </section>
+      {dialog}
+    </div>
+  );
+});
+LockedStep.displayName = 'LockedStep';
+
 const NO_FOCUS: readonly string[] = [];
+
+/** Below this the pane's header puts the course title on a row of its own. */
+const NARROW_HEADER_PX = 520;
+
+/** Where each step's pane was scrolled to, by `problem/step/tab`, for the visit. */
+const scrollMemory = new Map<string, number>();
 
 /** One figure, compact or full; `focus` holds only ids of this figure. */
 const FigureView: FC<{figure: ProblemFigure; compact: boolean; focus?: readonly string[]; onExpand?: () => void}> =
@@ -383,7 +451,7 @@ const CompanyHeader: FC<{company: Company}> = memo(({company}) => (
   <div className="border-ink-700 bg-ink-800/60 mb-3 flex items-center gap-3 rounded-xl border p-3">
     <CompanyMark company={company} size="lg" />
     <div className="min-w-0">
-      <p className="text-iris-400 text-[10px] font-bold uppercase tracking-wider">Company tagged</p>
+      <p className="text-iris-300 text-[10px] font-bold uppercase tracking-wider">Company tagged</p>
       <p className="text-ink-100 text-[12px] leading-snug">
         Derived from the{' '}
         <a className={linkClass} href={company.url} rel="noopener noreferrer" target="_blank">
@@ -422,7 +490,7 @@ const SOURCE_KIND_TONE: Record<SourceKind, string> = {
  */
 const Sources: FC<{company: Company | undefined; sources: readonly Source[]}> = memo(({company, sources}) => (
   <section className="border-ink-700 mt-6 border-t pt-4">
-    <h2 className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Sources</h2>
+    <h2 className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">Sources</h2>
     <ol className="mt-2 space-y-3">
       {sources.map(source => (
         <li className="flex gap-3" key={source.url}>
@@ -521,6 +589,12 @@ const ProblemPane: FC<{
   certified: boolean;
   /** Open the certificate dialog (download, add to LinkedIn, share). */
   onCertificate: () => void;
+  /** The step the address names when it is not unlocked yet: shown locked, `step` being the first open one. */
+  lockedStep: Step | null;
+  /** Reveal every open step before this one, which unlocks it. */
+  onRevealUpTo: (id: string) => void;
+  /** Bumped to bring the debrief into view (the verdict's link to it). */
+  debriefRequest: number;
 }> = memo(
   ({
     problem,
@@ -545,6 +619,9 @@ const ProblemPane: FC<{
     onCollapse,
     certified,
     onCertificate,
+    lockedStep,
+    onRevealUpTo,
+    debriefRequest,
   }) => {
     const score = problemScore(problem, attempts);
     const points = STEP_POINTS[problem.difficulty];
@@ -553,12 +630,35 @@ const ProblemPane: FC<{
     const onStepTab = useCallback(() => onTab('step'), [onTab]);
     const hasNext = stepIndex < problem.steps.length - 1;
     const done = attempt.status !== 'open';
-    // A new step (or tab) starts at the top: the diagram's highlight, the rail, then the heading — not
-    // wherever the previous step's content had been scrolled to.
+    /** The step the pane shows: the locked one the address names, or the open step. */
+    const shown = lockedStep ?? step;
+    const shownIndex = lockedStep === null ? stepIndex : problem.steps.indexOf(lockedStep);
+    const stack = LANGUAGE_STACK[language][step.concept];
+    // A step (or tab) opens where it was left this visit, after a guide or another step and back, and
+    // at the top the first time: the diagram's highlight, the rail, then the heading.
     const scroller = useRef<HTMLDivElement>(null);
+    const scrollKey = `${problem.id}/${shown.id}/${tab}`;
     useEffect(() => {
-      scroller.current?.scrollTo({top: 0});
-    }, [step.id, tab]);
+      scroller.current?.scrollTo({top: scrollMemory.get(scrollKey) ?? 0});
+    }, [scrollKey]);
+    const onScroll = useCallback(() => {
+      if (scroller.current !== null) scrollMemory.set(scrollKey, scroller.current.scrollTop);
+    }, [scrollKey]);
+    const debrief = useRef<HTMLElement>(null);
+    useEffect(() => {
+      if (debriefRequest > 0) debrief.current?.scrollIntoView({behavior: scrollBehavior(), block: 'start'});
+    }, [debriefRequest]);
+    // A narrow pane (phones, or beside an open explorer at 1024 px) gives the title its own row under
+    // the actions, as phones always did, instead of squeezing it to a letter between them.
+    const header = useRef<HTMLDivElement>(null);
+    const [narrowHeader, setNarrowHeader] = useState(false);
+    useEffect(() => {
+      const el = header.current;
+      if (el === null) return undefined;
+      const observer = new ResizeObserver(([entry]) => setNarrowHeader(entry.contentRect.width < NARROW_HEADER_PX));
+      observer.observe(el);
+      return () => observer.disconnect();
+    }, []);
     /** Steps that build each diagram node (1-based numbers), for tooltips and click-to-jump. */
     const stepsByNode = useMemo(() => {
       const map: Record<string, number[]> = {};
@@ -577,12 +677,16 @@ const ProblemPane: FC<{
     );
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="border-ink-700 flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-4 py-2">
+        <div
+          className="border-ink-700 flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-4 py-2"
+          ref={header}>
           <button className={`${ghostButtonClass} -ml-2`} onClick={onBack} type="button">
             ← problems
           </button>
-          {/* On phones the actions crowd the title out of the first row, so it takes the second. */}
-          <span className="order-last flex min-w-0 basis-full items-center gap-2 sm:order-none sm:flex-1 sm:basis-0">
+          <span
+            className={`order-last flex min-w-0 basis-full flex-wrap items-center gap-x-2 gap-y-1 ${
+              narrowHeader ? '' : 'sm:order-none sm:flex-1 sm:basis-0'
+            }`}>
             <span className="text-ink-50 min-w-0 truncate text-[13px] font-bold">{problem.title}</span>
             <DifficultyChip difficulty={problem.difficulty} />
             {problem.tag !== undefined ? <TagChip tag={problem.tag} /> : null}
@@ -592,7 +696,9 @@ const ProblemPane: FC<{
           </span>
           <button
             aria-label="download this course as Markdown"
-            className="border-ink-600 bg-ink-800 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 ml-auto flex h-6 w-6 items-center justify-center rounded-md border transition sm:ml-0"
+            className={`border-ink-600 bg-ink-800 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 ml-auto flex h-6 w-6 items-center justify-center rounded-md border transition ${
+              narrowHeader ? '' : 'sm:ml-0'
+            }`}
             onClick={onDownload}
             title={`download this course as a Markdown file (${LANGUAGE_LABEL[language]}): statement, diagrams, every step with its starter, hints and solution`}
             type="button">
@@ -653,24 +759,24 @@ const ProblemPane: FC<{
             </svg>
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" ref={scroller}>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" onScroll={onScroll} ref={scroller}>
           {problem.figures !== undefined && problem.figures.length > 0 ? (
             <PaneFigures
               figures={problem.figures}
-              focus={tab === 'step' ? step.focus : NO_FOCUS}
+              focus={tab === 'step' ? shown.focus : NO_FOCUS}
               title={problem.title}
             />
           ) : problem.diagram !== undefined ? (
             <SystemDiagram
               compact
               diagram={problem.diagram}
-              focus={tab === 'step' ? step.focus : NO_FOCUS}
+              focus={tab === 'step' ? shown.focus : NO_FOCUS}
               onSelectNode={onSelectNode}
               stepsByNode={stepsByNode}
             />
           ) : null}
           <StepRail
-            activeId={tab === 'step' ? step.id : null}
+            activeId={tab === 'step' ? shown.id : null}
             attempts={attempts}
             onSelect={onSelectStep}
             problem={problem}
@@ -690,7 +796,7 @@ const ProblemPane: FC<{
               }`}
               onClick={onStepTab}
               type="button">
-              Step {stepIndex + 1} of {problem.steps.length}
+              Step {shownIndex + 1} of {problem.steps.length}
             </button>
           </div>
 
@@ -716,9 +822,17 @@ const ProblemPane: FC<{
                 <Sources company={problem.company} sources={problem.sources} />
               ) : null}
             </div>
+          ) : lockedStep !== null ? (
+            <LockedStep
+              locked={lockedStep}
+              onGoTo={onSelectStep}
+              onRevealUpTo={onRevealUpTo}
+              open={step}
+              problem={problem}
+            />
           ) : (
             <div className="mt-3">
-              <p className="text-iris-400 flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
+              <p className="text-iris-300 flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
                 <span>
                   step {stepIndex + 1} · {CONCEPT_LABEL[step.concept]}
                 </span>
@@ -742,6 +856,11 @@ const ProblemPane: FC<{
               <p className="text-ink-300 mt-1 text-[12px]">
                 Edit <code className="font-code text-iris-200">{fileName(step.file, language)}</code> in the editor,
                 then submit.{' '}
+                {stack !== undefined ? (
+                  <>
+                    The reference uses <code className="font-code text-iris-200">{stack}</code>.{' '}
+                  </>
+                ) : null}
                 {runtimeHarness(step, language) !== undefined
                   ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
                   : step.harness?.[language] !== undefined
@@ -779,7 +898,9 @@ const ProblemPane: FC<{
                 userCode={userCode}
               />
               {done ? (
-                <section className="border-success-400/40 bg-success-400/5 mt-4 rounded-xl border p-3">
+                <section
+                  className="border-success-400/40 bg-success-400/5 mt-4 scroll-mt-3 rounded-xl border p-3"
+                  ref={debrief}>
                   <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Debrief</p>
                   <div className="mt-1">
                     <Markdown highlight={leetbuildHighlighter} source={step.debrief} />
@@ -797,8 +918,8 @@ const ProblemPane: FC<{
             {score.done}/{score.total} steps done
           </span>
           {tab === 'problem' ? (
-            <button className={primaryButtonClass} onClick={onStepTab} title={step.title} type="button">
-              {score.done === 0 ? 'start step 1 →' : `step ${stepIndex + 1} →`}
+            <button className={primaryButtonClass} onClick={onStepTab} title={shown.title} type="button">
+              {score.done === 0 && lockedStep === null ? 'start step 1 →' : `step ${shownIndex + 1} →`}
             </button>
           ) : (
             <button

@@ -45,9 +45,22 @@ export const BrandLockup: FC<{className?: string; size?: 'md' | 'lg'}> = memo(({
 ));
 BrandLockup.displayName = 'BrandLockup';
 
-/** Copy the landing page opens with — real text, so it is already in place while the rest loads. */
-export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
-  ({stats = ['real systems', '5 languages', 'AI systems', '1337 points']}) => (
+/** Where the hero's primary button goes once progress is known: a first course, or the course in progress. */
+export interface LandingStart {
+  href: string;
+  label: string;
+  title: string;
+}
+
+const primaryButton =
+  'bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-4 py-2 text-[13px] font-bold shadow-[0_8px_24px_rgba(108,76,241,0.18)] transition';
+
+/**
+ * Copy the landing page opens with — real text, so it is already in place while the rest loads.
+ * Practice comes first: until progress is known (`start` absent), its button goes to the list.
+ */
+export const LandingIntro: FC<{stats?: readonly string[]; start?: LandingStart}> = memo(
+  ({stats = ['real systems', '5 languages', 'AI systems', '1337 points'], start}) => (
     <section className="border-ink-700 relative overflow-hidden border-b">
       <div
         aria-hidden
@@ -77,8 +90,17 @@ export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
           ))}
         </div>
         <div className="mt-5 flex flex-wrap items-center gap-3">
+          {start === undefined ? (
+            <a className={primaryButton} href="#problems">
+              Start practising →
+            </a>
+          ) : (
+            <Link className={primaryButton} href={start.href} title={start.title}>
+              {start.label} →
+            </Link>
+          )}
           <Link
-            className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-4 py-2 text-[13px] font-bold shadow-[0_8px_24px_rgba(108,76,241,0.18)] transition"
+            className="border-iris-400/40 text-iris-300 hover:bg-iris-400/10 rounded-lg border px-4 py-2 text-[13px] font-bold transition"
             href="/mock-interview">
             AI mock interview →
           </Link>
@@ -182,7 +204,7 @@ const ProblemListSkeleton: FC = memo(() => (
         </div>
       </section>
       <section>
-        <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
+        <p className="text-iris-300 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
         <ul className="space-y-2">
           {ROW_TITLES.map((title, i) => (
             <li className="border-ink-700 bg-ink-850 flex items-center gap-3 rounded-xl border px-4 py-3" key={i}>
@@ -323,7 +345,7 @@ const PlaygroundSkeleton: FC = memo(() => (
           <div className="bg-ink-850 font-code flex min-h-0 flex-1 overflow-hidden text-[13px] leading-[18px]">
             <ol
               aria-hidden
-              className="border-ink-700 text-ink-500 shrink-0 select-none border-r py-2 pl-2 pr-2 text-right">
+              className="border-ink-700 text-ink-400 shrink-0 select-none border-r py-2 pl-2 pr-2 text-right">
               {lineStyles.map((_, i) => (
                 <li key={i}>{i + 1}</li>
               ))}

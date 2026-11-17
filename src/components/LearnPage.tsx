@@ -142,7 +142,7 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
                     active === s.id ? 'text-ink-50 font-semibold' : 'text-ink-300 hover:text-ink-50'
                   }`}
                   href={`#${s.id}`}>
-                  <span className="font-code text-ink-500 w-4 shrink-0 text-right text-[11px] leading-5">{i + 1}</span>
+                  <span className="font-code text-ink-400 w-4 shrink-0 text-right text-[11px] leading-5">{i + 1}</span>
                   {s.title}
                 </a>
               </li>

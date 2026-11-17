@@ -1,5 +1,16 @@
 import Link from 'next/link';
-import {type ChangeEvent, type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import Router, {useRouter} from 'next/router';
+import {
+  type ChangeEvent,
+  type FC,
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import {
   type ListedMockScenario,
@@ -8,6 +19,14 @@ import {
   resolveMockScenario,
 } from '@/data/mock';
 import {type Verdict, commonMessage, judge, withRuntime} from '@/lib/judge';
+import {
+  type MockMessage,
+  type MockSession,
+  clearMockSession,
+  loadMockSession,
+  saveMockSession,
+  secondsLeftAt,
+} from '@/lib/mockSession';
 import {type RuntimeStatus, getRunner, runtimeHarness, STATUS_TEXT} from '@/lib/runtime/client';
 import {stepJob} from '@/lib/runtime/job';
 import {formatClock} from '@/lib/timer';
@@ -24,13 +43,6 @@ import StepEditor from './StepEditor';
 
 /** `ready` is the scenario page with the clock not yet running, behind the start dialog. */
 type Phase = 'setup' | 'ready' | 'running' | 'report';
-
-interface AssistantMessage {
-  id: number;
-  from: 'ai' | 'you';
-  text: string;
-  tone?: 'ok' | 'warn';
-}
 
 const startersFor = (scenario: ResolvedMockScenario): Record<Language, string> =>
   Object.fromEntries(LANGUAGES.map(language => [language, codeFor(scenario.step, language).starter])) as Record<
@@ -80,6 +92,57 @@ const GradingStatus: FC<{runtime: RuntimeStatus; className: string}> = memo(({ru
   </p>
 ));
 GradingStatus.displayName = 'GradingStatus';
+
+/** The status of `language`'s runtime, live; idle where the language is graded by reading the code. */
+const useRuntimeStatus = (language: Language): RuntimeStatus => {
+  const runner = useMemo(() => getRunner(language), [language]);
+  const [status, setStatus] = useState<RuntimeStatus>(runner?.status ?? {state: 'idle'});
+  useEffect(() => {
+    if (runner === null) {
+      setStatus({state: 'idle'});
+      return undefined;
+    }
+    setStatus(runner.status);
+    return runner.onStatus(setStatus);
+  }, [runner]);
+  return status;
+};
+
+/** Where the runtime is, beside the clock and in the start dialog: it boots while the dialog is open. */
+const RuntimeBadge: FC<{language: Language; runtime: RuntimeStatus}> = memo(({language, runtime}) => {
+  if (runtime.state === 'idle') return null;
+  const booting = runtime.state === 'booting';
+  const failed = runtime.state === 'failed';
+  return (
+    <span
+      className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+        failed
+          ? 'border-danger-400/60 text-danger-300'
+          : booting
+          ? 'border-ink-600 text-ink-300'
+          : 'border-success-400/40 text-success-300'
+      }`}
+      role="status"
+      title={booting ? STATUS_TEXT[runtime.phase] : failed ? runtime.message : undefined}>
+      <span
+        aria-hidden
+        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+          failed
+            ? 'bg-danger-400'
+            : booting
+            ? 'bg-warning-400 animate-pulse motion-reduce:animate-none'
+            : 'bg-success-400'
+        }`}
+      />
+      {booting
+        ? `loading the ${LANGUAGE_LABEL[language]} runtime…`
+        : failed
+        ? 'runtime failed to start'
+        : 'runtime ready'}
+    </span>
+  );
+});
+RuntimeBadge.displayName = 'RuntimeBadge';
 
 /**
  * A compact pass/fail list, used both while the clock runs and in the report: for a failed check,
@@ -258,51 +321,105 @@ ScenarioCard.displayName = 'ScenarioCard';
 
 /**
  * The start dialog's body: what the interviewer will say, where the step comes from, how long the
- * clock runs, and the language to start in — chosen here so no seconds go to a dropdown later.
+ * clock runs, and the language to start in — chosen here so no seconds go to a dropdown later. The
+ * chosen language's runtime boots while it is open. `replaces`: the running session starting ends.
  */
-const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLanguage: (l: Language) => void}> = memo(
-  ({scenario, initial, onLanguage}) => {
-    const [chosen, setChosen] = useState<Language>(initial);
-    const onChange = useCallback(
-      (value: string) => {
-        const next = value as Language;
-        setChosen(next);
-        onLanguage(next);
-      },
-      [onLanguage],
-    );
-    return (
-      <div className="space-y-3">
-        <p className="text-ink-50 text-[14px] font-bold leading-snug">{scenario.title}</p>
-        <div className="flex flex-wrap items-center gap-2 text-[12px]">
-          <span className="text-ink-100 font-semibold">{scenario.problem.title}</span>
-          <DifficultyChip difficulty={scenario.problem.difficulty} />
-          <span className="text-ink-400">· {scenario.role}</span>
-        </div>
-        <p className="text-ink-300 text-[12px] leading-5">
-          The interviewer's brief, the requirements and the patch open when the clock starts. Only the signals it probes
-          are known in advance:
-        </p>
-        <div className="flex flex-wrap gap-1.5">
-          {scenario.signals.map(signal => (
-            <SignalChip key={signal} signal={signal} />
-          ))}
-        </div>
-        <div className="border-ink-700 flex flex-wrap items-center justify-between gap-3 border-t pt-3 text-[12px]">
-          <span className="text-ink-300 flex items-center gap-2">
-            language
-            <Select label="language" onChange={onChange} options={LANGUAGE_OPTIONS} value={chosen} />
-          </span>
-          <span className="text-ink-400">
-            <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the patch
-            loads in the editor · nothing is recorded
-          </span>
-        </div>
+const ScenarioBrief: FC<{
+  scenario: ResolvedMockScenario;
+  initial: Language;
+  onLanguage: (l: Language) => void;
+  replaces: string | null;
+}> = memo(({scenario, initial, onLanguage, replaces}) => {
+  const [chosen, setChosen] = useState<Language>(initial);
+  const runtime = useRuntimeStatus(chosen);
+  const onChange = useCallback(
+    (value: string) => {
+      const next = value as Language;
+      setChosen(next);
+      onLanguage(next);
+    },
+    [onLanguage],
+  );
+  return (
+    <div className="space-y-3">
+      <p className="text-ink-50 text-[14px] font-bold leading-snug">{scenario.title}</p>
+      <div className="flex flex-wrap items-center gap-2 text-[12px]">
+        <span className="text-ink-100 font-semibold">{scenario.problem.title}</span>
+        <DifficultyChip difficulty={scenario.problem.difficulty} />
+        <span className="text-ink-400">· {scenario.role}</span>
       </div>
+      <p className="text-ink-300 text-[12px] leading-5">
+        The interviewer's brief, the requirements and the patch open when the clock starts. Only the signals it probes
+        are known in advance:
+      </p>
+      <div className="flex flex-wrap gap-1.5">
+        {scenario.signals.map(signal => (
+          <SignalChip key={signal} signal={signal} />
+        ))}
+      </div>
+      <div className="border-ink-700 flex flex-wrap items-center justify-between gap-3 border-t pt-3 text-[12px]">
+        <span className="text-ink-300 flex items-center gap-2">
+          language
+          <Select label="language" onChange={onChange} options={LANGUAGE_OPTIONS} value={chosen} />
+          {runtimeHarness(scenario.step, chosen) !== undefined ? (
+            <RuntimeBadge language={chosen} runtime={runtime} />
+          ) : null}
+        </span>
+        <span className="text-ink-400">
+          <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the patch
+          loads in the editor · saved in this browser only
+        </span>
+      </div>
+      {replaces !== null ? (
+        <p className="border-warning-400/40 bg-warning-400/10 text-warning-300 rounded-lg border px-3 py-2 text-[12px] leading-5">
+          {replaces}
+        </p>
+      ) : null}
+    </div>
+  );
+});
+ScenarioBrief.displayName = 'ScenarioBrief';
+
+/** The saved session, on the picker: resume it (or open its report), or let it go. Its clock keeps running. */
+const ResumeBanner: FC<{session: MockSession; title: string; onResume: () => void; onDiscard: () => void}> = memo(
+  ({session, title, onResume, onDiscard}) => {
+    const [now, setNow] = useState(Date.now);
+    const running = session.phase === 'running';
+    useEffect(() => {
+      if (!running) return undefined;
+      const timer = window.setInterval(() => setNow(Date.now()), 1000);
+      return () => window.clearInterval(timer);
+    }, [running]);
+    const left = secondsLeftAt(session.deadline, session.endedAt, now);
+    const live = running && left > 0;
+    return (
+      <section
+        aria-label="saved session"
+        className="border-danger-400/40 bg-danger-400/10 mb-6 flex flex-wrap items-center gap-3 rounded-xl border px-4 py-3">
+        <p className="text-ink-100 min-w-0 flex-1 text-[13px] leading-6">
+          {live ? 'Resume ' : running ? 'Time ran out on ' : 'Your report on '}
+          <span className="text-ink-50 font-bold">{title}</span>
+          {live ? (
+            <>
+              ? <span className="font-code text-danger-200">{formatClock(left)}</span> left.
+            </>
+          ) : running ? (
+            '.'
+          ) : (
+            ' is saved.'
+          )}
+        </p>
+        <button className={MOCK_PRIMARY} onClick={onResume} type="button">
+          {live ? 'Resume' : 'Open report'}
+        </button>
+        <button className={ghostButtonClass} onClick={onDiscard} type="button">
+          {live ? 'Discard' : 'Dismiss'}
+        </button>
+      </section>
     );
   },
 );
-ScenarioBrief.displayName = 'ScenarioBrief';
+ResumeBanner.displayName = 'ResumeBanner';
 
 /**
  * The setup page's list: a search pill and the six signals to narrow by, then the cards in threes.
@@ -413,17 +530,35 @@ ScenarioPicker.displayName = 'ScenarioPicker';
  * test, decide — under a clock, not to pretend a model is on the other end.
  */
 const MockInterview: FC = memo(() => {
+  const router = useRouter();
+  /** The scenario the address names (`?scenario=<id>`); null on the picker. */
+  const urlScenario = router.isReady && typeof router.query.scenario === 'string' ? router.query.scenario : null;
   const [phase, setPhase] = useState<Phase>('setup');
+  const phaseRef = useRef(phase);
+  phaseRef.current = phase;
   const [scenario, setScenario] = useState<ResolvedMockScenario | null>(null);
   /** The scenario whose course is being fetched; `openFailed` when the last fetch failed. */
   const [opening, setOpening] = useState<string | null>(null);
   const [openFailed, setOpenFailed] = useState(false);
   /** Bumped per open: a course that arrives after another card was picked opens nothing. */
   const openRequest = useRef(0);
+  /** The scenario open or opening, as the address last named it. */
+  const shownId = useRef<string | null>(null);
+  /** Set by a card: open its scenario fresh even when its report is saved (a running session still resumes). */
+  const freshOpen = useRef<string | null>(null);
+  /** The picker pushed this scenario's address, so leaving it is a step back in history. */
+  const pushedFromPicker = useRef(false);
+  /** The saved session, as the picker offers it. */
+  const [saved, setSaved] = useState<MockSession | null>(loadMockSession);
   const [language, setLanguage] = useState<Language>('python');
   const [codeByLanguage, setCodeByLanguage] = useState<Record<Language, string> | null>(null);
   const [editorReset, setEditorReset] = useState(0);
-  const [secondsLeft, setSecondsLeft] = useState(0);
+  /** When the clock runs out, in `Date.now()` milliseconds; null before it starts. */
+  const [deadline, setDeadline] = useState<number | null>(null);
+  /** When the session ended (Finish, acceptance or time-up): the clock stops there. */
+  const [endedAt, setEndedAt] = useState<number | null>(null);
+  /** `Date.now()` as the clock last read it. */
+  const [now, setNow] = useState(Date.now);
   const [attempts, setAttempts] = useState(0);
   const [hints, setHints] = useState(0);
   const [verdict, setVerdict] = useState<Verdict | null>(null);
@@ -433,9 +568,8 @@ const MockInterview: FC = memo(() => {
   const [grading, setGrading] = useState(false);
   /** Bumped per grading and whenever the scenario restarts: a result that arrives for anything else is dropped. */
   const gradeSeq = useRef(0);
-  const runner = useMemo(() => getRunner(language), [language]);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({state: 'idle'});
-  const [messages, setMessages] = useState<AssistantMessage[]>([]);
+  const runtimeStatus = useRuntimeStatus(language);
+  const [messages, setMessages] = useState<MockMessage[]>([]);
   const [followUps, setFollowUps] = useState<Record<number, string>>({});
   const [copied, setCopied] = useState(false);
   const [promptCopied, setPromptCopied] = useState(false);
@@ -445,8 +579,9 @@ const MockInterview: FC = memo(() => {
   const nextMessage = useRef(1);
 
   const code = codeByLanguage?.[language] ?? '';
+  const secondsLeft = deadline === null ? (scenario?.minutes ?? 0) * 60 : secondsLeftAt(deadline, endedAt, now);
 
-  const say = useCallback((text: string, from: AssistantMessage['from'] = 'ai', tone?: AssistantMessage['tone']) => {
+  const say = useCallback((text: string, from: MockMessage['from'] = 'ai', tone?: MockMessage['tone']) => {
     setMessages(current => [...current, {id: nextMessage.current++, text, from, tone}]);
   }, []);
 
@@ -459,32 +594,43 @@ const MockInterview: FC = memo(() => {
     mainRef.current?.scrollTo({top: 0});
   }, [phase]);
 
-  // One countdown; when it reaches zero the mock ends and the report grades whatever is on screen.
+  // The clock reads the stored deadline against Date.now(), so a frozen page or a throttled
+  // background tab cannot stretch it. It wakes just after each whole second, and on returning to the tab.
   useEffect(() => {
-    if (phase !== 'running') return undefined;
-    if (secondsLeft <= 0) {
+    if (phase !== 'running' || deadline === null) return undefined;
+    let timer = 0;
+    const tick = (): void => {
+      window.clearTimeout(timer);
+      const at = Date.now();
+      setNow(at);
+      if (at < deadline) timer = window.setTimeout(tick, ((deadline - at) % 1000) + 20);
+    };
+    tick();
+    document.addEventListener('visibilitychange', tick);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', tick);
+    };
+  }, [phase, deadline]);
+
+  // Time is up: the mock ends and the report grades whatever is on screen.
+  useEffect(() => {
+    if (phase === 'running' && deadline !== null && now >= deadline) {
+      setEndedAt(deadline);
       setPhase('report');
-      return undefined;
     }
-    const timer = window.setTimeout(() => setSecondsLeft(current => Math.max(0, current - 1)), 1000);
-    return () => window.clearTimeout(timer);
-  }, [phase, secondsLeft]);
+  }, [phase, deadline, now]);
 
+  // Boot the language's runtime while the start dialog is open, so the first Submit does not wait for it.
   useEffect(() => {
-    if (runner === null) {
-      setRuntimeStatus({state: 'idle'});
-      return undefined;
+    if (
+      (phase === 'ready' || phase === 'running') &&
+      scenario !== null &&
+      runtimeHarness(scenario.step, language) !== undefined
+    ) {
+      getRunner(language)?.prewarm();
     }
-    setRuntimeStatus(runner.status);
-    return runner.onStatus(setRuntimeStatus);
-  }, [runner]);
-
-  // The clock runs: boot the language's runtime now, so the first Submit does not wait for its download.
-  useEffect(() => {
-    if (phase === 'running' && scenario !== null && runtimeHarness(scenario.step, language) !== undefined) {
-      runner?.prewarm();
-    }
-  }, [phase, scenario, language, runner]);
+  }, [phase, scenario, language]);
 
   // The report grades the code on screen: a submission's verdict when it graded this code, a fresh run otherwise.
   useEffect(() => {
@@ -499,6 +645,50 @@ const MockInterview: FC = memo(() => {
     });
   }, [phase, scenario, language, code, verdictCode]);
 
+  // The session is saved as it changes, so Back, a reload, the logo or the mode switch never lose it.
+  useEffect(() => {
+    if ((phase !== 'running' && phase !== 'report') || scenario === null || deadline === null) return;
+    if (codeByLanguage === null) return;
+    saveMockSession({
+      scenarioId: scenario.id,
+      phase,
+      language,
+      code: codeByLanguage,
+      deadline,
+      endedAt,
+      attempts,
+      hints,
+      messages,
+      followUps,
+      verdict,
+      verdictCode,
+    });
+  }, [
+    phase,
+    scenario,
+    language,
+    codeByLanguage,
+    deadline,
+    endedAt,
+    attempts,
+    hints,
+    messages,
+    followUps,
+    verdict,
+    verdictCode,
+  ]);
+
+  // While the clock runs, a reload or closing the tab asks first; the session is saved either way.
+  useEffect(() => {
+    if (phase !== 'running') return undefined;
+    const onBeforeUnload = (event: BeforeUnloadEvent): void => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [phase]);
+
   /** Open a scenario on its own page with the clock not yet running: the patch loads, the brief shows, nothing counts. */
   const prepare = useCallback((next: ResolvedMockScenario, chosen: Language) => {
     const starters = startersFor(next);
@@ -506,7 +696,8 @@ const MockInterview: FC = memo(() => {
     setLanguage(chosen);
     setCodeByLanguage(starters);
     setEditorReset(value => value + 1);
-    setSecondsLeft(next.minutes * 60);
+    setDeadline(null);
+    setEndedAt(null);
     setAttempts(0);
     setHints(0);
     setVerdict(null);
@@ -522,24 +713,178 @@ const MockInterview: FC = memo(() => {
     setPhase('ready');
   }, []);
 
-  const backToSetup = useCallback(() => {
+  /** Reopen a saved session where it was left; a clock that ran out while away goes straight to the report. */
+  const resume = useCallback((next: ResolvedMockScenario, session: MockSession) => {
+    setScenario(next);
+    setLanguage(session.language);
+    setCodeByLanguage({...startersFor(next), ...session.code});
+    setEditorReset(value => value + 1);
+    setDeadline(session.deadline);
+    setEndedAt(session.endedAt);
+    setNow(Date.now());
+    setAttempts(session.attempts);
+    setHints(session.hints);
+    setVerdict(session.verdict ?? null);
+    setVerdictCode(session.verdictCode ?? null);
+    setGrading(false);
+    gradeSeq.current += 1;
+    setFollowUps(session.followUps);
+    setCopied(false);
+    setPromptCopied(false);
+    setPromptText(null);
+    nextMessage.current = session.messages.reduce((max, message) => Math.max(max, message.id), 0) + 1;
+    setMessages(session.messages);
+    setPhase(session.phase);
+  }, []);
+
+  // A dialog belongs to the phase that opened it: one left open when the page moved on is not shown again.
+  const [dialog, openDialog] = useDialog();
+  const [dialogPhase, setDialogPhase] = useState<Phase | null>(null);
+  const [pickerDialog, openPickerDialog] = useDialog();
+
+  /** The picker, without touching the address: the saved session stays and the picker offers it. */
+  const leave = useCallback(() => {
+    openRequest.current += 1;
+    setOpening(null);
+    setDialogPhase(null);
     setPhase('setup');
     setScenario(null);
     setCodeByLanguage(null);
+    setDeadline(null);
+    setEndedAt(null);
     setVerdict(null);
     setVerdictCode(null);
     setGrading(false);
     gradeSeq.current += 1;
     setMessages([]);
+    setSaved(loadMockSession());
   }, []);
 
-  // The ready page sits behind a blurred backdrop until the brief is confirmed: Start runs the clock, anything else returns to the picker.
-  const [dialog, openDialog] = useDialog();
+  /**
+   * Back to the picker from the page's own buttons: a step back in history when the picker pushed
+   * this address. A running session stays saved; a report left this way is done with.
+   */
+  const backToSetup = useCallback(() => {
+    if (phaseRef.current === 'report') clearMockSession();
+    if (pushedFromPicker.current) {
+      pushedFromPicker.current = false;
+      Router.back();
+    } else {
+      void Router.replace('/mock-interview', undefined, {shallow: true, scroll: false});
+    }
+  }, []);
+
+  const show = useCallback(
+    (listed: ListedMockScenario, session: MockSession | null) => {
+      const request = ++openRequest.current;
+      setOpening(listed.id);
+      setOpenFailed(false);
+      resolveMockScenario(listed).then(
+        resolved => {
+          if (request !== openRequest.current) return;
+          setOpening(null);
+          if (session === null) prepare(resolved, resolved.defaultLanguage);
+          else resume(resolved, session);
+        },
+        () => {
+          if (request !== openRequest.current) return;
+          setOpening(null);
+          setOpenFailed(true);
+          shownId.current = null;
+          void Router.replace('/mock-interview', undefined, {shallow: true, scroll: false});
+        },
+      );
+    },
+    [prepare, resume],
+  );
+
+  // The address names the scenario: a card, Resume, Back/Forward and a reload all open it from
+  // there, resuming its saved session when there is one.
   useEffect(() => {
+    if (!router.isReady || urlScenario === shownId.current) return;
+    shownId.current = urlScenario;
+    if (urlScenario === null) {
+      leave();
+      return;
+    }
+    const listed = listedMockScenarios.find(s => s.id === urlScenario);
+    if (listed === undefined) {
+      shownId.current = null;
+      void Router.replace('/mock-interview', undefined, {shallow: true, scroll: false});
+      return;
+    }
+    const fresh = freshOpen.current === urlScenario;
+    freshOpen.current = null;
+    const session = loadMockSession();
+    const finished = session !== null && (session.phase === 'report' || session.deadline <= Date.now());
+    show(listed, session !== null && session.scenarioId === urlScenario && !(fresh && finished) ? session : null);
+  }, [router.isReady, urlScenario, leave, show]);
+
+  const openCard = useCallback((next: ListedMockScenario) => {
+    freshOpen.current = next.id;
+    pushedFromPicker.current = true;
+    void Router.push({pathname: '/mock-interview', query: {scenario: next.id}}, undefined, {
+      shallow: true,
+      scroll: false,
+    });
+  }, []);
+
+  const resumeSaved = useCallback(() => {
+    if (saved === null) return;
+    pushedFromPicker.current = true;
+    void Router.push({pathname: '/mock-interview', query: {scenario: saved.scenarioId}}, undefined, {
+      shallow: true,
+      scroll: false,
+    });
+  }, [saved]);
+
+  const discardSaved = useCallback(() => {
+    if (saved === null) return;
+    const left = secondsLeftAt(saved.deadline, saved.endedAt, Date.now());
+    const drop = (): void => {
+      clearMockSession();
+      setSaved(null);
+    };
+    if (saved.phase === 'report' || left === 0) {
+      drop();
+      return;
+    }
+    void openPickerDialog({
+      title: 'Discard the session?',
+      body: `${formatClock(left)} left. Your code and the AI pair log are deleted.`,
+      confirm: 'Discard',
+      cancel: 'Keep it',
+      danger: true,
+    }).then(ok => {
+      if (ok) drop();
+    });
+  }, [saved, openPickerDialog]);
+
+  // The ready page sits behind a blurred backdrop until the brief is confirmed: Start runs the clock,
+  // anything else returns to the picker. A layout effect, so a dialog from before never flashes.
+  useLayoutEffect(() => {
     if (phase !== 'ready' || scenario === null) return;
+    const current = loadMockSession();
+    const left = current === null ? 0 : secondsLeftAt(current.deadline, current.endedAt, Date.now());
+    const other =
+      current !== null && current.phase === 'running' && left > 0
+        ? listedMockScenarios.find(s => s.id === current.scenarioId)
+        : undefined;
+    setDialogPhase('ready');
     void openDialog({
       title: 'Start the timed assessment?',
-      body: <ScenarioBrief initial={scenario.defaultLanguage} onLanguage={setLanguage} scenario={scenario} />,
+      body: (
+        <ScenarioBrief
+          initial={scenario.defaultLanguage}
+          onLanguage={setLanguage}
+          replaces={
+            other === undefined
+              ? null
+              : `Starting ends your running session on ${other.title} (${formatClock(left)} left).`
+          }
+          scenario={scenario}
+        />
+      ),
       confirm: `Start the clock · ${scenario.minutes}:00`,
       cancel: 'Back to scenarios',
       conceal: true,
@@ -548,32 +893,16 @@ const MockInterview: FC = memo(() => {
         backToSetup();
         return;
       }
+      const at = Date.now();
+      setNow(at);
+      setEndedAt(null);
+      setDeadline(at + scenario.minutes * 60_000);
       setPhase('running');
       say('Here is the patch as it shipped. It passes the happy path. Debug it before you trust it.');
     });
   }, [phase, scenario, openDialog, backToSetup, say]);
   const sealed = phase === 'ready';
 
-  const openScenario = useCallback(
-    (next: ListedMockScenario) => {
-      const request = ++openRequest.current;
-      setOpening(next.id);
-      setOpenFailed(false);
-      resolveMockScenario(next).then(
-        resolved => {
-          if (request !== openRequest.current) return;
-          setOpening(null);
-          prepare(resolved, resolved.defaultLanguage);
-        },
-        () => {
-          if (request !== openRequest.current) return;
-          setOpening(null);
-          setOpenFailed(true);
-        },
-      );
-    },
-    [prepare],
-  );
   const retry = useCallback(() => {
     if (scenario !== null) prepare(scenario, language);
   }, [prepare, scenario, language]);
@@ -606,7 +935,10 @@ const MockInterview: FC = memo(() => {
       }
       setAttempts(value => value + 1);
       if (result.accepted) {
-        setPhase('report');
+        if (phaseRef.current === 'running') {
+          setEndedAt(Date.now());
+          setPhase('report');
+        }
         say('Accepted: every check passes. Read the debrief and answer the follow-ups.', 'ai', 'ok');
       } else {
         say(
@@ -618,7 +950,22 @@ const MockInterview: FC = memo(() => {
     });
   }, [code, grading, language, say, scenario]);
 
-  const onFinish = useCallback(() => setPhase('report'), []);
+  /** Finish asks first: it ends the session and cannot be undone. */
+  const onFinish = useCallback(() => {
+    if (deadline === null) return;
+    setDialogPhase('running');
+    void openDialog({
+      title: 'End the session now?',
+      body: `${formatClock(secondsLeftAt(deadline, null, Date.now()))} left. The report grades the code on screen.`,
+      confirm: 'End and see report',
+      cancel: 'Keep working',
+      danger: true,
+    }).then(ok => {
+      if (!ok || phaseRef.current !== 'running') return;
+      setEndedAt(Date.now());
+      setPhase('report');
+    });
+  }, [deadline, openDialog]);
 
   const onReset = useCallback(() => {
     if (scenario === null) return;
@@ -721,6 +1068,7 @@ const MockInterview: FC = memo(() => {
   }, [attempts, code, followUps, hints, language, scenario, say, verdict]);
 
   if (phase === 'setup') {
+    const savedTitle = saved === null ? undefined : listedMockScenarios.find(s => s.id === saved.scenarioId)?.title;
     return (
       <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
         <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2">
@@ -736,6 +1084,9 @@ const MockInterview: FC = memo(() => {
               className="pointer-events-none absolute inset-0 bg-[radial-gradient(90%_120%_at_0%_0%,rgba(244,114,129,0.24),transparent_58%),radial-gradient(70%_90%_at_100%_0%,rgba(227,174,40,0.10),transparent_55%)]"
             />
             <div className="relative mx-auto w-full max-w-5xl px-5 pb-8 pt-8">
+              {saved !== null && savedTitle !== undefined ? (
+                <ResumeBanner onDiscard={discardSaved} onResume={resumeSaved} session={saved} title={savedTitle} />
+              ) : null}
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <BrandLockup size="lg" />
                 <span className="border-danger-400/40 bg-danger-400/10 text-danger-200 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider">
@@ -765,13 +1116,9 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
           </div>
-          <ScenarioPicker
-            failed={openFailed}
-            onStart={openScenario}
-            opening={opening}
-            scenarios={listedMockScenarios}
-          />
+          <ScenarioPicker failed={openFailed} onStart={openCard} opening={opening} scenarios={listedMockScenarios} />
         </main>
+        {pickerDialog}
       </div>
     );
   }
@@ -920,6 +1267,9 @@ const MockInterview: FC = memo(() => {
               {scenario.title}
             </h1>
           </div>
+          {runtimeHarness(step, language) !== undefined ? (
+            <RuntimeBadge language={language} runtime={runtimeStatus} />
+          ) : null}
           <span
             className={`font-code rounded-full border px-2.5 py-1 text-[12px] font-semibold ${
               secondsLeft <= 120
@@ -996,6 +1346,7 @@ const MockInterview: FC = memo(() => {
               baseline={codeFor(scenario.step, language).starter}
               className="min-h-0 flex-1"
               fileKey={`${scenario.id}:${language}`}
+              label={fileName(step.file, language)}
               language={language}
               onChange={changeCode}
               onSubmit={onSubmit}
@@ -1089,7 +1440,7 @@ const MockInterview: FC = memo(() => {
           </p>
         </aside>
       </main>
-      {dialog}
+      {dialogPhase === phase ? dialog : null}
     </div>
   );
 });

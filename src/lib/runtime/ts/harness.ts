@@ -253,7 +253,8 @@ const explain = (error: unknown, modules: ModuleSystem): string => {
     const fn = f.fn?.replace(/^(?:async\s+)?(?:Object|exports|module\.exports)\./, '') ?? null;
     return `${head} — ${f.file.slice(WORK.length + 1)}:${f.line}${fn === null || fn === '' ? '' : ` in ${fn}`}`;
   }
-  if (harness.length > 0) return `${head} — raised by the check at line ${harness[0].line}`;
+  if (harness.length > 0)
+    return `${head} — raised inside the check (its line ${harness[0].line}), not in your file: usually a value your code returned or stored in an unexpected shape`;
   return head;
 };
 

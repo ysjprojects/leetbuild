@@ -1,5 +1,6 @@
 import {type FC, memo, useEffect, useRef} from 'react';
 
+import {prefersReducedMotion} from '@/lib/motion';
 import {concept, ink, iris, resolve, success, warning} from '@/styles/palette';
 
 /**
@@ -27,6 +28,11 @@ const Confetti: FC<{onDone: () => void}> = memo(({onDone}) => {
   onDoneRef.current = onDone;
 
   useEffect(() => {
+    // Reduced motion: no burst; the parent unmounts us at once.
+    if (prefersReducedMotion()) {
+      onDoneRef.current();
+      return undefined;
+    }
     const el = canvas.current;
     if (el === null) return undefined;
     const ctx = el.getContext('2d');

@@ -3,6 +3,8 @@
  * the same shape the landing page keeps in its URL (`/?track=dllm&q=redis&difficulty=hard&sort=points`),
  * so a filtered view is a link. Rows keep their catalogue number whatever the order on screen.
  */
+import {debuggingCourses} from '@/data/problems/summaries';
+
 import {type StepAttempt, problemScore, STEP_POINTS} from './scoring';
 import {
   type Difficulty,
@@ -19,6 +21,41 @@ export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress'
 /** The tabs above the list, LeetCode-style: every course, the systems track, or the deep-learning track. */
 export type TrackFilter = 'all' | 'systems' | 'dllm';
 
+/**
+ * The kinds of course, which the list's sections follow in catalogue order: a systems course where
+ * you build a service step by step, a one-step drill, a debugging course (every step starts from a
+ * starter that works but hides flaws) and a deep-learning problem.
+ */
+export type CourseKind = 'build' | 'drill' | 'debug' | 'dllm';
+/** The kinds the filter menu offers; deep learning has its own track tab. */
+export type KindFilter = Exclude<CourseKind, 'dllm'> | 'all';
+export const KIND_FILTERS: readonly Exclude<KindFilter, 'all'>[] = ['build', 'drill', 'debug'];
+
+/** `label`: the filter chip, the row marker and what search matches; `section`: the list's header over the kind. */
+export const KIND: Record<CourseKind, {label: string; section: string; blurb: string}> = {
+  build: {label: 'Build', section: 'Build a system', blurb: 'A real service, built one step at a time.'},
+  drill: {label: 'Drills', section: 'Drills', blurb: 'One step, one technique.'},
+  debug: {
+    label: 'Debugging',
+    section: 'Debugging courses',
+    blurb: 'Each step’s starter works but hides flaws: find them, fix them, prove the fix.',
+  },
+  dllm: {
+    label: 'Deep learning',
+    section: 'Deep learning',
+    blurb: 'Models and kernels from scratch, in PyTorch or CUDA.',
+  },
+};
+
+export const kindOf = (problem: ProblemSummary): CourseKind =>
+  problem.track === 'dllm'
+    ? 'dllm'
+    : debuggingCourses[problem.id] === true
+    ? 'debug'
+    : problem.steps.length === 1
+    ? 'drill'
+    : 'build';
+
 export interface ListQuery {
   /** Which track the list shows; a view rather than a filter, so `reset` and "clear" leave it alone. */
   track: TrackFilter;
@@ -30,6 +67,8 @@ export interface ListQuery {
   company: boolean;
   /** Only courses carrying this tag (`ai-systems`). */
   tag: ProblemTag | 'all';
+  /** Only courses of this kind (`debug`: the debugging courses). */
+  kind: KindFilter;
   sort: SortKey;
   /** Reverse the sort's natural direction. */
   desc: boolean;
@@ -42,6 +81,7 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
   status: 'all',
   company: false,
   tag: 'all',
+  kind: 'all',
   sort: 'order',
   desc: false,
 };
@@ -98,7 +138,7 @@ const tokens = (q: string): string[] =>
     .split(/\s+/)
     .filter(t => t !== '');
 
-/** Everything a search may hit: title, tagline, id, difficulty, concepts, company, step titles. */
+/** Everything a search may hit: title, tagline, id, difficulty, kind, concepts, company, step titles. */
 const haystack = (problem: ProblemSummary): string =>
   [
     problem.title,
@@ -108,6 +148,7 @@ const haystack = (problem: ProblemSummary): string =>
     ...problem.concepts.map(c => CONCEPT_LABEL[c]),
     problem.company?.name ?? '',
     problem.tag === undefined ? '' : TAG_LABEL[problem.tag],
+    KIND[kindOf(problem)].label,
     ...problem.steps.map(s => s.title),
   ]
     .join('\n')
@@ -139,6 +180,7 @@ export function applyListQuery(
       (query.status === 'all' || problemStatus(p, attempts) === query.status) &&
       (!query.company || p.company !== undefined) &&
       (query.tag === 'all' || p.tag === query.tag) &&
+      (query.kind === 'all' || kindOf(p) === query.kind) &&
       matchesSearch(p, query.q),
   );
   const byOrder = (a: ProblemSummary, b: ProblemSummary): number => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
@@ -169,7 +211,12 @@ export function applyListQuery(
 }
 
 export const isDefaultQuery = (query: ListQuery): boolean =>
-  query.q === '' && query.difficulty === 'all' && query.status === 'all' && !query.company && query.tag === 'all';
+  query.q === '' &&
+  query.difficulty === 'all' &&
+  query.status === 'all' &&
+  !query.company &&
+  query.tag === 'all' &&
+  query.kind === 'all';
 
 const one = (v: string | string[] | undefined): string | undefined => (Array.isArray(v) ? v[0] : v);
 
@@ -180,6 +227,7 @@ export function parseListQuery(params: Record<string, string | string[] | undefi
   const status = one(params.status);
   const sort = one(params.sort);
   const tag = one(params.tag);
+  const kind = one(params.kind);
   return {
     // `ai` was a tab once; its courses are in the systems track now, so an old link lands there.
     track: track === 'systems' || track === 'ai' ? 'systems' : track === 'dllm' ? 'dllm' : 'all',
@@ -188,6 +236,7 @@ export function parseListQuery(params: Record<string, string | string[] | undefi
     status: status !== undefined && status in STATUS_LABEL && status !== 'all' ? (status as StatusFilter) : 'all',
     company: one(params.company) === '1',
     tag: tag !== undefined && tag in TAG_LABEL ? (tag as ProblemTag) : 'all',
+    kind: KIND_FILTERS.find(k => k === kind) ?? 'all',
     sort: SORTS.some(s => s.key === sort) ? (sort as SortKey) : 'order',
     desc: one(params.desc) === '1',
   };
@@ -202,6 +251,7 @@ export function serializeListQuery(query: ListQuery): Record<string, string> {
   if (query.status !== 'all') params.status = query.status;
   if (query.company) params.company = '1';
   if (query.tag !== 'all') params.tag = query.tag;
+  if (query.kind !== 'all') params.kind = query.kind;
   if (query.sort !== 'order') params.sort = query.sort;
   if (query.desc) params.desc = '1';
   return params;

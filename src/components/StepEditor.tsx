@@ -7,7 +7,7 @@ import {
 } from '@codemirror/autocomplete';
 import {indentUnit} from '@codemirror/language';
 import {unifiedMergeView} from '@codemirror/merge';
-import {type Extension, Compartment, EditorState} from '@codemirror/state';
+import {type Extension, Compartment, EditorState, Prec} from '@codemirror/state';
 import {EditorView, keymap} from '@codemirror/view';
 import {type MutableRefObject, memo, useEffect, useRef} from 'react';
 
@@ -20,6 +20,7 @@ import {
   viewerExtensions,
 } from '@/lib/editor';
 import {useEditorSettings} from '@/lib/editorSettings';
+import {LANGUAGE_LABEL} from '@/lib/types';
 
 interface Props {
   value: string;
@@ -48,6 +49,8 @@ interface Props {
   resetKey?: number;
   viewRef?: MutableRefObject<EditorView | null>;
   className?: string;
+  /** The editor's accessible name, usually the open file's name; defaults to "<Language> code". */
+  label?: string;
 }
 
 const languageExtensions = (language: Syntax): Extension => [
@@ -55,6 +58,11 @@ const languageExtensions = (language: Syntax): Extension => [
   EditorState.tabSize.of(INDENT[language].tabSize),
   indentUnit.of(INDENT[language].unit),
 ];
+
+const labelExtension = (label: string | undefined, language: Syntax): Extension =>
+  EditorView.contentAttributes.of({
+    'aria-label': label ?? `${language === 'proto' ? 'Protocol Buffers' : LANGUAGE_LABEL[language]} code`,
+  });
 
 /** Files whose editor state (undo history, selection) is kept while other files are open: a whole course in every language. */
 const STATE_CACHE = 32;
@@ -73,6 +81,7 @@ const StepEditor = memo(
     resetKey,
     viewRef,
     className,
+    label,
   }: Props) => {
     const host = useRef<HTMLDivElement>(null);
     const view = useRef<EditorView | null>(null);
@@ -82,9 +91,12 @@ const StepEditor = memo(
     const languageCompartment = useRef(new Compartment());
     const diffCompartment = useRef(new Compartment());
     const settingsCompartment = useRef(new Compartment());
+    const labelCompartment = useRef(new Compartment());
     const settings = useEditorSettings();
     const settingsRef = useRef(settings);
     settingsRef.current = settings;
+    const labelRef = useRef(label);
+    labelRef.current = label;
     /** Editor state of every file opened on this view, by `fileKey`; restored when the file is reopened. */
     const states = useRef(new Map<string, EditorState>());
     const lastFileKey = useRef(fileKey);
@@ -102,6 +114,7 @@ const StepEditor = memo(
         // already in the file (the starter's identifiers are what the learner types most).
         readOnly ? [] : [closeBrackets(), autocompletion({override: [completeAnyWord]})],
         languageCompartment.current.of(languageExtensions(language)),
+        labelCompartment.current.of(labelExtension(label, language)),
         diffCompartment.current.of(
           diffOriginal === null
             ? []
@@ -114,23 +127,29 @@ const StepEditor = memo(
                 collapseUnchanged: {margin: 3, minSize: 6},
               }),
         ),
-        keymap.of([
-          {
-            key: 'Mod-Enter',
-            run: () => {
-              onSubmitRef.current?.();
-              return true;
+        // Above every other keymap: the default one binds Mod-Enter to insertBlankLine. Handled here, the
+        // event is marked (defaultPrevented) so page-level shortcuts skip it; without a handler it passes on.
+        Prec.highest(
+          keymap.of([
+            {
+              key: 'Mod-Enter',
+              run: () => {
+                const handler = onSubmitRef.current;
+                handler?.();
+                return handler !== undefined;
+              },
             },
-          },
-          {
-            key: "Mod-'",
-            run: () => {
-              onRunRef.current?.();
-              return true;
+            {
+              key: "Mod-'",
+              run: () => {
+                const handler = onRunRef.current;
+                handler?.();
+                return handler !== undefined;
+              },
             },
-          },
-          ...(readOnly ? [] : [...closeBracketsKeymap, ...completionKeymap]),
-        ]),
+          ]),
+        ),
+        keymap.of(readOnly ? [] : [...closeBracketsKeymap, ...completionKeymap]),
         EditorView.updateListener.of(update => {
           if (update.docChanged && !readOnly) onChangeRef.current?.(update.state.doc.toString());
         }),
@@ -161,6 +180,13 @@ const StepEditor = memo(
       if (v === null) return;
       v.dispatch({effects: languageCompartment.current.reconfigure(languageExtensions(language))});
     }, [language]);
+
+    // The accessible name follows the open file.
+    useEffect(() => {
+      const v = view.current;
+      if (v === null) return;
+      v.dispatch({effects: labelCompartment.current.reconfigure(labelExtension(label, language))});
+    }, [label, language]);
 
     // Font size, wrapping and key bindings follow the shared settings.
     useEffect(() => {
@@ -203,6 +229,7 @@ const StepEditor = memo(
         v.dispatch({
           effects: [
             languageCompartment.current.reconfigure(languageExtensions(language)),
+            labelCompartment.current.reconfigure(labelExtension(labelRef.current, language)),
             settingsCompartment.current.reconfigure(settingsExtensions(settingsRef.current, readOnly)),
           ],
         });

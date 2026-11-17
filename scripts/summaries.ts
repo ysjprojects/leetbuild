@@ -39,6 +39,9 @@ const HEADER =
 const isProblem = (value: unknown): value is Problem =>
   typeof value === 'object' && value !== null && 'steps' in value && 'statement' in value;
 
+/** A debugging course says how to work its flawed starters in this section of its statement (see AGENTS.md). */
+const isDebugging = (problem: Problem): boolean => /^## The debugging habit$/m.test(problem.statement);
+
 /** A value as TypeScript source: bare object keys where they can be, `undefined` fields left out. */
 const literal = (value: unknown): string => {
   if (Array.isArray(value)) return `[${value.map(literal).join(', ')}]`;
@@ -95,7 +98,11 @@ export async function renderSummaries(): Promise<Record<string, string>> {
     (tagged.length === 0 ? '' : `import {${tagged.join(', ')}} from '@/data/companies';\n`) +
     "import type {ProblemSummary} from '@/lib/types';\n\n" +
     '/** Every course as the problem list knows it, in catalogue order; the course itself loads when it opens. */\n' +
-    `export const problemSummaries: readonly ProblemSummary[] = [${problems.map(summarySource).join(', ')}];\n`;
+    `export const problemSummaries: readonly ProblemSummary[] = [${problems.map(summarySource).join(', ')}];\n\n` +
+    '/** The debugging courses, by id: every step starts from a working starter that hides flaws. */\n' +
+    `export const debuggingCourses: Readonly<Partial<Record<string, true>>> = ${literal(
+      Object.fromEntries(problems.filter(isDebugging).map(p => [p.id, true])),
+    )};\n`;
   const loaders = problems.map(problem => {
     const source = modules.get(problem.id);
     if (source === undefined) throw new Error(`${problem.id}: no src/data/problems/*/index.ts exports it`);

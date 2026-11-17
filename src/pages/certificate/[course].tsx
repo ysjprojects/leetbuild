@@ -80,7 +80,7 @@ const Certificate: FC<{course: ProblemSummary}> = memo(({course}) => {
       <Link className="mb-6 inline-flex" href="/">
         <BrandLockup />
       </Link>
-      <p className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Certificate of completion</p>
+      <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">Certificate of completion</p>
       <h1 className="text-ink-50 mt-1 text-2xl font-extrabold leading-tight">{course.title}</h1>
       <p className="text-ink-300 mt-1 text-[13px]">{course.tagline}</p>
       {!router.isReady ? null : details === null ? (

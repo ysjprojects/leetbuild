@@ -8,7 +8,7 @@
  * A page going away flushes them, stashing them first in localStorage, which writes synchronously:
  * an IndexedDB transaction may not outlive the page, and the next load applies the stash.
  */
-import {type StepAttempt, type Submission, HISTORY_LENGTH} from './scoring';
+import {type StepAttempt, type Submission, type SubmissionCheck, HISTORY_LENGTH} from './scoring';
 import {type Scratchpad, normalizeShapes} from './scratchpad';
 import {type ActiveTimer, type TimedSession, SESSION_HISTORY} from './timer';
 import {type Language, ALL_LANGUAGES, LANGUAGES} from './types';
@@ -245,6 +245,21 @@ const normalizeWorkspaces = (value: unknown): Record<string, Workspace> => {
   return workspaces;
 };
 
+/** A submission's checks as stored; absent (older records) or malformed is no checks. */
+const normalizeChecks = (value: unknown): SubmissionCheck[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const checks: SubmissionCheck[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const c = item as Partial<SubmissionCheck>;
+    if (typeof c.id !== 'string' || typeof c.passed !== 'boolean') continue;
+    checks.push(
+      typeof c.message === 'string' ? {id: c.id, passed: c.passed, message: c.message} : {id: c.id, passed: c.passed},
+    );
+  }
+  return checks;
+};
+
 const normalizeHistory = (value: unknown): Submission[] => {
   if (!Array.isArray(value)) return [];
   const history: Submission[] = [];
@@ -260,6 +275,8 @@ const normalizeHistory = (value: unknown): Submission[] => {
       accepted: s.accepted === true,
     };
     if (typeof s.code === 'string') submission.code = s.code;
+    const checks = normalizeChecks(s.checks);
+    if (checks !== undefined) submission.checks = checks;
     history.push(submission);
   }
   return history.slice(-HISTORY_LENGTH);

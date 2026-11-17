@@ -119,14 +119,16 @@ export function widgetsToNotes(markdown: string, stepUrl?: string): string {
 /**
  * `:::quiz` blocks become the question, its options as a task list, and the answer with its
  * explanation behind a `<details>` spoiler; `:::details Title` blocks become `<details>` elements;
- * `:::sequence`, `:::diagram`, `:::architecture` and `:::gpu` blocks become Mermaid fences.
+ * `:::sequence`, `:::diagram`, `:::architecture` and `:::gpu` blocks become Mermaid fences. A
+ * `</details>` is followed by a blank line: it ends an HTML block, so Markdown right after it (a
+ * heading) would otherwise be swallowed into the block.
  */
 export function blocksToMarkdown(markdown: string): string {
   return markdown.replace(
-    /^:::(quiz|details|sequence|diagram|architecture|gpu)([^\n]*)\n([\s\S]*?)^:::\s*$/gm,
+    /^:::(quiz|details|sequence|diagram|architecture|gpu)([^\n]*)\n([\s\S]*?)^:::[ \t]*$/gm,
     (_, kind: string, rest: string, body: string) => {
       if (kind === 'details')
-        return `<details>\n<summary>${rest.trim() || 'Details'}</summary>\n\n${body.trim()}\n\n</details>`;
+        return `<details>\n<summary>${rest.trim() || 'Details'}</summary>\n\n${body.trim()}\n\n</details>\n`;
       if (kind === 'sequence') return `\`\`\`mermaid\n${sequenceToMermaid(JSON.parse(body) as Sequence)}\n\`\`\``;
       if (kind === 'diagram') return `\`\`\`mermaid\n${diagramToMermaid(JSON.parse(body) as Diagram)}\n\`\`\``;
       if (kind === 'architecture')
@@ -157,6 +159,7 @@ export function blocksToMarkdown(markdown: string): string {
         `**${answer}** — ${explanation.join(' ')}`,
         ``,
         `</details>`,
+        ``,
       ].join('\n');
     },
   );

@@ -228,7 +228,10 @@ def _explain(exc: BaseException) -> str:
         f = learner[-1]
         return f"{head} — {f.filename[len(WORK) + 1:]}:{f.lineno} in {f.name}"
     if harness:
-        return f"{head} — raised by the check at line {harness[-1].lineno}"
+        return (
+            f"{head} — raised inside the check (its line {harness[-1].lineno}), not in your file: "
+            "usually a value your code returned or stored in an unexpected shape"
+        )
     return head
 
 

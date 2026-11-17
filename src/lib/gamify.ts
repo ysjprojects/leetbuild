@@ -298,29 +298,94 @@ export interface DailyPick {
   index: number;
 }
 
+/** Steps a learner accepts before the step of the day may be a hard one. */
+const WARMUP_STEPS = 5;
+
+/** The first step of `problem` not done yet (steps unlock in order; a revealed step counts as done). */
+const openStep = (problem: ProblemSummary, attempts: Record<string, StepAttempt>): number =>
+  problem.steps.findIndex(s => (attempts[stepKey(problem.id, s.id)] ?? OPEN_ATTEMPT).status === 'open');
+
 /**
  * Today's step: of the steps the learner can open right now — each unfinished problem's next one —
  * the one whose hash with the date is highest. Rendezvous hashing keeps the pick in place while
- * other problems move on; it changes when the picked step is done, and with the date.
+ * other problems move on; it changes when the picked step is done, and with the date. Until the
+ * learner has accepted a few steps, hard problems are left out while any other is open.
  */
-export function stepOfTheDay(
+function stepOfTheDay(
   problems: readonly ProblemSummary[],
   attempts: Record<string, StepAttempt>,
   today: string,
 ): DailyPick | null {
-  let best: DailyPick | null = null;
-  let bestHash = -1;
+  const pick = (eligible: (problem: ProblemSummary) => boolean): DailyPick | null => {
+    let best: DailyPick | null = null;
+    let bestHash = -1;
+    for (const problem of problems) {
+      if (!eligible(problem)) continue;
+      const index = openStep(problem, attempts);
+      if (index === -1) continue;
+      const step = problem.steps[index];
+      const h = hash(`${today}|${problem.id}/${step.id}`);
+      if (h > bestHash) {
+        bestHash = h;
+        best = {problem, step, index};
+      }
+    }
+    return best;
+  };
+  const accepted = Object.values(attempts).filter(a => a.status === 'accepted').length;
+  return (accepted < WARMUP_STEPS ? pick(p => p.difficulty !== 'hard') : null) ?? pick(() => true);
+}
+
+/** When a step was last worked on: accepted, revealed or judged; 0 for a step only opened or hinted. */
+const lastWorked = (attempt: StepAttempt): number =>
+  Math.max(attempt.solvedAt ?? 0, ...(attempt.history ?? []).map(s => s.at));
+
+const worked = (attempt: StepAttempt): boolean =>
+  attempt.status !== 'open' || attempt.hints > 0 || attempt.wrong > 0 || (attempt.history?.length ?? 0) > 0;
+
+/** Where the landing page sends the learner next, and why. */
+export interface NextPick extends DailyPick {
+  reason: 'start' | 'continue' | 'daily';
+}
+
+/**
+ * `continue`: the next step of the unfinished course worked on most recently; `start`, for a
+ * visitor who has worked on nothing, an easy first course; otherwise `daily`, the step of the day.
+ * `null` once every step is done.
+ */
+export function nextPick(
+  problems: readonly ProblemSummary[],
+  attempts: Record<string, StepAttempt>,
+  today: string,
+): NextPick | null {
+  let resume: DailyPick | null = null;
+  let resumeAt = -1;
+  let any = false;
   for (const problem of problems) {
-    const index = problem.steps.findIndex(s => (attempts[stepKey(problem.id, s.id)] ?? OPEN_ATTEMPT).status === 'open');
-    if (index === -1) continue;
-    const step = problem.steps[index];
-    const h = hash(`${today}|${problem.id}/${step.id}`);
-    if (h > bestHash) {
-      bestHash = h;
-      best = {problem, step, index};
+    let at = -1;
+    for (const step of problem.steps) {
+      const attempt = attempts[stepKey(problem.id, step.id)];
+      if (attempt !== undefined && worked(attempt)) at = Math.max(at, lastWorked(attempt));
+    }
+    if (at === -1) continue;
+    any = true;
+    const index = openStep(problem, attempts);
+    // Ties (records without times) go to the earlier course in the catalogue.
+    if (index !== -1 && at > resumeAt) {
+      resumeAt = at;
+      resume = {problem, step: problem.steps[index], index};
     }
   }
-  return best;
+  if (resume !== null) return {...resume, reason: 'continue'};
+  if (!any) {
+    // A course to start with: the catalogue's first easy systems course of more than one step.
+    const first = problems.find(
+      p => p.difficulty === 'easy' && (p.track ?? 'systems') === 'systems' && p.steps.length > 1,
+    );
+    if (first !== undefined) return {problem: first, step: first.steps[0], index: 0, reason: 'start'};
+  }
+  const daily = stepOfTheDay(problems, attempts, today);
+  return daily === null ? null : {...daily, reason: 'daily'};
 }
 
 /** How far along a badge is: earned when `value >= target`. Binary badges have a target of 1. */

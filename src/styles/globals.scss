@@ -120,8 +120,8 @@ dialog[open] {
   }
 }
 
-/* The playground: CodeMirror chrome, the syntax token palette shared by editors and static code
- * blocks, and the unified-diff colours of the reference-solution viewer. */
+/* The playground: CodeMirror chrome and the unified-diff colours of the reference-solution viewer
+ * (the syntax token palette is global, below). */
 .leetbuild-playground {
   --lb-panel: theme('colors.ink.850');
   --lb-border: theme('colors.ink.700');
@@ -159,7 +159,7 @@ dialog[open] {
 
   .cm-gutters {
     background: var(--lb-panel);
-    color: theme('colors.ink.500');
+    color: theme('colors.ink.400');
     border-right: 1px solid var(--lb-border);
   }
 
@@ -299,80 +299,6 @@ dialog[open] {
     color: var(--lb-text);
   }
 
-  /* Syntax tokens (classHighlighter) */
-  .tok-comment {
-    color: theme('colors.syntax.comment');
-    font-style: italic;
-  }
-
-  .tok-keyword,
-  .tok-controlKeyword,
-  .tok-operatorKeyword,
-  .tok-definitionKeyword,
-  .tok-moduleKeyword {
-    color: theme('colors.syntax.keyword');
-  }
-
-  .tok-typeName,
-  .tok-className,
-  .tok-namespace {
-    color: theme('colors.syntax.type');
-  }
-
-  .tok-modifier,
-  .tok-annotation,
-  .tok-meta {
-    color: theme('colors.syntax.meta');
-  }
-
-  .tok-string,
-  .tok-string2,
-  .tok-character {
-    color: theme('colors.syntax.string');
-  }
-
-  .tok-number,
-  .tok-bool,
-  .tok-atom,
-  .tok-literal {
-    color: theme('colors.syntax.number');
-  }
-
-  .tok-variableName {
-    color: theme('colors.syntax.variable');
-  }
-
-  .tok-variableName2,
-  .tok-propertyName {
-    color: theme('colors.syntax.property');
-  }
-
-  .tok-function,
-  .tok-definition {
-    color: theme('colors.syntax.function');
-    font-weight: 600;
-  }
-
-  .tok-labelName {
-    color: theme('colors.syntax.type');
-    font-weight: 600;
-  }
-
-  .tok-operator,
-  .tok-punctuation {
-    color: theme('colors.syntax.operator');
-  }
-
-  .tok-processingInstruction,
-  .tok-macroName {
-    color: theme('colors.syntax.meta');
-  }
-
-  .tok-invalid {
-    color: theme('colors.syntax.invalid');
-    text-decoration: underline;
-  }
-
   /* The unified diff of the reference solution against the learner's code. */
   .cm-changedLine {
     background: theme('colors.success.400 / 12%');
@@ -394,4 +320,79 @@ dialog[open] {
     background: theme('colors.ink.800 / 60%');
     color: var(--lb-muted);
   }
+}
+
+/* Syntax tokens (classHighlighter): editors, and static code blocks wherever they render, the
+ * guide pages included. */
+.tok-comment {
+  color: theme('colors.syntax.comment');
+  font-style: italic;
+}
+
+.tok-keyword,
+.tok-controlKeyword,
+.tok-operatorKeyword,
+.tok-definitionKeyword,
+.tok-moduleKeyword {
+  color: theme('colors.syntax.keyword');
+}
+
+.tok-typeName,
+.tok-className,
+.tok-namespace {
+  color: theme('colors.syntax.type');
+}
+
+.tok-modifier,
+.tok-annotation,
+.tok-meta {
+  color: theme('colors.syntax.meta');
+}
+
+.tok-string,
+.tok-string2,
+.tok-character {
+  color: theme('colors.syntax.string');
+}
+
+.tok-number,
+.tok-bool,
+.tok-atom,
+.tok-literal {
+  color: theme('colors.syntax.number');
+}
+
+.tok-variableName {
+  color: theme('colors.syntax.variable');
+}
+
+.tok-variableName2,
+.tok-propertyName {
+  color: theme('colors.syntax.property');
+}
+
+.tok-function,
+.tok-definition {
+  color: theme('colors.syntax.function');
+  font-weight: 600;
+}
+
+.tok-labelName {
+  color: theme('colors.syntax.type');
+  font-weight: 600;
+}
+
+.tok-operator,
+.tok-punctuation {
+  color: theme('colors.syntax.operator');
+}
+
+.tok-processingInstruction,
+.tok-macroName {
+  color: theme('colors.syntax.meta');
+}
+
+.tok-invalid {
+  color: theme('colors.syntax.invalid');
+  text-decoration: underline;
 }

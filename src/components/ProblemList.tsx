@@ -2,15 +2,18 @@ import Link from 'next/link';
 import {type FC, memo, useCallback, useId, useMemo, useState} from 'react';
 
 import {
+  type CourseKind,
   type TrackFilter,
   applyListQuery,
   inTrack,
+  KIND,
+  kindOf,
   problemStatus,
   TRACK_HINT,
   TRACK_LABEL,
   TRACK_TINT,
 } from '@/lib/catalog';
-import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
+import {type NextPick, type Streak, activityByDay, badgeProgress, BADGES, nextPick} from '@/lib/gamify';
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
@@ -178,6 +181,39 @@ const SolvedByDifficulty: FC<{profile: Profile}> = memo(({profile}) => {
 });
 SolvedByDifficulty.displayName = 'SolvedByDifficulty';
 
+const DIFFICULTY_WORD: Record<Difficulty, string> = {easy: 'Easy', medium: 'Medium', hard: 'Hard'};
+
+const NEXT_LABEL: Record<NextPick['reason'], string> = {
+  start: 'Start here:',
+  continue: 'Continue',
+  daily: 'Today’s step:',
+};
+
+const NEXT_TITLE: Record<NextPick['reason'], string> = {
+  start: 'an easy first course',
+  continue: 'the next step of the course you worked on last',
+  daily: 'the step of the day, one you can open right now',
+};
+
+/** Where to go next, in a line: an easy first course, the course in progress, or the step of the day. */
+const NextLink: FC<{pick: NextPick}> = memo(({pick}) => (
+  <Link
+    className="border-iris-400/40 bg-iris-400/10 text-iris-300 hover:bg-iris-400/20 mt-1 inline-flex max-w-full items-center gap-1 rounded-lg border px-2.5 py-1 text-[12px] font-semibold transition"
+    href={stepPath(pick.problem, pick.step)}
+    title={`${NEXT_TITLE[pick.reason]}: ${pick.problem.title}, step ${pick.index + 1}, ${pick.step.title}`}>
+    <span className="shrink-0">{NEXT_LABEL[pick.reason]}</span>
+    <span className="text-ink-50 min-w-0 truncate font-bold">{pick.problem.title}</span>
+    <span className="shrink-0">
+      ·{' '}
+      {pick.reason === 'start'
+        ? `${DIFFICULTY_WORD[pick.problem.difficulty]} · ~${pick.problem.minutes} min`
+        : `step ${pick.index + 1}`}{' '}
+      ›
+    </span>
+  </Link>
+));
+NextLink.displayName = 'NextLink';
+
 const ProfileStrip: FC<{
   profile: Profile;
   streak: Streak;
@@ -187,7 +223,8 @@ const ProfileStrip: FC<{
   activeDays: readonly string[];
   today: string;
   sessions: readonly TimedSession[];
-}> = memo(({profile, streak, badges, problems, attempts, activeDays, today, sessions}) => {
+  next: NextPick | null;
+}> = memo(({profile, streak, badges, problems, attempts, activeDays, today, sessions, next}) => {
   const rank = rankProgress(profile.score, profile.max);
   const share = Math.min(1, Math.max(0, (profile.score - rank.from) / Math.max(1, rank.nextAt - rank.from)));
   const earned = useMemo(() => BADGES.filter(b => badges[b.id] !== undefined), [badges]);
@@ -206,7 +243,6 @@ const ProfileStrip: FC<{
     });
   }, [openDialog, earned.length, badges, progress]);
   const counted = useMemo(() => sessions.filter(s => s.counted).length, [sessions]);
-  const pick = useMemo(() => stepOfTheDay(problems, attempts, today), [problems, attempts, today]);
   const activity = useMemo(() => activityByDay(attempts, activeDays), [attempts, activeDays]);
   const onRuns = useCallback(() => {
     void openDialog({
@@ -248,28 +284,21 @@ const ProfileStrip: FC<{
 
         <SolvedByDifficulty profile={profile} />
 
-        {/* Streak, with what to do about it: the step whose turn it is today */}
-        <div
-          className="flex min-w-0 items-center gap-2"
-          title="accept a step on consecutive days; the step of the day is one you can open right now">
+        {/* Streak, and where to go next: the course in progress, or a first one */}
+        <div className="flex min-w-0 max-w-[24rem] items-center gap-2">
           <Flame lit={streak.current > 0} />
-          <div className="min-w-0">
+          <div className="min-w-0" title="accept a step on consecutive days">
             <p className={`text-[14px] font-bold leading-tight ${streak.current > 0 ? 'text-ink-50' : 'text-ink-200'}`}>
               {streak.current > 0 ? `${streak.current}-day streak` : 'No streak yet'}
+              <span className="text-ink-400 text-[12px] font-normal">
+                {streak.today ? ' · safe today' : streak.current > 0 ? ' · keep it today' : ''}
+                {streak.best > streak.current ? ` · best ${streak.best}` : ''}
+              </span>
             </p>
-            {streak.today ? (
-              <p className="text-ink-400 text-[12px]">
-                safe for today{streak.best > streak.current ? ` · best ${streak.best}` : ''}
-              </p>
-            ) : pick !== null ? (
-              <Link
-                className="text-iris-300 hover:text-iris-200 block max-w-[20rem] text-[12px] leading-tight"
-                href={stepPath(pick.problem, pick.step)}
-                title={`today's step: ${pick.step.title} (${pick.problem.title}, step ${pick.index + 1})`}>
-                {streak.current > 0 ? 'keep it' : 'start one'} today: {pick.problem.title} · step {pick.index + 1} ›
-              </Link>
+            {next !== null ? (
+              <NextLink pick={next} />
             ) : (
-              <p className="text-ink-400 text-[12px]">every step is done — start a course over to keep it</p>
+              <p className="text-ink-400 text-[12px]">every step is done: start a course over to keep it</p>
             )}
           </div>
         </div>
@@ -472,6 +501,23 @@ const TrackBrief: FC<{track: TrackFilter}> = memo(({track}) => {
 });
 TrackBrief.displayName = 'TrackBrief';
 
+/** The debugging courses' marker: every step's starter works but hides flaws. */
+const DebuggingChip: FC = memo(() => (
+  <span
+    className="border-ink-500 text-ink-100 inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+    title={KIND.debug.blurb}>
+    <svg aria-hidden fill="none" height={10} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={10}>
+      <ellipse cx={8} cy={9.5} rx={3.5} ry={4.5} />
+      <path
+        d="M8 6v8M5.5 2.5 6.6 5M10.5 2.5 9.4 5M1.5 9h3M11.5 9h3M2 13.5l2.8-1.3M14 13.5l-2.8-1.3"
+        strokeLinecap="round"
+      />
+    </svg>
+    {KIND.debug.label}
+  </span>
+));
+DebuggingChip.displayName = 'DebuggingChip';
+
 const ProblemRow: FC<{
   problem: ProblemSummary;
   index: number;
@@ -496,6 +542,7 @@ const ProblemRow: FC<{
           <span className="flex flex-wrap items-center gap-2">
             <span className="text-ink-50 group-hover:text-iris-200 text-[14px] font-bold">{problem.title}</span>
             <DifficultyChip difficulty={problem.difficulty} />
+            {kindOf(problem) === 'debug' ? <DebuggingChip /> : null}
             {problem.tag !== undefined ? <TagChip tag={problem.tag} /> : null}
             {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
             {/* A course covers every concept, so its chips would say nothing; a single-topic problem names its one. */}
@@ -543,6 +590,16 @@ const ProblemRow: FC<{
 });
 ProblemRow.displayName = 'ProblemRow';
 
+/** A section of the list: the kind, how many of its rows are shown, and what its courses ask. Sticks while its rows scroll. */
+const SectionHeader: FC<{id: string; kind: CourseKind; count: number}> = memo(({id, kind, count}) => (
+  <h2 className="bg-ink-900/95 sticky top-0 z-10 flex items-baseline gap-2 pb-1.5 pt-1 backdrop-blur" id={id}>
+    <span className="text-ink-50 shrink-0 text-[14px] font-bold">{KIND[kind].section}</span>
+    <span className="font-code bg-ink-800 text-ink-200 shrink-0 rounded-full px-1.5 text-[11px]">{count}</span>
+    <span className="text-ink-400 hidden min-w-0 truncate text-[12px] sm:inline">{KIND[kind].blurb}</span>
+  </h2>
+));
+SectionHeader.displayName = 'SectionHeader';
+
 const ProblemList: FC<{
   problems: readonly ProblemSummary[];
   attempts: Record<string, StepAttempt>;
@@ -556,6 +613,32 @@ const ProblemList: FC<{
   const [query, update, reset] = useListQuery();
   const shown = useMemo(() => applyListQuery(problems, attempts, query), [problems, attempts, query]);
   const numbers = useMemo(() => new Map(problems.map((p, i) => [p.id, i])), [problems]);
+  // In the catalogue order, the rows fall into sections by kind, in the order each kind first appears;
+  // other sorts mix the kinds, and a single kind needs no header.
+  const sections = useMemo(() => {
+    if (query.sort !== 'order') return null;
+    const groups: {kind: CourseKind; rows: ProblemSummary[]}[] = [];
+    for (const problem of shown) {
+      const kind = kindOf(problem);
+      const group = groups.find(g => g.kind === kind);
+      if (group === undefined) groups.push({kind, rows: [problem]});
+      else group.rows.push(problem);
+    }
+    return groups.length > 1 ? groups : null;
+  }, [shown, query.sort]);
+  const row = useCallback(
+    (problem: ProblemSummary) => (
+      <ProblemRow
+        attempts={attempts}
+        best={bestSession(sessions, problem.id)}
+        index={numbers.get(problem.id) ?? 0}
+        key={problem.id}
+        problem={problem}
+      />
+    ),
+    [attempts, sessions, numbers],
+  );
+  const next = useMemo(() => nextPick(problems, attempts, today), [problems, attempts, today]);
   // The tab's courses: what "n/total solved" counts, before any search or filter narrows the rows.
   const inTab = useMemo(() => problems.filter(p => inTrack(p, query.track)), [problems, query.track]);
   const solvedCount = useMemo(
@@ -573,12 +656,24 @@ const ProblemList: FC<{
   );
   return (
     <div className="w-full">
-      <LandingIntro stats={stats} />
+      <LandingIntro
+        start={
+          next === null
+            ? undefined
+            : {
+                href: stepPath(next.problem, next.step),
+                label: next.reason === 'continue' ? 'Continue practising' : 'Start practising',
+                title: `${next.problem.title}, step ${next.index + 1}: ${next.step.title}`,
+              }
+        }
+        stats={stats}
+      />
       <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
         <ProfileStrip
           activeDays={activeDays}
           attempts={attempts}
           badges={badges}
+          next={next}
           problems={problems}
           profile={profile}
           sessions={sessions}
@@ -604,18 +699,17 @@ const ProblemList: FC<{
                 Clear them ›
               </button>
             </p>
+          ) : sections === null ? (
+            <ul className="space-y-2.5">{shown.map(row)}</ul>
           ) : (
-            <ul className="space-y-2.5">
-              {shown.map(problem => (
-                <ProblemRow
-                  attempts={attempts}
-                  best={bestSession(sessions, problem.id)}
-                  index={numbers.get(problem.id) ?? 0}
-                  key={problem.id}
-                  problem={problem}
-                />
+            <div className="space-y-4">
+              {sections.map(s => (
+                <section aria-labelledby={`kind-${s.kind}`} key={s.kind}>
+                  <SectionHeader count={s.rows.length} id={`kind-${s.kind}`} kind={s.kind} />
+                  <ul className="space-y-2.5">{s.rows.map(row)}</ul>
+                </section>
               ))}
-            </ul>
+            </div>
           )}
         </section>
       </div>

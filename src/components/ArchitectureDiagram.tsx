@@ -13,6 +13,7 @@ import {
   NOTE_FONT,
   SUB_FONT,
 } from '@/lib/architecture';
+import {scrollBehavior} from '@/lib/motion';
 import {alpha, concept, danger, ink, iris} from '@/styles/palette';
 
 import {InlineMarkdown} from './Markdown';
@@ -230,7 +231,10 @@ const ArchitectureDiagram: FC<{
     const target = layout.blocks.find(b => focused.has(b.id));
     if (target === undefined) return;
     const scale = el.scrollWidth / layout.width;
-    el.scrollTo({top: Math.max(0, (target.box.y - layout.minY) * scale - el.clientHeight / 3), behavior: 'smooth'});
+    el.scrollTo({
+      top: Math.max(0, (target.box.y - layout.minY) * scale - el.clientHeight / 3),
+      behavior: scrollBehavior(),
+    });
   }, [compact, focused, layout]);
 
   const lit = useCallback(

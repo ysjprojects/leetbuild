@@ -26,13 +26,14 @@ export const DIFFICULTY_CLASS: Record<Difficulty, string> = {
 
 const DIFFICULTY_LEVEL: Record<Difficulty, number> = {easy: 1, medium: 2, hard: 3};
 
+/** Chip text and border; the chip sits on the panel colour, since a hue tint over the grey page drops the 10 px text below 4.5:1 by day. */
 export const CONCEPT_CLASS: Record<Concept, string> = {
-  http: 'border-concept-http/50 bg-concept-http/10 text-concept-http',
-  grpc: 'border-concept-grpc/50 bg-concept-grpc/10 text-concept-grpc',
-  kafka: 'border-concept-kafka/50 bg-concept-kafka/10 text-concept-kafka',
-  redis: 'border-concept-redis/50 bg-concept-redis/10 text-concept-redis',
-  pytorch: 'border-concept-pytorch/50 bg-concept-pytorch/10 text-concept-pytorch',
-  cuda: 'border-concept-cuda/50 bg-concept-cuda/10 text-concept-cuda',
+  http: 'border-concept-http/50 text-concept-http',
+  grpc: 'border-concept-grpc/50 text-concept-grpc',
+  kafka: 'border-concept-kafka/50 text-concept-kafka',
+  redis: 'border-concept-redis/50 text-concept-redis',
+  pytorch: 'border-concept-pytorch/50 text-concept-pytorch',
+  cuda: 'border-concept-cuda/50 text-concept-cuda',
 };
 
 /** Solid colour per concept for bars and dots (the diagram palette). */
@@ -55,7 +56,7 @@ export const DifficultyChip: FC<{difficulty: Difficulty}> = memo(({difficulty}) 
 DifficultyChip.displayName = 'DifficultyChip';
 
 export const ConceptChip: FC<{concept: Concept}> = memo(({concept}) => (
-  <span className={`font-code rounded-full border px-1.5 py-0.5 text-[10px] ${CONCEPT_CLASS[concept]}`}>
+  <span className={`font-code bg-ink-850 rounded-full border px-1.5 py-0.5 text-[10px] ${CONCEPT_CLASS[concept]}`}>
     {CONCEPT_LABEL[concept]}
   </span>
 ));

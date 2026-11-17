@@ -18,6 +18,7 @@ import {
   THREAD_H,
   THREAD_W,
 } from '@/lib/gpuFigure';
+import {scrollBehavior} from '@/lib/motion';
 import {alpha, concept, danger, ink, iris, warning} from '@/styles/palette';
 
 import {InlineMarkdown} from './Markdown';
@@ -183,7 +184,10 @@ const GpuDiagram: FC<{
     );
     if (target === undefined) return;
     const scale = el.scrollWidth / layout.width;
-    el.scrollTo({left: Math.max(0, (target.box.x - layout.minX) * scale - el.clientWidth / 4), behavior: 'smooth'});
+    el.scrollTo({
+      left: Math.max(0, (target.box.x - layout.minX) * scale - el.clientWidth / 4),
+      behavior: scrollBehavior(),
+    });
   }, [compact, focused, layout]);
 
   const legend = useMemo(() => {

@@ -133,7 +133,7 @@ export const PopQuiz: FC<{quiz: PopQuizSpec; onAnswered?: (correct: boolean) => 
   const correct = chosen === quiz.answer;
   return (
     <div className="border-ink-600 bg-ink-850 my-4 rounded-xl border p-3">
-      <p className="text-iris-400 mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
+      <p className="text-iris-300 mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
         <span className="bg-iris-400/15 rounded-full px-2 py-0.5">Pop quiz</span>
         {answered ? (
           <span className={correct ? 'text-success-300' : 'text-danger-300'}>{correct ? 'Correct!' : 'Not quite'}</span>

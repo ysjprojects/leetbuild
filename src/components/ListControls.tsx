@@ -11,12 +11,15 @@ import {
 } from 'react';
 
 import {
+  type KindFilter,
   type ListQuery,
   type SortKey,
   type StatusFilter,
   type TrackFilter,
   DEFAULT_LIST_QUERY,
   isDefaultQuery,
+  KIND,
+  KIND_FILTERS,
   SORTS,
   STATUS_LABEL,
   TRACK_TINT,
@@ -188,7 +191,7 @@ const Menu: FC<{label: string; icon: 'sort' | 'filter'; active: boolean; closeOn
           {active ? <Dot /> : null}
         </button>
         {open ? (
-          <div className="border-ink-600 bg-ink-800 absolute left-0 top-full z-20 mt-1.5 min-w-[15rem] rounded-xl border p-2 shadow-2xl">
+          <div className="border-ink-600 bg-ink-800 absolute left-0 top-full z-20 mt-1.5 min-w-[19rem] rounded-xl border p-2 shadow-2xl">
             {children}
           </div>
         ) : null}
@@ -253,6 +256,14 @@ const StatusChipButton: FC<{value: StatusFilter; current: StatusFilter; update: 
     return <FilterChip label={STATUS_LABEL[value]} on={current === value} onClick={onClick} />;
   });
 StatusChipButton.displayName = 'StatusChipButton';
+
+const KindChipButton: FC<{value: KindFilter; current: KindFilter; update: (p: Partial<ListQuery>) => void}> = memo(
+  ({value, current, update}) => {
+    const onClick = useCallback(() => update({kind: value}), [update, value]);
+    return <FilterChip label={value === 'all' ? 'All' : KIND[value].label} on={current === value} onClick={onClick} />;
+  },
+);
+KindChipButton.displayName = 'KindChipButton';
 
 const FilterRow: FC<{label: string; children: ReactNode}> = memo(({label, children}) => (
   <div className="px-1 py-1.5">
@@ -319,17 +330,21 @@ export const ListControls: FC<{
   }, [update]);
   const [sortPicked, setSortPicked] = useState(0);
   const onSortPicked = useCallback(() => setSortPicked(n => n + 1), []);
-  const toggleCompany = useCallback(() => update({company: !query.company}), [update, query.company]);
-  const toggleAiSystems = useCallback(
-    () => update({tag: query.tag === 'ai-systems' ? 'all' : 'ai-systems'}),
-    [update, query.tag],
-  );
+  const anySource = useCallback(() => update({company: false}), [update]);
+  const companyOnly = useCallback(() => update({company: true}), [update]);
+  const anyTopic = useCallback(() => update({tag: 'all'}), [update]);
+  const aiSystemsOnly = useCallback(() => update({tag: 'ai-systems'}), [update]);
   const clearFilters = useCallback(
-    () => update({difficulty: 'all', status: 'all', company: false, tag: 'all'}),
+    () => update({difficulty: 'all', status: 'all', company: false, tag: 'all', kind: 'all'}),
     [update],
   );
   const filtering = useMemo(() => !isDefaultQuery(query), [query]);
-  const filtersSet = query.difficulty !== 'all' || query.status !== 'all' || query.company || query.tag !== 'all';
+  const filtersSet =
+    query.difficulty !== 'all' ||
+    query.status !== 'all' ||
+    query.company ||
+    query.tag !== 'all' ||
+    query.kind !== 'all';
   const sortSet = query.sort !== DEFAULT_LIST_QUERY.sort || query.desc;
   return (
     <div className="space-y-3">
@@ -384,13 +399,19 @@ export const ListControls: FC<{
               <StatusChipButton current={query.status} key={s} update={update} value={s} />
             ))}
           </FilterRow>
+          <FilterRow label="Kind">
+            <KindChipButton current={query.kind} update={update} value="all" />
+            {KIND_FILTERS.map(k => (
+              <KindChipButton current={query.kind} key={k} update={update} value={k} />
+            ))}
+          </FilterRow>
           <FilterRow label="Source">
-            <FilterChip label="All" on={!query.company} onClick={toggleCompany} />
-            <FilterChip label="Company-tagged" on={query.company} onClick={toggleCompany} />
+            <FilterChip label="All" on={!query.company} onClick={anySource} />
+            <FilterChip label="Company-tagged" on={query.company} onClick={companyOnly} />
           </FilterRow>
           <FilterRow label="Topic">
-            <FilterChip label="All" on={query.tag === 'all'} onClick={toggleAiSystems} />
-            <FilterChip label="AI systems" on={query.tag === 'ai-systems'} onClick={toggleAiSystems} />
+            <FilterChip label="All" on={query.tag === 'all'} onClick={anyTopic} />
+            <FilterChip label="AI systems" on={query.tag === 'ai-systems'} onClick={aiSystemsOnly} />
           </FilterRow>
           {filtersSet ? (
             <div className="border-ink-700 mt-1 border-t px-1 pt-2">

@@ -1,6 +1,7 @@
 import {type FC, type MouseEvent, memo, useCallback, useEffect, useMemo, useRef} from 'react';
 
 import {type PlacedNode, arrowHead, EDGE_FONT, LABEL_FONT, layoutDiagram, SUB_FONT} from '@/lib/layout';
+import {scrollBehavior} from '@/lib/motion';
 import type {Diagram, EdgeKind, NodeKind} from '@/lib/types';
 import {concept, ink, node as KIND_COLOR} from '@/styles/palette';
 
@@ -203,7 +204,7 @@ const SystemDiagram: FC<{
     const node = layout.nodes.find(n => n.id === focus[0]);
     if (node === undefined) return;
     const x = (node.cx / layout.width) * el.scrollWidth;
-    el.scrollTo({left: Math.max(0, x - el.clientWidth / 2), behavior: 'smooth'});
+    el.scrollTo({left: Math.max(0, x - el.clientWidth / 2), behavior: scrollBehavior()});
   }, [focus, layout]);
 
   return (

@@ -13,6 +13,13 @@ import {
   stepKey,
 } from './types';
 
+/** One check of a judged submission, as recorded with it (message trimmed). */
+export interface SubmissionCheck {
+  id: string;
+  passed: boolean;
+  message?: string;
+}
+
 /** One judged submission, kept per step (newest last, capped) for the Submissions list. */
 export interface Submission {
   at: number;
@@ -22,6 +29,8 @@ export interface Submission {
   accepted: boolean;
   /** The step's file as it was judged; absent in records written before code was kept. */
   code?: string;
+  /** Each check's outcome; absent in records written before checks were kept. */
+  checks?: SubmissionCheck[];
 }
 
 export const HISTORY_LENGTH = 12;

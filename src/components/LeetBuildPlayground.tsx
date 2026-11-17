@@ -10,13 +10,15 @@ import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl
 import {type TreeNode, buildTree} from '@/lib/fileTree';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
+import {scrollBehavior} from '@/lib/motion';
 import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
 import {stepIssueUrl} from '@/lib/report';
 import {type RuntimeStatus, getRunner, runtimeHarness} from '@/lib/runtime/client';
-import type {OutputLine, RunJob} from '@/lib/runtime/types';
+import type {OutputLine, RunJob, RunResult} from '@/lib/runtime/types';
 import {
   type StepAttempt,
   type Submission,
+  type SubmissionCheck,
   HISTORY_LENGTH,
   OPEN_ATTEMPT,
   profile as computeProfile,
@@ -48,6 +50,7 @@ import {
   type Problem,
   type ProblemSummary,
   type Step,
+  type StepCheck,
   codeFor,
   fileName,
   LANGUAGE_LABEL,
@@ -114,13 +117,21 @@ const useProblem = (
   };
 };
 
+/** The first step not yet accepted or revealed: where a learner heading for a later step goes next. */
+const firstOpenIndex = (problem: Problem, attempts: Record<string, StepAttempt>): number => {
+  const index = problem.steps.findIndex(s => (attempts[stepKey(problem.id, s.id)]?.status ?? 'open') === 'open');
+  return index < 0 ? 0 : index;
+};
+
 /**
- * The step an address opens: the named one when it exists and is reachable, otherwise the first.
+ * The step an address opens: the named one when it exists and is reachable; for a locked one, the
+ * first open step (the address keeps naming the locked step, shown as locked); otherwise the first.
  * `/<problem>` passes the step last visited (or nothing, for a never-opened problem).
  */
 const resolveStep = (problem: Problem, attempts: Record<string, StepAttempt>, wanted: string | undefined): Step => {
   const index = wanted === undefined ? 0 : problem.steps.findIndex(s => s.id === wanted);
-  return problem.steps[index >= 0 && unlocked(problem, index, attempts) ? index : 0];
+  if (index >= 0 && unlocked(problem, index, attempts)) return problem.steps[index];
+  return problem.steps[index > 0 ? firstOpenIndex(problem, attempts) : 0];
 };
 
 /** The submit and run shortcuts as this platform writes them. */
@@ -131,6 +142,8 @@ const RUN_SHORTCUT = MAC ? "⌘ '" : "Ctrl + '";
 
 /** Below `lg` the checks sit under the editor instead of beside it. */
 const STACKED = '(max-width: 1023px)';
+/** From here the explorer has room beside an editor of about 80 columns, so it starts open. */
+const ROOMY = '(min-width: 1366px)';
 
 // ---- resizable layout ----------------------------------------------------------------------------
 
@@ -150,12 +163,29 @@ const DEFAULT_SPLIT = {x: 0.44, y: 0.6};
 const LAYOUT_KEY = 'leetbuild:layout';
 /** Width of the problem pane while collapsed: a strip with the step title and the expand control. */
 const COLLAPSED_PANE = '2.25rem';
+/** The explorer beside the editor (`lg:w-52`), and folded into its strip (`w-7`). */
+const EXPLORER_PX = 208;
+const EXPLORER_STRIP_PX = 28;
+/** The editor column never gets narrower than this: one file tab, then Run and Submit, always on screen. */
+const MIN_EDITOR_PX = 420;
+/** The narrowest the IDE side of the split gets: the editor column's minimum plus the explorer or its strip. */
+const ideMinPx = (explorer: boolean): number => MIN_EDITOR_PX + (explorer ? EXPLORER_PX : EXPLORER_STRIP_PX);
+/**
+ * The editor bar folds its secondary controls as the editor column narrows, so one file tab, Run and
+ * Submit always fit: below the first width the library label goes (the step pane names it too), below
+ * the second reset becomes an icon and Run and Submit drop their shortcuts (still in their tooltips).
+ */
+const LABEL_BAR_PX = 620;
+const COMPACT_BAR_PX = 480;
 
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
 
-/** The explorer starts open beside the editor and closed where it would sit above a stacked editor. */
+/**
+ * The explorer starts open where an editor of about 80 columns still fits beside it (1366 px and up),
+ * folded below that and closed where it would sit above a stacked editor. A saved layout wins.
+ */
 const loadLayout = (): Layout => {
-  const fallback: Layout = {...DEFAULT_SPLIT, pane: true, explorer: !window.matchMedia(STACKED).matches};
+  const fallback: Layout = {...DEFAULT_SPLIT, pane: true, explorer: window.matchMedia(ROOMY).matches};
   try {
     const raw = window.localStorage.getItem(LAYOUT_KEY);
     if (raw === null) return fallback;
@@ -171,10 +201,52 @@ const loadLayout = (): Layout => {
   }
 };
 
+/**
+ * Width of an element, followed as it resizes; 0 until measured. Returns a callback ref, so an
+ * element that mounts later (after the course loads) is still observed.
+ */
+const useWidth = <T extends HTMLElement>(): [(el: T | null) => void, number] => {
+  const [width, setWidth] = useState(0);
+  const observer = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: T | null) => {
+    observer.current?.disconnect();
+    observer.current = null;
+    if (el === null) return;
+    observer.current = new ResizeObserver(([entry]) => setWidth(Math.round(entry.contentRect.width)));
+    observer.current.observe(el);
+  }, []);
+  return [ref, width];
+};
+
 const TOAST_MS = 6000;
 const EMPTY_SHAPES: readonly Shape[] = [];
 /** The per-problem run history names no other problem, so the list needs none. */
 const EMPTY_PROBLEMS: readonly ProblemSummary[] = [];
+
+/** What the checks panel showed for a step in a language after its last Run or Submit. */
+interface StepOutcome {
+  verdict: Verdict | null;
+  /** The step's file as it was judged, so a later edit still marks the verdict stale. */
+  code: string;
+  consoleRun: ConsoleRun | null;
+  earned: number | null;
+  tab: BottomTab;
+}
+
+/**
+ * Each step's last outcome by `workspaceKey`, for the visit: leaving the step (another step, a guide,
+ * any page) unmounts the playground, and coming back shows the verdict it left instead of unrun checks.
+ */
+const outcomes = new Map<string, StepOutcome>();
+
+/** Remember a step's outcome, keeping what `patch` leaves out (a program run keeps the last verdict). */
+const remember = (key: string, patch: Partial<StepOutcome>): void => {
+  const previous = outcomes.get(key) ?? {verdict: null, code: '', consoleRun: null, earned: null, tab: 'checks'};
+  outcomes.set(key, {...previous, ...patch});
+};
+
+/** A check's message as a submission keeps it: enough to recognise the failure, not a whole traceback. */
+const CHECK_MESSAGE_CHARS = 400;
 
 /** A fresh badge: dismisses itself after a while; the LinkedIn action keeps it open while in use. */
 const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}> = memo(({id, badge, onDismiss}) => {
@@ -229,19 +301,8 @@ const FileTab: FC<{
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
 }> = memo(({step, index, language, active, task, onOpen, onClose}) => {
-  const ref = useRef<HTMLDivElement>(null);
   const onClick = useCallback(() => onOpen(step.id), [onOpen, step.id]);
   const onCloseClick = useCallback(() => onClose(step.id), [onClose, step.id]);
-  // The strip scrolls sideways; bring the active tab into view without touching the page's vertical scroll.
-  useEffect(() => {
-    const el = ref.current;
-    const strip = el?.parentElement;
-    if (!active || !el || !strip) return;
-    const tab = el.getBoundingClientRect();
-    const box = strip.getBoundingClientRect();
-    if (tab.left < box.left) strip.scrollLeft -= box.left - tab.left;
-    else if (tab.right > box.right) strip.scrollLeft += tab.right - box.right;
-  }, [active]);
   const name = fileName(step.file, language);
   return (
     <div
@@ -249,7 +310,6 @@ const FileTab: FC<{
       className={`border-ink-700 group relative flex shrink-0 items-stretch border-r text-[11px] transition-colors ${
         active ? 'bg-ink-850 text-ink-50' : 'text-ink-300 hover:bg-ink-800/50 hover:text-ink-100 border-b'
       }`}
-      ref={ref}
       role="tab">
       {active ? <span aria-hidden className="bg-iris-400 absolute inset-x-0 top-0 h-0.5" /> : null}
       <button
@@ -343,32 +403,57 @@ const FileTabs: FC<{
   stepId: string;
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
-}> = memo(({problem, language, provided, openTabs, openFile, stepId, onOpen, onClose}) => (
-  <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto overflow-y-hidden" role="tablist">
-    {openTabs.map(id => {
-      if (isProvidedId(id)) {
-        const path = providedPath(id);
-        return provided.some(f => f.path === path) ? (
-          <ProvidedTab active={id === openFile} key={id} onClose={onClose} onOpen={onOpen} path={path} />
-        ) : null;
-      }
-      const index = problem.steps.findIndex(s => s.id === id);
-      return index < 0 ? null : (
-        <FileTab
-          active={id === openFile}
-          index={index}
-          key={id}
-          language={language}
-          onClose={onClose}
-          onOpen={onOpen}
-          step={problem.steps[index]}
-          task={id === stepId}
-        />
-      );
-    })}
-    <div aria-hidden className="border-ink-700 min-w-2 flex-1 border-b" />
-  </div>
-));
+}> = memo(({problem, language, provided, openTabs, openFile, stepId, onOpen, onClose}) => {
+  const strip = useRef<HTMLDivElement | null>(null);
+  const [measure, width] = useWidth<HTMLDivElement>();
+  const stripRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      strip.current = el;
+      measure(el);
+    },
+    [measure],
+  );
+  // The strip scrolls sideways: keep the active tab in view as it changes and as the strip resizes, its
+  // start (the step's dot, the name) first when it is wider than the strip. The page never scrolls.
+  useEffect(() => {
+    const box = strip.current;
+    const tab = box?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+    if (!box || !tab) return;
+    const left = tab.getBoundingClientRect().left - box.getBoundingClientRect().left + box.scrollLeft;
+    const right = left + tab.offsetWidth;
+    if (left < box.scrollLeft || tab.offsetWidth > box.clientWidth) box.scrollLeft = left;
+    else if (right > box.scrollLeft + box.clientWidth) box.scrollLeft = right - box.clientWidth;
+  }, [openFile, openTabs, width]);
+  return (
+    <div
+      className="flex min-w-[7.5rem] flex-1 items-stretch overflow-x-auto overflow-y-hidden"
+      ref={stripRef}
+      role="tablist">
+      {openTabs.map(id => {
+        if (isProvidedId(id)) {
+          const path = providedPath(id);
+          return provided.some(f => f.path === path) ? (
+            <ProvidedTab active={id === openFile} key={id} onClose={onClose} onOpen={onOpen} path={path} />
+          ) : null;
+        }
+        const index = problem.steps.findIndex(s => s.id === id);
+        return index < 0 ? null : (
+          <FileTab
+            active={id === openFile}
+            index={index}
+            key={id}
+            language={language}
+            onClose={onClose}
+            onOpen={onOpen}
+            step={problem.steps[index]}
+            task={id === stepId}
+          />
+        );
+      })}
+      <div aria-hidden className="border-ink-700 min-w-2 flex-1 border-b" />
+    </div>
+  );
+});
 FileTabs.displayName = 'FileTabs';
 
 /** View-only: an eye, so a provided file never reads as a locked step (the padlock means "not yet"). */
@@ -397,7 +482,7 @@ const ProvidedRow: FC<{
     <li>
       <button
         className={`flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-[11px] transition ${
-          active ? 'bg-ink-800 text-ink-300' : 'text-ink-500 hover:bg-ink-800/60 hover:text-ink-300'
+          active ? 'bg-ink-800 text-ink-300' : 'text-ink-400 hover:bg-ink-800/60 hover:text-ink-300'
         }`}
         onClick={onClick}
         style={style}
@@ -440,7 +525,7 @@ const ExplorerRow: FC<{
           active
             ? 'bg-ink-800 text-ink-50'
             : locked
-            ? 'text-ink-500'
+            ? 'text-ink-400'
             : 'text-ink-200 hover:bg-ink-800/60 hover:text-ink-50'
         }`}
         disabled={locked}
@@ -698,8 +783,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const [verdictCode, setVerdictCode] = useState('');
   const [earned, setEarned] = useState<number | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({state: 'idle'});
-  /** A submission is executing in the runtime; its result is still to come. */
-  const [running, setRunning] = useState(false);
+  /** A Run or Submit is executing in the runtime, which button started it and when; its result is still to come. */
+  const [pending, setPending] = useState<{kind: 'run' | 'submit'; since: number} | null>(null);
+  const running = pending !== null;
   /** The reference solution's verdict for the accepted step, once compared; the run is in progress while `comparing`. */
   const [reference, setReference] = useState<Verdict | null>(null);
   const [comparing, setComparing] = useState(false);
@@ -719,10 +805,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** Badges found on the first reconciliation after load are recorded silently, not announced. */
   const announceBadges = useRef(false);
   const [layout, setLayout] = useState<Layout>(loadLayout);
+  /** The layout as loaded: not saved until the learner changes it, so a default follows the screen it opens on. */
+  const loadedLayout = useRef(layout);
   const mainRef = useRef<HTMLElement>(null);
   const ideRef = useRef<HTMLDivElement>(null);
+  /** The editor column (tabs, editor bar, editor): its width decides how much of the bar folds. */
+  const [editorColumnRef, editorColumnWidth] = useWidth<HTMLDivElement>();
   const editorRef = useRef<EditorView | null>(null);
   const verdictRef = useRef<HTMLDivElement>(null);
+  /** Bumped to bring the step's debrief into view in the problem pane. */
+  const [debriefRequest, setDebriefRequest] = useState(0);
   const filesRef = useRef(files);
   const openTabsRef = useRef(openTabs);
   const openFileRef = useRef(openFile);
@@ -744,6 +836,15 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const step: Step | null =
     problem === null ? null : resolveStep(problem, progress.attempts, stepId ?? progress.lastStep[problem.id]);
   const stepIndex = problem === null || step === null ? -1 : problem.steps.indexOf(step);
+  /**
+   * The address names a step that is not unlocked yet (a guide's "Practise it" link, an old bookmark):
+   * the pane shows it locked, with the way there; the workspace holds the first open step meanwhile.
+   */
+  const lockedIndex =
+    problem === null || stepId === null || step === null || step.id === stepId
+      ? -1
+      : problem.steps.findIndex(s => s.id === stepId);
+  const lockedStep = problem !== null && lockedIndex > 0 ? problem.steps[lockedIndex] : null;
   // A deep-learning problem is written in one language; everything else follows the learner's choice.
   const language = problem?.language ?? progress.language;
   const runner = useMemo(() => getRunner(language), [language]);
@@ -763,6 +864,14 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const provided = useMemo(() => (problem === null ? [] : providedFiles(problem, language)), [problem, language]);
   const openProvided =
     openFile !== null && isProvidedId(openFile) ? provided.find(f => f.path === providedPath(openFile)) ?? null : null;
+  /** The open step file's name, the editor's accessible name. */
+  const openOwner = problem?.steps.find(s => s.id === openFile);
+  const openName = openOwner === undefined ? undefined : fileName(openOwner.file, language);
+  /** Why Run and Submit wait while the address names a locked step. */
+  const lockedTitle = `step ${lockedIndex + 1} is locked: go to step ${stepIndex + 1} to run or submit`;
+  /** How much of the editor bar folds in this editor column (0 until measured: nothing folds). */
+  const showLibrary = editorColumnWidth === 0 || editorColumnWidth >= LABEL_BAR_PX;
+  const compactBar = editorColumnWidth > 0 && editorColumnWidth < COMPACT_BAR_PX;
   const profile = useMemo(
     () => computeProfile(problemSummaries, progress.attempts, progress.submissions, progress.acceptedSubmissions),
     [progress.attempts, progress.submissions, progress.acceptedSubmissions],
@@ -823,7 +932,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
 
   /**
    * Mount the problem's filesystem in `lang` — every step's saved code or starter — and open
-   * `targetStep`'s file. Tabs of the same problem stay open; another problem starts with one tab.
+   * `targetStep`'s file, with the step's last outcome in that language if it had one this visit.
+   * Tabs of the same problem stay open; another problem starts with one tab.
    */
   const mount = useCallback(
     (target: Problem, targetStep: Step, lang: Language) => {
@@ -839,12 +949,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       openTab(targetStep.id);
       setResetKey(k => k + 1);
       submitSeq.current += 1;
-      setVerdict(null);
+      const outcome = outcomes.get(workspaceKey(target.id, targetStep.id, lang));
+      setVerdict(outcome?.verdict ?? null);
       setReference(null);
-      setVerdictCode('');
-      setEarned(null);
-      setConsoleRun(null);
-      setBottomTab('checks');
+      setVerdictCode(outcome?.code ?? '');
+      setEarned(outcome?.earned ?? null);
+      setConsoleRun(outcome?.consoleRun ?? null);
+      setBottomTab(outcome?.tab ?? 'checks');
     },
     [openTab],
   );
@@ -878,12 +989,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     };
   }, [store]);
 
-  // Canonical address: `/<problem>`, a locked step and an unknown step all resolve to a real step; show it.
+  // Canonical address: `/<problem>` and an unknown step resolve to a real step; show it. A locked step
+  // keeps its address: the pane shows it locked.
   useEffect(() => {
-    if (loaded && problem !== null && step !== null && step.id !== stepId) {
+    if (loaded && problem !== null && step !== null && lockedStep === null && step.id !== stepId) {
       void Router.replace(stepPath(problem, step));
     }
-  }, [loaded, problem, step, stepId]);
+  }, [loaded, problem, step, lockedStep, stepId]);
 
   // Arriving at a step (by link, chip, Back or Forward): load its saved code and remember the position.
   // A problem never touched opens on its description, like LeetCode; afterwards straight to the step.
@@ -901,6 +1013,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     );
   }, [loaded, problem, step, mount]);
 
+  // A locked step's address shows the step tab, where it says why it is locked and how to get there.
+  useEffect(() => {
+    if (lockedStep === null) return;
+    setTab('step');
+    setPaneOpen(true);
+  }, [lockedStep]);
+
   // Persist progress (debounced by the store); files are written through by `writeFile` as they change.
   useEffect(() => {
     if (!loaded) return;
@@ -915,7 +1034,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const onSelectStep = useCallback(
     (id: string) => {
       if (problem === null || step === null) return;
-      if (id === step.id) {
+      if (id === step.id && lockedStep === null) {
         // The open step's own chip, clicked from the description tab: nothing to navigate to.
         setTab('step');
         setPaneOpen(true);
@@ -925,7 +1044,26 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       if (index < 0 || !unlocked(problem, index, progress.attempts)) return;
       void Router.push(stepPath(problem, problem.steps[index]));
     },
-    [problem, step, progress.attempts],
+    [problem, step, lockedStep, progress.attempts],
+  );
+
+  /** Skip ahead to `id`: reveal every step before it still open (each scores 0), which unlocks it. */
+  const onRevealUpTo = useCallback(
+    (id: string) => {
+      if (problem === null) return;
+      const index = problem.steps.findIndex(s => s.id === id);
+      const now = Date.now();
+      setProgress(p => {
+        const attempts = {...p.attempts};
+        for (const s of problem.steps.slice(0, Math.max(0, index))) {
+          const key = stepKey(problem.id, s.id);
+          const current = attempts[key] ?? OPEN_ATTEMPT;
+          if (current.status === 'open') attempts[key] = {...current, status: 'revealed', language, solvedAt: now};
+        }
+        return {...p, attempts};
+      });
+    },
+    [problem, language],
   );
 
   const onNextStep = useCallback(() => {
@@ -946,6 +1084,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           const key = workspaceKey(target.id, s.id, lang);
           delete workspaces.current[key];
           store.deleteWorkspace(key);
+          outcomes.delete(key);
         }
       }
       const first = target.steps[0];
@@ -956,11 +1095,12 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       });
       setTab('step');
       setOpenTabs([first.id]);
-      // Clearing the attempts locks every later step, so the address re-resolves to step 1 and opens it;
-      // only when step 1 is already open does nothing change and the starter has to be loaded here.
+      // Step 1 opens: the address moves there (every later step is locked again), and when step 1 is
+      // already open the step does not change, so its starter has to be loaded here.
       if (stepIndex === 0) mount(target, first, language);
+      if (stepId !== first.id) void Router.replace(stepPath(target, first));
     },
-    [stepIndex, language, mount, store],
+    [stepIndex, stepId, language, mount, store],
   );
 
   const onResetProblem = useCallback(() => {
@@ -1147,10 +1287,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (loaded && step !== null && (runtimeHarness(step, language) !== undefined || program)) runner?.prewarm();
   }, [loaded, step, language, runner, program]);
 
-  /** Record a decided verdict: the attempt, the submission history (with the code judged), the score, the celebration. */
+  /**
+   * Record a decided verdict: the attempt, the submission history (with the code judged and each check's
+   * outcome), the celebration. Returns the points the step earned, or null when it was not accepted.
+   */
   const record = useCallback(
-    (result: Verdict, code: string) => {
-      if (problem === null || attemptKey === null) return;
+    (result: Verdict, code: string): number | null => {
+      if (problem === null || attemptKey === null) return null;
       const now = Date.now();
       const previous = progressRef.current.attempts[attemptKey] ?? OPEN_ATTEMPT;
       let next: StepAttempt = previous;
@@ -1159,6 +1302,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           ? {...previous, status: 'accepted', language, solvedAt: now}
           : {...previous, wrong: previous.wrong + 1, language};
       }
+      const checks: SubmissionCheck[] = result.results.map(r =>
+        r.message === undefined
+          ? {id: r.id, passed: r.passed}
+          : {
+              id: r.id,
+              passed: r.passed,
+              message:
+                r.message.length > CHECK_MESSAGE_CHARS ? `${r.message.slice(0, CHECK_MESSAGE_CHARS - 1)}…` : r.message,
+            },
+      );
       const submission: Submission = {
         at: now,
         language,
@@ -1166,9 +1319,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         total: result.total,
         accepted: result.accepted,
         code,
+        checks,
       };
       next = {...next, history: [...(previous.history ?? []), submission].slice(-HISTORY_LENGTH)};
-      setEarned(result.accepted ? stepScore(problem.difficulty, next) : null);
       const freshlyAccepted = previous.status === 'open' && result.accepted;
       const today = dayKey(new Date(now));
       setProgress(p => ({
@@ -1179,14 +1332,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         activeDays: freshlyAccepted && !p.activeDays.includes(today) ? [...p.activeDays, today] : p.activeDays,
       }));
       if (freshlyAccepted) setCelebration(c => c + 1);
+      return result.accepted ? stepScore(problem.difficulty, next) : null;
     },
     [problem, attemptKey, language],
   );
 
   const showVerdict = useCallback(() => {
     // Stacked layout: the verdict is off-screen under the editor, so bring it up instead of raising the keyboard.
-    if (window.matchMedia(STACKED).matches) verdictRef.current?.scrollIntoView({behavior: 'smooth', block: 'start'});
-    else editorRef.current?.focus();
+    if (window.matchMedia(STACKED).matches) {
+      verdictRef.current?.scrollIntoView({behavior: scrollBehavior(), block: 'start'});
+    } else editorRef.current?.focus();
   }, []);
 
   /**
@@ -1221,25 +1376,40 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     [problem, step, language],
   );
 
-  /** Start the console for a run; the returned sink drops lines once another run or step took over. */
+  /**
+   * Start the console for a run. `onOutput` takes its lines and `finish` closes it; both show it only
+   * while the run is still the current one, and `finish` returns it whole, to remember with the outcome.
+   */
   const capture = useCallback((label: string, token: number) => {
-    setConsoleRun({label, lines: [], running: true});
-    return (line: OutputLine): void => {
-      if (submitSeq.current === token) setConsoleRun(c => (c === null ? c : {...c, lines: [...c.lines, line]}));
+    let current: ConsoleRun = {label, lines: [], running: true};
+    setConsoleRun(current);
+    return {
+      onOutput: (line: OutputLine): void => {
+        current = {...current, lines: [...current.lines, line]};
+        if (submitSeq.current === token) setConsoleRun(current);
+      },
+      finish: (run: RunResult, checks?: readonly StepCheck[]): ConsoleRun => {
+        current = finished(current, run, checks);
+        if (submitSeq.current === token) setConsoleRun(current);
+        return current;
+      },
     };
   }, []);
 
   const submit = useCallback(() => {
-    if (problem === null || step === null || attemptKey === null || running) return;
+    if (problem === null || step === null || attemptKey === null || running || lockedStep !== null) return;
     const src = filesRef.current[step.id] ?? codeFor(step, language).starter;
     const result = judge(step, language, src);
+    const key = workspaceKey(problem.id, step.id, language);
     setVerdictCode(src);
     const token = ++submitSeq.current;
     const harness = runtimeHarness(step, language);
     if (harness === undefined) {
+      const points = record(result, src);
       setVerdict(result);
       setReference(null);
-      record(result, src);
+      setEarned(points);
+      remember(key, {verdict: result, code: src, earned: points});
       showVerdict();
       return;
     }
@@ -1250,24 +1420,26 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (job === null || runner === null) return;
     setVerdict(null);
     setReference(null);
-    setRunning(true);
-    const onOutput = capture(`submit · ${step.checks.length} checks`, token);
-    void runner.run(job, onOutput).then(run => {
-      setRunning(false);
+    setPending({kind: 'submit', since: Date.now()});
+    const output = capture(`submit · ${step.checks.length} checks`, token);
+    void runner.run(job, output.onOutput).then(run => {
+      setPending(null);
       const decided = withRuntime(result, run);
-      // A runtime that could not run the code is not a wrong submission; a decided run is recorded even if the
-      // learner moved on, but its verdict is only shown for the step it belongs to.
-      if (run.error === undefined) record(decided, src);
+      // A runtime that could not run the code is not a wrong submission; a decided run is recorded (and
+      // remembered for its step) even if the learner moved on, but its verdict is only shown for its own step.
+      const points = run.error === undefined ? record(decided, src) : null;
+      const consoleRun = output.finish(run, step.checks);
+      remember(key, {verdict: decided, code: src, consoleRun, earned: points, tab: 'checks'});
       if (submitSeq.current !== token) return;
-      setConsoleRun(c => (c === null ? c : finished(c, run, step.checks)));
       setVerdict(decided);
+      setEarned(points);
       showVerdict();
     });
-  }, [problem, step, attemptKey, language, running, runner, assemble, record, showVerdict, capture]);
+  }, [problem, step, attemptKey, language, running, lockedStep, runner, assemble, record, showVerdict, capture]);
 
   /** Run: execute the example check only and show what happened; no attempt, history or score is touched. */
   const trial = useCallback(() => {
-    if (problem === null || step === null || running) return;
+    if (problem === null || step === null || running || lockedStep !== null) return;
     const harness = runtimeHarness(step, language);
     if (harness === undefined || runner === null) return;
     const src = filesRef.current[step.id] ?? codeFor(step, language).starter;
@@ -1275,40 +1447,43 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     const result = narrow(judge(step, language, src), [example.id]);
     const job = assemble(harness, [example.id]);
     if (job === null) return;
+    const key = workspaceKey(problem.id, step.id, language);
     setVerdictCode(src);
     const token = ++submitSeq.current;
     setVerdict(null);
     setReference(null);
     setEarned(null);
-    setRunning(true);
-    const onOutput = capture('run · example check', token);
-    void runner.run(job, onOutput).then(run => {
-      setRunning(false);
+    setPending({kind: 'run', since: Date.now()});
+    const output = capture('run · example check', token);
+    void runner.run(job, output.onOutput).then(run => {
+      setPending(null);
+      const verdictNow: Verdict = {...withRuntime(result, run), trial: true};
+      const consoleRun = output.finish(run, step.checks);
+      remember(key, {verdict: verdictNow, code: src, consoleRun, earned: null, tab: 'checks'});
       if (submitSeq.current !== token) return;
-      setConsoleRun(c => (c === null ? c : finished(c, run, step.checks)));
-      setVerdict({...withRuntime(result, run), trial: true});
+      setVerdict(verdictNow);
       showVerdict();
     });
-  }, [problem, step, language, running, runner, assemble, showVerdict, capture]);
+  }, [problem, step, language, running, lockedStep, runner, assemble, showVerdict, capture]);
 
   /**
    * Run a PyTorch step's file as a program — `python file.py`, its self-test included — in the browser,
    * beside the course's other files (as `assemble` mounts them). The console shows it; nothing is recorded.
    */
   const runProgram = useCallback(() => {
-    if (step === null || running || runner === null) return;
+    if (problem === null || step === null || running || lockedStep !== null || runner === null) return;
     const job = assemble('', []);
     if (job === null) return;
+    const key = workspaceKey(problem.id, step.id, language);
     const token = ++submitSeq.current;
-    const onOutput = capture(`python ${fileName(step.file, language)}`, token);
+    const output = capture(`python ${fileName(step.file, language)}`, token);
     setBottomTab('console');
-    setRunning(true);
-    void runner.run({...job, program: true}, onOutput).then(run => {
-      setRunning(false);
-      if (submitSeq.current !== token) return;
-      setConsoleRun(c => (c === null ? c : finished(c, run)));
+    setPending({kind: 'run', since: Date.now()});
+    void runner.run({...job, program: true}, output.onOutput).then(run => {
+      setPending(null);
+      remember(key, {consoleRun: output.finish(run), tab: 'console'});
     });
-  }, [step, running, runner, assemble, capture, language]);
+  }, [problem, step, running, lockedStep, runner, assemble, capture, language]);
 
   /** What Run does: the example check where a harness exists, the program for a PyTorch step. */
   const runStep = program ? runProgram : trial;
@@ -1356,6 +1531,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           <panes.SubmissionCode
             code={code}
             current={sameLanguage ? filesRef.current[step.id] ?? codeFor(step, language).starter : null}
+            label={`${fileName(step.file, submission.language)}, as submitted`}
             language={submission.language}
           />
         ),
@@ -1450,11 +1626,15 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     [problem, progress.attempts, language],
   );
 
-  // Layout: the gutters report pixel deltas; convert them to shares of the container being split.
+  // Layout: the gutters report pixel deltas; convert them to shares of the container being split. The
+  // editor column keeps its pixel minimum: past it the gutter stops, so Run and Submit stay on screen.
   const dragX = useCallback((delta: number) => {
     const width = mainRef.current?.clientWidth ?? 0;
     if (width === 0) return;
-    setLayout(l => ({...l, x: clamp(l.x + delta / width, SPLIT_BOUNDS.x.min, SPLIT_BOUNDS.x.max)}));
+    setLayout(l => {
+      const max = Math.max(SPLIT_BOUNDS.x.min, Math.min(SPLIT_BOUNDS.x.max, 1 - ideMinPx(l.explorer) / (width - 8)));
+      return {...l, x: clamp(l.x + delta / width, SPLIT_BOUNDS.x.min, max)};
+    });
   }, []);
   const dragY = useCallback((delta: number) => {
     const height = ideRef.current?.clientHeight ?? 0;
@@ -1465,6 +1645,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const resetY = useCallback(() => setLayout(l => ({...l, y: DEFAULT_SPLIT.y})), []);
   const togglePaneSidebar = useCallback(() => setLayout(l => ({...l, pane: !l.pane})), []);
   const toggleExplorer = useCallback(() => setLayout(l => ({...l, explorer: !l.explorer})), []);
+  /** From the verdict: the step tab of the problem pane, shown, with the debrief brought into view. */
+  const onShowDebrief = useCallback(() => {
+    setTab('step');
+    setPaneOpen(true);
+    setLayout(l => (l.pane ? l : {...l, pane: true}));
+    setDebriefRequest(n => n + 1);
+  }, []);
   /**
    * Focus: the explorer and the problem pane fold together and come back together, to how they
    * were. In the stacked layout the pane is the accordion over the editor, so that is what folds.
@@ -1503,15 +1690,18 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     [scratchKey, store],
   );
 
-  // Shortcuts work from anywhere on the page (the editor binds Mod-Enter itself too); none while a dialog is open.
+  // Shortcuts work from anywhere on the page; none while a dialog is open. The editor binds Mod-Enter and
+  // Mod-' itself and marks the keys it handled (defaultPrevented), so those never run twice.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (document.querySelector('dialog[open]') !== null) return;
       const modKey = e.metaKey || e.ctrlKey;
       if (modKey && e.key === 'Enter') {
+        if (e.defaultPrevented) return;
         e.preventDefault();
         submit();
       } else if (modKey && !e.shiftKey && !e.altKey && e.code === 'Quote') {
+        if (e.defaultPrevented) return;
         e.preventDefault();
         runStep();
       } else if (modKey && e.shiftKey && !e.altKey && e.code === 'KeyF' && problem !== null) {
@@ -1553,7 +1743,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     toggleScratchpad,
   ]);
 
+  // A layout is saved once the learner changes it; until then the defaults follow the screen it opens on.
   useEffect(() => {
+    if (layout === loadedLayout.current) return;
     try {
       window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
     } catch {
@@ -1561,13 +1753,17 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     }
   }, [layout]);
   // Grid templates in `fr` so the shares need no definite container size; the 8px track is the gutter.
-  // A collapsed problem pane is a fixed strip with no gutter.
+  // The IDE track never goes below its pixel minimum, whatever the share, so Run and Submit stay on
+  // screen; the shares are in percent so that, when it does, the pane's factor alone (never under 1fr)
+  // still takes all the space left. A collapsed problem pane is a fixed strip with no gutter.
   const mainStyle = useMemo(
     () =>
       ({
-        '--lb-cols': layout.pane ? `${layout.x}fr 8px ${1 - layout.x}fr` : `${COLLAPSED_PANE} 1fr`,
+        '--lb-cols': layout.pane
+          ? `minmax(0, ${layout.x * 100}fr) 8px minmax(${ideMinPx(layout.explorer)}px, ${(1 - layout.x) * 100}fr)`
+          : `${COLLAPSED_PANE} 1fr`,
       } as CSSProperties),
-    [layout.x, layout.pane],
+    [layout.x, layout.pane, layout.explorer],
   );
   const ideStyle = useMemo(() => ({'--lb-rows': `${layout.y}fr 8px ${1 - layout.y}fr`} as CSSProperties), [layout.y]);
 
@@ -1675,7 +1871,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               className="text-iris-300 flex w-full items-center justify-between px-4 py-2 text-left text-[12px] font-semibold lg:hidden"
               onClick={togglePane}
               type="button">
-              Step {stepIndex + 1}: {step.title}
+              {lockedStep === null
+                ? `Step ${stepIndex + 1}: ${step.title}`
+                : `Step ${lockedIndex + 1}: ${lockedStep.title} (locked)`}
               <span>{paneOpen ? '▾' : '▸'}</span>
             </button>
             <div
@@ -1686,7 +1884,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 attempt={attempt}
                 attempts={progress.attempts}
                 certified={certified}
+                debriefRequest={debriefRequest}
                 language={language}
+                lockedStep={lockedStep}
                 onBack={onBack}
                 onCertificate={onCertificate}
                 onCollapse={togglePaneSidebar}
@@ -1697,6 +1897,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 onResetProblem={onResetProblem}
                 onRevealHint={onRevealHint}
                 onRevealSolution={onRevealSolution}
+                onRevealUpTo={onRevealUpTo}
                 onSelectStep={onSelectStep}
                 onTab={setTab}
                 problem={problem}
@@ -1708,7 +1909,14 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               />
             </div>
             {layout.pane ? null : (
-              <CollapsedPane onExpand={togglePaneSidebar} title={`Step ${stepIndex + 1}: ${step.title}`} />
+              <CollapsedPane
+                onExpand={togglePaneSidebar}
+                title={
+                  lockedStep === null
+                    ? `Step ${stepIndex + 1}: ${step.title}`
+                    : `Step ${lockedIndex + 1}: ${lockedStep.title} (locked)`
+                }
+              />
             )}
           </section>
 
@@ -1735,7 +1943,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               className="flex min-h-0 min-w-0 flex-1 flex-col lg:grid lg:h-full lg:grid-rows-[var(--lb-rows)]"
               ref={ideRef}
               style={ideStyle}>
-              <div className="flex h-[56vh] min-h-0 min-w-0 flex-col lg:h-auto">
+              <div className="flex h-[56vh] min-h-0 min-w-0 flex-col lg:h-auto" ref={editorColumnRef}>
                 {/* The tab bar: the rule along its bottom is drawn by the inactive tabs and the filler, never under the active tab, which shares the editor's surface. */}
                 <div className="bg-ink-900 flex h-9 shrink-0 items-stretch">
                   <div className="border-ink-700 flex shrink-0 items-center border-b px-1.5">
@@ -1771,51 +1979,79 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     stepId={step.id}
                   />
                   <div className="border-ink-700 flex shrink-0 items-center gap-2 border-b pl-2 pr-2">
-                    <span
-                      className="font-code text-ink-400 hidden shrink-0 text-[10px] md:inline"
-                      title="library the reference solution uses">
-                      {LANGUAGE_STACK[language][step.concept] ?? ''}
-                    </span>
+                    {showLibrary ? (
+                      <span
+                        className="font-code text-ink-400 hidden shrink-0 text-[10px] md:inline"
+                        title="library the reference solution uses">
+                        {LANGUAGE_STACK[language][step.concept] ?? ''}
+                      </span>
+                    ) : null}
                     <button
                       aria-label="editor settings"
-                      className="text-ink-300 hover:text-ink-50 flex h-6 w-6 items-center justify-center rounded-md transition"
+                      className="text-ink-300 hover:text-ink-50 flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition"
                       onClick={onEditorSettings}
                       title="editor settings: font size, long lines, Vim"
                       type="button">
                       <GearIcon />
                     </button>
                     <button
-                      className="text-ink-300 hover:text-ink-50 rounded-md px-2 py-1 text-[11px] transition disabled:cursor-not-allowed disabled:opacity-30"
+                      aria-label="reset this file"
+                      className={`text-ink-300 hover:text-ink-50 flex shrink-0 items-center justify-center rounded-md text-[11px] transition disabled:cursor-not-allowed disabled:opacity-30 ${
+                        compactBar ? 'h-6 w-6' : 'px-2 py-1'
+                      }`}
                       disabled={openFile === null || openProvided !== null}
                       onClick={onResetCode}
                       title="restore this file's starting code"
                       type="button">
-                      reset
+                      {compactBar ? (
+                        <svg
+                          aria-hidden
+                          fill="none"
+                          height={13}
+                          stroke="currentColor"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={1.8}
+                          viewBox="0 0 16 16"
+                          width={13}>
+                          <path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2.5 2.5v3h3" />
+                        </svg>
+                      ) : (
+                        'reset'
+                      )}
                     </button>
                     {runtimeHarness(step, language) !== undefined || program ? (
                       <button
-                        className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 rounded-lg border px-2.5 py-[3px] text-[12px] font-semibold transition disabled:cursor-wait disabled:opacity-60"
-                        disabled={running || comparing}
+                        className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-[3px] text-[12px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-60"
+                        disabled={running || comparing || lockedStep !== null}
                         onClick={runStep}
-                        title={`${RUN_SHORTCUT} · ${
-                          program
-                            ? `runs ${fileName(
-                                step.file,
-                                language,
-                              )} as a program in the browser, its self-test included`
-                            : `runs ${fileName(step.file, language)} against the example check`
-                        }; nothing is recorded`}
+                        title={
+                          lockedStep !== null
+                            ? lockedTitle
+                            : `${RUN_SHORTCUT} · ${
+                                program
+                                  ? `runs ${fileName(
+                                      step.file,
+                                      language,
+                                    )} as a program in the browser, its self-test included`
+                                  : `runs ${fileName(step.file, language)} against the example check`
+                              }; nothing is recorded`
+                        }
                         type="button">
-                        Run {RUN_KEYS}
+                        {pending?.kind === 'run' ? 'Running…' : compactBar ? 'Run' : `Run ${RUN_KEYS}`}
                       </button>
                     ) : null}
                     <button
-                      className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-3 py-1 text-[12px] font-bold transition disabled:cursor-wait disabled:opacity-60"
-                      disabled={running || comparing}
+                      className="bg-iris-400 text-ink-950 hover:bg-iris-300 shrink-0 whitespace-nowrap rounded-lg px-3 py-1 text-[12px] font-bold transition disabled:cursor-not-allowed disabled:opacity-60"
+                      disabled={running || comparing || lockedStep !== null}
                       onClick={submit}
-                      title={`${SUBMIT_SHORTCUT} · judges ${fileName(step.file, language)}`}
+                      title={
+                        lockedStep !== null
+                          ? lockedTitle
+                          : `${SUBMIT_SHORTCUT} · judges ${fileName(step.file, language)}`
+                      }
                       type="button">
-                      {running ? 'Running…' : `Submit ${SUBMIT_KEYS}`}
+                      {pending?.kind === 'submit' ? 'Judging…' : compactBar ? 'Submit' : `Submit ${SUBMIT_KEYS}`}
                     </button>
                   </div>
                 </div>
@@ -1837,6 +2073,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     <panes.StepEditor
                       className="min-h-0 min-w-0 flex-1"
                       fileKey={`${problem.id}/${openFile}/${language}`}
+                      label={`${openProvided.path}, read-only`}
                       language={openProvided.syntax}
                       readOnly
                       value={openProvided.text}
@@ -1847,6 +2084,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     baseline={openStarter}
                     className="min-h-0 min-w-0 flex-1"
                     fileKey={`${problem.id}/${openFile}/${language}`}
+                    label={openName}
                     language={language}
                     onChange={onCodeChange}
                     onRun={runStep}
@@ -1873,8 +2111,10 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   onCertificate={certified ? onCertificate : undefined}
                   onCompare={compare}
                   onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
+                  onShowDebrief={onShowDebrief}
                   onTab={setBottomTab}
                   onViewSubmission={onViewSubmission}
+                  pending={pending}
                   program={program}
                   reference={reference}
                   running={running}
