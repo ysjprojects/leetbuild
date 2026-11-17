@@ -3,6 +3,8 @@ import {type FC, memo, useMemo} from 'react';
 import type {Sequence} from '@/lib/types';
 import {concept, ink, iris} from '@/styles/palette';
 
+import {readableMinWidth, SideScroll} from './widgets/frame';
+
 /**
  * The runtime interaction a step implements: participants as lifelines, messages as arrows in
  * order. Labels wrap inside their column (a row grows by one line each) so a long Redis command
@@ -70,108 +72,117 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
 
   return (
     <div className="border-ink-700 bg-ink-850 rounded-xl border p-2">
-      <svg className="w-full" role="img" style={{maxHeight: 340}} viewBox={`0 0 ${width} ${height}`}>
-        <title>Sequence of calls for this step</title>
-        <defs>
-          <marker id="lb-seq-filled" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
-            <path d="M0 0L8 3.5L0 7z" fill={iris[300]} />
-          </marker>
-          <marker id="lb-seq-open" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
-            <path d="M0 0L8 3.5L0 7" fill="none" stroke={ink[200]} strokeWidth={1.4} />
-          </marker>
-        </defs>
-        {sequence.participants.map(p => {
-          const x = columns[p];
-          return (
-            <g key={p}>
-              <line stroke={ink[700]} strokeDasharray="3 3" strokeWidth={1} x1={x} x2={x} y1={TOP} y2={height - 4} />
-              <rect
-                fill={ink[800]}
-                height={22}
-                rx={6}
-                stroke={ink[600]}
-                width={COLUMN - 40}
-                x={x - (COLUMN - 40) / 2}
-                y={4}
-              />
-              <text fill={ink[50]} fontSize={11.5} fontWeight={700} textAnchor="middle" x={x} y={19}>
-                {p}
-              </text>
-            </g>
-          );
-        })}
-        {sequence.messages.map((m, i) => {
-          const {lines, y} = rows[i];
-          const from = columns[m.from];
-          const to = columns[m.to];
-          const style = KIND_STYLE[m.kind ?? 'sync'];
-          const labelW = Math.max(...lines.map(l => l.length)) * GLYPH + 8;
-          const labelH = LINE * lines.length;
-          if (from === to) {
-            // Self message: a small loop beside the lifeline, the label on the side with room for it.
-            const left = from + 34 + labelW > width;
-            const s = left ? -1 : 1;
-            const tx = left ? from - 34 : from + 34;
+      <SideScroll label="Sequence diagram" minWidth={readableMinWidth(width)}>
+        <svg className="w-full" role="img" style={{maxHeight: 340}} viewBox={`0 0 ${width} ${height}`}>
+          <title>Sequence of calls for this step</title>
+          <defs>
+            <marker id="lb-seq-filled" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
+              <path d="M0 0L8 3.5L0 7z" fill={iris[300]} />
+            </marker>
+            <marker id="lb-seq-open" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
+              <path d="M0 0L8 3.5L0 7" fill="none" stroke={ink[200]} strokeWidth={1.4} />
+            </marker>
+          </defs>
+          {sequence.participants.map(p => {
+            const x = columns[p];
+            return (
+              <g key={p}>
+                <line stroke={ink[700]} strokeDasharray="3 3" strokeWidth={1} x1={x} x2={x} y1={TOP} y2={height - 4} />
+                <rect
+                  fill={ink[800]}
+                  height={22}
+                  rx={6}
+                  stroke={ink[600]}
+                  width={COLUMN - 40}
+                  x={x - (COLUMN - 40) / 2}
+                  y={4}
+                />
+                <text fill={ink[50]} fontSize={11.5} fontWeight={700} textAnchor="middle" x={x} y={19}>
+                  {p}
+                </text>
+              </g>
+            );
+          })}
+          {sequence.messages.map((m, i) => {
+            const {lines, y} = rows[i];
+            const from = columns[m.from];
+            const to = columns[m.to];
+            const style = KIND_STYLE[m.kind ?? 'sync'];
+            const labelW = Math.max(...lines.map(l => l.length)) * GLYPH + 8;
+            const labelH = LINE * lines.length;
+            if (from === to) {
+              // Self message: a small loop beside the lifeline, the label on the side with room for it.
+              const left = from + 34 + labelW > width;
+              const s = left ? -1 : 1;
+              const tx = left ? from - 34 : from + 34;
+              return (
+                <g key={i}>
+                  <path
+                    d={`M${from} ${y - 8} h${28 * s} v14 h${-24 * s}`}
+                    fill="none"
+                    markerEnd={style.marker}
+                    stroke={style.color}
+                    strokeDasharray={style.dash}
+                    strokeWidth={1.4}
+                  />
+                  <text
+                    fill={ink[200]}
+                    fontFamily={MONO}
+                    fontSize={FONT}
+                    textAnchor={left ? 'end' : 'start'}
+                    x={tx}
+                    y={y + 2 - (labelH - LINE) / 2}>
+                    {lines.map((line, k) => (
+                      <tspan dy={k === 0 ? 0 : LINE} key={k} x={tx}>
+                        {line}
+                      </tspan>
+                    ))}
+                  </text>
+                </g>
+              );
+            }
+            const dir = to > from ? 1 : -1;
+            const x1 = from;
+            const x2 = to - dir * 2;
+            const mid = (x1 + x2) / 2;
             return (
               <g key={i}>
-                <path
-                  d={`M${from} ${y - 8} h${28 * s} v14 h${-24 * s}`}
-                  fill="none"
+                <line
                   markerEnd={style.marker}
                   stroke={style.color}
                   strokeDasharray={style.dash}
                   strokeWidth={1.4}
+                  x1={x1}
+                  x2={x2}
+                  y1={y}
+                  y2={y}
+                />
+                <rect
+                  fill={ink[850]}
+                  height={labelH + 2}
+                  rx={3}
+                  width={labelW}
+                  x={mid - labelW / 2}
+                  y={y - 4 - labelH}
                 />
                 <text
                   fill={ink[200]}
                   fontFamily={MONO}
                   fontSize={FONT}
-                  textAnchor={left ? 'end' : 'start'}
-                  x={tx}
-                  y={y + 2 - (labelH - LINE) / 2}>
+                  textAnchor="middle"
+                  x={mid}
+                  y={y - 5 - (labelH - LINE)}>
                   {lines.map((line, k) => (
-                    <tspan dy={k === 0 ? 0 : LINE} key={k} x={tx}>
+                    <tspan dy={k === 0 ? 0 : LINE} key={k} x={mid}>
                       {line}
                     </tspan>
                   ))}
                 </text>
               </g>
             );
-          }
-          const dir = to > from ? 1 : -1;
-          const x1 = from;
-          const x2 = to - dir * 2;
-          const mid = (x1 + x2) / 2;
-          return (
-            <g key={i}>
-              <line
-                markerEnd={style.marker}
-                stroke={style.color}
-                strokeDasharray={style.dash}
-                strokeWidth={1.4}
-                x1={x1}
-                x2={x2}
-                y1={y}
-                y2={y}
-              />
-              <rect fill={ink[850]} height={labelH + 2} rx={3} width={labelW} x={mid - labelW / 2} y={y - 4 - labelH} />
-              <text
-                fill={ink[200]}
-                fontFamily={MONO}
-                fontSize={FONT}
-                textAnchor="middle"
-                x={mid}
-                y={y - 5 - (labelH - LINE)}>
-                {lines.map((line, k) => (
-                  <tspan dy={k === 0 ? 0 : LINE} key={k} x={mid}>
-                    {line}
-                  </tspan>
-                ))}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
+          })}
+        </svg>
+      </SideScroll>
       <div className="text-ink-300 mt-1 flex flex-wrap gap-x-3 px-1 text-[10px]">
         <span className="text-iris-300">— request</span>
         <span className="text-ink-300">- - reply</span>

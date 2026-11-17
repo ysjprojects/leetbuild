@@ -58,6 +58,9 @@ const primaryButton =
 /**
  * Copy the landing page opens with — real text, so it is already in place while the rest loads.
  * Practice comes first: until progress is known (`start` absent), its button goes to the list.
+ * A returning learner (`data-returning` on <html>, set before paint by src/lib/returning.ts) gets
+ * one line, the headline and the actions, so the list starts near the top; the skeleton renders
+ * this same component, so the compact form is there from the first frame.
  */
 export const LandingIntro: FC<{stats?: readonly string[]; start?: LandingStart}> = memo(
   ({stats = ['real systems', '5 languages', 'AI systems', '1337 points'], start}) => (
@@ -66,54 +69,59 @@ export const LandingIntro: FC<{stats?: readonly string[]; start?: LandingStart}>
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(80%_120%_at_0%_0%,rgba(108,76,241,0.18),transparent_60%),radial-gradient(60%_90%_at_100%_0%,rgba(45,212,160,0.10),transparent_55%)]"
       />
-      <div className="relative mx-auto w-full max-w-5xl px-5 pb-8 pt-8">
-        <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="relative mx-auto w-full max-w-5xl px-5 pb-8 pt-8 [[data-returning]_&]:py-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 [[data-returning]_&]:hidden">
           <BrandLockup size="lg" />
           <span className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider">
             Practice
           </span>
         </div>
-        <h1 className="text-ink-50 mt-7 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
-          Practice system design <span className="text-iris-300">by building it.</span>
-        </h1>
-        <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
-          Real services, from a URL shortener to a payment ledger, built one file at a time in the language you
-          interview in, with checks at every step.
-        </p>
-        <div className="mt-5 flex flex-wrap gap-2">
-          {stats.map(stat => (
-            <span
-              className="border-ink-600 bg-ink-850/80 text-ink-200 rounded-full border px-3 py-1 text-[11px] font-semibold"
-              key={stat}>
-              {stat}
-            </span>
-          ))}
-        </div>
-        <div className="mt-5 flex flex-wrap items-center gap-3">
-          {start === undefined ? (
-            <a className={primaryButton} href="#problems">
-              Start practising →
-            </a>
-          ) : (
-            <Link className={primaryButton} href={start.href} title={start.title}>
-              {start.label} →
+        <div className="[[data-returning]_&]:flex [[data-returning]_&]:flex-wrap [[data-returning]_&]:items-center [[data-returning]_&]:justify-between [[data-returning]_&]:gap-x-6 [[data-returning]_&]:gap-y-3">
+          <h1 className="text-ink-50 mt-7 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl [[data-returning]_&]:mt-0 [[data-returning]_&]:text-xl">
+            Practice system design <span className="text-iris-300">by building it.</span>
+          </h1>
+          <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7 [[data-returning]_&]:hidden">
+            Real services, from a URL shortener to a payment ledger, built one file at a time in the language you
+            interview in, with checks at every step.
+          </p>
+          <div className="mt-5 flex flex-wrap gap-2 [[data-returning]_&]:hidden">
+            {stats.map(stat => (
+              <span
+                className="border-ink-600 bg-ink-850/80 text-ink-200 rounded-full border px-3 py-1 text-[11px] font-semibold"
+                key={stat}>
+                {stat}
+              </span>
+            ))}
+          </div>
+          <div className="mt-5 flex flex-wrap items-center gap-3 [[data-returning]_&]:mt-0">
+            {start === undefined ? (
+              <a className={primaryButton} href="#problems">
+                {/* What the real button most likely says, so it keeps its width when progress arrives. */}
+                <span className="[[data-returning]_&]:hidden">Start</span>
+                <span className="hidden [[data-returning]_&]:inline">Continue</span> practising →
+              </a>
+            ) : (
+              <Link className={primaryButton} href={start.href} title={start.title}>
+                {start.label} →
+              </Link>
+            )}
+            {/* On a phone a returning learner has the header's switch for this; the line stays short. */}
+            <Link
+              className="border-iris-400/40 text-iris-300 hover:bg-iris-400/10 rounded-lg border px-4 py-2 text-[13px] font-bold transition [[data-returning]_&]:hidden sm:[[data-returning]_&]:block"
+              href="/mock-interview">
+              AI mock interview →
             </Link>
-          )}
-          <Link
-            className="border-iris-400/40 text-iris-300 hover:bg-iris-400/10 rounded-lg border px-4 py-2 text-[13px] font-bold transition"
-            href="/mock-interview">
-            AI mock interview →
-          </Link>
-          <a
-            className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
-            href="#problems">
-            Browse courses ↓
-          </a>
-          <Link
-            className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
-            href="/guides">
-            Failure-mode guides
-          </Link>
+            <a
+              className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline [[data-returning]_&]:hidden"
+              href="#problems">
+              Browse courses ↓
+            </a>
+            <Link
+              className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
+              href="/guides">
+              Failure-mode guides
+            </Link>
+          </div>
         </div>
       </div>
     </section>
@@ -137,54 +145,43 @@ Bone.displayName = 'Bone';
 const ROW_TITLES = ['w-36', 'w-44', 'w-32', 'w-40', 'w-48', 'w-36', 'w-40'] as const;
 const ROW_TAGLINES = ['w-3/4', 'w-2/3', 'w-4/5', 'w-1/2', 'w-3/4', 'w-2/3', 'w-3/5'] as const;
 
+const TRACK_TABS = ['w-[118px]', 'w-28', 'w-24'] as const;
+
+/** The landing page's shape, box for box (hero, profile strip, toolbar, section header, rows), so the first row lands where it will be. */
 const ProblemListSkeleton: FC = memo(() => (
   <main className="min-h-0 flex-1 overflow-y-auto">
     <LandingIntro />
     <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
-      <section className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3">
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+      <section className="border-ink-700 bg-ink-850 rounded-2xl border px-5 py-4">
+        <div className="flex flex-wrap items-center gap-x-8 gap-y-4">
           <div className="flex items-center gap-3">
             <Bone className="h-[60px] w-[60px] rounded-full" />
             <div className="space-y-1.5">
               <Bone className="h-5 w-28 rounded" />
-              <Bone className="h-3 w-52 rounded" />
+              <Bone className="h-3 w-48 rounded" />
             </div>
           </div>
-          <div className="min-w-[13rem] space-y-1">
-            <span className="flex h-4 items-center justify-between">
+          <div className="w-[13rem] space-y-1">
+            <span className="flex h-[18px] items-center justify-between">
               <Bone className="h-3 w-12 rounded" />
               <Bone className="h-3 w-9 rounded" />
             </span>
             {[0, 1, 2].map(i => (
-              <span className="flex h-4 items-center gap-2" key={i}>
+              <span className="flex h-[18px] items-center gap-2" key={i}>
                 <Bone className="h-3 w-9 rounded" />
-                <Bone className="h-1.5 flex-1 rounded-full" />
+                <Bone className="h-2 flex-1 rounded-full" />
                 <Bone className="h-3 w-9 rounded" />
               </span>
             ))}
           </div>
           <div className="flex items-center gap-2">
             <Bone className="h-[18px] w-[18px] rounded-md" />
-            <div className="space-y-1.5">
-              <Bone className="h-3.5 w-24 rounded" />
-              <Bone className="h-2.5 w-32 rounded" />
+            <div className="space-y-2">
+              <Bone className="h-4 w-28 rounded" />
+              <Bone className="h-6 w-56 rounded-lg" />
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Bone className="h-[18px] w-[18px] rounded-md" />
-            <div className="space-y-1.5">
-              <Bone className="h-3.5 w-24 rounded" />
-              <Bone className="h-2.5 w-28 rounded" />
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Bone className="h-[18px] w-[18px] rounded-md" />
-            <div className="space-y-1.5">
-              <Bone className="h-3.5 w-24 rounded" />
-              <Bone className="h-2.5 w-28 rounded" />
-            </div>
-          </div>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex h-11 items-center gap-2">
             <Bone className="h-6 w-6 rounded-full" />
             <div className="space-y-1.5">
               <Bone className="h-3.5 w-24 rounded" />
@@ -192,22 +189,39 @@ const ProblemListSkeleton: FC = memo(() => (
             </div>
           </div>
         </div>
-        <div className="border-ink-700/70 mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-t pt-2.5">
-          {[0, 1, 2, 3].map(i => (
-            <div className="flex min-w-[9rem] flex-1 items-center gap-2" key={i}>
-              <Bone className="h-3 w-10 rounded" />
-              <Bone className="h-1.5 flex-1 rounded-full" />
+        <div className="border-ink-700/70 mt-3 flex flex-wrap items-center gap-x-6 gap-y-2 border-t pt-2.5">
+          {[0, 1].map(i => (
+            <div className="flex h-[18px] min-w-[11rem] flex-1 items-center gap-2.5" key={i}>
+              <Bone className="h-3 w-14 rounded" />
+              <Bone className="h-2 flex-1 rounded-full" />
               <Bone className="h-3 w-9 rounded" />
             </div>
           ))}
-          <Bone className="ml-auto h-3 w-12 rounded" />
+          <Bone className="ml-auto h-[22px] w-12 rounded-md" />
         </div>
       </section>
       <section>
-        <p className="text-iris-300 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
-        <ul className="space-y-2">
+        <div className="mb-3 space-y-3">
+          <div className="flex flex-wrap gap-2">
+            {TRACK_TABS.map(width => (
+              <Bone className={`h-9 rounded-full ${width}`} key={width} />
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Bone className="h-10 w-full rounded-full sm:w-80" />
+            <Bone className="h-10 w-10 shrink-0 rounded-full" />
+            <Bone className="h-10 w-10 shrink-0 rounded-full" />
+            <Bone className="ml-auto h-4 w-24 rounded" />
+          </div>
+        </div>
+        <span className="flex h-[31px] items-center gap-2 pb-0.5">
+          <Bone className="h-3.5 w-28 rounded" />
+          <Bone className="h-4 w-6 rounded-full" />
+          <Bone className="hidden h-3 w-56 rounded sm:block" />
+        </span>
+        <ul className="space-y-2.5">
           {ROW_TITLES.map((title, i) => (
-            <li className="border-ink-700 bg-ink-850 flex items-center gap-3 rounded-xl border px-4 py-3" key={i}>
+            <li className="border-ink-700 bg-ink-850 flex items-center gap-3 rounded-xl border px-4 py-3.5" key={i}>
               <Bone className="h-7 w-7 rounded-full" />
               <span className="min-w-0 flex-1">
                 <span className="flex h-[21px] items-center gap-2">
@@ -215,10 +229,10 @@ const ProblemListSkeleton: FC = memo(() => (
                   <Bone className="h-4 w-12 rounded-full" />
                   <Bone className="h-4 w-14 rounded-full" />
                 </span>
-                <span className="mt-0.5 flex h-[18px] items-center">
+                <span className="mt-1 flex h-5 items-center">
                   <Bone className={`h-3 rounded ${ROW_TAGLINES[i]}`} />
                 </span>
-                <span className="mt-2 flex h-[17px] items-center gap-3">
+                <span className="mt-2 flex h-[18px] items-center gap-3">
                   <Bone className="h-2.5 w-16 rounded-sm" />
                   <Bone className="h-2.5 w-14 rounded" />
                   <Bone className="h-2.5 w-12 rounded" />
@@ -394,10 +408,12 @@ export const LoadingScreen: FC<{phase: LoadingPhase; problemId: string | null; o
       <div
         aria-busy={onRetry === undefined}
         className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
-        <header className="border-ink-700 bg-ink-950/60 flex shrink-0 items-center gap-x-4 border-b px-3 py-2">
+        <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2">
           <div className="flex items-center gap-2">
             <BrandLockup />
           </div>
+          {/* The Practice / AI mock interview switch. */}
+          <Bone className="h-9 w-28 rounded-full sm:w-[13.5rem]" />
           <div className="ml-auto flex items-center gap-2">
             <Bone className="h-6 w-24 rounded-md" />
             <Bone className="h-6 w-16 rounded-full" />
@@ -407,8 +423,8 @@ export const LoadingScreen: FC<{phase: LoadingPhase; problemId: string | null; o
             <Bone className="h-7 w-7 rounded-full" />
           </div>
         </header>
-        {/* Progress by phase, short of full until the real thing replaces the screen. */}
-        <div aria-hidden className="bg-ink-800 h-0.5 shrink-0">
+        {/* Progress by phase, short of full until the real thing replaces the screen; drawn over the page's top edge so it takes no room. */}
+        <div aria-hidden className="bg-ink-800 relative z-10 -mb-0.5 h-0.5 shrink-0">
           <div
             className="lb-progress bg-iris-400 h-full"
             style={{width: `${Math.round((index / (total + 0.4)) * 100)}%`}}

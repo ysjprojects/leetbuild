@@ -86,7 +86,7 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
           type="button">
           {playing ? '❚❚' : '▶'}
         </button>
-        <button aria-label="reset" className={BUTTON_CLASS} onClick={onReset} type="button">
+        <button aria-label="Reset" className={BUTTON_CLASS} onClick={onReset} title="Reset" type="button">
           ↺
         </button>
       </>

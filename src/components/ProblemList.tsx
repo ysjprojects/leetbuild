@@ -1,5 +1,6 @@
 import Link from 'next/link';
-import {type FC, memo, useCallback, useId, useMemo, useState} from 'react';
+import {useRouter} from 'next/router';
+import {type FC, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState} from 'react';
 
 import {
   type CourseKind,
@@ -15,6 +16,8 @@ import {
 } from '@/lib/catalog';
 import {type NextPick, type Streak, activityByDay, badgeProgress, BADGES, nextPick} from '@/lib/gamify';
 import {useListQuery} from '@/lib/listQuery';
+import {LIST_ROOT_ID, rememberListView, restoreListView} from '@/lib/listReturn';
+import {rememberReturning} from '@/lib/returning';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
 import {type Difficulty, type ProblemSummary, ALL_LANGUAGES, stepKey, stepPath} from '@/lib/types';
@@ -611,7 +614,26 @@ const ProblemList: FC<{
   sessions: readonly TimedSession[];
 }> = memo(({problems, attempts, profile, streak, badges, activeDays, today, sessions}) => {
   const [query, update, reset] = useListQuery();
+  const router = useRouter();
   const shown = useMemo(() => applyListQuery(problems, attempts, query), [problems, attempts, query]);
+  // The way back: every navigation off the list (a row, the header, Back) and a reload keep its query
+  // and scroll; mounting on that view again, once the query is read, puts the scroll back before paint.
+  useEffect(() => {
+    router.events.on('routeChangeStart', rememberListView);
+    window.addEventListener('pagehide', rememberListView);
+    return () => {
+      router.events.off('routeChangeStart', rememberListView);
+      window.removeEventListener('pagehide', rememberListView);
+    };
+  }, [router.events]);
+  const restored = useRef(false);
+  useLayoutEffect(() => {
+    if (!router.isReady || restored.current) return;
+    restored.current = true;
+    restoreListView();
+  }, [router.isReady]);
+  // The next visit opens on the compact hero once there is progress (src/lib/returning.ts).
+  useEffect(() => rememberReturning({submissions: profile.submissions, attempts}), [profile.submissions, attempts]);
   const numbers = useMemo(() => new Map(problems.map((p, i) => [p.id, i])), [problems]);
   // In the catalogue order, the rows fall into sections by kind, in the order each kind first appears;
   // other sorts mix the kinds, and a single kind needs no header.
@@ -655,7 +677,7 @@ const ProblemList: FC<{
     [problems, profile.max],
   );
   return (
-    <div className="w-full">
+    <div className="w-full" id={LIST_ROOT_ID}>
       <LandingIntro
         start={
           next === null

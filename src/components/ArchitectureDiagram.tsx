@@ -17,6 +17,7 @@ import {scrollBehavior} from '@/lib/motion';
 import {alpha, concept, danger, ink, iris} from '@/styles/palette';
 
 import {InlineMarkdown} from './Markdown';
+import {readableMinWidth, SideScroll} from './widgets/frame';
 
 /**
  * A model or kernel drawn as a stack of layers read bottom to top (see lib/architecture.ts for the
@@ -275,7 +276,7 @@ const ArchitectureDiagram: FC<{
   const svg = (
     <svg
       className="block"
-      role="img"
+      role={details.size > 0 ? 'group' : 'img'}
       style={{
         width: '100%',
         maxWidth: layout.width * (compact ? 1 : 1.08),
@@ -443,14 +444,24 @@ const ArchitectureDiagram: FC<{
           ) : null}
         </div>
       ) : null}
-      <div className={compact ? 'max-h-[360px] overflow-y-auto' : undefined} ref={scroller}>
-        <div className="relative mx-auto" style={{maxWidth: layout.width * (compact ? 1 : 1.08)}}>
-          {svg}
-          {tooltip}
+      {compact ? (
+        // In the pane the stack scrolls down past 360 px, and sideways on a phone rather than shrink.
+        <div className="max-h-[360px] overflow-auto" ref={scroller}>
+          <div className="relative mx-auto" style={{maxWidth: layout.width, minWidth: readableMinWidth(layout.width)}}>
+            {svg}
+            {tooltip}
+          </div>
         </div>
-      </div>
+      ) : (
+        <SideScroll centered label="Architecture figure" minWidth={readableMinWidth(layout.width)}>
+          <div className="relative mx-auto" style={{maxWidth: layout.width * 1.08}}>
+            {svg}
+            {tooltip}
+          </div>
+        </SideScroll>
+      )}
       <p className="text-ink-400 mt-1 px-1 text-[10px]">
-        read bottom to top · hover a box marked with a dot for what it computes
+        read bottom to top · hover or tab to a box marked with a dot for what it computes
       </p>
     </div>
   );

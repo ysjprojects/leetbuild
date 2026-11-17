@@ -228,7 +228,7 @@ const Roofline: FC<WidgetProps> = memo(() => {
 
   return (
     <WidgetFrame controls={controls} readout={readout} title="roofline model">
-      <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
+      <svg className="w-full" role="group" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>{`Roofline of ${gpu.name}: attainable FLOP/s against arithmetic intensity, with six kernels placed by intensity`}</title>
         <g fontFamily={MONO} fontSize={9}>
           {X_TICKS.map(([v, label]) => (

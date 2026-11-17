@@ -20,12 +20,13 @@ import {cpus, tmpdir, totalmem} from 'node:os';
 import {join, resolve} from 'node:path';
 
 import {GUIDE_CONTENT} from '../src/data/guides';
+import {CHECK_SECTIONS, GUIDE_HEADINGS} from '../src/data/guides/checkSections';
 import {GUIDES} from '../src/data/guides/meta';
 import {architectureProblems} from '../src/lib/architecture';
-import {guidePath, GUIDES_PATH, learnPath} from '../src/lib/export';
+import {githubSlug, guidePath, GUIDES_PATH, learnPath} from '../src/lib/export';
 import {gpuProblems} from '../src/lib/gpuFigure';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
-import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
+import {malformedBlocksOf, parseBlocks, widgetsOf} from '../src/lib/markdown';
 import {CLANG_VERSION, CPP_UNSUPPORTED, cppSupported} from '../src/lib/runtime/cpp/support';
 import {stepJob} from '../src/lib/runtime/job';
 import {
@@ -38,6 +39,7 @@ import {
 import {type RunResult} from '../src/lib/runtime/types';
 import {STEP_POINTS} from '../src/lib/scoring';
 import {
+  type GuideId,
   type Language,
   type Problem,
   type Step,
@@ -711,6 +713,41 @@ function verifyGuides(problems: Problem[]): string[] {
   return errors;
 }
 
+/**
+ * The check-to-guide-section map (src/data/guides/checkSections): every key names a real course, step
+ * and check, and each of its one or two sections is a heading of one of that step's guides.
+ * `GUIDE_HEADINGS`, the labels the links carry, must be the guides' headings.
+ */
+function verifyCheckSections(problems: Problem[]): string[] {
+  const errors: string[] = [];
+  const headings = new Map(
+    GUIDE_IDS.map(id => [
+      id,
+      parseBlocks(GUIDE_CONTENT[id].guide).flatMap(block => (block.kind === 'heading' ? [block.text] : [])),
+    ]),
+  );
+  for (const id of GUIDE_IDS)
+    if (JSON.stringify(GUIDE_HEADINGS[id]) !== JSON.stringify(headings.get(id)))
+      errors.push(`checkSections GUIDE_HEADINGS.${id} differs from the guide's headings: copy them from the guide`);
+  for (const [key, sections] of Object.entries(CHECK_SECTIONS)) {
+    const [problemId, stepId, checkId] = key.split('/');
+    const step = problems.find(p => p.id === problemId)?.steps.find(s => s.id === stepId);
+    if (step?.checks.some(c => c.id === checkId) !== true) {
+      errors.push(`checkSections ${key}: no such course, step or check`);
+      continue;
+    }
+    if (sections.length === 0 || sections.length > 2) errors.push(`checkSections ${key}: one or two sections`);
+    for (const section of sections) {
+      const [guide, anchor] = section.split('#');
+      if (!step.guides?.includes(guide as GuideId))
+        errors.push(`checkSections ${key}: ${guide} is not one of the step's guides`);
+      else if (!(headings.get(guide as GuideId) ?? []).some(heading => githubSlug(heading) === anchor))
+        errors.push(`checkSections ${key}: ${section} is no heading of the guide`);
+    }
+  }
+  return errors;
+}
+
 /** The committed course summaries and module map must be what the courses render to (`yarn build:summaries`). */
 async function summariesFreshness(): Promise<string[]> {
   const rendered = await renderSummaries();
@@ -874,8 +911,8 @@ async function main(): Promise<void> {
     const stale = await summariesFreshness();
     console.log(`${stale.length === 0 ? '✓' : '✗'} course summaries and modules built from these courses`);
     errors.push(...stale);
-    const guides = verifyGuides(problems);
-    console.log(`${guides.length === 0 ? '✓' : '✗'} failure-mode guides`);
+    const guides = [...verifyGuides(problems), ...verifyCheckSections(problems)];
+    console.log(`${guides.length === 0 ? '✓' : '✗'} failure-mode guides and the sections checks link to`);
     errors.push(...guides);
   }
   errors.push(

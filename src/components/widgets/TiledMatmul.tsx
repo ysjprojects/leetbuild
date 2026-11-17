@@ -2,7 +2,7 @@ import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 're
 
 import {alpha, ink, iris, success, warning} from '@/styles/palette';
 
-import WidgetFrame, {tabClass} from './frame';
+import WidgetFrame, {clickOnKey, tabClass} from './frame';
 import type {WidgetProps} from './index';
 import PlaybackControls, {usePlayback} from './playback';
 
@@ -184,7 +184,7 @@ const TiledMatmul: FC<WidgetProps> = memo(() => {
   const barW = WIDTH - PX - 10;
   return (
     <WidgetFrame controls={controls} readout={readout} title="tiled matmul: shared-memory tiles over the K slabs">
-      <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
+      <svg className="w-full" role="group" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>{`C = A·B with ${tile}×${tile} tiles, output tile (${row}, ${col}), ${
           storing ? 'stored' : `slab ${step + 1} of ${GRID}`
         }`}</title>
@@ -215,6 +215,7 @@ const TiledMatmul: FC<WidgetProps> = memo(() => {
           return (
             <rect
               aria-label={`output tile row ${r} column ${c}`}
+              aria-pressed={on}
               className="cursor-pointer"
               data-c={c}
               data-r={r}
@@ -222,9 +223,11 @@ const TiledMatmul: FC<WidgetProps> = memo(() => {
               height={CELL}
               key={`${r}-${c}`}
               onClick={onPick}
+              onKeyDown={clickOnKey}
               role="button"
               stroke={on ? success[400] : ink[600]}
               strokeWidth={on ? 1.5 : 0.6}
+              tabIndex={0}
               width={CELL}
               x={CX + c * CELL}
               y={CY + r * CELL}>

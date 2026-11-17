@@ -190,7 +190,12 @@ const Sampling: FC<WidgetProps> = memo(() => {
         <button className={BUTTON_CLASS} onClick={onHundred} type="button">
           Sample ×100
         </button>
-        <button aria-label="clear samples" className={BUTTON_CLASS} onClick={onReset} type="button">
+        <button
+          aria-label="Clear samples"
+          className={BUTTON_CLASS}
+          onClick={onReset}
+          title="Clear samples"
+          type="button">
           ↺
         </button>
       </>

@@ -1,5 +1,6 @@
 import {Head, Html, Main, NextScript} from 'next/document';
 
+import {RETURNING_BOOT_SCRIPT} from '@/lib/returning';
 import {THEME_BOOT_SCRIPT} from '@/lib/theme';
 import {night} from '@/styles/palette';
 
@@ -19,6 +20,8 @@ export default function Document() {
         <link href="/site.webmanifest" rel="manifest" />
         {/* Picks Night or Day before the first paint: a saved choice, else the OS preference (src/lib/theme.ts). */}
         <script dangerouslySetInnerHTML={{__html: THEME_BOOT_SCRIPT}} />
+        {/* Marks a returning learner (`data-returning`) before the first paint, so the landing hero is compact from the first frame (src/lib/returning.ts). */}
+        <script dangerouslySetInnerHTML={{__html: RETURNING_BOOT_SCRIPT}} />
         {/* Google Translate rewrites the DOM under React's feet: https://github.com/facebook/react/issues/11538 */}
         <meta content="notranslate" name="google" />
       </Head>

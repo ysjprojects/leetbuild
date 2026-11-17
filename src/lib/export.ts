@@ -9,6 +9,7 @@ import {night} from '@/styles/palette';
 
 import {type Architecture, architectureToMermaid} from './architecture';
 import {type GpuFigure, gpuToMermaid} from './gpuFigure';
+import {quizOptionLine} from './markdown';
 import {
   type Diagram,
   type GuideId,
@@ -137,13 +138,16 @@ export function blocksToMarkdown(markdown: string): string {
       const prompt: string[] = [];
       const options: string[] = [];
       const explanation: string[] = [];
+      const reasons: string[] = [];
       let answer = '';
       for (const raw of body.split('\n')) {
         const line = raw.trim();
-        const option = /^-\s*\[( |x|X)\]\s*(.*)$/.exec(line);
+        const option = quizOptionLine(line);
         if (option !== null) {
-          options.push(`- [ ] ${option[2]}`);
-          if (option[1] !== ' ') answer = option[2];
+          const letter = String.fromCharCode(65 + options.length);
+          options.push(`- [ ] ${option.text}`);
+          if (option.correct) answer = option.text;
+          if (option.reason !== '') reasons.push(`- **${letter}.** ${option.reason}`);
         } else if (line.startsWith('>')) explanation.push(line.replace(/^>\s?/, ''));
         else if (line.startsWith('Q:')) prompt.push(line.slice(2).trim());
         else if (line !== '') prompt.push(line);
@@ -157,6 +161,7 @@ export function blocksToMarkdown(markdown: string): string {
         `<summary>Answer</summary>`,
         ``,
         `**${answer}** — ${explanation.join(' ')}`,
+        ...(reasons.length === 0 ? [] : ['', ...reasons]),
         ``,
         `</details>`,
         ``,

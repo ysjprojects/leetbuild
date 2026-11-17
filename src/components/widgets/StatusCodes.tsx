@@ -1,8 +1,8 @@
-import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
+import {type FC, type FocusEvent, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
 import {alpha, danger, ink, iris, success, warning} from '@/styles/palette';
 
-import WidgetFrame from './frame';
+import WidgetFrame, {clickOnKey} from './frame';
 import type {WidgetProps} from './index';
 
 type Retry = 'never' | 'backoff' | 'retry-after' | 'n/a';
@@ -198,6 +198,10 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
     setHovered(findStatus((e.target as SVGElement).getAttribute('data-code')));
   }, []);
   const onLeave = useCallback(() => setHovered(null), []);
+  // A code in keyboard focus reads out like a hovered one; Enter or Space pins it like a click.
+  const onFocus = useCallback((e: FocusEvent<SVGRectElement>) => {
+    setHovered(findStatus(e.currentTarget.getAttribute('data-code')));
+  }, []);
   const onClick = useCallback((e: MouseEvent<SVGRectElement>) => {
     const hit = findStatus(e.currentTarget.getAttribute('data-code'));
     setPinned(prev => (hit === null || prev === hit ? null : hit));
@@ -207,7 +211,7 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
   const readout = useMemo(
     () =>
       active === null ? (
-        'Pick the family first (success, client error, server error), then the most specific code in it: clients branch on the family, humans and logs branch on the code. Hover or click a code.'
+        'Pick the family first (success, client error, server error), then the most specific code in it: clients branch on the family, humans and logs branch on the code. Hover, click or tab to a code.'
       ) : (
         <>
           <b className="text-ink-100">
@@ -222,7 +226,12 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
 
   return (
     <WidgetFrame readout={readout} title="which status code">
-      <svg className="w-full" onMouseLeave={onLeave} onMouseOver={onOver} role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
+      <svg
+        className="w-full"
+        onMouseLeave={onLeave}
+        onMouseOver={onOver}
+        role="group"
+        viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>HTTP status codes a service uses, grouped by family, with retry guidance</title>
         {FAMILIES.map((family, fi) => {
           const x = 4 + fi * (COL_W + COL_GAP);
@@ -239,15 +248,20 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
                   <g key={s.code}>
                     <rect
                       aria-label={`${s.code} ${s.name}`}
+                      aria-pressed={isPinned}
                       className="cursor-pointer"
                       data-code={s.code}
                       fill={on ? SELECTED_FILL : ink[700]}
                       height={CELL_H}
+                      onBlur={onLeave}
                       onClick={onClick}
+                      onFocus={onFocus}
+                      onKeyDown={clickOnKey}
                       role="button"
                       rx={5}
                       stroke={on ? iris[400] : isPinned ? iris[200] : 'none'}
                       strokeWidth={0.75}
+                      tabIndex={0}
                       width={COL_W}
                       x={x}
                       y={y}>

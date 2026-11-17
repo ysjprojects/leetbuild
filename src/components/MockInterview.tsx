@@ -2,6 +2,7 @@ import Link from 'next/link';
 import Router, {useRouter} from 'next/router';
 import {
   type ChangeEvent,
+  type CSSProperties,
   type FC,
   memo,
   useCallback,
@@ -12,33 +13,57 @@ import {
   useState,
 } from 'react';
 
+import {GUIDES} from '@/data/guides/meta';
 import {
   type ListedMockScenario,
   type ResolvedMockScenario,
   listedMockScenarios,
   resolveMockScenario,
 } from '@/data/mock';
-import {type Verdict, commonMessage, judge, withRuntime} from '@/lib/judge';
+import {type CheckResult, type Verdict, commonMessage, judge, withRuntime} from '@/lib/judge';
 import {
+  type MockAttempt,
+  type MockLayout,
   type MockMessage,
   type MockSession,
+  bestAttempt,
   clearMockSession,
+  DEFAULT_MOCK_LAYOUT,
+  loadMockHistory,
+  loadMockLayout,
   loadMockSession,
+  MOCK_LAYOUT_BOUNDS,
+  recordMockAttempt,
+  saveMockLayout,
   saveMockSession,
   secondsLeftAt,
 } from '@/lib/mockSession';
+import {scrollBehavior} from '@/lib/motion';
 import {type RuntimeStatus, getRunner, runtimeHarness, STATUS_TEXT} from '@/lib/runtime/client';
 import {stepJob} from '@/lib/runtime/job';
 import {formatClock} from '@/lib/timer';
-import {type Difficulty, type Language, codeFor, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
+import {
+  type Difficulty,
+  type Language,
+  type Step,
+  codeFor,
+  CONCEPT_LABEL,
+  DIFFICULTIES,
+  fileName,
+  LANGUAGE_LABEL,
+  LANGUAGES,
+  stepPath,
+} from '@/lib/types';
 
 import {useDialog} from './Dialog';
+import {EditorSettingsForm, GearIcon} from './EditorSettings';
 import {SearchIcon} from './ListControls';
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
 import ModeSwitch from './ModeSwitch';
-import {DifficultyChip, ghostButtonClass, LANGUAGE_OPTIONS, ShapeNote} from './paneShared';
-import {Select} from './Select';
+import {DifficultyChip, ghostButtonClass, ShapeNote} from './paneShared';
+import {type SelectOption, Select} from './Select';
+import SplitGutter from './SplitGutter';
 import StepEditor from './StepEditor';
 
 /** `ready` is the scenario page with the clock not yet running, behind the start dialog. */
@@ -79,6 +104,56 @@ const grade = async (scenario: ResolvedMockScenario, language: Language, code: s
   const runner = getRunner(language);
   if (runtimeHarness(scenario.step, language) === undefined || runner === null) return verdict;
   return withRuntime(verdict, await runner.run(stepJob(scenario.problem, scenario.step, language, code)));
+};
+
+/** `1 hint`, `2 hints`: the report's counts, as the notes and the history say them. */
+const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** The editor's narrowest width on wide screens, in pixels: past it a gutter stops. */
+const EDITOR_MIN_PX = 380;
+
+/** A side pane's share of the workspace `width`, within its bounds and leaving the editor its minimum beside `other`. */
+const clampShare = (share: number, other: number, width: number): number => {
+  const max = Math.min(MOCK_LAYOUT_BOUNDS.max, 1 - other - EDITOR_MIN_PX / width);
+  return Math.min(Math.max(share, MOCK_LAYOUT_BOUNDS.min), Math.max(MOCK_LAYOUT_BOUNDS.min, max));
+};
+
+/**
+ * The language picker's options for `step`: a language Submit cannot run here (Scala, C++ without
+ * WebAssembly stack switching) is graded by reading the code, and its label says so.
+ */
+const languageOptions = (step: Step): SelectOption[] =>
+  LANGUAGES.map(language => ({
+    value: language,
+    label:
+      runtimeHarness(step, language) === undefined
+        ? `${LANGUAGE_LABEL[language]} (read, not run)`
+        : LANGUAGE_LABEL[language],
+  }));
+
+/**
+ * The flaws "What's missing?" names, one per click: the checks the patch fails in the scenario's
+ * own language (a course's starter "hides N flaws", N its failing checks), every check if the
+ * matchers miss them all.
+ */
+const flawsOf = (scenario: ResolvedMockScenario): CheckResult[] => {
+  const {results} = judge(
+    scenario.step,
+    scenario.defaultLanguage,
+    codeFor(scenario.step, scenario.defaultLanguage).starter,
+  );
+  const failing = results.filter(result => !result.passed);
+  return failing.length > 0 ? failing : results;
+};
+
+/** What each signal on a card means: the picker's legend and every chip's tooltip. */
+const SIGNAL_MEANING: Record<string, string> = {
+  Specify: 'Turn the brief into exact requirements: limits, status codes, what done means.',
+  Delegate: 'Split the work: what runs in parallel, what each part owns, what comes back.',
+  Verify: 'Prove the fix with a test that fails on the patch and passes after it.',
+  Evaluate: 'Judge model or ranking output against a measure, not by eye.',
+  Secure: 'Keep tenants, secrets and untrusted input where they belong.',
+  Operate: 'Keep it running under load and failure: deadlines, retries, expiry, cost.',
 };
 
 /** A grading under way: the language's runtime booting (a download the first time), then the checks running. */
@@ -146,9 +221,10 @@ RuntimeBadge.displayName = 'RuntimeBadge';
 
 /**
  * A compact pass/fail list, used both while the clock runs and in the report: for a failed check,
- * what the run observed, then what the check is for.
+ * what the run observed, then what the check is for. A verdict with no run read the code instead,
+ * and says so: there, passing means the code has the expected shape, not that it works.
  */
-const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, title}) => {
+const CheckResults: FC<{verdict: Verdict; title: string; language: Language}> = memo(({verdict, title, language}) => {
   const common = commonMessage(verdict);
   return (
     <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
@@ -158,6 +234,12 @@ const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, titl
           {verdict.passed}/{verdict.total} checks
         </span>
       </p>
+      {verdict.run === undefined ? (
+        <p className="border-warning-400/40 bg-warning-400/10 text-warning-300 mt-2 rounded-lg border px-2.5 py-1.5 text-[11px] leading-5">
+          Checked by reading the code, not by running it: {LANGUAGE_LABEL[language]} does not run in this browser. A
+          pass means the code has the expected shape, not that it works.
+        </p>
+      ) : null}
       {common !== null ? (
         <p className="font-code text-danger-200 mt-2 text-[11px] leading-5">
           {verdict.run?.error !== undefined ? `Could not run: ${common}` : common}
@@ -190,7 +272,9 @@ const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, titl
 CheckResults.displayName = 'CheckResults';
 
 const SignalChip: FC<{signal: string}> = memo(({signal}) => (
-  <span className="border-danger-400/30 bg-danger-400/[0.08] text-danger-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
+  <span
+    className="border-danger-400/30 bg-danger-400/[0.08] text-danger-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold"
+    title={SIGNAL_MEANING[signal]}>
     {signal}
   </span>
 ));
@@ -211,6 +295,16 @@ const Sealed: FC<{note: string; lines: number}> = memo(({note, lines}) => (
   </div>
 ));
 Sealed.displayName = 'Sealed';
+
+const MOCK_LINK = 'text-danger-300 underline decoration-danger-400/40 underline-offset-2 hover:text-danger-200';
+
+/** Marks an AI pair action that counts as a hint in the report. */
+const HintTag: FC = memo(() => (
+  <span className="rounded border border-current px-1 text-[9px] font-bold uppercase leading-[14px] tracking-wider opacity-80">
+    hint
+  </span>
+));
+HintTag.displayName = 'HintTag';
 
 const MOCK_PRIMARY =
   'rounded-lg bg-danger-400 px-3 py-1.5 text-[12px] font-semibold text-ink-950 transition hover:bg-danger-300 disabled:cursor-not-allowed disabled:opacity-30';
@@ -247,43 +341,101 @@ const DIFFICULTY_ACCENT: Record<Difficulty, {rail: string; number: string; hover
 /** The six signals the scenarios are tagged with, in the order the picker lists them. */
 const SIGNALS = ['Specify', 'Delegate', 'Verify', 'Evaluate', 'Secure', 'Operate'] as const;
 
-const signalChip = (on: boolean): string =>
+const DIFFICULTY_LABEL: Record<Difficulty, string> = {easy: 'Easy', medium: 'Medium', hard: 'Hard'};
+
+const filterChip = (on: boolean): string =>
   `rounded-full px-3 py-1 text-[12px] font-semibold transition ${
     on ? 'bg-danger-400 text-ink-950' : 'bg-ink-800 text-ink-200 hover:bg-ink-700 hover:text-ink-50'
   }`;
 
-const SignalToggle: FC<{signal: string; on: boolean; toggle: (signal: string) => void}> = memo(
-  ({signal, on, toggle}) => {
-    const onClick = useCallback(() => toggle(signal), [toggle, signal]);
-    return (
-      <button aria-pressed={on} className={signalChip(on)} onClick={onClick} type="button">
-        {signal}
-      </button>
-    );
-  },
-);
-SignalToggle.displayName = 'SignalToggle';
+/** A filter chip with how many scenarios carry its value; `title` says what the value means. */
+const FilterToggle: FC<{
+  value: string;
+  label: string;
+  count: number;
+  on: boolean;
+  title?: string;
+  toggle: (value: string) => void;
+}> = memo(({value, label, count, on, title, toggle}) => {
+  const onClick = useCallback(() => toggle(value), [toggle, value]);
+  return (
+    <button aria-pressed={on} className={filterChip(on)} onClick={onClick} title={title} type="button">
+      {label} <span className={`font-code ${on ? '' : 'text-ink-400'}`}>{count}</span>
+    </button>
+  );
+});
+FilterToggle.displayName = 'FilterToggle';
 
-/** Words of the search, lower-cased, against title, brief, role, signals and the course the scenario comes from. */
-const matchesScenario = (scenario: ListedMockScenario, q: string): boolean => {
-  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return true;
-  const text = [scenario.title, scenario.blurb, scenario.role, scenario.problem.title, ...scenario.signals]
-    .join('\n')
-    .toLowerCase();
-  return words.every(w => text.includes(w));
+/** Search words the scenarios never use, and the word they use for the same thing. */
+const SEARCH_ALIASES: Record<string, string> = {postgres: 'sql', postgresql: 'sql', mysql: 'sql', sqlite: 'sql'};
+
+/**
+ * What the search reads, lower-cased. `own`: the scenario and the step it practises (brief, flaws,
+ * test idea, follow-ups, the step's title and technology, the course's name). `course`: the course
+ * around it (its one-liner and the technologies all its steps use).
+ */
+interface SearchEntry {
+  own: string;
+  course: string;
+}
+
+const searchEntry = (scenario: ListedMockScenario): SearchEntry => {
+  const step = scenario.problem.steps.find(s => s.id === scenario.stepId);
+  return {
+    own: [
+      scenario.title,
+      scenario.blurb,
+      scenario.role,
+      scenario.prompt,
+      scenario.aiNote,
+      scenario.testIdea,
+      ...scenario.followUps,
+      ...scenario.signals,
+      scenario.problem.title,
+      step?.title ?? '',
+      step === undefined ? '' : `${step.concept} ${CONCEPT_LABEL[step.concept]}`,
+    ]
+      .join('\n')
+      .toLowerCase(),
+    course: [scenario.problem.tagline, ...scenario.problem.concepts.map(c => `${c} ${CONCEPT_LABEL[c]}`)]
+      .join('\n')
+      .toLowerCase(),
+  };
+};
+
+/** A search word (or its alias) at the start of a word, so `lua` finds Lua and not "evaluate". */
+const wordPattern = (word: string): RegExp => {
+  const alias = SEARCH_ALIASES[word];
+  const terms = (alias === undefined ? [word] : [word, alias]).map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp(`(?:^|[^a-z0-9])(?:${terms.join('|')})`);
+};
+
+/**
+ * How well a scenario matches the search: -1 when a word is in neither its own text nor its
+ * course's, else how many words its own text holds, so the scenarios about a technology come
+ * before those whose course merely uses it.
+ */
+const searchRank = (entry: SearchEntry, patterns: readonly RegExp[]): number => {
+  let own = 0;
+  for (const pattern of patterns) {
+    if (pattern.test(entry.own)) own += 1;
+    else if (!pattern.test(entry.course)) return -1;
+  }
+  return own;
 };
 
 /**
  * One scenario: the whole card starts it. The course it comes from sits above the title, so a wall
- * of cards still reads. `busy` while the course is on its way.
+ * of cards still reads. `busy` while the course is on its way; `best`, the best attempt kept here.
  */
 const ScenarioCard: FC<{
   scenario: ListedMockScenario;
   number: number;
   busy: boolean;
+  best: MockAttempt | null;
+  tries: number;
   onStart: (s: ListedMockScenario) => void;
-}> = memo(({scenario, number, busy, onStart}) => {
+}> = memo(({scenario, number, busy, best, tries, onStart}) => {
   const accent = DIFFICULTY_ACCENT[scenario.problem.difficulty];
   const onClick = useCallback(() => onStart(scenario), [onStart, scenario]);
   return (
@@ -308,6 +460,18 @@ const ScenarioCard: FC<{
           <SignalChip key={signal} signal={signal} />
         ))}
       </span>
+      {best !== null ? (
+        <span className="font-code mt-3 block text-[11px]">
+          <span className={best.accepted ? 'text-success-300' : 'text-ink-300'}>
+            Best {best.passed}/{best.total} in {formatClock(best.seconds)}
+            {best.read === true ? ' (read, not run)' : ''}
+          </span>
+          <span className="text-ink-400">
+            {' '}
+            · {tries} {tries === 1 ? 'attempt' : 'attempts'}
+          </span>
+        </span>
+      ) : null}
       <span className="border-ink-700/70 mt-3 flex w-full items-center justify-between border-t pt-2.5 text-[11px]">
         <span className="text-ink-400 truncate">{scenario.role}</span>
         <span className="text-danger-300 group-hover:text-danger-200 font-code shrink-0 font-semibold transition">
@@ -340,6 +504,8 @@ const ScenarioBrief: FC<{
     },
     [onLanguage],
   );
+  const options = useMemo(() => languageOptions(scenario.step), [scenario.step]);
+  const read = runtimeHarness(scenario.step, chosen) === undefined;
   return (
     <div className="space-y-3">
       <p className="text-ink-50 text-[14px] font-bold leading-snug">{scenario.title}</p>
@@ -360,16 +526,24 @@ const ScenarioBrief: FC<{
       <div className="border-ink-700 flex flex-wrap items-center justify-between gap-3 border-t pt-3 text-[12px]">
         <span className="text-ink-300 flex items-center gap-2">
           language
-          <Select label="language" onChange={onChange} options={LANGUAGE_OPTIONS} value={chosen} />
-          {runtimeHarness(scenario.step, chosen) !== undefined ? (
-            <RuntimeBadge language={chosen} runtime={runtime} />
-          ) : null}
+          <Select label="language" onChange={onChange} options={options} value={chosen} />
+          {read ? null : <RuntimeBadge language={chosen} runtime={runtime} />}
         </span>
         <span className="text-ink-400">
           <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the patch
           loads in the editor · saved in this browser only
         </span>
       </div>
+      {read ? (
+        <p className="border-warning-400/40 bg-warning-400/10 text-warning-300 rounded-lg border px-3 py-2 text-[12px] leading-5">
+          {LANGUAGE_LABEL[chosen]} does not run in this browser: Submit checks it by reading the code. An accepted
+          verdict means the code has the expected shape, not that it works. Pick another language to have it run.
+        </p>
+      ) : null}
+      <p className="text-ink-400 text-[12px] leading-5">
+        The report counts your submissions and the hints you reveal (buttons marked <HintTag />
+        ). Review and Copy prompt are free.
+      </p>
       {replaces !== null ? (
         <p className="border-warning-400/40 bg-warning-400/10 text-warning-300 rounded-lg border px-3 py-2 text-[12px] leading-5">
           {replaces}
@@ -433,41 +607,59 @@ const ScenarioPicker: FC<{
 }> = memo(({scenarios, opening, failed, onStart}) => {
   const [q, setQ] = useState('');
   const [on, setOn] = useState<readonly string[]>([]);
+  const [difficulty, setDifficulty] = useState<Difficulty | 'all'>('all');
+  const [history] = useState(loadMockHistory);
   const onSearch = useCallback((e: ChangeEvent<HTMLInputElement>) => setQ(e.target.value), []);
   const toggle = useCallback(
     (signal: string) =>
       setOn(current => (current.includes(signal) ? current.filter(s => s !== signal) : [...current, signal])),
     [],
   );
+  const pickDifficulty = useCallback(
+    (value: string) => setDifficulty(current => (current === value ? 'all' : (value as Difficulty | 'all'))),
+    [],
+  );
   const clear = useCallback(() => {
     setQ('');
     setOn([]);
+    setDifficulty('all');
   }, []);
   const numbers = useMemo(() => new Map(scenarios.map((s, i) => [s.id, i + 1])), [scenarios]);
-  const visible = useMemo(
-    () => scenarios.filter(s => matchesScenario(s, q) && on.every(signal => s.signals.includes(signal))),
-    [scenarios, q, on],
-  );
-  const filtering = q.trim() !== '' || on.length > 0;
+  const entries = useMemo(() => new Map(scenarios.map(s => [s.id, searchEntry(s)])), [scenarios]);
+  const counts = useMemo(() => {
+    const tally = new Map<string, number>();
+    for (const s of scenarios) {
+      for (const key of [s.problem.difficulty, ...s.signals]) tally.set(key, (tally.get(key) ?? 0) + 1);
+    }
+    return tally;
+  }, [scenarios]);
+  /** The scenarios shown, best match first; `aboutIt`, whether any matched by its own text rather than its course's. */
+  const {visible, aboutIt} = useMemo(() => {
+    const patterns = q.toLowerCase().split(/\s+/).filter(Boolean).map(wordPattern);
+    const ranked = scenarios
+      .filter(
+        s => (difficulty === 'all' || s.problem.difficulty === difficulty) && on.every(x => s.signals.includes(x)),
+      )
+      .map(s => ({s, rank: patterns.length === 0 ? 0 : searchRank(entries.get(s.id) as SearchEntry, patterns)}))
+      .filter(({rank}) => rank >= 0)
+      .sort((a, b) => b.rank - a.rank);
+    return {visible: ranked.map(({s}) => s), aboutIt: patterns.length === 0 || ranked.some(({rank}) => rank > 0)};
+  }, [scenarios, entries, q, on, difficulty]);
+  const filtering = q.trim() !== '' || on.length > 0 || difficulty !== 'all';
   return (
     <div className="mx-auto w-full max-w-5xl px-5 pb-10 pt-6">
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-64">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-72">
           <SearchIcon />
           <input
             aria-label="search scenarios"
             className="text-ink-50 placeholder:text-ink-400 w-full border-0 bg-transparent p-0 text-[13px] focus:outline-none focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
             onChange={onSearch}
-            placeholder="Search scenarios"
+            placeholder="Search: title, Redis, Kafka, retries…"
             type="search"
             value={q}
           />
         </label>
-        <div aria-label="signals" className="flex flex-wrap gap-1.5" role="group">
-          {SIGNALS.map(signal => (
-            <SignalToggle key={signal} on={on.includes(signal)} signal={signal} toggle={toggle} />
-          ))}
-        </div>
         <span className="text-ink-300 ml-auto flex items-center gap-2 text-[13px]">
           {filtering ? (
             <>
@@ -488,11 +680,71 @@ const ScenarioPicker: FC<{
           )}
         </span>
       </div>
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        <span className="text-ink-400 w-20 shrink-0 text-[11px] font-bold uppercase tracking-wider">Difficulty</span>
+        <div aria-label="difficulty" className="flex flex-wrap gap-1.5" role="group">
+          <FilterToggle
+            count={scenarios.length}
+            label="All"
+            on={difficulty === 'all'}
+            toggle={pickDifficulty}
+            value="all"
+          />
+          {DIFFICULTIES.map(d => (
+            <FilterToggle
+              count={counts.get(d) ?? 0}
+              key={d}
+              label={DIFFICULTY_LABEL[d]}
+              on={difficulty === d}
+              toggle={pickDifficulty}
+              value={d}
+            />
+          ))}
+        </div>
+      </div>
+      <div className="mb-4 flex flex-wrap items-start gap-1.5">
+        <span className="text-ink-400 w-20 shrink-0 pt-1.5 text-[11px] font-bold uppercase tracking-wider">
+          Signals
+        </span>
+        <div className="min-w-0 flex-1">
+          <div aria-label="signals" className="flex flex-wrap gap-1.5" role="group">
+            {SIGNALS.map(signal => (
+              <FilterToggle
+                count={counts.get(signal) ?? 0}
+                key={signal}
+                label={signal}
+                on={on.includes(signal)}
+                title={SIGNAL_MEANING[signal]}
+                toggle={toggle}
+                value={signal}
+              />
+            ))}
+          </div>
+          <details className="group mt-2">
+            <summary className="text-ink-300 hover:text-ink-50 cursor-pointer text-[12px] transition">
+              What the signals mean
+            </summary>
+            <dl className="border-ink-700 bg-ink-850 mt-2 grid gap-x-4 gap-y-1.5 rounded-xl border p-3 text-[12px] leading-5 sm:grid-cols-[auto_1fr]">
+              {SIGNALS.map(signal => (
+                <div className="contents" key={signal}>
+                  <dt className="text-danger-200 font-semibold">{signal}</dt>
+                  <dd className="text-ink-200 mb-1 sm:mb-0">{SIGNAL_MEANING[signal]}</dd>
+                </div>
+              ))}
+            </dl>
+          </details>
+        </div>
+      </div>
       {failed ? (
         <p
           className="border-danger-400/40 bg-danger-400/10 text-danger-200 mb-4 rounded-xl border px-4 py-3 text-[12px]"
           role="alert">
           The scenario's course did not load. Check the connection and start it again.
+        </p>
+      ) : null}
+      {visible.length > 0 && !aboutIt ? (
+        <p className="text-ink-300 mb-4 text-[12px] leading-5">
+          No scenario is about “{q.trim()}” itself; these come from courses that use it in another step.
         </p>
       ) : null}
       {visible.length === 0 ? (
@@ -504,15 +756,20 @@ const ScenarioPicker: FC<{
         </p>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {visible.map(s => (
-            <ScenarioCard
-              busy={opening === s.id}
-              key={s.id}
-              number={numbers.get(s.id) ?? 0}
-              onStart={onStart}
-              scenario={s}
-            />
-          ))}
+          {visible.map(s => {
+            const tries = history[s.id] ?? [];
+            return (
+              <ScenarioCard
+                best={bestAttempt(tries)}
+                busy={opening === s.id}
+                key={s.id}
+                number={numbers.get(s.id) ?? 0}
+                onStart={onStart}
+                scenario={s}
+                tries={tries.length}
+              />
+            );
+          })}
         </div>
       )}
       <p className="text-ink-400 border-ink-700 mt-6 border-t pt-4 text-[11px]">
@@ -560,7 +817,21 @@ const MockInterview: FC = memo(() => {
   /** `Date.now()` as the clock last read it. */
   const [now, setNow] = useState(Date.now);
   const [attempts, setAttempts] = useState(0);
-  const [hints, setHints] = useState(0);
+  /** Each hint revealed and the AI pair message carrying it; the ref is read by clicks before a render lands. */
+  const [revealed, setRevealedState] = useState<Record<string, number>>({});
+  const revealedRef = useRef(revealed);
+  const setRevealed = useCallback((next: Record<string, number>) => {
+    revealedRef.current = next;
+    setRevealedState(next);
+  }, []);
+  const hints = Object.keys(revealed).length;
+  /** The AI pair message a re-clicked hint scrolls back to, outlined for a moment. */
+  const [flash, setFlash] = useState<number | null>(null);
+  /** This scenario's finished attempts, newest first, once its report has graded. */
+  const [history, setHistory] = useState<MockAttempt[]>([]);
+  /** The report's final code opens on demand, so its editor only mounts when shown. */
+  const [codeOpen, setCodeOpen] = useState(false);
+  const [layout, setLayout] = useState<MockLayout>(loadMockLayout);
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   /** The code `verdict` graded: the report grades again only when the code on screen is different. */
   const [verdictCode, setVerdictCode] = useState<string | null>(null);
@@ -572,6 +843,8 @@ const MockInterview: FC = memo(() => {
   const [messages, setMessages] = useState<MockMessage[]>([]);
   const [followUps, setFollowUps] = useState<Record<number, string>>({});
   const [copied, setCopied] = useState(false);
+  /** The notes, shown to copy by hand when the clipboard refused them. */
+  const [notesText, setNotesText] = useState<string | null>(null);
   const [promptCopied, setPromptCopied] = useState(false);
   const [promptText, setPromptText] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
@@ -581,13 +854,26 @@ const MockInterview: FC = memo(() => {
   const code = codeByLanguage?.[language] ?? '';
   const secondsLeft = deadline === null ? (scenario?.minutes ?? 0) * 60 : secondsLeftAt(deadline, endedAt, now);
 
-  const say = useCallback((text: string, from: MockMessage['from'] = 'ai', tone?: MockMessage['tone']) => {
-    setMessages(current => [...current, {id: nextMessage.current++, text, from, tone}]);
+  /** Post a message to the AI pair log; returns its id. */
+  const say = useCallback((text: string, from: MockMessage['from'] = 'ai', tone?: MockMessage['tone']): number => {
+    const id = nextMessage.current++;
+    setMessages(current => [...current, {id, text, from, tone}]);
+    return id;
   }, []);
 
   useEffect(() => {
     if (logRef.current !== null) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [messages]);
+
+  useEffect(() => {
+    if (flash === null) return undefined;
+    const timer = window.setTimeout(() => setFlash(null), 1600);
+    return () => window.clearTimeout(timer);
+  }, [flash]);
+
+  useEffect(() => {
+    saveMockLayout(layout);
+  }, [layout]);
 
   // A new phase starts at its top: the setup page may have been scrolled when the scenario started.
   useEffect(() => {
@@ -645,6 +931,25 @@ const MockInterview: FC = memo(() => {
     });
   }, [phase, scenario, language, code, verdictCode]);
 
+  // A graded report is an attempt: kept per scenario (updated, not duplicated, when the report is reopened).
+  useEffect(() => {
+    if (phase !== 'report' || scenario === null || deadline === null || endedAt === null) return;
+    if (verdict === null || verdictCode !== code) return;
+    setHistory(
+      recordMockAttempt(scenario.id, {
+        startedAt: deadline - scenario.minutes * 60_000,
+        language,
+        accepted: verdict.accepted,
+        passed: verdict.passed,
+        total: verdict.total,
+        seconds: scenario.minutes * 60 - secondsLeftAt(deadline, endedAt, endedAt),
+        submissions: attempts,
+        hints,
+        read: verdict.run === undefined,
+      }),
+    );
+  }, [phase, scenario, deadline, endedAt, verdict, verdictCode, code, language, attempts, hints]);
+
   // The session is saved as it changes, so Back, a reload, the logo or the mode switch never lose it.
   useEffect(() => {
     if ((phase !== 'running' && phase !== 'report') || scenario === null || deadline === null) return;
@@ -658,6 +963,7 @@ const MockInterview: FC = memo(() => {
       endedAt,
       attempts,
       hints,
+      revealed,
       messages,
       followUps,
       verdict,
@@ -672,6 +978,7 @@ const MockInterview: FC = memo(() => {
     endedAt,
     attempts,
     hints,
+    revealed,
     messages,
     followUps,
     verdict,
@@ -690,52 +997,66 @@ const MockInterview: FC = memo(() => {
   }, [phase]);
 
   /** Open a scenario on its own page with the clock not yet running: the patch loads, the brief shows, nothing counts. */
-  const prepare = useCallback((next: ResolvedMockScenario, chosen: Language) => {
-    const starters = startersFor(next);
-    setScenario(next);
-    setLanguage(chosen);
-    setCodeByLanguage(starters);
-    setEditorReset(value => value + 1);
-    setDeadline(null);
-    setEndedAt(null);
-    setAttempts(0);
-    setHints(0);
-    setVerdict(null);
-    setVerdictCode(null);
-    setGrading(false);
-    gradeSeq.current += 1;
-    setFollowUps({});
-    setCopied(false);
-    setPromptCopied(false);
-    setPromptText(null);
-    nextMessage.current = 1;
-    setMessages([]);
-    setPhase('ready');
-  }, []);
+  const prepare = useCallback(
+    (next: ResolvedMockScenario, chosen: Language) => {
+      const starters = startersFor(next);
+      setScenario(next);
+      setLanguage(chosen);
+      setCodeByLanguage(starters);
+      setEditorReset(value => value + 1);
+      setDeadline(null);
+      setEndedAt(null);
+      setAttempts(0);
+      setRevealed({});
+      setFlash(null);
+      setCodeOpen(false);
+      setHistory([]);
+      setVerdict(null);
+      setVerdictCode(null);
+      setGrading(false);
+      gradeSeq.current += 1;
+      setFollowUps({});
+      setCopied(false);
+      setNotesText(null);
+      setPromptCopied(false);
+      setPromptText(null);
+      nextMessage.current = 1;
+      setMessages([]);
+      setPhase('ready');
+    },
+    [setRevealed],
+  );
 
   /** Reopen a saved session where it was left; a clock that ran out while away goes straight to the report. */
-  const resume = useCallback((next: ResolvedMockScenario, session: MockSession) => {
-    setScenario(next);
-    setLanguage(session.language);
-    setCodeByLanguage({...startersFor(next), ...session.code});
-    setEditorReset(value => value + 1);
-    setDeadline(session.deadline);
-    setEndedAt(session.endedAt);
-    setNow(Date.now());
-    setAttempts(session.attempts);
-    setHints(session.hints);
-    setVerdict(session.verdict ?? null);
-    setVerdictCode(session.verdictCode ?? null);
-    setGrading(false);
-    gradeSeq.current += 1;
-    setFollowUps(session.followUps);
-    setCopied(false);
-    setPromptCopied(false);
-    setPromptText(null);
-    nextMessage.current = session.messages.reduce((max, message) => Math.max(max, message.id), 0) + 1;
-    setMessages(session.messages);
-    setPhase(session.phase);
-  }, []);
+  const resume = useCallback(
+    (next: ResolvedMockScenario, session: MockSession) => {
+      setScenario(next);
+      setLanguage(session.language);
+      setCodeByLanguage({...startersFor(next), ...session.code});
+      setEditorReset(value => value + 1);
+      setDeadline(session.deadline);
+      setEndedAt(session.endedAt);
+      setNow(Date.now());
+      setAttempts(session.attempts);
+      setRevealed(session.revealed ?? {});
+      setFlash(null);
+      setCodeOpen(false);
+      setHistory([]);
+      setVerdict(session.verdict ?? null);
+      setVerdictCode(session.verdictCode ?? null);
+      setGrading(false);
+      gradeSeq.current += 1;
+      setFollowUps(session.followUps);
+      setCopied(false);
+      setNotesText(null);
+      setPromptCopied(false);
+      setPromptText(null);
+      nextMessage.current = session.messages.reduce((max, message) => Math.max(max, message.id), 0) + 1;
+      setMessages(session.messages);
+      setPhase(session.phase);
+    },
+    [setRevealed],
+  );
 
   // A dialog belongs to the phase that opened it: one left open when the page moved on is not shown again.
   const [dialog, openDialog] = useDialog();
@@ -934,15 +1255,24 @@ const MockInterview: FC = memo(() => {
         return;
       }
       setAttempts(value => value + 1);
+      const read = result.run === undefined;
       if (result.accepted) {
         if (phaseRef.current === 'running') {
           setEndedAt(Date.now());
           setPhase('report');
         }
-        say('Accepted: every check passes. Read the debrief and answer the follow-ups.', 'ai', 'ok');
+        say(
+          read
+            ? `Accepted by reading the code: every check looks satisfied. ${LANGUAGE_LABEL[language]} does not run here, so the shape is right; run it yourself before you trust it.`
+            : 'Accepted: every check passes. Read the debrief and answer the follow-ups.',
+          'ai',
+          'ok',
+        );
       } else {
         say(
-          `Not yet — ${result.passed}/${result.total} checks pass. I put the failing ones under the editor; fix the code, not the check names.`,
+          read
+            ? `Not yet: ${result.passed}/${result.total} checks look satisfied, by reading the code (${LANGUAGE_LABEL[language]} does not run here). The failing ones are under the editor.`
+            : `Not yet: ${result.passed}/${result.total} checks pass. I put the failing ones under the editor; fix the code, not the check names.`,
           'ai',
           'warn',
         );
@@ -979,11 +1309,41 @@ const MockInterview: FC = memo(() => {
     );
   }, [language, say, scenario]);
 
-  /** A read of the code against the static checks: a hint where Submit runs the code, the grade where it cannot. */
+  /** Bring an earlier AI pair message into view and outline it for a moment. */
+  const showMessage = useCallback((id: number) => {
+    logRef.current
+      ?.querySelector(`[data-message="${id}"]`)
+      ?.scrollIntoView({block: 'nearest', behavior: scrollBehavior()});
+    setFlash(id);
+  }, []);
+
+  /** A hint counts once: the first click posts it, another brings its message back into view. */
+  const reveal = useCallback(
+    (key: string, text: string) => {
+      const shown = revealedRef.current[key];
+      if (shown !== undefined) {
+        showMessage(shown);
+        return;
+      }
+      setRevealed({...revealedRef.current, [key]: say(text, 'ai', 'warn')});
+    },
+    [say, setRevealed, showMessage],
+  );
+
+  const flaws = useMemo(() => (scenario === null ? [] : flawsOf(scenario)), [scenario]);
+  const flawsShown = flaws.filter(flaw => revealed[`flaw:${flaw.id}`] !== undefined).length;
+
+  /**
+   * A free read of the code against the static checks. It never names a flaw the hints have not:
+   * it counts what looks unmet and names only the flaws already revealed.
+   */
   const onReview = useCallback(() => {
     if (scenario === null) return;
     const result = judge(scenario.step, language, code);
-    const read = runtimeHarness(scenario.step, language) !== undefined ? 'Reading the code, not running it' : 'Review';
+    const read =
+      runtimeHarness(scenario.step, language) !== undefined
+        ? 'Review (reading the code, not running it)'
+        : `Review (reading the code: ${LANGUAGE_LABEL[language]} does not run here)`;
     if (result.accepted) {
       say(
         `${read}: every check looks satisfied. Before you submit, say which check would catch a regression.`,
@@ -993,26 +1353,40 @@ const MockInterview: FC = memo(() => {
       return;
     }
     const failed = result.results.filter(item => !item.passed);
+    const named = failed.filter(item => revealedRef.current[`flaw:${item.id}`] !== undefined);
+    const unnamed = failed.length - named.length;
     say(
-      `${read}: ${result.passed}/${result.total} checks look satisfied.\n${failed
-        .map(item => `• ${item.title}\n  ${item.detail}`)
-        .join('\n')}`,
+      [
+        `${read}: ${result.passed}/${result.total} checks look satisfied.`,
+        ...named.map(item => `• Still unmet: ${item.title}`),
+        unnamed > 0
+          ? `${unnamed} more ${
+              unnamed === 1 ? 'looks' : 'look'
+            } unmet. What's missing? names them one at a time, as hints.`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
       'ai',
       'warn',
     );
   }, [code, language, say, scenario]);
 
+  /** One flaw per click, each counted once; once all are out, a click brings the first back into view. */
   const onExplain = useCallback(() => {
-    if (scenario === null) return;
-    setHints(value => value + 1);
-    say(`The subtle flaw: ${scenario.aiNote}`, 'ai', 'warn');
-  }, [say, scenario]);
+    const index = flaws.findIndex(flaw => revealedRef.current[`flaw:${flaw.id}`] === undefined);
+    if (index === -1) {
+      const first = flaws.length === 0 ? undefined : revealedRef.current[`flaw:${flaws[0].id}`];
+      if (first !== undefined) showMessage(first);
+      return;
+    }
+    const flaw = flaws[index];
+    reveal(`flaw:${flaw.id}`, `A flaw in the patch (${index + 1} of ${flaws.length}): ${flaw.title}.\n${flaw.detail}`);
+  }, [flaws, reveal, showMessage]);
 
   const onTestIdea = useCallback(() => {
-    if (scenario === null) return;
-    setHints(value => value + 1);
-    say(`Verification idea: ${scenario.testIdea}`, 'ai');
-  }, [say, scenario]);
+    if (scenario !== null) reveal('test', `Verification idea: ${scenario.testIdea}`);
+  }, [reveal, scenario]);
 
   const onCopyPrompt = useCallback(async () => {
     if (scenario === null) return;
@@ -1046,26 +1420,71 @@ const MockInterview: FC = memo(() => {
     );
   }, [code, language, say, scenario]);
 
+  /** The report as text: the outcome line, what the patch got wrong, the failing checks, the follow-ups and the debrief. */
   const onCopyNotes = useCallback(async () => {
-    if (scenario === null) return;
-    const result = verdict ?? judge(scenario.step, language, code);
+    if (scenario === null || deadline === null) return;
+    const result = verdict !== null && verdictCode === code ? verdict : judge(scenario.step, language, code);
+    const left = secondsLeftAt(deadline, endedAt, Date.now());
+    const origin = window.location.origin;
+    const failing = result.results.filter(item => !item.passed);
     const notes = [
       `Mock interview: ${scenario.title}`,
-      `${result.passed}/${result.total} checks · ${attempts} submission(s) · ${hints} AI hint(s)`,
+      `Course step: ${scenario.problem.title}, step ${scenario.problem.steps.indexOf(scenario.step) + 1}: ${
+        scenario.step.title
+      } (${origin}${stepPath(scenario.problem, scenario.step)})`,
+      [
+        `Outcome: ${result.accepted ? 'Accepted' : left === 0 ? 'Time’s up' : 'Not accepted'}`,
+        `${result.passed}/${result.total} checks`,
+        `${formatClock(scenario.minutes * 60 - left)} of ${scenario.minutes}:00`,
+        LANGUAGE_LABEL[language],
+        plural(attempts, 'submission'),
+        plural(hints, 'hint'),
+      ].join(' · '),
+      ...(result.run === undefined
+        ? [`Checked by reading the code: ${LANGUAGE_LABEL[language]} does not run in the browser.`]
+        : []),
       '',
-      'What the AI got wrong:',
+      'What the patch got wrong:',
       scenario.aiNote,
+      '',
+      failing.length === 0 ? 'Failing checks: none' : 'Failing checks:',
+      ...failing.map(item => `- ${item.title}: ${item.message ?? item.detail}`),
+      ...((scenario.step.guides ?? []).length > 0
+        ? ['', 'Study:', ...(scenario.step.guides ?? []).map(id => `- ${GUIDES[id].title}: ${origin}/guides/${id}`)]
+        : []),
       '',
       'Follow-ups:',
       ...scenario.followUps.map((question, index) => `Q: ${question}\nA: ${followUps[index] ?? ''}`),
+      '',
+      'Debrief:',
+      scenario.step.debrief.trim(),
     ].join('\n');
-    if (!(await copyText(notes))) {
-      say('Clipboard access was denied; select the notes and copy them manually.', 'ai', 'warn');
-      return;
+    if (await copyText(notes)) {
+      setNotesText(null);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } else {
+      setNotesText(notes);
     }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  }, [attempts, code, followUps, hints, language, scenario, say, verdict]);
+  }, [attempts, code, deadline, endedAt, followUps, hints, language, scenario, verdict, verdictCode]);
+
+  // The gutters report pixel deltas; the panes keep shares of the workspace's width, and the editor
+  // between them never gets narrower than EDITOR_MIN_PX.
+  const dragBrief = useCallback((delta: number) => {
+    const width = mainRef.current?.clientWidth ?? 0;
+    if (width > 0) setLayout(l => ({...l, brief: clampShare(l.brief + delta / width, l.pair, width)}));
+  }, []);
+  const dragPair = useCallback((delta: number) => {
+    const width = mainRef.current?.clientWidth ?? 0;
+    if (width > 0) setLayout(l => ({...l, pair: clampShare(l.pair - delta / width, l.brief, width)}));
+  }, []);
+  const resetBrief = useCallback(() => setLayout(l => ({...l, brief: DEFAULT_MOCK_LAYOUT.brief})), []);
+  const resetPair = useCallback(() => setLayout(l => ({...l, pair: DEFAULT_MOCK_LAYOUT.pair})), []);
+
+  const onEditorSettings = useCallback(() => {
+    setDialogPhase('running');
+    void openDialog({title: 'Editor', body: <EditorSettingsForm />});
+  }, [openDialog]);
 
   if (phase === 'setup') {
     const savedTitle = saved === null ? undefined : listedMockScenarios.find(s => s.id === saved.scenarioId)?.title;
@@ -1130,6 +1549,13 @@ const MockInterview: FC = memo(() => {
   const outcome = graded === null ? 'Grading…' : graded.accepted ? 'Accepted' : timeUp ? 'Time’s up' : 'Not accepted';
   const used = scenario.minutes * 60 - secondsLeft;
   const step = scenario.step;
+  const starter = codeFor(step, language).starter;
+  const options = languageOptions(step);
+  const coursePath = stepPath(scenario.problem, step);
+  const stepNumber = scenario.problem.steps.indexOf(step) + 1;
+  /** Guides open with a link back here: the scenario's address resumes its session or report. */
+  const from = encodeURIComponent(`/mock-interview?scenario=${scenario.id}`);
+  const best = bestAttempt(history);
 
   if (phase === 'report') {
     return (
@@ -1151,16 +1577,20 @@ const MockInterview: FC = memo(() => {
               <h1 className="text-ink-50 mt-1 text-2xl font-extrabold leading-tight">{scenario.title}</h1>
               <p className="text-ink-400 mt-2 text-[13px]">{scenario.role}</p>
             </div>
-            <div className="grid gap-3 sm:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
               {[
                 ['Outcome', outcome],
                 ['Checks', graded === null ? '…' : `${graded.passed}/${graded.total}`],
+                ['Time', `${formatClock(used)} of ${scenario.minutes}:00`],
                 ['Submissions', String(attempts)],
                 ['AI hints', String(hints)],
               ].map(([label, value]) => (
                 <div className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3" key={label}>
                   <p className="text-ink-400 text-[11px] font-bold uppercase tracking-wider">{label}</p>
                   <p className="text-ink-50 font-code mt-1 text-[15px] font-semibold">{value}</p>
+                  {label === 'Outcome' && graded !== null && graded.run === undefined ? (
+                    <p className="text-warning-300 mt-0.5 text-[11px]">read, not run</p>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -1170,18 +1600,59 @@ const MockInterview: FC = memo(() => {
                 runtime={runtimeStatus}
               />
             ) : (
-              <CheckResults title="What the checks found" verdict={graded} />
+              <CheckResults language={language} title="What the checks found" verdict={graded} />
             )}
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
               <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">What the patch got wrong</p>
               <p className="text-ink-200 mt-2 text-[13px] leading-6">{scenario.aiNote}</p>
               {graded !== null && !graded.accepted ? (
                 <p className="text-ink-400 mt-3 text-[12px] leading-6">
-                  You used {formatClock(used)} of the {scenario.minutes}:00 budget. Retry and name the failure mode
-                  before you run the checks.
+                  Retry and name the failure mode before you run the checks.
                 </p>
               ) : null}
+              <div className="border-ink-700 mt-4 space-y-2 border-t pt-4 text-[13px]">
+                {(step.guides ?? []).length > 0 ? (
+                  <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                    <span className="text-ink-300 text-[12px] font-semibold">Study this failure mode</span>
+                    {(step.guides ?? []).map(id => (
+                      <Link className={MOCK_LINK} href={`/guides/${id}?from=${from}`} key={id}>
+                        {GUIDES[id].title} ›
+                      </Link>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                  <span className="text-ink-300 text-[12px] font-semibold">Practise it without the clock</span>
+                  <Link className={MOCK_LINK} href={coursePath}>
+                    {scenario.problem.title}, step {stepNumber}: {step.title} ›
+                  </Link>
+                </div>
+              </div>
             </div>
+            <details
+              className="border-ink-700 bg-ink-850 rounded-xl border"
+              onToggle={event => setCodeOpen(event.currentTarget.open)}
+              open={codeOpen}>
+              <summary className="text-danger-200 flex cursor-pointer flex-wrap items-baseline justify-between gap-2 px-5 py-4 text-[12px] font-bold uppercase tracking-wide">
+                <span>Your final code</span>
+                <span className="text-ink-400 font-code text-[11px] font-normal normal-case tracking-normal">
+                  {fileName(step.file, language)} ·{' '}
+                  {code === starter ? 'unchanged from the patch' : 'your changes against the patch'}
+                </span>
+              </summary>
+              {codeOpen ? (
+                <div className="border-ink-700 flex h-[28rem] flex-col border-t">
+                  <StepEditor
+                    className="min-h-0 flex-1"
+                    label={`${fileName(step.file, language)}, your final code`}
+                    language={language}
+                    original={code === starter ? null : starter}
+                    readOnly
+                    value={code}
+                  />
+                </div>
+              ) : null}
+            </details>
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
               <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">Follow-up questions</p>
               <p className="text-ink-400 mt-2 text-[12px] leading-6">Write the shape of your answer, not an essay.</p>
@@ -1219,6 +1690,63 @@ const MockInterview: FC = memo(() => {
                 <Markdown source={step.debrief} />
               </div>
             </details>
+            {history.length > 0 ? (
+              <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
+                <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">
+                  Your attempts at this scenario
+                </p>
+                <p className="text-ink-400 mt-1 text-[12px]">Kept in this browser only.</p>
+                <div className="mt-3 overflow-x-auto">
+                  <table className="w-full min-w-[34rem] text-left text-[12px]">
+                    <thead className="text-ink-400 text-[11px] uppercase tracking-wider">
+                      <tr>
+                        <th className="py-1.5 pr-3 font-bold">When</th>
+                        <th className="py-1.5 pr-3 font-bold">Language</th>
+                        <th className="py-1.5 pr-3 font-bold">Outcome</th>
+                        <th className="py-1.5 pr-3 font-bold">Checks</th>
+                        <th className="py-1.5 pr-3 font-bold">Time</th>
+                        <th className="py-1.5 pr-3 font-bold">Submissions</th>
+                        <th className="py-1.5 font-bold">Hints</th>
+                      </tr>
+                    </thead>
+                    <tbody className="font-code">
+                      {history.map(attempt => {
+                        const current = deadline !== null && attempt.startedAt === deadline - scenario.minutes * 60_000;
+                        return (
+                          <tr
+                            className={`border-ink-700 border-t ${current ? 'text-ink-50' : 'text-ink-200'}`}
+                            key={attempt.startedAt}>
+                            <td className="py-1.5 pr-3">
+                              {new Date(attempt.startedAt).toLocaleString(undefined, {
+                                dateStyle: 'medium',
+                                timeStyle: 'short',
+                              })}
+                              {current ? <span className="text-danger-300 ml-2 font-sans">this one</span> : null}
+                              {attempt === best && history.length > 1 ? (
+                                <span className="text-success-300 ml-2 font-sans">best</span>
+                              ) : null}
+                            </td>
+                            <td className="py-1.5 pr-3">{LANGUAGE_LABEL[attempt.language]}</td>
+                            <td className={`py-1.5 pr-3 ${attempt.accepted ? 'text-success-300' : ''}`}>
+                              {attempt.accepted ? 'Accepted' : 'Not accepted'}
+                              {attempt.read === true ? (
+                                <span className="text-warning-300 ml-1.5 font-sans">read, not run</span>
+                              ) : null}
+                            </td>
+                            <td className="py-1.5 pr-3">
+                              {attempt.passed}/{attempt.total}
+                            </td>
+                            <td className="py-1.5 pr-3">{formatClock(attempt.seconds)}</td>
+                            <td className="py-1.5 pr-3">{attempt.submissions}</td>
+                            <td className="py-1.5">{attempt.hints}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
             <div className="flex flex-wrap items-center gap-3">
               <button className={MOCK_PRIMARY} onClick={retry} type="button">
                 Retry this scenario
@@ -1233,6 +1761,19 @@ const MockInterview: FC = memo(() => {
                 {copied ? 'Copied ✓' : 'Copy debrief notes'}
               </button>
             </div>
+            {notesText !== null ? (
+              <label className="block">
+                <span className="text-warning-300 text-[12px]">
+                  The clipboard was blocked. Select the notes and copy them.
+                </span>
+                <textarea
+                  className="border-ink-600 bg-ink-900 text-ink-200 focus:border-danger-400 mt-2 h-48 w-full resize-y rounded-lg border p-2.5 font-mono text-[11px] leading-5 outline-none"
+                  onFocus={event => event.currentTarget.select()}
+                  readOnly
+                  value={notesText}
+                />
+              </label>
+            ) : null}
           </div>
         </main>
       </div>
@@ -1249,13 +1790,7 @@ const MockInterview: FC = memo(() => {
           <ModeSwitch mode="mock" />
           <span className="text-ink-300 ml-auto flex items-center gap-1.5 text-[11px]">
             <span className="hidden sm:inline">language</span>
-            <Select
-              align="right"
-              label="language"
-              onChange={changeLanguage}
-              options={LANGUAGE_OPTIONS}
-              value={language}
-            />
+            <Select align="right" label="language" onChange={changeLanguage} options={options} value={language} />
           </span>
         </div>
         <div className="border-ink-700 flex flex-wrap items-center gap-x-3 gap-y-2 border-t px-3 py-2">
@@ -1297,9 +1832,10 @@ const MockInterview: FC = memo(() => {
       </header>
 
       <main
-        className="min-h-0 flex-1 overflow-y-auto lg:grid lg:grid-cols-[minmax(19rem,0.9fr)_minmax(25rem,1.15fr)_minmax(19rem,0.85fr)] lg:overflow-hidden"
-        ref={mainRef}>
-        <section className="border-ink-700 bg-ink-950/40 min-h-0 border-b p-5 lg:h-full lg:overflow-y-auto lg:border-b-0 lg:border-r">
+        className="min-h-0 flex-1 overflow-y-auto lg:flex lg:overflow-hidden"
+        ref={mainRef}
+        style={{'--mock-brief': `${layout.brief * 100}%`, '--mock-pair': `${layout.pair * 100}%`} as CSSProperties}>
+        <section className="border-ink-700 bg-ink-950/40 min-h-0 border-b p-5 lg:h-full lg:w-[var(--mock-brief)] lg:shrink-0 lg:overflow-y-auto lg:border-b-0">
           <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">{scenario.role}</p>
           {sealed ? (
             <Sealed lines={5} note="The interviewer's brief and the requirements open when the clock starts." />
@@ -1311,6 +1847,13 @@ const MockInterview: FC = memo(() => {
                   <SignalChip key={signal} signal={signal} />
                 ))}
               </div>
+              <p className="text-ink-400 mt-3 text-[12px] leading-5">
+                From the course:{' '}
+                <a className={MOCK_LINK} href={coursePath} rel="noopener" target="_blank">
+                  {scenario.problem.title}, step {stepNumber}: {step.title}
+                </a>{' '}
+                <span className="text-ink-400">(new tab; the clock keeps running)</span>
+              </p>
               <details className="border-ink-700 bg-ink-850/60 group mt-5 rounded-xl border">
                 <summary className="text-danger-200 flex cursor-pointer items-center justify-between gap-3 px-4 py-3 text-[12px] font-bold">
                   <span>Requirements &amp; failure mode</span>
@@ -1329,13 +1872,23 @@ const MockInterview: FC = memo(() => {
           )}
         </section>
 
-        <section className="border-ink-700 flex min-h-0 flex-col border-b lg:h-full lg:border-b-0 lg:border-r">
+        <SplitGutter axis="x" className="hidden lg:flex" onDrag={dragBrief} onReset={resetBrief} />
+
+        <section className="border-ink-700 flex min-h-0 flex-col border-b lg:h-full lg:min-w-0 lg:flex-1 lg:border-b-0">
           <div className="border-ink-700 flex shrink-0 items-center gap-2 border-b px-2 py-1.5">
-            <span className="font-code text-ink-200 text-[12px]">{fileName(step.file, language)}</span>
+            <span className="font-code text-ink-200 truncate text-[12px]">{fileName(step.file, language)}</span>
             <span className="border-warning-400/40 bg-warning-400/10 text-warning-300 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold">
               Patch
             </span>
-            <span className="text-ink-400 ml-auto text-[11px]">edit, then submit</span>
+            <span className="text-ink-400 ml-auto hidden text-[11px] sm:inline">edit, then submit</span>
+            <button
+              aria-label="editor settings"
+              className="text-ink-300 hover:text-ink-50 ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition sm:ml-0"
+              onClick={onEditorSettings}
+              title="editor settings: font size, long lines, Vim"
+              type="button">
+              <GearIcon />
+            </button>
           </div>
           {sealed ? (
             <div className="min-h-0 flex-1 p-4">
@@ -1358,12 +1911,14 @@ const MockInterview: FC = memo(() => {
             <GradingStatus className="border-ink-700 shrink-0 border-t px-3 py-2 text-[11px]" runtime={runtimeStatus} />
           ) : verdict !== null && !verdict.accepted ? (
             <div className="border-ink-700 max-h-[16rem] shrink-0 overflow-y-auto border-t p-2">
-              <CheckResults title="Latest submission" verdict={verdict} />
+              <CheckResults language={language} title="Latest submission" verdict={verdict} />
             </div>
           ) : null}
         </section>
 
-        <aside className="bg-ink-950/40 flex min-h-[28rem] flex-col lg:h-full lg:min-h-0">
+        <SplitGutter axis="x" className="hidden lg:flex" onDrag={dragPair} onReset={resetPair} />
+
+        <aside className="bg-ink-950/40 flex min-h-[28rem] flex-col lg:h-full lg:min-h-0 lg:w-[var(--mock-pair)] lg:shrink-0">
           <div className="border-ink-700 from-danger-400/[0.08] flex shrink-0 items-center justify-between gap-2 border-b bg-gradient-to-r to-transparent px-4 py-3">
             <div>
               <p className="text-ink-50 text-[13px] font-bold">AI pair</p>
@@ -1375,19 +1930,47 @@ const MockInterview: FC = memo(() => {
             <span className="font-code text-ink-400 text-[11px]">{hints} hints used</span>
           </div>
           <div className="grid shrink-0 grid-cols-2 gap-2 p-3 pb-2">
-            <button className={AI_ACTIONS.reset} onClick={onReset} type="button">
+            <button
+              className={AI_ACTIONS.reset}
+              onClick={onReset}
+              title="Back to the patch as it came in (⌘Z undoes it). Free."
+              type="button">
               Reset
             </button>
-            <button className={AI_ACTIONS.review} onClick={onReview} type="button">
+            <button
+              className={AI_ACTIONS.review}
+              onClick={onReview}
+              title="Reads your code against the checks and counts what looks unmet. Free."
+              type="button">
               Review
             </button>
-            <button className={AI_ACTIONS.missing} onClick={onExplain} type="button">
+            <button
+              className={`${AI_ACTIONS.missing} flex items-center justify-center gap-1.5`}
+              onClick={onExplain}
+              title={
+                flawsShown === flaws.length
+                  ? 'Every flaw is shown; click to bring them back into view.'
+                  : 'Names the next flaw in the patch. Each flaw counts as one hint in the report.'
+              }
+              type="button">
               What&apos;s missing?
+              <span className="font-code text-[11px] font-normal">
+                {flawsShown}/{flaws.length}
+              </span>
+              <HintTag />
             </button>
-            <button className={AI_ACTIONS.test} onClick={onTestIdea} type="button">
+            <button
+              className={`${AI_ACTIONS.test} flex items-center justify-center gap-1.5`}
+              onClick={onTestIdea}
+              title="A test that would prove the fix. Counts as one hint in the report, once."
+              type="button">
               Test idea
+              <HintTag />
             </button>
           </div>
+          <p className="text-ink-400 shrink-0 px-3 pb-2 text-[11px] leading-5">
+            Buttons marked <HintTag /> count in the report, once each. Review and Copy prompt are free.
+          </p>
           <div className="shrink-0 px-3 pb-3">
             <button className={`${ghostButtonClass} w-full`} onClick={() => void onCopyPrompt()} type="button">
               {promptCopied ? 'Copied ✓' : 'Copy prompt'}
@@ -1418,7 +2001,7 @@ const MockInterview: FC = memo(() => {
             ref={logRef}>
             {messages.map(message => (
               <div
-                className={`whitespace-pre-wrap rounded-lg px-3 py-2 text-[12px] leading-6 ${
+                className={`whitespace-pre-wrap rounded-lg px-3 py-2 text-[12px] leading-6 transition-shadow ${
                   message.from === 'ai'
                     ? message.tone === 'warn'
                       ? 'border-warning-400/30 bg-warning-400/[0.06] text-ink-200 border'
@@ -1426,7 +2009,8 @@ const MockInterview: FC = memo(() => {
                       ? 'border-success-400/30 bg-success-400/[0.06] text-ink-200 border'
                       : 'border-ink-700 bg-ink-850 text-ink-200 border'
                     : 'bg-danger-400/10 text-ink-200 ml-6'
-                }`}
+                } ${flash === message.id ? 'ring-warning-400 ring-2' : ''}`}
+                data-message={message.id}
                 key={message.id}>
                 <span className="text-ink-400 mb-1 block text-[10px] font-bold uppercase tracking-wider">
                   {message.from === 'ai' ? 'AI pair' : 'you'}

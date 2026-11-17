@@ -1,8 +1,10 @@
 /**
- * Writes src/data/problems/summaries.ts and src/data/problems/modules.ts from the courses (see
- * scripts/summaries.ts). Run `yarn build:summaries` after adding a course or changing what its
- * summary holds: its id, title, tagline, difficulty, concepts, minutes, track, tag, language,
- * company, or a step's id, title or concept. `yarn verify` fails while they are stale.
+ * Writes src/data/problems/summaries.ts and src/data/problems/modules.ts from the courses, and
+ * src/data/mockSteps.ts from the mock scenarios (see scripts/summaries.ts). Run
+ * `yarn build:summaries` after adding a course or changing what its summary holds: its id, title,
+ * tagline, difficulty, concepts, minutes, track, tag, language, company, or a step's id, title or
+ * concept; or after adding a mock scenario or changing its id, title, course or step. `yarn verify`
+ * fails while they are stale.
  */
 import {writeFileSync} from 'node:fs';
 

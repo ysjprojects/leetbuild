@@ -4,6 +4,7 @@ import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from '
 import {GUIDES} from '@/data/guides/meta';
 import {guidePath, learnPath} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
+import {mockScenarioFor, scenarioHref} from '@/lib/mockLinks';
 import {scrollBehavior} from '@/lib/motion';
 import {runtimeHarness} from '@/lib/runtime/client';
 import {CPP_UNSUPPORTED} from '@/lib/runtime/cpp/support';
@@ -28,7 +29,9 @@ import {
   runsAsProgram,
   sourceCredit,
   stepKey,
+  stepPath,
 } from '@/lib/types';
+import {useMediaQuery} from '@/lib/useMediaQuery';
 
 import ArchitectureDiagram from './ArchitectureDiagram';
 import {useDialog} from './Dialog';
@@ -306,6 +309,10 @@ const LockedStep: FC<{
 LockedStep.displayName = 'LockedStep';
 
 const NO_FOCUS: readonly string[] = [];
+const NO_GUIDES: readonly GuideId[] = [];
+
+/** Below `lg` the pane sits above the editor (the playground's stacked layout) instead of beside it. */
+const STACKED = '(max-width: 1023px)';
 
 /** Below this the pane's header puts the course title on a row of its own. */
 const NARROW_HEADER_PX = 520;
@@ -394,11 +401,20 @@ const DocumentGlyph: FC = memo(() => (
 ));
 DocumentGlyph.displayName = 'DocumentGlyph';
 
+/** A link from the step to a guide: it carries the step's address, so the guide's back link returns to it. */
+const fromStep = (href: string, from: string): string => {
+  const [path, hash] = href.split('#');
+  return `${path}?from=${encodeURIComponent(from)}${hash === undefined ? '' : `#${hash}`}`;
+};
+
+const CHIP_CLASS =
+  'border-iris-400/40 bg-iris-400/10 text-iris-200 hover:border-iris-400/70 hover:text-ink-50 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition';
+
 /** The course's learning guide, when it has one: the concepts walked through, on their own page. */
-const GuideLink: FC<{problemId: string}> = memo(({problemId}) => (
+const GuideLink: FC<{problemId: string; from: string; className?: string}> = memo(({problemId, from, className}) => (
   <Link
-    className="border-iris-400/40 bg-iris-400/10 text-iris-200 hover:border-iris-400/70 hover:text-ink-50 ml-auto inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition"
-    href={learnPath(problemId)}
+    className={`${CHIP_CLASS} ${className ?? ''}`}
+    href={fromStep(learnPath(problemId), from)}
     title="The concepts behind this course, walked through with demos and quizzes">
     <DocumentGlyph />
     Learning guide
@@ -407,39 +423,54 @@ const GuideLink: FC<{problemId: string}> = memo(({problemId}) => (
 GuideLink.displayName = 'GuideLink';
 
 /** A failure-mode guide as a chip: its title, its summary on hover; it opens the guide's page. */
-const GuideChip: FC<{id: GuideId}> = memo(({id}) => (
-  <Link
-    className="border-iris-400/40 bg-iris-400/10 text-iris-200 hover:border-iris-400/70 hover:text-ink-50 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition"
-    href={guidePath(id)}
-    title={GUIDES[id].tagline}>
+const GuideChip: FC<{id: GuideId; from: string}> = memo(({id, from}) => (
+  <Link className={CHIP_CLASS} href={fromStep(guidePath(id), from)} title={GUIDES[id].tagline}>
     <DocumentGlyph />
     {GUIDES[id].title}
   </Link>
 ));
 GuideChip.displayName = 'GuideChip';
 
-/** The failure-mode guides behind a step, above its hints: reading one costs no points. */
-const StepGuides: FC<{guides: readonly GuideId[]}> = memo(({guides}) => (
-  <section className="mt-4">
-    <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">Guides · free to read</p>
-    <div className="mt-1.5 flex flex-wrap gap-2">
-      {guides.map(id => (
-        <GuideChip id={id} key={id} />
-      ))}
-    </div>
-  </section>
-));
+/**
+ * What there is to read behind a step, above its hints (reading costs no points): the failure-mode
+ * guides behind its flaws, or the course's learning guide.
+ */
+const StepGuides: FC<{guides: readonly GuideId[]; problemId: string | null; from: string}> = memo(
+  ({guides, problemId, from}) => (
+    <section className="mt-4">
+      <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">
+        {guides.length + (problemId === null ? 0 : 1) === 1 ? 'Guide' : 'Guides'} · free to read
+      </p>
+      <div className="mt-1.5 flex flex-wrap gap-2">
+        {problemId === null ? null : <GuideLink from={from} problemId={problemId} />}
+        {guides.map(id => (
+          <GuideChip from={from} id={id} key={id} />
+        ))}
+      </div>
+    </section>
+  ),
+);
 StepGuides.displayName = 'StepGuides';
 
+/** The timed mock scenario built on this step: the same failure, rehearsed against the clock. */
+const MockLink: FC<{scenario: {id: string; title: string}}> = memo(({scenario}) => (
+  <p className="text-ink-300 mt-3 text-[12px]">
+    <Link className={linkClass} href={scenarioHref(scenario.id)} title={`Mock interview: ${scenario.title}`}>
+      Practise it as a timed mock ›
+    </Link>
+  </p>
+));
+MockLink.displayName = 'MockLink';
+
 /** A debugging course's guides, under its statement: every failure mode its steps hide, in reading order. */
-const CourseGuides: FC<{problem: Problem}> = memo(({problem}) => {
+const CourseGuides: FC<{problem: Problem; from: string}> = memo(({problem, from}) => {
   const ids = GUIDE_IDS.filter(id => problem.steps.some(step => step.guides?.includes(id) === true));
   return ids.length === 0 ? null : (
     <section className="border-ink-700 mt-4 border-t pt-3">
       <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">The failure modes this course hides</p>
       <div className="mt-1.5 flex flex-wrap gap-2">
         {ids.map(id => (
-          <GuideChip id={id} key={id} />
+          <GuideChip from={from} id={id} key={id} />
         ))}
       </div>
     </section>
@@ -675,8 +706,26 @@ const ProblemPane: FC<{
       },
       [stepsByNode, problem, attempts, onSelectStep],
     );
+    const here = stepPath(problem, shown);
+    const mock = useMemo(() => mockScenarioFor(problem.id, step.id), [problem.id, step.id]);
+    // Stacked (phones, zoom), the brief flows in the page's scroll and the step's task comes before the
+    // course's figure; beside the IDE the figure leads and the pane scrolls on its own.
+    const stacked = useMediaQuery(STACKED);
+    const figureAfterTask = stacked && tab === 'step' && lockedStep === null;
+    const courseFigure =
+      problem.figures !== undefined && problem.figures.length > 0 ? (
+        <PaneFigures figures={problem.figures} focus={tab === 'step' ? shown.focus : NO_FOCUS} title={problem.title} />
+      ) : problem.diagram !== undefined ? (
+        <SystemDiagram
+          compact
+          diagram={problem.diagram}
+          focus={tab === 'step' ? shown.focus : NO_FOCUS}
+          onSelectNode={onSelectNode}
+          stepsByNode={stepsByNode}
+        />
+      ) : null;
     return (
-      <div className="flex h-full min-h-0 flex-col">
+      <div className="flex min-h-0 flex-col lg:h-full">
         <div
           className="border-ink-700 flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-4 py-2"
           ref={header}>
@@ -759,22 +808,8 @@ const ProblemPane: FC<{
             </svg>
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" onScroll={onScroll} ref={scroller}>
-          {problem.figures !== undefined && problem.figures.length > 0 ? (
-            <PaneFigures
-              figures={problem.figures}
-              focus={tab === 'step' ? shown.focus : NO_FOCUS}
-              title={problem.title}
-            />
-          ) : problem.diagram !== undefined ? (
-            <SystemDiagram
-              compact
-              diagram={problem.diagram}
-              focus={tab === 'step' ? shown.focus : NO_FOCUS}
-              onSelectNode={onSelectNode}
-              stepsByNode={stepsByNode}
-            />
-          ) : null}
+        <div className="px-4 py-3 lg:min-h-0 lg:flex-1 lg:overflow-y-auto" onScroll={onScroll} ref={scroller}>
+          {figureAfterTask ? null : courseFigure}
           <StepRail
             activeId={tab === 'step' ? shown.id : null}
             attempts={attempts}
@@ -811,13 +846,15 @@ const ProblemPane: FC<{
                 <span>
                   {problem.steps.length} steps · {points} pts each
                 </span>
-                {problem.learn !== undefined ? <GuideLink problemId={problem.id} /> : null}
+                {problem.learn !== undefined ? (
+                  <GuideLink className="ml-auto" from={here} problemId={problem.id} />
+                ) : null}
               </div>
               {score.done === score.total ? (
                 <CourseComplete certified={certified} onCertificate={onCertificate} problem={problem} score={score} />
               ) : null}
               <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={problem.statement} />
-              {problem.learn === undefined ? <CourseGuides problem={problem} /> : null}
+              {problem.learn === undefined ? <CourseGuides from={here} problem={problem} /> : null}
               {problem.sources !== undefined && problem.sources.length > 0 ? (
                 <Sources company={problem.company} sources={problem.sources} />
               ) : null}
@@ -873,11 +910,6 @@ const ProblemPane: FC<{
                     }.`
                   : 'The checks read the shape of your code; nothing is executed in this language.'}
               </p>
-              {step.sequence !== undefined ? (
-                <div className="mt-3">
-                  <SequenceDiagram sequence={step.sequence} />
-                </div>
-              ) : null}
               <div className="mt-3">
                 <Markdown
                   highlight={leetbuildHighlighter}
@@ -886,7 +918,20 @@ const ProblemPane: FC<{
                   source={step.task}
                 />
               </div>
-              {step.guides !== undefined && step.guides.length > 0 ? <StepGuides guides={step.guides} /> : null}
+              {step.sequence !== undefined ? (
+                <div className="mt-3">
+                  <SequenceDiagram sequence={step.sequence} />
+                </div>
+              ) : null}
+              {figureAfterTask && courseFigure !== null ? <div className="mt-4">{courseFigure}</div> : null}
+              {(step.guides !== undefined && step.guides.length > 0) || problem.learn !== undefined ? (
+                <StepGuides
+                  from={here}
+                  guides={step.guides ?? NO_GUIDES}
+                  problemId={problem.learn === undefined ? null : problem.id}
+                />
+              ) : null}
+              {mock === null ? null : <MockLink scenario={mock} />}
               <Hints attempt={attempt} hints={step.hints} key={`hints:${step.id}`} onReveal={onRevealHint} />
               <Solution
                 attempt={attempt}

@@ -7,9 +7,9 @@ import {
 } from '@codemirror/autocomplete';
 import {indentUnit} from '@codemirror/language';
 import {unifiedMergeView} from '@codemirror/merge';
-import {type Extension, Compartment, EditorState, Prec} from '@codemirror/state';
-import {EditorView, keymap} from '@codemirror/view';
-import {type MutableRefObject, memo, useEffect, useRef} from 'react';
+import {type Extension, Compartment, EditorState, Prec, RangeSet, StateEffect, StateField} from '@codemirror/state';
+import {type DecorationSet, Decoration, EditorView, keymap} from '@codemirror/view';
+import {type MutableRefObject, memo, useEffect, useRef, useState} from 'react';
 
 import {
   type Syntax,
@@ -47,6 +47,11 @@ interface Props {
   fileKey?: string;
   /** Editors replace the open file's document with `value` in place when this changes (reset, load solution); undo brings the edits back. */
   resetKey?: number;
+  /**
+   * The line (1-based) the code never got past: a compile, syntax or import error the last Run or
+   * Submit reported in this file (editors only). Underlined until the next run clears it; edits move it.
+   */
+  error?: {line: number; message: string} | null;
   viewRef?: MutableRefObject<EditorView | null>;
   className?: string;
   /** The editor's accessible name, usually the open file's name; defaults to "<Language> code". */
@@ -64,7 +69,44 @@ const labelExtension = (label: string | undefined, language: Syntax): Extension 
     'aria-label': label ?? `${language === 'proto' ? 'Protocol Buffers' : LANGUAGE_LABEL[language]} code`,
   });
 
-/** Files whose editor state (undo history, selection) is kept while other files are open: a whole course in every language. */
+/** Mark (or clear, with null) the line a compile error points at. */
+const setError = StateEffect.define<{line: number; message: string} | null>();
+
+/**
+ * The reported line's text underlined as the lint package would (`.cm-lintRange-error`), the message
+ * in its tooltip; the mark follows edits until the next run replaces it.
+ */
+const errorField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update: (marks, tr) => {
+    let next = marks.map(tr.changes);
+    for (const effect of tr.effects) {
+      if (!effect.is(setError)) continue;
+      next = Decoration.none;
+      const error = effect.value;
+      if (error === null || error.line < 1 || error.line > tr.state.doc.lines) continue;
+      const line = tr.state.doc.line(error.line);
+      const from = line.from + (line.text.length - line.text.trimStart().length);
+      const tint = Decoration.line({class: 'bg-danger-400/10', attributes: {title: error.message}}).range(line.from);
+      // The line tinted (a blank one too), its text underlined as a lint error.
+      next =
+        from < line.to
+          ? RangeSet.of([tint, Decoration.mark({class: 'cm-lintRange cm-lintRange-error'}).range(from, line.to)])
+          : RangeSet.of(tint);
+    }
+    return next;
+  },
+  provide: field => EditorView.decorations.from(field),
+});
+
+/** A file's editor state and where it was scrolled, both ways, kept while other files are open. */
+interface CachedFile {
+  state: EditorState;
+  /** `EditorView.scrollSnapshot()`: its target type is not exported, and only the view reads it back. */
+  scroll: StateEffect<unknown>;
+}
+
+/** Files whose editor state (undo history, selection, scroll) is kept while other files are open: a whole course in every language. */
 const STATE_CACHE = 32;
 
 const StepEditor = memo(
@@ -82,6 +124,7 @@ const StepEditor = memo(
     viewRef,
     className,
     label,
+    error = null,
   }: Props) => {
     const host = useRef<HTMLDivElement>(null);
     const view = useRef<EditorView | null>(null);
@@ -97,8 +140,14 @@ const StepEditor = memo(
     settingsRef.current = settings;
     const labelRef = useRef(label);
     labelRef.current = label;
-    /** Editor state of every file opened on this view, by `fileKey`; restored when the file is reopened. */
-    const states = useRef(new Map<string, EditorState>());
+    /** Editor state and scroll of every file opened on this view, by `fileKey`; restored when the file is reopened. */
+    const states = useRef(new Map<string, CachedFile>());
+    /**
+     * Focus arrived from the keyboard (not a click in the editor): the hint says how to leave again,
+     * since Tab indents inside the editor.
+     */
+    const [keyboardFocus, setKeyboardFocus] = useState(false);
+    const pointerDown = useRef(false);
     const lastFileKey = useRef(fileKey);
     const lastResetKey = useRef(resetKey);
     onChangeRef.current = onChange;
@@ -109,7 +158,7 @@ const StepEditor = memo(
       const extensions: Extension[] = [
         // First, so Vim's bindings see keys before the editing keymaps.
         settingsCompartment.current.of(settingsExtensions(settings, readOnly)),
-        readOnly ? viewerExtensions() : editorExtensions(baseline),
+        readOnly ? viewerExtensions() : [editorExtensions(baseline), errorField],
         // Typing comfort the read-only viewers do not need: paired brackets and completion of words
         // already in the file (the starter's identifiers are what the learner types most).
         readOnly ? [] : [closeBrackets(), autocompletion({override: [completeAnyWord]})],
@@ -214,7 +263,7 @@ const StepEditor = memo(
         const cached = fileKey === undefined ? undefined : cache.get(fileKey);
         if (fileKey !== undefined) cache.delete(fileKey);
         if (lastFileKey.current !== undefined) {
-          cache.set(lastFileKey.current, v.state);
+          cache.set(lastFileKey.current, {state: v.state, scroll: v.scrollSnapshot()});
           if (cache.size > STATE_CACHE) {
             const [oldest] = cache.keys();
             cache.delete(oldest);
@@ -224,8 +273,14 @@ const StepEditor = memo(
         lastResetKey.current = resetKey;
         // A cached state is only reused when the file was not rewritten meanwhile (reset, load solution).
         v.setState(
-          cached !== undefined && cached.doc.toString() === value ? cached : buildStateRef.current(value, null),
+          cached !== undefined && cached.state.doc.toString() === value
+            ? cached.state
+            : buildStateRef.current(value, null),
         );
+        // The scroller is the view's, not the state's: each file comes back where it was left, both
+        // ways, and a file opened for the first time starts at its top-left corner.
+        v.scrollDOM.scrollTop = 0;
+        v.scrollDOM.scrollLeft = 0;
         v.dispatch({
           effects: [
             languageCompartment.current.reconfigure(languageExtensions(language)),
@@ -233,6 +288,7 @@ const StepEditor = memo(
             settingsCompartment.current.reconfigure(settingsExtensions(settingsRef.current, readOnly)),
           ],
         });
+        if (cached !== undefined) v.dispatch({effects: cached.scroll});
         return;
       }
       if (lastResetKey.current === resetKey) return;
@@ -242,7 +298,44 @@ const StepEditor = memo(
       }
     }, [value, original, readOnly, fileKey, resetKey, language]);
 
-    return <div className={className} ref={host} />;
+    // The compile error's line, in whichever file is open: set after a file swap, cleared with null.
+    useEffect(() => {
+      const v = view.current;
+      if (v === null || readOnly) return;
+      v.dispatch({
+        effects:
+          error === null || error.line > v.state.doc.lines
+            ? setError.of(null)
+            : [
+                setError.of(error),
+                EditorView.scrollIntoView(v.state.doc.line(error.line).from, {y: 'nearest', x: 'nearest'}),
+              ],
+      });
+    }, [error, fileKey, readOnly]);
+
+    if (readOnly) return <div className={className} ref={host} />;
+    return (
+      <div
+        className={`relative flex flex-col ${className ?? ''}`}
+        onBlur={() => setKeyboardFocus(false)}
+        onFocus={() => {
+          setKeyboardFocus(!pointerDown.current);
+          pointerDown.current = false;
+        }}
+        onPointerDown={() => {
+          pointerDown.current = true;
+        }}>
+        <div className="min-h-0 min-w-0 flex-1" ref={host} />
+        {keyboardFocus ? (
+          <p
+            aria-hidden
+            className="border-ink-600 bg-ink-850/90 text-ink-300 pointer-events-none absolute bottom-2 right-3 z-10 rounded-md border px-2 py-0.5 text-[10px]">
+            <kbd className="font-code text-ink-100">Esc</kbd> then <kbd className="font-code text-ink-100">Tab</kbd> to
+            leave the editor
+          </p>
+        ) : null}
+      </div>
+    );
   },
 );
 StepEditor.displayName = 'StepEditor';

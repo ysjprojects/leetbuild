@@ -93,7 +93,7 @@ const Idempotency: FC<WidgetProps> = memo(() => {
         <button className={BUTTON_CLASS} onClick={onTick} type="button">
           Advance clock
         </button>
-        <button className={BUTTON_CLASS} onClick={onReset} type="button">
+        <button aria-label="Reset" className={BUTTON_CLASS} onClick={onReset} title="Reset" type="button">
           ↺
         </button>
       </>

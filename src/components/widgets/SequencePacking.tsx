@@ -2,7 +2,7 @@ import {type ChangeEvent, type FC, type MouseEvent, memo, useCallback, useMemo, 
 
 import {alpha, concept, danger, ink, iris, node, success, warning} from '@/styles/palette';
 
-import WidgetFrame, {clamp, numParam, RANGE_CLASS, tabClass} from './frame';
+import WidgetFrame, {clamp, clickOnKey, numParam, RANGE_CLASS, tabClass} from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
 
@@ -226,7 +226,7 @@ const SequencePacking: FC<WidgetProps> = memo(({params}) => {
 
   return (
     <WidgetFrame controls={controls} readout={readout} title="sequence packing">
-      <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${height}`}>
+      <svg className="w-full" role="group" viewBox={`0 0 ${WIDTH} ${height}`}>
         <title>{`${docs} documents laid into rows of ${seqLen} tokens, ${mode}, and the block-diagonal causal attention mask of row ${
           row + 1
         }`}</title>
@@ -242,7 +242,16 @@ const SequencePacking: FC<WidgetProps> = memo(({params}) => {
             const segsOf = segments(r, lengths, seqLen);
             const pad = segsOf.find(s => s.doc === -1)?.len ?? 0;
             return (
-              <g className="cursor-pointer" data-row={i} key={i} onClick={onPick}>
+              <g
+                aria-label={`row ${i + 1}`}
+                aria-pressed={i === row}
+                className="cursor-pointer"
+                data-row={i}
+                key={i}
+                onClick={onPick}
+                onKeyDown={clickOnKey}
+                role="button"
+                tabIndex={0}>
                 <text fill={i === row ? iris[300] : ink[300]} textAnchor="end" x={ROW_X - 4} y={y + 10}>
                   {i + 1}
                 </text>

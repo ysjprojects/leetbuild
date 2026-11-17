@@ -149,7 +149,7 @@ const AttentionHeatmap: FC<WidgetProps> = memo(({params}) => {
 
   return (
     <WidgetFrame controls={controls} readout={readout} title="attention weights per head">
-      <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
+      <svg className="w-full" role="group" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>{`Head ${head} attention over "${TOKENS.join(' ')}", causal mask ${causal ? 'on' : 'off'}, ${
           scaled ? 'scaled' : 'unscaled'
         }; query row ${row} selected`}</title>

@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import {useRouter} from 'next/router';
 import {type FC, memo, useCallback, useEffect, useMemo, useState} from 'react';
 
 import {type Guide, downloadMarkdown, githubSlug, learnFileName, learnToMarkdown} from '@/lib/export';
@@ -16,9 +17,42 @@ import {renderWidget} from './widgets';
  * debugging courses share (`/guides/<id>`, which ends with the steps to practise it on). The
  * concepts walked through with figures, interactive demos and pop quizzes, a table of contents that
  * follows the sections, and the static versions to take away: the Markdown (figures as Mermaid,
- * quizzes with the answer behind a spoiler) and a PDF laid out for paper (lib/pdf.ts; figures as
- * images, demos as notes, answers printed).
+ * quizzes with the answer behind a spoiler) and a PDF laid out for paper (lib/pdf.ts; figures
+ * drawn, demos as notes, answers printed). Opened from a step (`?from=/<course>/<step>`), it leads
+ * back to that step first.
  */
+
+/** A step of the course a course guide belongs to, for naming the step it was opened from. */
+export interface GuideStep {
+  href: string;
+  title: string;
+}
+
+/** `?from=` when it is a path on this site (never another origin), as `pathname + search`; else `null`. */
+const sameSitePath = (from: string | null): string | null => {
+  if (from === null || !from.startsWith('/') || from.startsWith('//') || from.startsWith('/\\')) return null;
+  try {
+    const url = new URL(from, window.location.origin);
+    return url.origin === window.location.origin ? `${url.pathname}${url.search}` : null;
+  } catch {
+    return null;
+  }
+};
+
+/** What the back link names for the page the guide was opened from: the step (and its course) when the guide knows it. */
+const backLabel = (path: string, guide: Guide, steps: readonly GuideStep[]): string => {
+  const pathname = path.split('?')[0];
+  if (pathname === '/mock-interview') return 'back to the mock report';
+  // A step's address carries its number: `/image-cache/2-cache-aside`.
+  const number = /^\/[^/]+\/(\d+)-/.exec(pathname)?.[1];
+  if (number === undefined) return 'back';
+  const own = steps.find(s => s.href === pathname);
+  if (own !== undefined) return `back to step ${number}: ${own.title}`;
+  const course = guide.practice?.find(c => c.steps.some(s => s.href === pathname));
+  return course === undefined ? 'back to the step' : `back to ${course.course}, step ${number}`;
+};
+
+const NO_STEPS: readonly GuideStep[] = [];
 
 /** The guide's sections: every `#` heading outside fenced code, with the anchor the heading renders. */
 const sectionsOf = (markdown: string): {title: string; id: string}[] => {
@@ -65,8 +99,32 @@ const Practice: FC<{practice: NonNullable<Guide['practice']>}> = memo(({practice
 });
 Practice.displayName = 'Practice';
 
-const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
+const LearnPage: FC<{guide: Guide; steps?: readonly GuideStep[]}> = memo(({guide, steps = NO_STEPS}) => {
   const sections = useMemo(() => sectionsOf(guide.learn), [guide.learn]);
+  const router = useRouter();
+  // Where the guide was opened from (`?from=`), read after hydration: the page is pre-rendered without it.
+  const [from, setFrom] = useState<{href: string; label: string} | null>(null);
+  useEffect(() => {
+    const path = sameSitePath(new URLSearchParams(window.location.search).get('from'));
+    setFrom(path === null || path === guide.back.href ? null : {href: path, label: backLabel(path, guide, steps)});
+  }, [guide, router.asPath, steps]);
+
+  // The address's anchor in view once the page is drawn: on a client-side visit nothing else scrolls
+  // to it, and a heading inside a `:::details` exists only once that section opens itself.
+  useEffect(() => {
+    const id = decodeURIComponent(window.location.hash.slice(1));
+    if (id === '') return undefined;
+    let tries = 0;
+    let timer = 0;
+    const seek = (): void => {
+      const target = document.getElementById(id);
+      if (target !== null) target.scrollIntoView({block: 'start'});
+      else if (++tries < 20) timer = window.setTimeout(seek, 50);
+    };
+    timer = window.setTimeout(seek, 0);
+    return () => window.clearTimeout(timer);
+  }, [guide.id, router.asPath]);
+
   const [active, setActive] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(false);
 
@@ -110,10 +168,17 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
       </header>
 
       <section className="mt-8">
-        {/* The one way back: the course's description, or the guides' index, is where a guide is opened from. */}
-        <Link className={`${ghostButtonClass} -ml-3`} href={guide.back.href}>
-          ← {guide.back.label}
-        </Link>
+        {/* Back to the step it was opened from, when it was; always the course's description or the guides' index. */}
+        <div className="-ml-3 flex flex-wrap items-center gap-x-1">
+          {from !== null ? (
+            <Link className={ghostButtonClass} href={from.href}>
+              ← {from.label}
+            </Link>
+          ) : null}
+          <Link className={ghostButtonClass} href={guide.back.href}>
+            {from === null ? `← ${guide.back.label}` : guide.practice === undefined ? 'course overview' : 'all guides'}
+          </Link>
+        </div>
         <h1 className="text-ink-50 mt-1 text-3xl font-extrabold leading-tight tracking-tight">{guide.title}</h1>
         <p className="text-ink-300 mt-2 max-w-3xl text-[14px] leading-6">{guide.tagline}</p>
         <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -149,7 +214,8 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
             ))}
           </ol>
         </nav>
-        <article className="min-w-0 max-w-4xl">
+        {/* Running text holds to about 75 characters a line; figures, demos, code and tables use the full width. */}
+        <article className="min-w-0 max-w-4xl [&_[data-prose]]:max-w-[35em]">
           <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={guide.learn} />
           {guide.practice !== undefined && guide.practice.length > 0 ? <Practice practice={guide.practice} /> : null}
           {guide.sources.length > 0 ? (

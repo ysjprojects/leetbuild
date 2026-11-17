@@ -10,9 +10,12 @@ import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl
 import {type TreeNode, buildTree} from '@/lib/fileTree';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
+import {listHref} from '@/lib/listReturn';
 import {scrollBehavior} from '@/lib/motion';
+import {type CompileFailure, compileFailure} from '@/lib/outcome';
 import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
 import {stepIssueUrl} from '@/lib/report';
+import {rememberReturning} from '@/lib/returning';
 import {type RuntimeStatus, getRunner, runtimeHarness} from '@/lib/runtime/client';
 import type {OutputLine, RunJob, RunResult} from '@/lib/runtime/types';
 import {
@@ -231,6 +234,8 @@ interface StepOutcome {
   consoleRun: ConsoleRun | null;
   earned: number | null;
   tab: BottomTab;
+  /** The compile, syntax or import error the run stopped at, for the editor to underline. */
+  failure: CompileFailure | null;
 }
 
 /**
@@ -241,9 +246,20 @@ const outcomes = new Map<string, StepOutcome>();
 
 /** Remember a step's outcome, keeping what `patch` leaves out (a program run keeps the last verdict). */
 const remember = (key: string, patch: Partial<StepOutcome>): void => {
-  const previous = outcomes.get(key) ?? {verdict: null, code: '', consoleRun: null, earned: null, tab: 'checks'};
+  const previous = outcomes.get(key) ?? {
+    verdict: null,
+    code: '',
+    consoleRun: null,
+    earned: null,
+    tab: 'checks',
+    failure: null,
+  };
   outcomes.set(key, {...previous, ...patch});
 };
+
+/** Whether a file a runtime names (`api.ts`, `/work/booking/api.ts`) is the workspace file `path`. */
+const sameFile = (reported: string, path: string): boolean =>
+  reported === path || reported.endsWith(`/${path}`) || path.endsWith(`/${reported}`);
 
 /** A check's message as a submission keeps it: enough to recognise the failure, not a whole traceback. */
 const CHECK_MESSAGE_CHARS = 400;
@@ -782,6 +798,10 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   const [verdictCode, setVerdictCode] = useState('');
   const [earned, setEarned] = useState<number | null>(null);
+  /** The compile, syntax or import error the last Run or Submit stopped at: the editor underlines its line. */
+  const [failure, setFailure] = useState<CompileFailure | null>(null);
+  /** A line to bring up once its file is in the editor (a verdict's `file:line`). */
+  const [reveal, setReveal] = useState<{id: string; line: number} | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({state: 'idle'});
   /** A Run or Submit is executing in the runtime, which button started it and when; its result is still to come. */
   const [pending, setPending] = useState<{kind: 'run' | 'submit'; since: number} | null>(null);
@@ -867,6 +887,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** The open step file's name, the editor's accessible name. */
   const openOwner = problem?.steps.find(s => s.id === openFile);
   const openName = openOwner === undefined ? undefined : fileName(openOwner.file, language);
+  /** The compile error's line when it is in the open file (no file named: the step's own). */
+  const editorError = useMemo(() => {
+    if (failure?.line === undefined || step === null) return null;
+    const here =
+      failure.file === undefined ? openFile === step.id : openName !== undefined && sameFile(failure.file, openName);
+    return here ? {line: failure.line, message: failure.message} : null;
+  }, [failure, step, openFile, openName]);
   /** Why Run and Submit wait while the address names a locked step. */
   const lockedTitle = `step ${lockedIndex + 1} is locked: go to step ${stepIndex + 1} to run or submit`;
   /** How much of the editor bar folds in this editor column (0 until measured: nothing folds). */
@@ -956,6 +983,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       setEarned(outcome?.earned ?? null);
       setConsoleRun(outcome?.consoleRun ?? null);
       setBottomTab(outcome?.tab ?? 'checks');
+      setFailure(outcome?.failure ?? null);
     },
     [openTab],
   );
@@ -1024,11 +1052,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   useEffect(() => {
     if (!loaded) return;
     store.saveProgress(progress);
+    rememberReturning(progress);
   }, [progress, loaded, store]);
 
   // Navigation: every move is a route change, so Back and Forward retrace the learner's path ---------
+  /** Back to the list as it was left: its track, filters and search, and (ProblemList restores it) its scroll. */
   const onBack = useCallback(() => {
-    void Router.push('/');
+    void Router.push(listHref());
   }, []);
 
   const onSelectStep = useCallback(
@@ -1344,6 +1374,27 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     } else editorRef.current?.focus();
   }, []);
 
+  /** A verdict's `file:line`: open that workspace file and put the cursor on the line (other files are not the learner's). */
+  const onRevealLine = useCallback(
+    (file: string, line: number) => {
+      const owner = problem?.steps.find(s => sameFile(file, fileName(s.file, language)));
+      if (owner === undefined) return;
+      openTab(owner.id);
+      setReveal({id: owner.id, line});
+    },
+    [problem, language, openTab],
+  );
+
+  // Once the file is in the editor (the editor swaps files in its own effect, which runs first).
+  useEffect(() => {
+    const view = editorRef.current;
+    if (reveal === null || reveal.id !== openFile || view === null) return;
+    setReveal(null);
+    const {doc} = view.state;
+    view.dispatch({selection: {anchor: doc.line(clamp(reveal.line, 1, doc.lines)).from}, scrollIntoView: true});
+    view.focus();
+  }, [reveal, openFile]);
+
   /**
    * The step runs inside the course's real system. The step's own file is the learner's, and so is every
    * step they have passed in this language; every other step — not reached yet, revealed, or passed in
@@ -1409,7 +1460,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       setVerdict(result);
       setReference(null);
       setEarned(points);
-      remember(key, {verdict: result, code: src, earned: points});
+      setFailure(null);
+      remember(key, {verdict: result, code: src, earned: points, failure: null});
       showVerdict();
       return;
     }
@@ -1420,19 +1472,23 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (job === null || runner === null) return;
     setVerdict(null);
     setReference(null);
+    setFailure(null);
     setPending({kind: 'submit', since: Date.now()});
     const output = capture(`submit · ${step.checks.length} checks`, token);
     void runner.run(job, output.onOutput).then(run => {
       setPending(null);
       const decided = withRuntime(result, run);
-      // A runtime that could not run the code is not a wrong submission; a decided run is recorded (and
-      // remembered for its step) even if the learner moved on, but its verdict is only shown for its own step.
-      const points = run.error === undefined ? record(decided, src) : null;
+      // Code that never ran (the runtime failed, or it did not compile or import) is not a wrong
+      // submission; a decided run is recorded (and remembered for its step) even if the learner moved
+      // on, but its verdict is only shown for its own step.
+      const failure = compileFailure(decided.results, run.error);
+      const points = run.error === undefined && failure === null ? record(decided, src) : null;
       const consoleRun = output.finish(run, step.checks);
-      remember(key, {verdict: decided, code: src, consoleRun, earned: points, tab: 'checks'});
+      remember(key, {verdict: decided, code: src, consoleRun, earned: points, tab: 'checks', failure});
       if (submitSeq.current !== token) return;
       setVerdict(decided);
       setEarned(points);
+      setFailure(failure);
       showVerdict();
     });
   }, [problem, step, attemptKey, language, running, lockedStep, runner, assemble, record, showVerdict, capture]);
@@ -1453,15 +1509,18 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     setVerdict(null);
     setReference(null);
     setEarned(null);
+    setFailure(null);
     setPending({kind: 'run', since: Date.now()});
     const output = capture('run · example check', token);
     void runner.run(job, output.onOutput).then(run => {
       setPending(null);
       const verdictNow: Verdict = {...withRuntime(result, run), trial: true};
+      const failure = compileFailure(verdictNow.results, run.error);
       const consoleRun = output.finish(run, step.checks);
-      remember(key, {verdict: verdictNow, code: src, consoleRun, earned: null, tab: 'checks'});
+      remember(key, {verdict: verdictNow, code: src, consoleRun, earned: null, tab: 'checks', failure});
       if (submitSeq.current !== token) return;
       setVerdict(verdictNow);
+      setFailure(failure);
       showVerdict();
     });
   }, [problem, step, language, running, lockedStep, runner, assemble, showVerdict, capture]);
@@ -1876,8 +1935,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 : `Step ${lockedIndex + 1}: ${lockedStep.title} (locked)`}
               <span>{paneOpen ? '▾' : '▸'}</span>
             </button>
+            {/* Stacked, the brief flows in the page's scroll (the toggle above folds it); beside the IDE it scrolls on its own. */}
             <div
-              className={`${paneOpen ? 'block' : 'hidden'} h-[62vh] overflow-hidden lg:h-full ${
+              className={`${paneOpen ? 'block' : 'hidden'} lg:h-full lg:overflow-hidden ${
                 layout.pane ? 'lg:block' : 'lg:hidden'
               }`}>
               <panes.ProblemPane
@@ -2083,6 +2143,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   <panes.StepEditor
                     baseline={openStarter}
                     className="min-h-0 min-w-0 flex-1"
+                    error={editorError}
                     fileKey={`${problem.id}/${openFile}/${language}`}
                     label={openName}
                     language={language}
@@ -2111,10 +2172,12 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   onCertificate={certified ? onCertificate : undefined}
                   onCompare={compare}
                   onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
+                  onRevealLine={onRevealLine}
                   onShowDebrief={onShowDebrief}
                   onTab={setBottomTab}
                   onViewSubmission={onViewSubmission}
                   pending={pending}
+                  problemId={problem.id}
                   program={program}
                   reference={reference}
                   running={running}
@@ -2122,6 +2185,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   shareUrl={stepShareUrl}
                   stale={verdict !== null && verdictCode !== stepCode}
                   step={step}
+                  stepHref={stepPath(problem, step)}
                   tab={bottomTab}
                   verdict={verdict}
                 />

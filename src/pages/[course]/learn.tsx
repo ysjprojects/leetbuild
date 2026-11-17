@@ -2,9 +2,10 @@ import type {GetStaticPaths, GetStaticProps} from 'next';
 import Head from 'next/head';
 import {type FC, memo} from 'react';
 
-import LearnPage from '@/components/LearnPage';
+import LearnPage, {type GuideStep} from '@/components/LearnPage';
 import {problems} from '@/data/problems';
 import {type Guide, guideOf, learnPath} from '@/lib/export';
+import {stepPath} from '@/lib/types';
 
 /**
  * A course's learning guide, `/<problem>/learn`: a reading page rendered on the server from the
@@ -20,9 +21,11 @@ interface Props {
   path: string;
   title: string;
   description: string;
+  /** The course's steps, so a guide opened from one names it in its back link. */
+  steps: GuideStep[];
 }
 
-const CourseGuidePage: FC<Props> = memo(({guide, path, title, description}) => {
+const CourseGuidePage: FC<Props> = memo(({guide, path, title, description, steps}) => {
   const url = SITE_URL === undefined ? undefined : `${SITE_URL}${path}`;
   return (
     <>
@@ -37,7 +40,7 @@ const CourseGuidePage: FC<Props> = memo(({guide, path, title, description}) => {
         <meta content={description} name="twitter:description" />
         <meta content="width=device-width, initial-scale=1" name="viewport" />
       </Head>
-      <LearnPage guide={guide} />
+      <LearnPage guide={guide} steps={steps} />
     </>
   );
 });
@@ -60,6 +63,7 @@ export const getStaticProps: GetStaticProps<Props, {course: string}> = ({params}
       path: learnPath(problem.id),
       title: `${problem.title}: the learning guide — LeetBuild`,
       description: `The concepts behind ${problem.title}, walked through with figures, interactive demos and quizzes. ${problem.tagline}`,
+      steps: problem.steps.map(step => ({href: stepPath(problem, step), title: step.title})),
     },
   };
 };

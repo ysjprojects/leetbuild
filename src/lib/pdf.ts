@@ -1,9 +1,10 @@
 /**
- * The learning guide as a PDF of its own: an A4 document laid out for paper — title page with a
- * table of contents, sections with running footers, code and callouts in boxes, pop quizzes with
- * the answer printed — built from the same parsed dialect the page draws (lib/markdown.ts). The
- * page's figures and interactive demos stay on the page: a demo is a one-line note here, a figure
- * nothing at all. Pure: nothing here touches the DOM.
+ * The learning guide as a PDF of its own: an A4 document laid out for paper (title page with a
+ * table of contents, sections with running footers, code and callouts in boxes, figures, pop
+ * quizzes with the answer printed), built from the same parsed dialect the page draws
+ * (lib/markdown.ts). Figures come in as SVG drawn by the page's own components (lib/guidePdf.ts);
+ * an interactive demo stays on the page and is a one-line note here. Pure: nothing here touches
+ * the DOM.
  */
 import type {Content, ContentTable, ContentText, TableCell, TDocumentDefinitions} from 'pdfmake/interfaces';
 
@@ -93,8 +94,59 @@ const LETTERS = 'ABCDEFGH';
 /** A heading or title: plain text, with its symbols set in the code font when it has any. */
 const plain = (text: string): string | ContentText[] => (SYMBOLS.test(text) ? withSymbols({text}) : text);
 
-/** One block of the dialect as pdfmake content; `null` for what the PDF leaves out. */
-const blockContent = (block: Block): Content | null => {
+export type FigureBlock = Extract<Block, {kind: 'sequence' | 'diagram' | 'architecture' | 'gpu'}>;
+
+/** A figure drawn for paper: standalone SVG markup and its size in CSS px. */
+export interface FigureArt {
+  svg: string;
+  width: number;
+  height: number;
+}
+
+/** The guide's figures in document order, `:::details` bodies included: the order `guideDocument` draws them in. */
+export const figureBlocksOf = (blocks: readonly Block[]): FigureBlock[] =>
+  blocks.flatMap((block): FigureBlock[] =>
+    block.kind === 'details'
+      ? figureBlocksOf(block.body)
+      : block.kind === 'sequence' || block.kind === 'diagram' || block.kind === 'architecture' || block.kind === 'gpu'
+      ? [block]
+      : [],
+  );
+
+/** Tallest a figure is drawn, in points: a tall figure shrinks to keep a page's worth of room. */
+const FIGURE_MAX_HEIGHT = 600;
+
+/** A drawn figure, scaled to the text column (never above its own size), in a thin frame. */
+const figureContent = (art: FigureArt): Content => {
+  const scale = Math.min(1, COLUMN / art.width, FIGURE_MAX_HEIGHT / art.height);
+  return {
+    table: {
+      widths: ['*'],
+      body: [[{svg: art.svg, width: art.width * scale, alignment: 'center', margin: [0, 6, 0, 6]}]],
+    },
+    layout: {
+      hLineWidth: () => 0.5,
+      vLineWidth: () => 0.5,
+      hLineColor: () => RULE,
+      vLineColor: () => RULE,
+      paddingLeft: () => 0,
+      paddingRight: () => 0,
+      paddingTop: () => 0,
+      paddingBottom: () => 0,
+    },
+    margin: [0, 2, 0, 10],
+  };
+};
+
+const FIGURE_NAME: Record<FigureBlock['kind'], string> = {
+  sequence: 'sequence diagram',
+  diagram: 'system diagram',
+  architecture: 'architecture figure',
+  gpu: 'GPU figure',
+};
+
+/** One block of the dialect as pdfmake content; `null` for what the PDF leaves out. `figure` draws the next figure. */
+const blockContent = (block: Block, figure: (block: FigureBlock) => FigureArt | null): Content | null => {
   switch (block.kind) {
     case 'heading':
       return block.level === 1
@@ -134,7 +186,18 @@ const blockContent = (block: Block): Content | null => {
         canvas: [{type: 'line', x1: 0, y1: 0, x2: COLUMN, y2: 0, lineWidth: 0.5, lineColor: RULE}],
         margin: [0, 6, 0, 10],
       };
-    case 'quiz':
+    case 'quiz': {
+      const reasons = block.quiz.reasons
+        .map((reason, i): Content | null =>
+          reason === ''
+            ? null
+            : {
+                text: [{text: `${LETTERS[i]}: `, bold: true, color: MUTED}, ...runs(reason)],
+                style: 'body',
+                margin: [0, 2, 0, 0],
+              },
+        )
+        .filter((c): c is Content => c !== null);
       return box(
         [
           {text: 'POP QUIZ', style: 'label'},
@@ -154,9 +217,11 @@ const blockContent = (block: Block): Content | null => {
             style: 'body',
             margin: [0, 4, 0, 0],
           },
+          ...reasons,
         ],
         'panel',
       );
+    }
     case 'widget':
       return box(
         [
@@ -169,22 +234,41 @@ const blockContent = (block: Block): Content | null => {
       return {
         stack: [
           {text: plain(block.title), style: 'h3', margin: [0, 4, 0, 4]},
-          ...block.body.map(blockContent).filter((c): c is Content => c !== null),
+          ...block.body.map(b => blockContent(b, figure)).filter((c): c is Content => c !== null),
         ],
       };
     case 'sequence':
     case 'diagram':
     case 'architecture':
-    case 'gpu':
-      return null;
+    case 'gpu': {
+      const art = figure(block);
+      return art !== null
+        ? figureContent(art)
+        : box(
+            [
+              {text: 'FIGURE · ON THE PAGE', style: 'label'},
+              {
+                text: `The ${FIGURE_NAME[block.kind]} could not be drawn here; see it on the page.`,
+                style: 'body',
+                margin: [0, 2, 0, 0],
+              },
+            ],
+            'panel',
+          );
+    }
     case 'malformed':
       return {text: block.what, style: 'body', color: MUTED, italics: true};
   }
 };
 
-/** The whole document. */
-export function guideDocument(guide: Guide): TDocumentDefinitions {
+/**
+ * The whole document. `figures` holds the drawn figures in `figureBlocksOf` order; a missing one
+ * becomes a note pointing at the page.
+ */
+export function guideDocument(guide: Guide, figures: readonly (FigureArt | null)[] = []): TDocumentDefinitions {
   const blocks = parseBlocks(guide.learn);
+  let next = 0;
+  const figure = (): FigureArt | null => figures[next++] ?? null;
   const footerLabel = `${guide.title} — a LeetBuild learning guide`;
   return {
     pageSize: 'A4',
@@ -219,7 +303,7 @@ export function guideDocument(guide: Guide): TDocumentDefinitions {
       {text: plain(guide.tagline), style: 'tagline'},
       {toc: {title: {text: 'Contents', style: 'contents'}, textMargin: [0, 1, 0, 1]}},
       {text: '', pageBreak: 'after'},
-      ...blocks.map(blockContent).filter((c): c is Content => c !== null),
+      ...blocks.map(b => blockContent(b, figure)).filter((c): c is Content => c !== null),
       ...(guide.sources.length === 0
         ? []
         : [

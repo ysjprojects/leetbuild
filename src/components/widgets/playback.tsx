@@ -55,7 +55,7 @@ const PlaybackControls: FC<{label?: string; playback: Playback}> = memo(({label 
       <button aria-label="next step" className={BUTTON_CLASS} onClick={next} type="button">
         ›
       </button>
-      <button aria-label="reset" className={BUTTON_CLASS} onClick={reset} type="button">
+      <button aria-label="Reset" className={BUTTON_CLASS} onClick={reset} title="Reset" type="button">
         ↺
       </button>
       <label className="flex items-center gap-1.5">

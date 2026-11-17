@@ -1,9 +1,11 @@
-import {type FC, type MouseEvent, memo, useCallback, useEffect, useMemo, useRef} from 'react';
+import {type FC, type KeyboardEvent, type MouseEvent, memo, useCallback, useEffect, useMemo, useRef} from 'react';
 
 import {type PlacedNode, arrowHead, EDGE_FONT, LABEL_FONT, layoutDiagram, SUB_FONT} from '@/lib/layout';
 import {scrollBehavior} from '@/lib/motion';
 import type {Diagram, EdgeKind, NodeKind} from '@/lib/types';
 import {concept, ink, node as KIND_COLOR} from '@/styles/palette';
+
+import {SCROLL_MIN_CAP, useScrollsSideways} from './widgets/frame';
 
 /**
  * The problem's architecture as an SVG: boxes per component (coloured by kind) and labelled
@@ -118,13 +120,16 @@ const Node: FC<{
   const labelY = node.subLines.length === 0 ? y + node.h / 2 + 4.5 : y + 20;
   return (
     <g
+      aria-label={clickable ? `${node.label}, built in step ${steps.join(', ')}: open it` : undefined}
       className={clickable ? 'cursor-pointer' : undefined}
       data-node={clickable ? node.id : undefined}
-      opacity={lit ? 1 : 0.35}>
+      opacity={lit ? 1 : 0.35}
+      role={clickable ? 'button' : undefined}
+      tabIndex={clickable ? 0 : undefined}>
       <title>
         {steps.length === 0
-          ? `${node.label} — provided, not built here`
-          : `${node.label} — built in step ${steps.join(', ')}${clickable ? ' (click to open)' : ''}`}
+          ? `${node.label}: provided, not built here`
+          : `${node.label}: built in step ${steps.join(', ')}${clickable ? ' (click to open)' : ''}`}
       </title>
       <rect
         fill={lit && dimming ? LIT_NODE_FILL : NODE_FILL}
@@ -161,14 +166,24 @@ const SystemDiagram: FC<{
   stepsByNode?: Record<string, number[]>;
   onSelectNode?: (id: string) => void;
 }> = memo(({diagram, focus, compact = false, stepsByNode, onSelectNode}) => {
-  // Event delegation: every node group carries data-node; one handler on the svg serves them all.
-  const onClick = useCallback(
-    (e: MouseEvent<SVGSVGElement>) => {
-      if (onSelectNode === undefined) return;
-      const id = (e.target as SVGElement).closest('[data-node]')?.getAttribute('data-node');
-      if (id !== null && id !== undefined) onSelectNode(id);
+  // Event delegation: every node group carries data-node; one handler on the svg serves them all,
+  // for a click and for Enter or Space on a node in keyboard focus.
+  const select = useCallback(
+    (target: EventTarget): boolean => {
+      const id =
+        onSelectNode === undefined ? null : (target as SVGElement).closest('[data-node]')?.getAttribute('data-node');
+      if (id === null || id === undefined) return false;
+      onSelectNode?.(id);
+      return true;
     },
     [onSelectNode],
+  );
+  const onClick = useCallback((e: MouseEvent<SVGSVGElement>) => void select(e.target), [select]);
+  const onKeyDown = useCallback(
+    (e: KeyboardEvent<SVGSVGElement>) => {
+      if ((e.key === 'Enter' || e.key === ' ') && select(e.target)) e.preventDefault();
+    },
+    [select],
   );
   const layout = useMemo(() => layoutDiagram(diagram), [diagram]);
   const focused = useMemo(() => {
@@ -189,14 +204,19 @@ const SystemDiagram: FC<{
     return kinds;
   }, [diagram.nodes]);
   const wide = layout.width / layout.height > WIDE_ASPECT;
+  // Never drawn below a readable scale: a narrow column scrolls sideways instead. A wide diagram
+  // always did that; any other asks for no more than SCROLL_MIN_CAP, so a desktop pane scales it.
   const svgStyle = useMemo(
-    () =>
-      wide
-        ? {width: `max(100%, ${Math.round(layout.width * MIN_READABLE_SCALE)}px)`, height: 'auto'}
-        : {maxHeight: compact ? 240 : undefined},
+    () => ({
+      width: `max(100%, ${Math.round(
+        wide ? layout.width * MIN_READABLE_SCALE : Math.min(layout.width * MIN_READABLE_SCALE, SCROLL_MIN_CAP),
+      )}px)`,
+      ...(wide ? {height: 'auto'} : {maxHeight: compact ? 240 : undefined}),
+    }),
     [compact, wide, layout.width],
   );
   const scroller = useRef<HTMLDivElement>(null);
+  const scrolls = useScrollsSideways(scroller);
   // When a step opens, bring the first component it builds into view.
   useEffect(() => {
     const el = scroller.current;
@@ -208,11 +228,17 @@ const SystemDiagram: FC<{
   }, [focus, layout]);
 
   return (
-    <div className="border-ink-700 bg-ink-850 overflow-x-auto rounded-xl border p-2" ref={scroller}>
+    <div
+      aria-label={scrolls ? 'System architecture, scrolls sideways' : undefined}
+      className="border-ink-700 bg-ink-850 overflow-x-auto rounded-xl border p-2"
+      ref={scroller}
+      role={scrolls ? 'region' : undefined}
+      tabIndex={scrolls ? 0 : undefined}>
       <svg
         className="w-full"
         onClick={onClick}
-        role="img"
+        onKeyDown={onKeyDown}
+        role={onSelectNode === undefined ? 'img' : 'group'}
         style={svgStyle}
         viewBox={`0 ${layout.originY} ${layout.width} ${layout.height}`}>
         <title>System architecture</title>
@@ -285,7 +311,7 @@ const SystemDiagram: FC<{
             {KIND_LABEL[kind]}
           </span>
         ))}
-        {wide ? <span className="text-ink-400">wide diagram · scroll sideways</span> : null}
+        {scrolls ? <span className="text-ink-400">wide diagram · scroll sideways</span> : null}
       </div>
     </div>
   );

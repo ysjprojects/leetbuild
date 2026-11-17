@@ -1,9 +1,12 @@
+import Link from 'next/link';
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
+import {checkGuideLinks} from '@/data/guides/checkSections';
 import type {BottomTab, ConsoleRun} from '@/lib/console';
 import {type CheckResult, type Verdict, commonMessage, describeMatcher, judge} from '@/lib/judge';
 import {type MetricRow, comparedRows, metricByCheck, total} from '@/lib/metrics';
 import {scrollBehavior} from '@/lib/motion';
+import {type CompileFailure, type MessagePart, compileFailure, layoutMessage} from '@/lib/outcome';
 import type {RuntimeStatus} from '@/lib/runtime/client';
 import type {Phase} from '@/lib/runtime/types';
 import type {StepAttempt, Submission} from '@/lib/scoring';
@@ -135,8 +138,12 @@ const firstLine = (text: string): string => text.split('\n')[0];
 
 /** The verdict as the status line says it: short, with no glyphs. */
 const verdictSays = (verdict: Verdict, earned: number | null): string => {
-  const error = verdict.run?.error;
-  if (error !== undefined) return `Could not run: ${firstLine(error)}`;
+  const failure = compileFailure(verdict.results, verdict.run?.error);
+  const error = failure?.message ?? verdict.run?.error;
+  if (error !== undefined)
+    return `Could not run: ${firstLine(error)}. ${
+      verdict.trial === true ? 'Nothing was recorded' : 'It did not count'
+    }.`;
   if (verdict.trial === true) return verdict.accepted ? 'Example check passed' : 'Example check failed';
   if (verdict.accepted)
     return earned !== null && earned > 0 ? `Accepted, plus ${earned} point${earned === 1 ? '' : 's'}` : 'Accepted';
@@ -254,6 +261,141 @@ const ExpectedShape: FC<{check: StepCheck; language: Language}> = memo(({check, 
 });
 ExpectedShape.displayName = 'ExpectedShape';
 
+/** A folded value's text to read: JSON indented, anything else (a Python repr, a Go map) as it came. */
+const readable = (value: string): string => {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+};
+
+/** One line of a check's message: its text, each long value a toggle that opens it under the line. */
+const MessageLine: FC<{parts: readonly MessagePart[]; className: string; where?: string | null}> = memo(
+  ({parts, className, where = null}) => {
+    const [open, setOpen] = useState<ReadonlySet<number>>(() => new Set());
+    const toggle = useCallback(
+      (k: number) =>
+        setOpen(previous => {
+          const next = new Set(previous);
+          if (!next.delete(k)) next.add(k);
+          return next;
+        }),
+      [],
+    );
+    return (
+      <div className={className}>
+        <p className="whitespace-pre-wrap break-words">
+          {parts.map((part, k) =>
+            'text' in part ? (
+              <span key={k}>{part.text}</span>
+            ) : (
+              <button
+                aria-expanded={open.has(k)}
+                className="text-iris-300 hover:text-iris-200 font-sans text-[11px] font-semibold transition"
+                key={k}
+                onClick={() => toggle(k)}
+                title={`${part.value.length} characters`}
+                type="button">
+                <span className="font-code">{part.value.startsWith('[') ? '[…]' : '{…}'}</span>{' '}
+                {open.has(k) ? 'hide' : 'show'} {part.label} {open.has(k) ? '‹' : '›'}
+              </button>
+            ),
+          )}
+          {where !== null ? <span className="text-ink-400">{where}</span> : null}
+        </p>
+        {parts.map((part, k) =>
+          'value' in part && open.has(k) ? (
+            <pre
+              className="border-ink-700 bg-ink-950 text-ink-100 my-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded border px-2 py-1 text-[11px]"
+              key={k}>
+              {readable(part.value)}
+            </pre>
+          ) : null,
+        )}
+      </div>
+    );
+  },
+);
+MessageLine.displayName = 'MessageLine';
+
+/**
+ * A check's message, laid out to read: what it expected first, then what it observed with long
+ * values (a response body, a stored record) folded, then where it was raised.
+ */
+const CheckMessage: FC<{message: string; className: string; tone?: string}> = memo(
+  ({message, className, tone = 'text-danger-200'}) => {
+    const layout = useMemo(() => layoutMessage(message), [message]);
+    return (
+      <div className={`font-code ${className}`}>
+        {layout.expected !== null ? <MessageLine className={tone} parts={layout.expected} /> : null}
+        <MessageLine
+          className={layout.expected !== null ? 'text-ink-300' : tone}
+          parts={layout.observed}
+          where={layout.where}
+        />
+      </div>
+    );
+  },
+);
+CheckMessage.displayName = 'CheckMessage';
+
+/** A compile failure's message with its `file:line` a button that shows that line in the editor. */
+const FailureMessage: FC<{failure: CompileFailure; onRevealLine?: (file: string, line: number) => void}> = memo(
+  ({failure, onRevealLine}) => {
+    const {message, file, line} = failure;
+    const place = file !== undefined && line !== undefined ? `${file}:${line}` : null;
+    const at = place === null || onRevealLine === undefined ? -1 : message.indexOf(place);
+    if (at < 0 || file === undefined || line === undefined || onRevealLine === undefined)
+      return <p className="font-code text-ink-50 mt-1.5 whitespace-pre-wrap break-words text-[12px]">{message}</p>;
+    return (
+      <p className="font-code text-ink-50 mt-1.5 whitespace-pre-wrap break-words text-[12px]">
+        {message.slice(0, at)}
+        <button
+          className="text-warning-200 hover:text-ink-50 font-semibold underline underline-offset-2 transition"
+          onClick={() => onRevealLine(file, line)}
+          title={`show line ${line} of ${file} in the editor`}
+          type="button">
+          {place}
+        </button>
+        {message.slice(at + (place?.length ?? 0))}
+      </p>
+    );
+  },
+);
+FailureMessage.displayName = 'FailureMessage';
+
+/** `?from=` on a guide link, before its `#section`: the guide's back link returns to this step. */
+const withFrom = (href: string, from: string | undefined): string => {
+  if (from === undefined) return href;
+  const hash = href.indexOf('#');
+  const [path, section] = hash < 0 ? [href, ''] : [href.slice(0, hash), href.slice(hash)];
+  return `${path}?from=${encodeURIComponent(from).replace(/%2F/g, '/')}${section}`;
+};
+
+/** The guide sections that explain why a check fails, once the check is mapped to them. */
+const WhyLinks: FC<{problemId: string; stepId: string; checkId: string; from?: string}> = memo(
+  ({problemId, stepId, checkId, from}) => {
+    const links = useMemo(() => checkGuideLinks(problemId, stepId, checkId), [problemId, stepId, checkId]);
+    if (links.length === 0) return null;
+    return (
+      <ul className="mt-1 space-y-0.5 pl-6 text-[12px]">
+        {links.map(link => (
+          <li key={link.href}>
+            <Link
+              className="text-iris-300 hover:text-iris-200 transition"
+              href={withFrom(link.href, from)}
+              title="opens the guide at the section that explains this check">
+              Why this fails: <span className="font-semibold">{link.label}</span> ›
+            </Link>
+          </li>
+        ))}
+      </ul>
+    );
+  },
+);
+WhyLinks.displayName = 'WhyLinks';
+
 const formatTime = (at: number): string => {
   const d = new Date(at);
   const today = new Date();
@@ -317,9 +459,7 @@ const SubmissionRow: FC<{
                   {index >= 0 ? <span className="text-ink-400 text-[10px]">{index + 1}</span> : null}
                   <span className="font-sans font-semibold">{index >= 0 ? checks[index].title : c.id}</span>
                 </p>
-                {c.message !== undefined ? (
-                  <p className="text-danger-200 whitespace-pre-wrap break-words pl-5">{c.message}</p>
-                ) : null}
+                {c.message !== undefined ? <CheckMessage className="pl-5" message={c.message} /> : null}
               </li>
             );
           })}
@@ -699,6 +839,12 @@ const VerdictPane: FC<{
   /** Which view the panel shows: the checks or the console. */
   tab: BottomTab;
   onTab: (tab: BottomTab) => void;
+  /** Show a line of a file in the editor: a compile failure's `file:line`. */
+  onRevealLine?: (file: string, line: number) => void;
+  /** The course, to link each failing check to the guide sections that explain it. */
+  problemId?: string;
+  /** This step's address, so a guide opened from a check leads back here. */
+  stepHref?: string;
 }> = memo(
   ({
     step,
@@ -725,9 +871,19 @@ const VerdictPane: FC<{
     consoleRun,
     tab,
     onTab,
+    onRevealLine,
+    problemId,
+    stepHref,
   }) => {
     const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
     const runError = verdict?.run?.error;
+    /** The code never got to run (a compile, syntax or import error): one card, nothing counted. */
+    const failure = useMemo(
+      () => (verdict === null ? null : compileFailure(verdict.results, verdict.run?.error)),
+      [verdict],
+    );
+    /** No check was decided: the rows stay unrun under the card that says why. */
+    const undecided = failure !== null || runError !== undefined;
     /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
     const common = useMemo(() => (verdict === null ? null : commonMessage(verdict)), [verdict]);
     /** Checks whose static pattern already matches the starter: their shape cannot tell the starter from a fix. */
@@ -873,7 +1029,19 @@ const VerdictPane: FC<{
                   </p>
                 ) : (
                   <div ref={card}>
-                    {runError !== undefined ? (
+                    {failure !== null ? (
+                      <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
+                        <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">
+                          {verdict.trial === true ? 'Run' : 'Submit'}
+                        </p>
+                        <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
+                        <FailureMessage failure={failure} onRevealLine={onRevealLine} />
+                        <p className="text-warning-200 mt-1.5 text-[12px]">
+                          No check ran, so{' '}
+                          {verdict.trial === true ? 'nothing was recorded' : 'this did not count as a submission'}.
+                        </p>
+                      </div>
+                    ) : runError !== undefined ? (
                       <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
                         <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">Runtime</p>
                         <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
@@ -987,7 +1155,9 @@ const VerdictPane: FC<{
                             ? 'Failing checks now show the shape the judge expects.'
                             : `Fix the failing ones and submit again — after ${SHAPE_AFTER_WRONG} wrong submissions, failing checks show the exact shape the judge expects.`}
                         </p>
-                        {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
+                        {common !== null ? (
+                          <CheckMessage className="mt-1.5 text-[12px]" message={common} tone="text-ink-50" />
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -1008,7 +1178,7 @@ const VerdictPane: FC<{
               ) : null}
               <ul aria-busy={busy} className="space-y-1.5">
                 {step.checks.map((check, i) => {
-                  const result = verdict?.results.find(r => r.id === check.id) ?? null;
+                  const result = undecided ? null : verdict?.results.find(r => r.id === check.id) ?? null;
                   /** This check is in the run under way: every check for a Submit, the example for a Run. */
                   const inFlight =
                     busy && executes && pending !== null && !program && (pending.kind === 'submit' || i === 0);
@@ -1047,11 +1217,14 @@ const VerdictPane: FC<{
                       {result !== null && !result.passed ? (
                         <>
                           {result.message !== undefined && result.message !== common ? (
-                            <p className="font-code text-danger-200 mt-1 pl-6 text-[12px]">{result.message}</p>
+                            <CheckMessage className="mt-1 pl-6 text-[12px]" message={result.message} />
                           ) : null}
                           <p className="text-ink-200 mt-1 pl-6 text-[12px]">
                             <InlineMarkdown source={check.detail} />
                           </p>
+                          {problemId !== undefined ? (
+                            <WhyLinks checkId={check.id} from={stepHref} problemId={problemId} stepId={step.id} />
+                          ) : null}
                           {showShape && result.shape === undefined ? (
                             <ExpectedShape check={check} language={language} />
                           ) : null}

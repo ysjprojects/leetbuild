@@ -7,7 +7,8 @@
  *   ```python try           fenced code (`try` adds "Load into editor" where there is one)
  *   | a | b |             pipe tables with a |---| separator row; `\|` is a pipe inside a cell
  *   ---                   horizontal rule
- *   :::quiz               pop quiz: `Q: prompt`, options `- [ ]` / `- [x]`, `> explanation`, `:::`
+ *   :::quiz               pop quiz: `Q: prompt`, options `- [ ]` / `- [x]`, `> explanation`, `:::`; an option may
+ *                         end in ` > why` (outside code spans): what the reader learns on picking it
  *   :::widget name {json} interactive visual (the renderer decides what to draw)
  *   :::details Title      collapsible section until the closing `:::`
  *   :::sequence / :::diagram  a JSON `Sequence` / `Diagram` (lib/types) up to the closing `:::`
@@ -22,6 +23,8 @@ import type {Diagram, Sequence} from './types';
 export interface PopQuizSpec {
   prompt: string;
   options: string[];
+  /** Per option, why it is right or wrong; `''` where the quiz gives no reason for it. */
+  reasons: string[];
   answer: number;
   explanation: string;
 }
@@ -86,17 +89,39 @@ const tableCells = (line: string): string[] =>
     .split('|')
     .map(cell => cell.replace(/\uE002/g, '|').trim());
 
+/**
+ * A quiz option's text and its optional reason, `- [ ] text > why`: split at the first ` > ` outside
+ * a code span, so `` `offset > watermark` `` stays in the text.
+ */
+export const splitQuizOption = (option: string): {text: string; reason: string} => {
+  let code = false;
+  for (let i = 0; i < option.length; i++) {
+    if (option[i] === '`') code = !code;
+    else if (!code && option.startsWith(' > ', i))
+      return {text: option.slice(0, i).trim(), reason: option.slice(i + 3).trim()};
+  }
+  return {text: option.trim(), reason: ''};
+};
+
+/** A `- [ ]` / `- [x]` quiz option line: whether it is the answer, its text and its reason; `null` for another line. */
+export const quizOptionLine = (line: string): {correct: boolean; text: string; reason: string} | null => {
+  const option = /^-\s*\[( |x|X)\]\s*(.*)$/.exec(line.trim());
+  return option === null ? null : {correct: option[1] !== ' ', ...splitQuizOption(option[2])};
+};
+
 const parseQuiz = (lines: string[]): PopQuizSpec => {
   const promptLines: string[] = [];
   const options: string[] = [];
+  const reasons: string[] = [];
   const explanation: string[] = [];
   let answer = 0;
   for (const raw of lines) {
     const line = raw.trim();
-    const option = /^-\s*\[( |x|X)\]\s*(.*)$/.exec(line);
+    const option = quizOptionLine(line);
     if (option !== null) {
-      if (option[1].toLowerCase() === 'x') answer = options.length;
-      options.push(option[2]);
+      if (option.correct) answer = options.length;
+      options.push(option.text);
+      reasons.push(option.reason);
       continue;
     }
     if (line.startsWith('> ')) {
@@ -109,7 +134,7 @@ const parseQuiz = (lines: string[]): PopQuizSpec => {
     }
     if (line !== '') (options.length === 0 ? promptLines : explanation).push(line);
   }
-  return {prompt: promptLines.join(' '), options, answer, explanation: explanation.join(' ')};
+  return {prompt: promptLines.join(' '), options, reasons, answer, explanation: explanation.join(' ')};
 };
 
 export const parseBlocks = (source: string): Block[] => {

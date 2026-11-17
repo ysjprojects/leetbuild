@@ -22,6 +22,7 @@ import {scrollBehavior} from '@/lib/motion';
 import {alpha, concept, danger, ink, iris, warning} from '@/styles/palette';
 
 import {InlineMarkdown} from './Markdown';
+import {readableMinWidth, useScrollsSideways} from './widgets/frame';
 
 /**
  * The CUDA programming model drawn as GPU references draw it (lib/gpuFigure.ts for the spec):
@@ -176,6 +177,7 @@ const GpuDiagram: FC<{
 
   // A step's parts come into view when the compact figure is wider than the pane.
   const scroller = useRef<HTMLDivElement>(null);
+  const scrolls = useScrollsSideways(scroller);
   useEffect(() => {
     const el = scroller.current;
     if (el === null || !compact || focused.size === 0) return;
@@ -234,7 +236,7 @@ const GpuDiagram: FC<{
   const svg = (
     <svg
       className="block"
-      role="img"
+      role={details.size > 0 ? 'group' : 'img'}
       style={{width: '100%', height: 'auto', fontVariantLigatures: 'none'}}
       viewBox={`${layout.minX} ${layout.minY} ${layout.width} ${layout.height}`}>
       <title>GPU figure</title>
@@ -530,14 +532,16 @@ const GpuDiagram: FC<{
           </button>
         </div>
       ) : null}
-      <div className={compact ? 'overflow-x-auto' : undefined} ref={scroller}>
+      {/* A figure wider than its column scrolls sideways rather than shrinking its text below 80 %. */}
+      <div
+        aria-label={scrolls ? 'GPU figure, scrolls sideways' : undefined}
+        className="overflow-x-auto"
+        ref={scroller}
+        role={scrolls ? 'region' : undefined}
+        tabIndex={scrolls ? 0 : undefined}>
         <div
           className="relative mx-auto"
-          style={{
-            maxWidth: layout.width * (compact ? 1 : 1.08),
-            // In the pane a wide figure scrolls sideways rather than shrinking its text below 80%.
-            minWidth: compact ? layout.width * 0.8 : undefined,
-          }}>
+          style={{maxWidth: layout.width * (compact ? 1 : 1.08), minWidth: readableMinWidth(layout.width)}}>
           {svg}
           {tooltip}
         </div>
@@ -560,7 +564,7 @@ const GpuDiagram: FC<{
               {l.label}
             </span>
           ))}
-          {hasDetails ? <span>hover a part marked with a dot for what it does</span> : null}
+          {hasDetails ? <span>hover or tab to a part marked with a dot for what it does</span> : null}
         </p>
       ) : null}
     </div>

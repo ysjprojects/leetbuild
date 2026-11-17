@@ -30,6 +30,7 @@ export const SHORTCUTS: readonly Shortcut[] = [
   {keys: alt('['), label: 'Previous step'},
   {keys: '?', label: 'This list (outside the editor)'},
   {keys: 'Esc', label: 'Close a dialog or the scratchpad'},
+  {keys: 'Esc then Tab', label: 'Leave the editor (Tab indents inside it)'},
 ];
 
 /** True when typing in `target` should keep plain keys (like `?`) to itself. */
