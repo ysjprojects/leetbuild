@@ -76,9 +76,22 @@ redisReply* make_error(const std::string& message) {
   return out;
 }
 
-redisReply* tagged_reply(const lb::Json& tagged, const std::string& name) {
+redisReply* tagged_reply(const lb::Json& tagged, const std::vector<std::string>& args) {
   if (tagged.has("e")) return make_error(tagged["e"].as_string());
-  return make_reply(tagged["r"], status_command(name));
+  // `SET … GET` answers the old value as a bulk string (or nil), not a status line (Redis 7).
+  bool status = status_command(args[0]);
+  if (status && args.size() > 3) {
+    std::string n = args[0];
+    std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (n == "set") {
+      for (size_t i = 3; i < args.size(); i++) {
+        std::string o = args[i];
+        std::transform(o.begin(), o.end(), o.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (o == "get") status = false;
+      }
+    }
+  }
+  return make_reply(tagged["r"], status);
 }
 
 lb::Json reply_json(const redisReply& r) {
@@ -210,7 +223,7 @@ void* run(redisContext* c, const std::vector<std::string>& args) {
     std::snprintf(c->errstr, sizeof c->errstr, "empty command");
     return nullptr;
   }
-  return sw::redis::detail::tagged_reply(tagged_call(args), args[0]);
+  return sw::redis::detail::tagged_reply(tagged_call(args), args);
 }
 
 int append(redisContext* c, std::vector<std::string> args) {
@@ -274,7 +287,7 @@ int redisGetReply(redisContext* c, void** reply) {
     for (const auto& q : c->impl->queued) cmds.push(sw::redis::detail::to_json(q));
     const lb::Json tagged = sw::redis::detail::from_bridge(lb::call("redis.pipeline", cmds));
     for (size_t i = 0; i < tagged.items().size(); i++) {
-      c->impl->replies.push_back(sw::redis::detail::tagged_reply(tagged.items()[i], c->impl->queued[i][0]));
+      c->impl->replies.push_back(sw::redis::detail::tagged_reply(tagged.items()[i], c->impl->queued[i]));
     }
     c->impl->queued.clear();
   }

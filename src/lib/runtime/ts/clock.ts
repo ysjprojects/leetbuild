@@ -15,6 +15,7 @@ interface Timer {
   interval: number | null;
 }
 
+const RealDate = Date;
 const realNow = Date.now.bind(Date);
 const realPerformanceNow = globalThis.performance?.now.bind(globalThis.performance);
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
@@ -197,6 +198,17 @@ export class Clock {
     if (this.installed) return;
     this.installed = true;
     Date.now = () => this.now();
+    // `new Date()` and `Date()` read the virtual now, as Node's do the real one; every other form
+    // (`new Date(ms)`, statics, `instanceof`, the prototype) is the real constructor's.
+    const now = (): number => this.now();
+    const VirtualDate = function (this: unknown, ...args: unknown[]) {
+      if (new.target === undefined) return new RealDate(now()).toString();
+      const made: Date = Reflect.construct(RealDate, args.length === 0 ? [now()] : args, new.target);
+      return made;
+    } as unknown as DateConstructor;
+    Object.setPrototypeOf(VirtualDate, RealDate);
+    Object.defineProperty(VirtualDate, 'prototype', {value: RealDate.prototype});
+    globalThis.Date = VirtualDate;
     const perf = globalThis.performance;
     if (perf !== undefined) perf.now = () => this.now();
     // Node hands a timer's extra arguments to its callback: `setTimeout(resolve, 2000, false)`.
@@ -221,6 +233,7 @@ export class Clock {
   uninstall(): void {
     if (!this.installed) return;
     this.installed = false;
+    globalThis.Date = RealDate;
     Date.now = realNow;
     const perf = globalThis.performance;
     if (perf !== undefined && realPerformanceNow !== undefined) perf.now = realPerformanceNow;

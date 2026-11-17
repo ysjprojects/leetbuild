@@ -1947,7 +1947,6 @@ export class RedisServer {
         const numkeys = int(a[1]);
         const keys = a.slice(2, 2 + numkeys);
         const argv = a.slice(2 + numkeys);
-        const statusCommand = (cmd: string): boolean => STATUS_REPLIES.has(cmd);
         let out: string;
         // Commands from the script never block (XREAD with BLOCK is an error there, as in Redis).
         const caller = this.caller;
@@ -1957,7 +1956,11 @@ export class RedisServer {
             const args = (JSON.parse(argsJson) as (string | number)[]).map(String);
             const cmd = args[0].toLowerCase();
             try {
-              return JSON.stringify(tag(this.run(cmd, args.slice(1)), statusCommand(cmd)));
+              const rest = args.slice(1);
+              // `SET … GET` answers the old value as a bulk string (or nil), not a status line (Redis 7).
+              const status =
+                STATUS_REPLIES.has(cmd) && !(cmd === 'set' && rest.slice(2).some(o => o.toLowerCase() === 'get'));
+              return JSON.stringify(tag(this.run(cmd, rest), status));
             } catch (e) {
               return JSON.stringify({t: 'err', v: e instanceof Error ? e.message : String(e)});
             }

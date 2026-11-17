@@ -922,6 +922,13 @@ const SCENARIOS: Record<string, (s: RedisServer, check: Check) => void> = {
     );
     check('no table.unpack', s.execute(['eval', 'return type(table.unpack)', '0']), 'nil');
   },
+  'SET … GET in a script answers a bulk string or nil (Redis 7)': (s, check) => {
+    const run = (script: string) => s.execute(['eval', script, '1', 'k']);
+    check('no old value', run("return redis.call('set', KEYS[1], 'a', 'GET')"), null);
+    check('old value', run("return redis.call('set', KEYS[1], 'b', 'GET')"), 'a');
+    check('a string in Lua', run("return type(redis.call('set', KEYS[1], 'c', 'GET'))"), 'string');
+    check('plain SET is a status', run("return redis.call('set', KEYS[1], 'd').ok"), 'OK');
+  },
   "Lua 5.1's numbers are doubles": (s, check) => {
     const run = (script: string, ...rest: string[]) => s.execute(['eval', script, ...rest]);
     const at = '1794890484';
