@@ -24,7 +24,8 @@ Requirements:
 
 - The record is **keyed by \`dataset_id\`**: one dataset, one partition, one order.
 - The provided \`dedupe\` index (\`is_duplicate\`, \`mark\`) is consulted **before** the produce; a hash the
-  dataset already published returns without producing; a published hash is marked.
+  dataset already published returns without producing; a published hash is marked, an event left in the
+  outbox included (the relay will publish it).
 - The payload carries ids only: \`sample_id\`, \`job_id\`, \`dataset_id\`, \`teacher_version\`,
   \`dedupe_hash\`, \`tokens\`. The prompt text reaches neither the topic nor a log line.
 - The producer is **idempotent with \`acks=all\`** (or the stack's equivalent).
@@ -89,7 +90,7 @@ Requirements:
       id: 'version-and-hash',
       title: 'Carries the teacher version and the dedupe hash',
       detail:
-        'The payload carries teacher_version and dedupe_hash beside sample_id, job_id, dataset_id and tokens, so a bad run traces to a teacher version and a duplicate is recognisable downstream. The starter ships neither.',
+        "The payload carries teacher_version and dedupe_hash, taken from the sample's own record, beside sample_id, job_id, dataset_id and tokens, so a bad run traces to the teacher version that produced it and a duplicate is recognisable downstream. The starter ships neither.",
       match: {
         python: {all: [/teacher_version/, /dedupe_hash/]},
         typescript: {all: [/teacher_version/, /dedupe_hash/]},
@@ -102,7 +103,7 @@ Requirements:
       id: 'outbox-fallback',
       title: 'Writes an outbox row from the delivery report',
       detail:
-        'A produce the broker refuses puts the event in the outbox, handled where the broker answers (the delivery callback, the rejected send, the returned write error); publish does not raise. The starter never looks at the result.',
+        'A produce the broker refuses puts the event in the outbox, handled where the broker answers (the delivery callback, the rejected send, the returned write error), and its hash still counts as published; publish does not raise. The producer waits for every in-sync replica, so a leader failover loses no acknowledged sample, and is idempotent where the client offers it, so a lost acknowledgement writes no second copy. The starter never looks at the result.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /\.catch\(|catch\s*\(/]},
@@ -572,8 +573,8 @@ TOPIC = "distill.sample"
 PROMPT = "How do I reset my password after a phone change?"
 
 
-def _sample(sample_id="s-1", job_id="j1", dataset_id="ds-support", dedupe_hash="h-1", tokens=120):
-    return SampleRecord(sample_id=sample_id, job_id=job_id, dataset_id=dataset_id, teacher_version="teach-70b-v3.2", dedupe_hash=dedupe_hash, tokens=tokens, prompt=PROMPT)
+def _sample(sample_id="s-1", job_id="j1", dataset_id="ds-support", dedupe_hash="h-1", tokens=120, teacher_version="teach-70b-v3.2"):
+    return SampleRecord(sample_id=sample_id, job_id=job_id, dataset_id=dataset_id, teacher_version=teacher_version, dedupe_hash=dedupe_hash, tokens=tokens, prompt=PROMPT)
 
 
 def _settle(m):
@@ -630,6 +631,10 @@ def check_version_and_hash(ctx):
     expected = {"sample_id": "s-1", "job_id": "j1", "dataset_id": "ds-support", "teacher_version": "teach-70b-v3.2", "dedupe_hash": "h-1", "tokens": 77}
     for key, value in expected.items():
         assert event.get(key) == value, f"the event must carry {key}={value!r}, got {event}"
+    assert m.publish(_sample("s-2", dedupe_hash="h-2", teacher_version="teach-13b-v2.1")) is True
+    _settle(m)
+    events = _events(ctx)
+    assert len(events) == 2 and events[1].get("teacher_version") == "teach-13b-v2.1", f"a sample from teacher teach-13b-v2.1 must carry that version, the one on its record: got {events[1:]}"
 
 
 def check_outbox_fallback(ctx):
@@ -644,9 +649,17 @@ def check_outbox_fallback(ctx):
     assert len(rows) == 1, f"the broker refused one produce and the outbox holds {len(rows)} rows: a rejected produce must be kept for the relay, not dropped"
     assert rows[0].get("sample_id") == "s-1" and rows[0].get("dedupe_hash") == "h-1", f"the outbox row must be the event itself, got {rows[0]}"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
+    assert ctx.redis.sismember("distill:published:ds-support", "h-1"), "the refused event is kept in the outbox for the relay, so its hash still counts as published: mark it, or another worker produces a second copy"
     assert m.publish(_sample("s-2", dedupe_hash="h-2")) is True
     _settle(m)
     assert len(ctx.kafka.records(TOPIC)) == 1 and len(_outbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row"
+    ctx.kafka.failover(TOPIC)
+    assert len(ctx.kafka.records(TOPIC)) == 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The producer must wait for every in-sync replica (acks=all)"
+    ctx.kafka.lose_acks(TOPIC, 1)
+    assert m.publish(_sample("s-3", dedupe_hash="h-3")) is True
+    _settle(m)
+    ids = [e.get("sample_id") for e in _events(ctx)]
+    assert ids == ["s-2", "s-3"], f"the acknowledgement of s-3 was lost and the producer retried: distill.sample holds {ids}, expected s-2 and s-3 once each (enable the idempotent producer)"
     _ = result
 
 
@@ -687,8 +700,8 @@ const settle = (): Promise<void> => {
   return promise;
 };
 
-const sample = ({sampleId = 's-1', jobId = 'j1', datasetId = 'ds-support', dedupeHash = 'h-1', tokens = 120} = {}) => ({
-  sample_id: sampleId, job_id: jobId, dataset_id: datasetId, teacher_version: 'teach-70b-v3.2', dedupe_hash: dedupeHash, tokens, prompt: PROMPT,
+const sample = ({sampleId = 's-1', jobId = 'j1', datasetId = 'ds-support', dedupeHash = 'h-1', tokens = 120, teacherVersion = 'teach-70b-v3.2'} = {}) => ({
+  sample_id: sampleId, job_id: jobId, dataset_id: datasetId, teacher_version: teacherVersion, dedupe_hash: dedupeHash, tokens, prompt: PROMPT,
 });
 
 const events = ctx => ctx.kafka.records(TOPIC).map(r => JSON.parse(r.value.toString()));
@@ -732,6 +745,10 @@ export async function check_version_and_hash(ctx) {
   assert.equal(all.length, 1, \`one accepted sample produced \${all.length} records\`);
   const expected = {sample_id: 's-1', job_id: 'j1', dataset_id: 'ds-support', teacher_version: 'teach-70b-v3.2', dedupe_hash: 'h-1', tokens: 77};
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(all[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(all[0])}\`);
+  assert.equal(await m.publish(sample({sampleId: 's-2', dedupeHash: 'h-2', teacherVersion: 'teach-13b-v2.1'})), true);
+  await settle();
+  const later = events(ctx);
+  assert(later.length === 2 && later[1].teacher_version === 'teach-13b-v2.1', \`a sample from teacher teach-13b-v2.1 must carry that version, the one on its record: got \${JSON.stringify(later.slice(1))}\`);
 }
 
 export async function check_outbox_fallback(ctx) {
@@ -747,22 +764,42 @@ export async function check_outbox_fallback(ctx) {
   assert.equal(rows.length, 1, \`the broker refused one produce and the outbox holds \${rows.length} rows: a rejected produce must be kept for the relay, not dropped\`);
   assert(rows[0].sample_id === 's-1' && rows[0].dedupe_hash === 'h-1', \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
+  assert.equal(ctx.redis.sismember('distill:published:ds-support', 'h-1'), 1, 'the refused event is kept in the outbox for the relay, so its hash still counts as published: mark it, or another worker produces a second copy');
   assert.equal(await m.publish(sample({sampleId: 's-2', dedupeHash: 'h-2'})), true);
   await settle();
   assert(ctx.kafka.records(TOPIC).length === 1 && outboxRows(ctx).length === 1, 'a healthy produce after the failure reaches the topic and adds no outbox row');
+  ctx.kafka.failover(TOPIC);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'publish resolved, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The producer must wait for every in-sync replica (acks: -1)');
+  ctx.kafka.loseAcks(TOPIC, 1);
+  assert.equal(await m.publish(sample({sampleId: 's-3', dedupeHash: 'h-3'})), true);
+  await settle();
+  const ids = events(ctx).map(e => e.sample_id);
+  assert.deepEqual(ids, ['s-2', 's-3'], \`the acknowledgement of s-3 was lost and the producer retried: distill.sample holds \${JSON.stringify(ids)}, expected s-2 and s-3 once each (idempotent: true)\`);
 }
 
 export async function check_no_prompt_text(ctx) {
   const m = ctx.load('events');
-  ctx.kafka.failNext(TOPIC, 1);
-  await m.publish(sample({sampleId: 's-1', dedupeHash: 'h-1'}));
-  await m.publish(sample({sampleId: 's-2', dedupeHash: 'h-2'}));
-  await settle();
+  const lines: string[] = [];
+  const real = {log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug};
+  const capture = write => (...args: unknown[]) => {
+    lines.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+    write(...args);
+  };
+  Object.assign(console, {log: capture(real.log), info: capture(real.info), warn: capture(real.warn), error: capture(real.error), debug: capture(real.debug)});
+  try {
+    ctx.kafka.failNext(TOPIC, 1);
+    await m.publish(sample({sampleId: 's-1', dedupeHash: 'h-1'}));
+    await m.publish(sample({sampleId: 's-2', dedupeHash: 'h-2'}));
+    await settle();
+  } finally {
+    Object.assign(console, real);
+  }
   for (const value of ctx.kafka.values(TOPIC)) {
     assert(!value.includes('reset my password'), \`the event carries the prompt text: \${value}; the topic is retained and replicated, ids only\`);
     assert(!('prompt' in JSON.parse(value)), \`the event has a prompt field: \${value}\`);
   }
   for (const row of ctx.redis.lrange('distill:outbox', 0, -1)) assert(!row.includes('reset my password'), \`the outbox row carries the prompt text: \${row}\`);
+  for (const line of lines) assert(!line.includes('reset my password'), \`a log line carries the prompt text: \${line}\`);
 }
 `,
     go: `package main
@@ -770,6 +807,7 @@ export async function check_no_prompt_text(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"strings"
 
 	"distill/samples"
@@ -846,6 +884,12 @@ func CheckVersionAndHash(ctx *harness.Ctx) {
 	all := eventsAll(ctx)
 	ctx.Equal(len(all), 1, "one accepted sample; records")
 	ctx.Equal(all[0], map[string]any{"sample_id": "s-1", "job_id": "j1", "dataset_id": "ds-support", "teacher_version": "teach-70b-v3.2", "dedupe_hash": "h-1", "tokens": float64(77)}, "the event must carry the ids, teacher_version, dedupe_hash and tokens")
+	other := eventsSample("s-2", "j1", "ds-support", "h-2", 120)
+	other.TeacherVersion = "teach-13b-v2.1"
+	ctx.Assert(eventsPublish(ctx, other), "the second sample is published")
+	ctx.Settle()
+	all = eventsAll(ctx)
+	ctx.Assert(len(all) == 2 && all[1]["teacher_version"] == "teach-13b-v2.1", "a sample from teacher teach-13b-v2.1 must carry that version, the one on its record: got %v", all[1:])
 }
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
@@ -863,16 +907,25 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 	ctx.Equal(len(rows), 1, "the broker refused one produce: a rejected produce must be kept for the relay, not dropped; outbox rows")
 	ctx.Assert(rows[0]["sample_id"] == "s-1" && rows[0]["dedupe_hash"] == "h-1", "the outbox row must be the event itself, got %v", rows[0])
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
+	ctx.Assert(ctx.Redis.SIsMember("distill:published:ds-support", "h-1"), "the refused event is kept in the outbox for the relay, so its hash still counts as published: mark it, or another worker produces a second copy")
 	ctx.Assert(eventsPublish(ctx, eventsSample("s-2", "j1", "ds-support", "h-2", 120)), "a healthy produce is published")
 	ctx.Settle()
 	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Kafka.Failover(eventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The writer must wait for every in-sync replica (RequiredAcks: kafka.RequireAll); records")
 }
 
 func CheckNoPromptText(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-1", 120))
-	eventsPublish(ctx, eventsSample("s-2", "j1", "ds-support", "h-2", 120))
-	ctx.Settle()
+	var logged strings.Builder
+	previous := log.Writer()
+	log.SetOutput(&logged)
+	func() {
+		defer log.SetOutput(previous)
+		ctx.Kafka.FailNext(eventsTopic, 1)
+		eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-1", 120))
+		eventsPublish(ctx, eventsSample("s-2", "j1", "ds-support", "h-2", 120))
+		ctx.Settle()
+	}()
 	for _, value := range ctx.Kafka.Values(eventsTopic) {
 		ctx.Assert(!strings.Contains(value, "reset my password"), "the event carries the prompt text: %s; the topic is retained and replicated, ids only", value)
 		var e map[string]any
@@ -883,6 +936,9 @@ func CheckNoPromptText(ctx *harness.Ctx) {
 	for _, row := range ctx.Redis.LRange("distill:outbox", 0, -1) {
 		ctx.Assert(!strings.Contains(row, "reset my password"), "the outbox row carries the prompt text: %s", row)
 	}
+	for _, line := range strings.Split(logged.String(), "\\n") {
+		ctx.Assert(!strings.Contains(line, "reset my password"), "a log line carries the prompt text: %s", line)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -890,6 +946,8 @@ func CheckNoPromptText(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <exception>
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -954,6 +1012,12 @@ void CheckVersionAndHash(harness::Ctx& ctx) {
   ctx.Equal(all.size(), 1, "one accepted sample; records");
   ctx.Equal(all[0], nlohmann::json({{"sample_id", "s-1"}, {"job_id", "j1"}, {"dataset_id", "ds-support"}, {"teacher_version", "teach-70b-v3.2"}, {"dedupe_hash", "h-1"}, {"tokens", 77}}),
             "the event must carry the ids, teacher_version, dedupe_hash and tokens");
+  auto other = eventsSample("s-2", "j1", "ds-support", "h-2", 120);
+  other.teacher_version = "teach-13b-v2.1";
+  ctx.Assert(publish(other), "the second sample is published");
+  ctx.Settle();
+  const auto later = eventsAll(ctx);
+  ctx.Assert(later.size() == 2 && later[1].value("teacher_version", "") == "teach-13b-v2.1", "a sample from teacher teach-13b-v2.1 must carry that version, the one on its record: got %v", later.size() == 2 ? later[1] : nlohmann::json());
 }
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
@@ -969,18 +1033,40 @@ void CheckOutboxFallback(harness::Ctx& ctx) {
   ctx.Equal(rows.size(), 1, "the broker refused one produce: a rejected produce must be kept for the relay, not dropped; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].value("sample_id", "") == "s-1" && rows[0].value("dedupe_hash", "") == "h-1", "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused produce; records");
+  ctx.Assert(ctx.Redis.SIsMember("distill:published:ds-support", "h-1"), "the refused event is kept in the outbox for the relay, so its hash still counts as published: mark it, or another worker produces a second copy");
   ctx.Assert(publish(eventsSample("s-2", "j1", "ds-support", "h-2", 120)), "a healthy produce is published");
   ctx.Settle();
   producer->poll(0);
   ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  ctx.Kafka.Failover(kTopic);
+  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The producer must wait for every in-sync replica (acks=all); records");
+  ctx.Kafka.LoseAcks(kTopic, 1);
+  ctx.Assert(publish(eventsSample("s-3", "j1", "ds-support", "h-3", 120)), "s-3 is published");
+  ctx.Settle();
+  producer->poll(0);
+  std::vector<std::string> ids;
+  for (const auto& e : eventsAll(ctx)) ids.push_back(e.value("sample_id", ""));
+  ctx.Equal(ids, {"s-2", "s-3"}, "the acknowledgement of s-3 was lost and the producer retried: distill.sample must hold s-2 and s-3 once each (enable.idempotence)");
 }
 
 void CheckNoPromptText(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
-  publish(eventsSample("s-1", "j1", "ds-support", "h-1", 120));
-  publish(eventsSample("s-2", "j1", "ds-support", "h-2", 120));
-  ctx.Settle();
-  producer->poll(0);
+  std::ostringstream logged;
+  {
+    // the learner's log lines (std::cerr, std::cout) land in logged until the scope ends, however it ends
+    struct Capture {
+      std::streambuf* err;
+      std::streambuf* out;
+      ~Capture() {
+        std::cerr.rdbuf(err);
+        std::cout.rdbuf(out);
+      }
+    } capture{std::cerr.rdbuf(logged.rdbuf()), std::cout.rdbuf(logged.rdbuf())};
+    ctx.Kafka.FailNext(kTopic, 1);
+    publish(eventsSample("s-1", "j1", "ds-support", "h-1", 120));
+    publish(eventsSample("s-2", "j1", "ds-support", "h-2", 120));
+    ctx.Settle();
+    producer->poll(0);
+  }
   for (const auto& value : ctx.Kafka.Values(kTopic)) {
     ctx.Assert(value.find("reset my password") == std::string::npos, "the event carries the prompt text: %s; the topic is retained and replicated, ids only", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
@@ -988,6 +1074,10 @@ void CheckNoPromptText(harness::Ctx& ctx) {
   }
   for (const auto& row : ctx.Redis.LRange("distill:outbox", 0, -1)) {
     ctx.Assert(row.find("reset my password") == std::string::npos, "the outbox row carries the prompt text: %s", row);
+  }
+  std::istringstream lines(logged.str());
+  for (std::string line; std::getline(lines, line);) {
+    ctx.Assert(line.find("reset my password") == std::string::npos, "a log line carries the prompt text: %s", line);
   }
 }
 `,

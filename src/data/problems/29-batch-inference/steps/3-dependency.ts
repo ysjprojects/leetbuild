@@ -57,7 +57,7 @@ Requirements:
       id: 'attempt-deadline',
       title: 'Five-second deadline on every attempt',
       detail:
-        'Each Infer call carries a deadline of about 5 s (DEADLINE_S as timeout=, deadline: Date.now() + DEADLINE_MS, context.WithTimeout, withDeadlineAfter, set_deadline); a model that answers in 4 s is accepted. The starter sends no deadline.',
+        'Each Infer call carries a deadline of about 5 s (DEADLINE_S as timeout=, deadline: Date.now() + DEADLINE_MS, context.WithTimeout, withDeadlineAfter, set_deadline); a model that answers in 4 s is accepted on every record of a two-record shard. The starter sends no deadline.',
       match: {
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -70,7 +70,7 @@ Requirements:
       id: 'retry-unavailable',
       title: 'Retries only UNAVAILABLE, at most twice',
       detail:
-        'One UNAVAILABLE earns a retry after a backoff and the record is answered on the second call; a server that stays UNAVAILABLE gets three calls, then the record fails with reason unavailable. The starter retries anything until its 30-second wall clock runs out.',
+        'One UNAVAILABLE earns a retry after a backoff and the record is answered on the second call; a server that stays UNAVAILABLE gets three calls, then the record fails with reason unavailable; RESOURCE_EXHAUSTED and FAILED_PRECONDITION fail the record after one call with their own reason; and a retry after an UNAVAILABLE that took 3 s still carries a full 5 s deadline. The starter retries anything until its 30-second wall clock runs out.',
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_RECORD_SECONDS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_RECORD_SECONDS/]},
@@ -725,9 +725,16 @@ B = "b1"
 
 
 class ModelServicer(batch_inference_pb2_grpc.ModelServicer):
-    """The stand-in model server: answers from batch.model, INVALID_ARGUMENT for a poisoned input."""
+    """The stand-in model server: answers from batch.model, INVALID_ARGUMENT for a poisoned input; the
+    first call for record "late" ends UNAVAILABLE once its latency has passed (a restart mid-call)."""
+
+    def __init__(self):
+        self.restarted = False
 
     def Infer(self, request, context):
+        if request.record_id == "late" and not self.restarted:
+            self.restarted = True
+            context.abort(grpc.StatusCode.UNAVAILABLE, "model server restarting")
         if standin.is_poison(request.input):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "the model cannot parse this record")
         output, used = standin.infer(request.model, request.input)
@@ -760,8 +767,8 @@ def check_attempt_deadline(ctx):
     assert calls[0].timeout is not None, "the Infer call carries no deadline: a hung model server holds the worker for as long as it hangs"
     assert 4.5 <= calls[0].timeout <= 5.5, f"the deadline must be DEADLINE_S = 5 s, got {calls[0].timeout} s"
     ctx.grpc.set_latency("Infer", 4.0, config.MODEL_SERVER)
-    slow = m.run_shard(B, "sum-v7", 1, _records(1))
-    assert slow.completed == 1 and len(_calls(ctx)) == 2, f"a model server that answers in 4 s is within the deadline: completed {slow.completed}, errors {_errors(slow)}, {len(_calls(ctx))} calls"
+    slow = m.run_shard(B, "sum-v7", 1, _records(2))
+    assert slow.completed == 2 and len(_calls(ctx)) == 3, f"a model server that answers in 4 s is within the deadline for every record of the shard: completed {slow.completed}, errors {_errors(slow)}, {len(_calls(ctx))} calls"
 
 
 def check_retry_unavailable(ctx):
@@ -775,6 +782,18 @@ def check_retry_unavailable(ctx):
     calls = len(_calls(ctx)) - 2
     assert calls == 3, f"a model server that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the record, saw {calls}"
     assert result.failed == 1 and _errors(result) == [("r0", "unavailable")], f"after three UNAVAILABLE the record fails with reason unavailable: failed {result.failed}, errors {_errors(result)}"
+    ctx.grpc.failures.clear()  # the two UNAVAILABLE the record above did not use
+    for code, reason in ((grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.FAILED_PRECONDITION, "failed_precondition")):
+        before = len(_calls(ctx))
+        ctx.grpc.fail("Infer", code, "refused", times=1, target=config.MODEL_SERVER)
+        result = m.run_shard(B, "sum-v7", 2, _records(1))
+        n = len(_calls(ctx)) - before
+        assert n == 1 and _errors(result) == [("r0", reason)], f"{code.name} is final: the record fails with reason {reason} after one call, it got {n} calls and errors {_errors(result)}; only UNAVAILABLE is retried"
+    ctx.grpc.set_latency("Infer", 3.0, config.MODEL_SERVER)
+    before = len(_calls(ctx))
+    result = m.run_shard(B, "sum-v7", 3, [Record("late", "ticket 9: the queue stalls")])
+    timeouts = [c.timeout for c in _calls(ctx)[before:]]
+    assert result.completed == 1 and len(timeouts) == 2 and all(t is not None and 4.5 <= t <= 5.5 for t in timeouts), f"a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed {result.completed}, errors {_errors(result)}, the attempts carried deadlines {timeouts}; every attempt carries its own 5 s deadline, not what is left of the first one's"
 
 
 def check_hung_call_cut(ctx):
@@ -816,8 +835,14 @@ function world(ctx) {
   const {batch} = ctx.proto('batch_inference.proto');
   const config = ctx.load('/support/batch/config.ts');
   const standin = ctx.load('/support/batch/model.ts');
+  let restarted = false;
   ctx.grpc.serve(batch.Model.service, {
     Infer(call, callback) {
+      // the first call for record "late" ends UNAVAILABLE once its latency has passed (a restart mid-call)
+      if (call.request.record_id === 'late' && !restarted) {
+        restarted = true;
+        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'model server restarting'});
+      }
       if (standin.isPoison(call.request.input)) return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: 'the model cannot parse this record'});
       const {output, model} = standin.infer(call.request.model, call.request.input);
       callback(null, {output, model});
@@ -840,8 +865,8 @@ export async function check_attempt_deadline(ctx) {
   assert(call.timeout !== null, 'the Infer call carries no deadline: a hung model server holds the worker for as long as it hangs');
   assert(4.5 <= call.timeout && call.timeout <= 5.5, \`the deadline must be DEADLINE_MS = 5000 ms, got \${call.timeout} s\`);
   ctx.grpc.setLatency('Infer', 4.0, config.MODEL_SERVER);
-  const slow = await m.runShard(B, 'sum-v7', 1, records(1));
-  assert(slow.completed === 1 && calls(ctx).length === 2, \`a model server that answers in 4 s is within the deadline: completed \${slow.completed}, errors \${JSON.stringify(errors(slow))}, \${calls(ctx).length} calls\`);
+  const slow = await m.runShard(B, 'sum-v7', 1, records(2));
+  assert(slow.completed === 2 && calls(ctx).length === 3, \`a model server that answers in 4 s is within the deadline for every record of the shard: completed \${slow.completed}, errors \${JSON.stringify(errors(slow))}, \${calls(ctx).length} calls\`);
 }
 
 export async function check_retry_unavailable(ctx) {
@@ -855,6 +880,22 @@ export async function check_retry_unavailable(ctx) {
   const n = calls(ctx).length - 2;
   assert.equal(n, 3, \`a model server that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the record, saw \${n}\`);
   assert(result.failed === 1 && JSON.stringify(errors(result)) === JSON.stringify([['r0', 'unavailable']]), \`after three UNAVAILABLE the record fails with reason unavailable: failed \${result.failed}, errors \${JSON.stringify(errors(result))}\`);
+  ctx.grpc.clearFailures(); // the two UNAVAILABLE the record above did not use
+  for (const [code, reason] of [[ctx.grpc.status.RESOURCE_EXHAUSTED, 'resource_exhausted'], [ctx.grpc.status.FAILED_PRECONDITION, 'failed_precondition']]) {
+    const before = calls(ctx).length;
+    ctx.grpc.fail('Infer', code, 'refused', 1, config.MODEL_SERVER);
+    result = await m.runShard(B, 'sum-v7', 2, records(1));
+    const n = calls(ctx).length - before;
+    assert(n === 1 && JSON.stringify(errors(result)) === JSON.stringify([['r0', reason]]), \`\${reason} is final: the record fails with reason \${reason} after one call, it got \${n} calls and errors \${JSON.stringify(errors(result))}; only UNAVAILABLE is retried\`);
+  }
+  ctx.grpc.setLatency('Infer', 3.0, config.MODEL_SERVER);
+  const before = calls(ctx).length;
+  result = await m.runShard(B, 'sum-v7', 3, [{record_id: 'late', input: 'ticket 9: the queue stalls'}]);
+  const timeouts = calls(ctx).slice(before).map(c => c.timeout);
+  assert(
+    result.completed === 1 && timeouts.length === 2 && timeouts.every(t => t !== null && 4.5 <= t && t <= 5.5),
+    \`a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed \${result.completed}, errors \${JSON.stringify(errors(result))}, the attempts carried deadlines \${JSON.stringify(timeouts)}; every attempt carries its own 5 s deadline, not what is left of the first one's\`,
+  );
 }
 
 export async function check_hung_call_cut(ctx) {
@@ -896,6 +937,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -911,12 +953,17 @@ import (
 
 const clientBatch = "b1"
 
-// modelPeer is the stand-in model server: answers from batch/model, InvalidArgument for a poisoned input.
+// modelPeer is the stand-in model server: answers from batch/model, InvalidArgument for a poisoned
+// input; the first call for record "late" ends Unavailable once its latency has passed (a restart mid-call).
 type modelPeer struct {
 	pb.UnimplementedModelServer
+	restarted atomic.Bool
 }
 
-func (modelPeer) Infer(_ context.Context, req *pb.InferRequest) (*pb.InferReply, error) {
+func (p *modelPeer) Infer(_ context.Context, req *pb.InferRequest) (*pb.InferReply, error) {
+	if req.GetRecordId() == "late" && p.restarted.CompareAndSwap(false, true) {
+		return nil, status.Error(codes.Unavailable, "model server restarting")
+	}
 	if model.IsPoison(req.GetInput()) {
 		return nil, status.Error(codes.InvalidArgument, "the model cannot parse this record")
 	}
@@ -963,8 +1010,8 @@ func CheckAttemptDeadline(ctx *harness.Ctx) {
 	ctx.Assert(calls[0].HasDeadline(), "the Infer call carries no deadline: a hung model server holds the worker for as long as it hangs")
 	ctx.Assert(4500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 5500*time.Millisecond, "the deadline must be 5 s, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Infer", 4.0, config.ModelServer)
-	slow := clientRun(1, clientRecords(1, -1))
-	ctx.Assert(slow.Completed == 1 && len(clientCalls(ctx)) == 2, "a model server that answers in 4 s is within the deadline: completed %d, errors %v, %d calls", slow.Completed, clientErrors(slow), len(clientCalls(ctx)))
+	slow := clientRun(1, clientRecords(2, -1))
+	ctx.Assert(slow.Completed == 2 && len(clientCalls(ctx)) == 3, "a model server that answers in 4 s is within the deadline for every record of the shard: completed %d, errors %v, %d calls", slow.Completed, clientErrors(slow), len(clientCalls(ctx)))
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
@@ -977,6 +1024,28 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 	result = clientRun(1, clientRecords(1, -1))
 	ctx.Equal(len(clientCalls(ctx))-2, 3, "a model server that stays UNAVAILABLE gets maxAttempts = 3 calls for the record; calls")
 	ctx.Assert(result.Failed == 1 && strings.Join(clientErrors(result), ",") == "r0:unavailable", "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.Failed, clientErrors(result))
+	ctx.GRPC.ClearFailures() // the two UNAVAILABLE the record above did not use
+	for _, terminal := range []struct {
+		code   codes.Code
+		reason string
+	}{{codes.ResourceExhausted, "resource_exhausted"}, {codes.FailedPrecondition, "failed_precondition"}} {
+		before := len(clientCalls(ctx))
+		ctx.GRPC.Fail("Infer", terminal.code, "refused", 1, config.ModelServer)
+		result = clientRun(2, clientRecords(1, -1))
+		n := len(clientCalls(ctx)) - before
+		ctx.Assert(n == 1 && strings.Join(clientErrors(result), ",") == "r0:"+terminal.reason, "%s is final: the record fails with reason %s after one call, it got %d calls and errors %v; only UNAVAILABLE is retried", terminal.reason, terminal.reason, n, clientErrors(result))
+	}
+	ctx.GRPC.SetLatency("Infer", 3.0, config.ModelServer)
+	before := len(clientCalls(ctx))
+	result = clientRun(3, []records.Record{{RecordID: "late", Input: "ticket 9: the queue stalls"}})
+	late := clientCalls(ctx)[before:]
+	fresh := len(late) == 2
+	timeouts := []time.Duration{}
+	for _, c := range late {
+		timeouts = append(timeouts, c.Timeout)
+		fresh = fresh && c.HasDeadline() && 4500*time.Millisecond <= c.Timeout && c.Timeout <= 5500*time.Millisecond
+	}
+	ctx.Assert(result.Completed == 1 && fresh, "a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed %d, errors %v, the attempts carried deadlines %v; every attempt carries its own 5 s deadline, not what is left of the first one's", result.Completed, clientErrors(result), timeouts)
 }
 
 func CheckHungCallCut(ctx *harness.Ctx) {
@@ -1028,7 +1097,9 @@ func CheckPinnedModel(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <atomic>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "batch/model.h"
@@ -1037,16 +1108,21 @@ namespace {
 
 const std::string kBatch = "b1";
 
-// The stand-in model server: answers from batch/model.h, INVALID_ARGUMENT for a poisoned input.
+// The stand-in model server: answers from batch/model.h, INVALID_ARGUMENT for a poisoned input; the
+// first call for record "late" ends UNAVAILABLE once its latency has passed (a restart mid-call).
 class ModelPeer final : public batch::Model::Service {
  public:
   grpc::Status Infer(grpc::ServerContext*, const batch::InferRequest* req, batch::InferReply* reply) override {
+    if (req->record_id() == "late" && !restarted_.exchange(true)) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "model server restarting");
     if (model::is_poison(req->input())) return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "the model cannot parse this record");
     const auto answer = model::infer(req->model(), req->input());
     reply->set_output(answer.output);
     reply->set_model(answer.model);
     return grpc::Status::OK;
   }
+
+ private:
+  std::atomic<bool> restarted_{false};
 };
 
 void clientWorld(harness::Ctx& ctx) {
@@ -1081,8 +1157,8 @@ void CheckAttemptDeadline(harness::Ctx& ctx) {
   ctx.Assert(calls[0].HasDeadline(), "the Infer call carries no deadline: a hung model server holds the worker for as long as it hangs");
   ctx.Assert(4.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 5.5, "the deadline must be 5 s, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Infer", 4.0, config::kModelServer);
-  const auto slow = run_shard(kBatch, "sum-v7", 1, clientRecords(1));
-  ctx.Assert(slow.completed == 1 && ctx.GRPC.CallsTo("Infer").size() == 2, "a model server that answers in 4 s is within the deadline: completed %d, errors %v, %d calls", slow.completed, clientErrors(slow), ctx.GRPC.CallsTo("Infer").size());
+  const auto slow = run_shard(kBatch, "sum-v7", 1, clientRecords(2));
+  ctx.Assert(slow.completed == 2 && ctx.GRPC.CallsTo("Infer").size() == 3, "a model server that answers in 4 s is within the deadline for every record of the shard: completed %d, errors %v, %d calls", slow.completed, clientErrors(slow), ctx.GRPC.CallsTo("Infer").size());
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
@@ -1095,6 +1171,25 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   result = run_shard(kBatch, "sum-v7", 1, clientRecords(1));
   ctx.Equal(ctx.GRPC.CallsTo("Infer").size() - 2, 3, "a model server that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the record; calls");
   ctx.Assert(result.failed == 1 && clientErrors(result) == std::vector<std::string>{"r0:unavailable"}, "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.failed, clientErrors(result));
+  ctx.GRPC.ClearFailures();  // the two UNAVAILABLE the record above did not use
+  for (const auto& [code, reason] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::FAILED_PRECONDITION, "failed_precondition"}}) {
+    const auto before = ctx.GRPC.CallsTo("Infer").size();
+    ctx.GRPC.Fail("Infer", code, "refused", 1, config::kModelServer);
+    result = run_shard(kBatch, "sum-v7", 2, clientRecords(1));
+    const auto n = ctx.GRPC.CallsTo("Infer").size() - before;
+    ctx.Assert(n == 1 && clientErrors(result) == std::vector<std::string>{"r0:" + reason}, "%s is final: the record fails with reason %s after one call, it got %d calls and errors %v; only UNAVAILABLE is retried", reason, reason, n, clientErrors(result));
+  }
+  ctx.GRPC.SetLatency("Infer", 3.0, config::kModelServer);
+  const auto before = ctx.GRPC.CallsTo("Infer").size();
+  result = run_shard(kBatch, "sum-v7", 3, {{"late", "ticket 9: the queue stalls"}});
+  const auto all = ctx.GRPC.CallsTo("Infer");
+  bool fresh = all.size() - before == 2;
+  std::vector<double> timeouts;
+  for (size_t i = before; i < all.size(); i++) {
+    timeouts.push_back(all[i].HasDeadline() ? all[i].TimeoutSeconds() : -1);
+    fresh = fresh && all[i].HasDeadline() && 4.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 5.5;
+  }
+  ctx.Assert(result.completed == 1 && fresh, "a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed %d, errors %v, the attempts carried deadlines %v; every attempt carries its own 5 s deadline, not what is left of the first one's", result.completed, clientErrors(result), timeouts);
 }
 
 void CheckHungCallCut(harness::Ctx& ctx) {

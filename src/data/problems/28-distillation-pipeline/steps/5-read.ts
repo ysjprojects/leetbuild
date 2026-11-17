@@ -64,7 +64,7 @@ Requirements:
       id: 'route',
       title: 'Handles GET /v1/distill/jobs/{id}',
       detail:
-        "The report route answers 401 without X-Tenant-Id, 404 for an unknown job or another tenant's job, and 200 with the job's counts.",
+        "The report route answers 401 without X-Tenant-Id, 404 for an unknown job or another tenant's job, and 200 with the job's counts and acceptance_rate = accepted / sampled (duplicates are not samples).",
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/distill\/jobs\/\{job_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/distill\/jobs\/:job_id['"]/]},
@@ -77,7 +77,7 @@ Requirements:
       id: 'reconcile',
       title: 'Answers 409 when accepted + rejected differs from sampled',
       detail:
-        'The report compares accepted + rejected with sampled and answers 409 when they differ, instead of deriving one count from the others. The starter computes accepted as sampled - rejected.',
+        'The report compares accepted + rejected with sampled and answers 409 when they differ either way, fewer outcomes than samples or more, instead of deriving one count from the others. The starter computes accepted as sampled - rejected.',
       match: {
         python: {
           all: [
@@ -130,7 +130,7 @@ Requirements:
       id: 'implausible-rate',
       title: 'Flags an acceptance rate above 95 percent',
       detail:
-        'With samples and a rate above UNRELIABLE_ACCEPTANCE_RATE the report says flagged: implausible_acceptance_rate; at or below it, and for an empty job, flagged is null. The starter has no ceiling.',
+        'With samples and a rate above UNRELIABLE_ACCEPTANCE_RATE (0.95: 96 or 98 percent) the report says flagged: implausible_acceptance_rate; at or below it (exactly 95 percent included), and for an empty job, flagged is null. The starter has no ceiling.',
       match: {
         python: {all: [/UNRELIABLE_ACCEPTANCE_RATE/, /implausible_acceptance_rate/]},
         typescript: {all: [/UNRELIABLE_ACCEPTANCE_RATE/, /implausible_acceptance_rate/]},
@@ -824,7 +824,7 @@ async def _report(c, job_id=JOB, headers=TENANT):
 
 
 async def check_route(ctx):
-    _seed(ctx, 10, 7, 3, reasons={"refusal": 3})
+    _seed(ctx, 10, 7, 3, duplicate=4, reasons={"refusal": 3})
     async with _api(ctx) as c:
         r = await _report(c, headers={})
         assert r.status_code == 401, f"without X-Tenant-Id the report must answer 401, got {r.status_code}"
@@ -850,6 +850,9 @@ async def check_reconcile(ctx):
         ctx.redis.hset(f"distill:progress:{JOB}", "rejected", 7)
         r = await _report(c)
         assert r.status_code == 200 and r.json()["accepted"] == 3 and r.json()["rejected"] == 7, f"once the counts reconcile the report is 200 with the live accepted and rejected, got {r.status_code}: {r.text}"
+        ctx.redis.hset(f"distill:progress:{JOB}", "accepted", 5)
+        r = await _report(c)
+        assert r.status_code == 409, f"sampled 10, accepted 5, rejected 7: more outcomes than samples do not reconcile either (a sample recorded twice), the report must answer 409, got {r.status_code} with {r.text}"
 
 
 async def check_reasons(ctx):
@@ -872,6 +875,12 @@ async def check_implausible_rate(ctx):
         ctx.redis.hset(f"distill:progress:{JOB}", mapping={"accepted": 90, "rejected": 10})
         body = (await _report(c)).json()
         assert body.get("flagged") is None, f"90 percent is within the ceiling: flagged must be null, got {body.get('flagged')!r}"
+        ctx.redis.hset(f"distill:progress:{JOB}", mapping={"accepted": 95, "rejected": 5})
+        body = (await _report(c)).json()
+        assert body.get("flagged") is None, f"exactly 95 percent is at the ceiling, not above it: flagged must be null, got {body.get('flagged')!r}"
+        ctx.redis.hset(f"distill:progress:{JOB}", mapping={"accepted": 96, "rejected": 4})
+        body = (await _report(c)).json()
+        assert body.get("flagged") == "implausible_acceptance_rate", f"96 percent is above the ceiling and must be flagged, got flagged={body.get('flagged')!r}"
         ctx.redis.hset(f"distill:progress:{JOB}", mapping={"sampled": 0, "accepted": 0, "rejected": 0})
         r = await _report(c)
         assert r.status_code == 200 and r.json().get("flagged") is None and r.json()["acceptance_rate"] == 0, f"an empty job has rate 0 and no flag, got {r.status_code}: {r.text}"
@@ -907,7 +916,7 @@ function api(ctx) {
 const report = (c, jobId = JOB, headers: Record<string, string> = TENANT) => c.get(\`/v1/distill/jobs/\${jobId}\`, {headers});
 
 export async function check_route(ctx) {
-  seed(ctx, 10, 7, 3, {reasons: {refusal: 3}});
+  seed(ctx, 10, 7, 3, {duplicate: 4, reasons: {refusal: 3}});
   const c = api(ctx);
   let r = await report(c, JOB, {});
   assert.equal(r.status, 401, \`without X-Tenant-Id the report must answer 401, got \${r.status}\`);
@@ -932,6 +941,9 @@ export async function check_reconcile(ctx) {
   ctx.redis.hset(\`distill:progress:\${JOB}\`, 'rejected', 7);
   r = await report(c);
   assert(r.status === 200 && r.json().accepted === 3 && r.json().rejected === 7, \`once the counts reconcile the report is 200 with the live accepted and rejected, got \${r.status}: \${r.text}\`);
+  ctx.redis.hset(\`distill:progress:\${JOB}\`, 'accepted', 5);
+  r = await report(c);
+  assert.equal(r.status, 409, \`sampled 10, accepted 5, rejected 7: more outcomes than samples do not reconcile either (a sample recorded twice), the report must answer 409, got \${r.status} with \${r.text}\`);
 }
 
 export async function check_reasons(ctx) {
@@ -954,6 +966,12 @@ export async function check_implausible_rate(ctx) {
   ctx.redis.hset(\`distill:progress:\${JOB}\`, 'accepted', 90, 'rejected', 10);
   body = (await report(c)).json();
   assert(body.flagged === null || body.flagged === undefined, \`90 percent is within the ceiling: flagged must be null, got \${JSON.stringify(body.flagged)}\`);
+  ctx.redis.hset(\`distill:progress:\${JOB}\`, 'accepted', 95, 'rejected', 5);
+  body = (await report(c)).json();
+  assert(body.flagged === null || body.flagged === undefined, \`exactly 95 percent is at the ceiling, not above it: flagged must be null, got \${JSON.stringify(body.flagged)}\`);
+  ctx.redis.hset(\`distill:progress:\${JOB}\`, 'accepted', 96, 'rejected', 4);
+  body = (await report(c)).json();
+  assert.equal(body.flagged, 'implausible_acceptance_rate', \`96 percent is above the ceiling and must be flagged, got flagged=\${JSON.stringify(body.flagged)}\`);
   ctx.redis.hset(\`distill:progress:\${JOB}\`, 'sampled', 0, 'accepted', 0, 'rejected', 0);
   r = await report(c);
   body = r.json();
@@ -1015,7 +1033,7 @@ func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, 10, 7, 3, 0, map[string]int{"refusal": 3}, 1_700_000_000)
+	readSeed(ctx, 10, 7, 3, 4, map[string]int{"refusal": 3}, 1_700_000_000)
 	c := readClient(ctx)
 	r := c.Get("/v1/distill/jobs/" + readJobID)
 	ctx.Equal(r.Status, 401, "without X-Tenant-Id the report")
@@ -1045,6 +1063,9 @@ func CheckReconcile(ctx *harness.Ctx) {
 	r = readReport(c, readJobID)
 	body := readBody(ctx, r)
 	ctx.Assert(r.Status == 200 && body["accepted"] == float64(3) && body["rejected"] == float64(7), "once the counts reconcile the report is 200 with the live accepted and rejected, got %d: %s", r.Status, r.Text())
+	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 5)
+	r = readReport(c, readJobID)
+	ctx.Equal(r.Status, 409, "sampled 10, accepted 5, rejected 7: more outcomes than samples do not reconcile either (a sample recorded twice) (%s); the status", r.Text())
 }
 
 func CheckReasons(ctx *harness.Ctx) {
@@ -1068,6 +1089,12 @@ func CheckImplausibleRate(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 90, "rejected", 10)
 	body = readBody(ctx, readReport(c, readJobID))
 	ctx.Assert(body["flagged"] == nil, "90 percent is within the ceiling: flagged must be null, got %v", body["flagged"])
+	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 95, "rejected", 5)
+	body = readBody(ctx, readReport(c, readJobID))
+	ctx.Assert(body["flagged"] == nil, "exactly 95 percent is at the ceiling, not above it: flagged must be null, got %v", body["flagged"])
+	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 96, "rejected", 4)
+	body = readBody(ctx, readReport(c, readJobID))
+	ctx.Equal(body["flagged"], "implausible_acceptance_rate", "96 percent is above the ceiling and must be flagged; flagged")
 	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "sampled", 0, "accepted", 0, "rejected", 0)
 	r = readReport(c, readJobID)
 	body = readBody(ctx, r)
@@ -1128,7 +1155,7 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readSeed(ctx, 10, 7, 3, 0, {{"refusal", 3}}, 1700000000);
+  readSeed(ctx, 10, 7, 3, 4, {{"refusal", 3}}, 1700000000);
   Api api(ctx);
   auto r = api.http.Get("/v1/distill/jobs/" + kJob);
   ctx.Equal(r.Status, 401, "without X-Tenant-Id the report");
@@ -1154,6 +1181,9 @@ void CheckReconcile(harness::Ctx& ctx) {
   r = api.report();
   const json body = bodyOf(ctx, r);
   ctx.Assert(r.Status == 200 && body["accepted"] == 3 && body["rejected"] == 7, "once the counts reconcile the report is 200 with the live accepted and rejected, got %d: %s", r.Status, r.Text());
+  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 5);
+  r = api.report();
+  ctx.Equal(r.Status, 409, "sampled 10, accepted 5, rejected 7: more outcomes than samples do not reconcile either (a sample recorded twice) (%s); the status", r.Text());
 }
 
 void CheckReasons(harness::Ctx& ctx) {
@@ -1176,6 +1206,12 @@ void CheckImplausibleRate(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 90, "rejected", 10);
   body = bodyOf(ctx, api.report());
   ctx.Assert(!body.contains("flagged") || body["flagged"].is_null(), "90 percent is within the ceiling: flagged must be null, got %s", body.value("flagged", json()).dump());
+  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 95, "rejected", 5);
+  body = bodyOf(ctx, api.report());
+  ctx.Assert(!body.contains("flagged") || body["flagged"].is_null(), "exactly 95 percent is at the ceiling, not above it: flagged must be null, got %s", body.value("flagged", json()).dump());
+  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 96, "rejected", 4);
+  body = bodyOf(ctx, api.report());
+  ctx.Equal(body.value("flagged", json()), json("implausible_acceptance_rate"), "96 percent is above the ceiling and must be flagged; flagged");
   ctx.Redis.Do("HSET", "distill:progress:" + kJob, "sampled", 0, "accepted", 0, "rejected", 0);
   r = api.report();
   body = bodyOf(ctx, r);

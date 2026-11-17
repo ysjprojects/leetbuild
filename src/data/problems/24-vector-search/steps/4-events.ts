@@ -26,9 +26,9 @@ without a trace; and a consumer that crashes between its commit and its counters
   \`query_digest(query)\` in place of the vector.
 - The producer is idempotent with \`acks=all\` (kafka-go has no idempotent producer: \`RequireAll\`
   and a synchronous write).
-- A produce the delivery report rejects appends \`{"key", "payload"}\` to \`outbox:search.query\` and
-  returns \`False\`.
-- The consumer updates the counters, then commits.`,
+- A produce the delivery report rejects appends \`{"key", "payload"}\` to \`outbox:search.query\`, the
+  payload exactly as it would have been published, and returns \`False\`.
+- The consumer updates the counters, then commits; an event whose update fails is not committed.`,
   sequence: {
     participants: ['searchd', 'search.query', 'Redis', 'Analytics consumer'],
     messages: [
@@ -84,7 +84,7 @@ without a trace; and a consumer that crashes between its commit and its counters
       id: 'outbox',
       title: 'A rejected produce leaves an outbox row',
       detail:
-        'When the delivery report says the broker rejected the record, `{"key", "payload"}` is appended to `outbox:search.query` and the call returns false, so a relay can republish it. The starter logs the error and reports success.',
+        'When the delivery report says the broker rejected the record, `{"key", "payload"}` is appended to `outbox:search.query`, the payload as it would have been published (the digest, never the vector), and the call returns false, so a relay can republish it. The starter logs the error and reports success.',
       match: {
         python: {all: [/\.rpush\(\s*OUTBOX_KEY/], none: [/except\s+KafkaException/]},
         typescript: {all: [/\.rpush\(\s*OUTBOX_KEY/]},
@@ -97,7 +97,7 @@ without a trace; and a consumer that crashes between its commit and its counters
       id: 'commit-after-apply',
       title: 'Counts the event before committing its offset',
       detail:
-        'The consumer applies the event to `searchstats:{tenant}:{index_version}`, then commits; committed first, a crash between the two skips the event for good. The starter commits first.',
+        'The consumer applies the event to `searchstats:{tenant}:{index_version}`, then commits; committed first, a crash between the two skips the event for good, and an event whose counter update fails is never committed. The starter commits first.',
       match: {
         python: {order: [/apply_event\(json/, /consumer\.commit\(/]},
         typescript: {order: [/applyEvent\(JSON/, /commitOffsets\(/]},
@@ -888,8 +888,8 @@ def _publish(m, tenant="acme", request_id="r-1", latency_ms=12):
     return m.publish_search_event(tenant, request_id, QUERY, 10, "idx-42", latency_ms)
 
 
-def _event(request_id, latency_ms):
-    return json.dumps({"request_id": request_id, "tenant": "acme", "index_version": "idx-42", "k": 10, "latency_ms": latency_ms, "query_digest": query_digest(QUERY)})
+def _event(request_id, latency_ms, index_version="idx-42"):
+    return json.dumps({"request_id": request_id, "tenant": "acme", "index_version": index_version, "k": 10, "latency_ms": latency_ms, "query_digest": query_digest(QUERY)})
 
 
 def check_tenant_key(ctx):
@@ -941,6 +941,7 @@ def check_outbox(ctx):
     assert row.get("key") == "acme", f"the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition: {row}"
     payload = json.loads(row["payload"]) if isinstance(row.get("payload"), str) else row.get("payload")
     assert isinstance(payload, dict) and payload.get("request_id") == "r-1", f"the outbox row must carry the event payload: {row}"
+    assert "0.125" not in rows[0] and "0.0625" not in rows[0] and payload.get("query_digest") == query_digest(QUERY), f"the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: {rows[0]}"
     assert delivered is False, f"publish_search_event returned {delivered!r} for a rejected event, expected False"
     assert ctx.kafka.records(TOPIC) == [], "a rejected produce cannot be on the topic"
     assert _publish(m, "globex", "r-2") is True, "once the broker answers again the event is delivered"
@@ -951,13 +952,20 @@ def check_commit_after_apply(ctx):
     m = ctx.load("events")
     ctx.kafka.seed(TOPIC, key="acme", value=_event("r-1", 10))
     ctx.kafka.seed(TOPIC, key="acme", value=_event("r-2", 30))
+    # r-3's counters cannot be written (searchstats:acme:idx-43 holds a string): it is never counted.
+    ctx.redis.set("searchstats:acme:idx-43", "not a hash")
+    ctx.kafka.seed(TOPIC, key="acme", value=_event("r-3", 50, "idx-43"))
     seen = []
     ctx.kafka.on_commit(lambda group, offsets: seen.append(ctx.redis.hget("searchstats:acme:idx-42", "searches")))
-    ctx.drain(m.consume_search_events)
+    try:
+        ctx.drain(m.consume_search_events)
+    except Exception:  # noqa: BLE001  the consumer may stop on r-3's failure: that is an outcome too
+        pass
     stats = ctx.redis.hgetall("searchstats:acme:idx-42")
     assert stats.get("searches") == "2" and stats.get("latency_ms_total") == "40", f"searchstats:acme:idx-42 holds {stats}, expected searches 2 and latency_ms_total 40"
-    assert seen == ["1", "2"], f"at each commit the counter read {seen}, expected ['1', '2']: an offset was committed before its event was counted, so a crash between the two skips the event"
-    assert ctx.kafka.lag(GROUP, TOPIC) == 0, f"the consumer left {ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted"
+    assert seen[:2] == ["1", "2"], f"at each commit the counter read {seen}, expected ['1', '2']: an offset was committed before its event was counted, so a crash between the two skips the event"
+    lag = ctx.kafka.lag(GROUP, TOPIC)
+    assert lag == 1, f"r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE); the consumer left {lag} record(s) uncommitted, expected exactly r-3: an event that was not counted must not be committed, or it is skipped for good"
 `,
     typescript: `const TOPIC = 'search.query';
 const GROUP = 'search-analytics';
@@ -1029,6 +1037,11 @@ export async function check_outbox(ctx) {
   assert.equal(row.key, 'acme', \`the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition: \${rows[0]}\`);
   const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
   assert(payload !== null && typeof payload === 'object' && payload.request_id === 'r-1', \`the outbox row must carry the event payload: \${rows[0]}\`);
+  const {queryDigest} = ctx.load('/support/search/fingerprint.ts');
+  assert(
+    !rows[0].includes('0.125') && !rows[0].includes('0.0625') && payload.query_digest === queryDigest(QUERY),
+    \`the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: \${rows[0]}\`,
+  );
   assert.equal(delivered, false, \`publishSearchEvent returned \${delivered} for a rejected event, expected false\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'a rejected produce cannot be on the topic');
   assert.equal(await publish(m, 'globex', 'r-2'), true, 'once the broker answers again the event is delivered');
@@ -1038,17 +1051,25 @@ export async function check_outbox(ctx) {
 export async function check_commit_after_apply(ctx) {
   const m = ctx.load('events');
   const {queryDigest} = ctx.load('/support/search/fingerprint.ts');
-  const event = (requestId: string, latencyMs: number) =>
-    JSON.stringify({request_id: requestId, tenant: 'acme', index_version: 'idx-42', k: 10, latency_ms: latencyMs, query_digest: queryDigest(QUERY)});
+  const event = (requestId: string, latencyMs: number, indexVersion = 'idx-42') =>
+    JSON.stringify({request_id: requestId, tenant: 'acme', index_version: indexVersion, k: 10, latency_ms: latencyMs, query_digest: queryDigest(QUERY)});
   ctx.kafka.seed(TOPIC, {key: 'acme', value: event('r-1', 10)});
   ctx.kafka.seed(TOPIC, {key: 'acme', value: event('r-2', 30)});
+  // r-3's counters cannot be written (searchstats:acme:idx-43 holds a string): it is never counted.
+  ctx.redis.set('searchstats:acme:idx-43', 'not a hash');
+  ctx.kafka.seed(TOPIC, {key: 'acme', value: event('r-3', 50, 'idx-43')});
   const seen: (string | null)[] = [];
   ctx.kafka.onCommit(() => seen.push(ctx.redis.hget('searchstats:acme:idx-42', 'searches')));
-  await ctx.drain(m.consumeSearchEvents());
+  try {
+    await ctx.drain(m.consumeSearchEvents());
+  } catch {
+    // The consumer may stop on r-3's failure: that is an outcome too.
+  }
   const stats = ctx.redis.hgetall('searchstats:acme:idx-42');
   assert(stats.searches === '2' && stats.latency_ms_total === '40', \`searchstats:acme:idx-42 holds \${JSON.stringify(stats)}, expected searches 2 and latency_ms_total 40\`);
-  assert.deepStrictEqual(seen, ['1', '2'], \`at each commit the counter read \${JSON.stringify(seen)}, expected ["1","2"]: an offset was committed before its event was counted, so a crash between the two skips the event\`);
-  assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, \`the consumer left \${ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted\`);
+  assert.deepStrictEqual(seen.slice(0, 2), ['1', '2'], \`at each commit the counter read \${JSON.stringify(seen)}, expected ["1","2"]: an offset was committed before its event was counted, so a crash between the two skips the event\`);
+  const lag = ctx.kafka.lag(GROUP, TOPIC);
+  assert.equal(lag, 1, \`r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE); the consumer left \${lag} record(s) uncommitted, expected exactly r-3: an event that was not counted must not be committed, or it is skipped for good\`);
 }
 `,
     go: `package main
@@ -1079,8 +1100,8 @@ func eventsPublish(tenant, requestID string) bool {
 	return publishSearchEvent(eventsBg, tenant, requestID, eventsQuery, 10, "idx-42", 12)
 }
 
-func seededEvent(requestID string, latencyMs int) string {
-	raw, _ := json.Marshal(map[string]any{"request_id": requestID, "tenant": "acme", "index_version": "idx-42", "k": 10, "latency_ms": latencyMs, "query_digest": fingerprint.QueryDigest(eventsQuery)})
+func seededEvent(requestID string, latencyMs int, indexVersion string) string {
+	raw, _ := json.Marshal(map[string]any{"request_id": requestID, "tenant": "acme", "index_version": indexVersion, "k": 10, "latency_ms": latencyMs, "query_digest": fingerprint.QueryDigest(eventsQuery)})
 	return string(raw)
 }
 
@@ -1139,6 +1160,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 		payload = p
 	}
 	ctx.Assert(payload != nil && payload["request_id"] == "r-1", "the outbox row must carry the event payload: %s", rows[0])
+	ctx.Assert(!strings.Contains(rows[0], "0.125") && !strings.Contains(rows[0], "0.0625") && payload["query_digest"] == fingerprint.QueryDigest(eventsQuery), "the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: %s", rows[0])
 	ctx.Equal(delivered, false, "publishSearchEvent must report a rejected event as not delivered")
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
 	ctx.Equal(eventsPublish("globex", "r-2"), true, "once the broker answers again the event is delivered")
@@ -1147,8 +1169,11 @@ func CheckOutbox(ctx *harness.Ctx) {
 }
 
 func CheckCommitAfterApply(ctx *harness.Ctx) {
-	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-1", 10))
-	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-2", 30))
+	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-1", 10, "idx-42"))
+	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-2", 30, "idx-42"))
+	// r-3's counters cannot be written (searchstats:acme:idx-43 holds a string): it is never counted.
+	ctx.Redis.Set("searchstats:acme:idx-43", "not a hash")
+	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-3", 50, "idx-43"))
 	seen := []string{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		searches, _ := ctx.Redis.HGet("searchstats:acme:idx-42", "searches")
@@ -1157,14 +1182,19 @@ func CheckCommitAfterApply(ctx *harness.Ctx) {
 	ctx.Drain(func() { consumeSearchEvents(eventsBg) })
 	stats := ctx.Redis.HGetAll("searchstats:acme:idx-42")
 	ctx.Assert(stats["searches"] == "2" && stats["latency_ms_total"] == "40", "searchstats:acme:idx-42 holds %v, expected searches 2 and latency_ms_total 40", stats)
-	ctx.Equal(seen, []string{"1", "2"}, "at each commit the counter must already count the committed event; a commit before the count means a crash between the two skips the event; the counter at each commit")
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "records the consumer left uncommitted")
+	first := seen
+	if len(first) > 2 {
+		first = first[:2]
+	}
+	ctx.Equal(first, []string{"1", "2"}, "at each commit the counter must already count the committed event; a commit before the count means a crash between the two skips the event; the counter at each commit")
+	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 1, "r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE): an event that was not counted must not be committed, or it is skipped for good; records left uncommitted (exactly r-3)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1183,8 +1213,8 @@ bool eventsPublish(const std::string& tenant, const std::string& request_id) {
   return publishSearchEvent(tenant, request_id, kEventsQuery, 10, "idx-42", 12);
 }
 
-std::string seededEvent(const std::string& request_id, long latency_ms) {
-  return nlohmann::json{{"request_id", request_id}, {"tenant", "acme"}, {"index_version", "idx-42"}, {"k", 10}, {"latency_ms", latency_ms},
+std::string seededEvent(const std::string& request_id, long latency_ms, const std::string& index_version) {
+  return nlohmann::json{{"request_id", request_id}, {"tenant", "acme"}, {"index_version", index_version}, {"k", 10}, {"latency_ms", latency_ms},
                         {"query_digest", fingerprint::queryDigest(kEventsQuery)}}
       .dump();
 }
@@ -1245,6 +1275,8 @@ void CheckOutbox(harness::Ctx& ctx) {
   nlohmann::json payload;
   if (row.contains("payload")) payload = row["payload"].is_string() ? parsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("request_id", std::string()) == "r-1", "the outbox row must carry the event payload: %s", rows[0]);
+  ctx.Assert(rows[0].find("0.125") == std::string::npos && rows[0].find("0.0625") == std::string::npos && payload.value("query_digest", std::string()) == fingerprint::queryDigest(kEventsQuery),
+             "the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: %s", rows[0]);
   ctx.Equal(delivered, false, "publishSearchEvent must report a rejected event as not delivered");
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
   ctx.Equal(eventsPublish("globex", "r-2"), true, "once the broker answers again the event is delivered");
@@ -1253,18 +1285,28 @@ void CheckOutbox(harness::Ctx& ctx) {
 }
 
 void CheckCommitAfterApply(harness::Ctx& ctx) {
-  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-1", 10));
-  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-2", 30));
+  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-1", 10, "idx-42"));
+  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-2", 30, "idx-42"));
+  // r-3's counters cannot be written (searchstats:acme:idx-43 holds a string): it is never counted.
+  ctx.Redis.Set("searchstats:acme:idx-43", "not a hash");
+  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-3", 50, "idx-43"));
   auto seen = std::make_shared<std::vector<std::string>>();
   ctx.Kafka.OnCommit([&ctx, seen](const std::string&, const harness::KafkaOffsets&) {
     seen->push_back(ctx.Redis.HGet("searchstats:acme:idx-42", "searches").value_or(""));
   });
-  ctx.Drain([] { consumeSearchEvents(); });
+  ctx.Drain([] {
+    try {
+      consumeSearchEvents();
+    } catch (const std::exception&) {
+      // The consumer may stop on r-3's failure: that is an outcome too.
+    }
+  });
   const auto stats = ctx.Redis.HGetAll("searchstats:acme:idx-42");
   const auto field = [&stats](const std::string& f) { return stats.count(f) ? stats.at(f) : std::string(); };
   ctx.Assert(field("searches") == "2" && field("latency_ms_total") == "40", "searchstats:acme:idx-42 holds %v, expected searches 2 and latency_ms_total 40", stats);
-  ctx.Equal(*seen, std::vector<std::string>{"1", "2"}, "at each commit the counter must already count the committed event; a commit before the count means a crash between the two skips the event; the counter at each commit");
-  ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 0, "records the consumer left uncommitted");
+  const std::vector<std::string> first(seen->begin(), seen->begin() + static_cast<long>(std::min<size_t>(seen->size(), 2)));
+  ctx.Equal(first, std::vector<std::string>{"1", "2"}, "at each commit the counter must already count the committed event; a commit before the count means a crash between the two skips the event; the counter at each commit");
+  ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 1, "r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE): an event that was not counted must not be committed, or it is skipped for good; records left uncommitted (exactly r-3)");
 }
 `,
   },

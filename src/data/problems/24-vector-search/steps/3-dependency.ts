@@ -24,9 +24,11 @@ documents on shard 2 miss the top \`k\`.
 service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE: the shard is down
 \`\`\`
 
-- Every call carries a \`DEADLINE_S\` (400 ms) deadline.
-- At most \`MAX_ATTEMPTS\` (2) calls per shard, the second only after \`UNAVAILABLE\`.
-- A shard that did not answer is missing: \`partial\` is true and \`answered\` counts the shards that did.
+- Every call carries its own \`DEADLINE_S\` (400 ms) deadline, a retry included.
+- At most \`MAX_ATTEMPTS\` (2) calls per shard, the second only after \`UNAVAILABLE\`; any other code
+  ends that shard's attempts.
+- A shard that did not answer is missing: \`partial\` is true and \`answered\` counts the shards that
+  did. A shard that answered with no hits answered.
 - Fewer than \`quorum()\` answers (2 of 3) raise \`QuorumLost\`, which the API answers as 503.
 - The hits are the global top \`k\` by score, ties by id.`,
   sequence: {
@@ -46,7 +48,7 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
       id: 'deadline',
       title: 'Every shard call carries a 400 ms deadline',
       detail:
-        'Each `Search` call carries a 400 ms deadline (`timeout=DEADLINE_S`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a stalled shard is missing instead of holding the search open. The starter sets none.',
+        'Each `Search` call carries its own 400 ms deadline (`timeout=DEADLINE_S`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), a retry after a late `UNAVAILABLE` included, so a stalled shard is missing instead of holding the search open. The starter sets none.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.4\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -59,7 +61,7 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
       id: 'retry-policy',
       title: 'Two attempts at most, the second only after UNAVAILABLE',
       detail:
-        'A shard is called at most `MAX_ATTEMPTS` (2) times, and again only when it answered `UNAVAILABLE`; a deadline already spent its budget. The starter retries any error five times.',
+        'A shard is called at most `MAX_ATTEMPTS` (2) times, and again only when it answered `UNAVAILABLE`; `DEADLINE_EXCEEDED`, `INTERNAL`, `RESOURCE_EXHAUSTED` or any other code ends its attempts. The starter retries any error five times.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/], none: [/attempt\s*<\s*5\b/]},
@@ -72,7 +74,7 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
       id: 'partial',
       title: 'A missing shard is reported, not hidden',
       detail:
-        'A shard that did not answer is not an empty list: `answered` counts the shards that answered and `partial` is true when one is missing. The starter returns `partial: false` and `answered: 3` whatever happened.',
+        'A shard that did not answer is not an empty list, and an empty list is an answer: `answered` counts the shards that answered, hits or not, and `partial` is true when one is missing. The starter returns `partial: false` and `answered: 3` whatever happened.',
       match: {
         python: {all: [/answered\s*\+=\s*1/], none: [/["']partial["']\s*:\s*False/]},
         typescript: {all: [/answered\s*(\+=\s*1|\+\+)/], none: [/partial:\s*false/]},
@@ -98,7 +100,7 @@ service Shard { rpc Search(ShardRequest) returns (ShardReply); }  // UNAVAILABLE
       id: 'merge',
       title: 'The hits are the global top k',
       detail:
-        "Each shard answers its own top `k`; the merge sorts every reply by score (ties by id) before keeping `k`. The starter concatenates in shard order and cuts, so shard 0's documents crowd out better ones.",
+        "Each shard answers its own top `k`; the merge sorts every reply by score, ties by id, before keeping `k`. The starter concatenates in shard order and cuts, so shard 0's documents crowd out better ones.",
       match: {
         python: {all: [/\.sort\(|sorted\(/]},
         typescript: {all: [/\.sort\(/]},
@@ -754,22 +756,30 @@ SLICES = {
 }
 
 
-class ShardPeer(shard_pb2_grpc.ShardServicer):
-    """One shard: its slice's best k for acme in idx-42, nothing for anyone else."""
+# Tenant ties: one document per shard, every score equal, so only the id orders them.
+TIES = {"shard-0:9000": [("t-c", 0.5)], "shard-1:9000": [("t-b", 0.5)], "shard-2:9000": [("t-a", 0.5)]}
 
-    def __init__(self, hits):
-        self.hits = hits
+
+class ShardPeer(shard_pb2_grpc.ShardServicer):
+    """One shard: its slice's best k for acme (or ties) in idx-42, nothing for anyone else. For tenant
+    flaky, shard-1 answers UNAVAILABLE once its latency has passed: a shard that fails late."""
+
+    def __init__(self, target):
+        self.target = target
 
     def Search(self, request, context):
-        if request.tenant != "acme" or request.index_version != "idx-42":
+        if request.tenant == "flaky" and self.target == "shard-1:9000":
+            context.abort(grpc.StatusCode.UNAVAILABLE, "shard restarting")
+        slices = {"acme": SLICES, "ties": TIES}.get(request.tenant)
+        if slices is None or request.index_version != "idx-42":
             return shard_pb2.ShardReply()
-        best = sorted(self.hits, key=lambda h: -h[1])[: request.k]
+        best = sorted(slices[self.target], key=lambda h: -h[1])[: request.k]
         return shard_pb2.ShardReply(hits=[shard_pb2.Hit(id=i, score=s) for i, s in best])
 
 
 def _client(ctx):
     for target in SHARDS:
-        ctx.grpc.serve(shard_pb2_grpc.add_ShardServicer_to_server, ShardPeer(SLICES[target]), target=target)
+        ctx.grpc.serve(shard_pb2_grpc.add_ShardServicer_to_server, ShardPeer(target), target=target)
     return ctx.load("client")
 
 
@@ -781,10 +791,10 @@ def _calls(ctx, target):
     return len(ctx.grpc.calls_to("Search", target=target))
 
 
-def _search_any(m):
+def _search_any(m, tenant="acme"):
     """A search for checks that only count calls: QuorumLost is an outcome too."""
     try:
-        m.search_shards("acme", "idx-42", QUERY, 3)
+        m.search_shards(tenant, "idx-42", QUERY, 3)
     except m.QuorumLost:
         pass
 
@@ -798,6 +808,14 @@ def check_deadline(ctx):
         assert 0.3 <= call.timeout <= 0.5, f"a Search call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.4"
     assert result["partial"] is True and result["answered"] == 2, f"shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got {result}"
     assert _ids(result) == ["s1-a", "s0-a", "s0-b"], f"the answer must be the top 3 of shard-0 and shard-1, got {result}"
+    # shard-1 now answers UNAVAILABLE only after 300 ms: the retry must still get its own 400 ms.
+    ctx.grpc.set_latency("Search", 0.0, target="shard-2:9000")
+    ctx.grpc.set_latency("Search", 0.3, target="shard-1:9000")
+    before = _calls(ctx, "shard-1:9000")
+    _search_any(m, "flaky")
+    late = ctx.grpc.calls_to("Search", target="shard-1:9000")[before:]
+    assert len(late) == 2, f"shard-1 answered UNAVAILABLE after 300 ms and was called {len(late)} times in one search, expected a first call and one retry"
+    assert all(c.timeout is not None and 0.3 <= c.timeout <= 0.5 for c in late), f"after a first call that failed 300 ms in, the calls to shard-1 carried deadlines {[c.timeout for c in late]}: every attempt gets its own full 400 ms, not what is left of the first one"
 
 
 def check_retry_policy(ctx):
@@ -810,15 +828,21 @@ def check_retry_policy(ctx):
     _search_any(m)
     stopped = _calls(ctx, "shard-2:9000") - before
     assert stopped == 2, f"a shard that is down was called {stopped} times in one search, expected MAX_ATTEMPTS = 2"
-    ctx.grpc.fail("Search", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline", times=1, target="shard-0:9000")
-    before = _calls(ctx, "shard-0:9000")
-    _search_any(m)
-    timed_out = _calls(ctx, "shard-0:9000") - before
-    assert timed_out == 1, f"a shard that ran out of deadline was called {timed_out} times in one search: only UNAVAILABLE is retried"
+    for code in (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INVALID_ARGUMENT):
+        ctx.grpc.fail("Search", code, "terminal", times=1, target="shard-0:9000")
+        before = _calls(ctx, "shard-0:9000")
+        _search_any(m)
+        terminal = _calls(ctx, "shard-0:9000") - before
+        assert terminal == 1, f"a shard that answered {code.name} was called {terminal} times in one search: only UNAVAILABLE is retried"
 
 
 def check_partial(ctx):
     m = _client(ctx)
+    try:
+        empty = m.search_shards("globex", "idx-42", QUERY, 3)
+    except m.QuorumLost:
+        raise AssertionError("every shard answered globex with no hits and search_shards raised QuorumLost: an empty answer is an answer, only a shard that did not answer is missing") from None
+    assert empty["hits"] == [] and empty["partial"] is False and empty["answered"] == 3, f"every shard answered globex with no hits: the answer is complete and empty (answered 3, partial false), got {empty}"
     ctx.grpc.stop("shard-1:9000")
     result = m.search_shards("acme", "idx-42", QUERY, 3)
     assert result["partial"] is True, f"with shard-1 down the answer must say partial, got {result}: a dead shard is not an empty one"
@@ -845,6 +869,8 @@ def check_merge(ctx):
         assert r.tenant == "acme" and r.index_version == "idx-42" and r.k == 3 and list(r.query) == QUERY, f"every shard must be asked for acme's top 3 in idx-42, {call.target} got {r}"
     assert _ids(result) == ["s2-a", "s1-a", "s2-b"], f"the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge answered {_ids(result)}"
     assert result["partial"] is False and result["answered"] == 3, f"with every shard healthy the answer is complete, got {result}"
+    ties = m.search_shards("ties", "idx-42", QUERY, 2)
+    assert _ids(ties) == ["t-a", "t-b"], f"t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 are t-a and t-b by id; the merge answered {_ids(ties)}"
 `,
     typescript: `const SHARDS = ['shard-0:9000', 'shard-1:9000', 'shard-2:9000'];
 const QUERY = [1, 0, 0, 0];
@@ -854,7 +880,14 @@ const SLICES: Record<string, [string, number][]> = {
   'shard-1:9000': [['s1-a', 0.7], ['s1-b', 0.1]],
   'shard-2:9000': [['s2-a', 0.95], ['s2-b', 0.6]],
 };
+/** Tenant ties: one document per shard, every score equal, so only the id orders them. */
+const TIES: Record<string, [string, number][]> = {
+  'shard-0:9000': [['t-c', 0.5]],
+  'shard-1:9000': [['t-b', 0.5]],
+  'shard-2:9000': [['t-a', 0.5]],
+};
 
+/** acme (or ties) in idx-42 per SLICES; anyone else gets nothing. For tenant flaky, shard-1 answers UNAVAILABLE once its latency has passed: a shard that fails late. */
 function client(ctx) {
   const pkg = ctx.proto('shard.proto');
   for (const target of SHARDS) {
@@ -863,8 +896,10 @@ function client(ctx) {
       {
         Search(call, callback) {
           const {tenant, index_version, k} = call.request;
-          if (tenant !== 'acme' || index_version !== 'idx-42') return callback(null, {hits: []});
-          const best = [...SLICES[target]].sort((a, b) => b[1] - a[1]).slice(0, Number(k));
+          if (tenant === 'flaky' && target === 'shard-1:9000') return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'shard restarting'});
+          const slices = tenant === 'acme' ? SLICES : tenant === 'ties' ? TIES : null;
+          if (slices === null || index_version !== 'idx-42') return callback(null, {hits: []});
+          const best = [...slices[target]].sort((a, b) => b[1] - a[1]).slice(0, Number(k));
           callback(null, {hits: best.map(([id, score]) => ({id, score}))});
         },
       },
@@ -878,9 +913,9 @@ const ids = result => result.hits.map(h => h.id).join(',');
 const calls = (ctx, target: string): number => ctx.grpc.callsTo('Search', target).length;
 
 /** A search for checks that only count calls: QuorumLost is an outcome too. */
-async function searchAny(m): Promise<void> {
+async function searchAny(m, tenant = 'acme'): Promise<void> {
   try {
-    await m.searchShards('acme', 'idx-42', QUERY, 3);
+    await m.searchShards(tenant, 'idx-42', QUERY, 3);
   } catch (e) {
     if (!(e instanceof m.QuorumLost)) throw e;
   }
@@ -896,6 +931,17 @@ export async function check_deadline(ctx) {
   }
   assert(result.partial === true && result.answered === 2, \`shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got \${JSON.stringify(result)}\`);
   assert.equal(ids(result), 's1-a,s0-a,s0-b', \`the answer must be the top 3 of shard-0 and shard-1, got \${JSON.stringify(result)}\`);
+  // shard-1 now answers UNAVAILABLE only after 300 ms: the retry must still get its own 400 ms.
+  ctx.grpc.setLatency('Search', 0, 'shard-2:9000');
+  ctx.grpc.setLatency('Search', 0.3, 'shard-1:9000');
+  const before = calls(ctx, 'shard-1:9000');
+  await searchAny(m, 'flaky');
+  const late = ctx.grpc.callsTo('Search', 'shard-1:9000').slice(before);
+  assert.equal(late.length, 2, \`shard-1 answered UNAVAILABLE after 300 ms and was called \${late.length} times in one search, expected a first call and one retry\`);
+  assert(
+    late.every(c => c.timeout !== null && c.timeout >= 0.3 && c.timeout <= 0.5),
+    \`after a first call that failed 300 ms in, the calls to shard-1 carried deadlines \${JSON.stringify(late.map(c => c.timeout))}: every attempt gets its own full 400 ms, not what is left of the first one\`,
+  );
 }
 
 export async function check_retry_policy(ctx) {
@@ -908,15 +954,28 @@ export async function check_retry_policy(ctx) {
   await searchAny(m);
   const stopped = calls(ctx, 'shard-2:9000') - before;
   assert.equal(stopped, 2, \`a shard that is down was called \${stopped} times in one search, expected MAX_ATTEMPTS = 2\`);
-  ctx.grpc.fail('Search', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline', 1, 'shard-0:9000');
-  before = calls(ctx, 'shard-0:9000');
-  await searchAny(m);
-  const timedOut = calls(ctx, 'shard-0:9000') - before;
-  assert.equal(timedOut, 1, \`a shard that ran out of deadline was called \${timedOut} times in one search: only UNAVAILABLE is retried\`);
+  for (const code of ['DEADLINE_EXCEEDED', 'INTERNAL', 'RESOURCE_EXHAUSTED', 'INVALID_ARGUMENT']) {
+    ctx.grpc.fail('Search', ctx.grpc.status[code], 'terminal', 1, 'shard-0:9000');
+    before = calls(ctx, 'shard-0:9000');
+    await searchAny(m);
+    const terminal = calls(ctx, 'shard-0:9000') - before;
+    assert.equal(terminal, 1, \`a shard that answered \${code} was called \${terminal} times in one search: only UNAVAILABLE is retried\`);
+  }
 }
 
 export async function check_partial(ctx) {
   const m = client(ctx);
+  let empty;
+  try {
+    empty = await m.searchShards('globex', 'idx-42', QUERY, 3);
+  } catch (e) {
+    if (!(e instanceof m.QuorumLost)) throw e;
+    assert.fail('every shard answered globex with no hits and searchShards threw QuorumLost: an empty answer is an answer, only a shard that did not answer is missing');
+  }
+  assert(
+    empty.hits.length === 0 && empty.partial === false && empty.answered === 3,
+    \`every shard answered globex with no hits: the answer is complete and empty (answered 3, partial false), got \${JSON.stringify(empty)}\`,
+  );
   ctx.grpc.stop('shard-1:9000');
   const result = await m.searchShards('acme', 'idx-42', QUERY, 3);
   assert.equal(result.partial, true, \`with shard-1 down the answer must say partial, got \${JSON.stringify(result)}: a dead shard is not an empty one\`);
@@ -947,6 +1006,8 @@ export async function check_merge(ctx) {
   }
   assert.equal(ids(result), 's2-a,s1-a,s2-b', \`the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge answered \${ids(result)}\`);
   assert(result.partial === false && result.answered === 3, \`with every shard healthy the answer is complete, got \${JSON.stringify(result)}\`);
+  const ties = await m.searchShards('ties', 'idx-42', QUERY, 2);
+  assert.equal(ids(ties), 't-a,t-b', \`t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 are t-a and t-b by id; the merge answered \${ids(ties)}\`);
 }
 `,
     go: `package main
@@ -960,6 +1021,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "search/gen/shard"
 
@@ -984,17 +1046,29 @@ var shardSlices = map[string][]sliceHit{
 	"shard-2:9000": {{"s2-a", 0.95}, {"s2-b", 0.60}},
 }
 
-// shardPeer answers its slice's best k for acme in idx-42, nothing for anyone else.
+// tiedSlices is tenant ties: one document per shard, every score equal, so only the id orders them.
+var tiedSlices = map[string][]sliceHit{
+	"shard-0:9000": {{"t-c", 0.5}},
+	"shard-1:9000": {{"t-b", 0.5}},
+	"shard-2:9000": {{"t-a", 0.5}},
+}
+
+// shardPeer answers its slice's best k for acme (or ties) in idx-42, nothing for anyone else. For
+// tenant flaky, shard-1 answers UNAVAILABLE once its latency has passed: a shard that fails late.
 type shardPeer struct {
 	pb.UnimplementedShardServer
-	hits []sliceHit
+	target string
 }
 
 func (p *shardPeer) Search(_ context.Context, req *pb.ShardRequest) (*pb.ShardReply, error) {
-	if req.GetTenant() != "acme" || req.GetIndexVersion() != "idx-42" {
+	if req.GetTenant() == "flaky" && p.target == "shard-1:9000" {
+		return nil, status.Error(codes.Unavailable, "shard restarting")
+	}
+	slices := map[string]map[string][]sliceHit{"acme": shardSlices, "ties": tiedSlices}[req.GetTenant()]
+	if slices == nil || req.GetIndexVersion() != "idx-42" {
 		return &pb.ShardReply{}, nil
 	}
-	best := append([]sliceHit(nil), p.hits...)
+	best := append([]sliceHit(nil), slices[p.target]...)
 	sort.Slice(best, func(i, j int) bool { return best[i].score > best[j].score })
 	if int(req.GetK()) < len(best) {
 		best = best[:req.GetK()]
@@ -1007,9 +1081,11 @@ func (p *shardPeer) Search(_ context.Context, req *pb.ShardRequest) (*pb.ShardRe
 }
 
 func serveShards(ctx *harness.Ctx) {
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-0:9000"), &shardPeer{hits: shardSlices["shard-0:9000"]})
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-1:9000"), &shardPeer{hits: shardSlices["shard-1:9000"]})
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-2:9000"), &shardPeer{hits: shardSlices["shard-2:9000"]})
+	for _, target := range shardTargets {
+		// Bound to a variable first: the Go runtime reuses one &T{} literal passed straight to a call in a loop.
+		peer := &shardPeer{target: target}
+		pb.RegisterShardServer(ctx.GRPC.Server(target), peer)
+	}
 }
 
 func gatheredIDs(g Gathered) string {
@@ -1038,6 +1114,16 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.Assert(g.Partial && g.Answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so Partial must be true and Answered 2, got %+v", g)
 	ctx.Equal(gatheredIDs(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1")
+	// shard-1 now answers UNAVAILABLE only after 300 ms: the retry must still get its own 400 ms.
+	ctx.GRPC.SetLatency("Search", 0, "shard-2:9000")
+	ctx.GRPC.SetLatency("Search", 0.3, "shard-1:9000")
+	before := callCount(ctx, "shard-1:9000")
+	searchShards(clientBg, "flaky", "idx-42", clientQuery, 3)
+	late := ctx.GRPC.CallsTo("Search", "shard-1:9000")[before:]
+	ctx.Equal(len(late), 2, "shard-1 answered UNAVAILABLE after 300 ms: a first call and one retry; calls")
+	for _, call := range late {
+		ctx.Assert(call.HasDeadline() && call.Timeout >= 300*time.Millisecond && call.Timeout <= 500*time.Millisecond, "after a first call that failed 300 ms in, a call to shard-1 carried a %v deadline: every attempt gets its own full 400 ms, not what is left of the first one", call.Timeout)
+	}
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
@@ -1049,14 +1135,19 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	before := callCount(ctx, "shard-2:9000")
 	searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
 	ctx.Equal(callCount(ctx, "shard-2:9000")-before, 2, "a shard that is down must be called maxAttempts = 2 times in one search; calls")
-	ctx.GRPC.Fail("Search", codes.DeadlineExceeded, "deadline", 1, "shard-0:9000")
-	before = callCount(ctx, "shard-0:9000")
-	searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
-	ctx.Equal(callCount(ctx, "shard-0:9000")-before, 1, "a shard that ran out of deadline must not be called again in the same search (only UNAVAILABLE is retried); calls")
+	for _, code := range []codes.Code{codes.DeadlineExceeded, codes.Internal, codes.ResourceExhausted, codes.InvalidArgument} {
+		ctx.GRPC.Fail("Search", code, "terminal", 1, "shard-0:9000")
+		before = callCount(ctx, "shard-0:9000")
+		searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+		ctx.Equal(callCount(ctx, "shard-0:9000")-before, 1, "a shard that answered %v must not be called again in the same search (only UNAVAILABLE is retried); calls", code)
+	}
 }
 
 func CheckPartial(ctx *harness.Ctx) {
 	serveShards(ctx)
+	empty, err := searchShards(clientBg, "globex", "idx-42", clientQuery, 3)
+	ctx.Assert(err == nil, "every shard answered globex with no hits and searchShards returned %v: an empty answer is an answer, only a shard that did not answer is missing", err)
+	ctx.Assert(len(empty.Hits) == 0 && !empty.Partial && empty.Answered == 3, "every shard answered globex with no hits: the answer is complete and empty (Answered 3, Partial false), got %+v", empty)
 	ctx.GRPC.Stop("shard-1:9000")
 	g := mustGather(ctx)
 	ctx.Assert(g.Partial, "with shard-1 down the answer must say Partial, got %+v: a dead shard is not an empty one", g)
@@ -1082,6 +1173,9 @@ func CheckMerge(ctx *harness.Ctx) {
 	}
 	ctx.Equal(gatheredIDs(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge")
 	ctx.Assert(!g.Partial && g.Answered == 3, "with every shard healthy the answer is complete, got %+v", g)
+	ties, err := searchShards(clientBg, "ties", "idx-42", clientQuery, 2)
+	ctx.NoError(err, "searchShards(ties, idx-42, …, 2)")
+	ctx.Equal(gatheredIDs(ties), "t-a,t-b", "t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 by id are t-a and t-b; the merge")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1104,13 +1198,23 @@ const std::map<std::string, std::vector<std::pair<std::string, double>>> kSlices
     {"shard-2:9000", {{"s2-a", 0.95}, {"s2-b", 0.60}}},
 };
 
-// One shard: its slice's best k for acme in idx-42, nothing for anyone else.
+// Tenant ties: one document per shard, every score equal, so only the id orders them.
+const std::map<std::string, std::vector<std::pair<std::string, double>>> kTies = {
+    {"shard-0:9000", {{"t-c", 0.5}}},
+    {"shard-1:9000", {{"t-b", 0.5}}},
+    {"shard-2:9000", {{"t-a", 0.5}}},
+};
+
+// One shard: its slice's best k for acme (or ties) in idx-42, nothing for anyone else. For tenant
+// flaky, shard-1 answers UNAVAILABLE once its latency has passed: a shard that fails late.
 class ShardPeer final : public searchd::Shard::Service {
  public:
-  explicit ShardPeer(std::vector<std::pair<std::string, double>> hits) : hits_(std::move(hits)) {}
+  explicit ShardPeer(std::string target) : target_(std::move(target)) {}
   grpc::Status Search(grpc::ServerContext*, const searchd::ShardRequest* req, searchd::ShardReply* out) override {
-    if (req->tenant() != "acme" || req->index_version() != "idx-42") return grpc::Status::OK;
-    auto best = hits_;
+    if (req->tenant() == "flaky" && target_ == "shard-1:9000") return grpc::Status(grpc::StatusCode::UNAVAILABLE, "shard restarting");
+    const auto* slices = req->tenant() == "acme" ? &kSlices : req->tenant() == "ties" ? &kTies : nullptr;
+    if (slices == nullptr || req->index_version() != "idx-42") return grpc::Status::OK;
+    auto best = slices->at(target_);
     std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     if (static_cast<size_t>(req->k()) < best.size()) best.resize(req->k());
     for (const auto& [id, score] : best) {
@@ -1122,7 +1226,7 @@ class ShardPeer final : public searchd::Shard::Service {
   }
 
  private:
-  std::vector<std::pair<std::string, double>> hits_;
+  std::string target_;
 };
 
 void serveShards(harness::Ctx& ctx) {
@@ -1130,7 +1234,7 @@ void serveShards(harness::Ctx& ctx) {
   for (ShardPeer* p : peers) delete p;
   peers.clear();
   for (const std::string& target : kTargets) {
-    peers.push_back(new ShardPeer(kSlices.at(target)));
+    peers.push_back(new ShardPeer(target));
     ctx.GRPC.Server(target)->RegisterService(peers.back());
   }
 }
@@ -1175,6 +1279,16 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.Assert(g.partial && g.answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got %s", show(g));
   ctx.Equal(ids(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1");
+  // shard-1 now answers UNAVAILABLE only after 300 ms: the retry must still get its own 400 ms.
+  ctx.GRPC.SetLatency("Search", 0, "shard-2:9000");
+  ctx.GRPC.SetLatency("Search", 0.3, "shard-1:9000");
+  const int before = calls(ctx, "shard-1:9000");
+  quietly([] { searchShards("flaky", "idx-42", kQuery, 3); });
+  const auto all = ctx.GRPC.CallsTo("Search", "shard-1:9000");
+  ctx.Equal(static_cast<int>(all.size()) - before, 2, "shard-1 answered UNAVAILABLE after 300 ms: a first call and one retry; calls");
+  for (size_t i = static_cast<size_t>(before); i < all.size(); ++i) {
+    ctx.Assert(all[i].HasDeadline() && all[i].TimeoutSeconds() >= 0.3 && all[i].TimeoutSeconds() <= 0.5, "after a first call that failed 300 ms in, a call to shard-1 carried a %v s deadline: every attempt gets its own full 400 ms, not what is left of the first one", all[i].TimeoutSeconds());
+  }
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
@@ -1186,14 +1300,28 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   int before = calls(ctx, "shard-2:9000");
   quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
   ctx.Equal(calls(ctx, "shard-2:9000") - before, 2, "a shard that is down must be called kMaxAttempts = 2 times in one search; calls");
-  ctx.GRPC.Fail("Search", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline", 1, "shard-0:9000");
-  before = calls(ctx, "shard-0:9000");
-  quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
-  ctx.Equal(calls(ctx, "shard-0:9000") - before, 1, "a shard that ran out of deadline must not be called again in the same search (only UNAVAILABLE is retried); calls");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::DEADLINE_EXCEEDED, "DEADLINE_EXCEEDED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+  };
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.Fail("Search", code, "terminal", 1, "shard-0:9000");
+    before = calls(ctx, "shard-0:9000");
+    quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
+    ctx.Equal(calls(ctx, "shard-0:9000") - before, 1, "a shard that answered %s must not be called again in the same search (only UNAVAILABLE is retried); calls", name);
+  }
 }
 
 void CheckPartial(harness::Ctx& ctx) {
   serveShards(ctx);
+  try {
+    const Gathered empty = searchShards("globex", "idx-42", kQuery, 3);
+    ctx.Assert(empty.hits.empty() && !empty.partial && empty.answered == 3, "every shard answered globex with no hits: the answer is complete and empty (answered 3, partial false), got %s", show(empty));
+  } catch (const QuorumLost&) {
+    ctx.Fatalf("every shard answered globex with no hits and searchShards threw QuorumLost: an empty answer is an answer, only a shard that did not answer is missing");
+  }
   ctx.GRPC.Stop("shard-1:9000");
   const Gathered g = gather(ctx);
   ctx.Assert(g.partial, "with shard-1 down the answer must say partial, got %s: a dead shard is not an empty one", show(g));
@@ -1222,6 +1350,11 @@ void CheckMerge(harness::Ctx& ctx) {
   }
   ctx.Equal(ids(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge");
   ctx.Assert(!g.partial && g.answered == 3, "with every shard healthy the answer is complete, got %s", show(g));
+  try {
+    ctx.Equal(ids(searchShards("ties", "idx-42", kQuery, 2)), "t-a,t-b", "t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 by id are t-a and t-b; the merge");
+  } catch (const QuorumLost&) {
+    ctx.Fatalf("with every shard healthy searchShards(ties, idx-42, …, 2) threw QuorumLost");
+  }
 }
 `,
   },

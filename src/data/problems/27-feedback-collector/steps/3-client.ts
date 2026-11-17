@@ -47,7 +47,7 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
       id: 'deadline',
       title: 'The lookup carries a 200 ms deadline',
       detail:
-        'Every `GetAttribution` call is made with `DEADLINE_S` (200 ms), so a registry that answers in a second costs the vote 200 ms and an unattributed row; the starter gives it two seconds.',
+        'Every `GetAttribution` call is made with `DEADLINE_S` (200 ms), so a registry that answers in a second costs the vote at most 200 ms and an unattributed row; the starter gives it two seconds.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.2\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*200\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -62,7 +62,7 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
       id: 'unattributed',
       title: 'A failed lookup is unattributed, not the active model',
       detail:
-        "An unavailable registry or an unknown request answers `model_version = UNATTRIBUTED`; the starter answers `ACTIVE_MODEL`, so after a rollout the old model's ratings count for the new one.",
+        "Any failure, an unavailable registry, an unknown request or an internal error, answers `model_version = UNATTRIBUTED` and does not raise; the starter answers `ACTIVE_MODEL`, so after a rollout the old model's ratings count for the new one.",
       match: {
         python: {all: [/UNATTRIBUTED\s*=\s*["']unattributed["']/], none: [/ACTIVE_MODEL/]},
         typescript: {all: [/UNATTRIBUTED\s*=\s*['"]unattributed['"]/], none: [/ACTIVE_MODEL/]},
@@ -75,7 +75,7 @@ service Attribution { rpc GetAttribution(AttributionRequest) returns (Attributio
       id: 'retry-after-failure',
       title: 'A failure is not remembered',
       detail:
-        'After a failed lookup the next call for the same request asks the registry again, and only a success is cached; the starter remembers the failure for a day and answers it without asking.',
+        'After a failed lookup, a `NOT_FOUND` included, the next call for the same request asks the registry again, and only a success is cached; the starter remembers the failure for a day and answers it without asking.',
       match: {
         python: {none: [/_failures|FAILURE_TTL_S/]},
         typescript: {none: [/\bfailures\b|FAILURE_TTL_MS/]},
@@ -522,7 +522,9 @@ Attribution attribute(const std::string& tenant, const std::string& request_id) 
     },
   },
   harness: {
-    python: `import grpc
+    python: `import time
+
+import grpc
 
 import attribution_pb2
 import attribution_pb2_grpc
@@ -562,8 +564,11 @@ def check_deadline(ctx):
     assert calls[0].timeout is not None, "the lookup carries no deadline: a stalled registry holds every vote open"
     assert 0.15 <= calls[0].timeout <= 0.25, f"the lookup carries a {calls[0].timeout} s deadline, expected 200 ms"
     ctx.grpc.set_latency("GetAttribution", 1.0)
+    started = time.time()
     slow = m.attribute("t-acme", "req-2")
-    assert slow["model_version"] != "support-llm-2026-09", f"a registry that answers after 1 s was waited for ({slow}): past 200 ms the vote goes on unattributed"
+    waited = time.time() - started
+    assert slow["model_version"] == "unattributed", f"a registry that answers after 1 s gave {slow}: past 200 ms the vote goes on unattributed"
+    assert waited <= 0.25, f"a registry that answers after 1 s held the vote {waited:.2f} s: one lookup of 200 ms, then the vote goes on unattributed"
 
 
 def check_unattributed(ctx):
@@ -574,6 +579,12 @@ def check_unattributed(ctx):
     assert down["prompt_version"] == "" and down["route"] == "", f"an unattributed answer has no prompt version or route, got {down}"
     unknown = m.attribute("t-acme", "req-404")
     assert unknown["model_version"] == "unattributed", f"for a request the registry does not know attribute answered {unknown}"
+    ctx.grpc.fail("GetAttribution", grpc.StatusCode.INTERNAL, "registry bug")
+    try:
+        broken = m.attribute("t-acme", "req-2")
+    except grpc.RpcError as e:
+        raise AssertionError(f"a registry answering INTERNAL made attribute raise {e.code()}: any failure is unattributed") from e
+    assert broken["model_version"] == "unattributed", f"with the registry answering INTERNAL attribute answered {broken}: any failure is unattributed"
 
 
 def check_retry_after_failure(ctx):
@@ -586,6 +597,9 @@ def check_retry_after_failure(ctx):
     assert again["model_version"] == "support-llm-2026-09", f"once the registry answers, attribute must return its attribution, got {again}"
     third = m.attribute("t-acme", "req-1")
     assert _calls(ctx) == before + 1 and third == again, "a successful lookup is cached: a third request for req-1 must not call the registry"
+    m.attribute("t-acme", "req-404")
+    m.attribute("t-acme", "req-404")
+    assert _calls(ctx) == before + 3, "a NOT_FOUND was remembered: the second request for req-404 did not ask the registry, which may know it by then. Only a success is cached"
 
 
 def check_tenant_cache(ctx):
@@ -631,8 +645,11 @@ export async function check_deadline(ctx) {
   assert(all[0].timeout !== null, 'the lookup carries no deadline: a stalled registry holds every vote open');
   assert(0.15 <= all[0].timeout && all[0].timeout <= 0.25, \`the lookup carries a \${all[0].timeout} s deadline, expected 200 ms\`);
   ctx.grpc.setLatency('GetAttribution', 1.0);
+  const started = ctx.clock.now();
   const slow = await m.attribute('t-acme', 'req-2');
-  assert.notEqual(slow.model_version, 'support-llm-2026-09', \`a registry that answers after 1 s was waited for (\${JSON.stringify(slow)}): past 200 ms the vote goes on unattributed\`);
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert.equal(slow.model_version, 'unattributed', \`a registry that answers after 1 s gave \${JSON.stringify(slow)}: past 200 ms the vote goes on unattributed\`);
+  assert(waited <= 0.25, \`a registry that answers after 1 s held the vote \${waited.toFixed(2)} s: one lookup of 200 ms, then the vote goes on unattributed\`);
 }
 
 export async function check_unattributed(ctx) {
@@ -643,6 +660,14 @@ export async function check_unattributed(ctx) {
   assert(down.prompt_version === '' && down.route === '', \`an unattributed answer has no prompt version or route, got \${JSON.stringify(down)}\`);
   const unknown = await m.attribute('t-acme', 'req-404');
   assert.equal(unknown.model_version, 'unattributed', \`for a request the registry does not know attribute answered \${JSON.stringify(unknown)}\`);
+  ctx.grpc.fail('GetAttribution', ctx.grpc.status.INTERNAL, 'registry bug');
+  let broken;
+  try {
+    broken = await m.attribute('t-acme', 'req-2');
+  } catch (e) {
+    throw new Error(\`a registry answering INTERNAL made attribute throw \${String(e)}: any failure is unattributed\`);
+  }
+  assert.equal(broken.model_version, 'unattributed', \`with the registry answering INTERNAL attribute answered \${JSON.stringify(broken)}: any failure is unattributed\`);
 }
 
 export async function check_retry_after_failure(ctx) {
@@ -655,6 +680,9 @@ export async function check_retry_after_failure(ctx) {
   assert.equal(again.model_version, 'support-llm-2026-09', \`once the registry answers, attribute must return its attribution, got \${JSON.stringify(again)}\`);
   const third = await m.attribute('t-acme', 'req-1');
   assert(calls(ctx) === before + 1 && third.model_version === again.model_version, 'a successful lookup is cached: a third request for req-1 must not call the registry');
+  await m.attribute('t-acme', 'req-404');
+  await m.attribute('t-acme', 'req-404');
+  assert.equal(calls(ctx), before + 3, 'a NOT_FOUND was remembered: the second request for req-404 did not ask the registry, which may know it by then. Only a success is cached');
 }
 
 export async function check_tenant_cache(ctx) {
@@ -721,8 +749,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(calls[0].HasDeadline(), "the lookup carries no deadline: a stalled registry holds every vote open")
 	ctx.Assert(150*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 250*time.Millisecond, "the lookup carries a %v deadline, expected 200 ms", calls[0].Timeout)
 	ctx.GRPC.SetLatency("GetAttribution", 1.0, "")
+	started := ctx.Clock.Now()
 	slow := attribute(clientBg, "t-acme", "req-2")
-	ctx.Assert(slow.ModelVersion != "support-llm-2026-09", "a registry that answers after 1 s was waited for (%+v): past 200 ms the vote goes on unattributed", slow)
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Equal(slow.ModelVersion, "unattributed", "a registry that answers after 1 s (past 200 ms the vote goes on unattributed), the model")
+	ctx.Assert(waited <= 0.25, "a registry that answers after 1 s held the vote %.2f s: one lookup of 200 ms, then the vote goes on unattributed", waited)
 }
 
 func CheckUnattributed(ctx *harness.Ctx) {
@@ -733,6 +764,9 @@ func CheckUnattributed(ctx *harness.Ctx) {
 	ctx.Assert(down.PromptVersion == "" && down.Route == "", "an unattributed answer has no prompt version or route, got %+v", down)
 	unknown := attribute(clientBg, "t-acme", "req-404")
 	ctx.Equal(unknown.ModelVersion, "unattributed", "for a request the registry does not know, the model")
+	ctx.GRPC.Fail("GetAttribution", codes.Internal, "registry bug", 1, "")
+	broken := attribute(clientBg, "t-acme", "req-2")
+	ctx.Equal(broken.ModelVersion, "unattributed", "with the registry answering INTERNAL (any failure is unattributed), the model")
 }
 
 func CheckRetryAfterFailure(ctx *harness.Ctx) {
@@ -745,6 +779,9 @@ func CheckRetryAfterFailure(ctx *harness.Ctx) {
 	ctx.Equal(again.ModelVersion, "support-llm-2026-09", "once the registry answers, the attributed model")
 	third := attribute(clientBg, "t-acme", "req-1")
 	ctx.Assert(registryCalls(ctx) == before+1 && third == again, "a successful lookup is cached: a third request for req-1 must not call the registry")
+	attribute(clientBg, "t-acme", "req-404")
+	attribute(clientBg, "t-acme", "req-404")
+	ctx.Equal(registryCalls(ctx), before+3, "a NOT_FOUND must not be remembered: the second request for req-404 asks the registry again, which may know it by then (only a success is cached); the calls")
 }
 
 func CheckTenantCache(ctx *harness.Ctx) {
@@ -814,8 +851,11 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(calls[0].HasDeadline(), "the lookup carries no deadline: a stalled registry holds every vote open");
   ctx.Assert(0.15 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.25, "the lookup carries a %v s deadline, expected 200 ms", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("GetAttribution", 1.0);
+  const int64_t started = ctx.Clock.Now();
   const Attribution slow = attribute("t-acme", "req-2");
-  ctx.Assert(slow.model_version != "support-llm-2026-09", "a registry that answers after 1 s was waited for (model %q): past 200 ms the vote goes on unattributed", slow.model_version);
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Equal(slow.model_version, "unattributed", "a registry that answers after 1 s (past 200 ms the vote goes on unattributed), the model");
+  ctx.Assert(waited <= 0.25, "a registry that answers after 1 s held the vote %v s: one lookup of 200 ms, then the vote goes on unattributed", waited);
 }
 
 void CheckUnattributed(harness::Ctx& ctx) {
@@ -826,6 +866,9 @@ void CheckUnattributed(harness::Ctx& ctx) {
   ctx.Assert(down.prompt_version.empty() && down.route.empty(), "an unattributed answer has no prompt version or route, got %q and %q", down.prompt_version, down.route);
   const Attribution unknown = attribute("t-acme", "req-404");
   ctx.Equal(unknown.model_version, "unattributed", "for a request the registry does not know, the model");
+  ctx.GRPC.Fail("GetAttribution", grpc::StatusCode::INTERNAL, "registry bug", 1);
+  const Attribution broken = attribute("t-acme", "req-2");
+  ctx.Equal(broken.model_version, "unattributed", "with the registry answering INTERNAL (any failure is unattributed), the model");
 }
 
 void CheckRetryAfterFailure(harness::Ctx& ctx) {
@@ -838,6 +881,9 @@ void CheckRetryAfterFailure(harness::Ctx& ctx) {
   ctx.Equal(again.model_version, "support-llm-2026-09", "once the registry answers, the attributed model");
   const Attribution third = attribute("t-acme", "req-1");
   ctx.Assert(registryCalls(ctx) == before + 1 && third.model_version == again.model_version, "a successful lookup is cached: a third request for req-1 must not call the registry");
+  attribute("t-acme", "req-404");
+  attribute("t-acme", "req-404");
+  ctx.Equal(registryCalls(ctx), before + 3, "a NOT_FOUND must not be remembered: the second request for req-404 asks the registry again, which may know it by then (only a success is cached); the calls");
 }
 
 void CheckTenantCache(harness::Ctx& ctx) {

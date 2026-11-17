@@ -73,7 +73,7 @@ Requirements:
       id: 'retry-unavailable',
       title: 'Retries only UNAVAILABLE, at most twice',
       detail:
-        'One UNAVAILABLE earns a retry after a backoff and the sample is accepted on the second call; three in a row end as rejected with reason unavailable after exactly three calls. The starter retries anything until its wall clock runs out.',
+        'One UNAVAILABLE earns a retry after a backoff and the sample is accepted on the second call; three in a row end as rejected with reason unavailable after exactly three calls, each carrying its own full four-second deadline. Any other status (INTERNAL, RESOURCE_EXHAUSTED) is rejected after one call and recorded once. The starter retries anything until its wall clock runs out.',
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_SHARD_SECONDS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_SHARD_SECONDS/]},
@@ -112,7 +112,7 @@ Requirements:
       id: 'budget-before-call',
       title: 'Reserves budget before the call',
       detail:
-        'state.reserve runs before the first Generate: a duplicate prompt and a job out of budget make no call, and after a run sampled equals accepted plus rejected. The starter calls first and records without reserving.',
+        "state.reserve runs before the first Generate: a duplicate prompt and a job out of budget make no call, an accepted sample carries the reservation's dedupe_hash, and after a run sampled equals accepted plus rejected. The starter calls first and records without reserving.",
       match: {
         python: {order: [/state\.reserve\(/, /stub\.Generate\(/]},
         typescript: {order: [/state\.reserve\(/, /stub\.Generate\(/]},
@@ -836,7 +836,9 @@ Sample generate(JobState& state, const std::string& job_id, const std::string& p
     },
   },
   harness: {
-    python: `import grpc
+    python: `import hashlib
+
+import grpc
 
 import teacher_pb2
 import teacher_pb2_grpc
@@ -904,12 +906,22 @@ def check_retry_unavailable(ctx):
     _expect(sample, "accepted")
     assert sample.get("attempts") == 2 and len(_calls(ctx)) == 2, f"one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw {len(_calls(ctx))} calls and {sample}"
     assert ctx.clock.sleeps >= 1, "a retry waits a backoff before the next attempt"
-    ctx.grpc.fail("Generate", grpc.StatusCode.UNAVAILABLE, "teacher down", times=5, target=config.TEACHER)
+    ctx.grpc.fail("Generate", grpc.StatusCode.UNAVAILABLE, "teacher down", times=3, target=config.TEACHER)
     sample = m.generate(state, JOB, "p-2", "What is 3 + 3?")
     _expect(sample, "rejected", "unavailable")
     assert len(_calls(ctx)) == 5, f"a teacher that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then the sample is rejected: saw {len(_calls(ctx)) - 2} calls for it"
     assert sample.get("attempts") == 3, f"attempts must say 3, got {sample}"
     assert _progress(ctx).get("rejected") == 1 and _reasons(ctx).get("unavailable") == 1, f"the rejection is recorded once with reason unavailable: {_progress(ctx)}, {_reasons(ctx)}"
+    first = _calls(ctx)[0].timeout
+    for i, call in enumerate(_calls(ctx)):
+        assert call.timeout is not None and abs(call.timeout - first) <= 0.01, f"attempt deadlines {[c.timeout for c in _calls(ctx)]}: call {i + 1} did not carry the full DEADLINE_S, every attempt gets its own four seconds, not what is left of one deadline shared by the retries"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        calls, rejected = len(_calls(ctx)), _progress(ctx).get("rejected", 0)
+        ctx.grpc.fail("Generate", code, "teacher error", times=1, target=config.TEACHER)
+        sample = m.generate(state, JOB, f"p-{code.name}", f"What is {code.name}?")
+        _expect(sample, "rejected")
+        assert len(_calls(ctx)) == calls + 1, f"{code.name} is not UNAVAILABLE, so it is not retried: expected one call, saw {len(_calls(ctx)) - calls}"
+        assert _progress(ctx).get("rejected") == rejected + 1 and sum(_reasons(ctx).values()) == rejected + 1, f"a {code.name} is recorded once as rejected with a reason: {_progress(ctx)}, {_reasons(ctx)}"
 
 
 def check_refusal_recorded(ctx):
@@ -945,7 +957,7 @@ def check_budget_before_call(ctx):
     m, state = _world(ctx, cap=1)
     first = m.generate(state, JOB, "p-1", "What is the capital of France?")
     _expect(first, "accepted")
-    assert first.get("dedupe_hash"), f"an accepted sample carries the reservation's dedupe_hash: {first}"
+    assert first.get("dedupe_hash") == hashlib.sha256(b"What is the capital of France?").hexdigest(), f"an accepted sample carries the reservation's dedupe_hash (the prompt's SHA-256): {first}"
     assert len(_calls(ctx)) == 1
     second = m.generate(state, JOB, "p-2", "What is the capital of Peru?")
     _expect(second, "rejected", "budget")
@@ -957,7 +969,9 @@ def check_budget_before_call(ctx):
     assert progress.get("sampled") == progress.get("accepted", 0) + progress.get("rejected", 0) == 2, f"after a run sampled must equal accepted + rejected: {progress}"
     assert progress.get("duplicate") == 1 and _reasons(ctx).get("budget") == 1, f"the duplicate and the budget refusal are counted: {progress}, {_reasons(ctx)}"
 `,
-    typescript: `const JOB = 'j1';
+    typescript: `import {createHash} from 'node:crypto';
+
+const JOB = 'j1';
 
 /** The stand-in teacher at TEACHER, the step-2 state seeded, the learner's module. */
 async function world(ctx, cap = 100) {
@@ -1008,12 +1022,25 @@ export async function check_retry_unavailable(ctx) {
   expect(sample, 'accepted');
   assert(sample.attempts === 2 && calls(ctx).length === 2, \`one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw \${calls(ctx).length} calls and \${JSON.stringify(sample)}\`);
   assert(ctx.clock.sleeps >= 1, 'a retry waits a backoff before the next attempt');
-  ctx.grpc.fail('Generate', ctx.grpc.status.UNAVAILABLE, 'teacher down', 5, config.TEACHER);
+  ctx.grpc.fail('Generate', ctx.grpc.status.UNAVAILABLE, 'teacher down', 3, config.TEACHER);
   sample = await m.generate(state, JOB, 'p-2', 'What is 3 + 3?');
   expect(sample, 'rejected', 'unavailable');
   assert.equal(calls(ctx).length, 5, \`a teacher that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then the sample is rejected: saw \${calls(ctx).length - 2} calls for it\`);
   assert.equal(sample.attempts, 3, \`attempts must say 3, got \${JSON.stringify(sample)}\`);
   assert(progress(ctx).rejected === 1 && reasons(ctx).unavailable === 1, \`the rejection is recorded once with reason unavailable: \${JSON.stringify(progress(ctx))}, \${JSON.stringify(reasons(ctx))}\`);
+  const deadlines = calls(ctx).map(c => c.timeout);
+  deadlines.forEach((timeout, i) =>
+    assert(timeout !== null && Math.abs(timeout - deadlines[0]) <= 0.01, \`attempt deadlines \${JSON.stringify(deadlines)}: call \${i + 1} did not carry the full DEADLINE_MS, every attempt gets its own four seconds, not what is left of one deadline shared by the retries\`),
+  );
+  for (const code of ['INTERNAL', 'RESOURCE_EXHAUSTED']) {
+    const before = calls(ctx).length;
+    const rejected = progress(ctx).rejected ?? 0;
+    ctx.grpc.fail('Generate', ctx.grpc.status[code], 'teacher error', 1, config.TEACHER);
+    expect(await m.generate(state, JOB, \`p-\${code}\`, \`What is \${code}?\`), 'rejected');
+    assert.equal(calls(ctx).length, before + 1, \`\${code} is not UNAVAILABLE, so it is not retried: expected one call, saw \${calls(ctx).length - before}\`);
+    const total = Object.values(reasons(ctx)).reduce((a: number, b) => a + Number(b), 0);
+    assert(progress(ctx).rejected === rejected + 1 && total === rejected + 1, \`a \${code} is recorded once as rejected with a reason: \${JSON.stringify(progress(ctx))}, \${JSON.stringify(reasons(ctx))}\`);
+  }
 }
 
 export async function check_refusal_recorded(ctx) {
@@ -1049,7 +1076,8 @@ export async function check_budget_before_call(ctx) {
   const {m, state} = await world(ctx, 1);
   const first = await m.generate(state, JOB, 'p-1', 'What is the capital of France?');
   expect(first, 'accepted');
-  assert(first.dedupe_hash, \`an accepted sample carries the reservation's dedupe_hash: \${JSON.stringify(first)}\`);
+  const hash = createHash('sha256').update('What is the capital of France?').digest('hex');
+  assert.equal(first.dedupe_hash, hash, \`an accepted sample carries the reservation's dedupe_hash (the prompt's SHA-256): \${JSON.stringify(first)}\`);
   assert.equal(calls(ctx).length, 1);
   const second = await m.generate(state, JOB, 'p-2', 'What is the capital of Peru?');
   expect(second, 'rejected', 'budget');
@@ -1177,12 +1205,31 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 	clientExpect(ctx, sample, "accepted", "")
 	ctx.Assert(sample.Attempts == 2 && len(clientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", len(clientCalls(ctx)), sample)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
-	ctx.GRPC.Fail("Generate", codes.Unavailable, "teacher down", 5, config.Teacher)
+	ctx.GRPC.Fail("Generate", codes.Unavailable, "teacher down", 3, config.Teacher)
 	sample = clientGenerate(ctx, state, "p-2", "What is 3 + 3?")
 	clientExpect(ctx, sample, "rejected", "unavailable")
 	ctx.Equal(len(clientCalls(ctx)), 5, "a teacher that stays UNAVAILABLE gets maxAttempts = 3 calls, then the sample is rejected; calls so far")
 	ctx.Equal(sample.Attempts, 3, "Attempts")
 	ctx.Assert(clientCount(ctx, config.ProgressKey(clientJob), "rejected") == 1 && clientCount(ctx, config.ReasonsKey(clientJob), "unavailable") == 1, "the rejection is recorded once with reason unavailable: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)), ctx.Redis.HGetAll(config.ReasonsKey(clientJob)))
+	deadlines := []time.Duration{}
+	for _, call := range clientCalls(ctx) {
+		deadlines = append(deadlines, call.Timeout)
+	}
+	for i, call := range clientCalls(ctx) {
+		gap := call.Timeout - deadlines[0]
+		ctx.Assert(call.HasDeadline() && -10*time.Millisecond <= gap && gap <= 10*time.Millisecond, "attempt deadlines %v: call %d did not carry the full deadline, every attempt gets its own four seconds, not what is left of one deadline shared by the retries", deadlines, i+1)
+	}
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
+		before, rejected := len(clientCalls(ctx)), clientCount(ctx, config.ProgressKey(clientJob), "rejected")
+		ctx.GRPC.Fail("Generate", code, "teacher error", 1, config.Teacher)
+		clientExpect(ctx, clientGenerate(ctx, state, "p-"+code.String(), "What is "+code.String()+"?"), "rejected", "")
+		ctx.Equal(len(clientCalls(ctx))-before, 1, "%v is not UNAVAILABLE, so it is not retried; calls for it", code)
+		total := int64(0)
+		for field := range ctx.Redis.HGetAll(config.ReasonsKey(clientJob)) {
+			total += clientCount(ctx, config.ReasonsKey(clientJob), field)
+		}
+		ctx.Assert(clientCount(ctx, config.ProgressKey(clientJob), "rejected") == rejected+1 && total == rejected+1, "a %v is recorded once as rejected with a reason: %v, %v", code, ctx.Redis.HGetAll(config.ProgressKey(clientJob)), ctx.Redis.HGetAll(config.ReasonsKey(clientJob)))
+	}
 }
 
 func CheckRefusalRecorded(ctx *harness.Ctx) {
@@ -1219,7 +1266,8 @@ func CheckBudgetBeforeCall(ctx *harness.Ctx) {
 	state := clientWorld(ctx, 1)
 	first := clientGenerate(ctx, state, "p-1", "What is the capital of France?")
 	clientExpect(ctx, first, "accepted", "")
-	ctx.Assert(first.DedupeHash != "", "an accepted sample carries the reservation's DedupeHash: %+v", first)
+	sum := sha256.Sum256([]byte("What is the capital of France?"))
+	ctx.Equal(first.DedupeHash, hex.EncodeToString(sum[:]), "an accepted sample carries the reservation's DedupeHash (the prompt's SHA-256)")
 	ctx.Equal(len(clientCalls(ctx)), 1, "calls after one sample")
 	second := clientGenerate(ctx, state, "p-2", "What is the capital of Peru?")
 	clientExpect(ctx, second, "rejected", "budget")
@@ -1233,8 +1281,10 @@ func CheckBudgetBeforeCall(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 #include "digest.h"
 #include "distill/teacher.h"
@@ -1345,12 +1395,28 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   clientExpect(ctx, sample, "accepted");
   ctx.Assert(sample.attempts == 2 && ctx.GRPC.CallsTo("Generate").size() == 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and attempts %d", ctx.GRPC.CallsTo("Generate").size(), sample.attempts);
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
-  ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "teacher down", 5, config::kTeacher);
+  ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "teacher down", 3, config::kTeacher);
   sample = generate(w.state, kJob, "p-2", "What is 3 + 3?");
   clientExpect(ctx, sample, "rejected", "unavailable");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 5, "a teacher that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then the sample is rejected; calls so far");
   ctx.Equal(sample.attempts, 3, "attempts");
   ctx.Assert(clientCount(ctx, config::progress_key(kJob), "rejected") == 1 && clientCount(ctx, config::reasons_key(kJob), "unavailable") == 1, "the rejection is recorded once with reason unavailable: %v, %v", ctx.Redis.HGetAll(config::progress_key(kJob)), ctx.Redis.HGetAll(config::reasons_key(kJob)));
+  const auto all = ctx.GRPC.CallsTo("Generate");
+  std::string deadlines;
+  for (const auto& call : all) deadlines += (deadlines.empty() ? "" : " ") + std::to_string(call.TimeoutSeconds());
+  for (size_t i = 0; i < all.size(); ++i) {
+    ctx.Assert(all[i].HasDeadline() && std::abs(all[i].TimeoutSeconds() - all[0].TimeoutSeconds()) <= 0.01, "attempt deadlines [%s]: call %d did not carry the full deadline, every attempt gets its own four seconds, not what is left of one deadline shared by the retries", deadlines, i + 1);
+  }
+  for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
+    const size_t before = ctx.GRPC.CallsTo("Generate").size();
+    const long long rejected = clientCount(ctx, config::progress_key(kJob), "rejected");
+    ctx.GRPC.Fail("Generate", code, "teacher error", 1, config::kTeacher);
+    clientExpect(ctx, generate(w.state, kJob, std::string("p-") + name, std::string("What is ") + name + "?"), "rejected");
+    ctx.Equal(ctx.GRPC.CallsTo("Generate").size() - before, 1, "%s is not UNAVAILABLE, so it is not retried; calls for it", name);
+    long long total = 0;
+    for (const auto& [field, value] : ctx.Redis.HGetAll(config::reasons_key(kJob))) total += std::strtoll(value.c_str(), nullptr, 10);
+    ctx.Assert(clientCount(ctx, config::progress_key(kJob), "rejected") == rejected + 1 && total == rejected + 1, "a %s is recorded once as rejected with a reason: %v, %v", name, ctx.Redis.HGetAll(config::progress_key(kJob)), ctx.Redis.HGetAll(config::reasons_key(kJob)));
+  }
 }
 
 void CheckRefusalRecorded(harness::Ctx& ctx) {
@@ -1386,7 +1452,7 @@ void CheckBudgetBeforeCall(harness::Ctx& ctx) {
   auto& w = clientWorld(ctx, 1);
   const Sample first = generate(w.state, kJob, "p-1", "What is the capital of France?");
   clientExpect(ctx, first, "accepted");
-  ctx.Assert(!first.dedupe_hash.empty(), "an accepted sample carries the reservation's dedupe_hash");
+  ctx.Equal(first.dedupe_hash, sha256_hex("What is the capital of France?"), "an accepted sample carries the reservation's dedupe_hash (the prompt's SHA-256)");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 1, "calls after one sample");
   const Sample second = generate(w.state, kJob, "p-2", "What is the capital of Peru?");
   clientExpect(ctx, second, "rejected", "budget");

@@ -79,7 +79,7 @@ text ends up in the log, which is kept longer and read by more people than the f
       id: 'rating',
       title: 'A rating is required and must be -1, 0 or 1',
       detail:
-        'A body whose `rating` is missing or outside `ALLOWED_RATINGS` is `400`; the starter defaults a missing rating to `0`, so silence is counted as neutral.',
+        'A body whose `rating` is missing, outside `ALLOWED_RATINGS` or not an integer (`0.5`) is `400`, while an explicit `0` is stored as a neutral vote; the starter defaults a missing rating to `0`, so silence is counted as neutral.',
       match: {
         python: {all: [/ALLOWED_RATINGS/, /\b400\b/], none: [/rating:\s*int\s*=\s*0/]},
         typescript: {all: [/ALLOWED_RATINGS/, /\b400\b/], none: [/rating\s*\?\?\s*0/]},
@@ -92,7 +92,7 @@ text ends up in the log, which is kept longer and read by more people than the f
       id: 'comment-cap',
       title: 'The comment is capped at 2 KiB of UTF-8',
       detail:
-        'The comment is measured in UTF-8 bytes against `MAX_COMMENT_BYTES` (2048) and a larger one is `413`; counting characters lets 1100 accented letters (2200 bytes) through.',
+        'The comment is measured in UTF-8 bytes against `MAX_COMMENT_BYTES` (2048): exactly 2048 bytes fit and a larger one is `413`; counting characters lets 1100 accented letters (2200 bytes) through.',
       match: {
         python: {all: [/MAX_COMMENT_BYTES\s*=\s*(2\s*\*\s*1024|2048)\b/, /\.encode\(/, /\b413\b/]},
         typescript: {
@@ -116,7 +116,7 @@ text ends up in the log, which is kept longer and read by more people than the f
       id: 'no-comment-log',
       title: 'Logs the decision, not the comment',
       detail:
-        'The handler logs the tenant, the request id and the rating, and no log call carries the comment: logs are retained and shared far more widely than the feedback row.',
+        'The handler logs the tenant, the request id and the rating, and no log call carries the comment, on the refusals (`404`, `400`, `413`) as on the `201`: logs are retained and shared far more widely than the feedback row.',
       match: {
         python: {all: [/logger\.\w+\(/], none: [/logger\.\w+\([^)]*comment/]},
         typescript: {all: [/console\.\w+\(/], none: [/console\.\w+\([^;]*comment/i]},
@@ -622,24 +622,32 @@ async def check_rating(ctx):
         missing = await _post(c, {"request_id": "req-1", "comment": "meh"})
         out_of_range = await _post(c, {"request_id": "req-1", "rating": 5})
         down = await _post(c, {"request_id": "req-1", "rating": -1})
+        neutral = await _post(c, {"request_id": "req-1", "rating": 0})
+        fraction = await _post(c, {"request_id": "req-1", "rating": 0.5})
     assert missing.status_code == 400, f"a body without a rating answered {missing.status_code}, expected 400: a missing rating is not a neutral one"
     assert out_of_range.status_code == 400, f"rating 5 answered {out_of_range.status_code}, expected 400: ratings are -1, 0 or 1"
+    assert fraction.status_code in (400, 422), f"rating 0.5 answered {fraction.status_code}, expected 400: ratings are the integers -1, 0 or 1"
     assert down.status_code == 201, f"rating -1 answered {down.status_code}: {down.text}"
+    assert neutral.status_code == 201, f"an explicit rating 0 answered {neutral.status_code}, expected 201: 0 is a valid neutral vote, only a missing rating is refused"
     row = store.get_feedback(down.json()["feedback_id"])
     assert row is not None and row["rating"] == -1, f"the thumbs-down was stored as {row}"
-    assert len(_rows(ctx)) == 1, f"the store holds {_rows(ctx)}: only the valid rating may be stored"
+    row = store.get_feedback(neutral.json()["feedback_id"])
+    assert row is not None and row["rating"] == 0, f"the neutral vote was stored as {row}"
+    assert len(_rows(ctx)) == 2, f"the store holds {_rows(ctx)}: only the two valid ratings may be stored"
 
 
 async def check_comment_cap(ctx):
     store.mark_served("t-acme", "req-1")
     async with _api(ctx) as c:
         fits = await _post(c, {"request_id": "req-1", "rating": 0, "comment": "é" * 1000})
+        exact = await _post(c, {"request_id": "req-1", "rating": 0, "comment": "é" * 1024})
         accented = await _post(c, {"request_id": "req-1", "rating": 0, "comment": "é" * 1100})
         ascii_ = await _post(c, {"request_id": "req-1", "rating": 0, "comment": "x" * 2049})
     assert fits.status_code == 201, f"a 2000-byte comment answered {fits.status_code}, expected 201: {fits.text}"
+    assert exact.status_code == 201, f"a comment of exactly 2048 bytes answered {exact.status_code}, expected 201: the cap is at most 2 KiB, so 2048 bytes fit"
     assert accented.status_code == 413, f"a 2200-byte comment (1100 characters) answered {accented.status_code}, expected 413: the cap is 2 KiB of UTF-8, not 2048 characters"
     assert ascii_.status_code == 413, f"a 2049-byte comment answered {ascii_.status_code}, expected 413"
-    assert len(_rows(ctx)) == 1, f"the store holds {_rows(ctx)}: an oversized comment must not be stored"
+    assert len(_rows(ctx)) == 2, f"the store holds {_rows(ctx)}: an oversized comment must not be stored"
 
 
 async def check_no_comment_log(ctx):
@@ -652,13 +660,17 @@ async def check_no_comment_log(ctx):
     try:
         async with _api(ctx) as c:
             r = await _post(c, {"request_id": "req-1", "rating": -1, "comment": SECRET})
+            # Refused submits carry the comment too: no path may log it.
+            await _post(c, {"request_id": "req-404", "rating": 1, "comment": SECRET})
+            await _post(c, {"request_id": "req-1", "rating": 5, "comment": SECRET})
+            await _post(c, {"request_id": "req-1", "rating": 1, "comment": SECRET + "x" * 2048})
     finally:
         root.removeHandler(capture)
         root.setLevel(level)
     assert r.status_code == 201, f"POST /v1/feedback answered {r.status_code}: {r.text}"
     assert any("req-1" in line for line in capture.lines), f"the handler must log the decision with the request id; the log holds {capture.lines}"
     leaked = [line for line in capture.lines if "4417" in line or "charged twice" in line]
-    assert not leaked, f"the comment text reached the log: {leaked[0]!r}. Log the tenant, the request id and the rating only"
+    assert not leaked, f"the comment text reached the log: {leaked[0]!r}. Log the tenant, the request id and the rating only, on every path, refusals included"
 `,
     typescript: `const HEADERS = {'X-Tenant-Id': 't-acme', 'X-User-Id': 'u-1'};
 const SECRET = 'my card ending 4417 was charged twice';
@@ -716,24 +728,32 @@ export async function check_rating(ctx) {
   const missing = await post(c, {request_id: 'req-1', comment: 'meh'});
   const outOfRange = await post(c, {request_id: 'req-1', rating: 5});
   const down = await post(c, {request_id: 'req-1', rating: -1});
+  const neutral = await post(c, {request_id: 'req-1', rating: 0});
+  const fraction = await post(c, {request_id: 'req-1', rating: 0.5});
   assert.equal(missing.status, 400, \`a body without a rating answered \${missing.status}, expected 400: a missing rating is not a neutral one\`);
   assert.equal(outOfRange.status, 400, \`rating 5 answered \${outOfRange.status}, expected 400: ratings are -1, 0 or 1\`);
+  assert.equal(fraction.status, 400, \`rating 0.5 answered \${fraction.status}, expected 400: ratings are the integers -1, 0 or 1\`);
   assert.equal(down.status, 201, \`rating -1 answered \${down.status}: \${down.text}\`);
+  assert.equal(neutral.status, 201, \`an explicit rating 0 answered \${neutral.status}, expected 201: 0 is a valid neutral vote, only a missing rating is refused\`);
   const row = await store.getFeedback(down.json().feedback_id);
   assert(row !== null && row.rating === -1, \`the thumbs-down was stored as \${JSON.stringify(row)}\`);
-  assert.equal(rows(ctx).length, 1, \`the store holds \${JSON.stringify(rows(ctx))}: only the valid rating may be stored\`);
+  const zero = await store.getFeedback(neutral.json().feedback_id);
+  assert(zero !== null && zero.rating === 0, \`the neutral vote was stored as \${JSON.stringify(zero)}\`);
+  assert.equal(rows(ctx).length, 2, \`the store holds \${JSON.stringify(rows(ctx))}: only the two valid ratings may be stored\`);
 }
 
 export async function check_comment_cap(ctx) {
   const {c, store} = api(ctx);
   await store.markServed('t-acme', 'req-1');
   const fits = await post(c, {request_id: 'req-1', rating: 0, comment: 'é'.repeat(1000)});
+  const exact = await post(c, {request_id: 'req-1', rating: 0, comment: 'é'.repeat(1024)});
   const accented = await post(c, {request_id: 'req-1', rating: 0, comment: 'é'.repeat(1100)});
   const ascii = await post(c, {request_id: 'req-1', rating: 0, comment: 'x'.repeat(2049)});
   assert.equal(fits.status, 201, \`a 2000-byte comment answered \${fits.status}, expected 201: \${fits.text}\`);
+  assert.equal(exact.status, 201, \`a comment of exactly 2048 bytes answered \${exact.status}, expected 201: the cap is at most 2 KiB, so 2048 bytes fit\`);
   assert.equal(accented.status, 413, \`a 2200-byte comment (1100 characters) answered \${accented.status}, expected 413: the cap is 2 KiB of UTF-8, not 2048 characters\`);
   assert.equal(ascii.status, 413, \`a 2049-byte comment answered \${ascii.status}, expected 413\`);
-  assert.equal(rows(ctx).length, 1, \`the store holds \${JSON.stringify(rows(ctx))}: an oversized comment must not be stored\`);
+  assert.equal(rows(ctx).length, 2, \`the store holds \${JSON.stringify(rows(ctx))}: an oversized comment must not be stored\`);
 }
 
 export async function check_no_comment_log(ctx) {
@@ -742,11 +762,15 @@ export async function check_no_comment_log(ctx) {
   let r;
   const lines = await captured(async () => {
     r = await post(c, {request_id: 'req-1', rating: -1, comment: SECRET});
+    // Refused submits carry the comment too: no path may log it.
+    await post(c, {request_id: 'req-404', rating: 1, comment: SECRET});
+    await post(c, {request_id: 'req-1', rating: 5, comment: SECRET});
+    await post(c, {request_id: 'req-1', rating: 1, comment: SECRET + 'x'.repeat(2048)});
   });
   assert.equal(r.status, 201, \`POST /v1/feedback answered \${r.status}: \${r.text}\`);
   assert(lines.some(line => line.includes('req-1')), \`the handler must log the decision with the request id; the log holds \${JSON.stringify(lines)}\`);
   const leaked = lines.filter(line => line.includes('4417') || line.includes('charged twice'));
-  assert.equal(leaked.length, 0, \`the comment text reached the log: \${JSON.stringify(leaked[0])}. Log the tenant, the request id and the rating only\`);
+  assert.equal(leaked.length, 0, \`the comment text reached the log: \${JSON.stringify(leaked[0])}. Log the tenant, the request id and the rating only, on every path, refusals included\`);
 }
 `,
     go: `package main
@@ -821,24 +845,32 @@ func CheckRating(ctx *harness.Ctx) {
 	missing := postFeedback(c, map[string]any{"request_id": "req-1", "comment": "meh"})
 	outOfRange := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 5})
 	down := postFeedback(c, map[string]any{"request_id": "req-1", "rating": -1})
+	neutral := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0})
+	fraction := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0.5})
 	ctx.Equal(missing.Status, 400, "a body without a rating (a missing rating is not a neutral one)")
 	ctx.Equal(outOfRange.Status, 400, "rating 5 (ratings are -1, 0 or 1)")
+	ctx.Equal(fraction.Status, 400, "rating 0.5 (ratings are the integers -1, 0 or 1)")
 	ctx.Equal(down.Status, 201, "rating -1 (%s)", down.Text())
+	ctx.Equal(neutral.Status, 201, "an explicit rating 0 is a valid neutral vote, only a missing rating is refused (%s)", neutral.Text())
 	row := store.GetFeedback(apiBg, feedbackID(ctx, down))
 	ctx.Assert(row != nil && row.Rating == -1, "the thumbs-down was stored as %+v", row)
-	ctx.Equal(len(ctx.Redis.Keys("feedback:fb-*")), 1, "only the valid rating may be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"))
+	zero := store.GetFeedback(apiBg, feedbackID(ctx, neutral))
+	ctx.Assert(zero != nil && zero.Rating == 0, "the neutral vote was stored as %+v", zero)
+	ctx.Equal(len(ctx.Redis.Keys("feedback:fb-*")), 2, "only the two valid ratings may be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"))
 }
 
 func CheckCommentCap(ctx *harness.Ctx) {
 	store.MarkServed(apiBg, "t-acme", "req-1", 0)
 	c := api(ctx)
 	fits := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1000)})
+	exact := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1024)})
 	accented := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1100)})
 	ascii := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("x", 2049)})
 	ctx.Equal(fits.Status, 201, "a 2000-byte comment (%s)", fits.Text())
+	ctx.Equal(exact.Status, 201, "a comment of exactly 2048 bytes (the cap is at most 2 KiB, so 2048 bytes fit: %s)", exact.Text())
 	ctx.Equal(accented.Status, 413, "a 2200-byte comment of 1100 characters (the cap is 2 KiB of UTF-8, not 2048 characters)")
 	ctx.Equal(ascii.Status, 413, "a 2049-byte comment")
-	ctx.Equal(len(ctx.Redis.Keys("feedback:fb-*")), 1, "an oversized comment must not be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"))
+	ctx.Equal(len(ctx.Redis.Keys("feedback:fb-*")), 2, "an oversized comment must not be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"))
 }
 
 func CheckNoCommentLog(ctx *harness.Ctx) {
@@ -847,11 +879,15 @@ func CheckNoCommentLog(ctx *harness.Ctx) {
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	r := postFeedback(c, map[string]any{"request_id": "req-1", "rating": -1, "comment": apiSecret})
+	// Refused submits carry the comment too: no path may log it.
+	postFeedback(c, map[string]any{"request_id": "req-404", "rating": 1, "comment": apiSecret})
+	postFeedback(c, map[string]any{"request_id": "req-1", "rating": 5, "comment": apiSecret})
+	postFeedback(c, map[string]any{"request_id": "req-1", "rating": 1, "comment": apiSecret + strings.Repeat("x", 2048)})
 	log.SetOutput(os.Stderr)
 	logged := buf.String()
 	ctx.Equal(r.Status, 201, "POST /v1/feedback (%s)", r.Text())
 	ctx.Assert(strings.Contains(logged, "req-1"), "the handler must log the decision with the request id; the log holds %q", logged)
-	ctx.Assert(!strings.Contains(logged, "4417") && !strings.Contains(logged, "charged twice"), "the comment text reached the log: %q. Log the tenant, the request id and the rating only", logged)
+	ctx.Assert(!strings.Contains(logged, "4417") && !strings.Contains(logged, "charged twice"), "the comment text reached the log: %q. Log the tenant, the request id and the rating only, on every path, refusals included", logged)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -922,24 +958,32 @@ void CheckRating(harness::Ctx& ctx) {
   const auto missing = postFeedback(c, {{"request_id", "req-1"}, {"comment", "meh"}});
   const auto out_of_range = postFeedback(c, {{"request_id", "req-1"}, {"rating", 5}});
   const auto down = postFeedback(c, {{"request_id", "req-1"}, {"rating", -1}});
+  const auto neutral = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}});
+  const auto fraction = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0.5}});
   ctx.Equal(missing.Status, 400, "a body without a rating (a missing rating is not a neutral one)");
   ctx.Equal(out_of_range.Status, 400, "rating 5 (ratings are -1, 0 or 1)");
+  ctx.Equal(fraction.Status, 400, "rating 0.5 (ratings are the integers -1, 0 or 1)");
   ctx.Equal(down.Status, 201, "rating -1 (%s)", down.Text());
+  ctx.Equal(neutral.Status, 201, "an explicit rating 0 is a valid neutral vote, only a missing rating is refused (%s)", neutral.Text());
   const auto row = store::getFeedback(feedbackId(down));
   ctx.Assert(row && row->rating == -1, "the thumbs-down was stored with rating %d", row ? row->rating : 99);
-  ctx.Equal(ctx.Redis.Keys("feedback:fb-*").size(), 1, "only the valid rating may be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"));
+  const auto zero = store::getFeedback(feedbackId(neutral));
+  ctx.Assert(zero && zero->rating == 0, "the neutral vote was stored with rating %d", zero ? zero->rating : 99);
+  ctx.Equal(ctx.Redis.Keys("feedback:fb-*").size(), 2, "only the two valid ratings may be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"));
 }
 
 void CheckCommentCap(harness::Ctx& ctx) {
   store::markServed("t-acme", "req-1");
   auto c = api(ctx);
   const auto fits = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("é", 1000)}});
+  const auto exact = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("é", 1024)}});
   const auto accented = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("é", 1100)}});
   const auto ascii = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("x", 2049)}});
   ctx.Equal(fits.Status, 201, "a 2000-byte comment (%s)", fits.Text());
+  ctx.Equal(exact.Status, 201, "a comment of exactly 2048 bytes (the cap is at most 2 KiB, so 2048 bytes fit: %s)", exact.Text());
   ctx.Equal(accented.Status, 413, "a 2200-byte comment of 1100 characters (the cap is 2 KiB of UTF-8, not 2048 characters)");
   ctx.Equal(ascii.Status, 413, "a 2049-byte comment");
-  ctx.Equal(ctx.Redis.Keys("feedback:fb-*").size(), 1, "an oversized comment must not be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"));
+  ctx.Equal(ctx.Redis.Keys("feedback:fb-*").size(), 2, "an oversized comment must not be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"));
 }
 
 void CheckNoCommentLog(harness::Ctx& ctx) {
@@ -952,6 +996,10 @@ void CheckNoCommentLog(harness::Ctx& ctx) {
   harness::Response r;
   try {
     r = postFeedback(c, {{"request_id", "req-1"}, {"rating", -1}, {"comment", kSecret}});
+    // Refused submits carry the comment too: no path may log it.
+    postFeedback(c, {{"request_id", "req-404"}, {"rating", 1}, {"comment", kSecret}});
+    postFeedback(c, {{"request_id", "req-1"}, {"rating", 5}, {"comment", kSecret}});
+    postFeedback(c, {{"request_id", "req-1"}, {"rating", 1}, {"comment", kSecret + repeat("x", 2048)}});
   } catch (...) {
     std::clog.rdbuf(clog_was);
     std::cerr.rdbuf(cerr_was);
@@ -965,7 +1013,7 @@ void CheckNoCommentLog(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 201, "POST /v1/feedback (%s)", r.Text());
   ctx.Assert(logged.find("req-1") != std::string::npos, "the handler must log the decision with the request id; the log holds %q", logged);
   ctx.Assert(logged.find("4417") == std::string::npos && logged.find("charged twice") == std::string::npos,
-             "the comment text reached the log: %q. Log the tenant, the request id and the rating only", logged);
+             "the comment text reached the log: %q. Log the tenant, the request id and the rating only, on every path, refusals included", logged);
 }
 `,
   },

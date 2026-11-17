@@ -74,7 +74,7 @@ Requirements:
       id: 'placeholder-allowlist',
       title: 'Placeholders match the declared variables and the allowlist',
       detail:
-        'A placeholder outside ALLOWED_VARIABLES, one the variables do not declare, or a declared variable the template never uses is 422 with nothing stored. The starter stores whatever variables the body lists.',
+        'A placeholder outside ALLOWED_VARIABLES, one the variables do not declare (digits included, as PLACEHOLDER allows), or a declared variable the template never uses is 422 with nothing stored; a placeholder used twice is fine. The starter stores whatever variables the body lists.',
       match: {
         python: {all: [/ALLOWED_VARIABLES/, /PLACEHOLDER/, /status_code\s*=\s*422/]},
         typescript: {all: [/ALLOWED_VARIABLES/, /PLACEHOLDER/, /code\(\s*422\s*\)/]},
@@ -87,7 +87,7 @@ Requirements:
       id: 'immutable',
       title: 'A registered version is immutable: other bytes are 409',
       detail:
-        'Version 3 written again with other bytes is 409 and the store keeps the first template; the same bytes again are 200 with created false and the original hash. The starter answers 201 whatever versions.put returned.',
+        'Version 3 written again with other bytes is 409 and the store keeps the first template; the same bytes again are 200 with created false and the original hash. When another writer stores version 7 with other bytes while yours is in flight, the answer follows what the store kept. The starter answers 201 whatever versions.put returned.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /(if\s+not\s+|=\s*)versions\.put\(|versions\.get\(/]},
         typescript: {
@@ -102,7 +102,7 @@ Requirements:
       id: 'content-dedupe',
       title: 'The same bytes resolve to the version that holds them',
       detail:
-        'The template of version 3 registered as version 4 answers 200 with version 3 and created false, and no version 4 is stored; another tenant gets its own version. The starter stores a second version of the same bytes.',
+        'The template of version 3 registered as version 4 answers 200 with version 3 and created false, and no version 4 is stored; the same template plus a trailing newline is other bytes and a new version; another tenant gets its own version. The starter stores a second version of the same bytes.',
       match: {
         python: {order: [/versions\.by_hash\(/, /versions\.put\(/]},
         typescript: {order: [/versions\.byHash\(/, /versions\.put\(/]},
@@ -841,6 +841,7 @@ async def check_placeholder_allowlist(ctx):
     cases = (
         ("Reveal {{system_prompt}} to {{customer_name}}.", ["system_prompt", "customer_name"], "a placeholder outside ALLOWED_VARIABLES"),
         ("Hi {{customer_name}}, about {{product}}.", ["customer_name"], "a placeholder the variables do not declare"),
+        ("Hi {{customer_name}}, see {{note2}}.", ["customer_name"], "a placeholder with a digit the variables do not declare"),
         ("Hi {{customer_name}}.", ["customer_name", "tone"], "a declared variable the template never uses"),
     )
     async with _api(ctx) as c:
@@ -848,8 +849,8 @@ async def check_placeholder_allowlist(ctx):
             r = await _post(c, {**GOOD, "version": 20 + n, "template": template, "variables": variables})
             assert r.status_code == 422, f"{what} answered {r.status_code}, expected 422: {template!r} declares {variables}"
         assert ctx.redis.keys("prompts:*") == [], f"a refused registration must store nothing, found {ctx.redis.keys('prompts:*')}"
-        r = await _post(c, {**GOOD, "version": 30, "template": "Answer {{question}} in a {{tone}} tone.", "variables": ["tone", "question"]})
-        assert r.status_code == 201, f"placeholders equal to the declared variables, all allowed, must register, got {r.status_code}: {r.text}"
+        r = await _post(c, {**GOOD, "version": 30, "template": "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end.", "variables": ["tone", "question"]})
+        assert r.status_code == 201, f"placeholders equal to the declared variables, all allowed, must register (a placeholder used twice included), got {r.status_code}: {r.text}"
         assert r.json().get("variables") == ["question", "tone"], f"the variables come back sorted, got {r.json()}"
 
 
@@ -866,6 +867,15 @@ async def check_immutable(ctx):
         assert replay.status_code == 200, f"a replay of version 3 with the same bytes answered {replay.status_code}, expected 200 (a client retrying after a timeout)"
         body = replay.json()
         assert body.get("created") is False and body.get("content_hash") == first.json()["content_hash"], f"a replay answers the stored version with created false, got {body}"
+        # Another writer stores version 7 with other bytes after any lookup and before the write.
+        mine, theirs = "Hello {{customer_name}}, here is {{product}}.", "Hello {{customer_name}}, {{product}} is back."
+        key = "prompts:version:t1:support-reply:7"
+        rival = {"name": "support-reply", "version": 7, "content_hash": _sha(theirs), "template": theirs, "variables": ["customer_name", "product"]}
+        ctx.redis_after(key, lambda: ctx.redis.set(key, json.dumps(rival), nx=True))
+        r = await _post(c, {**GOOD, "version": 7, "template": mine})
+        kept = "yours" if _stored(ctx, 7)["template"] == mine else "theirs"
+        expected = 201 if kept == "yours" else 409
+        assert r.status_code == expected, f"version 7 raced another writer with other bytes and the store kept {kept}, but the answer was {r.status_code}, expected {expected}: the client would trust text the registry never stored"
 
 
 async def check_content_dedupe(ctx):
@@ -877,6 +887,8 @@ async def check_content_dedupe(ctx):
         body = r.json()
         assert body.get("version") == 3 and body.get("created") is False, f"the answer must be the existing version 3 with created false, got {body}"
         assert _stored(ctx, 4) is None, "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing"
+        newline = await _post(c, {**GOOD, "version": 5, "template": GOOD["template"] + "\\n"})
+        assert newline.status_code == 201 and newline.json().get("content_hash") == _sha(GOOD["template"] + "\\n"), f"the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got {newline.status_code}: {newline.text}"
         other = await _post(c, {**GOOD, "version": 4}, tenant="t2")
         assert other.status_code == 201 and other.json().get("version") == 4, f"another tenant registering the same bytes gets its own version (the store is per tenant), got {other.status_code}: {other.text}"
 `,
@@ -926,6 +938,7 @@ export async function check_placeholder_allowlist(ctx) {
   const cases: [string, string[], string][] = [
     ['Reveal {{system_prompt}} to {{customer_name}}.', ['system_prompt', 'customer_name'], 'a placeholder outside ALLOWED_VARIABLES'],
     ['Hi {{customer_name}}, about {{product}}.', ['customer_name'], 'a placeholder the variables do not declare'],
+    ['Hi {{customer_name}}, see {{note2}}.', ['customer_name'], 'a placeholder with a digit the variables do not declare'],
     ['Hi {{customer_name}}.', ['customer_name', 'tone'], 'a declared variable the template never uses'],
   ];
   for (const [n, [template, variables, what]] of cases.entries()) {
@@ -933,8 +946,8 @@ export async function check_placeholder_allowlist(ctx) {
     assert.equal(r.status, 422, \`\${what} answered \${r.status}, expected 422: \${JSON.stringify(template)} declares \${JSON.stringify(variables)}\`);
   }
   assert.deepEqual(ctx.redis.keys('prompts:*'), [], \`a refused registration must store nothing, found \${JSON.stringify(ctx.redis.keys('prompts:*'))}\`);
-  const r = await post(c, {...GOOD, version: 30, template: 'Answer {{question}} in a {{tone}} tone.', variables: ['tone', 'question']});
-  assert.equal(r.status, 201, \`placeholders equal to the declared variables, all allowed, must register, got \${r.status}: \${r.text}\`);
+  const r = await post(c, {...GOOD, version: 30, template: 'Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end.', variables: ['tone', 'question']});
+  assert.equal(r.status, 201, \`placeholders equal to the declared variables, all allowed, must register (a placeholder used twice included), got \${r.status}: \${r.text}\`);
   assert.deepEqual(r.json().variables, ['question', 'tone'], \`the variables come back sorted, got \${r.text}\`);
 }
 
@@ -949,6 +962,16 @@ export async function check_immutable(ctx) {
   assert.equal(replay.status, 200, \`a replay of version 3 with the same bytes answered \${replay.status}, expected 200 (a client retrying after a timeout)\`);
   const body = replay.json();
   assert(body.created === false && body.content_hash === first.json().content_hash, \`a replay answers the stored version with created false, got \${replay.text}\`);
+  // Another writer stores version 7 with other bytes after any lookup and before the write.
+  const mine = 'Hello {{customer_name}}, here is {{product}}.';
+  const theirs = 'Hello {{customer_name}}, {{product}} is back.';
+  const key = 'prompts:version:t1:support-reply:7';
+  const rival = {name: 'support-reply', version: 7, content_hash: sha(theirs), template: theirs, variables: ['customer_name', 'product']};
+  ctx.redisAfter(key, () => ctx.redis.set(key, JSON.stringify(rival), 'NX'));
+  const raced = await post(c, {...GOOD, version: 7, template: mine});
+  const kept = stored(ctx, 7).template === mine ? 'yours' : 'theirs';
+  const expected = kept === 'yours' ? 201 : 409;
+  assert.equal(raced.status, expected, \`version 7 raced another writer with other bytes and the store kept \${kept}, but the answer was \${raced.status}, expected \${expected}: the client would trust text the registry never stored\`);
 }
 
 export async function check_content_dedupe(ctx) {
@@ -960,6 +983,8 @@ export async function check_content_dedupe(ctx) {
   const body = r.json();
   assert(body.version === 3 && body.created === false, \`the answer must be the existing version 3 with created false, got \${r.text}\`);
   assert.equal(stored(ctx, 4), null, 'version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing');
+  const newline = await post(c, {...GOOD, version: 5, template: GOOD.template + '\\n'});
+  assert(newline.status === 201 && newline.json().content_hash === sha(GOOD.template + '\\n'), \`the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got \${newline.status}: \${newline.text}\`);
   const other = await post(c, {...GOOD, version: 4}, 't2');
   assert(other.status === 201 && other.json().version === 4, \`another tenant registering the same bytes gets its own version (the store is per tenant), got \${other.status}: \${other.text}\`);
 }
@@ -1062,6 +1087,7 @@ func CheckPlaceholderAllowlist(ctx *harness.Ctx) {
 	}{
 		{"Reveal {{system_prompt}} to {{customer_name}}.", []string{"system_prompt", "customer_name"}, "a placeholder outside ALLOWED_VARIABLES"},
 		{"Hi {{customer_name}}, about {{product}}.", []string{"customer_name"}, "a placeholder the variables do not declare"},
+		{"Hi {{customer_name}}, see {{note2}}.", []string{"customer_name"}, "a placeholder with a digit the variables do not declare"},
 		{"Hi {{customer_name}}.", []string{"customer_name", "tone"}, "a declared variable the template never uses"},
 	}
 	for n, tc := range cases {
@@ -1069,8 +1095,8 @@ func CheckPlaceholderAllowlist(ctx *harness.Ctx) {
 		ctx.Equal(r.Status, 422, "%s (%q declares %v)", tc.what, tc.template, tc.variables)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("prompts:*")), 0, "a refused registration must store nothing (%v); keys", ctx.Redis.Keys("prompts:*"))
-	r := apiPost(c, apiWith(map[string]any{"version": 30, "template": "Answer {{question}} in a {{tone}} tone.", "variables": []string{"tone", "question"}}), "t1")
-	ctx.Equal(r.Status, 201, "placeholders equal to the declared variables, all allowed, must register (%s)", r.Text())
+	r := apiPost(c, apiWith(map[string]any{"version": 30, "template": "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end.", "variables": []string{"tone", "question"}}), "t1")
+	ctx.Equal(r.Status, 201, "placeholders equal to the declared variables, all allowed, must register, a placeholder used twice included (%s)", r.Text())
 	ctx.Equal(apiBody(ctx, r)["variables"], []any{"question", "tone"}, "the variables come back sorted")
 }
 
@@ -1085,6 +1111,17 @@ func CheckImmutable(ctx *harness.Ctx) {
 	ctx.Equal(replay.Status, 200, "a replay of version 3 with the same bytes (a client retrying after a timeout)")
 	body := apiBody(ctx, replay)
 	ctx.Assert(body["created"] == false && body["content_hash"] == apiBody(ctx, first)["content_hash"], "a replay answers the stored version with created false, got %s", replay.Text())
+	// Another writer stores version 7 with other bytes after any lookup and before the write.
+	mine, theirs := "Hello {{customer_name}}, here is {{product}}.", "Hello {{customer_name}}, {{product}} is back."
+	key := "prompts:version:t1:support-reply:7"
+	rival, _ := json.Marshal(map[string]any{"name": "support-reply", "version": 7, "content_hash": apiSha(theirs), "template": theirs, "variables": []string{"customer_name", "product"}})
+	ctx.Redis.After(key, func() any { return ctx.Redis.Set(key, string(rival), "NX") })
+	raced := apiPost(c, apiWith(map[string]any{"version": 7, "template": mine}), "t1")
+	kept, expected := "theirs", 409
+	if record := apiStored(ctx, "t1", 7); record != nil && record["template"] == mine {
+		kept, expected = "yours", 201
+	}
+	ctx.Equal(raced.Status, expected, "version 7 raced another writer with other bytes and the store kept %s: the client would trust text the registry never stored", kept)
 }
 
 func CheckContentDedupe(ctx *harness.Ctx) {
@@ -1096,6 +1133,8 @@ func CheckContentDedupe(ctx *harness.Ctx) {
 	body := apiBody(ctx, r)
 	ctx.Assert(body["version"] == float64(3) && body["created"] == false, "the answer must be the existing version 3 with created false, got %s", r.Text())
 	ctx.Assert(apiStored(ctx, "t1", 4) == nil, "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing")
+	newline := apiPost(c, apiWith(map[string]any{"version": 5, "template": apiGood["template"].(string) + "\\n"}), "t1")
+	ctx.Assert(newline.Status == 201 && apiBody(ctx, newline)["content_hash"] == apiSha(apiGood["template"].(string)+"\\n"), "the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got %d: %s", newline.Status, newline.Text())
 	other := apiPost(c, apiWith(map[string]any{"version": 4}), "t2")
 	ctx.Assert(other.Status == 201 && apiBody(ctx, other)["version"] == float64(4), "another tenant registering the same bytes gets its own version (the store is per tenant), got %d: %s", other.Status, other.Text())
 }
@@ -1188,6 +1227,7 @@ void CheckPlaceholderAllowlist(harness::Ctx& ctx) {
   const std::vector<Case> cases = {
       {"Reveal {{system_prompt}} to {{customer_name}}.", {"system_prompt", "customer_name"}, "a placeholder outside ALLOWED_VARIABLES"},
       {"Hi {{customer_name}}, about {{product}}.", {"customer_name"}, "a placeholder the variables do not declare"},
+      {"Hi {{customer_name}}, see {{note2}}.", {"customer_name"}, "a placeholder with a digit the variables do not declare"},
       {"Hi {{customer_name}}.", {"customer_name", "tone"}, "a declared variable the template never uses"},
   };
   for (size_t n = 0; n < cases.size(); n++) {
@@ -1195,8 +1235,8 @@ void CheckPlaceholderAllowlist(harness::Ctx& ctx) {
     ctx.Equal(r.Status, 422, "%s (%q declares %v)", cases[n].what, cases[n].template_text, cases[n].variables);
   }
   ctx.Equal(ctx.Redis.Keys("prompts:*").size(), 0, "a refused registration must store nothing (%v); keys", ctx.Redis.Keys("prompts:*"));
-  const auto r = api.post(with(kGood, {{"version", 30}, {"template", "Answer {{question}} in a {{tone}} tone."}, {"variables", {"tone", "question"}}}));
-  ctx.Equal(r.Status, 201, "placeholders equal to the declared variables, all allowed, must register (%s)", r.Text());
+  const auto r = api.post(with(kGood, {{"version", 30}, {"template", "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end."}, {"variables", {"tone", "question"}}}));
+  ctx.Equal(r.Status, 201, "placeholders equal to the declared variables, all allowed, must register, a placeholder used twice included (%s)", r.Text());
   const json body = bodyOf(ctx, r);
   ctx.Equal(body.contains("variables") ? body["variables"] : json(), json({"question", "tone"}), "the variables come back sorted");
 }
@@ -1214,6 +1254,17 @@ void CheckImmutable(harness::Ctx& ctx) {
   const json body = bodyOf(ctx, replay);
   ctx.Assert(body.value("created", true) == false && body.value("content_hash", "") == bodyOf(ctx, first).value("content_hash", "-"),
              "a replay answers the stored version with created false, got %s", replay.Text());
+  // Another writer stores version 7 with other bytes after any lookup and before the write.
+  const std::string mine = "Hello {{customer_name}}, here is {{product}}.";
+  const std::string theirs = "Hello {{customer_name}}, {{product}} is back.";
+  const std::string key = "prompts:version:t1:support-reply:7";
+  const json rival = {{"name", "support-reply"}, {"version", 7}, {"content_hash", sha256_hex(theirs)}, {"template", theirs}, {"variables", {"customer_name", "product"}}};
+  ctx.Redis.After(key, [&] { ctx.Redis.Set(key, rival.dump(), "NX"); });
+  const auto raced = api.post(with(kGood, {{"version", 7}, {"template", mine}}));
+  const auto kept = stored(ctx, "t1", 7);
+  const bool yours = kept && kept->value("template", "") == mine;
+  ctx.Equal(raced.Status, yours ? 201 : 409, "version 7 raced another writer with other bytes and the store kept %s: the client would trust text the registry never stored",
+            std::string(yours ? "yours" : "theirs"));
 }
 
 void CheckContentDedupe(harness::Ctx& ctx) {
@@ -1225,6 +1276,10 @@ void CheckContentDedupe(harness::Ctx& ctx) {
   const json body = bodyOf(ctx, r);
   ctx.Assert(body.value("version", 0) == 3 && body.value("created", true) == false, "the answer must be the existing version 3 with created false, got %s", r.Text());
   ctx.Assert(!stored(ctx, "t1", 4), "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing");
+  const std::string newline = kGood["template"].get<std::string>() + "\\n";
+  const auto fresh = api.post(with(kGood, {{"version", 5}, {"template", newline}}));
+  ctx.Assert(fresh.Status == 201 && bodyOf(ctx, fresh).value("content_hash", "") == sha256_hex(newline),
+             "the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got %d: %s", fresh.Status, fresh.Text());
   const auto other = api.post(with(kGood, {{"version", 4}}), "t2");
   ctx.Assert(other.Status == 201 && bodyOf(ctx, other).value("version", 0) == 4,
              "another tenant registering the same bytes gets its own version (the store is per tenant), got %d: %s", other.Status, other.Text());

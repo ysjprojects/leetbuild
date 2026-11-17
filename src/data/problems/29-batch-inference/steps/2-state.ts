@@ -66,7 +66,7 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
       id: 'owner-heartbeat',
       title: 'Only the owner extends its lease',
       detail:
-        "A heartbeat from a worker that does not hold the shard answers false and leaves owner and deadline alone; the owner's heartbeat moves the deadline to now + LEASE_S, so a reap 40 s after the claim and 20 s after the heartbeat takes nothing. The starter's heartbeat makes the caller the owner.",
+        "A heartbeat from a worker that does not hold the shard answers false and leaves owner and deadline alone; the owner's heartbeat moves the deadline to now + LEASE_S, so a reap 40 s after the claim and 20 s after the heartbeat takes nothing; and a late heartbeat that races a reaper leaves the shard either still leased or cleanly requeued, never requeued with a deadline. The starter's heartbeat makes the caller the owner.",
       match: {
         python: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
         typescript: {all: [/['"]HGET['"][\s\S]{0,200}?['"]ZADD['"]/]},
@@ -79,7 +79,7 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
       id: 'reaper-requeue',
       title: "Requeues a dead worker's shard",
       detail:
-        'A shard whose deadline passed (its worker stopped heartbeating) is returned by reap, set back to pending, pushed on the pending list without owner or deadline, and the next claim takes it. The starter marks it failed, so one crash fails the batch.',
+        'A shard whose deadline is now (its worker stopped heartbeating LEASE_S ago) is returned by reap, set back to pending, pushed on the pending list without owner or deadline, and the next claim takes it. The starter marks it failed, so one crash fails the batch.',
       match: {
         python: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.rpush\(/], none: [/\.hset\([^\n]*["']failed["']/]},
         typescript: {all: [/redis\.call\(\s*['"]RPUSH['"]|\.rpush\(/], none: [/\.hset\([^\n]*['"]failed['"]/]},
@@ -92,7 +92,7 @@ Requirements, each operation **one Lua script** (\`register_script\`, \`defineCo
       id: 'fenced-complete',
       title: 'Refuses a completion from a replaced worker',
       detail:
-        'After the reaper gave shard 0 to w-b, a complete from w-a (who stalled past its lease) answers false and changes nothing; w-b completes it. The starter lets any caller write the outcome.',
+        'After the reaper gave shard 0 to w-b, a complete from w-a (who stalled past its lease) answers false and changes nothing; w-b completes it; and a late complete that races a reaper either finishes the shard or answers false, never marks a requeued shard done. The starter lets any caller write the outcome.',
       match: {
         python: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
         typescript: {all: [/['"]HGET['"][\s\S]{0,200}?['"]HDEL['"]/]},
@@ -779,6 +779,27 @@ def _deadline(ctx, shard):
     return ctx.redis.zscore(f"batch:deadlines:{B}", shard)
 
 
+def _view(ctx, shard):
+    """A shard's lease on one line: its owner, whether it has a deadline, its state, how often it is queued."""
+    has_deadline = "yes" if _deadline(ctx, shard) is not None else "no"
+    return f"owner={_owners(ctx).get(shard, '')} deadline={has_deadline} state={_states(ctx).get(shard, '')} queued={_pending(ctx).count(shard)}"
+
+
+def _reaper_between(ctx, shard):
+    """Another process's reaper, landing right after the learner's first command on batch:owners: it
+    requeues the shard if its deadline has passed, as reap does."""
+
+    def reap():
+        score = _deadline(ctx, shard)
+        if score is not None and score <= ctx.clock.time():
+            ctx.redis.zrem(f"batch:deadlines:{B}", shard)
+            ctx.redis.hdel(f"batch:owners:{B}", shard)
+            ctx.redis.hset(f"batch:shards:{B}", shard, "pending")
+            ctx.redis.rpush(f"batch:pending:{B}", shard)
+
+    ctx.redis_after(f"batch:owners:{B}", reap)
+
+
 def check_claim_atomic(ctx):
     m = _state(ctx, 3)
     probe = ctx.redis_after(f"batch:pending:{B}", lambda: (_pending(ctx), _owners(ctx)))
@@ -807,12 +828,18 @@ def check_owner_heartbeat(ctx):
     ctx.clock.advance(20)
     reaped = m.reap(B)
     assert list(reaped) == [] and _owners(ctx).get("0") == "w-a", f"40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took {reaped}"
+    ctx.clock.advance(11)  # w-a's next heartbeat comes late, just as a reaper runs
+    _reaper_between(ctx, "0")
+    extended = m.heartbeat(B, "0", "w-a")
+    view = _view(ctx, "0")
+    held, requeued = "owner=w-a deadline=yes state=running queued=0", "owner= deadline=no state=pending queued=1"
+    assert (extended and view == held) or (not extended and view == requeued), f"a reaper ran between heartbeat's commands; heartbeat answered {extended} and shard 0 ended up {view}: the owner check and the deadline write must be one script, or a requeued shard gets a deadline again and is handed out twice"
 
 
 def check_reaper_requeue(ctx):
     m = _state(ctx)
     assert m.claim(B, "w-a") == "0"
-    ctx.clock.advance(31)  # w-a died: no heartbeat for longer than the lease
+    ctx.clock.advance(30)  # w-a died: no heartbeat, and its deadline is now
     reaped = m.reap(B)
     assert list(reaped) == ["0"], f"reap must return the shard whose lease ran out, got {reaped}"
     state = _states(ctx).get("0")
@@ -836,6 +863,15 @@ def check_fenced_complete(ctx):
     assert _states(ctx).get("0") == "running" and _owners(ctx).get("0") == "w-b", f"a completion from w-a changed the shard w-b is running: shards {_states(ctx)}, owners {_owners(ctx)}"
     assert m.complete(B, "0", "w-b", "done"), "the owner's completion must succeed"
     assert _states(ctx).get("0") == "done" and "0" not in _owners(ctx), f"after w-b completes, shard 0 is done with no owner: shards {_states(ctx)}, owners {_owners(ctx)}"
+    ctx.redis.rpush(f"batch:pending:{B}", "1")
+    ctx.redis.hset(f"batch:shards:{B}", "1", "pending")
+    assert m.claim(B, "w-c") == "1", "w-c must be able to claim shard 1"
+    ctx.clock.advance(31)  # w-c finishes past its lease, just as a reaper runs
+    _reaper_between(ctx, "1")
+    done = m.complete(B, "1", "w-c", "done")
+    view = _view(ctx, "1")
+    finished, requeued = "owner= deadline=no state=done queued=0", "owner= deadline=no state=pending queued=1"
+    assert (done and view == finished) or (not done and view == requeued), f"a reaper ran between complete's commands; complete answered {done} and shard 1 ended up {view}: the owner check and the writes must be one script, or a requeued shard is marked done and still run again"
 
 
 def check_complete_clears_deadline(ctx):
@@ -867,6 +903,21 @@ const deadline = (ctx, shard: string) => {
   return score === null || score === undefined ? null : Number(score);
 };
 const nowS = ctx => ctx.clock.now() / 1000;
+/** A shard's lease on one line: its owner, whether it has a deadline, its state, how often it is queued. */
+const view = (ctx, shard: string) =>
+  \`owner=\${owners(ctx)[shard] ?? ''} deadline=\${deadline(ctx, shard) === null ? 'no' : 'yes'} state=\${states(ctx)[shard] ?? ''} queued=\${pending(ctx).filter(s => s === shard).length}\`;
+
+/** Another process's reaper, landing right after the learner's first command on batch:owners: it requeues the shard if its deadline has passed, as reap does. */
+function reaperBetween(ctx, shard: string) {
+  ctx.redisAfter(\`batch:owners:\${B}\`, () => {
+    const score = deadline(ctx, shard);
+    if (score === null || score > nowS(ctx)) return;
+    ctx.redis.zrem(\`batch:deadlines:\${B}\`, shard);
+    ctx.redis.hdel(\`batch:owners:\${B}\`, shard);
+    ctx.redis.hset(\`batch:shards:\${B}\`, shard, 'pending');
+    ctx.redis.rpush(\`batch:pending:\${B}\`, shard);
+  });
+}
 
 export async function check_claim_atomic(ctx) {
   const m = state(ctx, 3);
@@ -896,12 +947,20 @@ export async function check_owner_heartbeat(ctx) {
   ctx.clock.advance(20);
   const reaped = await m.reap(B);
   assert(reaped.length === 0 && owners(ctx)['0'] === 'w-a', \`40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took \${JSON.stringify(reaped)}\`);
+  ctx.clock.advance(11); // w-a's next heartbeat comes late, just as a reaper runs
+  reaperBetween(ctx, '0');
+  const extended = await m.heartbeat(B, '0', 'w-a');
+  const v = view(ctx, '0');
+  assert(
+    (extended && v === 'owner=w-a deadline=yes state=running queued=0') || (!extended && v === 'owner= deadline=no state=pending queued=1'),
+    \`a reaper ran between heartbeat's commands; heartbeat answered \${extended} and shard 0 ended up \${v}: the owner check and the deadline write must be one script, or a requeued shard gets a deadline again and is handed out twice\`,
+  );
 }
 
 export async function check_reaper_requeue(ctx) {
   const m = state(ctx);
   assert.equal(await m.claim(B, 'w-a'), '0');
-  ctx.clock.advance(31); // w-a died: no heartbeat for longer than the lease
+  ctx.clock.advance(30); // w-a died: no heartbeat, and its deadline is now
   const reaped = await m.reap(B);
   assert.deepEqual(reaped, ['0'], \`reap must return the shard whose lease ran out, got \${JSON.stringify(reaped)}\`);
   assert.equal(states(ctx)['0'], 'pending', \`the shard of a worker that died must go back to pending, it is \${JSON.stringify(states(ctx)['0'])}: a crash the shard did not cause would fail the batch\`);
@@ -924,6 +983,17 @@ export async function check_fenced_complete(ctx) {
   assert(states(ctx)['0'] === 'running' && owners(ctx)['0'] === 'w-b', \`a completion from w-a changed the shard w-b is running: shards \${JSON.stringify(states(ctx))}, owners \${JSON.stringify(owners(ctx))}\`);
   assert(await m.complete(B, '0', 'w-b', 'done'), "the owner's completion must succeed");
   assert(states(ctx)['0'] === 'done' && !('0' in owners(ctx)), \`after w-b completes, shard 0 is done with no owner: shards \${JSON.stringify(states(ctx))}, owners \${JSON.stringify(owners(ctx))}\`);
+  ctx.redis.rpush(\`batch:pending:\${B}\`, '1');
+  ctx.redis.hset(\`batch:shards:\${B}\`, '1', 'pending');
+  assert.equal(await m.claim(B, 'w-c'), '1', 'w-c must be able to claim shard 1');
+  ctx.clock.advance(31); // w-c finishes past its lease, just as a reaper runs
+  reaperBetween(ctx, '1');
+  const done = await m.complete(B, '1', 'w-c', 'done');
+  const v = view(ctx, '1');
+  assert(
+    (done && v === 'owner= deadline=no state=done queued=0') || (!done && v === 'owner= deadline=no state=pending queued=1'),
+    \`a reaper ran between complete's commands; complete answered \${done} and shard 1 ended up \${v}: the owner check and the writes must be one script, or a requeued shard is marked done and still run again\`,
+  );
 }
 
 export async function check_complete_clears_deadline(ctx) {
@@ -941,6 +1011,7 @@ export async function check_complete_clears_deadline(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"leetbuild/harness"
@@ -994,6 +1065,37 @@ func leaseNear(ctx *harness.Ctx, score float64) bool {
 	return score-(now+30) <= 1 && (now+30)-score <= 1
 }
 
+// leaseView is a shard's lease on one line: its owner, whether it has a deadline, its state, how often it is queued.
+func leaseView(ctx *harness.Ctx, shard string) string {
+	deadline := "no"
+	if _, ok := leaseDeadline(ctx, shard); ok {
+		deadline = "yes"
+	}
+	queued := 0
+	for _, s := range leasePending(ctx) {
+		if s == shard {
+			queued++
+		}
+	}
+	return fmt.Sprintf("owner=%s deadline=%s state=%s queued=%d", leaseOwners(ctx)[shard], deadline, leaseStates(ctx)[shard], queued)
+}
+
+// leaseReaperBetween is another process's reaper, landing right after the learner's first command on
+// batch:owners: it requeues the shard if its deadline has passed, as reap does.
+func leaseReaperBetween(ctx *harness.Ctx, shard string) {
+	ctx.Redis.After("batch:owners:"+leaseBatch, func() any {
+		score, ok := leaseDeadline(ctx, shard)
+		if !ok || score > float64(ctx.Clock.Now())/1000 {
+			return nil
+		}
+		ctx.Redis.Do("ZREM", "batch:deadlines:"+leaseBatch, shard)
+		ctx.Redis.Do("HDEL", "batch:owners:"+leaseBatch, shard)
+		ctx.Redis.Do("HSET", "batch:shards:"+leaseBatch, shard, "pending")
+		ctx.Redis.Do("RPUSH", "batch:pending:"+leaseBatch, shard)
+		return nil
+	})
+}
+
 func CheckClaimAtomic(ctx *harness.Ctx) {
 	leaseSeed(ctx, 3)
 	var seenPending []string
@@ -1034,12 +1136,17 @@ func CheckOwnerHeartbeat(ctx *harness.Ctx) {
 	ctx.Clock.Advance(20)
 	reaped := leaseReap(ctx)
 	ctx.Assert(len(reaped) == 0 && leaseOwners(ctx)["0"] == "w-a", "40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took %v", reaped)
+	ctx.Clock.Advance(11) // w-a's next heartbeat comes late, just as a reaper runs
+	leaseReaperBetween(ctx, "0")
+	extended := leaseHeartbeat(ctx, "0", "w-a")
+	view := leaseView(ctx, "0")
+	ctx.Assert((extended && view == "owner=w-a deadline=yes state=running queued=0") || (!extended && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between heartbeat's commands; heartbeat answered %t and shard 0 ended up %s: the owner check and the deadline write must be one script, or a requeued shard gets a deadline again and is handed out twice", extended, view)
 }
 
 func CheckReaperRequeue(ctx *harness.Ctx) {
 	leaseSeed(ctx, 1)
 	ctx.Equal(leaseClaim(ctx, "w-a"), "0", "the first claim")
-	ctx.Clock.Advance(31) // w-a died: no heartbeat for longer than the lease
+	ctx.Clock.Advance(30) // w-a died: no heartbeat, and its deadline is now
 	ctx.Equal(leaseReap(ctx), []string{"0"}, "reap must return the shard whose lease ran out")
 	ctx.Equal(leaseStates(ctx)["0"], "pending", "the shard of a worker that died must go back to pending (a crash the shard did not cause would fail the batch); its state")
 	ctx.Equal(leasePending(ctx), []string{"0"}, "the reaped shard must be on batch:pending again; it holds")
@@ -1064,6 +1171,14 @@ func CheckFencedComplete(ctx *harness.Ctx) {
 	ctx.Assert(leaseComplete(ctx, "0", "w-b", "done"), "the owner's completion must succeed")
 	_, owned := leaseOwners(ctx)["0"]
 	ctx.Assert(leaseStates(ctx)["0"] == "done" && !owned, "after w-b completes, shard 0 is done with no owner: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx))
+	ctx.Redis.Do("RPUSH", "batch:pending:"+leaseBatch, "1")
+	ctx.Redis.Do("HSET", "batch:shards:"+leaseBatch, "1", "pending")
+	ctx.Equal(leaseClaim(ctx, "w-c"), "1", "w-c must be able to claim shard 1")
+	ctx.Clock.Advance(31) // w-c finishes past its lease, just as a reaper runs
+	leaseReaperBetween(ctx, "1")
+	done := leaseComplete(ctx, "1", "w-c", "done")
+	view := leaseView(ctx, "1")
+	ctx.Assert((done && view == "owner= deadline=no state=done queued=0") || (!done && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between complete's commands; complete answered %t and shard 1 ended up %s: the owner check and the writes must be one script, or a requeued shard is marked done and still run again", done, view)
 }
 
 func CheckCompleteClearsDeadline(ctx *harness.Ctx) {
@@ -1112,6 +1227,26 @@ bool leaseNear(harness::Ctx& ctx, std::optional<double> score) {
   return score.has_value() && std::fabs(*score - (static_cast<double>(ctx.Clock.Now()) / 1000 + 30)) <= 1;
 }
 
+// A shard's lease on one line: its owner, whether it has a deadline, its state, how often it is queued.
+std::string leaseView(harness::Ctx& ctx, const std::string& shard) {
+  const auto pending = leasePending(ctx);
+  return "owner=" + field(leaseOwners(ctx), shard) + " deadline=" + (leaseDeadline(ctx, shard).has_value() ? "yes" : "no") +
+         " state=" + field(leaseStates(ctx), shard) + " queued=" + std::to_string(std::count(pending.begin(), pending.end(), shard));
+}
+
+// Another process's reaper, landing right after the learner's first command on batch:owners: it
+// requeues the shard if its deadline has passed, as reap does.
+void leaseReaperBetween(harness::Ctx& ctx, const std::string& shard) {
+  ctx.Redis.After("batch:owners:" + kBatch, [&ctx, shard] {
+    const auto score = leaseDeadline(ctx, shard);
+    if (!score.has_value() || *score > static_cast<double>(ctx.Clock.Now()) / 1000) return;
+    ctx.Redis.Do("ZREM", "batch:deadlines:" + kBatch, shard);
+    ctx.Redis.Do("HDEL", "batch:owners:" + kBatch, shard);
+    ctx.Redis.Do("HSET", "batch:shards:" + kBatch, shard, "pending");
+    ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, shard);
+  });
+}
+
 }  // namespace
 
 void CheckClaimAtomic(harness::Ctx& ctx) {
@@ -1150,12 +1285,17 @@ void CheckOwnerHeartbeat(harness::Ctx& ctx) {
   ctx.Clock.Advance(20);
   const auto reaped = reap(kBatch);
   ctx.Assert(reaped.empty() && field(leaseOwners(ctx), "0") == "w-a", "40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took %v", reaped);
+  ctx.Clock.Advance(11);  // w-a's next heartbeat comes late, just as a reaper runs
+  leaseReaperBetween(ctx, "0");
+  const bool extended = heartbeat(kBatch, "0", "w-a");
+  const std::string view = leaseView(ctx, "0");
+  ctx.Assert((extended && view == "owner=w-a deadline=yes state=running queued=0") || (!extended && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between heartbeat's commands; heartbeat answered %t and shard 0 ended up %s: the owner check and the deadline write must be one script, or a requeued shard gets a deadline again and is handed out twice", extended, view);
 }
 
 void CheckReaperRequeue(harness::Ctx& ctx) {
   leaseSeed(ctx, 1);
   ctx.Equal(claim(kBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
-  ctx.Clock.Advance(31);  // w-a died: no heartbeat for longer than the lease
+  ctx.Clock.Advance(30);  // w-a died: no heartbeat, and its deadline is now
   ctx.Equal(reap(kBatch), {"0"}, "reap must return the shard whose lease ran out");
   ctx.Equal(field(leaseStates(ctx), "0"), "pending", "the shard of a worker that died must go back to pending (a crash the shard did not cause would fail the batch); its state");
   ctx.Equal(leasePending(ctx), {"0"}, "the reaped shard must be on batch:pending again; it holds");
@@ -1177,6 +1317,14 @@ void CheckFencedComplete(harness::Ctx& ctx) {
   ctx.Assert(field(leaseStates(ctx), "0") == "running" && field(leaseOwners(ctx), "0") == "w-b", "a completion from w-a changed the shard w-b is running: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx));
   ctx.Assert(complete(kBatch, "0", "w-b", "done"), "the owner's completion must succeed");
   ctx.Assert(field(leaseStates(ctx), "0") == "done" && leaseOwners(ctx).count("0") == 0, "after w-b completes, shard 0 is done with no owner: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx));
+  ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, "1");
+  ctx.Redis.Do("HSET", "batch:shards:" + kBatch, "1", "pending");
+  ctx.Equal(claim(kBatch, "w-c"), std::optional<std::string>("1"), "w-c must be able to claim shard 1");
+  ctx.Clock.Advance(31);  // w-c finishes past its lease, just as a reaper runs
+  leaseReaperBetween(ctx, "1");
+  const bool done = complete(kBatch, "1", "w-c", "done");
+  const std::string view = leaseView(ctx, "1");
+  ctx.Assert((done && view == "owner= deadline=no state=done queued=0") || (!done && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between complete's commands; complete answered %t and shard 1 ended up %s: the owner check and the writes must be one script, or a requeued shard is marked done and still run again", done, view);
 }
 
 void CheckCompleteClearsDeadline(harness::Ctx& ctx) {

@@ -21,7 +21,8 @@ results after a search for 2 answers 2; and an entry written last week still ans
 - The key is \`search:{tenant}:{version}:{digest}:{k}\`, with \`digest = query_digest(query)\`
   (\`search.fingerprint\`, provided).
 - The active version is resolved **before** the lookup, because the key names it.
-- Every entry is written with a TTL of \`CACHE_TTL_S\` (60 seconds) in the same \`SET\`.`,
+- Every entry is written with a TTL of \`CACHE_TTL_S\` (60 seconds) in the same \`SET\`, and expires
+  60 seconds after that write: a hit does not extend it.`,
   sequence: {
     participants: ['searchd', 'Corpus', 'Result cache'],
     messages: [
@@ -76,7 +77,7 @@ results after a search for 2 answers 2; and an entry written last week still ans
       id: 'ttl',
       title: 'Entries expire after 60 seconds',
       detail:
-        'Every entry is written with the TTL in the same command (`ex=CACHE_TTL_S`, `EX`, `setex`, a duration); the TTL bounds how long an answer can outlive a document change inside one version. The starter writes with no expiry.',
+        'Every entry is written with the TTL in the same command (`ex=CACHE_TTL_S`, `EX`, `setex`, a duration), never by a second command a crash can skip, and it answers for the full 60 seconds and no longer: a hit does not extend it. The TTL bounds how long an answer can outlive a document change inside one version. The starter writes with no expiry.',
       match: {
         python: {all: [/\bex\s*=\s*CACHE_TTL_S|\.setex\(/]},
         typescript: {all: [/['"]EX['"]\s*,\s*CACHE_TTL_S|\.setex\(/]},
@@ -517,12 +518,32 @@ def check_ttl(ctx):
     m.cached_search("acme", QUERY, 2)
     keys = ctx.redis.keys("search:*")
     assert len(keys) == 1, f"one search must write one entry, Redis holds {sorted(keys)}"
-    ttl = ctx.redis.ttl(keys[0])
-    assert 0 < ttl <= 60, f"{keys[0]} has TTL {ttl}: write every entry with CACHE_TTL_S (60 s) in the same SET, or it answers until someone deletes it"
+    key = keys[0]
+    ttl = ctx.redis.ttl(key)
+    assert 50 < ttl <= 60, f"{key} has TTL {ttl}: write every entry with CACHE_TTL_S (60 s) in the same SET, or it answers until someone deletes it"
+    ctx.redis.delete(key)
+    written = []
+
+    def watch():
+        # A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+        n = ctx.redis.ttl(key)
+        if n == -2:
+            ctx.redis_after(key, watch)
+        elif not written:
+            written.append(n)
+        return n
+
+    ctx.redis_after(key, watch)
+    m.cached_search("acme", QUERY, 2)
+    assert written, f"the same search repeated after {key} was deleted never wrote it again; Redis holds {sorted(ctx.redis.keys('search:*'))}"
+    assert written[0] > 0, f"right after the command that wrote {key} its TTL was {written[0]}: a crash before the EXPIRE leaves an entry that never expires. The TTL belongs in the SET"
     corpus.put_document("acme", "idx-42", "a0", [1.0, 0.0, 0.0, 0.0])
-    ctx.clock.advance(61)
+    ctx.clock.advance(59)
+    held = m.cached_search("acme", QUERY, 2)
+    assert held["cached"] is True and _ids(held) == ["a1", "a2"], f"59 seconds after the write the search answered {held}: an entry lives for the full 60 seconds"
+    ctx.clock.advance(2)
     later = m.cached_search("acme", QUERY, 2)
-    assert later["cached"] is False and _ids(later) == ["a0", "a1"], f"61 seconds later, after a0 was added, the search answered {later}: the entry must have expired"
+    assert later["cached"] is False and _ids(later) == ["a0", "a1"], f"61 seconds after the write, after a0 was added, the search answered {later}: the entry must have expired 60 seconds after it was written, whatever read it since"
 `,
     typescript: `const QUERY = [1, 0, 0, 0];
 
@@ -578,12 +599,32 @@ export async function check_ttl(ctx) {
   await m.cachedSearch('acme', QUERY, 2);
   const keys = ctx.redis.keys('search:*');
   assert.equal(keys.length, 1, \`one search must write one entry, Redis holds \${JSON.stringify(keys)}\`);
-  const ttl = ctx.redis.ttl(keys[0]);
-  assert(ttl > 0 && ttl <= 60, \`\${keys[0]} has TTL \${ttl}: write every entry with CACHE_TTL_S (60 s) in the same SET, or it answers until someone deletes it\`);
+  const key = keys[0];
+  const ttl = ctx.redis.ttl(key);
+  assert(ttl > 50 && ttl <= 60, \`\${key} has TTL \${ttl}: write every entry with CACHE_TTL_S (60 s) in the same SET, or it answers until someone deletes it\`);
+  ctx.redis.del(key);
+  const written: number[] = [];
+  // A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+  const watch = () => {
+    const n = ctx.redis.ttl(key);
+    if (n === -2) ctx.redisAfter(key, watch);
+    else if (written.length === 0) written.push(n);
+    return n;
+  };
+  ctx.redisAfter(key, watch);
+  await m.cachedSearch('acme', QUERY, 2);
+  assert(written.length > 0, \`the same search repeated after \${key} was deleted never wrote it again; Redis holds \${JSON.stringify(ctx.redis.keys('search:*'))}\`);
+  assert(written[0] > 0, \`right after the command that wrote \${key} its TTL was \${written[0]}: a crash before the EXPIRE leaves an entry that never expires. The TTL belongs in the SET\`);
   await corpus.putDocument('acme', 'idx-42', 'a0', [1, 0, 0, 0]);
-  ctx.clock.advance(61);
+  ctx.clock.advance(59);
+  const held = await m.cachedSearch('acme', QUERY, 2);
+  assert(held.cached === true && ids(held) === 'a1,a2', \`59 seconds after the write the search answered \${JSON.stringify(held)}: an entry lives for the full 60 seconds\`);
+  ctx.clock.advance(2);
   const later = await m.cachedSearch('acme', QUERY, 2);
-  assert(later.cached === false && ids(later) === 'a0,a1', \`61 seconds later, after a0 was added, the search answered \${JSON.stringify(later)}: the entry must have expired\`);
+  assert(
+    later.cached === false && ids(later) === 'a0,a1',
+    \`61 seconds after the write, after a0 was added, the search answered \${JSON.stringify(later)}: the entry must have expired 60 seconds after it was written, whatever read it since\`,
+  );
 }
 `,
     go: `package main
@@ -666,12 +707,34 @@ func CheckTtl(ctx *harness.Ctx) {
 	mustSearch(ctx, "acme", 2)
 	keys := ctx.Redis.Keys("search:*")
 	ctx.Equal(len(keys), 1, "one search must write one entry; Redis holds %q; entries", keys)
-	ttl := ctx.Redis.TTL(keys[0])
-	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: write every entry with the 60 s TTL in the same SET, or it answers until someone deletes it", keys[0], ttl)
+	key := keys[0]
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(ttl > 50 && ttl <= 60, "%s has TTL %d: write every entry with the 60 s TTL in the same SET, or it answers until someone deletes it", key, ttl)
+	ctx.Redis.Del(key)
+	var writtenTTL int64
+	written := false
+	// A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+	var watch func() any
+	watch = func() any {
+		n := ctx.Redis.TTL(key)
+		if n == -2 {
+			ctx.Redis.After(key, watch)
+		} else if !written {
+			written, writtenTTL = true, n
+		}
+		return n
+	}
+	ctx.Redis.After(key, watch)
+	mustSearch(ctx, "acme", 2)
+	ctx.Assert(written, "the same search repeated after %s was deleted never wrote it again; Redis holds %q", key, ctx.Redis.Keys("search:*"))
+	ctx.Assert(writtenTTL > 0, "right after the command that wrote %s its TTL was %d: a crash before the EXPIRE leaves an entry that never expires. The TTL belongs in the SET", key, writtenTTL)
 	corpus.PutDocument(stateBg, "acme", "idx-42", "a0", []float64{1, 0, 0, 0})
-	ctx.Clock.Advance(61)
+	ctx.Clock.Advance(59)
+	held := mustSearch(ctx, "acme", 2)
+	ctx.Assert(held.Cached && resultIDs(held) == "a1,a2", "59 seconds after the write the search answered %+v: an entry lives for the full 60 seconds", held)
+	ctx.Clock.Advance(2)
 	later := mustSearch(ctx, "acme", 2)
-	ctx.Assert(!later.Cached && resultIDs(later) == "a0,a1", "61 seconds later, after a0 was added, the search answered %+v: the entry must have expired", later)
+	ctx.Assert(!later.Cached && resultIDs(later) == "a0,a1", "61 seconds after the write, after a0 was added, the search answered %+v: the entry must have expired 60 seconds after it was written, whatever read it since", later)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -743,12 +806,33 @@ void CheckTtl(harness::Ctx& ctx) {
   cachedSearch("acme", kQuery, 2);
   const auto keys = ctx.Redis.Keys("search:*");
   ctx.Equal(keys.size(), 1, "one search must write one entry; Redis holds %q; entries", keys);
-  const long long ttl = ctx.Redis.TTL(keys[0]);
-  ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: write every entry with the 60 s TTL in the same SET, or it answers until someone deletes it", keys[0], ttl);
+  const std::string key = keys[0];
+  const long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(ttl > 50 && ttl <= 60, "%s has TTL %d: write every entry with the 60 s TTL in the same SET, or it answers until someone deletes it", key, ttl);
+  ctx.Redis.Del(key);
+  bool written = false;
+  long long writtenTtl = 0;
+  // A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+  std::function<void()> watch = [&] {
+    const long long n = ctx.Redis.TTL(key);
+    if (n == -2) {
+      ctx.Redis.After(key, watch);
+    } else if (!written) {
+      written = true;
+      writtenTtl = n;
+    }
+  };
+  ctx.Redis.After(key, watch);
+  cachedSearch("acme", kQuery, 2);
+  ctx.Assert(written, "the same search repeated after %s was deleted never wrote it again; Redis holds %q", key, ctx.Redis.Keys("search:*"));
+  ctx.Assert(writtenTtl > 0, "right after the command that wrote %s its TTL was %d: a crash before the EXPIRE leaves an entry that never expires. The TTL belongs in the SET", key, writtenTtl);
   corpus::putDocument("acme", "idx-42", "a0", {1, 0, 0, 0});
-  ctx.Clock.Advance(61);
+  ctx.Clock.Advance(59);
+  const auto held = cachedSearch("acme", kQuery, 2);
+  ctx.Assert(cached(held) && ids(held) == "a1,a2", "59 seconds after the write the search answered %s: an entry lives for the full 60 seconds", held.dump());
+  ctx.Clock.Advance(2);
   const auto later = cachedSearch("acme", kQuery, 2);
-  ctx.Assert(!cached(later) && ids(later) == "a0,a1", "61 seconds later, after a0 was added, the search answered %s: the entry must have expired", later.dump());
+  ctx.Assert(!cached(later) && ids(later) == "a0,a1", "61 seconds after the write, after a0 was added, the search answered %s: the entry must have expired 60 seconds after it was written, whatever read it since", later.dump());
 }
 `,
   },

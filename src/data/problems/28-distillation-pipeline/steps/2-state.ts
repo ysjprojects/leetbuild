@@ -63,7 +63,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'dedupe-before-spend',
       title: 'A duplicate costs nothing and the budget stays at or above zero',
       detail:
-        'SISMEMBER runs before any DECRBY, so a repeated prompt leaves the budget where it was; with fewer than TOKENS_PER_CALL tokens left the verdict is budget and nothing is drawn. The starter decrements first and looks at the set second.',
+        'SISMEMBER runs before any DECRBY, so a repeated prompt leaves the budget where it was; with fewer than TOKENS_PER_CALL tokens left (511 as much as 0) the verdict is budget, nothing is drawn, and the refusal counts as sampled and rejected. The starter decrements first and looks at the set second.',
       match: {
         python: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
         typescript: {order: [/SISMEMBER/, /DECRBY/], none: [/\.decrby\(/]},
@@ -76,7 +76,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'atomic-script',
       title: 'Reserves in one Lua script',
       detail:
-        'The membership test, the budget floor, DECRBY, SADD and HINCRBY happen inside one EVAL/EVALSHA, so two workers reserving the same prompt spend once. The starter issues them as separate commands and a second worker lands between them.',
+        'The membership test, the budget floor, DECRBY, SADD and HINCRBY happen inside one EVAL/EVALSHA, so two workers reserving the same prompt spend once, and the moment the hash is in the set the draw and the count are there too. The starter issues them as separate commands and a second worker lands between them.',
       match: {
         python: {
           all: [
@@ -132,7 +132,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'reject-reason',
       title: 'Records a reason for every rejection',
       detail:
-        'A rejection increments its reason in distill:reasons:{job_id} (refusal, empty, deadline, unavailable, budget) beside rejected, so a run that rejected 40 percent of its samples can be explained. The starter counts rejections and nothing else.',
+        'A rejection increments its reason in distill:reasons:{job_id} (refusal, empty, deadline, unavailable, budget) in the same script that bumps rejected, so a run that rejected 40 percent of its samples can be explained and the two never disagree. The starter counts rejections and nothing else.',
       match: {
         python: {all: [/reasons_key\(|distill:reasons:/, /HINCRBY/]},
         typescript: {all: [/reasonsKey\(|distill:reasons:/, /HINCRBY/]},
@@ -145,7 +145,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'key-ttl',
       title: 'Expires the job keys and stamps updated_at from inside the script',
       detail:
-        'Every key the script touches gets EXPIRE TTL_S and the progress hash carries updated_at, so an abandoned job disappears on its own and a report can tell two readings apart. The starter sets no expiry and no stamp.',
+        'Every key the script touches gets EXPIRE TTL_S again, and the progress hash carries updated_at in unix seconds as of the last move, so an abandoned job disappears a day after its last move and a report can tell two readings apart. The starter sets no expiry and no stamp.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
@@ -847,6 +847,7 @@ void record(const std::string& job_id, const std::string& outcome, const std::st
   },
   harness: {
     python: `import hashlib
+import time
 
 JOB = "j1"
 COST = 512
@@ -878,6 +879,7 @@ def check_dedupe_before_spend(ctx):
     m = _state(ctx, cap=2)
     first = m.reserve(JOB, "What is the capital of France?")
     assert first["verdict"] == "ok", f"a fresh prompt must be reserved (verdict ok), got {first}"
+    assert int(first["remaining"]) == COST, f"reserve answers the tokens left after the draw as remaining: got {first}, expected {COST}"
     assert _budget(ctx) == COST, f"one reservation draws one call: budget is {_budget(ctx)}, expected {COST}"
     again = m.reserve(JOB, "What is the capital of France?")
     assert again["verdict"] == "duplicate", f"the same prompt again must be a duplicate, got {again}"
@@ -889,6 +891,11 @@ def check_dedupe_before_spend(ctx):
     assert third["verdict"] == "budget", f"with no budget left the verdict must be budget, got {third}"
     assert _budget(ctx) == 0, f"the budget went to {_budget(ctx)}: a job must stop at zero, not run negative"
     assert _count(ctx, "rejected") == 1 and ctx.redis.hget(f"distill:reasons:{JOB}", "budget") == "1", f"a budget refusal is a rejected sample with reason budget: {_progress(ctx)}, reasons {ctx.redis.hgetall(f'distill:reasons:{JOB}')}"
+    assert _count(ctx, "sampled") == 3, f"a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded: {_progress(ctx)}"
+    ctx.redis.set(f"distill:budget:{JOB}", COST - 1)
+    short = m.reserve(JOB, "What is the capital of Bolivia?")
+    assert short["verdict"] == "budget", f"with {COST - 1} tokens left, less than one call ({COST}), the verdict must be budget, got {short}"
+    assert _budget(ctx) == COST - 1, f"a budget refusal draws nothing: the budget went from {COST - 1} to {_budget(ctx)}"
 
 
 def check_atomic_script(ctx):
@@ -897,14 +904,18 @@ def check_atomic_script(ctx):
     hash = _sha(prompt)
 
     def other_worker():
-        # another worker reserving the same prompt, landing between two of this worker's commands
-        if ctx.redis.sismember(f"distill:seen:{JOB}", hash):
+        # another worker reserving the same prompt, landing between two of this worker's commands;
+        # first a snapshot of what this worker's reservation had done at that moment
+        seen = ctx.redis.sismember(f"distill:seen:{JOB}", hash)
+        snapshot["at_probe"] = (bool(seen), _budget(ctx), _count(ctx, "sampled"))
+        if seen:
             return "duplicate"
         ctx.redis.sadd(f"distill:seen:{JOB}", hash)
         ctx.redis.decrby(f"distill:budget:{JOB}", COST)
         ctx.redis.hincrby(f"distill:progress:{JOB}", "sampled", 1)
         return "ok"
 
+    snapshot = {}
     probe = ctx.redis_after(f"distill:seen:{JOB}", other_worker)
     mine = m.reserve(JOB, prompt)
     assert probe.fired, "reserve never touched the seen set"
@@ -912,6 +923,8 @@ def check_atomic_script(ctx):
     assert verdicts == ["duplicate", "ok"], f"two workers reserved the same prompt and the verdicts were {verdicts}: the membership test and the spend must run in one script, so exactly one of them pays"
     assert _budget(ctx) == 100 * COST - COST, f"two workers, one prompt: the budget is {_budget(ctx)}, expected one call drawn ({100 * COST - COST})"
     assert _count(ctx, "sampled") == 1, f"two workers, one prompt: sampled is {_count(ctx, 'sampled')}, expected 1"
+    seen, budget_then, sampled_then = snapshot["at_probe"]
+    assert not seen or (budget_then, sampled_then) == (100 * COST - COST, 1), f"the moment the hash was in the seen set, the budget was {budget_then} and sampled {sampled_then}: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step"
 
 
 def check_hashed_prompt(ctx):
@@ -928,26 +941,37 @@ def check_hashed_prompt(ctx):
 
 def check_reject_reason(ctx):
     m = _state(ctx)
+    snapshots = []
     for prompt, outcome, reason in (("p1", "accepted", ""), ("p2", "rejected", "refusal"), ("p3", "rejected", "refusal"), ("p4", "rejected", "empty")):
         assert m.reserve(JOB, prompt)["verdict"] == "ok"
+        if prompt == "p2":
+            # whichever key the record writes first, the other must already agree with it
+            for key in (f"distill:progress:{JOB}", f"distill:reasons:{JOB}"):
+                snapshots.append(ctx.redis_after(key, lambda: (_count(ctx, "rejected"), int(ctx.redis.hget(f"distill:reasons:{JOB}", "refusal") or 0))))
         m.record(JOB, outcome, reason)
     progress = _progress(ctx)
     assert (int(progress["sampled"]), int(progress["accepted"]), int(progress["rejected"])) == (4, 1, 3), f"four reservations, one accepted, three rejected: {progress}"
     reasons = ctx.redis.hgetall(f"distill:reasons:{JOB}")
     assert reasons.get("refusal") == "2" and reasons.get("empty") == "1", f"distill:reasons:{JOB} must count refusal 2 and empty 1, holds {reasons}"
     assert "accepted" not in reasons and "" not in reasons, f"only rejections carry a reason: {reasons}"
+    for probe in snapshots:
+        assert probe.fired and probe.result == (1, 1), f"right after the first rejection's record touched Redis, (rejected, refusal) read {probe.result}: the counter and its reason must move in one script, never one command apart"
 
 
 def check_key_ttl(ctx):
     m = _state(ctx)
     m.reserve(JOB, "p1")
     m.record(JOB, "rejected", "deadline")
+    ctx.clock.advance(50_000)
+    m.reserve(JOB, "p2")
+    m.record(JOB, "rejected", "refusal")
     for key in (f"distill:budget:{JOB}", f"distill:seen:{JOB}", f"distill:progress:{JOB}", f"distill:reasons:{JOB}"):
         ttl = ctx.redis.ttl(key)
         assert ttl != -2, f"{key} does not exist after a reservation and a record"
-        assert 0 < ttl <= 86_400, f"{key} has TTL {ttl}: every key the job owns expires TTL_S (86400 s) after its last move"
+        assert 86_400 - 50_000 < ttl <= 86_400, f"{key} has TTL {ttl} right after a reservation and a record 50000 s into the job: every key the job owns expires TTL_S (86400 s) after its last move, so each script refreshes the expiry of the keys it touches"
     stamp = ctx.redis.hget(f"distill:progress:{JOB}", "updated_at")
     assert stamp is not None and stamp.isdigit(), f"the progress hash must carry updated_at (unix seconds), it holds {_progress(ctx)}"
+    assert abs(int(stamp) - int(time.time())) <= 5, f"updated_at is {stamp} after the last record, the clock reads {int(time.time())}: every script stamps the time of its move in unix seconds"
     ctx.clock.advance(86_401)
     assert ctx.redis.keys(f"distill:*:{JOB}") == [], f"a day after its last move the job must be gone, found {ctx.redis.keys(f'distill:*:{JOB}')}"
 `,
@@ -971,6 +995,7 @@ export async function check_dedupe_before_spend(ctx) {
   const m = await state(ctx, 2);
   const first = await m.reserve(JOB, 'What is the capital of France?');
   assert.equal(first.verdict, 'ok', \`a fresh prompt must be reserved (verdict ok), got \${JSON.stringify(first)}\`);
+  assert.equal(Number(first.remaining), COST, \`reserve answers the tokens left after the draw as remaining: got \${JSON.stringify(first)}, expected \${COST}\`);
   assert.equal(budget(ctx), COST, \`one reservation draws one call: budget is \${budget(ctx)}, expected \${COST}\`);
   const again = await m.reserve(JOB, 'What is the capital of France?');
   assert.equal(again.verdict, 'duplicate', \`the same prompt again must be a duplicate, got \${JSON.stringify(again)}\`);
@@ -982,15 +1007,24 @@ export async function check_dedupe_before_spend(ctx) {
   assert.equal(third.verdict, 'budget', \`with no budget left the verdict must be budget, got \${JSON.stringify(third)}\`);
   assert.equal(budget(ctx), 0, \`the budget went to \${budget(ctx)}: a job must stop at zero, not run negative\`);
   assert(count(ctx, 'rejected') === 1 && ctx.redis.hget(\`distill:reasons:\${JOB}\`, 'budget') === '1', \`a budget refusal is a rejected sample with reason budget: \${JSON.stringify(progress(ctx))}, reasons \${JSON.stringify(ctx.redis.hgetall(\`distill:reasons:\${JOB}\`))}\`);
+  assert.equal(count(ctx, 'sampled'), 3, \`a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded: \${JSON.stringify(progress(ctx))}\`);
+  ctx.redis.set(\`distill:budget:\${JOB}\`, String(COST - 1));
+  const short = await m.reserve(JOB, 'What is the capital of Bolivia?');
+  assert.equal(short.verdict, 'budget', \`with \${COST - 1} tokens left, less than one call (\${COST}), the verdict must be budget, got \${JSON.stringify(short)}\`);
+  assert.equal(budget(ctx), COST - 1, \`a budget refusal draws nothing: the budget went from \${COST - 1} to \${budget(ctx)}\`);
 }
 
 export async function check_atomic_script(ctx) {
   const m = await state(ctx);
   const prompt = 'Explain photosynthesis to a ten-year-old.';
   const hash = sha(prompt);
-  // another worker reserving the same prompt, landing between two of this worker's commands
+  // another worker reserving the same prompt, landing between two of this worker's commands;
+  // first a snapshot of what this worker's reservation had done at that moment
+  let atProbe: [boolean, number, number] = [false, 0, 0];
   const probe = ctx.redisAfter(\`distill:seen:\${JOB}\`, () => {
-    if (ctx.redis.sismember(\`distill:seen:\${JOB}\`, hash) === 1) return 'duplicate';
+    const seen = ctx.redis.sismember(\`distill:seen:\${JOB}\`, hash) === 1;
+    atProbe = [seen, budget(ctx), count(ctx, 'sampled')];
+    if (seen) return 'duplicate';
     ctx.redis.sadd(\`distill:seen:\${JOB}\`, hash);
     ctx.redis.decrby(\`distill:budget:\${JOB}\`, COST);
     ctx.redis.hincrby(\`distill:progress:\${JOB}\`, 'sampled', 1);
@@ -1002,6 +1036,8 @@ export async function check_atomic_script(ctx) {
   assert.deepEqual(verdicts, ['duplicate', 'ok'], \`two workers reserved the same prompt and the verdicts were \${JSON.stringify(verdicts)}: the membership test and the spend must run in one script, so exactly one of them pays\`);
   assert.equal(budget(ctx), 100 * COST - COST, \`two workers, one prompt: the budget is \${budget(ctx)}, expected one call drawn (\${100 * COST - COST})\`);
   assert.equal(count(ctx, 'sampled'), 1, \`two workers, one prompt: sampled is \${count(ctx, 'sampled')}, expected 1\`);
+  const [seen, budgetThen, sampledThen] = atProbe;
+  assert(!seen || (budgetThen === 100 * COST - COST && sampledThen === 1), \`the moment the hash was in the seen set, the budget was \${budgetThen} and sampled \${sampledThen}: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step\`);
 }
 
 export async function check_hashed_prompt(ctx) {
@@ -1017,8 +1053,14 @@ export async function check_hashed_prompt(ctx) {
 
 export async function check_reject_reason(ctx) {
   const m = await state(ctx);
+  const snapshots: {fired: boolean; result: unknown}[] = [];
   for (const [prompt, outcome, reason] of [['p1', 'accepted', ''], ['p2', 'rejected', 'refusal'], ['p3', 'rejected', 'refusal'], ['p4', 'rejected', 'empty']]) {
     assert.equal((await m.reserve(JOB, prompt)).verdict, 'ok');
+    if (prompt === 'p2') {
+      // whichever key the record writes first, the other must already agree with it
+      for (const key of [\`distill:progress:\${JOB}\`, \`distill:reasons:\${JOB}\`])
+        snapshots.push(ctx.redisAfter(key, () => [count(ctx, 'rejected'), Number(ctx.redis.hget(\`distill:reasons:\${JOB}\`, 'refusal') ?? 0)]));
+    }
     await m.record(JOB, outcome, reason);
   }
   const p = progress(ctx);
@@ -1026,19 +1068,26 @@ export async function check_reject_reason(ctx) {
   const reasons = ctx.redis.hgetall(\`distill:reasons:\${JOB}\`);
   assert(reasons.refusal === '2' && reasons.empty === '1', \`distill:reasons:\${JOB} must count refusal 2 and empty 1, holds \${JSON.stringify(reasons)}\`);
   assert(!('accepted' in reasons) && !('' in reasons), \`only rejections carry a reason: \${JSON.stringify(reasons)}\`);
+  for (const probe of snapshots)
+    assert(probe.fired && JSON.stringify(probe.result) === '[1,1]', \`right after the first rejection's record touched Redis, [rejected, refusal] read \${JSON.stringify(probe.result)}: the counter and its reason must move in one script, never one command apart\`);
 }
 
 export async function check_key_ttl(ctx) {
   const m = await state(ctx);
   await m.reserve(JOB, 'p1');
   await m.record(JOB, 'rejected', 'deadline');
+  ctx.clock.advance(50_000);
+  await m.reserve(JOB, 'p2');
+  await m.record(JOB, 'rejected', 'refusal');
   for (const key of [\`distill:budget:\${JOB}\`, \`distill:seen:\${JOB}\`, \`distill:progress:\${JOB}\`, \`distill:reasons:\${JOB}\`]) {
     const ttl = Number(ctx.redis.ttl(key));
     assert(ttl !== -2, \`\${key} does not exist after a reservation and a record\`);
-    assert(0 < ttl && ttl <= 86_400, \`\${key} has TTL \${ttl}: every key the job owns expires TTL_S (86400 s) after its last move\`);
+    assert(86_400 - 50_000 < ttl && ttl <= 86_400, \`\${key} has TTL \${ttl} right after a reservation and a record 50000 s into the job: every key the job owns expires TTL_S (86400 s) after its last move, so each script refreshes the expiry of the keys it touches\`);
   }
   const stamp = ctx.redis.hget(\`distill:progress:\${JOB}\`, 'updated_at');
   assert(typeof stamp === 'string' && /^\\d+$/.test(stamp), \`the progress hash must carry updated_at (unix seconds), it holds \${JSON.stringify(progress(ctx))}\`);
+  const nowS = Math.floor(ctx.clock.now() / 1000);
+  assert(Math.abs(Number(stamp) - nowS) <= 5, \`updated_at is \${stamp} after the last record, the clock reads \${nowS}: every script stamps the time of its move in unix seconds\`);
   ctx.clock.advance(86_401);
   assert.deepEqual(ctx.redis.keys(\`distill:*:\${JOB}\`), [], \`a day after its last move the job must be gone, found \${JSON.stringify(ctx.redis.keys(\`distill:*:\${JOB}\`))}\`);
 }
@@ -1091,6 +1140,7 @@ func CheckDedupeBeforeSpend(ctx *harness.Ctx) {
 	stateStart(ctx, 2)
 	first := stateReserve(ctx, "What is the capital of France?")
 	ctx.Equal(first.Verdict, "ok", "a fresh prompt must be reserved; the verdict")
+	ctx.Equal(first.Remaining, int64(stateCost), "reserve answers the tokens left after the draw as Remaining")
 	ctx.Equal(stateBudget(ctx), stateCost, "one reservation draws one call; the budget")
 	again := stateReserve(ctx, "What is the capital of France?")
 	ctx.Equal(again.Verdict, "duplicate", "the same prompt again; the verdict")
@@ -1103,6 +1153,11 @@ func CheckDedupeBeforeSpend(ctx *harness.Ctx) {
 	ctx.Equal(stateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget")
 	reason, _ := ctx.Redis.HGet("distill:reasons:"+stateJob, "budget")
 	ctx.Assert(stateCount(ctx, "rejected") == 1 && reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:"+stateJob), ctx.Redis.HGetAll("distill:reasons:"+stateJob))
+	ctx.Equal(stateCount(ctx, "sampled"), 3, "a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded (%v); sampled", ctx.Redis.HGetAll("distill:progress:"+stateJob))
+	ctx.Redis.Do("SET", "distill:budget:"+stateJob, stateCost-1)
+	short := stateReserve(ctx, "What is the capital of Bolivia?")
+	ctx.Equal(short.Verdict, "budget", "with %d tokens left, less than one call (%d); the verdict", stateCost-1, stateCost)
+	ctx.Equal(stateBudget(ctx), stateCost-1, "a budget refusal draws nothing; the budget")
 }
 
 func CheckAtomicScript(ctx *harness.Ctx) {
@@ -1110,9 +1165,12 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 	prompt := "Explain photosynthesis to a ten-year-old."
 	hash := stateSha(prompt)
 	other := ""
-	// another worker reserving the same prompt, landing between two of this worker's commands
+	// another worker reserving the same prompt, landing between two of this worker's commands;
+	// first a snapshot of what this worker's reservation had done at that moment
+	seenThen, budgetThen, sampledThen := false, int64(0), int64(0)
 	ctx.Redis.After("distill:seen:"+stateJob, func() any {
-		if ctx.Redis.SIsMember("distill:seen:"+stateJob, hash) {
+		seenThen, budgetThen, sampledThen = ctx.Redis.SIsMember("distill:seen:"+stateJob, hash), stateBudget(ctx), stateCount(ctx, "sampled")
+		if seenThen {
 			other = "duplicate"
 			return nil
 		}
@@ -1129,6 +1187,7 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 	ctx.Equal(verdicts, []string{"duplicate", "ok"}, "two workers reserved the same prompt: the membership test and the spend must run in one script, so exactly one of them pays; the verdicts")
 	ctx.Equal(stateBudget(ctx), 100*stateCost-stateCost, "two workers, one prompt: one call drawn; the budget")
 	ctx.Equal(stateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled")
+	ctx.Assert(!seenThen || (budgetThen == 100*stateCost-stateCost && sampledThen == 1), "the moment the hash was in the seen set, the budget was %d and sampled %d: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step", budgetThen, sampledThen)
 }
 
 func CheckHashedPrompt(ctx *harness.Ctx) {
@@ -1151,8 +1210,25 @@ func CheckHashedPrompt(ctx *harness.Ctx) {
 
 func CheckRejectReason(ctx *harness.Ctx) {
 	stateStart(ctx, 100)
+	type snapshot struct {
+		fired             bool
+		rejected, refusal int64
+	}
+	snapshots := []*snapshot{{}, {}}
 	for _, s := range [][3]string{{"p1", "accepted", ""}, {"p2", "rejected", "refusal"}, {"p3", "rejected", "refusal"}, {"p4", "rejected", "empty"}} {
 		ctx.Equal(stateReserve(ctx, s[0]).Verdict, "ok", "reserve %s", s[0])
+		if s[0] == "p2" {
+			// whichever key the record writes first, the other must already agree with it
+			for i, key := range []string{"distill:progress:" + stateJob, "distill:reasons:" + stateJob} {
+				snap := snapshots[i]
+				ctx.Redis.After(key, func() any {
+					raw, _ := ctx.Redis.HGet("distill:reasons:"+stateJob, "refusal")
+					refusal, _ := strconv.ParseInt(raw, 10, 64)
+					*snap = snapshot{true, stateCount(ctx, "rejected"), refusal}
+					return nil
+				})
+			}
+		}
 		ctx.NoError(record(context.Background(), stateJob, s[1], s[2]), "record")
 	}
 	progress := ctx.Redis.HGetAll("distill:progress:" + stateJob)
@@ -1162,19 +1238,28 @@ func CheckRejectReason(ctx *harness.Ctx) {
 	_, acc := reasons["accepted"]
 	_, blank := reasons[""]
 	ctx.Assert(!acc && !blank, "only rejections carry a reason: %v", reasons)
+	for _, snap := range snapshots {
+		ctx.Assert(snap.fired && snap.rejected == 1 && snap.refusal == 1, "right after the first rejection's record touched Redis, rejected read %d and refusal %d: the counter and its reason must move in one script, never one command apart", snap.rejected, snap.refusal)
+	}
 }
 
 func CheckKeyTtl(ctx *harness.Ctx) {
 	stateStart(ctx, 100)
 	stateReserve(ctx, "p1")
 	ctx.NoError(record(context.Background(), stateJob, "rejected", "deadline"), "record")
+	ctx.Clock.Advance(50_000)
+	stateReserve(ctx, "p2")
+	ctx.NoError(record(context.Background(), stateJob, "rejected", "refusal"), "record")
 	for _, key := range []string{"distill:budget:" + stateJob, "distill:seen:" + stateJob, "distill:progress:" + stateJob, "distill:reasons:" + stateJob} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl != -2, "%s does not exist after a reservation and a record", key)
-		ctx.Assert(0 < ttl && ttl <= 86_400, "%s has TTL %d: every key the job owns expires TTLSeconds (86400 s) after its last move", key, ttl)
+		ctx.Assert(86_400-50_000 < ttl && ttl <= 86_400, "%s has TTL %d right after a reservation and a record 50000 s into the job: every key the job owns expires TTLSeconds (86400 s) after its last move, so each script refreshes the expiry of the keys it touches", key, ttl)
 	}
 	stamp, ok := ctx.Redis.HGet("distill:progress:"+stateJob, "updated_at")
 	ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:"+stateJob))
+	stamped, _ := strconv.ParseInt(stamp, 10, 64)
+	nowS := ctx.Clock.Now() / 1000
+	ctx.Assert(stamped-nowS <= 5 && nowS-stamped <= 5, "updated_at is %d after the last record, the clock reads %d: every script stamps the time of its move in unix seconds", stamped, nowS)
 	ctx.Clock.Advance(86_401)
 	ctx.Equal(len(ctx.Redis.Keys("distill:*:"+stateJob)), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:"+stateJob))
 }
@@ -1210,6 +1295,7 @@ void CheckDedupeBeforeSpend(harness::Ctx& ctx) {
   start_job(kJob, 2);
   const auto first = reserve(kJob, "What is the capital of France?");
   ctx.Equal(first.verdict, "ok", "a fresh prompt must be reserved; the verdict");
+  ctx.Equal(first.remaining, kCost, "reserve answers the tokens left after the draw as remaining");
   ctx.Equal(stateBudget(ctx), kCost, "one reservation draws one call; the budget");
   const auto again = reserve(kJob, "What is the capital of France?");
   ctx.Equal(again.verdict, "duplicate", "the same prompt again; the verdict");
@@ -1222,6 +1308,11 @@ void CheckDedupeBeforeSpend(harness::Ctx& ctx) {
   ctx.Equal(stateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget");
   const auto reason = ctx.Redis.HGet("distill:reasons:" + kJob, "budget");
   ctx.Assert(stateCount(ctx, "rejected") == 1 && reason && *reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:" + kJob), ctx.Redis.HGetAll("distill:reasons:" + kJob));
+  ctx.Equal(stateCount(ctx, "sampled"), 3, "a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded (%v); sampled", ctx.Redis.HGetAll("distill:progress:" + kJob));
+  ctx.Redis.Do("SET", "distill:budget:" + kJob, kCost - 1);
+  const auto shortOf = reserve(kJob, "What is the capital of Bolivia?");
+  ctx.Equal(shortOf.verdict, "budget", "with %d tokens left, less than one call (%d); the verdict", kCost - 1, kCost);
+  ctx.Equal(stateBudget(ctx), kCost - 1, "a budget refusal draws nothing; the budget");
 }
 
 void CheckAtomicScript(harness::Ctx& ctx) {
@@ -1229,9 +1320,15 @@ void CheckAtomicScript(harness::Ctx& ctx) {
   const std::string prompt = "Explain photosynthesis to a ten-year-old.";
   const std::string hash = sha256_hex(prompt);
   std::string other;
-  // another worker reserving the same prompt, landing between two of this worker's commands
+  // another worker reserving the same prompt, landing between two of this worker's commands;
+  // first a snapshot of what this worker's reservation had done at that moment
+  bool seenThen = false;
+  long long budgetThen = 0, sampledThen = 0;
   ctx.Redis.After("distill:seen:" + kJob, [&] {
-    if (ctx.Redis.SIsMember("distill:seen:" + kJob, hash)) {
+    seenThen = ctx.Redis.SIsMember("distill:seen:" + kJob, hash);
+    budgetThen = stateBudget(ctx);
+    sampledThen = stateCount(ctx, "sampled");
+    if (seenThen) {
       other = "duplicate";
       return;
     }
@@ -1247,6 +1344,7 @@ void CheckAtomicScript(harness::Ctx& ctx) {
   ctx.Equal(verdicts, {"duplicate", "ok"}, "two workers reserved the same prompt: the membership test and the spend must run in one script, so exactly one of them pays; the verdicts");
   ctx.Equal(stateBudget(ctx), 100 * kCost - kCost, "two workers, one prompt: one call drawn; the budget");
   ctx.Equal(stateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled");
+  ctx.Assert(!seenThen || (budgetThen == 100 * kCost - kCost && sampledThen == 1), "the moment the hash was in the seen set, the budget was %d and sampled %d: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step", budgetThen, sampledThen);
 }
 
 void CheckHashedPrompt(harness::Ctx& ctx) {
@@ -1265,8 +1363,23 @@ void CheckHashedPrompt(harness::Ctx& ctx) {
 void CheckRejectReason(harness::Ctx& ctx) {
   start_job(kJob, 100);
   const std::vector<std::vector<std::string>> samples = {{"p1", "accepted", ""}, {"p2", "rejected", "refusal"}, {"p3", "rejected", "refusal"}, {"p4", "rejected", "empty"}};
+  struct Snapshot {
+    bool fired = false;
+    long long rejected = 0, refusal = 0;
+  };
+  Snapshot snapshots[2];
   for (const auto& s : samples) {
     ctx.Equal(reserve(kJob, s[0]).verdict, "ok", "reserve %s", s[0]);
+    if (s[0] == "p2") {
+      // whichever key the record writes first, the other must already agree with it
+      const std::string keys[2] = {"distill:progress:" + kJob, "distill:reasons:" + kJob};
+      for (int i = 0; i < 2; ++i) {
+        ctx.Redis.After(keys[i], [&ctx, &snap = snapshots[i]] {
+          const auto refusal = ctx.Redis.HGet("distill:reasons:" + kJob, "refusal");
+          snap = Snapshot{true, stateCount(ctx, "rejected"), refusal ? std::strtoll(refusal->c_str(), nullptr, 10) : 0};
+        });
+      }
+    }
     record(kJob, s[1], s[2]);
   }
   ctx.Equal(std::vector<long long>{stateCount(ctx, "sampled"), stateCount(ctx, "accepted"), stateCount(ctx, "rejected")}, std::vector<long long>{4, 1, 3},
@@ -1274,20 +1387,29 @@ void CheckRejectReason(harness::Ctx& ctx) {
   const auto reasons = ctx.Redis.HGetAll("distill:reasons:" + kJob);
   ctx.Assert(reasons.count("refusal") && reasons.at("refusal") == "2" && reasons.count("empty") && reasons.at("empty") == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", kJob, reasons);
   ctx.Assert(!reasons.count("accepted") && !reasons.count(""), "only rejections carry a reason: %v", reasons);
+  for (const auto& snap : snapshots) {
+    ctx.Assert(snap.fired && snap.rejected == 1 && snap.refusal == 1, "right after the first rejection's record touched Redis, rejected read %d and refusal %d: the counter and its reason must move in one script, never one command apart", snap.rejected, snap.refusal);
+  }
 }
 
 void CheckKeyTtl(harness::Ctx& ctx) {
   start_job(kJob, 100);
   reserve(kJob, "p1");
   record(kJob, "rejected", "deadline");
+  ctx.Clock.Advance(50000);
+  reserve(kJob, "p2");
+  record(kJob, "rejected", "refusal");
   for (const std::string key : {"distill:budget:" + kJob, "distill:seen:" + kJob, "distill:progress:" + kJob, "distill:reasons:" + kJob}) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl != -2, "%s does not exist after a reservation and a record", key);
-    ctx.Assert(0 < ttl && ttl <= 86400, "%s has TTL %d: every key the job owns expires kTtlSeconds (86400 s) after its last move", key, ttl);
+    ctx.Assert(86400 - 50000 < ttl && ttl <= 86400, "%s has TTL %d right after a reservation and a record 50000 s into the job: every key the job owns expires kTtlSeconds (86400 s) after its last move, so each script refreshes the expiry of the keys it touches", key, ttl);
   }
   const auto stamp = ctx.Redis.HGet("distill:progress:" + kJob, "updated_at");
   ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
              "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:" + kJob));
+  const long long stamped = std::strtoll(stamp->c_str(), nullptr, 10);
+  const long long nowS = ctx.Clock.Now() / 1000;
+  ctx.Assert(std::llabs(stamped - nowS) <= 5, "updated_at is %d after the last record, the clock reads %d: every script stamps the time of its move in unix seconds", stamped, nowS);
   ctx.Clock.Advance(86401);
   ctx.Equal(ctx.Redis.Keys("distill:*:" + kJob).size(), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:" + kJob));
 }

@@ -19,11 +19,12 @@ one otherwise), clamps \`k\` into 1 to 100 and answers \`{hits, k, index_version
 body; a client that asks for 500 results gets 100 and believes it saw everything; a 3-number query
 is scored against 4-dimension vectors and still ranks; and a caller searches a retired index version.
 
-- The tenant is the \`X-Tenant-Id\` header: absent is **401**, a body \`tenant\` that differs is **403**.
+- The tenant is the \`X-Tenant-Id\` header: absent or empty is **401**, a body \`tenant\` that differs
+  is **403**.
 - The query has exactly the active index's \`dims\` numbers, else **400** naming the active version.
 - \`k\` is an integer from 1 to \`MAX_K\` (100); anything else is **400**, not clamped.
-- The search runs in the active version; a body \`index_version\` that is not it is **409** naming the
-  active one.`,
+- The search runs in the version active when the request arrives; a body \`index_version\` that is
+  not it is **409** naming the active one.`,
   sequence: {
     participants: ['Client', 'searchd', 'Corpus'],
     messages: [
@@ -54,7 +55,7 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
       id: 'tenant-header',
       title: 'The tenant is the authenticated header',
       detail:
-        'The tenant is `X-Tenant-Id` (**401** when absent); a body `tenant` that differs is **403**. The starter prefers the body, so a caller reads any corpus by naming it.',
+        'The tenant is `X-Tenant-Id` (**401** when absent or empty); a body `tenant` that differs is **403**. The starter prefers the body, so a caller reads any corpus by naming it.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/, /\b403\b/], none: [/body\.tenant\s+or\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/], none: [/body\.tenant\s*\?\?/]},
@@ -70,7 +71,7 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
       id: 'k-cap',
       title: 'Rejects k outside 1 to 100 instead of clamping it',
       detail:
-        '`k` must be an integer from 1 to `MAX_K` (100); anything else is **400**. The starter clamps it and answers 200, so the caller never learns its request was rewritten.',
+        '`k` must be an integer from 1 to `MAX_K` (100), both ends included; anything else is **400**. The starter clamps it and answers 200, so the caller never learns its request was rewritten.',
       match: {
         python: {all: [/MAX_K/, /\b400\b/], none: [/min\(\s*body\.k/]},
         typescript: {all: [/MAX_K/, /code\(\s*400\s*\)/], none: [/Math\.min\(/]},
@@ -96,7 +97,7 @@ is scored against 4-dimension vectors and still ranks; and a caller searches a r
       id: 'active-version',
       title: 'Searches the active version only',
       detail:
-        'The search runs in `active_index()` and a body `index_version` that is not the active one is **409** naming it. The starter searches whatever version the body names.',
+        'The search runs in the version `active_index()` names when the request arrives, also after a switch to a new version, and a body `index_version` that is not the active one is **409** naming it. The starter searches whatever version the body names.',
       match: {
         python: {all: [/\b409\b/], none: [/body\.index_version\s+or\b/]},
         typescript: {all: [/code\(\s*409\s*\)/], none: [/body\.index_version\s*\?\?/]},
@@ -592,11 +593,15 @@ async def check_route(ctx):
 async def check_tenant_header(ctx):
     async with _api(ctx) as c:
         anonymous = await c.post("/v1/search", json={"query": QUERY, "k": 2, "tenant": "globex"})
+        bare = await c.post("/v1/search", json={"query": QUERY, "k": 2})
+        empty = await c.post("/v1/search", json={"query": QUERY, "k": 2}, headers={"X-Tenant-Id": ""})
         forged = await c.post("/v1/search", json={"query": QUERY, "k": 2, "tenant": "globex"}, headers=ACME)
         agreeing = await c.post("/v1/search", json={"query": QUERY, "k": 2, "tenant": "acme"}, headers=ACME)
     assert "g1" not in forged.text, f"a caller authenticated as acme read globex's document g1 by naming globex in the body: {forged.status_code} {forged.text}"
     assert "g1" not in anonymous.text, f"a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: {anonymous.status_code} {anonymous.text}"
     assert anonymous.status_code == 401, f"a search without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert bare.status_code == 401, f"a search with neither X-Tenant-Id nor a body tenant answered {bare.status_code} {bare.text}, expected 401"
+    assert empty.status_code == 401, f"a search with an empty X-Tenant-Id answered {empty.status_code} {empty.text}: an empty header names no tenant, expected 401"
     assert forged.status_code == 403, f"a body tenant globex under X-Tenant-Id acme answered {forged.status_code}, expected 403"
     assert agreeing.status_code == 200 and _ids(agreeing) == ["a1", "a2"], f"a body tenant that agrees with the header is allowed: got {agreeing.status_code} {agreeing.text}"
 
@@ -604,10 +609,14 @@ async def check_tenant_header(ctx):
 async def check_k_cap(ctx):
     async with _api(ctx) as c:
         big = await c.post("/v1/search", json={"query": QUERY, "k": 500}, headers=ACME)
+        over = await c.post("/v1/search", json={"query": QUERY, "k": 101}, headers=ACME)
         zero = await c.post("/v1/search", json={"query": QUERY, "k": 0}, headers=ACME)
+        one = await c.post("/v1/search", json={"query": QUERY, "k": 1}, headers=ACME)
         cap = await c.post("/v1/search", json={"query": QUERY, "k": 100}, headers=ACME)
     assert big.status_code == 400, f"k 500 answered {big.status_code} {big.text}: a request above the cap of 100 must be rejected with 400, not clamped"
+    assert over.status_code == 400, f"k 101 answered {over.status_code} {over.text}: the cap is 100, expected 400"
     assert zero.status_code == 400, f"k 0 answered {zero.status_code} {zero.text}, expected 400"
+    assert one.status_code == 200 and one.json().get("k") == 1 and _ids(one) == ["a1"], f"k 1 is allowed and answers acme's nearest document a1, got {one.status_code} {one.text}"
     assert cap.status_code == 200 and cap.json().get("k") == 100 and len(_ids(cap)) == 3, f"k 100 is allowed and answers acme's three documents, got {cap.status_code} {cap.text}"
 
 
@@ -624,9 +633,16 @@ async def check_active_version(ctx):
     async with _api(ctx) as c:
         retired = await c.post("/v1/search", json={"query": QUERY, "k": 2, "index_version": "idx-41"}, headers=ACME)
         current = await c.post("/v1/search", json={"query": QUERY, "k": 2, "index_version": "idx-42"}, headers=ACME)
+        corpus.activate("idx-43", 4)
+        corpus.put_document("acme", "idx-43", "n1", [1.0, 0.0, 0.0, 0.0])
+        switched = await c.post("/v1/search", json={"query": QUERY, "k": 2}, headers=ACME)
+        pinned = await c.post("/v1/search", json={"query": QUERY, "k": 2, "index_version": "idx-42"}, headers=ACME)
     assert "old-1" not in retired.text, f"a caller searched the retired version idx-41 by naming it in the body: {retired.status_code} {retired.text}"
     assert retired.status_code == 409 and "idx-42" in retired.text, f"a body index_version idx-41 must be 409 naming the active idx-42, got {retired.status_code} {retired.text}"
     assert current.status_code == 200 and _ids(current) == ["a1", "a2"], f"a body index_version equal to the active one is allowed, got {current.status_code} {current.text}"
+    switched_body = switched.json() if switched.status_code == 200 else {}
+    assert switched.status_code == 200 and _ids(switched) == ["n1"] and switched_body.get("index_version") == "idx-43", f"after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got {switched.status_code} {switched.text}: the active version is read on every request"
+    assert pinned.status_code == 409 and "idx-43" in pinned.text, f"after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got {pinned.status_code} {pinned.text}"
 `,
     typescript: `const QUERY = [1, 0, 0, 0];
 const ACME = {'X-Tenant-Id': 'acme'};
@@ -665,11 +681,15 @@ export async function check_route(ctx) {
 export async function check_tenant_header(ctx) {
   const c = await api(ctx);
   const anonymous = await search(c, {query: QUERY, k: 2, tenant: 'globex'}, {});
+  const bare = await search(c, {query: QUERY, k: 2}, {});
+  const empty = await search(c, {query: QUERY, k: 2}, {'X-Tenant-Id': ''});
   const forged = await search(c, {query: QUERY, k: 2, tenant: 'globex'});
   const agreeing = await search(c, {query: QUERY, k: 2, tenant: 'acme'});
   assert(!forged.text.includes('g1'), \`a caller authenticated as acme read globex's document g1 by naming globex in the body: \${forged.status} \${forged.text}\`);
   assert(!anonymous.text.includes('g1'), \`a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: \${anonymous.status} \${anonymous.text}\`);
   assert.equal(anonymous.status, 401, \`a search without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(bare.status, 401, \`a search with neither X-Tenant-Id nor a body tenant answered \${bare.status} \${bare.text}, expected 401\`);
+  assert.equal(empty.status, 401, \`a search with an empty X-Tenant-Id answered \${empty.status} \${empty.text}: an empty header names no tenant, expected 401\`);
   assert.equal(forged.status, 403, \`a body tenant globex under X-Tenant-Id acme answered \${forged.status}, expected 403\`);
   assert(agreeing.status === 200 && ids(agreeing).join() === 'a1,a2', \`a body tenant that agrees with the header is allowed: got \${agreeing.status} \${agreeing.text}\`);
 }
@@ -677,10 +697,14 @@ export async function check_tenant_header(ctx) {
 export async function check_k_cap(ctx) {
   const c = await api(ctx);
   const big = await search(c, {query: QUERY, k: 500});
+  const over = await search(c, {query: QUERY, k: 101});
   const zero = await search(c, {query: QUERY, k: 0});
+  const one = await search(c, {query: QUERY, k: 1});
   const cap = await search(c, {query: QUERY, k: 100});
   assert.equal(big.status, 400, \`k 500 answered \${big.status} \${big.text}: a request above the cap of 100 must be rejected with 400, not clamped\`);
+  assert.equal(over.status, 400, \`k 101 answered \${over.status} \${over.text}: the cap is 100, expected 400\`);
   assert.equal(zero.status, 400, \`k 0 answered \${zero.status} \${zero.text}, expected 400\`);
+  assert(one.status === 200 && one.json().k === 1 && ids(one).join() === 'a1', \`k 1 is allowed and answers acme's nearest document a1, got \${one.status} \${one.text}\`);
   assert(cap.status === 200 && cap.json().k === 100 && ids(cap).length === 3, \`k 100 is allowed and answers acme's three documents, got \${cap.status} \${cap.text}\`);
 }
 
@@ -697,9 +721,19 @@ export async function check_active_version(ctx) {
   const c = await api(ctx);
   const retired = await search(c, {query: QUERY, k: 2, index_version: 'idx-41'});
   const current = await search(c, {query: QUERY, k: 2, index_version: 'idx-42'});
+  const corpus = ctx.load('/support/search/corpus.ts');
+  await corpus.activate('idx-43', 4);
+  await corpus.putDocument('acme', 'idx-43', 'n1', [1, 0, 0, 0]);
+  const switched = await search(c, {query: QUERY, k: 2});
+  const pinned = await search(c, {query: QUERY, k: 2, index_version: 'idx-42'});
   assert(!retired.text.includes('old-1'), \`a caller searched the retired version idx-41 by naming it in the body: \${retired.status} \${retired.text}\`);
   assert(retired.status === 409 && retired.text.includes('idx-42'), \`a body index_version idx-41 must be 409 naming the active idx-42, got \${retired.status} \${retired.text}\`);
   assert(current.status === 200 && ids(current).join() === 'a1,a2', \`a body index_version equal to the active one is allowed, got \${current.status} \${current.text}\`);
+  assert(
+    switched.status === 200 && ids(switched).join() === 'n1' && switched.json().index_version === 'idx-43',
+    \`after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got \${switched.status} \${switched.text}: the active version is read on every request\`,
+  );
+  assert(pinned.status === 409 && pinned.text.includes('idx-43'), \`after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got \${pinned.status} \${pinned.text}\`);
 }
 `,
     go: `package main
@@ -773,11 +807,15 @@ func CheckRoute(ctx *harness.Ctx) {
 func CheckTenantHeader(ctx *harness.Ctx) {
 	c := api(ctx)
 	anonymous := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "globex"}, "")
+	bare := searchAs(c, map[string]any{"query": apiQuery, "k": 2}, "")
+	empty := c.Post("/v1/search", map[string]any{"query": apiQuery, "k": 2}, "X-Tenant-Id", "")
 	forged := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "globex"}, "acme")
 	agreeing := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "acme"}, "acme")
 	ctx.Assert(!strings.Contains(forged.Text(), "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text())
 	ctx.Assert(!strings.Contains(anonymous.Text(), "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text())
 	ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id")
+	ctx.Equal(bare.Status, 401, "a search with neither X-Tenant-Id nor a body tenant (%s)", bare.Text())
+	ctx.Equal(empty.Status, 401, "a search with an empty X-Tenant-Id names no tenant (%s)", empty.Text())
 	ctx.Equal(forged.Status, 403, "a body tenant globex under X-Tenant-Id acme")
 	ctx.Assert(agreeing.Status == 200 && strings.Join(idsOf(agreeing), ",") == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text())
 }
@@ -785,10 +823,14 @@ func CheckTenantHeader(ctx *harness.Ctx) {
 func CheckKCap(ctx *harness.Ctx) {
 	c := api(ctx)
 	big := searchAs(c, map[string]any{"query": apiQuery, "k": 500}, "acme")
+	over := searchAs(c, map[string]any{"query": apiQuery, "k": 101}, "acme")
 	zero := searchAs(c, map[string]any{"query": apiQuery, "k": 0}, "acme")
+	one := searchAs(c, map[string]any{"query": apiQuery, "k": 1}, "acme")
 	limit := searchAs(c, map[string]any{"query": apiQuery, "k": 100}, "acme")
 	ctx.Equal(big.Status, 400, "k 500 answered %s: a request above the cap of 100 must be rejected with 400, not clamped; the status", big.Text())
+	ctx.Equal(over.Status, 400, "k 101 answered %s: the cap is 100; the status", over.Text())
 	ctx.Equal(zero.Status, 400, "k 0 (%s)", zero.Text())
+	ctx.Assert(one.Status == 200 && answerOf(one).K == 1 && strings.Join(idsOf(one), ",") == "a1", "k 1 is allowed and answers acme's nearest document a1, got %d %s", one.Status, one.Text())
 	ctx.Assert(limit.Status == 200 && answerOf(limit).K == 100 && len(idsOf(limit)) == 3, "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text())
 }
 
@@ -805,9 +847,16 @@ func CheckActiveVersion(ctx *harness.Ctx) {
 	c := api(ctx)
 	retired := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-41"}, "acme")
 	current := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-42"}, "acme")
+	bg := context.Background()
+	corpus.Activate(bg, "idx-43", 4)
+	corpus.PutDocument(bg, "acme", "idx-43", "n1", []float64{1, 0, 0, 0})
+	switched := searchAs(c, map[string]any{"query": apiQuery, "k": 2}, "acme")
+	pinned := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-42"}, "acme")
 	ctx.Assert(!strings.Contains(retired.Text(), "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text())
 	ctx.Assert(retired.Status == 409 && strings.Contains(retired.Text(), "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text())
 	ctx.Assert(current.Status == 200 && strings.Join(idsOf(current), ",") == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text())
+	ctx.Assert(switched.Status == 200 && strings.Join(idsOf(switched), ",") == "n1" && answerOf(switched).IndexVersion == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text())
+	ctx.Assert(pinned.Status == 409 && strings.Contains(pinned.Text(), "idx-43"), "after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got %d %s", pinned.Status, pinned.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -872,11 +921,15 @@ void CheckRoute(harness::Ctx& ctx) {
 void CheckTenantHeader(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto anonymous = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "");
+  const auto bare = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "");
+  const auto empty = c.Post("/v1/search", R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "Content-Type", "application/json", "X-Tenant-Id", "");
   const auto forged = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "acme");
   const auto agreeing = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "acme"})", "acme");
   ctx.Assert(!has(forged, "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text());
   ctx.Assert(!has(anonymous, "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text());
   ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id");
+  ctx.Equal(bare.Status, 401, "a search with neither X-Tenant-Id nor a body tenant (%s)", bare.Text());
+  ctx.Equal(empty.Status, 401, "a search with an empty X-Tenant-Id names no tenant (%s)", empty.Text());
   ctx.Equal(forged.Status, 403, "a body tenant globex under X-Tenant-Id acme");
   ctx.Assert(agreeing.Status == 200 && ids(agreeing) == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text());
 }
@@ -884,10 +937,14 @@ void CheckTenantHeader(harness::Ctx& ctx) {
 void CheckKCap(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto big = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 500})", "acme");
+  const auto over = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 101})", "acme");
   const auto zero = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 0})", "acme");
+  const auto one = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 1})", "acme");
   const auto limit = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 100})", "acme");
   ctx.Equal(big.Status, 400, "k 500 answered %s: a request above the cap of 100 must be rejected with 400, not clamped; the status", big.Text());
+  ctx.Equal(over.Status, 400, "k 101 answered %s: the cap is 100; the status", over.Text());
   ctx.Equal(zero.Status, 400, "k 0 (%s)", zero.Text());
+  ctx.Assert(one.Status == 200 && parsed(one).value("k", 0L) == 1 && ids(one) == "a1", "k 1 is allowed and answers acme's nearest document a1, got %d %s", one.Status, one.Text());
   ctx.Assert(limit.Status == 200 && parsed(limit).value("k", 0L) == 100 && ids(limit) == "a1,a2,a3", "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text());
 }
 
@@ -904,9 +961,15 @@ void CheckActiveVersion(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto retired = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-41"})", "acme");
   const auto current = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
+  corpus::activate("idx-43", 4);
+  corpus::putDocument("acme", "idx-43", "n1", {1, 0, 0, 0});
+  const auto switched = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
+  const auto pinned = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
   ctx.Assert(!has(retired, "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text());
   ctx.Assert(retired.Status == 409 && has(retired, "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text());
   ctx.Assert(current.Status == 200 && ids(current) == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text());
+  ctx.Assert(switched.Status == 200 && ids(switched) == "n1" && parsed(switched).value("index_version", std::string()) == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text());
+  ctx.Assert(pinned.Status == 409 && has(pinned, "idx-43"), "after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got %d %s", pinned.Status, pinned.Text());
 }
 `,
   },

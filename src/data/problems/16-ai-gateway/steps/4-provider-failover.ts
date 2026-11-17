@@ -21,14 +21,16 @@ already read, and never tries the fallback that was healthy all along.
 
 - Providers are \`primary:9000\` then \`fallback:9000\`: **one attempt each**, at most 2 in total,
   with the first that streams to completion winning.
-- Every attempt carries the **8 s stream deadline** (a gRPC deadline bounds the whole stream).
+- Every attempt carries its own full **8 s stream deadline** (a gRPC deadline bounds the whole
+  stream), the fallback's too.
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` move on to the next provider; any other status is
   raised to the caller at once. Once a chunk has been yielded, no failure moves on: a replay would
   duplicate output and bill it twice.
 - Every attempt sends the caller's \`idempotency-key\` as gRPC metadata; without a key the call is
   refused before any attempt.
-- A breaker per provider at \`circuit:{provider}\`: \`INCR\` on each retryable failure with a 30 s
-  expiry; at 5 the value becomes \`open\` for 30 s and that provider is skipped.`,
+- A breaker per provider at \`circuit:{provider}\`: \`INCR\` on each retryable failure, the count
+  expiring 30 s after it started; at the fifth the value becomes \`open\` for 30 s and that
+  provider is skipped.`,
   sequence: {
     participants: ['gateway', 'Redis', 'primary', 'fallback'],
     messages: [
@@ -51,7 +53,7 @@ already read, and never tries the fallback that was healthy all along.
       id: 'deadline',
       title: 'Every attempt carries the 8 s stream deadline',
       detail:
-        'Each StreamComplete call is opened with the 8 second deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`); a stalled provider then ends in DEADLINE_EXCEEDED and the fallback gets its turn.',
+        "Each StreamComplete call, the fallback's included, is opened with its own full 8 second deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), not what is left of one shared by both; a stalled provider then ends in DEADLINE_EXCEEDED and the fallback gets its turn.",
       match: {
         python: {all: [/StreamComplete\([\s\S]{0,300}?timeout\s*=/]},
         typescript: {all: [/StreamComplete\([\s\S]{0,300}?deadline\s*:/]},
@@ -86,7 +88,7 @@ already read, and never tries the fallback that was healthy all along.
       id: 'retryable-and-idempotent',
       title: 'Moves on only for UNAVAILABLE / DEADLINE_EXCEEDED, with the idempotency key',
       detail:
-        'Only the two retryable codes reach the next provider; every attempt carries `idempotency-key` metadata and no call starts without one; a failure after the first chunk is raised, not retried.',
+        "Only the two retryable codes, however they arrive, reach the next provider; any other status (several are tried) is raised at once and not counted. Every attempt, the fallback's included, carries `idempotency-key` metadata and no call starts without one. A failure before the first chunk moves on; a failure after it is raised, not retried.",
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /["']idempotency-key["']/, /metadata\s*=/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /['"]idempotency-key['"]/, /Metadata\(\)/]},
@@ -106,7 +108,7 @@ already read, and never tries the fallback that was healthy all along.
       id: 'circuit-breaker',
       title: 'Opens circuit:{provider} after five retryable failures for 30 s',
       detail:
-        '`circuit:{provider}` counts retryable failures with INCR and a 30 s expiry; at five it is set to `open` for 30 s and the provider is skipped until it expires.',
+        '`circuit:{provider}` counts retryable failures with INCR, the count expiring 30 s after it started; at the fifth it is set to `open` for a full 30 s and the provider is skipped until it expires. Four failures do not open it.',
       match: {
         python: {all: [/f["']circuit:\{/, /\.incr\(/, /["']open["']/, /\.expire\(|\bex\s*=/]},
         typescript: {all: [/`circuit:\$\{/, /\.incr\(/, /['"]open['"]/, /\.expire\(|['"]EX['"]/]},
@@ -811,6 +813,8 @@ async def check_deadline(ctx):
     assert 7.5 <= primary[0].timeout <= 8.5, f"the deadline must be the 8 s stream deadline, got {primary[0].timeout} s"
     assert error is None and chunks == TOKENS, f"after the primary timed out the fallback must serve the answer; got {chunks} and {error!r}"
     assert len(primary) == 1 and len(_calls(ctx, FALLBACK)) == 1, f"expected one attempt on each provider, got {len(primary)} on primary and {len(_calls(ctx, FALLBACK))} on fallback"
+    fallback = _calls(ctx, FALLBACK)[0]
+    assert fallback.timeout is not None and 7.5 <= fallback.timeout <= 8.5, f"the fallback attempt, made after the primary used up its 8 s, carried a deadline of {fallback.timeout} s: every attempt carries its own full 8 s deadline, not what is left of a shared one"
 
 
 async def check_bounded(ctx):
@@ -826,35 +830,65 @@ async def check_bounded(ctx):
 
 async def check_retryable_and_idempotent(ctx):
     m = _world(ctx)
-    ctx.grpc.fail("StreamComplete", grpc.StatusCode.INVALID_ARGUMENT, "bad request", times=1, target=PRIMARY)
-    chunks, error, ended = _run(ctx, m)
-    assert ended and error is not None, "INVALID_ARGUMENT from the primary must be raised to the caller at once"
-    assert len(_calls(ctx, FALLBACK)) == 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried (the request itself is wrong)"
-    assert ctx.redis.get("circuit:primary") != "open", "a non-retryable failure must not count towards the breaker"
+    for code in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL, grpc.StatusCode.NOT_FOUND):
+        ctx.grpc.fail("StreamComplete", code, "refused", times=1, target=PRIMARY)
+        chunks, error, ended = _run(ctx, m)
+        assert ended and error is not None, f"{code.name} from the primary must be raised to the caller at once"
+        assert len(_calls(ctx, FALLBACK)) == 0, f"{code.name} is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on)"
+    assert ctx.redis.get("circuit:primary") is None, f"a non-retryable failure must not count towards the breaker, circuit:primary is {ctx.redis.get('circuit:primary')!r}"
     chunks, error, ended = _run(ctx, m, key="k-7")
     assert error is None and chunks == TOKENS, f"a healthy primary must serve the answer, got {chunks} and {error!r}"
     md = dict((str(k), v) for k, v in _calls(ctx, PRIMARY)[-1].metadata)
     assert md.get("idempotency-key") == "k-7", f"the attempt carried metadata {md}, expected idempotency-key: k-7"
+    ctx.grpc.fail("StreamComplete", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline exceeded", times=1, target=PRIMARY)
+    chunks, error, ended = _run(ctx, m, key="k-8")
+    assert error is None and chunks == TOKENS, f"DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer, got {chunks} and {error!r}"
+    calls = _calls(ctx, FALLBACK)
+    md = dict((str(k), v) for k, v in calls[-1].metadata) if calls else {}
+    assert md.get("idempotency-key") == "k-8", f"the fallback attempt carried metadata {md}, expected idempotency-key: k-8 (every attempt carries the key)"
     before = len(_calls(ctx, PRIMARY))
     chunks, error, ended = _run(ctx, m, key="")
     assert error is not None and len(_calls(ctx, PRIMARY)) == before, "without an idempotency key the call must be refused before any attempt"
+    m = _world(ctx, primary_break_after=0)
+    chunks, error, ended = _run(ctx, m, key="k-10")
+    assert error is None and chunks == TOKENS, f"the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; got {chunks} and {error!r}"
     m = _world(ctx, primary_break_after=2)
+    fallback_before = len(_calls(ctx, FALLBACK))
     chunks, error, ended = _run(ctx, m, key="k-9")
     assert chunks == TOKENS[:2], f"the caller must receive the two chunks the primary streamed before failing, got {chunks}"
     assert error is not None, "a failure after the first chunk must be raised: a retry would replay output the user already read"
-    assert len(_calls(ctx, FALLBACK)) == 0, "after a chunk was delivered the fallback must not be tried: it would replay and bill the answer twice"
+    assert len(_calls(ctx, FALLBACK)) == fallback_before, "after a chunk was delivered the fallback must not be tried: it would replay and bill the answer twice"
 
 
 async def check_circuit_breaker(ctx):
     m = _world(ctx)
-    for i in range(5):
+
+    def fail_once(key):
         ctx.grpc.fail("StreamComplete", grpc.StatusCode.UNAVAILABLE, "primary restarting", times=1, target=PRIMARY)
-        chunks, error, ended = _run(ctx, m, key=f"k-{i}")
-        assert error is None and chunks == TOKENS, f"attempt {i + 1}: the fallback must serve the answer while the primary fails, got {chunks} and {error!r}"
+        chunks, error, ended = _run(ctx, m, key=key)
+        assert error is None and chunks == TOKENS, f"{key}: the fallback must serve the answer while the primary fails, got {chunks} and {error!r}"
+
+    # Four failures, then the 30 s window passes: the count starts over.
+    for i in range(4):
+        fail_once(f"k-a{i}")
+    ctx.clock.advance(31)
+    fail_once("k-a4")
+    assert ctx.redis.get("circuit:primary") != "open", "four failures, 31 s of quiet, then one more opened circuit:primary: the count must expire 30 s after it started"
+    ctx.clock.advance(31)
+    # Five failures, 5 s apart: the breaker opens at the fifth, for a full 30 s.
+    first = len(_calls(ctx, PRIMARY))
+    for i in range(5):
+        if i == 4:
+            state = ctx.redis.get("circuit:primary")
+            assert state != "open", f"after four retryable failures circuit:primary is already {state!r}: it opens at five"
+        fail_once(f"k-{i}")
+        if i < 4:
+            ctx.clock.advance(5)
+    assert len(_calls(ctx, PRIMARY)) - first == 5, f"five requests with the primary failing made {len(_calls(ctx, PRIMARY)) - first} primary attempts, expected 5"
     state = ctx.redis.get("circuit:primary")
     assert state == "open", f"after five retryable failures circuit:primary is {state!r}, expected 'open'"
     ttl = ctx.redis.ttl("circuit:primary")
-    assert 0 < ttl <= 30, f"circuit:primary must expire within 30 s, its TTL is {ttl}"
+    assert 28 <= ttl <= 30, f"circuit:primary must stay open for 30 s from the fifth failure, its TTL is {ttl}"
     before = len(_calls(ctx, PRIMARY))
     chunks, error, ended = _run(ctx, m, key="k-open")
     assert len(_calls(ctx, PRIMARY)) == before, "while the breaker is open the primary must be skipped"
@@ -930,6 +964,8 @@ export async function check_deadline(ctx) {
   assert(error === null, \`after the primary timed out the fallback must serve the answer; the call failed with \${error}\`);
   assert.deepStrictEqual(chunks, TOKENS, \`after the primary timed out the fallback must serve the answer; got \${JSON.stringify(chunks)}\`);
   assert(primary.length === 1 && calls(ctx, FALLBACK).length === 1, \`expected one attempt on each provider, got \${primary.length} on primary and \${calls(ctx, FALLBACK).length} on fallback\`);
+  const fallback = calls(ctx, FALLBACK)[0];
+  assert(fallback.timeout !== null && 7.5 <= fallback.timeout && fallback.timeout <= 8.5, \`the fallback attempt, made after the primary used up its 8 s, carried a deadline of \${fallback.timeout} s: every attempt carries its own full 8 s deadline, not what is left of a shared one\`);
 }
 
 export async function check_bounded(ctx) {
@@ -945,38 +981,66 @@ export async function check_bounded(ctx) {
 
 export async function check_retryable_and_idempotent(ctx) {
   let m = world(ctx);
-  ctx.grpc.fail('StreamComplete', ctx.grpc.status.INVALID_ARGUMENT, 'bad request', 1, PRIMARY);
-  let out = await run(ctx, m);
-  assert(out.ended && out.error !== null, 'INVALID_ARGUMENT from the primary must be raised to the caller at once');
-  assert.equal(calls(ctx, FALLBACK).length, 0, 'INVALID_ARGUMENT is not retryable: the fallback must not be tried (the request itself is wrong)');
-  assert.notEqual(ctx.redis.get('circuit:primary'), 'open', 'a non-retryable failure must not count towards the breaker');
-  out = await run(ctx, m, 'k-7');
+  for (const name of ['INVALID_ARGUMENT', 'RESOURCE_EXHAUSTED', 'INTERNAL', 'NOT_FOUND']) {
+    ctx.grpc.fail('StreamComplete', ctx.grpc.status[name], 'refused', 1, PRIMARY);
+    const refused = await run(ctx, m);
+    assert(refused.ended && refused.error !== null, \`\${name} from the primary must be raised to the caller at once\`);
+    assert.equal(calls(ctx, FALLBACK).length, 0, \`\${name} is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on)\`);
+  }
+  assert.equal(ctx.redis.get('circuit:primary'), null, \`a non-retryable failure must not count towards the breaker, circuit:primary is \${JSON.stringify(ctx.redis.get('circuit:primary'))}\`);
+  let out = await run(ctx, m, 'k-7');
   assert(out.error === null, \`a healthy primary must serve the answer, the call failed with \${out.error}\`);
   assert.deepStrictEqual(out.chunks, TOKENS, \`a healthy primary must serve the answer, got \${JSON.stringify(out.chunks)}\`);
   const md = calls(ctx, PRIMARY).at(-1).metadata.getMap();
   assert.equal(md['idempotency-key'], 'k-7', \`the attempt carried metadata \${JSON.stringify(md)}, expected idempotency-key: k-7\`);
+  ctx.grpc.fail('StreamComplete', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline exceeded', 1, PRIMARY);
+  out = await run(ctx, m, 'k-8');
+  assert(out.error === null && out.chunks.length === TOKENS.length, \`DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer, got \${JSON.stringify(out.chunks)} and \${out.error}\`);
+  const fallbackMd = calls(ctx, FALLBACK).at(-1)?.metadata.getMap() ?? {};
+  assert.equal(fallbackMd['idempotency-key'], 'k-8', \`the fallback attempt carried metadata \${JSON.stringify(fallbackMd)}, expected idempotency-key: k-8 (every attempt carries the key)\`);
   const before = calls(ctx, PRIMARY).length;
   out = await run(ctx, m, '');
   assert(out.error !== null && calls(ctx, PRIMARY).length === before, 'without an idempotency key the call must be refused before any attempt');
+  m = world(ctx, 0);
+  out = await run(ctx, m, 'k-10');
+  assert(out.error === null && out.chunks.length === TOKENS.length, \`the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; got \${JSON.stringify(out.chunks)} and \${out.error}\`);
   m = world(ctx, 2);
+  const fallbackBefore = calls(ctx, FALLBACK).length;
   out = await run(ctx, m, 'k-9');
   assert.deepStrictEqual(out.chunks, TOKENS.slice(0, 2), \`the caller must receive the two chunks the primary streamed before failing, got \${JSON.stringify(out.chunks)}\`);
   assert(out.error !== null, 'a failure after the first chunk must be raised: a retry would replay output the user already read');
-  assert.equal(calls(ctx, FALLBACK).length, 0, 'after a chunk was delivered the fallback must not be tried: it would replay and bill the answer twice');
+  assert.equal(calls(ctx, FALLBACK).length, fallbackBefore, 'after a chunk was delivered the fallback must not be tried: it would replay and bill the answer twice');
 }
 
 export async function check_circuit_breaker(ctx) {
   const m = world(ctx);
-  for (let i = 0; i < 5; i += 1) {
+  const failOnce = async (key: string) => {
     ctx.grpc.fail('StreamComplete', ctx.grpc.status.UNAVAILABLE, 'primary restarting', 1, PRIMARY);
-    const out = await run(ctx, m, \`k-\${i}\`);
-    assert(out.error === null, \`attempt \${i + 1}: the fallback must serve the answer while the primary fails, the call failed with \${out.error}\`);
-    assert.deepStrictEqual(out.chunks, TOKENS, \`attempt \${i + 1}: the fallback must serve the answer while the primary fails, got \${JSON.stringify(out.chunks)}\`);
+    const out = await run(ctx, m, key);
+    assert(out.error === null, \`\${key}: the fallback must serve the answer while the primary fails, the call failed with \${out.error}\`);
+    assert.deepStrictEqual(out.chunks, TOKENS, \`\${key}: the fallback must serve the answer while the primary fails, got \${JSON.stringify(out.chunks)}\`);
+  };
+  // Four failures, then the 30 s window passes: the count starts over.
+  for (let i = 0; i < 4; i += 1) await failOnce(\`k-a\${i}\`);
+  ctx.clock.advance(31);
+  await failOnce('k-a4');
+  assert.notEqual(ctx.redis.get('circuit:primary'), 'open', 'four failures, 31 s of quiet, then one more opened circuit:primary: the count must expire 30 s after it started');
+  ctx.clock.advance(31);
+  // Five failures, 5 s apart: the breaker opens at the fifth, for a full 30 s.
+  const first = calls(ctx, PRIMARY).length;
+  for (let i = 0; i < 5; i += 1) {
+    if (i === 4) {
+      const early = ctx.redis.get('circuit:primary');
+      assert.notEqual(early, 'open', \`after four retryable failures circuit:primary is already \${JSON.stringify(early)}: it opens at five\`);
+    }
+    await failOnce(\`k-\${i}\`);
+    if (i < 4) ctx.clock.advance(5);
   }
+  assert.equal(calls(ctx, PRIMARY).length - first, 5, \`five requests with the primary failing made \${calls(ctx, PRIMARY).length - first} primary attempts, expected 5\`);
   const state = ctx.redis.get('circuit:primary');
   assert.equal(state, 'open', \`after five retryable failures circuit:primary is \${JSON.stringify(state)}, expected 'open'\`);
   const ttl = Number(ctx.redis.ttl('circuit:primary'));
-  assert(0 < ttl && ttl <= 30, \`circuit:primary must expire within 30 s, its TTL is \${ttl}\`);
+  assert(28 <= ttl && ttl <= 30, \`circuit:primary must stay open for 30 s from the fifth failure, its TTL is \${ttl}\`);
   const before = calls(ctx, PRIMARY).length;
   let out = await run(ctx, m, 'k-open');
   assert.equal(calls(ctx, PRIMARY).length, before, 'while the breaker is open the primary must be skipped');
@@ -1001,6 +1065,7 @@ export async function check_fallback(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -1074,6 +1139,8 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.NoError(out.err, "after the primary timed out the fallback must serve the answer")
 	ctx.Equal(out.chunks, failoverTokens, "after the primary timed out the fallback must serve the answer")
 	ctx.Assert(len(primary) == 1 && len(failoverCalls(ctx, failoverFallback)) == 1, "expected one attempt on each provider, got %d on primary and %d on fallback", len(primary), len(failoverCalls(ctx, failoverFallback)))
+	fallback := failoverCalls(ctx, failoverFallback)[0]
+	ctx.Assert(fallback.HasDeadline() && 7500*time.Millisecond <= fallback.Timeout && fallback.Timeout <= 8500*time.Millisecond, "the fallback attempt, made after the primary used up its 8 s, carried a deadline of %v: every attempt carries its own full 8 s deadline, not what is left of a shared one", fallback.Timeout)
 }
 
 func CheckBounded(ctx *harness.Ctx) {
@@ -1089,41 +1156,77 @@ func CheckBounded(ctx *harness.Ctx) {
 
 func CheckRetryableAndIdempotent(ctx *harness.Ctx) {
 	failoverWorld(ctx, -1)
-	ctx.GRPC.Fail("StreamComplete", codes.InvalidArgument, "bad request", 1, failoverPrimary)
-	out := failoverRun(ctx, "k-1")
-	ctx.Assert(out.ended && out.err != nil, "INVALID_ARGUMENT from the primary must be returned to the caller at once")
-	ctx.Equal(len(failoverCalls(ctx, failoverFallback)), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried (the request itself is wrong); fallback attempts")
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.ResourceExhausted, codes.Internal, codes.NotFound} {
+		ctx.GRPC.Fail("StreamComplete", code, "refused", 1, failoverPrimary)
+		refused := failoverRun(ctx, "k-1")
+		ctx.Assert(refused.ended && refused.err != nil, "%v from the primary must be returned to the caller at once", code)
+		ctx.Equal(len(failoverCalls(ctx, failoverFallback)), 0, "%v is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on); fallback attempts", code)
+	}
 	state, _ := ctx.Redis.Get("circuit:primary")
-	ctx.Assert(state != "open", "a non-retryable failure must not count towards the breaker")
-	out = failoverRun(ctx, "k-7")
+	ctx.Equal(state, "", "a non-retryable failure must not count towards the breaker; circuit:primary")
+	out := failoverRun(ctx, "k-7")
 	ctx.NoError(out.err, "a healthy primary must serve the answer")
 	ctx.Equal(out.chunks, failoverTokens, "a healthy primary must serve the answer")
 	calls := failoverCalls(ctx, failoverPrimary)
 	md := calls[len(calls)-1].Metadata
 	ctx.Equal(md.Get("idempotency-key"), []string{"k-7"}, "the attempt carried metadata %v; idempotency-key", md)
+	ctx.GRPC.Fail("StreamComplete", codes.DeadlineExceeded, "deadline exceeded", 1, failoverPrimary)
+	out = failoverRun(ctx, "k-8")
+	ctx.Assert(out.err == nil && len(out.chunks) == len(failoverTokens), "DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer, got %q and %v", out.chunks, out.err)
+	fallbackCalls := failoverCalls(ctx, failoverFallback)
+	ctx.Assert(len(fallbackCalls) > 0, "DEADLINE_EXCEEDED from the primary is retryable: the fallback was never tried")
+	fallbackKey := fallbackCalls[len(fallbackCalls)-1].Metadata.Get("idempotency-key")
+	ctx.Assert(len(fallbackKey) > 0 && fallbackKey[0] == "k-8", "the fallback attempt carried idempotency-key %q, expected k-8 (every attempt carries the key)", fallbackKey)
 	before := len(failoverCalls(ctx, failoverPrimary))
 	out = failoverRun(ctx, "")
 	ctx.Assert(out.err != nil && len(failoverCalls(ctx, failoverPrimary)) == before, "without an idempotency key the call must be refused before any attempt")
 	ctx.GRPC.Stop(failoverPrimary)
+	pb.RegisterProviderServer(ctx.GRPC.Server(failoverPrimary), &failoverPeer{name: "primary", breakAfter: 0})
+	out = failoverRun(ctx, "k-10")
+	ctx.Assert(out.err == nil && len(out.chunks) == len(failoverTokens), "the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; got %q and %v", out.chunks, out.err)
+	ctx.GRPC.Stop(failoverPrimary)
 	pb.RegisterProviderServer(ctx.GRPC.Server(failoverPrimary), &failoverPeer{name: "primary", breakAfter: 2})
+	fallbackBefore := len(failoverCalls(ctx, failoverFallback))
 	out = failoverRun(ctx, "k-9")
 	ctx.Equal(out.chunks, failoverTokens[:2], "the caller must receive the two chunks the primary streamed before failing")
 	ctx.Assert(out.err != nil, "a failure after the first chunk must be returned: a retry would replay output the user already read")
-	ctx.Equal(len(failoverCalls(ctx, failoverFallback)), 0, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts")
+	ctx.Equal(len(failoverCalls(ctx, failoverFallback)), fallbackBefore, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts")
 }
 
 func CheckCircuitBreaker(ctx *harness.Ctx) {
 	failoverWorld(ctx, -1)
-	for i := range 5 {
+	failOnce := func(key string) {
 		ctx.GRPC.Fail("StreamComplete", codes.Unavailable, "primary restarting", 1, failoverPrimary)
-		out := failoverRun(ctx, "k-"+string(rune('0'+i)))
-		ctx.NoError(out.err, "attempt %d: the fallback must serve the answer while the primary fails", i+1)
-		ctx.Equal(out.chunks, failoverTokens, "attempt %d: the fallback must serve the answer while the primary fails", i+1)
+		out := failoverRun(ctx, key)
+		ctx.NoError(out.err, "%s: the fallback must serve the answer while the primary fails", key)
+		ctx.Equal(out.chunks, failoverTokens, "%s: the fallback must serve the answer while the primary fails", key)
 	}
+	// Four failures, then the 30 s window passes: the count starts over.
+	for i := range 4 {
+		failOnce(fmt.Sprintf("k-a%d", i))
+	}
+	ctx.Clock.Advance(31)
+	failOnce("k-a4")
+	quiet, _ := ctx.Redis.Get("circuit:primary")
+	ctx.Assert(quiet != "open", "four failures, 31 s of quiet, then one more opened circuit:primary: the count must expire 30 s after it started")
+	ctx.Clock.Advance(31)
+	// Five failures, 5 s apart: the breaker opens at the fifth, for a full 30 s.
+	first := len(failoverCalls(ctx, failoverPrimary))
+	for i := range 5 {
+		if i == 4 {
+			early, _ := ctx.Redis.Get("circuit:primary")
+			ctx.Assert(early != "open", "after four retryable failures circuit:primary is already %q: it opens at five", early)
+		}
+		failOnce(fmt.Sprintf("k-%d", i))
+		if i < 4 {
+			ctx.Clock.Advance(5)
+		}
+	}
+	ctx.Equal(len(failoverCalls(ctx, failoverPrimary))-first, 5, "five requests with the primary failing; primary attempts")
 	state, _ := ctx.Redis.Get("circuit:primary")
 	ctx.Equal(state, "open", "after five retryable failures circuit:primary")
 	ttl := ctx.Redis.TTL("circuit:primary")
-	ctx.Assert(0 < ttl && ttl <= 30, "circuit:primary must expire within 30 s, its TTL is %d", ttl)
+	ctx.Assert(28 <= ttl && ttl <= 30, "circuit:primary must stay open for 30 s from the fifth failure, its TTL is %d", ttl)
 	before := len(failoverCalls(ctx, failoverPrimary))
 	out := failoverRun(ctx, "k-open")
 	ctx.Equal(len(failoverCalls(ctx, failoverPrimary)), before, "while the breaker is open the primary must be skipped; primary attempts")
@@ -1146,8 +1249,10 @@ func CheckFallback(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <atomic>
 #include <exception>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -1169,7 +1274,7 @@ gateway::CompleteRequest failoverRequest() {
 // A model provider: streams the answer; with break_after >= 0 it fails UNAVAILABLE after that many chunks.
 class FailoverPeer final : public gateway::Provider::Service {
  public:
-  FailoverPeer(std::string name, int break_after) : name_(std::move(name)), break_after_(break_after) {}
+  FailoverPeer(std::string name, int break_after) : break_after_(break_after), name_(std::move(name)) {}
 
   grpc::Status StreamComplete(grpc::ServerContext*, const gateway::CompleteRequest*,
                               grpc::ServerWriter<gateway::Chunk>* srv) override {
@@ -1184,9 +1289,11 @@ class FailoverPeer final : public gateway::Provider::Service {
     return grpc::Status::OK;
   }
 
+  // Settable mid-check: the next streams fail UNAVAILABLE after this many chunks (-1: never).
+  std::atomic<int> break_after_;
+
  private:
   std::string name_;
-  int break_after_;
 };
 
 struct FailoverWorld {
@@ -1195,12 +1302,13 @@ struct FailoverWorld {
   explicit FailoverWorld(int primary_break_after) : primary("primary", primary_break_after) {}
 };
 
+FailoverWorld* gFailover = nullptr;
+
 void failoverWorld(harness::Ctx& ctx, int primary_break_after = -1) {
-  static FailoverWorld* w = nullptr;
-  delete w;
-  w = new FailoverWorld(primary_break_after);
-  ctx.GRPC.Server(kPrimary)->RegisterService(&w->primary);
-  ctx.GRPC.Server(kFallback)->RegisterService(&w->fallback);
+  delete gFailover;
+  gFailover = new FailoverWorld(primary_break_after);
+  ctx.GRPC.Server(kPrimary)->RegisterService(&gFailover->primary);
+  ctx.GRPC.Server(kFallback)->RegisterService(&gFailover->fallback);
 }
 
 struct FailoverOut {
@@ -1237,6 +1345,9 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(out.error.empty(), "after the primary timed out the fallback must serve the answer; the call threw %s", out.error);
   ctx.Equal(out.chunks, kFailoverTokens, "after the primary timed out the fallback must serve the answer");
   ctx.Assert(primary.size() == 1 && failoverCalls(ctx, kFallback) == 1, "expected one attempt on each provider, got %d on primary and %d on fallback", primary.size(), failoverCalls(ctx, kFallback));
+  const auto fallback = ctx.GRPC.CallsTo("StreamComplete", kFallback).front();
+  ctx.Assert(fallback.HasDeadline() && 7.5 <= fallback.TimeoutSeconds() && fallback.TimeoutSeconds() <= 8.5,
+             "the fallback attempt, made after the primary used up its 8 s, carried a deadline of %vs: every attempt carries its own full 8 s deadline, not what is left of a shared one", fallback.TimeoutSeconds());
 }
 
 void CheckBounded(harness::Ctx& ctx) {
@@ -1252,41 +1363,79 @@ void CheckBounded(harness::Ctx& ctx) {
 
 void CheckRetryableAndIdempotent(harness::Ctx& ctx) {
   failoverWorld(ctx);
-  ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::INVALID_ARGUMENT, "bad request", 1, kPrimary);
-  auto out = failoverRun(ctx, "k-1");
-  ctx.Assert(out.ended && !out.error.empty(), "INVALID_ARGUMENT from the primary must be thrown to the caller at once");
-  ctx.Equal(failoverCalls(ctx, kFallback), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried (the request itself is wrong); fallback attempts");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+      {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+  };
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.Fail("StreamComplete", code, "refused", 1, kPrimary);
+    const auto refused = failoverRun(ctx, "k-1");
+    ctx.Assert(refused.ended && !refused.error.empty(), "%s from the primary must be thrown to the caller at once", name);
+    ctx.Equal(failoverCalls(ctx, kFallback), 0, "%s is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on); fallback attempts", name);
+  }
   const auto state = ctx.Redis.Get("circuit:primary");
-  ctx.Assert(!state || *state != "open", "a non-retryable failure must not count towards the breaker");
-  out = failoverRun(ctx, "k-7");
+  ctx.Assert(!state, "a non-retryable failure must not count towards the breaker, circuit:primary is %q", state.value_or(""));
+  auto out = failoverRun(ctx, "k-7");
   ctx.Assert(out.error.empty(), "a healthy primary must serve the answer; the call threw %s", out.error);
   ctx.Equal(out.chunks, kFailoverTokens, "a healthy primary must serve the answer");
   const auto md = ctx.GRPC.CallsTo("StreamComplete", kPrimary).back().Metadata;
   std::vector<std::string> keys;
   for (auto [it, end] = md.equal_range("idempotency-key"); it != end; ++it) keys.push_back(it->second);
   ctx.Equal(keys, {"k-7"}, "the attempt carried metadata %v; idempotency-key", md);
+  ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1, kPrimary);
+  out = failoverRun(ctx, "k-8");
+  ctx.Assert(out.error.empty() && out.chunks.size() == kFailoverTokens.size(), "DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer; the call threw %q", out.error);
+  const auto fallbackCalls = ctx.GRPC.CallsTo("StreamComplete", kFallback);
+  ctx.Assert(!fallbackCalls.empty(), "DEADLINE_EXCEEDED from the primary is retryable: the fallback was never tried");
+  const auto fallbackMd = fallbackCalls.back().Metadata;
+  const auto fallbackKey = fallbackMd.find("idempotency-key");
+  ctx.Assert(fallbackKey != fallbackMd.end() && fallbackKey->second == "k-8", "the fallback attempt carried metadata %v, expected idempotency-key: k-8 (every attempt carries the key)", fallbackMd);
   const size_t before = failoverCalls(ctx, kPrimary);
   out = failoverRun(ctx, "");
   ctx.Assert(!out.error.empty() && failoverCalls(ctx, kPrimary) == before, "without an idempotency key the call must be refused before any attempt");
-  failoverWorld(ctx, 2);
+  gFailover->primary.break_after_ = 0;
+  out = failoverRun(ctx, "k-10");
+  ctx.Assert(out.error.empty() && out.chunks.size() == kFailoverTokens.size(), "the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; the call threw %q", out.error);
+  gFailover->primary.break_after_ = 2;
+  const size_t fallbackBefore = failoverCalls(ctx, kFallback);
   out = failoverRun(ctx, "k-9");
   ctx.Equal(out.chunks, std::vector<std::string>(kFailoverTokens.begin(), kFailoverTokens.begin() + 2), "the caller must receive the two chunks the primary streamed before failing");
   ctx.Assert(!out.error.empty(), "a failure after the first chunk must be thrown: a retry would replay output the user already read");
-  ctx.Equal(failoverCalls(ctx, kFallback), 0, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts");
+  ctx.Equal(failoverCalls(ctx, kFallback), fallbackBefore, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts");
 }
 
 void CheckCircuitBreaker(harness::Ctx& ctx) {
   failoverWorld(ctx);
-  for (int i = 0; i < 5; i++) {
+  auto failOnce = [&](const std::string& key) {
     ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::UNAVAILABLE, "primary restarting", 1, kPrimary);
-    const auto out = failoverRun(ctx, "k-" + std::to_string(i));
-    ctx.Assert(out.error.empty(), "attempt %d: the fallback must serve the answer while the primary fails; the call threw %s", i + 1, out.error);
-    ctx.Equal(out.chunks, kFailoverTokens, "attempt %d: the fallback must serve the answer while the primary fails", i + 1);
+    const auto out = failoverRun(ctx, key);
+    ctx.Assert(out.error.empty(), "%s: the fallback must serve the answer while the primary fails; the call threw %s", key, out.error);
+    ctx.Equal(out.chunks, kFailoverTokens, "%s: the fallback must serve the answer while the primary fails", key);
+  };
+  // Four failures, then the 30 s window passes: the count starts over.
+  for (int i = 0; i < 4; i++) failOnce("k-a" + std::to_string(i));
+  ctx.Clock.Advance(31);
+  failOnce("k-a4");
+  const auto quiet = ctx.Redis.Get("circuit:primary");
+  ctx.Assert(!quiet || *quiet != "open", "four failures, 31 s of quiet, then one more opened circuit:primary: the count must expire 30 s after it started");
+  ctx.Clock.Advance(31);
+  // Five failures, 5 s apart: the breaker opens at the fifth, for a full 30 s.
+  const size_t first = failoverCalls(ctx, kPrimary);
+  for (int i = 0; i < 5; i++) {
+    if (i == 4) {
+      const auto early = ctx.Redis.Get("circuit:primary");
+      ctx.Assert(!early || *early != "open", "after four retryable failures circuit:primary is already open: it opens at five");
+    }
+    failOnce("k-" + std::to_string(i));
+    if (i < 4) ctx.Clock.Advance(5);
   }
+  ctx.Equal(failoverCalls(ctx, kPrimary) - first, 5, "five requests with the primary failing; primary attempts");
   const auto state = ctx.Redis.Get("circuit:primary");
   ctx.Equal(state, "open", "after five retryable failures circuit:primary");
   const long long ttl = ctx.Redis.TTL("circuit:primary");
-  ctx.Assert(0 < ttl && ttl <= 30, "circuit:primary must expire within 30 s, its TTL is %d", ttl);
+  ctx.Assert(28 <= ttl && ttl <= 30, "circuit:primary must stay open for 30 s from the fifth failure, its TTL is %d", ttl);
   const size_t before = failoverCalls(ctx, kPrimary);
   auto out = failoverRun(ctx, "k-open");
   ctx.Equal(failoverCalls(ctx, kPrimary), before, "while the breaker is open the primary must be skipped; primary attempts");

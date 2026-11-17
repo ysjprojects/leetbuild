@@ -74,7 +74,7 @@ later does not reach the outbox.
       id: 'comment-fingerprint',
       title: 'A comment fingerprint, not the comment',
       detail:
-        'The payload carries `comment_fingerprint`, the SHA-256 hex of the comment, and no comment text: the topic is retained and copied to every consumer, so text written there outlives the row it came from.',
+        "The payload carries the row's ids, rating and attribution as stored, and `comment_fingerprint`, the SHA-256 hex of the comment's UTF-8 bytes exactly as written (accents and spaces included), and no comment text: the topic is retained and copied to every consumer, so text written there outlives the row it came from.",
       match: {
         python: {all: [/comment_fingerprint/, /sha256\(/], none: [/["']comment["']\s*:/]},
         typescript: {
@@ -103,7 +103,7 @@ later does not reach the outbox.
       id: 'outbox',
       title: 'A refused delivery goes to the outbox',
       detail:
-        "The event goes to `store.insert_outbox` from where the broker's answer arrives (the delivery callback, the rejected send, the returned write error); the starter wraps the enqueue in a `try`, which a refusal reported later never reaches.",
+        "The event, with its fingerprint and without the comment, goes to `store.insert_outbox` from where the broker's answer arrives (the delivery callback, the rejected send, the returned write error); the starter wraps the enqueue in a `try`, which a refusal reported later never reaches.",
       match: {
         python: {
           all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/],
@@ -543,6 +543,9 @@ import json
 
 TOPIC = "feedback.recorded"
 COMMENT = "The answer cited the 2023 refund policy"
+# Non-ASCII and a trailing space: the fingerprint is of the comment's exact UTF-8 bytes.
+ACCENTED = "Très utile, merci 👍 "
+FIELDS = ("feedback_id", "tenant", "request_id", "rating", "model_version", "prompt_version", "route")
 
 
 def _row(feedback_id="fb-1", tenant="t-acme", request_id="req-1", rating=1, comment=COMMENT):
@@ -576,19 +579,22 @@ def check_tenant_key(ctx):
 
 def check_comment_fingerprint(ctx):
     m = ctx.load("events")
-    m.publish_recorded(_row("fb-1"))
-    m.publish_recorded(_row("fb-2", request_id="req-2", rating=-1))
+    rows = [_row("fb-1"), _row("fb-2", request_id="req-2", rating=-1, comment=ACCENTED)]
+    for row in rows:
+        m.publish_recorded(row)
     _settle(m)
     values = ctx.kafka.values(TOPIC)
     assert len(values) == 2, f"two rows produced {len(values)} records"
-    want = hashlib.sha256(COMMENT.encode("utf-8")).hexdigest()
-    for value in values:
-        assert b"refund policy" not in value, f"the event carries the comment text: {value!r}; the topic is retained and replicated"
+    for value, row in zip(values, rows):
+        assert b"refund policy" not in value and b"merci" not in value, f"the event carries the comment text: {value!r}; the topic is retained and replicated"
         event = json.loads(value)
         assert "comment" not in event, f"the event has a comment field: {event}"
-        assert event.get("comment_fingerprint") == want, f"comment_fingerprint must be the SHA-256 hex of the comment ({want}), got {event.get('comment_fingerprint')!r}"
-        missing = [f for f in ("feedback_id", "tenant", "request_id", "rating", "model_version", "prompt_version", "route") if f not in event]
+        want = hashlib.sha256(row["comment"].encode("utf-8")).hexdigest()
+        assert event.get("comment_fingerprint") == want, f"comment_fingerprint of {row['comment']!r} must be the SHA-256 hex of its UTF-8 bytes ({want}), got {event.get('comment_fingerprint')!r}"
+        missing = [f for f in FIELDS if f not in event]
         assert not missing, f"the event lacks {missing}: {event}"
+        wrong = {f: event[f] for f in FIELDS if event[f] != row[f]}
+        assert not wrong, f"the event for {row['feedback_id']} carries {wrong}, expected the row's values {({f: row[f] for f in wrong})}"
 
 
 def check_acks_all(ctx):
@@ -611,6 +617,8 @@ def check_outbox(ctx):
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the broker refused one produce and the outbox holds {len(rows)} rows: the refusal arrives in the delivery report, which must write the outbox row"
     assert rows[0].get("feedback_id") == "fb-1" and rows[0].get("rating") == 1, f"the outbox row must be the event, got {rows[0]}"
+    assert "comment" not in rows[0] and "refund policy" not in json.dumps(rows[0]), f"the outbox row carries the comment text: {rows[0]}; it holds the event, with the fingerprint"
+    assert rows[0].get("comment_fingerprint") == hashlib.sha256(COMMENT.encode("utf-8")).hexdigest(), f"the outbox row must be the event with its comment_fingerprint, got {rows[0]}"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
     m.publish_recorded(_row("fb-2", request_id="req-2"))
     _settle(m)
@@ -620,9 +628,12 @@ def check_outbox(ctx):
 
 const TOPIC = 'feedback.recorded';
 const COMMENT = 'The answer cited the 2023 refund policy';
+// Non-ASCII and a trailing space: the fingerprint is of the comment's exact UTF-8 bytes.
+const ACCENTED = 'Très utile, merci 👍 ';
+const FIELDS = ['feedback_id', 'tenant', 'request_id', 'rating', 'model_version', 'prompt_version', 'route'];
 
-const row = (feedbackId = 'fb-1', tenant = 't-acme', requestId = 'req-1', rating = 1) => ({
-  feedback_id: feedbackId, tenant, user_id: 'u-1', request_id: requestId, rating, comment: COMMENT,
+const row = (feedbackId = 'fb-1', tenant = 't-acme', requestId = 'req-1', rating = 1, comment = COMMENT) => ({
+  feedback_id: feedbackId, tenant, user_id: 'u-1', request_id: requestId, rating, comment,
   model_version: 'support-llm-2026-09', prompt_version: 'triage-v4', route: 'primary',
 });
 
@@ -649,20 +660,23 @@ export async function check_tenant_key(ctx) {
 
 export async function check_comment_fingerprint(ctx) {
   const m = ctx.load('events');
-  await m.publishRecorded(row('fb-1'));
-  await m.publishRecorded(row('fb-2', 't-acme', 'req-2', -1));
+  const rows = [row('fb-1'), row('fb-2', 't-acme', 'req-2', -1, ACCENTED)];
+  for (const r of rows) await m.publishRecorded(r);
   await settle();
   const values = ctx.kafka.values(TOPIC);
   assert.equal(values.length, 2, \`two rows produced \${values.length} records\`);
-  const want = createHash('sha256').update(COMMENT).digest('hex');
-  for (const value of values) {
-    assert(!value.includes('refund policy'), \`the event carries the comment text: \${value}; the topic is retained and replicated\`);
+  values.forEach((value, i) => {
+    const sent = rows[i];
+    assert(!value.includes('refund policy') && !value.includes('merci'), \`the event carries the comment text: \${value}; the topic is retained and replicated\`);
     const event = JSON.parse(value);
     assert(!('comment' in event), \`the event has a comment field: \${value}\`);
-    assert.equal(event.comment_fingerprint, want, \`comment_fingerprint must be the SHA-256 hex of the comment (\${want}), got \${JSON.stringify(event.comment_fingerprint)}\`);
-    const missing = ['feedback_id', 'tenant', 'request_id', 'rating', 'model_version', 'prompt_version', 'route'].filter(f => !(f in event));
+    const want = createHash('sha256').update(sent.comment, 'utf8').digest('hex');
+    assert.equal(event.comment_fingerprint, want, \`comment_fingerprint of \${JSON.stringify(sent.comment)} must be the SHA-256 hex of its UTF-8 bytes (\${want}), got \${JSON.stringify(event.comment_fingerprint)}\`);
+    const missing = FIELDS.filter(f => !(f in event));
     assert.equal(missing.length, 0, \`the event lacks \${JSON.stringify(missing)}: \${value}\`);
-  }
+    const wrong = FIELDS.filter(f => event[f] !== sent[f]);
+    assert.equal(wrong.length, 0, \`the event for \${sent.feedback_id} carries \${JSON.stringify(wrong.map(f => [f, event[f]]))}, expected the row's values \${JSON.stringify(wrong.map(f => [f, sent[f]]))}\`);
+  });
 }
 
 export async function check_acks_all(ctx) {
@@ -686,6 +700,8 @@ export async function check_outbox(ctx) {
   const rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the broker refused one produce and the outbox holds \${rows.length} rows: the refusal arrives as the rejected send, which must write the outbox row\`);
   assert(rows[0].feedback_id === 'fb-1' && rows[0].rating === 1, \`the outbox row must be the event, got \${JSON.stringify(rows[0])}\`);
+  assert(!('comment' in rows[0]) && !JSON.stringify(rows[0]).includes('refund policy'), \`the outbox row carries the comment text: \${JSON.stringify(rows[0])}; it holds the event, with the fingerprint\`);
+  assert.equal(rows[0].comment_fingerprint, createHash('sha256').update(COMMENT, 'utf8').digest('hex'), \`the outbox row must be the event with its comment_fingerprint, got \${JSON.stringify(rows[0])}\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
   await m.publishRecorded(row('fb-2', 't-acme', 'req-2'));
   await settle();
@@ -699,6 +715,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"feedback/store"
@@ -747,23 +764,33 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckCommentFingerprint(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRow("fb-1", "t-acme", "req-1", 1))
-	eventsPublish(ctx, eventsRow("fb-2", "t-acme", "req-2", -1))
+	rows := []store.Feedback{eventsRow("fb-1", "t-acme", "req-1", 1), eventsRow("fb-2", "t-acme", "req-2", -1)}
+	// Non-ASCII and a trailing space: the fingerprint is of the comment's exact UTF-8 bytes.
+	rows[1].Comment = "Très utile, merci 👍 "
+	for _, row := range rows {
+		eventsPublish(ctx, row)
+	}
 	ctx.Settle()
 	values := ctx.Kafka.Values(topic)
 	ctx.Equal(len(values), 2, "two rows must produce two records; the records")
-	sum := sha256.Sum256([]byte(eventsComment))
-	want := hex.EncodeToString(sum[:])
-	for _, value := range values {
-		ctx.Assert(!strings.Contains(value, "refund policy"), "the event carries the comment text: %s; the topic is retained and replicated", value)
+	for i, value := range values {
+		if i >= len(rows) {
+			break
+		}
+		row := rows[i]
+		ctx.Assert(!strings.Contains(value, "refund policy") && !strings.Contains(value, "merci"), "the event carries the comment text: %s; the topic is retained and replicated", value)
 		var event map[string]any
 		ctx.NoError(json.Unmarshal([]byte(value), &event), "the event is JSON: %s", value)
 		_, has := event["comment"]
 		ctx.Assert(!has, "the event has a comment field: %s", value)
-		ctx.Equal(event["comment_fingerprint"], want, "comment_fingerprint must be the SHA-256 hex of the comment")
+		sum := sha256.Sum256([]byte(row.Comment))
+		ctx.Equal(event["comment_fingerprint"], hex.EncodeToString(sum[:]), "comment_fingerprint must be the SHA-256 hex of the comment's UTF-8 bytes (%q)", row.Comment)
+		want := map[string]any{"feedback_id": row.FeedbackID, "tenant": row.Tenant, "request_id": row.RequestID, "rating": float64(row.Rating),
+			"model_version": row.ModelVersion, "prompt_version": row.PromptVersion, "route": row.Route}
 		for _, f := range []string{"feedback_id", "tenant", "request_id", "rating", "model_version", "prompt_version", "route"} {
 			_, ok := event[f]
 			ctx.Assert(ok, "the event lacks %s: %s", f, value)
+			ctx.Equal(event[f], want[f], "the event for %s must carry the row's %s", row.FeedbackID, f)
 		}
 	}
 }
@@ -790,6 +817,10 @@ func CheckOutbox(ctx *harness.Ctx) {
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: the returned error must write the outbox row; outbox rows")
 	ctx.Assert(rows[0]["feedback_id"] == "fb-1" && rows[0]["rating"] == float64(1), "the outbox row must be the event, got %v", rows[0])
+	_, hasComment := rows[0]["comment"]
+	ctx.Assert(!hasComment && !strings.Contains(fmt.Sprint(rows[0]), "refund policy"), "the outbox row carries the comment text: %v; it holds the event, with the fingerprint", rows[0])
+	sum := sha256.Sum256([]byte(eventsComment))
+	ctx.Equal(rows[0]["comment_fingerprint"], hex.EncodeToString(sum[:]), "the outbox row must be the event with its comment_fingerprint")
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "nothing reached the topic for the refused produce; records")
 	eventsPublish(ctx, eventsRow("fb-2", "t-acme", "req-2", 1))
 	ctx.Settle()
@@ -847,19 +878,27 @@ void CheckTenantKey(harness::Ctx& ctx) {
 }
 
 void CheckCommentFingerprint(harness::Ctx& ctx) {
-  publish_recorded(eventsRow("fb-1", "t-acme", "req-1", 1));
-  publish_recorded(eventsRow("fb-2", "t-acme", "req-2", -1));
+  std::vector<store::Feedback> rows = {eventsRow("fb-1", "t-acme", "req-1", 1), eventsRow("fb-2", "t-acme", "req-2", -1)};
+  // Non-ASCII and a trailing space: the fingerprint is of the comment's exact UTF-8 bytes.
+  rows[1].comment = "Très utile, merci 👍 ";
+  for (const auto& row : rows) publish_recorded(row);
   settle(ctx);
   const auto values = ctx.Kafka.Values(kTopic);
   ctx.Equal(values.size(), 2, "two rows must produce two records; the records");
-  const std::string want = sha256_hex(kComment);
-  for (const auto& value : values) {
-    ctx.Assert(value.find("refund policy") == std::string::npos, "the event carries the comment text: %s; the topic is retained and replicated", value);
+  for (size_t i = 0; i < values.size() && i < rows.size(); i++) {
+    const auto& value = values[i];
+    const auto& row = rows[i];
+    ctx.Assert(value.find("refund policy") == std::string::npos && value.find("merci") == std::string::npos, "the event carries the comment text: %s; the topic is retained and replicated", value);
     const auto event = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(event.is_object() && !event.contains("comment"), "the event has a comment field: %s", value);
-    ctx.Equal(event.value("comment_fingerprint", ""), want, "comment_fingerprint must be the SHA-256 hex of the comment");
+    ctx.Equal(event.value("comment_fingerprint", ""), sha256_hex(row.comment), "comment_fingerprint must be the SHA-256 hex of the comment's UTF-8 bytes (%q)", row.comment);
+    const nlohmann::json want = {{"feedback_id", row.feedback_id},     {"tenant", row.tenant},
+                                 {"request_id", row.request_id},       {"rating", row.rating},
+                                 {"model_version", row.model_version}, {"prompt_version", row.prompt_version},
+                                 {"route", row.route}};
     for (const char* f : {"feedback_id", "tenant", "request_id", "rating", "model_version", "prompt_version", "route"}) {
       ctx.Assert(event.contains(f), "the event lacks %s: %s", f, value);
+      ctx.Assert(event.at(f) == want.at(f), "the event for %s carries %s %s, expected the row's %s", row.feedback_id, f, event.at(f).dump(), want.at(f).dump());
     }
   }
 }
@@ -884,6 +923,8 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(rows.size(), 1, "the broker refused one produce: the delivery report (dr_cb) must write the outbox row; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].is_object() && rows[0].value("feedback_id", "") == "fb-1" && rows[0].value("rating", 0) == 1,
              "the outbox row must be the event, got %v", rows.empty() ? nlohmann::json() : rows[0]);
+  ctx.Assert(!rows[0].contains("comment") && rows[0].dump().find("refund policy") == std::string::npos, "the outbox row carries the comment text: %v; it holds the event, with the fingerprint", rows[0]);
+  ctx.Equal(rows[0].value("comment_fingerprint", ""), sha256_hex(kComment), "the outbox row must be the event with its comment_fingerprint");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused produce; records");
   publish_recorded(eventsRow("fb-2", "t-acme", "req-2", 1));
   settle(ctx);

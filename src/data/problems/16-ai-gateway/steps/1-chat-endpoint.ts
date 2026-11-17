@@ -20,13 +20,14 @@ export const chatEndpointStep: Step = {
 that hangs and takes every worker with it, token counts billing cannot reconcile with the
 provider's invoice, and a prompt that leaks into a log line.
 
-- An empty \`messages\`, a role outside \`system\` / \`user\` / \`assistant\`, an estimated input over
-  **MAX_INPUT_TOKENS = 8192** (\`ceil(characters / 4)\`), or \`max_tokens\` outside **1…4096** answers
-  **400** and makes no provider call.
-- The \`Complete\` call carries an **8 s deadline**. \`DEADLINE_EXCEEDED\` becomes **504**; any other
-  provider failure becomes **502**.
+- An empty \`messages\`, a role outside \`system\` / \`user\` / \`assistant\` in any message, an estimated
+  input over **MAX_INPUT_TOKENS = 8192** (\`ceil(characters / 4)\` over every message's content), or
+  \`max_tokens\` outside **1…4096** answers **400** and makes no provider call.
+- The \`Complete\` call carries the request's model, every message in order and its \`max_tokens\`,
+  and an **8 s deadline**. \`DEADLINE_EXCEEDED\` becomes **504**; any other provider failure
+  becomes **502**.
 - \`usage\` is what the provider reported, not an estimate of the text; \`id\` is a fresh request id.
-- Neither the response nor a log line carries the messages.`,
+- Neither a response (a 200, a 400 or a 502) nor a log line carries the messages.`,
   sequence: {
     participants: ['Client', 'gateway', 'Provider'],
     messages: [
@@ -49,7 +50,7 @@ provider's invoice, and a prompt that leaks into a log line.
       id: 'route',
       title: 'Handles POST /v1/chat behind the bearer token',
       detail:
-        'A handler is registered for `POST /v1/chat`; it authenticates the tenant through the provided `authenticate` and answers JSON.',
+        'A handler is registered for `POST /v1/chat`; it authenticates the tenant through the provided `authenticate`, answers JSON, and its `Complete` request carries the model, every message in order and the `max_tokens` the client sent.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/chat["']/, /authenticate\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/chat['"]/, /authenticate\(/]},
@@ -62,7 +63,7 @@ provider's invoice, and a prompt that leaks into a log line.
       id: 'validate',
       title: 'Rejects bad requests with 400 before the provider call',
       detail:
-        'Empty `messages`, an unknown role, more than `MAX_INPUT_TOKENS` (ceil(chars / 4)) and `max_tokens` outside 1…4096 answer 400 before `Complete` is called: the input estimate and the limit comparison come before the call site.',
+        'Empty `messages`, an unknown role in any message, more than `MAX_INPUT_TOKENS` (ceil(chars / 4) summed over every message, one character over included) and `max_tokens` outside 1…4096 answer 400 before `Complete` is called; requests exactly at the limits are served. The input estimate and the limit comparison come before the call site.',
       match: {
         python: {
           all: [/>\s*MAX_INPUT_TOKENS/, /MAX_OUTPUT_TOKENS/, /\b400\b/],
@@ -90,7 +91,7 @@ provider's invoice, and a prompt that leaks into a log line.
       id: 'deadline',
       title: 'The provider call has an 8 s deadline and maps failures',
       detail:
-        'The `Complete` call carries the 8 second deadline; `DEADLINE_EXCEEDED` is answered 504 and every other provider failure 502. Without the deadline one hung provider pins a worker for good.',
+        'The `Complete` call carries the 8 second deadline; `DEADLINE_EXCEEDED` (the deadline expiring or the provider reporting it) is answered 504 and every other provider failure 502, without a retry. Without the deadline one hung provider pins a worker for good.',
       match: {
         python: {all: [/\.Complete\([\s\S]{0,300}?timeout\s*=/, /DEADLINE_EXCEEDED/, /\b504\b/, /\b502\b/]},
         typescript: {all: [/\.Complete\([\s\S]{0,400}?deadline\s*:/, /DEADLINE_EXCEEDED/, /\b504\b/, /\b502\b/]},
@@ -145,7 +146,7 @@ provider's invoice, and a prompt that leaks into a log line.
       id: 'no-prompt-echo',
       title: 'Neither the answer nor a log line carries the messages',
       detail:
-        'The response holds the completion and the usage only; nothing prints or logs the body, the messages or their content. A prompt in a log file is customer data in a place with no access control.',
+        'The response holds the completion and the usage only; nothing prints or logs the body, the messages or their content, on success, on a 400 or on a provider failure, and no error answer echoes them. A prompt in a log file is customer data in a place with no access control.',
       match: {
         python: {
           none: [
@@ -1025,13 +1026,18 @@ ANSWER = "The capital of France is Paris."
 class Providers(providers_pb2_grpc.ProviderServicer):
     """The model provider: a fixed answer, usage numbers a text estimate cannot reproduce."""
 
+    def __init__(self):
+        self.requests = []
+
     def Complete(self, request, context):
+        self.requests.append(request)
         chars = sum(len(m.content) for m in request.messages)
         return providers_pb2.CompleteReply(content=ANSWER, usage=providers_pb2.Usage(input_tokens=chars // 4 + 11, output_tokens=42))
 
 
 def _gateway(ctx):
-    ctx.grpc.serve(providers_pb2_grpc.add_ProviderServicer_to_server, Providers())
+    ctx.provider = Providers()
+    ctx.grpc.serve(providers_pb2_grpc.add_ProviderServicer_to_server, ctx.provider)
     return ctx.load("chat_api")
 
 
@@ -1055,6 +1061,12 @@ async def check_route(ctx):
     assert len(ctx.grpc.calls_to("Complete")) == 1, f"one chat made {len(ctx.grpc.calls_to('Complete'))} Complete calls, expected one"
     anonymous = await _chat(ctx, m, _body(), headers={})
     assert anonymous.status_code == 401, f"a request without a bearer token answered {anonymous.status_code}, expected 401"
+    sent = [{"role": "system", "content": "Answer in one word."}, {"role": "user", "content": "Capital of Peru?"}]
+    r = await _chat(ctx, m, {"model": "gpt-4o", "messages": sent, "max_tokens": 32})
+    assert r.status_code == 200, f"a chat with a system message answered {r.status_code}: {r.text}"
+    got = ctx.provider.requests[-1]
+    seen = {"model": got.model, "messages": [{"role": x.role, "content": x.content} for x in got.messages], "max_tokens": got.max_tokens}
+    assert seen == {"model": "gpt-4o", "messages": sent, "max_tokens": 32}, f"Complete must carry the request's model, every message in order and its max_tokens; the provider received {seen}"
 
 
 async def check_validate(ctx):
@@ -1062,8 +1074,12 @@ async def check_validate(ctx):
     bad = [
         ("an empty messages list", _body(messages=[])),
         ("an unknown role", _body(role="operator")),
+        ("an unknown role in a later message", _body(messages=[{"role": "user", "content": "hi"}, {"role": "tool", "content": "ok"}])),
         ("an input over 8192 tokens", _body(content="x" * (8192 * 4 + 4))),
+        ("an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", _body(content="x" * (8192 * 4 + 1))),
+        ("an input over 8192 tokens across two messages", _body(messages=[{"role": "system", "content": "x" * (4096 * 4)}, {"role": "user", "content": "x" * (4096 * 4 + 1)}])),
         ("max_tokens 0", _body(max_tokens=0)),
+        ("max_tokens 4097", _body(max_tokens=4097)),
         ("max_tokens 5000", _body(max_tokens=5000)),
     ]
     for what, body in bad:
@@ -1073,6 +1089,8 @@ async def check_validate(ctx):
         assert calls == 0, f"{what} was answered 400 but the provider was called ({calls} Complete call(s) so far): validate before the paid call"
     ok = await _chat(ctx, m, _body(content="x" * 8192 * 4, max_tokens=4096))
     assert ok.status_code == 200, f"a request at the limits (8192 input tokens, max_tokens 4096) answered {ok.status_code}: {ok.text}"
+    split = await _chat(ctx, m, _body(messages=[{"role": "system", "content": "x" * (4096 * 4)}, {"role": "assistant", "content": "x" * (4096 * 4)}], max_tokens=1))
+    assert split.status_code == 200, f"a request at the limits across two messages (8192 input tokens, max_tokens 1) answered {split.status_code}: {split.text}"
 
 
 async def check_deadline(ctx):
@@ -1092,7 +1110,13 @@ async def check_deadline(ctx):
     ctx.grpc.fail("Complete", grpc.StatusCode.RESOURCE_EXHAUSTED, "rate limited", times=1)
     limited = await _chat(ctx, m, _body())
     assert limited.status_code == 502, f"RESOURCE_EXHAUSTED from the provider answered {limited.status_code}, expected 502"
-    assert len(ctx.grpc.calls_to("Complete")) == 4, f"the four requests made {len(ctx.grpc.calls_to('Complete'))} Complete calls: the gateway must not retry on the client's behalf"
+    ctx.grpc.fail("Complete", grpc.StatusCode.INVALID_ARGUMENT, "unknown model", times=1)
+    refused = await _chat(ctx, m, _body())
+    assert refused.status_code == 502, f"INVALID_ARGUMENT from the provider answered {refused.status_code}, expected 502"
+    ctx.grpc.fail("Complete", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline exceeded", times=1)
+    expired = await _chat(ctx, m, _body())
+    assert expired.status_code == 504, f"DEADLINE_EXCEEDED reported by the provider answered {expired.status_code}, expected 504"
+    assert len(ctx.grpc.calls_to("Complete")) == 6, f"the six requests made {len(ctx.grpc.calls_to('Complete'))} Complete calls: the gateway must not retry on the client's behalf"
 
 
 async def check_usage(ctx):
@@ -1115,11 +1139,19 @@ async def check_no_prompt_echo(ctx):
     try:
         with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
             r = await _chat(ctx, m, _body(content=CANARY))
+            rejected = await _chat(ctx, m, _body(messages=[{"role": "user", "content": CANARY}, {"role": "operator", "content": CANARY}]))
+            ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, "provider restarting", times=1)
+            try:
+                failed = await _chat(ctx, m, _body(content=CANARY))
+            except Exception:  # an unhandled provider failure is the deadline check's finding, not this one's
+                failed = None
     finally:
         logging.getLogger().removeHandler(handler)
     assert r.status_code == 200, f"POST /v1/chat answered {r.status_code}: {r.text}"
     assert "CANARY-7731" not in r.text, f"the answer echoes the prompt: {r.text}"
-    assert "CANARY-7731" not in captured.getvalue(), f"the prompt was printed or logged: {captured.getvalue().strip()!r}"
+    assert "CANARY-7731" not in captured.getvalue(), f"the prompt was printed or logged (on success, on a 400 or on a provider failure): {captured.getvalue().strip()!r}"
+    for what, answer in (("the 400 for an unknown role", rejected), ("the answer to a failed provider call", failed)):
+        assert answer is None or "CANARY-7731" not in answer.text, f"{what} echoes the prompt: {answer.text}"
 `,
     typescript: `const AUTH = {Authorization: 'Bearer acme'};
 const CANARY = 'CANARY-7731 my account number is 4111';
@@ -1128,14 +1160,16 @@ const ANSWER = 'The capital of France is Paris.';
 /** The model provider: a fixed answer, usage numbers a text estimate cannot reproduce. */
 function gateway(ctx) {
   const pkg = ctx.proto('providers.proto');
+  const requests: {model: string; messages: {role: string; content: string}[]; max_tokens: number}[] = [];
   ctx.grpc.serve(pkg.gateway.Provider.service, {
     Complete(call, callback) {
+      requests.push(call.request);
       const chars = call.request.messages.reduce((n, m) => n + m.content.length, 0);
       callback(null, {content: ANSWER, usage: {input_tokens: Math.floor(chars / 4) + 11, output_tokens: 42}});
     },
   });
   const m = ctx.load('chat_api');
-  return {m, c: ctx.client(m.app)};
+  return {m, c: ctx.client(m.app), requests};
 }
 
 const body = (o: {content?: string; role?: string; max_tokens?: number; messages?: unknown[]} = {}) => ({
@@ -1145,7 +1179,7 @@ const body = (o: {content?: string; role?: string; max_tokens?: number; messages
 });
 
 export async function check_route(ctx) {
-  const {c} = gateway(ctx);
+  const {c, requests} = gateway(ctx);
   const r = await c.post('/v1/chat', {body: body(), headers: AUTH});
   assert.equal(r.status, 200, \`POST /v1/chat answered \${r.status}: \${r.text}\`);
   assert((r.headers['content-type'] ?? '').startsWith('application/json'), \`the answer must be JSON, got Content-Type \${JSON.stringify(r.headers['content-type'])}\`);
@@ -1155,6 +1189,12 @@ export async function check_route(ctx) {
   assert.equal(ctx.grpc.callsTo('Complete').length, 1, \`one chat made \${ctx.grpc.callsTo('Complete').length} Complete calls, expected one\`);
   const anonymous = await c.post('/v1/chat', {body: body()});
   assert.equal(anonymous.status, 401, \`a request without a bearer token answered \${anonymous.status}, expected 401\`);
+  const sent = [{role: 'system', content: 'Answer in one word.'}, {role: 'user', content: 'Capital of Peru?'}];
+  const peru = await c.post('/v1/chat', {body: {model: 'gpt-4o', messages: sent, max_tokens: 32}, headers: AUTH});
+  assert.equal(peru.status, 200, \`a chat with a system message answered \${peru.status}: \${peru.text}\`);
+  const got = requests.at(-1);
+  const seen = {model: got?.model, messages: (got?.messages ?? []).map(x => ({role: x.role, content: x.content})), max_tokens: got?.max_tokens};
+  assert.deepStrictEqual(seen, {model: 'gpt-4o', messages: sent, max_tokens: 32}, \`Complete must carry the request's model, every message in order and its max_tokens; the provider received \${JSON.stringify(seen)}\`);
 }
 
 export async function check_validate(ctx) {
@@ -1162,8 +1202,12 @@ export async function check_validate(ctx) {
   const bad: [string, unknown][] = [
     ['an empty messages list', body({messages: []})],
     ['an unknown role', body({role: 'operator'})],
+    ['an unknown role in a later message', body({messages: [{role: 'user', content: 'hi'}, {role: 'tool', content: 'ok'}]})],
     ['an input over 8192 tokens', body({content: 'x'.repeat(8192 * 4 + 4)})],
+    ['an input one character over 8192 tokens (ceil(32769 / 4) = 8193)', body({content: 'x'.repeat(8192 * 4 + 1)})],
+    ['an input over 8192 tokens across two messages', body({messages: [{role: 'system', content: 'x'.repeat(4096 * 4)}, {role: 'user', content: 'x'.repeat(4096 * 4 + 1)}]})],
     ['max_tokens 0', body({max_tokens: 0})],
+    ['max_tokens 4097', body({max_tokens: 4097})],
     ['max_tokens 5000', body({max_tokens: 5000})],
   ];
   for (const [what, b] of bad) {
@@ -1174,6 +1218,8 @@ export async function check_validate(ctx) {
   }
   const ok = await c.post('/v1/chat', {body: body({content: 'x'.repeat(8192 * 4), max_tokens: 4096}), headers: AUTH});
   assert.equal(ok.status, 200, \`a request at the limits (8192 input tokens, max_tokens 4096) answered \${ok.status}: \${ok.text}\`);
+  const split = await c.post('/v1/chat', {body: body({messages: [{role: 'system', content: 'x'.repeat(4096 * 4)}, {role: 'assistant', content: 'x'.repeat(4096 * 4)}], max_tokens: 1}), headers: AUTH});
+  assert.equal(split.status, 200, \`a request at the limits across two messages (8192 input tokens, max_tokens 1) answered \${split.status}: \${split.text}\`);
 }
 
 export async function check_deadline(ctx) {
@@ -1193,7 +1239,13 @@ export async function check_deadline(ctx) {
   ctx.grpc.fail('Complete', ctx.grpc.status.RESOURCE_EXHAUSTED, 'rate limited', 1);
   const limited = await c.post('/v1/chat', {body: body(), headers: AUTH});
   assert.equal(limited.status, 502, \`RESOURCE_EXHAUSTED from the provider answered \${limited.status}, expected 502\`);
-  assert.equal(ctx.grpc.callsTo('Complete').length, 4, \`the four requests made \${ctx.grpc.callsTo('Complete').length} Complete calls: the gateway must not retry on the client's behalf\`);
+  ctx.grpc.fail('Complete', ctx.grpc.status.INVALID_ARGUMENT, 'unknown model', 1);
+  const refused = await c.post('/v1/chat', {body: body(), headers: AUTH});
+  assert.equal(refused.status, 502, \`INVALID_ARGUMENT from the provider answered \${refused.status}, expected 502\`);
+  ctx.grpc.fail('Complete', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline exceeded', 1);
+  const expired = await c.post('/v1/chat', {body: body(), headers: AUTH});
+  assert.equal(expired.status, 504, \`DEADLINE_EXCEEDED reported by the provider answered \${expired.status}, expected 504\`);
+  assert.equal(ctx.grpc.callsTo('Complete').length, 6, \`the six requests made \${ctx.grpc.callsTo('Complete').length} Complete calls: the gateway must not retry on the client's behalf\`);
 }
 
 export async function check_usage(ctx) {
@@ -1213,16 +1265,22 @@ export async function check_no_prompt_echo(ctx) {
   const prior = {log: console.log, info: console.info, debug: console.debug, warn: console.warn, error: console.error};
   const capture = (...args: unknown[]) => void logged.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
   console.log = console.info = console.debug = console.warn = console.error = capture;
-  let r;
+  let r, rejected, failed;
   try {
     r = await c.post('/v1/chat', {body: body({content: CANARY}), headers: AUTH});
+    rejected = await c.post('/v1/chat', {body: body({messages: [{role: 'user', content: CANARY}, {role: 'operator', content: CANARY}]}), headers: AUTH});
+    ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, 'provider restarting', 1);
+    failed = await c.post('/v1/chat', {body: body({content: CANARY}), headers: AUTH});
   } finally {
     Object.assign(console, prior);
   }
   assert.equal(r.status, 200, \`POST /v1/chat answered \${r.status}: \${r.text}\`);
   assert(!r.text.includes('CANARY-7731'), \`the answer echoes the prompt: \${r.text}\`);
   const leak = logged.find(l => l.includes('CANARY-7731'));
-  assert(leak === undefined, \`the prompt was printed or logged: \${JSON.stringify(leak)}\`);
+  assert(leak === undefined, \`the prompt was printed or logged (on success, on a 400 or on a provider failure): \${JSON.stringify(leak)}\`);
+  for (const [what, answer] of [['the 400 for an unknown role', rejected], ['the answer to a failed provider call', failed]]) {
+    assert(!answer.text.includes('CANARY-7731'), \`\${what} echoes the prompt: \${answer.text}\`);
+  }
 }
 `,
     go: `package main
@@ -1230,6 +1288,7 @@ export async function check_no_prompt_echo(ctx) {
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -1251,9 +1310,11 @@ const (
 // providerPeer is the model provider: a fixed answer, usage numbers a text estimate cannot reproduce.
 type providerPeer struct {
 	pb.UnimplementedProviderServer
+	requests []*pb.CompleteRequest
 }
 
-func (providerPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (p *providerPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+	p.requests = append(p.requests, req)
 	chars := 0
 	for _, m := range req.GetMessages() {
 		chars += len(m.GetContent())
@@ -1261,8 +1322,11 @@ func (providerPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Co
 	return &pb.CompleteReply{Content: chatAnswer, Usage: &pb.Usage{InputTokens: int32(chars/4 + 11), OutputTokens: 42}}, nil
 }
 
+var chatPeer *providerPeer
+
 func chatGateway(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterProviderServer(ctx.GRPC.Server(""), &providerPeer{})
+	chatPeer = &providerPeer{}
+	pb.RegisterProviderServer(ctx.GRPC.Server(""), chatPeer)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -1293,6 +1357,19 @@ func CheckRoute(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 1, "one chat must make exactly one Complete call; the calls made")
 	anonymous := c.Post("/v1/chat", chatOK())
 	ctx.Equal(anonymous.Status, 401, "a request without a bearer token")
+	sent := []map[string]any{{"role": "system", "content": "Answer in one word."}, {"role": "user", "content": "Capital of Peru?"}}
+	peru := c.Post("/v1/chat", chatBody{Model: "gpt-4o", Messages: sent, MaxTokens: 32}, "Authorization", "Bearer acme")
+	ctx.Equal(peru.Status, 200, "a chat with a system message (%s)", peru.Text())
+	seen := "none"
+	if n := len(chatPeer.requests); n > 0 {
+		got := chatPeer.requests[n-1]
+		parts := []string{}
+		for _, m := range got.GetMessages() {
+			parts = append(parts, m.GetRole()+":"+m.GetContent())
+		}
+		seen = fmt.Sprintf("model=%s messages=%v max_tokens=%d", got.GetModel(), parts, got.GetMaxTokens())
+	}
+	ctx.Equal(seen, "model=gpt-4o messages=[system:Answer in one word. user:Capital of Peru?] max_tokens=32", "Complete must carry the request's model, every message in order and its max_tokens; the provider received")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
@@ -1303,8 +1380,12 @@ func CheckValidate(ctx *harness.Ctx) {
 	}{
 		{"an empty messages list", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{}, MaxTokens: 64}},
 		{"an unknown role", chatWith("hi", "operator", 64)},
+		{"an unknown role in a later message", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "user", "content": "hi"}, {"role": "tool", "content": "ok"}}, MaxTokens: 64}},
 		{"an input over 8192 tokens", chatWith(strings.Repeat("x", 8192*4+4), "user", 64)},
+		{"an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", chatWith(strings.Repeat("x", 8192*4+1), "user", 64)},
+		{"an input over 8192 tokens across two messages", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "system", "content": strings.Repeat("x", 4096*4)}, {"role": "user", "content": strings.Repeat("x", 4096*4+1)}}, MaxTokens: 64}},
 		{"max_tokens 0", chatWith("hi", "user", 0)},
+		{"max_tokens 4097", chatWith("hi", "user", 4097)},
 		{"max_tokens 5000", chatWith("hi", "user", 5000)},
 	}
 	for _, b := range bad {
@@ -1315,6 +1396,8 @@ func CheckValidate(ctx *harness.Ctx) {
 	}
 	ok := c.Post("/v1/chat", chatWith(strings.Repeat("x", 8192*4), "user", 4096), "Authorization", "Bearer acme")
 	ctx.Equal(ok.Status, 200, "a request at the limits (8192 input tokens, max_tokens 4096) (%s)", ok.Text())
+	split := c.Post("/v1/chat", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "system", "content": strings.Repeat("x", 4096*4)}, {"role": "assistant", "content": strings.Repeat("x", 4096*4)}}, MaxTokens: 1}, "Authorization", "Bearer acme")
+	ctx.Equal(split.Status, 200, "a request at the limits across two messages (8192 input tokens, max_tokens 1) (%s)", split.Text())
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
@@ -1335,7 +1418,13 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("Complete", codes.ResourceExhausted, "rate limited", 1, "")
 	limited := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(limited.Status, 502, "RESOURCE_EXHAUSTED from the provider")
-	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 4, "the four requests' Complete calls (the gateway must not retry on the client's behalf)")
+	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "unknown model", 1, "")
+	refused := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	ctx.Equal(refused.Status, 502, "INVALID_ARGUMENT from the provider")
+	ctx.GRPC.Fail("Complete", codes.DeadlineExceeded, "deadline exceeded", 1, "")
+	expired := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	ctx.Equal(expired.Status, 504, "DEADLINE_EXCEEDED reported by the provider")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 6, "the six requests' Complete calls (the gateway must not retry on the client's behalf)")
 	_ = status.Code
 }
 
@@ -1355,9 +1444,15 @@ func CheckNoPromptEcho(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
 	r := c.Post("/v1/chat", chatWith(chatCanary, "user", 64), "Authorization", "Bearer acme")
+	rejected := c.Post("/v1/chat", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "user", "content": chatCanary}, {"role": "operator", "content": chatCanary}}, MaxTokens: 64}, "Authorization", "Bearer acme")
 	ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "CANARY-7731"), "the answer echoes the prompt: %s", r.Text())
-	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was printed or logged: %q", strings.TrimSpace(logged.String()))
+	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was printed or logged (on success or on a 400): %q", strings.TrimSpace(logged.String()))
+	ctx.Assert(!strings.Contains(rejected.Text(), "CANARY-7731"), "the 400 for an unknown role echoes the prompt: %s", rejected.Text())
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "provider restarting", 1, "")
+	failed := c.Post("/v1/chat", chatWith(chatCanary, "user", 64), "Authorization", "Bearer acme")
+	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was logged on a provider failure: %q", strings.TrimSpace(logged.String()))
+	ctx.Assert(!strings.Contains(failed.Text(), "CANARY-7731"), "the answer to a failed provider call echoes the prompt: %s", failed.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1376,7 +1471,9 @@ const std::string kChatAnswer = "The capital of France is Paris.";
 // The model provider: a fixed answer, usage numbers a text estimate cannot reproduce.
 class ProviderPeer final : public gateway::Provider::Service {
  public:
+  std::vector<gateway::CompleteRequest> requests;
   grpc::Status Complete(grpc::ServerContext*, const gateway::CompleteRequest* req, gateway::CompleteReply* reply) override {
+    requests.push_back(*req);
     size_t chars = 0;
     for (const auto& m : req->messages()) chars += m.content().size();
     reply->set_content(kChatAnswer);
@@ -1391,14 +1488,25 @@ struct ChatGateway {
   httplib::Server svr;
 };
 
+ChatGateway* gChat = nullptr;
+
 harness::HTTP chatGateway(harness::Ctx& ctx) {
-  static ChatGateway* g = nullptr;
-  delete g;
-  g = new ChatGateway;
-  ctx.GRPC.Server("")->RegisterService(&g->peer);
-  register_routes(g->svr);
-  return ctx.HTTP(g->svr);
+  delete gChat;
+  gChat = new ChatGateway;
+  ctx.GRPC.Server("")->RegisterService(&gChat->peer);
+  register_routes(gChat->svr);
+  return ctx.HTTP(gChat->svr);
 }
+
+std::string chatMessages(const nlohmann::json& messages, int max_tokens = 64, const std::string& model = "gpt-4o-mini") {
+  nlohmann::json b;
+  b["model"] = model;
+  b["messages"] = messages;
+  b["max_tokens"] = max_tokens;
+  return b.dump();
+}
+
+nlohmann::json chatMsg(const std::string& role, const std::string& content) { return {{"role", role}, {"content", content}}; }
 
 std::string chatWith(const std::string& content, const std::string& role = "user", int max_tokens = 64) {
   nlohmann::json b;
@@ -1424,6 +1532,16 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 1, "one chat must make exactly one Complete call; the calls made");
   auto anonymous = c.Post("/v1/chat", chatOK());
   ctx.Equal(anonymous.Status, 401, "a request without a bearer token");
+  auto peru = c.Post("/v1/chat", chatMessages(nlohmann::json::array({chatMsg("system", "Answer in one word."), chatMsg("user", "Capital of Peru?")}), 32, "gpt-4o"), "Authorization", "Bearer acme");
+  ctx.Equal(peru.Status, 200, "a chat with a system message (%s)", peru.Text());
+  std::string seen = "none";
+  if (!gChat->peer.requests.empty()) {
+    const auto& got = gChat->peer.requests.back();
+    seen = "model=" + got.model() + " messages=[";
+    for (int i = 0; i < got.messages_size(); ++i) seen += (i ? " " : "") + got.messages(i).role() + ":" + got.messages(i).content();
+    seen += "] max_tokens=" + std::to_string(got.max_tokens());
+  }
+  ctx.Equal(seen, std::string("model=gpt-4o messages=[system:Answer in one word. user:Capital of Peru?] max_tokens=32"), "Complete must carry the request's model, every message in order and its max_tokens; the provider received");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
@@ -1435,8 +1553,12 @@ void CheckValidate(harness::Ctx& ctx) {
   const std::vector<std::pair<std::string, std::string>> bad = {
       {"an empty messages list", empty.dump()},
       {"an unknown role", chatWith("hi", "operator")},
+      {"an unknown role in a later message", chatMessages(nlohmann::json::array({chatMsg("user", "hi"), chatMsg("tool", "ok")}))},
       {"an input over 8192 tokens", chatWith(std::string(8192 * 4 + 4, 'x'))},
+      {"an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", chatWith(std::string(8192 * 4 + 1, 'x'))},
+      {"an input over 8192 tokens across two messages", chatMessages(nlohmann::json::array({chatMsg("system", std::string(4096 * 4, 'x')), chatMsg("user", std::string(4096 * 4 + 1, 'x'))}))},
       {"max_tokens 0", chatWith("hi", "user", 0)},
+      {"max_tokens 4097", chatWith("hi", "user", 4097)},
       {"max_tokens 5000", chatWith("hi", "user", 5000)},
   };
   for (const auto& [what, body] : bad) {
@@ -1447,6 +1569,8 @@ void CheckValidate(harness::Ctx& ctx) {
   }
   auto ok = c.Post("/v1/chat", chatWith(std::string(8192 * 4, 'x'), "user", 4096), "Authorization", "Bearer acme");
   ctx.Equal(ok.Status, 200, "a request at the limits (8192 input tokens, max_tokens 4096) (%s)", ok.Text());
+  auto split = c.Post("/v1/chat", chatMessages(nlohmann::json::array({chatMsg("system", std::string(4096 * 4, 'x')), chatMsg("assistant", std::string(4096 * 4, 'x'))}), 1), "Authorization", "Bearer acme");
+  ctx.Equal(split.Status, 200, "a request at the limits across two messages (8192 input tokens, max_tokens 1) (%s)", split.Text());
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
@@ -1467,7 +1591,13 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Complete", grpc::StatusCode::RESOURCE_EXHAUSTED, "rate limited", 1);
   auto limited = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
   ctx.Equal(limited.Status, 502, "RESOURCE_EXHAUSTED from the provider");
-  ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 4, "the four requests' Complete calls (the gateway must not retry on the client's behalf)");
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "unknown model", 1);
+  auto refused = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  ctx.Equal(refused.Status, 502, "INVALID_ARGUMENT from the provider");
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1);
+  auto expired = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  ctx.Equal(expired.Status, 504, "DEADLINE_EXCEEDED reported by the provider");
+  ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 6, "the six requests' Complete calls (the gateway must not retry on the client's behalf)");
 }
 
 void CheckUsage(harness::Ctx& ctx) {
@@ -1488,11 +1618,16 @@ void CheckNoPromptEcho(harness::Ctx& ctx) {
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
   auto r = c.Post("/v1/chat", chatWith(kChatCanary), "Authorization", "Bearer acme");
+  auto rejected = c.Post("/v1/chat", chatMessages(nlohmann::json::array({chatMsg("user", kChatCanary), chatMsg("operator", kChatCanary)})), "Authorization", "Bearer acme");
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "provider restarting", 1);
+  auto failed = c.Post("/v1/chat", chatWith(kChatCanary), "Authorization", "Bearer acme");
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text());
   ctx.Assert(r.Text().find("CANARY-7731") == std::string::npos, "the answer echoes the prompt: %s", r.Text());
-  ctx.Assert(logged.str().find("CANARY-7731") == std::string::npos, "the prompt was printed or logged: %q", logged.str());
+  ctx.Assert(logged.str().find("CANARY-7731") == std::string::npos, "the prompt was printed or logged (on success, on a 400 or on a provider failure): %q", logged.str());
+  ctx.Assert(rejected.Text().find("CANARY-7731") == std::string::npos, "the 400 for an unknown role echoes the prompt: %s", rejected.Text());
+  ctx.Assert(failed.Text().find("CANARY-7731") == std::string::npos, "the answer to a failed provider call echoes the prompt: %s", failed.Text());
 }
 `,
   },

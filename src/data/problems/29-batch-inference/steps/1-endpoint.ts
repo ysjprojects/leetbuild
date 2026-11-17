@@ -23,7 +23,8 @@ shard of records belongs to no shard at all.
 Requirements:
 
 - \`Idempotency-Key\` is required (**400** without it). A replay of the same \`(tenant, key)\` answers
-  **200** with the stored batch (\`store.get\`); a new batch is stored with \`store.put(tenant, key, job)\`.
+  **200** with the stored batch (\`store.get\`) whatever the manifest says now; a new batch is stored with
+  \`store.put(tenant, key, job)\`.
 - \`manifests.head(uri)\` is the only source of \`record_count\`. No object is **404**; \`sealed\` false
   is **409** with nothing stored, so the client's retry after the upload starts the batch.
 - \`record_count\` above \`MAX_RECORDS\` (1 000 000) is **400**, before anything is stored.
@@ -47,7 +48,7 @@ Requirements:
       id: 'route',
       title: 'Handles POST /v1/batches',
       detail:
-        'A batch over a sealed 2000-record manifest answers 202 with batch_id, status queued, model, manifest_uri, record_count and shards, is stored, and has its two shards pending; without X-Tenant-Id the submit is 401.',
+        'A batch over a sealed 2000-record manifest answers 202 with batch_id, status queued, model, manifest_uri, record_count and shards, is stored, and has its two shards pending, seeded only after the batch is stored; without X-Tenant-Id the submit is 401.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/batches["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/batches['"]/]},
@@ -60,7 +61,7 @@ Requirements:
       id: 'idempotency-key',
       title: 'Keys batches by (tenant, Idempotency-Key)',
       detail:
-        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same batch_id and seeds nothing again; another tenant with the same key gets its own batch. The starter stores each batch under its own fresh id, so every retry starts another run.',
+        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same batch_id and seeds nothing again, even once the manifest is gone from the object store; another tenant with the same key gets its own batch. The starter stores each batch under its own fresh id, so every retry starts another run.',
       match: {
         python: {all: [/Idempotency-Key/i, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/i, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
@@ -99,7 +100,7 @@ Requirements:
       id: 'shard-count',
       title: 'Rounds the shard count up',
       detail:
-        'A manifest of 2500 records is three shards (0, 1, 2) on the pending list, and 999 records is one; the last partial shard is a shard. The starter divides with the floor, so the last 500 records are never run.',
+        'A manifest of 2500 records is three shards (0, 1, 2) on the pending list, 999 records is one and exactly 3000 is three; the last partial shard is a shard. The starter divides with the floor, so the last 500 records are never run.',
       match: {
         python: {
           all: [/math\.ceil\(|SHARD_SIZE\s*-\s*1|-\s*\(\s*-\s*\w+/],
@@ -754,6 +755,17 @@ def _pending(ctx, batch_id):
 
 async def check_route(ctx):
     _manifest(ctx, 2000)
+    idem = "batch:idem:t1:k-1"
+    queued_at_put = []
+
+    def at_idem():
+        # store.get reads the key before store.put writes it: wait for the write
+        if ctx.redis.exists(idem):
+            queued_at_put.append(ctx.redis.keys("batch:pending:*"))
+        else:
+            ctx.redis_after(idem, at_idem)
+
+    ctx.redis_after(idem, at_idem)
     async with _api(ctx) as c:
         r = await _post(c)
         assert r.status_code == 202, f"a submit over a sealed 2000-record manifest answered {r.status_code}: {r.text}"
@@ -764,6 +776,7 @@ async def check_route(ctx):
         assert job["record_count"] == 2000 and job["shards"] == 2, f"2000 records are 2 shards of 1000: {job}"
         assert ctx.redis.get(f"batch:job:{job['batch_id']}") is not None, f"the batch must be in the store (batch:job:{{id}}): keys {sorted(ctx.redis.keys('batch:*'))}"
         assert _pending(ctx, job["batch_id"]) == ["0", "1"], f"shards 0 and 1 must be pending, batch:pending holds {_pending(ctx, job['batch_id'])}"
+        assert queued_at_put[:1] in ([], [[]]), f"when the batch was stored under (t1, k-1), shards were already queued on {queued_at_put[0]}: the shards are seeded after store.put, so a submit that dies in between never leaves queued shards of a batch nobody can find"
         r = await c.post("/v1/batches", json=GOOD, headers={"Idempotency-Key": "k-1"})
         assert r.status_code == 401, f"without X-Tenant-Id the submit must answer 401, got {r.status_code}"
 
@@ -784,6 +797,9 @@ async def check_idempotency_key(ctx):
         assert _pending(ctx, batch_id) == ["0", "1"], f"the replay must not seed the shards again: batch:pending holds {_pending(ctx, batch_id)}"
         other = await _post(c, key="k-7", tenant="t2")
         assert other.status_code == 202 and other.json()["batch_id"] != batch_id, "another tenant reusing the key gets its own batch (keys are per tenant)"
+        ctx.redis.delete(f"batch:manifest:{MANIFEST}")
+        replay = await _post(c, key="k-7")
+        assert replay.status_code == 200 and replay.json()["batch_id"] == batch_id, f"with the manifest since removed from the object store, a replay of (t1, k-7) answered {replay.status_code}: {replay.text}; the stored batch answers a replay before the manifest is read"
 
 
 async def check_record_cap(ctx):
@@ -826,6 +842,10 @@ async def check_shard_count(ctx):
         _manifest(ctx, 999, uri=small)
         r = await _post(c, {"manifest_uri": small, "model": "sum-v7"}, key="k-999")
         assert r.status_code == 202 and r.json()["shards"] == 1, f"999 records are one shard: {r.text}"
+        exact = "s3://acme-batches/2026-11/exact.jsonl"
+        _manifest(ctx, 3000, uri=exact)
+        r = await _post(c, {"manifest_uri": exact, "model": "sum-v7"}, key="k-3000")
+        assert r.status_code == 202 and r.json()["shards"] == 3, f"3000 records are exactly 3 shards: {r.text}"
 `,
     typescript: `const MANIFEST = 's3://acme-batches/2026-11/support-tickets.jsonl';
 const GOOD = {manifest_uri: MANIFEST, model: 'sum-v7'};
@@ -851,6 +871,14 @@ const pending = (ctx, batchId: string) => ctx.redis.lrange(\`batch:pending:\${ba
 
 export async function check_route(ctx) {
   manifest(ctx, 2000);
+  const idem = 'batch:idem:t1:k-1';
+  const queuedAtPut: string[][] = [];
+  // store.get reads the key before store.put writes it: wait for the write
+  const atIdem = () => {
+    if (Number(ctx.redis.exists(idem)) > 0) queuedAtPut.push(ctx.redis.keys('batch:pending:*'));
+    else ctx.redisAfter(idem, atIdem);
+  };
+  ctx.redisAfter(idem, atIdem);
   const c = api(ctx);
   const r = await post(c);
   assert.equal(r.status, 202, \`a submit over a sealed 2000-record manifest answered \${r.status}: \${r.text}\`);
@@ -860,6 +888,7 @@ export async function check_route(ctx) {
   assert(job.record_count === 2000 && job.shards === 2, \`2000 records are 2 shards of 1000: \${r.text}\`);
   assert(ctx.redis.get(\`batch:job:\${job.batch_id}\`) !== null, \`the batch must be in the store (batch:job:{id}): keys \${JSON.stringify(ctx.redis.keys('batch:*').sort())}\`);
   assert.deepEqual(pending(ctx, job.batch_id), ['0', '1'], \`shards 0 and 1 must be pending, batch:pending holds \${JSON.stringify(pending(ctx, job.batch_id))}\`);
+  assert(queuedAtPut.length === 0 || queuedAtPut[0].length === 0, \`when the batch was stored under (t1, k-1), shards were already queued on \${JSON.stringify(queuedAtPut[0])}: the shards are seeded after store.put, so a submit that dies in between never leaves queued shards of a batch nobody can find\`);
   const noTenant = await c.post('/v1/batches', {body: GOOD, headers: {'Idempotency-Key': 'k-1'}});
   assert.equal(noTenant.status, 401, \`without X-Tenant-Id the submit must answer 401, got \${noTenant.status}\`);
 }
@@ -880,6 +909,9 @@ export async function check_idempotency_key(ctx) {
   assert.deepEqual(pending(ctx, batchId), ['0', '1'], \`the replay must not seed the shards again: batch:pending holds \${JSON.stringify(pending(ctx, batchId))}\`);
   const other = await post(c, GOOD, {key: 'k-7', tenant: 't2'});
   assert(other.status === 202 && other.json().batch_id !== batchId, 'another tenant reusing the key gets its own batch (keys are per tenant)');
+  ctx.redis.del(\`batch:manifest:\${MANIFEST}\`);
+  const again = await post(c, GOOD, {key: 'k-7'});
+  assert(again.status === 200 && again.json().batch_id === batchId, \`with the manifest since removed from the object store, a replay of (t1, k-7) answered \${again.status}: \${again.text}; the stored batch answers a replay before the manifest is read\`);
 }
 
 export async function check_record_cap(ctx) {
@@ -922,6 +954,10 @@ export async function check_shard_count(ctx) {
   manifest(ctx, 999, true, small);
   r = await post(c, {manifest_uri: small, model: 'sum-v7'}, {key: 'k-999'});
   assert(r.status === 202 && r.json().shards === 1, \`999 records are one shard: \${r.text}\`);
+  const exact = 's3://acme-batches/2026-11/exact.jsonl';
+  manifest(ctx, 3000, true, exact);
+  r = await post(c, {manifest_uri: exact, model: 'sum-v7'}, {key: 'k-3000'});
+  assert(r.status === 202 && r.json().shards === 3, \`3000 records are exactly 3 shards: \${r.text}\`);
 }
 `,
     go: `package main
@@ -968,6 +1004,19 @@ func apiPending(ctx *harness.Ctx, batchID any) []string {
 
 func CheckRoute(ctx *harness.Ctx) {
 	apiSeedManifest(ctx, apiManifest, 2000, true)
+	const idem = "batch:idem:t1:k-1"
+	var queuedAtPut [][]string
+	// jobs.Get reads the key before jobs.Put writes it: wait for the write
+	var atIdem func() any
+	atIdem = func() any {
+		if ctx.Redis.Exists(idem) > 0 {
+			queuedAtPut = append(queuedAtPut, ctx.Redis.Keys("batch:pending:*"))
+		} else {
+			ctx.Redis.After(idem, atIdem)
+		}
+		return nil
+	}
+	ctx.Redis.After(idem, atIdem)
 	c := apiClient(ctx)
 	r := apiPost(c, apiBody(apiManifest), "k-1", "t1")
 	ctx.Equal(r.Status, 202, "a submit over a sealed 2000-record manifest (%s)", r.Text())
@@ -981,6 +1030,7 @@ func CheckRoute(ctx *harness.Ctx) {
 	_, stored := ctx.Redis.Get(fmt.Sprint("batch:job:", job["batch_id"]))
 	ctx.Assert(stored, "the batch must be in the store (batch:job:{id}): keys %v", ctx.Redis.Keys("batch:*"))
 	ctx.Equal(apiPending(ctx, job["batch_id"]), []string{"0", "1"}, "shards 0 and 1 must be pending; batch:pending holds")
+	ctx.Assert(len(queuedAtPut) == 0 || len(queuedAtPut[0]) == 0, "when the batch was stored under (t1, k-1), shards were already queued on %v: the shards are seeded after store.put, so a submit that dies in between never leaves queued shards of a batch nobody can find", queuedAtPut)
 	noTenant := c.Post("/v1/batches", apiBody(apiManifest), "Idempotency-Key", "k-1")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the submit")
 }
@@ -1001,6 +1051,9 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	ctx.Equal(apiPending(ctx, batchID), []string{"0", "1"}, "the replay must not seed the shards again; batch:pending holds")
 	other := apiPost(c, apiBody(apiManifest), "k-7", "t2")
 	ctx.Assert(other.Status == 202 && apiJob(ctx, other)["batch_id"] != batchID, "another tenant reusing the key gets its own batch (keys are per tenant)")
+	ctx.Redis.Del("batch:manifest:" + apiManifest)
+	again := apiPost(c, apiBody(apiManifest), "k-7", "t1")
+	ctx.Assert(again.Status == 200 && apiJob(ctx, again)["batch_id"] == batchID, "with the manifest since removed from the object store, a replay of (t1, k-7) answered %d: %s; the stored batch answers a replay before the manifest is read", again.Status, again.Text())
 }
 
 func CheckRecordCap(ctx *harness.Ctx) {
@@ -1044,6 +1097,10 @@ func CheckShardCount(ctx *harness.Ctx) {
 	apiSeedManifest(ctx, small, 999, true)
 	r = apiPost(c, apiBody(small), "k-999", "t1")
 	ctx.Assert(r.Status == 202 && apiJob(ctx, r)["shards"] == float64(1), "999 records are one shard: %s", r.Text())
+	exact := "s3://acme-batches/2026-11/exact.jsonl"
+	apiSeedManifest(ctx, exact, 3000, true)
+	r = apiPost(c, apiBody(exact), "k-3000", "t1")
+	ctx.Assert(r.Status == 202 && apiJob(ctx, r)["shards"] == float64(3), "3000 records are exactly 3 shards: %s", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1088,6 +1145,17 @@ std::vector<std::string> pendingOf(harness::Ctx& ctx, const json& batchId) {
 
 void CheckRoute(harness::Ctx& ctx) {
   seedManifest(ctx, kManifest, 2000, true);
+  const std::string idem = "batch:idem:t1:k-1";
+  std::vector<std::vector<std::string>> queuedAtPut;
+  // store.get reads the key before store.put writes it: wait for the write
+  std::function<void()> atIdem = [&] {
+    if (ctx.Redis.Exists(idem) > 0) {
+      queuedAtPut.push_back(ctx.Redis.Keys("batch:pending:*"));
+    } else {
+      ctx.Redis.After(idem, atIdem);
+    }
+  };
+  ctx.Redis.After(idem, atIdem);
   Api api(ctx);
   const auto r = api.post(kManifest, "k-1");
   ctx.Equal(r.Status, 202, "a submit over a sealed 2000-record manifest (%s)", r.Text());
@@ -1099,6 +1167,7 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Assert(job["record_count"] == 2000 && job["shards"] == 2, "2000 records are 2 shards of 1000: %s", r.Text());
   ctx.Assert(ctx.Redis.Get("batch:job:" + job["batch_id"].get<std::string>()).has_value(), "the batch must be in the store (batch:job:{id}): keys %v", ctx.Redis.Keys("batch:*"));
   ctx.Equal(pendingOf(ctx, job["batch_id"]), {"0", "1"}, "shards 0 and 1 must be pending; batch:pending holds");
+  ctx.Assert(queuedAtPut.empty() || queuedAtPut[0].empty(), "when the batch was stored under (t1, k-1), shards were already queued on %v: the shards are seeded after store.put, so a submit that dies in between never leaves queued shards of a batch nobody can find", queuedAtPut.empty() ? std::vector<std::string>{} : queuedAtPut[0]);
   const auto noTenant = api.http.Post("/v1/batches", json{{"manifest_uri", kManifest}, {"model", "sum-v7"}}.dump(), "Idempotency-Key", "k-1");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the submit");
 }
@@ -1119,6 +1188,9 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   ctx.Equal(pendingOf(ctx, batchId), {"0", "1"}, "the replay must not seed the shards again; batch:pending holds");
   const auto other = api.post(kManifest, "k-7", "t2");
   ctx.Assert(other.Status == 202 && jobOf(ctx, other)["batch_id"] != batchId, "another tenant reusing the key gets its own batch (keys are per tenant)");
+  ctx.Redis.Del("batch:manifest:" + std::string(kManifest));
+  const auto again = api.post(kManifest, "k-7");
+  ctx.Assert(again.Status == 200 && jobOf(ctx, again)["batch_id"] == batchId, "with the manifest since removed from the object store, a replay of (t1, k-7) answered %d: %s; the stored batch answers a replay before the manifest is read", again.Status, again.Text());
 }
 
 void CheckRecordCap(harness::Ctx& ctx) {
@@ -1162,6 +1234,10 @@ void CheckShardCount(harness::Ctx& ctx) {
   seedManifest(ctx, small, 999, true);
   r = api.post(small, "k-999");
   ctx.Assert(r.Status == 202 && jobOf(ctx, r)["shards"] == 1, "999 records are one shard: %s", r.Text());
+  const std::string exact = "s3://acme-batches/2026-11/exact.jsonl";
+  seedManifest(ctx, exact, 3000, true);
+  r = api.post(exact, "k-3000");
+  ctx.Assert(r.Status == 202 && jobOf(ctx, r)["shards"] == 3, "3000 records are exactly 3 shards: %s", r.Text());
 }
 `,
   },

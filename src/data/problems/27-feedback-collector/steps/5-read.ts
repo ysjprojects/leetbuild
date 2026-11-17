@@ -66,7 +66,7 @@ read as a verdict, and any window a caller types is accepted.
       id: 'recent-window',
       title: 'Counts only the ratings inside the window',
       detail:
-        "The score sums the hour buckets of the window (`hour_totals`), so a version's past does not hide its present; the starter reads the counters since the model shipped.",
+        "The score sums exactly the window's hour buckets (`hour_totals`), the current hour and the `hours - 1` before it, so a vote 23 hours ago is in the 24h window and one 24 hours ago is not, and a version's past does not hide its present; the starter reads the counters since the model shipped.",
       match: {
         python: {all: [/store\.hour_totals\(/], none: [/store\.totals\(/]},
         typescript: {all: [/hourTotals\(/], none: [/\btotals\(/]},
@@ -92,7 +92,7 @@ read as a verdict, and any window a caller types is accepted.
       id: 'cache-ttl',
       title: 'The score is cached for 60 seconds per version and window',
       detail:
-        'A body is reused for `CACHE_TTL_S` (60 s) and only for the same version and window; the starter keys the cache by version alone and keeps it forever.',
+        'A body is reused for `CACHE_TTL_S` (60 s, still at 59 s) and only for the same version and window, so another version never gets it; the starter keys the cache by version alone and keeps it forever.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*60\b/, /time\.time\(\)|time\.monotonic\(\)/]},
         typescript: {all: [/CACHE_TTL_MS\s*=\s*60_?000\b/, /Date\.now\(\)/]},
@@ -541,6 +541,7 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/models/([\\w.-]+)/sa
 from feedback import store
 
 VERSION = "support-llm-2026-09"
+OTHER = "support-llm-2026-10"
 
 
 def _align(ctx):
@@ -558,8 +559,8 @@ def _api(ctx):
     return ctx.client(ctx.load("read").app)
 
 
-async def _get(c, query=""):
-    return await c.get(f"/v1/models/{VERSION}/satisfaction{query}")
+async def _get(c, query="", version=VERSION):
+    return await c.get(f"/v1/models/{version}/satisfaction{query}")
 
 
 async def check_window(ctx):
@@ -582,14 +583,19 @@ async def check_recent_window(ctx):
     _seed(80, 80, now - 8 * 86400)  # last week: every vote a thumbs-up
     for i in range(60):  # the last day: 15 of 60
         store.record_quality(VERSION, 1 if i < 15 else -1, now - (i % 20) * 3600)
+    # Thumbs-up on each side of the windows' oldest bucket: 23 h and 24 h ago, 167 h and 168 h ago.
+    for hours_ago in (23, 24, 167, 168):
+        store.record_quality(VERSION, 1, now - hours_ago * 3600)
     async with _api(ctx) as c:
+        hour = await _get(c, "?window=1h")
         day = await _get(c, "?window=24h")
         week = await _get(c, "?window=7d")
     assert day.status_code == 200, f"?window=24h answered {day.status_code}: {day.text}"
     body = day.json()
-    assert body.get("samples") == 60, f"the 24h window counted {body.get('samples')} ratings, expected the 60 of the last day: votes from 8 days ago are outside it"
-    assert body.get("score") is not None and abs(body["score"] - 0.25) < 1e-9, f"the 24h score is {body.get('score')}, expected 15 / 60 = 0.25"
-    assert week.json().get("samples") == 60, f"the 7d window counted {week.json().get('samples')} ratings, expected 60: 8 days ago is outside 7 days"
+    assert body.get("samples") == 61, f"the 24h window counted {body.get('samples')} ratings, expected 61: the last day's 60 and the vote 23 h ago, not the one 24 h ago or 8 days ago (the hours now // 3600 - 23 to now // 3600)"
+    assert body.get("score") is not None and abs(body["score"] - 16 / 61) < 1e-9, f"the 24h score is {body.get('score')}, expected 16 / 61"
+    assert hour.json().get("samples") == 3, f"the 1h window counted {hour.json().get('samples')} ratings, expected the 3 of the current hour"
+    assert week.json().get("samples") == 63, f"the 7d window counted {week.json().get('samples')} ratings, expected 63: the votes up to 167 h ago, not the one 168 h ago or 8 days ago"
 
 
 async def check_sample_floor(ctx):
@@ -617,14 +623,20 @@ async def check_cache_ttl(ctx):
         _seed(60, 0, now)
         cached = (await _get(c, "?window=24h")).json()
         hour = (await _get(c, "?window=1h")).json()
-        ctx.clock.advance(61)
+        other = (await _get(c, "?window=24h", OTHER)).json()
+        ctx.clock.advance(59)
+        late = (await _get(c, "?window=24h")).json()
+        ctx.clock.advance(2)
         fresh = (await _get(c, "?window=24h")).json()
     assert first.get("samples") == 60 and first.get("score") == 1.0, f"60 thumbs-up answered {first}"
     assert cached == first, f"a second read right away answered {cached}, expected the cached {first}: the score is cached for 60 s"
     assert hour.get("window") == "1h" and hour.get("samples") == 120, f"?window=1h answered {hour}: the cache is per version and window, so the 1h read computes its own body"
+    assert other.get("model_version") == OTHER and other.get("samples") == 0, f"the 24h read of {OTHER}, a version with no ratings, answered {other}: the cache is per version and window"
+    assert late == first, f"59 s after the first read the 24h read answered {late}, expected the cached {first}: the score is cached for 60 s"
     assert fresh.get("samples") == 120 and fresh.get("score") is not None and abs(fresh["score"] - 0.5) < 1e-9, f"61 s later the 24h read answered {fresh}: a cached score expires after 60 s"
 `,
     typescript: `const VERSION = 'support-llm-2026-09';
+const OTHER = 'support-llm-2026-10';
 
 /** Move the clock to the middle of an hour, so the buckets a check writes are the ones the read sums. */
 function align(ctx): number {
@@ -642,7 +654,7 @@ async function seed(store, n: number, positive: number, at: number): Promise<voi
   for (let i = 0; i < n; i += 1) await store.recordQuality(VERSION, i < positive ? 1 : -1, at);
 }
 
-const get = (c, query = '') => c.get(\`/v1/models/\${VERSION}/satisfaction\${query}\`);
+const get = (c, query = '', version = VERSION) => c.get(\`/v1/models/\${version}/satisfaction\${query}\`);
 
 export async function check_window(ctx) {
   const {c, store} = api(ctx);
@@ -664,13 +676,17 @@ export async function check_recent_window(ctx) {
   const now = align(ctx);
   await seed(store, 80, 80, now - 8 * 86400); // last week: every vote a thumbs-up
   for (let i = 0; i < 60; i += 1) await store.recordQuality(VERSION, i < 15 ? 1 : -1, now - (i % 20) * 3600); // the last day: 15 of 60
+  // Thumbs-up on each side of the windows' oldest bucket: 23 h and 24 h ago, 167 h and 168 h ago.
+  for (const hoursAgo of [23, 24, 167, 168]) await store.recordQuality(VERSION, 1, now - hoursAgo * 3600);
+  const hour = await get(c, '?window=1h');
   const day = await get(c, '?window=24h');
   const week = await get(c, '?window=7d');
   assert.equal(day.status, 200, \`?window=24h answered \${day.status}: \${day.text}\`);
   const body = day.json();
-  assert.equal(body.samples, 60, \`the 24h window counted \${body.samples} ratings, expected the 60 of the last day: votes from 8 days ago are outside it\`);
-  assert(typeof body.score === 'number' && Math.abs(body.score - 0.25) < 1e-9, \`the 24h score is \${body.score}, expected 15 / 60 = 0.25\`);
-  assert.equal(week.json().samples, 60, \`the 7d window counted \${week.json().samples} ratings, expected 60: 8 days ago is outside 7 days\`);
+  assert.equal(body.samples, 61, \`the 24h window counted \${body.samples} ratings, expected 61: the last day's 60 and the vote 23 h ago, not the one 24 h ago or 8 days ago (the hours now // 3600 - 23 to now // 3600)\`);
+  assert(typeof body.score === 'number' && Math.abs(body.score - 16 / 61) < 1e-9, \`the 24h score is \${body.score}, expected 16 / 61\`);
+  assert.equal(hour.json().samples, 3, \`the 1h window counted \${hour.json().samples} ratings, expected the 3 of the current hour\`);
+  assert.equal(week.json().samples, 63, \`the 7d window counted \${week.json().samples} ratings, expected 63: the votes up to 167 h ago, not the one 168 h ago or 8 days ago\`);
 }
 
 export async function check_sample_floor(ctx) {
@@ -698,11 +714,16 @@ export async function check_cache_ttl(ctx) {
   await seed(store, 60, 0, now);
   const cached = (await get(c, '?window=24h')).json();
   const hour = (await get(c, '?window=1h')).json();
-  ctx.clock.advance(61);
+  const other = (await get(c, '?window=24h', OTHER)).json();
+  ctx.clock.advance(59);
+  const late = (await get(c, '?window=24h')).json();
+  ctx.clock.advance(2);
   const fresh = (await get(c, '?window=24h')).json();
   assert(first.samples === 60 && first.score === 1, \`60 thumbs-up answered \${JSON.stringify(first)}\`);
   assert.deepEqual(cached, first, \`a second read right away answered \${JSON.stringify(cached)}, expected the cached \${JSON.stringify(first)}: the score is cached for 60 s\`);
   assert(hour.window === '1h' && hour.samples === 120, \`?window=1h answered \${JSON.stringify(hour)}: the cache is per version and window, so the 1h read computes its own body\`);
+  assert(other.model_version === OTHER && other.samples === 0, \`the 24h read of \${OTHER}, a version with no ratings, answered \${JSON.stringify(other)}: the cache is per version and window\`);
+  assert.deepEqual(late, first, \`59 s after the first read the 24h read answered \${JSON.stringify(late)}, expected the cached \${JSON.stringify(first)}: the score is cached for 60 s\`);
   assert(fresh.samples === 120 && typeof fresh.score === 'number' && Math.abs(fresh.score - 0.5) < 1e-9, \`61 s later the 24h read answered \${JSON.stringify(fresh)}: a cached score expires after 60 s\`);
 }
 `,
@@ -718,6 +739,7 @@ import (
 )
 
 const readVersion = "support-llm-2026-09"
+const otherVersion = "support-llm-2026-10"
 
 var readBg = context.Background()
 
@@ -784,14 +806,20 @@ func CheckRecentWindow(ctx *harness.Ctx) {
 		}
 		store.RecordQuality(readBg, readVersion, rating, now-int64(i%20)*3600)
 	}
+	// Thumbs-up on each side of the windows' oldest bucket: 23 h and 24 h ago, 167 h and 168 h ago.
+	for _, hoursAgo := range []int64{23, 24, 167, 168} {
+		store.RecordQuality(readBg, readVersion, 1, now-hoursAgo*3600)
+	}
 	c := readAPI(ctx)
+	hour := getScore(c, "?window=1h")
 	day := getScore(c, "?window=24h")
 	week := getScore(c, "?window=7d")
 	ctx.Equal(day.Status, 200, "?window=24h (%s)", day.Text())
 	b := body(ctx, day)
-	ctx.Equal(b["samples"], 60, "the 24h window must count the 60 ratings of the last day (votes from 8 days ago are outside it); samples")
-	ctx.Assert(near(b["score"], 0.25), "the 24h score is %v, expected 15 / 60 = 0.25", b["score"])
-	ctx.Equal(body(ctx, week)["samples"], 60, "the 7d window must count 60 ratings (8 days ago is outside 7 days); samples")
+	ctx.Equal(b["samples"], 61, "the 24h window must count 61 ratings: the last day's 60 and the vote 23 h ago, not the one 24 h ago or 8 days ago (the hours now / 3600 - 23 to now / 3600); samples")
+	ctx.Assert(near(b["score"], 16.0/61), "the 24h score is %v, expected 16 / 61", b["score"])
+	ctx.Equal(body(ctx, hour)["samples"], 3, "the 1h window must count the 3 ratings of the current hour; samples")
+	ctx.Equal(body(ctx, week)["samples"], 63, "the 7d window must count 63 ratings: the votes up to 167 h ago, not the one 168 h ago or 8 days ago; samples")
 }
 
 func CheckSampleFloor(ctx *harness.Ctx) {
@@ -819,12 +847,17 @@ func CheckCacheTtl(ctx *harness.Ctx) {
 	seed(60, 0, now)
 	cached := getScore(c, "?window=24h")
 	hour := body(ctx, getScore(c, "?window=1h"))
-	ctx.Clock.Advance(61)
+	other := body(ctx, c.Get("/v1/models/"+otherVersion+"/satisfaction?window=24h"))
+	ctx.Clock.Advance(59)
+	late := getScore(c, "?window=24h")
+	ctx.Clock.Advance(2)
 	fresh := body(ctx, getScore(c, "?window=24h"))
 	f := body(ctx, first)
 	ctx.Assert(near(f["samples"], 60) && near(f["score"], 1), "60 thumbs-up answered %s", first.Text())
 	ctx.Equal(cached.Text(), first.Text(), "a second read right away must answer the cached body (the score is cached for 60 s)")
 	ctx.Assert(hour["window"] == "1h" && near(hour["samples"], 120), "?window=1h answered %v: the cache is per version and window, so the 1h read computes its own body", hour)
+	ctx.Assert(other["model_version"] == otherVersion && near(other["samples"], 0), "the 24h read of %s, a version with no ratings, answered %v: the cache is per version and window", otherVersion, other)
+	ctx.Equal(late.Text(), first.Text(), "59 s after the first read the 24h read must answer the cached body (the score is cached for 60 s)")
 	ctx.Assert(near(fresh["samples"], 120) && near(fresh["score"], 0.5), "61 s later the 24h read answered %v: a cached score expires after 60 s", fresh)
 }
 `,
@@ -836,6 +869,7 @@ func CheckCacheTtl(ctx *harness.Ctx) {
 namespace {
 
 const std::string kVersion = "support-llm-2026-09";
+const std::string kOtherVersion = "support-llm-2026-10";
 
 // Move the clock to the middle of an hour, so the buckets a check writes are the ones the read sums.
 long long align(harness::Ctx& ctx) {
@@ -887,14 +921,18 @@ void CheckRecentWindow(harness::Ctx& ctx) {
   const long long now = align(ctx);
   seed(80, 80, now - 8 * 86400);  // last week: every vote a thumbs-up
   for (int i = 0; i < 60; i++) store::recordQuality(kVersion, i < 15 ? 1 : -1, now - (i % 20) * 3600LL);  // the last day: 15 of 60
+  // Thumbs-up on each side of the windows' oldest bucket: 23 h and 24 h ago, 167 h and 168 h ago.
+  for (const long long hours_ago : {23LL, 24LL, 167LL, 168LL}) store::recordQuality(kVersion, 1, now - hours_ago * 3600);
   auto c = readApi(ctx);
+  const auto hour = getScore(c, "?window=1h");
   const auto day = getScore(c, "?window=24h");
   const auto week = getScore(c, "?window=7d");
   ctx.Equal(day.Status, 200, "?window=24h (%s)", day.Text());
   const auto b = body(ctx, day);
-  ctx.Equal(b.value("samples", 0LL), 60, "the 24h window must count the 60 ratings of the last day (votes from 8 days ago are outside it); samples");
-  ctx.Assert(near(b.value("score", nlohmann::json()), 0.25), "the 24h score is %s, expected 15 / 60 = 0.25", b.value("score", nlohmann::json()).dump());
-  ctx.Equal(body(ctx, week).value("samples", 0LL), 60, "the 7d window must count 60 ratings (8 days ago is outside 7 days); samples");
+  ctx.Equal(b.value("samples", 0LL), 61, "the 24h window must count 61 ratings: the last day's 60 and the vote 23 h ago, not the one 24 h ago or 8 days ago (the hours now / 3600 - 23 to now / 3600); samples");
+  ctx.Assert(near(b.value("score", nlohmann::json()), 16.0 / 61), "the 24h score is %s, expected 16 / 61", b.value("score", nlohmann::json()).dump());
+  ctx.Equal(body(ctx, hour).value("samples", 0LL), 3, "the 1h window must count the 3 ratings of the current hour; samples");
+  ctx.Equal(body(ctx, week).value("samples", 0LL), 63, "the 7d window must count 63 ratings: the votes up to 167 h ago, not the one 168 h ago or 8 days ago; samples");
 }
 
 void CheckSampleFloor(harness::Ctx& ctx) {
@@ -922,12 +960,17 @@ void CheckCacheTtl(harness::Ctx& ctx) {
   seed(60, 0, now);
   const auto cached = getScore(c, "?window=24h");
   const auto hour = body(ctx, getScore(c, "?window=1h"));
-  ctx.Clock.Advance(61);
+  const auto other = body(ctx, c.Get("/v1/models/" + kOtherVersion + "/satisfaction?window=24h"));
+  ctx.Clock.Advance(59);
+  const auto late = getScore(c, "?window=24h");
+  ctx.Clock.Advance(2);
   const auto fresh = body(ctx, getScore(c, "?window=24h"));
   const auto f = body(ctx, first);
   ctx.Assert(f.value("samples", 0LL) == 60 && near(f.value("score", nlohmann::json()), 1.0), "60 thumbs-up answered %s", first.Text());
   ctx.Equal(cached.Text(), first.Text(), "a second read right away must answer the cached body (the score is cached for 60 s)");
   ctx.Assert(hour.value("window", "") == "1h" && hour.value("samples", 0LL) == 120, "?window=1h answered %s: the cache is per version and window, so the 1h read computes its own body", hour.dump());
+  ctx.Assert(other.value("model_version", "") == kOtherVersion && other.value("samples", -1LL) == 0, "the 24h read of %s, a version with no ratings, answered %s: the cache is per version and window", kOtherVersion, other.dump());
+  ctx.Equal(late.Text(), first.Text(), "59 s after the first read the 24h read must answer the cached body (the score is cached for 60 s)");
   ctx.Assert(fresh.value("samples", 0LL) == 120 && near(fresh.value("score", nlohmann::json()), 0.5), "61 s later the 24h read answered %s: a cached score expires after 60 s", fresh.dump());
 }
 `,

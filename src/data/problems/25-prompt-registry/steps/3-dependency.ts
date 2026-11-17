@@ -54,7 +54,7 @@ Requirements:
       id: 'deadline',
       title: 'Three-second deadline on every attempt',
       detail:
-        'Each Evaluate call carries a deadline of about 3 s; an evaluator that hangs for 5 s gets three cut-off attempts and the version stays blocked with reason deadline, in under 11 s. The starter sends no deadline and waits the hang out.',
+        'Each Evaluate call carries a deadline of about 3 s; an evaluator that hangs for 5 s gets three cut-off attempts, each with its own full 3 s, and the version stays blocked with reason deadline, in under 11 s. The starter sends no deadline and waits the hang out.',
       match: {
         python: {all: [/timeout\s*=\s*(DEADLINE_S|\d)/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
@@ -67,7 +67,7 @@ Requirements:
       id: 'retry-policy',
       title: 'Retries UNAVAILABLE and DEADLINE_EXCEEDED, at most three attempts',
       detail:
-        'One UNAVAILABLE earns a retry after a backoff and the version is promoted on the second call; three in a row block with reason unavailable after exactly three calls; INVALID_ARGUMENT blocks after one. The starter never retries an error.',
+        'One UNAVAILABLE earns a retry after a backoff and the version is promoted on the second call; three in a row block with reason unavailable after exactly three calls; INVALID_ARGUMENT, RESOURCE_EXHAUSTED, ABORTED and FAILED_PRECONDITION each block with reason error after one. The starter never retries an error.',
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_GATE_SECONDS/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/MAX_GATE_SECONDS/]},
@@ -106,7 +106,7 @@ Requirements:
       id: 'record-by-hash',
       title: 'Records each verdict under the content hash it judged',
       detail:
-        'After version 2 passes, its verdict is in prompts:eval:{tenant}:{name}:{sha256}; version 3 is evaluated on its own bytes, fails, and is recorded too. The starter records nothing and promotes version 3 on the verdict it cached for the name.',
+        'After version 2 passes, its verdict (eval_id, passed, score, content_hash, version) is in prompts:eval:{tenant}:{name}:{sha256}; version 3 is evaluated on its own bytes, fails, and is recorded too. The starter records nothing and promotes version 3 on the verdict it cached for the name.',
       match: {
         python: {all: [/evals\.put\(/], none: [/VERDICT_TTL_S|_verdict_cache/]},
         typescript: {all: [/evals\.put\(/], none: [/VERDICT_TTL_S|verdictCache/]},
@@ -948,6 +948,8 @@ def check_deadline(ctx):
     _expect(result, "blocked", "deadline")
     assert len(_calls(ctx)) == 4, f"an evaluator that hangs gets MAX_ATTEMPTS = 3 calls, each cut at the deadline: saw {len(_calls(ctx)) - 1}"
     assert waited <= 11, f"the gate waited {waited:.1f} s on a hung evaluator: three 3-second attempts and their backoffs end well before that"
+    for n, call in enumerate(_calls(ctx)[1:], start=1):
+        assert call.timeout is not None and 2.5 <= call.timeout <= 3.5, f"attempt {n} on the hung evaluator carried a deadline of {call.timeout} s: every attempt gets its own 3 s, not what is left of the first one's"
     assert ctx.redis.get(LIVE) == "2", f"a version nobody could evaluate went live: live is {ctx.redis.get(LIVE)}"
 
 
@@ -962,10 +964,12 @@ def check_retry_policy(ctx):
     result = m.gate(state, T, N, 4, "alice")
     _expect(result, "blocked", "unavailable")
     assert len(_calls(ctx)) == 5 and result.get("attempts") == 3, f"an evaluator that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls: saw {len(_calls(ctx)) - 2} calls, {result}"
-    ctx.grpc.fail("Evaluate", grpc.StatusCode.INVALID_ARGUMENT, "template too long for the suite", times=1, target=config.EVALUATOR)
-    result = m.gate(state, T, N, 4, "alice")
-    _expect(result, "blocked", "error")
-    assert len(_calls(ctx)) == 6, f"INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer: saw {len(_calls(ctx)) - 5} calls"
+    terminal = (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.ABORTED, grpc.StatusCode.FAILED_PRECONDITION)
+    for n, code in enumerate(terminal):
+        ctx.grpc.fail("Evaluate", code, "the suite refused the request", times=1, target=config.EVALUATOR)
+        result = m.gate(state, T, N, 4, "alice")
+        assert len(_calls(ctx)) == 6 + n, f"{code.name} is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer: saw {len(_calls(ctx)) - 5 - n} calls"
+        _expect(result, "blocked", "error")
 
 
 def check_block_on_error(ctx):
@@ -995,7 +999,7 @@ def check_record_by_hash(ctx):
     _expect(first, "promoted")
     record = _eval(ctx, SAFE)
     assert record is not None, f"the verdict on version 2 must be recorded under its content hash (prompts:eval:{T}:{N}:<sha256>), found {sorted(ctx.redis.keys('prompts:eval*'))}"
-    assert record.get("eval_id") == first.get("eval_id") and record.get("passed") is True and record.get("version") == 2, f"the record carries eval_id, passed and version: {record}"
+    assert record.get("eval_id") == first.get("eval_id") and record.get("passed") is True and record.get("version") == 2 and record.get("score") == 0.93 and record.get("content_hash") == _sha(SAFE), f"the record carries eval_id, passed, score, content_hash and version: {record}"
     second = m.gate(state, T, N, 3, "alice")
     calls = _calls(ctx)
     assert len(calls) == 2, f"version 3 was decided without asking the evaluator ({len(calls)} calls in all): a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3"
@@ -1065,6 +1069,8 @@ export async function check_deadline(ctx) {
   expect(result, 'blocked', 'deadline');
   assert.equal(calls(ctx).length, 4, \`an evaluator that hangs gets MAX_ATTEMPTS = 3 calls, each cut at the deadline: saw \${calls(ctx).length - 1}\`);
   assert(waited <= 11, \`the gate waited \${waited.toFixed(1)} s on a hung evaluator: three 3-second attempts and their backoffs end well before that\`);
+  for (const [n, call] of calls(ctx).slice(1).entries())
+    assert(call.timeout !== null && 2.5 <= call.timeout && call.timeout <= 3.5, \`attempt \${n + 1} on the hung evaluator carried a deadline of \${call.timeout} s: every attempt gets its own 3 s, not what is left of the first one's\`);
   assert.equal(ctx.redis.get(LIVE), '2', \`a version nobody could evaluate went live: live is \${ctx.redis.get(LIVE)}\`);
 }
 
@@ -1079,10 +1085,12 @@ export async function check_retry_policy(ctx) {
   result = await m.gate(state, T, N, 4, 'alice');
   expect(result, 'blocked', 'unavailable');
   assert(calls(ctx).length === 5 && result.attempts === 3, \`an evaluator that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls: saw \${calls(ctx).length - 2} calls, \${JSON.stringify(result)}\`);
-  ctx.grpc.fail('Evaluate', ctx.grpc.status.INVALID_ARGUMENT, 'template too long for the suite', 1, config.EVALUATOR);
-  result = await m.gate(state, T, N, 4, 'alice');
-  expect(result, 'blocked', 'error');
-  assert.equal(calls(ctx).length, 6, \`INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer: saw \${calls(ctx).length - 5} calls\`);
+  for (const [n, code] of ['INVALID_ARGUMENT', 'RESOURCE_EXHAUSTED', 'ABORTED', 'FAILED_PRECONDITION'].entries()) {
+    ctx.grpc.fail('Evaluate', ctx.grpc.status[code], 'the suite refused the request', 1, config.EVALUATOR);
+    result = await m.gate(state, T, N, 4, 'alice');
+    assert.equal(calls(ctx).length, 6 + n, \`\${code} is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer: saw \${calls(ctx).length - 5 - n} calls\`);
+    expect(result, 'blocked', 'error');
+  }
 }
 
 export async function check_block_on_error(ctx) {
@@ -1112,7 +1120,7 @@ export async function check_record_by_hash(ctx) {
   expect(first, 'promoted');
   const record = evalOf(ctx, SAFE);
   assert(record !== null, \`the verdict on version 2 must be recorded under its content hash (prompts:eval:\${T}:\${N}:<sha256>), found \${JSON.stringify(ctx.redis.keys('prompts:eval*'))}\`);
-  assert(record.eval_id === first.eval_id && record.passed === true && record.version === 2, \`the record carries eval_id, passed and version: \${JSON.stringify(record)}\`);
+  assert(record.eval_id === first.eval_id && record.passed === true && record.version === 2 && record.score === 0.93 && record.content_hash === sha(SAFE), \`the record carries eval_id, passed, score, content_hash and version: \${JSON.stringify(record)}\`);
   const second = await m.gate(state, T, N, 3, 'alice');
   assert.equal(calls(ctx).length, 2, \`version 3 was decided without asking the evaluator (\${calls(ctx).length} calls in all): a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3\`);
   assert.equal(calls(ctx)[1].request.content_hash, sha(UNSAFE), "the second Evaluate call must carry version 3's content hash");
@@ -1236,6 +1244,9 @@ func CheckDeadline(ctx *harness.Ctx) {
 	gateExpect(ctx, result, "blocked", "deadline")
 	ctx.Equal(len(gateCalls(ctx)), 4, "an evaluator that hangs gets maxAttempts = 3 calls, each cut at the deadline; calls so far")
 	ctx.Assert(waited <= 11, "the gate waited %.1f s on a hung evaluator: three 3-second attempts and their backoffs end well before that", waited)
+	for n, call := range gateCalls(ctx)[1:] {
+		ctx.Assert(call.HasDeadline() && call.Timeout.Seconds() >= 2.5 && call.Timeout.Seconds() <= 3.5, "attempt %d on the hung evaluator carried a deadline of %v: every attempt gets its own 3 s, not what is left of the first one's", n+1, call.Timeout)
+	}
 	ctx.Equal(gateLive(ctx), "2", "a version nobody could evaluate must not go live; the live version")
 }
 
@@ -1250,10 +1261,12 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	result = gateRun(ctx, state, 4)
 	gateExpect(ctx, result, "blocked", "unavailable")
 	ctx.Assert(len(gateCalls(ctx)) == 5 && result.Attempts == 3, "an evaluator that stays UNAVAILABLE gets maxAttempts = 3 calls: saw %d calls, %+v", len(gateCalls(ctx))-2, result)
-	ctx.GRPC.Fail("Evaluate", codes.InvalidArgument, "template too long for the suite", 1, config.Evaluator)
-	result = gateRun(ctx, state, 4)
-	gateExpect(ctx, result, "blocked", "error")
-	ctx.Equal(len(gateCalls(ctx)), 6, "INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer; calls so far")
+	for n, code := range []codes.Code{codes.InvalidArgument, codes.ResourceExhausted, codes.Aborted, codes.FailedPrecondition} {
+		ctx.GRPC.Fail("Evaluate", code, "the suite refused the request", 1, config.Evaluator)
+		result = gateRun(ctx, state, 4)
+		ctx.Equal(len(gateCalls(ctx)), 6+n, "%s is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer; calls so far", code)
+		gateExpect(ctx, result, "blocked", "error")
+	}
 }
 
 func CheckBlockOnError(ctx *harness.Ctx) {
@@ -1283,7 +1296,7 @@ func CheckRecordByHash(ctx *harness.Ctx) {
 	gateExpect(ctx, first, "promoted", "")
 	record := gateEval(ctx, gateSafe)
 	ctx.Assert(record != nil, "the verdict on version 2 must be recorded under its content hash (prompts:eval:%s:%s:<sha256>), found %v", gateTenant, gateName, ctx.Redis.Keys("prompts:eval*"))
-	ctx.Assert(record["eval_id"] == first.EvalID && record["passed"] == true && record["version"] == float64(2), "the record carries eval_id, passed and version: %v", record)
+	ctx.Assert(record["eval_id"] == first.EvalID && record["passed"] == true && record["version"] == float64(2) && record["score"] == 0.93 && record["content_hash"] == gateSha(gateSafe), "the record carries eval_id, passed, score, content_hash and version: %v", record)
 	second := gateRun(ctx, state, 3)
 	calls := gateCalls(ctx)
 	ctx.Equal(len(calls), 2, "version 3 must be evaluated on its own bytes: a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3; Evaluate calls in all")
@@ -1395,6 +1408,10 @@ void CheckDeadline(harness::Ctx& ctx) {
   gateExpect(ctx, result, "blocked", "deadline");
   ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 4, "an evaluator that hangs gets kMaxAttempts = 3 calls, each cut at the deadline; calls so far");
   ctx.Assert(waited <= 11, "the gate waited %.1f s on a hung evaluator: three 3-second attempts and their backoffs end well before that", waited);
+  const auto hung = ctx.GRPC.CallsTo("Evaluate");
+  for (size_t n = 1; n < hung.size(); n++)
+    ctx.Assert(hung[n].HasDeadline() && 2.5 <= hung[n].TimeoutSeconds() && hung[n].TimeoutSeconds() <= 3.5,
+               "attempt %d on the hung evaluator carried a deadline of %vs: every attempt gets its own 3 s, not what is left of the first one's", n, hung[n].TimeoutSeconds());
   ctx.Equal(liveNow(ctx), "2", "a version nobody could evaluate must not go live; the live version");
 }
 
@@ -1409,10 +1426,16 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   result = gate(w.state, kT, kN, 4, "alice");
   gateExpect(ctx, result, "blocked", "unavailable");
   ctx.Assert(ctx.GRPC.CallsTo("Evaluate").size() == 5 && result.attempts == 3, "an evaluator that stays UNAVAILABLE gets kMaxAttempts = 3 calls: saw %d calls, attempts %d", ctx.GRPC.CallsTo("Evaluate").size() - 2, result.attempts);
-  ctx.GRPC.Fail("Evaluate", grpc::StatusCode::INVALID_ARGUMENT, "template too long for the suite", 1, config::kEvaluator);
-  result = gate(w.state, kT, kN, 4, "alice");
-  gateExpect(ctx, result, "blocked", "error");
-  ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 6, "INVALID_ARGUMENT says the request is wrong, so a retry gets the same answer; calls so far");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+                                                                          {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+                                                                          {grpc::StatusCode::ABORTED, "ABORTED"},
+                                                                          {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"}};
+  for (size_t n = 0; n < terminal.size(); n++) {
+    ctx.GRPC.Fail("Evaluate", terminal[n].first, "the suite refused the request", 1, config::kEvaluator);
+    result = gate(w.state, kT, kN, 4, "alice");
+    ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 6 + n, "%s is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer; calls so far", terminal[n].second);
+    gateExpect(ctx, result, "blocked", "error");
+  }
 }
 
 void CheckBlockOnError(harness::Ctx& ctx) {
@@ -1442,7 +1465,9 @@ void CheckRecordByHash(harness::Ctx& ctx) {
   gateExpect(ctx, first, "promoted");
   const auto record = evalOf(ctx, kSafe);
   ctx.Assert(record.has_value(), "the verdict on version 2 must be recorded under its content hash (prompts:eval:t1:support-reply:<sha256>), found %v", ctx.Redis.Keys("prompts:eval*"));
-  ctx.Assert(record->value("eval_id", "") == first.eval_id && record->value("passed", false) && record->value("version", 0) == 2, "the record carries eval_id, passed and version: %s", record->dump());
+  ctx.Assert(record->value("eval_id", "") == first.eval_id && record->value("passed", false) && record->value("version", 0) == 2 && record->value("score", 0.0) == 0.93 &&
+                 record->value("content_hash", "") == sha256_hex(kSafe),
+             "the record carries eval_id, passed, score, content_hash and version: %s", record->dump());
   const GateResult second = gate(w.state, kT, kN, 3, "alice");
   const auto calls = ctx.GRPC.CallsTo("Evaluate");
   ctx.Equal(calls.size(), 2, "version 3 must be evaluated on its own bytes: a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3; Evaluate calls in all");

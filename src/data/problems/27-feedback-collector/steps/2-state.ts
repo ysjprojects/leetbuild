@@ -63,7 +63,7 @@ has no expiry, so Redis keeps one key per vote for good.
       id: 'expiry',
       title: 'A ballot expires after 30 days, set with the claim',
       detail:
-        'The command that takes the ballot sets its 30-day expiry (`BALLOT_TTL_S`); a separate `EXPIRE` leaves a key without one if the process dies in between, and the starter sets none at all.',
+        'The command that takes the ballot sets its 30-day expiry (`BALLOT_TTL_S`), and a refused second vote leaves that expiry as it was; a separate `EXPIRE` leaves a key without one if the process dies in between, and the starter sets none at all.',
       match: {
         python: {
           all: [/BALLOT_TTL_S\s*=\s*(30\s*\*\s*24\s*\*\s*3600|30\s*\*\s*86400|2592000)\b/, /ex\s*=\s*BALLOT_TTL_S/],
@@ -294,6 +294,7 @@ bool claim(const std::string& tenant, const std::string& request_id, const std::
   },
   harness: {
     python: `TTL = 30 * 24 * 3600
+DAYS_10 = 10 * 24 * 3600
 KEY = "ballot:t-acme:req-1:u-1"
 # The starter's layout, so the race is staged whichever key the code uses.
 LOOSE_KEY = "ballot:req-1:u-1"
@@ -339,10 +340,15 @@ def check_expiry(ctx):
     assert TTL - 5 <= ttl <= TTL, f"the ballot {keys[0]} has TTL {ttl}, expected 30 days ({TTL} s): a ballot without an expiry is kept forever"
     if at_write.fired:
         assert at_write.result != -1, f"right after the command that wrote {KEY} it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)"
-    ctx.clock.advance(TTL + 1)
-    assert ctx.redis.keys("ballot:*") == [], f"30 days later the ballot is still there: {ctx.redis.keys('ballot:*')}"
+    ctx.clock.advance(DAYS_10)
+    assert m.claim("t-acme", "req-1", "u-1") is False, "a second vote 10 days later must find the ballot taken"
+    left = ctx.redis.ttl(KEY)
+    assert TTL - DAYS_10 - 5 <= left <= TTL - DAYS_10, f"10 days after the claim, and a refused second vote, the ballot has TTL {left}, expected 20 days ({TTL - DAYS_10} s): a refused vote must not renew the expiry"
+    ctx.clock.advance(TTL - DAYS_10 + 1)
+    assert ctx.redis.keys("ballot:*") == [], f"30 days after the claim the ballot is still there: {ctx.redis.keys('ballot:*')}"
 `,
     typescript: `const TTL = 30 * 24 * 3600;
+const DAYS_10 = 10 * 24 * 3600;
 const KEY = 'ballot:t-acme:req-1:u-1';
 // The starter's layout, so the race is staged whichever key the code uses.
 const LOOSE_KEY = 'ballot:req-1:u-1';
@@ -387,8 +393,12 @@ export async function check_expiry(ctx) {
   if (atWrite.fired) {
     assert.notEqual(atWrite.result, -1, \`right after the command that wrote \${KEY} it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)\`);
   }
-  ctx.clock.advance(TTL + 1);
-  assert.deepEqual(ctx.redis.keys('ballot:*'), [], \`30 days later the ballot is still there: \${JSON.stringify(ctx.redis.keys('ballot:*'))}\`);
+  ctx.clock.advance(DAYS_10);
+  assert.equal(await m.claim('t-acme', 'req-1', 'u-1'), false, 'a second vote 10 days later must find the ballot taken');
+  const left = ctx.redis.ttl(KEY);
+  assert(TTL - DAYS_10 - 5 <= left && left <= TTL - DAYS_10, \`10 days after the claim, and a refused second vote, the ballot has TTL \${left}, expected 20 days (\${TTL - DAYS_10} s): a refused vote must not renew the expiry\`);
+  ctx.clock.advance(TTL - DAYS_10 + 1);
+  assert.deepEqual(ctx.redis.keys('ballot:*'), [], \`30 days after the claim the ballot is still there: \${JSON.stringify(ctx.redis.keys('ballot:*'))}\`);
 }
 `,
     go: `package main
@@ -404,6 +414,7 @@ var stateBg = context.Background()
 
 const (
 	ballotTTLSeconds = 30 * 24 * 3600
+	days10           = 10 * 24 * 3600
 	exactKey         = "ballot:t-acme:req-1:u-1"
 	// The starter's layout, so the race is staged whichever key the code uses.
 	looseKey = "ballot:req-1:u-1"
@@ -462,8 +473,12 @@ func CheckExpiry(ctx *harness.Ctx) {
 	if atWrite.Fired {
 		ctx.Assert(atWrite.Result != int64(-1), "right after the command that wrote %s it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)", exactKey)
 	}
-	ctx.Clock.Advance(ballotTTLSeconds + 1)
-	ctx.Equal(len(ctx.Redis.Keys("ballot:*")), 0, "30 days later the ballot must be gone; ballots")
+	ctx.Clock.Advance(days10)
+	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-1"), false, "a second vote 10 days later must find the ballot taken")
+	left := ctx.Redis.TTL(exactKey)
+	ctx.Assert(ballotTTLSeconds-days10-5 <= left && left <= ballotTTLSeconds-days10, "10 days after the claim, and a refused second vote, the ballot has TTL %d, expected 20 days (%d s): a refused vote must not renew the expiry", left, ballotTTLSeconds-days10)
+	ctx.Clock.Advance(ballotTTLSeconds - days10 + 1)
+	ctx.Equal(len(ctx.Redis.Keys("ballot:*")), 0, "30 days after the claim the ballot must be gone; ballots")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -476,6 +491,7 @@ func CheckExpiry(ctx *harness.Ctx) {
 namespace {
 
 constexpr long long kTtl = 30LL * 24 * 3600;
+constexpr long long kDays10 = 10LL * 24 * 3600;
 const std::string kKey = "ballot:t-acme:req-1:u-1";
 // The starter's layout, so the race is staged whichever key the code uses.
 const std::string kLooseKey = "ballot:req-1:u-1";
@@ -539,8 +555,12 @@ void CheckExpiry(harness::Ctx& ctx) {
   if (at_write->fired) {
     ctx.Assert(at_write->ttl != -1, "right after the command that wrote %s it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)", kKey);
   }
-  ctx.Clock.Advance(kTtl + 1);
-  ctx.Equal(ctx.Redis.Keys("ballot:*").size(), 0, "30 days later the ballot must be gone; ballots");
+  ctx.Clock.Advance(kDays10);
+  ctx.Equal(claim("t-acme", "req-1", "u-1"), false, "a second vote 10 days later must find the ballot taken");
+  const long long left = ctx.Redis.TTL(kKey);
+  ctx.Assert(kTtl - kDays10 - 5 <= left && left <= kTtl - kDays10, "10 days after the claim, and a refused second vote, the ballot has TTL %d, expected 20 days (%d s): a refused vote must not renew the expiry", left, kTtl - kDays10);
+  ctx.Clock.Advance(kTtl - kDays10 + 1);
+  ctx.Equal(ctx.Redis.Keys("ballot:*").size(), 0, "30 days after the claim the ballot must be gone; ballots");
 }
 `,
   },

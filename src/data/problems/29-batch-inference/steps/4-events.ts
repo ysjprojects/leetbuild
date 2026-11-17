@@ -86,7 +86,7 @@ Requirements:
       id: 'outbox-on-reject',
       title: 'Writes an outbox row from the delivery report',
       detail:
-        'A produce the broker refuses puts the event in the outbox, handled where the broker answers (the delivery callback, the rejected send, the returned write error); publish_shard does not raise, and a healthy produce afterwards adds no row. The starter only catches errors the local enqueue throws, and the refusal arrives later.',
+        'A produce the broker refuses puts the whole event (ids, counts, output_uri and checksum) in the outbox, handled where the broker answers (the delivery callback, the rejected send, the returned write error); publish_shard does not raise, and a healthy produce afterwards adds no row. The starter only catches errors the local enqueue throws, and the refusal arrives later.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /await\s+producer\.send\(/], none: [/void\s+producer\.send\(/]},
@@ -99,7 +99,7 @@ Requirements:
       id: 'fold-before-commit',
       title: 'Folds a shard before committing its offset',
       detail:
-        "At the coordinator's first commit, batch:outputs already holds the shard that record carried, with its uri and checksum; after the drain both shards are folded and nothing is left uncommitted. The starter commits first, so a crash between the two loses the shard.",
+        "At the coordinator's first commit, batch:outputs already holds the shard that record carried, with its uri, checksum and counts; after the drain both shards are folded and committed, and a shard whose fold fails (its outputs key is not a hash) is left uncommitted. The starter commits first, so a crash between the two loses the shard.",
       match: {
         python: {order: [/fold_shard\(\s*json\.loads/, /consumer\.commit\(/]},
         typescript: {order: [/foldShard\(\s*JSON\.parse/, /commitOffsets\(/]},
@@ -112,7 +112,7 @@ Requirements:
       id: 'fold-once',
       title: 'Folds a replayed shard once',
       detail:
-        'The same shard event twice on the topic (a replay after a crash before the commit) leaves one entry and totals counted once: two shards of 2 completed and 1 failed records each are completed 4, failed 2. The starter adds the counts on every delivery.',
+        'The same shard event twice on the topic (a replay after a crash before the commit) leaves one entry and totals counted once: two shards of 2 completed and 1 failed records each are completed 4, failed 2; and the moment an entry lands, its counts are already in the totals. The starter adds the counts on every delivery.',
       match: {
         python: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.hsetnx\(/]},
         typescript: {all: [/redis\.call\(\s*['"]HSETNX['"]|\.hsetnx\(/]},
@@ -1015,6 +1015,7 @@ def check_outbox_on_reject(ctx):
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the broker refused one produce and batch:outbox holds {len(rows)} rows: the refusal arrives in the delivery report, and a shard whose event is lost never reaches the batch"
     assert rows[0].get("batch_id") == "b1" and rows[0].get("shard_id") == 0, f"the outbox row must be the event itself, got {rows[0]}"
+    assert rows[0].get("output_uri") == _uri(0) and rows[0].get("checksum") and (rows[0].get("completed"), rows[0].get("failed")) == (2, 1), f"the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: {rows[0]}"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
     m.publish_shard(_result(1))
     _settle(m)
@@ -1024,26 +1025,37 @@ def check_outbox_on_reject(ctx):
 def check_fold_before_commit(ctx):
     for shard in (0, 1):
         ctx.kafka.seed(TOPIC, key="b1", value=json.dumps(_event(shard)))
+    # Last on the same partition, a shard of b9 whose fold fails: batch:outputs:b9 is not a hash.
+    ctx.kafka.seed(TOPIC, key="b1", value=json.dumps({**_event(2), "batch_id": "b9"}))
+    ctx.redis.set("batch:outputs:b9", "not-a-hash")
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(sorted(ctx.redis.hkeys("batch:outputs:b1"))))
     m = ctx.load("events")
-    ctx.drain(m.consume_shards)
+    try:
+        ctx.drain(m.consume_shards)
+    except Exception:  # noqa: BLE001 - the failed fold may end the coordinator; the offsets are the verdict
+        pass
     assert at_commit, "the coordinator never committed an offset"
     assert "0" in at_commit[0], f"at the first commit batch:outputs:b1 held {at_commit[0]}: shard 0's offset was committed before it was folded, and a crash between the two loses the shard for good"
     entry = json.loads(ctx.redis.hget("batch:outputs:b1", "0") or "{}")
-    assert entry.get("uri") == _uri(0) and entry.get("checksum") == "c0", f"the folded entry carries the event's uri and checksum, got {entry}"
+    assert entry.get("uri") == _uri(0) and entry.get("checksum") == "c0" and (entry.get("completed"), entry.get("failed")) == (2, 1), f"the folded entry carries the event's uri, checksum and counts, got {entry}"
     assert sorted(ctx.redis.hkeys("batch:outputs:b1")) == ["0", "1"], f"both shards must be folded, batch:outputs:b1 holds {ctx.redis.hkeys('batch:outputs:b1')}"
-    assert ctx.kafka.lag(GROUP, TOPIC) == 0, f"the coordinator left {ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted"
+    lag = ctx.kafka.lag(GROUP, TOPIC)
+    assert lag <= 1, f"the coordinator left {lag} record(s) uncommitted: every shard it folded must be committed"
+    assert lag == 1, "the fold of b9's shard failed (WRONGTYPE) and its offset was committed anyway: the shard is lost for good. Commit only after the fold succeeded"
 
 
 def check_fold_once(ctx):
     for shard in (0, 0, 1):  # shard 0 twice: a replay after a crash before the commit
         ctx.kafka.seed(TOPIC, key="b1", value=json.dumps(_event(shard)))
+    at_entry = ctx.redis_after("batch:outputs:b1", lambda: (len(ctx.redis.hkeys("batch:outputs:b1")), ctx.redis.hget("batch:totals:b1", "completed")))
     m = ctx.load("events")
     ctx.drain(m.consume_shards)
     assert sorted(ctx.redis.hkeys("batch:outputs:b1")) == ["0", "1"], f"two shards, two entries: batch:outputs:b1 holds {ctx.redis.hkeys('batch:outputs:b1')}"
     totals = ctx.redis.hgetall("batch:totals:b1")
     assert totals.get("completed") == "4" and totals.get("failed") == "2", f"two shards of 2 completed and 1 failed record are completed 4, failed 2; batch:totals:b1 holds {totals}: the replayed shard was counted twice"
+    entries, completed = at_entry.result if at_entry.fired else (0, None)
+    assert int(completed or 0) == 2 * entries, f"right after the coordinator's first command on batch:outputs:b1 it held {entries} entries and the totals said completed {completed}: the entry and its counts must land in one script, or a crash between them leaves a shard folded and never counted"
 `,
     typescript: `import {createHash} from 'node:crypto';
 
@@ -1116,6 +1128,7 @@ export async function check_outbox_on_reject(ctx) {
   const rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the broker refused one produce and batch:outbox holds \${rows.length} rows: the refusal arrives with the send's result, and a shard whose event is lost never reaches the batch\`);
   assert(rows[0].batch_id === 'b1' && rows[0].shard_id === 0, \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
+  assert(rows[0].output_uri === uri(0) && rows[0].checksum && rows[0].completed === 2 && rows[0].failed === 1, \`the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: \${JSON.stringify(rows[0])}\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
   await m.publishShard(result(1));
   await settle();
@@ -1124,25 +1137,37 @@ export async function check_outbox_on_reject(ctx) {
 
 export async function check_fold_before_commit(ctx) {
   for (const shard of [0, 1]) ctx.kafka.seed(TOPIC, {key: 'b1', value: JSON.stringify(event(shard))});
+  // Last on the same partition, a shard of b9 whose fold fails: batch:outputs:b9 is not a hash.
+  ctx.kafka.seed(TOPIC, {key: 'b1', value: JSON.stringify({...event(2), batch_id: 'b9'})});
+  ctx.redis.set('batch:outputs:b9', 'not-a-hash');
   const atCommit: string[][] = [];
   ctx.kafka.onCommit(() => atCommit.push(Object.keys(ctx.redis.hgetall('batch:outputs:b1')).sort()));
   const m = ctx.load('events');
-  await ctx.drain(m.consumeShards());
+  try {
+    await ctx.drain(m.consumeShards());
+  } catch {
+    // The failed fold may end the coordinator; the offsets are the verdict.
+  }
   assert(atCommit.length > 0, 'the coordinator never committed an offset');
   assert(atCommit[0].includes('0'), \`at the first commit batch:outputs:b1 held \${JSON.stringify(atCommit[0])}: shard 0's offset was committed before it was folded, and a crash between the two loses the shard for good\`);
   const entry = JSON.parse(ctx.redis.hget('batch:outputs:b1', '0') ?? '{}');
-  assert(entry.uri === uri(0) && entry.checksum === 'c0', \`the folded entry carries the event's uri and checksum, got \${JSON.stringify(entry)}\`);
+  assert(entry.uri === uri(0) && entry.checksum === 'c0' && entry.completed === 2 && entry.failed === 1, \`the folded entry carries the event's uri, checksum and counts, got \${JSON.stringify(entry)}\`);
   assert.deepEqual(Object.keys(ctx.redis.hgetall('batch:outputs:b1')).sort(), ['0', '1'], 'both shards must be folded');
-  assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, \`the coordinator left \${ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted\`);
+  const lag = ctx.kafka.lag(GROUP, TOPIC);
+  assert(lag <= 1, \`the coordinator left \${lag} record(s) uncommitted: every shard it folded must be committed\`);
+  assert.equal(lag, 1, "the fold of b9's shard failed (WRONGTYPE) and its offset was committed anyway: the shard is lost for good. Commit only after the fold succeeded");
 }
 
 export async function check_fold_once(ctx) {
   for (const shard of [0, 0, 1]) ctx.kafka.seed(TOPIC, {key: 'b1', value: JSON.stringify(event(shard))}); // shard 0 twice: a replay after a crash before the commit
+  const atEntry = ctx.redisAfter('batch:outputs:b1', () => [ctx.redis.hkeys('batch:outputs:b1').length, ctx.redis.hget('batch:totals:b1', 'completed')]);
   const m = ctx.load('events');
   await ctx.drain(m.consumeShards());
   assert.deepEqual(Object.keys(ctx.redis.hgetall('batch:outputs:b1')).sort(), ['0', '1'], 'two shards, two entries in batch:outputs:b1');
   const totals = ctx.redis.hgetall('batch:totals:b1');
   assert(totals.completed === '4' && totals.failed === '2', \`two shards of 2 completed and 1 failed record are completed 4, failed 2; batch:totals:b1 holds \${JSON.stringify(totals)}: the replayed shard was counted twice\`);
+  const [entries, completed] = atEntry.fired ? atEntry.result : [0, null];
+  assert.equal(Number(completed ?? 0), 2 * entries, \`right after the coordinator's first command on batch:outputs:b1 it held \${entries} entries and the totals said completed \${completed}: the entry and its counts must land in one script, or a crash between them leaves a shard folded and never counted\`);
 }
 `,
     go: `package main
@@ -1155,6 +1180,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	"batch/records"
 
@@ -1252,6 +1279,8 @@ func CheckOutboxOnReject(ctx *harness.Ctx) {
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: the refusal arrives as the write's error, and a shard whose event is lost never reaches the batch; outbox rows")
 	ctx.Assert(rows[0]["batch_id"] == "b1" && rows[0]["shard_id"] == float64(0), "the outbox row must be the event itself, got %v", rows[0])
+	checksum, _ := rows[0]["checksum"].(string)
+	ctx.Assert(rows[0]["output_uri"] == eventsURI(0) && checksum != "" && rows[0]["completed"] == float64(2) && rows[0]["failed"] == float64(1), "the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: %v", rows[0])
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
 	ctx.NoError(eventsPublish(eventsResult("b1", 1)), "a healthy produce")
 	ctx.Settle()
@@ -1262,6 +1291,9 @@ func CheckFoldBeforeCommit(ctx *harness.Ctx) {
 	for _, shard := range []int{0, 1} {
 		ctx.Kafka.Seed(eventsTopic, "b1", eventsEvent(shard))
 	}
+	// Last on the same partition, a shard of b9 whose fold fails: batch:outputs:b9 is not a hash.
+	ctx.Kafka.Seed(eventsTopic, "b1", strings.Replace(eventsEvent(2), \`"batch_id":"b1"\`, \`"batch_id":"b9"\`, 1))
+	ctx.Redis.Set("batch:outputs:b9", "not-a-hash")
 	var atCommit [][]string
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, eventsFolded(ctx)) })
 	ctx.Drain(func() { consumeShards(context.Background()) })
@@ -1274,19 +1306,28 @@ func CheckFoldBeforeCommit(ctx *harness.Ctx) {
 	raw, _ := ctx.Redis.HGet("batch:outputs:b1", "0")
 	var entry map[string]any
 	json.Unmarshal([]byte(raw), &entry)
-	ctx.Assert(entry["uri"] == eventsURI(0) && entry["checksum"] == "c0", "the folded entry carries the event's uri and checksum, got %s", raw)
+	ctx.Assert(entry["uri"] == eventsURI(0) && entry["checksum"] == "c0" && entry["completed"] == float64(2) && entry["failed"] == float64(1), "the folded entry carries the event's uri, checksum and counts, got %s", raw)
 	ctx.Equal(eventsFolded(ctx), []string{"0", "1"}, "both shards must be folded; batch:outputs:b1 holds")
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "records the coordinator left uncommitted")
+	lag := ctx.Kafka.Lag(eventsGroup, eventsTopic)
+	ctx.Assert(lag <= 1, "the coordinator left %d record(s) uncommitted: every shard it folded must be committed", lag)
+	ctx.Assert(lag == 1, "the fold of b9's shard failed (WRONGTYPE) and its offset was committed anyway: the shard is lost for good. Commit only after the fold succeeded")
 }
 
 func CheckFoldOnce(ctx *harness.Ctx) {
 	for _, shard := range []int{0, 0, 1} { // shard 0 twice: a replay after a crash before the commit
 		ctx.Kafka.Seed(eventsTopic, "b1", eventsEvent(shard))
 	}
+	entries, completed := 0, ""
+	ctx.Redis.After("batch:outputs:b1", func() any {
+		entries = len(eventsFolded(ctx))
+		completed, _ = ctx.Redis.HGet("batch:totals:b1", "completed")
+		return nil
+	})
 	ctx.Drain(func() { consumeShards(context.Background()) })
 	ctx.Equal(eventsFolded(ctx), []string{"0", "1"}, "two shards, two entries; batch:outputs:b1 holds")
 	totals := ctx.Redis.HGetAll("batch:totals:b1")
 	ctx.Assert(totals["completed"] == "4" && totals["failed"] == "2", "two shards of 2 completed and 1 failed record are completed 4, failed 2; batch:totals:b1 holds %v: the replayed shard was counted twice", totals)
+	ctx.Assert(completed == strconv.Itoa(2*entries) || (entries == 0 && completed == ""), "right after the coordinator's first command on batch:outputs:b1 it held %d entries and the totals said completed %q: the entry and its counts must land in one script, or a crash between them leaves a shard folded and never counted", entries, completed)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1390,6 +1431,7 @@ void CheckOutboxOnReject(harness::Ctx& ctx) {
   const auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: the refusal arrives in the delivery report, and a shard whose event is lost never reaches the batch; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].value("batch_id", "") == "b1" && rows[0].value("shard_id", -1) == 0, "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
+  ctx.Assert(rows[0].value("output_uri", "") == eventsUri(0) && !rows[0].value("checksum", "").empty() && rows[0].value("completed", -1) == 2 && rows[0].value("failed", -1) == 1, "the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: %v", rows[0]);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
   ctx.Equal(eventsPublish(eventsResult("b1", 1)), "", "a healthy produce threw");
   ctx.Settle();
@@ -1399,24 +1441,42 @@ void CheckOutboxOnReject(harness::Ctx& ctx) {
 
 void CheckFoldBeforeCommit(harness::Ctx& ctx) {
   for (int shard : {0, 1}) ctx.Kafka.Seed(kEventsTopic, "b1", eventsEvent(shard));
+  // Last on the same partition, a shard of b9 whose fold fails: batch:outputs:b9 is not a hash.
+  auto failing = nlohmann::json::parse(eventsEvent(2));
+  failing["batch_id"] = "b9";
+  ctx.Kafka.Seed(kEventsTopic, "b1", failing.dump());
+  ctx.Redis.Set("batch:outputs:b9", "not-a-hash");
   std::vector<std::vector<std::string>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(eventsFolded(ctx)); });
-  ctx.Drain([] { consume_shards(); });
+  try {
+    ctx.Drain([] { consume_shards(); });
+  } catch (const std::exception&) {
+    // The failed fold may end the coordinator; the offsets are the verdict.
+  }
   ctx.Assert(!atCommit.empty(), "the coordinator never committed an offset");
   ctx.Assert(std::find(atCommit[0].begin(), atCommit[0].end(), "0") != atCommit[0].end(), "at the first commit batch:outputs:b1 held %v: shard 0's offset was committed before it was folded, and a crash between the two loses the shard for good", atCommit[0]);
   const auto entry = nlohmann::json::parse(ctx.Redis.HGet("batch:outputs:b1", "0").value_or("{}"), nullptr, false);
-  ctx.Assert(entry.is_object() && entry.value("uri", "") == eventsUri(0) && entry.value("checksum", "") == "c0", "the folded entry carries the event's uri and checksum, got %v", entry);
+  ctx.Assert(entry.is_object() && entry.value("uri", "") == eventsUri(0) && entry.value("checksum", "") == "c0" && entry.value("completed", -1) == 2 && entry.value("failed", -1) == 1, "the folded entry carries the event's uri, checksum and counts, got %v", entry);
   ctx.Equal(eventsFolded(ctx), {"0", "1"}, "both shards must be folded; batch:outputs:b1 holds");
-  ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 0, "records the coordinator left uncommitted");
+  const auto lag = ctx.Kafka.Lag(kEventsGroup, kEventsTopic);
+  ctx.Assert(lag <= 1, "the coordinator left %d record(s) uncommitted: every shard it folded must be committed", lag);
+  ctx.Assert(lag == 1, "the fold of b9's shard failed (WRONGTYPE) and its offset was committed anyway: the shard is lost for good. Commit only after the fold succeeded");
 }
 
 void CheckFoldOnce(harness::Ctx& ctx) {
   for (int shard : {0, 0, 1}) ctx.Kafka.Seed(kEventsTopic, "b1", eventsEvent(shard));  // shard 0 twice: a replay after a crash before the commit
+  size_t entries = 0;
+  std::string completed;
+  ctx.Redis.After("batch:outputs:b1", [&] {
+    entries = eventsFolded(ctx).size();
+    completed = ctx.Redis.HGet("batch:totals:b1", "completed").value_or("");
+  });
   ctx.Drain([] { consume_shards(); });
   ctx.Equal(eventsFolded(ctx), {"0", "1"}, "two shards, two entries; batch:outputs:b1 holds");
   const auto totals = ctx.Redis.HGetAll("batch:totals:b1");
   const auto field = [&](const char* f) { return totals.count(f) ? totals.at(f) : std::string(); };
   ctx.Assert(field("completed") == "4" && field("failed") == "2", "two shards of 2 completed and 1 failed record are completed 4, failed 2; batch:totals:b1 holds %v: the replayed shard was counted twice", totals);
+  ctx.Assert(completed == std::to_string(2 * entries) || (entries == 0 && completed.empty()), "right after the coordinator's first command on batch:outputs:b1 it held %d entries and the totals said completed %q: the entry and its counts must land in one script, or a crash between them leaves a shard folded and never counted", entries, completed);
 }
 `,
   },

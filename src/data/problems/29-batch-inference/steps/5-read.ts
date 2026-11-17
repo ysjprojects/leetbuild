@@ -50,7 +50,7 @@ Requirements:
       id: 'route',
       title: 'Handles GET /v1/batches/{id}',
       detail:
-        'A batch with one shard done, one running and one pending answers 200 with status in_progress, the shard counts, request_counts with total and the outputs of the folded shard; an unknown id is 404 and a request without X-Tenant-Id is 401.',
+        'A batch with one shard done, one running and one pending answers 200 with status in_progress, the shard counts, request_counts with total and the outputs of the folded shard; an 11-shard batch lists its outputs by shard number, 0 to 10; an unknown id is 404 and a request without X-Tenant-Id is 401.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/batches\/\{batch_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/batches\/:batch_id['"]/]},
@@ -63,7 +63,7 @@ Requirements:
       id: 'tenant-scope',
       title: "Answers 404 for another tenant's batch",
       detail:
-        'A batch submitted by t1 read with X-Tenant-Id t2 is 404, the same answer as an unknown id, so the output URIs stay with their tenant. The starter answers whoever asks.',
+        'A batch submitted by t1 read with X-Tenant-Id t2 is 404 with the same body as an unknown id, so the output URIs stay with their tenant and the answer leaks nothing. The starter answers whoever asks.',
       match: {
         python: {
           all: [
@@ -80,7 +80,7 @@ Requirements:
       id: 'running-not-finished',
       title: 'Not completed while shards still run',
       detail:
-        'With one shard done, two running and the pending list empty, the status is in_progress, not completed. The starter reads an empty pending list as a finished batch.',
+        'With one shard done, two running and the pending list empty, the status is in_progress, not completed; so it is with two shards done and the third back on the pending list. The starter reads an empty pending list as a finished batch.',
       match: {
         python: {all: [/["']running["']/], none: [/\.llen\(/]},
         typescript: {all: [/['"]running['"]|\.running\b/], none: [/\.llen\(/]},
@@ -93,7 +93,7 @@ Requirements:
       id: 'failures-partial',
       title: 'A batch with a failed shard is partial',
       detail:
-        'With every shard terminal and one of them failed, the status is partial; completed means every shard is done. The starter calls it completed.',
+        'With every shard terminal and one of them failed, the status is partial; a failed shard beside a running one is still in_progress; completed means every shard is done. The starter calls it completed.',
       match: {
         python: {all: [/["']partial["']/]},
         typescript: {all: [/['"]partial['"]/]},
@@ -106,7 +106,7 @@ Requirements:
       id: 'record-counts',
       title: 'Counts records from the folded totals',
       detail:
-        'A 2500-record batch whose three shards are done, with batch:totals holding completed 2497 and failed 3, reports request_counts {total 2500, completed 2497, failed 3}. The starter reports SHARD_SIZE records per shard, 3000 completed.',
+        'A 2500-record batch whose three shards are done, with batch:totals holding completed 2497 and failed 3, reports request_counts {total 2500, completed 2497, failed 3}; before anything is folded (no batch:totals) it reports completed 0 and failed 0. The starter reports SHARD_SIZE records per shard, 3000 completed.',
       match: {
         python: {all: [/totals_key\(|batch:totals:/], none: [/\*\s*SHARD_SIZE/]},
         typescript: {all: [/totalsKey\(|batch:totals:/], none: [/\*\s*SHARD_SIZE/]},
@@ -750,6 +750,9 @@ async def check_route(ctx):
     assert body["outputs"] == [{"shard_id": 0, "uri": f"s3://batch-outputs/{B}/shard-00000.jsonl", "checksum": "c0"}], f"the outputs are the folded entries with their checksums: {body['outputs']}"
     assert (await _get(ctx, batch_id="nope")).status_code == 404, "an unknown batch id is 404"
     assert (await _get(ctx, headers={})).status_code == 401, "a read without X-Tenant-Id is 401"
+    _seed(ctx, ["done"] * 11, outputs=range(11))
+    shard_ids = [o.get("shard_id") for o in (await _get(ctx)).json().get("outputs", [])]
+    assert shard_ids == list(range(11)), f"the outputs of an 11-shard batch come by shard number, 0 to 10, got {shard_ids}"
 
 
 async def check_tenant_scope(ctx):
@@ -757,6 +760,9 @@ async def check_tenant_scope(ctx):
     r = await _get(ctx, headers={"X-Tenant-Id": "t2"})
     assert r.status_code == 404, f"tenant t2 read t1's batch and got {r.status_code}: {r.text[:200]}. A batch id is not a secret; another tenant's batch must be 404, as an unknown id is"
     assert (await _get(ctx)).status_code == 200, "the batch's own tenant reads it"
+    foreign = (await _get(ctx, headers={"X-Tenant-Id": "t2"})).text
+    unknown = (await _get(ctx, headers={"X-Tenant-Id": "t2"}, batch_id="nope")).text
+    assert foreign == unknown, f"another tenant's batch answered {foreign!r} and an unknown id {unknown!r}: the two answers must be the same, or the difference tells t2 which ids exist"
 
 
 async def check_running_not_finished(ctx):
@@ -765,18 +771,27 @@ async def check_running_not_finished(ctx):
     body = r.json()
     assert body.get("status") == "in_progress", f"with two shards still running the batch is in_progress, the read said {body.get('status')!r}: an empty pending list means every shard was claimed, not finished"
     assert body["shards"]["running"] == 2, f"two shards are running: {body['shards']}"
+    _seed(ctx, ["done", "done", "pending"])  # shard 2 requeued by the reaper: nothing runs, one shard waits
+    body = (await _get(ctx)).json()
+    assert body.get("status") == "in_progress", f"with shard 2 back on the pending list the batch is in_progress, the read said {body.get('status')!r}: a pending shard is unfinished work"
 
 
 async def check_failures_partial(ctx):
     _seed(ctx, ["done", "done", "failed"], totals={"completed": 1996, "failed": 4}, outputs=(0, 1))
     body = (await _get(ctx)).json()
     assert body.get("status") == "partial", f"every shard is terminal and one failed: the batch is partial, the read said {body.get('status')!r}"
+    _seed(ctx, ["done", "failed", "running"])
+    body = (await _get(ctx)).json()
+    assert body.get("status") == "in_progress", f"a shard failed but another still runs: the batch is in_progress until every shard is terminal, the read said {body.get('status')!r}"
     _seed(ctx, ["done", "done", "done"], totals={"completed": 2497, "failed": 3}, outputs=(0, 1, 2))
     body = (await _get(ctx)).json()
     assert body.get("status") == "completed", f"every shard done is completed, the read said {body.get('status')!r}"
 
 
 async def check_record_counts(ctx):
+    _seed(ctx, ["pending", "pending", "pending"])
+    body = (await _get(ctx)).json()
+    assert body.get("request_counts") == {"total": 2500, "completed": 0, "failed": 0}, f"a batch with nothing folded yet (no batch:totals) reports completed 0 and failed 0, got {body.get('request_counts')}"
     _seed(ctx, ["done", "done", "done"], totals={"completed": 2497, "failed": 3}, outputs=(0, 1, 2))
     body = (await _get(ctx)).json()
     assert body.get("request_counts") == {"total": 2500, "completed": 2497, "failed": 3}, f"request_counts must be the batch's 2500 records with the folded totals (completed 2497, failed 3), got {body.get('request_counts')}: shard counts times SHARD_SIZE invent records"
@@ -814,6 +829,9 @@ export async function check_route(ctx) {
   assert.deepEqual(body.outputs, [{shard_id: 0, uri: \`s3://batch-outputs/\${B}/shard-00000.jsonl\`, checksum: 'c0'}], \`the outputs are the folded entries with their checksums: \${JSON.stringify(body.outputs)}\`);
   assert.equal((await get(ctx, TENANT, 'nope')).status, 404, 'an unknown batch id is 404');
   assert.equal((await get(ctx, {})).status, 401, 'a read without X-Tenant-Id is 401');
+  seed(ctx, Array(11).fill('done'), null, Array.from({length: 11}, (_, i) => i));
+  const shardIds = ((await get(ctx)).json().outputs ?? []).map(o => o.shard_id);
+  assert.deepEqual(shardIds, Array.from({length: 11}, (_, i) => i), \`the outputs of an 11-shard batch come by shard number, 0 to 10, got \${JSON.stringify(shardIds)}\`);
 }
 
 export async function check_tenant_scope(ctx) {
@@ -821,6 +839,9 @@ export async function check_tenant_scope(ctx) {
   const r = await get(ctx, {'X-Tenant-Id': 't2'});
   assert.equal(r.status, 404, \`tenant t2 read t1's batch and got \${r.status}: \${r.text.slice(0, 200)}. A batch id is not a secret; another tenant's batch must be 404, as an unknown id is\`);
   assert.equal((await get(ctx)).status, 200, "the batch's own tenant reads it");
+  const foreign = (await get(ctx, {'X-Tenant-Id': 't2'})).text;
+  const unknown = (await get(ctx, {'X-Tenant-Id': 't2'}, 'nope')).text;
+  assert.equal(foreign, unknown, \`another tenant's batch answered \${foreign} and an unknown id \${unknown}: the two answers must be the same, or the difference tells t2 which ids exist\`);
 }
 
 export async function check_running_not_finished(ctx) {
@@ -828,18 +849,28 @@ export async function check_running_not_finished(ctx) {
   const body = (await get(ctx)).json();
   assert.equal(body.status, 'in_progress', \`with two shards still running the batch is in_progress, the read said \${JSON.stringify(body.status)}: an empty pending list means every shard was claimed, not finished\`);
   assert.equal(body.shards.running, 2, \`two shards are running: \${JSON.stringify(body.shards)}\`);
+  seed(ctx, ['done', 'done', 'pending']); // shard 2 requeued by the reaper: nothing runs, one shard waits
+  const requeued = (await get(ctx)).json();
+  assert.equal(requeued.status, 'in_progress', \`with shard 2 back on the pending list the batch is in_progress, the read said \${JSON.stringify(requeued.status)}: a pending shard is unfinished work\`);
 }
 
 export async function check_failures_partial(ctx) {
   seed(ctx, ['done', 'done', 'failed'], {completed: 1996, failed: 4}, [0, 1]);
   let body = (await get(ctx)).json();
   assert.equal(body.status, 'partial', \`every shard is terminal and one failed: the batch is partial, the read said \${JSON.stringify(body.status)}\`);
+  seed(ctx, ['done', 'failed', 'running']);
+  body = (await get(ctx)).json();
+  assert.equal(body.status, 'in_progress', \`a shard failed but another still runs: the batch is in_progress until every shard is terminal, the read said \${JSON.stringify(body.status)}\`);
   seed(ctx, ['done', 'done', 'done'], {completed: 2497, failed: 3}, [0, 1, 2]);
   body = (await get(ctx)).json();
   assert.equal(body.status, 'completed', \`every shard done is completed, the read said \${JSON.stringify(body.status)}\`);
 }
 
 export async function check_record_counts(ctx) {
+  seed(ctx, ['pending', 'pending', 'pending']);
+  ctx.redis.del(\`batch:totals:\${B}\`);
+  const fresh = (await get(ctx)).json();
+  assert.deepEqual(fresh.request_counts, {total: 2500, completed: 0, failed: 0}, \`a batch with nothing folded yet (no batch:totals) reports completed 0 and failed 0, got \${JSON.stringify(fresh.request_counts)}\`);
   seed(ctx, ['done', 'done', 'done'], {completed: 2497, failed: 3}, [0, 1, 2]);
   const body = (await get(ctx)).json();
   assert.deepEqual(body.request_counts, {total: 2500, completed: 2497, failed: 3}, \`request_counts must be the batch's 2500 records with the folded totals (completed 2497, failed 3), got \${JSON.stringify(body.request_counts)}: shard counts times SHARD_SIZE invent records\`);
@@ -905,6 +936,22 @@ func CheckRoute(ctx *harness.Ctx) {
 	ctx.Equal(body["outputs"], []any{map[string]any{"shard_id": float64(0), "uri": "s3://batch-outputs/b1/shard-00000.jsonl", "checksum": "c0"}}, "the outputs are the folded entries with their checksums")
 	ctx.Equal(readGet(ctx, "nope", "X-Tenant-Id", "t1").Status, 404, "an unknown batch id")
 	ctx.Equal(readGet(ctx, readBatch).Status, 401, "a read without X-Tenant-Id")
+	all := make([]int, 11)
+	for i := range all {
+		all[i] = i
+	}
+	readSeed(ctx, []string{"done", "done", "done", "done", "done", "done", "done", "done", "done", "done", "done"}, 0, 0, all)
+	outputs, _ := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))["outputs"].([]any)
+	shardIDs := []any{}
+	for _, o := range outputs {
+		entry, _ := o.(map[string]any)
+		shardIDs = append(shardIDs, entry["shard_id"])
+	}
+	want := []any{}
+	for i := range all {
+		want = append(want, float64(i))
+	}
+	ctx.Equal(shardIDs, want, "the outputs of an 11-shard batch come by shard number, 0 to 10; shard ids")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
@@ -912,6 +959,9 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	r := readGet(ctx, readBatch, "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 read t1's batch: a batch id is not a secret, another tenant's batch must be 404 as an unknown id is")
 	ctx.Equal(readGet(ctx, readBatch, "X-Tenant-Id", "t1").Status, 200, "the batch's own tenant reads it")
+	foreign := readGet(ctx, readBatch, "X-Tenant-Id", "t2").Text()
+	unknown := readGet(ctx, "nope", "X-Tenant-Id", "t2").Text()
+	ctx.Assert(foreign == unknown, "another tenant's batch answered %q and an unknown id %q: the two answers must be the same, or the difference tells t2 which ids exist", foreign, unknown)
 }
 
 func CheckRunningNotFinished(ctx *harness.Ctx) {
@@ -920,18 +970,28 @@ func CheckRunningNotFinished(ctx *harness.Ctx) {
 	ctx.Equal(body["status"], "in_progress", "with two shards still running the batch is in_progress (an empty pending list means every shard was claimed, not finished); status")
 	shards, _ := body["shards"].(map[string]any)
 	ctx.Equal(shards["running"], float64(2), "two shards are running")
+	readSeed(ctx, []string{"done", "done", "pending"}, 998, 2, []int{0}) // shard 2 requeued by the reaper: nothing runs, one shard waits
+	body = readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	ctx.Equal(body["status"], "in_progress", "with shard 2 back on the pending list the batch is in_progress (a pending shard is unfinished work); status")
 }
 
 func CheckFailuresPartial(ctx *harness.Ctx) {
 	readSeed(ctx, []string{"done", "done", "failed"}, 1996, 4, []int{0, 1})
 	body := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "partial", "every shard is terminal and one failed: the batch is partial; status")
+	readSeed(ctx, []string{"done", "failed", "running"}, 998, 2, []int{0})
+	body = readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	ctx.Equal(body["status"], "in_progress", "a shard failed but another still runs: the batch is in_progress until every shard is terminal; status")
 	readSeed(ctx, []string{"done", "done", "done"}, 2497, 3, []int{0, 1, 2})
 	body = readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "completed", "every shard done is completed; status")
 }
 
 func CheckRecordCounts(ctx *harness.Ctx) {
+	readSeed(ctx, []string{"pending", "pending", "pending"}, 0, 0, nil)
+	ctx.Redis.Del("batch:totals:" + readBatch)
+	fresh := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	ctx.Equal(fresh["request_counts"], map[string]any{"total": float64(2500), "completed": float64(0), "failed": float64(0)}, "a batch with nothing folded yet (no batch:totals) reports completed 0 and failed 0; request_counts")
 	readSeed(ctx, []string{"done", "done", "done"}, 2497, 3, []int{0, 1, 2})
 	body := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["request_counts"], map[string]any{"total": float64(2500), "completed": float64(2497), "failed": float64(3)}, "request_counts must be the batch's 2500 records with the folded totals (shard counts times ShardSize invent records)")
@@ -995,6 +1055,16 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Equal(body["outputs"], json::array({json{{"shard_id", 0}, {"uri", "s3://batch-outputs/b1/shard-00000.jsonl"}, {"checksum", "c0"}}}), "the outputs are the folded entries with their checksums");
   ctx.Equal(read.http.Get("/v1/batches/nope", "X-Tenant-Id", "t1").Status, 404, "an unknown batch id");
   ctx.Equal(read.http.Get("/v1/batches/" + kBatch).Status, 401, "a read without X-Tenant-Id");
+  std::vector<int> all;
+  json want = json::array();
+  for (int i = 0; i < 11; i++) {
+    all.push_back(i);
+    want.push_back(i);
+  }
+  readSeed(ctx, std::vector<std::string>(11, "done"), 0, 0, all);
+  json shardIds = json::array();
+  for (const auto& o : bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1")).value("outputs", json::array())) shardIds.push_back(o.value("shard_id", json()));
+  ctx.Equal(shardIds, want, "the outputs of an 11-shard batch come by shard number, 0 to 10; shard ids");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
@@ -1002,6 +1072,9 @@ void CheckTenantScope(harness::Ctx& ctx) {
   Read read(ctx);
   ctx.Equal(read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t2").Status, 404, "tenant t2 read t1's batch: a batch id is not a secret, another tenant's batch must be 404 as an unknown id is");
   ctx.Equal(read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1").Status, 200, "the batch's own tenant reads it");
+  const auto foreign = read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t2").Text();
+  const auto unknown = read.http.Get("/v1/batches/nope", "X-Tenant-Id", "t2").Text();
+  ctx.Assert(foreign == unknown, "another tenant's batch answered %q and an unknown id %q: the two answers must be the same, or the difference tells t2 which ids exist", foreign, unknown);
 }
 
 void CheckRunningNotFinished(harness::Ctx& ctx) {
@@ -1010,6 +1083,9 @@ void CheckRunningNotFinished(harness::Ctx& ctx) {
   const json body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "in_progress", "with two shards still running the batch is in_progress (an empty pending list means every shard was claimed, not finished); status");
   ctx.Equal(body["shards"].value("running", -1), 2, "two shards are running");
+  readSeed(ctx, {"done", "done", "pending"}, 998, 2, {0});  // shard 2 requeued by the reaper: nothing runs, one shard waits
+  const json requeued = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  ctx.Equal(requeued.value("status", ""), "in_progress", "with shard 2 back on the pending list the batch is in_progress (a pending shard is unfinished work); status");
 }
 
 void CheckFailuresPartial(harness::Ctx& ctx) {
@@ -1017,14 +1093,21 @@ void CheckFailuresPartial(harness::Ctx& ctx) {
   Read read(ctx);
   json body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "partial", "every shard is terminal and one failed: the batch is partial; status");
+  readSeed(ctx, {"done", "failed", "running"}, 998, 2, {0});
+  body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  ctx.Equal(body.value("status", ""), "in_progress", "a shard failed but another still runs: the batch is in_progress until every shard is terminal; status");
   readSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
   body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "completed", "every shard done is completed; status");
 }
 
 void CheckRecordCounts(harness::Ctx& ctx) {
-  readSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
   Read read(ctx);
+  readSeed(ctx, {"pending", "pending", "pending"}, 0, 0, {});
+  ctx.Redis.Del("batch:totals:" + kBatch);
+  const json fresh = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  ctx.Equal(fresh["request_counts"], json{{"total", 2500}, {"completed", 0}, {"failed", 0}}, "a batch with nothing folded yet (no batch:totals) reports completed 0 and failed 0; request_counts");
+  readSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
   const json body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body["request_counts"], json{{"total", 2500}, {"completed", 2497}, {"failed", 3}}, "request_counts must be the batch's 2500 records with the folded totals (shard counts times kShardSize invent records)");
 }

@@ -20,9 +20,9 @@ answer, which confirms the id exists and ranks acme's corpus against globex's ve
 document's nearest neighbour is itself; and during a reindex a document embedded by the old model is
 compared with vectors from the new one, while the answer claims the new version.
 
-- The document is the tenant's (\`corpus.document(tenant, id)\`); another tenant's id is **404**, like a
-  missing one.
-- The document is not its own neighbour: the answer holds \`k\` other documents.
+- The document is the tenant's (\`corpus.document(tenant, id)\`); another tenant's id is **404** with
+  the same answer as a missing one.
+- The document is not its own neighbour, wherever it ranks: the answer holds \`k\` other documents.
 - The neighbours come from the version the document was embedded for (its \`version\`), and
   \`index_version\` names it.`,
   sequence: {
@@ -41,7 +41,7 @@ compared with vectors from the new one, while the answer claims the new version.
       id: 'route',
       title: 'Answers GET /v1/documents/{id}/neighbors',
       detail:
-        'Register `GET /v1/documents/{id}/neighbors`: **401** without `X-Tenant-Id`, **400** for `k` outside 1 to 20, and `{document_id, neighbors, index_version}` from `nearest` otherwise.',
+        'Register `GET /v1/documents/{id}/neighbors`: **401** when `X-Tenant-Id` is absent or empty, **400** for `k` outside 1 to 20, and `{document_id, neighbors, index_version}` from `nearest` otherwise.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/documents\/\{document_id\}\/neighbors["']/, /corpus\.nearest\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/documents\/:documentId\/neighbors['"]/, /nearest\(/]},
@@ -60,7 +60,7 @@ compared with vectors from the new one, while the answer claims the new version.
       id: 'tenant-scope',
       title: "Loads only the tenant's document",
       detail:
-        "The document is loaded with `document(tenant, id)`, and another tenant's id answers **404** like a missing one, so the endpoint confirms nothing about other tenants. The starter uses `document_by_id`, which finds any tenant's document.",
+        "The document is loaded with `document(tenant, id)`, and another tenant's id answers **404** with the same body as a missing one, so the endpoint confirms nothing about other tenants. The starter uses `document_by_id`, which finds any tenant's document.",
       match: {
         python: {all: [/corpus\.document\(\s*tenant\s*,/], none: [/document_by_id\(/]},
         typescript: {all: [/\bdocument\(\s*tenant\s*,/], none: [/documentById\(/]},
@@ -73,7 +73,7 @@ compared with vectors from the new one, while the answer claims the new version.
       id: 'excludes-self',
       title: 'A document is not its own neighbour',
       detail:
-        "The search asks for `k + 1` and drops the document's own id, so the answer holds `k` other documents. The starter returns the document itself first, with the top score.",
+        "The search asks for `k + 1` and drops the document's own id, wherever it ranks (a document can score another above itself), so the answer holds `k` other documents. The starter returns the document itself first, with the top score.",
       match: {
         python: {all: [/\bk\s*\+\s*1\b/, /!=\s*document_id\b/]},
         typescript: {all: [/\bk\s*\+\s*1\b/, /!==\s*documentId\b/]},
@@ -535,12 +535,18 @@ async def check_route(ctx):
     async with _read(ctx) as c:
         r = await c.get("/v1/documents/d1/neighbors?k=2", headers=ACME)
         anonymous = await c.get("/v1/documents/d1/neighbors?k=2")
+        empty = await c.get("/v1/documents/d1/neighbors?k=2", headers={"X-Tenant-Id": ""})
         big = await c.get("/v1/documents/d1/neighbors?k=21", headers=ACME)
+        zero = await c.get("/v1/documents/d1/neighbors?k=0", headers=ACME)
+        cap = await c.get("/v1/documents/d1/neighbors?k=20", headers=ACME)
     assert r.status_code == 200, f"GET /v1/documents/d1/neighbors answered {r.status_code}: {r.text}"
     body = r.json()
     assert "d2" in _ids(r) and body.get("document_id") == "d1" and body.get("index_version") == "idx-42", f"d1's neighbours must include d2, labelled idx-42, got {body}"
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert empty.status_code == 401, f"a read with an empty X-Tenant-Id answered {empty.status_code}, expected 401"
     assert big.status_code == 400, f"k 21 answered {big.status_code}, expected 400"
+    assert zero.status_code == 400, f"k 0 answered {zero.status_code}, expected 400"
+    assert cap.status_code == 200, f"k 20 is allowed, got {cap.status_code} {cap.text}"
 
 
 async def check_tenant_scope(ctx):
@@ -552,14 +558,18 @@ async def check_tenant_scope(ctx):
     assert foreign.status_code == 404, f"acme asked for the neighbours of globex's g1 and got {foreign.status_code} {foreign.text}: another tenant's document must be 404, like a missing one"
     assert reverse.status_code == 404, f"globex asked for the neighbours of acme's d1 and got {reverse.status_code} {reverse.text}, expected 404"
     assert missing.status_code == 404, f"a missing document answered {missing.status_code}, expected 404"
+    assert foreign.text.replace("g1", "{id}") == missing.text.replace("nope", "{id}"), f"globex's g1 answered acme {foreign.text} but a missing id answers {missing.text}: the difference tells acme the id exists in another tenant. Answer both the same way"
     assert own.status_code == 200 and _ids(own) == ["g2"], f"globex reading its own g1 must answer g2, got {own.status_code} {own.text}"
 
 
 async def check_excludes_self(ctx):
     async with _read(ctx) as c:
         r = await c.get("/v1/documents/d1/neighbors?k=2", headers=ACME)
+        # d3 [0.6, 0.4] scores d1 (0.6) and d2 (0.58) above itself (0.52): it is not the first hit of its own search.
+        inner = await c.get("/v1/documents/d3/neighbors?k=2", headers=ACME)
     assert "d1" not in _ids(r), f"d1's neighbours include d1 itself: {r.text}. Ask for k + 1 and drop the document"
     assert _ids(r) == ["d2", "d3"], f"d1's two nearest other documents are d2 and d3, got {r.text}"
+    assert _ids(inner) == ["d1", "d2"], f"d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52); got {inner.text}: drop the document by its id, wherever it ranks"
 
 
 async def check_document_version(ctx):
@@ -600,12 +610,18 @@ export async function check_route(ctx) {
   const {c} = await read(ctx);
   const r = await c.get('/v1/documents/d1/neighbors?k=2', {headers: ACME});
   const anonymous = await c.get('/v1/documents/d1/neighbors?k=2');
+  const empty = await c.get('/v1/documents/d1/neighbors?k=2', {headers: {'X-Tenant-Id': ''}});
   const big = await c.get('/v1/documents/d1/neighbors?k=21', {headers: ACME});
+  const zero = await c.get('/v1/documents/d1/neighbors?k=0', {headers: ACME});
+  const cap = await c.get('/v1/documents/d1/neighbors?k=20', {headers: ACME});
   assert.equal(r.status, 200, \`GET /v1/documents/d1/neighbors answered \${r.status}: \${r.text}\`);
   const body = r.json();
   assert(ids(r).split(',').includes('d2') && body.document_id === 'd1' && body.index_version === 'idx-42', \`d1's neighbours must include d2, labelled idx-42, got \${r.text}\`);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(empty.status, 401, \`a read with an empty X-Tenant-Id answered \${empty.status}, expected 401\`);
   assert.equal(big.status, 400, \`k 21 answered \${big.status}, expected 400\`);
+  assert.equal(zero.status, 400, \`k 0 answered \${zero.status}, expected 400\`);
+  assert.equal(cap.status, 200, \`k 20 is allowed, got \${cap.status} \${cap.text}\`);
 }
 
 export async function check_tenant_scope(ctx) {
@@ -617,14 +633,22 @@ export async function check_tenant_scope(ctx) {
   assert.equal(foreign.status, 404, \`acme asked for the neighbours of globex's g1 and got \${foreign.status} \${foreign.text}: another tenant's document must be 404, like a missing one\`);
   assert.equal(reverse.status, 404, \`globex asked for the neighbours of acme's d1 and got \${reverse.status} \${reverse.text}, expected 404\`);
   assert.equal(missing.status, 404, \`a missing document answered \${missing.status}, expected 404\`);
+  assert.equal(
+    foreign.text.replaceAll('g1', '{id}'),
+    missing.text.replaceAll('nope', '{id}'),
+    \`globex's g1 answered acme \${foreign.text} but a missing id answers \${missing.text}: the difference tells acme the id exists in another tenant. Answer both the same way\`,
+  );
   assert(own.status === 200 && ids(own) === 'g2', \`globex reading its own g1 must answer g2, got \${own.status} \${own.text}\`);
 }
 
 export async function check_excludes_self(ctx) {
   const {c} = await read(ctx);
   const r = await c.get('/v1/documents/d1/neighbors?k=2', {headers: ACME});
+  // d3 [0.6, 0.4] scores d1 (0.6) and d2 (0.58) above itself (0.52): it is not the first hit of its own search.
+  const inner = await c.get('/v1/documents/d3/neighbors?k=2', {headers: ACME});
   assert(!ids(r).split(',').includes('d1'), \`d1's neighbours include d1 itself: \${r.text}. Ask for k + 1 and drop the document\`);
   assert.equal(ids(r), 'd2,d3', \`d1's two nearest other documents are d2 and d3, got \${r.text}\`);
+  assert.equal(ids(inner), 'd1,d2', \`d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52); got \${inner.text}: drop the document by its id, wherever it ranks\`);
 }
 
 export async function check_document_version(ctx) {
@@ -692,12 +716,18 @@ func CheckRoute(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	r := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme")
 	anonymous := c.Get("/v1/documents/d1/neighbors?k=2")
+	empty := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "")
 	big := c.Get("/v1/documents/d1/neighbors?k=21", "X-Tenant-Id", "acme")
+	zero := c.Get("/v1/documents/d1/neighbors?k=0", "X-Tenant-Id", "acme")
+	limit := c.Get("/v1/documents/d1/neighbors?k=20", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/documents/d1/neighbors (%s)", r.Text())
 	a := readOf(r)
 	ctx.Assert(strings.Contains(neighborIDs(r), "d2") && a.DocumentID == "d1" && a.IndexVersion == "idx-42", "d1's neighbours must include d2, labelled idx-42, got %s", r.Text())
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id")
 	ctx.Equal(big.Status, 400, "k 21")
+	ctx.Equal(zero.Status, 400, "k 0")
+	ctx.Equal(limit.Status, 200, "k 20 is allowed (%s)", limit.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
@@ -709,14 +739,18 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	ctx.Equal(foreign.Status, 404, "acme asked for the neighbours of globex's g1 and got %s: another tenant's document must be 404, like a missing one; the status", foreign.Text())
 	ctx.Equal(reverse.Status, 404, "globex asked for the neighbours of acme's d1 (%s)", reverse.Text())
 	ctx.Equal(missing.Status, 404, "a missing document")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), "g1", "{id}"), strings.ReplaceAll(missing.Text(), "nope", "{id}"), "globex's g1 answered acme differently from a missing id, which tells acme the id exists in another tenant; answer both the same way. The answers, ids replaced by {id}")
 	ctx.Assert(own.Status == 200 && neighborIDs(own) == "g2", "globex reading its own g1 must answer g2, got %d %s", own.Status, own.Text())
 }
 
 func CheckExcludesSelf(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	r := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme")
+	// d3 [0.6, 0.4] scores d1 (0.6) and d2 (0.58) above itself (0.52): it is not the first hit of its own search.
+	inner := c.Get("/v1/documents/d3/neighbors?k=2", "X-Tenant-Id", "acme")
 	ctx.Assert(!strings.Contains(neighborIDs(r), "d1"), "d1's neighbours include d1 itself: %s. Ask for k + 1 and drop the document", r.Text())
 	ctx.Equal(neighborIDs(r), "d2,d3", "d1's two nearest other documents")
+	ctx.Equal(neighborIDs(inner), "d1,d2", "d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52): drop the document by its id, wherever it ranks; d3's neighbours")
 }
 
 func CheckDocumentVersion(ctx *harness.Ctx) {
@@ -770,19 +804,31 @@ std::string ids(const harness::Response& r) {
 
 bool contains(const std::string& haystack, const std::string& needle) { return haystack.find(needle) != std::string::npos; }
 
+// text with every occurrence of id written as {id}: two answers that differ only by the id they name compare equal.
+std::string withoutId(std::string text, const std::string& id) {
+  for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = readApi(ctx);
   const auto r = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme");
   const auto anonymous = c.Get("/v1/documents/d1/neighbors?k=2");
+  const auto empty = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "");
   const auto big = c.Get("/v1/documents/d1/neighbors?k=21", "X-Tenant-Id", "acme");
+  const auto zero = c.Get("/v1/documents/d1/neighbors?k=0", "X-Tenant-Id", "acme");
+  const auto limit = c.Get("/v1/documents/d1/neighbors?k=20", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/documents/d1/neighbors (%s)", r.Text());
   const auto body = parsed(r);
   ctx.Assert(contains(ids(r), "d2") && body.value("document_id", std::string()) == "d1" && body.value("index_version", std::string()) == "idx-42",
              "d1's neighbours must include d2, labelled idx-42, got %s", r.Text());
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id");
   ctx.Equal(big.Status, 400, "k 21");
+  ctx.Equal(zero.Status, 400, "k 0");
+  ctx.Equal(limit.Status, 200, "k 20 is allowed (%s)", limit.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
@@ -794,14 +840,18 @@ void CheckTenantScope(harness::Ctx& ctx) {
   ctx.Equal(foreign.Status, 404, "acme asked for the neighbours of globex's g1 and got %s: another tenant's document must be 404, like a missing one; the status", foreign.Text());
   ctx.Equal(reverse.Status, 404, "globex asked for the neighbours of acme's d1 (%s)", reverse.Text());
   ctx.Equal(missing.Status, 404, "a missing document");
+  ctx.Equal(withoutId(foreign.Text(), "g1"), withoutId(missing.Text(), "nope"), "globex's g1 answered acme differently from a missing id, which tells acme the id exists in another tenant; answer both the same way. The answers, ids replaced by {id}");
   ctx.Assert(own.Status == 200 && ids(own) == "g2", "globex reading its own g1 must answer g2, got %d %s", own.Status, own.Text());
 }
 
 void CheckExcludesSelf(harness::Ctx& ctx) {
   auto c = readApi(ctx);
   const auto r = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme");
+  // d3 [0.6, 0.4] scores d1 (0.6) and d2 (0.58) above itself (0.52): it is not the first hit of its own search.
+  const auto inner = c.Get("/v1/documents/d3/neighbors?k=2", "X-Tenant-Id", "acme");
   ctx.Assert(!contains(ids(r), "d1"), "d1's neighbours include d1 itself: %s. Ask for k + 1 and drop the document", r.Text());
   ctx.Equal(ids(r), "d2,d3", "d1's two nearest other documents");
+  ctx.Equal(ids(inner), "d1,d2", "d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52): drop the document by its id, wherever it ranks; d3's neighbours");
 }
 
 void CheckDocumentVersion(harness::Ctx& ctx) {

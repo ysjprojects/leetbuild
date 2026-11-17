@@ -25,12 +25,13 @@ under-bills.
 - The record key is the **tenant**; the event id stays the request id.
 - The producer is **idempotent** with \`acks=all\` (kafka-go has no idempotent mode: \`RequireAll\`
   is what it can promise).
-- The event carries \`id\`, \`tenant\`, \`model\`, \`input_tokens\`, \`output_tokens\`, \`latency_ms\`,
-  \`status\`; the messages are not in the event and not in a log line.
+- The event carries exactly \`id\`, \`tenant\`, \`model\`, \`input_tokens\`, \`output_tokens\`,
+  \`latency_ms\`, \`status\`, taken field by field; the messages are not in the event and not in a
+  log line.
 - A delivery failure, reported through the **delivery callback**, writes the event to the provided
   \`outbox\` (\`gateway/outbox\`: \`insert(event, reason)\`, the Redis list \`outbox:usage\`); the request
-  path does not wait for the broker.
-- \`run_billing\` increments **before** it commits.`,
+  path does not wait for the broker, even one that stops answering.
+- \`run_billing\` increments **before** it commits, and never commits past an increment that failed.`,
   sequence: {
     participants: ['gateway', 'usage', 'billing', 'Redis'],
     messages: [
@@ -52,7 +53,7 @@ under-bills.
       id: 'tenant-key',
       title: 'Produces with the tenant as the key',
       detail:
-        "The record key is the tenant, so one tenant's usage lands on one partition in order; keyed by request id a tenant is spread across all of them.",
+        "The record key is the tenant, so one tenant's usage lands on one partition in order; keyed by request id a tenant is spread across all of them. The event is exactly the request id, the tenant, the model, the provider's counts, the latency and the status.",
       match: {
         python: {all: [/\.produce\([\s\S]{0,300}?key\s*=\s*event\[["']tenant["']\]/]},
         typescript: {all: [/key:\s*event\.tenant/]},
@@ -78,7 +79,7 @@ under-bills.
       id: 'no-prompt-content',
       title: 'No message content in the event or the logs',
       detail:
-        'The event is ids, counts, latency and status; the messages are neither serialised into the record nor logged.',
+        'The event is ids, counts, latency and status, built from those fields one by one: no other field of the request (the messages, or the prompt under any other name) is serialised into the record, and no log line carries the prompt.',
       match: {
         python: {
           none: [
@@ -102,7 +103,7 @@ under-bills.
       id: 'outbox',
       title: 'A failed delivery goes to the outbox',
       detail:
-        "A delivery error, served through the delivery callback (`on_delivery`, the send promise's rejection, `Completion`, the `Callback`, `dr_cb`), writes the event to `outbox.insert(event, reason)`; the request path neither waits for the broker nor drops the event.",
+        "A delivery error, served through the delivery callback (`on_delivery`, the send promise's rejection, `Completion`, the `Callback`, `dr_cb`), writes the event to `outbox.insert(event, reason)`; the request path neither waits for the broker (not even one that has stopped answering) nor drops the event.",
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=|callback\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /\.catch\(|catch\s*\(/]},
@@ -115,7 +116,7 @@ under-bills.
       id: 'commit-after-increment',
       title: 'HINCRBY before the offset commit',
       detail:
-        'The consumer increments `usage:{tenant}:{day}` and only then commits; a crash between a commit and the increment loses the charge.',
+        'The consumer increments `usage:{tenant}:{day}` and only then commits; a crash between a commit and the increment loses the charge, and so does committing past an increment that failed.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -952,9 +953,8 @@ def check_tenant_key(ctx):
     assert keys == [b"acme", b"beta", b"acme"], f"records must be keyed by the tenant, got {keys}"
     assert records[0].partition == records[2].partition, "one tenant's events must land on one partition so they stay in order"
     event = json.loads(records[0].value)
-    assert event.get("id") == "r-1" and event.get("tenant") == "acme", f"the event id stays the request id and carries the tenant: {event}"
-    for field in ("model", "input_tokens", "output_tokens", "latency_ms", "status"):
-        assert field in event, f"the event is missing {field}: {event}"
+    expected = {"id": "r-1", "tenant": "acme", "model": "gpt-4o-mini", "input_tokens": 100, "output_tokens": 50, "latency_ms": 812.5, "status": 200}
+    assert event == expected, f"the event must be exactly {expected} (the request id, the tenant, the provider's counts), got {event}"
 
 
 def check_idempotent_acks(ctx):
@@ -980,14 +980,17 @@ def check_no_prompt_content(ctx):
     try:
         with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
             m.emit_usage(m.build_event(_request("r-1", content=CANARY), _usage()))
+            # A client that also sent the prompt in a field of its own: the event lists its fields, it does not copy the request.
+            m.emit_usage(m.build_event({**_request("r-2", content=CANARY), "input": CANARY}, _usage()))
             m.producer.poll(0)
     finally:
         logging.getLogger().removeHandler(handler)
     records = ctx.kafka.records("usage")
-    assert len(records) == 1, f"one emit_usage call produced {len(records)} records"
-    value = records[0].value.decode()
-    assert "CANARY-7731" not in value, f"the usage event carries the prompt: {value}"
-    assert "messages" not in json.loads(value), f"the usage event carries the messages: {value}"
+    assert len(records) == 2, f"two emit_usage calls produced {len(records)} records"
+    for record in records:
+        value = record.value.decode()
+        assert "CANARY-7731" not in value, f"the usage event carries the prompt: {value}. Build it from the listed fields, not from the request minus messages"
+        assert "messages" not in json.loads(value), f"the usage event carries the messages: {value}"
     assert "CANARY-7731" not in captured.getvalue(), f"the prompt was printed or logged: {captured.getvalue().strip()!r}"
 
 
@@ -1008,6 +1011,13 @@ def check_outbox(ctx):
     m.producer.poll(0)
     assert [json.loads(r.value)["id"] for r in ctx.kafka.records("usage")] == ["r-10"], "once the broker accepts records again they flow to the topic"
     assert len(_outbox(ctx)) == 1, "a delivered record must not be written to the outbox"
+    # The broker stops answering: emit_usage still returns at once, the answered request does not wait.
+    ctx.kafka.stall("usage")
+    started = ctx.clock.time()
+    m.emit_usage(m.build_event(_request("r-11"), _usage()))
+    waited = ctx.clock.time() - started
+    assert waited < 0.5, f"with the broker not answering emit_usage held the request for {waited:.1f} s: serve delivery reports without waiting (poll(0))"
+    ctx.kafka.resume("usage")
 
 
 def check_commit_after_increment(ctx):
@@ -1022,6 +1032,14 @@ def check_commit_after_increment(ctx):
     assert at_commit[0] is not None and int(at_commit[0]) >= 150, f"at the first commit usage:acme:{day} held {at_commit[0]!r}: the increment must come before the commit, or a crash in between loses the charge"
     assert ctx.redis.hget(f"usage:acme:{day}", "tokens") == "175", f"usage:acme:{day} tokens is {ctx.redis.hget(f'usage:acme:{day}', 'tokens')!r}, expected 175 (150 + 15 + 10)"
     assert ctx.kafka.lag("billing", "usage") == 0, "every processed record must be committed"
+    # An increment that fails (usage:beta:{day} is not a hash) must not be committed past: the charge would be lost.
+    ctx.redis.set(f"usage:beta:{day}", "not-a-hash")
+    ctx.kafka.seed("usage", key="beta", value=json.dumps({**_request("r-4", "beta"), **_usage(20, 5), "messages": None}))
+    try:
+        ctx.drain(m.run_billing)
+    except Exception:  # noqa: BLE001 - the consumer stopping on the failed increment is a correct outcome
+        pass
+    assert ctx.kafka.lag("billing", "usage") >= 1, f"HINCRBY failed for beta's record, yet its offset was committed: the charge is lost for good. Commit only after the increment succeeded"
 `,
     typescript: `const CANARY = 'CANARY-7731 my account number is 4111';
 
@@ -1057,8 +1075,8 @@ export async function check_tenant_key(ctx) {
   assert.deepStrictEqual(keys, ['acme', 'beta', 'acme'], \`records must be keyed by the tenant, got \${JSON.stringify(keys)}\`);
   assert.equal(records[0].partition, records[2].partition, "one tenant's events must land on one partition so they stay in order");
   const event = JSON.parse(records[0].value.toString());
-  assert(event.id === 'r-1' && event.tenant === 'acme', \`the event id stays the request id and carries the tenant: \${records[0].value}\`);
-  for (const field of ['model', 'input_tokens', 'output_tokens', 'latency_ms', 'status']) assert(field in event, \`the event is missing \${field}: \${records[0].value}\`);
+  const expected = {id: 'r-1', tenant: 'acme', model: 'gpt-4o-mini', input_tokens: 100, output_tokens: 50, latency_ms: 812.5, status: 200};
+  assert.deepStrictEqual(event, expected, \`the event must be exactly \${JSON.stringify(expected)} (the request id, the tenant, the provider's counts), got \${records[0].value}\`);
 }
 
 export async function check_idempotent_acks(ctx) {
@@ -1081,15 +1099,19 @@ export async function check_no_prompt_content(ctx) {
   console.log = console.info = console.debug = console.warn = console.error = capture;
   try {
     await m.emitUsage(m.buildEvent(request('r-1', 'acme', CANARY), usage()));
+    // A client that also sent the prompt in a field of its own: the event lists its fields, it does not copy the request.
+    await m.emitUsage(m.buildEvent({...request('r-2', 'acme', CANARY), input: CANARY}, usage()));
     await settle();
   } finally {
     Object.assign(console, prior);
   }
   const records = ctx.kafka.records('usage');
-  assert.equal(records.length, 1, \`one emitUsage call produced \${records.length} records\`);
-  const value = records[0].value.toString();
-  assert(!value.includes('CANARY-7731'), \`the usage event carries the prompt: \${value}\`);
-  assert(!('messages' in JSON.parse(value)), \`the usage event carries the messages: \${value}\`);
+  assert.equal(records.length, 2, \`two emitUsage calls produced \${records.length} records\`);
+  for (const record of records) {
+    const value = record.value.toString();
+    assert(!value.includes('CANARY-7731'), \`the usage event carries the prompt: \${value}. Build it from the listed fields, not from the request minus messages\`);
+    assert(!('messages' in JSON.parse(value)), \`the usage event carries the messages: \${value}\`);
+  }
   const leak = logged.find(l => l.includes('CANARY-7731'));
   assert(leak === undefined, \`the prompt was printed or logged: \${JSON.stringify(leak)}\`);
 }
@@ -1110,6 +1132,17 @@ export async function check_outbox(ctx) {
   await settle();
   assert.deepStrictEqual(ids(ctx), ['r-10'], 'once the broker accepts records again they flow to the topic');
   assert.equal(outbox(ctx).length, 1, 'a delivered record must not be written to the outbox');
+  // The broker stops answering: emitUsage still returns at once, the answered request does not wait.
+  ctx.kafka.stall('usage');
+  const started = ctx.clock.now();
+  try {
+    await m.emitUsage(m.buildEvent(request('r-11'), usage()));
+  } catch {
+    // what it threw is the outbox check above; the wait is this one
+  }
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(waited < 0.5, \`with the broker not answering emitUsage held the request for \${waited.toFixed(1)} s: send without awaiting the broker and handle the rejection\`);
+  ctx.kafka.resume('usage');
 }
 
 export async function check_commit_after_increment(ctx) {
@@ -1125,6 +1158,16 @@ export async function check_commit_after_increment(ctx) {
   assert(atCommit[0] !== null && Number(atCommit[0]) >= 150, \`at the first commit usage:acme:\${today} held \${JSON.stringify(atCommit[0])}: the increment must come before the commit, or a crash in between loses the charge\`);
   assert.equal(ctx.redis.hget(\`usage:acme:\${today}\`, 'tokens'), '175', \`usage:acme:\${today} tokens is \${JSON.stringify(ctx.redis.hget(\`usage:acme:\${today}\`, 'tokens'))}, expected 175 (150 + 15 + 10)\`);
   assert.equal(ctx.kafka.lag('billing', 'usage'), 0, 'every processed record must be committed');
+  // An increment that fails (usage:beta:{day} is not a hash) must not be committed past: the charge would be lost.
+  ctx.redis.set(\`usage:beta:\${today}\`, 'not-a-hash');
+  ctx.kafka.seed('usage', {key: 'beta', value: JSON.stringify({...request('r-4', 'beta'), ...usage(20, 5), messages: null})});
+  try {
+    await ctx.drain(m.runBilling());
+  } catch {
+    // the consumer stopping on the failed increment is a correct outcome
+  }
+  await settle();
+  assert(ctx.kafka.lag('billing', 'usage') >= 1, "HINCRBY failed for beta's record, yet its offset was committed: the charge is lost for good. Commit only after the increment succeeded");
 }
 `,
     go: `package main
@@ -1196,11 +1239,7 @@ func CheckTenantKey(ctx *harness.Ctx) {
 	}
 	ctx.Assert(len(acme) == 2 && acme[0] == acme[1], "one tenant's events must land on one partition so they stay in order; acme's partitions %v", acme)
 	ctx.Assert(first != nil && first["tenant"] == "acme", "the event id stays the request id and carries the tenant: %v", first)
-	event := first
-	for _, field := range []string{"model", "input_tokens", "output_tokens", "latency_ms", "status"} {
-		_, ok := event[field]
-		ctx.Assert(ok, "the event is missing %s: %s", field, records[0].Value)
-	}
+	ctx.Equal(first, map[string]any{"id": "r-1", "tenant": "acme", "model": "gpt-4o-mini", "input_tokens": float64(100), "output_tokens": float64(50), "latency_ms": 812.5, "status": float64(200)}, "the event must be exactly the request id, the tenant, the model, the provider's counts, the latency and the status")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
@@ -1246,6 +1285,13 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Settle()
 	ctx.Equal(usageIDs(ctx), []string{"r-10"}, "once the broker accepts records again they flow to the topic; the records")
 	ctx.Equal(len(usageOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
+	// The broker stops answering: emitUsage still returns at once, the answered request does not wait.
+	ctx.Kafka.Stall("usage")
+	started := ctx.Clock.Now()
+	emitUsage(context.Background(), buildEvent(usageRequest("r-11", "acme", "hi"), Usage{100, 50}))
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(waited < 0.5, "with the broker not answering emitUsage held the request for %.1f s: write asynchronously and handle the failure in the completion", waited)
+	ctx.Kafka.Resume("usage")
 }
 
 func CheckCommitAfterIncrement(ctx *harness.Ctx) {
@@ -1268,6 +1314,12 @@ func CheckCommitAfterIncrement(ctx *harness.Ctx) {
 	acme, _ := ctx.Redis.HGet("usage:acme:"+day, "tokens")
 	ctx.Equal(acme, "175", "usage:acme:%s tokens (150 + 15 + 10)", day)
 	ctx.Equal(ctx.Kafka.Lag("billing", "usage"), 0, "every processed record must be committed; the lag")
+	// An increment that fails (usage:beta:<day> is not a hash) must not be committed past: the charge would be lost.
+	ctx.Redis.Set("usage:beta:"+day, "not-a-hash")
+	value, _ := json.Marshal(map[string]any{"id": "r-4", "tenant": "beta", "model": "gpt-4o-mini", "input_tokens": 20, "output_tokens": 5, "latency_ms": 812.5, "status": 200})
+	ctx.Kafka.Seed("usage", "beta", string(value))
+	ctx.Drain(func() { runBilling(context.Background()) })
+	ctx.Assert(ctx.Kafka.Lag("billing", "usage") >= 1, "HINCRBY failed for beta's record, yet its offset was committed: the charge is lost for good. Commit only after the increment succeeded")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1331,11 +1383,8 @@ void CheckTenantKey(harness::Ctx& ctx) {
   ctx.Equal(ctx.Kafka.Keys("usage"), {"acme", "beta", "acme"}, "records must be keyed by the tenant");
   ctx.Equal(records[0].Partition, records[2].Partition, "one tenant's events must land on one partition so they stay in order; acme's partitions");
   const auto event = nlohmann::json::parse(records[0].Value.value_or(""), nullptr, false);
-  ctx.Assert(event.is_object() && event.value("id", "") == "r-1" && event.value("tenant", "") == "acme",
-             "the event id stays the request id and carries the tenant: %s", records[0].Value.value_or(""));
-  for (const std::string field : {"model", "input_tokens", "output_tokens", "latency_ms", "status"}) {
-    ctx.Assert(event.contains(field), "the event is missing %s: %s", field, records[0].Value.value_or(""));
-  }
+  const nlohmann::json expected = {{"id", "r-1"}, {"tenant", "acme"}, {"model", "gpt-4o-mini"}, {"input_tokens", 100}, {"output_tokens", 50}, {"latency_ms", 812.5}, {"status", 200}};
+  ctx.Equal(event, expected, "the event must be exactly the request id, the tenant, the model, the provider's counts, the latency and the status");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
@@ -1358,16 +1407,22 @@ void CheckNoPromptContent(harness::Ctx& ctx) {
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
   emit_usage(build_event(usageRequest("r-1", "acme", kUsageCanary), usageOf(100, 50)));
+  // A client that also sent the prompt in a field of its own: the event lists its fields, it does not copy the request.
+  auto withInput = usageRequest("r-2", "acme", kUsageCanary);
+  withInput["input"] = kUsageCanary;
+  emit_usage(build_event(withInput, usageOf(100, 50)));
   producer->poll(0);
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Settle();
   const auto records = ctx.Kafka.Records("usage");
-  ctx.Equal(records.size(), 1, "one emit_usage call; the records");
-  const std::string value = records[0].Value.value_or("");
-  ctx.Assert(value.find("CANARY-7731") == std::string::npos, "the usage event carries the prompt: %s", value);
-  const auto event = nlohmann::json::parse(value, nullptr, false);
-  ctx.Assert(event.is_object() && !event.contains("messages"), "the usage event carries the messages: %s", value);
+  ctx.Equal(records.size(), 2, "two emit_usage calls; the records");
+  for (const auto& record : records) {
+    const std::string value = record.Value.value_or("");
+    ctx.Assert(value.find("CANARY-7731") == std::string::npos, "the usage event carries the prompt: %s. Build it from the listed fields, not from the request minus messages", value);
+    const auto event = nlohmann::json::parse(value, nullptr, false);
+    ctx.Assert(event.is_object() && !event.contains("messages"), "the usage event carries the messages: %s", value);
+  }
   ctx.Assert(logged.str().find("CANARY-7731") == std::string::npos, "the prompt was printed or logged: %q", logged.str());
 }
 
@@ -1389,6 +1444,13 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Equal(usageIDs(ctx), {"r-10"}, "once the broker accepts records again they flow to the topic; the records");
   ctx.Equal(usageOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
+  // The broker stops answering: emit_usage still returns at once, the answered request does not wait.
+  ctx.Kafka.Stall("usage");
+  const int64_t started = ctx.Clock.Now();
+  emit_usage(build_event(usageRequest("r-11", "acme", "hi"), usageOf(100, 50)));
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(waited < 0.5, "with the broker not answering emit_usage held the request for %vs: serve delivery reports without waiting (poll(0))", waited);
+  ctx.Kafka.Resume("usage");
 }
 
 void CheckCommitAfterIncrement(harness::Ctx& ctx) {
@@ -1409,6 +1471,16 @@ void CheckCommitAfterIncrement(harness::Ctx& ctx) {
   ctx.Assert(atCommit[0] && (*atCommit[0] == "150" || *atCommit[0] == "165" || *atCommit[0] == "175"), "at the first commit usage:acme:%s held %v: the increment must come before the commit, or a crash in between loses the charge", day, atCommit[0]);
   ctx.Equal(ctx.Redis.HGet("usage:acme:" + day, "tokens"), "175", "usage:acme:%s tokens (150 + 15 + 10)", day);
   ctx.Equal(ctx.Kafka.Lag("billing", "usage"), 0, "every processed record must be committed; the lag");
+  // An increment that fails (usage:beta:<day> is not a hash) must not be committed past: the charge would be lost.
+  ctx.Redis.Set("usage:beta:" + day, "not-a-hash");
+  const nlohmann::json beta = {{"id", "r-4"}, {"tenant", "beta"}, {"model", "gpt-4o-mini"}, {"input_tokens", 20}, {"output_tokens", 5}, {"latency_ms", 812.5}, {"status", 200}};
+  ctx.Kafka.Seed("usage", "beta", beta.dump());
+  try {
+    ctx.Drain([] { run_billing(); });
+  } catch (const std::exception&) {
+    // the consumer stopping on the failed increment is a correct outcome
+  }
+  ctx.Assert(ctx.Kafka.Lag("billing", "usage") >= 1, "HINCRBY failed for beta's record, yet its offset was committed: the charge is lost for good. Commit only after the increment succeeded");
 }
 `,
   },

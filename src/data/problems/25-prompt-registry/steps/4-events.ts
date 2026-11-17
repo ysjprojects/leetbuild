@@ -77,7 +77,7 @@ Requirements:
       id: 'no-template',
       title: 'No template text in the event, the outbox or the logs',
       detail:
-        'The template reaches neither a record on prompt.lifecycle, an outbox row nor a log line: the topic is retained and replicated, so what goes in outlives the version. The starter copies it into the payload and the log.',
+        'The template reaches neither a record on prompt.lifecycle, an outbox row nor a log line, whether the broker acknowledges, refuses or never answers: the topic is retained and replicated, so what goes in outlives the version. The starter copies it into the payload and the log.',
       match: {
         python: {none: [/event\.template\b/]},
         typescript: {none: [/event\.template\b/]},
@@ -103,7 +103,7 @@ Requirements:
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A refused produce, or no acknowledgement within 2 s, leaves the payload in the outbox and publish returns false. The starter returns true before the broker answers.',
+        'A refused produce, or no acknowledgement within 2 s, leaves the payload in the outbox and publish returns false; against a broker that never answers, publish gives up after about 2 s (2.5 s at most). The starter returns true before the broker answers.',
       match: {
         python: {
           all: [/outbox\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -641,6 +641,8 @@ def check_no_template(ctx):
         ctx.kafka.fail_next(TOPIC, 1)
         m.publish(_event(1))
         m.publish(_event(2))
+        ctx.kafka.stall(TOPIC)  # no acknowledgement: the event goes to the outbox, and nothing logs its template
+        m.publish(_event(3))
     finally:
         logging.getLogger().removeHandler(capture)
     for value in ctx.kafka.values(TOPIC):
@@ -674,7 +676,7 @@ def check_outbox_on_failure(ctx):
     before = ctx.clock.time()
     ok = m.publish(_event(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish waited {waited:.0f} s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox"
+    assert waited <= 2.5, f"publish waited {waited:.1f} s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("event_id") == "ev-2", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish returned {ok!r} without an acknowledgement, expected False"
@@ -737,15 +739,27 @@ export async function check_event_identity(ctx) {
 
 export async function check_no_template(ctx) {
   const m = ctx.load('events');
-  ctx.kafka.failNext(TOPIC, 1);
-  await m.publish(event(1));
-  await m.publish(event(2));
-  await settle();
+  const logged: string[] = [];
+  const prior = {log: console.log, info: console.info, debug: console.debug, warn: console.warn, error: console.error};
+  console.log = console.info = console.debug = console.warn = console.error = (...args: unknown[]) =>
+    void logged.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  try {
+    ctx.kafka.failNext(TOPIC, 1);
+    await m.publish(event(1));
+    await m.publish(event(2));
+    ctx.kafka.stall(TOPIC); // no acknowledgement: the event goes to the outbox, and nothing logs its template
+    await m.publish(event(3));
+    await settle();
+  } finally {
+    Object.assign(console, prior);
+  }
   for (const value of ctx.kafka.values(TOPIC)) {
     assert(!value.includes('refund for order 4411'), \`the event carries the template text: \${value}; the topic is retained and replicated\`);
     assert(!('template' in JSON.parse(value)), \`the event has a template field: \${value}\`);
   }
   for (const row of ctx.redis.lrange('prompts:outbox', 0, -1)) assert(!row.includes('refund for order 4411'), \`the outbox row carries the template text: \${row}\`);
+  const leak = logged.find(line => line.includes('refund for order 4411'));
+  assert(leak === undefined, \`a log line carries the template text: \${leak}\`);
 }
 
 export async function check_idempotent_acks(ctx) {
@@ -773,7 +787,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publish(event(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publish waited \${waited.toFixed(0)} s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox\`);
+  assert(waited <= 2.5, \`publish waited \${waited.toFixed(1)} s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].event_id === 'ev-2', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publish resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -782,9 +796,12 @@ export async function check_outbox_on_failure(ctx) {
     go: `package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 
 	"prompts/lifecycle"
@@ -847,9 +864,14 @@ func CheckEventIdentity(ctx *harness.Ctx) {
 }
 
 func CheckNoTemplate(ctx *harness.Ctx) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
 	ctx.Kafka.FailNext(eventsTopic, 1)
 	eventsPublish(ctx, eventsEvent(1, "support-reply", "alice", "promoted", 4))
 	eventsPublish(ctx, eventsEvent(2, "support-reply", "alice", "promoted", 5))
+	ctx.Kafka.Stall(eventsTopic) // no acknowledgement: the event goes to the outbox, and nothing logs its template
+	eventsPublish(ctx, eventsEvent(3, "support-reply", "alice", "promoted", 6))
 	ctx.Settle()
 	for _, value := range ctx.Kafka.Values(eventsTopic) {
 		ctx.Assert(!strings.Contains(value, "refund for order 4411"), "the event carries the template text: %s; the topic is retained and replicated", value)
@@ -861,6 +883,7 @@ func CheckNoTemplate(ctx *harness.Ctx) {
 	for _, row := range ctx.Redis.LRange("prompts:outbox", 0, -1) {
 		ctx.Assert(!strings.Contains(row, "refund for order 4411"), "the outbox row carries the template text: %s", row)
 	}
+	ctx.Assert(!strings.Contains(logged.String(), "refund for order 4411"), "a log line carries the template text: %q", strings.TrimSpace(logged.String()))
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
@@ -886,7 +909,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsEvent(2, "support-reply", "alice", "promoted", 5))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publish waited %.0f s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox", waited)
+	ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["event_id"] == "ev-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publish's result without an acknowledgement")
@@ -896,6 +919,8 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -953,9 +978,16 @@ void CheckEventIdentity(harness::Ctx& ctx) {
 }
 
 void CheckNoTemplate(harness::Ctx& ctx) {
+  std::ostringstream logged;
+  auto* out = std::cout.rdbuf(logged.rdbuf());
+  auto* err = std::cerr.rdbuf(logged.rdbuf());
   ctx.Kafka.FailNext(kEventsTopic, 1);
   publish(eventsEvent(1));
   publish(eventsEvent(2, "support-reply", "alice", "promoted", 5));
+  ctx.Kafka.Stall(kEventsTopic);  // no acknowledgement: the event goes to the outbox, and nothing logs its template
+  publish(eventsEvent(3, "support-reply", "alice", "promoted", 6));
+  std::cout.rdbuf(out);
+  std::cerr.rdbuf(err);
   ctx.Settle();
   for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
     ctx.Assert(value.find("refund for order 4411") == std::string::npos, "the event carries the template text: %s; the topic is retained and replicated", value);
@@ -965,6 +997,7 @@ void CheckNoTemplate(harness::Ctx& ctx) {
   for (const auto& row : ctx.Redis.LRange("prompts:outbox", 0, -1)) {
     ctx.Assert(row.find("refund for order 4411") == std::string::npos, "the outbox row carries the template text: %s", row);
   }
+  ctx.Assert(logged.str().find("refund for order 4411") == std::string::npos, "a log line carries the template text: %s", logged.str());
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
@@ -990,7 +1023,7 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publish(eventsEvent(2, "support-reply", "alice", "promoted", 5));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publish waited %.0f s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox", waited);
+  ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && field(rows[1], "event_id") == "ev-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish's result without an acknowledgement");

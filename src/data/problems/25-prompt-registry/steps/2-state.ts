@@ -101,7 +101,7 @@ Requirements:
       id: 'rollback-previous',
       title: 'Rolls back to the version that was live before',
       detail:
-        'After promoting 1, 4 and 7, rollback lands on 4, then on 1, then returns none and leaves 1 live, each move audited. The starter subtracts one and puts version 6, which never shipped, live.',
+        'After promoting 1, 4 and 7, rollback lands on 4, then on 1, then returns none and leaves 1 live and the history as it was, each move audited. The starter subtracts one and puts version 6, which never shipped, live.',
       match: {
         python: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
         typescript: {all: [/\b(rpop|lindex|lrange)\b/i], none: [/current\s*-\s*1/]},
@@ -836,6 +836,7 @@ def check_rollback_previous(ctx):
     assert ctx.redis.get(LIVE) == "1", f"a second rollback must restore 1, the version live before 4, got {ctx.redis.get(LIVE)}"
     third = m.rollback(T, N, "oncall")
     assert third is None and ctx.redis.get(LIVE) == "1", f"with nothing earlier a rollback returns None and leaves 1 live: got {third}, live {ctx.redis.get(LIVE)}"
+    assert ctx.redis.lrange(HISTORY, 0, -1) == ["1"], f"a rollback with nothing earlier must change nothing, but the history is now {ctx.redis.lrange(HISTORY, 0, -1)}, expected ['1']: the next promotion has no version to roll back to"
     tail = [e.split("|")[:4] for e in ctx.redis.lrange(AUDIT, -2, -1)]
     assert tail == [["rollback", "7", "4", "oncall"], ["rollback", "4", "1", "oncall"]], f"each rollback is audited as rollback|from|to|actor: {ctx.redis.lrange(AUDIT, 0, -1)}"
 
@@ -917,6 +918,7 @@ export async function check_rollback_previous(ctx) {
   assert.equal(ctx.redis.get(LIVE), '1', \`a second rollback must restore 1, the version live before 4, got \${ctx.redis.get(LIVE)}\`);
   const third = await m.rollback(T, N, 'oncall');
   assert(third === null && ctx.redis.get(LIVE) === '1', \`with nothing earlier a rollback returns null and leaves 1 live: got \${JSON.stringify(third)}, live \${ctx.redis.get(LIVE)}\`);
+  assert.deepEqual(ctx.redis.lrange(HISTORY, 0, -1), ['1'], \`a rollback with nothing earlier must change nothing, but the history is now \${JSON.stringify(ctx.redis.lrange(HISTORY, 0, -1))}, expected ["1"]: the next promotion has no version to roll back to\`);
   const tail = (ctx.redis.lrange(AUDIT, -2, -1) as string[]).map(e => e.split('|').slice(0, 4));
   assert.deepEqual(tail, [['rollback', '7', '4', 'oncall'], ['rollback', '4', '1', 'oncall']], \`each rollback is audited as rollback|from|to|actor: \${JSON.stringify(ctx.redis.lrange(AUDIT, 0, -1))}\`);
 }
@@ -1049,6 +1051,7 @@ func CheckRollbackPrevious(ctx *harness.Ctx) {
 	ctx.Equal(stateLiveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version")
 	third := stateRollback(ctx)
 	ctx.Assert(third == nil && stateLiveNow(ctx) == "1", "with nothing earlier a rollback returns nil and leaves 1 live: got %+v, live %s", third, stateLiveNow(ctx))
+	ctx.Equal(ctx.Redis.LRange(stateHistory, 0, -1), []string{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history")
 	tail := ctx.Redis.LRange(stateAudit, -2, -1)
 	ctx.Assert(len(tail) == 2 && strings.HasPrefix(tail[0], "rollback|7|4|oncall|") && strings.HasPrefix(tail[1], "rollback|4|1|oncall|"), "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(stateAudit, 0, -1))
 }
@@ -1165,6 +1168,7 @@ void CheckRollbackPrevious(harness::Ctx& ctx) {
   ctx.Equal(liveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version");
   const auto third = rollback(kT, kN, "oncall");
   ctx.Assert(!third && liveNow(ctx) == "1", "with nothing earlier a rollback returns nullopt and leaves 1 live: live %s", liveNow(ctx));
+  ctx.Equal(ctx.Redis.LRange(kHistory, 0, -1), std::vector<std::string>{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history");
   const auto tail = ctx.Redis.LRange(kAudit, -2, -1);
   ctx.Assert(tail.size() == 2 && tail[0].rfind("rollback|7|4|oncall|", 0) == 0 && tail[1].rfind("rollback|4|1|oncall|", 0) == 0,
              "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(kAudit, 0, -1));

@@ -25,7 +25,8 @@ was; and billing has no number for what was streamed.
   write's return value, the connection's lifetime) and stop writing.
 - On disconnect, **cancel the upstream call** so the provider stops generating.
 - A stream that completes ends with \`data: {"usage": {"output_tokens": N}}\` (N chunks relayed)
-  and then \`data: [DONE]\`, each followed by a blank line.`,
+  and then \`data: [DONE]\`, each followed by a blank line. A stream the provider breaks off midway
+  did not complete: it never ends with \`[DONE]\`.`,
   sequence: {
     participants: ['Client', 'gateway', 'Provider'],
     messages: [
@@ -108,7 +109,7 @@ was; and billing has no number for what was streamed.
       id: 'done-and-usage',
       title: 'Ends with a usage frame and [DONE]',
       detail:
-        'A stream that completes writes `data: {"usage": {"output_tokens": N}}` with the number of chunks relayed, then `data: [DONE]`.',
+        'A stream that completes writes `data: {"usage": {"output_tokens": N}}` with the number of chunks relayed, then `data: [DONE]`. A stream the provider fails partway through ends without `[DONE]`, so the client does not take a cut answer for a complete one.',
       match: {
         python: {all: [/\[DONE\]/, /output_tokens/]},
         typescript: {all: [/\[DONE\]/, /output_tokens/]},
@@ -823,6 +824,8 @@ void register_routes(httplib::Server& svr) {
     python: `import asyncio
 import json
 
+import grpc
+
 import providers_pb2
 import providers_pb2_grpc
 
@@ -837,12 +840,16 @@ class Providers(providers_pb2_grpc.ProviderServicer):
     def __init__(self):
         self.produced = 0
         self.cancelled = False
+        # Set: the provider fails UNAVAILABLE after this many tokens, mid-stream.
+        self.break_after = None
 
     async def StreamComplete(self, request, context):
         try:
             for t in TOKENS:
                 if context.cancelled():
                     break
+                if self.break_after is not None and self.produced >= self.break_after:
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, "provider crashed mid-stream")
                 self.produced += 1
                 yield providers_pb2.Chunk(text=t)
                 await asyncio.sleep(GAP_S)
@@ -855,14 +862,13 @@ class Providers(providers_pb2_grpc.ProviderServicer):
             if context.cancelled():
                 self.cancelled = True
 
-
 def _gateway(ctx):
     peer = Providers()
     ctx.grpc.serve(providers_pb2_grpc.add_ProviderServicer_to_server, peer)
     return ctx.load("chat_stream"), peer
 
 
-async def _stream(ctx, m, disconnect_after=None):
+async def _stream(ctx, m, disconnect_after=None, tolerate_error=False):
     """
     Drive the app over ASGI the way a server does, frame by frame; after \`disconnect_after\` body
     frames the client hangs up. The server keeps accepting writes to the closed connection without
@@ -902,6 +908,10 @@ async def _stream(ctx, m, disconnect_after=None):
         await asyncio.wait_for(m.app(scope, receive, send), 5.0)
     except asyncio.TimeoutError:
         raise AssertionError(f"the stream did not end within 5 s of real time after {len(out['frames'])} frame(s)")
+    except Exception:
+        if not tolerate_error:
+            raise
+        # The handler let a provider failure escape: the server aborts the response where it is.
     for _ in range(100):
         await asyncio.sleep(0)  # whatever the handler left running gets to run
     return out
@@ -941,14 +951,14 @@ async def check_content_type(ctx):
 
 async def check_disconnect(ctx):
     m, peer = _gateway(ctx)
-    out = await _stream(ctx, m, disconnect_after=2)
+    out = await _stream(ctx, m, disconnect_after=2, tolerate_error=True)
     assert len(out["frames"]) == 2, f"the client hung up after 2 frames, the server had written {len(out['frames'])}"
     assert len(out["after"]) == 0, f"after the client hung up the stream wrote {len(out['after'])} more frame(s) into the closed connection: {out['after'][:2]}. Check request.is_disconnected() before relaying the next chunk"
 
 
 async def check_cancel_upstream(ctx):
     m, peer = _gateway(ctx)
-    out = await _stream(ctx, m, disconnect_after=2)
+    out = await _stream(ctx, m, disconnect_after=2, tolerate_error=True)
     assert peer.cancelled, f"the client hung up after 2 frames but the provider call was not cancelled: it generated {peer.produced} of {len(TOKENS)} tokens nobody read. Cancel the upstream call (upstream.cancel()) when the client leaves"
     assert peer.produced < len(TOKENS), f"the provider generated all {len(TOKENS)} tokens after the client hung up at 2: the cancel came too late"
 
@@ -962,6 +972,12 @@ async def check_done_and_usage(ctx):
     usage = json.loads(events[-2])
     assert usage == {"usage": {"output_tokens": len(TOKENS)}}, f"the frame before [DONE] must be {{'usage': {{'output_tokens': {len(TOKENS)}}}}} ({len(TOKENS)} chunks relayed), got {usage}"
     assert not peer.cancelled or peer.produced == len(TOKENS), "a stream that completed must not be reported as cancelled before the provider finished"
+    # The provider fails UNAVAILABLE after three tokens: the stream did not complete, and the client
+    # must not be told it did.
+    peer.produced, peer.break_after = 0, 3
+    broken = await _stream(ctx, m, tolerate_error=True)
+    cut = _events(broken["frames"])
+    assert "[DONE]" not in cut, f"the provider failed after 3 tokens, yet the stream ended with 'data: [DONE]' (frames: {cut}): a client takes [DONE] as a complete answer. End the stream without it"
 `,
     typescript: `const TOKENS = ['The', ' capital', ' of', ' France', ' is', ' Paris', '.'];
 const GAP_MS = 50;
@@ -976,11 +992,13 @@ const sleep = (ms: number): Promise<void> => {
 interface Peer {
   produced: number;
   cancelled: boolean;
+  /** Set: the provider fails UNAVAILABLE after this many tokens, mid-stream. */
+  breakAfter: number | null;
 }
 
 /** The model provider, streaming: one Chunk per token, GAP_MS of virtual time between two. */
 function gateway(ctx) {
-  const peer: Peer = {produced: 0, cancelled: false};
+  const peer: Peer = {produced: 0, cancelled: false, breakAfter: null};
   const pkg = ctx.proto('providers.proto');
   ctx.grpc.serve(pkg.gateway.Provider.service, {
     StreamComplete: async call => {
@@ -990,6 +1008,10 @@ function gateway(ctx) {
       for (const t of TOKENS) {
         if (call.cancelled) {
           peer.cancelled = true;
+          return;
+        }
+        if (peer.breakAfter !== null && peer.produced >= peer.breakAfter) {
+          call.emit('error', {code: ctx.grpc.status.UNAVAILABLE, details: 'provider crashed mid-stream'});
           return;
         }
         peer.produced += 1;
@@ -1008,7 +1030,7 @@ function gateway(ctx) {
  * frame, and after \`disconnectAfter\` frames the client hangs up (the raw request emits close,
  * further writes are refused), as Node does when the browser closes the tab.
  */
-async function stream(ctx, m, disconnectAfter = Infinity) {
+async function stream(ctx, m, disconnectAfter = Infinity, tolerateError = false) {
   const frames: string[] = [];
   const after: string[] = [];
   const headers: Record<string, string> = {};
@@ -1083,7 +1105,12 @@ async function stream(ctx, m, disconnectAfter = Infinity) {
   const budget = sleep(5000).then(() => {
     throw new Error(\`the stream did not end within 5 s after \${frames.length} frame(s)\`);
   });
-  await Promise.race([m.streamChat(request, reply), budget]);
+  try {
+    await Promise.race([m.streamChat(request, reply), budget]);
+  } catch (e) {
+    // A handler that lets a provider failure escape: the server aborts the response where it is.
+    if (!tolerateError || String(e).includes('did not end within')) throw e;
+  }
   await sleep(GAP_MS * (TOKENS.length + 2)); // whatever the handler left running gets to run
   return {frames, after, headers, status: () => status, ended: () => ended};
 }
@@ -1125,20 +1152,20 @@ export async function check_content_type(ctx) {
 
 export async function check_disconnect(ctx) {
   const {m} = gateway(ctx);
-  const out = await stream(ctx, m, 2);
+  const out = await stream(ctx, m, 2, true);
   assert.equal(out.frames.length, 2, \`the client hung up after 2 frames, the server had written \${out.frames.length}\`);
   assert.equal(out.after.length, 0, \`after the client hung up the stream wrote \${out.after.length} more frame(s) into the closed connection: \${JSON.stringify(out.after.slice(0, 2))}. Watch the raw request's close event and stop relaying\`);
 }
 
 export async function check_cancel_upstream(ctx) {
   const {m, peer} = gateway(ctx);
-  await stream(ctx, m, 2);
+  await stream(ctx, m, 2, true);
   assert(peer.cancelled, \`the client hung up after 2 frames but the provider call was not cancelled: it generated \${peer.produced} of \${TOKENS.length} tokens nobody read. Cancel the upstream call (upstream.cancel()) when the client leaves\`);
   assert(peer.produced < TOKENS.length, \`the provider generated all \${TOKENS.length} tokens after the client hung up at 2: the cancel came too late\`);
 }
 
 export async function check_done_and_usage(ctx) {
-  const {m} = gateway(ctx);
+  const {m, peer} = gateway(ctx);
   const out = await stream(ctx, m);
   const seen = events(out.frames);
   assert(seen.length > 0 && seen.at(-1) === '[DONE]', \`a stream that completes must end with 'data: [DONE]', the last frame was \${JSON.stringify(seen.at(-1))}\`);
@@ -1146,6 +1173,13 @@ export async function check_done_and_usage(ctx) {
   const usage = JSON.parse(seen.at(-2));
   assert.deepStrictEqual(usage, {usage: {output_tokens: TOKENS.length}}, \`the frame before [DONE] must be {"usage": {"output_tokens": \${TOKENS.length}}} (\${TOKENS.length} chunks relayed), got \${JSON.stringify(usage)}\`);
   assert(out.ended(), 'a stream that completes ends the response');
+  // The provider fails UNAVAILABLE after three tokens: the stream did not complete, and the client
+  // must not be told it did.
+  peer.produced = 0;
+  peer.breakAfter = 3;
+  const broken = await stream(ctx, m, Infinity, true);
+  const cut = events(broken.frames);
+  assert(!cut.includes('[DONE]'), \`the provider failed after 3 tokens, yet the stream ended with 'data: [DONE]' (frames: \${JSON.stringify(cut)}): a client takes [DONE] as a complete answer. End the stream without it\`);
 }
 `,
     go: `package main
@@ -1159,6 +1193,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"leetbuild/harness"
 
@@ -1178,6 +1215,8 @@ type streamPeer struct {
 	mu        sync.Mutex
 	produced  int
 	cancelled bool
+	// breakAfter > 0: the provider fails UNAVAILABLE after this many tokens, mid-stream.
+	breakAfter int
 }
 
 func (p *streamPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_StreamCompleteServer) error {
@@ -1189,6 +1228,10 @@ func (p *streamPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_Strea
 			return srv.Context().Err()
 		}
 		p.mu.Lock()
+		if p.breakAfter > 0 && p.produced >= p.breakAfter {
+			p.mu.Unlock()
+			return status.Error(codes.Unavailable, "provider crashed mid-stream")
+		}
 		p.produced++
 		p.mu.Unlock()
 		if err := srv.Send(&pb.Chunk{Text: t}); err != nil {
@@ -1327,7 +1370,7 @@ func CheckCancelUpstream(ctx *harness.Ctx) {
 }
 
 func CheckDoneAndUsage(ctx *harness.Ctx) {
-	mux, _ := streamGateway(ctx)
+	mux, peer := streamGateway(ctx)
 	out := streamOnce(ctx, mux, 0)
 	events := streamEvents(ctx, out)
 	ctx.Assert(len(events) > 0 && events[len(events)-1] == "[DONE]", "a stream that completes must end with 'data: [DONE]', the frames were %q", events)
@@ -1335,6 +1378,15 @@ func CheckDoneAndUsage(ctx *harness.Ctx) {
 	var usage map[string]any
 	ctx.NoError(json.Unmarshal([]byte(events[len(events)-2]), &usage), "the frame before [DONE] must be JSON, got %q", events[len(events)-2])
 	ctx.Equal(usage, map[string]any{"usage": map[string]any{"output_tokens": float64(len(streamTokens))}}, "the frame before [DONE] (%d chunks relayed)", len(streamTokens))
+	// The provider fails UNAVAILABLE after three tokens: the stream did not complete, and the client
+	// must not be told it did.
+	peer.mu.Lock()
+	peer.produced, peer.breakAfter = 0, 3
+	peer.mu.Unlock()
+	broken := streamEvents(ctx, streamOnce(ctx, mux, 0))
+	for _, e := range broken {
+		ctx.Assert(e != "[DONE]", "the provider failed after 3 tokens, yet the stream ended with 'data: [DONE]' (frames: %q): a client takes [DONE] as a complete answer. End the stream without it", broken)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1367,6 +1419,9 @@ class StreamPeer final : public gateway::Provider::Service {
       }
       {
         std::lock_guard<std::mutex> lock(mu_);
+        if (break_after_ > 0 && produced_ >= break_after_) {
+          return grpc::Status(grpc::StatusCode::UNAVAILABLE, "provider crashed mid-stream");
+        }
         produced_++;
       }
       gateway::Chunk chunk;
@@ -1389,11 +1444,18 @@ class StreamPeer final : public gateway::Provider::Service {
     std::lock_guard<std::mutex> lock(mu_);
     return {produced_, cancelled_};
   }
+  // From now on the provider fails UNAVAILABLE after n tokens, mid-stream.
+  void breakAfter(int n) {
+    std::lock_guard<std::mutex> lock(mu_);
+    produced_ = 0;
+    break_after_ = n;
+  }
 
  private:
   std::mutex mu_;
   int produced_ = 0;
   bool cancelled_ = false;
+  int break_after_ = 0;
 };
 
 struct StreamGateway {
@@ -1513,6 +1575,13 @@ void CheckDoneAndUsage(harness::Ctx& ctx) {
   const auto usage = nlohmann::json::parse(events[events.size() - 2], nullptr, false);
   nlohmann::json expected = {{"usage", {{"output_tokens", static_cast<int>(kStreamTokens.size())}}}};
   ctx.Equal(usage, expected, "the frame before [DONE] (%d chunks relayed)", static_cast<int>(kStreamTokens.size()));
+  // The provider fails UNAVAILABLE after three tokens: the stream did not complete, and the client
+  // must not be told it did.
+  g.peer.breakAfter(3);
+  const auto broken = streamEvents(ctx, streamOnce(ctx, g).body);
+  for (const auto& e : broken) {
+    ctx.Assert(e != "[DONE]", "the provider failed after 3 tokens, yet the stream ended with 'data: [DONE]' (frames: %v): a client takes [DONE] as a complete answer. End the stream without it", broken);
+  }
 }
 `,
   },

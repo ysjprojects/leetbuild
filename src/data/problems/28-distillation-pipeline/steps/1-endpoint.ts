@@ -60,7 +60,7 @@ Requirements:
       id: 'approved-teacher',
       title: 'Refuses a teacher outside the approved catalog',
       detail:
-        'The teacher is checked against the server-side catalog and anything else is 400 with no job stored. The starter stores whatever model string the caller sends.',
+        'The teacher must be one of the catalog names exactly, and anything else, an unlisted model of the same family or a shortened name included, is 400 with no job stored. The starter stores whatever model string the caller sends.',
       match: {
         python: {all: [/APPROVED_TEACHERS/, /status_code\s*=\s*400/]},
         typescript: {all: [/APPROVED_TEACHERS/, /code\(\s*400\s*\)/]},
@@ -86,7 +86,7 @@ Requirements:
       id: 'idempotency-key',
       title: 'Keys job starts by (tenant, Idempotency-Key)',
       detail:
-        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same job_id, another tenant with the same key gets its own job. The starter stores the job under its own fresh id, so every retry starts a new job.',
+        'Idempotency-Key is required (400 when missing or empty); a replay of the same (tenant, key) answers 200 with the same job_id, another tenant with the same key gets its own job. The starter stores the job under its own fresh id, so every retry starts a new job.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
@@ -99,7 +99,7 @@ Requirements:
       id: 'validate-before-create',
       title: 'Rejects before it stores the job',
       detail:
-        'The catalog and the cap are checked before store.put, so a rejected request touches the store not at all. The starter stores first.',
+        'The catalog, the dataset (an empty dataset_id is 400) and the cap are checked before store.put, so a rejected request writes nothing to the store. The starter stores first.',
       match: {
         python: {order: [/[<>]=?\s*MAX_SAMPLE_CAP|MAX_SAMPLE_CAP\s*[<>]|le\s*=\s*MAX_SAMPLE_CAP/, /store\.put\(/]},
         typescript: {order: [/[<>]=?\s*MAX_SAMPLE_CAP|MAX_SAMPLE_CAP\s*[<>]/, /store\.put\(/]},
@@ -723,8 +723,9 @@ async def check_route(ctx):
 
 async def check_approved_teacher(ctx):
     async with _api(ctx) as c:
-        r = await _post(c, {**GOOD, "teacher": "gpt-5-max"}, key="k-bad")
-        assert r.status_code == 400, f"a teacher outside the catalog (gpt-5-max) answered {r.status_code}, expected 400: the caller must not pick the model that spends the budget"
+        for teacher in ("gpt-5-max", "teach-405b-v1", "teach-70b"):
+            r = await _post(c, {**GOOD, "teacher": teacher}, key="k-bad")
+            assert r.status_code == 400, f"a teacher outside the catalog ({teacher}) answered {r.status_code}, expected 400: the caller must not pick the model that spends the budget, and the catalog is exact names"
         assert ctx.redis.keys("distill:job:*") == [], f"a refused start must store no job, found {ctx.redis.keys('distill:job:*')}"
         r = await _post(c, {**GOOD, "teacher": "teach-13b-v2"}, key="k-ok")
         assert r.status_code == 201, f"teach-13b-v2 is in the catalog, got {r.status_code}: {r.text}"
@@ -745,6 +746,9 @@ async def check_idempotency_key(ctx):
     async with _api(ctx) as c:
         r = await _post(c, GOOD, with_key=False)
         assert r.status_code == 400, f"a start without Idempotency-Key answered {r.status_code}, expected 400"
+        r = await _post(c, GOOD, key="")
+        assert r.status_code == 400, f"a start with an empty Idempotency-Key answered {r.status_code}, expected 400"
+        assert ctx.redis.keys("distill:job:*") == [], f"a start without a key must store no job, found {ctx.redis.keys('distill:job:*')}"
         first = await _post(c, GOOD, key="k-7")
         assert first.status_code == 201, f"the first start answered {first.status_code}: {first.text}"
         replay = await _post(c, GOOD, key="k-7")
@@ -757,13 +761,16 @@ async def check_idempotency_key(ctx):
 
 async def check_validate_before_create(ctx):
     async with _api(ctx) as c:
-        touched = ctx.redis_after("distill:idem:t1:k-bad", lambda: sorted(ctx.redis.keys("distill:*")))
+        wrote = ctx.redis_after("distill:idem:t1:k-bad", lambda: sorted(ctx.redis.keys("distill:*")))
         r = await _post(c, {**GOOD, "sample_cap": 5}, key="k-bad")
         assert r.status_code == 400, f"sample_cap=5 answered {r.status_code}, expected 400"
-        assert not touched.fired, f"a rejected start touched the job store (keys at that moment: {touched.result}): validate before store.put, so nothing has to be unwound"
+        assert not (wrote.fired and wrote.result), f"a rejected start wrote the job store (keys at that moment: {wrote.result}): validate before store.put, so nothing has to be unwound"
         assert ctx.redis.keys("distill:*") == [], f"a rejected start must leave nothing in Redis, found {ctx.redis.keys('distill:*')}"
         r = await _post(c, {**GOOD, "teacher": "gpt-5-max"}, key="k-bad")
         assert r.status_code == 400 and ctx.redis.keys("distill:*") == [], "a refused teacher must leave nothing in Redis either"
+        r = await _post(c, {**GOOD, "dataset_id": ""}, key="k-bad")
+        assert r.status_code == 400, f"an empty dataset_id answered {r.status_code}, expected 400"
+        assert ctx.redis.keys("distill:*") == [], f"a start with no dataset must leave nothing in Redis, found {ctx.redis.keys('distill:*')}"
 `,
     typescript: `const GOOD = {teacher: 'teach-70b-v3', dataset_id: 'ds-support-2026', sample_cap: 1000};
 const FIELDS = ['job_id', 'status', 'teacher', 'dataset_id', 'sample_cap', 'sampled', 'accepted', 'rejected'];
@@ -797,10 +804,12 @@ export async function check_route(ctx) {
 
 export async function check_approved_teacher(ctx) {
   const c = api(ctx);
-  let r = await post(c, {...GOOD, teacher: 'gpt-5-max'}, {key: 'k-bad'});
-  assert.equal(r.status, 400, \`a teacher outside the catalog (gpt-5-max) answered \${r.status}, expected 400: the caller must not pick the model that spends the budget\`);
+  for (const teacher of ['gpt-5-max', 'teach-405b-v1', 'teach-70b']) {
+    const bad = await post(c, {...GOOD, teacher}, {key: 'k-bad'});
+    assert.equal(bad.status, 400, \`a teacher outside the catalog (\${teacher}) answered \${bad.status}, expected 400: the caller must not pick the model that spends the budget, and the catalog is exact names\`);
+  }
   assert.deepEqual(jobKeys(ctx), [], \`a refused start must store no job, found \${JSON.stringify(jobKeys(ctx))}\`);
-  r = await post(c, {...GOOD, teacher: 'teach-13b-v2'}, {key: 'k-ok'});
+  const r = await post(c, {...GOOD, teacher: 'teach-13b-v2'}, {key: 'k-ok'});
   assert.equal(r.status, 201, \`teach-13b-v2 is in the catalog, got \${r.status}: \${r.text}\`);
 }
 
@@ -821,6 +830,9 @@ export async function check_idempotency_key(ctx) {
   const c = api(ctx);
   const noKey = await post(c, GOOD, {withKey: false});
   assert.equal(noKey.status, 400, \`a start without Idempotency-Key answered \${noKey.status}, expected 400\`);
+  const emptyKey = await post(c, GOOD, {key: ''});
+  assert.equal(emptyKey.status, 400, \`a start with an empty Idempotency-Key answered \${emptyKey.status}, expected 400\`);
+  assert.deepEqual(jobKeys(ctx), [], \`a start without a key must store no job, found \${JSON.stringify(jobKeys(ctx))}\`);
   const first = await post(c, GOOD, {key: 'k-7'});
   assert.equal(first.status, 201, \`the first start answered \${first.status}: \${first.text}\`);
   const replay = await post(c, GOOD, {key: 'k-7'});
@@ -833,13 +845,16 @@ export async function check_idempotency_key(ctx) {
 
 export async function check_validate_before_create(ctx) {
   const c = api(ctx);
-  const touched = ctx.redisAfter('distill:idem:t1:k-bad', () => ctx.redis.keys('distill:*').sort());
+  const wrote = ctx.redisAfter('distill:idem:t1:k-bad', () => ctx.redis.keys('distill:*').sort());
   let r = await post(c, {...GOOD, sample_cap: 5}, {key: 'k-bad'});
   assert.equal(r.status, 400, \`sample_cap=5 answered \${r.status}, expected 400\`);
-  assert(!touched.fired, \`a rejected start touched the job store (keys at that moment: \${JSON.stringify(touched.result)}): validate before store.put, so nothing has to be unwound\`);
+  assert(!(wrote.fired && wrote.result.length > 0), \`a rejected start wrote the job store (keys at that moment: \${JSON.stringify(wrote.result)}): validate before store.put, so nothing has to be unwound\`);
   assert.deepEqual(ctx.redis.keys('distill:*'), [], \`a rejected start must leave nothing in Redis, found \${JSON.stringify(ctx.redis.keys('distill:*'))}\`);
   r = await post(c, {...GOOD, teacher: 'gpt-5-max'}, {key: 'k-bad'});
   assert(r.status === 400 && ctx.redis.keys('distill:*').length === 0, 'a refused teacher must leave nothing in Redis either');
+  r = await post(c, {...GOOD, dataset_id: ''}, {key: 'k-bad'});
+  assert.equal(r.status, 400, \`an empty dataset_id answered \${r.status}, expected 400\`);
+  assert.deepEqual(ctx.redis.keys('distill:*'), [], \`a start with no dataset must leave nothing in Redis, found \${JSON.stringify(ctx.redis.keys('distill:*'))}\`);
 }
 `,
     go: `package main
@@ -900,10 +915,12 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckApprovedTeacher(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	r := apiPost(c, apiWith(apiGood, map[string]any{"teacher": "gpt-5-max"}), "k-bad", "t1")
-	ctx.Equal(r.Status, 400, "a teacher outside the catalog (gpt-5-max): the caller must not pick the model that spends the budget")
+	for _, teacher := range []string{"gpt-5-max", "teach-405b-v1", "teach-70b"} {
+		r := apiPost(c, apiWith(apiGood, map[string]any{"teacher": teacher}), "k-bad", "t1")
+		ctx.Equal(r.Status, 400, "a teacher outside the catalog (%s): the caller must not pick the model that spends the budget, and the catalog is exact names", teacher)
+	}
 	ctx.Equal(len(ctx.Redis.Keys("distill:job:*")), 0, "a refused start must store no job; jobs stored")
-	r = apiPost(c, apiWith(apiGood, map[string]any{"teacher": "teach-13b-v2"}), "k-ok", "t1")
+	r := apiPost(c, apiWith(apiGood, map[string]any{"teacher": "teach-13b-v2"}), "k-ok", "t1")
 	ctx.Equal(r.Status, 201, "teach-13b-v2 is in the catalog (%s)", r.Text())
 }
 
@@ -924,6 +941,9 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	noKey := c.Post("/v1/distill/jobs", apiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
+	emptyKey := apiPost(c, apiGood, "", "t1")
+	ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key")
+	ctx.Equal(len(ctx.Redis.Keys("distill:job:*")), 0, "a start without a key must store no job; jobs stored")
 	first := apiPost(c, apiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first start (%s)", first.Text())
 	replay := apiPost(c, apiGood, "k-7", "t1")
@@ -936,17 +956,21 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 
 func CheckValidateBeforeCreate(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	touched := false
+	wrote := false
 	ctx.Redis.After("distill:idem:t1:k-bad", func() any {
-		touched = true
-		return ctx.Redis.Keys("distill:*")
+		keys := ctx.Redis.Keys("distill:*")
+		wrote = len(keys) > 0
+		return keys
 	})
 	r := apiPost(c, apiWith(apiGood, map[string]any{"sample_cap": 5}), "k-bad", "t1")
 	ctx.Equal(r.Status, 400, "sample_cap=5")
-	ctx.Assert(!touched, "a rejected start touched the job store: validate before jobs.Put, so nothing has to be unwound")
+	ctx.Assert(!wrote, "a rejected start wrote the job store: validate before jobs.Put, so nothing has to be unwound")
 	ctx.Equal(len(ctx.Redis.Keys("distill:*")), 0, "a rejected start must leave nothing in Redis; keys")
 	r = apiPost(c, apiWith(apiGood, map[string]any{"teacher": "gpt-5-max"}), "k-bad", "t1")
 	ctx.Assert(r.Status == 400 && len(ctx.Redis.Keys("distill:*")) == 0, "a refused teacher must leave nothing in Redis either")
+	r = apiPost(c, apiWith(apiGood, map[string]any{"dataset_id": ""}), "k-bad", "t1")
+	ctx.Equal(r.Status, 400, "an empty dataset_id")
+	ctx.Equal(len(ctx.Redis.Keys("distill:*")), 0, "a start with no dataset must leave nothing in Redis; keys")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1005,10 +1029,12 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckApprovedTeacher(harness::Ctx& ctx) {
   Api api(ctx);
-  auto r = api.post(with(kGood, "teacher", "gpt-5-max"), "k-bad");
-  ctx.Equal(r.Status, 400, "a teacher outside the catalog (gpt-5-max): the caller must not pick the model that spends the budget");
+  for (const std::string teacher : {"gpt-5-max", "teach-405b-v1", "teach-70b"}) {
+    const auto bad = api.post(with(kGood, "teacher", teacher), "k-bad");
+    ctx.Equal(bad.Status, 400, "a teacher outside the catalog (%s): the caller must not pick the model that spends the budget, and the catalog is exact names", teacher);
+  }
   ctx.Equal(ctx.Redis.Keys("distill:job:*").size(), 0, "a refused start must store no job; jobs stored");
-  r = api.post(with(kGood, "teacher", "teach-13b-v2"), "k-ok");
+  const auto r = api.post(with(kGood, "teacher", "teach-13b-v2"), "k-ok");
   ctx.Equal(r.Status, 201, "teach-13b-v2 is in the catalog (%s)", r.Text());
 }
 
@@ -1029,6 +1055,9 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   Api api(ctx);
   const auto noKey = api.http.Post("/v1/distill/jobs", kGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
+  const auto emptyKey = api.post(kGood, "");
+  ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key");
+  ctx.Equal(ctx.Redis.Keys("distill:job:*").size(), 0, "a start without a key must store no job; jobs stored");
   const auto first = api.post(kGood, "k-7");
   ctx.Equal(first.Status, 201, "the first start (%s)", first.Text());
   const auto replay = api.post(kGood, "k-7");
@@ -1041,14 +1070,17 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
 
 void CheckValidateBeforeCreate(harness::Ctx& ctx) {
   Api api(ctx);
-  bool touched = false;
-  ctx.Redis.After("distill:idem:t1:k-bad", [&touched] { touched = true; });
+  bool wrote = false;
+  ctx.Redis.After("distill:idem:t1:k-bad", [&ctx, &wrote] { wrote = !ctx.Redis.Keys("distill:*").empty(); });
   auto r = api.post(with(kGood, "sample_cap", 5), "k-bad");
   ctx.Equal(r.Status, 400, "sample_cap=5");
-  ctx.Assert(!touched, "a rejected start touched the job store: validate before jobs::put, so nothing has to be unwound");
+  ctx.Assert(!wrote, "a rejected start wrote the job store: validate before jobs::put, so nothing has to be unwound");
   ctx.Equal(ctx.Redis.Keys("distill:*").size(), 0, "a rejected start must leave nothing in Redis; keys");
   r = api.post(with(kGood, "teacher", "gpt-5-max"), "k-bad");
   ctx.Assert(r.Status == 400 && ctx.Redis.Keys("distill:*").empty(), "a refused teacher must leave nothing in Redis either");
+  r = api.post(with(kGood, "dataset_id", ""), "k-bad");
+  ctx.Equal(r.Status, 400, "an empty dataset_id");
+  ctx.Equal(ctx.Redis.Keys("distill:*").size(), 0, "a start with no dataset must leave nothing in Redis; keys");
 }
 `,
   },

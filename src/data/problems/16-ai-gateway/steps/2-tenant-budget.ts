@@ -26,6 +26,8 @@ and a key that one tenant shares with its own tomorrow.
 - Read, compare, decrement and the first write with its expiry run inside **one Lua script**
   (\`EVAL\` / \`EVALSHA\`). The expiry is the time left until midnight UTC, set only when the key is
   created; a later reservation does not extend it.
+- A request that needs exactly what is left fits; the first request of a day is compared against
+  the fresh budget like any other.
 - A rejected request answers **429** with \`Retry-After\` (the key's TTL in seconds) and
   \`X-RateLimit-Remaining\`, and the route behind the guard does not run.`,
   sequence: {
@@ -90,7 +92,7 @@ and a key that one tenant shares with its own tomorrow.
       id: 'ttl',
       title: 'The day key expires at midnight UTC',
       detail:
-        'The script creates the key with `SET … EX <seconds to midnight>` (or an `EXPIRE` right after) and reports its `TTL`; a key with no expiry never resets, and an expiry set on every reservation keeps moving.',
+        'The script creates the key with `SET … EX <seconds to midnight>` (or an `EXPIRE` right after, in the same script) and reports its `TTL`: a replica reading the key right after the command that created it already sees the expiry. A key with no expiry never resets, and an expiry set on every reservation keeps moving.',
       match: {
         python: {
           all: [
@@ -128,7 +130,7 @@ and a key that one tenant shares with its own tomorrow.
       id: 'reject-headers',
       title: 'Answers 429 with Retry-After and X-RateLimit-Remaining',
       detail:
-        "A request that does not fit answers `429 Too Many Requests` with `Retry-After` (the key's TTL) and `X-RateLimit-Remaining`, and the route behind the guard does not run.",
+        "A request that does not fit answers `429 Too Many Requests` with `Retry-After` (the key's TTL in seconds) and `X-RateLimit-Remaining`, and the route behind the guard does not run. A request worth exactly what is left fits, and a day's first request is compared against the fresh budget too.",
       match: {
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\b429\b/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/, /\b429\b/]},
@@ -900,9 +902,13 @@ async def check_atomic(ctx):
 async def check_ttl(ctx):
     m = _gateway(ctx)
     key = f"budget:acme:{_day(ctx)}"
+    # The TTL as another replica would see it right after the command that created the key.
+    seen = []
+    probe = ctx.redis_after(key, lambda: seen.append(ctx.redis.ttl(key)))
     r = await _chat(ctx, m, _body(164))
     assert r.status_code == 200, f"the first request of the day answered {r.status_code}: {r.text}"
     assert ctx.redis.exists(key), f"after a request {key} does not exist (keys: {sorted(ctx.redis.keys('budget:*'))})"
+    assert probe.fired and seen[0] > 0, f"right after the command that created {key} its TTL was {seen[0] if seen else None}: a key created without its expiry lives forever if the next command never comes. Create it with its expiry in the same script"
     ttl = ctx.redis.ttl(key)
     assert ttl > 0, f"{key} has no expiry (TTL {ttl}): the daily budget never resets"
     midnight = 86400 - int(ctx.clock.time()) % 86400
@@ -916,16 +922,24 @@ async def check_ttl(ctx):
 async def check_reject_headers(ctx):
     m = _gateway(ctx)
     key = f"budget:acme:{_day(ctx)}"
-    ctx.redis.set(key, 50, ex=3600)
+    ctx.redis.set(key, 50, ex=1234)
     r = await _chat(ctx, m, _body(164))
     assert r.status_code == 429, f"a request worth 164 tokens against 50 remaining answered {r.status_code}, expected 429"
     assert m.served == [], "a rejected request must not reach the route behind the guard"
-    assert r.headers.get("retry-after") in ("3600", "3599"), f"Retry-After is {r.headers.get('retry-after')!r}, expected the key's TTL (3600 s)"
+    assert r.headers.get("retry-after") in ("1234", "1233"), f"Retry-After is {r.headers.get('retry-after')!r}, expected the key's TTL (1234 s)"
     assert r.headers.get("x-ratelimit-remaining") == "50", f"X-RateLimit-Remaining is {r.headers.get('x-ratelimit-remaining')!r}, expected 50"
     assert int(ctx.redis.get(key)) == 50, f"a rejected request must not spend: {key} holds {ctx.redis.get(key)}, expected 50"
     small = await _chat(ctx, m, _body(2, content_chars=4))
     assert small.status_code == 200 and len(m.served) == 1, f"a request that fits (2 tokens of 50) answered {small.status_code}"
     assert int(ctx.redis.get(key)) == 48, f"after a 2-token reservation {key} holds {ctx.redis.get(key)}, expected 48"
+    exact = await _chat(ctx, m, _body(48, content_chars=4))
+    assert exact.status_code == 200 and len(m.served) == 2, f"a request worth exactly the 48 tokens left answered {exact.status_code}, expected 200"
+    assert int(ctx.redis.get(key)) == 0, f"after spending the last 48 tokens {key} holds {ctx.redis.get(key)}, expected 0"
+    empty = await _chat(ctx, m, _body(1, content_chars=0))
+    assert empty.status_code == 429 and empty.headers.get("x-ratelimit-remaining") == "0", f"one token against an empty budget answered {empty.status_code} with X-RateLimit-Remaining {empty.headers.get('x-ratelimit-remaining')!r}, expected 429 and 0"
+    huge = await _chat(ctx, m, _body(1_000_001), headers={"Authorization": "Bearer beta"})
+    assert huge.status_code == 429 and len(m.served) == 2, f"beta's first request of the day, worth 1000001 tokens against a fresh 1000000 budget, answered {huge.status_code}, expected 429: the first reservation is compared too"
+    assert huge.headers.get("x-ratelimit-remaining") == "1000000", f"X-RateLimit-Remaining for beta's oversized first request is {huge.headers.get('x-ratelimit-remaining')!r}, expected 1000000"
 
 
 async def check_tenant_day_key(ctx):
@@ -987,9 +1001,13 @@ export async function check_atomic(ctx) {
 export async function check_ttl(ctx) {
   const {c} = gateway(ctx);
   const key = \`budget:acme:\${day(ctx)}\`;
+  // The TTL as another replica would see it right after the command that created the key.
+  const seen: number[] = [];
+  const probe = ctx.redisAfter(key, () => void seen.push(Number(ctx.redis.ttl(key))));
   const r = await c.post('/v1/chat', {body: body(164), headers: AUTH});
   assert.equal(r.status, 200, \`the first request of the day answered \${r.status}: \${r.text}\`);
   assert(ctx.redis.exists(key), \`after a request \${key} does not exist (keys: \${JSON.stringify(ctx.redis.keys('budget:*').sort())})\`);
+  assert(probe.fired && seen[0] > 0, \`right after the command that created \${key} its TTL was \${seen[0]}: a key created without its expiry lives forever if the next command never comes. Create it with its expiry in the same script\`);
   const ttl = Number(ctx.redis.ttl(key));
   assert(ttl > 0, \`\${key} has no expiry (TTL \${ttl}): the daily budget never resets\`);
   const midnight = 86400 - (Math.floor(ctx.clock.now() / 1000) % 86400);
@@ -1003,16 +1021,24 @@ export async function check_ttl(ctx) {
 export async function check_reject_headers(ctx) {
   const {c, served} = gateway(ctx);
   const key = \`budget:acme:\${day(ctx)}\`;
-  ctx.redis.set(key, 50, 'EX', 3600);
+  ctx.redis.set(key, 50, 'EX', 1234);
   const r = await c.post('/v1/chat', {body: body(164), headers: AUTH});
   assert.equal(r.status, 429, \`a request worth 164 tokens against 50 remaining answered \${r.status}, expected 429\`);
   assert.equal(served.length, 0, 'a rejected request must not reach the route behind the guard');
-  assert(['3600', '3599'].includes(r.headers['retry-after']), \`Retry-After is \${JSON.stringify(r.headers['retry-after'])}, expected the key's TTL (3600 s)\`);
+  assert(['1234', '1233'].includes(r.headers['retry-after']), \`Retry-After is \${JSON.stringify(r.headers['retry-after'])}, expected the key's TTL (1234 s)\`);
   assert.equal(r.headers['x-ratelimit-remaining'], '50', \`X-RateLimit-Remaining is \${JSON.stringify(r.headers['x-ratelimit-remaining'])}, expected 50\`);
   assert.equal(Number(ctx.redis.get(key)), 50, \`a rejected request must not spend: \${key} holds \${ctx.redis.get(key)}, expected 50\`);
   const small = await c.post('/v1/chat', {body: body(2, 4), headers: AUTH});
   assert(small.status === 200 && served.length === 1, \`a request that fits (2 tokens of 50) answered \${small.status}\`);
   assert.equal(Number(ctx.redis.get(key)), 48, \`after a 2-token reservation \${key} holds \${ctx.redis.get(key)}, expected 48\`);
+  const exact = await c.post('/v1/chat', {body: body(48, 4), headers: AUTH});
+  assert(exact.status === 200 && served.length === 2, \`a request worth exactly the 48 tokens left answered \${exact.status}, expected 200\`);
+  assert.equal(Number(ctx.redis.get(key)), 0, \`after spending the last 48 tokens \${key} holds \${ctx.redis.get(key)}, expected 0\`);
+  const empty = await c.post('/v1/chat', {body: body(1, 0), headers: AUTH});
+  assert(empty.status === 429 && empty.headers['x-ratelimit-remaining'] === '0', \`one token against an empty budget answered \${empty.status} with X-RateLimit-Remaining \${JSON.stringify(empty.headers['x-ratelimit-remaining'])}, expected 429 and 0\`);
+  const huge = await c.post('/v1/chat', {body: body(1_000_001), headers: {Authorization: 'Bearer beta'}});
+  assert(huge.status === 429 && served.length === 2, \`beta's first request of the day, worth 1000001 tokens against a fresh 1000000 budget, answered \${huge.status}, expected 429: the first reservation is compared too\`);
+  assert.equal(huge.headers['x-ratelimit-remaining'], '1000000', \`X-RateLimit-Remaining for beta's oversized first request is \${JSON.stringify(huge.headers['x-ratelimit-remaining'])}, expected 1000000\`);
 }
 
 export async function check_tenant_day_key(ctx) {
@@ -1099,9 +1125,16 @@ func CheckAtomic(ctx *harness.Ctx) {
 func CheckTtl(ctx *harness.Ctx) {
 	g := newBudgetGateway(ctx)
 	key := "budget:acme:" + budgetDay(ctx)
+	// The TTL as another replica would see it right after the command that created the key.
+	seen := []int64{}
+	ctx.Redis.After(key, func() any {
+		seen = append(seen, int64(ctx.Redis.TTL(key)))
+		return nil
+	})
 	r := g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Equal(r.Status, 200, "the first request of the day (%s)", r.Text())
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("budget:*"))
+	ctx.Assert(len(seen) > 0 && seen[0] > 0, "right after the command that created %s its TTL was %v: a key created without its expiry lives forever if the next command never comes. Create it with its expiry in the same script", key, seen)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): the daily budget never resets", key, ttl)
 	midnight := 86400 - (ctx.Clock.Now()/1000)%86400
@@ -1116,17 +1149,25 @@ func CheckTtl(ctx *harness.Ctx) {
 func CheckRejectHeaders(ctx *harness.Ctx) {
 	g := newBudgetGateway(ctx)
 	key := "budget:acme:" + budgetDay(ctx)
-	ctx.Redis.Do("SET", key, 50, "EX", 3600)
+	ctx.Redis.Do("SET", key, 50, "EX", 1234)
 	r := g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Equal(r.Status, 429, "a request worth 164 tokens against 50 remaining")
 	ctx.Equal(g.served, 0, "a rejected request must not reach the route behind the guard; the route ran")
 	retry := r.Header.Get("Retry-After")
-	ctx.Assert(retry == "3600" || retry == "3599", "Retry-After is %q, expected the key's TTL (3600 s)", retry)
+	ctx.Assert(retry == "1234" || retry == "1233", "Retry-After is %q, expected the key's TTL (1234 s)", retry)
 	ctx.Equal(r.Header.Get("X-RateLimit-Remaining"), "50", "X-RateLimit-Remaining")
 	ctx.Equal(budgetValue(ctx, key), 50, "a rejected request must not spend; %s", key)
 	small := g.http.Post("/v1/chat", budgetBody(2, 4), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status)
 	ctx.Equal(budgetValue(ctx, key), 48, "after a 2-token reservation %s", key)
+	exact := g.http.Post("/v1/chat", budgetBody(48, 4), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d, expected 200", exact.Status)
+	ctx.Equal(budgetValue(ctx, key), 0, "after spending the last 48 tokens %s", key)
+	empty := g.http.Post("/v1/chat", budgetBody(1, 0), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	ctx.Assert(empty.Status == 429 && empty.Header.Get("X-RateLimit-Remaining") == "0", "one token against an empty budget answered %d with X-RateLimit-Remaining %q, expected 429 and 0", empty.Status, empty.Header.Get("X-RateLimit-Remaining"))
+	huge := g.http.Post("/v1/chat", budgetBody(1_000_001, 400), "Authorization", "Bearer beta", "Content-Type", "application/json")
+	ctx.Assert(huge.Status == 429 && g.served == 2, "beta's first request of the day, worth 1000001 tokens against a fresh 1000000 budget, answered %d, expected 429: the first reservation is compared too", huge.Status)
+	ctx.Equal(huge.Header.Get("X-RateLimit-Remaining"), "1000000", "X-RateLimit-Remaining for beta's oversized first request")
 }
 
 func CheckTenantDayKey(ctx *harness.Ctx) {
@@ -1215,9 +1256,13 @@ void CheckAtomic(harness::Ctx& ctx) {
 void CheckTtl(harness::Ctx& ctx) {
   BudgetGateway g(ctx);
   const std::string key = "budget:acme:" + budgetDay(ctx);
+  // The TTL as another replica would see it right after the command that created the key.
+  std::vector<long long> seen;
+  ctx.Redis.After(key, [&] { seen.push_back(ctx.Redis.TTL(key)); });
   const auto r = g.chat(budgetBody(164));
   ctx.Equal(r.Status, 200, "the first request of the day (%s)", r.Text());
   ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("budget:*"));
+  ctx.Assert(!seen.empty() && seen[0] > 0, "right after the command that created %s its TTL was %d: a key created without its expiry lives forever if the next command never comes. Create it with its expiry in the same script", key, seen.empty() ? -2 : seen[0]);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): the daily budget never resets", key, ttl);
   const long long midnight = 86400 - (ctx.Clock.Now() / 1000) % 86400;
@@ -1231,17 +1276,25 @@ void CheckTtl(harness::Ctx& ctx) {
 void CheckRejectHeaders(harness::Ctx& ctx) {
   BudgetGateway g(ctx);
   const std::string key = "budget:acme:" + budgetDay(ctx);
-  ctx.Redis.Do("SET", key, 50, "EX", 3600);
+  ctx.Redis.Do("SET", key, 50, "EX", 1234);
   const auto r = g.chat(budgetBody(164));
   ctx.Equal(r.Status, 429, "a request worth 164 tokens against 50 remaining");
   ctx.Equal(g.served, 0, "a rejected request must not reach the route behind the guard; the route ran");
   const std::string retry = r.HeaderValue("Retry-After");
-  ctx.Assert(retry == "3600" || retry == "3599", "Retry-After is %q, expected the key's TTL (3600 s)", retry);
+  ctx.Assert(retry == "1234" || retry == "1233", "Retry-After is %q, expected the key's TTL (1234 s)", retry);
   ctx.Equal(r.HeaderValue("X-RateLimit-Remaining"), "50", "X-RateLimit-Remaining");
   ctx.Equal(budgetValue(ctx, key), 50, "a rejected request must not spend; %s", key);
   const auto small = g.chat(budgetBody(2, 4));
   ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status);
   ctx.Equal(budgetValue(ctx, key), 48, "after a 2-token reservation %s", key);
+  const auto exact = g.chat(budgetBody(48, 4));
+  ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d, expected 200", exact.Status);
+  ctx.Equal(budgetValue(ctx, key), 0, "after spending the last 48 tokens %s", key);
+  const auto empty = g.chat(budgetBody(1, 0));
+  ctx.Assert(empty.Status == 429 && empty.HeaderValue("X-RateLimit-Remaining") == "0", "one token against an empty budget answered %d with X-RateLimit-Remaining %q, expected 429 and 0", empty.Status, empty.HeaderValue("X-RateLimit-Remaining"));
+  const auto huge = g.chat(budgetBody(1000001), "beta");
+  ctx.Assert(huge.Status == 429 && g.served == 2, "beta's first request of the day, worth 1000001 tokens against a fresh 1000000 budget, answered %d, expected 429: the first reservation is compared too", huge.Status);
+  ctx.Equal(huge.HeaderValue("X-RateLimit-Remaining"), "1000000", "X-RateLimit-Remaining for beta's oversized first request");
 }
 
 void CheckTenantDayKey(harness::Ctx& ctx) {
