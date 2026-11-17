@@ -25,7 +25,7 @@ between commit and count loses it.
   producing; a held claim returns \`False\` without producing.
 - Read the delivery result where it arrives (the delivery callback, a rejected \`send\`,
   \`WriteMessages\`' error) and delete the claim when the delivery failed.
-- Count, then commit.`,
+- Count, then commit; a count that fails is not committed.`,
   sequence: {
     participants: ['Experiment API', 'Redis', 'experiment.exposure', 'Analysis consumer'],
     messages: [
@@ -64,7 +64,7 @@ between commit and count loses it.
       id: 'shared-dedupe',
       title: 'One exposure per unit across replicas',
       detail:
-        'The dedupe is a Redis claim, `exp:{experiment_id}:seen:{unit_id}` taken with `SET NX` and a 7-day TTL, so every replica sees it; the starter keeps a set in its own process.',
+        'The dedupe is a Redis claim, `exp:{experiment_id}:seen:{unit_id}` taken by one `SET NX` that carries the 7-day TTL, so every replica sees it and only the replica that took it publishes; the starter keeps a set in its own process.',
       match: {
         python: {all: [/nx\s*=\s*True/, /:seen:/], none: [/\b_seen\b/]},
         typescript: {all: [/['"]NX['"]/, /:seen:/], none: [/new Set</]},
@@ -90,7 +90,7 @@ between commit and count loses it.
       id: 'count-before-commit',
       title: 'The consumer counts, then commits',
       detail:
-        'The consumer adds the exposure to `exp:{id}:exposures` and only then commits its offset; a crash in between redelivers instead of losing the unit.',
+        'The consumer adds the exposure to `exp:{id}:exposures` and only then commits its offset; a crash in between redelivers instead of losing the unit, and a count that fails is never committed past.',
       match: {
         python: {order: [/store\.add_exposure\(/, /consumer\.commit\(/]},
         typescript: {order: [/addExposure\(/, /commitOffsets\(/]},
@@ -717,7 +717,20 @@ def check_experiment_key(ctx):
 
 def check_shared_dedupe(ctx):
     m = ctx.load("events")
+    claim = "exp:exp-1:seen:u-1"
+    ttls = []
+
+    def snapshot():
+        ttl = ctx.redis.ttl(claim)
+        if ttl == -2:  # not claimed yet: wait for the next command on the key
+            ctx.redis_after(claim, snapshot)
+        else:
+            ttls.append(ttl)
+
+    ctx.redis_after(claim, snapshot)
     assert m.record_exposure("exp-1", "u-1", "treatment") is True, "the first exposure of u-1 must be recorded"
+    assert ttls, f"nothing claimed {claim}: the dedupe must be a Redis claim every replica sees"
+    assert WEEK - 60 <= ttls[0] <= WEEK, f"right after {claim} was claimed its TTL was {ttls[0]} s (-1: none), expected EXPOSURE_TTL_S (7 days): claim with SET NX and the TTL in one command"
     assert m.record_exposure("exp-1", "u-1", "treatment") is False, "a re-render of the same page must not record a second exposure"
     m.producer.poll(0)
     replica = ctx.reload("events")
@@ -725,9 +738,14 @@ def check_shared_dedupe(ctx):
     replica.producer.poll(0)
     records = ctx.kafka.records(TOPIC)
     assert again is False and len(records) == 1, f"a second replica recorded u-1 again ({len(records)} records on the topic): the dedupe must be shared, a Redis claim, not a set in one process"
-    claim = "exp:exp-1:seen:u-1"
-    ttl = ctx.redis.ttl(claim)
-    assert 0 < ttl <= WEEK, f"{claim} has TTL {ttl}: the claim must exist and expire after EXPOSURE_TTL_S (7 days)"
+    # Another replica claims u-9 between this replica's first command on the claim and its next.
+    rival_claim = "exp:exp-1:seen:u-9"
+    rival = ctx.redis_after(rival_claim, lambda: bool(ctx.redis.set(rival_claim, "treatment", nx=True, ex=WEEK)))
+    got = m.record_exposure("exp-1", "u-9", "treatment")
+    m.producer.poll(0)
+    assert rival.fired, f"nothing touched {rival_claim}: the claim must be taken there"
+    published = sum(1 for e in _events(ctx) if e.get("unit_id") == "u-9") + (1 if rival.result else 0)
+    assert published == 1 and got is not rival.result, f"another replica claimed u-9 ({rival.result}) while this one answered {got}: u-9 was published {published} times; take the claim with SET NX and produce only when it is yours"
 
 
 def check_delivery_release(ctx):
@@ -748,15 +766,23 @@ def check_delivery_release(ctx):
 def check_count_before_commit(ctx):
     for unit, variant in (("u-1", "control"), ("u-2", "treatment"), ("u-3", "control")):
         ctx.kafka.seed(TOPIC, key="exp-1", value=json.dumps({"experiment_id": "exp-1", "unit_id": unit, "variant": variant, "ts": 0}))
+    # A count that fails: exp-2's counts are not a hash.
+    ctx.redis.set("exp:exp-2:exposures", "corrupt")
+    ctx.kafka.seed(TOPIC, key="exp-1", value=json.dumps({"experiment_id": "exp-2", "unit_id": "u-4", "variant": "control", "ts": 0}))
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(sum(int(v) for v in ctx.redis.hvals("exp:exp-1:exposures"))))
     m = ctx.load("events")
-    ctx.drain(m.consume_exposures)
+    try:
+        ctx.drain(m.consume_exposures)
+    except Exception:  # noqa: BLE001 - a consumer may stop on the count it could not make
+        pass
     assert at_commit, "the consumer never committed an offset"
     assert at_commit[0] >= 1, f"at the first commit exp:exp-1:exposures counted {at_commit[0]} units: count before committing, or a crash in between loses the exposure"
     counts = store.exposures("exp-1")
     assert counts == {"control": 2, "treatment": 1}, f"exp:exp-1:exposures holds {counts}, expected control 2, treatment 1"
-    assert ctx.kafka.lag("exposure-stats", TOPIC) == 0, "every counted record must be committed"
+    lag = ctx.kafka.lag("exposure-stats", TOPIC)
+    assert lag <= 1, f"{lag} counted records are not committed: every counted record must be committed"
+    assert lag == 1, "the consumer committed past an exposure it failed to count: a count that fails must not be committed"
 `,
     typescript: `const TOPIC = 'experiment.exposure';
 const WEEK = 7 * 24 * 3600;
@@ -789,16 +815,38 @@ export async function check_experiment_key(ctx) {
 
 export async function check_shared_dedupe(ctx) {
   const m = ctx.load('events');
+  const claim = 'exp:exp-1:seen:u-1';
+  const ttls: number[] = [];
+  const snapshot = () => {
+    const ttl = ctx.redis.ttl(claim);
+    if (ttl === -2) ctx.redisAfter(claim, snapshot); // not claimed yet: wait for the next command on the key
+    else ttls.push(ttl);
+  };
+  ctx.redisAfter(claim, snapshot);
   assert.equal(await m.recordExposure('exp-1', 'u-1', 'treatment'), true, 'the first exposure of u-1 must be recorded');
+  assert(ttls.length > 0, \`nothing claimed \${claim}: the dedupe must be a Redis claim every replica sees\`);
+  assert(
+    ttls[0] >= WEEK - 60 && ttls[0] <= WEEK,
+    \`right after \${claim} was claimed its TTL was \${ttls[0]} s (-1: none), expected EXPOSURE_TTL_S (7 days): claim with SET NX and the TTL in one command\`,
+  );
   assert.equal(await m.recordExposure('exp-1', 'u-1', 'treatment'), false, 'a re-render of the same page must not record a second exposure');
   const replica = ctx.reload('events');
   const again = await replica.recordExposure('exp-1', 'u-1', 'treatment');
   await settle();
   const records = ctx.kafka.records(TOPIC);
   assert(again === false && records.length === 1, \`a second replica recorded u-1 again (\${records.length} records on the topic): the dedupe must be shared, a Redis claim, not a set in one process\`);
-  const claim = 'exp:exp-1:seen:u-1';
-  const ttl = ctx.redis.ttl(claim);
-  assert(ttl > 0 && ttl <= WEEK, \`\${claim} has TTL \${ttl}: the claim must exist and expire after EXPOSURE_TTL_S (7 days)\`);
+  // Another replica claims u-9 between this replica's first command on the claim and its next.
+  const rivalClaim = 'exp:exp-1:seen:u-9';
+  const rival = ctx.redisAfter(rivalClaim, () => ctx.redis.set(rivalClaim, 'treatment', 'NX', 'EX', WEEK) === 'OK');
+  const got = await m.recordExposure('exp-1', 'u-9', 'treatment');
+  await settle();
+  assert(rival.fired, \`nothing touched \${rivalClaim}: the claim must be taken there\`);
+  if (rival.error !== undefined) throw rival.error;
+  const published = events(ctx).filter(e => e.unit_id === 'u-9').length + (rival.result ? 1 : 0);
+  assert(
+    published === 1 && got !== rival.result,
+    \`another replica claimed u-9 (\${rival.result}) while this one answered \${got}: u-9 was published \${published} times; take the claim with SET NX and produce only when it is yours\`,
+  );
 }
 
 export async function check_delivery_release(ctx) {
@@ -821,15 +869,24 @@ export async function check_count_before_commit(ctx) {
   for (const [unit, variant] of [['u-1', 'control'], ['u-2', 'treatment'], ['u-3', 'control']]) {
     ctx.kafka.seed(TOPIC, {key: 'exp-1', value: JSON.stringify({experiment_id: 'exp-1', unit_id: unit, variant, ts: 0})});
   }
+  // A count that fails: exp-2's counts are not a hash.
+  ctx.redis.set('exp:exp-2:exposures', 'corrupt');
+  ctx.kafka.seed(TOPIC, {key: 'exp-1', value: JSON.stringify({experiment_id: 'exp-2', unit_id: 'u-4', variant: 'control', ts: 0})});
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push((ctx.redis.hvals('exp:exp-1:exposures') as string[]).reduce((sum, v) => sum + Number(v), 0)));
   const m = ctx.load('events');
-  await ctx.drain(m.consumeExposures());
+  try {
+    await ctx.drain(m.consumeExposures());
+  } catch {
+    // a consumer may stop on the count it could not make
+  }
   assert(atCommit.length > 0, 'the consumer never committed an offset');
   assert(atCommit[0] >= 1, \`at the first commit exp:exp-1:exposures counted \${atCommit[0]} units: count before committing, or a crash in between loses the exposure\`);
   const counts = ctx.redis.hgetall('exp:exp-1:exposures');
   assert.deepStrictEqual(counts, {control: '2', treatment: '1'}, \`exp:exp-1:exposures holds \${JSON.stringify(counts)}, expected control 2, treatment 1\`);
-  assert.equal(ctx.kafka.lag('exposure-stats', TOPIC), 0, 'every counted record must be committed');
+  const lag = ctx.kafka.lag('exposure-stats', TOPIC);
+  assert(lag <= 1, \`\${lag} counted records are not committed: every counted record must be committed\`);
+  assert.equal(lag, 1, 'the consumer committed past an exposure it failed to count: a count that fails must not be committed');
 }
 `,
     go: `package main
@@ -845,9 +902,9 @@ import (
 	"leetbuild/harness"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func exposureUnits(ctx *harness.Ctx) []string {
+func hExposureUnits(ctx *harness.Ctx) []string {
 	units := []string{}
 	for _, r := range ctx.Kafka.Records(topic) {
 		var e map[string]any
@@ -859,9 +916,9 @@ func exposureUnits(ctx *harness.Ctx) []string {
 }
 
 func CheckExperimentKey(ctx *harness.Ctx) {
-	recordExposure(eventsBg, "exp-1", "u-1", "control")
-	recordExposure(eventsBg, "exp-2", "u-2", "treatment")
-	recordExposure(eventsBg, "exp-1", "u-3", "treatment")
+	recordExposure(hEventsBg, "exp-1", "u-1", "control")
+	recordExposure(hEventsBg, "exp-2", "u-2", "treatment")
+	recordExposure(hEventsBg, "exp-1", "u-3", "treatment")
 	ctx.Settle()
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 3, "three first exposures must produce three records on %s; the records", topic)
@@ -889,13 +946,42 @@ func CheckExperimentKey(ctx *harness.Ctx) {
 }
 
 func CheckSharedDedupe(ctx *harness.Ctx) {
-	ctx.Assert(recordExposure(eventsBg, "exp-1", "u-1", "treatment"), "the first exposure of u-1 must be recorded")
-	ctx.Assert(!recordExposure(eventsBg, "exp-1", "u-1", "treatment"), "a re-render of the same page must not record a second exposure")
+	claim := "exp:exp-1:seen:u-1"
+	var ttls []int64
+	var snapshot func() any
+	snapshot = func() any {
+		ttl := ctx.Redis.TTL(claim)
+		if ttl == -2 { // not claimed yet: wait for the next command on the key
+			ctx.Redis.After(claim, snapshot)
+		} else {
+			ttls = append(ttls, ttl)
+		}
+		return nil
+	}
+	ctx.Redis.After(claim, snapshot)
+	ctx.Assert(recordExposure(hEventsBg, "exp-1", "u-1", "treatment"), "the first exposure of u-1 must be recorded")
+	ctx.Assert(len(ttls) > 0, "nothing claimed %s: the dedupe must be a Redis claim every replica sees (SET NX), not a map in one process", claim)
+	ctx.Assert(ttls[0] >= 7*24*3600-60 && ttls[0] <= 7*24*3600, "right after %s was claimed its TTL was %d s (-1: none), expected 7 days: claim with SET NX and the TTL in one command", claim, ttls[0])
+	ctx.Assert(!recordExposure(hEventsBg, "exp-1", "u-1", "treatment"), "a re-render of the same page must not record a second exposure")
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one unit, one exposure; the records")
-	claim := "exp:exp-1:seen:u-1"
-	ttl := ctx.Redis.TTL(claim)
-	ctx.Assert(ttl > 0 && ttl <= 7*24*3600, "%s has TTL %d: the dedupe must be a Redis claim every replica sees (SET NX), expiring after 7 days, not a map in one process", claim, ttl)
+	// Another replica claims u-9 between this replica's first command on the claim and its next.
+	rivalClaim := "exp:exp-1:seen:u-9"
+	rival := ctx.Redis.After(rivalClaim, func() any { return ctx.Redis.Set(rivalClaim, "treatment", "NX", "EX", 7*24*3600) })
+	got := recordExposure(hEventsBg, "exp-1", "u-9", "treatment")
+	ctx.Settle()
+	ctx.Assert(rival.Fired, "nothing touched %s: the claim must be taken there", rivalClaim)
+	rivalWon := rival.Result == true
+	published := 0
+	for _, u := range hExposureUnits(ctx) {
+		if u == "u-9" {
+			published++
+		}
+	}
+	if rivalWon {
+		published++
+	}
+	ctx.Assert(published == 1 && got != rivalWon, "another replica claimed u-9 (%t) while this one answered %t: u-9 was published %d times; take the claim with SET NX and produce only when it is yours", rivalWon, got, published)
 }
 
 func CheckDeliveryRelease(ctx *harness.Ctx) {
@@ -906,13 +992,13 @@ func CheckDeliveryRelease(ctx *harness.Ctx) {
 				ctx.Fatalf("recordExposure failed the page render when the broker refused the record: %v", e)
 			}
 		}()
-		recordExposure(eventsBg, "exp-1", "u-1", "control")
+		recordExposure(hEventsBg, "exp-1", "u-1", "control")
 	}()
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "the broker refused the record; the records on the topic")
-	recordExposure(eventsBg, "exp-1", "u-1", "control") // the page renders again
+	recordExposure(hEventsBg, "exp-1", "u-1", "control") // the page renders again
 	ctx.Settle()
-	ctx.Equal(exposureUnits(ctx), []string{"u-1"}, "after a refused delivery and a second render the exposure must be on the topic (delete the claim when WriteMessages fails); the units")
+	ctx.Equal(hExposureUnits(ctx), []string{"u-1"}, "after a refused delivery and a second render the exposure must be on the topic (delete the claim when WriteMessages fails); the units")
 }
 
 func CheckCountBeforeCommit(ctx *harness.Ctx) {
@@ -920,6 +1006,10 @@ func CheckCountBeforeCommit(ctx *harness.Ctx) {
 		value, _ := json.Marshal(map[string]any{"experiment_id": "exp-1", "unit_id": s[0], "variant": s[1], "ts": 0})
 		ctx.Kafka.Seed(topic, "exp-1", string(value))
 	}
+	// A count that fails: exp-2's counts are not a hash.
+	ctx.Redis.Set("exp:exp-2:exposures", "corrupt")
+	bad, _ := json.Marshal(map[string]any{"experiment_id": "exp-2", "unit_id": "u-4", "variant": "control", "ts": 0})
+	ctx.Kafka.Seed(topic, "exp-1", string(bad))
 	var atCommit []int
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		total := 0
@@ -929,18 +1019,23 @@ func CheckCountBeforeCommit(ctx *harness.Ctx) {
 		}
 		atCommit = append(atCommit, total)
 	})
-	ctx.Drain(func() { consumeExposures(eventsBg) })
+	ctx.Drain(func() { consumeExposures(hEventsBg) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
 	ctx.Assert(atCommit[0] >= 1, "at the first commit exp:exp-1:exposures counted %d units: count before committing, or a crash in between loses the exposure", atCommit[0])
-	ctx.Equal(store.Exposures(eventsBg, "exp-1"), map[string]int64{"control": 2, "treatment": 1}, "exp:exp-1:exposures")
-	ctx.Equal(ctx.Kafka.Lag("exposure-stats", topic), 0, "every counted record must be committed; the lag")
+	ctx.Equal(store.Exposures(hEventsBg, "exp-1"), map[string]int64{"control": 2, "treatment": 1}, "exp:exp-1:exposures")
+	lag := ctx.Kafka.Lag("exposure-stats", topic)
+	ctx.Assert(lag <= 1, "%d counted records are not committed: every counted record must be committed", lag)
+	ctx.Assert(lag == 1, "the consumer committed past an exposure it failed to count: a count that fails must not be committed")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -949,7 +1044,7 @@ func CheckCountBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-std::vector<std::string> exposureUnits(harness::Ctx& ctx) {
+std::vector<std::string> hExposureUnits(harness::Ctx& ctx) {
   std::vector<std::string> units;
   for (const auto& r : ctx.Kafka.Records(kTopic)) {
     const auto e = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
@@ -977,14 +1072,37 @@ void CheckExperimentKey(harness::Ctx& ctx) {
 }
 
 void CheckSharedDedupe(harness::Ctx& ctx) {
+  const std::string claim = "exp:exp-1:seen:u-1";
+  auto ttls = std::make_shared<std::vector<long long>>();
+  auto snapshot = std::make_shared<std::function<void()>>();
+  *snapshot = [&ctx, claim, ttls, snapshot] {
+    const long long ttl = ctx.Redis.TTL(claim);
+    if (ttl == -2) {
+      ctx.Redis.After(claim, *snapshot);  // not claimed yet: wait for the next command on the key
+    } else {
+      ttls->push_back(ttl);
+    }
+  };
+  ctx.Redis.After(claim, *snapshot);
   ctx.Assert(record_exposure("exp-1", "u-1", "treatment"), "the first exposure of u-1 must be recorded");
+  ctx.Assert(!ttls->empty(), "nothing claimed %s: the dedupe must be a Redis claim every replica sees (SET NX), not a set in one process", claim);
+  ctx.Assert(ttls->front() >= 7LL * 24 * 3600 - 60 && ttls->front() <= 7LL * 24 * 3600, "right after %s was claimed its TTL was %d s (-1: none), expected 7 days: claim with SET NX and the TTL in one command", claim, ttls->front());
   ctx.Assert(!record_exposure("exp-1", "u-1", "treatment"), "a re-render of the same page must not record a second exposure");
   producer->poll(0);
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one unit, one exposure; the records");
-  const std::string claim = "exp:exp-1:seen:u-1";
-  const long long ttl = ctx.Redis.TTL(claim);
-  ctx.Assert(ttl > 0 && ttl <= 7 * 24 * 3600, "%s has TTL %d: the dedupe must be a Redis claim every replica sees (SET NX), expiring after 7 days, not a set in one process", claim, ttl);
+  // Another replica claims u-9 between this replica's first command on the claim and its next.
+  const std::string rival_claim = "exp:exp-1:seen:u-9";
+  auto rival = std::make_shared<std::optional<bool>>();
+  ctx.Redis.After(rival_claim, [&ctx, rival, rival_claim] { *rival = ctx.Redis.Set(rival_claim, "treatment", "NX", "EX", 7 * 24 * 3600); });
+  const bool got = record_exposure("exp-1", "u-9", "treatment");
+  producer->poll(0);
+  ctx.Settle();
+  ctx.Assert(rival->has_value(), "nothing touched %s: the claim must be taken there", rival_claim);
+  const bool rival_won = rival->value_or(false);
+  int published = rival_won ? 1 : 0;
+  for (const auto& u : hExposureUnits(ctx)) published += u == "u-9" ? 1 : 0;
+  ctx.Assert(published == 1 && got != rival_won, "another replica claimed u-9 (%t) while this one answered %t: u-9 was published %d times; take the claim with SET NX and produce only when it is yours", rival_won, got, published);
 }
 
 void CheckDeliveryRelease(harness::Ctx& ctx) {
@@ -1000,24 +1118,33 @@ void CheckDeliveryRelease(harness::Ctx& ctx) {
   record_exposure("exp-1", "u-1", "control");  // the page renders again
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(exposureUnits(ctx), {"u-1"}, "after a refused delivery and a second render the exposure must be on the topic (delete the claim in dr_cb); the units");
+  ctx.Equal(hExposureUnits(ctx), {"u-1"}, "after a refused delivery and a second render the exposure must be on the topic (delete the claim in dr_cb); the units");
 }
 
 void CheckCountBeforeCommit(harness::Ctx& ctx) {
   for (const auto& [unit, variant] : std::vector<std::pair<std::string, std::string>>{{"u-1", "control"}, {"u-2", "treatment"}, {"u-3", "control"}}) {
     ctx.Kafka.Seed(kTopic, "exp-1", nlohmann::json{{"experiment_id", "exp-1"}, {"unit_id", unit}, {"variant", variant}, {"ts", 0}}.dump());
   }
+  // A count that fails: exp-2's counts are not a hash.
+  ctx.Redis.Set("exp:exp-2:exposures", "corrupt");
+  ctx.Kafka.Seed(kTopic, "exp-1", nlohmann::json{{"experiment_id", "exp-2"}, {"unit_id", "u-4"}, {"variant", "control"}, {"ts", 0}}.dump());
   std::vector<long long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
     long long total = 0;
     for (const auto& [k, v] : ctx.Redis.HGetAll("exp:exp-1:exposures")) total += std::stoll(v);
     atCommit.push_back(total);
   });
-  ctx.Drain([] { consume_exposures(); });
+  try {
+    ctx.Drain([] { consume_exposures(); });
+  } catch (const std::exception&) {
+    // a consumer may stop on the count it could not make
+  }
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
   ctx.Assert(atCommit[0] >= 1, "at the first commit exp:exp-1:exposures counted %d units: count before committing, or a crash in between loses the exposure", atCommit[0]);
   ctx.Equal(store::exposures("exp-1"), std::map<std::string, long long>{{"control", 2}, {"treatment", 1}}, "exp:exp-1:exposures");
-  ctx.Equal(ctx.Kafka.Lag("exposure-stats", kTopic), 0, "every counted record must be committed; the lag");
+  const auto lag = ctx.Kafka.Lag("exposure-stats", kTopic);
+  ctx.Assert(lag <= 1, "%d counted records are not committed: every counted record must be committed", lag);
+  ctx.Assert(lag == 1, "the consumer committed past an exposure it failed to count: a count that fails must not be committed");
 }
 `,
   },

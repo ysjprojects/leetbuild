@@ -20,11 +20,12 @@ done and a customer with no email; a worker that replays the step after a restar
 email; a deadline whose request did arrive is resent on the spot.
 
 - \`effect_id(run_id, step)\` is \`"{run_id}:{step}"\`, and it goes in the request.
-- \`ledger.done(effect_id)\` first: a recorded message id is returned without calling the mailer.
+- \`ledger.done(effect_id)\` first: a recorded message id is returned without calling the mailer,
+  and the checkpoint still moves.
 - Call, then \`ledger.record(effect_id, message_id)\`, then
   \`checkpoint.advance(run_id, step, next_step, message_id, now)\`.
 - On \`DEADLINE_EXCEEDED\` ask \`GetDelivery(effect_id)\`: a delivery is the outcome; \`NOT_FOUND\`
-  raises \`EffectPending\` and the step is retried later.`,
+  raises \`EffectPending\` and the step is retried later. Each call carries its own \`DEADLINE_S\`.`,
   sequence: {
     participants: ['Worker', 'Effect ledger', 'Mailer', 'Checkpoint'],
     messages: [
@@ -55,7 +56,7 @@ email; a deadline whose request did arrive is resent on the spot.
       id: 'replay-skip',
       title: 'A replay returns the recorded outcome without calling',
       detail:
-        'Running the step a second time, as a worker does after a restart, returns the same message id and the mailer has sent one email. The starter keeps no ledger and sends again.',
+        'Running the step a second time, as a worker does after a restart, returns the same message id and the mailer has sent one email. A run whose ledger already holds a message id while its checkpoint never moved (a crash in between) returns that id without a call and moves the checkpoint. The starter keeps no ledger and sends again.',
       match: {
         python: {all: [/ledger\.done\(/]},
         typescript: {all: [/ledger\.done\(/]},
@@ -68,7 +69,7 @@ email; a deadline whose request did arrive is resent on the spot.
       id: 'effect-before-advance',
       title: 'The checkpoint moves only after the effect ran',
       detail:
-        'With the mailer down (UNAVAILABLE), the step fails and the checkpoint is still at `send_welcome`. The starter advances first, so the run moves past an email that was never sent.',
+        'With the mailer down (UNAVAILABLE), the step fails, the checkpoint is still at `send_welcome` and the ledger records nothing. The starter advances first, so the run moves past an email that was never sent.',
       match: {
         python: {order: [/mailer\.SendWelcome\(/, /checkpoint\.advance\(/]},
         typescript: {order: [/mailer\.SendWelcome\(/, /checkpoint\.advance\(/]},
@@ -94,7 +95,7 @@ email; a deadline whose request did arrive is resent on the spot.
       id: 'timeout-reconcile',
       title: 'A deadline is reconciled, never resent on the spot',
       detail:
-        'When the mailer sends the email and the reply is lost (DEADLINE_EXCEEDED), the step returns that message id with one email sent; when the request never arrived, the step fails with one call made and the checkpoint unmoved. Every call carries a 2 s deadline. The starter sends again.',
+        'When the mailer sends the email and the reply is lost (DEADLINE_EXCEEDED), the step returns that message id with one email sent; when the mailer is too slow for the deadline and nothing was delivered, the step fails with `EffectPending` after one call and the checkpoint unmoved. Every `SendWelcome` and `GetDelivery` call carries its own 2 s deadline. The starter sends again.',
       match: {
         python: {order: [/DEADLINE_EXCEEDED/, /mailer\.GetDelivery\(/]},
         typescript: {order: [/DEADLINE_EXCEEDED/, /mailer\.GetDelivery\(/]},
@@ -663,6 +664,13 @@ def check_replay_skip(ctx):
     replay = _step(ctx, m)  # a worker that restarted runs the step again
     assert len(mailer.sent) == 1, f"running send_welcome twice for r1 sent {len(mailer.sent)} emails: a replay must return the recorded outcome without calling"
     assert replay == first, f"the replay returned {replay!r}, the first attempt {first!r}: a replay returns the recorded message id"
+    # A worker that crashed after the record and before the advance: the replay finishes the step without a call.
+    _at_send_welcome(ctx, "r3")
+    ctx.redis.set("effect:r3:send_welcome", "m-0")
+    replay = _step(ctx, m, "r3")
+    assert replay == "m-0" and len(mailer.sent) == 1, f"replaying r3, whose effect the ledger already records as 'm-0', returned {replay!r} and the mailer has sent {len(mailer.sent)} emails in all, expected 'm-0' and still 1"
+    step = ctx.redis.hget("run:r3:checkpoint", "current_step")
+    assert step == "notify_sales", f"after the replay of r3 found its recorded effect the checkpoint is at {step!r}, expected notify_sales: a worker that crashed between the record and the advance leaves the run stuck"
 
 
 def check_effect_before_advance(ctx):
@@ -672,6 +680,8 @@ def check_effect_before_advance(ctx):
     assert _fails(lambda: _step(ctx, m)), "run_step returned normally while the mailer was down"
     step = ctx.redis.hget("run:r1:checkpoint", "current_step")
     assert step == "send_welcome", f"the mailer was down and no email went out, yet the checkpoint moved to {step!r}: the run will never send it"
+    recorded = ctx.redis.get("effect:r1:send_welcome")
+    assert recorded is None, f"the mailer was down and the ledger recorded {recorded!r} for r1:send_welcome: the retry will skip an email that was never sent"
 
 
 def check_record_before_advance(ctx):
@@ -691,17 +701,28 @@ def check_timeout_reconcile(ctx):
     assert len(mailer.sent) == 1, f"SendWelcome timed out after the email went out and the step sent {len(mailer.sent)} emails: ask GetDelivery by effect id instead of sending again"
     assert message_id == mailer.sent[0][1], f"run_step returned {message_id!r}, expected the delivered message {mailer.sent[0][1]!r}"
     assert ctx.redis.get("effect:r1:send_welcome") == message_id, "the reconciled outcome must be recorded in the ledger"
-    for call in ctx.grpc.calls_to("SendWelcome"):
-        assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"a SendWelcome call carries a {call.timeout} s deadline, expected DEADLINE_S = 2"
-    # A deadline whose request never arrived: nothing to find, and the request may still be in flight.
+    # A deadline whose request never arrived: the mailer is too slow for the 2 s deadline, so the first
+    # attempt fails late, nothing is found, and the request may still be in flight.
     _at_send_welcome(ctx, "r2")
     before = len(ctx.grpc.calls_to("SendWelcome"))
-    ctx.grpc.fail("SendWelcome", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline exceeded")
-    assert _fails(lambda: _step(ctx, m, "r2")), "run_step returned normally after a deadline with no delivery found: it must fail (EffectPending) so the step is retried later"
+    ctx.grpc.set_latency("SendWelcome", 5)
+    raised = None
+    try:
+        _step(ctx, m, "r2")
+    except Exception as exc:
+        raised = exc
+    assert raised is not None, "run_step returned normally after a deadline with no delivery found: it must fail (EffectPending) so the step is retried later"
+    assert isinstance(raised, m.EffectPending), f"after a deadline with no delivery found run_step raised {type(raised).__name__}, expected EffectPending, which tells the caller to retry the step later"
     sends = len(ctx.grpc.calls_to("SendWelcome")) - before
     assert sends == 1, f"after a deadline with no delivery found the step called SendWelcome {sends} times, expected 1: a resend on the spot doubles the email when the first request is still in flight"
     step = ctx.redis.hget("run:r2:checkpoint", "current_step")
     assert step == "send_welcome", f"r2's checkpoint moved to {step!r} although its email is unaccounted for"
+    for call in ctx.grpc.calls_to("SendWelcome"):
+        assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"a SendWelcome call carries a {call.timeout} s deadline, expected DEADLINE_S = 2"
+    lookups = ctx.grpc.calls_to("GetDelivery")
+    assert len(lookups) >= 2, f"the step called GetDelivery {len(lookups)} times over two deadlines: each deadline is reconciled by effect id"
+    for call in lookups:
+        assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"a GetDelivery call carries a {call.timeout} s deadline, expected DEADLINE_S = 2: each call has its own, not what is left of the send's"
 `,
     typescript: `function client(ctx) {
   const pkg = ctx.proto('workflow_engine.proto');
@@ -758,6 +779,16 @@ export async function check_replay_skip(ctx) {
   const replay = await step(m); // a worker that restarted runs the step again
   assert.equal(mailer.sent.length, 1, \`running send_welcome twice for r1 sent \${mailer.sent.length} emails: a replay must return the recorded outcome without calling\`);
   assert.equal(replay, first, 'a replay returns the recorded message id');
+  // A worker that crashed after the record and before the advance: the replay finishes the step without a call.
+  atSendWelcome(ctx, 'r3');
+  ctx.redis.set('effect:r3:send_welcome', 'm-0');
+  const resumed = await step(m, 'r3');
+  assert(
+    resumed === 'm-0' && mailer.sent.length === 1,
+    \`replaying r3, whose effect the ledger already records as 'm-0', resolved \${JSON.stringify(resumed)} and the mailer has sent \${mailer.sent.length} emails in all, expected 'm-0' and still 1\`,
+  );
+  const current = ctx.redis.hget('run:r3:checkpoint', 'current_step');
+  assert.equal(current, 'notify_sales', \`after the replay of r3 found its recorded effect the checkpoint is at \${JSON.stringify(current)}, expected notify_sales: a worker that crashed between the record and the advance leaves the run stuck\`);
 }
 
 export async function check_effect_before_advance(ctx) {
@@ -767,6 +798,8 @@ export async function check_effect_before_advance(ctx) {
   assert(await fails(step(m)), 'runStep resolved while the mailer was down');
   const current = ctx.redis.hget('run:r1:checkpoint', 'current_step');
   assert.equal(current, 'send_welcome', \`the mailer was down and no email went out, yet the checkpoint moved to \${JSON.stringify(current)}: the run will never send it\`);
+  const recorded = ctx.redis.get('effect:r1:send_welcome');
+  assert.equal(recorded, null, \`the mailer was down and the ledger recorded \${JSON.stringify(recorded)} for r1:send_welcome: the retry will skip an email that was never sent\`);
 }
 
 export async function check_record_before_advance(ctx) {
@@ -786,17 +819,33 @@ export async function check_timeout_reconcile(ctx) {
   assert.equal(mailer.sent.length, 1, \`SendWelcome timed out after the email went out and the step sent \${mailer.sent.length} emails: ask GetDelivery by effect id instead of sending again\`);
   assert.equal(messageId, mailer.sent[0].message_id, 'runStep must resolve the delivered message id');
   assert.equal(ctx.redis.get('effect:r1:send_welcome'), messageId, 'the reconciled outcome must be recorded in the ledger');
-  for (const call of ctx.grpc.callsTo('SendWelcome')) {
-    assert(call.timeout !== null && 1.5 <= call.timeout && call.timeout <= 2.5, \`a SendWelcome call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 2000\`);
-  }
-  // A deadline whose request never arrived: nothing to find, and the request may still be in flight.
+  // A deadline whose request never arrived: the mailer is too slow for the 2 s deadline, so the first
+  // attempt fails late, nothing is found, and the request may still be in flight.
   atSendWelcome(ctx, 'r2');
   const before = ctx.grpc.callsTo('SendWelcome').length;
-  ctx.grpc.fail('SendWelcome', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline exceeded');
-  assert(await fails(step(m, 'r2')), 'runStep resolved after a deadline with no delivery found: it must reject (EffectPending) so the step is retried later');
+  ctx.grpc.setLatency('SendWelcome', 5);
+  let raised: unknown = undefined;
+  try {
+    await step(m, 'r2');
+  } catch (err) {
+    raised = err ?? new Error(String(err));
+  }
+  assert(raised !== undefined, 'runStep resolved after a deadline with no delivery found: it must reject (EffectPending) so the step is retried later');
+  assert(raised instanceof m.EffectPending, \`after a deadline with no delivery found runStep rejected with \${(raised as Error)?.constructor?.name}, expected EffectPending, which tells the caller to retry the step later\`);
   const sends = ctx.grpc.callsTo('SendWelcome').length - before;
   assert.equal(sends, 1, \`after a deadline with no delivery found the step called SendWelcome \${sends} times: a resend on the spot doubles the email when the first request is still in flight\`);
   assert.equal(ctx.redis.hget('run:r2:checkpoint', 'current_step'), 'send_welcome', "r2's checkpoint moved although its email is unaccounted for");
+  for (const call of ctx.grpc.callsTo('SendWelcome')) {
+    assert(call.timeout !== null && 1.5 <= call.timeout && call.timeout <= 2.5, \`a SendWelcome call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 2000\`);
+  }
+  const lookups = ctx.grpc.callsTo('GetDelivery');
+  assert(lookups.length >= 2, \`the step called GetDelivery \${lookups.length} times over two deadlines: each deadline is reconciled by effect id\`);
+  for (const call of lookups) {
+    assert(
+      call.timeout !== null && 1.5 <= call.timeout && call.timeout <= 2.5,
+      \`a GetDelivery call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 2000: each call has its own, not what is left of the send's\`,
+    );
+  }
 }
 `,
     go: `package main
@@ -814,24 +863,24 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hDependencyBg = context.Background()
 
-type sentMail struct {
+type hSentMail struct {
 	effectID  string
 	messageID string
 }
 
-// mailerPeer sends whatever it is asked to (no deduplication); loseReplies sends, then answers
+// hMailerPeer sends whatever it is asked to (no deduplication); loseReplies sends, then answers
 // DEADLINE_EXCEEDED.
-type mailerPeer struct {
+type hMailerPeer struct {
 	pb.UnimplementedMailerServer
-	sent        []sentMail
+	sent        []hSentMail
 	loseReplies int
 }
 
-func (m *mailerPeer) SendWelcome(_ context.Context, req *pb.WelcomeRequest) (*pb.Delivery, error) {
+func (m *hMailerPeer) SendWelcome(_ context.Context, req *pb.WelcomeRequest) (*pb.Delivery, error) {
 	id := fmt.Sprintf("m-%d", len(m.sent)+1)
-	m.sent = append(m.sent, sentMail{req.GetEffectId(), id})
+	m.sent = append(m.sent, hSentMail{req.GetEffectId(), id})
 	if m.loseReplies > 0 {
 		m.loseReplies--
 		return nil, status.Error(codes.DeadlineExceeded, "the email went out, the reply was lost")
@@ -839,7 +888,7 @@ func (m *mailerPeer) SendWelcome(_ context.Context, req *pb.WelcomeRequest) (*pb
 	return &pb.Delivery{MessageId: id, EffectId: req.GetEffectId()}, nil
 }
 
-func (m *mailerPeer) GetDelivery(_ context.Context, req *pb.DeliveryLookup) (*pb.Delivery, error) {
+func (m *hMailerPeer) GetDelivery(_ context.Context, req *pb.DeliveryLookup) (*pb.Delivery, error) {
 	for i := len(m.sent) - 1; i >= 0; i-- {
 		if m.sent[i].effectID == req.GetEffectId() {
 			return &pb.Delivery{MessageId: m.sent[i].messageID, EffectId: m.sent[i].effectID}, nil
@@ -848,32 +897,32 @@ func (m *mailerPeer) GetDelivery(_ context.Context, req *pb.DeliveryLookup) (*pb
 	return nil, status.Errorf(codes.NotFound, "no message for %s", req.GetEffectId())
 }
 
-func client(ctx *harness.Ctx) *mailerPeer {
-	mailer := &mailerPeer{}
+func hServeMailer(ctx *harness.Ctx) *hMailerPeer {
+	mailer := &hMailerPeer{}
 	pb.RegisterMailerServer(ctx.GRPC.Server(""), mailer)
 	return mailer
 }
 
-func atSendWelcome(ctx *harness.Ctx, runID string) {
+func hAtSendWelcome(ctx *harness.Ctx, runID string) {
 	ctx.Redis.Do("HSET", "run:"+runID+":checkpoint", "current_step", "send_welcome", "completed", "create_account", "output_ref", "", "updated_at", "1000")
 }
 
-func currentStep(ctx *harness.Ctx, runID string) string {
+func hCurrentStep(ctx *harness.Ctx, runID string) string {
 	step, _ := ctx.Redis.HGet("run:"+runID+":checkpoint", "current_step")
 	return step
 }
 
-func mustStep(ctx *harness.Ctx, runID string) string {
-	messageID, err := runStep(clientBg, runID, "send_welcome", "notify_sales", "u-1")
+func hMustStep(ctx *harness.Ctx, runID string) string {
+	messageID, err := runStep(hDependencyBg, runID, "send_welcome", "notify_sales", "u-1")
 	ctx.NoError(err, "runStep(%s, send_welcome) failed", runID)
 	return messageID
 }
 
 func CheckEffectId(ctx *harness.Ctx) {
-	client(ctx)
+	hServeMailer(ctx)
 	for _, runID := range []string{"r1", "r2"} {
-		atSendWelcome(ctx, runID)
-		mustStep(ctx, runID)
+		hAtSendWelcome(ctx, runID)
+		hMustStep(ctx, runID)
 	}
 	var ids []string
 	for _, c := range ctx.GRPC.CallsTo("SendWelcome", "") {
@@ -883,55 +932,70 @@ func CheckEffectId(ctx *harness.Ctx) {
 }
 
 func CheckReplaySkip(ctx *harness.Ctx) {
-	mailer := client(ctx)
-	atSendWelcome(ctx, "r1")
-	first := mustStep(ctx, "r1")
-	replay := mustStep(ctx, "r1") // a worker that restarted runs the step again
+	mailer := hServeMailer(ctx)
+	hAtSendWelcome(ctx, "r1")
+	first := hMustStep(ctx, "r1")
+	replay := hMustStep(ctx, "r1") // a worker that restarted runs the step again
 	ctx.Equal(len(mailer.sent), 1, "running send_welcome twice for r1 must send one email (a replay returns the recorded outcome without calling); the emails")
 	ctx.Equal(replay, first, "a replay returns the recorded message id; the replay")
+	// A worker that crashed after the record and before the advance: the replay finishes the step without a call.
+	hAtSendWelcome(ctx, "r3")
+	ctx.Redis.Do("SET", "effect:r3:send_welcome", "m-0")
+	resumed := hMustStep(ctx, "r3")
+	ctx.Equal(resumed, "m-0", "replaying r3, whose effect the ledger already records as m-0; the message id")
+	ctx.Equal(len(mailer.sent), 1, "replaying r3, whose effect the ledger already records, must not call the mailer; the emails in all")
+	ctx.Equal(hCurrentStep(ctx, "r3"), "notify_sales", "after the replay of r3 found its recorded effect (a worker that crashed between the record and the advance leaves the run stuck otherwise), current_step")
 }
 
 func CheckEffectBeforeAdvance(ctx *harness.Ctx) {
-	client(ctx)
-	atSendWelcome(ctx, "r1")
+	hServeMailer(ctx)
+	hAtSendWelcome(ctx, "r1")
 	ctx.GRPC.Fail("SendWelcome", codes.Unavailable, "mailer is down", 1, "")
-	_, err := runStep(clientBg, "r1", "send_welcome", "notify_sales", "u-1")
+	_, err := runStep(hDependencyBg, "r1", "send_welcome", "notify_sales", "u-1")
 	ctx.Assert(err != nil, "runStep returned no error while the mailer was down")
-	ctx.Equal(currentStep(ctx, "r1"), "send_welcome", "the mailer was down and no email went out, so the checkpoint must not move (the run would never send it); current_step")
+	ctx.Equal(hCurrentStep(ctx, "r1"), "send_welcome", "the mailer was down and no email went out, so the checkpoint must not move (the run would never send it); current_step")
+	recorded, found := ctx.Redis.Get("effect:r1:send_welcome")
+	ctx.Assert(!found, "the mailer was down and the ledger recorded %q for r1:send_welcome: the retry will skip an email that was never sent", recorded)
 }
 
 func CheckRecordBeforeAdvance(ctx *harness.Ctx) {
-	client(ctx)
-	atSendWelcome(ctx, "r1")
+	hServeMailer(ctx)
+	hAtSendWelcome(ctx, "r1")
 	seen := ctx.Redis.After("run:r1:checkpoint", func() any {
 		recorded, _ := ctx.Redis.Get("effect:r1:send_welcome")
 		return recorded
 	})
-	messageID := mustStep(ctx, "r1")
+	messageID := hMustStep(ctx, "r1")
 	ctx.Assert(seen.Fired, "runStep never advanced run:r1:checkpoint")
 	ctx.Equal(seen.Result, messageID, "when the checkpoint moved, the ledger must already hold the message id for r1:send_welcome (a crash right there leaves a step marked done whose email no replay can find); the record")
 }
 
 func CheckTimeoutReconcile(ctx *harness.Ctx) {
-	mailer := client(ctx)
-	atSendWelcome(ctx, "r1")
+	mailer := hServeMailer(ctx)
+	hAtSendWelcome(ctx, "r1")
 	mailer.loseReplies = 1 // the email goes out, the reply is lost
-	messageID := mustStep(ctx, "r1")
+	messageID := hMustStep(ctx, "r1")
 	ctx.Equal(len(mailer.sent), 1, "SendWelcome timed out after the email went out: ask GetDelivery by effect id instead of sending again; the emails")
 	ctx.Equal(messageID, mailer.sent[0].messageID, "runStep must return the delivered message id")
 	recorded, _ := ctx.Redis.Get("effect:r1:send_welcome")
 	ctx.Equal(recorded, messageID, "the reconciled outcome must be recorded in the ledger")
+	// A deadline whose request never arrived: the mailer is too slow for the 2 s deadline, so the first
+	// attempt fails late, nothing is found, and the request may still be in flight.
+	hAtSendWelcome(ctx, "r2")
+	before := len(ctx.GRPC.CallsTo("SendWelcome", ""))
+	ctx.GRPC.SetLatency("SendWelcome", 5, "")
+	_, err := runStep(hDependencyBg, "r2", "send_welcome", "notify_sales", "u-1")
+	ctx.Assert(err != nil, "runStep returned no error after a deadline with no delivery found: it must fail (ErrEffectPending) so the step is retried later")
+	ctx.Equal(len(ctx.GRPC.CallsTo("SendWelcome", ""))-before, 1, "after a deadline with no delivery found, a resend on the spot doubles the email when the first request is still in flight; the SendWelcome calls")
+	ctx.Equal(hCurrentStep(ctx, "r2"), "send_welcome", "r2's email is unaccounted for, so its checkpoint must not move; current_step")
 	for _, call := range ctx.GRPC.CallsTo("SendWelcome", "") {
 		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a SendWelcome call carries a %v deadline, expected 2 s", call.Timeout)
 	}
-	// A deadline whose request never arrived: nothing to find, and the request may still be in flight.
-	atSendWelcome(ctx, "r2")
-	before := len(ctx.GRPC.CallsTo("SendWelcome", ""))
-	ctx.GRPC.Fail("SendWelcome", codes.DeadlineExceeded, "deadline exceeded", 1, "")
-	_, err := runStep(clientBg, "r2", "send_welcome", "notify_sales", "u-1")
-	ctx.Assert(err != nil, "runStep returned no error after a deadline with no delivery found: it must fail (ErrEffectPending) so the step is retried later")
-	ctx.Equal(len(ctx.GRPC.CallsTo("SendWelcome", ""))-before, 1, "after a deadline with no delivery found, a resend on the spot doubles the email when the first request is still in flight; the SendWelcome calls")
-	ctx.Equal(currentStep(ctx, "r2"), "send_welcome", "r2's email is unaccounted for, so its checkpoint must not move; current_step")
+	lookups := ctx.GRPC.CallsTo("GetDelivery", "")
+	ctx.Assert(len(lookups) >= 2, "the step called GetDelivery %d times over two deadlines: each deadline is reconciled by effect id", len(lookups))
+	for _, call := range lookups {
+		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a GetDelivery call carries a %v deadline, expected 2 s: each call has its own, not what is left of the send's", call.Timeout)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -946,7 +1010,7 @@ func CheckTimeoutReconcile(ctx *harness.Ctx) {
 namespace {
 
 // Sends whatever it is asked to (no deduplication); lose_replies sends, then answers DEADLINE_EXCEEDED.
-class MailerPeer final : public workflowd::Mailer::Service {
+class HMailerPeer final : public workflowd::Mailer::Service {
  public:
   std::vector<std::pair<std::string, std::string>> sent;  // (effect_id, message_id), oldest first
   int lose_replies = 0;
@@ -975,21 +1039,21 @@ class MailerPeer final : public workflowd::Mailer::Service {
   }
 };
 
-MailerPeer& client(harness::Ctx& ctx) {
-  static MailerPeer* peer = nullptr;
+HMailerPeer& hServeMailer(harness::Ctx& ctx) {
+  static HMailerPeer* peer = nullptr;
   delete peer;
-  peer = new MailerPeer;
+  peer = new HMailerPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-void atSendWelcome(harness::Ctx& ctx, const std::string& run_id) {
+void hAtSendWelcome(harness::Ctx& ctx, const std::string& run_id) {
   ctx.Redis.Do("HSET", "run:" + run_id + ":checkpoint", "current_step", "send_welcome", "completed", "create_account", "output_ref", "", "updated_at", "1000");
 }
 
-std::string currentStep(harness::Ctx& ctx, const std::string& run_id) { return ctx.Redis.HGet("run:" + run_id + ":checkpoint", "current_step").value_or(""); }
+std::string hCurrentStep(harness::Ctx& ctx, const std::string& run_id) { return ctx.Redis.HGet("run:" + run_id + ":checkpoint", "current_step").value_or(""); }
 
-std::string mustStep(harness::Ctx& ctx, const std::string& run_id) {
+std::string hMustStep(harness::Ctx& ctx, const std::string& run_id) {
   try {
     return runStep(run_id, "send_welcome", "notify_sales", "u-1");
   } catch (const std::exception& e) {
@@ -998,22 +1062,25 @@ std::string mustStep(harness::Ctx& ctx, const std::string& run_id) {
   return "";
 }
 
-bool fails(const std::string& run_id) {
+// How runStep ended: "returned", "pending" (EffectPending) or the type of anything else it threw.
+std::string hStepOutcome(const std::string& run_id) {
   try {
     runStep(run_id, "send_welcome", "notify_sales", "u-1");
+  } catch (const EffectPending&) {
+    return "pending";
   } catch (const std::exception&) {
-    return true;
+    return harness::CurrentExceptionType();
   }
-  return false;
+  return "returned";
 }
 
 }  // namespace
 
 void CheckEffectId(harness::Ctx& ctx) {
-  client(ctx);
+  hServeMailer(ctx);
   for (const std::string run_id : {"r1", "r2"}) {
-    atSendWelcome(ctx, run_id);
-    mustStep(ctx, run_id);
+    hAtSendWelcome(ctx, run_id);
+    hMustStep(ctx, run_id);
   }
   std::vector<std::string> ids;
   for (const auto& c : ctx.GRPC.CallsTo("SendWelcome")) ids.push_back(c.Request<workflowd::WelcomeRequest>().effect_id());
@@ -1021,54 +1088,71 @@ void CheckEffectId(harness::Ctx& ctx) {
 }
 
 void CheckReplaySkip(harness::Ctx& ctx) {
-  MailerPeer& mailer = client(ctx);
-  atSendWelcome(ctx, "r1");
-  const std::string first = mustStep(ctx, "r1");
-  const std::string replay = mustStep(ctx, "r1");  // a worker that restarted runs the step again
+  HMailerPeer& mailer = hServeMailer(ctx);
+  hAtSendWelcome(ctx, "r1");
+  const std::string first = hMustStep(ctx, "r1");
+  const std::string replay = hMustStep(ctx, "r1");  // a worker that restarted runs the step again
   ctx.Equal(mailer.sent.size(), 1, "running send_welcome twice for r1 must send one email (a replay returns the recorded outcome without calling); the emails");
   ctx.Equal(replay, first, "a replay returns the recorded message id; the replay");
+  // A worker that crashed after the record and before the advance: the replay finishes the step without a call.
+  hAtSendWelcome(ctx, "r3");
+  ctx.Redis.Do("SET", "effect:r3:send_welcome", "m-0");
+  const std::string resumed = hMustStep(ctx, "r3");
+  ctx.Equal(resumed, "m-0", "replaying r3, whose effect the ledger already records as m-0; the message id");
+  ctx.Equal(mailer.sent.size(), 1, "replaying r3, whose effect the ledger already records, must not call the mailer; the emails in all");
+  ctx.Equal(hCurrentStep(ctx, "r3"), "notify_sales", "after the replay of r3 found its recorded effect (a worker that crashed between the record and the advance leaves the run stuck otherwise), current_step");
 }
 
 void CheckEffectBeforeAdvance(harness::Ctx& ctx) {
-  client(ctx);
-  atSendWelcome(ctx, "r1");
+  hServeMailer(ctx);
+  hAtSendWelcome(ctx, "r1");
   ctx.GRPC.Fail("SendWelcome", grpc::StatusCode::UNAVAILABLE, "mailer is down");
-  ctx.Assert(fails("r1"), "runStep returned normally while the mailer was down");
-  ctx.Equal(currentStep(ctx, "r1"), "send_welcome", "the mailer was down and no email went out, so the checkpoint must not move (the run would never send it); current_step");
+  ctx.Assert(hStepOutcome("r1") != "returned", "runStep returned normally while the mailer was down");
+  ctx.Equal(hCurrentStep(ctx, "r1"), "send_welcome", "the mailer was down and no email went out, so the checkpoint must not move (the run would never send it); current_step");
+  const auto recorded = ctx.Redis.Get("effect:r1:send_welcome");
+  ctx.Assert(!recorded, "the mailer was down and the ledger recorded %q for r1:send_welcome: the retry will skip an email that was never sent", recorded.value_or(""));
 }
 
 void CheckRecordBeforeAdvance(harness::Ctx& ctx) {
-  client(ctx);
-  atSendWelcome(ctx, "r1");
+  hServeMailer(ctx);
+  hAtSendWelcome(ctx, "r1");
   bool fired = false;
   std::optional<std::string> recorded;
   ctx.Redis.After("run:r1:checkpoint", [&] {
     fired = true;
     recorded = ctx.Redis.Get("effect:r1:send_welcome");
   });
-  const std::string message_id = mustStep(ctx, "r1");
+  const std::string message_id = hMustStep(ctx, "r1");
   ctx.Assert(fired, "runStep never advanced run:r1:checkpoint");
   ctx.Equal(recorded.value_or(""), message_id, "when the checkpoint moved, the ledger must already hold the message id for r1:send_welcome (a crash right there leaves a step marked done whose email no replay can find); the record");
 }
 
 void CheckTimeoutReconcile(harness::Ctx& ctx) {
-  MailerPeer& mailer = client(ctx);
-  atSendWelcome(ctx, "r1");
+  HMailerPeer& mailer = hServeMailer(ctx);
+  hAtSendWelcome(ctx, "r1");
   mailer.lose_replies = 1;  // the email goes out, the reply is lost
-  const std::string message_id = mustStep(ctx, "r1");
+  const std::string message_id = hMustStep(ctx, "r1");
   ctx.Equal(mailer.sent.size(), 1, "SendWelcome timed out after the email went out: ask GetDelivery by effect id instead of sending again; the emails");
   ctx.Equal(message_id, mailer.sent[0].second, "runStep must return the delivered message id");
   ctx.Equal(ctx.Redis.Get("effect:r1:send_welcome").value_or(""), message_id, "the reconciled outcome must be recorded in the ledger");
+  // A deadline whose request never arrived: the mailer is too slow for the 2 s deadline, so the first
+  // attempt fails late, nothing is found, and the request may still be in flight.
+  hAtSendWelcome(ctx, "r2");
+  const size_t before = ctx.GRPC.CallsTo("SendWelcome").size();
+  ctx.GRPC.SetLatency("SendWelcome", 5);
+  const std::string outcome = hStepOutcome("r2");
+  ctx.Assert(outcome != "returned", "runStep returned normally after a deadline with no delivery found: it must throw (EffectPending) so the step is retried later");
+  ctx.Equal(outcome, "pending", "after a deadline with no delivery found runStep must throw EffectPending, which tells the caller to retry the step later; what it threw");
+  ctx.Equal(ctx.GRPC.CallsTo("SendWelcome").size() - before, 1, "after a deadline with no delivery found, a resend on the spot doubles the email when the first request is still in flight; the SendWelcome calls");
+  ctx.Equal(hCurrentStep(ctx, "r2"), "send_welcome", "r2's email is unaccounted for, so its checkpoint must not move; current_step");
   for (const auto& call : ctx.GRPC.CallsTo("SendWelcome")) {
     ctx.Assert(call.HasDeadline() && 1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a SendWelcome call carries a %v s deadline, expected kDeadline = 2 s", call.TimeoutSeconds());
   }
-  // A deadline whose request never arrived: nothing to find, and the request may still be in flight.
-  atSendWelcome(ctx, "r2");
-  const size_t before = ctx.GRPC.CallsTo("SendWelcome").size();
-  ctx.GRPC.Fail("SendWelcome", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded");
-  ctx.Assert(fails("r2"), "runStep returned normally after a deadline with no delivery found: it must throw (EffectPending) so the step is retried later");
-  ctx.Equal(ctx.GRPC.CallsTo("SendWelcome").size() - before, 1, "after a deadline with no delivery found, a resend on the spot doubles the email when the first request is still in flight; the SendWelcome calls");
-  ctx.Equal(currentStep(ctx, "r2"), "send_welcome", "r2's email is unaccounted for, so its checkpoint must not move; current_step");
+  const auto lookups = ctx.GRPC.CallsTo("GetDelivery");
+  ctx.Assert(lookups.size() >= 2, "the step called GetDelivery %d times over two deadlines: each deadline is reconciled by effect id", lookups.size());
+  for (const auto& call : lookups) {
+    ctx.Assert(call.HasDeadline() && 1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a GetDelivery call carries a %v s deadline, expected kDeadline = 2 s: each call has its own, not what is left of the send's", call.TimeoutSeconds());
+  }
 }
 `,
   },

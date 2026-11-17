@@ -80,7 +80,7 @@ its create forks the flag into a second version.
       id: 'default',
       title: 'A create without a default is 422',
       detail:
-        'An absent `default` is a 422 naming it, not a `false` nobody chose: the starter gives the field a `false` fallback (`= False`, `?? false`, a plain `bool`, `value("default", false)`, `getOrElse(false)`).',
+        'An absent or null `default` is a 422 naming it, not a `false` nobody chose: the starter gives the field a `false` fallback (`= False`, `?? false`, a plain `bool`, `value("default", false)`, `getOrElse(false)`).',
       match: {
         python: {all: [/body\.default is None|["']default["'] not in/], none: [/default:\s*bool\s*=\s*False/]},
         typescript: {
@@ -99,7 +99,7 @@ its create forks the flag into a second version.
       id: 'idempotency',
       title: 'Keys a create by (key, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is read (a missing one is 400) and the recorded answer is looked up (`create_result`/`createResult`) before the save; a replay answers it, and a fresh create records its result.',
+        '`Idempotency-Key` is read (a missing one is 400 and saves nothing) and the recorded answer for (flag key, Idempotency-Key) is looked up (`create_result`/`createResult`) before the save; a replay answers it, the same `Idempotency-Key` on another flag creates that flag, and a fresh create records its result.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.create_result\(/, /store\.record_create\(/, /\b400\b/],
@@ -600,6 +600,9 @@ async def check_registry(ctx):
         assert store.load("plan-gate") is None, f"a flag with a refused rule was stored: {store.load('plan-gate')}"
         r = await _create(c, {**BODY, "key": "country-gt", "rules": [{"attribute": "country", "operator": "gt", "value": "US"}]}, "k-2")
         assert r.status_code == 422, f"gt on the string attribute country answered {r.status_code}, expected 422: the registry has no gt for strings"
+        r = await _create(c, {**BODY, "key": "two-rules", "rules": [*RULES, {"attribute": "plan_tier", "operator": "eq", "value": "gold"}]}, "k-4")
+        assert r.status_code == 422 and "plan_tier" in r.text, f"a flag whose second rule targets plan_tier answered {r.status_code} {r.text}: every rule must pass the registry, expected a 422 naming plan_tier"
+        assert store.load("two-rules") is None, f"a flag with a refused second rule was stored: {store.load('two-rules')}"
         r = await _create(c, {**BODY, "key": "new-app", "rules": [{"attribute": "app_version", "operator": "gt", "value": 5}]}, "k-3")
     assert r.status_code == 201, f"gt on the number attribute app_version is registered, yet the create answered {r.status_code}: {r.text}"
 
@@ -610,6 +613,9 @@ async def check_default(ctx):
         assert r.status_code == 422, f"a create with no default answered {r.status_code}: the flag would serve false to everyone without anyone choosing it. Expected 422"
         assert "default" in r.text, f"the 422 must name default, got {r.text}"
         assert store.load("checkout") is None, f"a flag with no default was stored: {store.load('checkout')}"
+        r = await _create(c, {**BODY, "default": None}, "k-3")
+        assert r.status_code == 422 and "default" in r.text, f"a create with default null answered {r.status_code} {r.text}: null is no default either, expected a 422 naming default"
+        assert store.load("checkout") is None, f"a flag with a null default was stored: {store.load('checkout')}"
         r = await _create(c, {**BODY, "default": True}, "k-2")
     assert r.status_code == 201, f"a create with default true answered {r.status_code}: {r.text}"
     assert store.load("checkout")["default"] is True, f"the store holds {store.load('checkout')}, expected default true"
@@ -625,8 +631,12 @@ async def check_idempotency(ctx):
         assert stored["version"] == 1, f"the replay saved version {stored['version']}: a client retry forked the flag"
         fresh = await _create(c, {**BODY, "rollout": 50}, "k-2")
         assert fresh.status_code == 201 and fresh.json().get("version") == 2, f"a create with a new Idempotency-Key must save version 2, got {fresh.status_code} {fresh.text}"
+        other = await _create(c, {**BODY, "key": "pricing"}, "k-1")
+        assert other.status_code == 201 and other.json() == {"key": "pricing", "version": 1}, f"Idempotency-Key k-1 on another flag, pricing, answered {other.status_code} {other.text}: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1"
+        assert store.load("pricing") is not None, "the create of pricing with k-1 stored nothing"
         missing = await c.post("/v1/flags", json=BODY)
-    assert missing.status_code == 400, f"a create without Idempotency-Key answered {missing.status_code}, expected 400"
+        assert missing.status_code == 400, f"a create without Idempotency-Key answered {missing.status_code}, expected 400"
+    assert store.load("checkout")["version"] == 2, f"the create without Idempotency-Key saved version {store.load('checkout')['version']}: refuse it before the save"
 `,
     typescript: `const RULES = [{attribute: 'country', operator: 'eq', value: 'US'}];
 const BODY = {key: 'checkout', default: false, rules: RULES, rollout: 25};
@@ -655,6 +665,9 @@ export async function check_registry(ctx) {
   assert.equal(await store.load('plan-gate'), null, 'a flag with a refused rule was stored');
   r = await create(c, {...BODY, key: 'country-gt', rules: [{attribute: 'country', operator: 'gt', value: 'US'}]}, 'k-2');
   assert.equal(r.status, 422, \`gt on the string attribute country answered \${r.status}, expected 422: the registry has no gt for strings\`);
+  r = await create(c, {...BODY, key: 'two-rules', rules: [...RULES, {attribute: 'plan_tier', operator: 'eq', value: 'gold'}]}, 'k-4');
+  assert(r.status === 422 && r.text.includes('plan_tier'), \`a flag whose second rule targets plan_tier answered \${r.status} \${r.text}: every rule must pass the registry, expected a 422 naming plan_tier\`);
+  assert.equal(await store.load('two-rules'), null, 'a flag with a refused second rule was stored');
   r = await create(c, {...BODY, key: 'new-app', rules: [{attribute: 'app_version', operator: 'gt', value: 5}]}, 'k-3');
   assert.equal(r.status, 201, \`gt on the number attribute app_version is registered, yet the create answered \${r.status}: \${r.text}\`);
 }
@@ -666,6 +679,9 @@ export async function check_default(ctx) {
   assert.equal(r.status, 422, \`a create with no default answered \${r.status}: the flag would serve false to everyone without anyone choosing it. Expected 422\`);
   assert(r.text.includes('default'), \`the 422 must name default, got \${r.text}\`);
   assert.equal(await store.load('checkout'), null, 'a flag with no default was stored');
+  r = await create(c, {...BODY, default: null}, 'k-3');
+  assert(r.status === 422 && r.text.includes('default'), \`a create with default null answered \${r.status} \${r.text}: null is no default either, expected a 422 naming default\`);
+  assert.equal(await store.load('checkout'), null, 'a flag with a null default was stored');
   r = await create(c, {...BODY, default: true}, 'k-2');
   assert.equal(r.status, 201, \`a create with default true answered \${r.status}: \${r.text}\`);
   assert.equal((await store.load('checkout')).default, true, 'the stored default must be true');
@@ -681,8 +697,13 @@ export async function check_idempotency(ctx) {
   assert.equal(stored.version, 1, \`the replay saved version \${stored.version}: a client retry forked the flag\`);
   const fresh = await create(c, {...BODY, rollout: 50}, 'k-2');
   assert(fresh.status === 201 && fresh.json().version === 2, \`a create with a new Idempotency-Key must save version 2, got \${fresh.status} \${fresh.text}\`);
+  const other = await create(c, {...BODY, key: 'pricing'}, 'k-1');
+  assert(other.status === 201 && other.json().key === 'pricing' && other.json().version === 1, \`Idempotency-Key k-1 on another flag, pricing, answered \${other.status} \${other.text}: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1\`);
+  assert.notEqual(await store.load('pricing'), null, 'the create of pricing with k-1 stored nothing');
   const missing = await c.post('/v1/flags', {json: BODY});
   assert.equal(missing.status, 400, \`a create without Idempotency-Key answered \${missing.status}, expected 400\`);
+  const after = await store.load('checkout');
+  assert.equal(after.version, 2, \`the create without Idempotency-Key saved version \${after.version}: refuse it before the save\`);
 }
 `,
     go: `package main
@@ -744,6 +765,9 @@ func CheckRegistry(ctx *harness.Ctx) {
 	ctx.Assert(store.Load(apiBg, "plan-gate") == nil, "a flag with a refused rule was stored")
 	r = apiCreate(c, apiBody("country-gt", false, []map[string]any{{"attribute": "country", "operator": "gt", "value": "US"}}, 25), "k-2")
 	ctx.Equal(r.Status, 422, "gt on the string attribute country: the registry has no gt for strings; the status")
+	r = apiCreate(c, apiBody("two-rules", false, []map[string]any{usRules[0], {"attribute": "plan_tier", "operator": "eq", "value": "gold"}}, 25), "k-4")
+	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "plan_tier"), "a flag whose second rule targets plan_tier answered %d %s: every rule must pass the registry, expected a 422 naming plan_tier", r.Status, r.Text())
+	ctx.Assert(store.Load(apiBg, "two-rules") == nil, "a flag with a refused second rule was stored")
 	r = apiCreate(c, apiBody("new-app", false, []map[string]any{{"attribute": "app_version", "operator": "gt", "value": 5}}, 25), "k-3")
 	ctx.Equal(r.Status, 201, "gt on the number attribute app_version is registered (%s); the status", r.Text())
 }
@@ -754,6 +778,11 @@ func CheckDefault(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 422, "a create with no default would serve false to everyone without anyone choosing it (%s); the status", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "default"), "the 422 must name default, got %s", r.Text())
 	ctx.Assert(store.Load(apiBg, "checkout") == nil, "a flag with no default was stored")
+	nullDefault := apiBody("checkout", nil, usRules, 25)
+	nullDefault["default"] = nil
+	r = apiCreate(c, nullDefault, "k-3")
+	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "default"), "a create with default null answered %d %s: null is no default either, expected a 422 naming default", r.Status, r.Text())
+	ctx.Assert(store.Load(apiBg, "checkout") == nil, "a flag with a null default was stored")
 	r = apiCreate(c, apiBody("checkout", true, usRules, 25), "k-2")
 	ctx.Equal(r.Status, 201, "a create with default true (%s)", r.Text())
 	ctx.Equal(store.Load(apiBg, "checkout").Default, true, "the stored default")
@@ -768,8 +797,13 @@ func CheckIdempotency(ctx *harness.Ctx) {
 	ctx.Equal(store.Load(apiBg, "checkout").Version, int64(1), "a client retry must not fork the flag; the stored version")
 	fresh := apiCreate(c, apiBody("checkout", false, usRules, 50), "k-2")
 	ctx.Assert(fresh.Status == 201 && apiVersion(fresh) == 2, "a create with a new Idempotency-Key must save version 2, got %d %s", fresh.Status, fresh.Text())
+	other := apiCreate(c, apiBody("pricing", false, usRules, 25), "k-1")
+	otherBody, _ := other.JSON().(map[string]any)
+	ctx.Assert(other.Status == 201 && otherBody["key"] == "pricing" && apiVersion(other) == 1, "Idempotency-Key k-1 on another flag, pricing, answered %d %s: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1", other.Status, other.Text())
+	ctx.Assert(store.Load(apiBg, "pricing") != nil, "the create of pricing with k-1 stored nothing")
 	missing := c.Post("/v1/flags", apiBody("checkout", false, usRules, 25))
 	ctx.Equal(missing.Status, 400, "a create without Idempotency-Key")
+	ctx.Equal(store.Load(apiBg, "checkout").Version, int64(2), "a create without Idempotency-Key must be refused before the save; the stored version")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -825,6 +859,9 @@ void CheckRegistry(harness::Ctx& ctx) {
   ctx.Assert(!store::load("plan-gate"), "a flag with a refused rule was stored");
   r = apiCreate(c, apiBody("country-gt", nlohmann::json::parse(R"([{"attribute": "country", "operator": "gt", "value": "US"}])"), 25), "k-2");
   ctx.Equal(r.Status, 422, "gt on the string attribute country: the registry has no gt for strings; the status");
+  r = apiCreate(c, apiBody("two-rules", nlohmann::json::parse(R"([{"attribute": "country", "operator": "eq", "value": "US"}, {"attribute": "plan_tier", "operator": "eq", "value": "gold"}])"), 25), "k-4");
+  ctx.Assert(r.Status == 422 && r.Text().find("plan_tier") != std::string::npos, "a flag whose second rule targets plan_tier answered %d %s: every rule must pass the registry, expected a 422 naming plan_tier", r.Status, r.Text());
+  ctx.Assert(!store::load("two-rules"), "a flag with a refused second rule was stored");
   r = apiCreate(c, apiBody("new-app", nlohmann::json::parse(R"([{"attribute": "app_version", "operator": "gt", "value": 5}])"), 25), "k-3");
   ctx.Equal(r.Status, 201, "gt on the number attribute app_version is registered (%s); the status", r.Text());
 }
@@ -837,6 +874,10 @@ void CheckDefault(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 422, "a create with no default would serve false to everyone without anyone choosing it (%s); the status", r.Text());
   ctx.Assert(r.Text().find("default") != std::string::npos, "the 422 must name default, got %s", r.Text());
   ctx.Assert(!store::load("checkout"), "a flag with no default was stored");
+  body["default"] = nullptr;
+  r = apiCreate(c, body, "k-3");
+  ctx.Assert(r.Status == 422 && r.Text().find("default") != std::string::npos, "a create with default null answered %d %s: null is no default either, expected a 422 naming default", r.Status, r.Text());
+  ctx.Assert(!store::load("checkout"), "a flag with a null default was stored");
   body["default"] = true;
   r = apiCreate(c, body, "k-2");
   ctx.Equal(r.Status, 201, "a create with default true (%s)", r.Text());
@@ -852,8 +893,13 @@ void CheckIdempotency(harness::Ctx& ctx) {
   ctx.Equal(store::load("checkout")->value("version", 0L), 1L, "a client retry must not fork the flag; the stored version");
   const auto fresh = apiCreate(c, apiBody("checkout", kUsRules, 50), "k-2");
   ctx.Assert(fresh.Status == 201 && apiVersion(fresh) == 2, "a create with a new Idempotency-Key must save version 2, got %d %s", fresh.Status, fresh.Text());
+  const auto other = apiCreate(c, apiBody("pricing", kUsRules, 25), "k-1");
+  const auto otherBody = nlohmann::json::parse(other.Text(), nullptr, false);
+  ctx.Assert(other.Status == 201 && otherBody.is_object() && otherBody.value("key", "") == "pricing" && apiVersion(other) == 1, "Idempotency-Key k-1 on another flag, pricing, answered %d %s: a create is keyed by (key, Idempotency-Key), so it must save pricing version 1", other.Status, other.Text());
+  ctx.Assert(store::load("pricing").has_value(), "the create of pricing with k-1 stored nothing");
   const auto missing = c.Post("/v1/flags", apiBody("checkout", kUsRules, 25).dump(), "Content-Type", "application/json");
   ctx.Equal(missing.Status, 400, "a create without Idempotency-Key");
+  ctx.Equal(store::load("checkout")->value("version", 0L), 2L, "a create without Idempotency-Key must be refused before the save; the stored version");
 }
 `,
   },

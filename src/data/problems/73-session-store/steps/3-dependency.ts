@@ -24,7 +24,7 @@ cache ever saw. A token the auth service rejected is sent three times.
 - A positive answer is cached for \`CACHE_TTL_S\` = 30 s at most.
 - A deadline, \`UNAVAILABLE\` or any other failure denies the request (no claims); nothing older than
   the cache window is answered.
-- \`revoke\` drops the token's cache entry.
+- \`revoke\` drops the token's cache entry, even when the auth service does not answer.
 - \`UNAUTHENTICATED\` is the answer: one call, no retry.`,
   sequence: {
     participants: ['Session API', 'Cache', 'Auth service'],
@@ -42,7 +42,7 @@ cache ever saw. A token the auth service rejected is sent three times.
       id: 'deadline',
       title: 'Every validation carries a 150 ms deadline',
       detail:
-        'Each `Validate` call carries a deadline between 100 and 200 ms, and an auth service that takes a second to answer is a denial. The starter allows five seconds.',
+        'Every `Validate` call carries a deadline between 100 and 200 ms, a retry included, and an auth service that takes a second to answer is a denial. The starter allows five seconds.',
       match: {
         python: {all: [/timeout\s*=\s*(DEADLINE_S|0?\.15)\b/], none: [/timeout\s*=\s*5\b/]},
         typescript: {
@@ -64,7 +64,7 @@ cache ever saw. A token the auth service rejected is sent three times.
       id: 'short-cache',
       title: 'A positive answer is cached for 30 seconds',
       detail:
-        'A second validation 10 s later comes from the cache; 35 s after the first, a token the auth service has since revoked no longer validates. The starter trusts a cached answer for an hour.',
+        'A second validation 10 s later comes from the cache; 30.5 s after the first, a token the auth service has since revoked no longer validates. The starter trusts a cached answer for an hour.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*30\b/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*30\b/]},
@@ -77,7 +77,7 @@ cache ever saw. A token the auth service rejected is sent three times.
       id: 'fail-closed',
       title: 'An unreachable auth service denies the request',
       detail:
-        'An hour after a token was cached, with the auth service answering `UNAVAILABLE`, validation answers no claims. The starter falls back to the claims it cached last.',
+        'With the auth service answering `UNAVAILABLE`, a token cached 31 s ago, and again an hour ago, validates to no claims. The starter falls back to the claims it cached last.',
       match: {
         python: {none: [/except grpc\.RpcError[\s\S]*return hit\[0\]/]},
         typescript: {none: [/catch[\s\S]*return hit\.claims/]},
@@ -90,7 +90,7 @@ cache ever saw. A token the auth service rejected is sent three times.
       id: 'revoke-visible',
       title: 'A revocation reaches the cache',
       detail:
-        'Right after `revoke(token)` the token no longer validates. The starter tells the auth service and keeps the cached claims.',
+        'Right after `revoke(token)` the token no longer validates, even when the auth service failed the `Revoke`. The starter tells the auth service and keeps the cached claims.',
       match: {
         python: {order: [/def revoke\(/, /cache\.pop\(/]},
         typescript: {order: [/function revoke\(/, /cache\.delete\(/]},
@@ -661,11 +661,13 @@ def check_deadline(ctx):
     m, _ = _client(ctx)
     claims = m.validate("tok-1")
     assert claims == CLAIMS, f"validate('tok-1') answered {claims}, expected {CLAIMS}"
-    for call in ctx.grpc.calls_to("Validate"):
-        assert call.timeout is not None and 0.1 <= call.timeout <= 0.2, f"a Validate call carries a {call.timeout} s deadline, expected 150 ms: a slow auth service holds every request open that long"
     ctx.grpc.set_latency("Validate", 1.0)
     late = m.validate("tok-2")
     assert late is None, f"with the auth service answering in 1 s, validate('tok-2') answered {late}: give up at 150 ms and deny"
+    calls = ctx.grpc.calls_to("Validate")
+    assert len(calls) >= 2, f"two validations of uncached tokens made {len(calls)} Validate calls"
+    for call in calls:
+        assert call.timeout is not None and 0.1 <= call.timeout <= 0.2, f"a Validate call carries a {call.timeout} s deadline, expected 150 ms: a slow auth service holds every request open that long"
 
 
 def check_short_cache(ctx):
@@ -676,16 +678,19 @@ def check_short_cache(ctx):
     calls = len(ctx.grpc.calls_to("Validate"))
     assert calls == 1, f"two validations 10 s apart made {calls} Validate calls: the second must come from the cache"
     del auth.tokens["tok-1"]  # an operator revokes it at the auth service
-    ctx.clock.advance(25)
+    ctx.clock.advance(20.5)
     claims = m.validate("tok-1")
-    assert claims is None, f"35 s after it was cached, a token the auth service has revoked still validated ({claims}): cache a positive answer for 30 s at most"
+    assert claims is None, f"30.5 s after it was cached, a token the auth service has revoked still validated ({claims}): cache a positive answer for 30 s at most"
 
 
 def check_fail_closed(ctx):
     m, _ = _client(ctx)
     assert m.validate("tok-1") == CLAIMS, "validate('tok-1') must answer its claims"
-    ctx.clock.advance(3601)  # an hour later, past any cache window
     ctx.grpc.fail("Validate", grpc.StatusCode.UNAVAILABLE, "auth is down", times=10)
+    ctx.clock.advance(31)  # just past the cache window
+    claims = m.validate("tok-1")
+    assert claims is None, f"with the auth service down, validate answered {claims}, cached 31 s ago: nothing older than the cache window is answered, or a revoked token works for as long as the outage lasts"
+    ctx.clock.advance(3570)  # an hour later
     claims = m.validate("tok-1")
     assert claims is None, f"with the auth service down, validate answered {claims}, cached an hour ago: an outage must deny, or a revoked token works for as long as the outage lasts"
 
@@ -697,6 +702,15 @@ def check_revoke_visible(ctx):
     assert ctx.grpc.calls_to("Revoke"), "revoke must tell the auth service (Revoke)"
     claims = m.validate("tok-1")
     assert claims is None, f"right after revoke('tok-1') the token still validated from the cache ({claims}): revoke must drop the cached entry"
+    assert m.validate("tok-2") is not None, "validate('tok-2') must answer its claims"
+    ctx.grpc.fail("Revoke", grpc.StatusCode.UNAVAILABLE, "auth is down", times=1)
+    try:
+        m.revoke("tok-2")
+    except grpc.RpcError:
+        pass  # the auth service did not take the revocation; this instance must still stop trusting the token
+    ctx.grpc.fail("Validate", grpc.StatusCode.UNAVAILABLE, "auth is down", times=1)
+    claims = m.validate("tok-2")
+    assert claims is None, f"after revoke('tok-2') failed at the auth service, the token still validated from the cache ({claims}): the cached entry must go even when Revoke fails"
 
 
 def check_terminal_reject(ctx):
@@ -734,12 +748,14 @@ export async function check_deadline(ctx) {
   const {m} = client(ctx);
   const claims = await m.validate('tok-1');
   assert.equal(claimsOf(claims), JSON.stringify(CLAIMS), \`validate('tok-1') answered \${claimsOf(claims)}\`);
-  for (const call of ctx.grpc.callsTo('Validate')) {
-    assert(call.timeout !== null && 0.1 <= call.timeout && call.timeout <= 0.2, \`a Validate call carries a \${call.timeout} s deadline, expected 150 ms: a slow auth service holds every request open that long\`);
-  }
   ctx.grpc.setLatency('Validate', 1.0);
   const late = await m.validate('tok-2');
   assert.equal(late, null, \`with the auth service answering in 1 s, validate('tok-2') answered \${claimsOf(late)}: give up at 150 ms and deny\`);
+  const calls = ctx.grpc.callsTo('Validate');
+  assert(calls.length >= 2, \`two validations of uncached tokens made \${calls.length} Validate calls\`);
+  for (const call of calls) {
+    assert(call.timeout !== null && 0.1 <= call.timeout && call.timeout <= 0.2, \`a Validate call carries a \${call.timeout} s deadline, expected 150 ms: a slow auth service holds every request open that long\`);
+  }
 }
 
 export async function check_short_cache(ctx) {
@@ -750,17 +766,20 @@ export async function check_short_cache(ctx) {
   const calls = ctx.grpc.callsTo('Validate').length;
   assert.equal(calls, 1, \`two validations 10 s apart made \${calls} Validate calls: the second must come from the cache\`);
   tokens.delete('tok-1'); // an operator revokes it at the auth service
-  ctx.clock.advance(25);
+  ctx.clock.advance(20.5);
   const claims = await m.validate('tok-1');
-  assert.equal(claims, null, \`35 s after it was cached, a token the auth service has revoked still validated (\${claimsOf(claims)}): cache a positive answer for 30 s at most\`);
+  assert.equal(claims, null, \`30.5 s after it was cached, a token the auth service has revoked still validated (\${claimsOf(claims)}): cache a positive answer for 30 s at most\`);
 }
 
 export async function check_fail_closed(ctx) {
   const {m} = client(ctx);
   assert.equal(claimsOf(await m.validate('tok-1')), JSON.stringify(CLAIMS), "validate('tok-1') must answer its claims");
-  ctx.clock.advance(3601); // an hour later, past any cache window
   ctx.grpc.fail('Validate', ctx.grpc.status.UNAVAILABLE, 'auth is down', 10);
-  const claims = await m.validate('tok-1');
+  ctx.clock.advance(31); // just past the cache window
+  let claims = await m.validate('tok-1');
+  assert.equal(claims, null, \`with the auth service down, validate answered \${claimsOf(claims)}, cached 31 s ago: nothing older than the cache window is answered, or a revoked token works for as long as the outage lasts\`);
+  ctx.clock.advance(3570); // an hour later
+  claims = await m.validate('tok-1');
   assert.equal(claims, null, \`with the auth service down, validate answered \${claimsOf(claims)}, cached an hour ago: an outage must deny, or a revoked token works for as long as the outage lasts\`);
 }
 
@@ -771,6 +790,16 @@ export async function check_revoke_visible(ctx) {
   assert(ctx.grpc.callsTo('Revoke').length > 0, 'revoke must tell the auth service (Revoke)');
   const claims = await m.validate('tok-1');
   assert.equal(claims, null, \`right after revoke('tok-1') the token still validated from the cache (\${claimsOf(claims)}): revoke must drop the cached entry\`);
+  assert((await m.validate('tok-2')) !== null, "validate('tok-2') must answer its claims");
+  ctx.grpc.fail('Revoke', ctx.grpc.status.UNAVAILABLE, 'auth is down', 1);
+  try {
+    await m.revoke('tok-2');
+  } catch {
+    // the auth service did not take the revocation; this instance must still stop trusting the token
+  }
+  ctx.grpc.fail('Validate', ctx.grpc.status.UNAVAILABLE, 'auth is down', 1);
+  const after = await m.validate('tok-2');
+  assert.equal(after, null, \`after revoke('tok-2') failed at the auth service, the token still validated from the cache (\${claimsOf(after)}): the cached entry must go even when Revoke fails\`);
 }
 
 export async function check_terminal_reject(ctx) {
@@ -794,15 +823,15 @@ import (
 	"leetbuild/harness"
 )
 
-var bg = context.Background()
+var hBG = context.Background()
 
-// authPeer is the auth service: tokens it knows answer their claims, anything else is Unauthenticated.
-type authPeer struct {
+// hAuthPeer is the auth service: tokens it knows answer their claims, anything else is Unauthenticated.
+type hAuthPeer struct {
 	pb.UnimplementedAuthServer
 	tokens map[string]*pb.Claims
 }
 
-func (a *authPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.Claims, error) {
+func (a *hAuthPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.Claims, error) {
 	claims, ok := a.tokens[req.GetToken()]
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "unknown or revoked token")
@@ -810,14 +839,14 @@ func (a *authPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.Cla
 	return claims, nil
 }
 
-func (a *authPeer) Revoke(_ context.Context, req *pb.RevokeRequest) (*pb.RevokeReply, error) {
+func (a *hAuthPeer) Revoke(_ context.Context, req *pb.RevokeRequest) (*pb.RevokeReply, error) {
 	_, ok := a.tokens[req.GetToken()]
 	delete(a.tokens, req.GetToken())
 	return &pb.RevokeReply{Revoked: ok}, nil
 }
 
-func client(ctx *harness.Ctx) *authPeer {
-	peer := &authPeer{tokens: map[string]*pb.Claims{
+func hServeAuth(ctx *harness.Ctx) *hAuthPeer {
+	peer := &hAuthPeer{tokens: map[string]*pb.Claims{
 		"tok-1": {UserId: "u-1", DeviceClass: "mobile"},
 		"tok-2": {UserId: "u-2", DeviceClass: "desktop"},
 	}}
@@ -826,52 +855,63 @@ func client(ctx *harness.Ctx) *authPeer {
 	return peer
 }
 
-func isU1(c *Claims) bool { return c != nil && c.UserID == "u-1" && c.DeviceClass == "mobile" }
+func hIsU1(c *Claims) bool { return c != nil && c.UserID == "u-1" && c.DeviceClass == "mobile" }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Assert(isU1(validate(bg, "tok-1")), "validate(tok-1) must answer u-1's claims")
-	for _, call := range ctx.GRPC.CallsTo("Validate", "") {
+	hServeAuth(ctx)
+	ctx.Assert(hIsU1(validate(hBG, "tok-1")), "validate(tok-1) must answer u-1's claims")
+	ctx.GRPC.SetLatency("Validate", 1.0, "")
+	late := validate(hBG, "tok-2")
+	ctx.Assert(late == nil, "with the auth service answering in 1 s, validate(tok-2) answered %+v: give up at 150 ms and deny", late)
+	calls := ctx.GRPC.CallsTo("Validate", "")
+	ctx.Assert(len(calls) >= 2, "two validations of uncached tokens made %d Validate calls", len(calls))
+	for _, call := range calls {
 		ctx.Assert(call.HasDeadline() && call.Timeout.Seconds() >= 0.1 && call.Timeout.Seconds() <= 0.2, "a Validate call carries a %v deadline, expected 150 ms: a slow auth service holds every request open that long", call.Timeout)
 	}
-	ctx.GRPC.SetLatency("Validate", 1.0, "")
-	late := validate(bg, "tok-2")
-	ctx.Assert(late == nil, "with the auth service answering in 1 s, validate(tok-2) answered %+v: give up at 150 ms and deny", late)
 }
 
 func CheckShortCache(ctx *harness.Ctx) {
-	peer := client(ctx)
-	ctx.Assert(isU1(validate(bg, "tok-1")), "validate(tok-1) must answer u-1's claims")
+	peer := hServeAuth(ctx)
+	ctx.Assert(hIsU1(validate(hBG, "tok-1")), "validate(tok-1) must answer u-1's claims")
 	ctx.Clock.Advance(10)
-	ctx.Assert(isU1(validate(bg, "tok-1")), "validate(tok-1) must answer u-1's claims 10 s later")
+	ctx.Assert(hIsU1(validate(hBG, "tok-1")), "validate(tok-1) must answer u-1's claims 10 s later")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), 1, "two validations 10 s apart: the second must come from the cache; the Validate calls")
 	delete(peer.tokens, "tok-1") // an operator revokes it at the auth service
-	ctx.Clock.Advance(25)
-	claims := validate(bg, "tok-1")
-	ctx.Assert(claims == nil, "35 s after it was cached, a token the auth service has revoked still validated (%+v): cache a positive answer for 30 s at most", claims)
+	ctx.Clock.Advance(20.5)
+	claims := validate(hBG, "tok-1")
+	ctx.Assert(claims == nil, "30.5 s after it was cached, a token the auth service has revoked still validated (%+v): cache a positive answer for 30 s at most", claims)
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Assert(isU1(validate(bg, "tok-1")), "validate(tok-1) must answer u-1's claims")
-	ctx.Clock.Advance(3601) // an hour later, past any cache window
+	hServeAuth(ctx)
+	ctx.Assert(hIsU1(validate(hBG, "tok-1")), "validate(tok-1) must answer u-1's claims")
 	ctx.GRPC.Fail("Validate", codes.Unavailable, "auth is down", 10, "")
-	claims := validate(bg, "tok-1")
+	ctx.Clock.Advance(31) // just past the cache window
+	claims := validate(hBG, "tok-1")
+	ctx.Assert(claims == nil, "with the auth service down, validate answered %+v, cached 31 s ago: nothing older than the cache window is answered, or a revoked token works for as long as the outage lasts", claims)
+	ctx.Clock.Advance(3570) // an hour later
+	claims = validate(hBG, "tok-1")
 	ctx.Assert(claims == nil, "with the auth service down, validate answered %+v, cached an hour ago: an outage must deny, or a revoked token works for as long as the outage lasts", claims)
 }
 
 func CheckRevokeVisible(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Assert(isU1(validate(bg, "tok-1")), "validate(tok-1) must answer u-1's claims")
-	ctx.NoError(revoke(bg, "tok-1"), "revoke(tok-1)")
+	hServeAuth(ctx)
+	ctx.Assert(hIsU1(validate(hBG, "tok-1")), "validate(tok-1) must answer u-1's claims")
+	ctx.NoError(revoke(hBG, "tok-1"), "revoke(tok-1)")
 	ctx.Assert(len(ctx.GRPC.CallsTo("Revoke", "")) > 0, "revoke must tell the auth service (Revoke)")
-	claims := validate(bg, "tok-1")
+	claims := validate(hBG, "tok-1")
 	ctx.Assert(claims == nil, "right after revoke(tok-1) the token still validated from the cache (%+v): revoke must drop the cached entry", claims)
+	ctx.Assert(validate(hBG, "tok-2") != nil, "validate(tok-2) must answer its claims")
+	ctx.GRPC.Fail("Revoke", codes.Unavailable, "auth is down", 1, "")
+	_ = revoke(hBG, "tok-2") // the auth service does not take it; this instance must still stop trusting the token
+	ctx.GRPC.Fail("Validate", codes.Unavailable, "auth is down", 1, "")
+	claims = validate(hBG, "tok-2")
+	ctx.Assert(claims == nil, "after revoke(tok-2) failed at the auth service, the token still validated from the cache (%+v): the cached entry must go even when Revoke fails", claims)
 }
 
 func CheckTerminalReject(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Assert(validate(bg, "tok-unknown") == nil, "a token the auth service rejects must not validate")
+	hServeAuth(ctx)
+	ctx.Assert(validate(hBG, "tok-unknown") == nil, "a token the auth service rejects must not validate")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), 1, "a token the auth service rejected (Unauthenticated) is the answer, not a failure to retry; the Validate calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a rejection must not be slept on and retried; the sleeps")
 }
@@ -884,7 +924,7 @@ func CheckTerminalReject(ctx *harness.Ctx) {
 namespace {
 
 // The auth service: tokens it knows answer their claims, anything else is UNAUTHENTICATED.
-class AuthPeer final : public sessionauth::Auth::Service {
+class HAuthPeer final : public sessionauth::Auth::Service {
  public:
   std::map<std::string, std::pair<std::string, std::string>> tokens = {{"tok-1", {"u-1", "mobile"}}, {"tok-2", {"u-2", "desktop"}}};
   grpc::Status Validate(grpc::ServerContext*, const sessionauth::ValidateRequest* req, sessionauth::Claims* out) override {
@@ -900,60 +940,74 @@ class AuthPeer final : public sessionauth::Auth::Service {
   }
 };
 
-AuthPeer& client(harness::Ctx& ctx) {
-  static AuthPeer* peer = nullptr;
+HAuthPeer& hServeAuth(harness::Ctx& ctx) {
+  static HAuthPeer* peer = nullptr;
   delete peer;
-  peer = new AuthPeer;
+  peer = new HAuthPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   cache.clear();
   return *peer;
 }
 
-bool isU1(const std::optional<Claims>& c) { return c && c->user_id == "u-1" && c->device_class == "mobile"; }
+bool hIsU1(const std::optional<Claims>& c) { return c && c->user_id == "u-1" && c->device_class == "mobile"; }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Assert(isU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
-  for (const auto& call : ctx.GRPC.CallsTo("Validate")) {
+  hServeAuth(ctx);
+  ctx.Assert(hIsU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
+  ctx.GRPC.SetLatency("Validate", 1.0);
+  ctx.Assert(!validate("tok-2").has_value(), "with the auth service answering in 1 s, validate(tok-2) answered claims: give up at 150 ms and deny");
+  const auto calls = ctx.GRPC.CallsTo("Validate");
+  ctx.Assert(calls.size() >= 2, "two validations of uncached tokens made %d Validate calls", calls.size());
+  for (const auto& call : calls) {
     ctx.Assert(call.HasDeadline() && 0.1 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.2,
                "a Validate call carries a %v s deadline, expected 150 ms: a slow auth service holds every request open that long", call.TimeoutSeconds());
   }
-  ctx.GRPC.SetLatency("Validate", 1.0);
-  ctx.Assert(!validate("tok-2").has_value(), "with the auth service answering in 1 s, validate(tok-2) answered claims: give up at 150 ms and deny");
 }
 
 void CheckShortCache(harness::Ctx& ctx) {
-  AuthPeer& peer = client(ctx);
-  ctx.Assert(isU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
+  HAuthPeer& peer = hServeAuth(ctx);
+  ctx.Assert(hIsU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
   ctx.Clock.Advance(10);
-  ctx.Assert(isU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims 10 s later");
+  ctx.Assert(hIsU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims 10 s later");
   ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), 1, "two validations 10 s apart: the second must come from the cache; the Validate calls");
   peer.tokens.erase("tok-1");  // an operator revokes it at the auth service
-  ctx.Clock.Advance(25);
-  ctx.Assert(!validate("tok-1").has_value(), "35 s after it was cached, a token the auth service has revoked still validated: cache a positive answer for 30 s at most");
+  ctx.Clock.Advance(20.5);
+  ctx.Assert(!validate("tok-1").has_value(), "30.5 s after it was cached, a token the auth service has revoked still validated: cache a positive answer for 30 s at most");
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Assert(isU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
-  ctx.Clock.Advance(3601);  // an hour later, past any cache window
+  hServeAuth(ctx);
+  ctx.Assert(hIsU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
   ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "auth is down", 10);
+  ctx.Clock.Advance(31);  // just past the cache window
+  ctx.Assert(!validate("tok-1").has_value(),
+             "with the auth service down, validate answered the claims cached 31 s ago: nothing older than the cache window is answered, or a revoked token works for as long as the outage lasts");
+  ctx.Clock.Advance(3570);  // an hour later
   ctx.Assert(!validate("tok-1").has_value(),
              "with the auth service down, validate answered the claims cached an hour ago: an outage must deny, or a revoked token works for as long as the outage lasts");
 }
 
 void CheckRevokeVisible(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Assert(isU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
+  hServeAuth(ctx);
+  ctx.Assert(hIsU1(validate("tok-1")), "validate(tok-1) must answer u-1's claims");
   revoke("tok-1");
   ctx.Assert(!ctx.GRPC.CallsTo("Revoke").empty(), "revoke must tell the auth service (Revoke)");
   ctx.Assert(!validate("tok-1").has_value(), "right after revoke(tok-1) the token still validated from the cache: revoke must drop the cached entry");
+  ctx.Assert(validate("tok-2").has_value(), "validate(tok-2) must answer its claims");
+  ctx.GRPC.Fail("Revoke", grpc::StatusCode::UNAVAILABLE, "auth is down", 1);
+  try {
+    revoke("tok-2");
+  } catch (...) {
+    // the auth service did not take the revocation; this instance must still stop trusting the token
+  }
+  ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "auth is down", 1);
+  ctx.Assert(!validate("tok-2").has_value(), "after revoke(tok-2) failed at the auth service, the token still validated from the cache: the cached entry must go even when Revoke fails");
 }
 
 void CheckTerminalReject(harness::Ctx& ctx) {
-  client(ctx);
+  hServeAuth(ctx);
   ctx.Assert(!validate("tok-unknown").has_value(), "a token the auth service rejects must not validate");
   ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), 1, "a token the auth service rejected (UNAUTHENTICATED) is the answer, not a failure to retry; the Validate calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a rejection must not be slept on and retried; the sleeps");

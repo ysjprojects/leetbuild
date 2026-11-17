@@ -21,8 +21,10 @@ out. The page lists sessions that expired long ago and a last-seen time from an 
 everywhere" leaves every device signed in, and a login that lands while it runs survives where no
 page shows it.
 
-- The caller's session must belong to the user in the path; otherwise **403**, on both routes.
-- List only ids whose session still reads (\`store.read_session\`).
+- The caller's session must belong to the user in the path; otherwise **403**, on both routes,
+  whether or not that user has sessions.
+- List only ids whose session still reads (\`store.read_session\`); showing a session never extends
+  it.
 - Read the records on every request: \`last_seen\` within a minute of the truth.
 - Revoke-all deletes every \`session:{id}\` in the set, then the set, in one Lua script: a login
   landing meanwhile is either revoked or still listed.`,
@@ -53,7 +55,7 @@ page shows it.
       id: 'authz',
       title: "Refuses another user's sessions",
       detail:
-        "A caller signed in as u-1 gets **403** for u-2's page and for u-2's sign-out-everywhere, which leaves u-2's sessions live. The starter checks only that the caller is signed in.",
+        "A caller signed in as u-1 gets **403** for u-2's page and for u-2's sign-out-everywhere, which leaves u-2's sessions live, and the same for a user with no sessions at all. The starter checks only that the caller is signed in.",
       match: {
         python: {all: [/\b403\b/]},
         typescript: {all: [/\b403\b/]},
@@ -66,7 +68,7 @@ page shows it.
       id: 'active-only',
       title: 'Lists only sessions that still exist',
       detail:
-        "A session idle past its 15 minutes has expired, but its id stays in the user's set: the page must not list it. The starter turns a missing record into an entry.",
+        "A session idle past its 15 minutes has expired, but its id stays in the user's set: the page must not list it, and listing it ten minutes earlier must not have kept it alive. The starter turns a missing record into an entry.",
       match: {
         python: {none: [/read_session\([^)]*\)\s*or\s*\{\}/]},
         typescript: {none: [/record\?\./]},
@@ -749,7 +751,6 @@ void register_routes(httplib::Server& svr) {
   },
   harness: {
     python: `from sessions import store
-from sessions.state import touch_session
 
 ME = {"X-Session-Id": "s-1"}
 
@@ -777,16 +778,21 @@ async def check_authz(ctx):
         assert theirs.status_code == 403, f"u-1 asking for u-2's sessions got {theirs.status_code}: {theirs.text}. The path names whose page; the session says who asks: 403"
         signout = await c.delete("/v1/users/u-2/sessions", headers=ME)
         assert signout.status_code == 403, f"u-1 signing u-2 out everywhere got {signout.status_code}, expected 403"
+        nobody = await c.get("/v1/users/u-404/sessions", headers=ME)
+        assert nobody.status_code == 403, f"u-1 asking for the sessions of u-404, a user with none, got {nobody.status_code}: another user's page is 403 whether or not it has sessions"
+        nobody = await c.delete("/v1/users/u-404/sessions", headers=ME)
+        assert nobody.status_code == 403, f"u-1 signing u-404 (a user with no sessions) out everywhere got {nobody.status_code}, expected 403"
     assert store.read_session("s-9") is not None, "u-1 signed u-2's session s-9 out"
 
 
 async def check_active_only(ctx):
     async with _api(ctx) as c:
         ctx.clock.advance(600)
-        touch_session("s-1")
+        first = await _list(c)
+        assert sorted(first) == ["s-1", "s-2"], f"after 10 minutes u-1's page lists {sorted(first)}, expected s-1 and s-2"
         ctx.clock.advance(600)  # s-2 has been idle 20 minutes: expired, its id still in the set
         listed = await _list(c)
-    assert sorted(listed) == ["s-1"], f"u-1's page lists {sorted(listed)} ({list(listed.values())}): s-2 expired 5 minutes ago and must not be listed"
+    assert sorted(listed) == ["s-1"], f"u-1's page lists {sorted(listed)} ({list(listed.values())}): s-2 has not been used for 20 minutes and must not be listed. Showing a session on the page must not extend it"
 
 
 async def check_last_seen(ctx):
@@ -834,7 +840,7 @@ async function api(ctx) {
   await store.putSession('s-1', 'u-1', 'mobile', 'tok-1');
   await store.putSession('s-2', 'u-1', 'desktop', 'tok-2');
   await store.putSession('s-9', 'u-2', 'mobile', 'tok-9');
-  return {c: ctx.client(ctx.load('read').app), store, state: ctx.load('/support/sessions/state.ts')};
+  return {c: ctx.client(ctx.load('read').app), store};
 }
 
 async function list(c, userId = 'u-1') {
@@ -853,16 +859,21 @@ export async function check_authz(ctx) {
   assert.equal(theirs.status, 403, \`u-1 asking for u-2's sessions got \${theirs.status}: \${theirs.text}. The path names whose page; the session says who asks: 403\`);
   const signout = await c.delete('/v1/users/u-2/sessions', {headers: ME});
   assert.equal(signout.status, 403, \`u-1 signing u-2 out everywhere got \${signout.status}, expected 403\`);
+  const nobody = await c.get('/v1/users/u-404/sessions', {headers: ME});
+  assert.equal(nobody.status, 403, \`u-1 asking for the sessions of u-404, a user with none, got \${nobody.status}: another user's page is 403 whether or not it has sessions\`);
+  const nobodyOut = await c.delete('/v1/users/u-404/sessions', {headers: ME});
+  assert.equal(nobodyOut.status, 403, \`u-1 signing u-404 (a user with no sessions) out everywhere got \${nobodyOut.status}, expected 403\`);
   assert((await store.readSession('s-9')) !== null, "u-1 signed u-2's session s-9 out");
 }
 
 export async function check_active_only(ctx) {
-  const {c, state} = await api(ctx);
+  const {c} = await api(ctx);
   ctx.clock.advance(600);
-  await state.touchSession('s-1');
+  const first = await list(c);
+  assert.deepEqual(Object.keys(first).sort(), ['s-1', 's-2'], \`after 10 minutes u-1's page lists \${JSON.stringify(Object.keys(first))}, expected s-1 and s-2\`);
   ctx.clock.advance(600); // s-2 has been idle 20 minutes: expired, its id still in the set
   const listed = await list(c);
-  assert.deepEqual(Object.keys(listed), ['s-1'], \`u-1's page lists \${JSON.stringify(Object.values(listed))}: s-2 expired 5 minutes ago and must not be listed\`);
+  assert.deepEqual(Object.keys(listed), ['s-1'], \`u-1's page lists \${JSON.stringify(Object.values(listed))}: s-2 has not been used for 20 minutes and must not be listed. Showing a session on the page must not extend it\`);
 }
 
 export async function check_last_seen(ctx) {
@@ -912,45 +923,44 @@ import (
 	"net/http"
 	"sort"
 
-	"sessions/state"
 	"sessions/store"
 
 	"leetbuild/harness"
 )
 
-var bg = context.Background()
+var hBG = context.Background()
 
-type listed struct {
+type hListed struct {
 	SessionID   string \`json:"session_id"\`
 	DeviceClass string \`json:"device_class"\`
 	LastSeen    int64  \`json:"last_seen"\`
 	Rotation    int64  \`json:"rotation"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	ctx.NoError(store.PutSession(bg, "s-1", "u-1", "mobile", "tok-1"), "PutSession")
-	ctx.NoError(store.PutSession(bg, "s-2", "u-1", "desktop", "tok-2"), "PutSession")
-	ctx.NoError(store.PutSession(bg, "s-9", "u-2", "mobile", "tok-9"), "PutSession")
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	ctx.NoError(store.PutSession(hBG, "s-1", "u-1", "mobile", "tok-1"), "PutSession")
+	ctx.NoError(store.PutSession(hBG, "s-2", "u-1", "desktop", "tok-2"), "PutSession")
+	ctx.NoError(store.PutSession(hBG, "s-9", "u-2", "mobile", "tok-9"), "PutSession")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func list(ctx *harness.Ctx, c *harness.HTTP) map[string]listed {
+func hList(ctx *harness.Ctx, c *harness.HTTP) map[string]hListed {
 	r := c.Get("/v1/users/u-1/sessions", "X-Session-Id", "s-1")
 	ctx.Equal(r.Status, 200, "GET /v1/users/u-1/sessions as u-1's own session (%s)", r.Text())
 	var body struct {
-		Sessions []listed \`json:"sessions"\`
+		Sessions []hListed \`json:"sessions"\`
 	}
 	r.Decode(&body)
-	out := map[string]listed{}
+	out := map[string]hListed{}
 	for _, s := range body.Sessions {
 		out[s.SessionID] = s
 	}
 	return out
 }
 
-func ids(m map[string]listed) []string {
+func hIDs(m map[string]hListed) []string {
 	out := []string{}
 	for id := range m {
 		out = append(out, id)
@@ -960,36 +970,38 @@ func ids(m map[string]listed) []string {
 }
 
 func CheckAuthz(ctx *harness.Ctx) {
-	c := api(ctx)
-	ctx.Equal(ids(list(ctx, c)), []string{"s-1", "s-2"}, "u-1's page")
+	c := hAPI(ctx)
+	ctx.Equal(hIDs(hList(ctx, c)), []string{"s-1", "s-2"}, "u-1's page")
 	ctx.Equal(c.Get("/v1/users/u-1/sessions").Status, 401, "a request without a session")
 	theirs := c.Get("/v1/users/u-2/sessions", "X-Session-Id", "s-1")
 	ctx.Equal(theirs.Status, 403, "u-1 asking for u-2's sessions (%s): the path names whose page, the session says who asks", theirs.Text())
 	ctx.Equal(c.Delete("/v1/users/u-2/sessions", "X-Session-Id", "s-1").Status, 403, "u-1 signing u-2 out everywhere")
-	ctx.Assert(store.ReadSession(bg, "s-9") != nil, "u-1 signed u-2's session s-9 out")
+	nobody := c.Get("/v1/users/u-404/sessions", "X-Session-Id", "s-1")
+	ctx.Equal(nobody.Status, 403, "u-1 asking for the sessions of u-404, a user with none (%s): another user's page is 403 whether or not it has sessions", nobody.Text())
+	ctx.Equal(c.Delete("/v1/users/u-404/sessions", "X-Session-Id", "s-1").Status, 403, "u-1 signing u-404 (a user with no sessions) out everywhere")
+	ctx.Assert(store.ReadSession(hBG, "s-9") != nil, "u-1 signed u-2's session s-9 out")
 }
 
 func CheckActiveOnly(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	ctx.Clock.Advance(600)
-	_, err := state.TouchSession(bg, "s-1")
-	ctx.NoError(err, "TouchSession")
+	ctx.Equal(hIDs(hList(ctx, c)), []string{"s-1", "s-2"}, "u-1's page after 10 minutes")
 	ctx.Clock.Advance(600) // s-2 has been idle 20 minutes: expired, its id still in the set
-	page := list(ctx, c)
-	ctx.Equal(ids(page), []string{"s-1"}, "s-2 expired 5 minutes ago and must not be listed (%v); u-1's page", page)
+	page := hList(ctx, c)
+	ctx.Equal(hIDs(page), []string{"s-1"}, "s-2 has not been used for 20 minutes and must not be listed (%v); showing a session on the page must not extend it; u-1's page", page)
 }
 
 func CheckLastSeen(ctx *harness.Ctx) {
-	c := api(ctx)
-	list(ctx, c)
+	c := hAPI(ctx)
+	hList(ctx, c)
 	ctx.Clock.Advance(300)
-	seen := list(ctx, c)["s-1"].LastSeen
+	seen := hList(ctx, c)["s-1"].LastSeen
 	now := ctx.Clock.Now() / 1000
 	ctx.Assert(now-seen <= 60, "the caller's own session shows last_seen %d, %d s before now: the page must read the records, not an hour-old summary", seen, now-seen)
 }
 
 func CheckRevokeAll(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	r := c.Delete("/v1/users/u-1/sessions", "X-Session-Id", "s-1")
 	var body struct {
 		Revoked int \`json:"revoked"\`
@@ -997,15 +1009,15 @@ func CheckRevokeAll(ctx *harness.Ctx) {
 	r.Decode(&body)
 	ctx.Assert(r.Status == 200 && body.Revoked == 2, "sign out everywhere answered %d %s, expected 200 {revoked: 2}", r.Status, r.Text())
 	for _, id := range []string{"s-1", "s-2"} {
-		ctx.Assert(store.ReadSession(bg, id) == nil, "after sign out everywhere the session %s still reads: every device is still signed in", id)
+		ctx.Assert(store.ReadSession(hBG, id) == nil, "after sign out everywhere the session %s still reads: every device is still signed in", id)
 	}
-	ctx.Equal(len(store.UserSessions(bg, "u-1")), 0, "u-1's set must be gone; its ids")
+	ctx.Equal(len(store.UserSessions(hBG, "u-1")), 0, "u-1's set must be gone; its ids")
 	ctx.Equal(c.Get("/v1/users/u-1/sessions", "X-Session-Id", "s-1").Status, 401, "the revoked caller's own id")
-	ctx.Assert(store.ReadSession(bg, "s-9") != nil, "u-2's session must survive u-1's sign out")
+	ctx.Assert(store.ReadSession(hBG, "s-9") != nil, "u-2's session must survive u-1's sign out")
 }
 
 func CheckRevokeRace(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	now := ctx.Clock.Now() / 1000
 	// Another tab of u-1 logs in right now: the session and its set entry, as PutSession writes them.
 	probe := ctx.Redis.After("user:u-1:sessions", func() any {
@@ -1034,7 +1046,7 @@ func CheckRevokeRace(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   store::putSession("s-1", "u-1", "mobile", "tok-1");
   store::putSession("s-2", "u-1", "desktop", "tok-2");
   store::putSession("s-9", "u-2", "mobile", "tok-9");
@@ -1045,7 +1057,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::map<std::string, nlohmann::json> list(harness::Ctx& ctx, harness::HTTP& c) {
+std::map<std::string, nlohmann::json> hList(harness::Ctx& ctx, harness::HTTP& c) {
   const auto r = c.Get("/v1/users/u-1/sessions", "X-Session-Id", "s-1");
   ctx.Equal(r.Status, 200, "GET /v1/users/u-1/sessions as u-1's own session (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -1056,7 +1068,7 @@ std::map<std::string, nlohmann::json> list(harness::Ctx& ctx, harness::HTTP& c) 
   return out;
 }
 
-std::vector<std::string> ids(const std::map<std::string, nlohmann::json>& m) {
+std::vector<std::string> hIDs(const std::map<std::string, nlohmann::json>& m) {
   std::vector<std::string> out;
   for (const auto& [id, _] : m) out.push_back(id);
   return out;
@@ -1065,35 +1077,38 @@ std::vector<std::string> ids(const std::map<std::string, nlohmann::json>& m) {
 }  // namespace
 
 void CheckAuthz(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  ctx.Equal(ids(list(ctx, c)), {"s-1", "s-2"}, "u-1's page");
+  auto c = hApi(ctx);
+  ctx.Equal(hIDs(hList(ctx, c)), {"s-1", "s-2"}, "u-1's page");
   ctx.Equal(c.Get("/v1/users/u-1/sessions").Status, 401, "a request without a session");
   const auto theirs = c.Get("/v1/users/u-2/sessions", "X-Session-Id", "s-1");
   ctx.Equal(theirs.Status, 403, "u-1 asking for u-2's sessions (%s): the path names whose page, the session says who asks", theirs.Text());
   ctx.Equal(c.Delete("/v1/users/u-2/sessions", "X-Session-Id", "s-1").Status, 403, "u-1 signing u-2 out everywhere");
+  const auto nobody = c.Get("/v1/users/u-404/sessions", "X-Session-Id", "s-1");
+  ctx.Equal(nobody.Status, 403, "u-1 asking for the sessions of u-404, a user with none (%s): another user's page is 403 whether or not it has sessions", nobody.Text());
+  ctx.Equal(c.Delete("/v1/users/u-404/sessions", "X-Session-Id", "s-1").Status, 403, "u-1 signing u-404 (a user with no sessions) out everywhere");
   ctx.Assert(store::readSession("s-9").has_value(), "u-1 signed u-2's session s-9 out");
 }
 
 void CheckActiveOnly(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   ctx.Clock.Advance(600);
-  state::touchSession("s-1");
+  ctx.Equal(hIDs(hList(ctx, c)), {"s-1", "s-2"}, "u-1's page after 10 minutes");
   ctx.Clock.Advance(600);  // s-2 has been idle 20 minutes: expired, its id still in the set
-  ctx.Equal(ids(list(ctx, c)), {"s-1"}, "s-2 expired 5 minutes ago and must not be listed; u-1's page");
+  ctx.Equal(hIDs(hList(ctx, c)), {"s-1"}, "s-2 has not been used for 20 minutes and must not be listed; showing a session on the page must not extend it; u-1's page");
 }
 
 void CheckLastSeen(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  list(ctx, c);
+  auto c = hApi(ctx);
+  hList(ctx, c);
   ctx.Clock.Advance(300);
-  const auto page = list(ctx, c);
+  const auto page = hList(ctx, c);
   const long long seen = page.count("s-1") && page.at("s-1")["last_seen"].is_number() ? page.at("s-1")["last_seen"].get<long long>() : 0;
   const long long now = ctx.Clock.Now() / 1000;
   ctx.Assert(now - seen <= 60, "the caller's own session shows last_seen %d, %d s before now: the page must read the records, not an hour-old summary", seen, now - seen);
 }
 
 void CheckRevokeAll(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto r = c.Delete("/v1/users/u-1/sessions", "X-Session-Id", "s-1");
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(r.Status == 200 && body.is_object() && body.value("revoked", 0) == 2, "sign out everywhere answered %d %s, expected 200 {revoked: 2}", r.Status, r.Text());
@@ -1106,7 +1121,7 @@ void CheckRevokeAll(harness::Ctx& ctx) {
 }
 
 void CheckRevokeRace(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const long long now = ctx.Clock.Now() / 1000;
   bool fired = false;
   // Another tab of u-1 logs in right now: the session and its set entry, as putSession writes them.

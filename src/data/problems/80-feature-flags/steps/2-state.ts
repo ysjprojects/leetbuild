@@ -41,7 +41,7 @@ turns a rollout back to an older version. Users in one flag's 25% tail sit in ev
       id: 'one-snapshot',
       title: 'Reads and writes the rule set as one document',
       detail:
-        'The snapshot lives under `flags:snapshot` as one value, read with one GET; no per-flag `flags:rule:{key}` keys, which a reader sees half-updated and which outlive the version that dropped the flag.',
+        "The snapshot lives under `flags:snapshot` as one value (its version beside it under `flags:snapshot:version`), and `evaluate` reads it with one GET, so a publish landing mid-read cannot pair one version's rules with another's number; no per-flag `flags:rule:{key}` keys, which a reader sees half-updated and which outlive the version that dropped the flag.",
       match: {
         python: {all: [/flags:snapshot/], none: [/flags:rule:/]},
         typescript: {all: [/flags:snapshot/], none: [/flags:rule:/]},
@@ -54,7 +54,7 @@ turns a rollout back to an older version. Users in one flag's 25% tail sit in ev
       id: 'newer-only',
       title: 'Only a newer version replaces the snapshot',
       detail:
-        'The swap is one Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`) that compares the stored version with `ARGV[2]` (`tonumber`) before writing; a plain SET lets a late publisher put an older rule set back.',
+        'The swap is one Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`) that compares the stored version with `ARGV[2]` as numbers (`tonumber`) before writing, so an equal or older version is refused (10 is newer than 9) and another publisher cannot land between the compare and the write; a plain SET lets a late publisher put an older rule set back.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /tonumber\(/, /ARGV\[2\]/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /tonumber\(/, /ARGV\[2\]/]},
@@ -808,7 +808,13 @@ std::optional<json> evaluate(const std::string& flag_key, const std::map<std::st
     },
   },
   harness: {
-    python: `from flags.hashing import fnv1a32
+    python: `import json
+
+import redis
+
+from flags.hashing import fnv1a32
+
+_HREDIS = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 USER = {"user_id": "u-7", "country": "US"}
 USERS = [f"u-{i}" for i in range(400)]
@@ -834,6 +840,19 @@ def _consistent(pair, when):
         assert d["value"] is (d["version"] == 2), f"a read {when} answered {d}: version {d['version']} with the other version's rollout. The rule set was torn between two writes"
 
 
+def _land(snapshot):
+    """Another replica's publish of snapshot, landing once between two of the learner's commands."""
+    landed = []
+
+    def write():
+        if not landed:
+            landed.append(snapshot["version"])
+            _HREDIS.set("flags:snapshot", json.dumps(snapshot))
+            _HREDIS.set("flags:snapshot:version", snapshot["version"])
+
+    return write
+
+
 def check_one_snapshot(ctx):
     m = ctx.load("state")
     assert m.publish_snapshot(V1) is True, "the first snapshot must be applied"
@@ -852,6 +871,13 @@ def check_one_snapshot(ctx):
     assert m.publish_snapshot(v3) is True, "version 3 must be applied"
     assert m.evaluate("payments", USER) is None, f"payments is not in version 3, yet it still evaluates to {m.evaluate('payments', USER)}: per-flag keys outlive the snapshot that dropped them"
     assert m.read_snapshot() == v3, f"read_snapshot gives {m.read_snapshot()}, expected version 3 exactly"
+    assert _HREDIS.get("flags:snapshot:version") == "3", f"after version 3, flags:snapshot:version holds {_HREDIS.get('flags:snapshot:version')!r}, expected 3: the version sits beside the snapshot under that key"
+    # Version 4 lands while evaluate reads: the decision and its version must come from one read.
+    write = _land({"version": 4, "flags": {"checkout": _flag(0)}})
+    probes = [ctx.redis_after(key, write) for key in ("flags:snapshot", "flags:snapshot:version")]
+    d = m.evaluate("checkout", USER)
+    assert any(p.fired for p in probes), "evaluate read nothing under flags:snapshot"
+    assert d is not None and d["value"] is (d["version"] == 3), f"version 4 (rollout 0) landed while evaluate was reading version 3 (rollout 100), and evaluate answered {d}: the decision and its version came from two reads. Read the snapshot once"
 
 
 def check_newer_only(ctx):
@@ -865,6 +891,16 @@ def check_newer_only(ctx):
     v3 = {"version": 3, "flags": {"checkout": _flag(0), "payments": _flag(0)}}
     assert m.publish_snapshot(v3) is True, "a newer version (3) must be applied"
     assert m.evaluate("checkout", USER)["version"] == 3, f"after version 3 evaluate answers {m.evaluate('checkout', USER)}"
+    again = m.publish_snapshot({"version": 3, "flags": {"checkout": _flag(100)}})
+    assert again is False and m.read_snapshot() == v3, f"a second publish of version 3 answered {again} and left {m.read_snapshot()}: only a newer version may replace the snapshot, an equal one may not"
+    assert m.publish_snapshot({"version": 10, "flags": {"checkout": _flag(100)}}) is True, "version 10 over version 3 was refused: versions compare as numbers, not as text"
+    assert m.publish_snapshot({"version": 9, "flags": {"checkout": _flag(0)}}) is False, "version 9 replaced version 10: versions compare as numbers, not as text"
+    # Another replica publishes version 12 between two of this publisher's commands.
+    v12 = {"version": 12, "flags": {"checkout": _flag(100)}}
+    probe = ctx.redis_after("flags:snapshot:version", _land(v12))
+    m.publish_snapshot({"version": 11, "flags": {"checkout": _flag(0)}})
+    assert probe.fired, "publishing version 11 never touched flags:snapshot:version"
+    assert m.read_snapshot() == v12, f"version 12 landed while version 11 was being published, and the snapshot is now {m.read_snapshot()}: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script"
 
 
 def check_bucket_per_flag(ctx):
@@ -901,6 +937,17 @@ function consistent(seen, when: string): void {
   for (const d of seen) assert.equal(d.value, d.version === 2, \`a read \${when} answered \${JSON.stringify(d)}: version \${d.version} with the other version's rollout. The rule set was torn between two writes\`);
 }
 
+/** Another replica's publish of snapshot, landing once between two of the learner's commands. */
+function land(ctx, snapshot): () => void {
+  let landed = false;
+  return () => {
+    if (landed) return;
+    landed = true;
+    ctx.redis.set('flags:snapshot', JSON.stringify(snapshot));
+    ctx.redis.set('flags:snapshot:version', String(snapshot.version));
+  };
+}
+
 export async function check_one_snapshot(ctx) {
   const m = ctx.load('state');
   assert.equal(await m.publishSnapshot(V1), true, 'the first snapshot must be applied');
@@ -920,6 +967,14 @@ export async function check_one_snapshot(ctx) {
   const stale = await m.evaluate('payments', USER);
   assert.equal(stale, null, \`payments is not in version 3, yet it still evaluates to \${JSON.stringify(stale)}: per-flag keys outlive the snapshot that dropped them\`);
   assert.deepStrictEqual(await m.readSnapshot(), v3, 'readSnapshot must give version 3 exactly');
+  const stored = ctx.redis.get('flags:snapshot:version');
+  assert.equal(String(stored), '3', \`after version 3, flags:snapshot:version holds \${stored}, expected 3: the version sits beside the snapshot under that key\`);
+  // Version 4 lands while evaluate reads: the decision and its version must come from one read.
+  const write = land(ctx, {version: 4, flags: {checkout: flag(0)}});
+  const reads = ['flags:snapshot', 'flags:snapshot:version'].map(key => ctx.redisAfter(key, write));
+  const d = await m.evaluate('checkout', USER);
+  assert(reads.some(p => p.fired), 'evaluate read nothing under flags:snapshot');
+  assert(d !== null && d.value === (d.version === 3), \`version 4 (rollout 0) landed while evaluate was reading version 3 (rollout 100), and evaluate answered \${JSON.stringify(d)}: the decision and its version came from two reads. Read the snapshot once\`);
 }
 
 export async function check_newer_only(ctx) {
@@ -933,6 +988,20 @@ export async function check_newer_only(ctx) {
   const v3 = {version: 3, flags: {checkout: flag(0), payments: flag(0)}};
   assert.equal(await m.publishSnapshot(v3), true, 'a newer version (3) must be applied');
   assert.equal((await m.evaluate('checkout', USER)).version, 3, 'after version 3 evaluate must answer version 3');
+  const again = await m.publishSnapshot({version: 3, flags: {checkout: flag(100)}});
+  const kept = await m.readSnapshot();
+  const equalMessage = \`a second publish of version 3 answered \${again} and left \${JSON.stringify(kept)}: only a newer version may replace the snapshot, an equal one may not\`;
+  assert.equal(again, false, equalMessage);
+  assert.deepStrictEqual(kept, v3, equalMessage);
+  assert.equal(await m.publishSnapshot({version: 10, flags: {checkout: flag(100)}}), true, 'version 10 over version 3 was refused: versions compare as numbers, not as text');
+  assert.equal(await m.publishSnapshot({version: 9, flags: {checkout: flag(0)}}), false, 'version 9 replaced version 10: versions compare as numbers, not as text');
+  // Another replica publishes version 12 between two of this publisher's commands.
+  const v12 = {version: 12, flags: {checkout: flag(100)}};
+  const probe = ctx.redisAfter('flags:snapshot:version', land(ctx, v12));
+  await m.publishSnapshot({version: 11, flags: {checkout: flag(0)}});
+  assert(probe.fired, 'publishing version 11 never touched flags:snapshot:version');
+  const now = await m.readSnapshot();
+  assert.deepStrictEqual(now, v12, \`version 12 landed while version 11 was being published, and the snapshot is now \${JSON.stringify(now)}: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script\`);
 }
 
 export async function check_bucket_per_flag(ctx) {
@@ -960,6 +1029,7 @@ export async function check_bucket_per_flag(ctx) {
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"flags/hashing"
@@ -1023,6 +1093,21 @@ func stateConsistent(ctx *harness.Ctx, p statePair, when string) {
 	}
 }
 
+// stateLand is another replica's publish of s, landing once between two of the learner's commands.
+func stateLand(ctx *harness.Ctx, s Snapshot) func() any {
+	landed := false
+	return func() any {
+		if landed {
+			return nil
+		}
+		landed = true
+		doc, _ := json.Marshal(s)
+		ctx.Redis.Set("flags:snapshot", string(doc))
+		ctx.Redis.Set("flags:snapshot:version", s.Version)
+		return nil
+	}
+}
+
 func CheckOneSnapshot(ctx *harness.Ctx) {
 	ctx.Equal(statePublish(ctx, stateSnap(1, 0, "checkout", "payments")), true, "the first snapshot must be applied; applied")
 	// A request lands while version 2 is being written: it must see one whole rule set.
@@ -1046,6 +1131,14 @@ func CheckOneSnapshot(ctx *harness.Ctx) {
 	s, err := readSnapshot(stateBg)
 	ctx.NoError(err, "readSnapshot failed")
 	ctx.Assert(s != nil && s.Version == 3 && len(s.Flags) == 1, "readSnapshot gives %+v, expected version 3 with checkout only", s)
+	stored, _ := ctx.Redis.Get("flags:snapshot:version")
+	ctx.Equal(stored, "3", "after version 3, flags:snapshot:version must hold the version beside the snapshot; the value")
+	// Version 4 lands while evaluate reads: the decision and its version must come from one read.
+	write := stateLand(ctx, stateSnap(4, 0, "checkout"))
+	readSnap, readVersion := ctx.Redis.After("flags:snapshot", write), ctx.Redis.After("flags:snapshot:version", write)
+	d := stateEval(ctx, "checkout", stateUser)
+	ctx.Assert(readSnap.Fired || readVersion.Fired, "evaluate read nothing under flags:snapshot")
+	ctx.Assert(d != nil && d.Value == (d.Version == 3), "version 4 (rollout 0) landed while evaluate was reading version 3 (rollout 100), and evaluate answered %+v: the decision and its version came from two reads. Read the snapshot once", d)
 }
 
 func CheckNewerOnly(ctx *harness.Ctx) {
@@ -1059,6 +1152,19 @@ func CheckNewerOnly(ctx *harness.Ctx) {
 	ctx.Assert(d != nil && d.Version == 2 && d.Value, "after the late version 1 evaluate answers %+v, expected version 2 in the rollout", d)
 	ctx.Equal(statePublish(ctx, stateSnap(3, 0, "checkout", "payments")), true, "a newer version (3) must be applied; applied")
 	ctx.Equal(stateEval(ctx, "checkout", stateUser).Version, int64(3), "after version 3, the version evaluate answers")
+	again := statePublish(ctx, stateSnap(3, 100, "checkout"))
+	s, err = readSnapshot(stateBg)
+	ctx.NoError(err, "readSnapshot failed")
+	ctx.Assert(!again && s != nil && s.Version == 3 && len(s.Flags) == 2, "a second publish of version 3 answered %t and left %+v: only a newer version may replace the snapshot, an equal one may not", again, s)
+	ctx.Equal(statePublish(ctx, stateSnap(10, 100, "checkout")), true, "version 10 over version 3 was refused: versions compare as numbers, not as text; applied")
+	ctx.Equal(statePublish(ctx, stateSnap(9, 0, "checkout")), false, "version 9 replaced version 10: versions compare as numbers, not as text; applied")
+	// Another replica publishes version 12 between two of this publisher's commands.
+	probe := ctx.Redis.After("flags:snapshot:version", stateLand(ctx, stateSnap(12, 100, "checkout")))
+	statePublish(ctx, stateSnap(11, 0, "checkout"))
+	ctx.Assert(probe.Fired, "publishing version 11 never touched flags:snapshot:version")
+	s, err = readSnapshot(stateBg)
+	ctx.NoError(err, "readSnapshot failed")
+	ctx.Assert(s != nil && s.Version == 12 && s.Flags["checkout"].Rollout == 100, "version 12 landed while version 11 was being published, and the snapshot is now %+v: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script", s)
 }
 
 func CheckBucketPerFlag(ctx *harness.Ctx) {
@@ -1103,6 +1209,7 @@ func CheckBucketPerFlag(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1148,6 +1255,16 @@ void stateConsistent(harness::Ctx& ctx, const StatePair& p, const std::string& w
   }
 }
 
+// Another replica's publish of snapshot, landing once between two of the learner's commands.
+std::function<void()> stateLand(harness::Ctx& ctx, const nlohmann::json& snapshot, std::shared_ptr<bool> landed) {
+  return [&ctx, snapshot, landed] {
+    if (*landed) return;
+    *landed = true;
+    ctx.Redis.Set("flags:snapshot", snapshot.dump());
+    ctx.Redis.Set("flags:snapshot:version", std::to_string(snapshot.at("version").get<long long>()));
+  };
+}
+
 }  // namespace
 
 void CheckOneSnapshot(harness::Ctx& ctx) {
@@ -1165,6 +1282,15 @@ void CheckOneSnapshot(harness::Ctx& ctx) {
   ctx.Assert(!stale, "payments is not in version 3, yet it still evaluates to %s: per-flag keys outlive the snapshot that dropped them", stale ? stale->dump() : "");
   const auto s = readSnapshot();
   ctx.Assert(s && *s == stateSnap(3, 100, {"checkout"}), "readSnapshot gives %s, expected version 3 exactly", s ? s->dump() : "nothing");
+  ctx.Equal(ctx.Redis.Get("flags:snapshot:version").value_or(""), std::string("3"), "after version 3, flags:snapshot:version must hold the version beside the snapshot; the value");
+  // Version 4 lands while evaluate reads: the decision and its version must come from one read.
+  auto landed = std::make_shared<bool>(false);
+  const auto write = stateLand(ctx, stateSnap(4, 0, {"checkout"}), landed);
+  ctx.Redis.After("flags:snapshot", write);
+  ctx.Redis.After("flags:snapshot:version", write);
+  const auto d = evaluate("checkout", kStateUser);
+  ctx.Assert(*landed, "evaluate read nothing under flags:snapshot");
+  ctx.Assert(d && d->value("value", false) == (d->value("version", 0LL) == 3), "version 4 (rollout 0) landed while evaluate was reading version 3 (rollout 100), and evaluate answered %s: the decision and its version came from two reads. Read the snapshot once", d ? d->dump() : "nothing");
 }
 
 void CheckNewerOnly(harness::Ctx& ctx) {
@@ -1177,6 +1303,18 @@ void CheckNewerOnly(harness::Ctx& ctx) {
   ctx.Assert(d && d->value("version", 0LL) == 2 && d->value("value", false), "after the late version 1 evaluate answers %s, expected version 2 in the rollout", d ? d->dump() : "nothing");
   ctx.Equal(publishSnapshot(stateSnap(3, 0, {"checkout", "payments"})), true, "a newer version (3) must be applied; applied");
   ctx.Equal(evaluate("checkout", kStateUser)->value("version", 0LL), 3LL, "after version 3, the version evaluate answers");
+  const bool again = publishSnapshot(stateSnap(3, 100, {"checkout"}));
+  const auto kept = readSnapshot();
+  ctx.Assert(!again && kept && *kept == stateSnap(3, 0, {"checkout", "payments"}), "a second publish of version 3 answered %t and left %s: only a newer version may replace the snapshot, an equal one may not", again, kept ? kept->dump() : "nothing");
+  ctx.Equal(publishSnapshot(stateSnap(10, 100, {"checkout"})), true, "version 10 over version 3 was refused: versions compare as numbers, not as text; applied");
+  ctx.Equal(publishSnapshot(stateSnap(9, 0, {"checkout"})), false, "version 9 replaced version 10: versions compare as numbers, not as text; applied");
+  // Another replica publishes version 12 between two of this publisher's commands.
+  auto landed = std::make_shared<bool>(false);
+  ctx.Redis.After("flags:snapshot:version", stateLand(ctx, stateSnap(12, 100, {"checkout"}), landed));
+  publishSnapshot(stateSnap(11, 0, {"checkout"}));
+  ctx.Assert(*landed, "publishing version 11 never touched flags:snapshot:version");
+  const auto now = readSnapshot();
+  ctx.Assert(now && *now == stateSnap(12, 100, {"checkout"}), "version 12 landed while version 11 was being published, and the snapshot is now %s: version 11 overwrote a newer one because the compare and the write were separate round trips. Compare and replace in one script", now ? now->dump() : "nothing");
 }
 
 void CheckBucketPerFlag(harness::Ctx& ctx) {

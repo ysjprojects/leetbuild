@@ -24,7 +24,7 @@ records which steps finished; a finished run's checkpoint stays forever.
 - \`blobs.put(output)\` first; the hash holds only its reference, \`output_ref\`.
 - The script appends \`from_step\` to \`completed\` (comma-separated, in order).
 - A finished run (\`to_step\` \`""\`) expires after \`RETENTION_S\`, seven days (the same name in each
-  language's casing); a running checkpoint has no expiry.`,
+  language's casing), from the command that finishes it; a running checkpoint has no expiry.`,
   sequence: {
     participants: ['Worker', 'Blob store', 'Redis'],
     messages: [
@@ -45,7 +45,7 @@ records which steps finished; a finished run's checkpoint stays forever.
       id: 'cas',
       title: 'Advance is a compare-and-swap',
       detail:
-        'A second worker advances the run from `create_account` right after the first one read the checkpoint: exactly one of the two gets `True`. The starter compares in the client between an `HGET` and an `HSET`, so both win.',
+        "A second worker advances the run from `create_account` right after the first one read the checkpoint: exactly one of the two gets `True`, and `output_ref` names the winner's output. The starter compares in the client between an `HGET` and an `HSET`, so both win.",
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /ARGV\[1\]/],
@@ -77,7 +77,7 @@ records which steps finished; a finished run's checkpoint stays forever.
       id: 'trail',
       title: 'The checkpoint records the finished steps',
       detail:
-        'After `create_account` and `send_welcome` finish, `completed` is `create_account,send_welcome`, and a stale advance from `create_account` returns `False` and leaves it alone. The starter keeps only the cursor.',
+        'After `create_account` and `send_welcome` finish, `completed` is `create_account,send_welcome`, and a stale advance from `create_account` returns `False` and leaves the hash alone, `updated_at` included. The starter keeps only the cursor.',
       match: {
         python: {all: [/'completed'|"completed"/]},
         typescript: {all: [/'completed'|"completed"/]},
@@ -90,7 +90,7 @@ records which steps finished; a finished run's checkpoint stays forever.
       id: 'retention',
       title: 'Only a finished run expires',
       detail:
-        'A running checkpoint has no TTL; once the last step advances to `""` it expires in seven days. The starter never sets an expiry, and expiring on every advance would delete a run that is waiting on a slow step.',
+        'A running checkpoint has no TTL; once the last step advances to `""` it expires in seven days, already right after the command that finished it. The starter never sets an expiry, and expiring on every advance would delete a run that is waiting on a slow step.',
       match: {
         python: {all: [/EXPIRE/i, /RETENTION_S/]},
         typescript: {all: [/EXPIRE/i, /RETENTION_S/]},
@@ -403,6 +403,9 @@ def check_cas(ctx):
     assert winners == 1, f"two workers advanced r1 from create_account at the same moment and {winners} were told they won (first: {mine}, second: {rival.result}): both go on to run send_welcome. Compare and write in one script"
     step = ctx.redis.hget(KEY, "current_step")
     assert step == "send_welcome", f"after the race current_step is {step!r}, expected send_welcome"
+    winner = '{"worker": "w1"}' if mine else '{"worker": "w2"}'
+    ref = ctx.redis.hget(KEY, "output_ref") or ""
+    assert ref and ctx.redis.get(ref) == winner, f"after the race output_ref names {ctx.redis.get(ref) if ref else None!r}, expected the winner's output {winner}: the loser must write nothing"
 
 
 def check_ref(ctx):
@@ -427,6 +430,8 @@ def check_trail(ctx):
     assert completed == "create_account,send_welcome", f"completed is {completed!r} after create_account and send_welcome finished, expected 'create_account,send_welcome': nothing says which steps ran"
     step = ctx.redis.hget(KEY, "current_step")
     assert step == "notify_sales", f"current_step is {step!r}, expected notify_sales"
+    updated = ctx.redis.hget(KEY, "updated_at")
+    assert updated == "2100", f"after the stale advance at 2200 updated_at is {updated!r}, expected '2100': an advance that returns False writes nothing"
 
 
 def check_retention(ctx):
@@ -435,10 +440,17 @@ def check_retention(ctx):
     m.advance("r1", "create_account", "send_welcome", "{}", 2000)
     ttl = ctx.redis.ttl(KEY)
     assert ttl == -1, f"a running checkpoint has a TTL of {ttl} s: a run waiting on a slow step would lose its state. Only a finished run expires"
+    # Read the TTL the moment the finishing advance has touched the checkpoint, before anything else runs.
+    seen = ctx.redis_after(KEY, lambda: (ctx.redis.hget(KEY, "current_step"), ctx.redis.ttl(KEY)))
     assert m.advance("r1", "send_welcome", "", "{}", 2100) is True, "advancing the last step to '' must return True"
     assert ctx.redis.hget(KEY, "current_step") == "", f"a finished run's current_step is {ctx.redis.hget(KEY, 'current_step')!r}, expected ''"
     ttl = ctx.redis.ttl(KEY)
     assert RETENTION - 60 <= ttl <= RETENTION, f"the finished run's checkpoint has a TTL of {ttl} s, expected seven days (RETENTION_S = {RETENTION})"
+    assert seen.fired, "the finishing advance never touched run:r1:checkpoint"
+    if seen.error is not None:
+        raise seen.error
+    step, ttl = seen.result
+    assert step != "" or RETENTION - 60 <= ttl <= RETENTION, f"right after the command that finished the run its checkpoint had a TTL of {ttl} s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script"
 `,
     typescript: `const KEY = 'run:r1:checkpoint';
 const RETENTION = 7 * 24 * 3600;
@@ -459,6 +471,10 @@ export async function check_cas(ctx) {
   const winners = [mine, theirs].filter(won => won === true).length;
   assert.equal(winners, 1, \`two workers advanced r1 from create_account at the same moment and \${winners} were told they won (first: \${mine}, second: \${theirs}): both go on to run send_welcome. Compare and write in one script\`);
   assert.equal(ctx.redis.hget(KEY, 'current_step'), 'send_welcome', 'after the race current_step must be send_welcome');
+  const winner = mine === true ? '{"worker": "w1"}' : '{"worker": "w2"}';
+  const ref = ctx.redis.hget(KEY, 'output_ref') ?? '';
+  const stored = ref === '' ? null : ctx.redis.get(ref);
+  assert.equal(stored, winner, \`after the race output_ref names \${JSON.stringify(stored)}, expected the winner's output \${winner}: the loser must write nothing\`);
 }
 
 export async function check_ref(ctx) {
@@ -482,6 +498,8 @@ export async function check_trail(ctx) {
   const completed = ctx.redis.hget(KEY, 'completed');
   assert.equal(completed, 'create_account,send_welcome', \`completed is \${JSON.stringify(completed)} after create_account and send_welcome finished: nothing says which steps ran\`);
   assert.equal(ctx.redis.hget(KEY, 'current_step'), 'notify_sales', 'current_step must be notify_sales');
+  const updated = ctx.redis.hget(KEY, 'updated_at');
+  assert.equal(updated, '2100', \`after the stale advance at 2200 updated_at is \${JSON.stringify(updated)}, expected '2100': an advance that returns false writes nothing\`);
 }
 
 export async function check_retention(ctx) {
@@ -490,10 +508,19 @@ export async function check_retention(ctx) {
   await m.advance('r1', 'create_account', 'send_welcome', '{}', 2000);
   let ttl = ctx.redis.ttl(KEY);
   assert.equal(ttl, -1, \`a running checkpoint has a TTL of \${ttl} s: a run waiting on a slow step would lose its state. Only a finished run expires\`);
+  // Read the TTL the moment the finishing advance has touched the checkpoint, before anything else runs.
+  const seen = ctx.redisAfter(KEY, () => [ctx.redis.hget(KEY, 'current_step'), ctx.redis.ttl(KEY)]);
   assert.equal(await m.advance('r1', 'send_welcome', '', '{}', 2100), true, "advancing the last step to '' must return true");
   assert.equal(ctx.redis.hget(KEY, 'current_step'), '', "a finished run's current_step must be ''");
   ttl = ctx.redis.ttl(KEY);
   assert(RETENTION - 60 <= ttl && ttl <= RETENTION, \`the finished run's checkpoint has a TTL of \${ttl} s, expected seven days (RETENTION_S = \${RETENTION})\`);
+  assert(seen.fired, 'the finishing advance never touched run:r1:checkpoint');
+  if (seen.error !== undefined) throw seen.error;
+  const [step, early] = await seen.result;
+  assert(
+    step !== '' || (RETENTION - 60 <= early && early <= RETENTION),
+    \`right after the command that finished the run its checkpoint had a TTL of \${early} s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script\`,
+  );
 }
 `,
     go: `package main
@@ -516,13 +543,13 @@ func stateStart(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", stateKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000")
 }
 
-func mustAdvance(ctx *harness.Ctx, from, to, output string, now int64) bool {
+func hMustAdvance(ctx *harness.Ctx, from, to, output string, now int64) bool {
 	moved, err := advance(stateBg, "r1", from, to, output, now)
 	ctx.NoError(err, "advance(r1, %q, %q) failed", from, to)
 	return moved
 }
 
-func hget(ctx *harness.Ctx, field string) string {
+func hStateField(ctx *harness.Ctx, field string) string {
 	value, _ := ctx.Redis.HGet(stateKey, field)
 	return value
 }
@@ -535,7 +562,7 @@ func CheckCas(ctx *harness.Ctx) {
 		ctx.NoError(err, "the second worker's advance failed")
 		return moved
 	})
-	mine := mustAdvance(ctx, "create_account", "send_welcome", \`{"worker": "w1"}\`, 2000)
+	mine := hMustAdvance(ctx, "create_account", "send_welcome", \`{"worker": "w1"}\`, 2000)
 	ctx.Assert(rival.Fired, "advance never touched run:r1:checkpoint")
 	ctx.Assert(rival.Err == nil, "the second worker's advance failed: %v", rival.Err)
 	winners := 0
@@ -545,13 +572,19 @@ func CheckCas(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(winners == 1, "two workers advanced r1 from create_account at the same moment and %d were told they won (first: %v, second: %v): both go on to run send_welcome. Compare and write in one script", winners, mine, rival.Result)
-	ctx.Equal(hget(ctx, "current_step"), "send_welcome", "after the race, current_step")
+	ctx.Equal(hStateField(ctx, "current_step"), "send_welcome", "after the race, current_step")
+	winner := \`{"worker": "w2"}\`
+	if mine {
+		winner = \`{"worker": "w1"}\`
+	}
+	stored, _ := ctx.Redis.Get(hStateField(ctx, "output_ref"))
+	ctx.Equal(stored, winner, "after the race the loser must write nothing; the output output_ref names")
 }
 
 func CheckRef(ctx *harness.Ctx) {
 	stateStart(ctx)
 	output := \`{"account": "\` + strings.Repeat("a", 100000) + \`"}\`
-	ctx.Equal(mustAdvance(ctx, "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved")
+	ctx.Equal(hMustAdvance(ctx, "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved")
 	var big []string
 	for name, value := range ctx.Redis.HGetAll(stateKey) {
 		if len(value) > 1024 {
@@ -559,28 +592,41 @@ func CheckRef(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(big) == 0, "the checkpoint hash holds the field(s) %q over 1 KB: the 100 KB output belongs in the blob store, the hash holds its reference", big)
-	ref := hget(ctx, "output_ref")
+	ref := hStateField(ctx, "output_ref")
 	stored, ok := ctx.Redis.Get(ref)
 	ctx.Assert(ref != "" && ok && stored == output, "output_ref is %q: it must name the blob holding the output (blobs.Put returns it)", ref)
 }
 
 func CheckTrail(ctx *harness.Ctx) {
 	stateStart(ctx)
-	ctx.Equal(mustAdvance(ctx, "create_account", "send_welcome", "{}", 2000), true, "advancing from create_account; moved")
-	ctx.Equal(mustAdvance(ctx, "send_welcome", "notify_sales", "{}", 2100), true, "advancing from send_welcome; moved")
-	ctx.Equal(mustAdvance(ctx, "create_account", "send_welcome", "{}", 2200), false, "a stale advance from create_account, two steps later; moved")
-	ctx.Equal(hget(ctx, "completed"), "create_account,send_welcome", "after create_account and send_welcome finished (otherwise nothing says which steps ran), completed")
-	ctx.Equal(hget(ctx, "current_step"), "notify_sales", "current_step")
+	ctx.Equal(hMustAdvance(ctx, "create_account", "send_welcome", "{}", 2000), true, "advancing from create_account; moved")
+	ctx.Equal(hMustAdvance(ctx, "send_welcome", "notify_sales", "{}", 2100), true, "advancing from send_welcome; moved")
+	ctx.Equal(hMustAdvance(ctx, "create_account", "send_welcome", "{}", 2200), false, "a stale advance from create_account, two steps later; moved")
+	ctx.Equal(hStateField(ctx, "completed"), "create_account,send_welcome", "after create_account and send_welcome finished (otherwise nothing says which steps ran), completed")
+	ctx.Equal(hStateField(ctx, "current_step"), "notify_sales", "current_step")
+	ctx.Equal(hStateField(ctx, "updated_at"), "2100", "after the stale advance at 2200 (an advance that returns false writes nothing), updated_at")
+}
+
+type hTTLSeen struct {
+	step string
+	ttl  int64
 }
 
 func CheckRetention(ctx *harness.Ctx) {
 	stateStart(ctx)
-	mustAdvance(ctx, "create_account", "send_welcome", "{}", 2000)
+	hMustAdvance(ctx, "create_account", "send_welcome", "{}", 2000)
 	ctx.Equal(ctx.Redis.TTL(stateKey), int64(-1), "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL")
-	ctx.Equal(mustAdvance(ctx, "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved")
-	ctx.Equal(hget(ctx, "current_step"), "", "a finished run's current_step")
+	// Read the TTL the moment the finishing advance has touched the checkpoint, before anything else runs.
+	seen := ctx.Redis.After(stateKey, func() any {
+		return hTTLSeen{hStateField(ctx, "current_step"), ctx.Redis.TTL(stateKey)}
+	})
+	ctx.Equal(hMustAdvance(ctx, "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved")
+	ctx.Equal(hStateField(ctx, "current_step"), "", "a finished run's current_step")
 	ttl := ctx.Redis.TTL(stateKey)
 	ctx.Assert(stateRetention-60 <= ttl && ttl <= stateRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (retentionSeconds = %d)", ttl, stateRetention)
+	ctx.Assert(seen.Fired, "the finishing advance never touched run:r1:checkpoint")
+	early, _ := seen.Result.(hTTLSeen)
+	ctx.Assert(early.step != "" || (stateRetention-60 <= early.ttl && early.ttl <= stateRetention), "right after the command that finished the run its checkpoint had a TTL of %d s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script", early.ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -595,22 +641,28 @@ namespace {
 const std::string kKey = "run:r1:checkpoint";
 constexpr long long kRetention = 7 * 24 * 3600;
 
-void start(harness::Ctx& ctx) { ctx.Redis.Do("HSET", kKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000"); }
+void hStateStart(harness::Ctx& ctx) { ctx.Redis.Do("HSET", kKey, "current_step", "create_account", "completed", "", "output_ref", "", "updated_at", "1000"); }
 
-std::string field(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
+std::string hStateField(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
 
-struct Rival {
+struct HRival {
   bool fired = false;
   bool moved = false;
   std::optional<std::string> err;
 };
 
+struct HTTLSeen {
+  bool fired = false;
+  std::string step;
+  long long ttl = 0;
+};
+
 }  // namespace
 
 void CheckCas(harness::Ctx& ctx) {
-  start(ctx);
+  hStateStart(ctx);
   // A duplicate worker advances the run right after the first worker touched the checkpoint.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After(kKey, [rival] {
     rival->fired = true;
     try {
@@ -624,11 +676,13 @@ void CheckCas(harness::Ctx& ctx) {
   ctx.Assert(!rival->err, "the second worker's advance failed: %s", rival->err.value_or(""));
   const int winners = (mine ? 1 : 0) + (rival->moved ? 1 : 0);
   ctx.Assert(winners == 1, "two workers advanced r1 from create_account at the same moment and %d were told they won (first: %t, second: %t): both go on to run send_welcome. Compare and write in one script", winners, mine, rival->moved);
-  ctx.Equal(field(ctx, "current_step"), "send_welcome", "after the race, current_step");
+  ctx.Equal(hStateField(ctx, "current_step"), "send_welcome", "after the race, current_step");
+  const std::string winner = mine ? R"({"worker": "w1"})" : R"({"worker": "w2"})";
+  ctx.Equal(ctx.Redis.Get(hStateField(ctx, "output_ref")).value_or(""), winner, "after the race the loser must write nothing; the output output_ref names");
 }
 
 void CheckRef(harness::Ctx& ctx) {
-  start(ctx);
+  hStateStart(ctx);
   const std::string output = R"({"account": ")" + std::string(100000, 'a') + R"("})";
   ctx.Equal(advance("r1", "create_account", "send_welcome", output, 2000), true, "advancing a run at create_account; moved");
   std::vector<std::string> big;
@@ -636,27 +690,37 @@ void CheckRef(harness::Ctx& ctx) {
     if (value.size() > 1024) big.push_back(name);
   }
   ctx.Assert(big.empty(), "the checkpoint hash holds the field(s) %q over 1 KB: the 100 KB output belongs in the blob store, the hash holds its reference", big);
-  const std::string ref = field(ctx, "output_ref");
+  const std::string ref = hStateField(ctx, "output_ref");
   ctx.Assert(!ref.empty() && ctx.Redis.Get(ref).value_or("") == output, "output_ref is %q: it must name the blob holding the output (blobs::put returns it)", ref);
 }
 
 void CheckTrail(harness::Ctx& ctx) {
-  start(ctx);
+  hStateStart(ctx);
   ctx.Equal(advance("r1", "create_account", "send_welcome", "{}", 2000), true, "advancing from create_account; moved");
   ctx.Equal(advance("r1", "send_welcome", "notify_sales", "{}", 2100), true, "advancing from send_welcome; moved");
   ctx.Equal(advance("r1", "create_account", "send_welcome", "{}", 2200), false, "a stale advance from create_account, two steps later; moved");
-  ctx.Equal(field(ctx, "completed"), "create_account,send_welcome", "after create_account and send_welcome finished (otherwise nothing says which steps ran), completed");
-  ctx.Equal(field(ctx, "current_step"), "notify_sales", "current_step");
+  ctx.Equal(hStateField(ctx, "completed"), "create_account,send_welcome", "after create_account and send_welcome finished (otherwise nothing says which steps ran), completed");
+  ctx.Equal(hStateField(ctx, "current_step"), "notify_sales", "current_step");
+  ctx.Equal(hStateField(ctx, "updated_at"), "2100", "after the stale advance at 2200 (an advance that returns false writes nothing), updated_at");
 }
 
 void CheckRetention(harness::Ctx& ctx) {
-  start(ctx);
+  hStateStart(ctx);
   advance("r1", "create_account", "send_welcome", "{}", 2000);
   ctx.Equal(ctx.Redis.TTL(kKey), -1LL, "a running checkpoint must not expire (a run waiting on a slow step would lose its state); its TTL");
+  // Read the TTL the moment the finishing advance has touched the checkpoint, before anything else runs.
+  auto seen = std::make_shared<HTTLSeen>();
+  ctx.Redis.After(kKey, [seen, &ctx] {
+    seen->fired = true;
+    seen->step = hStateField(ctx, "current_step");
+    seen->ttl = ctx.Redis.TTL(kKey);
+  });
   ctx.Equal(advance("r1", "send_welcome", "", "{}", 2100), true, "advancing the last step to ''; moved");
-  ctx.Equal(field(ctx, "current_step"), "", "a finished run's current_step");
+  ctx.Equal(hStateField(ctx, "current_step"), "", "a finished run's current_step");
   const long long ttl = ctx.Redis.TTL(kKey);
   ctx.Assert(kRetention - 60 <= ttl && ttl <= kRetention, "the finished run's checkpoint has a TTL of %d s, expected seven days (kRetentionSeconds = %d)", ttl, kRetention);
+  ctx.Assert(seen->fired, "the finishing advance never touched run:r1:checkpoint");
+  ctx.Assert(!seen->step.empty() || (kRetention - 60 <= seen->ttl && seen->ttl <= kRetention), "right after the command that finished the run its checkpoint had a TTL of %d s: an expiry set by a second command is lost when the worker stops in between. Finish and expire in the one script", seen->ttl);
 }
 `,
   },

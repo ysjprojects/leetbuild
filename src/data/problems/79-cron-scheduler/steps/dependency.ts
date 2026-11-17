@@ -52,7 +52,7 @@ service JobRunner {
       id: 'deadline',
       title: 'Bounds every Trigger with a 3 s deadline',
       detail:
-        'A job service that answers in 2 s fires the window; one that takes 10 s ends it as `error` after about 3 s. The starter waits as long as the job service does.',
+        'A job service that answers in 2 s fires two windows of one pass, each Trigger with its own 3 s deadline; one that takes 10 s ends the window as `error` after about 3 s and one call. The starter waits as long as the job service does.',
       match: {
         python: {all: [/stub\.Trigger\([^\n]*timeout\s*=\s*(DEADLINE_S|3(\.0)?)\b/]},
         typescript: {all: [/\.Trigger\([\s\S]{0,200}?deadline:\s*Date\.now\(\)\s*\+\s*(DEADLINE_MS|3000)\b/]},
@@ -71,7 +71,7 @@ service JobRunner {
       id: 'single-attempt',
       title: 'Sends one Trigger per window and records the failure',
       detail:
-        'Against a job service that answers UNAVAILABLE, one window gets exactly one Trigger and its ledger row is `error:trigger_failed`. The starter calls again until a call succeeds.',
+        'Against a job service that answers UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED or INTERNAL, each window gets exactly one Trigger and its ledger row is `error:trigger_failed`. The starter calls again until a call succeeds.',
       match: {
         python: {all: [/stub\.Trigger\(/], none: [/while\s+True/]},
         typescript: {all: [/\.Trigger\(/], none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/]},
@@ -110,7 +110,7 @@ service JobRunner {
       id: 'catch-up-cap',
       title: 'catch_up replays at most five windows per pass',
       detail:
-        'Eight missed windows of a `catch_up` schedule fire the five oldest, in order; the three newest get no row. The starter fires all eight.',
+        'Eight missed windows of a `catch_up` schedule, passed in no particular order, fire the five oldest, oldest first; the three newest get no row. The starter fires all eight.',
       match: {
         python: {all: [/MAX_CATCH_UP/]},
         typescript: {all: [/MAX_CATCH_UP/]},
@@ -663,25 +663,35 @@ def _ledger():
 def check_deadline(ctx):
     m, schedule = _world(ctx, "catch_up")
     ctx.grpc.set_latency("Trigger", 2.0)
-    out = _run(ctx, m, schedule, [W])
-    assert out.get(W) == "fired", f"a job service that answers in 2 s ended the window {out.get(W)!r}, expected fired"
-    call = ctx.grpc.calls_to("Trigger")[0]
-    assert call.timeout is not None, "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it"
-    assert 2.5 <= call.timeout <= 3.5, f"the Trigger deadline is {call.timeout} s, expected about 3 s"
+    # Two windows in one pass: each Trigger carries its own 3 s, not what is left of the pass's.
+    out = _run(ctx, m, schedule, [W, W + 300])
+    assert out.get(W) == "fired" and out.get(W + 300) == "fired", f"a job service that answers in 2 s ended two windows of one pass {out}, expected both fired: every Trigger gets its own 3 s deadline"
+    for call in ctx.grpc.calls_to("Trigger"):
+        assert call.timeout is not None, "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it"
+        assert 2.5 <= call.timeout <= 3.5, f"a Trigger deadline is {call.timeout} s, expected about 3 s for every call"
     ctx.grpc.set_latency("Trigger", 10.0)
-    out = _run(ctx, m, schedule, [W + 300])
-    assert out.get(W + 300) == "error", f"a job service that takes 10 s ended the window {out.get(W + 300)!r}, expected error once the 3 s deadline passed"
-    assert _ledger().get(W + 300) == ("error", "trigger_failed"), f"the ledger row for the timed-out window is {_ledger().get(W + 300)}, expected error/trigger_failed"
+    before = ctx.clock.time()
+    out = _run(ctx, m, schedule, [W + 600])
+    waited = ctx.clock.time() - before
+    assert out.get(W + 600) == "error", f"a job service that takes 10 s ended the window {out.get(W + 600)!r}, expected error once the 3 s deadline passed"
+    calls = len(ctx.grpc.calls_to("Trigger")) - 2
+    assert calls == 1, f"the timed-out window got {calls} Trigger calls, expected 1: the job service may have started the run, so a second call can run it twice"
+    assert waited <= 3.5, f"the timed-out window took {waited:.1f} s, expected about 3 s"
+    assert _ledger().get(W + 600) == ("error", "trigger_failed"), f"the ledger row for the timed-out window is {_ledger().get(W + 600)}, expected error/trigger_failed"
 
 
 def check_single_attempt(ctx):
     m, schedule = _world(ctx, "catch_up")
-    ctx.grpc.fail("Trigger", grpc.StatusCode.UNAVAILABLE, "job service restarting", times=10)
-    out = _run(ctx, m, schedule, [W])
-    calls = len(ctx.grpc.calls_to("Trigger"))
-    assert calls == 1, f"one window against a job service that answers UNAVAILABLE got {calls} Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides"
-    assert out.get(W) == "error", f"run_missed returned {out} for the failed window, expected error"
-    assert _ledger() == {W: ("error", "trigger_failed")}, f"the ledger runs:s1 holds {_ledger()}, expected the window as error/trigger_failed"
+    codes = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL)
+    for k, code in enumerate(codes):
+        window = W + 300 * k
+        before = len(ctx.grpc.calls_to("Trigger"))
+        ctx.grpc.fail("Trigger", code, "job service restarting", times=1)
+        out = _run(ctx, m, schedule, [window])
+        calls = len(ctx.grpc.calls_to("Trigger")) - before
+        assert calls == 1, f"one window against a job service that answers {code.name} got {calls} Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides"
+        assert out.get(window) == "error", f"run_missed returned {out} for the window that failed with {code.name}, expected error"
+        assert _ledger().get(window) == ("error", "trigger_failed"), f"the ledger row for the window that failed with {code.name} is {_ledger().get(window)}, expected error/trigger_failed"
 
 
 def check_policy_skip(ctx):
@@ -709,7 +719,8 @@ def check_fire_once(ctx):
 def check_catch_up_cap(ctx):
     m, schedule = _world(ctx, "catch_up")
     missed = _missed(8)
-    _run(ctx, m, schedule, missed)
+    # The caller's list is in no particular order: the oldest five are the oldest by time.
+    _run(ctx, m, schedule, [missed[k] for k in (3, 7, 0, 5, 1, 6, 2, 4)])
     expected = [format_instant(w) for w in missed[:5]]
     assert _triggered(ctx) == expected, f"a catch_up schedule with 8 missed windows triggered {_triggered(ctx)}, expected the 5 oldest in order: an unbounded catch-up turns one pause into a burst on the job's database"
     assert _ledger() == {w: ("fired", "") for w in missed[:5]}, f"the ledger runs:s1 holds {_ledger()}, expected the 5 oldest fired and the 3 newest without a row, owed to the next pass"
@@ -761,25 +772,37 @@ async function ledger(): Promise<Record<string, string>> {
 export async function check_deadline(ctx) {
   const {m, schedule} = await world(ctx, 'catch_up');
   ctx.grpc.setLatency('Trigger', 2.0);
-  let out = await run(ctx, m, schedule, [W]);
-  assert.equal(out.get(W), 'fired', \`a job service that answers in 2 s ended the window \${JSON.stringify(out.get(W))}, expected fired\`);
-  const call = ctx.grpc.callsTo('Trigger')[0];
-  assert(call.timeout !== null, "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it");
-  assert(2.5 <= call.timeout && call.timeout <= 3.5, \`the Trigger deadline is \${call.timeout} s, expected about 3 s\`);
+  // Two windows in one pass: each Trigger carries its own 3 s, not what is left of the pass's.
+  let out = await run(ctx, m, schedule, [W, W + 300]);
+  assert(out.get(W) === 'fired' && out.get(W + 300) === 'fired', \`a job service that answers in 2 s ended two windows of one pass \${JSON.stringify([...out])}, expected both fired: every Trigger gets its own 3 s deadline\`);
+  for (const call of ctx.grpc.callsTo('Trigger')) {
+    assert(call.timeout !== null, "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it");
+    assert(2.5 <= call.timeout && call.timeout <= 3.5, \`a Trigger deadline is \${call.timeout} s, expected about 3 s for every call\`);
+  }
   ctx.grpc.setLatency('Trigger', 10.0);
-  out = await run(ctx, m, schedule, [W + 300]);
-  assert.equal(out.get(W + 300), 'error', \`a job service that takes 10 s ended the window \${JSON.stringify(out.get(W + 300))}, expected error once the 3 s deadline passed\`);
-  assert.equal((await ledger())[String(W + 300)], 'error:trigger_failed', 'the ledger row for the timed-out window must be error/trigger_failed');
+  const before = ctx.clock.now();
+  out = await run(ctx, m, schedule, [W + 600]);
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert.equal(out.get(W + 600), 'error', \`a job service that takes 10 s ended the window \${JSON.stringify(out.get(W + 600))}, expected error once the 3 s deadline passed\`);
+  const calls = ctx.grpc.callsTo('Trigger').length - 2;
+  assert.equal(calls, 1, \`the timed-out window got \${calls} Trigger calls, expected 1: the job service may have started the run, so a second call can run it twice\`);
+  assert(waited <= 3.5, \`the timed-out window took \${waited.toFixed(1)} s, expected about 3 s\`);
+  assert.equal((await ledger())[String(W + 600)], 'error:trigger_failed', 'the ledger row for the timed-out window must be error/trigger_failed');
 }
 
 export async function check_single_attempt(ctx) {
   const {m, schedule} = await world(ctx, 'catch_up');
-  ctx.grpc.fail('Trigger', ctx.grpc.status.UNAVAILABLE, 'job service restarting', 10);
-  const out = await run(ctx, m, schedule, [W]);
-  const calls = ctx.grpc.callsTo('Trigger').length;
-  assert.equal(calls, 1, \`one window against a job service that answers UNAVAILABLE got \${calls} Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides\`);
-  assert.equal(out.get(W), 'error', \`runMissed resolved \${JSON.stringify([...out])} for the failed window, expected error\`);
-  assert.deepEqual(await ledger(), {[String(W)]: 'error:trigger_failed'}, \`the ledger runs:s1 holds \${JSON.stringify(await ledger())}, expected the window as error/trigger_failed\`);
+  const codes = ['UNAVAILABLE', 'DEADLINE_EXCEEDED', 'RESOURCE_EXHAUSTED', 'INTERNAL'];
+  for (const [k, code] of codes.entries()) {
+    const window = W + 300 * k;
+    const before = ctx.grpc.callsTo('Trigger').length;
+    ctx.grpc.fail('Trigger', ctx.grpc.status[code], 'job service restarting', 1);
+    const out = await run(ctx, m, schedule, [window]);
+    const calls = ctx.grpc.callsTo('Trigger').length - before;
+    assert.equal(calls, 1, \`one window against a job service that answers \${code} got \${calls} Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides\`);
+    assert.equal(out.get(window), 'error', \`runMissed resolved \${JSON.stringify([...out])} for the window that failed with \${code}, expected error\`);
+    assert.equal((await ledger())[String(window)], 'error:trigger_failed', \`the ledger row for the window that failed with \${code} must be error/trigger_failed\`);
+  }
 }
 
 export async function check_policy_skip(ctx) {
@@ -806,7 +829,8 @@ export async function check_fire_once(ctx) {
 export async function check_catch_up_cap(ctx) {
   const {m, schedule} = await world(ctx, 'catch_up');
   const missed = missedWindows(8);
-  await run(ctx, m, schedule, missed);
+  // The caller's list is in no particular order: the oldest five are the oldest by time.
+  await run(ctx, m, schedule, [3, 7, 0, 5, 1, 6, 2, 4].map(k => missed[k]));
   const expected = missed.slice(0, 5).map(formatInstant);
   assert.deepEqual(triggered(ctx), expected, \`a catch_up schedule with 8 missed windows triggered \${JSON.stringify(triggered(ctx))}, expected the 5 oldest in order: an unbounded catch-up turns one pause into a burst on the job's database\`);
   const rows = Object.fromEntries(missed.slice(0, 5).map(w => [String(w), 'fired:']));
@@ -905,25 +929,40 @@ func clientLedger(ctx *harness.Ctx) map[int64]string {
 func CheckDeadline(ctx *harness.Ctx) {
 	s := clientWorld(ctx, "catch_up")
 	ctx.GRPC.SetLatency("Trigger", 2.0, "")
-	out := clientRun(ctx, s, []int64{clientWindow})
-	ctx.Equal(out[clientWindow], "fired", "a job service that answers in 2 s must fire the window; the outcome")
-	call := ctx.GRPC.CallsTo("Trigger", "")[0]
-	ctx.Assert(call.HasDeadline(), "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it")
-	ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "the Trigger deadline is %v, expected about 3 s", call.Timeout)
+	// Two windows in one pass: each Trigger carries its own 3 s, not what is left of the pass's.
+	out := clientRun(ctx, s, []int64{clientWindow, clientWindow + 300})
+	ctx.Assert(out[clientWindow] == "fired" && out[clientWindow+300] == "fired", "a job service that answers in 2 s ended two windows of one pass %v, expected both fired: every Trigger gets its own 3 s deadline", out)
+	for _, call := range ctx.GRPC.CallsTo("Trigger", "") {
+		ctx.Assert(call.HasDeadline(), "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it")
+		ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "a Trigger deadline is %v, expected about 3 s for every call", call.Timeout)
+	}
 	ctx.GRPC.SetLatency("Trigger", 10.0, "")
-	out = clientRun(ctx, s, []int64{clientWindow + 300})
-	ctx.Equal(out[clientWindow+300], "error", "a job service that takes 10 s must end the window as error once the 3 s deadline passed; the outcome")
-	ctx.Equal(clientLedger(ctx)[clientWindow+300], "error:trigger_failed", "the ledger row for the timed-out window")
+	before := ctx.Clock.Now()
+	out = clientRun(ctx, s, []int64{clientWindow + 600})
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Equal(out[clientWindow+600], "error", "a job service that takes 10 s must end the window as error once the 3 s deadline passed; the outcome")
+	calls := len(ctx.GRPC.CallsTo("Trigger", "")) - 2
+	ctx.Assert(calls == 1, "the timed-out window got %d Trigger calls, expected 1: the job service may have started the run, so a second call can run it twice", calls)
+	ctx.Assert(waited <= 3.5, "the timed-out window took %.1f s, expected about 3 s", waited)
+	ctx.Equal(clientLedger(ctx)[clientWindow+600], "error:trigger_failed", "the ledger row for the timed-out window")
 }
 
 func CheckSingleAttempt(ctx *harness.Ctx) {
 	s := clientWorld(ctx, "catch_up")
-	ctx.GRPC.Fail("Trigger", codes.Unavailable, "job service restarting", 10, "")
-	out := clientRun(ctx, s, []int64{clientWindow})
-	calls := len(ctx.GRPC.CallsTo("Trigger", ""))
-	ctx.Assert(calls == 1, "one window against a job service that answers UNAVAILABLE got %d Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides", calls)
-	ctx.Equal(out[clientWindow], "error", "runMissed's outcome for the failed window")
-	ctx.Equal(clientLedger(ctx), map[int64]string{clientWindow: "error:trigger_failed"}, "the ledger runs:s1")
+	failures := []struct {
+		name string
+		code codes.Code
+	}{{"UNAVAILABLE", codes.Unavailable}, {"DEADLINE_EXCEEDED", codes.DeadlineExceeded}, {"RESOURCE_EXHAUSTED", codes.ResourceExhausted}, {"INTERNAL", codes.Internal}}
+	for k, f := range failures {
+		window := clientWindow + int64(300*k)
+		before := len(ctx.GRPC.CallsTo("Trigger", ""))
+		ctx.GRPC.Fail("Trigger", f.code, "job service restarting", 1, "")
+		out := clientRun(ctx, s, []int64{window})
+		calls := len(ctx.GRPC.CallsTo("Trigger", "")) - before
+		ctx.Assert(calls == 1, "one window against a job service that answers %s got %d Trigger calls, expected 1: the job service runs every Trigger it receives, so the window is recorded as error and the next pass decides", f.name, calls)
+		ctx.Equal(out[window], "error", "runMissed's outcome for the window that failed with %s", f.name)
+		ctx.Equal(clientLedger(ctx)[window], "error:trigger_failed", "the ledger row for the window that failed with %s", f.name)
+	}
 }
 
 func CheckPolicySkip(ctx *harness.Ctx) {
@@ -955,7 +994,8 @@ func CheckFireOnce(ctx *harness.Ctx) {
 func CheckCatchUpCap(ctx *harness.Ctx) {
 	s := clientWorld(ctx, "catch_up")
 	missed := clientMissed(8)
-	clientRun(ctx, s, missed)
+	// The caller's list is in no particular order: the oldest five are the oldest by time.
+	clientRun(ctx, s, []int64{missed[3], missed[7], missed[0], missed[5], missed[1], missed[6], missed[2], missed[4]})
 	expected := []string{}
 	rows := map[int64]string{}
 	for _, w := range missed[:5] {
@@ -1037,29 +1077,52 @@ std::map<int64_t, std::string> clientLedger() {
 void CheckDeadline(harness::Ctx& ctx) {
   const auto s = clientWorld(ctx, "catch_up");
   ctx.GRPC.SetLatency("Trigger", 2.0);
-  auto out = clientRun(ctx, s, {kClientWindow});
-  ctx.Equal(out[kClientWindow], "fired", "a job service that answers in 2 s must fire the window; the outcome");
-  const auto call = ctx.GRPC.CallsTo("Trigger")[0];
-  ctx.Assert(call.HasDeadline(), "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it");
-  ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "the Trigger deadline is %vs, expected about 3 s", call.TimeoutSeconds());
+  // Two windows in one pass: each Trigger carries its own 3 s, not what is left of the pass's.
+  auto out = clientRun(ctx, s, {kClientWindow, kClientWindow + 300});
+  ctx.Assert(out[kClientWindow] == "fired" && out[kClientWindow + 300] == "fired",
+             "a job service that answers in 2 s ended two windows of one pass %v, expected both fired: every Trigger gets its own 3 s "
+             "deadline",
+             out);
+  for (const auto& call : ctx.GRPC.CallsTo("Trigger")) {
+    ctx.Assert(call.HasDeadline(), "the Trigger call carries no deadline: a job service that hangs holds the scheduler's pass with it");
+    ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "a Trigger deadline is %vs, expected about 3 s for every call",
+               call.TimeoutSeconds());
+  }
   ctx.GRPC.SetLatency("Trigger", 10.0);
-  out = clientRun(ctx, s, {kClientWindow + 300});
-  ctx.Equal(out[kClientWindow + 300], "error",
+  const int64_t before = ctx.Clock.Now();
+  out = clientRun(ctx, s, {kClientWindow + 600});
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Equal(out[kClientWindow + 600], "error",
             "a job service that takes 10 s must end the window as error once the 3 s deadline passed; the outcome");
-  ctx.Equal(clientLedger()[kClientWindow + 300], "error:trigger_failed", "the ledger row for the timed-out window");
+  const size_t calls = ctx.GRPC.CallsTo("Trigger").size() - 2;
+  ctx.Assert(calls == 1,
+             "the timed-out window got %d Trigger calls, expected 1: the job service may have started the run, so a second call can run "
+             "it twice",
+             calls);
+  ctx.Assert(waited <= 3.5, "the timed-out window took %.1f s, expected about 3 s", waited);
+  ctx.Equal(clientLedger()[kClientWindow + 600], "error:trigger_failed", "the ledger row for the timed-out window");
 }
 
 void CheckSingleAttempt(harness::Ctx& ctx) {
   const auto s = clientWorld(ctx, "catch_up");
-  ctx.GRPC.Fail("Trigger", grpc::StatusCode::UNAVAILABLE, "job service restarting", 10);
-  auto out = clientRun(ctx, s, {kClientWindow});
-  const size_t calls = ctx.GRPC.CallsTo("Trigger").size();
-  ctx.Assert(calls == 1,
-             "one window against a job service that answers UNAVAILABLE got %d Trigger calls, expected 1: the job service runs every "
-             "Trigger it receives, so the window is recorded as error and the next pass decides",
-             calls);
-  ctx.Equal(out[kClientWindow], "error", "runMissed's outcome for the failed window");
-  ctx.Equal(clientLedger(), std::map<int64_t, std::string>{{kClientWindow, "error:trigger_failed"}}, "the ledger runs:s1");
+  const std::vector<std::pair<std::string, grpc::StatusCode>> failures = {{"UNAVAILABLE", grpc::StatusCode::UNAVAILABLE},
+                                                                          {"DEADLINE_EXCEEDED", grpc::StatusCode::DEADLINE_EXCEEDED},
+                                                                          {"RESOURCE_EXHAUSTED", grpc::StatusCode::RESOURCE_EXHAUSTED},
+                                                                          {"INTERNAL", grpc::StatusCode::INTERNAL}};
+  for (size_t k = 0; k < failures.size(); k++) {
+    const auto& [name, code] = failures[k];
+    const int64_t window = kClientWindow + 300 * static_cast<int64_t>(k);
+    const size_t before = ctx.GRPC.CallsTo("Trigger").size();
+    ctx.GRPC.Fail("Trigger", code, "job service restarting", 1);
+    auto out = clientRun(ctx, s, {window});
+    const size_t calls = ctx.GRPC.CallsTo("Trigger").size() - before;
+    ctx.Assert(calls == 1,
+               "one window against a job service that answers %s got %d Trigger calls, expected 1: the job service runs every Trigger "
+               "it receives, so the window is recorded as error and the next pass decides",
+               name, calls);
+    ctx.Equal(out[window], "error", "runMissed's outcome for the window that failed with %s", name);
+    ctx.Equal(clientLedger()[window], "error:trigger_failed", "the ledger row for the window that failed with %s", name);
+  }
 }
 
 void CheckPolicySkip(harness::Ctx& ctx) {
@@ -1095,7 +1158,8 @@ void CheckFireOnce(harness::Ctx& ctx) {
 void CheckCatchUpCap(harness::Ctx& ctx) {
   const auto s = clientWorld(ctx, "catch_up");
   const auto missed = clientMissed(8);
-  clientRun(ctx, s, missed);
+  // The caller's list is in no particular order: the oldest five are the oldest by time.
+  clientRun(ctx, s, {missed[3], missed[7], missed[0], missed[5], missed[1], missed[6], missed[2], missed[4]});
   std::vector<std::string> expected;
   std::map<int64_t, std::string> rows;
   for (int k = 0; k < 5; k++) {
@@ -1112,7 +1176,7 @@ void CheckCatchUpCap(harness::Ctx& ctx) {
   hints: [
     "After a ten-minute scheduler pause the reporting database takes a burst of queries in seconds; on the day the job service restarted, one window's Trigger was sent dozens of times.",
     "The starter treats every missed window as owed and every failed call as worth repeating: nothing reads the schedule's policy, nothing bounds the replay, and a call with no deadline waits as long as the job service does.",
-    'Send one `Trigger` per window with `timeout=DEADLINE_S` and no loop; then branch on `misfire_policy`: `skip` records `policy_skip`, `fire_once_now` fires `windows[-1]` and records `coalesced` for the rest, `catch_up` fires `windows[:MAX_CATCH_UP]`.',
+    'Send one `Trigger` per window with `timeout=DEADLINE_S` and no loop; then sort the windows and branch on `misfire_policy`: `skip` records `policy_skip`, `fire_once_now` fires the newest and records `coalesced` for the rest, `catch_up` fires the oldest `MAX_CATCH_UP`.',
   ],
   debrief: `A pause is the one time a scheduler has more work than it was built for, so the code that runs after it is where bounds matter. The misfire policy is the owner's statement of what a missed window is worth: nothing for a cache warmer, the latest state for a report, every window for billing. Even the full replay is paced per pass, because the job's dependencies were sized for one fire per window. The single attempt follows from the job service's contract: it runs what it is told, so a retry after a timeout may be a second run, and an error row the next pass can see is the honest record. Production schedulers add a misfire threshold, so a fire a few seconds late is not a misfire, and a run key the job service deduplicates on, which makes a retry safe.`,
 };

@@ -20,11 +20,12 @@ flaws.
 mints one, a split that drifted from the frozen 50/50 (a sign assignment or logging is broken) stays
 hidden, and a lift printed alone makes a two-point effect and noise look the same.
 
-- Below the experiment's \`min_sample\` total exposures: \`status: "inconclusive"\`, \`winner: null\`,
-  whatever the p-value.
-- A variant whose exposures deviate from its share of the split by more than \`SRM_TOLERANCE\` (2 %):
-  \`status: "blocked"\`, \`winner: null\`,
-  \`caveat: {"kind": "srm", "blocking": true, "variant", "observed", "expected"}\`.
+- Below the experiment's \`min_sample\` total exposures (summed over its variants):
+  \`status: "inconclusive"\`, \`winner: null\`, whatever the p-value. Reaching it exactly is enough.
+- A variant whose exposures deviate from its expected count (its weight's share of the total) by more
+  than \`SRM_TOLERANCE\` (2 %) of that count: \`status: "blocked"\`, \`winner: null\`,
+  \`caveat: {"kind": "srm", "blocking": true, "variant", "observed", "expected"}\`, the observed and
+  expected exposures of the variant it names.
 - Every variant row carries \`ci_low\` and \`ci_high\`, whatever the status.`,
   sequence: {
     participants: ['Analyst', 'Experiment API', 'Redis'],
@@ -68,7 +69,7 @@ hidden, and a lift printed alone makes a two-point effect and noise look the sam
       id: 'min-sample',
       title: 'Inconclusive below the minimum sample',
       detail:
-        "The total exposures are compared with the experiment's `min_sample` before any p-value is read; below it the report is `inconclusive` with no winner.",
+        "The total exposures across the variants are compared with the experiment's `min_sample` before any p-value is read; below it the report is `inconclusive` with no winner, and reaching it exactly is enough.",
       match: {
         python: {order: [/<\s*experiment\[["']min_sample["']\]/, /p_value["']\]\s*<\s*ALPHA/]},
         typescript: {order: [/<\s*experiment\.min_sample/, /p_value\s*<\s*ALPHA/]},
@@ -81,7 +82,7 @@ hidden, and a lift printed alone makes a two-point effect and noise look the sam
       id: 'srm',
       title: 'A sample ratio mismatch blocks the winner',
       detail:
-        'A variant whose observed exposures deviate from its share of the frozen split by more than `SRM_TOLERANCE` (2 %) makes the report `blocked` with a blocking `srm` caveat and no winner.',
+        'A variant whose observed exposures deviate from its expected count under the frozen split by more than `SRM_TOLERANCE` (2 %) of that count makes the report `blocked`, with no winner and a blocking `srm` caveat naming the variant, its observed and its expected exposures.',
       match: {
         python: {all: [/>\s*SRM_TOLERANCE/, /["']blocked["']/]},
         typescript: {all: [/>\s*SRM_TOLERANCE/, /['"]blocked['"]/]},
@@ -629,8 +630,8 @@ BALANCED = ({"control": 5000, "treatment": 5000}, {"control": 500, "treatment": 
 DRIFTED = ({"control": 5600, "treatment": 4400}, {"control": 560, "treatment": 528})
 
 
-def _experiment(ctx, min_sample, counts):
-    experiment_id = store.create({"name": "cta", "unit": "user", "variants": SPLIT, "min_sample": min_sample, "salt": "s-1"})["id"]
+def _experiment(ctx, min_sample, counts, variants=SPLIT):
+    experiment_id = store.create({"name": "cta", "unit": "user", "variants": variants, "min_sample": min_sample, "salt": "s-1"})["id"]
     ctx.redis.hset(f"exp:{experiment_id}:exposures", mapping=counts[0])
     ctx.redis.hset(f"exp:{experiment_id}:conversions", mapping=counts[1])
     return experiment_id
@@ -665,6 +666,10 @@ async def check_min_sample(ctx):
     body = await _report(ctx, e)
     assert body.get("winner") is None, f"with 10,000 of the 20,000 exposures the design needs, the report named {body.get('winner')!r} the winner: a peek is not a result"
     assert body.get("status") == "inconclusive", f"below min_sample the status must be inconclusive, got {body.get('status')!r}"
+    body = await _report(ctx, _experiment(ctx, 10001, BALANCED))
+    assert body.get("status") == "inconclusive" and body.get("winner") is None, f"10,000 exposures against a min_sample of 10,001 must be inconclusive with no winner, got {body}"
+    body = await _report(ctx, _experiment(ctx, 10000, BALANCED))
+    assert body.get("status") == "complete" and body.get("winner") == "treatment", f"10,000 total exposures meet a min_sample of 10,000 (the total across variants, not each one) and must name treatment, got {body}"
 
 
 async def check_srm(ctx):
@@ -673,9 +678,24 @@ async def check_srm(ctx):
     assert body.get("winner") is None, f"a 56/44 split of a 50/50 design named {body.get('winner')!r} the winner: a sample ratio mismatch must block it"
     caveat = body.get("caveat") or {}
     assert body.get("status") == "blocked" and caveat.get("kind") == "srm" and caveat.get("blocking") is True, f"the report must be blocked with a blocking srm caveat, got status {body.get('status')!r}, caveat {body.get('caveat')}"
-    near = _experiment(ctx, 2000, ({"control": 5050, "treatment": 4950}, {"control": 505, "treatment": 594}))
-    body = await _report(ctx, near)
-    assert body.get("status") == "complete" and body.get("winner") == "treatment", f"a 50.5/49.5 split is within SRM_TOLERANCE and must not block, got {body}"
+    variant = caveat.get("variant")
+    assert variant in DRIFTED[0], f"the srm caveat must name the variant that drifted, got {caveat}"
+    observed, expected = caveat.get("observed"), caveat.get("expected")
+    assert observed == DRIFTED[0][variant] and isinstance(expected, (int, float)) and math.isclose(expected, 5000), f"the srm caveat must carry {variant}'s observed exposures ({DRIFTED[0][variant]}) and its expected count (5000), got {caveat}"
+    for counts, why in (
+        (({"control": 5050, "treatment": 4950}, {"control": 505, "treatment": 594}), "a 50.5/49.5 split of a 50/50 design"),
+        (({"control": 5099, "treatment": 4901}, {"control": 510, "treatment": 588}), "a 5,099/4,901 split, 1.98 % off the expected 5,000,"),
+    ):
+        body = await _report(ctx, _experiment(ctx, 2000, counts))
+        assert body.get("status") == "complete" and body.get("winner") == "treatment", f"{why} is within SRM_TOLERANCE and must not block, got {body}"
+    body = await _report(ctx, _experiment(ctx, 2000, ({"control": 7000, "treatment": 3000}, {"control": 700, "treatment": 360}), [{"key": "control", "weight": 70}, {"key": "treatment", "weight": 30}]))
+    assert body.get("status") == "complete", f"7,000/3,000 exposures of a 70/30 design match the split and must not block, got {body}"
+    for counts, why in (
+        (({"control": 5110, "treatment": 4890}, {"control": 511, "treatment": 587}), "a 5,110/4,890 split, 2.2 % off the expected 5,000"),
+        (({"control": 10000}, {"control": 1000}), "a 50/50 design with no treatment exposures at all"),
+    ):
+        body = await _report(ctx, _experiment(ctx, 2000, counts))
+        assert body.get("status") == "blocked" and body.get("winner") is None, f"{why} is a sample ratio mismatch and must block, got {body}"
 
 
 async def check_interval(ctx):
@@ -697,9 +717,9 @@ type Counts = [Record<string, number>, Record<string, number>];
 const BALANCED: Counts = [{control: 5000, treatment: 5000}, {control: 500, treatment: 600}];
 const DRIFTED: Counts = [{control: 5600, treatment: 4400}, {control: 560, treatment: 528}];
 
-async function experiment(ctx, minSample: number, counts: Counts): Promise<string> {
+async function experiment(ctx, minSample: number, counts: Counts, variants = SPLIT): Promise<string> {
   const store = ctx.load('/support/expd/store.ts');
-  const id = (await store.create({name: 'cta', unit: 'user', variants: SPLIT, min_sample: minSample, salt: 's-1'})).id;
+  const id = (await store.create({name: 'cta', unit: 'user', variants, min_sample: minSample, salt: 's-1'})).id;
   ctx.redis.hset(\`exp:\${id}:exposures\`, counts[0]);
   ctx.redis.hset(\`exp:\${id}:conversions\`, counts[1]);
   return id;
@@ -730,6 +750,13 @@ export async function check_min_sample(ctx) {
   const body = await report(ctx, await experiment(ctx, 20000, BALANCED));
   assert.equal(body.winner, null, \`with 10,000 of the 20,000 exposures the design needs, the report named \${body.winner} the winner: a peek is not a result\`);
   assert.equal(body.status, 'inconclusive', \`below min_sample the status must be inconclusive, got \${body.status}\`);
+  let near = await report(ctx, await experiment(ctx, 10001, BALANCED));
+  assert(near.status === 'inconclusive' && near.winner === null, \`10,000 exposures against a min_sample of 10,001 must be inconclusive with no winner, got \${JSON.stringify(near)}\`);
+  near = await report(ctx, await experiment(ctx, 10000, BALANCED));
+  assert(
+    near.status === 'complete' && near.winner === 'treatment',
+    \`10,000 total exposures meet a min_sample of 10,000 (the total across variants, not each one) and must name treatment, got \${JSON.stringify(near)}\`,
+  );
 }
 
 export async function check_srm(ctx) {
@@ -737,8 +764,33 @@ export async function check_srm(ctx) {
   assert.equal(body.winner, null, \`a 56/44 split of a 50/50 design named \${body.winner} the winner: a sample ratio mismatch must block it\`);
   const caveat = body.caveat ?? {};
   assert(body.status === 'blocked' && caveat.kind === 'srm' && caveat.blocking === true, \`the report must be blocked with a blocking srm caveat, got status \${body.status}, caveat \${JSON.stringify(body.caveat)}\`);
-  body = await report(ctx, await experiment(ctx, 2000, [{control: 5050, treatment: 4950}, {control: 505, treatment: 594}]));
-  assert(body.status === 'complete' && body.winner === 'treatment', \`a 50.5/49.5 split is within SRM_TOLERANCE and must not block, got \${JSON.stringify(body)}\`);
+  assert(caveat.variant in DRIFTED[0], \`the srm caveat must name the variant that drifted, got \${JSON.stringify(caveat)}\`);
+  assert(
+    caveat.observed === DRIFTED[0][caveat.variant] && typeof caveat.expected === 'number' && Math.abs(caveat.expected - 5000) < 1e-9,
+    \`the srm caveat must carry \${caveat.variant}'s observed exposures (\${DRIFTED[0][caveat.variant]}) and its expected count (5000), got \${JSON.stringify(caveat)}\`,
+  );
+  const within: [Counts, string][] = [
+    [[{control: 5050, treatment: 4950}, {control: 505, treatment: 594}], 'a 50.5/49.5 split of a 50/50 design'],
+    [[{control: 5099, treatment: 4901}, {control: 510, treatment: 588}], 'a 5,099/4,901 split, 1.98 % off the expected 5,000,'],
+  ];
+  for (const [counts, why] of within) {
+    body = await report(ctx, await experiment(ctx, 2000, counts));
+    assert(body.status === 'complete' && body.winner === 'treatment', \`\${why} is within SRM_TOLERANCE and must not block, got \${JSON.stringify(body)}\`);
+  }
+  const seventyThirty = [
+    {key: 'control', weight: 70},
+    {key: 'treatment', weight: 30},
+  ];
+  body = await report(ctx, await experiment(ctx, 2000, [{control: 7000, treatment: 3000}, {control: 700, treatment: 360}], seventyThirty));
+  assert.equal(body.status, 'complete', \`7,000/3,000 exposures of a 70/30 design match the split and must not block, got \${JSON.stringify(body)}\`);
+  const beyond: [Counts, string][] = [
+    [[{control: 5110, treatment: 4890}, {control: 511, treatment: 587}], 'a 5,110/4,890 split, 2.2 % off the expected 5,000'],
+    [[{control: 10000}, {control: 1000}], 'a 50/50 design with no treatment exposures at all'],
+  ];
+  for (const [counts, why] of beyond) {
+    body = await report(ctx, await experiment(ctx, 2000, counts));
+    assert(body.status === 'blocked' && body.winner === null, \`\${why} is a sample ratio mismatch and must block, got \${JSON.stringify(body)}\`);
+  }
 }
 
 export async function check_interval(ctx) {
@@ -768,17 +820,23 @@ import (
 	"leetbuild/harness"
 )
 
-type counts struct{ cn, n, cx, x int64 }
+type hCounts struct{ cn, n, cx, x int64 }
 
 var (
-	balanced = counts{5000, 5000, 500, 600}
-	drifted  = counts{5600, 4400, 560, 528}
+	hBalanced = hCounts{5000, 5000, 500, 600}
+	hDrifted  = hCounts{5600, 4400, 560, 528}
+	hSplit    = []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}
 )
 
-func reportOf(ctx *harness.Ctx, minSample int, c counts) map[string]any {
-	id := store.Create(context.Background(), store.Design{Name: "cta", Unit: "user", Variants: []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}, MinSample: minSample, Salt: "s-1"}).ID
-	ctx.Redis.Do("HSET", "exp:"+id+":exposures", "control", c.cn, "treatment", c.n)
-	ctx.Redis.Do("HSET", "exp:"+id+":conversions", "control", c.cx, "treatment", c.x)
+func hReportFor(ctx *harness.Ctx, minSample int, variants []store.Variant, exposures, conversions map[string]int64) map[string]any {
+	id := store.Create(context.Background(), store.Design{Name: "cta", Unit: "user", Variants: variants, MinSample: minSample, Salt: "s-1"}).ID
+	for suffix, values := range map[string]map[string]int64{":exposures": exposures, ":conversions": conversions} {
+		args := []any{"HSET", "exp:" + id + suffix}
+		for k, v := range values {
+			args = append(args, k, v)
+		}
+		ctx.Redis.Do(args...)
+	}
 	mux := http.NewServeMux()
 	register(mux)
 	r := ctx.HTTP(mux).Get("/v1/experiments/" + id + "/report")
@@ -788,7 +846,11 @@ func reportOf(ctx *harness.Ctx, minSample int, c counts) map[string]any {
 	return body
 }
 
-func treatmentRow(ctx *harness.Ctx, body map[string]any) map[string]any {
+func hReportOf(ctx *harness.Ctx, minSample int, c hCounts) map[string]any {
+	return hReportFor(ctx, minSample, hSplit, map[string]int64{"control": c.cn, "treatment": c.n}, map[string]int64{"control": c.cx, "treatment": c.x})
+}
+
+func hTreatmentRow(ctx *harness.Ctx, body map[string]any) map[string]any {
 	rows, _ := body["variants"].([]any)
 	for _, raw := range rows {
 		if row, ok := raw.(map[string]any); ok && row["variant"] == "treatment" {
@@ -800,9 +862,9 @@ func treatmentRow(ctx *harness.Ctx, body map[string]any) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	body := reportOf(ctx, 2000, balanced)
+	body := hReportOf(ctx, 2000, hBalanced)
 	ctx.Assert(body["status"] == "complete" && body["winner"] == "treatment", "10,000 balanced exposures with treatment converting 12 %% against 10 %% must name treatment, got %v", body)
-	row := treatmentRow(ctx, body)
+	row := hTreatmentRow(ctx, body)
 	lift, _ := row["lift"].(float64)
 	p, _ := row["p_value"].(float64)
 	ctx.Assert(math.Abs(lift-0.02) < 1e-9 && p < 0.05, "the treatment row must carry lift 0.02 and its p-value, got %v", row)
@@ -813,27 +875,49 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckMinSample(ctx *harness.Ctx) {
-	body := reportOf(ctx, 20000, balanced)
+	body := hReportOf(ctx, 20000, hBalanced)
 	ctx.Assert(body["winner"] == nil, "with 10,000 of the 20,000 exposures the design needs, the report named %v the winner: a peek is not a result", body["winner"])
 	ctx.Equal(body["status"], "inconclusive", "below min_sample the status")
+	body = hReportOf(ctx, 10001, hBalanced)
+	ctx.Assert(body["status"] == "inconclusive" && body["winner"] == nil, "10,000 exposures against a min_sample of 10,001 must be inconclusive with no winner, got %v", body)
+	body = hReportOf(ctx, 10000, hBalanced)
+	ctx.Assert(body["status"] == "complete" && body["winner"] == "treatment", "10,000 total exposures meet a min_sample of 10,000 (the total across variants, not each one) and must name treatment, got %v", body)
 }
 
 func CheckSrm(ctx *harness.Ctx) {
-	body := reportOf(ctx, 2000, drifted)
+	body := hReportOf(ctx, 2000, hDrifted)
 	ctx.Assert(body["winner"] == nil, "a 56/44 split of a 50/50 design named %v the winner: a sample ratio mismatch must block it", body["winner"])
 	caveat, _ := body["caveat"].(map[string]any)
 	ctx.Assert(body["status"] == "blocked" && caveat != nil && caveat["kind"] == "srm" && caveat["blocking"] == true, "the report must be blocked with a blocking srm caveat, got status %v, caveat %v", body["status"], body["caveat"])
-	body = reportOf(ctx, 2000, counts{5050, 4950, 505, 594})
-	ctx.Assert(body["status"] == "complete" && body["winner"] == "treatment", "a 50.5/49.5 split is within srmTolerance and must not block, got %v", body)
+	drifted := map[string]float64{"control": float64(hDrifted.cn), "treatment": float64(hDrifted.n)}
+	variant, _ := caveat["variant"].(string)
+	want, named := drifted[variant]
+	ctx.Assert(named, "the srm caveat must name the variant that drifted, got %v", caveat)
+	observed, _ := caveat["observed"].(float64)
+	expected, _ := caveat["expected"].(float64)
+	ctx.Assert(observed == want && math.Abs(expected-5000) < 1e-9, "the srm caveat must carry %s's observed exposures (%v) and its expected count (5000), got %v", variant, want, caveat)
+	for _, tc := range []struct {
+		c   hCounts
+		why string
+	}{{hCounts{5050, 4950, 505, 594}, "a 50.5/49.5 split of a 50/50 design"}, {hCounts{5099, 4901, 510, 588}, "a 5,099/4,901 split, 1.98 %% off the expected 5,000,"}} {
+		body = hReportOf(ctx, 2000, tc.c)
+		ctx.Assert(body["status"] == "complete" && body["winner"] == "treatment", tc.why+" is within srmTolerance and must not block, got %v", body)
+	}
+	body = hReportFor(ctx, 2000, []store.Variant{{Key: "control", Weight: 70}, {Key: "treatment", Weight: 30}}, map[string]int64{"control": 7000, "treatment": 3000}, map[string]int64{"control": 700, "treatment": 360})
+	ctx.Equal(body["status"], "complete", "7,000/3,000 exposures of a 70/30 design match the split and must not block; the status")
+	body = hReportOf(ctx, 2000, hCounts{5110, 4890, 511, 587})
+	ctx.Assert(body["status"] == "blocked" && body["winner"] == nil, "a 5,110/4,890 split, 2.2 %% off the expected 5,000, is a sample ratio mismatch and must block, got %v", body)
+	body = hReportFor(ctx, 2000, hSplit, map[string]int64{"control": 10000}, map[string]int64{"control": 1000})
+	ctx.Assert(body["status"] == "blocked" && body["winner"] == nil, "a 50/50 design with no treatment exposures at all is a sample ratio mismatch and must block, got %v", body)
 }
 
 func CheckInterval(ctx *harness.Ctx) {
 	for _, tc := range []struct {
 		minSample int
-		c         counts
+		c         hCounts
 		status    string
-	}{{2000, balanced, "complete"}, {20000, balanced, "inconclusive"}, {2000, drifted, "blocked"}} {
-		row := treatmentRow(ctx, reportOf(ctx, tc.minSample, tc.c))
+	}{{2000, hBalanced, "complete"}, {20000, hBalanced, "inconclusive"}, {2000, hDrifted, "blocked"}} {
+		row := hTreatmentRow(ctx, hReportOf(ctx, tc.minSample, tc.c))
 		low, okLow := row["ci_low"].(float64)
 		high, okHigh := row["ci_high"].(float64)
 		ctx.Assert(okLow && okHigh, "a %s report's treatment row has no interval: %v. Every lift carries ci_low and ci_high", tc.status, row)
@@ -849,7 +933,9 @@ func CheckInterval(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "expd/store.h"
@@ -858,14 +944,15 @@ namespace {
 
 using json = nlohmann::json;
 
-struct Counts {
+struct HCounts {
   long long cn, n, cx, x;
 };
 
-const Counts kBalanced{5000, 5000, 500, 600};
-const Counts kDrifted{5600, 4400, 560, 528};
+const HCounts hBalanced{5000, 5000, 500, 600};
+const HCounts hDrifted{5600, 4400, 560, 528};
+const std::vector<store::Variant> hSplit = {{"control", 50}, {"treatment", 50}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -873,17 +960,21 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json reportOf(harness::Ctx& ctx, long min_sample, const Counts& c) {
-  const std::string id = store::create(store::Design{"cta", "user", {{"control", 50}, {"treatment", 50}}, min_sample, "s-1"}).id;
-  ctx.Redis.Do("HSET", "exp:" + id + ":exposures", "control", c.cn, "treatment", c.n);
-  ctx.Redis.Do("HSET", "exp:" + id + ":conversions", "control", c.cx, "treatment", c.x);
-  auto http = api(ctx);
+json hReportFor(harness::Ctx& ctx, long min_sample, const std::vector<store::Variant>& variants, const std::map<std::string, long long>& exposures, const std::map<std::string, long long>& conversions) {
+  const std::string id = store::create(store::Design{"cta", "user", variants, min_sample, "s-1"}).id;
+  for (const auto& [k, v] : exposures) ctx.Redis.Do("HSET", "exp:" + id + ":exposures", k, v);
+  for (const auto& [k, v] : conversions) ctx.Redis.Do("HSET", "exp:" + id + ":conversions", k, v);
+  auto http = hAPI(ctx);
   const auto r = http.Get("/v1/experiments/" + id + "/report");
   ctx.Equal(r.Status, 200, "GET /v1/experiments/%s/report (%s)", id, r.Text());
   return json::parse(r.Text(), nullptr, false);
 }
 
-json treatmentRow(harness::Ctx& ctx, const json& body) {
+json hReportOf(harness::Ctx& ctx, long min_sample, const HCounts& c) {
+  return hReportFor(ctx, min_sample, hSplit, {{"control", c.cn}, {"treatment", c.n}}, {{"control", c.cx}, {"treatment", c.x}});
+}
+
+json hTreatmentRow(harness::Ctx& ctx, const json& body) {
   if (body.is_object() && body.contains("variants") && body["variants"].is_array()) {
     for (const auto& row : body["variants"]) {
       if (row.is_object() && row.value("variant", "") == "treatment") return row;
@@ -892,42 +983,62 @@ json treatmentRow(harness::Ctx& ctx, const json& body) {
   ctx.Fatalf("the report has no treatment row: %s", body.dump());
 }
 
-std::string text(const json& body, const char* field) { return body.contains(field) && body[field].is_string() ? body[field].get<std::string>() : ""; }
+std::string hText(const json& body, const char* field) { return body.contains(field) && body[field].is_string() ? body[field].get<std::string>() : ""; }
+
+bool hNoWinner(const json& body) { return body.contains("winner") && body["winner"].is_null(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const json body = reportOf(ctx, 2000, kBalanced);
-  ctx.Assert(text(body, "status") == "complete" && text(body, "winner") == "treatment", "10,000 balanced exposures with treatment converting 12 %% against 10 %% must name treatment, got %s", body.dump());
-  const json row = treatmentRow(ctx, body);
+  const json body = hReportOf(ctx, 2000, hBalanced);
+  ctx.Assert(hText(body, "status") == "complete" && hText(body, "winner") == "treatment", "10,000 balanced exposures with treatment converting 12 %% against 10 %% must name treatment, got %s", body.dump());
+  const json row = hTreatmentRow(ctx, body);
   ctx.Assert(std::fabs(row.value("lift", 0.0) - 0.02) < 1e-9 && row.value("p_value", 1.0) < 0.05, "the treatment row must carry lift 0.02 and its p-value, got %s", row.dump());
-  auto http = api(ctx);
+  auto http = hAPI(ctx);
   ctx.Equal(http.Get("/v1/experiments/exp-404/report").Status, 404, "an unknown experiment");
 }
 
 void CheckMinSample(harness::Ctx& ctx) {
-  const json body = reportOf(ctx, 20000, kBalanced);
-  ctx.Assert(body.contains("winner") && body["winner"].is_null(), "with 10,000 of the 20,000 exposures the design needs, the report named %s the winner: a peek is not a result", body.value("winner", json()).dump());
-  ctx.Equal(text(body, "status"), "inconclusive", "below min_sample the status");
+  json body = hReportOf(ctx, 20000, hBalanced);
+  ctx.Assert(hNoWinner(body), "with 10,000 of the 20,000 exposures the design needs, the report named %s the winner: a peek is not a result", body.value("winner", json()).dump());
+  ctx.Equal(hText(body, "status"), "inconclusive", "below min_sample the status");
+  body = hReportOf(ctx, 10001, hBalanced);
+  ctx.Assert(hText(body, "status") == "inconclusive" && hNoWinner(body), "10,000 exposures against a min_sample of 10,001 must be inconclusive with no winner, got %s", body.dump());
+  body = hReportOf(ctx, 10000, hBalanced);
+  ctx.Assert(hText(body, "status") == "complete" && hText(body, "winner") == "treatment", "10,000 total exposures meet a min_sample of 10,000 (the total across variants, not each one) and must name treatment, got %s", body.dump());
 }
 
 void CheckSrm(harness::Ctx& ctx) {
-  json body = reportOf(ctx, 2000, kDrifted);
-  ctx.Assert(body.contains("winner") && body["winner"].is_null(), "a 56/44 split of a 50/50 design named %s the winner: a sample ratio mismatch must block it", body.value("winner", json()).dump());
+  json body = hReportOf(ctx, 2000, hDrifted);
+  ctx.Assert(hNoWinner(body), "a 56/44 split of a 50/50 design named %s the winner: a sample ratio mismatch must block it", body.value("winner", json()).dump());
   const json caveat = body.value("caveat", json());
-  ctx.Assert(text(body, "status") == "blocked" && caveat.is_object() && caveat.value("kind", "") == "srm" && caveat.value("blocking", false), "the report must be blocked with a blocking srm caveat, got status %q, caveat %s", text(body, "status"), caveat.dump());
-  body = reportOf(ctx, 2000, Counts{5050, 4950, 505, 594});
-  ctx.Assert(text(body, "status") == "complete" && text(body, "winner") == "treatment", "a 50.5/49.5 split is within kSrmTolerance and must not block, got %s", body.dump());
+  ctx.Assert(hText(body, "status") == "blocked" && caveat.is_object() && caveat.value("kind", "") == "srm" && caveat.value("blocking", false), "the report must be blocked with a blocking srm caveat, got status %q, caveat %s", hText(body, "status"), caveat.dump());
+  const std::map<std::string, long long> drifted = {{"control", hDrifted.cn}, {"treatment", hDrifted.n}};
+  const std::string variant = hText(caveat, "variant");
+  ctx.Assert(drifted.count(variant) == 1, "the srm caveat must name the variant that drifted, got %s", caveat.dump());
+  const bool carries = caveat.contains("observed") && caveat["observed"].is_number() && caveat.contains("expected") && caveat["expected"].is_number() &&
+                       caveat["observed"].get<double>() == static_cast<double>(drifted.at(variant)) && std::fabs(caveat["expected"].get<double>() - 5000) < 1e-9;
+  ctx.Assert(carries, "the srm caveat must carry %s's observed exposures (%d) and its expected count (5000), got %s", variant, drifted.at(variant), caveat.dump());
+  for (const auto& [c, why] : std::vector<std::pair<HCounts, std::string>>{{HCounts{5050, 4950, 505, 594}, "a 50.5/49.5 split of a 50/50 design"}, {HCounts{5099, 4901, 510, 588}, "a 5,099/4,901 split, 1.98 % off the expected 5,000,"}}) {
+    body = hReportOf(ctx, 2000, c);
+    ctx.Assert(hText(body, "status") == "complete" && hText(body, "winner") == "treatment", "%s is within kSrmTolerance and must not block, got %s", why, body.dump());
+  }
+  body = hReportFor(ctx, 2000, {{"control", 70}, {"treatment", 30}}, {{"control", 7000}, {"treatment", 3000}}, {{"control", 700}, {"treatment", 360}});
+  ctx.Equal(hText(body, "status"), "complete", "7,000/3,000 exposures of a 70/30 design match the split and must not block; the status");
+  body = hReportOf(ctx, 2000, HCounts{5110, 4890, 511, 587});
+  ctx.Assert(hText(body, "status") == "blocked" && hNoWinner(body), "a 5,110/4,890 split, 2.2 %% off the expected 5,000, is a sample ratio mismatch and must block, got %s", body.dump());
+  body = hReportFor(ctx, 2000, hSplit, {{"control", 10000}}, {{"control", 1000}});
+  ctx.Assert(hText(body, "status") == "blocked" && hNoWinner(body), "a 50/50 design with no treatment exposures at all is a sample ratio mismatch and must block, got %s", body.dump());
 }
 
 void CheckInterval(harness::Ctx& ctx) {
   struct Case {
     long min_sample;
-    Counts c;
+    HCounts c;
     std::string status;
   };
-  for (const Case& tc : std::vector<Case>{{2000, kBalanced, "complete"}, {20000, kBalanced, "inconclusive"}, {2000, kDrifted, "blocked"}}) {
-    const json row = treatmentRow(ctx, reportOf(ctx, tc.min_sample, tc.c));
+  for (const Case& tc : std::vector<Case>{{2000, hBalanced, "complete"}, {20000, hBalanced, "inconclusive"}, {2000, hDrifted, "blocked"}}) {
+    const json row = hTreatmentRow(ctx, hReportOf(ctx, tc.min_sample, tc.c));
     ctx.Assert(row.contains("ci_low") && row.contains("ci_high"), "a %s report's treatment row has no interval: %s. Every lift carries ci_low and ci_high", tc.status, row.dump());
     const double pc = static_cast<double>(tc.c.cx) / tc.c.cn, pt = static_cast<double>(tc.c.x) / tc.c.n;
     const double half = 1.959964 * std::sqrt(pc * (1 - pc) / tc.c.cn + pt * (1 - pt) / tc.c.n);

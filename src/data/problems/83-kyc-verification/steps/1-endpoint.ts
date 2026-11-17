@@ -65,7 +65,7 @@ names another tenant's passport, gets the service to download it.
       id: 'caller-verdict',
       title: 'A status in the body never sets the case status',
       detail:
-        'The case opens `pending` through `open_case`/`openCase` and the endpoint records no decision: nothing in it calls `decide`, so a body that says `approved` opens a pending case.',
+        'The case opens `pending` through `open_case`/`openCase` and the endpoint records no decision: nothing in it calls `decide`, so a body that says `approved`, `rejected` or `manual_review` opens a pending case with nothing in its audit list.',
       match: {
         python: {all: [/intake\.open_case\(/], none: [/\bdecide\(/, /body\.status/]},
         typescript: {all: [/openCase\(/], none: [/\bdecide\(/, /body\.status/]},
@@ -677,6 +677,7 @@ def _api(ctx):
     storage.put("documents/t-a/license-1.jpg", "<licence scan of a-1>", "sha256:77ab02")
     storage.put("documents/t-b/passport-7.jpg", "<passport scan of tenant t-b's applicant>", "sha256:c0ffee")
     storage.put("documents/t-ab/passport-3.jpg", "<passport scan of tenant t-ab's applicant>", "sha256:0b0e11")
+    storage.put("documents/t-b/t-a/passport-9.jpg", "<passport scan filed in tenant t-b's folder>", "sha256:9a9a9a")
     return ctx.client(ctx.load("api").app)
 
 
@@ -705,18 +706,27 @@ async def check_route(ctx):
 
 async def check_caller_verdict(ctx):
     async with _api(ctx) as c:
-        r = await _submit(c, {"applicant": "a-1", "status": "approved", "documents": [PASSPORT]})
-    assert r.status_code == 201, f"a submission carrying a status answered {r.status_code}: {r.text}"
-    assert r.json().get("status") == "pending", f"a body that says approved opened a case answering {r.json()}: the caller set its own verdict"
-    case = cases.load(r.json()["case_id"])
-    assert case["status"] == "pending", f"a body that says approved left the case {case['status']!r} in the store: the verdict is the service's, the case opens pending"
+        for applicant, status in (("a-1", "approved"), ("a-2", "rejected"), ("a-3", "manual_review")):
+            r = await _submit(c, {"applicant": applicant, "status": status, "documents": [PASSPORT]})
+            assert r.status_code == 201, f"a submission carrying status {status!r} answered {r.status_code}: {r.text}"
+            assert r.json().get("status") == "pending", f"a body that says {status} opened a case answering {r.json()}: the caller set its own verdict"
+            case = cases.load(r.json()["case_id"])
+            assert case["status"] == "pending", f"a body that says {status} left the case {case['status']!r} in the store: the verdict is the service's, the case opens pending"
+            audit = ctx.redis.lrange(f"kyc:audit:{case['case_id']}", 0, -1)
+            assert audit == [], f"a submission with status {status!r} recorded the decisions {audit}: the endpoint decides nothing"
 
 
 async def check_document_type(ctx):
     async with _api(ctx) as c:
-        r = await _submit(c, {"applicant": "a-1", "documents": [{"type": "utility_bill", "ref": "documents/t-a/license-1.jpg"}]})
-        assert r.status_code == 400, f"a utility_bill answered {r.status_code}, expected 400: only passport, drivers_license and national_id prove an identity"
-        _untouched(ctx, "a utility_bill")
+        refused = (
+            ("a utility_bill", [{"type": "utility_bill", "ref": "documents/t-a/license-1.jpg"}]),
+            ("a bank_statement", [{"type": "bank_statement", "ref": "documents/t-a/license-1.jpg"}]),
+            ("a passport followed by a utility_bill", [PASSPORT, {"type": "utility_bill", "ref": "documents/t-a/license-1.jpg"}]),
+        )
+        for what, documents in refused:
+            r = await _submit(c, {"applicant": "a-1", "documents": documents})
+            assert r.status_code == 400, f"{what} answered {r.status_code}, expected 400: only passport, drivers_license and national_id prove an identity, and every document is checked"
+            _untouched(ctx, what)
         for kind in ("passport", "drivers_license", "national_id"):
             ok = await _submit(c, {"applicant": f"a-{kind}", "documents": [{"type": kind, "ref": "documents/t-a/license-1.jpg"}]})
             assert ok.status_code == 201, f"a {kind} answered {ok.status_code}: {ok.text}"
@@ -727,10 +737,13 @@ async def check_tenant_scope(ctx):
         r = await _submit(c, {"applicant": "a-1", "documents": [PASSPORT]}, tenant=None)
         assert r.status_code == 401, f"a submission without X-Tenant-Id answered {r.status_code}, expected 401"
         _untouched(ctx, "a submission without X-Tenant-Id")
-        for ref in ("documents/t-b/passport-7.jpg", "documents/t-ab/passport-3.jpg"):
+        for ref in ("documents/t-b/passport-7.jpg", "documents/t-ab/passport-3.jpg", "documents/t-b/t-a/passport-9.jpg"):
             r = await _submit(c, {"applicant": "a-1", "documents": [{"type": "passport", "ref": ref}]})
             assert r.status_code == 403, f"tenant t-a naming {ref} answered {r.status_code}, expected 403: the document is another tenant's"
             _untouched(ctx, f"a ref to {ref}")
+        r = await _submit(c, {"applicant": "a-1", "documents": [PASSPORT, {"type": "passport", "ref": "documents/t-b/passport-7.jpg"}]})
+        assert r.status_code == 403, f"tenant t-a sending its own passport and then documents/t-b/passport-7.jpg answered {r.status_code}, expected 403: every document is checked"
+        _untouched(ctx, "its own passport followed by a ref to documents/t-b/passport-7.jpg")
 `,
     typescript: `const PASSPORT = {type: 'passport', ref: 'documents/t-a/passport-1.jpg'};
 
@@ -740,6 +753,7 @@ async function api(ctx) {
   await storage.put('documents/t-a/license-1.jpg', '<licence scan of a-1>', 'sha256:77ab02');
   await storage.put('documents/t-b/passport-7.jpg', "<passport scan of tenant t-b's applicant>", 'sha256:c0ffee');
   await storage.put('documents/t-ab/passport-3.jpg', "<passport scan of tenant t-ab's applicant>", 'sha256:0b0e11');
+  await storage.put('documents/t-b/t-a/passport-9.jpg', "<passport scan filed in tenant t-b's folder>", 'sha256:9a9a9a');
   return {c: ctx.client(ctx.load('api').app), cases: ctx.load('/support/kyc/cases.ts')};
 }
 
@@ -766,18 +780,29 @@ export async function check_route(ctx) {
 
 export async function check_caller_verdict(ctx) {
   const {c, cases} = await api(ctx);
-  const r = await submit(c, {applicant: 'a-1', status: 'approved', documents: [PASSPORT]});
-  assert.equal(r.status, 201, \`a submission carrying a status answered \${r.status}: \${r.text}\`);
-  assert.equal(r.json().status, 'pending', \`a body that says approved opened a case answering \${r.text}: the caller set its own verdict\`);
-  const stored = await cases.load(r.json().case_id);
-  assert.equal(stored.status, 'pending', \`a body that says approved left the case \${stored.status} in the store: the verdict is the service's, the case opens pending\`);
+  for (const [applicant, status] of [['a-1', 'approved'], ['a-2', 'rejected'], ['a-3', 'manual_review']]) {
+    const r = await submit(c, {applicant, status, documents: [PASSPORT]});
+    assert.equal(r.status, 201, \`a submission carrying status \${status} answered \${r.status}: \${r.text}\`);
+    assert.equal(r.json().status, 'pending', \`a body that says \${status} opened a case answering \${r.text}: the caller set its own verdict\`);
+    const stored = await cases.load(r.json().case_id);
+    assert.equal(stored.status, 'pending', \`a body that says \${status} left the case \${stored.status} in the store: the verdict is the service's, the case opens pending\`);
+    const audit = ctx.redis.lrange(\`kyc:audit:\${stored.case_id}\`, 0, -1);
+    assert.equal(audit.length, 0, \`a submission with status \${status} recorded the decisions \${JSON.stringify(audit)}: the endpoint decides nothing\`);
+  }
 }
 
 export async function check_document_type(ctx) {
   const {c, cases} = await api(ctx);
-  const r = await submit(c, {applicant: 'a-1', documents: [{type: 'utility_bill', ref: 'documents/t-a/license-1.jpg'}]});
-  assert.equal(r.status, 400, \`a utility_bill answered \${r.status}, expected 400: only passport, drivers_license and national_id prove an identity\`);
-  await untouched(ctx, cases, 'a utility_bill');
+  const refused: [string, object[]][] = [
+    ['a utility_bill', [{type: 'utility_bill', ref: 'documents/t-a/license-1.jpg'}]],
+    ['a bank_statement', [{type: 'bank_statement', ref: 'documents/t-a/license-1.jpg'}]],
+    ['a passport followed by a utility_bill', [PASSPORT, {type: 'utility_bill', ref: 'documents/t-a/license-1.jpg'}]],
+  ];
+  for (const [what, documents] of refused) {
+    const r = await submit(c, {applicant: 'a-1', documents});
+    assert.equal(r.status, 400, \`\${what} answered \${r.status}, expected 400: only passport, drivers_license and national_id prove an identity, and every document is checked\`);
+    await untouched(ctx, cases, what);
+  }
   for (const kind of ['passport', 'drivers_license', 'national_id']) {
     const ok = await submit(c, {applicant: \`a-\${kind}\`, documents: [{type: kind, ref: 'documents/t-a/license-1.jpg'}]});
     assert.equal(ok.status, 201, \`a \${kind} answered \${ok.status}: \${ok.text}\`);
@@ -789,11 +814,14 @@ export async function check_tenant_scope(ctx) {
   let r = await submit(c, {applicant: 'a-1', documents: [PASSPORT]}, null);
   assert.equal(r.status, 401, \`a submission without X-Tenant-Id answered \${r.status}, expected 401\`);
   await untouched(ctx, cases, 'a submission without X-Tenant-Id');
-  for (const ref of ['documents/t-b/passport-7.jpg', 'documents/t-ab/passport-3.jpg']) {
+  for (const ref of ['documents/t-b/passport-7.jpg', 'documents/t-ab/passport-3.jpg', 'documents/t-b/t-a/passport-9.jpg']) {
     r = await submit(c, {applicant: 'a-1', documents: [{type: 'passport', ref}]});
     assert.equal(r.status, 403, \`tenant t-a naming \${ref} answered \${r.status}, expected 403: the document is another tenant's\`);
     await untouched(ctx, cases, \`a ref to \${ref}\`);
   }
+  r = await submit(c, {applicant: 'a-1', documents: [PASSPORT, {type: 'passport', ref: 'documents/t-b/passport-7.jpg'}]});
+  assert.equal(r.status, 403, \`tenant t-a sending its own passport and then documents/t-b/passport-7.jpg answered \${r.status}, expected 403: every document is checked\`);
+  await untouched(ctx, cases, 'its own passport followed by a ref to documents/t-b/passport-7.jpg');
 }
 `,
     go: `package main
@@ -808,84 +836,108 @@ import (
 	"leetbuild/harness"
 )
 
-var bg = context.Background()
+var hBg = context.Background()
 
-var passport = map[string]string{"type": "passport", "ref": "documents/t-a/passport-1.jpg"}
+var hPassport = map[string]string{"type": "passport", "ref": "documents/t-a/passport-1.jpg"}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	storage.Put(bg, "documents/t-a/passport-1.jpg", "<passport scan of a-1>", "sha256:5e1f0c")
-	storage.Put(bg, "documents/t-a/license-1.jpg", "<licence scan of a-1>", "sha256:77ab02")
-	storage.Put(bg, "documents/t-b/passport-7.jpg", "<passport scan of tenant t-b's applicant>", "sha256:c0ffee")
-	storage.Put(bg, "documents/t-ab/passport-3.jpg", "<passport scan of tenant t-ab's applicant>", "sha256:0b0e11")
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	storage.Put(hBg, "documents/t-a/passport-1.jpg", "<passport scan of a-1>", "sha256:5e1f0c")
+	storage.Put(hBg, "documents/t-a/license-1.jpg", "<licence scan of a-1>", "sha256:77ab02")
+	storage.Put(hBg, "documents/t-b/passport-7.jpg", "<passport scan of tenant t-b's applicant>", "sha256:c0ffee")
+	storage.Put(hBg, "documents/t-ab/passport-3.jpg", "<passport scan of tenant t-ab's applicant>", "sha256:0b0e11")
+	storage.Put(hBg, "documents/t-b/t-a/passport-9.jpg", "<passport scan filed in tenant t-b's folder>", "sha256:9a9a9a")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func submitAs(c *harness.HTTP, tenant string, body map[string]any) *harness.Response {
+func hSubmitAs(c *harness.HTTP, tenant string, body map[string]any) *harness.Response {
 	if tenant == "" {
 		return c.Post("/v1/verifications", body)
 	}
 	return c.Post("/v1/verifications", body, "X-Tenant-Id", tenant)
 }
 
-type opened struct {
+func hDoc(kind, ref string) map[string]string {
+	return map[string]string{"type": kind, "ref": ref}
+}
+
+type hOpened struct {
 	CaseID    string \`json:"case_id"\`
 	Applicant string \`json:"applicant"\`
 	Status    string \`json:"status"\`
 }
 
-func untouched(ctx *harness.Ctx, what string) {
+func hUntouched(ctx *harness.Ctx, what string) {
 	fetched := ctx.Redis.LRange("storage:fetches", 0, -1)
 	ctx.Assert(len(fetched) == 0, "%s was refused only after the service downloaded %q: refuse before anything is fetched", what, fetched)
 	_, spent := ctx.Redis.Get("kyc:attempts:t-a:a-1")
 	ctx.Assert(!spent, "%s spent one of the applicant's attempts: refuse before ReserveAttempt", what)
-	ctx.Assert(cases.Lookup(bg, "t-a", "a-1") == nil, "%s opened a case", what)
+	ctx.Assert(cases.Lookup(hBg, "t-a", "a-1") == nil, "%s opened a case", what)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := submitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": []any{passport}})
+	c := hAPI(ctx)
+	r := hSubmitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": []any{hPassport}})
 	ctx.Equal(r.Status, 201, "POST /v1/verifications (%s)", r.Text())
-	var body opened
+	var body hOpened
 	r.Decode(&body)
 	ctx.Assert(body.Status == "pending" && body.Applicant == "a-1", "a new submission must answer a pending case for a-1, got %s", r.Text())
-	stored := cases.Load(bg, body.CaseID)
+	stored := cases.Load(hBg, body.CaseID)
 	ctx.Assert(stored != nil && stored.Tenant == "t-a", "the store holds %+v for case %q", stored, body.CaseID)
 	ctx.Equal(stored.Documents, []cases.Document{{Type: "passport", Ref: "documents/t-a/passport-1.jpg", Digest: "sha256:5e1f0c"}}, "the case must carry each document with its digest")
 }
 
 func CheckCallerVerdict(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := submitAs(c, "t-a", map[string]any{"applicant": "a-1", "status": "approved", "documents": []any{passport}})
-	ctx.Equal(r.Status, 201, "a submission carrying a status (%s)", r.Text())
-	var body opened
-	r.Decode(&body)
-	ctx.Equal(body.Status, "pending", "a body that says approved opened a case answering %s: the caller set its own verdict; the status", r.Text())
-	ctx.Equal(cases.Load(bg, body.CaseID).Status, "pending", "a body that says approved must leave the case pending in the store (the verdict is the service's); the stored status")
+	c := hAPI(ctx)
+	for _, sent := range [][2]string{{"a-1", "approved"}, {"a-2", "rejected"}, {"a-3", "manual_review"}} {
+		status := sent[1]
+		r := hSubmitAs(c, "t-a", map[string]any{"applicant": sent[0], "status": status, "documents": []any{hPassport}})
+		ctx.Equal(r.Status, 201, "a submission carrying status %s (%s)", status, r.Text())
+		var body hOpened
+		r.Decode(&body)
+		ctx.Equal(body.Status, "pending", "a body that says %s opened a case answering %s: the caller set its own verdict; the status", status, r.Text())
+		ctx.Equal(cases.Load(hBg, body.CaseID).Status, "pending", "a body that says %s must leave the case pending in the store (the verdict is the service's); the stored status", status)
+		audit := ctx.Redis.LRange("kyc:audit:"+body.CaseID, 0, -1)
+		ctx.Assert(len(audit) == 0, "a submission with status %s recorded the decisions %q: the endpoint decides nothing", status, audit)
+	}
 }
 
 func CheckDocumentType(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := submitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": []any{map[string]string{"type": "utility_bill", "ref": "documents/t-a/license-1.jpg"}}})
-	ctx.Equal(r.Status, 400, "a utility_bill (only passport, drivers_license and national_id prove an identity)")
-	untouched(ctx, "a utility_bill")
+	c := hAPI(ctx)
+	license := "documents/t-a/license-1.jpg"
+	refused := []struct {
+		what      string
+		documents []any
+	}{
+		{"a utility_bill", []any{hDoc("utility_bill", license)}},
+		{"a bank_statement", []any{hDoc("bank_statement", license)}},
+		{"a passport followed by a utility_bill", []any{hPassport, hDoc("utility_bill", license)}},
+	}
+	for _, sent := range refused {
+		r := hSubmitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": sent.documents})
+		ctx.Equal(r.Status, 400, "%s (only passport, drivers_license and national_id prove an identity, and every document is checked)", sent.what)
+		hUntouched(ctx, sent.what)
+	}
 	for _, kind := range []string{"passport", "drivers_license", "national_id"} {
-		ok := submitAs(c, "t-a", map[string]any{"applicant": "a-" + kind, "documents": []any{map[string]string{"type": kind, "ref": "documents/t-a/license-1.jpg"}}})
+		ok := hSubmitAs(c, "t-a", map[string]any{"applicant": "a-" + kind, "documents": []any{hDoc(kind, license)}})
 		ctx.Equal(ok.Status, 201, "a %s (%s)", kind, ok.Text())
 	}
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := submitAs(c, "", map[string]any{"applicant": "a-1", "documents": []any{passport}})
+	c := hAPI(ctx)
+	r := hSubmitAs(c, "", map[string]any{"applicant": "a-1", "documents": []any{hPassport}})
 	ctx.Equal(r.Status, 401, "a submission without X-Tenant-Id")
-	untouched(ctx, "a submission without X-Tenant-Id")
-	for _, ref := range []string{"documents/t-b/passport-7.jpg", "documents/t-ab/passport-3.jpg"} {
-		r = submitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": []any{map[string]string{"type": "passport", "ref": ref}}})
+	hUntouched(ctx, "a submission without X-Tenant-Id")
+	for _, ref := range []string{"documents/t-b/passport-7.jpg", "documents/t-ab/passport-3.jpg", "documents/t-b/t-a/passport-9.jpg"} {
+		r = hSubmitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": []any{hDoc("passport", ref)}})
 		ctx.Equal(r.Status, 403, "tenant t-a naming %s (the document is another tenant's)", ref)
-		untouched(ctx, "a ref to "+ref)
+		hUntouched(ctx, "a ref to "+ref)
 	}
+	r = hSubmitAs(c, "t-a", map[string]any{"applicant": "a-1", "documents": []any{hPassport, hDoc("passport", "documents/t-b/passport-7.jpg")}})
+	ctx.Equal(r.Status, 403, "tenant t-a sending its own passport and then documents/t-b/passport-7.jpg (every document is checked)")
+	hUntouched(ctx, "its own passport followed by a ref to documents/t-b/passport-7.jpg")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -893,19 +945,24 @@ func CheckTenantScope(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "kyc/cases.h"
 #include "kyc/storage.h"
 
 namespace {
 
-const std::string kPassport = R"({"type": "passport", "ref": "documents/t-a/passport-1.jpg"})";
+nlohmann::json hDoc(const std::string& type, const std::string& ref) { return {{"type", type}, {"ref", ref}}; }
 
-harness::HTTP api(harness::Ctx& ctx) {
+const nlohmann::json hPassport = hDoc("passport", "documents/t-a/passport-1.jpg");
+
+harness::HTTP hApi(harness::Ctx& ctx) {
   storage::put("documents/t-a/passport-1.jpg", "<passport scan of a-1>", "sha256:5e1f0c");
   storage::put("documents/t-a/license-1.jpg", "<licence scan of a-1>", "sha256:77ab02");
   storage::put("documents/t-b/passport-7.jpg", "<passport scan of tenant t-b's applicant>", "sha256:c0ffee");
   storage::put("documents/t-ab/passport-3.jpg", "<passport scan of tenant t-ab's applicant>", "sha256:0b0e11");
+  storage::put("documents/t-b/t-a/passport-9.jpg", "<passport scan filed in tenant t-b's folder>", "sha256:9a9a9a");
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -913,16 +970,15 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response submitAs(harness::HTTP& c, const std::string& tenant, const std::string& body) {
-  if (tenant.empty()) return c.Post("/v1/verifications", body, "Content-Type", "application/json");
-  return c.Post("/v1/verifications", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
+harness::Response hSubmitAs(harness::HTTP& c, const std::string& tenant, const std::string& applicant, const nlohmann::json& documents,
+                            const std::string& status = "") {
+  nlohmann::json body = {{"applicant", applicant}, {"documents", documents}};
+  if (!status.empty()) body["status"] = status;
+  if (tenant.empty()) return c.Post("/v1/verifications", body.dump(), "Content-Type", "application/json");
+  return c.Post("/v1/verifications", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-std::string document(const std::string& type, const std::string& ref) {
-  return nlohmann::json{{"type", type}, {"ref", ref}}.dump();
-}
-
-void untouched(harness::Ctx& ctx, const std::string& what) {
+void hUntouched(harness::Ctx& ctx, const std::string& what) {
   const auto fetched = ctx.Redis.LRange("storage:fetches", 0, -1);
   ctx.Assert(fetched.empty(), "%s was refused only after the service downloaded %q: refuse before anything is fetched", what, fetched);
   ctx.Assert(!ctx.Redis.Get("kyc:attempts:t-a:a-1"), "%s spent one of the applicant's attempts: refuse before reserveAttempt", what);
@@ -932,8 +988,8 @@ void untouched(harness::Ctx& ctx, const std::string& what) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = submitAs(c, "t-a", R"({"applicant": "a-1", "documents": [)" + kPassport + "]}");
+  auto c = hApi(ctx);
+  const auto r = hSubmitAs(c, "t-a", "a-1", nlohmann::json::array({hPassport}));
   ctx.Equal(r.Status, 201, "POST /v1/verifications (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text());
   ctx.Assert(body.value("status", "") == "pending" && body.value("applicant", "") == "a-1", "a new submission must answer a pending case for a-1, got %s", r.Text());
@@ -944,35 +1000,52 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckCallerVerdict(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = submitAs(c, "t-a", R"({"applicant": "a-1", "status": "approved", "documents": [)" + kPassport + "]}");
-  ctx.Equal(r.Status, 201, "a submission carrying a status (%s)", r.Text());
-  const auto body = nlohmann::json::parse(r.Text());
-  ctx.Equal(body.value("status", ""), "pending", "a body that says approved opened a case answering %s: the caller set its own verdict; the status", r.Text());
-  ctx.Equal(cases::load(body.value("case_id", ""))->status, "pending", "a body that says approved must leave the case pending in the store (the verdict is the service's); the stored status");
+  auto c = hApi(ctx);
+  const std::vector<std::pair<std::string, std::string>> sent = {{"a-1", "approved"}, {"a-2", "rejected"}, {"a-3", "manual_review"}};
+  for (const auto& [applicant, status] : sent) {
+    const auto r = hSubmitAs(c, "t-a", applicant, nlohmann::json::array({hPassport}), status);
+    ctx.Equal(r.Status, 201, "a submission carrying status %s (%s)", status, r.Text());
+    const auto body = nlohmann::json::parse(r.Text());
+    const std::string caseId = body.value("case_id", "");
+    ctx.Equal(body.value("status", ""), "pending", "a body that says %s opened a case answering %s: the caller set its own verdict; the status", status, r.Text());
+    ctx.Equal(cases::load(caseId)->status, "pending", "a body that says %s must leave the case pending in the store (the verdict is the service's); the stored status", status);
+    const auto audit = ctx.Redis.LRange("kyc:audit:" + caseId, 0, -1);
+    ctx.Assert(audit.empty(), "a submission with status %s recorded the decisions %q: the endpoint decides nothing", status, audit);
+  }
 }
 
 void CheckDocumentType(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = submitAs(c, "t-a", R"({"applicant": "a-1", "documents": [)" + document("utility_bill", "documents/t-a/license-1.jpg") + "]}");
-  ctx.Equal(r.Status, 400, "a utility_bill (only passport, drivers_license and national_id prove an identity)");
-  untouched(ctx, "a utility_bill");
+  auto c = hApi(ctx);
+  const std::string license = "documents/t-a/license-1.jpg";
+  const std::vector<std::pair<std::string, nlohmann::json>> refused = {
+      {"a utility_bill", nlohmann::json::array({hDoc("utility_bill", license)})},
+      {"a bank_statement", nlohmann::json::array({hDoc("bank_statement", license)})},
+      {"a passport followed by a utility_bill", nlohmann::json::array({hPassport, hDoc("utility_bill", license)})},
+  };
+  for (const auto& [what, documents] : refused) {
+    const auto r = hSubmitAs(c, "t-a", "a-1", documents);
+    ctx.Equal(r.Status, 400, "%s (only passport, drivers_license and national_id prove an identity, and every document is checked)", what);
+    hUntouched(ctx, what);
+  }
   for (const std::string kind : {"passport", "drivers_license", "national_id"}) {
-    const auto ok = submitAs(c, "t-a", R"({"applicant": "a-)" + kind + R"(", "documents": [)" + document(kind, "documents/t-a/license-1.jpg") + "]}");
+    const auto ok = hSubmitAs(c, "t-a", "a-" + kind, nlohmann::json::array({hDoc(kind, license)}));
     ctx.Equal(ok.Status, 201, "a %s (%s)", kind, ok.Text());
   }
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = submitAs(c, "", R"({"applicant": "a-1", "documents": [)" + kPassport + "]}");
+  auto c = hApi(ctx);
+  auto r = hSubmitAs(c, "", "a-1", nlohmann::json::array({hPassport}));
   ctx.Equal(r.Status, 401, "a submission without X-Tenant-Id");
-  untouched(ctx, "a submission without X-Tenant-Id");
-  for (const std::string ref : {"documents/t-b/passport-7.jpg", "documents/t-ab/passport-3.jpg"}) {
-    r = submitAs(c, "t-a", R"({"applicant": "a-1", "documents": [)" + document("passport", ref) + "]}");
+  hUntouched(ctx, "a submission without X-Tenant-Id");
+  for (const std::string ref : {"documents/t-b/passport-7.jpg", "documents/t-ab/passport-3.jpg", "documents/t-b/t-a/passport-9.jpg"}) {
+    r = hSubmitAs(c, "t-a", "a-1", nlohmann::json::array({hDoc("passport", ref)}));
     ctx.Equal(r.Status, 403, "tenant t-a naming %s (the document is another tenant's)", ref);
-    untouched(ctx, "a ref to " + ref);
+    hUntouched(ctx, "a ref to " + ref);
   }
+  r = hSubmitAs(c, "t-a", "a-1", nlohmann::json::array({hPassport, hDoc("passport", "documents/t-b/passport-7.jpg")}));
+  ctx.Equal(r.Status, 403, "tenant t-a sending its own passport and then documents/t-b/passport-7.jpg (every document is checked)");
+  hUntouched(ctx, "its own passport followed by a ref to documents/t-b/passport-7.jpg");
 }
 `,
   },

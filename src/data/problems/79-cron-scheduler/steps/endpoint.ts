@@ -77,7 +77,7 @@ Berlin.
       id: 'frequency',
       title: 'Rejects a cadence under five minutes',
       detail:
-        '`* * * * *`, `*/2 * * * *` and `0,1 9 * * *` are **400** `too_frequent`; `*/5 * * * *` is accepted. The starter accepts any expression that parses.',
+        '`* * * * *`, `*/2 * * * *`, `*/4 * * * *`, `0,1 9 * * *` and `0,30,33 9 * * *` are **400** `too_frequent`; `*/5 * * * *` is accepted. The starter accepts any expression that parses.',
       match: {
         python: {all: [/too_frequent/, /shortest_gap_s\(/, /MIN_INTERVAL_S/]},
         typescript: {all: [/too_frequent/, /shortestGapS\(/, /MIN_INTERVAL_S/]},
@@ -112,7 +112,7 @@ Berlin.
       id: 'next-fire',
       title: "Computes next_fire on the schedule's wall clock",
       detail:
-        '`0 9 * * *` in Europe/Berlin, Asia/Kolkata and America/New_York answers the next 09:00 of that zone, in the response and in the store. The starter evaluates every expression in UTC.',
+        '`0 9 * * *` in Europe/Berlin, Asia/Kolkata and America/New_York answers the next 09:00 of that zone, in the response and in the store, and so does Europe/Berlin the day before it changes its clocks. The starter evaluates every expression in UTC.',
       match: {
         python: {all: [/next_fire\(\s*spec\s*,/], none: [/next_fire\(\s*spec\s*,\s*["']UTC["']/]},
         typescript: {all: [/nextFire\(\s*spec\s*,/], none: [/nextFire\(\s*spec\s*,\s*['"]UTC['"]/]},
@@ -703,7 +703,7 @@ void register_routes(httplib::Server& svr) {
   harness: {
     python: `import time
 
-from cronsched.cron import format_instant, next_fire, parse
+from cronsched.cron import format_instant, next_fire, parse, utc_offset_minutes
 from cronsched.store import store
 
 H = {"X-Tenant-Id": "t1"}
@@ -755,7 +755,7 @@ async def check_timezone(ctx):
 
 
 async def check_frequency(ctx):
-    for expr in ("* * * * *", "*/2 * * * *", "0,1 9 * * *"):
+    for expr in ("* * * * *", "*/2 * * * *", "*/4 * * * *", "0,1 9 * * *", "0,30,33 9 * * *"):
         r = await _post(ctx, _body(cron=expr))
         assert r.status_code == 400 and _error(r) == "too_frequent", f"cron {expr!r} answered {r.status_code} {r.text}, expected 400 too_frequent: its fires are less than five minutes apart"
     _nothing_stored(ctx, "a schedule that fires too often")
@@ -790,8 +790,20 @@ async def check_next_fire(ctx):
         assert got == expected, f"cron '0 9 * * *' in {zone} answered next_fire {got}, expected {expected}, the next 09:00 on the {zone} wall clock{on_utc}"
         stored = store.get(r.json()["id"]) or {}
         assert stored.get("next_fire") == expected, f"the stored next_fire is {stored.get('next_fire')!r}, expected {expected}"
+    # Noon UTC on the day before Europe/Berlin changes its clocks: the next 09:00 is on the other offset.
+    noon = now - now % 86400 + 12 * 3600
+    if noon < now:
+        noon += 86400
+    while utc_offset_minutes("Europe/Berlin", noon) == utc_offset_minutes("Europe/Berlin", noon + 86400):
+        noon += 86400
+    ctx.clock.advance(noon - now)
+    r = await _post(ctx, _body(cron="0 9 * * *", timezone="Europe/Berlin"))
+    assert r.status_code == 201, f"cron '0 9 * * *' in Europe/Berlin answered {r.status_code} {r.text}"
+    expected = format_instant(next_fire(spec, "Europe/Berlin", noon))
+    got = r.json().get("next_fire")
+    assert got == expected, f"at {format_instant(noon)}, the day before Europe/Berlin changes its clocks, cron '0 9 * * *' answered next_fire {got}, expected {expected}: the next 09:00 falls on the new offset, not on today's"
 `,
-    typescript: `import {formatInstant, nextFire, parse} from 'cronsched/cron';
+    typescript: `import {formatInstant, nextFire, parse, utcOffsetMinutes} from 'cronsched/cron';
 import {store} from 'cronsched/store';
 
 const H = {'X-Tenant-Id': 't1'};
@@ -844,7 +856,7 @@ export async function check_timezone(ctx) {
 
 export async function check_frequency(ctx) {
   const c = api(ctx);
-  for (const expr of ['* * * * *', '*/2 * * * *', '0,1 9 * * *']) {
+  for (const expr of ['* * * * *', '*/2 * * * *', '*/4 * * * *', '0,1 9 * * *', '0,30,33 9 * * *']) {
     const r = await c.post('/v1/schedules', {json: body({cron: expr}), headers: H});
     assert(r.status === 400 && errorOf(r) === 'too_frequent', \`cron '\${expr}' answered \${r.status} \${r.text}, expected 400 too_frequent: its fires are less than five minutes apart\`);
   }
@@ -883,6 +895,16 @@ export async function check_next_fire(ctx) {
     const stored = await store.get(r.json().id);
     assert.equal(stored?.next_fire, expected, \`the stored next_fire is \${JSON.stringify(stored?.next_fire)}, expected \${expected}\`);
   }
+  // Noon UTC on the day before Europe/Berlin changes its clocks: the next 09:00 is on the other offset.
+  let noon = now - (now % 86400) + 12 * 3600;
+  if (noon < now) noon += 86400;
+  while (utcOffsetMinutes('Europe/Berlin', noon) === utcOffsetMinutes('Europe/Berlin', noon + 86400)) noon += 86400;
+  ctx.clock.advance(noon - now);
+  const r = await c.post('/v1/schedules', {json: body({cron: '0 9 * * *', timezone: 'Europe/Berlin'}), headers: H});
+  assert.equal(r.status, 201, \`cron '0 9 * * *' in Europe/Berlin answered \${r.status} \${r.text}\`);
+  const expected = formatInstant(nextFire(spec, 'Europe/Berlin', noon));
+  const got = r.json().next_fire;
+  assert.equal(got, expected, \`at \${formatInstant(noon)}, the day before Europe/Berlin changes its clocks, cron '0 9 * * *' answered next_fire \${got}, expected \${expected}: the next 09:00 falls on the new offset, not on today's\`);
 }
 `,
     go: `package main
@@ -968,7 +990,7 @@ func CheckTimezone(ctx *harness.Ctx) {
 
 func CheckFrequency(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	for _, expr := range []string{"* * * * *", "*/2 * * * *", "0,1 9 * * *"} {
+	for _, expr := range []string{"* * * * *", "*/2 * * * *", "*/4 * * * *", "0,1 9 * * *", "0,30,33 9 * * *"} {
 		r := apiPost(c, apiBody("cron", expr))
 		ctx.Assert(r.Status == 400 && apiField(r, "error") == "too_frequent", "cron %q answered %d %s, expected 400 too_frequent: its fires are less than five minutes apart", expr, r.Status, r.Text())
 	}
@@ -1011,6 +1033,20 @@ func CheckNextFire(ctx *harness.Ctx) {
 		ctx.Assert(got == expected, "cron '0 9 * * *' in %s answered next_fire %s, expected %s, the next 09:00 on the %s wall clock%s", zone, got, expected, zone, onUTC)
 		ctx.Equal(apiStored(ctx, r).NextFire, expected, "the stored next_fire")
 	}
+	// Noon UTC on the day before Europe/Berlin changes its clocks: the next 09:00 is on the other offset.
+	noon := now - now%86400 + 12*3600
+	if noon < now {
+		noon += 86400
+	}
+	for cron.OffsetMinutes("Europe/Berlin", noon) == cron.OffsetMinutes("Europe/Berlin", noon+86400) {
+		noon += 86400
+	}
+	ctx.Clock.Advance(float64(noon - now))
+	r := apiPost(c, apiBody("cron", "0 9 * * *", "timezone", "Europe/Berlin"))
+	ctx.Equal(r.Status, 201, "cron '0 9 * * *' in Europe/Berlin (%s)", r.Text())
+	fire, _ := cron.NextFire(spec, "Europe/Berlin", noon)
+	got := apiField(r, "next_fire")
+	ctx.Assert(got == cron.FormatInstant(fire), "at %s, the day before Europe/Berlin changes its clocks, cron '0 9 * * *' answered next_fire %s, expected %s: the next 09:00 falls on the new offset, not on today's", cron.FormatInstant(noon), got, cron.FormatInstant(fire))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1092,7 +1128,7 @@ void CheckTimezone(harness::Ctx& ctx) {
 void CheckFrequency(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
   auto body = apiBody();
-  for (const std::string expr : {"* * * * *", "*/2 * * * *", "0,1 9 * * *"}) {
+  for (const std::string expr : {"* * * * *", "*/2 * * * *", "*/4 * * * *", "0,1 9 * * *", "0,30,33 9 * * *"}) {
     body["cron"] = expr;
     const auto r = apiPost(c, body);
     ctx.Assert(r.Status == 400 && apiField(r, "error") == "too_frequent",
@@ -1143,6 +1179,20 @@ void CheckNextFire(harness::Ctx& ctx) {
                expected, zone, on_utc);
     ctx.Equal(apiStored(r).next_fire, expected, "the stored next_fire");
   }
+  // Noon UTC on the day before Europe/Berlin changes its clocks: the next 09:00 is on the other offset.
+  int64_t noon = now - now % 86400 + 12 * 3600;
+  if (noon < now) noon += 86400;
+  while (cronsched::cron::OffsetMinutes("Europe/Berlin", noon) == cronsched::cron::OffsetMinutes("Europe/Berlin", noon + 86400)) noon += 86400;
+  ctx.Clock.Advance(static_cast<double>(noon - now));
+  body["timezone"] = "Europe/Berlin";
+  const auto r = apiPost(c, body);
+  ctx.Equal(r.Status, 201, "cron '0 9 * * *' in Europe/Berlin (%s)", r.Text());
+  const std::string expected = cronsched::cron::FormatInstant(*cronsched::cron::NextFire(spec, "Europe/Berlin", noon));
+  const std::string got = apiField(r, "next_fire");
+  ctx.Assert(got == expected,
+             "at %s, the day before Europe/Berlin changes its clocks, cron '0 9 * * *' answered next_fire %s, expected %s: the next 09:00 "
+             "falls on the new offset, not on today's",
+             cronsched::cron::FormatInstant(noon), got, expected);
 }
 `,
   },

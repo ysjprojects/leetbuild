@@ -68,7 +68,7 @@ cases; and an applicant reference reused by another tenant lands on the first te
       id: 'attempt-window',
       title: 'The window expires and the refusal says when',
       detail:
-        'The script gives the counter its `EXPIRE` on the first attempt and answers its `TTL`, and a refusal returns that TTL as the retry delay; a constant delay tells the client the wrong time, and a counter without an expiry never lets the applicant back in.',
+        'The script gives the counter its `EXPIRE` on the first attempt, in the same step that counts it, and answers its `TTL`; later attempts do not move the window, and a refusal returns that TTL as the retry delay. A constant delay tells the client the wrong time, and a counter without an expiry never lets the applicant back in.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/RETRY_AFTER_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /redis\.call\(\s*['"]TTL['"]/], none: [/RETRY_AFTER_S/]},
@@ -566,17 +566,23 @@ def check_atomic_attempts(ctx):
 
 def check_attempt_window(ctx):
     m = ctx.load("state")
-    for _ in range(4):
-        m.reserve_attempt("t-a", "a-1")
-    ttl = ctx.redis.ttl("kyc:attempts:t-a:a-1")
-    assert 0 < ttl <= 3600, f"kyc:attempts:t-a:a-1 has TTL {ttl}: the counter must expire ATTEMPT_WINDOW_S after the first attempt"
+    # The TTL is read right after the first reservation's own command, before anything else can run.
+    first = ctx.redis_after("kyc:attempts:t-a:a-1", lambda: ctx.redis.ttl("kyc:attempts:t-a:a-1"))
+    allowed, _ = m.reserve_attempt("t-a", "a-1")
+    assert allowed, "the first attempt was refused"
+    ttl = _settled(first, "kyc:attempts:t-a:a-1")
+    assert 0 < ttl <= 3600, f"kyc:attempts:t-a:a-1 has TTL {ttl} right after the first attempt's first command on it: the script that counts the first attempt must EXPIRE the counter ATTEMPT_WINDOW_S in the same step"
+    ctx.clock.advance(1000)
+    for n in range(2, 5):
+        allowed, _ = m.reserve_attempt("t-a", "a-1")
+        assert allowed, f"attempt {n} of 4 was refused"
     ctx.clock.advance(600)
     allowed, retry_after = m.reserve_attempt("t-a", "a-1")
     assert not allowed, "the 5th attempt inside the window was reserved"
-    assert 2990 <= retry_after <= 3000, f"600 s into a 3600 s window the refusal says retry in {retry_after} s, expected the ~3000 s left (the key's TTL)"
-    ctx.clock.advance(3001)
+    assert 1990 <= retry_after <= 2000, f"attempts at 0 s and 1000 s, then a refusal at 1600 s says retry in {retry_after} s, expected the ~2000 s left in the window the first attempt opened (the key's TTL)"
+    ctx.clock.advance(2001)
     allowed, _ = m.reserve_attempt("t-a", "a-1")
-    assert allowed, "after the window ended the applicant was still refused: the counter never expires"
+    assert allowed, "after the window the first attempt opened ended, the applicant was still refused"
 
 
 def check_single_case(ctx):
@@ -591,6 +597,8 @@ def check_single_case(ctx):
     assert [mine[1], theirs[1]].count(True) == 1, f"exactly one of two racing submissions may report created, got {mine} and {theirs}"
     opened = ctx.redis.keys("kyc:case:c-*")
     assert len(opened) == 1, f"the race left {sorted(opened)} in the case store, expected one case"
+    newest = cases.lookup("t-a", "a-1")
+    assert newest is not None and newest["case_id"] == mine[0], f"after the race the applicant's newest case is {newest and newest['case_id']!r}, expected the open case {mine[0]}: only the claim's winner writes a case"
 
 
 def check_case_scope(ctx):
@@ -626,15 +634,19 @@ export async function check_atomic_attempts(ctx) {
 
 export async function check_attempt_window(ctx) {
   const m = ctx.load('state');
-  for (let n = 0; n < 4; n += 1) await m.reserveAttempt('t-a', 'a-1');
-  const ttl = Number(ctx.redis.ttl('kyc:attempts:t-a:a-1'));
-  assert(ttl > 0 && ttl <= 3600, \`kyc:attempts:t-a:a-1 has TTL \${ttl}: the counter must expire ATTEMPT_WINDOW_S after the first attempt\`);
+  // The TTL is read right after the first reservation's own command, before anything else can run.
+  const first = ctx.redisAfter('kyc:attempts:t-a:a-1', () => ctx.redis.ttl('kyc:attempts:t-a:a-1'));
+  assert((await m.reserveAttempt('t-a', 'a-1')).allowed, 'the first attempt was refused');
+  const ttl = Number(await settled(first, 'kyc:attempts:t-a:a-1'));
+  assert(ttl > 0 && ttl <= 3600, \`kyc:attempts:t-a:a-1 has TTL \${ttl} right after the first attempt's first command on it: the script that counts the first attempt must EXPIRE the counter ATTEMPT_WINDOW_S in the same step\`);
+  ctx.clock.advance(1000);
+  for (let n = 2; n <= 4; n += 1) assert((await m.reserveAttempt('t-a', 'a-1')).allowed, \`attempt \${n} of 4 was refused\`);
   ctx.clock.advance(600);
   const refused = await m.reserveAttempt('t-a', 'a-1');
   assert(!refused.allowed, 'the 5th attempt inside the window was reserved');
-  assert(refused.retryAfterS >= 2990 && refused.retryAfterS <= 3000, \`600 s into a 3600 s window the refusal says retry in \${refused.retryAfterS} s, expected the ~3000 s left (the key's TTL)\`);
-  ctx.clock.advance(3001);
-  assert((await m.reserveAttempt('t-a', 'a-1')).allowed, 'after the window ended the applicant was still refused: the counter never expires');
+  assert(refused.retryAfterS >= 1990 && refused.retryAfterS <= 2000, \`attempts at 0 s and 1000 s, then a refusal at 1600 s says retry in \${refused.retryAfterS} s, expected the ~2000 s left in the window the first attempt opened (the key's TTL)\`);
+  ctx.clock.advance(2001);
+  assert((await m.reserveAttempt('t-a', 'a-1')).allowed, 'after the window the first attempt opened ended, the applicant was still refused');
 }
 
 export async function check_single_case(ctx) {
@@ -649,6 +661,8 @@ export async function check_single_case(ctx) {
   assert.equal([mine.created, theirs.created].filter(Boolean).length, 1, \`exactly one of two racing submissions may report created, got \${JSON.stringify(mine)} and \${JSON.stringify(theirs)}\`);
   const opened = ctx.redis.keys('kyc:case:c-*');
   assert.equal(opened.length, 1, \`the race left \${JSON.stringify(opened)} in the case store, expected one case\`);
+  const newest = await ctx.load('/support/kyc/cases.ts').lookup('t-a', 'a-1');
+  assert.equal(newest?.case_id, mine.caseId, \`after the race the applicant's newest case is \${newest?.case_id}, expected the open case \${mine.caseId}: only the claim's winner writes a case\`);
 }
 
 export async function check_case_scope(ctx) {
@@ -675,40 +689,40 @@ import (
 )
 
 var (
-	stateBg = context.Background()
-	docs    = []cases.Document{{Type: "passport", Ref: "documents/t-a/passport-1.jpg", Digest: "sha256:5e1f0c"}}
+	hStateBg = context.Background()
+	hDocs    = []cases.Document{{Type: "passport", Ref: "documents/t-a/passport-1.jpg", Digest: "sha256:5e1f0c"}}
 )
 
-type opened struct {
+type hOpened struct {
 	caseID  string
 	created bool
 	err     error
 }
 
-func mustReserve(ctx *harness.Ctx) (bool, int64) {
-	allowed, retryAfter, err := reserveAttempt(stateBg, "t-a", "a-1")
+func hMustReserve(ctx *harness.Ctx) (bool, int64) {
+	allowed, retryAfter, err := reserveAttempt(hStateBg, "t-a", "a-1")
 	ctx.NoError(err, "reserveAttempt(t-a, a-1) failed")
 	return allowed, retryAfter
 }
 
-func mustOpen(ctx *harness.Ctx, tenant string) opened {
-	caseID, created, err := openCase(stateBg, tenant, "a-1", docs)
+func hMustOpen(ctx *harness.Ctx, tenant string) hOpened {
+	caseID, created, err := openCase(hStateBg, tenant, "a-1", hDocs)
 	ctx.NoError(err, "openCase(%s, a-1) failed", tenant)
-	return opened{caseID, created, nil}
+	return hOpened{caseID, created, nil}
 }
 
 func CheckAtomicAttempts(ctx *harness.Ctx) {
 	for n := 1; n <= 3; n++ {
-		allowed, _ := mustReserve(ctx)
+		allowed, _ := hMustReserve(ctx)
 		ctx.Assert(allowed, "attempt %d of 4 was refused", n)
 	}
 	// A second submission of the same applicant lands while this one is reserving the 4th attempt.
 	rival := ctx.Redis.After("kyc:attempts:t-a:a-1", func() any {
-		allowed, _, err := reserveAttempt(stateBg, "t-a", "a-1")
+		allowed, _, err := reserveAttempt(hStateBg, "t-a", "a-1")
 		ctx.NoError(err, "the rival reservation failed")
 		return allowed
 	})
-	mine, _ := mustReserve(ctx)
+	mine, _ := hMustReserve(ctx)
 	ctx.Assert(rival.Fired, "nothing touched kyc:attempts:t-a:a-1")
 	theirs, _ := rival.Result.(bool)
 	ctx.Assert(!(mine && theirs), "two submissions racing for the 4th attempt were both granted: five attempts passed a cap of four. Read, compare and INCR in one script")
@@ -718,48 +732,57 @@ func CheckAtomicAttempts(ctx *harness.Ctx) {
 }
 
 func CheckAttemptWindow(ctx *harness.Ctx) {
-	for n := 0; n < 4; n++ {
-		mustReserve(ctx)
+	// The TTL is read right after the first reservation's own command, before anything else can run.
+	first := ctx.Redis.After("kyc:attempts:t-a:a-1", func() any { return ctx.Redis.TTL("kyc:attempts:t-a:a-1") })
+	allowed, _ := hMustReserve(ctx)
+	ctx.Assert(allowed, "the first attempt was refused")
+	ctx.Assert(first.Fired, "nothing touched kyc:attempts:t-a:a-1")
+	ttl, _ := first.Result.(int64)
+	ctx.Assert(ttl > 0 && ttl <= 3600, "kyc:attempts:t-a:a-1 has TTL %d right after the first attempt's first command on it: the script that counts the first attempt must EXPIRE the counter attemptWindowS in the same step", ttl)
+	ctx.Clock.Advance(1000)
+	for n := 2; n <= 4; n++ {
+		allowed, _ = hMustReserve(ctx)
+		ctx.Assert(allowed, "attempt %d of 4 was refused", n)
 	}
-	ttl := ctx.Redis.TTL("kyc:attempts:t-a:a-1")
-	ctx.Assert(ttl > 0 && ttl <= 3600, "kyc:attempts:t-a:a-1 has TTL %d: the counter must expire attemptWindowS after the first attempt", ttl)
 	ctx.Clock.Advance(600)
-	allowed, retryAfter := mustReserve(ctx)
+	allowed, retryAfter := hMustReserve(ctx)
 	ctx.Assert(!allowed, "the 5th attempt inside the window was reserved")
-	ctx.Assert(retryAfter >= 2990 && retryAfter <= 3000, "600 s into a 3600 s window the refusal says retry in %d s, expected the ~3000 s left (the key's TTL)", retryAfter)
-	ctx.Clock.Advance(3001)
-	allowed, _ = mustReserve(ctx)
-	ctx.Assert(allowed, "after the window ended the applicant was still refused: the counter never expires")
+	ctx.Assert(retryAfter >= 1990 && retryAfter <= 2000, "attempts at 0 s and 1000 s, then a refusal at 1600 s says retry in %d s, expected the ~2000 s left in the window the first attempt opened (the key's TTL)", retryAfter)
+	ctx.Clock.Advance(2001)
+	allowed, _ = hMustReserve(ctx)
+	ctx.Assert(allowed, "after the window the first attempt opened ended, the applicant was still refused")
 }
 
 func CheckSingleCase(ctx *harness.Ctx) {
 	// A second submission of the same applicant lands right after this one first touches the active-case key.
-	var theirs *opened
+	var theirs *hOpened
 	for _, key := range []string{"kyc:active:t-a:a-1", "kyc:active:a-1"} {
 		ctx.Redis.After(key, func() any {
 			if theirs == nil {
-				caseID, created, err := openCase(stateBg, "t-a", "a-1", docs)
-				theirs = &opened{caseID, created, err}
+				caseID, created, err := openCase(hStateBg, "t-a", "a-1", hDocs)
+				theirs = &hOpened{caseID, created, err}
 			}
 			return nil
 		})
 	}
-	mine := mustOpen(ctx, "t-a")
+	mine := hMustOpen(ctx, "t-a")
 	ctx.Assert(theirs != nil, "openCase never touched the active-case key")
 	ctx.NoError(theirs.err, "the rival openCase failed")
 	ctx.Assert(mine.caseID == theirs.caseID, "two submissions of one applicant opened two cases: %s and %s. Claim the key with SET NX and create the case only when the claim won", mine.caseID, theirs.caseID)
 	ctx.Assert(mine.created != theirs.created, "exactly one of two racing submissions may report created, got %v and %v", mine.created, theirs.created)
 	ctx.Equal(len(ctx.Redis.Keys("kyc:case:c-*")), 1, "the race must leave one case in the store (%q)", ctx.Redis.Keys("kyc:case:c-*"))
+	newest := cases.Lookup(hStateBg, "t-a", "a-1")
+	ctx.Assert(newest != nil && newest.CaseID == mine.caseID, "after the race the applicant's newest case is %+v, expected the open case %s: only the claim's winner writes a case", newest, mine.caseID)
 }
 
 func CheckCaseScope(ctx *harness.Ctx) {
-	first := mustOpen(ctx, "t-a")
+	first := hMustOpen(ctx, "t-a")
 	ctx.Assert(first.created, "the first submission must open a case")
-	again := mustOpen(ctx, "t-a")
+	again := hMustOpen(ctx, "t-a")
 	ctx.Assert(again.caseID == first.caseID && !again.created, "a second submission in t-a must answer the open case %s with created false, got %s %v", first.caseID, again.caseID, again.created)
-	other := mustOpen(ctx, "t-b")
+	other := hMustOpen(ctx, "t-b")
 	ctx.Assert(other.created && other.caseID != first.caseID, "applicant a-1 of tenant t-b was handed t-a's case %s: the active case key must name the tenant", other.caseID)
-	ctx.Equal(cases.Load(stateBg, other.caseID).Tenant, "t-b", "t-b's case must belong to t-b; its tenant")
+	ctx.Equal(cases.Load(hStateBg, other.caseID).Tenant, "t-b", "t-b's case must belong to t-b; its tenant")
 	active, _ := ctx.Redis.Get("kyc:active:t-a:a-1")
 	ctx.Equal(active, first.caseID, "kyc:active:t-a:a-1")
 }
@@ -775,16 +798,16 @@ func CheckCaseScope(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<cases::Document> kDocs = {{"passport", "documents/t-a/passport-1.jpg", "sha256:5e1f0c"}};
+const std::vector<cases::Document> hDocs = {{"passport", "documents/t-a/passport-1.jpg", "sha256:5e1f0c"}};
 
-struct Rival {
+struct HRival {
   bool fired = false;
   bool allowed = false;
   Opened opened;
   std::optional<std::string> err;
 };
 
-void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
+void hSettled(harness::Ctx& ctx, const HRival& r, const std::string& what) {
   ctx.Assert(r.fired, "nothing touched %s", what);
   ctx.Assert(!r.err, "the parallel call failed: %s", r.err.value_or(""));
 }
@@ -794,7 +817,7 @@ void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
 void CheckAtomicAttempts(harness::Ctx& ctx) {
   for (int n = 1; n <= 3; n++) ctx.Assert(reserveAttempt("t-a", "a-1").allowed, "attempt %d of 4 was refused", n);
   // A second submission of the same applicant lands while this one is reserving the 4th attempt.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After("kyc:attempts:t-a:a-1", [rival] {
     rival->fired = true;
     try {
@@ -804,51 +827,59 @@ void CheckAtomicAttempts(harness::Ctx& ctx) {
     }
   });
   const bool mine = reserveAttempt("t-a", "a-1").allowed;
-  settled(ctx, *rival, "kyc:attempts:t-a:a-1");
+  hSettled(ctx, *rival, "kyc:attempts:t-a:a-1");
   ctx.Assert(!(mine && rival->allowed), "two submissions racing for the 4th attempt were both granted: five attempts passed a cap of four. Read, compare and INCR in one script");
   ctx.Assert(mine || rival->allowed, "of two submissions racing for the 4th attempt neither was granted");
   ctx.Equal(ctx.Redis.Get("kyc:attempts:t-a:a-1"), std::optional<std::string>("4"), "kyc:attempts:t-a:a-1 after the race");
 }
 
 void CheckAttemptWindow(harness::Ctx& ctx) {
-  for (int n = 0; n < 4; n++) reserveAttempt("t-a", "a-1");
-  const long long ttl = ctx.Redis.TTL("kyc:attempts:t-a:a-1");
-  ctx.Assert(ttl > 0 && ttl <= 3600, "kyc:attempts:t-a:a-1 has TTL %d: the counter must expire kAttemptWindowS after the first attempt", ttl);
+  // The TTL is read right after the first reservation's own command, before anything else can run.
+  auto first = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After("kyc:attempts:t-a:a-1", [&ctx, first] { *first = ctx.Redis.TTL("kyc:attempts:t-a:a-1"); });
+  ctx.Assert(reserveAttempt("t-a", "a-1").allowed, "the first attempt was refused");
+  ctx.Assert(first->has_value(), "nothing touched kyc:attempts:t-a:a-1");
+  const long long ttl = first->value();
+  ctx.Assert(ttl > 0 && ttl <= 3600, "kyc:attempts:t-a:a-1 has TTL %d right after the first attempt's first command on it: the script that counts the first attempt must EXPIRE the counter kAttemptWindowS in the same step", ttl);
+  ctx.Clock.Advance(1000);
+  for (int n = 2; n <= 4; n++) ctx.Assert(reserveAttempt("t-a", "a-1").allowed, "attempt %d of 4 was refused", n);
   ctx.Clock.Advance(600);
   const Reservation refused = reserveAttempt("t-a", "a-1");
   ctx.Assert(!refused.allowed, "the 5th attempt inside the window was reserved");
-  ctx.Assert(refused.retry_after_s >= 2990 && refused.retry_after_s <= 3000, "600 s into a 3600 s window the refusal says retry in %d s, expected the ~3000 s left (the key's TTL)", refused.retry_after_s);
-  ctx.Clock.Advance(3001);
-  ctx.Assert(reserveAttempt("t-a", "a-1").allowed, "after the window ended the applicant was still refused: the counter never expires");
+  ctx.Assert(refused.retry_after_s >= 1990 && refused.retry_after_s <= 2000, "attempts at 0 s and 1000 s, then a refusal at 1600 s says retry in %d s, expected the ~2000 s left in the window the first attempt opened (the key's TTL)", refused.retry_after_s);
+  ctx.Clock.Advance(2001);
+  ctx.Assert(reserveAttempt("t-a", "a-1").allowed, "after the window the first attempt opened ended, the applicant was still refused");
 }
 
 void CheckSingleCase(harness::Ctx& ctx) {
   // A second submission of the same applicant lands right after this one first touches the active-case key.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   for (const std::string key : {"kyc:active:t-a:a-1", "kyc:active:a-1"}) {
     ctx.Redis.After(key, [rival] {
       if (rival->fired) return;
       rival->fired = true;
       try {
-        rival->opened = openCase("t-a", "a-1", kDocs);
+        rival->opened = openCase("t-a", "a-1", hDocs);
       } catch (const std::exception& e) {
         rival->err = e.what();
       }
     });
   }
-  const Opened mine = openCase("t-a", "a-1", kDocs);
-  settled(ctx, *rival, "the active-case key");
+  const Opened mine = openCase("t-a", "a-1", hDocs);
+  hSettled(ctx, *rival, "the active-case key");
   ctx.Assert(mine.case_id == rival->opened.case_id, "two submissions of one applicant opened two cases: %s and %s. Claim the key with SET NX and create the case only when the claim won", mine.case_id, rival->opened.case_id);
   ctx.Assert(mine.created != rival->opened.created, "exactly one of two racing submissions may report created, got %t and %t", mine.created, rival->opened.created);
   ctx.Equal(ctx.Redis.Keys("kyc:case:c-*").size(), 1, "the race must leave one case in the store (%q)", ctx.Redis.Keys("kyc:case:c-*"));
+  const auto newest = cases::lookup("t-a", "a-1");
+  ctx.Assert(newest && newest->case_id == mine.case_id, "after the race the applicant's newest case is %s, expected the open case %s: only the claim's winner writes a case", newest ? newest->case_id : "none", mine.case_id);
 }
 
 void CheckCaseScope(harness::Ctx& ctx) {
-  const Opened first = openCase("t-a", "a-1", kDocs);
+  const Opened first = openCase("t-a", "a-1", hDocs);
   ctx.Assert(first.created, "the first submission must open a case");
-  const Opened again = openCase("t-a", "a-1", kDocs);
+  const Opened again = openCase("t-a", "a-1", hDocs);
   ctx.Assert(again.case_id == first.case_id && !again.created, "a second submission in t-a must answer the open case %s with created false, got %s %t", first.case_id, again.case_id, again.created);
-  const Opened other = openCase("t-b", "a-1", kDocs);
+  const Opened other = openCase("t-b", "a-1", hDocs);
   ctx.Assert(other.created && other.case_id != first.case_id, "applicant a-1 of tenant t-b was handed t-a's case %s: the active case key must name the tenant", other.case_id);
   ctx.Equal(cases::load(other.case_id)->tenant, "t-b", "t-b's case must belong to t-b; its tenant");
   ctx.Equal(ctx.Redis.Get("kyc:active:t-a:a-1"), std::optional<std::string>(first.case_id), "kyc:active:t-a:a-1");

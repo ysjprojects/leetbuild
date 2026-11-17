@@ -70,7 +70,7 @@ rules are explained as "in rollout"; and a shared cache hands one user's explana
       id: 'same-decision',
       title: 'Answers the decision evaluate serves',
       detail:
-        "The explanation is `engine.evaluate` with the user's attributes, so kills and targeting rules count; the starter recomputes a bucket with `engine.bucket` and skips both.",
+        "The explanation is `engine.evaluate` with the user's attributes (every registered attribute the query names), so kills and targeting rules count; the starter recomputes a bucket with `engine.bucket` and skips both.",
       match: {
         python: {all: [/engine\.evaluate\(/], none: [/engine\.bucket\(/]},
         typescript: {all: [/\bevaluate\(/], none: [/\bbucket\(/]},
@@ -83,7 +83,7 @@ rules are explained as "in rollout"; and a shared cache hands one user's explana
       id: 'private',
       title: 'Cache-Control: private, no-store',
       detail:
-        'An explanation belongs to one user: `private, no-store` keeps it out of every shared cache; the starter answers `public, max-age=60`.',
+        'An explanation belongs to one user: `private, no-store` on every response, the 401, 403 and 404 included, keeps it out of every shared cache; the starter answers `public, max-age=60`.',
       match: {
         python: {all: [/private,\s*no-store/], none: [/public/]},
         typescript: {all: [/private,\s*no-store/], none: [/public/]},
@@ -479,6 +479,7 @@ SNAPSHOT = {
         "checkout": _flag(100, [{"attribute": "country", "operator": "eq", "value": "US"}]),
         "search-v2": _flag(100, killed=True),
         "beta": _flag(0),
+        "new-app": _flag(100, [{"attribute": "app_version", "operator": "gt", "value": 5}]),
     },
 }
 
@@ -518,7 +519,8 @@ async def check_caller_only(ctx):
 
 async def check_same_decision(ctx):
     async with _read(ctx) as c:
-        for flag_key, attrs in (("checkout", {"country": "DE"}), ("checkout", {"country": "US"}), ("search-v2", {})):
+        cases = (("checkout", {"country": "DE"}), ("checkout", {"country": "US"}), ("search-v2", {}), ("new-app", {"app_version": "7"}), ("new-app", {"app_version": "3"}))
+        for flag_key, attrs in cases:
             r = await _explain(c, flag_key, **attrs)
             assert r.status_code == 200, f"explaining {flag_key} {attrs} answered {r.status_code}: {r.text}"
             body = r.json()
@@ -530,10 +532,16 @@ async def check_same_decision(ctx):
 
 async def check_private(ctx):
     async with _read(ctx) as c:
-        r = await _explain(c, "beta")
-    directives = {d.strip() for d in r.headers.get("cache-control", "").split(",") if d.strip()}
-    assert "public" not in directives, f"the explanation answered Cache-Control {r.headers.get('cache-control')!r}: a shared cache will hand u-7's explanation to the next caller"
-    assert "private" in directives and "no-store" in directives, f"the explanation answered Cache-Control {r.headers.get('cache-control')!r}, expected private, no-store"
+        answers = [
+            ("the explanation", await _explain(c, "beta")),
+            ("the 401 without X-User-Id", await _explain(c, "beta", user=None)),
+            ("the 403 for another user", await _explain(c, "beta", user_id="u-42")),
+            ("the 404 for an unknown flag", await _explain(c, "ghost")),
+        ]
+    for what, r in answers:
+        directives = {d.strip() for d in r.headers.get("cache-control", "").split(",") if d.strip()}
+        assert "public" not in directives, f"{what} answered Cache-Control {r.headers.get('cache-control')!r}: a shared cache will hand u-7's explanation to the next caller"
+        assert "private" in directives and "no-store" in directives, f"{what} ({r.status_code}) answered Cache-Control {r.headers.get('cache-control')!r}, expected private, no-store on every response"
 `,
     typescript: `const flag = (rollout: number, rules: unknown[] = [], killed = false) => ({default: false, rules, rollout, salt: '2026', killed});
 
@@ -543,6 +551,7 @@ const SNAPSHOT = {
     checkout: flag(100, [{attribute: 'country', operator: 'eq', value: 'US'}]),
     'search-v2': flag(100, [], true),
     beta: flag(0),
+    'new-app': flag(100, [{attribute: 'app_version', operator: 'gt', value: 5}]),
   },
 };
 
@@ -586,6 +595,8 @@ export async function check_same_decision(ctx) {
     ['checkout', {country: 'DE'}],
     ['checkout', {country: 'US'}],
     ['search-v2', {}],
+    ['new-app', {app_version: '7'}],
+    ['new-app', {app_version: '3'}],
   ];
   for (const [flagKey, attrs] of cases) {
     const r = await explain(c, flagKey, 'u-7', attrs);
@@ -600,10 +611,18 @@ export async function check_same_decision(ctx) {
 
 export async function check_private(ctx) {
   const {c} = await read(ctx);
-  const r = await explain(c, 'beta');
-  const directives = new Set(String(r.headers['cache-control'] ?? '').split(',').map(d => d.trim()).filter(d => d !== ''));
-  assert(!directives.has('public'), \`the explanation answered Cache-Control \${JSON.stringify(r.headers['cache-control'])}: a shared cache will hand u-7's explanation to the next caller\`);
-  assert(directives.has('private') && directives.has('no-store'), \`the explanation answered Cache-Control \${JSON.stringify(r.headers['cache-control'])}, expected private, no-store\`);
+  const answers: [string, {status: number; headers: Record<string, unknown>}][] = [
+    ['the explanation', await explain(c, 'beta')],
+    ['the 401 without X-User-Id', await explain(c, 'beta', null)],
+    ['the 403 for another user', await explain(c, 'beta', 'u-7', {user_id: 'u-42'})],
+    ['the 404 for an unknown flag', await explain(c, 'ghost')],
+  ];
+  for (const [what, r] of answers) {
+    const header = r.headers['cache-control'];
+    const directives = new Set(String(header ?? '').split(',').map(d => d.trim()).filter(d => d !== ''));
+    assert(!directives.has('public'), \`\${what} answered Cache-Control \${JSON.stringify(header)}: a shared cache will hand u-7's explanation to the next caller\`);
+    assert(directives.has('private') && directives.has('no-store'), \`\${what} (\${r.status}) answered Cache-Control \${JSON.stringify(header)}, expected private, no-store on every response\`);
+  }
 }
 `,
     go: `package main
@@ -627,6 +646,7 @@ func readSetup(ctx *harness.Ctx) *harness.HTTP {
 		"checkout":  {Rollout: 100, Salt: "2026", Rules: []registry.Rule{{Attribute: "country", Operator: "eq", Value: "US"}}},
 		"search-v2": {Rollout: 100, Salt: "2026", Killed: true},
 		"beta":      {Rollout: 0, Salt: "2026"},
+		"new-app":   {Rollout: 100, Salt: "2026", Rules: []registry.Rule{{Attribute: "app_version", Operator: "gt", Value: 5}}},
 	}}
 	moved, err := engine.PublishSnapshot(readBg, s)
 	ctx.Assert(err == nil && moved, "seeding version 3 failed: %v", err)
@@ -680,7 +700,13 @@ func CheckSameDecision(ctx *harness.Ctx) {
 	cases := []struct {
 		flagKey string
 		attrs   map[string]string
-	}{{"checkout", map[string]string{"country": "DE"}}, {"checkout", map[string]string{"country": "US"}}, {"search-v2", map[string]string{}}}
+	}{
+		{"checkout", map[string]string{"country": "DE"}},
+		{"checkout", map[string]string{"country": "US"}},
+		{"search-v2", map[string]string{}},
+		{"new-app", map[string]string{"app_version": "7"}},
+		{"new-app", map[string]string{"app_version": "3"}},
+	}
 	for _, tc := range cases {
 		query := url.Values{}
 		attrs := map[string]string{"user_id": "u-7"}
@@ -699,15 +725,26 @@ func CheckSameDecision(ctx *harness.Ctx) {
 
 func CheckPrivate(ctx *harness.Ctx) {
 	c := readSetup(ctx)
-	r := readExplain(c, "beta", "u-7", nil)
-	directives := map[string]bool{}
-	for _, d := range strings.Split(r.Header.Get("Cache-Control"), ",") {
-		if d = strings.TrimSpace(d); d != "" {
-			directives[d] = true
-		}
+	answers := []struct {
+		what string
+		r    *harness.Response
+	}{
+		{"the explanation", readExplain(c, "beta", "u-7", nil)},
+		{"the 401 without X-User-Id", readExplain(c, "beta", "", nil)},
+		{"the 403 for another user", readExplain(c, "beta", "u-7", url.Values{"user_id": {"u-42"}})},
+		{"the 404 for an unknown flag", readExplain(c, "ghost", "u-7", nil)},
 	}
-	ctx.Assert(!directives["public"], "the explanation answered Cache-Control %q: a shared cache will hand u-7's explanation to the next caller", r.Header.Get("Cache-Control"))
-	ctx.Assert(directives["private"] && directives["no-store"], "the explanation answered Cache-Control %q, expected private, no-store", r.Header.Get("Cache-Control"))
+	for _, a := range answers {
+		header := a.r.Header.Get("Cache-Control")
+		directives := map[string]bool{}
+		for _, d := range strings.Split(header, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				directives[d] = true
+			}
+		}
+		ctx.Assert(!directives["public"], "%s answered Cache-Control %q: a shared cache will hand u-7's explanation to the next caller", a.what, header)
+		ctx.Assert(directives["private"] && directives["no-store"], "%s (%d) answered Cache-Control %q, expected private, no-store on every response", a.what, a.r.Status, header)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -733,7 +770,8 @@ harness::HTTP readSetup(harness::Ctx& ctx) {
       {"flags",
        {{"checkout", flag(100, nlohmann::json::parse(R"([{"attribute": "country", "operator": "eq", "value": "US"}])"), false)},
         {"search-v2", flag(100, nlohmann::json::array(), true)},
-        {"beta", flag(0, nlohmann::json::array(), false)}}}};
+        {"beta", flag(0, nlohmann::json::array(), false)},
+        {"new-app", flag(100, nlohmann::json::parse(R"([{"attribute": "app_version", "operator": "gt", "value": 5}])"), false)}}}};
   ctx.Assert(engine::publishSnapshot(snapshot), "seeding version 3 failed");
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -781,7 +819,7 @@ void CheckCallerOnly(harness::Ctx& ctx) {
 void CheckSameDecision(harness::Ctx& ctx) {
   auto c = readSetup(ctx);
   const std::vector<std::pair<std::string, std::map<std::string, std::string>>> cases = {
-      {"checkout", {{"country", "DE"}}}, {"checkout", {{"country", "US"}}}, {"search-v2", {}}};
+      {"checkout", {{"country", "DE"}}}, {"checkout", {{"country", "US"}}}, {"search-v2", {}}, {"new-app", {{"app_version", "7"}}}, {"new-app", {{"app_version", "3"}}}};
   for (const auto& [flag_key, extra] : cases) {
     std::string query;
     std::map<std::string, std::string> attrs = {{"user_id", "u-7"}};
@@ -802,17 +840,25 @@ void CheckSameDecision(harness::Ctx& ctx) {
 
 void CheckPrivate(harness::Ctx& ctx) {
   auto c = readSetup(ctx);
-  const auto r = readExplain(c, "beta", "u-7");
-  std::set<std::string> directives;
-  std::stringstream in(r.HeaderValue("Cache-Control"));
-  std::string d;
-  while (std::getline(in, d, ',')) {
-    const auto a = d.find_first_not_of(' ');
-    const auto e = d.find_last_not_of(' ');
-    if (a != std::string::npos) directives.insert(d.substr(a, e - a + 1));
+  const std::vector<std::pair<std::string, harness::Response>> answers = {
+      {"the explanation", readExplain(c, "beta", "u-7")},
+      {"the 401 without X-User-Id", readExplain(c, "beta", "")},
+      {"the 403 for another user", readExplain(c, "beta", "u-7", "user_id=u-42")},
+      {"the 404 for an unknown flag", readExplain(c, "ghost", "u-7")},
+  };
+  for (const auto& [what, r] : answers) {
+    const std::string header = r.HeaderValue("Cache-Control");
+    std::set<std::string> directives;
+    std::stringstream in(header);
+    std::string d;
+    while (std::getline(in, d, ',')) {
+      const auto a = d.find_first_not_of(' ');
+      const auto e = d.find_last_not_of(' ');
+      if (a != std::string::npos) directives.insert(d.substr(a, e - a + 1));
+    }
+    ctx.Assert(!directives.count("public"), "%s answered Cache-Control %q: a shared cache will hand u-7's explanation to the next caller", what, header);
+    ctx.Assert(directives.count("private") && directives.count("no-store"), "%s (%d) answered Cache-Control %q, expected private, no-store on every response", what, r.Status, header);
   }
-  ctx.Assert(!directives.count("public"), "the explanation answered Cache-Control %q: a shared cache will hand u-7's explanation to the next caller", r.HeaderValue("Cache-Control"));
-  ctx.Assert(directives.count("private") && directives.count("no-store"), "the explanation answered Cache-Control %q, expected private, no-store", r.HeaderValue("Cache-Control"));
 }
 `,
   },

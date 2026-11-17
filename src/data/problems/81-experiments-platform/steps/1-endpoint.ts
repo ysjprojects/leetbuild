@@ -87,7 +87,7 @@ writes its body through \`store.update\`. It serves the demo and hides three fla
       id: 'frozen-design',
       title: 'A design change is a new version: 409',
       detail:
-        'A `PATCH` whose body names one of `FROZEN_FIELDS` (`variants`, `unit`, `salt`, `min_sample`) answers **409** with `"required": "new version"` and writes nothing; a `name` edit still goes through.',
+        'A `PATCH` whose body names one of `FROZEN_FIELDS` (`variants`, `unit`, `salt`, `min_sample`), even with its current value, answers **409** with `"required": "new version"` and writes nothing, not even a `name` sent alongside; a `name`-only edit still goes through.',
       match: {
         python: {all: [/FROZEN_FIELDS/, /\b409\b/, /new version/]},
         typescript: {all: [/FROZEN_FIELDS/, /\b409\b/, /new version/]},
@@ -738,19 +738,24 @@ async def check_split(ctx):
             ([{"key": "control", "weight": 100}], "a single variant"),
             ([{"key": "control", "weight": 50}, {"key": "control", "weight": 50}], "two variants keyed control"),
             ([{"key": "control", "weight": 120}, {"key": "treatment", "weight": -20}], "a negative weight"),
+            ([{"key": "", "weight": 50}, {"key": "treatment", "weight": 50}], "an empty key"),
         ):
             r = await c.post("/v1/experiments", json=_design(variants=variants))
             assert r.status_code == 400, f"a design with {why} answered {r.status_code} {r.text}, expected 400: a split other than the one sent must not run"
         assert ctx.redis.get("exp:seq") is None, f"{ctx.redis.get('exp:seq')} experiment(s) were stored from rejected designs"
         three = [{"key": "control", "weight": 34}, {"key": "a", "weight": 33}, {"key": "b", "weight": 33}]
         r = await c.post("/v1/experiments", json=_design(variants=three))
-    assert r.status_code == 201, f"a 34/33/33 design answered {r.status_code}: {r.text}"
-    assert store.get(r.json()["id"])["variants"] == three, f"the split must be stored exactly as sent, the store holds {store.get(r.json()['id'])['variants']}"
+        assert r.status_code == 201, f"a 34/33/33 design answered {r.status_code}: {r.text}"
+        assert store.get(r.json()["id"])["variants"] == three, f"the split must be stored exactly as sent, the store holds {store.get(r.json()['id'])['variants']}"
+        held = [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}, {"key": "holdout", "weight": 0}]
+        r = await c.post("/v1/experiments", json=_design(variants=held))
+    assert r.status_code == 201, f"a 50/50/0 design answered {r.status_code} {r.text}: a weight of 0 is non-negative and allowed"
+    assert store.get(r.json()["id"])["variants"] == held, f"the split must be stored exactly as sent, the store holds {store.get(r.json()['id'])['variants']}"
 
 
 async def check_unit(ctx):
     async with _api(ctx) as c:
-        for unit in ("usr", "visitor"):
+        for unit in ("usr", "visitor", "User"):
             r = await c.post("/v1/experiments", json=_design(unit=unit))
             assert r.status_code == 400, f"a design with unit {unit!r} answered {r.status_code} {r.text}, expected 400: an unknown unit must not fall back to user"
         assert ctx.redis.get("exp:seq") is None, "an experiment was stored from a design with an unknown unit"
@@ -762,12 +767,21 @@ async def check_unit(ctx):
 async def check_frozen_design(ctx):
     async with _api(ctx) as c:
         experiment_id = await _create(c, salt="s-1")
-        for fields in ({"variants": [{"key": "control", "weight": 90}, {"key": "treatment", "weight": 10}]}, {"salt": "s-2"}, {"unit": "session"}, {"min_sample": 50}):
+        edits = (
+            {"variants": [{"key": "control", "weight": 90}, {"key": "treatment", "weight": 10}]},
+            {"salt": "s-2"},
+            {"unit": "session"},
+            {"min_sample": 50},
+            {"unit": "user"},
+            {"name": "sneaky", "salt": "s-2"},
+        )
+        for fields in edits:
             r = await c.patch(f"/v1/experiments/{experiment_id}", json=fields)
-            assert r.status_code == 409, f"PATCH {fields} on a running experiment answered {r.status_code} {r.text}, expected 409: a design change is a new version"
-            assert "new version" in r.text, f"the 409 must say a new version is required, got {r.text}"
+            assert r.status_code == 409, f"PATCH {fields} on a running experiment answered {r.status_code} {r.text}, expected 409: a PATCH naming a frozen field is a new version"
+            assert r.json().get("required") == "new version", f'the 409 must carry "required": "new version", got {r.text}'
         stored = store.get(experiment_id)
         assert stored["variants"] == SPLIT and stored["salt"] == "s-1" and stored["unit"] == "user" and stored["min_sample"] == 2000, f"a refused PATCH changed the design: {stored}"
+        assert stored["name"] == "checkout-cta", f"a refused PATCH must write nothing, the name became {stored['name']!r}"
         r = await c.patch(f"/v1/experiments/{experiment_id}", json={"name": "renamed"})
     assert r.status_code == 200 and store.get(experiment_id)["name"] == "renamed", f"a name-only PATCH answered {r.status_code} {r.text}; the name stays editable"
 `,
@@ -811,6 +825,7 @@ export async function check_split(ctx) {
     [[{key: 'control', weight: 100}], 'a single variant'],
     [[{key: 'control', weight: 50}, {key: 'control', weight: 50}], 'two variants keyed control'],
     [[{key: 'control', weight: 120}, {key: 'treatment', weight: -20}], 'a negative weight'],
+    [[{key: '', weight: 50}, {key: 'treatment', weight: 50}], 'an empty key'],
   ];
   for (const [variants, why] of cases) {
     const r = await c.post('/v1/experiments', {json: design({variants})});
@@ -818,14 +833,18 @@ export async function check_split(ctx) {
   }
   assert.equal(ctx.redis.get('exp:seq'), null, \`\${ctx.redis.get('exp:seq')} experiment(s) were stored from rejected designs\`);
   const three = [{key: 'control', weight: 34}, {key: 'a', weight: 33}, {key: 'b', weight: 33}];
-  const r = await c.post('/v1/experiments', {json: design({variants: three})});
+  let r = await c.post('/v1/experiments', {json: design({variants: three})});
   assert.equal(r.status, 201, \`a 34/33/33 design answered \${r.status}: \${r.text}\`);
   assert.deepStrictEqual((await store.get(r.json().id)).variants, three, 'the split must be stored exactly as sent');
+  const held = [{key: 'control', weight: 50}, {key: 'treatment', weight: 50}, {key: 'holdout', weight: 0}];
+  r = await c.post('/v1/experiments', {json: design({variants: held})});
+  assert.equal(r.status, 201, \`a 50/50/0 design answered \${r.status} \${r.text}: a weight of 0 is non-negative and allowed\`);
+  assert.deepStrictEqual((await store.get(r.json().id)).variants, held, 'the split must be stored exactly as sent');
 }
 
 export async function check_unit(ctx) {
   const {c, store} = api(ctx);
-  for (const unit of ['usr', 'visitor']) {
+  for (const unit of ['usr', 'visitor', 'User']) {
     const r = await c.post('/v1/experiments', {json: design({unit})});
     assert.equal(r.status, 400, \`a design with unit "\${unit}" answered \${r.status} \${r.text}, expected 400: an unknown unit must not fall back to user\`);
   }
@@ -839,17 +858,25 @@ export async function check_unit(ctx) {
 export async function check_frozen_design(ctx) {
   const {c, store} = api(ctx);
   const id = await create(c, {salt: 's-1'});
-  const edits = [{variants: [{key: 'control', weight: 90}, {key: 'treatment', weight: 10}]}, {salt: 's-2'}, {unit: 'session'}, {min_sample: 50}];
+  const edits = [
+    {variants: [{key: 'control', weight: 90}, {key: 'treatment', weight: 10}]},
+    {salt: 's-2'},
+    {unit: 'session'},
+    {min_sample: 50},
+    {unit: 'user'},
+    {name: 'sneaky', salt: 's-2'},
+  ];
   for (const fields of edits) {
     const r = await c.patch(\`/v1/experiments/\${id}\`, {json: fields});
-    assert.equal(r.status, 409, \`PATCH \${JSON.stringify(fields)} on a running experiment answered \${r.status} \${r.text}, expected 409: a design change is a new version\`);
-    assert(r.text.includes('new version'), \`the 409 must say a new version is required, got \${r.text}\`);
+    assert.equal(r.status, 409, \`PATCH \${JSON.stringify(fields)} on a running experiment answered \${r.status} \${r.text}, expected 409: a PATCH naming a frozen field is a new version\`);
+    assert.equal(r.json()?.required, 'new version', \`the 409 must carry "required": "new version", got \${r.text}\`);
   }
   const stored = await store.get(id);
   assert(
     JSON.stringify(stored.variants) === JSON.stringify(SPLIT) && stored.salt === 's-1' && stored.unit === 'user' && stored.min_sample === 2000,
     \`a refused PATCH changed the design: \${JSON.stringify(stored)}\`,
   );
+  assert.equal(stored.name, 'checkout-cta', \`a refused PATCH must write nothing, the name became "\${stored.name}"\`);
   const r = await c.patch(\`/v1/experiments/\${id}\`, {json: {name: 'renamed'}});
   assert(r.status === 200 && (await store.get(id)).name === 'renamed', \`a name-only PATCH answered \${r.status} \${r.text}; the name stays editable\`);
 }
@@ -859,50 +886,49 @@ export async function check_frozen_design(ctx) {
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"expd/store"
 
 	"leetbuild/harness"
 )
 
-var split = []map[string]any{{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}}
+var hSplit = []map[string]any{{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}}
 
-func design(overrides map[string]any) map[string]any {
-	d := map[string]any{"name": "checkout-cta", "unit": "user", "variants": split, "min_sample": 2000}
+func hDesign(overrides map[string]any) map[string]any {
+	d := map[string]any{"name": "checkout-cta", "unit": "user", "variants": hSplit, "min_sample": 2000}
 	for k, v := range overrides {
 		d[k] = v
 	}
 	return d
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func created(ctx *harness.Ctx, r *harness.Response) store.Experiment {
+func hCreated(ctx *harness.Ctx, r *harness.Response) store.Experiment {
 	ctx.Equal(r.Status, 201, "POST /v1/experiments with a valid design (%s)", r.Text())
 	var e store.Experiment
 	r.Decode(&e)
 	return e
 }
 
-func variantsOf(ctx *harness.Ctx, id string) []store.Variant {
+func hVariantsOf(ctx *harness.Ctx, id string) []store.Variant {
 	e := store.Get(context.Background(), id)
 	ctx.Assert(e != nil, "experiment %s is not in the store", id)
 	return e.Variants
 }
 
-var split5050 = []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}
+var hSplit5050 = []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"salt": "s-1"})))
+	c := hAPI(ctx)
+	e := hCreated(ctx, c.Post("/v1/experiments", hDesign(map[string]any{"salt": "s-1"})))
 	ctx.Assert(e.Version == 1 && e.Status == "running" && e.Salt == "s-1", "a new experiment answers version 1, running, with its salt; got %+v", e)
-	ctx.Equal(variantsOf(ctx, e.ID), split5050, "the stored split")
-	other := created(ctx, c.Post("/v1/experiments", design(nil)))
+	ctx.Equal(hVariantsOf(ctx, e.ID), hSplit5050, "the stored split")
+	other := hCreated(ctx, c.Post("/v1/experiments", hDesign(nil)))
 	ctx.Equal(other.Salt, other.ID, "without a salt the experiment id is the salt; the salt")
 	r := c.Patch("/v1/experiments/"+e.ID, map[string]any{"name": "checkout-cta-v1"})
 	ctx.Equal(r.Status, 200, "PATCH /v1/experiments/%s with a new name (%s)", e.ID, r.Text())
@@ -910,7 +936,7 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckSplit(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	cases := []struct {
 		variants []map[string]any
 		why      string
@@ -920,47 +946,58 @@ func CheckSplit(ctx *harness.Ctx) {
 		{[]map[string]any{{"key": "control", "weight": 100}}, "a single variant"},
 		{[]map[string]any{{"key": "control", "weight": 50}, {"key": "control", "weight": 50}}, "two variants keyed control"},
 		{[]map[string]any{{"key": "control", "weight": 120}, {"key": "treatment", "weight": -20}}, "a negative weight"},
+		{[]map[string]any{{"key": "", "weight": 50}, {"key": "treatment", "weight": 50}}, "an empty key"},
 	}
 	for _, tc := range cases {
-		r := c.Post("/v1/experiments", design(map[string]any{"variants": tc.variants}))
+		r := c.Post("/v1/experiments", hDesign(map[string]any{"variants": tc.variants}))
 		ctx.Assert(r.Status == 400, "a design with %s answered %d %s, expected 400: a split other than the one sent must not run", tc.why, r.Status, r.Text())
 	}
 	seq, ok := ctx.Redis.Get("exp:seq")
 	ctx.Assert(!ok, "%s experiment(s) were stored from rejected designs", seq)
 	three := []map[string]any{{"key": "control", "weight": 34}, {"key": "a", "weight": 33}, {"key": "b", "weight": 33}}
-	e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"variants": three})))
-	ctx.Equal(variantsOf(ctx, e.ID), []store.Variant{{Key: "control", Weight: 34}, {Key: "a", Weight: 33}, {Key: "b", Weight: 33}}, "the split must be stored exactly as sent; the stored split")
+	e := hCreated(ctx, c.Post("/v1/experiments", hDesign(map[string]any{"variants": three})))
+	ctx.Equal(hVariantsOf(ctx, e.ID), []store.Variant{{Key: "control", Weight: 34}, {Key: "a", Weight: 33}, {Key: "b", Weight: 33}}, "the split must be stored exactly as sent; the stored split")
+	held := []map[string]any{{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}, {"key": "holdout", "weight": 0}}
+	r := c.Post("/v1/experiments", hDesign(map[string]any{"variants": held}))
+	ctx.Assert(r.Status == 201, "a 50/50/0 design answered %d %s: a weight of 0 is non-negative and allowed", r.Status, r.Text())
+	var h store.Experiment
+	r.Decode(&h)
+	ctx.Equal(hVariantsOf(ctx, h.ID), []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}, {Key: "holdout", Weight: 0}}, "the split must be stored exactly as sent; the stored split")
 }
 
 func CheckUnit(ctx *harness.Ctx) {
-	c := api(ctx)
-	for _, unit := range []string{"usr", "visitor"} {
-		r := c.Post("/v1/experiments", design(map[string]any{"unit": unit}))
+	c := hAPI(ctx)
+	for _, unit := range []string{"usr", "visitor", "User"} {
+		r := c.Post("/v1/experiments", hDesign(map[string]any{"unit": unit}))
 		ctx.Assert(r.Status == 400, "a design with unit %q answered %d %s, expected 400: an unknown unit must not fall back to user", unit, r.Status, r.Text())
 	}
 	_, ok := ctx.Redis.Get("exp:seq")
 	ctx.Assert(!ok, "an experiment was stored from a design with an unknown unit")
 	for _, unit := range []string{"session", "account"} {
-		e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"unit": unit})))
+		e := hCreated(ctx, c.Post("/v1/experiments", hDesign(map[string]any{"unit": unit})))
 		ctx.Equal(store.Get(context.Background(), e.ID).Unit, unit, "the stored unit of a %s experiment", unit)
 	}
 }
 
 func CheckFrozenDesign(ctx *harness.Ctx) {
-	c := api(ctx)
-	e := created(ctx, c.Post("/v1/experiments", design(map[string]any{"salt": "s-1"})))
+	c := hAPI(ctx)
+	e := hCreated(ctx, c.Post("/v1/experiments", hDesign(map[string]any{"salt": "s-1"})))
 	edits := []map[string]any{
 		{"variants": []map[string]any{{"key": "control", "weight": 90}, {"key": "treatment", "weight": 10}}},
 		{"salt": "s-2"}, {"unit": "session"}, {"min_sample": 50},
+		{"unit": "user"}, {"name": "sneaky", "salt": "s-2"},
 	}
 	for _, fields := range edits {
 		r := c.Patch("/v1/experiments/"+e.ID, fields)
-		ctx.Assert(r.Status == 409, "PATCH %v on a running experiment answered %d %s, expected 409: a design change is a new version", fields, r.Status, r.Text())
-		ctx.Assert(strings.Contains(r.Text(), "new version"), "the 409 must say a new version is required, got %s", r.Text())
+		ctx.Assert(r.Status == 409, "PATCH %v on a running experiment answered %d %s, expected 409: a PATCH naming a frozen field is a new version", fields, r.Status, r.Text())
+		var body map[string]any
+		r.Decode(&body)
+		ctx.Assert(body["required"] == "new version", "the 409 must carry required: new version, got %s", r.Text())
 	}
 	stored := store.Get(context.Background(), e.ID)
 	ctx.Assert(stored.Salt == "s-1" && stored.Unit == "user" && stored.MinSample == 2000, "a refused PATCH changed the design: %+v", stored)
-	ctx.Equal(stored.Variants, split5050, "a refused PATCH must leave the split; the stored split")
+	ctx.Equal(stored.Variants, hSplit5050, "a refused PATCH must leave the split; the stored split")
+	ctx.Equal(stored.Name, "checkout-cta", "a refused PATCH must write nothing; the name")
 	r := c.Patch("/v1/experiments/"+e.ID, map[string]any{"name": "renamed"})
 	ctx.Assert(r.Status == 200 && store.Get(context.Background(), e.ID).Name == "renamed", "a name-only PATCH answered %d %s; the name stays editable", r.Status, r.Text())
 }
@@ -978,15 +1015,15 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kSplit = json::array({{{"key", "control"}, {"weight", 50}}, {{"key", "treatment"}, {"weight", 50}}});
+const json hSplit = json::array({{{"key", "control"}, {"weight", 50}}, {{"key", "treatment"}, {"weight", 50}}});
 
-std::string design(const json& overrides = json::object()) {
-  json d = {{"name", "checkout-cta"}, {"unit", "user"}, {"variants", kSplit}, {"min_sample", 2000}};
+std::string hDesign(const json& overrides = json::object()) {
+  json d = {{"name", "checkout-cta"}, {"unit", "user"}, {"variants", hSplit}, {"min_sample", 2000}};
   d.update(overrides);
   return d.dump();
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -994,84 +1031,93 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const std::string& body) { return c.Post("/v1/experiments", body, "Content-Type", "application/json"); }
+harness::Response hPost(harness::HTTP& c, const std::string& body) { return c.Post("/v1/experiments", body, "Content-Type", "application/json"); }
 
-harness::Response patch(harness::HTTP& c, const std::string& id, const json& fields) {
+harness::Response hPatch(harness::HTTP& c, const std::string& id, const json& fields) {
   return c.Patch("/v1/experiments/" + id, fields.dump(), "Content-Type", "application/json");
 }
 
-json created(harness::Ctx& ctx, const harness::Response& r) {
+json hCreated(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 201, "POST /v1/experiments with a valid design (%s)", r.Text());
   return json::parse(r.Text());
 }
 
-json storedSplit(const std::string& id) { return store::toJson(*store::get(id))["variants"]; }
+json hStoredSplit(const std::string& id) { return store::toJson(*store::get(id))["variants"]; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const json e = created(ctx, post(c, design({{"salt", "s-1"}})));
+  auto c = hAPI(ctx);
+  const json e = hCreated(ctx, hPost(c, hDesign({{"salt", "s-1"}})));
   ctx.Assert(e.value("version", 0) == 1 && e.value("status", "") == "running" && e.value("salt", "") == "s-1", "a new experiment answers version 1, running, with its salt; got %s", e.dump());
   const std::string id = e.value("id", "");
-  ctx.Equal(storedSplit(id), kSplit, "the stored split");
-  const json other = created(ctx, post(c, design()));
+  ctx.Equal(hStoredSplit(id), hSplit, "the stored split");
+  const json other = hCreated(ctx, hPost(c, hDesign()));
   ctx.Equal(other.value("salt", ""), other.value("id", ""), "without a salt the experiment id is the salt; the salt");
-  const auto r = patch(c, id, {{"name", "checkout-cta-v1"}});
+  const auto r = hPatch(c, id, {{"name", "checkout-cta-v1"}});
   ctx.Equal(r.Status, 200, "PATCH /v1/experiments/%s with a new name (%s)", id, r.Text());
   ctx.Equal(store::get(id)->name, "checkout-cta-v1", "the rename must reach the store; the name");
 }
 
 void CheckSplit(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   const std::vector<std::pair<json, std::string>> cases = {
       {json::array({{{"key", "control"}, {"weight", 60}}, {{"key", "treatment"}, {"weight", 50}}}), "weights summing to 110"},
       {json::array({{{"key", "control"}, {"weight", 49}}, {{"key", "treatment"}, {"weight", 50}}}), "weights summing to 99"},
       {json::array({{{"key", "control"}, {"weight", 100}}}), "a single variant"},
       {json::array({{{"key", "control"}, {"weight", 50}}, {{"key", "control"}, {"weight", 50}}}), "two variants keyed control"},
       {json::array({{{"key", "control"}, {"weight", 120}}, {{"key", "treatment"}, {"weight", -20}}}), "a negative weight"},
+      {json::array({{{"key", ""}, {"weight", 50}}, {{"key", "treatment"}, {"weight", 50}}}), "an empty key"},
   };
   for (const auto& [variants, why] : cases) {
-    const auto r = post(c, design({{"variants", variants}}));
+    const auto r = hPost(c, hDesign({{"variants", variants}}));
     ctx.Assert(r.Status == 400, "a design with %s answered %d %s, expected 400: a split other than the one sent must not run", why, r.Status, r.Text());
   }
   ctx.Assert(!ctx.Redis.Get("exp:seq"), "%s experiment(s) were stored from rejected designs", ctx.Redis.Get("exp:seq").value_or(""));
   const json three = json::array({{{"key", "control"}, {"weight", 34}}, {{"key", "a"}, {"weight", 33}}, {{"key", "b"}, {"weight", 33}}});
-  const json e = created(ctx, post(c, design({{"variants", three}})));
-  ctx.Equal(storedSplit(e.value("id", "")), three, "the split must be stored exactly as sent; the stored split");
+  const json e = hCreated(ctx, hPost(c, hDesign({{"variants", three}})));
+  ctx.Equal(hStoredSplit(e.value("id", "")), three, "the split must be stored exactly as sent; the stored split");
+  const json held = json::array({{{"key", "control"}, {"weight", 50}}, {{"key", "treatment"}, {"weight", 50}}, {{"key", "holdout"}, {"weight", 0}}});
+  const auto r = hPost(c, hDesign({{"variants", held}}));
+  ctx.Assert(r.Status == 201, "a 50/50/0 design answered %d %s: a weight of 0 is non-negative and allowed", r.Status, r.Text());
+  ctx.Equal(hStoredSplit(json::parse(r.Text()).value("id", "")), held, "the split must be stored exactly as sent; the stored split");
 }
 
 void CheckUnit(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const std::string unit : {"usr", "visitor"}) {
-    const auto r = post(c, design({{"unit", unit}}));
+  auto c = hAPI(ctx);
+  for (const std::string unit : {"usr", "visitor", "User"}) {
+    const auto r = hPost(c, hDesign({{"unit", unit}}));
     ctx.Assert(r.Status == 400, "a design with unit %q answered %d %s, expected 400: an unknown unit must not fall back to user", unit, r.Status, r.Text());
   }
   ctx.Assert(!ctx.Redis.Get("exp:seq"), "an experiment was stored from a design with an unknown unit");
   for (const std::string unit : {"session", "account"}) {
-    const json e = created(ctx, post(c, design({{"unit", unit}})));
+    const json e = hCreated(ctx, hPost(c, hDesign({{"unit", unit}})));
     ctx.Equal(store::get(e.value("id", ""))->unit, unit, "the stored unit of a %s experiment", unit);
   }
 }
 
 void CheckFrozenDesign(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string id = created(ctx, post(c, design({{"salt", "s-1"}}))).value("id", "");
+  auto c = hAPI(ctx);
+  const std::string id = hCreated(ctx, hPost(c, hDesign({{"salt", "s-1"}}))).value("id", "");
   const std::vector<json> edits = {
       {{"variants", json::array({{{"key", "control"}, {"weight", 90}}, {{"key", "treatment"}, {"weight", 10}}})}},
       {{"salt", "s-2"}},
       {{"unit", "session"}},
       {{"min_sample", 50}},
+      {{"unit", "user"}},
+      {{"name", "sneaky"}, {"salt", "s-2"}},
   };
   for (const json& fields : edits) {
-    const auto r = patch(c, id, fields);
-    ctx.Assert(r.Status == 409, "PATCH %s on a running experiment answered %d %s, expected 409: a design change is a new version", fields.dump(), r.Status, r.Text());
-    ctx.Assert(r.Text().find("new version") != std::string::npos, "the 409 must say a new version is required, got %s", r.Text());
+    const auto r = hPatch(c, id, fields);
+    ctx.Assert(r.Status == 409, "PATCH %s on a running experiment answered %d %s, expected 409: a PATCH naming a frozen field is a new version", fields.dump(), r.Status, r.Text());
+    const json body = json::parse(r.Text(), nullptr, false);
+    ctx.Assert(body.is_object() && body.value("required", "") == "new version", "the 409 must carry required: new version, got %s", r.Text());
   }
   const auto stored = store::get(id);
   ctx.Assert(stored->salt == "s-1" && stored->unit == "user" && stored->min_sample == 2000, "a refused PATCH changed the design: %s", store::toJson(*stored).dump());
-  ctx.Equal(storedSplit(id), kSplit, "a refused PATCH must leave the split; the stored split");
-  const auto r = patch(c, id, {{"name", "renamed"}});
+  ctx.Equal(hStoredSplit(id), hSplit, "a refused PATCH must leave the split; the stored split");
+  ctx.Equal(stored->name, "checkout-cta", "a refused PATCH must write nothing; the name");
+  const auto r = hPatch(c, id, {{"name", "renamed"}});
   ctx.Assert(r.Status == 200 && store::get(id)->name == "renamed", "a name-only PATCH answered %d %s; the name stays editable", r.Status, r.Text());
 }
 `,

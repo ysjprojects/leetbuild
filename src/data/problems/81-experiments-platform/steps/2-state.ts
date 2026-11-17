@@ -22,7 +22,8 @@ to control.
 
 - Cache under \`exp:{experiment_id}:assign:{unit_id}\` and read it **first**: a cached variant is the
   answer, whatever the design says now.
-- On a miss, write with \`SET NX\` (keeping the TTL); a lost write answers the variant that won.
+- On a miss, write with \`SET NX\` and the 90-day TTL in the same command; a lost write answers the
+  variant that won.
 - A \`stopped\` experiment serves the cached variant and assigns nothing new (\`None\`).`,
   sequence: {
     participants: ['Experiment API', 'Redis', 'experiment store'],
@@ -71,7 +72,7 @@ to control.
       id: 'first-write-wins',
       title: 'A new assignment is written with SET NX',
       detail:
-        'The first assignment of a unit is written only if absent (`SET NX` with the TTL), and a request that lost the write answers the variant that won, so two replicas cannot serve one unit two variants.',
+        'The first assignment of a unit is written only if absent, by one `SET NX` that carries the 90-day TTL (the key is never without its expiry), and a request that lost the write answers the variant that won, so two replicas cannot serve one unit two variants.',
       match: {
         python: {all: [/nx\s*=\s*True/]},
         typescript: {all: [/['"]NX['"]/]},
@@ -423,6 +424,21 @@ def check_first_write_wins(ctx):
         raise rival.error
     assert got == rival.result, f"another replica served u-1 {rival.result!r} and this request served {got!r}: write with SET NX and answer the variant that won"
     assert ctx.redis.get(key) == got, f"{key} holds {ctx.redis.get(key)!r} but u-1 was served {got!r}"
+    # A new unit: snapshot the TTL right after the command that creates its assignment.
+    fresh = f"exp:{e}:assign:u-2"
+    ttls = []
+
+    def snapshot():
+        ttl = ctx.redis.ttl(fresh)
+        if ttl == -2:  # not written yet: wait for the next command on the key
+            ctx.redis_after(fresh, snapshot)
+        else:
+            ttls.append(ttl)
+
+    ctx.redis_after(fresh, snapshot)
+    assert m.assign(e, "u-2") == "treatment", "in an all-treatment experiment u-2 must get treatment"
+    assert ttls, f"nothing wrote {fresh}"
+    assert 90 * 86400 - 60 <= ttls[0] <= 90 * 86400, f"right after {fresh} was written its TTL was {ttls[0]} s (-1: none), expected 90 days: write the assignment with SET NX and its TTL in one command"
 
 
 def check_stopped(ctx):
@@ -488,6 +504,21 @@ export async function check_first_write_wins(ctx) {
   if (rival.error !== undefined) throw rival.error;
   assert.equal(got, rival.result, \`another replica served u-1 \${rival.result} and this request served \${got}: write with SET NX and answer the variant that won\`);
   assert.equal(ctx.redis.get(key), got, \`\${key} holds \${ctx.redis.get(key)} but u-1 was served \${got}\`);
+  // A new unit: snapshot the TTL right after the command that creates its assignment.
+  const fresh = \`exp:\${e}:assign:u-2\`;
+  const ttls: number[] = [];
+  const snapshot = () => {
+    const ttl = ctx.redis.ttl(fresh);
+    if (ttl === -2) ctx.redisAfter(fresh, snapshot); // not written yet: wait for the next command on the key
+    else ttls.push(ttl);
+  };
+  ctx.redisAfter(fresh, snapshot);
+  assert.equal(await m.assign(e, 'u-2'), 'treatment', 'in an all-treatment experiment u-2 must get treatment');
+  assert(ttls.length > 0, \`nothing wrote \${fresh}\`);
+  assert(
+    ttls[0] >= 90 * 86400 - 60 && ttls[0] <= 90 * 86400,
+    \`right after \${fresh} was written its TTL was \${ttls[0]} s (-1: none), expected 90 days: write the assignment with SET NX and its TTL in one command\`,
+  );
 }
 
 export async function check_stopped(ctx) {
@@ -513,25 +544,25 @@ import (
 )
 
 var (
-	stateBg      = context.Background()
-	allControl   = []store.Variant{{Key: "control", Weight: 100}, {Key: "treatment", Weight: 0}}
-	allTreatment = []store.Variant{{Key: "control", Weight: 0}, {Key: "treatment", Weight: 100}}
+	hStateBg      = context.Background()
+	hAllControl   = []store.Variant{{Key: "control", Weight: 100}, {Key: "treatment", Weight: 0}}
+	hAllTreatment = []store.Variant{{Key: "control", Weight: 0}, {Key: "treatment", Weight: 100}}
 )
 
-func experiment(variants []store.Variant) string {
-	return store.Create(stateBg, store.Design{Name: "cta", Unit: "user", Variants: variants, MinSample: 1000, Salt: "s-1"}).ID
+func hExperiment(variants []store.Variant) string {
+	return store.Create(hStateBg, store.Design{Name: "cta", Unit: "user", Variants: variants, MinSample: 1000, Salt: "s-1"}).ID
 }
 
-func mustAssign(ctx *harness.Ctx, experimentID, unitID, want, why string) {
-	got, ok := assign(stateBg, experimentID, unitID)
+func hMustAssign(ctx *harness.Ctx, experimentID, unitID, want, why string) {
+	got, ok := assign(hStateBg, experimentID, unitID)
 	ctx.Assert(ok && got == want, "%s: %s got %q (assigned %t), expected %q", why, unitID, got, ok, want)
 }
 
 func CheckExperimentKey(ctx *harness.Ctx) {
-	a := experiment(allControl)
-	b := experiment(allTreatment)
-	mustAssign(ctx, a, "u-1", "control", "in an all-control experiment")
-	mustAssign(ctx, b, "u-1", "treatment", "in an all-treatment experiment (an assignment cached for another experiment must not answer this one)")
+	a := hExperiment(hAllControl)
+	b := hExperiment(hAllTreatment)
+	hMustAssign(ctx, a, "u-1", "control", "in an all-control experiment")
+	hMustAssign(ctx, b, "u-1", "treatment", "in an all-treatment experiment (an assignment cached for another experiment must not answer this one)")
 	keys := ctx.Redis.Keys("*assign*")
 	for _, c := range []struct{ id, variant string }{{a, "control"}, {b, "treatment"}} {
 		key := "exp:" + c.id + ":assign:u-1"
@@ -542,16 +573,16 @@ func CheckExperimentKey(ctx *harness.Ctx) {
 }
 
 func CheckSticky(ctx *harness.Ctx) {
-	e := experiment(allControl)
-	mustAssign(ctx, e, "u-1", "control", "in an all-control experiment")
+	e := hExperiment(hAllControl)
+	hMustAssign(ctx, e, "u-1", "control", "in an all-control experiment")
 	// The bulk tool rewrites the split and the salt of the running experiment behind the API.
-	store.Update(stateBg, e, map[string]any{"variants": allTreatment, "salt": "s-2"})
-	mustAssign(ctx, e, "u-1", "control", "after a bulk edit of the split and salt (read the cached assignment before hashing)")
-	mustAssign(ctx, e, "u-2", "treatment", "a unit first seen after the edit gets the split in force")
+	store.Update(hStateBg, e, map[string]any{"variants": hAllTreatment, "salt": "s-2"})
+	hMustAssign(ctx, e, "u-1", "control", "after a bulk edit of the split and salt (read the cached assignment before hashing)")
+	hMustAssign(ctx, e, "u-2", "treatment", "a unit first seen after the edit gets the split in force")
 }
 
 func CheckFirstWriteWins(ctx *harness.Ctx) {
-	e := experiment(allTreatment)
+	e := hExperiment(hAllTreatment)
 	key := "exp:" + e + ":assign:u-1"
 	// A replica still holding the design from before an edit assigns u-1 the way a correct one does.
 	rival := ctx.Redis.After(key, func() any {
@@ -561,19 +592,36 @@ func CheckFirstWriteWins(ctx *harness.Ctx) {
 		v, _ := ctx.Redis.Get(key)
 		return v
 	})
-	got, _ := assign(stateBg, e, "u-1")
+	got, _ := assign(hStateBg, e, "u-1")
 	ctx.Assert(rival.Fired, "nothing touched %s: the assignment must be cached there", key)
 	ctx.Assert(got == rival.Result, "another replica served u-1 %v and this request served %q: write with SET NX and answer the variant that won", rival.Result, got)
 	stored, _ := ctx.Redis.Get(key)
 	ctx.Equal(stored, got, "%s must hold what u-1 was served", key)
+	// A new unit: snapshot the TTL right after the command that creates its assignment.
+	fresh := "exp:" + e + ":assign:u-2"
+	var ttls []int64
+	var snapshot func() any
+	snapshot = func() any {
+		ttl := ctx.Redis.TTL(fresh)
+		if ttl == -2 { // not written yet: wait for the next command on the key
+			ctx.Redis.After(fresh, snapshot)
+		} else {
+			ttls = append(ttls, ttl)
+		}
+		return nil
+	}
+	ctx.Redis.After(fresh, snapshot)
+	hMustAssign(ctx, e, "u-2", "treatment", "in an all-treatment experiment")
+	ctx.Assert(len(ttls) > 0, "nothing wrote %s", fresh)
+	ctx.Assert(ttls[0] >= 90*86400-60 && ttls[0] <= 90*86400, "right after %s was written its TTL was %d s (-1: none), expected 90 days: write the assignment with SET NX and its TTL in one command", fresh, ttls[0])
 }
 
 func CheckStopped(ctx *harness.Ctx) {
-	e := experiment(allTreatment)
-	mustAssign(ctx, e, "u-1", "treatment", "in an all-treatment experiment")
-	store.SetStatus(stateBg, e, "stopped")
-	mustAssign(ctx, e, "u-1", "treatment", "once the experiment stopped (a stop must keep the assignments it wrote)")
-	late, ok := assign(stateBg, e, "u-2")
+	e := hExperiment(hAllTreatment)
+	hMustAssign(ctx, e, "u-1", "treatment", "in an all-treatment experiment")
+	store.SetStatus(hStateBg, e, "stopped")
+	hMustAssign(ctx, e, "u-1", "treatment", "once the experiment stopped (a stop must keep the assignments it wrote)")
+	late, ok := assign(hStateBg, e, "u-2")
 	ctx.Assert(!ok, "a unit first seen after the stop was assigned %q: a stopped experiment assigns no one new", late)
 	_, written := ctx.Redis.Get("exp:" + e + ":assign:u-2")
 	ctx.Assert(!written, "a stopped experiment wrote a new assignment")
@@ -581,6 +629,7 @@ func CheckStopped(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -590,14 +639,14 @@ func CheckStopped(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<store::Variant> kAllControl = {{"control", 100}, {"treatment", 0}};
-const std::vector<store::Variant> kAllTreatment = {{"control", 0}, {"treatment", 100}};
+const std::vector<store::Variant> hAllControl = {{"control", 100}, {"treatment", 0}};
+const std::vector<store::Variant> hAllTreatment = {{"control", 0}, {"treatment", 100}};
 
-std::string experiment(const std::vector<store::Variant>& variants) {
+std::string hExperiment(const std::vector<store::Variant>& variants) {
   return store::create(store::Design{"cta", "user", variants, 1000, "s-1"}).id;
 }
 
-void mustAssign(harness::Ctx& ctx, const std::string& experiment_id, const std::string& unit_id, const std::string& want, const std::string& why) {
+void hMustAssign(harness::Ctx& ctx, const std::string& experiment_id, const std::string& unit_id, const std::string& want, const std::string& why) {
   const auto got = assign(experiment_id, unit_id);
   ctx.Assert(got && *got == want, "%s: %s got %q (assigned %t), expected %q", why, unit_id, got.value_or(""), got.has_value(), want);
 }
@@ -605,10 +654,10 @@ void mustAssign(harness::Ctx& ctx, const std::string& experiment_id, const std::
 }  // namespace
 
 void CheckExperimentKey(harness::Ctx& ctx) {
-  const std::string a = experiment(kAllControl);
-  const std::string b = experiment(kAllTreatment);
-  mustAssign(ctx, a, "u-1", "control", "in an all-control experiment");
-  mustAssign(ctx, b, "u-1", "treatment", "in an all-treatment experiment (an assignment cached for another experiment must not answer this one)");
+  const std::string a = hExperiment(hAllControl);
+  const std::string b = hExperiment(hAllTreatment);
+  hMustAssign(ctx, a, "u-1", "control", "in an all-control experiment");
+  hMustAssign(ctx, b, "u-1", "treatment", "in an all-treatment experiment (an assignment cached for another experiment must not answer this one)");
   const auto keys = ctx.Redis.Keys("*assign*");
   for (const auto& [id, variant] : std::vector<std::pair<std::string, std::string>>{{a, "control"}, {b, "treatment"}}) {
     const std::string key = "exp:" + id + ":assign:u-1";
@@ -618,16 +667,16 @@ void CheckExperimentKey(harness::Ctx& ctx) {
 }
 
 void CheckSticky(harness::Ctx& ctx) {
-  const std::string e = experiment(kAllControl);
-  mustAssign(ctx, e, "u-1", "control", "in an all-control experiment");
+  const std::string e = hExperiment(hAllControl);
+  hMustAssign(ctx, e, "u-1", "control", "in an all-control experiment");
   // The bulk tool rewrites the split and the salt of the running experiment behind the API.
   store::update(e, {{"variants", nlohmann::json::array({{{"key", "control"}, {"weight", 0}}, {{"key", "treatment"}, {"weight", 100}}})}, {"salt", "s-2"}});
-  mustAssign(ctx, e, "u-1", "control", "after a bulk edit of the split and salt (read the cached assignment before hashing)");
-  mustAssign(ctx, e, "u-2", "treatment", "a unit first seen after the edit gets the split in force");
+  hMustAssign(ctx, e, "u-1", "control", "after a bulk edit of the split and salt (read the cached assignment before hashing)");
+  hMustAssign(ctx, e, "u-2", "treatment", "a unit first seen after the edit gets the split in force");
 }
 
 void CheckFirstWriteWins(harness::Ctx& ctx) {
-  const std::string e = experiment(kAllTreatment);
+  const std::string e = hExperiment(hAllTreatment);
   const std::string key = "exp:" + e + ":assign:u-1";
   auto rival = std::make_shared<std::optional<std::string>>();
   // A replica still holding the design from before an edit assigns u-1 the way a correct one does.
@@ -638,13 +687,29 @@ void CheckFirstWriteWins(harness::Ctx& ctx) {
   ctx.Assert(rival->has_value(), "nothing touched %s: the assignment must be cached there", key);
   ctx.Assert(got.value_or("") == **rival, "another replica served u-1 %q and this request served %q: write with SET NX and answer the variant that won", **rival, got.value_or(""));
   ctx.Equal(ctx.Redis.Get(key).value_or(""), got.value_or(""), "%s must hold what u-1 was served", key);
+  // A new unit: snapshot the TTL right after the command that creates its assignment.
+  const std::string fresh = "exp:" + e + ":assign:u-2";
+  auto ttls = std::make_shared<std::vector<long long>>();
+  auto snapshot = std::make_shared<std::function<void()>>();
+  *snapshot = [&ctx, fresh, ttls, snapshot] {
+    const long long ttl = ctx.Redis.TTL(fresh);
+    if (ttl == -2) {
+      ctx.Redis.After(fresh, *snapshot);  // not written yet: wait for the next command on the key
+    } else {
+      ttls->push_back(ttl);
+    }
+  };
+  ctx.Redis.After(fresh, *snapshot);
+  hMustAssign(ctx, e, "u-2", "treatment", "in an all-treatment experiment");
+  ctx.Assert(!ttls->empty(), "nothing wrote %s", fresh);
+  ctx.Assert(ttls->front() >= 90LL * 86400 - 60 && ttls->front() <= 90LL * 86400, "right after %s was written its TTL was %d s (-1: none), expected 90 days: write the assignment with SET NX and its TTL in one command", fresh, ttls->front());
 }
 
 void CheckStopped(harness::Ctx& ctx) {
-  const std::string e = experiment(kAllTreatment);
-  mustAssign(ctx, e, "u-1", "treatment", "in an all-treatment experiment");
+  const std::string e = hExperiment(hAllTreatment);
+  hMustAssign(ctx, e, "u-1", "treatment", "in an all-treatment experiment");
   store::setStatus(e, "stopped");
-  mustAssign(ctx, e, "u-1", "treatment", "once the experiment stopped (a stop must keep the assignments it wrote)");
+  hMustAssign(ctx, e, "u-1", "treatment", "once the experiment stopped (a stop must keep the assignments it wrote)");
   const auto late = assign(e, "u-2");
   ctx.Assert(!late, "a unit first seen after the stop was assigned %q: a stopped experiment assigns no one new", late.value_or(""));
   ctx.Assert(!ctx.Redis.Get("exp:" + e + ":assign:u-2"), "a stopped experiment wrote a new assignment");

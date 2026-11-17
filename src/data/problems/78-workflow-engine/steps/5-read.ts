@@ -45,7 +45,7 @@ stuck on a step looks like a run that is moving, and so does a finished one.
       id: 'tenant-scope',
       title: 'Scopes the run to the calling tenant',
       detail:
-        "A request without `X-Tenant-Id` is **401**; tenant t2 reading t1's run gets **404** with none of the run in the body, like an unknown run. The starter answers anyone.",
+        "A request without `X-Tenant-Id` is **401**; tenant t2 reading t1's run gets **404** with none of the run in the body, the same answer as an unknown run apart from the id. The starter answers anyone.",
       match: {
         python: {
           all: [/x-tenant-id/i, /status_code\s*=\s*401/, /\["tenant"\]\s*!=\s*tenant|tenant\s*!=\s*run\["tenant"\]/],
@@ -60,7 +60,7 @@ stuck on a step looks like a run that is moving, and so does a finished one.
       id: 'view',
       title: 'Reports the pinned steps and the checkpoint',
       detail:
-        "With version 4 published, a version-3 run reports `definition_version` 3, its pinned steps, and the checkpoint's `current_step`, `completed` and `checkpoint_at`. The starter reports the newest definition and no position.",
+        "With version 4 published, a version-3 run reports `definition_version` 3, its pinned steps, and the checkpoint's `current_step`, `completed` and `checkpoint_at`; `completed` is `[]` before any step finished and lists both steps once both did. The starter reports the newest definition and no position.",
       match: {
         python: {all: [/checkpoint\.read\(/, /pinned_steps/], none: [/definitions\.latest\(/]},
         typescript: {all: [/checkpoint\.read\(/, /pinned_steps/], none: [/definitions\.latest\(/]},
@@ -73,7 +73,7 @@ stuck on a step looks like a run that is moving, and so does a finished one.
       id: 'pending',
       title: 'Reports the effects that are still pending',
       detail:
-        'With `create_account` recorded in the ledger, `pending_effects` is `["send_welcome"]`. The starter has no such field, so an operator cannot see what a stuck run is waiting on.',
+        'With `create_account` recorded in the ledger, `pending_effects` is `["send_welcome"]`; once `send_welcome` is recorded too, it is `[]` even though the checkpoint has not moved yet. The starter has no such field, so an operator cannot see what a stuck run is waiting on.',
       match: {
         python: {all: [/pending_effects/, /ledger\.incomplete\(/]},
         typescript: {all: [/pending_effects/, /ledger\.incomplete\(/]},
@@ -86,7 +86,7 @@ stuck on a step looks like a run that is moving, and so does a finished one.
       id: 'status',
       title: 'Derives the status from the checkpoint',
       detail:
-        'A checkpoint written now or 100 s ago is `running`, one written 600 s ago is `stalled`, and `current_step` `""` is `succeeded`. The starter says `running` for every run.',
+        'A checkpoint written now, 100 s or 299 s ago is `running`, one written 301 s or 600 s ago is `stalled`, and `current_step` `""` is `succeeded`, however old the checkpoint. The starter says `running` for every run.',
       match: {
         python: {all: [/STALL_AFTER_S/, /"stalled"/, /"succeeded"/]},
         typescript: {all: [/STALL_AFTER_S/, /'stalled'/, /'succeeded'/]},
@@ -522,26 +522,33 @@ async def check_tenant_scope(ctx):
     async with c:
         r = await _read(c, run_id, tenant=None)
         assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
-        r = await _read(c, run_id, tenant="t2")
-        assert r.status_code == 404, f"tenant t2 reading t1's run answered {r.status_code}, expected 404 (exactly what an unknown run answers)"
-        assert "signup" not in r.text and "create_account" not in r.text, f"the 404 for another tenant's run carries the run: {r.text}"
-        r = await _read(c, "run-404")
-        assert r.status_code == 404, f"an unknown run answered {r.status_code}, expected 404"
+        foreign = await _read(c, run_id, tenant="t2")
+        assert foreign.status_code == 404, f"tenant t2 reading t1's run answered {foreign.status_code}, expected 404 (exactly what an unknown run answers)"
+        assert "signup" not in foreign.text and "create_account" not in foreign.text, f"the 404 for another tenant's run carries the run: {foreign.text}"
+        unknown = await _read(c, "run-404", tenant="t2")
+        assert unknown.status_code == 404, f"an unknown run answered {unknown.status_code}, expected 404"
+        same = foreign.text.replace(run_id, "{id}") == unknown.text.replace("run-404", "{id}")
+        assert same, f"another tenant's run answers {foreign.text} and an unknown run {unknown.text}: the difference tells a caller which run ids exist"
         r = await _read(c, run_id)
     assert r.status_code == 200, f"t1 reading its own run answered {r.status_code}: {r.text}"
 
 
 async def check_view(ctx):
     c, run_id = _setup(ctx)
-    now = int(time.time())
-    _checkpoint(ctx, run_id, "send_welcome", "create_account", now)
     async with c:
+        fresh = await _read(c, run_id)
+        now = int(time.time())
+        _checkpoint(ctx, run_id, "send_welcome", "create_account", now)
         r = await _read(c, run_id)
+        _checkpoint(ctx, run_id, "", "create_account,send_welcome", now)
+        finished = (await _read(c, run_id)).json().get("completed")
     assert r.status_code == 200, f"GET /v1/runs/{run_id} answered {r.status_code}: {r.text}"
     body = r.json()
     assert body.get("definition_version") == 3 and body.get("pinned_steps") == V3, f"a version-3 run answered {body}: it must report version 3 and its pinned steps, not the newest definition"
     assert body.get("current_step") == "send_welcome" and body.get("completed") == ["create_account"], f"the body says current_step {body.get('current_step')!r}, completed {body.get('completed')!r}; the checkpoint says send_welcome after create_account"
     assert body.get("checkpoint_at") == now, f"checkpoint_at is {body.get('checkpoint_at')!r}, expected the checkpoint's updated_at {now}"
+    assert fresh.json().get("completed") == [], f"a run that finished no step yet (completed '') reports completed {fresh.json().get('completed')!r}, expected []"
+    assert finished == V3, f"a checkpoint whose completed is 'create_account,send_welcome' reports completed {finished!r}, expected {V3}"
 
 
 async def check_pending(ctx):
@@ -550,23 +557,32 @@ async def check_pending(ctx):
     ledger.record(f"{run_id}:create_account", "acct-1")
     async with c:
         r = await _read(c, run_id)
+        pending = r.json().get("pending_effects")
+        assert pending == ["send_welcome"], f"with create_account recorded in the ledger, pending_effects is {pending!r}, expected ['send_welcome']"
+        # A worker recorded send_welcome's effect and stopped before the checkpoint moved: the ledger, not the checkpoint, says what is pending.
+        ledger.record(f"{run_id}:send_welcome", "m-1")
+        r = await _read(c, run_id)
     pending = r.json().get("pending_effects")
-    assert pending == ["send_welcome"], f"with create_account recorded in the ledger, pending_effects is {pending!r}, expected ['send_welcome']"
+    assert pending == [], f"with both effects recorded in the ledger and the checkpoint still at send_welcome, pending_effects is {pending!r}, expected []: it comes from the ledger"
 
 
 async def check_status(ctx):
     c, run_id = _setup(ctx)
     now = int(time.time())
     async with c:
-        for age, expected in ((0, "running"), (100, "running"), (600, "stalled")):
+        for age, expected in ((0, "running"), (100, "running"), (299, "running"), (301, "stalled"), (600, "stalled")):
             _checkpoint(ctx, run_id, "send_welcome", "create_account", now - age)
             r = await _read(c, run_id)
             status = r.json().get("status")
             assert status == expected, f"a checkpoint written {age} s ago reports status {status!r}, expected {expected!r} (STALL_AFTER_S = 300)"
         _checkpoint(ctx, run_id, "", "create_account,send_welcome", now)
         r = await _read(c, run_id)
+        status = r.json().get("status")
+        assert status == "succeeded", f"a run whose current_step is '' reports status {status!r}, expected 'succeeded'"
+        _checkpoint(ctx, run_id, "", "create_account,send_welcome", now - 600)
+        r = await _read(c, run_id)
     status = r.json().get("status")
-    assert status == "succeeded", f"a run whose current_step is '' reports status {status!r}, expected 'succeeded'"
+    assert status == "succeeded", f"a run that finished 600 s ago reports status {status!r}, expected 'succeeded': a finished run is never stalled"
 `,
     typescript: `const V3 = ['create_account', 'send_welcome'];
 const V4 = ['create_account', 'send_welcome', 'notify_sales'];
@@ -595,20 +611,28 @@ export async function check_tenant_scope(ctx) {
   const {c, runId} = await setup(ctx);
   let r = await read(c, runId, null);
   assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
-  r = await read(c, runId, 't2');
-  assert.equal(r.status, 404, \`tenant t2 reading t1's run answered \${r.status}, expected 404 (exactly what an unknown run answers)\`);
-  assert(!r.text.includes('signup') && !r.text.includes('create_account'), \`the 404 for another tenant's run carries the run: \${r.text}\`);
-  r = await read(c, 'run-404');
-  assert.equal(r.status, 404, \`an unknown run answered \${r.status}, expected 404\`);
+  const foreign = await read(c, runId, 't2');
+  assert.equal(foreign.status, 404, \`tenant t2 reading t1's run answered \${foreign.status}, expected 404 (exactly what an unknown run answers)\`);
+  assert(!foreign.text.includes('signup') && !foreign.text.includes('create_account'), \`the 404 for another tenant's run carries the run: \${foreign.text}\`);
+  const unknown = await read(c, 'run-404', 't2');
+  assert.equal(unknown.status, 404, \`an unknown run answered \${unknown.status}, expected 404\`);
+  assert.equal(
+    foreign.text.replaceAll(runId, '{id}'),
+    unknown.text.replaceAll('run-404', '{id}'),
+    \`another tenant's run answers \${foreign.text} and an unknown run \${unknown.text}: the difference tells a caller which run ids exist\`,
+  );
   r = await read(c, runId);
   assert.equal(r.status, 200, \`t1 reading its own run answered \${r.status}: \${r.text}\`);
 }
 
 export async function check_view(ctx) {
   const {c, runId} = await setup(ctx);
+  const fresh = (await read(c, runId)).json().completed;
   const now = nowS();
   setCheckpoint(ctx, runId, 'send_welcome', 'create_account', now);
   const r = await read(c, runId);
+  setCheckpoint(ctx, runId, '', 'create_account,send_welcome', now);
+  const finished = (await read(c, runId)).json().completed;
   assert.equal(r.status, 200, \`GET /v1/runs/\${runId} answered \${r.status}: \${r.text}\`);
   const body = r.json();
   assert(body.definition_version === 3 && JSON.stringify(body.pinned_steps) === JSON.stringify(V3), \`a version-3 run answered \${r.text}: it must report version 3 and its pinned steps, not the newest definition\`);
@@ -617,6 +641,8 @@ export async function check_view(ctx) {
     \`the body says current_step \${JSON.stringify(body.current_step)}, completed \${JSON.stringify(body.completed)}; the checkpoint says send_welcome after create_account\`,
   );
   assert.equal(body.checkpoint_at, now, "checkpoint_at must be the checkpoint's updated_at");
+  assert.deepStrictEqual(fresh, [], \`a run that finished no step yet (completed '') reports completed \${JSON.stringify(fresh)}, expected []\`);
+  assert.deepStrictEqual(finished, V3, \`a checkpoint whose completed is 'create_account,send_welcome' reports completed \${JSON.stringify(finished)}, expected \${JSON.stringify(V3)}\`);
 }
 
 export async function check_pending(ctx) {
@@ -625,6 +651,10 @@ export async function check_pending(ctx) {
   await ledger.record(\`\${runId}:create_account\`, 'acct-1');
   const pending = (await read(c, runId)).json().pending_effects;
   assert.deepStrictEqual(pending, ['send_welcome'], \`with create_account recorded in the ledger, pending_effects is \${JSON.stringify(pending)}, expected ["send_welcome"]\`);
+  // A worker recorded send_welcome's effect and stopped before the checkpoint moved: the ledger, not the checkpoint, says what is pending.
+  await ledger.record(\`\${runId}:send_welcome\`, 'm-1');
+  const after = (await read(c, runId)).json().pending_effects;
+  assert.deepStrictEqual(after, [], \`with both effects recorded in the ledger and the checkpoint still at send_welcome, pending_effects is \${JSON.stringify(after)}, expected []: it comes from the ledger\`);
 }
 
 export async function check_status(ctx) {
@@ -633,6 +663,8 @@ export async function check_status(ctx) {
   for (const [age, expected] of [
     [0, 'running'],
     [100, 'running'],
+    [299, 'running'],
+    [301, 'stalled'],
     [600, 'stalled'],
   ] as const) {
     setCheckpoint(ctx, runId, 'send_welcome', 'create_account', now - age);
@@ -640,8 +672,11 @@ export async function check_status(ctx) {
     assert.equal(status, expected, \`a checkpoint written \${age} s ago reports status \${JSON.stringify(status)}, expected \${expected} (STALL_AFTER_S = 300)\`);
   }
   setCheckpoint(ctx, runId, '', 'create_account,send_welcome', now);
-  const status = (await read(c, runId)).json().status;
+  let status = (await read(c, runId)).json().status;
   assert.equal(status, 'succeeded', \`a run whose current_step is '' reports status \${JSON.stringify(status)}, expected succeeded\`);
+  setCheckpoint(ctx, runId, '', 'create_account,send_welcome', now - 600);
+  status = (await read(c, runId)).json().status;
+  assert.equal(status, 'succeeded', \`a run that finished 600 s ago reports status \${JSON.stringify(status)}, expected succeeded: a finished run is never stalled\`);
 }
 `,
     go: `package main
@@ -666,7 +701,7 @@ var (
 	readV4 = []string{"create_account", "send_welcome", "notify_sales"}
 )
 
-type readBody struct {
+type hReadBody struct {
 	DefinitionVersion int      \`json:"definition_version"\`
 	PinnedSteps       []string \`json:"pinned_steps"\`
 	CurrentStep       string   \`json:"current_step"\`
@@ -685,51 +720,63 @@ func readSetup(ctx *harness.Ctx) (*harness.HTTP, string) {
 	return ctx.HTTP(mux), run.RunID
 }
 
-func setCheckpoint(ctx *harness.Ctx, runID, currentStep, completed string, updatedAt int64) {
+func hReadSetCheckpoint(ctx *harness.Ctx, runID, currentStep, completed string, updatedAt int64) {
 	ctx.Redis.Do("HSET", "run:"+runID+":checkpoint", "current_step", currentStep, "completed", completed, "updated_at", fmt.Sprint(updatedAt))
 }
 
-func readAs(c *harness.HTTP, runID, tenant string) *harness.Response {
+func hReadAs(c *harness.HTTP, runID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/runs/" + runID)
 	}
 	return c.Get("/v1/runs/"+runID, "X-Tenant-Id", tenant)
 }
 
-func decodeRead(r *harness.Response) readBody {
-	var body readBody
+func hDecodeRead(r *harness.Response) hReadBody {
+	var body hReadBody
 	r.Decode(&body)
 	return body
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
 	c, runID := readSetup(ctx)
-	ctx.Equal(readAs(c, runID, "").Status, 401, "a request without X-Tenant-Id; the status")
-	r := readAs(c, runID, "t2")
-	ctx.Equal(r.Status, 404, "tenant t2 reading t1's run must get exactly what an unknown run gets; the status")
-	ctx.Assert(!strings.Contains(r.Text(), "signup") && !strings.Contains(r.Text(), "create_account"), "the 404 for another tenant's run carries the run: %s", r.Text())
-	ctx.Equal(readAs(c, "run-404", "t1").Status, 404, "an unknown run; the status")
-	r = readAs(c, runID, "t1")
+	ctx.Equal(hReadAs(c, runID, "").Status, 401, "a request without X-Tenant-Id; the status")
+	foreign := hReadAs(c, runID, "t2")
+	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's run must get exactly what an unknown run gets; the status")
+	ctx.Assert(!strings.Contains(foreign.Text(), "signup") && !strings.Contains(foreign.Text(), "create_account"), "the 404 for another tenant's run carries the run: %s", foreign.Text())
+	unknown := hReadAs(c, "run-404", "t2")
+	ctx.Equal(unknown.Status, 404, "an unknown run; the status")
+	same := strings.ReplaceAll(foreign.Text(), runID, "{id}") == strings.ReplaceAll(unknown.Text(), "run-404", "{id}")
+	ctx.Assert(same, "another tenant's run answers %q and an unknown run %q: the difference tells a caller which run ids exist", foreign.Text(), unknown.Text())
+	r := hReadAs(c, runID, "t1")
 	ctx.Equal(r.Status, 200, "t1 reading its own run (%s); the status", r.Text())
 }
 
 func CheckView(ctx *harness.Ctx) {
 	c, runID := readSetup(ctx)
+	fresh := hDecodeRead(hReadAs(c, runID, "t1")).Completed
 	now := time.Now().Unix()
-	setCheckpoint(ctx, runID, "send_welcome", "create_account", now)
-	r := readAs(c, runID, "t1")
+	hReadSetCheckpoint(ctx, runID, "send_welcome", "create_account", now)
+	r := hReadAs(c, runID, "t1")
+	hReadSetCheckpoint(ctx, runID, "", "create_account,send_welcome", now)
+	finished := hDecodeRead(hReadAs(c, runID, "t1")).Completed
 	ctx.Equal(r.Status, 200, "GET /v1/runs/%s (%s); the status", runID, r.Text())
-	body := decodeRead(r)
+	body := hDecodeRead(r)
 	ctx.Assert(body.DefinitionVersion == 3 && strings.Join(body.PinnedSteps, ",") == strings.Join(readV3, ","), "a version-3 run answered %s: it must report version 3 and its pinned steps, not the newest definition", r.Text())
 	ctx.Assert(body.CurrentStep == "send_welcome" && strings.Join(body.Completed, ",") == "create_account", "the body says current_step %q, completed %q; the checkpoint says send_welcome after create_account", body.CurrentStep, body.Completed)
 	ctx.Equal(body.CheckpointAt, now, "checkpoint_at must be the checkpoint's updated_at")
+	ctx.Assert(len(fresh) == 0, "a run that finished no step yet (completed '') reports completed %q, expected an empty list", fresh)
+	ctx.Assert(strings.Join(finished, ",") == "create_account,send_welcome" && len(finished) == 2, "a checkpoint whose completed is 'create_account,send_welcome' reports completed %q, expected %q", finished, readV3)
 }
 
 func CheckPending(ctx *harness.Ctx) {
 	c, runID := readSetup(ctx)
-	setCheckpoint(ctx, runID, "send_welcome", "create_account", time.Now().Unix())
+	hReadSetCheckpoint(ctx, runID, "send_welcome", "create_account", time.Now().Unix())
 	ledger.Record(readBg, runID+":create_account", "acct-1")
-	ctx.Equal(decodeRead(readAs(c, runID, "t1")).PendingEffects, []string{"send_welcome"}, "with create_account recorded in the ledger, pending_effects")
+	ctx.Equal(hDecodeRead(hReadAs(c, runID, "t1")).PendingEffects, []string{"send_welcome"}, "with create_account recorded in the ledger, pending_effects")
+	// A worker recorded send_welcome's effect and stopped before the checkpoint moved: the ledger, not the checkpoint, says what is pending.
+	ledger.Record(readBg, runID+":send_welcome", "m-1")
+	after := hDecodeRead(hReadAs(c, runID, "t1")).PendingEffects
+	ctx.Assert(len(after) == 0, "with both effects recorded in the ledger and the checkpoint still at send_welcome, pending_effects is %q, expected an empty list: it comes from the ledger", after)
 }
 
 func CheckStatus(ctx *harness.Ctx) {
@@ -738,12 +785,14 @@ func CheckStatus(ctx *harness.Ctx) {
 	for _, tc := range []struct {
 		age  int64
 		want string
-	}{{0, "running"}, {100, "running"}, {600, "stalled"}} {
-		setCheckpoint(ctx, runID, "send_welcome", "create_account", now-tc.age)
-		ctx.Equal(decodeRead(readAs(c, runID, "t1")).Status, tc.want, "a checkpoint written %d s ago (stallAfterSeconds = 300); the status", tc.age)
+	}{{0, "running"}, {100, "running"}, {299, "running"}, {301, "stalled"}, {600, "stalled"}} {
+		hReadSetCheckpoint(ctx, runID, "send_welcome", "create_account", now-tc.age)
+		ctx.Equal(hDecodeRead(hReadAs(c, runID, "t1")).Status, tc.want, "a checkpoint written %d s ago (stallAfterSeconds = 300); the status", tc.age)
 	}
-	setCheckpoint(ctx, runID, "", "create_account,send_welcome", now)
-	ctx.Equal(decodeRead(readAs(c, runID, "t1")).Status, "succeeded", "a run whose current_step is ''; the status")
+	hReadSetCheckpoint(ctx, runID, "", "create_account,send_welcome", now)
+	ctx.Equal(hDecodeRead(hReadAs(c, runID, "t1")).Status, "succeeded", "a run whose current_step is ''; the status")
+	hReadSetCheckpoint(ctx, runID, "", "create_account,send_welcome", now-600)
+	ctx.Equal(hDecodeRead(hReadAs(c, runID, "t1")).Status, "succeeded", "a run that finished 600 s ago (a finished run is never stalled); the status")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -763,12 +812,12 @@ namespace {
 const std::vector<std::string> kV3 = {"create_account", "send_welcome"};
 const std::vector<std::string> kV4 = {"create_account", "send_welcome", "notify_sales"};
 
-struct Fixture {
+struct HReadFixture {
   harness::HTTP c;
   std::string run_id;
 };
 
-Fixture setup(harness::Ctx& ctx) {
+HReadFixture hReadSetup(harness::Ctx& ctx) {
   definitions::put("signup", 3, kV3, {{"create_account", "send_welcome"}});
   definitions::put("signup", 4, kV4, {{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}});
   const runs::Run run = runs::create("t1", "signup", 3, kV3, nlohmann::json{{"email", "ada@example.com"}}, 50);
@@ -776,66 +825,86 @@ Fixture setup(harness::Ctx& ctx) {
   delete svr;
   svr = new httplib::Server;
   register_routes(*svr);
-  return Fixture{ctx.HTTP(*svr), run.run_id};
+  return HReadFixture{ctx.HTTP(*svr), run.run_id};
 }
 
-long long nowSeconds() {
+long long hNowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-void setCheckpoint(harness::Ctx& ctx, const std::string& run_id, const std::string& current_step, const std::string& completed, long long updated_at) {
+void hReadSetCheckpoint(harness::Ctx& ctx, const std::string& run_id, const std::string& current_step, const std::string& completed, long long updated_at) {
   ctx.Redis.Do("HSET", "run:" + run_id + ":checkpoint", "current_step", current_step, "completed", completed, "updated_at", std::to_string(updated_at));
 }
 
-nlohmann::json body(const harness::Response& r) {
+nlohmann::json hReadBody(const harness::Response& r) {
   const auto parsed = nlohmann::json::parse(r.Text(), nullptr, false);
   return parsed.is_object() ? parsed : nlohmann::json::object();
+}
+
+std::string hReplaceAll(std::string text, const std::string& from, const std::string& to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
+  return text;
 }
 
 }  // namespace
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto f = setup(ctx);
+  auto f = hReadSetup(ctx);
   ctx.Equal(f.c.Get("/v1/runs/" + f.run_id).Status, 401, "a request without X-Tenant-Id; the status");
-  auto r = f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t2");
-  ctx.Equal(r.Status, 404, "tenant t2 reading t1's run must get exactly what an unknown run gets; the status");
-  ctx.Assert(r.Text().find("signup") == std::string::npos && r.Text().find("create_account") == std::string::npos, "the 404 for another tenant's run carries the run: %s", r.Text());
-  ctx.Equal(f.c.Get("/v1/runs/run-404", "X-Tenant-Id", "t1").Status, 404, "an unknown run; the status");
-  r = f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1");
+  const auto foreign = f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t2");
+  ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's run must get exactly what an unknown run gets; the status");
+  ctx.Assert(foreign.Text().find("signup") == std::string::npos && foreign.Text().find("create_account") == std::string::npos, "the 404 for another tenant's run carries the run: %s", foreign.Text());
+  const auto unknown = f.c.Get("/v1/runs/run-404", "X-Tenant-Id", "t2");
+  ctx.Equal(unknown.Status, 404, "an unknown run; the status");
+  ctx.Assert(hReplaceAll(foreign.Text(), f.run_id, "{id}") == hReplaceAll(unknown.Text(), "run-404", "{id}"),
+             "another tenant's run answers %q and an unknown run %q: the difference tells a caller which run ids exist", foreign.Text(), unknown.Text());
+  const auto r = f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "t1 reading its own run (%s); the status", r.Text());
 }
 
 void CheckView(harness::Ctx& ctx) {
-  auto f = setup(ctx);
-  const long long now = nowSeconds();
-  setCheckpoint(ctx, f.run_id, "send_welcome", "create_account", now);
+  auto f = hReadSetup(ctx);
+  const auto fresh = hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1"));
+  const long long now = hNowSeconds();
+  hReadSetCheckpoint(ctx, f.run_id, "send_welcome", "create_account", now);
   const auto r = f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1");
+  hReadSetCheckpoint(ctx, f.run_id, "", "create_account,send_welcome", now);
+  const auto finished = hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1"));
   ctx.Equal(r.Status, 200, "GET /v1/runs/%s (%s); the status", f.run_id, r.Text());
-  const auto b = body(r);
+  const auto b = hReadBody(r);
   ctx.Assert(b.value("definition_version", 0L) == 3 && b.value("pinned_steps", std::vector<std::string>{}) == kV3, "a version-3 run answered %s: it must report version 3 and its pinned steps, not the newest definition", r.Text());
   ctx.Assert(b.value("current_step", "") == "send_welcome" && b.value("completed", std::vector<std::string>{}) == std::vector<std::string>{"create_account"},
              "the body is %s; the checkpoint says send_welcome after create_account", r.Text());
   ctx.Equal(b.value("checkpoint_at", 0LL), now, "checkpoint_at must be the checkpoint's updated_at");
+  ctx.Assert(fresh.contains("completed") && fresh["completed"] == nlohmann::json::array(), "a run that finished no step yet (completed '') must report completed []; the body is %s", fresh.dump());
+  ctx.Equal(finished.value("completed", std::vector<std::string>{}), kV3, "a checkpoint whose completed is 'create_account,send_welcome'; completed");
 }
 
 void CheckPending(harness::Ctx& ctx) {
-  auto f = setup(ctx);
-  setCheckpoint(ctx, f.run_id, "send_welcome", "create_account", nowSeconds());
+  auto f = hReadSetup(ctx);
+  hReadSetCheckpoint(ctx, f.run_id, "send_welcome", "create_account", hNowSeconds());
   ledger::record(f.run_id + ":create_account", "acct-1");
-  const auto b = body(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1"));
+  const auto b = hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1"));
   ctx.Equal(b.value("pending_effects", std::vector<std::string>{}), std::vector<std::string>{"send_welcome"}, "with create_account recorded in the ledger, pending_effects");
+  // A worker recorded send_welcome's effect and stopped before the checkpoint moved: the ledger, not the checkpoint, says what is pending.
+  ledger::record(f.run_id + ":send_welcome", "m-1");
+  const auto after = hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1"));
+  ctx.Assert(after.contains("pending_effects") && after["pending_effects"] == nlohmann::json::array(),
+             "with both effects recorded in the ledger and the checkpoint still at send_welcome, pending_effects must be [] (it comes from the ledger); the body is %s", after.dump());
 }
 
 void CheckStatus(harness::Ctx& ctx) {
-  auto f = setup(ctx);
-  const long long now = nowSeconds();
-  const std::vector<std::pair<long long, std::string>> cases = {{0, "running"}, {100, "running"}, {600, "stalled"}};
+  auto f = hReadSetup(ctx);
+  const long long now = hNowSeconds();
+  const std::vector<std::pair<long long, std::string>> cases = {{0, "running"}, {100, "running"}, {299, "running"}, {301, "stalled"}, {600, "stalled"}};
   for (const auto& [age, want] : cases) {
-    setCheckpoint(ctx, f.run_id, "send_welcome", "create_account", now - age);
-    ctx.Equal(body(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1")).value("status", ""), want, "a checkpoint written %d s ago (kStallAfterSeconds = 300); the status", age);
+    hReadSetCheckpoint(ctx, f.run_id, "send_welcome", "create_account", now - age);
+    ctx.Equal(hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1")).value("status", ""), want, "a checkpoint written %d s ago (kStallAfterSeconds = 300); the status", age);
   }
-  setCheckpoint(ctx, f.run_id, "", "create_account,send_welcome", now);
-  ctx.Equal(body(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1")).value("status", ""), "succeeded", "a run whose current_step is ''; the status");
+  hReadSetCheckpoint(ctx, f.run_id, "", "create_account,send_welcome", now);
+  ctx.Equal(hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1")).value("status", ""), "succeeded", "a run whose current_step is ''; the status");
+  hReadSetCheckpoint(ctx, f.run_id, "", "create_account,send_welcome", now - 600);
+  ctx.Equal(hReadBody(f.c.Get("/v1/runs/" + f.run_id, "X-Tenant-Id", "t1")).value("status", ""), "succeeded", "a run that finished 600 s ago (a finished run is never stalled); the status");
 }
 `,
   },

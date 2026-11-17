@@ -102,7 +102,7 @@ session.
       id: 'auth-assertion',
       title: 'Only a complete assertion opens a session',
       detail:
-        'An assertion whose `status` is not `"complete"` (MFA still pending) is **401** and writes no session. The starter accepts any assertion that exists.',
+        'An assertion whose `status` is not `"complete"` (MFA still pending, or only the password checked) is **401**, writes no session and leaves the session the client presented live. The starter accepts any assertion that exists.',
       match: {
         python: {all: [/["']complete["']/, /\b401\b/]},
         typescript: {all: [/['"]complete['"]/, /\b401\b/]},
@@ -449,6 +449,7 @@ from sessions import store
 ASSERTIONS = {
     "tok-1": ("u-1", "mobile", "complete"),
     "tok-pending": ("u-1", "mobile", "mfa_pending"),
+    "tok-partial": ("u-1", "mobile", "password_verified"),
 }
 
 
@@ -526,12 +527,18 @@ async def check_auth_assertion(ctx):
         assert missing.status_code == 401, f"a login with no token answered {missing.status_code}, expected 401"
         pending = await c.post("/v1/sessions", headers=_headers("tok-pending"))
         assert pending.status_code == 401, f"a login whose assertion is still mfa_pending answered {pending.status_code}, expected 401: the second factor never passed"
+        partial = await c.post("/v1/sessions", headers=_headers("tok-partial"))
+        assert partial.status_code == 401, f"a login whose assertion is password_verified answered {partial.status_code}, expected 401: only status \\"complete\\" opens a session"
         assert ctx.redis.keys("session:*") == [], f"the refused login wrote {ctx.redis.keys('session:*')}"
-        await _login(c)
+        live = (await _login(c))["session_id"]
+        refused = await c.post("/v1/sessions", headers=_headers("tok-pending", live))
+        assert refused.status_code == 401, f"a login whose assertion is still mfa_pending answered {refused.status_code}, expected 401"
+    assert store.read_session(live) is not None and live in store.user_sessions("u-1"), f"a refused login on X-Session-Id {live} retired that live session: a refused login writes nothing"
 `,
     typescript: `function api(ctx) {
   ctx.redis.hset('assertion:tok-1', 'user_id', 'u-1', 'device_class', 'mobile', 'status', 'complete');
   ctx.redis.hset('assertion:tok-pending', 'user_id', 'u-1', 'device_class', 'mobile', 'status', 'mfa_pending');
+  ctx.redis.hset('assertion:tok-partial', 'user_id', 'u-1', 'device_class', 'mobile', 'status', 'password_verified');
   return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/sessions/store.ts')};
 }
 
@@ -596,14 +603,20 @@ export async function check_device_from_token(ctx) {
 }
 
 export async function check_auth_assertion(ctx) {
-  const {c} = api(ctx);
+  const {c, store} = api(ctx);
   const missing = await c.post('/v1/sessions');
   assert.equal(missing.status, 401, \`a login with no token answered \${missing.status}, expected 401\`);
   const pending = await c.post('/v1/sessions', {headers: headers('tok-pending')});
   assert.equal(pending.status, 401, \`a login whose assertion is still mfa_pending answered \${pending.status}, expected 401: the second factor never passed\`);
+  const partial = await c.post('/v1/sessions', {headers: headers('tok-partial')});
+  assert.equal(partial.status, 401, \`a login whose assertion is password_verified answered \${partial.status}, expected 401: only status "complete" opens a session\`);
   const written = ctx.redis.keys('session:*');
   assert.deepEqual(written, [], \`the refused login wrote \${JSON.stringify(written)}\`);
-  await login(c);
+  const live = (await login(c)).session_id;
+  const refused = await c.post('/v1/sessions', {headers: headers('tok-pending', live)});
+  assert.equal(refused.status, 401, \`a login whose assertion is still mfa_pending answered \${refused.status}, expected 401\`);
+  const kept = await store.readSession(live);
+  assert(kept !== null && (await store.userSessions('u-1')).includes(live), \`a refused login on X-Session-Id \${live} retired that live session: a refused login writes nothing\`);
 }
 `,
     go: `package main
@@ -619,91 +632,97 @@ import (
 	"leetbuild/harness"
 )
 
-var bg = context.Background()
+var hBG = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Do("HSET", "assertion:tok-1", "user_id", "u-1", "device_class", "mobile", "status", "complete")
 	ctx.Redis.Do("HSET", "assertion:tok-pending", "user_id", "u-1", "device_class", "mobile", "status", "mfa_pending")
+	ctx.Redis.Do("HSET", "assertion:tok-partial", "user_id", "u-1", "device_class", "mobile", "status", "password_verified")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-// plant writes an anonymous pre-login session: the id a browser holds before anyone signs in, the one an attacker plants.
-func plant(ctx *harness.Ctx, sessionID string) {
+// hPlant writes an anonymous pre-login session: the id a browser holds before anyone signs in, the one an attacker plants.
+func hPlant(ctx *harness.Ctx, sessionID string) {
 	now := ctx.Clock.Now() / 1000
 	ctx.Redis.Do("HSET", "session:"+sessionID, "user_id", "", "device_class", "web", "token_hash", "", "created_at", now, "last_seen", now, "rotation", 0)
 	ctx.Redis.Do("EXPIRE", "session:"+sessionID, 900)
 }
 
-type loginBody struct {
+type hLoginBody struct {
 	SessionID   string \`json:"session_id"\`
 	UserID      string \`json:"user_id"\`
 	DeviceClass string \`json:"device_class"\`
 }
 
-func login(ctx *harness.Ctx, c *harness.HTTP, sessionID string, body any) loginBody {
+func hLogin(ctx *harness.Ctx, c *harness.HTTP, sessionID string, body any) hLoginBody {
 	header := []string{"Authorization", "Bearer tok-1"}
 	if sessionID != "" {
 		header = append(header, "X-Session-Id", sessionID)
 	}
 	r := c.Post("/v1/sessions", body, header...)
 	ctx.Equal(r.Status, 201, "a login with a complete assertion (%s)", r.Text())
-	var out loginBody
+	var out hLoginBody
 	r.Decode(&out)
 	return out
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	body := login(ctx, c, "", nil)
+	c := hAPI(ctx)
+	body := hLogin(ctx, c, "", nil)
 	ctx.Assert(body.SessionID != "" && body.UserID == "u-1", "the login answered %+v, expected a session_id and user_id u-1", body)
-	record := store.ReadSession(bg, body.SessionID)
+	record := store.ReadSession(hBG, body.SessionID)
 	ctx.Assert(record != nil && record.UserID == "u-1", "the store has no session for u-1 under %s: %+v", body.SessionID, record)
-	ids := store.UserSessions(bg, "u-1")
+	ids := store.UserSessions(hBG, "u-1")
 	ctx.Assert(slices.Contains(ids, body.SessionID), "u-1's set holds %v, expected %s", ids, body.SessionID)
 }
 
 func CheckRotate(ctx *harness.Ctx) {
-	plant(ctx, "planted-1")
-	c := api(ctx)
-	body := login(ctx, c, "planted-1", nil)
+	hPlant(ctx, "planted-1")
+	c := hAPI(ctx)
+	body := hLogin(ctx, c, "planted-1", nil)
 	ctx.Assert(body.SessionID != "planted-1", "a login on X-Session-Id planted-1 answered planted-1: an id an attacker planted before the login is now signed in as u-1. Mint a fresh id at every login")
-	planted := store.ReadSession(bg, "planted-1")
+	planted := store.ReadSession(hBG, "planted-1")
 	ctx.Assert(planted == nil || planted.UserID != "u-1", "planted-1 now belongs to u-1: %+v", planted)
-	record := store.ReadSession(bg, body.SessionID)
+	record := store.ReadSession(hBG, body.SessionID)
 	ctx.Assert(record != nil && record.UserID == "u-1", "the fresh id %s must hold u-1's session, the store has %+v", body.SessionID, record)
 }
 
 func CheckInvalidateOld(ctx *harness.Ctx) {
-	plant(ctx, "planted-1")
-	c := api(ctx)
-	first := login(ctx, c, "planted-1", nil)
-	planted := store.ReadSession(bg, "planted-1")
+	hPlant(ctx, "planted-1")
+	c := hAPI(ctx)
+	first := hLogin(ctx, c, "planted-1", nil)
+	planted := store.ReadSession(hBG, "planted-1")
 	ctx.Assert(planted == nil, "after the login the id the client presented (planted-1) still reads as %+v: retire it in the same request", planted)
-	again := login(ctx, c, first.SessionID, nil)
-	ctx.Assert(store.ReadSession(bg, first.SessionID) == nil, "a second login on %s left it live", first.SessionID)
-	ids := store.UserSessions(bg, "u-1")
+	again := hLogin(ctx, c, first.SessionID, nil)
+	ctx.Assert(store.ReadSession(hBG, first.SessionID) == nil, "a second login on %s left it live", first.SessionID)
+	ids := store.UserSessions(hBG, "u-1")
 	ctx.Assert(!slices.Contains(ids, first.SessionID) && slices.Contains(ids, again.SessionID), "u-1's set holds %v: the retired id must leave it, the new one must be in it", ids)
 }
 
 func CheckDeviceFromToken(ctx *harness.Ctx) {
-	c := api(ctx)
-	body := login(ctx, c, "", map[string]string{"device_class": "desktop"})
+	c := hAPI(ctx)
+	body := hLogin(ctx, c, "", map[string]string{"device_class": "desktop"})
 	ctx.Equal(body.DeviceClass, "mobile", "the assertion saw mobile, the body's label must not override it; the answered device_class")
-	record := store.ReadSession(bg, body.SessionID)
+	record := store.ReadSession(hBG, body.SessionID)
 	ctx.Assert(record != nil && record.DeviceClass == "mobile", "the stored session must carry the assertion's device class mobile, got %+v", record)
 }
 
 func CheckAuthAssertion(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	missing := c.Post("/v1/sessions", nil)
 	ctx.Equal(missing.Status, 401, "a login with no token")
 	pending := c.Post("/v1/sessions", nil, "Authorization", "Bearer tok-pending")
 	ctx.Equal(pending.Status, 401, "a login whose assertion is still mfa_pending (the second factor never passed)")
+	partial := c.Post("/v1/sessions", nil, "Authorization", "Bearer tok-partial")
+	ctx.Equal(partial.Status, 401, "a login whose assertion is password_verified (only status \\"complete\\" opens a session)")
 	written := ctx.Redis.Keys("session:*")
 	ctx.Assert(len(written) == 0, "the refused login wrote %s", fmt.Sprint(written))
-	login(ctx, c, "", nil)
+	live := hLogin(ctx, c, "", nil).SessionID
+	refused := c.Post("/v1/sessions", nil, "Authorization", "Bearer tok-pending", "X-Session-Id", live)
+	ctx.Equal(refused.Status, 401, "a login whose assertion is still mfa_pending")
+	ctx.Assert(store.ReadSession(hBG, live) != nil && slices.Contains(store.UserSessions(hBG, "u-1"), live), "a refused login on X-Session-Id %s retired that live session: a refused login writes nothing", live)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -718,9 +737,10 @@ func CheckAuthAssertion(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "assertion:tok-1", "user_id", "u-1", "device_class", "mobile", "status", "complete");
   ctx.Redis.Do("HSET", "assertion:tok-pending", "user_id", "u-1", "device_class", "mobile", "status", "mfa_pending");
+  ctx.Redis.Do("HSET", "assertion:tok-partial", "user_id", "u-1", "device_class", "mobile", "status", "password_verified");
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -729,13 +749,13 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // An anonymous pre-login session: the id a browser holds before anyone signs in, the one an attacker plants.
-void plant(harness::Ctx& ctx, const std::string& session_id) {
+void hPlant(harness::Ctx& ctx, const std::string& session_id) {
   const long long now = ctx.Clock.Now() / 1000;
   ctx.Redis.Do("HSET", "session:" + session_id, "user_id", "", "device_class", "web", "token_hash", "", "created_at", now, "last_seen", now, "rotation", 0);
   ctx.Redis.Do("EXPIRE", "session:" + session_id, 900);
 }
 
-nlohmann::json login(harness::Ctx& ctx, harness::HTTP& c, const std::string& session_id = "", const std::string& body = "") {
+nlohmann::json hLogin(harness::Ctx& ctx, harness::HTTP& c, const std::string& session_id = "", const std::string& body = "") {
   const auto r = session_id.empty()
                      ? c.Post("/v1/sessions", body, "Content-Type", "application/json", "Authorization", "Bearer tok-1")
                      : c.Post("/v1/sessions", body, "Content-Type", "application/json", "Authorization", "Bearer tok-1", "X-Session-Id", session_id);
@@ -744,24 +764,24 @@ nlohmann::json login(harness::Ctx& ctx, harness::HTTP& c, const std::string& ses
   return out.is_object() ? out : nlohmann::json::object();
 }
 
-bool contains(const std::vector<std::string>& ids, const std::string& id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); }
+bool hContains(const std::vector<std::string>& ids, const std::string& id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto body = login(ctx, c);
+  auto c = hApi(ctx);
+  const auto body = hLogin(ctx, c);
   const std::string session_id = body.value("session_id", "");
   ctx.Assert(!session_id.empty() && body.value("user_id", "") == "u-1", "the login answered %s, expected a session_id and user_id u-1", body.dump());
   const auto record = store::readSession(session_id);
   ctx.Assert(record && record->user_id == "u-1", "the store has no session for u-1 under %s", session_id);
-  ctx.Assert(contains(store::userSessions("u-1"), session_id), "u-1's set must hold %s", session_id);
+  ctx.Assert(hContains(store::userSessions("u-1"), session_id), "u-1's set must hold %s", session_id);
 }
 
 void CheckRotate(harness::Ctx& ctx) {
-  plant(ctx, "planted-1");
-  auto c = api(ctx);
-  const std::string session_id = login(ctx, c, "planted-1").value("session_id", "");
+  hPlant(ctx, "planted-1");
+  auto c = hApi(ctx);
+  const std::string session_id = hLogin(ctx, c, "planted-1").value("session_id", "");
   ctx.Assert(session_id != "planted-1",
              "a login on X-Session-Id planted-1 answered planted-1: an id an attacker planted before the login is now signed in as u-1. Mint a fresh id at every login");
   const auto planted = store::readSession("planted-1");
@@ -771,33 +791,39 @@ void CheckRotate(harness::Ctx& ctx) {
 }
 
 void CheckInvalidateOld(harness::Ctx& ctx) {
-  plant(ctx, "planted-1");
-  auto c = api(ctx);
-  const std::string old = login(ctx, c, "planted-1").value("session_id", "");
+  hPlant(ctx, "planted-1");
+  auto c = hApi(ctx);
+  const std::string old = hLogin(ctx, c, "planted-1").value("session_id", "");
   ctx.Assert(!store::readSession("planted-1"), "after the login the id the client presented (planted-1) still reads: retire it in the same request");
-  const std::string fresh = login(ctx, c, old).value("session_id", "");
+  const std::string fresh = hLogin(ctx, c, old).value("session_id", "");
   ctx.Assert(!store::readSession(old), "a second login on %s left it live", old);
   const auto ids = store::userSessions("u-1");
-  ctx.Assert(!contains(ids, old) && contains(ids, fresh), "u-1's set holds %v: the retired id must leave it, the new one must be in it", ids);
+  ctx.Assert(!hContains(ids, old) && hContains(ids, fresh), "u-1's set holds %v: the retired id must leave it, the new one must be in it", ids);
 }
 
 void CheckDeviceFromToken(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto body = login(ctx, c, "", R"({"device_class": "desktop"})");
+  auto c = hApi(ctx);
+  const auto body = hLogin(ctx, c, "", R"({"device_class": "desktop"})");
   ctx.Equal(body.value("device_class", ""), "mobile", "the assertion saw mobile, the body's label must not override it; the answered device_class");
   const auto record = store::readSession(body.value("session_id", ""));
   ctx.Assert(record && record->device_class == "mobile", "the stored session must carry the assertion's device class mobile, got %q", record ? record->device_class : "");
 }
 
 void CheckAuthAssertion(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto missing = c.Post("/v1/sessions", "");
   ctx.Equal(missing.Status, 401, "a login with no token");
   const auto pending = c.Post("/v1/sessions", "", "Authorization", "Bearer tok-pending");
   ctx.Equal(pending.Status, 401, "a login whose assertion is still mfa_pending (the second factor never passed)");
+  const auto partial = c.Post("/v1/sessions", "", "Authorization", "Bearer tok-partial");
+  ctx.Equal(partial.Status, 401, "a login whose assertion is password_verified (only status \\"complete\\" opens a session)");
   const auto written = ctx.Redis.Keys("session:*");
   ctx.Assert(written.empty(), "the refused login wrote %v", written);
-  login(ctx, c);
+  const std::string live = hLogin(ctx, c).value("session_id", "");
+  const auto refused = c.Post("/v1/sessions", "", "Authorization", "Bearer tok-pending", "X-Session-Id", live);
+  ctx.Equal(refused.Status, 401, "a login whose assertion is still mfa_pending");
+  ctx.Assert(store::readSession(live).has_value() && hContains(store::userSessions("u-1"), live),
+             "a refused login on X-Session-Id %s retired that live session: a refused login writes nothing", live);
 }
 `,
   },

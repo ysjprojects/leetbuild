@@ -77,7 +77,7 @@ topic. A broker that rejects the record after accepting it leaves no outbox row.
       id: 'no-targets',
       title: 'Names the targeted attributes, never the rule values',
       detail:
-        'The payload carries `rule_attributes` and not the rules: a rule like `user_id in [u-17, u-42]` written to a retained, replicated topic outlives every deletion the store honours.',
+        "The payload carries `rule_attributes` (sorted, distinct) and not the rules, with `version` the snapshot that went live and `flag_version` the stored definition's: a rule like `user_id in [u-17, u-42]` written to a retained, replicated topic outlives every deletion the store honours.",
       match: {
         python: {all: [/rule_attributes/], none: [/["']rules["']\s*:\s*definition\[/]},
         typescript: {all: [/rule_attributes/], none: [/rules:\s*definition\.rules/]},
@@ -815,7 +815,11 @@ OUTBOX = "flags:outbox"
 CHECKOUT = {
     "key": "checkout",
     "default": False,
-    "rules": [{"attribute": "user_id", "operator": "in", "value": ["u-17", "u-42"]}, {"attribute": "country", "operator": "eq", "value": "US"}],
+    "rules": [
+        {"attribute": "user_id", "operator": "in", "value": ["u-17", "u-42"]},
+        {"attribute": "country", "operator": "eq", "value": "US"},
+        {"attribute": "country", "operator": "neq", "value": "CA"},
+    ],
     "rollout": 25,
 }
 SEARCH = {"key": "search-v2", "default": False, "rules": [], "rollout": 10}
@@ -869,15 +873,16 @@ def check_after_commit(ctx):
 
 def check_no_targets(ctx):
     m = _events(ctx)
+    _apply(m, "search-v2")  # the snapshot version (2) and checkout's definition version (1) now differ
     event = _apply(m, "checkout")
     records = ctx.kafka.records(TOPIC)
-    assert len(records) == 1, f"one change produced {len(records)} records"
-    text = _text(records[0])
+    assert len(records) == 2, f"two changes produced {len(records)} records"
+    text = _text(records[1])
     payload = json.loads(text)
-    assert "rules" not in payload and "u-17" not in text and "u-42" not in text, f"the event carries the targeting rules: {text}. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values"
-    assert payload.get("rule_attributes") == ["country", "user_id"], f"rule_attributes must be the sorted attributes the rules target, got {payload.get('rule_attributes')!r}"
-    want = {"type": "flag.changed", "flag_key": "checkout", "version": 1, "flag_version": 1, "rollout": 25, "actor": "alice"}
-    assert {name: payload.get(name) for name in want} == want, f"the event is {text}, expected {want} besides rule_attributes"
+    assert "rules" not in payload and "u-17" not in text and "u-42" not in text and "CA" not in text, f"the event carries the targeting rules: {text}. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values"
+    assert payload.get("rule_attributes") == ["country", "user_id"], f"rule_attributes must be the sorted, distinct attributes the rules target (two rules target country), got {payload.get('rule_attributes')!r}"
+    want = {"type": "flag.changed", "flag_key": "checkout", "version": 2, "flag_version": 1, "rollout": 25, "actor": "alice"}
+    assert {name: payload.get(name) for name in want} == want, f"the event is {text}, expected {want} besides rule_attributes: version is the snapshot that went live, flag_version the stored definition's"
     assert event == payload, f"apply_change must answer the event it produced: answered {event}, produced {payload}"
 
 
@@ -906,6 +911,7 @@ const CHECKOUT = {
   rules: [
     {attribute: 'user_id', operator: 'in', value: ['u-17', 'u-42']},
     {attribute: 'country', operator: 'eq', value: 'US'},
+    {attribute: 'country', operator: 'neq', value: 'CA'},
   ],
   rollout: 25,
 };
@@ -964,15 +970,16 @@ export async function check_after_commit(ctx) {
 
 export async function check_no_targets(ctx) {
   const {m} = await events(ctx);
+  await apply(m, 'search-v2'); // the snapshot version (2) and checkout's definition version (1) now differ
   const event = await apply(m, 'checkout');
   const records = ctx.kafka.records(TOPIC);
-  assert.equal(records.length, 1, \`one change produced \${records.length} records\`);
-  const text = records[0].value.toString();
+  assert.equal(records.length, 2, \`two changes produced \${records.length} records\`);
+  const text = records[1].value.toString();
   const payload = JSON.parse(text);
-  assert(!('rules' in payload) && !text.includes('u-17') && !text.includes('u-42'), \`the event carries the targeting rules: \${text}. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values\`);
-  assert.deepStrictEqual(payload.rule_attributes, ['country', 'user_id'], \`rule_attributes must be the sorted attributes the rules target, got \${JSON.stringify(payload.rule_attributes)}\`);
-  const want = {type: 'flag.changed', flag_key: 'checkout', version: 1, flag_version: 1, rollout: 25, actor: 'alice'};
-  for (const [name, value] of Object.entries(want)) assert.equal(payload[name], value, \`the event is \${text}: its \${name} must be \${JSON.stringify(value)}\`);
+  assert(!('rules' in payload) && !text.includes('u-17') && !text.includes('u-42') && !text.includes('CA'), \`the event carries the targeting rules: \${text}. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values\`);
+  assert.deepStrictEqual(payload.rule_attributes, ['country', 'user_id'], \`rule_attributes must be the sorted, distinct attributes the rules target (two rules target country), got \${JSON.stringify(payload.rule_attributes)}\`);
+  const want = {type: 'flag.changed', flag_key: 'checkout', version: 2, flag_version: 1, rollout: 25, actor: 'alice'};
+  for (const [name, value] of Object.entries(want)) assert.equal(payload[name], value, \`the event is \${text}: its \${name} must be \${JSON.stringify(value)} (version is the snapshot that went live, flag_version the stored definition's)\`);
   assert.deepStrictEqual(event, payload, 'applyChange must answer the event it produced');
 }
 
@@ -1015,6 +1022,7 @@ func eventsSeed(ctx *harness.Ctx, checkoutRollout int) {
 	_, err := store.Save(eventsBg, store.Definition{Key: "checkout", Rollout: checkoutRollout, Rules: []registry.Rule{
 		{Attribute: "user_id", Operator: "in", Value: []any{"u-17", "u-42"}},
 		{Attribute: "country", Operator: "eq", Value: "US"},
+		{Attribute: "country", Operator: "neq", Value: "CA"},
 	}})
 	ctx.NoError(err, "seeding checkout failed")
 }
@@ -1080,17 +1088,20 @@ func CheckAfterCommit(ctx *harness.Ctx) {
 
 func CheckNoTargets(ctx *harness.Ctx) {
 	eventsSetup(ctx)
+	eventsApply(ctx, "search-v2") // the snapshot version (2) and checkout's definition version (1) now differ
 	event := eventsApply(ctx, "checkout")
 	records := ctx.Kafka.Records(eventTopic)
-	ctx.Equal(len(records), 1, "one change, the records")
-	text := string(records[0].Value)
+	ctx.Equal(len(records), 2, "two changes, the records")
+	text := string(records[1].Value)
 	var payload map[string]any
-	ctx.NoError(json.Unmarshal(records[0].Value, &payload), "the event must be JSON (%s)", text)
+	ctx.NoError(json.Unmarshal(records[1].Value, &payload), "the event must be JSON (%s)", text)
 	_, hasRules := payload["rules"]
-	ctx.Assert(!hasRules && !strings.Contains(text, "u-17") && !strings.Contains(text, "u-42"), "the event carries the targeting rules: %s. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values", text)
-	ctx.Equal(payload["rule_attributes"], []any{"country", "user_id"}, "rule_attributes must be the sorted attributes the rules target")
-	ctx.Assert(payload["type"] == "flag.changed" && payload["flag_key"] == "checkout" && payload["version"] == float64(1) && payload["flag_version"] == float64(1) && payload["rollout"] == float64(25) && payload["actor"] == "alice", "the event is %s, expected type flag.changed, flag_key checkout, version 1, flag_version 1, rollout 25, actor alice", text)
+	ctx.Assert(!hasRules && !strings.Contains(text, "u-17") && !strings.Contains(text, "u-42") && !strings.Contains(text, "CA"), "the event carries the targeting rules: %s. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values", text)
+	ctx.Equal(payload["rule_attributes"], []any{"country", "user_id"}, "rule_attributes must be the sorted, distinct attributes the rules target (two rules target country)")
+	ctx.Assert(payload["type"] == "flag.changed" && payload["flag_key"] == "checkout" && payload["version"] == float64(2) && payload["flag_version"] == float64(1) && payload["rollout"] == float64(25) && payload["actor"] == "alice", "the event is %s, expected type flag.changed, flag_key checkout, version 2 (the snapshot that went live), flag_version 1 (the stored definition's), rollout 25, actor alice", text)
 	ctx.Equal(event["flag_key"], "checkout", "applyChange must answer the event it produced; its flag_key")
+	ctx.Equal(event["version"], 2, "applyChange must answer the event it produced; its version")
+	ctx.Equal(event["flag_version"], 1, "applyChange must answer the event it produced; its flag_version")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
@@ -1137,7 +1148,8 @@ void eventsSeed(int checkout_rollout) {
   store::save({{"key", "checkout"},
                {"default", false},
                {"rules", nlohmann::json::parse(R"([{"attribute": "user_id", "operator": "in", "value": ["u-17", "u-42"]},
-                                                 {"attribute": "country", "operator": "eq", "value": "US"}])")},
+                                                 {"attribute": "country", "operator": "eq", "value": "US"},
+                                                 {"attribute": "country", "operator": "neq", "value": "CA"}])")},
                {"rollout", checkout_rollout}});
 }
 
@@ -1163,7 +1175,7 @@ long long eventsVersion() {
   return s ? s->value("version", 0LL) : 0LL;
 }
 
-nlohmann::json parsed(const std::string& text) {
+nlohmann::json eventsParsed(const std::string& text) {
   const auto j = nlohmann::json::parse(text, nullptr, false);
   return j.is_discarded() ? nlohmann::json() : j;
 }
@@ -1208,16 +1220,17 @@ void CheckAfterCommit(harness::Ctx& ctx) {
 
 void CheckNoTargets(harness::Ctx& ctx) {
   eventsSetup();
+  eventsApply(ctx, "search-v2");  // the snapshot version (2) and checkout's definition version (1) now differ
   const auto event = eventsApply(ctx, "checkout");
   const auto records = ctx.Kafka.Records(kEventTopic);
-  ctx.Equal(records.size(), 1, "one change, the records");
-  const std::string text = records[0].Value.value_or("");
-  const auto payload = parsed(text);
+  ctx.Equal(records.size(), 2, "two changes, the records");
+  const std::string text = records[1].Value.value_or("");
+  const auto payload = eventsParsed(text);
   ctx.Assert(payload.is_object(), "the event must be JSON: %s", text);
-  ctx.Assert(!payload.contains("rules") && text.find("u-17") == std::string::npos && text.find("u-42") == std::string::npos, "the event carries the targeting rules: %s. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values", text);
-  ctx.Equal(payload.value("rule_attributes", std::vector<std::string>{}), {"country", "user_id"}, "rule_attributes must be the sorted attributes the rules target");
-  ctx.Assert(payload.value("type", "") == "flag.changed" && payload.value("flag_key", "") == "checkout" && payload.value("version", 0) == 1 && payload.value("flag_version", 0) == 1 && payload.value("rollout", 0) == 25 && payload.value("actor", "") == "alice",
-             "the event is %s, expected type flag.changed, flag_key checkout, version 1, flag_version 1, rollout 25, actor alice", text);
+  ctx.Assert(!payload.contains("rules") && text.find("u-17") == std::string::npos && text.find("u-42") == std::string::npos && text.find("CA") == std::string::npos, "the event carries the targeting rules: %s. User ids in a retained, replicated topic outlive every deletion request; name the attributes, not the values", text);
+  ctx.Equal(payload.value("rule_attributes", std::vector<std::string>{}), {"country", "user_id"}, "rule_attributes must be the sorted, distinct attributes the rules target (two rules target country)");
+  ctx.Assert(payload.value("type", "") == "flag.changed" && payload.value("flag_key", "") == "checkout" && payload.value("version", 0) == 2 && payload.value("flag_version", 0) == 1 && payload.value("rollout", 0) == 25 && payload.value("actor", "") == "alice",
+             "the event is %s, expected type flag.changed, flag_key checkout, version 2 (the snapshot that went live), flag_version 1 (the stored definition's), rollout 25, actor alice", text);
   ctx.Assert(event == payload, "applyChange must answer the event it produced: answered %s, produced %s", event.dump(), text);
 }
 
@@ -1235,10 +1248,10 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(eventsVersion(), 1LL, "the change must be live; the engine's version");
   const auto rows = ctx.Redis.LRange(kOutboxKey, 0, -1);
   ctx.Equal(rows.size(), 1, "the broker rejected the event and %s holds %v: the change is live and nobody downstream will hear of it. Write the outbox row from the delivery report; rows", kOutboxKey, rows);
-  const auto row = parsed(rows[0]);
+  const auto row = eventsParsed(rows[0]);
   ctx.Assert(row.is_object() && row.value("key", "") == "checkout", "the outbox row must carry the record key (the flag key) so the relay keeps the partition (%s)", rows[0]);
   nlohmann::json payload;
-  if (row.contains("payload")) payload = row["payload"].is_string() ? parsed(row["payload"].get<std::string>()) : row["payload"];
+  if (row.contains("payload")) payload = row["payload"].is_string() ? eventsParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("flag_key", "") == "checkout" && payload.value("version", 0) == 1, "the outbox row must carry the event payload: %s", rows[0]);
   ctx.Equal(ctx.Kafka.Records(kEventTopic).size(), 0, "a rejected record cannot be on the topic; the records");
   eventsApply(ctx, "search-v2");

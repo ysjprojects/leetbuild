@@ -22,8 +22,9 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
 
 - Each use slides the expiry back to \`SLIDING_TTL_S\` (15 min).
 - No session outlives \`created_at + ABSOLUTE_TTL_S\` (8 h): \`touch_session\` and \`rotate_session\`
-  retire one past it and answer \`None\`, and no expiry they set reaches past the cap.
-- The rotation's writes run in one Lua script (or one \`MULTI\`/\`EXEC\`).
+  retire one at or past it and answer \`None\`, and no expiry they set reaches past the cap.
+- The rotation reads and writes in one Lua script (or one \`MULTI\`/\`EXEC\` on a watched key): a
+  sign-out landing between its read and its writes cannot leave a live copy.
 - A rotation keeps \`created_at\`; \`rotation\` counts up.`,
   sequence: {
     participants: ['Session API', 'Redis'],
@@ -53,7 +54,7 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
       id: 'absolute-cap',
       title: 'No session outlives created_at + 8 hours',
       detail:
-        'Two minutes short of the cap a use answers the session with at most 120 s left on its key; past the cap it answers none and the session is retired. The starter never reads `created_at`.',
+        'Two minutes short of the cap a use answers the session with at most 120 s left on its key; at the cap or past it, it answers none and the session is retired. The starter never reads `created_at`.',
       match: {
         python: {order: [/def touch_session\(/, /ABSOLUTE_TTL_S/]},
         typescript: {order: [/function touchSession\(/, /ABSOLUTE_TTL_S/]},
@@ -66,7 +67,7 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
       id: 'atomic-rotate',
       title: 'The rotation is one atomic step',
       detail:
-        'Rotating sends no write on its own: the new hash, its expiry, the old hash and both set updates go in one `EVAL`/`EVALSHA` (or one `MULTI`/`EXEC`). The starter sends five separate writes.',
+        'Rotating sends no write on its own: the new hash, its expiry, the old hash and both set updates go in one `EVAL`/`EVALSHA` (or one `MULTI`/`EXEC`). A sign-out everywhere landing right after the rotation first touches the old session leaves the user no live session. The starter sends five separate writes.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(|\.evalsha\(|\.pipeline\(/],
@@ -94,7 +95,7 @@ the rotation's writes leaves two live ids, and a rotated session starts its eigh
       id: 'carry-created',
       title: 'A rotation keeps created_at',
       detail:
-        'A session that logged in seven hours ago rotates to an id with the same `created_at`, `rotation` + 1 and at most an hour on its key; a session past its cap does not rotate. The starter writes `created_at` = now.',
+        'A session that logged in seven hours ago rotates to an id with the same `created_at`, `rotation` + 1 and at most an hour on its key; two minutes short of the cap the new key has at most 120 s; a session at or past its cap does not rotate and leaves the hash and the set. The starter writes `created_at` = now.',
       match: {
         python: {
           all: [/f\[['"]created_at['"]\]|record\[["']created_at["']\]/],
@@ -640,6 +641,10 @@ def check_absolute_cap(ctx):
     record = m.touch_session(late)
     assert record is None, f"a session past created_at + ABSOLUTE_TTL_S answered {record}: the cap holds however often it is used"
     assert store.read_session(late) is None and late not in store.user_sessions("u-1"), "a session past its cap must be retired, hash and set entry"
+    edge = _session("s-3")
+    ctx.redis.hset(store.session_key(edge), "created_at", _now(ctx) - store.ABSOLUTE_TTL_S)  # exactly 8 hours ago
+    record = m.touch_session(edge)
+    assert record is None and store.read_session(edge) is None, f"a session used exactly ABSOLUTE_TTL_S after created_at answered {record}: at the cap it is retired"
 
 
 def check_atomic_rotate(ctx):
@@ -665,6 +670,19 @@ def check_atomic_rotate(ctx):
     assert record is not None and record["user_id"] == "u-1", f"the new id holds {record}"
     assert store.user_sessions("u-1") == [new_id], f"u-1's set holds {store.user_sessions('u-1')}, expected only the new id"
 
+    def sign_out_everywhere():
+        """u-5 signs out everywhere the instant the rotation first touches session:s-5."""
+        for gone in ctx.redis.smembers("user:u-5:sessions"):
+            ctx.redis.delete(f"session:{gone}")
+        ctx.redis.delete("user:u-5:sessions")
+
+    store.put_session("s-5", "u-5", "mobile", "tok-5")
+    probe = ctx.redis_after("session:s-5", sign_out_everywhere)
+    m.rotate_session("s-5")
+    assert probe.fired, "rotate_session('s-5') never touched session:s-5"
+    revived = [k for k in ctx.redis.keys("session:*") if ctx.redis.hget(k, "user_id") == "u-5"]
+    assert not revived, f"u-5 signed out everywhere between the rotation's read of s-5 and its writes, and {revived} is live afterwards: read and write in the one script (or watch the key)"
+
 
 def check_carry_created(ctx):
     m = ctx.load("state")
@@ -683,7 +701,17 @@ def check_carry_created(ctx):
     ctx.redis.hset(store.session_key(late), "created_at", _now(ctx) - store.ABSOLUTE_TTL_S - 1)
     rotated = m.rotate_session(late)
     assert rotated is None, f"a session past its cap rotated to {rotated}: rotation must not renew it"
-    assert store.read_session(late) is None, "a session past its cap must be retired when it tries to rotate"
+    assert store.read_session(late) is None and late not in store.user_sessions("u-1"), "a session past its cap must be retired when it tries to rotate, hash and set entry"
+    edge = _session("s-3")
+    ctx.redis.hset(store.session_key(edge), "created_at", _now(ctx) - store.ABSOLUTE_TTL_S)  # exactly 8 hours ago
+    rotated = m.rotate_session(edge)
+    assert rotated is None and store.read_session(edge) is None, f"a session exactly ABSOLUTE_TTL_S old rotated to {rotated}: at the cap it is retired"
+    near = _session("s-4")
+    ctx.redis.hset(store.session_key(near), "created_at", _now(ctx) - store.ABSOLUTE_TTL_S + 120)  # signed in 7 h 58 min ago
+    rotated = m.rotate_session(near)
+    assert rotated is not None, "a session two minutes short of its cap must still rotate"
+    ttl = ctx.redis.ttl(store.session_key(rotated))
+    assert 0 < ttl <= 120, f"two minutes short of the cap the rotated session expires in {ttl} s: no expiry may reach past created_at + ABSOLUTE_TTL_S"
 `,
     typescript: `const WRITES = new Set(['HSET', 'HMSET', 'HSETNX', 'DEL', 'UNLINK', 'SADD', 'SREM', 'EXPIRE', 'PEXPIRE', 'SET']);
 const ATOMIC = new Set(['EVAL', 'EVALSHA', 'MULTI', 'EXEC']);
@@ -719,6 +747,10 @@ export async function check_absolute_cap(ctx) {
   const record = await m.touchSession('s-2');
   assert.equal(record, null, \`a session past created_at + ABSOLUTE_TTL_S answered \${JSON.stringify(record)}: the cap holds however often it is used\`);
   assert((await store.readSession('s-2')) === null && !(await store.userSessions('u-1')).includes('s-2'), 'a session past its cap must be retired, hash and set entry');
+  await store.putSession('s-3', 'u-1', 'mobile', 'tok-1');
+  ctx.redis.hset(store.sessionKey('s-3'), 'created_at', String(nowSeconds(ctx) - store.ABSOLUTE_TTL_S)); // exactly 8 hours ago
+  const edge = await m.touchSession('s-3');
+  assert(edge === null && (await store.readSession('s-3')) === null, \`a session used exactly ABSOLUTE_TTL_S after created_at answered \${JSON.stringify(edge)}: at the cap it is retired\`);
 }
 
 export async function check_atomic_rotate(ctx) {
@@ -733,6 +765,16 @@ export async function check_atomic_rotate(ctx) {
   const record = await store.readSession(newId);
   assert(record !== null && record.user_id === 'u-1', \`the new id holds \${JSON.stringify(record)}\`);
   assert.deepEqual(await store.userSessions('u-1'), [newId], "u-1's set must hold only the new id");
+  await store.putSession('s-5', 'u-5', 'mobile', 'tok-5');
+  // u-5 signs out everywhere the instant the rotation first touches session:s-5.
+  const probe = ctx.redisAfter('session:s-5', () => {
+    for (const gone of ctx.redis.smembers('user:u-5:sessions') as string[]) ctx.redis.del(\`session:\${gone}\`);
+    ctx.redis.del('user:u-5:sessions');
+  });
+  await m.rotateSession('s-5');
+  assert(probe.fired, "rotateSession('s-5') never touched session:s-5");
+  const revived = (ctx.redis.keys('session:*') as string[]).filter(k => ctx.redis.hget(k, 'user_id') === 'u-5');
+  assert.deepEqual(revived, [], \`u-5 signed out everywhere between the rotation's read of s-5 and its writes, and \${JSON.stringify(revived)} is live afterwards: read and write in the one script (or watch the key)\`);
 }
 
 export async function check_carry_created(ctx) {
@@ -751,7 +793,17 @@ export async function check_carry_created(ctx) {
   ctx.redis.hset(store.sessionKey('s-2'), 'created_at', String(nowSeconds(ctx) - store.ABSOLUTE_TTL_S - 1));
   const rotated = await m.rotateSession('s-2');
   assert.equal(rotated, null, \`a session past its cap rotated to \${rotated}: rotation must not renew it\`);
-  assert.equal(await store.readSession('s-2'), null, 'a session past its cap must be retired when it tries to rotate');
+  assert((await store.readSession('s-2')) === null && !(await store.userSessions('u-1')).includes('s-2'), 'a session past its cap must be retired when it tries to rotate, hash and set entry');
+  await store.putSession('s-3', 'u-1', 'mobile', 'tok-1');
+  ctx.redis.hset(store.sessionKey('s-3'), 'created_at', String(nowSeconds(ctx) - store.ABSOLUTE_TTL_S)); // exactly 8 hours ago
+  const edge = await m.rotateSession('s-3');
+  assert(edge === null && (await store.readSession('s-3')) === null, \`a session exactly ABSOLUTE_TTL_S old rotated to \${edge}: at the cap it is retired\`);
+  await store.putSession('s-4', 'u-1', 'mobile', 'tok-1');
+  ctx.redis.hset(store.sessionKey('s-4'), 'created_at', String(nowSeconds(ctx) - store.ABSOLUTE_TTL_S + 120)); // signed in 7 h 58 min ago
+  const near = await m.rotateSession('s-4');
+  assert(near !== null, 'a session two minutes short of its cap must still rotate');
+  const nearTtl = ctx.redis.ttl(store.sessionKey(near));
+  assert(0 < nearTtl && nearTtl <= 120, \`two minutes short of the cap the rotated session expires in \${nearTtl} s: no expiry may reach past created_at + ABSOLUTE_TTL_S\`);
 }
 `,
     go: `package main
@@ -766,95 +818,127 @@ import (
 )
 
 var (
-	bg      = context.Background()
-	writes  = []string{"HSET", "HMSET", "HSETNX", "DEL", "UNLINK", "SADD", "SREM", "EXPIRE", "PEXPIRE", "SET"}
-	atomics = []string{"EVAL", "EVALSHA", "MULTI", "EXEC"}
+	hBG      = context.Background()
+	hWrites  = []string{"HSET", "HMSET", "HSETNX", "DEL", "UNLINK", "SADD", "SREM", "EXPIRE", "PEXPIRE", "SET"}
+	hAtomics = []string{"EVAL", "EVALSHA", "MULTI", "EXEC"}
 )
 
-func session(ctx *harness.Ctx, sessionID string) {
-	ctx.NoError(store.PutSession(bg, sessionID, "u-1", "mobile", "tok-1"), "PutSession")
+func hSession(ctx *harness.Ctx, sessionID string) {
+	ctx.NoError(store.PutSession(hBG, sessionID, "u-1", "mobile", "tok-1"), "PutSession")
 }
 
-func nowSeconds(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
+func hNow(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
 
-func touch(ctx *harness.Ctx, sessionID string) *store.Session {
-	record, err := touchSession(bg, sessionID)
+func hTouch(ctx *harness.Ctx, sessionID string) *store.Session {
+	record, err := touchSession(hBG, sessionID)
 	ctx.NoError(err, "touchSession(%s)", sessionID)
 	return record
 }
 
-func rotate(ctx *harness.Ctx, sessionID string) string {
-	newID, err := rotateSession(bg, sessionID)
+func hRotate(ctx *harness.Ctx, sessionID string) string {
+	newID, err := rotateSession(hBG, sessionID)
 	ctx.NoError(err, "rotateSession(%s)", sessionID)
 	return newID
 }
 
 func CheckSlidingTtl(ctx *harness.Ctx) {
-	session(ctx, "s-1")
+	hSession(ctx, "s-1")
 	for _, minute := range []int{10, 20, 30} {
 		ctx.Clock.Advance(600)
-		ctx.Assert(touch(ctx, "s-1") != nil, "a session used every 10 minutes was gone at minute %d: each use must slide the expiry back to SlidingTTLSeconds", minute)
+		ctx.Assert(hTouch(ctx, "s-1") != nil, "a session used every 10 minutes was gone at minute %d: each use must slide the expiry back to SlidingTTLSeconds", minute)
 		ttl := ctx.Redis.TTL(store.SessionKey("s-1"))
 		ctx.Assert(890 <= ttl && ttl <= 900, "right after a use at minute %d the session expires in %d s, expected 900: the use did not slide the expiry", minute, ttl)
 	}
 	ctx.Clock.Advance(901)
-	ctx.Assert(touch(ctx, "s-1") == nil, "a session idle for more than 15 minutes still answered")
+	ctx.Assert(hTouch(ctx, "s-1") == nil, "a session idle for more than 15 minutes still answered")
 }
 
 func CheckAbsoluteCap(ctx *harness.Ctx) {
-	session(ctx, "s-1")
-	ctx.Redis.Do("HSET", store.SessionKey("s-1"), "created_at", nowSeconds(ctx)-store.AbsoluteTTLSeconds+120) // signed in 7 h 58 min ago
-	ctx.Assert(touch(ctx, "s-1") != nil, "a session two minutes short of its cap must still answer")
+	hSession(ctx, "s-1")
+	ctx.Redis.Do("HSET", store.SessionKey("s-1"), "created_at", hNow(ctx)-store.AbsoluteTTLSeconds+120) // signed in 7 h 58 min ago
+	ctx.Assert(hTouch(ctx, "s-1") != nil, "a session two minutes short of its cap must still answer")
 	ttl := ctx.Redis.TTL(store.SessionKey("s-1"))
 	ctx.Assert(0 < ttl && ttl <= 120, "two minutes short of the cap a use left %d s on the session: no expiry may reach past created_at + AbsoluteTTLSeconds", ttl)
-	session(ctx, "s-2")
-	ctx.Redis.Do("HSET", store.SessionKey("s-2"), "created_at", nowSeconds(ctx)-store.AbsoluteTTLSeconds-1) // in active use, past its 8 hours
-	record := touch(ctx, "s-2")
+	hSession(ctx, "s-2")
+	ctx.Redis.Do("HSET", store.SessionKey("s-2"), "created_at", hNow(ctx)-store.AbsoluteTTLSeconds-1) // in active use, past its 8 hours
+	record := hTouch(ctx, "s-2")
 	ctx.Assert(record == nil, "a session past created_at + AbsoluteTTLSeconds answered %+v: the cap holds however often it is used", record)
-	ctx.Assert(store.ReadSession(bg, "s-2") == nil && !slices.Contains(store.UserSessions(bg, "u-1"), "s-2"), "a session past its cap must be retired, hash and set entry")
+	ctx.Assert(store.ReadSession(hBG, "s-2") == nil && !slices.Contains(store.UserSessions(hBG, "u-1"), "s-2"), "a session past its cap must be retired, hash and set entry")
+	hSession(ctx, "s-3")
+	ctx.Redis.Do("HSET", store.SessionKey("s-3"), "created_at", hNow(ctx)-store.AbsoluteTTLSeconds) // exactly 8 hours ago
+	edge := hTouch(ctx, "s-3")
+	ctx.Assert(edge == nil && store.ReadSession(hBG, "s-3") == nil, "a session used exactly AbsoluteTTLSeconds after created_at answered %+v: at the cap it is retired", edge)
 }
 
 func CheckAtomicRotate(ctx *harness.Ctx) {
-	session(ctx, "s-1")
+	hSession(ctx, "s-1")
 	before := len(ctx.Redis.RoundTrips())
-	newID := rotate(ctx, "s-1")
+	newID := hRotate(ctx, "s-1")
 	trips := ctx.Redis.RoundTrips()[before:]
 	ctx.Assert(newID != "" && newID != "s-1", "rotateSession(s-1) returned %q, expected a fresh id", newID)
 	var loose [][]string
 	for _, trip := range trips {
 		atomic, writing := false, false
 		for _, c := range trip {
-			atomic = atomic || slices.Contains(atomics, c)
-			writing = writing || slices.Contains(writes, c)
+			atomic = atomic || slices.Contains(hAtomics, c)
+			writing = writing || slices.Contains(hWrites, c)
 		}
 		if writing && !atomic {
 			loose = append(loose, trip)
 		}
 	}
 	ctx.Assert(len(loose) == 0, "rotateSession made the round trips %v: the writes %v go on their own, and a crash between them leaves two live ids or none. Send them in one script (or one MULTI/EXEC)", trips, loose)
-	ctx.Assert(store.ReadSession(bg, "s-1") == nil, "after the rotation the old id still reads")
-	record := store.ReadSession(bg, newID)
+	ctx.Assert(store.ReadSession(hBG, "s-1") == nil, "after the rotation the old id still reads")
+	record := store.ReadSession(hBG, newID)
 	ctx.Assert(record != nil && record.UserID == "u-1", "the new id holds %+v", record)
-	ctx.Equal(store.UserSessions(bg, "u-1"), []string{newID}, "u-1's set must hold only the new id")
+	ctx.Equal(store.UserSessions(hBG, "u-1"), []string{newID}, "u-1's set must hold only the new id")
+	ctx.NoError(store.PutSession(hBG, "s-5", "u-5", "mobile", "tok-5"), "PutSession")
+	// u-5 signs out everywhere the instant the rotation first touches session:s-5.
+	probe := ctx.Redis.After("session:s-5", func() any {
+		for _, gone := range ctx.Redis.SMembers("user:u-5:sessions") {
+			ctx.Redis.Del("session:" + gone)
+		}
+		ctx.Redis.Del("user:u-5:sessions")
+		return nil
+	})
+	hRotate(ctx, "s-5")
+	ctx.Assert(probe.Fired, "rotateSession(s-5) never touched session:s-5")
+	var revived []string
+	for _, key := range ctx.Redis.Keys("session:*") {
+		if owner, _ := ctx.Redis.HGet(key, "user_id"); owner == "u-5" {
+			revived = append(revived, key)
+		}
+	}
+	ctx.Assert(len(revived) == 0, "u-5 signed out everywhere between the rotation's read of s-5 and its writes, and %v is live afterwards: read and write in the one script (or watch the key)", revived)
 }
 
 func CheckCarryCreated(ctx *harness.Ctx) {
-	session(ctx, "s-1")
-	created := nowSeconds(ctx) - 7*3600 // signed in seven hours ago
+	hSession(ctx, "s-1")
+	created := hNow(ctx) - 7*3600 // signed in seven hours ago
 	ctx.Redis.Do("HSET", store.SessionKey("s-1"), "created_at", created)
-	newID := rotate(ctx, "s-1")
+	newID := hRotate(ctx, "s-1")
 	ctx.Assert(newID != "", "rotating a live session returned no id")
-	record := store.ReadSession(bg, newID)
+	record := store.ReadSession(hBG, newID)
 	ctx.Assert(record != nil, "the rotated session is not in the store")
 	ctx.Equal(record.CreatedAt, created, "a rotation that restarts the clock lets a session rotated every few hours live forever; the rotated session's created_at")
 	ctx.Assert(record.Rotation == 1 && record.TokenHash == store.TokenHash("tok-1"), "the rotated session is %+v, expected rotation 1 and the same token hash", record)
 	ttl := ctx.Redis.TTL(store.SessionKey(newID))
 	ctx.Assert(0 < ttl && ttl <= 3600, "the rotated session expires in %d s, but only an hour of its eight is left", ttl)
-	session(ctx, "s-2")
-	ctx.Redis.Do("HSET", store.SessionKey("s-2"), "created_at", nowSeconds(ctx)-store.AbsoluteTTLSeconds-1)
-	rotated := rotate(ctx, "s-2")
+	hSession(ctx, "s-2")
+	ctx.Redis.Do("HSET", store.SessionKey("s-2"), "created_at", hNow(ctx)-store.AbsoluteTTLSeconds-1)
+	rotated := hRotate(ctx, "s-2")
 	ctx.Equal(rotated, "", "a session past its cap must not rotate (rotation must not renew it); the new id")
-	ctx.Assert(store.ReadSession(bg, "s-2") == nil, "a session past its cap must be retired when it tries to rotate")
+	ctx.Assert(store.ReadSession(hBG, "s-2") == nil && !slices.Contains(store.UserSessions(hBG, "u-1"), "s-2"), "a session past its cap must be retired when it tries to rotate, hash and set entry")
+	hSession(ctx, "s-3")
+	ctx.Redis.Do("HSET", store.SessionKey("s-3"), "created_at", hNow(ctx)-store.AbsoluteTTLSeconds) // exactly 8 hours ago
+	edge := hRotate(ctx, "s-3")
+	ctx.Assert(edge == "" && store.ReadSession(hBG, "s-3") == nil, "a session exactly AbsoluteTTLSeconds old rotated to %q: at the cap it is retired", edge)
+	hSession(ctx, "s-4")
+	ctx.Redis.Do("HSET", store.SessionKey("s-4"), "created_at", hNow(ctx)-store.AbsoluteTTLSeconds+120) // signed in 7 h 58 min ago
+	near := hRotate(ctx, "s-4")
+	ctx.Assert(near != "", "a session two minutes short of its cap must still rotate")
+	nearTTL := ctx.Redis.TTL(store.SessionKey(near))
+	ctx.Assert(0 < nearTTL && nearTTL <= 120, "two minutes short of the cap the rotated session expires in %d s: no expiry may reach past created_at + AbsoluteTTLSeconds", nearTTL)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -868,19 +952,19 @@ func CheckCarryCreated(ctx *harness.Ctx) {
 
 namespace {
 
-const std::set<std::string> kWrites = {"HSET", "HMSET", "HSETNX", "DEL", "UNLINK", "SADD", "SREM", "EXPIRE", "PEXPIRE", "SET"};
-const std::set<std::string> kAtomic = {"EVAL", "EVALSHA", "MULTI", "EXEC"};
+const std::set<std::string> kHWrites = {"HSET", "HMSET", "HSETNX", "DEL", "UNLINK", "SADD", "SREM", "EXPIRE", "PEXPIRE", "SET"};
+const std::set<std::string> kHAtomic = {"EVAL", "EVALSHA", "MULTI", "EXEC"};
 
-void session(const std::string& session_id) { store::putSession(session_id, "u-1", "mobile", "tok-1"); }
+void hSession(const std::string& session_id) { store::putSession(session_id, "u-1", "mobile", "tok-1"); }
 
-long long nowSeconds(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
+long long hNow(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
 
-bool contains(const std::vector<std::string>& ids, const std::string& id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); }
+bool hContains(const std::vector<std::string>& ids, const std::string& id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); }
 
 }  // namespace
 
 void CheckSlidingTtl(harness::Ctx& ctx) {
-  session("s-1");
+  hSession("s-1");
   for (const int minute : {10, 20, 30}) {
     ctx.Clock.Advance(600);
     ctx.Assert(touchSession("s-1").has_value(), "a session used every 10 minutes was gone at minute %d: each use must slide the expiry back to kSlidingTtlS", minute);
@@ -892,19 +976,23 @@ void CheckSlidingTtl(harness::Ctx& ctx) {
 }
 
 void CheckAbsoluteCap(harness::Ctx& ctx) {
-  session("s-1");
-  ctx.Redis.Do("HSET", store::sessionKey("s-1"), "created_at", nowSeconds(ctx) - store::kAbsoluteTtlS + 120);  // signed in 7 h 58 min ago
+  hSession("s-1");
+  ctx.Redis.Do("HSET", store::sessionKey("s-1"), "created_at", hNow(ctx) - store::kAbsoluteTtlS + 120);  // signed in 7 h 58 min ago
   ctx.Assert(touchSession("s-1").has_value(), "a session two minutes short of its cap must still answer");
   const long long ttl = ctx.Redis.TTL(store::sessionKey("s-1"));
   ctx.Assert(0 < ttl && ttl <= 120, "two minutes short of the cap a use left %d s on the session: no expiry may reach past created_at + kAbsoluteTtlS", ttl);
-  session("s-2");
-  ctx.Redis.Do("HSET", store::sessionKey("s-2"), "created_at", nowSeconds(ctx) - store::kAbsoluteTtlS - 1);  // in active use, past its 8 hours
+  hSession("s-2");
+  ctx.Redis.Do("HSET", store::sessionKey("s-2"), "created_at", hNow(ctx) - store::kAbsoluteTtlS - 1);  // in active use, past its 8 hours
   ctx.Assert(!touchSession("s-2").has_value(), "a session past created_at + kAbsoluteTtlS answered: the cap holds however often it is used");
-  ctx.Assert(!store::readSession("s-2") && !contains(store::userSessions("u-1"), "s-2"), "a session past its cap must be retired, hash and set entry");
+  ctx.Assert(!store::readSession("s-2") && !hContains(store::userSessions("u-1"), "s-2"), "a session past its cap must be retired, hash and set entry");
+  hSession("s-3");
+  ctx.Redis.Do("HSET", store::sessionKey("s-3"), "created_at", hNow(ctx) - store::kAbsoluteTtlS);  // exactly 8 hours ago
+  const bool answered = touchSession("s-3").has_value();
+  ctx.Assert(!answered && !store::readSession("s-3"), "a session used exactly kAbsoluteTtlS after created_at answered: at the cap it is retired");
 }
 
 void CheckAtomicRotate(harness::Ctx& ctx) {
-  session("s-1");
+  hSession("s-1");
   const size_t before = ctx.Redis.RoundTrips().size();
   const std::string new_id = rotateSession("s-1").value_or("");
   const auto all = ctx.Redis.RoundTrips();
@@ -912,8 +1000,8 @@ void CheckAtomicRotate(harness::Ctx& ctx) {
   ctx.Assert(!new_id.empty() && new_id != "s-1", "rotateSession(s-1) returned %q, expected a fresh id", new_id);
   std::vector<std::vector<std::string>> loose;
   for (const auto& trip : trips) {
-    const bool atomic = std::any_of(trip.begin(), trip.end(), [](const std::string& c) { return kAtomic.count(c) > 0; });
-    const bool writing = std::any_of(trip.begin(), trip.end(), [](const std::string& c) { return kWrites.count(c) > 0; });
+    const bool atomic = std::any_of(trip.begin(), trip.end(), [](const std::string& c) { return kHAtomic.count(c) > 0; });
+    const bool writing = std::any_of(trip.begin(), trip.end(), [](const std::string& c) { return kHWrites.count(c) > 0; });
     if (writing && !atomic) loose.push_back(trip);
   }
   ctx.Assert(loose.empty(), "rotateSession made the round trips %v: the writes %v go on their own, and a crash between them leaves two live ids or none. Send them in one script (or one MULTI/EXEC)", trips, loose);
@@ -921,11 +1009,26 @@ void CheckAtomicRotate(harness::Ctx& ctx) {
   const auto record = store::readSession(new_id);
   ctx.Assert(record && record->user_id == "u-1", "the new id %s must hold u-1's session", new_id);
   ctx.Equal(store::userSessions("u-1"), std::vector<std::string>{new_id}, "u-1's set must hold only the new id");
+  store::putSession("s-5", "u-5", "mobile", "tok-5");
+  bool fired = false;
+  // u-5 signs out everywhere the instant the rotation first touches session:s-5.
+  ctx.Redis.After("session:s-5", [&] {
+    fired = true;
+    for (const auto& gone : ctx.Redis.SMembers("user:u-5:sessions")) ctx.Redis.Do("DEL", "session:" + gone);
+    ctx.Redis.Do("DEL", "user:u-5:sessions");
+  });
+  rotateSession("s-5");
+  ctx.Assert(fired, "rotateSession(s-5) never touched session:s-5");
+  std::vector<std::string> revived;
+  for (const auto& key : ctx.Redis.Keys("session:*")) {
+    if (ctx.Redis.HGet(key, "user_id").value_or("") == "u-5") revived.push_back(key);
+  }
+  ctx.Assert(revived.empty(), "u-5 signed out everywhere between the rotation's read of s-5 and its writes, and %v is live afterwards: read and write in the one script (or watch the key)", revived);
 }
 
 void CheckCarryCreated(harness::Ctx& ctx) {
-  session("s-1");
-  const long long created = nowSeconds(ctx) - 7 * 3600;  // signed in seven hours ago
+  hSession("s-1");
+  const long long created = hNow(ctx) - 7 * 3600;  // signed in seven hours ago
   ctx.Redis.Do("HSET", store::sessionKey("s-1"), "created_at", created);
   const auto new_id = rotateSession("s-1");
   ctx.Assert(new_id.has_value(), "rotating a live session returned none");
@@ -935,11 +1038,21 @@ void CheckCarryCreated(harness::Ctx& ctx) {
   ctx.Assert(record->rotation == 1 && record->token_hash == store::tokenHash("tok-1"), "the rotated session has rotation %d, expected 1 and the same token hash", record->rotation);
   const long long ttl = ctx.Redis.TTL(store::sessionKey(*new_id));
   ctx.Assert(0 < ttl && ttl <= 3600, "the rotated session expires in %d s, but only an hour of its eight is left", ttl);
-  session("s-2");
-  ctx.Redis.Do("HSET", store::sessionKey("s-2"), "created_at", nowSeconds(ctx) - store::kAbsoluteTtlS - 1);
+  hSession("s-2");
+  ctx.Redis.Do("HSET", store::sessionKey("s-2"), "created_at", hNow(ctx) - store::kAbsoluteTtlS - 1);
   const auto rotated = rotateSession("s-2");
   ctx.Assert(!rotated.has_value(), "a session past its cap rotated to %s: rotation must not renew it", rotated.value_or(""));
-  ctx.Assert(!store::readSession("s-2"), "a session past its cap must be retired when it tries to rotate");
+  ctx.Assert(!store::readSession("s-2") && !hContains(store::userSessions("u-1"), "s-2"), "a session past its cap must be retired when it tries to rotate, hash and set entry");
+  hSession("s-3");
+  ctx.Redis.Do("HSET", store::sessionKey("s-3"), "created_at", hNow(ctx) - store::kAbsoluteTtlS);  // exactly 8 hours ago
+  const auto edge = rotateSession("s-3");
+  ctx.Assert(!edge.has_value() && !store::readSession("s-3"), "a session exactly kAbsoluteTtlS old rotated to %s: at the cap it is retired", edge.value_or(""));
+  hSession("s-4");
+  ctx.Redis.Do("HSET", store::sessionKey("s-4"), "created_at", hNow(ctx) - store::kAbsoluteTtlS + 120);  // signed in 7 h 58 min ago
+  const auto near = rotateSession("s-4");
+  ctx.Assert(near.has_value(), "a session two minutes short of its cap must still rotate");
+  const long long near_ttl = ctx.Redis.TTL(store::sessionKey(near.value_or("")));
+  ctx.Assert(0 < near_ttl && near_ttl <= 120, "two minutes short of the cap the rotated session expires in %d s: no expiry may reach past created_at + kAbsoluteTtlS", near_ttl);
 }
 `,
   },

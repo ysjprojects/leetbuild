@@ -26,7 +26,8 @@ failover loses it, and a broker that refuses it or never answers loses it for go
 - The producer is idempotent with \`acks=all\` (Go uses confluent-kafka-go: kafka-go has no
   idempotent producer).
 - Wait for the delivery report at most 2 s; on a failure or no report, \`store.outbox_add(topic,
-  key, payload)\` and answer \`published: false\`.`,
+  key, payload)\` and answer \`published: false\`. A delivered event answers \`published: true\` and
+  leaves no outbox row.`,
   sequence: {
     participants: ['Session API', 'Session store', 'session.event', 'Outbox'],
     messages: [
@@ -94,7 +95,7 @@ failover loses it, and a broker that refuses it or never answers loses it for go
       id: 'outbox',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call answers `published: false`. The starter fires and forgets.',
+        'A delivered event answers `published: true` and leaves no outbox row. A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload (the token hash, never the token), and the call answers `published: false`. The starter fires and forgets.',
       match: {
         python: {all: [/store\.outbox_add\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/\boutboxAdd\(/, /await producer\.send\(/, /catch/]},
@@ -607,18 +608,24 @@ def check_idempotent_producer(ctx):
 
 def check_outbox(ctx):
     m = ctx.load("events")
+    delivered = m.open_session("u-2", "desktop", "tok-0")
+    assert delivered.get("published") is True, f"open_session answered {delivered} after the broker acknowledged the event, expected published: True"
+    assert _outbox(ctx) == [], f"the broker took the event and the outbox still holds {_outbox(ctx)}: the relay would publish it a second time"
+    assert len(ctx.kafka.records(TOPIC)) == 1, "the acknowledged event must be on session.event"
     ctx.kafka.fail_next(TOPIC, 1)
-    opened = m.open_session("u-1", "mobile", "tok-1")
+    opened = m.open_session("u-1", "mobile", "tok-secret-1")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the session is missing from the audit trail for good"
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "u-1" and rows[0].get("payload", {}).get("session_id") == opened["session_id"], f"the outbox row is {rows[0]}, expected the topic, the key u-1 and the payload"
+    raw = ctx.redis.lrange("outbox", 0, -1)[0]
+    assert "tok-secret-1" not in raw and rows[0]["payload"].get("token_hash") == store.token_hash("tok-secret-1"), f"the outbox row is {raw}: it carries the event's payload, the token hash and never the token"
     assert opened.get("published") is False, f"open_session answered {opened} after a failed delivery, expected published: False"
     assert store.read_session(opened["session_id"]) is not None, "the session must stay committed when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     stalled = m.open_session("u-1", "mobile", "tok-2")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"open_session waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"open_session waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("session_id") == stalled["session_id"], f"no delivery report within the window and the outbox holds {rows}"
     assert stalled.get("published") is False, f"open_session answered {stalled} without a delivery report, expected published: False"
@@ -686,19 +693,26 @@ export async function check_idempotent_producer(ctx) {
 
 export async function check_outbox(ctx) {
   const {m, store} = setup(ctx);
+  const delivered = await m.openSession('u-2', 'desktop', 'tok-0');
+  await settle();
+  assert.equal(delivered.published, true, \`openSession answered \${JSON.stringify(delivered)} after the broker acknowledged the event, expected published: true\`);
+  assert.deepEqual(outboxRows(ctx), [], \`the broker took the event and the outbox still holds \${JSON.stringify(outboxRows(ctx))}: the relay would publish it a second time\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the acknowledged event must be on session.event');
   ctx.kafka.failNext(TOPIC, 1);
-  const opened = await m.openSession('u-1', 'mobile', 'tok-1');
+  const opened = await m.openSession('u-1', 'mobile', 'tok-secret-1');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the session is missing from the audit trail for good\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'u-1' && rows[0].payload?.session_id === opened.session_id, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key u-1 and the payload\`);
+  const raw = (ctx.redis.lrange('outbox', 0, -1) as string[])[0];
+  assert(!raw.includes('tok-secret-1') && rows[0].payload?.token_hash === store.tokenHash('tok-secret-1'), \`the outbox row is \${raw}: it carries the event's payload, the token hash and never the token\`);
   assert.equal(opened.published, false, \`openSession answered \${JSON.stringify(opened)} after a failed delivery, expected published: false\`);
   assert((await store.readSession(opened.session_id)) !== null, 'the session must stay committed when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   const stalled = await m.openSession('u-1', 'mobile', 'tok-2');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`openSession waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`openSession waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.session_id === stalled.session_id, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(stalled.published, false, \`openSession answered \${JSON.stringify(stalled)} without a delivery report, expected published: false\`);
@@ -716,26 +730,26 @@ import (
 	"sessions/store"
 )
 
-const eventsTopic = "session.event"
+const hEventsTopic = "session.event"
 
-var bg = context.Background()
+var hBG = context.Background()
 
-func open(ctx *harness.Ctx, userID, deviceClass, token string) (string, bool) {
-	sessionID, published, err := openSession(bg, userID, deviceClass, token)
+func hOpen(ctx *harness.Ctx, userID, deviceClass, token string) (string, bool) {
+	sessionID, published, err := openSession(hBG, userID, deviceClass, token)
 	ctx.NoError(err, "openSession")
 	return sessionID, published
 }
 
-type outboxRow struct {
+type hOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outbox(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutbox(ctx *harness.Ctx) []hOutboxRow {
+	var rows []hOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row hOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -743,20 +757,20 @@ func outbox(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckUserKey(ctx *harness.Ctx) {
-	open(ctx, "u-1", "mobile", "tok-1")
-	open(ctx, "u-2", "desktop", "tok-2")
-	open(ctx, "u-1", "desktop", "tok-3")
+	hOpen(ctx, "u-1", "mobile", "tok-1")
+	hOpen(ctx, "u-2", "desktop", "tok-2")
+	hOpen(ctx, "u-1", "desktop", "tok-3")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(hEventsTopic)
 	ctx.Equal(len(records), 3, "three openSession calls must produce three records on session.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"u-1", "u-2", "u-1"}, "the records must be keyed by the user ids")
+	ctx.Equal(ctx.Kafka.Keys(hEventsTopic), []string{"u-1", "u-2", "u-1"}, "the records must be keyed by the user ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both u-1 events must land on one partition, or the audit trail reads one user's sessions out of order; the partitions")
 }
 
 func CheckHashedToken(ctx *harness.Ctx) {
-	sessionID, _ := open(ctx, "u-1", "mobile", "tok-secret-1")
+	sessionID, _ := hOpen(ctx, "u-1", "mobile", "tok-secret-1")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(hEventsTopic)
 	ctx.Equal(len(values), 1, "one openSession must produce one record; the records")
 	ctx.Assert(!strings.Contains(values[0], "tok-secret-1"), "the event carries the token itself: %s. A retained, replicated topic holding tokens is a credential store", values[0])
 	var value map[string]any
@@ -766,41 +780,48 @@ func CheckHashedToken(ctx *harness.Ctx) {
 }
 
 func CheckRecordFirst(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("user:u-1:sessions", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	sessionID, _ := open(ctx, "u-1", "mobile", "tok-1")
+	probe := ctx.Redis.After("user:u-1:sessions", func() any { return len(ctx.Kafka.Records(hEventsTopic)) })
+	sessionID, _ := hOpen(ctx, "u-1", "mobile", "tok-1")
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "openSession never committed the session (nothing entered user:u-1:sessions)")
 	ctx.Equal(probe.Result, 0, "when the session was committed the topic already held records: a consumer could read about a session the store does not have. Commit first, then produce; the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
-	ctx.Assert(store.ReadSession(bg, sessionID) != nil, "the session must be in the store")
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "the event must still be produced after the commit; the records")
+	ctx.Assert(store.ReadSession(hBG, sessionID) != nil, "the session must be in the store")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	open(ctx, "u-1", "mobile", "tok-1")
+	ctx.Kafka.LoseAcks(hEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hOpen(ctx, "u-1", "mobile", "tok-1")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	open(ctx, "u-1", "mobile", "tok-2")
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hOpen(ctx, "u-1", "mobile", "tok-2")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	sessionID, published := open(ctx, "u-1", "mobile", "tok-1")
+	_, delivered := hOpen(ctx, "u-2", "desktop", "tok-0")
 	ctx.Settle()
-	rows := outbox(ctx)
+	ctx.Equal(delivered, true, "openSession's published after the broker acknowledged the event")
+	ctx.Equal(len(hOutbox(ctx)), 0, "the broker took the event, so the relay must not publish it a second time; the outbox rows")
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "the acknowledged event must be on session.event; the records")
+	ctx.Kafka.FailNext(hEventsTopic, 1)
+	sessionID, published := hOpen(ctx, "u-1", "mobile", "tok-secret-1")
+	ctx.Settle()
+	rows := hOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the session is missing from the audit trail for good; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "u-1" && rows[0].Payload["session_id"] == sessionID, "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == hEventsTopic && rows[0].Key == "u-1" && rows[0].Payload["session_id"] == sessionID, "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
+	raw := ctx.Redis.LRange("outbox", 0, -1)[0]
+	ctx.Assert(!strings.Contains(raw, "tok-secret-1") && rows[0].Payload["token_hash"] == store.TokenHash("tok-secret-1"), "the outbox row is %s: it carries the event's payload, the token hash and never the token", raw)
 	ctx.Equal(published, false, "openSession's published after a failed delivery")
-	ctx.Assert(store.ReadSession(bg, sessionID) != nil, "the session must stay committed when only the produce failed")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Assert(store.ReadSession(hBG, sessionID) != nil, "the session must stay committed when only the produce failed")
+	ctx.Kafka.Stall(hEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	stalledID, published := open(ctx, "u-1", "mobile", "tok-2")
+	stalledID, published := hOpen(ctx, "u-1", "mobile", "tok-2")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "openSession waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = outbox(ctx)
+	ctx.Assert(waited <= 2.5, "openSession waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	rows = hOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["session_id"] == stalledID, "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(published, false, "openSession's published without a delivery report")
 }
@@ -816,9 +837,9 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "session.event";
+const std::string kHEventsTopic = "session.event";
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -828,7 +849,7 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
@@ -839,9 +860,9 @@ void CheckUserKey(harness::Ctx& ctx) {
   openSession("u-2", "desktop", "tok-2");
   openSession("u-1", "desktop", "tok-3");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three openSession calls must produce three records on session.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"u-1", "u-2", "u-1"}, "the records must be keyed by the user ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"u-1", "u-2", "u-1"}, "the records must be keyed by the user ids");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both u-1 events must land on one partition, or the audit trail reads one user's sessions out of order; the partitions");
 }
@@ -849,13 +870,13 @@ void CheckUserKey(harness::Ctx& ctx) {
 void CheckHashedToken(harness::Ctx& ctx) {
   const Opened opened = openSession("u-1", "mobile", "tok-secret-1");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one openSession must produce one record; the records");
   ctx.Assert(values[0].find("tok-secret-1") == std::string::npos,
              "the event carries the token itself: %s. A retained, replicated topic holding tokens is a credential store", values[0]);
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Equal(field(value, "token_hash"), store::tokenHash("tok-secret-1"), "the payload's token_hash (store::tokenHash of the token)");
-  ctx.Assert(field(value, "session_id") == opened.session_id && field(value, "user_id") == "u-1" && field(value, "device_class") == "mobile",
+  ctx.Equal(hField(value, "token_hash"), store::tokenHash("tok-secret-1"), "the payload's token_hash (store::tokenHash of the token)");
+  ctx.Assert(hField(value, "session_id") == opened.session_id && hField(value, "user_id") == "u-1" && hField(value, "device_class") == "mobile",
              "the payload is %s, expected the session id, user id and device class", values[0]);
 }
 
@@ -864,7 +885,7 @@ void CheckRecordFirst(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("user:u-1:sessions", [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+    atCommit = ctx.Kafka.Records(kHEventsTopic).size();
   });
   const Opened opened = openSession("u-1", "mobile", "tok-1");
   ctx.Settle();
@@ -872,40 +893,48 @@ void CheckRecordFirst(harness::Ctx& ctx) {
   ctx.Equal(atCommit, 0,
             "when the session was committed the topic already held records: a consumer could read about a session the store does not have. "
             "Commit first, then produce; the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
   ctx.Assert(store::readSession(opened.session_id).has_value(), "the session must be in the store");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   openSession("u-1", "mobile", "tok-1");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   openSession("u-1", "mobile", "tok-2");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const Opened opened = openSession("u-1", "mobile", "tok-1");
+  const Opened delivered = openSession("u-2", "desktop", "tok-0");
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  ctx.Equal(delivered.published, true, "openSession's published after the broker acknowledged the event");
+  ctx.Equal(hOutboxRows(ctx).size(), 0, "the broker took the event, so the relay must not publish it a second time; the outbox rows");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the acknowledged event must be on session.event; the records");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const Opened opened = openSession("u-1", "mobile", "tok-secret-1");
+  ctx.Settle();
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the session is missing from the audit trail for good; the rows");
-  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "u-1" && rows[0].contains("payload") &&
-                 field(rows[0]["payload"], "session_id") == opened.session_id,
+  ctx.Assert(hField(rows[0], "topic") == kHEventsTopic && hField(rows[0], "key") == "u-1" && rows[0].contains("payload") &&
+                 hField(rows[0]["payload"], "session_id") == opened.session_id,
              "the outbox row is %s, expected the topic, the key u-1 and the payload", rows[0].dump());
+  const std::string raw = ctx.Redis.LRange("outbox", 0, -1).at(0);
+  ctx.Assert(raw.find("tok-secret-1") == std::string::npos && hField(rows[0]["payload"], "token_hash") == store::tokenHash("tok-secret-1"),
+             "the outbox row is %s: it carries the event's payload, the token hash and never the token", raw);
   ctx.Equal(opened.published, false, "openSession's published after a failed delivery");
   ctx.Assert(store::readSession(opened.session_id).has_value(), "the session must stay committed when only the produce failed");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   const Opened stalled = openSession("u-1", "mobile", "tok-2");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "openSession waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "session_id") == stalled.session_id,
+  ctx.Assert(waited <= 2.5, "openSession waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hField(rows[1]["payload"], "session_id") == stalled.session_id,
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(stalled.published, false, "openSession's published without a delivery report");
 }

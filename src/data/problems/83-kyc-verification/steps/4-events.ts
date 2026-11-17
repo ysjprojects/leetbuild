@@ -67,7 +67,7 @@ recorded; and a lost acknowledgement or a leader failover duplicates or drops th
       id: 'digests-only',
       title: 'Carries reasons and digests, never document refs',
       detail:
-        'Each document goes out as its type and digest, and the payload carries the decided reasons; the storage refs stay in the case store, because a retained, replicated topic outlives every access rule on the scans.',
+        'Each document goes out as its type and digest, and the payload carries the decided case’s status, reasons and `degraded`; the storage refs stay in the case store, because a retained, replicated topic outlives every access rule on the scans.',
       match: {
         python: {all: [/["']digest["']:\s*\w+\[["']digest["']\]/, /["']reasons["']:\s*\w+\[["']reasons["']\]/]},
         typescript: {all: [/digest:\s*\w+\.digest/, /reasons:\s*\w+\.reasons/]},
@@ -583,6 +583,12 @@ def check_digests_only(ctx):
     assert payload.get("decision") == "rejected" and payload.get("reasons") == ["DOC_EXPIRED"], f"the event must carry the decision and its reasons, got {payload}"
     assert payload.get("degraded") is False and payload.get("case_id") == case_id and payload.get("applicant") == "a-1" and payload.get("tenant") == "t-a", f"the event must carry case_id, tenant, applicant and degraded, got {payload}"
     assert event == payload, f"record_decision must return the event it produced: returned {event}, produced {payload}"
+    # A vendor outage: the decided case says degraded, and so must its event.
+    m.record_decision(_case("a-2"), "manual_review", [], True)
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 2, f"two decisions produced {len(records)} records"
+    degraded = _payload(records[1])
+    assert degraded.get("decision") == "manual_review" and degraded.get("degraded") is True, f"a manual_review decided with degraded true went out as {degraded}: the event carries the decided case's status and degraded"
 
 
 def check_commit_before_produce(ctx):
@@ -659,6 +665,12 @@ export async function check_digests_only(ctx) {
   assert(p.decision === 'rejected' && JSON.stringify(p.reasons) === '["DOC_EXPIRED"]', \`the event must carry the decision and its reasons, got \${text}\`);
   assert(p.degraded === false && p.case_id === caseId && p.applicant === 'a-1' && p.tenant === 't-a', \`the event must carry case_id, tenant, applicant and degraded, got \${text}\`);
   assert.deepStrictEqual(event, p, \`recordDecision must return the event it produced: returned \${JSON.stringify(event)}, produced \${text}\`);
+  // A vendor outage: the decided case says degraded, and so must its event.
+  await m.recordDecision(await open(cases, 'a-2'), 'manual_review', [], true);
+  const after = ctx.kafka.records(TOPIC);
+  assert.equal(after.length, 2, \`two decisions produced \${after.length} records\`);
+  const degraded = payload(after[1]);
+  assert(degraded.decision === 'manual_review' && degraded.degraded === true, \`a manual_review decided with degraded true went out as \${after[1].value.toString()}: the event carries the decided case's status and degraded\`);
 }
 
 export async function check_commit_before_produce(ctx) {
@@ -697,73 +709,79 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "kyc.decided"
+const hTopic = "kyc.decided"
 
 var (
-	eventsBg = context.Background()
-	docs     = []cases.Document{
+	hEventsBg = context.Background()
+	hDocs     = []cases.Document{
 		{Type: "passport", Ref: "documents/t-a/passport-1.jpg", Digest: "sha256:5e1f0c"},
 		{Type: "drivers_license", Ref: "documents/t-a/license-1.jpg", Digest: "sha256:77ab02"},
 	}
 )
 
-func open(applicant string) string {
-	return cases.Create(eventsBg, cases.NewID(eventsBg), "t-a", applicant, docs).CaseID
+func hOpenCase(applicant string) string {
+	return cases.Create(hEventsBg, cases.NewID(hEventsBg), "t-a", applicant, hDocs).CaseID
 }
 
-func mustRecord(ctx *harness.Ctx, caseID, status string, reasons []string) map[string]any {
-	event, err := recordDecision(eventsBg, caseID, status, reasons, false)
+func hMustRecord(ctx *harness.Ctx, caseID, status string, reasons []string, degraded bool) map[string]any {
+	event, err := recordDecision(hEventsBg, caseID, status, reasons, degraded)
 	ctx.NoError(err, "recordDecision(%s, %s) failed", caseID, status)
 	return event
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
 func CheckApplicantKey(ctx *harness.Ctx) {
-	mustRecord(ctx, open("a-1"), "rejected", []string{"DOC_EXPIRED"})
-	mustRecord(ctx, open("a-1"), "approved", []string{})
-	mustRecord(ctx, open("a-2"), "approved", []string{})
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 3, "three decisions must produce three records on %s; the records", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{"a-1", "a-1", "a-2"}, "records must be keyed by the applicant (keyed by anything else, one person's decisions scatter across partitions)")
+	hMustRecord(ctx, hOpenCase("a-1"), "rejected", []string{"DOC_EXPIRED"}, false)
+	hMustRecord(ctx, hOpenCase("a-1"), "approved", []string{}, false)
+	hMustRecord(ctx, hOpenCase("a-2"), "approved", []string{}, false)
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 3, "three decisions must produce three records on %s; the records", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"a-1", "a-1", "a-2"}, "records must be keyed by the applicant (keyed by anything else, one person's decisions scatter across partitions)")
 	ctx.Assert(records[0].Partition == records[1].Partition, "a-1's two decisions landed on partitions %d and %d: one applicant's history must stay on one partition, in order", records[0].Partition, records[1].Partition)
 }
 
 func CheckDigestsOnly(ctx *harness.Ctx) {
-	caseID := open("a-1")
-	mustRecord(ctx, caseID, "rejected", []string{"DOC_EXPIRED"})
-	records := ctx.Kafka.Records(topic)
+	caseID := hOpenCase("a-1")
+	hMustRecord(ctx, caseID, "rejected", []string{"DOC_EXPIRED"}, false)
+	records := ctx.Kafka.Records(hTopic)
 	ctx.Equal(len(records), 1, "one decision; the records")
 	text := string(records[0].Value)
 	ctx.Assert(!strings.Contains(text, "documents/"), "the event carries the storage refs of the scans: %s. A retained topic outlives every access rule on them; send each document's type and digest", text)
-	p := payloadOf(ctx, records[0].Value)
+	p := hPayloadOf(ctx, records[0].Value)
 	ctx.Equal(p["documents"], []any{map[string]any{"type": "passport", "digest": "sha256:5e1f0c"}, map[string]any{"type": "drivers_license", "digest": "sha256:77ab02"}}, "documents must be [{type, digest}] per document")
 	ctx.Assert(p["decision"] == "rejected", "the event must carry the decision, got %s", text)
 	ctx.Equal(p["reasons"], []any{"DOC_EXPIRED"}, "the event must carry the decided reasons")
 	ctx.Assert(p["degraded"] == false && p["case_id"] == caseID && p["applicant"] == "a-1" && p["tenant"] == "t-a", "the event must carry case_id, tenant, applicant and degraded, got %s", text)
+	// A vendor outage: the decided case says degraded, and so must its event.
+	hMustRecord(ctx, hOpenCase("a-2"), "manual_review", []string{}, true)
+	records = ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 2, "two decisions; the records")
+	degraded := hPayloadOf(ctx, records[1].Value)
+	ctx.Assert(degraded["decision"] == "manual_review" && degraded["degraded"] == true, "a manual_review decided with degraded true went out as %s: the event carries the decided case's status and degraded", records[1].Value)
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	caseID := open("a-1")
+	caseID := hOpenCase("a-1")
 	// The moment the decision commits (its audit row), what is already on the topic.
-	atCommit := ctx.Redis.After("kyc:audit:"+caseID, func() any { return len(ctx.Kafka.Records(topic)) })
-	mustRecord(ctx, caseID, "approved", []string{})
+	atCommit := ctx.Redis.After("kyc:audit:"+caseID, func() any { return len(ctx.Kafka.Records(hTopic)) })
+	hMustRecord(ctx, caseID, "approved", []string{}, false)
 	ctx.Assert(atCommit.Fired, "recordDecision never committed the decision: nothing wrote the audit row")
 	ctx.Equal(atCommit.Result, 0, "when the decision committed the topic already held records: the event announced a decision the store did not hold yet. Decide, then produce; records at the commit")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one decision, the records on the topic")
-	recordDecision(eventsBg, open("a-2"), "verified", []string{}, false)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "a decision the case store refused (status verified) must not be announced; the records")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "after one decision, the records on the topic")
+	recordDecision(hEventsBg, hOpenCase("a-2"), "verified", []string{}, false)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "a decision the case store refused (status verified) must not be announced; the records")
 }
 
 func CheckDurableProducer(ctx *harness.Ctx) {
-	mustRecord(ctx, open("a-1"), "approved", []string{})
-	mustRecord(ctx, open("a-2"), "rejected", []string{"DOC_EXPIRED"})
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	hMustRecord(ctx, hOpenCase("a-1"), "approved", []string{}, false)
+	hMustRecord(ctx, hOpenCase("a-2"), "rejected", []string{"DOC_EXPIRED"}, false)
+	lost := ctx.Kafka.Failover(hTopic)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -775,27 +793,27 @@ func CheckDurableProducer(ctx *harness.Ctx) {
 
 #include "kyc/cases.h"
 
-using json = nlohmann::json;
-
 namespace {
 
-const std::string kTopic = "kyc.decided";
-const std::vector<cases::Document> kDocs = {{"passport", "documents/t-a/passport-1.jpg", "sha256:5e1f0c"},
+using HJson = nlohmann::json;
+
+const std::string hTopic = "kyc.decided";
+const std::vector<cases::Document> hDocs = {{"passport", "documents/t-a/passport-1.jpg", "sha256:5e1f0c"},
                                             {"drivers_license", "documents/t-a/license-1.jpg", "sha256:77ab02"}};
 
-std::string open(const std::string& applicant) { return cases::create(cases::newId(), "t-a", applicant, kDocs).case_id; }
+std::string hOpenCase(const std::string& applicant) { return cases::create(cases::newId(), "t-a", applicant, hDocs).case_id; }
 
-json mustRecord(harness::Ctx& ctx, const std::string& case_id, const std::string& status, const std::vector<std::string>& reasons) {
+HJson hMustRecord(harness::Ctx& ctx, const std::string& case_id, const std::string& status, const std::vector<std::string>& reasons, bool degraded = false) {
   try {
-    return record_decision(case_id, status, reasons, false);
+    return record_decision(case_id, status, reasons, degraded);
   } catch (const std::exception& e) {
     ctx.Fatalf("record_decision(%s, %s) threw %s: %s", case_id, status, harness::CurrentExceptionType(), e.what());
   }
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+HJson hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
-    return json::parse(record.Value.value_or(""));
+    return HJson::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
     ctx.Fatalf("the record's value is not JSON: %s (%s)", record.Value.value_or(""), e.what());
   }
@@ -804,54 +822,61 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
 }  // namespace
 
 void CheckApplicantKey(harness::Ctx& ctx) {
-  mustRecord(ctx, open("a-1"), "rejected", {"DOC_EXPIRED"});
-  mustRecord(ctx, open("a-1"), "approved", {});
-  mustRecord(ctx, open("a-2"), "approved", {});
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three decisions must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"a-1", "a-1", "a-2"}, "records must be keyed by the applicant (keyed by anything else, one person's decisions scatter across partitions)");
+  hMustRecord(ctx, hOpenCase("a-1"), "rejected", {"DOC_EXPIRED"});
+  hMustRecord(ctx, hOpenCase("a-1"), "approved", {});
+  hMustRecord(ctx, hOpenCase("a-2"), "approved", {});
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 3, "three decisions must produce three records on %s; the records", hTopic);
+  ctx.Equal(ctx.Kafka.Keys(hTopic), {"a-1", "a-1", "a-2"}, "records must be keyed by the applicant (keyed by anything else, one person's decisions scatter across partitions)");
   ctx.Assert(records[0].Partition == records[1].Partition, "a-1's two decisions landed on partitions %d and %d: one applicant's history must stay on one partition, in order", records[0].Partition, records[1].Partition);
 }
 
 void CheckDigestsOnly(harness::Ctx& ctx) {
-  const std::string case_id = open("a-1");
-  const json event = mustRecord(ctx, case_id, "rejected", {"DOC_EXPIRED"});
-  const auto records = ctx.Kafka.Records(kTopic);
+  const std::string case_id = hOpenCase("a-1");
+  const HJson event = hMustRecord(ctx, case_id, "rejected", {"DOC_EXPIRED"});
+  auto records = ctx.Kafka.Records(hTopic);
   ctx.Equal(records.size(), 1, "one decision; the records");
   const std::string text = records[0].Value.value_or("");
   ctx.Assert(text.find("documents/") == std::string::npos, "the event carries the storage refs of the scans: %s. A retained topic outlives every access rule on them; send each document's type and digest", text);
-  const json p = payloadOf(ctx, records[0]);
-  const json want = json::array({{{"type", "passport"}, {"digest", "sha256:5e1f0c"}}, {{"type", "drivers_license"}, {"digest", "sha256:77ab02"}}});
-  ctx.Assert(p.value("documents", json::array()) == want, "documents must be [{type, digest}] per document, got %s", p.value("documents", json::array()).dump());
-  ctx.Assert(p.value("decision", "") == "rejected" && p.value("reasons", json::array()) == json::array({"DOC_EXPIRED"}), "the event must carry the decision and its reasons, got %s", text);
+  const HJson p = hPayloadOf(ctx, records[0]);
+  const HJson want = HJson::array({{{"type", "passport"}, {"digest", "sha256:5e1f0c"}}, {{"type", "drivers_license"}, {"digest", "sha256:77ab02"}}});
+  ctx.Assert(p.value("documents", HJson::array()) == want, "documents must be [{type, digest}] per document, got %s", p.value("documents", HJson::array()).dump());
+  ctx.Assert(p.value("decision", "") == "rejected" && p.value("reasons", HJson::array()) == HJson::array({"DOC_EXPIRED"}), "the event must carry the decision and its reasons, got %s", text);
   ctx.Assert(p.value("degraded", true) == false && p.value("case_id", "") == case_id && p.value("applicant", "") == "a-1" && p.value("tenant", "") == "t-a",
              "the event must carry case_id, tenant, applicant and degraded, got %s", text);
   ctx.Assert(event == p, "record_decision must return the event it produced: returned %s, produced %s", event.dump(), text);
+  // A vendor outage: the decided case says degraded, and so must its event.
+  hMustRecord(ctx, hOpenCase("a-2"), "manual_review", {}, true);
+  records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 2, "two decisions; the records");
+  const HJson degraded = hPayloadOf(ctx, records[1]);
+  ctx.Assert(degraded.value("decision", "") == "manual_review" && degraded.value("degraded", false) == true,
+             "a manual_review decided with degraded true went out as %s: the event carries the decided case's status and degraded", records[1].Value.value_or(""));
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
-  const std::string case_id = open("a-1");
+  const std::string case_id = hOpenCase("a-1");
   // The moment the decision commits (its audit row), what is already on the topic.
   int atCommit = -1;
-  ctx.Redis.After("kyc:audit:" + case_id, [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  mustRecord(ctx, case_id, "approved", {});
+  ctx.Redis.After("kyc:audit:" + case_id, [&] { atCommit = static_cast<int>(ctx.Kafka.Records(hTopic).size()); });
+  hMustRecord(ctx, case_id, "approved", {});
   ctx.Assert(atCommit >= 0, "record_decision never committed the decision: nothing wrote the audit row");
   ctx.Equal(atCommit, 0, "when the decision committed the topic already held records: the event announced a decision the store did not hold yet. Decide, then produce; records at the commit");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one decision, the records on the topic");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after one decision, the records on the topic");
   try {
-    record_decision(open("a-2"), "verified", {}, false);
+    record_decision(hOpenCase("a-2"), "verified", {}, false);
   } catch (const std::exception&) {
   }
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "a decision the case store refused (status verified) must not be announced; the records");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "a decision the case store refused (status verified) must not be announced; the records");
 }
 
 void CheckDurableProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  mustRecord(ctx, open("a-1"), "approved", {});
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one decision whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
-  mustRecord(ctx, open("a-2"), "rejected", {"DOC_EXPIRED"});
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  ctx.Kafka.LoseAcks(hTopic, 1);
+  hMustRecord(ctx, hOpenCase("a-1"), "approved", {});
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "one decision whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
+  hMustRecord(ctx, hOpenCase("a-2"), "rejected", {"DOC_EXPIRED"});
+  const int lost = ctx.Kafka.Failover(hTopic);
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

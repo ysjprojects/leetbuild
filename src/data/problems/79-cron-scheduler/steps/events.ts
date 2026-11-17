@@ -71,7 +71,7 @@ stops answering.
       id: 'acks-idempotent',
       title: 'Configures an idempotent producer with acks=all',
       detail:
-        'A write whose acknowledgement was lost is retried and lands once; a record survives a leader failover. The starter sets `acks=1` and no idempotence.',
+        'A write whose acknowledgement was lost is retried and lands once, and the call returns true with no outbox row; a record survives a leader failover. The starter sets `acks=1` and no idempotence.',
       match: {
         python: {all: [/["']acks["']\s*:\s*["'](all|-1)["']/, /["']enable\.idempotence["']\s*:\s*True/]},
         typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
@@ -84,7 +84,7 @@ stops answering.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the schedule id and the payload, and the call returns false. The starter fires and forgets.',
+        'A delivered event returns true and leaves no outbox row. A failed delivery, or no report within 2 s (the call returns by about 2.5 s), leaves an outbox row with the topic, the schedule id and the whole payload, and the call returns false. The starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -587,8 +587,9 @@ def check_all_outcomes(ctx):
 def check_acks_idempotent(ctx):
     m = ctx.load("events")
     ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
-    m.publish_run(_schedule(1), W, "fired", "")
+    ok = m.publish_run(_schedule(1), W, "fired", "")
     assert len(ctx.kafka.records(TOPIC)) == 1, f"after one lost acknowledgement the topic holds {len(ctx.kafka.records(TOPIC))} records: the producer's retry wrote the run twice. Enable idempotence"
+    assert ok is True and _outbox(ctx) == [], f"after a lost acknowledgement the idempotent retry delivered the event, yet publish_run returned {ok!r} and the outbox holds {_outbox(ctx)}: the relay would publish it a second time"
     m.publish_run(_schedule(1), W + 300, "fired", "")
     ctx.kafka.failover(TOPIC)  # the partition leader dies right after acknowledging
     assert len(ctx.kafka.records(TOPIC)) == 2, "a leader failover lost the record the leader alone had acknowledged: acks=all waits for every in-sync replica"
@@ -596,17 +597,21 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_run(_schedule(1), W - 300, "fired", "")
+    assert ok is True, f"publish_run returned {ok!r} for a delivered event, expected True"
+    assert _outbox(ctx) == [], f"a delivered event left outbox rows {_outbox(ctx)}: the relay would publish it a second time"
     ctx.kafka.fail_next(TOPIC, 1)
-    ok = m.publish_run(_schedule(1), W, "fired", "")
+    ok = m.publish_run(_schedule(1), W, "error", "trigger_failed")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the ledger never learns the window ran"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "s1" and rows[0].get("payload", {}).get("window") == "2026-03-10T09:00:00Z", f"the outbox row is {rows[0]}, expected the topic, the key s1 and the payload"
+    payload = {"schedule_id": "s1", "job_ref": "billing.invoice", "window": "2026-03-10T09:00:00Z", "outcome": "error", "reason": "trigger_failed"}
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "s1" and rows[0].get("payload") == payload, f"the outbox row is {rows[0]}, expected the topic, the key s1 and the payload {payload}"
     assert ok is False, f"publish_run returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_run(_schedule(1), W + 300, "fired", "")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_run waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_run waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("window") == "2026-03-10T09:05:00Z", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_run returned {ok!r} without a delivery report, expected False"
@@ -663,9 +668,10 @@ export async function check_all_outcomes(ctx) {
 export async function check_acks_idempotent(ctx) {
   const m = ctx.load('events');
   ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
-  await m.publishRun(schedule(1), W, 'fired', '');
+  const ok = await m.publishRun(schedule(1), W, 'fired', '');
   await settle();
   assert.equal(ctx.kafka.records(TOPIC).length, 1, \`after one lost acknowledgement the topic holds \${ctx.kafka.records(TOPIC).length} records: the producer's retry wrote the run twice. Enable idempotence\`);
+  assert(ok === true && outboxRows(ctx).length === 0, \`after a lost acknowledgement the idempotent retry delivered the event, yet publishRun resolved \${JSON.stringify(ok)} and the outbox holds \${JSON.stringify(outboxRows(ctx))}: the relay would publish it a second time\`);
   await m.publishRun(schedule(1), W + 300, 'fired', '');
   await settle();
   ctx.kafka.failover(TOPIC); // the partition leader dies right after acknowledging
@@ -674,18 +680,24 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  let ok = await m.publishRun(schedule(1), W - 300, 'fired', '');
+  await settle();
+  assert.equal(ok, true, \`publishRun resolved \${JSON.stringify(ok)} for a delivered event, expected true\`);
+  assert.deepEqual(outboxRows(ctx), [], \`a delivered event left outbox rows \${JSON.stringify(outboxRows(ctx))}: the relay would publish it a second time\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishRun(schedule(1), W, 'fired', '');
+  ok = await m.publishRun(schedule(1), W, 'error', 'trigger_failed');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the ledger never learns the window ran\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 's1' && rows[0].payload?.window === '2026-03-10T09:00:00Z', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key s1 and the payload\`);
+  const payload = {schedule_id: 's1', job_ref: 'billing.invoice', window: '2026-03-10T09:00:00Z', outcome: 'error', reason: 'trigger_failed'};
+  const fields = JSON.stringify(Object.entries(rows[0].payload ?? {}).sort());
+  assert(rows[0].topic === TOPIC && rows[0].key === 's1' && fields === JSON.stringify(Object.entries(payload).sort()), \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key s1 and the payload \${JSON.stringify(payload)}\`);
   assert.equal(ok, false, \`publishRun resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishRun(schedule(1), W + 300, 'fired', '');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishRun waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishRun waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.window === '2026-03-10T09:05:00Z', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishRun resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -765,9 +777,10 @@ func CheckAllOutcomes(ctx *harness.Ctx) {
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsSchedule(1), eventsWindow, "fired", "")
+	ok := eventsPublish(ctx, eventsSchedule(1), eventsWindow, "fired", "")
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the run twice (enable.idempotence); the records")
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "after a lost acknowledgement the idempotent retry delivered the event, yet publishRun returned %v and the outbox holds %v: the relay would publish it a second time", ok, eventsOutbox(ctx))
 	eventsPublish(ctx, eventsSchedule(1), eventsWindow+300, "fired", "")
 	ctx.Settle()
 	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
@@ -775,18 +788,23 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := eventsPublish(ctx, eventsSchedule(1), eventsWindow-300, "fired", "")
+	ctx.Settle()
+	ctx.Equal(ok, true, "publishRun's result for a delivered event")
+	ctx.Assert(len(eventsOutbox(ctx)) == 0, "a delivered event left outbox rows %v: the relay would publish it a second time", eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsSchedule(1), eventsWindow, "fired", "")
+	ok = eventsPublish(ctx, eventsSchedule(1), eventsWindow, "error", "trigger_failed")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the ledger never learns the window ran; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "s1" && rows[0].Payload["window"] == "2026-03-10T09:00:00Z", "the outbox row is %v, expected the topic, the key s1 and the payload", rows[0])
+	payload := map[string]any{"schedule_id": "s1", "job_ref": "billing.invoice", "window": "2026-03-10T09:00:00Z", "outcome": "error", "reason": "trigger_failed"}
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "s1" && fmt.Sprint(rows[0].Payload) == fmt.Sprint(payload), "the outbox row is %v, expected the topic, the key s1 and the payload %v", rows[0], payload)
 	ctx.Equal(ok, false, "publishRun's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsSchedule(1), eventsWindow+300, "fired", "")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishRun waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishRun waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["window"] == "2026-03-10T09:05:00Z", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishRun's result without a delivery report")
@@ -863,10 +881,14 @@ void CheckAllOutcomes(harness::Ctx& ctx) {
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishRun(eventsSchedule(1), kEventsWindow, "fired", "");
+  const bool ok = publishRun(eventsSchedule(1), kEventsWindow, "fired", "");
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the run twice (enable.idempotence); the records");
+  ctx.Assert(ok && eventsOutbox(ctx).empty(),
+             "after a lost acknowledgement the idempotent retry delivered the event, yet publishRun returned %v and the outbox holds %d "
+             "rows: the relay would publish it a second time",
+             ok, eventsOutbox(ctx).size());
   publishRun(eventsSchedule(1), kEventsWindow + 300, "fired", "");
   ctx.Settle();
   ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
@@ -875,20 +897,29 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publishRun(eventsSchedule(1), kEventsWindow - 300, "fired", "");
+  ctx.Settle();
+  ctx.Equal(ok, true, "publishRun's result for a delivered event");
+  ctx.Assert(eventsOutbox(ctx).empty(), "a delivered event left %d outbox rows: the relay would publish it a second time", eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishRun(eventsSchedule(1), kEventsWindow, "fired", "");
+  ok = publishRun(eventsSchedule(1), kEventsWindow, "error", "trigger_failed");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the ledger never learns the window ran; the rows");
+  const nlohmann::json payload = {{"schedule_id", "s1"},
+                                  {"job_ref", "billing.invoice"},
+                                  {"window", "2026-03-10T09:00:00Z"},
+                                  {"outcome", "error"},
+                                  {"reason", "trigger_failed"}};
   ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "s1" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "window") == "2026-03-10T09:00:00Z",
-             "the outbox row is %s, expected the topic, the key s1 and the payload", rows[0].dump());
+                 rows[0]["payload"] == payload,
+             "the outbox row is %s, expected the topic, the key s1 and the payload %s", rows[0].dump(), payload.dump());
   ctx.Equal(ok, false, "publishRun's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishRun(eventsSchedule(1), kEventsWindow + 300, "fired", "");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishRun waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row",
+  ctx.Assert(waited <= 2.5, "publishRun waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row",
              waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "window") == "2026-03-10T09:05:00Z",

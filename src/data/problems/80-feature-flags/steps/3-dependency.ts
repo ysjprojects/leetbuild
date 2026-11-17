@@ -44,7 +44,7 @@ service Relay { rpc PushKill(KillRequest) returns (KillAck); }  // KillRequest{f
       id: 'deadline',
       title: 'The push carries a 1-second deadline',
       detail:
-        "The `PushKill` call has a deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and nothing sleeps between retries: a hung relay costs the operator one second, not the relay's whim.",
+        "The `PushKill` call has a deadline of 1 second (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) and is made once: a hung relay costs the operator one second, not the relay's whim, and the timed-out push is queued as pending.",
       match: {
         python: {all: [/timeout=KILL_DEADLINE_S|timeout=1(?:\.0)?\b/], none: [/time\.sleep\(/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/], none: [/\bsleep\(/]},
@@ -70,7 +70,7 @@ service Relay { rpc PushKill(KillRequest) returns (KillAck); }  // KillRequest{f
       id: 'pending',
       title: 'A failed push is queued and reported pending',
       detail:
-        'When the push fails, the kill (already in the snapshot) is RPUSHed to `flags:push:pending` and the answer says `pending`; the starter reports `pushed` whatever the relay said.',
+        'When the push fails, whatever the status, the kill (already in the snapshot) is RPUSHed to `flags:push:pending`, oldest first, the answer says `pending` and nothing retries in place; the starter reports `pushed` whatever the relay said.',
       match: {
         python: {all: [/flags:push:pending/, /rpush/i, /["']pending["']/]},
         typescript: {all: [/flags:push:pending/, /rpush/i, /['"]pending['"]/]},
@@ -637,13 +637,18 @@ def check_deadline(ctx):
     calls = ctx.grpc.calls_to("PushKill")
     assert len(calls) == 1, f"one kill made {len(calls)} PushKill calls"
     assert calls[0].timeout is not None, "the PushKill call carries no deadline: a relay that hangs holds the operator's kill open"
-    assert 0.5 <= calls[0].timeout <= 1.5, f"the PushKill call carries a {calls[0].timeout} s deadline, expected 1 s"
+    assert 0.8 <= calls[0].timeout <= 1.2, f"the PushKill call carries a {calls[0].timeout} s deadline, expected 1 s"
     ctx.grpc.set_latency("PushKill", 30.0)
     started = ctx.clock.time()
     result = m.kill_flag("search-v2", "oncall")
     elapsed = ctx.clock.time() - started
-    assert elapsed <= 2.0, f"with the relay hung, kill_flag held the operator for {elapsed:.1f} s: the push needs a 1-second deadline"
+    assert elapsed <= 1.5, f"with the relay hung, kill_flag held the operator for {elapsed:.1f} s: the push needs one attempt under a 1-second deadline"
+    pushes = len(ctx.grpc.calls_to("PushKill"))
+    assert pushes == 2, f"two kills made {pushes} PushKill calls: a push that timed out was retried in place, the retrier owns it"
     assert _killed("search-v2"), f"after a kill whose push timed out, search-v2 evaluates to {engine.evaluate('search-v2', USER)}: the kill must be in the snapshot"
+    assert result.get("status") == "pending", f"the push timed out (DEADLINE_EXCEEDED) and kill_flag answered {result}, expected status pending"
+    rows = [json.loads(row) for row in ctx.redis.lrange("flags:push:pending", 0, -1)]
+    assert rows == [{"flag_key": "search-v2", "version": 6, "actor": "oncall"}], f"after the timed-out push flags:push:pending holds {rows}, expected the search-v2 version 6 row: a deadline is a failed push too"
 
 
 def check_commit_first(ctx):
@@ -672,6 +677,13 @@ def check_pending(ctx):
     result = m.kill_flag("search-v2", "oncall")
     assert result.get("status") == "pushed", f"with the relay back kill_flag answered {result}"
     assert len(ctx.redis.lrange("flags:push:pending", 0, -1)) == 1, "a push that landed must not add a pending row"
+    # Any status is a failed push, not only the transient ones; rows queue in order for the retrier.
+    for code, version in ((grpc.StatusCode.PERMISSION_DENIED, 7), (grpc.StatusCode.INTERNAL, 8)):
+        ctx.grpc.fail("PushKill", code, "relay refused", times=1)
+        result = m.kill_flag("checkout", "oncall")
+        assert result.get("status") == "pending" and result.get("version") == version, f"the PushKill failed {code.name} and kill_flag answered {result}: every failed push is queued and answered pending, expected version {version}"
+    rows = [json.loads(row)["version"] for row in ctx.redis.lrange("flags:push:pending", 0, -1)]
+    assert rows == [5, 7, 8], f"flags:push:pending holds the versions {rows} in that order, expected [5, 7, 8]: the retrier reads the oldest failed push first"
 `,
     typescript: `const USER = {user_id: 'u-7'};
 const flag = (rollout: number) => ({default: false, rules: [], rollout, salt: '2026', killed: false});
@@ -701,13 +713,18 @@ export async function check_deadline(ctx) {
   const calls = ctx.grpc.callsTo('PushKill');
   assert.equal(calls.length, 1, \`one kill made \${calls.length} PushKill calls\`);
   assert(calls[0].timeout !== null, "the PushKill call carries no deadline: a relay that hangs holds the operator's kill open");
-  assert(0.5 <= calls[0].timeout && calls[0].timeout <= 1.5, \`the PushKill call carries a \${calls[0].timeout} s deadline, expected 1 s\`);
+  assert(0.8 <= calls[0].timeout && calls[0].timeout <= 1.2, \`the PushKill call carries a \${calls[0].timeout} s deadline, expected 1 s\`);
   ctx.grpc.setLatency('PushKill', 30.0);
   const started = ctx.clock.now();
   result = await m.killFlag('search-v2', 'oncall');
   const elapsed = (ctx.clock.now() - started) / 1000;
-  assert(elapsed <= 2.0, \`with the relay hung, killFlag held the operator for \${elapsed.toFixed(1)} s: the push needs a 1-second deadline\`);
+  assert(elapsed <= 1.5, \`with the relay hung, killFlag held the operator for \${elapsed.toFixed(1)} s: the push needs one attempt under a 1-second deadline\`);
+  const pushes = ctx.grpc.callsTo('PushKill').length;
+  assert.equal(pushes, 2, \`two kills made \${pushes} PushKill calls: a push that timed out was retried in place, the retrier owns it\`);
   assert(await killed('search-v2'), 'after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot');
+  assert.equal(result.status, 'pending', \`the push timed out (DEADLINE_EXCEEDED) and killFlag answered \${JSON.stringify(result)}, expected status pending\`);
+  const rows = ctx.redis.lrange('flags:push:pending', 0, -1).map(row => JSON.parse(row));
+  assert.deepStrictEqual(rows, [{flag_key: 'search-v2', version: 6, actor: 'oncall'}], \`after the timed-out push flags:push:pending holds \${JSON.stringify(rows)}, expected the search-v2 version 6 row: a deadline is a failed push too\`);
 }
 
 export async function check_commit_first(ctx) {
@@ -736,6 +753,14 @@ export async function check_pending(ctx) {
   result = await m.killFlag('search-v2', 'oncall');
   assert.equal(result.status, 'pushed', \`with the relay back killFlag answered \${JSON.stringify(result)}\`);
   assert.equal(ctx.redis.lrange('flags:push:pending', 0, -1).length, 1, 'a push that landed must not add a pending row');
+  // Any status is a failed push, not only the transient ones; rows queue in order for the retrier.
+  for (const [code, version] of [['PERMISSION_DENIED', 7], ['INTERNAL', 8]] as const) {
+    ctx.grpc.fail('PushKill', ctx.grpc.status[code], 'relay refused', 1);
+    result = await m.killFlag('checkout', 'oncall');
+    assert(result.status === 'pending' && result.version === version, \`the PushKill failed \${code} and killFlag answered \${JSON.stringify(result)}: every failed push is queued and answered pending, expected version \${version}\`);
+  }
+  const versions = ctx.redis.lrange('flags:push:pending', 0, -1).map(row => JSON.parse(row).version);
+  assert.deepStrictEqual(versions, [5, 7, 8], \`flags:push:pending holds the versions \${JSON.stringify(versions)} in that order, expected [5, 7, 8]: the retrier reads the oldest failed push first\`);
 }
 `,
     go: `package main
@@ -803,13 +828,18 @@ func CheckDeadline(ctx *harness.Ctx) {
 	calls := ctx.GRPC.CallsTo("PushKill", "")
 	ctx.Equal(len(calls), 1, "one kill, the PushKill calls")
 	ctx.Assert(calls[0].HasDeadline(), "the PushKill call carries no deadline: a relay that hangs holds the operator's kill open")
-	ctx.Assert(500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 1500*time.Millisecond, "the PushKill call carries a %v deadline, expected 1 s", calls[0].Timeout)
+	ctx.Assert(800*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 1200*time.Millisecond, "the PushKill call carries a %v deadline, expected 1 s", calls[0].Timeout)
 	ctx.GRPC.SetLatency("PushKill", 30.0, "")
 	started := ctx.Clock.Now()
-	killRun(ctx, "search-v2")
+	result = killRun(ctx, "search-v2")
 	elapsed := float64(ctx.Clock.Now()-started) / 1000
-	ctx.Assert(elapsed <= 2.0, "with the relay hung, killFlag held the operator for %.1f s: the push needs a 1-second deadline", elapsed)
+	ctx.Assert(elapsed <= 1.5, "with the relay hung, killFlag held the operator for %.1f s: the push needs one attempt under a 1-second deadline", elapsed)
+	ctx.Equal(len(ctx.GRPC.CallsTo("PushKill", "")), 2, "a push that timed out is the retrier's, not retried in place; the PushKill calls of two kills")
 	ctx.Assert(killIsKilled("search-v2"), "after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot")
+	ctx.Equal(result.Status, "pending", "the push timed out (DEADLINE_EXCEEDED); the status killFlag answers")
+	rows := ctx.Redis.LRange("flags:push:pending", 0, -1)
+	var row map[string]any
+	ctx.Assert(len(rows) == 1 && json.Unmarshal([]byte(rows[0]), &row) == nil && row["flag_key"] == "search-v2" && row["version"] == float64(6) && row["actor"] == "oncall", "after the timed-out push flags:push:pending holds %v, expected the search-v2 version 6 row: a deadline is a failed push too", rows)
 }
 
 func CheckCommitFirst(ctx *harness.Ctx) {
@@ -841,6 +871,23 @@ func CheckPending(ctx *harness.Ctx) {
 	ctx.Assert(killIsKilled("checkout"), "the kill must be in the snapshot even when the push failed")
 	ctx.Equal(killRun(ctx, "search-v2").Status, "pushed", "with the relay back, the status")
 	ctx.Equal(len(ctx.Redis.LRange("flags:push:pending", 0, -1)), 1, "a push that landed must not add a pending row; rows")
+	// Any status is a failed push, not only the transient ones; rows queue in order for the retrier.
+	for _, failure := range []struct {
+		code    codes.Code
+		version int64
+	}{{codes.PermissionDenied, 7}, {codes.Internal, 8}} {
+		ctx.GRPC.Fail("PushKill", failure.code, "relay refused", 1, "")
+		result = killRun(ctx, "checkout")
+		ctx.Assert(result.Status == "pending" && result.Version == failure.version, "the PushKill failed %v and killFlag answered %+v: every failed push is queued and answered pending, expected version %d", failure.code, result, failure.version)
+	}
+	var versions []float64
+	for _, raw := range ctx.Redis.LRange("flags:push:pending", 0, -1) {
+		var queued map[string]any
+		_ = json.Unmarshal([]byte(raw), &queued)
+		v, _ := queued["version"].(float64)
+		versions = append(versions, v)
+	}
+	ctx.Equal(versions, []float64{5, 7, 8}, "the retrier reads the oldest failed push first; the versions in flags:push:pending, in order")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -906,13 +953,17 @@ void CheckDeadline(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("PushKill");
   ctx.Equal(calls.size(), 1, "one kill, the PushKill calls");
   ctx.Assert(calls[0].HasDeadline(), "the PushKill call carries no deadline: a relay that hangs holds the operator's kill open");
-  ctx.Assert(0.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 1.5, "the PushKill call carries a %v s deadline, expected 1 s", calls[0].TimeoutSeconds());
+  ctx.Assert(0.8 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 1.2, "the PushKill call carries a %v s deadline, expected 1 s", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("PushKill", 30.0);
   const int64_t started = ctx.Clock.Now();
-  killRun(ctx, "search-v2");
+  const auto hung = killRun(ctx, "search-v2");
   const double elapsed = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  ctx.Assert(elapsed <= 2.0, "with the relay hung, killFlag held the operator for %v s: the push needs a 1-second deadline", elapsed);
+  ctx.Assert(elapsed <= 1.5, "with the relay hung, killFlag held the operator for %v s: the push needs one attempt under a 1-second deadline", elapsed);
+  ctx.Equal(ctx.GRPC.CallsTo("PushKill").size(), 2, "a push that timed out is the retrier's, not retried in place; the PushKill calls of two kills");
   ctx.Assert(killIsKilled("search-v2"), "after a kill whose push timed out, search-v2 must evaluate as killed: the kill must be in the snapshot");
+  ctx.Equal(hung.value("status", ""), "pending", "the push timed out (DEADLINE_EXCEEDED); the status killFlag answers");
+  const auto rows = ctx.Redis.LRange("flags:push:pending", 0, -1);
+  ctx.Assert(rows.size() == 1 && nlohmann::json::parse(rows[0], nullptr, false) == nlohmann::json{{"flag_key", "search-v2"}, {"version", 6}, {"actor", "oncall"}}, "after the timed-out push flags:push:pending holds %v, expected the search-v2 version 6 row: a deadline is a failed push too", rows);
 }
 
 void CheckCommitFirst(harness::Ctx& ctx) {
@@ -940,6 +991,19 @@ void CheckPending(harness::Ctx& ctx) {
   ctx.Assert(killIsKilled("checkout"), "the kill must be in the snapshot even when the push failed");
   ctx.Equal(killRun(ctx, "search-v2").value("status", ""), "pushed", "with the relay back, the status");
   ctx.Equal(ctx.Redis.LRange("flags:push:pending", 0, -1).size(), 1, "a push that landed must not add a pending row; rows");
+  // Any status is a failed push, not only the transient ones; rows queue in order for the retrier.
+  const std::vector<std::pair<grpc::StatusCode, long long>> failures = {{grpc::StatusCode::PERMISSION_DENIED, 7}, {grpc::StatusCode::INTERNAL, 8}};
+  for (const auto& [code, version] : failures) {
+    ctx.GRPC.Fail("PushKill", code, "relay refused", 1);
+    const auto refused = killRun(ctx, "checkout");
+    ctx.Assert(refused.value("status", "") == "pending" && refused.value("version", 0LL) == version, "the PushKill failed with status %d and killFlag answered %s: every failed push is queued and answered pending, expected version %d", static_cast<int>(code), refused.dump(), version);
+  }
+  std::vector<long long> versions;
+  for (const auto& raw : ctx.Redis.LRange("flags:push:pending", 0, -1)) {
+    const auto queued = nlohmann::json::parse(raw, nullptr, false);
+    versions.push_back(queued.is_object() ? queued.value("version", 0LL) : 0LL);
+  }
+  ctx.Equal(versions, std::vector<long long>{5, 7, 8}, "the retrier reads the oldest failed push first; the versions in flags:push:pending, in order");
 }
 `,
   },

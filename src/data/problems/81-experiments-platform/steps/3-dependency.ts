@@ -19,12 +19,14 @@ holds every ramp request open, a stats outage ramps without a check, a breached 
 but leaves the experiment running for the next scheduled ramp, and \`skip_guardrails\` in the body
 bypasses the check.
 
-- Every \`CheckGuardrails\` call carries a **2-second** deadline (\`GUARDRAIL_DEADLINE_S\`).
-- No verdict is not a pass: an error status (deadline, unavailable) answers **503** and moves nothing.
+- Every \`CheckGuardrails\` call carries a **2-second** deadline (\`GUARDRAIL_DEADLINE_S\`) of its own.
+- No verdict is not a pass: any error status (deadline, unavailable, internal, …) answers **503** and
+  moves nothing.
 - A breach pauses: \`store.set_status(id, "paused")\`, no traffic change, **409**
   \`{"status": "paused", "metric", "limit", "observed"}\`. A clean verdict sets the percentage and
   \`running\` again.
-- A body naming any of \`OVERRIDE_FIELDS\` (\`skip_guardrails\`, \`override\`, \`force\`) is **400**.`,
+- A body naming any of \`OVERRIDE_FIELDS\` (\`skip_guardrails\`, \`override\`, \`force\`), whatever the
+  value, is **400** before the check is called.`,
   sequence: {
     participants: ['Ramp scheduler', 'Experiment API', 'Stats service', 'experiment store'],
     messages: [
@@ -66,7 +68,7 @@ bypasses the check.
       id: 'deadline',
       title: 'CheckGuardrails carries a 2-second deadline',
       detail:
-        'Every guardrail call is made with a deadline of `GUARDRAIL_DEADLINE_S` (2 s); the starter sets none, so a stats service that hangs holds the ramp request for as long as it hangs.',
+        'Every guardrail call is made with a full deadline of `GUARDRAIL_DEADLINE_S` (2 s), set per request; the starter sets none, so a stats service that hangs holds the ramp request for as long as it hangs.',
       match: {
         python: {all: [/CheckGuardrails\([\s\S]{0,200}?timeout\s*=/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
@@ -79,7 +81,7 @@ bypasses the check.
       id: 'fail-closed',
       title: 'No verdict answers 503 and moves nothing',
       detail:
-        'A `CheckGuardrails` error (deadline, unavailable) answers **503** and leaves the percentage; the starter logs it and ramps as if the check had passed.',
+        'Any `CheckGuardrails` error status (deadline, unavailable, internal, permission denied, resource exhausted) answers **503** and leaves the percentage; the starter logs it and ramps as if the check had passed.',
       match: {
         python: {all: [/\b503\b/], none: [/verdict\s*=\s*None/]},
         typescript: {all: [/\b503\b/], none: [/verdict\s*=\s*null/]},
@@ -105,7 +107,7 @@ bypasses the check.
       id: 'no-override',
       title: 'The body cannot switch the check off',
       detail:
-        'A body naming any of `OVERRIDE_FIELDS` (`skip_guardrails`, `override`, `force`) answers **400** before anything else happens.',
+        'A body naming any of `OVERRIDE_FIELDS` (`skip_guardrails`, `override`, `force`), even set to `false`, answers **400** before anything else happens: no guardrail call, no change to the experiment.',
       match: {
         python: {all: [/OVERRIDE_FIELDS/], none: [/\.get\(\s*["']skip_guardrails["']\s*\)/]},
         typescript: {all: [/OVERRIDE_FIELDS/], none: [/body\.skip_guardrails/]},
@@ -682,12 +684,15 @@ SPLIT = [{"key": "control", "weight": 50}, {"key": "treatment", "weight": 50}]
 
 
 class Stats(experiments_platform_pb2_grpc.GuardrailsServicer):
-    """Clean verdicts unless breach holds (metric, limit, observed)."""
+    """Clean verdicts unless breach holds (metric, limit, observed); every call fails with code when it is set."""
 
     def __init__(self):
         self.breach = None
+        self.code = None
 
     def CheckGuardrails(self, request, context):
+        if self.code is not None:
+            context.abort(self.code, "stats cannot answer")
         if self.breach is None:
             return experiments_platform_pb2.GuardrailVerdict(breached=False)
         metric, limit, observed = self.breach
@@ -711,21 +716,33 @@ async def check_deadline(ctx):
     async with c:
         r = await _ramp(c, e, {"to_percent": 25})
         assert r.status_code == 200, f"a ramp to 25 % with clean guardrails answered {r.status_code}: {r.text}"
-        calls = ctx.grpc.calls_to("CheckGuardrails")
-        assert calls, "the ramp made no CheckGuardrails call"
-        timeout = calls[-1].timeout
-        assert timeout is not None, "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open"
-        assert 1.5 <= timeout <= 2.5, f"the CheckGuardrails call carries a {timeout} s deadline, expected GUARDRAIL_DEADLINE_S = 2"
+        for to_percent in (25, 30):
+            if to_percent == 30:
+                # Later requests get a full deadline of their own, not what is left of one set earlier.
+                ctx.clock.advance(10)
+                r = await _ramp(c, e, {"to_percent": 30})
+                assert r.status_code == 200, f"a ramp to 30 % with clean guardrails, 10 s after the first, answered {r.status_code}: {r.text}"
+            calls = ctx.grpc.calls_to("CheckGuardrails")
+            assert calls, "the ramp made no CheckGuardrails call"
+            timeout = calls[-1].timeout
+            assert timeout is not None, "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open"
+            assert 1.9 <= timeout <= 2.05, f"the CheckGuardrails call of the ramp to {to_percent} % carries a {timeout} s deadline, expected GUARDRAIL_DEADLINE_S = 2"
         ctx.grpc.set_latency("CheckGuardrails", 30.0)
         r = await _ramp(c, e, {"to_percent": 50})
     assert r.status_code == 503, f"with the stats service answering after 30 s the ramp answered {r.status_code} {r.text}, expected 503"
-    assert store.get(e)["percent"] == 25, f"a ramp whose guardrail check timed out moved the traffic to {store.get(e)['percent']} %"
+    assert store.get(e)["percent"] == 30, f"a ramp whose guardrail check timed out moved the traffic to {store.get(e)['percent']} %"
 
 
 async def check_fail_closed(ctx):
-    c, _, e = _setup(ctx)
-    ctx.grpc.fail("CheckGuardrails", grpc.StatusCode.UNAVAILABLE, "stats is down", times=5)
+    c, stats, e = _setup(ctx)
     async with c:
+        for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED):
+            stats.code = code
+            r = await _ramp(c, e, {"to_percent": 50})
+            assert r.status_code == 503, f"with CheckGuardrails answering {code.name} the ramp answered {r.status_code} {r.text}, expected 503: any error status is no verdict"
+            assert store.get(e)["percent"] == 10, f"a ramp whose guardrail check answered {code.name} moved the traffic to {store.get(e)['percent']} %"
+        stats.code = None
+        ctx.grpc.fail("CheckGuardrails", grpc.StatusCode.UNAVAILABLE, "stats is down", times=5)
         r = await _ramp(c, e, {"to_percent": 50})
     assert r.status_code == 503, f"with the stats service unavailable the ramp answered {r.status_code} {r.text}, expected 503: no verdict is not a pass"
     assert store.get(e)["percent"] == 10, f"a ramp without a guardrail verdict moved the traffic to {store.get(e)['percent']} %"
@@ -754,10 +771,12 @@ async def check_no_override(ctx):
     c, stats, e = _setup(ctx)
     stats.breach = ("latency_p99_ms", 800.0, 1450.0)
     async with c:
-        for flag in ("skip_guardrails", "override", "force"):
-            r = await _ramp(c, e, {"to_percent": 50, flag: True})
-            assert r.status_code == 400, f"a ramp with {flag} in the body answered {r.status_code} {r.text}, expected 400: the body cannot switch the check off"
-    assert store.get(e)["percent"] == 10, f"an override moved the traffic to {store.get(e)['percent']} % while latency is breached"
+        for body in ({"skip_guardrails": True}, {"override": True}, {"force": True}, {"skip_guardrails": False}, {"force": None}):
+            r = await _ramp(c, e, {"to_percent": 50, **body})
+            assert r.status_code == 400, f"a ramp with {body} in the body answered {r.status_code} {r.text}, expected 400: a body naming an override field is refused, whatever its value"
+    assert not ctx.grpc.calls_to("CheckGuardrails"), "a ramp naming an override field called CheckGuardrails: it is refused before anything else happens"
+    stored = store.get(e)
+    assert stored["percent"] == 10 and stored["status"] == "running", f"an override changed the experiment while latency is breached: {stored}"
 `,
     typescript: `const SPLIT = [
   {key: 'control', weight: 50},
@@ -766,9 +785,10 @@ async def check_no_override(ctx):
 
 async function setup(ctx) {
   const pkg = ctx.proto('experiments_platform.proto');
-  const stats: {breach: null | {metric: string; limit: number; observed: number}} = {breach: null};
+  const stats: {breach: null | {metric: string; limit: number; observed: number}; code: null | number} = {breach: null, code: null};
   ctx.grpc.serve(pkg.expguard.Guardrails.service, {
     CheckGuardrails(_call, callback) {
+      if (stats.code !== null) return callback({code: stats.code, details: 'stats cannot answer'});
       callback(null, stats.breach === null ? {breached: false} : {breached: true, ...stats.breach});
     },
   });
@@ -784,19 +804,34 @@ export async function check_deadline(ctx) {
   const {store, e, ramp} = await setup(ctx);
   let r = await ramp({to_percent: 25});
   assert.equal(r.status, 200, \`a ramp to 25 % with clean guardrails answered \${r.status}: \${r.text}\`);
-  const calls = ctx.grpc.callsTo('CheckGuardrails');
-  assert(calls.length > 0, 'the ramp made no CheckGuardrails call');
-  const timeout = calls[calls.length - 1].timeout;
-  assert(timeout !== null && timeout !== undefined, 'the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open');
-  assert(1.5 <= timeout && timeout <= 2.5, \`the CheckGuardrails call carries a \${timeout} s deadline, expected GUARDRAIL_DEADLINE_MS = 2000\`);
+  for (const toPercent of [25, 30]) {
+    if (toPercent === 30) {
+      // Later requests get a full deadline of their own, not what is left of one set earlier.
+      ctx.clock.advance(10);
+      r = await ramp({to_percent: 30});
+      assert.equal(r.status, 200, \`a ramp to 30 % with clean guardrails, 10 s after the first, answered \${r.status}: \${r.text}\`);
+    }
+    const calls = ctx.grpc.callsTo('CheckGuardrails');
+    assert(calls.length > 0, 'the ramp made no CheckGuardrails call');
+    const timeout = calls[calls.length - 1].timeout;
+    assert(timeout !== null && timeout !== undefined, 'the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open');
+    assert(1.9 <= timeout && timeout <= 2.05, \`the CheckGuardrails call of the ramp to \${toPercent} % carries a \${timeout} s deadline, expected GUARDRAIL_DEADLINE_MS = 2000\`);
+  }
   ctx.grpc.setLatency('CheckGuardrails', 30.0);
   r = await ramp({to_percent: 50});
   assert.equal(r.status, 503, \`with the stats service answering after 30 s the ramp answered \${r.status} \${r.text}, expected 503\`);
-  assert.equal((await store.get(e)).percent, 25, 'a ramp whose guardrail check timed out moved the traffic');
+  assert.equal((await store.get(e)).percent, 30, 'a ramp whose guardrail check timed out moved the traffic');
 }
 
 export async function check_fail_closed(ctx) {
-  const {store, e, ramp} = await setup(ctx);
+  const {store, stats, e, ramp} = await setup(ctx);
+  for (const name of ['INTERNAL', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED']) {
+    stats.code = ctx.grpc.status[name];
+    const r = await ramp({to_percent: 50});
+    assert.equal(r.status, 503, \`with CheckGuardrails answering \${name} the ramp answered \${r.status} \${r.text}, expected 503: any error status is no verdict\`);
+    assert.equal((await store.get(e)).percent, 10, \`a ramp whose guardrail check answered \${name} moved the traffic\`);
+  }
+  stats.code = null;
   ctx.grpc.fail('CheckGuardrails', ctx.grpc.status.UNAVAILABLE, 'stats is down', 5);
   const r = await ramp({to_percent: 50});
   assert.equal(r.status, 503, \`with the stats service unavailable the ramp answered \${r.status} \${r.text}, expected 503: no verdict is not a pass\`);
@@ -824,11 +859,13 @@ export async function check_pause_on_breach(ctx) {
 export async function check_no_override(ctx) {
   const {store, stats, e, ramp} = await setup(ctx);
   stats.breach = {metric: 'latency_p99_ms', limit: 800, observed: 1450};
-  for (const flag of ['skip_guardrails', 'override', 'force']) {
-    const r = await ramp({to_percent: 50, [flag]: true});
-    assert.equal(r.status, 400, \`a ramp with \${flag} in the body answered \${r.status} \${r.text}, expected 400: the body cannot switch the check off\`);
+  for (const extra of [{skip_guardrails: true}, {override: true}, {force: true}, {skip_guardrails: false}, {force: null}]) {
+    const r = await ramp({to_percent: 50, ...extra});
+    assert.equal(r.status, 400, \`a ramp with \${JSON.stringify(extra)} in the body answered \${r.status} \${r.text}, expected 400: a body naming an override field is refused, whatever its value\`);
   }
-  assert.equal((await store.get(e)).percent, 10, 'an override moved the traffic while latency is breached');
+  assert.equal(ctx.grpc.callsTo('CheckGuardrails').length, 0, 'a ramp naming an override field called CheckGuardrails: it is refused before anything else happens');
+  const stored = await store.get(e);
+  assert(stored.percent === 10 && stored.status === 'running', \`an override changed the experiment while latency is breached: \${JSON.stringify(stored)}\`);
 }
 `,
     go: `package main
@@ -840,6 +877,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "expd/gen/experiments_platform"
 	"expd/store"
@@ -847,85 +885,110 @@ import (
 	"leetbuild/harness"
 )
 
-var rampBg = context.Background()
+var hRampBg = context.Background()
 
-// statsPeer answers clean verdicts unless breach is set.
-type statsPeer struct {
+// hStatsPeer answers clean verdicts unless breach is set; every call fails with code when it is not OK.
+type hStatsPeer struct {
 	pb.UnimplementedGuardrailsServer
 	breach *pb.GuardrailVerdict
+	code   codes.Code
 }
 
-func (s *statsPeer) CheckGuardrails(_ context.Context, _ *pb.GuardrailRequest) (*pb.GuardrailVerdict, error) {
+func (s *hStatsPeer) CheckGuardrails(_ context.Context, _ *pb.GuardrailRequest) (*pb.GuardrailVerdict, error) {
+	if s.code != codes.OK {
+		return nil, status.Error(s.code, "stats cannot answer")
+	}
 	if s.breach != nil {
 		return s.breach, nil
 	}
 	return &pb.GuardrailVerdict{}, nil
 }
 
-func setup(ctx *harness.Ctx) (*harness.HTTP, *statsPeer, string) {
-	peer := &statsPeer{}
+func hSetup(ctx *harness.Ctx) (*harness.HTTP, *hStatsPeer, string) {
+	peer := &hStatsPeer{}
 	pb.RegisterGuardrailsServer(ctx.GRPC.Server(""), peer)
-	e := store.Create(rampBg, store.Design{Name: "cta", Unit: "user", Variants: []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}, MinSample: 1000, Salt: "s-1"}).ID
-	store.SetPercent(rampBg, e, 10)
+	e := store.Create(hRampBg, store.Design{Name: "cta", Unit: "user", Variants: []store.Variant{{Key: "control", Weight: 50}, {Key: "treatment", Weight: 50}}, MinSample: 1000, Salt: "s-1"}).ID
+	store.SetPercent(hRampBg, e, 10)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux), peer, e
 }
 
-func rampTo(c *harness.HTTP, e string, body map[string]any) *harness.Response {
+func hRampTo(c *harness.HTTP, e string, body map[string]any) *harness.Response {
 	return c.Post("/v1/experiments/"+e+"/ramp", body)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	c, _, e := setup(ctx)
-	r := rampTo(c, e, map[string]any{"to_percent": 25})
+	c, _, e := hSetup(ctx)
+	r := hRampTo(c, e, map[string]any{"to_percent": 25})
 	ctx.Equal(r.Status, 200, "a ramp to 25 %% with clean guardrails (%s)", r.Text())
-	calls := ctx.GRPC.CallsTo("CheckGuardrails", "")
-	ctx.Assert(len(calls) > 0, "the ramp made no CheckGuardrails call")
-	call := calls[len(calls)-1]
-	ctx.Assert(call.HasDeadline(), "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open")
-	ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "the CheckGuardrails call carries a %v deadline, expected 2 s", call.Timeout)
+	for _, toPercent := range []int{25, 30} {
+		if toPercent == 30 {
+			// Later requests get a full deadline of their own, not what is left of one set earlier.
+			ctx.Clock.Advance(10)
+			r = hRampTo(c, e, map[string]any{"to_percent": 30})
+			ctx.Equal(r.Status, 200, "a ramp to 30 %% with clean guardrails, 10 s after the first (%s)", r.Text())
+		}
+		calls := ctx.GRPC.CallsTo("CheckGuardrails", "")
+		ctx.Assert(len(calls) > 0, "the ramp made no CheckGuardrails call")
+		call := calls[len(calls)-1]
+		ctx.Assert(call.HasDeadline(), "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open")
+		ctx.Assert(1900*time.Millisecond <= call.Timeout && call.Timeout <= 2050*time.Millisecond, "the CheckGuardrails call of the ramp to %d %% carries a %v deadline, expected 2 s", toPercent, call.Timeout)
+	}
 	ctx.GRPC.SetLatency("CheckGuardrails", 30.0, "")
-	r = rampTo(c, e, map[string]any{"to_percent": 50})
+	r = hRampTo(c, e, map[string]any{"to_percent": 50})
 	ctx.Equal(r.Status, 503, "with the stats service answering after 30 s the ramp (%s)", r.Text())
-	ctx.Equal(store.Get(rampBg, e).Percent, 25, "a ramp whose guardrail check timed out must not move the traffic; the percent")
+	ctx.Equal(store.Get(hRampBg, e).Percent, 30, "a ramp whose guardrail check timed out must not move the traffic; the percent")
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	c, _, e := setup(ctx)
+	c, peer, e := hSetup(ctx)
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.ResourceExhausted} {
+		peer.code = code
+		r := hRampTo(c, e, map[string]any{"to_percent": 50})
+		ctx.Assert(r.Status == 503, "with CheckGuardrails answering %v the ramp answered %d %s, expected 503: any error status is no verdict", code, r.Status, r.Text())
+		ctx.Equal(store.Get(hRampBg, e).Percent, 10, "a ramp whose guardrail check answered %v must not move the traffic; the percent", code)
+	}
+	peer.code = codes.OK
 	ctx.GRPC.Fail("CheckGuardrails", codes.Unavailable, "stats is down", 5, "")
-	r := rampTo(c, e, map[string]any{"to_percent": 50})
+	r := hRampTo(c, e, map[string]any{"to_percent": 50})
 	ctx.Assert(r.Status == 503, "with the stats service unavailable the ramp answered %d %s, expected 503: no verdict is not a pass", r.Status, r.Text())
-	ctx.Equal(store.Get(rampBg, e).Percent, 10, "a ramp without a guardrail verdict must not move the traffic; the percent")
+	ctx.Equal(store.Get(hRampBg, e).Percent, 10, "a ramp without a guardrail verdict must not move the traffic; the percent")
 }
 
 func CheckPauseOnBreach(ctx *harness.Ctx) {
-	c, peer, e := setup(ctx)
+	c, peer, e := hSetup(ctx)
 	peer.breach = &pb.GuardrailVerdict{Breached: true, Metric: "error_rate", Limit: 0.05, Observed: 0.12}
-	r := rampTo(c, e, map[string]any{"to_percent": 50})
+	r := hRampTo(c, e, map[string]any{"to_percent": 50})
 	ctx.Equal(r.Status, 409, "with error_rate breached the ramp (%s)", r.Text())
 	var body map[string]any
 	r.Decode(&body)
 	ctx.Assert(body["status"] == "paused" && body["metric"] == "error_rate", "the 409 must say paused and name the metric, got %s", r.Text())
 	ctx.Assert(body["limit"] == 0.05 && body["observed"] == 0.12, "the 409 must carry the limit and the observed value, got %s", r.Text())
-	stored := store.Get(rampBg, e)
+	stored := store.Get(hRampBg, e)
 	ctx.Assert(stored.Status == "paused", "after a breach the experiment is %q: the pause must be written, or the next scheduled ramp tries again", stored.Status)
 	ctx.Equal(stored.Percent, 10, "a breached ramp must not move the traffic; the percent")
 	peer.breach = nil
-	r = rampTo(c, e, map[string]any{"to_percent": 50})
+	r = hRampTo(c, e, map[string]any{"to_percent": 50})
 	ctx.Equal(r.Status, 200, "once the guardrails are clean the ramp (%s)", r.Text())
-	stored = store.Get(rampBg, e)
+	stored = store.Get(hRampBg, e)
 	ctx.Assert(stored.Percent == 50 && stored.Status == "running", "a clean ramp must set 50 %% and running, the store holds %+v", stored)
 }
 
 func CheckNoOverride(ctx *harness.Ctx) {
-	c, peer, e := setup(ctx)
+	c, peer, e := hSetup(ctx)
 	peer.breach = &pb.GuardrailVerdict{Breached: true, Metric: "latency_p99_ms", Limit: 800, Observed: 1450}
-	for _, flag := range []string{"skip_guardrails", "override", "force"} {
-		r := rampTo(c, e, map[string]any{"to_percent": 50, flag: true})
-		ctx.Assert(r.Status == 400, "a ramp with %s in the body answered %d %s, expected 400: the body cannot switch the check off", flag, r.Status, strings.TrimSpace(r.Text()))
+	for _, extra := range []map[string]any{{"skip_guardrails": true}, {"override": true}, {"force": true}, {"skip_guardrails": false}, {"force": nil}} {
+		body := map[string]any{"to_percent": 50}
+		for k, v := range extra {
+			body[k] = v
+		}
+		r := hRampTo(c, e, body)
+		ctx.Assert(r.Status == 400, "a ramp with %v in the body answered %d %s, expected 400: a body naming an override field is refused, whatever its value", extra, r.Status, strings.TrimSpace(r.Text()))
 	}
-	ctx.Equal(store.Get(rampBg, e).Percent, 10, "an override must not move the traffic while latency is breached; the percent")
+	ctx.Equal(len(ctx.GRPC.CallsTo("CheckGuardrails", "")), 0, "a ramp naming an override field must be refused before anything else happens; the CheckGuardrails calls")
+	stored := store.Get(hRampBg, e)
+	ctx.Assert(stored.Percent == 10 && stored.Status == "running", "an override changed the experiment while latency is breached: %+v", stored)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -934,23 +997,27 @@ func CheckNoOverride(ctx *harness.Ctx) {
 
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "experiments_platform.grpc.pb.h"
 #include "expd/store.h"
 
 namespace {
 
-// Clean verdicts unless breach is set.
-class StatsPeer final : public expguard::Guardrails::Service {
+// Clean verdicts unless breach is set; every call fails with code when it is not OK.
+class HStatsPeer final : public expguard::Guardrails::Service {
  public:
   std::optional<expguard::GuardrailVerdict> breach;
+  grpc::StatusCode code = grpc::StatusCode::OK;
   grpc::Status CheckGuardrails(grpc::ServerContext*, const expguard::GuardrailRequest*, expguard::GuardrailVerdict* out) override {
+    if (code != grpc::StatusCode::OK) return grpc::Status(code, "stats cannot answer");
     if (breach) *out = *breach;
     return grpc::Status::OK;
   }
 };
 
-expguard::GuardrailVerdict breached(const std::string& metric, double limit, double observed) {
+expguard::GuardrailVerdict hBreached(const std::string& metric, double limit, double observed) {
   expguard::GuardrailVerdict v;
   v.set_breached(true);
   v.set_metric(metric);
@@ -959,60 +1026,77 @@ expguard::GuardrailVerdict breached(const std::string& metric, double limit, dou
   return v;
 }
 
-struct World {
-  StatsPeer stats;
+struct HWorld {
+  HStatsPeer stats;
   httplib::Server svr;
 };
 
-struct Setup {
+struct HSetup {
   harness::HTTP c;
-  StatsPeer& stats;
+  HStatsPeer& stats;
   std::string e;
 };
 
-Setup setup(harness::Ctx& ctx) {
-  static World* world = nullptr;
+HSetup hSetup(harness::Ctx& ctx) {
+  static HWorld* world = nullptr;
   delete world;
-  world = new World;
+  world = new HWorld;
   ctx.GRPC.Server("")->RegisterService(&world->stats);
   const std::string e = store::create(store::Design{"cta", "user", {{"control", 50}, {"treatment", 50}}, 1000, "s-1"}).id;
   store::setPercent(e, 10);
   register_routes(world->svr);
-  return Setup{ctx.HTTP(world->svr), world->stats, e};
+  return HSetup{ctx.HTTP(world->svr), world->stats, e};
 }
 
-harness::Response rampTo(Setup& s, const nlohmann::json& body) {
+harness::Response hRampTo(HSetup& s, const nlohmann::json& body) {
   return s.c.Post("/v1/experiments/" + s.e + "/ramp", body.dump(), "Content-Type", "application/json");
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  Setup s = setup(ctx);
-  auto r = rampTo(s, {{"to_percent", 25}});
+  HSetup s = hSetup(ctx);
+  auto r = hRampTo(s, {{"to_percent", 25}});
   ctx.Equal(r.Status, 200, "a ramp to 25 %% with clean guardrails (%s)", r.Text());
-  const auto calls = ctx.GRPC.CallsTo("CheckGuardrails");
-  ctx.Assert(!calls.empty(), "the ramp made no CheckGuardrails call");
-  ctx.Assert(calls.back().HasDeadline(), "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open");
-  ctx.Assert(1.5 <= calls.back().TimeoutSeconds() && calls.back().TimeoutSeconds() <= 2.5, "the CheckGuardrails call carries a %v s deadline, expected kGuardrailDeadline = 2 s", calls.back().TimeoutSeconds());
+  for (const int to_percent : {25, 30}) {
+    if (to_percent == 30) {
+      // Later requests get a full deadline of their own, not what is left of one set earlier.
+      ctx.Clock.Advance(10);
+      r = hRampTo(s, {{"to_percent", 30}});
+      ctx.Equal(r.Status, 200, "a ramp to 30 %% with clean guardrails, 10 s after the first (%s)", r.Text());
+    }
+    const auto calls = ctx.GRPC.CallsTo("CheckGuardrails");
+    ctx.Assert(!calls.empty(), "the ramp made no CheckGuardrails call");
+    ctx.Assert(calls.back().HasDeadline(), "the CheckGuardrails call carries no deadline: a stats service that hangs holds every ramp request open");
+    ctx.Assert(1.9 <= calls.back().TimeoutSeconds() && calls.back().TimeoutSeconds() <= 2.05, "the CheckGuardrails call of the ramp to %d %% carries a %v s deadline, expected kGuardrailDeadline = 2 s", to_percent, calls.back().TimeoutSeconds());
+  }
   ctx.GRPC.SetLatency("CheckGuardrails", 30.0);
-  r = rampTo(s, {{"to_percent", 50}});
+  r = hRampTo(s, {{"to_percent", 50}});
   ctx.Equal(r.Status, 503, "with the stats service answering after 30 s the ramp (%s)", r.Text());
-  ctx.Equal(store::get(s.e)->percent, 25, "a ramp whose guardrail check timed out must not move the traffic; the percent");
+  ctx.Equal(store::get(s.e)->percent, 30, "a ramp whose guardrail check timed out must not move the traffic; the percent");
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  Setup s = setup(ctx);
+  HSetup s = hSetup(ctx);
+  const std::vector<std::pair<grpc::StatusCode, std::string>> codes = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}};
+  for (const auto& [code, name] : codes) {
+    s.stats.code = code;
+    const auto r = hRampTo(s, {{"to_percent", 50}});
+    ctx.Assert(r.Status == 503, "with CheckGuardrails answering %s the ramp answered %d %s, expected 503: any error status is no verdict", name, r.Status, r.Text());
+    ctx.Equal(store::get(s.e)->percent, 10, "a ramp whose guardrail check answered %s must not move the traffic; the percent", name);
+  }
+  s.stats.code = grpc::StatusCode::OK;
   ctx.GRPC.Fail("CheckGuardrails", grpc::StatusCode::UNAVAILABLE, "stats is down", 5);
-  const auto r = rampTo(s, {{"to_percent", 50}});
+  const auto r = hRampTo(s, {{"to_percent", 50}});
   ctx.Assert(r.Status == 503, "with the stats service unavailable the ramp answered %d %s, expected 503: no verdict is not a pass", r.Status, r.Text());
   ctx.Equal(store::get(s.e)->percent, 10, "a ramp without a guardrail verdict must not move the traffic; the percent");
 }
 
 void CheckPauseOnBreach(harness::Ctx& ctx) {
-  Setup s = setup(ctx);
-  s.stats.breach = breached("error_rate", 0.05, 0.12);
-  auto r = rampTo(s, {{"to_percent", 50}});
+  HSetup s = hSetup(ctx);
+  s.stats.breach = hBreached("error_rate", 0.05, 0.12);
+  auto r = hRampTo(s, {{"to_percent", 50}});
   ctx.Equal(r.Status, 409, "with error_rate breached the ramp (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.value("status", "") == "paused" && body.value("metric", "") == "error_rate", "the 409 must say paused and name the metric, got %s", r.Text());
@@ -1021,20 +1105,25 @@ void CheckPauseOnBreach(harness::Ctx& ctx) {
   ctx.Assert(stored->status == "paused", "after a breach the experiment is %q: the pause must be written, or the next scheduled ramp tries again", stored->status);
   ctx.Equal(stored->percent, 10, "a breached ramp must not move the traffic; the percent");
   s.stats.breach.reset();
-  r = rampTo(s, {{"to_percent", 50}});
+  r = hRampTo(s, {{"to_percent", 50}});
   ctx.Equal(r.Status, 200, "once the guardrails are clean the ramp (%s)", r.Text());
   stored = store::get(s.e);
   ctx.Assert(stored->percent == 50 && stored->status == "running", "a clean ramp must set 50 %% and running, the store holds %s", store::toJson(*stored).dump());
 }
 
 void CheckNoOverride(harness::Ctx& ctx) {
-  Setup s = setup(ctx);
-  s.stats.breach = breached("latency_p99_ms", 800, 1450);
-  for (const std::string flag : {"skip_guardrails", "override", "force"}) {
-    const auto r = rampTo(s, {{"to_percent", 50}, {flag, true}});
-    ctx.Assert(r.Status == 400, "a ramp with %s in the body answered %d %s, expected 400: the body cannot switch the check off", flag, r.Status, r.Text());
+  HSetup s = hSetup(ctx);
+  s.stats.breach = hBreached("latency_p99_ms", 800, 1450);
+  const std::vector<nlohmann::json> extras = {{{"skip_guardrails", true}}, {{"override", true}}, {{"force", true}}, {{"skip_guardrails", false}}, {{"force", nullptr}}};
+  for (const auto& extra : extras) {
+    nlohmann::json body = {{"to_percent", 50}};
+    body.update(extra);
+    const auto r = hRampTo(s, body);
+    ctx.Assert(r.Status == 400, "a ramp with %s in the body answered %d %s, expected 400: a body naming an override field is refused, whatever its value", extra.dump(), r.Status, r.Text());
   }
-  ctx.Equal(store::get(s.e)->percent, 10, "an override must not move the traffic while latency is breached; the percent");
+  ctx.Assert(ctx.GRPC.CallsTo("CheckGuardrails").empty(), "a ramp naming an override field called CheckGuardrails: it is refused before anything else happens");
+  const auto stored = store::get(s.e);
+  ctx.Assert(stored->percent == 10 && stored->status == "running", "an override changed the experiment while latency is breached: %s", store::toJson(*stored).dump());
 }
 `,
   },

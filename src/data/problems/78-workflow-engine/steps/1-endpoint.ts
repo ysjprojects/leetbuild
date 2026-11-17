@@ -62,7 +62,7 @@ graph is accepted; a 70 KB input or a budget of 0 steps is stored.
       id: 'immutable',
       title: 'Keeps a published version immutable',
       detail:
-        'Re-publishing `signup` version 3 with other steps answers **409** and version 3 keeps its steps. The starter overwrites the hash, so every run pinned to version 3 changes under it.',
+        'Re-publishing `signup` version 3 with other steps, or with its steps and other edges, answers **409** and version 3 keeps its graph; publishing version 2 afterwards, never published before, is accepted. The starter overwrites the hash, so every run pinned to version 3 changes under it.',
       match: {
         python: {all: [/status_code\s*=\s*409/], order: [/definitions\.exists\(/, /definitions\.put\(/]},
         typescript: {all: [/code\(\s*409\s*\)/], order: [/definitions\.exists\(/, /definitions\.put\(/]},
@@ -88,7 +88,7 @@ graph is accepted; a 70 KB input or a budget of 0 steps is stored.
       id: 'bounds',
       title: 'Caps the input document and the step budget',
       detail:
-        'A 70 KB input answers **413**, `max_steps` 0 or 501 answers **400**, and none of them writes a run record; `max_steps` 500 with a small input is accepted. The starter stores whatever arrives.',
+        'A 70 KB input, or 40,000 `é` characters (80 KB of UTF-8), answers **413**, `max_steps` 0 or 501 answers **400**, and none of them writes a run record; `max_steps` 1 and 500, and an input of exactly 65,536 serialized bytes, are accepted. The starter stores whatever arrives.',
       match: {
         python: {all: [/MAX_INPUT_BYTES/, /\bMAX_STEPS\b/, /status_code\s*=\s*413/, /status_code\s*=\s*400/]},
         typescript: {all: [/MAX_INPUT_BYTES/, /\bMAX_STEPS\b/, /code\(\s*413\s*\)/, /code\(\s*400\s*\)/]},
@@ -727,7 +727,9 @@ void register_routes(httplib::Server& svr) {
     },
   },
   harness: {
-    python: `from workflow import definitions, runs
+    python: `import json
+
+from workflow import definitions, runs
 
 V3 = {"name": "signup", "version": 3, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]}
 V4 = {
@@ -763,9 +765,14 @@ async def check_immutable(ctx):
         r = await c.post("/v1/workflows", json=V3)
         assert r.status_code == 201, f"the first publish of signup v3 answered {r.status_code}: {r.text}"
         r = await c.post("/v1/workflows", json={**V3, "steps": ["create_account"], "edges": []})
-    assert r.status_code == 409, f"re-publishing signup v3 with other steps answered {r.status_code}, expected 409"
-    stored = definitions.get("signup", 3)["steps"]
-    assert stored == V3["steps"], f"re-publishing signup v3 rewrote it to {stored}: every run pinned to v3 now runs other steps"
+        assert r.status_code == 409, f"re-publishing signup v3 with other steps answered {r.status_code}, expected 409"
+        r = await c.post("/v1/workflows", json={**V3, "edges": []})
+        assert r.status_code == 409, f"re-publishing signup v3 with its steps but other edges answered {r.status_code}, expected 409: an existing (name, version) is never written again"
+        stored = definitions.get("signup", 3)
+        assert stored["steps"] == V3["steps"] and stored["edges"] == V3["edges"], f"re-publishing signup v3 rewrote it to {stored}: every run pinned to v3 now runs another graph"
+        r = await c.post("/v1/workflows", json={**V3, "version": 2})
+    assert r.status_code == 201, f"publishing signup v2, never published, after v3 answered {r.status_code}: only an existing (name, version) is a conflict"
+    assert definitions.get("signup", 2) is not None, "signup v2 must be stored"
 
 
 async def check_pin(ctx):
@@ -787,13 +794,20 @@ async def check_bounds(ctx):
         await c.post("/v1/workflows", json=V3)
         r = await c.post("/v1/runs", json=_run(input_doc={"blob": "x" * 70000}), headers=TENANT)
         assert r.status_code == 413, f"a 70 KB input answered {r.status_code}, expected 413 (MAX_INPUT_BYTES = 1 << 16)"
+        r = await c.post("/v1/runs", json=_run(input_doc={"name": "é" * 40000}), headers=TENANT)
+        assert r.status_code == 413, f"an input of 40000 'é' (80 KB of UTF-8) answered {r.status_code}, expected 413: the limit counts bytes, not characters"
         for budget in (0, 501):
             r = await c.post("/v1/runs", json=_run(max_steps=budget), headers=TENANT)
             assert r.status_code == 400, f"max_steps {budget} answered {r.status_code}, expected 400 (1..MAX_STEPS = 500)"
         stored = sorted(ctx.redis.keys("run:run-*"))
         assert stored == [], f"rejected requests wrote run records: {stored}"
         r = await c.post("/v1/runs", json=_run(max_steps=500), headers=TENANT)
-    assert r.status_code == 202, f"max_steps 500 with a small input answered {r.status_code}: {r.text}"
+        assert r.status_code == 202, f"max_steps 500 with a small input answered {r.status_code}: {r.text}"
+        r = await c.post("/v1/runs", json=_run(max_steps=1), headers=TENANT)
+        assert r.status_code == 202, f"max_steps 1 answered {r.status_code}, expected 202 (1..MAX_STEPS = 500)"
+        exact = {"blob": "x" * ((1 << 16) - len(json.dumps({"blob": ""})))}
+        r = await c.post("/v1/runs", json=_run(input_doc=exact), headers=TENANT)
+    assert r.status_code == 202, f"an input of exactly MAX_INPUT_BYTES (65536 bytes serialized) answered {r.status_code}, expected 202: only an input over the limit is refused"
 `,
     typescript: `const V3 = {name: 'signup', version: 3, steps: ['create_account', 'send_welcome'], edges: [['create_account', 'send_welcome']]};
 const V4 = {
@@ -834,8 +848,16 @@ export async function check_immutable(ctx) {
   assert.equal(r.status, 201, \`the first publish of signup v3 answered \${r.status}: \${r.text}\`);
   r = await c.post('/v1/workflows', {json: {...V3, steps: ['create_account'], edges: []}});
   assert.equal(r.status, 409, \`re-publishing signup v3 with other steps answered \${r.status}, expected 409\`);
-  const stored = (await definitions.get('signup', 3)).steps;
-  assert.deepStrictEqual(stored, V3.steps, \`re-publishing signup v3 rewrote it to \${JSON.stringify(stored)}: every run pinned to v3 now runs other steps\`);
+  r = await c.post('/v1/workflows', {json: {...V3, edges: []}});
+  assert.equal(r.status, 409, \`re-publishing signup v3 with its steps but other edges answered \${r.status}, expected 409: an existing (name, version) is never written again\`);
+  const stored = await definitions.get('signup', 3);
+  assert(
+    JSON.stringify(stored.steps) === JSON.stringify(V3.steps) && JSON.stringify(stored.edges) === JSON.stringify(V3.edges),
+    \`re-publishing signup v3 rewrote it to \${JSON.stringify(stored)}: every run pinned to v3 now runs another graph\`,
+  );
+  r = await c.post('/v1/workflows', {json: {...V3, version: 2}});
+  assert.equal(r.status, 201, \`publishing signup v2, never published, after v3 answered \${r.status}: only an existing (name, version) is a conflict\`);
+  assert.notEqual(await definitions.get('signup', 2), null, 'signup v2 must be stored');
 }
 
 export async function check_pin(ctx) {
@@ -860,6 +882,8 @@ export async function check_bounds(ctx) {
   await c.post('/v1/workflows', {json: V3});
   let r = await c.post('/v1/runs', {json: run(3, {blob: 'x'.repeat(70000)}), headers: TENANT});
   assert.equal(r.status, 413, \`a 70 KB input answered \${r.status}, expected 413 (MAX_INPUT_BYTES = 1 << 16)\`);
+  r = await c.post('/v1/runs', {json: run(3, {name: 'é'.repeat(40000)}), headers: TENANT});
+  assert.equal(r.status, 413, \`an input of 40000 'é' (80 KB of UTF-8) answered \${r.status}, expected 413: the limit counts bytes, not characters\`);
   for (const budget of [0, 501]) {
     r = await c.post('/v1/runs', {json: run(3, {}, budget), headers: TENANT});
     assert.equal(r.status, 400, \`max_steps \${budget} answered \${r.status}, expected 400 (1..MAX_STEPS = 500)\`);
@@ -868,6 +892,11 @@ export async function check_bounds(ctx) {
   assert.deepStrictEqual(stored, [], \`rejected requests wrote run records: \${JSON.stringify(stored)}\`);
   r = await c.post('/v1/runs', {json: run(3, {email: 'ada@example.com'}, 500), headers: TENANT});
   assert.equal(r.status, 202, \`max_steps 500 with a small input answered \${r.status}: \${r.text}\`);
+  r = await c.post('/v1/runs', {json: run(3, {email: 'ada@example.com'}, 1), headers: TENANT});
+  assert.equal(r.status, 202, \`max_steps 1 answered \${r.status}, expected 202 (1..MAX_STEPS = 500)\`);
+  const exact = {blob: 'x'.repeat((1 << 16) - JSON.stringify({blob: ''}).length)};
+  r = await c.post('/v1/runs', {json: run(3, exact), headers: TENANT});
+  assert.equal(r.status, 202, \`an input of exactly MAX_INPUT_BYTES (65536 bytes serialized) answered \${r.status}, expected 202: only an input over the limit is refused\`);
 }
 `,
     go: `package main
@@ -884,53 +913,62 @@ import (
 )
 
 var (
-	apiBg = context.Background()
-	v3    = map[string]any{"name": "signup", "version": 3, "steps": []string{"create_account", "send_welcome"}, "edges": [][]string{{"create_account", "send_welcome"}}}
-	v4    = map[string]any{
+	hEndpointBg = context.Background()
+	hV3         = map[string]any{"name": "signup", "version": 3, "steps": []string{"create_account", "send_welcome"}, "edges": [][]string{{"create_account", "send_welcome"}}}
+	hV4         = map[string]any{
 		"name": "signup", "version": 4, "steps": []string{"create_account", "send_welcome", "notify_sales"},
 		"edges": [][]string{{"create_account", "send_welcome"}, {"send_welcome", "notify_sales"}},
 	}
-	v3Steps = []string{"create_account", "send_welcome"}
+	hV3Steps = []string{"create_account", "send_welcome"}
+	hV3Edges = [][]string{{"create_account", "send_welcome"}}
+	hEmail   = map[string]any{"email": "ada@example.com"}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hEndpointAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func runBody(version int, input map[string]any, maxSteps int) map[string]any {
+func hRunBody(version int, input map[string]any, maxSteps int) map[string]any {
 	return map[string]any{"workflow": "signup", "version": version, "input": input, "max_steps": maxSteps}
 }
 
-var email = map[string]any{"email": "ada@example.com"}
-
 func CheckCycle(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hEndpointAPI(ctx)
 	loop := map[string]any{"name": "loop", "version": 1, "steps": []string{"a", "b", "c"}, "edges": [][]string{{"a", "b"}, {"b", "c"}, {"c", "a"}}}
 	r := c.Post("/v1/workflows", loop)
 	ctx.Equal(r.Status, 422, "publishing a graph whose edges run a → b → c → a (a run of it never reaches a last step); the status")
-	ctx.Assert(definitions.Get(apiBg, "loop", 1) == nil, "the cyclic graph was stored: %+v", definitions.Get(apiBg, "loop", 1))
-	r = c.Post("/v1/workflows", v3)
+	ctx.Assert(definitions.Get(hEndpointBg, "loop", 1) == nil, "the cyclic graph was stored: %+v", definitions.Get(hEndpointBg, "loop", 1))
+	r = c.Post("/v1/workflows", hV3)
 	ctx.Equal(r.Status, 201, "publishing an acyclic graph (%s); the status", r.Text())
-	ctx.Assert(definitions.Get(apiBg, "signup", 3) != nil, "the acyclic graph must be stored")
+	ctx.Assert(definitions.Get(hEndpointBg, "signup", 3) != nil, "the acyclic graph must be stored")
 }
 
 func CheckImmutable(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/workflows", v3)
+	c := hEndpointAPI(ctx)
+	r := c.Post("/v1/workflows", hV3)
 	ctx.Equal(r.Status, 201, "the first publish of signup v3 (%s); the status", r.Text())
 	rewrite := map[string]any{"name": "signup", "version": 3, "steps": []string{"create_account"}, "edges": [][]string{}}
 	r = c.Post("/v1/workflows", rewrite)
 	ctx.Equal(r.Status, 409, "re-publishing signup v3 with other steps; the status")
-	ctx.Equal(definitions.Get(apiBg, "signup", 3).Steps, v3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps")
+	rewire := map[string]any{"name": "signup", "version": 3, "steps": hV3Steps, "edges": [][]string{}}
+	r = c.Post("/v1/workflows", rewire)
+	ctx.Equal(r.Status, 409, "re-publishing signup v3 with its steps but other edges (an existing (name, version) is never written again); the status")
+	stored := definitions.Get(hEndpointBg, "signup", 3)
+	ctx.Equal(stored.Steps, hV3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps")
+	ctx.Equal(stored.Edges, hV3Edges, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run another graph); its edges")
+	older := map[string]any{"name": "signup", "version": 2, "steps": hV3Steps, "edges": hV3Edges}
+	r = c.Post("/v1/workflows", older)
+	ctx.Equal(r.Status, 201, "publishing signup v2, never published, after v3 (only an existing (name, version) is a conflict); the status")
+	ctx.Assert(definitions.Get(hEndpointBg, "signup", 2) != nil, "signup v2 must be stored")
 }
 
 func CheckPin(ctx *harness.Ctx) {
-	c := api(ctx)
-	c.Post("/v1/workflows", v3)
-	c.Post("/v1/workflows", v4)
-	r := c.Post("/v1/runs", runBody(3, email, 50), "X-Tenant-Id", "t1")
+	c := hEndpointAPI(ctx)
+	c.Post("/v1/workflows", hV3)
+	c.Post("/v1/workflows", hV4)
+	r := c.Post("/v1/runs", hRunBody(3, hEmail, 50), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 202, "starting a run of signup v3 (%s); the status", r.Text())
 	var body struct {
 		RunID             string   \`json:"run_id"\`
@@ -938,25 +976,33 @@ func CheckPin(ctx *harness.Ctx) {
 		PinnedSteps       []string \`json:"pinned_steps"\`
 	}
 	r.Decode(&body)
-	ctx.Assert(body.DefinitionVersion == 3 && strings.Join(body.PinnedSteps, ",") == strings.Join(v3Steps, ","), "a run that asked for signup v3 answered %s: it must pin version 3 and its steps, whatever was published later", r.Text())
-	stored := runs.Get(apiBg, body.RunID)
-	ctx.Assert(stored != nil && stored.DefinitionVersion == 3 && strings.Join(stored.PinnedSteps, ",") == strings.Join(v3Steps, ","), "the stored run is %+v, expected version 3 and its steps", stored)
-	r = c.Post("/v1/runs", runBody(9, email, 50), "X-Tenant-Id", "t1")
+	ctx.Assert(body.DefinitionVersion == 3 && strings.Join(body.PinnedSteps, ",") == strings.Join(hV3Steps, ","), "a run that asked for signup v3 answered %s: it must pin version 3 and its steps, whatever was published later", r.Text())
+	stored := runs.Get(hEndpointBg, body.RunID)
+	ctx.Assert(stored != nil && stored.DefinitionVersion == 3 && strings.Join(stored.PinnedSteps, ",") == strings.Join(hV3Steps, ","), "the stored run is %+v, expected version 3 and its steps", stored)
+	r = c.Post("/v1/runs", hRunBody(9, hEmail, 50), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 404, "a run of signup v9, never published; the status")
 }
 
 func CheckBounds(ctx *harness.Ctx) {
-	c := api(ctx)
-	c.Post("/v1/workflows", v3)
-	r := c.Post("/v1/runs", runBody(3, map[string]any{"blob": strings.Repeat("x", 70000)}, 50), "X-Tenant-Id", "t1")
+	c := hEndpointAPI(ctx)
+	c.Post("/v1/workflows", hV3)
+	r := c.Post("/v1/runs", hRunBody(3, map[string]any{"blob": strings.Repeat("x", 70000)}, 50), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 413, "a 70 KB input (maxInputBytes = 1 << 16); the status")
+	r = c.Post("/v1/runs", hRunBody(3, map[string]any{"name": strings.Repeat("é", 40000)}, 50), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 413, "an input of 40000 'é' (80 KB of UTF-8; the limit counts bytes, not characters); the status")
 	for _, budget := range []int{0, 501} {
-		r = c.Post("/v1/runs", runBody(3, map[string]any{}, budget), "X-Tenant-Id", "t1")
+		r = c.Post("/v1/runs", hRunBody(3, map[string]any{}, budget), "X-Tenant-Id", "t1")
 		ctx.Equal(r.Status, 400, "max_steps %d (1..maxSteps = 500); the status", budget)
 	}
 	ctx.Equal(ctx.Redis.Keys("run:run-*"), []string{}, "rejected requests must not write run records; the run keys")
-	r = c.Post("/v1/runs", runBody(3, email, 500), "X-Tenant-Id", "t1")
+	r = c.Post("/v1/runs", hRunBody(3, hEmail, 500), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 202, "max_steps 500 with a small input (%s); the status", r.Text())
+	r = c.Post("/v1/runs", hRunBody(3, hEmail, 1), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 202, "max_steps 1 (1..maxSteps = 500; %s); the status", r.Text())
+	// {"blob":""} is 11 bytes serialized, so this input is exactly 1 << 16 bytes.
+	exact := map[string]any{"blob": strings.Repeat("x", 1<<16-11)}
+	r = c.Post("/v1/runs", hRunBody(3, exact, 50), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 202, "an input of exactly maxInputBytes (65536 bytes serialized; only an input over the limit is refused); the status")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -975,8 +1021,9 @@ const std::string kV3 = R"({"name": "signup", "version": 3, "steps": ["create_ac
 const std::string kV4 =
     R"({"name": "signup", "version": 4, "steps": ["create_account", "send_welcome", "notify_sales"], "edges": [["create_account", "send_welcome"], ["send_welcome", "notify_sales"]]})";
 const std::vector<std::string> kV3Steps = {"create_account", "send_welcome"};
+const std::vector<std::vector<std::string>> kV3Edges = {{"create_account", "send_welcome"}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hEndpointApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -984,11 +1031,11 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const std::string& path, const std::string& body) {
+harness::Response hPost(harness::HTTP& c, const std::string& path, const std::string& body) {
   return c.Post(path, body, "Content-Type", "application/json", "X-Tenant-Id", "t1");
 }
 
-std::string runBody(long version, const nlohmann::json& input, long max_steps) {
+std::string hRunBody(long version, const nlohmann::json& input, long max_steps) {
   return nlohmann::json{{"workflow", "signup"}, {"version", version}, {"input", input}, {"max_steps", max_steps}}.dump();
 }
 
@@ -997,51 +1044,68 @@ const nlohmann::json kEmail = {{"email", "ada@example.com"}};
 }  // namespace
 
 void CheckCycle(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "/v1/workflows", R"({"name": "loop", "version": 1, "steps": ["a", "b", "c"], "edges": [["a", "b"], ["b", "c"], ["c", "a"]]})");
+  auto c = hEndpointApi(ctx);
+  auto r = hPost(c, "/v1/workflows", R"({"name": "loop", "version": 1, "steps": ["a", "b", "c"], "edges": [["a", "b"], ["b", "c"], ["c", "a"]]})");
   ctx.Equal(r.Status, 422, "publishing a graph whose edges run a → b → c → a (a run of it never reaches a last step); the status");
   ctx.Assert(!definitions::get("loop", 1), "the cyclic graph was stored");
-  r = post(c, "/v1/workflows", kV3);
+  r = hPost(c, "/v1/workflows", kV3);
   ctx.Equal(r.Status, 201, "publishing an acyclic graph (%s); the status", r.Text());
   ctx.Assert(definitions::get("signup", 3).has_value(), "the acyclic graph must be stored");
 }
 
 void CheckImmutable(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "/v1/workflows", kV3);
+  auto c = hEndpointApi(ctx);
+  auto r = hPost(c, "/v1/workflows", kV3);
   ctx.Equal(r.Status, 201, "the first publish of signup v3 (%s); the status", r.Text());
-  r = post(c, "/v1/workflows", R"({"name": "signup", "version": 3, "steps": ["create_account"], "edges": []})");
+  r = hPost(c, "/v1/workflows", R"({"name": "signup", "version": 3, "steps": ["create_account"], "edges": []})");
   ctx.Equal(r.Status, 409, "re-publishing signup v3 with other steps; the status");
-  ctx.Equal(definitions::get("signup", 3)->steps, kV3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps");
+  r = hPost(c, "/v1/workflows", R"({"name": "signup", "version": 3, "steps": ["create_account", "send_welcome"], "edges": []})");
+  ctx.Equal(r.Status, 409, "re-publishing signup v3 with its steps but other edges (an existing (name, version) is never written again); the status");
+  const auto stored = definitions::get("signup", 3);
+  ctx.Assert(stored.has_value(), "signup v3 must stay stored");
+  ctx.Equal(stored->steps, kV3Steps, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run other steps); its steps");
+  ctx.Equal(stored->edges, kV3Edges, "re-publishing signup v3 must not rewrite it (every run pinned to v3 would run another graph); its edges");
+  r = hPost(c, "/v1/workflows", R"({"name": "signup", "version": 2, "steps": ["create_account", "send_welcome"], "edges": [["create_account", "send_welcome"]]})");
+  ctx.Equal(r.Status, 201, "publishing signup v2, never published, after v3 (only an existing (name, version) is a conflict); the status");
+  ctx.Assert(definitions::get("signup", 2).has_value(), "signup v2 must be stored");
 }
 
 void CheckPin(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  post(c, "/v1/workflows", kV3);
-  post(c, "/v1/workflows", kV4);
-  auto r = post(c, "/v1/runs", runBody(3, kEmail, 50));
+  auto c = hEndpointApi(ctx);
+  hPost(c, "/v1/workflows", kV3);
+  hPost(c, "/v1/workflows", kV4);
+  auto r = hPost(c, "/v1/runs", hRunBody(3, kEmail, 50));
   ctx.Equal(r.Status, 202, "starting a run of signup v3 (%s); the status", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   const bool pinned = body.is_object() && body.value("definition_version", 0L) == 3 && body.value("pinned_steps", std::vector<std::string>{}) == kV3Steps;
   ctx.Assert(pinned, "a run that asked for signup v3 answered %s: it must pin version 3 and its steps, whatever was published later", r.Text());
   const auto stored = runs::get(body.value("run_id", ""));
   ctx.Assert(stored && stored->definition_version == 3 && stored->pinned_steps == kV3Steps, "the stored run must hold version 3 and its steps");
-  r = post(c, "/v1/runs", runBody(9, kEmail, 50));
+  r = hPost(c, "/v1/runs", hRunBody(9, kEmail, 50));
   ctx.Equal(r.Status, 404, "a run of signup v9, never published; the status");
 }
 
 void CheckBounds(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  post(c, "/v1/workflows", kV3);
-  auto r = post(c, "/v1/runs", runBody(3, nlohmann::json{{"blob", std::string(70000, 'x')}}, 50));
+  auto c = hEndpointApi(ctx);
+  hPost(c, "/v1/workflows", kV3);
+  auto r = hPost(c, "/v1/runs", hRunBody(3, nlohmann::json{{"blob", std::string(70000, 'x')}}, 50));
   ctx.Equal(r.Status, 413, "a 70 KB input (kMaxInputBytes = 1 << 16); the status");
+  std::string accented;
+  for (int i = 0; i < 40000; ++i) accented += "é";
+  r = hPost(c, "/v1/runs", hRunBody(3, nlohmann::json{{"name", accented}}, 50));
+  ctx.Equal(r.Status, 413, "an input of 40000 'é' (80 KB of UTF-8; the limit counts bytes, not characters); the status");
   for (const long budget : {0L, 501L}) {
-    r = post(c, "/v1/runs", runBody(3, nlohmann::json::object(), budget));
+    r = hPost(c, "/v1/runs", hRunBody(3, nlohmann::json::object(), budget));
     ctx.Equal(r.Status, 400, "max_steps %d (1..kMaxSteps = 500); the status", budget);
   }
   ctx.Equal(ctx.Redis.Keys("run:run-*"), std::vector<std::string>{}, "rejected requests must not write run records; the run keys");
-  r = post(c, "/v1/runs", runBody(3, kEmail, 500));
+  r = hPost(c, "/v1/runs", hRunBody(3, kEmail, 500));
   ctx.Equal(r.Status, 202, "max_steps 500 with a small input (%s); the status", r.Text());
+  r = hPost(c, "/v1/runs", hRunBody(3, kEmail, 1));
+  ctx.Equal(r.Status, 202, "max_steps 1 (1..kMaxSteps = 500; %s); the status", r.Text());
+  const size_t pad = (size_t{1} << 16) - nlohmann::json{{"blob", ""}}.dump().size();
+  r = hPost(c, "/v1/runs", hRunBody(3, nlohmann::json{{"blob", std::string(pad, 'x')}}, 50));
+  ctx.Equal(r.Status, 202, "an input of exactly kMaxInputBytes (65536 bytes serialized; only an input over the limit is refused); the status");
 }
 `,
   },

@@ -55,7 +55,7 @@ that is down.
       id: 'window-bucket',
       title: 'Claims the minute, not the tick',
       detail:
-        'Ticks 2 s and 7 s into the 09:00 minute claim one lease, `lease:s1:{09:00}`, and the job runs once with that window. The starter uses the tick itself as the window.',
+        'Ticks 2 s, 7 s and 59 s into the 09:00 minute claim one lease, `lease:s1:{09:00}`, and the job runs once with that window. The starter uses the tick itself as the window.',
       match: {
         python: {all: [/window_of\(\s*tick\s*\)|tick\s*\/\/\s*(WINDOW_S|60)\b/]},
         typescript: {all: [/windowOf\(\s*tick\s*\)|Math\.floor\(\s*tick\s*\/\s*(WINDOW_S|60)\b/]},
@@ -68,7 +68,7 @@ that is down.
       id: 'lease-ttl',
       title: 'Expires the lease after 300 s',
       detail:
-        'After a fire the lease has a TTL of at most 300 s and is gone once it passes. The starter writes a lease that never expires.',
+        'Right after the command that creates the lease, it holds the owner with a TTL of 300 s, and it is gone once that passes. The starter writes a lease that never expires.',
       match: {
         python: {all: [/ex\s*=\s*(LEASE_TTL_S|300)\b/]},
         typescript: {all: [/['"]EX['"]\s*,\s*(LEASE_TTL_S|300)\b/]},
@@ -83,7 +83,7 @@ that is down.
       id: 'error-recorded',
       title: 'Records a failed trigger and returns error',
       detail:
-        'A trigger that raises leaves `runs:s1` holding the window as `error:trigger_failed`, and `fire_window` returns `error`. The starter records only successes.',
+        'A trigger that raises, whatever it raises, leaves `runs:s1` holding the window as `error:trigger_failed`, and `fire_window` returns `error`. The starter records only successes.',
       match: {
         python: {all: [/["']error["']\s*,\s*["']trigger_failed["']/]},
         typescript: {all: [/['"]error['"]\s*,\s*['"]trigger_failed['"]/]},
@@ -424,34 +424,46 @@ def check_window_bucket(ctx):
     fired = []
     a = m.fire_window(S, W + 2, "a", _trigger(fired))
     b = m.fire_window(S, W + 7, "b", _trigger(fired))
+    c = m.fire_window(S, W + 59, "c", _trigger(fired))
     leases = sorted(ctx.redis.keys("lease:*"))
-    assert len(fired) == 1, f"instances a and b ticked 2 s and 7 s into the 09:00 minute and the job ran {len(fired)} times (leases {leases}): both ticks belong to window {W}, so both claim {lease_key(S, W)}"
+    assert len(fired) == 1, f"instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran {len(fired)} times (leases {leases}): every tick belongs to window {W}, so all three claim {lease_key(S, W)}"
     assert fired[0][1] == W, f"the trigger received window {fired[0][1]}, expected the start of the minute, {W}"
-    assert (a, b) == ("fired", "taken"), f"fire_window returned {a!r} then {b!r}, expected 'fired' then 'taken'"
+    assert (a, b, c) == ("fired", "taken", "taken"), f"fire_window returned {a!r}, {b!r} then {c!r}, expected 'fired', 'taken', 'taken'"
     runs = store.runs(S)
     assert runs == [{"window": W, "outcome": "fired", "reason": ""}], f"the ledger runs:s1 holds {runs}, expected one fired row for window {W}"
 
 
 def check_lease_ttl(ctx):
     m = ctx.load("state")
+    key = lease_key(S, W)
+    # A snapshot right after the first command on the lease: a TTL set by a later command is not there yet.
+    probe = ctx.redis_after(key, lambda: (ctx.redis.get(key), ctx.redis.ttl(key)))
     m.fire_window(S, W, "a", _trigger([]))
-    ttl = ctx.redis.ttl(lease_key(S, W))
-    assert 0 < ttl <= 300, f"{lease_key(S, W)} has TTL {ttl}, expected at most 300 s: a lease that never expires is one key per schedule per minute, kept forever"
+    assert probe.fired, f"fire_window never touched {key}"
+    holder, ttl = probe.result
+    assert holder == "a", f"right after the claim {key} holds {holder!r}, expected the owner 'a'"
+    assert 290 <= ttl <= 300, f"right after the claim {key} has TTL {ttl}, expected 300 s from the claiming command itself: a TTL set by a second command leaves a lease that never expires when the instance dies between the two"
+    ttl = ctx.redis.ttl(key)
+    assert 0 < ttl <= 300, f"{key} has TTL {ttl}, expected at most 300 s: a lease that never expires is one key per schedule per minute, kept forever"
     ctx.clock.advance(301)
-    assert ctx.redis.exists(lease_key(S, W)) == 0, f"{lease_key(S, W)} still exists 301 s after the fire"
+    assert ctx.redis.exists(key) == 0, f"{key} still exists 301 s after the fire"
+
+
+class JobServiceDown(Exception):
+    """Whatever the job client raises: not necessarily a RuntimeError or a grpc.RpcError."""
 
 
 def check_error_recorded(ctx):
     m = ctx.load("state")
 
     def failing(schedule_id, window):
-        raise RuntimeError("job service unreachable")
+        raise JobServiceDown("job service unreachable")
 
     try:
         outcome = m.fire_window(S, W, "a", failing)
-    except RuntimeError:
+    except JobServiceDown:
         outcome = None
-    assert outcome == "error", f"a trigger that raised made fire_window {'raise' if outcome is None else f'return {outcome!r}'}, expected it to return 'error'"
+    assert outcome == "error", f"a trigger that raised made fire_window {'raise' if outcome is None else f'return {outcome!r}'}, expected it to return 'error' whatever the trigger raised"
     runs = store.runs(S)
     assert runs == [{"window": W, "outcome": "error", "reason": "trigger_failed"}], f"after a failed trigger the ledger runs:s1 holds {runs}, expected window {W} as error with reason trigger_failed: without the row the window reads as never attempted"
     assert m.fire_window(S, W + 60, "a", _trigger([])) == "fired", "the next window, with the job service back, must fire"
@@ -488,21 +500,29 @@ export async function check_window_bucket(ctx) {
   const fired: [string, number][] = [];
   const a = await m.fireWindow(S, W + 2, 'a', trigger(fired));
   const b = await m.fireWindow(S, W + 7, 'b', trigger(fired));
+  const c = await m.fireWindow(S, W + 59, 'c', trigger(fired));
   const leases = ctx.redis.keys('lease:*').sort();
-  assert.equal(fired.length, 1, \`instances a and b ticked 2 s and 7 s into the 09:00 minute and the job ran \${fired.length} times (leases \${JSON.stringify(leases)}): both ticks belong to window \${W}, so both claim \${leaseKey(S, W)}\`);
+  assert.equal(fired.length, 1, \`instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran \${fired.length} times (leases \${JSON.stringify(leases)}): every tick belongs to window \${W}, so all three claim \${leaseKey(S, W)}\`);
   assert.equal(fired[0][1], W, \`the trigger received window \${fired[0][1]}, expected the start of the minute, \${W}\`);
-  assert.deepEqual([a, b], ['fired', 'taken'], \`fireWindow resolved \${a} then \${b}, expected fired then taken\`);
+  assert.deepEqual([a, b, c], ['fired', 'taken', 'taken'], \`fireWindow resolved \${a}, \${b} then \${c}, expected fired, taken, taken\`);
   const runs = await store.runs(S);
   assert.deepEqual(runs, [{window: W, outcome: 'fired', reason: ''}], \`the ledger runs:s1 holds \${JSON.stringify(runs)}, expected one fired row for window \${W}\`);
 }
 
 export async function check_lease_ttl(ctx) {
   const m = ctx.load('state');
+  const key = leaseKey(S, W);
+  // A snapshot right after the first command on the lease: a TTL set by a later command is not there yet.
+  const probe = ctx.redisAfter(key, () => [ctx.redis.get(key), ctx.redis.ttl(key)]);
   await m.fireWindow(S, W, 'a', trigger([]));
-  const ttl = ctx.redis.ttl(leaseKey(S, W));
-  assert(0 < ttl && ttl <= 300, \`\${leaseKey(S, W)} has TTL \${ttl}, expected at most 300 s: a lease that never expires is one key per schedule per minute, kept forever\`);
+  assert(probe.fired, \`fireWindow never touched \${key}\`);
+  const [holder, first] = probe.result as [string | null, number];
+  assert.equal(holder, 'a', \`right after the claim \${key} holds \${JSON.stringify(holder)}, expected the owner a\`);
+  assert(290 <= first && first <= 300, \`right after the claim \${key} has TTL \${first}, expected 300 s from the claiming command itself: a TTL set by a second command leaves a lease that never expires when the instance dies between the two\`);
+  const ttl = ctx.redis.ttl(key);
+  assert(0 < ttl && ttl <= 300, \`\${key} has TTL \${ttl}, expected at most 300 s: a lease that never expires is one key per schedule per minute, kept forever\`);
   ctx.clock.advance(301);
-  assert.equal(ctx.redis.exists(leaseKey(S, W)), 0, \`\${leaseKey(S, W)} still exists 301 s after the fire\`);
+  assert.equal(ctx.redis.exists(key), 0, \`\${key} still exists 301 s after the fire\`);
 }
 
 export async function check_error_recorded(ctx) {
@@ -587,17 +607,30 @@ func CheckWindowBucket(ctx *harness.Ctx) {
 	ctx.NoError(err, "fireWindow")
 	b, err := fireWindow(context.Background(), stateSchedule, stateWindow+7, "b", stateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
-	ctx.Assert(len(fired) == 1, "instances a and b ticked 2 s and 7 s into the 09:00 minute and the job ran %d times (leases %q): both ticks belong to window %d, so both claim %s", len(fired), ctx.Redis.Keys("lease:*"), stateWindow, store.LeaseKey(stateSchedule, stateWindow))
+	c, err := fireWindow(context.Background(), stateSchedule, stateWindow+59, "c", stateTrigger(&fired))
+	ctx.NoError(err, "fireWindow")
+	ctx.Assert(len(fired) == 1, "instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran %d times (leases %q): every tick belongs to window %d, so all three claim %s", len(fired), ctx.Redis.Keys("lease:*"), stateWindow, store.LeaseKey(stateSchedule, stateWindow))
 	ctx.Equal(fired[0].window, stateWindow, "the window the trigger received (the start of the minute)")
-	ctx.Assert(a == "fired" && b == "taken", "fireWindow returned %q then %q, expected fired then taken", a, b)
+	ctx.Assert(a == "fired" && b == "taken" && c == "taken", "fireWindow returned %q, %q then %q, expected fired, taken, taken", a, b, c)
 	ctx.Equal(stateRuns(ctx), []store.Run{{Window: stateWindow, Outcome: "fired", Reason: ""}}, "the ledger runs:s1 (one fired row for the window)")
 }
 
 func CheckLeaseTtl(ctx *harness.Ctx) {
 	var fired []stateFire
+	key := store.LeaseKey(stateSchedule, stateWindow)
+	// A snapshot right after the first command on the lease: a TTL set by a later command is not there yet.
+	var holder string
+	var first int64
+	probe := ctx.Redis.After(key, func() any {
+		holder, _ = ctx.Redis.Get(key)
+		first = ctx.Redis.TTL(key)
+		return nil
+	})
 	_, err := fireWindow(context.Background(), stateSchedule, stateWindow, "a", stateTrigger(&fired))
 	ctx.NoError(err, "fireWindow")
-	key := store.LeaseKey(stateSchedule, stateWindow)
+	ctx.Assert(probe.Fired, "fireWindow never touched %s", key)
+	ctx.Equal(holder, "a", "the owner %s holds right after the claim", key)
+	ctx.Assert(290 <= first && first <= 300, "right after the claim %s has TTL %d, expected 300 s from the claiming command itself: a TTL set by a second command leaves a lease that never expires when the instance dies between the two", key, first)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= 300, "%s has TTL %d, expected at most 300 s: a lease that never expires is one key per schedule per minute, kept forever", key, ttl)
 	ctx.Clock.Advance(301)
@@ -672,19 +705,35 @@ void CheckWindowBucket(harness::Ctx& ctx) {
   std::vector<std::pair<std::string, int64_t>> fired;
   const std::string a = fireWindow(kStateSchedule, kStateWindow + 2, "a", stateTrigger(fired));
   const std::string b = fireWindow(kStateSchedule, kStateWindow + 7, "b", stateTrigger(fired));
+  const std::string c = fireWindow(kStateSchedule, kStateWindow + 59, "c", stateTrigger(fired));
   ctx.Assert(fired.size() == 1,
-             "instances a and b ticked 2 s and 7 s into the 09:00 minute and the job ran %d times (leases %q): both ticks belong to "
-             "window %d, so both claim %s",
+             "instances a, b and c ticked 2 s, 7 s and 59 s into the 09:00 minute and the job ran %d times (leases %q): every tick "
+             "belongs to window %d, so all three claim %s",
              fired.size(), ctx.Redis.Keys("lease:*"), kStateWindow, cronsched::LeaseKey(kStateSchedule, kStateWindow));
   ctx.Equal(fired[0].second, kStateWindow, "the window the trigger received (the start of the minute)");
-  ctx.Assert(a == "fired" && b == "taken", "fireWindow returned %s then %s, expected fired then taken", a, b);
+  ctx.Assert(a == "fired" && b == "taken" && c == "taken", "fireWindow returned %s, %s then %s, expected fired, taken, taken", a, b, c);
   ctx.Equal(stateRuns(), std::to_string(kStateWindow) + "=fired:;", "the ledger runs:s1 (one fired row for the window)");
 }
 
 void CheckLeaseTtl(harness::Ctx& ctx) {
   std::vector<std::pair<std::string, int64_t>> fired;
-  fireWindow(kStateSchedule, kStateWindow, "a", stateTrigger(fired));
   const std::string key = cronsched::LeaseKey(kStateSchedule, kStateWindow);
+  // A snapshot right after the first command on the lease: a TTL set by a later command is not there yet.
+  bool probed = false;
+  std::string holder;
+  long long first = 0;
+  ctx.Redis.After(key, [&] {
+    probed = true;
+    holder = ctx.Redis.Get(key).value_or("");
+    first = ctx.Redis.TTL(key);
+  });
+  fireWindow(kStateSchedule, kStateWindow, "a", stateTrigger(fired));
+  ctx.Assert(probed, "fireWindow never touched %s", key);
+  ctx.Equal(holder, "a", "the owner %s holds right after the claim", key);
+  ctx.Assert(290 <= first && first <= 300,
+             "right after the claim %s has TTL %d, expected 300 s from the claiming command itself: a TTL set by a second command "
+             "leaves a lease that never expires when the instance dies between the two",
+             key, first);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= 300,
              "%s has TTL %d, expected at most 300 s: a lease that never expires is one key per schedule per minute, kept forever", key,
