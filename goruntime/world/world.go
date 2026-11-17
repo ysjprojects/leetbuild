@@ -107,6 +107,7 @@ var ErrUnavailable = errors.New("not available in this runtime")
 func Reset() {
 	HTTP.reset()
 	Process.reset()
+	Drains.reset()
 	SpawnInstance = nil
 }
 

@@ -1,6 +1,42 @@
 package harness
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"leetbuild/goruntime/models/kafka/kafkatest"
+	"leetbuild/goruntime/vclock"
+)
+
+// A drain that starts once the check's sleep budget is spent still runs fn until the world settles,
+// as a Python loop runs to its next sleep past the limit, instead of returning before fn ran.
+func TestDrainAfterTheBudgetIsSpentStillRunsFn(t *testing.T) {
+	clock := kafkatest.New()
+	clock.SetBudget(1)
+	vclock.Set(clock)
+	stop := clock.Start()
+	defer func() {
+		stop()
+		vclock.Set(vclock.Real{})
+	}()
+	ctx := New(clock)
+	if ctx.Drain(func() {
+		for {
+			vclock.Sleep(time.Second)
+		}
+	}) {
+		t.Fatal("a loop that sleeps forever returned")
+	}
+	select {
+	case <-clock.Interrupted():
+	default:
+		t.Fatal("the first drain ended before the budget was spent")
+	}
+	ran := false
+	if !ctx.Drain(func() { ran = true }) || !ran {
+		t.Fatal("a drain after the budget was spent returned before fn ran")
+	}
+}
 
 func TestEqualComparesNumbersByValueAtAnyDepth(t *testing.T) {
 	cases := []struct {

@@ -35,6 +35,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+
+	"leetbuild/goruntime/world"
 )
 
 // Host is what the runtime gives a check: the moments only the host can see.
@@ -139,11 +141,26 @@ func (c *Ctx) Tick() {
 // Drain runs fn (typically the learner's consume loop) until it returns, the world settles while it
 // is still running (it waits for input that will not come), or the sleep budget ends it. It reports
 // whether fn returned.
+//
+// fn's loop keeps running after Drain returns. A confluent consumer it polls with a timeout waits,
+// once every record of its assignment was delivered (and the auto-commit has committed them), for
+// the next record without moving the clock: the moment Python's poll ends a drained loop and
+// kafkajs's run() returns, where the poll's timeout would otherwise spend the check's sleep budget
+// one jump at a time. Records seeded later wake it, so a later Drain sees them taken — by this loop
+// or the one it starts — with the consumer still a member of its group. A Drain that starts once the
+// budget is spent still runs fn until the world settles (fn's sleeps never end then), as a Python
+// loop runs to its next sleep past the limit.
 func (c *Ctx) Drain(fn func()) bool {
+	interrupted := c.host.Interrupted()
+	select {
+	case <-interrupted:
+		interrupted = nil
+	default:
+	}
 	done := make(chan any, 1)
 	go func() {
 		defer func() { done <- recover() }()
-		fn()
+		world.Drains.Run(fn)
 	}()
 	settled := make(chan struct{})
 	go func() {
@@ -166,7 +183,7 @@ func (c *Ctx) Drain(fn func()) bool {
 		default:
 			return false
 		}
-	case <-c.host.Interrupted():
+	case <-interrupted:
 		return false
 	}
 }

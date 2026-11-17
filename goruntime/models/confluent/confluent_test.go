@@ -2,9 +2,11 @@ package kafka_test
 
 import (
 	"hash/crc32"
+	"sync"
 	"testing"
 	"time"
 
+	"leetbuild/goruntime/harness"
 	kafka "leetbuild/goruntime/models/confluent"
 	mk "leetbuild/goruntime/models/kafka"
 	"leetbuild/goruntime/models/kafka/kafkatest"
@@ -389,6 +391,87 @@ func TestAutoCommitOnTheTimerAndClose(t *testing.T) {
 	}
 	if auto != 2 {
 		t.Fatalf("auto-commit events: %d", auto)
+	}
+}
+
+// A loop ctx.Drain runs polls with a timeout that would spend the check's sleep budget one jump at
+// a time. Once every record of its assignment was delivered (and auto-committed) the poll waits for
+// the next record without moving the clock, as Python's poll ends a drained loop: the drain ends at
+// once, and the next Drain sees what was seeded since taken — by the first loop, still polling, or
+// the second (its re-subscribe redelivers what was not committed yet, as a rebalance does).
+func TestDrainLoopWaitsForTheNextRecordWithoutMovingTheClock(t *testing.T) {
+	b, clock := world(t)
+	ctx := harness.New(clock)
+	var mu sync.Mutex
+	loop := func(c *kafka.Consumer, topic string, commit bool, seen *[]string) func() {
+		return func() {
+			if err := c.Subscribe(topic, nil); err != nil {
+				t.Error(err)
+				return
+			}
+			for {
+				msg, ok := c.Poll(1000).(*kafka.Message)
+				if !ok {
+					continue
+				}
+				mu.Lock()
+				*seen = append(*seen, string(msg.Value))
+				mu.Unlock()
+				if commit {
+					if _, err := c.CommitMessage(msg); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}
+		}
+	}
+	taken := func(what string, seen *[]string, want ...string) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		distinct := map[string]bool{}
+		for _, v := range *seen {
+			distinct[v] = true
+		}
+		ok := len(distinct) == len(want)
+		for _, v := range want {
+			ok = ok && distinct[v]
+		}
+		if !ok {
+			t.Fatalf("%s: the loops took %v, want %v", what, *seen, want)
+		}
+	}
+
+	b.CreateTopic("turns", 1)
+	c := consumer(t, kafka.ConfigMap{"group.id": "g", "auto.offset.reset": "earliest", "enable.auto.commit": false})
+	var seen []string
+	start := clock.Now()
+	b.Seed("turns", 0, nil, []byte("a"), nil)
+	if ctx.Drain(loop(c, "turns", true, &seen)) {
+		t.Fatal("the loop never returns")
+	}
+	taken("the first drain", &seen, "a")
+	if moved := clock.Now().Sub(start); moved != 0 || clock.Jumps() != 0 {
+		t.Fatalf("the drained loop moved the clock %v in %d jumps", moved, clock.Jumps())
+	}
+	b.Seed("turns", 0, nil, []byte("b"), nil)
+	b.Seed("turns", 0, nil, []byte("c"), nil)
+	ctx.Drain(loop(c, "turns", true, &seen))
+	taken("the second drain", &seen, "a", "b", "c")
+	if lag, moved := b.Lag("g", "turns"), clock.Now().Sub(start); lag != 0 || moved != 0 {
+		t.Fatalf("after the second drain: lag %d, the clock moved %v", lag, moved)
+	}
+
+	// With auto-commit the clock moves on to the timer's tick (5 s) that commits what was delivered.
+	auto := consumer(t, kafka.ConfigMap{"group.id": "auto", "auto.offset.reset": "earliest"})
+	var autoSeen []string
+	b.Seed("events", 0, nil, []byte("x"), nil)
+	start = clock.Now()
+	ctx.Drain(loop(auto, "events", false, &autoSeen))
+	taken("the auto-commit drain", &autoSeen, "x")
+	if lag, moved := b.Lag("auto", "events"), clock.Now().Sub(start); lag != 0 || moved < 5*time.Second || moved > 6*time.Second {
+		t.Fatalf("auto-commit: lag %d after %v; want 0 after the 5 s tick", lag, moved)
 	}
 }
 

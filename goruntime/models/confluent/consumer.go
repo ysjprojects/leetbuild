@@ -22,8 +22,10 @@ type RebalanceCb func(*Consumer, Event) error
 // Subscribe joins the consumer group (group.id is required): the group's members split the
 // partitions, and each assigned partition starts at the group's committed offset, else at
 // auto.offset.reset (latest by default). Poll and ReadMessage deliver the next record round-robin
-// over the unpaused partitions, waiting on the virtual clock for the timeout. With
-// enable.auto.offset.store (default) every delivered record's offset+1 is stored; with
+// over the unpaused partitions, waiting on the virtual clock for the timeout — except in a loop
+// ctx.Drain runs, where a poll that finds every record of its assignment delivered (and committed,
+// with auto-commit) waits for the next one without moving the clock, as Python's poll ends a drained
+// loop. With enable.auto.offset.store (default) every delivered record's offset+1 is stored; with
 // enable.auto.commit (default) the stored offsets are committed every auto.commit.interval.ms
 // (default 5 s) and on Close.
 type Consumer struct {
@@ -508,19 +510,28 @@ func (c *Consumer) Poll(timeoutMs int) (event Event) {
 			return ev
 		}
 		wake := c.wake
+		idle := timeoutMs > 0 && c.idleLocked(b)
 		c.mu.Unlock()
 		if timeoutMs == 0 {
 			return nil
 		}
 		var timeout <-chan time.Time
 		var t *vclock.Timer
+		var passing *vclock.Ticker
 		if timeoutMs > 0 {
 			left := vclock.Until(deadline)
 			if left <= 0 {
 				return nil
 			}
-			t = vclock.NewTimer(left)
-			timeout = t.C
+			if idle && world.Drains.InDrain() {
+				// A drain loop with nothing left to take: the timeout passes only as the clock
+				// moves for another reason (a ticker never moves it); the next record wakes it.
+				passing = vclock.NewTicker(left)
+				timeout = passing.C
+			} else {
+				t = vclock.NewTimer(left)
+				timeout = t.C
+			}
 		}
 		select {
 		case <-changed:
@@ -530,7 +541,31 @@ func (c *Consumer) Poll(timeoutMs int) (event Event) {
 		if t != nil {
 			t.Stop()
 		}
+		if passing != nil {
+			passing.Stop()
+		}
 	}
+}
+
+// idleLocked reports whether a timed poll in a drain loop (ctx.Drain) may wait for the next record
+// without moving the clock: every assigned partition, paused ones included, was delivered to its
+// end — where Python's poll ends a drained loop, while a paused partition still holding records
+// keeps it polling — and the auto-commit has no stored offset left to commit (the clock moves on to
+// its next tick first, as librdkafka's timer commits an idle consumer's offsets).
+func (c *Consumer) idleLocked(b *mk.Broker) bool {
+	if c.autoCommit && c.interval > 0 && len(c.dueLocked(b)) > 0 {
+		return false
+	}
+	for _, tp := range c.assigned {
+		pos, ok := c.positions[tp]
+		if !ok {
+			pos = c.startLocked(tp, OffsetStored)
+		}
+		if pos < b.EndOffset(tp.Topic, tp.Partition) {
+			return false
+		}
+	}
+	return true
 }
 
 // membership is the consumer's group membership, joined again if the group evicted it.
@@ -717,16 +752,22 @@ func (c *Consumer) CommitOffsets(offsets []TopicPartition) ([]TopicPartition, er
 func (c *Consumer) commitStored(kind string) {
 	b := mk.Default()
 	c.mu.Lock()
+	due := c.dueLocked(b)
+	c.mu.Unlock()
+	if len(due) > 0 {
+		b.Commit(c.group, due, kind)
+	}
+}
+
+// dueLocked is what the auto-commit would commit now: the stored offsets not committed yet.
+func (c *Consumer) dueLocked(b *mk.Broker) mk.Offsets {
 	due := mk.Offsets{}
 	for tp, o := range c.stored {
 		if cur, ok := b.CommittedOffset(c.group, tp.Topic, tp.Partition); !ok || cur != o {
 			due[tp] = o
 		}
 	}
-	c.mu.Unlock()
-	if len(due) > 0 {
-		b.Commit(c.group, due, kind)
-	}
+	return due
 }
 
 // StoreOffsets stores the provided list of offsets that will be committed
