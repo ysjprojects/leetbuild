@@ -63,7 +63,7 @@ reserving another tenant's sku, and a client that times out and retries, holding
       id: 'quantity-range',
       title: 'Rejects a quantity outside 1..1000 with 400 before the reserve',
       detail:
-        'Quantities -3, 0 and 1001 answer **400** and leave the counter alone; 1000 is reserved. The starter hands any quantity to the reserve, and a negative one adds stock.',
+        'Quantities -3, 0, 1001 and 4294967297 answer **400**, a quantity of 2.5 is rejected too, and none of them moves the counter; 1 and 1000 are reserved. The starter hands any quantity to the reserve, and a negative one adds stock.',
       match: {
         python: {
           all: [/MAX_ORDER_QUANTITY\s*=\s*1000/, /\b400\b/],
@@ -608,13 +608,18 @@ async def check_route(ctx):
 
 async def check_quantity_range(ctx):
     async with await _world(ctx, units=5000) as c:
-        for n, quantity in enumerate((-3, 0, 1001)):
+        for n, quantity in enumerate((-3, 0, 1001, 4294967297)):
             r = await _reserve(c, quantity=quantity, key=f"k-{n}")
             assert r.status_code == 400, f"a quantity of {quantity} answered {r.status_code} and stock:sku-1 is now {_units(ctx)}: a quantity outside 1..1000 is 400, before any stock moves"
             assert _units(ctx) == 5000, f"a rejected quantity of {quantity} moved the counter to {_units(ctx)}"
+        r = await _reserve(c, quantity=2.5, key="k-5")
+        assert r.status_code in (400, 422), f"a quantity of 2.5 answered {r.status_code} and stock:sku-1 is now {_units(ctx)}: a quantity that is not a whole number is rejected before any stock moves"
+        assert _units(ctx) == 5000, f"a rejected quantity of 2.5 moved the counter to {_units(ctx)}"
+        one = await _reserve(c, quantity=1, key="k-8")
         r = await _reserve(c, quantity=1000, key="k-9")
+    assert one.status_code == 201, f"a quantity of 1 (the floor) answered {one.status_code}: {one.text}"
     assert r.status_code == 201, f"a quantity of 1000 (the cap) answered {r.status_code}: {r.text}"
-    assert _units(ctx) == 4000, f"stock:sku-1 is {_units(ctx)} after reserving 1000 of 5000"
+    assert _units(ctx) == 3999, f"stock:sku-1 is {_units(ctx)} after reserving 1 and 1000 of 5000"
 
 
 async def check_sku_tenant(ctx):
@@ -669,14 +674,19 @@ export async function check_route(ctx) {
 
 export async function check_quantity_range(ctx) {
   const c = world(ctx, 5000);
-  for (const [n, quantity] of [-3, 0, 1001].entries()) {
+  for (const [n, quantity] of [-3, 0, 1001, 4294967297].entries()) {
     const r = await reserveReq(c, {quantity, key: \`k-\${n}\`});
     assert.equal(r.status, 400, \`a quantity of \${quantity} answered \${r.status} and stock:sku-1 is now \${units(ctx)}: a quantity outside 1..1000 is 400, before any stock moves\`);
     assert.equal(units(ctx), 5000, \`a rejected quantity of \${quantity} moved the counter to \${units(ctx)}\`);
   }
+  const fraction = await reserveReq(c, {quantity: 2.5, key: 'k-5'});
+  assert(fraction.status === 400 || fraction.status === 422, \`a quantity of 2.5 answered \${fraction.status} and stock:sku-1 is now \${units(ctx)}: a quantity that is not a whole number is rejected before any stock moves\`);
+  assert.equal(units(ctx), 5000, \`a rejected quantity of 2.5 moved the counter to \${units(ctx)}\`);
+  const one = await reserveReq(c, {quantity: 1, key: 'k-8'});
   const r = await reserveReq(c, {quantity: 1000, key: 'k-9'});
+  assert.equal(one.status, 201, \`a quantity of 1 (the floor) answered \${one.status}: \${one.text}\`);
   assert.equal(r.status, 201, \`a quantity of 1000 (the cap) answered \${r.status}: \${r.text}\`);
-  assert.equal(units(ctx), 4000, \`stock:sku-1 is \${units(ctx)} after reserving 1000 of 5000\`);
+  assert.equal(units(ctx), 3999, \`stock:sku-1 is \${units(ctx)} after reserving 1 and 1000 of 5000\`);
 }
 
 export async function check_sku_tenant(ctx) {
@@ -724,7 +734,7 @@ func apiWorld(ctx *harness.Ctx, units int) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiReserve(c *harness.HTTP, sku string, quantity int, key string) *harness.Response {
+func apiReserve(c *harness.HTTP, sku string, quantity any, key string) *harness.Response {
 	body := map[string]any{"sku": sku, "quantity": quantity}
 	if key == "" {
 		return c.Post("/v1/reservations", body, "X-Tenant-Id", "t1")
@@ -765,14 +775,19 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckQuantityRange(ctx *harness.Ctx) {
 	c := apiWorld(ctx, 5000)
-	for n, quantity := range []int{-3, 0, 1001} {
+	for n, quantity := range []int64{-3, 0, 1001, 4294967297} {
 		r := apiReserve(c, "sku-1", quantity, fmt.Sprintf("k-%d", n))
 		ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves", quantity, r.Status, apiUnits(ctx, "sku-1"))
 		ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity)
 	}
+	fraction := apiReserve(c, "sku-1", 2.5, "k-5")
+	ctx.Assert(fraction.Status == 400 || fraction.Status == 422, "a quantity of 2.5 answered %d and stock:sku-1 is now %d: a quantity that is not a whole number is rejected before any stock moves", fraction.Status, apiUnits(ctx, "sku-1"))
+	ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of 2.5")
+	one := apiReserve(c, "sku-1", 1, "k-8")
 	r := apiReserve(c, "sku-1", 1000, "k-9")
+	ctx.Equal(one.Status, 201, "a quantity of 1, the floor (%s)", one.Text())
 	ctx.Equal(r.Status, 201, "a quantity of 1000, the cap (%s)", r.Text())
-	ctx.Equal(apiUnits(ctx, "sku-1"), 4000, "stock:sku-1 after reserving 1000 of 5000")
+	ctx.Equal(apiUnits(ctx, "sku-1"), 3999, "stock:sku-1 after reserving 1 and 1000 of 5000")
 }
 
 func CheckSkuTenant(ctx *harness.Ctx) {
@@ -819,7 +834,7 @@ harness::HTTP apiWorld(harness::Ctx& ctx, int units) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiReserve(harness::HTTP& c, const std::string& sku, int quantity, const std::string& key) {
+harness::Response apiReserve(harness::HTTP& c, const std::string& sku, const nlohmann::json& quantity, const std::string& key) {
   const std::string body = nlohmann::json{{"sku", sku}, {"quantity", quantity}}.dump();
   if (key.empty()) return c.Post("/v1/reservations", body, "Content-Type", "application/json", "X-Tenant-Id", "t1");
   return c.Post("/v1/reservations", body, "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", key);
@@ -852,15 +867,22 @@ void CheckRoute(harness::Ctx& ctx) {
 void CheckQuantityRange(harness::Ctx& ctx) {
   auto c = apiWorld(ctx, 5000);
   int n = 0;
-  for (const int quantity : {-3, 0, 1001}) {
+  for (const long long quantity : {-3LL, 0LL, 1001LL, 4294967297LL}) {
     const auto r = apiReserve(c, "sku-1", quantity, "k-" + std::to_string(n++));
     ctx.Assert(r.Status == 400, "a quantity of %d answered %d and stock:sku-1 is now %d: a quantity outside 1..1000 is 400, before any stock moves",
                quantity, r.Status, apiUnits(ctx, "sku-1"));
     ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of %d", quantity);
   }
+  const auto fraction = apiReserve(c, "sku-1", 2.5, "k-5");
+  ctx.Assert(fraction.Status == 400 || fraction.Status == 422,
+             "a quantity of 2.5 answered %d and stock:sku-1 is now %d: a quantity that is not a whole number is rejected before any stock moves",
+             fraction.Status, apiUnits(ctx, "sku-1"));
+  ctx.Equal(apiUnits(ctx, "sku-1"), 5000, "stock:sku-1 after a rejected quantity of 2.5");
+  const auto one = apiReserve(c, "sku-1", 1, "k-8");
   const auto r = apiReserve(c, "sku-1", 1000, "k-9");
+  ctx.Equal(one.Status, 201, "a quantity of 1, the floor (%s)", one.Text());
   ctx.Equal(r.Status, 201, "a quantity of 1000, the cap (%s)", r.Text());
-  ctx.Equal(apiUnits(ctx, "sku-1"), 4000, "stock:sku-1 after reserving 1000 of 5000");
+  ctx.Equal(apiUnits(ctx, "sku-1"), 3999, "stock:sku-1 after reserving 1 and 1000 of 5000");
 }
 
 void CheckSkuTenant(harness::Ctx& ctx) {

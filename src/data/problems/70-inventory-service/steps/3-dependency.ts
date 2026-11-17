@@ -90,7 +90,7 @@ once, a warehouse that never answers, and one that refuses the reservation for g
       id: 'unanswered-pending',
       title: 'Keeps the hold and records pending when the warehouse never answers',
       detail:
-        'A warehouse that stays UNAVAILABLE gets two calls; the reservation ends `pending`, its hold and its units untouched. The starter releases the units the warehouse may already have allocated.',
+        'A warehouse that stays UNAVAILABLE gets two calls, and one that hangs gets two calls that each carry their own 2 s deadline; either way the reservation ends `pending`, its hold and its units untouched. The starter releases the units the warehouse may already have allocated.',
       match: {
         python: {all: [/["']pending["']/, /UNAVAILABLE/]},
         typescript: {all: [/['"]pending['"]/, /UNAVAILABLE/]},
@@ -103,7 +103,7 @@ once, a warehouse that never answers, and one that refuses the reservation for g
       id: 'rejection-final',
       title: 'Takes FAILED_PRECONDITION as final: one call, the hold released',
       detail:
-        'A warehouse that cannot fill the reservation gets one call; the units go back to the counter once and the reservation is `rejected`. The starter asks again.',
+        'A warehouse that cannot fill the reservation gets one call; the units go back to the counter once and the reservation is `rejected`. A warehouse that answers INTERNAL or PERMISSION_DENIED gets one call too. The starter asks again.',
       match: {
         python: {all: [/FAILED_PRECONDITION/, /stock\.release\(/, /["']rejected["']/]},
         typescript: {all: [/FAILED_PRECONDITION/, /\brelease\(/, /['"]rejected['"]/]},
@@ -630,7 +630,7 @@ def check_retry_same_id(ctx):
 
 def check_unanswered_pending(ctx):
     m, warehouse = _world(ctx)
-    ctx.grpc.fail("ConfirmReservation", grpc.StatusCode.UNAVAILABLE, "warehouse down", times=5)
+    ctx.grpc.fail("ConfirmReservation", grpc.StatusCode.UNAVAILABLE, "warehouse down", times=2)
     result = m.confirm_reservation(dict(RESERVATION))
     calls = len(ctx.grpc.calls_to("ConfirmReservation"))
     assert calls == 2, f"a warehouse that stays UNAVAILABLE got {calls} calls, expected MAX_CONFIRM_ATTEMPTS = 2"
@@ -638,17 +638,36 @@ def check_unanswered_pending(ctx):
     assert _status(ctx) == "pending", f"the stored reservation's status is {_status(ctx)!r}, expected pending"
     assert ctx.redis.hget("holds:sku-1", "r-1") == "3" and ctx.redis.exists("hold:r-1") == 1, "the hold of a pending reservation was dropped: its units may already be allocated in the warehouse"
     assert _units(ctx) == 7, f"stock:sku-1 is {_units(ctx)}: a pending reservation's units must not go back to the counter"
+    # A warehouse that hangs: every attempt runs into its own deadline.
+    ctx.grpc.set_latency("ConfirmReservation", 30)
+    result = m.confirm_reservation(dict(RESERVATION))
+    hung = ctx.grpc.calls_to("ConfirmReservation")[2:]
+    assert len(hung) == 2, f"a warehouse that never answers got {len(hung)} calls, expected MAX_CONFIRM_ATTEMPTS = 2: DEADLINE_EXCEEDED is retried like UNAVAILABLE"
+    timeouts = [c.timeout for c in hung]
+    assert all(t is not None and 1.5 <= t <= 2.5 for t in timeouts), f"the two attempts at a hung warehouse carried deadlines {timeouts} s: each attempt gets its own 2 s, not what is left of the first one's"
+    assert result == "pending", f"a warehouse that never answered ended the reservation {result!r}: it may have allocated, so it is pending"
+    assert ctx.redis.hget("holds:sku-1", "r-1") == "3" and _units(ctx) == 7, f"after a hung warehouse holds:sku-1 is {ctx.redis.hgetall('holds:sku-1')} and stock:sku-1 {_units(ctx)}: a pending reservation keeps its hold"
 
 
 def check_rejection_final(ctx):
     m, warehouse = _world(ctx)
-    ctx.grpc.fail("ConfirmReservation", grpc.StatusCode.FAILED_PRECONDITION, "not enough units in the warehouse", times=5)
+    ctx.grpc.fail("ConfirmReservation", grpc.StatusCode.FAILED_PRECONDITION, "not enough units in the warehouse", times=1)
     result = m.confirm_reservation(dict(RESERVATION))
     calls = len(ctx.grpc.calls_to("ConfirmReservation"))
     assert calls == 1, f"FAILED_PRECONDITION is a verdict, and the warehouse was asked {calls} times"
     assert result == "rejected", f"confirm_reservation returned {result!r}, expected rejected"
     assert _units(ctx) == 10 and ctx.redis.hgetall("holds:sku-1") == {}, f"after the refusal stock:sku-1 is {_units(ctx)} and holds:sku-1 {ctx.redis.hgetall('holds:sku-1')}: the 3 units go back once"
     assert _status(ctx) == "rejected", f"the stored reservation's status is {_status(ctx)!r}, expected rejected"
+    # Codes other than DEADLINE_EXCEEDED and UNAVAILABLE are not retried either: one call each, whatever the outcome.
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED):
+        ctx.grpc.fail("ConfirmReservation", code, "warehouse error", times=1)
+        before = len(ctx.grpc.calls_to("ConfirmReservation"))
+        try:
+            m.confirm_reservation(dict(RESERVATION))
+        except Exception:
+            pass
+        asked = len(ctx.grpc.calls_to("ConfirmReservation")) - before
+        assert asked == 1, f"a warehouse that answered {code.name} was asked {asked} times: only DEADLINE_EXCEEDED and UNAVAILABLE are retried"
 `,
     typescript: `import {store} from 'inventory/store';
 
@@ -706,7 +725,7 @@ export async function check_retry_same_id(ctx) {
 
 export async function check_unanswered_pending(ctx) {
   const m = await world(ctx);
-  ctx.grpc.fail('ConfirmReservation', ctx.grpc.status.UNAVAILABLE, 'warehouse down', 5);
+  ctx.grpc.fail('ConfirmReservation', ctx.grpc.status.UNAVAILABLE, 'warehouse down', 2);
   const result = await m.confirmReservation({...RESERVATION});
   const calls = ctx.grpc.callsTo('ConfirmReservation').length;
   assert.equal(calls, 2, \`a warehouse that stays UNAVAILABLE got \${calls} calls, expected MAX_CONFIRM_ATTEMPTS = 2\`);
@@ -714,17 +733,38 @@ export async function check_unanswered_pending(ctx) {
   assert.equal(status(ctx), 'pending', \`the stored reservation's status is \${status(ctx)}, expected pending\`);
   assert(ctx.redis.hget('holds:sku-1', 'r-1') === '3' && ctx.redis.exists('hold:r-1') === 1, 'the hold of a pending reservation was dropped: its units may already be allocated in the warehouse');
   assert.equal(units(ctx), 7, \`stock:sku-1 is \${units(ctx)}: a pending reservation's units must not go back to the counter\`);
+  // A warehouse that hangs: every attempt runs into its own deadline.
+  ctx.grpc.setLatency('ConfirmReservation', 30);
+  const again = await m.confirmReservation({...RESERVATION});
+  const hung = ctx.grpc.callsTo('ConfirmReservation').slice(2);
+  assert.equal(hung.length, 2, \`a warehouse that never answers got \${hung.length} calls, expected MAX_CONFIRM_ATTEMPTS = 2: DEADLINE_EXCEEDED is retried like UNAVAILABLE\`);
+  const timeouts = hung.map(c => c.timeout);
+  assert(timeouts.every(t => t !== null && 1.5 <= t && t <= 2.5), \`the two attempts at a hung warehouse carried deadlines \${JSON.stringify(timeouts)} s: each attempt gets its own 2 s, not what is left of the first one's\`);
+  assert.equal(again, 'pending', \`a warehouse that never answered ended the reservation \${JSON.stringify(again)}: it may have allocated, so it is pending\`);
+  assert(ctx.redis.hget('holds:sku-1', 'r-1') === '3' && units(ctx) === 7, \`after a hung warehouse holds:sku-1 is \${JSON.stringify(ctx.redis.hgetall('holds:sku-1'))} and stock:sku-1 \${units(ctx)}: a pending reservation keeps its hold\`);
 }
 
 export async function check_rejection_final(ctx) {
   const m = await world(ctx);
-  ctx.grpc.fail('ConfirmReservation', ctx.grpc.status.FAILED_PRECONDITION, 'not enough units in the warehouse', 5);
+  ctx.grpc.fail('ConfirmReservation', ctx.grpc.status.FAILED_PRECONDITION, 'not enough units in the warehouse', 1);
   const result = await m.confirmReservation({...RESERVATION});
   const calls = ctx.grpc.callsTo('ConfirmReservation').length;
   assert.equal(calls, 1, \`FAILED_PRECONDITION is a verdict, and the warehouse was asked \${calls} times\`);
   assert.equal(result, 'rejected', \`confirmReservation resolved \${JSON.stringify(result)}, expected rejected\`);
   assert(units(ctx) === 10 && Object.keys(ctx.redis.hgetall('holds:sku-1')).length === 0, \`after the refusal stock:sku-1 is \${units(ctx)} and holds:sku-1 \${JSON.stringify(ctx.redis.hgetall('holds:sku-1'))}: the 3 units go back once\`);
   assert.equal(status(ctx), 'rejected', \`the stored reservation's status is \${status(ctx)}, expected rejected\`);
+  // Codes other than DEADLINE_EXCEEDED and UNAVAILABLE are not retried either: one call each, whatever the outcome.
+  for (const name of ['INTERNAL', 'PERMISSION_DENIED']) {
+    ctx.grpc.fail('ConfirmReservation', ctx.grpc.status[name], 'warehouse error', 1);
+    const before = ctx.grpc.callsTo('ConfirmReservation').length;
+    try {
+      await m.confirmReservation({...RESERVATION});
+    } catch {
+      // the outcome is the client's choice; only the number of calls is checked
+    }
+    const asked = ctx.grpc.callsTo('ConfirmReservation').length - before;
+    assert.equal(asked, 1, \`a warehouse that answered \${name} was asked \${asked} times: only DEADLINE_EXCEEDED and UNAVAILABLE are retried\`);
+  }
 }
 `,
     go: `package main
@@ -812,7 +852,7 @@ func CheckRetrySameId(ctx *harness.Ctx) {
 
 func CheckUnansweredPending(ctx *harness.Ctx) {
 	clientWorld(ctx)
-	ctx.GRPC.Fail("ConfirmReservation", codes.Unavailable, "warehouse down", 5, "")
+	ctx.GRPC.Fail("ConfirmReservation", codes.Unavailable, "warehouse down", 2, "")
 	result := clientConfirm(ctx)
 	ctx.Equal(len(ctx.GRPC.CallsTo("ConfirmReservation", "")), 2, "a warehouse that stays UNAVAILABLE gets MAX_CONFIRM_ATTEMPTS = 2 calls; the calls")
 	ctx.Equal(result, "pending", "no attempt was answered, so the warehouse may have allocated; the result")
@@ -820,16 +860,35 @@ func CheckUnansweredPending(ctx *harness.Ctx) {
 	quantity, _ := ctx.Redis.HGet("holds:sku-1", "r-1")
 	ctx.Assert(quantity == "3" && ctx.Redis.Exists("hold:r-1") == 1, "the hold of a pending reservation was dropped: its units may already be allocated in the warehouse")
 	ctx.Equal(clientUnits(ctx), "7", "stock:sku-1 (a pending reservation's units must not go back to the counter)")
+	// A warehouse that hangs: every attempt runs into its own deadline.
+	ctx.GRPC.SetLatency("ConfirmReservation", 30, "")
+	again := clientConfirm(ctx)
+	hung := ctx.GRPC.CallsTo("ConfirmReservation", "")[2:]
+	ctx.Equal(len(hung), 2, "a warehouse that never answers gets MAX_CONFIRM_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried like UNAVAILABLE); the calls")
+	for _, call := range hung {
+		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "an attempt at a hung warehouse carried a deadline of %v: each attempt gets its own 2 s, not what is left of the first one's", call.Timeout)
+	}
+	ctx.Equal(again, "pending", "a warehouse that never answered may have allocated; the result")
+	quantity, _ = ctx.Redis.HGet("holds:sku-1", "r-1")
+	ctx.Assert(quantity == "3" && clientUnits(ctx) == "7", "after a hung warehouse holds:sku-1 is %v and stock:sku-1 %s: a pending reservation keeps its hold", ctx.Redis.HGetAll("holds:sku-1"), clientUnits(ctx))
 }
 
 func CheckRejectionFinal(ctx *harness.Ctx) {
 	clientWorld(ctx)
-	ctx.GRPC.Fail("ConfirmReservation", codes.FailedPrecondition, "not enough units in the warehouse", 5, "")
+	ctx.GRPC.Fail("ConfirmReservation", codes.FailedPrecondition, "not enough units in the warehouse", 1, "")
 	result := clientConfirm(ctx)
 	ctx.Equal(len(ctx.GRPC.CallsTo("ConfirmReservation", "")), 1, "FAILED_PRECONDITION is a verdict; the calls to the warehouse")
 	ctx.Equal(result, "rejected", "confirmReservation's result")
 	ctx.Assert(clientUnits(ctx) == "10" && len(ctx.Redis.HGetAll("holds:sku-1")) == 0, "after the refusal stock:sku-1 is %s and holds:sku-1 %v: the 3 units go back once", clientUnits(ctx), ctx.Redis.HGetAll("holds:sku-1"))
 	ctx.Equal(clientStatus(ctx), "rejected", "the stored reservation's status")
+	// Codes other than DEADLINE_EXCEEDED and UNAVAILABLE are not retried either: one call each, whatever the outcome.
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied} {
+		ctx.GRPC.Fail("ConfirmReservation", code, "warehouse error", 1, "")
+		before := len(ctx.GRPC.CallsTo("ConfirmReservation", ""))
+		r := clientReservation
+		confirmReservation(context.Background(), &r) // the outcome is the client's choice; only the calls are checked
+		ctx.Equal(len(ctx.GRPC.CallsTo("ConfirmReservation", ""))-before, 1, "a warehouse that answered %s is not retried (only DEADLINE_EXCEEDED and UNAVAILABLE are); the calls", code)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -898,7 +957,7 @@ void CheckRetrySameId(harness::Ctx& ctx) {
 
 void CheckUnansweredPending(harness::Ctx& ctx) {
   clientWorld(ctx);
-  ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::UNAVAILABLE, "warehouse down", 5);
+  ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::UNAVAILABLE, "warehouse down", 2);
   const std::string result = confirmReservation(kClientReservation);
   ctx.Equal(ctx.GRPC.CallsTo("ConfirmReservation").size(), 2, "a warehouse that stays UNAVAILABLE gets MAX_CONFIRM_ATTEMPTS = 2 calls; the calls");
   ctx.Equal(result, "pending", "no attempt was answered, so the warehouse may have allocated; the result");
@@ -906,17 +965,42 @@ void CheckUnansweredPending(harness::Ctx& ctx) {
   ctx.Assert(ctx.Redis.HGet("holds:sku-1", "r-1").value_or("") == "3" && ctx.Redis.Exists("hold:r-1") == 1,
              "the hold of a pending reservation was dropped: its units may already be allocated in the warehouse");
   ctx.Equal(clientUnits(ctx), "7", "stock:sku-1 (a pending reservation's units must not go back to the counter)");
+  // A warehouse that hangs: every attempt runs into its own deadline.
+  ctx.GRPC.SetLatency("ConfirmReservation", 30);
+  const std::string again = confirmReservation(kClientReservation);
+  const auto calls = ctx.GRPC.CallsTo("ConfirmReservation");
+  ctx.Equal(calls.size(), 4, "a warehouse that never answers gets MAX_CONFIRM_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried like UNAVAILABLE); the calls so far");
+  for (size_t i = 2; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 1.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 2.5,
+               "an attempt at a hung warehouse carried a deadline of %vs: each attempt gets its own 2 s, not what is left of the first one's",
+               calls[i].TimeoutSeconds());
+  }
+  ctx.Equal(again, "pending", "a warehouse that never answered may have allocated; the result");
+  ctx.Assert(ctx.Redis.HGet("holds:sku-1", "r-1").value_or("") == "3" && clientUnits(ctx) == "7",
+             "after a hung warehouse holds:sku-1 is %v and stock:sku-1 %s: a pending reservation keeps its hold", ctx.Redis.HGetAll("holds:sku-1"), clientUnits(ctx));
 }
 
 void CheckRejectionFinal(harness::Ctx& ctx) {
   clientWorld(ctx);
-  ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::FAILED_PRECONDITION, "not enough units in the warehouse", 5);
+  ctx.GRPC.Fail("ConfirmReservation", grpc::StatusCode::FAILED_PRECONDITION, "not enough units in the warehouse", 1);
   const std::string result = confirmReservation(kClientReservation);
   ctx.Equal(ctx.GRPC.CallsTo("ConfirmReservation").size(), 1, "FAILED_PRECONDITION is a verdict; the calls to the warehouse");
   ctx.Equal(result, "rejected", "confirmReservation's result");
   ctx.Assert(clientUnits(ctx) == "10" && ctx.Redis.HGetAll("holds:sku-1").empty(),
              "after the refusal stock:sku-1 is %s and holds:sku-1 %v: the 3 units go back once", clientUnits(ctx), ctx.Redis.HGetAll("holds:sku-1"));
   ctx.Equal(clientStatus(ctx), "rejected", "the stored reservation's status");
+  // Codes other than DEADLINE_EXCEEDED and UNAVAILABLE are not retried either: one call each, whatever the outcome.
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::INTERNAL, "INTERNAL"},
+                                                                                      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}}) {
+    ctx.GRPC.Fail("ConfirmReservation", code, "warehouse error", 1);
+    const size_t before = ctx.GRPC.CallsTo("ConfirmReservation").size();
+    try {
+      confirmReservation(kClientReservation);
+    } catch (...) {
+      // the outcome is the client's choice; only the calls are checked
+    }
+    ctx.Equal(ctx.GRPC.CallsTo("ConfirmReservation").size() - before, 1, "a warehouse that answered %s is not retried (only DEADLINE_EXCEEDED and UNAVAILABLE are); the calls", name);
+  }
 }
 `,
   },

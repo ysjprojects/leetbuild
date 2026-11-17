@@ -71,7 +71,7 @@ timeout starts a second browser.
       id: 'profile',
       title: 'Refuses an unknown profile and an off-profile start URL',
       detail:
-        'An unknown profile is 400 rather than a fallback to `DEFAULT_PROFILE`, and a `start_url` goes through `authorize_navigation`/`authorizeNavigation` before it becomes the first page; a refused one is 400.',
+        'An unknown profile is 400 rather than a fallback to `DEFAULT_PROFILE`, and a `start_url` goes through `authorize_navigation`/`authorizeNavigation` against the requested profile before it becomes the first page; a refused one is 400.',
       match: {
         python: {all: [/profiles\.authorize_navigation\(/], none: [/DEFAULT_PROFILE/]},
         typescript: {all: [/authorizeNavigation\(/], none: [/DEFAULT_PROFILE/]},
@@ -84,7 +84,7 @@ timeout starts a second browser.
       id: 'budget',
       title: 'Requires a step budget from 1 to 60',
       detail:
-        '`max_steps` is required and bounded by `MAX_STEPS` (60); a missing, zero or larger budget is 400. The starter reads a missing budget as `UNLIMITED`.',
+        '`max_steps` is required and bounded by `MAX_STEPS` (60); a missing, zero, negative or larger budget is 400, while 1 and 60 are accepted. The starter reads a missing budget as `UNLIMITED`.',
       match: {
         python: {all: [/MAX_STEPS\s*=\s*60\b/], none: [/UNLIMITED/]},
         typescript: {all: [/MAX_STEPS\s*=\s*60\b/], none: [/UNLIMITED/]},
@@ -685,6 +685,8 @@ async def check_profile(ctx):
         assert r.status_code == 400, f"a start with profile 'intranet', which the catalog does not have, answered {r.status_code} {r.text}: it must be 400, not a session under another profile"
         r = await _start(c, {**BODY, "start_url": "http://169.254.169.254/latest/meta-data/"}, key="k-2")
         assert r.status_code == 400, f"a start_url outside the profile (http://169.254.169.254/…) answered {r.status_code} {r.text}: authorize it against the profile and refuse it with 400"
+        r = await _start(c, {**BODY, "profile": "docs-only", "start_url": "https://en.wikipedia.org/wiki/Kettle"}, key="k-4")
+        assert r.status_code == 400, f"a docs-only start at https://en.wikipedia.org/… answered {r.status_code} {r.text}: authorize start_url against the requested profile, which allows *.readthedocs.io only"
         assert _stored(ctx) == [], f"refused starts left sessions behind: {_stored(ctx)}"
         r = await _start(c, {**BODY, "start_url": "https://en.wikipedia.org/wiki/Kettle"}, key="k-3")
     assert r.status_code == 201, f"a start_url the profile allows answered {r.status_code}: {r.text}"
@@ -694,12 +696,14 @@ async def check_profile(ctx):
 async def check_budget(ctx):
     no_budget = {k: v for k, v in BODY.items() if k != "max_steps"}
     async with _api(ctx) as c:
-        for key, body, label in (("k-1", no_budget, "without max_steps"), ("k-2", {**BODY, "max_steps": 0}, "with max_steps 0"), ("k-3", {**BODY, "max_steps": 61}, "with max_steps 61")):
+        for key, body, label in (("k-1", no_budget, "without max_steps"), ("k-2", {**BODY, "max_steps": 0}, "with max_steps 0"), ("k-3", {**BODY, "max_steps": 61}, "with max_steps 61"), ("k-4", {**BODY, "max_steps": -1}, "with max_steps -1")):
             r = await _start(c, body, key=key)
             assert r.status_code == 400, f"a start {label} answered {r.status_code} {r.text}: the budget is required, 1 to 60 steps"
         assert _stored(ctx) == [], f"starts without a valid budget left sessions behind: {_stored(ctx)}"
-        r = await _start(c, {**BODY, "max_steps": 60}, key="k-4")
-    assert r.status_code == 201 and r.json().get("budget_remaining") == 60, f"a start with max_steps 60 answered {r.status_code} {r.text}, expected 201 with budget_remaining 60"
+        r = await _start(c, {**BODY, "max_steps": 60}, key="k-5")
+        assert r.status_code == 201 and r.json().get("budget_remaining") == 60, f"a start with max_steps 60 answered {r.status_code} {r.text}, expected 201 with budget_remaining 60"
+        r = await _start(c, {**BODY, "max_steps": 1}, key="k-6")
+    assert r.status_code == 201 and r.json().get("budget_remaining") == 1, f"a start with max_steps 1 answered {r.status_code} {r.text}, expected 201 with budget_remaining 1"
 
 
 async def check_idempotency(ctx):
@@ -750,6 +754,8 @@ export async function check_profile(ctx) {
   assert.equal(r.status, 400, \`a start with profile 'intranet', which the catalog does not have, answered \${r.status} \${r.text}: it must be 400, not a session under another profile\`);
   r = await start(c, {...BODY, start_url: 'http://169.254.169.254/latest/meta-data/'}, 'k-2');
   assert.equal(r.status, 400, \`a start_url outside the profile (http://169.254.169.254/…) answered \${r.status} \${r.text}: authorize it against the profile and refuse it with 400\`);
+  r = await start(c, {...BODY, profile: 'docs-only', start_url: 'https://en.wikipedia.org/wiki/Kettle'}, 'k-4');
+  assert.equal(r.status, 400, \`a docs-only start at https://en.wikipedia.org/… answered \${r.status} \${r.text}: authorize start_url against the requested profile, which allows *.readthedocs.io only\`);
   assert.deepStrictEqual(stored(ctx), [], \`refused starts left sessions behind: \${JSON.stringify(stored(ctx))}\`);
   r = await start(c, {...BODY, start_url: 'https://en.wikipedia.org/wiki/Kettle'}, 'k-3');
   assert.equal(r.status, 201, \`a start_url the profile allows answered \${r.status}: \${r.text}\`);
@@ -759,13 +765,15 @@ export async function check_profile(ctx) {
 export async function check_budget(ctx) {
   const {c} = api(ctx);
   const {max_steps: _, ...noBudget} = BODY;
-  for (const [key, body, label] of [['k-1', noBudget, 'without max_steps'], ['k-2', {...BODY, max_steps: 0}, 'with max_steps 0'], ['k-3', {...BODY, max_steps: 61}, 'with max_steps 61']] as const) {
+  for (const [key, body, label] of [['k-1', noBudget, 'without max_steps'], ['k-2', {...BODY, max_steps: 0}, 'with max_steps 0'], ['k-3', {...BODY, max_steps: 61}, 'with max_steps 61'], ['k-4', {...BODY, max_steps: -1}, 'with max_steps -1']] as const) {
     const r = await start(c, body, key);
     assert.equal(r.status, 400, \`a start \${label} answered \${r.status} \${r.text}: the budget is required, 1 to 60 steps\`);
   }
   assert.deepStrictEqual(stored(ctx), [], \`starts without a valid budget left sessions behind: \${JSON.stringify(stored(ctx))}\`);
-  const r = await start(c, {...BODY, max_steps: 60}, 'k-4');
+  let r = await start(c, {...BODY, max_steps: 60}, 'k-5');
   assert(r.status === 201 && r.json().budget_remaining === 60, \`a start with max_steps 60 answered \${r.status} \${r.text}, expected 201 with budget_remaining 60\`);
+  r = await start(c, {...BODY, max_steps: 1}, 'k-6');
+  assert(r.status === 201 && r.json().budget_remaining === 1, \`a start with max_steps 1 answered \${r.status} \${r.text}, expected 201 with budget_remaining 1\`);
 }
 
 export async function check_idempotency(ctx) {
@@ -792,9 +800,9 @@ import (
 	"leetbuild/harness"
 )
 
-const entry = "https://www.example.com/"
+const hEntry = "https://www.example.com/"
 
-func body(changes map[string]any, drop string) map[string]any {
+func hBody(changes map[string]any, drop string) map[string]any {
 	out := map[string]any{"task": "find the price of the 2 L kettle", "profile": "public-web", "max_steps": 10}
 	for k, v := range changes {
 		out[k] = v
@@ -803,83 +811,88 @@ func body(changes map[string]any, drop string) map[string]any {
 	return out
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func start(c *harness.HTTP, b map[string]any, key string) *harness.Response {
+func hStart(c *harness.HTTP, b map[string]any, key string) *harness.Response {
 	return c.Post("/v1/browser/sessions", b, "X-Tenant-Id", "acme", "Idempotency-Key", key)
 }
 
-type view struct {
+type hView struct {
 	SessionID       string \`json:"session_id"\`
 	CurrentURL      string \`json:"current_url"\`
 	BudgetRemaining int    \`json:"budget_remaining"\`
 }
 
-func viewOf(r *harness.Response) view {
-	var v view
+func hViewOf(r *harness.Response) hView {
+	var v hView
 	r.Decode(&v)
 	return v
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := start(c, body(nil, ""), "k-1")
+	c := hAPI(ctx)
+	r := hStart(c, hBody(nil, ""), "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/browser/sessions (%s)", r.Text())
-	v := viewOf(r)
+	v := hViewOf(r)
 	session := sessions.LoadSession(context.Background(), v.SessionID)
 	ctx.Assert(session != nil, "the answer names session %q, which is not stored under browser:session:{id}", v.SessionID)
 	ctx.Assert(session.Tenant == "acme" && session.Profile == "public-web", "the stored session belongs to %q under %q, expected acme under public-web", session.Tenant, session.Profile)
-	ctx.Equal(v.CurrentURL, entry, "a session without start_url starts at the profile's entry; current_url")
+	ctx.Equal(v.CurrentURL, hEntry, "a session without start_url starts at the profile's entry; current_url")
 	ctx.Equal(v.BudgetRemaining, 10, "a session of 10 steps; budget_remaining")
-	r = c.Post("/v1/browser/sessions", body(nil, ""), "Idempotency-Key", "k-2")
+	r = c.Post("/v1/browser/sessions", hBody(nil, ""), "Idempotency-Key", "k-2")
 	ctx.Equal(r.Status, 401, "a start without X-Tenant-Id")
 }
 
 func CheckProfile(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := start(c, body(map[string]any{"profile": "intranet"}, ""), "k-1")
+	c := hAPI(ctx)
+	r := hStart(c, hBody(map[string]any{"profile": "intranet"}, ""), "k-1")
 	ctx.Equal(r.Status, 400, "a start with profile 'intranet', which the catalog does not have, must be 400, not a session under another profile (%s)", r.Text())
-	r = start(c, body(map[string]any{"start_url": "http://169.254.169.254/latest/meta-data/"}, ""), "k-2")
+	r = hStart(c, hBody(map[string]any{"start_url": "http://169.254.169.254/latest/meta-data/"}, ""), "k-2")
 	ctx.Equal(r.Status, 400, "a start_url outside the profile (http://169.254.169.254/…) must be authorized against the profile and refused (%s)", r.Text())
+	r = hStart(c, hBody(map[string]any{"profile": "docs-only", "start_url": "https://en.wikipedia.org/wiki/Kettle"}, ""), "k-4")
+	ctx.Equal(r.Status, 400, "a docs-only start at https://en.wikipedia.org/… must be authorized against the requested profile, which allows *.readthedocs.io only (%s)", r.Text())
 	ctx.Equal(len(ctx.Redis.Keys("browser:session:*")), 0, "refused starts must leave no session; stored sessions")
-	r = start(c, body(map[string]any{"start_url": "https://en.wikipedia.org/wiki/Kettle"}, ""), "k-3")
+	r = hStart(c, hBody(map[string]any{"start_url": "https://en.wikipedia.org/wiki/Kettle"}, ""), "k-3")
 	ctx.Equal(r.Status, 201, "a start_url the profile allows (%s)", r.Text())
-	ctx.Equal(viewOf(r).CurrentURL, "https://en.wikipedia.org/wiki/Kettle", "an allowed start_url must be the first page; current_url")
+	ctx.Equal(hViewOf(r).CurrentURL, "https://en.wikipedia.org/wiki/Kettle", "an allowed start_url must be the first page; current_url")
 }
 
 func CheckBudget(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	cases := []struct {
 		key, label string
 		b          map[string]any
 	}{
-		{"k-1", "without max_steps", body(nil, "max_steps")},
-		{"k-2", "with max_steps 0", body(map[string]any{"max_steps": 0}, "")},
-		{"k-3", "with max_steps 61", body(map[string]any{"max_steps": 61}, "")},
+		{"k-1", "without max_steps", hBody(nil, "max_steps")},
+		{"k-2", "with max_steps 0", hBody(map[string]any{"max_steps": 0}, "")},
+		{"k-3", "with max_steps 61", hBody(map[string]any{"max_steps": 61}, "")},
+		{"k-4", "with max_steps -1", hBody(map[string]any{"max_steps": -1}, "")},
 	}
 	for _, tc := range cases {
-		r := start(c, tc.b, tc.key)
+		r := hStart(c, tc.b, tc.key)
 		ctx.Equal(r.Status, 400, "a start %s must be refused: the budget is required, 1 to 60 steps (%s)", tc.label, r.Text())
 	}
 	ctx.Equal(len(ctx.Redis.Keys("browser:session:*")), 0, "starts without a valid budget must leave no session; stored sessions")
-	r := start(c, body(map[string]any{"max_steps": 60}, ""), "k-4")
-	ctx.Assert(r.Status == 201 && viewOf(r).BudgetRemaining == 60, "a start with max_steps 60 answered %d %s, expected 201 with budget_remaining 60", r.Status, r.Text())
+	r := hStart(c, hBody(map[string]any{"max_steps": 60}, ""), "k-5")
+	ctx.Assert(r.Status == 201 && hViewOf(r).BudgetRemaining == 60, "a start with max_steps 60 answered %d %s, expected 201 with budget_remaining 60", r.Status, r.Text())
+	r = hStart(c, hBody(map[string]any{"max_steps": 1}, ""), "k-6")
+	ctx.Assert(r.Status == 201 && hViewOf(r).BudgetRemaining == 1, "a start with max_steps 1 answered %d %s, expected 201 with budget_remaining 1", r.Status, r.Text())
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := start(c, body(nil, ""), "k-1")
+	c := hAPI(ctx)
+	first := hStart(c, hBody(nil, ""), "k-1")
 	ctx.Equal(first.Status, 201, "the first start (%s)", first.Text())
-	replay := start(c, body(nil, ""), "k-1")
-	ctx.Assert(replay.Status == 200 && viewOf(replay).SessionID == viewOf(first).SessionID, "a retry with the same Idempotency-Key answered %d %s: it must answer 200 with session %q", replay.Status, replay.Text(), viewOf(first).SessionID)
+	replay := hStart(c, hBody(nil, ""), "k-1")
+	ctx.Assert(replay.Status == 200 && hViewOf(replay).SessionID == hViewOf(first).SessionID, "a retry with the same Idempotency-Key answered %d %s: it must answer 200 with session %q", replay.Status, replay.Text(), hViewOf(first).SessionID)
 	ctx.Equal(len(ctx.Redis.Keys("browser:session:*")), 1, "one start and its retry; stored sessions")
-	other := c.Post("/v1/browser/sessions", body(nil, ""), "X-Tenant-Id", "globex", "Idempotency-Key", "k-1")
-	ctx.Assert(other.Status == 201 && viewOf(other).SessionID != viewOf(first).SessionID, "the same key from another tenant answered %d %s: it is another request and starts its own session", other.Status, other.Text())
-	missing := c.Post("/v1/browser/sessions", body(nil, ""), "X-Tenant-Id", "acme")
+	other := c.Post("/v1/browser/sessions", hBody(nil, ""), "X-Tenant-Id", "globex", "Idempotency-Key", "k-1")
+	ctx.Assert(other.Status == 201 && hViewOf(other).SessionID != hViewOf(first).SessionID, "the same key from another tenant answered %d %s: it is another request and starts its own session", other.Status, other.Text())
+	missing := c.Post("/v1/browser/sessions", hBody(nil, ""), "X-Tenant-Id", "acme")
 	ctx.Equal(missing.Status, 400, "a start without Idempotency-Key")
 }
 `,
@@ -894,11 +907,11 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEntry = "https://www.example.com/";
+const std::string hEntry = "https://www.example.com/";
 
-nlohmann::json body() { return {{"task", "find the price of the 2 L kettle"}, {"profile", "public-web"}, {"max_steps", 10}}; }
+nlohmann::json hBody() { return {{"task", "find the price of the 2 L kettle"}, {"profile", "public-web"}, {"max_steps", 10}}; }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -906,11 +919,11 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response start(harness::HTTP& c, const nlohmann::json& b, const std::string& key, const std::string& tenant = "acme") {
+harness::Response hStart(harness::HTTP& c, const nlohmann::json& b, const std::string& key, const std::string& tenant = "acme") {
   return c.Post("/v1/browser/sessions", b.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json viewOf(const harness::Response& r) {
+nlohmann::json hViewOf(const harness::Response& r) {
   const auto v = nlohmann::json::parse(r.Text(), nullptr, false);
   return v.is_object() ? v : nlohmann::json::object();
 }
@@ -918,68 +931,78 @@ nlohmann::json viewOf(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = start(c, body(), "k-1");
+  auto c = hApi(ctx);
+  auto r = hStart(c, hBody(), "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/browser/sessions (%s)", r.Text());
-  const auto v = viewOf(r);
+  const auto v = hViewOf(r);
   const auto session = sessions::loadSession(v.value("session_id", ""));
   ctx.Assert(session.has_value(), "the answer names session %q, which is not stored under browser:session:{id}", v.value("session_id", ""));
   ctx.Assert(session->tenant == "acme" && session->profile == "public-web", "the stored session belongs to %q under %q, expected acme under public-web", session->tenant, session->profile);
-  ctx.Equal(v.value("current_url", ""), kEntry, "a session without start_url starts at the profile's entry; current_url");
+  ctx.Equal(v.value("current_url", ""), hEntry, "a session without start_url starts at the profile's entry; current_url");
   ctx.Equal(v.value("budget_remaining", 0L), 10, "a session of 10 steps; budget_remaining");
-  r = c.Post("/v1/browser/sessions", body().dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
+  r = c.Post("/v1/browser/sessions", hBody().dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
   ctx.Equal(r.Status, 401, "a start without X-Tenant-Id");
 }
 
 void CheckProfile(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto b = body();
+  auto c = hApi(ctx);
+  auto b = hBody();
   b["profile"] = "intranet";
-  auto r = start(c, b, "k-1");
+  auto r = hStart(c, b, "k-1");
   ctx.Equal(r.Status, 400, "a start with profile 'intranet', which the catalog does not have, must be 400, not a session under another profile (%s)", r.Text());
-  b = body();
+  b = hBody();
   b["start_url"] = "http://169.254.169.254/latest/meta-data/";
-  r = start(c, b, "k-2");
+  r = hStart(c, b, "k-2");
   ctx.Equal(r.Status, 400, "a start_url outside the profile (http://169.254.169.254/…) must be authorized against the profile and refused (%s)", r.Text());
+  auto docs = hBody();
+  docs["profile"] = "docs-only";
+  docs["start_url"] = "https://en.wikipedia.org/wiki/Kettle";
+  r = hStart(c, docs, "k-4");
+  ctx.Equal(r.Status, 400, "a docs-only start at https://en.wikipedia.org/… must be authorized against the requested profile, which allows *.readthedocs.io only (%s)", r.Text());
   ctx.Equal(ctx.Redis.Keys("browser:session:*"), std::vector<std::string>{}, "refused starts must leave no session; stored");
   b["start_url"] = "https://en.wikipedia.org/wiki/Kettle";
-  r = start(c, b, "k-3");
+  r = hStart(c, b, "k-3");
   ctx.Equal(r.Status, 201, "a start_url the profile allows (%s)", r.Text());
-  ctx.Equal(viewOf(r).value("current_url", ""), "https://en.wikipedia.org/wiki/Kettle", "an allowed start_url must be the first page; current_url");
+  ctx.Equal(hViewOf(r).value("current_url", ""), "https://en.wikipedia.org/wiki/Kettle", "an allowed start_url must be the first page; current_url");
 }
 
 void CheckBudget(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto none = body();
+  auto c = hApi(ctx);
+  auto none = hBody();
   none.erase("max_steps");
-  auto zero = body();
+  auto zero = hBody();
   zero["max_steps"] = 0;
-  auto over = body();
+  auto over = hBody();
   over["max_steps"] = 61;
-  const std::vector<std::pair<nlohmann::json, std::string>> cases = {{none, "without max_steps"}, {zero, "with max_steps 0"}, {over, "with max_steps 61"}};
+  auto negative = hBody();
+  negative["max_steps"] = -1;
+  const std::vector<std::pair<nlohmann::json, std::string>> cases = {
+      {none, "without max_steps"}, {zero, "with max_steps 0"}, {over, "with max_steps 61"}, {negative, "with max_steps -1"}};
   int n = 0;
   for (const auto& [b, label] : cases) {
-    const auto r = start(c, b, "k-" + std::to_string(++n));
+    const auto r = hStart(c, b, "k-" + std::to_string(++n));
     ctx.Equal(r.Status, 400, "a start %s must be refused: the budget is required, 1 to 60 steps (%s)", label, r.Text());
   }
   ctx.Equal(ctx.Redis.Keys("browser:session:*"), std::vector<std::string>{}, "starts without a valid budget must leave no session; stored");
-  auto full = body();
-  full["max_steps"] = 60;
-  const auto r = start(c, full, "k-4");
-  ctx.Assert(r.Status == 201 && viewOf(r).value("budget_remaining", 0L) == 60, "a start with max_steps 60 answered %d %s, expected 201 with budget_remaining 60", r.Status, r.Text());
+  for (const long steps : {60L, 1L}) {
+    auto valid = hBody();
+    valid["max_steps"] = steps;
+    const auto r = hStart(c, valid, "k-" + std::to_string(++n));
+    ctx.Assert(r.Status == 201 && hViewOf(r).value("budget_remaining", 0L) == steps, "a start with max_steps %d answered %d %s, expected 201 with budget_remaining %d", steps, r.Status, r.Text(), steps);
+  }
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = start(c, body(), "k-1");
+  auto c = hApi(ctx);
+  const auto first = hStart(c, hBody(), "k-1");
   ctx.Equal(first.Status, 201, "the first start (%s)", first.Text());
-  const std::string id = viewOf(first).value("session_id", "");
-  const auto replay = start(c, body(), "k-1");
-  ctx.Assert(replay.Status == 200 && viewOf(replay).value("session_id", "") == id, "a retry with the same Idempotency-Key answered %d %s: it must answer 200 with session %q", replay.Status, replay.Text(), id);
+  const std::string id = hViewOf(first).value("session_id", "");
+  const auto replay = hStart(c, hBody(), "k-1");
+  ctx.Assert(replay.Status == 200 && hViewOf(replay).value("session_id", "") == id, "a retry with the same Idempotency-Key answered %d %s: it must answer 200 with session %q", replay.Status, replay.Text(), id);
   ctx.Equal(ctx.Redis.Keys("browser:session:*").size(), 1, "one start and its retry; stored sessions");
-  const auto other = start(c, body(), "k-1", "globex");
-  ctx.Assert(other.Status == 201 && viewOf(other).value("session_id", "") != id, "the same key from another tenant answered %d %s: it is another request and starts its own session", other.Status, other.Text());
-  const auto missing = c.Post("/v1/browser/sessions", body().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  const auto other = hStart(c, hBody(), "k-1", "globex");
+  ctx.Assert(other.Status == 201 && hViewOf(other).value("session_id", "") != id, "the same key from another tenant answered %d %s: it is another request and starts its own session", other.Status, other.Text());
+  const auto missing = c.Post("/v1/browser/sessions", hBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
   ctx.Equal(missing.Status, 400, "a start without Idempotency-Key");
 }
 `,

@@ -44,7 +44,7 @@ refusal arrives in the delivery report and nothing reads it.
       id: 'event-envelope',
       title: 'A completed attempt publishes one job.event',
       detail:
-        'A completed attempt produces one record on `job.event` carrying `job_id`, `kind: "completed"`, `attempts`, `duration_ms` and `worker`, and `complete` returns true.',
+        'A completed attempt produces one record on `job.event` carrying `job_id`, `kind: "completed"`, `attempts`, `duration_ms` and `worker`, `complete` returns true, and nothing is written to `jobs:outbox` for an event the broker took.',
       match: {
         python: {all: [/TOPIC\s*=\s*["']job\.event["']/, /["']duration_ms["']/]},
         typescript: {all: [/TOPIC\s*=\s*['"]job\.event['"]/, /duration_ms/]},
@@ -83,7 +83,7 @@ refusal arrives in the delivery report and nothing reads it.
       id: 'outbox-on-rejection',
       title: 'A refused record goes to the outbox from the delivery report',
       detail:
-        'When the broker refuses the record, the event lands in `jobs:outbox`, nothing reaches the topic, and `complete` neither raises nor undoes the completed job. The starter looks only at errors the produce call itself raises.',
+        'When the broker refuses the record, the whole event, every field, lands in `jobs:outbox`, nothing reaches the topic, and `complete` neither raises nor undoes the completed job. The starter looks only at errors the produce call itself raises.',
       match: {
         python: {all: [/on_delivery\s*=/, /store\.outbox_add\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/catch[\s\S]*store\.outboxAdd\(/]},
@@ -549,6 +549,8 @@ def check_event_envelope(ctx):
     expected = {"job_id": "job-1", "kind": "completed", "attempts": 1, "duration_ms": 840, "worker": "w-1"}
     for key, value in expected.items():
         assert events[0].get(key) == value, f"the event must carry {key}={value!r}, got {events[0]}"
+    outbox = ctx.redis.lrange("jobs:outbox", 0, -1)
+    assert outbox == [], f"the broker took the event, yet jobs:outbox holds {outbox}: the relay would publish it a second time. Only a refused event goes to the outbox"
 
 
 def check_job_key(ctx):
@@ -594,7 +596,8 @@ def check_outbox_on_rejection(ctx):
     _settle(m)
     rows = [json.loads(row) for row in ctx.redis.lrange("jobs:outbox", 0, -1)]
     assert len(rows) == 1, f"the broker refused the completed event and jobs:outbox holds {len(rows)} rows: the refusal arrives in the delivery report, and the event must be kept for the relay"
-    assert rows[0].get("job_id") == "job-1" and rows[0].get("kind") == "completed", f"the outbox row must be the event itself, got {rows[0]}"
+    expected = {"job_id": "job-1", "kind": "completed", "attempts": 1, "duration_ms": 840, "worker": "w-1"}
+    assert all(rows[0].get(key) == value for key, value in expected.items()), f"the outbox row must be the event itself, {expected}, got {rows[0]}: the relay republishes the row as it is"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused record"
     assert done is True and store.get_job("job-1")["state"] == "completed", f"the job is done whatever the broker said: complete returned {done!r} and the job is {store.get_job('job-1')}"
 `,
@@ -628,6 +631,8 @@ export async function check_event_envelope(ctx) {
   assert.equal(all.length, 1, \`one completed attempt produced \${all.length} records on \${TOPIC}\`);
   const expected = {job_id: 'job-1', kind: 'completed', attempts: 1, duration_ms: 840, worker: 'w-1'};
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(all[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(all[0])}\`);
+  const outbox = ctx.redis.lrange('jobs:outbox', 0, -1);
+  assert.deepEqual(outbox, [], \`the broker took the event, yet jobs:outbox holds \${JSON.stringify(outbox)}: the relay would publish it a second time. Only a refused event goes to the outbox\`);
 }
 
 export async function check_job_key(ctx) {
@@ -675,7 +680,8 @@ export async function check_outbox_on_rejection(ctx) {
   await settle();
   const rows = ctx.redis.lrange('jobs:outbox', 0, -1).map(row => JSON.parse(row));
   assert.equal(rows.length, 1, \`the broker refused the completed event and jobs:outbox holds \${rows.length} rows: the event must be kept for the relay\`);
-  assert(rows[0].job_id === 'job-1' && rows[0].kind === 'completed', \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
+  const expected = {job_id: 'job-1', kind: 'completed', attempts: 1, duration_ms: 840, worker: 'w-1'};
+  assert(Object.entries(expected).every(([key, value]) => rows[0][key] === value), \`the outbox row must be the event itself, \${JSON.stringify(expected)}, got \${JSON.stringify(rows[0])}: the relay republishes the row as it is\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused record');
   const job = await store.getJob('job-1');
   assert(done === true && job.state === 'completed', \`the job is done whatever the broker said: complete returned \${done} and the job is \${JSON.stringify(job)}\`);
@@ -727,6 +733,8 @@ func CheckEventEnvelope(ctx *harness.Ctx) {
 	all := eventsAll(ctx)
 	ctx.Equal(len(all), 1, "one completed attempt's records on job.event")
 	ctx.Equal(all[0], map[string]any{"job_id": "job-1", "kind": "completed", "attempts": float64(1), "duration_ms": float64(840), "worker": "w-1"}, "the event")
+	outbox := ctx.Redis.LRange("jobs:outbox", 0, -1)
+	ctx.Assert(len(outbox) == 0, "the broker took the event, yet jobs:outbox holds %v: the relay would publish it a second time. Only a refused event goes to the outbox", outbox)
 }
 
 func CheckJobKey(ctx *harness.Ctx) {
@@ -775,7 +783,7 @@ func CheckOutboxOnRejection(ctx *harness.Ctx) {
 	ctx.Equal(len(rows), 1, "the broker refused the completed event: it must be kept for the relay; outbox rows")
 	var row map[string]any
 	json.Unmarshal([]byte(rows[0]), &row)
-	ctx.Assert(row["job_id"] == "job-1" && row["kind"] == "completed", "the outbox row must be the event itself, got %s", rows[0])
+	ctx.Assert(row["job_id"] == "job-1" && row["kind"] == "completed" && row["attempts"] == float64(1) && row["duration_ms"] == float64(840) && row["worker"] == "w-1", "the outbox row must be the event itself, {job_id: job-1, kind: completed, attempts: 1, duration_ms: 840, worker: w-1}, got %s: the relay republishes the row as it is", rows[0])
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "nothing reached the topic for the refused record; records")
 	job := store.GetJob(eventsBg, "job-1")
 	ctx.Assert(done && job.State == "completed", "the job is done whatever the broker said: complete returned %v and the job is %+v", done, job)
@@ -823,6 +831,8 @@ void CheckEventEnvelope(harness::Ctx& ctx) {
   const auto all = eventsAll(ctx);
   ctx.Equal(all.size(), 1, "one completed attempt's records on job.event");
   ctx.Equal(all[0], nlohmann::json({{"job_id", "job-1"}, {"kind", "completed"}, {"attempts", 1}, {"duration_ms", 840}, {"worker", "w-1"}}), "the event");
+  const auto outbox = ctx.Redis.LRange("jobs:outbox", 0, -1);
+  ctx.Assert(outbox.empty(), "the broker took the event, yet jobs:outbox holds %s: the relay would publish it a second time. Only a refused event goes to the outbox", outbox.empty() ? "" : outbox[0]);
 }
 
 void CheckJobKey(harness::Ctx& ctx) {
@@ -871,7 +881,7 @@ void CheckOutboxOnRejection(harness::Ctx& ctx) {
   const auto rows = ctx.Redis.LRange("jobs:outbox", 0, -1);
   ctx.Equal(rows.size(), 1, "the broker refused the completed event: it must be kept for the relay; outbox rows");
   const auto row = nlohmann::json::parse(rows.empty() ? "{}" : rows[0], nullptr, false);
-  ctx.Assert(row.value("job_id", "") == "job-1" && row.value("kind", "") == "completed", "the outbox row must be the event itself, got %s", rows.empty() ? "" : rows[0]);
+  ctx.Assert(row.is_object() && row.value("job_id", "") == "job-1" && row.value("kind", "") == "completed" && row.value("attempts", 0) == 1 && row.value("duration_ms", 0) == 840 && row.value("worker", "") == "w-1", "the outbox row must be the event itself, {job_id: job-1, kind: completed, attempts: 1, duration_ms: 840, worker: w-1}, got %s: the relay republishes the row as it is", rows.empty() ? "" : rows[0]);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused record; records");
   ctx.Assert(done && store::getJob("job-1")->state == "completed", "the job is done whatever the broker said: complete returned %t and the job is %s", done, store::getJob("job-1")->state);
 }

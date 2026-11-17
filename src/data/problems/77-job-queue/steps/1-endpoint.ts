@@ -19,7 +19,7 @@ answers a hit with \`200 {job_id, duplicate: true}\`; otherwise it queues the jo
 are queued and fail in a worker five attempts later; two replicas that receive one retried request
 both queue it, and a key reserved once is never released.
 
-- A type missing from \`store.JOB_TYPES\` is **400**, before anything is written.
+- A type missing from \`store.JOB_TYPES\` is **400**, before anything is written, the Dedupe-Key included.
 - \`store.validate_payload(type, payload)\` returns the first path the schema rejects
   (\`payload.amount_cents\`); a rejected payload is **422** with that path in the body.
 - Reserve the key with one \`SET … NX EX DEDUPE_WINDOW_S\` (86 400 s) before the job is created;
@@ -54,7 +54,7 @@ both queue it, and a key reserved once is never released.
       id: 'job-type',
       title: 'An unregistered job type is 400 and nothing is queued',
       detail:
-        'The type is looked up in the registry before the job is created: `emial.send` answers **400**, and neither a job record nor a queue entry exists afterwards. The starter queues whatever type it is given.',
+        'The type is looked up in the registry before the job is created: `emial.send` answers **400**, and neither a job record, a queue entry nor a Dedupe-Key reservation exists afterwards, so the corrected retry with the same key is queued. The starter queues whatever type it is given.',
       match: {
         python: {all: [/store\.JOB_TYPES\b/], order: [/store\.JOB_TYPES\b/, /store\.create_job\(/]},
         typescript: {all: [/store\.JOB_TYPES\b/], order: [/store\.JOB_TYPES\b/, /store\.createJob\(/]},
@@ -73,7 +73,7 @@ both queue it, and a key reserved once is never released.
       id: 'payload-schema',
       title: 'A payload the schema rejects is 422 naming the path',
       detail:
-        'A missing field, a field of the wrong type and a field the closed schema does not list each answer **422** with the path `validate_payload` returns, and nothing is queued. The starter passes the payload straight to the queue.',
+        'A missing field, a field of the wrong type and a field the closed schema does not list each answer **422** with the path `validate_payload` returns, nothing is queued and the Dedupe-Key stays free for the corrected retry. The starter passes the payload straight to the queue.',
       match: {
         python: {
           all: [/store\.validate_payload\(/, /\b422\b/],
@@ -98,7 +98,7 @@ both queue it, and a key reserved once is never released.
       id: 'dedupe-window',
       title: 'Reserves the Dedupe-Key in one SET NX EX before the job exists',
       detail:
-        'A replay answers **200** with the original job id; the key expires after `DEDUPE_WINDOW_S`; and when another replica reserves the key between two of your commands, its job id is answered and no second job is queued. The starter reads with `GET`, queues, then writes with a plain `SET`.',
+        'A replay answers **200** with the original job id; the key holds a TTL of `DEDUPE_WINDOW_S` (a day) from the command that creates it; and when another replica reserves the key between two of your commands, its job id is answered and no second job is queued. The starter reads with `GET`, queues, then writes with a plain `SET`.',
       match: {
         python: {all: [/nx\s*=\s*True/, /ex\s*=\s*DEDUPE_WINDOW_S/], order: [/nx\s*=\s*True/, /store\.create_job\(/]},
         typescript: {all: [/['"]NX['"]/, /DEDUPE_WINDOW_S/], order: [/['"]NX['"]/, /store\.createJob\(/]},
@@ -558,12 +558,16 @@ async def check_route(ctx):
 
 async def check_job_type(ctx):
     async with _api(ctx) as c:
-        r = await c.post("/v1/jobs", json={"type": "emial.send", "payload": EMAIL["payload"]}, headers=TENANT)
+        headers = {**TENANT, "Dedupe-Key": "welcome-typo"}
+        r = await c.post("/v1/jobs", json={"type": "emial.send", "payload": EMAIL["payload"]}, headers=headers)
         assert r.status_code == 400, f"the unregistered type emial.send answered {r.status_code}, expected 400: no worker runs a type the registry does not know"
         assert _queued(ctx) == [], f"an unregistered job type was queued: jobs:queue holds {_queued(ctx)}"
         assert ctx.redis.keys("job:*") == [], f"an unregistered job type left a job record: {ctx.redis.keys('job:*')}"
-        r = await c.post("/v1/jobs", json=EMAIL, headers=TENANT)
-    assert r.status_code == 202, f"a registered type answered {r.status_code}: {r.text}"
+        assert ctx.redis.keys("jobs:dedupe:*") == [], f"a request answered 400 reserved its Dedupe-Key {ctx.redis.keys('jobs:dedupe:*')}: the corrected retry would be answered with a job that was never queued"
+        # The caller fixes the type and retries with the same key.
+        r = await c.post("/v1/jobs", json=EMAIL, headers=headers)
+    assert r.status_code == 202, f"the corrected retry with the same Dedupe-Key answered {r.status_code}, expected 202: {r.text}"
+    assert _queued(ctx) == [r.json().get("job_id")], f"the corrected retry must queue its job: jobs:queue holds {_queued(ctx)}, the answer was {r.text}"
 
 
 async def check_payload_schema(ctx):
@@ -572,28 +576,42 @@ async def check_payload_schema(ctx):
         ({"invoice_id": "inv-7", "amount_cents": "1200"}, "payload.amount_cents", "an amount sent as a string"),
         ({"invoice_id": "inv-7", "amount_cents": 1200, "card_number": "4242"}, "payload.card_number", "a field the schema does not list"),
     ]
+    headers = {**TENANT, "Dedupe-Key": "charge-inv-7"}
     async with _api(ctx) as c:
         for payload, path, what in cases:
-            r = await c.post("/v1/jobs", json={"type": "invoice.charge", "payload": payload}, headers=TENANT)
+            r = await c.post("/v1/jobs", json={"type": "invoice.charge", "payload": payload}, headers=headers)
             assert r.status_code == 422, f"{what} answered {r.status_code}, expected 422: the job would fail in a worker five times instead"
             assert path in r.text, f"the 422 for {what} must name {path}, got {r.text}"
         assert _queued(ctx) == [], f"a rejected payload was queued: jobs:queue holds {_queued(ctx)}"
-        r = await c.post("/v1/jobs", json={"type": "invoice.charge", "payload": {"invoice_id": "inv-7", "amount_cents": 1200}}, headers=TENANT)
-    assert r.status_code == 202, f"a payload that fits the schema answered {r.status_code}: {r.text}"
+        assert ctx.redis.keys("jobs:dedupe:*") == [], f"a request answered 422 reserved its Dedupe-Key {ctx.redis.keys('jobs:dedupe:*')}: the corrected retry would be answered with a job that was never queued"
+        r = await c.post("/v1/jobs", json={"type": "invoice.charge", "payload": {"invoice_id": "inv-7", "amount_cents": 1200}}, headers=headers)
+    assert r.status_code == 202, f"a payload that fits the schema, retried with the same Dedupe-Key, answered {r.status_code}: {r.text}"
+    assert _queued(ctx) == [r.json().get("job_id")], f"the corrected retry must queue its job: jobs:queue holds {_queued(ctx)}, the answer was {r.text}"
 
 
 async def check_dedupe_window(ctx):
     headers = {**TENANT, "Dedupe-Key": "welcome-ada"}
     key = store.dedupe_key("t-1", "welcome-ada")
+    ttls = []
+
+    def watch_ttl():
+        # The key's TTL right after each command on it, until one finds it existing.
+        ttl = ctx.redis.ttl(key)
+        ttls.append(ttl)
+        if ttl == -2:
+            ctx.redis_after(key, watch_ttl)
+
+    ctx.redis_after(key, watch_ttl)
     async with _api(ctx) as c:
         first = await c.post("/v1/jobs", json=EMAIL, headers=headers)
         assert first.status_code == 202, f"the first POST answered {first.status_code}: {first.text}"
+        assert ttls and ttls[-1] != -1, f"{key} existed without a TTL right after the command that created it (TTLs seen {ttls}): reserve and expire in one SET NX EX, or a crash between two commands keeps the key forever"
         original = first.json()["job_id"]
         replay = await c.post("/v1/jobs", json=EMAIL, headers=headers)
         assert replay.status_code == 200 and replay.json().get("job_id") == original, f"a replayed Dedupe-Key must answer 200 with the original job id {original}, got {replay.status_code} {replay.text}"
         assert len(_queued(ctx)) == 1, f"a replay queued a second job: jobs:queue holds {_queued(ctx)}"
         ttl = ctx.redis.ttl(key)
-        assert 0 < ttl <= 86400, f"{key} has TTL {ttl}: the reservation must expire after DEDUPE_WINDOW_S (86400 s), not hold the key forever"
+        assert 86400 - 60 <= ttl <= 86400, f"{key} has TTL {ttl}: the reservation must expire after DEDUPE_WINDOW_S (86400 s), a day: not sooner, and not never"
         ctx.clock.advance(86401)
         later = await c.post("/v1/jobs", json=EMAIL, headers=headers)
         assert later.status_code == 202 and later.json().get("job_id") != original, f"a day later the same key must queue a new job, got {later.status_code} {later.text}"
@@ -630,12 +648,16 @@ export async function check_route(ctx) {
 
 export async function check_job_type(ctx) {
   const {c} = api(ctx);
-  let r = await c.post('/v1/jobs', {json: {type: 'emial.send', payload: EMAIL.payload}, headers: TENANT});
+  const headers = {...TENANT, 'Dedupe-Key': 'welcome-typo'};
+  let r = await c.post('/v1/jobs', {json: {type: 'emial.send', payload: EMAIL.payload}, headers});
   assert.equal(r.status, 400, \`the unregistered type emial.send answered \${r.status}, expected 400: no worker runs a type the registry does not know\`);
   assert.deepEqual(queued(ctx), [], \`an unregistered job type was queued: jobs:queue holds \${JSON.stringify(queued(ctx))}\`);
   assert.deepEqual(ctx.redis.keys('job:*'), [], \`an unregistered job type left a job record: \${JSON.stringify(ctx.redis.keys('job:*'))}\`);
-  r = await c.post('/v1/jobs', {json: EMAIL, headers: TENANT});
-  assert.equal(r.status, 202, \`a registered type answered \${r.status}: \${r.text}\`);
+  assert.deepEqual(ctx.redis.keys('jobs:dedupe:*'), [], \`a request answered 400 reserved its Dedupe-Key \${JSON.stringify(ctx.redis.keys('jobs:dedupe:*'))}: the corrected retry would be answered with a job that was never queued\`);
+  // The caller fixes the type and retries with the same key.
+  r = await c.post('/v1/jobs', {json: EMAIL, headers});
+  assert.equal(r.status, 202, \`the corrected retry with the same Dedupe-Key answered \${r.status}, expected 202: \${r.text}\`);
+  assert.deepEqual(queued(ctx), [r.json().job_id], \`the corrected retry must queue its job: jobs:queue holds \${JSON.stringify(queued(ctx))}, the answer was \${r.text}\`);
 }
 
 export async function check_payload_schema(ctx) {
@@ -645,28 +667,40 @@ export async function check_payload_schema(ctx) {
     [{invoice_id: 'inv-7', amount_cents: '1200'}, 'payload.amount_cents', 'an amount sent as a string'],
     [{invoice_id: 'inv-7', amount_cents: 1200, card_number: '4242'}, 'payload.card_number', 'a field the schema does not list'],
   ];
+  const headers = {...TENANT, 'Dedupe-Key': 'charge-inv-7'};
   for (const [payload, path, what] of cases) {
-    const r = await c.post('/v1/jobs', {json: {type: 'invoice.charge', payload}, headers: TENANT});
+    const r = await c.post('/v1/jobs', {json: {type: 'invoice.charge', payload}, headers});
     assert.equal(r.status, 422, \`\${what} answered \${r.status}, expected 422: the job would fail in a worker five times instead\`);
     assert(r.text.includes(path), \`the 422 for \${what} must name \${path}, got \${r.text}\`);
   }
   assert.deepEqual(queued(ctx), [], \`a rejected payload was queued: jobs:queue holds \${JSON.stringify(queued(ctx))}\`);
-  const r = await c.post('/v1/jobs', {json: {type: 'invoice.charge', payload: {invoice_id: 'inv-7', amount_cents: 1200}}, headers: TENANT});
-  assert.equal(r.status, 202, \`a payload that fits the schema answered \${r.status}: \${r.text}\`);
+  assert.deepEqual(ctx.redis.keys('jobs:dedupe:*'), [], \`a request answered 422 reserved its Dedupe-Key \${JSON.stringify(ctx.redis.keys('jobs:dedupe:*'))}: the corrected retry would be answered with a job that was never queued\`);
+  const r = await c.post('/v1/jobs', {json: {type: 'invoice.charge', payload: {invoice_id: 'inv-7', amount_cents: 1200}}, headers});
+  assert.equal(r.status, 202, \`a payload that fits the schema, retried with the same Dedupe-Key, answered \${r.status}: \${r.text}\`);
+  assert.deepEqual(queued(ctx), [r.json().job_id], \`the corrected retry must queue its job: jobs:queue holds \${JSON.stringify(queued(ctx))}, the answer was \${r.text}\`);
 }
 
 export async function check_dedupe_window(ctx) {
   const {c, store} = api(ctx);
   const headers = {...TENANT, 'Dedupe-Key': 'welcome-ada'};
   const key = store.dedupeKey('t-1', 'welcome-ada');
+  const ttls: number[] = [];
+  const watchTtl = () => {
+    // The key's TTL right after each command on it, until one finds it existing.
+    const ttl = ctx.redis.ttl(key);
+    ttls.push(ttl);
+    if (ttl === -2) ctx.redisAfter(key, watchTtl);
+  };
+  ctx.redisAfter(key, watchTtl);
   const first = await c.post('/v1/jobs', {json: EMAIL, headers});
   assert.equal(first.status, 202, \`the first POST answered \${first.status}: \${first.text}\`);
+  assert(ttls.length > 0 && ttls[ttls.length - 1] !== -1, \`\${key} existed without a TTL right after the command that created it (TTLs seen \${JSON.stringify(ttls)}): reserve and expire in one SET NX EX, or a crash between two commands keeps the key forever\`);
   const original = first.json().job_id;
   const replay = await c.post('/v1/jobs', {json: EMAIL, headers});
   assert(replay.status === 200 && replay.json().job_id === original, \`a replayed Dedupe-Key must answer 200 with the original job id \${original}, got \${replay.status} \${replay.text}\`);
   assert.equal(queued(ctx).length, 1, \`a replay queued a second job: jobs:queue holds \${JSON.stringify(queued(ctx))}\`);
   const ttl = ctx.redis.ttl(key);
-  assert(ttl > 0 && ttl <= 86400, \`\${key} has TTL \${ttl}: the reservation must expire after DEDUPE_WINDOW_S (86400 s), not hold the key forever\`);
+  assert(ttl >= 86400 - 60 && ttl <= 86400, \`\${key} has TTL \${ttl}: the reservation must expire after DEDUPE_WINDOW_S (86400 s), a day: not sooner, and not never\`);
   ctx.clock.advance(86401);
   const later = await c.post('/v1/jobs', {json: EMAIL, headers});
   assert(later.status === 202 && later.json().job_id !== original, \`a day later the same key must queue a new job, got \${later.status} \${later.text}\`);
@@ -699,7 +733,7 @@ var (
 	emailJob     = map[string]any{"type": "email.send", "payload": map[string]any{"to": "ada@example.com", "template": "welcome"}}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func harnessAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -714,7 +748,7 @@ func jobIDOf(r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := harnessAPI(ctx)
 	r := c.Post("/v1/jobs", emailJob, tenantHeader...)
 	ctx.Equal(r.Status, 202, "POST /v1/jobs (%s)", r.Text())
 	jobID := jobIDOf(r)
@@ -725,17 +759,21 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckJobType(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/jobs", map[string]any{"type": "emial.send", "payload": emailJob["payload"]}, tenantHeader...)
+	c := harnessAPI(ctx)
+	headers := append(append([]string{}, tenantHeader...), "Dedupe-Key", "welcome-typo")
+	r := c.Post("/v1/jobs", map[string]any{"type": "emial.send", "payload": emailJob["payload"]}, headers...)
 	ctx.Equal(r.Status, 400, "the unregistered type emial.send must be 400 (no worker runs a type the registry does not know); the status")
 	ctx.Equal(ctx.Redis.LLen("jobs:queue"), 0, "an unregistered job type was queued; jobs:queue length")
 	ctx.Equal(len(ctx.Redis.Keys("job:*")), 0, "an unregistered job type left a job record %v; job records", ctx.Redis.Keys("job:*"))
-	r = c.Post("/v1/jobs", emailJob, tenantHeader...)
-	ctx.Equal(r.Status, 202, "a registered type (%s)", r.Text())
+	ctx.Assert(len(ctx.Redis.Keys("jobs:dedupe:*")) == 0, "a request answered 400 reserved its Dedupe-Key %v: the corrected retry would be answered with a job that was never queued", ctx.Redis.Keys("jobs:dedupe:*"))
+	// The caller fixes the type and retries with the same key.
+	r = c.Post("/v1/jobs", emailJob, headers...)
+	ctx.Equal(r.Status, 202, "the corrected retry with the same Dedupe-Key (%s)", r.Text())
+	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{jobIDOf(r)}, "the corrected retry must queue its job; jobs:queue")
 }
 
 func CheckPayloadSchema(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := harnessAPI(ctx)
 	cases := []struct {
 		payload map[string]any
 		path    string
@@ -745,17 +783,20 @@ func CheckPayloadSchema(ctx *harness.Ctx) {
 		{map[string]any{"invoice_id": "inv-7", "amount_cents": "1200"}, "payload.amount_cents", "an amount sent as a string"},
 		{map[string]any{"invoice_id": "inv-7", "amount_cents": 1200, "card_number": "4242"}, "payload.card_number", "a field the schema does not list"},
 	}
+	headers := append(append([]string{}, tenantHeader...), "Dedupe-Key", "charge-inv-7")
 	for _, tc := range cases {
-		r := c.Post("/v1/jobs", map[string]any{"type": "invoice.charge", "payload": tc.payload}, tenantHeader...)
+		r := c.Post("/v1/jobs", map[string]any{"type": "invoice.charge", "payload": tc.payload}, headers...)
 		ctx.Equal(r.Status, 422, "%s must be 422 (the job would fail in a worker five times instead); the status", tc.what)
-		ctx.Assert(contains(r.Text(), tc.path), "the 422 for %s must name %s, got %s", tc.what, tc.path, r.Text())
+		ctx.Assert(harnessContains(r.Text(), tc.path), "the 422 for %s must name %s, got %s", tc.what, tc.path, r.Text())
 	}
 	ctx.Equal(ctx.Redis.LLen("jobs:queue"), 0, "a rejected payload was queued; jobs:queue length")
-	r := c.Post("/v1/jobs", map[string]any{"type": "invoice.charge", "payload": map[string]any{"invoice_id": "inv-7", "amount_cents": 1200}}, tenantHeader...)
-	ctx.Equal(r.Status, 202, "a payload that fits the schema (%s)", r.Text())
+	ctx.Assert(len(ctx.Redis.Keys("jobs:dedupe:*")) == 0, "a request answered 422 reserved its Dedupe-Key %v: the corrected retry would be answered with a job that was never queued", ctx.Redis.Keys("jobs:dedupe:*"))
+	r := c.Post("/v1/jobs", map[string]any{"type": "invoice.charge", "payload": map[string]any{"invoice_id": "inv-7", "amount_cents": 1200}}, headers...)
+	ctx.Equal(r.Status, 202, "a payload that fits the schema, retried with the same Dedupe-Key (%s)", r.Text())
+	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{jobIDOf(r)}, "the corrected retry must queue its job; jobs:queue")
 }
 
-func contains(s, sub string) bool {
+func harnessContains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
 			return true
@@ -765,17 +806,30 @@ func contains(s, sub string) bool {
 }
 
 func CheckDedupeWindow(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := harnessAPI(ctx)
 	headers := append(append([]string{}, tenantHeader...), "Dedupe-Key", "welcome-ada")
 	key := store.DedupeKey("t-1", "welcome-ada")
+	var ttls []int64
+	var watchTTL func() any
+	watchTTL = func() any {
+		// The key's TTL right after each command on it, until one finds it existing.
+		ttl := ctx.Redis.TTL(key)
+		ttls = append(ttls, ttl)
+		if ttl == -2 {
+			ctx.Redis.After(key, watchTTL)
+		}
+		return nil
+	}
+	ctx.Redis.After(key, watchTTL)
 	first := c.Post("/v1/jobs", emailJob, headers...)
 	ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text())
+	ctx.Assert(len(ttls) > 0 && ttls[len(ttls)-1] != -1, "%s existed without a TTL right after the command that created it (TTLs seen %v): reserve and expire in one SET NX EX, or a crash between two commands keeps the key forever", key, ttls)
 	original := jobIDOf(first)
 	replay := c.Post("/v1/jobs", emailJob, headers...)
 	ctx.Assert(replay.Status == 200 && jobIDOf(replay) == original, "a replayed Dedupe-Key must answer 200 with the original job id %s, got %d %s", original, replay.Status, replay.Text())
 	ctx.Equal(ctx.Redis.LLen("jobs:queue"), 1, "a replay queued a second job; jobs:queue length")
 	ttl := ctx.Redis.TTL(key)
-	ctx.Assert(ttl > 0 && ttl <= 86400, "%s has TTL %d: the reservation must expire after the dedupe window (86400 s), not hold the key forever", key, ttl)
+	ctx.Assert(ttl >= 86400-60 && ttl <= 86400, "%s has TTL %d: the reservation must expire after the dedupe window (86400 s), a day: not sooner, and not never", key, ttl)
 	ctx.Clock.Advance(86401)
 	later := c.Post("/v1/jobs", emailJob, headers...)
 	ctx.Assert(later.Status == 202 && jobIDOf(later) != original, "a day later the same key must queue a new job, got %d %s", later.Status, later.Text())
@@ -797,7 +851,9 @@ func CheckDedupeWindow(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "jobs/store.h"
 
@@ -805,7 +861,7 @@ namespace {
 
 const std::string kEmail = R"({"type": "email.send", "payload": {"to": "ada@example.com", "template": "welcome"}})";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP harnessApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -813,12 +869,12 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const std::string& body, const std::string& dedupe = "") {
+harness::Response harnessPost(harness::HTTP& c, const std::string& body, const std::string& dedupe = "") {
   if (dedupe.empty()) return c.Post("/v1/jobs", body, "Content-Type", "application/json", "X-Tenant-Id", "t-1");
   return c.Post("/v1/jobs", body, "Content-Type", "application/json", "X-Tenant-Id", "t-1", "Dedupe-Key", dedupe);
 }
 
-std::string jobIdOf(const harness::Response& r) {
+std::string harnessJobIdOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("job_id", "") : "";
 }
@@ -826,10 +882,10 @@ std::string jobIdOf(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kEmail);
+  auto c = harnessApi(ctx);
+  const auto r = harnessPost(c, kEmail);
   ctx.Equal(r.Status, 202, "POST /v1/jobs (%s)", r.Text());
-  const std::string job_id = jobIdOf(r);
+  const std::string job_id = harnessJobIdOf(r);
   ctx.Assert(!job_id.empty(), "the 202 must carry the job id, got %s", r.Text());
   const auto job = store::getJob(job_id);
   ctx.Assert(job && job->state == "queued" && job->tenant == "t-1", "the job record of %s is %s", job_id, job ? job->state : "missing");
@@ -837,46 +893,62 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckJobType(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, R"({"type": "emial.send", "payload": {"to": "ada@example.com", "template": "welcome"}})");
+  auto c = harnessApi(ctx);
+  auto r = harnessPost(c, R"({"type": "emial.send", "payload": {"to": "ada@example.com", "template": "welcome"}})", "welcome-typo");
   ctx.Equal(r.Status, 400, "the unregistered type emial.send must be 400 (no worker runs a type the registry does not know); the status");
   ctx.Equal(ctx.Redis.LLen("jobs:queue"), 0, "an unregistered job type was queued; jobs:queue length");
   ctx.Equal(ctx.Redis.Keys("job:*").size(), 0, "an unregistered job type left a job record; job records");
-  r = post(c, kEmail);
-  ctx.Equal(r.Status, 202, "a registered type (%s)", r.Text());
+  ctx.Assert(ctx.Redis.Keys("jobs:dedupe:*").empty(), "a request answered 400 reserved its Dedupe-Key: the corrected retry would be answered with a job that was never queued");
+  // The caller fixes the type and retries with the same key.
+  r = harnessPost(c, kEmail, "welcome-typo");
+  ctx.Equal(r.Status, 202, "the corrected retry with the same Dedupe-Key (%s)", r.Text());
+  ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), std::vector<std::string>{harnessJobIdOf(r)}, "the corrected retry must queue its job; jobs:queue");
 }
 
 void CheckPayloadSchema(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = harnessApi(ctx);
   const std::vector<std::vector<std::string>> cases = {
       {R"({"invoice_id": "inv-7"})", "payload.amount_cents", "a payload missing amount_cents"},
       {R"({"invoice_id": "inv-7", "amount_cents": "1200"})", "payload.amount_cents", "an amount sent as a string"},
       {R"({"invoice_id": "inv-7", "amount_cents": 1200, "card_number": "4242"})", "payload.card_number", "a field the schema does not list"},
   };
   for (const auto& tc : cases) {
-    const auto r = post(c, R"({"type": "invoice.charge", "payload": )" + tc[0] + "}");
+    const auto r = harnessPost(c, R"({"type": "invoice.charge", "payload": )" + tc[0] + "}", "charge-inv-7");
     ctx.Equal(r.Status, 422, "%s must be 422 (the job would fail in a worker five times instead); the status", tc[2]);
     ctx.Assert(r.Text().find(tc[1]) != std::string::npos, "the 422 for %s must name %s, got %s", tc[2], tc[1], r.Text());
   }
   ctx.Equal(ctx.Redis.LLen("jobs:queue"), 0, "a rejected payload was queued; jobs:queue length");
-  const auto r = post(c, R"({"type": "invoice.charge", "payload": {"invoice_id": "inv-7", "amount_cents": 1200}})");
-  ctx.Equal(r.Status, 202, "a payload that fits the schema (%s)", r.Text());
+  ctx.Assert(ctx.Redis.Keys("jobs:dedupe:*").empty(), "a request answered 422 reserved its Dedupe-Key: the corrected retry would be answered with a job that was never queued");
+  const auto r = harnessPost(c, R"({"type": "invoice.charge", "payload": {"invoice_id": "inv-7", "amount_cents": 1200}})", "charge-inv-7");
+  ctx.Equal(r.Status, 202, "a payload that fits the schema, retried with the same Dedupe-Key (%s)", r.Text());
+  ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), std::vector<std::string>{harnessJobIdOf(r)}, "the corrected retry must queue its job; jobs:queue");
 }
 
 void CheckDedupeWindow(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = harnessApi(ctx);
   const std::string key = store::dedupeKey("t-1", "welcome-ada");
-  const auto first = post(c, kEmail, "welcome-ada");
+  std::vector<long long> ttls;
+  std::function<void()> watch_ttl = [&] {
+    // The key's TTL right after each command on it, until one finds it existing.
+    const long long t = ctx.Redis.TTL(key);
+    ttls.push_back(t);
+    if (t == -2) ctx.Redis.After(key, watch_ttl);
+  };
+  ctx.Redis.After(key, watch_ttl);
+  const auto first = harnessPost(c, kEmail, "welcome-ada");
   ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text());
-  const std::string original = jobIdOf(first);
-  const auto replay = post(c, kEmail, "welcome-ada");
-  ctx.Assert(replay.Status == 200 && jobIdOf(replay) == original, "a replayed Dedupe-Key must answer 200 with the original job id %s, got %d %s", original, replay.Status, replay.Text());
+  std::string seen;
+  for (const long long t : ttls) seen += (seen.empty() ? "" : " ") + std::to_string(t);
+  ctx.Assert(!ttls.empty() && ttls.back() != -1, "%s existed without a TTL right after the command that created it (TTLs seen [%s]): reserve and expire in one SET NX EX, or a crash between two commands keeps the key forever", key, seen);
+  const std::string original = harnessJobIdOf(first);
+  const auto replay = harnessPost(c, kEmail, "welcome-ada");
+  ctx.Assert(replay.Status == 200 && harnessJobIdOf(replay) == original, "a replayed Dedupe-Key must answer 200 with the original job id %s, got %d %s", original, replay.Status, replay.Text());
   ctx.Equal(ctx.Redis.LLen("jobs:queue"), 1, "a replay queued a second job; jobs:queue length");
   const long long ttl = ctx.Redis.TTL(key);
-  ctx.Assert(ttl > 0 && ttl <= 86400, "%s has TTL %d: the reservation must expire after the dedupe window (86400 s), not hold the key forever", key, ttl);
+  ctx.Assert(ttl >= 86400 - 60 && ttl <= 86400, "%s has TTL %d: the reservation must expire after the dedupe window (86400 s), a day: not sooner, and not never", key, ttl);
   ctx.Clock.Advance(86401);
-  const auto later = post(c, kEmail, "welcome-ada");
-  ctx.Assert(later.Status == 202 && jobIdOf(later) != original, "a day later the same key must queue a new job, got %d %s", later.Status, later.Text());
+  const auto later = harnessPost(c, kEmail, "welcome-ada");
+  ctx.Assert(later.Status == 202 && harnessJobIdOf(later) != original, "a day later the same key must queue a new job, got %d %s", later.Status, later.Text());
   const std::string race = store::dedupeKey("t-1", "invoice-7");
   bool fired = false;
   bool other_won = false;
@@ -886,13 +958,13 @@ void CheckDedupeWindow(harness::Ctx& ctx) {
     other_won = ctx.Redis.Set(race, "job-other", "NX", "EX", 86400);
   });
   const long long before = ctx.Redis.LLen("jobs:queue");
-  const auto r = post(c, kEmail, "invoice-7");
+  const auto r = harnessPost(c, kEmail, "invoice-7");
   ctx.Assert(fired, "the request never touched the Dedupe-Key's reservation");
   const std::string held = ctx.Redis.Get(race).value_or("");
   if (other_won) {
-    ctx.Assert(jobIdOf(r) == "job-other" && ctx.Redis.LLen("jobs:queue") == before, "another replica reserved the key between your read and your write; you queued %s anyway and the key now holds %s: reserve with one SET NX EX before the job exists", jobIdOf(r), held);
+    ctx.Assert(harnessJobIdOf(r) == "job-other" && ctx.Redis.LLen("jobs:queue") == before, "another replica reserved the key between your read and your write; you queued %s anyway and the key now holds %s: reserve with one SET NX EX before the job exists", harnessJobIdOf(r), held);
   } else {
-    ctx.Assert(held == jobIdOf(r) && ctx.Redis.LLen("jobs:queue") == before + 1, "your request reserved the key, so it must queue its job: the key holds %s, the answer was %s", held, r.Text());
+    ctx.Assert(held == harnessJobIdOf(r) && ctx.Redis.LLen("jobs:queue") == before + 1, "your request reserved the key, so it must queue its job: the key holds %s, the answer was %s", held, r.Text());
   }
 }
 `,

@@ -19,13 +19,15 @@ expectation makes a large service look fine at a tenth of its traffic and a smal
 all day; no hour is ever called a gap; and any tenant can read the pipeline of a service it does not
 own.
 
-- A \`service\` outside the caller's registry (\`registry.is_registered\`) is **404**.
+- A \`service\` outside the caller's registry (\`registry.is_registered\`) is **404**; one inside it is
+  reported even before anything was indexed for it.
 - \`hours\` lists the 24 complete hours (\`HOUR_S = 3600\`, each by its start in epoch seconds),
   oldest first, each with its \`indexed\` count.
 - Each hour's \`expected\` is \`ledger.expected_per_hour(tenant, service, hours[0])\`: this service's
   own mean over the 7 days before the window.
-- An hour whose \`indexed\` is below \`expected × (1 − GAP_THRESHOLD)\`, \`GAP_THRESHOLD = 0.5\`, has
-  \`gap: true\`; the body carries \`gaps\` (how many) and \`threshold\`.`,
+- An hour whose \`indexed\` is strictly below \`expected × (1 − GAP_THRESHOLD)\`,
+  \`GAP_THRESHOLD = 0.5\`, has \`gap: true\` (exactly half is not a gap); the body carries \`gaps\`
+  (how many) and \`threshold\`.`,
   sequence: {
     participants: ['Completeness UI', 'logindex', 'service registry', 'Index ledger'],
     messages: [
@@ -60,7 +62,7 @@ own.
       id: 'foreign-404',
       title: "Answers 404 for a service outside the caller's registry",
       detail:
-        "A service the caller's tenant did not register, another tenant's included, is **404**; the starter reports on any service id, which tells a tenant what another tenant runs and how much it logs.",
+        "A service the caller's tenant did not register, another tenant's included, is **404**, while a service it registered is **200** even with nothing indexed yet; the starter reports on any service id, which tells a tenant what another tenant runs and how much it logs.",
       match: {
         python: {all: [/registry\.is_registered\(/, /\b404\b/]},
         typescript: {all: [/isRegistered\(/, /code\(\s*404\s*\)/]},
@@ -99,7 +101,7 @@ own.
       id: 'gap-threshold',
       title: 'Flags an hour more than half below its baseline',
       detail:
-        'An hour below `expected × (1 − GAP_THRESHOLD)` has `gap: true`, and the body counts them in `gaps` next to `threshold`; the starter flags nothing, so a dead hour never shows on the page.',
+        'An hour strictly below `expected × (1 − GAP_THRESHOLD)` has `gap: true` (exactly half is not a gap), and the body counts them in `gaps` next to `threshold`; the starter flags nothing, so a dead hour never shows on the page.',
       match: {
         python: {all: [/GAP_THRESHOLD\s*=\s*0\.5/, /"gap"/, /"gaps"/]},
         typescript: {all: [/GAP_THRESHOLD\s*=\s*0\.5/, /gap:/, /gaps:/]},
@@ -532,8 +534,8 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/services/([\\w.-]+)/
 from logindex import ledger, registry
 
 HOUR = 3600
-# Window hours (by index) that differ from the baseline.
-ACME = {5: 3000, 9: 6000, 20: 0}
+# Window hours (by index) that differ from the baseline: 5000 is exactly half of it, 4999 just under.
+ACME = {5: 3000, 9: 6000, 12: 5000, 15: 4999, 20: 0}
 GLOBEX = {3: 8}
 
 
@@ -545,6 +547,7 @@ def _window():
 def _api(ctx):
     m = ctx.load("read")
     registry.add_service("acme", "checkout")
+    registry.add_service("acme", "billing")  # registered this morning: nothing indexed yet
     registry.add_service("globex", "checkout")
     registry.add_service("globex", "search")
     hours = _window()
@@ -588,10 +591,12 @@ async def check_foreign_404(ctx):
         foreign = await _get(c, "search")
         unknown = await _get(c, "chekout")
         own = await _get(c, "checkout")
+        fresh = await _get(c, "billing")
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
     assert foreign.status_code == 404, f"acme reading search, a service only globex registered, answered {foreign.status_code}: {foreign.text}. Another tenant's pipeline must be 404"
     assert unknown.status_code == 404, f"a service nobody registered answered {unknown.status_code}, expected 404"
     assert own.status_code == 200, f"acme reading its own checkout answered {own.status_code}: {own.text}"
+    assert fresh.status_code == 200, f"acme reading billing, which it registered but has indexed nothing yet, answered {fresh.status_code}: {fresh.text}. The registry decides what the caller owns, not the ledger"
 
 
 async def check_hourly(ctx):
@@ -618,13 +623,13 @@ async def check_gap_threshold(ctx):
         acme = await _report(c)
         globex = await _report(c, tenant="globex")
     flagged = [i for i, b in enumerate(_buckets(acme)) if b.get("gap") is True]
-    assert flagged == [5, 20], f"against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; flagged hours {flagged}, expected [5, 20]"
-    assert acme.get("gaps") == 2 and acme.get("threshold") == 0.5, f"the report must count its gaps (2) and carry the threshold (0.5), got gaps {acme.get('gaps')!r}, threshold {acme.get('threshold')!r}"
+    assert flagged == [5, 15, 20], f"against a baseline of 10000, the hours with 3000, 4999 and 0 are gaps and those with 6000 and 5000 (exactly half) are not; flagged hours {flagged}, expected [5, 15, 20]"
+    assert acme.get("gaps") == 3 and acme.get("threshold") == 0.5, f"the report must count its gaps (3) and carry the threshold (0.5), got gaps {acme.get('gaps')!r}, threshold {acme.get('threshold')!r}"
     quiet = [i for i, b in enumerate(_buckets(globex)) if b.get("gap") is not False]
     assert quiet == [] and globex.get("gaps") == 0, f"globex's checkout at 10 an hour (8 once) against its baseline of 10 has no gap, the report flags hours {quiet}"
 `,
     typescript: `const HOUR = 3600;
-const ACME: Record<number, number> = {5: 3000, 9: 6000, 20: 0};
+const ACME: Record<number, number> = {5: 3000, 9: 6000, 12: 5000, 15: 4999, 20: 0};
 const GLOBEX: Record<number, number> = {3: 8};
 
 async function api(ctx) {
@@ -632,6 +637,7 @@ async function api(ctx) {
   const registry = ctx.load('/support/logindex/registry.ts');
   const ledger = ctx.load('/support/logindex/ledger.ts');
   await registry.addService('acme', 'checkout');
+  await registry.addService('acme', 'billing'); // registered this morning: nothing indexed yet
   await registry.addService('globex', 'checkout');
   await registry.addService('globex', 'search');
   const current = Math.floor(ctx.clock.now() / 1000 / HOUR) * HOUR;
@@ -674,10 +680,12 @@ export async function check_foreign_404(ctx) {
   const foreign = await get(c, 'search');
   const unknown = await get(c, 'chekout');
   const own = await get(c, 'checkout');
+  const fresh = await get(c, 'billing');
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
   assert.equal(foreign.status, 404, \`acme reading search, a service only globex registered, answered \${foreign.status}: \${foreign.text}. Another tenant's pipeline must be 404\`);
   assert.equal(unknown.status, 404, \`a service nobody registered answered \${unknown.status}, expected 404\`);
   assert.equal(own.status, 200, \`acme reading its own checkout answered \${own.status}: \${own.text}\`);
+  assert.equal(fresh.status, 200, \`acme reading billing, which it registered but has indexed nothing yet, answered \${fresh.status}: \${fresh.text}. The registry decides what the caller owns, not the ledger\`);
 }
 
 export async function check_hourly(ctx) {
@@ -701,8 +709,8 @@ export async function check_gap_threshold(ctx) {
   const acme = await report(c);
   const globex = await report(c, 'checkout', 'globex');
   const flagged = buckets(acme).flatMap((x, i) => (x.gap === true ? [i] : []));
-  assert.deepStrictEqual(flagged, [5, 20], \`against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; flagged hours \${JSON.stringify(flagged)}, expected [5, 20]\`);
-  assert(acme.gaps === 2 && acme.threshold === 0.5, \`the report must count its gaps (2) and carry the threshold (0.5), got gaps \${acme.gaps}, threshold \${acme.threshold}\`);
+  assert.deepStrictEqual(flagged, [5, 15, 20], \`against a baseline of 10000, the hours with 3000, 4999 and 0 are gaps and those with 6000 and 5000 (exactly half) are not; flagged hours \${JSON.stringify(flagged)}, expected [5, 15, 20]\`);
+  assert(acme.gaps === 3 && acme.threshold === 0.5, \`the report must count its gaps (3) and carry the threshold (0.5), got gaps \${acme.gaps}, threshold \${acme.threshold}\`);
   const quiet = buckets(globex).flatMap((x, i) => (x.gap !== false ? [i] : []));
   assert(quiet.length === 0 && globex.gaps === 0, \`globex's checkout at 10 an hour (8 once) against its baseline of 10 has no gap, the report flags hours \${JSON.stringify(quiet)}\`);
 }
@@ -720,131 +728,134 @@ import (
 	"leetbuild/harness"
 )
 
-const readHour = 3600
+const hHour = 3600
 
 var (
-	readBg     = context.Background()
-	readAcme   = map[int]int64{5: 3000, 9: 6000, 20: 0}
-	readGlobex = map[int]int64{3: 8}
+	hBg     = context.Background()
+	hAcme   = map[int]int64{5: 3000, 9: 6000, 12: 5000, 15: 4999, 20: 0}
+	hGlobex = map[int]int64{3: 8}
 )
 
-type readBucket struct {
+type hBucket struct {
 	Hour     int64 \`json:"hour"\`
 	Indexed  int64 \`json:"indexed"\`
 	Expected int64 \`json:"expected"\`
 	Gap      *bool \`json:"gap"\`
 }
 
-type readReport struct {
-	Service   string       \`json:"service"\`
-	Hours     []readBucket \`json:"hours"\`
-	Gaps      *int         \`json:"gaps"\`
-	Threshold *float64     \`json:"threshold"\`
+type hReport struct {
+	Service   string    \`json:"service"\`
+	Hours     []hBucket \`json:"hours"\`
+	Gaps      *int      \`json:"gaps"\`
+	Threshold *float64  \`json:"threshold"\`
 }
 
-func countOr(m map[int]int64, i int, fallback int64) int64 {
+func hCountOr(m map[int]int64, i int, fallback int64) int64 {
 	if n, ok := m[i]; ok {
 		return n
 	}
 	return fallback
 }
 
-func readAPI(ctx *harness.Ctx) (*harness.HTTP, []int64) {
-	registry.AddService(readBg, "acme", "checkout")
-	registry.AddService(readBg, "globex", "checkout")
-	registry.AddService(readBg, "globex", "search")
-	current := ctx.Clock.Now() / 1000 / readHour * readHour
+func hAPI(ctx *harness.Ctx) (*harness.HTTP, []int64) {
+	registry.AddService(hBg, "acme", "checkout")
+	registry.AddService(hBg, "acme", "billing") // registered this morning: nothing indexed yet
+	registry.AddService(hBg, "globex", "checkout")
+	registry.AddService(hBg, "globex", "search")
+	current := ctx.Clock.Now() / 1000 / hHour * hHour
 	hours := make([]int64, 24)
 	for i := range hours {
-		hours[i] = current - readHour*int64(24-i)
+		hours[i] = current - hHour*int64(24-i)
 	}
 	for i := int64(1); i <= 168; i++ {
-		ledger.RecordIndexed(readBg, "acme", "checkout", hours[0]-readHour*i, 10000)
-		ledger.RecordIndexed(readBg, "globex", "checkout", hours[0]-readHour*i, 10)
+		ledger.RecordIndexed(hBg, "acme", "checkout", hours[0]-hHour*i, 10000)
+		ledger.RecordIndexed(hBg, "globex", "checkout", hours[0]-hHour*i, 10)
 	}
 	for i, hour := range hours {
-		ledger.RecordIndexed(readBg, "acme", "checkout", hour, countOr(readAcme, i, 10000))
-		ledger.RecordIndexed(readBg, "globex", "checkout", hour, countOr(readGlobex, i, 10))
+		ledger.RecordIndexed(hBg, "acme", "checkout", hour, hCountOr(hAcme, i, 10000))
+		ledger.RecordIndexed(hBg, "globex", "checkout", hour, hCountOr(hGlobex, i, 10))
 	}
-	ledger.RecordIndexed(readBg, "acme", "checkout", current, 40) // the current hour, still filling
+	ledger.RecordIndexed(hBg, "acme", "checkout", current, 40) // the current hour, still filling
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux), hours
 }
 
-func getReport(c *harness.HTTP, service, tenant string) *harness.Response {
+func hGet(c *harness.HTTP, service, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/services/" + service + "/completeness")
 	}
 	return c.Get("/v1/services/"+service+"/completeness", "X-Tenant-Id", tenant)
 }
 
-func mustReport(ctx *harness.Ctx, c *harness.HTTP, tenant string) readReport {
-	r := getReport(c, "checkout", tenant)
+func hMustReport(ctx *harness.Ctx, c *harness.HTTP, tenant string) hReport {
+	r := hGet(c, "checkout", tenant)
 	ctx.Equal(r.Status, 200, "%s's completeness of checkout (%s)", tenant, r.Text())
-	var body readReport
+	var body hReport
 	json.Unmarshal(r.Body, &body)
 	ctx.Assert(len(body.Hours) == 24, "the report must list the 24 complete hours, got %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, _ := readAPI(ctx)
-	r := getReport(c, "checkout", "acme")
+	c, _ := hAPI(ctx)
+	r := hGet(c, "checkout", "acme")
 	ctx.Equal(r.Status, 200, "acme's completeness of checkout (%s)", r.Text())
-	var body readReport
+	var body hReport
 	json.Unmarshal(r.Body, &body)
 	ctx.Equal(body.Service, "checkout", "the report must name the service")
 }
 
 func CheckForeign404(ctx *harness.Ctx) {
-	c, _ := readAPI(ctx)
-	ctx.Equal(getReport(c, "checkout", "").Status, 401, "a read without X-Tenant-Id")
-	foreign := getReport(c, "search", "acme")
+	c, _ := hAPI(ctx)
+	ctx.Equal(hGet(c, "checkout", "").Status, 401, "a read without X-Tenant-Id")
+	foreign := hGet(c, "search", "acme")
 	ctx.Equal(foreign.Status, 404, "acme reading search, a service only globex registered, must be 404 (%s); another tenant's pipeline", foreign.Text())
-	ctx.Equal(getReport(c, "chekout", "acme").Status, 404, "a service nobody registered")
-	ctx.Equal(getReport(c, "checkout", "acme").Status, 200, "acme reading its own checkout")
+	ctx.Equal(hGet(c, "chekout", "acme").Status, 404, "a service nobody registered")
+	ctx.Equal(hGet(c, "checkout", "acme").Status, 200, "acme reading its own checkout")
+	fresh := hGet(c, "billing", "acme")
+	ctx.Equal(fresh.Status, 200, "acme reading billing, which it registered but has indexed nothing yet (%s): the registry decides what the caller owns, not the ledger", fresh.Text())
 }
 
 func CheckHourly(ctx *harness.Ctx) {
-	c, hours := readAPI(ctx)
-	body := mustReport(ctx, c, "acme")
+	c, hours := hAPI(ctx)
+	body := hMustReport(ctx, c, "acme")
 	got := make([]int64, 24)
 	indexed := make([]int64, 24)
 	want := make([]int64, 24)
 	for i, b := range body.Hours {
 		got[i] = b.Hour
 		indexed[i] = b.Indexed
-		want[i] = countOr(readAcme, i, 10000)
+		want[i] = hCountOr(hAcme, i, 10000)
 	}
 	ctx.Equal(got, hours, "the hours must be the 24 complete hours before now, oldest first, by their start in epoch seconds")
 	ctx.Equal(indexed, want, "each hour must carry its indexed count from the ledger")
 }
 
 func CheckExpectationPerTenant(ctx *harness.Ctx) {
-	c, _ := readAPI(ctx)
+	c, _ := hAPI(ctx)
 	for _, tc := range []struct {
 		tenant string
 		want   int64
 	}{{"acme", 10000}, {"globex", 10}} {
-		for _, b := range mustReport(ctx, c, tc.tenant).Hours {
+		for _, b := range hMustReport(ctx, c, tc.tenant).Hours {
 			ctx.Equal(b.Expected, tc.want, "%s's checkout indexed %d an hour all week: the baseline is the service's own history; an hour's expected", tc.tenant, tc.want)
 		}
 	}
 }
 
 func CheckGapThreshold(ctx *harness.Ctx) {
-	c, _ := readAPI(ctx)
-	acme := mustReport(ctx, c, "acme")
+	c, _ := hAPI(ctx)
+	acme := hMustReport(ctx, c, "acme")
 	flagged := []int{}
 	for i, b := range acme.Hours {
 		if b.Gap != nil && *b.Gap {
 			flagged = append(flagged, i)
 		}
 	}
-	ctx.Equal(flagged, []int{5, 20}, "against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; the flagged hours")
-	ctx.Assert(acme.Gaps != nil && *acme.Gaps == 2 && acme.Threshold != nil && *acme.Threshold == 0.5, "the report must count its gaps (2) and carry the threshold (0.5)")
-	globex := mustReport(ctx, c, "globex")
+	ctx.Equal(flagged, []int{5, 15, 20}, "against a baseline of 10000, the hours with 3000, 4999 and 0 are gaps and those with 6000 and 5000 (exactly half) are not; the flagged hours")
+	ctx.Assert(acme.Gaps != nil && *acme.Gaps == 3 && acme.Threshold != nil && *acme.Threshold == 0.5, "the report must count its gaps (3) and carry the threshold (0.5)")
+	globex := hMustReport(ctx, c, "globex")
 	quiet := []int{}
 	for i, b := range globex.Hours {
 		if b.Gap == nil || *b.Gap {
@@ -868,33 +879,34 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr long long kHour = 3600;
-const std::map<int, long long> kAcme = {{5, 3000}, {9, 6000}, {20, 0}};
-const std::map<int, long long> kGlobex = {{3, 8}};
+constexpr long long kHHour = 3600;
+const std::map<int, long long> kHAcme = {{5, 3000}, {9, 6000}, {12, 5000}, {15, 4999}, {20, 0}};
+const std::map<int, long long> kHGlobex = {{3, 8}};
 
-long long countOr(const std::map<int, long long>& m, int i, long long fallback) { return m.count(i) ? m.at(i) : fallback; }
+long long hCountOr(const std::map<int, long long>& m, int i, long long fallback) { return m.count(i) ? m.at(i) : fallback; }
 
-std::vector<long long> window(harness::Ctx& ctx) {
-  const long long current = ctx.Clock.Now() / 1000 / kHour * kHour;
+std::vector<long long> hWindow(harness::Ctx& ctx) {
+  const long long current = ctx.Clock.Now() / 1000 / kHHour * kHHour;
   std::vector<long long> hours;
-  for (int i = 0; i < 24; i++) hours.push_back(current - kHour * (24 - i));
+  for (int i = 0; i < 24; i++) hours.push_back(current - kHHour * (24 - i));
   return hours;
 }
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   registry::addService("acme", "checkout");
+  registry::addService("acme", "billing");  // registered this morning: nothing indexed yet
   registry::addService("globex", "checkout");
   registry::addService("globex", "search");
-  const auto hours = window(ctx);
+  const auto hours = hWindow(ctx);
   for (long long i = 1; i <= 168; i++) {
-    ledger::recordIndexed("acme", "checkout", hours[0] - kHour * i, 10000);
-    ledger::recordIndexed("globex", "checkout", hours[0] - kHour * i, 10);
+    ledger::recordIndexed("acme", "checkout", hours[0] - kHHour * i, 10000);
+    ledger::recordIndexed("globex", "checkout", hours[0] - kHHour * i, 10);
   }
   for (int i = 0; i < 24; i++) {
-    ledger::recordIndexed("acme", "checkout", hours[i], countOr(kAcme, i, 10000));
-    ledger::recordIndexed("globex", "checkout", hours[i], countOr(kGlobex, i, 10));
+    ledger::recordIndexed("acme", "checkout", hours[i], hCountOr(kHAcme, i, 10000));
+    ledger::recordIndexed("globex", "checkout", hours[i], hCountOr(kHGlobex, i, 10));
   }
-  ledger::recordIndexed("acme", "checkout", hours.back() + kHour, 40);  // the current hour, still filling
+  ledger::recordIndexed("acme", "checkout", hours.back() + kHHour, 40);  // the current hour, still filling
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -902,13 +914,13 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response getReport(harness::HTTP& c, const std::string& service, const std::string& tenant) {
+harness::Response hGet(harness::HTTP& c, const std::string& service, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/services/" + service + "/completeness");
   return c.Get("/v1/services/" + service + "/completeness", "X-Tenant-Id", tenant);
 }
 
-json mustReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& tenant) {
-  const auto r = getReport(c, "checkout", tenant);
+json hMustReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& tenant) {
+  const auto r = hGet(c, "checkout", tenant);
   ctx.Equal(r.Status, 200, "%s's completeness of checkout (%s)", tenant, r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.contains("hours") && body["hours"].is_array() && body["hours"].size() == 24, "the report must list the 24 complete hours, got %s", r.Text());
@@ -918,56 +930,58 @@ json mustReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& tenant) 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const auto r = getReport(c, "checkout", "acme");
+  auto c = hApi(ctx);
+  const auto r = hGet(c, "checkout", "acme");
   ctx.Equal(r.Status, 200, "acme's completeness of checkout (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Equal(body.is_object() ? body.value("service", "") : std::string(), "checkout", "the report must name the service");
 }
 
 void CheckForeign404(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  ctx.Equal(getReport(c, "checkout", "").Status, 401, "a read without X-Tenant-Id");
-  const auto foreign = getReport(c, "search", "acme");
+  auto c = hApi(ctx);
+  ctx.Equal(hGet(c, "checkout", "").Status, 401, "a read without X-Tenant-Id");
+  const auto foreign = hGet(c, "search", "acme");
   ctx.Equal(foreign.Status, 404, "acme reading search, a service only globex registered, must be 404 (%s); another tenant's pipeline", foreign.Text());
-  ctx.Equal(getReport(c, "chekout", "acme").Status, 404, "a service nobody registered");
-  ctx.Equal(getReport(c, "checkout", "acme").Status, 200, "acme reading its own checkout");
+  ctx.Equal(hGet(c, "chekout", "acme").Status, 404, "a service nobody registered");
+  ctx.Equal(hGet(c, "checkout", "acme").Status, 200, "acme reading its own checkout");
+  const auto fresh = hGet(c, "billing", "acme");
+  ctx.Equal(fresh.Status, 200, "acme reading billing, which it registered but has indexed nothing yet (%s): the registry decides what the caller owns, not the ledger", fresh.Text());
 }
 
 void CheckHourly(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const auto hours = window(ctx);
-  const json body = mustReport(ctx, c, "acme");
+  auto c = hApi(ctx);
+  const auto hours = hWindow(ctx);
+  const json body = hMustReport(ctx, c, "acme");
   std::vector<long long> got, indexed, want;
   for (int i = 0; i < 24; i++) {
     got.push_back(body["hours"][i].value("hour", 0LL));
     indexed.push_back(body["hours"][i].value("indexed", -1LL));
-    want.push_back(countOr(kAcme, i, 10000));
+    want.push_back(hCountOr(kHAcme, i, 10000));
   }
   ctx.Equal(got, hours, "the hours must be the 24 complete hours before now, oldest first, by their start in epoch seconds");
   ctx.Equal(indexed, want, "each hour must carry its indexed count from the ledger");
 }
 
 void CheckExpectationPerTenant(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = hApi(ctx);
   for (const auto& [tenant, expected] : std::vector<std::pair<std::string, long long>>{{"acme", 10000}, {"globex", 10}}) {
-    for (const auto& b : mustReport(ctx, c, tenant)["hours"]) {
+    for (const auto& b : hMustReport(ctx, c, tenant)["hours"]) {
       ctx.Equal(b.value("expected", -1LL), expected, "%s's checkout indexed %d an hour all week: the baseline is the service's own history; an hour's expected", tenant, expected);
     }
   }
 }
 
 void CheckGapThreshold(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const json acme = mustReport(ctx, c, "acme");
+  auto c = hApi(ctx);
+  const json acme = hMustReport(ctx, c, "acme");
   std::vector<int> flagged;
   for (int i = 0; i < 24; i++) {
     const json& b = acme["hours"][i];
     if (b.contains("gap") && b["gap"].is_boolean() && b["gap"].get<bool>()) flagged.push_back(i);
   }
-  ctx.Equal(flagged, {5, 20}, "against a baseline of 10000, the hours with 3000 and 0 are gaps and the one with 6000 is not; the flagged hours");
-  ctx.Assert(acme.value("gaps", -1) == 2 && acme.value("threshold", -1.0) == 0.5, "the report must count its gaps (2) and carry the threshold (0.5), got %s", acme.dump().substr(0, 200));
-  const json globex = mustReport(ctx, c, "globex");
+  ctx.Equal(flagged, {5, 15, 20}, "against a baseline of 10000, the hours with 3000, 4999 and 0 are gaps and those with 6000 and 5000 (exactly half) are not; the flagged hours");
+  ctx.Assert(acme.value("gaps", -1) == 3 && acme.value("threshold", -1.0) == 0.5, "the report must count its gaps (3) and carry the threshold (0.5), got %s", acme.dump().substr(0, 200));
+  const json globex = hMustReport(ctx, c, "globex");
   std::vector<int> quiet;
   for (int i = 0; i < 24; i++) {
     const json& b = globex["hours"][i];

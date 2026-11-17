@@ -58,7 +58,7 @@ warehouse sync that stalled without anyone being told.
       id: 'reserved-holds',
       title: 'Counts live holds as reserved and expired ones as available',
       detail:
-        'With one live hold of 2 and one expired hold of 3 on a sku of 10, the read answers available 8, reserved 2, on_hand 10. The starter reports nothing reserved.',
+        'With one live hold of 2 and one expired hold of 3 on a sku of 10, the read answers available 8, reserved 2, on_hand 10, and on_hand stays 10 when another reserve lands between its commands. The starter reports nothing reserved.',
       match: {
         python: {all: [/holds_key\(/, /EXISTS|\.exists\(/]},
         typescript: {all: [/holdsKey\(/, /EXISTS|\.exists\(/]},
@@ -84,7 +84,7 @@ warehouse sync that stalled without anyone being told.
       id: 'stale',
       title: 'Reports stale when the warehouse sync is over 60 s old',
       detail:
-        'A sync written now reads `stale: false`; two minutes later the same read says `stale: true`, with `synced_at` in the body. The starter always answers `stale: false`.',
+        'A sync written now reads `stale: false` with `synced_at` in the body, and so does one 58 s old; at 61 s the same read says `stale: true`, and so does a sku the sync never wrote. The starter always answers `stale: false`.',
       match: {
         python: {all: [/SYNC_STALE_AFTER_S/, /catalog\.synced_at\(/]},
         typescript: {all: [/SYNC_STALE_AFTER_S/, /syncedAt\(/]},
@@ -599,14 +599,23 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/skus/([\\w-]+)/stock
 async def _world(ctx):
     now = int(ctx.clock.time())
     ctx.redis.hset("sku:sku-1", mapping={"tenant": "t1", "synced_at": now})
+    ctx.redis.hset("sku:sku-2", mapping={"tenant": "t1"})  # the warehouse sync never wrote it
     ctx.redis.hset("sku:sku-9", mapping={"tenant": "t2", "synced_at": now})
     ctx.redis.set("stock:sku-1", 10)
+    ctx.redis.set("stock:sku-2", 10)
     ctx.redis.set("stock:sku-9", 10)
     return ctx.client(ctx.load("read").app)
 
 
 async def _read(c, sku="sku-1", tenant="t1"):
     return await c.get(f"/v1/skus/{sku}/stock", headers={"X-Tenant-Id": tenant})
+
+
+def _buyer(ctx, reservation_id):
+    """Another buyer's reserve of 1 unit: the counter goes down and a live hold appears, in one step."""
+    ctx.redis.decrby("stock:sku-1", 1)
+    ctx.redis.hset("holds:sku-1", reservation_id, 1)
+    ctx.redis.set(f"hold:{reservation_id}", 1, ex=900)
 
 
 async def check_live_counter(ctx):
@@ -627,9 +636,16 @@ async def check_reserved_holds(ctx):
         stock.reserve("sku-1", 2, "r-2")
         ctx.clock.advance(400)  # r-1's hold expired, r-2's is live
         r = await _read(c)
-    body = r.json()
-    got = (body.get("available"), body.get("reserved"), body.get("on_hand"))
-    assert got == (8, 2, 10), f"with a live hold of 2 and an expired hold of 3 on 10 units the read answers available, reserved, on_hand = {got}, expected (8, 2, 10): an expired hold is available again, a live one is reserved"
+        body = r.json()
+        got = (body.get("available"), body.get("reserved"), body.get("on_hand"))
+        assert got == (8, 2, 10), f"with a live hold of 2 and an expired hold of 3 on 10 units the read answers available, reserved, on_hand = {got}, expected (8, 2, 10): an expired hold is available again, a live one is reserved"
+        # Another buyer reserves right after the read's first command on the counter, then on the hold map.
+        for n, key in enumerate(("stock:sku-1", "holds:sku-1")):
+            probe = ctx.redis_after(key, lambda n=n: _buyer(ctx, f"r-buyer-{n}"))
+            body = (await _read(c)).json()
+            assert probe.fired, f"the read never touched {key}"
+            got = (body.get("available"), body.get("reserved"), body.get("on_hand"))
+            assert got[2] == 10 and got[0] + got[1] == 10, f"a reserve that landed between the read's commands made it answer available, reserved, on_hand = {got}: a reserve moves units from available to reserved and on_hand stays 10, so read the counter and the hold map in one script"
 
 
 async def check_tenant_404(ctx):
@@ -645,24 +661,38 @@ async def check_tenant_404(ctx):
 async def check_stale(ctx):
     async with await _world(ctx) as c:
         fresh = await _read(c)
-        ctx.clock.advance(120)  # the warehouse sync stopped writing
+        ctx.clock.advance(58)
+        recent = await _read(c)
+        ctx.clock.advance(3)  # the warehouse sync stopped writing a minute ago
         late = await _read(c)
+        never = await _read(c, sku="sku-2")
     assert fresh.json().get("stale") is False, f"a sync written just now reads {fresh.json()}, expected stale false"
     assert fresh.json().get("synced_at") is not None, f"the read must carry synced_at, got {fresh.json()}"
-    assert late.json().get("stale") is True, f"two minutes after the last warehouse sync the read answers {late.json()}, expected stale true (SYNC_STALE_AFTER_S = 60)"
+    assert recent.json().get("stale") is False, f"58 s after the last warehouse sync the read answers {recent.json()}, expected stale false (SYNC_STALE_AFTER_S = 60)"
+    assert late.json().get("stale") is True, f"61 s after the last warehouse sync the read answers {late.json()}, expected stale true (SYNC_STALE_AFTER_S = 60)"
+    assert never.status_code == 200 and never.json().get("stale") is True, f"a sku the warehouse sync never wrote reads {never.status_code} {never.text}, expected stale true: no sync time is the stalest of all"
 `,
     typescript: `import {reserve} from 'inventory/stock';
 
 function world(ctx) {
   const now = String(Math.floor(ctx.clock.now() / 1000));
   ctx.redis.hset('sku:sku-1', 'tenant', 't1', 'synced_at', now);
+  ctx.redis.hset('sku:sku-2', 'tenant', 't1'); // the warehouse sync never wrote it
   ctx.redis.hset('sku:sku-9', 'tenant', 't2', 'synced_at', now);
   ctx.redis.set('stock:sku-1', '10');
+  ctx.redis.set('stock:sku-2', '10');
   ctx.redis.set('stock:sku-9', '10');
   return ctx.client(ctx.load('read').app);
 }
 
 const read = (c, sku = 'sku-1', tenant = 't1') => c.get(\`/v1/skus/\${sku}/stock\`, {headers: {'X-Tenant-Id': tenant}});
+
+/** Another buyer's reserve of 1 unit: the counter goes down and a live hold appears, in one step. */
+function buyer(ctx, reservationId: string) {
+  ctx.redis.decrby('stock:sku-1', 1);
+  ctx.redis.hset('holds:sku-1', reservationId, '1');
+  ctx.redis.set(\`hold:\${reservationId}\`, '1', 'EX', 900);
+}
 
 export async function check_live_counter(ctx) {
   const c = world(ctx);
@@ -683,6 +713,14 @@ export async function check_reserved_holds(ctx) {
   const body = (await read(c)).json();
   const got = [body.available, body.reserved, body.on_hand];
   assert.deepEqual(got, [8, 2, 10], \`with a live hold of 2 and an expired hold of 3 on 10 units the read answers available, reserved, on_hand = \${JSON.stringify(got)}, expected [8, 2, 10]: an expired hold is available again, a live one is reserved\`);
+  // Another buyer reserves right after the read's first command on the counter, then on the hold map.
+  for (const [n, key] of ['stock:sku-1', 'holds:sku-1'].entries()) {
+    const probe = ctx.redisAfter(key, () => buyer(ctx, \`r-buyer-\${n}\`));
+    const snap = (await read(c)).json();
+    assert(probe.fired, \`the read never touched \${key}\`);
+    const levels = [snap.available, snap.reserved, snap.on_hand];
+    assert(levels[2] === 10 && levels[0] + levels[1] === 10, \`a reserve that landed between the read's commands made it answer available, reserved, on_hand = \${JSON.stringify(levels)}: a reserve moves units from available to reserved and on_hand stays 10, so read the counter and the hold map in one script\`);
+  }
 }
 
 export async function check_tenant_404(ctx) {
@@ -698,17 +736,23 @@ export async function check_tenant_404(ctx) {
 export async function check_stale(ctx) {
   const c = world(ctx);
   const fresh = (await read(c)).json();
-  ctx.clock.advance(120); // the warehouse sync stopped writing
+  ctx.clock.advance(58);
+  const recent = (await read(c)).json();
+  ctx.clock.advance(3); // the warehouse sync stopped writing a minute ago
   const late = (await read(c)).json();
+  const never = await read(c, 'sku-2');
   assert.equal(fresh.stale, false, \`a sync written just now reads \${JSON.stringify(fresh)}, expected stale false\`);
   assert(fresh.synced_at !== null && fresh.synced_at !== undefined, \`the read must carry synced_at, got \${JSON.stringify(fresh)}\`);
-  assert.equal(late.stale, true, \`two minutes after the last warehouse sync the read answers \${JSON.stringify(late)}, expected stale true (SYNC_STALE_AFTER_S = 60)\`);
+  assert.equal(recent.stale, false, \`58 s after the last warehouse sync the read answers \${JSON.stringify(recent)}, expected stale false (SYNC_STALE_AFTER_S = 60)\`);
+  assert.equal(late.stale, true, \`61 s after the last warehouse sync the read answers \${JSON.stringify(late)}, expected stale true (SYNC_STALE_AFTER_S = 60)\`);
+  assert(never.status === 200 && never.json().stale === true, \`a sku the warehouse sync never wrote reads \${never.status} \${never.text}, expected stale true: no sync time is the stalest of all\`);
 }
 `,
     go: `package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	"leetbuild/harness"
@@ -719,15 +763,17 @@ import (
 func readWorld(ctx *harness.Ctx) *harness.HTTP {
 	now := ctx.Clock.Now() / 1000
 	ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1", "synced_at", now)
+	ctx.Redis.Do("HSET", "sku:sku-2", "tenant", "t1") // the warehouse sync never wrote it
 	ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2", "synced_at", now)
 	ctx.Redis.Set("stock:sku-1", 10)
+	ctx.Redis.Set("stock:sku-2", 10)
 	ctx.Redis.Set("stock:sku-9", 10)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type readBody struct {
+type readStockBody struct {
 	Available int  \`json:"available"\`
 	Reserved  int  \`json:"reserved"\`
 	OnHand    int  \`json:"on_hand"\`
@@ -735,9 +781,9 @@ type readBody struct {
 	Stale     bool \`json:"stale"\`
 }
 
-func readStockOf(ctx *harness.Ctx, c *harness.HTTP, sku, tenant string) (*harness.Response, readBody) {
+func readStockOf(ctx *harness.Ctx, c *harness.HTTP, sku, tenant string) (*harness.Response, readStockBody) {
 	r := c.Get("/v1/skus/"+sku+"/stock", "X-Tenant-Id", tenant)
-	var body readBody
+	var body readStockBody
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
@@ -748,6 +794,13 @@ func readReserve(ctx *harness.Ctx, quantity int, reservationID string) {
 	ok, err := stock.Reserve(context.Background(), "sku-1", quantity, reservationID)
 	ctx.NoError(err, "reserving through inventory/stock")
 	ctx.Assert(ok, "reserving %d units of sku-1 was refused", quantity)
+}
+
+// readBuyer is another buyer's reserve of 1 unit: the counter goes down and a live hold appears, in one step.
+func readBuyer(ctx *harness.Ctx, reservationID string) {
+	ctx.Redis.Do("DECRBY", "stock:sku-1", 1)
+	ctx.Redis.Do("HSET", "holds:sku-1", reservationID, 1)
+	ctx.Redis.Set("hold:"+reservationID, 1, "EX", 900)
 }
 
 func CheckLiveCounter(ctx *harness.Ctx) {
@@ -768,6 +821,17 @@ func CheckReservedHolds(ctx *harness.Ctx) {
 	ctx.Clock.Advance(400) // r-1's hold expired, r-2's is live
 	_, body := readStockOf(ctx, c, "sku-1", "t1")
 	ctx.Equal([]int{body.Available, body.Reserved, body.OnHand}, []int{8, 2, 10}, "available, reserved, on_hand with a live hold of 2 and an expired hold of 3 on 10 units (an expired hold is available again, a live one is reserved)")
+	// Another buyer reserves right after the read's first command on the counter, then on the hold map.
+	for n, key := range []string{"stock:sku-1", "holds:sku-1"} {
+		buyer := fmt.Sprintf("r-buyer-%d", n)
+		probe := ctx.Redis.After(key, func() any {
+			readBuyer(ctx, buyer)
+			return nil
+		})
+		_, snap := readStockOf(ctx, c, "sku-1", "t1")
+		ctx.Assert(probe.Fired, "the read never touched %s", key)
+		ctx.Assert(snap.OnHand == 10 && snap.Available+snap.Reserved == 10, "a reserve that landed between the read's commands made it answer available, reserved, on_hand = %d, %d, %d: a reserve moves units from available to reserved and on_hand stays 10, so read the counter and the hold map in one script", snap.Available, snap.Reserved, snap.OnHand)
+	}
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
@@ -783,11 +847,16 @@ func CheckTenant404(ctx *harness.Ctx) {
 func CheckStale(ctx *harness.Ctx) {
 	c := readWorld(ctx)
 	_, fresh := readStockOf(ctx, c, "sku-1", "t1")
-	ctx.Clock.Advance(120) // the warehouse sync stopped writing
+	ctx.Clock.Advance(58)
+	_, recent := readStockOf(ctx, c, "sku-1", "t1")
+	ctx.Clock.Advance(3) // the warehouse sync stopped writing a minute ago
 	_, late := readStockOf(ctx, c, "sku-1", "t1")
+	never, neverBody := readStockOf(ctx, c, "sku-2", "t1")
 	ctx.Equal(fresh.Stale, false, "stale for a sync written just now")
 	ctx.Assert(fresh.SyncedAt != nil, "the read must carry synced_at")
-	ctx.Equal(late.Stale, true, "stale two minutes after the last warehouse sync (SYNC_STALE_AFTER_S = 60)")
+	ctx.Equal(recent.Stale, false, "stale 58 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)")
+	ctx.Equal(late.Stale, true, "stale 61 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)")
+	ctx.Assert(never.Status == 200 && neverBody.Stale, "a sku the warehouse sync never wrote reads %d %s, expected stale true: no sync time is the stalest of all", never.Status, never.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -804,8 +873,10 @@ namespace {
 harness::HTTP readWorld(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
   ctx.Redis.Do("HSET", "sku:sku-1", "tenant", "t1", "synced_at", now);
+  ctx.Redis.Do("HSET", "sku:sku-2", "tenant", "t1");  // the warehouse sync never wrote it
   ctx.Redis.Do("HSET", "sku:sku-9", "tenant", "t2", "synced_at", now);
   ctx.Redis.Do("SET", "stock:sku-1", 10);
+  ctx.Redis.Do("SET", "stock:sku-2", 10);
   ctx.Redis.Do("SET", "stock:sku-9", 10);
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -818,7 +889,7 @@ harness::Response readStockOf(harness::HTTP& c, const std::string& sku, const st
   return c.Get("/v1/skus/" + sku + "/stock", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json readBody(const harness::Response& r) {
+nlohmann::json readStockJson(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
@@ -827,15 +898,22 @@ void readReserve(harness::Ctx& ctx, int quantity, const std::string& reservation
   ctx.Assert(inventory::stock::Reserve("sku-1", quantity, reservation_id), "reserving %d units of sku-1 was refused", quantity);
 }
 
+// Another buyer's reserve of 1 unit: the counter goes down and a live hold appears, in one step.
+void readBuyer(harness::Ctx& ctx, const std::string& reservation_id) {
+  ctx.Redis.Do("DECRBY", "stock:sku-1", 1);
+  ctx.Redis.Do("HSET", "holds:sku-1", reservation_id, 1);
+  ctx.Redis.Do("SET", "hold:" + reservation_id, 1, "EX", 900);
+}
+
 }  // namespace
 
 void CheckLiveCounter(harness::Ctx& ctx) {
   auto c = readWorld(ctx);
   const auto r = readStockOf(c, "sku-1", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/skus/sku-1/stock (%s)", r.Text());
-  ctx.Equal(readBody(r).value("available", -1LL), 10, "the available units of a sku with 10");
+  ctx.Equal(readStockJson(r).value("available", -1LL), 10, "the available units of a sku with 10");
   readReserve(ctx, 4, "r-1");
-  ctx.Equal(readBody(readStockOf(c, "sku-1", "t1")).value("available", -1LL), 6,
+  ctx.Equal(readStockJson(readStockOf(c, "sku-1", "t1")).value("available", -1LL), 6,
             "the available units after a reservation of 4 (the storefront must not promise units the counter already gave away: "
             "read stock:sku-1, not a cache)");
 }
@@ -846,11 +924,28 @@ void CheckReservedHolds(harness::Ctx& ctx) {
   ctx.Clock.Advance(600);
   readReserve(ctx, 2, "r-2");
   ctx.Clock.Advance(400);  // r-1's hold expired, r-2's is live
-  const auto body = readBody(readStockOf(c, "sku-1", "t1"));
+  const auto body = readStockJson(readStockOf(c, "sku-1", "t1"));
   const std::vector<long long> got = {body.value("available", -1LL), body.value("reserved", -1LL), body.value("on_hand", -1LL)};
   ctx.Equal(got, {8, 2, 10},
             "available, reserved, on_hand with a live hold of 2 and an expired hold of 3 on 10 units (an expired hold is "
             "available again, a live one is reserved)");
+  // Another buyer reserves right after the read's first command on the counter, then on the hold map.
+  int n = 0;
+  for (const std::string key : {"stock:sku-1", "holds:sku-1"}) {
+    bool fired = false;
+    const std::string buyer = "r-buyer-" + std::to_string(n++);
+    ctx.Redis.After(key, [&ctx, &fired, buyer] {
+      fired = true;
+      readBuyer(ctx, buyer);
+    });
+    const auto snap = readStockJson(readStockOf(c, "sku-1", "t1"));
+    ctx.Assert(fired, "the read never touched %s", key);
+    const long long available = snap.value("available", -1LL), reserved = snap.value("reserved", -1LL), on_hand = snap.value("on_hand", -1LL);
+    ctx.Assert(on_hand == 10 && available + reserved == 10,
+               "a reserve that landed between the read's commands made it answer available, reserved, on_hand = %d, %d, %d: a reserve "
+               "moves units from available to reserved and on_hand stays 10, so read the counter and the hold map in one script",
+               available, reserved, on_hand);
+  }
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
@@ -862,12 +957,18 @@ void CheckTenant404(harness::Ctx& ctx) {
 
 void CheckStale(harness::Ctx& ctx) {
   auto c = readWorld(ctx);
-  const auto fresh = readBody(readStockOf(c, "sku-1", "t1"));
-  ctx.Clock.Advance(120);  // the warehouse sync stopped writing
-  const auto late = readBody(readStockOf(c, "sku-1", "t1"));
+  const auto fresh = readStockJson(readStockOf(c, "sku-1", "t1"));
+  ctx.Clock.Advance(58);
+  const auto recent = readStockJson(readStockOf(c, "sku-1", "t1"));
+  ctx.Clock.Advance(3);  // the warehouse sync stopped writing a minute ago
+  const auto late = readStockJson(readStockOf(c, "sku-1", "t1"));
+  const auto never = readStockOf(c, "sku-2", "t1");
   ctx.Equal(fresh.value("stale", true), false, "stale for a sync written just now");
   ctx.Assert(fresh.contains("synced_at") && !fresh["synced_at"].is_null(), "the read must carry synced_at, got %s", fresh.dump());
-  ctx.Equal(late.value("stale", false), true, "stale two minutes after the last warehouse sync (SYNC_STALE_AFTER_S = 60)");
+  ctx.Equal(recent.value("stale", true), false, "stale 58 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)");
+  ctx.Equal(late.value("stale", false), true, "stale 61 s after the last warehouse sync (SYNC_STALE_AFTER_S = 60)");
+  ctx.Assert(never.Status == 200 && readStockJson(never).value("stale", false),
+             "a sku the warehouse sync never wrote reads %d %s, expected stale true: no sync time is the stalest of all", never.Status, never.Text());
 }
 `,
   },

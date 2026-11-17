@@ -21,11 +21,12 @@ returning the offset; \`drain_batch(tenant, service)\` reads the whole list, del
 two appends racing for the last bytes under a cap both get in; one drain hands the writer every
 record at once; and a record appended while a drain runs is deleted unread.
 
-- \`MAX_BUFFER_BYTES\` is \`64 << 20\`: a record that would take \`bytes\` past it is shed, nothing
-  written, and \`append_record\` returns **0**.
+- \`MAX_BUFFER_BYTES\` is \`64 << 20\`: a record that would take \`bytes\` (UTF-8 bytes) past it is
+  shed, nothing written, and \`append_record\` returns **0**; one that fills it exactly fits.
 - The cap check and the writes are **one Lua script** (\`register_script\` or \`EVAL\`), so two
   appends cannot both pass the check.
-- \`drain_batch\` takes at most \`BATCH_SIZE\` (1000) records, oldest first, and leaves the rest.
+- \`drain_batch\` takes at most \`BATCH_SIZE\` (1000) records, oldest first, and leaves the rest;
+  \`offset\` keeps counting across drains.
 - The drain reads, trims and settles \`count\` and \`bytes\` in **one script**: an append that lands
   meanwhile stays in the buffer.`,
   sequence: {
@@ -52,7 +53,7 @@ record at once; and a record appended while a drain runs is deleted unread.
       id: 'byte-cap',
       title: 'Sheds a record that would take the buffer past 64 MiB',
       detail:
-        '`MAX_BUFFER_BYTES = 64 << 20`; a record that does not fit returns **0** and writes nothing (list, count, bytes and offset unchanged); the starter has no cap, so a stalled shard grows the buffer without bound.',
+        '`MAX_BUFFER_BYTES = 64 << 20`, counted in UTF-8 bytes; a record that does not fit returns **0** and writes nothing (list, count, bytes and offset unchanged), and a record that fills the buffer exactly is admitted. The starter has no cap, so a stalled shard grows the buffer without bound.',
       match: {
         python: {all: [/MAX_BUFFER_BYTES\s*=\s*64\s*<<\s*20/, /return 0/]},
         typescript: {all: [/MAX_BUFFER_BYTES\s*=\s*64\s*<<\s*20/, /return 0/]},
@@ -78,7 +79,7 @@ record at once; and a record appended while a drain runs is deleted unread.
       id: 'drain-batch',
       title: 'Drains at most 1000 records, oldest first',
       detail:
-        '`BATCH_SIZE = 1000`: a drain returns the oldest 1000 records and leaves the rest with `count` and `bytes` describing them; the starter returns the whole list, however long an outage made it.',
+        '`BATCH_SIZE = 1000`: a drain returns the oldest 1000 records and leaves the rest with `count` and `bytes` describing them, and `offset` keeps counting after the buffer drains empty; the starter returns the whole list, however long an outage made it.',
       match: {
         python: {all: [/BATCH_SIZE\s*=\s*1000/, /LTRIM/], none: [/\.lrange\(/]},
         typescript: {all: [/BATCH_SIZE\s*=\s*1000/, /LTRIM/], none: [/\.lrange\(/]},
@@ -547,8 +548,8 @@ def _consistent(ctx, when):
 
 def check_byte_cap(ctx):
     m = ctx.load("state")
-    assert m.append_record("acme", "checkout", _rec("m-0")) == 1, "the first append into an empty buffer must return offset 1"
-    first = ctx.redis.lrange(KEY, 0, -1)
+    assert m.append_record("acme", "checkout", _rec("m-0 card declined: 12 € over the limit")) == 1, "the first append into an empty buffer must return offset 1"
+    first = _consistent(ctx, "after one append of a record holding a euro sign (3 bytes in UTF-8)")
     ctx.redis.hincrby(META, "bytes", MAX - 100 - _size(first[0]))
     meta_before = ctx.redis.hgetall(META)
     shed = m.append_record("acme", "checkout", _rec("m-1 " + "x" * 200))
@@ -556,6 +557,14 @@ def check_byte_cap(ctx):
     assert ctx.redis.lrange(KEY, 0, -1) == first, f"a shed record must not reach {KEY}, which now holds {ctx.redis.llen(KEY)} records"
     assert ctx.redis.hgetall(META) == meta_before, f"a shed record must leave {META} as it was: {meta_before} became {ctx.redis.hgetall(META)}"
     assert m.append_record("acme", "billing", _rec("m-2")) == 1, "another index's buffer has its own cap: its first append must return offset 1"
+    # A record that fills the buffer to exactly the cap fits; the next byte does not.
+    size = _size(ctx.redis.lrange("buffer:acme:billing", 0, -1)[0])
+    ctx.redis.hset(META, "bytes", MAX - size)
+    exact = m.append_record("acme", "checkout", _rec("m-2"))
+    assert exact == 2, f"a {size}-byte record with exactly {size} bytes left under the cap returned {exact}, expected offset 2: only a record that takes bytes past 64 MiB is shed"
+    assert int(ctx.redis.hget(META, "bytes")) == MAX, f"{META} says bytes {ctx.redis.hget(META, 'bytes')} after filling the buffer to the cap, expected {MAX}"
+    full = m.append_record("acme", "checkout", _rec("m-3"))
+    assert full == 0, f"an append into a buffer at exactly 64 MiB returned {full}: it must be shed and return 0"
 
 
 def check_atomic_append(ctx):
@@ -587,6 +596,8 @@ def check_drain_batch(ctx):
     assert [r.get("message") for r in rest] == [f"m-{i}" for i in range(1000, 1005)], f"the second drain returned {len(rest)} records, expected the 5 left"
     assert _consistent(ctx, "after the second drain") == []
     assert m.drain_batch("acme", "checkout") == [], "a drain of an empty buffer must return no records"
+    after = m.append_record("acme", "checkout", _rec("m-1005"))
+    assert after == 1006, f"an append after the buffer was drained empty returned offset {after}, expected 1006: offset counts every record ever appended, and a drain settles only count and bytes"
 
 
 def check_drain_atomic(ctx):
@@ -627,8 +638,8 @@ function consistent(ctx, when: string): string[] {
 
 export async function check_byte_cap(ctx) {
   const m = ctx.load('state');
-  assert.equal(await m.appendRecord('acme', 'checkout', rec('m-0')), 1, 'the first append into an empty buffer must return offset 1');
-  const first = ctx.redis.lrange(KEY, 0, -1);
+  assert.equal(await m.appendRecord('acme', 'checkout', rec('m-0 card declined: 12 € over the limit')), 1, 'the first append into an empty buffer must return offset 1');
+  const first = consistent(ctx, 'after one append of a record holding a euro sign (3 bytes in UTF-8)');
   ctx.redis.hincrby(META, 'bytes', MAX - 100 - size(first[0]));
   const before = JSON.stringify(ctx.redis.hgetall(META));
   const shed = await m.appendRecord('acme', 'checkout', rec('m-1 ' + 'x'.repeat(200)));
@@ -636,6 +647,14 @@ export async function check_byte_cap(ctx) {
   assert.deepStrictEqual(ctx.redis.lrange(KEY, 0, -1), first, \`a shed record must not reach \${KEY}, which now holds \${ctx.redis.llen(KEY)} records\`);
   assert.equal(JSON.stringify(ctx.redis.hgetall(META)), before, \`a shed record must leave \${META} as it was: \${before} became \${JSON.stringify(ctx.redis.hgetall(META))}\`);
   assert.equal(await m.appendRecord('acme', 'billing', rec('m-2')), 1, "another index's buffer has its own cap: its first append must return offset 1");
+  // A record that fills the buffer to exactly the cap fits; the next byte does not.
+  const fit = size(ctx.redis.lrange('buffer:acme:billing', 0, -1)[0]);
+  ctx.redis.hset(META, 'bytes', MAX - fit);
+  const exact = await m.appendRecord('acme', 'checkout', rec('m-2'));
+  assert.equal(exact, 2, \`a \${fit}-byte record with exactly \${fit} bytes left under the cap returned \${exact}, expected offset 2: only a record that takes bytes past 64 MiB is shed\`);
+  assert.equal(Number(ctx.redis.hget(META, 'bytes')), MAX, \`\${META} says bytes \${ctx.redis.hget(META, 'bytes')} after filling the buffer to the cap, expected \${MAX}\`);
+  const full = await m.appendRecord('acme', 'checkout', rec('m-3'));
+  assert.equal(full, 0, \`an append into a buffer at exactly 64 MiB returned \${full}: it must be shed and return 0\`);
 }
 
 export async function check_atomic_append(ctx) {
@@ -668,6 +687,8 @@ export async function check_drain_batch(ctx) {
   assert.deepStrictEqual(rest.map(r => r.message), want, \`the second drain returned \${rest.length} records, expected the 5 left\`);
   assert.deepStrictEqual(consistent(ctx, 'after the second drain'), []);
   assert.deepStrictEqual(await m.drainBatch('acme', 'checkout'), [], 'a drain of an empty buffer must return no records');
+  const after = await m.appendRecord('acme', 'checkout', rec('m-1005'));
+  assert.equal(after, 1006, \`an append after the buffer was drained empty returned offset \${after}, expected 1006: offset counts every record ever appended, and a drain settles only count and bytes\`);
 }
 
 export async function check_drain_atomic(ctx) {
@@ -698,137 +719,145 @@ import (
 )
 
 const (
-	stateKey  = "buffer:acme:checkout"
-	stateMeta = "buffer:acme:checkout:meta"
-	stateMax  = 64 << 20
+	hKey  = "buffer:acme:checkout"
+	hMeta = "buffer:acme:checkout:meta"
+	hMax  = 64 << 20
 )
 
-var stateBg = context.Background()
+var hBg = context.Background()
 
-func rec(message string) buffer.Record {
+func hRec(message string) buffer.Record {
 	return buffer.Record{Service: "checkout", Timestamp: "2026-11-03T10:00:00Z", Level: "error", Message: message}
 }
 
-func mustAppend(ctx *harness.Ctx, service string, r buffer.Record) int64 {
-	offset, err := appendRecord(stateBg, "acme", service, r)
+func hAppend(ctx *harness.Ctx, service string, r buffer.Record) int64 {
+	offset, err := appendRecord(hBg, "acme", service, r)
 	ctx.NoError(err, "appendRecord(acme, %s) failed", service)
 	return offset
 }
 
-func mustDrain(ctx *harness.Ctx) []buffer.Record {
-	batch, err := drainBatch(stateBg, "acme", "checkout")
+func hDrain(ctx *harness.Ctx) []buffer.Record {
+	batch, err := drainBatch(hBg, "acme", "checkout")
 	ctx.NoError(err, "drainBatch(acme, checkout) failed")
 	return batch
 }
 
-func messageOf(raw string) string {
+func hMessageOf(raw string) string {
 	var r buffer.Record
 	json.Unmarshal([]byte(raw), &r)
 	return r.Message
 }
 
-func consistent(ctx *harness.Ctx, when string) []string {
-	rows := ctx.Redis.LRange(stateKey, 0, -1)
-	meta := ctx.Redis.HGetAll(stateMeta)
+func hConsistent(ctx *harness.Ctx, when string) []string {
+	rows := ctx.Redis.LRange(hKey, 0, -1)
+	meta := ctx.Redis.HGetAll(hMeta)
 	count, _ := strconv.Atoi(meta["count"])
 	used, _ := strconv.Atoi(meta["bytes"])
 	total := 0
 	for _, x := range rows {
 		total += len(x)
 	}
-	ctx.Equal(count, len(rows), "%s: the count in %s against the records in %s", when, stateMeta, stateKey)
-	ctx.Equal(used, total, "%s: the bytes in %s against the size of the records in %s", when, stateMeta, stateKey)
+	ctx.Equal(count, len(rows), "%s: the count in %s against the records in %s", when, hMeta, hKey)
+	ctx.Equal(used, total, "%s: the bytes in %s against the size of the records in %s", when, hMeta, hKey)
 	return rows
 }
 
 func CheckByteCap(ctx *harness.Ctx) {
-	ctx.Equal(mustAppend(ctx, "checkout", rec("m-0")), int64(1), "the first append into an empty buffer must return offset 1")
-	first := ctx.Redis.LRange(stateKey, 0, -1)
-	ctx.Redis.Do("HINCRBY", stateMeta, "bytes", stateMax-100-len(first[0]))
-	before := ctx.Redis.HGetAll(stateMeta)
-	shed := mustAppend(ctx, "checkout", rec("m-1 "+strings.Repeat("x", 200)))
+	ctx.Equal(hAppend(ctx, "checkout", hRec("m-0 card declined: 12 € over the limit")), int64(1), "the first append into an empty buffer must return offset 1")
+	first := hConsistent(ctx, "after one append of a record holding a euro sign (3 bytes in UTF-8)")
+	ctx.Redis.Do("HINCRBY", hMeta, "bytes", hMax-100-len(first[0]))
+	before := ctx.Redis.HGetAll(hMeta)
+	shed := hAppend(ctx, "checkout", hRec("m-1 "+strings.Repeat("x", 200)))
 	ctx.Equal(shed, int64(0), "with 100 bytes left under the 64 MiB cap a 300-byte record must be shed; appendRecord's return")
-	ctx.Equal(ctx.Redis.LRange(stateKey, 0, -1), first, "a shed record must not reach %s; its records", stateKey)
-	ctx.Equal(ctx.Redis.HGetAll(stateMeta), before, "a shed record must leave %s as it was", stateMeta)
-	ctx.Equal(mustAppend(ctx, "billing", rec("m-2")), int64(1), "another index's buffer has its own cap: its first append must return offset 1")
+	ctx.Equal(ctx.Redis.LRange(hKey, 0, -1), first, "a shed record must not reach %s; its records", hKey)
+	ctx.Equal(ctx.Redis.HGetAll(hMeta), before, "a shed record must leave %s as it was", hMeta)
+	ctx.Equal(hAppend(ctx, "billing", hRec("m-2")), int64(1), "another index's buffer has its own cap: its first append must return offset 1")
+	// A record that fills the buffer to exactly the cap fits; the next byte does not.
+	fit := len(ctx.Redis.LRange("buffer:acme:billing", 0, -1)[0])
+	ctx.Redis.Do("HSET", hMeta, "bytes", hMax-fit)
+	ctx.Equal(hAppend(ctx, "checkout", hRec("m-2")), int64(2), "a %d-byte record with exactly %d bytes left under the cap must be appended at offset 2: only a record that takes bytes past 64 MiB is shed", fit, fit)
+	used, _ := ctx.Redis.HGet(hMeta, "bytes")
+	ctx.Equal(used, strconv.Itoa(hMax), "the bytes in %s after filling the buffer to the cap", hMeta)
+	ctx.Equal(hAppend(ctx, "checkout", hRec("m-3")), int64(0), "an append into a buffer at exactly 64 MiB must be shed; appendRecord's return")
 }
 
 func CheckAtomicAppend(ctx *harness.Ctx) {
-	ctx.Redis.Do("HSET", stateMeta, "count", 0, "bytes", stateMax-350, "offset", 0)
-	r := rec(strings.Repeat("x", 150))
+	ctx.Redis.Do("HSET", hMeta, "count", 0, "bytes", hMax-350, "offset", 0)
+	r := hRec(strings.Repeat("x", 150))
 	// A second append lands right after this one's first command on the meta hash.
-	rival := ctx.Redis.After(stateMeta, func() any {
-		offset, err := appendRecord(stateBg, "acme", "checkout", r)
+	rival := ctx.Redis.After(hMeta, func() any {
+		offset, err := appendRecord(hBg, "acme", "checkout", r)
 		ctx.NoError(err, "the rival append failed")
 		return offset
 	})
-	first := mustAppend(ctx, "checkout", r)
-	ctx.Assert(rival.Fired, "nothing touched %s", stateMeta)
+	first := hAppend(ctx, "checkout", r)
+	ctx.Assert(rival.Fired, "nothing touched %s", hMeta)
 	ctx.Assert(rival.Err == nil, "the rival append failed: %v", rival.Err)
 	second, _ := rival.Result.(int64)
 	offsets := []int64{first, second}
 	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
 	ctx.Assert(offsets[0] == 0 && offsets[1] > 0, "two appends raced for the last 350 bytes under the cap, where one record fits, and returned %d and %d: exactly one must be shed (0). Check the cap and write in one script", first, second)
-	used, _ := ctx.Redis.HGet(stateMeta, "bytes")
+	used, _ := ctx.Redis.HGet(hMeta, "bytes")
 	n, _ := strconv.Atoi(used)
-	ctx.Assert(n <= stateMax, "%s says bytes %d, past the 64 MiB cap by %d", stateMeta, n, n-stateMax)
-	ctx.Equal(ctx.Redis.LLen(stateKey), int64(1), "after the race %s must hold the one record that fit; its records", stateKey)
+	ctx.Assert(n <= hMax, "%s says bytes %d, past the 64 MiB cap by %d", hMeta, n, n-hMax)
+	ctx.Equal(ctx.Redis.LLen(hKey), int64(1), "after the race %s must hold the one record that fit; its records", hKey)
 }
 
 func CheckDrainBatch(ctx *harness.Ctx) {
-	args := []any{"RPUSH", stateKey}
+	args := []any{"RPUSH", hKey}
 	total := 0
 	for i := 0; i < 1005; i++ {
-		raw, _ := json.Marshal(rec(fmt.Sprintf("m-%d", i)))
+		raw, _ := json.Marshal(hRec(fmt.Sprintf("m-%d", i)))
 		args = append(args, string(raw))
 		total += len(raw)
 	}
 	ctx.Redis.Do(args...)
-	ctx.Redis.Do("HSET", stateMeta, "count", 1005, "bytes", total, "offset", 1005)
-	batch := mustDrain(ctx)
+	ctx.Redis.Do("HSET", hMeta, "count", 1005, "bytes", total, "offset", 1005)
+	batch := hDrain(ctx)
 	ctx.Equal(len(batch), 1000, "a drain of 1005 buffered records must return batchSize = 1000; the records drained")
 	ctx.Assert(batch[0].Message == "m-0" && batch[len(batch)-1].Message == "m-999", "a drain must take the oldest records in order, it returned %s … %s", batch[0].Message, batch[len(batch)-1].Message)
-	left := consistent(ctx, "after the first drain")
+	left := hConsistent(ctx, "after the first drain")
 	want := []string{"m-1000", "m-1001", "m-1002", "m-1003", "m-1004"}
 	var kept []string
 	for _, x := range left {
-		kept = append(kept, messageOf(x))
+		kept = append(kept, hMessageOf(x))
 	}
-	ctx.Equal(kept, want, "%s must keep the 5 newest records", stateKey)
-	rest := mustDrain(ctx)
+	ctx.Equal(kept, want, "%s must keep the 5 newest records", hKey)
+	rest := hDrain(ctx)
 	var got []string
 	for _, r := range rest {
 		got = append(got, r.Message)
 	}
 	ctx.Equal(got, want, "the second drain must return the 5 records left")
-	ctx.Equal(len(consistent(ctx, "after the second drain")), 0, "the records left after the second drain")
-	ctx.Equal(len(mustDrain(ctx)), 0, "a drain of an empty buffer; the records it returned")
+	ctx.Equal(len(hConsistent(ctx, "after the second drain")), 0, "the records left after the second drain")
+	ctx.Equal(len(hDrain(ctx)), 0, "a drain of an empty buffer; the records it returned")
+	ctx.Equal(hAppend(ctx, "checkout", hRec("m-1005")), int64(1006), "an append after the buffer was drained empty: offset counts every record ever appended, and a drain settles only count and bytes; the offset")
 }
 
 func CheckDrainAtomic(ctx *harness.Ctx) {
 	for i := 0; i < 3; i++ {
-		mustAppend(ctx, "checkout", rec(fmt.Sprintf("m-%d", i)))
+		hAppend(ctx, "checkout", hRec(fmt.Sprintf("m-%d", i)))
 	}
 	// An ingest lands while the drain is between its commands.
-	late := ctx.Redis.After(stateKey, func() any {
-		offset, err := appendRecord(stateBg, "acme", "checkout", rec("late"))
+	late := ctx.Redis.After(hKey, func() any {
+		offset, err := appendRecord(hBg, "acme", "checkout", hRec("late"))
 		ctx.NoError(err, "the late append failed")
 		return offset
 	})
-	batch := mustDrain(ctx)
-	ctx.Assert(late.Fired, "nothing touched %s", stateKey)
+	batch := hDrain(ctx)
+	ctx.Assert(late.Fired, "nothing touched %s", hKey)
 	ctx.Assert(late.Err == nil, "the late append failed: %v", late.Err)
-	left := consistent(ctx, "after a drain raced an append")
+	left := hConsistent(ctx, "after a drain raced an append")
 	var drained, kept []string
 	for _, r := range batch {
 		drained = append(drained, r.Message)
 	}
 	for _, x := range left {
-		kept = append(kept, messageOf(x))
+		kept = append(kept, hMessageOf(x))
 	}
 	seen := append(append([]string{}, drained...), kept...)
 	sort.Strings(seen)
-	ctx.Equal(seen, []string{"late", "m-0", "m-1", "m-2"}, "a record appended while the drain ran was lost (the drain returned %v, %s holds %v); every record", drained, stateKey, kept)
+	ctx.Equal(seen, []string{"late", "m-0", "m-1", "m-2"}, "a record appended while the drain ran was lost (the drain returned %v, %s holds %v); every record", drained, hKey, kept)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -845,37 +874,37 @@ func CheckDrainAtomic(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kKey = "buffer:acme:checkout";
-const std::string kMeta = "buffer:acme:checkout:meta";
-constexpr long long kMax = 64LL << 20;
+const std::string kHKey = "buffer:acme:checkout";
+const std::string kHMeta = "buffer:acme:checkout:meta";
+constexpr long long kHMax = 64LL << 20;
 
-buffer::Record rec(const std::string& message) { return {"checkout", "2026-11-03T10:00:00Z", "error", message}; }
+buffer::Record hRec(const std::string& message) { return {"checkout", "2026-11-03T10:00:00Z", "error", message}; }
 
-std::string messageOf(const std::string& raw) { return nlohmann::json::parse(raw, nullptr, false).value("message", ""); }
+std::string hMessageOf(const std::string& raw) { return nlohmann::json::parse(raw, nullptr, false).value("message", ""); }
 
-long long field(const std::map<std::string, std::string>& meta, const std::string& name) {
+long long hField(const std::map<std::string, std::string>& meta, const std::string& name) {
   return meta.count(name) && !meta.at(name).empty() ? std::stoll(meta.at(name)) : 0;
 }
 
-std::vector<std::string> consistent(harness::Ctx& ctx, const std::string& when) {
-  const auto rows = ctx.Redis.LRange(kKey, 0, -1);
-  const auto meta = ctx.Redis.HGetAll(kMeta);
+std::vector<std::string> hConsistent(harness::Ctx& ctx, const std::string& when) {
+  const auto rows = ctx.Redis.LRange(kHKey, 0, -1);
+  const auto meta = ctx.Redis.HGetAll(kHMeta);
   long long total = 0;
   for (const auto& x : rows) total += static_cast<long long>(x.size());
-  ctx.Equal(field(meta, "count"), static_cast<long long>(rows.size()), "%s: the count in %s against the records in %s", when, kMeta, kKey);
-  ctx.Equal(field(meta, "bytes"), total, "%s: the bytes in %s against the size of the records in %s", when, kMeta, kKey);
+  ctx.Equal(hField(meta, "count"), static_cast<long long>(rows.size()), "%s: the count in %s against the records in %s", when, kHMeta, kHKey);
+  ctx.Equal(hField(meta, "bytes"), total, "%s: the bytes in %s against the size of the records in %s", when, kHMeta, kHKey);
   return rows;
 }
 
 // A probe's outcome: whether it fired, what the append returned, what it threw.
-struct Rival {
+struct HRival {
   bool fired = false;
   long long offset = -1;
   std::optional<std::string> err;
 };
 
-std::shared_ptr<Rival> rivalAppend(harness::Ctx& ctx, const std::string& key, const buffer::Record& r) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRivalAppend(harness::Ctx& ctx, const std::string& key, const buffer::Record& r) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out, r] {
     out->fired = true;
     try {
@@ -887,7 +916,7 @@ std::shared_ptr<Rival> rivalAppend(harness::Ctx& ctx, const std::string& key, co
   return out;
 }
 
-void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
+void hSettled(harness::Ctx& ctx, const HRival& r, const std::string& what) {
   ctx.Assert(r.fired, "nothing touched %s", what);
   ctx.Assert(!r.err, "the parallel append failed: %s", r.err.value_or(""));
 }
@@ -895,70 +924,77 @@ void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
 }  // namespace
 
 void CheckByteCap(harness::Ctx& ctx) {
-  ctx.Equal(::appendRecord("acme", "checkout", rec("m-0")), 1LL, "the first append into an empty buffer must return offset 1");
-  const auto first = ctx.Redis.LRange(kKey, 0, -1);
-  ctx.Redis.Do("HINCRBY", kMeta, "bytes", kMax - 100 - static_cast<long long>(first[0].size()));
-  const auto before = ctx.Redis.HGetAll(kMeta);
-  const long long shed = ::appendRecord("acme", "checkout", rec("m-1 " + std::string(200, 'x')));
+  ctx.Equal(::appendRecord("acme", "checkout", hRec("m-0 card declined: 12 € over the limit")), 1LL, "the first append into an empty buffer must return offset 1");
+  const auto first = hConsistent(ctx, "after one append of a record holding a euro sign (3 bytes in UTF-8)");
+  ctx.Redis.Do("HINCRBY", kHMeta, "bytes", kHMax - 100 - static_cast<long long>(first[0].size()));
+  const auto before = ctx.Redis.HGetAll(kHMeta);
+  const long long shed = ::appendRecord("acme", "checkout", hRec("m-1 " + std::string(200, 'x')));
   ctx.Equal(shed, 0LL, "with 100 bytes left under the 64 MiB cap a 300-byte record must be shed; appendRecord's return");
-  ctx.Equal(ctx.Redis.LRange(kKey, 0, -1), first, "a shed record must not reach %s; its records", kKey);
-  ctx.Equal(ctx.Redis.HGetAll(kMeta), before, "a shed record must leave %s as it was", kMeta);
-  ctx.Equal(::appendRecord("acme", "billing", rec("m-2")), 1LL, "another index's buffer has its own cap: its first append must return offset 1");
+  ctx.Equal(ctx.Redis.LRange(kHKey, 0, -1), first, "a shed record must not reach %s; its records", kHKey);
+  ctx.Equal(ctx.Redis.HGetAll(kHMeta), before, "a shed record must leave %s as it was", kHMeta);
+  ctx.Equal(::appendRecord("acme", "billing", hRec("m-2")), 1LL, "another index's buffer has its own cap: its first append must return offset 1");
+  // A record that fills the buffer to exactly the cap fits; the next byte does not.
+  const long long fit = static_cast<long long>(ctx.Redis.LRange("buffer:acme:billing", 0, -1)[0].size());
+  ctx.Redis.Do("HSET", kHMeta, "bytes", std::to_string(kHMax - fit));
+  ctx.Equal(::appendRecord("acme", "checkout", hRec("m-2")), 2LL, "a %d-byte record with exactly %d bytes left under the cap must be appended at offset 2: only a record that takes bytes past 64 MiB is shed", fit, fit);
+  ctx.Equal(hField(ctx.Redis.HGetAll(kHMeta), "bytes"), kHMax, "the bytes in %s after filling the buffer to the cap", kHMeta);
+  ctx.Equal(::appendRecord("acme", "checkout", hRec("m-3")), 0LL, "an append into a buffer at exactly 64 MiB must be shed; appendRecord's return");
 }
 
 void CheckAtomicAppend(harness::Ctx& ctx) {
-  ctx.Redis.Do("HSET", kMeta, "count", "0", "bytes", std::to_string(kMax - 350), "offset", "0");
-  const buffer::Record r = rec(std::string(150, 'x'));
+  ctx.Redis.Do("HSET", kHMeta, "count", "0", "bytes", std::to_string(kHMax - 350), "offset", "0");
+  const buffer::Record r = hRec(std::string(150, 'x'));
   // A second append lands right after this one's first command on the meta hash.
-  const auto rival = rivalAppend(ctx, kMeta, r);
+  const auto rival = hRivalAppend(ctx, kHMeta, r);
   const long long first = ::appendRecord("acme", "checkout", r);
-  settled(ctx, *rival, kMeta);
+  hSettled(ctx, *rival, kHMeta);
   const long long low = std::min(first, rival->offset);
   const long long high = std::max(first, rival->offset);
   ctx.Assert(low == 0 && high > 0, "two appends raced for the last 350 bytes under the cap, where one record fits, and returned %d and %d: exactly one must be shed (0). Check the cap and write in one script", first, rival->offset);
-  const long long used = field(ctx.Redis.HGetAll(kMeta), "bytes");
-  ctx.Assert(used <= kMax, "%s says bytes %d, past the 64 MiB cap by %d", kMeta, used, used - kMax);
-  ctx.Equal(ctx.Redis.LLen(kKey), 1LL, "after the race %s must hold the one record that fit; its records", kKey);
+  const long long used = hField(ctx.Redis.HGetAll(kHMeta), "bytes");
+  ctx.Assert(used <= kHMax, "%s says bytes %d, past the 64 MiB cap by %d", kHMeta, used, used - kHMax);
+  ctx.Equal(ctx.Redis.LLen(kHKey), 1LL, "after the race %s must hold the one record that fit; its records", kHKey);
 }
 
 void CheckDrainBatch(harness::Ctx& ctx) {
-  std::vector<std::string> args = {"RPUSH", kKey};
+  std::vector<std::string> args = {"RPUSH", kHKey};
   long long total = 0;
   for (int i = 0; i < 1005; i++) {
-    args.push_back(buffer::toJson(rec("m-" + std::to_string(i))).dump());
+    args.push_back(buffer::toJson(hRec("m-" + std::to_string(i))).dump());
     total += static_cast<long long>(args.back().size());
   }
   ctx.Redis.Must(args);
-  ctx.Redis.Do("HSET", kMeta, "count", "1005", "bytes", std::to_string(total), "offset", "1005");
+  ctx.Redis.Do("HSET", kHMeta, "count", "1005", "bytes", std::to_string(total), "offset", "1005");
   const auto batch = ::drainBatch("acme", "checkout");
   ctx.Equal(batch.size(), 1000, "a drain of 1005 buffered records must return kBatchSize = 1000; the records drained");
   ctx.Assert(batch.front().message == "m-0" && batch.back().message == "m-999", "a drain must take the oldest records in order, it returned %s … %s", batch.front().message, batch.back().message);
-  const auto left = consistent(ctx, "after the first drain");
+  const auto left = hConsistent(ctx, "after the first drain");
   const std::vector<std::string> want = {"m-1000", "m-1001", "m-1002", "m-1003", "m-1004"};
   std::vector<std::string> kept;
-  for (const auto& x : left) kept.push_back(messageOf(x));
-  ctx.Equal(kept, want, "%s must keep the 5 newest records", kKey);
+  for (const auto& x : left) kept.push_back(hMessageOf(x));
+  ctx.Equal(kept, want, "%s must keep the 5 newest records", kHKey);
   std::vector<std::string> got;
   for (const auto& r : ::drainBatch("acme", "checkout")) got.push_back(r.message);
   ctx.Equal(got, want, "the second drain must return the 5 records left");
-  ctx.Equal(consistent(ctx, "after the second drain").size(), 0, "the records left after the second drain");
+  ctx.Equal(hConsistent(ctx, "after the second drain").size(), 0, "the records left after the second drain");
   ctx.Equal(::drainBatch("acme", "checkout").size(), 0, "a drain of an empty buffer; the records it returned");
+  ctx.Equal(::appendRecord("acme", "checkout", hRec("m-1005")), 1006LL, "an append after the buffer was drained empty: offset counts every record ever appended, and a drain settles only count and bytes; the offset");
 }
 
 void CheckDrainAtomic(harness::Ctx& ctx) {
-  for (int i = 0; i < 3; i++) ::appendRecord("acme", "checkout", rec("m-" + std::to_string(i)));
+  for (int i = 0; i < 3; i++) ::appendRecord("acme", "checkout", hRec("m-" + std::to_string(i)));
   // An ingest lands while the drain is between its commands.
-  const auto late = rivalAppend(ctx, kKey, rec("late"));
+  const auto late = hRivalAppend(ctx, kHKey, hRec("late"));
   const auto batch = ::drainBatch("acme", "checkout");
-  settled(ctx, *late, kKey);
-  const auto left = consistent(ctx, "after a drain raced an append");
+  hSettled(ctx, *late, kHKey);
+  const auto left = hConsistent(ctx, "after a drain raced an append");
   std::vector<std::string> drained, kept;
   for (const auto& r : batch) drained.push_back(r.message);
-  for (const auto& x : left) kept.push_back(messageOf(x));
+  for (const auto& x : left) kept.push_back(hMessageOf(x));
   std::vector<std::string> seen = drained;
   seen.insert(seen.end(), kept.begin(), kept.end());
   std::sort(seen.begin(), seen.end());
-  ctx.Equal(seen, {"late", "m-0", "m-1", "m-2"}, "a record appended while the drain ran was lost (the drain returned %v, %s holds %v); every record", drained, kKey, kept);
+  ctx.Equal(seen, {"late", "m-0", "m-1", "m-2"}, "a record appended while the drain ran was lost (the drain returned %v, %s holds %v); every record", drained, kHKey, kept);
 }
 `,
   },

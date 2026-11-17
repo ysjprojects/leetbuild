@@ -46,7 +46,7 @@ budget keeps taking steps.
       id: 'lease-guard',
       title: 'Takes the lease and charges the step in one script',
       detail:
-        'The lease is read, compared and taken inside one Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`), so a second worker cannot land between the read and the write; the starter reads the lease with a client `GET` and writes it later.',
+        'The lease is read, compared and taken inside one Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`) that also charges the step, so a second worker cannot land between the read and the write; the starter reads the lease with a client `GET` and writes it later.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]GET['"]/],
@@ -68,7 +68,7 @@ budget keeps taking steps.
       id: 'lease-ttl',
       title: 'The lease expires 45 seconds after the last step',
       detail:
-        'The lease is set with an expiry of `LEASE_TTL_MS` (`SET … PX`), refreshed by each step of its holder, so a crashed worker’s session is free 45 seconds later; the starter’s lease never expires.',
+        'The command that writes the lease gives it its `LEASE_TTL_MS` expiry (`SET … PX`), refreshed by each step of its holder, so a crashed worker’s session is free 45 seconds later; the starter’s lease never expires.',
       match: {
         python: {all: [/['"]PX['"]|\bpx\s*=|pexpire/i, /LEASE_TTL_MS\s*=\s*45_?000\b/]},
         typescript: {all: [/['"]PX['"]|pexpire/i, /LEASE_TTL_MS\s*=\s*45_?000\b/]},
@@ -81,7 +81,7 @@ budget keeps taking steps.
       id: 'budget',
       title: 'An exhausted budget refuses the step and records it',
       detail:
-        'Before charging, the script compares `budget_remaining` with zero; at zero it sets `status` to `budget_exhausted` and returns `BUDGET_EXHAUSTED`. The starter charges every step and lets the budget go negative.',
+        'Before charging, the script compares `budget_remaining` with zero; at zero it sets `status` to `budget_exhausted` and returns `BUDGET_EXHAUSTED`, so two steps at once on the last unit of budget take exactly one. The starter charges every step and lets the budget go negative.',
       match: {
         python: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
         typescript: {all: [/['"]budget_exhausted['"]/, /<=\s*0\b|<\s*1\b/]},
@@ -472,14 +472,25 @@ def check_lease_guard(ctx):
     winner, loser = ("worker-a", "worker-b") if mine == 1 else ("worker-b", "worker-a")
     assert m.begin_step(sid, winner) == 2, "the lease holder must be able to take the next step (2)"
     assert m.begin_step(sid, loser) == m.LEASE_HELD, "the other worker must still get LEASE_HELD"
+    # The command that takes the lease charges the step: no crash or rival lands between the two.
+    other = _session()
+    lease = f"browser:lease:{other}"
+    seen = ctx.redis_after(lease, lambda: (ctx.redis.exists(lease), sessions.load_session(other)))
+    assert m.begin_step(other, "worker-a") == 1, "the first step of a fresh session must be 1"
+    assert seen.fired, f"begin_step never touched {lease}"
+    held, snapshot = seen.result
+    assert not held or (snapshot["step_index"] == 1 and snapshot["budget_remaining"] == 9), f"right after the command that took {lease} the session held step_index {snapshot['step_index']}, budget_remaining {snapshot['budget_remaining']}: take the lease and charge the step in the same script"
 
 
 def check_lease_ttl(ctx):
     m = ctx.load("state")
     sid = _session()
+    lease = f"browser:lease:{sid}"
+    written = ctx.redis_after(lease, lambda: ctx.redis.pttl(lease))
     assert m.begin_step(sid, "worker-a") == 1, "the first step of a fresh session must be 1"
-    ttl = ctx.redis.pttl(f"browser:lease:{sid}")
-    assert 0 < ttl <= 45_000, f"browser:lease:{sid} has a TTL of {ttl} ms: a lease that never expires keeps a crashed worker's session stuck. It must expire LEASE_TTL_MS (45000 ms) after the holder's last step"
+    assert written.result == -2 or 44_000 <= written.result <= 45_000, f"right after the command that wrote {lease} its TTL was {written.result} ms: the command that writes the lease gives it its LEASE_TTL_MS (45000 ms) expiry (SET … PX)"
+    ttl = ctx.redis.pttl(lease)
+    assert 44_000 <= ttl <= 45_000, f"{lease} has a TTL of {ttl} ms: a lease that never expires keeps a crashed worker's session stuck. It must expire LEASE_TTL_MS (45000 ms) after the holder's last step"
     assert m.begin_step(sid, "worker-b") == m.LEASE_HELD, "while worker-a's lease is live worker-b must get LEASE_HELD"
     ctx.clock.advance(30)
     assert m.begin_step(sid, "worker-a") == 2, "the holder's next step (30 s later) must go through and refresh its lease"
@@ -500,6 +511,15 @@ def check_budget(ctx):
     assert session["step_index"] == 2 and session["budget_remaining"] == 0, f"the refused step was charged: step_index {session['step_index']}, budget_remaining {session['budget_remaining']}, expected 2 and 0"
     assert session["status"] == "budget_exhausted", f"the session's status is {session['status']!r} after its budget ran out, expected budget_exhausted"
     assert m.begin_step("s-404", "worker-a") == m.NO_SESSION, "a step on a session that does not exist must answer NO_SESSION"
+    # The same worker's two steps on the last unit of budget: exactly one is charged.
+    last = _session(max_steps=1)
+    rival = ctx.redis_after(sessions.session_key(last), lambda: m.begin_step(last, "worker-a"))
+    mine = m.begin_step(last, "worker-a")
+    assert rival.fired, f"begin_step never touched {sessions.session_key(last)}"
+    if rival.error is not None:
+        raise rival.error
+    session = sessions.load_session(last)
+    assert sorted([mine, rival.result]) == [m.BUDGET_EXHAUSTED, 1] and session["budget_remaining"] == 0, f"two steps at once on a 1-step budget got {mine} and {rival.result} and left budget_remaining {session['budget_remaining']}: compare the budget in the script that charges it, so exactly one step is taken"
 `,
     typescript: `async function session(ctx, maxSteps = 10): Promise<string> {
   const sessions = ctx.load('/support/browser/sessions.ts');
@@ -522,14 +542,25 @@ export async function check_lease_guard(ctx) {
   const [winner, loser] = mine === 1 ? ['worker-a', 'worker-b'] : ['worker-b', 'worker-a'];
   assert.equal(await m.beginStep(sid, winner), 2, 'the lease holder must be able to take the next step (2)');
   assert.equal(await m.beginStep(sid, loser), m.LEASE_HELD, 'the other worker must still get LEASE_HELD');
+  // The command that takes the lease charges the step: no crash or rival lands between the two.
+  const other = await session(ctx);
+  const lease = \`browser:lease:\${other}\`;
+  const seen = ctx.redisAfter(lease, () => ({held: ctx.redis.exists(lease), snapshot: ctx.redis.hgetall(\`browser:session:\${other}\`)}));
+  assert.equal(await m.beginStep(other, 'worker-a'), 1, 'the first step of a fresh session must be 1');
+  assert(seen.fired, \`beginStep never touched \${lease}\`);
+  const {held, snapshot} = seen.result;
+  assert(!held || (Number(snapshot.step_index) === 1 && Number(snapshot.budget_remaining) === 9), \`right after the command that took \${lease} the session held step_index \${snapshot.step_index}, budget_remaining \${snapshot.budget_remaining}: take the lease and charge the step in the same script\`);
 }
 
 export async function check_lease_ttl(ctx) {
   const m = ctx.load('state');
   const sid = await session(ctx);
+  const lease = \`browser:lease:\${sid}\`;
+  const written = ctx.redisAfter(lease, () => ctx.redis.pttl(lease));
   assert.equal(await m.beginStep(sid, 'worker-a'), 1, 'the first step of a fresh session must be 1');
-  const ttl = ctx.redis.pttl(\`browser:lease:\${sid}\`);
-  assert(ttl > 0 && ttl <= 45_000, \`browser:lease:\${sid} has a TTL of \${ttl} ms: a lease that never expires keeps a crashed worker's session stuck. It must expire LEASE_TTL_MS (45000 ms) after the holder's last step\`);
+  assert(written.result === -2 || (written.result >= 44_000 && written.result <= 45_000), \`right after the command that wrote \${lease} its TTL was \${written.result} ms: the command that writes the lease gives it its LEASE_TTL_MS (45000 ms) expiry (SET … PX)\`);
+  const ttl = ctx.redis.pttl(lease);
+  assert(ttl >= 44_000 && ttl <= 45_000, \`\${lease} has a TTL of \${ttl} ms: a lease that never expires keeps a crashed worker's session stuck. It must expire LEASE_TTL_MS (45000 ms) after the holder's last step\`);
   assert.equal(await m.beginStep(sid, 'worker-b'), m.LEASE_HELD, "while worker-a's lease is live worker-b must get LEASE_HELD");
   ctx.clock.advance(30);
   assert.equal(await m.beginStep(sid, 'worker-a'), 2, "the holder's next step (30 s later) must go through and refresh its lease");
@@ -551,6 +582,18 @@ export async function check_budget(ctx) {
   assert(s.step_index === 2 && s.budget_remaining === 0, \`the refused step was charged: step_index \${s.step_index}, budget_remaining \${s.budget_remaining}, expected 2 and 0\`);
   assert.equal(s.status, 'budget_exhausted', \`the session's status is \${s.status} after its budget ran out, expected budget_exhausted\`);
   assert.equal(await m.beginStep('s-404', 'worker-a'), m.NO_SESSION, 'a step on a session that does not exist must answer NO_SESSION');
+  // The same worker's two steps on the last unit of budget: exactly one is charged.
+  const last = await session(ctx, 1);
+  const rival = ctx.redisAfter(\`browser:session:\${last}\`, () => m.beginStep(last, 'worker-a'));
+  const mine = await m.beginStep(last, 'worker-a');
+  assert(rival.fired, \`beginStep never touched browser:session:\${last}\`);
+  if (rival.error !== undefined) throw rival.error;
+  const theirs = await rival.result;
+  const after = await sessions.loadSession(last);
+  assert(
+    [mine, theirs].sort((a, b) => a - b).join() === [m.BUDGET_EXHAUSTED, 1].join() && after.budget_remaining === 0,
+    \`two steps at once on a 1-step budget got \${mine} and \${theirs} and left budget_remaining \${after.budget_remaining}: compare the budget in the script that charges it, so exactly one step is taken\`,
+  );
 }
 `,
     go: `package main
@@ -565,26 +608,27 @@ import (
 
 var stateBg = context.Background()
 
-func newSession(maxSteps int) string {
+func hNewSession(maxSteps int) string {
 	return sessions.CreateSession(stateBg, "acme", "public-web", "buy a kettle", maxSteps, "https://www.example.com/").ID
 }
 
-func step(ctx *harness.Ctx, sid, worker string) int {
+func hStep(ctx *harness.Ctx, sid, worker string) int {
 	n, err := beginStep(stateBg, sid, worker)
 	ctx.NoError(err, "beginStep(%s, %s) failed", sid, worker)
 	return n
 }
 
 func CheckLeaseGuard(ctx *harness.Ctx) {
-	sid := newSession(10)
+	sid := hNewSession(10)
 	// Worker B picks the session up right after worker A's first command on its lease.
 	rival := ctx.Redis.After("browser:lease:"+sid, func() any {
 		n, err := beginStep(stateBg, sid, "worker-b")
 		ctx.NoError(err, "worker-b's beginStep failed")
 		return n
 	})
-	mine := step(ctx, sid, "worker-a")
+	mine := hStep(ctx, sid, "worker-a")
 	ctx.Assert(rival.Fired, "beginStep never touched browser:lease:%s", sid)
+	ctx.NoError(rival.Err, "worker-b's beginStep")
 	theirs := rival.Result.(int)
 	ctx.Assert((mine == 1 && theirs == leaseHeld) || (mine == leaseHeld && theirs == 1), "two workers began a step on one session at the same moment and got %d and %d: exactly one may win (step 1), the other must get leaseHeld (%d)", mine, theirs, leaseHeld)
 	s := sessions.LoadSession(stateBg, sid)
@@ -593,36 +637,70 @@ func CheckLeaseGuard(ctx *harness.Ctx) {
 	if mine != 1 {
 		winner, loser = loser, winner
 	}
-	ctx.Equal(step(ctx, sid, winner), 2, "the lease holder must be able to take the next step")
-	ctx.Equal(step(ctx, sid, loser), leaseHeld, "the other worker must still get leaseHeld")
+	ctx.Equal(hStep(ctx, sid, winner), 2, "the lease holder must be able to take the next step")
+	ctx.Equal(hStep(ctx, sid, loser), leaseHeld, "the other worker must still get leaseHeld")
+	// The command that takes the lease charges the step: no crash or rival lands between the two.
+	other := hNewSession(10)
+	lease := "browser:lease:" + other
+	seen := ctx.Redis.After(lease, func() any {
+		if ctx.Redis.Exists(lease) == 0 {
+			return map[string]string(nil)
+		}
+		return ctx.Redis.HGetAll(sessions.SessionKey(other))
+	})
+	ctx.Equal(hStep(ctx, other, "worker-a"), 1, "the first step of a fresh session")
+	ctx.Assert(seen.Fired, "beginStep never touched %s", lease)
+	ctx.NoError(seen.Err, "reading the session after the lease was taken")
+	if snapshot := seen.Result.(map[string]string); snapshot != nil {
+		ctx.Assert(snapshot["step_index"] == "1" && snapshot["budget_remaining"] == "9", "right after the command that took %s the session held step_index %s, budget_remaining %s: take the lease and charge the step in the same script", lease, snapshot["step_index"], snapshot["budget_remaining"])
+	}
 }
 
 func CheckLeaseTtl(ctx *harness.Ctx) {
-	sid := newSession(10)
-	ctx.Equal(step(ctx, sid, "worker-a"), 1, "the first step of a fresh session")
-	ttl := ctx.Redis.PTTL("browser:lease:" + sid)
-	ctx.Assert(ttl > 0 && ttl <= 45000, "browser:lease:%s has a TTL of %d ms: a lease that never expires keeps a crashed worker's session stuck. It must expire leaseTTLMs (45000 ms) after the holder's last step", sid, ttl)
-	ctx.Equal(step(ctx, sid, "worker-b"), leaseHeld, "while worker-a's lease is live worker-b must get leaseHeld")
+	sid := hNewSession(10)
+	lease := "browser:lease:" + sid
+	written := ctx.Redis.After(lease, func() any { return ctx.Redis.PTTL(lease) })
+	ctx.Equal(hStep(ctx, sid, "worker-a"), 1, "the first step of a fresh session")
+	ctx.NoError(written.Err, "reading the lease's TTL")
+	first, _ := written.Result.(int64)
+	ctx.Assert(first == -2 || (first >= 44000 && first <= 45000), "right after the command that wrote %s its TTL was %d ms: the command that writes the lease gives it its leaseTTLMs (45000 ms) expiry (SET … PX)", lease, first)
+	ttl := ctx.Redis.PTTL(lease)
+	ctx.Assert(ttl >= 44000 && ttl <= 45000, "%s has a TTL of %d ms: a lease that never expires keeps a crashed worker's session stuck. It must expire leaseTTLMs (45000 ms) after the holder's last step", lease, ttl)
+	ctx.Equal(hStep(ctx, sid, "worker-b"), leaseHeld, "while worker-a's lease is live worker-b must get leaseHeld")
 	ctx.Clock.Advance(30)
-	ctx.Equal(step(ctx, sid, "worker-a"), 2, "the holder's next step (30 s later) must go through and refresh its lease")
+	ctx.Equal(hStep(ctx, sid, "worker-a"), 2, "the holder's next step (30 s later) must go through and refresh its lease")
 	ctx.Clock.Advance(30)
-	ctx.Equal(step(ctx, sid, "worker-b"), leaseHeld, "30 s after the holder's last step its lease is still live: worker-b must get leaseHeld")
+	ctx.Equal(hStep(ctx, sid, "worker-b"), leaseHeld, "30 s after the holder's last step its lease is still live: worker-b must get leaseHeld")
 	ctx.Clock.Advance(16)
-	ctx.Equal(step(ctx, sid, "worker-b"), 3, "46 s after worker-a's last step its lease has expired: the next worker must resume the session at step 3")
+	ctx.Equal(hStep(ctx, sid, "worker-b"), 3, "46 s after worker-a's last step its lease has expired: the next worker must resume the session at step 3")
 }
 
 func CheckBudget(ctx *harness.Ctx) {
-	sid := newSession(2)
-	ctx.Equal([]int{step(ctx, sid, "worker-a"), step(ctx, sid, "worker-a")}, []int{1, 2}, "a 2-step session must take steps 1 and 2")
-	ctx.Equal(step(ctx, sid, "worker-a"), budgetExhausted, "a third step on a 2-step budget must be refused with budgetExhausted")
+	sid := hNewSession(2)
+	ctx.Equal([]int{hStep(ctx, sid, "worker-a"), hStep(ctx, sid, "worker-a")}, []int{1, 2}, "a 2-step session must take steps 1 and 2")
+	ctx.Equal(hStep(ctx, sid, "worker-a"), budgetExhausted, "a third step on a 2-step budget must be refused with budgetExhausted")
 	s := sessions.LoadSession(stateBg, sid)
 	ctx.Assert(s.StepIndex == 2 && s.BudgetRemaining == 0, "the refused step was charged: step_index %d, budget_remaining %d, expected 2 and 0", s.StepIndex, s.BudgetRemaining)
 	ctx.Equal(s.Status, "budget_exhausted", "the session's status after its budget ran out")
-	ctx.Equal(step(ctx, "s-404", "worker-a"), noSession, "a step on a session that does not exist")
+	ctx.Equal(hStep(ctx, "s-404", "worker-a"), noSession, "a step on a session that does not exist")
+	// The same worker's two steps on the last unit of budget: exactly one is charged.
+	last := hNewSession(1)
+	rival := ctx.Redis.After(sessions.SessionKey(last), func() any {
+		n, err := beginStep(stateBg, last, "worker-a")
+		ctx.NoError(err, "the concurrent beginStep failed")
+		return n
+	})
+	mine := hStep(ctx, last, "worker-a")
+	ctx.Assert(rival.Fired, "beginStep never touched %s", sessions.SessionKey(last))
+	ctx.NoError(rival.Err, "the concurrent beginStep")
+	theirs := rival.Result.(int)
+	after := sessions.LoadSession(stateBg, last)
+	ctx.Assert(((mine == 1 && theirs == budgetExhausted) || (mine == budgetExhausted && theirs == 1)) && after.BudgetRemaining == 0, "two steps at once on a 1-step budget got %d and %d and left budget_remaining %d: compare the budget in the script that charges it, so exactly one step is taken", mine, theirs, after.BudgetRemaining)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -631,30 +709,41 @@ func CheckBudget(ctx *harness.Ctx) {
 
 namespace {
 
-std::string newSession(long max_steps) {
+std::string hNewSession(long max_steps) {
   return sessions::createSession("acme", "public-web", "buy a kettle", max_steps, "https://www.example.com/").session_id;
 }
 
-struct Rival {
+struct HRival {
   bool fired = false;
   long result = 0;
   std::optional<std::string> err;
 };
 
-}  // namespace
-
-void CheckLeaseGuard(harness::Ctx& ctx) {
-  const std::string sid = newSession(10);
-  // Worker B picks the session up right after worker A's first command on its lease.
-  auto rival = std::make_shared<Rival>();
-  ctx.Redis.After("browser:lease:" + sid, [rival, sid] {
+// A second step of worker on sid, run inside the probe on key.
+std::shared_ptr<HRival> hRaceOn(harness::Ctx& ctx, const std::string& key, const std::string& sid, const std::string& worker) {
+  auto rival = std::make_shared<HRival>();
+  ctx.Redis.After(key, [rival, sid, worker] {
     rival->fired = true;
     try {
-      rival->result = beginStep(sid, "worker-b");
+      rival->result = beginStep(sid, worker);
     } catch (const std::exception& e) {
       rival->err = e.what();
     }
   });
+  return rival;
+}
+
+struct HSnapshot {
+  bool fired = false;
+  std::optional<std::map<std::string, std::string>> session;
+};
+
+}  // namespace
+
+void CheckLeaseGuard(harness::Ctx& ctx) {
+  const std::string sid = hNewSession(10);
+  // Worker B picks the session up right after worker A's first command on its lease.
+  const auto rival = hRaceOn(ctx, "browser:lease:" + sid, sid, "worker-b");
   const long mine = beginStep(sid, "worker-a");
   ctx.Assert(rival->fired, "beginStep never touched browser:lease:%s", sid);
   ctx.Assert(!rival->err, "worker-b's beginStep failed: %s", rival->err.value_or(""));
@@ -666,13 +755,32 @@ void CheckLeaseGuard(harness::Ctx& ctx) {
   const std::string loser = mine == 1 ? "worker-b" : "worker-a";
   ctx.Equal(beginStep(sid, winner), 2, "the lease holder must be able to take the next step");
   ctx.Equal(beginStep(sid, loser), kLeaseHeld, "the other worker must still get kLeaseHeld");
+  // The command that takes the lease charges the step: no crash or rival lands between the two.
+  const std::string other = hNewSession(10);
+  const std::string lease = "browser:lease:" + other;
+  const auto seen = std::make_shared<HSnapshot>();
+  ctx.Redis.After(lease, [&ctx, seen, lease, other] {
+    seen->fired = true;
+    if (ctx.Redis.Exists(lease) != 0) seen->session = ctx.Redis.HGetAll(sessions::sessionKey(other));
+  });
+  ctx.Equal(beginStep(other, "worker-a"), 1, "the first step of a fresh session");
+  ctx.Assert(seen->fired, "beginStep never touched %s", lease);
+  if (seen->session) {
+    auto snapshot = *seen->session;
+    ctx.Assert(snapshot["step_index"] == "1" && snapshot["budget_remaining"] == "9", "right after the command that took %s the session held step_index %s, budget_remaining %s: take the lease and charge the step in the same script", lease, snapshot["step_index"], snapshot["budget_remaining"]);
+  }
 }
 
 void CheckLeaseTtl(harness::Ctx& ctx) {
-  const std::string sid = newSession(10);
+  const std::string sid = hNewSession(10);
+  const std::string lease = "browser:lease:" + sid;
+  const auto written = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After(lease, [&ctx, written, lease] { *written = ctx.Redis.PTTL(lease); });
   ctx.Equal(beginStep(sid, "worker-a"), 1, "the first step of a fresh session");
-  const long long ttl = ctx.Redis.PTTL("browser:lease:" + sid);
-  ctx.Assert(ttl > 0 && ttl <= 45000, "browser:lease:%s has a TTL of %d ms: a lease that never expires keeps a crashed worker's session stuck. It must expire kLeaseTtlMs (45000 ms) after the holder's last step", sid, ttl);
+  const long long first = written->value_or(-2);
+  ctx.Assert(first == -2 || (first >= 44000 && first <= 45000), "right after the command that wrote %s its TTL was %d ms: the command that writes the lease gives it its kLeaseTtlMs (45000 ms) expiry (SET … PX)", lease, first);
+  const long long ttl = ctx.Redis.PTTL(lease);
+  ctx.Assert(ttl >= 44000 && ttl <= 45000, "%s has a TTL of %d ms: a lease that never expires keeps a crashed worker's session stuck. It must expire kLeaseTtlMs (45000 ms) after the holder's last step", lease, ttl);
   ctx.Equal(beginStep(sid, "worker-b"), kLeaseHeld, "while worker-a's lease is live worker-b must get kLeaseHeld");
   ctx.Clock.Advance(30);
   ctx.Equal(beginStep(sid, "worker-a"), 2, "the holder's next step (30 s later) must go through and refresh its lease");
@@ -683,7 +791,7 @@ void CheckLeaseTtl(harness::Ctx& ctx) {
 }
 
 void CheckBudget(harness::Ctx& ctx) {
-  const std::string sid = newSession(2);
+  const std::string sid = hNewSession(2);
   const long first = beginStep(sid, "worker-a");
   const long second = beginStep(sid, "worker-a");
   ctx.Assert(first == 1 && second == 2, "a 2-step session must take steps 1 and 2, got %d and %d", first, second);
@@ -692,6 +800,15 @@ void CheckBudget(harness::Ctx& ctx) {
   ctx.Assert(s->step_index == 2 && s->budget_remaining == 0, "the refused step was charged: step_index %d, budget_remaining %d, expected 2 and 0", s->step_index, s->budget_remaining);
   ctx.Equal(s->status, "budget_exhausted", "the session's status after its budget ran out");
   ctx.Equal(beginStep("s-404", "worker-a"), kNoSession, "a step on a session that does not exist");
+  // The same worker's two steps on the last unit of budget: exactly one is charged.
+  const std::string last = hNewSession(1);
+  const auto rival = hRaceOn(ctx, sessions::sessionKey(last), last, "worker-a");
+  const long mine = beginStep(last, "worker-a");
+  ctx.Assert(rival->fired, "beginStep never touched %s", sessions::sessionKey(last));
+  ctx.Assert(!rival->err, "the concurrent beginStep failed: %s", rival->err.value_or(""));
+  const long theirs = rival->result;
+  const auto after = sessions::loadSession(last);
+  ctx.Assert(((mine == 1 && theirs == kBudgetExhausted) || (mine == kBudgetExhausted && theirs == 1)) && after->budget_remaining == 0, "two steps at once on a 1-step budget got %d and %d and left budget_remaining %d: compare the budget in the script that charges it, so exactly one step is taken", mine, theirs, after->budget_remaining);
 }
 `,
   },

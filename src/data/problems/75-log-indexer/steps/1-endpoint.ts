@@ -21,12 +21,12 @@ record with an unknown level or a clock an hour off lands in the index.
 
 - A missing \`X-Tenant-Id\` is **401**; a \`service\` the tenant's registry does not hold
   (\`registry.is_registered\`) is **400** naming the registry.
-- A record over \`MAX_RECORD_BYTES\` (\`1 << 20\`) is **413**, decided on the bytes before anything
-  parses them.
+- A record over \`MAX_RECORD_BYTES\` (\`1 << 20\`) is **413**, decided on the whole request's bytes
+  before anything parses them; a record of exactly 1 MiB is accepted.
 - \`message\` keeps at most \`MAX_MESSAGE_BYTES\` (\`16 << 10\`) bytes, cut on a character boundary,
   and the 202 reports \`truncated\`, \`original_bytes\` and \`stored_bytes\`.
-- \`level\` is one of \`LEVELS\` (debug, info, warn, error, fatal) and \`timestamp\` is RFC 3339 within
-  \`MAX_SKEW\` (5 minutes) of now; otherwise **400**.
+- \`level\` is one of \`LEVELS\` (debug, info, warn, error, fatal) and \`timestamp\` is RFC 3339, with
+  its offset, within \`MAX_SKEW\` (5 minutes) of now, behind or ahead; otherwise **400**.
 - Nothing rejected reaches the buffer.`,
   sequence: {
     participants: ['Log agent', 'Ingest API', 'service registry', 'Redis buffer'],
@@ -76,7 +76,7 @@ record with an unknown level or a clock an hour off lands in the index.
       id: 'record-cap',
       title: 'Answers 413 for a record over 1 MiB, before parsing it',
       detail:
-        'The cap (`1 << 20` bytes) is applied to the request bytes before the JSON parse, and an oversized record is **413** with nothing buffered; the starter parses and buffers a record of any size.',
+        'The cap (`1 << 20` bytes) is applied to the whole request body before the JSON parse: a record over it is **413** with nothing buffered, whatever its message alone weighs, and a record of exactly 1 MiB is accepted; the starter parses and buffers a record of any size.',
       match: {
         python: {all: [/MAX_RECORD_BYTES\s*=\s*1\s*<<\s*20/, /\b413\b/], order: [/\b413\b/, /json\.loads\(/]},
         typescript: {all: [/MAX_RECORD_BYTES\s*=\s*1\s*<<\s*20/, /bodyLimit:\s*MAX_RECORD_BYTES/]},
@@ -92,7 +92,7 @@ record with an unknown level or a clock an hour off lands in the index.
       id: 'truncation',
       title: 'Cuts a message at 16 KiB of bytes and reports the cut',
       detail:
-        'A message over `16 << 10` bytes keeps its first 16 KiB of UTF-8, cut back to a character boundary, and the 202 carries `truncated`, `original_bytes` and `stored_bytes`; the starter counts characters and reports nothing.',
+        'A message over `16 << 10` bytes keeps its first 16 KiB of UTF-8, cut back to the start of the character the cut lands in (2-, 3- and 4-byte characters alike), and the 202 carries `truncated`, `original_bytes` and `stored_bytes`; a message of exactly 16 KiB is kept whole. The starter counts characters and reports nothing.',
       match: {
         python: {all: [/MAX_MESSAGE_BYTES\s*=\s*16\s*<<\s*10/, /\.encode\(/, /original_bytes/, /stored_bytes/]},
         typescript: {
@@ -107,7 +107,7 @@ record with an unknown level or a clock an hour off lands in the index.
       id: 'validate-before-buffer',
       title: 'Rejects an unknown level or a skewed timestamp before buffering',
       detail:
-        'A `level` outside `LEVELS` or a `timestamp` that is not RFC 3339 within 5 minutes of now is **400**, checked before the append; the starter buffers every record it can parse.',
+        'A `level` outside `LEVELS`, or a `timestamp` that is not RFC 3339 with its offset or lies more than 5 minutes from now, behind or ahead, is **400**, checked before the append; the starter buffers every record it can parse.',
       match: {
         python: {
           all: [/LEVELS/, /MAX_SKEW\s*=\s*timedelta\(minutes=5\)/],
@@ -783,8 +783,8 @@ from logindex import registry
 MESSAGE = "payment declined: card_expired"
 
 
-def _stamp(offset_s=0):
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset_s))
+def _stamp(offset_s=0, zone="Z", zone_s=0):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + offset_s + zone_s)) + zone
 
 
 def _record(**over):
@@ -837,14 +837,28 @@ async def check_tenant_service(ctx):
     assert len(_buffered(ctx)) == 1, f"buffer:acme:checkout holds {len(_buffered(ctx))} records, expected 1"
 
 
+def _exact_body(extra=0):
+    """A record of exactly 1 MiB of JSON bytes (plus extra), its message under 1 MiB."""
+    shell = json.dumps(_record(message=""))
+    return json.dumps(_record(message="x" * ((1 << 20) - len(shell) + extra))).encode()
+
+
 async def check_record_cap(ctx):
     async with _api(ctx) as c:
         huge = await _post(c, _record(message="x" * (1 << 20)))
         near = await _post(c, _record(message="x" * ((1 << 20) - 400)))
+        exact_body = _exact_body()
+        over_body = _exact_body(1)
+        headers = {"X-Tenant-Id": "acme", "Content-Type": "application/json"}
+        exact = await c.post("/v1/logs", content=exact_body, headers=headers)
+        over = await c.post("/v1/logs", content=over_body, headers=headers)
+    assert len(exact_body) == 1 << 20 and len(over_body) == (1 << 20) + 1
     assert huge.status_code == 413, f"a record over 1 MiB answered {huge.status_code}, expected 413"
+    assert over.status_code == 413, f"a record of 1 MiB + 1 byte whose message alone is under 1 MiB answered {over.status_code}, expected 413: the cap is on the whole record's bytes"
     assert near.status_code == 202, f"a record just under 1 MiB answered {near.status_code}, expected 202 (its message is cut, the record is accepted): {near.text[:200]}"
+    assert exact.status_code == 202, f"a record of exactly 1 MiB (1048576 bytes) answered {exact.status_code}, expected 202: only a record over the cap is 413: {exact.text[:200]}"
     stored = _buffered(ctx)
-    assert len(stored) == 1, f"only the record under the cap may be buffered; buffer:acme:checkout holds {len(stored)} records"
+    assert len(stored) == 2, f"only the records within the cap may be buffered; buffer:acme:checkout holds {len(stored)} records, expected 2"
 
 
 async def check_truncation(ctx):
@@ -852,7 +866,9 @@ async def check_truncation(ctx):
         short = await _post(c, _record())
         ascii_ = await _post(c, _record(message="a" * 20480))
         euro = await _post(c, _record(message="€" * 7000))
-    for r in (short, ascii_, euro):
+        whole = await _post(c, _record(message="a" * 16384))
+        emoji = await _post(c, _record(message="a" + "😀" * 4100))
+    for r in (short, ascii_, euro, whole, emoji):
         assert r.status_code == 202, f"a record answered {r.status_code}: {r.text[:200]}"
     body = short.json()
     assert body.get("truncated") is False and body.get("original_bytes") == 30 and body.get("stored_bytes") == 30, f"a 30-byte message must be answered truncated false with original_bytes and stored_bytes 30, got {body}"
@@ -860,10 +876,16 @@ async def check_truncation(ctx):
     assert body.get("truncated") is True and body.get("original_bytes") == 20480 and body.get("stored_bytes") == 16384, f"a 20480-byte message must be answered truncated true, original_bytes 20480, stored_bytes 16384, got {body}"
     body = euro.json()
     assert body.get("truncated") is True and body.get("original_bytes") == 21000 and body.get("stored_bytes") == 16383, f"7000 euro signs (3 bytes each) must be cut to 16383 bytes on a character boundary and answered original_bytes 21000, stored_bytes 16383, got {body}"
+    body = whole.json()
+    assert body.get("truncated") is False and body.get("original_bytes") == 16384 and body.get("stored_bytes") == 16384, f"a message of exactly 16384 bytes fits and must be answered truncated false with original_bytes and stored_bytes 16384, got {body}"
+    body = emoji.json()
+    assert body.get("truncated") is True and body.get("original_bytes") == 16401 and body.get("stored_bytes") == 16381, f"'a' and 4100 emoji (4 bytes each) must be cut back to 16381 bytes, the last whole character, and answered original_bytes 16401, stored_bytes 16381, got {body}"
     stored = _buffered(ctx)
-    assert len(stored) == 3, f"buffer:acme:checkout holds {len(stored)} records, expected 3"
+    assert len(stored) == 5, f"buffer:acme:checkout holds {len(stored)} records, expected 5"
     assert len(stored[1]["message"].encode()) == 16384, f"the stored ASCII message is {len(stored[1]['message'].encode())} bytes, expected 16384"
     assert stored[2]["message"] == "€" * 5461, f"the stored euro message is {len(stored[2]['message'].encode())} bytes, expected 5461 whole characters (16383 bytes): cut the bytes, not the characters, and never split one"
+    assert stored[3]["message"] == "a" * 16384, f"the stored 16384-byte message is {len(stored[3]['message'].encode())} bytes, expected all 16384 of them"
+    assert stored[4]["message"] == "a" + "😀" * 4095, f"the stored emoji message is {len(stored[4]['message'].encode())} bytes, expected 'a' and 4095 whole emoji (16381 bytes): walk back to the start of the character the cut lands in"
 
 
 async def check_validate_before_buffer(ctx):
@@ -871,18 +893,28 @@ async def check_validate_before_buffer(ctx):
         rejected = {
             "level verbose": await _post(c, _record(level="verbose")),
             "a timestamp 10 minutes old": await _post(c, _record(timestamp=_stamp(-600))),
+            "a timestamp 5.5 minutes old": await _post(c, _record(timestamp=_stamp(-330))),
             "a timestamp 10 minutes ahead": await _post(c, _record(timestamp=_stamp(600))),
             "timestamp yesterday": await _post(c, _record(timestamp="yesterday")),
+            "a timestamp without its offset": await _post(c, _record(timestamp=_stamp(zone=""))),
+            "the current time in RFC 2822 form": await _post(c, _record(timestamp=time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime()))),
         }
-        late = await _post(c, _record(timestamp=_stamp(-240)))
+        accepted = {
+            "a timestamp 4 minutes old": await _post(c, _record(timestamp=_stamp(-240))),
+            "a timestamp 4 minutes ahead": await _post(c, _record(timestamp=_stamp(240))),
+            "the current time written at +02:00": await _post(c, _record(timestamp=_stamp(zone="+02:00", zone_s=7200))),
+        }
     for what, r in rejected.items():
         assert r.status_code == 400, f"a record with {what} answered {r.status_code}, expected 400"
-    assert late.status_code == 202, f"a record 4 minutes old is inside the 5-minute skew and answered {late.status_code}: {late.text}"
-    assert len(_buffered(ctx)) == 1, f"buffer:acme:checkout holds {len(_buffered(ctx))} records: a rejected record must not reach the buffer"
+    for what, r in accepted.items():
+        assert r.status_code == 202, f"a record with {what} is inside the 5-minute skew and answered {r.status_code}: {r.text}"
+    assert len(_buffered(ctx)) == 3, f"buffer:acme:checkout holds {len(_buffered(ctx))} records, expected the 3 accepted: a rejected record must not reach the buffer"
 `,
     typescript: `const MESSAGE = 'payment declined: card_expired';
 
 const stamp = (ctx, offsetS = 0): string => new Date(ctx.clock.now() + offsetS * 1000).toISOString();
+// The current time as wall-clock digits in another zone, with or without the zone's suffix.
+const zoned = (ctx, zoneS: number, suffix: string): string => new Date(ctx.clock.now() + zoneS * 1000).toISOString().slice(0, 19) + suffix;
 const bytes = (text: string): number => new TextEncoder().encode(text).length;
 
 function record(ctx, over: Record<string, unknown> = {}) {
@@ -928,13 +960,27 @@ export async function check_tenant_service(ctx) {
   assert.equal(buffered(ctx).length, 1, \`buffer:acme:checkout holds \${buffered(ctx).length} records, expected 1\`);
 }
 
+// A record of exactly 1 MiB of JSON bytes (plus extra), its message under 1 MiB.
+function exactBody(ctx, extra = 0): string {
+  const shell = JSON.stringify(record(ctx, {message: ''}));
+  return JSON.stringify(record(ctx, {message: 'x'.repeat((1 << 20) - bytes(shell) + extra)}));
+}
+
 export async function check_record_cap(ctx) {
   const c = await api(ctx);
   const huge = await post(c, record(ctx, {message: 'x'.repeat(1 << 20)}));
   const near = await post(c, record(ctx, {message: 'x'.repeat((1 << 20) - 400)}));
+  const exactPayload = exactBody(ctx);
+  const overPayload = exactBody(ctx, 1);
+  assert(bytes(exactPayload) === 1 << 20 && bytes(overPayload) === (1 << 20) + 1, 'the harness built the boundary records wrong');
+  const headers = {'X-Tenant-Id': 'acme', 'content-type': 'application/json'};
+  const exact = await c.post('/v1/logs', {body: exactPayload, headers});
+  const over = await c.post('/v1/logs', {body: overPayload, headers});
   assert.equal(huge.status, 413, \`a record over 1 MiB answered \${huge.status}, expected 413\`);
+  assert.equal(over.status, 413, \`a record of 1 MiB + 1 byte whose message alone is under 1 MiB answered \${over.status}, expected 413: the cap is on the whole record's bytes\`);
   assert.equal(near.status, 202, \`a record just under 1 MiB answered \${near.status}, expected 202 (its message is cut, the record is accepted): \${near.text.slice(0, 200)}\`);
-  assert.equal(buffered(ctx).length, 1, \`only the record under the cap may be buffered; buffer:acme:checkout holds \${buffered(ctx).length} records\`);
+  assert.equal(exact.status, 202, \`a record of exactly 1 MiB (1048576 bytes) answered \${exact.status}, expected 202: only a record over the cap is 413: \${exact.text.slice(0, 200)}\`);
+  assert.equal(buffered(ctx).length, 2, \`only the records within the cap may be buffered; buffer:acme:checkout holds \${buffered(ctx).length} records, expected 2\`);
 }
 
 export async function check_truncation(ctx) {
@@ -942,17 +988,25 @@ export async function check_truncation(ctx) {
   const short = await post(c, record(ctx));
   const ascii = await post(c, record(ctx, {message: 'a'.repeat(20480)}));
   const euro = await post(c, record(ctx, {message: '€'.repeat(7000)}));
-  for (const r of [short, ascii, euro]) assert.equal(r.status, 202, \`a record answered \${r.status}: \${r.text.slice(0, 200)}\`);
+  const whole = await post(c, record(ctx, {message: 'a'.repeat(16384)}));
+  const emoji = await post(c, record(ctx, {message: 'a' + '😀'.repeat(4100)}));
+  for (const r of [short, ascii, euro, whole, emoji]) assert.equal(r.status, 202, \`a record answered \${r.status}: \${r.text.slice(0, 200)}\`);
   let body = short.json();
   assert(body.truncated === false && body.original_bytes === 30 && body.stored_bytes === 30, \`a 30-byte message must be answered truncated false with original_bytes and stored_bytes 30, got \${short.text}\`);
   body = ascii.json();
   assert(body.truncated === true && body.original_bytes === 20480 && body.stored_bytes === 16384, \`a 20480-byte message must be answered truncated true, original_bytes 20480, stored_bytes 16384, got \${ascii.text}\`);
   body = euro.json();
   assert(body.truncated === true && body.original_bytes === 21000 && body.stored_bytes === 16383, \`7000 euro signs (3 bytes each) must be cut to 16383 bytes on a character boundary and answered original_bytes 21000, stored_bytes 16383, got \${euro.text}\`);
+  body = whole.json();
+  assert(body.truncated === false && body.original_bytes === 16384 && body.stored_bytes === 16384, \`a message of exactly 16384 bytes fits and must be answered truncated false with original_bytes and stored_bytes 16384, got \${whole.text}\`);
+  body = emoji.json();
+  assert(body.truncated === true && body.original_bytes === 16401 && body.stored_bytes === 16381, \`'a' and 4100 emoji (4 bytes each) must be cut back to 16381 bytes, the last whole character, and answered original_bytes 16401, stored_bytes 16381, got \${emoji.text}\`);
   const stored = buffered(ctx);
-  assert.equal(stored.length, 3, \`buffer:acme:checkout holds \${stored.length} records, expected 3\`);
+  assert.equal(stored.length, 5, \`buffer:acme:checkout holds \${stored.length} records, expected 5\`);
   assert.equal(bytes(stored[1].message), 16384, \`the stored ASCII message is \${bytes(stored[1].message)} bytes, expected 16384\`);
   assert(stored[2].message === '€'.repeat(5461), \`the stored euro message is \${bytes(stored[2].message)} bytes, expected 5461 whole characters (16383 bytes): cut the bytes, not the characters, and never split one\`);
+  assert(stored[3].message === 'a'.repeat(16384), \`the stored 16384-byte message is \${bytes(stored[3].message)} bytes, expected all 16384 of them\`);
+  assert(stored[4].message === 'a' + '😀'.repeat(4095), \`the stored emoji message is \${bytes(stored[4].message)} bytes, expected 'a' and 4095 whole emoji (16381 bytes): walk back to the start of the character the cut lands in\`);
 }
 
 export async function check_validate_before_buffer(ctx) {
@@ -960,13 +1014,20 @@ export async function check_validate_before_buffer(ctx) {
   const rejected: [string, unknown][] = [
     ['level verbose', await post(c, record(ctx, {level: 'verbose'}))],
     ['a timestamp 10 minutes old', await post(c, record(ctx, {timestamp: stamp(ctx, -600)}))],
+    ['a timestamp 5.5 minutes old', await post(c, record(ctx, {timestamp: stamp(ctx, -330)}))],
     ['a timestamp 10 minutes ahead', await post(c, record(ctx, {timestamp: stamp(ctx, 600)}))],
     ['timestamp yesterday', await post(c, record(ctx, {timestamp: 'yesterday'}))],
+    ['a timestamp without its offset', await post(c, record(ctx, {timestamp: zoned(ctx, 0, '')}))],
+    ['the current time in RFC 2822 form', await post(c, record(ctx, {timestamp: new Date(ctx.clock.now()).toUTCString()}))],
   ];
-  const late = await post(c, record(ctx, {timestamp: stamp(ctx, -240)}));
+  const accepted: [string, unknown][] = [
+    ['a timestamp 4 minutes old', await post(c, record(ctx, {timestamp: stamp(ctx, -240)}))],
+    ['a timestamp 4 minutes ahead', await post(c, record(ctx, {timestamp: stamp(ctx, 240)}))],
+    ['the current time written at +02:00', await post(c, record(ctx, {timestamp: zoned(ctx, 7200, '+02:00')}))],
+  ];
   for (const [what, r] of rejected as [string, {status: number}][]) assert.equal(r.status, 400, \`a record with \${what} answered \${r.status}, expected 400\`);
-  assert.equal(late.status, 202, \`a record 4 minutes old is inside the 5-minute skew and answered \${late.status}: \${late.text}\`);
-  assert.equal(buffered(ctx).length, 1, \`buffer:acme:checkout holds \${buffered(ctx).length} records: a rejected record must not reach the buffer\`);
+  for (const [what, r] of accepted as [string, {status: number; text: string}][]) assert.equal(r.status, 202, \`a record with \${what} is inside the 5-minute skew and answered \${r.status}: \${r.text}\`);
+  assert.equal(buffered(ctx).length, 3, \`buffer:acme:checkout holds \${buffered(ctx).length} records, expected the 3 accepted: a rejected record must not reach the buffer\`);
 }
 `,
     go: `package main
@@ -983,11 +1044,11 @@ import (
 	"leetbuild/harness"
 )
 
-const apiMessage = "payment declined: card_expired"
+const hMessage = "payment declined: card_expired"
 
-var apiBg = context.Background()
+var hBg = context.Background()
 
-type ingestReply struct {
+type hIngestReply struct {
 	Accepted      bool \`json:"accepted"\`
 	Offset        int  \`json:"offset"\`
 	Truncated     *bool \`json:"truncated"\`
@@ -995,40 +1056,47 @@ type ingestReply struct {
 	StoredBytes   int  \`json:"stored_bytes"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	registry.AddService(apiBg, "acme", "checkout")
-	registry.AddService(apiBg, "globex", "billing")
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	registry.AddService(hBg, "acme", "checkout")
+	registry.AddService(hBg, "globex", "billing")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func stamp(ctx *harness.Ctx, offset time.Duration) string {
+func hStamp(ctx *harness.Ctx, offset time.Duration) string {
 	return ctx.Clock.Time().Add(offset).UTC().Format(time.RFC3339)
 }
 
-func logRecord(ctx *harness.Ctx, field, value string) map[string]string {
-	rec := map[string]string{"service": "checkout", "timestamp": stamp(ctx, 0), "level": "error", "message": apiMessage}
+func hLogRecord(ctx *harness.Ctx, field, value string) map[string]string {
+	rec := map[string]string{"service": "checkout", "timestamp": hStamp(ctx, 0), "level": "error", "message": hMessage}
 	if field != "" {
 		rec[field] = value
 	}
 	return rec
 }
 
-func postLog(c *harness.HTTP, rec map[string]string, tenant string) *harness.Response {
+func hPostLog(c *harness.HTTP, rec map[string]string, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Post("/v1/logs", rec)
 	}
 	return c.Post("/v1/logs", rec, "X-Tenant-Id", tenant)
 }
 
-func replyOf(r *harness.Response) ingestReply {
-	var out ingestReply
+// hExactBody is a record of exactly 1 MiB of JSON bytes (plus extra), its message under 1 MiB.
+func hExactBody(ctx *harness.Ctx, extra int) string {
+	shell, _ := json.Marshal(hLogRecord(ctx, "message", ""))
+	body, _ := json.Marshal(hLogRecord(ctx, "message", strings.Repeat("x", (1<<20)-len(shell)+extra)))
+	return string(body)
+}
+
+func hReplyOf(r *harness.Response) hIngestReply {
+	var out hIngestReply
 	json.Unmarshal(r.Body, &out)
 	return out
 }
 
-func buffered(ctx *harness.Ctx) []map[string]string {
+func hBuffered(ctx *harness.Ctx) []map[string]string {
 	var out []map[string]string
 	for _, raw := range ctx.Redis.LRange("buffer:acme:checkout", 0, -1) {
 		var rec map[string]string
@@ -1038,7 +1106,7 @@ func buffered(ctx *harness.Ctx) []map[string]string {
 	return out
 }
 
-func buffers(ctx *harness.Ctx) []string {
+func hBuffers(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, k := range ctx.Redis.Keys("buffer:*") {
 		if !strings.HasSuffix(k, ":meta") {
@@ -1048,7 +1116,7 @@ func buffers(ctx *harness.Ctx) []string {
 	return out
 }
 
-func brief(text string) string {
+func hBrief(text string) string {
 	if len(text) > 200 {
 		return text[:200]
 	}
@@ -1056,77 +1124,102 @@ func brief(text string) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := postLog(c, logRecord(ctx, "", ""), "acme")
+	c := hAPI(ctx)
+	r := hPostLog(c, hLogRecord(ctx, "", ""), "acme")
 	ctx.Equal(r.Status, 202, "POST /v1/logs with a valid record (%s)", r.Text())
-	body := replyOf(r)
+	body := hReplyOf(r)
 	ctx.Assert(body.Accepted && body.Offset == 1, "the first record must be answered accepted with offset 1, got %s", r.Text())
-	stored := buffered(ctx)
-	ctx.Assert(len(stored) == 1 && stored[0]["message"] == apiMessage && stored[0]["service"] == "checkout", "buffer:acme:checkout holds %v, expected the one record", stored)
+	stored := hBuffered(ctx)
+	ctx.Assert(len(stored) == 1 && stored[0]["message"] == hMessage && stored[0]["service"] == "checkout", "buffer:acme:checkout holds %v, expected the one record", stored)
 }
 
 func CheckTenantService(ctx *harness.Ctx) {
-	c := api(ctx)
-	anonymous := postLog(c, logRecord(ctx, "", ""), "")
-	typo := postLog(c, logRecord(ctx, "service", "chekout"), "acme")
-	foreign := postLog(c, logRecord(ctx, "service", "billing"), "acme")
-	ok := postLog(c, logRecord(ctx, "", ""), "acme")
+	c := hAPI(ctx)
+	anonymous := hPostLog(c, hLogRecord(ctx, "", ""), "")
+	typo := hPostLog(c, hLogRecord(ctx, "service", "chekout"), "acme")
+	foreign := hPostLog(c, hLogRecord(ctx, "service", "billing"), "acme")
+	ok := hPostLog(c, hLogRecord(ctx, "", ""), "acme")
 	ctx.Equal(anonymous.Status, 401, "a record without X-Tenant-Id")
 	ctx.Equal(typo.Status, 400, "a record for chekout, a service acme never registered")
 	ctx.Assert(strings.Contains(typo.Text(), "registry"), "the 400 must say the service is not in the tenant's registry, got %s", typo.Text())
 	ctx.Equal(foreign.Status, 400, "acme posting to billing, a service only globex registered")
 	ctx.Equal(ok.Status, 202, "a record for acme's checkout (%s)", ok.Text())
-	ctx.Equal(buffers(ctx), []string{"buffer:acme:checkout"}, "only the registered record may be buffered; the buffers in Redis")
-	ctx.Equal(len(buffered(ctx)), 1, "the records in buffer:acme:checkout")
+	ctx.Equal(hBuffers(ctx), []string{"buffer:acme:checkout"}, "only the registered record may be buffered; the buffers in Redis")
+	ctx.Equal(len(hBuffered(ctx)), 1, "the records in buffer:acme:checkout")
 }
 
 func CheckRecordCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	huge := postLog(c, logRecord(ctx, "message", strings.Repeat("x", 1<<20)), "acme")
-	near := postLog(c, logRecord(ctx, "message", strings.Repeat("x", (1<<20)-400)), "acme")
+	c := hAPI(ctx)
+	huge := hPostLog(c, hLogRecord(ctx, "message", strings.Repeat("x", 1<<20)), "acme")
+	near := hPostLog(c, hLogRecord(ctx, "message", strings.Repeat("x", (1<<20)-400)), "acme")
+	exactBody, overBody := hExactBody(ctx, 0), hExactBody(ctx, 1)
+	ctx.Assert(len(exactBody) == 1<<20 && len(overBody) == (1<<20)+1, "the harness built the boundary records wrong")
+	exact := c.Post("/v1/logs", exactBody, "X-Tenant-Id", "acme", "Content-Type", "application/json")
+	over := c.Post("/v1/logs", overBody, "X-Tenant-Id", "acme", "Content-Type", "application/json")
 	ctx.Equal(huge.Status, 413, "a record over 1 MiB")
-	ctx.Equal(near.Status, 202, "a record just under 1 MiB must be accepted with its message cut (%s)", brief(near.Text()))
-	ctx.Equal(len(buffered(ctx)), 1, "only the record under the cap may be buffered; the records in buffer:acme:checkout")
+	ctx.Equal(over.Status, 413, "a record of 1 MiB + 1 byte whose message alone is under 1 MiB: the cap is on the whole record's bytes")
+	ctx.Equal(near.Status, 202, "a record just under 1 MiB must be accepted with its message cut (%s)", hBrief(near.Text()))
+	ctx.Equal(exact.Status, 202, "a record of exactly 1 MiB (1048576 bytes): only a record over the cap is 413 (%s)", hBrief(exact.Text()))
+	ctx.Equal(len(hBuffered(ctx)), 2, "only the records within the cap may be buffered; the records in buffer:acme:checkout")
 }
 
 func CheckTruncation(ctx *harness.Ctx) {
-	c := api(ctx)
-	short := postLog(c, logRecord(ctx, "", ""), "acme")
-	ascii := postLog(c, logRecord(ctx, "message", strings.Repeat("a", 20480)), "acme")
-	euro := postLog(c, logRecord(ctx, "message", strings.Repeat("€", 7000)), "acme")
-	for _, r := range []*harness.Response{short, ascii, euro} {
-		ctx.Equal(r.Status, 202, "a record (%s)", brief(r.Text()))
+	c := hAPI(ctx)
+	short := hPostLog(c, hLogRecord(ctx, "", ""), "acme")
+	ascii := hPostLog(c, hLogRecord(ctx, "message", strings.Repeat("a", 20480)), "acme")
+	euro := hPostLog(c, hLogRecord(ctx, "message", strings.Repeat("€", 7000)), "acme")
+	whole := hPostLog(c, hLogRecord(ctx, "message", strings.Repeat("a", 16384)), "acme")
+	emoji := hPostLog(c, hLogRecord(ctx, "message", "a"+strings.Repeat("😀", 4100)), "acme")
+	for _, r := range []*harness.Response{short, ascii, euro, whole, emoji} {
+		ctx.Equal(r.Status, 202, "a record (%s)", hBrief(r.Text()))
 	}
-	body := replyOf(short)
+	body := hReplyOf(short)
 	ctx.Assert(body.Truncated != nil && !*body.Truncated && body.OriginalBytes == 30 && body.StoredBytes == 30, "a 30-byte message must be answered truncated false with original_bytes and stored_bytes 30, got %s", short.Text())
-	body = replyOf(ascii)
+	body = hReplyOf(ascii)
 	ctx.Assert(body.Truncated != nil && *body.Truncated && body.OriginalBytes == 20480 && body.StoredBytes == 16384, "a 20480-byte message must be answered truncated true, original_bytes 20480, stored_bytes 16384, got %s", ascii.Text())
-	body = replyOf(euro)
+	body = hReplyOf(euro)
 	ctx.Assert(body.Truncated != nil && *body.Truncated && body.OriginalBytes == 21000 && body.StoredBytes == 16383, "7000 euro signs (3 bytes each) must be cut to 16383 bytes on a character boundary and answered original_bytes 21000, stored_bytes 16383, got %s", euro.Text())
-	stored := buffered(ctx)
-	ctx.Equal(len(stored), 3, "the records in buffer:acme:checkout")
+	body = hReplyOf(whole)
+	ctx.Assert(body.Truncated != nil && !*body.Truncated && body.OriginalBytes == 16384 && body.StoredBytes == 16384, "a message of exactly 16384 bytes fits and must be answered truncated false with original_bytes and stored_bytes 16384, got %s", whole.Text())
+	body = hReplyOf(emoji)
+	ctx.Assert(body.Truncated != nil && *body.Truncated && body.OriginalBytes == 16401 && body.StoredBytes == 16381, "'a' and 4100 emoji (4 bytes each) must be cut back to 16381 bytes, the last whole character, and answered original_bytes 16401, stored_bytes 16381, got %s", emoji.Text())
+	stored := hBuffered(ctx)
+	ctx.Equal(len(stored), 5, "the records in buffer:acme:checkout")
 	ctx.Equal(len(stored[1]["message"]), 16384, "the bytes of the stored ASCII message")
 	ctx.Assert(stored[2]["message"] == strings.Repeat("€", 5461), "the stored euro message is %d bytes, expected 5461 whole characters (16383 bytes): cut the bytes, not the characters, and never split one", len(stored[2]["message"]))
+	ctx.Assert(stored[3]["message"] == strings.Repeat("a", 16384), "the stored 16384-byte message is %d bytes, expected all 16384 of them", len(stored[3]["message"]))
+	ctx.Assert(stored[4]["message"] == "a"+strings.Repeat("😀", 4095), "the stored emoji message is %d bytes, expected 'a' and 4095 whole emoji (16381 bytes): walk back to the start of the character the cut lands in", len(stored[4]["message"]))
 }
 
 func CheckValidateBeforeBuffer(ctx *harness.Ctx) {
-	c := api(ctx)
-	cases := []struct {
+	c := hAPI(ctx)
+	now := ctx.Clock.Time()
+	rejected := []struct {
 		what         string
 		field, value string
 	}{
 		{"level verbose", "level", "verbose"},
-		{"a timestamp 10 minutes old", "timestamp", stamp(ctx, -10*time.Minute)},
-		{"a timestamp 10 minutes ahead", "timestamp", stamp(ctx, 10*time.Minute)},
+		{"a timestamp 10 minutes old", "timestamp", hStamp(ctx, -10*time.Minute)},
+		{"a timestamp 5.5 minutes old", "timestamp", hStamp(ctx, -330*time.Second)},
+		{"a timestamp 10 minutes ahead", "timestamp", hStamp(ctx, 10*time.Minute)},
 		{"timestamp yesterday", "timestamp", "yesterday"},
+		{"a timestamp without its offset", "timestamp", now.UTC().Format("2006-01-02T15:04:05")},
+		{"the current time in RFC 2822 form", "timestamp", now.UTC().Format(http.TimeFormat)},
 	}
-	for _, tc := range cases {
-		r := postLog(c, logRecord(ctx, tc.field, tc.value), "acme")
+	for _, tc := range rejected {
+		r := hPostLog(c, hLogRecord(ctx, tc.field, tc.value), "acme")
 		ctx.Equal(r.Status, 400, "a record with %s", tc.what)
 	}
-	late := postLog(c, logRecord(ctx, "timestamp", stamp(ctx, -4*time.Minute)), "acme")
-	ctx.Equal(late.Status, 202, "a record 4 minutes old is inside the 5-minute skew (%s)", late.Text())
-	ctx.Equal(len(buffered(ctx)), 1, "a rejected record must not reach the buffer; the records in buffer:acme:checkout")
+	accepted := []struct{ what, value string }{
+		{"a timestamp 4 minutes old", hStamp(ctx, -4*time.Minute)},
+		{"a timestamp 4 minutes ahead", hStamp(ctx, 4*time.Minute)},
+		{"the current time written at +02:00", now.In(time.FixedZone("", 7200)).Format(time.RFC3339)},
+	}
+	for _, tc := range accepted {
+		r := hPostLog(c, hLogRecord(ctx, "timestamp", tc.value), "acme")
+		ctx.Equal(r.Status, 202, "a record with %s is inside the 5-minute skew (%s)", tc.what, r.Text())
+	}
+	ctx.Equal(len(hBuffered(ctx)), 3, "the 3 accepted records, and no rejected one, in buffer:acme:checkout")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1143,9 +1236,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kApiMessage = "payment declined: card_expired";
+const std::string kHMessage = "payment declined: card_expired";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   registry::addService("acme", "checkout");
   registry::addService("globex", "billing");
   static httplib::Server* svr = nullptr;
@@ -1155,8 +1248,12 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-// An RFC 3339 UTC timestamp offset_s seconds from now.
-std::string stamp(harness::Ctx& ctx, long long offset_s) {
+struct HCivil {
+  long long y, m, d, secs, weekday;
+};
+
+// The UTC calendar date of the instant offset_s seconds from now.
+HCivil hCivil(harness::Ctx& ctx, long long offset_s) {
   const long long t = ctx.Clock.Now() / 1000 + offset_s;
   long long z = t / 86400 + 719468;
   const long long secs = t % 86400;
@@ -1168,34 +1265,58 @@ std::string stamp(harness::Ctx& ctx, long long offset_s) {
   const long long d = doy - (153 * mp + 2) / 5 + 1;
   const long long m = mp < 10 ? mp + 3 : mp - 9;
   const long long y = yoe + era * 400 + (m <= 2);
+  return {y, m, d, secs, (t / 86400 + 4) % 7};
+}
+
+// An RFC 3339 timestamp offset_s seconds from now: the wall clock zone_s seconds east of UTC, then the suffix.
+std::string hStamp(harness::Ctx& ctx, long long offset_s, long long zone_s = 0, const std::string& suffix = "Z") {
+  const HCivil c = hCivil(ctx, offset_s + zone_s);
   char out[32];
-  std::snprintf(out, sizeof out, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lldZ", y, m, d, secs / 3600, secs / 60 % 60, secs % 60);
+  std::snprintf(out, sizeof out, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld", c.y, c.m, c.d, c.secs / 3600, c.secs / 60 % 60, c.secs % 60);
+  return out + suffix;
+}
+
+// The current time in RFC 2822 form, as an HTTP Date header writes it.
+std::string hRfc2822(harness::Ctx& ctx) {
+  static const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  const HCivil c = hCivil(ctx, 0);
+  char out[40];
+  std::snprintf(out, sizeof out, "%s, %02lld %s %04lld %02lld:%02lld:%02lld GMT", days[c.weekday], c.d, months[c.m - 1], c.y, c.secs / 3600, c.secs / 60 % 60, c.secs % 60);
   return out;
 }
 
-json logRecord(harness::Ctx& ctx, const std::string& field = "", const std::string& value = "") {
-  json rec = {{"service", "checkout"}, {"timestamp", stamp(ctx, 0)}, {"level", "error"}, {"message", kApiMessage}};
+json hLogRecord(harness::Ctx& ctx, const std::string& field = "", const std::string& value = "") {
+  json rec = {{"service", "checkout"}, {"timestamp", hStamp(ctx, 0)}, {"level", "error"}, {"message", kHMessage}};
   if (!field.empty()) rec[field] = value;
   return rec;
 }
 
-harness::Response postLog(harness::HTTP& c, const json& rec, const std::string& tenant = "acme") {
-  if (tenant.empty()) return c.Post("/v1/logs", rec.dump(), "Content-Type", "application/json");
-  return c.Post("/v1/logs", rec.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
+harness::Response hPostRaw(harness::HTTP& c, const std::string& body, const std::string& tenant = "acme") {
+  if (tenant.empty()) return c.Post("/v1/logs", body, "Content-Type", "application/json");
+  return c.Post("/v1/logs", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-json replyOf(const harness::Response& r) {
+harness::Response hPostLog(harness::HTTP& c, const json& rec, const std::string& tenant = "acme") { return hPostRaw(c, rec.dump(), tenant); }
+
+// A record of exactly 1 MiB of JSON bytes (plus extra), its message under 1 MiB.
+std::string hExactBody(harness::Ctx& ctx, size_t extra) {
+  const size_t shell = hLogRecord(ctx, "message", "").dump().size();
+  return hLogRecord(ctx, "message", std::string((1 << 20) - shell + extra, 'x')).dump();
+}
+
+json hReplyOf(const harness::Response& r) {
   const json j = json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : json::object();
 }
 
-std::vector<json> buffered(harness::Ctx& ctx) {
+std::vector<json> hBuffered(harness::Ctx& ctx) {
   std::vector<json> out;
   for (const auto& raw : ctx.Redis.LRange("buffer:acme:checkout", 0, -1)) out.push_back(json::parse(raw, nullptr, false));
   return out;
 }
 
-std::vector<std::string> buffers(harness::Ctx& ctx) {
+std::vector<std::string> hBuffers(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& k : ctx.Redis.Keys("buffer:*")) {
     if (k.size() < 5 || k.substr(k.size() - 5) != ":meta") out.push_back(k);
@@ -1203,89 +1324,114 @@ std::vector<std::string> buffers(harness::Ctx& ctx) {
   return out;
 }
 
-std::string repeat(const std::string& s, size_t n) {
+std::string hRepeat(const std::string& s, size_t n) {
   std::string out;
   out.reserve(s.size() * n);
   for (size_t i = 0; i < n; i++) out += s;
   return out;
 }
 
-std::string brief(const std::string& text) { return text.substr(0, 200); }
+std::string hBrief(const std::string& text) { return text.substr(0, 200); }
 
-bool isFalse(const json& body, const char* name) { return body.contains(name) && body[name].is_boolean() && !body[name].get<bool>(); }
-bool isTrue(const json& body, const char* name) { return body.contains(name) && body[name].is_boolean() && body[name].get<bool>(); }
+bool hIsFalse(const json& body, const char* name) { return body.contains(name) && body[name].is_boolean() && !body[name].get<bool>(); }
+bool hIsTrue(const json& body, const char* name) { return body.contains(name) && body[name].is_boolean() && body[name].get<bool>(); }
+
+bool hCut(const json& body, bool truncated, int original, int stored) {
+  return (truncated ? hIsTrue(body, "truncated") : hIsFalse(body, "truncated")) && body.value("original_bytes", 0) == original && body.value("stored_bytes", 0) == stored;
+}
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = postLog(c, logRecord(ctx));
+  auto c = hApi(ctx);
+  const auto r = hPostLog(c, hLogRecord(ctx));
   ctx.Equal(r.Status, 202, "POST /v1/logs with a valid record (%s)", r.Text());
-  const json body = replyOf(r);
-  ctx.Assert(isTrue(body, "accepted") && body.value("offset", 0) == 1, "the first record must be answered accepted with offset 1, got %s", r.Text());
-  const auto stored = buffered(ctx);
-  ctx.Assert(stored.size() == 1 && stored[0].value("message", "") == kApiMessage && stored[0].value("service", "") == "checkout",
+  const json body = hReplyOf(r);
+  ctx.Assert(hIsTrue(body, "accepted") && body.value("offset", 0) == 1, "the first record must be answered accepted with offset 1, got %s", r.Text());
+  const auto stored = hBuffered(ctx);
+  ctx.Assert(stored.size() == 1 && stored[0].value("message", "") == kHMessage && stored[0].value("service", "") == "checkout",
              "buffer:acme:checkout holds %d records, expected the one record", stored.size());
 }
 
 void CheckTenantService(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto anonymous = postLog(c, logRecord(ctx), "");
-  const auto typo = postLog(c, logRecord(ctx, "service", "chekout"));
-  const auto foreign = postLog(c, logRecord(ctx, "service", "billing"));
-  const auto ok = postLog(c, logRecord(ctx));
+  auto c = hApi(ctx);
+  const auto anonymous = hPostLog(c, hLogRecord(ctx), "");
+  const auto typo = hPostLog(c, hLogRecord(ctx, "service", "chekout"));
+  const auto foreign = hPostLog(c, hLogRecord(ctx, "service", "billing"));
+  const auto ok = hPostLog(c, hLogRecord(ctx));
   ctx.Equal(anonymous.Status, 401, "a record without X-Tenant-Id");
   ctx.Equal(typo.Status, 400, "a record for chekout, a service acme never registered");
   ctx.Assert(typo.Text().find("registry") != std::string::npos, "the 400 must say the service is not in the tenant's registry, got %s", typo.Text());
   ctx.Equal(foreign.Status, 400, "acme posting to billing, a service only globex registered");
   ctx.Equal(ok.Status, 202, "a record for acme's checkout (%s)", ok.Text());
-  ctx.Equal(buffers(ctx), {"buffer:acme:checkout"}, "only the registered record may be buffered; the buffers in Redis");
-  ctx.Equal(buffered(ctx).size(), 1, "the records in buffer:acme:checkout");
+  ctx.Equal(hBuffers(ctx), {"buffer:acme:checkout"}, "only the registered record may be buffered; the buffers in Redis");
+  ctx.Equal(hBuffered(ctx).size(), 1, "the records in buffer:acme:checkout");
 }
 
 void CheckRecordCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto huge = postLog(c, logRecord(ctx, "message", std::string(1 << 20, 'x')));
-  const auto near = postLog(c, logRecord(ctx, "message", std::string((1 << 20) - 400, 'x')));
+  auto c = hApi(ctx);
+  const auto huge = hPostLog(c, hLogRecord(ctx, "message", std::string(1 << 20, 'x')));
+  const auto near = hPostLog(c, hLogRecord(ctx, "message", std::string((1 << 20) - 400, 'x')));
+  const std::string exactBody = hExactBody(ctx, 0), overBody = hExactBody(ctx, 1);
+  ctx.Assert(exactBody.size() == (1 << 20) && overBody.size() == (1 << 20) + 1, "the harness built the boundary records wrong");
+  const auto exact = hPostRaw(c, exactBody);
+  const auto over = hPostRaw(c, overBody);
   ctx.Equal(huge.Status, 413, "a record over 1 MiB");
-  ctx.Equal(near.Status, 202, "a record just under 1 MiB must be accepted with its message cut (%s)", brief(near.Text()));
-  ctx.Equal(buffered(ctx).size(), 1, "only the record under the cap may be buffered; the records in buffer:acme:checkout");
+  ctx.Equal(over.Status, 413, "a record of 1 MiB + 1 byte whose message alone is under 1 MiB: the cap is on the whole record's bytes");
+  ctx.Equal(near.Status, 202, "a record just under 1 MiB must be accepted with its message cut (%s)", hBrief(near.Text()));
+  ctx.Equal(exact.Status, 202, "a record of exactly 1 MiB (1048576 bytes): only a record over the cap is 413 (%s)", hBrief(exact.Text()));
+  ctx.Equal(hBuffered(ctx).size(), 2, "only the records within the cap may be buffered; the records in buffer:acme:checkout");
 }
 
 void CheckTruncation(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto shortReply = postLog(c, logRecord(ctx));
-  const auto ascii = postLog(c, logRecord(ctx, "message", std::string(20480, 'a')));
-  const auto euro = postLog(c, logRecord(ctx, "message", repeat("€", 7000)));
-  for (const auto* r : {&shortReply, &ascii, &euro}) ctx.Equal(r->Status, 202, "a record (%s)", brief(r->Text()));
-  json body = replyOf(shortReply);
-  ctx.Assert(isFalse(body, "truncated") && body.value("original_bytes", 0) == 30 && body.value("stored_bytes", 0) == 30,
-             "a 30-byte message must be answered truncated false with original_bytes and stored_bytes 30, got %s", shortReply.Text());
-  body = replyOf(ascii);
-  ctx.Assert(isTrue(body, "truncated") && body.value("original_bytes", 0) == 20480 && body.value("stored_bytes", 0) == 16384,
-             "a 20480-byte message must be answered truncated true, original_bytes 20480, stored_bytes 16384, got %s", ascii.Text());
-  body = replyOf(euro);
-  ctx.Assert(isTrue(body, "truncated") && body.value("original_bytes", 0) == 21000 && body.value("stored_bytes", 0) == 16383,
+  auto c = hApi(ctx);
+  const auto shortReply = hPostLog(c, hLogRecord(ctx));
+  const auto ascii = hPostLog(c, hLogRecord(ctx, "message", std::string(20480, 'a')));
+  const auto euro = hPostLog(c, hLogRecord(ctx, "message", hRepeat("€", 7000)));
+  const auto whole = hPostLog(c, hLogRecord(ctx, "message", std::string(16384, 'a')));
+  const auto emoji = hPostLog(c, hLogRecord(ctx, "message", "a" + hRepeat("😀", 4100)));
+  for (const auto* r : {&shortReply, &ascii, &euro, &whole, &emoji}) ctx.Equal(r->Status, 202, "a record (%s)", hBrief(r->Text()));
+  ctx.Assert(hCut(hReplyOf(shortReply), false, 30, 30), "a 30-byte message must be answered truncated false with original_bytes and stored_bytes 30, got %s", shortReply.Text());
+  ctx.Assert(hCut(hReplyOf(ascii), true, 20480, 16384), "a 20480-byte message must be answered truncated true, original_bytes 20480, stored_bytes 16384, got %s", ascii.Text());
+  ctx.Assert(hCut(hReplyOf(euro), true, 21000, 16383),
              "7000 euro signs (3 bytes each) must be cut to 16383 bytes on a character boundary and answered original_bytes 21000, stored_bytes 16383, got %s", euro.Text());
-  const auto stored = buffered(ctx);
-  ctx.Equal(stored.size(), 3, "the records in buffer:acme:checkout");
+  ctx.Assert(hCut(hReplyOf(whole), false, 16384, 16384),
+             "a message of exactly 16384 bytes fits and must be answered truncated false with original_bytes and stored_bytes 16384, got %s", whole.Text());
+  ctx.Assert(hCut(hReplyOf(emoji), true, 16401, 16381),
+             "'a' and 4100 emoji (4 bytes each) must be cut back to 16381 bytes, the last whole character, and answered original_bytes 16401, stored_bytes 16381, got %s", emoji.Text());
+  const auto stored = hBuffered(ctx);
+  ctx.Equal(stored.size(), 5, "the records in buffer:acme:checkout");
   ctx.Equal(stored[1].value("message", "").size(), 16384, "the bytes of the stored ASCII message");
   const std::string kept = stored[2].value("message", "");
-  ctx.Assert(kept == repeat("€", 5461), "the stored euro message is %d bytes, expected 5461 whole characters (16383 bytes): cut the bytes, not the characters, and never split one", kept.size());
+  ctx.Assert(kept == hRepeat("€", 5461), "the stored euro message is %d bytes, expected 5461 whole characters (16383 bytes): cut the bytes, not the characters, and never split one", kept.size());
+  const std::string fits = stored[3].value("message", "");
+  ctx.Assert(fits == std::string(16384, 'a'), "the stored 16384-byte message is %d bytes, expected all 16384 of them", fits.size());
+  const std::string emojiKept = stored[4].value("message", "");
+  ctx.Assert(emojiKept == "a" + hRepeat("😀", 4095), "the stored emoji message is %d bytes, expected 'a' and 4095 whole emoji (16381 bytes): walk back to the start of the character the cut lands in", emojiKept.size());
 }
 
 void CheckValidateBeforeBuffer(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::vector<std::vector<std::string>> cases = {
+  auto c = hApi(ctx);
+  const std::vector<std::vector<std::string>> rejected = {
       {"level verbose", "level", "verbose"},
-      {"a timestamp 10 minutes old", "timestamp", stamp(ctx, -600)},
-      {"a timestamp 10 minutes ahead", "timestamp", stamp(ctx, 600)},
+      {"a timestamp 10 minutes old", "timestamp", hStamp(ctx, -600)},
+      {"a timestamp 5.5 minutes old", "timestamp", hStamp(ctx, -330)},
+      {"a timestamp 10 minutes ahead", "timestamp", hStamp(ctx, 600)},
       {"timestamp yesterday", "timestamp", "yesterday"},
+      {"a timestamp without its offset", "timestamp", hStamp(ctx, 0, 0, "")},
+      {"the current time in RFC 2822 form", "timestamp", hRfc2822(ctx)},
   };
-  for (const auto& tc : cases) ctx.Equal(postLog(c, logRecord(ctx, tc[1], tc[2])).Status, 400, "a record with %s", tc[0]);
-  const auto late = postLog(c, logRecord(ctx, "timestamp", stamp(ctx, -240)));
-  ctx.Equal(late.Status, 202, "a record 4 minutes old is inside the 5-minute skew (%s)", late.Text());
-  ctx.Equal(buffered(ctx).size(), 1, "a rejected record must not reach the buffer; the records in buffer:acme:checkout");
+  for (const auto& tc : rejected) ctx.Equal(hPostLog(c, hLogRecord(ctx, tc[1], tc[2])).Status, 400, "a record with %s", tc[0]);
+  const std::vector<std::vector<std::string>> accepted = {
+      {"a timestamp 4 minutes old", hStamp(ctx, -240)},
+      {"a timestamp 4 minutes ahead", hStamp(ctx, 240)},
+      {"the current time written at +02:00", hStamp(ctx, 0, 7200, "+02:00")},
+  };
+  for (const auto& tc : accepted) {
+    const auto r = hPostLog(c, hLogRecord(ctx, "timestamp", tc[1]));
+    ctx.Equal(r.Status, 202, "a record with %s is inside the 5-minute skew (%s)", tc[0], r.Text());
+  }
+  ctx.Equal(hBuffered(ctx).size(), 3, "the 3 accepted records, and no rejected one, in buffer:acme:checkout");
 }
 `,
   },

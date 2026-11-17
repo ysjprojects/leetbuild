@@ -60,7 +60,7 @@ one reservation landing together.
       id: 'hold-ttl',
       title: "Gives the hold the reservation's 900 s TTL",
       detail:
-        '`hold:{id}` expires with the reservation, `RESERVATION_TTL_S` from `inventory.stock`, set by `EX` inside the script. The starter holds the units for an hour.',
+        '`hold:{id}` expires with the reservation, `RESERVATION_TTL_S` from `inventory.stock`, and already has that TTL right after the command that writes it. The starter holds the units for an hour.',
       match: {
         python: {all: [/RESERVATION_TTL_S/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
         typescript: {all: [/RESERVATION_TTL_S/, /redis\.call\(\s*'SET'[^\n]*'EX'/], none: [/\b3600\b/]},
@@ -73,7 +73,7 @@ one reservation landing together.
       id: 'reclaim-expired',
       title: "Gives an expired hold's units back before it checks the counter",
       detail:
-        'A cart that held the whole stock and was abandoned an hour ago does not block the next buyer: the script credits every reservation whose `hold:{id}` is gone, then checks. The starter never gives expired units back.',
+        'Two carts abandoned an hour ago do not block the next buyer: the script gives each reservation whose `hold:{id}` is gone its own quantity back, then checks, and a cart whose hold is still live keeps it. The starter never gives expired units back.',
       match: {
         python: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
         typescript: {order: [/redis\.call\(\s*'EXISTS'/, /redis\.call\(\s*'DECRBY'/]},
@@ -86,7 +86,7 @@ one reservation landing together.
       id: 'settle-once',
       title: 'Releases or sells a reservation once, never both',
       detail:
-        'A warehouse confirmation lands in the middle of a release, and a cancellation in the middle of a confirm: the units end up either back on the counter or sold, and the second caller gets 0. The starter reads the hold, then acts on what it read.',
+        'A warehouse confirmation lands in the middle of a release, and a cancellation in the middle of a confirm: the units end up either back on the counter or sold, the second caller gets 0, and a confirmation gives nothing back to the counter. The starter reads the hold, then acts on what it read.',
       match: {
         python: {all: [/redis\.call\(\s*'HGET'/], none: [/\.incrby\(/, /\.hdel\(/]},
         typescript: {all: [/redis\.call\(\s*'HGET'/], none: [/\.incrby\(/, /\.hdel\(/]},
@@ -689,7 +689,11 @@ def check_atomic_reserve(ctx):
 def check_hold_ttl(ctx):
     m = ctx.load("state")
     ctx.redis.set(stock_key(SKU), 5)
+    # The TTL is read right after the first command that writes hold:r-1: a hold key without one, even for a moment, outlives a crash.
+    probe = ctx.redis_after(hold_key("r-1"), lambda: ctx.redis.ttl(hold_key("r-1")))
     assert m.reserve(SKU, 2, "r-1") is True, "reserve refused 2 of 5 units"
+    assert probe.fired, "reserve never wrote hold:r-1"
+    assert 850 <= probe.result <= 900, f"right after the command that wrote hold:r-1 its TTL was {probe.result}: SET it with EX RESERVATION_TTL_S in the same command, inside the script"
     ttl = ctx.redis.ttl(hold_key("r-1"))
     assert 850 <= ttl <= 900, f"hold:r-1 has TTL {ttl}, expected the reservation's RESERVATION_TTL_S (900 s): a hold that outlives its reservation blocks units nobody can buy"
     assert ctx.redis.hget(holds_key(SKU), "r-1") == "2", f"holds:sku-1 maps r-1 to {ctx.redis.hget(holds_key(SKU), 'r-1')!r}, expected 2"
@@ -698,15 +702,17 @@ def check_hold_ttl(ctx):
 
 def check_reclaim_expired(ctx):
     m = ctx.load("state")
-    ctx.redis.set(stock_key(SKU), 3)
-    assert m.reserve(SKU, 3, "r-1") is True, "reserve refused 3 of 3 units"
-    ctx.clock.advance(3601)  # the cart was abandoned an hour ago: its hold key is gone
+    ctx.redis.set(stock_key(SKU), 4)
+    assert m.reserve(SKU, 3, "r-1") is True, "reserve refused 3 of 4 units"
+    assert m.reserve(SKU, 1, "r-0") is True, "reserve refused the last unit"
+    ctx.clock.advance(3601)  # both carts were abandoned an hour ago: their hold keys are gone
     assert ctx.redis.exists(hold_key("r-1")) == 0, "hold:r-1 still exists an hour later"
+    _held(ctx, "r-live", 2)  # a cart filled a minute ago still holds 2 units
     again = m.reserve(SKU, 3, "r-2")
-    assert again is True, "a cart abandoned an hour ago still blocks all 3 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter"
-    assert _units(ctx) == 0, f"stock:sku-1 is {_units(ctx)} after the expired 3 came back and 3 were reserved again, expected 0"
+    assert again is True, "carts abandoned an hour ago still block their 4 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter"
     holds = ctx.redis.hgetall(holds_key(SKU))
-    assert holds == {"r-2": "3"}, f"holds:sku-1 is {holds}, expected only the live reservation r-2"
+    assert holds == {"r-live": "2", "r-2": "3"}, f"holds:sku-1 is {holds}, expected the live reservations r-live (2) and r-2 (3): only a hold whose own hold:{{id}} key is gone is given back"
+    assert _units(ctx) == 1, f"stock:sku-1 is {_units(ctx)} after the expired 3 and 1 came back and 3 were reserved again, expected 1: each expired hold gives back its own quantity"
 
 
 def check_settle_once(ctx):
@@ -745,6 +751,7 @@ def check_settle_once(ctx):
     confirmed = m.confirm(SKU, "r-2")
     assert probe.fired, "confirm never touched holds:sku-1"
     assert confirmed + probe.result == 2, f"r-2's 2 units were put back ({probe.result}) and confirmed as sold ({confirmed}) at once: confirm must act only while the hold is still in holds:sku-1, in one script"
+    assert _units(ctx) == 5 + released + probe.result, f"stock:sku-1 is {_units(ctx)} after r-2 was confirmed, expected {5 + released + probe.result}: a confirmation sells the held units, it gives nothing back to the counter"
 `,
     typescript: `import {holdKey, holdsKey, stockKey} from 'inventory/stock';
 
@@ -778,7 +785,12 @@ export async function check_atomic_reserve(ctx) {
 export async function check_hold_ttl(ctx) {
   const m = ctx.load('state');
   ctx.redis.set(stockKey(SKU), '5');
+  // The TTL is read right after the first command that writes hold:r-1: a hold key without one, even for a moment, outlives a crash.
+  const probe = ctx.redisAfter(holdKey('r-1'), () => ctx.redis.ttl(holdKey('r-1')));
   assert.equal(await m.reserve(SKU, 2, 'r-1'), true, 'reserve refused 2 of 5 units');
+  assert(probe.fired, 'reserve never wrote hold:r-1');
+  const first = probe.result as number;
+  assert(850 <= first && first <= 900, \`right after the command that wrote hold:r-1 its TTL was \${first}: SET it with EX RESERVATION_TTL_S in the same command, inside the script\`);
   const ttl = ctx.redis.ttl(holdKey('r-1'));
   assert(850 <= ttl && ttl <= 900, \`hold:r-1 has TTL \${ttl}, expected the reservation's RESERVATION_TTL_S (900 s): a hold that outlives its reservation blocks units nobody can buy\`);
   assert.equal(ctx.redis.hget(holdsKey(SKU), 'r-1'), '2', \`holds:sku-1 maps r-1 to \${ctx.redis.hget(holdsKey(SKU), 'r-1')}, expected 2\`);
@@ -787,15 +799,17 @@ export async function check_hold_ttl(ctx) {
 
 export async function check_reclaim_expired(ctx) {
   const m = ctx.load('state');
-  ctx.redis.set(stockKey(SKU), '3');
-  assert.equal(await m.reserve(SKU, 3, 'r-1'), true, 'reserve refused 3 of 3 units');
-  ctx.clock.advance(3601); // the cart was abandoned an hour ago: its hold key is gone
+  ctx.redis.set(stockKey(SKU), '4');
+  assert.equal(await m.reserve(SKU, 3, 'r-1'), true, 'reserve refused 3 of 4 units');
+  assert.equal(await m.reserve(SKU, 1, 'r-0'), true, 'reserve refused the last unit');
+  ctx.clock.advance(3601); // both carts were abandoned an hour ago: their hold keys are gone
   assert.equal(ctx.redis.exists(holdKey('r-1')), 0, 'hold:r-1 still exists an hour later');
+  held(ctx, 'r-live', 2); // a cart filled a minute ago still holds 2 units
   const again = await m.reserve(SKU, 3, 'r-2');
-  assert.equal(again, true, 'a cart abandoned an hour ago still blocks all 3 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter');
-  assert.equal(units(ctx), 0, \`stock:sku-1 is \${units(ctx)} after the expired 3 came back and 3 were reserved again, expected 0\`);
+  assert.equal(again, true, 'carts abandoned an hour ago still block their 4 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter');
   const holds = ctx.redis.hgetall(holdsKey(SKU));
-  assert.deepEqual(holds, {'r-2': '3'}, \`holds:sku-1 is \${JSON.stringify(holds)}, expected only the live reservation r-2\`);
+  assert.deepEqual(holds, {'r-live': '2', 'r-2': '3'}, \`holds:sku-1 is \${JSON.stringify(holds)}, expected the live reservations r-live (2) and r-2 (3): only a hold whose own hold:{id} key is gone is given back\`);
+  assert.equal(units(ctx), 1, \`stock:sku-1 is \${units(ctx)} after the expired 3 and 1 came back and 3 were reserved again, expected 1: each expired hold gives back its own quantity\`);
 }
 
 export async function check_settle_once(ctx) {
@@ -828,6 +842,7 @@ export async function check_settle_once(ctx) {
   const confirmed = await m.confirm(SKU, 'r-2');
   assert(probe.fired, 'confirm never touched holds:sku-1');
   assert.equal(confirmed + (probe.result as number), 2, \`r-2's 2 units were put back (\${probe.result}) and confirmed as sold (\${confirmed}) at once: confirm must act only while the hold is still in holds:sku-1, in one script\`);
+  assert.equal(units(ctx), 5 + released + (probe.result as number), \`stock:sku-1 is \${units(ctx)} after r-2 was confirmed, expected \${5 + released + (probe.result as number)}: a confirmation sells the held units, it gives nothing back to the counter\`);
 }
 `,
     go: `package main
@@ -892,9 +907,17 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 
 func CheckHoldTtl(ctx *harness.Ctx) {
 	ctx.Redis.Set(stock.Key(stateSKU), 5)
+	// The TTL is read right after the first command that writes hold:r-1: a hold key without one, even for a moment, outlives a crash.
+	var firstTTL int64
+	probe := ctx.Redis.After(stock.HoldKey("r-1"), func() any {
+		firstTTL = ctx.Redis.TTL(stock.HoldKey("r-1"))
+		return firstTTL
+	})
 	ok, err := reserve(context.Background(), stateSKU, 2, "r-1")
 	ctx.NoError(err, "reserve")
 	ctx.Assert(ok, "reserve refused 2 of 5 units")
+	ctx.Assert(probe.Fired, "reserve never wrote hold:r-1")
+	ctx.Assert(850 <= firstTTL && firstTTL <= 900, "right after the command that wrote hold:r-1 its TTL was %d: SET it with EX RESERVATION_TTL_S in the same command, inside the script", firstTTL)
 	ttl := ctx.Redis.TTL(stock.HoldKey("r-1"))
 	ctx.Assert(850 <= ttl && ttl <= 900, "hold:r-1 has TTL %d, expected the reservation's RESERVATION_TTL_S (900 s): a hold that outlives its reservation blocks units nobody can buy", ttl)
 	quantity, _ := ctx.Redis.HGet(stock.HoldsKey(stateSKU), "r-1")
@@ -903,17 +926,21 @@ func CheckHoldTtl(ctx *harness.Ctx) {
 }
 
 func CheckReclaimExpired(ctx *harness.Ctx) {
-	ctx.Redis.Set(stock.Key(stateSKU), 3)
+	ctx.Redis.Set(stock.Key(stateSKU), 4)
 	ok, err := reserve(context.Background(), stateSKU, 3, "r-1")
 	ctx.NoError(err, "reserve")
-	ctx.Assert(ok, "reserve refused 3 of 3 units")
-	ctx.Clock.Advance(3601) // the cart was abandoned an hour ago: its hold key is gone
+	ctx.Assert(ok, "reserve refused 3 of 4 units")
+	ok, err = reserve(context.Background(), stateSKU, 1, "r-0")
+	ctx.NoError(err, "reserve")
+	ctx.Assert(ok, "reserve refused the last unit")
+	ctx.Clock.Advance(3601) // both carts were abandoned an hour ago: their hold keys are gone
 	ctx.Equal(ctx.Redis.Exists(stock.HoldKey("r-1")), 0, "hold:r-1 an hour later")
+	stateHeld(ctx, "r-live", 2) // a cart filled a minute ago still holds 2 units
 	again, err := reserve(context.Background(), stateSKU, 3, "r-2")
 	ctx.NoError(err, "reserve")
-	ctx.Assert(again, "a cart abandoned an hour ago still blocks all 3 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter")
-	ctx.Equal(stateUnits(ctx), 0, "stock:sku-1 after the expired 3 came back and 3 were reserved again")
-	ctx.Equal(ctx.Redis.HGetAll(stock.HoldsKey(stateSKU)), map[string]string{"r-2": "3"}, "holds:sku-1 (only the live reservation r-2)")
+	ctx.Assert(again, "carts abandoned an hour ago still block their 4 units: give back the units of every reservation whose hold key is gone, inside the script, before checking the counter")
+	ctx.Equal(ctx.Redis.HGetAll(stock.HoldsKey(stateSKU)), map[string]string{"r-live": "2", "r-2": "3"}, "holds:sku-1 (the live reservations r-live and r-2: only a hold whose own hold:{id} key is gone is given back)")
+	ctx.Equal(stateUnits(ctx), 1, "stock:sku-1 after the expired 3 and 1 came back and 3 were reserved again (each expired hold gives back its own quantity)")
 }
 
 func CheckSettleOnce(ctx *harness.Ctx) {
@@ -942,6 +969,7 @@ func CheckSettleOnce(ctx *harness.Ctx) {
 	ctx.NoError(err, "confirm")
 	ctx.Assert(probe.Fired, "confirm never touched holds:sku-1")
 	ctx.Assert(confirmed+cancelled == 2, "r-2's 2 units were put back (%d) and confirmed as sold (%d) at once: confirm must act only while the hold is still in holds:sku-1, in one script", cancelled, confirmed)
+	ctx.Equal(stateUnits(ctx), 5+released+cancelled, "stock:sku-1 after r-2 was confirmed (a confirmation sells the held units, it gives nothing back to the counter)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1001,7 +1029,19 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
 
 void CheckHoldTtl(harness::Ctx& ctx) {
   ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 5);
+  // The TTL is read right after the first command that writes hold:r-1: a hold key without one, even for a moment, outlives a crash.
+  bool fired = false;
+  long long first_ttl = 0;
+  ctx.Redis.After(inventory::stock::HoldKey("r-1"), [&] {
+    fired = true;
+    first_ttl = ctx.Redis.TTL(inventory::stock::HoldKey("r-1"));
+  });
   ctx.Assert(reserve(kStateSku, 2, "r-1"), "reserve refused 2 of 5 units");
+  ctx.Assert(fired, "reserve never wrote hold:r-1");
+  ctx.Assert(850 <= first_ttl && first_ttl <= 900,
+             "right after the command that wrote hold:r-1 its TTL was %d: SET it with EX RESERVATION_TTL_S in the same command, "
+             "inside the script",
+             first_ttl);
   const long long ttl = ctx.Redis.TTL(inventory::stock::HoldKey("r-1"));
   ctx.Assert(850 <= ttl && ttl <= 900,
              "hold:r-1 has TTL %d, expected the reservation's RESERVATION_TTL_S (900 s): a hold that outlives its reservation "
@@ -1012,16 +1052,20 @@ void CheckHoldTtl(harness::Ctx& ctx) {
 }
 
 void CheckReclaimExpired(harness::Ctx& ctx) {
-  ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 3);
-  ctx.Assert(reserve(kStateSku, 3, "r-1"), "reserve refused 3 of 3 units");
-  ctx.Clock.Advance(3601);  // the cart was abandoned an hour ago: its hold key is gone
+  ctx.Redis.Do("SET", inventory::stock::Key(kStateSku), 4);
+  ctx.Assert(reserve(kStateSku, 3, "r-1"), "reserve refused 3 of 4 units");
+  ctx.Assert(reserve(kStateSku, 1, "r-0"), "reserve refused the last unit");
+  ctx.Clock.Advance(3601);  // both carts were abandoned an hour ago: their hold keys are gone
   ctx.Equal(ctx.Redis.Exists(inventory::stock::HoldKey("r-1")), 0, "hold:r-1 an hour later");
+  stateHeld(ctx, "r-live", 2);  // a cart filled a minute ago still holds 2 units
   ctx.Assert(reserve(kStateSku, 3, "r-2"),
-             "a cart abandoned an hour ago still blocks all 3 units: give back the units of every reservation whose hold key "
+             "carts abandoned an hour ago still block their 4 units: give back the units of every reservation whose hold key "
              "is gone, inside the script, before checking the counter");
-  ctx.Equal(stateUnits(ctx), 0, "stock:sku-1 after the expired 3 came back and 3 were reserved again");
-  ctx.Equal(ctx.Redis.HGetAll(inventory::stock::HoldsKey(kStateSku)), std::map<std::string, std::string>{{"r-2", "3"}},
-            "holds:sku-1 (only the live reservation r-2)");
+  ctx.Equal(ctx.Redis.HGetAll(inventory::stock::HoldsKey(kStateSku)),
+            std::map<std::string, std::string>{{"r-live", "2"}, {"r-2", "3"}},
+            "holds:sku-1 (the live reservations r-live and r-2: only a hold whose own hold:{id} key is gone is given back)");
+  ctx.Equal(stateUnits(ctx), 1,
+            "stock:sku-1 after the expired 3 and 1 came back and 3 were reserved again (each expired hold gives back its own quantity)");
 }
 
 void CheckSettleOnce(harness::Ctx& ctx) {
@@ -1056,6 +1100,8 @@ void CheckSettleOnce(harness::Ctx& ctx) {
              "r-2's 2 units were put back (%d) and confirmed as sold (%d) at once: confirm must act only while the hold is "
              "still in holds:sku-1, in one script",
              cancelled, confirmed);
+  ctx.Equal(stateUnits(ctx), 5 + released + cancelled,
+            "stock:sku-1 after r-2 was confirmed (a confirmation sells the held units, it gives nothing back to the counter)");
 }
 `,
   },

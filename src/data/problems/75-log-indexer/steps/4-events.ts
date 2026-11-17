@@ -21,10 +21,12 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
 
 - The message key is the **service id**.
 - \`bulk_write\` runs **first**; a batch it refuses (\`MappingConflict\`, \`ShardWriteFailed\`) is not
-  announced, and the event carries the shard's \`batch_id\` and \`index_snapshot\`.
+  announced, its error reaches the caller, and the event carries the shard's \`batch_id\` and
+  \`index_snapshot\`.
 - \`indexed_count\` and \`rejected_count\` are the shard's \`indexed\` and \`rejected\`.
 - The broker's answer is the **delivery report** (\`on_delivery\`): a rejected event is RPUSHed to
-  \`OUTBOX_KEY\` as \`{"key": service, "payload": <event JSON>}\` and \`index_batch\` returns \`None\`.`,
+  \`OUTBOX_KEY\` as \`{"key": service, "payload": <event JSON>}\` and \`index_batch\` returns \`None\`;
+  an event neither delivered nor kept raises.`,
   sequence: {
     participants: ['Buffered writer', 'Index shard', 'log.indexed', 'Redis outbox'],
     messages: [
@@ -53,7 +55,7 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
       id: 'after-commit',
       title: 'Produces only after the shard took the batch',
       detail:
-        '`bulk_write` runs before the produce: when it is called the topic holds nothing for this batch, a refused batch produces nothing, and the event carries the batch id the shard indexed.',
+        '`bulk_write` runs before the produce: when it is called the topic holds nothing for this batch, a refused batch (`MappingConflict` or `ShardWriteFailed`) raises to the caller and leaves nothing on the topic or in the outbox, and the event carries the batch id the shard indexed.',
       match: {
         python: {order: [/bulk_write\(/, /producer\.produce\(/]},
         typescript: {order: [/await bulkWrite\(/, /producer\.send\(/]},
@@ -81,7 +83,7 @@ ledger counts records the shard rejected as indexed; and a produce the broker re
       id: 'outbox',
       title: 'Keeps a rejected event in the outbox',
       detail:
-        'The delivery report decides: a rejected event is RPUSHed to `outbox:log.indexed` with its key and payload and the call answers no event; the starter never sees the rejection, so the event is gone.',
+        'The delivery report decides: a rejected event is RPUSHed to `outbox:log.indexed` with its key and the whole event as payload, and the call answers no event; if that RPUSH fails too, the call raises. The starter never sees the rejection, so the event is gone.',
       match: {
         python: {all: [/on_delivery/, /rpush\(OUTBOX_KEY/], none: [/except\s+KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /rpush\(OUTBOX_KEY/], none: [/\.catch\(/]},
@@ -679,6 +681,16 @@ def check_after_commit(ctx):
     else:
         raise AssertionError("with the shard refusing the batch (a mapping conflict) index_batch returned instead of raising")
     assert len(ctx.kafka.records(TOPIC)) == 1, f"a batch the shard refused left {len(ctx.kafka.records(TOPIC)) - 1} event(s) on {TOPIC}: only a committed batch may be announced"
+    shard.conflict = ""
+    ctx.grpc.fail("BulkWrite", grpc.StatusCode.UNAVAILABLE, "shard down", times=3)
+    try:
+        m.index_batch("acme", "checkout", RECORDS)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("with the shard down through every attempt (ShardWriteFailed) index_batch returned instead of raising: the writer must learn the batch was not indexed")
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"a batch the shard never took left {len(ctx.kafka.records(TOPIC)) - 1} event(s) on {TOPIC}: only a committed batch may be announced"
+    assert ctx.redis.lrange(OUTBOX, 0, -1) == [], f"a batch the shard refused left {ctx.redis.lrange(OUTBOX, 0, -1)} in {OUTBOX}: the relay would announce a batch the index does not hold"
 
 
 def check_shard_counts(ctx):
@@ -700,10 +712,21 @@ def check_outbox(ctx):
     assert row.get("key") == "checkout", f"the outbox row must carry the message key (the service) so the relay publishes it to the same partition: {row}"
     payload = json.loads(row["payload"]) if isinstance(row.get("payload"), str) else row.get("payload")
     assert isinstance(payload, dict) and payload.get("batch_id") == shard.batch_ids[0], f"the outbox row must carry the event for batch {shard.batch_ids[0]}: {row}"
+    assert payload.get("indexed_count") == 2 and payload.get("rejected_count") == 1 and payload.get("index_snapshot") == "logs-acme@1" and payload.get("service") == "checkout", f"the outbox row must carry the whole event the topic would have had (the shard's counts and snapshot): {row}"
     assert result is None, f"index_batch returned {result} for an event the broker rejected, expected None"
     assert ctx.kafka.records(TOPIC) == [], "a rejected produce cannot be on the topic"
     assert m.index_batch("acme", "billing", RECORDS) is not None, "once the broker answers again the event is delivered"
     assert len(ctx.redis.lrange(OUTBOX, 0, -1)) == 1, "a delivered event leaves no outbox row"
+    # The outbox write itself fails (the key holds a string): the event is neither on the topic nor kept, so the caller must hear of it.
+    ctx.redis.delete(OUTBOX)
+    ctx.redis.set(OUTBOX, "not a list")
+    ctx.kafka.fail_next(TOPIC, 1)
+    try:
+        lost = m.index_batch("acme", "checkout", RECORDS)
+    except Exception:
+        pass
+    else:
+        raise AssertionError(f"with the broker rejecting the event and the RPUSH to {OUTBOX} failing (WRONGTYPE), index_batch returned {lost}: an event neither delivered nor kept must raise to the caller")
 `,
     typescript: `const TOPIC = 'log.indexed';
 const OUTBOX = 'outbox:log.indexed';
@@ -774,6 +797,18 @@ export async function check_after_commit(ctx) {
   await settle();
   assert(threw, 'with the shard refusing the batch (a mapping conflict) indexBatch returned instead of throwing');
   assert.equal(ctx.kafka.records(TOPIC).length, 1, \`a batch the shard refused left \${ctx.kafka.records(TOPIC).length - 1} event(s) on \${TOPIC}: only a committed batch may be announced\`);
+  shard.conflict = '';
+  ctx.grpc.fail('BulkWrite', ctx.grpc.status.UNAVAILABLE, 'shard down', 3);
+  threw = false;
+  try {
+    await m.indexBatch('acme', 'checkout', RECORDS);
+  } catch {
+    threw = true;
+  }
+  await settle();
+  assert(threw, 'with the shard down through every attempt (ShardWriteFailed) indexBatch returned instead of throwing: the writer must learn the batch was not indexed');
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`a batch the shard never took left \${ctx.kafka.records(TOPIC).length - 1} event(s) on \${TOPIC}: only a committed batch may be announced\`);
+  assert.deepStrictEqual(ctx.redis.lrange(OUTBOX, 0, -1), [], \`a batch the shard refused left \${JSON.stringify(ctx.redis.lrange(OUTBOX, 0, -1))} in \${OUTBOX}: the relay would announce a batch the index does not hold\`);
 }
 
 export async function check_shard_counts(ctx) {
@@ -795,10 +830,23 @@ export async function check_outbox(ctx) {
   assert.equal(row.key, 'checkout', \`the outbox row must carry the message key (the service) so the relay publishes it to the same partition: \${rows[0]}\`);
   const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
   assert(payload !== null && typeof payload === 'object' && payload.batch_id === shard.batchIds[0], \`the outbox row must carry the event for batch \${shard.batchIds[0]}: \${rows[0]}\`);
+  assert(payload.indexed_count === 2 && payload.rejected_count === 1 && payload.index_snapshot === 'logs-acme@1' && payload.service === 'checkout', \`the outbox row must carry the whole event the topic would have had (the shard's counts and snapshot): \${rows[0]}\`);
   assert.equal(result, null, \`indexBatch returned \${JSON.stringify(result)} for an event the broker rejected, expected null\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'a rejected produce cannot be on the topic');
   assert((await index(m, 'billing')) !== null, 'once the broker answers again the event is delivered');
   assert.equal(ctx.redis.lrange(OUTBOX, 0, -1).length, 1, 'a delivered event leaves no outbox row');
+  // The outbox write itself fails (the key holds a string): the event is neither on the topic nor kept, so the caller must hear of it.
+  ctx.redis.del(OUTBOX);
+  ctx.redis.set(OUTBOX, 'not a list');
+  ctx.kafka.failNext(TOPIC, 1);
+  let lost: unknown = 'threw';
+  try {
+    lost = await m.indexBatch('acme', 'checkout', RECORDS);
+  } catch {
+    lost = 'threw';
+  }
+  await settle();
+  assert.equal(lost, 'threw', \`with the broker rejecting the event and the RPUSH to \${OUTBOX} failing (WRONGTYPE), indexBatch returned \${JSON.stringify(lost)}: an event neither delivered nor kept must throw to the caller\`);
 }
 `,
     go: `package main
@@ -819,21 +867,21 @@ import (
 )
 
 const (
-	eventsTopic  = "log.indexed"
-	eventsOutbox = "outbox:log.indexed"
+	hTopic  = "log.indexed"
+	hOutbox = "outbox:log.indexed"
 )
 
 var (
-	eventsBg      = context.Background()
-	eventsRecords = []buffer.Record{
+	hBg      = context.Background()
+	hRecords = []buffer.Record{
 		{Service: "checkout", Timestamp: "2026-11-03T10:00:00Z", Level: "error", Message: "m-0"},
 		{Service: "checkout", Timestamp: "2026-11-03T10:00:01Z", Level: "info", Message: "m-1"},
 		{Service: "checkout", Timestamp: "2026-11-03T10:00:02Z", Level: "trace", Message: "m-2"},
 	}
 )
 
-// wireEvent is a log.indexed event as it crosses the topic.
-type wireEvent struct {
+// hWireEvent is a log.indexed event as it crosses the topic.
+type hWireEvent struct {
 	BatchID       string \`json:"batch_id"\`
 	Tenant        string \`json:"tenant"\`
 	Service       string \`json:"service"\`
@@ -843,9 +891,9 @@ type wireEvent struct {
 	IndexSnapshot string \`json:"index_snapshot"\`
 }
 
-// eventShard indexes every batch (a trace record is rejected); conflict refuses every batch. It
+// hEventShard indexes every batch (a trace record is rejected); conflict refuses every batch. It
 // notes the records on log.indexed when each write arrives.
-type eventShard struct {
+type hEventShard struct {
 	pb.UnimplementedIndexShardServer
 	ctx      *harness.Ctx
 	conflict string
@@ -853,8 +901,8 @@ type eventShard struct {
 	batchIDs []string
 }
 
-func (s *eventShard) BulkWrite(_ context.Context, req *pb.BulkWriteRequest) (*pb.BulkWriteReply, error) {
-	s.onTopic = append(s.onTopic, len(s.ctx.Kafka.Records(eventsTopic)))
+func (s *hEventShard) BulkWrite(_ context.Context, req *pb.BulkWriteRequest) (*pb.BulkWriteReply, error) {
+	s.onTopic = append(s.onTopic, len(s.ctx.Kafka.Records(hTopic)))
 	if s.conflict != "" {
 		return nil, status.Error(codes.FailedPrecondition, s.conflict)
 	}
@@ -868,38 +916,47 @@ func (s *eventShard) BulkWrite(_ context.Context, req *pb.BulkWriteRequest) (*pb
 	return &pb.BulkWriteReply{Indexed: int32(indexed), Rejected: int32(len(req.GetRecords()) - indexed), IndexSnapshot: fmt.Sprintf("%s@%d", req.GetIndex(), len(s.batchIDs))}, nil
 }
 
-func eventsWorld(ctx *harness.Ctx) *eventShard {
-	peer := &eventShard{ctx: ctx}
+func hServeShard(ctx *harness.Ctx) *hEventShard {
+	peer := &hEventShard{ctx: ctx}
 	pb.RegisterIndexShardServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func decode(raw []byte) wireEvent {
-	var e wireEvent
+func hDecode(raw []byte) hWireEvent {
+	var e hWireEvent
 	json.Unmarshal(raw, &e)
 	return e
 }
 
-func asWire(event map[string]any) wireEvent {
+func hAsWire(event map[string]any) hWireEvent {
 	raw, _ := json.Marshal(event)
-	return decode(raw)
+	return hDecode(raw)
 }
 
-func mustIndex(ctx *harness.Ctx, service string) map[string]any {
-	event, err := indexBatch(eventsBg, "acme", service, eventsRecords)
+// hPayload decodes an outbox row's payload, whether it holds the event's JSON text or the event itself.
+func hPayload(raw json.RawMessage) hWireEvent {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return hDecode([]byte(text))
+	}
+	return hDecode(raw)
+}
+
+func hMustIndex(ctx *harness.Ctx, service string) map[string]any {
+	event, err := indexBatch(hBg, "acme", service, hRecords)
 	ctx.NoError(err, "indexBatch(acme, %s) failed", service)
 	ctx.Settle()
 	return event
 }
 
 func CheckServiceKey(ctx *harness.Ctx) {
-	eventsWorld(ctx)
+	hServeShard(ctx)
 	for _, service := range []string{"checkout", "checkout", "billing", "checkout"} {
-		ctx.Assert(mustIndex(ctx, service) != nil, "indexBatch(acme, %s) on a healthy broker must return the event", service)
+		ctx.Assert(hMustIndex(ctx, service) != nil, "indexBatch(acme, %s) on a healthy broker must return the event", service)
 	}
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 4, "four batches must produce four records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"checkout", "checkout", "billing", "checkout"}, "records must be keyed by the service")
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 4, "four batches must produce four records on %s; the records", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"checkout", "checkout", "billing", "checkout"}, "records must be keyed by the service")
 	partitions := map[int]bool{}
 	for _, r := range records {
 		if string(r.Key) == "checkout" {
@@ -910,48 +967,64 @@ func CheckServiceKey(ctx *harness.Ctx) {
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
-	peer := eventsWorld(ctx)
-	event := asWire(mustIndex(ctx, "checkout"))
-	ctx.Equal(peer.onTopic, []int{0}, "when the shard received the batch, %s already held records: the event announced a batch the shard had not taken; the records at the write", eventsTopic)
+	peer := hServeShard(ctx)
+	event := hAsWire(hMustIndex(ctx, "checkout"))
+	ctx.Equal(peer.onTopic, []int{0}, "when the shard received the batch, %s already held records: the event announced a batch the shard had not taken; the records at the write", hTopic)
 	ctx.Equal(event.BatchID, peer.batchIDs[0], "announce the batch id the shard saw; the event's batch id")
 	ctx.Equal(event.IndexSnapshot, "logs-acme@1", "the event must carry the shard's index_snapshot")
 	peer.conflict = "user_id"
-	_, err := indexBatch(eventsBg, "acme", "checkout", eventsRecords)
+	_, err := indexBatch(hBg, "acme", "checkout", hRecords)
 	ctx.Settle()
 	ctx.Assert(err != nil, "with the shard refusing the batch (a mapping conflict) indexBatch returned no error")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a batch the shard refused must not be announced; the records on %s", eventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "a batch the shard refused must not be announced; the records on %s", hTopic)
+	peer.conflict = ""
+	ctx.GRPC.Fail("BulkWrite", codes.Unavailable, "shard down", 3, "")
+	_, err = indexBatch(hBg, "acme", "checkout", hRecords)
+	ctx.Settle()
+	ctx.Assert(err != nil, "with the shard down through every attempt (ErrShardWriteFailed) indexBatch returned no error: the writer must learn the batch was not indexed")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "a batch the shard never took must not be announced; the records on %s", hTopic)
+	ctx.Equal(len(ctx.Redis.LRange(hOutbox, 0, -1)), 0, "a batch the shard refused must leave nothing in %s, or the relay announces a batch the index does not hold; the rows", hOutbox)
 }
 
 func CheckShardCounts(ctx *harness.Ctx) {
-	eventsWorld(ctx)
-	mustIndex(ctx, "checkout")
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 1, "one batch, the records on %s", eventsTopic)
-	p := decode(records[0].Value)
+	hServeShard(ctx)
+	hMustIndex(ctx, "checkout")
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 1, "one batch, the records on %s", hTopic)
+	p := hDecode(records[0].Value)
 	ctx.Assert(p.IndexedCount != nil && *p.IndexedCount == 2 && p.RejectedCount != nil && *p.RejectedCount == 1, "the shard indexed 2 of 3 records and rejected 1; the event says %s", records[0].Value)
 	ctx.Assert(p.Tenant == "acme" && p.Service == "checkout" && p.Index == "logs-acme", "the event must name the tenant, the service and the index: %s", records[0].Value)
 	ctx.Assert(!strings.Contains(string(records[0].Value), "m-0"), "the event carries log text: %s", records[0].Value)
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	peer := eventsWorld(ctx)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	result, err := indexBatch(eventsBg, "acme", "checkout", eventsRecords)
+	peer := hServeShard(ctx)
+	ctx.Kafka.FailNext(hTopic, 1)
+	result, err := indexBatch(hBg, "acme", "checkout", hRecords)
 	ctx.Settle()
 	ctx.NoError(err, "a rejected produce is kept in the outbox, not returned as an error")
-	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
-	ctx.Equal(len(rows), 1, "after the broker rejected the event %s must hold one row with it; it holds %v; rows", eventsOutbox, rows)
+	rows := ctx.Redis.LRange(hOutbox, 0, -1)
+	ctx.Equal(len(rows), 1, "after the broker rejected the event %s must hold one row with it; it holds %v; rows", hOutbox, rows)
 	var row struct {
-		Key     string \`json:"key"\`
-		Payload string \`json:"payload"\`
+		Key     string          \`json:"key"\`
+		Payload json.RawMessage \`json:"payload"\`
 	}
 	json.Unmarshal([]byte(rows[0]), &row)
 	ctx.Equal(row.Key, "checkout", "the outbox row must carry the message key (the service) so the relay publishes it to the same partition (%s)", rows[0])
-	ctx.Equal(decode([]byte(row.Payload)).BatchID, peer.batchIDs[0], "the outbox row must carry the event for the batch the shard indexed (%s)", rows[0])
+	payload := hPayload(row.Payload)
+	ctx.Equal(payload.BatchID, peer.batchIDs[0], "the outbox row must carry the event for the batch the shard indexed (%s)", rows[0])
+	ctx.Assert(payload.IndexedCount != nil && *payload.IndexedCount == 2 && payload.RejectedCount != nil && *payload.RejectedCount == 1 && payload.IndexSnapshot == "logs-acme@1" && payload.Service == "checkout", "the outbox row must carry the whole event the topic would have had (the shard's counts and snapshot): %s", rows[0])
 	ctx.Assert(result == nil, "indexBatch returned %v for an event the broker rejected, expected nil", result)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
-	ctx.Assert(mustIndex(ctx, "billing") != nil, "once the broker answers again the event is delivered")
-	ctx.Equal(len(ctx.Redis.LRange(eventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 0, "a rejected produce cannot be on the topic; the records")
+	ctx.Assert(hMustIndex(ctx, "billing") != nil, "once the broker answers again the event is delivered")
+	ctx.Equal(len(ctx.Redis.LRange(hOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
+	// The outbox write itself fails (the key holds a string): the event is neither on the topic nor kept, so the caller must hear of it.
+	ctx.Redis.Do("DEL", hOutbox)
+	ctx.Redis.Do("SET", hOutbox, "not a list")
+	ctx.Kafka.FailNext(hTopic, 1)
+	lost, err := indexBatch(hBg, "acme", "checkout", hRecords)
+	ctx.Settle()
+	ctx.Assert(err != nil, "with the broker rejecting the event and the RPUSH to %s failing (WRONGTYPE), indexBatch returned %v and no error: an event neither delivered nor kept must reach the caller as an error", hOutbox, lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -970,9 +1043,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kEventsTopic = "log.indexed";
-const std::string kEventsOutbox = "outbox:log.indexed";
-const std::vector<buffer::Record> kEventsRecords = {
+const std::string kHTopic = "log.indexed";
+const std::string kHOutbox = "outbox:log.indexed";
+const std::vector<buffer::Record> kHRecords = {
     {"checkout", "2026-11-03T10:00:00Z", "error", "m-0"},
     {"checkout", "2026-11-03T10:00:01Z", "info", "m-1"},
     {"checkout", "2026-11-03T10:00:02Z", "trace", "m-2"},
@@ -980,7 +1053,7 @@ const std::vector<buffer::Record> kEventsRecords = {
 
 // Indexes every batch (a trace record is rejected); conflict refuses every batch. It notes the
 // records on log.indexed when each write arrives.
-class EventShard final : public logshard::IndexShard::Service {
+class HEventShard final : public logshard::IndexShard::Service {
  public:
   harness::Ctx* ctx = nullptr;
   std::string conflict;
@@ -988,7 +1061,7 @@ class EventShard final : public logshard::IndexShard::Service {
   std::vector<std::string> batchIds;
 
   grpc::Status BulkWrite(grpc::ServerContext*, const logshard::BulkWriteRequest* req, logshard::BulkWriteReply* out) override {
-    onTopic.push_back(static_cast<int>(ctx->Kafka.Records(kEventsTopic).size()));
+    onTopic.push_back(static_cast<int>(ctx->Kafka.Records(kHTopic).size()));
     if (!conflict.empty()) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, conflict);
     batchIds.push_back(req->batch_id());
     int indexed = 0;
@@ -1000,24 +1073,24 @@ class EventShard final : public logshard::IndexShard::Service {
   }
 };
 
-EventShard& eventsWorld(harness::Ctx& ctx) {
-  static EventShard* peer = nullptr;
+HEventShard& hServeShard(harness::Ctx& ctx) {
+  static HEventShard* peer = nullptr;
   delete peer;
-  peer = new EventShard;
+  peer = new HEventShard;
   peer->ctx = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-json parsed(const std::string& text) {
+json hParsed(const std::string& text) {
   const auto j = json::parse(text, nullptr, false);
   return j.is_discarded() ? json::object() : j;
 }
 
-std::optional<json> mustIndex(harness::Ctx& ctx, const std::string& service) {
+std::optional<json> hMustIndex(harness::Ctx& ctx, const std::string& service) {
   std::optional<json> event;
   try {
-    event = indexBatch("acme", service, kEventsRecords);
+    event = indexBatch("acme", service, kHRecords);
   } catch (const std::exception& e) {
     ctx.Fatalf("indexBatch(acme, %s) threw %s: %s", service, harness::CurrentExceptionType(), e.what());
   }
@@ -1025,16 +1098,29 @@ std::optional<json> mustIndex(harness::Ctx& ctx, const std::string& service) {
   return event;
 }
 
+// Whether indexBatch throws; what it returned when it did not.
+bool hThrows(harness::Ctx& ctx, std::string& returned) {
+  bool threw = false;
+  try {
+    const auto event = indexBatch("acme", "checkout", kHRecords);
+    returned = event ? event->dump() : "nothing";
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Settle();
+  return threw;
+}
+
 }  // namespace
 
 void CheckServiceKey(harness::Ctx& ctx) {
-  eventsWorld(ctx);
+  hServeShard(ctx);
   for (const std::string service : {"checkout", "checkout", "billing", "checkout"}) {
-    ctx.Assert(mustIndex(ctx, service).has_value(), "indexBatch(acme, %s) on a healthy broker must return the event", service);
+    ctx.Assert(hMustIndex(ctx, service).has_value(), "indexBatch(acme, %s) on a healthy broker must return the event", service);
   }
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 4, "four batches must produce four records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"checkout", "checkout", "billing", "checkout"}, "records must be keyed by the service");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 4, "four batches must produce four records on %s; the records", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"checkout", "checkout", "billing", "checkout"}, "records must be keyed by the service");
   std::set<int> partitions;
   for (const auto& r : records) {
     if (r.Key.value_or("") == "checkout") partitions.insert(r.Partition);
@@ -1043,51 +1129,58 @@ void CheckServiceKey(harness::Ctx& ctx) {
 }
 
 void CheckAfterCommit(harness::Ctx& ctx) {
-  EventShard& peer = eventsWorld(ctx);
-  const auto event = mustIndex(ctx, "checkout");
-  ctx.Equal(peer.onTopic, {0}, "when the shard received the batch, %s already held records: the event announced a batch the shard had not taken; the records at the write", kEventsTopic);
+  HEventShard& peer = hServeShard(ctx);
+  const auto event = hMustIndex(ctx, "checkout");
+  ctx.Equal(peer.onTopic, {0}, "when the shard received the batch, %s already held records: the event announced a batch the shard had not taken; the records at the write", kHTopic);
   ctx.Assert(event.has_value(), "indexBatch on a healthy broker must return the event");
   ctx.Equal(event->value("batch_id", ""), peer.batchIds.at(0), "announce the batch id the shard saw; the event's batch id");
   ctx.Equal(event->value("index_snapshot", ""), "logs-acme@1", "the event must carry the shard's index_snapshot");
   peer.conflict = "user_id";
-  bool threw = false;
-  try {
-    indexBatch("acme", "checkout", kEventsRecords);
-  } catch (const std::exception&) {
-    threw = true;
-  }
-  ctx.Settle();
-  ctx.Assert(threw, "with the shard refusing the batch (a mapping conflict) indexBatch returned instead of throwing");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "a batch the shard refused must not be announced; the records on %s", kEventsTopic);
+  std::string returned;
+  ctx.Assert(hThrows(ctx, returned), "with the shard refusing the batch (a mapping conflict) indexBatch returned %s instead of throwing", returned);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "a batch the shard refused must not be announced; the records on %s", kHTopic);
+  peer.conflict = "";
+  ctx.GRPC.Fail("BulkWrite", grpc::StatusCode::UNAVAILABLE, "shard down", 3);
+  ctx.Assert(hThrows(ctx, returned), "with the shard down through every attempt (ShardWriteFailed) indexBatch returned %s instead of throwing: the writer must learn the batch was not indexed", returned);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "a batch the shard never took must not be announced; the records on %s", kHTopic);
+  ctx.Equal(ctx.Redis.LRange(kHOutbox, 0, -1).size(), 0, "a batch the shard refused must leave nothing in %s, or the relay announces a batch the index does not hold; the rows", kHOutbox);
 }
 
 void CheckShardCounts(harness::Ctx& ctx) {
-  eventsWorld(ctx);
-  mustIndex(ctx, "checkout");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 1, "one batch, the records on %s", kEventsTopic);
+  hServeShard(ctx);
+  hMustIndex(ctx, "checkout");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 1, "one batch, the records on %s", kHTopic);
   const std::string text = records[0].Value.value_or("");
-  const json p = parsed(text);
+  const json p = hParsed(text);
   ctx.Assert(p.value("indexed_count", -1) == 2 && p.value("rejected_count", -1) == 1, "the shard indexed 2 of 3 records and rejected 1; the event says %s", text);
   ctx.Assert(p.value("tenant", "") == "acme" && p.value("service", "") == "checkout" && p.value("index", "") == "logs-acme", "the event must name the tenant, the service and the index: %s", text);
   ctx.Assert(text.find("m-0") == std::string::npos, "the event carries log text: %s", text);
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  EventShard& peer = eventsWorld(ctx);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const auto result = mustIndex(ctx, "checkout");
-  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
-  ctx.Equal(rows.size(), 1, "after the broker rejected the event %s must hold one row with it; it holds %v; rows", kEventsOutbox, rows);
-  const json row = parsed(rows[0]);
+  HEventShard& peer = hServeShard(ctx);
+  ctx.Kafka.FailNext(kHTopic, 1);
+  const auto result = hMustIndex(ctx, "checkout");
+  const auto rows = ctx.Redis.LRange(kHOutbox, 0, -1);
+  ctx.Equal(rows.size(), 1, "after the broker rejected the event %s must hold one row with it; it holds %v; rows", kHOutbox, rows);
+  const json row = hParsed(rows[0]);
   ctx.Equal(row.value("key", ""), "checkout", "the outbox row must carry the message key (the service) so the relay publishes it to the same partition (%s)", rows[0]);
   json payload;
-  if (row.contains("payload")) payload = row["payload"].is_string() ? parsed(row["payload"].get<std::string>()) : row["payload"];
+  if (row.contains("payload")) payload = row["payload"].is_string() ? hParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("batch_id", "") == peer.batchIds.at(0), "the outbox row must carry the event for the batch the shard indexed: %s", rows[0]);
+  ctx.Assert(payload.value("indexed_count", -1) == 2 && payload.value("rejected_count", -1) == 1 && payload.value("index_snapshot", "") == "logs-acme@1" && payload.value("service", "") == "checkout",
+             "the outbox row must carry the whole event the topic would have had (the shard's counts and snapshot): %s", rows[0]);
   ctx.Assert(!result.has_value(), "indexBatch returned %s for an event the broker rejected, expected nothing", result ? result->dump() : "");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
-  ctx.Assert(mustIndex(ctx, "billing").has_value(), "once the broker answers again the event is delivered");
-  ctx.Equal(ctx.Redis.LRange(kEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
+  ctx.Assert(hMustIndex(ctx, "billing").has_value(), "once the broker answers again the event is delivered");
+  ctx.Equal(ctx.Redis.LRange(kHOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
+  // The outbox write itself fails (the key holds a string): the event is neither on the topic nor kept, so the caller must hear of it.
+  ctx.Redis.Do("DEL", kHOutbox);
+  ctx.Redis.Do("SET", kHOutbox, "not a list");
+  ctx.Kafka.FailNext(kHTopic, 1);
+  std::string returned;
+  ctx.Assert(hThrows(ctx, returned), "with the broker rejecting the event and the RPUSH to %s failing (WRONGTYPE), indexBatch returned %s: an event neither delivered nor kept must throw to the caller", kHOutbox, returned);
 }
 `,
   },

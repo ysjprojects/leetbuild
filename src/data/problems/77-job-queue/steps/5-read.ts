@@ -75,7 +75,7 @@ the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to s
       id: 'stalled-claim',
       title: 'A claim past its deadline reads as stalled',
       detail:
-        "A claimed job reads `running`; 61 s later, with nobody reaping it, the same read answers `stalled`. The starter reports the record's state, which still says `running`.",
+        "A claimed job reads `running`, still 1 s before its deadline; at the deadline and after it, with nobody reaping it, the same read answers `stalled` with `retry_overdue: false`. The starter reports the record's state, which still says `running`.",
       match: {
         python: {all: [/\.zscore\(/, /["']stalled["']/]},
         typescript: {all: [/\.zscore\(/, /['"]stalled['"]/]},
@@ -88,7 +88,7 @@ the reaper is behind, shows a \`next_retry_at_ms\` in the past with nothing to s
       id: 'retry-overdue',
       title: 'A retry whose time has passed is flagged retry_overdue',
       detail:
-        'A job retrying in 2 s reads `retrying` with `retry_overdue: false` and its `next_retry_at_ms`; 3 s later it still reads `retrying`, with `retry_overdue: true`. The starter has no such field.',
+        'A queued job reads `retry_overdue: false`. A job retrying in 2 s reads `retrying` with `retry_overdue: false` and its `next_retry_at_ms`; at its retry time and 1 s later it still reads `retrying`, with `retry_overdue: true`. The starter has no such field.',
       match: {
         python: {all: [/["']retry_overdue["']/]},
         typescript: {all: [/retry_overdue/]},
@@ -612,10 +612,17 @@ async def check_stalled_claim(ctx):
     async with _api(ctx) as c:
         fresh = await c.get("/v1/jobs/job-1", headers=T1)
         assert fresh.json().get("state") == "running", f"a job claimed a moment ago reads {fresh.json()}"
-        ctx.clock.advance(61)  # the worker died; no reaper has run
-        late = await c.get("/v1/jobs/job-1", headers=T1)
-    state = late.json().get("state")
+        ctx.clock.advance(59)
+        before = (await c.get("/v1/jobs/job-1", headers=T1)).json()
+        assert before.get("state") == "running", f"1 s before its claim deadline the job reads {before}: it is still running"
+        ctx.clock.advance(1)  # the deadline itself: the worker died; no reaper has run
+        at = (await c.get("/v1/jobs/job-1", headers=T1)).json()
+        assert at.get("state") == "stalled", f"at its claim deadline (score equal to now) the job reads {at}: a claim whose score is at or before now is stalled"
+        ctx.clock.advance(1)
+        late = (await c.get("/v1/jobs/job-1", headers=T1)).json()
+    state = late.get("state")
     assert state == "stalled", f"61 s after the claim, with its deadline past, the job reads {state!r}: compare the jobs:inflight score with now and report stalled"
+    assert late.get("retry_overdue") is False, f"a stalled claim is not a retry: retry_overdue must stay false, got {late}"
 
 
 async def check_retry_overdue(ctx):
@@ -623,11 +630,17 @@ async def check_retry_overdue(ctx):
     assert queue.claim("w-1") == "job-1"
     due = int(time.time() * 1000) + 2000
     queue.retry_later("job-1", due)
+    _job("job-2")
     async with _api(ctx) as c:
+        queued = (await c.get("/v1/jobs/job-2", headers=T1)).json()
+        assert queued.get("retry_overdue") is False, f"a queued job must read retry_overdue false, got {queued}"
         ahead = (await c.get("/v1/jobs/job-1", headers=T1)).json()
         assert ahead.get("state") == "retrying" and ahead.get("next_retry_at_ms") == due, f"a job retrying in 2 s reads {ahead}"
         assert ahead.get("retry_overdue") is False, f"with the retry still ahead the read must say retry_overdue false, got {ahead}"
-        ctx.clock.advance(3)  # the reaper is behind
+        ctx.clock.advance(2)  # the retry time itself
+        at = (await c.get("/v1/jobs/job-1", headers=T1)).json()
+        assert at.get("retry_overdue") is True, f"at its retry time (score equal to now) the job reads {at}: a retry whose score is at or before now is overdue"
+        ctx.clock.advance(1)  # the reaper is behind
         late = (await c.get("/v1/jobs/job-1", headers=T1)).json()
     assert late.get("state") == "retrying", f"an overdue retry is still retrying, got {late}"
     assert late.get("retry_overdue") is True, f"3 s after its retry time the job reads {late}: a next_retry_at_ms in the past must come with retry_overdue true"
@@ -678,10 +691,16 @@ export async function check_stalled_claim(ctx) {
   assert.equal(await queue.claim('w-1'), 'job-1');
   const fresh = await c.get('/v1/jobs/job-1', {headers: T1});
   assert.equal(fresh.json().state, 'running', \`a job claimed a moment ago reads \${fresh.text}\`);
-  ctx.clock.advance(61); // the worker died; no reaper has run
-  const late = await c.get('/v1/jobs/job-1', {headers: T1});
-  const state = late.json().state;
-  assert.equal(state, 'stalled', \`61 s after the claim, with its deadline past, the job reads \${state}: compare the jobs:inflight score with now and report stalled\`);
+  ctx.clock.advance(59);
+  const before = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
+  assert.equal(before.state, 'running', \`1 s before its claim deadline the job reads \${JSON.stringify(before)}: it is still running\`);
+  ctx.clock.advance(1); // the deadline itself: the worker died; no reaper has run
+  const at = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
+  assert.equal(at.state, 'stalled', \`at its claim deadline (score equal to now) the job reads \${JSON.stringify(at)}: a claim whose score is at or before now is stalled\`);
+  ctx.clock.advance(1);
+  const late = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
+  assert.equal(late.state, 'stalled', \`61 s after the claim, with its deadline past, the job reads \${late.state}: compare the jobs:inflight score with now and report stalled\`);
+  assert.equal(late.retry_overdue, false, \`a stalled claim is not a retry: retry_overdue must stay false, got \${JSON.stringify(late)}\`);
 }
 
 export async function check_retry_overdue(ctx) {
@@ -690,10 +709,16 @@ export async function check_retry_overdue(ctx) {
   assert.equal(await queue.claim('w-1'), 'job-1');
   const due = Date.now() + 2000;
   await queue.retryLater('job-1', due);
+  await job(store, 'job-2');
+  const queued = (await c.get('/v1/jobs/job-2', {headers: T1})).json();
+  assert.equal(queued.retry_overdue, false, \`a queued job must read retry_overdue false, got \${JSON.stringify(queued)}\`);
   const ahead = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
   assert(ahead.state === 'retrying' && ahead.next_retry_at_ms === due, \`a job retrying in 2 s reads \${JSON.stringify(ahead)}\`);
   assert.equal(ahead.retry_overdue, false, \`with the retry still ahead the read must say retry_overdue false, got \${JSON.stringify(ahead)}\`);
-  ctx.clock.advance(3); // the reaper is behind
+  ctx.clock.advance(2); // the retry time itself
+  const at = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
+  assert.equal(at.retry_overdue, true, \`at its retry time (score equal to now) the job reads \${JSON.stringify(at)}: a retry whose score is at or before now is overdue\`);
+  ctx.clock.advance(1); // the reaper is behind
   const late = (await c.get('/v1/jobs/job-1', {headers: T1})).json();
   assert.equal(late.state, 'retrying', \`an overdue retry is still retrying, got \${JSON.stringify(late)}\`);
   assert.equal(late.retry_overdue, true, \`3 s after its retry time the job reads \${JSON.stringify(late)}: a next_retry_at_ms in the past must come with retry_overdue true\`);
@@ -703,6 +728,7 @@ export async function check_retry_overdue(ctx) {
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -714,13 +740,19 @@ import (
 
 var readBg = context.Background()
 
-type readBody struct {
+type harnessReadBody struct {
 	State          string           \`json:"state"\`
 	Attempts       int              \`json:"attempts"\`
 	AttemptHistory []map[string]any \`json:"attempt_history"\`
 	NextRetryAtMs  *int64           \`json:"next_retry_at_ms"\`
 	RetryOverdue   *bool            \`json:"retry_overdue"\`
 	DeadReason     *string          \`json:"dead_reason"\`
+}
+
+// harnessShow renders a body for a failure message, its pointers as values.
+func harnessShow(b harnessReadBody) string {
+	out, _ := json.Marshal(b)
+	return string(out)
 }
 
 func readAPI(ctx *harness.Ctx) *harness.HTTP {
@@ -733,10 +765,10 @@ func readJobFor(ctx *harness.Ctx, jobID, tenant string) {
 	ctx.NoError(store.CreateJob(readBg, jobID, tenant, "email.send", map[string]any{"to": "ada@example.com", "template": "welcome"}), "CreateJob")
 }
 
-func readGet(ctx *harness.Ctx, c *harness.HTTP, jobID string) readBody {
+func readGet(ctx *harness.Ctx, c *harness.HTTP, jobID string) harnessReadBody {
 	r := c.Get("/v1/jobs/"+jobID, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "GET /v1/jobs/%s (%s)", jobID, r.Text())
-	var body readBody
+	var body harnessReadBody
 	r.Decode(&body)
 	return body
 }
@@ -751,9 +783,9 @@ func CheckStatusRoute(ctx *harness.Ctx) {
 	queue.Bury(readBg, "job-1", "permanent_error")
 	c := readAPI(ctx)
 	queued := readGet(ctx, c, "job-2")
-	ctx.Assert(queued.State == "queued" && queued.Attempts == 0 && len(queued.AttemptHistory) == 0, "a queued job reads %+v", queued)
+	ctx.Assert(queued.State == "queued" && queued.Attempts == 0 && len(queued.AttemptHistory) == 0, "a queued job reads %s", harnessShow(queued))
 	dead := readGet(ctx, c, "job-1")
-	ctx.Assert(dead.State == "dead" && dead.DeadReason != nil && *dead.DeadReason == "permanent_error", "a buried job must read dead with its dead_reason, got %+v", dead)
+	ctx.Assert(dead.State == "dead" && dead.DeadReason != nil && *dead.DeadReason == "permanent_error", "a buried job must read dead with its dead_reason, got %s", harnessShow(dead))
 	ctx.Assert(len(dead.AttemptHistory) == 1 && strings.HasPrefix(dead.AttemptHistory[0]["error"].(string), "INVALID_ARGUMENT"), "the attempt history must carry each attempt's error, got %v", dead.AttemptHistory)
 }
 
@@ -775,9 +807,16 @@ func CheckStalledClaim(ctx *harness.Ctx) {
 	ctx.Equal(got, "job-1", "the harness's claim")
 	c := readAPI(ctx)
 	ctx.Equal(readGet(ctx, c, "job-1").State, "running", "a job claimed a moment ago; its state")
-	ctx.Clock.Advance(61) // the worker died; no reaper has run
-	state := readGet(ctx, c, "job-1").State
-	ctx.Assert(state == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", state)
+	ctx.Clock.Advance(59)
+	before := readGet(ctx, c, "job-1")
+	ctx.Assert(before.State == "running", "1 s before its claim deadline the job reads %s: it is still running", harnessShow(before))
+	ctx.Clock.Advance(1) // the deadline itself: the worker died; no reaper has run
+	at := readGet(ctx, c, "job-1")
+	ctx.Assert(at.State == "stalled", "at its claim deadline (score equal to now) the job reads %s: a claim whose score is at or before now is stalled", harnessShow(at))
+	ctx.Clock.Advance(1)
+	late := readGet(ctx, c, "job-1")
+	ctx.Assert(late.State == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", late.State)
+	ctx.Assert(late.RetryOverdue != nil && !*late.RetryOverdue, "a stalled claim is not a retry: retry_overdue must stay false, got %s", harnessShow(late))
 }
 
 func CheckRetryOverdue(ctx *harness.Ctx) {
@@ -786,14 +825,20 @@ func CheckRetryOverdue(ctx *harness.Ctx) {
 	ctx.Equal(got, "job-1", "the harness's claim")
 	due := ctx.Clock.Now() + 2000
 	ctx.NoError(queue.RetryLater(readBg, "job-1", due), "RetryLater")
+	readJobFor(ctx, "job-2", "t-1")
 	c := readAPI(ctx)
+	queued := readGet(ctx, c, "job-2")
+	ctx.Assert(queued.RetryOverdue != nil && !*queued.RetryOverdue, "a queued job must read retry_overdue false, got %s", harnessShow(queued))
 	ahead := readGet(ctx, c, "job-1")
-	ctx.Assert(ahead.State == "retrying" && ahead.NextRetryAtMs != nil && *ahead.NextRetryAtMs == due, "a job retrying in 2 s reads %+v", ahead)
-	ctx.Assert(ahead.RetryOverdue != nil && !*ahead.RetryOverdue, "with the retry still ahead the read must say retry_overdue false, got %+v", ahead)
-	ctx.Clock.Advance(3) // the reaper is behind
+	ctx.Assert(ahead.State == "retrying" && ahead.NextRetryAtMs != nil && *ahead.NextRetryAtMs == due, "a job retrying in 2 s reads %s", harnessShow(ahead))
+	ctx.Assert(ahead.RetryOverdue != nil && !*ahead.RetryOverdue, "with the retry still ahead the read must say retry_overdue false, got %s", harnessShow(ahead))
+	ctx.Clock.Advance(2) // the retry time itself
+	at := readGet(ctx, c, "job-1")
+	ctx.Assert(at.RetryOverdue != nil && *at.RetryOverdue, "at its retry time (score equal to now) the job reads %s: a retry whose score is at or before now is overdue", harnessShow(at))
+	ctx.Clock.Advance(1) // the reaper is behind
 	late := readGet(ctx, c, "job-1")
 	ctx.Equal(late.State, "retrying", "an overdue retry is still retrying; the state")
-	ctx.Assert(late.RetryOverdue != nil && *late.RetryOverdue, "3 s after its retry time the job reads %+v: a next_retry_at_ms in the past must come with retry_overdue true", late)
+	ctx.Assert(late.RetryOverdue != nil && *late.RetryOverdue, "3 s after its retry time the job reads %s: a next_retry_at_ms in the past must come with retry_overdue true", harnessShow(late))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -860,9 +905,17 @@ void CheckStalledClaim(harness::Ctx& ctx) {
   ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
   auto c = readAPI(ctx);
   ctx.Equal(readGet(ctx, c, "job-1").value("state", ""), "running", "a job claimed a moment ago; its state");
-  ctx.Clock.Advance(61);  // the worker died; no reaper has run
-  const std::string state = readGet(ctx, c, "job-1").value("state", "");
+  ctx.Clock.Advance(59);
+  const auto before = readGet(ctx, c, "job-1");
+  ctx.Assert(before.value("state", "") == "running", "1 s before its claim deadline the job reads %s: it is still running", before.dump());
+  ctx.Clock.Advance(1);  // the deadline itself: the worker died; no reaper has run
+  const auto at = readGet(ctx, c, "job-1");
+  ctx.Assert(at.value("state", "") == "stalled", "at its claim deadline (score equal to now) the job reads %s: a claim whose score is at or before now is stalled", at.dump());
+  ctx.Clock.Advance(1);
+  const auto late = readGet(ctx, c, "job-1");
+  const std::string state = late.value("state", "");
   ctx.Assert(state == "stalled", "61 s after the claim, with its deadline past, the job reads %q: compare the jobs:inflight score with now and report stalled", state);
+  ctx.Assert(late.contains("retry_overdue") && late["retry_overdue"] == false, "a stalled claim is not a retry: retry_overdue must stay false, got %s", late.dump());
 }
 
 void CheckRetryOverdue(harness::Ctx& ctx) {
@@ -870,11 +923,17 @@ void CheckRetryOverdue(harness::Ctx& ctx) {
   ctx.Equal(queue::claim("w-1").value_or(""), "job-1", "the harness's claim");
   const long long due = ctx.Clock.Now() + 2000;
   queue::retryLater("job-1", due);
+  readJobFor("job-2", "t-1");
   auto c = readAPI(ctx);
+  const auto queued = readGet(ctx, c, "job-2");
+  ctx.Assert(queued.contains("retry_overdue") && queued["retry_overdue"] == false, "a queued job must read retry_overdue false, got %s", queued.dump());
   const auto ahead = readGet(ctx, c, "job-1");
   ctx.Assert(ahead.value("state", "") == "retrying" && ahead["next_retry_at_ms"] == due, "a job retrying in 2 s reads %s", ahead.dump());
   ctx.Assert(ahead.contains("retry_overdue") && ahead["retry_overdue"] == false, "with the retry still ahead the read must say retry_overdue false, got %s", ahead.dump());
-  ctx.Clock.Advance(3);  // the reaper is behind
+  ctx.Clock.Advance(2);  // the retry time itself
+  const auto at = readGet(ctx, c, "job-1");
+  ctx.Assert(at.contains("retry_overdue") && at["retry_overdue"] == true, "at its retry time (score equal to now) the job reads %s: a retry whose score is at or before now is overdue", at.dump());
+  ctx.Clock.Advance(1);  // the reaper is behind
   const auto late = readGet(ctx, c, "job-1");
   ctx.Equal(late.value("state", ""), "retrying", "an overdue retry is still retrying; the state");
   ctx.Assert(late.contains("retry_overdue") && late["retry_overdue"] == true, "3 s after its retry time the job reads %s: a next_retry_at_ms in the past must come with retry_overdue true", late.dump());

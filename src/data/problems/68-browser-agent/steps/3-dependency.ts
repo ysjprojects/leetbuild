@@ -25,10 +25,10 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
                         rpc Act(ActRequest) returns (Page); rpc Snapshot(SnapshotRequest) returns (Page); }
 \`\`\`
 
-- Every driver call carries a **\`DEADLINE_S\` = 15 s** deadline.
+- Every driver call carries a **\`DEADLINE_S\` = 15 s** deadline, each retry a full one of its own.
 - \`Act\` is sent once. On \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\`, read \`Snapshot\`: a digest that
   differs from the session's \`page_digest\` means the action landed, so answer that page; an
-  unchanged one makes a single further \`Act\` safe.
+  unchanged one makes a single further \`Act\` safe. Any other code ends the action \`failed\`.
 - \`profiles.authorize_navigation\` runs on **every hop**, the first URL and each \`location\`; a
   refused hop ends the action \`blocked\` with the reason before the browser goes there.`,
   sequence: {
@@ -48,7 +48,7 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
       id: 'deadline',
       title: 'Every driver call carries a 15-second deadline',
       detail:
-        'Navigate, Act and Snapshot are each made with `DEADLINE_S` (15 s), so a hung page ends the action as failed; the starter sets no deadline and waits as long as the page does.',
+        'Navigate, Act and Snapshot are each made with `DEADLINE_S` (15 s), every retry with a full deadline of its own, so a hung page ends the action as failed; the starter sets no deadline and waits as long as the page does.',
       match: {
         python: {
           all: [
@@ -73,7 +73,7 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
       id: 'verify-before-retry',
       title: 'A click whose reply was lost is checked against the page',
       detail:
-        '`Act` is sent once; after `UNAVAILABLE` or `DEADLINE_EXCEEDED` the page is read with `Snapshot` and the action is sent again only if the digest still matches the session’s `page_digest`. The starter replays `Act` through the retry loop.',
+        '`Act` is sent once; after `UNAVAILABLE` or `DEADLINE_EXCEEDED` the page is read with `Snapshot` and the action is sent once more only if the digest still matches the session’s `page_digest`; any other code ends the action failed. The starter replays `Act` through the retry loop.',
       match: {
         python: {all: [/driver\.Snapshot\(/], order: [/driver\.Act\(/, /driver\.Snapshot\(/]},
         typescript: {all: [/driver\.Snapshot\(/], order: [/driver\.Act\(/, /driver\.Snapshot\(/]},
@@ -89,7 +89,7 @@ service BrowserDriver { rpc Navigate(NavigateRequest) returns (Page);   // a 3xx
       id: 'redirect-hops',
       title: 'Authorizes every redirect hop before following it',
       detail:
-        '`authorize_navigation`/`authorizeNavigation` runs inside the redirect loop, ahead of each `Navigate`, so a `location` outside the profile ends the action blocked; the starter authorizes the first URL only.',
+        '`authorize_navigation`/`authorizeNavigation` runs inside the redirect loop, ahead of each `Navigate`, the first URL included, so a `location` outside the profile ends the action blocked; the starter authorizes the first URL only.',
       match: {
         python: {order: [/for _ in range\(MAX_REDIRECTS/, /profiles\.authorize_navigation\(/]},
         typescript: {order: [/for \(let hop = 0; hop <= MAX_REDIRECTS/, /authorizeNavigation\(/]},
@@ -1085,23 +1085,31 @@ ENTRY = "https://www.example.com/"
 KETTLES = "https://www.example.com/kettles"
 METADATA = "http://169.254.169.254/latest/meta-data/"
 WIKI = "https://en.wikipedia.org/wiki/Kettle"
+PLAIN = "http://www.example.com/checkout"
 
 
 class Driver(browser_agent_pb2_grpc.BrowserDriverServicer):
-    """One browser: Navigate answers redirects[url] as a 302, Act applies the action (drop: refused
-    before the page sees it; lose_reply: applied, then the reply is lost), the digest counts actions."""
+    """One browser: Navigate answers redirects[url] as a 302 (navigate_fail: the next ones fail
+    UNAVAILABLE once they arrive), Act applies the action (drop: refused with drop_code before the
+    page sees it; lose_reply: applied, then the reply is lost with lose_code), the digest counts actions."""
 
     def __init__(self):
         self.url = ENTRY
         self.applied = 0
         self.drop = 0
+        self.drop_code = grpc.StatusCode.UNAVAILABLE
         self.lose_reply = 0
+        self.lose_code = grpc.StatusCode.DEADLINE_EXCEEDED
+        self.navigate_fail = 0
         self.redirects = {}
 
     def _page(self):
         return pb.Page(url=self.url, status=200, digest=f"{self.url}#{self.applied}")
 
     def Navigate(self, request, context):
+        if self.navigate_fail:
+            self.navigate_fail -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "renderer crashed")
         if request.url in self.redirects:
             return pb.Page(url=request.url, status=302, location=self.redirects[request.url])
         self.url = request.url
@@ -1110,11 +1118,11 @@ class Driver(browser_agent_pb2_grpc.BrowserDriverServicer):
     def Act(self, request, context):
         if self.drop:
             self.drop -= 1
-            context.abort(grpc.StatusCode.UNAVAILABLE, "driver restarting")
+            context.abort(self.drop_code, "driver refused the action")
         self.applied += 1
         if self.lose_reply:
             self.lose_reply -= 1
-            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "reply lost")
+            context.abort(self.lose_code, "reply lost")
         return self._page()
 
     def Snapshot(self, request, context):
@@ -1128,16 +1136,28 @@ def _world(ctx):
     return ctx.load("client"), driver, sid
 
 
+def _deadlines(ctx):
+    for method in ("Navigate", "Act", "Snapshot"):
+        for call in ctx.grpc.calls_to(method):
+            assert call.timeout is not None, f"a {method} call carries no deadline: a hung page holds the worker as long as it hangs"
+            assert 14.5 <= call.timeout <= 15.5, f"a {method} call carries a {call.timeout} s deadline, expected DEADLINE_S = 15 on every call"
+
+
 def check_deadline(ctx):
     m, driver, sid = _world(ctx)
     step = m.run_action(sid, "w-1", {"type": "navigate", "target": KETTLES})
     assert step["outcome"] == "ok", f"a navigation with a healthy driver ended {step}"
     step = m.run_action(sid, "w-1", {"type": "click", "target": "#add-to-cart"})
     assert step["outcome"] == "ok", f"a click with a healthy driver ended {step}"
-    for method in ("Navigate", "Act"):
-        for call in ctx.grpc.calls_to(method):
-            assert call.timeout is not None, f"a {method} call carries no deadline: a hung page holds the worker as long as it hangs"
-            assert 14.5 <= call.timeout <= 15.5, f"a {method} call carries a {call.timeout} s deadline, expected DEADLINE_S = 15"
+    driver.lose_reply = 1
+    m.run_action(sid, "w-1", {"type": "click", "target": "#buy"})
+    _deadlines(ctx)
+    # The first attempt fails late: the retry still gets its own 15 s.
+    ctx.grpc.set_latency("Navigate", 10.0)
+    driver.navigate_fail = 1
+    step = m.run_action(sid, "w-1", {"type": "navigate", "target": ENTRY})
+    assert step["outcome"] == "ok", f"a navigation whose first attempt failed UNAVAILABLE after 10 s ended {step['outcome']!r} ({step['reason']}): every attempt carries its own DEADLINE_S, and the retry of a 10 s page fits in it"
+    _deadlines(ctx)
     ctx.grpc.set_latency("Navigate", 60.0)
     step = m.run_action(sid, "w-1", {"type": "navigate", "target": ENTRY})
     assert step["outcome"] == "failed", f"with a page that hangs for 60 s the navigation ended {step['outcome']!r}: under a 15 s deadline it must end failed"
@@ -1154,16 +1174,39 @@ def check_verify_before_retry(ctx):
     driver.drop = 1
     step = m.run_action(sid, "w-1", {"type": "click", "target": "#confirm"})
     assert driver.applied == 2 and step["outcome"] == "ok", f"a click the driver refused before touching the page left {driver.applied} applied actions and outcome {step['outcome']!r}: the digest is unchanged, so one more Act is safe"
+    driver.lose_reply, driver.lose_code = 1, grpc.StatusCode.UNAVAILABLE
+    step = m.run_action(sid, "w-1", {"type": "click", "target": "#pay"})
+    assert driver.applied == 3 and step["outcome"] == "ok", f"a click applied before its reply was lost as UNAVAILABLE left {driver.applied} applied actions (expected 3) and outcome {step['outcome']!r}: UNAVAILABLE is checked against Snapshot too"
+    # The one further Act is sent once: its own lost reply is not replayed blindly.
+    driver.drop, driver.lose_reply, driver.lose_code = 1, 1, grpc.StatusCode.DEADLINE_EXCEEDED
+    m.run_action(sid, "w-1", {"type": "click", "target": "#submit"})
+    assert driver.applied == 4, f"after a refused click and a replay whose reply was lost the page applied {driver.applied - 3} clicks: the replay is sent once, never through a blind retry"
+    for code in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.NOT_FOUND):
+        snapshots = len(ctx.grpc.calls_to("Snapshot"))
+        driver.drop, driver.drop_code = 1, code
+        step = m.run_action(sid, "w-1", {"type": "click", "target": "#gone"})
+        assert driver.applied == 4 and step["outcome"] == "failed", f"a click the driver refused with {code.name} left {driver.applied - 4} extra applied actions and outcome {step['outcome']!r}: only UNAVAILABLE and DEADLINE_EXCEEDED may have lost a reply; {code.name} ends the action failed"
+        assert len(ctx.grpc.calls_to("Snapshot")) == snapshots, f"a click refused with {code.name} was followed by Snapshot: only UNAVAILABLE and DEADLINE_EXCEEDED are checked against the page"
 
 
 def check_redirect_hops(ctx):
     m, driver, sid = _world(ctx)
     driver.redirects["https://www.example.com/login"] = METADATA
     driver.redirects["https://www.example.com/old-kettles"] = WIKI
-    step = m.run_action(sid, "w-1", {"type": "navigate", "target": "https://www.example.com/login"})
-    sent = [c.request.url for c in ctx.grpc.calls_to("Navigate")]
-    assert METADATA not in sent, f"the browser was sent to {sent}: /login redirected to the metadata address and nothing authorized that hop"
-    assert step["outcome"] == "blocked" and step["reason"], f"a redirect outside the profile must end the action blocked with a reason, got {step}"
+    driver.redirects["https://www.example.com/promo"] = "https://www.example.com/sso"
+    driver.redirects["https://www.example.com/sso"] = METADATA
+    driver.redirects["https://www.example.com/checkout"] = PLAIN
+    cases = (
+        (METADATA, METADATA, "the metadata address itself"),
+        ("https://www.example.com/login", METADATA, "/login, which redirects to the metadata address"),
+        ("https://www.example.com/promo", METADATA, "/promo, whose second hop goes to the metadata address"),
+        ("https://www.example.com/checkout", PLAIN, "/checkout, which redirects to plain http on the same host"),
+    )
+    for target, refused, label in cases:
+        step = m.run_action(sid, "w-1", {"type": "navigate", "target": target})
+        sent = [c.request.url for c in ctx.grpc.calls_to("Navigate")]
+        assert refused not in sent, f"navigating to {label} sent the browser to {sent}: authorize every URL, the first and each hop, before Navigate goes there"
+        assert step["outcome"] == "blocked" and step["reason"], f"navigating to {label} must end the action blocked with a reason, got {step}"
     assert sessions.load_session(sid)["current_url"] == ENTRY, "a blocked navigation must leave the session on its page"
     step = m.run_action(sid, "w-1", {"type": "navigate", "target": "https://www.example.com/old-kettles"})
     assert step["outcome"] == "ok" and step["url"] == WIKI, f"a redirect to a host the profile allows must be followed, got {step}"
@@ -1173,14 +1216,31 @@ def check_redirect_hops(ctx):
 const KETTLES = 'https://www.example.com/kettles';
 const METADATA = 'http://169.254.169.254/latest/meta-data/';
 const WIKI = 'https://en.wikipedia.org/wiki/Kettle';
+const PLAIN = 'http://www.example.com/checkout';
 
-/** One browser: Navigate answers redirects as a 302, Act applies the action (drop: refused before the page sees it; loseReply: applied, then the reply is lost), the digest counts actions. */
+/**
+ * One browser: Navigate answers redirects as a 302 (navigateFail: the next ones fail UNAVAILABLE once they arrive), Act applies the action
+ * (drop: refused with dropCode before the page sees it; loseReply: applied, then the reply is lost with loseCode), the digest counts actions.
+ */
 async function world(ctx) {
   const pkg = ctx.proto('browser_agent.proto');
-  const driver = {url: ENTRY, applied: 0, drop: 0, loseReply: 0, redirects: new Map<string, string>()};
+  const driver = {
+    url: ENTRY,
+    applied: 0,
+    drop: 0,
+    dropCode: ctx.grpc.status.UNAVAILABLE,
+    loseReply: 0,
+    loseCode: ctx.grpc.status.DEADLINE_EXCEEDED,
+    navigateFail: 0,
+    redirects: new Map<string, string>(),
+  };
   const page = () => ({url: driver.url, status: 200, location: '', digest: \`\${driver.url}#\${driver.applied}\`});
   ctx.grpc.serve(pkg.browseragent.BrowserDriver.service, {
     Navigate(call, callback) {
+      if (driver.navigateFail > 0) {
+        driver.navigateFail--;
+        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'renderer crashed'});
+      }
       const {url} = call.request;
       const location = driver.redirects.get(url);
       if (location !== undefined) return callback(null, {url, status: 302, location, digest: ''});
@@ -1190,12 +1250,12 @@ async function world(ctx) {
     Act(_call, callback) {
       if (driver.drop > 0) {
         driver.drop--;
-        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'driver restarting'});
+        return callback({code: driver.dropCode, details: 'driver refused the action'});
       }
       driver.applied++;
       if (driver.loseReply > 0) {
         driver.loseReply--;
-        return callback({code: ctx.grpc.status.DEADLINE_EXCEEDED, details: 'reply lost'});
+        return callback({code: driver.loseCode, details: 'reply lost'});
       }
       callback(null, page());
     },
@@ -1208,18 +1268,30 @@ async function world(ctx) {
   return {m: ctx.load('client'), driver, sid, sessions};
 }
 
+function deadlines(ctx) {
+  for (const method of ['Navigate', 'Act', 'Snapshot']) {
+    for (const call of ctx.grpc.callsTo(method)) {
+      assert(call.timeout !== null, \`a \${method} call carries no deadline: a hung page holds the worker as long as it hangs\`);
+      assert(call.timeout >= 14.5 && call.timeout <= 15.5, \`a \${method} call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 15000 on every call\`);
+    }
+  }
+}
+
 export async function check_deadline(ctx) {
-  const {m, sid} = await world(ctx);
+  const {m, driver, sid} = await world(ctx);
   let step = await m.runAction(sid, 'w-1', {type: 'navigate', target: KETTLES});
   assert.equal(step.outcome, 'ok', \`a navigation with a healthy driver ended \${JSON.stringify(step)}\`);
   step = await m.runAction(sid, 'w-1', {type: 'click', target: '#add-to-cart'});
   assert.equal(step.outcome, 'ok', \`a click with a healthy driver ended \${JSON.stringify(step)}\`);
-  for (const method of ['Navigate', 'Act']) {
-    for (const call of ctx.grpc.callsTo(method)) {
-      assert(call.timeout !== null, \`a \${method} call carries no deadline: a hung page holds the worker as long as it hangs\`);
-      assert(call.timeout >= 14.5 && call.timeout <= 15.5, \`a \${method} call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 15000\`);
-    }
-  }
+  driver.loseReply = 1;
+  await m.runAction(sid, 'w-1', {type: 'click', target: '#buy'});
+  deadlines(ctx);
+  // The first attempt fails late: the retry still gets its own 15 s.
+  ctx.grpc.setLatency('Navigate', 10);
+  driver.navigateFail = 1;
+  step = await m.runAction(sid, 'w-1', {type: 'navigate', target: ENTRY});
+  assert.equal(step.outcome, 'ok', \`a navigation whose first attempt failed UNAVAILABLE after 10 s ended \${step.outcome} (\${step.reason}): every attempt carries its own DEADLINE_MS, and the retry of a 10 s page fits in it\`);
+  deadlines(ctx);
   ctx.grpc.setLatency('Navigate', 60);
   step = await m.runAction(sid, 'w-1', {type: 'navigate', target: ENTRY});
   assert.equal(step.outcome, 'failed', \`with a page that hangs for 60 s the navigation ended \${step.outcome}: under a 15 s deadline it must end failed\`);
@@ -1236,18 +1308,47 @@ export async function check_verify_before_retry(ctx) {
   driver.drop = 1;
   step = await m.runAction(sid, 'w-1', {type: 'click', target: '#confirm'});
   assert(driver.applied === 2 && step.outcome === 'ok', \`a click the driver refused before touching the page left \${driver.applied} applied actions and outcome \${step.outcome}: the digest is unchanged, so one more Act is safe\`);
+  driver.loseReply = 1;
+  driver.loseCode = ctx.grpc.status.UNAVAILABLE;
+  step = await m.runAction(sid, 'w-1', {type: 'click', target: '#pay'});
+  assert(driver.applied === 3 && step.outcome === 'ok', \`a click applied before its reply was lost as UNAVAILABLE left \${driver.applied} applied actions (expected 3) and outcome \${step.outcome}: UNAVAILABLE is checked against Snapshot too\`);
+  // The one further Act is sent once: its own lost reply is not replayed blindly.
+  driver.drop = 1;
+  driver.loseReply = 1;
+  driver.loseCode = ctx.grpc.status.DEADLINE_EXCEEDED;
+  await m.runAction(sid, 'w-1', {type: 'click', target: '#submit'});
+  assert.equal(driver.applied, 4, \`after a refused click and a replay whose reply was lost the page applied \${driver.applied - 3} clicks: the replay is sent once, never through a blind retry\`);
+  for (const name of ['INVALID_ARGUMENT', 'FAILED_PRECONDITION', 'NOT_FOUND']) {
+    const snapshots = ctx.grpc.callsTo('Snapshot').length;
+    driver.drop = 1;
+    driver.dropCode = ctx.grpc.status[name];
+    step = await m.runAction(sid, 'w-1', {type: 'click', target: '#gone'});
+    assert(driver.applied === 4 && step.outcome === 'failed', \`a click the driver refused with \${name} left \${driver.applied - 4} extra applied actions and outcome \${step.outcome}: only UNAVAILABLE and DEADLINE_EXCEEDED may have lost a reply; \${name} ends the action failed\`);
+    assert.equal(ctx.grpc.callsTo('Snapshot').length, snapshots, \`a click refused with \${name} was followed by Snapshot: only UNAVAILABLE and DEADLINE_EXCEEDED are checked against the page\`);
+  }
 }
 
 export async function check_redirect_hops(ctx) {
   const {m, driver, sid, sessions} = await world(ctx);
   driver.redirects.set('https://www.example.com/login', METADATA);
   driver.redirects.set('https://www.example.com/old-kettles', WIKI);
-  let step = await m.runAction(sid, 'w-1', {type: 'navigate', target: 'https://www.example.com/login'});
-  const sent = ctx.grpc.callsTo('Navigate').map(c => c.request.url);
-  assert(!sent.includes(METADATA), \`the browser was sent to \${JSON.stringify(sent)}: /login redirected to the metadata address and nothing authorized that hop\`);
-  assert(step.outcome === 'blocked' && step.reason !== '', \`a redirect outside the profile must end the action blocked with a reason, got \${JSON.stringify(step)}\`);
+  driver.redirects.set('https://www.example.com/promo', 'https://www.example.com/sso');
+  driver.redirects.set('https://www.example.com/sso', METADATA);
+  driver.redirects.set('https://www.example.com/checkout', PLAIN);
+  const cases = [
+    [METADATA, METADATA, 'the metadata address itself'],
+    ['https://www.example.com/login', METADATA, '/login, which redirects to the metadata address'],
+    ['https://www.example.com/promo', METADATA, '/promo, whose second hop goes to the metadata address'],
+    ['https://www.example.com/checkout', PLAIN, '/checkout, which redirects to plain http on the same host'],
+  ];
+  for (const [target, refused, label] of cases) {
+    const step = await m.runAction(sid, 'w-1', {type: 'navigate', target});
+    const sent = ctx.grpc.callsTo('Navigate').map(c => c.request.url);
+    assert(!sent.includes(refused), \`navigating to \${label} sent the browser to \${JSON.stringify(sent)}: authorize every URL, the first and each hop, before Navigate goes there\`);
+    assert(step.outcome === 'blocked' && step.reason !== '', \`navigating to \${label} must end the action blocked with a reason, got \${JSON.stringify(step)}\`);
+  }
   assert.equal((await sessions.loadSession(sid)).current_url, ENTRY, 'a blocked navigation must leave the session on its page');
-  step = await m.runAction(sid, 'w-1', {type: 'navigate', target: 'https://www.example.com/old-kettles'});
+  const step = await m.runAction(sid, 'w-1', {type: 'navigate', target: 'https://www.example.com/old-kettles'});
   assert(step.outcome === 'ok' && step.url === WIKI, \`a redirect to a host the profile allows must be followed, got \${JSON.stringify(step)}\`);
   assert.equal((await sessions.loadSession(sid)).current_url, WIKI, 'the session must record the page the redirect ended on');
 }
@@ -1269,31 +1370,39 @@ import (
 )
 
 const (
-	entryURL   = "https://www.example.com/"
-	kettlesURL = "https://www.example.com/kettles"
-	metadata   = "http://169.254.169.254/latest/meta-data/"
-	wikiURL    = "https://en.wikipedia.org/wiki/Kettle"
+	hEntryURL    = "https://www.example.com/"
+	hKettlesURL  = "https://www.example.com/kettles"
+	hMetadataURL = "http://169.254.169.254/latest/meta-data/"
+	hWikiURL     = "https://en.wikipedia.org/wiki/Kettle"
+	hPlainURL    = "http://www.example.com/checkout"
 )
 
 var clientBg = context.Background()
 
-// driverPeer is one browser: Navigate answers redirects as a 302, Act applies the action (drop:
-// refused before the page sees it; loseReply: applied, then the reply is lost), the digest counts
-// actions.
-type driverPeer struct {
+// hDriverPeer is one browser: Navigate answers redirects as a 302 (navigateFail: the next ones fail
+// Unavailable once they arrive), Act applies the action (drop: refused with dropCode before the page
+// sees it; loseReply: applied, then the reply is lost with loseCode), the digest counts actions.
+type hDriverPeer struct {
 	pb.UnimplementedBrowserDriverServer
-	url       string
-	applied   int
-	drop      int
-	loseReply int
-	redirects map[string]string
+	url          string
+	applied      int
+	drop         int
+	dropCode     codes.Code
+	loseReply    int
+	loseCode     codes.Code
+	navigateFail int
+	redirects    map[string]string
 }
 
-func (d *driverPeer) page() *pb.Page {
+func (d *hDriverPeer) page() *pb.Page {
 	return &pb.Page{Url: d.url, Status: 200, Digest: fmt.Sprintf("%s#%d", d.url, d.applied)}
 }
 
-func (d *driverPeer) Navigate(_ context.Context, req *pb.NavigateRequest) (*pb.Page, error) {
+func (d *hDriverPeer) Navigate(_ context.Context, req *pb.NavigateRequest) (*pb.Page, error) {
+	if d.navigateFail > 0 {
+		d.navigateFail--
+		return nil, status.Error(codes.Unavailable, "renderer crashed")
+	}
 	if location, ok := d.redirects[req.GetUrl()]; ok {
 		return &pb.Page{Url: req.GetUrl(), Status: 302, Location: location}, nil
 	}
@@ -1301,99 +1410,144 @@ func (d *driverPeer) Navigate(_ context.Context, req *pb.NavigateRequest) (*pb.P
 	return d.page(), nil
 }
 
-func (d *driverPeer) Act(_ context.Context, _ *pb.ActRequest) (*pb.Page, error) {
+func (d *hDriverPeer) Act(_ context.Context, _ *pb.ActRequest) (*pb.Page, error) {
 	if d.drop > 0 {
 		d.drop--
-		return nil, status.Error(codes.Unavailable, "driver restarting")
+		return nil, status.Error(d.dropCode, "driver refused the action")
 	}
 	d.applied++
 	if d.loseReply > 0 {
 		d.loseReply--
-		return nil, status.Error(codes.DeadlineExceeded, "reply lost")
+		return nil, status.Error(d.loseCode, "reply lost")
 	}
 	return d.page(), nil
 }
 
-func (d *driverPeer) Snapshot(_ context.Context, _ *pb.SnapshotRequest) (*pb.Page, error) {
+func (d *hDriverPeer) Snapshot(_ context.Context, _ *pb.SnapshotRequest) (*pb.Page, error) {
 	return d.page(), nil
 }
 
-func world(ctx *harness.Ctx) (*driverPeer, string) {
-	driver := &driverPeer{url: entryURL, redirects: map[string]string{}}
+func hWorld(ctx *harness.Ctx) (*hDriverPeer, string) {
+	driver := &hDriverPeer{url: hEntryURL, dropCode: codes.Unavailable, loseCode: codes.DeadlineExceeded, redirects: map[string]string{}}
 	pb.RegisterBrowserDriverServer(ctx.GRPC.Server(""), driver)
-	return driver, sessions.CreateSession(clientBg, "acme", "public-web", "buy a kettle", 20, entryURL).ID
+	return driver, sessions.CreateSession(clientBg, "acme", "public-web", "buy a kettle", 20, hEntryURL).ID
+}
+
+func hDeadlines(ctx *harness.Ctx) {
+	for _, method := range []string{"Navigate", "Act", "Snapshot"} {
+		for _, call := range ctx.GRPC.CallsTo(method, "") {
+			ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a hung page holds the worker as long as it hangs", method)
+			ctx.Assert(call.Timeout >= 14500*time.Millisecond && call.Timeout <= 15500*time.Millisecond, "a %s call carries a %v deadline, expected 15 s on every call", method, call.Timeout)
+		}
+	}
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	_, sid := world(ctx)
-	step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: kettlesURL})
+	driver, sid := hWorld(ctx)
+	step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hKettlesURL})
 	ctx.Equal(step.Outcome, "ok", "a navigation with a healthy driver (%+v)", step)
 	step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#add-to-cart"})
 	ctx.Equal(step.Outcome, "ok", "a click with a healthy driver (%+v)", step)
-	for _, method := range []string{"Navigate", "Act"} {
-		for _, call := range ctx.GRPC.CallsTo(method, "") {
-			ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a hung page holds the worker as long as it hangs", method)
-			ctx.Assert(call.Timeout >= 14500*time.Millisecond && call.Timeout <= 15500*time.Millisecond, "a %s call carries a %v deadline, expected 15 s", method, call.Timeout)
-		}
-	}
+	driver.loseReply = 1
+	runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#buy"})
+	hDeadlines(ctx)
+	// The first attempt fails late: the retry still gets its own 15 s.
+	ctx.GRPC.SetLatency("Navigate", 10, "")
+	driver.navigateFail = 1
+	step = runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hEntryURL})
+	ctx.Assert(step.Outcome == "ok", "a navigation whose first attempt failed Unavailable after 10 s ended %q (%s): every attempt carries its own 15 s deadline, and the retry of a 10 s page fits in it", step.Outcome, step.Reason)
+	hDeadlines(ctx)
 	ctx.GRPC.SetLatency("Navigate", 60, "")
-	step = runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: entryURL})
+	step = runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hEntryURL})
 	ctx.Equal(step.Outcome, "failed", "with a page that hangs for 60 s, under a 15 s deadline the navigation must end failed; outcome")
 }
 
 func CheckVerifyBeforeRetry(ctx *harness.Ctx) {
-	driver, sid := world(ctx)
-	runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: kettlesURL})
+	driver, sid := hWorld(ctx)
+	runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: hKettlesURL})
 	driver.loseReply = 1
 	step := runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#buy"})
 	ctx.Equal(driver.applied, 1, "the click's reply was lost after the page handled it, and a retry clicks again. Read Snapshot and compare the digest before sending it again; times applied")
 	ctx.Assert(len(ctx.GRPC.CallsTo("Snapshot", "")) > 0, "a click whose reply was lost must be checked against the page (Snapshot)")
-	ctx.Assert(step.Outcome == "ok" && step.Digest == kettlesURL+"#1", "the click landed, so the step must end ok on the page it left: %+v", step)
+	ctx.Assert(step.Outcome == "ok" && step.Digest == hKettlesURL+"#1", "the click landed, so the step must end ok on the page it left: %+v", step)
 	driver.drop = 1
 	step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#confirm"})
 	ctx.Assert(driver.applied == 2 && step.Outcome == "ok", "a click the driver refused before touching the page left %d applied actions and outcome %q: the digest is unchanged, so one more Act is safe", driver.applied, step.Outcome)
+	driver.loseReply, driver.loseCode = 1, codes.Unavailable
+	step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#pay"})
+	ctx.Assert(driver.applied == 3 && step.Outcome == "ok", "a click applied before its reply was lost as Unavailable left %d applied actions (expected 3) and outcome %q: Unavailable is checked against Snapshot too", driver.applied, step.Outcome)
+	// The one further Act is sent once: its own lost reply is not replayed blindly.
+	driver.drop, driver.loseReply, driver.loseCode = 1, 1, codes.DeadlineExceeded
+	runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#submit"})
+	ctx.Assert(driver.applied == 4, "after a refused click and a replay whose reply was lost the page applied %d clicks: the replay is sent once, never through a blind retry", driver.applied-3)
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.FailedPrecondition, codes.NotFound} {
+		snapshots := len(ctx.GRPC.CallsTo("Snapshot", ""))
+		driver.drop, driver.dropCode = 1, code
+		step = runAction(clientBg, sid, "w-1", Action{Type: "click", Target: "#gone"})
+		ctx.Assert(driver.applied == 4 && step.Outcome == "failed", "a click the driver refused with %v left %d extra applied actions and outcome %q: only Unavailable and DeadlineExceeded may have lost a reply; %v ends the action failed", code, driver.applied-4, step.Outcome, code)
+		ctx.Assert(len(ctx.GRPC.CallsTo("Snapshot", "")) == snapshots, "a click refused with %v was followed by Snapshot: only Unavailable and DeadlineExceeded are checked against the page", code)
+	}
 }
 
 func CheckRedirectHops(ctx *harness.Ctx) {
-	driver, sid := world(ctx)
-	driver.redirects["https://www.example.com/login"] = metadata
-	driver.redirects["https://www.example.com/old-kettles"] = wikiURL
-	step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: "https://www.example.com/login"})
-	var sent []string
-	for _, c := range ctx.GRPC.CallsTo("Navigate", "") {
-		sent = append(sent, c.Request.(*pb.NavigateRequest).GetUrl())
-		ctx.Assert(sent[len(sent)-1] != metadata, "the browser was sent to %q: /login redirected to the metadata address and nothing authorized that hop", sent)
+	driver, sid := hWorld(ctx)
+	driver.redirects["https://www.example.com/login"] = hMetadataURL
+	driver.redirects["https://www.example.com/old-kettles"] = hWikiURL
+	driver.redirects["https://www.example.com/promo"] = "https://www.example.com/sso"
+	driver.redirects["https://www.example.com/sso"] = hMetadataURL
+	driver.redirects["https://www.example.com/checkout"] = hPlainURL
+	cases := []struct{ target, refused, label string }{
+		{hMetadataURL, hMetadataURL, "the metadata address itself"},
+		{"https://www.example.com/login", hMetadataURL, "/login, which redirects to the metadata address"},
+		{"https://www.example.com/promo", hMetadataURL, "/promo, whose second hop goes to the metadata address"},
+		{"https://www.example.com/checkout", hPlainURL, "/checkout, which redirects to plain http on the same host"},
 	}
-	ctx.Assert(step.Outcome == "blocked" && step.Reason != "", "a redirect outside the profile must end the action blocked with a reason, got %+v", step)
-	ctx.Equal(sessions.LoadSession(clientBg, sid).CurrentURL, entryURL, "a blocked navigation must leave the session on its page; current_url")
-	step = runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: "https://www.example.com/old-kettles"})
-	ctx.Assert(step.Outcome == "ok" && step.URL == wikiURL, "a redirect to a host the profile allows must be followed, got %+v", step)
-	ctx.Equal(sessions.LoadSession(clientBg, sid).CurrentURL, wikiURL, "the session must record the page the redirect ended on; current_url")
+	for _, tc := range cases {
+		step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: tc.target})
+		var sent []string
+		for _, c := range ctx.GRPC.CallsTo("Navigate", "") {
+			sent = append(sent, c.Request.(*pb.NavigateRequest).GetUrl())
+		}
+		for _, url := range sent {
+			ctx.Assert(url != tc.refused, "navigating to %s sent the browser to %q: authorize every URL, the first and each hop, before Navigate goes there", tc.label, sent)
+		}
+		ctx.Assert(step.Outcome == "blocked" && step.Reason != "", "navigating to %s must end the action blocked with a reason, got %+v", tc.label, step)
+	}
+	ctx.Equal(sessions.LoadSession(clientBg, sid).CurrentURL, hEntryURL, "a blocked navigation must leave the session on its page; current_url")
+	step := runAction(clientBg, sid, "w-1", Action{Type: "navigate", Target: "https://www.example.com/old-kettles"})
+	ctx.Assert(step.Outcome == "ok" && step.URL == hWikiURL, "a redirect to a host the profile allows must be followed, got %+v", step)
+	ctx.Equal(sessions.LoadSession(clientBg, sid).CurrentURL, hWikiURL, "the session must record the page the redirect ended on; current_url")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "browser/sessions.h"
 
 namespace {
 
-const std::string kEntry = "https://www.example.com/";
-const std::string kKettles = "https://www.example.com/kettles";
-const std::string kMetadata = "http://169.254.169.254/latest/meta-data/";
-const std::string kWiki = "https://en.wikipedia.org/wiki/Kettle";
+const std::string hEntry = "https://www.example.com/";
+const std::string hKettles = "https://www.example.com/kettles";
+const std::string hMetadata = "http://169.254.169.254/latest/meta-data/";
+const std::string hWiki = "https://en.wikipedia.org/wiki/Kettle";
+const std::string hPlain = "http://www.example.com/checkout";
 
-// One browser: Navigate answers redirects as a 302, Act applies the action (drop: refused before
-// the page sees it; lose_reply: applied, then the reply is lost), the digest counts actions.
-class DriverPeer final : public browseragent::BrowserDriver::Service {
+// One browser: Navigate answers redirects as a 302 (navigate_fail: the next ones fail UNAVAILABLE
+// once they arrive), Act applies the action (drop: refused with drop_code before the page sees it;
+// lose_reply: applied, then the reply is lost with lose_code), the digest counts actions.
+class HDriverPeer final : public browseragent::BrowserDriver::Service {
  public:
-  std::string url = kEntry;
+  std::string url = hEntry;
   int applied = 0;
   int drop = 0;
+  grpc::StatusCode drop_code = grpc::StatusCode::UNAVAILABLE;
   int lose_reply = 0;
+  grpc::StatusCode lose_code = grpc::StatusCode::DEADLINE_EXCEEDED;
+  int navigate_fail = 0;
   std::map<std::string, std::string> redirects;
 
   void fill(browseragent::Page* out) {
@@ -1403,6 +1557,10 @@ class DriverPeer final : public browseragent::BrowserDriver::Service {
   }
 
   grpc::Status Navigate(grpc::ServerContext*, const browseragent::NavigateRequest* req, browseragent::Page* out) override {
+    if (navigate_fail > 0) {
+      navigate_fail--;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "renderer crashed");
+    }
     const auto it = redirects.find(req->url());
     if (it != redirects.end()) {
       out->set_url(req->url());
@@ -1418,12 +1576,12 @@ class DriverPeer final : public browseragent::BrowserDriver::Service {
   grpc::Status Act(grpc::ServerContext*, const browseragent::ActRequest*, browseragent::Page* out) override {
     if (drop > 0) {
       drop--;
-      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "driver restarting");
+      return grpc::Status(drop_code, "driver refused the action");
     }
     applied++;
     if (lose_reply > 0) {
       lose_reply--;
-      return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "reply lost");
+      return grpc::Status(lose_code, "reply lost");
     }
     fill(out);
     return grpc::Status::OK;
@@ -1435,63 +1593,109 @@ class DriverPeer final : public browseragent::BrowserDriver::Service {
   }
 };
 
-DriverPeer& world(harness::Ctx& ctx, std::string& sid) {
-  static DriverPeer* driver = nullptr;
+HDriverPeer& hWorld(harness::Ctx& ctx, std::string& sid) {
+  static HDriverPeer* driver = nullptr;
   delete driver;
-  driver = new DriverPeer;
+  driver = new HDriverPeer;
   ctx.GRPC.Server("")->RegisterService(driver);
-  sid = sessions::createSession("acme", "public-web", "buy a kettle", 20, kEntry).session_id;
+  sid = sessions::createSession("acme", "public-web", "buy a kettle", 20, hEntry).session_id;
   return *driver;
+}
+
+void hDeadlines(harness::Ctx& ctx) {
+  for (const std::string method : {"Navigate", "Act", "Snapshot"}) {
+    for (const auto& call : ctx.GRPC.CallsTo(method)) {
+      ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a hung page holds the worker as long as it hangs", method);
+      ctx.Assert(call.TimeoutSeconds() >= 14.5 && call.TimeoutSeconds() <= 15.5, "a %s call carries a %v s deadline, expected 15 s on every call", method, call.TimeoutSeconds());
+    }
+  }
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
   std::string sid;
-  world(ctx, sid);
-  auto step = runAction(sid, "w-1", Action{"navigate", kKettles, ""});
+  HDriverPeer& driver = hWorld(ctx, sid);
+  auto step = runAction(sid, "w-1", Action{"navigate", hKettles, ""});
   ctx.Equal(step.outcome, "ok", "a navigation with a healthy driver (%s)", step.reason);
   step = runAction(sid, "w-1", Action{"click", "#add-to-cart", ""});
   ctx.Equal(step.outcome, "ok", "a click with a healthy driver (%s)", step.reason);
-  for (const std::string method : {"Navigate", "Act"}) {
-    for (const auto& call : ctx.GRPC.CallsTo(method)) {
-      ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a hung page holds the worker as long as it hangs", method);
-      ctx.Assert(call.TimeoutSeconds() >= 14.5 && call.TimeoutSeconds() <= 15.5, "a %s call carries a %v s deadline, expected 15 s", method, call.TimeoutSeconds());
-    }
-  }
+  driver.lose_reply = 1;
+  runAction(sid, "w-1", Action{"click", "#buy", ""});
+  hDeadlines(ctx);
+  // The first attempt fails late: the retry still gets its own 15 s.
+  ctx.GRPC.SetLatency("Navigate", 10);
+  driver.navigate_fail = 1;
+  step = runAction(sid, "w-1", Action{"navigate", hEntry, ""});
+  ctx.Assert(step.outcome == "ok", "a navigation whose first attempt failed UNAVAILABLE after 10 s ended %q (%s): every attempt carries its own 15 s deadline, and the retry of a 10 s page fits in it", step.outcome, step.reason);
+  hDeadlines(ctx);
   ctx.GRPC.SetLatency("Navigate", 60);
-  step = runAction(sid, "w-1", Action{"navigate", kEntry, ""});
+  step = runAction(sid, "w-1", Action{"navigate", hEntry, ""});
   ctx.Equal(step.outcome, "failed", "with a page that hangs for 60 s, under a 15 s deadline the navigation must end failed; outcome");
 }
 
 void CheckVerifyBeforeRetry(harness::Ctx& ctx) {
   std::string sid;
-  DriverPeer& driver = world(ctx, sid);
-  runAction(sid, "w-1", Action{"navigate", kKettles, ""});
+  HDriverPeer& driver = hWorld(ctx, sid);
+  runAction(sid, "w-1", Action{"navigate", hKettles, ""});
   driver.lose_reply = 1;
   auto step = runAction(sid, "w-1", Action{"click", "#buy", ""});
   ctx.Equal(driver.applied, 1, "the click's reply was lost after the page handled it, and a retry clicks again. Read Snapshot and compare the digest before sending it again; times applied");
   ctx.Assert(!ctx.GRPC.CallsTo("Snapshot").empty(), "a click whose reply was lost must be checked against the page (Snapshot)");
-  ctx.Assert(step.outcome == "ok" && step.digest == kKettles + "#1", "the click landed, so the step must end ok on the page it left: outcome %q digest %q", step.outcome, step.digest);
+  ctx.Assert(step.outcome == "ok" && step.digest == hKettles + "#1", "the click landed, so the step must end ok on the page it left: outcome %q digest %q", step.outcome, step.digest);
   driver.drop = 1;
   step = runAction(sid, "w-1", Action{"click", "#confirm", ""});
   ctx.Assert(driver.applied == 2 && step.outcome == "ok", "a click the driver refused before touching the page left %d applied actions and outcome %q: the digest is unchanged, so one more Act is safe", driver.applied, step.outcome);
+  driver.lose_reply = 1;
+  driver.lose_code = grpc::StatusCode::UNAVAILABLE;
+  step = runAction(sid, "w-1", Action{"click", "#pay", ""});
+  ctx.Assert(driver.applied == 3 && step.outcome == "ok", "a click applied before its reply was lost as UNAVAILABLE left %d applied actions (expected 3) and outcome %q: UNAVAILABLE is checked against Snapshot too", driver.applied, step.outcome);
+  // The one further Act is sent once: its own lost reply is not replayed blindly.
+  driver.drop = 1;
+  driver.lose_reply = 1;
+  driver.lose_code = grpc::StatusCode::DEADLINE_EXCEEDED;
+  runAction(sid, "w-1", Action{"click", "#submit", ""});
+  ctx.Assert(driver.applied == 4, "after a refused click and a replay whose reply was lost the page applied %d clicks: the replay is sent once, never through a blind retry", driver.applied - 3);
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"}, {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t snapshots = ctx.GRPC.CallsTo("Snapshot").size();
+    driver.drop = 1;
+    driver.drop_code = code;
+    step = runAction(sid, "w-1", Action{"click", "#gone", ""});
+    ctx.Assert(driver.applied == 4 && step.outcome == "failed", "a click the driver refused with %s left %d extra applied actions and outcome %q: only UNAVAILABLE and DEADLINE_EXCEEDED may have lost a reply; %s ends the action failed", name, driver.applied - 4, step.outcome, name);
+    ctx.Assert(ctx.GRPC.CallsTo("Snapshot").size() == snapshots, "a click refused with %s was followed by Snapshot: only UNAVAILABLE and DEADLINE_EXCEEDED are checked against the page", name);
+  }
 }
 
 void CheckRedirectHops(harness::Ctx& ctx) {
   std::string sid;
-  DriverPeer& driver = world(ctx, sid);
-  driver.redirects["https://www.example.com/login"] = kMetadata;
-  driver.redirects["https://www.example.com/old-kettles"] = kWiki;
-  auto step = runAction(sid, "w-1", Action{"navigate", "https://www.example.com/login", ""});
-  std::vector<std::string> sent;
-  for (const auto& c : ctx.GRPC.CallsTo("Navigate")) sent.push_back(c.Request<browseragent::NavigateRequest>().url());
-  for (const auto& url : sent) ctx.Assert(url != kMetadata, "the browser was sent to %q: /login redirected to the metadata address and nothing authorized that hop", sent);
-  ctx.Assert(step.outcome == "blocked" && !step.reason.empty(), "a redirect outside the profile must end the action blocked with a reason, got outcome %q", step.outcome);
-  ctx.Equal(sessions::loadSession(sid)->current_url, kEntry, "a blocked navigation must leave the session on its page; current_url");
-  step = runAction(sid, "w-1", Action{"navigate", "https://www.example.com/old-kettles", ""});
-  ctx.Assert(step.outcome == "ok" && step.url == kWiki, "a redirect to a host the profile allows must be followed, got outcome %q url %q", step.outcome, step.url);
-  ctx.Equal(sessions::loadSession(sid)->current_url, kWiki, "the session must record the page the redirect ended on; current_url");
+  HDriverPeer& driver = hWorld(ctx, sid);
+  driver.redirects["https://www.example.com/login"] = hMetadata;
+  driver.redirects["https://www.example.com/old-kettles"] = hWiki;
+  driver.redirects["https://www.example.com/promo"] = "https://www.example.com/sso";
+  driver.redirects["https://www.example.com/sso"] = hMetadata;
+  driver.redirects["https://www.example.com/checkout"] = hPlain;
+  struct HCase {
+    std::string target, refused, label;
+  };
+  const std::vector<HCase> cases = {
+      {hMetadata, hMetadata, "the metadata address itself"},
+      {"https://www.example.com/login", hMetadata, "/login, which redirects to the metadata address"},
+      {"https://www.example.com/promo", hMetadata, "/promo, whose second hop goes to the metadata address"},
+      {"https://www.example.com/checkout", hPlain, "/checkout, which redirects to plain http on the same host"},
+  };
+  for (const auto& tc : cases) {
+    const auto step = runAction(sid, "w-1", Action{"navigate", tc.target, ""});
+    std::vector<std::string> sent;
+    for (const auto& c : ctx.GRPC.CallsTo("Navigate")) sent.push_back(c.Request<browseragent::NavigateRequest>().url());
+    for (const auto& url : sent) ctx.Assert(url != tc.refused, "navigating to %s sent the browser to %q: authorize every URL, the first and each hop, before Navigate goes there", tc.label, sent);
+    ctx.Assert(step.outcome == "blocked" && !step.reason.empty(), "navigating to %s must end the action blocked with a reason, got outcome %q", tc.label, step.outcome);
+  }
+  ctx.Equal(sessions::loadSession(sid)->current_url, hEntry, "a blocked navigation must leave the session on its page; current_url");
+  const auto step = runAction(sid, "w-1", Action{"navigate", "https://www.example.com/old-kettles", ""});
+  ctx.Assert(step.outcome == "ok" && step.url == hWiki, "a redirect to a host the profile allows must be followed, got outcome %q url %q", step.outcome, step.url);
+  ctx.Equal(sessions::loadSession(sid)->current_url, hWiki, "the session must record the page the redirect ended on; current_url");
 }
 `,
   },

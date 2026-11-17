@@ -48,7 +48,7 @@ commit and the increment drops an event from the rollup.
       id: 'per-service',
       title: 'One event per service, counts only',
       detail:
-        'The spans are grouped by service and each group is one event `{trace_id, service, span_count, max_ms}`; the starter produces an event per span, each carrying the span itself into a topic that retains it.',
+        "The spans are grouped by service and each group is one event `{trace_id, service, span_count, max_ms}`, `max_ms` the longest of that service's spans; the starter produces an event per span, each carrying the span itself into a topic that retains it.",
       match: {
         python: {all: [/span_count/, /max_ms/], none: [/["']span["']\s*:/]},
         typescript: {all: [/span_count/, /max_ms/], none: [/\bspan\s*\}|\bspan:\s*span\b/]},
@@ -96,7 +96,7 @@ commit and the increment drops an event from the rollup.
       id: 'counters-before-commit',
       title: 'HINCRBY before the offset commit',
       detail:
-        'The rollup increments `rollup:{service}` and only then commits the offset: a crash in between redelivers the event instead of losing it.',
+        'The rollup increments both fields of `rollup:{service}` and only then commits the offset: a crash in between redelivers the event instead of losing it, and an increment that fails leaves its offset uncommitted.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -781,8 +781,9 @@ def _trace(trace_id, spans):
 
 A = _trace(TRACE_A, [
     _span(TRACE_A, "00f067aa0ba902b7", "", "checkout", 412),
-    _span(TRACE_A, "00f067aa0ba902b8", "00f067aa0ba902b7", "payments", 120),
-    _span(TRACE_A, "00f067aa0ba902b9", "00f067aa0ba902b7", "payments", 95),
+    _span(TRACE_A, "00f067aa0ba902b8", "00f067aa0ba902b7", "payments", 95),
+    _span(TRACE_A, "00f067aa0ba902b9", "00f067aa0ba902b7", "payments", 120),
+    _span(TRACE_A, "00f067aa0ba902ba", "00f067aa0ba902b7", "payments", 80),
 ])
 B = _trace(TRACE_B, [
     _span(TRACE_B, "10f067aa0ba902b7", "", "checkout", 300),
@@ -801,7 +802,7 @@ def check_per_service(ctx):
     assert len(events) == 2, f"a trace with spans in checkout and payments produced {len(events)} records on {TOPIC}, expected one per service"
     want = [
         {"trace_id": TRACE_A, "service": "checkout", "span_count": 1, "max_ms": 412},
-        {"trace_id": TRACE_A, "service": "payments", "span_count": 2, "max_ms": 120},
+        {"trace_id": TRACE_A, "service": "payments", "span_count": 3, "max_ms": 120},
     ]
     assert events == want, f"the events must be {want}, with no span in them; got {events}"
 
@@ -835,21 +836,33 @@ def check_idempotent_acks(ctx):
 
 
 def check_counters_before_commit(ctx):
+    # One partition, in this order; the last record's increment fails: rollup:search is not a hash.
     for event in (
         {"trace_id": TRACE_A, "service": "checkout", "span_count": 1, "max_ms": 412},
         {"trace_id": TRACE_A, "service": "payments", "span_count": 2, "max_ms": 120},
         {"trace_id": TRACE_B, "service": "checkout", "span_count": 1, "max_ms": 300},
+        {"trace_id": TRACE_B, "service": "search", "span_count": 1, "max_ms": 40},
     ):
-        ctx.kafka.seed(TOPIC, key=event["service"], value=json.dumps(event))
+        ctx.kafka.seed(TOPIC, key=event["service"], value=json.dumps(event), partition=0)
+    ctx.redis.set("rollup:search", "not-a-hash")
     at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(sum(int(ctx.redis.hget(k, "traces") or 0) for k in ctx.redis.keys("rollup:*"))))
+
+    def counted(field):
+        return sum(int(ctx.redis.hget(f"rollup:{s}", field) or 0) for s in ("checkout", "payments"))
+
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((counted("traces"), counted("spans"))))
     m = ctx.load("events")
-    ctx.drain(m.run_rollup)
+    try:
+        ctx.drain(m.run_rollup)
+    except Exception:  # noqa: BLE001 - the failed increment may end the consumer; the offsets are the verdict
+        pass
     assert at_commit, "the rollup never committed an offset"
-    assert at_commit[0] >= 1, "at the first commit no event had been counted yet: the increment must come before the commit, or a crash in between loses the event"
+    assert at_commit[0][0] >= 1 and at_commit[0][1] >= 1, f"at the first commit the rollup had counted traces {at_commit[0][0]} and spans {at_commit[0][1]}: both increments must come before the commit, or a crash in between loses the event"
     assert ctx.redis.hgetall("rollup:checkout") == {"traces": "2", "spans": "2"}, f"rollup:checkout is {ctx.redis.hgetall('rollup:checkout')}, expected traces 2, spans 2"
     assert ctx.redis.hgetall("rollup:payments") == {"traces": "1", "spans": "2"}, f"rollup:payments is {ctx.redis.hgetall('rollup:payments')}, expected traces 1, spans 2"
-    assert ctx.kafka.lag("latency-rollup", TOPIC) == 0, "every counted event must be committed by group latency-rollup"
+    lag = ctx.kafka.lag("latency-rollup", TOPIC)
+    assert lag <= 1, f"the lag of group latency-rollup is {lag}: every event whose increments succeeded must be committed"
+    assert lag == 1, "the increment of the search event failed (WRONGTYPE) and its offset was committed anyway: the event is lost from the rollup for good. Commit only after both increments succeeded"
 `,
     typescript: `const TOPIC = 'trace.completed';
 const TRACE_A = '4bf92f3577b34da6a3ce929d0e0e4736';
@@ -860,8 +873,9 @@ const trace = (trace_id: string, spans) => ({trace_id, owner: 'acme', root: span
 
 const A = trace(TRACE_A, [
   span(TRACE_A, '00f067aa0ba902b7', '', 'checkout', 412),
-  span(TRACE_A, '00f067aa0ba902b8', '00f067aa0ba902b7', 'payments', 120),
-  span(TRACE_A, '00f067aa0ba902b9', '00f067aa0ba902b7', 'payments', 95),
+  span(TRACE_A, '00f067aa0ba902b8', '00f067aa0ba902b7', 'payments', 95),
+  span(TRACE_A, '00f067aa0ba902b9', '00f067aa0ba902b7', 'payments', 120),
+  span(TRACE_A, '00f067aa0ba902ba', '00f067aa0ba902b7', 'payments', 80),
 ]);
 const B = trace(TRACE_B, [span(TRACE_B, '10f067aa0ba902b7', '', 'checkout', 300), span(TRACE_B, '10f067aa0ba902b8', '10f067aa0ba902b7', 'payments', 80)]);
 
@@ -874,7 +888,7 @@ export async function check_per_service(ctx) {
   assert.equal(got.length, 2, \`a trace with spans in checkout and payments produced \${got.length} records on \${TOPIC}, expected one per service\`);
   const want = [
     {trace_id: TRACE_A, service: 'checkout', span_count: 1, max_ms: 412},
-    {trace_id: TRACE_A, service: 'payments', span_count: 2, max_ms: 120},
+    {trace_id: TRACE_A, service: 'payments', span_count: 3, max_ms: 120},
   ];
   assert.deepStrictEqual(got, want, \`the events must be \${JSON.stringify(want)}, with no span in them; got \${JSON.stringify(got)}\`);
 }
@@ -910,22 +924,32 @@ export async function check_idempotent_acks(ctx) {
 }
 
 export async function check_counters_before_commit(ctx) {
+  // One partition, in this order; the last record's increment fails: rollup:search is not a hash.
   for (const event of [
     {trace_id: TRACE_A, service: 'checkout', span_count: 1, max_ms: 412},
     {trace_id: TRACE_A, service: 'payments', span_count: 2, max_ms: 120},
     {trace_id: TRACE_B, service: 'checkout', span_count: 1, max_ms: 300},
+    {trace_id: TRACE_B, service: 'search', span_count: 1, max_ms: 40},
   ]) {
-    ctx.kafka.seed(TOPIC, {key: event.service, value: JSON.stringify(event)});
+    ctx.kafka.seed(TOPIC, {key: event.service, value: JSON.stringify(event), partition: 0});
   }
-  const atCommit: number[] = [];
-  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.keys('rollup:*').reduce((n: number, k: string) => n + Number(ctx.redis.hget(k, 'traces') ?? 0), 0)));
+  ctx.redis.set('rollup:search', 'not-a-hash');
+  const counted = (field: string) => ['checkout', 'payments'].reduce((n, s) => n + Number(ctx.redis.hget(\`rollup:\${s}\`, field) ?? 0), 0);
+  const atCommit: [number, number][] = [];
+  ctx.kafka.onCommit(() => atCommit.push([counted('traces'), counted('spans')]));
   const m = ctx.load('events');
-  await ctx.drain(m.runRollup());
+  try {
+    await ctx.drain(m.runRollup());
+  } catch {
+    // The failed increment may end the consumer; the offsets are the verdict.
+  }
   assert(atCommit.length > 0, 'the rollup never committed an offset');
-  assert(atCommit[0] >= 1, 'at the first commit no event had been counted yet: the increment must come before the commit, or a crash in between loses the event');
+  assert(atCommit[0][0] >= 1 && atCommit[0][1] >= 1, \`at the first commit the rollup had counted traces \${atCommit[0][0]} and spans \${atCommit[0][1]}: both increments must come before the commit, or a crash in between loses the event\`);
   assert.deepStrictEqual(ctx.redis.hgetall('rollup:checkout'), {traces: '2', spans: '2'}, \`rollup:checkout is \${JSON.stringify(ctx.redis.hgetall('rollup:checkout'))}, expected traces 2, spans 2\`);
   assert.deepStrictEqual(ctx.redis.hgetall('rollup:payments'), {traces: '1', spans: '2'}, \`rollup:payments is \${JSON.stringify(ctx.redis.hgetall('rollup:payments'))}, expected traces 1, spans 2\`);
-  assert.equal(ctx.kafka.lag('latency-rollup', TOPIC), 0, 'every counted event must be committed by group latency-rollup');
+  const lag = ctx.kafka.lag('latency-rollup', TOPIC);
+  assert(lag <= 1, \`the lag of group latency-rollup is \${lag}: every event whose increments succeeded must be committed\`);
+  assert.equal(lag, 1, 'the increment of the search event failed (WRONGTYPE) and its offset was committed anyway: the event is lost from the rollup for good. Commit only after both increments succeeded');
 }
 `,
     go: `package main
@@ -958,8 +982,9 @@ func evTrace(traceID string, spans ...assembly.Span) *assembly.Trace {
 func traceA() *assembly.Trace {
 	return evTrace(evTraceA,
 		assembly.Span{SpanID: "00f067aa0ba902b7", Service: "checkout", DurationMs: 412},
-		assembly.Span{SpanID: "00f067aa0ba902b8", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 120},
-		assembly.Span{SpanID: "00f067aa0ba902b9", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 95})
+		assembly.Span{SpanID: "00f067aa0ba902b8", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 95},
+		assembly.Span{SpanID: "00f067aa0ba902b9", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 120},
+		assembly.Span{SpanID: "00f067aa0ba902ba", ParentSpanID: "00f067aa0ba902b7", Service: "payments", DurationMs: 80})
 }
 
 func traceB() *assembly.Trace {
@@ -991,7 +1016,7 @@ func CheckPerService(ctx *harness.Ctx) {
 	sort.Slice(events, func(i, j int) bool { return events[i]["service"].(string) < events[j]["service"].(string) })
 	want := []map[string]any{
 		{"trace_id": evTraceA, "service": "checkout", "span_count": 1, "max_ms": 412},
-		{"trace_id": evTraceA, "service": "payments", "span_count": 2, "max_ms": 120},
+		{"trace_id": evTraceA, "service": "payments", "span_count": 3, "max_ms": 120},
 	}
 	ctx.Equal(events, want, "the events, with no span in them")
 }
@@ -1029,30 +1054,39 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 }
 
 func CheckCountersBeforeCommit(ctx *harness.Ctx) {
-	for _, e := range []completedEvent{
-		{TraceID: evTraceA, Service: "checkout", SpanCount: 1, MaxMs: 412},
-		{TraceID: evTraceA, Service: "payments", SpanCount: 2, MaxMs: 120},
-		{TraceID: evTraceB, Service: "checkout", SpanCount: 1, MaxMs: 300},
+	// One partition, in this order; the last record's increment fails: rollup:search is not a hash.
+	for _, e := range []map[string]any{
+		{"trace_id": evTraceA, "service": "checkout", "span_count": 1, "max_ms": 412},
+		{"trace_id": evTraceA, "service": "payments", "span_count": 2, "max_ms": 120},
+		{"trace_id": evTraceB, "service": "checkout", "span_count": 1, "max_ms": 300},
+		{"trace_id": evTraceB, "service": "search", "span_count": 1, "max_ms": 40},
 	} {
 		value, _ := json.Marshal(e)
-		ctx.Kafka.Seed(evTopic, e.Service, string(value))
+		ctx.Kafka.SeedPartition(evTopic, 0, e["service"], string(value))
 	}
-	var atCommit []int
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+	ctx.Redis.Set("rollup:search", "not-a-hash")
+	evCounted := func(field string) int {
 		total := 0
-		for _, k := range ctx.Redis.Keys("rollup:*") {
-			v, _ := ctx.Redis.HGet(k, "traces")
+		for _, s := range []string{"checkout", "payments"} {
+			v, _ := ctx.Redis.HGet("rollup:"+s, field)
 			n, _ := strconv.Atoi(v)
 			total += n
 		}
-		atCommit = append(atCommit, total)
+		return total
+	}
+	var atCommit [][2]int
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		atCommit = append(atCommit, [2]int{evCounted("traces"), evCounted("spans")})
 	})
+	// The failed increment may end the consumer; the offsets are the verdict.
 	ctx.Drain(func() { runRollup(context.Background()) })
 	ctx.Assert(len(atCommit) > 0, "the rollup never committed an offset")
-	ctx.Assert(atCommit[0] >= 1, "at the first commit no event had been counted yet: the increment must come before the commit, or a crash in between loses the event")
+	ctx.Assert(atCommit[0][0] >= 1 && atCommit[0][1] >= 1, "at the first commit the rollup had counted traces %d and spans %d: both increments must come before the commit, or a crash in between loses the event", atCommit[0][0], atCommit[0][1])
 	ctx.Equal(ctx.Redis.HGetAll("rollup:checkout"), map[string]string{"traces": "2", "spans": "2"}, "rollup:checkout")
 	ctx.Equal(ctx.Redis.HGetAll("rollup:payments"), map[string]string{"traces": "1", "spans": "2"}, "rollup:payments")
-	ctx.Equal(ctx.Kafka.Lag("latency-rollup", evTopic), 0, "every counted event must be committed by group latency-rollup; the lag")
+	lag := ctx.Kafka.Lag("latency-rollup", evTopic)
+	ctx.Assert(lag <= 1, "the lag of group latency-rollup is %d: every event whose increments succeeded must be committed", lag)
+	ctx.Assert(lag == 1, "the increment of the search event failed (WRONGTYPE) and its offset was committed anyway: the event is lost from the rollup for good. Commit only after both increments succeeded")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1083,8 +1117,9 @@ assembly::Trace evTrace(const std::string& trace_id, std::vector<assembly::Span>
 
 assembly::Trace traceA() {
   return evTrace(kTraceA, {{"", "00f067aa0ba902b7", "", "checkout", 0, 412},
-                           {"", "00f067aa0ba902b8", "00f067aa0ba902b7", "payments", 0, 120},
-                           {"", "00f067aa0ba902b9", "00f067aa0ba902b7", "payments", 0, 95}});
+                           {"", "00f067aa0ba902b8", "00f067aa0ba902b7", "payments", 0, 95},
+                           {"", "00f067aa0ba902b9", "00f067aa0ba902b7", "payments", 0, 120},
+                           {"", "00f067aa0ba902ba", "00f067aa0ba902b7", "payments", 0, 80}});
 }
 
 assembly::Trace traceB() {
@@ -1097,7 +1132,7 @@ std::vector<nlohmann::json> evEvents(harness::Ctx& ctx) {
   return out;
 }
 
-void publish(harness::Ctx& ctx, const assembly::Trace& trace) {
+void evPublish(harness::Ctx& ctx, const assembly::Trace& trace) {
   publish_completed(trace);
   ctx.Settle();
 }
@@ -1105,20 +1140,20 @@ void publish(harness::Ctx& ctx, const assembly::Trace& trace) {
 }  // namespace
 
 void CheckPerService(harness::Ctx& ctx) {
-  publish(ctx, traceA());
+  evPublish(ctx, traceA());
   auto events = evEvents(ctx);
   ctx.Equal(events.size(), 2, "a trace with spans in checkout and payments must produce one record per service on %s; the records", kTopic2);
   std::sort(events.begin(), events.end(), [](const nlohmann::json& a, const nlohmann::json& b) { return a.value("service", "") < b.value("service", ""); });
   const std::vector<nlohmann::json> want = {
       {{"trace_id", kTraceA}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 412}},
-      {{"trace_id", kTraceA}, {"service", "payments"}, {"span_count", 2}, {"max_ms", 120}},
+      {{"trace_id", kTraceA}, {"service", "payments"}, {"span_count", 3}, {"max_ms", 120}},
   };
   ctx.Assert(events == want, "the events must be %s, with no span in them; got %s", nlohmann::json(want).dump(), nlohmann::json(events).dump());
 }
 
 void CheckServiceKey(harness::Ctx& ctx) {
-  publish(ctx, traceA());
-  publish(ctx, traceB());
+  evPublish(ctx, traceA());
+  evPublish(ctx, traceB());
   const auto records = ctx.Kafka.Records(kTopic2);
   ctx.Assert(!records.empty(), "nothing was produced on %s", kTopic2);
   std::map<std::string, std::set<int>> partitions;
@@ -1133,13 +1168,13 @@ void CheckServiceKey(harness::Ctx& ctx) {
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic2, 1);
-  publish(ctx, traceA());
+  evPublish(ctx, traceA());
   auto values = ctx.Kafka.Values(kTopic2);
   const size_t before = values.size();
   std::sort(values.begin(), values.end());
   ctx.Assert(std::adjacent_find(values.begin(), values.end()) == values.end(),
              "after one produce whose acknowledgement was lost %s holds the same event twice: the producer's retry wrote it again. Enable idempotence so the broker recognises the retry", kTopic2);
-  publish(ctx, traceB());
+  evPublish(ctx, traceB());
   ctx.Kafka.Failover(kTopic2);
   bool found = false;
   for (const auto& e : evEvents(ctx)) found = found || (e.is_object() && e.value("trace_id", "") == kTraceB);
@@ -1147,25 +1182,37 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
 }
 
 void CheckCountersBeforeCommit(harness::Ctx& ctx) {
+  // One partition, in this order; the last record's increment fails: rollup:search is not a hash.
   for (const nlohmann::json& e : std::vector<nlohmann::json>{
            {{"trace_id", kTraceA}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 412}},
            {{"trace_id", kTraceA}, {"service", "payments"}, {"span_count", 2}, {"max_ms", 120}},
            {{"trace_id", kTraceB}, {"service", "checkout"}, {"span_count", 1}, {"max_ms", 300}},
+           {{"trace_id", kTraceB}, {"service", "search"}, {"span_count", 1}, {"max_ms", 40}},
        }) {
-    ctx.Kafka.Seed(kTopic2, e["service"].get<std::string>(), e.dump());
+    ctx.Kafka.SeedPartition(kTopic2, 0, e["service"].get<std::string>(), e.dump());
   }
-  std::vector<long long> atCommit;
-  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+  ctx.Redis.Set("rollup:search", "not-a-hash");
+  const auto counted = [&ctx](const std::string& field) {
     long long total = 0;
-    for (const auto& k : ctx.Redis.Keys("rollup:*")) total += std::stoll(ctx.Redis.HGet(k, "traces").value_or("0"));
-    atCommit.push_back(total);
-  });
-  ctx.Drain([] { run_rollup(); });
+    for (const std::string s : {"checkout", "payments"}) total += std::stoll(ctx.Redis.HGet("rollup:" + s, field).value_or("0"));
+    return total;
+  };
+  std::vector<std::pair<long long, long long>> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.emplace_back(counted("traces"), counted("spans")); });
+  try {
+    ctx.Drain([] { run_rollup(); });
+  } catch (const std::exception&) {
+    // The failed increment may end the consumer; the offsets are the verdict.
+  }
   ctx.Assert(!atCommit.empty(), "the rollup never committed an offset");
-  ctx.Assert(atCommit[0] >= 1, "at the first commit no event had been counted yet: the increment must come before the commit, or a crash in between loses the event");
+  ctx.Assert(atCommit[0].first >= 1 && atCommit[0].second >= 1,
+             "at the first commit the rollup had counted traces %v and spans %v: both increments must come before the commit, or a crash in between loses the event", atCommit[0].first,
+             atCommit[0].second);
   ctx.Equal(ctx.Redis.HGetAll("rollup:checkout"), std::map<std::string, std::string>{{"traces", "2"}, {"spans", "2"}}, "rollup:checkout");
   ctx.Equal(ctx.Redis.HGetAll("rollup:payments"), std::map<std::string, std::string>{{"traces", "1"}, {"spans", "2"}}, "rollup:payments");
-  ctx.Equal(ctx.Kafka.Lag("latency-rollup", kTopic2), 0, "every counted event must be committed by group latency-rollup; the lag");
+  const auto lag = ctx.Kafka.Lag("latency-rollup", kTopic2);
+  ctx.Assert(lag <= 1, "the lag of group latency-rollup is %v: every event whose increments succeeded must be committed", lag);
+  ctx.Assert(lag == 1, "the increment of the search event failed (WRONGTYPE) and its offset was committed anyway: the event is lost from the rollup for good. Commit only after both increments succeeded");
 }
 `,
   },

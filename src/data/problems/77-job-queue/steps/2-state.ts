@@ -22,8 +22,8 @@ workers run it at once; a completed job comes back after its deadline and runs a
 
 - \`claim\` is one Lua script: \`LPOP\`, \`ZADD jobs:inflight <deadline> <id>\` and
   \`HSET job:{id} state running worker … deadline_ms …\`.
-- \`return_expired\` is one script that requeues a member only when its \`ZREM\` returned 1, sets
-  \`state = queued\` and clears \`worker\` and \`deadline_ms\`.
+- \`return_expired\` is one script that requeues a member at the head of \`jobs:queue\` only when its
+  \`ZREM\` returned 1, sets \`state = queued\` and clears \`worker\` and \`deadline_ms\`.
 - \`ack\` also \`ZREM\`s the job from \`jobs:inflight\` and answers false when the claim is gone.`,
   sequence: {
     participants: ['Worker', 'Reaper', 'Redis'],
@@ -63,7 +63,7 @@ workers run it at once; a completed job comes back after its deadline and runs a
       id: 'atomic-claim',
       title: 'Pops and records the claim in one script',
       detail:
-        'At every instant the claimed job is on `jobs:queue` or in `jobs:inflight`: the check looks right after your first command on `jobs:queue`. The starter pops with a client `LPOP` and writes the claim afterwards, so in between the job is nowhere.',
+        'At every instant the claimed job is on `jobs:queue` or in `jobs:inflight`, and once it is in `jobs:inflight` its record says `running` with the worker: the check looks right after your first command on `jobs:queue`. The starter pops with a client `LPOP` and writes the claim afterwards, so in between the job is nowhere.',
       match: {
         python: {all: [/redis\.call\(\s*['"]LPOP['"]/, /register_script\(|\.eval\(/], none: [/\br\.lpop\(/]},
         typescript: {all: [/redis\.call\(\s*['"]LPOP['"]/, /defineCommand\(|\.eval\(/], none: [/redis\.lpop\(/]},
@@ -76,7 +76,7 @@ workers run it at once; a completed job comes back after its deadline and runs a
       id: 'single-return',
       title: 'An expired claim is requeued once, guarded by its ZREM',
       detail:
-        'A second reaper returns the same expired claim right after your first command on `jobs:inflight`; afterwards the job is on `jobs:queue` exactly once. The starter pushes every member it read, whether or not another reaper already took it.',
+        'A second reaper returns the same expired claim right after your first command on `jobs:inflight`; afterwards the job is on `jobs:queue` exactly once. On a later return the job is on one of the two structures after every command your reaper sends to `jobs:inflight`, goes back at the head of `jobs:queue`, and its record is `queued` with no `worker` or `deadline_ms`. The starter pushes every member it read, whether or not another reaper already took it.',
       match: {
         python: {all: [/redis\.call\(\s*['"]ZREM['"][^)]*\)\s*==\s*1/], none: [/\br\.lpush\(/]},
         typescript: {all: [/redis\.call\(\s*['"]ZREM['"][^)]*\)\s*==\s*1/], none: [/redis\.lpush\(/]},
@@ -723,10 +723,13 @@ def check_claim_deadline(ctx):
 def check_atomic_claim(ctx):
     m = ctx.load("state")
     a = _job(1)
-    probe = ctx.redis_after("jobs:queue", lambda: _where(ctx, a))
+    probe = ctx.redis_after("jobs:queue", lambda: (_where(ctx, a), store.get_job(a)))
     assert m.claim("w-1") == a, f"the claim must hand out {a}"
     assert probe.fired, "claim never touched jobs:queue"
-    assert probe.result, f"right after your first command on jobs:queue, {a} was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script"
+    places, job = probe.result
+    assert places, f"right after your first command on jobs:queue, {a} was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script"
+    if places == ["jobs:inflight"]:
+        assert job["state"] == "running" and job["worker"] == "w-1", f"right after your first command on jobs:queue, {a} was in jobs:inflight but job:{a} was {job}: a worker that dies there leaves a claimed job the record calls queued. Write the record in the claim's script"
     assert _where(ctx, a) == ["jobs:inflight"], f"after the claim {a} is in {_where(ctx, a)}, expected jobs:inflight only"
 
 
@@ -748,11 +751,26 @@ def check_single_return(ctx):
     copies = ctx.redis.lrange("jobs:queue", 0, -1).count(a)
     assert copies == 1, f"two reapers returned one expired claim and jobs:queue now holds {a} {copies} times: two workers will run it at once. Requeue a member only when your ZREM removed it"
     assert m.claim("w-2") == a, f"the returned job must be claimable again"
+    b = _job(2)
     ctx.clock.advance(61)
-    assert m.return_expired() == [a], f"one expired claim must be returned once"
+    seen = []
+    watching = [True]
+
+    def watch():
+        # Where the job is right after each of the reaper's commands on jobs:inflight.
+        if watching[0]:
+            seen.append(_where(ctx, a))
+            ctx.redis_after("jobs:inflight", watch)
+
+    ctx.redis_after("jobs:inflight", watch)
+    returned = m.return_expired()
+    watching[0] = False
+    assert returned == [a], f"one expired claim must be returned once, got {returned}"
+    assert [] not in seen, f"right after one of your commands on jobs:inflight, {a} was on neither jobs:queue nor jobs:inflight (places seen {seen}): a reaper that dies there loses the job. Remove and requeue in one script"
+    assert ctx.redis.lrange("jobs:queue", 0, -1) == [a, b], f"jobs:queue after the return is {ctx.redis.lrange('jobs:queue', 0, -1)}: an expired claim goes back at the head, ahead of {b}"
     assert m.return_expired() == [], "a second pass must find nothing to return"
     job = store.get_job(a)
-    assert job["state"] == "queued" and job["worker"] is None, f"a returned job must be queued with no worker, got {job}"
+    assert job["state"] == "queued" and job["worker"] is None and job["deadline_ms"] is None, f"a returned job must be queued with no worker and no deadline_ms, got {job}"
 
 
 def check_ack_clears_claim(ctx):
@@ -804,10 +822,14 @@ export async function check_claim_deadline(ctx) {
 export async function check_atomic_claim(ctx) {
   const {m, store} = await setup(ctx);
   const a = await job(store, 1);
-  const probe = ctx.redisAfter('jobs:queue', () => where(ctx, a));
+  const probe = ctx.redisAfter('jobs:queue', () => ({places: where(ctx, a), record: ctx.redis.hgetall(\`job:\${a}\`)}));
   assert.equal(await m.claim('w-1'), a, \`the claim must hand out \${a}\`);
   assert(probe.fired, 'claim never touched jobs:queue');
-  assert(probe.result.length > 0, \`right after your first command on jobs:queue, \${a} was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script\`);
+  const {places, record} = probe.result;
+  assert(places.length > 0, \`right after your first command on jobs:queue, \${a} was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script\`);
+  if (places.length === 1 && places[0] === 'jobs:inflight') {
+    assert(record.state === 'running' && record.worker === 'w-1', \`right after your first command on jobs:queue, \${a} was in jobs:inflight but job:\${a} was \${JSON.stringify(record)}: a worker that dies there leaves a claimed job the record calls queued. Write the record in the claim's script\`);
+  }
   assert.deepEqual(where(ctx, a), ['jobs:inflight'], \`after the claim \${a} is in \${JSON.stringify(where(ctx, a))}, expected jobs:inflight only\`);
 }
 
@@ -828,11 +850,25 @@ export async function check_single_return(ctx) {
   const copies = ctx.redis.lrange('jobs:queue', 0, -1).filter(id => id === a).length;
   assert.equal(copies, 1, \`two reapers returned one expired claim and jobs:queue now holds \${a} \${copies} times: two workers will run it at once. Requeue a member only when your ZREM removed it\`);
   assert.equal(await m.claim('w-2'), a, 'the returned job must be claimable again');
+  const b = await job(store, 2);
   ctx.clock.advance(61);
-  assert.deepEqual(await m.returnExpired(), [a], 'one expired claim must be returned once');
+  const seen: string[][] = [];
+  let watching = true;
+  const watch = () => {
+    // Where the job is right after each of the reaper's commands on jobs:inflight.
+    if (!watching) return;
+    seen.push(where(ctx, a));
+    ctx.redisAfter('jobs:inflight', watch);
+  };
+  ctx.redisAfter('jobs:inflight', watch);
+  const returned = await m.returnExpired();
+  watching = false;
+  assert.deepEqual(returned, [a], \`one expired claim must be returned once, got \${JSON.stringify(returned)}\`);
+  assert(seen.every(places => places.length > 0), \`right after one of your commands on jobs:inflight, \${a} was on neither jobs:queue nor jobs:inflight (places seen \${JSON.stringify(seen)}): a reaper that dies there loses the job. Remove and requeue in one script\`);
+  assert.deepEqual(ctx.redis.lrange('jobs:queue', 0, -1), [a, b], \`jobs:queue after the return is \${JSON.stringify(ctx.redis.lrange('jobs:queue', 0, -1))}: an expired claim goes back at the head, ahead of \${b}\`);
   assert.deepEqual(await m.returnExpired(), [], 'a second pass must find nothing to return');
   const record = await store.getJob(a);
-  assert(record.state === 'queued' && record.worker === null, \`a returned job must be queued with no worker, got \${JSON.stringify(record)}\`);
+  assert(record.state === 'queued' && record.worker === null && record.deadline_ms === null, \`a returned job must be queued with no worker and no deadline_ms, got \${JSON.stringify(record)}\`);
 }
 
 export async function check_ack_clears_claim(ctx) {
@@ -912,11 +948,18 @@ func CheckClaimDeadline(ctx *harness.Ctx) {
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
 	a := stateJob(ctx, 1)
-	probe := ctx.Redis.After("jobs:queue", func() any { return stateWhere(ctx, a) })
+	var record map[string]string
+	probe := ctx.Redis.After("jobs:queue", func() any {
+		record = ctx.Redis.HGetAll("job:" + a)
+		return stateWhere(ctx, a)
+	})
 	ctx.Equal(stateClaim(ctx, "w-1"), a, "the claim")
 	ctx.Assert(probe.Fired, "claim never touched jobs:queue")
 	places, _ := probe.Result.([]string)
 	ctx.Assert(len(places) > 0, "right after your first command on jobs:queue, %s was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script", a)
+	if len(places) == 1 && places[0] == "jobs:inflight" {
+		ctx.Assert(record["state"] == "running" && record["worker"] == "w-1", "right after your first command on jobs:queue, %s was in jobs:inflight but job:%s was %v: a worker that dies there leaves a claimed job the record calls queued. Write the record in the claim's script", a, a, record)
+	}
 	ctx.Equal(stateWhere(ctx, a), []string{"jobs:inflight"}, "where the job is after the claim")
 }
 
@@ -938,13 +981,33 @@ func CheckSingleReturn(ctx *harness.Ctx) {
 	copies := stateCopies(ctx, a)
 	ctx.Assert(copies == 1, "two reapers returned one expired claim and jobs:queue now holds %s %d times: two workers will run it at once. Requeue a member only when your ZREM removed it", a, copies)
 	ctx.Equal(stateClaim(ctx, "w-2"), a, "the returned job must be claimable again; the claim")
+	b := stateJob(ctx, 2)
 	ctx.Clock.Advance(61)
+	var seen [][]string
+	watching := true
+	var watch func() any
+	watch = func() any {
+		// Where the job is right after each of the reaper's commands on jobs:inflight.
+		if watching {
+			seen = append(seen, stateWhere(ctx, a))
+			ctx.Redis.After("jobs:inflight", watch)
+		}
+		return nil
+	}
+	ctx.Redis.After("jobs:inflight", watch)
 	first, _ := returnExpired(stateBg)
+	watching = false
 	ctx.Equal(first, []string{a}, "one expired claim must be returned once")
+	lost := false
+	for _, places := range seen {
+		lost = lost || len(places) == 0
+	}
+	ctx.Assert(!lost, "right after one of your commands on jobs:inflight, %s was on neither jobs:queue nor jobs:inflight (places seen %v): a reaper that dies there loses the job. Remove and requeue in one script", a, seen)
+	ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), []string{a, b}, "an expired claim goes back at the head, ahead of "+b+"; jobs:queue after the return")
 	second, _ := returnExpired(stateBg)
 	ctx.Equal(len(second), 0, "a second pass must find nothing to return; returned")
 	job := store.GetJob(stateBg, a)
-	ctx.Assert(job.State == "queued" && job.Worker == "", "a returned job must be queued with no worker, got %+v", job)
+	ctx.Assert(job.State == "queued" && job.Worker == "" && job.DeadlineMs == 0, "a returned job must be queued with no worker and no deadline_ms, got %+v", job)
 }
 
 func CheckAckClearsClaim(ctx *harness.Ctx) {
@@ -967,6 +1030,8 @@ func CheckAckClearsClaim(ctx *harness.Ctx) {
     cpp: `#include <leetbuild/harness.h>
 
 #include <algorithm>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -1012,13 +1077,18 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   const std::string a = stateJob(1);
   bool fired = false;
   std::vector<std::string> places;
+  std::map<std::string, std::string> record;
   ctx.Redis.After("jobs:queue", [&] {
     fired = true;
     places = stateWhere(ctx, a);
+    record = ctx.Redis.HGetAll("job:" + a);
   });
   ctx.Equal(claim("w-1").value_or(""), a, "the claim");
   ctx.Assert(fired, "claim never touched jobs:queue");
   ctx.Assert(!places.empty(), "right after your first command on jobs:queue, %s was on neither jobs:queue nor jobs:inflight: a worker that dies there loses the job with no trace. Pop and record the claim in one script", a);
+  if (places == std::vector<std::string>{"jobs:inflight"}) {
+    ctx.Assert(record["state"] == "running" && record["worker"] == "w-1", "right after your first command on jobs:queue, %s was in jobs:inflight but job:%s was %s by '%s': a worker that dies there leaves a claimed job the record calls queued. Write the record in the claim's script", a, a, record["state"], record["worker"]);
+  }
   ctx.Equal(stateWhere(ctx, a), std::vector<std::string>{"jobs:inflight"}, "where the job is after the claim");
 }
 
@@ -1040,11 +1110,31 @@ void CheckSingleReturn(harness::Ctx& ctx) {
   const long copies = stateCopies(ctx, a);
   ctx.Assert(copies == 1, "two reapers returned one expired claim and jobs:queue now holds %s %d times: two workers will run it at once. Requeue a member only when your ZREM removed it", a, copies);
   ctx.Equal(claim("w-2").value_or(""), a, "the returned job must be claimable again; the claim");
+  const std::string b = stateJob(2);
   ctx.Clock.Advance(61);
-  ctx.Equal(returnExpired(), std::vector<std::string>{a}, "one expired claim must be returned once");
+  std::vector<std::vector<std::string>> seen;
+  bool watching = true;
+  std::function<void()> watch = [&] {
+    // Where the job is right after each of the reaper's commands on jobs:inflight.
+    if (!watching) return;
+    seen.push_back(stateWhere(ctx, a));
+    ctx.Redis.After("jobs:inflight", watch);
+  };
+  ctx.Redis.After("jobs:inflight", watch);
+  const auto returned = returnExpired();
+  watching = false;
+  ctx.Equal(returned, std::vector<std::string>{a}, "one expired claim must be returned once");
+  std::string trail;
+  bool lost = false;
+  for (const auto& places : seen) {
+    lost = lost || places.empty();
+    trail += places.empty() ? " nowhere" : " " + places.front();
+  }
+  ctx.Assert(!lost, "right after one of your commands on jobs:inflight, %s was on neither jobs:queue nor jobs:inflight (places seen:%s): a reaper that dies there loses the job. Remove and requeue in one script", a, trail);
+  ctx.Equal(ctx.Redis.LRange("jobs:queue", 0, -1), std::vector<std::string>{a, b}, "an expired claim goes back at the head, ahead of " + b + "; jobs:queue after the return");
   ctx.Equal(returnExpired().size(), 0, "a second pass must find nothing to return; returned");
   const auto job = store::getJob(a);
-  ctx.Assert(job && job->state == "queued" && job->worker.empty(), "a returned job must be queued with no worker, got %s by %s", job ? job->state : "", job ? job->worker : "");
+  ctx.Assert(job && job->state == "queued" && job->worker.empty() && job->deadline_ms == 0, "a returned job must be queued with no worker and no deadline_ms, got %s by '%s' until %d", job ? job->state : "", job ? job->worker : "", job ? job->deadline_ms : 0);
 }
 
 void CheckAckClearsClaim(harness::Ctx& ctx) {

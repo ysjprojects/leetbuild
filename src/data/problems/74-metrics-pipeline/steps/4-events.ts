@@ -91,7 +91,7 @@ leaves nothing behind; and a lost acknowledgement writes the event twice.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'Every event whose delivery report fails, or does not arrive within `ACK_TIMEOUT_S` (2 s), becomes an outbox row with the topic, the key and the payload, and is not counted as published. The starter only catches errors `produce` raises locally, so a failed delivery vanishes.',
+        'Every event whose own delivery report fails, or does not arrive within `ACK_TIMEOUT_S` (2 s, one wait for the whole tick), becomes an outbox row with the topic, the key and the payload, and is not counted as published; the events acknowledged are counted and get no row. The starter only catches errors `produce` raises locally, so a failed delivery vanishes.',
       match: {
         python: {
           all: [/on_delivery\s*=/, /producer\.flush\(\s*ACK_TIMEOUT_S/, /outbox\.insert\(/],
@@ -747,13 +747,25 @@ def check_outbox_on_failure(ctx):
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "acme/cpu_seconds{host=a}" and row.get("payload", {}).get("window_id") == window_id(w), f"the outbox row is {row}, expected the topic, the key acme/cpu_seconds{{host=a}} and the event"
     assert n == 0, f"publish_rollups counted {n} published after a failed delivery, expected 0"
+    # One tick, three events, the first delivery fails: two windows of one series and one of another.
+    tick = [_window(start=START + 20), _window(start=START + 30), _window(host="b", start=START + 20)]
+    seen = len(ctx.kafka.records(TOPIC))
+    ctx.kafka.fail_next(TOPIC, 1)
+    n = m.publish_rollups(tick)
+    on_topic = sorted(json.loads(r.value).get("window_id", "?") for r in ctx.kafka.records(TOPIC)[seen:])
+    boxed = sorted(row.get("payload", {}).get("window_id", "?") for row in _outbox(ctx)[1:])
+    missing = sorted({window_id(t) for t in tick} - set(on_topic))
+    assert window_id(tick[0]) in boxed and boxed == missing, f"in a tick of 3 events whose first delivery failed, the topic got {on_topic} and the outbox {boxed}, expected the outbox to hold exactly the events not on the topic, {missing}: track each event's own delivery report"
+    assert n == len(on_topic), f"publish_rollups counted {n} published, expected the {len(on_topic)} events the broker acknowledged"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
+    stalled = [_window(start=START + 40), _window(host="b", start=START + 40)]
     before = ctx.clock.time()
-    n = m.publish_rollups([_window(start=START + 10)])
+    n = m.publish_rollups(stalled)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_rollups waited {waited:.0f} s for a broker that does not answer: wait at most ACK_TIMEOUT_S, then write the outbox row"
-    rows = _outbox(ctx)
-    assert len(rows) == 2 and rows[1].get("payload", {}).get("window_start") == START + 10, f"no acknowledgement within the window and the outbox holds {rows}"
+    assert waited <= 2.5, f"publish_rollups waited {waited:.1f} s for a broker that does not answer: wait at most ACK_TIMEOUT_S (2 s) for all the reports together, then write the outbox rows"
+    rows = _outbox(ctx)[1 + len(boxed):]
+    got = sorted(row.get("payload", {}).get("window_id", "?") for row in rows)
+    assert got == sorted(window_id(s) for s in stalled), f"no acknowledgement within the window and the outbox gained {got}"
     assert n == 0, f"publish_rollups counted {n} published without an acknowledgement, expected 0"
 
 
@@ -847,13 +859,26 @@ export async function check_outbox_on_failure(ctx) {
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the rollup is lost\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'acme/cpu_seconds{host=a}' && rows[0].payload?.window_id === model.windowId(w), \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key acme/cpu_seconds{host=a} and the event\`);
   assert.equal(n, 0, \`publishRollups counted \${n} published after a failed delivery, expected 0\`);
+  // One tick, three events, the first delivery fails: two windows of one series and one of another.
+  const tick = [windowOf('acme', 'a', START + 20), windowOf('acme', 'a', START + 30), windowOf('acme', 'b', START + 20)];
+  const seen = ctx.kafka.values(TOPIC).length;
+  ctx.kafka.failNext(TOPIC, 1);
+  n = await m.publishRollups(tick);
+  await settle();
+  const onTopic = (ctx.kafka.values(TOPIC) as string[]).slice(seen).map(v => JSON.parse(v).window_id ?? '?').sort();
+  const boxed = outboxRows(ctx).slice(1).map(row => row.payload?.window_id ?? '?').sort();
+  const missing = tick.map(t => model.windowId(t)).filter(id => !onTopic.includes(id)).sort();
+  assert(boxed.includes(model.windowId(tick[0])) && JSON.stringify(boxed) === JSON.stringify(missing), \`in a tick of 3 events whose first delivery failed, the topic got \${JSON.stringify(onTopic)} and the outbox \${JSON.stringify(boxed)}, expected the outbox to hold exactly the events not on the topic, \${JSON.stringify(missing)}: track each event's own delivery\`);
+  assert.equal(n, onTopic.length, \`publishRollups counted \${n} published, expected the \${onTopic.length} events the broker acknowledged\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
+  const stalled = [windowOf('acme', 'a', START + 40), windowOf('acme', 'b', START + 40)];
   const before = ctx.clock.now();
-  n = await m.publishRollups([windowOf('acme', 'a', START + 10)]);
+  n = await m.publishRollups(stalled);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishRollups waited \${waited.toFixed(0)} s for a broker that does not answer: wait at most ACK_TIMEOUT_MS, then write the outbox row\`);
-  rows = outboxRows(ctx);
-  assert(rows.length === 2 && rows[1].payload?.window_start === START + 10, \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert(waited <= 2.5, \`publishRollups waited \${waited.toFixed(1)} s for a broker that does not answer: wait at most ACK_TIMEOUT_MS (2 s) for all the acknowledgements together, then write the outbox rows\`);
+  rows = outboxRows(ctx).slice(1 + boxed.length);
+  const got = rows.map(row => row.payload?.window_id ?? '?').sort();
+  assert.deepStrictEqual(got, stalled.map(s => model.windowId(s)).sort(), \`no acknowledgement within the window and the outbox gained \${JSON.stringify(got)}\`);
   assert.equal(n, 0, \`publishRollups counted \${n} published without an acknowledgement, expected 0\`);
 }
 
@@ -1006,6 +1031,26 @@ func CheckWindowBoundaries(ctx *harness.Ctx) {
 	ctx.Equal(event, want, "a consumer needs both boundaries and the count to fold the window; the event")
 }
 
+func eventsIDs(values []string) []string {
+	ids := []string{}
+	for _, v := range values {
+		var event map[string]any
+		json.Unmarshal([]byte(v), &event)
+		ids = append(ids, fmt.Sprint(event["window_id"]))
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func eventsBoxed(rows []eventsRow) []string {
+	ids := []string{}
+	for _, row := range rows {
+		ids = append(ids, fmt.Sprint(row.Payload["window_id"]))
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	eventsSetup(ctx)
 	w := eventsWindow("acme", "a", eventsStart, 3)
@@ -1016,13 +1061,43 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the rollup is lost; the rows")
 	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "acme/cpu_seconds{host=a}" && rows[0].Payload["window_id"] == model.WindowID(w), "the outbox row is %+v, expected the topic, the key acme/cpu_seconds{host=a} and the event", rows[0])
 	ctx.Equal(n, 0, "publishRollups' count after a failed delivery")
+	// One tick, three events, the first delivery fails: two windows of one series and one of another.
+	tick := []model.Window{eventsWindow("acme", "a", eventsStart+20, 3), eventsWindow("acme", "a", eventsStart+30, 3), eventsWindow("acme", "b", eventsStart+20, 3)}
+	seen := len(ctx.Kafka.Values(eventsTopic))
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	n = eventsPublish(ctx, tick...)
+	ctx.Settle()
+	onTopic := eventsIDs(ctx.Kafka.Values(eventsTopic)[seen:])
+	boxed := eventsBoxed(eventsOutbox(ctx)[1:])
+	missing := []string{}
+	firstBoxed := false
+	for _, t := range tick {
+		found := false
+		for _, id := range onTopic {
+			found = found || id == model.WindowID(t)
+		}
+		if !found {
+			missing = append(missing, model.WindowID(t))
+		}
+	}
+	for _, id := range boxed {
+		firstBoxed = firstBoxed || id == model.WindowID(tick[0])
+	}
+	sort.Strings(missing)
+	ctx.Assert(firstBoxed && fmt.Sprint(boxed) == fmt.Sprint(missing), "in a tick of 3 events whose first delivery failed, the topic got %v and the outbox %v, expected the outbox to hold exactly the events not on the topic, %v: track each event's own delivery report", onTopic, boxed, missing)
+	ctx.Equal(n, len(onTopic), "publishRollups' count must be the events the broker acknowledged")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	stalled := []model.Window{eventsWindow("acme", "a", eventsStart+40, 3), eventsWindow("acme", "b", eventsStart+40, 3)}
 	before := ctx.Clock.Now()
-	n = eventsPublish(ctx, eventsWindow("acme", "a", eventsStart+10, 3))
+	n = eventsPublish(ctx, stalled...)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishRollups waited %.0f s for a broker that does not answer: wait at most ackTimeout, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishRollups waited %.1f s for a broker that does not answer: wait at most ackTimeout (2 s) for all the delivery reports together, then write the outbox rows", waited)
 	rows = eventsOutbox(ctx)
-	ctx.Assert(len(rows) == 2 && rows[1].Payload["window_id"] == model.WindowID(eventsWindow("acme", "a", eventsStart+10, 3)), "no acknowledgement within the window and the outbox holds %+v", rows)
+	got := []string{}
+	if len(rows) >= 1+len(boxed) {
+		got = eventsBoxed(rows[1+len(boxed):])
+	}
+	ctx.Equal(got, []string{model.WindowID(stalled[0]), model.WindowID(stalled[1])}, "no acknowledgement within the window: the window ids the outbox gained")
 	ctx.Equal(n, 0, "publishRollups' count without an acknowledgement")
 }
 
@@ -1097,8 +1172,23 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+// The sorted window ids of the events (JSON text) from index from on; eventsBoxed is the same for outbox rows.
+std::vector<std::string> eventsIds(const std::vector<std::string>& values, size_t from = 0) {
+  std::vector<std::string> ids;
+  for (size_t i = from; i < values.size(); i++) ids.push_back(hField(nlohmann::json::parse(values[i], nullptr, false), "window_id"));
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+std::vector<std::string> eventsBoxed(const std::vector<nlohmann::json>& rows, size_t from) {
+  std::vector<std::string> ids;
+  for (size_t i = from; i < rows.size(); i++) ids.push_back(rows[i].contains("payload") ? hField(rows[i]["payload"], "window_id") : "");
+  std::sort(ids.begin(), ids.end());
+  return ids;
 }
 
 }  // namespace
@@ -1138,7 +1228,7 @@ void CheckPublishAfterConfirm(harness::Ctx& ctx) {
   ctx.Assert(!onTopic.empty(), "publishRollups never asked the shard writers (metrics::flushWindows)");
   for (size_t n : onTopic) ctx.Assert(n == 0, "when the shards were asked the topic already held %d events: an event must follow the shard's acceptance, not precede it", n);
   std::vector<std::string> published;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) published.push_back(field(nlohmann::json::parse(v, nullptr, false), "window_id"));
+  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) published.push_back(hField(nlohmann::json::parse(v, nullptr, false), "window_id"));
   std::sort(published.begin(), published.end());
   std::sort(want.begin(), want.end());
   ctx.Equal(published, want, "with %s down only the windows the other shards accepted are rolled up; its windows are pending. The events' window ids", down);
@@ -1166,18 +1256,34 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the rollup is lost; the rows");
-  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "acme/cpu_seconds{host=a}" && rows[0].contains("payload") &&
-                 field(rows[0]["payload"], "window_id") == metrics::windowId(w),
+  ctx.Assert(hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == "acme/cpu_seconds{host=a}" && rows[0].contains("payload") &&
+                 hField(rows[0]["payload"], "window_id") == metrics::windowId(w),
              "the outbox row is %s, expected the topic, the key acme/cpu_seconds{host=a} and the event", rows[0].dump());
   ctx.Equal(n, 0, "publishRollups' count after a failed delivery");
+  // One tick, three events, the first delivery fails: two windows of one series and one of another.
+  const std::vector<metrics::Window> tick = {eventsWindow("acme", "a", kEventsStart + 20), eventsWindow("acme", "a", kEventsStart + 30), eventsWindow("acme", "b", kEventsStart + 20)};
+  const size_t seen = ctx.Kafka.Values(kEventsTopic).size();
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  n = publishRollups(tick);
+  ctx.Settle();
+  const auto onTopic = eventsIds(ctx.Kafka.Values(kEventsTopic), seen);
+  const auto boxed = eventsBoxed(eventsOutbox(ctx), 1);
+  std::vector<std::string> missing;
+  for (const auto& t : tick) {
+    if (std::find(onTopic.begin(), onTopic.end(), metrics::windowId(t)) == onTopic.end()) missing.push_back(metrics::windowId(t));
+  }
+  std::sort(missing.begin(), missing.end());
+  ctx.Assert(std::find(boxed.begin(), boxed.end(), metrics::windowId(tick[0])) != boxed.end() && boxed == missing,
+             "in a tick of 3 events whose first delivery failed, the topic got %v and the outbox %v, expected the outbox to hold exactly the events not on the topic, %v: track each event's own delivery report", onTopic, boxed, missing);
+  ctx.Equal(static_cast<size_t>(n), onTopic.size(), "publishRollups' count must be the events the broker acknowledged");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  const std::vector<metrics::Window> stalled = {eventsWindow("acme", "a", kEventsStart + 40), eventsWindow("acme", "b", kEventsStart + 40)};
   const int64_t before = ctx.Clock.Now();
-  n = publishRollups({eventsWindow("acme", "a", kEventsStart + 10)});
+  n = publishRollups(stalled);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishRollups waited %.0f s for a broker that does not answer: wait at most kAckTimeoutMs, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && rows[1]["payload"].value("window_start", 0LL) == kEventsStart + 10,
-             "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(waited <= 2.5, "publishRollups waited %.1f s for a broker that does not answer: wait at most kAckTimeoutMs (2 s) for all the delivery reports together, then write the outbox rows", waited);
+  ctx.Equal(eventsBoxed(eventsOutbox(ctx), 1 + boxed.size()), std::vector<std::string>{metrics::windowId(stalled[0]), metrics::windowId(stalled[1])},
+            "no acknowledgement within the window: the window ids the outbox gained");
   ctx.Equal(n, 0, "publishRollups' count without an acknowledgement");
 }
 

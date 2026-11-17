@@ -56,7 +56,7 @@ loop, and a trace storage will never accept is sent again every second.
       id: 'deadline',
       title: 'Every Write carries a 2-second deadline',
       detail:
-        'Each attempt is made with a 2-second deadline on the call, so a stalled storage costs the flusher at most two seconds per attempt; the starter waits for as long as storage takes.',
+        'Each attempt is made with its own 2-second deadline on the call, and a timed-out attempt is retried, so a stalled storage costs the flusher three attempts of two seconds each; the starter waits for as long as storage takes.',
       match: {
         python: {all: [/\.Write\([\s\S]{0,200}?timeout\s*=/]},
         typescript: {all: [/\.Write\([\s\S]{0,300}?deadline:/]},
@@ -82,7 +82,7 @@ loop, and a trace storage will never accept is sent again every second.
       id: 'bounded-retries',
       title: 'At most 3 attempts, for UNAVAILABLE and DEADLINE_EXCEEDED only',
       detail:
-        'The loop is bounded by `MAX_ATTEMPTS` (3) and retries only the transient codes; when the attempts run out the trace is kept for the next cycle. The starter loops until storage answers.',
+        'The loop is bounded by `MAX_ATTEMPTS` (3) and retries only the transient codes; when the attempts run out, or another status such as `PERMISSION_DENIED` or `INTERNAL` answers after one call, the trace is kept for the next cycle. The starter loops until storage answers.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /StatusCode\.UNAVAILABLE/], none: [/while True/]},
         typescript: {
@@ -101,7 +101,7 @@ loop, and a trace storage will never accept is sent again every second.
       id: 'quarantine',
       title: 'A schema rejection is quarantined, not retried',
       detail:
-        'An `INVALID_ARGUMENT` cannot succeed by repeating: the trace goes to `quarantine(trace, details)` after one call and the answer says so.',
+        "An `INVALID_ARGUMENT` cannot succeed by repeating: the trace goes to `quarantine(trace, details)`, with storage's details as the reason, after one call and the answer says so.",
       match: {
         python: {all: [/StatusCode\.INVALID_ARGUMENT/, /assembly\.quarantine\(/]},
         typescript: {all: [/status\.INVALID_ARGUMENT/, /quarantine\(/]},
@@ -667,6 +667,7 @@ def check_deadline(ctx):
         assert call.timeout is not None, "a Write carries no deadline: a storage that stalls holds the flusher for as long as it stalls"
         assert 1.5 <= call.timeout <= 2.5, f"a Write carries a {call.timeout} s deadline, expected 2 s"
     assert result is not None, "with storage stalled flush_trace never returned"
+    assert len(calls) == 3, f"with storage stalled flush_trace called Write {len(calls)} times, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retried, and every attempt gets its own 2 s"
     assert result["kept"] is True and result["flushed"] is False, f"every write timed out, so the trace must be kept for the next cycle; flush_trace answered {result}"
     assert ctx.redis.exists(KEY) == 1, "the writes timed out and the trace is gone from Redis"
     ctx.grpc.set_latency("Write", 0.0)
@@ -687,12 +688,26 @@ def check_delete_after_confirm(ctx):
 
 def check_bounded_retries(ctx):
     m, storage = _client(ctx)
-    ctx.grpc.fail("Write", grpc.StatusCode.UNAVAILABLE, times=50)
+    ctx.grpc.fail("Write", grpc.StatusCode.UNAVAILABLE, times=3)
     result = _flush(ctx, m, "with storage down")
     calls = len(ctx.grpc.calls_to("Write"))
     assert calls == 3, f"with storage down flush_trace called Write {calls} times, expected MAX_ATTEMPTS = 3"
     assert result == {"flushed": False, "kept": True, "quarantined": False, "attempts": 3}, f"three UNAVAILABLE answers must end in kept, attempts 3; flush_trace answered {result}"
     assert ctx.redis.exists(KEY) == 1, "storage never took the trace and it is gone from Redis: it must stay for the next cycle"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INTERNAL, grpc.StatusCode.FAILED_PRECONDITION):
+        before = len(ctx.grpc.calls_to("Write"))
+        ctx.grpc.fail("Write", code, times=1)
+        result = _flush(ctx, m, f"with storage answering {code.name}")
+        calls = len(ctx.grpc.calls_to("Write")) - before
+        assert calls == 1, f"storage answered {code.name} and flush_trace called Write {calls} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert result == {"flushed": False, "kept": True, "quarantined": False, "attempts": 1}, f"{code.name} is neither retried nor a schema rejection: the trace is kept for the next cycle, attempts 1; flush_trace answered {result}"
+        assert ctx.redis.exists(KEY) == 1 and ctx.redis.exists(f"quarantine:{TRACE}") == 0, f"after {code.name} the trace must stay in the assembly, not be dropped or quarantined"
+    before = len(ctx.grpc.calls_to("Write"))
+    ctx.grpc.fail("Write", grpc.StatusCode.UNAVAILABLE, times=2)
+    result = _flush(ctx, m, "with storage back after two UNAVAILABLE answers")
+    calls = len(ctx.grpc.calls_to("Write")) - before
+    assert calls == 3 and result == {"flushed": True, "kept": False, "quarantined": False, "attempts": 3}, f"two UNAVAILABLE answers then OK: the third attempt must write the trace; flush_trace called Write {calls} times and answered {result}"
+    assert ctx.redis.exists(KEY) == 0, "storage confirmed the third attempt and the assembly state is still in Redis"
 
 
 def check_quarantine(ctx):
@@ -703,6 +718,8 @@ def check_quarantine(ctx):
     assert result.get("quarantined") is True and result.get("flushed") is False, f"a rejected trace must be answered as quarantined, flush_trace answered {result}"
     ttl = ctx.redis.ttl(f"quarantine:{TRACE}")
     assert 7 * 86400 - 60 <= ttl <= 7 * 86400, f"quarantine:{TRACE} has TTL {ttl}: the trace must be parked with assembly.quarantine"
+    parked = ctx.redis.get(f"quarantine:{TRACE}") or ""
+    assert "span without a service" in parked, f"quarantine:{TRACE} must record storage's details as the reason (span without a service: ...), it holds {parked[:200]!r}"
     assert ctx.redis.exists(KEY) == 0, "a quarantined trace must leave the assembly"
 `,
     typescript: `const TRACE = '4bf92f3577b34da6a3ce929d0e0e4736';
@@ -745,6 +762,7 @@ export async function check_deadline(ctx) {
     assert(1.5 <= call.timeout && call.timeout <= 2.5, \`a Write carries a \${call.timeout} s deadline, expected 2 s\`);
   }
   assert(result !== undefined, 'with storage stalled flushTrace never resolved');
+  assert.equal(calls.length, 3, \`with storage stalled flushTrace called Write \${calls.length} times, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retried, and every attempt gets its own 2 s\`);
   assert(result.kept === true && result.flushed === false, \`every write timed out, so the trace must be kept for the next cycle; flushTrace answered \${JSON.stringify(result)}\`);
   assert.equal(ctx.redis.exists(KEY), 1, 'the writes timed out and the trace is gone from Redis');
   ctx.grpc.setLatency('Write', 0);
@@ -765,12 +783,27 @@ export async function check_delete_after_confirm(ctx) {
 
 export async function check_bounded_retries(ctx) {
   const {m} = await client(ctx);
-  ctx.grpc.fail('Write', ctx.grpc.status.UNAVAILABLE, '', 50);
-  const result = await flush(ctx, m, 'with storage down');
-  const calls = ctx.grpc.callsTo('Write').length;
+  ctx.grpc.fail('Write', ctx.grpc.status.UNAVAILABLE, '', 3);
+  let result = await flush(ctx, m, 'with storage down');
+  let calls = ctx.grpc.callsTo('Write').length;
   assert.equal(calls, 3, \`with storage down flushTrace called Write \${calls} times, expected MAX_ATTEMPTS = 3\`);
   assert.deepStrictEqual(result, {flushed: false, kept: true, quarantined: false, attempts: 3}, \`three UNAVAILABLE answers must end in kept, attempts 3; flushTrace answered \${JSON.stringify(result)}\`);
   assert.equal(ctx.redis.exists(KEY), 1, 'storage never took the trace and it is gone from Redis: it must stay for the next cycle');
+  for (const name of ['PERMISSION_DENIED', 'INTERNAL', 'FAILED_PRECONDITION']) {
+    const before = ctx.grpc.callsTo('Write').length;
+    ctx.grpc.fail('Write', ctx.grpc.status[name], '', 1);
+    result = await flush(ctx, m, \`with storage answering \${name}\`);
+    calls = ctx.grpc.callsTo('Write').length - before;
+    assert.equal(calls, 1, \`storage answered \${name} and flushTrace called Write \${calls} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert.deepStrictEqual(result, {flushed: false, kept: true, quarantined: false, attempts: 1}, \`\${name} is neither retried nor a schema rejection: the trace is kept for the next cycle, attempts 1; flushTrace answered \${JSON.stringify(result)}\`);
+    assert(ctx.redis.exists(KEY) === 1 && ctx.redis.exists(\`quarantine:\${TRACE}\`) === 0, \`after \${name} the trace must stay in the assembly, not be dropped or quarantined\`);
+  }
+  const before = ctx.grpc.callsTo('Write').length;
+  ctx.grpc.fail('Write', ctx.grpc.status.UNAVAILABLE, '', 2);
+  result = await flush(ctx, m, 'with storage back after two UNAVAILABLE answers');
+  calls = ctx.grpc.callsTo('Write').length - before;
+  assert(calls === 3 && result.flushed === true && result.kept === false && result.quarantined === false && result.attempts === 3, \`two UNAVAILABLE answers then OK: the third attempt must write the trace (flushed, attempts 3); flushTrace called Write \${calls} times and answered \${JSON.stringify(result)}\`);
+  assert.equal(ctx.redis.exists(KEY), 0, 'storage confirmed the third attempt and the assembly state is still in Redis');
 }
 
 export async function check_quarantine(ctx) {
@@ -781,6 +814,8 @@ export async function check_quarantine(ctx) {
   assert(result.quarantined === true && result.flushed === false, \`a rejected trace must be answered as quarantined, flushTrace answered \${JSON.stringify(result)}\`);
   const ttl = ctx.redis.ttl(\`quarantine:\${TRACE}\`);
   assert(7 * 86400 - 60 <= ttl && ttl <= 7 * 86400, \`quarantine:\${TRACE} has TTL \${ttl}: the trace must be parked with quarantine()\`);
+  const parked = ctx.redis.get(\`quarantine:\${TRACE}\`) ?? '';
+  assert(parked.includes('span without a service'), \`quarantine:\${TRACE} must record storage's details as the reason (span without a service: ...), it holds \${JSON.stringify(parked.slice(0, 200))}\`);
   assert.equal(ctx.redis.exists(KEY), 0, 'a quarantined trace must leave the assembly');
 }
 `,
@@ -788,6 +823,7 @@ export async function check_quarantine(ctx) {
 
 import (
 	"context"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -863,6 +899,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(call.Timeout.Seconds() >= 1.5 && call.Timeout.Seconds() <= 2.5, "a Write carries a %v deadline, expected 2 s", call.Timeout)
 	}
 	ctx.Assert(returned, "with storage stalled flushTrace never returned")
+	ctx.Assert(len(calls) == 3, "with storage stalled flushTrace called Write %d times, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retried, and every attempt gets its own 2 s", len(calls))
 	ctx.Assert(result.Kept && !result.Flushed, "every write timed out, so the trace must be kept for the next cycle; flushTrace answered %+v", result)
 	ctx.Equal(ctx.Redis.Exists(clKey), 1, "the writes timed out; the trace must still be in Redis")
 	ctx.GRPC.SetLatency("Write", 0, "")
@@ -887,11 +924,29 @@ func CheckDeleteAfterConfirm(ctx *harness.Ctx) {
 
 func CheckBoundedRetries(ctx *harness.Ctx) {
 	clientPeer(ctx, "payments")
-	ctx.GRPC.Fail("Write", codes.Unavailable, "", 50, "")
+	ctx.GRPC.Fail("Write", codes.Unavailable, "", 3, "")
 	result := mustFlush(ctx, "with storage down")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Write", "")), 3, "with storage down, the Write calls (MAX_ATTEMPTS = 3)")
 	ctx.Equal(result, flushResult{Kept: true, Attempts: 3}, "three UNAVAILABLE answers must end in kept, attempts 3; flushTrace answered")
 	ctx.Equal(ctx.Redis.Exists(clKey), 1, "storage never took the trace; it must stay in Redis for the next cycle")
+	for _, terminal := range []struct {
+		name string
+		code codes.Code
+	}{{"PERMISSION_DENIED", codes.PermissionDenied}, {"INTERNAL", codes.Internal}, {"FAILED_PRECONDITION", codes.FailedPrecondition}} {
+		before := len(ctx.GRPC.CallsTo("Write", ""))
+		ctx.GRPC.Fail("Write", terminal.code, "", 1, "")
+		result = mustFlush(ctx, "with storage answering "+terminal.name)
+		calls := len(ctx.GRPC.CallsTo("Write", "")) - before
+		ctx.Assert(calls == 1, "storage answered %s and flushTrace called Write %d times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", terminal.name, calls)
+		ctx.Assert(result == flushResult{Kept: true, Attempts: 1}, "%s is neither retried nor a schema rejection: the trace is kept for the next cycle, attempts 1; flushTrace answered %+v", terminal.name, result)
+		ctx.Assert(ctx.Redis.Exists(clKey) == 1 && ctx.Redis.Exists("quarantine:"+clTrace) == 0, "after %s the trace must stay in the assembly, not be dropped or quarantined", terminal.name)
+	}
+	before := len(ctx.GRPC.CallsTo("Write", ""))
+	ctx.GRPC.Fail("Write", codes.Unavailable, "", 2, "")
+	result = mustFlush(ctx, "with storage back after two UNAVAILABLE answers")
+	calls := len(ctx.GRPC.CallsTo("Write", "")) - before
+	ctx.Assert(calls == 3 && result == flushResult{Flushed: true, Attempts: 3}, "two UNAVAILABLE answers then OK: the third attempt must write the trace; flushTrace called Write %d times and answered %+v", calls, result)
+	ctx.Equal(ctx.Redis.Exists(clKey), 0, "storage confirmed the third attempt; the assembly state must be gone from Redis")
 }
 
 func CheckQuarantine(ctx *harness.Ctx) {
@@ -901,12 +956,15 @@ func CheckQuarantine(ctx *harness.Ctx) {
 	ctx.Assert(result.Quarantined && !result.Flushed, "a rejected trace must be answered as quarantined, flushTrace answered %+v", result)
 	ttl := ctx.Redis.TTL("quarantine:" + clTrace)
 	ctx.Assert(ttl >= 7*86400-60 && ttl <= 7*86400, "quarantine:%s has TTL %d: the trace must be parked with assembly.Quarantine", clTrace, ttl)
+	parked, _ := ctx.Redis.Get("quarantine:" + clTrace)
+	ctx.Assert(strings.Contains(parked, "span without a service"), "quarantine:%s must record storage's details as the reason (span without a service: ...), it holds %.200q", clTrace, parked)
 	ctx.Equal(ctx.Redis.Exists(clKey), 0, "a quarantined trace must leave the assembly")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "trace_collector.grpc.pb.h"
@@ -971,6 +1029,7 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a Write carries a %v s deadline, expected 2 s", call.TimeoutSeconds());
   }
   ctx.Assert(returned, "with storage stalled flushTrace never returned");
+  ctx.Assert(calls.size() == 3, "with storage stalled flushTrace called Write %v times, expected kMaxAttempts = 3: DEADLINE_EXCEEDED is retried, and every attempt gets its own 2 s", calls.size());
   ctx.Assert(result.kept && !result.flushed, "every write timed out, so the trace must be kept for the next cycle; flushTrace answered kept %t flushed %t", result.kept, result.flushed);
   ctx.Equal(ctx.Redis.Exists(kKey), 1, "the writes timed out; the trace must still be in Redis");
   ctx.GRPC.SetLatency("Write", 0);
@@ -993,11 +1052,31 @@ void CheckDeleteAfterConfirm(harness::Ctx& ctx) {
 
 void CheckBoundedRetries(harness::Ctx& ctx) {
   clientPeer(ctx, "payments");
-  ctx.GRPC.Fail("Write", grpc::StatusCode::UNAVAILABLE, "", 50);
-  const FlushResult result = mustFlush(ctx, "with storage down");
+  ctx.GRPC.Fail("Write", grpc::StatusCode::UNAVAILABLE, "", 3);
+  FlushResult result = mustFlush(ctx, "with storage down");
   ctx.Equal(ctx.GRPC.CallsTo("Write").size(), 3, "with storage down, the Write calls (kMaxAttempts = 3)");
   ctx.Assert(!result.flushed && result.kept && !result.quarantined && result.attempts == 3, "three UNAVAILABLE answers must end in kept, attempts 3; flushTrace answered kept %t after %v attempts", result.kept, result.attempts);
   ctx.Equal(ctx.Redis.Exists(kKey), 1, "storage never took the trace; it must stay in Redis for the next cycle");
+  const std::vector<std::pair<std::string, grpc::StatusCode>> terminals = {
+      {"PERMISSION_DENIED", grpc::StatusCode::PERMISSION_DENIED}, {"INTERNAL", grpc::StatusCode::INTERNAL}, {"FAILED_PRECONDITION", grpc::StatusCode::FAILED_PRECONDITION}};
+  for (const auto& [name, code] : terminals) {
+    const std::size_t before = ctx.GRPC.CallsTo("Write").size();
+    ctx.GRPC.Fail("Write", code, "", 1);
+    result = mustFlush(ctx, "with storage answering " + name);
+    const std::size_t calls = ctx.GRPC.CallsTo("Write").size() - before;
+    ctx.Assert(calls == 1, "storage answered %s and flushTrace called Write %v times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", name, calls);
+    ctx.Assert(!result.flushed && result.kept && !result.quarantined && result.attempts == 1,
+               "%s is neither retried nor a schema rejection: the trace is kept for the next cycle, attempts 1; flushTrace answered flushed %t kept %t quarantined %t after %v attempts", name,
+               result.flushed, result.kept, result.quarantined, result.attempts);
+    ctx.Assert(ctx.Redis.Exists(kKey) == 1 && ctx.Redis.Exists("quarantine:" + kTrace) == 0, "after %s the trace must stay in the assembly, not be dropped or quarantined", name);
+  }
+  const std::size_t before = ctx.GRPC.CallsTo("Write").size();
+  ctx.GRPC.Fail("Write", grpc::StatusCode::UNAVAILABLE, "", 2);
+  result = mustFlush(ctx, "with storage back after two UNAVAILABLE answers");
+  const std::size_t calls = ctx.GRPC.CallsTo("Write").size() - before;
+  ctx.Assert(calls == 3 && result.flushed && !result.kept && !result.quarantined && result.attempts == 3,
+             "two UNAVAILABLE answers then OK: the third attempt must write the trace; flushTrace called Write %v times and answered flushed %t after %v attempts", calls, result.flushed, result.attempts);
+  ctx.Equal(ctx.Redis.Exists(kKey), 0, "storage confirmed the third attempt; the assembly state must be gone from Redis");
 }
 
 void CheckQuarantine(harness::Ctx& ctx) {
@@ -1007,6 +1086,8 @@ void CheckQuarantine(harness::Ctx& ctx) {
   ctx.Assert(result.quarantined && !result.flushed, "a rejected trace must be answered as quarantined");
   const long long ttl = ctx.Redis.TTL("quarantine:" + kTrace);
   ctx.Assert(ttl >= 7 * 86400 - 60 && ttl <= 7 * 86400, "quarantine:%s has TTL %v: the trace must be parked with assembly::quarantine", kTrace, ttl);
+  const std::string parked = ctx.Redis.Get("quarantine:" + kTrace).value_or("");
+  ctx.Assert(parked.find("span without a service") != std::string::npos, "quarantine:%s must record storage's details as the reason (span without a service: ...), it holds %q", kTrace, parked.substr(0, 200));
   ctx.Equal(ctx.Redis.Exists(kKey), 0, "a quarantined trace must leave the assembly");
 }
 `,

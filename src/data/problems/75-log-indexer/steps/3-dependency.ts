@@ -20,7 +20,7 @@ serves the demo and hides four flaws.
 hammered five times; a mapping conflict, which no retry can fix, is retried and reported as an
 outage; and a write whose reply was lost is indexed twice, because the retry carries a new batch id.
 
-- Every attempt carries a **3-second deadline** (\`DEADLINE_S\`).
+- Every attempt carries its own **3-second deadline** (\`DEADLINE_S\`), a retry included.
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, at most \`MAX_ATTEMPTS = 3\` attempts in
   all, with a backoff between them; any other failure raises \`ShardWriteFailed\` at once.
 - \`FAILED_PRECONDITION\` raises \`MappingConflict(field)\` with the field the shard named in the
@@ -47,7 +47,7 @@ outage; and a write whose reply was lost is indexed twice, because the retry car
       id: 'deadline',
       title: 'Bounds every attempt with a 3-second deadline',
       detail:
-        'Every BulkWrite carries a 3-second deadline, so a shard that stops answering costs three attempts of 3 s and a `ShardWriteFailed`; the starter sets none, and a hung shard holds the batch for as long as it hangs.',
+        'Every BulkWrite carries its own 3-second deadline, a retry included, so a shard that stops answering costs three attempts of 3 s and a `ShardWriteFailed`; the starter sets none, and a hung shard holds the batch for as long as it hangs.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*3\b/, /timeout=DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -60,7 +60,7 @@ outage; and a write whose reply was lost is indexed twice, because the retry car
       id: 'retry-set',
       title: 'Retries UNAVAILABLE and DEADLINE_EXCEEDED only, three attempts at most',
       detail:
-        'Two `UNAVAILABLE` answers are retried through to a success with a backoff between attempts; a longer outage stops at `MAX_ATTEMPTS = 3`; any other status is not retried. The starter retries every status five times.',
+        'Two `UNAVAILABLE` answers are retried through to a success with a backoff between attempts; a longer outage stops at `MAX_ATTEMPTS = 3`; any other status (`PERMISSION_DENIED`, `INTERNAL`, `RESOURCE_EXHAUSTED`, `INVALID_ARGUMENT` among them) raises `ShardWriteFailed` after one call. The starter retries every status five times.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*3\b/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /MAX_ATTEMPTS\s*=\s*3\b/]},
@@ -547,6 +547,8 @@ def check_deadline(ctx):
     before = _calls(ctx)
     _fails(m, m.ShardWriteFailed, "with the shard 10 s slow")
     assert _calls(ctx) - before == 3, f"a shard slower than the deadline was tried {_calls(ctx) - before} times, expected MAX_ATTEMPTS = 3"
+    for call in ctx.grpc.calls_to("BulkWrite")[before:]:
+        assert call.timeout is not None and 2.5 <= call.timeout <= 3.5, f"after an attempt timed out at 3 s, attempt {call.request.attempt} carried a {call.timeout} s deadline: every attempt gets its own 3 s, not what is left of a shared one"
 
 
 def check_retry_set(ctx):
@@ -560,10 +562,11 @@ def check_retry_set(ctx):
     ctx.grpc.fail("BulkWrite", grpc.StatusCode.UNAVAILABLE, "shard down", times=3)
     _fails(m, m.ShardWriteFailed, "with the shard down")
     assert _calls(ctx) - before == 3, f"an outage was tried {_calls(ctx) - before} times, expected MAX_ATTEMPTS = 3"
-    before = _calls(ctx)
-    ctx.grpc.fail("BulkWrite", grpc.StatusCode.PERMISSION_DENIED, "index is read-only", times=1)
-    _fails(m, m.ShardWriteFailed, "with PERMISSION_DENIED")
-    assert _calls(ctx) - before == 1, f"PERMISSION_DENIED is not retryable and was tried {_calls(ctx) - before} times, expected 1"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INVALID_ARGUMENT):
+        before = _calls(ctx)
+        ctx.grpc.fail("BulkWrite", code, "refused", times=1)
+        _fails(m, m.ShardWriteFailed, f"with {code.name}")
+        assert _calls(ctx) - before == 1, f"{code.name} is not retryable and was tried {_calls(ctx) - before} times, expected 1"
 
 
 def check_terminal_conflict(ctx):
@@ -643,6 +646,9 @@ export async function check_deadline(ctx) {
   const before = calls(ctx);
   await fails(m, 'ShardWriteFailed', 'with the shard 10 s slow');
   assert.equal(calls(ctx) - before, 3, \`a shard slower than the deadline was tried \${calls(ctx) - before} times, expected MAX_ATTEMPTS = 3\`);
+  for (const call of ctx.grpc.callsTo('BulkWrite').slice(before)) {
+    assert(call.timeout !== null && 2.5 <= call.timeout && call.timeout <= 3.5, \`after an attempt timed out at 3 s, attempt \${call.request.attempt} carried a \${call.timeout} s deadline: every attempt gets its own 3 s, not what is left of a shared one\`);
+  }
 }
 
 export async function check_retry_set(ctx) {
@@ -656,10 +662,12 @@ export async function check_retry_set(ctx) {
   ctx.grpc.fail('BulkWrite', ctx.grpc.status.UNAVAILABLE, 'shard down', 3);
   await fails(m, 'ShardWriteFailed', 'with the shard down');
   assert.equal(calls(ctx) - before, 3, \`an outage was tried \${calls(ctx) - before} times, expected MAX_ATTEMPTS = 3\`);
-  before = calls(ctx);
-  ctx.grpc.fail('BulkWrite', ctx.grpc.status.PERMISSION_DENIED, 'index is read-only', 1);
-  await fails(m, 'ShardWriteFailed', 'with PERMISSION_DENIED');
-  assert.equal(calls(ctx) - before, 1, \`PERMISSION_DENIED is not retryable and was tried \${calls(ctx) - before} times, expected 1\`);
+  for (const code of ['PERMISSION_DENIED', 'INTERNAL', 'RESOURCE_EXHAUSTED', 'INVALID_ARGUMENT']) {
+    before = calls(ctx);
+    ctx.grpc.fail('BulkWrite', ctx.grpc.status[code], 'refused', 1);
+    await fails(m, 'ShardWriteFailed', \`with \${code}\`);
+    assert.equal(calls(ctx) - before, 1, \`\${code} is not retryable and was tried \${calls(ctx) - before} times, expected 1\`);
+  }
 }
 
 export async function check_terminal_conflict(ctx) {
@@ -703,20 +711,20 @@ import (
 	"leetbuild/harness"
 )
 
-const clientIndex = "logs-acme"
+const hIndex = "logs-acme"
 
 var (
-	clientBg      = context.Background()
-	clientRecords = []buffer.Record{
+	hBg      = context.Background()
+	hRecords = []buffer.Record{
 		{Service: "checkout", Timestamp: "2026-11-03T10:00:00Z", Level: "error", Message: "m-0"},
 		{Service: "checkout", Timestamp: "2026-11-03T10:00:01Z", Level: "info", Message: "m-1"},
 		{Service: "checkout", Timestamp: "2026-11-03T10:00:02Z", Level: "trace", Message: "m-2"},
 	}
 )
 
-// shardPeer indexes each batch id once (a trace record is rejected); conflict refuses every batch,
+// hShardPeer indexes each batch id once (a trace record is rejected); conflict refuses every batch,
 // loseReply writes, then answers Unavailable, that many times.
-type shardPeer struct {
+type hShardPeer struct {
 	pb.UnimplementedIndexShardServer
 	batches   map[string]*pb.BulkWriteReply
 	documents int
@@ -724,7 +732,7 @@ type shardPeer struct {
 	loseReply int
 }
 
-func (s *shardPeer) BulkWrite(_ context.Context, req *pb.BulkWriteRequest) (*pb.BulkWriteReply, error) {
+func (s *hShardPeer) BulkWrite(_ context.Context, req *pb.BulkWriteRequest) (*pb.BulkWriteReply, error) {
 	if s.conflict != "" {
 		return nil, status.Error(codes.FailedPrecondition, s.conflict)
 	}
@@ -745,73 +753,79 @@ func (s *shardPeer) BulkWrite(_ context.Context, req *pb.BulkWriteRequest) (*pb.
 	return s.batches[req.GetBatchId()], nil
 }
 
-func client(ctx *harness.Ctx) *shardPeer {
-	peer := &shardPeer{batches: map[string]*pb.BulkWriteReply{}}
+func hServeShard(ctx *harness.Ctx) *hShardPeer {
+	peer := &hShardPeer{batches: map[string]*pb.BulkWriteReply{}}
 	pb.RegisterIndexShardServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func shardCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("BulkWrite", "")) }
+func hShardCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("BulkWrite", "")) }
 
-func mustWrite(ctx *harness.Ctx, why string) shard.WriteResult {
-	result, err := bulkWrite(clientBg, clientIndex, clientRecords)
+func hMustWrite(ctx *harness.Ctx, why string) shard.WriteResult {
+	result, err := bulkWrite(hBg, hIndex, hRecords)
 	ctx.NoError(err, "%s: bulkWrite failed", why)
 	return result
 }
 
-func writeFails(ctx *harness.Ctx, why string) error {
-	result, err := bulkWrite(clientBg, clientIndex, clientRecords)
+func hWriteFails(ctx *harness.Ctx, why string) error {
+	result, err := bulkWrite(hBg, hIndex, hRecords)
 	ctx.Assert(err != nil, "%s: bulkWrite returned %+v instead of an error", why, result)
 	return err
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	result := mustWrite(ctx, "with a healthy shard")
+	hServeShard(ctx)
+	result := hMustWrite(ctx, "with a healthy shard")
 	ctx.Assert(result.Indexed == 2 && result.Rejected == 1 && result.IndexSnapshot == "logs-acme@1", "a healthy write must return the shard's reply (indexed 2, rejected 1, snapshot logs-acme@1), got %+v", result)
 	for _, call := range ctx.GRPC.CallsTo("BulkWrite", "") {
 		ctx.Assert(call.HasDeadline(), "a BulkWrite carries no deadline: a shard that stops answering holds the batch and its writer for as long as it hangs")
 		ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "a BulkWrite carries a %v deadline, expected 3 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("BulkWrite", 10.0, "")
-	before := shardCalls(ctx)
-	ctx.ErrorIs(writeFails(ctx, "with the shard 10 s slow"), shard.ErrShardWriteFailed, "with the shard 10 s slow")
-	ctx.Equal(shardCalls(ctx)-before, 3, "a shard slower than the deadline must be tried maxAttempts = 3 times; the calls")
+	before := hShardCalls(ctx)
+	ctx.ErrorIs(hWriteFails(ctx, "with the shard 10 s slow"), shard.ErrShardWriteFailed, "with the shard 10 s slow")
+	ctx.Equal(hShardCalls(ctx)-before, 3, "a shard slower than the deadline must be tried maxAttempts = 3 times; the calls")
+	for _, call := range ctx.GRPC.CallsTo("BulkWrite", "")[before:] {
+		attempt := call.Request.(*pb.BulkWriteRequest).GetAttempt()
+		ctx.Assert(call.HasDeadline() && 2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "after an attempt timed out at 3 s, attempt %d carried a %v deadline: every attempt gets its own 3 s, not what is left of a shared one", attempt, call.Timeout)
+	}
 }
 
 func CheckRetrySet(ctx *harness.Ctx) {
-	client(ctx)
+	hServeShard(ctx)
 	ctx.GRPC.Fail("BulkWrite", codes.Unavailable, "shard restarting", 2, "")
-	result := mustWrite(ctx, "two Unavailable answers are retryable")
+	result := hMustWrite(ctx, "two Unavailable answers are retryable")
 	ctx.Equal(result.Indexed, 2, "after two Unavailable answers the third attempt must succeed; indexed")
-	ctx.Equal(shardCalls(ctx), 3, "two Unavailable answers then a success; the calls")
+	ctx.Equal(hShardCalls(ctx), 3, "two Unavailable answers then a success; the calls")
 	ctx.Assert(ctx.Clock.Sleeps() >= 2, "the attempts were %d sleeps apart: a retry needs a backoff", ctx.Clock.Sleeps())
-	before := shardCalls(ctx)
+	before := hShardCalls(ctx)
 	ctx.GRPC.Fail("BulkWrite", codes.Unavailable, "shard down", 3, "")
-	ctx.ErrorIs(writeFails(ctx, "with the shard down"), shard.ErrShardWriteFailed, "with the shard down")
-	ctx.Equal(shardCalls(ctx)-before, 3, "an outage must be tried maxAttempts = 3 times; the calls")
-	ctx.GRPC.ClearFailures()
-	before = shardCalls(ctx)
-	ctx.GRPC.Fail("BulkWrite", codes.PermissionDenied, "index is read-only", 1, "")
-	ctx.ErrorIs(writeFails(ctx, "with PermissionDenied"), shard.ErrShardWriteFailed, "with PermissionDenied")
-	ctx.Equal(shardCalls(ctx)-before, 1, "PermissionDenied is not retryable; the calls")
+	ctx.ErrorIs(hWriteFails(ctx, "with the shard down"), shard.ErrShardWriteFailed, "with the shard down")
+	ctx.Equal(hShardCalls(ctx)-before, 3, "an outage must be tried maxAttempts = 3 times; the calls")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.Internal, codes.ResourceExhausted, codes.InvalidArgument} {
+		ctx.GRPC.ClearFailures()
+		before = hShardCalls(ctx)
+		ctx.GRPC.Fail("BulkWrite", code, "refused", 1, "")
+		ctx.ErrorIs(hWriteFails(ctx, "with "+code.String()), shard.ErrShardWriteFailed, "with %s", code)
+		ctx.Equal(hShardCalls(ctx)-before, 1, "%s is not retryable; the calls", code)
+	}
 }
 
 func CheckTerminalConflict(ctx *harness.Ctx) {
-	peer := client(ctx)
+	peer := hServeShard(ctx)
 	peer.conflict = "user_id"
-	err := writeFails(ctx, "with a mapping conflict on user_id")
+	err := hWriteFails(ctx, "with a mapping conflict on user_id")
 	var conflict *shard.MappingConflict
 	ctx.Assert(errors.As(err, &conflict), "with a mapping conflict bulkWrite must return a *shard.MappingConflict, got %v", err)
 	ctx.Equal(conflict.Field, "user_id", "the MappingConflict must carry the field the shard named")
-	ctx.Equal(shardCalls(ctx), 1, "no retry changes the mapping, a conflict is terminal after one call; the calls")
+	ctx.Equal(hShardCalls(ctx), 1, "no retry changes the mapping, a conflict is terminal after one call; the calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a mapping conflict must not be slept on and retried; the sleeps")
 }
 
 func CheckStableBatchId(ctx *harness.Ctx) {
-	peer := client(ctx)
+	peer := hServeShard(ctx)
 	peer.loseReply = 1
-	result := mustWrite(ctx, "a write whose reply was lost")
+	result := hMustWrite(ctx, "a write whose reply was lost")
 	calls := ctx.GRPC.CallsTo("BulkWrite", "")
 	ctx.Equal(len(calls), 2, "a write whose reply was lost; the calls")
 	first := calls[0].Request.(*pb.BulkWriteRequest)
@@ -819,7 +833,7 @@ func CheckStableBatchId(ctx *harness.Ctx) {
 	ctx.Assert(first.GetBatchId() == second.GetBatchId() && first.GetBatchId() == result.BatchID, "the attempts carried batch ids %q and %q and the result %q: every attempt of one batch must send the same id", first.GetBatchId(), second.GetBatchId(), result.BatchID)
 	ctx.Assert(first.GetAttempt() == 1 && second.GetAttempt() == 2, "the attempts were numbered %d and %d, expected 1 and 2", first.GetAttempt(), second.GetAttempt())
 	ctx.Equal(peer.documents, 2, "for a batch of 2 indexable records whose first reply was lost the retry wrote it again under a new batch id; the documents indexed")
-	again := mustWrite(ctx, "a second batch")
+	again := hMustWrite(ctx, "a second batch")
 	ctx.Assert(again.BatchID != result.BatchID, "a new batch must get a new batch id")
 }
 `,
@@ -835,8 +849,8 @@ func CheckStableBatchId(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kIndex = "logs-acme";
-const std::vector<buffer::Record> kRecords = {
+const std::string kHIndex = "logs-acme";
+const std::vector<buffer::Record> kHRecords = {
     {"checkout", "2026-11-03T10:00:00Z", "error", "m-0"},
     {"checkout", "2026-11-03T10:00:01Z", "info", "m-1"},
     {"checkout", "2026-11-03T10:00:02Z", "trace", "m-2"},
@@ -844,7 +858,7 @@ const std::vector<buffer::Record> kRecords = {
 
 // Indexes each batch id once (a trace record is rejected); conflict refuses every batch, loseReply
 // writes, then answers UNAVAILABLE, that many times.
-class ShardPeer final : public logshard::IndexShard::Service {
+class HShardPeer final : public logshard::IndexShard::Service {
  public:
   std::map<std::string, logshard::BulkWriteReply> batches;
   int documents = 0;
@@ -872,19 +886,19 @@ class ShardPeer final : public logshard::IndexShard::Service {
   }
 };
 
-ShardPeer& client(harness::Ctx& ctx) {
-  static ShardPeer* peer = nullptr;
+HShardPeer& hServeShard(harness::Ctx& ctx) {
+  static HShardPeer* peer = nullptr;
   delete peer;
-  peer = new ShardPeer;
+  peer = new HShardPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-size_t shardCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("BulkWrite").size(); }
+size_t hShardCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("BulkWrite").size(); }
 
-shard::WriteResult mustWrite(harness::Ctx& ctx, const std::string& why) {
+shard::WriteResult hMustWrite(harness::Ctx& ctx, const std::string& why) {
   try {
-    return ::bulkWrite(kIndex, kRecords);
+    return ::bulkWrite(kHIndex, kHRecords);
   } catch (const std::exception& e) {
     ctx.Fatalf("%s: bulkWrite threw %s: %s", why, harness::CurrentExceptionType(), e.what());
   }
@@ -892,9 +906,9 @@ shard::WriteResult mustWrite(harness::Ctx& ctx, const std::string& why) {
 }
 
 template <class E>
-E mustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& why) {
+E hMustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& why) {
   try {
-    const shard::WriteResult result = ::bulkWrite(kIndex, kRecords);
+    const shard::WriteResult result = ::bulkWrite(kHIndex, kHRecords);
     ctx.Fatalf("%s: bulkWrite returned batch %s instead of throwing %s", why, result.batch_id, expected);
   } catch (const E& e) {
     return e;
@@ -909,8 +923,8 @@ E mustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& w
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  const auto result = mustWrite(ctx, "with a healthy shard");
+  hServeShard(ctx);
+  const auto result = hMustWrite(ctx, "with a healthy shard");
   ctx.Assert(result.indexed == 2 && result.rejected == 1 && result.index_snapshot == "logs-acme@1",
              "a healthy write must return the shard's reply (indexed 2, rejected 1, snapshot logs-acme@1), got indexed %d, rejected %d, snapshot %q", result.indexed, result.rejected, result.index_snapshot);
   for (const auto& call : ctx.GRPC.CallsTo("BulkWrite")) {
@@ -918,42 +932,57 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "a BulkWrite carries a %v s deadline, expected kDeadline = 3 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("BulkWrite", 10.0);
-  const size_t before = shardCalls(ctx);
-  mustThrow<shard::ShardWriteFailed>(ctx, "ShardWriteFailed", "with the shard 10 s slow");
-  ctx.Equal(shardCalls(ctx) - before, 3, "a shard slower than the deadline must be tried kMaxAttempts = 3 times; the calls");
+  const size_t before = hShardCalls(ctx);
+  hMustThrow<shard::ShardWriteFailed>(ctx, "ShardWriteFailed", "with the shard 10 s slow");
+  ctx.Equal(hShardCalls(ctx) - before, 3, "a shard slower than the deadline must be tried kMaxAttempts = 3 times; the calls");
+  const auto slow = ctx.GRPC.CallsTo("BulkWrite");
+  for (size_t i = before; i < slow.size(); i++) {
+    const auto& call = slow[i];
+    ctx.Assert(call.HasDeadline() && 2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5,
+               "after an attempt timed out at 3 s, attempt %d carried a %v s deadline: every attempt gets its own 3 s, not what is left of a shared one",
+               call.Request<logshard::BulkWriteRequest>().attempt(), call.TimeoutSeconds());
+  }
 }
 
 void CheckRetrySet(harness::Ctx& ctx) {
-  client(ctx);
+  hServeShard(ctx);
   ctx.GRPC.Fail("BulkWrite", grpc::StatusCode::UNAVAILABLE, "shard restarting", 2);
-  const auto result = mustWrite(ctx, "two UNAVAILABLE answers are retryable");
+  const auto result = hMustWrite(ctx, "two UNAVAILABLE answers are retryable");
   ctx.Equal(result.indexed, 2, "after two UNAVAILABLE answers the third attempt must succeed; indexed");
-  ctx.Equal(shardCalls(ctx), 3, "two UNAVAILABLE answers then a success; the calls");
+  ctx.Equal(hShardCalls(ctx), 3, "two UNAVAILABLE answers then a success; the calls");
   ctx.Assert(ctx.Clock.Sleeps() >= 2, "the attempts were %d sleeps apart: a retry needs a backoff", ctx.Clock.Sleeps());
-  size_t before = shardCalls(ctx);
+  size_t before = hShardCalls(ctx);
   ctx.GRPC.Fail("BulkWrite", grpc::StatusCode::UNAVAILABLE, "shard down", 3);
-  mustThrow<shard::ShardWriteFailed>(ctx, "ShardWriteFailed", "with the shard down");
-  ctx.Equal(shardCalls(ctx) - before, 3, "an outage must be tried kMaxAttempts = 3 times; the calls");
-  ctx.GRPC.ClearFailures();
-  before = shardCalls(ctx);
-  ctx.GRPC.Fail("BulkWrite", grpc::StatusCode::PERMISSION_DENIED, "index is read-only", 1);
-  mustThrow<shard::ShardWriteFailed>(ctx, "ShardWriteFailed", "with PERMISSION_DENIED");
-  ctx.Equal(shardCalls(ctx) - before, 1, "PERMISSION_DENIED is not retryable; the calls");
+  hMustThrow<shard::ShardWriteFailed>(ctx, "ShardWriteFailed", "with the shard down");
+  ctx.Equal(hShardCalls(ctx) - before, 3, "an outage must be tried kMaxAttempts = 3 times; the calls");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+  };
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.ClearFailures();
+    before = hShardCalls(ctx);
+    ctx.GRPC.Fail("BulkWrite", code, "refused", 1);
+    hMustThrow<shard::ShardWriteFailed>(ctx, "ShardWriteFailed", "with " + name);
+    ctx.Equal(hShardCalls(ctx) - before, 1, "%s is not retryable; the calls", name);
+  }
 }
 
 void CheckTerminalConflict(harness::Ctx& ctx) {
-  ShardPeer& peer = client(ctx);
+  HShardPeer& peer = hServeShard(ctx);
   peer.conflict = "user_id";
-  const auto conflict = mustThrow<shard::MappingConflict>(ctx, "MappingConflict", "with a mapping conflict on user_id");
+  const auto conflict = hMustThrow<shard::MappingConflict>(ctx, "MappingConflict", "with a mapping conflict on user_id");
   ctx.Equal(conflict.field, "user_id", "the MappingConflict must carry the field the shard named");
-  ctx.Equal(shardCalls(ctx), 1, "no retry changes the mapping, a conflict is terminal after one call; the calls");
+  ctx.Equal(hShardCalls(ctx), 1, "no retry changes the mapping, a conflict is terminal after one call; the calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a mapping conflict must not be slept on and retried; the sleeps");
 }
 
 void CheckStableBatchId(harness::Ctx& ctx) {
-  ShardPeer& peer = client(ctx);
+  HShardPeer& peer = hServeShard(ctx);
   peer.loseReply = 1;
-  const auto result = mustWrite(ctx, "a write whose reply was lost");
+  const auto result = hMustWrite(ctx, "a write whose reply was lost");
   const auto calls = ctx.GRPC.CallsTo("BulkWrite");
   ctx.Equal(calls.size(), 2, "a write whose reply was lost; the calls");
   const auto first = calls[0].Request<logshard::BulkWriteRequest>();
@@ -962,7 +991,7 @@ void CheckStableBatchId(harness::Ctx& ctx) {
              "the attempts carried batch ids %q and %q and the result %q: every attempt of one batch must send the same id", first.batch_id(), second.batch_id(), result.batch_id);
   ctx.Assert(first.attempt() == 1 && second.attempt() == 2, "the attempts were numbered %d and %d, expected 1 and 2", first.attempt(), second.attempt());
   ctx.Equal(peer.documents, 2, "for a batch of 2 indexable records whose first reply was lost the retry wrote it again under a new batch id; the documents indexed");
-  const auto again = mustWrite(ctx, "a second batch");
+  const auto again = hMustWrite(ctx, "a second batch");
   ctx.Assert(again.batch_id != result.batch_id, "a new batch must get a new batch id");
 }
 `,

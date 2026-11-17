@@ -64,7 +64,7 @@ cannot be lined up with a log line. And any tenant can read any trace.
       id: 'tenant-scope',
       title: "Another tenant's trace is 404",
       detail:
-        "The trace's `owner` is compared with the caller and a foreign trace answers **404**, so the read path neither serves nor confirms another tenant's traces; the starter serves any trace to any tenant.",
+        "The trace's `owner` is compared with the caller and a foreign trace answers **404** with the same body as a trace that does not exist, so the read path neither serves nor confirms another tenant's traces; the starter serves any trace to any tenant.",
       match: {
         python: {all: [/["']owner["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']owner["']\]/]},
         typescript: {all: [/owner\s*!==\s*tenant|tenant\s*!==\s*\w+\.owner/]},
@@ -77,7 +77,7 @@ cannot be lined up with a log line. And any tenant can read any trace.
       id: 'gaps-visible',
       title: 'Every span is shown, and the missing parents are gaps',
       detail:
-        'No stored span is filtered out; each parent id that is not in the trace is reported in `gaps` with how many spans are `waiting` for it. The starter drops those spans, so the tree looks shorter and complete.',
+        'No stored span is filtered out; each parent id that is not in the trace is reported once in `gaps` with how many spans are `waiting` for it, ordered by `parent_span_id`. The starter drops those spans, so the tree looks shorter and complete.',
       match: {
         python: {all: [/waiting/], none: [/["']gaps["']\s*:\s*\[\]/]},
         typescript: {all: [/waiting/], none: [/gaps:\s*\[\]/]},
@@ -103,7 +103,7 @@ cannot be lined up with a log line. And any tenant can read any trace.
       id: 'absolute-timestamps',
       title: 'Spans carry absolute start and end times',
       detail:
-        'Each span reports the `start_ms` it was ingested with and `end_ms` = `start_ms + duration_ms`, so a span can be lined up with logs and deploys; the starter reports offsets from the earliest span.',
+        'Each span reports the `start_ms` it was ingested with, its `duration_ms` and `end_ms` = `start_ms + duration_ms`, so a span can be lined up with logs and deploys; the starter reports offsets from the earliest span.',
       match: {
         python: {all: [/end_ms/], none: [/-\s*origin/]},
         typescript: {all: [/end_ms/], none: [/-\s*origin/]},
@@ -620,16 +620,22 @@ async def check_tenant_scope(ctx):
     assert foreign.status_code == 404, f"tenant globex read acme's trace and got {foreign.status_code}: {foreign.text}. A trace owned by another tenant is 404"
     assert "checkout" not in foreign.text, f"the 404 for another tenant's trace leaks its content: {foreign.text}"
     assert missing.status_code == 404, f"a trace that does not exist answered {missing.status_code}"
+    assert foreign.text.replace(TRACE, OTHER) == missing.text, f"another tenant's trace must answer exactly as a missing one, or the answer confirms it exists: the foreign trace answered {foreign.text}, a missing one {missing.text}"
     assert own.status_code == 200, f"the owner reading its trace answered {own.status_code}: {own.text}"
 
 
 async def check_gaps_visible(ctx):
     _seed()
+    # Two more spans wait for one parent whose id sorts before NEVER and that they name after it.
+    early_parent = "00f067aa0ba902a0"
+    for span_id, start in (("00f067aa0ba902bb", T0 + 70), ("00f067aa0ba902bc", T0 + 80)):
+        assembly.insert_span("acme", {"trace_id": TRACE, "span_id": span_id, "parent_span_id": early_parent, "service": "search", "start_ms": start, "duration_ms": 5})
     async with _api(ctx) as c:
         body = await _ok(c)
     ids = [s.get("span_id") for s in body.get("spans", [])]
     assert ORPHAN in ids, f"span {ORPHAN} names a parent that never arrived and the read dropped it: spans {ids}. Every stored span must be shown"
-    assert body.get("gaps") == [{"parent_span_id": NEVER, "waiting": 1}], f"the parent {NEVER} never arrived and one span waits for it: gaps must be [{{parent_span_id: {NEVER}, waiting: 1}}], got {body.get('gaps')}"
+    want = [{"parent_span_id": early_parent, "waiting": 2}, {"parent_span_id": NEVER, "waiting": 1}]
+    assert body.get("gaps") == want, f"two spans wait for {early_parent} and one for {NEVER}, neither arrived: gaps must be {want}, one entry per missing parent with its waiting count, ordered by parent_span_id; got {body.get('gaps')}"
 
 
 async def check_partial_marker(ctx):
@@ -650,6 +656,7 @@ async def check_absolute_timestamps(ctx):
     for span in body.get("spans", []):
         start, duration = want[span["span_id"]]
         assert span.get("start_ms") == start, f"span {span['span_id']} was ingested with start_ms {start} and the read answers {span.get('start_ms')}: report the absolute time, not an offset"
+        assert span.get("duration_ms") == duration, f"span {span['span_id']} must carry its duration_ms {duration}, got {span.get('duration_ms')}"
         assert span.get("end_ms") == start + duration, f"span {span['span_id']} must carry end_ms = start_ms + duration_ms = {start + duration}, got {span.get('end_ms')}"
 `,
     typescript: `const TRACE = '4bf92f3577b34da6a3ce929d0e0e4736';
@@ -692,15 +699,23 @@ export async function check_tenant_scope(ctx) {
   assert.equal(foreign.status, 404, \`tenant globex read acme's trace and got \${foreign.status}: \${foreign.text}. A trace owned by another tenant is 404\`);
   assert(!foreign.text.includes('checkout'), \`the 404 for another tenant's trace leaks its content: \${foreign.text}\`);
   assert.equal(missing.status, 404, \`a trace that does not exist answered \${missing.status}\`);
+  assert.equal(foreign.text.replaceAll(TRACE, OTHER), missing.text, \`another tenant's trace must answer exactly as a missing one, or the answer confirms it exists: the foreign trace answered \${foreign.text}, a missing one \${missing.text}\`);
   assert.equal(own.status, 200, \`the owner reading its trace answered \${own.status}: \${own.text}\`);
 }
 
 export async function check_gaps_visible(ctx) {
   await seed(ctx);
+  // Two more spans wait for one parent whose id sorts before NEVER and that they name after it.
+  const earlyParent = '00f067aa0ba902a0';
+  const assembly = ctx.load('/support/traces/assembly.ts');
+  for (const [span_id, start_ms] of [['00f067aa0ba902bb', T0 + 70], ['00f067aa0ba902bc', T0 + 80]] as const) {
+    await assembly.insertSpan('acme', {trace_id: TRACE, span_id, parent_span_id: earlyParent, service: 'search', start_ms, duration_ms: 5});
+  }
   const body = await ok(api(ctx));
   const ids = (body.spans ?? []).map(s => s.span_id);
   assert(ids.includes(ORPHAN), \`span \${ORPHAN} names a parent that never arrived and the read dropped it: spans \${JSON.stringify(ids)}. Every stored span must be shown\`);
-  assert.deepStrictEqual(body.gaps, [{parent_span_id: NEVER, waiting: 1}], \`the parent \${NEVER} never arrived and one span waits for it: gaps must list it with waiting 1, got \${JSON.stringify(body.gaps)}\`);
+  const want = [{parent_span_id: earlyParent, waiting: 2}, {parent_span_id: NEVER, waiting: 1}];
+  assert.deepStrictEqual(body.gaps, want, \`two spans wait for \${earlyParent} and one for \${NEVER}, neither arrived: gaps must be \${JSON.stringify(want)}, one entry per missing parent with its waiting count, ordered by parent_span_id; got \${JSON.stringify(body.gaps)}\`);
 }
 
 export async function check_partial_marker(ctx) {
@@ -720,6 +735,7 @@ export async function check_absolute_timestamps(ctx) {
   for (const span of body.spans ?? []) {
     const [start, duration] = want[span.span_id];
     assert.equal(span.start_ms, start, \`span \${span.span_id} was ingested with start_ms \${start} and the read answers \${span.start_ms}: report the absolute time, not an offset\`);
+    assert.equal(span.duration_ms, duration, \`span \${span.span_id} must carry its duration_ms \${duration}, got \${span.duration_ms}\`);
     assert.equal(span.end_ms, start + duration, \`span \${span.span_id} must carry end_ms = start_ms + duration_ms = \${start + duration}, got \${span.end_ms}\`);
   }
 }
@@ -746,14 +762,20 @@ const (
 	rdT0     = int64(1712345678901)
 )
 
-type readBody struct {
-	RootSpanID string \`json:"root_span_id"\`
-	Partial    *bool  \`json:"partial"\`
-	Gaps       []gap  \`json:"gaps"\`
+type rdGap struct {
+	ParentSpanID string \`json:"parent_span_id"\`
+	Waiting      int    \`json:"waiting"\`
+}
+
+type rdBody struct {
+	RootSpanID string  \`json:"root_span_id"\`
+	Partial    *bool   \`json:"partial"\`
+	Gaps       []rdGap \`json:"gaps"\`
 	Spans      []struct {
-		SpanID  string \`json:"span_id"\`
-		StartMs int64  \`json:"start_ms"\`
-		EndMs   *int64 \`json:"end_ms"\`
+		SpanID     string \`json:"span_id"\`
+		StartMs    int64  \`json:"start_ms"\`
+		DurationMs *int64 \`json:"duration_ms"\`
+		EndMs      *int64 \`json:"end_ms"\`
 	} \`json:"spans"\`
 }
 
@@ -781,15 +803,15 @@ func rdGet(c *harness.HTTP, traceID, tenant string) *harness.Response {
 	return c.Get("/v1/traces/"+traceID, "X-Tenant-Id", tenant)
 }
 
-func rdOK(ctx *harness.Ctx, c *harness.HTTP, traceID string) readBody {
+func rdOK(ctx *harness.Ctx, c *harness.HTTP, traceID string) rdBody {
 	r := rdGet(c, traceID, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/traces/%s by its owner (%s)", traceID, r.Text())
-	var body readBody
+	var body rdBody
 	r.Decode(&body)
 	return body
 }
 
-func spanIDs(body readBody) []string {
+func rdSpanIDs(body rdBody) []string {
 	ids := []string{}
 	for _, s := range body.Spans {
 		ids = append(ids, s.SpanID)
@@ -801,7 +823,7 @@ func CheckRoute(ctx *harness.Ctx) {
 	rdSeed(ctx, rdTrace, false)
 	body := rdOK(ctx, rdAPI(ctx), rdTrace)
 	ctx.Equal(body.RootSpanID, rdRoot, "the trace's root_span_id")
-	ctx.Equal(spanIDs(body), []string{rdRoot, rdPay}, "the read must list both spans in start order; the span ids")
+	ctx.Equal(rdSpanIDs(body), []string{rdRoot, rdPay}, "the read must list both spans in start order; the span ids")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
@@ -810,21 +832,29 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	foreign := rdGet(c, rdTrace, "globex")
 	ctx.Equal(foreign.Status, 404, "tenant globex read acme's trace (%s): a trace owned by another tenant is 404", foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), "checkout"), "the 404 for another tenant's trace leaks its content: %s", foreign.Text())
-	ctx.Equal(rdGet(c, rdOther, "globex").Status, 404, "a trace that does not exist")
+	missing := rdGet(c, rdOther, "globex")
+	ctx.Equal(missing.Status, 404, "a trace that does not exist")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), rdTrace, rdOther), missing.Text(), "another tenant's trace must answer exactly as a missing one, or the answer confirms it exists; the foreign body (trace id swapped) against a missing one's")
 	own := rdGet(c, rdTrace, "acme")
 	ctx.Equal(own.Status, 200, "the owner reading its trace (%s)", own.Text())
 }
 
 func CheckGapsVisible(ctx *harness.Ctx) {
 	rdSeed(ctx, rdTrace, true)
+	// Two more spans wait for one parent whose id sorts before rdNever and that they name after it.
+	const earlyParent = "00f067aa0ba902a0"
+	for i, spanID := range []string{"00f067aa0ba902bb", "00f067aa0ba902bc"} {
+		_, err := assembly.InsertSpan(context.Background(), "acme", assembly.Span{TraceID: rdTrace, SpanID: spanID, ParentSpanID: earlyParent, Service: "search", StartMs: rdT0 + 70 + int64(i)*10, DurationMs: 5})
+		ctx.NoError(err, "seeding span %s", spanID)
+	}
 	body := rdOK(ctx, rdAPI(ctx), rdTrace)
-	ids := spanIDs(body)
+	ids := rdSpanIDs(body)
 	found := false
 	for _, id := range ids {
 		found = found || id == rdOrphan
 	}
 	ctx.Assert(found, "span %s names a parent that never arrived and the read dropped it: spans %q. Every stored span must be shown", rdOrphan, ids)
-	ctx.Equal(body.Gaps, []gap{{ParentSpanID: rdNever, Waiting: 1}}, "the parent %s never arrived and one span waits for it; gaps", rdNever)
+	ctx.Equal(body.Gaps, []rdGap{{ParentSpanID: earlyParent, Waiting: 2}, {ParentSpanID: rdNever, Waiting: 1}}, "two spans wait for %s and one for %s, neither arrived: one entry per missing parent with its waiting count, ordered by parent_span_id; gaps", earlyParent, rdNever)
 }
 
 func CheckPartialMarker(ctx *harness.Ctx) {
@@ -844,6 +874,7 @@ func CheckAbsoluteTimestamps(ctx *harness.Ctx) {
 	for _, s := range body.Spans {
 		w := want[s.SpanID]
 		ctx.Equal(s.StartMs, w[0], "span %s was ingested with start_ms %d: report the absolute time, not an offset; start_ms", s.SpanID, w[0])
+		ctx.Assert(s.DurationMs != nil && *s.DurationMs == w[1], "span %s must carry its duration_ms %d", s.SpanID, w[1])
 		ctx.Assert(s.EndMs != nil && *s.EndMs == w[0]+w[1], "span %s must carry end_ms = start_ms + duration_ms = %d", s.SpanID, w[0]+w[1])
 	}
 }
@@ -870,13 +901,13 @@ const std::string kOrphan = "00f067aa0ba902b9";
 const std::string kNever = "00f067aa0ba902ba";
 constexpr long long kT0 = 1712345678901LL;
 
-void seed(const std::string& trace_id, bool orphan) {
+void rdSeed(const std::string& trace_id, bool orphan) {
   assembly::insertSpan("acme", assembly::Span{trace_id, kRoot, "", "checkout", kT0, 412});
   assembly::insertSpan("acme", assembly::Span{trace_id, kPay, kRoot, "payments", kT0 + 40, 120});
   if (orphan) assembly::insertSpan("acme", assembly::Span{trace_id, kOrphan, kNever, "inventory", kT0 + 60, 30});
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP rdApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -884,15 +915,15 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response get(harness::HTTP& c, const std::string& trace_id, const std::string& tenant) { return c.Get("/v1/traces/" + trace_id, "X-Tenant-Id", tenant); }
+harness::Response rdGet(harness::HTTP& c, const std::string& trace_id, const std::string& tenant) { return c.Get("/v1/traces/" + trace_id, "X-Tenant-Id", tenant); }
 
-nlohmann::json ok(harness::Ctx& ctx, harness::HTTP& c, const std::string& trace_id) {
-  const auto r = get(c, trace_id, "acme");
+nlohmann::json rdOk(harness::Ctx& ctx, harness::HTTP& c, const std::string& trace_id) {
+  const auto r = rdGet(c, trace_id, "acme");
   ctx.Equal(r.Status, 200, "GET /v1/traces/%s by its owner (%s)", trace_id, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-std::vector<std::string> spanIds(const nlohmann::json& body) {
+std::vector<std::string> rdSpanIds(const nlohmann::json& body) {
   std::vector<std::string> ids;
   if (body.is_object() && body.contains("spans")) {
     for (const auto& s : body["spans"]) ids.push_back(s.value("span_id", ""));
@@ -903,52 +934,63 @@ std::vector<std::string> spanIds(const nlohmann::json& body) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  seed(kTrace, false);
-  auto c = api(ctx);
-  const auto body = ok(ctx, c, kTrace);
+  rdSeed(kTrace, false);
+  auto c = rdApi(ctx);
+  const auto body = rdOk(ctx, c, kTrace);
   ctx.Equal(body.value("root_span_id", ""), kRoot, "the trace's root_span_id");
-  ctx.Equal(spanIds(body), {kRoot, kPay}, "the read must list both spans in start order; the span ids");
+  ctx.Equal(rdSpanIds(body), {kRoot, kPay}, "the read must list both spans in start order; the span ids");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  seed(kTrace, true);
-  auto c = api(ctx);
-  const auto foreign = get(c, kTrace, "globex");
+  rdSeed(kTrace, true);
+  auto c = rdApi(ctx);
+  const auto foreign = rdGet(c, kTrace, "globex");
   ctx.Equal(foreign.Status, 404, "tenant globex read acme's trace (%s): a trace owned by another tenant is 404", foreign.Text());
   ctx.Assert(foreign.Text().find("checkout") == std::string::npos, "the 404 for another tenant's trace leaks its content: %s", foreign.Text());
-  ctx.Equal(get(c, kOther, "globex").Status, 404, "a trace that does not exist");
-  const auto own = get(c, kTrace, "acme");
+  const auto missing = rdGet(c, kOther, "globex");
+  ctx.Equal(missing.Status, 404, "a trace that does not exist");
+  std::string swapped = foreign.Text();
+  for (auto at = swapped.find(kTrace); at != std::string::npos; at = swapped.find(kTrace, at + kOther.size())) swapped.replace(at, kTrace.size(), kOther);
+  ctx.Equal(swapped, missing.Text(), "another tenant's trace must answer exactly as a missing one, or the answer confirms it exists; the foreign body (trace id swapped) against a missing one's");
+  const auto own = rdGet(c, kTrace, "acme");
   ctx.Equal(own.Status, 200, "the owner reading its trace (%s)", own.Text());
 }
 
 void CheckGapsVisible(harness::Ctx& ctx) {
-  seed(kTrace, true);
-  auto c = api(ctx);
-  const auto body = ok(ctx, c, kTrace);
-  const auto ids = spanIds(body);
+  rdSeed(kTrace, true);
+  // Two more spans wait for one parent whose id sorts before kNever and that they name after it.
+  const std::string early_parent = "00f067aa0ba902a0";
+  assembly::insertSpan("acme", assembly::Span{kTrace, "00f067aa0ba902bb", early_parent, "search", kT0 + 70, 5});
+  assembly::insertSpan("acme", assembly::Span{kTrace, "00f067aa0ba902bc", early_parent, "search", kT0 + 80, 5});
+  auto c = rdApi(ctx);
+  const auto body = rdOk(ctx, c, kTrace);
+  const auto ids = rdSpanIds(body);
   ctx.Assert(std::find(ids.begin(), ids.end(), kOrphan) != ids.end(), "span %s names a parent that never arrived and the read dropped it: spans %q. Every stored span must be shown", kOrphan, ids);
-  const nlohmann::json want = nlohmann::json::array({{{"parent_span_id", kNever}, {"waiting", 1}}});
-  ctx.Assert(body.value("gaps", nlohmann::json()) == want, "the parent %s never arrived and one span waits for it: gaps must be %s, got %s", kNever, want.dump(), body.value("gaps", nlohmann::json()).dump());
+  const nlohmann::json want = nlohmann::json::array({{{"parent_span_id", early_parent}, {"waiting", 2}}, {{"parent_span_id", kNever}, {"waiting", 1}}});
+  ctx.Assert(body.value("gaps", nlohmann::json()) == want,
+             "two spans wait for %s and one for %s, neither arrived: gaps must be %s, one entry per missing parent with its waiting count, ordered by parent_span_id; got %s", early_parent, kNever,
+             want.dump(), body.value("gaps", nlohmann::json()).dump());
 }
 
 void CheckPartialMarker(harness::Ctx& ctx) {
-  seed(kTrace, true);
-  seed(kOther, false);
-  auto c = api(ctx);
-  const auto partial = ok(ctx, c, kTrace);
-  const auto whole = ok(ctx, c, kOther);
+  rdSeed(kTrace, true);
+  rdSeed(kOther, false);
+  auto c = rdApi(ctx);
+  const auto partial = rdOk(ctx, c, kTrace);
+  const auto whole = rdOk(ctx, c, kOther);
   ctx.Assert(partial.value("partial", nlohmann::json()) == true, "a trace with a missing parent must be answered partial true, got %s", partial.value("partial", nlohmann::json()).dump());
   ctx.Assert(whole.value("partial", nlohmann::json()) == false, "a trace with every parent present must be answered partial false, got %s", whole.value("partial", nlohmann::json()).dump());
 }
 
 void CheckAbsoluteTimestamps(harness::Ctx& ctx) {
-  seed(kTrace, false);
-  auto c = api(ctx);
-  const auto body = ok(ctx, c, kTrace);
+  rdSeed(kTrace, false);
+  auto c = rdApi(ctx);
+  const auto body = rdOk(ctx, c, kTrace);
   const std::map<std::string, std::pair<long long, long long>> want = {{kRoot, {kT0, 412}}, {kPay, {kT0 + 40, 120}}};
   for (const auto& s : body.value("spans", nlohmann::json::array())) {
     const auto& [start, duration] = want.at(s.value("span_id", ""));
     ctx.Equal(s.value("start_ms", 0LL), start, "span %s was ingested with start_ms %v: report the absolute time, not an offset; start_ms", s.value("span_id", ""), start);
+    ctx.Equal(s.value("duration_ms", -1LL), duration, "span %s must carry its duration_ms; duration_ms", s.value("span_id", ""));
     ctx.Equal(s.value("end_ms", 0LL), start + duration, "span %s must carry end_ms = start_ms + duration_ms; end_ms", s.value("span_id", ""));
   }
 }

@@ -89,7 +89,7 @@ and a delivery that fails after \`produce\` returned.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the sku and the payload, and the call returns false. The starter only catches errors raised by `produce` itself, which covers the local queue and nothing the broker does.',
+        'An acknowledged delivery returns true and leaves no outbox row. A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the sku and the movement, and the call returns false without waiting much past the 2 s. The starter only catches errors raised by `produce` itself, which covers the local queue and nothing the broker does.',
       match: {
         python: {
           all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -658,17 +658,21 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_movement(_reservation(0), "reserved")
+    assert ok is True, f"publish_movement returned {ok!r} for a movement the broker acknowledged, expected True"
+    assert _outbox(ctx) == [], f"a movement the broker acknowledged left outbox rows {_outbox(ctx)}: the relay would publish it twice"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_movement(_reservation(1), "reserved")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the ledger never learns these units moved"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "sku-1" and rows[0].get("payload", {}).get("reservation_id") == "r-1", f"the outbox row is {rows[0]}, expected the topic, the key sku-1 and the payload"
+    payload = rows[0].get("payload") or {}
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "sku-1" and payload.get("reservation_id") == "r-1" and payload.get("reason") == "reserved" and payload.get("delta") == -3, f"the outbox row is {rows[0]}, expected the topic, the key sku-1 and the movement's payload"
     assert ok is False, f"publish_movement returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_movement(_reservation(2), "reserved")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_movement waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_movement waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("reservation_id") == "r-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_movement returned {ok!r} without a delivery report, expected False"
@@ -733,18 +737,23 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  let ok = await m.publishMovement(reservation(0), 'reserved');
+  await settle();
+  assert.equal(ok, true, \`publishMovement resolved \${JSON.stringify(ok)} for a movement the broker acknowledged, expected true\`);
+  assert.deepEqual(outboxRows(ctx), [], \`a movement the broker acknowledged left outbox rows \${JSON.stringify(outboxRows(ctx))}: the relay would publish it twice\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishMovement(reservation(1), 'reserved');
+  ok = await m.publishMovement(reservation(1), 'reserved');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the ledger never learns these units moved\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'sku-1' && rows[0].payload?.reservation_id === 'r-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key sku-1 and the payload\`);
+  const payload = rows[0].payload ?? {};
+  assert(rows[0].topic === TOPIC && rows[0].key === 'sku-1' && payload.reservation_id === 'r-1' && payload.reason === 'reserved' && payload.delta === -3, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key sku-1 and the movement's payload\`);
   assert.equal(ok, false, \`publishMovement resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishMovement(reservation(2), 'reserved');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishMovement waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishMovement waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.reservation_id === 'r-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishMovement resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -836,18 +845,22 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := eventsPublish(ctx, eventsReservation(0, "sku-1"), "reserved")
+	ctx.Settle()
+	ctx.Equal(ok, true, "publishMovement's result for a movement the broker acknowledged")
+	ctx.Equal(len(eventsOutbox(ctx)), 0, "outbox rows left by a movement the broker acknowledged (the relay would publish it twice)")
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
+	ok = eventsPublish(ctx, eventsReservation(1, "sku-1"), "reserved")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the ledger never learns these units moved; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "sku-1" && rows[0].Payload["reservation_id"] == "r-1", "the outbox row is %v, expected the topic, the key sku-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "sku-1" && rows[0].Payload["reservation_id"] == "r-1" && rows[0].Payload["reason"] == "reserved" && rows[0].Payload["delta"] == float64(-3), "the outbox row is %v, expected the topic, the key sku-1 and the movement's payload", rows[0])
 	ctx.Equal(ok, false, "publishMovement's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsReservation(2, "sku-1"), "reserved")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishMovement waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishMovement waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["reservation_id"] == "r-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishMovement's result without a delivery report")
@@ -930,20 +943,26 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publishMovement(eventsReservation(0), "reserved");
+  ctx.Settle();
+  ctx.Equal(ok, true, "publishMovement's result for a movement the broker acknowledged");
+  ctx.Equal(eventsOutbox(ctx).size(), 0, "outbox rows left by a movement the broker acknowledged (the relay would publish it twice)");
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishMovement(eventsReservation(1), "reserved");
+  ok = publishMovement(eventsReservation(1), "reserved");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the ledger never learns these units moved; the rows");
   ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "sku-1" &&
-                 rows[0].contains("payload") && eventsField(rows[0]["payload"], "reservation_id") == "r-1",
-             "the outbox row is %s, expected the topic, the key sku-1 and the payload", rows[0].dump());
+                 rows[0].contains("payload") && eventsField(rows[0]["payload"], "reservation_id") == "r-1" &&
+                 eventsField(rows[0]["payload"], "reason") == "reserved" && rows[0]["payload"].is_object() &&
+                 rows[0]["payload"].value("delta", 99LL) == -3,
+             "the outbox row is %s, expected the topic, the key sku-1 and the movement's payload", rows[0].dump());
   ctx.Equal(ok, false, "publishMovement's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishMovement(eventsReservation(2), "reserved");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishMovement waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishMovement waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "reservation_id") == "r-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());

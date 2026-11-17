@@ -23,8 +23,8 @@ append loses that step for good.
 - The record key is the **session id**.
 - \`step_event\` carries \`session_id\`, \`step_index\`, \`action\`, \`outcome\`, \`reason\` and
   \`target_digest\` (\`trace.digest(target)\`), nothing else: no \`text\`, \`target\` or \`url\`.
-- The consumer **appends first and commits after**; a redelivered step overwrites itself in the
-  trace.`,
+- The consumer **appends first and commits after**, and never commits a step whose append failed;
+  a redelivered step overwrites itself in the trace.`,
   sequence: {
     participants: ['Worker', 'browser.step', 'Trace consumer', 'Trace store'],
     messages: [
@@ -73,7 +73,7 @@ append loses that step for good.
       id: 'append-before-commit',
       title: 'Appends to the trace before committing the offset',
       detail:
-        'The consumer calls `append_step`/`appendStep` and only then commits, so a crash between the two redelivers the step instead of losing it.',
+        'The consumer calls `append_step`/`appendStep` and only then commits, so a crash between the two redelivers the step instead of losing it; a step whose append fails is never committed.',
       match: {
         python: {order: [/trace\.append_step\(/, /consumer\.commit\(/]},
         typescript: {order: [/appendStep\(/, /commitOffsets\(/]},
@@ -710,16 +710,25 @@ def check_append_before_commit(ctx):
     for index in (1, 2, 3):
         event = {"session_id": "s-1", "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.digest(f"#b{index}")}
         ctx.kafka.seed(TOPIC, key="s-1", value=json.dumps(event))
+    # The last record's append fails: browser:trace:s-9 is not a hash.
+    ctx.redis.set("browser:trace:s-9", "not a hash")
+    poisoned = {"session_id": "s-9", "step_index": 1, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.digest("#b1")}
+    ctx.kafka.seed(TOPIC, key="s-1", value=json.dumps(poisoned))
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(len(trace.read_trace("s-1"))))
     m = ctx.load("events")
-    ctx.drain(m.run_trace_consumer)
+    try:
+        ctx.drain(m.run_trace_consumer)
+    except Exception:
+        pass  # the failed append may stop the consumer
     assert at_commit, "the consumer never committed an offset"
     assert at_commit[0] >= 1, f"at the first commit the trace of s-1 held {at_commit[0]} steps: the offset was committed before the step was appended, so a crash in between loses it"
     assert at_commit == sorted(at_commit) and all(n >= i + 1 for i, n in enumerate(at_commit)), f"the trace lengths at each commit were {at_commit}: every commit must follow its append"
     steps = [e["step_index"] for e in trace.read_trace("s-1")]
     assert steps == [1, 2, 3], f"the trace of s-1 holds steps {steps}, expected [1, 2, 3]"
-    assert ctx.kafka.lag("trace-store", TOPIC) == 0, "every appended step must be committed"
+    lag = ctx.kafka.lag("trace-store", TOPIC)
+    assert lag != 0, "a step whose append failed (WRONGTYPE on browser:trace:s-9) was committed anyway: it is lost. Commit only after the append succeeds"
+    assert lag == 1, f"the lag is {lag} after three appended steps and one failed append: every appended step must be committed"
 `,
     typescript: `const TOPIC = 'browser.step';
 const EVENT_KEYS = ['action', 'outcome', 'reason', 'session_id', 'step_index', 'target_digest'];
@@ -778,16 +787,26 @@ export async function check_append_before_commit(ctx) {
     const event = {session_id: 's-1', step_index: index, action: 'click', outcome: 'ok', reason: '', target_digest: trace.digest(\`#b\${index}\`)};
     ctx.kafka.seed(TOPIC, {key: 's-1', value: JSON.stringify(event)});
   }
+  // The last record's append fails: browser:trace:s-9 is not a hash.
+  ctx.redis.set('browser:trace:s-9', 'not a hash');
+  const poisoned = {session_id: 's-9', step_index: 1, action: 'click', outcome: 'ok', reason: '', target_digest: trace.digest('#b1')};
+  ctx.kafka.seed(TOPIC, {key: 's-1', value: JSON.stringify(poisoned)});
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hlen('browser:trace:s-1')));
   const m = ctx.load('events');
-  await ctx.drain(m.runTraceConsumer());
+  try {
+    await ctx.drain(m.runTraceConsumer());
+  } catch {
+    // the failed append may stop the consumer
+  }
   assert(atCommit.length > 0, 'the consumer never committed an offset');
   assert(atCommit[0] >= 1, \`at the first commit the trace of s-1 held \${atCommit[0]} steps: the offset was committed before the step was appended, so a crash in between loses it\`);
   assert(atCommit.every((n, i) => n >= i + 1), \`the trace lengths at each commit were \${JSON.stringify(atCommit)}: every commit must follow its append\`);
   const steps = (await trace.readTrace('s-1')).map(e => e.step_index);
   assert.deepStrictEqual(steps, [1, 2, 3], \`the trace of s-1 holds steps \${JSON.stringify(steps)}, expected [1, 2, 3]\`);
-  assert.equal(ctx.kafka.lag('trace-store', TOPIC), 0, 'every appended step must be committed');
+  const lag = ctx.kafka.lag('trace-store', TOPIC);
+  assert.notEqual(lag, 0, 'a step whose append failed (WRONGTYPE on browser:trace:s-9) was committed anyway: it is lost. Commit only after the append succeeds');
+  assert.equal(lag, 1, \`the lag is \${lag} after three appended steps and one failed append: every appended step must be committed\`);
 }
 `,
     go: `package main
@@ -805,18 +824,18 @@ import (
 )
 
 const (
-	stepTopic = "browser.step"
-	canary    = "hunter2-CANARY-7731"
+	hStepTopic = "browser.step"
+	hCanary    = "hunter2-CANARY-7731"
 )
 
 var eventsBg = context.Background()
 
-func testStep(sessionID string, index int, action, target, text string) trace.Step {
+func hTestStep(sessionID string, index int, action, target, text string) trace.Step {
 	return trace.Step{SessionID: sessionID, StepIndex: index, Action: action, Target: target, Text: text, Outcome: "ok",
 		URL: fmt.Sprintf("https://www.example.com/%s/%d", sessionID, index), Digest: fmt.Sprintf("page#%d", index)}
 }
 
-func decode(raw []byte) map[string]any {
+func hDecode(raw []byte) map[string]any {
 	event := map[string]any{}
 	json.Unmarshal(raw, &event)
 	return event
@@ -824,17 +843,17 @@ func decode(raw []byte) map[string]any {
 
 func CheckSessionKey(ctx *harness.Ctx) {
 	for index := 1; index <= 4; index++ {
-		ctx.NoError(publishStep(eventsBg, testStep("s-1", index, "click", "#buy", "")), "publishStep(s-1, %d)", index)
+		ctx.NoError(publishStep(eventsBg, hTestStep("s-1", index, "click", "#buy", "")), "publishStep(s-1, %d)", index)
 		if index < 4 {
-			ctx.NoError(publishStep(eventsBg, testStep("s-2", index, "click", "#buy", "")), "publishStep(s-2, %d)", index)
+			ctx.NoError(publishStep(eventsBg, hTestStep("s-2", index, "click", "#buy", "")), "publishStep(s-2, %d)", index)
 		}
 	}
-	records := ctx.Kafka.Records(stepTopic)
-	ctx.Equal(len(records), 7, "7 published steps; records on %s", stepTopic)
+	records := ctx.Kafka.Records(hStepTopic)
+	ctx.Equal(len(records), 7, "7 published steps; records on %s", hStepTopic)
 	partitions := map[string]map[int]bool{}
 	order := map[string][]int{}
 	for _, r := range records {
-		event := decode(r.Value)
+		event := hDecode(r.Value)
 		session := fmt.Sprint(event["session_id"])
 		ctx.Equal(string(r.Key), session, "a step of %s must be keyed by its session id, so one session's steps share a partition; the key", session)
 		if partitions[session] == nil {
@@ -850,13 +869,13 @@ func CheckSessionKey(ctx *harness.Ctx) {
 }
 
 func CheckNoTypedValues(ctx *harness.Ctx) {
-	ctx.NoError(publishStep(eventsBg, testStep("s-1", 3, "type", "#password", canary)), "publishStep")
-	records := ctx.Kafka.Records(stepTopic)
-	ctx.Equal(len(records), 1, "one published step; records on %s", stepTopic)
+	ctx.NoError(publishStep(eventsBg, hTestStep("s-1", 3, "type", "#password", hCanary)), "publishStep")
+	records := ctx.Kafka.Records(hStepTopic)
+	ctx.Equal(len(records), 1, "one published step; records on %s", hStepTopic)
 	raw := string(records[0].Value)
-	ctx.Assert(!strings.Contains(raw, canary), "the typed password is on the topic: %s. The event must not carry text", raw)
+	ctx.Assert(!strings.Contains(raw, hCanary), "the typed password is on the topic: %s. The event must not carry text", raw)
 	ctx.Assert(!strings.Contains(raw, "#password") && !strings.Contains(raw, "https://www.example.com/"), "the event carries the selector or the URL: %s. Carry target_digest instead", raw)
-	event := decode(records[0].Value)
+	event := hDecode(records[0].Value)
 	keys := make([]string, 0, len(event))
 	for k := range event {
 		keys = append(keys, k)
@@ -870,8 +889,12 @@ func CheckNoTypedValues(ctx *harness.Ctx) {
 func CheckAppendBeforeCommit(ctx *harness.Ctx) {
 	for index := 1; index <= 3; index++ {
 		value, _ := json.Marshal(map[string]any{"session_id": "s-1", "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest(fmt.Sprintf("#b%d", index))})
-		ctx.Kafka.Seed(stepTopic, "s-1", string(value))
+		ctx.Kafka.Seed(hStepTopic, "s-1", string(value))
 	}
+	// The last record's append fails: browser:trace:s-9 is not a hash.
+	ctx.Redis.Set("browser:trace:s-9", "not a hash")
+	poisoned, _ := json.Marshal(map[string]any{"session_id": "s-9", "step_index": 1, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest("#b1")})
+	ctx.Kafka.Seed(hStepTopic, "s-1", string(poisoned))
 	var atCommit []int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		atCommit = append(atCommit, ctx.Redis.HLen("browser:trace:s-1"))
@@ -889,7 +912,9 @@ func CheckAppendBeforeCommit(ctx *harness.Ctx) {
 		steps = append(steps, trace.StepIndex(e))
 	}
 	ctx.Equal(steps, []int{1, 2, 3}, "the trace of s-1")
-	ctx.Equal(ctx.Kafka.Lag("trace-store", stepTopic), 0, "every appended step must be committed; the lag")
+	lag := ctx.Kafka.Lag("trace-store", hStepTopic)
+	ctx.Assert(lag != 0, "a step whose append failed (WRONGTYPE on browser:trace:s-9) was committed anyway: it is lost. Commit only after the append succeeds")
+	ctx.Assert(lag == 1, "the lag is %d after three appended steps and one failed append: every appended step must be committed", lag)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -906,16 +931,16 @@ func CheckAppendBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStepTopic = "browser.step";
-const std::string kCanary = "hunter2-CANARY-7731";
+const std::string hStepTopic = "browser.step";
+const std::string hCanary = "hunter2-CANARY-7731";
 
-trace::Step testStep(const std::string& session_id, long index, const std::string& action = "click", const std::string& target = "#buy",
-                     const std::string& text = "") {
+trace::Step hTestStep(const std::string& session_id, long index, const std::string& action = "click", const std::string& target = "#buy",
+                      const std::string& text = "") {
   return trace::Step{session_id, index, action, target, text, "ok", "https://www.example.com/" + session_id + "/" + std::to_string(index),
                      "page#" + std::to_string(index), ""};
 }
 
-nlohmann::json decode(const std::optional<std::string>& raw) {
+nlohmann::json hDecode(const std::optional<std::string>& raw) {
   const auto v = nlohmann::json::parse(raw.value_or(""), nullptr, false);
   return v.is_object() ? v : nlohmann::json::object();
 }
@@ -924,15 +949,15 @@ nlohmann::json decode(const std::optional<std::string>& raw) {
 
 void CheckSessionKey(harness::Ctx& ctx) {
   for (long index = 1; index <= 4; index++) {
-    publishStep(testStep("s-1", index));
-    if (index < 4) publishStep(testStep("s-2", index));
+    publishStep(hTestStep("s-1", index));
+    if (index < 4) publishStep(hTestStep("s-2", index));
   }
-  const auto records = ctx.Kafka.Records(kStepTopic);
-  ctx.Equal(records.size(), 7, "7 published steps; records on %s", kStepTopic);
+  const auto records = ctx.Kafka.Records(hStepTopic);
+  ctx.Equal(records.size(), 7, "7 published steps; records on %s", hStepTopic);
   std::map<std::string, std::set<int>> partitions;
   std::map<std::string, std::vector<long>> order;
   for (const auto& r : records) {
-    const auto event = decode(r.Value);
+    const auto event = hDecode(r.Value);
     const std::string session = event.value("session_id", "");
     ctx.Equal(r.Key.value_or(""), session, "a step of %s must be keyed by its session id, so one session's steps share a partition; the key", session);
     partitions[session].insert(r.Partition);
@@ -945,13 +970,13 @@ void CheckSessionKey(harness::Ctx& ctx) {
 }
 
 void CheckNoTypedValues(harness::Ctx& ctx) {
-  publishStep(testStep("s-1", 3, "type", "#password", kCanary));
-  const auto records = ctx.Kafka.Records(kStepTopic);
-  ctx.Equal(records.size(), 1, "one published step; records on %s", kStepTopic);
+  publishStep(hTestStep("s-1", 3, "type", "#password", hCanary));
+  const auto records = ctx.Kafka.Records(hStepTopic);
+  ctx.Equal(records.size(), 1, "one published step; records on %s", hStepTopic);
   const std::string raw = records[0].Value.value_or("");
-  ctx.Assert(raw.find(kCanary) == std::string::npos, "the typed password is on the topic: %s. The event must not carry text", raw);
+  ctx.Assert(raw.find(hCanary) == std::string::npos, "the typed password is on the topic: %s. The event must not carry text", raw);
   ctx.Assert(raw.find("#password") == std::string::npos && raw.find("https://www.example.com/") == std::string::npos, "the event carries the selector or the URL: %s. Carry target_digest instead", raw);
-  const auto event = decode(records[0].Value);
+  const auto event = hDecode(records[0].Value);
   std::vector<std::string> keys;
   for (const auto& item : event.items()) keys.push_back(item.key());
   std::sort(keys.begin(), keys.end());
@@ -963,11 +988,19 @@ void CheckNoTypedValues(harness::Ctx& ctx) {
 void CheckAppendBeforeCommit(harness::Ctx& ctx) {
   for (long index = 1; index <= 3; index++) {
     const nlohmann::json event = {{"session_id", "s-1"}, {"step_index", index}, {"action", "click"}, {"outcome", "ok"}, {"reason", ""}, {"target_digest", trace::digest("#b" + std::to_string(index))}};
-    ctx.Kafka.Seed(kStepTopic, "s-1", event.dump());
+    ctx.Kafka.Seed(hStepTopic, "s-1", event.dump());
   }
+  // The last record's append fails: browser:trace:s-9 is not a hash.
+  ctx.Redis.Set("browser:trace:s-9", "not a hash");
+  const nlohmann::json poisoned = {{"session_id", "s-9"}, {"step_index", 1}, {"action", "click"}, {"outcome", "ok"}, {"reason", ""}, {"target_digest", trace::digest("#b1")}};
+  ctx.Kafka.Seed(hStepTopic, "s-1", poisoned.dump());
   std::vector<long long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HLen("browser:trace:s-1")); });
-  ctx.Drain([] { runTraceConsumer(); });
+  try {
+    ctx.Drain([] { runTraceConsumer(); });
+  } catch (const std::exception&) {
+    // the failed append may stop the consumer
+  }
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
   ctx.Assert(atCommit[0] >= 1, "at the first commit the trace of s-1 held %d steps: the offset was committed before the step was appended, so a crash in between loses it", atCommit[0]);
   for (size_t i = 0; i < atCommit.size(); i++) {
@@ -976,7 +1009,9 @@ void CheckAppendBeforeCommit(harness::Ctx& ctx) {
   std::vector<long> steps;
   for (const auto& e : trace::readTrace("s-1")) steps.push_back(e.value("step_index", 0L));
   ctx.Equal(steps, std::vector<long>{1, 2, 3}, "the trace of s-1");
-  ctx.Equal(ctx.Kafka.Lag("trace-store", kStepTopic), 0, "every appended step must be committed; the lag");
+  const auto lag = ctx.Kafka.Lag("trace-store", hStepTopic);
+  ctx.Assert(lag != 0, "a step whose append failed (WRONGTYPE on browser:trace:s-9) was committed anyway: it is lost. Commit only after the append succeeds");
+  ctx.Assert(lag == 1, "the lag is %d after three appended steps and one failed append: every appended step must be committed", lag);
 }
 `,
   },

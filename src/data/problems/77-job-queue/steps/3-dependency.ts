@@ -56,7 +56,7 @@ still restarting; a hung executor holds the worker past its claim, so a second w
       id: 'retry-classes',
       title: 'Retries only the retryable statuses; a permanent one buries at once',
       detail:
-        '`INVALID_ARGUMENT` buries the job on its first attempt with `dead_reason = permanent_error` and puts it on `jobs:dead`; `UNAVAILABLE` schedules a retry. The starter retries every status alike.',
+        '`INVALID_ARGUMENT` buries the job on its first attempt with `dead_reason = permanent_error` and puts it on `jobs:dead`, and so do `FAILED_PRECONDITION`, `NOT_FOUND` and `PERMISSION_DENIED`; `UNAVAILABLE`, `RESOURCE_EXHAUSTED` and `ABORTED` each schedule a retry. The starter retries every status alike.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /RESOURCE_EXHAUSTED/, /ABORTED/, /permanent_error/]},
         typescript: {
@@ -120,7 +120,7 @@ still restarting; a hung executor holds the worker past its claim, so a second w
       id: 'backoff',
       title: 'Spaces retries 1 s, 2 s, 4 s apart',
       detail:
-        'After attempts 1, 2 and 3 fail, the retry is due 1 000, 2 000 and 4 000 ms later (`next_retry_at_ms` and the `jobs:inflight` score). The starter schedules every retry for now.',
+        'After attempts 1, 2, 3 and 4 fail, the retry is due 1 000, 2 000, 4 000 and 8 000 ms later (`next_retry_at_ms` and the `jobs:inflight` score). The starter schedules every retry for now.',
       match: {
         python: {all: [/BACKOFF_BASE_MS\s*(\*|<<)/]},
         typescript: {all: [/BACKOFF_BASE_MS\s*(\*|<<)/]},
@@ -133,7 +133,7 @@ still restarting; a hung executor holds the worker past its claim, so a second w
       id: 'call-deadline',
       title: 'Execute carries a deadline under the visibility timeout',
       detail:
-        'With an executor that takes 120 s, the call carries a deadline of at most 30 s and the attempt answers `retry`. The starter waits as long as the executor takes, past the 60 s claim, while the reaper hands the job to another worker.',
+        'With an executor that takes 120 s, the call carries a deadline of 30 s, `EXECUTE_TIMEOUT_S`, and the attempt answers `retry`. The starter waits as long as the executor takes, past the 60 s claim, while the reaper hands the job to another worker.',
       match: {
         python: {all: [/timeout\s*=\s*EXECUTE_TIMEOUT_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*EXECUTE_TIMEOUT_S/]},
@@ -694,10 +694,23 @@ def check_retry_classes(ctx):
     job = store.get_job("job-1")
     assert job["state"] == "dead" and job["dead_reason"] == "permanent_error", f"the buried job is {job}, expected dead with dead_reason permanent_error"
     assert ctx.redis.lrange("jobs:dead", 0, -1) == ["job-1"], f"jobs:dead holds {ctx.redis.lrange('jobs:dead', 0, -1)}"
-    _claimed("job-2")
-    ctx.grpc.fail("Execute", grpc.StatusCode.UNAVAILABLE, "executor restarting", 1)
-    outcome = m.run_attempt("job-2", "w-1")
-    assert outcome == "retry" and store.get_job("job-2")["state"] == "retrying", f"UNAVAILABLE returned {outcome!r} with the job {store.get_job('job-2')}: an executor that is down may be up later, so schedule a retry"
+    n = 1
+    # Every status outside the four retryable ones is permanent, not only INVALID_ARGUMENT.
+    for code in (grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.NOT_FOUND, grpc.StatusCode.PERMISSION_DENIED):
+        n += 1
+        job_id = f"job-{n}"
+        _claimed(job_id)
+        ctx.grpc.fail("Execute", code, "rejected", 1)
+        outcome = m.run_attempt(job_id, "w-1")
+        job = store.get_job(job_id)
+        assert outcome == "dead" and job["dead_reason"] == "permanent_error", f"{code.name} returned {outcome!r} with the job {job}: only UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED and ABORTED are retryable, any other status buries with permanent_error"
+    for code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.ABORTED):
+        n += 1
+        job_id = f"job-{n}"
+        _claimed(job_id)
+        ctx.grpc.fail("Execute", code, "try again later", 1)
+        outcome = m.run_attempt(job_id, "w-1")
+        assert outcome == "retry" and store.get_job(job_id)["state"] == "retrying", f"{code.name} returned {outcome!r} with the job {store.get_job(job_id)}: the executor may answer later, so schedule a retry"
 
 
 def check_attempts_durable(ctx):
@@ -722,8 +735,8 @@ def check_attempts_durable(ctx):
 
 def check_backoff(ctx):
     m, _ = _setup(ctx)
-    ctx.grpc.fail("Execute", grpc.StatusCode.UNAVAILABLE, "executor restarting", 3)
-    for attempt, delay in ((1, 1000), (2, 2000), (3, 4000)):
+    ctx.grpc.fail("Execute", grpc.StatusCode.UNAVAILABLE, "executor restarting", 4)
+    for attempt, delay in ((1, 1000), (2, 2000), (3, 4000), (4, 8000)):
         now = int(time.time() * 1000)
         outcome = m.run_attempt("job-1", "w-1")
         assert outcome == "retry", f"attempt {attempt} returned {outcome!r}"
@@ -740,7 +753,7 @@ def check_call_deadline(ctx):
     calls = ctx.grpc.calls_to("Execute")
     assert calls, "no Execute call was made"
     assert calls[0].timeout is not None, "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker"
-    assert calls[0].timeout <= 30.5, f"the Execute call carries a {calls[0].timeout} s deadline, expected EXECUTE_TIMEOUT_S = 30, under the 60 s visibility timeout"
+    assert 29.5 <= calls[0].timeout <= 30.5, f"the Execute call carries a {calls[0].timeout} s deadline, expected EXECUTE_TIMEOUT_S = 30: under the 60 s visibility timeout, and no shorter, or a job that needs 20 s never finishes"
     assert outcome == "retry", f"a call that hit its deadline returned {outcome!r}: DEADLINE_EXCEEDED is retryable"
 `,
     typescript: `const INVOICE = {invoice_id: 'inv-7', amount_cents: 1200};
@@ -795,11 +808,24 @@ export async function check_retry_classes(ctx) {
   const job = await store.getJob('job-1');
   assert(job.state === 'dead' && job.dead_reason === 'permanent_error', \`the buried job is \${JSON.stringify(job)}, expected dead with dead_reason permanent_error\`);
   assert.deepEqual(ctx.redis.lrange('jobs:dead', 0, -1), ['job-1'], 'jobs:dead must hold the buried job');
-  await claimed(queue, store, 'job-2');
-  ctx.grpc.fail('Execute', ctx.grpc.status.UNAVAILABLE, 'executor restarting', 1);
-  outcome = await m.runAttempt('job-2', 'w-1');
-  const second = await store.getJob('job-2');
-  assert(outcome === 'retry' && second.state === 'retrying', \`UNAVAILABLE returned \${outcome} with the job \${JSON.stringify(second)}: an executor that is down may be up later, so schedule a retry\`);
+  let n = 1;
+  // Every status outside the four retryable ones is permanent, not only INVALID_ARGUMENT.
+  for (const code of ['FAILED_PRECONDITION', 'NOT_FOUND', 'PERMISSION_DENIED']) {
+    const jobId = \`job-\${++n}\`;
+    await claimed(queue, store, jobId);
+    ctx.grpc.fail('Execute', ctx.grpc.status[code], 'rejected', 1);
+    outcome = await m.runAttempt(jobId, 'w-1');
+    const record = await store.getJob(jobId);
+    assert(outcome === 'dead' && record.dead_reason === 'permanent_error', \`\${code} returned \${outcome} with the job \${JSON.stringify(record)}: only UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED and ABORTED are retryable, any other status buries with permanent_error\`);
+  }
+  for (const code of ['UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'ABORTED']) {
+    const jobId = \`job-\${++n}\`;
+    await claimed(queue, store, jobId);
+    ctx.grpc.fail('Execute', ctx.grpc.status[code], 'try again later', 1);
+    outcome = await m.runAttempt(jobId, 'w-1');
+    const record = await store.getJob(jobId);
+    assert(outcome === 'retry' && record.state === 'retrying', \`\${code} returned \${outcome} with the job \${JSON.stringify(record)}: the executor may answer later, so schedule a retry\`);
+  }
 }
 
 export async function check_attempts_durable(ctx) {
@@ -824,8 +850,8 @@ export async function check_attempts_durable(ctx) {
 
 export async function check_backoff(ctx) {
   const {m, queue, store} = await setup(ctx);
-  ctx.grpc.fail('Execute', ctx.grpc.status.UNAVAILABLE, 'executor restarting', 3);
-  for (const [attempt, delay] of [[1, 1000], [2, 2000], [3, 4000]]) {
+  ctx.grpc.fail('Execute', ctx.grpc.status.UNAVAILABLE, 'executor restarting', 4);
+  for (const [attempt, delay] of [[1, 1000], [2, 2000], [3, 4000], [4, 8000]]) {
     const now = Date.now();
     const outcome = await m.runAttempt('job-1', 'w-1');
     assert.equal(outcome, 'retry', \`attempt \${attempt} returned \${outcome}\`);
@@ -843,7 +869,7 @@ export async function check_call_deadline(ctx) {
   const calls = ctx.grpc.callsTo('Execute');
   assert(calls.length > 0, 'no Execute call was made');
   assert(calls[0].timeout !== null, 'the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker');
-  assert(calls[0].timeout <= 30.5, \`the Execute call carries a \${calls[0].timeout} s deadline, expected EXECUTE_TIMEOUT_S = 30, under the 60 s visibility timeout\`);
+  assert(calls[0].timeout >= 29.5 && calls[0].timeout <= 30.5, \`the Execute call carries a \${calls[0].timeout} s deadline, expected EXECUTE_TIMEOUT_S = 30: under the 60 s visibility timeout, and no shorter, or a job that needs 20 s never finishes\`);
   assert.equal(outcome, 'retry', \`a call that hit its deadline returned \${outcome}: DEADLINE_EXCEEDED is retryable\`);
 }
 `,
@@ -852,6 +878,7 @@ export async function check_call_deadline(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -931,11 +958,26 @@ func CheckRetryClasses(ctx *harness.Ctx) {
 	job := store.GetJob(clientBg, "job-1")
 	ctx.Assert(job.State == "dead" && job.DeadReason == "permanent_error", "the buried job is %+v, expected dead with dead_reason permanent_error", job)
 	ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), []string{"job-1"}, "jobs:dead")
-	clientClaimed(ctx, "job-2")
-	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 1, "")
-	outcome = clientRun(ctx, "job-2")
-	second := store.GetJob(clientBg, "job-2")
-	ctx.Assert(outcome == "retry" && second.State == "retrying", "UNAVAILABLE returned %q with the job %+v: an executor that is down may be up later, so schedule a retry", outcome, second)
+	n := 1
+	// Every status outside the four retryable ones is permanent, not only INVALID_ARGUMENT.
+	for _, code := range []codes.Code{codes.FailedPrecondition, codes.NotFound, codes.PermissionDenied} {
+		n++
+		jobID := fmt.Sprintf("job-%d", n)
+		clientClaimed(ctx, jobID)
+		ctx.GRPC.Fail("Execute", code, "rejected", 1, "")
+		outcome = clientRun(ctx, jobID)
+		record := store.GetJob(clientBg, jobID)
+		ctx.Assert(outcome == "dead" && record.DeadReason == "permanent_error", "%v returned %q with the job %+v: only UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED and ABORTED are retryable, any other status buries with permanent_error", code, outcome, record)
+	}
+	for _, code := range []codes.Code{codes.Unavailable, codes.ResourceExhausted, codes.Aborted} {
+		n++
+		jobID := fmt.Sprintf("job-%d", n)
+		clientClaimed(ctx, jobID)
+		ctx.GRPC.Fail("Execute", code, "try again later", 1, "")
+		outcome = clientRun(ctx, jobID)
+		record := store.GetJob(clientBg, jobID)
+		ctx.Assert(outcome == "retry" && record.State == "retrying", "%v returned %q with the job %+v: the executor may answer later, so schedule a retry", code, outcome, record)
+	}
 }
 
 func CheckAttemptsDurable(ctx *harness.Ctx) {
@@ -965,8 +1007,8 @@ func CheckAttemptsDurable(ctx *harness.Ctx) {
 
 func CheckBackoff(ctx *harness.Ctx) {
 	clientSetup(ctx)
-	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 3, "")
-	for i, delay := range []int64{1000, 2000, 4000} {
+	ctx.GRPC.Fail("Execute", codes.Unavailable, "executor restarting", 4, "")
+	for i, delay := range []int64{1000, 2000, 4000, 8000} {
 		now := ctx.Clock.Now()
 		ctx.Equal(clientRun(ctx, "job-1"), "retry", "attempt %d", i+1)
 		due, _ := ctx.Redis.ZScore("jobs:inflight", "job-1")
@@ -983,7 +1025,7 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 	calls := ctx.GRPC.CallsTo("Execute", "")
 	ctx.Assert(len(calls) > 0, "no Execute call was made")
 	ctx.Assert(calls[0].HasDeadline(), "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker")
-	ctx.Assert(calls[0].Timeout <= 30500*time.Millisecond, "the Execute call carries a %v deadline, expected executeTimeout = 30 s, under the 60 s visibility timeout", calls[0].Timeout)
+	ctx.Assert(calls[0].Timeout >= 29500*time.Millisecond && calls[0].Timeout <= 30500*time.Millisecond, "the Execute call carries a %v deadline, expected executeTimeout = 30 s: under the 60 s visibility timeout, and no shorter, or a job that needs 20 s never finishes", calls[0].Timeout)
 	ctx.Equal(outcome, "retry", "a call that hit its deadline (DEADLINE_EXCEEDED is retryable); the outcome")
 }
 `,
@@ -992,6 +1034,7 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "job_queue.grpc.pb.h"
@@ -1056,11 +1099,34 @@ void CheckRetryClasses(harness::Ctx& ctx) {
   const auto job = store::getJob("job-1");
   ctx.Assert(job->state == "dead" && job->dead_reason == "permanent_error", "the buried job is %s with dead_reason %q, expected dead with permanent_error", job->state, job->dead_reason);
   ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), std::vector<std::string>{"job-1"}, "jobs:dead");
-  clientClaimed(ctx, "job-2");
-  ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 1);
-  outcome = runAttempt("job-2", "w-1");
-  const auto second = store::getJob("job-2");
-  ctx.Assert(outcome == "retry" && second->state == "retrying", "UNAVAILABLE returned %q with the job %s: an executor that is down may be up later, so schedule a retry", outcome, second->state);
+  int n = 1;
+  // Every status outside the four retryable ones is permanent, not only INVALID_ARGUMENT.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> permanent = {
+      {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+      {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+  };
+  for (const auto& [code, name] : permanent) {
+    const std::string job_id = "job-" + std::to_string(++n);
+    clientClaimed(ctx, job_id);
+    ctx.GRPC.Fail("Execute", code, "rejected", 1);
+    outcome = runAttempt(job_id, "w-1");
+    const auto record = store::getJob(job_id);
+    ctx.Assert(outcome == "dead" && record->dead_reason == "permanent_error", "%s returned %q with the job %s (dead_reason %q): only UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED and ABORTED are retryable, any other status buries with permanent_error", name, outcome, record->state, record->dead_reason);
+  }
+  const std::vector<std::pair<grpc::StatusCode, std::string>> retryable = {
+      {grpc::StatusCode::UNAVAILABLE, "UNAVAILABLE"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::ABORTED, "ABORTED"},
+  };
+  for (const auto& [code, name] : retryable) {
+    const std::string job_id = "job-" + std::to_string(++n);
+    clientClaimed(ctx, job_id);
+    ctx.GRPC.Fail("Execute", code, "try again later", 1);
+    outcome = runAttempt(job_id, "w-1");
+    const auto record = store::getJob(job_id);
+    ctx.Assert(outcome == "retry" && record->state == "retrying", "%s returned %q with the job %s: the executor may answer later, so schedule a retry", name, outcome, record->state);
+  }
 }
 
 void CheckAttemptsDurable(harness::Ctx& ctx) {
@@ -1087,9 +1153,9 @@ void CheckAttemptsDurable(harness::Ctx& ctx) {
 
 void CheckBackoff(harness::Ctx& ctx) {
   clientSetup(ctx);
-  ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 3);
+  ctx.GRPC.Fail("Execute", grpc::StatusCode::UNAVAILABLE, "executor restarting", 4);
   int attempt = 0;
-  for (const long long delay : {1000LL, 2000LL, 4000LL}) {
+  for (const long long delay : {1000LL, 2000LL, 4000LL, 8000LL}) {
     attempt++;
     const long long now = ctx.Clock.Now();
     ctx.Equal(runAttempt("job-1", "w-1"), "retry", "attempt %d", attempt);
@@ -1107,7 +1173,7 @@ void CheckCallDeadline(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("Execute");
   ctx.Assert(!calls.empty(), "no Execute call was made");
   ctx.Assert(calls[0].HasDeadline(), "the Execute call carries no deadline: an executor that hangs holds the worker past the 60 s visibility timeout, and the reaper hands the job to a second worker");
-  ctx.Assert(calls[0].TimeoutSeconds() <= 30.5, "the Execute call carries a %v s deadline, expected kExecuteTimeout = 30 s, under the 60 s visibility timeout", calls[0].TimeoutSeconds());
+  ctx.Assert(calls[0].TimeoutSeconds() >= 29.5 && calls[0].TimeoutSeconds() <= 30.5, "the Execute call carries a %v s deadline, expected kExecuteTimeout = 30 s: under the 60 s visibility timeout, and no shorter, or a job that needs 20 s never finishes", calls[0].TimeoutSeconds());
   ctx.Equal(outcome, "retry", "a call that hit its deadline (DEADLINE_EXCEEDED is retryable); the outcome");
 }
 `,

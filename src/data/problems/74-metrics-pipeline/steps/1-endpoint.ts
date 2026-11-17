@@ -42,7 +42,7 @@ handler partly dropped tells the sender to delete datapoints that were never sto
       id: 'route',
       title: 'Handles POST /v1/metrics for a tenant',
       detail:
-        'Register `POST /v1/metrics`, answer **401** without `X-Tenant-Id`, and hand a valid batch to `merge_batch`.',
+        'Register `POST /v1/metrics`, answer **401** without `X-Tenant-Id`, and hand a valid batch to `merge_batch`; `applied` is what it returned, so a redelivered batch answers `false`.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/metrics["']/, /merge_batch\(/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/metrics['"]/, /mergeBatch\(/]},
@@ -746,6 +746,9 @@ async def check_route(ctx):
         assert r.json() == {"accepted": 2, "applied": True}, f"a valid batch of 2 samples must answer {{accepted: 2, applied: true}}, got {r.json()}"
         stored = ctx.redis.hgetall(_key(a))
         assert stored.get("count") == "2" and float(stored.get("sum", 0)) == 5.0, f"{_key(a)} holds {stored} after the batch, expected count 2 and sum 5"
+        r = await _post(c, [a, b])
+        assert r.status_code == 200 and r.json().get("applied") is False, f"a redelivery of batch b-1 answered {r.status_code} {r.text}, expected 200 with applied false: applied reports what merge_batch did"
+        assert ctx.redis.hget(_key(a), "count") == "2", f"the redelivered batch b-1 was counted again: {_key(a)} holds {ctx.redis.hgetall(_key(a))}"
         r = await _post(c, [a], batch_id="b-2", tenant="")
     assert r.status_code == 401, f"a batch without X-Tenant-Id answered {r.status_code}, expected 401"
 
@@ -775,15 +778,17 @@ async def check_label_budget(ctx):
 
 
 async def check_timestamp_skew(ctx):
+    ctx.clock.advance((15 - time.time() % 10) % 10)  # now is a whole second ending in 5: no window starts exactly 3600 s ago
     async with _api(ctx) as c:
-        for ago, when in ((7200, "two hours old"), (-7200, "two hours in the future")):
+        for ago, when in ((7200, "two hours old"), (-7200, "two hours in the future"), (3601, "3601 s old"), (-3601, "3601 s in the future")):
             r = await _post(c, [_sample(), _sample(ago=ago)], batch_id=f"b{ago}")
             assert r.status_code == 400 and "timestamp_out_of_skew" in r.text, f"a sample {when} answered {r.status_code} {r.text}, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw"
         assert _written(ctx) == [], f"a batch with a stale sample wrote {_written(ctx)}"
-        late = _sample(ago=3500)
-        r = await _post(c, [late], batch_id="b-ok")
-    assert r.status_code == 200, f"a sample 3500 s old is within the skew and answered {r.status_code}: {r.text}"
-    assert ctx.redis.exists(_key(late)) == 1, f"the sample 3500 s old was not merged into {_key(late)}"
+        edge = [_sample(ago=3600), _sample(ago=-3600)]
+        r = await _post(c, edge, batch_id="b-ok")
+    assert r.status_code == 200, f"samples exactly 3600 s old and 3600 s ahead are within the skew (more than 3600 s away is out) and answered {r.status_code}: {r.text}"
+    for s in edge:
+        assert ctx.redis.exists(_key(s)) == 1, f"the sample at {s['timestamp']} (now {int(time.time())}) was not merged into {_key(s)}"
 
 
 async def check_validate_before_ack(ctx):
@@ -830,6 +835,9 @@ export async function check_route(ctx) {
   assert.deepStrictEqual(r.json(), {accepted: 2, applied: true}, \`a valid batch of 2 samples must answer {accepted: 2, applied: true}, got \${r.text}\`);
   const stored = ctx.redis.hgetall(keyOf(t, a));
   assert(stored.count === '2' && Number(stored.sum) === 5, \`\${keyOf(t, a)} holds \${JSON.stringify(stored)} after the batch, expected count 2 and sum 5\`);
+  r = await post(t.c, [a, b]);
+  assert(r.status === 200 && r.json().applied === false, \`a redelivery of batch b-1 answered \${r.status} \${r.text}, expected 200 with applied false: applied reports what mergeBatch did\`);
+  assert.equal(ctx.redis.hget(keyOf(t, a), 'count'), '2', 'the redelivered batch b-1 was counted again');
   r = await post(t.c, [a], 'b-2', '');
   assert.equal(r.status, 401, \`a batch without X-Tenant-Id answered \${r.status}, expected 401\`);
 }
@@ -859,15 +867,17 @@ export async function check_label_budget(ctx) {
 
 export async function check_timestamp_skew(ctx) {
   const t = setup(ctx);
-  for (const [ago, when] of [[7200, 'two hours old'], [-7200, 'two hours in the future']] as const) {
+  ctx.clock.advance(((15000 - (ctx.clock.now() % 10000)) % 10000) / 1000); // now is a whole second ending in 5: no window starts exactly 3600 s ago
+  const cases = [[7200, 'two hours old'], [-7200, 'two hours in the future'], [3601, '3601 s old'], [-3601, '3601 s in the future']] as const;
+  for (const [ago, when] of cases) {
     const r = await post(t.c, [sample(ctx), sample(ctx, {ago})], \`b\${ago}\`);
     assert(r.status === 400 && r.text.includes('timestamp_out_of_skew'), \`a sample \${when} answered \${r.status} \${r.text}, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw\`);
   }
   assert.deepStrictEqual(written(ctx), [], 'a batch with a stale sample must write nothing');
-  const late = sample(ctx, {ago: 3500});
-  const r = await post(t.c, [late], 'b-ok');
-  assert.equal(r.status, 200, \`a sample 3500 s old is within the skew and answered \${r.status}: \${r.text}\`);
-  assert.equal(ctx.redis.exists(keyOf(t, late)), 1, \`the sample 3500 s old was not merged into \${keyOf(t, late)}\`);
+  const edge = [sample(ctx, {ago: 3600}), sample(ctx, {ago: -3600})];
+  const r = await post(t.c, edge, 'b-ok');
+  assert.equal(r.status, 200, \`samples exactly 3600 s old and 3600 s ahead are within the skew (more than 3600 s away is out) and answered \${r.status}: \${r.text}\`);
+  for (const s of edge) assert.equal(ctx.redis.exists(keyOf(t, s)), 1, \`the sample at \${s.timestamp} (now \${now(ctx)}) was not merged into \${keyOf(t, s)}\`);
 }
 
 export async function check_validate_before_ack(ctx) {
@@ -933,6 +943,10 @@ func CheckRoute(ctx *harness.Ctx) {
 	ctx.Equal(r.JSON(), map[string]any{"accepted": 2, "applied": true}, "a valid batch of 2 samples must answer {accepted: 2, applied: true}")
 	stored := ctx.Redis.HGetAll(apiKey(a))
 	ctx.Assert(stored["count"] == "2" && stored["sum"] == "5", "%s holds %v after the batch, expected count 2 and sum 5", apiKey(a), stored)
+	r = apiPost(c, []model.Sample{a, b}, "b-1", "acme")
+	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"applied":false\`), "a redelivery of batch b-1 answered %d %s, expected 200 with applied false: applied reports what MergeBatch did", r.Status, r.Text())
+	count, _ := ctx.Redis.HGet(apiKey(a), "count")
+	ctx.Equal(count, "2", "the redelivered batch b-1 must not be counted again; the window's count")
 	r = apiPost(c, []model.Sample{a}, "b-2", "")
 	ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id")
 }
@@ -950,7 +964,7 @@ func CheckBatchLimit(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 200, "a batch of exactly 500 samples (%s)", r.Text())
 }
 
-func labelsOf(names ...string) map[string]string {
+func apiLabelsOf(names ...string) map[string]string {
 	out := map[string]string{}
 	for _, n := range names {
 		out[n] = "x"
@@ -965,25 +979,28 @@ func CheckLabelBudget(ctx *harness.Ctx) {
 	ctx.Equal(apiWritten(ctx), []string{}, "a batch with a label outside the allowlist must write nothing; keys written")
 	r = apiPost(c, []model.Sample{apiSample(ctx, "http_requests", map[string]string{"host": "a", "pod": "p-1"}, 5, 1)}, "b-2", "globex")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "pod"), "globex sent the label pod, which only acme may send, and got %d %s: the allowlist is per tenant", r.Status, r.Text())
-	nine := labelsOf("env", "host", "job", "method", "pod", "region", "route", "service", "status")
+	nine := apiLabelsOf("env", "host", "job", "method", "pod", "region", "route", "service", "status")
 	r = apiPost(c, []model.Sample{apiSample(ctx, "http_requests", nine, 5, 1)}, "b-3", "acme")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "too_many_labels"), "a sample with 9 labels answered %d %s, expected 422 too_many_labels", r.Status, r.Text())
-	eight := labelsOf("env", "host", "job", "method", "pod", "region", "route", "service")
+	eight := apiLabelsOf("env", "host", "job", "method", "pod", "region", "route", "service")
 	r = apiPost(c, []model.Sample{apiSample(ctx, "http_requests", eight, 5, 1)}, "b-4", "acme")
 	ctx.Equal(r.Status, 200, "a sample with 8 allowed labels (%s)", r.Text())
 }
 
 func CheckTimestampSkew(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	for _, ago := range []int64{7200, -7200} {
+	ctx.Clock.Advance(float64((15000-ctx.Clock.Now()%10000)%10000) / 1000) // now is a whole second ending in 5: no window starts exactly 3600 s ago
+	for _, ago := range []int64{7200, -7200, 3601, -3601} {
 		r := apiPost(c, []model.Sample{apiSample(ctx, "http_requests", nil, 5, 1), apiSample(ctx, "http_requests", nil, ago, 1)}, fmt.Sprintf("b%d", ago), "acme")
 		ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "timestamp_out_of_skew"), "a sample %d s old (negative: in the future) answered %d %s, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw", ago, r.Status, r.Text())
 	}
 	ctx.Equal(apiWritten(ctx), []string{}, "a batch with a stale sample must write nothing; keys written")
-	late := apiSample(ctx, "http_requests", nil, 3500, 1)
-	r := apiPost(c, []model.Sample{late}, "b-ok", "acme")
-	ctx.Equal(r.Status, 200, "a sample 3500 s old is within the skew (%s)", r.Text())
-	ctx.Equal(ctx.Redis.Exists(apiKey(late)), 1, "the sample 3500 s old must be merged into %s", apiKey(late))
+	edge := []model.Sample{apiSample(ctx, "http_requests", nil, 3600, 1), apiSample(ctx, "http_requests", nil, -3600, 1)}
+	r := apiPost(c, edge, "b-ok", "acme")
+	ctx.Equal(r.Status, 200, "samples exactly 3600 s old and 3600 s ahead are within the skew, more than 3600 s away is out (%s)", r.Text())
+	for _, s := range edge {
+		ctx.Equal(ctx.Redis.Exists(apiKey(s)), 1, "the sample at %d (now %d) must be merged into %s", s.Timestamp, ctx.Clock.Now()/1000, apiKey(s))
+	}
 }
 
 func CheckValidateBeforeAck(ctx *harness.Ctx) {
@@ -1012,8 +1029,8 @@ func CheckValidateBeforeAck(ctx *harness.Ctx) {
 
 namespace {
 
-using Labels = std::map<std::string, std::string>;
-const Labels kHost = {{"host", "a"}, {"region", "eu"}};
+using ApiLabels = std::map<std::string, std::string>;
+const ApiLabels kHost = {{"host", "a"}, {"region", "eu"}};
 
 harness::HTTP apiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -1023,7 +1040,7 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-metrics::Sample apiSample(harness::Ctx& ctx, const std::string& metric = "http_requests", const Labels& labels = kHost, long long ago = 5,
+metrics::Sample apiSample(harness::Ctx& ctx, const std::string& metric = "http_requests", const ApiLabels& labels = kHost, long long ago = 5,
                           double value = 1) {
   return metrics::Sample{metric, labels, ctx.Clock.Now() / 1000 - ago, value};
 }
@@ -1048,10 +1065,10 @@ std::vector<std::string> apiWritten(harness::Ctx& ctx) {
   return keys;
 }
 
-bool has(const harness::Response& r, const std::string& text) { return r.Text().find(text) != std::string::npos; }
+bool apiHas(const harness::Response& r, const std::string& text) { return r.Text().find(text) != std::string::npos; }
 
-Labels labelsOf(const std::vector<std::string>& names) {
-  Labels out;
+ApiLabels apiLabelsOf(const std::vector<std::string>& names) {
+  ApiLabels out;
   for (const auto& n : names) out[n] = "x";
   return out;
 }
@@ -1069,6 +1086,11 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto stored = ctx.Redis.HGetAll(apiKey(a));
   ctx.Assert(stored.count("count") && stored.at("count") == "2" && stored.count("sum") && std::stod(stored.at("sum")) == 5.0,
              "%s holds %v after the batch, expected count 2 and sum 5", apiKey(a), stored);
+  r = apiPost(c, {a, b});
+  const auto again = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(r.Status == 200 && again.is_object() && again.contains("applied") && again["applied"] == false,
+             "a redelivery of batch b-1 answered %d %s, expected 200 with applied false: applied reports what mergeBatch did", r.Status, r.Text());
+  ctx.Equal(ctx.Redis.HGet(apiKey(a), "count"), std::optional<std::string>("2"), "the redelivered batch b-1 must not be counted again; the window's count");
   r = apiPost(c, {a}, "b-2", "");
   ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id");
 }
@@ -1078,7 +1100,7 @@ void CheckBatchLimit(harness::Ctx& ctx) {
   std::vector<metrics::Sample> big;
   for (int i = 0; i < 501; i++) big.push_back(apiSample(ctx, "http_requests", kHost, 5, i));
   auto r = apiPost(c, big);
-  ctx.Assert(r.Status == 400 && has(r, "batch_too_large"), "a batch of 501 samples answered %d %s, expected 400 batch_too_large", r.Status, r.Text());
+  ctx.Assert(r.Status == 400 && apiHas(r, "batch_too_large"), "a batch of 501 samples answered %d %s, expected 400 batch_too_large", r.Status, r.Text());
   ctx.Equal(apiWritten(ctx).size(), 0, "a rejected batch must merge nothing; keys written");
   big.pop_back();
   r = apiPost(c, big, "b-2");
@@ -1088,37 +1110,40 @@ void CheckBatchLimit(harness::Ctx& ctx) {
 void CheckLabelBudget(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
   auto r = apiPost(c, {apiSample(ctx), apiSample(ctx, "http_requests", {{"host", "a"}, {"region", "eu"}, {"user_id", "u-81"}})});
-  ctx.Assert(r.Status == 422 && has(r, "user_id"), "a sample labelled user_id answered %d %s, expected 422 naming user_id: every user id would mint a series", r.Status, r.Text());
+  ctx.Assert(r.Status == 422 && apiHas(r, "user_id"), "a sample labelled user_id answered %d %s, expected 422 naming user_id: every user id would mint a series", r.Status, r.Text());
   ctx.Equal(apiWritten(ctx).size(), 0, "a batch with a label outside the allowlist must write nothing; keys written");
   r = apiPost(c, {apiSample(ctx, "http_requests", {{"host", "a"}, {"pod", "p-1"}})}, "b-2", "globex");
-  ctx.Assert(r.Status == 422 && has(r, "pod"), "globex sent the label pod, which only acme may send, and got %d %s: the allowlist is per tenant", r.Status, r.Text());
-  r = apiPost(c, {apiSample(ctx, "http_requests", labelsOf({"env", "host", "job", "method", "pod", "region", "route", "service", "status"}))}, "b-3");
-  ctx.Assert(r.Status == 422 && has(r, "too_many_labels"), "a sample with 9 labels answered %d %s, expected 422 too_many_labels", r.Status, r.Text());
-  r = apiPost(c, {apiSample(ctx, "http_requests", labelsOf({"env", "host", "job", "method", "pod", "region", "route", "service"}))}, "b-4");
+  ctx.Assert(r.Status == 422 && apiHas(r, "pod"), "globex sent the label pod, which only acme may send, and got %d %s: the allowlist is per tenant", r.Status, r.Text());
+  r = apiPost(c, {apiSample(ctx, "http_requests", apiLabelsOf({"env", "host", "job", "method", "pod", "region", "route", "service", "status"}))}, "b-3");
+  ctx.Assert(r.Status == 422 && apiHas(r, "too_many_labels"), "a sample with 9 labels answered %d %s, expected 422 too_many_labels", r.Status, r.Text());
+  r = apiPost(c, {apiSample(ctx, "http_requests", apiLabelsOf({"env", "host", "job", "method", "pod", "region", "route", "service"}))}, "b-4");
   ctx.Equal(r.Status, 200, "a sample with 8 allowed labels (%s)", r.Text());
 }
 
 void CheckTimestampSkew(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
-  for (long long ago : {7200LL, -7200LL}) {
+  ctx.Clock.Advance(double((15000 - ctx.Clock.Now() % 10000) % 10000) / 1000);  // now is a whole second ending in 5: no window starts exactly 3600 s ago
+  for (long long ago : {7200LL, -7200LL, 3601LL, -3601LL}) {
     const auto r = apiPost(c, {apiSample(ctx), apiSample(ctx, "http_requests", kHost, ago)}, "b" + std::to_string(ago));
-    ctx.Assert(r.Status == 400 && has(r, "timestamp_out_of_skew"), "a sample %d s old (negative: in the future) answered %d %s, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw", ago, r.Status, r.Text());
+    ctx.Assert(r.Status == 400 && apiHas(r, "timestamp_out_of_skew"), "a sample %d s old (negative: in the future) answered %d %s, expected 400 timestamp_out_of_skew: it would rewrite a window readers already saw", ago, r.Status, r.Text());
   }
   ctx.Equal(apiWritten(ctx).size(), 0, "a batch with a stale sample must write nothing; keys written");
-  const auto late = apiSample(ctx, "http_requests", kHost, 3500);
-  const auto r = apiPost(c, {late}, "b-ok");
-  ctx.Equal(r.Status, 200, "a sample 3500 s old is within the skew (%s)", r.Text());
-  ctx.Equal(ctx.Redis.Exists(apiKey(late)), 1, "the sample 3500 s old must be merged into %s", apiKey(late));
+  const std::vector<metrics::Sample> edge = {apiSample(ctx, "http_requests", kHost, 3600), apiSample(ctx, "http_requests", kHost, -3600)};
+  const auto r = apiPost(c, edge, "b-ok");
+  ctx.Equal(r.Status, 200, "samples exactly 3600 s old and 3600 s ahead are within the skew, more than 3600 s away is out (%s)", r.Text());
+  for (const auto& s : edge) {
+    ctx.Equal(ctx.Redis.Exists(apiKey(s)), 1, "the sample at %d (now %d) must be merged into %s", s.timestamp, ctx.Clock.Now() / 1000, apiKey(s));
+  }
 }
 
 void CheckValidateBeforeAck(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
   const auto good = apiSample(ctx);
   auto r = apiPost(c, {good, apiSample(ctx, "http requests")});
-  ctx.Assert(r.Status == 400 && has(r, "invalid_metric"), "a batch with a malformed metric name answered %d %s, expected 400 invalid_metric: a 200 tells the sender to drop a sample that was never stored", r.Status, r.Text());
+  ctx.Assert(r.Status == 400 && apiHas(r, "invalid_metric"), "a batch with a malformed metric name answered %d %s, expected 400 invalid_metric: a 200 tells the sender to drop a sample that was never stored", r.Status, r.Text());
   ctx.Equal(apiWritten(ctx).size(), 0, "the rejected batch must write nothing (validate the whole batch before mergeBatch); keys written");
   r = apiPost(c, {good});
-  ctx.Assert(r.Status == 200 && has(r, "\\"applied\\":true"), "the corrected retry of batch b-1 answered %d %s: the rejected attempt must leave the batch id unclaimed", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && apiHas(r, "\\"applied\\":true"), "the corrected retry of batch b-1 answered %d %s: the rejected attempt must leave the batch id unclaimed", r.Status, r.Text());
   ctx.Equal(ctx.Redis.HGet(apiKey(good), "count"), std::optional<std::string>("1"), "after the corrected retry, the window's count");
 }
 `,

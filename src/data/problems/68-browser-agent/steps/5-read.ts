@@ -87,7 +87,7 @@ for as long as the object exists.
       id: 'screenshot-expiry',
       title: 'The screenshot reference is signed and expires within 15 minutes',
       detail:
-        'The screenshot is `sign_screenshot`/`signScreenshot` with `SCREENSHOT_TTL_S` (900), answered with its `expires_at` and signed on each read; the starter answers the store’s permanent `public_url`.',
+        'The screenshot is `sign_screenshot`/`signScreenshot` for the session’s current `step_index` with `SCREENSHOT_TTL_S` (900), answered with its `expires_at` and signed on each read; the starter answers the store’s permanent `public_url`.',
       match: {
         python: {all: [/screenshots\.sign_screenshot\(/, /SCREENSHOT_TTL_S\s*=\s*900\b/], none: [/public_url\(/]},
         typescript: {all: [/signScreenshot\(/, /SCREENSHOT_TTL_S\s*=\s*900\b/], none: [/publicUrl\(/]},
@@ -507,12 +507,14 @@ async def check_screenshot_expiry(ctx):
         first = (await _get(c, sid)).json().get("screenshot", {})
         now = int(time.time())
         assert "expires_at" in first, f"the screenshot reference {first} has no expires_at: a permanent URL is a read credential for life"
-        assert 0 < first["expires_at"] - now <= 900, f"the screenshot expires {first['expires_at'] - now} s from now, expected at most SCREENSHOT_TTL_S = 900"
+        assert 899 <= first["expires_at"] - now <= 900, f"the screenshot expires {first['expires_at'] - now} s from now, expected SCREENSHOT_TTL_S = 900"
         assert screenshots.verify(first["url"], now), f"the screenshot store refuses {first['url']}: sign it with sign_screenshot"
+        assert first["url"].startswith(screenshots.public_url(sid, 3) + "?"), f"the screenshot reference {first['url']} is not the session's current step (3): sign {screenshots.public_url(sid, 3)}"
         assert not screenshots.verify(first["url"], now + 901), "the screenshot URL still works 901 s later"
         ctx.clock.advance(600)
         second = (await _get(c, sid)).json().get("screenshot", {})
     assert second.get("expires_at", 0) > first["expires_at"], f"a read 600 s later answered the same expiry {second.get('expires_at')}: sign the reference on every read"
+    assert 899 <= second["expires_at"] - (now + 600) <= 900, f"a read 600 s later expires {second['expires_at'] - now - 600} s after it, expected SCREENSHOT_TTL_S = 900"
 `,
     typescript: `async function world(ctx, steps = 3) {
   const sessions = ctx.load('/support/browser/sessions.ts');
@@ -559,16 +561,19 @@ export async function check_trace_bounded(ctx) {
 
 export async function check_screenshot_expiry(ctx) {
   const {c, sid} = await world(ctx);
-  const {verify} = ctx.load('/support/browser/screenshots.ts');
+  const {verify, publicUrl} = ctx.load('/support/browser/screenshots.ts');
   const first = (await get(c, sid)).json().screenshot ?? {};
   const now = Math.floor(ctx.clock.now() / 1000);
   assert(typeof first.expires_at === 'number', \`the screenshot reference \${JSON.stringify(first)} has no expires_at: a permanent URL is a read credential for life\`);
-  assert(first.expires_at - now > 0 && first.expires_at - now <= 900, \`the screenshot expires \${first.expires_at - now} s from now, expected at most SCREENSHOT_TTL_S = 900\`);
+  assert(first.expires_at - now >= 899 && first.expires_at - now <= 900, \`the screenshot expires \${first.expires_at - now} s from now, expected SCREENSHOT_TTL_S = 900\`);
   assert(verify(first.url, now), \`the screenshot store refuses \${first.url}: sign it with signScreenshot\`);
+  assert(String(first.url).startsWith(\`\${publicUrl(sid, 3)}?\`), \`the screenshot reference \${first.url} is not the session's current step (3): sign \${publicUrl(sid, 3)}\`);
   assert(!verify(first.url, now + 901), 'the screenshot URL still works 901 s later');
   ctx.clock.advance(600);
   const second = (await get(c, sid)).json().screenshot ?? {};
   assert((second.expires_at ?? 0) > first.expires_at, \`a read 600 s later answered the same expiry \${second.expires_at}: sign the reference on every read\`);
+  const later = second.expires_at - (now + 600);
+  assert(later >= 899 && later <= 900, \`a read 600 s later expires \${later} s after it, expected SCREENSHOT_TTL_S = 900\`);
 }
 `,
     go: `package main
@@ -577,6 +582,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"browser/screenshots"
 	"browser/sessions"
@@ -587,7 +593,7 @@ import (
 
 var readBg = context.Background()
 
-func world(ctx *harness.Ctx, steps int) (*harness.HTTP, string) {
+func hWorld(ctx *harness.Ctx, steps int) (*harness.HTTP, string) {
 	sid := sessions.CreateSession(readBg, "acme", "public-web", "buy a kettle", 200, "https://www.example.com/").ID
 	for index := 1; index <= steps; index++ {
 		trace.AppendStep(readBg, sid, map[string]any{"session_id": sid, "step_index": index, "action": "click", "outcome": "ok", "reason": "", "target_digest": trace.Digest(fmt.Sprintf("#b%d", index))})
@@ -598,7 +604,7 @@ func world(ctx *harness.Ctx, steps int) (*harness.HTTP, string) {
 	return ctx.HTTP(mux), sid
 }
 
-type readView struct {
+type hReadView struct {
 	SessionID       string \`json:"session_id"\`
 	BudgetRemaining int    \`json:"budget_remaining"\`
 	Steps           []struct {
@@ -610,16 +616,16 @@ type readView struct {
 	} \`json:"screenshot"\`
 }
 
-func read(c *harness.HTTP, sid, tenant string) (*harness.Response, readView) {
+func hRead(c *harness.HTTP, sid, tenant string) (*harness.Response, hReadView) {
 	r := c.Get("/v1/browser/sessions/"+sid, "X-Tenant-Id", tenant)
-	var v readView
+	var v hReadView
 	if r.Status == 200 {
 		r.Decode(&v)
 	}
 	return r, v
 }
 
-func indexes(v readView) []int {
+func hIndexes(v hReadView) []int {
 	out := []int{}
 	for _, s := range v.Steps {
 		out = append(out, s.StepIndex)
@@ -628,46 +634,49 @@ func indexes(v readView) []int {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, sid := world(ctx, 3)
-	r, v := read(c, sid, "acme")
+	c, sid := hWorld(ctx, 3)
+	r, v := hRead(c, sid, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/browser/sessions/%s (%s)", sid, r.Text())
 	ctx.Assert(v.SessionID == sid && v.BudgetRemaining == 197, "the read must answer the session's view (budget_remaining 197), got %s", r.Text())
-	ctx.Equal(indexes(v), []int{1, 2, 3}, "the read must answer the trace; steps")
+	ctx.Equal(hIndexes(v), []int{1, 2, 3}, "the read must answer the trace; steps")
 	ctx.Assert(v.Screenshot.URL != "", "the read must answer a screenshot reference, got %s", r.Text())
 	r = c.Get("/v1/browser/sessions/" + sid)
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c, sid := world(ctx, 3)
-	foreign, _ := read(c, sid, "globex")
-	missing, _ := read(c, "s-404", "globex")
+	c, sid := hWorld(ctx, 3)
+	foreign, _ := hRead(c, sid, "globex")
+	missing, _ := hRead(c, "s-404", "globex")
 	ctx.Equal(foreign.Status, 404, "tenant globex read acme's session %s: a foreign session must be 404 (%s)", sid, foreign.Text())
 	ctx.Equal(foreign.Text(), missing.Text(), "a foreign session and a missing one must be indistinguishable; the body")
 }
 
 func CheckTraceBounded(ctx *harness.Ctx) {
-	c, sid := world(ctx, 60)
-	r, v := read(c, sid, "acme")
+	c, sid := hWorld(ctx, 60)
+	r, v := hRead(c, sid, "acme")
 	ctx.Equal(r.Status, 200, "the read (%s)", r.Text())
 	want := []int{}
 	for i := 11; i <= 60; i++ {
 		want = append(want, i)
 	}
-	ctx.Equal(indexes(v), want, "a 60-step session must answer the last traceLimit = 50 steps, 11 to 60 in order; steps")
+	ctx.Equal(hIndexes(v), want, "a 60-step session must answer the last traceLimit = 50 steps, 11 to 60 in order; steps")
 }
 
 func CheckScreenshotExpiry(ctx *harness.Ctx) {
-	c, sid := world(ctx, 3)
-	_, first := read(c, sid, "acme")
+	c, sid := hWorld(ctx, 3)
+	_, first := hRead(c, sid, "acme")
 	now := ctx.Clock.Now() / 1000
 	ctx.Assert(first.Screenshot.ExpiresAt > 0, "the screenshot reference has no expires_at: a permanent URL is a read credential for life")
-	ctx.Assert(first.Screenshot.ExpiresAt-now > 0 && first.Screenshot.ExpiresAt-now <= 900, "the screenshot expires %d s from now, expected at most screenshotTTLS = 900", first.Screenshot.ExpiresAt-now)
+	ctx.Assert(first.Screenshot.ExpiresAt-now >= 899 && first.Screenshot.ExpiresAt-now <= 900, "the screenshot expires %d s from now, expected screenshotTTLS = 900", first.Screenshot.ExpiresAt-now)
 	ctx.Assert(screenshots.Verify(first.Screenshot.URL, now), "the screenshot store refuses %s: sign it with SignScreenshot", first.Screenshot.URL)
+	ctx.Assert(strings.HasPrefix(first.Screenshot.URL, screenshots.PublicURL(sid, 3)+"?"), "the screenshot reference %s is not the session's current step (3): sign %s", first.Screenshot.URL, screenshots.PublicURL(sid, 3))
 	ctx.Assert(!screenshots.Verify(first.Screenshot.URL, now+901), "the screenshot URL still works 901 s later")
 	ctx.Clock.Advance(600)
-	_, second := read(c, sid, "acme")
+	_, second := hRead(c, sid, "acme")
 	ctx.Assert(second.Screenshot.ExpiresAt > first.Screenshot.ExpiresAt, "a read 600 s later answered the same expiry %d: sign the reference on every read", second.Screenshot.ExpiresAt)
+	later := second.Screenshot.ExpiresAt - (now + 600)
+	ctx.Assert(later >= 899 && later <= 900, "a read 600 s later expires %d s after it, expected screenshotTTLS = 900", later)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -683,12 +692,12 @@ func CheckScreenshotExpiry(ctx *harness.Ctx) {
 
 namespace {
 
-struct World {
+struct HWorld {
   harness::HTTP c;
   std::string sid;
 };
 
-World world(harness::Ctx& ctx, long steps) {
+HWorld hWorld(harness::Ctx& ctx, long steps) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -698,15 +707,15 @@ World world(harness::Ctx& ctx, long steps) {
     trace::appendStep(sid, {{"session_id", sid}, {"step_index", index}, {"action", "click"}, {"outcome", "ok"}, {"reason", ""}, {"target_digest", trace::digest("#b" + std::to_string(index))}});
   }
   ctx.Redis.Do("HSET", sessions::sessionKey(sid), "step_index", std::to_string(steps), "budget_remaining", std::to_string(200 - steps));
-  return World{ctx.HTTP(*svr), sid};
+  return HWorld{ctx.HTTP(*svr), sid};
 }
 
-nlohmann::json bodyOf(const harness::Response& r) {
+nlohmann::json hBodyOf(const harness::Response& r) {
   const auto v = nlohmann::json::parse(r.Text(), nullptr, false);
   return v.is_object() ? v : nlohmann::json::object();
 }
 
-std::vector<long> indexes(const nlohmann::json& body) {
+std::vector<long> hIndexes(const nlohmann::json& body) {
   std::vector<long> out;
   if (body.contains("steps") && body["steps"].is_array()) {
     for (const auto& s : body["steps"]) out.push_back(s.value("step_index", 0L));
@@ -717,19 +726,19 @@ std::vector<long> indexes(const nlohmann::json& body) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto w = world(ctx, 3);
+  auto w = hWorld(ctx, 3);
   auto r = w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/browser/sessions/%s (%s)", w.sid, r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.value("session_id", "") == w.sid && body.value("budget_remaining", 0L) == 197, "the read must answer the session's view (budget_remaining 197), got %s", r.Text());
-  ctx.Equal(indexes(body), std::vector<long>{1, 2, 3}, "the read must answer the trace; steps");
+  ctx.Equal(hIndexes(body), std::vector<long>{1, 2, 3}, "the read must answer the trace; steps");
   ctx.Assert(body.contains("screenshot") && !body["screenshot"].value("url", "").empty(), "the read must answer a screenshot reference, got %s", r.Text());
   r = w.c.Get("/v1/browser/sessions/" + w.sid);
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto w = world(ctx, 3);
+  auto w = hWorld(ctx, 3);
   const auto foreign = w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "globex");
   const auto missing = w.c.Get("/v1/browser/sessions/s-404", "X-Tenant-Id", "globex");
   ctx.Equal(foreign.Status, 404, "tenant globex read acme's session %s: a foreign session must be 404 (%s)", w.sid, foreign.Text());
@@ -737,26 +746,31 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckTraceBounded(harness::Ctx& ctx) {
-  auto w = world(ctx, 60);
+  auto w = hWorld(ctx, 60);
   const auto r = w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
   std::vector<long> want;
   for (long i = 11; i <= 60; i++) want.push_back(i);
-  ctx.Equal(indexes(bodyOf(r)), want, "a 60-step session must answer the last kTraceLimit = 50 steps, 11 to 60 in order; steps");
+  ctx.Equal(hIndexes(hBodyOf(r)), want, "a 60-step session must answer the last kTraceLimit = 50 steps, 11 to 60 in order; steps");
 }
 
 void CheckScreenshotExpiry(harness::Ctx& ctx) {
-  auto w = world(ctx, 3);
-  const auto first = bodyOf(w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme")).value("screenshot", nlohmann::json::object());
+  auto w = hWorld(ctx, 3);
+  const auto first = hBodyOf(w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme")).value("screenshot", nlohmann::json::object());
   const long long now = ctx.Clock.Now() / 1000;
   const long long expires = first.value("expires_at", 0LL);
+  const std::string url = first.value("url", "");
   ctx.Assert(expires > 0, "the screenshot reference %s has no expires_at: a permanent URL is a read credential for life", first.dump());
-  ctx.Assert(expires - now > 0 && expires - now <= 900, "the screenshot expires %d s from now, expected at most kScreenshotTtlS = 900", expires - now);
-  ctx.Assert(screenshots::verify(first.value("url", ""), now), "the screenshot store refuses %s: sign it with signScreenshot", first.value("url", ""));
-  ctx.Assert(!screenshots::verify(first.value("url", ""), now + 901), "the screenshot URL still works 901 s later");
+  ctx.Assert(expires - now >= 899 && expires - now <= 900, "the screenshot expires %d s from now, expected kScreenshotTtlS = 900", expires - now);
+  ctx.Assert(screenshots::verify(url, now), "the screenshot store refuses %s: sign it with signScreenshot", url);
+  const std::string current = screenshots::publicUrl(w.sid, 3) + "?";
+  ctx.Assert(url.rfind(current, 0) == 0, "the screenshot reference %s is not the session's current step (3): sign %s", url, screenshots::publicUrl(w.sid, 3));
+  ctx.Assert(!screenshots::verify(url, now + 901), "the screenshot URL still works 901 s later");
   ctx.Clock.Advance(600);
-  const auto second = bodyOf(w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme")).value("screenshot", nlohmann::json::object());
+  const auto second = hBodyOf(w.c.Get("/v1/browser/sessions/" + w.sid, "X-Tenant-Id", "acme")).value("screenshot", nlohmann::json::object());
   ctx.Assert(second.value("expires_at", 0LL) > expires, "a read 600 s later answered the same expiry %d: sign the reference on every read", second.value("expires_at", 0LL));
+  const long long later = second.value("expires_at", 0LL) - (now + 600);
+  ctx.Assert(later >= 899 && later <= 900, "a read 600 s later expires %d s after it, expected kScreenshotTtlS = 900", later);
 }
 `,
   },
