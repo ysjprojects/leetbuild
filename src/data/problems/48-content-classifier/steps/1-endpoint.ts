@@ -20,12 +20,13 @@ empty or unbounded document reaches an expensive call; one tenant classifies aga
 tenant's taxonomy; and a label the model invented flows downstream as if the taxonomy contained it.
 
 - A \`mime_type\` that is not \`text/*\` is **415**, and nothing reaches the model.
-- The text is trimmed: empty is **400**, more than \`MAX_TEXT_BYTES\` (64 KiB) of UTF-8 is **413**.
+- The text is trimmed, and the trimmed text is what the model sees: empty is **400**, more than
+  \`MAX_TEXT_BYTES\` (64 KiB) of UTF-8 is **413**.
 - A missing \`X-Tenant-Id\` is **401**. The taxonomy comes from \`taxonomies.load(tenant,
   taxonomy_id, version)\` at the requested version (the latest when absent); one the tenant does
-  not own is **404**.
-- \`bind_labels\` keeps the labels the version contains; the rest go to \`unknown_labels\` and add
-  \`REVIEW_LABEL\` (\`review\`), which is also the answer when no label survives.`,
+  not own, or a version it does not have, is **404**.
+- \`bind_labels\` keeps the labels the requested version contains; the rest go to \`unknown_labels\`
+  and add \`REVIEW_LABEL\` (\`review\`), which is also the answer when no label survives.`,
   sequence: {
     participants: ['Client', 'Content Classifier', 'taxonomy store', 'Model'],
     messages: [
@@ -70,7 +71,7 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
       id: 'content-type',
       title: 'Rejects a document that is not text with 415',
       detail:
-        'A `mime_type` outside `text/*` (an image, an octet stream) is **415** and never reaches the model; `text/markdown` is classified. The starter sends whatever bytes it gets.',
+        'A `mime_type` outside `text/*` (an image, a PDF, an octet stream) is **415** and never reaches the model; `text/markdown` and `text/csv` are classified. The starter sends whatever bytes it gets.',
       match: {
         python: {all: [/\.startswith\(\s*["']text\/["']\s*\)/, /\b415\b/]},
         typescript: {all: [/\.startsWith\(\s*['"]text\/['"]\s*\)/, /\b415\b/]},
@@ -83,7 +84,7 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
       id: 'size-and-empty',
       title: 'Trims, then rejects empty text (400) and more than 64 KiB (413)',
       detail:
-        'The trimmed text is **400** when empty and **413** when its UTF-8 encoding exceeds `MAX_TEXT_BYTES` (`1 << 16`), both before any model call. The starter checks neither.',
+        'The trimmed text is **400** when empty and **413** when its UTF-8 encoding exceeds `MAX_TEXT_BYTES` (`1 << 16`), both before any model call, and the model receives the trimmed text. The starter checks neither.',
       match: {
         python: {all: [/MAX_TEXT_BYTES\s*=/, /\b413\b/, /\b400\b/, /\.strip\(\)/]},
         typescript: {all: [/MAX_TEXT_BYTES\s*=/, /\b413\b/, /\b400\b/, /\.trim\(\)/]},
@@ -96,7 +97,7 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
       id: 'tenant-scope',
       title: 'Resolves the taxonomy for this tenant at the requested version',
       detail:
-        'A missing `X-Tenant-Id` is **401**; the taxonomy comes from `taxonomies.load(tenant, …)` at the requested version, so another tenant’s taxonomy is **404**. The starter uses `by_id`, which finds any tenant’s taxonomy and only its latest version.',
+        'A missing `X-Tenant-Id` is **401**; the taxonomy comes from `taxonomies.load(tenant, …)` at the requested version, so another tenant’s taxonomy, or a version that does not exist, is **404**. The starter uses `by_id`, which finds any tenant’s taxonomy and only its latest version.',
       match: {
         python: {all: [/taxonomies\.load\(\s*tenant/, /\b401\b/], none: [/taxonomies\.by_id\(/]},
         typescript: {all: [/taxonomies\.load\(\s*tenant/, /\b401\b/], none: [/taxonomies\.byId\(/]},
@@ -112,7 +113,7 @@ tenant's taxonomy; and a label the model invented flows downstream as if the tax
       id: 'taxonomy-binding',
       title: 'Binds labels to the taxonomy version, invented labels to review',
       detail:
-        'The response’s `labels` come from `bind_labels`/`bindLabels` over the model’s labels: only labels the version contains, plus `REVIEW_LABEL` when one was unknown or none survived, and the unknown ones in `unknown_labels`. The starter returns the model’s strings unchecked.',
+        'The response’s `labels` come from `bind_labels`/`bindLabels` over the model’s labels: only labels the requested version contains, plus `REVIEW_LABEL` when one was unknown or none survived, and the unknown ones in `unknown_labels`. The starter returns the model’s strings unchecked.',
       match: {
         python: {
           all: [/def bind_labels\(/, /REVIEW_LABEL/, /bind_labels\(\s*result\[/],
@@ -790,6 +791,11 @@ async def check_content_type(ctx):
         r = await _classify(c, mime_type="application/octet-stream")
         assert r.status_code == 415, f"a document of type application/octet-stream answered {r.status_code}, expected 415"
         assert _calls(ctx) == 0, "an octet stream reached the model"
+        r = await _classify(c, mime_type="application/pdf")
+        assert r.status_code == 415, f"a document of type application/pdf answered {r.status_code}, expected 415: every type outside text/* is refused, not only images and octet streams"
+        assert _calls(ctx) == 0, "a PDF reached the model"
+        r = await _classify(c, mime_type="text/csv")
+        assert r.status_code == 200, f"a text/csv document is text and must be classified, got {r.status_code}: {r.text}"
         r = await _classify(c, mime_type="text/markdown")
     assert r.status_code == 200, f"a text/markdown document is text and must be classified, got {r.status_code}: {r.text}"
 
@@ -805,7 +811,9 @@ async def check_size_and_empty(ctx):
         assert r.status_code == 413, f"40000 accented letters are 80000 bytes of UTF-8 and answered {r.status_code}, expected 413: the cap counts bytes, not characters"
         assert _calls(ctx) == 0, f"an oversized document reached the model ({_calls(ctx)} Classify calls)"
         r = await _classify(c, text="  " + "a" * (64 * 1024) + "  ")
-    assert r.status_code == 200, f"64 KiB of text with surrounding spaces answered {r.status_code}: the cap applies to the trimmed text"
+        assert r.status_code == 200, f"64 KiB of text with surrounding spaces answered {r.status_code}: the cap applies to the trimmed text"
+        r = await _classify(c, text="  refuse: please refund  ")
+    assert r.status_code == 200 and r.json().get("provenance") == "fallback", f"the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got {r.status_code} {r.text}"
 
 
 async def check_tenant_scope(ctx):
@@ -815,6 +823,9 @@ async def check_tenant_scope(ctx):
         r = await _classify(c, tenant="globex")
         assert r.status_code == 404, f"tenant globex classified against acme's taxonomy tx-support and got {r.status_code}, expected 404"
         assert _calls(ctx) == 0, "a request for another tenant's taxonomy reached the model"
+        r = await _classify(c, version=2)
+        assert r.status_code == 404, f"a request for version 2 of a taxonomy that has only version 1 answered {r.status_code}, expected 404"
+        assert _calls(ctx) == 0, "a request for a version that does not exist reached the model"
         taxonomies.put_version("acme", "tx-support", ["billing", "support", "security", "abuse"])
         r = await _classify(c, version=1)
         assert r.status_code == 200 and r.json().get("taxonomy_version") == 1, f"a request for version 1 must be classified against version 1, got {r.status_code} {r.text}"
@@ -831,8 +842,15 @@ async def check_taxonomy_binding(ctx):
         assert body.get("unknown_labels") == ["urgent"], f"the invented label must be reported in unknown_labels, got {body.get('unknown_labels')}"
         body = (await _classify(c, text="hello there #weather")).json()
         assert body.get("labels") == ["review"] and body.get("unknown_labels") == ["weather"], f"with no known label the document goes to review alone, got {body}"
+        body = (await _classify(c, text="hello there")).json()
+        assert body.get("labels") == ["review"] and body.get("unknown_labels") == [], f"a document the model gave no label goes to review, got {body}"
         body = (await _classify(c, text="my screen is broken")).json()
-    assert body.get("labels") == ["support"] and body.get("unknown_labels") == [], f"known labels pass through unchanged, got {body}"
+        assert body.get("labels") == ["support"] and body.get("unknown_labels") == [], f"known labels pass through unchanged, got {body}"
+        taxonomies.put_version("acme", "tx-support", ["billing", "support", "security", "urgent"])
+        body = (await _classify(c, text="refund my invoice #urgent", version=1)).json()
+        assert body.get("labels") == ["billing", "review"] and body.get("unknown_labels") == ["urgent"], f"version 2 added 'urgent', but a request for version 1 binds to version 1's labels, got {body}"
+        body = (await _classify(c, text="refund my invoice #urgent")).json()
+    assert body.get("labels") == ["billing", "urgent"] and body.get("unknown_labels") == [], f"the latest version (2) contains 'urgent', got {body}"
 `,
     typescript: `const TEXT = 'I was charged twice, please refund';
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==';
@@ -885,6 +903,11 @@ export async function check_content_type(ctx) {
   r = await post(c, {mimeType: 'application/octet-stream'});
   assert.equal(r.status, 415, \`a document of type application/octet-stream answered \${r.status}, expected 415\`);
   assert.equal(calls(ctx), 0, 'an octet stream reached the model');
+  r = await post(c, {mimeType: 'application/pdf'});
+  assert.equal(r.status, 415, \`a document of type application/pdf answered \${r.status}, expected 415: every type outside text/* is refused, not only images and octet streams\`);
+  assert.equal(calls(ctx), 0, 'a PDF reached the model');
+  r = await post(c, {mimeType: 'text/csv'});
+  assert.equal(r.status, 200, \`a text/csv document is text and must be classified, got \${r.status}: \${r.text}\`);
   r = await post(c, {mimeType: 'text/markdown'});
   assert.equal(r.status, 200, \`a text/markdown document is text and must be classified, got \${r.status}: \${r.text}\`);
 }
@@ -901,6 +924,8 @@ export async function check_size_and_empty(ctx) {
   assert.equal(calls(ctx), 0, \`an oversized document reached the model (\${calls(ctx)} Classify calls)\`);
   r = await post(c, {text: '  ' + 'a'.repeat(64 * 1024) + '  '});
   assert.equal(r.status, 200, \`64 KiB of text with surrounding spaces answered \${r.status}: the cap applies to the trimmed text\`);
+  r = await post(c, {text: '  refuse: please refund  '});
+  assert(r.status === 200 && r.json().provenance === 'fallback', \`the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got \${r.status} \${r.text}\`);
 }
 
 export async function check_tenant_scope(ctx) {
@@ -910,6 +935,9 @@ export async function check_tenant_scope(ctx) {
   r = await post(c, {tenant: 'globex'});
   assert.equal(r.status, 404, \`tenant globex classified against acme's taxonomy tx-support and got \${r.status}, expected 404\`);
   assert.equal(calls(ctx), 0, "a request for another tenant's taxonomy reached the model");
+  r = await post(c, {version: 2});
+  assert.equal(r.status, 404, \`a request for version 2 of a taxonomy that has only version 1 answered \${r.status}, expected 404\`);
+  assert.equal(calls(ctx), 0, 'a request for a version that does not exist reached the model');
   await taxonomies.putVersion('acme', 'tx-support', ['billing', 'support', 'security', 'abuse']);
   r = await post(c, {version: 1});
   assert(r.status === 200 && r.json().taxonomy_version === 1, \`a request for version 1 must be classified against version 1, got \${r.status} \${r.text}\`);
@@ -918,7 +946,7 @@ export async function check_tenant_scope(ctx) {
 }
 
 export async function check_taxonomy_binding(ctx) {
-  const {c} = await api(ctx);
+  const {c, taxonomies} = await api(ctx);
   let r = await post(c, {text: 'refund my invoice #urgent'});
   assert.equal(r.status, 200, \`POST /v1/classify answered \${r.status}: \${r.text}\`);
   let body = r.json();
@@ -927,9 +955,19 @@ export async function check_taxonomy_binding(ctx) {
   r = await post(c, {text: 'hello there #weather'});
   body = r.json();
   assert(JSON.stringify(body.labels) === '["review"]' && JSON.stringify(body.unknown_labels) === '["weather"]', \`with no known label the document goes to review alone, got \${r.text}\`);
+  r = await post(c, {text: 'hello there'});
+  body = r.json();
+  assert(JSON.stringify(body.labels) === '["review"]' && JSON.stringify(body.unknown_labels) === '[]', \`a document the model gave no label goes to review, got \${r.text}\`);
   r = await post(c, {text: 'my screen is broken'});
   body = r.json();
   assert(JSON.stringify(body.labels) === '["support"]' && JSON.stringify(body.unknown_labels) === '[]', \`known labels pass through unchanged, got \${r.text}\`);
+  await taxonomies.putVersion('acme', 'tx-support', ['billing', 'support', 'security', 'urgent']);
+  r = await post(c, {text: 'refund my invoice #urgent', version: 1});
+  body = r.json();
+  assert(JSON.stringify(body.labels) === '["billing","review"]' && JSON.stringify(body.unknown_labels) === '["urgent"]', \`version 2 added 'urgent', but a request for version 1 binds to version 1's labels, got \${r.text}\`);
+  r = await post(c, {text: 'refund my invoice #urgent'});
+  body = r.json();
+  assert(JSON.stringify(body.labels) === '["billing","urgent"]' && JSON.stringify(body.unknown_labels) === '[]', \`the latest version (2) contains 'urgent', got \${r.text}\`);
 }
 `,
     go: `package main
@@ -1017,6 +1055,11 @@ func CheckContentType(ctx *harness.Ctx) {
 	r = apiPost(c, "acme", "application/octet-stream", apiText, 0)
 	ctx.Equal(r.Status, 415, "a document of type application/octet-stream")
 	ctx.Equal(apiCalls(ctx), 0, "an octet stream reached the model; Classify calls")
+	r = apiPost(c, "acme", "application/pdf", apiText, 0)
+	ctx.Equal(r.Status, 415, "a document of type application/pdf: every type outside text/* is refused, not only images and octet streams")
+	ctx.Equal(apiCalls(ctx), 0, "a PDF reached the model; Classify calls")
+	r = apiPost(c, "acme", "text/csv", apiText, 0)
+	ctx.Equal(r.Status, 200, "a text/csv document is text and must be classified (%s)", r.Text())
 	r = apiPost(c, "acme", "text/markdown", apiText, 0)
 	ctx.Equal(r.Status, 200, "a text/markdown document is text and must be classified (%s)", r.Text())
 }
@@ -1033,6 +1076,8 @@ func CheckSizeAndEmpty(ctx *harness.Ctx) {
 	ctx.Equal(apiCalls(ctx), 0, "an oversized document reached the model; Classify calls")
 	r = apiPost(c, "acme", "text/plain", "  "+strings.Repeat("a", 64*1024)+"  ", 0)
 	ctx.Equal(r.Status, 200, "64 KiB of text with surrounding spaces: the cap applies to the trimmed text")
+	r = apiPost(c, "acme", "text/plain", "  refuse: please refund  ", 0)
+	ctx.Assert(r.Status == 200 && apiDecode(r).Provenance == "fallback", "the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got %d %s", r.Status, r.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
@@ -1042,6 +1087,9 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	r = apiPost(c, "globex", "text/plain", apiText, 0)
 	ctx.Equal(r.Status, 404, "tenant globex classified against acme's taxonomy tx-support")
 	ctx.Equal(apiCalls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls")
+	r = apiPost(c, "acme", "text/plain", apiText, 2)
+	ctx.Equal(r.Status, 404, "a request for version 2 of a taxonomy that has only version 1")
+	ctx.Equal(apiCalls(ctx), 0, "a request for a version that does not exist reached the model; Classify calls")
 	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security", "abuse"})
 	ctx.NoError(err, "publishing version 2")
 	r = apiPost(c, "acme", "text/plain", apiText, 1)
@@ -1060,9 +1108,21 @@ func CheckTaxonomyBinding(ctx *harness.Ctx) {
 	r = apiPost(c, "acme", "text/plain", "hello there #weather", 0)
 	reply = apiDecode(r)
 	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "review" && len(reply.UnknownLabels) == 1 && reply.UnknownLabels[0] == "weather", "with no known label the document goes to review alone, got %s", r.Text())
+	r = apiPost(c, "acme", "text/plain", "hello there", 0)
+	reply = apiDecode(r)
+	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "review" && len(reply.UnknownLabels) == 0, "a document the model gave no label goes to review, got %s", r.Text())
 	r = apiPost(c, "acme", "text/plain", "my screen is broken", 0)
 	reply = apiDecode(r)
 	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "support" && len(reply.UnknownLabels) == 0, "known labels pass through unchanged, got %s", r.Text())
+	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security", "urgent"})
+	ctx.NoError(err, "publishing version 2")
+	r = apiPost(c, "acme", "text/plain", "refund my invoice #urgent", 1)
+	reply = apiDecode(r)
+	ctx.Assert(len(reply.Labels) == 2 && reply.Labels[0] == "billing" && reply.Labels[1] == "review" && len(reply.UnknownLabels) == 1 && reply.UnknownLabels[0] == "urgent",
+		"version 2 added 'urgent', but a request for version 1 binds to version 1's labels, got %s", r.Text())
+	r = apiPost(c, "acme", "text/plain", "refund my invoice #urgent", 0)
+	reply = apiDecode(r)
+	ctx.Assert(len(reply.Labels) == 2 && reply.Labels[0] == "billing" && reply.Labels[1] == "urgent" && len(reply.UnknownLabels) == 0, "the latest version (2) contains 'urgent', got %s", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1144,6 +1204,11 @@ void CheckContentType(harness::Ctx& ctx) {
   r = post(c, "acme", "application/octet-stream", kText);
   ctx.Equal(r.Status, 415, "a document of type application/octet-stream");
   ctx.Equal(calls(ctx), 0, "an octet stream reached the model; Classify calls");
+  r = post(c, "acme", "application/pdf", kText);
+  ctx.Equal(r.Status, 415, "a document of type application/pdf: every type outside text/* is refused, not only images and octet streams");
+  ctx.Equal(calls(ctx), 0, "a PDF reached the model; Classify calls");
+  r = post(c, "acme", "text/csv", kText);
+  ctx.Equal(r.Status, 200, "a text/csv document is text and must be classified (%s)", r.Text());
   r = post(c, "acme", "text/markdown", kText);
   ctx.Equal(r.Status, 200, "a text/markdown document is text and must be classified (%s)", r.Text());
 }
@@ -1162,6 +1227,10 @@ void CheckSizeAndEmpty(harness::Ctx& ctx) {
   ctx.Equal(calls(ctx), 0, "an oversized document reached the model; Classify calls");
   r = post(c, "acme", "text/plain", "  " + std::string(64 * 1024, 'a') + "  ");
   ctx.Equal(r.Status, 200, "64 KiB of text with surrounding spaces: the cap applies to the trimmed text");
+  r = post(c, "acme", "text/plain", "  refuse: please refund  ");
+  const auto refused = decode(r);
+  ctx.Assert(r.Status == 200 && refused.is_object() && refused.value("provenance", "") == "fallback",
+             "the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got %d %s", r.Status, r.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
@@ -1171,6 +1240,9 @@ void CheckTenantScope(harness::Ctx& ctx) {
   r = post(c, "globex", "text/plain", kText);
   ctx.Equal(r.Status, 404, "tenant globex classified against acme's taxonomy tx-support");
   ctx.Equal(calls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls");
+  r = post(c, "acme", "text/plain", kText, 2);
+  ctx.Equal(r.Status, 404, "a request for version 2 of a taxonomy that has only version 1");
+  ctx.Equal(calls(ctx), 0, "a request for a version that does not exist reached the model; Classify calls");
   taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security", "abuse"});
   r = post(c, "acme", "text/plain", kText, 1);
   ctx.Assert(r.Status == 200 && versionOf(r) == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text());
@@ -1189,10 +1261,23 @@ void CheckTaxonomyBinding(harness::Ctx& ctx) {
   body = decode(r);
   ctx.Assert(strings(body, "labels") == std::vector<std::string>{"review"} && strings(body, "unknown_labels") == std::vector<std::string>{"weather"},
              "with no known label the document goes to review alone, got %s", r.Text());
+  r = post(c, "acme", "text/plain", "hello there");
+  body = decode(r);
+  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"review"} && strings(body, "unknown_labels").empty(),
+             "a document the model gave no label goes to review, got %s", r.Text());
   r = post(c, "acme", "text/plain", "my screen is broken");
   body = decode(r);
   ctx.Assert(strings(body, "labels") == std::vector<std::string>{"support"} && strings(body, "unknown_labels").empty(),
              "known labels pass through unchanged, got %s", r.Text());
+  taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security", "urgent"});
+  r = post(c, "acme", "text/plain", "refund my invoice #urgent", 1);
+  body = decode(r);
+  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"billing", "review"} && strings(body, "unknown_labels") == std::vector<std::string>{"urgent"},
+             "version 2 added 'urgent', but a request for version 1 binds to version 1's labels, got %s", r.Text());
+  r = post(c, "acme", "text/plain", "refund my invoice #urgent");
+  body = decode(r);
+  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"billing", "urgent"} && strings(body, "unknown_labels").empty(),
+             "the latest version (2) contains 'urgent', got %s", r.Text());
 }
 `,
   },

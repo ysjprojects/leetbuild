@@ -48,7 +48,7 @@ per tenant forever.
       id: 'tenant-key',
       title: 'Caches under (tenant, taxonomy id, version)',
       detail:
-        'The entry is `taxonomy:{tenant}:{taxonomy_id}:{version}`, so a tenant that does not own the taxonomy misses and the store answers none. The starter’s key has no tenant: globex reads acme’s cached labels.',
+        'The entry is `taxonomy:{tenant}:{taxonomy_id}:{version}`, so a tenant that does not own the taxonomy misses and the store answers none, and a miss loads the requested version from the store. The starter’s key has no tenant: globex reads acme’s cached labels.',
       match: {
         python: {all: [/f["']taxonomy:\{tenant\}:\{taxonomy_id\}:\{version\}["']/]},
         typescript: {all: [/`taxonomy:\$\{tenant\}:\$\{taxonomyId\}:\$\{version\}`/]},
@@ -61,7 +61,7 @@ per tenant forever.
       id: 'ttl',
       title: 'Cache entries expire after 10 minutes',
       detail:
-        'The entry is written with a TTL of `TAXONOMY_TTL_S` = 600 s and is gone ten minutes later. The starter’s entry never expires.',
+        'The write that creates the entry carries a TTL of `TAXONOMY_TTL_S` = 600 s, and the entry is gone ten minutes later. The starter’s entry never expires.',
       match: {
         python: {all: [/TAXONOMY_TTL_S\s*=\s*600\b/, /ex\s*=\s*TAXONOMY_TTL_S/]},
         typescript: {all: [/TAXONOMY_TTL_S\s*=\s*600\b/, /['"]EX['"],\s*TAXONOMY_TTL_S/]},
@@ -103,7 +103,7 @@ per tenant forever.
       id: 'expire-with-window',
       title: 'Counter keys die with their window',
       detail:
-        'The increment and an `EXPIRE` of `3600 - now % 3600` seconds go in one transaction, so the key expires at the end of its hour however late in the hour it was first written. The starter’s counter key never expires.',
+        'The increment and an `EXPIRE` of `3600 - now % 3600` seconds go in one transaction, so the key has its expiry from its first write and expires at the end of its hour however late in the hour it was first written. The starter’s counter key never expires.',
       match: {
         python: {all: [/pipeline\(/, /\.expire\(/, /COUNTER_WINDOW_S\s*-\s*int\(now\)\s*%\s*COUNTER_WINDOW_S/]},
         typescript: {all: [/\.multi\(\)/, /\.expire\(/, /COUNTER_WINDOW_S\s*-\s*\(?nowS\s*%\s*COUNTER_WINDOW_S/]},
@@ -591,6 +591,10 @@ def check_tenant_key(ctx):
     assert leaked is None, f"tenant globex read acme's cached taxonomy: {leaked}. The cache key must carry the tenant"
     keys = sorted(ctx.redis.keys("taxonomy:*"))
     assert keys == ["taxonomy:acme:tx-support:1"], f"the cache holds {keys}, expected taxonomy:acme:tx-support:1"
+    taxonomies.put_version("acme", "tx-support", LABELS + ["abuse"])
+    taxonomies.put_version("acme", "tx-support", LABELS + ["abuse", "fraud"])
+    got = m.load_taxonomy("acme", "tx-support", 2)
+    assert got is not None and got.get("version") == 2 and sorted(got["labels"]) == sorted(LABELS + ["abuse"]), f"with versions 2 and 3 published, acme's load of version 2 answered {got}: a miss loads the requested version from the store"
 
 
 def check_ttl(ctx):
@@ -602,6 +606,10 @@ def check_ttl(ctx):
     assert 590 <= ttl <= 600, f"the cache entry {keys[0]} has TTL {ttl}, expected TAXONOMY_TTL_S = 600 (-1 means it never expires)"
     ctx.clock.advance(601)
     assert ctx.redis.exists(keys[0]) == 0, f"the cache entry {keys[0]} is still there after ten minutes"
+    key = m.taxonomy_key("acme", "tx-support", 1)
+    probe = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
+    m.cache_taxonomy("acme", {"taxonomy_id": "tx-support", "version": 1, "labels": LABELS})
+    assert probe.fired and 590 <= probe.result <= 600, f"right after the write that created {key} its TTL was {probe.result if probe.fired else 'never written'}: the entry must carry its expiry from the write that creates it"
 
 
 def check_atomic_replace(ctx):
@@ -644,8 +652,11 @@ def check_window_counters(ctx):
 
 def check_expire_with_window(ctx):
     m = ctx.load("state")
-    _at_minute_50(ctx)
+    hour = _at_minute_50(ctx)
+    key = f"counters:acme:{hour}"
+    probe = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     m.bump_counter("acme", "billing")
+    assert probe.fired and 595 <= probe.result <= 600, f"right after the first write to {key} its TTL was {probe.result if probe.fired else 'never written'}: the EXPIRE goes in the same transaction as the HINCRBY"
     keys = ctx.redis.keys("*")
     assert len(keys) == 1, f"one increment must touch one key, Redis holds {keys}"
     ttl = ctx.redis.ttl(keys[0])
@@ -682,6 +693,11 @@ export async function check_tenant_key(ctx) {
   assert.equal(leaked, null, \`tenant globex read acme's cached taxonomy: \${JSON.stringify(leaked)}. The cache key must carry the tenant\`);
   const keys = ctx.redis.keys('taxonomy:*');
   assert.deepEqual(keys, ['taxonomy:acme:tx-support:1'], \`the cache holds \${JSON.stringify(keys)}, expected taxonomy:acme:tx-support:1\`);
+  const taxonomies = ctx.load('/support/classifier/taxonomies.ts');
+  await taxonomies.putVersion('acme', 'tx-support', [...LABELS, 'abuse']);
+  await taxonomies.putVersion('acme', 'tx-support', [...LABELS, 'abuse', 'fraud']);
+  const v2 = await m.loadTaxonomy('acme', 'tx-support', 2);
+  assert(v2 !== null && v2.version === 2 && JSON.stringify(sorted(v2.labels)) === JSON.stringify(sorted([...LABELS, 'abuse'])), \`with versions 2 and 3 published, acme's load of version 2 answered \${JSON.stringify(v2)}: a miss loads the requested version from the store\`);
 }
 
 export async function check_ttl(ctx) {
@@ -693,6 +709,10 @@ export async function check_ttl(ctx) {
   assert(590 <= ttl && ttl <= 600, \`the cache entry \${keys[0]} has TTL \${ttl}, expected TAXONOMY_TTL_S = 600 (-1 means it never expires)\`);
   ctx.clock.advance(601);
   assert.equal(ctx.redis.exists(keys[0]), 0, \`the cache entry \${keys[0]} is still there after ten minutes\`);
+  const key = m.taxonomyKey('acme', 'tx-support', 1);
+  const probe = ctx.redisAfter(key, () => ctx.redis.ttl(key));
+  await m.cacheTaxonomy('acme', {taxonomy_id: 'tx-support', version: 1, labels: LABELS});
+  assert(probe.fired && 590 <= probe.result && probe.result <= 600, \`right after the write that created \${key} its TTL was \${probe.fired ? probe.result : 'never written'}: the entry must carry its expiry from the write that creates it\`);
 }
 
 export async function check_atomic_replace(ctx) {
@@ -731,8 +751,11 @@ export async function check_window_counters(ctx) {
 
 export async function check_expire_with_window(ctx) {
   const m = ctx.load('state');
-  atMinute50(ctx);
+  const hour = atMinute50(ctx);
+  const key = \`counters:acme:\${hour}\`;
+  const probe = ctx.redisAfter(key, () => ctx.redis.ttl(key));
   await m.bumpCounter('acme', 'billing');
+  assert(probe.fired && 595 <= probe.result && probe.result <= 600, \`right after the first write to \${key} its TTL was \${probe.fired ? probe.result : 'never written'}: the EXPIRE goes in the same transaction as the HINCRBY\`);
   const keys = ctx.redis.keys('*');
   assert.equal(keys.length, 1, \`one increment must touch one key, Redis holds \${JSON.stringify(keys)}\`);
   let ttl = ctx.redis.ttl(keys[0]);
@@ -788,6 +811,14 @@ func CheckTenantKey(ctx *harness.Ctx) {
 	ctx.NoError(err, "loadTaxonomy(globex)")
 	ctx.Assert(leaked == nil, "tenant globex read acme's cached taxonomy: %+v. The cache key must carry the tenant", leaked)
 	ctx.Equal(ctx.Redis.Keys("taxonomy:*"), []string{"taxonomy:acme:tx-support:1"}, "the cache keys")
+	_, err = taxonomies.PutVersion(context.Background(), "acme", "tx-support", append(append([]string{}, stateLabels...), "abuse"))
+	ctx.NoError(err, "publishing version 2")
+	_, err = taxonomies.PutVersion(context.Background(), "acme", "tx-support", append(append([]string{}, stateLabels...), "abuse", "fraud"))
+	ctx.NoError(err, "publishing version 3")
+	v2, err := loadTaxonomy(context.Background(), "acme", "tx-support", 2)
+	ctx.NoError(err, "loadTaxonomy(acme, 2)")
+	ctx.Assert(v2 != nil && v2.Version == 2, "with versions 2 and 3 published, acme's load of version 2 answered %+v: a miss loads the requested version from the store", v2)
+	ctx.Equal(stateSorted(v2.Labels), stateSorted(append(append([]string{}, stateLabels...), "abuse")), "with versions 2 and 3 published, the labels of acme's load of version 2")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
@@ -800,6 +831,12 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Assert(590 <= ttl && ttl <= 600, "the cache entry %s has TTL %d, expected TAXONOMY_TTL = 600 s (-1 means it never expires)", keys[0], ttl)
 	ctx.Clock.Advance(601)
 	ctx.Equal(ctx.Redis.Exists(keys[0]), int64(0), "the cache entry %s after ten minutes; exists", keys[0])
+	key := taxonomyKey("acme", "tx-support", 1)
+	probe := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
+	ctx.NoError(cacheTaxonomy(context.Background(), "acme", &taxonomies.Taxonomy{TaxonomyID: "tx-support", Version: 1, Labels: stateLabels}), "cacheTaxonomy")
+	ctx.Assert(probe.Fired, "cacheTaxonomy never wrote %s", key)
+	first, _ := probe.Result.(int64)
+	ctx.Assert(590 <= first && first <= 600, "right after the write that created %s its TTL was %d: the entry must carry its expiry from the write that creates it", key, first)
 }
 
 func CheckAtomicReplace(ctx *harness.Ctx) {
@@ -845,8 +882,13 @@ func CheckWindowCounters(ctx *harness.Ctx) {
 }
 
 func CheckExpireWithWindow(ctx *harness.Ctx) {
-	stateAtMinute50(ctx)
+	hour := stateAtMinute50(ctx)
+	key := fmt.Sprintf("counters:acme:%d", hour)
+	probe := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
 	ctx.NoError(bumpCounter(context.Background(), "acme", "billing"), "bumpCounter")
+	ctx.Assert(probe.Fired, "bumpCounter never wrote %s", key)
+	first, _ := probe.Result.(int64)
+	ctx.Assert(595 <= first && first <= 600, "right after the first write to %s its TTL was %d: the EXPIRE goes in the same transaction as the HINCRBY", key, first)
 	keys := ctx.Redis.Keys("*")
 	ctx.Equal(len(keys), 1, "one increment must touch one key (%v); keys", keys)
 	ttl := ctx.Redis.TTL(keys[0])
@@ -895,6 +937,15 @@ void CheckTenantKey(harness::Ctx& ctx) {
   const auto leaked = loadTaxonomy("globex", "tx-support", 1);
   ctx.Assert(!leaked.has_value(), "tenant globex read acme's cached taxonomy (%d labels). The cache key must carry the tenant", leaked ? leaked->labels.size() : 0);
   ctx.Equal(ctx.Redis.Keys("taxonomy:*"), {"taxonomy:acme:tx-support:1"}, "the cache keys");
+  auto v2Labels = kLabels;
+  v2Labels.push_back("abuse");
+  auto v3Labels = v2Labels;
+  v3Labels.push_back("fraud");
+  taxonomies::putVersion("acme", "tx-support", v2Labels);
+  taxonomies::putVersion("acme", "tx-support", v3Labels);
+  const auto v2 = loadTaxonomy("acme", "tx-support", 2);
+  ctx.Assert(v2.has_value() && v2->version == 2, "with versions 2 and 3 published, acme's load of version 2 answered version %d: a miss loads the requested version from the store", v2 ? v2->version : 0);
+  ctx.Equal(sorted(v2->labels), sorted(v2Labels), "with versions 2 and 3 published, the labels of acme's load of version 2");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
@@ -906,6 +957,12 @@ void CheckTtl(harness::Ctx& ctx) {
   ctx.Assert(590 <= ttl && ttl <= 600, "the cache entry %s has TTL %d, expected kTaxonomyTtl = 600 s (-1 means it never expires)", keys[0], ttl);
   ctx.Clock.Advance(601);
   ctx.Equal(ctx.Redis.Exists(keys[0]), 0, "the cache entry %s after ten minutes; exists", keys[0]);
+  const std::string key = taxonomyKey("acme", "tx-support", 1);
+  long long first = -3;
+  ctx.Redis.After(key, [&] { first = ctx.Redis.TTL(key); });
+  cacheTaxonomy("acme", taxonomies::Taxonomy{"tx-support", 1, kLabels});
+  ctx.Assert(first != -3, "cacheTaxonomy never wrote %s", key);
+  ctx.Assert(590 <= first && first <= 600, "right after the write that created %s its TTL was %d: the entry must carry its expiry from the write that creates it", key, first);
 }
 
 void CheckAtomicReplace(harness::Ctx& ctx) {
@@ -948,8 +1005,13 @@ void CheckWindowCounters(harness::Ctx& ctx) {
 }
 
 void CheckExpireWithWindow(harness::Ctx& ctx) {
-  atMinute50(ctx);
+  const long long hour = atMinute50(ctx);
+  const std::string key = "counters:acme:" + std::to_string(hour);
+  long long first = -3;
+  ctx.Redis.After(key, [&] { first = ctx.Redis.TTL(key); });
   bumpCounter("acme", "billing");
+  ctx.Assert(first != -3, "bumpCounter never wrote %s", key);
+  ctx.Assert(595 <= first && first <= 600, "right after the first write to %s its TTL was %d: the EXPIRE goes in the same transaction as the HINCRBY", key, first);
   const auto keys = ctx.Redis.Keys("*");
   ctx.Equal(keys.size(), 1, "one increment must touch one key; keys");
   long long ttl = ctx.Redis.TTL(keys[0]);

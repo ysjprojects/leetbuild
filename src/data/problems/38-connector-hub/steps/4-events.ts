@@ -26,8 +26,8 @@ and a consumer that crashes after committing loses the page from the health read
   \`enable.idempotence\`; kafka-go has no idempotent writer, so it takes \`RequireAll\`).
 - A delivery the broker rejects (the delivery report, a rejected \`send\`, a \`WriteMessages\` error)
   appends \`{"key", "payload"}\` to the list \`outbox:connector.sync\`; the page stays committed.
-- \`consume_sync\` (group \`connector-health\`) applies an event to \`health:{id}\` (\`last_success_at\`,
-  \`pages\`, \`records\`) and commits its offset after.`,
+- \`consume_sync\` (group \`connector-health\`) applies an event to \`health:{id}\` (\`last_success_at\` from
+  the event's \`at\`, \`pages\`, \`records\`) and commits its offset after.`,
   sequence: {
     participants: ['Sync worker', 'Redis ledger', 'connector.sync', 'Health consumer'],
     messages: [
@@ -68,7 +68,7 @@ and a consumer that crashes after committing loses the page from the health read
       id: 'no-secrets',
       title: 'Carries ids and counts, no token and no records',
       detail:
-        'The payload is `{connector_id, cursor, records, at}` with `records` the count: the token reference and record bodies stay out of a topic that is retained, replicated and read by every consumer.',
+        'The payload is `{connector_id, cursor, records, at}` with `records` the count and `at` the epoch second as an integer: the token reference and record bodies stay out of a topic that is retained, replicated and read by every consumer.',
       match: {
         python: {all: [/["']records["']\s*:\s*len\(/], none: [/token_ref/, /\.body\b|sample/]},
         typescript: {all: [/records:\s*page\.records\.length/], none: [/token_ref/, /\.body\b|sample/]},
@@ -107,7 +107,7 @@ and a consumer that crashes after committing loses the page from the health read
       id: 'apply-before-commit',
       title: 'Applies the event before committing its offset',
       detail:
-        'The consumer writes `health:{id}` and commits the offset afterwards, so a crash in between replays the event; committing first loses it.',
+        "The consumer writes `health:{id}` (`last_success_at` is the event's `at`, not the time the consumer read it) and commits the offset afterwards, so a crash in between replays the event; committing first loses it.",
       match: {
         python: {order: [/\n\s+apply_event\(/, /consumer\.commit\(/]},
         typescript: {order: [/\n\s+await applyEvent\(/, /commitOffsets\(/]},
@@ -986,6 +986,8 @@ def check_no_secrets(ctx):
     event = json.loads(text)
     assert set(event) == {"connector_id", "cursor", "records", "at"}, f"the event must be {{connector_id, cursor, records, at}}, got {text}"
     assert event["connector_id"] == a["connector_id"] and event["cursor"] == "t1" and event["records"] == 2, f"the event must name the connector, the cursor the page moved to (t1) and its 2 records: {text}"
+    at = event["at"]
+    assert type(at) is int and abs(at - ctx.clock.time()) <= 1, f"the event's at is {at!r}, the page landed at {int(ctx.clock.time())}: at is the epoch second, an integer, so the health read can compare it with sync_interval_s"
 
 
 def check_idempotent_producer(ctx):
@@ -1024,12 +1026,15 @@ def check_apply_before_commit(ctx):
     cid = a["connector_id"]
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(int(ctx.redis.hget(f"health:{cid}", "pages") or 0)))
+    landed = json.loads(ctx.kafka.records(TOPIC)[-1].value)["at"]
+    ctx.clock.advance(600)  # the consumer runs ten minutes behind the producer
     ctx.drain(m.consume_sync)
     assert at_commit, "the consumer never committed an offset"
     for k, pages in enumerate(at_commit, start=1):
         assert pages >= k, f"at commit {k} health:{cid} counted {pages} page(s): the offset was committed before the event was applied, and a crash in between loses the page from the health read"
     health = ctx.redis.hgetall(f"health:{cid}")
     assert health.get("pages") == "3" and health.get("records") == "6" and health.get("last_success_at"), f"health:{cid} holds {health}, expected pages 3, records 6 and last_success_at"
+    assert health.get("last_success_at") == str(landed), f"a consumer ten minutes behind wrote last_success_at {health.get('last_success_at')}, the last page landed at {landed}: last_success_at is the event's at, or a lagging consumer reports a stale connector as fresh"
     assert ctx.kafka.lag(GROUP, TOPIC) == 0, f"the consumer left {ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted"
 `,
     typescript: `const TOPIC = 'connector.sync';
@@ -1088,6 +1093,7 @@ export async function check_no_secrets(ctx) {
   const event = JSON.parse(text);
   assert.deepStrictEqual(Object.keys(event).sort(), ['at', 'connector_id', 'cursor', 'records'], \`the event must be {connector_id, cursor, records, at}, got \${text}\`);
   assert(event.connector_id === a.connector_id && event.cursor === 't1' && event.records === 2, \`the event must name the connector, the cursor the page moved to (t1) and its 2 records: \${text}\`);
+  assert(Number.isInteger(event.at) && Math.abs(event.at - ctx.clock.now() / 1000) <= 1, \`the event's at is \${event.at}, the page landed at \${Math.floor(ctx.clock.now() / 1000)}: at is the epoch second, an integer, so the health read can compare it with sync_interval_s\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -1123,6 +1129,8 @@ export async function check_apply_before_commit(ctx) {
   const cid = a.connector_id;
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push(Number(ctx.redis.hget(\`health:\${cid}\`, 'pages') ?? 0)));
+  const landed = JSON.parse(ctx.kafka.records(TOPIC).at(-1).value.toString()).at;
+  ctx.clock.advance(600); // the consumer runs ten minutes behind the producer
   await ctx.drain(m.consumeSync());
   assert(atCommit.length > 0, 'the consumer never committed an offset');
   atCommit.forEach((pages, i) => {
@@ -1130,6 +1138,7 @@ export async function check_apply_before_commit(ctx) {
   });
   const health = ctx.redis.hgetall(\`health:\${cid}\`);
   assert(health.pages === '3' && health.records === '6' && health.last_success_at, \`health:\${cid} holds \${JSON.stringify(health)}, expected pages 3, records 6 and last_success_at\`);
+  assert.equal(health.last_success_at, String(landed), \`a consumer ten minutes behind wrote last_success_at \${health.last_success_at}, the last page landed at \${landed}: last_success_at is the event's at, or a lagging consumer reports a stale connector as fresh\`);
   assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, \`the consumer left \${ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted\`);
 }
 `,
@@ -1222,6 +1231,9 @@ func CheckNoSecrets(ctx *harness.Ctx) {
 	sort.Strings(fields)
 	ctx.Equal(fields, []string{"at", "connector_id", "cursor", "records"}, "the event must be {connector_id, cursor, records, at} (%s); its fields", text)
 	ctx.Assert(event["connector_id"] == a.ConnectorID && event["cursor"] == "t1" && event["records"] == float64(2), "the event must name the connector, the cursor the page moved to (t1) and its 2 records: %s", text)
+	at, isNumber := event["at"].(float64)
+	now := float64(ctx.Clock.Now()) / 1000
+	ctx.Assert(isNumber && at == float64(int64(at)) && at-now <= 1 && now-at <= 1, "the event's at is %v, the page landed at %d: at is the epoch second, an integer, so the health read can compare it with sync_interval_s", event["at"], int64(now))
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
@@ -1271,6 +1283,11 @@ func CheckApplyBeforeCommit(ctx *harness.Ctx) {
 		n, _ := strconv.Atoi(pages)
 		atCommit = append(atCommit, n)
 	})
+	var last map[string]any
+	all := ctx.Kafka.Records(eventsTopic)
+	json.Unmarshal(all[len(all)-1].Value, &last)
+	landed, _ := last["at"].(float64)
+	ctx.Clock.Advance(600) // the consumer runs ten minutes behind the producer
 	ctx.Drain(func() { consumeSync(context.Background()) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
 	for i, pages := range atCommit {
@@ -1278,6 +1295,7 @@ func CheckApplyBeforeCommit(ctx *harness.Ctx) {
 	}
 	health := ctx.Redis.HGetAll("health:" + a.ConnectorID)
 	ctx.Assert(health["pages"] == "3" && health["records"] == "6" && health["last_success_at"] != "", "health:%s holds %v, expected pages 3, records 6 and last_success_at", a.ConnectorID, health)
+	ctx.Equal(health["last_success_at"], strconv.FormatInt(int64(landed), 10), "a consumer ten minutes behind must write the event's at, or a lagging consumer reports a stale connector as fresh; last_success_at")
 	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "records the consumer left uncommitted")
 }
 `,
@@ -1366,6 +1384,9 @@ void CheckNoSecrets(harness::Ctx& ctx) {
   ctx.Equal(fields, {"at", "connector_id", "cursor", "records"}, "the event must be {connector_id, cursor, records, at} (%s); its fields", text);
   ctx.Assert(event.value("connector_id", "") == a.connector_id && event.value("cursor", "") == "t1" && event.value("records", 0) == 2,
              "the event must name the connector, the cursor the page moved to (t1) and its 2 records: %s", text);
+  const long long now = ctx.Clock.Now() / 1000;
+  ctx.Assert(event.contains("at") && event["at"].is_number_integer() && event["at"].get<long long>() >= now - 1 && event["at"].get<long long>() <= now + 1,
+             "the event's at is %s, the page landed at %d: at is the epoch second, an integer, so the health read can compare it with sync_interval_s", event.contains("at") ? event["at"].dump() : std::string("missing"), now);
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
@@ -1405,6 +1426,9 @@ void CheckApplyBeforeCommit(harness::Ctx& ctx) {
     const auto pages = ctx.Redis.HGet(key, "pages");
     atCommit.push_back(pages && !pages->empty() ? std::stol(*pages) : 0);
   });
+  const auto last = parsed(ctx.Kafka.Records(kEventsTopic).back().Value.value_or(""));
+  const long long landed = last.is_object() ? last.value("at", 0LL) : 0;
+  ctx.Clock.Advance(600);  // the consumer runs ten minutes behind the producer
   ctx.Drain([] { consumeSync(); });
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
   for (size_t i = 0; i < atCommit.size(); i++) {
@@ -1415,6 +1439,7 @@ void CheckApplyBeforeCommit(harness::Ctx& ctx) {
   const auto health = ctx.Redis.HGetAll(key);
   const auto field = [&health](const std::string& f) { return health.count(f) ? health.at(f) : std::string(); };
   ctx.Assert(field("pages") == "3" && field("records") == "6" && !field("last_success_at").empty(), "%s holds %v, expected pages 3, records 6 and last_success_at", key, health);
+  ctx.Equal(field("last_success_at"), std::to_string(landed), "a consumer ten minutes behind must write the event's at, or a lagging consumer reports a stale connector as fresh; last_success_at");
   ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 0, "records the consumer left uncommitted");
 }
 `,

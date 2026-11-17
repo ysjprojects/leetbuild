@@ -30,7 +30,7 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
   \`fallback_reason\`: \`classifier_timeout\`, \`classifier_refused\`, \`classifier_unavailable\` or
   \`breaker_open\`.
 - After **\`BREAKER_THRESHOLD\` = 5** calls in a row that ended on a retryable status, skip the
-  classifier for **\`BREAKER_COOLDOWN_S\` = 30 s**, then try it again.`,
+  classifier for **\`BREAKER_COOLDOWN_S\` = 30 s**, then try it again; a failed try opens it again.`,
   sequence: {
     participants: ['triage-api', 'Classifier', 'Ruleset v3'],
     messages: [
@@ -52,7 +52,7 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
       id: 'deadline',
       title: 'Calls the classifier under a 1-second deadline',
       detail:
-        'Every `Classify` call carries a deadline of one second; a classifier slower than that ends in the ruleset with `fallback_reason` `classifier_timeout` instead of holding the ticket open.',
+        'Every `Classify` call, each retry included, carries its own deadline of one second; a classifier slower than that is tried `MAX_ATTEMPTS` times and ends in the ruleset with `fallback_reason` `classifier_timeout` instead of holding the ticket open.',
       match: {
         python: {all: [/timeout\s*=/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/]},
@@ -65,7 +65,7 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
       id: 'retry-policy',
       title: 'Tries three times, and only on a retryable status',
       detail:
-        'At most `MAX_ATTEMPTS` tries, and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are tried again: a refusal (`INVALID_ARGUMENT`) is answered by the ruleset after one call.',
+        'At most `MAX_ATTEMPTS` tries, and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are tried again: a refusal (`INVALID_ARGUMENT`) or any other status is answered by the ruleset after one call.',
       match: {
         python: {all: [/range\(\s*MAX_ATTEMPTS\s*\)/, /in RETRYABLE/]},
         typescript: {all: [/<\s*MAX_ATTEMPTS/, /RETRYABLE\.includes\(/]},
@@ -91,7 +91,7 @@ service Classifier { rpc Classify(ClassifyRequest) returns (ClassifyReply); }  /
       id: 'breaker-cooldown',
       title: 'Benches the classifier for seconds, after five failures',
       detail:
-        'Only `BREAKER_THRESHOLD` calls in a row that failed on a retryable status open the breaker, and it stays open `BREAKER_COOLDOWN_S` before one call probes the classifier again, instead of an hour after a single failure.',
+        'Only `BREAKER_THRESHOLD` tickets in a row since the last success that failed on a retryable status open the breaker (a refusal does not count), and it stays open `BREAKER_COOLDOWN_S` before one ticket probes the classifier again, reopening it at once if that probe fails, instead of an hour after a single failure.',
       match: {
         python: {all: [/BREAKER_COOLDOWN_S/, /BREAKER_THRESHOLD/], none: [/FAILURE_TTL_S/]},
         typescript: {all: [/BREAKER_COOLDOWN_MS/, /BREAKER_THRESHOLD/], none: [/FAILURE_TTL_MS/]},
@@ -636,6 +636,7 @@ def check_deadline(ctx):
         assert call.timeout is not None, "a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open"
         assert 0.5 <= call.timeout <= 1.5, f"a Classify call carries a {call.timeout} s deadline, expected DEADLINE_S = 1"
     assert d == _rules("classifier_timeout"), f"with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got {d}"
+    assert _calls(ctx) == 4, f"a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make MAX_ATTEMPTS = 3 tries, each under its own 1 s deadline; it made {_calls(ctx) - 1}"
 
 
 def check_retry_policy(ctx):
@@ -651,6 +652,12 @@ def check_retry_policy(ctx):
     d = m.classify("acme", INVOICE)
     assert _calls(ctx) == 7, f"with the classifier UNAVAILABLE classify made {_calls(ctx) - 4} tries, expected MAX_ATTEMPTS = 3"
     assert d == _rules("classifier_unavailable"), f"after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got {d}"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INTERNAL, grpc.StatusCode.UNIMPLEMENTED):
+        before = _calls(ctx)
+        ctx.grpc.fail("Classify", code, "the classifier will not take this ticket", times=1)
+        d = m.classify("acme", INVOICE)
+        assert _calls(ctx) == before + 1, f"a ticket the classifier answered {code.name} was sent {_calls(ctx) - before} times: only UNAVAILABLE and DEADLINE_EXCEEDED are tried again"
+        assert d["queue"] == "billing" and d["ruleset_version"] == "v3" and d["fallback_reason"], f"a ticket the classifier answered {code.name} must be routed by the rules, saying why, got {d}"
 
 
 def check_rules_fallback(ctx):
@@ -670,16 +677,36 @@ def check_breaker_cooldown(ctx):
     before = _calls(ctx)
     d = m.classify("acme", INVOICE)
     assert _calls(ctx) == before + 1 and d == MODEL, f"one ticket that failed benched the classifier: the next ticket made {_calls(ctx) - before} calls and was routed {d}. One failure must not take a healthy classifier out of service"
-    model.down = True
+    ctx.grpc.fail("Classify", grpc.StatusCode.INVALID_ARGUMENT, "the classifier does not read this language", times=5)
     for _ in range(5):
         m.classify("acme", INVOICE)
     before = _calls(ctx)
     d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == before + 1 and d == MODEL, f"five refused tickets benched the classifier: the next ticket made {_calls(ctx) - before} calls and was routed {d}. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker"
+    model.down = True
+    for _ in range(4):
+        m.classify("acme", INVOICE)
+    before = _calls(ctx)
+    m.classify("acme", INVOICE)
+    assert _calls(ctx) == before + 3, f"after four tickets in a row failed the fifth made {_calls(ctx) - before} calls, expected MAX_ATTEMPTS = 3: the breaker counts failed tickets, not tries, from the last success, and opens at BREAKER_THRESHOLD = 5"
+    before = _calls(ctx)
+    d = m.classify("acme", INVOICE)
     assert _calls(ctx) == before and d == _rules("breaker_open"), f"after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made {_calls(ctx) - before} calls and answered {d}"
+    ctx.clock.advance(29)
+    before = _calls(ctx)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == before and d == _rules("breaker_open"), f"29 s after the breaker opened it must still skip the classifier (BREAKER_COOLDOWN_S = 30); it made {_calls(ctx) - before} calls and answered {d}"
+    ctx.clock.advance(2)
+    before = _calls(ctx)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) > before and d == _rules("classifier_unavailable"), f"31 s after the breaker opened one ticket must probe the classifier; it made {_calls(ctx) - before} calls and answered {d}"
+    before = _calls(ctx)
+    d = m.classify("acme", INVOICE)
+    assert _calls(ctx) == before and d == _rules("breaker_open"), f"the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made {_calls(ctx) - before} calls and answered {d}"
     model.down = False
     ctx.clock.advance(31)
     d = m.classify("acme", INVOICE)
-    assert d == MODEL, f"31 s after the breaker opened the classifier is healthy again and must be asked, got {d}"
+    assert d == MODEL, f"31 s after the breaker opened again the classifier is healthy and must be asked, got {d}"
 `,
     typescript: `const INVOICE = 'Refund for invoice 4411: the payment was charged twice';
 const OUTAGE = 'Production outage: every login fails';
@@ -716,6 +743,7 @@ export async function check_deadline(ctx) {
     assert(0.5 <= call.timeout && call.timeout <= 1.5, \`a Classify call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 1000\`);
   }
   assert.deepStrictEqual(d, rulesDecision('classifier_timeout'), \`with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got \${show(d)}\`);
+  assert.equal(calls(ctx), 4, \`a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make MAX_ATTEMPTS = 3 tries, each under its own 1 s deadline; it made \${calls(ctx) - 1}\`);
 }
 
 export async function check_retry_policy(ctx) {
@@ -731,6 +759,13 @@ export async function check_retry_policy(ctx) {
   d = await m.classify('acme', INVOICE);
   assert.equal(calls(ctx), 7, \`with the classifier UNAVAILABLE classify made \${calls(ctx) - 4} tries, expected MAX_ATTEMPTS = 3\`);
   assert.deepStrictEqual(d, rulesDecision('classifier_unavailable'), \`after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got \${show(d)}\`);
+  for (const name of ['PERMISSION_DENIED', 'INTERNAL', 'UNIMPLEMENTED']) {
+    const before = calls(ctx);
+    ctx.grpc.fail('Classify', ctx.grpc.status[name], 'the classifier will not take this ticket', 1);
+    d = await m.classify('acme', INVOICE);
+    assert.equal(calls(ctx), before + 1, \`a ticket the classifier answered \${name} was sent \${calls(ctx) - before} times: only UNAVAILABLE and DEADLINE_EXCEEDED are tried again\`);
+    assert(d.queue === 'billing' && d.ruleset_version === 'v3' && d.fallback_reason, \`a ticket the classifier answered \${name} must be routed by the rules, saying why, got \${show(d)}\`);
+  }
 }
 
 export async function check_rules_fallback(ctx) {
@@ -750,15 +785,34 @@ export async function check_breaker_cooldown(ctx) {
   let before = calls(ctx);
   let d = await m.classify('acme', INVOICE);
   assert(calls(ctx) === before + 1 && show(d) === show(MODEL), \`one ticket that failed benched the classifier: the next ticket made \${calls(ctx) - before} calls and was routed \${show(d)}. One failure must not take a healthy classifier out of service\`);
-  model.down = true;
+  ctx.grpc.fail('Classify', ctx.grpc.status.INVALID_ARGUMENT, 'the classifier does not read this language', 5);
   for (let i = 0; i < 5; i++) await m.classify('acme', INVOICE);
   before = calls(ctx);
   d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) === before + 1 && show(d) === show(MODEL), \`five refused tickets benched the classifier: the next ticket made \${calls(ctx) - before} calls and was routed \${show(d)}. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker\`);
+  model.down = true;
+  for (let i = 0; i < 4; i++) await m.classify('acme', INVOICE);
+  before = calls(ctx);
+  await m.classify('acme', INVOICE);
+  assert.equal(calls(ctx), before + 3, \`after four tickets in a row failed the fifth made \${calls(ctx) - before} calls, expected MAX_ATTEMPTS = 3: the breaker counts failed tickets, not tries, from the last success, and opens at BREAKER_THRESHOLD = 5\`);
+  before = calls(ctx);
+  d = await m.classify('acme', INVOICE);
   assert(calls(ctx) === before && show(d) === show(rulesDecision('breaker_open')), \`after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made \${calls(ctx) - before} calls and answered \${show(d)}\`);
+  ctx.clock.advance(29);
+  before = calls(ctx);
+  d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) === before && show(d) === show(rulesDecision('breaker_open')), \`29 s after the breaker opened it must still skip the classifier (BREAKER_COOLDOWN_MS = 30000); it made \${calls(ctx) - before} calls and answered \${show(d)}\`);
+  ctx.clock.advance(2);
+  before = calls(ctx);
+  d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) > before && show(d) === show(rulesDecision('classifier_unavailable')), \`31 s after the breaker opened one ticket must probe the classifier; it made \${calls(ctx) - before} calls and answered \${show(d)}\`);
+  before = calls(ctx);
+  d = await m.classify('acme', INVOICE);
+  assert(calls(ctx) === before && show(d) === show(rulesDecision('breaker_open')), \`the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made \${calls(ctx) - before} calls and answered \${show(d)}\`);
   model.down = false;
   ctx.clock.advance(31);
   d = await m.classify('acme', INVOICE);
-  assert.deepStrictEqual(d, MODEL, \`31 s after the breaker opened the classifier is healthy again and must be asked, got \${show(d)}\`);
+  assert.deepStrictEqual(d, MODEL, \`31 s after the breaker opened again the classifier is healthy and must be asked, got \${show(d)}\`);
 }
 `,
     go: `package main
@@ -827,6 +881,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(500*time.Millisecond <= call.Timeout && call.Timeout <= 1500*time.Millisecond, "a Classify call carries a %v deadline, expected 1 s", call.Timeout)
 	}
 	ctx.Equal(d, rulesDecision("classifier_timeout", "billing", "normal"), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout")
+	ctx.Equal(classifyCalls(ctx)-1, 3, "a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make MAX_ATTEMPTS = 3 tries, each under its own 1 s deadline; the tries")
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
@@ -842,6 +897,13 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	d = classify(context.Background(), "acme", clientInvoice)
 	ctx.Equal(classifyCalls(ctx)-4, 3, "with the classifier UNAVAILABLE classify must make MAX_ATTEMPTS tries; the tries")
 	ctx.Equal(d, rulesDecision("classifier_unavailable", "billing", "normal"), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.Internal, codes.Unimplemented} {
+		before := classifyCalls(ctx)
+		ctx.GRPC.Fail("Classify", code, "the classifier will not take this ticket", 1, "")
+		d = classify(context.Background(), "acme", clientInvoice)
+		ctx.Equal(classifyCalls(ctx)-before, 1, "a ticket the classifier answered %s must not be tried again (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", code)
+		ctx.Assert(d.Queue == "billing" && d.RulesetVersion == "v3" && d.FallbackReason != "", "a ticket the classifier answered %s must be routed by the rules, saying why, got %+v", code, d)
+	}
 }
 
 func CheckRulesFallback(ctx *harness.Ctx) {
@@ -861,21 +923,44 @@ func CheckBreakerCooldown(ctx *harness.Ctx) {
 	before := classifyCalls(ctx)
 	d := classify(context.Background(), "acme", clientInvoice)
 	ctx.Assert(classifyCalls(ctx) == before+1 && d == modelDecision, "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %+v. One failure must not take a healthy classifier out of service", classifyCalls(ctx)-before, d)
-	p.down = true
+	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "the classifier does not read this language", 5, "")
 	for i := 0; i < 5; i++ {
 		classify(context.Background(), "acme", clientInvoice)
 	}
 	before = classifyCalls(ctx)
 	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) == before+1 && d == modelDecision, "five refused tickets benched the classifier: the next ticket made %d calls and was routed %+v. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker", classifyCalls(ctx)-before, d)
+	p.down = true
+	for i := 0; i < 4; i++ {
+		classify(context.Background(), "acme", clientInvoice)
+	}
+	before = classifyCalls(ctx)
+	classify(context.Background(), "acme", clientInvoice)
+	ctx.Equal(classifyCalls(ctx)-before, 3, "after four tickets in a row failed the fifth must make MAX_ATTEMPTS tries: the breaker counts failed tickets, not tries, from the last success, and opens at BREAKER_THRESHOLD = 5; the fifth ticket's calls")
+	before = classifyCalls(ctx)
+	d = classify(context.Background(), "acme", clientInvoice)
 	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	ctx.Clock.Advance(29)
+	before = classifyCalls(ctx)
+	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "29 s after the breaker opened it must still skip the classifier (BREAKER_COOLDOWN = 30 s); it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	ctx.Clock.Advance(2)
+	before = classifyCalls(ctx)
+	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) > before && d == rulesDecision("classifier_unavailable", "billing", "normal"), "31 s after the breaker opened one ticket must probe the classifier; it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	before = classifyCalls(ctx)
+	d = classify(context.Background(), "acme", clientInvoice)
+	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made %d calls and answered %+v", classifyCalls(ctx)-before, d)
 	p.down = false
 	ctx.Clock.Advance(31)
-	ctx.Equal(classify(context.Background(), "acme", clientInvoice), modelDecision, "31 s after the breaker opened the classifier is healthy again and must be asked")
+	ctx.Equal(classify(context.Background(), "acme", clientInvoice), modelDecision, "31 s after the breaker opened again the classifier is healthy and must be asked")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -934,6 +1019,7 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.5, "a Classify call carries a %v s deadline, expected kDeadline = 1 s", call.TimeoutSeconds());
   }
   ctx.Assert(same(d, rulesDecision("classifier_timeout")), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got %s", show(d));
+  ctx.Equal(calls(ctx) - 1, 3, "a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make kMaxAttempts = 3 tries, each under its own 1 s deadline; the tries");
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
@@ -949,6 +1035,15 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   d = classify("acme", kInvoice);
   ctx.Equal(calls(ctx) - 4, 3, "with the classifier UNAVAILABLE classify must make kMaxAttempts tries; the tries");
   ctx.Assert(same(d, rulesDecision("classifier_unavailable")), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got %s", show(d));
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNIMPLEMENTED, "UNIMPLEMENTED"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t before = calls(ctx);
+    ctx.GRPC.Fail("Classify", code, "the classifier will not take this ticket", 1);
+    d = classify("acme", kInvoice);
+    ctx.Equal(calls(ctx) - before, 1, "a ticket the classifier answered %s must not be tried again (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", name);
+    ctx.Assert(d.queue == "billing" && d.ruleset_version == "v3" && !d.fallback_reason.empty(), "a ticket the classifier answered %s must be routed by the rules, saying why, got %s", name, show(d));
+  }
 }
 
 void CheckRulesFallback(harness::Ctx& ctx) {
@@ -968,15 +1063,34 @@ void CheckBreakerCooldown(harness::Ctx& ctx) {
   size_t before = calls(ctx);
   rules::Decision d = classify("acme", kInvoice);
   ctx.Assert(calls(ctx) == before + 1 && same(d, kModel), "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %s. One failure must not take a healthy classifier out of service", calls(ctx) - before, show(d));
-  p.down = true;
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "the classifier does not read this language", 5);
   for (int i = 0; i < 5; ++i) classify("acme", kInvoice);
   before = calls(ctx);
   d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) == before + 1 && same(d, kModel), "five refused tickets benched the classifier: the next ticket made %d calls and was routed %s. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker", calls(ctx) - before, show(d));
+  p.down = true;
+  for (int i = 0; i < 4; ++i) classify("acme", kInvoice);
+  before = calls(ctx);
+  classify("acme", kInvoice);
+  ctx.Equal(calls(ctx) - before, 3, "after four tickets in a row failed the fifth must make kMaxAttempts tries: the breaker counts failed tickets, not tries, from the last success, and opens at kBreakerThreshold = 5; the fifth ticket's calls");
+  before = calls(ctx);
+  d = classify("acme", kInvoice);
   ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %s", calls(ctx) - before, show(d));
+  ctx.Clock.Advance(29);
+  before = calls(ctx);
+  d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "29 s after the breaker opened it must still skip the classifier (kBreakerCooldown = 30 s); it made %d calls and answered %s", calls(ctx) - before, show(d));
+  ctx.Clock.Advance(2);
+  before = calls(ctx);
+  d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) > before && same(d, rulesDecision("classifier_unavailable")), "31 s after the breaker opened one ticket must probe the classifier; it made %d calls and answered %s", calls(ctx) - before, show(d));
+  before = calls(ctx);
+  d = classify("acme", kInvoice);
+  ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made %d calls and answered %s", calls(ctx) - before, show(d));
   p.down = false;
   ctx.Clock.Advance(31);
   d = classify("acme", kInvoice);
-  ctx.Assert(same(d, kModel), "31 s after the breaker opened the classifier is healthy again and must be asked, got %s", show(d));
+  ctx.Assert(same(d, kModel), "31 s after the breaker opened again the classifier is healthy and must be asked, got %s", show(d));
 }
 `,
   },

@@ -66,7 +66,7 @@ chain still verifies; and the answer does not say how much of the chain it cover
       id: 'tenant-scope',
       title: 'Only the record’s tenant can verify it; foreign and missing are 404',
       detail:
-        'The tenant comes from `X-Tenant-Id` (401 without it), never from a query parameter, and is compared with the record’s tenant; a foreign record answers the same **404** as a missing one, never 403.',
+        'The tenant comes from `X-Tenant-Id` (401 without it, whatever the query string says), never from a query parameter, and is compared with the record’s tenant; a foreign record answers the same **404**, body included, as a missing one, never 403.',
       match: {
         python: {
           all: [/x-tenant-id/i, /\b401\b/, /\b404\b/, /\["tenant"\]\s*!=\s*tenant|tenant\s*!=\s*record\["tenant"\]/],
@@ -533,14 +533,15 @@ async def check_tenant_scope(ctx):
     mine = _chained(1, "t1")
     _chained(1, "t2")
     async with _api(ctx) as c:
-        anonymous = await _verify(c, mine, tenant="")
-        assert anonymous.status_code == 401, f"a verify without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+        anonymous = await _verify(c, mine, tenant="", query="?tenant=t1")
+        assert anonymous.status_code == 401, f"a verify without X-Tenant-Id (naming ?tenant=t1) answered {anonymous.status_code}, expected 401: the tenant is the header, never a parameter"
         foreign = await _verify(c, mine, tenant="t2")
         assert foreign.status_code == 404, f"tenant t2 verifying t1's record answered {foreign.status_code}: {foreign.text}. Another tenant's record is 404, exactly like a missing one"
         spoofed = await _verify(c, mine, tenant="t2", query="?tenant=t1")
         assert spoofed.status_code == 404, f"tenant t2 naming ?tenant=t1 got {spoofed.status_code}: {spoofed.text}. The tenant is the header, not a parameter"
         missing = await _verify(c, "d-404", tenant="t2")
         assert missing.status_code == 404, f"a missing record answered {missing.status_code}, expected 404"
+        assert foreign.text.replace(mine, "{id}") == missing.text.replace("d-404", "{id}"), f"t2 asking for t1's record got {foreign.text} and for a missing one {missing.text}: the two answers must not differ, or a caller learns which records exist"
         own = await _verify(c, mine, tenant="t1")
     assert own.status_code == 200 and own.json().get("valid") is True, f"t1 verifying its own record answered {own.status_code} {own.text}"
 
@@ -609,14 +610,15 @@ export async function check_tenant_scope(ctx) {
   const {c, chained} = read(ctx);
   const mine = await chained(1, 't1');
   await chained(1, 't2');
-  const anonymous = await verify(c, mine, '');
-  assert.equal(anonymous.status, 401, \`a verify without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const anonymous = await verify(c, mine, '', '?tenant=t1');
+  assert.equal(anonymous.status, 401, \`a verify without X-Tenant-Id (naming ?tenant=t1) answered \${anonymous.status}, expected 401: the tenant is the header, never a parameter\`);
   const foreign = await verify(c, mine, 't2');
   assert.equal(foreign.status, 404, \`tenant t2 verifying t1's record answered \${foreign.status}: \${foreign.text}. Another tenant's record is 404, exactly like a missing one\`);
   const spoofed = await verify(c, mine, 't2', '?tenant=t1');
   assert.equal(spoofed.status, 404, \`tenant t2 naming ?tenant=t1 got \${spoofed.status}: \${spoofed.text}. The tenant is the header, not a parameter\`);
   const missing = await verify(c, 'd-404', 't2');
   assert.equal(missing.status, 404, \`a missing record answered \${missing.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll(mine, '{id}'), missing.text.replaceAll('d-404', '{id}'), \`t2 asking for t1's record got \${foreign.text} and for a missing one \${missing.text}: the two answers must not differ, or a caller learns which records exist\`);
   const own = await verify(c, mine, 't1');
   assert(own.status === 200 && own.json().valid === true, \`t1 verifying its own record answered \${own.status} \${own.text}\`);
 }
@@ -658,6 +660,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"audit/chain"
 	"audit/digest"
@@ -715,12 +718,14 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	mine := chainedRecord(ctx, 1, "t1")
 	chainedRecord(ctx, 1, "t2")
-	ctx.Equal(verifyAs(c, mine, "", "").Status, 401, "a verify without X-Tenant-Id; the status")
+	ctx.Equal(verifyAs(c, mine, "", "?tenant=t1").Status, 401, "a verify without X-Tenant-Id (naming ?tenant=t1): the tenant is the header, never a parameter; the status")
 	foreign := verifyAs(c, mine, "t2", "")
 	ctx.Equal(foreign.Status, 404, "tenant t2 verifying t1's record (%s): another tenant's record is 404, exactly like a missing one; the status", foreign.Text())
 	spoofed := verifyAs(c, mine, "t2", "?tenant=t1")
 	ctx.Equal(spoofed.Status, 404, "tenant t2 naming ?tenant=t1 (%s): the tenant is the header, not a parameter; the status", spoofed.Text())
-	ctx.Equal(verifyAs(c, "d-404", "t2", "").Status, 404, "a missing record; the status")
+	missing := verifyAs(c, "d-404", "t2", "")
+	ctx.Equal(missing.Status, 404, "a missing record; the status")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), mine, "{id}"), strings.ReplaceAll(missing.Text(), "d-404", "{id}"), "t2 asking for t1's record and for a missing one must get the same answer, or a caller learns which records exist; the answers")
 	own := verifyAs(c, mine, "t1", "")
 	ctx.Assert(own.Status == 200 && bodyOf(own)["valid"] == true, "t1 verifying its own record answered %d %s", own.Status, own.Text())
 }
@@ -794,6 +799,12 @@ harness::Response verifyAs(harness::HTTP& c, const std::string& record_id, const
 
 json bodyOf(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
 
+// The answer with the record id replaced, so that answers about two different ids compare.
+std::string withoutId(std::string text, const std::string& id) {
+  for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -809,12 +820,14 @@ void CheckTenantScope(harness::Ctx& ctx) {
   auto c = readApi(ctx);
   const std::string mine = chainedRecord(1, "t1");
   chainedRecord(1, "t2");
-  ctx.Equal(verifyAs(c, mine, "").Status, 401, "a verify without X-Tenant-Id; the status");
+  ctx.Equal(verifyAs(c, mine, "", "?tenant=t1").Status, 401, "a verify without X-Tenant-Id (naming ?tenant=t1): the tenant is the header, never a parameter; the status");
   const auto foreign = verifyAs(c, mine, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 verifying t1's record (%s): another tenant's record is 404, exactly like a missing one; the status", foreign.Text());
   const auto spoofed = verifyAs(c, mine, "t2", "?tenant=t1");
   ctx.Equal(spoofed.Status, 404, "tenant t2 naming ?tenant=t1 (%s): the tenant is the header, not a parameter; the status", spoofed.Text());
-  ctx.Equal(verifyAs(c, "d-404", "t2").Status, 404, "a missing record; the status");
+  const auto missing = verifyAs(c, "d-404", "t2");
+  ctx.Equal(missing.Status, 404, "a missing record; the status");
+  ctx.Equal(withoutId(foreign.Text(), mine), withoutId(missing.Text(), "d-404"), "t2 asking for t1's record and for a missing one must get the same answer, or a caller learns which records exist; the answers");
   const auto own = verifyAs(c, mine, "t1");
   ctx.Assert(own.Status == 200 && bodyOf(own).value("valid", false), "t1 verifying its own record answered %d %s", own.Status, own.Text());
 }

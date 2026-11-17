@@ -20,9 +20,10 @@ an old classification was made against, so nobody can say which rules produced i
 version and no changes; and a record names whatever version was current when it was written.
 
 - A missing \`X-Tenant-Id\` is **401**; \`taxonomies.load(tenant, taxonomy_id, version)\` resolves
-  \`?version=\` (the latest when absent), and another tenant's taxonomy is **404**.
-- The body is \`{taxonomy_id, version, labels, changelog}\`; with \`?since=n\` the changelog is
-  \`taxonomies.changelog(tenant, taxonomy_id, n, version)\`, otherwise \`[]\`.
+  \`?version=\` (the latest when absent), and another tenant's taxonomy, or a version that does not
+  exist, is **404**.
+- The body is \`{taxonomy_id, version, labels, changelog}\`; with \`?since=n\` (\`0\` included) the
+  changelog is \`taxonomies.changelog(tenant, taxonomy_id, n, version)\`, otherwise \`[]\`.
 - \`publish_version\` writes a new version with \`taxonomies.put_version\` and returns its number.
 - \`record_classification\` records the \`taxonomy_version\` it was given.`,
   sequence: {
@@ -82,7 +83,7 @@ version and no changes; and a record names whatever version was current when it 
       id: 'changelog',
       title: 'Names the version and serves the changelog',
       detail:
-        'The body carries the resolved `version`, `?version=` selects an old one, and `?since=n` adds the changes of every version after n up to it, from `taxonomies.changelog`. The starter answers the latest labels with no version.',
+        'The body carries the resolved `version`, `?version=` selects an old one (one that does not exist is **404**), and `?since=n` adds the changes of every version after n up to it, from `taxonomies.changelog`; `?since=0` starts at version 1, and without `?since` the changelog is `[]`. The starter answers the latest labels with no version.',
       match: {
         python: {all: [/taxonomies\.changelog\(/, /["']version["']\s*:\s*taxonomy\[/]},
         typescript: {all: [/taxonomies\.changelog\(/, /version:\s*taxonomy\.version/]},
@@ -645,6 +646,11 @@ async def check_changelog(ctx):
         assert body.get("changelog") == [{"version": 2, "added": ["abuse"], "removed": []}, {"version": 3, "added": [], "removed": ["security"]}], f"?since=1 must list the changes of versions 2 and 3, got {body.get('changelog')}"
         body = (await _get(c, "/v1/taxonomies/tx-support?version=1")).json()
         assert body.get("version") == 1 and body.get("labels") == V1, f"?version=1 must serve version 1 as it was, got {body}"
+        assert body.get("changelog") == [], f"without ?since the changelog is empty, got {body.get('changelog')}"
+        r = await _get(c, "/v1/taxonomies/tx-support?version=9")
+        assert r.status_code == 404, f"?version=9 of a taxonomy with three versions answered {r.status_code} {r.text}, expected 404"
+        body = (await _get(c, "/v1/taxonomies/tx-support?version=1&since=0")).json()
+        assert body.get("changelog") == [{"version": 1, "added": V1, "removed": []}], f"?since=0 lists every change up to the version, the creation of version 1 included, got {body.get('changelog')}"
         body = (await _get(c, "/v1/taxonomies/tx-support?version=2&since=1")).json()
     assert body.get("changelog") == [{"version": 2, "added": ["abuse"], "removed": []}], f"the changelog runs up to the requested version, got {body.get('changelog')}"
 
@@ -714,6 +720,11 @@ export async function check_changelog(ctx) {
   );
   body = (await get(c, '/v1/taxonomies/tx-support?version=1')).json();
   assert(body.version === 1 && same(body.labels, V1), \`?version=1 must serve version 1 as it was, got \${JSON.stringify(body)}\`);
+  assert(same(body.changelog, []), \`without ?since the changelog is empty, got \${JSON.stringify(body.changelog)}\`);
+  const missing = await get(c, '/v1/taxonomies/tx-support?version=9');
+  assert.equal(missing.status, 404, \`?version=9 of a taxonomy with three versions answered \${missing.status} \${missing.text}, expected 404\`);
+  body = (await get(c, '/v1/taxonomies/tx-support?version=1&since=0')).json();
+  assert(same(body.changelog, [{version: 1, added: V1, removed: []}]), \`?since=0 lists every change up to the version, the creation of version 1 included, got \${JSON.stringify(body.changelog)}\`);
   body = (await get(c, '/v1/taxonomies/tx-support?version=2&since=1')).json();
   assert(same(body.changelog, [{version: 2, added: ['abuse'], removed: []}]), \`the changelog runs up to the requested version, got \${JSON.stringify(body.changelog)}\`);
 }
@@ -829,6 +840,15 @@ func CheckChangelog(ctx *harness.Ctx) {
 	r = readGet(c, "/v1/taxonomies/tx-support?version=1", "acme")
 	body = readDecode(r)
 	ctx.Assert(body.Version == 1 && len(body.Labels) == 3 && body.Labels[2] == "security", "?version=1 must serve version 1 as it was, got %s", r.Text())
+	var raw map[string]any
+	_ = json.Unmarshal([]byte(r.Text()), &raw)
+	empty, isList := raw["changelog"].([]any)
+	ctx.Assert(isList && len(empty) == 0, "without ?since the changelog is an empty list, got %s", r.Text())
+	r = readGet(c, "/v1/taxonomies/tx-support?version=9", "acme")
+	ctx.Equal(r.Status, 404, "?version=9 of a taxonomy with three versions (%s)", r.Text())
+	body = readDecode(readGet(c, "/v1/taxonomies/tx-support?version=1&since=0", "acme"))
+	got, _ = json.Marshal(body.Changelog)
+	ctx.Equal(string(got), \`[{"version":1,"added":["billing","support","security"],"removed":[]}]\`, "?since=0 lists every change up to the version, the creation of version 1 included")
 	body = readDecode(readGet(c, "/v1/taxonomies/tx-support?version=2&since=1", "acme"))
 	got, _ = json.Marshal(body.Changelog)
 	ctx.Equal(string(got), \`[{"version":2,"added":["abuse"],"removed":[]}]\`, "the changelog runs up to the requested version")
@@ -924,6 +944,12 @@ void CheckChangelog(harness::Ctx& ctx) {
   r = readGet(c, "/v1/taxonomies/tx-support?version=1");
   body = decode(r);
   ctx.Assert(body.value("version", 0L) == 1 && labelsOf(body) == kV1, "?version=1 must serve version 1 as it was, got %s", r.Text());
+  ctx.Assert(body.is_object() && body.contains("changelog") && body["changelog"] == nlohmann::json::array(), "without ?since the changelog is empty, got %s", r.Text());
+  r = readGet(c, "/v1/taxonomies/tx-support?version=9");
+  ctx.Equal(r.Status, 404, "?version=9 of a taxonomy with three versions (%s)", r.Text());
+  body = decode(readGet(c, "/v1/taxonomies/tx-support?version=1&since=0"));
+  ctx.Equal(body.value("changelog", nlohmann::json::array()).dump(), nlohmann::json::parse(R"([{"version":1,"added":["billing","support","security"],"removed":[]}])").dump(),
+            "?since=0 lists every change up to the version, the creation of version 1 included");
   body = decode(readGet(c, "/v1/taxonomies/tx-support?version=2&since=1"));
   ctx.Equal(body.value("changelog", nlohmann::json::array()).dump(), R"([{"added":["abuse"],"removed":[],"version":2}])",
             "the changelog runs up to the requested version");

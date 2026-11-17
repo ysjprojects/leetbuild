@@ -19,8 +19,8 @@ names. It serves the demo and hides four flaws.
 ignores what running jobs consumed. Any caller can read any team's numbers, and a read without a
 window answers anyway.
 
-- The caller's team is the \`X-Team-Id\` header: missing is **401**, a path team that differs is
-  **403**.
+- The caller's team is the \`X-Team-Id\` header, checked before the window: missing is **401**, a
+  path team that differs is **403**.
 - \`window\` is required and matches \`WINDOW_RE\` (\`YYYY-MM-DDTHH:MMZ\`), else **400**.
 - Read \`reserved\` and \`consumed\` from \`window_key(team, window)\` (\`quota:{team}:{window}\`, provided
   in \`quota.ledger\`), the hash the reserve script writes; \`quota\` is \`limit_of(team)\`.
@@ -68,7 +68,7 @@ window answers anyway.
       id: 'team-scope',
       title: 'Scopes the read to the X-Team-Id caller',
       detail:
-        'A read without `X-Team-Id` is **401** and one of another team is **403**; the starter answers any caller with any team’s numbers.',
+        'A read without `X-Team-Id` is **401** and one of another team is **403**, also when the window is missing or invalid; the starter answers any caller with any team’s numbers.',
       match: {
         python: {all: [/x-team-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-team-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
@@ -81,7 +81,7 @@ window answers anyway.
       id: 'window-validated',
       title: 'Requires a valid window',
       detail:
-        'A read without `window`, or with one that does not match `WINDOW_RE`, is **400**: capacity is per window, so there is no answer without one. The starter answers anyway.',
+        'A read without `window`, or with one that does not match `WINDOW_RE` as a whole, is **400**: capacity is per window, so there is no answer without one. The starter answers anyway.',
       match: {
         python: {all: [/WINDOW_RE/, /\b400\b/]},
         typescript: {all: [/WINDOW_RE/, /code\(\s*400\s*\)/]},
@@ -94,7 +94,7 @@ window answers anyway.
       id: 'same-ledger',
       title: 'Reads the ledger the reserve path writes',
       detail:
-        'The numbers come from `quota:{team}:{window}`: units reserved since the nightly rollup show up at once, and another window shows its own. The starter reads `quota:aggregate:{team}`.',
+        'The numbers come from `quota:{team}:{window}`: units reserved since the nightly rollup show up at once, another window shows its own, a window with no hash yet reports nothing held, and the read writes nothing. The starter reads `quota:aggregate:{team}`.',
       match: {
         python: {all: [/window_key\(\s*team\s*,\s*window\s*\)|quota:\{team\}:\{window\}/], none: [/quota:aggregate/]},
         typescript: {
@@ -110,7 +110,7 @@ window answers anyway.
       id: 'available-formula',
       title: 'Reports what a reserve would be granted',
       detail:
-        '`available` is `quota - reserved - consumed`, floored at 0: a reserve of exactly that many units is granted, and an overdrawn window reports 0, not a negative. The starter subtracts only `reserved`.',
+        '`available` is `quota - reserved - consumed` with `quota = limit_of(team)`, floored at 0: a reserve of exactly that many units is granted, and an overdrawn window reports 0, not a negative. The starter subtracts only `reserved`.',
       match: {
         python: {all: [/reserved\s*-\s*consumed/, /\bmax\(/]},
         typescript: {all: [/reserved\s*-\s*consumed/, /Math\.max\(/]},
@@ -572,8 +572,12 @@ async def check_team_scope(ctx):
     async with _api(ctx) as c:
         anonymous = await _read(c, caller=None)
         assert anonymous.status_code == 401, f"a read without X-Team-Id answered {anonymous.status_code}, expected 401"
+        anonymous = await _read(c, caller=None, window=None)
+        assert anonymous.status_code == 401, f"a read without X-Team-Id and without a window answered {anonymous.status_code}, expected 401: the caller is checked before the window"
         foreign = await _read(c, team="vision", caller="research")
         assert foreign.status_code == 403, f"team research reading /v1/quotas/vision answered {foreign.status_code} {foreign.text}, expected 403: another team's usage is not research's to read"
+        foreign = await _read(c, team="vision", caller="research", window="tomorrow")
+        assert foreign.status_code == 403, f"team research reading /v1/quotas/vision with a bad window answered {foreign.status_code} {foreign.text}, expected 403: the caller is checked before the window"
         own = await _read(c)
     assert own.status_code == 200, f"research reading its own quota answered {own.status_code}: {own.text}"
 
@@ -582,21 +586,22 @@ async def check_window_validated(ctx):
     async with _api(ctx) as c:
         missing = await _read(c, window=None)
         assert missing.status_code == 400, f"a read without a window answered {missing.status_code} {missing.text}, expected 400: capacity is per window"
-        for window in ("tomorrow", "2026-11-02"):
+        for window in ("tomorrow", "2026-11-02", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"):
             r = await _read(c, window=window)
-            assert r.status_code == 400, f"a read for window {window!r} answered {r.status_code}, expected 400"
+            assert r.status_code == 400, f"a read for window {window!r} answered {r.status_code}, expected 400: the whole window must match YYYY-MM-DDTHH:MMZ"
         r = await _read(c)
     assert r.status_code == 200, f"a read for window {W} answered {r.status_code}: {r.text}"
 
 
 async def check_same_ledger(ctx):
-    _rollup(ctx, 8, 0, 0)
+    _rollup(ctx, 8, 5, 1)
     assert ledger.reserve("research", W, "gpu-a100", 3), "the ledger refused 3 units"
     async with _api(ctx) as c:
         now = (await _read(c)).json()
         other = (await _read(c, window=W2)).json()
     assert now.get("reserved") == 3, f"after 3 units were reserved at 14:00 the read reports reserved {now.get('reserved')} ({now}): it must read quota:research:{W}, the hash the reserve script writes, not last night's rollup"
-    assert other.get("reserved") == 0 and other.get("available") == 8, f"the 15:00 window reports {other}, expected nothing reserved and 8 available: capacity is per window"
+    assert other.get("reserved") == 0 and other.get("consumed") == 0 and other.get("available") == 8, f"the 15:00 window reports {other}, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held"
+    assert not ctx.redis.exists(f"quota:research:{W2}"), f"reading the 15:00 window wrote quota:research:{W2} ({ctx.redis.hgetall(f'quota:research:{W2}')}): a read must not write the ledger"
 
 
 async def check_available_formula(ctx):
@@ -606,14 +611,15 @@ async def check_available_formula(ctx):
     _rollup(ctx, 8, 3, 2)  # the rollup is current: only the formula is under test
     async with _api(ctx) as c:
         body = (await _read(c)).json()
-        assert body.get("available") == 3, f"with 8 units, 3 reserved and 2 consumed the read reports available {body.get('available')} ({body}), expected 3: a running job's units are not free"
+        expected = {"team": "research", "window": W, "quota": 8, "reserved": 3, "consumed": 2, "available": 3}
+        assert body == expected, f"with 8 units, 3 reserved and 2 consumed the read reports {body}, expected {expected}: a running job's units are not free"
         granted = ledger.reserve("research", W, "gpu-a100", body["available"])
         assert granted, "a reserve of the reported available units was refused"
         ledger.release("research", granted)
         ctx.redis.hset("quota:limits", "research", 4)  # the team's limit was cut below what it holds
         _rollup(ctx, 4, 3, 2)
         cut = (await _read(c)).json()
-    assert cut.get("available") == 0, f"with the limit cut to 4 while 5 units are held the read reports available {cut.get('available')}, expected 0: available is floored at 0"
+    assert cut.get("quota") == 4 and cut.get("available") == 0, f"with the limit cut to 4 while 5 units are held the read reports {cut}, expected quota 4 and available 0: quota is limit_of(team), and available is floored at 0"
 `,
     typescript: `const W = '2026-11-02T14:00Z';
 const W2 = '2026-11-02T15:00Z';
@@ -644,8 +650,12 @@ export async function check_team_scope(ctx) {
   const {c} = api(ctx);
   const anonymous = await read(c, 'research', null);
   assert.equal(anonymous.status, 401, \`a read without X-Team-Id answered \${anonymous.status}, expected 401\`);
+  const anonymousBare = await read(c, 'research', null, null);
+  assert.equal(anonymousBare.status, 401, \`a read without X-Team-Id and without a window answered \${anonymousBare.status}, expected 401: the caller is checked before the window\`);
   const foreign = await read(c, 'vision', 'research');
   assert.equal(foreign.status, 403, \`team research reading /v1/quotas/vision answered \${foreign.status} \${foreign.text}, expected 403: another team's usage is not research's to read\`);
+  const foreignBad = await read(c, 'vision', 'research', 'tomorrow');
+  assert.equal(foreignBad.status, 403, \`team research reading /v1/quotas/vision with a bad window answered \${foreignBad.status} \${foreignBad.text}, expected 403: the caller is checked before the window\`);
   const own = await read(c);
   assert.equal(own.status, 200, \`research reading its own quota answered \${own.status}: \${own.text}\`);
 }
@@ -654,9 +664,9 @@ export async function check_window_validated(ctx) {
   const {c} = api(ctx);
   const missing = await read(c, 'research', 'research', null);
   assert.equal(missing.status, 400, \`a read without a window answered \${missing.status} \${missing.text}, expected 400: capacity is per window\`);
-  for (const window of ['tomorrow', '2026-11-02']) {
+  for (const window of ['tomorrow', '2026-11-02', '2026-11-02T14:00Zx', 'x2026-11-02T14:00Z']) {
     const r = await read(c, 'research', 'research', window);
-    assert.equal(r.status, 400, \`a read for window "\${window}" answered \${r.status}, expected 400\`);
+    assert.equal(r.status, 400, \`a read for window "\${window}" answered \${r.status}, expected 400: the whole window must match YYYY-MM-DDTHH:MMZ\`);
   }
   const r = await read(c);
   assert.equal(r.status, 200, \`a read for window \${W} answered \${r.status}: \${r.text}\`);
@@ -664,12 +674,16 @@ export async function check_window_validated(ctx) {
 
 export async function check_same_ledger(ctx) {
   const {c, ledger} = api(ctx);
-  rollup(ctx, 8, 0, 0);
+  rollup(ctx, 8, 5, 1);
   assert(await ledger.reserve('research', W, 'gpu-a100', 3), 'the ledger refused 3 units');
   const now = (await read(c)).json();
   const other = (await read(c, 'research', 'research', W2)).json();
   assert.equal(now.reserved, 3, \`after 3 units were reserved at 14:00 the read reports reserved \${now.reserved} (\${JSON.stringify(now)}): it must read quota:research:\${W}, the hash the reserve script writes, not last night's rollup\`);
-  assert(other.reserved === 0 && other.available === 8, \`the 15:00 window reports \${JSON.stringify(other)}, expected nothing reserved and 8 available: capacity is per window\`);
+  assert(
+    other.reserved === 0 && other.consumed === 0 && other.available === 8,
+    \`the 15:00 window reports \${JSON.stringify(other)}, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held\`,
+  );
+  assert.equal(ctx.redis.exists(\`quota:research:\${W2}\`), 0, \`reading the 15:00 window wrote quota:research:\${W2} (\${JSON.stringify(ctx.redis.hgetall(\`quota:research:\${W2}\`))}): a read must not write the ledger\`);
 }
 
 export async function check_available_formula(ctx) {
@@ -679,14 +693,15 @@ export async function check_available_formula(ctx) {
   assert(running && (await ledger.consume('research', running)), 'the ledger refused to reserve and consume 2 units');
   rollup(ctx, 8, 3, 2); // the rollup is current: only the formula is under test
   const body = (await read(c)).json();
-  assert.equal(body.available, 3, \`with 8 units, 3 reserved and 2 consumed the read reports available \${body.available} (\${JSON.stringify(body)}), expected 3: a running job's units are not free\`);
+  const expected = {team: 'research', window: W, quota: 8, reserved: 3, consumed: 2, available: 3};
+  assert.deepStrictEqual(body, expected, \`with 8 units, 3 reserved and 2 consumed the read reports \${JSON.stringify(body)}, expected \${JSON.stringify(expected)}: a running job's units are not free\`);
   const granted = await ledger.reserve('research', W, 'gpu-a100', body.available);
   assert(granted, 'a reserve of the reported available units was refused');
   await ledger.release('research', granted);
   ctx.redis.hset('quota:limits', 'research', 4); // the team's limit was cut below what it holds
   rollup(ctx, 4, 3, 2);
   const cut = (await read(c)).json();
-  assert.equal(cut.available, 0, \`with the limit cut to 4 while 5 units are held the read reports available \${cut.available}, expected 0: available is floored at 0\`);
+  assert(cut.quota === 4 && cut.available === 0, \`with the limit cut to 4 while 5 units are held the read reports \${JSON.stringify(cut)}, expected quota 4 and available 0: quota is limitOf(team), and available is floored at 0\`);
 }
 `,
     go: `package main
@@ -709,6 +724,7 @@ var readBg = context.Background()
 
 type quotaView struct {
 	Team      string \`json:"team"\`
+	Window    string \`json:"window"\`
 	Quota     int64  \`json:"quota"\`
 	Reserved  int64  \`json:"reserved"\`
 	Consumed  int64  \`json:"consumed"\`
@@ -752,8 +768,11 @@ func CheckRoute(ctx *harness.Ctx) {
 func CheckTeamScope(ctx *harness.Ctx) {
 	c := api(ctx)
 	ctx.Equal(readAs(c, "research", "", readW).Status, 401, "a read without X-Team-Id; the status")
+	ctx.Equal(readAs(c, "research", "", "").Status, 401, "a read without X-Team-Id and without a window (the caller is checked before the window); the status")
 	foreign := readAs(c, "vision", "research", readW)
 	ctx.Equal(foreign.Status, 403, "team research reading /v1/quotas/vision (another team's usage is not research's to read, %s); the status", foreign.Text())
+	foreign = readAs(c, "vision", "research", "tomorrow")
+	ctx.Equal(foreign.Status, 403, "team research reading /v1/quotas/vision with a bad window (the caller is checked before the window, %s); the status", foreign.Text())
 	own := readAs(c, "research", "research", readW)
 	ctx.Equal(own.Status, 200, "research reading its own quota (%s); the status", own.Text())
 }
@@ -762,22 +781,23 @@ func CheckWindowValidated(ctx *harness.Ctx) {
 	c := api(ctx)
 	missing := readAs(c, "research", "research", "")
 	ctx.Equal(missing.Status, 400, "a read without a window (capacity is per window, %s); the status", missing.Text())
-	for _, window := range []string{"tomorrow", "2026-11-02"} {
-		ctx.Equal(readAs(c, "research", "research", window).Status, 400, "a read for window %q; the status", window)
+	for _, window := range []string{"tomorrow", "2026-11-02", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"} {
+		ctx.Equal(readAs(c, "research", "research", window).Status, 400, "a read for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window)
 	}
 	r := readAs(c, "research", "research", readW)
 	ctx.Equal(r.Status, 200, "a read for window %s (%s); the status", readW, r.Text())
 }
 
 func CheckSameLedger(ctx *harness.Ctx) {
-	rollup(ctx, 8, 0, 0)
+	rollup(ctx, 8, 5, 1)
 	id, err := ledger.Reserve(readBg, "research", readW, "gpu-a100", 3, "")
 	ctx.Assert(err == nil && id != "", "the ledger refused 3 units: %v", err)
 	c := api(ctx)
 	now := readAs(c, "research", "research", readW)
 	other := readAs(c, "research", "research", readW2)
 	ctx.Equal(view(now).Reserved, int64(3), "after 3 units were reserved at 14:00 the read must report them (read quota:research:%s, the hash the reserve script writes, not last night's rollup: %s); reserved", readW, now.Text())
-	ctx.Assert(view(other).Reserved == 0 && view(other).Available == 8, "the 15:00 window reports %s, expected nothing reserved and 8 available: capacity is per window", other.Text())
+	ctx.Assert(view(other).Reserved == 0 && view(other).Consumed == 0 && view(other).Available == 8, "the 15:00 window reports %s, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held", other.Text())
+	ctx.Equal(ctx.Redis.Exists("quota:research:"+readW2), int64(0), "reading the 15:00 window must not write quota:research:%s (a read must not write the ledger, %v); the key exists", readW2, ctx.Redis.HGetAll("quota:research:"+readW2))
 }
 
 func CheckAvailableFormula(ctx *harness.Ctx) {
@@ -789,14 +809,14 @@ func CheckAvailableFormula(ctx *harness.Ctx) {
 	rollup(ctx, 8, 3, 2) // the rollup is current: only the formula is under test
 	c := api(ctx)
 	body := readAs(c, "research", "research", readW)
-	ctx.Equal(view(body).Available, int64(3), "with 8 units, 3 reserved and 2 consumed (a running job's units are not free, %s); available", body.Text())
+	ctx.Equal(view(body), quotaView{Team: "research", Window: readW, Quota: 8, Reserved: 3, Consumed: 2, Available: 3}, "with 8 units, 3 reserved and 2 consumed (a running job's units are not free, %s); the read", body.Text())
 	granted, _ := ledger.Reserve(readBg, "research", readW, "gpu-a100", view(body).Available, "")
 	ctx.Assert(granted != "", "a reserve of the reported available units was refused")
 	ledger.Release(readBg, "research", granted)
 	ctx.Redis.Do("HSET", "quota:limits", "research", 4) // the team's limit was cut below what it holds
 	rollup(ctx, 4, 3, 2)
 	cut := readAs(c, "research", "research", readW)
-	ctx.Equal(view(cut).Available, int64(0), "with the limit cut to 4 while 5 units are held, available is floored at 0 (%s); available", cut.Text())
+	ctx.Assert(view(cut).Quota == 4 && view(cut).Available == 0, "with the limit cut to 4 while 5 units are held the read reports %s, expected quota 4 and available 0: quota is ledger.LimitOf(team), and available is floored at 0", cut.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -847,8 +867,11 @@ void CheckRoute(harness::Ctx& ctx) {
 void CheckTeamScope(harness::Ctx& ctx) {
   auto c = api(ctx);
   ctx.Equal(readAs(c, "research", "", kW).Status, 401, "a read without X-Team-Id; the status");
+  ctx.Equal(readAs(c, "research", "", "").Status, 401, "a read without X-Team-Id and without a window (the caller is checked before the window); the status");
   const auto foreign = readAs(c, "vision", "research", kW);
   ctx.Equal(foreign.Status, 403, "team research reading /v1/quotas/vision (another team's usage is not research's to read, %s); the status", foreign.Text());
+  const auto foreign_bad = readAs(c, "vision", "research", "tomorrow");
+  ctx.Equal(foreign_bad.Status, 403, "team research reading /v1/quotas/vision with a bad window (the caller is checked before the window, %s); the status", foreign_bad.Text());
   const auto own = readAs(c, "research", "research", kW);
   ctx.Equal(own.Status, 200, "research reading its own quota (%s); the status", own.Text());
 }
@@ -857,21 +880,23 @@ void CheckWindowValidated(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto missing = readAs(c, "research", "research", "");
   ctx.Equal(missing.Status, 400, "a read without a window (capacity is per window, %s); the status", missing.Text());
-  for (const std::string window : {"tomorrow", "2026-11-02"}) {
-    ctx.Equal(readAs(c, "research", "research", window).Status, 400, "a read for window %q; the status", window);
+  for (const std::string window : {"tomorrow", "2026-11-02", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"}) {
+    ctx.Equal(readAs(c, "research", "research", window).Status, 400, "a read for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window);
   }
   const auto r = readAs(c, "research", "research", kW);
   ctx.Equal(r.Status, 200, "a read for window %s (%s); the status", kW, r.Text());
 }
 
 void CheckSameLedger(harness::Ctx& ctx) {
-  rollup(ctx, 8, 0, 0);
+  rollup(ctx, 8, 5, 1);
   ctx.Assert(ledger::reserve("research", kW, "gpu-a100", 3).has_value(), "the ledger refused 3 units");
   auto c = api(ctx);
   const auto now = readAs(c, "research", "research", kW);
   const auto other = readAs(c, "research", "research", kW2);
   ctx.Equal(field(now, "reserved"), 3, "after 3 units were reserved at 14:00 the read must report them (read quota:research:%s, the hash the reserve script writes, not last night's rollup: %s); reserved", kW, now.Text());
-  ctx.Assert(field(other, "reserved") == 0 && field(other, "available") == 8, "the 15:00 window reports %s, expected nothing reserved and 8 available: capacity is per window", other.Text());
+  ctx.Assert(field(other, "reserved") == 0 && field(other, "consumed") == 0 && field(other, "available") == 8,
+             "the 15:00 window reports %s, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held", other.Text());
+  ctx.Equal(ctx.Redis.Exists("quota:research:" + kW2), 0, "reading the 15:00 window must not write quota:research:%s (a read must not write the ledger); the key exists", kW2);
 }
 
 void CheckAvailableFormula(harness::Ctx& ctx) {
@@ -881,14 +906,16 @@ void CheckAvailableFormula(harness::Ctx& ctx) {
   rollup(ctx, 8, 3, 2);  // the rollup is current: only the formula is under test
   auto c = api(ctx);
   const auto body = readAs(c, "research", "research", kW);
-  ctx.Equal(field(body, "available"), 3, "with 8 units, 3 reserved and 2 consumed (a running job's units are not free, %s); available", body.Text());
+  const nlohmann::json expected = {{"team", "research"}, {"window", kW}, {"quota", 8}, {"reserved", 3}, {"consumed", 2}, {"available", 3}};
+  ctx.Equal(nlohmann::json::parse(body.Text(), nullptr, false), expected, "with 8 units, 3 reserved and 2 consumed (a running job's units are not free); the read");
   const auto granted = ledger::reserve("research", kW, "gpu-a100", field(body, "available"));
   ctx.Assert(granted.has_value(), "a reserve of the reported available units was refused");
   ledger::release("research", *granted);
   ctx.Redis.Do("HSET", "quota:limits", "research", 4);  // the team's limit was cut below what it holds
   rollup(ctx, 4, 3, 2);
   const auto cut = readAs(c, "research", "research", kW);
-  ctx.Equal(field(cut, "available"), 0, "with the limit cut to 4 while 5 units are held, available is floored at 0 (%s); available", cut.Text());
+  ctx.Assert(field(cut, "quota") == 4 && field(cut, "available") == 0,
+             "with the limit cut to 4 while 5 units are held the read reports %s, expected quota 4 and available 0: quota is ledger::limitOf(team), and available is floored at 0", cut.Text());
 }
 `,
   },

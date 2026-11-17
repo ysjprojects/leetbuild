@@ -75,7 +75,7 @@ later.
       id: 'atomic-claim',
       title: 'Checks and claims in one atomic script',
       detail:
-        'The dedupe check and the claim run inside one Lua script, so of two deliveries of a ticket that land together exactly one is admitted. A client-side `EXISTS` then `SET` lets the second delivery in between.',
+        'The dedupe check and the claim run inside one Lua script, so of two deliveries of a ticket that land together exactly one is admitted, and the claim carries its day-long expiry from the moment it is written. A client-side `EXISTS` then `SET` lets the second delivery in between.',
       match: {
         python: {all: [/register_script\(|\.eval\(/], none: [/\br\.exists\(/, /\br\.set\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/], none: [/redis\.exists\(/, /redis\.set\(/]},
@@ -88,7 +88,7 @@ later.
       id: 'window-expiry',
       title: "Expires the queue's counter with its window",
       detail:
-        "The script `EXPIRE`s the minute's counter on its first write, so every window's key goes away a minute after it was opened instead of living for good.",
+        "The script that creates the minute's counter `EXPIRE`s it on that first write, so the key never exists without a TTL and every window's key goes away a minute after it was opened instead of living for good.",
       match: {
         python: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/]},
@@ -114,7 +114,7 @@ later.
       id: 'full-releases-claim',
       title: 'A full queue claims nothing',
       detail:
-        'The script answers `full` before it claims the ticket, so a ticket refused this minute is admitted when it comes back after `retry_after` seconds instead of being dropped as a duplicate.',
+        "The script answers `full` before it claims the ticket, with `retry_after` the counter's TTL (the seconds left in the window opened by the minute's first ticket), so a ticket refused this minute is admitted when it comes back after `retry_after` seconds instead of being dropped as a duplicate.",
       match: {
         python: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
         typescript: {order: [/['"]full['"]/, /redis\.call\(\s*['"]SET['"],\s*KEYS\[1\]/]},
@@ -479,7 +479,13 @@ def _align(ctx):
 
 def check_atomic_claim(ctx):
     m = ctx.load("state")
-    rival = ctx.redis_after(CLAIM, lambda: m.admit("acme", "billing", "h-1"))
+    claim_ttl = []
+
+    def rival_delivery():
+        claim_ttl.append(ctx.redis.ttl(CLAIM))
+        return m.admit("acme", "billing", "h-1")
+
+    rival = ctx.redis_after(CLAIM, rival_delivery)
     first = m.admit("acme", "billing", "h-1")
     assert rival.fired, f"admit never touched {CLAIM}: claim the ticket under triage:dedupe:{{tenant}}:{{ticket_hash}}"
     if rival.error is not None:
@@ -487,6 +493,7 @@ def check_atomic_claim(ctx):
     statuses = sorted([first["status"], rival.result["status"]])
     assert statuses == ["admitted", "duplicate"], f"a second delivery of h-1 landed right after admit first touched {CLAIM} and the two got {statuses}: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script"
     assert m.admit("acme", "billing", "h-1")["status"] == "duplicate", "a third delivery of h-1 must be a duplicate"
+    assert claim_ttl[0] != -1, f"right after admit first wrote {CLAIM} the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good"
     ttl = ctx.redis.ttl(CLAIM)
     assert 86400 - 60 <= ttl <= 86400, f"{CLAIM} expires in {ttl} s, expected DEDUPE_TTL_S (a day)"
 
@@ -494,7 +501,10 @@ def check_atomic_claim(ctx):
 def check_window_expiry(ctx):
     m = ctx.load("state")
     _align(ctx)
+    opened = f"admit:acme:billing:{int(ctx.clock.time()) // 60}"
+    first_ttl = ctx.redis_after(opened, lambda: ctx.redis.ttl(opened))
     assert m.admit("acme", "billing", "h-1")["status"] == "admitted", "a fresh ticket in an empty queue must be admitted"
+    assert not first_ttl.fired or first_ttl.result != -1, f"right after admit first wrote {opened} the counter had no TTL: EXPIRE it in the script that creates it, or a crash in between leaves the key for good"
     counter = _counter(ctx)
     ttl = ctx.redis.ttl(counter)
     assert 0 < ttl <= 60, f"{counter} has TTL {ttl}: the counter must expire with its window (EXPIRE on its first write), or every minute leaves a key behind for good"
@@ -520,11 +530,13 @@ def check_full_releases_claim(ctx):
     _align(ctx)
     for i in range(m.QUEUE_CAP):
         assert m.admit("acme", "billing", f"h-{i}")["status"] == "admitted", f"ticket {i + 1} of {m.QUEUE_CAP} must be admitted"
+        if i == 0:
+            ctx.clock.advance(30)  # the minute's first ticket opened the window 30 s before the queue filled
     late = m.admit("acme", "billing", "h-late")
     assert late["status"] == "full", f"ticket {m.QUEUE_CAP + 1} in one minute got {late}, expected full"
     assert not ctx.redis.exists("triage:dedupe:acme:h-late"), "the full queue refused h-late and still claimed it: its retry next minute will be dropped as a duplicate. Answer full before claiming"
     assert ctx.redis.get(_counter(ctx)) == str(m.QUEUE_CAP), f"a refused ticket took a slot: the counter holds {ctx.redis.get(_counter(ctx))}, expected {m.QUEUE_CAP}"
-    assert 0 < late["retry_after"] <= 60, f"the refusal says retry after {late['retry_after']} s: it must be the seconds until the minute's counter expires"
+    assert 0 < late["retry_after"] <= 31, f"the refusal says retry after {late['retry_after']} s, but the minute's counter was opened 30 s earlier and expires in about 30 s: retry_after is the counter's TTL, set once on its first write"
     ctx.clock.advance(late["retry_after"] + 1)
     again = m.admit("acme", "billing", "h-late")
     assert again["status"] == "admitted", f"h-late came back after retry_after and got {again['status']!r}, expected admitted"
@@ -544,7 +556,11 @@ function align(ctx): void {
 
 export async function check_atomic_claim(ctx) {
   const m = ctx.load('state');
-  const rival = ctx.redisAfter(CLAIM, () => m.admit('acme', 'billing', 'h-1'));
+  let claimTtl: number | undefined;
+  const rival = ctx.redisAfter(CLAIM, () => {
+    claimTtl = ctx.redis.ttl(CLAIM);
+    return m.admit('acme', 'billing', 'h-1');
+  });
   const first = await m.admit('acme', 'billing', 'h-1');
   assert(rival.fired, \`admit never touched \${CLAIM}: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}\`);
   if (rival.error !== undefined) throw rival.error;
@@ -552,6 +568,7 @@ export async function check_atomic_claim(ctx) {
   const statuses = [first.status, other.status].sort();
   assert.deepStrictEqual(statuses, ['admitted', 'duplicate'], \`a second delivery of h-1 landed right after admit first touched \${CLAIM} and the two got \${JSON.stringify(statuses)}: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script\`);
   assert.equal((await m.admit('acme', 'billing', 'h-1')).status, 'duplicate', 'a third delivery of h-1 must be a duplicate');
+  assert(claimTtl !== -1, \`right after admit first wrote \${CLAIM} the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good\`);
   const ttl = ctx.redis.ttl(CLAIM);
   assert(86400 - 60 <= ttl && ttl <= 86400, \`\${CLAIM} expires in \${ttl} s, expected DEDUPE_TTL_S (a day)\`);
 }
@@ -559,7 +576,10 @@ export async function check_atomic_claim(ctx) {
 export async function check_window_expiry(ctx) {
   const m = ctx.load('state');
   align(ctx);
+  const opened = \`admit:acme:billing:\${Math.floor(ctx.clock.now() / 1000 / 60)}\`;
+  const firstTtl = ctx.redisAfter(opened, () => ctx.redis.ttl(opened));
   assert.equal((await m.admit('acme', 'billing', 'h-1')).status, 'admitted', 'a fresh ticket in an empty queue must be admitted');
+  assert(!firstTtl.fired || firstTtl.result !== -1, \`right after admit first wrote \${opened} the counter had no TTL: EXPIRE it in the script that creates it, or a crash in between leaves the key for good\`);
   const key = counter(ctx);
   const ttl = ctx.redis.ttl(key);
   assert(ttl > 0 && ttl <= 60, \`\${key} has TTL \${ttl}: the counter must expire with its window (EXPIRE on its first write), or every minute leaves a key behind for good\`);
@@ -584,12 +604,15 @@ export async function check_duplicates_free(ctx) {
 export async function check_full_releases_claim(ctx) {
   const m = ctx.load('state');
   align(ctx);
-  for (let i = 0; i < m.QUEUE_CAP; i++) assert.equal((await m.admit('acme', 'billing', \`h-\${i}\`)).status, 'admitted', \`ticket \${i + 1} of \${m.QUEUE_CAP} must be admitted\`);
+  for (let i = 0; i < m.QUEUE_CAP; i++) {
+    assert.equal((await m.admit('acme', 'billing', \`h-\${i}\`)).status, 'admitted', \`ticket \${i + 1} of \${m.QUEUE_CAP} must be admitted\`);
+    if (i === 0) ctx.clock.advance(30); // the minute's first ticket opened the window 30 s before the queue filled
+  }
   const late = await m.admit('acme', 'billing', 'h-late');
   assert.equal(late.status, 'full', \`ticket \${m.QUEUE_CAP + 1} in one minute got \${JSON.stringify(late)}, expected full\`);
   assert.equal(ctx.redis.exists('triage:dedupe:acme:h-late'), 0, 'the full queue refused h-late and still claimed it: its retry next minute will be dropped as a duplicate. Answer full before claiming');
   assert.equal(ctx.redis.get(counter(ctx)), String(m.QUEUE_CAP), \`a refused ticket took a slot: the counter holds \${ctx.redis.get(counter(ctx))}, expected \${m.QUEUE_CAP}\`);
-  assert(late.retry_after > 0 && late.retry_after <= 60, \`the refusal says retry after \${late.retry_after} s: it must be the seconds until the minute's counter expires\`);
+  assert(late.retry_after > 0 && late.retry_after <= 31, \`the refusal says retry after \${late.retry_after} s, but the minute's counter was opened 30 s earlier and expires in about 30 s: retry_after is the counter's TTL, set once on its first write\`);
   ctx.clock.advance(late.retry_after + 1);
   const again = await m.admit('acme', 'billing', 'h-late');
   assert.equal(again.status, 'admitted', \`h-late came back after retry_after and got \${JSON.stringify(again.status)}, expected admitted\`);
@@ -627,7 +650,11 @@ func alignMinute(ctx *harness.Ctx) {
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	rival := ctx.Redis.After(stateClaim, func() any { return mustAdmit(ctx, "acme", "billing", "h-1") })
+	claimTTL := int64(-2)
+	rival := ctx.Redis.After(stateClaim, func() any {
+		claimTTL = ctx.Redis.TTL(stateClaim)
+		return mustAdmit(ctx, "acme", "billing", "h-1")
+	})
 	first := mustAdmit(ctx, "acme", "billing", "h-1")
 	ctx.Assert(rival.Fired, "admit never touched %s: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}", stateClaim)
 	ctx.Assert(rival.Err == nil, "the second delivery failed: %v", rival.Err)
@@ -636,13 +663,17 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	got[other.Status]++
 	ctx.Assert(got["admitted"] == 1 && got["duplicate"] == 1, "a second delivery of h-1 landed right after admit first touched %s and the two got %s and %s: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script", stateClaim, first.Status, other.Status)
 	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-1").Status, "duplicate", "a third delivery of h-1")
+	ctx.Assert(claimTTL != -1, "right after admit first wrote %s the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good", stateClaim)
 	ttl := ctx.Redis.TTL(stateClaim)
 	ctx.Assert(86400-60 <= ttl && ttl <= 86400, "%s expires in %d s, expected DEDUPE_TTL_S (a day)", stateClaim, ttl)
 }
 
 func CheckWindowExpiry(ctx *harness.Ctx) {
 	alignMinute(ctx)
+	opened := fmt.Sprintf("admit:acme:billing:%d", ctx.Clock.Now()/1000/60)
+	firstTTL := ctx.Redis.After(opened, func() any { return ctx.Redis.TTL(opened) })
 	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-1").Status, "admitted", "a fresh ticket in an empty queue")
+	ctx.Assert(!firstTTL.Fired || firstTTL.Result != int64(-1), "right after admit first wrote %s the counter had no TTL: EXPIRE it in the script that creates it, or a crash in between leaves the key for good", opened)
 	counter := counterKey(ctx, "acme", "billing")
 	ttl := ctx.Redis.TTL(counter)
 	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its window (EXPIRE on its first write), or every minute leaves a key behind for good", counter, ttl)
@@ -670,13 +701,16 @@ func CheckFullReleasesClaim(ctx *harness.Ctx) {
 	alignMinute(ctx)
 	for i := 0; i < queueCap; i++ {
 		ctx.Equal(mustAdmit(ctx, "acme", "billing", fmt.Sprintf("h-%d", i)).Status, "admitted", "ticket %d of %d", i+1, queueCap)
+		if i == 0 {
+			ctx.Clock.Advance(30) // the minute's first ticket opened the window 30 s before the queue filled
+		}
 	}
 	late := mustAdmit(ctx, "acme", "billing", "h-late")
 	ctx.Equal(late.Status, "full", "ticket %d in one minute", queueCap+1)
 	ctx.Equal(ctx.Redis.Exists("triage:dedupe:acme:h-late"), int64(0), "the full queue refused h-late and must not claim it (its retry next minute would be dropped as a duplicate: answer full before claiming); the claim")
 	used, _ := ctx.Redis.Get(counterKey(ctx, "acme", "billing"))
 	ctx.Equal(used, strconv.Itoa(queueCap), "a refused ticket must not take a slot; the counter")
-	ctx.Assert(late.RetryAfter > 0 && late.RetryAfter <= 60, "the refusal says retry after %d s: it must be the seconds until the minute's counter expires", late.RetryAfter)
+	ctx.Assert(late.RetryAfter > 0 && late.RetryAfter <= 31, "the refusal says retry after %d s, but the minute's counter was opened 30 s earlier and expires in about 30 s: retry_after is the counter's TTL, set once on its first write", late.RetryAfter)
 	ctx.Clock.Advance(float64(late.RetryAfter + 1))
 	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-late").Status, "admitted", "h-late came back after retry_after")
 }
@@ -705,7 +739,11 @@ void alignMinute(harness::Ctx& ctx) { ctx.Clock.Advance(static_cast<double>(61 -
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   auto rival = std::make_shared<std::optional<Admission>>();
-  ctx.Redis.After(kClaim, [rival] { *rival = admit("acme", "billing", "h-1"); });
+  auto claimTtl = std::make_shared<long long>(-2);
+  ctx.Redis.After(kClaim, [&ctx, rival, claimTtl] {
+    *claimTtl = ctx.Redis.TTL(kClaim);
+    *rival = admit("acme", "billing", "h-1");
+  });
   const Admission first = admit("acme", "billing", "h-1");
   ctx.Assert(rival->has_value(), "admit never touched %s: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}", kClaim);
   const std::string other = (*rival)->status;
@@ -713,13 +751,18 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
              "a second delivery of h-1 landed right after admit first touched %s and the two got %s and %s: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script",
              kClaim, first.status, other);
   ctx.Equal(admit("acme", "billing", "h-1").status, "duplicate", "a third delivery of h-1");
+  ctx.Assert(*claimTtl != -1, "right after admit first wrote %s the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good", kClaim);
   const long long ttl = ctx.Redis.TTL(kClaim);
   ctx.Assert(86400 - 60 <= ttl && ttl <= 86400, "%s expires in %d s, expected kDedupeTtlSeconds (a day)", kClaim, ttl);
 }
 
 void CheckWindowExpiry(harness::Ctx& ctx) {
   alignMinute(ctx);
+  const std::string opened = "admit:acme:billing:" + std::to_string(ctx.Clock.Now() / 1000 / 60);
+  auto firstTtl = std::make_shared<long long>(-2);
+  ctx.Redis.After(opened, [&ctx, opened, firstTtl] { *firstTtl = ctx.Redis.TTL(opened); });
   ctx.Equal(admit("acme", "billing", "h-1").status, "admitted", "a fresh ticket in an empty queue");
+  ctx.Assert(*firstTtl != -1, "right after admit first wrote %s the counter had no TTL: EXPIRE it in the script that creates it, or a crash in between leaves the key for good", opened);
   const std::string counter = counterKey(ctx, "acme", "billing");
   const long long ttl = ctx.Redis.TTL(counter);
   ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its window (EXPIRE on its first write), or every minute leaves a key behind for good", counter, ttl);
@@ -745,12 +788,15 @@ void CheckDuplicatesFree(harness::Ctx& ctx) {
 
 void CheckFullReleasesClaim(harness::Ctx& ctx) {
   alignMinute(ctx);
-  for (long long i = 0; i < kQueueCap; ++i) ctx.Equal(admit("acme", "billing", "h-" + std::to_string(i)).status, "admitted", "ticket %d of %d", i + 1, kQueueCap);
+  for (long long i = 0; i < kQueueCap; ++i) {
+    ctx.Equal(admit("acme", "billing", "h-" + std::to_string(i)).status, "admitted", "ticket %d of %d", i + 1, kQueueCap);
+    if (i == 0) ctx.Clock.Advance(30);  // the minute's first ticket opened the window 30 s before the queue filled
+  }
   const Admission late = admit("acme", "billing", "h-late");
   ctx.Equal(late.status, "full", "ticket %d in one minute", kQueueCap + 1);
   ctx.Equal(ctx.Redis.Exists("triage:dedupe:acme:h-late"), 0, "the full queue refused h-late and must not claim it (its retry next minute would be dropped as a duplicate: answer full before claiming); the claim");
   ctx.Equal(ctx.Redis.Get(counterKey(ctx, "acme", "billing")), std::optional<std::string>(std::to_string(kQueueCap)), "a refused ticket must not take a slot; the counter");
-  ctx.Assert(late.retry_after > 0 && late.retry_after <= 60, "the refusal says retry after %d s: it must be the seconds until the minute's counter expires", late.retry_after);
+  ctx.Assert(late.retry_after > 0 && late.retry_after <= 31, "the refusal says retry after %d s, but the minute's counter was opened 30 s earlier and expires in about 30 s: retry_after is the counter's TTL, set once on its first write", late.retry_after);
   ctx.Clock.Advance(static_cast<double>(late.retry_after + 1));
   ctx.Equal(admit("acme", "billing", "h-late").status, "admitted", "h-late came back after retry_after");
 }

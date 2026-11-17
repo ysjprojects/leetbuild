@@ -54,7 +54,7 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
       id: 'deadline',
       title: 'Every vendor call carries a 2-second deadline',
       detail:
-        '`FetchPage` is called with `DEADLINE_S` (2 s); without one a vendor that stops answering holds the worker for as long as the vendor likes. A deadline is reported as `VendorUnavailable` and counted toward the breaker.',
+        'Every `FetchPage` attempt, retries included, carries its own `DEADLINE_S` (2 s); without one a vendor that stops answering holds the worker for as long as the vendor likes. A deadline is reported as `VendorUnavailable` and counted toward the breaker.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*2(\.0)?\b/, /FetchPage\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /deadline:[^\n]*DEADLINE_MS/]},
@@ -67,7 +67,7 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
       id: 'backoff',
       title: 'Backs off a 429 with growing, jittered waits',
       detail:
-        '`RESOURCE_EXHAUSTED` is retried after a wait of half to all of `min(BACKOFF_MAX_S, BACKOFF_BASE_S · 2^attempt)`, at most `MAX_ATTEMPTS` calls; retrying at once is the flood the vendor asked to stop.',
+        '`RESOURCE_EXHAUSTED` is retried after a wait of half to all of `min(BACKOFF_MAX_S, BACKOFF_BASE_S · 2^attempt)`, each retry with its own full deadline, at most `MAX_ATTEMPTS` calls; retrying at once is the flood the vendor asked to stop, and waits without jitter send every rate-limited worker back together.',
       match: {
         python: {all: [/RESOURCE_EXHAUSTED/, /time\.sleep\(/, /2\s*\*\*\s*attempt/, /random\./]},
         typescript: {all: [/RESOURCE_EXHAUSTED/, /setTimeout\(/, /2\s*\*\*\s*attempt/, /Math\.random\(/]},
@@ -93,7 +93,7 @@ service Vendor { rpc FetchPage(FetchPageRequest) returns (Page); }
       id: 'breaker',
       title: 'Opens a breaker after five consecutive failures',
       detail:
-        'A 5xx or a deadline counts in `health:{id}` (`consecutive_failures`); at `BREAKER_FAILURES` (5) `open_until` is set `BREAKER_COOLDOWN_S` (30) ahead and a fetch raises `BreakerOpen` without calling the vendor until it passes; a success resets the count.',
+        'A 5xx (`UNAVAILABLE`, `INTERNAL`) or a deadline counts in `health:{id}` (`consecutive_failures`) without a retry; at `BREAKER_FAILURES` (5) `open_until` is set `BREAKER_COOLDOWN_S` (30) seconds ahead and a fetch raises `BreakerOpen` without calling the vendor until it passes; a success resets the count, and every answered call sets `last_run_at`.',
       match: {
         python: {
           all: [/BREAKER_FAILURES\s*=\s*5\b/, /BREAKER_COOLDOWN_S\s*=\s*30\b/, /open_until/, /consecutive_failures/],
@@ -882,6 +882,15 @@ def check_backoff(ctx):
     made = len(_calls(ctx)) - 4
     assert isinstance(err, m.VendorUnavailable), f"a vendor answering 429 to every attempt: fetch_page {_did(page, err)}, expected VendorUnavailable"
     assert made == 5, f"a vendor answering 429 to every attempt was called {made} times, expected MAX_ATTEMPTS = 5"
+    deadlines = [c.timeout for c in _calls(ctx)]
+    assert all(t is not None and 1.5 <= t <= 2.5 for t in deadlines), f"the attempts carried deadlines of {deadlines} s: every attempt gets its own DEADLINE_S (2 s), not what is left of the first one's"
+    again = _calls(ctx)[4:]
+    gaps_again = [round(b.started - a.started, 3) for a, b in zip(again, again[1:])]
+    for waits in (gaps, gaps_again):
+        for attempt, gap in enumerate(waits):
+            ceiling = min(8.0, 0.25 * 2**attempt)
+            assert ceiling / 2 - 0.005 <= gap <= ceiling + 0.005, f"the waits between retries were {waits} s: after 429 number {attempt + 1} the wait must be half to all of min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2^{attempt}), {ceiling / 2} to {ceiling} s"
+    assert gaps_again[:3] != gaps, f"two runs waited exactly {gaps} s between their retries: without jitter, workers rate limited together retry together"
 
 
 def check_auth_terminal(ctx):
@@ -900,22 +909,33 @@ def check_auth_terminal(ctx):
 
 def check_breaker(ctx):
     m, cid = _client(ctx)
-    ctx.grpc.fail("FetchPage", grpc.StatusCode.UNAVAILABLE, "vendor 503", times=5)
+    # A 500 counts like a 503: it is not a rate limit, so it is neither retried nor left out of the count.
+    answers = ["503", "503", "500", "503", "503"]
+    ctx.grpc.fail("FetchPage", grpc.StatusCode.UNAVAILABLE, "vendor 503", times=2)
+    ctx.grpc.fail("FetchPage", grpc.StatusCode.INTERNAL, "vendor 500", times=1)
+    ctx.grpc.fail("FetchPage", grpc.StatusCode.UNAVAILABLE, "vendor 503", times=2)
     for run in range(1, 6):
         page, err = _fetch(m, cid, str(run))
-        assert isinstance(err, m.VendorUnavailable), f"run {run} against a vendor answering 503: fetch_page {_did(page, err)}, expected VendorUnavailable"
-    assert len(_calls(ctx)) == 5, f"five runs against a vendor answering 503 made {len(_calls(ctx))} calls, expected one a run: a 5xx goes back to the scheduler"
+        assert isinstance(err, m.VendorUnavailable), f"run {run} against a vendor answering {answers[run - 1]}: fetch_page {_did(page, err)}, expected VendorUnavailable"
+    assert len(_calls(ctx)) == 5, f"five runs against a vendor answering 503, 503, 500, 503, 503 made {len(_calls(ctx))} calls, expected one a run: a 5xx goes back to the scheduler"
     health = ctx.redis.hgetall(f"health:{cid}")
-    assert health.get("consecutive_failures") == "5", f"health:{cid} holds {health}, expected consecutive_failures 5"
-    assert int(health.get("open_until") or 0) > ctx.clock.time(), f"after five consecutive failures health:{cid} holds {health}: open_until must lie BREAKER_COOLDOWN_S ahead"
+    now = ctx.clock.time()
+    assert health.get("consecutive_failures") == "5", f"after 503, 503, 500, 503, 503 health:{cid} holds {health}, expected consecutive_failures 5: every failure but a rate limit counts"
+    open_until = int(health.get("open_until") or 0)
+    assert now + 29 <= open_until <= now + 31, f"after five consecutive failures at {now:.0f} health:{cid} holds {health}: open_until must be now plus BREAKER_COOLDOWN_S (30 s), in seconds"
+    assert abs(int(health.get("last_run_at") or 0) - now) <= 1, f"the vendor answered a failure at {now:.0f}, health:{cid} holds {health}: every answered call sets last_run_at"
     page, err = _fetch(m, cid, "6")
     assert isinstance(err, m.BreakerOpen), f"the sixth run after five consecutive failures: fetch_page {_did(page, err)}, expected BreakerOpen"
+    ctx.clock.advance(29)
+    page, err = _fetch(m, cid, "6")
+    assert isinstance(err, m.BreakerOpen), f"29 s after the breaker opened, inside its 30 s cooldown: fetch_page {_did(page, err)}, expected BreakerOpen"
     assert len(_calls(ctx)) == 5, "with the breaker open the vendor was called"
-    ctx.clock.advance(31)
+    ctx.clock.advance(2)
     page, err = _fetch(m, cid, "6")
     assert err is None and page is not None, f"31 s later a recovered vendor must be tried again: fetch_page raised {err!r}"
     health = ctx.redis.hgetall(f"health:{cid}")
     assert health.get("consecutive_failures") == "0", f"a success must reset the failure count, health:{cid} holds {health}"
+    assert abs(int(health.get("last_run_at") or 0) - ctx.clock.time()) <= 1, f"the vendor answered a page at {ctx.clock.time():.0f}, health:{cid} holds {health}: every answered call sets last_run_at"
 `,
     typescript: `async function client(ctx) {
   const pkg = ctx.proto('vendor.proto');
@@ -975,6 +995,17 @@ export async function check_backoff(ctx) {
   ({page, err} = await fetch(m, cid, '1'));
   assert(err instanceof m.VendorUnavailable, \`a vendor answering 429 to every attempt: fetchPage threw \${named(err)}, expected VendorUnavailable\`);
   assert.equal(calls(ctx).length - 4, 5, \`a vendor answering 429 to every attempt was called \${calls(ctx).length - 4} times, expected MAX_ATTEMPTS = 5\`);
+  const deadlines = calls(ctx).map(c => c.timeout);
+  assert(deadlines.every(t => t !== null && 1.5 <= t && t <= 2.5), \`the attempts carried deadlines of \${JSON.stringify(deadlines)} s: every attempt gets its own DEADLINE_MS (2 s), not what is left of the first one's\`);
+  const again = calls(ctx).slice(4);
+  const gapsAgain = again.slice(1).map((c, i) => (c.started - again[i].started) / 1000);
+  for (const waits of [gaps, gapsAgain]) {
+    waits.forEach((gap, attempt) => {
+      const ceiling = Math.min(8, 0.25 * 2 ** attempt);
+      assert(ceiling / 2 - 0.005 <= gap && gap <= ceiling + 0.005, \`the waits between retries were \${JSON.stringify(waits)} s: after 429 number \${attempt + 1} the wait must be half to all of min(BACKOFF_MAX_S, BACKOFF_BASE_S * 2^\${attempt}), \${ceiling / 2} to \${ceiling} s\`);
+    });
+  }
+  assert(gapsAgain.slice(0, 3).some((gap, i) => gap !== gaps[i]), \`two runs waited exactly \${JSON.stringify(gaps)} s between their retries: without jitter, workers rate limited together retry together\`);
 }
 
 export async function check_auth_terminal(ctx) {
@@ -992,23 +1023,34 @@ export async function check_auth_terminal(ctx) {
 
 export async function check_breaker(ctx) {
   const {m, cid} = await client(ctx);
-  ctx.grpc.fail('FetchPage', ctx.grpc.status.UNAVAILABLE, 'vendor 503', 5);
+  // A 500 counts like a 503: it is not a rate limit, so it is neither retried nor left out of the count.
+  const answers = ['503', '503', '500', '503', '503'];
+  ctx.grpc.fail('FetchPage', ctx.grpc.status.UNAVAILABLE, 'vendor 503', 2);
+  ctx.grpc.fail('FetchPage', ctx.grpc.status.INTERNAL, 'vendor 500', 1);
+  ctx.grpc.fail('FetchPage', ctx.grpc.status.UNAVAILABLE, 'vendor 503', 2);
   for (let run = 1; run <= 5; run += 1) {
     const {err} = await fetch(m, cid, String(run));
-    assert(err instanceof m.VendorUnavailable, \`run \${run} against a vendor answering 503: fetchPage threw \${named(err)}, expected VendorUnavailable\`);
+    assert(err instanceof m.VendorUnavailable, \`run \${run} against a vendor answering \${answers[run - 1]}: fetchPage threw \${named(err)}, expected VendorUnavailable\`);
   }
-  assert.equal(calls(ctx).length, 5, \`five runs against a vendor answering 503 made \${calls(ctx).length} calls, expected one a run: a 5xx goes back to the scheduler\`);
+  assert.equal(calls(ctx).length, 5, \`five runs against a vendor answering 503, 503, 500, 503, 503 made \${calls(ctx).length} calls, expected one a run: a 5xx goes back to the scheduler\`);
   let health = ctx.redis.hgetall(\`health:\${cid}\`);
-  assert.equal(health.consecutive_failures, '5', \`health:\${cid} holds \${JSON.stringify(health)}, expected consecutive_failures 5\`);
-  assert(Number(health.open_until ?? 0) * 1000 > ctx.clock.now(), \`after five consecutive failures health:\${cid} holds \${JSON.stringify(health)}: open_until must lie BREAKER_COOLDOWN_S ahead\`);
+  const now = ctx.clock.now() / 1000;
+  assert.equal(health.consecutive_failures, '5', \`after 503, 503, 500, 503, 503 health:\${cid} holds \${JSON.stringify(health)}, expected consecutive_failures 5: every failure but a rate limit counts\`);
+  const openUntil = Number(health.open_until ?? 0);
+  assert(now + 29 <= openUntil && openUntil <= now + 31, \`after five consecutive failures at \${Math.round(now)} health:\${cid} holds \${JSON.stringify(health)}: open_until must be now plus BREAKER_COOLDOWN_S (30 s), in seconds\`);
+  assert(Math.abs(Number(health.last_run_at ?? 0) - now) <= 1, \`the vendor answered a failure at \${Math.round(now)}, health:\${cid} holds \${JSON.stringify(health)}: every answered call sets last_run_at\`);
   let {page, err} = await fetch(m, cid, '6');
   assert(err instanceof m.BreakerOpen, \`the sixth run after five consecutive failures: fetchPage threw \${named(err)}, expected BreakerOpen\`);
+  ctx.clock.advance(29);
+  ({page, err} = await fetch(m, cid, '6'));
+  assert(err instanceof m.BreakerOpen, \`29 s after the breaker opened, inside its 30 s cooldown: fetchPage threw \${named(err)}, expected BreakerOpen\`);
   assert.equal(calls(ctx).length, 5, 'with the breaker open the vendor was called');
-  ctx.clock.advance(31);
+  ctx.clock.advance(2);
   ({page, err} = await fetch(m, cid, '6'));
   assert(err === null && page !== null, \`31 s later a recovered vendor must be tried again: fetchPage threw \${named(err)}\`);
   health = ctx.redis.hgetall(\`health:\${cid}\`);
   assert.equal(health.consecutive_failures, '0', \`a success must reset the failure count, health:\${cid} holds \${JSON.stringify(health)}\`);
+  assert(Math.abs(Number(health.last_run_at ?? 0) - ctx.clock.now() / 1000) <= 1, \`the vendor answered a page at \${Math.round(ctx.clock.now() / 1000)}, health:\${cid} holds \${JSON.stringify(health)}: every answered call sets last_run_at\`);
 }
 `,
     go: `package main
@@ -1096,6 +1138,29 @@ func CheckBackoff(ctx *harness.Ctx) {
 	_, err = fetch(cid, "1")
 	ctx.Assert(errors.Is(err, ErrVendorUnavailable), "a vendor answering 429 to every attempt: fetchPage returned %v, expected ErrVendorUnavailable", err)
 	ctx.Equal(len(fetchCalls(ctx))-4, 5, "a vendor answering 429 to every attempt; the calls (maxAttempts)")
+	var deadlines []time.Duration
+	ownDeadline := true
+	for _, call := range fetchCalls(ctx) {
+		deadlines = append(deadlines, call.Timeout)
+		ownDeadline = ownDeadline && call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond
+	}
+	ctx.Assert(ownDeadline, "the attempts carried deadlines of %v: every attempt gets its own deadline (2 s), not what is left of the first one's", deadlines)
+	again := fetchCalls(ctx)[4:]
+	var gapsAgain []float64
+	for i := 1; i < len(again); i++ {
+		gapsAgain = append(gapsAgain, again[i].Started.Sub(again[i-1].Started).Seconds())
+	}
+	for _, waits := range [][]float64{gaps, gapsAgain} {
+		for attempt, gap := range waits {
+			ceiling := 0.25 * float64(int(1)<<attempt) // under backoffMax for every attempt of a run
+			ctx.Assert(ceiling/2-0.005 <= gap && gap <= ceiling+0.005, "the waits between retries were %v s: after 429 number %d the wait must be half to all of min(backoffMax, backoffBase << %d), %v to %v s", waits, attempt+1, attempt, ceiling/2, ceiling)
+		}
+	}
+	jittered := false
+	for i := range gaps {
+		jittered = jittered || gapsAgain[i] != gaps[i]
+	}
+	ctx.Assert(jittered, "two runs waited exactly %v s between their retries: without jitter, workers rate limited together retry together", gaps)
 }
 
 func CheckAuthTerminal(ctx *harness.Ctx) {
@@ -1113,24 +1178,37 @@ func CheckAuthTerminal(ctx *harness.Ctx) {
 
 func CheckBreaker(ctx *harness.Ctx) {
 	cid := client(ctx)
-	ctx.GRPC.Fail("FetchPage", codes.Unavailable, "vendor 503", 5, "")
+	// A 500 counts like a 503: it is not a rate limit, so it is neither retried nor left out of the count.
+	answers := []string{"503", "503", "500", "503", "503"}
+	ctx.GRPC.Fail("FetchPage", codes.Unavailable, "vendor 503", 2, "")
+	ctx.GRPC.Fail("FetchPage", codes.Internal, "vendor 500", 1, "")
+	ctx.GRPC.Fail("FetchPage", codes.Unavailable, "vendor 503", 2, "")
 	for run := 1; run <= 5; run++ {
 		_, err := fetch(cid, strconv.Itoa(run))
-		ctx.Assert(errors.Is(err, ErrVendorUnavailable), "run %d against a vendor answering 503: fetchPage returned %v, expected ErrVendorUnavailable", run, err)
+		ctx.Assert(errors.Is(err, ErrVendorUnavailable), "run %d against a vendor answering %s: fetchPage returned %v, expected ErrVendorUnavailable", run, answers[run-1], err)
 	}
-	ctx.Equal(len(fetchCalls(ctx)), 5, "five runs against a vendor answering 503 must make one call a run (a 5xx goes back to the scheduler); the calls")
+	ctx.Equal(len(fetchCalls(ctx)), 5, "five runs against a vendor answering 503, 503, 500, 503, 503 must make one call a run (a 5xx goes back to the scheduler); the calls")
 	health := ctx.Redis.HGetAll("health:" + cid)
-	ctx.Equal(health["consecutive_failures"], "5", "health:%s consecutive_failures (it holds %v)", cid, health)
+	now := ctx.Clock.Now() / 1000
+	ctx.Equal(health["consecutive_failures"], "5", "after 503, 503, 500, 503, 503 (every failure but a rate limit counts) health:%s consecutive_failures (it holds %v)", cid, health)
 	openUntil, _ := strconv.ParseInt(health["open_until"], 10, 64)
-	ctx.Assert(openUntil*1000 > ctx.Clock.Now(), "after five consecutive failures health:%s holds %v: open_until must lie breakerCooldownS ahead", cid, health)
+	ctx.Assert(now+29 <= openUntil && openUntil <= now+31, "after five consecutive failures at %d health:%s holds %v: open_until must be now plus breakerCooldownS (30 s), in seconds", now, cid, health)
+	lastRun, _ := strconv.ParseInt(health["last_run_at"], 10, 64)
+	ctx.Assert(now-1 <= lastRun && lastRun <= now+1, "the vendor answered a failure at %d, health:%s holds %v: every answered call sets last_run_at", now, cid, health)
 	_, err := fetch(cid, "6")
 	ctx.Assert(errors.Is(err, ErrBreakerOpen), "the sixth run after five consecutive failures: fetchPage returned %v, expected ErrBreakerOpen", err)
+	ctx.Clock.Advance(29)
+	_, err = fetch(cid, "6")
+	ctx.Assert(errors.Is(err, ErrBreakerOpen), "29 s after the breaker opened, inside its 30 s cooldown: fetchPage returned %v, expected ErrBreakerOpen", err)
 	ctx.Equal(len(fetchCalls(ctx)), 5, "with the breaker open the vendor must not be called; the calls")
-	ctx.Clock.Advance(31)
+	ctx.Clock.Advance(2)
 	page, err := fetch(cid, "6")
 	ctx.Assert(err == nil && page != nil, "31 s later a recovered vendor must be tried again: fetchPage returned %v", err)
-	failures, _ := ctx.Redis.HGet("health:"+cid, "consecutive_failures")
-	ctx.Equal(failures, "0", "a success must reset the failure count; consecutive_failures")
+	health = ctx.Redis.HGetAll("health:" + cid)
+	ctx.Equal(health["consecutive_failures"], "0", "a success must reset the failure count; consecutive_failures")
+	now = ctx.Clock.Now() / 1000
+	lastRun, _ = strconv.ParseInt(health["last_run_at"], 10, 64)
+	ctx.Assert(now-1 <= lastRun && lastRun <= now+1, "the vendor answered a page at %d, health:%s holds %v: every answered call sets last_run_at", now, cid, health)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1221,6 +1299,27 @@ void CheckBackoff(harness::Ctx& ctx) {
   out = fetch(cid, "1");
   ctx.Equal(out.thrown, "VendorUnavailable", "a vendor answering 429 to every attempt; fetchPage threw");
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size() - 4, 5, "a vendor answering 429 to every attempt; the calls (kMaxAttempts)");
+  const auto all = ctx.GRPC.CallsTo("FetchPage");
+  std::vector<double> deadlines;
+  bool own_deadline = true;
+  for (const auto& call : all) {
+    deadlines.push_back(call.HasDeadline() ? call.TimeoutSeconds() : -1);
+    own_deadline = own_deadline && call.HasDeadline() && 1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5;
+  }
+  ctx.Assert(own_deadline, "the attempts carried deadlines of %v s (-1: none): every attempt gets its own kDeadline (2 s), not what is left of the first one's", deadlines);
+  std::vector<double> gaps_again;
+  for (size_t i = 5; i < all.size(); i++) gaps_again.push_back(seconds(all[i].Started - all[i - 1].Started));
+  for (const auto* waits : {&gaps, &gaps_again}) {
+    for (size_t attempt = 0; attempt < waits->size(); attempt++) {
+      const double ceiling = 0.25 * static_cast<double>(1 << attempt);  // under kBackoffMax for every attempt of a run
+      const double gap = (*waits)[attempt];
+      ctx.Assert(ceiling / 2 - 0.005 <= gap && gap <= ceiling + 0.005, "the waits between retries were %v s: after 429 number %d the wait must be half to all of min(kBackoffMax, kBackoffBase << %d), %v to %v s",
+                 *waits, attempt + 1, attempt, ceiling / 2, ceiling);
+    }
+  }
+  bool jittered = false;
+  for (size_t i = 0; i < gaps.size(); i++) jittered = jittered || gaps_again[i] != gaps[i];
+  ctx.Assert(jittered, "two runs waited exactly %v s between their retries: without jitter, workers rate limited together retry together", gaps);
 }
 
 void CheckAuthTerminal(harness::Ctx& ctx) {
@@ -1238,24 +1337,43 @@ void CheckAuthTerminal(harness::Ctx& ctx) {
 
 void CheckBreaker(harness::Ctx& ctx) {
   const std::string cid = client(ctx);
-  ctx.GRPC.Fail("FetchPage", grpc::StatusCode::UNAVAILABLE, "vendor 503", 5);
+  // A 500 counts like a 503: it is not a rate limit, so it is neither retried nor left out of the count.
+  const std::vector<std::string> answers = {"503", "503", "500", "503", "503"};
+  ctx.GRPC.Fail("FetchPage", grpc::StatusCode::UNAVAILABLE, "vendor 503", 2);
+  ctx.GRPC.Fail("FetchPage", grpc::StatusCode::INTERNAL, "vendor 500", 1);
+  ctx.GRPC.Fail("FetchPage", grpc::StatusCode::UNAVAILABLE, "vendor 503", 2);
   for (int run = 1; run <= 5; run++) {
     const Outcome out = fetch(cid, std::to_string(run));
-    ctx.Equal(out.thrown, "VendorUnavailable", "run %d against a vendor answering 503; fetchPage threw", run);
+    ctx.Equal(out.thrown, "VendorUnavailable", "run %d against a vendor answering %s; fetchPage threw", run, answers[run - 1]);
   }
-  ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 5, "five runs against a vendor answering 503 must make one call a run (a 5xx goes back to the scheduler); the calls");
-  const auto health = ctx.Redis.HGetAll("health:" + cid);
-  const auto field = [&health](const std::string& f) { return health.count(f) ? health.at(f) : std::string(); };
-  ctx.Equal(field("consecutive_failures"), "5", "health:%s consecutive_failures (it holds %v)", cid, health);
-  const long long open_until = field("open_until").empty() ? 0 : std::stoll(field("open_until"));
-  ctx.Assert(open_until * 1000 > ctx.Clock.Now(), "after five consecutive failures health:%s holds %v: open_until must lie kBreakerCooldownS ahead", cid, health);
+  ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 5, "five runs against a vendor answering 503, 503, 500, 503, 503 must make one call a run (a 5xx goes back to the scheduler); the calls");
+  auto health = ctx.Redis.HGetAll("health:" + cid);
+  const auto number = [&health](const std::string& f) -> long long {
+    try {
+      return health.count(f) ? std::stoll(health.at(f)) : 0;
+    } catch (const std::exception&) {
+      return 0;
+    }
+  };
+  long long now = ctx.Clock.Now() / 1000;
+  ctx.Equal(health.count("consecutive_failures") ? health.at("consecutive_failures") : std::string(), "5",
+            "after 503, 503, 500, 503, 503 (every failure but a rate limit counts) health:%s consecutive_failures (it holds %v)", cid, health);
+  const long long open_until = number("open_until");
+  ctx.Assert(now + 29 <= open_until && open_until <= now + 31, "after five consecutive failures at %d health:%s holds %v: open_until must be now plus kBreakerCooldownS (30 s), in seconds", now, cid, health);
+  ctx.Assert(now - 1 <= number("last_run_at") && number("last_run_at") <= now + 1, "the vendor answered a failure at %d, health:%s holds %v: every answered call sets last_run_at", now, cid, health);
   Outcome out = fetch(cid, "6");
   ctx.Equal(out.thrown, "BreakerOpen", "the sixth run after five consecutive failures; fetchPage threw");
+  ctx.Clock.Advance(29);
+  out = fetch(cid, "6");
+  ctx.Equal(out.thrown, "BreakerOpen", "29 s after the breaker opened, inside its 30 s cooldown; fetchPage threw");
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 5, "with the breaker open the vendor must not be called; the calls");
-  ctx.Clock.Advance(31);
+  ctx.Clock.Advance(2);
   out = fetch(cid, "6");
   ctx.Assert(out.thrown.empty(), "31 s later a recovered vendor must be tried again: fetchPage threw %s", out.thrown);
-  ctx.Equal(ctx.Redis.HGet("health:" + cid, "consecutive_failures").value_or(""), "0", "a success must reset the failure count; consecutive_failures");
+  health = ctx.Redis.HGetAll("health:" + cid);
+  ctx.Equal(health.count("consecutive_failures") ? health.at("consecutive_failures") : std::string(), "0", "a success must reset the failure count; consecutive_failures");
+  now = ctx.Clock.Now() / 1000;
+  ctx.Assert(now - 1 <= number("last_run_at") && number("last_run_at") <= now + 1, "the vendor answered a page at %d, health:%s holds %v: every answered call sets last_run_at", now, cid, health);
 }
 `,
   },

@@ -59,7 +59,7 @@ Requirements:
       id: 'attempt-deadline',
       title: 'Two-second deadline on every model call',
       detail:
-        'Each Predict carries a deadline of about 2 s; a large model that hangs is cut three times and the small model answers, downgraded with reason deadline, within about 7 s. The healthy path calls the large model once and reports its model_version. The starter sends no deadline.',
+        'Each Predict, every retry and the small-model call included, carries its own deadline of about 2 s; a large model that hangs is cut three times and the small model answers, downgraded with reason deadline, within about 7 s. The healthy path calls the large model once and reports its model_version. The starter sends no deadline.',
       match: {
         python: {all: [/DEADLINE_S/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -72,7 +72,7 @@ Requirements:
       id: 'retry-policy',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED, at most three calls',
       detail:
-        'INVALID_ARGUMENT from the large model is failed with reason invalid_argument after one call and no small-model call; one UNAVAILABLE earns one retry after a backoff. The starter retries every error on alternating models.',
+        'INVALID_ARGUMENT from the large model is failed with reason invalid_argument after one call and no small-model call, and so are RESOURCE_EXHAUSTED (reason resource_exhausted) and PERMISSION_DENIED; one UNAVAILABLE earns one retry after a backoff. The starter retries every error on alternating models.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS/, /StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/],
@@ -973,6 +973,8 @@ def check_attempt_deadline(ctx):
     assert len(_large(ctx)) == 4, f"a hung large model is cut at the deadline and retried up to 3 calls, saw {len(_large(ctx)) - 1}"
     assert r.get("model_version") == models.SMALL_VERSION and r.get("downgraded") is True and r.get("downgrade_reason") == "deadline", f"after three cut calls the small model answers, downgraded with reason deadline: {r}"
     assert waited <= 8.0, f"predict waited {waited:.1f} s on a model that hangs: three 2 s deadlines and a small call fit in about 7 s"
+    for call in _large(ctx)[1:] + _small(ctx):
+        assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"every call carries its own 2 s deadline, the retries and the small-model call included: a call went out with {call.timeout} s"
 
 
 def check_retry_policy(ctx):
@@ -988,6 +990,12 @@ def check_retry_policy(ctx):
     assert r.get("attempts") == 2 and len(_large(ctx)) == 3, f"one UNAVAILABLE earns one retry on the large model: {r}, {len(_large(ctx)) - 1} large calls"
     assert r.get("model_version") == models.LARGE_VERSION and len(_small(ctx)) == 0, f"the retry answered, so no downgrade: {r}"
     assert ctx.clock.sleeps >= 1, "a retry waits a backoff before the next attempt"
+    for i, (code, reason) in enumerate(((grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.PERMISSION_DENIED, None))):
+        before = len(_large(ctx))
+        ctx.grpc.fail("Predict", code, "refused", times=1, target=config.LARGE_MODEL)
+        r = m.predict(pool, "t1", f"inf-{3 + i}", CAT, "classify")
+        _expect(r, "failed", reason)
+        assert len(_large(ctx)) == before + 1 and len(_small(ctx)) == 0, f"{code.name} is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw {len(_large(ctx)) - before} large and {len(_small(ctx))} small calls"
 
 
 def check_downgrade(ctx):
@@ -1016,7 +1024,7 @@ def check_throttled_no_call(ctx):
         r = e
     assert ctx.grpc.calls_to("Predict") == [], f"t1's pool is full and predict still called the model ({len(ctx.grpc.calls_to('Predict'))} calls)"
     _expect(r, "throttled")
-    assert isinstance(r.get("retry_after"), int) and r["retry_after"] >= 1, f"a throttled result carries the pool's retry_after: {r}"
+    assert isinstance(r.get("retry_after"), int) and 299 <= r["retry_after"] <= 300, f"a throttled result carries the pool's retry_after (the earliest lease ends in 300 s): {r}"
     _expect(m.predict(pool, "t2", "inf-2", CAT, "classify"), "complete")
 
 
@@ -1076,6 +1084,9 @@ export async function check_attempt_deadline(ctx) {
   assert.equal(large().length, 4, \`a hung large model is cut at the deadline and retried up to 3 calls, saw \${large().length - 1}\`);
   assert(r.model_version === models.SMALL_VERSION && r.downgraded === true && r.downgrade_reason === 'deadline', \`after three cut calls the small model answers, downgraded with reason deadline: \${JSON.stringify(r)}\`);
   assert(waited <= 8.0, \`predict waited \${waited.toFixed(1)} s on a model that hangs: three 2 s deadlines and a small call fit in about 7 s\`);
+  for (const call of [...large().slice(1), ...ctx.grpc.callsTo('Predict', config.SMALL_MODEL)]) {
+    assert(call.timeout !== null && call.timeout >= 1.5 && call.timeout <= 2.5, \`every call carries its own 2 s deadline, the retries and the small-model call included: a call went out with \${call.timeout} s\`);
+  }
 }
 
 export async function check_retry_policy(ctx) {
@@ -1093,6 +1104,13 @@ export async function check_retry_policy(ctx) {
   assert(r.attempts === 2 && large().length === 3, \`one UNAVAILABLE earns one retry on the large model: \${JSON.stringify(r)}, \${large().length - 1} large calls\`);
   assert(r.model_version === models.LARGE_VERSION && small().length === 0, \`the retry answered, so no downgrade: \${JSON.stringify(r)}\`);
   assert(ctx.clock.sleeps >= 1, 'a retry waits a backoff before the next attempt');
+  for (const [i, [code, name, reason]] of ([[ctx.grpc.status.RESOURCE_EXHAUSTED, 'RESOURCE_EXHAUSTED', 'resource_exhausted'], [ctx.grpc.status.PERMISSION_DENIED, 'PERMISSION_DENIED', undefined]] as const).entries()) {
+    const before = large().length;
+    ctx.grpc.fail('Predict', code, 'refused', 1, config.LARGE_MODEL);
+    r = await m.predict(pool, 't1', \`inf-\${3 + i}\`, CAT, 'classify');
+    expect(r, 'failed', reason);
+    assert(large().length === before + 1 && small().length === 0, \`\${name} is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw \${large().length - before} large and \${small().length} small calls\`);
+  }
 }
 
 export async function check_downgrade(ctx) {
@@ -1119,7 +1137,7 @@ export async function check_throttled_no_call(ctx) {
   const r = await m.predict(pool, 't1', 'inf-1', CAT, 'classify');
   assert.equal(ctx.grpc.callsTo('Predict').length, 0, \`t1's pool is full and predict still called the model (\${ctx.grpc.callsTo('Predict').length} calls)\`);
   expect(r, 'throttled');
-  assert(Number.isInteger(r.retry_after) && r.retry_after >= 1, \`a throttled result carries the pool's retry_after: \${JSON.stringify(r)}\`);
+  assert(Number.isInteger(r.retry_after) && r.retry_after >= 299 && r.retry_after <= 300, \`a throttled result carries the pool's retry_after (the earliest lease ends in 300 s): \${JSON.stringify(r)}\`);
   expect(await m.predict(pool, 't2', 'inf-2', CAT, 'classify'), 'complete');
 }
 
@@ -1228,6 +1246,9 @@ func CheckAttemptDeadline(ctx *harness.Ctx) {
 	ctx.Equal(len(clientLarge(ctx)), 4, "a hung large model is cut at the deadline and retried up to 3 calls; large calls so far")
 	ctx.Assert(r.ModelVersion == models.SmallVersion && r.Downgraded && r.DowngradeReason == "deadline", "after three cut calls the small model answers, downgraded with reason deadline: %+v", r)
 	ctx.Assert(waited <= 8.0, "predict waited %.1f s on a model that hangs: three 2 s deadlines and a small call fit in about 7 s", waited)
+	for _, call := range append(clientLarge(ctx)[1:], clientSmall(ctx)...) {
+		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "every call carries its own 2 s deadline, the retries and the small-model call included: a call went out with %v (deadline set: %t)", call.Timeout, call.HasDeadline())
+	}
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
@@ -1243,6 +1264,17 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	ctx.Assert(r.Attempts == 2 && len(clientLarge(ctx)) == 3, "one UNAVAILABLE earns one retry on the large model: %+v, %d large calls", r, len(clientLarge(ctx))-1)
 	ctx.Assert(r.ModelVersion == models.LargeVersion && len(clientSmall(ctx)) == 0, "the retry answered, so no downgrade: %+v", r)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
+	for i, tc := range []struct {
+		code   codes.Code
+		name   string
+		reason string
+	}{{codes.ResourceExhausted, "RESOURCE_EXHAUSTED", "resource_exhausted"}, {codes.PermissionDenied, "PERMISSION_DENIED", ""}} {
+		before := len(clientLarge(ctx))
+		ctx.GRPC.Fail("Predict", tc.code, "refused", 1, config.LargeModel)
+		r = clientPredict(ctx, pool, "t1", "inf-"+string(rune('3'+i)))
+		clientExpect(ctx, r, "failed", tc.reason)
+		ctx.Assert(len(clientLarge(ctx)) == before+1 && len(clientSmall(ctx)) == 0, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw %d large and %d small calls", tc.name, len(clientLarge(ctx))-before, len(clientSmall(ctx)))
+	}
 }
 
 func CheckDowngrade(ctx *harness.Ctx) {
@@ -1270,7 +1302,7 @@ func CheckThrottledNoCall(ctx *harness.Ctx) {
 	r := clientPredict(ctx, pool, "t1", "inf-1")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Predict", "")), 0, "t1's pool is full and predict still called the model; calls")
 	clientExpect(ctx, r, "throttled", "")
-	ctx.Assert(r.RetryAfter >= 1, "a throttled result carries the pool's RetryAfter: %+v", r)
+	ctx.Assert(r.RetryAfter == 60, "a throttled result carries the pool's RetryAfter (this pool answered 60): %+v", r)
 	clientExpect(ctx, clientPredict(ctx, pool, "t2", "inf-2"), "complete", "")
 }
 
@@ -1380,6 +1412,12 @@ void CheckAttemptDeadline(harness::Ctx& ctx) {
   ctx.Equal(largeCalls(ctx), 4, "a hung large model is cut at the deadline and retried up to 3 calls; large calls so far");
   ctx.Assert(r.model_version == models::kSmallVersion && r.downgraded && r.downgrade_reason == "deadline", "after three cut calls the small model answers, downgraded with reason deadline (got %q, %q)", r.model_version, r.downgrade_reason);
   ctx.Assert(waited <= 8.0, "predict waited %.1f s on a model that hangs: three 2 s deadlines and a small call fit in about 7 s", waited);
+  auto later = ctx.GRPC.CallsTo("Predict", config::kLargeModel);
+  later.erase(later.begin());
+  for (const auto& call : ctx.GRPC.CallsTo("Predict", config::kSmallModel)) later.push_back(call);
+  for (const auto& call : later) {
+    ctx.Assert(call.HasDeadline() && 1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "every call carries its own 2 s deadline, the retries and the small-model call included: a call went out with %vs (deadline set: %t)", call.TimeoutSeconds(), call.HasDeadline());
+  }
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
@@ -1395,6 +1433,19 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   ctx.Assert(r.attempts == 2 && largeCalls(ctx) == 3, "one UNAVAILABLE earns one retry on the large model: attempts %d, %d large calls", r.attempts, largeCalls(ctx) - 1);
   ctx.Assert(r.model_version == models::kLargeVersion && smallCalls(ctx) == 0, "the retry answered, so no downgrade (model_version %q)", r.model_version);
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
+  struct Terminal {
+    grpc::StatusCode code;
+    std::string name;
+    std::string reason;
+  };
+  int n = 3;
+  for (const Terminal& t : {Terminal{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"}, Terminal{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", ""}}) {
+    const size_t before = largeCalls(ctx);
+    ctx.GRPC.Fail("Predict", t.code, "refused", 1, config::kLargeModel);
+    r = predict(w.pool, "t1", "inf-" + std::to_string(n++), kCat, "classify");
+    clientExpect(ctx, r, "failed", t.reason);
+    ctx.Assert(largeCalls(ctx) == before + 1 && smallCalls(ctx) == 0, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw %d large and %d small calls", t.name, largeCalls(ctx) - before, smallCalls(ctx));
+  }
 }
 
 void CheckDowngrade(harness::Ctx& ctx) {
@@ -1419,7 +1470,7 @@ void CheckThrottledNoCall(harness::Ctx& ctx) {
   const Prediction r = predict(w.pool, "t1", "inf-1", kCat, "classify");
   ctx.Equal(ctx.GRPC.CallsTo("Predict").size(), 0, "t1's pool is full and predict still called the model; calls");
   clientExpect(ctx, r, "throttled");
-  ctx.Assert(r.retry_after >= 1, "a throttled result carries the pool's retry_after (got %d)", r.retry_after);
+  ctx.Assert(r.retry_after == 60, "a throttled result carries the pool's retry_after (this pool answered 60; got %d)", r.retry_after);
   clientExpect(ctx, predict(w.pool, "t2", "inf-2", kCat, "classify"), "complete");
 }
 

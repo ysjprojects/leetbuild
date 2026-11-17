@@ -19,8 +19,8 @@ demo and hides four flaws.
 promised the same GPUs and nothing records either grant; any caller can reserve against another
 team's window, with a window, a class or an amount the broker cannot enforce.
 
-- The caller's team is the \`X-Team-Id\` header: missing is **401**, a path team that differs is
-  **403**.
+- The caller's team is the \`X-Team-Id\` header, checked before any field: missing is **401**, a path
+  team that differs is **403**.
 - \`window\` matches \`WINDOW_RE\` (\`YYYY-MM-DDTHH:MMZ\`) and \`amount\` is an integer from 1 to
   \`MAX_RESERVE_AMOUNT\` (64), else **400**.
 - \`resource_class\` is one of \`RESOURCE_CLASSES\` (\`gpu-a100\`, \`gpu-h100\`, \`tpu-v5\`), else **400**.
@@ -74,7 +74,7 @@ team's window, with a window, a class or an amount the broker cannot enforce.
       id: 'team-scope',
       title: 'Scopes the path team to the X-Team-Id caller',
       detail:
-        'A reserve without `X-Team-Id` is **401** and one whose path names another team is **403**, with nothing written; the starter trusts the path, so any caller can take another team’s units.',
+        'A reserve without `X-Team-Id` is **401** and one whose path names another team is **403**, even when a field is also invalid, with nothing written; the starter trusts the path, so any caller can take another team’s units.',
       match: {
         python: {all: [/x-team-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-team-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
@@ -87,7 +87,7 @@ team's window, with a window, a class or an amount the broker cannot enforce.
       id: 'window-and-amount',
       title: 'Validates the window shape and the amount range',
       detail:
-        'A window that does not match `WINDOW_RE` (`YYYY-MM-DDTHH:MMZ`) and an amount outside 1..`MAX_RESERVE_AMOUNT` are **400**; the starter takes any string as a window and lets an amount over the cap reach the quota comparison.',
+        'A window that does not match `WINDOW_RE` (`YYYY-MM-DDTHH:MMZ`) as a whole and an amount that is not an integer from 1 to `MAX_RESERVE_AMOUNT` are **400**, and an amount of exactly 64 is allowed; the starter takes any string as a window and lets an amount over the cap reach the quota comparison.',
       match: {
         python: {all: [/WINDOW_RE/, /MAX_RESERVE_AMOUNT/, /\b400\b/]},
         typescript: {all: [/WINDOW_RE/, /MAX_RESERVE_AMOUNT/, /code\(\s*400\s*\)/]},
@@ -113,7 +113,7 @@ team's window, with a window, a class or an amount the broker cannot enforce.
       id: 'recorded',
       title: 'Records the grant and answers 201 with its id',
       detail:
-        'The units are taken through one `ledger.reserve` call, the answer is **201** with the reservation id, and a reserve the window can no longer cover is **409**; the starter answers ok and writes nothing, so a second job is promised the same units.',
+        'The units are taken through one `ledger.reserve` call, the answer is **201** with the reservation id, and a reserve the window can no longer cover is **409**, also when another broker fills the window while the request is in flight; the starter answers ok and writes nothing, so a second job is promised the same units.',
       match: {
         python: {all: [/ledger\.reserve\(/, /reservation_id/, /\b201\b/], none: [/["']status["']\s*:\s*["']ok["']/]},
         typescript: {all: [/\breserve\(/, /reservation_id/, /code\(\s*201\s*\)/], none: [/status:\s*['"]ok['"]/]},
@@ -542,6 +542,7 @@ void register_routes(httplib::Server& svr) { svr.Post(R"(/v1/quotas/([\\w-]+)/re
   },
   harness: {
     python: `W = "2026-11-02T14:00Z"
+W2 = "2026-11-02T15:00Z"
 BODY = {"window": W, "resource_class": "gpu-a100", "amount": 4}
 
 
@@ -564,24 +565,34 @@ async def check_team_scope(ctx):
     async with _api(ctx) as c:
         anonymous = await _reserve(c, caller=None)
         assert anonymous.status_code == 401, f"a reserve without X-Team-Id answered {anonymous.status_code}, expected 401"
+        anonymous = await _reserve(c, caller=None, window="tomorrow")
+        assert anonymous.status_code == 401, f"a reserve without X-Team-Id and with a bad window answered {anonymous.status_code}, expected 401: the caller is checked before any field"
         foreign = await _reserve(c, team="vision", caller="research")
         assert foreign.status_code == 403, f"team research reserving on /v1/quotas/vision/reserve answered {foreign.status_code}, expected 403: the path names another team's quota"
-        assert not ctx.redis.keys("quota:vision:*"), f"the forbidden reserve wrote vision's ledger: {ctx.redis.keys('quota:vision:*')}"
+        foreign = await _reserve(c, team="vision", caller="research", resource_class="gpu-z9")
+        assert foreign.status_code == 403, f"team research reserving on /v1/quotas/vision/reserve with an unknown class answered {foreign.status_code}, expected 403: the caller is checked before any field, so another team's path tells it nothing"
+        written = ctx.redis.keys("quota:*") + ctx.redis.keys("reservation:*")
+        assert not written, f"the refused reserves wrote the ledger: {written}"
         own = await _reserve(c)
     assert own.status_code in (200, 201), f"research reserving on its own path answered {own.status_code}: {own.text}"
 
 
 async def check_window_and_amount(ctx):
     async with _api(ctx) as c:
-        for window in ("tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z"):
+        for window in ("tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"):
             r = await _reserve(c, window=window)
-            assert r.status_code == 400, f"a reserve for window {window!r} answered {r.status_code}, expected 400: the window must match YYYY-MM-DDTHH:MMZ"
+            assert r.status_code == 400, f"a reserve for window {window!r} answered {r.status_code}, expected 400: the whole window must match YYYY-MM-DDTHH:MMZ"
         for amount in (0, -3, 65):
             r = await _reserve(c, amount=amount)
             assert r.status_code == 400, f"a reserve of {amount} units answered {r.status_code}, expected 400: the amount is 1..64"
+        r = await _reserve(c, amount=2.5)
+        assert r.status_code in (400, 422), f"a reserve of 2.5 units answered {r.status_code}, expected 400: the amount is an integer"
         assert not ctx.redis.keys("quota:*"), f"a rejected reserve wrote the ledger: {ctx.redis.keys('quota:*')}"
         r = await _reserve(c, amount=1)
-    assert r.status_code in (200, 201), f"a valid reserve of 1 unit answered {r.status_code}: {r.text}"
+        assert r.status_code in (200, 201), f"a valid reserve of 1 unit answered {r.status_code}: {r.text}"
+        ctx.redis.hset("quota:limits", "research", 64)
+        r = await _reserve(c, window=W2, amount=64)
+    assert r.status_code in (200, 201), f"with research's limit at 64 a reserve of 64 units answered {r.status_code}: {r.text}. 64 is MAX_RESERVE_AMOUNT itself and is allowed"
 
 
 async def check_resource_class(ctx):
@@ -609,9 +620,19 @@ async def check_recorded(ctx):
         second = await _reserve(c, amount=5)
         assert second.status_code == 409 and "quota_exhausted" in second.text, f"with 3 of research's 8 units left a reserve of 5 answered {second.status_code} {second.text}, expected 409 quota_exhausted: the same units went to two jobs"
         third = await _reserve(c, amount=3)
-    assert third.status_code == 201, f"the last 3 units must still be granted, the reserve answered {third.status_code} {third.text}"
+        assert third.status_code == 201, f"the last 3 units must still be granted, the reserve answered {third.status_code} {third.text}"
+
+        def another_broker_takes_the_rest():
+            ctx.redis.hset(f"quota:research:{W2}", mapping={"limit": 8, "reserved": 8, "consumed": 0})
+
+        ctx.redis_after(f"quota:research:{W2}", another_broker_takes_the_rest)
+        raced = await _reserve(c, window=W2, amount=4)
+    if raced.status_code != 409:
+        raced_id = raced.json().get("reservation_id") if raced.status_code == 201 else None
+        assert raced_id and ctx.redis.hget(f"reservation:research:{raced_id}", "amount") == "4", f"another broker took the rest of window {W2} right after this reserve first touched it, and the reserve answered {raced.status_code} {raced.text}: the answer must come from what ledger.reserve returned, a reservation or 409"
 `,
     typescript: `const W = '2026-11-02T14:00Z';
+const W2 = '2026-11-02T15:00Z';
 const BODY = {window: W, resource_class: 'gpu-a100', amount: 4};
 
 function reserve(c, fields: Record<string, unknown> = {}, team = 'research', caller: string | null = 'research') {
@@ -629,26 +650,34 @@ export async function check_team_scope(ctx) {
   const c = ctx.client(ctx.load('api').app);
   const anonymous = await reserve(c, {}, 'research', null);
   assert.equal(anonymous.status, 401, \`a reserve without X-Team-Id answered \${anonymous.status}, expected 401\`);
+  const anonymousBad = await reserve(c, {window: 'tomorrow'}, 'research', null);
+  assert.equal(anonymousBad.status, 401, \`a reserve without X-Team-Id and with a bad window answered \${anonymousBad.status}, expected 401: the caller is checked before any field\`);
   const foreign = await reserve(c, {}, 'vision', 'research');
   assert.equal(foreign.status, 403, \`team research reserving on /v1/quotas/vision/reserve answered \${foreign.status}, expected 403: the path names another team's quota\`);
-  assert.equal(ctx.redis.keys('quota:vision:*').length, 0, "the forbidden reserve wrote vision's ledger");
+  const foreignBad = await reserve(c, {resource_class: 'gpu-z9'}, 'vision', 'research');
+  assert.equal(foreignBad.status, 403, \`team research reserving on /v1/quotas/vision/reserve with an unknown class answered \${foreignBad.status}, expected 403: the caller is checked before any field, so another team's path tells it nothing\`);
+  const written = [...ctx.redis.keys('quota:*'), ...ctx.redis.keys('reservation:*')];
+  assert.equal(written.length, 0, \`the refused reserves wrote the ledger: \${JSON.stringify(written)}\`);
   const own = await reserve(c);
   assert(own.status === 200 || own.status === 201, \`research reserving on its own path answered \${own.status}: \${own.text}\`);
 }
 
 export async function check_window_and_amount(ctx) {
   const c = ctx.client(ctx.load('api').app);
-  for (const window of ['tomorrow', '2026-11-02 14:00', '2026-11-02T14:00:00Z']) {
+  for (const window of ['tomorrow', '2026-11-02 14:00', '2026-11-02T14:00:00Z', '2026-11-02T14:00Zx', 'x2026-11-02T14:00Z']) {
     const r = await reserve(c, {window});
-    assert.equal(r.status, 400, \`a reserve for window "\${window}" answered \${r.status}, expected 400: the window must match YYYY-MM-DDTHH:MMZ\`);
+    assert.equal(r.status, 400, \`a reserve for window "\${window}" answered \${r.status}, expected 400: the whole window must match YYYY-MM-DDTHH:MMZ\`);
   }
-  for (const amount of [0, -3, 65]) {
+  for (const amount of [0, -3, 65, 2.5]) {
     const r = await reserve(c, {amount});
-    assert.equal(r.status, 400, \`a reserve of \${amount} units answered \${r.status}, expected 400: the amount is 1..64\`);
+    assert.equal(r.status, 400, \`a reserve of \${amount} units answered \${r.status}, expected 400: the amount is an integer from 1 to 64\`);
   }
   assert.equal(ctx.redis.keys('quota:*').length, 0, \`a rejected reserve wrote the ledger: \${JSON.stringify(ctx.redis.keys('quota:*'))}\`);
   const r = await reserve(c, {amount: 1});
   assert(r.status === 200 || r.status === 201, \`a valid reserve of 1 unit answered \${r.status}: \${r.text}\`);
+  ctx.redis.hset('quota:limits', 'research', 64);
+  const max = await reserve(c, {window: W2, amount: 64});
+  assert(max.status === 200 || max.status === 201, \`with research's limit at 64 a reserve of 64 units answered \${max.status}: \${max.text}. 64 is MAX_RESERVE_AMOUNT itself and is allowed\`);
 }
 
 export async function check_resource_class(ctx) {
@@ -679,6 +708,15 @@ export async function check_recorded(ctx) {
   assert(second.status === 409 && second.text.includes('quota_exhausted'), \`with 3 of research's 8 units left a reserve of 5 answered \${second.status} \${second.text}, expected 409 quota_exhausted: the same units went to two jobs\`);
   const third = await reserve(c, {amount: 3});
   assert.equal(third.status, 201, \`the last 3 units must still be granted, the reserve answered \${third.status} \${third.text}\`);
+  ctx.redisAfter(\`quota:research:\${W2}\`, () => ctx.redis.hset(\`quota:research:\${W2}\`, {limit: 8, reserved: 8, consumed: 0}));
+  const raced = await reserve(c, {window: W2, amount: 4});
+  if (raced.status !== 409) {
+    const racedId = raced.status === 201 ? raced.json().reservation_id : null;
+    assert(
+      racedId && ctx.redis.hget(\`reservation:research:\${racedId}\`, 'amount') === '4',
+      \`another broker took the rest of window \${W2} right after this reserve first touched it, and the reserve answered \${raced.status} \${raced.text}: the answer must come from what reserve returned, a reservation or 409\`,
+    );
+  }
 }
 `,
     go: `package main
@@ -690,7 +728,10 @@ import (
 	"leetbuild/harness"
 )
 
-const apiWindow = "2026-11-02T14:00Z"
+const (
+	apiWindow  = "2026-11-02T14:00Z"
+	apiWindow2 = "2026-11-02T15:00Z"
+)
 
 func api(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
@@ -724,26 +765,34 @@ func CheckTeamScope(ctx *harness.Ctx) {
 	c := api(ctx)
 	anonymous := reserveAs(c, "research", "", nil)
 	ctx.Equal(anonymous.Status, 401, "a reserve without X-Team-Id; the status")
+	anonymous = reserveAs(c, "research", "", map[string]any{"window": "tomorrow"})
+	ctx.Equal(anonymous.Status, 401, "a reserve without X-Team-Id and with a bad window (the caller is checked before any field); the status")
 	foreign := reserveAs(c, "vision", "research", nil)
 	ctx.Equal(foreign.Status, 403, "team research reserving on /v1/quotas/vision/reserve (the path names another team's quota); the status")
-	ctx.Equal(len(ctx.Redis.Keys("quota:vision:*")), 0, "the forbidden reserve must not write vision's ledger; the keys")
+	foreign = reserveAs(c, "vision", "research", map[string]any{"resource_class": "gpu-z9"})
+	ctx.Equal(foreign.Status, 403, "team research reserving on /v1/quotas/vision/reserve with an unknown class (the caller is checked before any field, so another team's path tells it nothing); the status")
+	written := append(ctx.Redis.Keys("quota:*"), ctx.Redis.Keys("reservation:*")...)
+	ctx.Equal(len(written), 0, "the refused reserves must not write the ledger (%v); the keys", written)
 	own := reserveAs(c, "research", "research", nil)
 	ctx.Assert(ok(own), "research reserving on its own path answered %d: %s", own.Status, own.Text())
 }
 
 func CheckWindowAndAmount(ctx *harness.Ctx) {
 	c := api(ctx)
-	for _, window := range []string{"tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z"} {
+	for _, window := range []string{"tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"} {
 		r := reserveAs(c, "research", "research", map[string]any{"window": window})
-		ctx.Equal(r.Status, 400, "a reserve for window %q (the window must match YYYY-MM-DDTHH:MMZ); the status", window)
+		ctx.Equal(r.Status, 400, "a reserve for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window)
 	}
-	for _, amount := range []int{0, -3, 65} {
+	for _, amount := range []any{0, -3, 65, 2.5} {
 		r := reserveAs(c, "research", "research", map[string]any{"amount": amount})
-		ctx.Equal(r.Status, 400, "a reserve of %d units (the amount is 1..64); the status", amount)
+		ctx.Equal(r.Status, 400, "a reserve of %v units (the amount is an integer from 1 to 64); the status", amount)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("quota:*")), 0, "a rejected reserve must not write the ledger; the keys")
 	r := reserveAs(c, "research", "research", map[string]any{"amount": 1})
 	ctx.Assert(ok(r), "a valid reserve of 1 unit answered %d: %s", r.Status, r.Text())
+	ctx.Redis.Do("HSET", "quota:limits", "research", 64)
+	r = reserveAs(c, "research", "research", map[string]any{"window": apiWindow2, "amount": 64})
+	ctx.Assert(ok(r), "with research's limit at 64 a reserve of 64 units answered %d: %s. 64 is MAX_RESERVE_AMOUNT itself and is allowed", r.Status, r.Text())
 }
 
 func CheckResourceClass(ctx *harness.Ctx) {
@@ -780,6 +829,20 @@ func CheckRecorded(ctx *harness.Ctx) {
 	ctx.Assert(second.Status == 409 && strings.Contains(second.Text(), "quota_exhausted"), "with 3 of research's 8 units left a reserve of 5 answered %d %s, expected 409 quota_exhausted: the same units went to two jobs", second.Status, second.Text())
 	third := reserveAs(c, "research", "research", map[string]any{"amount": 3})
 	ctx.Equal(third.Status, 201, "the last 3 units must still be granted (%s); the status", third.Text())
+	ctx.Redis.After("quota:research:"+apiWindow2, func() any {
+		return ctx.Redis.Do("HSET", "quota:research:"+apiWindow2, "limit", 8, "reserved", 8, "consumed", 0)
+	})
+	raced := reserveAs(c, "research", "research", map[string]any{"window": apiWindow2, "amount": 4})
+	if raced.Status != 409 {
+		var racedBody struct {
+			ReservationID string \`json:"reservation_id"\`
+		}
+		if raced.Status == 201 {
+			raced.Decode(&racedBody)
+		}
+		amount, _ := ctx.Redis.HGet("reservation:research:"+racedBody.ReservationID, "amount")
+		ctx.Assert(racedBody.ReservationID != "" && amount == "4", "another broker took the rest of window %s right after this reserve first touched it, and the reserve answered %d %s: the answer must come from what ledger.Reserve returned, a reservation or 409", apiWindow2, raced.Status, raced.Text())
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -791,6 +854,7 @@ func CheckRecorded(ctx *harness.Ctx) {
 namespace {
 
 const std::string kW = "2026-11-02T14:00Z";
+const std::string kW2 = "2026-11-02T15:00Z";
 
 harness::HTTP api(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -825,26 +889,34 @@ void CheckTeamScope(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto anonymous = reserveAs(c, "research", "");
   ctx.Equal(anonymous.Status, 401, "a reserve without X-Team-Id; the status");
+  const auto anonymous_bad = reserveAs(c, "research", "", {{"window", "tomorrow"}});
+  ctx.Equal(anonymous_bad.Status, 401, "a reserve without X-Team-Id and with a bad window (the caller is checked before any field); the status");
   const auto foreign = reserveAs(c, "vision", "research");
   ctx.Equal(foreign.Status, 403, "team research reserving on /v1/quotas/vision/reserve (the path names another team's quota); the status");
-  ctx.Equal(ctx.Redis.Keys("quota:vision:*").size(), 0, "the forbidden reserve must not write vision's ledger; the keys");
+  const auto foreign_bad = reserveAs(c, "vision", "research", {{"resource_class", "gpu-z9"}});
+  ctx.Equal(foreign_bad.Status, 403,
+            "team research reserving on /v1/quotas/vision/reserve with an unknown class (the caller is checked before any field, so another team's path tells it nothing); the status");
+  ctx.Equal(ctx.Redis.Keys("quota:*").size() + ctx.Redis.Keys("reservation:*").size(), 0, "the refused reserves must not write the ledger; the keys");
   const auto own = reserveAs(c, "research", "research");
   ctx.Assert(ok(own), "research reserving on its own path answered %d: %s", own.Status, own.Text());
 }
 
 void CheckWindowAndAmount(harness::Ctx& ctx) {
   auto c = api(ctx);
-  for (const std::string window : {"tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z"}) {
+  for (const std::string window : {"tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"}) {
     const auto r = reserveAs(c, "research", "research", {{"window", window}});
-    ctx.Equal(r.Status, 400, "a reserve for window %q (the window must match YYYY-MM-DDTHH:MMZ); the status", window);
+    ctx.Equal(r.Status, 400, "a reserve for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window);
   }
-  for (const int amount : {0, -3, 65}) {
+  for (const nlohmann::json amount : {nlohmann::json(0), nlohmann::json(-3), nlohmann::json(65), nlohmann::json(2.5)}) {
     const auto r = reserveAs(c, "research", "research", {{"amount", amount}});
-    ctx.Equal(r.Status, 400, "a reserve of %d units (the amount is 1..64); the status", amount);
+    ctx.Equal(r.Status, 400, "a reserve of %s units (the amount is an integer from 1 to 64); the status", amount.dump());
   }
   ctx.Equal(ctx.Redis.Keys("quota:*").size(), 0, "a rejected reserve must not write the ledger; the keys");
   const auto r = reserveAs(c, "research", "research", {{"amount", 1}});
   ctx.Assert(ok(r), "a valid reserve of 1 unit answered %d: %s", r.Status, r.Text());
+  ctx.Redis.Do("HSET", "quota:limits", "research", "64");
+  const auto max = reserveAs(c, "research", "research", {{"window", kW2}, {"amount", 64}});
+  ctx.Assert(ok(max), "with research's limit at 64 a reserve of 64 units answered %d: %s. 64 is MAX_RESERVE_AMOUNT itself and is allowed", max.Status, max.Text());
 }
 
 void CheckResourceClass(harness::Ctx& ctx) {
@@ -878,6 +950,18 @@ void CheckRecorded(harness::Ctx& ctx) {
              "with 3 of research's 8 units left a reserve of 5 answered %d %s, expected 409 quota_exhausted: the same units went to two jobs", second.Status, second.Text());
   const auto third = reserveAs(c, "research", "research", {{"amount", 3}});
   ctx.Equal(third.Status, 201, "the last 3 units must still be granted (%s); the status", third.Text());
+  ctx.Redis.After("quota:research:" + kW2, [&ctx] { ctx.Redis.Do("HSET", "quota:research:" + kW2, "limit", "8", "reserved", "8", "consumed", "0"); });
+  const auto raced = reserveAs(c, "research", "research", {{"window", kW2}, {"amount", 4}});
+  if (raced.Status != 409) {
+    const auto raced_body = nlohmann::json::parse(raced.Text(), nullptr, false);
+    const std::string raced_id =
+        raced.Status == 201 && raced_body.is_object() && raced_body.contains("reservation_id") && raced_body["reservation_id"].is_string()
+            ? raced_body["reservation_id"].get<std::string>()
+            : "";
+    ctx.Assert(!raced_id.empty() && ctx.Redis.HGet("reservation:research:" + raced_id, "amount").value_or("") == "4",
+               "another broker took the rest of window %s right after this reserve first touched it, and the reserve answered %d %s: the answer must come from what ledger::reserve returned, a reservation or 409",
+               kW2, raced.Status, raced.Text());
+  }
 }
 `,
   },

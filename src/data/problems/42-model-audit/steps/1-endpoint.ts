@@ -60,7 +60,7 @@ be rewritten after the fact.
       id: 'tenant-header',
       title: 'The tenant is the authenticated header',
       detail:
-        'The tenant is read from `X-Tenant-Id` only (a missing one is **401**); a `tenant` field in the body is ignored, so a caller cannot write into another tenant’s trail.',
+        'The tenant is read from `X-Tenant-Id` only (a missing one is **401**, even when the body names a tenant); a `tenant` field in the body is ignored, so a caller cannot write into another tenant’s trail.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/], none: [/body(\.get\(|\[)\s*["']tenant["']/]},
         typescript: {all: [/x-tenant-id/i, /code\(401\)/], none: [/body\.tenant\b|body\[['"]tenant['"]\]/]},
@@ -73,7 +73,7 @@ be rewritten after the fact.
       id: 'digests-only',
       title: 'Only validated digests reach the ledger',
       detail:
-        'Both digests pass `is_digest`/`isDigest` and the text fields are non-empty (**400** otherwise), and only the four named fields are inserted: the body as a whole never reaches `ledger.insert`, so a prompt sent along is dropped.',
+        'Both digests pass `is_digest`/`isDigest` and both text fields are non-empty (**400** otherwise), and only the four named fields are inserted: the body as a whole never reaches `ledger.insert`, so a prompt or any other field sent along is dropped.',
       match: {
         python: {all: [/is_digest\(/, /\b400\b/], none: [/\*\*body\b/, /dict\(body\)/]},
         typescript: {all: [/isDigest\(/, /code\(400\)/], none: [/\.\.\.body\b/]},
@@ -86,7 +86,7 @@ be rewritten after the fact.
       id: 'server-time',
       title: 'recorded_at is the server clock, monotonic per tenant',
       detail:
-        '`recorded_at` is `max(now_ms, last_recorded_at(tenant) + 1)` from the server clock; the caller’s `timestamp` is never read, so nobody can backdate a decision.',
+        '`recorded_at` is `max(now_ms, last_recorded_at(tenant) + 1)` from the server clock in milliseconds, with the tenant’s last record read from the ledger (another replica may have written it); the caller’s `timestamp` is never read, so nobody can backdate a decision.',
       match: {
         python: {all: [/ledger\.last_recorded_at\(/, /time\.time\(\)/], none: [/["']timestamp["']/]},
         typescript: {all: [/lastRecordedAt\(/, /Date\.now\(\)/], none: [/\btimestamp\b/]},
@@ -624,8 +624,8 @@ async def check_route(ctx):
 
 async def check_tenant_header(ctx):
     async with _api(ctx) as c:
-        anonymous = await _append(c, headers={})
-        assert anonymous.status_code == 401, f"an append without X-Tenant-Id answered {anonymous.status_code}, expected 401: the tenant is the authenticated header"
+        anonymous = await _append(c, body={**BODY, "tenant": "t2"}, headers={})
+        assert anonymous.status_code == 401, f"an append without X-Tenant-Id (its body naming tenant t2) answered {anonymous.status_code}, expected 401: the tenant is the authenticated header, never the body"
         assert _records(ctx) == [], f"an append without a tenant was stored: {_records(ctx)}"
         spoofed = await _append(c, body={**BODY, "tenant": "t2"})
     assert spoofed.status_code == 201, f"an append as t1 answered {spoofed.status_code}: {spoofed.text}"
@@ -635,7 +635,7 @@ async def check_tenant_header(ctx):
 
 async def check_digests_only(ctx):
     async with _api(ctx) as c:
-        r = await _append(c, body={**BODY, "prompt": PROMPT, "decision": "approve the refund"})
+        r = await _append(c, body={**BODY, "prompt": PROMPT, "decision": "approve the refund", "context": {"order": "9921"}})
         assert r.status_code == 201, f"a valid append with extra fields answered {r.status_code}: {r.text}"
         raw = ctx.redis.hgetall(f"audit:rec:{r.json()['id']}")
         extra = sorted(set(raw) - ALLOWED)
@@ -648,6 +648,10 @@ async def check_digests_only(ctx):
             ({k: v for k, v in BODY.items() if k != "input_digest"}, "no input_digest"),
             ({**BODY, "model_version": ""}, "an empty model_version"),
             ({k: v for k, v in BODY.items() if k != "policy_id"}, "no policy_id"),
+            ({**BODY, "decision_digest": OUT.upper()}, "an upper-case decision_digest"),
+            ({**BODY, "input_digest": "z" * 64}, "a 64-character input_digest that is not hex"),
+            ({**BODY, "policy_id": ""}, "an empty policy_id"),
+            ({k: v for k, v in BODY.items() if k != "model_version"}, "no model_version"),
         ]
         for body, what in bad:
             r = await _append(c, body=body)
@@ -663,13 +667,17 @@ async def check_server_time(ctx):
         second = await _append(c, body=backdated)
         third = await _append(c)
         other = await _append(c, headers={"X-Tenant-Id": "t2"})
-        ctx.clock.advance(5)
+        # Another replica already wrote t3's newest record a minute ahead: the ledger, not this process, knows it.
+        ctx.redis.hset("audit:tenant:t3", "last_recorded_at", str(now + 60000))
+        replica = await _append(c, headers={"X-Tenant-Id": "t3"})
+        ctx.clock.advance(5.25)
         later = await _append(c)
     at = [r.json().get("recorded_at") for r in (first, second, third)]
     assert isinstance(at[0], int) and abs(at[0] - now) <= 1000, f"recorded_at is {at[0]!r} while the server clock reads {now}: the caller's timestamp (2010-01-01) was kept. recorded_at comes from the server clock"
     assert at[1] == at[0] + 1 and at[2] == at[0] + 2, f"three appends in one millisecond got recorded_at {at}, expected {[at[0], at[0] + 1, at[0] + 2]}: each record of a tenant lands strictly after the tenant's last one"
     assert abs(other.json()["recorded_at"] - now) <= 1000, f"t2's first record got recorded_at {other.json()['recorded_at']}, expected the clock ({now}): the order is per tenant"
-    assert abs(later.json()["recorded_at"] - (now + 5000)) <= 1000, f"five seconds later recorded_at is {later.json()['recorded_at']}, expected about {now + 5000}"
+    assert replica.json().get("recorded_at") == now + 60001, f"t3's last record (written by another replica) has recorded_at {now + 60000}, and the next one got {replica.json().get('recorded_at')}, expected {now + 60001}: the tenant's last record is the ledger's last_recorded_at"
+    assert abs(later.json()["recorded_at"] - (now + 5250)) <= 1, f"5.25 seconds later recorded_at is {later.json()['recorded_at']}, expected {now + 5250}: recorded_at is the server clock in milliseconds"
     assert ledger.get(first.json()["id"])["recorded_at"] == at[0], "the ledger must hold the recorded_at the answer gave"
 
 
@@ -716,8 +724,8 @@ export async function check_route(ctx) {
 
 export async function check_tenant_header(ctx) {
   const {c, ledger, body} = api(ctx);
-  const anonymous = await append(c, body, {});
-  assert.equal(anonymous.status, 401, \`an append without X-Tenant-Id answered \${anonymous.status}, expected 401: the tenant is the authenticated header\`);
+  const anonymous = await append(c, {...body, tenant: 't2'}, {});
+  assert.equal(anonymous.status, 401, \`an append without X-Tenant-Id (its body naming tenant t2) answered \${anonymous.status}, expected 401: the tenant is the authenticated header, never the body\`);
   assert.deepEqual(records(ctx), [], \`an append without a tenant was stored: \${JSON.stringify(records(ctx))}\`);
   const spoofed = await append(c, {...body, tenant: 't2'});
   assert.equal(spoofed.status, 201, \`an append as t1 answered \${spoofed.status}: \${spoofed.text}\`);
@@ -727,7 +735,7 @@ export async function check_tenant_header(ctx) {
 
 export async function check_digests_only(ctx) {
   const {c, body} = api(ctx);
-  const r = await append(c, {...body, prompt: PROMPT, decision: 'approve the refund'});
+  const r = await append(c, {...body, prompt: PROMPT, decision: 'approve the refund', context: {order: '9921'}});
   assert.equal(r.status, 201, \`a valid append with extra fields answered \${r.status}: \${r.text}\`);
   const raw = ctx.redis.hgetall(\`audit:rec:\${r.json().id}\`);
   const extra = Object.keys(raw).filter(name => ALLOWED[name] !== true).sort();
@@ -741,6 +749,10 @@ export async function check_digests_only(ctx) {
     [without('input_digest'), 'no input_digest'],
     [{...body, model_version: ''}, 'an empty model_version'],
     [without('policy_id'), 'no policy_id'],
+    [{...body, decision_digest: body.decision_digest.toUpperCase()}, 'an upper-case decision_digest'],
+    [{...body, input_digest: 'z'.repeat(64)}, 'a 64-character input_digest that is not hex'],
+    [{...body, policy_id: ''}, 'an empty policy_id'],
+    [without('model_version'), 'no model_version'],
   ];
   for (const [b, what] of bad) {
     const rejected = await append(c, b);
@@ -757,13 +769,17 @@ export async function check_server_time(ctx) {
   const second = await append(c, backdated);
   const third = await append(c, body);
   const other = await append(c, body, {'X-Tenant-Id': 't2'});
-  ctx.clock.advance(5);
+  // Another replica already wrote t3's newest record a minute ahead: the ledger, not this process, knows it.
+  ctx.redis.hset('audit:tenant:t3', 'last_recorded_at', String(now + 60000));
+  const replica = await append(c, body, {'X-Tenant-Id': 't3'});
+  ctx.clock.advance(5.25);
   const later = await append(c, body);
   const at = [first, second, third].map(r => r.json().recorded_at);
   assert(typeof at[0] === 'number' && Math.abs(at[0] - now) <= 1000, \`recorded_at is \${JSON.stringify(at[0])} while the server clock reads \${now}: the caller's timestamp (2010-01-01) was kept. recorded_at comes from the server clock\`);
   assert(at[1] === at[0] + 1 && at[2] === at[0] + 2, \`three appends in one millisecond got recorded_at \${JSON.stringify(at)}, expected \${at[0]}, \${at[0] + 1}, \${at[0] + 2}: each record of a tenant lands strictly after the tenant's last one\`);
   assert(Math.abs(other.json().recorded_at - now) <= 1000, \`t2's first record got recorded_at \${other.json().recorded_at}, expected the clock (\${now}): the order is per tenant\`);
-  assert(Math.abs(later.json().recorded_at - (now + 5000)) <= 1000, \`five seconds later recorded_at is \${later.json().recorded_at}, expected about \${now + 5000}\`);
+  assert.equal(replica.json().recorded_at, now + 60001, \`t3's last record (written by another replica) has recorded_at \${now + 60000}, and the next one got \${replica.json().recorded_at}, expected \${now + 60001}: the tenant's last record is the ledger's last_recorded_at\`);
+  assert(Math.abs(later.json().recorded_at - (now + 5250)) <= 1, \`5.25 seconds later recorded_at is \${later.json().recorded_at}, expected \${now + 5250}: recorded_at is the server clock in milliseconds\`);
   assert.equal((await ledger.get(first.json().id)).recorded_at, at[0], 'the ledger must hold the recorded_at the answer gave');
 }
 
@@ -785,6 +801,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"audit/digest"
@@ -793,9 +810,9 @@ import (
 	"leetbuild/harness"
 )
 
-const prompt = "Customer 4411 asks for a refund of order 9921 after the kettle broke"
+const promptText = "Customer 4411 asks for a refund of order 9921 after the kettle broke"
 
-var allowed = map[string]bool{"id": true, "tenant": true, "model_version": true, "policy_id": true, "input_digest": true, "decision_digest": true, "recorded_at": true, "position": true, "status": true}
+var storedFields = map[string]bool{"id": true, "tenant": true, "model_version": true, "policy_id": true, "input_digest": true, "decision_digest": true, "recorded_at": true, "position": true, "status": true}
 
 func validBody() map[string]any {
 	return map[string]any{
@@ -838,14 +855,14 @@ func appendAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Resp
 	return c.Post("/v1/audit/decisions", body, "X-Tenant-Id", tenant)
 }
 
-type answer struct {
+type appendedRecord struct {
 	ID         string \`json:"id"\`
 	Tenant     string \`json:"tenant"\`
 	RecordedAt int64  \`json:"recorded_at"\`
 }
 
-func answerOf(r *harness.Response) answer {
-	var a answer
+func appendedOf(r *harness.Response) appendedRecord {
+	var a appendedRecord
 	r.Decode(&a)
 	return a
 }
@@ -867,24 +884,24 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckTenantHeader(ctx *harness.Ctx) {
 	c := api(ctx)
-	anonymous := appendAs(c, validBody(), "")
-	ctx.Equal(anonymous.Status, 401, "an append without X-Tenant-Id must be refused: the tenant is the authenticated header; the status")
+	anonymous := appendAs(c, with(validBody(), "tenant", "t2"), "")
+	ctx.Equal(anonymous.Status, 401, "an append without X-Tenant-Id (its body naming tenant t2) must be refused: the tenant is the authenticated header, never the body; the status")
 	ctx.Equal(len(ctx.Redis.Keys("audit:rec:*")), 0, "an append without a tenant was stored; the records")
 	spoofed := appendAs(c, with(validBody(), "tenant", "t2"), "t1")
 	ctx.Equal(spoofed.Status, 201, "an append as t1 (%s)", spoofed.Text())
-	record := ledger.Get(context.Background(), answerOf(spoofed).ID)
+	record := ledger.Get(context.Background(), appendedOf(spoofed).ID)
 	ctx.Assert(record != nil && record.Tenant == "t1", "a caller authenticated as t1 wrote a record into another tenant by naming it in the body (%+v): the tenant comes from X-Tenant-Id only", record)
 }
 
 func CheckDigestsOnly(ctx *harness.Ctx) {
 	c := api(ctx)
 	body := validBody()
-	r := appendAs(c, with(with(body, "prompt", prompt), "decision", "approve the refund"), "t1")
+	r := appendAs(c, with(with(with(body, "prompt", promptText), "decision", "approve the refund"), "context", map[string]any{"order": "9921"}), "t1")
 	ctx.Equal(r.Status, 201, "a valid append with extra fields (%s)", r.Text())
-	raw := ctx.Redis.HGetAll("audit:rec:" + answerOf(r).ID)
+	raw := ctx.Redis.HGetAll("audit:rec:" + appendedOf(r).ID)
 	var extra []string
 	for name := range raw {
-		if !allowed[name] {
+		if !storedFields[name] {
 			extra = append(extra, name)
 		}
 	}
@@ -899,10 +916,14 @@ func CheckDigestsOnly(ctx *harness.Ctx) {
 	}{
 		{with(body, "input_digest", strings.ToUpper(in)), "an upper-case input_digest"},
 		{with(body, "decision_digest", out[:63]), "a 63-character decision_digest"},
-		{with(body, "decision_digest", prompt), "a decision_digest holding text"},
+		{with(body, "decision_digest", promptText), "a decision_digest holding text"},
 		{without(body, "input_digest"), "no input_digest"},
 		{with(body, "model_version", ""), "an empty model_version"},
 		{without(body, "policy_id"), "no policy_id"},
+		{with(body, "decision_digest", strings.ToUpper(out)), "an upper-case decision_digest"},
+		{with(body, "input_digest", strings.Repeat("z", 64)), "a 64-character input_digest that is not hex"},
+		{with(body, "policy_id", ""), "an empty policy_id"},
+		{without(body, "model_version"), "no model_version"},
 	}
 	for _, b := range bad {
 		rejected := appendAs(c, b.body, "t1")
@@ -915,22 +936,26 @@ func CheckServerTime(ctx *harness.Ctx) {
 	c := api(ctx)
 	now := ctx.Clock.Now()
 	backdated := with(validBody(), "timestamp", 1262304000000)
-	first := answerOf(appendAs(c, backdated, "t1"))
-	second := answerOf(appendAs(c, backdated, "t1"))
-	third := answerOf(appendAs(c, validBody(), "t1"))
-	other := answerOf(appendAs(c, validBody(), "t2"))
-	ctx.Clock.Advance(5)
-	later := answerOf(appendAs(c, validBody(), "t1"))
+	first := appendedOf(appendAs(c, backdated, "t1"))
+	second := appendedOf(appendAs(c, backdated, "t1"))
+	third := appendedOf(appendAs(c, validBody(), "t1"))
+	other := appendedOf(appendAs(c, validBody(), "t2"))
+	// Another replica already wrote t3's newest record a minute ahead: the ledger, not this process, knows it.
+	ctx.Redis.Do("HSET", "audit:tenant:t3", "last_recorded_at", strconv.FormatInt(now+60000, 10))
+	replica := appendedOf(appendAs(c, validBody(), "t3"))
+	ctx.Clock.Advance(5.25)
+	later := appendedOf(appendAs(c, validBody(), "t1"))
 	ctx.Assert(first.RecordedAt >= now-1000 && first.RecordedAt <= now+1000, "recorded_at is %d while the server clock reads %d: the caller's timestamp (2010-01-01) was kept. recorded_at comes from the server clock", first.RecordedAt, now)
 	ctx.Assert(second.RecordedAt == first.RecordedAt+1 && third.RecordedAt == first.RecordedAt+2, "three appends in one millisecond got recorded_at %d, %d, %d: each record of a tenant lands strictly after the tenant's last one", first.RecordedAt, second.RecordedAt, third.RecordedAt)
 	ctx.Assert(other.RecordedAt >= now-1000 && other.RecordedAt <= now+1000, "t2's first record got recorded_at %d, expected the clock (%d): the order is per tenant", other.RecordedAt, now)
-	ctx.Assert(later.RecordedAt >= now+4000 && later.RecordedAt <= now+6000, "five seconds later recorded_at is %d, expected about %d", later.RecordedAt, now+5000)
+	ctx.Equal(replica.RecordedAt, now+60001, "t3's last record (written by another replica) has recorded_at %d; the next one must land right after it: the tenant's last record is the ledger's last_recorded_at; its recorded_at", now+60000)
+	ctx.Assert(later.RecordedAt >= now+5249 && later.RecordedAt <= now+5251, "5.25 seconds later recorded_at is %d, expected %d: recorded_at is the server clock in milliseconds", later.RecordedAt, now+5250)
 	ctx.Equal(ledger.Get(context.Background(), first.ID).RecordedAt, first.RecordedAt, "the ledger must hold the recorded_at the answer gave")
 }
 
 func CheckAppendOnly(ctx *harness.Ctx) {
 	c := api(ctx)
-	record := answerOf(appendAs(c, validBody(), "t1"))
+	record := appendedOf(appendAs(c, validBody(), "t1"))
 	before := ctx.Redis.HGetAll("audit:rec:" + record.ID)
 	for _, method := range []string{"PATCH", "PUT", "DELETE"} {
 		r := c.Do(method, "/v1/audit/decisions/"+record.ID, map[string]any{"decision_digest": strings.Repeat("0", 64)}, "X-Tenant-Id", "t1")
@@ -1008,8 +1033,10 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTenantHeader(harness::Ctx& ctx) {
   auto c = api(ctx);
-  const auto anonymous = appendAs(c, validBody(), "");
-  ctx.Equal(anonymous.Status, 401, "an append without X-Tenant-Id must be refused: the tenant is the authenticated header; the status");
+  json anonymous_body = validBody();
+  anonymous_body["tenant"] = "t2";
+  const auto anonymous = appendAs(c, anonymous_body, "");
+  ctx.Equal(anonymous.Status, 401, "an append without X-Tenant-Id (its body naming tenant t2) must be refused: the tenant is the authenticated header, never the body; the status");
   ctx.Equal(ctx.Redis.Keys("audit:rec:*").size(), 0, "an append without a tenant was stored; the records");
   json spoof = validBody();
   spoof["tenant"] = "t2";
@@ -1025,6 +1052,7 @@ void CheckDigestsOnly(harness::Ctx& ctx) {
   json extra_fields = body;
   extra_fields["prompt"] = kPrompt;
   extra_fields["decision"] = "approve the refund";
+  extra_fields["context"] = {{"order", "9921"}};
   const auto r = appendAs(c, extra_fields, "t1");
   ctx.Equal(r.Status, 201, "a valid append with extra fields (%s)", r.Text());
   const auto raw = ctx.Redis.HGetAll("audit:rec:" + answerOf(r).value("id", ""));
@@ -1034,16 +1062,23 @@ void CheckDigestsOnly(harness::Ctx& ctx) {
   }
   ctx.Assert(extra.empty(), "the ledger row holds %q (%v): the body went to the ledger as it came. Only model_version, policy_id and the two digests are stored", extra, raw);
   ctx.Assert(r.Text().find("kettle") == std::string::npos, "the answer echoes the prompt: %s", r.Text());
-  std::string upper = body["input_digest"].get<std::string>();
-  std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
-  json b1 = body, b2 = body, b3 = body, b5 = body;
-  b1["input_digest"] = upper;
+  const auto upper = [](std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+    return s;
+  };
+  json b1 = body, b2 = body, b3 = body, b5 = body, b6 = body, b7 = body, b8 = body;
+  b1["input_digest"] = upper(body["input_digest"].get<std::string>());
   b2["decision_digest"] = body["decision_digest"].get<std::string>().substr(0, 63);
   b3["decision_digest"] = kPrompt;
   b5["model_version"] = "";
+  b6["decision_digest"] = upper(body["decision_digest"].get<std::string>());
+  b7["input_digest"] = std::string(64, 'z');
+  b8["policy_id"] = "";
   const std::vector<std::pair<json, std::string>> bad = {
       {b1, "an upper-case input_digest"}, {b2, "a 63-character decision_digest"}, {b3, "a decision_digest holding text"},
-      {without(body, "input_digest"), "no input_digest"}, {b5, "an empty model_version"}, {without(body, "policy_id"), "no policy_id"}};
+      {without(body, "input_digest"), "no input_digest"}, {b5, "an empty model_version"}, {without(body, "policy_id"), "no policy_id"},
+      {b6, "an upper-case decision_digest"}, {b7, "a 64-character input_digest that is not hex"}, {b8, "an empty policy_id"},
+      {without(body, "model_version"), "no model_version"}};
   for (const auto& [b, what] : bad) {
     const auto rejected = appendAs(c, b, "t1");
     ctx.Equal(rejected.Status, 400, "an append with %s; the status", what);
@@ -1060,13 +1095,17 @@ void CheckServerTime(harness::Ctx& ctx) {
   const auto second = appendAs(c, backdated, "t1");
   const auto third = appendAs(c, validBody(), "t1");
   const auto other = appendAs(c, validBody(), "t2");
-  ctx.Clock.Advance(5);
+  // Another replica already wrote t3's newest record a minute ahead: the ledger, not this process, knows it.
+  ctx.Redis.Do("HSET", "audit:tenant:t3", "last_recorded_at", std::to_string(now + 60000));
+  const auto replica = appendAs(c, validBody(), "t3");
+  ctx.Clock.Advance(5.25);
   const auto later = appendAs(c, validBody(), "t1");
   const long long at0 = recordedAt(first), at1 = recordedAt(second), at2 = recordedAt(third);
   ctx.Assert(at0 >= now - 1000 && at0 <= now + 1000, "recorded_at is %d while the server clock reads %d: the caller's timestamp (2010-01-01) was kept. recorded_at comes from the server clock", at0, now);
   ctx.Assert(at1 == at0 + 1 && at2 == at0 + 2, "three appends in one millisecond got recorded_at %d, %d, %d: each record of a tenant lands strictly after the tenant's last one", at0, at1, at2);
   ctx.Assert(recordedAt(other) >= now - 1000 && recordedAt(other) <= now + 1000, "t2's first record got recorded_at %d, expected the clock (%d): the order is per tenant", recordedAt(other), now);
-  ctx.Assert(recordedAt(later) >= now + 4000 && recordedAt(later) <= now + 6000, "five seconds later recorded_at is %d, expected about %d", recordedAt(later), now + 5000);
+  ctx.Equal(recordedAt(replica), now + 60001, "t3's last record (written by another replica) has recorded_at %d; the next one must land right after it: the tenant's last record is the ledger's last_recorded_at; its recorded_at", now + 60000);
+  ctx.Assert(recordedAt(later) >= now + 5249 && recordedAt(later) <= now + 5251, "5.25 seconds later recorded_at is %d, expected %d: recorded_at is the server clock in milliseconds", recordedAt(later), now + 5250);
   ctx.Equal(ledger::get(answerOf(first).value("id", ""))->recorded_at, at0, "the ledger must hold the recorded_at the answer gave");
 }
 

@@ -25,12 +25,13 @@ message ClassifyRequest { string text = 1; string taxonomy_id = 2; int64 taxonom
 message ClassifyReply { repeated string labels = 1; bool refused = 2; string model_version = 3; }
 \`\`\`
 
-- Each call carries a **700 ms** deadline (\`DEADLINE_S\`).
+- Each call, a retry included, carries its own **700 ms** deadline (\`DEADLINE_S\`).
 - At most \`MAX_ATTEMPTS\` = 3 calls; only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried. A
   refusal or any other status ends the attempts.
 - Without a model answer, \`rules_classify(text)\` labels the text from \`KEYWORD_RULES\`; no match
   is \`REVIEW_LABEL\`, never \`safe\`.
-- A rules result has provenance \`fallback\`, model_version \`rules\`, and adds one to \`FALLBACK_KEY\`.`,
+- A rules result has provenance \`fallback\`, model_version \`rules\`, and adds one to \`FALLBACK_KEY\`;
+  a retry the model answered is not a fallback.`,
   sequence: {
     participants: ['Content Classifier', 'Model', 'Rules fallback', 'Redis'],
     messages: [
@@ -48,7 +49,7 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
       id: 'deadline',
       title: 'Every model call carries a 700 ms deadline',
       detail:
-        'Each Classify call carries a deadline of 0.7 s (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a model that hangs costs three short attempts, not the hang. The starter sends no deadline.',
+        'Each Classify call, a retry included, carries its own deadline of 0.7 s (`timeout=DEADLINE_S`, `deadline: Date.now() + DEADLINE_MS`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), so a model that hangs costs three short attempts, not the hang. The starter sends no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.7\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*700\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -103,7 +104,7 @@ message ClassifyReply { repeated string labels = 1; bool refused = 2; string mod
       id: 'provenance',
       title: 'Fallback results carry their provenance and count separately',
       detail:
-        'A rules answer has provenance `fallback` and model_version `rules`, and each one adds one to `FALLBACK_KEY` (`metrics:classifier_fallback_total`), so an outage shows as a spike. The starter marks everything `model` and counts nothing.',
+        'A rules answer has provenance `fallback` and model_version `rules`, and each one adds one to `FALLBACK_KEY` (`metrics:classifier_fallback_total`), so an outage shows as a spike; a retry the model answered adds nothing. The starter marks everything `model` and counts nothing.',
       match: {
         python: {all: [/["']fallback["']/, /["']rules["']/, /\.incr\(\s*FALLBACK_KEY\s*\)/]},
         typescript: {all: [/['"]fallback['"]/, /['"]rules['"]/, /\.incr\(\s*FALLBACK_KEY\s*\)/]},
@@ -740,6 +741,10 @@ def check_deadline(ctx):
     waited = ctx.clock.time() - started
     assert waited <= 2.6, f"classify waited {waited:.1f} s on a model that hangs: three attempts of 0.7 s, then the fallback"
     assert result.get("provenance") == "fallback" and result.get("labels") == ["support"], f"a hung model must end in the rules fallback, got {result}"
+    hung = _calls(ctx)[1:]
+    assert len(hung) == 3, f"a model that hangs past every deadline gets MAX_ATTEMPTS = 3 calls (DEADLINE_EXCEEDED is retried), saw {len(hung)}"
+    timeouts = [call.timeout for call in hung]
+    assert all(t is not None and 0.6 <= t <= 0.8 for t in timeouts), f"each attempt carries its own 0.7 s deadline, the three calls carried {timeouts} s: a retry after a late failure needs a full deadline of its own"
 
 
 def check_refusal_terminal(ctx):
@@ -758,6 +763,15 @@ def check_refusal_terminal(ctx):
     result = m.classify(BROKEN, "tx-support", 1)
     assert len(_calls(ctx)) == 7, f"INVALID_ARGUMENT will not change on a retry: one call, saw {len(_calls(ctx)) - 6}"
     assert result.get("provenance") == "fallback", f"a terminal status ends in the rules, got {result}"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL):
+        before = len(_calls(ctx))
+        ctx.grpc.fail("Classify", code, "terminal", times=1, target=config.MODEL)
+        result = m.classify(BROKEN, "tx-support", 1)
+        assert len(_calls(ctx)) - before == 1 and result.get("provenance") == "fallback", f"{code.name} is not retried: one call and the rules, saw {len(_calls(ctx)) - before} calls and {result}"
+    before = len(_calls(ctx))
+    ctx.grpc.fail("Classify", grpc.StatusCode.DEADLINE_EXCEEDED, "too slow", times=1, target=config.MODEL)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert len(_calls(ctx)) - before == 2 and result.get("provenance") == "model", f"one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw {len(_calls(ctx)) - before} calls and {result}"
 
 
 def check_rules_fallback(ctx):
@@ -784,6 +798,9 @@ def check_provenance(ctx):
     result = m.classify(BROKEN, "tx-support", 1)
     assert result.get("provenance") == "model" and result.get("model_version") == labeler.MODEL_VERSION, f"the model's answer carries provenance model and its version, got {result}"
     assert _fallbacks(ctx) == 0, f"no fallback happened, yet {config.FALLBACK_KEY} is {_fallbacks(ctx)}"
+    _outage(ctx, times=1)
+    result = m.classify(BROKEN, "tx-support", 1)
+    assert result.get("provenance") == "model" and _fallbacks(ctx) == 0, f"a retry the model answered is not a fallback: got {result} and {config.FALLBACK_KEY} = {_fallbacks(ctx)}"
     _outage(ctx, times=3)
     result = m.classify(BROKEN, "tx-support", 1)
     assert result.get("provenance") == "fallback" and result.get("model_version") == "rules", f"an answer from the rules must say provenance fallback and model_version rules, got {result}"
@@ -829,6 +846,10 @@ export async function check_deadline(ctx) {
   const waited = (ctx.clock.now() - started) / 1000;
   assert(waited <= 2.6, \`classify waited \${waited.toFixed(1)} s on a model that hangs: three attempts of 0.7 s, then the fallback\`);
   assert(result.provenance === 'fallback' && same(result.labels, ['support']), \`a hung model must end in the rules fallback, got \${JSON.stringify(result)}\`);
+  const hung = calls(ctx).slice(1);
+  assert.equal(hung.length, 3, \`a model that hangs past every deadline gets MAX_ATTEMPTS = 3 calls (DEADLINE_EXCEEDED is retried), saw \${hung.length}\`);
+  const timeouts = hung.map(c => c.timeout);
+  assert(timeouts.every(t => t !== null && t !== undefined && 0.6 <= t && t <= 0.8), \`each attempt carries its own 700 ms deadline, the three calls carried \${JSON.stringify(timeouts)} s: a retry after a late failure needs a full deadline of its own\`);
 }
 
 export async function check_refusal_terminal(ctx) {
@@ -847,6 +868,16 @@ export async function check_refusal_terminal(ctx) {
   result = await m.classify(BROKEN, 'tx-support', 1);
   assert.equal(calls(ctx).length, 7, \`INVALID_ARGUMENT will not change on a retry: one call, saw \${calls(ctx).length - 6}\`);
   assert.equal(result.provenance, 'fallback', \`a terminal status ends in the rules, got \${JSON.stringify(result)}\`);
+  for (const code of ['PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'INTERNAL']) {
+    const before = calls(ctx).length;
+    ctx.grpc.fail('Classify', ctx.grpc.status[code], 'terminal', 1, config.MODEL);
+    result = await m.classify(BROKEN, 'tx-support', 1);
+    assert(calls(ctx).length - before === 1 && result.provenance === 'fallback', \`\${code} is not retried: one call and the rules, saw \${calls(ctx).length - before} calls and \${JSON.stringify(result)}\`);
+  }
+  const before = calls(ctx).length;
+  ctx.grpc.fail('Classify', ctx.grpc.status.DEADLINE_EXCEEDED, 'too slow', 1, config.MODEL);
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  assert(calls(ctx).length - before === 2 && result.provenance === 'model', \`one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw \${calls(ctx).length - before} calls and \${JSON.stringify(result)}\`);
 }
 
 export async function check_rules_fallback(ctx) {
@@ -873,6 +904,9 @@ export async function check_provenance(ctx) {
   let result = await m.classify(BROKEN, 'tx-support', 1);
   assert(result.provenance === 'model' && result.model_version === labeler.MODEL_VERSION, \`the model's answer carries provenance model and its version, got \${JSON.stringify(result)}\`);
   assert.equal(fallbacks(ctx, config), 0, \`no fallback happened, yet \${config.FALLBACK_KEY} is \${fallbacks(ctx, config)}\`);
+  outage(ctx, config, 1);
+  result = await m.classify(BROKEN, 'tx-support', 1);
+  assert(result.provenance === 'model' && fallbacks(ctx, config) === 0, \`a retry the model answered is not a fallback: got \${JSON.stringify(result)} and \${config.FALLBACK_KEY} = \${fallbacks(ctx, config)}\`);
   outage(ctx, config, 3);
   result = await m.classify(BROKEN, 'tx-support', 1);
   assert(result.provenance === 'fallback' && result.model_version === 'rules', \`an answer from the rules must say provenance fallback and model_version rules, got \${JSON.stringify(result)}\`);
@@ -957,6 +991,12 @@ func CheckDeadline(ctx *harness.Ctx) {
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 2.6, "classify waited %.1f s on a model that hangs: three attempts of 0.7 s, then the fallback", waited)
 	ctx.Assert(result.Provenance == "fallback" && clientIs(result.Labels, "support"), "a hung model must end in the rules fallback, got %+v", result)
+	hung := clientCalls(ctx)[1:]
+	ctx.Equal(len(hung), 3, "a model that hangs past every deadline gets maxAttempts = 3 calls (DEADLINE_EXCEEDED is retried); calls")
+	for i, call := range hung {
+		ctx.Assert(call.HasDeadline() && 600*time.Millisecond <= call.Timeout && call.Timeout <= 800*time.Millisecond,
+			"each attempt carries its own 700 ms deadline, attempt %d carried %v: a retry after a late failure needs a full deadline of its own", i+1, call.Timeout)
+	}
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
@@ -975,6 +1015,16 @@ func CheckRefusalTerminal(ctx *harness.Ctx) {
 	result = clientClassify(ctx, clientBroken)
 	ctx.Equal(len(clientCalls(ctx)), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far")
 	ctx.Equal(result.Provenance, "fallback", "a terminal status ends in the rules; the provenance")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.ResourceExhausted, codes.Internal} {
+		before := len(clientCalls(ctx))
+		ctx.GRPC.Fail("Classify", code, "terminal", 1, config.Model)
+		result = clientClassify(ctx, clientBroken)
+		ctx.Assert(len(clientCalls(ctx))-before == 1 && result.Provenance == "fallback", "%s is not retried: one call and the rules, saw %d calls and %+v", code, len(clientCalls(ctx))-before, result)
+	}
+	before := len(clientCalls(ctx))
+	ctx.GRPC.Fail("Classify", codes.DeadlineExceeded, "too slow", 1, config.Model)
+	result = clientClassify(ctx, clientBroken)
+	ctx.Assert(len(clientCalls(ctx))-before == 2 && result.Provenance == "model", "one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw %d calls and %+v", len(clientCalls(ctx))-before, result)
 }
 
 func CheckRulesFallback(ctx *harness.Ctx) {
@@ -1003,6 +1053,9 @@ func CheckProvenance(ctx *harness.Ctx) {
 	result := clientClassify(ctx, clientBroken)
 	ctx.Assert(result.Provenance == "model" && result.ModelVersion == labeler.Version, "the model's answer carries provenance model and its version, got %+v", result)
 	ctx.Equal(clientFallbacks(ctx), 0, "no fallback happened; %s", config.FallbackKey)
+	clientOutage(ctx, 1)
+	result = clientClassify(ctx, clientBroken)
+	ctx.Assert(result.Provenance == "model" && clientFallbacks(ctx) == 0, "a retry the model answered is not a fallback: got %+v and %s = %d", result, config.FallbackKey, clientFallbacks(ctx))
 	clientOutage(ctx, 3)
 	result = clientClassify(ctx, clientBroken)
 	ctx.Assert(result.Provenance == "fallback" && result.ModelVersion == "rules", "an answer from the rules must say provenance fallback and ModelVersion rules, got %+v", result)
@@ -1070,6 +1123,12 @@ void CheckDeadline(harness::Ctx& ctx) {
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 2.6, "classify waited %.1f s on a model that hangs: three attempts of 0.7 s, then the fallback", waited);
   ctx.Assert(result.provenance == "fallback" && is(result.labels, {"support"}), "a hung model must end in the rules fallback, got %v from %q", result.labels, result.provenance);
+  const auto after = ctx.GRPC.CallsTo("Classify");
+  ctx.Equal(after.size(), 4, "a model that hangs past every deadline gets kMaxAttempts = 3 calls (DEADLINE_EXCEEDED is retried); calls in all");
+  for (size_t i = 1; i < after.size(); i++) {
+    ctx.Assert(after[i].HasDeadline() && 0.6 <= after[i].TimeoutSeconds() && after[i].TimeoutSeconds() <= 0.8,
+               "each attempt carries its own 700 ms deadline, attempt %d carried %vs: a retry after a late failure needs a full deadline of its own", i, after[i].TimeoutSeconds());
+  }
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
@@ -1088,6 +1147,18 @@ void CheckRefusalTerminal(harness::Ctx& ctx) {
   result = classify(kBroken, "tx-support", 1);
   ctx.Equal(calls(ctx), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far");
   ctx.Equal(result.provenance, "fallback", "a terminal status ends in the rules; the provenance");
+  const std::pair<grpc::StatusCode, const char*> terminal[] = {
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t before = calls(ctx);
+    ctx.GRPC.Fail("Classify", code, "terminal", 1, config::kModel);
+    result = classify(kBroken, "tx-support", 1);
+    ctx.Assert(calls(ctx) - before == 1 && result.provenance == "fallback", "%s is not retried: one call and the rules, saw %d calls and %q", name, calls(ctx) - before, result.provenance);
+  }
+  const size_t before = calls(ctx);
+  ctx.GRPC.Fail("Classify", grpc::StatusCode::DEADLINE_EXCEEDED, "too slow", 1, config::kModel);
+  result = classify(kBroken, "tx-support", 1);
+  ctx.Assert(calls(ctx) - before == 2 && result.provenance == "model", "one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw %d calls and %q", calls(ctx) - before, result.provenance);
 }
 
 void CheckRulesFallback(harness::Ctx& ctx) {
@@ -1115,6 +1186,9 @@ void CheckProvenance(harness::Ctx& ctx) {
   Result result = classify(kBroken, "tx-support", 1);
   ctx.Assert(result.provenance == "model" && result.model_version == labeler::kVersion, "the model's answer carries provenance model and its version, got %q %q", result.provenance, result.model_version);
   ctx.Equal(fallbacks(ctx), 0, "no fallback happened; %s", config::kFallbackKey);
+  outage(ctx, 1);
+  result = classify(kBroken, "tx-support", 1);
+  ctx.Assert(result.provenance == "model" && fallbacks(ctx) == 0, "a retry the model answered is not a fallback: got %q and %s = %d", result.provenance, config::kFallbackKey, fallbacks(ctx));
   outage(ctx, 3);
   result = classify(kBroken, "tx-support", 1);
   ctx.Assert(result.provenance == "fallback" && result.model_version == "rules", "an answer from the rules must say provenance fallback and model_version rules, got %q %q", result.provenance, result.model_version);

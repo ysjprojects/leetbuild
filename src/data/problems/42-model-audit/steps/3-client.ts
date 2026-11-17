@@ -59,7 +59,7 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
       id: 'deadline',
       title: 'Every Sign attempt carries a 500 ms deadline',
       detail:
-        'Each call is made with `DEADLINE_S`/`DEADLINE_MS` (500 ms), so three attempts against a stalled signer cost 1.5 s, not an open request.',
+        'Each call is made with its own full `DEADLINE_S`/`DEADLINE_MS` (500 ms), never with what is left of one deadline shared by the retries, so three attempts against a stalled signer cost 1.5 s, not an open request.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.5\b/, /Sign\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*500\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -72,7 +72,7 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
       id: 'transient-only',
       title: 'Only UNAVAILABLE and DEADLINE_EXCEEDED are retried',
       detail:
-        'A transient code is retried; any other (`PERMISSION_DENIED`: the key is revoked) queues the record and raises `ReceiptRefused` after one call, so an operator hears about it.',
+        'A transient code is retried; any other (`PERMISSION_DENIED`: the key is revoked, and every other code, on whichever attempt it comes) queues the record and raises `ReceiptRefused` after that one call, so an operator hears about it.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /raise ReceiptRefused/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/, /throw new ReceiptRefused/]},
@@ -98,7 +98,7 @@ service ReceiptSigner { rpc Sign(SignRequest) returns (Receipt); }  // PERMISSIO
       id: 'no-sticky-failure',
       title: 'Each record makes its own attempts',
       detail:
-        'No process-wide flag remembers a failure: after the signer recovers, the next record is sent to it and signed.',
+        'No process-wide flag remembers a failure: after the signer recovers, the next record is sent to it and signed, and a record right after a failed one still makes all `MAX_ATTEMPTS` attempts.',
       match: {
         python: {none: [/signer_?[dD]own/]},
         typescript: {none: [/signer_?[dD]own/]},
@@ -680,7 +680,7 @@ def check_deadline(ctx):
     before = len(ctx.grpc.calls_to("Sign"))
     slow = m.request_receipt(other)
     calls = ctx.grpc.calls_to("Sign")[before:]
-    assert all(c.timeout is not None and c.timeout <= 0.55 for c in calls), f"against a signer that takes 2 s the attempts carried deadlines {[c.timeout for c in calls]}, expected 0.5 s each"
+    assert all(c.timeout is not None and 0.45 <= c.timeout <= 0.55 for c in calls), f"against a signer that takes 2 s the attempts carried deadlines {[c.timeout for c in calls]}, expected 0.5 s each: every attempt carries its own full deadline, not what is left of one shared by the retries"
     assert len(calls) == m.MAX_ATTEMPTS, f"against a signer that takes 2 s request_receipt made {len(calls)} attempts, expected MAX_ATTEMPTS = {m.MAX_ATTEMPTS}"
     assert slow["status"] == "unsigned", f"three attempts that hit the deadline answered {slow}, expected unsigned"
 
@@ -704,6 +704,34 @@ def check_transient_only(ctx):
     answer = m.request_receipt(other)
     assert answer["status"] == "signed", f"after one UNAVAILABLE and one DEADLINE_EXCEEDED the third attempt must sign the record, got {answer}"
     assert len(ctx.grpc.calls_to("Sign")) == calls + 3, f"the transient failures took {len(ctx.grpc.calls_to('Sign')) - calls} calls, expected 3"
+    # Every code but the two transient ones is final, after one call, whichever it is and whichever attempt meets it.
+    terminal = [grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL]
+    for n, code in enumerate(terminal, start=3):
+        record, _ = _chained(n)
+        ctx.grpc.fail("Sign", code, "refused", times=1)
+        before = len(ctx.grpc.calls_to("Sign"))
+        try:
+            answer = m.request_receipt(record)
+        except m.ReceiptRefused:
+            pass
+        else:
+            raise AssertionError(f"a Sign that failed with {code.name} was answered {answer}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other code raises ReceiptRefused")
+        made = len(ctx.grpc.calls_to("Sign")) - before
+        assert made == 1, f"a Sign that failed with {code.name} led to {made} Sign calls, expected 1: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert _queue(ctx)[-1:] == [record], f"a record refused with {code.name} must wait in audit:signing_queue, it holds {_queue(ctx)}"
+    late, _ = _chained(9)
+    ctx.grpc.fail("Sign", grpc.StatusCode.UNAVAILABLE, "signer restarting", times=1)
+    ctx.grpc.fail("Sign", grpc.StatusCode.PERMISSION_DENIED, "key k-2026 is revoked", times=1)
+    before = len(ctx.grpc.calls_to("Sign"))
+    try:
+        answer = m.request_receipt(late)
+    except m.ReceiptRefused:
+        pass
+    else:
+        raise AssertionError(f"an UNAVAILABLE then a PERMISSION_DENIED was answered {answer}: the second attempt's refusal is final, request_receipt must raise ReceiptRefused")
+    made = len(ctx.grpc.calls_to("Sign")) - before
+    assert made == 2, f"an UNAVAILABLE then a PERMISSION_DENIED took {made} Sign calls, expected 2"
+    assert _queue(ctx)[-1:] == [late], f"a record refused on its second attempt must wait in audit:signing_queue, it holds {_queue(ctx)}"
 
 
 def check_unsigned_queue(ctx):
@@ -728,6 +756,13 @@ def check_no_sticky_failure(ctx):
     assert len(ctx.grpc.calls_to("Sign")) > before, "after one record failed, the next record was never sent to the signer: a failure must not be remembered for the whole process"
     assert answer["status"] == "signed", f"with the signer back the next record answered {answer}, expected signed"
     assert ledger.get(second)["status"] == "signed", f"the ledger says {ledger.get(second)['status']!r} for the record the recovered signer signed"
+    # Another outage, then a record that meets one blip: it makes its own MAX_ATTEMPTS and rides it out.
+    ctx.grpc.fail("Sign", grpc.StatusCode.UNAVAILABLE, "signer down", times=3)
+    m.request_receipt(_chained(3)[0])
+    fourth, _ = _chained(4)
+    ctx.grpc.fail("Sign", grpc.StatusCode.UNAVAILABLE, "signer restarting", times=1)
+    answer = m.request_receipt(fourth)
+    assert answer["status"] == "signed", f"right after a record the signer never signed, the next one met one UNAVAILABLE and answered {answer}, expected signed on its second attempt: each record makes its own MAX_ATTEMPTS"
 `,
     typescript: `import {createHash} from 'node:crypto';
 
@@ -770,7 +805,7 @@ export async function check_deadline(ctx) {
   const before = ctx.grpc.callsTo('Sign').length;
   const slow = await m.requestReceipt(other.recordId);
   const calls = ctx.grpc.callsTo('Sign').slice(before);
-  assert(calls.every(c => c.timeout !== null && c.timeout <= 0.55), \`against a signer that takes 2 s the attempts carried deadlines \${JSON.stringify(calls.map(c => c.timeout))}, expected 0.5 s each\`);
+  assert(calls.every(c => c.timeout !== null && 0.45 <= c.timeout && c.timeout <= 0.55), \`against a signer that takes 2 s the attempts carried deadlines \${JSON.stringify(calls.map(c => c.timeout))}, expected 0.5 s each: every attempt carries its own full deadline, not what is left of one shared by the retries\`);
   assert.equal(calls.length, m.MAX_ATTEMPTS, \`against a signer that takes 2 s requestReceipt made \${calls.length} attempts, expected MAX_ATTEMPTS = \${m.MAX_ATTEMPTS}\`);
   assert.equal(slow.status, 'unsigned', \`three attempts that hit the deadline answered \${JSON.stringify(slow)}, expected unsigned\`);
 }
@@ -795,6 +830,37 @@ export async function check_transient_only(ctx) {
   const retried = await m.requestReceipt(other.recordId);
   assert.equal(retried.status, 'signed', \`after one UNAVAILABLE and one DEADLINE_EXCEEDED the third attempt must sign the record, got \${JSON.stringify(retried)}\`);
   assert.equal(ctx.grpc.callsTo('Sign').length, calls + 3, \`the transient failures took \${ctx.grpc.callsTo('Sign').length - calls} calls, expected 3\`);
+  // Every code but the two transient ones is final, after one call, whichever it is and whichever attempt meets it.
+  const terminal = ['INVALID_ARGUMENT', 'FAILED_PRECONDITION', 'UNAUTHENTICATED', 'RESOURCE_EXHAUSTED', 'INTERNAL'];
+  for (const [i, code] of terminal.entries()) {
+    const {recordId: record} = await chained(3 + i);
+    ctx.grpc.fail('Sign', ctx.grpc.status[code], 'refused', 1);
+    const sent = ctx.grpc.callsTo('Sign').length;
+    let refused;
+    try {
+      refused = await m.requestReceipt(record);
+    } catch (e) {
+      assert(e instanceof m.ReceiptRefused, \`a Sign that failed with \${code} made requestReceipt throw \${(e as Error).constructor.name}: \${(e as Error).message}, expected ReceiptRefused\`);
+    }
+    assert.equal(refused, undefined, \`a Sign that failed with \${code} was answered \${JSON.stringify(refused)}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other code throws ReceiptRefused\`);
+    const made = ctx.grpc.callsTo('Sign').length - sent;
+    assert.equal(made, 1, \`a Sign that failed with \${code} led to \${made} Sign calls, expected 1: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert.deepEqual(queue(ctx).slice(-1), [record], \`a record refused with \${code} must wait in audit:signing_queue, it holds \${JSON.stringify(queue(ctx))}\`);
+  }
+  const late = await chained(9);
+  ctx.grpc.fail('Sign', ctx.grpc.status.UNAVAILABLE, 'signer restarting', 1);
+  ctx.grpc.fail('Sign', ctx.grpc.status.PERMISSION_DENIED, 'key k-2026 is revoked', 1);
+  const sent = ctx.grpc.callsTo('Sign').length;
+  let lateAnswer;
+  try {
+    lateAnswer = await m.requestReceipt(late.recordId);
+  } catch (e) {
+    assert(e instanceof m.ReceiptRefused, \`an UNAVAILABLE then a PERMISSION_DENIED made requestReceipt throw \${(e as Error).constructor.name}: \${(e as Error).message}, expected ReceiptRefused\`);
+  }
+  assert.equal(lateAnswer, undefined, \`an UNAVAILABLE then a PERMISSION_DENIED was answered \${JSON.stringify(lateAnswer)}: the second attempt's refusal is final, requestReceipt must throw ReceiptRefused\`);
+  const made = ctx.grpc.callsTo('Sign').length - sent;
+  assert.equal(made, 2, \`an UNAVAILABLE then a PERMISSION_DENIED took \${made} Sign calls, expected 2\`);
+  assert.deepEqual(queue(ctx).slice(-1), [late.recordId], \`a record refused on its second attempt must wait in audit:signing_queue, it holds \${JSON.stringify(queue(ctx))}\`);
 }
 
 export async function check_unsigned_queue(ctx) {
@@ -819,6 +885,13 @@ export async function check_no_sticky_failure(ctx) {
   assert(ctx.grpc.callsTo('Sign').length > before, 'after one record failed, the next record was never sent to the signer: a failure must not be remembered for the whole process');
   assert.equal(answer.status, 'signed', \`with the signer back the next record answered \${JSON.stringify(answer)}, expected signed\`);
   assert.equal((await ledger.get(second.recordId)).status, 'signed', 'the ledger must say signed for the record the recovered signer signed');
+  // Another outage, then a record that meets one blip: it makes its own MAX_ATTEMPTS and rides it out.
+  ctx.grpc.fail('Sign', ctx.grpc.status.UNAVAILABLE, 'signer down', 3);
+  await m.requestReceipt((await chained(3)).recordId);
+  const fourth = await chained(4);
+  ctx.grpc.fail('Sign', ctx.grpc.status.UNAVAILABLE, 'signer restarting', 1);
+  const blip = await m.requestReceipt(fourth.recordId);
+  assert.equal(blip.status, 'signed', \`right after a record the signer never signed, the next one met one UNAVAILABLE and answered \${JSON.stringify(blip)}, expected signed on its second attempt: each record makes its own MAX_ATTEMPTS\`);
 }
 `,
     go: `package main
@@ -850,7 +923,7 @@ func (signerPeer) Sign(_ context.Context, req *pb.SignRequest) (*pb.Receipt, err
 	return &pb.Receipt{RecordId: req.GetRecordId(), Signature: fmt.Sprintf("sig:%s:%d:%s", req.GetTenant(), req.GetPosition(), req.GetDigest()[:12]), KeyId: "k-2026"}, nil
 }
 
-func client(ctx *harness.Ctx) {
+func serveSigner(ctx *harness.Ctx) {
 	pb.RegisterReceiptSignerServer(ctx.GRPC.Server(""), signerPeer{})
 }
 
@@ -873,7 +946,7 @@ func chained(ctx *harness.Ctx, n int) (string, chain.Entry) {
 func signingQueue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("audit:signing_queue", 0, -1) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
+	serveSigner(ctx)
 	recordID, entry := chained(ctx, 1)
 	signed, err := requestReceipt(clientBg, recordID)
 	ctx.NoError(err, "with a healthy signer requestReceipt failed")
@@ -889,14 +962,14 @@ func CheckDeadline(ctx *harness.Ctx) {
 	slow, _ := requestReceipt(clientBg, other)
 	calls := ctx.GRPC.CallsTo("Sign", "")[before:]
 	for _, call := range calls {
-		ctx.Assert(call.HasDeadline() && call.Timeout <= 550*time.Millisecond, "against a signer that takes 2 s an attempt carried a %v deadline, expected 500 ms", call.Timeout)
+		ctx.Assert(call.HasDeadline() && 450*time.Millisecond <= call.Timeout && call.Timeout <= 550*time.Millisecond, "against a signer that takes 2 s an attempt carried a %v deadline, expected 500 ms: every attempt carries its own full deadline, not what is left of one shared by the retries", call.Timeout)
 	}
 	ctx.Equal(len(calls), maxAttempts, "against a signer that takes 2 s, the attempts (expected maxAttempts)")
 	ctx.Equal(slow.Status, "unsigned", "three attempts that hit the deadline; the status")
 }
 
 func CheckTransientOnly(ctx *harness.Ctx) {
-	client(ctx)
+	serveSigner(ctx)
 	recordID, _ := chained(ctx, 1)
 	ctx.GRPC.Fail("Sign", codes.PermissionDenied, "key k-2026 is revoked", 1, "")
 	answer, err := requestReceipt(clientBg, recordID)
@@ -911,10 +984,31 @@ func CheckTransientOnly(ctx *harness.Ctx) {
 	ctx.NoError(err, "after two transient failures requestReceipt failed")
 	ctx.Equal(retried.Status, "signed", "after one UNAVAILABLE and one DEADLINE_EXCEEDED the third attempt must sign the record; the status")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Sign", "")), calls+3, "the transient failures and the success; the Sign calls")
+	// Every code but the two transient ones is final, after one call, whichever it is and whichever attempt meets it.
+	terminal := []codes.Code{codes.InvalidArgument, codes.FailedPrecondition, codes.Unauthenticated, codes.ResourceExhausted, codes.Internal}
+	for i, code := range terminal {
+		record, _ := chained(ctx, 3+i)
+		ctx.GRPC.Fail("Sign", code, "refused", 1, "")
+		sent := len(ctx.GRPC.CallsTo("Sign", ""))
+		answer, err := requestReceipt(clientBg, record)
+		ctx.Assert(err != nil && errors.Is(err, ErrReceiptRefused), "a Sign that failed with %v was answered %+v (error %v): only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other code returns an error wrapping ErrReceiptRefused", code, answer, err)
+		ctx.Equal(len(ctx.GRPC.CallsTo("Sign", ""))-sent, 1, "a Sign that failed with %v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Sign calls", code)
+		queued := signingQueue(ctx)
+		ctx.Assert(len(queued) > 0 && queued[len(queued)-1] == record, "a record refused with %v must wait in audit:signing_queue, it holds %q", code, queued)
+	}
+	late, _ := chained(ctx, 9)
+	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer restarting", 1, "")
+	ctx.GRPC.Fail("Sign", codes.PermissionDenied, "key k-2026 is revoked", 1, "")
+	sent := len(ctx.GRPC.CallsTo("Sign", ""))
+	lateAnswer, err := requestReceipt(clientBg, late)
+	ctx.Assert(err != nil && errors.Is(err, ErrReceiptRefused), "an UNAVAILABLE then a PERMISSION_DENIED was answered %+v (error %v): the second attempt's refusal is final, requestReceipt must return an error wrapping ErrReceiptRefused", lateAnswer, err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Sign", ""))-sent, 2, "an UNAVAILABLE then a PERMISSION_DENIED; the Sign calls")
+	queued := signingQueue(ctx)
+	ctx.Assert(len(queued) > 0 && queued[len(queued)-1] == late, "a record refused on its second attempt must wait in audit:signing_queue, it holds %q", queued)
 }
 
 func CheckUnsignedQueue(ctx *harness.Ctx) {
-	client(ctx)
+	serveSigner(ctx)
 	recordID, _ := chained(ctx, 1)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer down", 3, "")
 	answer, err := requestReceipt(clientBg, recordID)
@@ -926,7 +1020,7 @@ func CheckUnsignedQueue(ctx *harness.Ctx) {
 }
 
 func CheckNoStickyFailure(ctx *harness.Ctx) {
-	client(ctx)
+	serveSigner(ctx)
 	first, _ := chained(ctx, 1)
 	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer down", 3, "")
 	requestReceipt(clientBg, first)
@@ -937,6 +1031,14 @@ func CheckNoStickyFailure(ctx *harness.Ctx) {
 	ctx.Assert(len(ctx.GRPC.CallsTo("Sign", "")) > before, "after one record failed, the next record was never sent to the signer: a failure must not be remembered for the whole process")
 	ctx.Equal(answer.Status, "signed", "with the signer back, the next record's status")
 	ctx.Equal(ledger.Get(clientBg, second).Status, "signed", "the ledger status of the record the recovered signer signed")
+	// Another outage, then a record that meets one blip: it makes its own maxAttempts and rides it out.
+	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer down", 3, "")
+	third, _ := chained(ctx, 3)
+	requestReceipt(clientBg, third)
+	fourth, _ := chained(ctx, 4)
+	ctx.GRPC.Fail("Sign", codes.Unavailable, "signer restarting", 1, "")
+	blip, err := requestReceipt(clientBg, fourth)
+	ctx.Assert(err == nil && blip.Status == "signed", "right after a record the signer never signed, the next one met one UNAVAILABLE and answered %+v (error %v), expected signed on its second attempt: each record makes its own maxAttempts", blip, err)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -958,7 +1060,7 @@ class SignerPeer final : public audit::ReceiptSigner::Service {
   }
 };
 
-void client(harness::Ctx& ctx) {
+void serveSigner(harness::Ctx& ctx) {
   static SignerPeer* peer = nullptr;
   delete peer;
   peer = new SignerPeer;
@@ -982,7 +1084,7 @@ std::vector<std::string> signingQueue(harness::Ctx& ctx) { return ctx.Redis.LRan
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
+  serveSigner(ctx);
   const auto [record_id, entry] = chained(1);
   const ReceiptResult signed_ = requestReceipt(record_id);
   const std::string want = "sig:t1:1:" + entry.digest.substr(0, 12);
@@ -997,14 +1099,14 @@ void CheckDeadline(harness::Ctx& ctx) {
   const ReceiptResult slow = requestReceipt(other);
   const auto calls = ctx.GRPC.CallsTo("Sign");
   for (size_t i = before; i < calls.size(); i++) {
-    ctx.Assert(calls[i].HasDeadline() && calls[i].TimeoutSeconds() <= 0.55, "against a signer that takes 2 s an attempt carried a %v s deadline, expected 0.5 s", calls[i].TimeoutSeconds());
+    ctx.Assert(calls[i].HasDeadline() && 0.45 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 0.55, "against a signer that takes 2 s an attempt carried a %v s deadline, expected 0.5 s: every attempt carries its own full deadline, not what is left of one shared by the retries", calls[i].TimeoutSeconds());
   }
   ctx.Equal(calls.size() - before, kMaxAttempts, "against a signer that takes 2 s, the attempts (expected kMaxAttempts)");
   ctx.Equal(slow.status, "unsigned", "three attempts that hit the deadline; the status");
 }
 
 void CheckTransientOnly(harness::Ctx& ctx) {
-  client(ctx);
+  serveSigner(ctx);
   const std::string record_id = chained(1).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::PERMISSION_DENIED, "key k-2026 is revoked", 1);
   bool refused = false;
@@ -1024,10 +1126,48 @@ void CheckTransientOnly(harness::Ctx& ctx) {
   const ReceiptResult retried = requestReceipt(other);
   ctx.Equal(retried.status, "signed", "after one UNAVAILABLE and one DEADLINE_EXCEEDED the third attempt must sign the record; the status");
   ctx.Equal(ctx.GRPC.CallsTo("Sign").size(), calls + 3, "the transient failures and the success; the Sign calls");
+  // Every code but the two transient ones is final, after one call, whichever it is and whichever attempt meets it.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+                                                                          {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+                                                                          {grpc::StatusCode::UNAUTHENTICATED, "UNAUTHENTICATED"},
+                                                                          {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+                                                                          {grpc::StatusCode::INTERNAL, "INTERNAL"}};
+  int n = 3;
+  for (const auto& [code, name] : terminal) {
+    const std::string record = chained(n++).first;
+    ctx.GRPC.Fail("Sign", code, "refused", 1);
+    const size_t sent = ctx.GRPC.CallsTo("Sign").size();
+    bool final_ = false;
+    std::string status;
+    try {
+      status = requestReceipt(record).status;
+    } catch (const ReceiptRefused&) {
+      final_ = true;
+    }
+    ctx.Assert(final_, "a Sign that failed with %s was answered %q: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other code throws ReceiptRefused", name, status);
+    ctx.Equal(ctx.GRPC.CallsTo("Sign").size() - sent, 1, "a Sign that failed with %s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Sign calls", name);
+    const auto queued = signingQueue(ctx);
+    ctx.Assert(!queued.empty() && queued.back() == record, "a record refused with %s must wait in audit:signing_queue, it holds %v", name, queued);
+  }
+  const std::string late = chained(9).first;
+  ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer restarting", 1);
+  ctx.GRPC.Fail("Sign", grpc::StatusCode::PERMISSION_DENIED, "key k-2026 is revoked", 1);
+  const size_t sent = ctx.GRPC.CallsTo("Sign").size();
+  bool late_refused = false;
+  std::string late_status;
+  try {
+    late_status = requestReceipt(late).status;
+  } catch (const ReceiptRefused&) {
+    late_refused = true;
+  }
+  ctx.Assert(late_refused, "an UNAVAILABLE then a PERMISSION_DENIED was answered %q: the second attempt's refusal is final, requestReceipt must throw ReceiptRefused", late_status);
+  ctx.Equal(ctx.GRPC.CallsTo("Sign").size() - sent, 2, "an UNAVAILABLE then a PERMISSION_DENIED; the Sign calls");
+  const auto queued = signingQueue(ctx);
+  ctx.Assert(!queued.empty() && queued.back() == late, "a record refused on its second attempt must wait in audit:signing_queue, it holds %v", queued);
 }
 
 void CheckUnsignedQueue(harness::Ctx& ctx) {
-  client(ctx);
+  serveSigner(ctx);
   const std::string record_id = chained(1).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer down", 3);
   const ReceiptResult answer = requestReceipt(record_id);
@@ -1038,7 +1178,7 @@ void CheckUnsignedQueue(harness::Ctx& ctx) {
 }
 
 void CheckNoStickyFailure(harness::Ctx& ctx) {
-  client(ctx);
+  serveSigner(ctx);
   const std::string first = chained(1).first;
   ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer down", 3);
   requestReceipt(first);
@@ -1048,6 +1188,13 @@ void CheckNoStickyFailure(harness::Ctx& ctx) {
   ctx.Assert(ctx.GRPC.CallsTo("Sign").size() > before, "after one record failed, the next record was never sent to the signer: a failure must not be remembered for the whole process");
   ctx.Equal(answer.status, "signed", "with the signer back, the next record's status");
   ctx.Equal(ledger::get(second)->status, "signed", "the ledger status of the record the recovered signer signed");
+  // Another outage, then a record that meets one blip: it makes its own kMaxAttempts and rides it out.
+  ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer down", 3);
+  requestReceipt(chained(3).first);
+  const std::string fourth = chained(4).first;
+  ctx.GRPC.Fail("Sign", grpc::StatusCode::UNAVAILABLE, "signer restarting", 1);
+  const ReceiptResult blip = requestReceipt(fourth);
+  ctx.Equal(blip.status, "signed", "right after a record the signer never signed, the next one met one UNAVAILABLE and must be signed on its second attempt (each record makes its own kMaxAttempts); the status");
 }
 `,
   },

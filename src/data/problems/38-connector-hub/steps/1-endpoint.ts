@@ -19,7 +19,7 @@ cloud metadata endpoint, and the sync worker will call it with the customer's to
 reference comes back in every answer; a request without a tenant, or for \`source_type: "ftp"\`, is
 accepted; and a client that retries after a timeout gets a second connector.
 
-- A missing \`X-Tenant-Id\` is **401**; a \`source_type\` outside \`REGISTERED_HOSTS\` is **400**.
+- A missing or empty \`X-Tenant-Id\` is **401**; a \`source_type\` outside \`REGISTERED_HOSTS\` is **400**.
 - The host is always \`REGISTERED_HOSTS[source_type]\`. A \`base_url\`, when sent, must be \`https\` on
   exactly that host, compared as strings: anything else is **403** and creates nothing.
 - The answer is \`{connector_id, source_type, host, status}\`; the token reference stays in the
@@ -60,7 +60,7 @@ accepted; and a client that retries after a timeout gets a second connector.
       id: 'tenant-and-source',
       title: 'Requires a tenant and a registered source type',
       detail:
-        'A registration without `X-Tenant-Id` answers **401** and one whose `source_type` is not a key of `REGISTERED_HOSTS` answers **400**, both before anything is created.',
+        'A registration without `X-Tenant-Id`, or with an empty one, answers **401** and one whose `source_type` is not a key of `REGISTERED_HOSTS` answers **400**, both before anything is created.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /status_code\s*=\s*400/]},
         typescript: {all: [/code\(\s*401\s*\)/, /code\(\s*400\s*\)/]},
@@ -102,7 +102,7 @@ accepted; and a client that retries after a timeout gets a second connector.
       id: 'idempotent-register',
       title: 'Answers a replayed registration with the existing connector',
       detail:
-        '`Idempotency-Key` is required (**400**); the `(tenant, key)` is looked up with `find_by_key`/`findByKey` before a connector is created, a replay answers that connector with **200**, and a new one is recorded with `remember_key`/`rememberKey`.',
+        '`Idempotency-Key` is required (**400**, creating nothing); the `(tenant, key)` is looked up with `find_by_key`/`findByKey` before a connector is created, a replay answers that connector with **200**, and a new one is recorded with `remember_key`/`rememberKey`.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.find_by_key\(/, /store\.remember_key\(/],
@@ -649,6 +649,8 @@ async def check_tenant_and_source(ctx):
     async with _api(ctx) as c:
         anon = await c.post("/v1/connectors", json=GITHUB, headers=_headers(tenant=""))
         assert anon.status_code == 401, f"a registration without X-Tenant-Id answered {anon.status_code}, expected 401"
+        blank = await c.post("/v1/connectors", json=GITHUB, headers={"X-Tenant-Id": "", "Idempotency-Key": "k-blank"})
+        assert blank.status_code == 401, f"a registration with an empty X-Tenant-Id answered {blank.status_code}, expected 401: an empty header names no tenant"
         ftp = await c.post("/v1/connectors", json={"source_type": "ftp", "token_ref": TOKEN}, headers=_headers(key="k-2"))
         assert ftp.status_code == 400, f"a registration for source_type ftp answered {ftp.status_code}, expected 400: only the sources in REGISTERED_HOSTS have a host the platform registered"
     assert _connectors(ctx) == [], f"refused registrations created connectors: {_connectors(ctx)}"
@@ -656,9 +658,11 @@ async def check_tenant_and_source(ctx):
 
 async def check_registered_host(ctx):
     async with _api(ctx) as c:
-        for url in ("https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com", "https://evil.io/?next=https://api.github.com"):
+        for url in ("https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com", "https://evil.io/?next=https://api.github.com", "https://api.github.com@169.254.169.254/"):
             r = await c.post("/v1/connectors", json={**GITHUB, "base_url": url}, headers=_headers(key=url))
             assert r.status_code == 403, f"base_url {url} answered {r.status_code}, expected 403: the sync worker would call a host the platform never registered for github, with the customer's token"
+        r = await c.post("/v1/connectors", json={"source_type": "slack", "token_ref": TOKEN, "base_url": "https://evilslack.com"}, headers=_headers(key="k-slack"))
+        assert r.status_code == 403, f"a slack registration with base_url https://evilslack.com answered {r.status_code}, expected 403: the host must be exactly slack.com, not a name that ends with it"
         assert _connectors(ctx) == [], f"refused registrations created connectors: {[store.get(k.split(':', 1)[1]) for k in _connectors(ctx)]}"
         r = await c.post("/v1/connectors", json={"source_type": "github", "token_ref": TOKEN}, headers=_headers(key="k-none"))
     assert r.status_code == 201 and r.json().get("host") == "api.github.com", f"a registration without base_url must take the registered host, got {r.status_code} {r.text}"
@@ -687,6 +691,7 @@ async def check_idempotent_register(ctx):
         assert other.status_code == 201 and other.json().get("connector_id") != first.json().get("connector_id"), f"the same key from another tenant is another registration, got {other.status_code} {other.text}"
         missing = await c.post("/v1/connectors", json=GITHUB, headers=_headers(key=""))
     assert missing.status_code == 400, f"a registration without Idempotency-Key answered {missing.status_code}, expected 400"
+    assert len(_connectors(ctx)) == 2, f"a registration without Idempotency-Key must create nothing, the registry holds {len(_connectors(ctx))} connectors, expected 2"
 `,
     typescript: `const TOKEN = 'vault:acme/github#4';
 const GITHUB = {source_type: 'github', token_ref: TOKEN, base_url: 'https://api.github.com'};
@@ -719,6 +724,8 @@ export async function check_tenant_and_source(ctx) {
   const {c} = api(ctx);
   const anon = await c.post('/v1/connectors', {json: GITHUB, headers: headers('')});
   assert.equal(anon.status, 401, \`a registration without X-Tenant-Id answered \${anon.status}, expected 401\`);
+  const blank = await c.post('/v1/connectors', {json: GITHUB, headers: {'X-Tenant-Id': '', 'Idempotency-Key': 'k-blank'}});
+  assert.equal(blank.status, 401, \`a registration with an empty X-Tenant-Id answered \${blank.status}, expected 401: an empty header names no tenant\`);
   const ftp = await c.post('/v1/connectors', {json: {source_type: 'ftp', token_ref: TOKEN}, headers: headers('acme', 'k-2')});
   assert.equal(ftp.status, 400, \`a registration for source_type ftp answered \${ftp.status}, expected 400: only the sources in REGISTERED_HOSTS have a host the platform registered\`);
   assert.deepStrictEqual(connectors(ctx), [], \`refused registrations created connectors: \${JSON.stringify(connectors(ctx))}\`);
@@ -726,10 +733,12 @@ export async function check_tenant_and_source(ctx) {
 
 export async function check_registered_host(ctx) {
   const {c} = api(ctx);
-  for (const url of ['https://169.254.169.254/latest/meta-data', 'https://api.github.com.evil.io', 'http://api.github.com', 'https://evil.io/?next=https://api.github.com']) {
+  for (const url of ['https://169.254.169.254/latest/meta-data', 'https://api.github.com.evil.io', 'http://api.github.com', 'https://evil.io/?next=https://api.github.com', 'https://api.github.com@169.254.169.254/']) {
     const r = await c.post('/v1/connectors', {json: {...GITHUB, base_url: url}, headers: headers('acme', url)});
     assert.equal(r.status, 403, \`base_url \${url} answered \${r.status}, expected 403: the sync worker would call a host the platform never registered for github, with the customer's token\`);
   }
+  const slack = await c.post('/v1/connectors', {json: {source_type: 'slack', token_ref: TOKEN, base_url: 'https://evilslack.com'}, headers: headers('acme', 'k-slack')});
+  assert.equal(slack.status, 403, \`a slack registration with base_url https://evilslack.com answered \${slack.status}, expected 403: the host must be exactly slack.com, not a name that ends with it\`);
   assert.deepStrictEqual(connectors(ctx), [], \`refused registrations created connectors: \${JSON.stringify(connectors(ctx))}\`);
   const r = await c.post('/v1/connectors', {json: {source_type: 'github', token_ref: TOKEN}, headers: headers('acme', 'k-none')});
   assert(r.status === 201 && r.json().host === 'api.github.com', \`a registration without base_url must take the registered host, got \${r.status} \${r.text}\`);
@@ -759,6 +768,7 @@ export async function check_idempotent_register(ctx) {
   assert(other.status === 201 && other.json().connector_id !== first.json().connector_id, \`the same key from another tenant is another registration, got \${other.status} \${other.text}\`);
   const missing = await c.post('/v1/connectors', {json: GITHUB, headers: headers('acme', '')});
   assert.equal(missing.status, 400, \`a registration without Idempotency-Key answered \${missing.status}, expected 400\`);
+  assert.equal(connectors(ctx).length, 2, \`a registration without Idempotency-Key must create nothing, the registry holds \${connectors(ctx).length} connectors, expected 2\`);
 }
 `,
     go: `package main
@@ -834,6 +844,8 @@ func CheckTenantAndSource(ctx *harness.Ctx) {
 	c := api(ctx)
 	anon := post(c, github, "", "k-1")
 	ctx.Equal(anon.Status, 401, "a registration without X-Tenant-Id")
+	blank := c.Post("/v1/connectors", github, "X-Tenant-Id", "", "Idempotency-Key", "k-blank")
+	ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id (an empty header names no tenant)")
 	ftp := post(c, map[string]any{"source_type": "ftp", "token_ref": token}, "acme", "k-2")
 	ctx.Equal(ftp.Status, 400, "a registration for source_type ftp (only the sources in registeredHosts have a host the platform registered)")
 	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 0, "refused registrations must create nothing; the connectors")
@@ -841,10 +853,12 @@ func CheckTenantAndSource(ctx *harness.Ctx) {
 
 func CheckRegisteredHost(ctx *harness.Ctx) {
 	c := api(ctx)
-	for _, url := range []string{"https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com", "https://evil.io/?next=https://api.github.com"} {
+	for _, url := range []string{"https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com", "https://evil.io/?next=https://api.github.com", "https://api.github.com@169.254.169.254/"} {
 		r := post(c, with(github, "base_url", url), "acme", url)
 		ctx.Equal(r.Status, 403, "base_url %s: the sync worker would call a host the platform never registered for github, with the customer's token; the status", url)
 	}
+	slack := post(c, map[string]any{"source_type": "slack", "token_ref": token, "base_url": "https://evilslack.com"}, "acme", "k-slack")
+	ctx.Equal(slack.Status, 403, "a slack registration with base_url https://evilslack.com (the host must be exactly slack.com, not a name that ends with it); the status")
 	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 0, "refused registrations must create nothing; the connectors")
 	r := post(c, with(github, "base_url", nil), "acme", "k-none")
 	ctx.Assert(r.Status == 201 && strings.Contains(r.Text(), \`"api.github.com"\`), "a registration without base_url must take the registered host, got %d %s", r.Status, r.Text())
@@ -874,6 +888,7 @@ func CheckIdempotentRegister(ctx *harness.Ctx) {
 	ctx.Assert(other.Status == 201 && connectorOf(other) != connectorOf(first), "the same key from another tenant is another registration, got %d %s", other.Status, other.Text())
 	missing := post(c, github, "acme", "")
 	ctx.Equal(missing.Status, 400, "a registration without Idempotency-Key")
+	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 2, "a registration without Idempotency-Key must create nothing; the connectors")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -933,6 +948,8 @@ void CheckTenantAndSource(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto anon = post(c, kGithub, "", "k-1");
   ctx.Equal(anon.Status, 401, "a registration without X-Tenant-Id");
+  const auto blank = c.Post("/v1/connectors", kGithub.dump(), "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", "k-blank");
+  ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id (an empty header names no tenant)");
   const auto ftp = post(c, {{"source_type", "ftp"}, {"token_ref", kToken}}, "acme", "k-2");
   ctx.Equal(ftp.Status, 400, "a registration for source_type ftp (only the sources in kRegisteredHosts have a host the platform registered)");
   ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 0, "refused registrations must create nothing; the connectors");
@@ -941,12 +958,14 @@ void CheckTenantAndSource(harness::Ctx& ctx) {
 void CheckRegisteredHost(harness::Ctx& ctx) {
   auto c = api(ctx);
   for (const std::string url : {"https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com",
-                                "https://evil.io/?next=https://api.github.com"}) {
+                                "https://evil.io/?next=https://api.github.com", "https://api.github.com@169.254.169.254/"}) {
     nlohmann::json body = kGithub;
     body["base_url"] = url;
     const auto r = post(c, body, "acme", url);
     ctx.Equal(r.Status, 403, "base_url %s: the sync worker would call a host the platform never registered for github, with the customer's token; the status", url);
   }
+  const auto slack = post(c, {{"source_type", "slack"}, {"token_ref", kToken}, {"base_url", "https://evilslack.com"}}, "acme", "k-slack");
+  ctx.Equal(slack.Status, 403, "a slack registration with base_url https://evilslack.com (the host must be exactly slack.com, not a name that ends with it); the status");
   ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 0, "refused registrations must create nothing; the connectors");
   const auto r = post(c, {{"source_type", "github"}, {"token_ref", kToken}}, "acme", "k-none");
   ctx.Assert(r.Status == 201 && bodyOf(r).value("host", "") == "api.github.com", "a registration without base_url must take the registered host, got %d %s", r.Status, r.Text());
@@ -977,6 +996,7 @@ void CheckIdempotentRegister(harness::Ctx& ctx) {
   ctx.Assert(other.Status == 201 && connectorOf(other) != connectorOf(first), "the same key from another tenant is another registration, got %d %s", other.Status, other.Text());
   const auto missing = post(c, kGithub, "acme", "");
   ctx.Equal(missing.Status, 400, "a registration without Idempotency-Key");
+  ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 2, "a registration without Idempotency-Key must create nothing; the connectors");
 }
 `,
   },

@@ -24,10 +24,10 @@ for good.
 
 - Key every event by the **tenant**.
 - The event is \`{ticket_id, tenant, queue, priority, confidence, fallback_reason, received_at}\`:
-  no text.
-- Write the outbox row where the broker answers: the delivery report (\`on_delivery\`, a rejected
-  \`send\`, kafka-go's \`Completion\`, \`dr_cb\`, a producer \`Callback\`).
-- \`run()\` records the routing, then commits.`,
+  no text, nothing else from the ticket.
+- Write the outbox row, that same event, where the broker answers: the delivery report
+  (\`on_delivery\`, a rejected \`send\`, kafka-go's \`Completion\`, \`dr_cb\`, a producer \`Callback\`).
+- \`run()\` records the routing, then commits; a routing it could not record is not committed.`,
   sequence: {
     participants: ['triage-api', 'triage.decided', 'outbox', 'Routing consumer', 'routing store'],
     messages: [
@@ -62,7 +62,7 @@ for good.
       id: 'ids-not-text',
       title: 'Carries ids and scores, not the ticket text',
       detail:
-        'The event is ticket_id, tenant, queue, priority, confidence, fallback_reason and received_at; nothing reads the ticket text into it.',
+        'The event is exactly ticket_id, tenant, queue, priority, confidence, fallback_reason and received_at: the ticket text, and any other field a ticket carries, stays out of it.',
       match: {
         python: {none: [/ticket\[\s*["']text["']\s*\]/]},
         typescript: {none: [/ticket\.text/]},
@@ -75,7 +75,7 @@ for good.
       id: 'outbox-on-reject',
       title: 'Writes the outbox row from the delivery report',
       detail:
-        "A record the broker refuses is written to the outbox where the broker's answer arrives (the delivery callback, the rejected send, the writer's completion); a `try` around the enqueue sees none of those.",
+        "A record the broker refuses is written to the outbox, as the same event the topic would have carried, where the broker's answer arrives (the delivery callback, the rejected send, the writer's completion); a `try` around the enqueue sees none of those.",
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/\.catch\(|await\s+producer\.send\(/, /insertOutbox\(/]},
@@ -88,7 +88,7 @@ for good.
       id: 'record-before-commit',
       title: 'Records the routing before committing the offset',
       detail:
-        'The consumer writes the routing record and only then commits, so a crash between the two redelivers the event instead of losing the ticket.',
+        'The consumer writes the routing record and only then commits, so a crash between the two redelivers the event instead of losing the ticket; a record whose write fails is not committed either.',
       match: {
         python: {order: [/store\.record_routing\(/, /\.commit\(/]},
         typescript: {order: [/await recordRouting\(/, /commitOffsets\(/]},
@@ -730,7 +730,8 @@ def check_tenant_key(ctx):
 
 def check_ids_not_text(ctx):
     m = ctx.load("events")
-    m.publish_decision(_ticket("t-1"), _decision("billing", "normal", "classifier_timeout"))
+    # A ticket carries more than the event needs (the requester, here): the event names its fields.
+    m.publish_decision({**_ticket("t-1"), "requester": "ana@acme.example"}, _decision("billing", "normal", "classifier_timeout"))
     m.producer.poll(0)
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one routed ticket produced {len(records)} records"
@@ -752,7 +753,8 @@ def check_outbox_on_reject(ctx):
     m.producer.poll(0)
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the broker refused one record and outbox:triage.decided holds {len(rows)} rows: the refusal arrives in the delivery report (on_delivery), after produce has returned"
-    assert rows[0].get("ticket_id") == "t-1" and rows[0].get("tenant") == "acme", f"the outbox row must be the event, got {rows[0]}"
+    expected = {"ticket_id": "t-1", "tenant": "acme", "queue": "billing", "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000}
+    assert rows[0] == expected, f"the outbox row must be the event the topic would have carried, {expected}, got {rows[0]}: the relay republishes it as it is"
     assert ctx.kafka.records(TOPIC) == [], "nothing may reach the topic for the refused record"
     m.publish_decision(_ticket("t-2"), _decision())
     m.producer.poll(0)
@@ -781,6 +783,17 @@ def check_record_before_commit(ctx):
     for ticket_id, tenant, _queue in seeded:
         assert ctx.redis.hget(f"routing:{tenant}:{ticket_id}", "status") == "open", f"{ticket_id} was never recorded"
     assert ctx.kafka.lag("routing", TOPIC) == 0, "every recorded event must be committed"
+    # A record whose routing cannot be written (the key holds a string: WRONGTYPE) must not be committed.
+    ctx.redis.set("routing:acme:t-4", "not a routing record")
+    ctx.kafka.seed(TOPIC, key="acme", value=json.dumps({"ticket_id": "t-4", "tenant": "acme", "queue": "billing", "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000}))
+    failing = ctx.kafka.records(TOPIC)[-1]
+    m = ctx.load("events")
+    try:
+        ctx.drain(m.run)
+    except Exception:  # noqa: BLE001 - the consumer may stop on the failed write
+        pass
+    committed = ctx.kafka.committed_offset("routing", TOPIC, failing.partition)
+    assert committed is not None and committed <= failing.offset, f"recording t-4 failed (WRONGTYPE) and group routing committed its offset anyway ({committed}): a write that failed must leave the record uncommitted, to be redelivered, not be logged and skipped"
 `,
     typescript: `const TOPIC = 'triage.decided';
 const TEXT = 'Refund for invoice 4411: my card ending 4242 was charged twice';
@@ -818,7 +831,8 @@ export async function check_tenant_key(ctx) {
 
 export async function check_ids_not_text(ctx) {
   const m = ctx.load('events');
-  await m.publishDecision(ticket('t-1'), decision('billing', 'normal', 'classifier_timeout'));
+  // A ticket carries more than the event needs (the requester, here): the event names its fields.
+  await m.publishDecision({...ticket('t-1'), requester: 'ana@acme.example'}, decision('billing', 'normal', 'classifier_timeout'));
   await settle();
   const records = ctx.kafka.records(TOPIC);
   assert.equal(records.length, 1, \`one routed ticket produced \${records.length} records\`);
@@ -841,7 +855,8 @@ export async function check_outbox_on_reject(ctx) {
   await settle();
   const rows = outbox(ctx);
   assert.equal(rows.length, 1, \`the broker refused one record and outbox:triage.decided holds \${rows.length} rows: the refusal rejects the send's promise, after publishDecision's try has finished\`);
-  assert(rows[0].ticket_id === 't-1' && rows[0].tenant === 'acme', \`the outbox row must be the event, got \${JSON.stringify(rows[0])}\`);
+  const expected = {ticket_id: 't-1', tenant: 'acme', queue: 'billing', priority: 'normal', confidence: 0.92, fallback_reason: '', received_at: 1760000000};
+  assert.deepStrictEqual(rows[0], expected, \`the outbox row must be the event the topic would have carried, \${JSON.stringify(expected)}, got \${JSON.stringify(rows[0])}: the relay republishes it as it is\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing may reach the topic for the refused record');
   await m.publishDecision(ticket('t-2'), decision());
   await settle();
@@ -868,6 +883,18 @@ export async function check_record_before_commit(ctx) {
   assert.equal(early.length, 0, \`group routing committed past \${JSON.stringify([...new Set(early)].sort())} before their routing records were written: a consumer that dies between the commit and the write loses those tickets for good. Record, then commit\`);
   for (const [ticketId, tenant] of seeded) assert.equal(ctx.redis.hget(\`routing:\${tenant}:\${ticketId}\`, 'status'), 'open', \`\${ticketId} was never recorded\`);
   assert.equal(ctx.kafka.lag('routing', TOPIC), 0, 'every recorded event must be committed');
+  // A record whose routing cannot be written (the key holds a string: WRONGTYPE) must not be committed.
+  ctx.redis.set('routing:acme:t-4', 'not a routing record');
+  ctx.kafka.seed(TOPIC, {key: 'acme', value: JSON.stringify({ticket_id: 't-4', tenant: 'acme', queue: 'billing', priority: 'normal', confidence: 0.92, fallback_reason: '', received_at: 1760000000})});
+  const failing = ctx.kafka.records(TOPIC).at(-1);
+  const again = ctx.load('events');
+  try {
+    await ctx.drain(again.run());
+  } catch {
+    // the consumer may stop on the failed write
+  }
+  const committed = ctx.kafka.committedOffset('routing', TOPIC, failing.partition);
+  assert(committed !== null && committed <= failing.offset, \`recording t-4 failed (WRONGTYPE) and group routing committed its offset anyway (\${committed}): a write that failed must leave the record uncommitted, to be redelivered, not be logged and skipped\`);
 }
 `,
     go: `package main
@@ -953,7 +980,8 @@ func CheckOutboxOnReject(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one record: the refusal reaches the writer's Completion, after WriteMessages has returned; outbox:triage.decided rows")
-	ctx.Assert(rows[0]["ticket_id"] == "t-1" && rows[0]["tenant"] == "acme", "the outbox row must be the event, got %v", rows[0])
+	ctx.Equal(rows[0], map[string]any{"ticket_id": "t-1", "tenant": "acme", "queue": "billing", "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000},
+		"the outbox row must be the event the topic would have carried: the relay republishes it as it is")
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing may reach the topic for the refused record; the records")
 	publishDecision(context.Background(), eventsTicket("t-2", "acme"), eventsDecision("billing", "normal", ""))
 	ctx.Settle()
@@ -988,6 +1016,13 @@ func CheckRecordBeforeCommit(ctx *harness.Ctx) {
 		ctx.Equal(status, "open", "%s must be recorded; its status", s[0])
 	}
 	ctx.Equal(ctx.Kafka.Lag("routing", eventsTopic), int64(0), "every recorded event must be committed; the lag")
+	// A record whose routing cannot be written (the key holds a string: WRONGTYPE) must not be committed.
+	ctx.Redis.Set("routing:acme:t-4", "not a routing record")
+	value, _ := json.Marshal(map[string]any{"ticket_id": "t-4", "tenant": "acme", "queue": "billing", "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000})
+	failing := ctx.Kafka.Seed(eventsTopic, "acme", string(value))
+	ctx.Drain(func() { run(context.Background()) })
+	offset, ok := ctx.Kafka.Committed("routing", eventsTopic, failing.Partition)
+	ctx.Assert(ok && offset <= failing.Offset, "recording t-4 failed (WRONGTYPE) and group routing committed its offset anyway (%d): a write that failed must leave the record uncommitted, to be redelivered, not be logged and skipped", offset)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1056,7 +1091,8 @@ void CheckOutboxOnReject(harness::Ctx& ctx) {
   ctx.Settle();
   const auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one record: the refusal arrives in the delivery report (dr_cb), after produce has returned; outbox:triage.decided rows");
-  ctx.Assert(rows[0].is_object() && rows[0].value("ticket_id", "") == "t-1" && rows[0].value("tenant", "") == "acme", "the outbox row must be the event, got %s", rows[0].dump());
+  const nlohmann::json expected = {{"ticket_id", "t-1"}, {"tenant", "acme"}, {"queue", "billing"}, {"priority", "normal"}, {"confidence", 0.92}, {"fallback_reason", ""}, {"received_at", 1760000000}};
+  ctx.Equal(rows[0], expected, "the outbox row must be the event the topic would have carried: the relay republishes it as it is");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing may reach the topic for the refused record; the records");
   publish_decision(eventsTicket("t-2", "acme"), eventsDecision("billing"));
   producer->poll(0);
@@ -1085,6 +1121,17 @@ void CheckRecordBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(early.empty(), "group routing committed past %q before their routing records were written: a consumer that dies between the commit and the write loses those tickets for good. Record, then commit", early);
   for (const auto& s : seeded) ctx.Equal(ctx.Redis.HGet("routing:" + s[1] + ":" + s[0], "status"), std::optional<std::string>("open"), "%s must be recorded; its status", s[0]);
   ctx.Equal(ctx.Kafka.Lag("routing", kTopic), 0, "every recorded event must be committed; the lag");
+  // A record whose routing cannot be written (the key holds a string: WRONGTYPE) must not be committed.
+  ctx.Redis.Set("routing:acme:t-4", "not a routing record");
+  const nlohmann::json failingEvent = {{"ticket_id", "t-4"}, {"tenant", "acme"}, {"queue", "billing"}, {"priority", "normal"}, {"confidence", 0.92}, {"fallback_reason", ""}, {"received_at", 1760000000}};
+  const auto failing = ctx.Kafka.Seed(kTopic, "acme", failingEvent.dump());
+  try {
+    ctx.Drain([] { run(); });
+  } catch (...) {
+    // the consumer may stop on the failed write
+  }
+  const auto committed = ctx.Kafka.Committed("routing", kTopic, failing.Partition);
+  ctx.Assert(committed.has_value() && *committed <= failing.Offset, "recording t-4 failed (WRONGTYPE) and group routing committed its offset anyway (%d): a write that failed must leave the record uncommitted, to be redelivered, not be logged and skipped", committed.value_or(-1));
 }
 `,
   },

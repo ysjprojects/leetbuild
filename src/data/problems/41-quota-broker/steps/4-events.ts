@@ -104,7 +104,7 @@ the record, or never answers, loses the event while the caller hears \`True\`.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an `outbox:quota` row with the topic, the team key and the payload, and the call returns false; the starter returns true before the broker answers.',
+        'A failed delivery, or no report within 2 s, leaves an `outbox:quota` row with the topic, the team key and exactly the six-field payload, and the call returns false; a delivered event, also the one right after a failure, returns true and adds no row. The starter returns true before the broker answers.',
       match: {
         python: {
           all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -649,6 +649,11 @@ def check_no_requester(ctx):
     assert "requested_by" not in value, f"the payload names the requester ({value.get('requested_by')!r}): the topic is retained and replicated, so it records who asked for every GPU"
     expected = {"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": W, "resource_class": "gpu-a100", "amount": 4}
     assert value == expected, f"the payload is {value}, expected exactly {expected}"
+    m.publish_quota_event("consumed", _reservation(2, "vision", "tpu-v5"))
+    records = ctx.kafka.records(TOPIC)
+    value = json.loads(records[-1].value) if len(records) == 2 else None
+    expected = {"kind": "consumed", "reservation_id": "r-2", "team": "vision", "window": W, "resource_class": "tpu-v5", "amount": 4}
+    assert value == expected, f"a consumed event for vision's r-2 carries {value}, expected exactly {expected}"
 
 
 def check_acks_idempotent(ctx):
@@ -667,13 +672,17 @@ def check_outbox_on_failure(ctx):
     ok = m.publish_quota_event("reserved", _reservation(1))
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and outbox:quota holds {len(rows)} rows: without a row the grant never reaches the ledger consumer"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "research" and rows[0].get("payload", {}).get("reservation_id") == "r-1", f"the outbox row is {rows[0]}, expected the topic, the key research and the payload"
+    expected = {"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": W, "resource_class": "gpu-a100", "amount": 4}
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "research" and rows[0].get("payload") == expected, f"the outbox row is {rows[0]}, expected the topic, the key research and exactly the payload {expected}"
     assert ok is False, f"publish_quota_event returned {ok!r} after a failed delivery, expected False"
+    ok = m.publish_quota_event("reserved", _reservation(0))
+    assert ok is True, f"after the failed delivery, publish_quota_event returned {ok!r} for a record the broker acknowledged, expected True"
+    assert len(_outbox(ctx)) == 1, f"a delivered event added an outbox:quota row ({_outbox(ctx)}): the relay would produce it a second time"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_quota_event("released", _reservation(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_quota_event waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_quota_event waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("reservation_id") == "r-2", f"no delivery report within the window and outbox:quota holds {rows}"
     assert ok is False, f"publish_quota_event returned {ok!r} without a delivery report, expected False"
@@ -722,6 +731,12 @@ export async function check_no_requester(ctx) {
   assert(!('requested_by' in value), \`the payload names the requester (\${value.requested_by}): the topic is retained and replicated, so it records who asked for every GPU\`);
   const expected = {kind: 'reserved', reservation_id: 'r-1', team: 'research', window: W, resource_class: 'gpu-a100', amount: 4};
   assert.deepStrictEqual(value, expected, \`the payload is \${values[0]}, expected exactly \${JSON.stringify(expected)}\`);
+  await m.publishQuotaEvent('consumed', reservation(2, 'vision', 'tpu-v5'));
+  await settle();
+  const after = ctx.kafka.values(TOPIC);
+  const consumed = after.length === 2 ? JSON.parse(after[1]) : null;
+  const expectedConsumed = {kind: 'consumed', reservation_id: 'r-2', team: 'vision', window: W, resource_class: 'tpu-v5', amount: 4};
+  assert.deepStrictEqual(consumed, expectedConsumed, \`a consumed event for vision's r-2 carries \${JSON.stringify(consumed)}, expected exactly \${JSON.stringify(expectedConsumed)}\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -743,13 +758,19 @@ export async function check_outbox_on_failure(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and outbox:quota holds \${rows.length} rows: without a row the grant never reaches the ledger consumer\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'research' && rows[0].payload?.reservation_id === 'r-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key research and the payload\`);
+  const expected = {kind: 'reserved', reservation_id: 'r-1', team: 'research', window: W, resource_class: 'gpu-a100', amount: 4};
+  assert(rows[0].topic === TOPIC && rows[0].key === 'research', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic and the key research\`);
+  assert.deepStrictEqual(rows[0].payload, expected, \`the outbox row's payload is \${JSON.stringify(rows[0].payload)}, expected exactly \${JSON.stringify(expected)}\`);
   assert.equal(ok, false, \`publishQuotaEvent resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ok = await m.publishQuotaEvent('reserved', reservation(0));
+  await settle();
+  assert.equal(ok, true, \`after the failed delivery, publishQuotaEvent resolved \${JSON.stringify(ok)} for a record the broker acknowledged, expected true\`);
+  assert.equal(outboxRows(ctx).length, 1, \`a delivered event added an outbox:quota row (\${JSON.stringify(outboxRows(ctx))}): the relay would produce it a second time\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishQuotaEvent('released', reservation(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishQuotaEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishQuotaEvent waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.reservation_id === 'r-2', \`no delivery report within the window and outbox:quota holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishQuotaEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -814,6 +835,13 @@ func CheckNoRequester(ctx *harness.Ctx) {
 	_, named := value["requested_by"]
 	ctx.Assert(!named, "the payload names the requester (%v): the topic is retained and replicated, so it records who asked for every GPU", value["requested_by"])
 	ctx.Equal(value, map[string]any{"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": eventsWindow, "resource_class": "gpu-a100", "amount": float64(4)}, "the payload")
+	eventsPublish(ctx, "consumed", eventsReservation(2, "vision", "tpu-v5"))
+	ctx.Settle()
+	values = ctx.Kafka.Values(topic)
+	ctx.Equal(len(values), 2, "a second publishQuotaEvent must produce a second record; the records")
+	var consumed map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[1]), &consumed), "the payload must be JSON")
+	ctx.Equal(consumed, map[string]any{"kind": "consumed", "reservation_id": "r-2", "team": "vision", "window": eventsWindow, "resource_class": "tpu-v5", "amount": float64(4)}, "the payload of a consumed event for vision's r-2")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -833,13 +861,18 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox:quota row the grant never reaches the ledger consumer; the rows")
-	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "research" && rows[0].Payload["reservation_id"] == "r-1", "the outbox row is %v, expected the topic, the key research and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "research", "the outbox row is %v, expected the topic and the key research", rows[0])
+	ctx.Equal(rows[0].Payload, map[string]any{"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": eventsWindow, "resource_class": "gpu-a100", "amount": float64(4)}, "the outbox row's payload")
 	ctx.Equal(ok, false, "publishQuotaEvent's result after a failed delivery")
+	ok = eventsPublish(ctx, "reserved", eventsReservation(0, "research", "gpu-a100"))
+	ctx.Settle()
+	ctx.Equal(ok, true, "after the failed delivery, publishQuotaEvent's result for a record the broker acknowledged")
+	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered event must add no outbox:quota row, or the relay produces it a second time; the rows")
 	ctx.Kafka.Stall(topic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, "released", eventsReservation(2, "research", "gpu-a100"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishQuotaEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishQuotaEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["reservation_id"] == "r-2", "no delivery report within the window and outbox:quota holds %v", rows)
 	ctx.Equal(ok, false, "publishQuotaEvent's result without a delivery report")
@@ -898,6 +931,12 @@ void CheckNoRequester(harness::Ctx& ctx) {
              "the payload %s names the requester: the topic is retained and replicated, so it records who asked for every GPU", values[0]);
   const nlohmann::json expected = {{"kind", "reserved"}, {"reservation_id", "r-1"}, {"team", "research"}, {"window", kEventsWindow}, {"resource_class", "gpu-a100"}, {"amount", 4}};
   ctx.Equal(value, expected, "the payload");
+  publishQuotaEvent("consumed", eventsReservation(2, "vision", "tpu-v5"));
+  ctx.Settle();
+  const auto after = ctx.Kafka.Values(kTopic);
+  ctx.Equal(after.size(), 2, "a second publishQuotaEvent must produce a second record; the records");
+  const nlohmann::json expected_consumed = {{"kind", "consumed"}, {"reservation_id", "r-2"}, {"team", "vision"}, {"window", kEventsWindow}, {"resource_class", "tpu-v5"}, {"amount", 4}};
+  ctx.Equal(nlohmann::json::parse(after[1], nullptr, false), expected_consumed, "the payload of a consumed event for vision's r-2");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -918,15 +957,19 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox:quota row the grant never reaches the ledger consumer; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kTopic && eventsField(rows[0], "key") == "research" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "reservation_id") == "r-1",
-             "the outbox row is %s, expected the topic, the key research and the payload", rows[0].dump());
+  ctx.Assert(eventsField(rows[0], "topic") == kTopic && eventsField(rows[0], "key") == "research", "the outbox row is %s, expected the topic and the key research", rows[0].dump());
+  const nlohmann::json expected = {{"kind", "reserved"}, {"reservation_id", "r-1"}, {"team", "research"}, {"window", kEventsWindow}, {"resource_class", "gpu-a100"}, {"amount", 4}};
+  ctx.Equal(rows[0].value("payload", nlohmann::json()), expected, "the outbox row's payload");
   ctx.Equal(ok, false, "publishQuotaEvent's result after a failed delivery");
+  ok = publishQuotaEvent("reserved", eventsReservation(0));
+  ctx.Settle();
+  ctx.Equal(ok, true, "after the failed delivery, publishQuotaEvent's result for a record the broker acknowledged");
+  ctx.Equal(eventsOutbox(ctx).size(), 1, "a delivered event must add no outbox:quota row, or the relay produces it a second time; the rows");
   ctx.Kafka.Stall(kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishQuotaEvent("released", eventsReservation(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishQuotaEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishQuotaEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "reservation_id") == "r-2",
              "no delivery report within the window and outbox:quota holds %d rows", rows.size());

@@ -26,8 +26,9 @@ consumer that crashes between commit and count loses the count.
   \`provenance\` and \`text_hash\` (SHA-256 hex of the text), and no text.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\`; Go uses confluent-kafka-go,
   whose producer can be idempotent).
-- A failed delivery report, or none within \`ACK_TIMEOUT_S\` (2 s), writes the payload to the outbox,
-  and \`publish\` returns false.
+- A failed delivery report, or none within \`ACK_TIMEOUT_S\` (2 s), writes the payload (the event,
+  text hash and all) to the outbox, and \`publish\` returns false; a delivered event returns true and
+  writes no row.
 - The consumer counts every label of a record, then commits its offset.`,
   sequence: {
     participants: ['Content Classifier', 'classify.result', 'Metrics consumer', 'Redis'],
@@ -94,7 +95,7 @@ consumer that crashes between commit and count loses the count.
       id: 'outbox-on-failure',
       title: 'Writes the outbox from the delivery report',
       detail:
-        'A delivery that fails, or brings no acknowledgement within 2 s, writes the payload to the outbox and `publish` returns false; the error arrives in the delivery report (`on_delivery`, a rejected `send`, the delivery channel, `dr_cb`, the send future), not as an exception from `produce`. The starter only catches local errors.',
+        'A delivery that fails, or brings no acknowledgement within 2 s, writes the event payload (with its `text_hash`, never the text) to the outbox and `publish` returns false; a delivered event returns true and leaves the outbox alone. The error arrives in the delivery report (`on_delivery`, a rejected `send`, the delivery channel, `dr_cb`, the send future), not as an exception from `produce`. The starter only catches local errors.',
       match: {
         python: {all: [/on_delivery\s*=/, /outbox\.insert\(/], none: [/except KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /outbox\.insert\(/], none: [/void producer\.send\(/]},
@@ -1047,17 +1048,20 @@ def check_idempotent_acks(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish(_c(0))
+    assert ok is True and _outbox(ctx) == [], f"a delivered event returned {ok!r} and left the outbox {_outbox(ctx)}: only an undelivered event goes to the outbox"
     ctx.kafka.fail_next(TOPIC, 1)
-    ok = m.publish(_c(1))
+    ok = m.publish(_c(1, text=CARD))
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: the event is lost. The failure arrives in the delivery report, not as an exception from produce"
     assert rows[0].get("request_id") == "req-1" and rows[0].get("tenant") == "acme", f"the outbox row must be the event's payload, got {rows[0]}"
+    assert "text" not in rows[0] and "4111" not in json.dumps(rows[0]) and rows[0].get("text_hash") == hashlib.sha256(CARD.encode("utf-8")).hexdigest(), f"the outbox row is republished as the event, so it carries the text_hash and never the text, got {rows[0]}"
     assert ok is False, f"publish returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish(_c(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("request_id") == "req-2", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish returned {ok!r} without an acknowledgement, expected False"
@@ -1152,18 +1156,25 @@ export async function check_idempotent_acks(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  let ok = await m.publish(c(0));
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`a delivered event resolved \${JSON.stringify(ok)} and left the outbox \${JSON.stringify(outboxRows(ctx))}: only an undelivered event goes to the outbox\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publish(c(1));
+  ok = await m.publish(c(1, 'acme', ['billing'], CARD));
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: the event is lost. The failure arrives as a rejected send, not as an exception from calling it\`);
   assert(rows[0].request_id === 'req-1' && rows[0].tenant === 'acme', \`the outbox row must be the event's payload, got \${JSON.stringify(rows[0])}\`);
+  assert(
+    !('text' in rows[0]) && !JSON.stringify(rows[0]).includes('4111') && rows[0].text_hash === '8a083646ad2530b746123a2625a441622ba9ac4720541ffbd9dbec7519a372a2',
+    \`the outbox row is republished as the event, so it carries the text_hash and never the text, got \${JSON.stringify(rows[0])}\`,
+  );
   assert.equal(ok, false, \`publish resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publish(c(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publish waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the acknowledgement at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publish waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the acknowledgement at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].request_id === 'req-2', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publish resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -1274,18 +1285,26 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := eventsPublish(ctx, eventsC(0, "acme", []string{"billing"}, ""))
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered event returned %v and left the outbox %v: only an undelivered event goes to the outbox", ok, eventsOutbox(ctx))
 	ctx.Kafka.FailNext(config.Topic, 1)
-	ok := eventsPublish(ctx, eventsC(1, "acme", []string{"billing"}, ""))
+	ok = eventsPublish(ctx, eventsC(1, "acme", []string{"billing"}, eventsCard))
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the event is lost (the failure arrives in the delivery report, not from Produce); the rows")
 	ctx.Assert(rows[0]["request_id"] == "req-1" && rows[0]["tenant"] == "acme", "the outbox row must be the event's payload, got %v", rows[0])
+	_, rowHasText := rows[0]["text"]
+	rowRaw, _ := json.Marshal(rows[0])
+	cardSum := sha256.Sum256([]byte(eventsCard))
+	ctx.Assert(!rowHasText && !strings.Contains(string(rowRaw), "4111") && rows[0]["text_hash"] == hex.EncodeToString(cardSum[:]),
+		"the outbox row is republished as the event, so it carries the text_hash and never the text, got %s", rowRaw)
 	ctx.Equal(ok, false, "publish's result after a failed delivery")
 	ctx.Kafka.Stall(config.Topic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsC(2, "acme", []string{"billing"}, ""))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["request_id"] == "req-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publish's result without an acknowledgement")
@@ -1399,18 +1418,23 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publish(eventsC(0, "acme", {"billing"}));
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivered event returned %v and left %d outbox rows: only an undelivered event goes to the outbox", ok, eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(config::kTopic, 1);
-  bool ok = publish(eventsC(1, "acme", {"billing"}));
+  ok = publish(eventsC(1, "acme", {"billing"}, kCard));
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the event is lost (the failure arrives in dr_cb, not from produce); the rows");
   ctx.Assert(field(rows[0], "request_id") == "req-1" && field(rows[0], "tenant") == "acme", "the outbox row must be the event's payload, got %s", rows[0].dump());
+  ctx.Assert(!rows[0].contains("text") && rows[0].dump().find("4111") == std::string::npos && field(rows[0], "text_hash") == sha256_hex(kCard),
+             "the outbox row is republished as the event, so it carries the text_hash and never the text, got %s", rows[0].dump());
   ctx.Equal(ok, false, "publish's result after a failed delivery");
   ctx.Kafka.Stall(config::kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publish(eventsC(2, "acme", {"billing"}));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && field(rows[1], "request_id") == "req-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish's result without an acknowledgement");

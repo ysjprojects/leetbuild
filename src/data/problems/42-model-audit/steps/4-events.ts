@@ -74,7 +74,7 @@ the produce loses the event.
       id: 'committed-event',
       title: 'Publishes what the chain committed',
       detail:
-        '`append_and_publish` calls `append_entry` first and publishes the position and link it returned; announcing the position after `head` before appending describes a position another replica may take.',
+        '`append_and_publish` calls `append_entry` first and publishes the position and link it returned; announcing the position after `head` before appending, or reading `head` again after it, describes a position another replica may take.',
       match: {
         python: {
           order: [/def append_and_publish/, /chain\.append_entry\(/, /publish_appended\(/],
@@ -90,7 +90,7 @@ the produce loses the event.
       id: 'outbox',
       title: 'A refused produce leaves an outbox row',
       detail:
-        'The delivery report (the `on_delivery` callback, the rejected `send`, the `WriteMessages` error, `dr_cb`, the producer `Callback`) writes the event to `insert_outbox`/`insertOutbox`; a `try` around the enqueue catches only local errors.',
+        'The delivery report (the `on_delivery` callback, the rejected `send`, the `WriteMessages` error, `dr_cb`, the producer `Callback`) writes the event itself, the same four fields, to `insert_outbox`/`insertOutbox`; a `try` around the enqueue catches only local errors.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /ledger\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
@@ -657,6 +657,19 @@ def check_committed_event(ctx):
     assert events[0].get("position") == 2, f"the event announces position {events[0].get('position')} while the chain holds the record at 2: it was published before the append, at a position another replica took"
     assert events[0].get("digest") == entry["digest"], f"the event's digest {events[0].get('digest')} is not the link the chain holds at position 2 ({entry['digest']})"
     assert event == events[0], f"append_and_publish answered {event}, the topic holds {events[0]}"
+    # Another replica chains right after this append's own write: the event still names what append_entry returned.
+    second = _record(2)
+    late_digest = hashlib.sha256(b"late").hexdigest()
+    ctx.redis_after("audit:chain:t1", lambda: ctx.redis_after("audit:chain:t1", lambda: chain.append_entry("t1", "d-late", late_digest)))
+    answer = m.append_and_publish(second["id"])
+    _settle(m)
+    at = ledger.get(second["id"])["position"]
+    entry = chain.entry_at("t1", at)
+    head = chain.head("t1")["position"]
+    assert entry and entry["record_id"] == second["id"] and head == 4, f"the second record must be chained next to the late rival, the ledger says {at}, the chain holds {entry} and ends at {head}"
+    published = _events(ctx)[-1]
+    assert published.get("position") == at and published.get("digest") == entry["digest"], f"another replica chained position {head} right after this append wrote position {at}, and the event announces position {published.get('position')}: it names the position and link append_entry returned, not the head read afterwards"
+    assert answer == published, f"append_and_publish answered {answer}, the topic holds {published}"
 
 
 def check_outbox(ctx):
@@ -672,7 +685,9 @@ def check_outbox(ctx):
     assert len(rows) == 1, f"the broker refused one produce and audit:outbox holds {len(rows)} rows: the event is lost for every mirror"
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "t1", f"the outbox row is {row}, expected topic {TOPIC} and key t1"
-    assert row.get("payload", {}).get("record_id") == record["id"] and row["payload"].get("position") == 1, f"the outbox row must carry the event, got {row}"
+    payload = row.get("payload", {})
+    assert payload.get("record_id") == record["id"] and payload.get("position") == 1, f"the outbox row must carry the event, got {row}"
+    assert set(payload) == FIELDS and payload.get("digest") == chain.entry_at("t1", 1)["digest"], f"the outbox row's payload is {payload}, expected the event itself: exactly {sorted(FIELDS)}, with the link the chain holds at position 1"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
     assert chain.head("t1")["position"] == 1, "the append must stand when only the produce failed"
     m.append_and_publish(_record(2)["id"])
@@ -745,6 +760,26 @@ export async function check_committed_event(ctx) {
   assert.equal(all[0].position, 2, \`the event announces position \${all[0].position} while the chain holds the record at 2: it was published before the append, at a position another replica took\`);
   assert.equal(all[0].digest, entry.digest, \`the event's digest \${all[0].digest} is not the link the chain holds at position 2 (\${entry.digest})\`);
   assert.deepEqual(event, all[0], \`appendAndPublish answered \${JSON.stringify(event)}, the topic holds \${JSON.stringify(all[0])}\`);
+  // Another replica chains right after this append's own write: the event still names what appendEntry returned.
+  const second = await record(2);
+  const {linkDigest} = ctx.load('/support/audit/digest.ts');
+  ctx.redisAfter('audit:chain:t1', () =>
+    ctx.redisAfter('audit:chain:t1', () => {
+      const now = ctx.redis.hgetall('audit:chain:t1');
+      const n = Number(now.length) + 1;
+      const link = linkDigest(now.head, sha('late'), n);
+      ctx.redis.hset('audit:chain:t1', {[\`rec:\${n}\`]: sha('late'), [\`link:\${n}\`]: link, [\`id:\${n}\`]: 'd-late', head: link, length: String(n)});
+    }),
+  );
+  const answer = await m.appendAndPublish(second.id);
+  await settle();
+  const at = (await ledger.get(second.id)).position;
+  const placed = await chain.entryAt('t1', at);
+  const head = (await chain.head('t1')).position;
+  assert(placed !== null && placed.record_id === second.id && head === 4, \`the second record must be chained next to the late rival, the ledger says \${at}, the chain holds \${JSON.stringify(placed)} and ends at \${head}\`);
+  const published = payloads(ctx).at(-1);
+  assert(published.position === at && published.digest === placed.digest, \`another replica chained position \${head} right after this append wrote position \${at}, and the event announces position \${published.position}: it names the position and link appendEntry returned, not the head read afterwards\`);
+  assert.deepEqual(answer, published, \`appendAndPublish answered \${JSON.stringify(answer)}, the topic holds \${JSON.stringify(published)}\`);
 }
 
 export async function check_outbox(ctx) {
@@ -760,7 +795,10 @@ export async function check_outbox(ctx) {
   const rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the broker refused one produce and audit:outbox holds \${rows.length} rows: the event is lost for every mirror\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 't1', \`the outbox row is \${JSON.stringify(rows[0])}, expected topic \${TOPIC} and key t1\`);
-  assert(rows[0].payload?.record_id === r.id && rows[0].payload?.position === 1, \`the outbox row must carry the event, got \${JSON.stringify(rows[0])}\`);
+  const payload = rows[0].payload ?? {};
+  assert(payload.record_id === r.id && payload.position === 1, \`the outbox row must carry the event, got \${JSON.stringify(rows[0])}\`);
+  const first = await chain.entryAt('t1', 1);
+  assert(JSON.stringify(Object.keys(payload).sort()) === JSON.stringify(FIELDS) && payload.digest === first?.digest, \`the outbox row's payload is \${JSON.stringify(payload)}, expected the event itself: exactly \${JSON.stringify(FIELDS)}, with the link the chain holds at position 1\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
   assert.equal((await chain.head('t1')).position, 1, 'the append must stand when only the produce failed');
   await m.appendAndPublish((await record(2)).id);
@@ -876,6 +914,27 @@ func CheckCommittedEvent(ctx *harness.Ctx) {
 	ctx.Equal(all[0]["position"], 2, "the event must announce the position the chain holds the record at (it was published before the append, at a position another replica took); the position")
 	ctx.Equal(all[0]["digest"], entry.Digest, "the event's digest must be the link the chain holds at position 2")
 	ctx.Equal(event["digest"], entry.Digest, "appendAndPublish must answer the event it published; its digest")
+	// Another replica chains right after this append's own write: the event still names what appendEntry returned.
+	second := eventRecord(ctx, 2, "risk-v7")
+	ctx.Redis.After("audit:chain:t1", func() any {
+		ctx.Redis.After("audit:chain:t1", func() any {
+			_, err := chain.AppendEntry(eventsBg, "t1", "d-late", digest.Sha256Hex("late"))
+			ctx.NoError(err, "the late rival append failed")
+			return nil
+		})
+		return nil
+	})
+	answer := mustAppendAndPublish(ctx, second.ID)
+	ctx.Settle()
+	at := ledger.Get(eventsBg, second.ID).Position
+	placed, err := chain.EntryAt(eventsBg, "t1", at)
+	ctx.NoError(err, "EntryAt failed")
+	head, _ := chain.Head(eventsBg, "t1")
+	ctx.Assert(placed != nil && placed.RecordID == second.ID && head.Position == 4, "the second record must be chained next to the late rival, the ledger says %d, the chain holds %+v and ends at %d", at, placed, head.Position)
+	all = eventPayloads(ctx)
+	published := all[len(all)-1]
+	ctx.Assert(published["position"] == float64(at) && published["digest"] == placed.Digest, "another replica chained position %d right after this append wrote position %d, and the event announces position %v: it names the position and link appendEntry returned, not the head read afterwards", head.Position, at, published["position"])
+	ctx.Equal(answer["digest"], placed.Digest, "appendAndPublish must answer the event it published; its digest")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
@@ -889,6 +948,13 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "t1", "the outbox row is %v, expected topic %s and key t1", rows[0], eventsTopic)
 	payload, _ := rows[0]["payload"].(map[string]any)
 	ctx.Assert(payload != nil && payload["record_id"] == record.ID && payload["position"] == float64(1), "the outbox row must carry the event, got %v", rows[0])
+	var fields []string
+	for name := range payload {
+		fields = append(fields, name)
+	}
+	sort.Strings(fields)
+	first, _ := chain.EntryAt(eventsBg, "t1", 1)
+	ctx.Assert(strings.Join(fields, ",") == "digest,position,record_id,tenant" && first != nil && payload["digest"] == first.Digest, "the outbox row's payload is %v, expected the event itself: exactly digest, position, record_id and tenant, with the link the chain holds at position 1", payload)
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing may reach the topic for the refused produce; the events")
 	head, _ := chain.Head(eventsBg, "t1")
 	ctx.Equal(head.Position, int64(1), "the append must stand when only the produce failed; the chain's last position")
@@ -981,6 +1047,19 @@ void CheckCommittedEvent(harness::Ctx& ctx) {
   ctx.Equal(all[0].value("position", 0L), 2, "the event must announce the position the chain holds the record at (it was published before the append, at a position another replica took); the position");
   ctx.Equal(all[0].value("digest", ""), entry->digest, "the event's digest must be the link the chain holds at position 2");
   ctx.Equal(event.value("digest", ""), entry->digest, "appendAndPublish must answer the event it published; its digest");
+  // Another replica chains right after this append's own write: the event still names what appendEntry returned.
+  const ledger::Decision second = eventRecord(2, "risk-v7");
+  ctx.Redis.After("audit:chain:t1", [&ctx] { ctx.Redis.After("audit:chain:t1", [] { chain::appendEntry("t1", "d-late", sha256_hex("late")); }); });
+  const json answer = appendAndPublish(second.id);
+  settle(ctx);
+  const long at = ledger::get(second.id)->position;
+  const auto placed = chain::entryAt("t1", at);
+  const long head = chain::head("t1").position;
+  ctx.Assert(placed && placed->record_id == second.id && head == 4, "the second record must be chained next to the late rival, the ledger says %d and the chain ends at %d", at, head);
+  const auto later = eventPayloads(ctx);
+  const json published = later.empty() ? json::object() : later.back();
+  ctx.Assert(published.value("position", 0L) == at && placed && published.value("digest", "") == placed->digest, "another replica chained position %d right after this append wrote position %d, and the event announces position %d: it names the position and link appendEntry returned, not the head read afterwards", head, at, published.value("position", 0L));
+  ctx.Equal(answer.value("digest", ""), placed ? placed->digest : "", "appendAndPublish must answer the event it published; its digest");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
@@ -996,6 +1075,12 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(rows.size(), 1, "the broker refused one produce: without an outbox row the event is lost for every mirror; the outbox rows");
   ctx.Assert(rows[0].value("topic", "") == kEventsTopic && rows[0].value("key", "") == "t1", "the outbox row is %s, expected topic %s and key t1", rows[0].dump(), kEventsTopic);
   ctx.Assert(rows[0].contains("payload") && rows[0]["payload"].value("record_id", "") == record.id && rows[0]["payload"].value("position", 0L) == 1, "the outbox row must carry the event, got %s", rows[0].dump());
+  std::vector<std::string> fields;
+  if (rows[0].contains("payload") && rows[0]["payload"].is_object()) {
+    for (const auto& [name, value] : rows[0]["payload"].items()) fields.push_back(name);
+  }
+  const auto first = chain::entryAt("t1", 1);
+  ctx.Assert(fields == std::vector<std::string>{"digest", "position", "record_id", "tenant"} && first && rows[0]["payload"].value("digest", "") == first->digest, "the outbox row's payload is %s, expected the event itself: exactly digest, position, record_id and tenant, with the link the chain holds at position 1", rows[0].dump());
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing may reach the topic for the refused produce; the events");
   ctx.Equal(chain::head("t1").position, 1, "the append must stand when only the produce failed; the chain's last position");
   appendAndPublish(eventRecord(2, "risk-v7").id);

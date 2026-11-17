@@ -65,7 +65,7 @@ retried release refunds the same units twice.
       id: 'atomic-take',
       title: 'Compares and takes in one Lua script',
       detail:
-        'A second broker reserving 6 of 8 units between this reserve’s read and its write is refused, because the read, the comparison, the `HINCRBY` and the reservation record run as one script; the starter’s `HGET`, compare, `HINCRBY` sequence grants both.',
+        'A second broker reserving 6 of 8 units between this reserve’s read and its write is refused, because the read, the comparison, the `HINCRBY` and the reservation record run as one script; a reserve that fills the window exactly is granted, `consumed` units and the team’s `limit_of` count, and a refused reserve records nothing. The starter’s `HGET`, compare, `HINCRBY` sequence grants both.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HINCRBY['"]/],
@@ -87,7 +87,7 @@ retried release refunds the same units twice.
       id: 'expire-window',
       title: 'Expires the window hash and the reservation',
       detail:
-        'The window hash and the reservation carry a TTL between an hour and `TTL_S` (86400 s) after a reserve, set inside the script; the starter sets none, so Redis keeps every window the broker ever served.',
+        'The window hash and the reservation carry a TTL between an hour and `TTL_S` (86400 s) as soon as the reserve’s script has run, set inside it; the starter sets none, so Redis keeps every window the broker ever served.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /TTL_S/]},
@@ -608,6 +608,7 @@ bool release(const std::string& team, const std::string& reservation_id) {
   harness: {
     python: `W1 = "2026-11-02T14:00Z"
 W2 = "2026-11-02T15:00Z"
+W3 = "2026-11-02T16:00Z"
 
 
 def _reserved(ctx, key):
@@ -647,16 +648,36 @@ def check_atomic_take(ctx):
     granted = [x for x in (mine, theirs) if x]
     total = _ledger_reserved(ctx)
     assert len(granted) == 1 and total == 6, f"two overlapping reserves of 6 against research's 8 units: {len(granted)} granted and the ledger holds reserved {total}. The read, the comparison and the increment must run as one script"
+    # The comparison: reserved + consumed + amount against limit_of(team), an exact fill allowed.
+    assert m.reserve("research", W1, "gpu-a100", 2), "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits"
+    assert not m.reserve("research", W1, "gpu-a100", 1), "with all 8 of research's units reserved a reserve of 1 more was granted"
+    ctx.redis.hset(f"quota:research:{W2}", mapping={"limit": 8, "reserved": 0, "consumed": 5})
+    assert not m.reserve("research", W2, "gpu-a100", 4), f"with 5 of research's 8 units consumed in {W2} a reserve of 4 was granted: consumed units count against the limit too"
+    assert m.reserve("research", W2, "gpu-a100", 3), f"with 5 of research's 8 units consumed in {W2} a reserve of the last 3 was refused"
+    ctx.redis.hset("quota:limits", "research", 12)
+    assert m.reserve("research", W3, "gpu-a100", 10), "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is limit_of(team)"
+    records = ctx.redis.keys("reservation:research:*")
+    assert len(records) == 4, f"4 reserves were granted and Redis holds {len(records)} reservations: a refused reserve must record nothing"
 
 
 def check_expire_window(ctx):
     m = ctx.load("state")
+    seen = {}
+
+    def ttls_after_the_first_write():
+        for key in ctx.redis.keys("quota:research*") + ctx.redis.keys("reservation:research:*"):
+            seen[key] = ctx.redis.ttl(key)
+
+    probe = ctx.redis_after(f"quota:research:{W1}", ttls_after_the_first_write)
     assert m.reserve("research", W1, "gpu-a100", 2), "a reserve of 2 units was refused"
     keys = sorted(ctx.redis.keys("quota:research*")) + sorted(ctx.redis.keys("reservation:research:*"))
     assert len(keys) == 2, f"a reserve must leave the window hash and the reservation, Redis holds {keys}"
     for key in keys:
         ttl = ctx.redis.ttl(key)
         assert 3600 <= ttl <= 86400, f"{key} has TTL {ttl}: the window hash and the reservation must expire after TTL_S (86400 s), or Redis keeps every window the broker ever served"
+    assert probe.fired, f"the reserve never touched quota:research:{W1}"
+    for key, ttl in seen.items():
+        assert 3600 <= ttl <= 86400, f"right after the reserve's first command on quota:research:{W1}, {key} had TTL {ttl}: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires"
 
 
 def check_release_once(ctx):
@@ -675,6 +696,7 @@ def check_release_once(ctx):
 `,
     typescript: `const W1 = '2026-11-02T14:00Z';
 const W2 = '2026-11-02T15:00Z';
+const W3 = '2026-11-02T16:00Z';
 
 const reserved = (ctx, key: string): number => Number(ctx.redis.hget(key, 'reserved') ?? 0);
 
@@ -709,16 +731,34 @@ export async function check_atomic_take(ctx) {
   const granted = [mine, theirs].filter(x => x).length;
   const total = ledgerReserved(ctx);
   assert(granted === 1 && total === 6, \`two overlapping reserves of 6 against research's 8 units: \${granted} granted and the ledger holds reserved \${total}. The read, the comparison and the increment must run as one script\`);
+  // The comparison: reserved + consumed + amount against limitOf(team), an exact fill allowed.
+  assert(await m.reserve('research', W1, 'gpu-a100', 2), "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits");
+  assert(!(await m.reserve('research', W1, 'gpu-a100', 1)), "with all 8 of research's units reserved a reserve of 1 more was granted");
+  ctx.redis.hset(\`quota:research:\${W2}\`, {limit: 8, reserved: 0, consumed: 5});
+  assert(!(await m.reserve('research', W2, 'gpu-a100', 4)), \`with 5 of research's 8 units consumed in \${W2} a reserve of 4 was granted: consumed units count against the limit too\`);
+  assert(await m.reserve('research', W2, 'gpu-a100', 3), \`with 5 of research's 8 units consumed in \${W2} a reserve of the last 3 was refused\`);
+  ctx.redis.hset('quota:limits', 'research', 12);
+  assert(await m.reserve('research', W3, 'gpu-a100', 10), 'with research’s limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is limitOf(team)');
+  const records = ctx.redis.keys('reservation:research:*');
+  assert.equal(records.length, 4, \`4 reserves were granted and Redis holds \${records.length} reservations: a refused reserve must record nothing\`);
 }
 
 export async function check_expire_window(ctx) {
   const m = ctx.load('state');
+  const seen: Record<string, number> = {};
+  const probe = ctx.redisAfter(\`quota:research:\${W1}\`, () => {
+    for (const key of [...ctx.redis.keys('quota:research*'), ...ctx.redis.keys('reservation:research:*')]) seen[key] = ctx.redis.ttl(key);
+  });
   assert(await m.reserve('research', W1, 'gpu-a100', 2), 'a reserve of 2 units was refused');
   const keys = [...ctx.redis.keys('quota:research*').sort(), ...ctx.redis.keys('reservation:research:*').sort()];
   assert.equal(keys.length, 2, \`a reserve must leave the window hash and the reservation, Redis holds \${JSON.stringify(keys)}\`);
   for (const key of keys) {
     const ttl = ctx.redis.ttl(key);
     assert(ttl >= 3600 && ttl <= 86400, \`\${key} has TTL \${ttl}: the window hash and the reservation must expire after TTL_S (86400 s), or Redis keeps every window the broker ever served\`);
+  }
+  assert(probe.fired, \`the reserve never touched quota:research:\${W1}\`);
+  for (const [key, ttl] of Object.entries(seen)) {
+    assert(ttl >= 3600 && ttl <= 86400, \`right after the reserve's first command on quota:research:\${W1}, \${key} had TTL \${ttl}: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires\`);
   }
 }
 
@@ -749,6 +789,7 @@ import (
 const (
 	stateW1 = "2026-11-02T14:00Z"
 	stateW2 = "2026-11-02T15:00Z"
+	stateW3 = "2026-11-02T16:00Z"
 )
 
 var stateBg = context.Background()
@@ -823,15 +864,36 @@ func CheckAtomicTake(ctx *harness.Ctx) {
 	}
 	total := ledgerReserved(ctx)
 	ctx.Assert(granted == 1 && total == 6, "two overlapping reserves of 6 against research's 8 units: %d granted and the ledger holds reserved %d. The read, the comparison and the increment must run as one script", granted, total)
+	// The comparison: reserved + consumed + amount against ledger.LimitOf(team), an exact fill allowed.
+	ctx.Assert(mustReserve(ctx, stateW1, "gpu-a100", 2) != "", "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits")
+	ctx.Assert(mustReserve(ctx, stateW1, "gpu-a100", 1) == "", "with all 8 of research's units reserved a reserve of 1 more was granted")
+	ctx.Redis.Do("HSET", "quota:research:"+stateW2, "limit", 8, "reserved", 0, "consumed", 5)
+	ctx.Assert(mustReserve(ctx, stateW2, "gpu-a100", 4) == "", "with 5 of research's 8 units consumed in %s a reserve of 4 was granted: consumed units count against the limit too", stateW2)
+	ctx.Assert(mustReserve(ctx, stateW2, "gpu-a100", 3) != "", "with 5 of research's 8 units consumed in %s a reserve of the last 3 was refused", stateW2)
+	ctx.Redis.Do("HSET", "quota:limits", "research", 12)
+	ctx.Assert(mustReserve(ctx, stateW3, "gpu-a100", 10) != "", "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is ledger.LimitOf(team)")
+	records := ctx.Redis.Keys("reservation:research:*")
+	ctx.Equal(len(records), 4, "4 reserves were granted, and a refused reserve must record nothing; the reservations in Redis")
 }
 
 func CheckExpireWindow(ctx *harness.Ctx) {
+	seen := map[string]int64{}
+	probe := ctx.Redis.After("quota:research:"+stateW1, func() any {
+		for _, key := range append(ctx.Redis.Keys("quota:research*"), ctx.Redis.Keys("reservation:research:*")...) {
+			seen[key] = ctx.Redis.TTL(key)
+		}
+		return nil
+	})
 	ctx.Assert(mustReserve(ctx, stateW1, "gpu-a100", 2) != "", "a reserve of 2 units was refused")
 	keys := append(ctx.Redis.Keys("quota:research*"), ctx.Redis.Keys("reservation:research:*")...)
 	ctx.Equal(len(keys), 2, "a reserve must leave the window hash and the reservation (Redis holds %q); the keys", keys)
 	for _, key := range keys {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 3600 && ttl <= 86400, "%s has TTL %d: the window hash and the reservation must expire after a day (86400 s), or Redis keeps every window the broker ever served", key, ttl)
+	}
+	ctx.Assert(probe.Fired, "the reserve never touched quota:research:%s", stateW1)
+	for key, ttl := range seen {
+		ctx.Assert(ttl >= 3600 && ttl <= 86400, "right after the reserve's first command on quota:research:%s, %s had TTL %d: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires", stateW1, key, ttl)
 	}
 }
 
@@ -862,6 +924,7 @@ func CheckReleaseOnce(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -871,6 +934,7 @@ namespace {
 
 const std::string kW1 = "2026-11-02T14:00Z";
 const std::string kW2 = "2026-11-02T15:00Z";
+const std::string kW3 = "2026-11-02T16:00Z";
 
 long long hashReserved(harness::Ctx& ctx, const std::string& key) {
   const auto raw = ctx.Redis.HGet(key, "reserved");
@@ -935,9 +999,26 @@ void CheckAtomicTake(harness::Ctx& ctx) {
   const int granted = (mine ? 1 : 0) + (fired->reserved ? 1 : 0);
   const long long total = ledgerReserved(ctx);
   ctx.Assert(granted == 1 && total == 6, "two overlapping reserves of 6 against research's 8 units: %d granted and the ledger holds reserved %d. The read, the comparison and the increment must run as one script", granted, total);
+  // The comparison: reserved + consumed + amount against ledger::limitOf(team), an exact fill allowed.
+  ctx.Assert(reserve("research", kW1, "gpu-a100", 2).has_value(), "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits");
+  ctx.Assert(!reserve("research", kW1, "gpu-a100", 1).has_value(), "with all 8 of research's units reserved a reserve of 1 more was granted");
+  ctx.Redis.Do("HSET", "quota:research:" + kW2, "limit", "8", "reserved", "0", "consumed", "5");
+  ctx.Assert(!reserve("research", kW2, "gpu-a100", 4).has_value(), "with 5 of research's 8 units consumed in %s a reserve of 4 was granted: consumed units count against the limit too", kW2);
+  ctx.Assert(reserve("research", kW2, "gpu-a100", 3).has_value(), "with 5 of research's 8 units consumed in %s a reserve of the last 3 was refused", kW2);
+  ctx.Redis.Do("HSET", "quota:limits", "research", "12");
+  ctx.Assert(reserve("research", kW3, "gpu-a100", 10).has_value(), "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is ledger::limitOf(team)");
+  ctx.Equal(ctx.Redis.Keys("reservation:research:*").size(), 4, "4 reserves were granted, and a refused reserve must record nothing; the reservations in Redis");
 }
 
 void CheckExpireWindow(harness::Ctx& ctx) {
+  auto seen = std::make_shared<std::map<std::string, long long>>();
+  auto fired = std::make_shared<bool>(false);
+  ctx.Redis.After("quota:research:" + kW1, [&ctx, seen, fired] {
+    *fired = true;
+    auto touched = ctx.Redis.Keys("quota:research*");
+    for (const auto& k : ctx.Redis.Keys("reservation:research:*")) touched.push_back(k);
+    for (const auto& k : touched) (*seen)[k] = ctx.Redis.TTL(k);
+  });
   ctx.Assert(reserve("research", kW1, "gpu-a100", 2).has_value(), "a reserve of 2 units was refused");
   auto keys = ctx.Redis.Keys("quota:research*");
   for (const auto& k : ctx.Redis.Keys("reservation:research:*")) keys.push_back(k);
@@ -945,6 +1026,12 @@ void CheckExpireWindow(harness::Ctx& ctx) {
   for (const auto& key : keys) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl >= 3600 && ttl <= 86400, "%s has TTL %d: the window hash and the reservation must expire after kTtlSeconds (86400 s), or Redis keeps every window the broker ever served", key, ttl);
+  }
+  ctx.Assert(*fired, "the reserve never touched quota:research:%s", kW1);
+  for (const auto& [key, ttl] : *seen) {
+    ctx.Assert(ttl >= 3600 && ttl <= 86400,
+               "right after the reserve's first command on quota:research:%s, %s had TTL %d: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires",
+               kW1, key, ttl);
   }
 }
 

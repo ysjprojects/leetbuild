@@ -72,7 +72,7 @@ after a timeout files the same ticket twice.
       id: 'server-side-routing',
       title: 'Takes queue and priority from the text, not the body',
       detail:
-        'The routing is the ruleset decision for the text (`rule_decision`/`ruleDecision`); nothing reads `priority` or `queue` from the request body, so a caller cannot route itself.',
+        'The routing is the ruleset decision for the text (`rule_decision`/`ruleDecision`); nothing reads `priority` or `queue` from the request body, not even a real queue name, so a caller cannot route itself.',
       match: {
         python: {all: [/rules\.rule_decision\(/], none: [/body\.(priority|queue)\b/]},
         typescript: {all: [/ruleDecision\(/], none: [/body\.(priority|queue)\b/]},
@@ -85,7 +85,7 @@ after a timeout files the same ticket twice.
       id: 'text-cap',
       title: 'Answers 400 for a blank text and 413 past 32 KiB, before any work',
       detail:
-        'The text is measured in UTF-8 bytes against the 32 KiB cap (**413**) and a blank text is **400**, both before the ruleset runs and before a ticket id is minted.',
+        'The text, as sent, is measured in UTF-8 bytes against the 32 KiB cap (**413**) and a blank text is **400**, both before the ruleset runs and before a ticket id is minted.',
       match: {
         python: {all: [/\b413\b/, /\.encode\(/], order: [/>\s*MAX_TEXT_BYTES/, /rules\.rule_decision\(/]},
         typescript: {
@@ -554,11 +554,11 @@ async def check_route(ctx):
 
 async def check_server_side_routing(ctx):
     async with _api(ctx) as c:
-        r = await c.post(PATH, json={"text": INVOICE, "priority": "urgent", "queue": "vip"}, headers=_headers())
+        r = await c.post(PATH, json={"text": INVOICE, "priority": "urgent", "queue": "delivery"}, headers=_headers())
         assert r.status_code == 200, f"POST {PATH} answered {r.status_code}: {r.text}"
         body = r.json()
         assert body.get("priority") == "normal", f"the caller sent priority urgent and the ticket was routed at {body.get('priority')!r}: priority comes from the text (normal for an invoice), the body's priority is ignored"
-        assert body.get("queue") == "billing", f"the caller sent queue vip and the ticket was routed to {body.get('queue')!r}: the queue comes from the text (billing), the body's queue is ignored"
+        assert body.get("queue") == "billing", f"the caller sent queue delivery and the ticket was routed to {body.get('queue')!r}: the queue comes from the text (billing), the body's queue is ignored even when it names a real queue"
         recorded = store.decision_for_key("acme", "k-1")
         assert recorded is not None and recorded.get("queue") == "billing" and recorded.get("priority") == "normal", f"the recorded routing must be the server's decision, got {recorded}"
         r = await c.post(PATH, json={"text": "Production outage: every login fails", "priority": "low"}, headers=_headers(key="k-2"))
@@ -574,12 +574,14 @@ async def check_text_cap(ctx):
         wide = "\\u00e9" * (16 * 1024 + 1)
         r = await c.post(PATH, json={"text": wide}, headers=_headers(key="k-wide"))
         assert r.status_code == 413, f"a ticket of 16 385 characters (32 770 bytes of UTF-8) answered {r.status_code}, expected 413: the cap counts bytes, not characters"
-        assert ctx.redis.get("ticket:seq") is None, f"an oversized ticket was given a ticket id (ticket:seq is {ctx.redis.get('ticket:seq')}): reject it before minting one"
         for blank in ("", "   "):
             r = await c.post(PATH, json={"text": blank}, headers=_headers(key=f"k-blank-{len(blank)}"))
             assert r.status_code == 400, f"a ticket with text {blank!r} answered {r.status_code}, expected 400"
         r = await c.post(PATH, json={"priority": "low"}, headers=_headers(key="k-none"))
         assert r.status_code == 400, f"a ticket without text answered {r.status_code}, expected 400"
+        r = await c.post(PATH, json={"text": "a" * (32 * 1024) + "\\n"}, headers=_headers(key="k-pad"))
+        assert r.status_code == 413, f"a ticket of 32 KiB of text plus a trailing newline (32 769 bytes) answered {r.status_code}, expected 413: the cap measures the text as sent"
+        assert ctx.redis.get("ticket:seq") is None, f"a blank or oversized ticket was given a ticket id (ticket:seq is {ctx.redis.get('ticket:seq')}): reject it before minting one"
         r = await c.post(PATH, json={"text": "a" * (32 * 1024)}, headers=_headers(key="k-max"))
     assert r.status_code == 200, f"a ticket of exactly 32 KiB answered {r.status_code}, expected 200"
 
@@ -624,11 +626,11 @@ export async function check_route(ctx) {
 
 export async function check_server_side_routing(ctx) {
   const {c, store} = api(ctx);
-  let r = await c.post(PATH, {json: {text: INVOICE, priority: 'urgent', queue: 'vip'}, headers: headers()});
+  let r = await c.post(PATH, {json: {text: INVOICE, priority: 'urgent', queue: 'delivery'}, headers: headers()});
   assert.equal(r.status, 200, \`POST \${PATH} answered \${r.status}: \${r.text}\`);
   let body = r.json();
   assert.equal(body.priority, 'normal', \`the caller sent priority urgent and the ticket was routed at \${JSON.stringify(body.priority)}: priority comes from the text (normal for an invoice), the body's priority is ignored\`);
-  assert.equal(body.queue, 'billing', \`the caller sent queue vip and the ticket was routed to \${JSON.stringify(body.queue)}: the queue comes from the text (billing), the body's queue is ignored\`);
+  assert.equal(body.queue, 'billing', \`the caller sent queue delivery and the ticket was routed to \${JSON.stringify(body.queue)}: the queue comes from the text (billing), the body's queue is ignored even when it names a real queue\`);
   const recorded = await store.decisionForKey('acme', 'k-1');
   assert(recorded !== null && recorded.queue === 'billing' && recorded.priority === 'normal', \`the recorded routing must be the server's decision, got \${JSON.stringify(recorded)}\`);
   r = await c.post(PATH, {json: {text: 'Production outage: every login fails', priority: 'low'}, headers: headers('acme', 'k-2')});
@@ -642,13 +644,15 @@ export async function check_text_cap(ctx) {
   assert.equal(r.status, 413, \`a 32 769-byte ticket answered \${r.status}, expected 413: the text is capped at 32 KiB before any work\`);
   r = await c.post(PATH, {json: {text: '\\u00e9'.repeat(16 * 1024 + 1)}, headers: headers('acme', 'k-wide')});
   assert.equal(r.status, 413, \`a ticket of 16 385 characters (32 770 bytes of UTF-8) answered \${r.status}, expected 413: the cap counts bytes, not characters\`);
-  assert.equal(ctx.redis.get('ticket:seq'), null, \`an oversized ticket was given a ticket id (ticket:seq is \${ctx.redis.get('ticket:seq')}): reject it before minting one\`);
   for (const blank of ['', '   ']) {
     r = await c.post(PATH, {json: {text: blank}, headers: headers('acme', \`k-blank-\${blank.length}\`)});
     assert.equal(r.status, 400, \`a ticket with text \${JSON.stringify(blank)} answered \${r.status}, expected 400\`);
   }
   r = await c.post(PATH, {json: {priority: 'low'}, headers: headers('acme', 'k-none')});
   assert.equal(r.status, 400, \`a ticket without text answered \${r.status}, expected 400\`);
+  r = await c.post(PATH, {json: {text: 'a'.repeat(32 * 1024) + '\\n'}, headers: headers('acme', 'k-pad')});
+  assert.equal(r.status, 413, \`a ticket of 32 KiB of text plus a trailing newline (32 769 bytes) answered \${r.status}, expected 413: the cap measures the text as sent\`);
+  assert.equal(ctx.redis.get('ticket:seq'), null, \`a blank or oversized ticket was given a ticket id (ticket:seq is \${ctx.redis.get('ticket:seq')}): reject it before minting one\`);
   r = await c.post(PATH, {json: {text: 'a'.repeat(32 * 1024)}, headers: headers('acme', 'k-max')});
   assert.equal(r.status, 200, \`a ticket of exactly 32 KiB answered \${r.status}, expected 200\`);
 }
@@ -724,9 +728,9 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckServerSideRouting(ctx *harness.Ctx) {
 	c := api(ctx)
-	body := routingOf(ctx, post(c, map[string]string{"text": invoice, "priority": "urgent", "queue": "vip"}, "acme", "k-1"))
+	body := routingOf(ctx, post(c, map[string]string{"text": invoice, "priority": "urgent", "queue": "delivery"}, "acme", "k-1"))
 	ctx.Equal(body["priority"], "normal", "the caller sent priority urgent: priority comes from the text (normal for an invoice), the body's priority is ignored; the routed priority")
-	ctx.Equal(body["queue"], "billing", "the caller sent queue vip: the queue comes from the text (billing), the body's queue is ignored; the routed queue")
+	ctx.Equal(body["queue"], "billing", "the caller sent queue delivery: the queue comes from the text (billing), the body's queue is ignored even when it names a real queue; the routed queue")
 	recorded := store.DecisionForKey(context.Background(), "acme", "k-1")
 	ctx.Assert(recorded != nil && recorded["queue"] == "billing" && recorded["priority"] == "normal", "the recorded routing must be the server's decision, got %v", recorded)
 	body = routingOf(ctx, post(c, map[string]string{"text": "Production outage: every login fails", "priority": "low"}, "acme", "k-2"))
@@ -739,13 +743,15 @@ func CheckTextCap(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 413, "a 32 769-byte ticket must be refused before any work (the cap is 32 KiB)")
 	r = post(c, map[string]string{"text": strings.Repeat("\\u00e9", 16*1024+1)}, "acme", "k-wide")
 	ctx.Equal(r.Status, 413, "a ticket of 16 385 characters (32 770 bytes of UTF-8) must be refused: the cap counts bytes, not characters")
-	ctx.Equal(ticketSeq(ctx), "", "an oversized ticket must be refused before a ticket id is minted; ticket:seq")
 	for _, blank := range []string{"", "   "} {
 		r = post(c, map[string]string{"text": blank}, "acme", "k-blank-"+strings.Repeat("s", len(blank)))
 		ctx.Equal(r.Status, 400, "a ticket with text %q", blank)
 	}
 	r = post(c, map[string]string{"priority": "low"}, "acme", "k-none")
 	ctx.Equal(r.Status, 400, "a ticket without text")
+	r = post(c, map[string]string{"text": strings.Repeat("a", 32*1024) + "\\n"}, "acme", "k-pad")
+	ctx.Equal(r.Status, 413, "a ticket of 32 KiB of text plus a trailing newline (32 769 bytes) must be refused: the cap measures the text as sent")
+	ctx.Equal(ticketSeq(ctx), "", "a blank or oversized ticket must be refused before a ticket id is minted; ticket:seq")
 	r = post(c, map[string]string{"text": strings.Repeat("a", 32*1024)}, "acme", "k-max")
 	ctx.Equal(r.Status, 200, "a ticket of exactly 32 KiB")
 }
@@ -816,9 +822,9 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckServerSideRouting(harness::Ctx& ctx) {
   auto c = api(ctx);
-  auto body = routingOf(ctx, post(c, {{"text", kInvoice}, {"priority", "urgent"}, {"queue", "vip"}}, "acme", "k-1"));
+  auto body = routingOf(ctx, post(c, {{"text", kInvoice}, {"priority", "urgent"}, {"queue", "delivery"}}, "acme", "k-1"));
   ctx.Equal(body.value("priority", ""), "normal", "the caller sent priority urgent: priority comes from the text (normal for an invoice), the body's priority is ignored; the routed priority");
-  ctx.Equal(body.value("queue", ""), "billing", "the caller sent queue vip: the queue comes from the text (billing), the body's queue is ignored; the routed queue");
+  ctx.Equal(body.value("queue", ""), "billing", "the caller sent queue delivery: the queue comes from the text (billing), the body's queue is ignored even when it names a real queue; the routed queue");
   const auto recorded = store::decisionForKey("acme", "k-1");
   ctx.Assert(recorded && recorded->value("queue", "") == "billing" && recorded->value("priority", "") == "normal", "the recorded routing must be the server's decision, got %s", recorded ? recorded->dump() : "none");
   body = routingOf(ctx, post(c, {{"text", "Production outage: every login fails"}, {"priority", "low"}}, "acme", "k-2"));
@@ -831,13 +837,15 @@ void CheckTextCap(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 413, "a 32 769-byte ticket must be refused before any work (the cap is 32 KiB)");
   r = post(c, {{"text", repeat("\\u00e9", 16 * 1024 + 1)}}, "acme", "k-wide");
   ctx.Equal(r.Status, 413, "a ticket of 16 385 characters (32 770 bytes of UTF-8) must be refused: the cap counts bytes, not characters");
-  ctx.Assert(!ctx.Redis.Get("ticket:seq"), "an oversized ticket was given a ticket id (ticket:seq is %s): reject it before minting one", ctx.Redis.Get("ticket:seq").value_or(""));
   for (const std::string blank : {"", "   "}) {
     r = post(c, {{"text", blank}}, "acme", "k-blank-" + std::to_string(blank.size()));
     ctx.Equal(r.Status, 400, "a ticket with text %q", blank);
   }
   r = post(c, {{"priority", "low"}}, "acme", "k-none");
   ctx.Equal(r.Status, 400, "a ticket without text");
+  r = post(c, {{"text", repeat("a", 32 * 1024) + "\\n"}}, "acme", "k-pad");
+  ctx.Equal(r.Status, 413, "a ticket of 32 KiB of text plus a trailing newline (32 769 bytes) must be refused: the cap measures the text as sent");
+  ctx.Assert(!ctx.Redis.Get("ticket:seq"), "a blank or oversized ticket was given a ticket id (ticket:seq is %s): reject it before minting one", ctx.Redis.Get("ticket:seq").value_or(""));
   r = post(c, {{"text", repeat("a", 32 * 1024)}}, "acme", "k-max");
   ctx.Equal(r.Status, 200, "a ticket of exactly 32 KiB");
 }

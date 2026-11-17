@@ -88,7 +88,7 @@ Requirements:
       id: 'quality-fields',
       title: 'Carries the version, the downgrade flag and the digest',
       detail:
-        'The event is inference_id, tenant, task, model_version, downgraded, confidence, latency_ms and content_hash, so the pipeline can count per version and set downgraded answers apart. The starter sends the label and none of the three.',
+        "The event is exactly inference_id, tenant, task, model_version, downgraded, confidence, latency_ms and content_hash, nothing more, so the pipeline can count per version and set downgraded answers apart; a downgraded inference carries the small model's version and downgraded true. The starter sends the label and none of the three.",
       match: {
         python: {all: [/["']model_version["']/, /["']downgraded["']/, /["']content_hash["']/]},
         typescript: {all: [/model_version:/, /downgraded:/, /content_hash:/]},
@@ -597,6 +597,12 @@ def check_quality_fields(ctx):
     assert len(events) == 1, f"one inference produced {len(events)} records"
     for key, value in EXPECTED.items():
         assert events[0].get(key) == value, f"the event must carry {key}={value!r}, got {events[0]}"
+    extra = sorted(set(events[0]) - set(EXPECTED))
+    assert extra == [], f"the event is exactly {sorted(EXPECTED)}; it also carries {extra}: {events[0]}"
+    m.publish(_record("inf-2", model_version=SMALL, downgraded=True))
+    _settle(m)
+    events = _events(ctx)
+    assert len(events) == 2 and events[1] == dict(EXPECTED, inference_id="inf-2", model_version=SMALL, downgraded=True), f"a downgraded inference carries model_version {SMALL} and downgraded true, got {events[1:]}"
 
 
 def check_idempotent_producer(ctx):
@@ -681,6 +687,13 @@ export async function check_quality_fields(ctx) {
   const all = events(ctx);
   assert.equal(all.length, 1, \`one inference produced \${all.length} records\`);
   for (const [key, value] of Object.entries(EXPECTED)) assert.deepEqual(all[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(all[0])}\`);
+  const extra = Object.keys(all[0]).filter(key => !(key in EXPECTED)).sort();
+  assert.deepEqual(extra, [], \`the event is exactly \${Object.keys(EXPECTED).sort().join(', ')}; it also carries \${extra.join(', ')}: \${JSON.stringify(all[0])}\`);
+  await m.publish(record('inf-2', 't1', SMALL, true));
+  await settle();
+  const both = events(ctx);
+  assert(both.length === 2, \`two inferences produced \${both.length} records\`);
+  assert.deepEqual(both[1], {...EXPECTED, inference_id: 'inf-2', model_version: SMALL, downgraded: true}, \`a downgraded inference carries model_version \${SMALL} and downgraded true, got \${JSON.stringify(both[1])}\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -787,6 +800,13 @@ func CheckQualityFields(ctx *harness.Ctx) {
 	var e map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &e), "the event is JSON: %s", values[0])
 	ctx.Equal(e, map[string]any{"inference_id": "inf-1", "tenant": "t1", "task": "classify", "model_version": eventsLarge, "downgraded": false, "confidence": 0.92, "latency_ms": float64(840), "content_hash": "9f2c41aa"}, "the event must be the ids, model_version, downgraded, confidence, latency_ms and content_hash")
+	eventsPublish(ctx, eventsRecord("inf-2", "t1", eventsSmall, true))
+	ctx.Settle()
+	values = ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 2, "two inferences; records")
+	var d map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[1]), &d), "the event is JSON: %s", values[1])
+	ctx.Equal(d, map[string]any{"inference_id": "inf-2", "tenant": "t1", "task": "classify", "model_version": eventsSmall, "downgraded": true, "confidence": 0.92, "latency_ms": float64(840), "content_hash": "9f2c41aa"}, "a downgraded inference carries model_version %s and downgraded true", eventsSmall)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
@@ -887,6 +907,13 @@ void CheckQualityFields(harness::Ctx& ctx) {
   ctx.Equal(nlohmann::json::parse(values[0], nullptr, false),
             nlohmann::json({{"inference_id", "inf-1"}, {"tenant", "t1"}, {"task", "classify"}, {"model_version", kLarge}, {"downgraded", false}, {"confidence", 0.92}, {"latency_ms", 840}, {"content_hash", "9f2c41aa"}}),
             "the event must be the ids, model_version, downgraded, confidence, latency_ms and content_hash");
+  publish(eventsRecord("inf-2", "t1", kSmall, true));
+  settle(ctx);
+  const auto both = ctx.Kafka.Values(kTopic);
+  ctx.Equal(both.size(), 2, "two inferences; records");
+  ctx.Equal(nlohmann::json::parse(both.back(), nullptr, false),
+            nlohmann::json({{"inference_id", "inf-2"}, {"tenant", "t1"}, {"task", "classify"}, {"model_version", kSmall}, {"downgraded", true}, {"confidence", 0.92}, {"latency_ms", 840}, {"content_hash", "9f2c41aa"}}),
+            "a downgraded inference carries model_version %s and downgraded true", kSmall);
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {

@@ -70,7 +70,7 @@ Requirements:
       id: 'lease-expiry',
       title: "A crashed holder's slot comes back after its lease",
       detail:
-        'Each ticket is scored with its lease expiry (now + LEASE_S) and admission drops expired tickets first, so ten workers that crashed holding slots stop blocking the tenant once their leases end. The starter scores the admission time and never sweeps.',
+        "Each ticket is scored with its lease expiry (now + LEASE_S) and admission drops expired tickets first, a lease ending this very second included, so workers that crashed holding slots stop blocking the tenant once their leases end; the same script sets the pool key's expiry to LEASE_S on every admission. The starter scores the admission time and never sweeps.",
       match: {
         python: {all: [/ZREMRANGEBYSCORE/, /LEASE_S/]},
         typescript: {all: [/ZREMRANGEBYSCORE/, /LEASE_S/]},
@@ -560,15 +560,25 @@ def check_atomic_admit(ctx):
 
 def check_lease_expiry(ctx):
     m = ctx.load("state")
-    tickets = [m.admit("t1").get("ticket") for _ in range(10)]
-    assert all(tickets), f"ten admissions into an empty 10-slot pool must all get a ticket: {tickets}"
+    ttl = ctx.redis_after(POOL, lambda: ctx.redis.ttl(POOL))
+    tickets = [m.admit("t1").get("ticket") for _ in range(9)]
+    assert all(tickets), f"nine admissions into an empty 10-slot pool must all get a ticket: {tickets}"
+    first_ttl = ttl.result if ttl.fired else None
+    ctx.clock.advance(100)
+    assert m.admit("t1").get("ticket"), "the tenth admission into a 10-slot pool must get a ticket"
+    refreshed = ctx.redis.ttl(POOL)
     assert m.admit("t1").get("ticket") is None, "the eleventh admission must be refused"
-    ctx.clock.advance(301)  # the ten holders crashed without releasing
+    ctx.clock.advance(199)  # the first nine holders crashed without releasing; their leases end in one second
+    early = m.admit("t1")
+    assert early.get("ticket") is None, f"one second before the nine leases end the pool is still full, yet admit answered {early}"
+    ctx.clock.advance(1)  # exactly LEASE_S after the nine were admitted: their leases have ended
     again = m.admit("t1")
-    assert again.get("ticket"), f"five minutes after ten holders crashed the tenant is still locked out ({again}): a lease must end on its own"
-    assert _held(ctx) == 1, f"the expired leases must be gone: the pool holds {_held(ctx)} tickets"
+    assert again.get("ticket"), f"five minutes after nine holders crashed the tenant is still locked out ({again}): a lease ends on its own, at its expiry"
+    assert _held(ctx) == 2, f"the nine expired leases must be gone and the live one kept: the pool holds {_held(ctx)} tickets"
     score = ctx.redis.zscore(POOL, again["ticket"])
     assert score is not None and abs(score - (time.time() + 300)) <= 1, f"a ticket is scored with its lease expiry (now + LEASE_S), got {score}"
+    assert first_ttl is not None and 299 <= first_ttl <= 300, f"right after the admitting script the pool's key has TTL {first_ttl}: the script itself sets the key's expiry to LEASE_S"
+    assert 299 <= refreshed <= 300, f"every admission refreshes the key's expiry to LEASE_S, yet 100 s after the first the TTL was {refreshed}: the key would vanish under a live lease"
 
 
 def check_owner_release(ctx):
@@ -584,13 +594,16 @@ def check_owner_release(ctx):
 
 def check_retry_after(ctx):
     m = ctx.load("state")
-    for _ in range(10):
+    for _ in range(5):
         assert m.admit("t1").get("ticket")
-    ctx.clock.advance(100)
+    ctx.clock.advance(50)
+    for _ in range(5):
+        assert m.admit("t1").get("ticket")
+    ctx.clock.advance(50)
     refused = m.admit("t1")
     assert refused.get("ticket") is None, f"a full pool must refuse: {refused}"
     wait = refused.get("retry_after")
-    assert isinstance(wait, int) and 199 <= wait <= 201, f"the earliest lease ends in 200 s, retry_after says {wait!r}: a client told to come back in 1 s polls 200 times"
+    assert isinstance(wait, int) and 199 <= wait <= 201, f"the earliest lease ends in 200 s (the latest in 250 s), retry_after says {wait!r}: a client told to come back in 1 s polls 200 times"
 `,
     typescript: `const POOL = 'vision:gpu:t1';
 const nowS = ctx => Math.floor(ctx.clock.now() / 1000);
@@ -617,16 +630,26 @@ export async function check_atomic_admit(ctx) {
 
 export async function check_lease_expiry(ctx) {
   const m = ctx.load('state');
+  const ttl = ctx.redisAfter(POOL, () => Number(ctx.redis.ttl(POOL)));
   const tickets: (string | null)[] = [];
-  for (let i = 0; i < 10; i++) tickets.push((await m.admit('t1')).ticket);
-  assert(tickets.every(Boolean), \`ten admissions into an empty 10-slot pool must all get a ticket: \${JSON.stringify(tickets)}\`);
+  for (let i = 0; i < 9; i++) tickets.push((await m.admit('t1')).ticket);
+  assert(tickets.every(Boolean), \`nine admissions into an empty 10-slot pool must all get a ticket: \${JSON.stringify(tickets)}\`);
+  const firstTtl = ttl.fired ? ttl.result : null;
+  ctx.clock.advance(100);
+  assert((await m.admit('t1')).ticket, 'the tenth admission into a 10-slot pool must get a ticket');
+  const refreshed = Number(ctx.redis.ttl(POOL));
   assert.equal((await m.admit('t1')).ticket, null, 'the eleventh admission must be refused');
-  ctx.clock.advance(301); // the ten holders crashed without releasing
+  ctx.clock.advance(199); // the first nine holders crashed without releasing; their leases end in one second
+  const early = await m.admit('t1');
+  assert.equal(early.ticket, null, \`one second before the nine leases end the pool is still full, yet admit answered \${JSON.stringify(early)}\`);
+  ctx.clock.advance(1); // exactly LEASE_S after the nine were admitted: their leases have ended
   const again = await m.admit('t1');
-  assert(again.ticket, \`five minutes after ten holders crashed the tenant is still locked out (\${JSON.stringify(again)}): a lease must end on its own\`);
-  assert.equal(held(ctx), 1, \`the expired leases must be gone: the pool holds \${held(ctx)} tickets\`);
+  assert(again.ticket, \`five minutes after nine holders crashed the tenant is still locked out (\${JSON.stringify(again)}): a lease ends on its own, at its expiry\`);
+  assert.equal(held(ctx), 2, \`the nine expired leases must be gone and the live one kept: the pool holds \${held(ctx)} tickets\`);
   const score = Number(ctx.redis.zscore(POOL, again.ticket));
   assert(Math.abs(score - (nowS(ctx) + 300)) <= 1, \`a ticket is scored with its lease expiry (now + LEASE_S), got \${score}\`);
+  assert(firstTtl !== null && firstTtl >= 299 && firstTtl <= 300, \`right after the admitting script the pool's key has TTL \${firstTtl}: the script itself sets the key's expiry to LEASE_S\`);
+  assert(refreshed >= 299 && refreshed <= 300, \`every admission refreshes the key's expiry to LEASE_S, yet 100 s after the first the TTL was \${refreshed}: the key would vanish under a live lease\`);
 }
 
 export async function check_owner_release(ctx) {
@@ -642,12 +665,14 @@ export async function check_owner_release(ctx) {
 
 export async function check_retry_after(ctx) {
   const m = ctx.load('state');
-  for (let i = 0; i < 10; i++) assert((await m.admit('t1')).ticket);
-  ctx.clock.advance(100);
+  for (let i = 0; i < 5; i++) assert((await m.admit('t1')).ticket);
+  ctx.clock.advance(50);
+  for (let i = 0; i < 5; i++) assert((await m.admit('t1')).ticket);
+  ctx.clock.advance(50);
   const refused = await m.admit('t1');
   assert.equal(refused.ticket, null, \`a full pool must refuse: \${JSON.stringify(refused)}\`);
   const wait = refused.retryAfter;
-  assert(Number.isInteger(wait) && wait >= 199 && wait <= 201, \`the earliest lease ends in 200 s, retryAfter says \${wait}: a client told to come back in 1 s polls 200 times\`);
+  assert(Number.isInteger(wait) && wait >= 199 && wait <= 201, \`the earliest lease ends in 200 s (the latest in 250 s), retryAfter says \${wait}: a client told to come back in 1 s polls 200 times\`);
 }
 `,
     go: `package main
@@ -711,16 +736,29 @@ func CheckAtomicAdmit(ctx *harness.Ctx) {
 }
 
 func CheckLeaseExpiry(ctx *harness.Ctx) {
-	for i := 0; i < 10; i++ {
-		ctx.Assert(stateAdmit(ctx).Ticket != "", "ten admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i+1)
+	firstTTL := int64(-3)
+	ctx.Redis.After(statePool, func() any {
+		firstTTL = ctx.Redis.TTL(statePool)
+		return nil
+	})
+	for i := 0; i < 9; i++ {
+		ctx.Assert(stateAdmit(ctx).Ticket != "", "nine admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i+1)
 	}
+	ctx.Clock.Advance(100)
+	ctx.Assert(stateAdmit(ctx).Ticket != "", "the tenth admission into a 10-slot pool must get a ticket")
+	refreshed := ctx.Redis.TTL(statePool)
 	ctx.Equal(stateAdmit(ctx).Ticket, "", "the eleventh admission must be refused; its ticket")
-	ctx.Clock.Advance(301) // the ten holders crashed without releasing
+	ctx.Clock.Advance(199) // the first nine holders crashed without releasing; their leases end in one second
+	early := stateAdmit(ctx)
+	ctx.Assert(early.Ticket == "", "one second before the nine leases end the pool is still full, yet admit answered %+v", early)
+	ctx.Clock.Advance(1) // exactly LeaseSeconds after the nine were admitted: their leases have ended
 	again := stateAdmit(ctx)
-	ctx.Assert(again.Ticket != "", "five minutes after ten holders crashed the tenant is still locked out (%+v): a lease must end on its own", again)
-	ctx.Equal(ctx.Redis.ZCard(statePool), 1, "the expired leases must be gone; tickets held")
+	ctx.Assert(again.Ticket != "", "five minutes after nine holders crashed the tenant is still locked out (%+v): a lease ends on its own, at its expiry", again)
+	ctx.Equal(ctx.Redis.ZCard(statePool), 2, "the nine expired leases must be gone and the live one kept; tickets held")
 	score, ok := ctx.Redis.ZScore(statePool, again.Ticket)
 	ctx.Assert(ok && math.Abs(score-float64(ctx.Clock.Now()/1000+300)) <= 1, "a ticket is scored with its lease expiry (now + LeaseSeconds), got %v", score)
+	ctx.Assert(firstTTL >= 299 && firstTTL <= 300, "right after the admitting script the pool's key has TTL %d: the script itself sets the key's expiry to LeaseSeconds", firstTTL)
+	ctx.Assert(refreshed >= 299 && refreshed <= 300, "every admission refreshes the key's expiry to LeaseSeconds, yet 100 s after the first the TTL was %d: the key would vanish under a live lease", refreshed)
 }
 
 func CheckOwnerRelease(ctx *harness.Ctx) {
@@ -736,12 +774,15 @@ func CheckOwnerRelease(ctx *harness.Ctx) {
 
 func CheckRetryAfter(ctx *harness.Ctx) {
 	for i := 0; i < 10; i++ {
+		if i == 5 {
+			ctx.Clock.Advance(50)
+		}
 		ctx.Assert(stateAdmit(ctx).Ticket != "", "admission %d into an empty pool", i+1)
 	}
-	ctx.Clock.Advance(100)
+	ctx.Clock.Advance(50)
 	refused := stateAdmit(ctx)
 	ctx.Equal(refused.Ticket, "", "a full pool must refuse; the ticket")
-	ctx.Assert(refused.RetryAfter >= 199 && refused.RetryAfter <= 201, "the earliest lease ends in 200 s, RetryAfter says %d: a client told to come back in 1 s polls 200 times", refused.RetryAfter)
+	ctx.Assert(refused.RetryAfter >= 199 && refused.RetryAfter <= 201, "the earliest lease ends in 200 s (the latest in 250 s), RetryAfter says %d: a client told to come back in 1 s polls 200 times", refused.RetryAfter)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -786,14 +827,24 @@ void CheckAtomicAdmit(harness::Ctx& ctx) {
 }
 
 void CheckLeaseExpiry(harness::Ctx& ctx) {
-  for (int i = 0; i < 10; i++) ctx.Assert(!admit("t1").ticket.empty(), "ten admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i + 1);
+  long long firstTtl = -3;
+  ctx.Redis.After(kPool, [&] { firstTtl = ctx.Redis.TTL(kPool); });
+  for (int i = 0; i < 9; i++) ctx.Assert(!admit("t1").ticket.empty(), "nine admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i + 1);
+  ctx.Clock.Advance(100);
+  ctx.Assert(!admit("t1").ticket.empty(), "the tenth admission into a 10-slot pool must get a ticket");
+  const long long refreshed = ctx.Redis.TTL(kPool);
   ctx.Equal(admit("t1").ticket, "", "the eleventh admission must be refused; its ticket");
-  ctx.Clock.Advance(301);  // the ten holders crashed without releasing
+  ctx.Clock.Advance(199);  // the first nine holders crashed without releasing; their leases end in one second
+  const Admission early = admit("t1");
+  ctx.Assert(early.ticket.empty(), "one second before the nine leases end the pool is still full, yet admit handed out ticket %s", early.ticket);
+  ctx.Clock.Advance(1);  // exactly kLeaseSeconds after the nine were admitted: their leases have ended
   const Admission again = admit("t1");
-  ctx.Assert(!again.ticket.empty(), "five minutes after ten holders crashed the tenant is still locked out (retry_after %d): a lease must end on its own", again.retry_after);
-  ctx.Equal(ctx.Redis.ZCard(kPool), 1, "the expired leases must be gone; tickets held");
+  ctx.Assert(!again.ticket.empty(), "five minutes after nine holders crashed the tenant is still locked out (retry_after %d): a lease ends on its own, at its expiry", again.retry_after);
+  ctx.Equal(ctx.Redis.ZCard(kPool), 2, "the nine expired leases must be gone and the live one kept; tickets held");
   const auto score = ctx.Redis.ZScore(kPool, again.ticket);
   ctx.Assert(score && std::abs(*score - static_cast<double>(ctx.Clock.Now() / 1000 + 300)) <= 1, "a ticket is scored with its lease expiry (now + kLeaseSeconds), got %v", score.value_or(-1));
+  ctx.Assert(firstTtl >= 299 && firstTtl <= 300, "right after the admitting script the pool's key has TTL %d: the script itself sets the key's expiry to kLeaseSeconds", firstTtl);
+  ctx.Assert(refreshed >= 299 && refreshed <= 300, "every admission refreshes the key's expiry to kLeaseSeconds, yet 100 s after the first the TTL was %d: the key would vanish under a live lease", refreshed);
 }
 
 void CheckOwnerRelease(harness::Ctx& ctx) {
@@ -810,11 +861,14 @@ void CheckOwnerRelease(harness::Ctx& ctx) {
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {
-  for (int i = 0; i < 10; i++) ctx.Assert(!admit("t1").ticket.empty(), "admission %d into an empty pool", i + 1);
-  ctx.Clock.Advance(100);
+  for (int i = 0; i < 10; i++) {
+    if (i == 5) ctx.Clock.Advance(50);
+    ctx.Assert(!admit("t1").ticket.empty(), "admission %d into an empty pool", i + 1);
+  }
+  ctx.Clock.Advance(50);
   const Admission refused = admit("t1");
   ctx.Equal(refused.ticket, "", "a full pool must refuse; the ticket");
-  ctx.Assert(refused.retry_after >= 199 && refused.retry_after <= 201, "the earliest lease ends in 200 s, retry_after says %d: a client told to come back in 1 s polls 200 times", refused.retry_after);
+  ctx.Assert(refused.retry_after >= 199 && refused.retry_after <= 201, "the earliest lease ends in 200 s (the latest in 250 s), retry_after says %d: a client told to come back in 1 s polls 200 times", refused.retry_after);
 }
 `,
   },

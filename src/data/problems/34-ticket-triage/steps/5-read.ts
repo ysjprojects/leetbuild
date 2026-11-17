@@ -26,8 +26,8 @@ reads as a healthy classifier.
 - Depth and waits count **open** records only (\`status\`).
 - \`median_wait_s\` is the median of the open records' waits in seconds (the mean of the middle two
   for an even count), 0 for an empty queue.
-- \`fallback_count\` counts every record with a non-empty \`fallback_reason\`; \`fallback_share\` is
-  it over the depth, rounded to three decimals.`,
+- \`fallback_count\` counts every open record with a non-empty \`fallback_reason\`; \`fallback_share\`
+  is it over the depth, rounded to three decimals.`,
   sequence: {
     participants: ['Queue manager', 'Queue summary', 'routing store'],
     messages: [
@@ -77,7 +77,7 @@ reads as a healthy classifier.
       id: 'tenant-scope',
       title: "Answers 404 for another tenant's queue",
       detail:
-        "The queue's tenant is compared with the caller's, and a queue the caller does not own is 404 like an unknown one; the records read are the caller's.",
+        "The queue's tenant is compared with the caller's, and a queue the caller does not own is 404 with the same answer as an unknown one; the records read are the caller's.",
       match: {
         python: {all: [/\[\s*["']tenant["']\s*\]\s*[!=]=\s*tenant/, /\b404\b/]},
         typescript: {all: [/\.tenant\s*[!=]==?\s*tenant/, /\b404\b/]},
@@ -90,7 +90,7 @@ reads as a healthy classifier.
       id: 'open-depth',
       title: 'Counts open tickets only',
       detail:
-        'Depth and waits are computed over the records whose `status` is `open`; a closed ticket has left the queue.',
+        'Depth, waits and fallbacks are computed over the records whose `status` is `open`; a closed ticket has left the queue.',
       match: {
         python: {all: [/["']open["']/]},
         typescript: {all: [/["']open["']/]},
@@ -103,7 +103,7 @@ reads as a healthy classifier.
       id: 'median-wait',
       title: 'Reports the median wait, not the mean',
       detail:
-        '`median_wait_s` comes from the sorted waits (the middle one, or the mean of the middle two), so one stuck ticket does not move it.',
+        '`median_wait_s` comes from the sorted waits (the middle one, or the exact mean of the middle two), so one stuck ticket does not move it.',
       match: {
         python: {all: [/sorted\(|\.sort\(/], none: [/sum\(\s*waits\s*\)/]},
         typescript: {all: [/\.sort\(/], none: [/\.reduce\(/]},
@@ -116,7 +116,7 @@ reads as a healthy classifier.
       id: 'fallback-share',
       title: 'Counts every fallback reason',
       detail:
-        '`fallback_count` and `fallback_share` count every record the ruleset routed (any non-empty `fallback_reason`), not one reason picked by name.',
+        '`fallback_count` and `fallback_share` count every open record the ruleset routed (any non-empty `fallback_reason`), not one reason picked by name, and the share is rounded to three decimals.',
       match: {
         python: {all: [/fallback_reason/], none: [/classifier_timeout/]},
         typescript: {all: [/fallback_reason/], none: [/classifier_timeout/]},
@@ -596,8 +596,10 @@ async def check_tenant_scope(ctx):
     _seed("globex", "billing", "t-9", 30)
     r = await _summary(ctx, acme, tenant="globex")
     assert r.status_code == 404, f"globex asked for acme's queue {acme} and got {r.status_code} {r.text}: a queue the caller does not own is 404, the same as an unknown id"
+    foreign = r.text.replace(acme, "{id}")
     r = await _summary(ctx, "q-404")
     assert r.status_code == 404, f"an unknown queue id answered {r.status_code}, expected 404"
+    assert r.text.replace("q-404", "{id}") == foreign, f"another tenant's queue answered {foreign!r} and an unknown id {r.text!r}: the two answers must not differ, or a caller learns which ids exist"
     r = await _summary(ctx, globex, tenant="globex")
     assert r.status_code == 200 and r.json().get("depth") == 1, f"globex's own billing queue holds one ticket, got {r.status_code} {r.text}"
 
@@ -617,13 +619,13 @@ async def check_open_depth(ctx):
 
 async def check_median_wait(ctx):
     queue_id = store.create_queue("acme", "billing")
-    for i, wait in enumerate((30, 60, 90, 7200)):
+    for i, wait in enumerate((30, 61, 90, 7200)):
         _seed("acme", "billing", f"t-{i}", wait)
     body = (await _summary(ctx, queue_id)).json()
-    assert abs(body.get("median_wait_s", -1) - 75) <= 1, f"four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says {body.get('median_wait_s')}. A mean is dragged by the one stuck ticket"
+    assert abs(body.get("median_wait_s", -1) - 75.5) < 0.25, f"four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says {body.get('median_wait_s')}. A mean is dragged by the one stuck ticket"
     _seed("acme", "billing", "t-4", 120)
     body = (await _summary(ctx, queue_id)).json()
-    assert abs(body.get("median_wait_s", -1) - 90) <= 1, f"five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says {body.get('median_wait_s')}"
+    assert abs(body.get("median_wait_s", -1) - 90) <= 1, f"five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says {body.get('median_wait_s')}"
     empty = store.create_queue("acme", "account")
     body = (await _summary(ctx, empty)).json()
     assert body.get("depth") == 0 and body.get("median_wait_s") == 0, f"an empty queue has depth 0 and median_wait_s 0, the summary says {body}"
@@ -631,11 +633,17 @@ async def check_median_wait(ctx):
 
 async def check_fallback_share(ctx):
     queue_id = store.create_queue("acme", "billing")
+    _seed("acme", "billing", "t-closed", 60, "breaker_open", closed=True)
     for i, reason in enumerate(("", "classifier_timeout", "classifier_unavailable", "breaker_open")):
         _seed("acme", "billing", f"t-{i}", 60, reason)
     body = (await _summary(ctx, queue_id)).json()
-    assert body.get("fallback_count") == 3, f"three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker): fallback_count must be 3, the summary says {body.get('fallback_count')}"
+    assert body.get("fallback_count") == 3, f"three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue: fallback_count must be 3, the summary says {body.get('fallback_count')}"
     assert abs(body.get("fallback_share", -1) - 0.75) < 0.001, f"fallback_share must be 3 of 4 = 0.75, the summary says {body.get('fallback_share')}"
+    account = store.create_queue("acme", "account")
+    for i, reason in enumerate(("", "classifier_refused", "classifier_timeout")):
+        _seed("acme", "account", f"t-a{i}", 60, reason)
+    body = (await _summary(ctx, account)).json()
+    assert body.get("fallback_count") == 2 and abs(body.get("fallback_share", -1) - 0.667) < 1e-6, f"two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says {body.get('fallback_count')} and {body.get('fallback_share')}"
 `,
     typescript: `function api(ctx) {
   return {c: ctx.client(ctx.load('read').app), store: ctx.load('/support/triage/store.ts')};
@@ -672,8 +680,10 @@ export async function check_tenant_scope(ctx) {
   await seed(ctx, store, 'globex', 'billing', 't-9', 30);
   let r = await summary(c, acme, 'globex');
   assert.equal(r.status, 404, \`globex asked for acme's queue \${acme} and got \${r.status} \${r.text}: a queue the caller does not own is 404, the same as an unknown id\`);
+  const foreign = r.text.replaceAll(acme, '{id}');
   r = await summary(c, 'q-404');
   assert.equal(r.status, 404, \`an unknown queue id answered \${r.status}, expected 404\`);
+  assert.equal(r.text.replaceAll('q-404', '{id}'), foreign, \`another tenant's queue answered \${JSON.stringify(foreign)} and an unknown id \${JSON.stringify(r.text)}: the two answers must not differ, or a caller learns which ids exist\`);
   r = await summary(c, globex, 'globex');
   assert(r.status === 200 && r.json().depth === 1, \`globex's own billing queue holds one ticket, got \${r.status} \${r.text}\`);
 }
@@ -693,12 +703,12 @@ export async function check_open_depth(ctx) {
 export async function check_median_wait(ctx) {
   const {c, store} = api(ctx);
   const queueId = await store.createQueue('acme', 'billing');
-  for (const [i, wait] of [30, 60, 90, 7200].entries()) await seed(ctx, store, 'acme', 'billing', \`t-\${i}\`, wait);
+  for (const [i, wait] of [30, 61, 90, 7200].entries()) await seed(ctx, store, 'acme', 'billing', \`t-\${i}\`, wait);
   let body = (await summary(c, queueId)).json();
-  assert(Math.abs(body.median_wait_s - 75) <= 1, \`four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says \${body.median_wait_s}. A mean is dragged by the one stuck ticket\`);
+  assert(Math.abs(body.median_wait_s - 75.5) < 0.25, \`four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says \${body.median_wait_s}. A mean is dragged by the one stuck ticket\`);
   await seed(ctx, store, 'acme', 'billing', 't-4', 120);
   body = (await summary(c, queueId)).json();
-  assert(Math.abs(body.median_wait_s - 90) <= 1, \`five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says \${body.median_wait_s}\`);
+  assert(Math.abs(body.median_wait_s - 90) <= 1, \`five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says \${body.median_wait_s}\`);
   const empty = await store.createQueue('acme', 'account');
   body = (await summary(c, empty)).json();
   assert(body.depth === 0 && body.median_wait_s === 0, \`an empty queue has depth 0 and median_wait_s 0, the summary says \${JSON.stringify(body)}\`);
@@ -707,10 +717,15 @@ export async function check_median_wait(ctx) {
 export async function check_fallback_share(ctx) {
   const {c, store} = api(ctx);
   const queueId = await store.createQueue('acme', 'billing');
+  await seed(ctx, store, 'acme', 'billing', 't-closed', 60, 'breaker_open', true);
   for (const [i, reason] of ['', 'classifier_timeout', 'classifier_unavailable', 'breaker_open'].entries()) await seed(ctx, store, 'acme', 'billing', \`t-\${i}\`, 60, reason);
   const body = (await summary(c, queueId)).json();
-  assert.equal(body.fallback_count, 3, \`three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker): fallback_count must be 3, the summary says \${body.fallback_count}\`);
+  assert.equal(body.fallback_count, 3, \`three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue: fallback_count must be 3, the summary says \${body.fallback_count}\`);
   assert(Math.abs(body.fallback_share - 0.75) < 0.001, \`fallback_share must be 3 of 4 = 0.75, the summary says \${body.fallback_share}\`);
+  const account = await store.createQueue('acme', 'account');
+  for (const [i, reason] of ['', 'classifier_refused', 'classifier_timeout'].entries()) await seed(ctx, store, 'acme', 'account', \`t-a\${i}\`, 60, reason);
+  const other = (await summary(c, account)).json();
+  assert(other.fallback_count === 2 && Math.abs(other.fallback_share - 0.667) < 1e-6, \`two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says \${other.fallback_count} and \${other.fallback_share}\`);
 }
 `,
     go: `package main
@@ -719,6 +734,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"triage/store"
 
@@ -784,8 +800,10 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	seed(ctx, "globex", "billing", "t-9", 30, "", false)
 	r, _ := summaryOf(ctx, acme, "globex")
 	ctx.Assert(r.Status == 404, "globex asked for acme's queue %s and got %d %s: a queue the caller does not own is 404, the same as an unknown id", acme, r.Status, r.Text())
+	foreign := strings.ReplaceAll(r.Text(), acme, "{id}")
 	r, _ = summaryOf(ctx, "q-404", "acme")
 	ctx.Equal(r.Status, 404, "an unknown queue id")
+	ctx.Equal(strings.ReplaceAll(r.Text(), "q-404", "{id}"), foreign, "another tenant's queue and an unknown id must answer alike, or a caller learns which ids exist; the unknown id's answer")
 	r, body := summaryOf(ctx, globex, "globex")
 	ctx.Assert(r.Status == 200 && number(body, "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text())
 }
@@ -805,14 +823,15 @@ func CheckOpenDepth(ctx *harness.Ctx) {
 
 func CheckMedianWait(ctx *harness.Ctx) {
 	queueID := store.CreateQueue(readBg, "acme", "billing")
-	for i, wait := range []int64{30, 60, 90, 7200} {
+	for i, wait := range []int64{30, 61, 90, 7200} {
 		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
 	}
 	_, body := summaryOf(ctx, queueID, "acme")
-	ctx.Assert(near(number(body, "median_wait_s"), 75), "four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says %v. A mean is dragged by the one stuck ticket", body["median_wait_s"])
+	median := number(body, "median_wait_s")
+	ctx.Assert(median > 75.25 && median < 75.75, "four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says %v. A mean is dragged by the one stuck ticket", body["median_wait_s"])
 	seed(ctx, "acme", "billing", "t-4", 120, "", false)
 	_, body = summaryOf(ctx, queueID, "acme")
-	ctx.Assert(near(number(body, "median_wait_s"), 90), "five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says %v", body["median_wait_s"])
+	ctx.Assert(near(number(body, "median_wait_s"), 90), "five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says %v", body["median_wait_s"])
 	empty := store.CreateQueue(readBg, "acme", "account")
 	_, body = summaryOf(ctx, empty, "acme")
 	ctx.Assert(number(body, "depth") == 0 && number(body, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %v", body)
@@ -820,13 +839,21 @@ func CheckMedianWait(ctx *harness.Ctx) {
 
 func CheckFallbackShare(ctx *harness.Ctx) {
 	queueID := store.CreateQueue(readBg, "acme", "billing")
+	seed(ctx, "acme", "billing", "t-closed", 60, "breaker_open", true)
 	for i, reason := range []string{"", "classifier_timeout", "classifier_unavailable", "breaker_open"} {
 		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), 60, reason, false)
 	}
 	_, body := summaryOf(ctx, queueID, "acme")
-	ctx.Equal(number(body, "fallback_count"), 3.0, "three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker); fallback_count")
+	ctx.Equal(number(body, "fallback_count"), 3.0, "three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue; fallback_count")
 	share := number(body, "fallback_share")
 	ctx.Assert(share > 0.749 && share < 0.751, "fallback_share must be 3 of 4 = 0.75, the summary says %v", body["fallback_share"])
+	account := store.CreateQueue(readBg, "acme", "account")
+	for i, reason := range []string{"", "classifier_refused", "classifier_timeout"} {
+		seed(ctx, "acme", "account", fmt.Sprintf("t-a%d", i), 60, reason, false)
+	}
+	_, other := summaryOf(ctx, account, "acme")
+	share = number(other, "fallback_share")
+	ctx.Assert(number(other, "fallback_count") == 2 && share > 0.666999 && share < 0.667001, "two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says %v and %v", other["fallback_count"], other["fallback_share"])
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -867,6 +894,12 @@ double number(const nlohmann::json& b, const std::string& field) {
   return b.is_object() && b.contains(field) && b[field].is_number() ? b[field].get<double>() : -1;
 }
 
+// The answer's text with the queue id it names replaced, so two answers can be compared.
+std::string withoutId(std::string text, const std::string& id) {
+  for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at)) text.replace(at, id.size(), "{id}");
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -889,8 +922,10 @@ void CheckTenantScope(harness::Ctx& ctx) {
   seed(ctx, "globex", "billing", "t-9", 30);
   auto r = summary(ctx, acme, "globex");
   ctx.Assert(r.Status == 404, "globex asked for acme's queue %s and got %d %s: a queue the caller does not own is 404, the same as an unknown id", acme, r.Status, r.Text());
+  const std::string foreign = withoutId(r.Text(), acme);
   r = summary(ctx, "q-404");
   ctx.Equal(r.Status, 404, "an unknown queue id");
+  ctx.Equal(withoutId(r.Text(), "q-404"), foreign, "another tenant's queue and an unknown id must answer alike, or a caller learns which ids exist; the unknown id's answer");
   r = summary(ctx, globex, "globex");
   ctx.Assert(r.Status == 200 && number(body(r), "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text());
 }
@@ -909,13 +944,13 @@ void CheckOpenDepth(harness::Ctx& ctx) {
 
 void CheckMedianWait(harness::Ctx& ctx) {
   const std::string queue_id = store::createQueue("acme", "billing");
-  const std::vector<long long> waits = {30, 60, 90, 7200};
+  const std::vector<long long> waits = {30, 61, 90, 7200};
   for (size_t i = 0; i < waits.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
   auto b = body(summary(ctx, queue_id));
-  ctx.Assert(std::fabs(number(b, "median_wait_s") - 75) <= 1, "four tickets waited 30, 60, 90 and 7200 s: the median is 75, the summary says %v. A mean is dragged by the one stuck ticket", number(b, "median_wait_s"));
+  ctx.Assert(std::fabs(number(b, "median_wait_s") - 75.5) < 0.25, "four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says %v. A mean is dragged by the one stuck ticket", number(b, "median_wait_s"));
   seed(ctx, "acme", "billing", "t-4", 120);
   b = body(summary(ctx, queue_id));
-  ctx.Assert(std::fabs(number(b, "median_wait_s") - 90) <= 1, "five tickets waited 30, 60, 90, 120 and 7200 s: the median is 90, the summary says %v", number(b, "median_wait_s"));
+  ctx.Assert(std::fabs(number(b, "median_wait_s") - 90) <= 1, "five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says %v", number(b, "median_wait_s"));
   const std::string empty = store::createQueue("acme", "account");
   b = body(summary(ctx, empty));
   ctx.Assert(number(b, "depth") == 0 && number(b, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %s", b.dump());
@@ -923,11 +958,18 @@ void CheckMedianWait(harness::Ctx& ctx) {
 
 void CheckFallbackShare(harness::Ctx& ctx) {
   const std::string queue_id = store::createQueue("acme", "billing");
+  seed(ctx, "acme", "billing", "t-closed", 60, "breaker_open", true);
   const std::vector<std::string> reasons = {"", "classifier_timeout", "classifier_unavailable", "breaker_open"};
   for (size_t i = 0; i < reasons.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), 60, reasons[i]);
   const auto b = body(summary(ctx, queue_id));
-  ctx.Equal(number(b, "fallback_count"), 3, "three of four tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker); fallback_count");
+  ctx.Equal(number(b, "fallback_count"), 3, "three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue; fallback_count");
   ctx.Assert(std::fabs(number(b, "fallback_share") - 0.75) < 0.001, "fallback_share must be 3 of 4 = 0.75, the summary says %v", number(b, "fallback_share"));
+  const std::string account = store::createQueue("acme", "account");
+  const std::vector<std::string> accountReasons = {"", "classifier_refused", "classifier_timeout"};
+  for (size_t i = 0; i < accountReasons.size(); ++i) seed(ctx, "acme", "account", "t-a" + std::to_string(i), 60, accountReasons[i]);
+  const auto other = body(summary(ctx, account));
+  ctx.Assert(number(other, "fallback_count") == 2 && std::fabs(number(other, "fallback_share") - 0.667) < 1e-6,
+             "two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says %v and %v", number(other, "fallback_count"), number(other, "fallback_share"));
 }
 `,
   },

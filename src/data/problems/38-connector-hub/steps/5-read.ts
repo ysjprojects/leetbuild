@@ -19,8 +19,8 @@ run fails reads healthy, because a failed run moves \`last_run_at\` too, while a
 unhealthy most of the day. An open breaker is invisible, and a connector disabled on a revoked token
 looks fine.
 
-- A missing \`X-Tenant-Id\` is **401**; another tenant's connector answers what a missing one does:
-  **404**.
+- A missing or empty \`X-Tenant-Id\` is **401**; another tenant's connector answers what a missing
+  one does: **404**.
 - Lag runs from \`last_success_at\` (step 4's consumer writes it): \`cursor_lag_s\` is now minus it,
   and \`status\` is \`unhealthy\` when there is none or the lag exceeds \`STALE_INTERVALS\` (2) times
   the connector's \`sync_interval_s\`.
@@ -44,7 +44,8 @@ looks fine.
     {
       id: 'route',
       title: 'Serves GET /v1/connectors/{id}/health',
-      detail: 'Register `GET /v1/connectors/{id}/health`; a connector whose pages land on time reads healthy.',
+      detail:
+        'Register `GET /v1/connectors/{id}/health`; a connector whose pages land on time reads healthy, and the answer carries every field of the task, never the token reference.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/connectors\/\{\w+\}\/health["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/connectors\/:\w+\/health['"]/]},
@@ -57,7 +58,7 @@ looks fine.
       id: 'tenant-scope',
       title: "Scopes the read to the caller's tenant",
       detail:
-        'A missing `X-Tenant-Id` is **401**, and a connector of another tenant answers the same **404** as a missing one, so connector ids cannot be probed across tenants.',
+        'A missing or empty `X-Tenant-Id` is **401**, and a connector of another tenant answers the same **404** as a missing one, so connector ids cannot be probed across tenants.',
       match: {
         python: {
           all: [
@@ -76,7 +77,7 @@ looks fine.
       id: 'stale-from-success',
       title: 'Measures lag from the last successful page, in sync intervals',
       detail:
-        '`cursor_lag_s` runs from `last_success_at` and the connector is `unhealthy` past `STALE_INTERVALS` (2) of its own `sync_interval_s`; `last_run_at` moves on every failed run, so a connector that syncs nothing reads healthy forever.',
+        '`cursor_lag_s` runs from `last_success_at` and the connector is `unhealthy` once the lag exceeds `STALE_INTERVALS` (2) of its own `sync_interval_s` (exactly two is still healthy); `last_run_at` moves on every failed run, so a connector that syncs nothing reads healthy forever.',
       match: {
         python: {
           all: [/STALE_INTERVALS\s*=\s*2\b/, /last_success_at/, /sync_interval_s/, /cursor_lag_s/],
@@ -596,6 +597,10 @@ async def check_route(ctx):
     async with client as c:
         body = await _body(c, cid, "for a connector synced a minute ago")
     assert body.get("connector_id") == cid and body.get("status") == "healthy", f"a connector synced a minute ago must read healthy, got {body}"
+    fields = {"connector_id", "status", "disabled_reason", "last_success_at", "cursor_lag_s", "sync_interval_s", "consecutive_failures", "breaker"}
+    assert fields <= set(body), f"the answer is missing {sorted(fields - set(body))}: it is {{connector_id, status, disabled_reason, last_success_at, cursor_lag_s, sync_interval_s, consecutive_failures, breaker}}, got {body}"
+    assert body.get("last_success_at") == now - 60, f"the answer must carry last_success_at {now - 60}, got {body}"
+    assert "vault:" not in str(body), f"the health read carries the token reference: {body}. Answer the health fields; the reference stays in the registry"
 
 
 async def check_tenant_scope(ctx):
@@ -604,9 +609,11 @@ async def check_tenant_scope(ctx):
     _health(ctx, other, last_run_at=now - 60, last_success_at=now - 60)
     async with client as c:
         anon = await _get(c, cid, tenant="")
+        blank = await c.get(f"/v1/connectors/{cid}/health", headers={"X-Tenant-Id": ""})
         foreign = await _get(c, other)
         missing = await _get(c, "c-404")
     assert anon.status_code == 401, f"a health read without X-Tenant-Id answered {anon.status_code}, expected 401"
+    assert blank.status_code == 401, f"a health read with an empty X-Tenant-Id answered {blank.status_code}, expected 401: an empty header names no tenant"
     assert foreign.status_code == 404, f"acme read globex's connector {other}: {foreign.status_code} {foreign.text}. Another tenant's connector must answer 404"
     assert missing.status_code == 404 and foreign.text == missing.text, f"another tenant's connector answered {foreign.status_code} {foreign.text!r}, a missing one {missing.status_code} {missing.text!r}: the two must be the same, or ids can be probed"
 
@@ -619,15 +626,24 @@ async def check_stale_from_success(ctx):
     _health(ctx, daily, last_run_at=now - 7200, last_success_at=now - 7200, consecutive_failures=0, open_until=0)
     never = store.create("acme", "slack", "slack.com", "vault:acme/slack#1", 900)["connector_id"]
     _health(ctx, never, last_run_at=now - 30, consecutive_failures=1, open_until=0)
+    # Exactly two intervals is not past them; one second more is.
+    edge = store.create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#1", 900)["connector_id"]
+    _health(ctx, edge, last_run_at=now - 1800, last_success_at=now - 1800, consecutive_failures=0, open_until=0)
+    late = store.create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900)["connector_id"]
+    _health(ctx, late, last_run_at=now - 30, last_success_at=now - 1801, consecutive_failures=0, open_until=0)
     async with client as c:
         failing = await _body(c, cid, "for a connector whose runs fail")
         quiet = await _body(c, daily, "for a daily connector")
         empty = await _body(c, never, "for a connector that never landed a page")
+        on_edge = await _body(c, edge, "for a connector whose last page landed two intervals ago")
+        past = await _body(c, late, "for a connector whose last page landed two intervals and a second ago")
     assert failing.get("status") == "unhealthy", f"no page has landed for 2700 s, three sync intervals of 900 s, and the read says {failing}: a failed run moves last_run_at too. Measure from last_success_at"
     lag = failing.get("cursor_lag_s")
     assert isinstance(lag, int) and abs(lag - 2700) <= 5 and failing.get("sync_interval_s") == 900, f"the answer must carry cursor_lag_s (about 2700) and sync_interval_s 900, got {failing}"
     assert quiet.get("status") == "healthy", f"a daily connector whose last page landed 2 h ago reads {quiet}: staleness is two of its own sync intervals, not a fixed hour"
     assert empty.get("status") == "unhealthy" and empty.get("cursor_lag_s") is None, f"a connector that never landed a page must read unhealthy with no lag, got {empty}"
+    assert on_edge.get("status") == "healthy", f"a 900 s connector whose last page landed exactly 1800 s ago reads {on_edge}: it is unhealthy only once the lag exceeds STALE_INTERVALS (2) intervals"
+    assert past.get("status") == "unhealthy", f"a 900 s connector whose last page landed 1801 s ago reads {past}: the lag exceeds STALE_INTERVALS (2) intervals"
 
 
 async def check_breaker_state(ctx):
@@ -645,10 +661,16 @@ async def check_disabled_status(ctx):
     client, cid, now = _world(ctx)
     _health(ctx, cid, last_run_at=now - 60, last_success_at=now - 60, consecutive_failures=0, open_until=0)
     store.disable(cid, "vendor rejected the OAuth token (401)")
+    # Disabled long ago: no page has landed since, and the read must still say why.
+    stale = store.create("acme", "slack", "slack.com", "vault:acme/slack#1", 900)["connector_id"]
+    _health(ctx, stale, last_run_at=now - 86400, last_success_at=now - 86400, consecutive_failures=0, open_until=0)
+    store.disable(stale, "vendor rejected the OAuth token (401)")
     async with client as c:
         body = await _body(c, cid, "for a disabled connector")
+        old = await _body(c, stale, "for a connector disabled a day ago")
     assert body.get("status") == "disabled", f"a connector disabled on a rejected token reads {body}: it syncs nothing until a human acts, and must say so"
     assert body.get("disabled_reason") == "vendor rejected the OAuth token (401)", f"the answer must carry the reason the connector was disabled, got {body}"
+    assert old.get("status") == "disabled", f"a connector disabled a day ago, its last page a day old, reads {old}: disabled says more than unhealthy, a human must act before it syncs again"
 `,
     typescript: `async function world(ctx) {
   const m = ctx.load('read');
@@ -675,6 +697,11 @@ export async function check_route(ctx) {
   health(ctx, cid, {last_run_at: now - 60, last_success_at: now - 60, consecutive_failures: 0, open_until: 0, pages: 4, records: 8});
   const b = await body(c, cid, 'for a connector synced a minute ago');
   assert(b.connector_id === cid && b.status === 'healthy', \`a connector synced a minute ago must read healthy, got \${JSON.stringify(b)}\`);
+  const fields = ['connector_id', 'status', 'disabled_reason', 'last_success_at', 'cursor_lag_s', 'sync_interval_s', 'consecutive_failures', 'breaker'];
+  const absent = fields.filter(f => !(f in b));
+  assert.deepStrictEqual(absent, [], \`the answer is missing \${JSON.stringify(absent)}: it is {connector_id, status, disabled_reason, last_success_at, cursor_lag_s, sync_interval_s, consecutive_failures, breaker}, got \${JSON.stringify(b)}\`);
+  assert.equal(b.last_success_at, now - 60, \`the answer must carry last_success_at \${now - 60}, got \${JSON.stringify(b)}\`);
+  assert(!JSON.stringify(b).includes('vault:'), \`the health read carries the token reference: \${JSON.stringify(b)}. Answer the health fields; the reference stays in the registry\`);
 }
 
 export async function check_tenant_scope(ctx) {
@@ -682,9 +709,11 @@ export async function check_tenant_scope(ctx) {
   const other = (await store.create('globex', 'slack', 'slack.com', 'vault:globex/slack#1', 900)).connector_id;
   health(ctx, other, {last_run_at: now - 60, last_success_at: now - 60});
   const anon = await read(c, cid, '');
+  const blank = await c.get(\`/v1/connectors/\${cid}/health\`, {headers: {'X-Tenant-Id': ''}});
   const foreign = await read(c, other);
   const missing = await read(c, 'c-404');
   assert.equal(anon.status, 401, \`a health read without X-Tenant-Id answered \${anon.status}, expected 401\`);
+  assert.equal(blank.status, 401, \`a health read with an empty X-Tenant-Id answered \${blank.status}, expected 401: an empty header names no tenant\`);
   assert.equal(foreign.status, 404, \`acme read globex's connector \${other}: \${foreign.status} \${foreign.text}. Another tenant's connector must answer 404\`);
   assert(missing.status === 404 && foreign.text === missing.text, \`another tenant's connector answered \${foreign.status} \${JSON.stringify(foreign.text)}, a missing one \${missing.status} \${JSON.stringify(missing.text)}: the two must be the same, or ids can be probed\`);
 }
@@ -697,13 +726,22 @@ export async function check_stale_from_success(ctx) {
   health(ctx, daily, {last_run_at: now - 7200, last_success_at: now - 7200, consecutive_failures: 0, open_until: 0});
   const never = (await store.create('acme', 'slack', 'slack.com', 'vault:acme/slack#1', 900)).connector_id;
   health(ctx, never, {last_run_at: now - 30, consecutive_failures: 1, open_until: 0});
+  // Exactly two intervals is not past them; one second more is.
+  const edge = (await store.create('acme', 'stripe', 'api.stripe.com', 'vault:acme/stripe#1', 900)).connector_id;
+  health(ctx, edge, {last_run_at: now - 1800, last_success_at: now - 1800, consecutive_failures: 0, open_until: 0});
+  const late = (await store.create('acme', 'stripe', 'api.stripe.com', 'vault:acme/stripe#2', 900)).connector_id;
+  health(ctx, late, {last_run_at: now - 30, last_success_at: now - 1801, consecutive_failures: 0, open_until: 0});
   const failing = await body(c, cid, 'for a connector whose runs fail');
   const quiet = await body(c, daily, 'for a daily connector');
   const empty = await body(c, never, 'for a connector that never landed a page');
+  const onEdge = await body(c, edge, 'for a connector whose last page landed two intervals ago');
+  const past = await body(c, late, 'for a connector whose last page landed two intervals and a second ago');
   assert.equal(failing.status, 'unhealthy', \`no page has landed for 2700 s, three sync intervals of 900 s, and the read says \${JSON.stringify(failing)}: a failed run moves last_run_at too. Measure from last_success_at\`);
   assert(typeof failing.cursor_lag_s === 'number' && Math.abs(failing.cursor_lag_s - 2700) <= 5 && failing.sync_interval_s === 900, \`the answer must carry cursor_lag_s (about 2700) and sync_interval_s 900, got \${JSON.stringify(failing)}\`);
   assert.equal(quiet.status, 'healthy', \`a daily connector whose last page landed 2 h ago reads \${JSON.stringify(quiet)}: staleness is two of its own sync intervals, not a fixed hour\`);
   assert(empty.status === 'unhealthy' && (empty.cursor_lag_s ?? null) === null, \`a connector that never landed a page must read unhealthy with no lag, got \${JSON.stringify(empty)}\`);
+  assert.equal(onEdge.status, 'healthy', \`a 900 s connector whose last page landed exactly 1800 s ago reads \${JSON.stringify(onEdge)}: it is unhealthy only once the lag exceeds STALE_INTERVALS (2) intervals\`);
+  assert.equal(past.status, 'unhealthy', \`a 900 s connector whose last page landed 1801 s ago reads \${JSON.stringify(past)}: the lag exceeds STALE_INTERVALS (2) intervals\`);
 }
 
 export async function check_breaker_state(ctx) {
@@ -720,9 +758,15 @@ export async function check_disabled_status(ctx) {
   const {c, store, cid, now} = await world(ctx);
   health(ctx, cid, {last_run_at: now - 60, last_success_at: now - 60, consecutive_failures: 0, open_until: 0});
   await store.disable(cid, 'vendor rejected the OAuth token (401)');
+  // Disabled long ago: no page has landed since, and the read must still say why.
+  const stale = (await store.create('acme', 'slack', 'slack.com', 'vault:acme/slack#1', 900)).connector_id;
+  health(ctx, stale, {last_run_at: now - 86400, last_success_at: now - 86400, consecutive_failures: 0, open_until: 0});
+  await store.disable(stale, 'vendor rejected the OAuth token (401)');
   const b = await body(c, cid, 'for a disabled connector');
+  const old = await body(c, stale, 'for a connector disabled a day ago');
   assert.equal(b.status, 'disabled', \`a connector disabled on a rejected token reads \${JSON.stringify(b)}: it syncs nothing until a human acts, and must say so\`);
   assert.equal(b.disabled_reason, 'vendor rejected the OAuth token (401)', \`the answer must carry the reason the connector was disabled, got \${JSON.stringify(b)}\`);
+  assert.equal(old.status, 'disabled', \`a connector disabled a day ago, its last page a day old, reads \${JSON.stringify(old)}: disabled says more than unhealthy, a human must act before it syncs again\`);
 }
 `,
     go: `package main
@@ -732,6 +776,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 
 	"hub/store"
 
@@ -775,6 +820,15 @@ func CheckRoute(ctx *harness.Ctx) {
 	seedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0, "pages": 4, "records": 8})
 	body := healthBody(ctx, c, cid, "for a connector synced a minute ago")
 	ctx.Assert(body["connector_id"] == cid && body["status"] == "healthy", "a connector synced a minute ago must read healthy, got %v", body)
+	var absent []string
+	for _, field := range []string{"connector_id", "status", "disabled_reason", "last_success_at", "cursor_lag_s", "sync_interval_s", "consecutive_failures", "breaker"} {
+		if _, ok := body[field]; !ok {
+			absent = append(absent, field)
+		}
+	}
+	ctx.Assert(len(absent) == 0, "the answer is missing %v: it is {connector_id, status, disabled_reason, last_success_at, cursor_lag_s, sync_interval_s, consecutive_failures, breaker}, got %v", absent, body)
+	ctx.Assert(body["last_success_at"] == float64(now-60), "the answer must carry last_success_at %d, got %v", now-60, body)
+	ctx.Assert(!strings.Contains(fmt.Sprint(body), "vault:"), "the health read carries the token reference: %v. Answer the health fields; the reference stays in the registry", body)
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
@@ -782,9 +836,11 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	other := store.Create(readBg, "globex", "slack", "slack.com", "vault:globex/slack#1", 900).ConnectorID
 	seedHealth(ctx, other, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60})
 	anon := readHealth(c, cid, "")
+	blank := c.Get("/v1/connectors/"+cid+"/health", "X-Tenant-Id", "")
 	foreign := readHealth(c, other, "acme")
 	missing := readHealth(c, "c-404", "acme")
 	ctx.Equal(anon.Status, 401, "a health read without X-Tenant-Id")
+	ctx.Equal(blank.Status, 401, "a health read with an empty X-Tenant-Id (an empty header names no tenant)")
 	ctx.Equal(foreign.Status, 404, "acme read globex's connector %s (%s): another tenant's connector", other, foreign.Text())
 	ctx.Assert(missing.Status == 404 && foreign.Text() == missing.Text(), "another tenant's connector answered %d %q, a missing one %d %q: the two must be the same, or ids can be probed", foreign.Status, foreign.Text(), missing.Status, missing.Text())
 }
@@ -797,14 +853,23 @@ func CheckStaleFromSuccess(ctx *harness.Ctx) {
 	seedHealth(ctx, daily, map[string]int64{"last_run_at": now - 7200, "last_success_at": now - 7200, "consecutive_failures": 0, "open_until": 0})
 	never := store.Create(readBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
 	seedHealth(ctx, never, map[string]int64{"last_run_at": now - 30, "consecutive_failures": 1, "open_until": 0})
+	// Exactly two intervals is not past them; one second more is.
+	edge := store.Create(readBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#1", 900).ConnectorID
+	seedHealth(ctx, edge, map[string]int64{"last_run_at": now - 1800, "last_success_at": now - 1800, "consecutive_failures": 0, "open_until": 0})
+	late := store.Create(readBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).ConnectorID
+	seedHealth(ctx, late, map[string]int64{"last_run_at": now - 30, "last_success_at": now - 1801, "consecutive_failures": 0, "open_until": 0})
 	failing := healthBody(ctx, c, cid, "for a connector whose runs fail")
 	quiet := healthBody(ctx, c, daily, "for a daily connector")
 	empty := healthBody(ctx, c, never, "for a connector that never landed a page")
+	onEdge := healthBody(ctx, c, edge, "for a connector whose last page landed two intervals ago")
+	past := healthBody(ctx, c, late, "for a connector whose last page landed two intervals and a second ago")
 	ctx.Equal(failing["status"], "unhealthy", "no page has landed for 2700 s, three sync intervals of 900 s (%v): a failed run moves last_run_at too. Measure from last_success_at; the status", failing)
 	lag, ok := failing["cursor_lag_s"].(float64)
 	ctx.Assert(ok && math.Abs(lag-2700) <= 5 && failing["sync_interval_s"] == float64(900), "the answer must carry cursor_lag_s (about 2700) and sync_interval_s 900, got %v", failing)
 	ctx.Equal(quiet["status"], "healthy", "a daily connector whose last page landed 2 h ago (%v): staleness is two of its own sync intervals, not a fixed hour; the status", quiet)
 	ctx.Assert(empty["status"] == "unhealthy" && empty["cursor_lag_s"] == nil, "a connector that never landed a page must read unhealthy with no lag, got %v", empty)
+	ctx.Equal(onEdge["status"], "healthy", "a 900 s connector whose last page landed exactly 1800 s ago (%v) is unhealthy only once the lag exceeds staleIntervals (2) intervals; the status", onEdge)
+	ctx.Equal(past["status"], "unhealthy", "a 900 s connector whose last page landed 1801 s ago (%v): the lag exceeds staleIntervals (2) intervals; the status", past)
 }
 
 func CheckBreakerState(ctx *harness.Ctx) {
@@ -821,9 +886,15 @@ func CheckDisabledStatus(ctx *harness.Ctx) {
 	c, cid, now := readWorld(ctx)
 	seedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0})
 	store.Disable(readBg, cid, "vendor rejected the OAuth token (401)")
+	// Disabled long ago: no page has landed since, and the read must still say why.
+	stale := store.Create(readBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
+	seedHealth(ctx, stale, map[string]int64{"last_run_at": now - 86400, "last_success_at": now - 86400, "consecutive_failures": 0, "open_until": 0})
+	store.Disable(readBg, stale, "vendor rejected the OAuth token (401)")
 	body := healthBody(ctx, c, cid, "for a disabled connector")
+	old := healthBody(ctx, c, stale, "for a connector disabled a day ago")
 	ctx.Equal(body["status"], "disabled", "a connector disabled on a rejected token syncs nothing until a human acts, and must say so (%v); the status", body)
 	ctx.Equal(body["disabled_reason"], "vendor rejected the OAuth token (401)", "the reason the connector was disabled")
+	ctx.Equal(old["status"], "disabled", "a connector disabled a day ago, its last page a day old (%v): disabled says more than unhealthy, a human must act before it syncs again; the status", old)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -833,6 +904,7 @@ func CheckDisabledStatus(ctx *harness.Ctx) {
 #include <cmath>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -877,6 +949,13 @@ void CheckRoute(harness::Ctx& ctx) {
   seedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}, {"pages", 4}, {"records", 8}});
   const auto body = healthBody(ctx, w.c, w.cid, "for a connector synced a minute ago");
   ctx.Assert(body.value("connector_id", "") == w.cid && body.value("status", "") == "healthy", "a connector synced a minute ago must read healthy, got %s", body.dump());
+  std::vector<std::string> absent;
+  for (const std::string field : {"connector_id", "status", "disabled_reason", "last_success_at", "cursor_lag_s", "sync_interval_s", "consecutive_failures", "breaker"}) {
+    if (!body.contains(field)) absent.push_back(field);
+  }
+  ctx.Assert(absent.empty(), "the answer is missing %v: it is {connector_id, status, disabled_reason, last_success_at, cursor_lag_s, sync_interval_s, consecutive_failures, breaker}, got %s", absent, body.dump());
+  ctx.Assert(body["last_success_at"].is_number_integer() && body["last_success_at"].get<long long>() == w.now - 60, "the answer must carry last_success_at %d, got %s", w.now - 60, body.dump());
+  ctx.Assert(body.dump().find("vault:") == std::string::npos, "the health read carries the token reference: %s. Answer the health fields; the reference stays in the registry", body.dump());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
@@ -884,9 +963,11 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const std::string other = store::create("globex", "slack", "slack.com", "vault:globex/slack#1", 900).connector_id;
   seedHealth(ctx, other, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}});
   const auto anon = readHealth(w.c, w.cid, "");
+  const auto blank = w.c.Get("/v1/connectors/" + w.cid + "/health", "X-Tenant-Id", "");
   const auto foreign = readHealth(w.c, other, "acme");
   const auto missing = readHealth(w.c, "c-404", "acme");
   ctx.Equal(anon.Status, 401, "a health read without X-Tenant-Id");
+  ctx.Equal(blank.Status, 401, "a health read with an empty X-Tenant-Id (an empty header names no tenant)");
   ctx.Equal(foreign.Status, 404, "acme read globex's connector %s (%s): another tenant's connector", other, foreign.Text());
   ctx.Assert(missing.Status == 404 && foreign.Text() == missing.Text(), "another tenant's connector answered %d %q, a missing one %d %q: the two must be the same, or ids can be probed",
              foreign.Status, foreign.Text(), missing.Status, missing.Text());
@@ -900,15 +981,24 @@ void CheckStaleFromSuccess(harness::Ctx& ctx) {
   seedHealth(ctx, daily, {{"last_run_at", w.now - 7200}, {"last_success_at", w.now - 7200}, {"consecutive_failures", 0}, {"open_until", 0}});
   const std::string never = store::create("acme", "slack", "slack.com", "vault:acme/slack#1", 900).connector_id;
   seedHealth(ctx, never, {{"last_run_at", w.now - 30}, {"consecutive_failures", 1}, {"open_until", 0}});
+  // Exactly two intervals is not past them; one second more is.
+  const std::string edge = store::create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#1", 900).connector_id;
+  seedHealth(ctx, edge, {{"last_run_at", w.now - 1800}, {"last_success_at", w.now - 1800}, {"consecutive_failures", 0}, {"open_until", 0}});
+  const std::string late = store::create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).connector_id;
+  seedHealth(ctx, late, {{"last_run_at", w.now - 30}, {"last_success_at", w.now - 1801}, {"consecutive_failures", 0}, {"open_until", 0}});
   const auto failing = healthBody(ctx, w.c, w.cid, "for a connector whose runs fail");
   const auto quiet = healthBody(ctx, w.c, daily, "for a daily connector");
   const auto empty = healthBody(ctx, w.c, never, "for a connector that never landed a page");
+  const auto on_edge = healthBody(ctx, w.c, edge, "for a connector whose last page landed two intervals ago");
+  const auto past = healthBody(ctx, w.c, late, "for a connector whose last page landed two intervals and a second ago");
   ctx.Equal(failing.value("status", ""), "unhealthy", "no page has landed for 2700 s, three sync intervals of 900 s (%s): a failed run moves last_run_at too. Measure from last_success_at; the status", failing.dump());
   const bool lagged = failing.contains("cursor_lag_s") && failing["cursor_lag_s"].is_number() && std::abs(failing["cursor_lag_s"].get<double>() - 2700) <= 5;
   ctx.Assert(lagged && failing.value("sync_interval_s", 0) == 900, "the answer must carry cursor_lag_s (about 2700) and sync_interval_s 900, got %s", failing.dump());
   ctx.Equal(quiet.value("status", ""), "healthy", "a daily connector whose last page landed 2 h ago (%s): staleness is two of its own sync intervals, not a fixed hour; the status", quiet.dump());
   ctx.Assert(empty.value("status", "") == "unhealthy" && (!empty.contains("cursor_lag_s") || empty["cursor_lag_s"].is_null()),
              "a connector that never landed a page must read unhealthy with no lag, got %s", empty.dump());
+  ctx.Equal(on_edge.value("status", ""), "healthy", "a 900 s connector whose last page landed exactly 1800 s ago (%s) is unhealthy only once the lag exceeds kStaleIntervals (2) intervals; the status", on_edge.dump());
+  ctx.Equal(past.value("status", ""), "unhealthy", "a 900 s connector whose last page landed 1801 s ago (%s): the lag exceeds kStaleIntervals (2) intervals; the status", past.dump());
 }
 
 void CheckBreakerState(harness::Ctx& ctx) {
@@ -926,9 +1016,15 @@ void CheckDisabledStatus(harness::Ctx& ctx) {
   World w = readWorld(ctx);
   seedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}});
   store::disable(w.cid, "vendor rejected the OAuth token (401)");
+  // Disabled long ago: no page has landed since, and the read must still say why.
+  const std::string stale = store::create("acme", "slack", "slack.com", "vault:acme/slack#1", 900).connector_id;
+  seedHealth(ctx, stale, {{"last_run_at", w.now - 86400}, {"last_success_at", w.now - 86400}, {"consecutive_failures", 0}, {"open_until", 0}});
+  store::disable(stale, "vendor rejected the OAuth token (401)");
   const auto body = healthBody(ctx, w.c, w.cid, "for a disabled connector");
+  const auto old = healthBody(ctx, w.c, stale, "for a connector disabled a day ago");
   ctx.Equal(body.value("status", ""), "disabled", "a connector disabled on a rejected token syncs nothing until a human acts, and must say so (%s); the status", body.dump());
   ctx.Equal(body.value("disabled_reason", ""), "vendor rejected the OAuth token (401)", "the reason the connector was disabled");
+  ctx.Equal(old.value("status", ""), "disabled", "a connector disabled a day ago, its last page a day old (%s): disabled says more than unhealthy, a human must act before it syncs again; the status", old.dump());
 }
 `,
   },

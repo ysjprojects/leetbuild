@@ -65,7 +65,7 @@ Requirements:
       id: 'tenant-scope',
       title: "Another tenant's id is 404",
       detail:
-        'A row that belongs to another tenant answers 404, indistinguishable from an id that does not exist, and carries none of the row. The starter serves whichever row the id names.',
+        'A row that belongs to another tenant answers 404 with the same body an id that does not exist gets, and carries none of the row; that holds for its pending and its expired rows too. The starter serves whichever row the id names.',
       match: {
         python: {all: [/\[\s*["']tenant["']\s*\]\s*!=\s*tenant|\.get\(\s*["']tenant["']\s*\)\s*!=\s*tenant/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant/]},
@@ -78,7 +78,7 @@ Requirements:
       id: 'pending-202',
       title: 'A pending inference is 202, not a result',
       detail:
-        'A row the worker has not finished answers 202 with inference_id and status pending and no label or confidence; once it is complete the same id answers 200. The starter answers 200 with a null label.',
+        'A row the worker has not finished answers 202 with inference_id and status pending and nothing else; once it is complete the same id answers 200. The starter answers 200 with a null label.',
       match: {
         python: {all: [/status_code\s*=\s*202/]},
         typescript: {all: [/code\(\s*202\s*\)/]},
@@ -91,7 +91,7 @@ Requirements:
       id: 'result-expiry',
       title: 'A result past 30 days is 410 with its metadata',
       detail:
-        'A complete row whose created_at is more than RESULT_TTL_S old answers 410 with status expired and metadata (task, content_hash, model_version, created_at), and no label or confidence; a 29-day-old result is still 200. The starter serves every result forever.',
+        'A complete row whose created_at is more than RESULT_TTL_S old answers 410 with status expired and metadata of exactly task, content_hash, model_version and created_at, and no label or confidence; the window is counted in seconds, so a minute past 30 days is 410 and a minute short of it is still 200. The starter serves every result forever.',
       match: {
         python: {all: [/RESULT_TTL_S/, /status_code\s*=\s*410/]},
         typescript: {all: [/RESULT_TTL_S/, /code\(\s*410\s*\)/]},
@@ -501,8 +501,8 @@ DAY = 86_400
 LARGE = "vision-large-3.1.0"
 
 
-def _row(ctx, inference_id, tenant="t1", status="complete", age_days=0):
-    row = {"inference_id": inference_id, "tenant": tenant, "status": status, "task": "classify", "image": f"tenants/{tenant}/images/cat.jpg", "content_hash": "9f2c41aa", "created_at": int(time.time()) - age_days * DAY}
+def _row(ctx, inference_id, tenant="t1", status="complete", age_days=0, age_s=0):
+    row = {"inference_id": inference_id, "tenant": tenant, "status": status, "task": "classify", "image": f"tenants/{tenant}/images/cat.jpg", "content_hash": "9f2c41aa", "created_at": int(time.time()) - age_days * DAY - age_s}
     if status == "complete":
         row.update(label="tabby_cat", confidence=0.92, model_version=LARGE, downgraded=False)
     ctx.redis.set(f"vision:inference:{inference_id}", json.dumps(row))
@@ -532,12 +532,20 @@ async def check_route(ctx):
 
 async def check_tenant_scope(ctx):
     _row(ctx, "inf-t2", tenant="t2")
+    _row(ctx, "inf-t2-pending", tenant="t2", status="pending")
+    _row(ctx, "inf-t2-old", tenant="t2", age_days=31)
     async with _api(ctx) as c:
         r = await _get(c, "inf-t2", tenant="t1")
         assert r.status_code == 404, f"tenant t1 read t2's inference and got {r.status_code}: {r.text}; another tenant's id must be 404, like an id that does not exist"
         assert "tabby_cat" not in r.text, f"the refusal leaks t2's prediction: {r.text}"
         r = await _get(c, "inf-t2", tenant="t2")
         assert r.status_code == 200, f"t2 reads its own inference, got {r.status_code}"
+        foreign = await _get(c, "inf-t2", tenant="t1")
+        missing = await _get(c, "inf-t9", tenant="t1")
+        assert foreign.text.replace("inf-t2", "{id}") == missing.text.replace("inf-t9", "{id}"), f"another tenant's id must answer exactly like an id that does not exist: {foreign.text} vs {missing.text}"
+        for inference_id in ("inf-t2-pending", "inf-t2-old"):
+            r = await _get(c, inference_id, tenant="t1")
+            assert r.status_code == 404, f"tenant t1 read t2's {inference_id} and got {r.status_code}: {r.text}; the tenant is compared before the status or the age says anything"
 
 
 async def check_pending_202(ctx):
@@ -547,7 +555,7 @@ async def check_pending_202(ctx):
         assert r.status_code == 202, f"an inference the worker has not finished answered {r.status_code}, expected 202: a 200 with a null label is cached as the answer"
         body = r.json()
         assert body.get("status") == "pending" and body.get("inference_id") == "inf-1", f"the 202 says which inference and that it is pending: {body}"
-        assert "label" not in body and "confidence" not in body, f"a pending inference carries no result fields: {body}"
+        assert set(body) == {"inference_id", "status"}, f"a pending inference is {{inference_id, status}} and nothing more: {body}"
         _row(ctx, "inf-1")
         r = await _get(c, "inf-1")
         assert r.status_code == 200 and r.json().get("label") == "tabby_cat", f"once complete the same id answers 200 with the label, got {r.status_code}: {r.text}"
@@ -556,6 +564,8 @@ async def check_pending_202(ctx):
 async def check_result_expiry(ctx):
     _row(ctx, "inf-old", age_days=31)
     _row(ctx, "inf-recent", age_days=29)
+    _row(ctx, "inf-edge-old", age_days=30, age_s=60)
+    _row(ctx, "inf-edge-recent", age_days=30, age_s=-60)
     async with _api(ctx) as c:
         r = await _get(c, "inf-old")
         assert r.status_code == 410, f"a 31-day-old result answered {r.status_code}, expected 410: results are kept for RESULT_TTL_S (30 days)"
@@ -566,14 +576,19 @@ async def check_result_expiry(ctx):
         for key, value in (("task", "classify"), ("content_hash", "9f2c41aa"), ("model_version", LARGE)):
             assert metadata.get(key) == value, f"the 410 metadata must keep {key}={value!r}, got {metadata}"
         assert isinstance(metadata.get("created_at"), int), f"the 410 metadata keeps created_at: {metadata}"
+        assert set(metadata) == {"task", "content_hash", "model_version", "created_at"}, f"the 410 metadata is task, content_hash, model_version and created_at and nothing more: {metadata}"
         r = await _get(c, "inf-recent")
         assert r.status_code == 200, f"a 29-day-old result is still inside the window, got {r.status_code}"
+        r = await _get(c, "inf-edge-old")
+        assert r.status_code == 410, f"a result 30 days and one minute old answered {r.status_code}, expected 410: the window is RESULT_TTL_S seconds, not whole days"
+        r = await _get(c, "inf-edge-recent")
+        assert r.status_code == 200, f"a result one minute short of 30 days answered {r.status_code}, expected 200: it is still inside RESULT_TTL_S"
 `,
     typescript: `const DAY = 86_400;
 const LARGE = 'vision-large-3.1.0';
 
-function row(ctx, inferenceId: string, {tenant = 't1', status = 'complete', ageDays = 0} = {}) {
-  const r: Record<string, unknown> = {inference_id: inferenceId, tenant, status, task: 'classify', image: \`tenants/\${tenant}/images/cat.jpg\`, content_hash: '9f2c41aa', created_at: Math.floor(ctx.clock.now() / 1000) - ageDays * DAY};
+function row(ctx, inferenceId: string, {tenant = 't1', status = 'complete', ageDays = 0, ageS = 0} = {}) {
+  const r: Record<string, unknown> = {inference_id: inferenceId, tenant, status, task: 'classify', image: \`tenants/\${tenant}/images/cat.jpg\`, content_hash: '9f2c41aa', created_at: Math.floor(ctx.clock.now() / 1000) - ageDays * DAY - ageS};
   if (status === 'complete') Object.assign(r, {label: 'tabby_cat', confidence: 0.92, model_version: LARGE, downgraded: false});
   ctx.redis.set(\`vision:inference:\${inferenceId}\`, JSON.stringify(r));
 }
@@ -596,12 +611,21 @@ export async function check_route(ctx) {
 
 export async function check_tenant_scope(ctx) {
   row(ctx, 'inf-t2', {tenant: 't2'});
+  row(ctx, 'inf-t2-pending', {tenant: 't2', status: 'pending'});
+  row(ctx, 'inf-t2-old', {tenant: 't2', ageDays: 31});
   const c = api(ctx);
   let r = await read(c, 'inf-t2', 't1');
   assert.equal(r.status, 404, \`tenant t1 read t2's inference and got \${r.status}: \${r.text}; another tenant's id must be 404, like an id that does not exist\`);
   assert(!r.text.includes('tabby_cat'), \`the refusal leaks t2's prediction: \${r.text}\`);
   r = await read(c, 'inf-t2', 't2');
   assert.equal(r.status, 200, \`t2 reads its own inference, got \${r.status}\`);
+  const foreign = await read(c, 'inf-t2', 't1');
+  const missing = await read(c, 'inf-t9', 't1');
+  assert.equal(foreign.text.replaceAll('inf-t2', '{id}'), missing.text.replaceAll('inf-t9', '{id}'), \`another tenant's id must answer exactly like an id that does not exist: \${foreign.text} vs \${missing.text}\`);
+  for (const inferenceId of ['inf-t2-pending', 'inf-t2-old']) {
+    r = await read(c, inferenceId, 't1');
+    assert.equal(r.status, 404, \`tenant t1 read t2's \${inferenceId} and got \${r.status}: \${r.text}; the tenant is compared before the status or the age says anything\`);
+  }
 }
 
 export async function check_pending_202(ctx) {
@@ -611,7 +635,7 @@ export async function check_pending_202(ctx) {
   assert.equal(r.status, 202, \`an inference the worker has not finished answered \${r.status}, expected 202: a 200 with a null label is cached as the answer\`);
   const body = r.json();
   assert(body.status === 'pending' && body.inference_id === 'inf-1', \`the 202 says which inference and that it is pending: \${r.text}\`);
-  assert(!('label' in body) && !('confidence' in body), \`a pending inference carries no result fields: \${r.text}\`);
+  assert.deepEqual(Object.keys(body).sort(), ['inference_id', 'status'], \`a pending inference is {inference_id, status} and nothing more: \${r.text}\`);
   row(ctx, 'inf-1');
   r = await read(c, 'inf-1');
   assert(r.status === 200 && r.json().label === 'tabby_cat', \`once complete the same id answers 200 with the label, got \${r.status}: \${r.text}\`);
@@ -620,6 +644,8 @@ export async function check_pending_202(ctx) {
 export async function check_result_expiry(ctx) {
   row(ctx, 'inf-old', {ageDays: 31});
   row(ctx, 'inf-recent', {ageDays: 29});
+  row(ctx, 'inf-edge-old', {ageDays: 30, ageS: 60});
+  row(ctx, 'inf-edge-recent', {ageDays: 30, ageS: -60});
   const c = api(ctx);
   let r = await read(c, 'inf-old');
   assert.equal(r.status, 410, \`a 31-day-old result answered \${r.status}, expected 410: results are kept for RESULT_TTL_S (30 days)\`);
@@ -629,8 +655,13 @@ export async function check_result_expiry(ctx) {
   const metadata = body.metadata ?? {};
   for (const [key, value] of [['task', 'classify'], ['content_hash', '9f2c41aa'], ['model_version', LARGE]]) assert.equal(metadata[key], value, \`the 410 metadata must keep \${key}=\${value}, got \${JSON.stringify(metadata)}\`);
   assert(Number.isInteger(metadata.created_at), \`the 410 metadata keeps created_at: \${JSON.stringify(metadata)}\`);
+  assert.deepEqual(Object.keys(metadata).sort(), ['content_hash', 'created_at', 'model_version', 'task'], \`the 410 metadata is task, content_hash, model_version and created_at and nothing more: \${JSON.stringify(metadata)}\`);
   r = await read(c, 'inf-recent');
   assert.equal(r.status, 200, \`a 29-day-old result is still inside the window, got \${r.status}\`);
+  r = await read(c, 'inf-edge-old');
+  assert.equal(r.status, 410, \`a result 30 days and one minute old answered \${r.status}, expected 410: the window is RESULT_TTL_S seconds, not whole days\`);
+  r = await read(c, 'inf-edge-recent');
+  assert.equal(r.status, 200, \`a result one minute short of 30 days answered \${r.status}, expected 200: it is still inside RESULT_TTL_S\`);
 }
 `,
     go: `package main
@@ -638,6 +669,7 @@ export async function check_result_expiry(ctx) {
 import (
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 
 	"leetbuild/harness"
@@ -648,8 +680,8 @@ const (
 	readLarge = "vision-large-3.1.0"
 )
 
-func readRow(ctx *harness.Ctx, inferenceID, tenant, status string, ageDays int64) {
-	row := map[string]any{"inference_id": inferenceID, "tenant": tenant, "status": status, "task": "classify", "image": "tenants/" + tenant + "/images/cat.jpg", "content_hash": "9f2c41aa", "created_at": ctx.Clock.Now()/1000 - ageDays*readDay}
+func readRow(ctx *harness.Ctx, inferenceID, tenant, status string, ageSeconds int64) {
+	row := map[string]any{"inference_id": inferenceID, "tenant": tenant, "status": status, "task": "classify", "image": "tenants/" + tenant + "/images/cat.jpg", "content_hash": "9f2c41aa", "created_at": ctx.Clock.Now()/1000 - ageSeconds}
 	if status == "complete" {
 		row["label"] = "tabby_cat"
 		row["confidence"] = 0.92
@@ -672,6 +704,15 @@ func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	return body
 }
 
+func readKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func CheckRoute(ctx *harness.Ctx) {
 	readRow(ctx, "inf-1", "t1", "complete", 0)
 	c := readClient(ctx)
@@ -685,11 +726,20 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckTenantScope(ctx *harness.Ctx) {
 	readRow(ctx, "inf-t2", "t2", "complete", 0)
+	readRow(ctx, "inf-t2-pending", "t2", "pending", 0)
+	readRow(ctx, "inf-t2-old", "t2", "complete", 31*readDay)
 	c := readClient(ctx)
 	r := c.Get("/v1/inferences/inf-t2", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 404, "tenant t1 read t2's inference (%s): another tenant's id must be 404, like an id that does not exist", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "tabby_cat"), "the refusal leaks t2's prediction: %s", r.Text())
 	ctx.Equal(c.Get("/v1/inferences/inf-t2", "X-Tenant-Id", "t2").Status, 200, "t2 reads its own inference")
+	foreign := c.Get("/v1/inferences/inf-t2", "X-Tenant-Id", "t1")
+	missing := c.Get("/v1/inferences/inf-t9", "X-Tenant-Id", "t1")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), "inf-t2", "{id}"), strings.ReplaceAll(missing.Text(), "inf-t9", "{id}"), "another tenant's id must answer exactly like an id that does not exist; the bodies")
+	for _, id := range []string{"inf-t2-pending", "inf-t2-old"} {
+		r = c.Get("/v1/inferences/"+id, "X-Tenant-Id", "t1")
+		ctx.Equal(r.Status, 404, "tenant t1 read t2's %s (%s): the tenant is compared before the status or the age says anything", id, r.Text())
+	}
 }
 
 func CheckPending202(ctx *harness.Ctx) {
@@ -699,17 +749,17 @@ func CheckPending202(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 202, "an inference the worker has not finished (a 200 with a null label is cached as the answer)")
 	body := readBody(ctx, r)
 	ctx.Assert(body["status"] == "pending" && body["inference_id"] == "inf-1", "the 202 says which inference and that it is pending: %s", r.Text())
-	_, hasLabel := body["label"]
-	_, hasConfidence := body["confidence"]
-	ctx.Assert(!hasLabel && !hasConfidence, "a pending inference carries no result fields: %s", r.Text())
+	ctx.Equal(readKeys(body), []string{"inference_id", "status"}, "a pending inference is {inference_id, status} and nothing more; the 202's fields")
 	readRow(ctx, "inf-1", "t1", "complete", 0)
 	r = c.Get("/v1/inferences/inf-1", "X-Tenant-Id", "t1")
 	ctx.Assert(r.Status == 200 && readBody(ctx, r)["label"] == "tabby_cat", "once complete the same id answers 200 with the label, got %d: %s", r.Status, r.Text())
 }
 
 func CheckResultExpiry(ctx *harness.Ctx) {
-	readRow(ctx, "inf-old", "t1", "complete", 31)
-	readRow(ctx, "inf-recent", "t1", "complete", 29)
+	readRow(ctx, "inf-old", "t1", "complete", 31*readDay)
+	readRow(ctx, "inf-recent", "t1", "complete", 29*readDay)
+	readRow(ctx, "inf-edge-old", "t1", "complete", 30*readDay+60)
+	readRow(ctx, "inf-edge-recent", "t1", "complete", 30*readDay-60)
 	c := readClient(ctx)
 	r := c.Get("/v1/inferences/inf-old", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 410, "a 31-day-old result: results are kept for ResultTTLSeconds (30 days)")
@@ -721,7 +771,10 @@ func CheckResultExpiry(ctx *harness.Ctx) {
 	ctx.Assert(metadata["task"] == "classify" && metadata["content_hash"] == "9f2c41aa" && metadata["model_version"] == readLarge, "the 410 metadata must keep task, content_hash and model_version, got %v", metadata)
 	_, hasCreated := metadata["created_at"].(float64)
 	ctx.Assert(hasCreated, "the 410 metadata keeps created_at: %v", metadata)
+	ctx.Equal(readKeys(metadata), []string{"content_hash", "created_at", "model_version", "task"}, "the 410 metadata is task, content_hash, model_version and created_at and nothing more; its fields")
 	ctx.Equal(c.Get("/v1/inferences/inf-recent", "X-Tenant-Id", "t1").Status, 200, "a 29-day-old result is still inside the window")
+	ctx.Equal(c.Get("/v1/inferences/inf-edge-old", "X-Tenant-Id", "t1").Status, 410, "a result 30 days and one minute old: the window is ResultTTLSeconds seconds, not whole days")
+	ctx.Equal(c.Get("/v1/inferences/inf-edge-recent", "X-Tenant-Id", "t1").Status, 200, "a result one minute short of 30 days is still inside ResultTTLSeconds")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -729,6 +782,7 @@ func CheckResultExpiry(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -737,8 +791,8 @@ using json = nlohmann::json;
 constexpr long long kDay = 86400;
 const std::string kLarge = "vision-large-3.1.0";
 
-void readRow(harness::Ctx& ctx, const std::string& inference_id, const std::string& tenant = "t1", const std::string& status = "complete", long long age_days = 0) {
-  json row = {{"inference_id", inference_id}, {"tenant", tenant}, {"status", status}, {"task", "classify"}, {"image", "tenants/" + tenant + "/images/cat.jpg"}, {"content_hash", "9f2c41aa"}, {"created_at", ctx.Clock.Now() / 1000 - age_days * kDay}};
+void readRow(harness::Ctx& ctx, const std::string& inference_id, const std::string& tenant = "t1", const std::string& status = "complete", long long age_seconds = 0) {
+  json row = {{"inference_id", inference_id}, {"tenant", tenant}, {"status", status}, {"task", "classify"}, {"image", "tenants/" + tenant + "/images/cat.jpg"}, {"content_hash", "9f2c41aa"}, {"created_at", ctx.Clock.Now() / 1000 - age_seconds}};
   if (status == "complete") {
     row["label"] = "tabby_cat";
     row["confidence"] = 0.92;
@@ -763,6 +817,17 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
   return body;
 }
 
+std::vector<std::string> keysOf(const json& object) {
+  std::vector<std::string> keys;
+  for (const auto& [key, value] : object.items()) keys.push_back(key);
+  return keys;  // nlohmann::json keeps an object's keys sorted
+}
+
+std::string withId(std::string text, const std::string& id) {
+  for (auto at = text.find(id); at != std::string::npos; at = text.find(id, at)) text.replace(at, id.size(), "{id}");
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -779,11 +844,18 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTenantScope(harness::Ctx& ctx) {
   readRow(ctx, "inf-t2", "t2");
+  readRow(ctx, "inf-t2-pending", "t2", "pending");
+  readRow(ctx, "inf-t2-old", "t2", "complete", 31 * kDay);
   Api api(ctx);
   const auto r = api.read("inf-t2", "t1");
   ctx.Equal(r.Status, 404, "tenant t1 read t2's inference (%s): another tenant's id must be 404, like an id that does not exist", r.Text());
   ctx.Assert(r.Text().find("tabby_cat") == std::string::npos, "the refusal leaks t2's prediction: %s", r.Text());
   ctx.Equal(api.read("inf-t2", "t2").Status, 200, "t2 reads its own inference");
+  ctx.Equal(withId(api.read("inf-t2", "t1").Text(), "inf-t2"), withId(api.read("inf-t9", "t1").Text(), "inf-t9"), "another tenant's id must answer exactly like an id that does not exist; the bodies");
+  for (const char* id : {"inf-t2-pending", "inf-t2-old"}) {
+    const auto foreign = api.read(id, "t1");
+    ctx.Equal(foreign.Status, 404, "tenant t1 read t2's %s (%s): the tenant is compared before the status or the age says anything", id, foreign.Text());
+  }
 }
 
 void CheckPending202(harness::Ctx& ctx) {
@@ -793,15 +865,17 @@ void CheckPending202(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 202, "an inference the worker has not finished (a 200 with a null label is cached as the answer)");
   const json body = bodyOf(ctx, r);
   ctx.Assert(body.value("status", "") == "pending" && body.value("inference_id", "") == "inf-1", "the 202 says which inference and that it is pending: %s", r.Text());
-  ctx.Assert(!body.contains("label") && !body.contains("confidence"), "a pending inference carries no result fields: %s", r.Text());
+  ctx.Equal(keysOf(body), std::vector<std::string>{"inference_id", "status"}, "a pending inference is {inference_id, status} and nothing more; the 202's fields");
   readRow(ctx, "inf-1");
   r = api.read("inf-1");
   ctx.Assert(r.Status == 200 && bodyOf(ctx, r).value("label", "") == "tabby_cat", "once complete the same id answers 200 with the label, got %d: %s", r.Status, r.Text());
 }
 
 void CheckResultExpiry(harness::Ctx& ctx) {
-  readRow(ctx, "inf-old", "t1", "complete", 31);
-  readRow(ctx, "inf-recent", "t1", "complete", 29);
+  readRow(ctx, "inf-old", "t1", "complete", 31 * kDay);
+  readRow(ctx, "inf-recent", "t1", "complete", 29 * kDay);
+  readRow(ctx, "inf-edge-old", "t1", "complete", 30 * kDay + 60);
+  readRow(ctx, "inf-edge-recent", "t1", "complete", 30 * kDay - 60);
   Api api(ctx);
   const auto r = api.read("inf-old");
   ctx.Equal(r.Status, 410, "a 31-day-old result: results are kept for kResultTtlSeconds (30 days)");
@@ -812,7 +886,10 @@ void CheckResultExpiry(harness::Ctx& ctx) {
   ctx.Assert(metadata.value("task", "") == "classify" && metadata.value("content_hash", "") == "9f2c41aa" && metadata.value("model_version", "") == kLarge,
              "the 410 metadata must keep task, content_hash and model_version, got %s", metadata.dump());
   ctx.Assert(metadata.contains("created_at") && metadata["created_at"].is_number_integer(), "the 410 metadata keeps created_at: %s", metadata.dump());
+  ctx.Equal(keysOf(metadata), std::vector<std::string>{"content_hash", "created_at", "model_version", "task"}, "the 410 metadata is task, content_hash, model_version and created_at and nothing more; its fields");
   ctx.Equal(api.read("inf-recent").Status, 200, "a 29-day-old result is still inside the window");
+  ctx.Equal(api.read("inf-edge-old").Status, 410, "a result 30 days and one minute old: the window is kResultTtlSeconds seconds, not whole days");
+  ctx.Equal(api.read("inf-edge-recent").Status, 200, "a result one minute short of 30 days is still inside kResultTtlSeconds");
 }
 `,
   },

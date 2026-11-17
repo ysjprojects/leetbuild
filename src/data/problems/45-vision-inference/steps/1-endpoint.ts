@@ -46,7 +46,7 @@ Requirements:
       id: 'route',
       title: 'Handles POST /v1/inferences',
       detail:
-        'A valid request answers 201 with the pending inference (inference_id, status, task, image, the SHA-256 of the bytes, created_at) and stores it; 401 without X-Tenant-Id, 404 for a key with no object.',
+        'A valid request answers 201 with the pending inference (inference_id, status, task, image, the SHA-256 of the bytes, created_at) and stores it; 401 without X-Tenant-Id; 404 for a key with no object, which stores nothing, so a retry once the object exists starts the inference.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/v1\/inferences["']/]},
         typescript: {all: [/app\.post\(\s*['"]\/v1\/inferences['"]/]},
@@ -59,7 +59,7 @@ Requirements:
       id: 'task-catalog',
       title: 'Refuses a task outside the catalog',
       detail:
-        'A task other than classify, detect or embed is 400 and stores nothing. The starter stores whatever task the caller names.',
+        'A task that is not exactly classify, detect or embed (a different case or a stray space included) is 400 and stores nothing. The starter stores whatever task the caller names.',
       match: {
         python: {all: [/ALLOWED_TASKS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_TASKS/, /code\(\s*400\s*\)/]},
@@ -788,6 +788,8 @@ OUT_OF_SCOPE = (
     "https://169.254.169.254/latest/meta-data/",
     "tenants/t1/images/../../t2/images/cat.jpg",
     "tenants/t1-other/images/cat.jpg",
+    "tenants/t1/models/weights.bin",
+    "tenants/t1/images/../images/cat.jpg",
 )
 
 
@@ -829,12 +831,17 @@ async def check_route(ctx):
         assert r.status_code == 401, f"without X-Tenant-Id the request must answer 401, got {r.status_code}"
         r = await _post(c, {"image": "tenants/t1/images/missing.jpg", "task": "classify"}, key="k-3")
         assert r.status_code == 404, f"a key with no object behind it answered {r.status_code}, expected 404"
+        assert len(_rows(ctx)) == 1, f"a 404 must store no inference: the store holds {len(_rows(ctx))} rows after one 201 and one 404"
+        ctx.redis_bytes.set("vision:object:tenants/t1/images/missing.jpg", CAT_BYTES)
+        r = await _post(c, {"image": "tenants/t1/images/missing.jpg", "task": "classify"}, key="k-3")
+        assert r.status_code == 201 and r.json().get("content_hash") == hashlib.sha256(CAT_BYTES).hexdigest(), f"once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got {r.status_code}: {r.text}"
 
 
 async def check_task_catalog(ctx):
     async with _api(ctx) as c:
-        r = await _post(c, {"image": CAT, "task": "segment-everything"}, key="k-bad")
-        assert r.status_code == 400, f"task 'segment-everything' answered {r.status_code}, expected 400: the model router has no such task"
+        for i, task in enumerate(("segment-everything", "Classify", "classify ")):
+            r = await _post(c, {"image": CAT, "task": task}, key=f"k-bad-{i}")
+            assert r.status_code == 400, f"task {task!r} answered {r.status_code}, expected 400: the catalog is exactly classify, detect and embed"
         assert _rows(ctx) == [], f"a refused task must store no inference, found {_rows(ctx)}"
         for i, task in enumerate(("classify", "detect", "embed")):
             r = await _post(c, {"image": CAT, "task": task}, key=f"k-{i}")
@@ -889,6 +896,8 @@ const OUT_OF_SCOPE = [
   'https://169.254.169.254/latest/meta-data/',
   'tenants/t1/images/../../t2/images/cat.jpg',
   'tenants/t1-other/images/cat.jpg',
+  'tenants/t1/models/weights.bin',
+  'tenants/t1/images/../images/cat.jpg',
 ];
 
 function api(ctx) {
@@ -920,12 +929,19 @@ export async function check_route(ctx) {
   assert.equal(r.status, 401, \`without X-Tenant-Id the request must answer 401, got \${r.status}\`);
   r = await post(c, {image: 'tenants/t1/images/missing.jpg', task: 'classify'}, {key: 'k-3'});
   assert.equal(r.status, 404, \`a key with no object behind it answered \${r.status}, expected 404\`);
+  assert.equal(rows(ctx).length, 1, \`a 404 must store no inference: the store holds \${rows(ctx).length} rows after one 201 and one 404\`);
+  ctx.redis.set('vision:object:tenants/t1/images/missing.jpg', CAT_BYTES);
+  r = await post(c, {image: 'tenants/t1/images/missing.jpg', task: 'classify'}, {key: 'k-3'});
+  assert(r.status === 201 && r.json().content_hash === createHash('sha256').update(CAT_BYTES).digest('hex'), \`once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got \${r.status}: \${r.text}\`);
 }
 
 export async function check_task_catalog(ctx) {
   const c = api(ctx);
-  let r = await post(c, {image: CAT, task: 'segment-everything'}, {key: 'k-bad'});
-  assert.equal(r.status, 400, \`task 'segment-everything' answered \${r.status}, expected 400: the model router has no such task\`);
+  let r;
+  for (const [i, task] of ['segment-everything', 'Classify', 'classify '].entries()) {
+    r = await post(c, {image: CAT, task}, {key: \`k-bad-\${i}\`});
+    assert.equal(r.status, 400, \`task '\${task}' answered \${r.status}, expected 400: the catalog is exactly classify, detect and embed\`);
+  }
   assert.deepEqual(rows(ctx), [], \`a refused task must store no inference, found \${JSON.stringify(rows(ctx))}\`);
   for (const [i, task] of ['classify', 'detect', 'embed'].entries()) {
     r = await post(c, {image: CAT, task}, {key: \`k-\${i}\`});
@@ -994,6 +1010,8 @@ var apiOutOfScope = []string{
 	"https://169.254.169.254/latest/meta-data/",
 	"tenants/t1/images/../../t2/images/cat.jpg",
 	"tenants/t1-other/images/cat.jpg",
+	"tenants/t1/models/weights.bin",
+	"tenants/t1/images/../images/cat.jpg",
 }
 
 func apiClient(ctx *harness.Ctx) *harness.HTTP {
@@ -1038,12 +1056,19 @@ func CheckRoute(ctx *harness.Ctx) {
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the request")
 	missing := apiPost(c, "tenants/t1/images/missing.jpg", "classify", "k-3", "t1")
 	ctx.Equal(missing.Status, 404, "a key with no object behind it")
+	ctx.Equal(len(ctx.Redis.Keys("vision:inference:*")), 1, "a 404 must store no inference: rows after one 201 and one 404")
+	ctx.Redis.Set("vision:object:tenants/t1/images/missing.jpg", apiCatBytes)
+	retry := apiPost(c, "tenants/t1/images/missing.jpg", "classify", "k-3", "t1")
+	ctx.Assert(retry.Status == 201 && apiBody(ctx, retry)["content_hash"] == hex.EncodeToString(sum[:]), "once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got %d: %s", retry.Status, retry.Text())
 }
 
 func CheckTaskCatalog(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	r := apiPost(c, apiCat, "segment-everything", "k-bad", "t1")
-	ctx.Equal(r.Status, 400, "task segment-everything: the model router has no such task")
+	var r *harness.Response
+	for i, task := range []string{"segment-everything", "Classify", "classify "} {
+		r = apiPost(c, apiCat, task, "k-bad-"+strconv.Itoa(i), "t1")
+		ctx.Equal(r.Status, 400, "task %q: the catalog is exactly classify, detect and embed", task)
+	}
 	ctx.Equal(len(ctx.Redis.Keys("vision:inference:*")), 0, "a refused task must store no inference; inferences stored")
 	for i, task := range []string{"classify", "detect", "embed"} {
 		r = apiPost(c, apiCat, task, "k-"+strconv.Itoa(i), "t1")
@@ -1117,6 +1142,8 @@ const std::vector<std::string> kOutOfScope = {
     "https://169.254.169.254/latest/meta-data/",
     "tenants/t1/images/../../t2/images/cat.jpg",
     "tenants/t1-other/images/cat.jpg",
+    "tenants/t1/models/weights.bin",
+    "tenants/t1/images/../images/cat.jpg",
 };
 
 struct Api {
@@ -1157,11 +1184,18 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto noTenant = api.http.Post("/v1/inferences", json({{"image", kCat}, {"task", "classify"}}).dump(), "Idempotency-Key", "k-2");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the request");
   ctx.Equal(api.post("tenants/t1/images/missing.jpg", "classify", "k-3").Status, 404, "a key with no object behind it");
+  ctx.Equal(ctx.Redis.Keys("vision:inference:*").size(), 1, "a 404 must store no inference: rows after one 201 and one 404");
+  ctx.Redis.Set("vision:object:tenants/t1/images/missing.jpg", kCatBytes);
+  const auto retry = api.post("tenants/t1/images/missing.jpg", "classify", "k-3");
+  ctx.Assert(retry.Status == 201 && bodyOf(ctx, retry).value("content_hash", "") == sha256_hex(kCatBytes), "once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got %d: %s", retry.Status, retry.Text());
 }
 
 void CheckTaskCatalog(harness::Ctx& ctx) {
   Api api(ctx);
-  ctx.Equal(api.post(kCat, "segment-everything", "k-bad").Status, 400, "task segment-everything: the model router has no such task");
+  int bad = 0;
+  for (const char* task : {"segment-everything", "Classify", "classify "}) {
+    ctx.Equal(api.post(kCat, task, "k-bad-" + std::to_string(bad++)).Status, 400, "task '%s': the catalog is exactly classify, detect and embed", task);
+  }
   ctx.Equal(ctx.Redis.Keys("vision:inference:*").size(), 0, "a refused task must store no inference; inferences stored");
   int i = 0;
   for (const char* task : {"classify", "detect", "embed"}) {

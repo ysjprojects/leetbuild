@@ -23,7 +23,7 @@ answered counts as a yes; and a grant cannot be traced to the pool generation it
 service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RESOURCE_EXHAUSTED: no room
 \`\`\`
 
-- Every \`Confirm\` carries a \`DEADLINE_S\` = 0.25 s deadline.
+- Every \`Confirm\` attempt carries a \`DEADLINE_S\` = 0.25 s deadline of its own.
 - \`confirm_capacity(...)\` makes at most \`MAX_ATTEMPTS\` = 2 attempts and retries only the codes in
   \`RETRIABLE\` (\`UNAVAILABLE\`, \`DEADLINE_EXCEEDED\`).
 - \`RESOURCE_EXHAUSTED\` raises \`CapacityExhausted\` at once (the handler's 409).
@@ -65,7 +65,7 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
       id: 'deadline',
       title: 'Every Confirm carries a 250 ms deadline',
       detail:
-        'Each `Confirm` call is made with `DEADLINE_S` (0.25 s); the starter sets none, so a capacity service that stops answering holds every reserve open.',
+        'Each `Confirm` call is made with `DEADLINE_S` (0.25 s), and a second attempt after a first that failed late gets the full 0.25 s again; the starter sets none, so a capacity service that stops answering holds every reserve open.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.25\b/, /Confirm\([\s\S]{0,160}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*250\b/, /Confirm\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -78,7 +78,7 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
       id: 'retry-transient',
       title: 'Retries UNAVAILABLE and DEADLINE_EXCEEDED, twice at most',
       detail:
-        'One `UNAVAILABLE` is followed by exactly one more attempt; a pool that stays down gets `MAX_ATTEMPTS` (2) calls, not five, and no sleep stretches the reserve.',
+        'One `UNAVAILABLE` or `DEADLINE_EXCEEDED` is followed by exactly one more attempt; any other code, such as `INTERNAL`, `INVALID_ARGUMENT` or `PERMISSION_DENIED`, is `CapacityUnavailable` after one call; a pool that stays down gets `MAX_ATTEMPTS` (2) calls, not five, and no sleep stretches the reserve.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*2\b/, /RETRIABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
@@ -106,7 +106,7 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
       id: 'exhausted-terminal',
       title: 'A full pool is CapacityExhausted after one call',
       detail:
-        '`RESOURCE_EXHAUSTED` raises `CapacityExhausted` after a single `Confirm` and writes nothing; the starter asks again four times, then grants the units anyway.',
+        '`RESOURCE_EXHAUSTED` raises `CapacityExhausted` after a single `Confirm` and writes nothing, also when it answers the second attempt after an `UNAVAILABLE`; the starter asks again four times, then grants the units anyway.',
       match: {
         python: {all: [/RESOURCE_EXHAUSTED/, /raise CapacityExhausted/]},
         typescript: {all: [/RESOURCE_EXHAUSTED/, /throw new CapacityExhausted/]},
@@ -119,7 +119,7 @@ service Capacity { rpc Confirm(ConfirmRequest) returns (ConfirmReply); }  // RES
       id: 'deny-when-unsure',
       title: 'No confirmation, no grant',
       detail:
-        'A capacity service slower than the deadline makes the reserve raise `CapacityUnavailable` within a second and leaves the ledger untouched: `confirm_capacity` runs before `ledger.reserve`. The starter reserves whatever the pool said.',
+        'A capacity service slower than the deadline makes the reserve raise `CapacityUnavailable` after two attempts of 0.25 s, about half a second, and leaves the ledger untouched: `confirm_capacity` runs before `ledger.reserve`. The starter reserves whatever the pool said.',
       match: {
         python: {
           all: [/raise CapacityUnavailable/],
@@ -621,8 +621,12 @@ class Pool(capacity_pb2_grpc.CapacityServicer):
 
     def __init__(self):
         self.free = 16
+        self.restarts = 0  # calls that wait out their latency, then fail UNAVAILABLE
 
     def Confirm(self, request, context):
+        if self.restarts > 0:
+            self.restarts -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "pool restarting")
         if request.amount > self.free:
             context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, f"{self.free} {request.resource_class} units free in {request.window}")
         return capacity_pb2.ConfirmReply(source_version="pool-v42")
@@ -660,14 +664,18 @@ def _confirms(ctx):
 
 
 def check_deadline(ctx):
-    m, _ = _client(ctx)
+    m, pool = _client(ctx)
     kind, value = _outcome(m)
     assert kind == "ok" and value, f"with the pool answering, a reserve of 4 units must be granted, got {kind} {value!r}"
-    calls = ctx.grpc.calls_to("Confirm")
-    assert calls, "no Confirm call was made"
-    for call in calls:
+    assert ctx.grpc.calls_to("Confirm"), "no Confirm call was made"
+    # The first attempt fails UNAVAILABLE after 200 ms: the second still gets a deadline of its own.
+    ctx.grpc.set_latency("Confirm", 0.2)
+    pool.restarts = 1
+    kind, value = _outcome(m)
+    assert kind == "ok" and value, f"with every Confirm taking 200 ms and the first failing UNAVAILABLE, the second attempt must confirm and the reserve be granted, got {kind} {value!r}: every attempt carries its own DEADLINE_S, not what is left of one shared deadline"
+    for call in ctx.grpc.calls_to("Confirm"):
         assert call.timeout is not None, "a Confirm call carries no deadline: a stalled capacity service holds every reserve open"
-        assert 0.2 <= call.timeout <= 0.3, f"a Confirm call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.25"
+        assert 0.2 <= call.timeout <= 0.3, f"a Confirm call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.25 on every attempt"
 
 
 def check_retry_transient(ctx):
@@ -676,12 +684,27 @@ def check_retry_transient(ctx):
     kind, value = _outcome(m)
     assert kind == "ok" and value, f"one UNAVAILABLE, then an answer: the second attempt must confirm and the reserve be granted, got {kind} {value!r}"
     assert _confirms(ctx) == 2, f"one UNAVAILABLE took {_confirms(ctx)} Confirm calls, expected 2"
+    ctx.grpc.fail("Confirm", grpc.StatusCode.DEADLINE_EXCEEDED, "pool slow", times=1)
+    before = _confirms(ctx)
+    kind, value = _outcome(m)
+    assert kind == "ok" and value, f"one DEADLINE_EXCEEDED, then an answer: the second attempt must confirm and the reserve be granted, got {kind} {value!r}"
+    assert _confirms(ctx) - before == 2, f"one DEADLINE_EXCEEDED took {_confirms(ctx) - before} Confirm calls, expected 2"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED):
+        ctx.grpc.fail("Confirm", code, "not a transient fault", times=1)
+        before = _confirms(ctx)
+        outcome = _outcome(m)
+        made = _confirms(ctx) - before
+        assert made == 1, f"one {code.name} took {made} Confirm calls, expected 1: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        _expect_raise(outcome, m.CapacityUnavailable, f"with the pool answering {code.name}")
     ctx.grpc.fail("Confirm", grpc.StatusCode.UNAVAILABLE, "pool down", times=20)
     before = _confirms(ctx)
+    started = ctx.clock.time()
     outcome = _outcome(m)
     made = _confirms(ctx) - before
     assert made == 2, f"with the pool down the reserve made {made} Confirm calls, expected MAX_ATTEMPTS = 2"
     _expect_raise(outcome, m.CapacityUnavailable, "with the pool down")
+    waited = ctx.clock.time() - started
+    assert waited < 0.05, f"with the pool failing at once the reserve took {waited:.2f} s: no sleep may stretch the reserve between attempts"
 
 
 def check_exhausted_terminal(ctx):
@@ -691,6 +714,11 @@ def check_exhausted_terminal(ctx):
     assert _confirms(ctx) == 1, f"a pool that answered RESOURCE_EXHAUSTED was asked {_confirms(ctx)} times: a full pool is an answer, not a fault"
     _expect_raise(outcome, m.CapacityExhausted, "with 2 units free in the pool and 4 asked")
     _untouched(ctx, "the pool said it is full")
+    ctx.grpc.fail("Confirm", grpc.StatusCode.UNAVAILABLE, "pool restarting", times=1)
+    outcome = _outcome(m, amount=4)
+    assert _confirms(ctx) == 3, f"an UNAVAILABLE then RESOURCE_EXHAUSTED took {_confirms(ctx) - 1} Confirm calls, expected 2"
+    _expect_raise(outcome, m.CapacityExhausted, "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked")
+    _untouched(ctx, "the pool said it is full on the second attempt")
 
 
 def check_deny_when_unsure(ctx):
@@ -699,7 +727,7 @@ def check_deny_when_unsure(ctx):
     before = ctx.clock.time()
     outcome = _outcome(m)
     waited = ctx.clock.time() - before
-    assert waited <= 1.0, f"the reserve waited {waited:.1f} s for a capacity service that takes 5 s: two attempts of 250 ms, then deny"
+    assert waited <= 0.6, f"the reserve waited {waited:.2f} s for a capacity service that takes 5 s: two attempts of 250 ms, then deny"
     _expect_raise(outcome, m.CapacityUnavailable, "with the capacity service taking 5 s to answer")
     _untouched(ctx, "the capacity service never answered in time")
 
@@ -716,10 +744,15 @@ def check_source_version(ctx):
 /** The shared pool: free units in every window; a confirmation names generation pool-v42. */
 function client(ctx) {
   const pkg = ctx.proto('capacity.proto');
-  const pool = {free: 16};
+  // restarts: calls that wait out their latency, then fail UNAVAILABLE.
+  const pool = {free: 16, restarts: 0};
   ctx.grpc.serve(pkg.quota.Capacity.service, {
     Confirm(call, callback) {
       const {amount, resource_class, window} = call.request;
+      if (pool.restarts > 0) {
+        pool.restarts -= 1;
+        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'pool restarting'});
+      }
       if (Number(amount) > pool.free) {
         return callback({code: ctx.grpc.status.RESOURCE_EXHAUSTED, details: \`\${pool.free} \${resource_class} units free in \${window}\`});
       }
@@ -752,14 +785,21 @@ function untouched(ctx, why: string): void {
 const confirms = (ctx): number => ctx.grpc.callsTo('Confirm').length;
 
 export async function check_deadline(ctx) {
-  const {m} = client(ctx);
+  const {m, pool} = client(ctx);
   const got = await outcome(m);
   assert(got.ok && got.value, \`with the pool answering, a reserve of 4 units must be granted, got \${String(got.value)}\`);
-  const calls = ctx.grpc.callsTo('Confirm');
-  assert(calls.length > 0, 'no Confirm call was made');
-  for (const call of calls) {
+  assert(ctx.grpc.callsTo('Confirm').length > 0, 'no Confirm call was made');
+  // The first attempt fails UNAVAILABLE after 200 ms: the second still gets a deadline of its own.
+  ctx.grpc.setLatency('Confirm', 0.2);
+  pool.restarts = 1;
+  const second = await outcome(m);
+  assert(
+    second.ok && second.value,
+    \`with every Confirm taking 200 ms and the first failing UNAVAILABLE, the second attempt must confirm and the reserve be granted, got \${String(second.value)}: every attempt carries its own DEADLINE_MS, not what is left of one shared deadline\`,
+  );
+  for (const call of ctx.grpc.callsTo('Confirm')) {
     assert(call.timeout !== null, 'a Confirm call carries no deadline: a stalled capacity service holds every reserve open');
-    assert(call.timeout >= 0.2 && call.timeout <= 0.3, \`a Confirm call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 250\`);
+    assert(call.timeout >= 0.2 && call.timeout <= 0.3, \`a Confirm call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 250 on every attempt\`);
   }
 }
 
@@ -769,12 +809,28 @@ export async function check_retry_transient(ctx) {
   const first = await outcome(m);
   assert(first.ok && first.value, \`one UNAVAILABLE, then an answer: the second attempt must confirm and the reserve be granted, got \${String(first.value)}\`);
   assert.equal(confirms(ctx), 2, \`one UNAVAILABLE took \${confirms(ctx)} Confirm calls, expected 2\`);
+  ctx.grpc.fail('Confirm', ctx.grpc.status.DEADLINE_EXCEEDED, 'pool slow', 1);
+  let before = confirms(ctx);
+  const slow = await outcome(m);
+  assert(slow.ok && slow.value, \`one DEADLINE_EXCEEDED, then an answer: the second attempt must confirm and the reserve be granted, got \${String(slow.value)}\`);
+  assert.equal(confirms(ctx) - before, 2, \`one DEADLINE_EXCEEDED took \${confirms(ctx) - before} Confirm calls, expected 2\`);
+  for (const code of ['INTERNAL', 'INVALID_ARGUMENT', 'PERMISSION_DENIED']) {
+    ctx.grpc.fail('Confirm', ctx.grpc.status[code], 'not a transient fault', 1);
+    before = confirms(ctx);
+    const terminal = await outcome(m);
+    const made = confirms(ctx) - before;
+    assert.equal(made, 1, \`one \${code} took \${made} Confirm calls, expected 1: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    expectThrow(terminal, m.CapacityUnavailable, \`with the pool answering \${code}\`);
+  }
   ctx.grpc.fail('Confirm', ctx.grpc.status.UNAVAILABLE, 'pool down', 20);
-  const before = confirms(ctx);
+  before = confirms(ctx);
+  const started = ctx.clock.now();
   const down = await outcome(m);
   const made = confirms(ctx) - before;
   assert.equal(made, 2, \`with the pool down the reserve made \${made} Confirm calls, expected MAX_ATTEMPTS = 2\`);
   expectThrow(down, m.CapacityUnavailable, 'with the pool down');
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(waited < 0.05, \`with the pool failing at once the reserve took \${waited.toFixed(2)} s: no sleep may stretch the reserve between attempts\`);
 }
 
 export async function check_exhausted_terminal(ctx) {
@@ -784,6 +840,11 @@ export async function check_exhausted_terminal(ctx) {
   assert.equal(confirms(ctx), 1, \`a pool that answered RESOURCE_EXHAUSTED was asked \${confirms(ctx)} times: a full pool is an answer, not a fault\`);
   expectThrow(got, m.CapacityExhausted, 'with 2 units free in the pool and 4 asked');
   untouched(ctx, 'the pool said it is full');
+  ctx.grpc.fail('Confirm', ctx.grpc.status.UNAVAILABLE, 'pool restarting', 1);
+  const second = await outcome(m, 4);
+  assert.equal(confirms(ctx), 3, \`an UNAVAILABLE then RESOURCE_EXHAUSTED took \${confirms(ctx) - 1} Confirm calls, expected 2\`);
+  expectThrow(second, m.CapacityExhausted, 'with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked');
+  untouched(ctx, 'the pool said it is full on the second attempt');
 }
 
 export async function check_deny_when_unsure(ctx) {
@@ -792,7 +853,7 @@ export async function check_deny_when_unsure(ctx) {
   const before = ctx.clock.now();
   const got = await outcome(m);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 1.0, \`the reserve waited \${waited.toFixed(1)} s for a capacity service that takes 5 s: two attempts of 250 ms, then deny\`);
+  assert(waited <= 0.6, \`the reserve waited \${waited.toFixed(2)} s for a capacity service that takes 5 s: two attempts of 250 ms, then deny\`);
   expectThrow(got, m.CapacityUnavailable, 'with the capacity service taking 5 s to answer');
   untouched(ctx, 'the capacity service never answered in time');
 }
@@ -825,10 +886,15 @@ const clientWindow = "2026-11-02T14:00Z"
 // poolPeer is the shared pool: free units in every window; a confirmation names generation pool-v42.
 type poolPeer struct {
 	pb.UnimplementedCapacityServer
-	free int64
+	free     int64
+	restarts int // calls that wait out their latency, then fail UNAVAILABLE
 }
 
 func (p *poolPeer) Confirm(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
+	if p.restarts > 0 {
+		p.restarts--
+		return nil, status.Error(codes.Unavailable, "pool restarting")
+	}
 	if req.GetAmount() > p.free {
 		return nil, status.Errorf(codes.ResourceExhausted, "%d %s units free in %s", p.free, req.GetResourceClass(), req.GetWindow())
 	}
@@ -858,14 +924,18 @@ func untouched(ctx *harness.Ctx, why string) {
 func confirms(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Confirm", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
+	pool := client(ctx)
 	id, err := attempt(4)
 	ctx.Assert(err == nil && id != "", "with the pool answering, a reserve of 4 units must be granted, got %q %v", id, err)
-	calls := ctx.GRPC.CallsTo("Confirm", "")
-	ctx.Assert(len(calls) > 0, "no Confirm call was made")
-	for _, call := range calls {
+	ctx.Assert(len(ctx.GRPC.CallsTo("Confirm", "")) > 0, "no Confirm call was made")
+	// The first attempt fails UNAVAILABLE after 200 ms: the second still gets a deadline of its own.
+	ctx.GRPC.SetLatency("Confirm", 0.2, "")
+	pool.restarts = 1
+	id, err = attempt(4)
+	ctx.Assert(err == nil && id != "", "with every Confirm taking 200 ms and the first failing UNAVAILABLE, the second attempt must confirm and the reserve be granted, got %q %v: every attempt carries its own deadline, not what is left of one shared deadline", id, err)
+	for _, call := range ctx.GRPC.CallsTo("Confirm", "") {
 		ctx.Assert(call.HasDeadline(), "a Confirm call carries no deadline: a stalled capacity service holds every reserve open")
-		ctx.Assert(200*time.Millisecond <= call.Timeout && call.Timeout <= 300*time.Millisecond, "a Confirm call carries a %v deadline, expected 250 ms", call.Timeout)
+		ctx.Assert(200*time.Millisecond <= call.Timeout && call.Timeout <= 300*time.Millisecond, "a Confirm call carries a %v deadline, expected 250 ms on every attempt", call.Timeout)
 	}
 }
 
@@ -875,11 +945,26 @@ func CheckRetryTransient(ctx *harness.Ctx) {
 	id, err := attempt(4)
 	ctx.Assert(err == nil && id != "", "one UNAVAILABLE, then an answer: the second attempt must confirm and the reserve be granted, got %q %v", id, err)
 	ctx.Equal(confirms(ctx), 2, "one UNAVAILABLE must cost exactly one more attempt; the Confirm calls")
-	ctx.GRPC.Fail("Confirm", codes.Unavailable, "pool down", 20, "")
+	ctx.GRPC.Fail("Confirm", codes.DeadlineExceeded, "pool slow", 1, "")
 	before := confirms(ctx)
+	id, err = attempt(4)
+	ctx.Assert(err == nil && id != "", "one DEADLINE_EXCEEDED, then an answer: the second attempt must confirm and the reserve be granted, got %q %v", id, err)
+	ctx.Equal(confirms(ctx)-before, 2, "one DEADLINE_EXCEEDED must cost exactly one more attempt; the Confirm calls")
+	for _, code := range []codes.Code{codes.Internal, codes.InvalidArgument, codes.PermissionDenied} {
+		ctx.GRPC.Fail("Confirm", code, "not a transient fault", 1, "")
+		before = confirms(ctx)
+		id, err = attempt(4)
+		ctx.Equal(confirms(ctx)-before, 1, "one %v is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Confirm calls", code)
+		expectErr(ctx, id, err, ErrCapacityUnavailable, fmt.Sprintf("with the pool answering %v", code))
+	}
+	ctx.GRPC.Fail("Confirm", codes.Unavailable, "pool down", 20, "")
+	before = confirms(ctx)
+	started := ctx.Clock.Now()
 	id, err = attempt(4)
 	ctx.Equal(confirms(ctx)-before, 2, "with the pool down the reserve must stop at maxAttempts; the Confirm calls")
 	expectErr(ctx, id, err, ErrCapacityUnavailable, "with the pool down")
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(waited < 0.05, "with the pool failing at once the reserve took %.2f s: no sleep may stretch the reserve between attempts", waited)
 }
 
 func CheckExhaustedTerminal(ctx *harness.Ctx) {
@@ -889,6 +974,11 @@ func CheckExhaustedTerminal(ctx *harness.Ctx) {
 	ctx.Equal(confirms(ctx), 1, "a pool that answered RESOURCE_EXHAUSTED is an answer, not a fault; the Confirm calls")
 	expectErr(ctx, id, err, ErrCapacityExhausted, "with 2 units free in the pool and 4 asked")
 	untouched(ctx, "the pool said it is full")
+	ctx.GRPC.Fail("Confirm", codes.Unavailable, "pool restarting", 1, "")
+	id, err = attempt(4)
+	ctx.Equal(confirms(ctx), 3, "an UNAVAILABLE then RESOURCE_EXHAUSTED must take 2 more Confirm calls; the Confirm calls so far")
+	expectErr(ctx, id, err, ErrCapacityExhausted, "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked")
+	untouched(ctx, "the pool said it is full on the second attempt")
 }
 
 func CheckDenyWhenUnsure(ctx *harness.Ctx) {
@@ -897,7 +987,7 @@ func CheckDenyWhenUnsure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	id, err := attempt(4)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 1.0, "the reserve waited %.1f s for a capacity service that takes 5 s: two attempts of 250 ms, then deny", waited)
+	ctx.Assert(waited <= 0.6, "the reserve waited %.2f s for a capacity service that takes 5 s: two attempts of 250 ms, then deny", waited)
 	expectErr(ctx, id, err, ErrCapacityUnavailable, "with the capacity service taking 5 s to answer")
 	untouched(ctx, "the capacity service never answered in time")
 }
@@ -914,6 +1004,7 @@ func CheckSourceVersion(ctx *harness.Ctx) {
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -924,7 +1015,12 @@ const std::string kW = "2026-11-02T14:00Z";
 class PoolPeer final : public quota::Capacity::Service {
  public:
   long long free = 16;
+  int restarts = 0;  // calls that wait out their latency, then fail UNAVAILABLE
   grpc::Status Confirm(grpc::ServerContext*, const quota::ConfirmRequest* req, quota::ConfirmReply* out) override {
+    if (restarts > 0) {
+      --restarts;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "pool restarting");
+    }
     if (req->amount() > free) {
       return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, std::to_string(free) + " " + req->resource_class() + " units free in " + req->window());
     }
@@ -983,14 +1079,20 @@ size_t confirms(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Confirm").size(); 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
+  PoolPeer& pool = client(ctx);
   const Outcome got = attempt();
   ctx.Assert(!got.threw && got.id, "with the pool answering, a reserve of 4 units must be granted, got %s", got.threw ? got.what : "nothing");
-  const auto calls = ctx.GRPC.CallsTo("Confirm");
-  ctx.Assert(!calls.empty(), "no Confirm call was made");
-  for (const auto& call : calls) {
+  ctx.Assert(!ctx.GRPC.CallsTo("Confirm").empty(), "no Confirm call was made");
+  // The first attempt fails UNAVAILABLE after 200 ms: the second still gets a deadline of its own.
+  ctx.GRPC.SetLatency("Confirm", 0.2);
+  pool.restarts = 1;
+  const Outcome second = attempt();
+  ctx.Assert(!second.threw && second.id,
+             "with every Confirm taking 200 ms and the first failing UNAVAILABLE, the second attempt must confirm and the reserve be granted, got %s: every attempt carries its own kDeadline, not what is left of one shared deadline",
+             second.threw ? second.what : "nothing");
+  for (const auto& call : ctx.GRPC.CallsTo("Confirm")) {
     ctx.Assert(call.HasDeadline(), "a Confirm call carries no deadline: a stalled capacity service holds every reserve open");
-    ctx.Assert(0.2 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.3, "a Confirm call carries a %v s deadline, expected kDeadline = 250 ms", call.TimeoutSeconds());
+    ctx.Assert(0.2 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.3, "a Confirm call carries a %v s deadline, expected kDeadline = 250 ms on every attempt", call.TimeoutSeconds());
   }
 }
 
@@ -1000,11 +1102,28 @@ void CheckRetryTransient(harness::Ctx& ctx) {
   const Outcome first = attempt();
   ctx.Assert(!first.threw && first.id, "one UNAVAILABLE, then an answer: the second attempt must confirm and the reserve be granted, got %s", first.threw ? first.what : "nothing");
   ctx.Equal(confirms(ctx), 2, "one UNAVAILABLE must cost exactly one more attempt; the Confirm calls");
+  ctx.GRPC.Fail("Confirm", grpc::StatusCode::DEADLINE_EXCEEDED, "pool slow", 1);
+  size_t before = confirms(ctx);
+  const Outcome slow = attempt();
+  ctx.Assert(!slow.threw && slow.id, "one DEADLINE_EXCEEDED, then an answer: the second attempt must confirm and the reserve be granted, got %s", slow.threw ? slow.what : "nothing");
+  ctx.Equal(confirms(ctx) - before, 2, "one DEADLINE_EXCEEDED must cost exactly one more attempt; the Confirm calls");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.Fail("Confirm", code, "not a transient fault", 1);
+    before = confirms(ctx);
+    const Outcome got = attempt();
+    ctx.Equal(confirms(ctx) - before, 1, "one %s is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Confirm calls", name);
+    expectThrow(ctx, got, got.unavailable, "CapacityUnavailable", "with the pool answering " + name);
+  }
   ctx.GRPC.Fail("Confirm", grpc::StatusCode::UNAVAILABLE, "pool down", 20);
-  const size_t before = confirms(ctx);
+  before = confirms(ctx);
+  const int64_t started = ctx.Clock.Now();
   const Outcome down = attempt();
   ctx.Equal(confirms(ctx) - before, 2, "with the pool down the reserve must stop at kMaxAttempts; the Confirm calls");
   expectThrow(ctx, down, down.unavailable, "CapacityUnavailable", "with the pool down");
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(waited < 0.05, "with the pool failing at once the reserve took %.2f s: no sleep may stretch the reserve between attempts", waited);
 }
 
 void CheckExhaustedTerminal(harness::Ctx& ctx) {
@@ -1014,6 +1133,11 @@ void CheckExhaustedTerminal(harness::Ctx& ctx) {
   ctx.Equal(confirms(ctx), 1, "a pool that answered RESOURCE_EXHAUSTED is an answer, not a fault; the Confirm calls");
   expectThrow(ctx, got, got.exhausted, "CapacityExhausted", "with 2 units free in the pool and 4 asked");
   untouched(ctx, "the pool said it is full");
+  ctx.GRPC.Fail("Confirm", grpc::StatusCode::UNAVAILABLE, "pool restarting", 1);
+  const Outcome second = attempt(4);
+  ctx.Equal(confirms(ctx), 3, "an UNAVAILABLE then RESOURCE_EXHAUSTED must take 2 more Confirm calls; the Confirm calls so far");
+  expectThrow(ctx, second, second.exhausted, "CapacityExhausted", "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked");
+  untouched(ctx, "the pool said it is full on the second attempt");
 }
 
 void CheckDenyWhenUnsure(harness::Ctx& ctx) {
@@ -1022,7 +1146,7 @@ void CheckDenyWhenUnsure(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   const Outcome got = attempt();
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 1.0, "the reserve waited %.1f s for a capacity service that takes 5 s: two attempts of 250 ms, then deny", waited);
+  ctx.Assert(waited <= 0.6, "the reserve waited %.2f s for a capacity service that takes 5 s: two attempts of 250 ms, then deny", waited);
   expectThrow(ctx, got, got.unavailable, "CapacityUnavailable", "with the capacity service taking 5 s to answer");
   untouched(ctx, "the capacity service never answered in time");
 }

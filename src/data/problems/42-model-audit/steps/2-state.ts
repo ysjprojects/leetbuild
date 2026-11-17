@@ -57,7 +57,7 @@ for the head says valid about a chain with a hole in it.
       id: 'cas-append',
       title: 'One script appends only while the chain is where the append read it',
       detail:
-        'The write is a Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`) that compares `length` with what the append read (`~=`) before writing, and the append retries on 0; a plain `HSET` lets two appends write the same position.',
+        'The write is a Lua script (`register_script`/`defineCommand`/`NewScript`/`eval`) that compares `length` with what the append read (`~=`) before writing, and the append reads again and retries on 0, up to `MAX_APPEND_ATTEMPTS` = 5 attempts, so it still lands after losing four races; a plain `HSET` lets two appends write the same position.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/\br\.hset\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /~=/], none: [/redis\.hset\(/]},
@@ -709,6 +709,29 @@ def check_cas_append(ctx):
     assert chain.get("length") == "2", f"length is {chain.get('length')}, expected 2"
     verdict = m.verify_chain("t1", 1)
     assert verdict == {"valid": True, "chain_length": 2, "first_divergence": None}, f"after the race verify_chain answered {verdict}: the second link must be computed from the first"
+    # Under contention: eight writes from other replicas, each landing right after one of this append's
+    # commands, so up to four of its compare-and-sets lose; the fifth attempt (MAX_APPEND_ATTEMPTS) still lands.
+    busy = "audit:chain:t2"
+    landed = []
+
+    def replica():
+        n = len(landed) + 1
+        chain = ctx.redis.hgetall(busy)
+        position = int(chain.get("length") or 0) + 1
+        link = link_digest(chain.get("head", ""), _rec(100 + n), position)
+        ctx.redis.hset(busy, mapping={f"rec:{position}": _rec(100 + n), f"link:{position}": link, f"id:{position}": f"d-r{n}", "head": link, "length": position})
+        landed.append(position)
+        if n < 8:
+            ctx.redis_after(busy, replica)
+
+    ctx.redis_after(busy, replica)
+    try:
+        late = m.append_entry("t2", "d-late", _rec(50))
+    except Exception as exc:
+        raise AssertionError(f"an append whose compare-and-set lost to other replicas four times failed ({exc!r}): it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts") from None
+    assert late.get("position") == len(landed) + 1 and ctx.redis.hget(busy, f"id:{len(landed) + 1}") == "d-late", f"after other replicas took positions 1 to {len(landed)} the append answered {late}, expected position {len(landed) + 1}: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts"
+    verdict = m.verify_chain("t2", 1)
+    assert verdict == {"valid": True, "chain_length": len(landed) + 1, "first_divergence": None}, f"after the contended append verify_chain answered {verdict}"
 
 
 def check_no_ttl(ctx):
@@ -768,7 +791,7 @@ export async function check_chain_link(ctx) {
 }
 
 export async function check_cas_append(ctx) {
-  const {m, rec} = state(ctx);
+  const {m, rec, linkDigest} = state(ctx);
   // A second auditd replica appends right after this one read the chain.
   const rival = ctx.redisAfter(KEY, () => m.appendEntry('t1', 'd-rival', rec(9)));
   const mine = await m.appendEntry('t1', 'd-mine', rec(1));
@@ -781,6 +804,30 @@ export async function check_cas_append(ctx) {
   assert.equal(chain.length, '2', \`length is \${chain.length}, expected 2\`);
   const verdict = await m.verifyChain('t1', 1);
   assert.deepEqual(verdict, {valid: true, chain_length: 2, first_divergence: null}, \`after the race verifyChain answered \${JSON.stringify(verdict)}: the second link must be computed from the first\`);
+  // Under contention: eight writes from other replicas, each landing right after one of this append's
+  // commands, so up to four of its compare-and-sets lose; the fifth attempt (MAX_APPEND_ATTEMPTS) still lands.
+  const busy = 'audit:chain:t2';
+  const landed: number[] = [];
+  const replica = () => {
+    const n = landed.length + 1;
+    const chain = ctx.redis.hgetall(busy);
+    const position = Number(chain.length ?? 0) + 1;
+    const link = linkDigest(chain.head ?? '', rec(100 + n), position);
+    ctx.redis.hset(busy, {[\`rec:\${position}\`]: rec(100 + n), [\`link:\${position}\`]: link, [\`id:\${position}\`]: \`d-r\${n}\`, head: link, length: String(position)});
+    landed.push(position);
+    if (n < 8) ctx.redisAfter(busy, replica);
+  };
+  ctx.redisAfter(busy, replica);
+  let late;
+  try {
+    late = await m.appendEntry('t2', 'd-late', rec(50));
+  } catch (e) {
+    assert.fail(\`an append whose compare-and-set lost to other replicas four times failed (\${e}): it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts\`);
+  }
+  const next = landed.length + 1;
+  assert(late?.position === next && ctx.redis.hget(busy, \`id:\${next}\`) === 'd-late', \`after other replicas took positions 1 to \${landed.length} the append answered \${JSON.stringify(late)}, expected position \${next}: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts\`);
+  const contended = await m.verifyChain('t2', 1);
+  assert.deepEqual(contended, {valid: true, chain_length: next, first_divergence: null}, \`after the contended append verifyChain answered \${JSON.stringify(contended)}\`);
 }
 
 export async function check_no_ttl(ctx) {
@@ -816,6 +863,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 
 	"audit/digest"
 
@@ -893,6 +941,33 @@ func CheckCasAppend(ctx *harness.Ctx) {
 	ctx.Equal(ids, []string{"d-mine", "d-rival"}, "the ids at positions 1 and 2")
 	ctx.Equal(chain["length"], "2", "length")
 	expect(ctx, mustVerify(ctx, 1), true, 2, 0, "after the race (the second link must be computed from the first)")
+	// Under contention: eight writes from other replicas, each landing right after one of this append's
+	// commands, so up to four of its compare-and-sets lose; the fifth attempt (MAX_APPEND_ATTEMPTS) still lands.
+	const busy = "audit:chain:t2"
+	landed := 0
+	var replica func() any
+	replica = func() any {
+		landed++
+		chain := ctx.Redis.HGetAll(busy)
+		length, _ := strconv.Atoi(chain["length"])
+		position := length + 1
+		link := digest.LinkDigest(chain["head"], recDigest(100+landed), int64(position))
+		p := strconv.Itoa(position)
+		ctx.Redis.Do("HSET", busy, "rec:"+p, recDigest(100+landed), "link:"+p, link, "id:"+p, fmt.Sprintf("d-r%d", landed), "head", link, "length", p)
+		if landed < 8 {
+			ctx.Redis.After(busy, replica)
+		}
+		return nil
+	}
+	ctx.Redis.After(busy, replica)
+	late, err := appendEntry(stateBg, "t2", "d-late", recDigest(50))
+	ctx.NoError(err, "an append whose compare-and-set lost to other replicas four times failed: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts")
+	next := int64(landed + 1)
+	id, _ := ctx.Redis.HGet(busy, "id:"+strconv.FormatInt(next, 10))
+	ctx.Assert(late.Position == next && id == "d-late", "after other replicas took positions 1 to %d the append answered %+v, expected position %d: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts", landed, late, next)
+	contended, err := verifyChain(stateBg, "t2", 1)
+	ctx.NoError(err, "verifyChain(t2, 1) failed")
+	expect(ctx, contended, true, next, 0, "after the contended append")
 }
 
 func CheckNoTtl(ctx *harness.Ctx) {
@@ -920,6 +995,7 @@ func CheckFirstDivergence(ctx *harness.Ctx) {
     cpp: `#include <leetbuild/harness.h>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -986,6 +1062,33 @@ void CheckCasAppend(harness::Ctx& ctx) {
   ctx.Equal(ids, {std::string("d-mine"), std::string("d-rival")}, "the ids at positions 1 and 2");
   ctx.Equal(field(chain, "length"), "2", "length");
   expect(ctx, verifyChain("t1", 1), true, 2, std::nullopt, "after the race (the second link must be computed from the first)");
+  // Under contention: eight writes from other replicas, each landing right after one of this append's
+  // commands, so up to four of its compare-and-sets lose; the fifth attempt (MAX_APPEND_ATTEMPTS) still lands.
+  const std::string busy = "audit:chain:t2";
+  auto landed = std::make_shared<int>(0);
+  auto replica = std::make_shared<std::function<void()>>();
+  *replica = [&ctx, busy, landed, replica] {
+    const int n = ++*landed;
+    const auto chain = ctx.Redis.HGetAll(busy);
+    const std::string length = field(chain, "length");
+    const long position = (length.empty() ? 0 : std::stol(length)) + 1;
+    const std::string link = digest::linkDigest(field(chain, "head"), recDigest(100 + n), position);
+    const std::string p = std::to_string(position);
+    ctx.Redis.Do("HSET", busy, "rec:" + p, recDigest(100 + n), "link:" + p, link, "id:" + p, "d-r" + std::to_string(n), "head", link, "length", p);
+    if (n < 8) ctx.Redis.After(busy, *replica);
+  };
+  ctx.Redis.After(busy, *replica);
+  std::optional<Entry> late;
+  std::string error;
+  try {
+    late = appendEntry("t2", "d-late", recDigest(50));
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+  ctx.Assert(error.empty(), "an append whose compare-and-set lost to other replicas four times failed (%s): it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts", error);
+  const long next = *landed + 1;
+  ctx.Assert(late && late->position == next && ctx.Redis.HGet(busy, "id:" + std::to_string(next)).value_or("") == "d-late", "after other replicas took positions 1 to %d the append answered position %d, expected %d: it reads again and retries, up to MAX_APPEND_ATTEMPTS = 5 attempts", *landed, late ? late->position : 0L, next);
+  expect(ctx, verifyChain("t2", 1), true, next, std::nullopt, "after the contended append");
 }
 
 void CheckNoTtl(harness::Ctx& ctx) {
