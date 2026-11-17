@@ -62,7 +62,7 @@ replayed old version rolls a Tier 1 table back to Tier 4.
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'After a lost acknowledgement the topic holds the event once, and a leader failover right after the acknowledgement keeps it. The starter uses the default producer: its retry writes twice and a leader-only acknowledgement can vanish.',
+        'After a lost acknowledgement the topic holds the event once and the call returns true, and a leader failover right after the acknowledgement keeps it. The starter uses the default producer: its retry writes twice and a leader-only acknowledgement can vanish.',
       match: {
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -75,7 +75,7 @@ replayed old version rolls a Tier 1 table back to Tier 4.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and keeps a refused event',
       detail:
-        'A delivery the broker fails, or one with no report within the window, leaves an outbox row with the topic, the entity and the payload, and the call returns false. The starter only catches errors the produce call raises, which a broker refusal never does.',
+        'A delivery the broker fails, or one with no report within 5 s, leaves an outbox row with the topic, the entity and the whole payload, and the call returns false, without waiting much past the 5 s; a report that comes after 3 s is waited for, and the call returns true with no row. The starter only catches errors the produce call raises, which a broker refusal never does.',
       match: {
         python: {
           all: [/on_delivery\s*=/, /producer\.flush\(/, /store\.insert_outbox\(/],
@@ -91,7 +91,7 @@ replayed old version rolls a Tier 1 table back to Tier 4.
       id: 'version-guard',
       title: 'Applies only a newer version',
       detail:
-        'Versions 1, 2 and a replayed 1 of one table leave the catalogue at version 2 and Tier 1, and every record is committed. The starter applies whatever arrives last.',
+        'Versions 1, 2 and a replayed 1 of one table leave the catalogue at version 2 and Tier 1, the first version of another table is applied, a version older than the one the catalogue already holds is not, and every record is committed once its event is handled. The starter applies whatever arrives last.',
       match: {
         python: {all: [/store\.catalog_version\(/]},
         typescript: {all: [/catalogVersion\(/]},
@@ -764,7 +764,8 @@ def check_entity_key(ctx):
 def check_idempotent_acks(ctx):
     m = ctx.load("publish_classified")
     ctx.kafka.lose_acks(TOPIC, 1)  # the broker wrote it, the acknowledgement never arrived
-    _publish(m, "deliveries", 1)
+    ok = _publish(m, "deliveries", 1)
+    assert ok is True, f"publish_classified returned {ok!r} for an event the broker took, expected True"
     n = len(ctx.kafka.records(TOPIC))
     assert n == 1, f"after one lost acknowledgement the topic holds {n} records: the producer's retry wrote the event twice. Make it idempotent"
     _publish(m, "deliveries", 2)
@@ -780,28 +781,44 @@ def check_outbox_on_failure(ctx):
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the broker failed the delivery and the outbox holds {len(rows)} rows: the tier change is gone from the metadata store"
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "deliveries" and rows[0].get("payload", {}).get("version") == 1, f"the outbox row is {rows[0]}, expected the topic, the entity as key and the payload"
+    want = {"entity": "deliveries", "tier": 1, "tags": TAGS, "verified_by": "team-logistics", "version": 1}
+    assert rows[0].get("payload") == want, f"the outbox row carries the payload {rows[0].get('payload')}, expected the whole event {want}"
     assert ok is False, f"publish_classified returned {ok!r} after a failed delivery, expected False"
+    ctx.kafka.stall(TOPIC, 3)  # a slow broker: the acknowledgement comes after 3 s, inside the window
+    ok = _publish(m, "deliveries", 2)
+    assert ok is True and len(_outbox(ctx)) == 1, f"a broker that acknowledged after 3 s got publish_classified returning {ok!r} with {len(_outbox(ctx)) - 1} new outbox row(s): wait up to ACK_TIMEOUT_S = 5 for the report"
+    assert len(ctx.kafka.records(TOPIC)) == 1, f"the slowly acknowledged event is not on {TOPIC}"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     started = ctx.clock.time()
-    ok = _publish(m, "deliveries", 2)
+    ok = _publish(m, "deliveries", 3)
     waited = ctx.clock.time() - started
-    assert waited <= 10, f"publish_classified waited {waited:.0f} s on a broker that does not answer, expected at most ACK_TIMEOUT_S = 5"
+    assert waited <= 6, f"publish_classified waited {waited:.0f} s on a broker that does not answer, expected at most ACK_TIMEOUT_S = 5"
     rows = _outbox(ctx)
-    assert len(rows) == 2 and rows[1].get("payload", {}).get("version") == 2, f"no delivery report within the window and the outbox holds {rows}"
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("version") == 3, f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_classified returned {ok!r} without a delivery report, expected False"
 
 
 def check_version_guard(ctx):
-    for version, tier in ((1, 4), (2, 1), (1, 4)):  # the last one is a replay of version 1
-        event = {"entity": "deliveries", "tier": tier, "tags": TAGS, "verified_by": "team-logistics", "version": version}
-        ctx.kafka.seed(TOPIC, key="deliveries", value=json.dumps(event))
+    # payments is at version 5 in the catalogue already, from before this consumer started.
+    ctx.redis.hset("catalog:payments", mapping={"tier": 1, "tags": json.dumps(TAGS, sort_keys=True), "version": 5})
+    events = [("deliveries", 1, 4), ("deliveries", 2, 1), ("deliveries", 1, 4), ("orders", 1, 3), ("payments", 4, 4)]
+    for entity, version, tier in events:  # deliveries 1 is replayed after 2; orders and payments are other tables
+        event = {"entity": entity, "tier": tier, "tags": TAGS, "verified_by": "team-logistics", "version": version}
+        ctx.kafka.seed(TOPIC, key=entity, value=json.dumps(event), partition=0)
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.hget("catalog:deliveries", "version")))
     m = ctx.load("publish_classified")
     try:
         ctx.drain(m.consume)
     except Exception as exc:
         raise AssertionError(f"consume() stopped with {type(exc).__name__}: {exc}") from exc
+    assert at_commit and at_commit[0] == "1", f"the first offset was committed with the catalogue at version {at_commit[0] if at_commit else None}, expected 1: commit after the event is applied"
     catalog = ctx.redis.hgetall("catalog:deliveries")
     assert catalog.get("version") == "2" and catalog.get("tier") == "1", f"after versions 1, 2 and a replayed 1 the catalogue holds version {catalog.get('version')} at tier {catalog.get('tier')}: the replay rolled the table back. Apply only a newer version"
+    orders = ctx.redis.hgetall("catalog:orders")
+    assert orders.get("version") == "1" and orders.get("tier") == "3", f"orders version 1, the first of another table, left the catalogue at {orders}: versions are compared per entity"
+    payments = ctx.redis.hgetall("catalog:payments")
+    assert payments.get("version") == "5" and payments.get("tier") == "1", f"payments version 4 arrived with the catalogue already at version 5 and left {payments}: compare with store.catalog_version, what the metadata store holds"
     assert ctx.kafka.lag(GROUP, TOPIC) == 0, f"{ctx.kafka.lag(GROUP, TOPIC)} record(s) left uncommitted: a skipped version is committed too"
 `,
     typescript: `const TOPIC = 'entity.classified';
@@ -835,8 +852,9 @@ export async function check_entity_key(ctx) {
 export async function check_idempotent_acks(ctx) {
   const m = ctx.load('publish_classified');
   ctx.kafka.loseAcks(TOPIC, 1); // the broker wrote it, the acknowledgement never arrived
-  await publish(m, 'deliveries', 1);
+  const ok = await publish(m, 'deliveries', 1);
   await settle();
+  assert.equal(ok, true, \`publishClassified resolved \${JSON.stringify(ok)} for an event the broker took, expected true\`);
   let n = ctx.kafka.records(TOPIC).length;
   assert.equal(n, 1, \`after one lost acknowledgement the topic holds \${n} records: the producer's retry wrote the event twice. Make it idempotent\`);
   await publish(m, 'deliveries', 2);
@@ -854,26 +872,49 @@ export async function check_outbox_on_failure(ctx) {
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the broker failed the delivery and the outbox holds \${rows.length} rows: the tier change is gone from the metadata store\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'deliveries' && rows[0].payload?.version === 1, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the entity as key and the payload\`);
+  const want = {entity: 'deliveries', tier: 1, tags: TAGS, verified_by: 'team-logistics', version: 1};
+  assert.deepEqual(rows[0].payload, want, \`the outbox row carries the payload \${JSON.stringify(rows[0].payload)}, expected the whole event\`);
   assert.equal(ok, false, \`publishClassified resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
+  ctx.kafka.stall(TOPIC, 3); // a slow broker: the acknowledgement comes after 3 s, inside the window
+  ok = await publish(m, 'deliveries', 2);
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 1, \`a broker that acknowledged after 3 s got publishClassified resolving \${JSON.stringify(ok)} with \${outboxRows(ctx).length - 1} new outbox row(s): wait up to ACK_TIMEOUT_MS = 5000 for the report\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, \`the slowly acknowledged event is not on \${TOPIC}\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const started = ctx.clock.now();
-  ok = await publish(m, 'deliveries', 2);
+  ok = await publish(m, 'deliveries', 3);
   const waited = (ctx.clock.now() - started) / 1000;
-  assert(waited <= 10, \`publishClassified waited \${waited.toFixed(0)} s on a broker that does not answer, expected at most ACK_TIMEOUT_MS = 5000\`);
+  assert(waited <= 6, \`publishClassified waited \${waited.toFixed(0)} s on a broker that does not answer, expected at most ACK_TIMEOUT_MS = 5000\`);
+  await settle();
   rows = outboxRows(ctx);
-  assert(rows.length === 2 && rows[1].payload?.version === 2, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert(rows.length === 2 && rows[1].payload?.version === 3, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishClassified resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
 }
 
 export async function check_version_guard(ctx) {
-  for (const [version, tier] of [[1, 4], [2, 1], [1, 4]]) {
-    // the last one is a replay of version 1
-    ctx.kafka.seed(TOPIC, {key: 'deliveries', value: JSON.stringify({entity: 'deliveries', tier, tags: TAGS, verified_by: 'team-logistics', version})});
+  // payments is at version 5 in the catalogue already, from before this consumer started.
+  ctx.redis.hset('catalog:payments', {tier: '1', tags: JSON.stringify(TAGS), version: '5'});
+  const events: [string, number, number][] = [
+    ['deliveries', 1, 4],
+    ['deliveries', 2, 1],
+    ['deliveries', 1, 4], // a replay of version 1
+    ['orders', 1, 3], // another table
+    ['payments', 4, 4],
+  ];
+  for (const [entity, version, tier] of events) {
+    ctx.kafka.seed(TOPIC, {key: entity, value: JSON.stringify({entity, tier, tags: TAGS, verified_by: 'team-logistics', version}), partition: 0});
   }
+  const atCommit: (string | null)[] = [];
+  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hget('catalog:deliveries', 'version')));
   const m = ctx.load('publish_classified');
   await ctx.drain(m.consume());
+  assert(atCommit.length > 0 && atCommit[0] === '1', \`the first offset was committed with the catalogue at version \${atCommit[0]}, expected 1: commit after the event is applied\`);
   const catalog = ctx.redis.hgetall('catalog:deliveries');
   assert(catalog.version === '2' && catalog.tier === '1', \`after versions 1, 2 and a replayed 1 the catalogue holds version \${catalog.version} at tier \${catalog.tier}: the replay rolled the table back. Apply only a newer version\`);
+  const orders = {...ctx.redis.hgetall('catalog:orders')};
+  assert(orders.version === '1' && orders.tier === '3', \`orders version 1, the first of another table, left the catalogue at \${JSON.stringify(orders)}: versions are compared per entity\`);
+  const payments = {...ctx.redis.hgetall('catalog:payments')};
+  assert(payments.version === '5' && payments.tier === '1', \`payments version 4 arrived with the catalogue already at version 5 and left \${JSON.stringify(payments)}: compare with catalogVersion, what the metadata store holds\`);
   assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, 'a skipped version must be committed too');
 }
 `,
@@ -928,8 +969,9 @@ func CheckEntityKey(ctx *harness.Ctx) {
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(classifiedTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	classifiedPublish(ctx, "deliveries", 1, 1, classifiedTags)
+	ok := classifiedPublish(ctx, "deliveries", 1, 1, classifiedTags)
 	ctx.Settle()
+	ctx.Equal(ok, true, "publishClassified's result for an event the broker took")
 	ctx.Equal(len(ctx.Kafka.Records(classifiedTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
 	classifiedPublish(ctx, "deliveries", 2, 1, classifiedTags)
 	ctx.Settle()
@@ -944,22 +986,47 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	rows := classifiedOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker failed the delivery: without an outbox row the tier change is gone from the metadata store; the rows")
 	ctx.Assert(rows[0].Topic == classifiedTopic && rows[0].Key == "deliveries" && rows[0].Payload["version"] == float64(1), "the outbox row is %v, expected the topic, the entity as key and the payload", rows[0])
+	ctx.Equal(rows[0].Payload, map[string]any{"entity": "deliveries", "tier": float64(1), "tags": map[string]any{"passport_no": "Personal.ID", "merchant_id": "None"}, "verified_by": "team-logistics", "version": float64(1)}, "the outbox row must carry the whole event as its payload")
 	ctx.Equal(ok, false, "publishClassified's result after a failed delivery")
+	ctx.Kafka.StallFor(classifiedTopic, 3) // a slow broker: the acknowledgement comes after 3 s, inside the window
+	ok = classifiedPublish(ctx, "deliveries", 2, 1, classifiedTags)
+	ctx.Settle()
+	ctx.Assert(ok && len(classifiedOutbox(ctx)) == 1, "a broker that acknowledged after 3 s got publishClassified returning %v with %d new outbox row(s): wait up to 5 s for the report", ok, len(classifiedOutbox(ctx))-1)
+	ctx.Equal(len(ctx.Kafka.Records(classifiedTopic)), 1, "the slowly acknowledged event must be on the topic; records")
 	ctx.Kafka.Stall(classifiedTopic) // the broker stops answering
 	started := ctx.Clock.Now()
-	ok = classifiedPublish(ctx, "deliveries", 2, 1, classifiedTags)
+	ok = classifiedPublish(ctx, "deliveries", 3, 1, classifiedTags)
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	ctx.Assert(waited <= 10, "publishClassified waited %.0f s on a broker that does not answer, expected at most 5", waited)
+	ctx.Assert(waited <= 6, "publishClassified waited %.0f s on a broker that does not answer, expected at most 5", waited)
+	ctx.Settle()
 	rows = classifiedOutbox(ctx)
-	ctx.Assert(len(rows) == 2 && rows[1].Payload["version"] == float64(2), "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["version"] == float64(3), "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishClassified's result without a delivery report")
 }
 
 func CheckVersionGuard(ctx *harness.Ctx) {
-	for _, v := range [][2]int{{1, 4}, {2, 1}, {1, 4}} { // the last one is a replay of version 1
-		event, _ := json.Marshal(map[string]any{"entity": "deliveries", "tier": v[1], "tags": classifiedTags, "verified_by": "team-logistics", "version": v[0]})
-		ctx.Kafka.Seed(classifiedTopic, "deliveries", event)
+	// payments is at version 5 in the catalogue already, from before this consumer started.
+	tagsJSON, _ := json.Marshal(classifiedTags)
+	ctx.Redis.Do("HSET", "catalog:payments", "tier", 1, "tags", string(tagsJSON), "version", 5)
+	events := []struct {
+		entity        string
+		version, tier int
+	}{
+		{"deliveries", 1, 4},
+		{"deliveries", 2, 1},
+		{"deliveries", 1, 4}, // a replay of version 1
+		{"orders", 1, 3},     // another table
+		{"payments", 4, 4},
 	}
+	for _, e := range events {
+		event, _ := json.Marshal(map[string]any{"entity": e.entity, "tier": e.tier, "tags": classifiedTags, "verified_by": "team-logistics", "version": e.version})
+		ctx.Kafka.SeedPartition(classifiedTopic, 0, e.entity, event)
+	}
+	var atCommit []string
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		v, _ := ctx.Redis.HGet("catalog:deliveries", "version")
+		atCommit = append(atCommit, v)
+	})
 	c, cancel := context.WithCancel(context.Background())
 	var err error
 	ctx.Drain(func() { err = consume(c) })
@@ -969,7 +1036,12 @@ func CheckVersionGuard(ctx *harness.Ctx) {
 		ctx.Fatalf("consume returned an error: %v", err)
 	}
 	catalog := ctx.Redis.HGetAll("catalog:deliveries")
+	ctx.Assert(len(atCommit) > 0 && atCommit[0] == "1", "the first offset was committed with the catalogue at version %v, expected 1: commit after the event is applied", atCommit)
 	ctx.Assert(catalog["version"] == "2" && catalog["tier"] == "1", "after versions 1, 2 and a replayed 1 the catalogue holds version %s at tier %s: the replay rolled the table back. Apply only a newer version", catalog["version"], catalog["tier"])
+	orders := ctx.Redis.HGetAll("catalog:orders")
+	ctx.Assert(orders["version"] == "1" && orders["tier"] == "3", "orders version 1, the first of another table, left the catalogue at %v: versions are compared per entity", orders)
+	payments := ctx.Redis.HGetAll("catalog:payments")
+	ctx.Assert(payments["version"] == "5" && payments["tier"] == "1", "payments version 4 arrived with the catalogue already at version 5 and left %v: compare with store.CatalogVersion, what the metadata store holds", payments)
 	ctx.Equal(ctx.Kafka.Lag(classifiedGroup, classifiedTopic), 0, "a skipped version must be committed too; records left")
 }
 `,
@@ -983,14 +1055,14 @@ func CheckVersionGuard(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kGroup = "metadata-store";
-const std::map<std::string, std::string> kTags = {{"passport_no", "Personal.ID"}, {"merchant_id", "None"}};
+const std::string hGroup = "metadata-store";
+const std::map<std::string, std::string> hTags = {{"passport_no", "Personal.ID"}, {"merchant_id", "None"}};
 
-bool publish(const std::string& entity, long long version, int tier = 1, const std::map<std::string, std::string>& tags = kTags) {
+bool hPublish(const std::string& entity, long long version, int tier = 1, const std::map<std::string, std::string>& tags = hTags) {
   return publishClassified(entity, tier, tags, "team-logistics", version);
 }
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1000,36 +1072,37 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-long long payloadVersion(const nlohmann::json& row) {
+long long hPayloadVersion(const nlohmann::json& row) {
   return row.contains("payload") && row["payload"].is_object() ? row["payload"].value("version", 0LL) : 0;
 }
 
-struct runner {
+struct hConsumeRunner {
   bool done = false;
   std::optional<std::string> err;
 };
-std::shared_ptr<runner> active;
+std::shared_ptr<hConsumeRunner> hConsumeActive;
 
 }  // namespace
 
 void CheckEntityKey(harness::Ctx& ctx) {
-  publish("deliveries", 1);
-  publish("orders", 1, 4, {{"order_id", "None"}});
-  publish("deliveries", 2);
+  hPublish("deliveries", 1);
+  hPublish("orders", 1, 4, {{"order_id", "None"}});
+  hPublish("deliveries", 2);
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kClassifiedTopic);
   ctx.Equal(ctx.Kafka.Keys(kClassifiedTopic), {"deliveries", "orders", "deliveries"}, "the records must be keyed by entity: one table's versions share a key");
   ctx.Equal(records[0].Partition, records[2].Partition, "both versions of deliveries must land on one partition, or the metadata store sees them out of order; the partitions");
   const auto value = nlohmann::json::parse(ctx.Kafka.Values(kClassifiedTopic)[2], nullptr, false);
-  ctx.Equal(value, nlohmann::json{{"entity", "deliveries"}, {"tier", 1}, {"tags", kTags}, {"verified_by", "team-logistics"}, {"version", 2}}, "the event");
+  ctx.Equal(value, nlohmann::json{{"entity", "deliveries"}, {"tier", 1}, {"tags", hTags}, {"verified_by", "team-logistics"}, {"version", 2}}, "the event");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kClassifiedTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish("deliveries", 1);
+  const bool ok = hPublish("deliveries", 1);
   ctx.Settle();
+  ctx.Equal(ok, true, "publishClassified's result for an event the broker took");
   ctx.Equal(ctx.Kafka.Records(kClassifiedTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publish("deliveries", 2);
+  hPublish("deliveries", 2);
   ctx.Settle();
   ctx.Kafka.Failover(kClassifiedTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kClassifiedTopic).size(), 2, "a leader failover must not lose an acknowledged event (acks=all); the records");
@@ -1037,30 +1110,55 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kClassifiedTopic, 1);
-  bool ok = publish("deliveries", 1);
+  bool ok = hPublish("deliveries", 1);
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the broker failed the delivery: without an outbox row the tier change is gone from the metadata store; the rows");
-  ctx.Assert(rows[0].value("topic", "") == kClassifiedTopic && rows[0].value("key", "") == "deliveries" && payloadVersion(rows[0]) == 1,
+  ctx.Assert(rows[0].value("topic", "") == kClassifiedTopic && rows[0].value("key", "") == "deliveries" && hPayloadVersion(rows[0]) == 1,
              "the outbox row is %s, expected the topic, the entity as key and the payload", rows[0].dump());
+  ctx.Equal(rows[0].contains("payload") ? rows[0]["payload"] : nlohmann::json(),
+            nlohmann::json{{"entity", "deliveries"}, {"tier", 1}, {"tags", hTags}, {"verified_by", "team-logistics"}, {"version", 1}},
+            "the outbox row must carry the whole event as its payload");
   ctx.Equal(ok, false, "publishClassified's result after a failed delivery");
+  ctx.Kafka.StallFor(kClassifiedTopic, 3);  // a slow broker: the acknowledgement comes after 3 s, inside the window
+  ok = hPublish("deliveries", 2);
+  ctx.Settle();
+  ctx.Assert(ok && hOutboxRows(ctx).size() == 1, "a broker that acknowledged after 3 s got publishClassified returning %v with %d new outbox row(s): wait up to 5 s for the report", ok,
+             hOutboxRows(ctx).size() - 1);
+  ctx.Equal(ctx.Kafka.Records(kClassifiedTopic).size(), 1, "the slowly acknowledged event must be on the topic; records");
   ctx.Kafka.Stall(kClassifiedTopic);  // the broker stops answering
   const int64_t started = ctx.Clock.Now();
-  ok = publish("deliveries", 2);
+  ok = hPublish("deliveries", 3);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  ctx.Assert(waited <= 10, "publishClassified waited %.0f s on a broker that does not answer, expected at most 5", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && payloadVersion(rows[1]) == 2, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(waited <= 6, "publishClassified waited %.0f s on a broker that does not answer, expected at most 5", waited);
+  ctx.Settle();
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && hPayloadVersion(rows[1]) == 3, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishClassified's result without a delivery report");
 }
 
 void CheckVersionGuard(harness::Ctx& ctx) {
-  for (const auto& [version, tier] : std::vector<std::pair<int, int>>{{1, 4}, {2, 1}, {1, 4}}) {  // the last one is a replay of version 1
-    ctx.Kafka.Seed(kClassifiedTopic, "deliveries",
-                   nlohmann::json{{"entity", "deliveries"}, {"tier", tier}, {"tags", kTags}, {"verified_by", "team-logistics"}, {"version", version}}.dump());
+  // payments is at version 5 in the catalogue already, from before this consumer started.
+  ctx.Redis.Do("HSET", "catalog:payments", "tier", "1", "tags", nlohmann::json(hTags).dump(), "version", "5");
+  struct Event {
+    std::string entity;
+    int version, tier;
+  };
+  const std::vector<Event> events = {
+      {"deliveries", 1, 4},
+      {"deliveries", 2, 1},
+      {"deliveries", 1, 4},  // a replay of version 1
+      {"orders", 1, 3},      // another table
+      {"payments", 4, 4},
+  };
+  for (const auto& e : events) {
+    ctx.Kafka.SeedPartition(kClassifiedTopic, 0, e.entity,
+                            nlohmann::json{{"entity", e.entity}, {"tier", e.tier}, {"tags", hTags}, {"verified_by", "team-logistics"}, {"version", e.version}}.dump());
   }
-  if (!active || active->done) {
-    auto r = active = std::make_shared<runner>();
+  std::vector<std::string> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HGet("catalog:deliveries", "version").value_or("")); });
+  if (!hConsumeActive || hConsumeActive->done) {
+    auto r = hConsumeActive = std::make_shared<hConsumeRunner>();
     lb::spawn([r] {
       try {
         consume();
@@ -1073,12 +1171,19 @@ void CheckVersionGuard(harness::Ctx& ctx) {
     });
   }
   ctx.Settle();
-  if (active->done && active->err) ctx.Fatalf("consume() stopped with %s", *active->err);
+  if (hConsumeActive->done && hConsumeActive->err) ctx.Fatalf("consume() stopped with %s", *hConsumeActive->err);
   const auto catalog = ctx.Redis.HGetAll("catalog:deliveries");
   const std::string version = catalog.count("version") ? catalog.at("version") : "";
   const std::string tier = catalog.count("tier") ? catalog.at("tier") : "";
+  ctx.Assert(!atCommit.empty() && atCommit[0] == "1", "the first offset was committed with the catalogue at version %v, expected 1: commit after the event is applied", atCommit);
   ctx.Assert(version == "2" && tier == "1", "after versions 1, 2 and a replayed 1 the catalogue holds version %q at tier %q: the replay rolled the table back. Apply only a newer version", version, tier);
-  ctx.Equal(ctx.Kafka.Lag(kGroup, kClassifiedTopic), 0, "a skipped version must be committed too; records left");
+  const auto orders = ctx.Redis.HGetAll("catalog:orders");
+  ctx.Assert(orders.count("version") && orders.at("version") == "1" && orders.count("tier") && orders.at("tier") == "3",
+             "orders version 1, the first of another table, left the catalogue at %s: versions are compared per entity", nlohmann::json(orders).dump());
+  const auto payments = ctx.Redis.HGetAll("catalog:payments");
+  ctx.Assert(payments.count("version") && payments.at("version") == "5" && payments.count("tier") && payments.at("tier") == "1",
+             "payments version 4 arrived with the catalogue already at version 5 and left %s: compare with store::catalogVersion, what the metadata store holds", nlohmann::json(payments).dump());
+  ctx.Equal(ctx.Kafka.Lag(hGroup, kClassifiedTopic), 0, "a skipped version must be committed too; records left");
 }
 `,
   },

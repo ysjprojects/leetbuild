@@ -55,7 +55,7 @@ is a hope; and keys without an expiry grow with every table the lake ever had.
       id: 'budget-atomic',
       title: 'Reserves the day’s budget atomically, before the call',
       detail:
-        'With the day at 400 no call is made; at 399 with another worker reserving at the same moment, exactly one of the two gets the slot and the counter never passes 400. The starter reads, calls, then increments, so both workers pass.',
+        'With the day at 400 no call is made and the counter stays at 400; at 399 the 400th entity still gets its slot, and with another worker reserving at the same moment exactly one of the two gets it and the counter never passes 400. The starter reads, calls, then increments, so both workers pass.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /['"]INCR['"]/, /['"]DECR['"]/], none: [/\br\.incr\(/]},
         typescript: {all: [/\.eval\(|defineCommand\(/, /['"]INCR['"]/, /['"]DECR['"]/], none: [/redis\.incr\(/]},
@@ -68,7 +68,7 @@ is a hope; and keys without an expiry grow with every table the lake ever had.
       id: 'expiry',
       title: 'Every key it writes expires',
       detail:
-        'The cached tags and `verify:{entity}` expire after 7 days and the day counter after 2. The starter sets no expiry on any of them.',
+        'The cached tags and `verify:{entity}` expire after 7 days and the day counter 2 days after its first write, not its latest; the tags and the counter have their expiry from the moment they exist. The starter sets no expiry on any of them.',
       match: {
         python: {all: [/ex\s*=\s*RESULT_TTL_S/, /\.expire\([^\n]*VERIFY_TTL_S/, /BUDGET_TTL_S/]},
         typescript: {all: [/['"]EX['"],\s*RESULT_TTL_S/, /\.expire\([^\n]*VERIFY_TTL_S/, /BUDGET_TTL_S/]},
@@ -613,6 +613,10 @@ def check_budget_atomic(ctx):
     except m.BudgetExhausted:
         pass
     assert _calls(ctx) == 0, f"with today's budget spent the model was called {_calls(ctx)} time(s)"
+    assert ctx.redis.get(day) == "400", f"a refused reservation left {day} at {ctx.redis.get(day)!r}, expected 400: over the cap the slot is given back"
+    ctx.redis.set(day, 399)
+    _classify(m, _job("payments", OLD))  # the 400th entity of the day still fits
+    assert _calls(ctx) == 1 and ctx.redis.get(day) == "400", f"at 399 the 400th entity must get the last slot: {_calls(ctx)} call(s), {day} = {ctx.redis.get(day)!r}"
     ctx.redis.set(day, 399)
     other = []
 
@@ -634,11 +638,31 @@ def check_budget_atomic(ctx):
     assert probe.fired and other, f"classify_entity never touched {day}"
     assert used <= 400, f"two workers raced for the last slot and {day} reads {used}: the read, the call and the INCR are separate steps, so both passed. Reserve with one script before the call"
     assert mine != other[0], f"exactly one of the two workers gets the last slot (yours: {mine}, the other: {other[0]})"
-    assert _calls(ctx) == (1 if mine else 0), f"the model was called {_calls(ctx)} time(s) though your worker {'got' if mine else 'did not get'} a slot"
+    assert _calls(ctx) == (2 if mine else 1), f"the model was called {_calls(ctx) - 1} time(s) though your worker {'got' if mine else 'did not get'} a slot"
+
+
+def _ttl_when_written(ctx, key, seen):
+    """The TTL of key right after the first command that leaves it existing (a lookup of the missing key
+    before that re-arms the probe)."""
+
+    def watch():
+        if ctx.redis.exists(key):
+            seen[key] = ctx.redis.ttl(key)
+        else:
+            ctx.redis_after(key, watch)
+
+    ctx.redis_after(key, watch)
 
 
 def check_expiry(ctx):
     m = _module(ctx)
+    into_day = ctx.clock.time() % 86400
+    if into_day > 86400 - 7200:  # the hour this check waits stays inside one UTC day
+        ctx.clock.advance(86400 - into_day + 60)
+    at_write = {}
+    cache_key = f"classify:deliveries:{jobs.schema_hash(NEW)}"
+    _ttl_when_written(ctx, cache_key, at_write)
+    _ttl_when_written(ctx, _day(), at_write)
     _classify(m, _job("deliveries", NEW))
     written = ctx.redis.keys("classify:*")
     assert written, "classify_entity cached nothing under classify:*"
@@ -650,7 +674,15 @@ def check_expiry(ctx):
     ttl = ctx.redis.ttl("verify:deliveries")
     assert 604000 <= ttl <= 604800, f"verify:deliveries has TTL {ttl}, expected VERIFY_TTL_S = 604800 (7 days)"
     ttl = ctx.redis.ttl(_day())
-    assert 0 < ttl <= 172800, f"{_day()} has TTL {ttl}, expected BUDGET_TTL_S = 172800 (2 days) set on its first write"
+    assert 172000 <= ttl <= 172800, f"{_day()} has TTL {ttl}, expected BUDGET_TTL_S = 172800 (2 days) set on its first write"
+    for k in (cache_key, _day()):
+        assert at_write.get(k, -1) > 0, f"{k} existed without a TTL right after the command that wrote it (TTL {at_write.get(k)}): a crash before the separate EXPIRE leaves it forever. Write it with its expiry in one command"
+    day = _day()
+    ctx.clock.advance(3600)
+    _classify(m, _job("orders", OLD))
+    assert ctx.redis.get(day) == "2", f"{day} is {ctx.redis.get(day)!r} after two entities, expected 2"
+    ttl = ctx.redis.ttl(day)
+    assert ttl <= 172800 - 3500, f"an hour later the second reservation reset {day}'s TTL to {ttl}: the counter expires 2 days after its first write, not its last"
 `,
     typescript: `const GATEWAY = 'llm-gateway:9000';
 const OLD = ['merchant_id', 'status'];
@@ -706,6 +738,10 @@ export async function check_budget_atomic(ctx) {
   }
   assert(threw, 'with 400 entities classified today classifyEntity must throw BudgetExhausted');
   assert.equal(calls(ctx), 0, \`with today's budget spent the model was called \${calls(ctx)} time(s)\`);
+  assert.equal(ctx.redis.get(day), '400', \`a refused reservation left \${day} at \${ctx.redis.get(day)}, expected 400: over the cap the slot is given back\`);
+  ctx.redis.set(day, '399');
+  await classify(m, job(schemaHash, 'payments', OLD)); // the 400th entity of the day still fits
+  assert(calls(ctx) === 1 && ctx.redis.get(day) === '400', \`at 399 the 400th entity must get the last slot: \${calls(ctx)} call(s), \${day} = \${ctx.redis.get(day)}\`);
   ctx.redis.set(day, '399');
   const other: boolean[] = [];
   // A second worker reserving the same slot the way the task says: INCR, and DECR back over the cap.
@@ -726,11 +762,30 @@ export async function check_budget_atomic(ctx) {
   assert(probe.fired && other.length === 1, \`classifyEntity never touched \${day}\`);
   assert(used <= 400, \`two workers raced for the last slot and \${day} reads \${used}: the read, the call and the INCR are separate steps, so both passed. Reserve with one script before the call\`);
   assert.notEqual(mine, other[0], \`exactly one of the two workers gets the last slot (yours: \${mine}, the other: \${other[0]})\`);
-  assert.equal(calls(ctx), mine ? 1 : 0, \`the model was called \${calls(ctx)} time(s) though your worker \${mine ? 'got' : 'did not get'} a slot\`);
+  assert.equal(calls(ctx), mine ? 2 : 1, \`the model was called \${calls(ctx) - 1} time(s) though your worker \${mine ? 'got' : 'did not get'} a slot\`);
+}
+
+/**
+ * The TTL of key right after the first command that leaves it existing (a lookup of the missing key
+ * before that re-arms the probe).
+ */
+function ttlWhenWritten(ctx, key: string, seen: Record<string, number>) {
+  const watch = () => {
+    if (Number(ctx.redis.exists(key)) === 1) seen[key] = Number(ctx.redis.ttl(key));
+    else ctx.redisAfter(key, watch);
+  };
+  ctx.redisAfter(key, watch);
 }
 
 export async function check_expiry(ctx) {
   const {m, schemaHash} = world(ctx);
+  const intoDay = (ctx.clock.now() / 1000) % 86400;
+  if (intoDay > 86400 - 7200) ctx.clock.advance(86400 - intoDay + 60); // the hour this check waits stays inside one UTC day
+  const atWrite: Record<string, number> = {};
+  const cacheKey = \`classify:deliveries:\${schemaHash(NEW)}\`;
+  const day = today(ctx);
+  ttlWhenWritten(ctx, cacheKey, atWrite);
+  ttlWhenWritten(ctx, day, atWrite);
   await classify(m, job(schemaHash, 'deliveries', NEW));
   const written: string[] = ctx.redis.keys('classify:*');
   assert(written.length > 0, 'classifyEntity cached nothing under classify:*');
@@ -741,8 +796,16 @@ export async function check_expiry(ctx) {
   assert.deepEqual({...pending}, {owner: 'team-logistics', schema_hash: schemaHash(NEW), state: 'pending'}, \`verify:deliveries holds \${JSON.stringify(pending)}\`);
   ttl = ctx.redis.ttl('verify:deliveries');
   assert(604000 <= ttl && ttl <= 604800, \`verify:deliveries has TTL \${ttl}, expected VERIFY_TTL_S = 604800 (7 days)\`);
-  ttl = ctx.redis.ttl(today(ctx));
-  assert(0 < ttl && ttl <= 172800, \`\${today(ctx)} has TTL \${ttl}, expected BUDGET_TTL_S = 172800 (2 days) set on its first write\`);
+  ttl = ctx.redis.ttl(day);
+  assert(172000 <= ttl && ttl <= 172800, \`\${day} has TTL \${ttl}, expected BUDGET_TTL_S = 172800 (2 days) set on its first write\`);
+  for (const k of [cacheKey, day]) {
+    assert((atWrite[k] ?? -1) > 0, \`\${k} existed without a TTL right after the command that wrote it (TTL \${atWrite[k]}): a crash before the separate EXPIRE leaves it forever. Write it with its expiry in one command\`);
+  }
+  ctx.clock.advance(3600);
+  await classify(m, job(schemaHash, 'orders', OLD));
+  assert.equal(ctx.redis.get(day), '2', \`\${day} is \${ctx.redis.get(day)} after two entities, expected 2\`);
+  ttl = ctx.redis.ttl(day);
+  assert(ttl <= 172800 - 3500, \`an hour later the second reservation reset \${day}'s TTL to \${ttl}: the counter expires 2 days after its first write, not its last\`);
 }
 `,
     go: `package main
@@ -761,14 +824,14 @@ import (
 var (
 	cacheOld   = []string{"merchant_id", "status"}
 	cacheNew   = []string{"merchant_id", "status", "passport_no"}
-	modelCalls int
+	cacheModelCalls int
 )
 
 // cacheWorld stands step 2 in: passport columns are Personal.ID, the rest None; it counts the model calls.
 func cacheWorld() {
-	modelCalls = 0
+	cacheModelCalls = 0
 	classifyColumns = func(_ context.Context, _ string, columns []string) (map[string]string, error) {
-		modelCalls++
+		cacheModelCalls++
 		tags := map[string]string{}
 		for _, c := range columns {
 			tags[c] = "None"
@@ -797,11 +860,11 @@ func CheckCacheKey(ctx *harness.Ctx) {
 	cacheClassify(ctx, cacheJob("deliveries", cacheOld))
 	tags := cacheClassify(ctx, cacheJob("deliveries", cacheNew))
 	ctx.Equal(tags["passport_no"], "Personal.ID", "after passport_no was added classifyEntity served the cached tags of the old schema (%v); key the cache by schema_hash. passport_no", tags)
-	ctx.Equal(modelCalls, 2, "a changed schema must be classified again; model calls for two schemas")
+	ctx.Equal(cacheModelCalls, 2, "a changed schema must be classified again; model calls for two schemas")
 	key := "classify:deliveries:" + jobs.SchemaHash(cacheNew)
 	ctx.Equal(ctx.Redis.Exists(key), 1, "the new tags must be cached under %s (keys: %v)", key, ctx.Redis.Keys("classify:*"))
 	again := cacheClassify(ctx, cacheJob("deliveries", cacheOld))
-	ctx.Assert(modelCalls == 2 && len(again) == 2, "a job for the old schema must be a cache hit: %d model calls, tags %v", modelCalls, again)
+	ctx.Assert(cacheModelCalls == 2 && len(again) == 2, "a job for the old schema must be a cache hit: %d model calls, tags %v", cacheModelCalls, again)
 	used, _ := ctx.Redis.Get(cacheDay(ctx))
 	ctx.Equal(used, "2", "%s after two model calls and a cache hit (a hit spends no budget)", cacheDay(ctx))
 }
@@ -812,7 +875,13 @@ func CheckBudgetAtomic(ctx *harness.Ctx) {
 	ctx.Redis.Set(day, 400)
 	_, err := classifyEntity(context.Background(), cacheJob("orders", cacheOld))
 	ctx.Assert(errors.Is(err, ErrBudgetExhausted), "with 400 entities classified today classifyEntity must return ErrBudgetExhausted, got %v", err)
-	ctx.Equal(modelCalls, 0, "with today's budget spent the model must not be called; calls")
+	ctx.Equal(cacheModelCalls, 0, "with today's budget spent the model must not be called; calls")
+	left, _ := ctx.Redis.Get(day)
+	ctx.Equal(left, "400", "a refused reservation must give the slot back over the cap; %s", day)
+	ctx.Redis.Set(day, 399)
+	cacheClassify(ctx, cacheJob("payments", cacheOld)) // the 400th entity of the day still fits
+	last, _ := ctx.Redis.Get(day)
+	ctx.Assert(cacheModelCalls == 1 && last == "400", "at 399 the 400th entity must get the last slot: %d call(s), %s = %s", cacheModelCalls, day, last)
 	ctx.Redis.Set(day, 399)
 	var other []bool
 	// A second worker reserving the same slot the way the task says: INCR, and DECR back over the cap.
@@ -833,15 +902,38 @@ func CheckBudgetAtomic(ctx *harness.Ctx) {
 	ctx.Assert(probe.Fired && len(other) == 1, "classifyEntity never touched %s", day)
 	ctx.Assert(used <= 400, "two workers raced for the last slot and %s reads %d: the read, the call and the INCR are separate steps, so both passed. Reserve with one script before the call", day, used)
 	ctx.Assert(mine != other[0], "exactly one of the two workers gets the last slot (yours: %v, the other: %v)", mine, other[0])
-	want := 0
+	want := 1
 	if mine {
-		want = 1
+		want = 2
 	}
-	ctx.Equal(modelCalls, want, "the model calls must match the slot your worker got")
+	ctx.Equal(cacheModelCalls, want, "the model calls must match the slot your worker got")
+}
+
+// cacheTTLWhenWritten records the TTL of key right after the first command that leaves it existing (a
+// lookup of the missing key before that re-arms the probe).
+func cacheTTLWhenWritten(ctx *harness.Ctx, key string, seen map[string]int64) {
+	var watch func() any
+	watch = func() any {
+		if ctx.Redis.Exists(key) == 1 {
+			seen[key] = ctx.Redis.TTL(key)
+		} else {
+			ctx.Redis.After(key, watch)
+		}
+		return nil
+	}
+	ctx.Redis.After(key, watch)
 }
 
 func CheckExpiry(ctx *harness.Ctx) {
 	cacheWorld()
+	if intoDay := ctx.Clock.Now() / 1000 % 86400; intoDay > 86400-7200 {
+		ctx.Clock.Advance(float64(86400 - intoDay + 60)) // the hour this check waits stays inside one UTC day
+	}
+	atWrite := map[string]int64{}
+	cacheKey := "classify:deliveries:" + jobs.SchemaHash(cacheNew)
+	day := cacheDay(ctx)
+	cacheTTLWhenWritten(ctx, cacheKey, atWrite)
+	cacheTTLWhenWritten(ctx, day, atWrite)
 	cacheClassify(ctx, cacheJob("deliveries", cacheNew))
 	written := ctx.Redis.Keys("classify:*")
 	ctx.Assert(len(written) > 0, "classifyEntity cached nothing under classify:*")
@@ -851,14 +943,26 @@ func CheckExpiry(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.HGetAll("verify:deliveries"), map[string]string{"owner": "team-logistics", "schema_hash": jobs.SchemaHash(cacheNew), "state": "pending"}, "verify:deliveries")
 	ttl = ctx.Redis.TTL("verify:deliveries")
 	ctx.Assert(604000 <= ttl && ttl <= 604800, "verify:deliveries has TTL %d, expected 604800 (7 days)", ttl)
-	ttl = ctx.Redis.TTL(cacheDay(ctx))
-	ctx.Assert(0 < ttl && ttl <= 172800, "%s has TTL %d, expected 172800 (2 days) set on its first write", cacheDay(ctx), ttl)
+	ttl = ctx.Redis.TTL(day)
+	ctx.Assert(172000 <= ttl && ttl <= 172800, "%s has TTL %d, expected 172800 (2 days) set on its first write", day, ttl)
+	for _, k := range []string{cacheKey, day} {
+		got, ok := atWrite[k]
+		ctx.Assert(ok && got > 0, "%s existed without a TTL right after the command that wrote it (TTL %d): a crash before the separate EXPIRE leaves it forever. Write it with its expiry in one command", k, got)
+	}
+	ctx.Clock.Advance(3600)
+	cacheClassify(ctx, cacheJob("orders", cacheOld))
+	used, _ := ctx.Redis.Get(day)
+	ctx.Equal(used, "2", "%s after two entities", day)
+	ttl = ctx.Redis.TTL(day)
+	ctx.Assert(ttl <= 172800-3500, "an hour later the second reservation reset %s's TTL to %d: the counter expires 2 days after its first write, not its last", day, ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <ctime>
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -867,11 +971,11 @@ func CheckExpiry(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kOld = {"merchant_id", "status"};
-const std::vector<std::string> kNew = {"merchant_id", "status", "passport_no"};
+const std::vector<std::string> hOld = {"merchant_id", "status"};
+const std::vector<std::string> hNew = {"merchant_id", "status", "passport_no"};
 
 // The LLM gateway stand-in: passport columns are Personal.ID, the rest None.
-class CacheGateway final : public metasensed::Classifier::Service {
+class HCacheGateway final : public metasensed::Classifier::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const metasensed::ClassifyRequest* req, metasensed::ClassifyReply* reply) override {
     nlohmann::json rows = nlohmann::json::array();
@@ -882,18 +986,18 @@ class CacheGateway final : public metasensed::Classifier::Service {
   }
 };
 
-void world(harness::Ctx& ctx) {
-  static CacheGateway peer;
+void hCacheWorld(harness::Ctx& ctx) {
+  static HCacheGateway peer;
   ctx.GRPC.Server("llm-gateway:9000")->RegisterService(&peer);
 }
 
-nlohmann::json job(const std::string& entity, const std::vector<std::string>& columns) {
+nlohmann::json hJob(const std::string& entity, const std::vector<std::string>& columns) {
   return {{"entity", entity}, {"owner", "team-logistics"}, {"schema_hash", jobs::schemaHash(columns)}, {"columns", columns}};
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
 
-std::string today(harness::Ctx& ctx) {
+std::string hToday(harness::Ctx& ctx) {
   const std::time_t now = ctx.Clock.Now() / 1000;
   std::tm utc{};
   gmtime_r(&now, &utc);
@@ -902,7 +1006,7 @@ std::string today(harness::Ctx& ctx) {
   return std::string("budget:") + date;
 }
 
-std::map<std::string, std::string> classifyOK(harness::Ctx& ctx, const nlohmann::json& j) {
+std::map<std::string, std::string> hClassifyOK(harness::Ctx& ctx, const nlohmann::json& j) {
   try {
     return classifyEntity(j);
   } catch (const std::exception& e) {
@@ -913,31 +1017,36 @@ std::map<std::string, std::string> classifyOK(harness::Ctx& ctx, const nlohmann:
 }  // namespace
 
 void CheckCacheKey(harness::Ctx& ctx) {
-  world(ctx);
-  classifyOK(ctx, job("deliveries", kOld));
-  const auto tags = classifyOK(ctx, job("deliveries", kNew));
+  hCacheWorld(ctx);
+  hClassifyOK(ctx, hJob("deliveries", hOld));
+  const auto tags = hClassifyOK(ctx, hJob("deliveries", hNew));
   ctx.Equal(tags.count("passport_no") ? tags.at("passport_no") : "<missing>", "Personal.ID",
             "after passport_no was added classifyEntity served the cached tags of the old schema; key the cache by schema_hash. passport_no");
-  ctx.Equal(calls(ctx), 2, "a changed schema must be classified again; Classify calls for two schemas");
-  const std::string key = "classify:deliveries:" + jobs::schemaHash(kNew);
+  ctx.Equal(hCalls(ctx), 2, "a changed schema must be classified again; Classify calls for two schemas");
+  const std::string key = "classify:deliveries:" + jobs::schemaHash(hNew);
   ctx.Equal(ctx.Redis.Exists(key), 1, "the new tags must be cached under %s (keys: %v)", key, ctx.Redis.Keys("classify:*"));
-  const auto again = classifyOK(ctx, job("deliveries", kOld));
-  ctx.Assert(calls(ctx) == 2 && again.size() == 2, "a job for the old schema must be a cache hit: %d calls, %d tags", calls(ctx), again.size());
-  ctx.Equal(ctx.Redis.Get(today(ctx)).value_or(""), "2", "%s after two model calls and a cache hit (a hit spends no budget)", today(ctx));
+  const auto again = hClassifyOK(ctx, hJob("deliveries", hOld));
+  ctx.Assert(hCalls(ctx) == 2 && again.size() == 2, "a job for the old schema must be a cache hit: %d calls, %d tags", hCalls(ctx), again.size());
+  ctx.Equal(ctx.Redis.Get(hToday(ctx)).value_or(""), "2", "%s after two model calls and a cache hit (a hit spends no budget)", hToday(ctx));
 }
 
 void CheckBudgetAtomic(harness::Ctx& ctx) {
-  world(ctx);
-  const std::string day = today(ctx);
+  hCacheWorld(ctx);
+  const std::string day = hToday(ctx);
   ctx.Redis.Set(day, "400");
   bool threw = false;
   try {
-    classifyEntity(job("orders", kOld));
+    classifyEntity(hJob("orders", hOld));
   } catch (const BudgetExhausted&) {
     threw = true;
   }
   ctx.Assert(threw, "with 400 entities classified today classifyEntity must throw BudgetExhausted");
-  ctx.Equal(calls(ctx), 0, "with today's budget spent the model must not be called; calls");
+  ctx.Equal(hCalls(ctx), 0, "with today's budget spent the model must not be called; calls");
+  ctx.Equal(ctx.Redis.Get(day).value_or(""), "400", "a refused reservation must give the slot back over the cap; %s", day);
+  ctx.Redis.Set(day, "399");
+  hClassifyOK(ctx, hJob("payments", hOld));  // the 400th entity of the day still fits
+  ctx.Assert(hCalls(ctx) == 1 && ctx.Redis.Get(day).value_or("") == "400", "at 399 the 400th entity must get the last slot: %d call(s), %s = %s", hCalls(ctx), day,
+             ctx.Redis.Get(day).value_or("<missing>"));
   ctx.Redis.Set(day, "399");
   std::vector<bool> other;
   // A second worker reserving the same slot the way the task says: INCR, and DECR back over the cap.
@@ -951,7 +1060,7 @@ void CheckBudgetAtomic(harness::Ctx& ctx) {
   });
   bool mine = true;
   try {
-    classifyEntity(job("deliveries", kOld));
+    classifyEntity(hJob("deliveries", hOld));
   } catch (const BudgetExhausted&) {
     mine = false;
   }
@@ -959,23 +1068,53 @@ void CheckBudgetAtomic(harness::Ctx& ctx) {
   ctx.Assert(other.size() == 1, "classifyEntity never touched %s", day);
   ctx.Assert(used <= 400, "two workers raced for the last slot and %s reads %d: the read, the call and the INCR are separate steps, so both passed. Reserve with one script before the call", day, used);
   ctx.Assert(mine != other[0], "exactly one of the two workers gets the last slot (yours: %v, the other: %v)", mine, static_cast<bool>(other[0]));
-  ctx.Equal(calls(ctx), mine ? 1 : 0, "the model calls must match the slot your worker got");
+  ctx.Equal(hCalls(ctx), mine ? 2 : 1, "the model calls must match the slot your worker got");
+}
+
+// Records the TTL of key right after the first command that leaves it existing (a lookup of the
+// missing key before that re-arms the probe).
+void hTTLWhenWritten(harness::Ctx& ctx, const std::string& key, std::map<std::string, long long>& seen) {
+  auto watch = std::make_shared<std::function<void()>>();
+  *watch = [&ctx, &seen, key, watch] {
+    if (ctx.Redis.Exists(key) == 1) {
+      seen[key] = ctx.Redis.TTL(key);
+    } else {
+      ctx.Redis.After(key, *watch);
+    }
+  };
+  ctx.Redis.After(key, *watch);
 }
 
 void CheckExpiry(harness::Ctx& ctx) {
-  world(ctx);
-  classifyOK(ctx, job("deliveries", kNew));
+  hCacheWorld(ctx);
+  const int64_t intoDay = ctx.Clock.Now() / 1000 % 86400;
+  if (intoDay > 86400 - 7200) ctx.Clock.Advance(static_cast<double>(86400 - intoDay + 60));  // the hour this check waits stays inside one UTC day
+  std::map<std::string, long long> atWrite;
+  const std::string cacheKey = "classify:deliveries:" + jobs::schemaHash(hNew);
+  const std::string day = hToday(ctx);
+  hTTLWhenWritten(ctx, cacheKey, atWrite);
+  hTTLWhenWritten(ctx, day, atWrite);
+  hClassifyOK(ctx, hJob("deliveries", hNew));
   const auto written = ctx.Redis.Keys("classify:*");
   ctx.Assert(!written.empty(), "classifyEntity cached nothing under classify:*");
   const std::string key = written[0];
   long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(604000 <= ttl && ttl <= 604800, "%s has TTL %d, expected 604800 (7 days)", key, ttl);
   ctx.Equal(ctx.Redis.HGetAll("verify:deliveries"),
-            std::map<std::string, std::string>{{"owner", "team-logistics"}, {"schema_hash", jobs::schemaHash(kNew)}, {"state", "pending"}}, "verify:deliveries");
+            std::map<std::string, std::string>{{"owner", "team-logistics"}, {"schema_hash", jobs::schemaHash(hNew)}, {"state", "pending"}}, "verify:deliveries");
   ttl = ctx.Redis.TTL("verify:deliveries");
   ctx.Assert(604000 <= ttl && ttl <= 604800, "verify:deliveries has TTL %d, expected 604800 (7 days)", ttl);
-  ttl = ctx.Redis.TTL(today(ctx));
-  ctx.Assert(0 < ttl && ttl <= 172800, "%s has TTL %d, expected 172800 (2 days) set on its first write", today(ctx), ttl);
+  ttl = ctx.Redis.TTL(day);
+  ctx.Assert(172000 <= ttl && ttl <= 172800, "%s has TTL %d, expected 172800 (2 days) set on its first write", day, ttl);
+  for (const std::string& k : {cacheKey, day}) {
+    const long long got = atWrite.count(k) ? atWrite.at(k) : -2;
+    ctx.Assert(got > 0, "%s existed without a TTL right after the command that wrote it (TTL %d): a crash before the separate EXPIRE leaves it forever. Write it with its expiry in one command", k, got);
+  }
+  ctx.Clock.Advance(3600);
+  hClassifyOK(ctx, hJob("orders", hOld));
+  ctx.Equal(ctx.Redis.Get(day).value_or(""), "2", "%s after two entities", day);
+  ttl = ctx.Redis.TTL(day);
+  ctx.Assert(ttl <= 172800 - 3500, "an hour later the second reservation reset %s's TTL to %d: the counter expires 2 days after its first write, not its last", day, ttl);
 }
 `,
   },

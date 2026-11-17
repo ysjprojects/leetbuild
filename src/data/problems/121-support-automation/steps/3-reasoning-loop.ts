@@ -20,12 +20,15 @@ bill; a call without a deadline holds a worker for as long as the dependency sta
 from the model lets a prompt injection in a help article issue a refund for a customer; and a write
 tool without a key refunds twice when the worker retries the turn.
 
-- Every \`Reason\` carries **5 s** (\`REASON_DEADLINE_S\`); a failed one returns \`escalated\`.
+- Every \`Reason\` carries its own **5 s** (\`REASON_DEADLINE_S\`); a failed one, whatever the
+  status, returns \`escalated\`.
 - At most **6** iterations (\`MAX_ITERATIONS\`), then \`escalated\`.
-- \`TOOL_REGISTRY\` maps a name to \`READ\` or \`WRITE\` and the roles that may run it; an unknown
-  name or a role not listed makes the outcome \`{"error": "tool not allowed"}\`, with no \`Invoke\`.
-- Every \`Invoke\` carries **3 s** (\`TOOL_DEADLINE_S\`); a failed one is the outcome
-  \`{"error": "tool failed"}\`.
+- \`TOOL_REGISTRY\` maps a name to \`READ\` or \`WRITE\` and the roles that may run it:
+  \`get_reservation\` and \`search_help\` are \`READ\` for customers and agents; \`update_listing\` and
+  \`issue_refund\` are \`WRITE\` for agents only. An unknown name or a role not listed makes the
+  outcome \`{"error": "tool not allowed"}\`, with no \`Invoke\`.
+- Every \`Invoke\` carries its own **3 s** (\`TOOL_DEADLINE_S\`); a failed one, whatever the status,
+  is the outcome \`{"error": "tool failed"}\`.
 - \`WRITE\` tools carry \`idempotency_key = "{turn_id}:{iteration}"\`; \`READ\` tools none.`,
   sequence: {
     participants: ['CoT workflow', 'Context store', 'LLM Adapter', 'Tool Manager'],
@@ -46,7 +49,7 @@ tool without a key refunds twice when the worker retries the turn.
       id: 'reason-deadline',
       title: 'Every Reason call carries a 5 s deadline',
       detail:
-        'A turn is answered after two Reason calls, each with a deadline of about 5 s, and the context holds the question, the tool outcome and the answer; a model that takes 6 s is cut at 5 s and the turn comes back `escalated`. The starter calls Reason without a deadline.',
+        'A turn is answered after two Reason calls, each with a deadline of about 5 s, and the context holds the question, the tool outcome and the answer; with a model that takes 2 s, every Reason call still carries about 5 s; a model that takes 6 s is cut at 5 s and the turn comes back `escalated`, as it does when Reason fails with INTERNAL. The starter calls Reason without a deadline.',
       match: {
         python: {all: [/REASON_DEADLINE_S/, /Reason\([\s\S]{0,200}?timeout\s*=\s*REASON_DEADLINE_S/]},
         typescript: {
@@ -77,7 +80,7 @@ tool without a key refunds twice when the worker retries the turn.
       id: 'tool-registry',
       title: 'Resolves tools through the registry and the turn’s role',
       detail:
-        'A customer turn whose model asks for `issue_refund` (agent-only), or for `delete_account` (unregistered), makes no Invoke and feeds `{"error": "tool not allowed"}` back to the model; an agent turn runs `issue_refund`. The starter invokes whatever name the model returned.',
+        'A customer turn whose model asks for `issue_refund` or `update_listing` (agent-only), or for `delete_account` (unregistered), makes no Invoke and feeds `{"error": "tool not allowed"}` back to the model; an agent turn runs `issue_refund`. The starter invokes whatever name the model returned.',
       match: {
         python: {all: [/TOOL_REGISTRY/, /tool not allowed/]},
         typescript: {all: [/TOOL_REGISTRY/, /tool not allowed/]},
@@ -90,7 +93,7 @@ tool without a key refunds twice when the worker retries the turn.
       id: 'tool-deadline',
       title: 'Every Invoke call carries a 3 s deadline',
       detail:
-        'Each Invoke carries a deadline of about 3 s; a tool that takes 5 s is cut at 3 s, `{"error": "tool failed"}` goes back to the model and the turn is still answered. The starter waits for the tool however long it takes.',
+        'Each Invoke carries a deadline of about 3 s, also on every iteration of a loop whose tool takes 2 s; a tool that takes 5 s is cut at 3 s, `{"error": "tool failed"}` goes back to the model and the turn is still answered, as it is when Invoke fails with INTERNAL. The starter waits for the tool however long it takes.',
       match: {
         python: {all: [/TOOL_DEADLINE_S/, /Invoke\([\s\S]{0,300}?timeout\s*=\s*TOOL_DEADLINE_S/]},
         typescript: {
@@ -869,12 +872,24 @@ def check_reason_deadline(ctx):
     for call in reasons:
         assert call.timeout is not None, "a Reason call carries no deadline: a stalled model holds the worker for as long as it stalls"
         assert 4.5 <= call.timeout <= 5.5, f"the Reason deadline must be REASON_DEADLINE_S = 5 s, got {call.timeout} s"
+    ctx.grpc.set_latency("Reason", 2.0, config.LLM_ADAPTER)
+    steady = m.run_turn(store, _turn(turn_id="turn-2"))
+    assert steady.get("status") == "answered", f"a model that takes 2 s per call must still answer, got {steady}"
+    for call in ctx.grpc.calls_to("Reason")[2:]:
+        assert call.timeout is not None and 4.5 <= call.timeout <= 5.5, f"with a model that takes 2 s per call, a later Reason call carried a deadline of {call.timeout} s: each call gets its own REASON_DEADLINE_S = 5 s, not what is left of one shared budget"
     ctx.grpc.set_latency("Reason", 6.0, config.LLM_ADAPTER)
     started = ctx.clock.offset
-    slow = m.run_turn(store, _turn(turn_id="turn-2"))
+    slow = m.run_turn(store, _turn(turn_id="turn-3"))
     waited = ctx.clock.offset - started
     assert waited <= 5.5, f"the turn waited {waited:.1f} s on a model that takes 6 s: cut it at the 5 s deadline"
     assert slow.get("status") == "escalated", f"a Reason call that failed its deadline must end the turn escalated, got {slow}"
+    ctx.grpc.set_latency("Reason", 0.0, config.LLM_ADAPTER)
+    ctx.grpc.fail("Reason", grpc.StatusCode.INTERNAL, "the model adapter crashed")
+    try:
+        broken = m.run_turn(store, _turn(turn_id="turn-4"))
+    except grpc.RpcError as err:
+        raise AssertionError(f"a Reason call that failed with INTERNAL escaped run_turn ({err.code()}): any failed Reason ends the turn escalated") from None
+    assert broken.get("status") == "escalated", f"a Reason call that failed with INTERNAL must end the turn escalated, got {broken}"
 
 
 def check_bounded_loop(ctx):
@@ -891,7 +906,8 @@ def check_tool_registry(ctx):
     assert "issue_refund" not in tools.executed, "a customer turn ran issue_refund because the model asked for it: resolve the tool through TOOL_REGISTRY and the turn's role before any Invoke"
     assert result.get("status") == "answered" and "tool not allowed" in result.get("answer", ""), f"the model must be told {{\\"error\\": \\"tool not allowed\\"}} and answer from it, got {result}"
     m.run_turn(store, _turn(text="call:delete_account now", turn_id="turn-2"))
-    assert [c.request.tool for c in ctx.grpc.calls_to("Invoke")] == [], f"a tool outside the registry must not reach the Tool Manager, saw Invoke for {[c.request.tool for c in ctx.grpc.calls_to('Invoke')]}"
+    m.run_turn(store, _turn(text="call:update_listing to allow pets", turn_id="turn-4"))
+    assert [c.request.tool for c in ctx.grpc.calls_to("Invoke")] == [], f"a tool outside the registry, or update_listing (agent-only) on a customer turn, must not reach the Tool Manager, saw Invoke for {[c.request.tool for c in ctx.grpc.calls_to('Invoke')]}"
     agent = m.run_turn(store, _turn(text="call:issue_refund for HM-4410", role="agent", turn_id="turn-3", actor="agent-7"))
     assert tools.executed == ["issue_refund"] and agent.get("status") == "answered", f"an agent turn may run issue_refund, executed {tools.executed}, result {agent}"
 
@@ -908,6 +924,19 @@ def check_tool_deadline(ctx):
     assert 2.5 <= invokes[0].timeout <= 3.5, f"the Invoke deadline must be TOOL_DEADLINE_S = 3 s, got {invokes[0].timeout} s"
     assert waited <= 3.5, f"the turn waited {waited:.1f} s on a tool that takes 5 s: cut it at 3 s"
     assert result.get("status") == "answered" and "tool failed" in result.get("answer", ""), f"a tool that failed its deadline is an outcome the model sees ({{\\"error\\": \\"tool failed\\"}}), and the turn goes on; got {result}"
+    ctx.grpc.set_latency("Invoke", 2.0, config.TOOL_MANAGER)
+    looped = m.run_turn(store, _turn(text="loop: check every reservation", turn_id="turn-2"))
+    later = ctx.grpc.calls_to("Invoke")[1:]
+    assert len(later) == 6 and looped.get("status") == "escalated", f"a looping model with a tool that takes 2 s must make 6 Invoke calls and escalate, saw {len(later)} calls and {looped}"
+    for call in later:
+        assert call.timeout is not None and 2.5 <= call.timeout <= 3.5, f"with a tool that takes 2 s per call, a later Invoke carried a deadline of {call.timeout} s: each call gets its own TOOL_DEADLINE_S = 3 s, not what is left of one shared budget"
+    ctx.grpc.set_latency("Invoke", 0.0, config.TOOL_MANAGER)
+    ctx.grpc.fail("Invoke", grpc.StatusCode.INTERNAL, "the tool crashed")
+    try:
+        crashed = m.run_turn(store, _turn(turn_id="turn-3"))
+    except grpc.RpcError as err:
+        raise AssertionError(f"an Invoke that failed with INTERNAL escaped run_turn ({err.code()}): any failed Invoke is the outcome {{\\"error\\": \\"tool failed\\"}}") from None
+    assert crashed.get("status") == "answered" and "tool failed" in crashed.get("answer", ""), f"an Invoke that failed with INTERNAL is the outcome {{\\"error\\": \\"tool failed\\"}} the model sees, and the turn goes on; got {crashed}"
 
 
 def check_write_idempotency(ctx):
@@ -978,12 +1007,27 @@ export async function check_reason_deadline(ctx) {
     assert(call.timeout !== null, 'a Reason call carries no deadline: a stalled model holds the worker for as long as it stalls');
     assert(call.timeout >= 4.5 && call.timeout <= 5.5, \`the Reason deadline must be REASON_DEADLINE_MS = 5000 ms, got \${call.timeout} s\`);
   }
+  ctx.grpc.setLatency('Reason', 2.0, config.LLM_ADAPTER);
+  const steady = await m.runTurn(store, turnOf({turn_id: 'turn-2'}));
+  assert.equal(steady.status, 'answered', \`a model that takes 2 s per call must still answer, got \${JSON.stringify(steady)}\`);
+  for (const call of ctx.grpc.callsTo('Reason').slice(2)) {
+    assert(call.timeout !== null && call.timeout >= 4.5 && call.timeout <= 5.5, \`with a model that takes 2 s per call, a later Reason call carried a deadline of \${call.timeout} s: each call gets its own REASON_DEADLINE_MS = 5000 ms, not what is left of one shared budget\`);
+  }
   ctx.grpc.setLatency('Reason', 6.0, config.LLM_ADAPTER);
   const started = ctx.clock.now();
-  const slow = await m.runTurn(store, turnOf({turn_id: 'turn-2'}));
+  const slow = await m.runTurn(store, turnOf({turn_id: 'turn-3'}));
   const waited = (ctx.clock.now() - started) / 1000;
   assert(waited <= 5.5, \`the turn waited \${waited.toFixed(1)} s on a model that takes 6 s: cut it at the 5 s deadline\`);
   assert.equal(slow.status, 'escalated', \`a Reason call that failed its deadline must end the turn escalated, got \${JSON.stringify(slow)}\`);
+  ctx.grpc.setLatency('Reason', 0, config.LLM_ADAPTER);
+  ctx.grpc.fail('Reason', ctx.grpc.status.INTERNAL, 'the model adapter crashed');
+  let broken;
+  try {
+    broken = await m.runTurn(store, turnOf({turn_id: 'turn-4'}));
+  } catch (e) {
+    assert.fail(\`a Reason call that failed with INTERNAL escaped runTurn (\${String(e)}): any failed Reason ends the turn escalated\`);
+  }
+  assert.equal(broken.status, 'escalated', \`a Reason call that failed with INTERNAL must end the turn escalated, got \${JSON.stringify(broken)}\`);
 }
 
 export async function check_bounded_loop(ctx) {
@@ -1005,8 +1049,9 @@ export async function check_tool_registry(ctx) {
   assert(!tools.executed.includes('issue_refund'), 'a customer turn ran issue_refund because the model asked for it: resolve the tool through TOOL_REGISTRY and the turn\\'s role before any Invoke');
   assert(result.status === 'answered' && result.answer.includes('tool not allowed'), \`the model must be told {"error": "tool not allowed"} and answer from it, got \${JSON.stringify(result)}\`);
   await m.runTurn(store, turnOf({text: 'call:delete_account now', turn_id: 'turn-2'}));
+  await m.runTurn(store, turnOf({text: 'call:update_listing to allow pets', turn_id: 'turn-4'}));
   const invoked = ctx.grpc.callsTo('Invoke').map(c => c.request.tool);
-  assert.deepStrictEqual(invoked, [], \`a tool outside the registry must not reach the Tool Manager, saw Invoke for \${JSON.stringify(invoked)}\`);
+  assert.deepStrictEqual(invoked, [], \`a tool outside the registry, or update_listing (agent-only) on a customer turn, must not reach the Tool Manager, saw Invoke for \${JSON.stringify(invoked)}\`);
   const agent = await m.runTurn(store, turnOf({text: 'call:issue_refund for HM-4410', role: 'agent', turn_id: 'turn-3', actor: 'agent-7'}));
   assert(tools.executed.length === 1 && tools.executed[0] === 'issue_refund' && agent.status === 'answered', \`an agent turn may run issue_refund, executed \${JSON.stringify(tools.executed)}, result \${JSON.stringify(agent)}\`);
 }
@@ -1023,6 +1068,22 @@ export async function check_tool_deadline(ctx) {
   assert(invokes[0].timeout >= 2.5 && invokes[0].timeout <= 3.5, \`the Invoke deadline must be TOOL_DEADLINE_MS = 3000 ms, got \${invokes[0].timeout} s\`);
   assert(waited <= 3.5, \`the turn waited \${waited.toFixed(1)} s on a tool that takes 5 s: cut it at 3 s\`);
   assert(result.status === 'answered' && result.answer.includes('tool failed'), \`a tool that failed its deadline is an outcome the model sees ({"error": "tool failed"}), and the turn goes on; got \${JSON.stringify(result)}\`);
+  ctx.grpc.setLatency('Invoke', 2.0, config.TOOL_MANAGER);
+  const looped = await m.runTurn(store, turnOf({text: 'loop: check every reservation', turn_id: 'turn-2'}));
+  const later = ctx.grpc.callsTo('Invoke').slice(1);
+  assert(later.length === 6 && looped.status === 'escalated', \`a looping model with a tool that takes 2 s must make 6 Invoke calls and escalate, saw \${later.length} calls and \${JSON.stringify(looped)}\`);
+  for (const call of later) {
+    assert(call.timeout !== null && call.timeout >= 2.5 && call.timeout <= 3.5, \`with a tool that takes 2 s per call, a later Invoke carried a deadline of \${call.timeout} s: each call gets its own TOOL_DEADLINE_MS = 3000 ms, not what is left of one shared budget\`);
+  }
+  ctx.grpc.setLatency('Invoke', 0, config.TOOL_MANAGER);
+  ctx.grpc.fail('Invoke', ctx.grpc.status.INTERNAL, 'the tool crashed');
+  let crashed;
+  try {
+    crashed = await m.runTurn(store, turnOf({turn_id: 'turn-3'}));
+  } catch (e) {
+    assert.fail(\`an Invoke that failed with INTERNAL escaped runTurn (\${String(e)}): any failed Invoke is the outcome {"error": "tool failed"}\`);
+  }
+  assert(crashed.status === 'answered' && crashed.answer.includes('tool failed'), \`an Invoke that failed with INTERNAL is the outcome {"error": "tool failed"} the model sees, and the turn goes on; got \${JSON.stringify(crashed)}\`);
 }
 
 export async function check_write_idempotency(ctx) {
@@ -1165,12 +1226,22 @@ func CheckReasonDeadline(ctx *harness.Ctx) {
 		ctx.Assert(call.HasDeadline(), "a Reason call carries no deadline: a stalled model holds the worker for as long as it stalls")
 		ctx.Assert(call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "the Reason deadline must be reasonDeadline = 5 s, got %v", call.Timeout)
 	}
+	ctx.GRPC.SetLatency("Reason", 2.0, config.LlmAdapter)
+	steady := cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-2", "guest-1"))
+	ctx.Equal(steady.Status, "answered", "a model that takes 2 s per call must still answer (%+v)", steady)
+	for _, call := range ctx.GRPC.CallsTo("Reason", "")[2:] {
+		ctx.Assert(call.HasDeadline() && call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "with a model that takes 2 s per call, a later Reason call carried a deadline of %v: each call gets its own reasonDeadline = 5 s, not what is left of one shared budget", call.Timeout)
+	}
 	ctx.GRPC.SetLatency("Reason", 6.0, config.LlmAdapter)
 	started := ctx.Clock.Now()
-	slow := cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-2", "guest-1"))
+	slow := cotRun(ctx, store, cotTurn(cotQuestion, "customer", "turn-3", "guest-1"))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 5.5, "the turn waited %.1f s on a model that takes 6 s: cut it at the 5 s deadline", waited)
 	ctx.Equal(slow.Status, "escalated", "a Reason call that failed its deadline must end the turn escalated (%+v)", slow)
+	ctx.GRPC.SetLatency("Reason", 0, config.LlmAdapter)
+	ctx.GRPC.Fail("Reason", codes.Internal, "the model adapter crashed", 1, "")
+	broken, err := runTurn(context.Background(), store, cotTurn(cotQuestion, "customer", "turn-4", "guest-1"))
+	ctx.Assert(err == nil && broken.Status == "escalated", "a Reason call that failed with Internal must end the turn escalated, not return the error; got %+v (%v)", broken, err)
 }
 
 func CheckBoundedLoop(ctx *harness.Ctx) {
@@ -1186,7 +1257,8 @@ func CheckToolRegistry(ctx *harness.Ctx) {
 	ctx.Equal(cotCount(tools.executed, "issue_refund"), 0, "a customer turn ran issue_refund because the model asked for it: resolve the tool through toolRegistry and the turn's role before any Invoke; refunds executed")
 	ctx.Assert(err == nil && result.Status == "answered" && strings.Contains(result.Answer, "tool not allowed"), "the model must be told {\\"error\\": \\"tool not allowed\\"} and answer from it, got %+v (%v)", result, err)
 	runTurn(context.Background(), store, cotTurn("call:delete_account now", "customer", "turn-2", "guest-1"))
-	ctx.Equal(len(ctx.GRPC.CallsTo("Invoke", "")), 0, "a tool outside the registry must not reach the Tool Manager; Invoke calls")
+	runTurn(context.Background(), store, cotTurn("call:update_listing to allow pets", "customer", "turn-4", "guest-1"))
+	ctx.Equal(len(ctx.GRPC.CallsTo("Invoke", "")), 0, "a tool outside the registry, or update_listing (agent-only) on a customer turn, must not reach the Tool Manager; Invoke calls")
 	agent := cotRun(ctx, store, cotTurn("call:issue_refund for HM-4410", "agent", "turn-3", "agent-7"))
 	ctx.Assert(len(tools.executed) == 1 && tools.executed[0] == "issue_refund" && agent.Status == "answered", "an agent turn may run issue_refund, executed %v, result %+v", tools.executed, agent)
 }
@@ -1203,6 +1275,17 @@ func CheckToolDeadline(ctx *harness.Ctx) {
 	ctx.Assert(invokes[0].Timeout >= 2500*time.Millisecond && invokes[0].Timeout <= 3500*time.Millisecond, "the Invoke deadline must be toolDeadline = 3 s, got %v", invokes[0].Timeout)
 	ctx.Assert(waited <= 3.5, "the turn waited %.1f s on a tool that takes 5 s: cut it at 3 s", waited)
 	ctx.Assert(err == nil && result.Status == "answered" && strings.Contains(result.Answer, "tool failed"), "a tool that failed its deadline is an outcome the model sees ({\\"error\\": \\"tool failed\\"}), and the turn goes on; got %+v (%v)", result, err)
+	ctx.GRPC.SetLatency("Invoke", 2.0, config.ToolManager)
+	looped, err := runTurn(context.Background(), store, cotTurn("loop: check every reservation", "customer", "turn-2", "guest-1"))
+	later := ctx.GRPC.CallsTo("Invoke", "")[1:]
+	ctx.Assert(err == nil && len(later) == 6 && looped.Status == "escalated", "a looping model with a tool that takes 2 s must make 6 Invoke calls and escalate, saw %d calls and %+v (%v)", len(later), looped, err)
+	for _, call := range later {
+		ctx.Assert(call.HasDeadline() && call.Timeout >= 2500*time.Millisecond && call.Timeout <= 3500*time.Millisecond, "with a tool that takes 2 s per call, a later Invoke carried a deadline of %v: each call gets its own toolDeadline = 3 s, not what is left of one shared budget", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("Invoke", 0, config.ToolManager)
+	ctx.GRPC.Fail("Invoke", codes.Internal, "the tool crashed", 1, "")
+	crashed, err := runTurn(context.Background(), store, cotTurn(cotQuestion, "customer", "turn-3", "guest-1"))
+	ctx.Assert(err == nil && crashed.Status == "answered" && strings.Contains(crashed.Answer, "tool failed"), "an Invoke that failed with Internal is the outcome {\\"error\\": \\"tool failed\\"} the model sees, and the turn goes on; got %+v (%v)", crashed, err)
 }
 
 func CheckWriteIdempotency(ctx *harness.Ctx) {
@@ -1341,12 +1424,24 @@ void CheckReasonDeadline(harness::Ctx& ctx) {
     ctx.Assert(call.HasDeadline(), "a Reason call carries no deadline: a stalled model holds the worker for as long as it stalls");
     ctx.Assert(call.TimeoutSeconds() >= 4.5 && call.TimeoutSeconds() <= 5.5, "the Reason deadline must be kReasonDeadline = 5 s, got %vs", call.TimeoutSeconds());
   }
+  ctx.GRPC.SetLatency("Reason", 2.0, config::kLlmAdapter);
+  const TurnResult steady = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-2"));
+  ctx.Equal(steady.status, "answered", "a model that takes 2 s per call must still answer");
+  const auto later = ctx.GRPC.CallsTo("Reason");
+  for (size_t i = 2; i < later.size(); i++) {
+    ctx.Assert(later[i].HasDeadline() && later[i].TimeoutSeconds() >= 4.5 && later[i].TimeoutSeconds() <= 5.5,
+               "with a model that takes 2 s per call, a later Reason call carried a deadline of %vs: each call gets its own kReasonDeadline = 5 s, not what is left of one shared budget", later[i].TimeoutSeconds());
+  }
   ctx.GRPC.SetLatency("Reason", 6.0, config::kLlmAdapter);
   const int64_t started = ctx.Clock.Now();
-  const TurnResult slow = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-2"));
+  const TurnResult slow = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-3"));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 5.5, "the turn waited %.1f s on a model that takes 6 s: cut it at the 5 s deadline", waited);
   ctx.Equal(slow.status, "escalated", "a Reason call that failed its deadline must end the turn escalated");
+  ctx.GRPC.SetLatency("Reason", 0, config::kLlmAdapter);
+  ctx.GRPC.Fail("Reason", grpc::StatusCode::INTERNAL, "the model adapter crashed");
+  const TurnResult broken = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-4"));
+  ctx.Equal(broken.status, "escalated", "a Reason call that failed with INTERNAL must end the turn escalated");
 }
 
 void CheckBoundedLoop(harness::Ctx& ctx) {
@@ -1371,9 +1466,10 @@ void CheckToolRegistry(harness::Ctx& ctx) {
              "the model must be told {\\"error\\": \\"tool not allowed\\"} and answer from it, got %s %q %s", result.status, result.answer, error);
   try {
     run_turn(w.store, cotTurn("call:delete_account now", "customer", "turn-2"));
+    run_turn(w.store, cotTurn("call:update_listing to allow pets", "customer", "turn-4"));
   } catch (const std::exception&) {
   }
-  ctx.Equal(ctx.GRPC.CallsTo("Invoke").size(), 0, "a tool outside the registry must not reach the Tool Manager; Invoke calls");
+  ctx.Equal(ctx.GRPC.CallsTo("Invoke").size(), 0, "a tool outside the registry, or update_listing (agent-only) on a customer turn, must not reach the Tool Manager; Invoke calls");
   const TurnResult agent = cotRun(ctx, w, cotTurn("call:issue_refund for HM-4410", "agent", "turn-3", "agent-7"));
   ctx.Assert(w.tools.executed == std::vector<std::string>{"issue_refund"} && agent.status == "answered", "an agent turn may run issue_refund, executed %v, status %s", w.tools.executed, agent.status);
 }
@@ -1391,6 +1487,19 @@ void CheckToolDeadline(harness::Ctx& ctx) {
   ctx.Assert(waited <= 3.5, "the turn waited %.1f s on a tool that takes 5 s: cut it at 3 s", waited);
   ctx.Assert(result.status == "answered" && result.answer.find("tool failed") != std::string::npos,
              "a tool that failed its deadline is an outcome the model sees ({\\"error\\": \\"tool failed\\"}), and the turn goes on; got %s %q", result.status, result.answer);
+  ctx.GRPC.SetLatency("Invoke", 2.0, config::kToolManager);
+  const TurnResult looped = cotRun(ctx, w, cotTurn("loop: check every reservation", "customer", "turn-2"));
+  const auto all = ctx.GRPC.CallsTo("Invoke");
+  ctx.Assert(all.size() == 7 && looped.status == "escalated", "a looping model with a tool that takes 2 s must make 6 Invoke calls and escalate, saw %d calls and %s", all.size() - 1, looped.status);
+  for (size_t i = 1; i < all.size(); i++) {
+    ctx.Assert(all[i].HasDeadline() && all[i].TimeoutSeconds() >= 2.5 && all[i].TimeoutSeconds() <= 3.5,
+               "with a tool that takes 2 s per call, a later Invoke carried a deadline of %vs: each call gets its own kToolDeadline = 3 s, not what is left of one shared budget", all[i].TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("Invoke", 0, config::kToolManager);
+  ctx.GRPC.Fail("Invoke", grpc::StatusCode::INTERNAL, "the tool crashed");
+  const TurnResult crashed = cotRun(ctx, w, cotTurn(kCotQuestion, "customer", "turn-3"));
+  ctx.Assert(crashed.status == "answered" && crashed.answer.find("tool failed") != std::string::npos,
+             "an Invoke that failed with INTERNAL is the outcome {\\"error\\": \\"tool failed\\"} the model sees, and the turn goes on; got %s %q", crashed.status, crashed.answer);
 }
 
 void CheckWriteIdempotency(harness::Ctx& ctx) {

@@ -27,7 +27,7 @@ forever; a crash between the commit and the write loses the count.
   producer; kafka-go has none).
 - The consumer counts **refused** events only, in \`signatures:{hour}\` (\`hour\` = \`ts\` //
   \`HOUR_S = 3600\`), and expires each bucket after \`BUCKET_TTL_S\` = 7 days.
-- Commit the offset **after** the Redis write.`,
+- Commit the offset **after** the Redis write; when the write fails, leave the event uncommitted.`,
   sequence: {
     participants: ['promptguard', 'prompt.security', 'Signature consumer', 'Redis'],
     messages: [
@@ -57,7 +57,7 @@ forever; a crash between the commit and the write loses the count.
       id: 'user-key',
       title: 'One event per decision, keyed by user',
       detail:
-        'Each publish leaves one record keyed by the user, so a user’s events share a partition, with event_id, user, document_hash, decision (served or refused), signals, signature and ts. The starter keys by a fresh event id.',
+        'Each publish leaves one record keyed by the user, so a user’s events share a partition, with event_id, user, document_hash, decision (served or refused), signals, signature and ts, the decision’s time in unix seconds. The starter keys by a fresh event id.',
       match: {
         python: {all: [/key\s*=\s*user\b/]},
         typescript: {all: [/key:\s*user\b/]},
@@ -96,7 +96,7 @@ forever; a crash between the commit and the write loses the count.
       id: 'hour-bucket',
       title: 'Counts refusals per signature per hour, for a week',
       detail:
-        'The consumer HINCRBYs signatures:{ts // 3600} for refused events only and expires each bucket after seven days. The starter counts every event, served ones too, in one signatures hash that never expires.',
+        'The consumer HINCRBYs signatures:{ts // 3600} for refused events only (an event at 12:59:59 counts in the 12:00 bucket, one at 13:00:00 in the next) and expires each bucket after seven days. The starter counts every event, served ones too, in one signatures hash that never expires.',
       match: {
         python: {all: [/signatures_key\(/, /\.expire\(\s*key\s*,\s*BUCKET_TTL_S/]},
         typescript: {all: [/signaturesKey\(/, /\.expire\(\s*key\s*,\s*BUCKET_TTL_S/]},
@@ -109,7 +109,7 @@ forever; a crash between the commit and the write loses the count.
       id: 'write-before-commit',
       title: 'Writes the count before committing the offset',
       detail:
-        'When an event’s offset is committed its count is already in Redis, so a crash replays the event instead of losing it. The starter commits first.',
+        'When an event’s offset is committed its count is already in Redis, so a crash replays the event instead of losing it; an event whose count fails (a WRONGTYPE bucket) stays uncommitted, with the event before it committed. The starter commits first.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -918,6 +918,7 @@ void run() {
 import importlib
 import json
 import logging
+import time
 
 TOPIC = "prompt.security"
 GROUP = "signatures"
@@ -972,6 +973,7 @@ def _value(record):
 
 def check_user_key(ctx):
     m, _ = _events(ctx)
+    started = int(time.time())
     m.publish("u-ana", _served("r-1"))
     m.publish("u-ana", _refused("r-2"))
     m.publish("u-ben", _served("r-3"))
@@ -985,6 +987,8 @@ def check_user_key(ctx):
     assert not missing, f"the event lacks {missing}: {event}"
     assert event["user"] == "u-ana" and event["document_hash"] == DOC_HASH, f"the event names the user and the document hash: {event}"
     assert event["decision"] == "refused" and event["signals"] == ["secret"] and event["signature"] == SIG_A, f"a refusal's event carries decision refused, its signals and its signature: {event}"
+    now = int(time.time())
+    assert isinstance(event["ts"], int) and started - 1 <= event["ts"] <= now + 1, f"ts is the decision's time in unix seconds (between {started} and {now}), the event says {event['ts']!r}: the consumer buckets it by ts // 3600"
     assert _value(records[0])["decision"] == "served", f"a served decision's event says served: {_value(records[0])}"
 
 
@@ -1016,13 +1020,14 @@ def check_hour_bucket(ctx):
     _seed(ctx, "u-ana", "refused", SIG_A, T + 10)
     _seed(ctx, "u-ben", "refused", SIG_A, T + 20)
     _seed(ctx, "u-ana", "served", "", T + 30)
-    _seed(ctx, "u-cy", "refused", SIG_B, T + 3_605)
+    _seed(ctx, "u-cy", "refused", SIG_A, T + 3_599)
+    _seed(ctx, "u-cy", "refused", SIG_B, T + 3_600)
     m, _ = _events(ctx)
     ctx.drain(m.run)
     this_hour, next_hour = f"signatures:{HOUR}", f"signatures:{HOUR + 1}"
     assert ctx.redis.exists("signatures") == 0, f"one global signatures hash ({ctx.redis.hgetall('signatures')}) cannot show when an attack began: bucket by hour, signatures:{{ts // 3600}}"
-    assert ctx.redis.hgetall(this_hour) == {SIG_A: "2"}, f"{this_hour} holds {ctx.redis.hgetall(this_hour)}, expected {SIG_A} counted twice and nothing for the served decision"
-    assert ctx.redis.hgetall(next_hour) == {SIG_B: "1"}, f"{next_hour} holds {ctx.redis.hgetall(next_hour)}, expected {SIG_B} once"
+    assert ctx.redis.hgetall(this_hour) == {SIG_A: "3"}, f"{this_hour} holds {ctx.redis.hgetall(this_hour)}, expected {SIG_A} counted three times (ts {T} + 10, + 20 and + 3599) and nothing for the served decision"
+    assert ctx.redis.hgetall(next_hour) == {SIG_B: "1"}, f"{next_hour} holds {ctx.redis.hgetall(next_hour)}, expected {SIG_B} once (ts {T} + 3600 opens the next hour)"
     for key in (this_hour, next_hour):
         ttl = ctx.redis.ttl(key)
         assert 7 * 86_400 - 60 <= ttl <= 7 * 86_400, f"{key} has TTL {ttl}: an hourly bucket is kept for BUCKET_TTL_S = 7 days"
@@ -1030,16 +1035,26 @@ def check_hour_bucket(ctx):
 
 def check_write_before_commit(ctx):
     _seed(ctx, "u-ana", "refused", SIG_A, T + 10)
-    event = ctx.kafka.records(TOPIC)[0]
+    # the next event's bucket is not a hash: its HINCRBY fails WRONGTYPE; a third event follows it
+    _seed(ctx, "u-ana", "refused", SIG_B, T + 7_210)
+    _seed(ctx, "u-ana", "refused", SIG_A, T + 20)
+    ctx.redis.set(f"signatures:{HOUR + 2}", "not a hash")
+    event, failing, _ = ctx.kafka.records(TOPIC)
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append((dict(offsets), ctx.redis.hget(f"signatures:{HOUR}", SIG_A))))
     m, _ = _events(ctx)
     assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be committed on a timer, before the count"
-    ctx.drain(m.run)
+    try:
+        ctx.drain(m.run)
+    except Exception:  # the failed write may end the loop: the offset is what is graded
+        pass
     covering = [count for offsets, count in at_commit if offsets.get((TOPIC, event.partition), 0) > event.offset]
     assert covering, "the event's offset was never committed"
     assert covering[0] == "1", f"when the event's offset was committed its count read {covering[0]!r}: write the count first, then commit, so a crash replays the event instead of losing it"
-    assert ctx.kafka.lag(GROUP, TOPIC) == 0, "every event must be committed once counted"
+    past = [offsets[(TOPIC, failing.partition)] for offsets, _ in at_commit if offsets.get((TOPIC, failing.partition), 0) > failing.offset]
+    assert not past, f"the second event's count failed (WRONGTYPE) and its offset was committed anyway (to {past[0]}): a failed write must leave the event uncommitted, to be read again"
+    committed = ctx.kafka.committed_offset(GROUP, TOPIC, event.partition)
+    assert committed == failing.offset, f"the first event, counted, must be committed (offset {failing.offset}), the group's offset reads {committed}"
 `,
     typescript: `import {createHash} from 'node:crypto';
 
@@ -1081,6 +1096,7 @@ function valueOf(record) {
 
 export async function check_user_key(ctx) {
   const {m} = events(ctx);
+  const started = Math.floor(Date.now() / 1000);
   await m.publish('u-ana', served('r-1'));
   await m.publish('u-ana', refused('r-2'));
   await m.publish('u-ben', served('r-3'));
@@ -1094,6 +1110,8 @@ export async function check_user_key(ctx) {
   assert.equal(missing.length, 0, \`the event lacks \${JSON.stringify(missing)}: \${JSON.stringify(event)}\`);
   assert(event.user === 'u-ana' && event.document_hash === DOC_HASH, \`the event names the user and the document hash: \${JSON.stringify(event)}\`);
   assert(event.decision === 'refused' && JSON.stringify(event.signals) === '["secret"]' && event.signature === SIG_A, \`a refusal's event carries decision refused, its signals and its signature: \${JSON.stringify(event)}\`);
+  const now = Math.floor(Date.now() / 1000);
+  assert(Number.isInteger(event.ts) && event.ts >= started - 1 && event.ts <= now + 1, \`ts is the decision's time in unix seconds (between \${started} and \${now}), the event says \${JSON.stringify(event.ts)}: the consumer buckets it by ts // 3600\`);
   assert.equal(valueOf(records[0]).decision, 'served', \`a served decision's event says served: \${JSON.stringify(valueOf(records[0]))}\`);
 }
 
@@ -1126,14 +1144,15 @@ export async function check_hour_bucket(ctx) {
   seed(ctx, 'u-ana', 'refused', SIG_A, T + 10);
   seed(ctx, 'u-ben', 'refused', SIG_A, T + 20);
   seed(ctx, 'u-ana', 'served', '', T + 30);
-  seed(ctx, 'u-cy', 'refused', SIG_B, T + 3_605);
+  seed(ctx, 'u-cy', 'refused', SIG_A, T + 3_599);
+  seed(ctx, 'u-cy', 'refused', SIG_B, T + 3_600);
   const {m} = events(ctx);
   await ctx.drain(m.run());
   const thisHour = \`signatures:\${HOUR}\`;
   const nextHour = \`signatures:\${HOUR + 1}\`;
   assert.equal(ctx.redis.exists('signatures'), 0, \`one global signatures hash (\${JSON.stringify(ctx.redis.hgetall('signatures'))}) cannot show when an attack began: bucket by hour, signatures:{ts // 3600}\`);
-  assert.deepEqual(ctx.redis.hgetall(thisHour), {[SIG_A]: '2'}, \`\${thisHour} holds \${JSON.stringify(ctx.redis.hgetall(thisHour))}, expected \${SIG_A} counted twice and nothing for the served decision\`);
-  assert.deepEqual(ctx.redis.hgetall(nextHour), {[SIG_B]: '1'}, \`\${nextHour} holds \${JSON.stringify(ctx.redis.hgetall(nextHour))}, expected \${SIG_B} once\`);
+  assert.deepEqual(ctx.redis.hgetall(thisHour), {[SIG_A]: '3'}, \`\${thisHour} holds \${JSON.stringify(ctx.redis.hgetall(thisHour))}, expected \${SIG_A} counted three times (ts \${T} + 10, + 20 and + 3599) and nothing for the served decision\`);
+  assert.deepEqual(ctx.redis.hgetall(nextHour), {[SIG_B]: '1'}, \`\${nextHour} holds \${JSON.stringify(ctx.redis.hgetall(nextHour))}, expected \${SIG_B} once (ts \${T} + 3600 opens the next hour)\`);
   for (const key of [thisHour, nextHour]) {
     const ttl = ctx.redis.ttl(key);
     assert(ttl >= 7 * 86_400 - 60 && ttl <= 7 * 86_400, \`\${key} has TTL \${ttl}: an hourly bucket is kept for BUCKET_TTL_S = 7 days\`);
@@ -1142,16 +1161,27 @@ export async function check_hour_bucket(ctx) {
 
 export async function check_write_before_commit(ctx) {
   seed(ctx, 'u-ana', 'refused', SIG_A, T + 10);
-  const event = ctx.kafka.records(TOPIC)[0];
+  // the next event's bucket is not a hash: its HINCRBY fails WRONGTYPE; a third event follows it
+  seed(ctx, 'u-ana', 'refused', SIG_B, T + 7_210);
+  seed(ctx, 'u-ana', 'refused', SIG_A, T + 20);
+  ctx.redis.set(\`signatures:\${HOUR + 2}\`, 'not a hash');
+  const [event, failing] = ctx.kafka.records(TOPIC);
   const atCommit: [Map<string, number>, string | null][] = [];
   ctx.kafka.onCommit((group, offsets) => atCommit.push([new Map(offsets), ctx.redis.hget(\`signatures:\${HOUR}\`, SIG_A)]));
   const {m} = events(ctx);
-  await ctx.drain(m.run());
+  try {
+    await ctx.drain(m.run());
+  } catch {
+    // the failed write may end the loop: the offsets are what is graded
+  }
   assert.equal(ctx.kafka.consumers.at(-1).autoCommit, false, 'autoCommit is on: offsets would be committed on a timer, before the count');
   const covering = atCommit.filter(([offsets]) => (offsets.get(\`\${TOPIC}|\${event.partition}\`) ?? 0) > event.offset).map(([, count]) => count);
   assert(covering.length > 0, "the event's offset was never committed");
   assert.equal(covering[0], '1', \`when the event's offset was committed its count read \${JSON.stringify(covering[0])}: write the count first, then commit, so a crash replays the event instead of losing it\`);
-  assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, 'every event must be committed once counted');
+  const past = atCommit.map(([offsets]) => offsets.get(\`\${TOPIC}|\${failing.partition}\`) ?? 0).filter(offset => offset > failing.offset);
+  assert.equal(past.length, 0, \`the second event's count failed (WRONGTYPE) and its offset was committed anyway (to \${past[0]}): a failed write must leave the event uncommitted, to be read again\`);
+  const committed = ctx.kafka.committedOffset(GROUP, TOPIC, event.partition);
+  assert.equal(committed, failing.offset, \`the first event, counted, must be committed (offset \${failing.offset}), the group's offset reads \${committed}\`);
 }
 `,
     go: `package main
@@ -1220,6 +1250,7 @@ func eventsDrain(ctx *harness.Ctx) {
 }
 
 func CheckUserKey(ctx *harness.Ctx) {
+	started := float64(ctx.Clock.Now() / 1000)
 	eventsPublish(ctx, "u-ana", eventsServed("r-1"))
 	eventsPublish(ctx, "u-ana", eventsRefused("r-2", eventsSigA))
 	eventsPublish(ctx, "u-ben", eventsServed("r-3"))
@@ -1239,6 +1270,9 @@ func CheckUserKey(ctx *harness.Ctx) {
 	ctx.Assert(event["user"] == "u-ana" && event["document_hash"] == eventsDocHash(), "the event names the user and the document hash: %s", records[1].Value)
 	signals, _ := event["signals"].([]any)
 	ctx.Assert(event["decision"] == "refused" && len(signals) == 1 && signals[0] == "secret" && event["signature"] == eventsSigA, "a refusal's event carries decision refused, its signals and its signature: %s", records[1].Value)
+	now := float64(ctx.Clock.Now() / 1000)
+	ts, _ := event["ts"].(float64)
+	ctx.Assert(ts == float64(int64(ts)) && ts >= started-1 && ts <= now+1, "ts is the decision's time in unix seconds (between %.0f and %.0f), the event says %v: the consumer buckets it by ts / 3600", started, now, event["ts"])
 	ctx.Equal(eventsValue(ctx, records[0])["decision"], "served", "a served decision's event says served")
 }
 
@@ -1269,13 +1303,14 @@ func CheckHourBucket(ctx *harness.Ctx) {
 	eventsSeed(ctx, "u-ana", "refused", eventsSigA, eventsT+10)
 	eventsSeed(ctx, "u-ben", "refused", eventsSigA, eventsT+20)
 	eventsSeed(ctx, "u-ana", "served", "", eventsT+30)
-	eventsSeed(ctx, "u-cy", "refused", eventsSigB, eventsT+3_605)
+	eventsSeed(ctx, "u-cy", "refused", eventsSigA, eventsT+3_599)
+	eventsSeed(ctx, "u-cy", "refused", eventsSigB, eventsT+3_600)
 	eventsDrain(ctx)
 	thisHour := "signatures:" + strconv.FormatInt(eventsHour, 10)
 	nextHour := "signatures:" + strconv.FormatInt(eventsHour+1, 10)
 	ctx.Equal(ctx.Redis.Exists("signatures"), 0, "one global signatures hash (%v) cannot show when an attack began: bucket by hour, signatures:{ts / 3600}; EXISTS signatures", ctx.Redis.HGetAll("signatures"))
-	ctx.Equal(ctx.Redis.HGetAll(thisHour), map[string]string{eventsSigA: "2"}, "%s must count %s twice and nothing for the served decision", thisHour, eventsSigA)
-	ctx.Equal(ctx.Redis.HGetAll(nextHour), map[string]string{eventsSigB: "1"}, "%s must count %s once", nextHour, eventsSigB)
+	ctx.Equal(ctx.Redis.HGetAll(thisHour), map[string]string{eventsSigA: "3"}, "%s must count %s three times (ts %d + 10, + 20 and + 3599) and nothing for the served decision", thisHour, eventsSigA, eventsT)
+	ctx.Equal(ctx.Redis.HGetAll(nextHour), map[string]string{eventsSigB: "1"}, "%s must count %s once (ts %d + 3600 opens the next hour)", nextHour, eventsSigB, eventsT)
 	for _, key := range []string{thisHour, nextHour} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 7*86_400-60 && ttl <= 7*86_400, "%s has TTL %d: an hourly bucket is kept for 7 days", key, ttl)
@@ -1284,7 +1319,12 @@ func CheckHourBucket(ctx *harness.Ctx) {
 
 func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 	eventsSeed(ctx, "u-ana", "refused", eventsSigA, eventsT+10)
-	event := ctx.Kafka.Records(eventsTopic)[0]
+	// the next event's bucket is not a hash: its HINCRBY fails WRONGTYPE; a third event follows it
+	eventsSeed(ctx, "u-ana", "refused", eventsSigB, eventsT+7_210)
+	eventsSeed(ctx, "u-ana", "refused", eventsSigA, eventsT+20)
+	ctx.Redis.Set("signatures:"+strconv.FormatInt(eventsHour+2, 10), "not a hash")
+	records := ctx.Kafka.Records(eventsTopic)
+	event, failing := records[0], records[1]
 	thisHour := "signatures:" + strconv.FormatInt(eventsHour, 10)
 	type snapshot struct {
 		offsets harness.KafkaOffsets
@@ -1310,7 +1350,11 @@ func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 	}
 	ctx.Assert(len(covering) > 0, "the event's offset was never committed")
 	ctx.Equal(covering[0], "1", "write the count first, then commit, so a crash replays the event instead of losing it; the count when the offset was committed")
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "every event must be committed once counted; lag")
+	for _, snap := range atCommit {
+		offset := snap.offsets[harness.KafkaTopicPartition{Topic: eventsTopic, Partition: failing.Partition}]
+		ctx.Assert(offset <= failing.Offset, "the second event's count failed (WRONGTYPE) and its offset was committed anyway (to %d): a failed write must leave the event uncommitted, to be read again", offset)
+	}
+	ctx.Equal(ctx.Kafka.CommittedOffset(eventsGroup, eventsTopic, event.Partition), failing.Offset, "the first event, counted, must be committed; the group's offset")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1318,6 +1362,7 @@ func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1327,39 +1372,39 @@ func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic = "prompt.security";
-const std::string kGroup = "signatures";
-constexpr long long kT = 1791201600;  // 2026-10-05 12:00:00 UTC
-constexpr long long kHour = kT / 3600;
-const std::string kSigA = "5f1c0a9e2b7d4c13";
-const std::string kSigB = "a07e3d91c4b2f865";
-const std::string kAnswer = "The notice period is thirty days.";
+const std::string hTopic = "prompt.security";
+const std::string hGroup = "signatures";
+constexpr long long hT = 1791201600;  // 2026-10-05 12:00:00 UTC
+constexpr long long hHour = hT / 3600;
+const std::string hSigA = "5f1c0a9e2b7d4c13";
+const std::string hSigB = "a07e3d91c4b2f865";
+const std::string hAnswer = "The notice period is thirty days.";
 
-std::string docHash() { return sha256_hex("The notice period is thirty days. Either party may end the contract in writing."); }
+std::string hDocHash() { return sha256_hex("The notice period is thirty days. Either party may end the contract in writing."); }
 
-Decision served(const std::string& rid) { return {rid, docHash(), kAnswer, {kAnswer}, false, {}, ""}; }
+Decision hServed(const std::string& rid) { return {rid, hDocHash(), hAnswer, {hAnswer}, false, {}, ""}; }
 
-Decision refused(const std::string& rid, const std::string& signature) {
-  return {rid, docHash(), "I cannot answer that from this document.", {}, true, {"secret"}, signature};
+Decision hRefused(const std::string& rid, const std::string& signature) {
+  return {rid, hDocHash(), "I cannot answer that from this document.", {}, true, {"secret"}, signature};
 }
 
-void publishAndSettle(harness::Ctx& ctx, const std::string& user, const Decision& d) {
+void hPublish(harness::Ctx& ctx, const std::string& user, const Decision& d) {
   publish(user, d);
   ctx.Settle();
 }
 
-void seed(harness::Ctx& ctx, const std::string& user, const std::string& decision, const std::string& signature, long long ts) {
+void hSeed(harness::Ctx& ctx, const std::string& user, const std::string& decision, const std::string& signature, long long ts) {
   const nlohmann::json event = {{"event_id", "e-" + std::to_string(ts) + "-" + user},
                                 {"user", user},
-                                {"document_hash", docHash()},
+                                {"document_hash", hDocHash()},
                                 {"decision", decision},
                                 {"signals", decision == "refused" ? std::vector<std::string>{"secret"} : std::vector<std::string>{}},
                                 {"signature", signature},
                                 {"ts", ts}};
-  ctx.Kafka.Seed(kTopic, user, event.dump());
+  ctx.Kafka.Seed(hTopic, user, event.dump());
 }
 
-nlohmann::json valueOf(harness::Ctx& ctx, const harness::KafkaRecord& r) {
+nlohmann::json hValueOf(harness::Ctx& ctx, const harness::KafkaRecord& r) {
   const auto event = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
   ctx.Assert(event.is_object(), "the record's value is not JSON: %s", r.Value.value_or(""));
   return event;
@@ -1367,19 +1412,19 @@ nlohmann::json valueOf(harness::Ctx& ctx, const harness::KafkaRecord& r) {
 
 // The consume loop until it waits for events: its consume(1000) idles in 1 s polls of virtual time,
 // so a few of them end the drain.
-void drain(harness::Ctx& ctx) {
+void hDrain(harness::Ctx& ctx) {
   ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 5);
   ctx.Drain([] { run(); });
 }
 
 // Everything the learner writes to cerr, clog or cout while alive.
-struct CaptureLogs {
+struct HCaptureLogs {
   std::ostringstream lines;
   std::streambuf* err;
   std::streambuf* clg;
   std::streambuf* out;
-  CaptureLogs() : err(std::cerr.rdbuf(lines.rdbuf())), clg(std::clog.rdbuf(lines.rdbuf())), out(std::cout.rdbuf(lines.rdbuf())) {}
-  ~CaptureLogs() {
+  HCaptureLogs() : err(std::cerr.rdbuf(lines.rdbuf())), clg(std::clog.rdbuf(lines.rdbuf())), out(std::cout.rdbuf(lines.rdbuf())) {}
+  ~HCaptureLogs() {
     std::cerr.rdbuf(err);
     std::clog.rdbuf(clg);
     std::cout.rdbuf(out);
@@ -1389,58 +1434,62 @@ struct CaptureLogs {
 }  // namespace
 
 void CheckUserKey(harness::Ctx& ctx) {
-  publishAndSettle(ctx, "u-ana", served("r-1"));
-  publishAndSettle(ctx, "u-ana", refused("r-2", kSigA));
-  publishAndSettle(ctx, "u-ben", served("r-3"));
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three decisions must leave three events on %s; the records", kTopic);
+  const long long started = ctx.Clock.Now() / 1000;
+  hPublish(ctx, "u-ana", hServed("r-1"));
+  hPublish(ctx, "u-ana", hRefused("r-2", hSigA));
+  hPublish(ctx, "u-ben", hServed("r-3"));
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 3, "three decisions must leave three events on %s; the records", hTopic);
   std::vector<std::string> keys;
   for (const auto& r : records) keys.push_back(r.Key.value_or(""));
   ctx.Equal(keys, std::vector<std::string>{"u-ana", "u-ana", "u-ben"}, "key each event by the user, so one user's events share a partition and keep their order; the keys");
   ctx.Equal(records[0].Partition, records[1].Partition, "two events of one user must share a partition");
-  const auto event = valueOf(ctx, records[1]);
+  const auto event = hValueOf(ctx, records[1]);
   for (const char* f : {"event_id", "user", "document_hash", "decision", "signals", "signature", "ts"}) ctx.Assert(event.contains(f), "the event lacks %s: %s", f, event.dump());
-  ctx.Assert(event["user"] == "u-ana" && event["document_hash"] == docHash(), "the event names the user and the document hash: %s", event.dump());
-  ctx.Assert(event["decision"] == "refused" && event["signals"] == nlohmann::json::array({"secret"}) && event["signature"] == kSigA, "a refusal's event carries decision refused, its signals and its signature: %s", event.dump());
-  ctx.Assert(valueOf(ctx, records[0])["decision"] == "served", "a served decision's event says served: %s", records[0].Value.value_or(""));
+  ctx.Assert(event["user"] == "u-ana" && event["document_hash"] == hDocHash(), "the event names the user and the document hash: %s", event.dump());
+  ctx.Assert(event["decision"] == "refused" && event["signals"] == nlohmann::json::array({"secret"}) && event["signature"] == hSigA, "a refusal's event carries decision refused, its signals and its signature: %s", event.dump());
+  const long long now = ctx.Clock.Now() / 1000;
+  ctx.Assert(event["ts"].is_number_integer() && event["ts"].get<long long>() >= started - 1 && event["ts"].get<long long>() <= now + 1, "ts is the decision's time in unix seconds (between %d and %d), the event says %s: the consumer buckets it by ts / 3600", started, now, event["ts"].dump());
+  ctx.Assert(hValueOf(ctx, records[0])["decision"] == "served", "a served decision's event says served: %s", records[0].Value.value_or(""));
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishAndSettle(ctx, "u-ana", refused("r-2", kSigA));
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "a leader failover must not lose the event (acks=all waits for every in-sync replica); the records");
-  publishAndSettle(ctx, "u-ana", served("r-1"));
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after the failover the producer must keep producing; the records");
+  ctx.Kafka.LoseAcks(hTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hPublish(ctx, "u-ana", hRefused("r-2", hSigA));
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Kafka.Failover(hTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "a leader failover must not lose the event (acks=all waits for every in-sync replica); the records");
+  hPublish(ctx, "u-ana", hServed("r-1"));
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "after the failover the producer must keep producing; the records");
 }
 
 void CheckNoText(harness::Ctx& ctx) {
   std::string logged;
   {
-    CaptureLogs capture;
-    publishAndSettle(ctx, "u-ana", served("r-1"));
-    publishAndSettle(ctx, "u-ben", refused("r-2", kSigA));
+    HCaptureLogs capture;
+    hPublish(ctx, "u-ana", hServed("r-1"));
+    hPublish(ctx, "u-ben", hRefused("r-2", hSigA));
     logged = capture.lines.str();
   }
-  for (const auto& r : ctx.Kafka.Records(kTopic)) {
-    ctx.Assert(!valueOf(ctx, r).contains("answer"), "the event carries an answer field: %s. The topic is retained and replicated; hashes and signal names are enough", r.Value.value_or(""));
+  for (const auto& r : ctx.Kafka.Records(hTopic)) {
+    ctx.Assert(!hValueOf(ctx, r).contains("answer"), "the event carries an answer field: %s. The topic is retained and replicated; hashes and signal names are enough", r.Value.value_or(""));
     ctx.Assert(r.Value.value_or("").find("thirty days") == std::string::npos, "the answer text is in the event: %s", r.Value.value_or(""));
   }
   ctx.Assert(logged.find("thirty days") == std::string::npos, "a log line carries the answer: %q. Log the user, the decision and the signature", logged);
 }
 
 void CheckHourBucket(harness::Ctx& ctx) {
-  seed(ctx, "u-ana", "refused", kSigA, kT + 10);
-  seed(ctx, "u-ben", "refused", kSigA, kT + 20);
-  seed(ctx, "u-ana", "served", "", kT + 30);
-  seed(ctx, "u-cy", "refused", kSigB, kT + 3605);
-  drain(ctx);
-  const std::string thisHour = "signatures:" + std::to_string(kHour);
-  const std::string nextHour = "signatures:" + std::to_string(kHour + 1);
+  hSeed(ctx, "u-ana", "refused", hSigA, hT + 10);
+  hSeed(ctx, "u-ben", "refused", hSigA, hT + 20);
+  hSeed(ctx, "u-ana", "served", "", hT + 30);
+  hSeed(ctx, "u-cy", "refused", hSigA, hT + 3599);
+  hSeed(ctx, "u-cy", "refused", hSigB, hT + 3600);
+  hDrain(ctx);
+  const std::string thisHour = "signatures:" + std::to_string(hHour);
+  const std::string nextHour = "signatures:" + std::to_string(hHour + 1);
   ctx.Equal(ctx.Redis.Exists("signatures"), 0, "one global signatures hash (%v) cannot show when an attack began: bucket by hour, signatures:{ts / 3600}; EXISTS signatures", ctx.Redis.HGetAll("signatures"));
-  ctx.Equal(ctx.Redis.HGetAll(thisHour), std::map<std::string, std::string>{{kSigA, "2"}}, "%s must count %s twice and nothing for the served decision", thisHour, kSigA);
-  ctx.Equal(ctx.Redis.HGetAll(nextHour), std::map<std::string, std::string>{{kSigB, "1"}}, "%s must count %s once", nextHour, kSigB);
+  ctx.Equal(ctx.Redis.HGetAll(thisHour), std::map<std::string, std::string>{{hSigA, "3"}}, "%s must count %s three times (ts %d + 10, + 20 and + 3599) and nothing for the served decision", thisHour, hSigA, hT);
+  ctx.Equal(ctx.Redis.HGetAll(nextHour), std::map<std::string, std::string>{{hSigB, "1"}}, "%s must count %s once (ts %d + 3600 opens the next hour)", nextHour, hSigB, hT);
   for (const auto& key : {thisHour, nextHour}) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl >= 7 * 86400 - 60 && ttl <= 7 * 86400, "%s has TTL %d: an hourly bucket is kept for 7 days", key, ttl);
@@ -1448,28 +1497,43 @@ void CheckHourBucket(harness::Ctx& ctx) {
 }
 
 void CheckWriteBeforeCommit(harness::Ctx& ctx) {
-  seed(ctx, "u-ana", "refused", kSigA, kT + 10);
-  const auto event = ctx.Kafka.Records(kTopic)[0];
-  const std::string thisHour = "signatures:" + std::to_string(kHour);
+  hSeed(ctx, "u-ana", "refused", hSigA, hT + 10);
+  // the next event's bucket is not a hash: its HINCRBY fails WRONGTYPE; a third event follows it
+  hSeed(ctx, "u-ana", "refused", hSigB, hT + 7210);
+  hSeed(ctx, "u-ana", "refused", hSigA, hT + 20);
+  ctx.Redis.Set("signatures:" + std::to_string(hHour + 2), "not a hash");
+  const auto records = ctx.Kafka.Records(hTopic);
+  const auto event = records[0];
+  const auto failing = records[1];
+  const std::string thisHour = "signatures:" + std::to_string(hHour);
   struct Snapshot {
     harness::KafkaOffsets offsets;
     std::string count;
   };
   std::vector<Snapshot> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
-    atCommit.push_back({offsets, ctx.Redis.HGet(thisHour, kSigA).value_or("")});
+    atCommit.push_back({offsets, ctx.Redis.HGet(thisHour, hSigA).value_or("")});
   });
-  drain(ctx);
+  try {
+    hDrain(ctx);
+  } catch (const std::exception&) {
+    // the failed write may end the loop: the offsets are what is graded
+  }
   const auto consumers = ctx.Kafka.Consumers();
   ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit, "enable.auto.commit is on: offsets would be committed on a timer, before the count");
   std::vector<std::string> covering;
   for (const auto& snap : atCommit) {
-    const auto at = snap.offsets.find(harness::KafkaTopicPartition{kTopic, event.Partition});
+    const auto at = snap.offsets.find(harness::KafkaTopicPartition{hTopic, event.Partition});
     if (at != snap.offsets.end() && at->second > event.Offset) covering.push_back(snap.count);
   }
   ctx.Assert(!covering.empty(), "the event's offset was never committed");
   ctx.Equal(covering[0], "1", "write the count first, then commit, so a crash replays the event instead of losing it; the count when the offset was committed");
-  ctx.Equal(ctx.Kafka.Lag(kGroup, kTopic), 0, "every event must be committed once counted; lag");
+  for (const auto& snap : atCommit) {
+    const auto at = snap.offsets.find(harness::KafkaTopicPartition{hTopic, failing.Partition});
+    const int64_t offset = at == snap.offsets.end() ? 0 : at->second;
+    ctx.Assert(offset <= failing.Offset, "the second event's count failed (WRONGTYPE) and its offset was committed anyway (to %d): a failed write must leave the event uncommitted, to be read again", offset);
+  }
+  ctx.Equal(ctx.Kafka.CommittedOffset(hGroup, hTopic, event.Partition), failing.Offset, "the first event, counted, must be committed; the group's offset");
 }
 `,
   },

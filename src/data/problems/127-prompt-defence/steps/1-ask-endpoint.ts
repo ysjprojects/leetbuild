@@ -67,7 +67,7 @@ retries a slow answer pays for a second model call.
       id: 'control-chars',
       title: 'Strips control characters and their escape strings first',
       detail:
-        'A question of 400 backspaces, 450 typed \\b escapes and "What is the notice period?" reaches the model as the question alone; a question of nothing but controls is 400. The starter forwards the text untouched.',
+        'A question of 400 backspaces, 450 typed \\b escapes and "What is the notice period?" reaches the model as the question alone; ESC, form feed, SO, US and carriage returns are stripped while tabs and newlines stay; a question of nothing but controls is 400. The starter forwards the text untouched.',
       match: {
         python: {all: [/CONTROL_CHARS\s*=/, /strip_controls\(\s*body\.question\s*\)/]},
         typescript: {all: [/CONTROL_CHARS\s*=/, /stripControls\(\s*body\.question\s*\)/]},
@@ -80,7 +80,7 @@ retries a slow answer pays for a second model call.
       id: 'token-cap',
       title: 'Caps the question at 512 tokens, not 2 000 characters',
       detail:
-        'A 940-character question of 600 tokens is 413 with no model call; a 3 200-character question of 190 tokens is answered. The starter counts characters, so it does the opposite.',
+        'A 940-character question of 600 tokens is 413 with no model call, and so is one of 513 tokens; a 3 200-character question of 190 tokens and one of exactly 512 are answered. The starter counts characters, so it gets these wrong.',
       match: {
         python: {
           all: [/MAX_QUESTION_TOKENS\s*=\s*512/, /len\(tokens\)\s*>\s*MAX_QUESTION_TOKENS/],
@@ -102,7 +102,7 @@ retries a slow answer pays for a second model call.
       id: 'repeat-ratio',
       title: 'Rejects a question that is one phrase repeated',
       detail:
-        'jq_THREADS 100 times and "/goto maiden" 40 times are 422 with no model call; a 40-token repeat (under 64 tokens) and a varied 80-token question are answered. The starter has no repetition check.',
+        'jq_THREADS 100 times, "/goto maiden" 40 times, dog 64 times and 64 tokens where dog covers 33 are 422 with no model call; dog 63 times (under 64 tokens), 64 tokens where dog covers exactly half, and a varied 80-token question are answered. The starter has no repetition check.',
       match: {
         python: {all: [/repeat_ratio\(\s*tokens\s*\)\s*>\s*MAX_REPEAT_RATIO/, /status_code\s*=\s*422/]},
         typescript: {all: [/repeatRatio\(\s*tokens\s*\)\s*>\s*MAX_REPEAT_RATIO/, /code\(\s*422\s*\)/]},
@@ -115,7 +115,7 @@ retries a slow answer pays for a second model call.
       id: 'idempotency-key',
       title: 'Keys retries by (user, Idempotency-Key)',
       detail:
-        'Without Idempotency-Key the request is 400; a replay of the same (user, key) answers the stored decision with no second model call; another user with the same key gets an answer of their own. The starter ignores the header.',
+        'Without Idempotency-Key the request is 400; a replay of the same (user, key) answers the stored decision with no second model call, even once the user’s window is full; another user with the same key gets an answer of their own. The starter ignores the header.',
       match: {
         python: {all: [/Idempotency-Key/, /asks\.get\(\s*user\s*,/, /asks\.put\(\s*user\s*,/]},
         typescript: {all: [/idempotency-key/, /asks\.get\(\s*user\s*,/, /asks\.put\(\s*user\s*,/]},
@@ -957,6 +957,10 @@ async def check_control_chars(ctx):
         sent = _sent(ctx)
         assert "\\x08" not in sent and "\\\\b" not in sent, f"the model received {sent.count(chr(8))} backspaces and {sent.count(chr(92) + 'b')} typed \\\\b escapes: strip CONTROL_CHARS before the question is measured or used"
         assert "What is the notice period?" in sent, f"the question itself must reach the model: {sent[:200]!r}"
+        r = await _ask(c, "\\x1b\\x0c\\x0e\\x1fWhat is\\tthe\\r notice\\nperiod?", key="k-3")
+        assert r.status_code == 200, f"a question with ESC, FF, SO, US and CR in it must be answered once they are stripped, got {r.status_code}: {r.text[:200]}"
+        sent = _sent(ctx)
+        assert "What is\\tthe notice\\nperiod?" in sent, f"CONTROL_CHARS covers \\\\x00-\\\\x08, \\\\x0b-\\\\x1f and \\\\x7f while tab and newline stay: 'What is<TAB>the<CR> notice<LF>period?' behind ESC, FF, SO and US reached the model as {sent[-80:]!r}"
         calls = _calls(ctx)
         r = await _ask(c, "\\x00\\x07\\\\r\\\\b\\x7f", key="k-2")
         assert r.status_code == 400, f"a question of nothing but control characters must be 400, got {r.status_code}"
@@ -973,15 +977,27 @@ async def check_token_cap(ctx):
         r = await _ask(c, dense, key="k-dense")
         assert r.status_code == 413, f"a {len(dense)}-character question of 600 tokens must be 413, got {r.status_code}"
         assert _calls(ctx) == calls, "a question over the cap must not reach the model"
+        exact = " ".join(f"w{i}" for i in range(512))
+        r = await _ask(c, exact, key="k-512")
+        assert r.status_code == 200, f"a question of exactly 512 tokens is at the cap and must be answered, got {r.status_code}"
+        calls = _calls(ctx)
+        r = await _ask(c, exact + " w512", key="k-513")
+        assert r.status_code == 413, f"a question of 513 tokens is over the 512-token cap and must be 413, got {r.status_code}"
+        assert _calls(ctx) == calls, "a question over the cap must not reach the model"
 
 
 async def check_repeat_ratio(ctx):
     async with _api(ctx) as c:
         calls = _calls(ctx)
-        for i, question in enumerate(["jq_THREADS " * 100, "/goto maiden " * 40]):
+        repeats = [("jq_THREADS " * 100, "jq_THREADS x100"), ("/goto maiden " * 40, "/goto maiden x40"), ("dog " * 64, "dog x64, exactly MIN_REPEAT_TOKENS"), (" ".join(f"dog w{i}" for i in range(31)) + " dog dog", "64 tokens, dog 33 times (ratio 0.52)")]
+        for i, (question, name) in enumerate(repeats):
             r = await _ask(c, question, key=f"k-rep-{i}")
-            assert r.status_code == 422, f"{question[:24]!r} repeated is a divergence attack and must be 422, got {r.status_code}"
+            assert r.status_code == 422, f"{name} repeats one sequence over more than half of 64 or more tokens and must be 422, got {r.status_code}"
         assert _calls(ctx) == calls, "a repeated-token question must not reach the model"
+        r = await _ask(c, "dog " * 63, key="k-63")
+        assert r.status_code == 200, f"a 63-token repeat is under MIN_REPEAT_TOKENS = 64 and must be answered, got {r.status_code}"
+        r = await _ask(c, " ".join(f"dog w{i}" for i in range(32)), key="k-half")
+        assert r.status_code == 200, f"64 tokens with dog 32 times is a repeat ratio of exactly 0.5, not above MAX_REPEAT_RATIO, and must be answered, got {r.status_code}"
         r = await _ask(c, "dog " * 40, key="k-short")
         assert r.status_code == 200, f"a 40-token repeat is under MIN_REPEAT_TOKENS = 64 and must be answered, got {r.status_code}"
         r = await _ask(c, " ".join(f"w{i}" for i in range(80)), key="k-varied")
@@ -1000,6 +1016,9 @@ async def check_idempotency_key(ctx):
         assert _calls(ctx) == 1, f"a client retry cost {_calls(ctx)} model calls: look up (user, key) before asking the model"
         other = await _ask(c, "What is the notice period?", user="u-ben", key="k-7")
         assert other.status_code == 200 and other.json().get("request_id") != first.json().get("request_id"), "another user with the same key gets an answer of their own"
+        ctx.redis.set(f"limits:u-ana:{int(time.time()) // 60}", 30, ex=60)
+        again = await _ask(c, "What is the notice period?", key="k-7")
+        assert again.status_code == 200 and again.json().get("request_id") == first.json().get("request_id"), f"with u-ana's window full, a replay of k-7 answered {again.status_code}: asks.get answers the stored decision before admit spends the window"
 `,
     typescript: `const DOC_ID = 'contract-7';
 const DOC = 'The notice period is thirty days. Either party may end the contract in writing.';
@@ -1063,6 +1082,10 @@ export async function check_control_chars(ctx) {
   const prompt: string = sent(ctx);
   assert(!prompt.includes('\\x08') && !prompt.includes('\\\\b'), \`the model received \${prompt.split('\\x08').length - 1} backspaces and \${prompt.split('\\\\b').length - 1} typed \\\\b escapes: strip CONTROL_CHARS before the question is measured or used\`);
   assert(prompt.includes('What is the notice period?'), \`the question itself must reach the model: \${JSON.stringify(prompt.slice(0, 200))}\`);
+  r = await ask(c, '\\x1b\\x0c\\x0e\\x1fWhat is\\tthe\\r notice\\nperiod?', {key: 'k-3'});
+  assert.equal(r.status, 200, \`a question with ESC, FF, SO, US and CR in it must be answered once they are stripped, got \${r.status}: \${r.text.slice(0, 200)}\`);
+  const kept: string = sent(ctx);
+  assert(kept.includes('What is\\tthe notice\\nperiod?'), \`CONTROL_CHARS covers \\\\x00-\\\\x08, \\\\x0b-\\\\x1f and \\\\x7f while tab and newline stay: 'What is<TAB>the<CR> notice<LF>period?' behind ESC, FF, SO and US reached the model as \${JSON.stringify(kept.slice(-80))}\`);
   const before = calls(ctx);
   r = await ask(c, '\\x00\\x07\\\\r\\\\b\\x7f', {key: 'k-2'});
   assert.equal(r.status, 400, \`a question of nothing but control characters must be 400, got \${r.status}\`);
@@ -1079,17 +1102,34 @@ export async function check_token_cap(ctx) {
   r = await ask(c, dense, {key: 'k-dense'});
   assert.equal(r.status, 413, \`a \${dense.length}-character question of 600 tokens must be 413, got \${r.status}\`);
   assert.equal(calls(ctx), before, 'a question over the cap must not reach the model');
+  const exact = Array.from({length: 512}, (_, i) => \`w\${i}\`).join(' ');
+  r = await ask(c, exact, {key: 'k-512'});
+  assert.equal(r.status, 200, \`a question of exactly 512 tokens is at the cap and must be answered, got \${r.status}\`);
+  const atCap = calls(ctx);
+  r = await ask(c, \`\${exact} w512\`, {key: 'k-513'});
+  assert.equal(r.status, 413, \`a question of 513 tokens is over the 512-token cap and must be 413, got \${r.status}\`);
+  assert.equal(calls(ctx), atCap, 'a question over the cap must not reach the model');
 }
 
 export async function check_repeat_ratio(ctx) {
   const c = api(ctx);
   const before = calls(ctx);
-  for (const [i, question] of ['jq_THREADS '.repeat(100), '/goto maiden '.repeat(40)].entries()) {
+  const repeats: [string, string][] = [
+    ['jq_THREADS '.repeat(100), 'jq_THREADS x100'],
+    ['/goto maiden '.repeat(40), '/goto maiden x40'],
+    ['dog '.repeat(64), 'dog x64, exactly MIN_REPEAT_TOKENS'],
+    [Array.from({length: 31}, (_, i) => \`dog w\${i}\`).join(' ') + ' dog dog', '64 tokens, dog 33 times (ratio 0.52)'],
+  ];
+  for (const [i, [question, name]] of repeats.entries()) {
     const r = await ask(c, question, {key: \`k-rep-\${i}\`});
-    assert.equal(r.status, 422, \`\${JSON.stringify(question.slice(0, 24))} repeated is a divergence attack and must be 422, got \${r.status}\`);
+    assert.equal(r.status, 422, \`\${name} repeats one sequence over more than half of 64 or more tokens and must be 422, got \${r.status}\`);
   }
   assert.equal(calls(ctx), before, 'a repeated-token question must not reach the model');
-  let r = await ask(c, 'dog '.repeat(40), {key: 'k-short'});
+  let r = await ask(c, 'dog '.repeat(63), {key: 'k-63'});
+  assert.equal(r.status, 200, \`a 63-token repeat is under MIN_REPEAT_TOKENS = 64 and must be answered, got \${r.status}\`);
+  r = await ask(c, Array.from({length: 32}, (_, i) => \`dog w\${i}\`).join(' '), {key: 'k-half'});
+  assert.equal(r.status, 200, \`64 tokens with dog 32 times is a repeat ratio of exactly 0.5, not above MAX_REPEAT_RATIO, and must be answered, got \${r.status}\`);
+  r = await ask(c, 'dog '.repeat(40), {key: 'k-short'});
   assert.equal(r.status, 200, \`a 40-token repeat is under MIN_REPEAT_TOKENS = 64 and must be answered, got \${r.status}\`);
   r = await ask(c, Array.from({length: 80}, (_, i) => \`w\${i}\`).join(' '), {key: 'k-varied'});
   assert.equal(r.status, 200, \`a varied 80-token question must be answered, got \${r.status}\`);
@@ -1107,6 +1147,9 @@ export async function check_idempotency_key(ctx) {
   assert.equal(calls(ctx), 1, \`a client retry cost \${calls(ctx)} model calls: look up (user, key) before asking the model\`);
   const other = await ask(c, 'What is the notice period?', {user: 'u-ben', key: 'k-7'});
   assert(other.status === 200 && other.json().request_id !== first.json().request_id, 'another user with the same key gets an answer of their own');
+  ctx.redis.set(\`limits:u-ana:\${Math.floor(Date.now() / 1000 / 60)}\`, 30, 'EX', 60);
+  const again = await ask(c, 'What is the notice period?', {key: 'k-7'});
+  assert(again.status === 200 && again.json().request_id === first.json().request_id, \`with u-ana's window full, a replay of k-7 answered \${again.status}: asks.get answers the stored decision before admit spends the window\`);
 }
 `,
     go: `package main
@@ -1134,13 +1177,18 @@ const (
 // askQuestions are the questions respond received, in order.
 var askQuestions []string
 
-// askClient serves the learner's route over stand-ins for steps 2 and 4: every user but u-busy is
-// admitted, sessions are kept nowhere, and respond answers the document's first sentence.
+// askFull holds the users whose window the admit stand-in reports full.
+var askFull map[string]bool
+
+// askClient serves the learner's route over stand-ins for steps 2 and 4: every user but u-busy (and
+// those in askFull) is admitted, sessions are kept nowhere, and respond answers the document's first
+// sentence.
 func askClient(ctx *harness.Ctx) *harness.HTTP {
 	askQuestions = nil
+	askFull = map[string]bool{}
 	ctx.Redis.Set("doc:"+askDocID, askDoc)
 	admit = func(_ context.Context, user string) (types.Admission, error) {
-		if user == "u-busy" {
+		if user == "u-busy" || askFull[user] {
 			return types.Admission{OK: false, RetryAfter: 17}, nil
 		}
 		return types.Admission{OK: true, Remaining: 29}, nil
@@ -1175,6 +1223,15 @@ func askField(ctx *harness.Ctx, r *harness.Response, field string) any {
 	return body[field]
 }
 
+// askWords is n tokens or pairs: prefix+"w0" to prefix+"w<n-1>", joined by spaces.
+func askWords(n int, prefix string) string {
+	words := make([]string, n)
+	for i := range words {
+		words[i] = fmt.Sprintf("%sw%d", prefix, i)
+	}
+	return strings.Join(words, " ")
+}
+
 func CheckRoute(ctx *harness.Ctx) {
 	c := askClient(ctx)
 	r := askPost(c, "What is the notice period?", "u-ana", "k-1", askDocID)
@@ -1206,6 +1263,10 @@ func CheckControlChars(ctx *harness.Ctx) {
 	r = askPost(c, "\\x00\\x07\\\\r\\\\b\\x7f", "u-ana", "k-2", askDocID)
 	ctx.Equal(r.Status, 400, "a question of nothing but control characters")
 	ctx.Equal(len(askQuestions), 1, "an empty question must not reach respond; calls")
+	r = askPost(c, "\\x1b\\x0c\\x0e\\x1fWhat is\\tthe\\r notice\\nperiod?", "u-ana", "k-3", askDocID)
+	ctx.Equal(r.Status, 200, "a question with ESC, FF, SO, US and CR in it, once they are stripped")
+	ctx.Equal(len(askQuestions), 2, "the question must reach respond; calls")
+	ctx.Equal(askQuestions[1], "What is\\tthe notice\\nperiod?", "controlChars covers \\\\x00-\\\\x08, \\\\x0b-\\\\x1f and \\\\x7f while tab and newline stay: the question respond receives")
 }
 
 func CheckTokenCap(ctx *harness.Ctx) {
@@ -1223,14 +1284,27 @@ func CheckTokenCap(ctx *harness.Ctx) {
 	before := len(askQuestions)
 	ctx.Equal(askPost(c, dense.String(), "u-ana", "k-dense", askDocID).Status, 413, "a %d-character question of 600 tokens", dense.Len())
 	ctx.Equal(len(askQuestions), before, "a question over the cap must not reach respond; calls")
+	exact := askWords(512, "")
+	ctx.Equal(askPost(c, exact, "u-ana", "k-512", askDocID).Status, 200, "a question of exactly 512 tokens is at the cap")
+	before = len(askQuestions)
+	ctx.Equal(askPost(c, exact+" w512", "u-ana", "k-513", askDocID).Status, 413, "a question of 513 tokens is over the 512-token cap")
+	ctx.Equal(len(askQuestions), before, "a question over the cap must not reach respond; calls")
 }
 
 func CheckRepeatRatio(ctx *harness.Ctx) {
 	c := askClient(ctx)
-	for i, question := range []string{strings.Repeat("jq_THREADS ", 100), strings.Repeat("/goto maiden ", 40)} {
-		ctx.Equal(askPost(c, question, "u-ana", fmt.Sprintf("k-rep-%d", i), askDocID).Status, 422, "%q repeated is a divergence attack", question[:12])
+	repeats := [][2]string{
+		{strings.Repeat("jq_THREADS ", 100), "jq_THREADS x100"},
+		{strings.Repeat("/goto maiden ", 40), "/goto maiden x40"},
+		{strings.Repeat("dog ", 64), "dog x64, exactly minRepeatTokens"},
+		{askWords(31, "dog ") + " dog dog", "64 tokens, dog 33 times (ratio 0.52)"},
+	}
+	for i, q := range repeats {
+		ctx.Equal(askPost(c, q[0], "u-ana", fmt.Sprintf("k-rep-%d", i), askDocID).Status, 422, "%s repeats one sequence over more than half of 64 or more tokens", q[1])
 	}
 	ctx.Equal(len(askQuestions), 0, "a repeated-token question must not reach respond; calls")
+	ctx.Equal(askPost(c, strings.Repeat("dog ", 63), "u-ana", "k-63", askDocID).Status, 200, "a 63-token repeat is under minRepeatTokens = 64")
+	ctx.Equal(askPost(c, askWords(32, "dog "), "u-ana", "k-half", askDocID).Status, 200, "64 tokens with dog 32 times is a repeat ratio of exactly 0.5, not above maxRepeatRatio")
 	ctx.Equal(askPost(c, strings.Repeat("dog ", 40), "u-ana", "k-short", askDocID).Status, 200, "a 40-token repeat is under minRepeatTokens = 64")
 	varied := make([]string, 80)
 	for i := range varied {
@@ -1250,6 +1324,10 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	ctx.Equal(len(askQuestions), 1, "a client retry must not cost a second model call: look up (user, key) first; respond calls")
 	other := askPost(c, "What is the notice period?", "u-ben", "k-7", askDocID)
 	ctx.Assert(other.Status == 200 && askField(ctx, other, "request_id") != askField(ctx, first, "request_id"), "another user with the same key gets an answer of their own")
+	askFull["u-ana"] = true
+	again := askPost(c, "What is the notice period?", "u-ana", "k-7", askDocID)
+	ctx.Equal(again.Status, 200, "with u-ana's window full, a replay of k-7: asks.Get answers the stored decision before admit spends the window")
+	ctx.Equal(askField(ctx, again, "request_id"), askField(ctx, first, "request_id"), "a replay with the window full answers the stored decision; request_id")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1258,6 +1336,7 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 
 #include <cstdio>
 #include <string>
+#include <set>
 #include <vector>
 
 #include "digest.h"
@@ -1266,23 +1345,26 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDocId = "contract-7";
-const std::string kDoc = "The notice period is thirty days. Either party may end the contract in writing.";
-const std::string kFirst = "The notice period is thirty days.";
+const std::string hDocId = "contract-7";
+const std::string hDoc = "The notice period is thirty days. Either party may end the contract in writing.";
+const std::string hFirst = "The notice period is thirty days.";
 
 // The questions respond received, in order.
-std::vector<std::string> gQuestions;
+std::vector<std::string> hQuestions;
+// The users whose window the admit stand-in reports full.
+std::set<std::string> hFull;
 
-struct Api {
+struct HAskApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
-    gQuestions.clear();
-    ctx.Redis.Set("doc:" + kDocId, kDoc);
+  explicit HAskApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    hQuestions.clear();
+    hFull.clear();
+    ctx.Redis.Set("doc:" + hDocId, hDoc);
     register_routes(svr);
   }
 
-  harness::Response post(const std::string& question, const std::string& user = "u-ana", const std::string& key = "k-1", const std::string& doc = kDocId) {
+  harness::Response post(const std::string& question, const std::string& user = "u-ana", const std::string& key = "k-1", const std::string& doc = hDocId) {
     const std::string body = nlohmann::json{{"document_id", doc}, {"question", question}}.dump();
     if (user.empty()) return http.Post("/v1/ask", body, "Idempotency-Key", key);
     if (key.empty()) return http.Post("/v1/ask", body, "X-User-Id", user);
@@ -1290,19 +1372,26 @@ struct Api {
   }
 };
 
-nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
 }
 
-std::string repeated(const std::string& text, int n) {
+std::string hRepeated(const std::string& text, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += text;
   return out;
 }
 
-size_t occurrences(const std::string& text, const std::string& needle) {
+// n tokens or pairs: prefix + "w0" to prefix + "w<n-1>", joined by spaces.
+std::string hWords(int n, const std::string& prefix) {
+  std::string out;
+  for (int i = 0; i < n; i++) out += (i == 0 ? "" : " ") + prefix + "w" + std::to_string(i);
+  return out;
+}
+
+size_t hOccurrences(const std::string& text, const std::string& needle) {
   size_t n = 0;
   for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + needle.size())) n++;
   return n;
@@ -1310,48 +1399,51 @@ size_t occurrences(const std::string& text, const std::string& needle) {
 
 }  // namespace
 
-// Stand-ins for steps 2 and 4: every user but u-busy is admitted, sessions are kept nowhere, and
-// respond answers the document's first sentence.
-Admission admit(const std::string& user) { return user == "u-busy" ? Admission{false, 0, 17} : Admission{true, 29, 0}; }
+// Stand-ins for steps 2 and 4: every user but u-busy (and those in hFull) is admitted, sessions are
+// kept nowhere, and respond answers the document's first sentence.
+Admission admit(const std::string& user) { return user == "u-busy" || hFull.count(user) > 0 ? Admission{false, 0, 17} : Admission{true, 29, 0}; }
 
 void remember(const std::string&, const std::string&, const std::string&) {}
 
 Decision respond(const std::string&, const std::string&, const std::string& document, const std::string& question) {
-  gQuestions.push_back(question);
+  hQuestions.push_back(question);
   const std::string first = model::first_sentence(document);
-  return {"r-" + std::to_string(gQuestions.size()), sha256_hex(document), first, {first}, false, {}, ""};
+  return {"r-" + std::to_string(hQuestions.size()), sha256_hex(document), first, {first}, false, {}, ""};
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
+  HAskApi api(ctx);
   auto r = api.post("What is the notice period?");
   ctx.Equal(r.Status, 200, "a valid question (%s)", r.Text());
-  const auto body = bodyOf(ctx, r);
+  const auto body = hBodyOf(ctx, r);
   for (const char* f : {"request_id", "document_hash", "answer", "spans", "refused", "signals", "signature"}) ctx.Assert(body.contains(f), "the 200 body lacks %s: %s", f, r.Text());
-  ctx.Assert(body["answer"] == kFirst && body["refused"] == false, "the decision answers from the document: %s", r.Text());
+  ctx.Assert(body["answer"] == hFirst && body["refused"] == false, "the decision answers from the document: %s", r.Text());
   ctx.Equal(api.post("Hi?", "", "k-2").Status, 401, "without X-User-Id");
   ctx.Equal(api.post("What is the notice period?", "u-ana", "k-3", "missing-doc").Status, 404, "an unknown document");
-  const size_t before = gQuestions.size();
+  const size_t before = hQuestions.size();
   r = api.post("What is the notice period?", "u-busy", "k-4");
   ctx.Equal(r.Status, 429, "a user whose window is full");
   ctx.Equal(r.HeaderValue("Retry-After"), "17", "a 429 carries the admission's Retry-After");
-  ctx.Equal(gQuestions.size(), before, "a refused user must not reach respond; calls");
+  ctx.Equal(hQuestions.size(), before, "a refused user must not reach respond; calls");
 }
 
 void CheckControlChars(harness::Ctx& ctx) {
-  Api api(ctx);
-  const std::string question = repeated("\\x08", 400) + repeated("\\\\b", 450) + "What is the notice period?";
+  HAskApi api(ctx);
+  const std::string question = hRepeated("\\x08", 400) + hRepeated("\\\\b", 450) + "What is the notice period?";
   ctx.Equal(api.post(question).Status, 200, "a question that is the real question once its controls are stripped");
-  ctx.Equal(gQuestions.size(), 1, "the question must reach respond once; calls");
-  const std::string got = gQuestions[0];
-  ctx.Assert(got.find('\\x08') == std::string::npos && got.find("\\\\b") == std::string::npos, "respond received %d backspaces and %d typed \\\\b escapes: strip kControlChars before the question is measured or used", occurrences(got, "\\x08"), occurrences(got, "\\\\b"));
+  ctx.Equal(hQuestions.size(), 1, "the question must reach respond once; calls");
+  const std::string got = hQuestions[0];
+  ctx.Assert(got.find('\\x08') == std::string::npos && got.find("\\\\b") == std::string::npos, "respond received %d backspaces and %d typed \\\\b escapes: strip kControlChars before the question is measured or used", hOccurrences(got, "\\x08"), hOccurrences(got, "\\\\b"));
   ctx.Equal(got, "What is the notice period?", "the question respond receives");
   ctx.Equal(api.post(std::string("\\x00\\x07\\\\r\\\\b\\x7f", 7), "u-ana", "k-2").Status, 400, "a question of nothing but control characters");
-  ctx.Equal(gQuestions.size(), 1, "an empty question must not reach respond; calls");
+  ctx.Equal(hQuestions.size(), 1, "an empty question must not reach respond; calls");
+  ctx.Equal(api.post("\\x1b\\x0c\\x0e\\x1fWhat is\\tthe\\r notice\\nperiod?", "u-ana", "k-3").Status, 200, "a question with ESC, FF, SO, US and CR in it, once they are stripped");
+  ctx.Equal(hQuestions.size(), 2, "the question must reach respond; calls");
+  ctx.Equal(hQuestions[1], "What is\\tthe notice\\nperiod?", "kControlChars covers \\\\x00-\\\\x08, \\\\x0b-\\\\x1f and \\\\x7f while tab and newline stay: the question respond receives");
 }
 
 void CheckTokenCap(harness::Ctx& ctx) {
-  Api api(ctx);
+  HAskApi api(ctx);
   std::string wordy;
   for (int i = 0; i < 190; i++) {
     char word[32];
@@ -1361,33 +1453,44 @@ void CheckTokenCap(harness::Ctx& ctx) {
   ctx.Equal(api.post(wordy, "u-ana", "k-wordy").Status, 200, "a %d-character question of 190 tokens is under the 512-token cap: the cap counts tokens, not characters", wordy.size());
   std::string dense;
   for (int i = 0; i < 300; i++) dense += std::string(1, static_cast<char>('a' + i % 26)) + std::to_string(i / 26) + ".";
-  const size_t before = gQuestions.size();
+  size_t before = hQuestions.size();
   ctx.Equal(api.post(dense, "u-ana", "k-dense").Status, 413, "a %d-character question of 600 tokens", dense.size());
-  ctx.Equal(gQuestions.size(), before, "a question over the cap must not reach respond; calls");
+  ctx.Equal(hQuestions.size(), before, "a question over the cap must not reach respond; calls");
+  const std::string exact = hWords(512, "");
+  ctx.Equal(api.post(exact, "u-ana", "k-512").Status, 200, "a question of exactly 512 tokens is at the cap");
+  before = hQuestions.size();
+  ctx.Equal(api.post(exact + " w512", "u-ana", "k-513").Status, 413, "a question of 513 tokens is over the 512-token cap");
+  ctx.Equal(hQuestions.size(), before, "a question over the cap must not reach respond; calls");
 }
 
 void CheckRepeatRatio(harness::Ctx& ctx) {
-  Api api(ctx);
-  ctx.Equal(api.post(repeated("jq_THREADS ", 100), "u-ana", "k-rep-0").Status, 422, "jq_THREADS repeated is a divergence attack");
-  ctx.Equal(api.post(repeated("/goto maiden ", 40), "u-ana", "k-rep-1").Status, 422, "/goto maiden repeated is a divergence attack");
-  ctx.Equal(gQuestions.size(), 0, "a repeated-token question must not reach respond; calls");
-  ctx.Equal(api.post(repeated("dog ", 40), "u-ana", "k-short").Status, 200, "a 40-token repeat is under kMinRepeatTokens = 64");
-  std::string varied;
-  for (int i = 0; i < 80; i++) varied += (i == 0 ? "w" : " w") + std::to_string(i);
-  ctx.Equal(api.post(varied, "u-ana", "k-varied").Status, 200, "a varied 80-token question");
+  HAskApi api(ctx);
+  ctx.Equal(api.post(hRepeated("jq_THREADS ", 100), "u-ana", "k-rep-0").Status, 422, "jq_THREADS repeated is a divergence attack");
+  ctx.Equal(api.post(hRepeated("/goto maiden ", 40), "u-ana", "k-rep-1").Status, 422, "/goto maiden repeated is a divergence attack");
+  ctx.Equal(api.post(hRepeated("dog ", 64), "u-ana", "k-rep-2").Status, 422, "dog x64, exactly kMinRepeatTokens, repeats one token over more than half");
+  ctx.Equal(api.post(hWords(31, "dog ") + " dog dog", "u-ana", "k-rep-3").Status, 422, "64 tokens with dog 33 times (ratio 0.52) repeat one token over more than half");
+  ctx.Equal(hQuestions.size(), 0, "a repeated-token question must not reach respond; calls");
+  ctx.Equal(api.post(hRepeated("dog ", 63), "u-ana", "k-63").Status, 200, "a 63-token repeat is under kMinRepeatTokens = 64");
+  ctx.Equal(api.post(hWords(32, "dog "), "u-ana", "k-half").Status, 200, "64 tokens with dog 32 times is a repeat ratio of exactly 0.5, not above kMaxRepeatRatio");
+  ctx.Equal(api.post(hRepeated("dog ", 40), "u-ana", "k-short").Status, 200, "a 40-token repeat is under kMinRepeatTokens = 64");
+  ctx.Equal(api.post(hWords(80, ""), "u-ana", "k-varied").Status, 200, "a varied 80-token question");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
+  HAskApi api(ctx);
   ctx.Equal(api.post("What is the notice period?", "u-ana", "").Status, 400, "a question without Idempotency-Key");
-  ctx.Equal(gQuestions.size(), 0, "a question without Idempotency-Key must not reach respond; calls");
+  ctx.Equal(hQuestions.size(), 0, "a question without Idempotency-Key must not reach respond; calls");
   const auto first = api.post("What is the notice period?", "u-ana", "k-7");
   const auto replay = api.post("What is the notice period?", "u-ana", "k-7");
   ctx.Assert(first.Status == 200 && replay.Status == 200, "the question and its replay answered %d and %d", first.Status, replay.Status);
-  ctx.Equal(bodyOf(ctx, replay)["request_id"], bodyOf(ctx, first)["request_id"], "a replay of the same (user, Idempotency-Key) must return the stored decision; request_id");
-  ctx.Equal(gQuestions.size(), 1, "a client retry must not cost a second model call: look up (user, key) first; respond calls");
+  ctx.Equal(hBodyOf(ctx, replay)["request_id"], hBodyOf(ctx, first)["request_id"], "a replay of the same (user, Idempotency-Key) must return the stored decision; request_id");
+  ctx.Equal(hQuestions.size(), 1, "a client retry must not cost a second model call: look up (user, key) first; respond calls");
   const auto other = api.post("What is the notice period?", "u-ben", "k-7");
-  ctx.Assert(other.Status == 200 && bodyOf(ctx, other)["request_id"] != bodyOf(ctx, first)["request_id"], "another user with the same key gets an answer of their own");
+  ctx.Assert(other.Status == 200 && hBodyOf(ctx, other)["request_id"] != hBodyOf(ctx, first)["request_id"], "another user with the same key gets an answer of their own");
+  hFull.insert("u-ana");
+  const auto again = api.post("What is the notice period?", "u-ana", "k-7");
+  ctx.Equal(again.Status, 200, "with u-ana's window full, a replay of k-7: asks::get answers the stored decision before admit spends the window");
+  ctx.Equal(hBodyOf(ctx, again)["request_id"], hBodyOf(ctx, first)["request_id"], "a replay with the window full answers the stored decision; request_id");
 }
 `,
   },

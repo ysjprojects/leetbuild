@@ -59,7 +59,7 @@ the library is a tier nobody defined; and a verification with no audit entry can
       id: 'owner-only',
       title: 'Lets only the owner verify',
       detail:
-        'A caller who is not the owner in the pending verification gets 403 and nothing is stored. The starter lets any caller with a user id verify any table.',
+        'A caller who is not the owner in the pending verification gets 403 and nothing is stored, even when the body names the owner; without `X-User-Id` the answer is 401 whatever the body says. The starter lets any caller with a user id verify any table.',
       match: {
         python: {all: [/\b403\b/, /\[["']owner["']\]/]},
         typescript: {all: [/\b403\b/, /\.owner\b/]},
@@ -72,7 +72,7 @@ the library is a tier nobody defined; and a verification with no audit entry can
       id: 'tier-server-side',
       title: 'Derives the tier from the tags, never from the body',
       detail:
-        'An edit that tags `passport_no` as `Personal.ID` while sending `"tier": 4` is stored and answered as Tier 1; acknowledged contact data is Tier 2 whatever the body says. The starter stores the tier the caller sent.',
+        'An edit that tags `passport_no` as `Personal.ID` while sending `"tier": 4` is stored and answered as Tier 1; acknowledged contact data is Tier 2 whatever the body says; and over all the tags of the entity after an edit, `Personal.Name` is Tier 2, `Geo.Geohash` alone Tier 3 and nothing sensitive Tier 4, the most sensitive tag winning. The starter stores the tier the caller sent.',
       match: {
         python: {all: [/PRIVACY_RULES/, /derive_tier\(/], none: [/body\.get\(\s*["']tier["']/, /body\[["']tier["']\]/]},
         typescript: {all: [/PRIVACY_RULES/, /deriveTier\(/], none: [/body\.tier\b/, /\[['"]tier['"]\]/]},
@@ -85,7 +85,7 @@ the library is a tier nobody defined; and a verification with no audit entry can
       id: 'tag-whitelist',
       title: 'Rejects unknown actions and tags outside the library with 400',
       detail:
-        'An edit that tags a column `Public` and an action `approve` both answer 400 and store nothing. The starter stores any string as a tag and treats any action as an acknowledgement.',
+        'An edit with any tag outside the library (`Public` beside a valid tag, or `personal.id`), an action `approve` and a body without an action all answer 400 and store nothing. The starter stores any string as a tag and treats any action as an acknowledgement.',
       match: {
         python: {all: [/taxonomy\.known\(/, /\b400\b/]},
         typescript: {all: [/\bknown\(/, /\b400\b/]},
@@ -667,6 +667,11 @@ async def check_owner_only(ctx):
         assert _stored(ctx) == {}, f"a refused verification stored {_stored(ctx)}"
         r = await _verify(c, {"action": "ack"}, user="")
         assert r.status_code == 401, f"a verification without X-User-Id answered {r.status_code}, expected 401"
+        r = await _verify(c, {"action": "ack", "user": OWNER, "owner": OWNER, "verified_by": OWNER}, user="")
+        assert r.status_code == 401, f"a verification without X-User-Id but naming the owner in its body answered {r.status_code}, expected 401: the caller is the header, never the body"
+        r = await _verify(c, {"action": "ack", "user": OWNER, "owner": OWNER, "verified_by": OWNER}, user="team-growth")
+        assert r.status_code == 403, f"team-growth naming the owner in its body answered {r.status_code}, expected 403"
+        assert _stored(ctx) == {}, f"refused verifications stored {_stored(ctx)}"
         r = await _verify(c, {"action": "ack"})
     assert r.status_code == 200, f"the owner's own ack answered {r.status_code}: {r.text}"
 
@@ -680,14 +685,36 @@ async def check_tier_server_side(ctx):
     assert r.status_code == 200, f"the owner's edit answered {r.status_code}: {r.text}"
     assert r.json().get("tier") == 1, f"passport_no tagged Personal.ID with \\"tier\\": 4 in the body answered tier {r.json().get('tier')}, expected 1"
     assert _stored(ctx).get("tier") == "1", f"entity:deliveries stores tier {_stored(ctx).get('tier')!r}, expected 1: access control reads this"
+    # Each edit applies to the pending tags {merchant_id: None, passport_no: None, customer_email: Personal.Contact_Info}.
+    cases = [
+        ({"passport_no": "None"}, 2, "customer_email stays Personal.Contact_Info"),
+        ({"customer_email": "None"}, 4, "every tag None"),
+        ({"customer_email": "None", "merchant_id": "Geo.Geohash"}, 3, "a Geo.Geohash column, nothing more sensitive"),
+        ({"merchant_id": "Geo.Geohash", "customer_email": "Personal.Name"}, 2, "Geo.Geohash and Personal.Name: the most sensitive wins"),
+        ({"merchant_id": "Personal.Contact_Info", "customer_email": "Geo.Geohash", "passport_no": "Personal.ID"}, 1, "Personal.ID among others"),
+    ]
+    async with _api(ctx) as c:
+        for edits, want, why in cases:
+            r = await _verify(c, {"action": "edit", "tags": edits, "tier": 1 if want == 4 else 4})
+            assert r.status_code == 200, f"the owner's edit {edits} answered {r.status_code}: {r.text}"
+            merged = {**PENDING, **edits}
+            assert r.json().get("tags") == merged, f"the edit {edits} answered tags {r.json().get('tags')}, expected the pending tags with the edit applied: {merged}"
+            assert r.json().get("tier") == want, f"the edit {edits} ({why}) answered tier {r.json().get('tier')}, expected {want}: Personal.ID is Tier 1, Personal.Name or Personal.Contact_Info Tier 2, Geo.Geohash Tier 3, else Tier 4, over all the entity's tags"
+            assert _stored(ctx).get("tier") == str(want), f"entity:deliveries stores tier {_stored(ctx).get('tier')!r} after the edit {edits}, expected {want}"
 
 
 async def check_tag_whitelist(ctx):
     async with _api(ctx) as c:
         r = await _verify(c, {"action": "edit", "tags": {"passport_no": "Public"}})
         assert r.status_code == 400, f"an edit with the tag Public answered {r.status_code}, expected 400: Public is not in the tag library"
+        r = await _verify(c, {"action": "edit", "tags": {"passport_no": "Personal.ID", "merchant_id": "Public"}})
+        assert r.status_code == 400, f"an edit with one known tag and the tag Public answered {r.status_code}, expected 400: one tag outside the library refuses the edit"
+        r = await _verify(c, {"action": "edit", "tags": {"passport_no": "personal.id"}})
+        assert r.status_code == 400, f"an edit with the tag personal.id answered {r.status_code}, expected 400: the library is case-sensitive"
         r = await _verify(c, {"action": "approve"})
         assert r.status_code == 400, f"the action approve answered {r.status_code}, expected 400: actions are ack and edit"
+        r = await _verify(c, {"tags": {"passport_no": "Personal.ID"}})
+        assert r.status_code == 400, f"a verification without an action answered {r.status_code}, expected 400: actions are ack and edit"
     assert _stored(ctx) == {}, f"refused verifications stored {_stored(ctx)}"
 
 
@@ -729,6 +756,12 @@ export async function check_owner_only(ctx) {
   assert.deepEqual(stored(ctx), {}, \`a refused verification stored \${JSON.stringify(stored(ctx))}\`);
   r = await verify(c, {action: 'ack'}, '');
   assert.equal(r.status, 401, \`a verification without X-User-Id answered \${r.status}, expected 401\`);
+  const naming = {action: 'ack', user: OWNER, owner: OWNER, verified_by: OWNER};
+  r = await verify(c, naming, '');
+  assert.equal(r.status, 401, \`a verification without X-User-Id but naming the owner in its body answered \${r.status}, expected 401: the caller is the header, never the body\`);
+  r = await verify(c, naming, 'team-growth');
+  assert.equal(r.status, 403, \`team-growth naming the owner in its body answered \${r.status}, expected 403\`);
+  assert.deepEqual(stored(ctx), {}, \`refused verifications stored \${JSON.stringify(stored(ctx))}\`);
   r = await verify(c, {action: 'ack'});
   assert.equal(r.status, 200, \`the owner's own ack answered \${r.status}: \${r.text}\`);
 }
@@ -742,14 +775,36 @@ export async function check_tier_server_side(ctx) {
   assert.equal(r.status, 200, \`the owner's edit answered \${r.status}: \${r.text}\`);
   assert.equal(r.json().tier, 1, \`passport_no tagged Personal.ID with "tier": 4 in the body answered tier \${r.json().tier}, expected 1\`);
   assert.equal(stored(ctx).tier, '1', \`entity:deliveries stores tier \${stored(ctx).tier}, expected 1: access control reads this\`);
+  // Each edit applies to the pending tags {merchant_id: None, passport_no: None, customer_email: Personal.Contact_Info}.
+  const cases: [Record<string, string>, number, string][] = [
+    [{passport_no: 'None'}, 2, 'customer_email stays Personal.Contact_Info'],
+    [{customer_email: 'None'}, 4, 'every tag None'],
+    [{customer_email: 'None', merchant_id: 'Geo.Geohash'}, 3, 'a Geo.Geohash column, nothing more sensitive'],
+    [{merchant_id: 'Geo.Geohash', customer_email: 'Personal.Name'}, 2, 'Geo.Geohash and Personal.Name: the most sensitive wins'],
+    [{merchant_id: 'Personal.Contact_Info', customer_email: 'Geo.Geohash', passport_no: 'Personal.ID'}, 1, 'Personal.ID among others'],
+  ];
+  for (const [edits, want, why] of cases) {
+    r = await verify(c, {action: 'edit', tags: edits, tier: want === 4 ? 1 : 4});
+    assert.equal(r.status, 200, \`the owner's edit \${JSON.stringify(edits)} answered \${r.status}: \${r.text}\`);
+    const merged = {...PENDING, ...edits};
+    assert.deepEqual(r.json().tags, merged, \`the edit \${JSON.stringify(edits)} answered tags \${JSON.stringify(r.json().tags)}, expected the pending tags with the edit applied\`);
+    assert.equal(r.json().tier, want, \`the edit \${JSON.stringify(edits)} (\${why}) answered tier \${r.json().tier}, expected \${want}: Personal.ID is Tier 1, Personal.Name or Personal.Contact_Info Tier 2, Geo.Geohash Tier 3, else Tier 4, over all the entity's tags\`);
+    assert.equal(stored(ctx).tier, String(want), \`entity:deliveries stores tier \${stored(ctx).tier} after the edit \${JSON.stringify(edits)}, expected \${want}\`);
+  }
 }
 
 export async function check_tag_whitelist(ctx) {
   const c = api(ctx);
   let r = await verify(c, {action: 'edit', tags: {passport_no: 'Public'}});
   assert.equal(r.status, 400, \`an edit with the tag Public answered \${r.status}, expected 400: Public is not in the tag library\`);
+  r = await verify(c, {action: 'edit', tags: {passport_no: 'Personal.ID', merchant_id: 'Public'}});
+  assert.equal(r.status, 400, \`an edit with one known tag and the tag Public answered \${r.status}, expected 400: one tag outside the library refuses the edit\`);
+  r = await verify(c, {action: 'edit', tags: {passport_no: 'personal.id'}});
+  assert.equal(r.status, 400, \`an edit with the tag personal.id answered \${r.status}, expected 400: the library is case-sensitive\`);
   r = await verify(c, {action: 'approve'});
   assert.equal(r.status, 400, \`the action approve answered \${r.status}, expected 400: actions are ack and edit\`);
+  r = await verify(c, {tags: {passport_no: 'Personal.ID'}});
+  assert.equal(r.status, 400, \`a verification without an action answered \${r.status}, expected 400: actions are ack and edit\`);
   assert.deepEqual(stored(ctx), {}, \`refused verifications stored \${JSON.stringify(stored(ctx))}\`);
 }
 
@@ -767,6 +822,7 @@ export async function check_audit(ctx) {
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"leetbuild/harness"
 )
@@ -825,6 +881,12 @@ func CheckOwnerOnly(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "a refused verification must store nothing; fields stored")
 	r = verifyAs(c, map[string]any{"action": "ack"}, "")
 	ctx.Equal(r.Status, 401, "a verification without X-User-Id")
+	naming := map[string]any{"action": "ack", "user": verifyOwner, "owner": verifyOwner, "verified_by": verifyOwner}
+	r = verifyAs(c, naming, "")
+	ctx.Equal(r.Status, 401, "a verification without X-User-Id but naming the owner in its body (the caller is the header, never the body)")
+	r = verifyAs(c, naming, "team-growth")
+	ctx.Equal(r.Status, 403, "team-growth naming the owner in its body")
+	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "refused verifications must store nothing; fields stored")
 	r = verifyAs(c, map[string]any{"action": "ack"}, verifyOwner)
 	ctx.Equal(r.Status, 200, "the owner's own ack (%s)", r.Text())
 }
@@ -838,14 +900,51 @@ func CheckTierServerSide(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text())
 	ctx.Equal(verifyDecode(r).Tier, 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier")
 	ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["tier"], "1", "the stored tier access control reads")
+	// Each edit applies to the pending tags {merchant_id: None, passport_no: None, customer_email: Personal.Contact_Info}.
+	cases := []struct {
+		edits map[string]string
+		want  int
+		why   string
+	}{
+		{map[string]string{"passport_no": "None"}, 2, "customer_email stays Personal.Contact_Info"},
+		{map[string]string{"customer_email": "None"}, 4, "every tag None"},
+		{map[string]string{"customer_email": "None", "merchant_id": "Geo.Geohash"}, 3, "a Geo.Geohash column, nothing more sensitive"},
+		{map[string]string{"merchant_id": "Geo.Geohash", "customer_email": "Personal.Name"}, 2, "Geo.Geohash and Personal.Name: the most sensitive wins"},
+		{map[string]string{"merchant_id": "Personal.Contact_Info", "customer_email": "Geo.Geohash", "passport_no": "Personal.ID"}, 1, "Personal.ID among others"},
+	}
+	for _, tc := range cases {
+		bodyTier := 4
+		if tc.want == 4 {
+			bodyTier = 1
+		}
+		r = verifyAs(c, map[string]any{"action": "edit", "tags": tc.edits, "tier": bodyTier}, verifyOwner)
+		ctx.Equal(r.Status, 200, "the owner's edit %v (%s)", tc.edits, r.Text())
+		merged := map[string]string{}
+		for k, v := range verifyPending {
+			merged[k] = v
+		}
+		for k, v := range tc.edits {
+			merged[k] = v
+		}
+		answer := verifyDecode(r)
+		ctx.Equal(answer.Tags, merged, "the edit %v must answer the pending tags with the edit applied", tc.edits)
+		ctx.Equal(answer.Tier, tc.want, "the edit %v (%s): Personal.ID is Tier 1, Personal.Name or Personal.Contact_Info Tier 2, Geo.Geohash Tier 3, else Tier 4, over all the entity's tags; tier", tc.edits, tc.why)
+		ctx.Equal(ctx.Redis.HGetAll("entity:deliveries")["tier"], strconv.Itoa(tc.want), "the stored tier after the edit %v", tc.edits)
+	}
 }
 
 func CheckTagWhitelist(ctx *harness.Ctx) {
 	c := verifyAPI(ctx)
 	r := verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Public"}}, verifyOwner)
 	ctx.Equal(r.Status, 400, "an edit with the tag Public (not in the tag library)")
+	r = verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "Personal.ID", "merchant_id": "Public"}}, verifyOwner)
+	ctx.Equal(r.Status, 400, "an edit with one known tag and the tag Public (one tag outside the library refuses the edit)")
+	r = verifyAs(c, map[string]any{"action": "edit", "tags": map[string]string{"passport_no": "personal.id"}}, verifyOwner)
+	ctx.Equal(r.Status, 400, "an edit with the tag personal.id (the library is case-sensitive)")
 	r = verifyAs(c, map[string]any{"action": "approve"}, verifyOwner)
 	ctx.Equal(r.Status, 400, "the action approve (actions are ack and edit)")
+	r = verifyAs(c, map[string]any{"tags": map[string]string{"passport_no": "Personal.ID"}}, verifyOwner)
+	ctx.Equal(r.Status, 400, "a verification without an action (actions are ack and edit)")
 	ctx.Equal(len(ctx.Redis.HGetAll("entity:deliveries")), 0, "refused verifications must store nothing; fields stored")
 }
 
@@ -872,12 +971,12 @@ func CheckAudit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kOwner = "team-logistics";
-const std::map<std::string, std::string> kPending = {{"merchant_id", "None"}, {"passport_no", "None"}, {"customer_email", "Personal.Contact_Info"}};
+const std::string hOwner = "team-logistics";
+const std::map<std::string, std::string> hPending = {{"merchant_id", "None"}, {"passport_no", "None"}, {"customer_email", "Personal.Contact_Info"}};
 
-harness::HTTP api(harness::Ctx& ctx) {
-  ctx.Redis.Do("HSET", "verify:deliveries", "owner", kOwner, "schema_hash", "4f2a", "state", "pending");
-  ctx.Redis.Set("classify:deliveries:4f2a", nlohmann::json(kPending).dump());
+harness::HTTP hApi(harness::Ctx& ctx) {
+  ctx.Redis.Do("HSET", "verify:deliveries", "owner", hOwner, "schema_hash", "4f2a", "state", "pending");
+  ctx.Redis.Set("classify:deliveries:4f2a", nlohmann::json(hPending).dump());
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -885,12 +984,12 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response verify(harness::HTTP& c, const nlohmann::json& body, const std::string& user = kOwner) {
+harness::Response hVerify(harness::HTTP& c, const nlohmann::json& body, const std::string& user = hOwner) {
   if (user.empty()) return c.Post("/v1/entities/deliveries/verify", body.dump(), "Content-Type", "application/json");
   return c.Post("/v1/entities/deliveries/verify", body.dump(), "Content-Type", "application/json", "X-User-Id", user);
 }
 
-nlohmann::json answer(const harness::Response& r) {
+nlohmann::json hAnswer(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
@@ -898,57 +997,93 @@ nlohmann::json answer(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = verify(c, {{"action", "ack"}});
+  auto c = hApi(ctx);
+  const auto r = hVerify(c, {{"action", "ack"}});
   ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text());
-  const auto body = answer(r);
+  const auto body = hAnswer(r);
   ctx.Assert(body.value("entity", "") == "deliveries" && body.value("version", 0) == 1, "the ack answered %s, expected the entity and version 1", r.Text());
-  ctx.Equal(body.contains("tags") ? body["tags"] : nlohmann::json(), nlohmann::json(kPending), "the ack must answer the pending tags");
+  ctx.Equal(body.contains("tags") ? body["tags"] : nlohmann::json(), nlohmann::json(hPending), "the ack must answer the pending tags");
   ctx.Equal(ctx.Redis.HGet("entity:deliveries", "version").value_or(""), "1", "entity:deliveries version after the ack");
 }
 
 void CheckOwnerOnly(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "None"}}}}, "team-growth");
+  auto c = hApi(ctx);
+  auto r = hVerify(c, {{"action", "edit"}, {"tags", {{"passport_no", "None"}}}}, "team-growth");
   ctx.Equal(r.Status, 403, "team-growth verifying team-logistics' table (only the owner verifies)");
   ctx.Equal(ctx.Redis.HGetAll("entity:deliveries").size(), 0, "a refused verification must store nothing; fields stored");
-  r = verify(c, {{"action", "ack"}}, "");
+  r = hVerify(c, {{"action", "ack"}}, "");
   ctx.Equal(r.Status, 401, "a verification without X-User-Id");
-  r = verify(c, {{"action", "ack"}});
+  const nlohmann::json naming = {{"action", "ack"}, {"user", hOwner}, {"owner", hOwner}, {"verified_by", hOwner}};
+  r = hVerify(c, naming, "");
+  ctx.Equal(r.Status, 401, "a verification without X-User-Id but naming the owner in its body (the caller is the header, never the body)");
+  r = hVerify(c, naming, "team-growth");
+  ctx.Equal(r.Status, 403, "team-growth naming the owner in its body");
+  ctx.Equal(ctx.Redis.HGetAll("entity:deliveries").size(), 0, "refused verifications must store nothing; fields stored");
+  r = hVerify(c, {{"action", "ack"}});
   ctx.Equal(r.Status, 200, "the owner's own ack (%s)", r.Text());
 }
 
 void CheckTierServerSide(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = verify(c, {{"action", "ack"}, {"tier", 4}});
+  auto c = hApi(ctx);
+  auto r = hVerify(c, {{"action", "ack"}, {"tier", 4}});
   ctx.Equal(r.Status, 200, "the owner's ack (%s)", r.Text());
-  ctx.Equal(answer(r).value("tier", 0), 2, "acknowledged tags with Personal.Contact_Info: the tier comes from the tags, not the body; tier");
-  r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}}}, {"tier", 4}});
+  ctx.Equal(hAnswer(r).value("tier", 0), 2, "acknowledged tags with Personal.Contact_Info: the tier comes from the tags, not the body; tier");
+  r = hVerify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}}}, {"tier", 4}});
   ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text());
-  ctx.Equal(answer(r).value("tier", 0), 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier");
+  ctx.Equal(hAnswer(r).value("tier", 0), 1, "passport_no tagged Personal.ID with \\"tier\\": 4 in the body; tier");
   ctx.Equal(ctx.Redis.HGet("entity:deliveries", "tier").value_or(""), "1", "the stored tier access control reads");
+  // Each edit applies to the pending tags {merchant_id: None, passport_no: None, customer_email: Personal.Contact_Info}.
+  struct Case {
+    std::map<std::string, std::string> edits;
+    int want;
+    std::string why;
+  };
+  const std::vector<Case> cases = {
+      {{{"passport_no", "None"}}, 2, "customer_email stays Personal.Contact_Info"},
+      {{{"customer_email", "None"}}, 4, "every tag None"},
+      {{{"customer_email", "None"}, {"merchant_id", "Geo.Geohash"}}, 3, "a Geo.Geohash column, nothing more sensitive"},
+      {{{"merchant_id", "Geo.Geohash"}, {"customer_email", "Personal.Name"}}, 2, "Geo.Geohash and Personal.Name: the most sensitive wins"},
+      {{{"merchant_id", "Personal.Contact_Info"}, {"customer_email", "Geo.Geohash"}, {"passport_no", "Personal.ID"}}, 1, "Personal.ID among others"},
+  };
+  for (const auto& tc : cases) {
+    const std::string edits = nlohmann::json(tc.edits).dump();
+    r = hVerify(c, {{"action", "edit"}, {"tags", tc.edits}, {"tier", tc.want == 4 ? 1 : 4}});
+    ctx.Equal(r.Status, 200, "the owner's edit %s (%s)", edits, r.Text());
+    auto merged = hPending;
+    for (const auto& [column, tag] : tc.edits) merged[column] = tag;
+    const auto body = hAnswer(r);
+    ctx.Equal(body.contains("tags") ? body["tags"] : nlohmann::json(), nlohmann::json(merged), "the edit %s must answer the pending tags with the edit applied", edits);
+    ctx.Equal(body.value("tier", 0), tc.want, "the edit %s (%s): Personal.ID is Tier 1, Personal.Name or Personal.Contact_Info Tier 2, Geo.Geohash Tier 3, else Tier 4, over all the entity's tags; tier", edits, tc.why);
+    ctx.Equal(ctx.Redis.HGet("entity:deliveries", "tier").value_or(""), std::to_string(tc.want), "the stored tier after the edit %s", edits);
+  }
 }
 
 void CheckTagWhitelist(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Public"}}}});
+  auto c = hApi(ctx);
+  auto r = hVerify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Public"}}}});
   ctx.Equal(r.Status, 400, "an edit with the tag Public (not in the tag library)");
-  r = verify(c, {{"action", "approve"}});
+  r = hVerify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}, {"merchant_id", "Public"}}}});
+  ctx.Equal(r.Status, 400, "an edit with one known tag and the tag Public (one tag outside the library refuses the edit)");
+  r = hVerify(c, {{"action", "edit"}, {"tags", {{"passport_no", "personal.id"}}}});
+  ctx.Equal(r.Status, 400, "an edit with the tag personal.id (the library is case-sensitive)");
+  r = hVerify(c, {{"action", "approve"}});
   ctx.Equal(r.Status, 400, "the action approve (actions are ack and edit)");
+  r = hVerify(c, {{"tags", {{"passport_no", "Personal.ID"}}}});
+  ctx.Equal(r.Status, 400, "a verification without an action (actions are ack and edit)");
   ctx.Equal(ctx.Redis.HGetAll("entity:deliveries").size(), 0, "refused verifications must store nothing; fields stored");
 }
 
 void CheckAudit(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = verify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}}}});
+  auto c = hApi(ctx);
+  const auto r = hVerify(c, {{"action", "edit"}, {"tags", {{"passport_no", "Personal.ID"}}}});
   ctx.Equal(r.Status, 200, "the owner's edit (%s)", r.Text());
-  ctx.Equal(answer(r).value("verified_by", ""), kOwner, "the response's verified_by");
+  ctx.Equal(hAnswer(r).value("verified_by", ""), hOwner, "the response's verified_by");
   std::vector<std::pair<std::string, std::string>> entries;
   for (const auto& raw : ctx.Redis.LRange("audit:deliveries", 0, -1)) {
     const auto e = nlohmann::json::parse(raw, nullptr, false);
     entries.emplace_back(e.value("user", ""), e.value("action", ""));
   }
-  ctx.Equal(entries, std::vector<std::pair<std::string, std::string>>{{kOwner, "edit"}}, "audit:deliveries must hold one entry for the owner's edit");
+  ctx.Equal(entries, std::vector<std::pair<std::string, std::string>>{{hOwner, "edit"}}, "audit:deliveries must hold one entry for the owner's edit");
 }
 `,
   },

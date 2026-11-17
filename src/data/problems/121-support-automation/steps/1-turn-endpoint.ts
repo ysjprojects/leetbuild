@@ -58,7 +58,7 @@ runs of whatever write tool the model picks.
       id: 'principal',
       title: 'Takes the role from the verified principal',
       detail:
-        'A guest token with `"role": "agent"` in the body enqueues a turn with role customer; an agent token enqueues role agent. The starter lets the body name the role.',
+        'A guest token with `"role": "agent"` in the body enqueues a turn with role customer; an agent token enqueues role agent, also with `"role": "customer"` in the body. The starter lets the body name the role.',
       match: {
         python: {all: [/principal\.role/], none: [/body\.get\(\s*["']role["']|body\[\s*["']role["']\s*\]/]},
         typescript: {all: [/principal\.role/], none: [/body\.role/]},
@@ -71,7 +71,7 @@ runs of whatever write tool the model picks.
       id: 'text-cap',
       title: 'Rejects empty text with 400 and text over 8 KiB of UTF-8 with 413',
       detail:
-        'An empty or missing text answers 400; 8193 bytes, or 3000 characters that are 9000 bytes, answer 413; exactly 8192 bytes is accepted; nothing rejected is enqueued. The starter forwards any text to the workflow.',
+        'An empty, missing or non-string text answers 400; 8193 bytes, or 3000 characters that are 9000 bytes, answer 413; exactly 8192 bytes is accepted; nothing rejected is stored under its key or enqueued. The starter forwards any text to the workflow.',
       match: {
         python: {all: [/MAX_TEXT_BYTES/, /status_code\s*=\s*413/, /\.encode\(/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /code\(\s*413\s*\)/, /TextEncoder|byteLength/]},
@@ -702,6 +702,10 @@ async def check_principal(ctx):
         assert r.status_code == 202, f"an agent message answered {r.status_code}: {r.text}"
         turn = _queued(ctx)[-1]
         assert turn.get("role") == "agent" and turn.get("actor") == "agent-7", f"an agent token must enqueue role agent, actor agent-7: {turn}"
+        r = await _post(c, token="tok-agent-7", conversation="c-3", key="k-3", body={"text": QUESTION, "role": "customer"})
+        assert r.status_code == 202, f"an agent message answered {r.status_code}: {r.text}"
+        turn = _queued(ctx)[-1]
+        assert turn.get("role") == "agent", f"an agent token with \\"role\\": \\"customer\\" in the body enqueued a turn with role {turn.get('role')!r}: a role in the body changes nothing"
 
 
 async def check_text_cap(ctx):
@@ -710,11 +714,15 @@ async def check_text_cap(ctx):
         assert r.status_code == 400, f"an empty text answered {r.status_code}, expected 400"
         r = await _post(c, body={}, key="k-none")
         assert r.status_code == 400, f"a body without text answered {r.status_code}, expected 400"
+        r = await _post(c, body={"text": 42}, key="k-number")
+        assert r.status_code == 400, f"a text that is a number answered {r.status_code}, expected 400: text is a non-empty string"
         r = await _post(c, text="a" * 8193, key="k-big")
         assert r.status_code == 413, f"8193 bytes of text answered {r.status_code}, expected 413: every byte is re-sent to the model on every iteration"
         r = await _post(c, text="\\u20ac" * 3000, key="k-euro")
         assert r.status_code == 413, f"3000 euro signs (9000 bytes of UTF-8) answered {r.status_code}, expected 413: the cap counts bytes, not characters"
         assert _queued(ctx) == [], f"rejected messages enqueued {len(_queued(ctx))} turns"
+        for key in ("k-empty", "k-none", "k-number", "k-big", "k-euro"):
+            assert ctx.redis.get(f"turn:c-1:{key}") is None, f"a rejected message stored a turn under {key}: every rejection happens before anything is stored, or the client's corrected retry under that key replays the rejected turn"
         r = await _post(c, text="a" * 8192, key="k-edge")
         assert r.status_code == 202, f"exactly 8192 bytes is within the cap, got {r.status_code}: {r.text}"
 
@@ -797,6 +805,10 @@ export async function check_principal(ctx) {
   assert.equal(r.status, 202, \`an agent message answered \${r.status}: \${r.text}\`);
   turn = queued(ctx).at(-1);
   assert(turn.role === 'agent' && turn.actor === 'agent-7', \`an agent token must enqueue role agent, actor agent-7: \${JSON.stringify(turn)}\`);
+  r = await post(c, {token: 'tok-agent-7', conversation: 'c-3', key: 'k-3', body: {text: QUESTION, role: 'customer'}});
+  assert.equal(r.status, 202, \`an agent message answered \${r.status}: \${r.text}\`);
+  turn = queued(ctx).at(-1);
+  assert.equal(turn.role, 'agent', \`an agent token with "role": "customer" in the body enqueued a turn with role \${turn.role}: a role in the body changes nothing\`);
 }
 
 export async function check_text_cap(ctx) {
@@ -805,11 +817,16 @@ export async function check_text_cap(ctx) {
   assert.equal(r.status, 400, \`an empty text answered \${r.status}, expected 400\`);
   r = await post(c, {body: {}, key: 'k-none'});
   assert.equal(r.status, 400, \`a body without text answered \${r.status}, expected 400\`);
+  r = await post(c, {body: {text: 42}, key: 'k-number'});
+  assert.equal(r.status, 400, \`a text that is a number answered \${r.status}, expected 400: text is a non-empty string\`);
   r = await post(c, {text: 'a'.repeat(8193), key: 'k-big'});
   assert.equal(r.status, 413, \`8193 bytes of text answered \${r.status}, expected 413: every byte is re-sent to the model on every iteration\`);
   r = await post(c, {text: '\\u20ac'.repeat(3000), key: 'k-euro'});
   assert.equal(r.status, 413, \`3000 euro signs (9000 bytes of UTF-8) answered \${r.status}, expected 413: the cap counts bytes, not characters\`);
   assert.equal(queued(ctx).length, 0, \`rejected messages enqueued \${queued(ctx).length} turns\`);
+  for (const key of ['k-empty', 'k-none', 'k-number', 'k-big', 'k-euro']) {
+    assert.equal(ctx.redis.get(\`turn:c-1:\${key}\`), null, \`a rejected message stored a turn under \${key}: every rejection happens before anything is stored, or the client's corrected retry under that key replays the rejected turn\`);
+  }
   r = await post(c, {text: 'a'.repeat(8192), key: 'k-edge'});
   assert.equal(r.status, 202, \`exactly 8192 bytes is within the cap, got \${r.status}: \${r.text}\`);
 }
@@ -920,15 +937,24 @@ func CheckPrincipal(ctx *harness.Ctx) {
 	queued = apiQueued(ctx)
 	turn := queued[len(queued)-1]
 	ctx.Assert(turn["role"] == "agent" && turn["actor"] == "agent-7", "an agent token must enqueue role agent, actor agent-7: %v", turn)
+	r = apiPost(c, "c-3", "k-3", "tok-agent-7", map[string]any{"text": apiQuestion, "role": "customer"})
+	ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text())
+	queued = apiQueued(ctx)
+	ctx.Equal(queued[len(queued)-1]["role"], "agent", "an agent token with \\"role\\": \\"customer\\" in the body (a role in the body changes nothing); the role")
 }
 
 func CheckTextCap(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	ctx.Equal(apiPost(c, "c-1", "k-empty", "tok-guest-1", apiText("")).Status, 400, "an empty text")
 	ctx.Equal(apiPost(c, "c-1", "k-none", "tok-guest-1", map[string]any{}).Status, 400, "a body without text")
+	ctx.Equal(apiPost(c, "c-1", "k-number", "tok-guest-1", map[string]any{"text": 42}).Status, 400, "a text that is a number (text is a non-empty string)")
 	ctx.Equal(apiPost(c, "c-1", "k-big", "tok-guest-1", apiText(strings.Repeat("a", 8193))).Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)")
 	ctx.Equal(apiPost(c, "c-1", "k-euro", "tok-guest-1", apiText(strings.Repeat("\\u20ac", 3000))).Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)")
 	ctx.Equal(len(apiQueued(ctx)), 0, "rejected messages must enqueue nothing; turns enqueued")
+	for _, key := range []string{"k-empty", "k-none", "k-number", "k-big", "k-euro"} {
+		_, found := ctx.Redis.Get("turn:c-1:" + key)
+		ctx.Assert(!found, "a rejected message stored a turn under %s: every rejection happens before anything is stored, or the client's corrected retry under that key replays the rejected turn", key)
+	}
 	r := apiPost(c, "c-1", "k-edge", "tok-guest-1", apiText(strings.Repeat("a", 8192)))
 	ctx.Equal(r.Status, 202, "exactly 8192 bytes is within the cap (%s)", r.Text())
 }
@@ -977,12 +1003,12 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kQuestion = "Where is my next reservation?";
+const std::string kHQuestion = "Where is my next reservation?";
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& conversation = "c-1", const std::string& key = "k-1",
                          const std::string& token = "tok-guest-1") {
@@ -993,20 +1019,20 @@ struct Api {
   }
 };
 
-json text(const std::string& t) { return {{"text", t}}; }
+json hText(const std::string& t) { return {{"text", t}}; }
 
-std::vector<json> queued(harness::Ctx& ctx) {
+std::vector<json> hQueued(harness::Ctx& ctx) {
   std::vector<json> out;
   for (const auto& raw : ctx.Redis.LRange("apv2:turns", 0, -1)) out.push_back(json::parse(raw, nullptr, false));
   return out;
 }
 
-std::string turnId(const harness::Response& r) {
+std::string hTurnId(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains("turn_id") && body["turn_id"].is_string() ? body["turn_id"].get<std::string>() : "";
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
@@ -1015,75 +1041,83 @@ std::string repeat(const std::string& s, int n) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(text(kQuestion));
+  HApi api(ctx);
+  const auto r = api.post(hText(kHQuestion));
   ctx.Equal(r.Status, 202, "a valid message (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
-  ctx.Assert(body.is_object() && !turnId(r).empty() && body.value("status", "") == "queued", "the 202 body must be {turn_id, status: queued}, got %s", r.Text());
-  const auto turns = queued(ctx);
+  ctx.Assert(body.is_object() && !hTurnId(r).empty() && body.value("status", "") == "queued", "the 202 body must be {turn_id, status: queued}, got %s", r.Text());
+  const auto turns = hQueued(ctx);
   ctx.Equal(turns.size(), 1, "one message must enqueue one turn on apv2:turns; turns enqueued");
-  ctx.Equal(turns[0].value("turn_id", ""), turnId(r), "the enqueued turn must be the one answered");
-  for (const auto& [field, value] : std::vector<std::pair<std::string, std::string>>{{"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"text", kQuestion}}) {
+  ctx.Equal(turns[0].value("turn_id", ""), hTurnId(r), "the enqueued turn must be the one answered");
+  for (const auto& [field, value] : std::vector<std::pair<std::string, std::string>>{{"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"text", kHQuestion}}) {
     ctx.Equal(turns[0].value(field, ""), value, "the enqueued turn's %s (%s)", field, turns[0].dump());
   }
-  ctx.Equal(api.post(text(kQuestion), "c-1", "k-2", "").Status, 401, "a message without a bearer token");
-  ctx.Equal(api.post(text(kQuestion), "c-1", "k-3", "tok-unknown").Status, 401, "a message with an unknown token");
-  ctx.Equal(queued(ctx).size(), 1, "a rejected message must enqueue nothing; turns enqueued");
+  ctx.Equal(api.post(hText(kHQuestion), "c-1", "k-2", "").Status, 401, "a message without a bearer token");
+  ctx.Equal(api.post(hText(kHQuestion), "c-1", "k-3", "tok-unknown").Status, 401, "a message with an unknown token");
+  ctx.Equal(hQueued(ctx).size(), 1, "a rejected message must enqueue nothing; turns enqueued");
 }
 
 void CheckPrincipal(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   auto r = api.post({{"text", "Refund my last stay"}, {"role", "agent"}});
   ctx.Equal(r.Status, 202, "a guest message (%s)", r.Text());
-  ctx.Equal(queued(ctx).back().value("role", ""), "customer",
+  ctx.Equal(hQueued(ctx).back().value("role", ""), "customer",
             "a guest token with \\"role\\": \\"agent\\" in the body: the enqueued turn's role must come from the verified principal, or any guest runs agent-only tools; the role");
-  r = api.post(text(kQuestion), "c-2", "k-2", "tok-agent-7");
+  r = api.post(hText(kHQuestion), "c-2", "k-2", "tok-agent-7");
   ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text());
-  const json turn = queued(ctx).back();
+  const json turn = hQueued(ctx).back();
   ctx.Assert(turn.value("role", "") == "agent" && turn.value("actor", "") == "agent-7", "an agent token must enqueue role agent, actor agent-7: %s", turn.dump());
+  r = api.post({{"text", kHQuestion}, {"role", "customer"}}, "c-3", "k-3", "tok-agent-7");
+  ctx.Equal(r.Status, 202, "an agent message (%s)", r.Text());
+  ctx.Equal(hQueued(ctx).back().value("role", ""), "agent", "an agent token with \\"role\\": \\"customer\\" in the body (a role in the body changes nothing); the role");
 }
 
 void CheckTextCap(harness::Ctx& ctx) {
-  Api api(ctx);
-  ctx.Equal(api.post(text(""), "c-1", "k-empty").Status, 400, "an empty text");
+  HApi api(ctx);
+  ctx.Equal(api.post(hText(""), "c-1", "k-empty").Status, 400, "an empty text");
   ctx.Equal(api.post(json::object(), "c-1", "k-none").Status, 400, "a body without text");
-  ctx.Equal(api.post(text(std::string(8193, 'a')), "c-1", "k-big").Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)");
-  ctx.Equal(api.post(text(repeat("\\u20ac", 3000)), "c-1", "k-euro").Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)");
-  ctx.Equal(queued(ctx).size(), 0, "rejected messages must enqueue nothing; turns enqueued");
-  const auto r = api.post(text(std::string(8192, 'a')), "c-1", "k-edge");
+  ctx.Equal(api.post({{"text", 42}}, "c-1", "k-number").Status, 400, "a text that is a number (text is a non-empty string)");
+  ctx.Equal(api.post(hText(std::string(8193, 'a')), "c-1", "k-big").Status, 413, "8193 bytes of text (every byte is re-sent to the model on every iteration)");
+  ctx.Equal(api.post(hText(hRepeat("\\u20ac", 3000)), "c-1", "k-euro").Status, 413, "3000 euro signs, 9000 bytes of UTF-8 (the cap counts bytes, not characters)");
+  ctx.Equal(hQueued(ctx).size(), 0, "rejected messages must enqueue nothing; turns enqueued");
+  for (const std::string key : {"k-empty", "k-none", "k-number", "k-big", "k-euro"}) {
+    ctx.Assert(!ctx.Redis.Get("turn:c-1:" + key).has_value(),
+               "a rejected message stored a turn under %s: every rejection happens before anything is stored, or the client's corrected retry under that key replays the rejected turn", key);
+  }
+  const auto r = api.post(hText(std::string(8192, 'a')), "c-1", "k-edge");
   ctx.Equal(r.Status, 202, "exactly 8192 bytes is within the cap (%s)", r.Text());
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  ctx.Equal(api.post(text(kQuestion), "c-1", "").Status, 400, "a message without Idempotency-Key (a retry of it could not be told from a new question)");
-  ctx.Equal(queued(ctx).size(), 0, "a message without Idempotency-Key must enqueue nothing; turns enqueued");
-  const auto first = api.post(text(kQuestion), "c-1", "k-7");
+  HApi api(ctx);
+  ctx.Equal(api.post(hText(kHQuestion), "c-1", "").Status, 400, "a message without Idempotency-Key (a retry of it could not be told from a new question)");
+  ctx.Equal(hQueued(ctx).size(), 0, "a message without Idempotency-Key must enqueue nothing; turns enqueued");
+  const auto first = api.post(hText(kHQuestion), "c-1", "k-7");
   ctx.Equal(first.Status, 202, "the first message (%s)", first.Text());
-  const auto replay = api.post(text(kQuestion), "c-1", "k-7");
+  const auto replay = api.post(hText(kHQuestion), "c-1", "k-7");
   ctx.Equal(replay.Status, 202, "a replay must answer 202 with the stored turn");
-  ctx.Equal(turnId(replay), turnId(first), "a replay of (c-1, k-7) must answer the first turn id");
-  ctx.Equal(queued(ctx).size(), 1, "a message and its replay; turns enqueued");
-  const auto other = api.post(text(kQuestion), "c-2", "k-7");
-  ctx.Assert(other.Status == 202 && turnId(other) != turnId(first), "the same key on another conversation is a new turn");
+  ctx.Equal(hTurnId(replay), hTurnId(first), "a replay of (c-1, k-7) must answer the first turn id");
+  ctx.Equal(hQueued(ctx).size(), 1, "a message and its replay; turns enqueued");
+  const auto other = api.post(hText(kHQuestion), "c-2", "k-7");
+  ctx.Assert(other.Status == 202 && hTurnId(other) != hTurnId(first), "the same key on another conversation is a new turn");
 }
 
 void CheckClaimRace(harness::Ctx& ctx) {
-  const json rival = {{"turn_id", "rival-turn"}, {"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"role", "customer"}, {"text", kQuestion}};
+  const json rival = {{"turn_id", "rival-turn"}, {"tenant", "t1"}, {"conversation", "c-1"}, {"actor", "guest-1"}, {"role", "customer"}, {"text", kHQuestion}};
   bool fired = false;
   ctx.Redis.After("turn:c-1:k-race", [&] {
     fired = true;
     // Another replica handling the same retry stores its turn and enqueues it.
     if (ctx.Redis.Set("turn:c-1:k-race", rival.dump(), "EX", 86400, "NX")) ctx.Redis.Do("RPUSH", "apv2:turns", rival.dump());
   });
-  Api api(ctx);
-  const auto r = api.post(text(kQuestion), "c-1", "k-race");
+  HApi api(ctx);
+  const auto r = api.post(hText(kHQuestion), "c-1", "k-race");
   ctx.Assert(fired, "the handler never touched turn:c-1:k-race: store the turn under (conversation, Idempotency-Key)");
   ctx.Equal(r.Status, 202, "the message (%s)", r.Text());
-  ctx.Equal(queued(ctx).size(), 1,
+  ctx.Equal(hQueued(ctx).size(), 1,
             "two replicas handled one retry: a read then a write leaves a gap another replica lands in, so claim the key in one command (turns::claim); turns enqueued for one key");
   const json stored = json::parse(ctx.Redis.Get("turn:c-1:k-race").value_or("{}"), nullptr, false);
-  ctx.Equal(turnId(r), stored.value("turn_id", ""), "the answer must name the turn the key holds");
+  ctx.Equal(hTurnId(r), stored.value("turn_id", ""), "the answer must name the turn the key holds");
 }
 `,
   },

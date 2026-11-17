@@ -78,7 +78,7 @@ every turn pays for the same search again and again.
       id: 'ttl',
       title: 'Refreshes a 24-hour TTL on every write',
       detail:
-        'After an append `ctx:t1:c-1` expires in about 24 hours; an hour later another append puts it back to 24 hours; a day after the last write it is gone. The starter sets no TTL.',
+        'Right after the first command of the first append creates `ctx:t1:c-1` it already expires in about 24 hours; an hour later another append puts it back to 24 hours; a day after the last write it is gone. The starter sets no TTL.',
       match: {
         python: {all: [/CONTEXT_TTL_S/, /\.expire\(/]},
         typescript: {all: [/CONTEXT_TTL_S/, /\.expire\(/]},
@@ -104,7 +104,7 @@ every turn pays for the same search again and again.
       id: 'retriever-cache',
       title: 'Caches each retriever answer for five minutes',
       detail:
-        'Two assemblies of one question make one Retrieve call and return the same articles; the answer sits under `config.retriever_key` with a TTL of at most 300 s; 301 s later, or for a new question, the retriever is asked again. The starter calls the retriever on every assembly.',
+        'Two assemblies of one question make one Retrieve call and return the same articles; the command that caches the answer under `config.retriever_key` sets its TTL of at most 300 s; 299 s later it is still served from the cache; 301 s later, or for a new question, the retriever is asked again. The starter calls the retriever on every assembly.',
       match: {
         python: {all: [/RETRIEVER_TTL_S/, /retriever_key\(/]},
         typescript: {all: [/RETRIEVER_TTL_S/, /retrieverKey\(/]},
@@ -745,12 +745,17 @@ PROFILE = {
 
 
 class Retriever(pb_grpc.ContextRetrieverServicer):
+    def __init__(self, on_call=None):
+        self.on_call = on_call
+
     def Retrieve(self, request, context):
+        if self.on_call is not None:
+            self.on_call(request)
         return pb.RetrieveReply(items=standins.retrieve(request.retriever, request.question))
 
 
-def _store(ctx):
-    ctx.grpc.serve(pb_grpc.add_ContextRetrieverServicer_to_server, Retriever(), config.RETRIEVER)
+def _store(ctx, on_call=None):
+    ctx.grpc.serve(pb_grpc.add_ContextRetrieverServicer_to_server, Retriever(on_call), config.RETRIEVER)
     return ctx.load("context_store")
 
 
@@ -794,7 +799,10 @@ def check_bounded(ctx):
 
 def check_ttl(ctx):
     m = _store(ctx)
+    probe = ctx.redis_after("ctx:t1:c-1", lambda: ctx.redis.ttl("ctx:t1:c-1"))
     m.append_item("t1", "c-1", {"kind": "user", "text": "hello"})
+    assert probe.fired, "append_item never wrote ctx:t1:c-1"
+    assert probe.result > 86_000, f"right after append_item's first command created ctx:t1:c-1 the list had TTL {probe.result}: EXPIRE belongs in the same MULTI/EXEC as the RPUSH, or a crash in between leaves a list that never expires"
     ttls = {key: ctx.redis.ttl(key) for key in _lists(ctx)}
     assert ttls.get("ctx:t1:c-1", -2) > 86_000, f"after append_item the context lists have TTLs {ttls}: every write refreshes a 24-hour TTL (CONTEXT_TTL_S = 86400) on ctx:t1:c-1, or a conversation's context outlives it by years"
     ctx.clock.advance(3600)
@@ -816,18 +824,30 @@ def check_declared(ctx):
 
 
 def check_retriever_cache(ctx):
-    m = _store(ctx)
     question = "How do I change my check-in time?"
+    key = config.retriever_key("t1", "help_articles", question)
+    cached = []
+
+    def on_call(request):
+        # The retriever is answering: the next command on the key is the one that caches the answer.
+        if not cached:
+            cached.append(ctx.redis_after(key, lambda: ctx.redis.ttl(key)))
+
+    m = _store(ctx, on_call)
     first = list(m.assemble("t1", "c-1", "guest-1", question)["articles"])
     assert first == [f"Help article for: {question}"], f"the articles must be what help_articles returned, got {first}"
     again = list(m.assemble("t1", "c-1", "guest-1", question)["articles"])
     assert again == first, f"the cached articles must equal the retrieved ones: {again} vs {first}"
     calls = len(ctx.grpc.calls_to("Retrieve"))
     assert calls == 1, f"two assemblies of the same question made {calls} Retrieve calls: cache the answer under config.retriever_key for RETRIEVER_TTL_S = 300 s"
-    key = config.retriever_key("t1", "help_articles", question)
+    assert cached and cached[0].fired, f"the answer was never cached at {key}"
+    assert 0 < cached[0].result <= 300, f"right after the command that cached the answer at {key} it had TTL {cached[0].result}: store the answer and its TTL in one command (SETEX), or a crash in between caches it forever"
     ttl = ctx.redis.ttl(key)
     assert 0 < ttl <= 300, f"the cached answer at {key} has TTL {ttl}, expected at most 300 s"
-    ctx.clock.advance(301)
+    ctx.clock.advance(299)
+    m.assemble("t1", "c-1", "guest-1", question)
+    assert len(ctx.grpc.calls_to("Retrieve")) == 1, "299 s after it was cached the answer is still fresh and makes no call: it is cached for RETRIEVER_TTL_S = 300 s"
+    ctx.clock.advance(2)
     m.assemble("t1", "c-1", "guest-1", question)
     assert len(ctx.grpc.calls_to("Retrieve")) == 2, "five minutes later the cached answer has expired and the retriever is asked again"
     m.assemble("t1", "c-1", "guest-1", "Can I bring a dog?")
@@ -842,12 +862,13 @@ def check_retriever_cache(ctx):
   payment_last4: '4242',
 };
 
-function store(ctx) {
+function store(ctx, onCall?: () => void) {
   const {apv2rpc} = ctx.proto('support_automation.proto');
   const config = ctx.load('/support/apv2/config.ts');
   const standins = ctx.load('/support/apv2/standins.ts');
   ctx.grpc.serve(apv2rpc.ContextRetriever.service, {
     Retrieve(call, callback) {
+      onCall?.();
       callback(null, {items: standins.retrieve(call.request.retriever, call.request.question)});
     },
   }, config.RETRIEVER);
@@ -894,7 +915,10 @@ export async function check_bounded(ctx) {
 
 export async function check_ttl(ctx) {
   const {m} = store(ctx);
+  const probe = ctx.redisAfter('ctx:t1:c-1', () => ctx.redis.ttl('ctx:t1:c-1'));
   await m.appendItem('t1', 'c-1', {kind: 'user', text: 'hello'});
+  assert(probe.fired, 'appendItem never wrote ctx:t1:c-1');
+  assert(probe.result > 86_000, \`right after appendItem's first command created ctx:t1:c-1 the list had TTL \${probe.result}: EXPIRE belongs in the same MULTI/EXEC as the RPUSH, or a crash in between leaves a list that never expires\`);
   const ttls = Object.fromEntries(Object.keys(lists(ctx)).map(key => [key, ctx.redis.ttl(key)]));
   assert((ttls['ctx:t1:c-1'] ?? -2) > 86_000, \`after appendItem the context lists have TTLs \${JSON.stringify(ttls)}: every write refreshes a 24-hour TTL (CONTEXT_TTL_S = 86400) on ctx:t1:c-1, or a conversation's context outlives it by years\`);
   ctx.clock.advance(3600);
@@ -916,8 +940,13 @@ export async function check_declared(ctx) {
 }
 
 export async function check_retriever_cache(ctx) {
-  const {m, config} = store(ctx);
   const question = 'How do I change my check-in time?';
+  const cached: {fired: boolean; result: unknown}[] = [];
+  const {m, config} = store(ctx, () => {
+    // The retriever is answering: the next command on the key is the one that caches the answer.
+    const key = config.retrieverKey('t1', 'help_articles', question);
+    if (cached.length === 0) cached.push(ctx.redisAfter(key, () => ctx.redis.ttl(key)));
+  });
   const first = [...(await m.assemble('t1', 'c-1', 'guest-1', question)).articles];
   assert.deepStrictEqual(first, [\`Help article for: \${question}\`], \`the articles must be what help_articles returned, got \${JSON.stringify(first)}\`);
   const again = [...(await m.assemble('t1', 'c-1', 'guest-1', question)).articles];
@@ -925,9 +954,15 @@ export async function check_retriever_cache(ctx) {
   const calls = ctx.grpc.callsTo('Retrieve').length;
   assert.equal(calls, 1, \`two assemblies of the same question made \${calls} Retrieve calls: cache the answer under config.retrieverKey for RETRIEVER_TTL_S = 300 s\`);
   const key = config.retrieverKey('t1', 'help_articles', question);
+  assert(cached.length === 1 && cached[0].fired, \`the answer was never cached at \${key}\`);
+  const created = cached[0].result as number;
+  assert(created > 0 && created <= 300, \`right after the command that cached the answer at \${key} it had TTL \${created}: store the answer and its TTL in one command (SET with EX), or a crash in between caches it forever\`);
   const ttl = ctx.redis.ttl(key);
   assert(ttl > 0 && ttl <= 300, \`the cached answer at \${key} has TTL \${ttl}, expected at most 300 s\`);
-  ctx.clock.advance(301);
+  ctx.clock.advance(299);
+  await m.assemble('t1', 'c-1', 'guest-1', question);
+  assert.equal(ctx.grpc.callsTo('Retrieve').length, 1, '299 s after it was cached the answer is still fresh and makes no call: it is cached for RETRIEVER_TTL_S = 300 s');
+  ctx.clock.advance(2);
   await m.assemble('t1', 'c-1', 'guest-1', question);
   assert.equal(ctx.grpc.callsTo('Retrieve').length, 2, 'five minutes later the cached answer has expired and the retriever is asked again');
   await m.assemble('t1', 'c-1', 'guest-1', 'Can I bring a dog?');
@@ -951,14 +986,20 @@ import (
 
 type retrieverPeer struct {
 	pb.UnimplementedContextRetrieverServer
+	onCall func()
 }
 
-func (retrieverPeer) Retrieve(_ context.Context, req *pb.RetrieveRequest) (*pb.RetrieveReply, error) {
+func (p retrieverPeer) Retrieve(_ context.Context, req *pb.RetrieveRequest) (*pb.RetrieveReply, error) {
+	if p.onCall != nil {
+		p.onCall()
+	}
 	return &pb.RetrieveReply{Items: standins.Retrieve(req.GetRetriever(), req.GetQuestion())}, nil
 }
 
-func storeWorld(ctx *harness.Ctx) {
-	pb.RegisterContextRetrieverServer(ctx.GRPC.Server(config.Retriever), retrieverPeer{})
+func storeWorld(ctx *harness.Ctx) { storeWorldWith(ctx, nil) }
+
+func storeWorldWith(ctx *harness.Ctx, onCall func()) {
+	pb.RegisterContextRetrieverServer(ctx.GRPC.Server(config.Retriever), retrieverPeer{onCall: onCall})
 }
 
 func storeAppend(ctx *harness.Ctx, tenant, conversation, kind, text string) {
@@ -1039,7 +1080,11 @@ func CheckBounded(ctx *harness.Ctx) {
 
 func CheckTtl(ctx *harness.Ctx) {
 	storeWorld(ctx)
+	probe := ctx.Redis.After("ctx:t1:c-1", func() any { return ctx.Redis.TTL("ctx:t1:c-1") })
 	storeAppend(ctx, "t1", "c-1", "user", "hello")
+	ctx.Assert(probe.Fired, "appendItem never wrote ctx:t1:c-1")
+	created, _ := probe.Result.(int64)
+	ctx.Assert(created > 86_000, "right after appendItem's first command created ctx:t1:c-1 the list had TTL %d: Expire belongs in the same MULTI/EXEC (TxPipelined) as the RPush, or a crash in between leaves a list that never expires", created)
 	ttls := map[string]int64{}
 	for key := range storeLists(ctx) {
 		ttls[key] = ctx.Redis.TTL(key)
@@ -1070,17 +1115,32 @@ func CheckDeclared(ctx *harness.Ctx) {
 }
 
 func CheckRetrieverCache(ctx *harness.Ctx) {
-	storeWorld(ctx)
 	question := "How do I change my check-in time?"
+	key := config.RetrieverKey("t1", "help_articles", question)
+	asked, cachedFired, created := false, false, int64(0)
+	storeWorldWith(ctx, func() {
+		// The retriever is answering: the next command on the key is the one that caches the answer.
+		if !asked {
+			asked = true
+			ctx.Redis.After(key, func() any {
+				cachedFired, created = true, ctx.Redis.TTL(key)
+				return nil
+			})
+		}
+	})
 	first := storeAssemble(ctx, "guest-1", question).Articles
 	ctx.Equal(first, []string{"Help article for: " + question}, "the articles must be what help_articles returned")
 	again := storeAssemble(ctx, "guest-1", question).Articles
 	ctx.Equal(again, first, "the cached articles must equal the retrieved ones")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 1, "two assemblies of the same question: cache the answer under config.RetrieverKey for retrieverTTL = 300 s; Retrieve calls")
-	key := config.RetrieverKey("t1", "help_articles", question)
+	ctx.Assert(cachedFired, "the answer was never cached at %s", key)
+	ctx.Assert(created > 0 && created <= 300, "right after the command that cached the answer at %s it had TTL %d: store the answer and its TTL in one command (Set with an expiration), or a crash in between caches it forever", key, created)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0 && ttl <= 300, "the cached answer at %s has TTL %d, expected at most 300 s", key, ttl)
-	ctx.Clock.Advance(301)
+	ctx.Clock.Advance(299)
+	storeAssemble(ctx, "guest-1", question)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 1, "299 s after it was cached the answer is still fresh and makes no call: it is cached for retrieverTTL = 300 s; Retrieve calls")
+	ctx.Clock.Advance(2)
 	storeAssemble(ctx, "guest-1", question)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Retrieve", "")), 2, "five minutes later the cached answer has expired and the retriever is asked again; Retrieve calls")
 	storeAssemble(ctx, "guest-1", "Can I bring a dog?")
@@ -1091,6 +1151,7 @@ func CheckRetrieverCache(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -1103,14 +1164,17 @@ using json = nlohmann::json;
 
 class RetrieverPeer final : public apv2rpc::ContextRetriever::Service {
  public:
+  std::function<void()> on_call;
   grpc::Status Retrieve(grpc::ServerContext*, const apv2rpc::RetrieveRequest* req, apv2rpc::RetrieveReply* reply) override {
+    if (on_call) on_call();
     for (const auto& item : standins::retrieve(req->retriever(), req->question())) reply->add_items(item);
     return grpc::Status::OK;
   }
 };
 
-void storeWorld(harness::Ctx& ctx) {
+void storeWorld(harness::Ctx& ctx, std::function<void()> on_call = nullptr) {
   static RetrieverPeer peer;
+  peer.on_call = std::move(on_call);
   ctx.GRPC.Server(config::kRetriever)->RegisterService(&peer);
 }
 
@@ -1128,7 +1192,7 @@ std::vector<std::string> storeTexts(harness::Ctx& ctx, const std::string& key) {
   return out;
 }
 
-std::string describe(const std::map<std::string, long long>& m) {
+std::string hDescribe(const std::map<std::string, long long>& m) {
   std::string out = "{";
   for (const auto& [k, v] : m) out += (out.size() > 1 ? ", " : "") + k + ": " + std::to_string(v);
   return out + "}";
@@ -1160,7 +1224,7 @@ void CheckBounded(harness::Ctx& ctx) {
   const auto lists = storeLists(ctx);
   long long longest = -1;
   for (const auto& [_, n] : lists) longest = std::max(longest, n);
-  ctx.Assert(longest >= 0 && longest <= 40, "after 45 appends the context lists hold %s: trim to the newest kMaxContextItems = 40, or every turn re-sends a longer prompt", describe(lists));
+  ctx.Assert(longest >= 0 && longest <= 40, "after 45 appends the context lists hold %s: trim to the newest kMaxContextItems = 40, or every turn re-sends a longer prompt", hDescribe(lists));
   const auto history = assemble("t1", "c-1", "guest-1", "q").history;
   ctx.Equal(history.size(), 40, "assemble must return the newest 40 items; items returned");
   ctx.Assert(history.front().text == "message 6" && history.back().text == "message 45", "assemble must return items 6 to 45, oldest first; got %q … %q", history.front().text, history.back().text);
@@ -1179,11 +1243,19 @@ void CheckBounded(harness::Ctx& ctx) {
 
 void CheckTtl(harness::Ctx& ctx) {
   storeWorld(ctx);
+  bool fired = false;
+  long long created = -2;
+  ctx.Redis.After("ctx:t1:c-1", [&] {
+    fired = true;
+    created = ctx.Redis.TTL("ctx:t1:c-1");
+  });
   append_item("t1", "c-1", {"user", "hello"});
+  ctx.Assert(fired, "append_item never wrote ctx:t1:c-1");
+  ctx.Assert(created > 86000, "right after append_item's first command created ctx:t1:c-1 the list had TTL %d: expire belongs in the same transaction() as the rpush, or a crash in between leaves a list that never expires", created);
   std::map<std::string, long long> ttls;
   for (const auto& [key, _] : storeLists(ctx)) ttls[key] = ctx.Redis.TTL(key);
   ctx.Assert(ttls.count("ctx:t1:c-1") == 1 && ttls["ctx:t1:c-1"] > 86000,
-             "after append_item the context lists have TTLs %s: every write refreshes a 24-hour TTL (kContextTtl) on ctx:t1:c-1, or a conversation's context outlives it by years", describe(ttls));
+             "after append_item the context lists have TTLs %s: every write refreshes a 24-hour TTL (kContextTtl) on ctx:t1:c-1, or a conversation's context outlives it by years", hDescribe(ttls));
   ctx.Clock.Advance(3600);
   append_item("t1", "c-1", {"assistant", "hi"});
   const long long ttl = ctx.Redis.TTL("ctx:t1:c-1");
@@ -1206,17 +1278,32 @@ void CheckDeclared(harness::Ctx& ctx) {
 }
 
 void CheckRetrieverCache(harness::Ctx& ctx) {
-  storeWorld(ctx);
   const std::string question = "How do I change my check-in time?";
+  const std::string key = config::retriever_key("t1", "help_articles", question);
+  bool asked = false, cachedFired = false;
+  long long created = 0;
+  storeWorld(ctx, [&] {
+    // The retriever is answering: the next command on the key is the one that caches the answer.
+    if (asked) return;
+    asked = true;
+    ctx.Redis.After(key, [&] {
+      cachedFired = true;
+      created = ctx.Redis.TTL(key);
+    });
+  });
   const auto first = assemble("t1", "c-1", "guest-1", question).articles;
   ctx.Equal(first, std::vector<std::string>{"Help article for: " + question}, "the articles must be what help_articles returned");
   const auto again = assemble("t1", "c-1", "guest-1", question).articles;
   ctx.Equal(again, first, "the cached articles must equal the retrieved ones");
   ctx.Equal(ctx.GRPC.CallsTo("Retrieve").size(), 1, "two assemblies of the same question: cache the answer under config::retriever_key for kRetrieverTtl = 300 s; Retrieve calls");
-  const std::string key = config::retriever_key("t1", "help_articles", question);
+  ctx.Assert(cachedFired, "the answer was never cached at %s", key);
+  ctx.Assert(created > 0 && created <= 300, "right after the command that cached the answer at %s it had TTL %d: store the answer and its TTL in one command (set with a ttl), or a crash in between caches it forever", key, created);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl > 0 && ttl <= 300, "the cached answer at %s has TTL %d, expected at most 300 s", key, ttl);
-  ctx.Clock.Advance(301);
+  ctx.Clock.Advance(299);
+  assemble("t1", "c-1", "guest-1", question);
+  ctx.Equal(ctx.GRPC.CallsTo("Retrieve").size(), 1, "299 s after it was cached the answer is still fresh and makes no call: it is cached for kRetrieverTtl = 300 s; Retrieve calls");
+  ctx.Clock.Advance(2);
   assemble("t1", "c-1", "guest-1", question);
   ctx.Equal(ctx.GRPC.CallsTo("Retrieve").size(), 2, "five minutes later the cached answer has expired and the retriever is asked again; Retrieve calls");
   assemble("t1", "c-1", "guest-1", "Can I bring a dog?");

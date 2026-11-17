@@ -27,7 +27,8 @@ increment that loses a call from the metrics.
 - The span carries every field above except \`prompt\` and \`answer\`, which stay out of the logs too.
 - A delivery failure, reported through the **delivery callback**, writes the span to the provided
   outbox (\`outbox.insert(span, reason)\`, the Redis list \`apv2:outbox\`); \`emit\` does not wait.
-- \`consume\` increments the metrics **before** it commits.`,
+- \`consume\` increments the metrics **before** it commits, and never commits a span whose
+  increment failed.`,
   sequence: {
     participants: ['CoT workflow', 'assistant.trace', 'Trace consumer', 'Redis'],
     messages: [
@@ -95,7 +96,7 @@ increment that loses a call from the metrics.
       id: 'outbox-fallback',
       title: 'A failed delivery goes to the outbox',
       detail:
-        "A span the broker refuses reaches `apv2:outbox` through the delivery callback (`on_delivery`, the send promise's rejection, `Events()`, the `Callback`, `dr_cb`), without a flush; the next span flows to the topic and stays out of the outbox. The starter ignores delivery reports, so a refused span is gone.",
+        "A span the broker refuses reaches `apv2:outbox` through the delivery callback (`on_delivery`, the send promise's rejection, `Events()`, the `Callback`, `dr_cb`), without a flush, as the span: no `prompt`, no `answer` and none of the guest's text; the next span flows to the topic and stays out of the outbox. The starter ignores delivery reports, so a refused span is gone.",
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=|callback\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /\.catch\(|catch\s*\(/]},
@@ -108,7 +109,7 @@ increment that loses a call from the metrics.
       id: 'metrics-before-commit',
       title: 'Updates the metrics before committing the offset',
       detail:
-        'At the first offset commit the metrics already count the first span, and after three spans `metrics:t1:llm:support-model` reads 2 calls, 2000 ms, 400 input and 70 output tokens, `metrics:t1:guardrail:gate` 1 blocked, with no lag. The starter commits first, so a crash in between loses the call from the metrics.',
+        'At the first offset commit the metrics already count the first span, and after three spans `metrics:t1:llm:support-model` reads 2 calls, 2000 ms, 400 input and 70 output tokens and `metrics:t1:guardrail:gate` 1 blocked, all three committed; a fourth span whose increment fails (its counters are not a hash) stays uncommitted, a lag of 1. The starter commits first, so a crash in between loses the call from the metrics.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -328,7 +329,7 @@ export async function consume(): Promise<void> {
       const span = JSON.parse(message.value?.toString() ?? '{}') as Span;
       const key = metricsKey(span.tenant, span.kind, span.name);
       const blocked = Object.values(span.verdicts ?? {}).some(verdict => verdict !== 'PASS');
-      await redis
+      const replies = await redis
         .pipeline()
         .hincrby(key, 'calls', 1)
         .hincrby(key, 'latency_ms', span.latency_ms)
@@ -336,6 +337,9 @@ export async function consume(): Promise<void> {
         .hincrby(key, 'output_tokens', span.output_tokens)
         .hincrby(key, 'blocked', blocked ? 1 : 0)
         .exec();
+      // exec() resolves with [error, result] pairs: a failed increment must stop the commit too.
+      const failed = replies?.find(([err]) => err !== null);
+      if (failed) throw failed[0]; // not committed: the span is redelivered
       await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]); // after the increments
     },
   });
@@ -922,13 +926,14 @@ def check_outbox_fallback(ctx):
     m = ctx.load("trace_events")
     ctx.kafka.fail_next(TOPIC, 1)
     try:
-        m.emit(_call("turn-9"))
+        m.emit(_call("turn-9", prompt=CANARY, answer="Answer to " + CANARY))
     except Exception as exc:  # noqa: BLE001 - whatever it raised is the verdict
         raise AssertionError(f"emit failed the turn when the broker refused the span: {exc!r}. Write the span to the outbox instead") from None
     m.producer.poll(0)
     rows = _outbox(ctx)
     assert rows, "the broker refused the span and nothing reached apv2:outbox: handle the delivery report (on_delivery) and call outbox.insert(span, reason)"
     assert rows[0].get("span", {}).get("turn_id") == "turn-9", f"the outbox row must carry the span: {rows[0]}"
+    assert "prompt" not in rows[0]["span"] and "answer" not in rows[0]["span"] and "CANARY-5521" not in json.dumps(rows[0]), f"the outbox row carries the guest's text: write the span, not the call: {rows[0]}"
     assert ctx.kafka.flushes == 0, "emit must not flush: the turn would wait for the broker"
     m.emit(_call("turn-10"))
     m.producer.poll(0)
@@ -940,16 +945,23 @@ def check_metrics_before_commit(ctx):
     llm = "metrics:t1:llm:support-model"
     for call in (_call("turn-1", latency_ms=800, input_tokens=100, output_tokens=50), _call("turn-1", latency_ms=1200, input_tokens=300, output_tokens=20), _call("turn-1", kind="guardrail", name="gate", latency_ms=40, input_tokens=0, output_tokens=0, verdicts={"relevance": "PASS", "groundedness": "FAIL"})):
         ctx.kafka.seed(TOPIC, key="c-1", value=json.dumps(_span(call)))
+    # The fourth span's counters are not a hash: its increment fails, so its offset must stay uncommitted.
+    ctx.redis.set("metrics:t1:tool:broken", "not a hash")
+    ctx.kafka.seed(TOPIC, key="c-1", value=json.dumps(_span(_call("turn-1", kind="tool", name="broken", latency_ms=5, input_tokens=0, output_tokens=0))))
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.hget(llm, "calls")))
     m = ctx.load("trace_events")
-    ctx.drain(m.consume)
+    try:
+        ctx.drain(m.consume)
+    except Exception:  # noqa: BLE001 - the failed increment may end the loop; the offsets are the verdict
+        pass
     assert at_commit, "the consumer never committed an offset"
     assert at_commit[0] is not None and int(at_commit[0]) >= 1, f"at the first commit {llm} calls held {at_commit[0]!r}: increment before the commit, or a crash in between loses the call from the metrics"
     totals = {k: int(v) for k, v in ctx.redis.hgetall(llm).items()}
     assert totals == {"calls": 2, "latency_ms": 2000, "input_tokens": 400, "output_tokens": 70, "blocked": 0}, f"{llm} reads {totals}, expected 2 calls, 2000 ms, 400 and 70 tokens, 0 blocked"
     assert ctx.redis.hget("metrics:t1:guardrail:gate", "blocked") == "1", "a guardrail span with a FAIL verdict counts as blocked"
-    assert ctx.kafka.lag("insights", TOPIC) == 0, "every processed span must be committed"
+    lag = ctx.kafka.lag("insights", TOPIC)
+    assert lag == 1, f"the insights group's lag is {lag}, expected 1: the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics"
 `,
     typescript: `const TOPIC = 'assistant.trace';
 const CANARY = 'CANARY-5521 my email is ana@example.com';
@@ -1036,7 +1048,7 @@ export async function check_outbox_fallback(ctx) {
   const m = ctx.load('trace_events');
   ctx.kafka.failNext(TOPIC, 1);
   try {
-    await m.emit(callOf({turn_id: 'turn-9'}));
+    await m.emit(callOf({turn_id: 'turn-9', prompt: CANARY, answer: 'Answer to ' + CANARY}));
   } catch (e) {
     assert.fail(\`emit failed the turn when the broker refused the span: \${e}. Write the span to the outbox instead\`);
   }
@@ -1044,6 +1056,7 @@ export async function check_outbox_fallback(ctx) {
   const rows = outboxRows(ctx);
   assert(rows.length > 0, 'the broker refused the span and nothing reached apv2:outbox: catch the rejected send and call outbox.insert(span, reason)');
   assert.equal(rows[0].span?.turn_id, 'turn-9', \`the outbox row must carry the span: \${JSON.stringify(rows[0])}\`);
+  assert(!('prompt' in rows[0].span) && !('answer' in rows[0].span) && !JSON.stringify(rows[0]).includes('CANARY-5521'), \`the outbox row carries the guest's text: write the span, not the call: \${JSON.stringify(rows[0])}\`);
   await m.emit(callOf({turn_id: 'turn-10'}));
   await settle();
   assert.deepStrictEqual(turnIds(ctx), ['turn-10'], 'once the broker accepts records again spans flow to the topic');
@@ -1059,16 +1072,24 @@ export async function check_metrics_before_commit(ctx) {
   ]) {
     ctx.kafka.seed(TOPIC, {key: 'c-1', value: JSON.stringify(spanOf(call))});
   }
+  // The fourth span's counters are not a hash: its increment fails, so its offset must stay uncommitted.
+  ctx.redis.set('metrics:t1:tool:broken', 'not a hash');
+  ctx.kafka.seed(TOPIC, {key: 'c-1', value: JSON.stringify(spanOf(callOf({kind: 'tool', name: 'broken', latency_ms: 5, input_tokens: 0, output_tokens: 0})))});
   const atCommit: (string | null)[] = [];
   ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hget(llm, 'calls')));
   const m = ctx.load('trace_events');
-  await ctx.drain(m.consume());
+  try {
+    await ctx.drain(m.consume());
+  } catch {
+    // the failed increment may end the loop; the offsets are the verdict
+  }
   assert(atCommit.length > 0, 'the consumer never committed an offset');
   assert(atCommit[0] !== null && Number(atCommit[0]) >= 1, \`at the first commit \${llm} calls held \${JSON.stringify(atCommit[0])}: increment before the commit, or a crash in between loses the call from the metrics\`);
   const totals = Object.fromEntries(Object.entries(ctx.redis.hgetall(llm)).map(([k, v]) => [k, Number(v)]));
   assert.deepStrictEqual(totals, {calls: 2, latency_ms: 2000, input_tokens: 400, output_tokens: 70, blocked: 0}, \`\${llm} reads \${JSON.stringify(totals)}, expected 2 calls, 2000 ms, 400 and 70 tokens, 0 blocked\`);
   assert.equal(ctx.redis.hget('metrics:t1:guardrail:gate', 'blocked'), '1', 'a guardrail span with a FAIL verdict counts as blocked');
-  assert.equal(ctx.kafka.lag('insights', TOPIC), 0, 'every processed span must be committed');
+  const lag = ctx.kafka.lag('insights', TOPIC);
+  assert.equal(lag, 1, \`the insights group's lag is \${lag}, expected 1: the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics\`);
 }
 `,
     go: `package main
@@ -1171,13 +1192,19 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 				ctx.Fatalf("emit failed the turn when the broker refused the span: %v. Write the span to the outbox instead", e)
 			}
 		}()
-		emit(context.Background(), traceCall("turn-9", "c-1", "llm", "support-model", 800, 100, 50, nil))
+		call := traceCall("turn-9", "c-1", "llm", "support-model", 800, 100, 50, nil)
+		call.Prompt = traceCanary
+		call.Answer = "Answer to " + traceCanary
+		emit(context.Background(), call)
 	}()
 	ctx.Settle()
 	rows := traceOutbox(ctx)
 	ctx.Assert(len(rows) > 0, "the broker refused the span and nothing reached apv2:outbox: read the producer's delivery reports (Events()) and call outbox.Insert")
 	span, _ := rows[0]["span"].(map[string]any)
 	ctx.Equal(span["turn_id"], "turn-9", "the outbox row must carry the span; the row %v; its turn id", rows[0])
+	_, hasPrompt := span["prompt"]
+	_, hasAnswer := span["answer"]
+	ctx.Assert(!hasPrompt && !hasAnswer && !strings.Contains(harness.Show(rows[0]), "CANARY-5521"), "the outbox row carries the guest's text: write the span, not the call: %v", rows[0])
 	ctx.Equal(ctx.Kafka.Flushes(), 0, "emit must not flush (the turn would wait for the broker); the flushes")
 	emit(context.Background(), traceCall("turn-10", "c-1", "llm", "support-model", 800, 100, 50, nil))
 	ctx.Settle()
@@ -1195,6 +1222,10 @@ func CheckMetricsBeforeCommit(ctx *harness.Ctx) {
 		value, _ := json.Marshal(s)
 		ctx.Kafka.Seed(traceTopic, "c-1", string(value))
 	}
+	// The fourth span's counters are not a hash: its increment fails, so its offset must stay uncommitted.
+	ctx.Redis.Set("metrics:t1:tool:broken", "not a hash")
+	broken, _ := json.Marshal(map[string]any{"tenant": "t1", "conversation": "c-1", "turn_id": "turn-1", "iteration": 2, "kind": "tool", "name": "broken", "latency_ms": 5, "input_tokens": 0, "output_tokens": 0, "verdicts": map[string]string{}})
+	ctx.Kafka.Seed(traceTopic, "c-1", string(broken))
 	var atCommit []string
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		v, _ := ctx.Redis.HGet(llm, "calls")
@@ -1206,7 +1237,7 @@ func CheckMetricsBeforeCommit(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.HGetAll(llm), map[string]string{"calls": "2", "latency_ms": "2000", "input_tokens": "400", "output_tokens": "70", "blocked": "0"}, "%s (2 calls, 2000 ms, 400 and 70 tokens, 0 blocked)", llm)
 	blocked, _ := ctx.Redis.HGet("metrics:t1:guardrail:gate", "blocked")
 	ctx.Equal(blocked, "1", "a guardrail span with a FAIL verdict counts as blocked")
-	ctx.Equal(ctx.Kafka.Lag("insights", traceTopic), 0, "every processed span must be committed; the lag")
+	ctx.Equal(ctx.Kafka.Lag("insights", traceTopic), 1, "the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1304,7 +1335,10 @@ void CheckNoText(harness::Ctx& ctx) {
 void CheckOutboxFallback(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTraceTopic, 1);
   try {
-    emit(traceCall("turn-9"));
+    json call = traceCall("turn-9");
+    call["prompt"] = kTraceCanary;
+    call["answer"] = "Answer to " + kTraceCanary;
+    emit(call);
   } catch (const std::exception& e) {
     ctx.Fatalf("emit failed the turn when the broker refused the span: %s. Write the span to the outbox instead", e.what());
   }
@@ -1313,6 +1347,8 @@ void CheckOutboxFallback(harness::Ctx& ctx) {
   const auto rows = traceOutbox(ctx);
   ctx.Assert(!rows.empty(), "the broker refused the span and nothing reached apv2:outbox: handle the delivery report (dr_cb) with outbox::insert");
   ctx.Assert(rows[0].is_object() && rows[0].contains("span") && rows[0]["span"].value("turn_id", "") == "turn-9", "the outbox row must carry the span: %s", rows[0].dump());
+  ctx.Assert(!rows[0]["span"].contains("prompt") && !rows[0]["span"].contains("answer") && rows[0].dump().find("CANARY-5521") == std::string::npos,
+             "the outbox row carries the guest's text: write the span, not the call: %s", rows[0].dump());
   ctx.Equal(ctx.Kafka.Flushes(), 0, "emit must not flush (the turn would wait for the broker); the flushes");
   emit(traceCall("turn-10"));
   producer->poll(0);
@@ -1329,15 +1365,28 @@ void CheckMetricsBeforeCommit(harness::Ctx& ctx) {
     span.erase("answer");
     ctx.Kafka.Seed(kTraceTopic, "c-1", span.dump());
   }
+  // The fourth span's counters are not a hash: its increment fails, so its offset must stay uncommitted.
+  ctx.Redis.Set("metrics:t1:tool:broken", "not a hash");
+  json broken = traceCall("turn-1", "c-1", "tool", "broken", 5, 0, 0);
+  broken.erase("prompt");
+  broken.erase("answer");
+  ctx.Kafka.Seed(kTraceTopic, "c-1", broken.dump());
   std::vector<std::optional<std::string>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HGet(llm, "calls")); });
-  ctx.Drain([] { consume(); });
+  ctx.Drain([] {
+    try {
+      consume();
+    } catch (const std::exception&) {
+      // the failed increment may end the loop; the offsets are the verdict
+    }
+  });
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
   ctx.Assert(atCommit[0] && *atCommit[0] != "0", "at the first commit %s calls held %v: increment before the commit, or a crash in between loses the call from the metrics", llm, atCommit[0]);
   ctx.Equal(ctx.Redis.HGetAll(llm), std::map<std::string, std::string>{{"calls", "2"}, {"latency_ms", "2000"}, {"input_tokens", "400"}, {"output_tokens", "70"}, {"blocked", "0"}},
             "%s (2 calls, 2000 ms, 400 and 70 tokens, 0 blocked)", llm);
   ctx.Equal(ctx.Redis.HGet("metrics:t1:guardrail:gate", "blocked"), "1", "a guardrail span with a FAIL verdict counts as blocked");
-  ctx.Equal(ctx.Kafka.Lag("insights", kTraceTopic), 0, "every processed span must be committed; the lag");
+  ctx.Equal(ctx.Kafka.Lag("insights", kTraceTopic), 1,
+            "the three counted spans are committed, and the span whose increment failed (WRONGTYPE on metrics:t1:tool:broken) is not, or it is lost from the metrics; the lag");
 }
 `,
   },
