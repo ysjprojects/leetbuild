@@ -810,11 +810,11 @@ import (
 	"leetbuild/harness"
 )
 
-const retrieveQ = "refund window policy"
+const kHRetrieveQ = "refund window policy"
 
-// retrieveSeed stores a chunk whose vector is the query's, scaled: its knn rank follows the scale.
-func retrieveSeed(ctx *harness.Ctx, tenant, name, text string, scale float64, start int) {
-	q := embed.Vector(retrieveQ)
+// hRetrieveSeed stores a chunk whose vector is the query's, scaled: its knn rank follows the scale.
+func hRetrieveSeed(ctx *harness.Ctx, tenant, name, text string, scale float64, start int) {
+	q := embed.Vector(kHRetrieveQ)
 	vector := make([]float64, len(q))
 	for i, x := range q {
 		vector[i] = x * scale
@@ -823,23 +823,23 @@ func retrieveSeed(ctx *harness.Ctx, tenant, name, text string, scale float64, st
 	ctx.NoError(err, "seeding %s-%s", tenant, name)
 }
 
-func retrieveCorpus(ctx *harness.Ctx) {
+func hRetrieveCorpus(ctx *harness.Ctx) {
 	// lexical (words shared with the query): a 2, b 1. knn (scale): c, b, d, e, a. t2's x is nearest of all.
-	retrieveSeed(ctx, "t1", "a", "Refund window: 30 days from delivery.", 0.1, 1600)
-	retrieveSeed(ctx, "t1", "b", "Refund requests need the order number.", 0.9, 0)
-	retrieveSeed(ctx, "t1", "c", "Shipping takes five business days.", 1.0, 0)
-	retrieveSeed(ctx, "t1", "d", "Invoices are emailed monthly.", 0.8, 0)
-	retrieveSeed(ctx, "t1", "e", "Support answers within a day.", 0.7, 0)
-	retrieveSeed(ctx, "t2", "x", "Refund window for partners: 90 days.", 2.0, 0)
+	hRetrieveSeed(ctx, "t1", "a", "Refund window: 30 days from delivery.", 0.1, 1600)
+	hRetrieveSeed(ctx, "t1", "b", "Refund requests need the order number.", 0.9, 0)
+	hRetrieveSeed(ctx, "t1", "c", "Shipping takes five business days.", 1.0, 0)
+	hRetrieveSeed(ctx, "t1", "d", "Invoices are emailed monthly.", 0.8, 0)
+	hRetrieveSeed(ctx, "t1", "e", "Support answers within a day.", 0.7, 0)
+	hRetrieveSeed(ctx, "t2", "x", "Refund window for partners: 90 days.", 2.0, 0)
 }
 
-func retrieveRun(ctx *harness.Ctx, tenant, query string, k int) []search.Hit {
+func hRetrieveRun(ctx *harness.Ctx, tenant, query string, k int) []search.Hit {
 	hits, err := retrieve(context.Background(), tenant, query, k)
 	ctx.NoError(err, "retrieve(%q, %q, %d)", tenant, query, k)
 	return hits
 }
 
-func retrieveIDs(hits []search.Hit) []string {
+func hRetrieveIDs(hits []search.Hit) []string {
 	ids := []string{}
 	for _, h := range hits {
 		ids = append(ids, h.ChunkID)
@@ -848,11 +848,11 @@ func retrieveIDs(hits []search.Hit) []string {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	retrieveCorpus(ctx)
+	hRetrieveCorpus(ctx)
 	for i := 0; i < 60; i++ { // another tenant's chunks, all nearer the query than any of t1's
-		retrieveSeed(ctx, "t2", fmt.Sprintf("p%02d", i), fmt.Sprintf("Partner note %d.", i), 3.0, 0)
+		hRetrieveSeed(ctx, "t2", fmt.Sprintf("p%02d", i), fmt.Sprintf("Partner note %d.", i), 3.0, 0)
 	}
-	ids := retrieveIDs(retrieveRun(ctx, "t1", retrieveQ, 10))
+	ids := hRetrieveIDs(hRetrieveRun(ctx, "t1", kHRetrieveQ, 10))
 	for _, id := range ids {
 		ctx.Assert(strings.HasPrefix(id, "t1-"), "tenant t1's retrieval returned t2's chunks (%v): the vector search must be prefiltered by tenant, not run over the whole index", ids)
 	}
@@ -863,32 +863,32 @@ func CheckTenantScope(ctx *harness.Ctx) {
 
 func CheckKCap(ctx *harness.Ctx) {
 	for i := 0; i < 25; i++ {
-		retrieveSeed(ctx, "t1", fmt.Sprintf("n%02d", i), fmt.Sprintf("Refund note %d.", i), float64(i+1)/100, 0)
+		hRetrieveSeed(ctx, "t1", fmt.Sprintf("n%02d", i), fmt.Sprintf("Refund note %d.", i), float64(i+1)/100, 0)
 	}
-	many := retrieveRun(ctx, "t1", retrieveQ, 500)
+	many := hRetrieveRun(ctx, "t1", kHRetrieveQ, 500)
 	ctx.Equal(len(many), 20, "k = 500: k is capped at maxK = 20, whatever the caller asks; hits")
-	few := retrieveRun(ctx, "t1", "refund note", 3)
+	few := hRetrieveRun(ctx, "t1", "refund note", 3)
 	ctx.Equal(len(few), 3, "k = 3; hits")
 }
 
 func CheckRrfMerge(ctx *harness.Ctx) {
-	retrieveCorpus(ctx)
-	hits := retrieveRun(ctx, "t1", retrieveQ, 5)
-	ids := retrieveIDs(hits)
+	hRetrieveCorpus(ctx)
+	hits := hRetrieveRun(ctx, "t1", kHRetrieveQ, 5)
+	ids := hRetrieveIDs(hits)
 	ctx.Assert(len(ids) >= 2 && ids[0] == "t1-b" && ids[1] == "t1-a", "t1-b is second in both rankings, t1-a first in one and last in the other: fused by 1/(60 + rank), b leads, then a; got %v", ids)
 	ctx.Assert(math.Abs(hits[0].Score-2.0/62) < 1e-9, "the top hit's score must be its fused score 1/62 + 1/62, got %v", hits[0].Score)
-	top := retrieveRun(ctx, "t1", retrieveQ, 1)
+	top := hRetrieveRun(ctx, "t1", kHRetrieveQ, 1)
 	ctx.Assert(len(top) == 1 && top[0].ChunkID == "t1-b" && math.Abs(top[0].Score-2.0/62) < 1e-9, "k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks candidates = 50 ids before the fusion, whatever k is; got %+v", top)
-	retrieveSeed(ctx, "t3", "z", "Refund window policy.", 0.5, 0) // lexical first, vector second
-	retrieveSeed(ctx, "t3", "m", "Refund.", 1.0, 0)                // lexical second, vector first
-	tied := retrieveIDs(retrieveRun(ctx, "t3", retrieveQ, 2))
+	hRetrieveSeed(ctx, "t3", "z", "Refund window policy.", 0.5, 0) // lexical first, vector second
+	hRetrieveSeed(ctx, "t3", "m", "Refund.", 1.0, 0)                // lexical second, vector first
+	tied := hRetrieveIDs(hRetrieveRun(ctx, "t3", kHRetrieveQ, 2))
 	ctx.Equal(tied, []string{"t3-m", "t3-z"}, "t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id")
 }
 
 func CheckCitationOffsets(ctx *harness.Ctx) {
-	retrieveCorpus(ctx)
+	hRetrieveCorpus(ctx)
 	text := "Refund window: 30 days from delivery."
-	for _, h := range retrieveRun(ctx, "t1", retrieveQ, 5) {
+	for _, h := range hRetrieveRun(ctx, "t1", kHRetrieveQ, 5) {
 		if h.ChunkID != "t1-a" {
 			continue
 		}
@@ -900,8 +900,8 @@ func CheckCitationOffsets(ctx *harness.Ctx) {
 }
 
 func CheckCacheKey(ctx *harness.Ctx) {
-	retrieveCorpus(ctx)
-	sum := sha256.Sum256([]byte(retrieveQ))
+	hRetrieveCorpus(ctx)
+	sum := sha256.Sum256([]byte(kHRetrieveQ))
 	digest := hex.EncodeToString(sum[:])
 	key := "rag:q:t1:5:" + digest
 	born, bornSeen := int64(0), false
@@ -915,12 +915,12 @@ func CheckCacheKey(ctx *harness.Ctx) {
 		return nil
 	}
 	ctx.Redis.After(key, ttlAtCreation)
-	retrieveRun(ctx, "t1", retrieveQ, 5)
+	hRetrieveRun(ctx, "t1", kHRetrieveQ, 5)
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "the hits must be cached at rag:q:{tenant}:{k}:{sha256(query)}, found %v", ctx.Redis.Keys("rag:q:*"))
 	ctx.Assert(bornSeen && 0 < born && born <= 60, "%s had TTL %d the moment it was written: the entry and its 60 s expiry go in one command (SET … EX), so no crash leaves it immortal", key, born)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= 60, "%s has TTL %d: the cache keeps hits cacheTTL = 60 s", key, ttl)
-	retrieveRun(ctx, "t2", retrieveQ, 5)
+	hRetrieveRun(ctx, "t2", kHRetrieveQ, 5)
 	ctx.Assert(ctx.Redis.Exists("rag:q:t2:5:"+digest) == 1, "t2 asking the same query must get a cache entry of its own: a key without the tenant serves t1's chunks to t2")
 	ctx.Clock.Advance(61)
 	ctx.Equal(ctx.Redis.Exists(key), int64(0), "%s outlived its 60 s", key)
@@ -937,26 +937,26 @@ func CheckCacheKey(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQ = "refund window policy";
+const std::string kHQ = "refund window policy";
 
 // A chunk whose vector is the query's, scaled: its knn rank follows the scale.
-void retrieveSeed(const std::string& tenant, const std::string& name, const std::string& text, double scale, int start = 0) {
-  std::vector<double> vector = embed::vector(kQ);
+void hRetrieveSeed(const std::string& tenant, const std::string& name, const std::string& text, double scale, int start = 0) {
+  std::vector<double> vector = embed::vector(kHQ);
   for (double& x : vector) x *= scale;
   search::upsert({tenant + "-" + name, tenant, "handbook", 2, start, start + static_cast<int>(text.size()), text}, vector);
 }
 
-void retrieveCorpus() {
+void hRetrieveCorpus() {
   // lexical (words shared with the query): a 2, b 1. knn (scale): c, b, d, e, a. t2's x is nearest of all.
-  retrieveSeed("t1", "a", "Refund window: 30 days from delivery.", 0.1, 1600);
-  retrieveSeed("t1", "b", "Refund requests need the order number.", 0.9);
-  retrieveSeed("t1", "c", "Shipping takes five business days.", 1.0);
-  retrieveSeed("t1", "d", "Invoices are emailed monthly.", 0.8);
-  retrieveSeed("t1", "e", "Support answers within a day.", 0.7);
-  retrieveSeed("t2", "x", "Refund window for partners: 90 days.", 2.0);
+  hRetrieveSeed("t1", "a", "Refund window: 30 days from delivery.", 0.1, 1600);
+  hRetrieveSeed("t1", "b", "Refund requests need the order number.", 0.9);
+  hRetrieveSeed("t1", "c", "Shipping takes five business days.", 1.0);
+  hRetrieveSeed("t1", "d", "Invoices are emailed monthly.", 0.8);
+  hRetrieveSeed("t1", "e", "Support answers within a day.", 0.7);
+  hRetrieveSeed("t2", "x", "Refund window for partners: 90 days.", 2.0);
 }
 
-std::vector<std::string> idsOf(const std::vector<search::Hit>& hits) {
+std::vector<std::string> hIdsOf(const std::vector<search::Hit>& hits) {
   std::vector<std::string> ids;
   for (const auto& h : hits) ids.push_back(h.chunk_id);
   return ids;
@@ -965,13 +965,13 @@ std::vector<std::string> idsOf(const std::vector<search::Hit>& hits) {
 }  // namespace
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  retrieveCorpus();
+  hRetrieveCorpus();
   for (int i = 0; i < 60; i++) {  // another tenant's chunks, all nearer the query than any of t1's
     char name[8];
     std::snprintf(name, sizeof name, "p%02d", i);
-    retrieveSeed("t2", name, "Partner note " + std::to_string(i) + ".", 3.0);
+    hRetrieveSeed("t2", name, "Partner note " + std::to_string(i) + ".", 3.0);
   }
-  const auto ids = idsOf(retrieve("t1", kQ, 10));
+  const auto ids = hIdsOf(retrieve("t1", kHQ, 10));
   for (const auto& id : ids) ctx.Assert(id.rfind("t1-", 0) == 0, "tenant t1's retrieval returned t2's chunks (%v): the vector search must be prefiltered by tenant, not run over the whole index", ids);
   auto sorted = ids;
   std::sort(sorted.begin(), sorted.end());
@@ -982,29 +982,29 @@ void CheckKCap(harness::Ctx& ctx) {
   for (int i = 0; i < 25; i++) {
     char name[8];
     std::snprintf(name, sizeof name, "n%02d", i);
-    retrieveSeed("t1", name, "Refund note " + std::to_string(i) + ".", (i + 1) / 100.0);
+    hRetrieveSeed("t1", name, "Refund note " + std::to_string(i) + ".", (i + 1) / 100.0);
   }
-  ctx.Equal(retrieve("t1", kQ, 500).size(), 20, "k = 500: k is capped at kMaxK = 20, whatever the caller asks; hits");
+  ctx.Equal(retrieve("t1", kHQ, 500).size(), 20, "k = 500: k is capped at kMaxK = 20, whatever the caller asks; hits");
   ctx.Equal(retrieve("t1", "refund note", 3).size(), 3, "k = 3; hits");
 }
 
 void CheckRrfMerge(harness::Ctx& ctx) {
-  retrieveCorpus();
-  const auto hits = retrieve("t1", kQ, 5);
-  const auto ids = idsOf(hits);
+  hRetrieveCorpus();
+  const auto hits = retrieve("t1", kHQ, 5);
+  const auto ids = hIdsOf(hits);
   ctx.Assert(ids.size() >= 2 && ids[0] == "t1-b" && ids[1] == "t1-a", "t1-b is second in both rankings, t1-a first in one and last in the other: fused by 1/(60 + rank), b leads, then a; got %v", ids);
   ctx.Assert(std::abs(hits[0].score - 2.0 / 62) < 1e-9, "the top hit's score must be its fused score 1/62 + 1/62, got %v", hits[0].score);
-  const auto top = retrieve("t1", kQ, 1);
-  ctx.Assert(top.size() == 1 && top[0].chunk_id == "t1-b" && std::abs(top[0].score - 2.0 / 62) < 1e-9, "k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks kCandidates = 50 ids before the fusion, whatever k is; got %v", idsOf(top));
-  retrieveSeed("t3", "z", "Refund window policy.", 0.5);  // lexical first, vector second
-  retrieveSeed("t3", "m", "Refund.", 1.0);                // lexical second, vector first
-  ctx.Equal(idsOf(retrieve("t3", kQ, 2)), {"t3-m", "t3-z"}, "t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id");
+  const auto top = retrieve("t1", kHQ, 1);
+  ctx.Assert(top.size() == 1 && top[0].chunk_id == "t1-b" && std::abs(top[0].score - 2.0 / 62) < 1e-9, "k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks kCandidates = 50 ids before the fusion, whatever k is; got %v", hIdsOf(top));
+  hRetrieveSeed("t3", "z", "Refund window policy.", 0.5);  // lexical first, vector second
+  hRetrieveSeed("t3", "m", "Refund.", 1.0);                // lexical second, vector first
+  ctx.Equal(hIdsOf(retrieve("t3", kHQ, 2)), {"t3-m", "t3-z"}, "t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id");
 }
 
 void CheckCitationOffsets(harness::Ctx& ctx) {
-  retrieveCorpus();
+  hRetrieveCorpus();
   const int len = static_cast<int>(std::string("Refund window: 30 days from delivery.").size());
-  for (const auto& h : retrieve("t1", kQ, 5)) {
+  for (const auto& h : retrieve("t1", kHQ, 5)) {
     if (h.chunk_id != "t1-a") continue;
     ctx.Assert(h.doc_id == "handbook" && h.version == 2, "a hit names its document and version, got doc %q version %d", h.doc_id, h.version);
     ctx.Assert(h.start == 1600 && h.end == 1600 + len, "t1-a sits at 1600..%d of its document; the hit says %d..%d: offsets are document coordinates, so a citation can highlight them", 1600 + len, h.start, h.end);
@@ -1014,8 +1014,8 @@ void CheckCitationOffsets(harness::Ctx& ctx) {
 }
 
 void CheckCacheKey(harness::Ctx& ctx) {
-  retrieveCorpus();
-  const std::string digest = sha256_hex(kQ);
+  hRetrieveCorpus();
+  const std::string digest = sha256_hex(kHQ);
   const std::string key = "rag:q:t1:5:" + digest;
   bool bornSeen = false;
   long long born = 0;
@@ -1028,12 +1028,12 @@ void CheckCacheKey(harness::Ctx& ctx) {
     born = ctx.Redis.TTL(key);
   };
   ctx.Redis.After(key, ttlAtCreation);
-  retrieve("t1", kQ, 5);
+  retrieve("t1", kHQ, 5);
   ctx.Assert(ctx.Redis.Exists(key) == 1, "the hits must be cached at rag:q:{tenant}:{k}:{sha256(query)}, found %v", ctx.Redis.Keys("rag:q:*"));
   ctx.Assert(bornSeen && 0 < born && born <= 60, "%s had TTL %d the moment it was written: the entry and its 60 s expiry go in one command (SET … EX), so no crash leaves it immortal", key, born);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= 60, "%s has TTL %d: the cache keeps hits kCacheTtl = 60 s", key, ttl);
-  retrieve("t2", kQ, 5);
+  retrieve("t2", kHQ, 5);
   ctx.Assert(ctx.Redis.Exists("rag:q:t2:5:" + digest) == 1, "t2 asking the same query must get a cache entry of its own: a key without the tenant serves t1's chunks to t2");
   ctx.Clock.Advance(61);
   ctx.Equal(ctx.Redis.Exists(key), 0, "%s outlived its 60 s", key);

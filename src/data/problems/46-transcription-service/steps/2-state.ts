@@ -853,35 +853,35 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateJob(ref string) string {
-	return jobs.Create(stateBg, "t-1", ref, ref, 90, "en", 3).JobID
+func hStateJob(ref string) string {
+	return jobs.Create(hStateBg, "t-1", ref, ref, 90, "en", 3).JobID
 }
 
-func stateSegment(index int) jobs.Segment {
+func hStateSegment(index int) jobs.Segment {
 	return jobs.Segment{ChunkIndex: index, StartMs: index * 30000, EndMs: index*30000 + 10000, Speaker: "A", Text: fmt.Sprintf("chunk %d", index)}
 }
 
 // stateAsr is a transcribe for chunk index that records its calls.
-func stateAsr(calls *[]int, index int) func() ([]jobs.Segment, error) {
+func hStateAsr(calls *[]int, index int) func() ([]jobs.Segment, error) {
 	return func() ([]jobs.Segment, error) {
 		*calls = append(*calls, index)
-		return []jobs.Segment{stateSegment(index)}, nil
+		return []jobs.Segment{hStateSegment(index)}, nil
 	}
 }
 
-func mustRun(ctx *harness.Ctx, jobID string, index int, transcribe func() ([]jobs.Segment, error)) chunkResult {
-	r, err := runChunk(stateBg, jobID, index, 3, transcribe)
+func hMustRun(ctx *harness.Ctx, jobID string, index int, transcribe func() ([]jobs.Segment, error)) chunkResult {
+	r, err := runChunk(hStateBg, jobID, index, 3, transcribe)
 	ctx.NoError(err, "runChunk(%s, %d) failed", jobID, index)
 	return r
 }
 
 func CheckJobKey(ctx *harness.Ctx) {
-	a, b := stateJob("s3://calls/a.wav"), stateJob("s3://calls/b.wav")
+	a, b := hStateJob("s3://calls/a.wav"), hStateJob("s3://calls/b.wav")
 	var calls []int
-	first := mustRun(ctx, a, 0, stateAsr(&calls, 0))
-	second := mustRun(ctx, b, 0, stateAsr(&calls, 0))
+	first := hMustRun(ctx, a, 0, hStateAsr(&calls, 0))
+	second := hMustRun(ctx, b, 0, hStateAsr(&calls, 0))
 	ctx.Equal(first.Status, "done", "chunk 0 of %s", a)
 	ctx.Assert(second.Status == "done" && len(calls) == 2, "chunk 0 of %s answered %q after chunk 0 of %s was done: the two jobs share one ledger, so the second job's chunk is never transcribed", b, second.Status, a)
 	for _, job := range []string{a, b} {
@@ -890,7 +890,7 @@ func CheckJobKey(ctx *harness.Ctx) {
 }
 
 func CheckClaimBeforeTranscribe(ctx *harness.Ctx) {
-	job := stateJob("s3://calls/a.wav")
+	job := hStateJob("s3://calls/a.wav")
 	var calls []int
 	var seen []string
 	var inner []chunkResult
@@ -901,11 +901,11 @@ func CheckClaimBeforeTranscribe(ctx *harness.Ctx) {
 		seen = append(seen, state)
 		if len(calls) == 1 {
 			// The broker redelivers the chunk while this delivery is still at the provider.
-			inner = append(inner, mustRun(ctx, job, 0, transcribe))
+			inner = append(inner, hMustRun(ctx, job, 0, transcribe))
 		}
-		return []jobs.Segment{stateSegment(0)}, nil
+		return []jobs.Segment{hStateSegment(0)}, nil
 	}
-	outer := mustRun(ctx, job, 0, transcribe)
+	outer := hMustRun(ctx, job, 0, transcribe)
 	ctx.Equal(len(calls), 1, "a chunk redelivered while its first delivery was at the ASR provider must be transcribed once (claim the chunk before the call); transcriptions")
 	ctx.Assert(len(inner) == 1 && inner[0].Status == "duplicate", "the redelivery answered %+v, expected duplicate", inner)
 	ctx.Equal(outer.Status, "done", "the first delivery")
@@ -913,77 +913,77 @@ func CheckClaimBeforeTranscribe(ctx *harness.Ctx) {
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	job := stateJob("s3://calls/a.wav")
+	job := hStateJob("s3://calls/a.wav")
 	var calls []int
 	// A second worker's delivery of the same chunk lands right after this one first touches the ledger.
 	rival := ctx.Redis.After("job:"+job+":chunks", func() any {
-		r, err := runChunk(stateBg, job, 0, 3, stateAsr(&calls, 0))
+		r, err := runChunk(hStateBg, job, 0, 3, hStateAsr(&calls, 0))
 		ctx.NoError(err, "the rival delivery failed")
 		return r.Status
 	})
-	mine := mustRun(ctx, job, 0, stateAsr(&calls, 0))
+	mine := hMustRun(ctx, job, 0, hStateAsr(&calls, 0))
 	ctx.Assert(rival.Fired, "nothing touched job:%s:chunks: each job's chunks live in its own ledger hash", job)
 	ctx.Assert(rival.Err == nil, "the rival delivery failed: %v", rival.Err)
 	statuses := []string{mine.Status, fmt.Sprint(rival.Result)}
 	sort.Strings(statuses)
 	ctx.Assert(len(calls) == 1 && statuses[0] == "done" && statuses[1] == "duplicate", "two deliveries racing on the ledger transcribed chunk 0 %d times (%v): reading the state and writing running must be one Lua script", len(calls), statuses)
 	// Two redeliveries of a failed chunk: the second lands right after the first one's second command on the ledger.
-	mustRun(ctx, job, 1, stateBroken)
+	hMustRun(ctx, job, 1, hStateBroken)
 	var again []int
 	theirs := "no rival"
 	var rivalErr error
 	ctx.Redis.After("job:"+job+":chunks", func() any {
 		ctx.Redis.After("job:"+job+":chunks", func() any {
-			r, err := runChunk(stateBg, job, 1, 3, stateAsr(&again, 1))
+			r, err := runChunk(hStateBg, job, 1, 3, hStateAsr(&again, 1))
 			theirs, rivalErr = r.Status, err
 			return nil
 		})
 		return nil
 	})
-	mineAgain := mustRun(ctx, job, 1, stateAsr(&again, 1))
+	mineAgain := hMustRun(ctx, job, 1, hStateAsr(&again, 1))
 	ctx.NoError(rivalErr, "the rival redelivery of failed chunk 1 failed")
 	ctx.Assert(len(again) <= 1, "two redeliveries racing on failed chunk 1 transcribed it %d times (%s, %s): reclaiming a failed chunk must be the same one Lua script", len(again), mineAgain.Status, theirs)
 }
 
-func stateBroken() ([]jobs.Segment, error) { return nil, errors.New("ASR: the span could not be decoded") }
+func hStateBroken() ([]jobs.Segment, error) { return nil, errors.New("ASR: the span could not be decoded") }
 
 func CheckFailureReleases(ctx *harness.Ctx) {
-	job := stateJob("s3://calls/a.wav")
-	result := mustRun(ctx, job, 1, stateBroken)
+	job := hStateJob("s3://calls/a.wav")
+	result := hMustRun(ctx, job, 1, hStateBroken)
 	ctx.Equal(result.Status, "failed", "a chunk whose transcription failed is not progress; the status")
 	state, _ := ctx.Redis.HGet("job:"+job+":chunks", "1")
 	ctx.Equal(state, "failed", "after a failed transcription, job:%s:chunks for chunk 1", job)
 	var calls []int
-	again := mustRun(ctx, job, 1, stateAsr(&calls, 1))
+	again := hMustRun(ctx, job, 1, hStateAsr(&calls, 1))
 	ctx.Assert(again.Status == "done" && len(calls) == 1, "the redelivery of the failed chunk answered %q with %d transcriptions: it must be claimed and transcribed again", again.Status, len(calls))
 	state, _ = ctx.Redis.HGet("job:"+job+":chunks", "1")
 	ctx.Equal(state, "done", "after the redelivery, chunk 1")
 }
 
 func CheckLedgerTtl(ctx *harness.Ctx) {
-	job := stateJob("s3://calls/a.wav")
+	job := hStateJob("s3://calls/a.wav")
 	key := "job:" + job + ":chunks"
 	var calls []int
 	for _, index := range []int{0, 1} {
-		mustRun(ctx, job, index, stateAsr(&calls, index))
+		hMustRun(ctx, job, index, hStateAsr(&calls, index))
 	}
 	ctx.Equal(ctx.Redis.Exists(key), int64(1), "%s must exist after two chunks (keys: %q)", key, ctx.Redis.Keys("*chunks*"))
 	ctx.Equal(ctx.Redis.TTL(key), int64(-1), "a running job's ledger must not expire with chunk 2 still to come; the TTL of %s", key)
-	ctx.Equal(jobs.Get(stateBg, job).Status, "queued", "the job with one chunk to go")
-	mustRun(ctx, job, 2, stateAsr(&calls, 2))
+	ctx.Equal(jobs.Get(hStateBg, job).Status, "queued", "the job with one chunk to go")
+	hMustRun(ctx, job, 2, hStateAsr(&calls, 2))
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(86000 < ttl && ttl <= 86400, "after the last chunk %s has a TTL of %d, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good", key, ttl)
-	ctx.Equal(jobs.Get(stateBg, job).Status, "done", "the job after its last chunk")
+	ctx.Equal(jobs.Get(hStateBg, job).Status, "done", "the job after its last chunk")
 	// Chunk 1 of another job fails while chunks 0 and 2 are done: three fields, two of them done.
-	other := stateJob("s3://calls/b.wav")
+	other := hStateJob("s3://calls/b.wav")
 	key = "job:" + other + ":chunks"
-	mustRun(ctx, other, 0, stateAsr(&calls, 0))
-	mustRun(ctx, other, 1, stateBroken)
-	mustRun(ctx, other, 2, stateAsr(&calls, 2))
-	status := jobs.Get(stateBg, other).Status
+	hMustRun(ctx, other, 0, hStateAsr(&calls, 0))
+	hMustRun(ctx, other, 1, hStateBroken)
+	hMustRun(ctx, other, 2, hStateAsr(&calls, 2))
+	status := jobs.Get(hStateBg, other).Status
 	ctx.Assert(status == "queued" && ctx.Redis.TTL(key) == -1, "with chunk 1 failed and chunks 0 and 2 done the job is %q and %s has a TTL of %d s: a failed chunk is not done, the job is still queued and its ledger must not expire", status, key, ctx.Redis.TTL(key))
-	mustRun(ctx, other, 1, stateAsr(&calls, 1))
-	status, ttl = jobs.Get(stateBg, other).Status, ctx.Redis.TTL(key)
+	hMustRun(ctx, other, 1, hStateAsr(&calls, 1))
+	status, ttl = jobs.Get(hStateBg, other).Status, ctx.Redis.TTL(key)
 	ctx.Assert(status == "done" && 86000 < ttl && ttl <= 86400, "once the failed chunk is redelivered and done, the job is %q and %s has a TTL of %d s, expected done and 86 400 s", status, key, ttl)
 }
 `,
@@ -999,29 +999,29 @@ func CheckLedgerTtl(ctx *harness.Ctx) {
 
 namespace {
 
-std::string stateJob(const std::string& ref) { return jobs::create("t-1", ref, ref, 90, "en", 3).job_id; }
+std::string hStateJob(const std::string& ref) { return jobs::create("t-1", ref, ref, 90, "en", 3).job_id; }
 
-jobs::Segment stateSegment(int index) { return {index, index * 30000, index * 30000 + 10000, "A", "chunk " + std::to_string(index)}; }
+jobs::Segment hStateSegment(int index) { return {index, index * 30000, index * 30000 + 10000, "A", "chunk " + std::to_string(index)}; }
 
 // A transcribe() for chunk index that records its calls.
-std::function<std::vector<jobs::Segment>()> stateAsr(std::shared_ptr<std::vector<int>> calls, int index) {
+std::function<std::vector<jobs::Segment>()> hStateAsr(std::shared_ptr<std::vector<int>> calls, int index) {
   return [calls, index] {
     calls->push_back(index);
-    return std::vector<jobs::Segment>{stateSegment(index)};
+    return std::vector<jobs::Segment>{hStateSegment(index)};
   };
 }
 
 // A transcribe() whose provider cannot decode the span.
-std::vector<jobs::Segment> stateBroken() { throw std::runtime_error("ASR: the span could not be decoded"); }
+std::vector<jobs::Segment> hStateBroken() { throw std::runtime_error("ASR: the span could not be decoded"); }
 
 }  // namespace
 
 void CheckJobKey(harness::Ctx& ctx) {
-  const std::string a = stateJob("s3://calls/a.wav");
-  const std::string b = stateJob("s3://calls/b.wav");
+  const std::string a = hStateJob("s3://calls/a.wav");
+  const std::string b = hStateJob("s3://calls/b.wav");
   auto calls = std::make_shared<std::vector<int>>();
-  const auto first = runChunk(a, 0, 3, stateAsr(calls, 0));
-  const auto second = runChunk(b, 0, 3, stateAsr(calls, 0));
+  const auto first = runChunk(a, 0, 3, hStateAsr(calls, 0));
+  const auto second = runChunk(b, 0, 3, hStateAsr(calls, 0));
   ctx.Equal(first.status, "done", "chunk 0 of %s", a);
   ctx.Assert(second.status == "done" && calls->size() == 2, "chunk 0 of %s answered %q after chunk 0 of %s was done: the two jobs share one ledger, so the second job's chunk is never transcribed", b, second.status, a);
   for (const std::string& job : {a, b}) {
@@ -1030,7 +1030,7 @@ void CheckJobKey(harness::Ctx& ctx) {
 }
 
 void CheckClaimBeforeTranscribe(harness::Ctx& ctx) {
-  const std::string job = stateJob("s3://calls/a.wav");
+  const std::string job = hStateJob("s3://calls/a.wav");
   int calls = 0;
   std::vector<std::string> seen;
   std::vector<std::string> inner;
@@ -1039,7 +1039,7 @@ void CheckClaimBeforeTranscribe(harness::Ctx& ctx) {
     seen.push_back(ctx.Redis.HGet("job:" + job + ":chunks", "0").value_or(""));
     // The broker redelivers the chunk while this delivery is still at the provider.
     if (calls == 1) inner.push_back(runChunk(job, 0, 3, transcribe).status);
-    return std::vector<jobs::Segment>{stateSegment(0)};
+    return std::vector<jobs::Segment>{hStateSegment(0)};
   };
   const auto outer = runChunk(job, 0, 3, transcribe);
   ctx.Equal(calls, 1, "a chunk redelivered while its first delivery was at the ASR provider must be transcribed once (claim the chunk before the call); transcriptions");
@@ -1049,7 +1049,7 @@ void CheckClaimBeforeTranscribe(harness::Ctx& ctx) {
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  const std::string job = stateJob("s3://calls/a.wav");
+  const std::string job = hStateJob("s3://calls/a.wav");
   auto calls = std::make_shared<std::vector<int>>();
   auto fired = std::make_shared<bool>(false);
   auto theirs = std::make_shared<std::string>();
@@ -1058,68 +1058,68 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   ctx.Redis.After("job:" + job + ":chunks", [=] {
     *fired = true;
     try {
-      *theirs = runChunk(job, 0, 3, stateAsr(calls, 0)).status;
+      *theirs = runChunk(job, 0, 3, hStateAsr(calls, 0)).status;
     } catch (const std::exception& e) {
       *error = e.what();
     }
   });
-  const auto mine = runChunk(job, 0, 3, stateAsr(calls, 0));
+  const auto mine = runChunk(job, 0, 3, hStateAsr(calls, 0));
   ctx.Assert(*fired, "nothing touched job:%s:chunks: each job's chunks live in its own ledger hash", job);
   ctx.Assert(!error->has_value(), "the rival delivery failed: %s", error->value_or(""));
   std::vector<std::string> statuses = {mine.status, *theirs};
   std::sort(statuses.begin(), statuses.end());
   ctx.Assert(calls->size() == 1 && statuses[0] == "done" && statuses[1] == "duplicate", "two deliveries racing on the ledger transcribed chunk 0 %d times (%q): reading the state and writing running must be one Lua script", calls->size(), statuses);
   // Two redeliveries of a failed chunk: the second lands right after the first one's second command on the ledger.
-  runChunk(job, 1, 3, stateBroken);
+  runChunk(job, 1, 3, hStateBroken);
   auto again = std::make_shared<std::vector<int>>();
   auto theirsAgain = std::make_shared<std::string>("no rival");
   harness::Ctx* probes = &ctx;
   ctx.Redis.After("job:" + job + ":chunks", [=] {
     probes->Redis.After("job:" + job + ":chunks", [=] {
       try {
-        *theirsAgain = runChunk(job, 1, 3, stateAsr(again, 1)).status;
+        *theirsAgain = runChunk(job, 1, 3, hStateAsr(again, 1)).status;
       } catch (const std::exception& e) {
         *error = e.what();
       }
     });
   });
-  const auto mineAgain = runChunk(job, 1, 3, stateAsr(again, 1));
+  const auto mineAgain = runChunk(job, 1, 3, hStateAsr(again, 1));
   ctx.Assert(!error->has_value(), "the rival redelivery of failed chunk 1 failed: %s", error->value_or(""));
   ctx.Assert(again->size() <= 1, "two redeliveries racing on failed chunk 1 transcribed it %d times (%s, %s): reclaiming a failed chunk must be the same one Lua script", again->size(), mineAgain.status, *theirsAgain);
 }
 
 void CheckFailureReleases(harness::Ctx& ctx) {
-  const std::string job = stateJob("s3://calls/a.wav");
-  const auto result = runChunk(job, 1, 3, stateBroken);
+  const std::string job = hStateJob("s3://calls/a.wav");
+  const auto result = runChunk(job, 1, 3, hStateBroken);
   ctx.Equal(result.status, "failed", "a chunk whose transcription threw is not progress; the status");
   ctx.Equal(ctx.Redis.HGet("job:" + job + ":chunks", "1").value_or(""), "failed", "after a failed transcription, job:%s:chunks for chunk 1", job);
   auto calls = std::make_shared<std::vector<int>>();
-  const auto again = runChunk(job, 1, 3, stateAsr(calls, 1));
+  const auto again = runChunk(job, 1, 3, hStateAsr(calls, 1));
   ctx.Assert(again.status == "done" && calls->size() == 1, "the redelivery of the failed chunk answered %q with %d transcriptions: it must be claimed and transcribed again", again.status, calls->size());
   ctx.Equal(ctx.Redis.HGet("job:" + job + ":chunks", "1").value_or(""), "done", "after the redelivery, chunk 1");
 }
 
 void CheckLedgerTtl(harness::Ctx& ctx) {
-  const std::string job = stateJob("s3://calls/a.wav");
+  const std::string job = hStateJob("s3://calls/a.wav");
   const std::string key = "job:" + job + ":chunks";
   auto calls = std::make_shared<std::vector<int>>();
-  for (int index : {0, 1}) runChunk(job, index, 3, stateAsr(calls, index));
+  for (int index : {0, 1}) runChunk(job, index, 3, hStateAsr(calls, index));
   ctx.Equal(ctx.Redis.Exists(key), 1, "%s must exist after two chunks (keys: %q)", key, ctx.Redis.Keys("*chunks*"));
   ctx.Equal(ctx.Redis.TTL(key), -1, "a running job's ledger must not expire with chunk 2 still to come; the TTL of %s", key);
   ctx.Equal(jobs::get(job)->status, "queued", "the job with one chunk to go");
-  runChunk(job, 2, 3, stateAsr(calls, 2));
+  runChunk(job, 2, 3, hStateAsr(calls, 2));
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(86000 < ttl && ttl <= 86400, "after the last chunk %s has a TTL of %d, expected 86 400 s: a finished job's ledger otherwise stays in Redis for good", key, ttl);
   ctx.Equal(jobs::get(job)->status, "done", "the job after its last chunk");
   // Chunk 1 of another job fails while chunks 0 and 2 are done: three fields, two of them done.
-  const std::string other = stateJob("s3://calls/b.wav");
+  const std::string other = hStateJob("s3://calls/b.wav");
   const std::string otherKey = "job:" + other + ":chunks";
-  runChunk(other, 0, 3, stateAsr(calls, 0));
-  runChunk(other, 1, 3, stateBroken);
-  runChunk(other, 2, 3, stateAsr(calls, 2));
+  runChunk(other, 0, 3, hStateAsr(calls, 0));
+  runChunk(other, 1, 3, hStateBroken);
+  runChunk(other, 2, 3, hStateAsr(calls, 2));
   const std::string status = jobs::get(other)->status;
   ctx.Assert(status == "queued" && ctx.Redis.TTL(otherKey) == -1, "with chunk 1 failed and chunks 0 and 2 done the job is %q and %s has a TTL of %d s: a failed chunk is not done, the job is still queued and its ledger must not expire", status, otherKey, ctx.Redis.TTL(otherKey));
-  runChunk(other, 1, 3, stateAsr(calls, 1));
+  runChunk(other, 1, 3, hStateAsr(calls, 1));
   const std::string finished = jobs::get(other)->status;
   const long long otherTtl = ctx.Redis.TTL(otherKey);
   ctx.Assert(finished == "done" && 86000 < otherTtl && otherTtl <= 86400, "once the failed chunk is redelivered and done, the job is %q and %s has a TTL of %d s, expected done and 86 400 s", finished, otherKey, otherTtl);

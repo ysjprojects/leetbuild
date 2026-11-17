@@ -830,35 +830,35 @@ import (
 	"leetbuild/harness"
 )
 
-const indexedTopic = "asset.indexed"
+const kHIndexedTopic = "asset.indexed"
 
 var (
-	eventsBg        = context.Background()
-	eventsCaptioned = assets.Captioned{Caption: "a red kettle on a stove", Source: "vision"}
+	hEventsBg        = context.Background()
+	hEventsCaptioned = assets.Captioned{Caption: "a red kettle on a stove", Source: "vision"}
 )
 
-func eventsAsset(ctx *harness.Ctx, n int) assets.Asset {
-	a, err := assets.Create(eventsBg, "t1", "sha256:"+strings.Repeat(string(rune('0'+n)), 64), "image/png", 48213, "")
+func hEventsAsset(ctx *harness.Ctx, n int) assets.Asset {
+	a, err := assets.Create(hEventsBg, "t1", "sha256:"+strings.Repeat(string(rune('0'+n)), 64), "image/png", 48213, "")
 	ctx.NoError(err, "creating asset %d failed", n)
 	return *a
 }
 
-func eventsPublish(ctx *harness.Ctx, a assets.Asset, c assets.Captioned) bool {
-	ok, err := indexAndPublish(eventsBg, a, c)
+func hEventsPublish(ctx *harness.Ctx, a assets.Asset, c assets.Captioned) bool {
+	ok, err := indexAndPublish(hEventsBg, a, c)
 	ctx.NoError(err, "indexAndPublish(%s) failed (a failed delivery is answered with an outbox row and false)", a.AssetID)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -866,26 +866,26 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckAssetKey(ctx *harness.Ctx) {
-	a1, a2 := eventsAsset(ctx, 1), eventsAsset(ctx, 2)
-	eventsPublish(ctx, a1, eventsCaptioned)
-	eventsPublish(ctx, a2, eventsCaptioned)
-	eventsPublish(ctx, a1, assets.Captioned{Caption: "a red kettle, recaptioned", Source: "vision"})
+	a1, a2 := hEventsAsset(ctx, 1), hEventsAsset(ctx, 2)
+	hEventsPublish(ctx, a1, hEventsCaptioned)
+	hEventsPublish(ctx, a2, hEventsCaptioned)
+	hEventsPublish(ctx, a1, assets.Captioned{Caption: "a red kettle, recaptioned", Source: "vision"})
 	ctx.Settle()
-	records := ctx.Kafka.Records(indexedTopic)
+	records := ctx.Kafka.Records(kHIndexedTopic)
 	ctx.Equal(len(records), 3, "three calls must produce three records on asset.indexed; the records")
-	ctx.Equal(ctx.Kafka.Keys(indexedTopic), []string{"a-1", "a-2", "a-1"}, "the records must be keyed by the asset ids (keyed by tenant, a busy tenant's events pile onto one partition)")
+	ctx.Equal(ctx.Kafka.Keys(kHIndexedTopic), []string{"a-1", "a-2", "a-1"}, "the records must be keyed by the asset ids (keyed by tenant, a busy tenant's events pile onto one partition)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "a-1's two events must land on one partition, in order; the partitions")
 }
 
 func CheckPayloadFacts(ctx *harness.Ctx) {
-	a1 := eventsAsset(ctx, 1)
-	ok := eventsPublish(ctx, a1, eventsCaptioned)
+	a1 := hEventsAsset(ctx, 1)
+	ok := hEventsPublish(ctx, a1, hEventsCaptioned)
 	ctx.Equal(ok, true, "indexAndPublish's result after the broker acknowledged the event")
 	ctx.Settle()
-	values := ctx.Kafka.Values(indexedTopic)
+	values := ctx.Kafka.Values(kHIndexedTopic)
 	ctx.Equal(len(values), 1, "one call must produce one record; the records")
 	ctx.Assert(!strings.Contains(values[0], "http"), "the event carries a URL: %s. The topic is kept and replayed to every consumer; a link to the original bytes there skips the signed, expiring read path", values[0])
-	ctx.Assert(!strings.Contains(values[0], eventsCaptioned.Caption), "the event carries the caption: %s. The topic is kept and replayed to every consumer; the event carries the asset's facts, not its content", values[0])
+	ctx.Assert(!strings.Contains(values[0], hEventsCaptioned.Caption), "the event carries the caption: %s. The topic is kept and replayed to every consumer; the event carries the asset's facts, not its content", values[0])
 	var p map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &p), "the payload must be JSON")
 	got := map[string]any{}
@@ -895,9 +895,9 @@ func CheckPayloadFacts(ctx *harness.Ctx) {
 	want := map[string]any{"asset_id": "a-1", "tenant": "t1", "checksum": a1.Checksum, "mime": "image/png", "embedding_ids": []any{"a-1:image", "a-1:caption"}, "degraded": false}
 	ctx.Equal(got, want, "the event's facts (a consumer needs the checksum to verify the bytes and the embedding ids to find the vectors)")
 	// An asset indexed without a caption: one vector, and the event says it is degraded.
-	eventsPublish(ctx, eventsAsset(ctx, 2), assets.Captioned{Source: "none", Degraded: true})
+	hEventsPublish(ctx, hEventsAsset(ctx, 2), assets.Captioned{Source: "none", Degraded: true})
 	ctx.Settle()
-	values = ctx.Kafka.Values(indexedTopic)
+	values = ctx.Kafka.Values(kHIndexedTopic)
 	var p2 map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[len(values)-1]), &p2), "the payload must be JSON")
 	got = map[string]any{"asset_id": p2["asset_id"], "embedding_ids": p2["embedding_ids"], "degraded": p2["degraded"]}
@@ -906,51 +906,51 @@ func CheckPayloadFacts(ctx *harness.Ctx) {
 }
 
 func CheckIndexBeforePublish(ctx *harness.Ctx) {
-	a1 := eventsAsset(ctx, 1)
-	probe := ctx.Redis.After("index:a-1", func() any { return len(ctx.Kafka.Records(indexedTopic)) })
-	eventsPublish(ctx, a1, eventsCaptioned)
+	a1 := hEventsAsset(ctx, 1)
+	probe := ctx.Redis.After("index:a-1", func() any { return len(ctx.Kafka.Records(kHIndexedTopic)) })
+	hEventsPublish(ctx, a1, hEventsCaptioned)
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "indexAndPublish never wrote the index (index:a-1)")
 	ctx.Equal(probe.Result, 0, "when the index was written the topic already held events: a consumer reacting to asset.indexed looks the vectors up before they exist. Write the index, then produce; the records at the index write")
-	ctx.Equal(len(ctx.Kafka.Records(indexedTopic)), 1, "the event must still be produced after the index write; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHIndexedTopic)), 1, "the event must still be produced after the index write; the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(indexedTopic, 1)
-	ok := eventsPublish(ctx, eventsAsset(ctx, 1), eventsCaptioned)
+	ctx.Kafka.FailNext(kHIndexedTopic, 1)
+	ok := hEventsPublish(ctx, hEventsAsset(ctx, 1), hEventsCaptioned)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row nothing ever tells the platform a-1 is searchable; the rows")
-	ctx.Assert(rows[0].Topic == indexedTopic && rows[0].Key == "a-1" && rows[0].Payload["asset_id"] == "a-1", "the outbox row is %+v, expected the topic, the key a-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHIndexedTopic && rows[0].Key == "a-1" && rows[0].Payload["asset_id"] == "a-1", "the outbox row is %+v, expected the topic, the key a-1 and the payload", rows[0])
 	ids, _ := json.Marshal(rows[0].Payload["embedding_ids"])
 	ctx.Assert(rows[0].Payload["checksum"] == "sha256:"+strings.Repeat("1", 64) && string(ids) == \`["a-1:image","a-1:caption"]\`, "the outbox row's payload is %v: the relay publishes it as the event, so it is the event's whole payload", rows[0].Payload)
 	ctx.Equal(ok, false, "indexAndPublish's result after a failed delivery")
 	ctx.Equal(ctx.Redis.Exists("index:a-1"), int64(1), "the index write must stand when only the produce failed")
-	ctx.Kafka.Stall(indexedTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHIndexedTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsAsset(ctx, 2), eventsCaptioned)
+	ok = hEventsPublish(ctx, hEventsAsset(ctx, 2), hEventsCaptioned)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "indexAndPublish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["asset_id"] == "a-2", "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "indexAndPublish's result without a delivery report")
 	// The outbox write fails too (the broker still does not answer): the caller must hear of it, or the event is lost with nobody told.
 	ctx.Redis.Do("DEL", "outbox")
 	ctx.Redis.Do("SET", "outbox", "not a list")
-	a3 := eventsAsset(ctx, 3)
-	ok, err := indexAndPublish(eventsBg, a3, eventsCaptioned)
+	a3 := hEventsAsset(ctx, 3)
+	ok, err := indexAndPublish(hEventsBg, a3, hEventsCaptioned)
 	ctx.Assert(err != nil, "the delivery and then the outbox write failed, and indexAndPublish returned %v with no error: the event is in neither place and nothing says so. A failed outbox write must reach the caller", ok)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(indexedTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsAsset(ctx, 1), eventsCaptioned)
+	ctx.Kafka.LoseAcks(kHIndexedTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsAsset(ctx, 1), hEventsCaptioned)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(indexedTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsAsset(ctx, 2), eventsCaptioned)
+	ctx.Equal(len(ctx.Kafka.Records(kHIndexedTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsAsset(ctx, 2), hEventsCaptioned)
 	ctx.Settle()
-	lost := ctx.Kafka.Failover(indexedTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(indexedTopic)), 2, "a leader failover lost %d record(s): with acks=1 the leader alone acknowledged them. Use acks=all; the records", lost)
+	lost := ctx.Kafka.Failover(kHIndexedTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHIndexedTopic)), 2, "a leader failover lost %d record(s): with acks=1 the leader alone acknowledged them. Use acks=all; the records", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -962,13 +962,13 @@ func CheckIdempotentProducer(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kIndexedTopic = "asset.indexed";
+const std::string kHIndexedTopic = "asset.indexed";
 
-assets::Captioned captioned(const std::string& caption = "a red kettle on a stove") { return assets::Captioned{caption, "vision", false}; }
+assets::Captioned hCaptioned(const std::string& caption = "a red kettle on a stove") { return assets::Captioned{caption, "vision", false}; }
 
-assets::Asset eventsAsset(int n) { return assets::create("t1", "sha256:" + std::string(64, static_cast<char>('0' + n)), "image/png", 48213, ""); }
+assets::Asset hEventsAsset(int n) { return assets::create("t1", "sha256:" + std::string(64, static_cast<char>('0' + n)), "image/png", 48213, ""); }
 
-bool eventsPublish(harness::Ctx& ctx, const assets::Asset& a, const assets::Captioned& c) {
+bool hEventsPublish(harness::Ctx& ctx, const assets::Asset& a, const assets::Captioned& c) {
   try {
     return indexAndPublish(a, c);
   } catch (const std::exception& e) {
@@ -978,7 +978,7 @@ bool eventsPublish(harness::Ctx& ctx, const assets::Asset& a, const assets::Capt
   return false;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -988,31 +988,31 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckAssetKey(harness::Ctx& ctx) {
-  const assets::Asset a1 = eventsAsset(1);
-  const assets::Asset a2 = eventsAsset(2);
-  eventsPublish(ctx, a1, captioned());
-  eventsPublish(ctx, a2, captioned());
-  eventsPublish(ctx, a1, captioned("a red kettle, recaptioned"));
+  const assets::Asset a1 = hEventsAsset(1);
+  const assets::Asset a2 = hEventsAsset(2);
+  hEventsPublish(ctx, a1, hCaptioned());
+  hEventsPublish(ctx, a2, hCaptioned());
+  hEventsPublish(ctx, a1, hCaptioned("a red kettle, recaptioned"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kIndexedTopic);
+  const auto records = ctx.Kafka.Records(kHIndexedTopic);
   ctx.Equal(records.size(), 3, "three calls must produce three records on asset.indexed; the records");
-  ctx.Equal(ctx.Kafka.Keys(kIndexedTopic), {"a-1", "a-2", "a-1"}, "the records must be keyed by the asset ids (keyed by tenant, a busy tenant's events pile onto one partition)");
+  ctx.Equal(ctx.Kafka.Keys(kHIndexedTopic), {"a-1", "a-2", "a-1"}, "the records must be keyed by the asset ids (keyed by tenant, a busy tenant's events pile onto one partition)");
   ctx.Equal(records[0].Partition, records[2].Partition, "a-1's two events must land on one partition, in order; the partitions");
 }
 
 void CheckPayloadFacts(harness::Ctx& ctx) {
-  const assets::Asset a1 = eventsAsset(1);
-  const bool ok = eventsPublish(ctx, a1, captioned());
+  const assets::Asset a1 = hEventsAsset(1);
+  const bool ok = hEventsPublish(ctx, a1, hCaptioned());
   ctx.Equal(ok, true, "indexAndPublish's result after the broker acknowledged the event");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kIndexedTopic);
+  const auto values = ctx.Kafka.Values(kHIndexedTopic);
   ctx.Equal(values.size(), 1, "one call must produce one record; the records");
   ctx.Assert(values[0].find("http") == std::string::npos,
              "the event carries a URL: %s. The topic is kept and replayed to every consumer; a link to the original bytes there skips the signed, expiring read path", values[0]);
@@ -1026,9 +1026,9 @@ void CheckPayloadFacts(harness::Ctx& ctx) {
                                {"embedding_ids", {"a-1:image", "a-1:caption"}}, {"degraded", false}};
   ctx.Equal(got, want, "the event's facts (a consumer needs the checksum to verify the bytes and the embedding ids to find the vectors)");
   // An asset indexed without a caption: one vector, and the event says it is degraded.
-  eventsPublish(ctx, eventsAsset(2), assets::Captioned{"", "none", true});
+  hEventsPublish(ctx, hEventsAsset(2), assets::Captioned{"", "none", true});
   ctx.Settle();
-  const auto all = ctx.Kafka.Values(kIndexedTopic);
+  const auto all = ctx.Kafka.Values(kHIndexedTopic);
   const auto p2 = nlohmann::json::parse(all.back(), nullptr, false);
   ctx.Assert(p2.is_object(), "the payload must be JSON, got %s", all.back());
   const nlohmann::json got2 = {{"asset_id", p2.value("asset_id", nlohmann::json())}, {"embedding_ids", p2.value("embedding_ids", nlohmann::json())}, {"degraded", p2.value("degraded", nlohmann::json())}};
@@ -1037,50 +1037,50 @@ void CheckPayloadFacts(harness::Ctx& ctx) {
 }
 
 void CheckIndexBeforePublish(harness::Ctx& ctx) {
-  const assets::Asset a1 = eventsAsset(1);
+  const assets::Asset a1 = hEventsAsset(1);
   size_t atIndex = 999;
   bool fired = false;
   ctx.Redis.After("index:a-1", [&] {
     fired = true;
-    atIndex = ctx.Kafka.Records(kIndexedTopic).size();
+    atIndex = ctx.Kafka.Records(kHIndexedTopic).size();
   });
-  eventsPublish(ctx, a1, captioned());
+  hEventsPublish(ctx, a1, hCaptioned());
   ctx.Settle();
   ctx.Assert(fired, "indexAndPublish never wrote the index (index:a-1)");
   ctx.Equal(atIndex, 0,
             "when the index was written the topic already held events: a consumer reacting to asset.indexed looks the vectors up before they exist. Write the index, then produce; the records at the index write");
-  ctx.Equal(ctx.Kafka.Records(kIndexedTopic).size(), 1, "the event must still be produced after the index write; the records");
+  ctx.Equal(ctx.Kafka.Records(kHIndexedTopic).size(), 1, "the event must still be produced after the index write; the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kIndexedTopic, 1);
-  bool ok = eventsPublish(ctx, eventsAsset(1), captioned());
+  ctx.Kafka.FailNext(kHIndexedTopic, 1);
+  bool ok = hEventsPublish(ctx, hEventsAsset(1), hCaptioned());
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row nothing ever tells the platform a-1 is searchable; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kIndexedTopic && eventsField(rows[0], "key") == "a-1" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "asset_id") == "a-1",
+  ctx.Assert(hEventsField(rows[0], "topic") == kHIndexedTopic && hEventsField(rows[0], "key") == "a-1" && rows[0].contains("payload") &&
+                 hEventsField(rows[0]["payload"], "asset_id") == "a-1",
              "the outbox row is %s, expected the topic, the key a-1 and the payload", rows[0].dump());
-  ctx.Assert(eventsField(rows[0]["payload"], "checksum") == "sha256:" + std::string(64, '1') && rows[0]["payload"].value("embedding_ids", nlohmann::json()) == nlohmann::json{"a-1:image", "a-1:caption"},
+  ctx.Assert(hEventsField(rows[0]["payload"], "checksum") == "sha256:" + std::string(64, '1') && rows[0]["payload"].value("embedding_ids", nlohmann::json()) == nlohmann::json{"a-1:image", "a-1:caption"},
              "the outbox row's payload is %s: the relay publishes it as the event, so it is the event's whole payload", rows[0]["payload"].dump());
   ctx.Equal(ok, false, "indexAndPublish's result after a failed delivery");
   ctx.Equal(ctx.Redis.Exists("index:a-1"), 1, "the index write must stand when only the produce failed");
-  ctx.Kafka.Stall(kIndexedTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHIndexedTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = eventsPublish(ctx, eventsAsset(2), captioned());
+  ok = hEventsPublish(ctx, hEventsAsset(2), hCaptioned());
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "indexAndPublish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "asset_id") == "a-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "asset_id") == "a-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "indexAndPublish's result without a delivery report");
   // The outbox write fails too (the broker still does not answer): the caller must hear of it, or the event is lost with nobody told.
   ctx.Redis.Do("DEL", "outbox");
   ctx.Redis.Do("SET", "outbox", "not a list");
-  const assets::Asset a3 = eventsAsset(3);
+  const assets::Asset a3 = hEventsAsset(3);
   bool raised = false;
   try {
-    ok = indexAndPublish(a3, captioned());
+    ok = indexAndPublish(a3, hCaptioned());
   } catch (const std::exception&) {
     raised = true;
   }
@@ -1088,15 +1088,15 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kIndexedTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  eventsPublish(ctx, eventsAsset(1), captioned());
+  ctx.Kafka.LoseAcks(kHIndexedTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hEventsPublish(ctx, hEventsAsset(1), hCaptioned());
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kIndexedTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHIndexedTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  eventsPublish(ctx, eventsAsset(2), captioned());
+  hEventsPublish(ctx, hEventsAsset(2), hCaptioned());
   ctx.Settle();
-  const int lost = ctx.Kafka.Failover(kIndexedTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kIndexedTopic).size(), 2, "a leader failover lost %d record(s): with acks=1 the leader alone acknowledged them. Use acks=all; the records", lost);
+  const int lost = ctx.Kafka.Failover(kHIndexedTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHIndexedTopic).size(), 2, "a leader failover lost %d record(s): with acks=1 the leader alone acknowledged them. Use acks=all; the records", lost);
 }
 `,
   },

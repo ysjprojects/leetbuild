@@ -952,21 +952,21 @@ import (
 	"booking/tz"
 )
 
-type apiRange struct {
+type HApiRange struct {
 	ResourceID string \`json:"resource_id"\`
 	Start      string \`json:"start"\`
 	End        string \`json:"end"\`
 }
 
 // apiBody is a range starting startIn from now, as the client sends it.
-func apiBody(startIn, length time.Duration) apiRange {
+func hApiBody(startIn, length time.Duration) HApiRange {
 	now := time.Now().Unix()
-	return apiRange{"r1", tz.FormatInstant(now + int64(startIn.Seconds())), tz.FormatInstant(now + int64(startIn.Seconds()) + int64(length.Seconds()))}
+	return HApiRange{"r1", tz.FormatInstant(now + int64(startIn.Seconds())), tz.FormatInstant(now + int64(startIn.Seconds()) + int64(length.Seconds()))}
 }
 
 // apiClient serves the learner's routes over step 2's hold map, which the harness stands in for:
 // every slot free and held together, the hold key with the payment window.
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	takeHold = func(_ context.Context, resourceID string, fields []string) (*store.Hold, error) {
 		held := ctx.Redis.HGetAll(slots.Key(resourceID))
 		for _, f := range fields {
@@ -986,7 +986,7 @@ func apiClient(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, body apiRange, header ...string) *harness.Response {
+func hApiPost(c *harness.HTTP, body HApiRange, header ...string) *harness.Response {
 	if len(header) == 0 {
 		header = []string{"X-Tenant-Id", "t1", "Idempotency-Key", "k1"}
 	}
@@ -994,7 +994,7 @@ func apiPost(c *harness.HTTP, body apiRange, header ...string) *harness.Response
 }
 
 // apiField is a string field of the JSON body ("" when absent).
-func apiField(r *harness.Response, field string) string {
+func hApiField(r *harness.Response, field string) string {
 	var body map[string]any
 	if err := json.Unmarshal(r.Body, &body); err != nil {
 		return ""
@@ -1003,20 +1003,20 @@ func apiField(r *harness.Response, field string) string {
 	return s
 }
 
-func apiError(r *harness.Response) string { return apiField(r, "error") }
+func hApiError(r *harness.Response) string { return hApiField(r, "error") }
 
-func apiNothingHeld(ctx *harness.Ctx, what string) {
+func hApiNothingHeld(ctx *harness.Ctx, what string) {
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "%s must leave nothing behind, Redis holds %q", what, keys)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	body := apiBody(time.Hour, time.Hour)
-	r := apiPost(c, body)
+	c := hApiClient(ctx)
+	body := hApiBody(time.Hour, time.Hour)
+	r := hApiPost(c, body)
 	ctx.Equal(r.Status, 201, "POST /v1/bookings for a free future hour (%s)", r.Text())
-	bookingID := apiField(r, "booking_id")
-	holdID := apiField(r, "hold_id")
+	bookingID := hApiField(r, "booking_id")
+	holdID := hApiField(r, "hold_id")
 	ctx.Assert(bookingID != "" && holdID != "", "the answer must carry booking_id and hold_id: %s", r.Text())
 	start, _ := tz.ParseInstant(body.Start)
 	end, _ := tz.ParseInstant(body.End)
@@ -1029,61 +1029,61 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckRangeOrder(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(time.Hour, 0))
-	ctx.Assert(r.Status == 400 && apiError(r) == "invalid_range", "a zero-length range answered %d %s, expected 400 invalid_range", r.Status, r.Text())
-	apiNothingHeld(ctx, "a rejected range")
-	r = apiPost(c, apiBody(2*time.Hour, -time.Hour))
-	ctx.Assert(r.Status == 400 && apiError(r) == "invalid_range", "a range with end before start answered %d %s, expected 400 invalid_range", r.Status, r.Text())
-	apiNothingHeld(ctx, "a rejected range")
-	r = apiPost(c, apiRange{"r1", "tomorrow", "later"})
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(time.Hour, 0))
+	ctx.Assert(r.Status == 400 && hApiError(r) == "invalid_range", "a zero-length range answered %d %s, expected 400 invalid_range", r.Status, r.Text())
+	hApiNothingHeld(ctx, "a rejected range")
+	r = hApiPost(c, hApiBody(2*time.Hour, -time.Hour))
+	ctx.Assert(r.Status == 400 && hApiError(r) == "invalid_range", "a range with end before start answered %d %s, expected 400 invalid_range", r.Status, r.Text())
+	hApiNothingHeld(ctx, "a rejected range")
+	r = hApiPost(c, HApiRange{"r1", "tomorrow", "later"})
 	ctx.Equal(r.Status, 400, "instants that do not parse")
 }
 
 func CheckPastStart(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(-time.Hour, 2*time.Hour))
-	ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past", "a range starting an hour ago answered %d %s, expected 422 range_in_past", r.Status, r.Text())
-	apiNothingHeld(ctx, "a range in the past")
-	r = apiPost(c, apiBody(-2*time.Minute, time.Hour))
-	ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past", "a range that started two minutes ago answered %d %s, expected 422 range_in_past", r.Status, r.Text())
-	apiNothingHeld(ctx, "a range in the past")
-	r = apiPost(c, apiBody(time.Minute, time.Hour))
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(-time.Hour, 2*time.Hour))
+	ctx.Assert(r.Status == 422 && hApiError(r) == "range_in_past", "a range starting an hour ago answered %d %s, expected 422 range_in_past", r.Status, r.Text())
+	hApiNothingHeld(ctx, "a range in the past")
+	r = hApiPost(c, hApiBody(-2*time.Minute, time.Hour))
+	ctx.Assert(r.Status == 422 && hApiError(r) == "range_in_past", "a range that started two minutes ago answered %d %s, expected 422 range_in_past", r.Status, r.Text())
+	hApiNothingHeld(ctx, "a range in the past")
+	r = hApiPost(c, hApiBody(time.Minute, time.Hour))
 	ctx.Equal(r.Status, 201, "a range starting in a minute (%s)", r.Text())
 }
 
 func CheckHorizon(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(91*24*time.Hour, time.Hour))
-	ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon", "a range 91 days out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text())
-	apiNothingHeld(ctx, "a range beyond the horizon")
-	r = apiPost(c, apiBody(89*24*time.Hour+23*time.Hour, 2*time.Hour))
-	ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon", "a range that starts inside the horizon but ends 90 days and an hour out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text())
-	apiNothingHeld(ctx, "a range beyond the horizon")
-	r = apiPost(c, apiBody(89*24*time.Hour, time.Hour))
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(91*24*time.Hour, time.Hour))
+	ctx.Assert(r.Status == 422 && hApiError(r) == "beyond_horizon", "a range 91 days out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text())
+	hApiNothingHeld(ctx, "a range beyond the horizon")
+	r = hApiPost(c, hApiBody(89*24*time.Hour+23*time.Hour, 2*time.Hour))
+	ctx.Assert(r.Status == 422 && hApiError(r) == "beyond_horizon", "a range that starts inside the horizon but ends 90 days and an hour out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text())
+	hApiNothingHeld(ctx, "a range beyond the horizon")
+	r = hApiPost(c, hApiBody(89*24*time.Hour, time.Hour))
 	ctx.Equal(r.Status, 201, "a range 89 days out (%s)", r.Text())
 }
 
 func CheckReplay(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	body := apiBody(time.Hour, time.Hour)
-	r := apiPost(c, body, "X-Tenant-Id", "t1")
-	ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key", "a request without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key", r.Status, r.Text())
-	r = apiPost(c, apiBody(-time.Hour, 2*time.Hour), "X-Tenant-Id", "t1")
-	ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key", "a past range without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key: the key is the first rule", r.Status, r.Text())
-	first := apiPost(c, body)
+	c := hApiClient(ctx)
+	body := hApiBody(time.Hour, time.Hour)
+	r := hApiPost(c, body, "X-Tenant-Id", "t1")
+	ctx.Assert(r.Status == 400 && hApiError(r) == "missing_idempotency_key", "a request without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key", r.Status, r.Text())
+	r = hApiPost(c, hApiBody(-time.Hour, 2*time.Hour), "X-Tenant-Id", "t1")
+	ctx.Assert(r.Status == 400 && hApiError(r) == "missing_idempotency_key", "a past range without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key: the key is the first rule", r.Status, r.Text())
+	first := hApiPost(c, body)
 	ctx.Equal(first.Status, 201, "the first booking (%s)", first.Text())
-	again := apiPost(c, body) // the client timed out and retried with the same key
+	again := hApiPost(c, body) // the client timed out and retried with the same key
 	ctx.Equal(again.Status, 200, "the replayed request must answer the first booking (%s)", again.Text())
-	ctx.Equal(apiField(again, "booking_id"), apiField(first, "booking_id"), "the replay must answer the first booking")
-	holdID := apiField(first, "hold_id")
+	ctx.Equal(hApiField(again, "booking_id"), hApiField(first, "booking_id"), "the replay must answer the first booking")
+	holdID := hApiField(first, "hold_id")
 	ctx.Equal(ctx.Redis.Keys("hold:*"), []string{slots.HoldKey(holdID)}, "a replay must not take a second hold; the hold keys")
-	other := apiPost(c, body, "X-Tenant-Id", "t1", "Idempotency-Key", "k2")
+	other := hApiPost(c, body, "X-Tenant-Id", "t1", "Idempotency-Key", "k2")
 	ctx.Equal(other.Status, 409, "a different key for the held range (slot_taken)")
 	// The first hold expired unpaid and the sweeper freed its slots; only now does the retry arrive.
 	ctx.Redis.Del(slots.Key("r1"), slots.HoldKey(holdID))
-	late := apiPost(c, body)
-	ctx.Assert(late.Status == 200 && apiField(late, "booking_id") == apiField(first, "booking_id"), "a replay after the first hold expired answered %d %s, expected 200 with booking %s", late.Status, late.Text(), apiField(first, "booking_id"))
+	late := hApiPost(c, body)
+	ctx.Assert(late.Status == 200 && hApiField(late, "booking_id") == hApiField(first, "booking_id"), "a replay after the first hold expired answered %d %s, expected 200 with booking %s", late.Status, late.Text(), hApiField(first, "booking_id"))
 	retaken := ctx.Redis.Keys("hold:*")
 	ctx.Assert(len(retaken) == 0 && len(ctx.Redis.HGetAll(slots.Key("r1"))) == 0, "a replay after the first hold expired took a new hold (%q): the key decides a replay before any hold is taken", retaken)
 }
@@ -1099,7 +1099,7 @@ func CheckReplay(ctx *harness.Ctx) {
 namespace {
 
 // A range starting start_in seconds from now, as the client sends it.
-std::string apiBody(int64_t start_in, int64_t length = 3600, const std::string& resource = "r1") {
+std::string hApiBody(int64_t start_in, int64_t length = 3600, const std::string& resource = "r1") {
   const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   return nlohmann::json{{"resource_id", resource},
                         {"start", booking::tz::FormatInstant(now + start_in)},
@@ -1107,7 +1107,7 @@ std::string apiBody(int64_t start_in, int64_t length = 3600, const std::string& 
       .dump();
 }
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1115,18 +1115,18 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response apiPost(harness::HTTP& c, const std::string& body, const std::string& tenant = "t1",
+harness::Response hApiPost(harness::HTTP& c, const std::string& body, const std::string& tenant = "t1",
                           const std::string& key = "k1") {
   if (key.empty()) return c.Post("/v1/bookings", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/bookings", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-std::string apiError(const harness::Response& r) {
+std::string hApiError(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("error", "") : "";
 }
 
-void apiNothingHeld(harness::Ctx& ctx, const std::string& what) {
+void hApiNothingHeld(harness::Ctx& ctx, const std::string& what) {
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "%s must leave nothing behind, Redis holds %q", what, keys);
 }
@@ -1134,9 +1134,9 @@ void apiNothingHeld(harness::Ctx& ctx, const std::string& what) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const std::string body = apiBody(3600);
-  const auto r = apiPost(c, body);
+  auto c = hApiClient(ctx);
+  const std::string body = hApiBody(3600);
+  const auto r = hApiPost(c, body);
   ctx.Equal(r.Status, 201, "POST /v1/bookings for a free future hour (%s)", r.Text());
   const auto booking = nlohmann::json::parse(r.Text(), nullptr, false);
   const std::string booking_id = booking.is_object() ? booking.value("booking_id", "") : "";
@@ -1154,62 +1154,62 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckRangeOrder(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiPost(c, apiBody(3600, 0));
-  ctx.Assert(r.Status == 400 && apiError(r) == "invalid_range", "a zero-length range answered %d %s, expected 400 invalid_range",
+  auto c = hApiClient(ctx);
+  auto r = hApiPost(c, hApiBody(3600, 0));
+  ctx.Assert(r.Status == 400 && hApiError(r) == "invalid_range", "a zero-length range answered %d %s, expected 400 invalid_range",
              r.Status, r.Text());
-  apiNothingHeld(ctx, "a rejected range");
-  r = apiPost(c, apiBody(7200, -3600));
-  ctx.Assert(r.Status == 400 && apiError(r) == "invalid_range",
+  hApiNothingHeld(ctx, "a rejected range");
+  r = hApiPost(c, hApiBody(7200, -3600));
+  ctx.Assert(r.Status == 400 && hApiError(r) == "invalid_range",
              "a range with end before start answered %d %s, expected 400 invalid_range", r.Status, r.Text());
-  apiNothingHeld(ctx, "a rejected range");
-  r = apiPost(c, R"({"resource_id":"r1","start":"tomorrow","end":"later"})");
+  hApiNothingHeld(ctx, "a rejected range");
+  r = hApiPost(c, R"({"resource_id":"r1","start":"tomorrow","end":"later"})");
   ctx.Equal(r.Status, 400, "instants that do not parse");
 }
 
 void CheckPastStart(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiPost(c, apiBody(-3600, 7200));
-  ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past",
+  auto c = hApiClient(ctx);
+  auto r = hApiPost(c, hApiBody(-3600, 7200));
+  ctx.Assert(r.Status == 422 && hApiError(r) == "range_in_past",
              "a range starting an hour ago answered %d %s, expected 422 range_in_past", r.Status, r.Text());
-  apiNothingHeld(ctx, "a range in the past");
-  r = apiPost(c, apiBody(-120));
-  ctx.Assert(r.Status == 422 && apiError(r) == "range_in_past",
+  hApiNothingHeld(ctx, "a range in the past");
+  r = hApiPost(c, hApiBody(-120));
+  ctx.Assert(r.Status == 422 && hApiError(r) == "range_in_past",
              "a range that started two minutes ago answered %d %s, expected 422 range_in_past", r.Status, r.Text());
-  apiNothingHeld(ctx, "a range in the past");
-  r = apiPost(c, apiBody(60));
+  hApiNothingHeld(ctx, "a range in the past");
+  r = hApiPost(c, hApiBody(60));
   ctx.Equal(r.Status, 201, "a range starting in a minute (%s)", r.Text());
 }
 
 void CheckHorizon(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiPost(c, apiBody(91LL * 86400));
-  ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon",
+  auto c = hApiClient(ctx);
+  auto r = hApiPost(c, hApiBody(91LL * 86400));
+  ctx.Assert(r.Status == 422 && hApiError(r) == "beyond_horizon",
              "a range 91 days out answered %d %s, expected 422 beyond_horizon", r.Status, r.Text());
-  apiNothingHeld(ctx, "a range beyond the horizon");
-  r = apiPost(c, apiBody(89LL * 86400 + 23 * 3600, 2 * 3600));
-  ctx.Assert(r.Status == 422 && apiError(r) == "beyond_horizon",
+  hApiNothingHeld(ctx, "a range beyond the horizon");
+  r = hApiPost(c, hApiBody(89LL * 86400 + 23 * 3600, 2 * 3600));
+  ctx.Assert(r.Status == 422 && hApiError(r) == "beyond_horizon",
              "a range that starts inside the horizon but ends 90 days and an hour out answered %d %s, expected 422 "
              "beyond_horizon",
              r.Status, r.Text());
-  apiNothingHeld(ctx, "a range beyond the horizon");
-  r = apiPost(c, apiBody(89LL * 86400));
+  hApiNothingHeld(ctx, "a range beyond the horizon");
+  r = hApiPost(c, hApiBody(89LL * 86400));
   ctx.Equal(r.Status, 201, "a range 89 days out (%s)", r.Text());
 }
 
 void CheckReplay(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const std::string body = apiBody(3600);
-  auto r = apiPost(c, body, "t1", "");
-  ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key",
+  auto c = hApiClient(ctx);
+  const std::string body = hApiBody(3600);
+  auto r = hApiPost(c, body, "t1", "");
+  ctx.Assert(r.Status == 400 && hApiError(r) == "missing_idempotency_key",
              "a request without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key", r.Status, r.Text());
-  r = apiPost(c, apiBody(-3600, 7200), "t1", "");
-  ctx.Assert(r.Status == 400 && apiError(r) == "missing_idempotency_key",
+  r = hApiPost(c, hApiBody(-3600, 7200), "t1", "");
+  ctx.Assert(r.Status == 400 && hApiError(r) == "missing_idempotency_key",
              "a past range without Idempotency-Key answered %d %s, expected 400 missing_idempotency_key: the key is the first rule",
              r.Status, r.Text());
-  const auto first = apiPost(c, body);
+  const auto first = hApiPost(c, body);
   ctx.Equal(first.Status, 201, "the first booking (%s)", first.Text());
-  const auto again = apiPost(c, body);  // the client timed out and retried with the same key
+  const auto again = hApiPost(c, body);  // the client timed out and retried with the same key
   ctx.Equal(again.Status, 200, "the replayed request must answer the first booking (%s)", again.Text());
   const auto firstBooking = nlohmann::json::parse(first.Text());
   const auto againBooking = nlohmann::json::parse(again.Text(), nullptr, false);
@@ -1217,11 +1217,11 @@ void CheckReplay(harness::Ctx& ctx) {
             "the replay must answer the first booking");
   ctx.Equal(ctx.Redis.Keys("hold:*"), {booking::slots::HoldKey(firstBooking.value("hold_id", ""))},
             "a replay must not take a second hold; the hold keys");
-  const auto other = apiPost(c, body, "t1", "k2");
+  const auto other = hApiPost(c, body, "t1", "k2");
   ctx.Equal(other.Status, 409, "a different key for the held range (slot_taken)");
   // The first hold expired unpaid and the sweeper freed its slots; only now does the retry arrive.
   ctx.Redis.Del(booking::slots::Key("r1"), booking::slots::HoldKey(firstBooking.value("hold_id", "")));
-  const auto late = apiPost(c, body);
+  const auto late = hApiPost(c, body);
   const auto lateBooking = nlohmann::json::parse(late.Text(), nullptr, false);
   ctx.Assert(late.Status == 200 && lateBooking.is_object() &&
                  lateBooking.value("booking_id", "") == firstBooking.value("booking_id", ""),

@@ -652,19 +652,19 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func promote(ctx *harness.Ctx, surface, version string) {
-	ctx.NoError(store.Promote(readBg, surface, version, "popularity"), "promote %s on %s", version, surface)
+func hPromote(ctx *harness.Ctx, surface, version string) {
+	ctx.NoError(store.Promote(hReadBg, surface, version, "popularity"), "promote %s on %s", version, surface)
 }
 
-func versionOf(r *harness.Response) string {
+func hVersionOf(r *harness.Response) string {
 	var body struct {
 		ModelVersion string \`json:"model_version"\`
 	}
@@ -673,57 +673,57 @@ func versionOf(r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	promote(ctx, "home", "ranker-v7")
-	c := api(ctx)
+	hPromote(ctx, "home", "ranker-v7")
+	c := hApi(ctx)
 	r := c.Get("/v1/surfaces/home/config")
 	ctx.Equal(r.Status, 200, "GET /v1/surfaces/home/config (%s)", r.Text())
 	var body map[string]string
 	r.Decode(&body)
 	ctx.Equal(body, map[string]string{"surface": "home", "model_version": "ranker-v7", "fallback_policy": "popularity"}, "the home config")
 	ctx.Equal(c.Get("/v1/surfaces/search/config").Status, 404, "an unknown surface")
-	promote(ctx, "search", "ranker-v7") // the surface launches
+	hPromote(ctx, "search", "ranker-v7") // the surface launches
 	ctx.Clock.Advance(6)
 	launched := c.Get("/v1/surfaces/search/config")
 	ctx.Assert(launched.Status == 200, "6 s after the search surface was created its config answered %d %s: an unknown surface was remembered as unknown. Keep a surface's answer at most configTTL = 5 s, missing ones too", launched.Status, launched.Text())
 }
 
 func CheckNoQueryVersion(ctx *harness.Ctx) {
-	promote(ctx, "home", "ranker-v7")
-	promote(ctx, "home", "ranker-v8") // the rollout: ranker-v7 was promoted once, and is no longer active
-	c := api(ctx)
+	hPromote(ctx, "home", "ranker-v7")
+	hPromote(ctx, "home", "ranker-v8") // the rollout: ranker-v7 was promoted once, and is no longer active
+	c := hApi(ctx)
 	r := c.Get("/v1/surfaces/home/config?model_version=ranker-v9")
-	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v8", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8", r.Status, r.Text())
 	r = c.Get("/v1/surfaces/home/config?model_version=ranker-v7")
-	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered %d %s: a caller pinned a version the surface has moved off. Serve the configured ranker-v8", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v8", "after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered %d %s: a caller pinned a version the surface has moved off. Serve the configured ranker-v8", r.Status, r.Text())
 }
 
 func CheckPromotedOnly(ctx *harness.Ctx) {
-	promote(ctx, "home", "ranker-v7")
-	c := api(ctx)
+	hPromote(ctx, "home", "ranker-v7")
+	c := hApi(ctx)
 	r := c.Get("/v1/surfaces/home/config")
-	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v7", "the home config is %d %s, expected ranker-v7", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v7", "the home config is %d %s, expected ranker-v7", r.Status, r.Text())
 	ctx.Redis.Do("HSET", "surface:home", "model_version", "ranker-v9") // edited by hand, never promoted
 	ctx.Clock.Advance(6)
 	r = c.Get("/v1/surfaces/home/config")
 	ctx.Equal(r.Status, 404, "the config names ranker-v9, which was never promoted: expected 404, not the version it last served (%s)", r.Text())
-	promote(ctx, "home", "ranker-v8")
+	hPromote(ctx, "home", "ranker-v8")
 	ctx.Clock.Advance(6)
 	r = c.Get("/v1/surfaces/home/config")
-	ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after ranker-v8 was promoted the read answered %d %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v8", "after ranker-v8 was promoted the read answered %d %s", r.Status, r.Text())
 }
 
 func CheckLiveConfig(ctx *harness.Ctx) {
-	promote(ctx, "home", "ranker-v7")
-	promote(ctx, "home", "ranker-v8")
-	c := api(ctx)
+	hPromote(ctx, "home", "ranker-v7")
+	hPromote(ctx, "home", "ranker-v8")
+	c := hApi(ctx)
 	first := c.Get("/v1/surfaces/home/config")
-	ctx.Assert(first.Status == 200 && versionOf(first) == "ranker-v8", "the home config is %d %s, expected ranker-v8", first.Status, first.Text())
+	ctx.Assert(first.Status == 200 && hVersionOf(first) == "ranker-v8", "the home config is %d %s, expected ranker-v8", first.Status, first.Text())
 	ctx.Clock.Advance(4)
 	c.Get("/v1/surfaces/home/config") // a read inside the window: the copy is 4 s old
-	promote(ctx, "home", "ranker-v7") // the rollback
+	hPromote(ctx, "home", "ranker-v7") // the rollback
 	ctx.Clock.Advance(4)
 	after := c.Get("/v1/surfaces/home/config")
-	ctx.Equal(versionOf(after), "ranker-v7", "8 s after the config was read, and 4 s after the rollback, the copy must have been read again once it was configTTL = 5 s old, however often it was used; the version served")
+	ctx.Equal(hVersionOf(after), "ranker-v7", "8 s after the config was read, and 4 s after the rollback, the copy must have been read again once it was configTTL = 5 s old, however often it was used; the version served")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -734,7 +734,7 @@ func CheckLiveConfig(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -742,7 +742,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string versionOf(const harness::Response& r) {
+std::string hVersionOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("model_version", "") : "";
 }
@@ -751,7 +751,7 @@ std::string versionOf(const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   store::promote("home", "ranker-v7");
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/surfaces/home/config");
   ctx.Equal(r.Status, 200, "GET /v1/surfaces/home/config (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -766,18 +766,18 @@ void CheckRoute(harness::Ctx& ctx) {
 void CheckNoQueryVersion(harness::Ctx& ctx) {
   store::promote("home", "ranker-v7");
   store::promote("home", "ranker-v8");  // the rollout: ranker-v7 was promoted once, and is no longer active
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   auto r = c.Get("/v1/surfaces/home/config?model_version=ranker-v9");
-  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v8", "GET /v1/surfaces/home/config?model_version=ranker-v9 answered %d %s: a query parameter chose the version the surface's readers rank with. Serve the configured ranker-v8", r.Status, r.Text());
   r = c.Get("/v1/surfaces/home/config?model_version=ranker-v7");
-  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered %d %s: a caller pinned a version the surface has moved off. Serve the configured ranker-v8", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v8", "after the rollout to ranker-v8, GET /v1/surfaces/home/config?model_version=ranker-v7 answered %d %s: a caller pinned a version the surface has moved off. Serve the configured ranker-v8", r.Status, r.Text());
 }
 
 void CheckPromotedOnly(harness::Ctx& ctx) {
   store::promote("home", "ranker-v7");
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   auto r = c.Get("/v1/surfaces/home/config");
-  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v7", "the home config is %d %s, expected ranker-v7", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v7", "the home config is %d %s, expected ranker-v7", r.Status, r.Text());
   ctx.Redis.Do("HSET", "surface:home", "model_version", "ranker-v9");  // edited by hand, never promoted
   ctx.Clock.Advance(6);
   r = c.Get("/v1/surfaces/home/config");
@@ -785,21 +785,21 @@ void CheckPromotedOnly(harness::Ctx& ctx) {
   store::promote("home", "ranker-v8");
   ctx.Clock.Advance(6);
   r = c.Get("/v1/surfaces/home/config");
-  ctx.Assert(r.Status == 200 && versionOf(r) == "ranker-v8", "after ranker-v8 was promoted the read answered %d %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hVersionOf(r) == "ranker-v8", "after ranker-v8 was promoted the read answered %d %s", r.Status, r.Text());
 }
 
 void CheckLiveConfig(harness::Ctx& ctx) {
   store::promote("home", "ranker-v7");
   store::promote("home", "ranker-v8");
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto first = c.Get("/v1/surfaces/home/config");
-  ctx.Assert(first.Status == 200 && versionOf(first) == "ranker-v8", "the home config is %d %s, expected ranker-v8", first.Status, first.Text());
+  ctx.Assert(first.Status == 200 && hVersionOf(first) == "ranker-v8", "the home config is %d %s, expected ranker-v8", first.Status, first.Text());
   ctx.Clock.Advance(4);
   c.Get("/v1/surfaces/home/config");  // a read inside the window: the copy is 4 s old
   store::promote("home", "ranker-v7");  // the rollback
   ctx.Clock.Advance(4);
   const auto after = c.Get("/v1/surfaces/home/config");
-  ctx.Equal(versionOf(after), "ranker-v7", "8 s after the config was read, and 4 s after the rollback, the copy must have been read again once it was kConfigTtl = 5 s old, however often it was used; the version served");
+  ctx.Equal(hVersionOf(after), "ranker-v7", "8 s after the config was read, and 4 s after the rollback, the copy must have been read again once it was kConfigTtl = 5 s old, however often it was used; the version served");
 }
 `,
   },

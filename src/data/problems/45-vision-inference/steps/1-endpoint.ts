@@ -999,13 +999,13 @@ import (
 )
 
 const (
-	apiCat      = "tenants/t1/images/cat.jpg"
-	apiCatBytes = "jpeg:tabby cat on a sofa"
-	apiForeign  = "tenants/t2/images/cat.jpg"
+	kHApiCat      = "tenants/t1/images/cat.jpg"
+	kHApiCatBytes = "jpeg:tabby cat on a sofa"
+	kHApiForeign  = "tenants/t2/images/cat.jpg"
 )
 
-var apiOutOfScope = []string{
-	apiForeign,
+var hApiOutOfScope = []string{
+	kHApiForeign,
 	"s3://internal-models/weights.bin",
 	"https://169.254.169.254/latest/meta-data/",
 	"tenants/t1/images/../../t2/images/cat.jpg",
@@ -1014,9 +1014,9 @@ var apiOutOfScope = []string{
 	"tenants/t1/images/../images/cat.jpg",
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
-	ctx.Redis.Set("vision:object:"+apiCat, apiCatBytes)
-	for _, key := range apiOutOfScope {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
+	ctx.Redis.Set("vision:object:"+kHApiCat, kHApiCatBytes)
+	for _, key := range hApiOutOfScope {
 		ctx.Redis.Set("vision:object:"+key, "jpeg:someone else's bytes")
 	}
 	mux := http.NewServeMux()
@@ -1024,27 +1024,27 @@ func apiClient(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, image, task, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, image, task, key, tenant string) *harness.Response {
 	return c.Post("/v1/inferences", map[string]any{"image": image, "task": task}, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiCat, "classify", "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, kHApiCat, "classify", "k-1", "t1")
 	ctx.Equal(r.Status, 201, "a valid request (%s)", r.Text())
-	inf := apiBody(ctx, r)
+	inf := hApiBody(ctx, r)
 	for _, key := range []string{"inference_id", "status", "task", "image", "content_hash", "created_at"} {
 		_, ok := inf[key]
 		ctx.Assert(ok, "the 201 body lacks %s: %s", key, r.Text())
 	}
-	ctx.Assert(inf["status"] == "pending" && inf["task"] == "classify" && inf["image"] == apiCat, "a new inference is pending and echoes the request: %s", r.Text())
-	sum := sha256.Sum256([]byte(apiCatBytes))
+	ctx.Assert(inf["status"] == "pending" && inf["task"] == "classify" && inf["image"] == kHApiCat, "a new inference is pending and echoes the request: %s", r.Text())
+	sum := sha256.Sum256([]byte(kHApiCatBytes))
 	ctx.Equal(inf["content_hash"], hex.EncodeToString(sum[:]), "content_hash must be the SHA-256 of the object's bytes")
 	id, _ := inf["inference_id"].(string)
 	raw, ok := ctx.Redis.Get("vision:inference:" + id)
@@ -1052,45 +1052,45 @@ func CheckRoute(ctx *harness.Ctx) {
 	var row map[string]any
 	json.Unmarshal([]byte(raw), &row)
 	ctx.Equal(row["tenant"], "t1", "the stored row carries the tenant")
-	noTenant := c.Post("/v1/inferences", map[string]any{"image": apiCat, "task": "classify"}, "Idempotency-Key", "k-2")
+	noTenant := c.Post("/v1/inferences", map[string]any{"image": kHApiCat, "task": "classify"}, "Idempotency-Key", "k-2")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the request")
-	missing := apiPost(c, "tenants/t1/images/missing.jpg", "classify", "k-3", "t1")
+	missing := hApiPost(c, "tenants/t1/images/missing.jpg", "classify", "k-3", "t1")
 	ctx.Equal(missing.Status, 404, "a key with no object behind it")
 	ctx.Equal(len(ctx.Redis.Keys("vision:inference:*")), 1, "a 404 must store no inference: rows after one 201 and one 404")
-	ctx.Redis.Set("vision:object:tenants/t1/images/missing.jpg", apiCatBytes)
-	retry := apiPost(c, "tenants/t1/images/missing.jpg", "classify", "k-3", "t1")
-	ctx.Assert(retry.Status == 201 && apiBody(ctx, retry)["content_hash"] == hex.EncodeToString(sum[:]), "once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got %d: %s", retry.Status, retry.Text())
+	ctx.Redis.Set("vision:object:tenants/t1/images/missing.jpg", kHApiCatBytes)
+	retry := hApiPost(c, "tenants/t1/images/missing.jpg", "classify", "k-3", "t1")
+	ctx.Assert(retry.Status == 201 && hApiBody(ctx, retry)["content_hash"] == hex.EncodeToString(sum[:]), "once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got %d: %s", retry.Status, retry.Text())
 }
 
 func CheckTaskCatalog(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	var r *harness.Response
 	for i, task := range []string{"segment-everything", "Classify", "classify "} {
-		r = apiPost(c, apiCat, task, "k-bad-"+strconv.Itoa(i), "t1")
+		r = hApiPost(c, kHApiCat, task, "k-bad-"+strconv.Itoa(i), "t1")
 		ctx.Equal(r.Status, 400, "task %q: the catalog is exactly classify, detect and embed", task)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("vision:inference:*")), 0, "a refused task must store no inference; inferences stored")
 	for i, task := range []string{"classify", "detect", "embed"} {
-		r = apiPost(c, apiCat, task, "k-"+strconv.Itoa(i), "t1")
+		r = hApiPost(c, kHApiCat, task, "k-"+strconv.Itoa(i), "t1")
 		ctx.Equal(r.Status, 201, "task %s is in the catalog (%s)", task, r.Text())
 	}
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	for i, key := range apiOutOfScope {
-		r := apiPost(c, key, "classify", "k-"+strconv.Itoa(i), "t1")
+	c := hApiClient(ctx)
+	for i, key := range hApiOutOfScope {
+		r := hApiPost(c, key, "classify", "k-"+strconv.Itoa(i), "t1")
 		ctx.Equal(r.Status, 403, "tenant t1 asked for %s: only keys under tenants/t1/images/ are t1's", key)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("vision:inference:*")), 0, "refused keys must store no inference; inferences stored")
-	r := apiPost(c, apiCat, "classify", "k-ok", "t1")
-	ctx.Equal(r.Status, 201, "t1's own key %s (%s)", apiCat, r.Text())
+	r := hApiPost(c, kHApiCat, "classify", "k-ok", "t1")
+	ctx.Equal(r.Status, 201, "t1's own key %s (%s)", kHApiCat, r.Text())
 }
 
 func CheckScopeBeforeFetch(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	foreign, bucket := false, false
-	ctx.Redis.After("vision:object:"+apiForeign, func() any {
+	ctx.Redis.After("vision:object:"+kHApiForeign, func() any {
 		foreign = true
 		return nil
 	})
@@ -1098,26 +1098,26 @@ func CheckScopeBeforeFetch(ctx *harness.Ctx) {
 		bucket = true
 		return nil
 	})
-	r := apiPost(c, apiForeign, "classify", "k-1", "t1")
-	ctx.Assert(!foreign, "the object %s was read for tenant t1 (the request answered %d): decide the 403 before objects.Fetch", apiForeign, r.Status)
-	ctx.Equal(r.Status, 403, "tenant t1 asked for %s", apiForeign)
-	r = apiPost(c, "s3://internal-models/weights.bin", "classify", "k-2", "t1")
+	r := hApiPost(c, kHApiForeign, "classify", "k-1", "t1")
+	ctx.Assert(!foreign, "the object %s was read for tenant t1 (the request answered %d): decide the 403 before objects.Fetch", kHApiForeign, r.Status)
+	ctx.Equal(r.Status, 403, "tenant t1 asked for %s", kHApiForeign)
+	r = hApiPost(c, "s3://internal-models/weights.bin", "classify", "k-2", "t1")
 	ctx.Assert(r.Status == 403 && !bucket, "an s3:// key reached the object store: the scope test must run before the fetch")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/inferences", map[string]any{"image": apiCat, "task": "classify"}, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/inferences", map[string]any{"image": kHApiCat, "task": "classify"}, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a request without Idempotency-Key")
-	first := apiPost(c, apiCat, "classify", "k-7", "t1")
+	first := hApiPost(c, kHApiCat, "classify", "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first request (%s)", first.Text())
-	replay := apiPost(c, apiCat, "classify", "k-7", "t1")
+	replay := hApiPost(c, kHApiCat, "classify", "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored inference")
-	ctx.Equal(apiBody(ctx, replay)["inference_id"], apiBody(ctx, first)["inference_id"], "the replay must answer the same inference")
+	ctx.Equal(hApiBody(ctx, replay)["inference_id"], hApiBody(ctx, first)["inference_id"], "the replay must answer the same inference")
 	ctx.Equal(len(ctx.Redis.Keys("vision:inference:*")), 1, "one key, one inference: inferences stored after a request and its replay")
-	ctx.Redis.Set("vision:object:"+apiForeign, apiCatBytes)
-	other := apiPost(c, apiForeign, "classify", "k-7", "t2")
-	ctx.Assert(other.Status == 201 && apiBody(ctx, other)["inference_id"] != apiBody(ctx, first)["inference_id"], "another tenant reusing the key gets its own inference (keys are per tenant)")
+	ctx.Redis.Set("vision:object:"+kHApiForeign, kHApiCatBytes)
+	other := hApiPost(c, kHApiForeign, "classify", "k-7", "t2")
+	ctx.Assert(other.Status == 201 && hApiBody(ctx, other)["inference_id"] != hApiBody(ctx, first)["inference_id"], "another tenant reusing the key gets its own inference (keys are per tenant)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1133,11 +1133,11 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kCat = "tenants/t1/images/cat.jpg";
-const std::string kCatBytes = "jpeg:tabby cat on a sofa";
-const std::string kForeign = "tenants/t2/images/cat.jpg";
-const std::vector<std::string> kOutOfScope = {
-    kForeign,
+const std::string kHCat = "tenants/t1/images/cat.jpg";
+const std::string kHCatBytes = "jpeg:tabby cat on a sofa";
+const std::string kHForeign = "tenants/t2/images/cat.jpg";
+const std::vector<std::string> kHOutOfScope = {
+    kHForeign,
     "s3://internal-models/weights.bin",
     "https://169.254.169.254/latest/meta-data/",
     "tenants/t1/images/../../t2/images/cat.jpg",
@@ -1146,12 +1146,12 @@ const std::vector<std::string> kOutOfScope = {
     "tenants/t1/images/../images/cat.jpg",
 };
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
-    ctx.Redis.Set("vision:object:" + kCat, kCatBytes);
-    for (const auto& key : kOutOfScope) ctx.Redis.Set("vision:object:" + key, "jpeg:someone else's bytes");
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    ctx.Redis.Set("vision:object:" + kHCat, kHCatBytes);
+    for (const auto& key : kHOutOfScope) ctx.Redis.Set("vision:object:" + key, "jpeg:someone else's bytes");
     register_routes(svr);
   }
 
@@ -1160,7 +1160,7 @@ struct Api {
   }
 };
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
@@ -1169,78 +1169,78 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kCat, "classify");
+  HApi api(ctx);
+  const auto r = api.post(kHCat, "classify");
   ctx.Equal(r.Status, 201, "a valid request (%s)", r.Text());
-  const json inf = bodyOf(ctx, r);
+  const json inf = hBodyOf(ctx, r);
   for (const char* key : {"inference_id", "status", "task", "image", "content_hash", "created_at"}) {
     ctx.Assert(inf.contains(key), "the 201 body lacks %s: %s", key, r.Text());
   }
-  ctx.Assert(inf["status"] == "pending" && inf["task"] == "classify" && inf["image"] == kCat, "a new inference is pending and echoes the request: %s", r.Text());
-  ctx.Equal(inf.value("content_hash", ""), sha256_hex(kCatBytes), "content_hash must be the SHA-256 of the object's bytes");
+  ctx.Assert(inf["status"] == "pending" && inf["task"] == "classify" && inf["image"] == kHCat, "a new inference is pending and echoes the request: %s", r.Text());
+  ctx.Equal(inf.value("content_hash", ""), sha256_hex(kHCatBytes), "content_hash must be the SHA-256 of the object's bytes");
   const auto raw = ctx.Redis.Get("vision:inference:" + inf.value("inference_id", ""));
   ctx.Assert(raw.has_value(), "the inference must be in the store (vision:inference:{id}): keys %v", ctx.Redis.Keys("vision:*"));
   ctx.Equal(json::parse(*raw).value("tenant", ""), "t1", "the stored row carries the tenant");
-  const auto noTenant = api.http.Post("/v1/inferences", json({{"image", kCat}, {"task", "classify"}}).dump(), "Idempotency-Key", "k-2");
+  const auto noTenant = api.http.Post("/v1/inferences", json({{"image", kHCat}, {"task", "classify"}}).dump(), "Idempotency-Key", "k-2");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the request");
   ctx.Equal(api.post("tenants/t1/images/missing.jpg", "classify", "k-3").Status, 404, "a key with no object behind it");
   ctx.Equal(ctx.Redis.Keys("vision:inference:*").size(), 1, "a 404 must store no inference: rows after one 201 and one 404");
-  ctx.Redis.Set("vision:object:tenants/t1/images/missing.jpg", kCatBytes);
+  ctx.Redis.Set("vision:object:tenants/t1/images/missing.jpg", kHCatBytes);
   const auto retry = api.post("tenants/t1/images/missing.jpg", "classify", "k-3");
-  ctx.Assert(retry.Status == 201 && bodyOf(ctx, retry).value("content_hash", "") == sha256_hex(kCatBytes), "once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got %d: %s", retry.Status, retry.Text());
+  ctx.Assert(retry.Status == 201 && hBodyOf(ctx, retry).value("content_hash", "") == sha256_hex(kHCatBytes), "once the object exists, a retry of the 404'd request starts the inference (201 with its digest), got %d: %s", retry.Status, retry.Text());
 }
 
 void CheckTaskCatalog(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   int bad = 0;
   for (const char* task : {"segment-everything", "Classify", "classify "}) {
-    ctx.Equal(api.post(kCat, task, "k-bad-" + std::to_string(bad++)).Status, 400, "task '%s': the catalog is exactly classify, detect and embed", task);
+    ctx.Equal(api.post(kHCat, task, "k-bad-" + std::to_string(bad++)).Status, 400, "task '%s': the catalog is exactly classify, detect and embed", task);
   }
   ctx.Equal(ctx.Redis.Keys("vision:inference:*").size(), 0, "a refused task must store no inference; inferences stored");
   int i = 0;
   for (const char* task : {"classify", "detect", "embed"}) {
-    const auto r = api.post(kCat, task, "k-" + std::to_string(i++));
+    const auto r = api.post(kHCat, task, "k-" + std::to_string(i++));
     ctx.Equal(r.Status, 201, "task %s is in the catalog (%s)", task, r.Text());
   }
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   int i = 0;
-  for (const auto& key : kOutOfScope) {
+  for (const auto& key : kHOutOfScope) {
     ctx.Equal(api.post(key, "classify", "k-" + std::to_string(i++)).Status, 403, "tenant t1 asked for %s: only keys under tenants/t1/images/ are t1's", key);
   }
   ctx.Equal(ctx.Redis.Keys("vision:inference:*").size(), 0, "refused keys must store no inference; inferences stored");
-  const auto r = api.post(kCat, "classify", "k-ok");
-  ctx.Equal(r.Status, 201, "t1's own key %s (%s)", kCat, r.Text());
+  const auto r = api.post(kHCat, "classify", "k-ok");
+  ctx.Equal(r.Status, 201, "t1's own key %s (%s)", kHCat, r.Text());
 }
 
 void CheckScopeBeforeFetch(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   bool foreign = false;
   bool bucket = false;
-  ctx.Redis.After("vision:object:" + kForeign, [&foreign] { foreign = true; });
+  ctx.Redis.After("vision:object:" + kHForeign, [&foreign] { foreign = true; });
   ctx.Redis.After("vision:object:s3://internal-models/weights.bin", [&bucket] { bucket = true; });
-  const auto first = api.post(kForeign, "classify", "k-1");
-  ctx.Assert(!foreign, "the object %s was read for tenant t1 (the request answered %d): decide the 403 before objects::fetch_object", kForeign, first.Status);
-  ctx.Equal(first.Status, 403, "tenant t1 asked for %s", kForeign);
+  const auto first = api.post(kHForeign, "classify", "k-1");
+  ctx.Assert(!foreign, "the object %s was read for tenant t1 (the request answered %d): decide the 403 before objects::fetch_object", kHForeign, first.Status);
+  ctx.Equal(first.Status, 403, "tenant t1 asked for %s", kHForeign);
   const auto r = api.post("s3://internal-models/weights.bin", "classify", "k-2");
   ctx.Assert(r.Status == 403 && !bucket, "an s3:// key reached the object store: the scope test must run before the fetch");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/inferences", json({{"image", kCat}, {"task", "classify"}}).dump(), "X-Tenant-Id", "t1");
+  HApi api(ctx);
+  const auto noKey = api.http.Post("/v1/inferences", json({{"image", kHCat}, {"task", "classify"}}).dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a request without Idempotency-Key");
-  const auto first = api.post(kCat, "classify", "k-7");
+  const auto first = api.post(kHCat, "classify", "k-7");
   ctx.Equal(first.Status, 201, "the first request (%s)", first.Text());
-  const auto replay = api.post(kCat, "classify", "k-7");
+  const auto replay = api.post(kHCat, "classify", "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored inference");
-  ctx.Equal(bodyOf(ctx, replay)["inference_id"], bodyOf(ctx, first)["inference_id"], "the replay must answer the same inference");
+  ctx.Equal(hBodyOf(ctx, replay)["inference_id"], hBodyOf(ctx, first)["inference_id"], "the replay must answer the same inference");
   ctx.Equal(ctx.Redis.Keys("vision:inference:*").size(), 1, "one key, one inference: inferences stored after a request and its replay");
-  ctx.Redis.Set("vision:object:" + kForeign, kCatBytes);
-  const auto other = api.post(kForeign, "classify", "k-7", "t2");
-  ctx.Assert(other.Status == 201 && bodyOf(ctx, other)["inference_id"] != bodyOf(ctx, first)["inference_id"], "another tenant reusing the key gets its own inference (keys are per tenant)");
+  ctx.Redis.Set("vision:object:" + kHForeign, kHCatBytes);
+  const auto other = api.post(kHForeign, "classify", "k-7", "t2");
+  ctx.Assert(other.Status == 201 && hBodyOf(ctx, other)["inference_id"] != hBodyOf(ctx, first)["inference_id"], "another tenant reusing the key gets its own inference (keys are per tenant)");
 }
 `,
   },

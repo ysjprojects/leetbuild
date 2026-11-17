@@ -794,15 +794,15 @@ import (
 )
 
 var (
-	apiTexts = []string{"Rotate keys every 90 days.", "Revoke a leaked key at once."}
-	// apiEmbeds counts the model calls: step 3's embed, stood in for by embedding/model.
-	apiEmbeds int
+	hApiTexts = []string{"Rotate keys every 90 days.", "Revoke a leaked key at once."}
+	// hApiEmbeds counts the model calls: step 3's embed, stood in for by embedding/model.
+	hApiEmbeds int
 )
 
-func apiWorld(ctx *harness.Ctx) *harness.HTTP {
-	apiEmbeds = 0
+func hApiWorld(ctx *harness.Ctx) *harness.HTTP {
+	hApiEmbeds = 0
 	embed = func(_ context.Context, text, modelVersion string) ([]float32, error) {
-		apiEmbeds++
+		hApiEmbeds++
 		return model.VectorFor(modelVersion, text), nil
 	}
 	mux := http.NewServeMux()
@@ -810,7 +810,7 @@ func apiWorld(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, inputs []string, tenant, key string) *harness.Response {
+func hApiPost(c *harness.HTTP, inputs []string, tenant, key string) *harness.Response {
 	var header []string
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -821,7 +821,7 @@ func apiPost(c *harness.HTTP, inputs []string, tenant, key string) *harness.Resp
 	return c.Post("/v1/embeddings", map[string]any{"inputs": inputs}, header...)
 }
 
-type apiBody struct {
+type HApiBody struct {
 	ModelVersion  string      \`json:"model_version"\`
 	Dimension     int         \`json:"dimension"\`
 	ContentHashes []string    \`json:"content_hashes"\`
@@ -830,74 +830,74 @@ type apiBody struct {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiWorld(ctx)
-	r := apiPost(c, apiTexts, "acme", "k-1")
+	c := hApiWorld(ctx)
+	r := hApiPost(c, hApiTexts, "acme", "k-1")
 	ctx.Equal(r.Status, 200, "POST /v1/embeddings (%s)", r.Text())
-	var body apiBody
+	var body HApiBody
 	r.Decode(&body)
 	ctx.Equal(body.ModelVersion, config.ModelVersion, "the response must name the model")
-	ctx.Equal(body.Vectors, [][]float32{model.VectorFor(config.ModelVersion, apiTexts[0]), model.VectorFor(config.ModelVersion, apiTexts[1])}, "one vector per input, in input order")
-	ctx.Equal(body.ContentHashes, []string{config.ContentHash(apiTexts[0]), config.ContentHash(apiTexts[1])}, "content_hashes must be the SHA-256 of each input")
+	ctx.Equal(body.Vectors, [][]float32{model.VectorFor(config.ModelVersion, hApiTexts[0]), model.VectorFor(config.ModelVersion, hApiTexts[1])}, "one vector per input, in input order")
+	ctx.Equal(body.ContentHashes, []string{config.ContentHash(hApiTexts[0]), config.ContentHash(hApiTexts[1])}, "content_hashes must be the SHA-256 of each input")
 	ctx.Equal(body.Dimension, 8, "dimension must be the vectors' length")
 }
 
 func CheckTenantRequired(ctx *harness.Ctx) {
-	c := apiWorld(ctx)
-	r := apiPost(c, apiTexts, "", "k-1")
+	c := hApiWorld(ctx)
+	r := hApiPost(c, hApiTexts, "", "k-1")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id must be 401 (%s)", r.Text())
-	ctx.Equal(apiEmbeds, 0, "a request without a tenant must cost no model call; Embed calls")
-	empty := c.Post("/v1/embeddings", map[string]any{"inputs": apiTexts}, "X-Tenant-Id", "", "Idempotency-Key", "k-2")
+	ctx.Equal(hApiEmbeds, 0, "a request without a tenant must cost no model call; Embed calls")
+	empty := c.Post("/v1/embeddings", map[string]any{"inputs": hApiTexts}, "X-Tenant-Id", "", "Idempotency-Key", "k-2")
 	ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text())
-	ctx.Equal(apiEmbeds, 0, "a request with an empty tenant must cost no model call; Embed calls")
+	ctx.Equal(hApiEmbeds, 0, "a request with an empty tenant must cost no model call; Embed calls")
 }
 
 func CheckBatchCap(ctx *harness.Ctx) {
-	c := apiWorld(ctx)
+	c := hApiWorld(ctx)
 	inputs := make([]string, 257)
 	for i := range inputs {
 		inputs[i] = fmt.Sprintf("input %d", i)
 	}
-	big := apiPost(c, inputs, "acme", "k-1")
-	ctx.Assert(big.Status == 400, "a batch of 257 inputs answered %d after %d Embed calls: maxBatchInputs = 256, and the 257th is 400", big.Status, apiEmbeds)
-	ctx.Equal(apiEmbeds, 0, "a refused batch must cost no model call; Embed calls")
-	empty := apiPost(c, []string{}, "acme", "k-2")
+	big := hApiPost(c, inputs, "acme", "k-1")
+	ctx.Assert(big.Status == 400, "a batch of 257 inputs answered %d after %d Embed calls: maxBatchInputs = 256, and the 257th is 400", big.Status, hApiEmbeds)
+	ctx.Equal(hApiEmbeds, 0, "a refused batch must cost no model call; Embed calls")
+	empty := hApiPost(c, []string{}, "acme", "k-2")
 	ctx.Equal(empty.Status, 400, "an empty batch")
 	full := make([]string, 256)
 	for i := range full {
 		full[i] = fmt.Sprintf("input %d", i)
 	}
-	ok := apiPost(c, full, "acme", "k-3")
+	ok := hApiPost(c, full, "acme", "k-3")
 	ctx.Equal(ok.Status, 200, "a batch of exactly 256 inputs (maxBatchInputs): the cap allows 256 (%.120s)", ok.Text())
-	var body apiBody
+	var body HApiBody
 	ok.Decode(&body)
 	ctx.Equal(len(body.Vectors), 256, "a batch of 256 inputs must answer 256 vectors; vectors")
 }
 
 func CheckInputBytes(ctx *harness.Ctx) {
-	c := apiWorld(ctx)
+	c := hApiWorld(ctx)
 	wide := strings.Repeat("日", 3000) // 3000 characters, 9000 bytes of UTF-8
-	r := apiPost(c, []string{"short", wide}, "acme", "k-1")
+	r := hApiPost(c, []string{"short", wide}, "acme", "k-1")
 	ctx.Assert(r.Status == 413, "an input of 9000 UTF-8 bytes answered %d: an input over maxInputBytes is 413, not cut and embedded as another text", r.Status)
-	ctx.Equal(apiEmbeds, 0, "nothing in a refused batch is embedded; Embed calls")
-	var body apiBody
+	ctx.Equal(hApiEmbeds, 0, "nothing in a refused batch is embedded; Embed calls")
+	var body HApiBody
 	r.Decode(&body)
 	ctx.Assert(body.Index != nil && *body.Index == 1, "the 413 must name the index of the input (1), got %s", r.Text())
-	edge := apiPost(c, []string{strings.Repeat("a", 8192)}, "acme", "k-2")
+	edge := hApiPost(c, []string{strings.Repeat("a", 8192)}, "acme", "k-2")
 	ctx.Equal(edge.Status, 200, "an input of exactly 8192 bytes")
 }
 
 func CheckReplay(ctx *harness.Ctx) {
-	c := apiWorld(ctx)
-	first := apiPost(c, apiTexts, "acme", "k-1")
+	c := hApiWorld(ctx)
+	first := hApiPost(c, hApiTexts, "acme", "k-1")
 	ctx.Equal(first.Status, 200, "the first request (%s)", first.Text())
-	n := apiEmbeds
-	again := apiPost(c, apiTexts, "acme", "k-1")
-	ctx.Assert(apiEmbeds == n, "a retry with the same Idempotency-Key embedded again (%d more Embed calls): the model server is paid twice for one request", apiEmbeds-n)
+	n := hApiEmbeds
+	again := hApiPost(c, hApiTexts, "acme", "k-1")
+	ctx.Assert(hApiEmbeds == n, "a retry with the same Idempotency-Key embedded again (%d more Embed calls): the model server is paid twice for one request", hApiEmbeds-n)
 	ctx.Equal(again.Status, 200, "the replay")
 	ctx.Equal(again.JSON(), first.JSON(), "the replay must answer the recorded response")
-	other := apiPost(c, apiTexts, "globex", "k-1")
-	ctx.Assert(other.Status == 200 && apiEmbeds == n+2, "the key is the tenant's: another tenant's k-1 is a request of its own (expected 2 new Embed calls, saw %d)", apiEmbeds-n)
-	missing := apiPost(c, apiTexts, "acme", "")
+	other := hApiPost(c, hApiTexts, "globex", "k-1")
+	ctx.Assert(other.Status == 200 && hApiEmbeds == n+2, "the key is the tenant's: another tenant's k-1 is a request of its own (expected 2 new Embed calls, saw %d)", hApiEmbeds-n)
+	missing := hApiPost(c, hApiTexts, "acme", "")
 	ctx.Equal(missing.Status, 400, "a request without Idempotency-Key")
 }
 `,
@@ -914,29 +914,29 @@ func CheckReplay(ctx *harness.Ctx) {
 namespace {
 
 // The model calls: step 3's embed, stood in for by embedding/model.h.
-int g_embeds = 0;
+int hG_embeds = 0;
 
 }  // namespace
 
 std::vector<float> embed(const std::string& text, const std::string& model_version) {
-  g_embeds++;
+  hG_embeds++;
   return model::vectorFor(model_version, text);
 }
 
 namespace {
 
-const std::vector<std::string> kTexts = {"Rotate keys every 90 days.", "Revoke a leaked key at once."};
+const std::vector<std::string> kHTexts = {"Rotate keys every 90 days.", "Revoke a leaked key at once."};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
   register_routes(*svr);
-  g_embeds = 0;
+  hG_embeds = 0;
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const std::vector<std::string>& inputs, const std::string& tenant, const std::string& key) {
+harness::Response hPost(harness::HTTP& c, const std::vector<std::string>& inputs, const std::string& tenant, const std::string& key) {
   const std::string body = nlohmann::json{{"inputs", inputs}}.dump();
   if (!tenant.empty() && !key.empty())
     return c.Post("/v1/embeddings", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
@@ -944,73 +944,73 @@ harness::Response post(harness::HTTP& c, const std::vector<std::string>& inputs,
   return c.Post("/v1/embeddings", body, "Content-Type", "application/json", "Idempotency-Key", key);
 }
 
-nlohmann::json parsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hParsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kTexts, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto r = hPost(c, kHTexts, "acme", "k-1");
   ctx.Equal(r.Status, 200, "POST /v1/embeddings (%s)", r.Text());
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   ctx.Equal(body.value("model_version", ""), config::kModelVersion, "the response must name the model");
-  const std::vector<std::vector<float>> want = {model::vectorFor(config::kModelVersion, kTexts[0]), model::vectorFor(config::kModelVersion, kTexts[1])};
+  const std::vector<std::vector<float>> want = {model::vectorFor(config::kModelVersion, kHTexts[0]), model::vectorFor(config::kModelVersion, kHTexts[1])};
   ctx.Equal(body.value("vectors", nlohmann::json::array()), nlohmann::json(want), "one vector per input, in input order");
-  ctx.Equal(body.value("content_hashes", nlohmann::json::array()), nlohmann::json({config::contentHash(kTexts[0]), config::contentHash(kTexts[1])}), "content_hashes must be the SHA-256 of each input");
+  ctx.Equal(body.value("content_hashes", nlohmann::json::array()), nlohmann::json({config::contentHash(kHTexts[0]), config::contentHash(kHTexts[1])}), "content_hashes must be the SHA-256 of each input");
   ctx.Equal(body.value("dimension", 0), 8, "dimension must be the vectors' length");
 }
 
 void CheckTenantRequired(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kTexts, "", "k-1");
+  auto c = hApi(ctx);
+  const auto r = hPost(c, kHTexts, "", "k-1");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id must be 401 (%s)", r.Text());
-  ctx.Equal(g_embeds, 0, "a request without a tenant must cost no model call; Embed calls");
-  const std::string body = nlohmann::json{{"inputs", kTexts}}.dump();
+  ctx.Equal(hG_embeds, 0, "a request without a tenant must cost no model call; Embed calls");
+  const std::string body = nlohmann::json{{"inputs", kHTexts}}.dump();
   const auto empty = c.Post("/v1/embeddings", body, "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", "k-2");
   ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text());
-  ctx.Equal(g_embeds, 0, "a request with an empty tenant must cost no model call; Embed calls");
+  ctx.Equal(hG_embeds, 0, "a request with an empty tenant must cost no model call; Embed calls");
 }
 
 void CheckBatchCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::vector<std::string> inputs;
   for (int i = 0; i < 257; i++) inputs.push_back("input " + std::to_string(i));
-  const auto big = post(c, inputs, "acme", "k-1");
-  ctx.Assert(big.Status == 400, "a batch of 257 inputs answered %d after %d Embed calls: kMaxBatchInputs = 256, and the 257th is 400", big.Status, g_embeds);
-  ctx.Equal(g_embeds, 0, "a refused batch must cost no model call; Embed calls");
-  const auto empty = post(c, {}, "acme", "k-2");
+  const auto big = hPost(c, inputs, "acme", "k-1");
+  ctx.Assert(big.Status == 400, "a batch of 257 inputs answered %d after %d Embed calls: kMaxBatchInputs = 256, and the 257th is 400", big.Status, hG_embeds);
+  ctx.Equal(hG_embeds, 0, "a refused batch must cost no model call; Embed calls");
+  const auto empty = hPost(c, {}, "acme", "k-2");
   ctx.Equal(empty.Status, 400, "an empty batch");
   std::vector<std::string> full;
   for (int i = 0; i < 256; i++) full.push_back("input " + std::to_string(i));
-  const auto ok = post(c, full, "acme", "k-3");
+  const auto ok = hPost(c, full, "acme", "k-3");
   ctx.Equal(ok.Status, 200, "a batch of exactly 256 inputs (kMaxBatchInputs): the cap allows 256 (%s)", ok.Text().substr(0, 120));
-  ctx.Equal(parsed(ok).value("vectors", nlohmann::json::array()).size(), 256, "a batch of 256 inputs must answer 256 vectors; vectors");
+  ctx.Equal(hParsed(ok).value("vectors", nlohmann::json::array()).size(), 256, "a batch of 256 inputs must answer 256 vectors; vectors");
 }
 
 void CheckInputBytes(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::string wide;
   for (int i = 0; i < 3000; i++) wide += "\\u65e5";  // 3000 characters, 9000 bytes of UTF-8
-  const auto r = post(c, {"short", wide}, "acme", "k-1");
+  const auto r = hPost(c, {"short", wide}, "acme", "k-1");
   ctx.Assert(r.Status == 413, "an input of 9000 UTF-8 bytes answered %d: an input over kMaxInputBytes is 413, not cut and embedded as another text", r.Status);
-  ctx.Equal(g_embeds, 0, "nothing in a refused batch is embedded; Embed calls");
-  ctx.Equal(parsed(r).value("index", -1), 1, "the 413 must name the index of the input (%s)", r.Text());
-  const auto edge = post(c, {std::string(8192, 'a')}, "acme", "k-2");
+  ctx.Equal(hG_embeds, 0, "nothing in a refused batch is embedded; Embed calls");
+  ctx.Equal(hParsed(r).value("index", -1), 1, "the 413 must name the index of the input (%s)", r.Text());
+  const auto edge = hPost(c, {std::string(8192, 'a')}, "acme", "k-2");
   ctx.Equal(edge.Status, 200, "an input of exactly 8192 bytes");
 }
 
 void CheckReplay(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, kTexts, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto first = hPost(c, kHTexts, "acme", "k-1");
   ctx.Equal(first.Status, 200, "the first request (%s)", first.Text());
-  const int n = g_embeds;
-  const auto again = post(c, kTexts, "acme", "k-1");
-  ctx.Assert(g_embeds == n, "a retry with the same Idempotency-Key embedded again (%d more Embed calls): the model server is paid twice for one request", g_embeds - n);
+  const int n = hG_embeds;
+  const auto again = hPost(c, kHTexts, "acme", "k-1");
+  ctx.Assert(hG_embeds == n, "a retry with the same Idempotency-Key embedded again (%d more Embed calls): the model server is paid twice for one request", hG_embeds - n);
   ctx.Equal(again.Status, 200, "the replay");
-  ctx.Equal(parsed(again), parsed(first), "the replay must answer the recorded response");
-  const auto other = post(c, kTexts, "globex", "k-1");
-  ctx.Assert(other.Status == 200 && g_embeds == n + 2, "the key is the tenant's: another tenant's k-1 is a request of its own (expected 2 new Embed calls, saw %d)", g_embeds - n);
-  const auto missing = post(c, kTexts, "acme", "");
+  ctx.Equal(hParsed(again), hParsed(first), "the replay must answer the recorded response");
+  const auto other = hPost(c, kHTexts, "globex", "k-1");
+  ctx.Assert(other.Status == 200 && hG_embeds == n + 2, "the key is the tenant's: another tenant's k-1 is a request of its own (expected 2 new Embed calls, saw %d)", hG_embeds - n);
+  const auto missing = hPost(c, kHTexts, "acme", "");
   ctx.Equal(missing.Status, 400, "a request without Idempotency-Key");
 }
 `,

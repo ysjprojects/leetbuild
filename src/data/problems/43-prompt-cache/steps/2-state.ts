@@ -545,22 +545,22 @@ import (
 )
 
 var (
-	stateKey   = "pc:t1:7:" + strings.Repeat("a", 64)
-	stateOther = "pc:t1:7:" + strings.Repeat("c", 64)
+	hStateKey   = "pc:t1:7:" + strings.Repeat("a", 64)
+	hStateOther = "pc:t1:7:" + strings.Repeat("c", 64)
 )
 
-const stateTTL = 6 * 3600
+const kHStateTTL = 6 * 3600
 
-func stateRecord(completion string) record.Record {
+func hStateRecord(completion string) record.Record {
 	return record.Record{Tenant: "t1", Version: 7, Completion: completion, Tokens: 3}
 }
 
-func stateJSON(rec record.Record) string {
+func hStateJSON(rec record.Record) string {
 	raw, _ := json.Marshal(rec)
 	return string(raw)
 }
 
-func stateStored(ctx *harness.Ctx, key string) record.Record {
+func hStateStored(ctx *harness.Ctx, key string) record.Record {
 	raw, ok := ctx.Redis.Get(key)
 	ctx.Assert(ok, "nothing is stored under %s", key)
 	var rec record.Record
@@ -570,42 +570,42 @@ func stateStored(ctx *harness.Ctx, key string) record.Record {
 
 func CheckRoundTrip(ctx *harness.Ctx) {
 	bg := context.Background()
-	empty, err := lookup(bg, stateKey)
+	empty, err := lookup(bg, hStateKey)
 	ctx.NoError(err, "lookup on an empty cache")
 	ctx.Assert(empty == nil, "an empty cache must answer nil, got %+v", empty)
-	first, err := fill(bg, stateKey, stateRecord("Answer: hello"))
+	first, err := fill(bg, hStateKey, hStateRecord("Answer: hello"))
 	ctx.NoError(err, "fill")
-	ctx.Equal(first, stateRecord("Answer: hello"), "the first fill must return its own record")
-	ctx.Equal(stateStored(ctx, stateKey), stateRecord("Answer: hello"), "the entry under %s", stateKey)
-	again, err := lookup(bg, stateKey)
+	ctx.Equal(first, hStateRecord("Answer: hello"), "the first fill must return its own record")
+	ctx.Equal(hStateStored(ctx, hStateKey), hStateRecord("Answer: hello"), "the entry under %s", hStateKey)
+	again, err := lookup(bg, hStateKey)
 	ctx.NoError(err, "lookup after the fill")
-	ctx.Assert(again != nil && *again == stateRecord("Answer: hello"), "a lookup after the fill must return the record, got %+v", again)
+	ctx.Assert(again != nil && *again == hStateRecord("Answer: hello"), "a lookup after the fill must return the record, got %+v", again)
 }
 
 func CheckFirstWriterWins(ctx *harness.Ctx) {
 	bg := context.Background()
-	rival := stateRecord("Answer from replica B")
+	rival := hStateRecord("Answer from replica B")
 	// Replica B misses on the same prefix and fills (with SET NX EX) the moment this fill first touches the key.
 	rivalWon := false
-	probe := ctx.Redis.After(stateKey, func() any {
-		rivalWon = ctx.Redis.Set(stateKey, stateJSON(rival), "EX", stateTTL, "NX")
+	probe := ctx.Redis.After(hStateKey, func() any {
+		rivalWon = ctx.Redis.Set(hStateKey, hStateJSON(rival), "EX", kHStateTTL, "NX")
 		return rivalWon
 	})
-	returned, err := fill(bg, stateKey, stateRecord("Answer from replica A"))
+	returned, err := fill(bg, hStateKey, hStateRecord("Answer from replica A"))
 	ctx.NoError(err, "fill")
-	ctx.Assert(probe.Fired, "fill never touched %s", stateKey)
-	now := stateStored(ctx, stateKey)
+	ctx.Assert(probe.Fired, "fill never touched %s", hStateKey)
+	now := hStateStored(ctx, hStateKey)
 	if rivalWon {
-		ctx.Assert(now == rival, "replica B filled %s between this fill's read and its write, and this fill overwrote it with %q: two callers now hold different answers for one key. The fill must be one SET NX", stateKey, now.Completion)
+		ctx.Assert(now == rival, "replica B filled %s between this fill's read and its write, and this fill overwrote it with %q: two callers now hold different answers for one key. The fill must be one SET NX", hStateKey, now.Completion)
 		ctx.Assert(returned == rival, "this fill lost the race and answered its own completion %q: the loser must answer the stored record", returned.Completion)
 	} else {
-		ctx.Assert(now == returned && returned == stateRecord("Answer from replica A"), "this fill won the race: the entry and the answer must both be its record, got entry %+v and answer %+v", now, returned)
+		ctx.Assert(now == returned && returned == hStateRecord("Answer from replica A"), "this fill won the race: the entry and the answer must both be its record, got entry %+v and answer %+v", now, returned)
 	}
-	ctx.Redis.Set(stateOther, stateJSON(rival), "EX", 120) // two minutes before its version retires
-	late, err := fill(bg, stateOther, stateRecord("late answer"))
+	ctx.Redis.Set(hStateOther, hStateJSON(rival), "EX", 120) // two minutes before its version retires
+	late, err := fill(bg, hStateOther, hStateRecord("late answer"))
 	ctx.NoError(err, "fill over an existing entry")
-	ctx.Assert(late == rival && stateStored(ctx, stateOther) == rival, "a fill over an existing entry must leave it and answer it, got %+v", late)
-	ttl := ctx.Redis.TTL(stateOther)
+	ctx.Assert(late == rival && hStateStored(ctx, hStateOther) == rival, "a fill over an existing entry must leave it and answer it, got %+v", late)
+	ttl := ctx.Redis.TTL(hStateOther)
 	ctx.Assert(0 < ttl && ttl <= 120, "a fill that found an entry moved its expiry to %d s: the entry must die with its prompt version", ttl)
 }
 
@@ -615,28 +615,28 @@ func CheckVersionTtl(ctx *harness.Ctx) {
 	// The TTL the entry has right after the command that created it (a read of the empty key waits).
 	var watch func() any
 	watch = func() any {
-		if ctx.Redis.Exists(stateKey) == 1 {
-			created, seen = ctx.Redis.TTL(stateKey), true
+		if ctx.Redis.Exists(hStateKey) == 1 {
+			created, seen = ctx.Redis.TTL(hStateKey), true
 		} else {
-			ctx.Redis.After(stateKey, watch)
+			ctx.Redis.After(hStateKey, watch)
 		}
 		return nil
 	}
-	ctx.Redis.After(stateKey, watch)
-	_, err := fill(context.Background(), stateKey, stateRecord("Answer: hello"))
+	ctx.Redis.After(hStateKey, watch)
+	_, err := fill(context.Background(), hStateKey, hStateRecord("Answer: hello"))
 	ctx.NoError(err, "fill")
-	ttl := ctx.Redis.TTL(stateKey)
-	ctx.Assert(ttl != -1, "the entry under %s has no expiry: it outlives its prompt version and keeps serving a retired template", stateKey)
-	ctx.Assert(stateTTL-5 <= ttl && ttl <= stateTTL, "the entry expires in %d s, expected VERSION_TTL_S = %d s set by the fill", ttl, stateTTL)
+	ttl := ctx.Redis.TTL(hStateKey)
+	ctx.Assert(ttl != -1, "the entry under %s has no expiry: it outlives its prompt version and keeps serving a retired template", hStateKey)
+	ctx.Assert(kHStateTTL-5 <= ttl && ttl <= kHStateTTL, "the entry expires in %d s, expected VERSION_TTL_S = %d s set by the fill", ttl, kHStateTTL)
 	ctx.Assert(seen && created != -1, "the entry existed without an expiry right after the command that wrote it: a TTL set by a second command is lost if the process dies in between. The write itself must carry EX")
 }
 
 func CheckHitKeepsTtl(ctx *harness.Ctx) {
-	ctx.Redis.Set(stateKey, stateJSON(stateRecord("Answer: hello")), "EX", 120) // two minutes before its version retires
-	hit, err := lookup(context.Background(), stateKey)
+	ctx.Redis.Set(hStateKey, hStateJSON(hStateRecord("Answer: hello")), "EX", 120) // two minutes before its version retires
+	hit, err := lookup(context.Background(), hStateKey)
 	ctx.NoError(err, "lookup")
-	ctx.Assert(hit != nil && *hit == stateRecord("Answer: hello"), "a lookup must return the stored record, got %+v", hit)
-	ttl := ctx.Redis.TTL(stateKey)
+	ctx.Assert(hit != nil && *hit == hStateRecord("Answer: hello"), "a lookup must return the stored record, got %+v", hit)
+	ttl := ctx.Redis.TTL(hStateKey)
 	ctx.Assert(0 < ttl && ttl <= 120, "a hit moved the entry's expiry to %d s: an entry must die with its prompt version, however often it is read", ttl)
 }
 `,
@@ -647,17 +647,17 @@ func CheckHitKeepsTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kKey = "pc:t1:7:" + std::string(64, 'a');
-const std::string kOther = "pc:t1:7:" + std::string(64, 'c');
-constexpr long long kTtl = 6 * 3600;
+const std::string kHKey = "pc:t1:7:" + std::string(64, 'a');
+const std::string kHOther = "pc:t1:7:" + std::string(64, 'c');
+constexpr long long kHTtl = 6 * 3600;
 
-record::Record stateRecord(const std::string& completion) { return {"t1", 7, completion, 3}; }
+record::Record hStateRecord(const std::string& completion) { return {"t1", 7, completion, 3}; }
 
-bool same(const record::Record& a, const record::Record& b) {
+bool hSame(const record::Record& a, const record::Record& b) {
   return a.tenant == b.tenant && a.version == b.version && a.completion == b.completion && a.tokens == b.tokens;
 }
 
-record::Record stored(harness::Ctx& ctx, const std::string& key) {
+record::Record hStored(harness::Ctx& ctx, const std::string& key) {
   const auto raw = ctx.Redis.Get(key);
   ctx.Assert(raw.has_value(), "nothing is stored under %s", key);
   return record::decode(*raw);
@@ -666,36 +666,36 @@ record::Record stored(harness::Ctx& ctx, const std::string& key) {
 }  // namespace
 
 void CheckRoundTrip(harness::Ctx& ctx) {
-  ctx.Assert(!lookup(kKey).has_value(), "an empty cache must answer nothing");
-  const record::Record first = fill(kKey, stateRecord("Answer: hello"));
-  ctx.Assert(same(first, stateRecord("Answer: hello")), "the first fill must return its own record, got completion %q", first.completion);
-  ctx.Assert(same(stored(ctx, kKey), stateRecord("Answer: hello")), "the entry under %s must be the record's JSON, got %s", kKey, ctx.Redis.Get(kKey).value_or(""));
-  const auto again = lookup(kKey);
-  ctx.Assert(again.has_value() && same(*again, stateRecord("Answer: hello")), "a lookup after the fill must return the record");
+  ctx.Assert(!lookup(kHKey).has_value(), "an empty cache must answer nothing");
+  const record::Record first = fill(kHKey, hStateRecord("Answer: hello"));
+  ctx.Assert(hSame(first, hStateRecord("Answer: hello")), "the first fill must return its own record, got completion %q", first.completion);
+  ctx.Assert(hSame(hStored(ctx, kHKey), hStateRecord("Answer: hello")), "the entry under %s must be the record's JSON, got %s", kHKey, ctx.Redis.Get(kHKey).value_or(""));
+  const auto again = lookup(kHKey);
+  ctx.Assert(again.has_value() && hSame(*again, hStateRecord("Answer: hello")), "a lookup after the fill must return the record");
 }
 
 void CheckFirstWriterWins(harness::Ctx& ctx) {
-  const record::Record rival = stateRecord("Answer from replica B");
+  const record::Record rival = hStateRecord("Answer from replica B");
   // Replica B misses on the same prefix and fills (with SET NX EX) the moment this fill first touches the key.
   bool fired = false;
   bool rivalWon = false;
-  ctx.Redis.After(kKey, [&] {
+  ctx.Redis.After(kHKey, [&] {
     fired = true;
-    rivalWon = ctx.Redis.Set(kKey, record::encode(rival), "EX", kTtl, "NX");
+    rivalWon = ctx.Redis.Set(kHKey, record::encode(rival), "EX", kHTtl, "NX");
   });
-  const record::Record returned = fill(kKey, stateRecord("Answer from replica A"));
-  ctx.Assert(fired, "fill never touched %s", kKey);
-  const record::Record now = stored(ctx, kKey);
+  const record::Record returned = fill(kHKey, hStateRecord("Answer from replica A"));
+  ctx.Assert(fired, "fill never touched %s", kHKey);
+  const record::Record now = hStored(ctx, kHKey);
   if (rivalWon) {
-    ctx.Assert(same(now, rival), "replica B filled %s between this fill's read and its write, and this fill overwrote it with %q: two callers now hold different answers for one key. The fill must be one SET NX", kKey, now.completion);
-    ctx.Assert(same(returned, rival), "this fill lost the race and answered its own completion %q: the loser must answer the stored record", returned.completion);
+    ctx.Assert(hSame(now, rival), "replica B filled %s between this fill's read and its write, and this fill overwrote it with %q: two callers now hold different answers for one key. The fill must be one SET NX", kHKey, now.completion);
+    ctx.Assert(hSame(returned, rival), "this fill lost the race and answered its own completion %q: the loser must answer the stored record", returned.completion);
   } else {
-    ctx.Assert(same(now, returned) && same(returned, stateRecord("Answer from replica A")), "this fill won the race: the entry and the answer must both be its record, got entry %q and answer %q", now.completion, returned.completion);
+    ctx.Assert(hSame(now, returned) && hSame(returned, hStateRecord("Answer from replica A")), "this fill won the race: the entry and the answer must both be its record, got entry %q and answer %q", now.completion, returned.completion);
   }
-  ctx.Redis.Set(kOther, record::encode(rival), "EX", 120);  // two minutes before its version retires
-  const record::Record late = fill(kOther, stateRecord("late answer"));
-  ctx.Assert(same(late, rival) && same(stored(ctx, kOther), rival), "a fill over an existing entry must leave it and answer it, got %q", late.completion);
-  const long long otherTtl = ctx.Redis.TTL(kOther);
+  ctx.Redis.Set(kHOther, record::encode(rival), "EX", 120);  // two minutes before its version retires
+  const record::Record late = fill(kHOther, hStateRecord("late answer"));
+  ctx.Assert(hSame(late, rival) && hSame(hStored(ctx, kHOther), rival), "a fill over an existing entry must leave it and answer it, got %q", late.completion);
+  const long long otherTtl = ctx.Redis.TTL(kHOther);
   ctx.Assert(0 < otherTtl && otherTtl <= 120, "a fill that found an entry moved its expiry to %d s: the entry must die with its prompt version", otherTtl);
 }
 
@@ -704,26 +704,26 @@ void CheckVersionTtl(harness::Ctx& ctx) {
   long long created = -1;
   // The TTL the entry has right after the command that created it (a read of the empty key waits).
   std::function<void()> watch = [&] {
-    if (ctx.Redis.Exists(kKey) == 1) {
-      created = ctx.Redis.TTL(kKey);
+    if (ctx.Redis.Exists(kHKey) == 1) {
+      created = ctx.Redis.TTL(kHKey);
       seen = true;
     } else {
-      ctx.Redis.After(kKey, watch);
+      ctx.Redis.After(kHKey, watch);
     }
   };
-  ctx.Redis.After(kKey, watch);
-  fill(kKey, stateRecord("Answer: hello"));
-  const long long ttl = ctx.Redis.TTL(kKey);
-  ctx.Assert(ttl != -1, "the entry under %s has no expiry: it outlives its prompt version and keeps serving a retired template", kKey);
-  ctx.Assert(kTtl - 5 <= ttl && ttl <= kTtl, "the entry expires in %d s, expected VERSION_TTL_S = %d s set by the fill", ttl, kTtl);
+  ctx.Redis.After(kHKey, watch);
+  fill(kHKey, hStateRecord("Answer: hello"));
+  const long long ttl = ctx.Redis.TTL(kHKey);
+  ctx.Assert(ttl != -1, "the entry under %s has no expiry: it outlives its prompt version and keeps serving a retired template", kHKey);
+  ctx.Assert(kHTtl - 5 <= ttl && ttl <= kHTtl, "the entry expires in %d s, expected VERSION_TTL_S = %d s set by the fill", ttl, kHTtl);
   ctx.Assert(seen && created != -1, "the entry existed without an expiry right after the command that wrote it: a TTL set by a second command is lost if the process dies in between. The write itself must carry EX");
 }
 
 void CheckHitKeepsTtl(harness::Ctx& ctx) {
-  ctx.Redis.Set(kKey, record::encode(stateRecord("Answer: hello")), "EX", 120);  // two minutes before its version retires
-  const auto hit = lookup(kKey);
-  ctx.Assert(hit.has_value() && same(*hit, stateRecord("Answer: hello")), "a lookup must return the stored record");
-  const long long ttl = ctx.Redis.TTL(kKey);
+  ctx.Redis.Set(kHKey, record::encode(hStateRecord("Answer: hello")), "EX", 120);  // two minutes before its version retires
+  const auto hit = lookup(kHKey);
+  ctx.Assert(hit.has_value() && hSame(*hit, hStateRecord("Answer: hello")), "a lookup must return the stored record");
+  const long long ttl = ctx.Redis.TTL(kHKey);
   ctx.Assert(0 < ttl && ttl <= 120, "a hit moved the entry's expiry to %d s: an entry must die with its prompt version, however often it is read", ttl);
 }
 `,

@@ -1170,26 +1170,26 @@ import (
 	"leetbuild/harness"
 )
 
-const clientCat = "tenants/t1/images/cat.jpg"
+const kHClientCat = "tenants/t1/images/cat.jpg"
 
 // modelPeer is one model deployment: answers from vision/models with its own version.
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedPredictorServer
 	version string
 }
 
-func (p *modelPeer) Predict(_ context.Context, req *pb.PredictRequest) (*pb.PredictReply, error) {
+func (p *HModelPeer) Predict(_ context.Context, req *pb.PredictRequest) (*pb.PredictReply, error) {
 	label, confidence := models.Answer(req.GetTask(), p.version)
 	return &pb.PredictReply{Label: label, Confidence: confidence, ModelVersion: p.version}, nil
 }
 
 // clientPool stands in for the step-2 GPU pool over the harness's Redis.
-type clientPool struct {
+type HClientPool struct {
 	ctx  *harness.Ctx
 	next int
 }
 
-func (p *clientPool) Admit(_ context.Context, tenant string) (Admission, error) {
+func (p *HClientPool) Admit(_ context.Context, tenant string) (Admission, error) {
 	now := p.ctx.Clock.Now() / 1000
 	key := config.GPUKey(tenant)
 	p.ctx.Redis.Do("ZREMRANGEBYSCORE", key, "-inf", now)
@@ -1202,27 +1202,27 @@ func (p *clientPool) Admit(_ context.Context, tenant string) (Admission, error) 
 	return Admission{Ticket: ticket}, nil
 }
 
-func (p *clientPool) Release(_ context.Context, tenant, ticket string) (bool, error) {
+func (p *HClientPool) Release(_ context.Context, tenant, ticket string) (bool, error) {
 	removed, _ := p.ctx.Redis.Do("ZREM", config.GPUKey(tenant), ticket).(int64)
 	return removed == 1, nil
 }
 
-func clientWorld(ctx *harness.Ctx) *clientPool {
-	pb.RegisterPredictorServer(ctx.GRPC.Server(config.LargeModel), &modelPeer{version: models.LargeVersion})
-	pb.RegisterPredictorServer(ctx.GRPC.Server(config.SmallModel), &modelPeer{version: models.SmallVersion})
-	return &clientPool{ctx: ctx}
+func hClientWorld(ctx *harness.Ctx) *HClientPool {
+	pb.RegisterPredictorServer(ctx.GRPC.Server(config.LargeModel), &HModelPeer{version: models.LargeVersion})
+	pb.RegisterPredictorServer(ctx.GRPC.Server(config.SmallModel), &HModelPeer{version: models.SmallVersion})
+	return &HClientPool{ctx: ctx}
 }
 
-func clientPredict(ctx *harness.Ctx, pool *clientPool, tenant, inferenceID string) Prediction {
-	r, err := predict(context.Background(), pool, tenant, inferenceID, clientCat, "classify")
+func hClientPredict(ctx *harness.Ctx, pool *HClientPool, tenant, inferenceID string) Prediction {
+	r, err := predict(context.Background(), pool, tenant, inferenceID, kHClientCat, "classify")
 	ctx.NoError(err, "predict(%s)", inferenceID)
 	return r
 }
 
-func clientLarge(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Predict", config.LargeModel) }
-func clientSmall(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Predict", config.SmallModel) }
+func hClientLarge(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Predict", config.LargeModel) }
+func hClientSmall(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Predict", config.SmallModel) }
 
-func clientExpect(ctx *harness.Ctx, r Prediction, status, reason string) {
+func hClientExpect(ctx *harness.Ctx, r Prediction, status, reason string) {
 	ctx.Equal(r.Status, status, "the prediction's status (%+v)", r)
 	if reason != "" {
 		ctx.Equal(r.Reason, reason, "the prediction's reason (%+v)", r)
@@ -1230,92 +1230,92 @@ func clientExpect(ctx *harness.Ctx, r Prediction, status, reason string) {
 }
 
 func CheckAttemptDeadline(ctx *harness.Ctx) {
-	pool := clientWorld(ctx)
-	r := clientPredict(ctx, pool, "t1", "inf-1")
-	clientExpect(ctx, r, "complete", "")
-	ctx.Equal(len(clientLarge(ctx)), 1, "a healthy large model is called once; calls")
-	ctx.Assert(clientLarge(ctx)[0].HasDeadline(), "the Predict call carries no deadline: a hung model holds the GPU slot until it answers")
-	timeout := clientLarge(ctx)[0].Timeout
+	pool := hClientWorld(ctx)
+	r := hClientPredict(ctx, pool, "t1", "inf-1")
+	hClientExpect(ctx, r, "complete", "")
+	ctx.Equal(len(hClientLarge(ctx)), 1, "a healthy large model is called once; calls")
+	ctx.Assert(hClientLarge(ctx)[0].HasDeadline(), "the Predict call carries no deadline: a hung model holds the GPU slot until it answers")
+	timeout := hClientLarge(ctx)[0].Timeout
 	ctx.Assert(1500*time.Millisecond <= timeout && timeout <= 2500*time.Millisecond, "the deadline must be 2 s, got %v", timeout)
 	ctx.Assert(r.Label == "tabby_cat" && r.ModelVersion == models.LargeVersion && !r.Downgraded, "a large-model answer carries its label, ModelVersion %s and Downgraded false: %+v", models.LargeVersion, r)
 	ctx.GRPC.SetLatency("Predict", 5.0, config.LargeModel)
 	started := ctx.Clock.Now()
-	r = clientPredict(ctx, pool, "t1", "inf-2")
+	r = hClientPredict(ctx, pool, "t1", "inf-2")
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	clientExpect(ctx, r, "complete", "")
-	ctx.Equal(len(clientLarge(ctx)), 4, "a hung large model is cut at the deadline and retried up to 3 calls; large calls so far")
+	hClientExpect(ctx, r, "complete", "")
+	ctx.Equal(len(hClientLarge(ctx)), 4, "a hung large model is cut at the deadline and retried up to 3 calls; large calls so far")
 	ctx.Assert(r.ModelVersion == models.SmallVersion && r.Downgraded && r.DowngradeReason == "deadline", "after three cut calls the small model answers, downgraded with reason deadline: %+v", r)
 	ctx.Assert(waited <= 8.0, "predict waited %.1f s on a model that hangs: three 2 s deadlines and a small call fit in about 7 s", waited)
-	for _, call := range append(clientLarge(ctx)[1:], clientSmall(ctx)...) {
+	for _, call := range append(hClientLarge(ctx)[1:], hClientSmall(ctx)...) {
 		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "every call carries its own 2 s deadline, the retries and the small-model call included: a call went out with %v (deadline set: %t)", call.Timeout, call.HasDeadline())
 	}
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	pool := clientWorld(ctx)
+	pool := hClientWorld(ctx)
 	ctx.GRPC.Fail("Predict", codes.InvalidArgument, "image is not decodable", 1, config.LargeModel)
-	r := clientPredict(ctx, pool, "t1", "inf-1")
-	clientExpect(ctx, r, "failed", "invalid_argument")
+	r := hClientPredict(ctx, pool, "t1", "inf-1")
+	hClientExpect(ctx, r, "failed", "invalid_argument")
 	ctx.Equal(r.Label, "", "a failed inference carries no label")
-	ctx.Assert(len(clientLarge(ctx)) == 1 && len(clientSmall(ctx)) == 0, "INVALID_ARGUMENT is an answer, not an outage: one call and no downgrade, saw %d large and %d small calls", len(clientLarge(ctx)), len(clientSmall(ctx)))
+	ctx.Assert(len(hClientLarge(ctx)) == 1 && len(hClientSmall(ctx)) == 0, "INVALID_ARGUMENT is an answer, not an outage: one call and no downgrade, saw %d large and %d small calls", len(hClientLarge(ctx)), len(hClientSmall(ctx)))
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "replica restarting", 1, config.LargeModel)
-	r = clientPredict(ctx, pool, "t1", "inf-2")
-	clientExpect(ctx, r, "complete", "")
-	ctx.Assert(r.Attempts == 2 && len(clientLarge(ctx)) == 3, "one UNAVAILABLE earns one retry on the large model: %+v, %d large calls", r, len(clientLarge(ctx))-1)
-	ctx.Assert(r.ModelVersion == models.LargeVersion && len(clientSmall(ctx)) == 0, "the retry answered, so no downgrade: %+v", r)
+	r = hClientPredict(ctx, pool, "t1", "inf-2")
+	hClientExpect(ctx, r, "complete", "")
+	ctx.Assert(r.Attempts == 2 && len(hClientLarge(ctx)) == 3, "one UNAVAILABLE earns one retry on the large model: %+v, %d large calls", r, len(hClientLarge(ctx))-1)
+	ctx.Assert(r.ModelVersion == models.LargeVersion && len(hClientSmall(ctx)) == 0, "the retry answered, so no downgrade: %+v", r)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	for i, tc := range []struct {
 		code   codes.Code
 		name   string
 		reason string
 	}{{codes.ResourceExhausted, "RESOURCE_EXHAUSTED", "resource_exhausted"}, {codes.PermissionDenied, "PERMISSION_DENIED", ""}} {
-		before := len(clientLarge(ctx))
+		before := len(hClientLarge(ctx))
 		ctx.GRPC.Fail("Predict", tc.code, "refused", 1, config.LargeModel)
-		r = clientPredict(ctx, pool, "t1", "inf-"+string(rune('3'+i)))
-		clientExpect(ctx, r, "failed", tc.reason)
-		ctx.Assert(len(clientLarge(ctx)) == before+1 && len(clientSmall(ctx)) == 0, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw %d large and %d small calls", tc.name, len(clientLarge(ctx))-before, len(clientSmall(ctx)))
+		r = hClientPredict(ctx, pool, "t1", "inf-"+string(rune('3'+i)))
+		hClientExpect(ctx, r, "failed", tc.reason)
+		ctx.Assert(len(hClientLarge(ctx)) == before+1 && len(hClientSmall(ctx)) == 0, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw %d large and %d small calls", tc.name, len(hClientLarge(ctx))-before, len(hClientSmall(ctx)))
 	}
 }
 
 func CheckDowngrade(ctx *harness.Ctx) {
-	pool := clientWorld(ctx)
+	pool := hClientWorld(ctx)
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "large pool drained", 3, config.LargeModel)
-	r := clientPredict(ctx, pool, "t1", "inf-1")
-	clientExpect(ctx, r, "complete", "")
-	ctx.Assert(len(clientLarge(ctx)) == 3 && len(clientSmall(ctx)) == 1, "three large calls, then one small call: saw %d and %d", len(clientLarge(ctx)), len(clientSmall(ctx)))
+	r := hClientPredict(ctx, pool, "t1", "inf-1")
+	hClientExpect(ctx, r, "complete", "")
+	ctx.Assert(len(hClientLarge(ctx)) == 3 && len(hClientSmall(ctx)) == 1, "three large calls, then one small call: saw %d and %d", len(hClientLarge(ctx)), len(hClientSmall(ctx)))
 	ctx.Assert(r.Label == "tabby_cat" && r.Confidence == 0.81 && r.ModelVersion == models.SmallVersion, "the small model's answer, with its version: %+v", r)
 	ctx.Assert(r.Downgraded && r.DowngradeReason == "unavailable", "a downgrade is recorded (Downgraded true, DowngradeReason unavailable): %+v", r)
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "large pool drained", 3, config.LargeModel)
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "small pool drained", 1, config.SmallModel)
-	r = clientPredict(ctx, pool, "t1", "inf-2")
+	r = hClientPredict(ctx, pool, "t1", "inf-2")
 	ctx.Assert(r.Label != "unknown", "both models are down and predict invented a label: %+v", r)
-	clientExpect(ctx, r, "failed", "unavailable")
+	hClientExpect(ctx, r, "failed", "unavailable")
 	ctx.Equal(r.Label, "", "a failed inference carries no label")
 }
 
 func CheckThrottledNoCall(ctx *harness.Ctx) {
-	pool := clientWorld(ctx)
+	pool := hClientWorld(ctx)
 	for i := 0; i < 10; i++ {
 		a, _ := pool.Admit(context.Background(), "t1")
 		ctx.Assert(a.Ticket != "", "admission %d into an empty pool", i+1)
 	}
-	r := clientPredict(ctx, pool, "t1", "inf-1")
+	r := hClientPredict(ctx, pool, "t1", "inf-1")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Predict", "")), 0, "t1's pool is full and predict still called the model; calls")
-	clientExpect(ctx, r, "throttled", "")
+	hClientExpect(ctx, r, "throttled", "")
 	ctx.Assert(r.RetryAfter == 60, "a throttled result carries the pool's RetryAfter (this pool answered 60): %+v", r)
-	clientExpect(ctx, clientPredict(ctx, pool, "t2", "inf-2"), "complete", "")
+	hClientExpect(ctx, hClientPredict(ctx, pool, "t2", "inf-2"), "complete", "")
 }
 
 func CheckReleaseEveryPath(ctx *harness.Ctx) {
-	pool := clientWorld(ctx)
-	clientExpect(ctx, clientPredict(ctx, pool, "t1", "inf-1"), "complete", "")
+	pool := hClientWorld(ctx)
+	hClientExpect(ctx, hClientPredict(ctx, pool, "t1", "inf-1"), "complete", "")
 	ctx.Equal(ctx.Redis.ZCard(config.GPUKey("t1")), 0, "after a complete inference; GPU slots t1 still holds")
 	ctx.GRPC.Fail("Predict", codes.InvalidArgument, "image is not decodable", 1, config.LargeModel)
-	clientPredict(ctx, pool, "t1", "inf-2")
+	hClientPredict(ctx, pool, "t1", "inf-2")
 	ctx.Equal(ctx.Redis.ZCard(config.GPUKey("t1")), 0, "after a rejected inference; GPU slots t1 still holds")
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "large pool drained", 5, config.LargeModel)
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "small pool drained", 5, config.SmallModel)
-	clientPredict(ctx, pool, "t1", "inf-3")
+	hClientPredict(ctx, pool, "t1", "inf-3")
 	ctx.Equal(ctx.Redis.ZCard(config.GPUKey("t1")), 0, "after an inference both models failed (release on every path); GPU slots t1 still holds")
 }
 `,
@@ -1327,12 +1327,12 @@ func CheckReleaseEveryPath(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kCat = "tenants/t1/images/cat.jpg";
+const std::string kHCat = "tenants/t1/images/cat.jpg";
 
 // One model deployment: answers from vision/models.h with its own version.
-class ModelPeer final : public vision::Predictor::Service {
+class HModelPeer final : public vision::Predictor::Service {
  public:
-  explicit ModelPeer(std::string version) : version_(std::move(version)) {}
+  explicit HModelPeer(std::string version) : version_(std::move(version)) {}
   grpc::Status Predict(grpc::ServerContext*, const vision::PredictRequest* req, vision::PredictReply* reply) override {
     const auto answer = models::answer(req->task(), version_);
     reply->set_label(answer.label);
@@ -1346,9 +1346,9 @@ class ModelPeer final : public vision::Predictor::Service {
 };
 
 // Stands in for the step-2 GPU pool over the harness's Redis.
-class ClientPool final : public Pool {
+class HClientPool final : public Pool {
  public:
-  explicit ClientPool(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HClientPool(harness::Ctx& ctx) : ctx_(ctx) {}
 
   Admission admit(const std::string& tenant) override {
     const long long now = ctx_.Clock.Now() / 1000;
@@ -1369,26 +1369,26 @@ class ClientPool final : public Pool {
   int next_ = 0;
 };
 
-struct World {
-  ModelPeer large{models::kLargeVersion};
-  ModelPeer small{models::kSmallVersion};
-  ClientPool pool;
-  explicit World(harness::Ctx& ctx) : pool(ctx) {}
+struct HWorld {
+  HModelPeer large{models::kLargeVersion};
+  HModelPeer small{models::kSmallVersion};
+  HClientPool pool;
+  explicit HWorld(harness::Ctx& ctx) : pool(ctx) {}
 };
 
-World& clientWorld(harness::Ctx& ctx) {
-  static World* world = nullptr;
+HWorld& hClientWorld(harness::Ctx& ctx) {
+  static HWorld* world = nullptr;
   delete world;
-  world = new World(ctx);
+  world = new HWorld(ctx);
   ctx.GRPC.Server(config::kLargeModel)->RegisterService(&world->large);
   ctx.GRPC.Server(config::kSmallModel)->RegisterService(&world->small);
   return *world;
 }
 
-size_t largeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Predict", config::kLargeModel).size(); }
-size_t smallCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Predict", config::kSmallModel).size(); }
+size_t hLargeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Predict", config::kLargeModel).size(); }
+size_t hSmallCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Predict", config::kSmallModel).size(); }
 
-void clientExpect(harness::Ctx& ctx, const Prediction& r, const std::string& status, const std::string& reason = "") {
+void hClientExpect(harness::Ctx& ctx, const Prediction& r, const std::string& status, const std::string& reason = "") {
   ctx.Equal(r.status, status, "the prediction's status (reason %q, label %q, attempts %d)", r.reason, r.label, r.attempts);
   if (!reason.empty()) ctx.Equal(r.reason, reason, "the prediction's reason");
 }
@@ -1396,20 +1396,20 @@ void clientExpect(harness::Ctx& ctx, const Prediction& r, const std::string& sta
 }  // namespace
 
 void CheckAttemptDeadline(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
-  Prediction r = predict(w.pool, "t1", "inf-1", kCat, "classify");
-  clientExpect(ctx, r, "complete");
-  ctx.Equal(largeCalls(ctx), 1, "a healthy large model is called once; calls");
+  auto& w = hClientWorld(ctx);
+  Prediction r = predict(w.pool, "t1", "inf-1", kHCat, "classify");
+  hClientExpect(ctx, r, "complete");
+  ctx.Equal(hLargeCalls(ctx), 1, "a healthy large model is called once; calls");
   const auto first = ctx.GRPC.CallsTo("Predict", config::kLargeModel)[0];
   ctx.Assert(first.HasDeadline(), "the Predict call carries no deadline: a hung model holds the GPU slot until it answers");
   ctx.Assert(1.5 <= first.TimeoutSeconds() && first.TimeoutSeconds() <= 2.5, "the deadline must be 2 s, got %vs", first.TimeoutSeconds());
   ctx.Assert(r.label == "tabby_cat" && r.model_version == models::kLargeVersion && !r.downgraded, "a large-model answer carries its label, model_version %s and downgraded false (got %q, %q)", models::kLargeVersion, r.label, r.model_version);
   ctx.GRPC.SetLatency("Predict", 5.0, config::kLargeModel);
   const int64_t started = ctx.Clock.Now();
-  r = predict(w.pool, "t1", "inf-2", kCat, "classify");
+  r = predict(w.pool, "t1", "inf-2", kHCat, "classify");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  clientExpect(ctx, r, "complete");
-  ctx.Equal(largeCalls(ctx), 4, "a hung large model is cut at the deadline and retried up to 3 calls; large calls so far");
+  hClientExpect(ctx, r, "complete");
+  ctx.Equal(hLargeCalls(ctx), 4, "a hung large model is cut at the deadline and retried up to 3 calls; large calls so far");
   ctx.Assert(r.model_version == models::kSmallVersion && r.downgraded && r.downgrade_reason == "deadline", "after three cut calls the small model answers, downgraded with reason deadline (got %q, %q)", r.model_version, r.downgrade_reason);
   ctx.Assert(waited <= 8.0, "predict waited %.1f s on a model that hangs: three 2 s deadlines and a small call fit in about 7 s", waited);
   auto later = ctx.GRPC.CallsTo("Predict", config::kLargeModel);
@@ -1421,17 +1421,17 @@ void CheckAttemptDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
+  auto& w = hClientWorld(ctx);
   ctx.GRPC.Fail("Predict", grpc::StatusCode::INVALID_ARGUMENT, "image is not decodable", 1, config::kLargeModel);
-  Prediction r = predict(w.pool, "t1", "inf-1", kCat, "classify");
-  clientExpect(ctx, r, "failed", "invalid_argument");
+  Prediction r = predict(w.pool, "t1", "inf-1", kHCat, "classify");
+  hClientExpect(ctx, r, "failed", "invalid_argument");
   ctx.Equal(r.label, "", "a failed inference carries no label");
-  ctx.Assert(largeCalls(ctx) == 1 && smallCalls(ctx) == 0, "INVALID_ARGUMENT is an answer, not an outage: one call and no downgrade, saw %d large and %d small calls", largeCalls(ctx), smallCalls(ctx));
+  ctx.Assert(hLargeCalls(ctx) == 1 && hSmallCalls(ctx) == 0, "INVALID_ARGUMENT is an answer, not an outage: one call and no downgrade, saw %d large and %d small calls", hLargeCalls(ctx), hSmallCalls(ctx));
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "replica restarting", 1, config::kLargeModel);
-  r = predict(w.pool, "t1", "inf-2", kCat, "classify");
-  clientExpect(ctx, r, "complete");
-  ctx.Assert(r.attempts == 2 && largeCalls(ctx) == 3, "one UNAVAILABLE earns one retry on the large model: attempts %d, %d large calls", r.attempts, largeCalls(ctx) - 1);
-  ctx.Assert(r.model_version == models::kLargeVersion && smallCalls(ctx) == 0, "the retry answered, so no downgrade (model_version %q)", r.model_version);
+  r = predict(w.pool, "t1", "inf-2", kHCat, "classify");
+  hClientExpect(ctx, r, "complete");
+  ctx.Assert(r.attempts == 2 && hLargeCalls(ctx) == 3, "one UNAVAILABLE earns one retry on the large model: attempts %d, %d large calls", r.attempts, hLargeCalls(ctx) - 1);
+  ctx.Assert(r.model_version == models::kLargeVersion && hSmallCalls(ctx) == 0, "the retry answered, so no downgrade (model_version %q)", r.model_version);
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   struct Terminal {
     grpc::StatusCode code;
@@ -1440,50 +1440,50 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   };
   int n = 3;
   for (const Terminal& t : {Terminal{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"}, Terminal{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", ""}}) {
-    const size_t before = largeCalls(ctx);
+    const size_t before = hLargeCalls(ctx);
     ctx.GRPC.Fail("Predict", t.code, "refused", 1, config::kLargeModel);
-    r = predict(w.pool, "t1", "inf-" + std::to_string(n++), kCat, "classify");
-    clientExpect(ctx, r, "failed", t.reason);
-    ctx.Assert(largeCalls(ctx) == before + 1 && smallCalls(ctx) == 0, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw %d large and %d small calls", t.name, largeCalls(ctx) - before, smallCalls(ctx));
+    r = predict(w.pool, "t1", "inf-" + std::to_string(n++), kHCat, "classify");
+    hClientExpect(ctx, r, "failed", t.reason);
+    ctx.Assert(hLargeCalls(ctx) == before + 1 && hSmallCalls(ctx) == 0, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED: one call and no downgrade, saw %d large and %d small calls", t.name, hLargeCalls(ctx) - before, hSmallCalls(ctx));
   }
 }
 
 void CheckDowngrade(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
+  auto& w = hClientWorld(ctx);
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "large pool drained", 3, config::kLargeModel);
-  Prediction r = predict(w.pool, "t1", "inf-1", kCat, "classify");
-  clientExpect(ctx, r, "complete");
-  ctx.Assert(largeCalls(ctx) == 3 && smallCalls(ctx) == 1, "three large calls, then one small call: saw %d and %d", largeCalls(ctx), smallCalls(ctx));
+  Prediction r = predict(w.pool, "t1", "inf-1", kHCat, "classify");
+  hClientExpect(ctx, r, "complete");
+  ctx.Assert(hLargeCalls(ctx) == 3 && hSmallCalls(ctx) == 1, "three large calls, then one small call: saw %d and %d", hLargeCalls(ctx), hSmallCalls(ctx));
   ctx.Assert(r.label == "tabby_cat" && r.confidence == 0.81 && r.model_version == models::kSmallVersion, "the small model's answer, with its version (got %q, %v, %q)", r.label, r.confidence, r.model_version);
   ctx.Assert(r.downgraded && r.downgrade_reason == "unavailable", "a downgrade is recorded (downgraded true, downgrade_reason unavailable; got %q)", r.downgrade_reason);
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "large pool drained", 3, config::kLargeModel);
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "small pool drained", 1, config::kSmallModel);
-  r = predict(w.pool, "t1", "inf-2", kCat, "classify");
+  r = predict(w.pool, "t1", "inf-2", kHCat, "classify");
   ctx.Assert(r.label != "unknown", "both models are down and predict invented a label (status %q)", r.status);
-  clientExpect(ctx, r, "failed", "unavailable");
+  hClientExpect(ctx, r, "failed", "unavailable");
   ctx.Equal(r.label, "", "a failed inference carries no label");
 }
 
 void CheckThrottledNoCall(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
+  auto& w = hClientWorld(ctx);
   for (int i = 0; i < 10; i++) ctx.Assert(!w.pool.admit("t1").ticket.empty(), "admission %d into an empty pool", i + 1);
-  const Prediction r = predict(w.pool, "t1", "inf-1", kCat, "classify");
+  const Prediction r = predict(w.pool, "t1", "inf-1", kHCat, "classify");
   ctx.Equal(ctx.GRPC.CallsTo("Predict").size(), 0, "t1's pool is full and predict still called the model; calls");
-  clientExpect(ctx, r, "throttled");
+  hClientExpect(ctx, r, "throttled");
   ctx.Assert(r.retry_after == 60, "a throttled result carries the pool's retry_after (this pool answered 60; got %d)", r.retry_after);
-  clientExpect(ctx, predict(w.pool, "t2", "inf-2", kCat, "classify"), "complete");
+  hClientExpect(ctx, predict(w.pool, "t2", "inf-2", kHCat, "classify"), "complete");
 }
 
 void CheckReleaseEveryPath(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx);
-  clientExpect(ctx, predict(w.pool, "t1", "inf-1", kCat, "classify"), "complete");
+  auto& w = hClientWorld(ctx);
+  hClientExpect(ctx, predict(w.pool, "t1", "inf-1", kHCat, "classify"), "complete");
   ctx.Equal(ctx.Redis.ZCard(config::gpu_key("t1")), 0, "after a complete inference; GPU slots t1 still holds");
   ctx.GRPC.Fail("Predict", grpc::StatusCode::INVALID_ARGUMENT, "image is not decodable", 1, config::kLargeModel);
-  predict(w.pool, "t1", "inf-2", kCat, "classify");
+  predict(w.pool, "t1", "inf-2", kHCat, "classify");
   ctx.Equal(ctx.Redis.ZCard(config::gpu_key("t1")), 0, "after a rejected inference; GPU slots t1 still holds");
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "large pool drained", 5, config::kLargeModel);
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "small pool drained", 5, config::kSmallModel);
-  predict(w.pool, "t1", "inf-3", kCat, "classify");
+  predict(w.pool, "t1", "inf-3", kHCat, "classify");
   ctx.Equal(ctx.Redis.ZCard(config::gpu_key("t1")), 0, "after an inference both models failed (release on every path); GPU slots t1 still holds");
 }
 `,

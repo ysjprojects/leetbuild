@@ -729,87 +729,87 @@ import (
 )
 
 const (
-	apiWindow  = "2026-11-02T14:00Z"
-	apiWindow2 = "2026-11-02T15:00Z"
+	kHApiWindow  = "2026-11-02T14:00Z"
+	kHApiWindow2 = "2026-11-02T15:00Z"
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func body(fields map[string]any) map[string]any {
-	out := map[string]any{"window": apiWindow, "resource_class": "gpu-a100", "amount": 4}
+func hBody(fields map[string]any) map[string]any {
+	out := map[string]any{"window": kHApiWindow, "resource_class": "gpu-a100", "amount": 4}
 	for k, v := range fields {
 		out[k] = v
 	}
 	return out
 }
 
-func reserveAs(c *harness.HTTP, team, caller string, fields map[string]any) *harness.Response {
+func hReserveAs(c *harness.HTTP, team, caller string, fields map[string]any) *harness.Response {
 	if caller == "" {
-		return c.Post("/v1/quotas/"+team+"/reserve", body(fields))
+		return c.Post("/v1/quotas/"+team+"/reserve", hBody(fields))
 	}
-	return c.Post("/v1/quotas/"+team+"/reserve", body(fields), "X-Team-Id", caller)
+	return c.Post("/v1/quotas/"+team+"/reserve", hBody(fields), "X-Team-Id", caller)
 }
 
-func ok(r *harness.Response) bool { return r.Status == 200 || r.Status == 201 }
+func hOk(r *harness.Response) bool { return r.Status == 200 || r.Status == 201 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r := reserveAs(api(ctx), "research", "research", nil)
-	ctx.Assert(ok(r), "POST /v1/quotas/research/reserve for 4 of research's 8 units answered %d: %s", r.Status, r.Text())
+	r := hReserveAs(hApi(ctx), "research", "research", nil)
+	ctx.Assert(hOk(r), "POST /v1/quotas/research/reserve for 4 of research's 8 units answered %d: %s", r.Status, r.Text())
 }
 
 func CheckTeamScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	anonymous := reserveAs(c, "research", "", nil)
+	c := hApi(ctx)
+	anonymous := hReserveAs(c, "research", "", nil)
 	ctx.Equal(anonymous.Status, 401, "a reserve without X-Team-Id; the status")
-	anonymous = reserveAs(c, "research", "", map[string]any{"window": "tomorrow"})
+	anonymous = hReserveAs(c, "research", "", map[string]any{"window": "tomorrow"})
 	ctx.Equal(anonymous.Status, 401, "a reserve without X-Team-Id and with a bad window (the caller is checked before any field); the status")
-	foreign := reserveAs(c, "vision", "research", nil)
+	foreign := hReserveAs(c, "vision", "research", nil)
 	ctx.Equal(foreign.Status, 403, "team research reserving on /v1/quotas/vision/reserve (the path names another team's quota); the status")
-	foreign = reserveAs(c, "vision", "research", map[string]any{"resource_class": "gpu-z9"})
+	foreign = hReserveAs(c, "vision", "research", map[string]any{"resource_class": "gpu-z9"})
 	ctx.Equal(foreign.Status, 403, "team research reserving on /v1/quotas/vision/reserve with an unknown class (the caller is checked before any field, so another team's path tells it nothing); the status")
 	written := append(ctx.Redis.Keys("quota:*"), ctx.Redis.Keys("reservation:*")...)
 	ctx.Equal(len(written), 0, "the refused reserves must not write the ledger (%v); the keys", written)
-	own := reserveAs(c, "research", "research", nil)
-	ctx.Assert(ok(own), "research reserving on its own path answered %d: %s", own.Status, own.Text())
+	own := hReserveAs(c, "research", "research", nil)
+	ctx.Assert(hOk(own), "research reserving on its own path answered %d: %s", own.Status, own.Text())
 }
 
 func CheckWindowAndAmount(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, window := range []string{"tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"} {
-		r := reserveAs(c, "research", "research", map[string]any{"window": window})
+		r := hReserveAs(c, "research", "research", map[string]any{"window": window})
 		ctx.Equal(r.Status, 400, "a reserve for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window)
 	}
 	for _, amount := range []any{0, -3, 65, 2.5} {
-		r := reserveAs(c, "research", "research", map[string]any{"amount": amount})
+		r := hReserveAs(c, "research", "research", map[string]any{"amount": amount})
 		ctx.Equal(r.Status, 400, "a reserve of %v units (the amount is an integer from 1 to 64); the status", amount)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("quota:*")), 0, "a rejected reserve must not write the ledger; the keys")
-	r := reserveAs(c, "research", "research", map[string]any{"amount": 1})
-	ctx.Assert(ok(r), "a valid reserve of 1 unit answered %d: %s", r.Status, r.Text())
+	r := hReserveAs(c, "research", "research", map[string]any{"amount": 1})
+	ctx.Assert(hOk(r), "a valid reserve of 1 unit answered %d: %s", r.Status, r.Text())
 	ctx.Redis.Do("HSET", "quota:limits", "research", 64)
-	r = reserveAs(c, "research", "research", map[string]any{"window": apiWindow2, "amount": 64})
-	ctx.Assert(ok(r), "with research's limit at 64 a reserve of 64 units answered %d: %s. 64 is MAX_RESERVE_AMOUNT itself and is allowed", r.Status, r.Text())
+	r = hReserveAs(c, "research", "research", map[string]any{"window": kHApiWindow2, "amount": 64})
+	ctx.Assert(hOk(r), "with research's limit at 64 a reserve of 64 units answered %d: %s. 64 is MAX_RESERVE_AMOUNT itself and is allowed", r.Status, r.Text())
 }
 
 func CheckResourceClass(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, class := range []string{"gpu-z9", "GPU-A100", ""} {
-		r := reserveAs(c, "research", "research", map[string]any{"resource_class": class})
+		r := hReserveAs(c, "research", "research", map[string]any{"resource_class": class})
 		ctx.Equal(r.Status, 400, "a reserve of resource class %q (the broker has no pool for it); the status", class)
 	}
 	for _, class := range []string{"gpu-a100", "gpu-h100", "tpu-v5"} {
-		r := reserveAs(c, "research", "research", map[string]any{"resource_class": class, "amount": 1})
-		ctx.Assert(ok(r), "a reserve of %s answered %d: %s", class, r.Status, r.Text())
+		r := hReserveAs(c, "research", "research", map[string]any{"resource_class": class, "amount": 1})
+		ctx.Assert(hOk(r), "a reserve of %s answered %d: %s", class, r.Status, r.Text())
 	}
 }
 
 func CheckRecorded(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := reserveAs(c, "research", "research", map[string]any{"amount": 5})
+	c := hApi(ctx)
+	first := hReserveAs(c, "research", "research", map[string]any{"amount": 5})
 	ctx.Equal(first.Status, 201, "a reserve of 5 of research's 8 units must answer 201 with the reservation (%s); the status", first.Text())
 	var got struct {
 		ReservationID string \`json:"reservation_id"\`
@@ -820,19 +820,19 @@ func CheckRecorded(ctx *harness.Ctx) {
 	}
 	first.Decode(&got)
 	ctx.Assert(got.ReservationID != "", "the 201 carries no reservation_id: %s. A release or a consume needs it", first.Text())
-	ctx.Assert(got.Team == "research" && got.Window == apiWindow && got.ResourceClass == "gpu-a100" && got.Amount == 5, "the 201 body is %s, expected the team, window, resource_class and amount of the grant", first.Text())
+	ctx.Assert(got.Team == "research" && got.Window == kHApiWindow && got.ResourceClass == "gpu-a100" && got.Amount == 5, "the 201 body is %s, expected the team, window, resource_class and amount of the grant", first.Text())
 	record := ctx.Redis.HGetAll("reservation:research:" + got.ReservationID)
-	ctx.Assert(record["amount"] == "5" && record["window"] == apiWindow, "reservation:research:%s holds %v: the grant must be recorded through ledger.Reserve", got.ReservationID, record)
-	reserved, _ := ctx.Redis.HGet("quota:research:"+apiWindow, "reserved")
-	ctx.Equal(reserved, "5", "quota:research:%s reserved", apiWindow)
-	second := reserveAs(c, "research", "research", map[string]any{"amount": 5})
+	ctx.Assert(record["amount"] == "5" && record["window"] == kHApiWindow, "reservation:research:%s holds %v: the grant must be recorded through ledger.Reserve", got.ReservationID, record)
+	reserved, _ := ctx.Redis.HGet("quota:research:"+kHApiWindow, "reserved")
+	ctx.Equal(reserved, "5", "quota:research:%s reserved", kHApiWindow)
+	second := hReserveAs(c, "research", "research", map[string]any{"amount": 5})
 	ctx.Assert(second.Status == 409 && strings.Contains(second.Text(), "quota_exhausted"), "with 3 of research's 8 units left a reserve of 5 answered %d %s, expected 409 quota_exhausted: the same units went to two jobs", second.Status, second.Text())
-	third := reserveAs(c, "research", "research", map[string]any{"amount": 3})
+	third := hReserveAs(c, "research", "research", map[string]any{"amount": 3})
 	ctx.Equal(third.Status, 201, "the last 3 units must still be granted (%s); the status", third.Text())
-	ctx.Redis.After("quota:research:"+apiWindow2, func() any {
-		return ctx.Redis.Do("HSET", "quota:research:"+apiWindow2, "limit", 8, "reserved", 8, "consumed", 0)
+	ctx.Redis.After("quota:research:"+kHApiWindow2, func() any {
+		return ctx.Redis.Do("HSET", "quota:research:"+kHApiWindow2, "limit", 8, "reserved", 8, "consumed", 0)
 	})
-	raced := reserveAs(c, "research", "research", map[string]any{"window": apiWindow2, "amount": 4})
+	raced := hReserveAs(c, "research", "research", map[string]any{"window": kHApiWindow2, "amount": 4})
 	if raced.Status != 409 {
 		var racedBody struct {
 			ReservationID string \`json:"reservation_id"\`
@@ -841,7 +841,7 @@ func CheckRecorded(ctx *harness.Ctx) {
 			raced.Decode(&racedBody)
 		}
 		amount, _ := ctx.Redis.HGet("reservation:research:"+racedBody.ReservationID, "amount")
-		ctx.Assert(racedBody.ReservationID != "" && amount == "4", "another broker took the rest of window %s right after this reserve first touched it, and the reserve answered %d %s: the answer must come from what ledger.Reserve returned, a reservation or 409", apiWindow2, raced.Status, raced.Text())
+		ctx.Assert(racedBody.ReservationID != "" && amount == "4", "another broker took the rest of window %s right after this reserve first touched it, and the reserve answered %d %s: the answer must come from what ledger.Reserve returned, a reservation or 409", kHApiWindow2, raced.Status, raced.Text())
 	}
 }
 `,
@@ -853,10 +853,10 @@ func CheckRecorded(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kW = "2026-11-02T14:00Z";
-const std::string kW2 = "2026-11-02T15:00Z";
+const std::string kHW = "2026-11-02T14:00Z";
+const std::string kHW2 = "2026-11-02T15:00Z";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -864,94 +864,94 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string body(nlohmann::json fields = nlohmann::json::object()) {
-  nlohmann::json out = {{"window", kW}, {"resource_class", "gpu-a100"}, {"amount", 4}};
+std::string hBody(nlohmann::json fields = nlohmann::json::object()) {
+  nlohmann::json out = {{"window", kHW}, {"resource_class", "gpu-a100"}, {"amount", 4}};
   for (const auto& [k, v] : fields.items()) out[k] = v;
   return out.dump();
 }
 
-harness::Response reserveAs(harness::HTTP& c, const std::string& team, const std::string& caller, nlohmann::json fields = nlohmann::json::object()) {
-  if (caller.empty()) return c.Post("/v1/quotas/" + team + "/reserve", body(fields), "Content-Type", "application/json");
-  return c.Post("/v1/quotas/" + team + "/reserve", body(fields), "Content-Type", "application/json", "X-Team-Id", caller);
+harness::Response hReserveAs(harness::HTTP& c, const std::string& team, const std::string& caller, nlohmann::json fields = nlohmann::json::object()) {
+  if (caller.empty()) return c.Post("/v1/quotas/" + team + "/reserve", hBody(fields), "Content-Type", "application/json");
+  return c.Post("/v1/quotas/" + team + "/reserve", hBody(fields), "Content-Type", "application/json", "X-Team-Id", caller);
 }
 
-bool ok(const harness::Response& r) { return r.Status == 200 || r.Status == 201; }
+bool hOk(const harness::Response& r) { return r.Status == 200 || r.Status == 201; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = reserveAs(c, "research", "research");
-  ctx.Assert(ok(r), "POST /v1/quotas/research/reserve for 4 of research's 8 units answered %d: %s", r.Status, r.Text());
+  auto c = hApi(ctx);
+  const auto r = hReserveAs(c, "research", "research");
+  ctx.Assert(hOk(r), "POST /v1/quotas/research/reserve for 4 of research's 8 units answered %d: %s", r.Status, r.Text());
 }
 
 void CheckTeamScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto anonymous = reserveAs(c, "research", "");
+  auto c = hApi(ctx);
+  const auto anonymous = hReserveAs(c, "research", "");
   ctx.Equal(anonymous.Status, 401, "a reserve without X-Team-Id; the status");
-  const auto anonymous_bad = reserveAs(c, "research", "", {{"window", "tomorrow"}});
+  const auto anonymous_bad = hReserveAs(c, "research", "", {{"window", "tomorrow"}});
   ctx.Equal(anonymous_bad.Status, 401, "a reserve without X-Team-Id and with a bad window (the caller is checked before any field); the status");
-  const auto foreign = reserveAs(c, "vision", "research");
+  const auto foreign = hReserveAs(c, "vision", "research");
   ctx.Equal(foreign.Status, 403, "team research reserving on /v1/quotas/vision/reserve (the path names another team's quota); the status");
-  const auto foreign_bad = reserveAs(c, "vision", "research", {{"resource_class", "gpu-z9"}});
+  const auto foreign_bad = hReserveAs(c, "vision", "research", {{"resource_class", "gpu-z9"}});
   ctx.Equal(foreign_bad.Status, 403,
             "team research reserving on /v1/quotas/vision/reserve with an unknown class (the caller is checked before any field, so another team's path tells it nothing); the status");
   ctx.Equal(ctx.Redis.Keys("quota:*").size() + ctx.Redis.Keys("reservation:*").size(), 0, "the refused reserves must not write the ledger; the keys");
-  const auto own = reserveAs(c, "research", "research");
-  ctx.Assert(ok(own), "research reserving on its own path answered %d: %s", own.Status, own.Text());
+  const auto own = hReserveAs(c, "research", "research");
+  ctx.Assert(hOk(own), "research reserving on its own path answered %d: %s", own.Status, own.Text());
 }
 
 void CheckWindowAndAmount(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const std::string window : {"tomorrow", "2026-11-02 14:00", "2026-11-02T14:00:00Z", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"}) {
-    const auto r = reserveAs(c, "research", "research", {{"window", window}});
+    const auto r = hReserveAs(c, "research", "research", {{"window", window}});
     ctx.Equal(r.Status, 400, "a reserve for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window);
   }
   for (const nlohmann::json amount : {nlohmann::json(0), nlohmann::json(-3), nlohmann::json(65), nlohmann::json(2.5)}) {
-    const auto r = reserveAs(c, "research", "research", {{"amount", amount}});
+    const auto r = hReserveAs(c, "research", "research", {{"amount", amount}});
     ctx.Equal(r.Status, 400, "a reserve of %s units (the amount is an integer from 1 to 64); the status", amount.dump());
   }
   ctx.Equal(ctx.Redis.Keys("quota:*").size(), 0, "a rejected reserve must not write the ledger; the keys");
-  const auto r = reserveAs(c, "research", "research", {{"amount", 1}});
-  ctx.Assert(ok(r), "a valid reserve of 1 unit answered %d: %s", r.Status, r.Text());
+  const auto r = hReserveAs(c, "research", "research", {{"amount", 1}});
+  ctx.Assert(hOk(r), "a valid reserve of 1 unit answered %d: %s", r.Status, r.Text());
   ctx.Redis.Do("HSET", "quota:limits", "research", "64");
-  const auto max = reserveAs(c, "research", "research", {{"window", kW2}, {"amount", 64}});
-  ctx.Assert(ok(max), "with research's limit at 64 a reserve of 64 units answered %d: %s. 64 is MAX_RESERVE_AMOUNT itself and is allowed", max.Status, max.Text());
+  const auto max = hReserveAs(c, "research", "research", {{"window", kHW2}, {"amount", 64}});
+  ctx.Assert(hOk(max), "with research's limit at 64 a reserve of 64 units answered %d: %s. 64 is MAX_RESERVE_AMOUNT itself and is allowed", max.Status, max.Text());
 }
 
 void CheckResourceClass(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const std::string resource_class : {"gpu-z9", "GPU-A100", ""}) {
-    const auto r = reserveAs(c, "research", "research", {{"resource_class", resource_class}});
+    const auto r = hReserveAs(c, "research", "research", {{"resource_class", resource_class}});
     ctx.Equal(r.Status, 400, "a reserve of resource class %q (the broker has no pool for it); the status", resource_class);
   }
   for (const std::string resource_class : {"gpu-a100", "gpu-h100", "tpu-v5"}) {
-    const auto r = reserveAs(c, "research", "research", {{"resource_class", resource_class}, {"amount", 1}});
-    ctx.Assert(ok(r), "a reserve of %s answered %d: %s", resource_class, r.Status, r.Text());
+    const auto r = hReserveAs(c, "research", "research", {{"resource_class", resource_class}, {"amount", 1}});
+    ctx.Assert(hOk(r), "a reserve of %s answered %d: %s", resource_class, r.Status, r.Text());
   }
 }
 
 void CheckRecorded(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = reserveAs(c, "research", "research", {{"amount", 5}});
+  auto c = hApi(ctx);
+  const auto first = hReserveAs(c, "research", "research", {{"amount", 5}});
   ctx.Equal(first.Status, 201, "a reserve of 5 of research's 8 units must answer 201 with the reservation (%s); the status", first.Text());
   const auto got = nlohmann::json::parse(first.Text(), nullptr, false);
   const std::string reservation_id = got.is_object() ? got.value("reservation_id", "") : "";
   ctx.Assert(!reservation_id.empty(), "the 201 carries no reservation_id: %s. A release or a consume needs it", first.Text());
-  ctx.Assert(got.value("team", "") == "research" && got.value("window", "") == kW && got.value("resource_class", "") == "gpu-a100" &&
+  ctx.Assert(got.value("team", "") == "research" && got.value("window", "") == kHW && got.value("resource_class", "") == "gpu-a100" &&
                  got.value("amount", 0) == 5,
              "the 201 body is %s, expected the team, window, resource_class and amount of the grant", first.Text());
   auto record = ctx.Redis.HGetAll("reservation:research:" + reservation_id);
-  ctx.Assert(record["amount"] == "5" && record["window"] == kW, "reservation:research:%s holds amount %q window %q: the grant must be recorded through ledger::reserve",
+  ctx.Assert(record["amount"] == "5" && record["window"] == kHW, "reservation:research:%s holds amount %q window %q: the grant must be recorded through ledger::reserve",
              reservation_id, record["amount"], record["window"]);
-  ctx.Equal(ctx.Redis.HGet("quota:research:" + kW, "reserved").value_or(""), "5", "quota:research:%s reserved", kW);
-  const auto second = reserveAs(c, "research", "research", {{"amount", 5}});
+  ctx.Equal(ctx.Redis.HGet("quota:research:" + kHW, "reserved").value_or(""), "5", "quota:research:%s reserved", kHW);
+  const auto second = hReserveAs(c, "research", "research", {{"amount", 5}});
   ctx.Assert(second.Status == 409 && second.Text().find("quota_exhausted") != std::string::npos,
              "with 3 of research's 8 units left a reserve of 5 answered %d %s, expected 409 quota_exhausted: the same units went to two jobs", second.Status, second.Text());
-  const auto third = reserveAs(c, "research", "research", {{"amount", 3}});
+  const auto third = hReserveAs(c, "research", "research", {{"amount", 3}});
   ctx.Equal(third.Status, 201, "the last 3 units must still be granted (%s); the status", third.Text());
-  ctx.Redis.After("quota:research:" + kW2, [&ctx] { ctx.Redis.Do("HSET", "quota:research:" + kW2, "limit", "8", "reserved", "8", "consumed", "0"); });
-  const auto raced = reserveAs(c, "research", "research", {{"window", kW2}, {"amount", 4}});
+  ctx.Redis.After("quota:research:" + kHW2, [&ctx] { ctx.Redis.Do("HSET", "quota:research:" + kHW2, "limit", "8", "reserved", "8", "consumed", "0"); });
+  const auto raced = hReserveAs(c, "research", "research", {{"window", kHW2}, {"amount", 4}});
   if (raced.Status != 409) {
     const auto raced_body = nlohmann::json::parse(raced.Text(), nullptr, false);
     const std::string raced_id =
@@ -960,7 +960,7 @@ void CheckRecorded(harness::Ctx& ctx) {
             : "";
     ctx.Assert(!raced_id.empty() && ctx.Redis.HGet("reservation:research:" + raced_id, "amount").value_or("") == "4",
                "another broker took the rest of window %s right after this reserve first touched it, and the reserve answered %d %s: the answer must come from what ledger::reserve returned, a reservation or 409",
-               kW2, raced.Status, raced.Text());
+               kHW2, raced.Status, raced.Text());
   }
 }
 `,

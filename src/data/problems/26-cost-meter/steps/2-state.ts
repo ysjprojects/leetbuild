@@ -654,49 +654,49 @@ import (
 )
 
 const (
-	stateWindow = 3600
-	stateGrace  = 3600
+	kHStateWindow = 3600
+	kHStateGrace  = 3600
 )
 
-// stateMidWindow moves the clock to half past the next hour; the bucket it falls in.
-func stateMidWindow(ctx *harness.Ctx) int64 {
+// hStateMidWindow moves the clock to half past the next hour; the bucket it falls in.
+func hStateMidWindow(ctx *harness.Ctx) int64 {
 	now := float64(ctx.Clock.Now()) / 1000
-	ctx.Clock.Advance(stateWindow - math.Mod(now, stateWindow) + 1800)
-	return ctx.Clock.Now() / 1000 / stateWindow
+	ctx.Clock.Advance(kHStateWindow - math.Mod(now, kHStateWindow) + 1800)
+	return ctx.Clock.Now() / 1000 / kHStateWindow
 }
 
-func stateKey(tenant string, bucket int64) string {
+func hStateKey(tenant string, bucket int64) string {
 	return "meter:" + tenant + ":" + strconv.FormatInt(bucket, 10)
 }
 
-func stateRecord(ctx *harness.Ctx, tenant string, in, out, cost int64) Totals {
+func hStateRecord(ctx *harness.Ctx, tenant string, in, out, cost int64) Totals {
 	t, err := recordUsage(context.Background(), tenant, in, out, cost)
 	ctx.NoError(err, "recordUsage(%s)", tenant)
 	return t
 }
 
 func CheckWindowKey(ctx *harness.Ctx) {
-	bucket := stateMidWindow(ctx)
-	stateRecord(ctx, "t1", 1000, 200, 4500)
-	key := stateKey("t1", bucket)
+	bucket := hStateMidWindow(ctx)
+	hStateRecord(ctx, "t1", 1000, 200, 4500)
+	key := hStateKey("t1", bucket)
 	ctx.Equal(ctx.Redis.HGetAll(key)["input_tokens"], "1000", "a report at half past the hour must land in %s (meter:{tenant}:{bucket}); the keys are %v; its input_tokens", key, ctx.Redis.Keys("*"))
-	stateRecord(ctx, "t2", 7, 7, 7)
-	ctx.Equal(ctx.Redis.HGetAll(stateKey("t2", bucket))["input_tokens"], "7", "another tenant has its own window (keys %v); its input_tokens", ctx.Redis.Keys("*"))
-	ctx.Clock.Advance(stateWindow)
-	totals := stateRecord(ctx, "t1", 10, 20, 300)
+	hStateRecord(ctx, "t2", 7, 7, 7)
+	ctx.Equal(ctx.Redis.HGetAll(hStateKey("t2", bucket))["input_tokens"], "7", "another tenant has its own window (keys %v); its input_tokens", ctx.Redis.Keys("*"))
+	ctx.Clock.Advance(kHStateWindow)
+	totals := hStateRecord(ctx, "t1", 10, 20, 300)
 	ctx.Equal(totals, Totals{InputTokens: 10, OutputTokens: 20, CostMicros: 300, Events: 1}, "the next hour starts a new window from zero (without the hour in the key, last week's spend still counts against this hour's budget); recordUsage's totals")
-	ctx.Equal(ctx.Redis.HGetAll(stateKey("t1", bucket+1))["input_tokens"], "10", "the next hour's report must land in %s (keys %v); its input_tokens", stateKey("t1", bucket+1), ctx.Redis.Keys("*"))
-	ctx.Clock.Advance(stateWindow/2 - 1)
-	late := stateRecord(ctx, "t1", 1, 1, 1)
-	ctx.Equal(late.Events, int64(2), "a report in the last second of the hour belongs to that hour's window %s; its events", stateKey("t1", bucket+1))
+	ctx.Equal(ctx.Redis.HGetAll(hStateKey("t1", bucket+1))["input_tokens"], "10", "the next hour's report must land in %s (keys %v); its input_tokens", hStateKey("t1", bucket+1), ctx.Redis.Keys("*"))
+	ctx.Clock.Advance(kHStateWindow/2 - 1)
+	late := hStateRecord(ctx, "t1", 1, 1, 1)
+	ctx.Equal(late.Events, int64(2), "a report in the last second of the hour belongs to that hour's window %s; its events", hStateKey("t1", bucket+1))
 	ctx.Clock.Advance(2)
-	fresh := stateRecord(ctx, "t1", 1, 1, 1)
-	ctx.Equal(fresh.Events, int64(1), "a report a second into the next hour starts %s from zero; its events", stateKey("t1", bucket+2))
+	fresh := hStateRecord(ctx, "t1", 1, 1, 1)
+	ctx.Equal(fresh.Events, int64(1), "a report a second into the next hour starts %s from zero; its events", hStateKey("t1", bucket+2))
 }
 
 func CheckAtomicScript(ctx *harness.Ctx) {
-	bucket := stateMidWindow(ctx)
-	key := stateKey("t1", bucket)
+	bucket := hStateMidWindow(ctx)
+	key := hStateKey("t1", bucket)
 	fired := false
 	// another replica recording a report for the same tenant, landing between two of this one's commands
 	ctx.Redis.After(key, func() any {
@@ -707,7 +707,7 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 		ctx.Redis.Do("HINCRBY", key, "events", 1)
 		return nil
 	})
-	totals := stateRecord(ctx, "t1", 1000, 200, 4500)
+	totals := hStateRecord(ctx, "t1", 1000, 200, 4500)
 	ctx.Assert(fired, "recordUsage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"))
 	ctx.Equal(totals, Totals{InputTokens: 1000, OutputTokens: 200, CostMicros: 4500, Events: 1}, "recordUsage must answer the totals its own write produced: another report landed between its commands and was counted as this one's; the totals")
 	w := ctx.Redis.HGetAll(key)
@@ -715,23 +715,23 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 }
 
 func CheckWindowExpiry(ctx *harness.Ctx) {
-	bucket := stateMidWindow(ctx)
-	key := stateKey("t1", bucket)
+	bucket := hStateMidWindow(ctx)
+	key := hStateKey("t1", bucket)
 	fired, firstTTL := false, int64(0)
 	// the TTL the window has the moment the command that created it returns: a second command is too late
 	ctx.Redis.After(key, func() any {
 		fired, firstTTL = true, ctx.Redis.TTL(key)
 		return nil
 	})
-	stateRecord(ctx, "t1", 100, 10, 400)
+	hStateRecord(ctx, "t1", 100, 10, 400)
 	ctx.Assert(fired, "recordUsage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"))
 	ctx.Assert(firstTTL > 0, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the window, or a crash in between leaves a window that never expires", key, firstTTL)
-	expected := float64((bucket+1)*stateWindow+stateGrace) - float64(ctx.Clock.Now())/1000
+	expected := float64((bucket+1)*kHStateWindow+kHStateGrace) - float64(ctx.Clock.Now())/1000
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0, "%s has TTL %d: a window that never expires keeps last hour's spend in Redis for good", key, ttl)
 	ctx.Assert(math.Abs(float64(ttl)-expected) <= 3, "%s has TTL %d s at half past the hour, expected about %.0f s: the window expires GraceSeconds after it closes, not a fixed time after each write", key, ttl, expected)
 	ctx.Clock.Advance(600)
-	stateRecord(ctx, "t1", 100, 10, 400)
+	hStateRecord(ctx, "t1", 100, 10, 400)
 	later := ctx.Redis.TTL(key)
 	ctx.Assert(math.Abs(float64(later)-(expected-600)) <= 3, "a write ten minutes later moved the expiry: TTL %d s, expected about %.0f s", later, expected-600)
 	ctx.Clock.Advance(expected - 600 + 1)
@@ -739,12 +739,12 @@ func CheckWindowExpiry(ctx *harness.Ctx) {
 }
 
 func CheckIntegerMicros(ctx *harness.Ctx) {
-	bucket := stateMidWindow(ctx)
+	bucket := hStateMidWindow(ctx)
 	var totals Totals
 	for _, cost := range []int64{1, 2, 3, 100_000, 7} {
-		totals = stateRecord(ctx, "t1", 10, 10, cost)
+		totals = hStateRecord(ctx, "t1", 10, 10, cost)
 	}
-	w := ctx.Redis.HGetAll(stateKey("t1", bucket))
+	w := ctx.Redis.HGetAll(hStateKey("t1", bucket))
 	ctx.Equal(w["cost_micros"], "100013", "five reports costing 100013 micro-dollars in all left the window as %v: the spend must be an exact integer sum in cost_micros (HINCRBY), not floats of dollars; cost_micros", w)
 	for field, v := range w {
 		ctx.Assert(!strings.Contains(v, "."), "every field of the window must be an integer: %s is %s", field, v)
@@ -759,19 +759,19 @@ func CheckIntegerMicros(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kWindow = 3600;
-constexpr long long kGrace = 3600;
+constexpr long long kHWindow = 3600;
+constexpr long long kHGrace = 3600;
 
 // Move the clock to half past the next hour; the bucket it falls in.
-long long midWindow(harness::Ctx& ctx) {
+long long hMidWindow(harness::Ctx& ctx) {
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
-  ctx.Clock.Advance(kWindow - std::fmod(now, kWindow) + 1800);
-  return ctx.Clock.Now() / 1000 / kWindow;
+  ctx.Clock.Advance(kHWindow - std::fmod(now, kHWindow) + 1800);
+  return ctx.Clock.Now() / 1000 / kHWindow;
 }
 
-std::string windowOf(const std::string& tenant, long long bucket) { return "meter:" + tenant + ":" + std::to_string(bucket); }
+std::string hWindowOf(const std::string& tenant, long long bucket) { return "meter:" + tenant + ":" + std::to_string(bucket); }
 
-std::string field(harness::Ctx& ctx, const std::string& key, const std::string& name) {
+std::string hField(harness::Ctx& ctx, const std::string& key, const std::string& name) {
   const auto all = ctx.Redis.HGetAll(key);
   const auto it = all.find(name);
   return it == all.end() ? "" : it->second;
@@ -780,29 +780,29 @@ std::string field(harness::Ctx& ctx, const std::string& key, const std::string& 
 }  // namespace
 
 void CheckWindowKey(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
+  const long long bucket = hMidWindow(ctx);
   record_usage("t1", 1000, 200, 4500);
-  const std::string key = windowOf("t1", bucket);
-  ctx.Equal(field(ctx, key, "input_tokens"), "1000", "a report at half past the hour must land in %s (meter:{tenant}:{bucket}); the keys are %v; its input_tokens", key, ctx.Redis.Keys("*"));
+  const std::string key = hWindowOf("t1", bucket);
+  ctx.Equal(hField(ctx, key, "input_tokens"), "1000", "a report at half past the hour must land in %s (meter:{tenant}:{bucket}); the keys are %v; its input_tokens", key, ctx.Redis.Keys("*"));
   record_usage("t2", 7, 7, 7);
-  ctx.Equal(field(ctx, windowOf("t2", bucket), "input_tokens"), "7", "another tenant has its own window (keys %v); its input_tokens", ctx.Redis.Keys("*"));
-  ctx.Clock.Advance(kWindow);
+  ctx.Equal(hField(ctx, hWindowOf("t2", bucket), "input_tokens"), "7", "another tenant has its own window (keys %v); its input_tokens", ctx.Redis.Keys("*"));
+  ctx.Clock.Advance(kHWindow);
   const Totals totals = record_usage("t1", 10, 20, 300);
   ctx.Assert(totals.input_tokens == 10 && totals.output_tokens == 20 && totals.cost_micros == 300 && totals.events == 1,
              "the next hour starts a new window from zero, record_usage answered (%d, %d, %d, %d events): without the hour in the key, last week's spend still counts against this hour's budget",
              totals.input_tokens, totals.output_tokens, totals.cost_micros, totals.events);
-  ctx.Equal(field(ctx, windowOf("t1", bucket + 1), "input_tokens"), "10", "the next hour's report must land in %s (keys %v); its input_tokens", windowOf("t1", bucket + 1), ctx.Redis.Keys("*"));
-  ctx.Clock.Advance(kWindow / 2 - 1);
+  ctx.Equal(hField(ctx, hWindowOf("t1", bucket + 1), "input_tokens"), "10", "the next hour's report must land in %s (keys %v); its input_tokens", hWindowOf("t1", bucket + 1), ctx.Redis.Keys("*"));
+  ctx.Clock.Advance(kHWindow / 2 - 1);
   const Totals late = record_usage("t1", 1, 1, 1);
-  ctx.Equal(late.events, 2, "a report in the last second of the hour belongs to that hour's window %s; its events", windowOf("t1", bucket + 1));
+  ctx.Equal(late.events, 2, "a report in the last second of the hour belongs to that hour's window %s; its events", hWindowOf("t1", bucket + 1));
   ctx.Clock.Advance(2);
   const Totals fresh = record_usage("t1", 1, 1, 1);
-  ctx.Equal(fresh.events, 1, "a report a second into the next hour starts %s from zero; its events", windowOf("t1", bucket + 2));
+  ctx.Equal(fresh.events, 1, "a report a second into the next hour starts %s from zero; its events", hWindowOf("t1", bucket + 2));
 }
 
 void CheckAtomicScript(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  const std::string key = windowOf("t1", bucket);
+  const long long bucket = hMidWindow(ctx);
+  const std::string key = hWindowOf("t1", bucket);
   bool fired = false;
   // another replica recording a report for the same tenant, landing between two of this one's commands
   ctx.Redis.After(key, [&] {
@@ -817,13 +817,13 @@ void CheckAtomicScript(harness::Ctx& ctx) {
   ctx.Assert(totals.input_tokens == 1000 && totals.output_tokens == 200 && totals.cost_micros == 4500 && totals.events == 1,
              "record_usage answered (%d, %d, %d, %d events), expected the totals its own write produced (1000, 200, 4500, 1 event): another report landed between its commands and was counted as this one's",
              totals.input_tokens, totals.output_tokens, totals.cost_micros, totals.events);
-  ctx.Assert(field(ctx, key, "input_tokens") == "1500" && field(ctx, key, "cost_micros") == "6500" && field(ctx, key, "events") == "2",
+  ctx.Assert(hField(ctx, key, "input_tokens") == "1500" && hField(ctx, key, "cost_micros") == "6500" && hField(ctx, key, "events") == "2",
              "both reports must be in the window: %v", ctx.Redis.HGetAll(key));
 }
 
 void CheckWindowExpiry(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  const std::string key = windowOf("t1", bucket);
+  const long long bucket = hMidWindow(ctx);
+  const std::string key = hWindowOf("t1", bucket);
   bool fired = false;
   long long firstTtl = 0;
   // the TTL the window has the moment the command that created it returns: a second command is too late
@@ -834,7 +834,7 @@ void CheckWindowExpiry(harness::Ctx& ctx) {
   record_usage("t1", 100, 10, 400);
   ctx.Assert(fired, "record_usage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"));
   ctx.Assert(firstTtl > 0, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the window, or a crash in between leaves a window that never expires", key, firstTtl);
-  const double expected = static_cast<double>((bucket + 1) * kWindow + kGrace) - static_cast<double>(ctx.Clock.Now()) / 1000;
+  const double expected = static_cast<double>((bucket + 1) * kHWindow + kHGrace) - static_cast<double>(ctx.Clock.Now()) / 1000;
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl > 0, "%s has TTL %d: a window that never expires keeps last hour's spend in Redis for good", key, ttl);
   ctx.Assert(std::fabs(static_cast<double>(ttl) - expected) <= 3,
@@ -848,11 +848,11 @@ void CheckWindowExpiry(harness::Ctx& ctx) {
 }
 
 void CheckIntegerMicros(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
+  const long long bucket = hMidWindow(ctx);
   Totals totals;
   for (long long cost : {1LL, 2LL, 3LL, 100000LL, 7LL}) totals = record_usage("t1", 10, 10, cost);
-  const std::string key = windowOf("t1", bucket);
-  ctx.Equal(field(ctx, key, "cost_micros"), "100013",
+  const std::string key = hWindowOf("t1", bucket);
+  ctx.Equal(hField(ctx, key, "cost_micros"), "100013",
             "five reports costing 100013 micro-dollars in all left the window as %v: the spend must be an exact integer sum in cost_micros (HINCRBY), not floats of dollars; cost_micros", ctx.Redis.HGetAll(key));
   for (const auto& [name, value] : ctx.Redis.HGetAll(key)) {
     ctx.Assert(value.find('.') == std::string::npos, "every field of the window must be an integer: %s is %s", name, value);

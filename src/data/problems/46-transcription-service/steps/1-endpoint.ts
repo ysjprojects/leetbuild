@@ -809,29 +809,29 @@ import (
 	"leetbuild/harness"
 )
 
-const apiRef = "s3://calls/2026-11-02/support-0412.wav"
+const kHApiRef = "s3://calls/2026-11-02/support-0412.wav"
 
-type apiView struct {
+type HApiView struct {
 	JobID       string \`json:"job_id"\`
 	Status      string \`json:"status"\`
 	TotalChunks int    \`json:"total_chunks"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // apiBody is a submit's JSON body; duration is a number of seconds, whole or not.
-func apiBody(ref string, duration any, language string) map[string]any {
+func hApiBody(ref string, duration any, language string) map[string]any {
 	return map[string]any{"audio_ref": ref, "duration_seconds": duration, "language": language}
 }
 
 // submit posts a job for tenant; the view is decoded only from a 2xx answer.
-func submit(c *harness.HTTP, body map[string]any, tenant string) (*harness.Response, apiView) {
+func hSubmit(c *harness.HTTP, body map[string]any, tenant string) (*harness.Response, HApiView) {
 	r := c.Post("/v1/transcriptions", body, "X-Tenant-Id", tenant)
-	var v apiView
+	var v HApiView
 	if r.Status >= 200 && r.Status < 300 {
 		r.Decode(&v)
 	}
@@ -839,23 +839,23 @@ func submit(c *harness.HTTP, body map[string]any, tenant string) (*harness.Respo
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r, v := submit(c, apiBody(apiRef, 95, "en"), "t-1")
+	c := hApi(ctx)
+	r, v := hSubmit(c, hApiBody(kHApiRef, 95, "en"), "t-1")
 	ctx.Equal(r.Status, 202, "POST /v1/transcriptions (%s)", r.Text())
 	ctx.Assert(v.Status == "queued" && v.TotalChunks == 4, "a 95-second file is a queued job of 4 chunks of 30 s, got %s", r.Text())
 	job := jobs.Get(context.Background(), v.JobID)
-	ctx.Assert(job != nil && job.Tenant == "t-1" && job.AudioRef == apiRef, "the jobs store holds %+v for %s", job, v.JobID)
-	anonymous := c.Post("/v1/transcriptions", apiBody("s3://calls/other.wav", 95, "en"))
+	ctx.Assert(job != nil && job.Tenant == "t-1" && job.AudioRef == kHApiRef, "the jobs store holds %+v for %s", job, v.JobID)
+	anonymous := c.Post("/v1/transcriptions", hApiBody("s3://calls/other.wav", 95, "en"))
 	ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckDurationCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	over, _ := submit(c, apiBody("s3://calls/five-hours.wav", 14401, "en"), "t-1")
-	zero, _ := submit(c, apiBody("s3://calls/empty.wav", 0, "en"), "t-1")
-	negative, _ := submit(c, apiBody("s3://calls/negative.wav", -30, "en"), "t-1")
-	half, _ := submit(c, apiBody("s3://calls/half-second.wav", 0.5, "en"), "t-1")
-	capped, v := submit(c, apiBody("s3://calls/four-hours.wav", 14400, "en"), "t-1")
+	c := hApi(ctx)
+	over, _ := hSubmit(c, hApiBody("s3://calls/five-hours.wav", 14401, "en"), "t-1")
+	zero, _ := hSubmit(c, hApiBody("s3://calls/empty.wav", 0, "en"), "t-1")
+	negative, _ := hSubmit(c, hApiBody("s3://calls/negative.wav", -30, "en"), "t-1")
+	half, _ := hSubmit(c, hApiBody("s3://calls/half-second.wav", 0.5, "en"), "t-1")
+	capped, v := hSubmit(c, hApiBody("s3://calls/four-hours.wav", 14400, "en"), "t-1")
 	ctx.Equal(over.Status, 400, "a 14 401-second file (the cap is four hours)")
 	ctx.Equal(zero.Status, 400, "a 0-second file")
 	ctx.Equal(negative.Status, 400, "a -30-second file (the duration is 1 to 14 400 seconds)")
@@ -864,41 +864,41 @@ func CheckDurationCap(ctx *harness.Ctx) {
 }
 
 func CheckLanguageAllowlist(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	accepted := map[string]int{}
 	for _, language := range []string{"xx", "", "e", "EN", "english", "constructor"} {
-		if r, _ := submit(c, apiBody("s3://calls/lang-"+language+".wav", 95, language), "t-1"); r.Status != 400 {
+		if r, _ := hSubmit(c, hApiBody("s3://calls/lang-"+language+".wav", 95, language), "t-1"); r.Status != 400 {
 			accepted[language] = r.Status
 		}
 	}
-	ok, _ := submit(c, apiBody("s3://calls/tokyo.wav", 95, "ja"), "t-1")
+	ok, _ := hSubmit(c, hApiBody("s3://calls/tokyo.wav", 95, "ja"), "t-1")
 	ctx.Equal(accepted, map[string]int{}, "languages outside en, es, fr, de, ja must be 400; the languages accepted, with their status")
 	ctx.Equal(ok.Status, 202, "language ja is allowlisted (%s)", ok.Text())
 }
 
 func CheckStageAfterValidate(ctx *harness.Ctx) {
-	c := api(ctx)
-	submit(c, apiBody("s3://calls/five-hours.wav", 18000, "en"), "t-1")
-	submit(c, apiBody("s3://calls/klingon.wav", 95, "xx"), "t-1")
+	c := hApi(ctx)
+	hSubmit(c, hApiBody("s3://calls/five-hours.wav", 18000, "en"), "t-1")
+	hSubmit(c, hApiBody("s3://calls/klingon.wav", 95, "xx"), "t-1")
 	staged := ctx.Redis.LRange("audio:staged", 0, -1)
 	ctx.Assert(len(staged) == 0, "requests that must be refused (five hours; language xx) staged %q: the download is paid before the metadata is checked", staged)
-	r, _ := submit(c, apiBody(apiRef, 95, "en"), "t-1")
+	r, _ := hSubmit(c, hApiBody(kHApiRef, 95, "en"), "t-1")
 	ctx.Equal(r.Status, 202, "a valid request (%s)", r.Text())
-	ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), []string{apiRef}, "a valid request stages its audio once; audio:staged")
+	ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), []string{kHApiRef}, "a valid request stages its audio once; audio:staged")
 }
 
 func CheckAudioDedupe(ctx *harness.Ctx) {
-	c := api(ctx)
-	first, v1 := submit(c, apiBody(apiRef, 95, "en"), "t-1")
-	replay, v2 := submit(c, apiBody(apiRef, 95, "en"), "t-1")
-	hinted, v4 := submit(c, apiBody(apiRef, 95, "es"), "t-1")
-	other, v3 := submit(c, apiBody(apiRef, 95, "en"), "t-2")
+	c := hApi(ctx)
+	first, v1 := hSubmit(c, hApiBody(kHApiRef, 95, "en"), "t-1")
+	replay, v2 := hSubmit(c, hApiBody(kHApiRef, 95, "en"), "t-1")
+	hinted, v4 := hSubmit(c, hApiBody(kHApiRef, 95, "es"), "t-1")
+	other, v3 := hSubmit(c, hApiBody(kHApiRef, 95, "en"), "t-2")
 	ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text())
 	ctx.Equal(replay.Status, 200, "the retried submit must answer 200 with the job that exists (%s)", replay.Text())
 	ctx.Equal(v2.JobID, v1.JobID, "a retried submit of the same audio must answer the job that exists, not a second job transcribed and billed twice; the job id")
 	ctx.Assert(hinted.Status == 200 && v4.JobID == v1.JobID, "the same audio_ref with another language hint answered %d %s, expected 200 with job %s: the job is keyed by sha256(audio_ref)", hinted.Status, hinted.Text(), v1.JobID)
 	ctx.Assert(other.Status == 202 && v3.JobID != v1.JobID, "tenant t-2 submitting the same audio must get a job of its own, got %d %s", other.Status, other.Text())
-	ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), []string{apiRef, apiRef}, "one staging per job after a submit, its retries and another tenant's submit; audio:staged")
+	ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), []string{kHApiRef, kHApiRef}, "one staging per job after a submit, its retries and another tenant's submit; audio:staged")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -911,9 +911,9 @@ func CheckAudioDedupe(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRef = "s3://calls/2026-11-02/support-0412.wav";
+const std::string kHRef = "s3://calls/2026-11-02/support-0412.wav";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -922,38 +922,38 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // A submit's JSON body; duration is a number of seconds, whole or not.
-std::string apiBody(const std::string& ref, const nlohmann::json& duration, const std::string& language) {
+std::string hApiBody(const std::string& ref, const nlohmann::json& duration, const std::string& language) {
   return nlohmann::json{{"audio_ref", ref}, {"duration_seconds", duration}, {"language", language}}.dump();
 }
 
 // One submit for tenant: the response and its body (null unless the answer is JSON).
-std::pair<harness::Response, nlohmann::json> submit(harness::HTTP& c, const std::string& body, const std::string& tenant) {
+std::pair<harness::Response, nlohmann::json> hSubmit(harness::HTTP& c, const std::string& body, const std::string& tenant) {
   auto r = c.Post("/v1/transcriptions", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return {r, nlohmann::json::parse(r.Text(), nullptr, false)};
 }
 
-std::string jobIdOf(const nlohmann::json& j) { return j.is_object() ? j.value("job_id", "") : ""; }
+std::string hJobIdOf(const nlohmann::json& j) { return j.is_object() ? j.value("job_id", "") : ""; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto [r, body] = submit(c, apiBody(kRef, 95, "en"), "t-1");
+  auto c = hApi(ctx);
+  const auto [r, body] = hSubmit(c, hApiBody(kHRef, 95, "en"), "t-1");
   ctx.Equal(r.Status, 202, "POST /v1/transcriptions (%s)", r.Text());
   ctx.Assert(body.is_object() && body.value("status", "") == "queued" && body.value("total_chunks", 0) == 4, "a 95-second file is a queued job of 4 chunks of 30 s, got %s", r.Text());
-  const auto job = jobs::get(jobIdOf(body));
-  ctx.Assert(job && job->tenant == "t-1" && job->audio_ref == kRef, "the jobs store holds no job of t-1 for %s", jobIdOf(body));
-  const auto anonymous = c.Post("/v1/transcriptions", apiBody("s3://calls/other.wav", 95, "en"), "Content-Type", "application/json");
+  const auto job = jobs::get(hJobIdOf(body));
+  ctx.Assert(job && job->tenant == "t-1" && job->audio_ref == kHRef, "the jobs store holds no job of t-1 for %s", hJobIdOf(body));
+  const auto anonymous = c.Post("/v1/transcriptions", hApiBody("s3://calls/other.wav", 95, "en"), "Content-Type", "application/json");
   ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckDurationCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto over = submit(c, apiBody("s3://calls/five-hours.wav", 14401, "en"), "t-1").first;
-  const auto zero = submit(c, apiBody("s3://calls/empty.wav", 0, "en"), "t-1").first;
-  const auto negative = submit(c, apiBody("s3://calls/negative.wav", -30, "en"), "t-1").first;
-  const auto half = submit(c, apiBody("s3://calls/half-second.wav", 0.5, "en"), "t-1").first;
-  const auto [capped, body] = submit(c, apiBody("s3://calls/four-hours.wav", 14400, "en"), "t-1");
+  auto c = hApi(ctx);
+  const auto over = hSubmit(c, hApiBody("s3://calls/five-hours.wav", 14401, "en"), "t-1").first;
+  const auto zero = hSubmit(c, hApiBody("s3://calls/empty.wav", 0, "en"), "t-1").first;
+  const auto negative = hSubmit(c, hApiBody("s3://calls/negative.wav", -30, "en"), "t-1").first;
+  const auto half = hSubmit(c, hApiBody("s3://calls/half-second.wav", 0.5, "en"), "t-1").first;
+  const auto [capped, body] = hSubmit(c, hApiBody("s3://calls/four-hours.wav", 14400, "en"), "t-1");
   ctx.Equal(over.Status, 400, "a 14 401-second file (the cap is four hours)");
   ctx.Equal(zero.Status, 400, "a 0-second file");
   ctx.Equal(negative.Status, 400, "a -30-second file (the duration is 1 to 14 400 seconds)");
@@ -962,40 +962,40 @@ void CheckDurationCap(harness::Ctx& ctx) {
 }
 
 void CheckLanguageAllowlist(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::vector<std::string> accepted;
   for (const std::string language : {"xx", "", "e", "EN", "english", "constructor"}) {
-    const auto r = submit(c, apiBody("s3://calls/lang-" + language + ".wav", 95, language), "t-1").first;
+    const auto r = hSubmit(c, hApiBody("s3://calls/lang-" + language + ".wav", 95, language), "t-1").first;
     if (r.Status != 400) accepted.push_back(language + " answered " + std::to_string(r.Status));
   }
-  const auto ok = submit(c, apiBody("s3://calls/tokyo.wav", 95, "ja"), "t-1").first;
+  const auto ok = hSubmit(c, hApiBody("s3://calls/tokyo.wav", 95, "ja"), "t-1").first;
   ctx.Assert(accepted.empty(), "languages outside en, es, fr, de, ja must be 400, got %q", accepted);
   ctx.Equal(ok.Status, 202, "language ja is allowlisted (%s)", ok.Text());
 }
 
 void CheckStageAfterValidate(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  submit(c, apiBody("s3://calls/five-hours.wav", 18000, "en"), "t-1");
-  submit(c, apiBody("s3://calls/klingon.wav", 95, "xx"), "t-1");
+  auto c = hApi(ctx);
+  hSubmit(c, hApiBody("s3://calls/five-hours.wav", 18000, "en"), "t-1");
+  hSubmit(c, hApiBody("s3://calls/klingon.wav", 95, "xx"), "t-1");
   const auto staged = ctx.Redis.LRange("audio:staged", 0, -1);
   ctx.Assert(staged.empty(), "requests that must be refused (five hours; language xx) staged %q: the download is paid before the metadata is checked", staged);
-  const auto r = submit(c, apiBody(kRef, 95, "en"), "t-1").first;
+  const auto r = hSubmit(c, hApiBody(kHRef, 95, "en"), "t-1").first;
   ctx.Equal(r.Status, 202, "a valid request (%s)", r.Text());
-  ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), {kRef}, "a valid request stages its audio once; audio:staged");
+  ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), {kHRef}, "a valid request stages its audio once; audio:staged");
 }
 
 void CheckAudioDedupe(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto [first, b1] = submit(c, apiBody(kRef, 95, "en"), "t-1");
-  const auto [replay, b2] = submit(c, apiBody(kRef, 95, "en"), "t-1");
-  const auto [hinted, b4] = submit(c, apiBody(kRef, 95, "es"), "t-1");
-  const auto [other, b3] = submit(c, apiBody(kRef, 95, "en"), "t-2");
+  auto c = hApi(ctx);
+  const auto [first, b1] = hSubmit(c, hApiBody(kHRef, 95, "en"), "t-1");
+  const auto [replay, b2] = hSubmit(c, hApiBody(kHRef, 95, "en"), "t-1");
+  const auto [hinted, b4] = hSubmit(c, hApiBody(kHRef, 95, "es"), "t-1");
+  const auto [other, b3] = hSubmit(c, hApiBody(kHRef, 95, "en"), "t-2");
   ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text());
   ctx.Equal(replay.Status, 200, "the retried submit must answer 200 with the job that exists (%s)", replay.Text());
-  ctx.Equal(jobIdOf(b2), jobIdOf(b1), "a retried submit of the same audio must answer the job that exists, not a second job transcribed and billed twice; the job id");
-  ctx.Assert(hinted.Status == 200 && jobIdOf(b4) == jobIdOf(b1), "the same audio_ref with another language hint answered %d %s, expected 200 with job %s: the job is keyed by sha256(audio_ref)", hinted.Status, hinted.Text(), jobIdOf(b1));
-  ctx.Assert(other.Status == 202 && jobIdOf(b3) != jobIdOf(b1), "tenant t-2 submitting the same audio must get a job of its own, got %d %s", other.Status, other.Text());
-  ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), {kRef, kRef}, "one staging per job after a submit, its retries and another tenant's submit; audio:staged");
+  ctx.Equal(hJobIdOf(b2), hJobIdOf(b1), "a retried submit of the same audio must answer the job that exists, not a second job transcribed and billed twice; the job id");
+  ctx.Assert(hinted.Status == 200 && hJobIdOf(b4) == hJobIdOf(b1), "the same audio_ref with another language hint answered %d %s, expected 200 with job %s: the job is keyed by sha256(audio_ref)", hinted.Status, hinted.Text(), hJobIdOf(b1));
+  ctx.Assert(other.Status == 202 && hJobIdOf(b3) != hJobIdOf(b1), "tenant t-2 submitting the same audio must get a job of its own, got %d %s", other.Status, other.Text());
+  ctx.Equal(ctx.Redis.LRange("audio:staged", 0, -1), {kHRef, kHRef}, "one staging per job after a submit, its retries and another tenant's submit; audio:staged");
 }
 `,
   },

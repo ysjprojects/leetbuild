@@ -788,21 +788,21 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-const apiSecret = "my card ending 4417 was charged twice"
+const kHApiSecret = "my card ending 4417 was charged twice"
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postFeedback(c *harness.HTTP, body map[string]any) *harness.Response {
+func hPostFeedback(c *harness.HTTP, body map[string]any) *harness.Response {
 	return c.Post("/v1/feedback", body, "X-Tenant-Id", "t-acme", "X-User-Id", "u-1")
 }
 
-func feedbackID(ctx *harness.Ctx, r *harness.Response) string {
+func hFeedbackID(ctx *harness.Ctx, r *harness.Response) string {
 	var body struct {
 		FeedbackID string \`json:"feedback_id"\`
 	}
@@ -811,8 +811,8 @@ func feedbackID(ctx *harness.Ctx, r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	store.MarkServed(apiBg, "t-acme", "req-1", 0)
-	r := postFeedback(api(ctx), map[string]any{"request_id": "req-1", "rating": 1, "comment": "clear answer"})
+	store.MarkServed(hApiBg, "t-acme", "req-1", 0)
+	r := hPostFeedback(hApi(ctx), map[string]any{"request_id": "req-1", "rating": 1, "comment": "clear answer"})
 	ctx.Equal(r.Status, 201, "POST /v1/feedback for a served request (%s)", r.Text())
 	var body struct {
 		FeedbackID string \`json:"feedback_id"\`
@@ -821,18 +821,18 @@ func CheckRoute(ctx *harness.Ctx) {
 	}
 	r.Decode(&body)
 	ctx.Assert(body.FeedbackID != "" && body.RequestID == "req-1" && body.Rating == 1, "the 201 must carry feedback_id, request_id and rating, got %s", r.Text())
-	row := store.GetFeedback(apiBg, body.FeedbackID)
+	row := store.GetFeedback(hApiBg, body.FeedbackID)
 	ctx.Assert(row != nil, "no row feedback:%s was stored", body.FeedbackID)
 	ctx.Equal([]any{row.Tenant, row.UserID, row.RequestID, row.Rating}, []any{"t-acme", "u-1", "req-1", 1}, "the stored row (tenant, user, request, rating)")
 }
 
 func CheckServedRequest(ctx *harness.Ctx) {
-	store.MarkServed(apiBg, "t-acme", "req-1", 0)
-	store.MarkServed(apiBg, "t-other", "req-9", 0)
-	c := api(ctx)
-	unknown := postFeedback(c, map[string]any{"request_id": "req-404", "rating": 1})
-	foreign := postFeedback(c, map[string]any{"request_id": "req-9", "rating": -1})
-	known := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 1})
+	store.MarkServed(hApiBg, "t-acme", "req-1", 0)
+	store.MarkServed(hApiBg, "t-other", "req-9", 0)
+	c := hApi(ctx)
+	unknown := hPostFeedback(c, map[string]any{"request_id": "req-404", "rating": 1})
+	foreign := hPostFeedback(c, map[string]any{"request_id": "req-9", "rating": -1})
+	known := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 1})
 	ctx.Equal(unknown.Status, 404, "a rating for a request id nobody served")
 	ctx.Equal(foreign.Status, 404, "a rating for a request served to another tenant (the lookup is per tenant)")
 	ctx.Equal(known.Status, 201, "a rating for a served request (%s)", known.Text())
@@ -840,32 +840,32 @@ func CheckServedRequest(ctx *harness.Ctx) {
 }
 
 func CheckRating(ctx *harness.Ctx) {
-	store.MarkServed(apiBg, "t-acme", "req-1", 0)
-	c := api(ctx)
-	missing := postFeedback(c, map[string]any{"request_id": "req-1", "comment": "meh"})
-	outOfRange := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 5})
-	down := postFeedback(c, map[string]any{"request_id": "req-1", "rating": -1})
-	neutral := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0})
-	fraction := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0.5})
+	store.MarkServed(hApiBg, "t-acme", "req-1", 0)
+	c := hApi(ctx)
+	missing := hPostFeedback(c, map[string]any{"request_id": "req-1", "comment": "meh"})
+	outOfRange := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 5})
+	down := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": -1})
+	neutral := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 0})
+	fraction := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 0.5})
 	ctx.Equal(missing.Status, 400, "a body without a rating (a missing rating is not a neutral one)")
 	ctx.Equal(outOfRange.Status, 400, "rating 5 (ratings are -1, 0 or 1)")
 	ctx.Equal(fraction.Status, 400, "rating 0.5 (ratings are the integers -1, 0 or 1)")
 	ctx.Equal(down.Status, 201, "rating -1 (%s)", down.Text())
 	ctx.Equal(neutral.Status, 201, "an explicit rating 0 is a valid neutral vote, only a missing rating is refused (%s)", neutral.Text())
-	row := store.GetFeedback(apiBg, feedbackID(ctx, down))
+	row := store.GetFeedback(hApiBg, hFeedbackID(ctx, down))
 	ctx.Assert(row != nil && row.Rating == -1, "the thumbs-down was stored as %+v", row)
-	zero := store.GetFeedback(apiBg, feedbackID(ctx, neutral))
+	zero := store.GetFeedback(hApiBg, hFeedbackID(ctx, neutral))
 	ctx.Assert(zero != nil && zero.Rating == 0, "the neutral vote was stored as %+v", zero)
 	ctx.Equal(len(ctx.Redis.Keys("feedback:fb-*")), 2, "only the two valid ratings may be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"))
 }
 
 func CheckCommentCap(ctx *harness.Ctx) {
-	store.MarkServed(apiBg, "t-acme", "req-1", 0)
-	c := api(ctx)
-	fits := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1000)})
-	exact := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1024)})
-	accented := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1100)})
-	ascii := postFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("x", 2049)})
+	store.MarkServed(hApiBg, "t-acme", "req-1", 0)
+	c := hApi(ctx)
+	fits := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1000)})
+	exact := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1024)})
+	accented := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("é", 1100)})
+	ascii := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 0, "comment": strings.Repeat("x", 2049)})
 	ctx.Equal(fits.Status, 201, "a 2000-byte comment (%s)", fits.Text())
 	ctx.Equal(exact.Status, 201, "a comment of exactly 2048 bytes (the cap is at most 2 KiB, so 2048 bytes fit: %s)", exact.Text())
 	ctx.Equal(accented.Status, 413, "a 2200-byte comment of 1100 characters (the cap is 2 KiB of UTF-8, not 2048 characters)")
@@ -874,15 +874,15 @@ func CheckCommentCap(ctx *harness.Ctx) {
 }
 
 func CheckNoCommentLog(ctx *harness.Ctx) {
-	store.MarkServed(apiBg, "t-acme", "req-1", 0)
-	c := api(ctx)
+	store.MarkServed(hApiBg, "t-acme", "req-1", 0)
+	c := hApi(ctx)
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
-	r := postFeedback(c, map[string]any{"request_id": "req-1", "rating": -1, "comment": apiSecret})
+	r := hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": -1, "comment": kHApiSecret})
 	// Refused submits carry the comment too: no path may log it.
-	postFeedback(c, map[string]any{"request_id": "req-404", "rating": 1, "comment": apiSecret})
-	postFeedback(c, map[string]any{"request_id": "req-1", "rating": 5, "comment": apiSecret})
-	postFeedback(c, map[string]any{"request_id": "req-1", "rating": 1, "comment": apiSecret + strings.Repeat("x", 2048)})
+	hPostFeedback(c, map[string]any{"request_id": "req-404", "rating": 1, "comment": kHApiSecret})
+	hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 5, "comment": kHApiSecret})
+	hPostFeedback(c, map[string]any{"request_id": "req-1", "rating": 1, "comment": kHApiSecret + strings.Repeat("x", 2048)})
 	log.SetOutput(os.Stderr)
 	logged := buf.String()
 	ctx.Equal(r.Status, 201, "POST /v1/feedback (%s)", r.Text())
@@ -898,9 +898,9 @@ func CheckNoCommentLog(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSecret = "my card ending 4417 was charged twice";
+const std::string kHSecret = "my card ending 4417 was charged twice";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -908,17 +908,17 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postFeedback(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hPostFeedback(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/feedback", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-acme", "X-User-Id", "u-1");
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
 }
 
-std::string feedbackId(const harness::Response& r) {
+std::string hFeedbackId(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("feedback_id", "") : "";
 }
@@ -927,8 +927,8 @@ std::string feedbackId(const harness::Response& r) {
 
 void CheckRoute(harness::Ctx& ctx) {
   store::markServed("t-acme", "req-1");
-  auto c = api(ctx);
-  const auto r = postFeedback(c, {{"request_id", "req-1"}, {"rating", 1}, {"comment", "clear answer"}});
+  auto c = hApi(ctx);
+  const auto r = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 1}, {"comment", "clear answer"}});
   ctx.Equal(r.Status, 201, "POST /v1/feedback for a served request (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && !body.value("feedback_id", "").empty() && body.value("request_id", "") == "req-1" && body.value("rating", 0) == 1,
@@ -942,10 +942,10 @@ void CheckRoute(harness::Ctx& ctx) {
 void CheckServedRequest(harness::Ctx& ctx) {
   store::markServed("t-acme", "req-1");
   store::markServed("t-other", "req-9");
-  auto c = api(ctx);
-  const auto unknown = postFeedback(c, {{"request_id", "req-404"}, {"rating", 1}});
-  const auto foreign = postFeedback(c, {{"request_id", "req-9"}, {"rating", -1}});
-  const auto known = postFeedback(c, {{"request_id", "req-1"}, {"rating", 1}});
+  auto c = hApi(ctx);
+  const auto unknown = hPostFeedback(c, {{"request_id", "req-404"}, {"rating", 1}});
+  const auto foreign = hPostFeedback(c, {{"request_id", "req-9"}, {"rating", -1}});
+  const auto known = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 1}});
   ctx.Equal(unknown.Status, 404, "a rating for a request id nobody served");
   ctx.Equal(foreign.Status, 404, "a rating for a request served to another tenant (the lookup is per tenant)");
   ctx.Equal(known.Status, 201, "a rating for a served request (%s)", known.Text());
@@ -954,31 +954,31 @@ void CheckServedRequest(harness::Ctx& ctx) {
 
 void CheckRating(harness::Ctx& ctx) {
   store::markServed("t-acme", "req-1");
-  auto c = api(ctx);
-  const auto missing = postFeedback(c, {{"request_id", "req-1"}, {"comment", "meh"}});
-  const auto out_of_range = postFeedback(c, {{"request_id", "req-1"}, {"rating", 5}});
-  const auto down = postFeedback(c, {{"request_id", "req-1"}, {"rating", -1}});
-  const auto neutral = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}});
-  const auto fraction = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0.5}});
+  auto c = hApi(ctx);
+  const auto missing = hPostFeedback(c, {{"request_id", "req-1"}, {"comment", "meh"}});
+  const auto out_of_range = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 5}});
+  const auto down = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", -1}});
+  const auto neutral = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 0}});
+  const auto fraction = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 0.5}});
   ctx.Equal(missing.Status, 400, "a body without a rating (a missing rating is not a neutral one)");
   ctx.Equal(out_of_range.Status, 400, "rating 5 (ratings are -1, 0 or 1)");
   ctx.Equal(fraction.Status, 400, "rating 0.5 (ratings are the integers -1, 0 or 1)");
   ctx.Equal(down.Status, 201, "rating -1 (%s)", down.Text());
   ctx.Equal(neutral.Status, 201, "an explicit rating 0 is a valid neutral vote, only a missing rating is refused (%s)", neutral.Text());
-  const auto row = store::getFeedback(feedbackId(down));
+  const auto row = store::getFeedback(hFeedbackId(down));
   ctx.Assert(row && row->rating == -1, "the thumbs-down was stored with rating %d", row ? row->rating : 99);
-  const auto zero = store::getFeedback(feedbackId(neutral));
+  const auto zero = store::getFeedback(hFeedbackId(neutral));
   ctx.Assert(zero && zero->rating == 0, "the neutral vote was stored with rating %d", zero ? zero->rating : 99);
   ctx.Equal(ctx.Redis.Keys("feedback:fb-*").size(), 2, "only the two valid ratings may be stored; the rows %q", ctx.Redis.Keys("feedback:fb-*"));
 }
 
 void CheckCommentCap(harness::Ctx& ctx) {
   store::markServed("t-acme", "req-1");
-  auto c = api(ctx);
-  const auto fits = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("é", 1000)}});
-  const auto exact = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("é", 1024)}});
-  const auto accented = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("é", 1100)}});
-  const auto ascii = postFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", repeat("x", 2049)}});
+  auto c = hApi(ctx);
+  const auto fits = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", hRepeat("é", 1000)}});
+  const auto exact = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", hRepeat("é", 1024)}});
+  const auto accented = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", hRepeat("é", 1100)}});
+  const auto ascii = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 0}, {"comment", hRepeat("x", 2049)}});
   ctx.Equal(fits.Status, 201, "a 2000-byte comment (%s)", fits.Text());
   ctx.Equal(exact.Status, 201, "a comment of exactly 2048 bytes (the cap is at most 2 KiB, so 2048 bytes fit: %s)", exact.Text());
   ctx.Equal(accented.Status, 413, "a 2200-byte comment of 1100 characters (the cap is 2 KiB of UTF-8, not 2048 characters)");
@@ -988,18 +988,18 @@ void CheckCommentCap(harness::Ctx& ctx) {
 
 void CheckNoCommentLog(harness::Ctx& ctx) {
   store::markServed("t-acme", "req-1");
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::ostringstream buf;
   std::streambuf* clog_was = std::clog.rdbuf(buf.rdbuf());
   std::streambuf* cerr_was = std::cerr.rdbuf(buf.rdbuf());
   std::streambuf* cout_was = std::cout.rdbuf(buf.rdbuf());
   harness::Response r;
   try {
-    r = postFeedback(c, {{"request_id", "req-1"}, {"rating", -1}, {"comment", kSecret}});
+    r = hPostFeedback(c, {{"request_id", "req-1"}, {"rating", -1}, {"comment", kHSecret}});
     // Refused submits carry the comment too: no path may log it.
-    postFeedback(c, {{"request_id", "req-404"}, {"rating", 1}, {"comment", kSecret}});
-    postFeedback(c, {{"request_id", "req-1"}, {"rating", 5}, {"comment", kSecret}});
-    postFeedback(c, {{"request_id", "req-1"}, {"rating", 1}, {"comment", kSecret + repeat("x", 2048)}});
+    hPostFeedback(c, {{"request_id", "req-404"}, {"rating", 1}, {"comment", kHSecret}});
+    hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 5}, {"comment", kHSecret}});
+    hPostFeedback(c, {{"request_id", "req-1"}, {"rating", 1}, {"comment", kHSecret + hRepeat("x", 2048)}});
   } catch (...) {
     std::clog.rdbuf(clog_was);
     std::cerr.rdbuf(cerr_was);

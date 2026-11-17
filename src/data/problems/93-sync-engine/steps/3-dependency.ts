@@ -794,22 +794,22 @@ import (
 )
 
 const (
-	clientBase    = "milk\\neggs\\nbread"
-	clientPhone   = "milk\\neggs\\nsourdough" // the phone's edit of line 3, now the head
-	clientLaptop  = "oat milk\\neggs\\nbread" // the laptop's edit of line 1, made offline against the base
-	clientMerged  = "oat milk\\neggs\\nsourdough"
-	clientOverlap = "milk\\neggs\\nrye" // the laptop's edit of line 3 too
-	clientLater   = "milk\\neggs\\nsourdough loaf" // the phone's next edit, landing while the laptop's edit is merged
+	kHClientBase    = "milk\\neggs\\nbread"
+	kHClientPhone   = "milk\\neggs\\nsourdough" // the phone's edit of line 3, now the head
+	kHClientLaptop  = "oat milk\\neggs\\nbread" // the laptop's edit of line 1, made offline against the base
+	kHClientMerged  = "oat milk\\neggs\\nsourdough"
+	kHClientOverlap = "milk\\neggs\\nrye" // the laptop's edit of line 3 too
+	kHClientLater   = "milk\\neggs\\nsourdough loaf" // the phone's next edit, landing while the laptop's edit is merged
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // mergerPeer is a line-by-line three-way merge: edits of different lines combine, two edits of one line are FailedPrecondition.
-type mergerPeer struct {
+type HMergerPeer struct {
 	pb.UnimplementedMergerServer
 }
 
-func (mergerPeer) ThreeWayMerge(_ context.Context, req *pb.MergeRequest) (*pb.MergeResult, error) {
+func (HMergerPeer) ThreeWayMerge(_ context.Context, req *pb.MergeRequest) (*pb.MergeResult, error) {
 	base, local, remote := strings.Split(req.GetBase(), "\\n"), strings.Split(req.GetLocal(), "\\n"), strings.Split(req.GetRemote(), "\\n")
 	if len(base) != len(local) || len(base) != len(remote) {
 		return nil, status.Error(codes.FailedPrecondition, "the edits change the number of lines")
@@ -827,40 +827,40 @@ func (mergerPeer) ThreeWayMerge(_ context.Context, req *pb.MergeRequest) (*pb.Me
 	return &pb.MergeResult{Body: strings.Join(merged, "\\n")}, nil
 }
 
-func clientServe(ctx *harness.Ctx) {
-	pb.RegisterMergerServer(ctx.GRPC.Server(""), mergerPeer{})
+func hClientServe(ctx *harness.Ctx) {
+	pb.RegisterMergerServer(ctx.GRPC.Server(""), HMergerPeer{})
 }
 
 // clientSeed writes the base as the laptop last pulled it, then the phone's edit of it as the head.
-func clientSeed(ctx *harness.Ctx, docID string) (base, head int64) {
-	b, err := revisions.ApplyChange(clientBg, docID, 0, store.ContentHash(clientBase), clientBase, "laptop")
+func hClientSeed(ctx *harness.Ctx, docID string) (base, head int64) {
+	b, err := revisions.ApplyChange(hClientBg, docID, 0, store.ContentHash(kHClientBase), kHClientBase, "laptop")
 	ctx.NoError(err, "seeding %s", docID)
-	h, err := revisions.ApplyChange(clientBg, docID, b.Revision, store.ContentHash(clientPhone), clientPhone, "phone")
+	h, err := revisions.ApplyChange(hClientBg, docID, b.Revision, store.ContentHash(kHClientPhone), kHClientPhone, "phone")
 	ctx.NoError(err, "seeding %s", docID)
 	return b.Revision, h.Revision
 }
 
-func clientResolve(ctx *harness.Ctx, docID string, base int64, body string) store.Outcome {
-	out, err := resolveConflict(clientBg, docID, base, body, "laptop")
+func hClientResolve(ctx *harness.Ctx, docID string, base int64, body string) store.Outcome {
+	out, err := resolveConflict(hClientBg, docID, base, body, "laptop")
 	ctx.NoError(err, "resolveConflict(%s) failed", docID)
 	return out
 }
 
-func clientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ThreeWayMerge", "")) }
+func hClientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ThreeWayMerge", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientServe(ctx)
-	base, _ := clientSeed(ctx, "d-1")
-	out := clientResolve(ctx, "d-1", base, clientLaptop)
+	hClientServe(ctx)
+	base, _ := hClientSeed(ctx, "d-1")
+	out := hClientResolve(ctx, "d-1", base, kHClientLaptop)
 	ctx.Equal(out.Status, "merged", "with a healthy merger the edits of lines 1 and 3 must merge; the status")
 	for _, call := range ctx.GRPC.CallsTo("ThreeWayMerge", "") {
 		ctx.Assert(call.HasDeadline(), "a ThreeWayMerge call carries no deadline: a merger that hangs holds the push open")
 		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a ThreeWayMerge call carries a %v deadline, expected mergeDeadline = 2 s", call.Timeout)
 	}
-	base, head := clientSeed(ctx, "d-2")
+	base, head := hClientSeed(ctx, "d-2")
 	ctx.GRPC.SetLatency("ThreeWayMerge", 10.0, "")
-	before, start := ctx.Clock.Now(), clientCalls(ctx)
-	out = clientResolve(ctx, "d-2", base, clientLaptop)
+	before, start := ctx.Clock.Now(), hClientCalls(ctx)
+	out = hClientResolve(ctx, "d-2", base, kHClientLaptop)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 5, "resolveConflict waited %.0f s for a merger that answers in 10 s: two attempts of 2 s each, then give up", waited)
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a merger that never answered in time must leave the document conflicted at its head revision")
@@ -873,63 +873,63 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
-	clientServe(ctx)
-	base, _ := clientSeed(ctx, "d-1")
+	hClientServe(ctx)
+	base, _ := hClientSeed(ctx, "d-1")
 	ctx.GRPC.Fail("ThreeWayMerge", codes.Unavailable, "merger restarting", 1, "")
-	out := clientResolve(ctx, "d-1", base, clientLaptop)
-	ctx.Equal(clientCalls(ctx), 2, "one Unavailable, then a healthy merger; the calls")
-	ctx.Assert(out.Status == "merged" && store.Head(clientBg, "d-1").Body == clientMerged, "the second attempt must merge, got %+v and a head of %q", out, store.Head(clientBg, "d-1").Body)
-	base, head := clientSeed(ctx, "d-2")
+	out := hClientResolve(ctx, "d-1", base, kHClientLaptop)
+	ctx.Equal(hClientCalls(ctx), 2, "one Unavailable, then a healthy merger; the calls")
+	ctx.Assert(out.Status == "merged" && store.Head(hClientBg, "d-1").Body == kHClientMerged, "the second attempt must merge, got %+v and a head of %q", out, store.Head(hClientBg, "d-1").Body)
+	base, head := hClientSeed(ctx, "d-2")
 	ctx.GRPC.Fail("ThreeWayMerge", codes.Unavailable, "merger down", 10, "")
-	before := clientCalls(ctx)
-	out = clientResolve(ctx, "d-2", base, clientLaptop)
-	ctx.Equal(clientCalls(ctx)-before, 2, "a merger that stays Unavailable must be asked at most maxMergeAttempts (2) times for one conflict; the calls")
+	before := hClientCalls(ctx)
+	out = hClientResolve(ctx, "d-2", base, kHClientLaptop)
+	ctx.Equal(hClientCalls(ctx)-before, 2, "a merger that stays Unavailable must be asked at most maxMergeAttempts (2) times for one conflict; the calls")
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "after the last attempt the document must be conflicted at its head revision")
 }
 
 func CheckRejectionTerminal(ctx *harness.Ctx) {
-	clientServe(ctx)
-	base, head := clientSeed(ctx, "d-1")
-	out := clientResolve(ctx, "d-1", base, clientOverlap)
-	ctx.Equal(clientCalls(ctx), 1, "the merger refused two edits of line 3 (FailedPrecondition): a refusal is final; the calls")
+	hClientServe(ctx)
+	base, head := hClientSeed(ctx, "d-1")
+	out := hClientResolve(ctx, "d-1", base, kHClientOverlap)
+	ctx.Equal(hClientCalls(ctx), 1, "the merger refused two edits of line 3 (FailedPrecondition): a refusal is final; the calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a refused merge must not be slept on and asked again; the sleeps")
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a refused merge must leave the document conflicted at its head revision")
-	base, head = clientSeed(ctx, "d-2")
+	base, head = hClientSeed(ctx, "d-2")
 	ctx.GRPC.Fail("ThreeWayMerge", codes.InvalidArgument, "the request is malformed", 1, "")
-	before := clientCalls(ctx)
-	out = clientResolve(ctx, "d-2", base, clientLaptop)
-	ctx.Equal(clientCalls(ctx)-before, 1, "the merger answered InvalidArgument: only Unavailable and DeadlineExceeded are asked again; the calls")
+	before := hClientCalls(ctx)
+	out = hClientResolve(ctx, "d-2", base, kHClientLaptop)
+	ctx.Equal(hClientCalls(ctx)-before, 1, "the merger answered InvalidArgument: only Unavailable and DeadlineExceeded are asked again; the calls")
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: head}, "a merge that failed with InvalidArgument must leave the document conflicted at its head revision")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a failed merge that is not retried must not be slept on; the sleeps")
 }
 
 func CheckKeepBoth(ctx *harness.Ctx) {
-	clientServe(ctx)
-	base, head := clientSeed(ctx, "d-1")
-	out := clientResolve(ctx, "d-1", base, clientOverlap)
-	now := store.Head(clientBg, "d-1")
-	ctx.Assert(now.Body == clientPhone && now.Revision == head, "a failed merge replaced the phone's edit: the head reads %q at revision %d. Leave the head as it is", now.Body, now.Revision)
-	kept := store.ConflictOf(clientBg, "d-1")
-	ctx.Assert(kept != nil && kept.Body == clientOverlap && kept.BaseRevision == base && kept.Device == "laptop", "the laptop's edit must be kept for the user with MarkConflicted (its body, base revision %d and device), the store holds %+v", base, kept)
+	hClientServe(ctx)
+	base, head := hClientSeed(ctx, "d-1")
+	out := hClientResolve(ctx, "d-1", base, kHClientOverlap)
+	now := store.Head(hClientBg, "d-1")
+	ctx.Assert(now.Body == kHClientPhone && now.Revision == head, "a failed merge replaced the phone's edit: the head reads %q at revision %d. Leave the head as it is", now.Body, now.Revision)
+	kept := store.ConflictOf(hClientBg, "d-1")
+	ctx.Assert(kept != nil && kept.Body == kHClientOverlap && kept.BaseRevision == base && kept.Device == "laptop", "the laptop's edit must be kept for the user with MarkConflicted (its body, base revision %d and device), the store holds %+v", base, kept)
 	ctx.Equal(out.Status, "conflicted", "the answer's status")
 	// The phone edits d-2 again while the laptop's edit of it is being merged.
-	base2, head2 := clientSeed(ctx, "d-2")
+	base2, head2 := hClientSeed(ctx, "d-2")
 	rival := ctx.Redis.After("doc:d-2", func() any {
-		outcome, err := revisions.ApplyChange(clientBg, "d-2", head2, store.ContentHash(clientLater), clientLater, "phone")
+		outcome, err := revisions.ApplyChange(hClientBg, "d-2", head2, store.ContentHash(kHClientLater), kHClientLater, "phone")
 		if err != nil {
 			panic(err)
 		}
 		return outcome
 	})
-	out = clientResolve(ctx, "d-2", base2, clientLaptop)
+	out = hClientResolve(ctx, "d-2", base2, kHClientLaptop)
 	ctx.Assert(rival.Fired, "resolveConflict never read d-2's head")
 	ctx.Assert(rival.Err == nil, "the phone's apply failed: %v", rival.Err)
 	moved := rival.Result.(store.Outcome).Revision
-	now2 := store.Head(clientBg, "d-2")
-	ctx.Assert(now2.Body == clientLater && now2.Revision == moved, "the phone's edit that landed during the merge was replaced: the head reads %q at revision %d", now2.Body, now2.Revision)
+	now2 := store.Head(hClientBg, "d-2")
+	ctx.Assert(now2.Body == kHClientLater && now2.Revision == moved, "the phone's edit that landed during the merge was replaced: the head reads %q at revision %d", now2.Body, now2.Revision)
 	ctx.Equal(out, store.Outcome{Status: "conflicted", Revision: moved}, "the head moved while the merge ran, so the merged body was not applied: the answer must be conflicted at the new head revision")
-	kept2 := store.ConflictOf(clientBg, "d-2")
-	ctx.Assert(kept2 != nil && kept2.Body == clientLaptop && kept2.BaseRevision == base2 && kept2.Device == "laptop", "the merged body did not apply, so the laptop's edit must be kept with MarkConflicted (its body, base revision %d and device), the store holds %+v", base2, kept2)
+	kept2 := store.ConflictOf(hClientBg, "d-2")
+	ctx.Assert(kept2 != nil && kept2.Body == kHClientLaptop && kept2.BaseRevision == base2 && kept2.Device == "laptop", "the merged body did not apply, so the laptop's edit must be kept with MarkConflicted (its body, base revision %d and device), the store holds %+v", base2, kept2)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -946,14 +946,14 @@ func CheckKeepBoth(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kClientBase = "milk\\neggs\\nbread";
-const std::string kClientPhone = "milk\\neggs\\nsourdough";   // the phone's edit of line 3, now the head
-const std::string kClientLaptop = "oat milk\\neggs\\nbread";  // the laptop's edit of line 1, made offline against the base
-const std::string kClientMerged = "oat milk\\neggs\\nsourdough";
-const std::string kClientOverlap = "milk\\neggs\\nrye";  // the laptop's edit of line 3 too
-const std::string kClientLater = "milk\\neggs\\nsourdough loaf";  // the phone's next edit, landing while the laptop's edit is merged
+const std::string kHClientBase = "milk\\neggs\\nbread";
+const std::string kHClientPhone = "milk\\neggs\\nsourdough";   // the phone's edit of line 3, now the head
+const std::string kHClientLaptop = "oat milk\\neggs\\nbread";  // the laptop's edit of line 1, made offline against the base
+const std::string kHClientMerged = "oat milk\\neggs\\nsourdough";
+const std::string kHClientOverlap = "milk\\neggs\\nrye";  // the laptop's edit of line 3 too
+const std::string kHClientLater = "milk\\neggs\\nsourdough loaf";  // the phone's next edit, landing while the laptop's edit is merged
 
-std::vector<std::string> lines(const std::string& text) {
+std::vector<std::string> hLines(const std::string& text) {
   std::vector<std::string> out;
   std::stringstream in(text);
   std::string line;
@@ -962,10 +962,10 @@ std::vector<std::string> lines(const std::string& text) {
 }
 
 // A line-by-line three-way merge: edits of different lines combine, two edits of one line are FAILED_PRECONDITION.
-class MergerPeer final : public syncd::Merger::Service {
+class HMergerPeer final : public syncd::Merger::Service {
  public:
   grpc::Status ThreeWayMerge(grpc::ServerContext*, const syncd::MergeRequest* req, syncd::MergeResult* out) override {
-    const auto base = lines(req->base()), local = lines(req->local()), remote = lines(req->remote());
+    const auto base = hLines(req->base()), local = hLines(req->local()), remote = hLines(req->remote());
     if (base.size() != local.size() || base.size() != remote.size()) {
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "the edits change the number of lines");
     }
@@ -981,43 +981,43 @@ class MergerPeer final : public syncd::Merger::Service {
   }
 };
 
-void clientServe(harness::Ctx& ctx) {
-  static MergerPeer* peer = nullptr;
+void hClientServe(harness::Ctx& ctx) {
+  static HMergerPeer* peer = nullptr;
   delete peer;
-  peer = new MergerPeer;
+  peer = new HMergerPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
 // The base as the laptop last pulled it, then the phone's edit of it as the head: {base revision, head revision}.
-std::pair<long long, long long> clientSeed(const std::string& doc_id) {
-  const long long base = revisions::applyChange(doc_id, 0, store::contentHash(kClientBase), kClientBase, "laptop").revision;
-  const long long head = revisions::applyChange(doc_id, base, store::contentHash(kClientPhone), kClientPhone, "phone").revision;
+std::pair<long long, long long> hClientSeed(const std::string& doc_id) {
+  const long long base = revisions::applyChange(doc_id, 0, store::contentHash(kHClientBase), kHClientBase, "laptop").revision;
+  const long long head = revisions::applyChange(doc_id, base, store::contentHash(kHClientPhone), kHClientPhone, "phone").revision;
   return {base, head};
 }
 
-size_t clientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ThreeWayMerge").size(); }
+size_t hClientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ThreeWayMerge").size(); }
 
-std::string outcomeText(const store::Outcome& o) { return o.status + " at " + std::to_string(o.revision); }
+std::string hOutcomeText(const store::Outcome& o) { return o.status + " at " + std::to_string(o.revision); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientServe(ctx);
-  auto [base, head] = clientSeed("d-1");
-  store::Outcome out = resolveConflict("d-1", base, kClientLaptop, "laptop");
+  hClientServe(ctx);
+  auto [base, head] = hClientSeed("d-1");
+  store::Outcome out = resolveConflict("d-1", base, kHClientLaptop, "laptop");
   ctx.Equal(out.status, "merged", "with a healthy merger the edits of lines 1 and 3 must merge; the status");
   for (const auto& call : ctx.GRPC.CallsTo("ThreeWayMerge")) {
     ctx.Assert(call.HasDeadline(), "a ThreeWayMerge call carries no deadline: a merger that hangs holds the push open");
     ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a ThreeWayMerge call carries a %v s deadline, expected kMergeDeadline = 2 s", call.TimeoutSeconds());
   }
-  std::tie(base, head) = clientSeed("d-2");
+  std::tie(base, head) = hClientSeed("d-2");
   ctx.GRPC.SetLatency("ThreeWayMerge", 10.0);
   const int64_t before = ctx.Clock.Now();
-  const size_t start = clientCalls(ctx);
-  out = resolveConflict("d-2", base, kClientLaptop, "laptop");
+  const size_t start = hClientCalls(ctx);
+  out = resolveConflict("d-2", base, kHClientLaptop, "laptop");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 5, "resolveConflict waited %.0f s for a merger that answers in 10 s: two attempts of 2 s each, then give up", waited);
-  ctx.Assert(out.status == "conflicted" && out.revision == head, "a merger that never answered in time must leave the document conflicted at its head revision %d, got %s", head, outcomeText(out));
+  ctx.Assert(out.status == "conflicted" && out.revision == head, "a merger that never answered in time must leave the document conflicted at its head revision %d, got %s", head, hOutcomeText(out));
   const auto all = ctx.GRPC.CallsTo("ThreeWayMerge");
   ctx.Equal(all.size() - start, size_t{2}, "a merger that answers in 10 s must be asked kMaxMergeAttempts (2) times for one conflict; the calls");
   for (size_t i = start; i < all.size(); i++) {
@@ -1027,66 +1027,66 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
-  clientServe(ctx);
-  auto [base, head] = clientSeed("d-1");
+  hClientServe(ctx);
+  auto [base, head] = hClientSeed("d-1");
   ctx.GRPC.Fail("ThreeWayMerge", grpc::StatusCode::UNAVAILABLE, "merger restarting", 1);
-  store::Outcome out = resolveConflict("d-1", base, kClientLaptop, "laptop");
-  ctx.Equal(clientCalls(ctx), size_t{2}, "one UNAVAILABLE, then a healthy merger; the calls");
-  ctx.Assert(out.status == "merged" && store::head("d-1")->body == kClientMerged, "the second attempt must merge, got %s and a head of %q", outcomeText(out), store::head("d-1")->body);
-  std::tie(base, head) = clientSeed("d-2");
+  store::Outcome out = resolveConflict("d-1", base, kHClientLaptop, "laptop");
+  ctx.Equal(hClientCalls(ctx), size_t{2}, "one UNAVAILABLE, then a healthy merger; the calls");
+  ctx.Assert(out.status == "merged" && store::head("d-1")->body == kHClientMerged, "the second attempt must merge, got %s and a head of %q", hOutcomeText(out), store::head("d-1")->body);
+  std::tie(base, head) = hClientSeed("d-2");
   ctx.GRPC.Fail("ThreeWayMerge", grpc::StatusCode::UNAVAILABLE, "merger down", 10);
-  const size_t before = clientCalls(ctx);
-  out = resolveConflict("d-2", base, kClientLaptop, "laptop");
-  ctx.Equal(clientCalls(ctx) - before, size_t{2}, "a merger that stays UNAVAILABLE must be asked at most kMaxMergeAttempts (2) times for one conflict; the calls");
-  ctx.Assert(out.status == "conflicted" && out.revision == head, "after the last attempt the document must be conflicted at its head revision %d, got %s", head, outcomeText(out));
+  const size_t before = hClientCalls(ctx);
+  out = resolveConflict("d-2", base, kHClientLaptop, "laptop");
+  ctx.Equal(hClientCalls(ctx) - before, size_t{2}, "a merger that stays UNAVAILABLE must be asked at most kMaxMergeAttempts (2) times for one conflict; the calls");
+  ctx.Assert(out.status == "conflicted" && out.revision == head, "after the last attempt the document must be conflicted at its head revision %d, got %s", head, hOutcomeText(out));
 }
 
 void CheckRejectionTerminal(harness::Ctx& ctx) {
-  clientServe(ctx);
-  const auto [base, head] = clientSeed("d-1");
-  const store::Outcome out = resolveConflict("d-1", base, kClientOverlap, "laptop");
-  ctx.Equal(clientCalls(ctx), size_t{1}, "the merger refused two edits of line 3 (FAILED_PRECONDITION): a refusal is final; the calls");
+  hClientServe(ctx);
+  const auto [base, head] = hClientSeed("d-1");
+  const store::Outcome out = resolveConflict("d-1", base, kHClientOverlap, "laptop");
+  ctx.Equal(hClientCalls(ctx), size_t{1}, "the merger refused two edits of line 3 (FAILED_PRECONDITION): a refusal is final; the calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a refused merge must not be slept on and asked again; the sleeps");
-  ctx.Assert(out.status == "conflicted" && out.revision == head, "a refused merge must leave the document conflicted at its head revision %d, got %s", head, outcomeText(out));
-  const auto [base2, head2] = clientSeed("d-2");
+  ctx.Assert(out.status == "conflicted" && out.revision == head, "a refused merge must leave the document conflicted at its head revision %d, got %s", head, hOutcomeText(out));
+  const auto [base2, head2] = hClientSeed("d-2");
   ctx.GRPC.Fail("ThreeWayMerge", grpc::StatusCode::INVALID_ARGUMENT, "the request is malformed", 1);
-  const size_t before = clientCalls(ctx);
-  const store::Outcome out2 = resolveConflict("d-2", base2, kClientLaptop, "laptop");
-  ctx.Equal(clientCalls(ctx) - before, size_t{1}, "the merger answered INVALID_ARGUMENT: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the calls");
-  ctx.Assert(out2.status == "conflicted" && out2.revision == head2, "a merge that failed with INVALID_ARGUMENT must leave the document conflicted at its head revision %d, got %s", head2, outcomeText(out2));
+  const size_t before = hClientCalls(ctx);
+  const store::Outcome out2 = resolveConflict("d-2", base2, kHClientLaptop, "laptop");
+  ctx.Equal(hClientCalls(ctx) - before, size_t{1}, "the merger answered INVALID_ARGUMENT: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the calls");
+  ctx.Assert(out2.status == "conflicted" && out2.revision == head2, "a merge that failed with INVALID_ARGUMENT must leave the document conflicted at its head revision %d, got %s", head2, hOutcomeText(out2));
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a failed merge that is not retried must not be slept on; the sleeps");
 }
 
 void CheckKeepBoth(harness::Ctx& ctx) {
-  clientServe(ctx);
-  const auto [base, head] = clientSeed("d-1");
-  const store::Outcome out = resolveConflict("d-1", base, kClientOverlap, "laptop");
+  hClientServe(ctx);
+  const auto [base, head] = hClientSeed("d-1");
+  const store::Outcome out = resolveConflict("d-1", base, kHClientOverlap, "laptop");
   const auto now = store::head("d-1");
-  ctx.Assert(now->body == kClientPhone && now->revision == head, "a failed merge replaced the phone's edit: the head reads %q at revision %d. Leave the head as it is", now->body, now->revision);
+  ctx.Assert(now->body == kHClientPhone && now->revision == head, "a failed merge replaced the phone's edit: the head reads %q at revision %d. Leave the head as it is", now->body, now->revision);
   const auto kept = store::conflictOf("d-1");
-  ctx.Assert(kept && kept->body == kClientOverlap && kept->base_revision == base && kept->device == "laptop",
+  ctx.Assert(kept && kept->body == kHClientOverlap && kept->base_revision == base && kept->device == "laptop",
              "the laptop's edit must be kept for the user with markConflicted (its body, base revision %d and device), the store holds %s", base, kept ? kept->body : "nothing");
   ctx.Equal(out.status, "conflicted", "the answer's status");
   // The phone edits d-2 again while the laptop's edit of it is being merged.
-  const auto [base2, head2] = clientSeed("d-2");
+  const auto [base2, head2] = hClientSeed("d-2");
   std::optional<store::Outcome> rival;
   std::optional<std::string> failed;
   ctx.Redis.After("doc:d-2", [&, head2 = head2] {
     try {
-      rival = revisions::applyChange("d-2", head2, store::contentHash(kClientLater), kClientLater, "phone");
+      rival = revisions::applyChange("d-2", head2, store::contentHash(kHClientLater), kHClientLater, "phone");
     } catch (const std::exception& e) {
       failed = e.what();
     }
   });
-  const store::Outcome out2 = resolveConflict("d-2", base2, kClientLaptop, "laptop");
+  const store::Outcome out2 = resolveConflict("d-2", base2, kHClientLaptop, "laptop");
   ctx.Assert(!failed, "the phone's apply failed: %s", failed.value_or(""));
   ctx.Assert(rival.has_value(), "resolveConflict never read d-2's head");
   const long long moved = rival->revision;
   const auto now2 = store::head("d-2");
-  ctx.Assert(now2->body == kClientLater && now2->revision == moved, "the phone's edit that landed during the merge was replaced: the head reads %q at revision %d", now2->body, now2->revision);
-  ctx.Assert(out2.status == "conflicted" && out2.revision == moved, "the head moved to revision %d while the merge ran, so the merged body was not applied: answer conflicted at revision %d, got %s", moved, moved, outcomeText(out2));
+  ctx.Assert(now2->body == kHClientLater && now2->revision == moved, "the phone's edit that landed during the merge was replaced: the head reads %q at revision %d", now2->body, now2->revision);
+  ctx.Assert(out2.status == "conflicted" && out2.revision == moved, "the head moved to revision %d while the merge ran, so the merged body was not applied: answer conflicted at revision %d, got %s", moved, moved, hOutcomeText(out2));
   const auto kept2 = store::conflictOf("d-2");
-  ctx.Assert(kept2 && kept2->body == kClientLaptop && kept2->base_revision == base2 && kept2->device == "laptop",
+  ctx.Assert(kept2 && kept2->body == kHClientLaptop && kept2->base_revision == base2 && kept2->device == "laptop",
              "the merged body did not apply, so the laptop's edit must be kept with markConflicted (its body, base revision %d and device), the store holds %s", base2, kept2 ? kept2->body : "nothing");
 }
 `,

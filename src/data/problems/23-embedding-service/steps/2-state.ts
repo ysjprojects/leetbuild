@@ -589,18 +589,18 @@ import (
 )
 
 const (
-	stateTenant = "acme"
-	stateText   = "How do I rotate an API key?"
+	kHStateTenant = "acme"
+	kHStateText   = "How do I rotate an API key?"
 )
 
-// stateCompute is the model call the worker hands in: it counts its calls and may run a side effect first.
-type stateCompute struct {
+// HStateCompute is the model call the worker hands in: it counts its calls and may run a side effect first.
+type HStateCompute struct {
 	vector []float32
 	before func()
 	calls  int
 }
 
-func (c *stateCompute) fn() func() ([]float32, error) {
+func (c *HStateCompute) fn() func() ([]float32, error) {
 	return func() ([]float32, error) {
 		c.calls++
 		if c.before != nil {
@@ -610,12 +610,12 @@ func (c *stateCompute) fn() func() ([]float32, error) {
 	}
 }
 
-func stateKey(version string) string {
-	return config.VectorKey(stateTenant, version, config.ContentHash(stateText))
+func hStateKey(version string) string {
+	return config.VectorKey(kHStateTenant, version, config.ContentHash(kHStateText))
 }
 
-func stateStored(ctx *harness.Ctx, version string) []float32 {
-	raw, ok := ctx.Redis.Get(stateKey(version))
+func hStateStored(ctx *harness.Ctx, version string) []float32 {
+	raw, ok := ctx.Redis.Get(hStateKey(version))
 	if !ok {
 		return nil
 	}
@@ -624,37 +624,37 @@ func stateStored(ctx *harness.Ctx, version string) []float32 {
 	return v
 }
 
-func stateStore(ctx *harness.Ctx, version string, c *stateCompute) []float32 {
-	got, err := storeVector(context.Background(), stateTenant, version, stateText, c.fn())
+func hStateStore(ctx *harness.Ctx, version string, c *HStateCompute) []float32 {
+	got, err := storeVector(context.Background(), kHStateTenant, version, kHStateText, c.fn())
 	ctx.NoError(err, "storeVector(%s)", version)
 	return got
 }
 
 func CheckCacheHit(ctx *harness.Ctx) {
-	v2 := model.VectorFor(config.ModelVersion, stateText)
-	ctx.Equal(stateStore(ctx, config.ModelVersion, &stateCompute{vector: v2}), v2, "a miss must return the computed vector")
-	second := &stateCompute{vector: model.VectorFor(config.ModelVersion, "something else")}
-	got := stateStore(ctx, config.ModelVersion, second)
+	v2 := model.VectorFor(config.ModelVersion, kHStateText)
+	ctx.Equal(hStateStore(ctx, config.ModelVersion, &HStateCompute{vector: v2}), v2, "a miss must return the computed vector")
+	second := &HStateCompute{vector: model.VectorFor(config.ModelVersion, "something else")}
+	got := hStateStore(ctx, config.ModelVersion, second)
 	ctx.Equal(second.calls, 0, "the second call for the same input computed again: a hit must be served from the cache; compute calls")
 	ctx.Equal(got, v2, "a hit must return the stored vector")
 }
 
 func CheckVersionKey(ctx *harness.Ctx) {
-	v1, v2 := model.VectorFor(config.PreviousVersion, stateText), model.VectorFor(config.ModelVersion, stateText)
-	stateStore(ctx, config.PreviousVersion, &stateCompute{vector: v1})
-	upgraded := &stateCompute{vector: v2}
-	got := stateStore(ctx, config.ModelVersion, upgraded)
+	v1, v2 := model.VectorFor(config.PreviousVersion, kHStateText), model.VectorFor(config.ModelVersion, kHStateText)
+	hStateStore(ctx, config.PreviousVersion, &HStateCompute{vector: v1})
+	upgraded := &HStateCompute{vector: v2}
+	got := hStateStore(ctx, config.ModelVersion, upgraded)
 	ctx.Assert(upgraded.calls == 1 && len(got) == len(v2), "after the upgrade an embed-v2 request was answered with %v: the embed-v1 vector, because the key leaves out the model version", got)
 	ctx.Equal(got, v2, "the embed-v2 request's vector")
-	ctx.Equal(stateStored(ctx, config.ModelVersion), v2, "the embed-v2 vector must be stored under %s (keys %v)", stateKey(config.ModelVersion), ctx.Redis.Keys("emb:*"))
-	ctx.Equal(stateStored(ctx, config.PreviousVersion), v1, "the embed-v1 vector must stay under %s for explicit embed-v1 reads", stateKey(config.PreviousVersion))
-	again := &stateCompute{vector: v1}
-	ctx.Equal(stateStore(ctx, config.PreviousVersion, again), v1, "an embed-v1 request is still a hit on the embed-v1 vector")
+	ctx.Equal(hStateStored(ctx, config.ModelVersion), v2, "the embed-v2 vector must be stored under %s (keys %v)", hStateKey(config.ModelVersion), ctx.Redis.Keys("emb:*"))
+	ctx.Equal(hStateStored(ctx, config.PreviousVersion), v1, "the embed-v1 vector must stay under %s for explicit embed-v1 reads", hStateKey(config.PreviousVersion))
+	again := &HStateCompute{vector: v1}
+	ctx.Equal(hStateStore(ctx, config.PreviousVersion, again), v1, "an embed-v1 request is still a hit on the embed-v1 vector")
 	ctx.Equal(again.calls, 0, "an embed-v1 request is still a hit; compute calls")
 }
 
 func CheckTtlInWrite(ctx *harness.Ctx) {
-	key := stateKey(config.ModelVersion)
+	key := hStateKey(config.ModelVersion)
 	var ttl int64
 	written := false
 	// A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
@@ -670,7 +670,7 @@ func CheckTtlInWrite(ctx *harness.Ctx) {
 	}
 	// The next command on the key that leaves it stored is the write: what a crash right after it leaves.
 	arm := func() { ctx.Redis.After(key, watch) }
-	stateStore(ctx, config.ModelVersion, &stateCompute{vector: model.VectorFor(config.ModelVersion, stateText), before: arm})
+	hStateStore(ctx, config.ModelVersion, &HStateCompute{vector: model.VectorFor(config.ModelVersion, kHStateText), before: arm})
 	ctx.Assert(written, "storeVector never wrote %s; keys: %v", key, ctx.Redis.Keys("emb:*"))
 	ctx.Assert(ttl > 0, "right after the command that wrote the vector its TTL was %d: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET", ttl)
 	now := ctx.Redis.TTL(key)
@@ -678,19 +678,19 @@ func CheckTtlInWrite(ctx *harness.Ctx) {
 }
 
 func CheckFirstWriterWins(ctx *harness.Ctx) {
-	key := stateKey(config.ModelVersion)
+	key := hStateKey(config.ModelVersion)
 	winner := []float32{0.5, 0.25, -0.25, -0.5, 0.125, -0.125, 0.75, -0.75}
 	doc, _ := json.Marshal(winner)
 	// Another worker missed too, computed first and stored its vector.
 	otherWorker := func() { ctx.Redis.Set(key, string(doc), "EX", config.VectorTTLSeconds) }
-	got := stateStore(ctx, config.ModelVersion, &stateCompute{vector: model.VectorFor(config.ModelVersion, stateText), before: otherWorker})
-	ctx.Equal(stateStored(ctx, config.ModelVersion), winner, "another worker stored its vector while this one computed: the write must not overwrite the first writer; the cache holds")
+	got := hStateStore(ctx, config.ModelVersion, &HStateCompute{vector: model.VectorFor(config.ModelVersion, kHStateText), before: otherWorker})
+	ctx.Equal(hStateStored(ctx, config.ModelVersion), winner, "another worker stored its vector while this one computed: the write must not overwrite the first writer; the cache holds")
 	ctx.Equal(got, winner, "storeVector must return the cached vector, not its own, or two callers of one input hold different vectors; it returned")
 
 	// A second worker lands right after this one's next command on the key, once it has computed: a
 	// check followed by a plain SET leaves a window between the two, and the racer stores first in it.
 	racedText := "How do I revoke a leaked key?"
-	racedKey := config.VectorKey(stateTenant, config.ModelVersion, config.ContentHash(racedText))
+	racedKey := config.VectorKey(kHStateTenant, config.ModelVersion, config.ContentHash(racedText))
 	racer := []float32{-0.5, 0.5, 0.25, -0.25, 0.75, -0.75, 0.125, -0.125}
 	racerDoc, _ := json.Marshal(racer)
 	racerStored := false
@@ -700,8 +700,8 @@ func CheckFirstWriterWins(ctx *harness.Ctx) {
 			return racerStored
 		})
 	}
-	compute := &stateCompute{vector: model.VectorFor(config.ModelVersion, racedText), before: arm}
-	second, err := storeVector(context.Background(), stateTenant, config.ModelVersion, racedText, compute.fn())
+	compute := &HStateCompute{vector: model.VectorFor(config.ModelVersion, racedText), before: arm}
+	second, err := storeVector(context.Background(), kHStateTenant, config.ModelVersion, racedText, compute.fn())
 	ctx.NoError(err, "storeVector(%s)", racedText)
 	var held []float32
 	if raw, ok := ctx.Redis.Get(racedKey); ok {
@@ -726,11 +726,11 @@ func CheckFirstWriterWins(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTenant = "acme";
-const std::string kText = "How do I rotate an API key?";
+const std::string kHTenant = "acme";
+const std::string kHText = "How do I rotate an API key?";
 
 // The model call the worker hands in: counts its calls, may run a side effect first.
-struct Compute {
+struct HCompute {
   std::vector<float> vector;
   std::function<void()> before;
   int calls = 0;
@@ -743,10 +743,10 @@ struct Compute {
   }
 };
 
-std::string stateKey(const std::string& version) { return config::vectorKey(kTenant, version, config::contentHash(kText)); }
+std::string hStateKey(const std::string& version) { return config::vectorKey(kHTenant, version, config::contentHash(kHText)); }
 
-std::optional<std::vector<float>> stored(harness::Ctx& ctx, const std::string& version) {
-  const auto raw = ctx.Redis.Get(stateKey(version));
+std::optional<std::vector<float>> hStored(harness::Ctx& ctx, const std::string& version) {
+  const auto raw = ctx.Redis.Get(hStateKey(version));
   if (!raw) return std::nullopt;
   return nlohmann::json::parse(*raw).get<std::vector<float>>();
 }
@@ -754,33 +754,33 @@ std::optional<std::vector<float>> stored(harness::Ctx& ctx, const std::string& v
 }  // namespace
 
 void CheckCacheHit(harness::Ctx& ctx) {
-  const auto v2 = model::vectorFor(config::kModelVersion, kText);
-  Compute first{v2};
-  ctx.Equal(storeVector(kTenant, config::kModelVersion, kText, first.fn()), v2, "a miss must return the computed vector");
-  Compute second{model::vectorFor(config::kModelVersion, "something else")};
-  const auto got = storeVector(kTenant, config::kModelVersion, kText, second.fn());
+  const auto v2 = model::vectorFor(config::kModelVersion, kHText);
+  HCompute first{v2};
+  ctx.Equal(storeVector(kHTenant, config::kModelVersion, kHText, first.fn()), v2, "a miss must return the computed vector");
+  HCompute second{model::vectorFor(config::kModelVersion, "something else")};
+  const auto got = storeVector(kHTenant, config::kModelVersion, kHText, second.fn());
   ctx.Equal(second.calls, 0, "the second call for the same input computed again: a hit must be served from the cache; compute calls");
   ctx.Equal(got, v2, "a hit must return the stored vector");
 }
 
 void CheckVersionKey(harness::Ctx& ctx) {
-  const auto v1 = model::vectorFor(config::kPreviousVersion, kText);
-  const auto v2 = model::vectorFor(config::kModelVersion, kText);
-  Compute old{v1};
-  storeVector(kTenant, config::kPreviousVersion, kText, old.fn());
-  Compute upgraded{v2};
-  const auto got = storeVector(kTenant, config::kModelVersion, kText, upgraded.fn());
+  const auto v1 = model::vectorFor(config::kPreviousVersion, kHText);
+  const auto v2 = model::vectorFor(config::kModelVersion, kHText);
+  HCompute old{v1};
+  storeVector(kHTenant, config::kPreviousVersion, kHText, old.fn());
+  HCompute upgraded{v2};
+  const auto got = storeVector(kHTenant, config::kModelVersion, kHText, upgraded.fn());
   ctx.Assert(upgraded.calls == 1 && got.size() == v2.size(), "after the upgrade an embed-v2 request was answered with %v: the embed-v1 vector, because the key leaves out the model version", got);
   ctx.Equal(got, v2, "the embed-v2 request's vector");
-  ctx.Equal(stored(ctx, config::kModelVersion), std::optional<std::vector<float>>(v2), "the embed-v2 vector must be stored under %s (keys %v)", stateKey(config::kModelVersion), ctx.Redis.Keys("emb:*"));
-  ctx.Equal(stored(ctx, config::kPreviousVersion), std::optional<std::vector<float>>(v1), "the embed-v1 vector must stay under %s for explicit embed-v1 reads", stateKey(config::kPreviousVersion));
-  Compute again{v1};
-  ctx.Equal(storeVector(kTenant, config::kPreviousVersion, kText, again.fn()), v1, "an embed-v1 request is still a hit on the embed-v1 vector");
+  ctx.Equal(hStored(ctx, config::kModelVersion), std::optional<std::vector<float>>(v2), "the embed-v2 vector must be stored under %s (keys %v)", hStateKey(config::kModelVersion), ctx.Redis.Keys("emb:*"));
+  ctx.Equal(hStored(ctx, config::kPreviousVersion), std::optional<std::vector<float>>(v1), "the embed-v1 vector must stay under %s for explicit embed-v1 reads", hStateKey(config::kPreviousVersion));
+  HCompute again{v1};
+  ctx.Equal(storeVector(kHTenant, config::kPreviousVersion, kHText, again.fn()), v1, "an embed-v1 request is still a hit on the embed-v1 vector");
   ctx.Equal(again.calls, 0, "an embed-v1 request is still a hit; compute calls");
 }
 
 void CheckTtlInWrite(harness::Ctx& ctx) {
-  const std::string key = stateKey(config::kModelVersion);
+  const std::string key = hStateKey(config::kModelVersion);
   bool written = false;
   long long ttl = 0;
   // A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
@@ -793,10 +793,10 @@ void CheckTtlInWrite(harness::Ctx& ctx) {
       ttl = n;
     }
   };
-  Compute compute{model::vectorFor(config::kModelVersion, kText)};
+  HCompute compute{model::vectorFor(config::kModelVersion, kHText)};
   // The next command on the key that leaves it stored is the write: what a crash right after it leaves.
   compute.before = [&] { ctx.Redis.After(key, watch); };
-  storeVector(kTenant, config::kModelVersion, kText, compute.fn());
+  storeVector(kHTenant, config::kModelVersion, kHText, compute.fn());
   ctx.Assert(written, "storeVector never wrote %s; keys: %v", key, ctx.Redis.Keys("emb:*"));
   ctx.Assert(ttl > 0, "right after the command that wrote the vector its TTL was %d: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET", ttl);
   const long long now = ctx.Redis.TTL(key);
@@ -804,26 +804,26 @@ void CheckTtlInWrite(harness::Ctx& ctx) {
 }
 
 void CheckFirstWriterWins(harness::Ctx& ctx) {
-  const std::string key = stateKey(config::kModelVersion);
+  const std::string key = hStateKey(config::kModelVersion);
   const std::vector<float> winner = {0.5f, 0.25f, -0.25f, -0.5f, 0.125f, -0.125f, 0.75f, -0.75f};
-  Compute compute{model::vectorFor(config::kModelVersion, kText)};
+  HCompute compute{model::vectorFor(config::kModelVersion, kHText)};
   // Another worker missed too, computed first and stored its vector.
   compute.before = [&] { ctx.Redis.Set(key, nlohmann::json(winner).dump(), "EX", config::kVectorTtlSeconds); };
-  const auto got = storeVector(kTenant, config::kModelVersion, kText, compute.fn());
-  ctx.Equal(stored(ctx, config::kModelVersion), std::optional<std::vector<float>>(winner), "another worker stored its vector while this one computed: the write must not overwrite the first writer; the cache holds");
+  const auto got = storeVector(kHTenant, config::kModelVersion, kHText, compute.fn());
+  ctx.Equal(hStored(ctx, config::kModelVersion), std::optional<std::vector<float>>(winner), "another worker stored its vector while this one computed: the write must not overwrite the first writer; the cache holds");
   ctx.Equal(got, winner, "storeVector must return the cached vector, not its own, or two callers of one input hold different vectors; it returned");
 
   // A second worker lands right after this one's next command on the key, once it has computed: a
   // check followed by a plain SET leaves a window between the two, and the racer stores first in it.
   const std::string raced_text = "How do I revoke a leaked key?";
-  const std::string raced_key = config::vectorKey(kTenant, config::kModelVersion, config::contentHash(raced_text));
+  const std::string raced_key = config::vectorKey(kHTenant, config::kModelVersion, config::contentHash(raced_text));
   const std::vector<float> racer = {-0.5f, 0.5f, 0.25f, -0.25f, 0.75f, -0.75f, 0.125f, -0.125f};
   bool racer_stored = false;
-  Compute raced{model::vectorFor(config::kModelVersion, raced_text)};
+  HCompute raced{model::vectorFor(config::kModelVersion, raced_text)};
   raced.before = [&] {
     ctx.Redis.After(raced_key, [&] { racer_stored = ctx.Redis.Set(raced_key, nlohmann::json(racer).dump(), "EX", config::kVectorTtlSeconds, "NX"); });
   };
-  const auto second = storeVector(kTenant, config::kModelVersion, raced_text, raced.fn());
+  const auto second = storeVector(kHTenant, config::kModelVersion, raced_text, raced.fn());
   const auto raw = ctx.Redis.Get(raced_key);
   const std::vector<float> held = raw ? nlohmann::json::parse(*raw).get<std::vector<float>>() : std::vector<float>{};
   if (racer_stored) {

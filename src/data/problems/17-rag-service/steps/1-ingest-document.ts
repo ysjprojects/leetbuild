@@ -1065,36 +1065,36 @@ import (
 	"leetbuild/harness"
 )
 
-const ingestDoc = "rag:doc:t1:handbook-2026:1"
+const kHIngestDoc = "rag:doc:t1:handbook-2026:1"
 
-var ingestGood = map[string]any{"doc_id": "handbook-2026", "version": 1, "content_type": "text/markdown", "content": "# Refunds\\nRefunds are accepted within 30 days."}
+var hIngestGood = map[string]any{"doc_id": "handbook-2026", "version": 1, "content_type": "text/markdown", "content": "# Refunds\\nRefunds are accepted within 30 days."}
 
-func ingestClient(ctx *harness.Ctx) *harness.HTTP {
+func hIngestClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func ingestWith(field string, value any) map[string]any {
+func hIngestWith(field string, value any) map[string]any {
 	out := map[string]any{}
-	for k, v := range ingestGood {
+	for k, v := range hIngestGood {
 		out[k] = v
 	}
 	out[field] = value
 	return out
 }
 
-func ingestPost(c *harness.HTTP, body map[string]any) *harness.Response {
+func hIngestPost(c *harness.HTTP, body map[string]any) *harness.Response {
 	return c.Post("/v1/documents", body, "X-Tenant-Id", "t1")
 }
 
-func ingestJob(r *harness.Response) string {
+func hIngestJob(r *harness.Response) string {
 	body, _ := r.JSON().(map[string]any)
 	job, _ := body["job_id"].(string)
 	return job
 }
 
-func ingestOutbox(ctx *harness.Ctx) []map[string]any {
+func hIngestOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("rag:outbox", 0, -1) {
 		var e map[string]any
@@ -1104,26 +1104,26 @@ func ingestOutbox(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func ingestSHA(text string) string {
+func hIngestSHA(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(sum[:])
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := ingestClient(ctx)
-	r := ingestPost(c, ingestGood)
+	c := hIngestClient(ctx)
+	r := hIngestPost(c, hIngestGood)
 	ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text())
-	job := ingestJob(r)
+	job := hIngestJob(r)
 	ctx.Assert(job != "", "the 202 body must carry the job_id: %s", r.Text())
-	stored := ctx.Redis.HGetAll(ingestDoc)
-	ctx.Assert(stored["job_id"] == job && stored["content"] == ingestGood["content"], "the version must be stored at %s with its job_id and content, found %v", ingestDoc, stored)
-	ctx.Equal(len(ingestOutbox(ctx)), 1, "one upload, one outbox row; rows in rag:outbox")
-	noTenant := c.Post("/v1/documents", ingestGood)
+	stored := ctx.Redis.HGetAll(kHIngestDoc)
+	ctx.Assert(stored["job_id"] == job && stored["content"] == hIngestGood["content"], "the version must be stored at %s with its job_id and content, found %v", kHIngestDoc, stored)
+	ctx.Equal(len(hIngestOutbox(ctx)), 1, "one upload, one outbox row; rows in rag:outbox")
+	noTenant := c.Post("/v1/documents", hIngestGood)
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the upload")
 }
 
 func CheckValidateBody(ctx *harness.Ctx) {
-	c := ingestClient(ctx)
+	c := hIngestClient(ctx)
 	cases := []struct {
 		field  string
 		value  any
@@ -1142,46 +1142,46 @@ func CheckValidateBody(ctx *harness.Ctx) {
 		{"content", strings.Repeat("é", 1<<19+1), 413, "524289 two-byte characters (1 MiB + 2 bytes of UTF-8)"},
 	}
 	for _, tc := range cases {
-		r := ingestPost(c, ingestWith(tc.field, tc.value))
+		r := hIngestPost(c, hIngestWith(tc.field, tc.value))
 		ctx.Equal(r.Status, tc.status, "%s", tc.what)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("rag:*")), 0, "rejected uploads must store nothing; keys in Redis")
-	r := ingestPost(c, ingestWith("content", strings.Repeat("a", 1<<20)))
+	r := hIngestPost(c, hIngestWith("content", strings.Repeat("a", 1<<20)))
 	ctx.Equal(r.Status, 202, "exactly 1 MiB is within the limit")
-	wide := ingestWith("content", strings.Repeat("é", 1<<19))
+	wide := hIngestWith("content", strings.Repeat("é", 1<<19))
 	wide["version"] = 2
-	ctx.Equal(ingestPost(c, wide).Status, 202, "exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit")
-	ctx.Equal(ingestPost(c, ingestWith("doc_id", strings.Repeat("a", 64))).Status, 202, "a 64-character doc_id is valid")
+	ctx.Equal(hIngestPost(c, wide).Status, 202, "exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit")
+	ctx.Equal(hIngestPost(c, hIngestWith("doc_id", strings.Repeat("a", 64))).Status, 202, "a 64-character doc_id is valid")
 }
 
 func CheckVersionConflict(ctx *harness.Ctx) {
-	c := ingestClient(ctx)
-	first := ingestPost(c, ingestGood)
+	c := hIngestClient(ctx)
+	first := hIngestPost(c, hIngestGood)
 	ctx.Equal(first.Status, 202, "the first upload (%s)", first.Text())
-	job := ingestJob(first)
-	retry := ingestPost(c, ingestGood)
-	ctx.Assert(retry.Status == 202 && ingestJob(retry) == job, "the same upload again is a retry: 202 with job %s, got %d %s", job, retry.Status, retry.Text())
-	ctx.Equal(len(ingestOutbox(ctx)), 1, "a retry must not add an outbox row; rows")
-	v2 := ingestPost(c, ingestWith("version", 2))
-	ctx.Assert(v2.Status == 202 && ingestJob(v2) != "" && ingestJob(v2) != job, "version 2 is a new document version with its own job, got %d %s", v2.Status, v2.Text())
-	rewrite := ingestPost(c, ingestWith("content", "Refunds are never accepted."))
+	job := hIngestJob(first)
+	retry := hIngestPost(c, hIngestGood)
+	ctx.Assert(retry.Status == 202 && hIngestJob(retry) == job, "the same upload again is a retry: 202 with job %s, got %d %s", job, retry.Status, retry.Text())
+	ctx.Equal(len(hIngestOutbox(ctx)), 1, "a retry must not add an outbox row; rows")
+	v2 := hIngestPost(c, hIngestWith("version", 2))
+	ctx.Assert(v2.Status == 202 && hIngestJob(v2) != "" && hIngestJob(v2) != job, "version 2 is a new document version with its own job, got %d %s", v2.Status, v2.Text())
+	rewrite := hIngestPost(c, hIngestWith("content", "Refunds are never accepted."))
 	ctx.Equal(rewrite.Status, 409, "version 1 with other content: a stored version is immutable, so another hash is a 409, not a retry")
-	stored := ctx.Redis.HGetAll(ingestDoc)
-	ctx.Assert(stored["sha256"] == ingestSHA(ingestGood["content"].(string)) && stored["content"] == ingestGood["content"], "the 409 must leave version 1 as it was, found %v", stored)
-	ctx.Equal(len(ingestOutbox(ctx)), 2, "two versions, two outbox rows; rows")
+	stored := ctx.Redis.HGetAll(kHIngestDoc)
+	ctx.Assert(stored["sha256"] == hIngestSHA(hIngestGood["content"].(string)) && stored["content"] == hIngestGood["content"], "the 409 must leave version 1 as it was, found %v", stored)
+	ctx.Equal(len(hIngestOutbox(ctx)), 2, "two versions, two outbox rows; rows")
 }
 
 func CheckOutboxTx(ctx *harness.Ctx) {
 	var seen map[string]int64
 	snapshot := func() any {
-		seen = map[string]int64{"doc": ctx.Redis.Exists(ingestDoc), "outbox": ctx.Redis.LLen("rag:outbox")}
+		seen = map[string]int64{"doc": ctx.Redis.Exists(kHIngestDoc), "outbox": ctx.Redis.LLen("rag:outbox")}
 		return nil
 	}
-	ctx.Redis.After(ingestDoc, func() any {
+	ctx.Redis.After(kHIngestDoc, func() any {
 		snapshot()
 		if seen["doc"] == 0 {
 			seen = nil
-			ctx.Redis.After(ingestDoc, snapshot) // the lookup came first: watch the write
+			ctx.Redis.After(kHIngestDoc, snapshot) // the lookup came first: watch the write
 		}
 		return nil
 	})
@@ -1194,31 +1194,31 @@ func CheckOutboxTx(ctx *harness.Ctx) {
 		}
 		if rowFirst == 0 {
 			rowFirst = -1
-			if ctx.Redis.Exists(ingestDoc) == 1 {
+			if ctx.Redis.Exists(kHIngestDoc) == 1 {
 				rowFirst = 1
 			}
 		}
 		return nil
 	}
 	ctx.Redis.After("rag:outbox", rowAppears)
-	r := ingestPost(ingestClient(ctx), ingestGood)
+	r := hIngestPost(hIngestClient(ctx), hIngestGood)
 	ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text())
 	ctx.Assert(rowFirst != -1, "the outbox row appeared before its document: a crash right there leaves an event naming a document that was never stored; write both in one MULTI/EXEC")
 	ctx.Assert(seen != nil && seen["doc"] == 1, "the document was never written")
 	ctx.Equal(seen["outbox"], int64(1), "when the document became visible, the rows in rag:outbox (a crash right there leaves a document no worker hears about; write both in one MULTI/EXEC)")
-	rows := ingestOutbox(ctx)
-	job, _ := ctx.Redis.HGet(ingestDoc, "job_id")
+	rows := hIngestOutbox(ctx)
+	job, _ := ctx.Redis.HGet(kHIngestDoc, "job_id")
 	ctx.Assert(len(rows) == 1 && rows[0]["job_id"] == job, "the outbox row must name the stored job: %v", rows)
 }
 
 func CheckEventIdsOnly(ctx *harness.Ctx) {
-	r := ingestPost(ingestClient(ctx), ingestGood)
+	r := hIngestPost(hIngestClient(ctx), hIngestGood)
 	ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text())
-	rows := ingestOutbox(ctx)
+	rows := hIngestOutbox(ctx)
 	ctx.Equal(len(rows), 1, "one upload, one outbox row; rows")
 	_, has := rows[0]["content"]
 	ctx.Assert(!has, "the event carries the document text; ids and the hash only, the worker reads the content from the store")
-	expected := map[string]any{"tenant": "t1", "doc_id": "handbook-2026", "version": float64(1), "job_id": ingestJob(r), "sha256": ingestSHA(ingestGood["content"].(string))}
+	expected := map[string]any{"tenant": "t1", "doc_id": "handbook-2026", "version": float64(1), "job_id": hIngestJob(r), "sha256": hIngestSHA(hIngestGood["content"].(string))}
 	for key, value := range expected {
 		ctx.Equal(rows[0][key], value, "the event's %s (event %v)", key, rows[0])
 	}
@@ -1242,34 +1242,34 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kDoc = "rag:doc:t1:handbook-2026:1";
-const json kGood = {{"doc_id", "handbook-2026"}, {"version", 1}, {"content_type", "text/markdown"}, {"content", "# Refunds\\nRefunds are accepted within 30 days."}};
+const std::string kHDoc = "rag:doc:t1:handbook-2026:1";
+const json kHGood = {{"doc_id", "handbook-2026"}, {"version", 1}, {"content_type", "text/markdown"}, {"content", "# Refunds\\nRefunds are accepted within 30 days."}};
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
   harness::Response post(const json& body) { return http.Post("/v1/documents", body.dump(), "X-Tenant-Id", "t1"); }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json hWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-std::string repeat(const std::string& unit, size_t n) {
+std::string hRepeat(const std::string& unit, size_t n) {
   std::string out;
   out.reserve(unit.size() * n);
   for (size_t i = 0; i < n; ++i) out += unit;
   return out;
 }
 
-std::string jobOf(const harness::Response& r) {
+std::string hJobOf(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains("job_id") && body["job_id"].is_string() ? body["job_id"].get<std::string>() : "";
 }
 
-std::vector<json> outboxRows(harness::Ctx& ctx) {
+std::vector<json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<json> out;
   for (const auto& row : ctx.Redis.LRange("rag:outbox", 0, -1)) out.push_back(json::parse(row, nullptr, false));
   return out;
@@ -1278,20 +1278,20 @@ std::vector<json> outboxRows(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HApi api(ctx);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text());
-  const std::string job = jobOf(r);
+  const std::string job = hJobOf(r);
   ctx.Assert(!job.empty(), "the 202 body must carry the job_id: %s", r.Text());
-  auto stored = ctx.Redis.HGetAll(kDoc);
-  ctx.Assert(stored["job_id"] == job && stored["content"] == kGood["content"].get<std::string>(), "the version must be stored at %s with its job_id and content, found %v", kDoc, stored);
-  ctx.Equal(outboxRows(ctx).size(), 1, "one upload, one outbox row; rows in rag:outbox");
-  const auto noTenant = api.http.Post("/v1/documents", kGood.dump());
+  auto stored = ctx.Redis.HGetAll(kHDoc);
+  ctx.Assert(stored["job_id"] == job && stored["content"] == kHGood["content"].get<std::string>(), "the version must be stored at %s with its job_id and content, found %v", kHDoc, stored);
+  ctx.Equal(hOutboxRows(ctx).size(), 1, "one upload, one outbox row; rows in rag:outbox");
+  const auto noTenant = api.http.Post("/v1/documents", kHGood.dump());
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the upload");
 }
 
 void CheckValidateBody(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   struct Case {
     std::string field;
     json value;
@@ -1308,45 +1308,45 @@ void CheckValidateBody(harness::Ctx& ctx) {
       {"version", 0, 400, "version 0"},
       {"version", -1, 400, "version -1"},
       {"content", std::string((1 << 20) + 1, 'a'), 413, "content of 1 MiB + 1 byte"},
-      {"content", repeat("é", (1 << 19) + 1), 413, "524289 two-byte characters (1 MiB + 2 bytes of UTF-8)"},
+      {"content", hRepeat("é", (1 << 19) + 1), 413, "524289 two-byte characters (1 MiB + 2 bytes of UTF-8)"},
   };
-  for (const auto& c : cases) ctx.Equal(api.post(with(kGood, c.field, c.value)).Status, c.status, "%s", c.what);
+  for (const auto& c : cases) ctx.Equal(api.post(hWith(kHGood, c.field, c.value)).Status, c.status, "%s", c.what);
   ctx.Equal(ctx.Redis.Keys("rag:*").size(), 0, "rejected uploads must store nothing; keys in Redis");
-  ctx.Equal(api.post(with(kGood, "content", std::string(1 << 20, 'a'))).Status, 202, "exactly 1 MiB is within the limit");
-  ctx.Equal(api.post(with(with(kGood, "version", 2), "content", repeat("é", 1 << 19))).Status, 202, "exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit");
-  ctx.Equal(api.post(with(kGood, "doc_id", std::string(64, 'a'))).Status, 202, "a 64-character doc_id is valid");
+  ctx.Equal(api.post(hWith(kHGood, "content", std::string(1 << 20, 'a'))).Status, 202, "exactly 1 MiB is within the limit");
+  ctx.Equal(api.post(hWith(hWith(kHGood, "version", 2), "content", hRepeat("é", 1 << 19))).Status, 202, "exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit");
+  ctx.Equal(api.post(hWith(kHGood, "doc_id", std::string(64, 'a'))).Status, 202, "a 64-character doc_id is valid");
 }
 
 void CheckVersionConflict(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto first = api.post(kGood);
+  HApi api(ctx);
+  const auto first = api.post(kHGood);
   ctx.Equal(first.Status, 202, "the first upload (%s)", first.Text());
-  const std::string job = jobOf(first);
-  const auto retry = api.post(kGood);
-  ctx.Assert(retry.Status == 202 && jobOf(retry) == job, "the same upload again is a retry: 202 with job %s, got %d %s", job, retry.Status, retry.Text());
-  ctx.Equal(outboxRows(ctx).size(), 1, "a retry must not add an outbox row; rows");
-  const auto v2 = api.post(with(kGood, "version", 2));
-  ctx.Assert(v2.Status == 202 && !jobOf(v2).empty() && jobOf(v2) != job, "version 2 is a new document version with its own job, got %d %s", v2.Status, v2.Text());
-  const auto rewrite = api.post(with(kGood, "content", "Refunds are never accepted."));
+  const std::string job = hJobOf(first);
+  const auto retry = api.post(kHGood);
+  ctx.Assert(retry.Status == 202 && hJobOf(retry) == job, "the same upload again is a retry: 202 with job %s, got %d %s", job, retry.Status, retry.Text());
+  ctx.Equal(hOutboxRows(ctx).size(), 1, "a retry must not add an outbox row; rows");
+  const auto v2 = api.post(hWith(kHGood, "version", 2));
+  ctx.Assert(v2.Status == 202 && !hJobOf(v2).empty() && hJobOf(v2) != job, "version 2 is a new document version with its own job, got %d %s", v2.Status, v2.Text());
+  const auto rewrite = api.post(hWith(kHGood, "content", "Refunds are never accepted."));
   ctx.Equal(rewrite.Status, 409, "version 1 with other content: a stored version is immutable, so another hash is a 409, not a retry");
-  auto stored = ctx.Redis.HGetAll(kDoc);
-  const std::string content = kGood["content"];
+  auto stored = ctx.Redis.HGetAll(kHDoc);
+  const std::string content = kHGood["content"];
   ctx.Assert(stored["sha256"] == sha256_hex(content) && stored["content"] == content, "the 409 must leave version 1 as it was, found %v", stored);
-  ctx.Equal(outboxRows(ctx).size(), 2, "two versions, two outbox rows; rows");
+  ctx.Equal(hOutboxRows(ctx).size(), 2, "two versions, two outbox rows; rows");
 }
 
 void CheckOutboxTx(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   bool written = false;
   long long outbox = -1;
-  ctx.Redis.After(kDoc, [&] {
-    if (ctx.Redis.Exists(kDoc) == 1) {
+  ctx.Redis.After(kHDoc, [&] {
+    if (ctx.Redis.Exists(kHDoc) == 1) {
       written = true;
       outbox = ctx.Redis.LLen("rag:outbox");
       return;
     }
-    ctx.Redis.After(kDoc, [&] {  // the lookup came first: watch the write
-      written = ctx.Redis.Exists(kDoc) == 1;
+    ctx.Redis.After(kHDoc, [&] {  // the lookup came first: watch the write
+      written = ctx.Redis.Exists(kHDoc) == 1;
       outbox = ctx.Redis.LLen("rag:outbox");
     });
   });
@@ -1356,26 +1356,26 @@ void CheckOutboxTx(harness::Ctx& ctx) {
       ctx.Redis.After("rag:outbox", rowAppears);  // a read of the list, not the row: watch on
       return;
     }
-    if (rowFirst == 0) rowFirst = ctx.Redis.Exists(kDoc) == 1 ? 1 : -1;
+    if (rowFirst == 0) rowFirst = ctx.Redis.Exists(kHDoc) == 1 ? 1 : -1;
   };
   ctx.Redis.After("rag:outbox", rowAppears);
-  const auto r = api.post(kGood);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text());
   ctx.Assert(rowFirst != -1, "the outbox row appeared before its document: a crash right there leaves an event naming a document that was never stored; write both in one MULTI/EXEC");
   ctx.Assert(written, "the document was never written");
   ctx.Equal(outbox, 1, "when the document became visible, the rows in rag:outbox (a crash right there leaves a document no worker hears about; write both in one MULTI/EXEC)");
-  const auto rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 1 && rows[0].value("job_id", "") == ctx.Redis.HGet(kDoc, "job_id").value_or("?"), "the outbox row must name the stored job: %v", rows);
+  const auto rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 1 && rows[0].value("job_id", "") == ctx.Redis.HGet(kHDoc, "job_id").value_or("?"), "the outbox row must name the stored job: %v", rows);
 }
 
 void CheckEventIdsOnly(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HApi api(ctx);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text());
-  const auto rows = outboxRows(ctx);
+  const auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "one upload, one outbox row; rows");
   ctx.Assert(!rows[0].contains("content"), "the event carries the document text; ids and the hash only, the worker reads the content from the store");
-  const json expected = {{"tenant", "t1"}, {"doc_id", "handbook-2026"}, {"version", 1}, {"job_id", jobOf(r)}, {"sha256", sha256_hex(kGood["content"].get<std::string>())}};
+  const json expected = {{"tenant", "t1"}, {"doc_id", "handbook-2026"}, {"version", 1}, {"job_id", hJobOf(r)}, {"sha256", sha256_hex(kHGood["content"].get<std::string>())}};
   for (const auto& [key, value] : expected.items()) ctx.Equal(rows[0].value(key, json()), value, "the event's %s (event %v)", key, rows[0]);
   std::vector<std::string> fields;
   for (const auto& [key, value] : rows[0].items()) fields.push_back(key);

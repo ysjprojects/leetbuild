@@ -1065,15 +1065,15 @@ import (
 	"leetbuild/harness"
 )
 
-var reviewer = []string{"X-Tenant-Id", "acme", "X-Roles", "platform-reviewer"}
+var hReviewer = []string{"X-Tenant-Id", "acme", "X-Roles", "platform-reviewer"}
 
 // sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect, first 16 hex.
 const (
-	minted        = "8bcec681e207c4df"
-	mintedBilling = "7f3ed45ed789ea40" // the same definition with owner "billing"
+	kHMinted        = "8bcec681e207c4df"
+	kHMintedBilling = "7f3ed45ed789ea40" // the same definition with owner "billing"
 )
 
-func schemaDoc() map[string]any {
+func hSchemaDoc() map[string]any {
 	return map[string]any{
 		"type":       "object",
 		"properties": map[string]any{"amount": map[string]any{"type": "integer"}, "currency": map[string]any{"type": "string"}},
@@ -1081,11 +1081,11 @@ func schemaDoc() map[string]any {
 	}
 }
 
-func tool(overrides map[string]any) map[string]any {
+func hTool(overrides map[string]any) map[string]any {
 	body := map[string]any{
 		"name":           "payments.refund",
 		"version":        "v1",
-		"schema":         schemaDoc(),
+		"schema":         hSchemaDoc(),
 		"side_effect":    "irreversible",
 		"owner":          "payments",
 		"endpoint":       "https://payments.internal/refund",
@@ -1097,13 +1097,13 @@ func tool(overrides map[string]any) map[string]any {
 	return body
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func versionIn(r *harness.Response) string {
+func hVersionIn(r *harness.Response) string {
 	var body struct {
 		Version string \`json:"version"\`
 	}
@@ -1111,61 +1111,61 @@ func versionIn(r *harness.Response) string {
 	return body.Version
 }
 
-func sameJSON(a, b any) bool {
+func hSameJSON(a, b any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return string(x) == string(y)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/tools", tool(nil), reviewer...)
+	c := hApi(ctx)
+	r := c.Post("/v1/tools", hTool(nil), hReviewer...)
 	ctx.Equal(r.Status, 201, "POST /v1/tools by a platform reviewer (%s)", r.Text())
-	version := versionIn(r)
+	version := hVersionIn(r)
 	ctx.Assert(version != "" && strings.Contains(r.Text(), \`"irreversible"\`) && strings.Contains(r.Text(), "payments.refund"), "the 201 must carry name, version and side_effect, got %s", r.Text())
 	row, err := store.Get(context.Background(), "payments.refund", version)
 	ctx.NoError(err, "store.Get failed")
-	ctx.Assert(row != nil && sameJSON(row["schema"], schemaDoc()), "tool:payments.refund:%s holds %v, expected the registered definition", version, row)
-	r = c.Post("/v1/tools", tool(map[string]any{"name": "payments.void"}), "X-Roles", "platform-reviewer")
+	ctx.Assert(row != nil && hSameJSON(row["schema"], hSchemaDoc()), "tool:payments.refund:%s holds %v, expected the registered definition", version, row)
+	r = c.Post("/v1/tools", hTool(map[string]any{"name": "payments.void"}), "X-Roles", "platform-reviewer")
 	ctx.Equal(r.Status, 401, "a registration without X-Tenant-Id")
 }
 
 func CheckRole(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, roles := range []string{"", "tool-author", "platform-reviewers", "Platform-Reviewer"} {
 		headers := []string{"X-Tenant-Id", "acme"}
 		if roles != "" {
 			headers = append(headers, "X-Roles", roles)
 		}
-		r := c.Post("/v1/tools", tool(nil), headers...)
+		r := c.Post("/v1/tools", hTool(nil), headers...)
 		ctx.Equal(r.Status, 403, "a registration with X-Roles %q must be refused (an authenticated caller is not an entitled one)", roles)
 	}
 	ctx.Assert(len(ctx.Redis.Keys("tool:*")) == 0, "refused registrations wrote %q: the role is checked before any write", ctx.Redis.Keys("tool:*"))
-	r := c.Post("/v1/tools", tool(nil), "X-Tenant-Id", "acme", "X-Roles", "tool-author, platform-reviewer")
+	r := c.Post("/v1/tools", hTool(nil), "X-Tenant-Id", "acme", "X-Roles", "tool-author, platform-reviewer")
 	ctx.Equal(r.Status, 201, "a caller holding platform-reviewer among other roles (%s)", r.Text())
 }
 
 func CheckSideEffect(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, value := range []string{"maybe", "READ", ""} {
-		r := c.Post("/v1/tools", tool(map[string]any{"side_effect": value}), reviewer...)
+		r := c.Post("/v1/tools", hTool(map[string]any{"side_effect": value}), hReviewer...)
 		ctx.Equal(r.Status, 400, "side_effect %q must be refused: the class must be read, write or irreversible", value)
 	}
 	for _, name := range []string{"Payments Refund", "p", "9payments", "payments.Refund", "p" + strings.Repeat("a", 64)} {
-		r := c.Post("/v1/tools", tool(map[string]any{"name": name}), reviewer...)
+		r := c.Post("/v1/tools", hTool(map[string]any{"name": name}), hReviewer...)
 		ctx.Equal(r.Status, 400, "the name %q must be refused: it must match ^[a-z][a-z0-9_.-]{1,63}$", name)
 	}
 	ctx.Assert(len(ctx.Redis.Keys("tool:*")) == 0, "refused registrations wrote %q", ctx.Redis.Keys("tool:*"))
-	longest := c.Post("/v1/tools", tool(map[string]any{"name": "p" + strings.Repeat("a", 63)}), reviewer...)
+	longest := c.Post("/v1/tools", hTool(map[string]any{"name": "p" + strings.Repeat("a", 63)}), hReviewer...)
 	ctx.Equal(longest.Status, 201, "a 64-character name, which the pattern allows (%s)", longest.Text())
 	for i, value := range []string{"read", "write", "irreversible"} {
-		r := c.Post("/v1/tools", tool(map[string]any{"name": fmt.Sprintf("payments.tool%d", i), "side_effect": value}), reviewer...)
+		r := c.Post("/v1/tools", hTool(map[string]any{"name": fmt.Sprintf("payments.tool%d", i), "side_effect": value}), hReviewer...)
 		ctx.Equal(r.Status, 201, "side_effect %q (%s)", value, r.Text())
 	}
 }
 
 func CheckSchema(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	cases := []struct {
 		schema  map[string]any
 		pointer string
@@ -1176,12 +1176,12 @@ func CheckSchema(ctx *harness.Ctx) {
 		{map[string]any{"properties": map[string]any{"amount": map[string]any{"type": "integer"}}}, "/type"},
 	}
 	for _, tc := range cases {
-		r := c.Post("/v1/tools", tool(map[string]any{"schema": tc.schema}), reviewer...)
+		r := c.Post("/v1/tools", hTool(map[string]any{"schema": tc.schema}), hReviewer...)
 		ctx.Equal(r.Status, 422, "the schema %v must be refused: an agent cannot build arguments from it", tc.schema)
 		ctx.Assert(strings.Contains(r.Text(), tc.pointer), "the 422 for %v must name the failing pointer %s, got %s", tc.schema, tc.pointer, r.Text())
 	}
 	broken := map[string]any{"type": "object", "properties": map[string]any{"amount": map[string]any{"type": "integer"}, "note": map[string]any{}}, "required": []any{"amount", "currency"}}
-	twice := c.Post("/v1/tools", tool(map[string]any{"schema": broken}), reviewer...)
+	twice := c.Post("/v1/tools", hTool(map[string]any{"schema": broken}), hReviewer...)
 	ctx.Equal(twice.Status, 422, "the schema %v must be refused", broken)
 	var report struct {
 		Errors []struct {
@@ -1201,41 +1201,41 @@ func CheckSchema(ctx *harness.Ctx) {
 		ctx.Assert(found, "the schema %v fails twice and the 422 names %q: one pointer per failure, %s is missing", broken, pointers, pointer)
 	}
 	ctx.Assert(len(ctx.Redis.Keys("tool:*")) == 0, "invalid schemas were stored: %q", ctx.Redis.Keys("tool:*"))
-	r := c.Post("/v1/tools", tool(nil), reviewer...)
+	r := c.Post("/v1/tools", hTool(nil), hReviewer...)
 	ctx.Equal(r.Status, 201, "a valid schema (%s)", r.Text())
 }
 
 func CheckVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := c.Post("/v1/tools", tool(map[string]any{"version": "v1"}), reviewer...)
+	c := hApi(ctx)
+	first := c.Post("/v1/tools", hTool(map[string]any{"version": "v1"}), hReviewer...)
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	version := versionIn(first)
+	version := hVersionIn(first)
 	ctx.Assert(version != "v1", "the version is the caller's label v1: a label can be reused for another definition. Mint it from the content")
 	ctx.Assert(regexp.MustCompile(\`^[0-9a-f]{16}$\`).MatchString(version), "the version %q must be 16 hex characters of a sha256 digest", version)
-	ctx.Assert(version == minted, "the version is %q, expected %q: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect", version, minted)
-	again := c.Post("/v1/tools", tool(map[string]any{"version": "v2"}), reviewer...)
+	ctx.Assert(version == kHMinted, "the version is %q, expected %q: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect", version, kHMinted)
+	again := c.Post("/v1/tools", hTool(map[string]any{"version": "v2"}), hReviewer...)
 	ctx.Equal(again.Status, 409, "re-registering the same definition")
-	changedSchema := schemaDoc()
+	changedSchema := hSchemaDoc()
 	changedSchema["properties"].(map[string]any)["reason"] = map[string]any{"type": "string"}
-	changed := c.Post("/v1/tools", tool(map[string]any{"version": "v1", "schema": changedSchema}), reviewer...)
+	changed := c.Post("/v1/tools", hTool(map[string]any{"version": "v1", "schema": changedSchema}), hReviewer...)
 	ctx.Equal(changed.Status, 201, "a changed definition (%s)", changed.Text())
-	ctx.Assert(versionIn(changed) != version, "a changed definition got the version of the first one")
+	ctx.Assert(hVersionIn(changed) != version, "a changed definition got the version of the first one")
 	row, err := store.Get(context.Background(), "payments.refund", version)
 	ctx.NoError(err, "store.Get failed")
-	ctx.Assert(row != nil && sameJSON(row["schema"], schemaDoc()), "the first version now holds %v: a stored version must stay immutable", row)
+	ctx.Assert(row != nil && hSameJSON(row["schema"], hSchemaDoc()), "the first version now holds %v: a stored version must stay immutable", row)
 	// Another reviewer registers the same definition between this request's first look at the version and its write.
-	key := "tool:payments.refund:" + mintedBilling
+	key := "tool:payments.refund:" + kHMintedBilling
 	const rival = "https://billing.internal/refund-rival"
-	schemaJSON, _ := json.Marshal(schemaDoc())
+	schemaJSON, _ := json.Marshal(hSchemaDoc())
 	raced := false
 	probe := ctx.Redis.After(key, func() any {
 		if ctx.Redis.Exists(key) == 0 {
-			ctx.Redis.Do("HSET", key, "name", "payments.refund", "version", mintedBilling, "side_effect", "irreversible", "owner", "billing", "schema", string(schemaJSON), "endpoint", rival, "credential_ref", "vault://payments/refund")
+			ctx.Redis.Do("HSET", key, "name", "payments.refund", "version", kHMintedBilling, "side_effect", "irreversible", "owner", "billing", "schema", string(schemaJSON), "endpoint", rival, "credential_ref", "vault://payments/refund")
 			raced = true
 		}
 		return nil
 	})
-	r := c.Post("/v1/tools", tool(map[string]any{"owner": "billing"}), reviewer...)
+	r := c.Post("/v1/tools", hTool(map[string]any{"owner": "billing"}), hReviewer...)
 	ctx.NoError(probe.Err, "the competing registration failed")
 	if raced {
 		ctx.Equal(r.Status, 409, "another registration of the same definition landed between this request's check and its write: only a write that refuses an existing version is safe")
@@ -1258,18 +1258,18 @@ func CheckVersion(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kSchema = {
+const nlohmann::json kHSchema = {
     {"type", "object"},
     {"properties", {{"amount", {{"type", "integer"}}}, {"currency", {{"type", "string"}}}}},
     {"required", {"amount"}}};
 // sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect, first 16 hex.
-const std::string kMinted = "8bcec681e207c4df";
-const std::string kMintedBilling = "7f3ed45ed789ea40";  // the same definition with owner "billing"
+const std::string kHMinted = "8bcec681e207c4df";
+const std::string kHMintedBilling = "7f3ed45ed789ea40";  // the same definition with owner "billing"
 
-nlohmann::json tool(const nlohmann::json& overrides = nlohmann::json::object()) {
+nlohmann::json hTool(const nlohmann::json& overrides = nlohmann::json::object()) {
   nlohmann::json body = {{"name", "payments.refund"},
                          {"version", "v1"},
-                         {"schema", kSchema},
+                         {"schema", kHSchema},
                          {"side_effect", "irreversible"},
                          {"owner", "payments"},
                          {"endpoint", "https://payments.internal/refund"},
@@ -1278,7 +1278,7 @@ nlohmann::json tool(const nlohmann::json& overrides = nlohmann::json::object()) 
   return body;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1286,11 +1286,11 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/tools", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "X-Roles", "platform-reviewer");
 }
 
-std::string versionIn(const harness::Response& r) {
+std::string hVersionIn(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("version", "") : "";
 }
@@ -1298,51 +1298,51 @@ std::string versionIn(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, tool());
+  auto c = hApi(ctx);
+  auto r = hPost(c, hTool());
   ctx.Equal(r.Status, 201, "POST /v1/tools by a platform reviewer (%s)", r.Text());
-  const std::string version = versionIn(r);
+  const std::string version = hVersionIn(r);
   ctx.Assert(!version.empty() && r.Text().find("irreversible") != std::string::npos, "the 201 must carry name, version and side_effect, got %s", r.Text());
   const auto row = store::get("payments.refund", version);
-  ctx.Assert(row && (*row)["schema"] == kSchema, "tool:payments.refund:%s holds %s, expected the registered definition", version, row ? row->dump() : "nothing");
-  r = c.Post("/v1/tools", tool({{"name", "payments.void"}}).dump(), "Content-Type", "application/json", "X-Roles", "platform-reviewer");
+  ctx.Assert(row && (*row)["schema"] == kHSchema, "tool:payments.refund:%s holds %s, expected the registered definition", version, row ? row->dump() : "nothing");
+  r = c.Post("/v1/tools", hTool({{"name", "payments.void"}}).dump(), "Content-Type", "application/json", "X-Roles", "platform-reviewer");
   ctx.Equal(r.Status, 401, "a registration without X-Tenant-Id");
 }
 
 void CheckRole(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = c.Post("/v1/tools", tool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  auto c = hApi(ctx);
+  auto r = c.Post("/v1/tools", hTool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 403, "a registration without X-Roles must be refused (an authenticated caller is not an entitled one)");
   for (const std::string roles : {"tool-author", "platform-reviewers", "Platform-Reviewer"}) {
-    r = c.Post("/v1/tools", tool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "X-Roles", roles);
+    r = c.Post("/v1/tools", hTool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "X-Roles", roles);
     ctx.Equal(r.Status, 403, "a registration with X-Roles %q must be refused (an authenticated caller is not an entitled one)", roles);
   }
   ctx.Equal(ctx.Redis.Keys("tool:*"), std::vector<std::string>{}, "refused registrations must write nothing: the role is checked before any write; the tool keys");
-  r = c.Post("/v1/tools", tool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "X-Roles", "tool-author, platform-reviewer");
+  r = c.Post("/v1/tools", hTool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "X-Roles", "tool-author, platform-reviewer");
   ctx.Equal(r.Status, 201, "a caller holding platform-reviewer among other roles (%s)", r.Text());
 }
 
 void CheckSideEffect(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const std::string value : {"maybe", "READ", ""}) {
-    const auto r = post(c, tool({{"side_effect", value}}));
+    const auto r = hPost(c, hTool({{"side_effect", value}}));
     ctx.Equal(r.Status, 400, "side_effect %q must be refused: the class must be read, write or irreversible", value);
   }
   for (const std::string name : {std::string("Payments Refund"), std::string("p"), std::string("9payments"), std::string("payments.Refund"), "p" + std::string(64, 'a')}) {
-    ctx.Equal(post(c, tool({{"name", name}})).Status, 400, "the name %q must be refused: it must match ^[a-z][a-z0-9_.-]{1,63}$", name);
+    ctx.Equal(hPost(c, hTool({{"name", name}})).Status, 400, "the name %q must be refused: it must match ^[a-z][a-z0-9_.-]{1,63}$", name);
   }
   ctx.Equal(ctx.Redis.Keys("tool:*"), std::vector<std::string>{}, "refused registrations must write nothing; the tool keys");
-  const auto longest = post(c, tool({{"name", "p" + std::string(63, 'a')}}));
+  const auto longest = hPost(c, hTool({{"name", "p" + std::string(63, 'a')}}));
   ctx.Equal(longest.Status, 201, "a 64-character name, which the pattern allows (%s)", longest.Text());
   int i = 0;
   for (const std::string value : {"read", "write", "irreversible"}) {
-    const auto r = post(c, tool({{"name", "payments.tool" + std::to_string(i++)}, {"side_effect", value}}));
+    const auto r = hPost(c, hTool({{"name", "payments.tool" + std::to_string(i++)}, {"side_effect", value}}));
     ctx.Equal(r.Status, 201, "side_effect %q (%s)", value, r.Text());
   }
 }
 
 void CheckSchema(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<std::pair<nlohmann::json, std::string>> cases = {
       {{{"type", "array"}}, "/type"},
       {{{"type", "object"}, {"properties", {{"amount", nlohmann::json::object()}}}}, "/properties/amount/type"},
@@ -1350,14 +1350,14 @@ void CheckSchema(harness::Ctx& ctx) {
       {{{"properties", {{"amount", {{"type", "integer"}}}}}}, "/type"},
   };
   for (const auto& [schema, pointer] : cases) {
-    const auto r = post(c, tool({{"schema", schema}}));
+    const auto r = hPost(c, hTool({{"schema", schema}}));
     ctx.Equal(r.Status, 422, "the schema %s must be refused: an agent cannot build arguments from it", schema.dump());
     ctx.Assert(r.Text().find(pointer) != std::string::npos, "the 422 for %s must name the failing pointer %s, got %s", schema.dump(), pointer, r.Text());
   }
   const nlohmann::json broken = {{"type", "object"},
                                  {"properties", {{"amount", {{"type", "integer"}}}, {"note", nlohmann::json::object()}}},
                                  {"required", {"amount", "currency"}}};
-  const auto twice = post(c, tool({{"schema", broken}}));
+  const auto twice = hPost(c, hTool({{"schema", broken}}));
   ctx.Equal(twice.Status, 422, "the schema %s must be refused", broken.dump());
   const auto report = nlohmann::json::parse(twice.Text(), nullptr, false);
   std::vector<std::string> pointers;
@@ -1370,37 +1370,37 @@ void CheckSchema(harness::Ctx& ctx) {
     ctx.Assert(std::find(pointers.begin(), pointers.end(), pointer) != pointers.end(), "the schema %s fails twice and the 422 (%s) must carry errors, a list of {pointer, message}, one pointer per failure: %s is missing", broken.dump(), twice.Text(), pointer);
   }
   ctx.Equal(ctx.Redis.Keys("tool:*"), std::vector<std::string>{}, "invalid schemas must not be stored; the tool keys");
-  const auto r = post(c, tool());
+  const auto r = hPost(c, hTool());
   ctx.Equal(r.Status, 201, "a valid schema (%s)", r.Text());
 }
 
 void CheckVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, tool({{"version", "v1"}}));
+  auto c = hApi(ctx);
+  const auto first = hPost(c, hTool({{"version", "v1"}}));
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const std::string version = versionIn(first);
+  const std::string version = hVersionIn(first);
   ctx.Assert(version != "v1", "the version is the caller's label v1: a label can be reused for another definition. Mint it from the content");
   ctx.Assert(std::regex_match(version, std::regex("^[0-9a-f]{16}$")), "the version %q must be 16 hex characters of a sha256 digest", version);
-  ctx.Assert(version == kMinted, "the version is %q, expected %q: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect", version, kMinted);
-  ctx.Equal(post(c, tool({{"version", "v2"}})).Status, 409, "re-registering the same definition");
-  nlohmann::json changed_schema = kSchema;
+  ctx.Assert(version == kHMinted, "the version is %q, expected %q: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect", version, kHMinted);
+  ctx.Equal(hPost(c, hTool({{"version", "v2"}})).Status, 409, "re-registering the same definition");
+  nlohmann::json changed_schema = kHSchema;
   changed_schema["properties"]["reason"] = {{"type", "string"}};
-  const auto changed = post(c, tool({{"version", "v1"}, {"schema", changed_schema}}));
+  const auto changed = hPost(c, hTool({{"version", "v1"}, {"schema", changed_schema}}));
   ctx.Equal(changed.Status, 201, "a changed definition (%s)", changed.Text());
-  ctx.Assert(versionIn(changed) != version, "a changed definition got the version of the first one");
+  ctx.Assert(hVersionIn(changed) != version, "a changed definition got the version of the first one");
   const auto row = store::get("payments.refund", version);
-  ctx.Assert(row && (*row)["schema"] == kSchema, "the first version now holds %s: a stored version must stay immutable", row ? row->dump() : "nothing");
+  ctx.Assert(row && (*row)["schema"] == kHSchema, "the first version now holds %s: a stored version must stay immutable", row ? row->dump() : "nothing");
   // Another reviewer registers the same definition between this request's first look at the version and its write.
-  const std::string key = "tool:payments.refund:" + kMintedBilling;
+  const std::string key = "tool:payments.refund:" + kHMintedBilling;
   const std::string rival = "https://billing.internal/refund-rival";
   std::atomic<bool> raced{false};
   ctx.Redis.After(key, [&] {
     if (ctx.Redis.Exists(key) == 0) {
-      ctx.Redis.Do("HSET", key, "name", "payments.refund", "version", kMintedBilling, "side_effect", "irreversible", "owner", "billing", "schema", kSchema.dump(), "endpoint", rival, "credential_ref", "vault://payments/refund");
+      ctx.Redis.Do("HSET", key, "name", "payments.refund", "version", kHMintedBilling, "side_effect", "irreversible", "owner", "billing", "schema", kHSchema.dump(), "endpoint", rival, "credential_ref", "vault://payments/refund");
       raced = true;
     }
   });
-  const auto r = post(c, tool({{"owner", "billing"}}));
+  const auto r = hPost(c, hTool({{"owner", "billing"}}));
   if (raced) {
     ctx.Equal(r.Status, 409, "another registration of the same definition landed between this request's check and its write: only a write that refuses an existing version is safe");
     ctx.Assert(ctx.Redis.HGet(key, "endpoint") == std::optional<std::string>(rival), "the version registered by the other reviewer was replaced: %s", ctx.Redis.HGet(key, "endpoint").value_or("nothing"));

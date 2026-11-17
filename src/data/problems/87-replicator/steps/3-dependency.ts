@@ -959,25 +959,25 @@ import (
 	"leetbuild/harness"
 )
 
-const schemaDiff = "orders.discount_code: text at the source, missing at the target"
+const kHSchemaDiff = "orders.discount_code: text at the source, missing at the target"
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-func change(n int64) Change {
+func hChange(n int64) Change {
 	return Change{ChangeID: fmt.Sprintf("c-%d", n), Offset: n, Key: fmt.Sprintf("orders/%d", n), Value: fmt.Sprintf(\`{"total": %d00}\`, n)}
 }
 
 // targetPeer dedupes by change_id; loseReplies drops the reply of that many applied calls.
-type targetPeer struct {
+type HTargetPeer struct {
 	pb.UnimplementedTargetRegionServer
 	applied     []string
 	loseReplies int
 	mismatched  map[string]bool
 }
 
-func (t *targetPeer) ApplyChange(_ context.Context, req *pb.ApplyChangeRequest) (*pb.ApplyChangeReply, error) {
+func (t *HTargetPeer) ApplyChange(_ context.Context, req *pb.ApplyChangeRequest) (*pb.ApplyChangeReply, error) {
 	if t.mismatched[req.GetKey()] {
-		return nil, status.Error(codes.FailedPrecondition, schemaDiff)
+		return nil, status.Error(codes.FailedPrecondition, kHSchemaDiff)
 	}
 	for _, id := range t.applied {
 		if id == req.GetChangeId() {
@@ -992,28 +992,28 @@ func (t *targetPeer) ApplyChange(_ context.Context, req *pb.ApplyChangeRequest) 
 	return &pb.ApplyChangeReply{}, nil
 }
 
-func client(ctx *harness.Ctx) *targetPeer {
-	t := &targetPeer{mismatched: map[string]bool{}}
+func hClient(ctx *harness.Ctx) *HTargetPeer {
+	t := &HTargetPeer{mismatched: map[string]bool{}}
 	pb.RegisterTargetRegionServer(ctx.GRPC.Server(""), t)
 	return t
 }
 
-func mustFail(ctx *harness.Ctx, c Change, target error, why string) error {
-	offset, err := replicateChange(clientBg, "rep-1", 0, c)
+func hMustFail(ctx *harness.Ctx, c Change, target error, why string) error {
+	offset, err := replicateChange(hClientBg, "rep-1", 0, c)
 	ctx.Assert(err != nil, "%s: replicateChange returned %d instead of an error wrapping %v", why, offset, target)
 	ctx.ErrorIs(err, target, "%s: replicateChange returned %v", why, err)
 	return err
 }
 
-func resumed(ctx *harness.Ctx) int64 {
-	offset, err := offsets.ResumeOffset(clientBg, "rep-1", 0)
+func hResumed(ctx *harness.Ctx) int64 {
+	offset, err := offsets.ResumeOffset(hClientBg, "rep-1", 0)
 	ctx.NoError(err, "ResumeOffset")
 	return offset
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	offset, err := replicateChange(clientBg, "rep-1", 0, change(1))
+	hClient(ctx)
+	offset, err := replicateChange(hClientBg, "rep-1", 0, hChange(1))
 	ctx.NoError(err, "with a healthy target replicateChange failed")
 	ctx.Equal(offset, int64(1), "with a healthy target replicateChange must return the shard's offset")
 	for _, call := range ctx.GRPC.CallsTo("ApplyChange", "") {
@@ -1022,7 +1022,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("ApplyChange", 10.0, "")
 	before := len(ctx.GRPC.CallsTo("ApplyChange", ""))
-	mustFail(ctx, change(2), ErrApplyFailed, "with a target slower than the deadline")
+	hMustFail(ctx, hChange(2), ErrApplyFailed, "with a target slower than the deadline")
 	slow := ctx.GRPC.CallsTo("ApplyChange", "")[before:]
 	ctx.Equal(len(slow), 3, "a target slower than the deadline must be called maxAttempts = 3 times (DeadlineExceeded is retried); the calls")
 	for n, call := range slow {
@@ -1031,31 +1031,31 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBoundedAttempts(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.Fail("ApplyChange", codes.InvalidArgument, "offset is not an integer", 1, "")
-	mustFail(ctx, change(1), ErrApplyFailed, "with a request the target rejects (InvalidArgument)")
+	hMustFail(ctx, hChange(1), ErrApplyFailed, "with a request the target rejects (InvalidArgument)")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", "")), 1, "InvalidArgument must not be retried (only Unavailable, DeadlineExceeded and ResourceExhausted are); the calls")
 	for _, code := range []codes.Code{codes.Aborted, codes.Internal, codes.Unknown} {
 		before := len(ctx.GRPC.CallsTo("ApplyChange", ""))
 		ctx.GRPC.Fail("ApplyChange", code, "the target refused the change", 1, "")
-		mustFail(ctx, change(3), ErrApplyFailed, fmt.Sprintf("with the target answering %v", code))
+		hMustFail(ctx, hChange(3), ErrApplyFailed, fmt.Sprintf("with the target answering %v", code))
 		ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", ""))-before, 1, "%v must not be retried (only Unavailable, DeadlineExceeded and ResourceExhausted are); the calls", code)
 	}
 	before := len(ctx.GRPC.CallsTo("ApplyChange", ""))
 	ctx.GRPC.Fail("ApplyChange", codes.ResourceExhausted, "target busy", 1, "")
-	offset, err := replicateChange(clientBg, "rep-1", 0, change(4))
+	offset, err := replicateChange(hClientBg, "rep-1", 0, hChange(4))
 	ctx.NoError(err, "after one ResourceExhausted replicateChange failed: ResourceExhausted is retried")
 	ctx.Assert(len(ctx.GRPC.CallsTo("ApplyChange", ""))-before == 2 && offset == 4, "after one ResourceExhausted replicateChange made %d calls and returned %d, expected 2 calls and the offset 4: ResourceExhausted is retried", len(ctx.GRPC.CallsTo("ApplyChange", ""))-before, offset)
 	before = len(ctx.GRPC.CallsTo("ApplyChange", ""))
 	ctx.GRPC.Fail("ApplyChange", codes.Unavailable, "", 10, "")
-	mustFail(ctx, change(2), ErrApplyFailed, "with the target unavailable")
+	hMustFail(ctx, hChange(2), ErrApplyFailed, "with the target unavailable")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", ""))-before, 3, "an unavailable target must be called maxAttempts = 3 times for one change; the calls")
 }
 
 func CheckChangeId(ctx *harness.Ctx) {
-	t := client(ctx)
+	t := hClient(ctx)
 	t.loseReplies = 1
-	offset, err := replicateChange(clientBg, "rep-1", 0, change(7))
+	offset, err := replicateChange(hClientBg, "rep-1", 0, hChange(7))
 	ctx.NoError(err, "replicateChange after one lost reply")
 	var sent []string
 	for _, call := range ctx.GRPC.CallsTo("ApplyChange", "") {
@@ -1067,31 +1067,31 @@ func CheckChangeId(ctx *harness.Ctx) {
 }
 
 func CheckSchemaMismatch(ctx *harness.Ctx) {
-	t := client(ctx)
+	t := hClient(ctx)
 	t.mismatched["orders/3"] = true
-	err := mustFail(ctx, change(3), ErrSchemaMismatch, "with a change the target's schema lacks")
+	err := hMustFail(ctx, hChange(3), ErrSchemaMismatch, "with a change the target's schema lacks")
 	ctx.Assert(strings.Contains(err.Error(), "discount_code"), "the schema mismatch must carry the target's diff, got %v", err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("ApplyChange", "")), 1, "a schema mismatch must be sent once: the target refuses it until its schema changes; the calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a schema mismatch must not be slept on and retried; the sleeps")
-	ctx.Equal(resumed(ctx), int64(0), "the shard's offset must not move past a change the target refused")
+	ctx.Equal(hResumed(ctx), int64(0), "the shard's offset must not move past a change the target refused")
 }
 
 func CheckAdvanceAfterConfirm(ctx *harness.Ctx) {
-	client(ctx)
-	_, err := offsets.AdvanceOffset(clientBg, "rep-1", 1, 10)
+	hClient(ctx)
+	_, err := offsets.AdvanceOffset(hClientBg, "rep-1", 1, 10)
 	ctx.NoError(err, "AdvanceOffset")
-	offset, err := replicateChange(clientBg, "rep-1", 1, change(7))
+	offset, err := replicateChange(hClientBg, "rep-1", 1, hChange(7))
 	ctx.NoError(err, "replicateChange(c-7) with a healthy target")
 	ctx.Equal(offset, int64(10), "shard 1 already stood at 10 and replicating the late change c-7 must return the shard's offset as AdvanceOffset leaves it")
-	shard1, err := offsets.ResumeOffset(clientBg, "rep-1", 1)
+	shard1, err := offsets.ResumeOffset(hClientBg, "rep-1", 1)
 	ctx.NoError(err, "ResumeOffset")
 	ctx.Equal(shard1, int64(10), "a late change must not move shard 1 back; its offset")
-	_, err = replicateChange(clientBg, "rep-1", 0, change(1))
+	_, err = replicateChange(hClientBg, "rep-1", 0, hChange(1))
 	ctx.NoError(err, "replicateChange(c-1) with a healthy target")
 	ctx.GRPC.Fail("ApplyChange", codes.Unavailable, "", 20, "")
-	_, err = replicateChange(clientBg, "rep-1", 0, change(2))
+	_, err = replicateChange(hClientBg, "rep-1", 0, hChange(2))
 	ctx.Assert(err != nil, "replicateChange returned no error although the target never confirmed change c-2")
-	ctx.Equal(resumed(ctx), int64(1), "the target never confirmed c-2, so the shard's offset must stay at 1 or a restart skips c-2; the offset")
+	ctx.Equal(hResumed(ctx), int64(1), "the target never confirmed c-2, so the shard's offset must stay at 1 or a restart skips c-2; the offset")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1105,20 +1105,20 @@ func CheckAdvanceAfterConfirm(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDiff = "orders.discount_code: text at the source, missing at the target";
+const std::string kHDiff = "orders.discount_code: text at the source, missing at the target";
 
-Change change(long long n) {
+Change hChange(long long n) {
   return Change{"c-" + std::to_string(n), n, "orders/" + std::to_string(n), "{\\"total\\": " + std::to_string(n) + "00}"};
 }
 
 // The target region: dedupes by change_id; lose_replies drops the reply of that many applied calls.
-class TargetPeer final : public replicatord::TargetRegion::Service {
+class HTargetPeer final : public replicatord::TargetRegion::Service {
  public:
   std::vector<std::string> applied;
   int lose_replies = 0;
   std::set<std::string> mismatched;
   grpc::Status ApplyChange(grpc::ServerContext*, const replicatord::ApplyChangeRequest* req, replicatord::ApplyChangeReply* out) override {
-    if (mismatched.count(req->key())) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, kDiff);
+    if (mismatched.count(req->key())) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, kHDiff);
     if (std::find(applied.begin(), applied.end(), req->change_id()) != applied.end()) {
       out->set_duplicate(true);
       return grpc::Status::OK;
@@ -1132,16 +1132,16 @@ class TargetPeer final : public replicatord::TargetRegion::Service {
   }
 };
 
-TargetPeer& client(harness::Ctx& ctx) {
-  static TargetPeer* peer = nullptr;
+HTargetPeer& hClient(harness::Ctx& ctx) {
+  static HTargetPeer* peer = nullptr;
   delete peer;
-  peer = new TargetPeer;
+  peer = new HTargetPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
 template <class E>
-std::string mustThrow(harness::Ctx& ctx, const Change& c, const std::string& expected, const std::string& why) {
+std::string hMustThrow(harness::Ctx& ctx, const Change& c, const std::string& expected, const std::string& why) {
   long long offset = 0;
   try {
     offset = replicateChange("rep-1", 0, c);
@@ -1156,15 +1156,15 @@ std::string mustThrow(harness::Ctx& ctx, const Change& c, const std::string& exp
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Equal(replicateChange("rep-1", 0, change(1)), 1, "with a healthy target replicateChange must return the shard's offset");
+  hClient(ctx);
+  ctx.Equal(replicateChange("rep-1", 0, hChange(1)), 1, "with a healthy target replicateChange must return the shard's offset");
   for (const auto& call : ctx.GRPC.CallsTo("ApplyChange")) {
     ctx.Assert(call.HasDeadline(), "an ApplyChange call carries no deadline: a target that stops answering holds the worker");
     ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "an ApplyChange call carries a %v s deadline, expected kApplyDeadline = 3 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("ApplyChange", 10.0);
   const std::size_t before = ctx.GRPC.CallsTo("ApplyChange").size();
-  mustThrow<ApplyFailed>(ctx, change(2), "ApplyFailed", "with a target slower than the deadline");
+  hMustThrow<ApplyFailed>(ctx, hChange(2), "ApplyFailed", "with a target slower than the deadline");
   const auto calls = ctx.GRPC.CallsTo("ApplyChange");
   ctx.Equal(calls.size() - before, 3, "a target slower than the deadline must be called kMaxAttempts = 3 times (DEADLINE_EXCEEDED is retried); the calls");
   for (std::size_t n = before; n < calls.size(); n++) {
@@ -1175,33 +1175,33 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBoundedAttempts(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::INVALID_ARGUMENT, "offset is not an integer", 1);
-  mustThrow<ApplyFailed>(ctx, change(1), "ApplyFailed", "with a request the target rejects (INVALID_ARGUMENT)");
+  hMustThrow<ApplyFailed>(ctx, hChange(1), "ApplyFailed", "with a request the target rejects (INVALID_ARGUMENT)");
   ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size(), 1, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are); the calls");
   const std::vector<std::pair<grpc::StatusCode, std::string>> refused = {
       {grpc::StatusCode::ABORTED, "ABORTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNKNOWN, "UNKNOWN"}};
   for (const auto& [code, name] : refused) {
     const std::size_t before = ctx.GRPC.CallsTo("ApplyChange").size();
     ctx.GRPC.Fail("ApplyChange", code, "the target refused the change", 1);
-    mustThrow<ApplyFailed>(ctx, change(3), "ApplyFailed", "with the target answering " + name);
+    hMustThrow<ApplyFailed>(ctx, hChange(3), "ApplyFailed", "with the target answering " + name);
     ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size() - before, 1, "%s must not be retried (only UNAVAILABLE, DEADLINE_EXCEEDED and RESOURCE_EXHAUSTED are); the calls", name);
   }
   std::size_t before = ctx.GRPC.CallsTo("ApplyChange").size();
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::RESOURCE_EXHAUSTED, "target busy", 1);
-  const long long offset = replicateChange("rep-1", 0, change(4));
+  const long long offset = replicateChange("rep-1", 0, hChange(4));
   const std::size_t made = ctx.GRPC.CallsTo("ApplyChange").size() - before;
   ctx.Assert(made == 2 && offset == 4, "after one RESOURCE_EXHAUSTED replicateChange made %d calls and returned %d, expected 2 calls and the offset 4: RESOURCE_EXHAUSTED is retried", made, offset);
   before = ctx.GRPC.CallsTo("ApplyChange").size();
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::UNAVAILABLE, "", 10);
-  mustThrow<ApplyFailed>(ctx, change(2), "ApplyFailed", "with the target unavailable");
+  hMustThrow<ApplyFailed>(ctx, hChange(2), "ApplyFailed", "with the target unavailable");
   ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size() - before, 3, "an unavailable target must be called kMaxAttempts = 3 times for one change; the calls");
 }
 
 void CheckChangeId(harness::Ctx& ctx) {
-  TargetPeer& target = client(ctx);
+  HTargetPeer& target = hClient(ctx);
   target.lose_replies = 1;
-  const long long offset = replicateChange("rep-1", 0, change(7));
+  const long long offset = replicateChange("rep-1", 0, hChange(7));
   std::vector<std::string> sent;
   for (const auto& call : ctx.GRPC.CallsTo("ApplyChange")) sent.push_back(call.Request<replicatord::ApplyChangeRequest>().change_id());
   ctx.Assert(target.applied.size() == 1, "the reply of the first attempt was lost and the target applied the change %d times (change ids %q): every attempt must carry the change's own change_id", target.applied.size(), sent);
@@ -1210,9 +1210,9 @@ void CheckChangeId(harness::Ctx& ctx) {
 }
 
 void CheckSchemaMismatch(harness::Ctx& ctx) {
-  TargetPeer& target = client(ctx);
+  HTargetPeer& target = hClient(ctx);
   target.mismatched.insert("orders/3");
-  const std::string message = mustThrow<SchemaMismatch>(ctx, change(3), "SchemaMismatch", "with a change the target's schema lacks");
+  const std::string message = hMustThrow<SchemaMismatch>(ctx, hChange(3), "SchemaMismatch", "with a change the target's schema lacks");
   ctx.Assert(message.find("discount_code") != std::string::npos, "SchemaMismatch must carry the target's diff, got %s", message);
   ctx.Equal(ctx.GRPC.CallsTo("ApplyChange").size(), 1, "a schema mismatch must be sent once: the target refuses it until its schema changes; the calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a schema mismatch must not be slept on and retried; the sleeps");
@@ -1220,16 +1220,16 @@ void CheckSchemaMismatch(harness::Ctx& ctx) {
 }
 
 void CheckAdvanceAfterConfirm(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   offsets::advanceOffset("rep-1", 1, 10);
-  const long long offset = replicateChange("rep-1", 1, change(7));
+  const long long offset = replicateChange("rep-1", 1, hChange(7));
   ctx.Equal(offset, 10, "shard 1 already stood at 10 and replicating the late change c-7 must return the shard's offset as advanceOffset leaves it");
   ctx.Equal(offsets::resumeOffset("rep-1", 1), 10, "a late change must not move shard 1 back; its offset");
-  replicateChange("rep-1", 0, change(1));
+  replicateChange("rep-1", 0, hChange(1));
   ctx.GRPC.Fail("ApplyChange", grpc::StatusCode::UNAVAILABLE, "", 20);
   bool returned = false;
   try {
-    replicateChange("rep-1", 0, change(2));
+    replicateChange("rep-1", 0, hChange(2));
     returned = true;
   } catch (const std::exception&) {
   }

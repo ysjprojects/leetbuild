@@ -733,29 +733,29 @@ import (
 	"leetbuild/harness"
 )
 
-const readDS = "imdb-reviews"
+const kHReadDS = "imdb-reviews"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readSeed(ctx *harness.Ctx, dataset, version, tenant, status string, report *store.Report) {
-	sha := store.PutObject(readBg, fmt.Sprintf("1,%[1]s %[2]s,pos\\n2,%[1]s %[2]s,neg\\n3,%[1]s %[2]s,pos\\n", dataset, version))
-	err := store.PutVersion(readBg, &store.VersionRecord{Tenant: tenant, Dataset: dataset, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: 60, RowCount: 3, Status: status, Report: report})
+func hReadSeed(ctx *harness.Ctx, dataset, version, tenant, status string, report *store.Report) {
+	sha := store.PutObject(hReadBg, fmt.Sprintf("1,%[1]s %[2]s,pos\\n2,%[1]s %[2]s,neg\\n3,%[1]s %[2]s,pos\\n", dataset, version))
+	err := store.PutVersion(hReadBg, &store.VersionRecord{Tenant: tenant, Dataset: dataset, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: 60, RowCount: 3, Status: status, Report: report})
 	ctx.NoError(err, "seeding %s@%s", dataset, version)
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
-	readSeed(ctx, readDS, "2026-01", "t1", "validated", &store.Report{Passed: true, RowsScanned: 3, RowsTotal: 3, Failures: []string{}})
-	readSeed(ctx, readDS, "2026-02", "t1", "rejected", &store.Report{Passed: false, RowsScanned: 3, RowsTotal: 3, Failures: []string{"row 2: label missing"}})
-	readSeed(ctx, readDS, "2026-03", "t1", "pending", nil)
-	readSeed(ctx, "private-logs", "2026-01", "t2", "validated", &store.Report{Passed: true, RowsScanned: 3, RowsTotal: 3, Failures: []string{}})
-	_, err := pointer.Promote(readBg, readDS, "2026-01", "alice")
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
+	hReadSeed(ctx, kHReadDS, "2026-01", "t1", "validated", &store.Report{Passed: true, RowsScanned: 3, RowsTotal: 3, Failures: []string{}})
+	hReadSeed(ctx, kHReadDS, "2026-02", "t1", "rejected", &store.Report{Passed: false, RowsScanned: 3, RowsTotal: 3, Failures: []string{"row 2: label missing"}})
+	hReadSeed(ctx, kHReadDS, "2026-03", "t1", "pending", nil)
+	hReadSeed(ctx, "private-logs", "2026-01", "t2", "validated", &store.Report{Passed: true, RowsScanned: 3, RowsTotal: 3, Failures: []string{}})
+	_, err := pointer.Promote(hReadBg, kHReadDS, "2026-01", "alice")
 	ctx.NoError(err, "promoting 2026-01")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	ctx.Assert(body != nil, "the answer is not a JSON object: %s", r.Text())
@@ -763,11 +763,11 @@ func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	r := c.Get("/v1/datasets/"+readDS+"/versions/2026-01", "X-Tenant-Id", "t1")
-	ctx.Equal(r.Status, 200, "GET /v1/datasets/%s/versions/2026-01 (%s)", readDS, r.Text())
-	body := readBody(ctx, r)
-	rec := store.Version(readBg, readDS, "2026-01")
+	c := hReadAPI(ctx)
+	r := c.Get("/v1/datasets/"+kHReadDS+"/versions/2026-01", "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/datasets/%s/versions/2026-01 (%s)", kHReadDS, r.Text())
+	body := hReadBody(ctx, r)
+	rec := store.Version(hReadBg, kHReadDS, "2026-01")
 	ctx.Equal(body["content_sha256"], rec.ContentSHA256, "the answer's content_sha256")
 	ctx.Equal(body["version"], "2026-01", "the answer's version")
 	ctx.Equal(body["owner"], "team-lm", "the answer's owner")
@@ -777,15 +777,15 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScoped(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	foreign := c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t1")
-	unknown := c.Get("/v1/datasets/"+readDS+"/versions/2030-01", "X-Tenant-Id", "t1")
+	unknown := c.Get("/v1/datasets/"+kHReadDS+"/versions/2030-01", "X-Tenant-Id", "t1")
 	own := c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t2")
 	ghost := c.Get("/v1/datasets/ghost-logs/versions/2026-01", "X-Tenant-Id", "t1")
-	_, err := pointer.Promote(readBg, "private-logs", "2026-01", "bob")
+	_, err := pointer.Promote(hReadBg, "private-logs", "2026-01", "bob")
 	ctx.NoError(err, "promoting private-logs@2026-01")
 	foreignLatest := c.Get("/v1/datasets/private-logs/versions/latest", "X-Tenant-Id", "t1")
-	sha := store.Version(readBg, "private-logs", "2026-01").ContentSHA256
+	sha := store.Version(hReadBg, "private-logs", "2026-01").ContentSHA256
 	ctx.Equal(foreign.Status, 404, "tenant t1 reading t2's private-logs@2026-01: another tenant's version must answer 404")
 	ctx.Assert(!strings.Contains(foreign.Text(), sha), "the answer to another tenant carries the content hash")
 	ctx.Equal(unknown.Status, 404, "an unknown version")
@@ -795,12 +795,12 @@ func CheckTenantScoped(ctx *harness.Ctx) {
 }
 
 func CheckSignedUrl(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	now := ctx.Clock.Now() / 1000
-	r := c.Get("/v1/datasets/"+readDS+"/versions/2026-01", "X-Tenant-Id", "t1")
+	r := c.Get("/v1/datasets/"+kHReadDS+"/versions/2026-01", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "the read (%s)", r.Text())
-	body := readBody(ctx, r)
-	sha := store.Version(readBg, readDS, "2026-01").ContentSHA256
+	body := hReadBody(ctx, r)
+	sha := store.Version(hReadBg, kHReadDS, "2026-01").ContentSHA256
 	raw, _ := body["expires_at"].(float64)
 	expiresAt := int64(raw)
 	ctx.Assert(now+290 <= expiresAt && expiresAt <= now+301, "expires_at is %v, expected about 300 s from now (%d): a link without an expiry works for whoever holds it, for ever", body["expires_at"], now+300)
@@ -811,7 +811,7 @@ func CheckSignedUrl(ctx *harness.Ctx) {
 	}
 	ctx.Clock.Advance(600)
 	later := ctx.Clock.Now() / 1000
-	again := readBody(ctx, c.Get("/v1/datasets/"+readDS+"/versions/2026-01", "X-Tenant-Id", "t1"))
+	again := hReadBody(ctx, c.Get("/v1/datasets/"+kHReadDS+"/versions/2026-01", "X-Tenant-Id", "t1"))
 	raw, _ = again["expires_at"].(float64)
 	expiresAt = int64(raw)
 	ctx.Assert(later+290 <= expiresAt && expiresAt <= later+301, "read again ten minutes later, the answer's expires_at is %v, expected about %d: every read signs a URL valid for 300 s from that read", again["expires_at"], later+300)
@@ -819,27 +819,27 @@ func CheckSignedUrl(ctx *harness.Ctx) {
 }
 
 func CheckValidatorReport(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	rejected := c.Get("/v1/datasets/"+readDS+"/versions/2026-02", "X-Tenant-Id", "t1")
-	pending := c.Get("/v1/datasets/"+readDS+"/versions/2026-03", "X-Tenant-Id", "t1")
+	c := hReadAPI(ctx)
+	rejected := c.Get("/v1/datasets/"+kHReadDS+"/versions/2026-02", "X-Tenant-Id", "t1")
+	pending := c.Get("/v1/datasets/"+kHReadDS+"/versions/2026-03", "X-Tenant-Id", "t1")
 	ctx.Equal(rejected.Status, 200, "reading the rejected 2026-02 (%s)", rejected.Text())
-	body := readBody(ctx, rejected)
+	body := hReadBody(ctx, rejected)
 	report, _ := body["validator_report"].(map[string]any)
 	ctx.Assert(body["status"] == "rejected" && report != nil && report["passed"] == false, "the rejected version answered %s: its failures must be in the answer", rejected.Text())
 	ctx.Equal(report["failures"], []any{"row 2: label missing"}, "the rejected version's failures")
-	p := readBody(ctx, pending)
+	p := hReadBody(ctx, pending)
 	value, present := p["validator_report"]
 	ctx.Assert(present && value == nil, "a pending version must answer validator_report null, got %s", pending.Text())
 }
 
 func CheckLatestPointer(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	r := c.Get("/v1/datasets/"+readDS+"/versions/latest", "X-Tenant-Id", "t1")
+	c := hReadAPI(ctx)
+	r := c.Get("/v1/datasets/"+kHReadDS+"/versions/latest", "X-Tenant-Id", "t1")
 	none := c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1")
-	readSeed(ctx, "wiki-text", "2026-01", "t1", "pending", nil)
+	hReadSeed(ctx, "wiki-text", "2026-01", "t1", "pending", nil)
 	unpromoted := c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "GET …/versions/latest (%s)", r.Text())
-	ctx.Equal(readBody(ctx, r)["version"], "2026-01", "latest must resolve to the promoted 2026-01 (anything else hands a training run a version nobody validated); it resolved to")
+	ctx.Equal(hReadBody(ctx, r)["version"], "2026-01", "latest must resolve to the promoted 2026-01 (anything else hands a training run a version nobody validated); it resolved to")
 	ctx.Equal(none.Status, 404, "latest of a dataset with no promoted version")
 	ctx.Equal(unpromoted.Status, 404, "latest of wiki-text, which has a registered version but no promoted one (without a promotion there is no latest)")
 }
@@ -857,11 +857,11 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kDS = "imdb-reviews";
-const json kPassed = {{"passed", true}, {"rows_scanned", 3}, {"rows_total", 3}, {"failures", json::array()}};
-const json kFailed = {{"passed", false}, {"rows_scanned", 3}, {"rows_total", 3}, {"failures", {"row 2: label missing"}}};
+const std::string kHDS = "imdb-reviews";
+const json kHPassed = {{"passed", true}, {"rows_scanned", 3}, {"rows_total", 3}, {"failures", json::array()}};
+const json kHFailed = {{"passed", false}, {"rows_scanned", 3}, {"rows_total", 3}, {"failures", {"row 2: label missing"}}};
 
-void seed(const std::string& dataset, const std::string& version, const std::string& tenant, const std::string& status,
+void hSeed(const std::string& dataset, const std::string& version, const std::string& tenant, const std::string& status,
           const std::optional<json>& report) {
   store::VersionRecord rec;
   rec.tenant = tenant;
@@ -877,12 +877,12 @@ void seed(const std::string& dataset, const std::string& version, const std::str
   store::putVersion(rec);
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
-  seed(kDS, "2026-01", "t1", "validated", kPassed);
-  seed(kDS, "2026-02", "t1", "rejected", kFailed);
-  seed(kDS, "2026-03", "t1", "pending", std::nullopt);
-  seed("private-logs", "2026-01", "t2", "validated", kPassed);
-  pointer::promote(kDS, "2026-01", "alice");
+harness::HTTP hApi(harness::Ctx& ctx) {
+  hSeed(kHDS, "2026-01", "t1", "validated", kHPassed);
+  hSeed(kHDS, "2026-02", "t1", "rejected", kHFailed);
+  hSeed(kHDS, "2026-03", "t1", "pending", std::nullopt);
+  hSeed("private-logs", "2026-01", "t2", "validated", kHPassed);
+  pointer::promote(kHDS, "2026-01", "alice");
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -890,14 +890,14 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the answer is not a JSON object: %s", r.Text());
   return body;
 }
 
 // text with the dataset name replaced: two answers that differ only in the name they echo are one answer.
-std::string withoutName(std::string text, const std::string& name) {
+std::string hWithoutName(std::string text, const std::string& name) {
   for (size_t at = text.find(name); at != std::string::npos; at = text.find(name, at)) text.replace(at, name.size(), "{dataset}");
   return text;
 }
@@ -905,11 +905,11 @@ std::string withoutName(std::string text, const std::string& name) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = c.Get("/v1/datasets/" + kDS + "/versions/2026-01", "X-Tenant-Id", "t1");
-  ctx.Equal(r.Status, 200, "GET /v1/datasets/%s/versions/2026-01 (%s)", kDS, r.Text());
-  const json body = bodyOf(ctx, r);
-  const auto rec = store::version(kDS, "2026-01");
+  auto c = hApi(ctx);
+  const auto r = c.Get("/v1/datasets/" + kHDS + "/versions/2026-01", "X-Tenant-Id", "t1");
+  ctx.Equal(r.Status, 200, "GET /v1/datasets/%s/versions/2026-01 (%s)", kHDS, r.Text());
+  const json body = hBodyOf(ctx, r);
+  const auto rec = store::version(kHDS, "2026-01");
   ctx.Equal(body.value("content_sha256", ""), rec->content_sha256, "the answer's content_sha256");
   ctx.Equal(body.value("version", ""), "2026-01", "the answer's version");
   ctx.Equal(body.value("owner", ""), "team-lm", "the answer's owner");
@@ -919,9 +919,9 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScoped(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto foreign = c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t1");
-  const auto unknown = c.Get("/v1/datasets/" + kDS + "/versions/2030-01", "X-Tenant-Id", "t1");
+  const auto unknown = c.Get("/v1/datasets/" + kHDS + "/versions/2030-01", "X-Tenant-Id", "t1");
   const auto own = c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t2");
   const auto ghost = c.Get("/v1/datasets/ghost-logs/versions/2026-01", "X-Tenant-Id", "t1");
   pointer::promote("private-logs", "2026-01", "bob");
@@ -931,19 +931,19 @@ void CheckTenantScoped(harness::Ctx& ctx) {
   ctx.Assert(foreign.Text().find(sha) == std::string::npos, "the answer to another tenant carries the content hash");
   ctx.Equal(unknown.Status, 404, "an unknown version");
   ctx.Equal(own.Status, 200, "t2 reading its own version (%s)", own.Text());
-  ctx.Assert(withoutName(foreign.Text(), "private-logs") == withoutName(ghost.Text(), "ghost-logs"),
+  ctx.Assert(hWithoutName(foreign.Text(), "private-logs") == hWithoutName(ghost.Text(), "ghost-logs"),
              "t2's private-logs@2026-01 answered %q and a dataset nobody registered answered %q: the difference tells t1 that the version exists", foreign.Text(), ghost.Text());
   ctx.Assert(foreignLatest.Status == 404 && foreignLatest.Text().find(sha) == std::string::npos,
              "tenant t1 reading t2's private-logs@latest got %d: %s. latest resolves to a version, and that version is another tenant's", foreignLatest.Status, foreignLatest.Text());
 }
 
 void CheckSignedUrl(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const long long now = ctx.Clock.Now() / 1000;
-  const auto r = c.Get("/v1/datasets/" + kDS + "/versions/2026-01", "X-Tenant-Id", "t1");
+  const auto r = c.Get("/v1/datasets/" + kHDS + "/versions/2026-01", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
-  const std::string sha = store::version(kDS, "2026-01")->content_sha256;
+  const json body = hBodyOf(ctx, r);
+  const std::string sha = store::version(kHDS, "2026-01")->content_sha256;
   const long long expires_at = body.contains("expires_at") && body["expires_at"].is_number() ? body["expires_at"].get<long long>() : 0;
   ctx.Assert(now + 290 <= expires_at && expires_at <= now + 301,
              "expires_at is %d, expected about 300 s from now (%d): a link without an expiry works for whoever holds it, for ever", expires_at, now + 300);
@@ -954,7 +954,7 @@ void CheckSignedUrl(harness::Ctx& ctx) {
   }
   ctx.Clock.Advance(600);
   const long long later = ctx.Clock.Now() / 1000;
-  const json again = bodyOf(ctx, c.Get("/v1/datasets/" + kDS + "/versions/2026-01", "X-Tenant-Id", "t1"));
+  const json again = hBodyOf(ctx, c.Get("/v1/datasets/" + kHDS + "/versions/2026-01", "X-Tenant-Id", "t1"));
   const long long renewed = again.contains("expires_at") && again["expires_at"].is_number() ? again["expires_at"].get<long long>() : 0;
   ctx.Assert(later + 290 <= renewed && renewed <= later + 301,
              "read again ten minutes later, the answer's expires_at is %d, expected about %d: every read signs a URL valid for 300 s from that read", renewed, later + 300);
@@ -962,25 +962,25 @@ void CheckSignedUrl(harness::Ctx& ctx) {
 }
 
 void CheckValidatorReport(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto rejected = c.Get("/v1/datasets/" + kDS + "/versions/2026-02", "X-Tenant-Id", "t1");
-  const auto pending = c.Get("/v1/datasets/" + kDS + "/versions/2026-03", "X-Tenant-Id", "t1");
+  auto c = hApi(ctx);
+  const auto rejected = c.Get("/v1/datasets/" + kHDS + "/versions/2026-02", "X-Tenant-Id", "t1");
+  const auto pending = c.Get("/v1/datasets/" + kHDS + "/versions/2026-03", "X-Tenant-Id", "t1");
   ctx.Equal(rejected.Status, 200, "reading the rejected 2026-02 (%s)", rejected.Text());
-  const json body = bodyOf(ctx, rejected);
-  ctx.Assert(body.value("status", "") == "rejected" && body.contains("validator_report") && body["validator_report"] == kFailed,
+  const json body = hBodyOf(ctx, rejected);
+  ctx.Assert(body.value("status", "") == "rejected" && body.contains("validator_report") && body["validator_report"] == kHFailed,
              "the rejected version answered %s: its failures must be in the answer", rejected.Text());
-  const json p = bodyOf(ctx, pending);
+  const json p = hBodyOf(ctx, pending);
   ctx.Assert(p.contains("validator_report") && p["validator_report"].is_null(), "a pending version must answer validator_report null, got %s", pending.Text());
 }
 
 void CheckLatestPointer(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = c.Get("/v1/datasets/" + kDS + "/versions/latest", "X-Tenant-Id", "t1");
+  auto c = hApi(ctx);
+  const auto r = c.Get("/v1/datasets/" + kHDS + "/versions/latest", "X-Tenant-Id", "t1");
   const auto none = c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1");
-  seed("wiki-text", "2026-01", "t1", "pending", std::nullopt);
+  hSeed("wiki-text", "2026-01", "t1", "pending", std::nullopt);
   const auto unpromoted = c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "GET …/versions/latest (%s)", r.Text());
-  ctx.Equal(bodyOf(ctx, r).value("version", ""), "2026-01", "latest must resolve to the promoted 2026-01 (anything else hands a training run a version nobody validated); it resolved to");
+  ctx.Equal(hBodyOf(ctx, r).value("version", ""), "2026-01", "latest must resolve to the promoted 2026-01 (anything else hands a training run a version nobody validated); it resolved to");
   ctx.Equal(none.Status, 404, "latest of a dataset with no promoted version");
   ctx.Equal(unpromoted.Status, 404, "latest of wiki-text, which has a registered version but no promoted one (without a promotion there is no latest)");
 }

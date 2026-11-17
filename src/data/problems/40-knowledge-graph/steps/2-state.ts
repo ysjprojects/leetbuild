@@ -643,21 +643,21 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateEdge(ctx *harness.Ctx, left, right string) {
+func hStateEdge(ctx *harness.Ctx, left, right string) {
 	ctx.Redis.Do("SADD", "edges:"+left, right)
 	ctx.Redis.Do("SADD", "edges:"+right, left)
 }
 
-func stateRead(ctx *harness.Ctx, entityID string) string {
-	ids, err := readNeighbors(stateBg, entityID)
+func hStateRead(ctx *harness.Ctx, entityID string) string {
+	ids, err := readNeighbors(hStateBg, entityID)
 	ctx.NoError(err, "readNeighbors(%s) failed", entityID)
 	return strings.Join(ids, ",")
 }
 
 // stateFiller is another worker reading end right after its version moved and caching what the store holds then.
-func stateFiller(ctx *harness.Ctx, end string) func() any {
+func hStateFiller(ctx *harness.Ctx, end string) func() any {
 	return func() any {
 		raw, _ := ctx.Redis.Get("adj:" + end + ":version")
 		version, _ := strconv.Atoi(raw)
@@ -668,7 +668,7 @@ func stateFiller(ctx *harness.Ctx, end string) func() any {
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	stateEdge(ctx, "e-1", "e-2")
+	hStateEdge(ctx, "e-1", "e-2")
 	var writtenTTL int64
 	written := false
 	// The TTL right after the command that wrote adj:e-1: a crash before a later EXPIRE leaves it forever.
@@ -683,56 +683,56 @@ func CheckTtl(ctx *harness.Ctx) {
 		return n
 	}
 	ctx.Redis.After("adj:e-1", watch)
-	ctx.Equal(stateRead(ctx, "e-1"), "e-2", "readNeighbors(e-1)")
+	ctx.Equal(hStateRead(ctx, "e-1"), "e-2", "readNeighbors(e-1)")
 	ctx.Assert(written, "readNeighbors(e-1) never wrote adj:e-1 on a miss")
 	ctx.Assert(writtenTTL > 0, "right after the command that wrote adj:e-1 its TTL was %d: a crash before a later EXPIRE leaves an entry that never expires. The TTL belongs in the SET", writtenTTL)
 	ttl := ctx.Redis.TTL("adj:e-1")
 	ctx.Assert(240 <= ttl && ttl <= 300, "adj:e-1 has TTL %d: a cached neighbour list must expire after 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever", ttl)
 	// An edge change, then a refill of the stale entry: every fill carries the TTL.
-	stateEdge(ctx, "e-1", "e-3")
+	hStateEdge(ctx, "e-1", "e-3")
 	ctx.Redis.Do("INCR", "adj:e-1:version")
-	ctx.Equal(stateRead(ctx, "e-1"), "e-2,e-3", "readNeighbors(e-1) after adj:e-1:version moved")
+	ctx.Equal(hStateRead(ctx, "e-1"), "e-2,e-3", "readNeighbors(e-1) after adj:e-1:version moved")
 	ttl = ctx.Redis.TTL("adj:e-1")
 	ctx.Assert(240 <= ttl && ttl <= 300, "after the refill of a stale entry adj:e-1 has TTL %d: every fill of adj:e-1 carries EX 300, the refill too", ttl)
 }
 
 func CheckVersionStamp(ctx *harness.Ctx) {
-	stateEdge(ctx, "e-1", "e-2")
+	hStateEdge(ctx, "e-1", "e-2")
 	// Another worker adds e-1 to e-3 while this read is between its load and its fill.
 	probe := ctx.Redis.After("edges:e-1", func() any {
-		stateEdge(ctx, "e-1", "e-3")
+		hStateEdge(ctx, "e-1", "e-3")
 		ctx.Redis.Do("INCR", "adj:e-1:version")
 		ctx.Redis.Do("INCR", "adj:e-3:version")
 		return nil
 	})
-	first := stateRead(ctx, "e-1")
+	first := hStateRead(ctx, "e-1")
 	ctx.Assert(probe.Fired, "readNeighbors never loaded edges:e-1 from the graph store on a miss")
 	ctx.Assert(first == "e-2" || first == "e-2,e-3", "readNeighbors(e-1) gave %q", first)
 	raw, _ := ctx.Redis.Get("adj:e-1")
 	entry := map[string]any{}
 	ctx.Assert(json.Unmarshal([]byte(raw), &entry) == nil && entry["version"] != nil, "adj:e-1 holds %q: a cached list must carry the version it was built from", raw)
-	again := stateRead(ctx, "e-1")
+	again := hStateRead(ctx, "e-1")
 	ctx.Assert(again == "e-2,e-3", "an edge change raced the fill and readNeighbors still serves %q: the entry was filled from a list that was stale on arrival. Read adj:e-1:version before loading and stamp the entry with it", again)
 }
 
 func CheckBothEnds(ctx *harness.Ctx) {
-	stateEdge(ctx, "e-1", "e-2")
-	ctx.Equal(stateRead(ctx, "e-1"), "e-2", "the first read must cache e-1 -> [e-2]")
-	ctx.Equal(stateRead(ctx, "e-3"), "", "the first read must cache e-3 -> []")
-	ctx.NoError(applyEdge(stateBg, "e-1", "e-3"), "applyEdge(e-1, e-3) failed")
+	hStateEdge(ctx, "e-1", "e-2")
+	ctx.Equal(hStateRead(ctx, "e-1"), "e-2", "the first read must cache e-1 -> [e-2]")
+	ctx.Equal(hStateRead(ctx, "e-3"), "", "the first read must cache e-3 -> []")
+	ctx.NoError(applyEdge(hStateBg, "e-1", "e-3"), "applyEdge(e-1, e-3) failed")
 	ctx.Equal(ctx.Redis.SMembers("edges:e-3"), []string{"e-1"}, "applyEdge must store the edge with store.AddEdge; edges:e-3")
-	left := stateRead(ctx, "e-1")
+	left := hStateRead(ctx, "e-1")
 	ctx.Assert(left == "e-2,e-3", "after applyEdge(e-1, e-3) readNeighbors(e-1) serves %q", left)
-	right := stateRead(ctx, "e-3")
+	right := hStateRead(ctx, "e-3")
 	ctx.Assert(right == "e-1", "after applyEdge(e-1, e-3) readNeighbors(e-3) still serves %q: an edge changes the neighbour lists of both its ends", right)
 	v1, _ := ctx.Redis.Get("adj:e-1:version")
 	v3, _ := ctx.Redis.Get("adj:e-3:version")
 	ctx.Assert(v1 == "1" && v3 == "1", "applyEdge must increment adj:e-1:version and adj:e-3:version, they hold %q and %q: a delete races a reader's fill, a version bump does not", v1, v3)
-	nearProbe := ctx.Redis.After("adj:e-1:version", stateFiller(ctx, "e-1"))
-	farProbe := ctx.Redis.After("adj:e-4:version", stateFiller(ctx, "e-4"))
-	ctx.NoError(applyEdge(stateBg, "e-1", "e-4"), "applyEdge(e-1, e-4) failed")
+	nearProbe := ctx.Redis.After("adj:e-1:version", hStateFiller(ctx, "e-1"))
+	farProbe := ctx.Redis.After("adj:e-4:version", hStateFiller(ctx, "e-4"))
+	ctx.NoError(applyEdge(hStateBg, "e-1", "e-4"), "applyEdge(e-1, e-4) failed")
 	ctx.Assert(nearProbe.Fired && farProbe.Fired, "applyEdge(e-1, e-4) must increment adj:e-1:version and adj:e-4:version")
-	grown, far := stateRead(ctx, "e-1"), stateRead(ctx, "e-4")
+	grown, far := hStateRead(ctx, "e-1"), hStateRead(ctx, "e-4")
 	ctx.Assert(grown == "e-2,e-3,e-4" && far == "e-1", "a reader that filled the cache right after applyEdge(e-1, e-4) bumped a version left e-1 -> %q and e-4 -> %q served: it cached the list before the edge under the new version. Bump after store.AddEdge", grown, far)
 }
 `,
@@ -746,19 +746,19 @@ func CheckBothEnds(ctx *harness.Ctx) {
 
 namespace {
 
-void stateEdge(harness::Ctx& ctx, const std::string& left, const std::string& right) {
+void hStateEdge(harness::Ctx& ctx, const std::string& left, const std::string& right) {
   ctx.Redis.Do("SADD", "edges:" + left, right);
   ctx.Redis.Do("SADD", "edges:" + right, left);
 }
 
-std::string stateRead(const std::string& entity_id) {
+std::string hStateRead(const std::string& entity_id) {
   std::string out;
   for (const auto& id : readNeighbors(entity_id)) out += (out.empty() ? "" : ",") + id;
   return out;
 }
 
 // Another worker reading end right after its version moved and caching what the store holds then.
-std::function<void()> stateFiller(harness::Ctx& ctx, const std::string& end, bool& fired) {
+std::function<void()> hStateFiller(harness::Ctx& ctx, const std::string& end, bool& fired) {
   return [&ctx, end, &fired] {
     fired = true;
     const std::string raw = ctx.Redis.Get("adj:" + end + ":version").value_or("0");
@@ -770,7 +770,7 @@ std::function<void()> stateFiller(harness::Ctx& ctx, const std::string& end, boo
 }  // namespace
 
 void CheckTtl(harness::Ctx& ctx) {
-  stateEdge(ctx, "e-1", "e-2");
+  hStateEdge(ctx, "e-1", "e-2");
   bool written = false;
   long long writtenTtl = 0;
   // The TTL right after the command that wrote adj:e-1: a crash before a later EXPIRE leaves it forever.
@@ -784,60 +784,60 @@ void CheckTtl(harness::Ctx& ctx) {
     }
   };
   ctx.Redis.After("adj:e-1", watch);
-  ctx.Equal(stateRead("e-1"), "e-2", "readNeighbors(e-1)");
+  ctx.Equal(hStateRead("e-1"), "e-2", "readNeighbors(e-1)");
   ctx.Assert(written, "readNeighbors(e-1) never wrote adj:e-1 on a miss");
   ctx.Assert(writtenTtl > 0, "right after the command that wrote adj:e-1 its TTL was %d: a crash before a later EXPIRE leaves an entry that never expires. The TTL belongs in the SET", writtenTtl);
   long long ttl = ctx.Redis.TTL("adj:e-1");
   ctx.Assert(240 <= ttl && ttl <= 300, "adj:e-1 has TTL %d: a cached neighbour list must expire after 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever", ttl);
   // An edge change, then a refill of the stale entry: every fill carries the TTL.
-  stateEdge(ctx, "e-1", "e-3");
+  hStateEdge(ctx, "e-1", "e-3");
   ctx.Redis.Do("INCR", "adj:e-1:version");
-  ctx.Equal(stateRead("e-1"), "e-2,e-3", "readNeighbors(e-1) after adj:e-1:version moved");
+  ctx.Equal(hStateRead("e-1"), "e-2,e-3", "readNeighbors(e-1) after adj:e-1:version moved");
   ttl = ctx.Redis.TTL("adj:e-1");
   ctx.Assert(240 <= ttl && ttl <= 300, "after the refill of a stale entry adj:e-1 has TTL %d: every fill of adj:e-1 carries EX 300, the refill too", ttl);
 }
 
 void CheckVersionStamp(harness::Ctx& ctx) {
-  stateEdge(ctx, "e-1", "e-2");
+  hStateEdge(ctx, "e-1", "e-2");
   bool fired = false;
   // Another worker adds e-1 to e-3 while this read is between its load and its fill.
   ctx.Redis.After("edges:e-1", [&] {
     fired = true;
-    stateEdge(ctx, "e-1", "e-3");
+    hStateEdge(ctx, "e-1", "e-3");
     ctx.Redis.Do("INCR", "adj:e-1:version");
     ctx.Redis.Do("INCR", "adj:e-3:version");
   });
-  const std::string first = stateRead("e-1");
+  const std::string first = hStateRead("e-1");
   ctx.Assert(fired, "readNeighbors never loaded edges:e-1 from the graph store on a miss");
   ctx.Assert(first == "e-2" || first == "e-2,e-3", "readNeighbors(e-1) gave %q", first);
   const std::string raw = ctx.Redis.Get("adj:e-1").value_or("");
   const auto entry = nlohmann::json::parse(raw, nullptr, false);
   ctx.Assert(entry.is_object() && entry.contains("version"), "adj:e-1 holds %q: a cached list must carry the version it was built from", raw);
-  const std::string again = stateRead("e-1");
+  const std::string again = hStateRead("e-1");
   ctx.Assert(again == "e-2,e-3", "an edge change raced the fill and readNeighbors still serves %q: the entry was filled from a list that was stale on arrival. Read adj:e-1:version before loading and stamp the entry with it", again);
 }
 
 void CheckBothEnds(harness::Ctx& ctx) {
-  stateEdge(ctx, "e-1", "e-2");
-  ctx.Equal(stateRead("e-1"), "e-2", "the first read must cache e-1 -> [e-2]");
-  ctx.Equal(stateRead("e-3"), "", "the first read must cache e-3 -> []");
+  hStateEdge(ctx, "e-1", "e-2");
+  ctx.Equal(hStateRead("e-1"), "e-2", "the first read must cache e-1 -> [e-2]");
+  ctx.Equal(hStateRead("e-3"), "", "the first read must cache e-3 -> []");
   applyEdge("e-1", "e-3");
   ctx.Equal(ctx.Redis.SMembers("edges:e-3"), std::vector<std::string>{"e-1"}, "applyEdge must store the edge with store::addEdge; edges:e-3");
-  const std::string left = stateRead("e-1");
+  const std::string left = hStateRead("e-1");
   ctx.Assert(left == "e-2,e-3", "after applyEdge(e-1, e-3) readNeighbors(e-1) serves %q", left);
-  const std::string right = stateRead("e-3");
+  const std::string right = hStateRead("e-3");
   ctx.Assert(right == "e-1", "after applyEdge(e-1, e-3) readNeighbors(e-3) still serves %q: an edge changes the neighbour lists of both its ends", right);
   const std::string v1 = ctx.Redis.Get("adj:e-1:version").value_or("");
   const std::string v3 = ctx.Redis.Get("adj:e-3:version").value_or("");
   ctx.Assert(v1 == "1" && v3 == "1", "applyEdge must increment adj:e-1:version and adj:e-3:version, they hold %q and %q: a delete races a reader's fill, a version bump does not", v1, v3);
   bool nearFired = false;
   bool farFired = false;
-  ctx.Redis.After("adj:e-1:version", stateFiller(ctx, "e-1", nearFired));
-  ctx.Redis.After("adj:e-4:version", stateFiller(ctx, "e-4", farFired));
+  ctx.Redis.After("adj:e-1:version", hStateFiller(ctx, "e-1", nearFired));
+  ctx.Redis.After("adj:e-4:version", hStateFiller(ctx, "e-4", farFired));
   applyEdge("e-1", "e-4");
   ctx.Assert(nearFired && farFired, "applyEdge(e-1, e-4) must increment adj:e-1:version and adj:e-4:version");
-  const std::string grown = stateRead("e-1");
-  const std::string far = stateRead("e-4");
+  const std::string grown = hStateRead("e-1");
+  const std::string far = hStateRead("e-4");
   ctx.Assert(grown == "e-2,e-3,e-4" && far == "e-1", "a reader that filled the cache right after applyEdge(e-1, e-4) bumped a version left e-1 -> %q and e-4 -> %q served: it cached the list before the edge under the new version. Bump after store::addEdge", grown, far);
 }
 `,

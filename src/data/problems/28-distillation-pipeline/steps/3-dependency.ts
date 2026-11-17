@@ -1107,24 +1107,24 @@ import (
 	"leetbuild/harness"
 )
 
-const clientJob = "j1"
+const kHClientJob = "j1"
 
 // teacherPeer is the stand-in teacher: answers from distill/teacher.
-type teacherPeer struct {
+type HTeacherPeer struct {
 	pb.UnimplementedTeacherServer
 }
 
-func (teacherPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+func (HTeacherPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
 	text, refused := teacher.Complete(req.GetPrompt())
 	return &pb.GenerateReply{Text: text, Refused: refused, TeacherVersion: teacher.Version}, nil
 }
 
 // clientState stands in for the step-2 job state over the harness's Redis.
-type clientState struct {
+type HClientState struct {
 	ctx *harness.Ctx
 }
 
-func (s clientState) Reserve(_ context.Context, jobID, prompt string) (Reservation, error) {
+func (s HClientState) Reserve(_ context.Context, jobID, prompt string) (Reservation, error) {
 	sum := sha256.Sum256([]byte(prompt))
 	hash := hex.EncodeToString(sum[:])
 	if s.ctx.Redis.SIsMember(config.SeenKey(jobID), hash) {
@@ -1145,7 +1145,7 @@ func (s clientState) Reserve(_ context.Context, jobID, prompt string) (Reservati
 	return Reservation{Verdict: "ok", Remaining: left, DedupeHash: hash}, nil
 }
 
-func (s clientState) Record(_ context.Context, jobID, outcome, reason string) error {
+func (s HClientState) Record(_ context.Context, jobID, outcome, reason string) error {
 	if outcome == "accepted" {
 		s.ctx.Redis.Do("HINCRBY", config.ProgressKey(jobID), "accepted", 1)
 		return nil
@@ -1155,27 +1155,27 @@ func (s clientState) Record(_ context.Context, jobID, outcome, reason string) er
 	return nil
 }
 
-func clientWorld(ctx *harness.Ctx, cap int) clientState {
-	pb.RegisterTeacherServer(ctx.GRPC.Server(config.Teacher), &teacherPeer{})
-	ctx.Redis.Set(config.BudgetKey(clientJob), int64(cap)*config.TokensPerCall)
-	ctx.Redis.Do("HSET", config.ProgressKey(clientJob), "sampled", 0, "accepted", 0, "rejected", 0, "duplicate", 0)
-	return clientState{ctx: ctx}
+func hClientWorld(ctx *harness.Ctx, cap int) HClientState {
+	pb.RegisterTeacherServer(ctx.GRPC.Server(config.Teacher), &HTeacherPeer{})
+	ctx.Redis.Set(config.BudgetKey(kHClientJob), int64(cap)*config.TokensPerCall)
+	ctx.Redis.Do("HSET", config.ProgressKey(kHClientJob), "sampled", 0, "accepted", 0, "rejected", 0, "duplicate", 0)
+	return HClientState{ctx: ctx}
 }
 
-func clientGenerate(ctx *harness.Ctx, state clientState, promptID, prompt string) Sample {
-	sample, err := generate(context.Background(), state, clientJob, promptID, prompt)
+func hClientGenerate(ctx *harness.Ctx, state HClientState, promptID, prompt string) Sample {
+	sample, err := generate(context.Background(), state, kHClientJob, promptID, prompt)
 	ctx.NoError(err, "generate(%q)", promptID)
 	return sample
 }
 
-func clientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
+func hClientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
 
-func clientCount(ctx *harness.Ctx, key, field string) int64 {
+func hClientCount(ctx *harness.Ctx, key, field string) int64 {
 	n, _ := strconv.ParseInt(ctx.Redis.HGetAll(key)[field], 10, 64)
 	return n
 }
 
-func clientExpect(ctx *harness.Ctx, sample Sample, status, reason string) {
+func hClientExpect(ctx *harness.Ctx, sample Sample, status, reason string) {
 	ctx.Equal(sample.Status, status, "the sample's status (%+v)", sample)
 	if reason != "" {
 		ctx.Equal(sample.Reason, reason, "the sample's reason (%+v)", sample)
@@ -1183,100 +1183,100 @@ func clientExpect(ctx *harness.Ctx, sample Sample, status, reason string) {
 }
 
 func CheckAttemptDeadline(ctx *harness.Ctx) {
-	state := clientWorld(ctx, 100)
-	sample := clientGenerate(ctx, state, "p-1", "What is the capital of France?")
-	clientExpect(ctx, sample, "accepted", "")
+	state := hClientWorld(ctx, 100)
+	sample := hClientGenerate(ctx, state, "p-1", "What is the capital of France?")
+	hClientExpect(ctx, sample, "accepted", "")
 	ctx.Equal(sample.Text, "Teacher answer: What is the capital of France?", "an accepted sample carries the reply's text")
 	ctx.Equal(sample.TeacherVersion, teacher.Version, "an accepted sample carries TeacherVersion")
 	ctx.Equal(sample.Attempts, 1, "a healthy teacher is called once; attempts")
-	calls := clientCalls(ctx)
+	calls := hClientCalls(ctx)
 	ctx.Equal(len(calls), 1, "a healthy teacher must be called exactly once; Generate calls")
 	ctx.Assert(calls[0].HasDeadline(), "the Generate call carries no deadline: a hung teacher would hold the worker for the whole shard")
 	ctx.Assert(3500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 4500*time.Millisecond, "the deadline must be 4 s, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Generate", 3.0, config.Teacher)
-	clientExpect(ctx, clientGenerate(ctx, state, "p-2", "What is the capital of Peru?"), "accepted", "")
-	ctx.Equal(len(clientCalls(ctx)), 2, "a teacher that answers within the deadline is accepted on the first call; calls")
+	hClientExpect(ctx, hClientGenerate(ctx, state, "p-2", "What is the capital of Peru?"), "accepted", "")
+	ctx.Equal(len(hClientCalls(ctx)), 2, "a teacher that answers within the deadline is accepted on the first call; calls")
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	state := clientWorld(ctx, 100)
+	state := hClientWorld(ctx, 100)
 	ctx.GRPC.Fail("Generate", codes.Unavailable, "teacher restarting", 1, config.Teacher)
-	sample := clientGenerate(ctx, state, "p-1", "What is 2 + 2?")
-	clientExpect(ctx, sample, "accepted", "")
-	ctx.Assert(sample.Attempts == 2 && len(clientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", len(clientCalls(ctx)), sample)
+	sample := hClientGenerate(ctx, state, "p-1", "What is 2 + 2?")
+	hClientExpect(ctx, sample, "accepted", "")
+	ctx.Assert(sample.Attempts == 2 && len(hClientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", len(hClientCalls(ctx)), sample)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	ctx.GRPC.Fail("Generate", codes.Unavailable, "teacher down", 3, config.Teacher)
-	sample = clientGenerate(ctx, state, "p-2", "What is 3 + 3?")
-	clientExpect(ctx, sample, "rejected", "unavailable")
-	ctx.Equal(len(clientCalls(ctx)), 5, "a teacher that stays UNAVAILABLE gets maxAttempts = 3 calls, then the sample is rejected; calls so far")
+	sample = hClientGenerate(ctx, state, "p-2", "What is 3 + 3?")
+	hClientExpect(ctx, sample, "rejected", "unavailable")
+	ctx.Equal(len(hClientCalls(ctx)), 5, "a teacher that stays UNAVAILABLE gets maxAttempts = 3 calls, then the sample is rejected; calls so far")
 	ctx.Equal(sample.Attempts, 3, "Attempts")
-	ctx.Assert(clientCount(ctx, config.ProgressKey(clientJob), "rejected") == 1 && clientCount(ctx, config.ReasonsKey(clientJob), "unavailable") == 1, "the rejection is recorded once with reason unavailable: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)), ctx.Redis.HGetAll(config.ReasonsKey(clientJob)))
+	ctx.Assert(hClientCount(ctx, config.ProgressKey(kHClientJob), "rejected") == 1 && hClientCount(ctx, config.ReasonsKey(kHClientJob), "unavailable") == 1, "the rejection is recorded once with reason unavailable: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)), ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob)))
 	deadlines := []time.Duration{}
-	for _, call := range clientCalls(ctx) {
+	for _, call := range hClientCalls(ctx) {
 		deadlines = append(deadlines, call.Timeout)
 	}
-	for i, call := range clientCalls(ctx) {
+	for i, call := range hClientCalls(ctx) {
 		gap := call.Timeout - deadlines[0]
 		ctx.Assert(call.HasDeadline() && -10*time.Millisecond <= gap && gap <= 10*time.Millisecond, "attempt deadlines %v: call %d did not carry the full deadline, every attempt gets its own four seconds, not what is left of one deadline shared by the retries", deadlines, i+1)
 	}
 	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
-		before, rejected := len(clientCalls(ctx)), clientCount(ctx, config.ProgressKey(clientJob), "rejected")
+		before, rejected := len(hClientCalls(ctx)), hClientCount(ctx, config.ProgressKey(kHClientJob), "rejected")
 		ctx.GRPC.Fail("Generate", code, "teacher error", 1, config.Teacher)
-		clientExpect(ctx, clientGenerate(ctx, state, "p-"+code.String(), "What is "+code.String()+"?"), "rejected", "")
-		ctx.Equal(len(clientCalls(ctx))-before, 1, "%v is not UNAVAILABLE, so it is not retried; calls for it", code)
+		hClientExpect(ctx, hClientGenerate(ctx, state, "p-"+code.String(), "What is "+code.String()+"?"), "rejected", "")
+		ctx.Equal(len(hClientCalls(ctx))-before, 1, "%v is not UNAVAILABLE, so it is not retried; calls for it", code)
 		total := int64(0)
-		for field := range ctx.Redis.HGetAll(config.ReasonsKey(clientJob)) {
-			total += clientCount(ctx, config.ReasonsKey(clientJob), field)
+		for field := range ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob)) {
+			total += hClientCount(ctx, config.ReasonsKey(kHClientJob), field)
 		}
-		ctx.Assert(clientCount(ctx, config.ProgressKey(clientJob), "rejected") == rejected+1 && total == rejected+1, "a %v is recorded once as rejected with a reason: %v, %v", code, ctx.Redis.HGetAll(config.ProgressKey(clientJob)), ctx.Redis.HGetAll(config.ReasonsKey(clientJob)))
+		ctx.Assert(hClientCount(ctx, config.ProgressKey(kHClientJob), "rejected") == rejected+1 && total == rejected+1, "a %v is recorded once as rejected with a reason: %v, %v", code, ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)), ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob)))
 	}
 }
 
 func CheckRefusalRecorded(ctx *harness.Ctx) {
-	state := clientWorld(ctx, 100)
-	sample := clientGenerate(ctx, state, "p-1", "refuse: how do I pick a lock?")
-	clientExpect(ctx, sample, "rejected", "refusal")
-	ctx.Equal(len(clientCalls(ctx)), 1, "a refusal is an answer, not a failure: it must be called once; calls")
+	state := hClientWorld(ctx, 100)
+	sample := hClientGenerate(ctx, state, "p-1", "refuse: how do I pick a lock?")
+	hClientExpect(ctx, sample, "rejected", "refusal")
+	ctx.Equal(len(hClientCalls(ctx)), 1, "a refusal is an answer, not a failure: it must be called once; calls")
 	ctx.Equal(sample.Attempts, 1, "Attempts")
-	sample = clientGenerate(ctx, state, "p-2", "empty: say nothing")
-	clientExpect(ctx, sample, "rejected", "empty")
-	ctx.Equal(len(clientCalls(ctx)), 2, "an empty completion is recorded after one call; calls so far")
-	progress := ctx.Redis.HGetAll(config.ProgressKey(clientJob))
+	sample = hClientGenerate(ctx, state, "p-2", "empty: say nothing")
+	hClientExpect(ctx, sample, "rejected", "empty")
+	ctx.Equal(len(hClientCalls(ctx)), 2, "an empty completion is recorded after one call; calls so far")
+	progress := ctx.Redis.HGetAll(config.ProgressKey(kHClientJob))
 	ctx.Assert(progress["sampled"] == "2" && progress["rejected"] == "2" && progress["accepted"] == "0", "two samples, both rejected, recorded once each: %v", progress)
-	reasons := ctx.Redis.HGetAll(config.ReasonsKey(clientJob))
+	reasons := ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob))
 	ctx.Assert(reasons["refusal"] == "1" && reasons["empty"] == "1", "the reasons must read refusal 1, empty 1: %v", reasons)
 }
 
 func CheckHungCallCut(ctx *harness.Ctx) {
-	state := clientWorld(ctx, 100)
+	state := hClientWorld(ctx, 100)
 	ctx.GRPC.SetLatency("Generate", 5.0, config.Teacher)
 	started := ctx.Clock.Now()
-	sample := clientGenerate(ctx, state, "p-1", "Explain photosynthesis.")
+	sample := hClientGenerate(ctx, state, "p-1", "Explain photosynthesis.")
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	clientExpect(ctx, sample, "rejected", "deadline")
-	ctx.Equal(len(clientCalls(ctx)), 1, "a hung call is cut at the deadline and not retried; calls")
-	ctx.Equal(clientCalls(ctx)[0].Code, codes.DeadlineExceeded, "the call must end DEADLINE_EXCEEDED")
+	hClientExpect(ctx, sample, "rejected", "deadline")
+	ctx.Equal(len(hClientCalls(ctx)), 1, "a hung call is cut at the deadline and not retried; calls")
+	ctx.Equal(hClientCalls(ctx)[0].Code, codes.DeadlineExceeded, "the call must end DEADLINE_EXCEEDED")
 	ctx.Assert(waited <= 4.6, "the worker waited %.1f s on a teacher that hangs: the deadline must cut it at about 4 s", waited)
-	ctx.Assert(clientCount(ctx, config.ReasonsKey(clientJob), "deadline") == 1 && clientCount(ctx, config.ProgressKey(clientJob), "rejected") == 1, "the sample is recorded as rejected with reason deadline: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)), ctx.Redis.HGetAll(config.ReasonsKey(clientJob)))
+	ctx.Assert(hClientCount(ctx, config.ReasonsKey(kHClientJob), "deadline") == 1 && hClientCount(ctx, config.ProgressKey(kHClientJob), "rejected") == 1, "the sample is recorded as rejected with reason deadline: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)), ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob)))
 	ctx.GRPC.SetLatency("Generate", 0, config.Teacher)
-	clientExpect(ctx, clientGenerate(ctx, state, "p-2", "And respiration?"), "accepted", "")
+	hClientExpect(ctx, hClientGenerate(ctx, state, "p-2", "And respiration?"), "accepted", "")
 }
 
 func CheckBudgetBeforeCall(ctx *harness.Ctx) {
-	state := clientWorld(ctx, 1)
-	first := clientGenerate(ctx, state, "p-1", "What is the capital of France?")
-	clientExpect(ctx, first, "accepted", "")
+	state := hClientWorld(ctx, 1)
+	first := hClientGenerate(ctx, state, "p-1", "What is the capital of France?")
+	hClientExpect(ctx, first, "accepted", "")
 	sum := sha256.Sum256([]byte("What is the capital of France?"))
 	ctx.Equal(first.DedupeHash, hex.EncodeToString(sum[:]), "an accepted sample carries the reservation's DedupeHash (the prompt's SHA-256)")
-	ctx.Equal(len(clientCalls(ctx)), 1, "calls after one sample")
-	second := clientGenerate(ctx, state, "p-2", "What is the capital of Peru?")
-	clientExpect(ctx, second, "rejected", "budget")
-	ctx.Equal(len(clientCalls(ctx)), 1, "with the budget spent the worker must not call the teacher; calls")
-	clientExpect(ctx, clientGenerate(ctx, state, "p-3", "What is the capital of France?"), "duplicate", "")
-	ctx.Equal(len(clientCalls(ctx)), 1, "a duplicate prompt must not call the teacher; calls")
-	sampled, accepted, rejected := clientCount(ctx, config.ProgressKey(clientJob), "sampled"), clientCount(ctx, config.ProgressKey(clientJob), "accepted"), clientCount(ctx, config.ProgressKey(clientJob), "rejected")
-	ctx.Assert(sampled == 2 && sampled == accepted+rejected, "after a run sampled must equal accepted + rejected: %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)))
-	ctx.Assert(clientCount(ctx, config.ProgressKey(clientJob), "duplicate") == 1 && clientCount(ctx, config.ReasonsKey(clientJob), "budget") == 1, "the duplicate and the budget refusal are counted: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(clientJob)), ctx.Redis.HGetAll(config.ReasonsKey(clientJob)))
+	ctx.Equal(len(hClientCalls(ctx)), 1, "calls after one sample")
+	second := hClientGenerate(ctx, state, "p-2", "What is the capital of Peru?")
+	hClientExpect(ctx, second, "rejected", "budget")
+	ctx.Equal(len(hClientCalls(ctx)), 1, "with the budget spent the worker must not call the teacher; calls")
+	hClientExpect(ctx, hClientGenerate(ctx, state, "p-3", "What is the capital of France?"), "duplicate", "")
+	ctx.Equal(len(hClientCalls(ctx)), 1, "a duplicate prompt must not call the teacher; calls")
+	sampled, accepted, rejected := hClientCount(ctx, config.ProgressKey(kHClientJob), "sampled"), hClientCount(ctx, config.ProgressKey(kHClientJob), "accepted"), hClientCount(ctx, config.ProgressKey(kHClientJob), "rejected")
+	ctx.Assert(sampled == 2 && sampled == accepted+rejected, "after a run sampled must equal accepted + rejected: %v", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)))
+	ctx.Assert(hClientCount(ctx, config.ProgressKey(kHClientJob), "duplicate") == 1 && hClientCount(ctx, config.ReasonsKey(kHClientJob), "budget") == 1, "the duplicate and the budget refusal are counted: %v, %v", ctx.Redis.HGetAll(config.ProgressKey(kHClientJob)), ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob)))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1291,10 +1291,10 @@ func CheckBudgetBeforeCall(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "j1";
+const std::string kHJob = "j1";
 
 // The stand-in teacher: answers from distill/teacher.h.
-class TeacherPeer final : public distill::Teacher::Service {
+class HTeacherPeer final : public distill::Teacher::Service {
  public:
   grpc::Status Generate(grpc::ServerContext*, const distill::GenerateRequest* req, distill::GenerateReply* reply) override {
     const auto completion = teacher::complete(req->prompt());
@@ -1306,9 +1306,9 @@ class TeacherPeer final : public distill::Teacher::Service {
 };
 
 // Stands in for the step-2 job state over the harness's Redis.
-class ClientState final : public JobState {
+class HClientState final : public JobState {
  public:
-  explicit ClientState(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HClientState(harness::Ctx& ctx) : ctx_(ctx) {}
 
   Reservation reserve(const std::string& job_id, const std::string& prompt) override {
     const std::string hash = sha256_hex(prompt);
@@ -1343,29 +1343,29 @@ class ClientState final : public JobState {
   harness::Ctx& ctx_;
 };
 
-struct World {
-  TeacherPeer peer;
-  ClientState state;
-  explicit World(harness::Ctx& ctx) : state(ctx) {}
+struct HWorld {
+  HTeacherPeer peer;
+  HClientState state;
+  explicit HWorld(harness::Ctx& ctx) : state(ctx) {}
 };
 
-World& clientWorld(harness::Ctx& ctx, int cap) {
-  static World* world = nullptr;
+HWorld& hClientWorld(harness::Ctx& ctx, int cap) {
+  static HWorld* world = nullptr;
   delete world;
-  world = new World(ctx);
+  world = new HWorld(ctx);
   ctx.GRPC.Server(config::kTeacher)->RegisterService(&world->peer);
-  ctx.Redis.Set(config::budget_key(kJob), static_cast<long long>(cap) * config::kTokensPerCall);
-  ctx.Redis.Do("HSET", config::progress_key(kJob), "sampled", 0, "accepted", 0, "rejected", 0, "duplicate", 0);
+  ctx.Redis.Set(config::budget_key(kHJob), static_cast<long long>(cap) * config::kTokensPerCall);
+  ctx.Redis.Do("HSET", config::progress_key(kHJob), "sampled", 0, "accepted", 0, "rejected", 0, "duplicate", 0);
   return *world;
 }
 
-long long clientCount(harness::Ctx& ctx, const std::string& key, const std::string& field) {
+long long hClientCount(harness::Ctx& ctx, const std::string& key, const std::string& field) {
   const auto all = ctx.Redis.HGetAll(key);
   const auto it = all.find(field);
   return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
 }
 
-void clientExpect(harness::Ctx& ctx, const Sample& sample, const std::string& status, const std::string& reason = "") {
+void hClientExpect(harness::Ctx& ctx, const Sample& sample, const std::string& status, const std::string& reason = "") {
   ctx.Equal(sample.status, status, "the sample's status (reason %q, attempts %d)", sample.reason, sample.attempts);
   if (!reason.empty()) ctx.Equal(sample.reason, reason, "the sample's reason");
 }
@@ -1373,9 +1373,9 @@ void clientExpect(harness::Ctx& ctx, const Sample& sample, const std::string& st
 }  // namespace
 
 void CheckAttemptDeadline(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx, 100);
-  const Sample sample = generate(w.state, kJob, "p-1", "What is the capital of France?");
-  clientExpect(ctx, sample, "accepted");
+  auto& w = hClientWorld(ctx, 100);
+  const Sample sample = generate(w.state, kHJob, "p-1", "What is the capital of France?");
+  hClientExpect(ctx, sample, "accepted");
   ctx.Equal(sample.text, "Teacher answer: What is the capital of France?", "an accepted sample carries the reply's text");
   ctx.Equal(sample.teacher_version, teacher::kVersion, "an accepted sample carries teacher_version");
   ctx.Equal(sample.attempts, 1, "a healthy teacher is called once; attempts");
@@ -1384,23 +1384,23 @@ void CheckAttemptDeadline(harness::Ctx& ctx) {
   ctx.Assert(calls[0].HasDeadline(), "the Generate call carries no deadline: a hung teacher would hold the worker for the whole shard");
   ctx.Assert(3.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 4.5, "the deadline must be 4 s, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Generate", 3.0, config::kTeacher);
-  clientExpect(ctx, generate(w.state, kJob, "p-2", "What is the capital of Peru?"), "accepted");
+  hClientExpect(ctx, generate(w.state, kHJob, "p-2", "What is the capital of Peru?"), "accepted");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 2, "a teacher that answers within the deadline is accepted on the first call; calls");
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx, 100);
+  auto& w = hClientWorld(ctx, 100);
   ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "teacher restarting", 1, config::kTeacher);
-  Sample sample = generate(w.state, kJob, "p-1", "What is 2 + 2?");
-  clientExpect(ctx, sample, "accepted");
+  Sample sample = generate(w.state, kHJob, "p-1", "What is 2 + 2?");
+  hClientExpect(ctx, sample, "accepted");
   ctx.Assert(sample.attempts == 2 && ctx.GRPC.CallsTo("Generate").size() == 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and attempts %d", ctx.GRPC.CallsTo("Generate").size(), sample.attempts);
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "teacher down", 3, config::kTeacher);
-  sample = generate(w.state, kJob, "p-2", "What is 3 + 3?");
-  clientExpect(ctx, sample, "rejected", "unavailable");
+  sample = generate(w.state, kHJob, "p-2", "What is 3 + 3?");
+  hClientExpect(ctx, sample, "rejected", "unavailable");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 5, "a teacher that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then the sample is rejected; calls so far");
   ctx.Equal(sample.attempts, 3, "attempts");
-  ctx.Assert(clientCount(ctx, config::progress_key(kJob), "rejected") == 1 && clientCount(ctx, config::reasons_key(kJob), "unavailable") == 1, "the rejection is recorded once with reason unavailable: %v, %v", ctx.Redis.HGetAll(config::progress_key(kJob)), ctx.Redis.HGetAll(config::reasons_key(kJob)));
+  ctx.Assert(hClientCount(ctx, config::progress_key(kHJob), "rejected") == 1 && hClientCount(ctx, config::reasons_key(kHJob), "unavailable") == 1, "the rejection is recorded once with reason unavailable: %v, %v", ctx.Redis.HGetAll(config::progress_key(kHJob)), ctx.Redis.HGetAll(config::reasons_key(kHJob)));
   const auto all = ctx.GRPC.CallsTo("Generate");
   std::string deadlines;
   for (const auto& call : all) deadlines += (deadlines.empty() ? "" : " ") + std::to_string(call.TimeoutSeconds());
@@ -1409,61 +1409,61 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   }
   for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
     const size_t before = ctx.GRPC.CallsTo("Generate").size();
-    const long long rejected = clientCount(ctx, config::progress_key(kJob), "rejected");
+    const long long rejected = hClientCount(ctx, config::progress_key(kHJob), "rejected");
     ctx.GRPC.Fail("Generate", code, "teacher error", 1, config::kTeacher);
-    clientExpect(ctx, generate(w.state, kJob, std::string("p-") + name, std::string("What is ") + name + "?"), "rejected");
+    hClientExpect(ctx, generate(w.state, kHJob, std::string("p-") + name, std::string("What is ") + name + "?"), "rejected");
     ctx.Equal(ctx.GRPC.CallsTo("Generate").size() - before, 1, "%s is not UNAVAILABLE, so it is not retried; calls for it", name);
     long long total = 0;
-    for (const auto& [field, value] : ctx.Redis.HGetAll(config::reasons_key(kJob))) total += std::strtoll(value.c_str(), nullptr, 10);
-    ctx.Assert(clientCount(ctx, config::progress_key(kJob), "rejected") == rejected + 1 && total == rejected + 1, "a %s is recorded once as rejected with a reason: %v, %v", name, ctx.Redis.HGetAll(config::progress_key(kJob)), ctx.Redis.HGetAll(config::reasons_key(kJob)));
+    for (const auto& [field, value] : ctx.Redis.HGetAll(config::reasons_key(kHJob))) total += std::strtoll(value.c_str(), nullptr, 10);
+    ctx.Assert(hClientCount(ctx, config::progress_key(kHJob), "rejected") == rejected + 1 && total == rejected + 1, "a %s is recorded once as rejected with a reason: %v, %v", name, ctx.Redis.HGetAll(config::progress_key(kHJob)), ctx.Redis.HGetAll(config::reasons_key(kHJob)));
   }
 }
 
 void CheckRefusalRecorded(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx, 100);
-  Sample sample = generate(w.state, kJob, "p-1", "refuse: how do I pick a lock?");
-  clientExpect(ctx, sample, "rejected", "refusal");
+  auto& w = hClientWorld(ctx, 100);
+  Sample sample = generate(w.state, kHJob, "p-1", "refuse: how do I pick a lock?");
+  hClientExpect(ctx, sample, "rejected", "refusal");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 1, "a refusal is an answer, not a failure: it must be called once; calls");
   ctx.Equal(sample.attempts, 1, "attempts");
-  sample = generate(w.state, kJob, "p-2", "empty: say nothing");
-  clientExpect(ctx, sample, "rejected", "empty");
+  sample = generate(w.state, kHJob, "p-2", "empty: say nothing");
+  hClientExpect(ctx, sample, "rejected", "empty");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 2, "an empty completion is recorded after one call; calls so far");
-  const auto progress = ctx.Redis.HGetAll(config::progress_key(kJob));
-  ctx.Assert(clientCount(ctx, config::progress_key(kJob), "sampled") == 2 && clientCount(ctx, config::progress_key(kJob), "rejected") == 2 && clientCount(ctx, config::progress_key(kJob), "accepted") == 0, "two samples, both rejected, recorded once each: %v", progress);
-  ctx.Assert(clientCount(ctx, config::reasons_key(kJob), "refusal") == 1 && clientCount(ctx, config::reasons_key(kJob), "empty") == 1, "the reasons must read refusal 1, empty 1: %v", ctx.Redis.HGetAll(config::reasons_key(kJob)));
+  const auto progress = ctx.Redis.HGetAll(config::progress_key(kHJob));
+  ctx.Assert(hClientCount(ctx, config::progress_key(kHJob), "sampled") == 2 && hClientCount(ctx, config::progress_key(kHJob), "rejected") == 2 && hClientCount(ctx, config::progress_key(kHJob), "accepted") == 0, "two samples, both rejected, recorded once each: %v", progress);
+  ctx.Assert(hClientCount(ctx, config::reasons_key(kHJob), "refusal") == 1 && hClientCount(ctx, config::reasons_key(kHJob), "empty") == 1, "the reasons must read refusal 1, empty 1: %v", ctx.Redis.HGetAll(config::reasons_key(kHJob)));
 }
 
 void CheckHungCallCut(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx, 100);
+  auto& w = hClientWorld(ctx, 100);
   ctx.GRPC.SetLatency("Generate", 5.0, config::kTeacher);
   const int64_t started = ctx.Clock.Now();
-  const Sample sample = generate(w.state, kJob, "p-1", "Explain photosynthesis.");
+  const Sample sample = generate(w.state, kHJob, "p-1", "Explain photosynthesis.");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  clientExpect(ctx, sample, "rejected", "deadline");
+  hClientExpect(ctx, sample, "rejected", "deadline");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 1, "a hung call is cut at the deadline and not retried; calls");
   ctx.Equal(ctx.GRPC.CallsTo("Generate")[0].Code, grpc::StatusCode::DEADLINE_EXCEEDED, "the call must end DEADLINE_EXCEEDED");
   ctx.Assert(waited <= 4.6, "the worker waited %.1f s on a teacher that hangs: the deadline must cut it at about 4 s", waited);
-  ctx.Assert(clientCount(ctx, config::reasons_key(kJob), "deadline") == 1 && clientCount(ctx, config::progress_key(kJob), "rejected") == 1, "the sample is recorded as rejected with reason deadline: %v, %v", ctx.Redis.HGetAll(config::progress_key(kJob)), ctx.Redis.HGetAll(config::reasons_key(kJob)));
+  ctx.Assert(hClientCount(ctx, config::reasons_key(kHJob), "deadline") == 1 && hClientCount(ctx, config::progress_key(kHJob), "rejected") == 1, "the sample is recorded as rejected with reason deadline: %v, %v", ctx.Redis.HGetAll(config::progress_key(kHJob)), ctx.Redis.HGetAll(config::reasons_key(kHJob)));
   ctx.GRPC.SetLatency("Generate", 0, config::kTeacher);
-  clientExpect(ctx, generate(w.state, kJob, "p-2", "And respiration?"), "accepted");
+  hClientExpect(ctx, generate(w.state, kHJob, "p-2", "And respiration?"), "accepted");
 }
 
 void CheckBudgetBeforeCall(harness::Ctx& ctx) {
-  auto& w = clientWorld(ctx, 1);
-  const Sample first = generate(w.state, kJob, "p-1", "What is the capital of France?");
-  clientExpect(ctx, first, "accepted");
+  auto& w = hClientWorld(ctx, 1);
+  const Sample first = generate(w.state, kHJob, "p-1", "What is the capital of France?");
+  hClientExpect(ctx, first, "accepted");
   ctx.Equal(first.dedupe_hash, sha256_hex("What is the capital of France?"), "an accepted sample carries the reservation's dedupe_hash (the prompt's SHA-256)");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 1, "calls after one sample");
-  const Sample second = generate(w.state, kJob, "p-2", "What is the capital of Peru?");
-  clientExpect(ctx, second, "rejected", "budget");
+  const Sample second = generate(w.state, kHJob, "p-2", "What is the capital of Peru?");
+  hClientExpect(ctx, second, "rejected", "budget");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 1, "with the budget spent the worker must not call the teacher; calls");
-  clientExpect(ctx, generate(w.state, kJob, "p-3", "What is the capital of France?"), "duplicate");
+  hClientExpect(ctx, generate(w.state, kHJob, "p-3", "What is the capital of France?"), "duplicate");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 1, "a duplicate prompt must not call the teacher; calls");
-  const long long sampled = clientCount(ctx, config::progress_key(kJob), "sampled");
-  const long long accepted = clientCount(ctx, config::progress_key(kJob), "accepted");
-  const long long rejected = clientCount(ctx, config::progress_key(kJob), "rejected");
-  ctx.Assert(sampled == 2 && sampled == accepted + rejected, "after a run sampled must equal accepted + rejected: %v", ctx.Redis.HGetAll(config::progress_key(kJob)));
-  ctx.Assert(clientCount(ctx, config::progress_key(kJob), "duplicate") == 1 && clientCount(ctx, config::reasons_key(kJob), "budget") == 1, "the duplicate and the budget refusal are counted: %v, %v", ctx.Redis.HGetAll(config::progress_key(kJob)), ctx.Redis.HGetAll(config::reasons_key(kJob)));
+  const long long sampled = hClientCount(ctx, config::progress_key(kHJob), "sampled");
+  const long long accepted = hClientCount(ctx, config::progress_key(kHJob), "accepted");
+  const long long rejected = hClientCount(ctx, config::progress_key(kHJob), "rejected");
+  ctx.Assert(sampled == 2 && sampled == accepted + rejected, "after a run sampled must equal accepted + rejected: %v", ctx.Redis.HGetAll(config::progress_key(kHJob)));
+  ctx.Assert(hClientCount(ctx, config::progress_key(kHJob), "duplicate") == 1 && hClientCount(ctx, config::reasons_key(kHJob), "budget") == 1, "the duplicate and the budget refusal are counted: %v, %v", ctx.Redis.HGetAll(config::progress_key(kHJob)), ctx.Redis.HGetAll(config::reasons_key(kHJob)));
 }
 `,
   },

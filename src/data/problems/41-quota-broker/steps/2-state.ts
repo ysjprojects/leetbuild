@@ -787,12 +787,12 @@ import (
 )
 
 const (
-	stateW1 = "2026-11-02T14:00Z"
-	stateW2 = "2026-11-02T15:00Z"
-	stateW3 = "2026-11-02T16:00Z"
+	kHStateW1 = "2026-11-02T14:00Z"
+	kHStateW2 = "2026-11-02T15:00Z"
+	kHStateW3 = "2026-11-02T16:00Z"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
 func hashReserved(ctx *harness.Ctx, key string) int64 {
 	raw, _ := ctx.Redis.HGet(key, "reserved")
@@ -801,7 +801,7 @@ func hashReserved(ctx *harness.Ctx, key string) int64 {
 }
 
 // ledgerReserved is the units reserved over every hash the code keeps for team research.
-func ledgerReserved(ctx *harness.Ctx) int64 {
+func hLedgerReserved(ctx *harness.Ctx) int64 {
 	var total int64
 	for _, key := range ctx.Redis.Keys("quota:research*") {
 		if ctx.Redis.Type(key) == "hash" {
@@ -811,40 +811,40 @@ func ledgerReserved(ctx *harness.Ctx) int64 {
 	return total
 }
 
-func mustReserve(ctx *harness.Ctx, window, class string, amount int64) string {
-	id, err := reserve(stateBg, "research", window, class, amount, "")
+func hMustReserve(ctx *harness.Ctx, window, class string, amount int64) string {
+	id, err := reserve(hStateBg, "research", window, class, amount, "")
 	ctx.NoError(err, "reserve(research, %s, %s, %d) failed", window, class, amount)
 	return id
 }
 
-func mustRelease(ctx *harness.Ctx, id string) bool {
-	released, err := release(stateBg, "research", id)
+func hMustRelease(ctx *harness.Ctx, id string) bool {
+	released, err := release(hStateBg, "research", id)
 	ctx.NoError(err, "release(research, %s) failed", id)
 	return released
 }
 
 func CheckWindowKey(ctx *harness.Ctx) {
-	first := mustReserve(ctx, stateW1, "gpu-a100", 6)
+	first := hMustReserve(ctx, kHStateW1, "gpu-a100", 6)
 	ctx.Assert(first != "", "a reserve of 6 of research's 8 units in an empty window was refused")
-	second := mustReserve(ctx, stateW2, "gpu-a100", 6)
-	ctx.Assert(second != "", "a reserve of 6 units in the next window (%s) was refused: the 14:00 jobs spent the 15:00 quota (keys: %q). Keep one hash per window", stateW2, ctx.Redis.Keys("quota:research*"))
-	ctx.Assert(hashReserved(ctx, "quota:research:"+stateW1) == 6 && hashReserved(ctx, "quota:research:"+stateW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"))
-	ctx.Equal(mustRelease(ctx, first), true, "releasing the 14:00 reservation; released")
-	ctx.Assert(hashReserved(ctx, "quota:research:"+stateW1) == 0 && hashReserved(ctx, "quota:research:"+stateW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hashReserved(ctx, "quota:research:"+stateW1), hashReserved(ctx, "quota:research:"+stateW2))
+	second := hMustReserve(ctx, kHStateW2, "gpu-a100", 6)
+	ctx.Assert(second != "", "a reserve of 6 units in the next window (%s) was refused: the 14:00 jobs spent the 15:00 quota (keys: %q). Keep one hash per window", kHStateW2, ctx.Redis.Keys("quota:research*"))
+	ctx.Assert(hashReserved(ctx, "quota:research:"+kHStateW1) == 6 && hashReserved(ctx, "quota:research:"+kHStateW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"))
+	ctx.Equal(hMustRelease(ctx, first), true, "releasing the 14:00 reservation; released")
+	ctx.Assert(hashReserved(ctx, "quota:research:"+kHStateW1) == 0 && hashReserved(ctx, "quota:research:"+kHStateW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hashReserved(ctx, "quota:research:"+kHStateW1), hashReserved(ctx, "quota:research:"+kHStateW2))
 }
 
 func CheckAtomicTake(ctx *harness.Ctx) {
 	// A second broker reserves 6 units right after this reserve's first command on research's hash.
 	var probes []func() (bool, any, error)
-	for _, key := range []string{"quota:research:" + stateW1, "quota:research"} {
+	for _, key := range []string{"quota:research:" + kHStateW1, "quota:research"} {
 		p := ctx.Redis.After(key, func() any {
-			id, err := reserve(stateBg, "research", stateW1, "gpu-h100", 6, "")
+			id, err := reserve(hStateBg, "research", kHStateW1, "gpu-h100", 6, "")
 			ctx.NoError(err, "the rival reserve failed")
 			return id
 		})
 		probes = append(probes, func() (bool, any, error) { return p.Fired, p.Result, p.Err })
 	}
-	mine := mustReserve(ctx, stateW1, "gpu-a100", 6)
+	mine := hMustReserve(ctx, kHStateW1, "gpu-a100", 6)
 	var theirs string
 	fired := false
 	for _, probe := range probes {
@@ -862,55 +862,55 @@ func CheckAtomicTake(ctx *harness.Ctx) {
 			granted++
 		}
 	}
-	total := ledgerReserved(ctx)
+	total := hLedgerReserved(ctx)
 	ctx.Assert(granted == 1 && total == 6, "two overlapping reserves of 6 against research's 8 units: %d granted and the ledger holds reserved %d. The read, the comparison and the increment must run as one script", granted, total)
 	// The comparison: reserved + consumed + amount against ledger.LimitOf(team), an exact fill allowed.
-	ctx.Assert(mustReserve(ctx, stateW1, "gpu-a100", 2) != "", "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits")
-	ctx.Assert(mustReserve(ctx, stateW1, "gpu-a100", 1) == "", "with all 8 of research's units reserved a reserve of 1 more was granted")
-	ctx.Redis.Do("HSET", "quota:research:"+stateW2, "limit", 8, "reserved", 0, "consumed", 5)
-	ctx.Assert(mustReserve(ctx, stateW2, "gpu-a100", 4) == "", "with 5 of research's 8 units consumed in %s a reserve of 4 was granted: consumed units count against the limit too", stateW2)
-	ctx.Assert(mustReserve(ctx, stateW2, "gpu-a100", 3) != "", "with 5 of research's 8 units consumed in %s a reserve of the last 3 was refused", stateW2)
+	ctx.Assert(hMustReserve(ctx, kHStateW1, "gpu-a100", 2) != "", "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits")
+	ctx.Assert(hMustReserve(ctx, kHStateW1, "gpu-a100", 1) == "", "with all 8 of research's units reserved a reserve of 1 more was granted")
+	ctx.Redis.Do("HSET", "quota:research:"+kHStateW2, "limit", 8, "reserved", 0, "consumed", 5)
+	ctx.Assert(hMustReserve(ctx, kHStateW2, "gpu-a100", 4) == "", "with 5 of research's 8 units consumed in %s a reserve of 4 was granted: consumed units count against the limit too", kHStateW2)
+	ctx.Assert(hMustReserve(ctx, kHStateW2, "gpu-a100", 3) != "", "with 5 of research's 8 units consumed in %s a reserve of the last 3 was refused", kHStateW2)
 	ctx.Redis.Do("HSET", "quota:limits", "research", 12)
-	ctx.Assert(mustReserve(ctx, stateW3, "gpu-a100", 10) != "", "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is ledger.LimitOf(team)")
+	ctx.Assert(hMustReserve(ctx, kHStateW3, "gpu-a100", 10) != "", "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is ledger.LimitOf(team)")
 	records := ctx.Redis.Keys("reservation:research:*")
 	ctx.Equal(len(records), 4, "4 reserves were granted, and a refused reserve must record nothing; the reservations in Redis")
 }
 
 func CheckExpireWindow(ctx *harness.Ctx) {
 	seen := map[string]int64{}
-	probe := ctx.Redis.After("quota:research:"+stateW1, func() any {
+	probe := ctx.Redis.After("quota:research:"+kHStateW1, func() any {
 		for _, key := range append(ctx.Redis.Keys("quota:research*"), ctx.Redis.Keys("reservation:research:*")...) {
 			seen[key] = ctx.Redis.TTL(key)
 		}
 		return nil
 	})
-	ctx.Assert(mustReserve(ctx, stateW1, "gpu-a100", 2) != "", "a reserve of 2 units was refused")
+	ctx.Assert(hMustReserve(ctx, kHStateW1, "gpu-a100", 2) != "", "a reserve of 2 units was refused")
 	keys := append(ctx.Redis.Keys("quota:research*"), ctx.Redis.Keys("reservation:research:*")...)
 	ctx.Equal(len(keys), 2, "a reserve must leave the window hash and the reservation (Redis holds %q); the keys", keys)
 	for _, key := range keys {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 3600 && ttl <= 86400, "%s has TTL %d: the window hash and the reservation must expire after a day (86400 s), or Redis keeps every window the broker ever served", key, ttl)
 	}
-	ctx.Assert(probe.Fired, "the reserve never touched quota:research:%s", stateW1)
+	ctx.Assert(probe.Fired, "the reserve never touched quota:research:%s", kHStateW1)
 	for key, ttl := range seen {
-		ctx.Assert(ttl >= 3600 && ttl <= 86400, "right after the reserve's first command on quota:research:%s, %s had TTL %d: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires", stateW1, key, ttl)
+		ctx.Assert(ttl >= 3600 && ttl <= 86400, "right after the reserve's first command on quota:research:%s, %s had TTL %d: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires", kHStateW1, key, ttl)
 	}
 }
 
 func CheckReleaseOnce(ctx *harness.Ctx) {
-	id := mustReserve(ctx, stateW1, "gpu-a100", 4)
+	id := hMustReserve(ctx, kHStateW1, "gpu-a100", 4)
 	ctx.Assert(id != "", "a reserve of 4 units was refused")
 	// The scheduler's retry releases the same reservation while this release is running.
 	rival := ctx.Redis.After("reservation:research:"+id, func() any {
-		released, err := release(stateBg, "research", id)
+		released, err := release(hStateBg, "research", id)
 		ctx.NoError(err, "the rival release failed")
 		return released
 	})
-	mine := mustRelease(ctx, id)
+	mine := hMustRelease(ctx, id)
 	ctx.Assert(rival.Fired, "the release never touched reservation:research:%s", id)
 	ctx.Assert(rival.Err == nil, "the rival release failed: %v", rival.Err)
 	theirs, _ := rival.Result.(bool)
-	total := ledgerReserved(ctx)
+	total := hLedgerReserved(ctx)
 	ctx.Equal(total, int64(0), "two overlapping releases of one 4-unit reservation refunded it twice (read, refund and delete in one script); reserved")
 	refunds := 0
 	for _, released := range []bool{mine, theirs} {
@@ -919,7 +919,7 @@ func CheckReleaseOnce(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(refunds, 1, "two releases of one reservation reported %t and %t: exactly one may refund; the refunds", mine, theirs)
-	ctx.Equal(mustRelease(ctx, id), false, "a release of a reservation that is gone; released")
+	ctx.Equal(hMustRelease(ctx, id), false, "a release of a reservation that is gone; released")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -932,9 +932,9 @@ func CheckReleaseOnce(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kW1 = "2026-11-02T14:00Z";
-const std::string kW2 = "2026-11-02T15:00Z";
-const std::string kW3 = "2026-11-02T16:00Z";
+const std::string kHW1 = "2026-11-02T14:00Z";
+const std::string kHW2 = "2026-11-02T15:00Z";
+const std::string kHW3 = "2026-11-02T16:00Z";
 
 long long hashReserved(harness::Ctx& ctx, const std::string& key) {
   const auto raw = ctx.Redis.HGet(key, "reserved");
@@ -942,7 +942,7 @@ long long hashReserved(harness::Ctx& ctx, const std::string& key) {
 }
 
 // The units reserved over every hash the code keeps for team research.
-long long ledgerReserved(harness::Ctx& ctx) {
+long long hLedgerReserved(harness::Ctx& ctx) {
   long long total = 0;
   for (const auto& key : ctx.Redis.Keys("quota:research*")) {
     if (ctx.Redis.Type(key) == "hash") total += hashReserved(ctx, key);
@@ -951,19 +951,19 @@ long long ledgerReserved(harness::Ctx& ctx) {
 }
 
 // A probe's outcome: whether it fired, what the parallel call returned, what it threw.
-struct Rival {
+struct HRival {
   bool fired = false;
   std::optional<std::string> reserved;
   bool released = false;
   std::optional<std::string> err;
 };
 
-std::shared_ptr<Rival> rivalReserve(harness::Ctx& ctx, const std::string& key) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRivalReserve(harness::Ctx& ctx, const std::string& key) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out] {
     out->fired = true;
     try {
-      out->reserved = reserve("research", kW1, "gpu-h100", 6);
+      out->reserved = reserve("research", kHW1, "gpu-h100", 6);
     } catch (const std::exception& e) {
       out->err = e.what();
     }
@@ -974,20 +974,20 @@ std::shared_ptr<Rival> rivalReserve(harness::Ctx& ctx, const std::string& key) {
 }  // namespace
 
 void CheckWindowKey(harness::Ctx& ctx) {
-  const auto first = reserve("research", kW1, "gpu-a100", 6);
+  const auto first = reserve("research", kHW1, "gpu-a100", 6);
   ctx.Assert(first.has_value(), "a reserve of 6 of research's 8 units in an empty window was refused");
-  const auto second = reserve("research", kW2, "gpu-a100", 6);
-  ctx.Assert(second.has_value(), "a reserve of 6 units in the next window (%s) was refused: the 14:00 jobs spent the 15:00 quota (keys: %q). Keep one hash per window", kW2, ctx.Redis.Keys("quota:research*"));
-  ctx.Assert(hashReserved(ctx, "quota:research:" + kW1) == 6 && hashReserved(ctx, "quota:research:" + kW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"));
+  const auto second = reserve("research", kHW2, "gpu-a100", 6);
+  ctx.Assert(second.has_value(), "a reserve of 6 units in the next window (%s) was refused: the 14:00 jobs spent the 15:00 quota (keys: %q). Keep one hash per window", kHW2, ctx.Redis.Keys("quota:research*"));
+  ctx.Assert(hashReserved(ctx, "quota:research:" + kHW1) == 6 && hashReserved(ctx, "quota:research:" + kHW2) == 6, "each window's hash must hold reserved 6, Redis holds %q", ctx.Redis.Keys("quota:research*"));
   ctx.Equal(release("research", *first), true, "releasing the 14:00 reservation; released");
-  ctx.Assert(hashReserved(ctx, "quota:research:" + kW1) == 0 && hashReserved(ctx, "quota:research:" + kW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hashReserved(ctx, "quota:research:" + kW1), hashReserved(ctx, "quota:research:" + kW2));
+  ctx.Assert(hashReserved(ctx, "quota:research:" + kHW1) == 0 && hashReserved(ctx, "quota:research:" + kHW2) == 6, "the release must refund the window its reservation recorded: 14:00 holds %d, 15:00 holds %d", hashReserved(ctx, "quota:research:" + kHW1), hashReserved(ctx, "quota:research:" + kHW2));
 }
 
 void CheckAtomicTake(harness::Ctx& ctx) {
   // A second broker reserves 6 units right after this reserve's first command on research's hash.
-  const std::vector<std::shared_ptr<Rival>> probes = {rivalReserve(ctx, "quota:research:" + kW1), rivalReserve(ctx, "quota:research")};
-  const auto mine = reserve("research", kW1, "gpu-a100", 6);
-  std::shared_ptr<Rival> fired;
+  const std::vector<std::shared_ptr<HRival>> probes = {hRivalReserve(ctx, "quota:research:" + kHW1), hRivalReserve(ctx, "quota:research")};
+  const auto mine = reserve("research", kHW1, "gpu-a100", 6);
+  std::shared_ptr<HRival> fired;
   for (const auto& p : probes) {
     if (p->fired) {
       fired = p;
@@ -997,29 +997,29 @@ void CheckAtomicTake(harness::Ctx& ctx) {
   ctx.Assert(fired != nullptr, "the reserve never touched research's window hash");
   ctx.Assert(!fired->err, "the rival reserve failed: %s", fired->err.value_or(""));
   const int granted = (mine ? 1 : 0) + (fired->reserved ? 1 : 0);
-  const long long total = ledgerReserved(ctx);
+  const long long total = hLedgerReserved(ctx);
   ctx.Assert(granted == 1 && total == 6, "two overlapping reserves of 6 against research's 8 units: %d granted and the ledger holds reserved %d. The read, the comparison and the increment must run as one script", granted, total);
   // The comparison: reserved + consumed + amount against ledger::limitOf(team), an exact fill allowed.
-  ctx.Assert(reserve("research", kW1, "gpu-a100", 2).has_value(), "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits");
-  ctx.Assert(!reserve("research", kW1, "gpu-a100", 1).has_value(), "with all 8 of research's units reserved a reserve of 1 more was granted");
-  ctx.Redis.Do("HSET", "quota:research:" + kW2, "limit", "8", "reserved", "0", "consumed", "5");
-  ctx.Assert(!reserve("research", kW2, "gpu-a100", 4).has_value(), "with 5 of research's 8 units consumed in %s a reserve of 4 was granted: consumed units count against the limit too", kW2);
-  ctx.Assert(reserve("research", kW2, "gpu-a100", 3).has_value(), "with 5 of research's 8 units consumed in %s a reserve of the last 3 was refused", kW2);
+  ctx.Assert(reserve("research", kHW1, "gpu-a100", 2).has_value(), "with 6 of research's 8 units reserved a reserve of the last 2 was refused: a reserve that fills the window exactly fits");
+  ctx.Assert(!reserve("research", kHW1, "gpu-a100", 1).has_value(), "with all 8 of research's units reserved a reserve of 1 more was granted");
+  ctx.Redis.Do("HSET", "quota:research:" + kHW2, "limit", "8", "reserved", "0", "consumed", "5");
+  ctx.Assert(!reserve("research", kHW2, "gpu-a100", 4).has_value(), "with 5 of research's 8 units consumed in %s a reserve of 4 was granted: consumed units count against the limit too", kHW2);
+  ctx.Assert(reserve("research", kHW2, "gpu-a100", 3).has_value(), "with 5 of research's 8 units consumed in %s a reserve of the last 3 was refused", kHW2);
   ctx.Redis.Do("HSET", "quota:limits", "research", "12");
-  ctx.Assert(reserve("research", kW3, "gpu-a100", 10).has_value(), "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is ledger::limitOf(team)");
+  ctx.Assert(reserve("research", kHW3, "gpu-a100", 10).has_value(), "with research's limit raised to 12 in quota:limits a reserve of 10 was refused: the limit is ledger::limitOf(team)");
   ctx.Equal(ctx.Redis.Keys("reservation:research:*").size(), 4, "4 reserves were granted, and a refused reserve must record nothing; the reservations in Redis");
 }
 
 void CheckExpireWindow(harness::Ctx& ctx) {
   auto seen = std::make_shared<std::map<std::string, long long>>();
   auto fired = std::make_shared<bool>(false);
-  ctx.Redis.After("quota:research:" + kW1, [&ctx, seen, fired] {
+  ctx.Redis.After("quota:research:" + kHW1, [&ctx, seen, fired] {
     *fired = true;
     auto touched = ctx.Redis.Keys("quota:research*");
     for (const auto& k : ctx.Redis.Keys("reservation:research:*")) touched.push_back(k);
     for (const auto& k : touched) (*seen)[k] = ctx.Redis.TTL(k);
   });
-  ctx.Assert(reserve("research", kW1, "gpu-a100", 2).has_value(), "a reserve of 2 units was refused");
+  ctx.Assert(reserve("research", kHW1, "gpu-a100", 2).has_value(), "a reserve of 2 units was refused");
   auto keys = ctx.Redis.Keys("quota:research*");
   for (const auto& k : ctx.Redis.Keys("reservation:research:*")) keys.push_back(k);
   ctx.Equal(keys.size(), 2, "a reserve must leave the window hash and the reservation (Redis holds %q); the keys", keys);
@@ -1027,19 +1027,19 @@ void CheckExpireWindow(harness::Ctx& ctx) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl >= 3600 && ttl <= 86400, "%s has TTL %d: the window hash and the reservation must expire after kTtlSeconds (86400 s), or Redis keeps every window the broker ever served", key, ttl);
   }
-  ctx.Assert(*fired, "the reserve never touched quota:research:%s", kW1);
+  ctx.Assert(*fired, "the reserve never touched quota:research:%s", kHW1);
   for (const auto& [key, ttl] : *seen) {
     ctx.Assert(ttl >= 3600 && ttl <= 86400,
                "right after the reserve's first command on quota:research:%s, %s had TTL %d: the TTL must be set by the same script that writes the key, or a broker dying in between leaves a key that never expires",
-               kW1, key, ttl);
+               kHW1, key, ttl);
   }
 }
 
 void CheckReleaseOnce(harness::Ctx& ctx) {
-  const auto id = reserve("research", kW1, "gpu-a100", 4);
+  const auto id = reserve("research", kHW1, "gpu-a100", 4);
   ctx.Assert(id.has_value(), "a reserve of 4 units was refused");
   // The scheduler's retry releases the same reservation while this release is running.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   const std::string reservation_id = *id;
   ctx.Redis.After("reservation:research:" + reservation_id, [rival, reservation_id] {
     rival->fired = true;
@@ -1052,7 +1052,7 @@ void CheckReleaseOnce(harness::Ctx& ctx) {
   const bool mine = release("research", reservation_id);
   ctx.Assert(rival->fired, "the release never touched reservation:research:%s", reservation_id);
   ctx.Assert(!rival->err, "the rival release failed: %s", rival->err.value_or(""));
-  ctx.Equal(ledgerReserved(ctx), 0, "two overlapping releases of one 4-unit reservation refunded it twice (read, refund and delete in one script); reserved");
+  ctx.Equal(hLedgerReserved(ctx), 0, "two overlapping releases of one 4-unit reservation refunded it twice (read, refund and delete in one script); reserved");
   ctx.Equal((mine ? 1 : 0) + (rival->released ? 1 : 0), 1, "two releases of one reservation reported %t and %t: exactly one may refund; the refunds", mine, rival->released);
   ctx.Equal(release("research", reservation_id), false, "a release of a reservation that is gone; released");
 }

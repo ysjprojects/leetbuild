@@ -739,25 +739,25 @@ import (
 )
 
 const (
-	eventsTopic = "vision.inference"
-	eventsLarge = "vision-large-3.1.0"
-	eventsSmall = "vision-small-1.7.2"
-	eventsURL   = "https://objects.internal/tenants/t1/images/cat.jpg?X-Amz-Signature=5f1d"
+	kHEventsTopic = "vision.inference"
+	kHEventsLarge = "vision-large-3.1.0"
+	kHEventsSmall = "vision-small-1.7.2"
+	kHEventsURL   = "https://objects.internal/tenants/t1/images/cat.jpg?X-Amz-Signature=5f1d"
 )
 
-func eventsRecord(inferenceID, tenant, modelVersion string, downgraded bool) results.InferenceRecord {
+func hEventsRecord(inferenceID, tenant, modelVersion string, downgraded bool) results.InferenceRecord {
 	return results.InferenceRecord{
 		InferenceID: inferenceID, Tenant: tenant, Task: "classify", ModelVersion: modelVersion, Label: "tabby_cat",
 		Confidence: 0.92, Downgraded: downgraded, LatencyMs: 840, ContentHash: "9f2c41aa",
-		ImageKey: "tenants/" + tenant + "/images/cat.jpg", ImageURL: eventsURL,
+		ImageKey: "tenants/" + tenant + "/images/cat.jpg", ImageURL: kHEventsURL,
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, r results.InferenceRecord) {
+func hEventsPublish(ctx *harness.Ctx, r results.InferenceRecord) {
 	ctx.NoError(publish(context.Background(), r), "publish(%s)", r.InferenceID)
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("vision:outbox", 0, -1) {
 		var e map[string]any
@@ -768,22 +768,22 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckVersionKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRecord("inf-1", "t1", eventsLarge, false))
-	eventsPublish(ctx, eventsRecord("inf-2", "t2", eventsLarge, false))
-	eventsPublish(ctx, eventsRecord("inf-3", "t1", eventsSmall, true))
+	hEventsPublish(ctx, hEventsRecord("inf-1", "t1", kHEventsLarge, false))
+	hEventsPublish(ctx, hEventsRecord("inf-2", "t2", kHEventsLarge, false))
+	hEventsPublish(ctx, hEventsRecord("inf-3", "t1", kHEventsSmall, true))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three inferences must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{eventsLarge, eventsLarge, eventsSmall}, "records must be keyed by model_version (keyed by tenant, one version's events spread over every partition)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three inferences must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{kHEventsLarge, kHEventsLarge, kHEventsSmall}, "records must be keyed by model_version (keyed by tenant, one version's events spread over every partition)")
 	ctx.Equal(records[0].Partition, records[1].Partition, "both vision-large events must land on one partition; the partitions")
 }
 
 func CheckNoImageReference(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish(ctx, eventsRecord("inf-1", "t1", eventsLarge, false))
-	eventsPublish(ctx, eventsRecord("inf-2", "t1", eventsLarge, false))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsPublish(ctx, hEventsRecord("inf-1", "t1", kHEventsLarge, false))
+	hEventsPublish(ctx, hEventsRecord("inf-2", "t1", kHEventsLarge, false))
 	ctx.Settle()
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
 		ctx.Assert(!strings.Contains(value, "X-Amz-Signature"), "the event carries the presigned URL: %s; the topic is retained and replicated, and a signed URL is a credential", value)
 		ctx.Assert(!strings.Contains(value, "tenants/t1/images"), "the event carries the storage key: %s; content_hash stands for the image", value)
 	}
@@ -793,51 +793,51 @@ func CheckNoImageReference(ctx *harness.Ctx) {
 }
 
 func CheckQualityFields(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRecord("inf-1", "t1", eventsLarge, false))
+	hEventsPublish(ctx, hEventsRecord("inf-1", "t1", kHEventsLarge, false))
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one inference; records")
 	var e map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &e), "the event is JSON: %s", values[0])
-	ctx.Equal(e, map[string]any{"inference_id": "inf-1", "tenant": "t1", "task": "classify", "model_version": eventsLarge, "downgraded": false, "confidence": 0.92, "latency_ms": float64(840), "content_hash": "9f2c41aa"}, "the event must be the ids, model_version, downgraded, confidence, latency_ms and content_hash")
-	eventsPublish(ctx, eventsRecord("inf-2", "t1", eventsSmall, true))
+	ctx.Equal(e, map[string]any{"inference_id": "inf-1", "tenant": "t1", "task": "classify", "model_version": kHEventsLarge, "downgraded": false, "confidence": 0.92, "latency_ms": float64(840), "content_hash": "9f2c41aa"}, "the event must be the ids, model_version, downgraded, confidence, latency_ms and content_hash")
+	hEventsPublish(ctx, hEventsRecord("inf-2", "t1", kHEventsSmall, true))
 	ctx.Settle()
-	values = ctx.Kafka.Values(eventsTopic)
+	values = ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 2, "two inferences; records")
 	var d map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[1]), &d), "the event is JSON: %s", values[1])
-	ctx.Equal(d, map[string]any{"inference_id": "inf-2", "tenant": "t1", "task": "classify", "model_version": eventsSmall, "downgraded": true, "confidence": 0.92, "latency_ms": float64(840), "content_hash": "9f2c41aa"}, "a downgraded inference carries model_version %s and downgraded true", eventsSmall)
+	ctx.Equal(d, map[string]any{"inference_id": "inf-2", "tenant": "t1", "task": "classify", "model_version": kHEventsSmall, "downgraded": true, "confidence": 0.92, "latency_ms": float64(840), "content_hash": "9f2c41aa"}, "a downgraded inference carries model_version %s and downgraded true", kHEventsSmall)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsRecord("inf-1", "t1", eventsLarge, false))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsRecord("inf-1", "t1", kHEventsLarge, false))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsRecord("inf-2", "t1", eventsLarge, false))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsRecord("inf-2", "t1", kHEventsLarge, false))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
 	func() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Fatalf("publish panicked when the broker refused the produce: %v; the event goes to the outbox, the worker goes on", e)
 			}
 		}()
-		eventsPublish(ctx, eventsRecord("inf-1", "t1", eventsLarge, false))
+		hEventsPublish(ctx, hEventsRecord("inf-1", "t1", kHEventsLarge, false))
 	}()
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: without an outbox row the inference is missing from every quality metric; outbox rows")
-	ctx.Assert(rows[0]["inference_id"] == "inf-1" && rows[0]["model_version"] == eventsLarge, "the outbox row must be the event itself, got %v", rows[0])
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
-	eventsPublish(ctx, eventsRecord("inf-2", "t1", eventsLarge, false))
+	ctx.Assert(rows[0]["inference_id"] == "inf-1" && rows[0]["model_version"] == kHEventsLarge, "the outbox row must be the event itself, got %v", rows[0])
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing reached the topic for the refused produce; records")
+	hEventsPublish(ctx, hEventsRecord("inf-2", "t1", kHEventsLarge, false))
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -850,23 +850,23 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic = "vision.inference";
-const std::string kLarge = "vision-large-3.1.0";
-const std::string kSmall = "vision-small-1.7.2";
-const std::string kUrl = "https://objects.internal/tenants/t1/images/cat.jpg?X-Amz-Signature=5f1d";
+const std::string kHTopic = "vision.inference";
+const std::string kHLarge = "vision-large-3.1.0";
+const std::string kHSmall = "vision-small-1.7.2";
+const std::string kHUrl = "https://objects.internal/tenants/t1/images/cat.jpg?X-Amz-Signature=5f1d";
 
-results::InferenceRecord eventsRecord(const std::string& inference_id, const std::string& tenant = "t1", const std::string& model_version = kLarge,
+results::InferenceRecord hEventsRecord(const std::string& inference_id, const std::string& tenant = "t1", const std::string& model_version = kHLarge,
                                       bool downgraded = false) {
-  return {inference_id, tenant, "classify", model_version, "tabby_cat", 0.92, downgraded, 840, "9f2c41aa", "tenants/" + tenant + "/images/cat.jpg", kUrl};
+  return {inference_id, tenant, "classify", model_version, "tabby_cat", 0.92, downgraded, 840, "9f2c41aa", "tenants/" + tenant + "/images/cat.jpg", kHUrl};
 }
 
 // The worker's loop serves delivery reports between inferences.
-void settle(harness::Ctx& ctx) {
+void hSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("vision:outbox", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
@@ -875,22 +875,22 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckVersionKey(harness::Ctx& ctx) {
-  publish(eventsRecord("inf-1", "t1"));
-  publish(eventsRecord("inf-2", "t2"));
-  publish(eventsRecord("inf-3", "t1", kSmall, true));
-  settle(ctx);
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three inferences must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {kLarge, kLarge, kSmall}, "records must be keyed by model_version (keyed by tenant, one version's events spread over every partition)");
+  publish(hEventsRecord("inf-1", "t1"));
+  publish(hEventsRecord("inf-2", "t2"));
+  publish(hEventsRecord("inf-3", "t1", kHSmall, true));
+  hSettle(ctx);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 3, "three inferences must produce three records on %s; the records", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {kHLarge, kHLarge, kHSmall}, "records must be keyed by model_version (keyed by tenant, one version's events spread over every partition)");
   ctx.Equal(records[0].Partition, records[1].Partition, "both vision-large events must land on one partition; the partitions");
 }
 
 void CheckNoImageReference(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
-  publish(eventsRecord("inf-1"));
-  publish(eventsRecord("inf-2"));
-  settle(ctx);
-  for (const auto& value : ctx.Kafka.Values(kTopic)) {
+  ctx.Kafka.FailNext(kHTopic, 1);
+  publish(hEventsRecord("inf-1"));
+  publish(hEventsRecord("inf-2"));
+  hSettle(ctx);
+  for (const auto& value : ctx.Kafka.Values(kHTopic)) {
     ctx.Assert(value.find("X-Amz-Signature") == std::string::npos, "the event carries the presigned URL: %s; the topic is retained and replicated, and a signed URL is a credential", value);
     ctx.Assert(value.find("tenants/t1/images") == std::string::npos, "the event carries the storage key: %s; content_hash stands for the image", value);
   }
@@ -900,48 +900,48 @@ void CheckNoImageReference(harness::Ctx& ctx) {
 }
 
 void CheckQualityFields(harness::Ctx& ctx) {
-  publish(eventsRecord("inf-1"));
-  settle(ctx);
-  const auto values = ctx.Kafka.Values(kTopic);
+  publish(hEventsRecord("inf-1"));
+  hSettle(ctx);
+  const auto values = ctx.Kafka.Values(kHTopic);
   ctx.Equal(values.size(), 1, "one inference; records");
   ctx.Equal(nlohmann::json::parse(values[0], nullptr, false),
-            nlohmann::json({{"inference_id", "inf-1"}, {"tenant", "t1"}, {"task", "classify"}, {"model_version", kLarge}, {"downgraded", false}, {"confidence", 0.92}, {"latency_ms", 840}, {"content_hash", "9f2c41aa"}}),
+            nlohmann::json({{"inference_id", "inf-1"}, {"tenant", "t1"}, {"task", "classify"}, {"model_version", kHLarge}, {"downgraded", false}, {"confidence", 0.92}, {"latency_ms", 840}, {"content_hash", "9f2c41aa"}}),
             "the event must be the ids, model_version, downgraded, confidence, latency_ms and content_hash");
-  publish(eventsRecord("inf-2", "t1", kSmall, true));
-  settle(ctx);
-  const auto both = ctx.Kafka.Values(kTopic);
+  publish(hEventsRecord("inf-2", "t1", kHSmall, true));
+  hSettle(ctx);
+  const auto both = ctx.Kafka.Values(kHTopic);
   ctx.Equal(both.size(), 2, "two inferences; records");
   ctx.Equal(nlohmann::json::parse(both.back(), nullptr, false),
-            nlohmann::json({{"inference_id", "inf-2"}, {"tenant", "t1"}, {"task", "classify"}, {"model_version", kSmall}, {"downgraded", true}, {"confidence", 0.92}, {"latency_ms", 840}, {"content_hash", "9f2c41aa"}}),
-            "a downgraded inference carries model_version %s and downgraded true", kSmall);
+            nlohmann::json({{"inference_id", "inf-2"}, {"tenant", "t1"}, {"task", "classify"}, {"model_version", kHSmall}, {"downgraded", true}, {"confidence", 0.92}, {"latency_ms", 840}, {"content_hash", "9f2c41aa"}}),
+            "a downgraded inference carries model_version %s and downgraded true", kHSmall);
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish(eventsRecord("inf-1"));
-  settle(ctx);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publish(eventsRecord("inf-2"));
-  settle(ctx);
-  ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.LoseAcks(kHTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publish(hEventsRecord("inf-1"));
+  hSettle(ctx);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publish(hEventsRecord("inf-2"));
+  hSettle(ctx);
+  ctx.Kafka.Failover(kHTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
+  ctx.Kafka.FailNext(kHTopic, 1);
   try {
-    publish(eventsRecord("inf-1"));
+    publish(hEventsRecord("inf-1"));
   } catch (const std::exception& e) {
     ctx.Fatalf("publish threw when the broker refused the produce: %s; the event goes to the outbox, the worker goes on", e.what());
   }
-  settle(ctx);
-  const auto rows = eventsOutbox(ctx);
+  hSettle(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: without an outbox row the inference is missing from every quality metric; outbox rows");
-  ctx.Assert(!rows.empty() && rows[0].value("inference_id", "") == "inf-1" && rows[0].value("model_version", "") == kLarge, "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused produce; records");
-  publish(eventsRecord("inf-2"));
-  settle(ctx);
-  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  ctx.Assert(!rows.empty() && rows[0].value("inference_id", "") == "inf-1" && rows[0].value("model_version", "") == kHLarge, "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 0, "nothing reached the topic for the refused produce; records");
+  publish(hEventsRecord("inf-2"));
+  hSettle(ctx);
+  ctx.Assert(ctx.Kafka.Records(kHTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
 }
 `,
   },

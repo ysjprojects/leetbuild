@@ -909,12 +909,12 @@ import (
 	"leetbuild/harness"
 )
 
-// pricingPeer is the stand-in pricing service: answers meter/pricing's table.
-type pricingPeer struct {
+// HPricingPeer is the stand-in pricing service: answers meter/pricing's table.
+type HPricingPeer struct {
 	pb.UnimplementedPricingServer
 }
 
-func (pricingPeer) GetRates(context.Context, *pb.RatesRequest) (*pb.RateTable, error) {
+func (HPricingPeer) GetRates(context.Context, *pb.RatesRequest) (*pb.RateTable, error) {
 	table := &pb.RateTable{Version: pricing.Version}
 	for _, model := range pricing.Models {
 		rate := pricing.Rates[model]
@@ -923,24 +923,24 @@ func (pricingPeer) GetRates(context.Context, *pb.RatesRequest) (*pb.RateTable, e
 	return table, nil
 }
 
-func clientWorld(ctx *harness.Ctx) {
-	pb.RegisterPricingServer(ctx.GRPC.Server(config.Pricing), &pricingPeer{})
+func hClientWorld(ctx *harness.Ctx) {
+	pb.RegisterPricingServer(ctx.GRPC.Server(config.Pricing), &HPricingPeer{})
 }
 
-func clientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("GetRates", "") }
+func hClientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("GetRates", "") }
 
-func clientFail(ctx *harness.Ctx) {
+func hClientFail(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("GetRates", codes.Unavailable, "pricing restarting", 1, config.Pricing)
 }
 
-func clientExpect(ctx *harness.Ctx, price Price, cost int64, source string, priced bool, version string) {
+func hClientExpect(ctx *harness.Ctx, price Price, cost int64, source string, priced bool, version string) {
 	ctx.Equal(price, Price{CostMicros: cost, Priced: priced, Source: source, RateVersion: version}, "costOf's price")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
-	calls := clientCalls(ctx)
+	hClientWorld(ctx)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
+	calls := hClientCalls(ctx)
 	ctx.Equal(len(calls), 1, "one lookup must make one GetRates call; calls")
 	ctx.Assert(calls[0].HasDeadline(), "the GetRates call carries no deadline: a hung pricing replica holds the report path as long as it hangs")
 	ctx.Assert(150*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 250*time.Millisecond, "the deadline must be 200 ms, got %v", calls[0].Timeout)
@@ -951,63 +951,63 @@ func CheckDeadline(ctx *harness.Ctx) {
 	price := costOf(context.Background(), "gpt-4o", 1200, 300)
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 0.3, "the lookup waited %.1f s on a pricing service that hangs: the deadline must cut it at 0.2 s", waited)
-	clientExpect(ctx, price, 6000, "cache", true, pricing.Version)
-	for _, call := range clientCalls(ctx) {
+	hClientExpect(ctx, price, 6000, "cache", true, pricing.Version)
+	for _, call := range hClientCalls(ctx) {
 		ctx.Assert(call.HasDeadline() && 150*time.Millisecond <= call.Timeout && call.Timeout <= 250*time.Millisecond, "every GetRates call carries its own 200 ms deadline, one carried %v", call.Timeout)
 	}
 }
 
 func CheckCacheFallback(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
-	clientFail(ctx)
+	hClientWorld(ctx)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
+	hClientFail(ctx)
 	price := costOf(context.Background(), "gpt-4o-mini", 1200, 300)
-	ctx.Equal(len(clientCalls(ctx)), 2, "a lookup asks the service first, then falls back; GetRates calls for two lookups")
-	clientExpect(ctx, price, 360, "cache", true, pricing.Version)
+	ctx.Equal(len(hClientCalls(ctx)), 2, "a lookup asks the service first, then falls back; GetRates calls for two lookups")
+	hClientExpect(ctx, price, 360, "cache", true, pricing.Version)
 	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
 		ctx.GRPC.Fail("GetRates", code, "pricing failed", 1, config.Pricing)
 		again := costOf(context.Background(), "claude-sonnet-4", 1000, 1000)
 		ctx.Equal(again.Source, "cache", "a lookup that failed with %v must be priced from the cached table too (%+v); its source", code, again)
-		clientExpect(ctx, again, 18000, "cache", true, pricing.Version)
+		hClientExpect(ctx, again, 18000, "cache", true, pricing.Version)
 	}
 }
 
 func CheckCacheFreshness(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
+	hClientWorld(ctx)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
 	ctx.Clock.Advance(3500)
-	clientFail(ctx)
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "cache", true, pricing.Version)
+	hClientFail(ctx)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "cache", true, pricing.Version)
 	ctx.Clock.Advance(101)
-	clientFail(ctx)
+	hClientFail(ctx)
 	price := costOf(context.Background(), "gpt-4o", 1200, 300)
-	ctx.Equal(len(clientCalls(ctx)), 3, "every lookup asks the service; GetRates calls for three lookups")
-	clientExpect(ctx, price, 0, "uncosted", false, "")
+	ctx.Equal(len(hClientCalls(ctx)), 3, "every lookup asks the service; GetRates calls for three lookups")
+	hClientExpect(ctx, price, 0, "uncosted", false, "")
 	// a later reply replaces the table and restarts its hour
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
 	ctx.Clock.Advance(3000)
-	clientFail(ctx)
+	hClientFail(ctx)
 	refreshed := costOf(context.Background(), "gpt-4o", 1200, 300)
 	ctx.Equal(refreshed.Source, "cache", "a table fetched 3000 s ago must price a failed lookup (%+v): each reply replaces the cached table and its fetch time; its source", refreshed)
-	clientExpect(ctx, refreshed, 6000, "cache", true, pricing.Version)
+	hClientExpect(ctx, refreshed, 6000, "cache", true, pricing.Version)
 }
 
 func CheckUncostedModel(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientExpect(ctx, costOf(context.Background(), "llama-3-70b-local", 5000, 500), 0, "uncosted", false, "")
-	clientExpect(ctx, costOf(context.Background(), "claude-sonnet-4", 1000, 1000), 18000, "service", true, pricing.Version)
+	hClientWorld(ctx)
+	hClientExpect(ctx, costOf(context.Background(), "llama-3-70b-local", 5000, 500), 0, "uncosted", false, "")
+	hClientExpect(ctx, costOf(context.Background(), "claude-sonnet-4", 1000, 1000), 18000, "service", true, pricing.Version)
 	// the cost is the floor of the sum: (input * input_rate + output * output_rate) / 1000, rounded down
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o-mini", 6, 2), 2, "service", true, pricing.Version)
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o-mini", 9, 1), 1, "service", true, pricing.Version)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o-mini", 6, 2), 2, "service", true, pricing.Version)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o-mini", 9, 1), 1, "service", true, pricing.Version)
 }
 
 func CheckFailureNotCached(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientFail(ctx)
-	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 0, "uncosted", false, "")
+	hClientWorld(ctx)
+	hClientFail(ctx)
+	hClientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 0, "uncosted", false, "")
 	price := costOf(context.Background(), "gpt-4o", 1200, 300)
-	ctx.Equal(len(clientCalls(ctx)), 2, "after a failed lookup the next one must ask the service again; GetRates calls for two lookups")
-	clientExpect(ctx, price, 6000, "service", true, pricing.Version)
+	ctx.Equal(len(hClientCalls(ctx)), 2, "after a failed lookup the next one must ask the service again; GetRates calls for two lookups")
+	hClientExpect(ctx, price, 6000, "service", true, pricing.Version)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1019,7 +1019,7 @@ func CheckFailureNotCached(ctx *harness.Ctx) {
 namespace {
 
 // The stand-in pricing service: answers meter/pricing.h's table.
-class PricingPeer final : public meter::Pricing::Service {
+class HPricingPeer final : public meter::Pricing::Service {
  public:
   grpc::Status GetRates(grpc::ServerContext*, const meter::RatesRequest*, meter::RateTable* reply) override {
     reply->set_version(pricing::kVersion);
@@ -1033,16 +1033,16 @@ class PricingPeer final : public meter::Pricing::Service {
   }
 };
 
-void clientWorld(harness::Ctx& ctx) {
-  static PricingPeer* peer = nullptr;
+void hClientWorld(harness::Ctx& ctx) {
+  static HPricingPeer* peer = nullptr;
   delete peer;
-  peer = new PricingPeer();
+  peer = new HPricingPeer();
   ctx.GRPC.Server(config::kPricing)->RegisterService(peer);
 }
 
-void clientFail(harness::Ctx& ctx) { ctx.GRPC.Fail("GetRates", grpc::StatusCode::UNAVAILABLE, "pricing restarting", 1, config::kPricing); }
+void hClientFail(harness::Ctx& ctx) { ctx.GRPC.Fail("GetRates", grpc::StatusCode::UNAVAILABLE, "pricing restarting", 1, config::kPricing); }
 
-void clientExpect(harness::Ctx& ctx, const Price& price, long long cost, const std::string& source, bool priced, const std::string& version) {
+void hClientExpect(harness::Ctx& ctx, const Price& price, long long cost, const std::string& source, bool priced, const std::string& version) {
   ctx.Assert(price.cost_micros == cost && price.priced == priced && price.source == source && price.rate_version == version,
              "expected cost_micros=%d, priced=%t, source=%s, rate_version=%q; cost_of answered cost_micros=%d, priced=%t, source=%s, rate_version=%q",
              cost, priced, source, version, price.cost_micros, price.priced, price.source, price.rate_version);
@@ -1051,8 +1051,8 @@ void clientExpect(harness::Ctx& ctx, const Price& price, long long cost, const s
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
+  hClientWorld(ctx);
+  hClientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
   const auto calls = ctx.GRPC.CallsTo("GetRates");
   ctx.Equal(calls.size(), 1, "one lookup must make one GetRates call; calls");
   ctx.Assert(calls[0].HasDeadline(), "the GetRates call carries no deadline: a hung pricing replica holds the report path as long as it hangs");
@@ -1064,7 +1064,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   const Price price = cost_of("gpt-4o", 1200, 300);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 0.3, "the lookup waited %.1f s on a pricing service that hangs: the deadline must cut it at 0.2 s", waited);
-  clientExpect(ctx, price, 6000, "cache", true, pricing::kVersion);
+  hClientExpect(ctx, price, 6000, "cache", true, pricing::kVersion);
   for (const auto& call : ctx.GRPC.CallsTo("GetRates")) {
     ctx.Assert(call.HasDeadline() && 0.15 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.25,
                "every GetRates call carries its own 200 ms deadline, one carried %vs", call.TimeoutSeconds());
@@ -1072,56 +1072,56 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckCacheFallback(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
-  clientFail(ctx);
+  hClientWorld(ctx);
+  hClientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
+  hClientFail(ctx);
   const Price price = cost_of("gpt-4o-mini", 1200, 300);
   ctx.Equal(ctx.GRPC.CallsTo("GetRates").size(), 2, "a lookup asks the service first, then falls back; GetRates calls for two lookups");
-  clientExpect(ctx, price, 360, "cache", true, pricing::kVersion);
+  hClientExpect(ctx, price, 360, "cache", true, pricing::kVersion);
   for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
     ctx.GRPC.Fail("GetRates", code, "pricing failed", 1, config::kPricing);
     const Price again = cost_of("claude-sonnet-4", 1000, 1000);
     ctx.Equal(again.source, std::string("cache"), "a lookup that failed with %s must be priced from the cached table too; its source", name);
-    clientExpect(ctx, again, 18000, "cache", true, pricing::kVersion);
+    hClientExpect(ctx, again, 18000, "cache", true, pricing::kVersion);
   }
 }
 
 void CheckCacheFreshness(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
+  hClientWorld(ctx);
+  hClientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
   ctx.Clock.Advance(3500);
-  clientFail(ctx);
-  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "cache", true, pricing::kVersion);
+  hClientFail(ctx);
+  hClientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "cache", true, pricing::kVersion);
   ctx.Clock.Advance(101);
-  clientFail(ctx);
+  hClientFail(ctx);
   const Price price = cost_of("gpt-4o", 1200, 300);
   ctx.Equal(ctx.GRPC.CallsTo("GetRates").size(), 3, "every lookup asks the service; GetRates calls for three lookups");
-  clientExpect(ctx, price, 0, "uncosted", false, "");
+  hClientExpect(ctx, price, 0, "uncosted", false, "");
   // a later reply replaces the table and restarts its hour
-  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
+  hClientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
   ctx.Clock.Advance(3000);
-  clientFail(ctx);
+  hClientFail(ctx);
   const Price refreshed = cost_of("gpt-4o", 1200, 300);
   ctx.Equal(refreshed.source, std::string("cache"), "a table fetched 3000 s ago must price a failed lookup (each reply replaces the cached table and its fetch time); its source");
-  clientExpect(ctx, refreshed, 6000, "cache", true, pricing::kVersion);
+  hClientExpect(ctx, refreshed, 6000, "cache", true, pricing::kVersion);
 }
 
 void CheckUncostedModel(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  clientExpect(ctx, cost_of("llama-3-70b-local", 5000, 500), 0, "uncosted", false, "");
-  clientExpect(ctx, cost_of("claude-sonnet-4", 1000, 1000), 18000, "service", true, pricing::kVersion);
+  hClientWorld(ctx);
+  hClientExpect(ctx, cost_of("llama-3-70b-local", 5000, 500), 0, "uncosted", false, "");
+  hClientExpect(ctx, cost_of("claude-sonnet-4", 1000, 1000), 18000, "service", true, pricing::kVersion);
   // the cost is the floor of the sum: (input * input_rate + output * output_rate) / 1000, rounded down
-  clientExpect(ctx, cost_of("gpt-4o-mini", 6, 2), 2, "service", true, pricing::kVersion);
-  clientExpect(ctx, cost_of("gpt-4o-mini", 9, 1), 1, "service", true, pricing::kVersion);
+  hClientExpect(ctx, cost_of("gpt-4o-mini", 6, 2), 2, "service", true, pricing::kVersion);
+  hClientExpect(ctx, cost_of("gpt-4o-mini", 9, 1), 1, "service", true, pricing::kVersion);
 }
 
 void CheckFailureNotCached(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  clientFail(ctx);
-  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 0, "uncosted", false, "");
+  hClientWorld(ctx);
+  hClientFail(ctx);
+  hClientExpect(ctx, cost_of("gpt-4o", 1200, 300), 0, "uncosted", false, "");
   const Price price = cost_of("gpt-4o", 1200, 300);
   ctx.Equal(ctx.GRPC.CallsTo("GetRates").size(), 2, "after a failed lookup the next one must ask the service again; GetRates calls for two lookups");
-  clientExpect(ctx, price, 6000, "service", true, pricing::kVersion);
+  hClientExpect(ctx, price, 6000, "service", true, pricing::kVersion);
 }
 `,
   },

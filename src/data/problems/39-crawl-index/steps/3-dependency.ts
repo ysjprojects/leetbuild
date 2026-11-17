@@ -997,17 +997,17 @@ import (
 )
 
 const (
-	clientJob  = "nightly"
-	clientHost = "blog.example.com"
+	kHClientJob  = "nightly"
+	kHClientHost = "blog.example.com"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-func hostURL(path string) string { return "https://" + clientHost + path }
+func hostURL(path string) string { return "https://" + kHClientHost + path }
 
 // fetcherPeer is the web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429
 // (Retry-After 45), anything else 200. It notes what the host's queue held during each call.
-type fetcherPeer struct {
+type HFetcherPeer struct {
 	pb.UnimplementedFetcherServer
 	ctx          *harness.Ctx
 	fetchedURLs  []string
@@ -1016,9 +1016,9 @@ type fetcherPeer struct {
 	rival func() (bool, any, error)
 }
 
-func (f *fetcherPeer) Fetch(_ context.Context, req *pb.FetchRequest) (*pb.FetchReply, error) {
+func (f *HFetcherPeer) Fetch(_ context.Context, req *pb.FetchRequest) (*pb.FetchReply, error) {
 	f.fetchedURLs = append(f.fetchedURLs, req.GetUrl())
-	f.queuedDuring = append(f.queuedDuring, f.ctx.Redis.LRange("frontier:"+clientJob+":"+clientHost, 0, -1))
+	f.queuedDuring = append(f.queuedDuring, f.ctx.Redis.LRange("frontier:"+kHClientJob+":"+kHClientHost, 0, -1))
 	path := strings.TrimPrefix(req.GetUrl(), hostURL(""))
 	if strings.HasPrefix(path, "/forbidden") {
 		return &pb.FetchReply{Status: 403}, nil
@@ -1028,8 +1028,8 @@ func (f *fetcherPeer) Fetch(_ context.Context, req *pb.FetchRequest) (*pb.FetchR
 	}
 	if strings.HasPrefix(path, "/busy") {
 		// Another worker's take lands right after the worker's next write to the host's queue.
-		probe := f.ctx.Redis.After("frontier:"+clientJob+":"+clientHost, func() any {
-			url, _ := frontier.Take(clientBg, clientJob, clientHost, 60)
+		probe := f.ctx.Redis.After("frontier:"+kHClientJob+":"+kHClientHost, func() any {
+			url, _ := frontier.Take(hClientBg, kHClientJob, kHClientHost, 60)
 			return url
 		})
 		f.rival = func() (bool, any, error) { return probe.Fired, probe.Result, probe.Err }
@@ -1038,48 +1038,48 @@ func (f *fetcherPeer) Fetch(_ context.Context, req *pb.FetchRequest) (*pb.FetchR
 	return &pb.FetchReply{Status: 200, ContentHash: "sha256:" + path, BodyRef: "pages" + path}, nil
 }
 
-func clientWorld(ctx *harness.Ctx, paths ...string) *fetcherPeer {
-	peer := &fetcherPeer{ctx: ctx}
+func hClientWorld(ctx *harness.Ctx, paths ...string) *HFetcherPeer {
+	peer := &HFetcherPeer{ctx: ctx}
 	pb.RegisterFetcherServer(ctx.GRPC.Server(""), peer)
 	for _, path := range paths {
-		ctx.NoError(frontier.Enqueue(clientBg, clientJob, clientHost, hostURL(path)), "enqueue %s", path)
+		ctx.NoError(frontier.Enqueue(hClientBg, kHClientJob, kHClientHost, hostURL(path)), "enqueue %s", path)
 	}
 	return peer
 }
 
-func fetchNext(ctx *harness.Ctx) *Outcome {
-	out, err := fetchOne(clientBg, clientJob, clientHost, 60)
+func hFetchNext(ctx *harness.Ctx) *Outcome {
+	out, err := fetchOne(hClientBg, kHClientJob, kHClientHost, 60)
 	ctx.NoError(err, "fetchOne failed")
 	return out
 }
 
-func outcomeOf(out *Outcome) string {
+func hOutcomeOf(out *Outcome) string {
 	if out == nil {
 		return "nil"
 	}
 	return out.Outcome
 }
 
-func recorded(path string) string {
-	page := records.PageOf(clientBg, clientJob, hostURL(path))
+func hRecorded(path string) string {
+	page := records.PageOf(hClientBg, kHClientJob, hostURL(path))
 	if page == nil {
 		return ""
 	}
 	return page["status"]
 }
 
-func fetchCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Fetch", "")) }
+func hFetchCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Fetch", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx, "/posts/1", "/posts/2")
-	ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "a healthy fetch; the outcome")
+	hClientWorld(ctx, "/posts/1", "/posts/2")
+	ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "fetched", "a healthy fetch; the outcome")
 	for _, call := range ctx.GRPC.CallsTo("Fetch", "") {
 		ctx.Assert(call.HasDeadline(), "a Fetch call carries no deadline: a host that never answers holds the worker forever")
 		ctx.Assert(4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a Fetch call carries a %v deadline, expected 5 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Fetch", 10.0, "")
-	ctx.Equal(outcomeOf(fetchNext(ctx)), "failed", "a host slower than the deadline on every attempt; the outcome")
-	ctx.Equal(recorded("/posts/2"), "failed", "the slow URL's record")
+	ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "failed", "a host slower than the deadline on every attempt; the outcome")
+	ctx.Equal(hRecorded("/posts/2"), "failed", "the slow URL's record")
 	slow := ctx.GRPC.CallsTo("Fetch", "")[1:]
 	ctx.Equal(len(slow), 3, "a host slower than the deadline: DEADLINE_EXCEEDED is retried up to maxAttempts = 3; the attempts")
 	for _, call := range slow {
@@ -1088,78 +1088,78 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	clientWorld(ctx, "/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5", "/posts/6", "/posts/7")
+	hClientWorld(ctx, "/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5", "/posts/6", "/posts/7")
 	ctx.GRPC.Fail("Fetch", codes.Unavailable, "host down", 3, "")
-	out := fetchNext(ctx)
-	calls := fetchCalls(ctx)
+	out := hFetchNext(ctx)
+	calls := hFetchCalls(ctx)
 	ctx.Equal(calls, 3, "the fetcher answered UNAVAILABLE three times: at most maxAttempts = 3, then the page fails; the calls for one URL")
-	ctx.Assert(outcomeOf(out) == "failed" && recorded("/posts/1") == "failed", "after three UNAVAILABLE the worker answered %s and recorded %q, expected failed", outcomeOf(out), recorded("/posts/1"))
+	ctx.Assert(hOutcomeOf(out) == "failed" && hRecorded("/posts/1") == "failed", "after three UNAVAILABLE the worker answered %s and recorded %q, expected failed", hOutcomeOf(out), hRecorded("/posts/1"))
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.NotFound, codes.PermissionDenied, codes.Internal} {
 		ctx.Clock.Advance(1)
 		ctx.GRPC.Fail("Fetch", code, "refused", 1, "")
-		out = fetchNext(ctx)
-		extra := fetchCalls(ctx) - calls
+		out = hFetchNext(ctx)
+		extra := hFetchCalls(ctx) - calls
 		calls += extra
 		ctx.Equal(extra, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for a %s", code)
-		ctx.Equal(outcomeOf(out), "failed", "a %s; the outcome", code)
+		ctx.Equal(hOutcomeOf(out), "failed", "a %s; the outcome", code)
 	}
 	ctx.Clock.Advance(1)
 	ctx.GRPC.Fail("Fetch", codes.Unavailable, "host down", 2, "")
-	out = fetchNext(ctx)
-	extra := fetchCalls(ctx) - calls
-	ctx.Assert(extra == 3 && outcomeOf(out) == "fetched", "two UNAVAILABLE, then a 200: the worker answered %s after %d calls, expected the third attempt to fetch the page", outcomeOf(out), extra)
+	out = hFetchNext(ctx)
+	extra := hFetchCalls(ctx) - calls
+	ctx.Assert(extra == 3 && hOutcomeOf(out) == "fetched", "two UNAVAILABLE, then a 200: the worker answered %s after %d calls, expected the third attempt to fetch the page", hOutcomeOf(out), extra)
 	ctx.Clock.Advance(1)
 	ctx.GRPC.Fail("Fetch", codes.DeadlineExceeded, "slow", 1, "")
-	ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "one DEADLINE_EXCEEDED, then a 200: a retry must fetch the page; the outcome")
+	ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "fetched", "one DEADLINE_EXCEEDED, then a 200: a retry must fetch the page; the outcome")
 }
 
 func CheckTerminalStatus(ctx *harness.Ctx) {
-	clientWorld(ctx, "/forbidden/a", "/gone/b")
-	out := fetchNext(ctx)
-	ctx.Equal(fetchCalls(ctx), 1, "a 403 is the site's answer about the URL, recorded after one call; the calls")
-	ctx.Assert(outcomeOf(out) == "refused" && recorded("/forbidden/a") == "refused", "a 403 answered %s and recorded %q, expected refused", outcomeOf(out), recorded("/forbidden/a"))
-	ctx.Equal(records.PageOf(clientBg, clientJob, hostURL("/forbidden/a"))["reason"], "forbidden", "a 403 is records.MarkRefused(jobID, url, \\"forbidden\\"); the recorded reason")
+	hClientWorld(ctx, "/forbidden/a", "/gone/b")
+	out := hFetchNext(ctx)
+	ctx.Equal(hFetchCalls(ctx), 1, "a 403 is the site's answer about the URL, recorded after one call; the calls")
+	ctx.Assert(hOutcomeOf(out) == "refused" && hRecorded("/forbidden/a") == "refused", "a 403 answered %s and recorded %q, expected refused", hOutcomeOf(out), hRecorded("/forbidden/a"))
+	ctx.Equal(records.PageOf(hClientBg, kHClientJob, hostURL("/forbidden/a"))["reason"], "forbidden", "a 403 is records.MarkRefused(jobID, url, \\"forbidden\\"); the recorded reason")
 	ctx.Clock.Advance(1)
-	out = fetchNext(ctx)
-	ctx.Equal(fetchCalls(ctx), 2, "a 404 is one call, then gone; the calls")
-	ctx.Assert(outcomeOf(out) == "gone" && recorded("/gone/b") == "gone", "a 404 answered %s and recorded %q, expected gone", outcomeOf(out), recorded("/gone/b"))
+	out = hFetchNext(ctx)
+	ctx.Equal(hFetchCalls(ctx), 2, "a 404 is one call, then gone; the calls")
+	ctx.Assert(hOutcomeOf(out) == "gone" && hRecorded("/gone/b") == "gone", "a 404 answered %s and recorded %q, expected gone", hOutcomeOf(out), hRecorded("/gone/b"))
 }
 
 func CheckThrottle429(ctx *harness.Ctx) {
-	peer := clientWorld(ctx, "/busy/a", "/posts/1")
-	out := fetchNext(ctx)
-	ctx.Equal(fetchCalls(ctx), 1, "a 429 means the host asked for room: no more requests; the calls")
-	ctx.Equal(outcomeOf(out), "throttled", "a 429; the outcome")
+	peer := hClientWorld(ctx, "/busy/a", "/posts/1")
+	out := hFetchNext(ctx)
+	ctx.Equal(hFetchCalls(ctx), 1, "a 429 means the host asked for room: no more requests; the calls")
+	ctx.Equal(hOutcomeOf(out), "throttled", "a 429; the outcome")
 	ctx.Assert(peer.rival != nil, "the fetcher never answered a 429")
 	fired, rival, rivalErr := peer.rival()
 	ctx.Assert(fired, "a 429 never put the URL back on the host's queue")
 	ctx.NoError(rivalErr, "another worker's take")
 	ctx.Equal(rival, "", "another worker's take landed when the throttled URL went back: the host was not throttled yet. Throttle the host before the URL goes back; the rival's take")
-	ctx.Equal(recorded("/busy/a"), "", "a 429 is not the URL's outcome: nothing may be recorded, the URL goes back; the record")
-	ctx.Equal(ctx.Redis.LRange("frontier:"+clientJob+":"+clientHost, 0, -1), []string{hostURL("/posts/1"), hostURL("/busy/a")}, "the throttled URL must go back to the tail of the host's queue")
-	again := fetchNext(ctx)
-	ctx.Assert(again == nil && fetchCalls(ctx) == 1, "right after a 429 with Retry-After 45 the worker fetched again (%s): the whole host must wait", outcomeOf(again))
+	ctx.Equal(hRecorded("/busy/a"), "", "a 429 is not the URL's outcome: nothing may be recorded, the URL goes back; the record")
+	ctx.Equal(ctx.Redis.LRange("frontier:"+kHClientJob+":"+kHClientHost, 0, -1), []string{hostURL("/posts/1"), hostURL("/busy/a")}, "the throttled URL must go back to the tail of the host's queue")
+	again := hFetchNext(ctx)
+	ctx.Assert(again == nil && hFetchCalls(ctx) == 1, "right after a 429 with Retry-After 45 the worker fetched again (%s): the whole host must wait", hOutcomeOf(again))
 	ctx.Clock.Advance(31)
-	again = fetchNext(ctx)
-	ctx.Assert(again == nil && fetchCalls(ctx) == 1, "31 s into a 429's Retry-After of 45 s the worker fetched again (%s): the host waits the reply's retry_after_s", outcomeOf(again))
+	again = hFetchNext(ctx)
+	ctx.Assert(again == nil && hFetchCalls(ctx) == 1, "31 s into a 429's Retry-After of 45 s the worker fetched again (%s): the host waits the reply's retry_after_s", hOutcomeOf(again))
 	ctx.Clock.Advance(15)
-	out = fetchNext(ctx)
+	out = hFetchNext(ctx)
 	ctx.Assert(out != nil && out.URL == hostURL("/posts/1") && out.Outcome == "fetched", "after Retry-After the host's next URL must be fetched, got %+v", out)
 }
 
 func CheckTakeFirst(ctx *harness.Ctx) {
-	peer := clientWorld(ctx, "/posts/1", "/posts/2", "/posts/3")
-	ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "a healthy fetch; the outcome")
+	peer := hClientWorld(ctx, "/posts/1", "/posts/2", "/posts/3")
+	ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "fetched", "a healthy fetch; the outcome")
 	for _, queued := range peer.queuedDuring[0] {
 		ctx.Assert(queued != peer.fetchedURLs[0], "while %s was being fetched the host's queue still held it (%q): another worker would fetch it too. Take it off the queue before the call", peer.fetchedURLs[0], peer.queuedDuring[0])
 	}
-	fetchNext(ctx)
-	third := fetchNext(ctx)
-	ctx.Assert(third == nil && fetchCalls(ctx) == 2, "a third fetch in the same instant answered %s after %d calls: the host's bucket holds Burst = 2 tokens, the third URL must wait for frontier.Take", outcomeOf(third), fetchCalls(ctx))
+	hFetchNext(ctx)
+	third := hFetchNext(ctx)
+	ctx.Assert(third == nil && hFetchCalls(ctx) == 2, "a third fetch in the same instant answered %s after %d calls: the host's bucket holds Burst = 2 tokens, the third URL must wait for frontier.Take", hOutcomeOf(third), hFetchCalls(ctx))
 	ctx.Clock.Advance(0.5)
-	fourth, err := fetchOne(clientBg, clientJob, clientHost, 120)
+	fourth, err := fetchOne(hClientBg, kHClientJob, kHClientHost, 120)
 	ctx.NoError(err, "fetchOne failed")
-	ctx.Equal(outcomeOf(fourth), "fetched", "half a second later at ratePerMinute = 120 the bucket refills at the rate the worker was given, which hands out the next URL; the outcome")
+	ctx.Equal(hOutcomeOf(fourth), "fetched", "half a second later at ratePerMinute = 120 the bucket refills at the rate the worker was given, which hands out the next URL; the outcome")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1172,23 +1172,23 @@ func CheckTakeFirst(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "nightly";
+const std::string kHJob = "nightly";
 const std::string kHost = "blog.example.com";
 
 std::string hostUrl(const std::string& path) { return "https://" + kHost + path; }
 
 // The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 45),
 // anything else 200. It notes what the host's queue held during each call.
-class FetcherPeer final : public crawl::Fetcher::Service {
+class HFetcherPeer final : public crawl::Fetcher::Service {
  public:
-  explicit FetcherPeer(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HFetcherPeer(harness::Ctx& ctx) : ctx_(ctx) {}
   std::vector<std::pair<std::string, std::vector<std::string>>> queued_during;
   // What another worker's take got when a 429 sent the URL back, once a 429 armed the probe.
   std::shared_ptr<bool> rival_fired;
   std::shared_ptr<std::string> rival_took;
 
   grpc::Status Fetch(grpc::ServerContext*, const crawl::FetchRequest* req, crawl::FetchReply* out) override {
-    queued_during.emplace_back(req->url(), ctx_.Redis.LRange("frontier:" + kJob + ":" + kHost, 0, -1));
+    queued_during.emplace_back(req->url(), ctx_.Redis.LRange("frontier:" + kHJob + ":" + kHost, 0, -1));
     const std::string path = req->url().substr(hostUrl("").size());
     if (path.rfind("/forbidden", 0) == 0) {
       out->set_status(403);
@@ -1198,9 +1198,9 @@ class FetcherPeer final : public crawl::Fetcher::Service {
       // Another worker's take lands right after the worker's next write to the host's queue.
       auto fired = rival_fired = std::make_shared<bool>(false);
       auto took = rival_took = std::make_shared<std::string>();
-      ctx_.Redis.After("frontier:" + kJob + ":" + kHost, [fired, took] {
+      ctx_.Redis.After("frontier:" + kHJob + ":" + kHost, [fired, took] {
         *fired = true;
-        *took = frontier::take(kJob, kHost, 60).value_or("");
+        *took = frontier::take(kHJob, kHost, 60).value_or("");
       });
       out->set_status(429);
       out->set_retry_after_s(45);
@@ -1216,44 +1216,44 @@ class FetcherPeer final : public crawl::Fetcher::Service {
   harness::Ctx& ctx_;
 };
 
-FetcherPeer& world(harness::Ctx& ctx, const std::vector<std::string>& paths) {
-  static FetcherPeer* peer = nullptr;
+HFetcherPeer& hWorld(harness::Ctx& ctx, const std::vector<std::string>& paths) {
+  static HFetcherPeer* peer = nullptr;
   delete peer;
-  peer = new FetcherPeer(ctx);
+  peer = new HFetcherPeer(ctx);
   ctx.GRPC.Server("")->RegisterService(peer);
-  for (const std::string& path : paths) frontier::enqueue(kJob, kHost, hostUrl(path));
+  for (const std::string& path : paths) frontier::enqueue(kHJob, kHost, hostUrl(path));
   return *peer;
 }
 
-std::optional<Outcome> fetchNext(harness::Ctx& ctx) {
+std::optional<Outcome> hFetchNext(harness::Ctx& ctx) {
   try {
-    return fetchOne(kJob, kHost, 60);
+    return fetchOne(kHJob, kHost, 60);
   } catch (const std::exception& e) {
     ctx.Fatalf("fetchOne threw %s: %s", harness::CurrentExceptionType(), e.what());
   }
 }
 
-std::string outcomeOf(const std::optional<Outcome>& out) { return out ? out->outcome : "none"; }
+std::string hOutcomeOf(const std::optional<Outcome>& out) { return out ? out->outcome : "none"; }
 
-std::string recorded(const std::string& path) {
-  const auto page = records::pageOf(kJob, hostUrl(path));
+std::string hRecorded(const std::string& path) {
+  const auto page = records::pageOf(kHJob, hostUrl(path));
   return page && page->count("status") ? page->at("status") : "";
 }
 
-size_t fetchCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Fetch").size(); }
+size_t hFetchCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Fetch").size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  world(ctx, {"/posts/1", "/posts/2"});
-  ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "a healthy fetch; the outcome");
+  hWorld(ctx, {"/posts/1", "/posts/2"});
+  ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "fetched", "a healthy fetch; the outcome");
   for (const auto& call : ctx.GRPC.CallsTo("Fetch")) {
     ctx.Assert(call.HasDeadline(), "a Fetch call carries no deadline: a host that never answers holds the worker forever");
     ctx.Assert(4.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 5.5, "a Fetch call carries a %v s deadline, expected kDeadline = 5 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Fetch", 10.0);
-  ctx.Equal(outcomeOf(fetchNext(ctx)), "failed", "a host slower than the deadline on every attempt; the outcome");
-  ctx.Equal(recorded("/posts/2"), "failed", "the slow URL's record");
+  ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "failed", "a host slower than the deadline on every attempt; the outcome");
+  ctx.Equal(hRecorded("/posts/2"), "failed", "the slow URL's record");
   const auto calls = ctx.GRPC.CallsTo("Fetch");
   ctx.Equal(calls.size(), 4, "a host slower than the deadline: DEADLINE_EXCEEDED is retried up to kMaxAttempts = 3; the calls, the healthy one included");
   for (size_t i = 1; i < calls.size(); i++) {
@@ -1262,12 +1262,12 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  world(ctx, {"/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5", "/posts/6", "/posts/7"});
+  hWorld(ctx, {"/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5", "/posts/6", "/posts/7"});
   ctx.GRPC.Fail("Fetch", grpc::StatusCode::UNAVAILABLE, "host down", 3);
-  auto out = fetchNext(ctx);
-  size_t calls = fetchCalls(ctx);
+  auto out = hFetchNext(ctx);
+  size_t calls = hFetchCalls(ctx);
   ctx.Equal(calls, 3, "the fetcher answered UNAVAILABLE three times: at most kMaxAttempts = 3, then the page fails; the calls for one URL");
-  ctx.Assert(outcomeOf(out) == "failed" && recorded("/posts/1") == "failed", "after three UNAVAILABLE the worker answered %s and recorded %q, expected failed", outcomeOf(out), recorded("/posts/1"));
+  ctx.Assert(hOutcomeOf(out) == "failed" && hRecorded("/posts/1") == "failed", "after three UNAVAILABLE the worker answered %s and recorded %q, expected failed", hOutcomeOf(out), hRecorded("/posts/1"));
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
       {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
@@ -1277,73 +1277,73 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   for (const auto& [code, name] : terminal) {
     ctx.Clock.Advance(1);
     ctx.GRPC.Fail("Fetch", code, "refused", 1);
-    out = fetchNext(ctx);
-    const size_t extra = fetchCalls(ctx) - calls;
+    out = hFetchNext(ctx);
+    const size_t extra = hFetchCalls(ctx) - calls;
     calls += extra;
     ctx.Equal(extra, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for a %s", name);
-    ctx.Equal(outcomeOf(out), "failed", "a %s; the outcome", name);
+    ctx.Equal(hOutcomeOf(out), "failed", "a %s; the outcome", name);
   }
   ctx.Clock.Advance(1);
   ctx.GRPC.Fail("Fetch", grpc::StatusCode::UNAVAILABLE, "host down", 2);
-  out = fetchNext(ctx);
-  const size_t extra = fetchCalls(ctx) - calls;
-  ctx.Assert(extra == 3 && outcomeOf(out) == "fetched", "two UNAVAILABLE, then a 200: the worker answered %s after %d calls, expected the third attempt to fetch the page", outcomeOf(out), extra);
+  out = hFetchNext(ctx);
+  const size_t extra = hFetchCalls(ctx) - calls;
+  ctx.Assert(extra == 3 && hOutcomeOf(out) == "fetched", "two UNAVAILABLE, then a 200: the worker answered %s after %d calls, expected the third attempt to fetch the page", hOutcomeOf(out), extra);
   ctx.Clock.Advance(1);
   ctx.GRPC.Fail("Fetch", grpc::StatusCode::DEADLINE_EXCEEDED, "slow", 1);
-  ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "one DEADLINE_EXCEEDED, then a 200: a retry must fetch the page; the outcome");
+  ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "fetched", "one DEADLINE_EXCEEDED, then a 200: a retry must fetch the page; the outcome");
 }
 
 void CheckTerminalStatus(harness::Ctx& ctx) {
-  world(ctx, {"/forbidden/a", "/gone/b"});
-  auto out = fetchNext(ctx);
-  ctx.Equal(fetchCalls(ctx), 1, "a 403 is the site's answer about the URL, recorded after one call; the calls");
-  ctx.Assert(outcomeOf(out) == "refused" && recorded("/forbidden/a") == "refused", "a 403 answered %s and recorded %q, expected refused", outcomeOf(out), recorded("/forbidden/a"));
-  const auto page = records::pageOf(kJob, hostUrl("/forbidden/a"));
+  hWorld(ctx, {"/forbidden/a", "/gone/b"});
+  auto out = hFetchNext(ctx);
+  ctx.Equal(hFetchCalls(ctx), 1, "a 403 is the site's answer about the URL, recorded after one call; the calls");
+  ctx.Assert(hOutcomeOf(out) == "refused" && hRecorded("/forbidden/a") == "refused", "a 403 answered %s and recorded %q, expected refused", hOutcomeOf(out), hRecorded("/forbidden/a"));
+  const auto page = records::pageOf(kHJob, hostUrl("/forbidden/a"));
   const std::string reason = page && page->count("reason") ? page->at("reason") : "";
   ctx.Equal(reason, "forbidden", "a 403 is records::markRefused(job_id, url, \\"forbidden\\"); the recorded reason");
   ctx.Clock.Advance(1);
-  out = fetchNext(ctx);
-  ctx.Equal(fetchCalls(ctx), 2, "a 404 is one call, then gone; the calls");
-  ctx.Assert(outcomeOf(out) == "gone" && recorded("/gone/b") == "gone", "a 404 answered %s and recorded %q, expected gone", outcomeOf(out), recorded("/gone/b"));
+  out = hFetchNext(ctx);
+  ctx.Equal(hFetchCalls(ctx), 2, "a 404 is one call, then gone; the calls");
+  ctx.Assert(hOutcomeOf(out) == "gone" && hRecorded("/gone/b") == "gone", "a 404 answered %s and recorded %q, expected gone", hOutcomeOf(out), hRecorded("/gone/b"));
 }
 
 void CheckThrottle429(harness::Ctx& ctx) {
-  FetcherPeer& peer = world(ctx, {"/busy/a", "/posts/1"});
-  auto out = fetchNext(ctx);
-  ctx.Equal(fetchCalls(ctx), 1, "a 429 means the host asked for room: no more requests; the calls");
-  ctx.Equal(outcomeOf(out), "throttled", "a 429; the outcome");
+  HFetcherPeer& peer = hWorld(ctx, {"/busy/a", "/posts/1"});
+  auto out = hFetchNext(ctx);
+  ctx.Equal(hFetchCalls(ctx), 1, "a 429 means the host asked for room: no more requests; the calls");
+  ctx.Equal(hOutcomeOf(out), "throttled", "a 429; the outcome");
   ctx.Assert(peer.rival_fired && *peer.rival_fired, "a 429 never put the URL back on the host's queue");
   ctx.Equal(peer.rival_took ? *peer.rival_took : std::string(), "", "another worker's take landed when the throttled URL went back: the host was not throttled yet. Throttle the host before the URL goes back; the rival's take");
-  ctx.Equal(recorded("/busy/a"), "", "a 429 is not the URL's outcome: nothing may be recorded, the URL goes back; the record");
-  ctx.Equal(ctx.Redis.LRange("frontier:" + kJob + ":" + kHost, 0, -1), {hostUrl("/posts/1"), hostUrl("/busy/a")}, "the throttled URL must go back to the tail of the host's queue");
-  auto again = fetchNext(ctx);
-  ctx.Assert(!again && fetchCalls(ctx) == 1, "right after a 429 with Retry-After 45 the worker fetched again (%s): the whole host must wait", outcomeOf(again));
+  ctx.Equal(hRecorded("/busy/a"), "", "a 429 is not the URL's outcome: nothing may be recorded, the URL goes back; the record");
+  ctx.Equal(ctx.Redis.LRange("frontier:" + kHJob + ":" + kHost, 0, -1), {hostUrl("/posts/1"), hostUrl("/busy/a")}, "the throttled URL must go back to the tail of the host's queue");
+  auto again = hFetchNext(ctx);
+  ctx.Assert(!again && hFetchCalls(ctx) == 1, "right after a 429 with Retry-After 45 the worker fetched again (%s): the whole host must wait", hOutcomeOf(again));
   ctx.Clock.Advance(31);
-  again = fetchNext(ctx);
-  ctx.Assert(!again && fetchCalls(ctx) == 1, "31 s into a 429's Retry-After of 45 s the worker fetched again (%s): the host waits the reply's retry_after_s", outcomeOf(again));
+  again = hFetchNext(ctx);
+  ctx.Assert(!again && hFetchCalls(ctx) == 1, "31 s into a 429's Retry-After of 45 s the worker fetched again (%s): the host waits the reply's retry_after_s", hOutcomeOf(again));
   ctx.Clock.Advance(15);
-  out = fetchNext(ctx);
-  ctx.Assert(out && out->url == hostUrl("/posts/1") && out->outcome == "fetched", "after Retry-After the host's next URL must be fetched, got %s", outcomeOf(out));
+  out = hFetchNext(ctx);
+  ctx.Assert(out && out->url == hostUrl("/posts/1") && out->outcome == "fetched", "after Retry-After the host's next URL must be fetched, got %s", hOutcomeOf(out));
 }
 
 void CheckTakeFirst(harness::Ctx& ctx) {
-  FetcherPeer& peer = world(ctx, {"/posts/1", "/posts/2", "/posts/3"});
-  ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "a healthy fetch; the outcome");
+  HFetcherPeer& peer = hWorld(ctx, {"/posts/1", "/posts/2", "/posts/3"});
+  ctx.Equal(hOutcomeOf(hFetchNext(ctx)), "fetched", "a healthy fetch; the outcome");
   const auto& [fetched, queued] = peer.queued_during.at(0);
   for (const std::string& u : queued) {
     ctx.Assert(u != fetched, "while %s was being fetched the host's queue still held it (%q): another worker would fetch it too. Take it off the queue before the call", fetched, queued);
   }
-  fetchNext(ctx);
-  const auto third = fetchNext(ctx);
-  ctx.Assert(!third && fetchCalls(ctx) == 2, "a third fetch in the same instant answered %s after %d calls: the host's bucket holds kBurst = 2 tokens, the third URL must wait for frontier::take", outcomeOf(third), fetchCalls(ctx));
+  hFetchNext(ctx);
+  const auto third = hFetchNext(ctx);
+  ctx.Assert(!third && hFetchCalls(ctx) == 2, "a third fetch in the same instant answered %s after %d calls: the host's bucket holds kBurst = 2 tokens, the third URL must wait for frontier::take", hOutcomeOf(third), hFetchCalls(ctx));
   ctx.Clock.Advance(0.5);
   std::optional<Outcome> fourth;
   try {
-    fourth = fetchOne(kJob, kHost, 120);
+    fourth = fetchOne(kHJob, kHost, 120);
   } catch (const std::exception& e) {
     ctx.Fatalf("fetchOne threw %s: %s", harness::CurrentExceptionType(), e.what());
   }
-  ctx.Equal(outcomeOf(fourth), "fetched", "half a second later at rate_per_minute = 120 the bucket refills at the rate the worker was given, which hands out the next URL; the outcome");
+  ctx.Equal(hOutcomeOf(fourth), "fetched", "half a second later at rate_per_minute = 120 the bucket refills at the rate the worker was given, which hands out the next URL; the outcome");
 }
 `,
   },

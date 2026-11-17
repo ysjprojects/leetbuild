@@ -1221,22 +1221,22 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsCard = "Please refund invoice 4411, my card is 4111 1111 1111 1111"
+const kHEventsCard = "Please refund invoice 4411, my card is 4111 1111 1111 1111"
 
-func eventsC(n int, tenant string, labels []string, text string) Classification {
+func hEventsC(n int, tenant string, labels []string, text string) Classification {
 	if text == "" {
 		text = fmt.Sprintf("refund request number %d", n)
 	}
 	return Classification{RequestID: fmt.Sprintf("req-%d", n), Tenant: tenant, TaxonomyID: "tx-support", TaxonomyVersion: 2, Labels: labels, Provenance: "model", Text: text}
 }
 
-func eventsPublish(ctx *harness.Ctx, c Classification) bool {
+func hEventsPublish(ctx *harness.Ctx, c Classification) bool {
 	ok, err := publish(context.Background(), c)
 	ctx.NoError(err, "publish(%s)", c.RequestID)
 	return ok
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	rows := []map[string]any{}
 	for _, text := range ctx.Redis.LRange(config.OutboxKey, 0, -1) {
 		var row map[string]any
@@ -1247,9 +1247,9 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsC(1, "acme", []string{"billing"}, ""))
-	eventsPublish(ctx, eventsC(2, "globex", []string{"support"}, ""))
-	eventsPublish(ctx, eventsC(3, "acme", []string{"security"}, ""))
+	hEventsPublish(ctx, hEventsC(1, "acme", []string{"billing"}, ""))
+	hEventsPublish(ctx, hEventsC(2, "globex", []string{"support"}, ""))
+	hEventsPublish(ctx, hEventsC(3, "acme", []string{"security"}, ""))
 	ctx.Settle()
 	records := ctx.Kafka.Records(config.Topic)
 	ctx.Equal(len(records), 3, "three publish calls must produce three records on classify.result; the records")
@@ -1258,7 +1258,7 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckTextHash(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsC(1, "acme", []string{"billing"}, eventsCard))
+	hEventsPublish(ctx, hEventsC(1, "acme", []string{"billing"}, kHEventsCard))
 	ctx.Settle()
 	values := ctx.Kafka.Values(config.Topic)
 	ctx.Equal(len(values), 1, "one publish must produce one record; the records")
@@ -1266,7 +1266,7 @@ func CheckTextHash(ctx *harness.Ctx) {
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
 	_, hasText := value["text"]
 	ctx.Assert(!hasText && !strings.Contains(values[0], "4111"), "the payload carries the document: %s. A retained topic must not hold tenant content", values[0])
-	sum := sha256.Sum256([]byte(eventsCard))
+	sum := sha256.Sum256([]byte(kHEventsCard))
 	ctx.Equal(value["text_hash"], hex.EncodeToString(sum[:]), "text_hash must be the SHA-256 hex of the text")
 	ctx.Assert(value["request_id"] == "req-1" && value["tenant"] == "acme" && value["taxonomy_id"] == "tx-support" && value["taxonomy_version"] == float64(2) && value["provenance"] == "model",
 		"the payload must carry request_id, tenant, taxonomy_id, taxonomy_version and provenance, got %s", values[0])
@@ -1275,37 +1275,37 @@ func CheckTextHash(ctx *harness.Ctx) {
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(config.Topic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsC(1, "acme", []string{"billing"}, ""))
+	hEventsPublish(ctx, hEventsC(1, "acme", []string{"billing"}, ""))
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(config.Topic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsC(2, "acme", []string{"billing"}, ""))
+	hEventsPublish(ctx, hEventsC(2, "acme", []string{"billing"}, ""))
 	ctx.Settle()
 	ctx.Kafka.Failover(config.Topic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(config.Topic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := eventsPublish(ctx, eventsC(0, "acme", []string{"billing"}, ""))
+	ok := hEventsPublish(ctx, hEventsC(0, "acme", []string{"billing"}, ""))
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered event returned %v and left the outbox %v: only an undelivered event goes to the outbox", ok, eventsOutbox(ctx))
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "a delivered event returned %v and left the outbox %v: only an undelivered event goes to the outbox", ok, hEventsOutbox(ctx))
 	ctx.Kafka.FailNext(config.Topic, 1)
-	ok = eventsPublish(ctx, eventsC(1, "acme", []string{"billing"}, eventsCard))
+	ok = hEventsPublish(ctx, hEventsC(1, "acme", []string{"billing"}, kHEventsCard))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the event is lost (the failure arrives in the delivery report, not from Produce); the rows")
 	ctx.Assert(rows[0]["request_id"] == "req-1" && rows[0]["tenant"] == "acme", "the outbox row must be the event's payload, got %v", rows[0])
 	_, rowHasText := rows[0]["text"]
 	rowRaw, _ := json.Marshal(rows[0])
-	cardSum := sha256.Sum256([]byte(eventsCard))
+	cardSum := sha256.Sum256([]byte(kHEventsCard))
 	ctx.Assert(!rowHasText && !strings.Contains(string(rowRaw), "4111") && rows[0]["text_hash"] == hex.EncodeToString(cardSum[:]),
 		"the outbox row is republished as the event, so it carries the text_hash and never the text, got %s", rowRaw)
 	ctx.Equal(ok, false, "publish's result after a failed delivery")
 	ctx.Kafka.Stall(config.Topic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsC(2, "acme", []string{"billing"}, ""))
+	ok = hEventsPublish(ctx, hEventsC(2, "acme", []string{"billing"}, ""))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["request_id"] == "req-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publish's result without an acknowledgement")
 }
@@ -1357,13 +1357,13 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kCard = "Please refund invoice 4411, my card is 4111 1111 1111 1111";
+const std::string kHCard = "Please refund invoice 4411, my card is 4111 1111 1111 1111";
 
-Classification eventsC(int n, const std::string& tenant, const std::vector<std::string>& labels, const std::string& text = "") {
+Classification hEventsC(int n, const std::string& tenant, const std::vector<std::string>& labels, const std::string& text = "") {
   return Classification{"req-" + std::to_string(n), tenant, "tx-support", 2, labels, "model", text.empty() ? "refund request number " + std::to_string(n) : text};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange(config::kOutboxKey, 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1373,16 +1373,16 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  publish(eventsC(1, "acme", {"billing"}));
-  publish(eventsC(2, "globex", {"support"}));
-  publish(eventsC(3, "acme", {"security"}));
+  publish(hEventsC(1, "acme", {"billing"}));
+  publish(hEventsC(2, "globex", {"support"}));
+  publish(hEventsC(3, "acme", {"security"}));
   ctx.Settle();
   const auto records = ctx.Kafka.Records(config::kTopic);
   ctx.Equal(records.size(), 3, "three publish calls must produce three records on classify.result; the records");
@@ -1391,52 +1391,52 @@ void CheckTenantKey(harness::Ctx& ctx) {
 }
 
 void CheckTextHash(harness::Ctx& ctx) {
-  publish(eventsC(1, "acme", {"billing"}, kCard));
+  publish(hEventsC(1, "acme", {"billing"}, kHCard));
   ctx.Settle();
   const auto values = ctx.Kafka.Values(config::kTopic);
   ctx.Equal(values.size(), 1, "one publish must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(value.is_object() && !value.contains("text") && values[0].find("4111") == std::string::npos,
              "the payload carries the document: %s. A retained topic must not hold tenant content", values[0]);
-  ctx.Equal(field(value, "text_hash"), sha256_hex(kCard), "text_hash must be the SHA-256 hex of the text");
-  ctx.Assert(field(value, "request_id") == "req-1" && field(value, "tenant") == "acme" && field(value, "taxonomy_id") == "tx-support" &&
-                 value.value("taxonomy_version", 0L) == 2 && field(value, "provenance") == "model",
+  ctx.Equal(hField(value, "text_hash"), sha256_hex(kHCard), "text_hash must be the SHA-256 hex of the text");
+  ctx.Assert(hField(value, "request_id") == "req-1" && hField(value, "tenant") == "acme" && hField(value, "taxonomy_id") == "tx-support" &&
+                 value.value("taxonomy_version", 0L) == 2 && hField(value, "provenance") == "model",
              "the payload must carry request_id, tenant, taxonomy_id, taxonomy_version and provenance, got %s", values[0]);
   ctx.Equal(value.value("labels", std::vector<std::string>{}), {"billing"}, "the payload's labels");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(config::kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish(eventsC(1, "acme", {"billing"}));
+  publish(hEventsC(1, "acme", {"billing"}));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(config::kTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publish(eventsC(2, "acme", {"billing"}));
+  publish(hEventsC(2, "acme", {"billing"}));
   ctx.Settle();
   ctx.Kafka.Failover(config::kTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(config::kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publish(eventsC(0, "acme", {"billing"}));
+  bool ok = publish(hEventsC(0, "acme", {"billing"}));
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivered event returned %v and left %d outbox rows: only an undelivered event goes to the outbox", ok, eventsOutbox(ctx).size());
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(), "a delivered event returned %v and left %d outbox rows: only an undelivered event goes to the outbox", ok, hEventsOutbox(ctx).size());
   ctx.Kafka.FailNext(config::kTopic, 1);
-  ok = publish(eventsC(1, "acme", {"billing"}, kCard));
+  ok = publish(hEventsC(1, "acme", {"billing"}, kHCard));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the event is lost (the failure arrives in dr_cb, not from produce); the rows");
-  ctx.Assert(field(rows[0], "request_id") == "req-1" && field(rows[0], "tenant") == "acme", "the outbox row must be the event's payload, got %s", rows[0].dump());
-  ctx.Assert(!rows[0].contains("text") && rows[0].dump().find("4111") == std::string::npos && field(rows[0], "text_hash") == sha256_hex(kCard),
+  ctx.Assert(hField(rows[0], "request_id") == "req-1" && hField(rows[0], "tenant") == "acme", "the outbox row must be the event's payload, got %s", rows[0].dump());
+  ctx.Assert(!rows[0].contains("text") && rows[0].dump().find("4111") == std::string::npos && hField(rows[0], "text_hash") == sha256_hex(kHCard),
              "the outbox row is republished as the event, so it carries the text_hash and never the text, got %s", rows[0].dump());
   ctx.Equal(ok, false, "publish's result after a failed delivery");
   ctx.Kafka.Stall(config::kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publish(eventsC(2, "acme", {"billing"}));
+  ok = publish(hEventsC(2, "acme", {"billing"}));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && field(rows[1], "request_id") == "req-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hField(rows[1], "request_id") == "req-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish's result without an acknowledgement");
 }
 

@@ -781,48 +781,48 @@ import (
 	"leetbuild/harness"
 )
 
-var stateLabels = []string{"billing", "support", "security"}
+var hStateLabels = []string{"billing", "support", "security"}
 
-func stateWorld(ctx *harness.Ctx) {
-	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", stateLabels)
+func hStateWorld(ctx *harness.Ctx) {
+	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", hStateLabels)
 	ctx.NoError(err, "seeding tx-support")
 }
 
 // stateAtMinute50 moves the clock to 50 minutes into an hour (600 s left in the window) and returns the hour.
-func stateAtMinute50(ctx *harness.Ctx) int64 {
+func hStateAtMinute50(ctx *harness.Ctx) int64 {
 	now := ctx.Clock.Now() / 1000
 	ctx.Clock.Advance(float64(((3000-now%3600)%3600 + 3600) % 3600))
 	return ctx.Clock.Now() / 1000 / 3600
 }
 
-func stateSorted(labels []string) []string {
+func hStateSorted(labels []string) []string {
 	out := append([]string{}, labels...)
 	sort.Strings(out)
 	return out
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	stateWorld(ctx)
+	hStateWorld(ctx)
 	got, err := loadTaxonomy(context.Background(), "acme", "tx-support", 1)
 	ctx.NoError(err, "loadTaxonomy(acme)")
 	ctx.Assert(got != nil, "acme's load of tx-support version 1 answered nothing")
-	ctx.Equal(stateSorted(got.Labels), stateSorted(stateLabels), "acme's labels of tx-support version 1")
+	ctx.Equal(hStateSorted(got.Labels), hStateSorted(hStateLabels), "acme's labels of tx-support version 1")
 	leaked, err := loadTaxonomy(context.Background(), "globex", "tx-support", 1)
 	ctx.NoError(err, "loadTaxonomy(globex)")
 	ctx.Assert(leaked == nil, "tenant globex read acme's cached taxonomy: %+v. The cache key must carry the tenant", leaked)
 	ctx.Equal(ctx.Redis.Keys("taxonomy:*"), []string{"taxonomy:acme:tx-support:1"}, "the cache keys")
-	_, err = taxonomies.PutVersion(context.Background(), "acme", "tx-support", append(append([]string{}, stateLabels...), "abuse"))
+	_, err = taxonomies.PutVersion(context.Background(), "acme", "tx-support", append(append([]string{}, hStateLabels...), "abuse"))
 	ctx.NoError(err, "publishing version 2")
-	_, err = taxonomies.PutVersion(context.Background(), "acme", "tx-support", append(append([]string{}, stateLabels...), "abuse", "fraud"))
+	_, err = taxonomies.PutVersion(context.Background(), "acme", "tx-support", append(append([]string{}, hStateLabels...), "abuse", "fraud"))
 	ctx.NoError(err, "publishing version 3")
 	v2, err := loadTaxonomy(context.Background(), "acme", "tx-support", 2)
 	ctx.NoError(err, "loadTaxonomy(acme, 2)")
 	ctx.Assert(v2 != nil && v2.Version == 2, "with versions 2 and 3 published, acme's load of version 2 answered %+v: a miss loads the requested version from the store", v2)
-	ctx.Equal(stateSorted(v2.Labels), stateSorted(append(append([]string{}, stateLabels...), "abuse")), "with versions 2 and 3 published, the labels of acme's load of version 2")
+	ctx.Equal(hStateSorted(v2.Labels), hStateSorted(append(append([]string{}, hStateLabels...), "abuse")), "with versions 2 and 3 published, the labels of acme's load of version 2")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	stateWorld(ctx)
+	hStateWorld(ctx)
 	_, err := loadTaxonomy(context.Background(), "acme", "tx-support", 1)
 	ctx.NoError(err, "loadTaxonomy")
 	keys := ctx.Redis.Keys("taxonomy:*")
@@ -833,7 +833,7 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.Exists(keys[0]), int64(0), "the cache entry %s after ten minutes; exists", keys[0])
 	key := taxonomyKey("acme", "tx-support", 1)
 	probe := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
-	ctx.NoError(cacheTaxonomy(context.Background(), "acme", &taxonomies.Taxonomy{TaxonomyID: "tx-support", Version: 1, Labels: stateLabels}), "cacheTaxonomy")
+	ctx.NoError(cacheTaxonomy(context.Background(), "acme", &taxonomies.Taxonomy{TaxonomyID: "tx-support", Version: 1, Labels: hStateLabels}), "cacheTaxonomy")
 	ctx.Assert(probe.Fired, "cacheTaxonomy never wrote %s", key)
 	first, _ := probe.Result.(int64)
 	ctx.Assert(590 <= first && first <= 600, "right after the write that created %s its TTL was %d: the entry must carry its expiry from the write that creates it", key, first)
@@ -855,7 +855,7 @@ func CheckAtomicReplace(ctx *harness.Ctx) {
 		}
 		return "none:0"
 	})
-	err := cacheTaxonomy(context.Background(), "acme", &taxonomies.Taxonomy{TaxonomyID: "tx-support", Version: 1, Labels: stateLabels})
+	err := cacheTaxonomy(context.Background(), "acme", &taxonomies.Taxonomy{TaxonomyID: "tx-support", Version: 1, Labels: hStateLabels})
 	ctx.NoError(err, "cacheTaxonomy")
 	ctx.Assert(probe.Fired, "cacheTaxonomy never wrote %s", key)
 	ctx.Equal(probe.Result, "string:3", "a reader right after the first write to %s must see all 3 labels: write the whole taxonomy in one SET; what it saw (type:labels)", key)
@@ -864,11 +864,11 @@ func CheckAtomicReplace(ctx *harness.Ctx) {
 	got, err := loadTaxonomy(context.Background(), "acme", "tx-support", 1)
 	ctx.NoError(err, "loadTaxonomy")
 	ctx.Assert(got != nil, "the re-cached entry answered nothing")
-	ctx.Equal(stateSorted(got.Labels), []string{"billing", "support"}, "after a re-cache with two labels: a write must replace the entry, not patch it; the labels")
+	ctx.Equal(hStateSorted(got.Labels), []string{"billing", "support"}, "after a re-cache with two labels: a write must replace the entry, not patch it; the labels")
 }
 
 func CheckWindowCounters(ctx *harness.Ctx) {
-	hour := stateAtMinute50(ctx)
+	hour := hStateAtMinute50(ctx)
 	for _, c := range [][2]string{{"acme", "billing"}, {"acme", "billing"}, {"acme", "support"}, {"globex", "billing"}} {
 		ctx.NoError(bumpCounter(context.Background(), c[0], c[1]), "bumpCounter(%s, %s)", c[0], c[1])
 	}
@@ -882,7 +882,7 @@ func CheckWindowCounters(ctx *harness.Ctx) {
 }
 
 func CheckExpireWithWindow(ctx *harness.Ctx) {
-	hour := stateAtMinute50(ctx)
+	hour := hStateAtMinute50(ctx)
 	key := fmt.Sprintf("counters:acme:%d", hour)
 	probe := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
 	ctx.NoError(bumpCounter(context.Background(), "acme", "billing"), "bumpCounter")
@@ -911,18 +911,18 @@ func CheckExpireWithWindow(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kLabels = {"billing", "support", "security"};
+const std::vector<std::string> kHLabels = {"billing", "support", "security"};
 
-void stateWorld() { taxonomies::putVersion("acme", "tx-support", kLabels); }
+void hStateWorld() { taxonomies::putVersion("acme", "tx-support", kHLabels); }
 
 // Moves the clock to 50 minutes into an hour (600 s left in the window); returns the hour.
-long long atMinute50(harness::Ctx& ctx) {
+long long hAtMinute50(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
   ctx.Clock.Advance(static_cast<double>(((3000 - now % 3600) % 3600 + 3600) % 3600));
   return ctx.Clock.Now() / 1000 / 3600;
 }
 
-std::vector<std::string> sorted(std::vector<std::string> labels) {
+std::vector<std::string> hSorted(std::vector<std::string> labels) {
   std::sort(labels.begin(), labels.end());
   return labels;
 }
@@ -930,14 +930,14 @@ std::vector<std::string> sorted(std::vector<std::string> labels) {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  stateWorld();
+  hStateWorld();
   const auto got = loadTaxonomy("acme", "tx-support", 1);
   ctx.Assert(got.has_value(), "acme's load of tx-support version 1 answered nothing");
-  ctx.Equal(sorted(got->labels), sorted(kLabels), "acme's labels of tx-support version 1");
+  ctx.Equal(hSorted(got->labels), hSorted(kHLabels), "acme's labels of tx-support version 1");
   const auto leaked = loadTaxonomy("globex", "tx-support", 1);
   ctx.Assert(!leaked.has_value(), "tenant globex read acme's cached taxonomy (%d labels). The cache key must carry the tenant", leaked ? leaked->labels.size() : 0);
   ctx.Equal(ctx.Redis.Keys("taxonomy:*"), {"taxonomy:acme:tx-support:1"}, "the cache keys");
-  auto v2Labels = kLabels;
+  auto v2Labels = kHLabels;
   v2Labels.push_back("abuse");
   auto v3Labels = v2Labels;
   v3Labels.push_back("fraud");
@@ -945,11 +945,11 @@ void CheckTenantKey(harness::Ctx& ctx) {
   taxonomies::putVersion("acme", "tx-support", v3Labels);
   const auto v2 = loadTaxonomy("acme", "tx-support", 2);
   ctx.Assert(v2.has_value() && v2->version == 2, "with versions 2 and 3 published, acme's load of version 2 answered version %d: a miss loads the requested version from the store", v2 ? v2->version : 0);
-  ctx.Equal(sorted(v2->labels), sorted(v2Labels), "with versions 2 and 3 published, the labels of acme's load of version 2");
+  ctx.Equal(hSorted(v2->labels), hSorted(v2Labels), "with versions 2 and 3 published, the labels of acme's load of version 2");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  stateWorld();
+  hStateWorld();
   loadTaxonomy("acme", "tx-support", 1);
   const auto keys = ctx.Redis.Keys("taxonomy:*");
   ctx.Equal(keys.size(), 1, "one load must cache one entry; the entries");
@@ -960,7 +960,7 @@ void CheckTtl(harness::Ctx& ctx) {
   const std::string key = taxonomyKey("acme", "tx-support", 1);
   long long first = -3;
   ctx.Redis.After(key, [&] { first = ctx.Redis.TTL(key); });
-  cacheTaxonomy("acme", taxonomies::Taxonomy{"tx-support", 1, kLabels});
+  cacheTaxonomy("acme", taxonomies::Taxonomy{"tx-support", 1, kHLabels});
   ctx.Assert(first != -3, "cacheTaxonomy never wrote %s", key);
   ctx.Assert(590 <= first && first <= 600, "right after the write that created %s its TTL was %d: the entry must carry its expiry from the write that creates it", key, first);
 }
@@ -978,17 +978,17 @@ void CheckAtomicReplace(harness::Ctx& ctx) {
       seen = "string:" + std::to_string(doc.is_object() && doc.contains("labels") ? doc["labels"].size() : 0);
     }
   });
-  cacheTaxonomy("acme", taxonomies::Taxonomy{"tx-support", 1, kLabels});
+  cacheTaxonomy("acme", taxonomies::Taxonomy{"tx-support", 1, kHLabels});
   ctx.Assert(fired, "cacheTaxonomy never wrote %s", key);
   ctx.Equal(seen, "string:3", "a reader right after the first write to %s must see all 3 labels: write the whole taxonomy in one SET; what it saw (type:labels)", key);
   cacheTaxonomy("acme", taxonomies::Taxonomy{"tx-support", 1, {"billing", "support"}});
   const auto got = loadTaxonomy("acme", "tx-support", 1);
   ctx.Assert(got.has_value(), "the re-cached entry answered nothing");
-  ctx.Equal(sorted(got->labels), {"billing", "support"}, "after a re-cache with two labels: a write must replace the entry, not patch it; the labels");
+  ctx.Equal(hSorted(got->labels), {"billing", "support"}, "after a re-cache with two labels: a write must replace the entry, not patch it; the labels");
 }
 
 void CheckWindowCounters(harness::Ctx& ctx) {
-  const long long hour = atMinute50(ctx);
+  const long long hour = hAtMinute50(ctx);
   bumpCounter("acme", "billing");
   bumpCounter("acme", "billing");
   bumpCounter("acme", "support");
@@ -1005,7 +1005,7 @@ void CheckWindowCounters(harness::Ctx& ctx) {
 }
 
 void CheckExpireWithWindow(harness::Ctx& ctx) {
-  const long long hour = atMinute50(ctx);
+  const long long hour = hAtMinute50(ctx);
   const std::string key = "counters:acme:" + std::to_string(hour);
   long long first = -3;
   ctx.Redis.After(key, [&] { first = ctx.Redis.TTL(key); });

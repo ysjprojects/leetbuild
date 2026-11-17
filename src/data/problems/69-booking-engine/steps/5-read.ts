@@ -810,14 +810,14 @@ import (
 	"booking/tz"
 )
 
-const readDay = "2026-03-10"
+const kHReadDay = "2026-03-10"
 
 var (
-	readBerlin = slots.DayFields("Europe/Berlin", 2026, 3, 10) // 08:00 to 19:30 CET: 07:00Z to 18:30Z
-	readTokyo  = slots.DayFields("Asia/Tokyo", 2026, 3, 10)    // 08:00 to 19:30 JST: the day before, 23:00Z, to 10:30Z
+	hReadBerlin = slots.DayFields("Europe/Berlin", 2026, 3, 10) // 08:00 to 19:30 CET: 07:00Z to 18:30Z
+	hReadTokyo  = slots.DayFields("Asia/Tokyo", 2026, 3, 10)    // 08:00 to 19:30 JST: the day before, 23:00Z, to 10:30Z
 )
 
-func readInstants(fields []string) []string {
+func hReadInstants(fields []string) []string {
 	out := []string{}
 	for _, f := range fields {
 		minute, _ := strconv.ParseInt(f, 10, 64)
@@ -826,36 +826,36 @@ func readInstants(fields []string) []string {
 	return out
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, query string) *harness.Response {
-	return c.Get("/v1/resources/r1/availability?from=" + readDay + "&to=" + readDay + query)
+func hReadGet(c *harness.HTTP, query string) *harness.Response {
+	return c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=" + kHReadDay + query)
 }
 
-type readBody struct {
+type HReadBody struct {
 	ResourceID string   \`json:"resource_id"\`
 	Timezone   string   \`json:"timezone"\`
 	Slots      []string \`json:"slots"\`
 	Error      string   \`json:"error"\`
 }
 
-func readDecode(ctx *harness.Ctx, r *harness.Response) readBody {
-	var body readBody
+func hReadDecode(ctx *harness.Ctx, r *harness.Response) HReadBody {
+	var body HReadBody
 	ctx.NoError(json.Unmarshal(r.Body, &body), "the answer must be JSON with resource_id, timezone and a slots list")
 	return body
 }
 
-func readSlots(ctx *harness.Ctx, r *harness.Response) []string {
-	body := readDecode(ctx, r)
+func hReadSlots(ctx *harness.Ctx, r *harness.Response) []string {
+	body := hReadDecode(ctx, r)
 	ctx.Assert(body.Slots != nil, "the answer must carry a slots list: %s", r.Text())
 	return body.Slots
 }
 
-func readHas(slots []string, instant string) bool {
+func hReadHas(slots []string, instant string) bool {
 	for _, s := range slots {
 		if s == instant {
 			return true
@@ -865,74 +865,74 @@ func readHas(slots []string, instant string) bool {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	r := readGet(c, "")
+	c := hReadClient(ctx)
+	r := hReadGet(c, "")
 	ctx.Equal(r.Status, 200, "GET /v1/resources/r1/availability (%s)", r.Text())
-	ctx.Equal(readDecode(ctx, r).ResourceID, "r1", "the answer must echo the resource id")
-	readSlots(ctx, r)
+	ctx.Equal(hReadDecode(ctx, r).ResourceID, "r1", "the answer must echo the resource id")
+	hReadSlots(ctx, r)
 }
 
 func CheckRangeCap(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	probe := ctx.Redis.After(slots.Key("r1"), func() any { return nil })
-	r := c.Get("/v1/resources/r1/availability?from=" + readDay + "&to=2026-06-09") // 91 days
-	ctx.Assert(r.Status == 400 && readDecode(ctx, r).Error == "range_too_long", "a 91-day span answered %d %s, expected 400 range_too_long", r.Status, r.Text())
+	r := c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=2026-06-09") // 91 days
+	ctx.Assert(r.Status == 400 && hReadDecode(ctx, r).Error == "range_too_long", "a 91-day span answered %d %s, expected 400 range_too_long", r.Status, r.Text())
 	ctx.Assert(!probe.Fired, "a 91-day span was refused only after reading resource:r1:slots: refuse it before any slot work")
-	r = c.Get("/v1/resources/r1/availability?from=" + readDay + "&to=2026-06-08") // 90 days
+	r = c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=2026-06-08") // 90 days
 	ctx.Equal(r.Status, 200, "a 90-day span (%s)", r.Text())
-	ctx.Equal(len(readSlots(ctx, r)), 91*len(readBerlin), "a 90-day span of free days; its slots")
-	r = c.Get("/v1/resources/r1/availability?from=" + readDay + "&to=2026-03-09")
+	ctx.Equal(len(hReadSlots(ctx, r)), 91*len(hReadBerlin), "a 90-day span of free days; its slots")
+	r = c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=2026-03-09")
 	ctx.Equal(r.Status, 400, "a span ending before it starts")
 }
 
 func CheckLiveHoldMap(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	for _, f := range readBerlin {
-		ctx.Redis.Do("HSET", "availability:r1:"+readDay, f, "free") // last night's materialization: everything free
+	c := hReadClient(ctx)
+	for _, f := range hReadBerlin {
+		ctx.Redis.Do("HSET", "availability:r1:"+kHReadDay, f, "free") // last night's materialization: everything free
 	}
-	ctx.Redis.Do("HSET", slots.Key("r1"), readBerlin[2], "booked:b-9") // booked a second ago
-	r := readGet(c, "")
+	ctx.Redis.Do("HSET", slots.Key("r1"), hReadBerlin[2], "booked:b-9") // booked a second ago
+	r := hReadGet(c, "")
 	ctx.Equal(r.Status, 200, "GET (%s)", r.Text())
-	got := readSlots(ctx, r)
-	booked := readInstants(readBerlin[2:3])[0]
-	ctx.Assert(!readHas(got, booked), "the slot booked a second ago (%s) is still advertised: read resource:r1:slots at request time, not a materialization", booked)
-	ctx.Equal(got, readInstants(append(append([]string{}, readBerlin[:2]...), readBerlin[3:]...)), "a day with one booked slot must list the other %d slots of the Berlin day", len(readBerlin)-1)
-	ctx.Redis.Do("HSET", slots.Key("r1"), readBerlin[5], "h-now")
+	got := hReadSlots(ctx, r)
+	booked := hReadInstants(hReadBerlin[2:3])[0]
+	ctx.Assert(!hReadHas(got, booked), "the slot booked a second ago (%s) is still advertised: read resource:r1:slots at request time, not a materialization", booked)
+	ctx.Equal(got, hReadInstants(append(append([]string{}, hReadBerlin[:2]...), hReadBerlin[3:]...)), "a day with one booked slot must list the other %d slots of the Berlin day", len(hReadBerlin)-1)
+	ctx.Redis.Do("HSET", slots.Key("r1"), hReadBerlin[5], "h-now")
 	ctx.Redis.Set(slots.HoldKey("h-now"), "held", "EX", 900)
-	ctx.Assert(!readHas(readSlots(ctx, readGet(c, "")), readInstants(readBerlin[5:6])[0]), "a slot held since the previous read must be gone from the next one")
+	ctx.Assert(!hReadHas(hReadSlots(ctx, hReadGet(c, "")), hReadInstants(hReadBerlin[5:6])[0]), "a slot held since the previous read must be gone from the next one")
 }
 
 func CheckHeldExcluded(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	ctx.Redis.Do("HSET", slots.Key("r1"), readBerlin[0], "booked:b-1")
-	ctx.Redis.Do("HSET", slots.Key("r1"), readBerlin[1], "h-live")
+	c := hReadClient(ctx)
+	ctx.Redis.Do("HSET", slots.Key("r1"), hReadBerlin[0], "booked:b-1")
+	ctx.Redis.Do("HSET", slots.Key("r1"), hReadBerlin[1], "h-live")
 	ctx.Redis.Set(slots.HoldKey("h-live"), "held", "EX", 900)
-	ctx.Redis.Do("HSET", slots.Key("r1"), readBerlin[2], "h-dead") // its checkout was abandoned an hour ago
-	r := readGet(c, "")
+	ctx.Redis.Do("HSET", slots.Key("r1"), hReadBerlin[2], "h-dead") // its checkout was abandoned an hour ago
+	r := hReadGet(c, "")
 	ctx.Equal(r.Status, 200, "GET (%s)", r.Text())
-	got := readSlots(ctx, r)
-	first := readInstants(readBerlin[:3])
-	ctx.Assert(!readHas(got, first[0]), "a confirmed booking's slot (%s) is advertised as free", first[0])
-	ctx.Assert(!readHas(got, first[1]), "a slot held inside the payment window (%s) is advertised as free", first[1])
-	ctx.Assert(readHas(got, first[2]), "a slot whose hold expired (%s) is not advertised: an entry whose hold:{id} key is gone is free again", first[2])
-	ctx.Equal(len(got), len(readBerlin)-2, "the day's slots")
+	got := hReadSlots(ctx, r)
+	first := hReadInstants(hReadBerlin[:3])
+	ctx.Assert(!hReadHas(got, first[0]), "a confirmed booking's slot (%s) is advertised as free", first[0])
+	ctx.Assert(!hReadHas(got, first[1]), "a slot held inside the payment window (%s) is advertised as free", first[1])
+	ctx.Assert(hReadHas(got, first[2]), "a slot whose hold expired (%s) is not advertised: an entry whose hold:{id} key is gone is free again", first[2])
+	ctx.Equal(len(got), len(hReadBerlin)-2, "the day's slots")
 }
 
 func CheckTimezoneEcho(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	r := readGet(c, "")
+	c := hReadClient(ctx)
+	r := hReadGet(c, "")
 	ctx.Equal(r.Status, 200, "GET (%s)", r.Text())
-	ctx.Equal(readDecode(ctx, r).Timezone, "Europe/Berlin", "without tz the answer must name the resource's zone")
-	ctx.Equal(readSlots(ctx, r), readInstants(readBerlin), "the Berlin day must run 07:00Z to 18:30Z (08:00 to 19:30 CET)")
-	ctx.Redis.Do("HSET", slots.Key("r1"), readTokyo[0], "booked:b-2") // 08:00 in Tokyo: 23:00Z the day before
-	r = readGet(c, "&tz=Asia/Tokyo")
+	ctx.Equal(hReadDecode(ctx, r).Timezone, "Europe/Berlin", "without tz the answer must name the resource's zone")
+	ctx.Equal(hReadSlots(ctx, r), hReadInstants(hReadBerlin), "the Berlin day must run 07:00Z to 18:30Z (08:00 to 19:30 CET)")
+	ctx.Redis.Do("HSET", slots.Key("r1"), hReadTokyo[0], "booked:b-2") // 08:00 in Tokyo: 23:00Z the day before
+	r = hReadGet(c, "&tz=Asia/Tokyo")
 	ctx.Equal(r.Status, 200, "tz=Asia/Tokyo (%s)", r.Text())
-	ctx.Equal(readDecode(ctx, r).Timezone, "Asia/Tokyo", "the answer must name the zone it resolved")
-	ctx.Equal(readSlots(ctx, r), readInstants(readTokyo[1:]), "Tokyo's day starts at 23:00Z the day before and its 08:00 slot is booked")
-	r = readGet(c, "&tz=Mars/Olympus")
-	ctx.Assert(r.Status == 400 && readDecode(ctx, r).Error == "unknown_timezone", "an unknown zone answered %d %s, expected 400 unknown_timezone", r.Status, r.Text())
-	r = readGet(c, "&tz=constructor")
-	ctx.Assert(r.Status == 400 && readDecode(ctx, r).Error == "unknown_timezone", "tz=constructor answered %d %s, expected 400 unknown_timezone: only the zones booking/tz lists are known", r.Status, r.Text())
+	ctx.Equal(hReadDecode(ctx, r).Timezone, "Asia/Tokyo", "the answer must name the zone it resolved")
+	ctx.Equal(hReadSlots(ctx, r), hReadInstants(hReadTokyo[1:]), "Tokyo's day starts at 23:00Z the day before and its 08:00 slot is booked")
+	r = hReadGet(c, "&tz=Mars/Olympus")
+	ctx.Assert(r.Status == 400 && hReadDecode(ctx, r).Error == "unknown_timezone", "an unknown zone answered %d %s, expected 400 unknown_timezone", r.Status, r.Text())
+	r = hReadGet(c, "&tz=constructor")
+	ctx.Assert(r.Status == 400 && hReadDecode(ctx, r).Error == "unknown_timezone", "tz=constructor answered %d %s, expected 400 unknown_timezone: only the zones booking/tz lists are known", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -943,17 +943,17 @@ func CheckTimezoneEcho(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kReadDay = "2026-03-10";
-const std::vector<std::string> kReadBerlin = booking::slots::DayFields("Europe/Berlin", 2026, 3, 10);  // 07:00Z to 18:30Z
-const std::vector<std::string> kReadTokyo = booking::slots::DayFields("Asia/Tokyo", 2026, 3, 10);  // the day before, 23:00Z, to 10:30Z
+const std::string kHReadDay = "2026-03-10";
+const std::vector<std::string> kHReadBerlin = booking::slots::DayFields("Europe/Berlin", 2026, 3, 10);  // 07:00Z to 18:30Z
+const std::vector<std::string> kHReadTokyo = booking::slots::DayFields("Asia/Tokyo", 2026, 3, 10);  // the day before, 23:00Z, to 10:30Z
 
-std::vector<std::string> readInstants(const std::vector<std::string>& fields) {
+std::vector<std::string> hReadInstants(const std::vector<std::string>& fields) {
   std::vector<std::string> out;
   for (const auto& f : fields) out.push_back(booking::tz::FormatInstant(std::stoll(f) * 60));
   return out;
 }
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -961,107 +961,107 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& query = "") {
-  return c.Get("/v1/resources/r1/availability?from=" + kReadDay + "&to=" + kReadDay + query);
+harness::Response hReadGet(harness::HTTP& c, const std::string& query = "") {
+  return c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=" + kHReadDay + query);
 }
 
-nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hReadBody(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the answer must be JSON with resource_id, timezone and a slots list, got %s", r.Text());
   return body;
 }
 
-std::string readField(const nlohmann::json& body, const std::string& field) {
+std::string hReadField(const nlohmann::json& body, const std::string& field) {
   return body.contains(field) && body[field].is_string() ? body[field].get<std::string>() : "";
 }
 
-std::vector<std::string> readSlots(harness::Ctx& ctx, const harness::Response& r) {
-  const auto body = readBody(ctx, r);
+std::vector<std::string> hReadSlots(harness::Ctx& ctx, const harness::Response& r) {
+  const auto body = hReadBody(ctx, r);
   ctx.Assert(body.contains("slots") && body["slots"].is_array(), "the answer must carry a slots list: %s", r.Text());
   return body["slots"].get<std::vector<std::string>>();
 }
 
-bool readHas(const std::vector<std::string>& slots, const std::string& instant) {
+bool hReadHas(const std::vector<std::string>& slots, const std::string& instant) {
   return std::find(slots.begin(), slots.end(), instant) != slots.end();
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  const auto r = readGet(c);
+  auto c = hReadClient(ctx);
+  const auto r = hReadGet(c);
   ctx.Equal(r.Status, 200, "GET /v1/resources/r1/availability (%s)", r.Text());
-  ctx.Equal(readField(readBody(ctx, r), "resource_id"), "r1", "the answer must echo the resource id");
-  readSlots(ctx, r);
+  ctx.Equal(hReadField(hReadBody(ctx, r), "resource_id"), "r1", "the answer must echo the resource id");
+  hReadSlots(ctx, r);
 }
 
 void CheckRangeCap(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
+  auto c = hReadClient(ctx);
   bool touched = false;
   ctx.Redis.After(booking::slots::Key("r1"), [&] { touched = true; });
-  auto r = c.Get("/v1/resources/r1/availability?from=" + kReadDay + "&to=2026-06-09");  // 91 days
-  ctx.Assert(r.Status == 400 && readField(readBody(ctx, r), "error") == "range_too_long",
+  auto r = c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=2026-06-09");  // 91 days
+  ctx.Assert(r.Status == 400 && hReadField(hReadBody(ctx, r), "error") == "range_too_long",
              "a 91-day span answered %d %s, expected 400 range_too_long", r.Status, r.Text());
   ctx.Assert(!touched, "a 91-day span was refused only after reading resource:r1:slots: refuse it before any slot work");
-  r = c.Get("/v1/resources/r1/availability?from=" + kReadDay + "&to=2026-06-08");  // 90 days
+  r = c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=2026-06-08");  // 90 days
   ctx.Equal(r.Status, 200, "a 90-day span (%s)", r.Text());
-  ctx.Equal(readSlots(ctx, r).size(), 91 * kReadBerlin.size(), "a 90-day span of free days; its slots");
-  r = c.Get("/v1/resources/r1/availability?from=" + kReadDay + "&to=2026-03-09");
+  ctx.Equal(hReadSlots(ctx, r).size(), 91 * kHReadBerlin.size(), "a 90-day span of free days; its slots");
+  r = c.Get("/v1/resources/r1/availability?from=" + kHReadDay + "&to=2026-03-09");
   ctx.Equal(r.Status, 400, "a span ending before it starts");
 }
 
 void CheckLiveHoldMap(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  for (const auto& f : kReadBerlin) ctx.Redis.Do("HSET", "availability:r1:" + kReadDay, f, "free");  // last night's materialization
-  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kReadBerlin[2], "booked:b-9");  // booked a second ago
-  auto r = readGet(c);
+  auto c = hReadClient(ctx);
+  for (const auto& f : kHReadBerlin) ctx.Redis.Do("HSET", "availability:r1:" + kHReadDay, f, "free");  // last night's materialization
+  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kHReadBerlin[2], "booked:b-9");  // booked a second ago
+  auto r = hReadGet(c);
   ctx.Equal(r.Status, 200, "GET (%s)", r.Text());
-  const auto got = readSlots(ctx, r);
-  const std::string booked = readInstants({kReadBerlin[2]})[0];
-  ctx.Assert(!readHas(got, booked),
+  const auto got = hReadSlots(ctx, r);
+  const std::string booked = hReadInstants({kHReadBerlin[2]})[0];
+  ctx.Assert(!hReadHas(got, booked),
              "the slot booked a second ago (%s) is still advertised: read resource:r1:slots at request time, not a materialization", booked);
-  std::vector<std::string> rest(kReadBerlin.begin(), kReadBerlin.begin() + 2);
-  rest.insert(rest.end(), kReadBerlin.begin() + 3, kReadBerlin.end());
-  ctx.Equal(got, readInstants(rest), "a day with one booked slot must list the other %d slots of the Berlin day", kReadBerlin.size() - 1);
-  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kReadBerlin[5], "h-now");
+  std::vector<std::string> rest(kHReadBerlin.begin(), kHReadBerlin.begin() + 2);
+  rest.insert(rest.end(), kHReadBerlin.begin() + 3, kHReadBerlin.end());
+  ctx.Equal(got, hReadInstants(rest), "a day with one booked slot must list the other %d slots of the Berlin day", kHReadBerlin.size() - 1);
+  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kHReadBerlin[5], "h-now");
   ctx.Redis.Do("SET", booking::slots::HoldKey("h-now"), "held", "EX", 900);
-  ctx.Assert(!readHas(readSlots(ctx, readGet(c)), readInstants({kReadBerlin[5]})[0]),
+  ctx.Assert(!hReadHas(hReadSlots(ctx, hReadGet(c)), hReadInstants({kHReadBerlin[5]})[0]),
              "a slot held since the previous read must be gone from the next one");
 }
 
 void CheckHeldExcluded(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kReadBerlin[0], "booked:b-1");
-  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kReadBerlin[1], "h-live");
+  auto c = hReadClient(ctx);
+  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kHReadBerlin[0], "booked:b-1");
+  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kHReadBerlin[1], "h-live");
   ctx.Redis.Do("SET", booking::slots::HoldKey("h-live"), "held", "EX", 900);
-  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kReadBerlin[2], "h-dead");  // its checkout was abandoned an hour ago
-  const auto r = readGet(c);
+  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kHReadBerlin[2], "h-dead");  // its checkout was abandoned an hour ago
+  const auto r = hReadGet(c);
   ctx.Equal(r.Status, 200, "GET (%s)", r.Text());
-  const auto got = readSlots(ctx, r);
-  const auto first = readInstants({kReadBerlin[0], kReadBerlin[1], kReadBerlin[2]});
-  ctx.Assert(!readHas(got, first[0]), "a confirmed booking's slot (%s) is advertised as free", first[0]);
-  ctx.Assert(!readHas(got, first[1]), "a slot held inside the payment window (%s) is advertised as free", first[1]);
-  ctx.Assert(readHas(got, first[2]), "a slot whose hold expired (%s) is not advertised: an entry whose hold:{id} key is gone is free again", first[2]);
-  ctx.Equal(got.size(), kReadBerlin.size() - 2, "the day's slots");
+  const auto got = hReadSlots(ctx, r);
+  const auto first = hReadInstants({kHReadBerlin[0], kHReadBerlin[1], kHReadBerlin[2]});
+  ctx.Assert(!hReadHas(got, first[0]), "a confirmed booking's slot (%s) is advertised as free", first[0]);
+  ctx.Assert(!hReadHas(got, first[1]), "a slot held inside the payment window (%s) is advertised as free", first[1]);
+  ctx.Assert(hReadHas(got, first[2]), "a slot whose hold expired (%s) is not advertised: an entry whose hold:{id} key is gone is free again", first[2]);
+  ctx.Equal(got.size(), kHReadBerlin.size() - 2, "the day's slots");
 }
 
 void CheckTimezoneEcho(harness::Ctx& ctx) {
-  auto c = readClient(ctx);
-  auto r = readGet(c);
+  auto c = hReadClient(ctx);
+  auto r = hReadGet(c);
   ctx.Equal(r.Status, 200, "GET (%s)", r.Text());
-  ctx.Equal(readField(readBody(ctx, r), "timezone"), "Europe/Berlin", "without tz the answer must name the resource's zone");
-  ctx.Equal(readSlots(ctx, r), readInstants(kReadBerlin), "the Berlin day must run 07:00Z to 18:30Z (08:00 to 19:30 CET)");
-  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kReadTokyo[0], "booked:b-2");  // 08:00 in Tokyo: 23:00Z the day before
-  r = readGet(c, "&tz=Asia/Tokyo");
+  ctx.Equal(hReadField(hReadBody(ctx, r), "timezone"), "Europe/Berlin", "without tz the answer must name the resource's zone");
+  ctx.Equal(hReadSlots(ctx, r), hReadInstants(kHReadBerlin), "the Berlin day must run 07:00Z to 18:30Z (08:00 to 19:30 CET)");
+  ctx.Redis.Do("HSET", booking::slots::Key("r1"), kHReadTokyo[0], "booked:b-2");  // 08:00 in Tokyo: 23:00Z the day before
+  r = hReadGet(c, "&tz=Asia/Tokyo");
   ctx.Equal(r.Status, 200, "tz=Asia/Tokyo (%s)", r.Text());
-  ctx.Equal(readField(readBody(ctx, r), "timezone"), "Asia/Tokyo", "the answer must name the zone it resolved");
-  ctx.Equal(readSlots(ctx, r), readInstants(std::vector<std::string>(kReadTokyo.begin() + 1, kReadTokyo.end())),
+  ctx.Equal(hReadField(hReadBody(ctx, r), "timezone"), "Asia/Tokyo", "the answer must name the zone it resolved");
+  ctx.Equal(hReadSlots(ctx, r), hReadInstants(std::vector<std::string>(kHReadTokyo.begin() + 1, kHReadTokyo.end())),
             "Tokyo's day starts at 23:00Z the day before and its 08:00 slot is booked");
-  r = readGet(c, "&tz=Mars/Olympus");
-  ctx.Assert(r.Status == 400 && readField(readBody(ctx, r), "error") == "unknown_timezone",
+  r = hReadGet(c, "&tz=Mars/Olympus");
+  ctx.Assert(r.Status == 400 && hReadField(hReadBody(ctx, r), "error") == "unknown_timezone",
              "an unknown zone answered %d %s, expected 400 unknown_timezone", r.Status, r.Text());
-  r = readGet(c, "&tz=constructor");
-  ctx.Assert(r.Status == 400 && readField(readBody(ctx, r), "error") == "unknown_timezone",
+  r = hReadGet(c, "&tz=constructor");
+  ctx.Assert(r.Status == 400 && hReadField(hReadBody(ctx, r), "error") == "unknown_timezone",
              "tz=constructor answered %d %s, expected 400 unknown_timezone: only the zones booking/tz lists are known", r.Status,
              r.Text());
 }

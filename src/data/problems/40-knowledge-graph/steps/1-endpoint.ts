@@ -868,9 +868,9 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-type upserted struct {
+type HUpserted struct {
 	ID      string   \`json:"id"\`
 	Type    string   \`json:"type"\`
 	Aliases []string \`json:"aliases"\`
@@ -882,106 +882,106 @@ type upserted struct {
 	} \`json:"candidates"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func upsert(c *harness.HTTP, key string, body map[string]any) *harness.Response {
+func hUpsert(c *harness.HTTP, key string, body map[string]any) *harness.Response {
 	return c.Post("/v1/entities", body, "X-Tenant-Id", "t1", "Idempotency-Key", key)
 }
 
-func decoded(r *harness.Response) upserted {
-	out := upserted{}
+func hDecoded(r *harness.Response) HUpserted {
+	out := HUpserted{}
 	r.Decode(&out)
 	return out
 }
 
-func create(ctx *harness.Ctx, c *harness.HTTP, key string, body map[string]any) string {
-	r := upsert(c, key, body)
+func hCreate(ctx *harness.Ctx, c *harness.HTTP, key string, body map[string]any) string {
+	r := hUpsert(c, key, body)
 	ctx.Equal(r.Status, 201, "POST /v1/entities %v (%s)", body, r.Text())
-	return decoded(r).ID
+	return hDecoded(r).ID
 }
 
-func seq(ctx *harness.Ctx) string {
+func hSeq(ctx *harness.Ctx) string {
 	n, _ := ctx.Redis.Get("entity:seq")
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := upsert(c, "k-1", map[string]any{"type": "person", "name": "Ada Lovelace", "aliases": []string{"Ada", "A. Lovelace"}})
+	c := hApi(ctx)
+	r := hUpsert(c, "k-1", map[string]any{"type": "person", "name": "Ada Lovelace", "aliases": []string{"Ada", "A. Lovelace"}})
 	ctx.Equal(r.Status, 201, "POST /v1/entities (%s)", r.Text())
-	first := decoded(r)
+	first := hDecoded(r)
 	ctx.Assert(!first.Merged && strings.Join(first.Aliases, ",") == "a. lovelace,ada", "a new entity must answer merged false with its aliases, got %s", r.Text())
-	stored := store.GetEntity(apiBg, first.ID)
+	stored := store.GetEntity(hApiBg, first.ID)
 	ctx.Assert(stored != nil && stored.Tenant == "t1" && stored.Type == "person", "the store holds %+v for %s", stored, first.ID)
-	r = upsert(c, "k-2", map[string]any{"type": "person", "name": "Augusta Ada King", "aliases": []string{"ada", "Augusta King"}})
-	again := decoded(r)
+	r = hUpsert(c, "k-2", map[string]any{"type": "person", "name": "Augusta Ada King", "aliases": []string{"ada", "Augusta King"}})
+	again := hDecoded(r)
 	ctx.Assert(r.Status == 200 && again.ID == first.ID && again.Merged, "an alias the same person already claims must extend that entity (200, merged true), got %d %s", r.Status, r.Text())
-	ctx.Assert(strings.Contains(strings.Join(store.GetEntity(apiBg, first.ID).Aliases, ","), "augusta king"), "the new alias must be claimed by %s", first.ID)
+	ctx.Assert(strings.Contains(strings.Join(store.GetEntity(hApiBg, first.ID).Aliases, ","), "augusta king"), "the new alias must be claimed by %s", first.ID)
 	r = c.Post("/v1/entities", map[string]any{"type": "person", "name": "Grace Hopper"}, "Idempotency-Key", "k-3")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckMergePolicy(ctx *harness.Ctx) {
-	c := api(ctx)
-	ada := create(ctx, c, "k-1", map[string]any{"type": "person", "name": "Ada Lovelace", "aliases": []string{"ada"}})
-	r := upsert(c, "k-2", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "merge_into": ada})
+	c := hApi(ctx)
+	ada := hCreate(ctx, c, "k-1", map[string]any{"type": "person", "name": "Ada Lovelace", "aliases": []string{"ada"}})
+	r := hUpsert(c, "k-2", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "merge_into": ada})
 	ctx.Assert(r.Status == 400, "a body naming merge_into answered %d %s: the caller folded Grace Hopper into Ada Lovelace. Whether two entities become one is the server's decision; refuse the field with 400", r.Status, r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "merge_into"), "the 400 must name the refused field, got %s", r.Text())
-	ctx.Equal(store.GetEntity(apiBg, ada).Aliases, []string{"ada"}, "the refused request must not change %s; its aliases", ada)
-	ctx.Assert(store.FindAlias(apiBg, "t1", "grace") == nil, "the refused request must write nothing, yet the alias grace is claimed")
-	r = upsert(c, "k-3", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "force": true})
+	ctx.Equal(store.GetEntity(hApiBg, ada).Aliases, []string{"ada"}, "the refused request must not change %s; its aliases", ada)
+	ctx.Assert(store.FindAlias(hApiBg, "t1", "grace") == nil, "the refused request must write nothing, yet the alias grace is claimed")
+	r = hUpsert(c, "k-3", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "force": true})
 	ctx.Equal(r.Status, 400, "a body carrying force")
-	r = upsert(c, "k-5", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "merge_policy": "auto"})
+	r = hUpsert(c, "k-5", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "merge_policy": "auto"})
 	ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "merge_policy"), "a body carrying merge_policy answered %d %s, expected 400 naming merge_policy: every authorityFields key is refused", r.Status, r.Text())
-	r = upsert(c, "k-6", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "force": false})
+	r = hUpsert(c, "k-6", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "force": false})
 	ctx.Assert(r.Status == 400, "a body carrying force false answered %d %s, expected 400: a body carrying the field is refused whatever its value", r.Status, r.Text())
-	ctx.Assert(store.FindAlias(apiBg, "t1", "grace") == nil, "a refused request must write nothing, yet the alias grace is claimed")
-	r = upsert(c, "k-4", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}})
+	ctx.Assert(store.FindAlias(hApiBg, "t1", "grace") == nil, "a refused request must write nothing, yet the alias grace is claimed")
+	r = hUpsert(c, "k-4", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}})
 	ctx.Equal(r.Status, 201, "the same entity without authority fields (%s)", r.Text())
 }
 
 func CheckCrossType409(ctx *harness.Ctx) {
-	c := api(ctx)
-	person := create(ctx, c, "k-1", map[string]any{"type": "person", "name": "Jordan Reyes", "aliases": []string{"jordan"}})
-	r := upsert(c, "k-2", map[string]any{"type": "company", "name": "Jordan Ltd", "aliases": []string{"Jordan", "Jordan Ltd"}})
+	c := hApi(ctx)
+	person := hCreate(ctx, c, "k-1", map[string]any{"type": "person", "name": "Jordan Reyes", "aliases": []string{"jordan"}})
+	r := hUpsert(c, "k-2", map[string]any{"type": "company", "name": "Jordan Ltd", "aliases": []string{"Jordan", "Jordan Ltd"}})
 	ctx.Assert(r.Status == 409, "a company claiming the alias of a person answered %d %s: the company was folded into the person. A cross-type collision is 409", r.Status, r.Text())
 	named, types := false, []string{}
-	for _, candidate := range decoded(r).Candidates {
+	for _, candidate := range hDecoded(r).Candidates {
 		if id, ok := candidate.ID.(string); ok && id == person {
 			named = true
 		}
 		types = append(types, candidate.Type)
 	}
 	ctx.Assert(named && len(types) == 2 && ((types[0] == "person" && types[1] == "company") || (types[0] == "company" && types[1] == "person")), "the 409 must name both candidates (the person %s and the proposed company), got %s", person, r.Text())
-	stored := store.GetEntity(apiBg, person)
+	stored := store.GetEntity(hApiBg, person)
 	ctx.Assert(strings.Join(stored.Aliases, ",") == "jordan" && stored.Type == "person", "the 409 must write nothing, yet %s is now %+v", person, stored)
-	ctx.Assert(store.FindAlias(apiBg, "t1", "jordan ltd") == nil, "the 409 must write nothing, yet the alias jordan ltd is claimed")
-	ctx.Equal(seq(ctx), "1", "the 409 must create nothing; the entities that exist")
-	acme := create(ctx, c, "k-3", map[string]any{"type": "company", "name": "Acme", "aliases": []string{"acme"}})
-	r = upsert(c, "k-4", map[string]any{"type": "company", "name": "Acme Jordan", "aliases": []string{"Acme", "Jordan"}})
+	ctx.Assert(store.FindAlias(hApiBg, "t1", "jordan ltd") == nil, "the 409 must write nothing, yet the alias jordan ltd is claimed")
+	ctx.Equal(hSeq(ctx), "1", "the 409 must create nothing; the entities that exist")
+	acme := hCreate(ctx, c, "k-3", map[string]any{"type": "company", "name": "Acme", "aliases": []string{"acme"}})
+	r = hUpsert(c, "k-4", map[string]any{"type": "company", "name": "Acme Jordan", "aliases": []string{"Acme", "Jordan"}})
 	ctx.Assert(r.Status == 409, "a company whose first alias belongs to a company and whose second belongs to a person answered %d %s: every alias is checked, a cross-type claimant on any of them is 409", r.Status, r.Text())
-	acmeAliases := strings.Join(store.GetEntity(apiBg, acme).Aliases, ",")
+	acmeAliases := strings.Join(store.GetEntity(hApiBg, acme).Aliases, ",")
 	jordan := ""
-	if claimant := store.FindAlias(apiBg, "t1", "jordan"); claimant != nil {
+	if claimant := store.FindAlias(hApiBg, "t1", "jordan"); claimant != nil {
 		jordan = claimant.ID
 	}
 	ctx.Assert(acmeAliases == "acme" && jordan == person, "the 409 must write nothing, yet %s holds %s and jordan is claimed by %s", acme, acmeAliases, jordan)
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	body := map[string]any{"type": "person", "name": "Ada Lovelace"}
-	first := upsert(c, "k-1", body)
+	first := hUpsert(c, "k-1", body)
 	ctx.Equal(first.Status, 201, "the first upsert (%s)", first.Text())
-	replay := upsert(c, "k-1", body)
-	ctx.Assert(replay.Status == 201 && decoded(replay).ID == decoded(first).ID, "a replay of Idempotency-Key k-1 must answer what the first call answered: first %d %s, replay %d %s", first.Status, first.Text(), replay.Status, replay.Text())
-	ctx.Equal(seq(ctx), "1", "a retried upsert must not create a second entity (look (tenant, key) up before writing); the entities that exist")
+	replay := hUpsert(c, "k-1", body)
+	ctx.Assert(replay.Status == 201 && hDecoded(replay).ID == hDecoded(first).ID, "a replay of Idempotency-Key k-1 must answer what the first call answered: first %d %s, replay %d %s", first.Status, first.Text(), replay.Status, replay.Text())
+	ctx.Equal(hSeq(ctx), "1", "a retried upsert must not create a second entity (look (tenant, key) up before writing); the entities that exist")
 	other := c.Post("/v1/entities", body, "X-Tenant-Id", "t2", "Idempotency-Key", "k-1")
-	ctx.Assert(other.Status == 201 && decoded(other).ID != decoded(first).ID, "the same key from another tenant is another request, got %d %s", other.Status, other.Text())
+	ctx.Assert(other.Status == 201 && hDecoded(other).ID != hDecoded(first).ID, "the same key from another tenant is another request, got %d %s", other.Status, other.Text())
 	none := c.Post("/v1/entities", body, "X-Tenant-Id", "t1")
 	ctx.Equal(none.Status, 400, "an upsert without Idempotency-Key")
 }
@@ -996,7 +996,7 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1004,24 +1004,24 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response upsert(harness::HTTP& c, const std::string& key, const nlohmann::json& body, const std::string& tenant = "t1") {
+harness::Response hUpsert(harness::HTTP& c, const std::string& key, const nlohmann::json& body, const std::string& tenant = "t1") {
   return c.Post("/v1/entities", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::string idOf(const harness::Response& r) {
-  const auto body = bodyOf(r);
+std::string hIdOf(const harness::Response& r) {
+  const auto body = hBodyOf(r);
   return body.is_object() && body.contains("id") && body["id"].is_string() ? body["id"].get<std::string>() : "";
 }
 
-std::string create(harness::Ctx& ctx, harness::HTTP& c, const std::string& key, const nlohmann::json& body) {
-  const auto r = upsert(c, key, body);
+std::string hCreate(harness::Ctx& ctx, harness::HTTP& c, const std::string& key, const nlohmann::json& body) {
+  const auto r = hUpsert(c, key, body);
   ctx.Equal(r.Status, 201, "POST /v1/entities %s (%s)", body.dump(), r.Text());
-  return idOf(r);
+  return hIdOf(r);
 }
 
-std::string joined(const std::vector<std::string>& items) {
+std::string hJoined(const std::vector<std::string>& items) {
   std::string out;
   for (const auto& item : items) out += (out.empty() ? "" : ",") + item;
   return out;
@@ -1030,48 +1030,48 @@ std::string joined(const std::vector<std::string>& items) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = upsert(c, "k-1", {{"type", "person"}, {"name", "Ada Lovelace"}, {"aliases", {"Ada", "A. Lovelace"}}});
+  auto c = hApi(ctx);
+  auto r = hUpsert(c, "k-1", {{"type", "person"}, {"name", "Ada Lovelace"}, {"aliases", {"Ada", "A. Lovelace"}}});
   ctx.Equal(r.Status, 201, "POST /v1/entities (%s)", r.Text());
-  const auto first = bodyOf(r);
+  const auto first = hBodyOf(r);
   ctx.Assert(first.value("merged", true) == false && first.value("aliases", std::vector<std::string>{}) == std::vector<std::string>{"a. lovelace", "ada"},
              "a new entity must answer merged false with its aliases, got %s", r.Text());
-  const std::string id = idOf(r);
+  const std::string id = hIdOf(r);
   const auto stored = store::getEntity(id);
   ctx.Assert(stored && stored->tenant == "t1" && stored->type == "person", "the store must hold %s as a person of t1", id);
-  r = upsert(c, "k-2", {{"type", "person"}, {"name", "Augusta Ada King"}, {"aliases", {"ada", "Augusta King"}}});
-  ctx.Assert(r.Status == 200 && idOf(r) == id && bodyOf(r).value("merged", false), "an alias the same person already claims must extend that entity (200, merged true), got %d %s", r.Status, r.Text());
+  r = hUpsert(c, "k-2", {{"type", "person"}, {"name", "Augusta Ada King"}, {"aliases", {"ada", "Augusta King"}}});
+  ctx.Assert(r.Status == 200 && hIdOf(r) == id && hBodyOf(r).value("merged", false), "an alias the same person already claims must extend that entity (200, merged true), got %d %s", r.Status, r.Text());
   const auto aliases = store::getEntity(id)->aliases;
-  ctx.Assert(std::find(aliases.begin(), aliases.end(), "augusta king") != aliases.end(), "the new alias must be claimed by %s, it holds %s", id, joined(aliases));
+  ctx.Assert(std::find(aliases.begin(), aliases.end(), "augusta king") != aliases.end(), "the new alias must be claimed by %s, it holds %s", id, hJoined(aliases));
   r = c.Post("/v1/entities", R"({"type": "person", "name": "Grace Hopper"})", "Content-Type", "application/json", "Idempotency-Key", "k-3");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckMergePolicy(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string ada = create(ctx, c, "k-1", {{"type", "person"}, {"name", "Ada Lovelace"}, {"aliases", {"ada"}}});
-  auto r = upsert(c, "k-2", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"merge_into", ada}});
+  auto c = hApi(ctx);
+  const std::string ada = hCreate(ctx, c, "k-1", {{"type", "person"}, {"name", "Ada Lovelace"}, {"aliases", {"ada"}}});
+  auto r = hUpsert(c, "k-2", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"merge_into", ada}});
   ctx.Assert(r.Status == 400, "a body naming merge_into answered %d %s: the caller folded Grace Hopper into Ada Lovelace. Whether two entities become one is the server's decision; refuse the field with 400", r.Status, r.Text());
   ctx.Assert(r.Text().find("merge_into") != std::string::npos, "the 400 must name the refused field, got %s", r.Text());
-  ctx.Equal(joined(store::getEntity(ada)->aliases), "ada", "the refused request must not change %s; its aliases", ada);
+  ctx.Equal(hJoined(store::getEntity(ada)->aliases), "ada", "the refused request must not change %s; its aliases", ada);
   ctx.Assert(!store::findAlias("t1", "grace"), "the refused request must write nothing, yet the alias grace is claimed");
-  r = upsert(c, "k-3", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"force", true}});
+  r = hUpsert(c, "k-3", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"force", true}});
   ctx.Equal(r.Status, 400, "a body carrying force");
-  r = upsert(c, "k-5", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"merge_policy", "auto"}});
+  r = hUpsert(c, "k-5", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"merge_policy", "auto"}});
   ctx.Assert(r.Status == 400 && r.Text().find("merge_policy") != std::string::npos, "a body carrying merge_policy answered %d %s, expected 400 naming merge_policy: every kAuthorityFields key is refused", r.Status, r.Text());
-  r = upsert(c, "k-6", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"force", false}});
+  r = hUpsert(c, "k-6", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"force", false}});
   ctx.Assert(r.Status == 400, "a body carrying force false answered %d %s, expected 400: a body carrying the field is refused whatever its value", r.Status, r.Text());
   ctx.Assert(!store::findAlias("t1", "grace"), "a refused request must write nothing, yet the alias grace is claimed");
-  r = upsert(c, "k-4", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}});
+  r = hUpsert(c, "k-4", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}});
   ctx.Equal(r.Status, 201, "the same entity without authority fields (%s)", r.Text());
 }
 
 void CheckCrossType409(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string person = create(ctx, c, "k-1", {{"type", "person"}, {"name", "Jordan Reyes"}, {"aliases", {"jordan"}}});
-  const auto r = upsert(c, "k-2", {{"type", "company"}, {"name", "Jordan Ltd"}, {"aliases", {"Jordan", "Jordan Ltd"}}});
+  auto c = hApi(ctx);
+  const std::string person = hCreate(ctx, c, "k-1", {{"type", "person"}, {"name", "Jordan Reyes"}, {"aliases", {"jordan"}}});
+  const auto r = hUpsert(c, "k-2", {{"type", "company"}, {"name", "Jordan Ltd"}, {"aliases", {"Jordan", "Jordan Ltd"}}});
   ctx.Assert(r.Status == 409, "a company claiming the alias of a person answered %d %s: the company was folded into the person. A cross-type collision is 409", r.Status, r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   bool named = false;
   std::vector<std::string> types;
   if (body.is_object() && body.contains("candidates") && body["candidates"].is_array()) {
@@ -1083,28 +1083,28 @@ void CheckCrossType409(harness::Ctx& ctx) {
   std::sort(types.begin(), types.end());
   ctx.Assert(named && types == std::vector<std::string>{"company", "person"}, "the 409 must name both candidates (the person %s and the proposed company), got %s", person, r.Text());
   const auto stored = store::getEntity(person);
-  ctx.Assert(joined(stored->aliases) == "jordan" && stored->type == "person", "the 409 must write nothing, yet %s now holds the aliases %s as a %s", person, joined(stored->aliases), stored->type);
+  ctx.Assert(hJoined(stored->aliases) == "jordan" && stored->type == "person", "the 409 must write nothing, yet %s now holds the aliases %s as a %s", person, hJoined(stored->aliases), stored->type);
   ctx.Assert(!store::findAlias("t1", "jordan ltd"), "the 409 must write nothing, yet the alias jordan ltd is claimed");
   ctx.Equal(ctx.Redis.Get("entity:seq").value_or(""), "1", "the 409 must create nothing; the entities that exist");
-  const std::string acme = create(ctx, c, "k-3", {{"type", "company"}, {"name", "Acme"}, {"aliases", {"acme"}}});
-  const auto mixed = upsert(c, "k-4", {{"type", "company"}, {"name", "Acme Jordan"}, {"aliases", {"Acme", "Jordan"}}});
+  const std::string acme = hCreate(ctx, c, "k-3", {{"type", "company"}, {"name", "Acme"}, {"aliases", {"acme"}}});
+  const auto mixed = hUpsert(c, "k-4", {{"type", "company"}, {"name", "Acme Jordan"}, {"aliases", {"Acme", "Jordan"}}});
   ctx.Assert(mixed.Status == 409, "a company whose first alias belongs to a company and whose second belongs to a person answered %d %s: every alias is checked, a cross-type claimant on any of them is 409", mixed.Status, mixed.Text());
-  const std::string acmeAliases = joined(store::getEntity(acme)->aliases);
+  const std::string acmeAliases = hJoined(store::getEntity(acme)->aliases);
   const auto claimant = store::findAlias("t1", "jordan");
   const std::string jordan = claimant ? claimant->id : "";
   ctx.Assert(acmeAliases == "acme" && jordan == person, "the 409 must write nothing, yet %s holds %s and jordan is claimed by %s", acme, acmeAliases, jordan);
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const nlohmann::json body = {{"type", "person"}, {"name", "Ada Lovelace"}};
-  const auto first = upsert(c, "k-1", body);
+  const auto first = hUpsert(c, "k-1", body);
   ctx.Equal(first.Status, 201, "the first upsert (%s)", first.Text());
-  const auto replay = upsert(c, "k-1", body);
-  ctx.Assert(replay.Status == 201 && bodyOf(replay) == bodyOf(first), "a replay of Idempotency-Key k-1 must answer what the first call answered: first %d %s, replay %d %s", first.Status, first.Text(), replay.Status, replay.Text());
+  const auto replay = hUpsert(c, "k-1", body);
+  ctx.Assert(replay.Status == 201 && hBodyOf(replay) == hBodyOf(first), "a replay of Idempotency-Key k-1 must answer what the first call answered: first %d %s, replay %d %s", first.Status, first.Text(), replay.Status, replay.Text());
   ctx.Equal(ctx.Redis.Get("entity:seq").value_or(""), "1", "a retried upsert must not create a second entity (look (tenant, key) up before writing); the entities that exist");
-  const auto other = upsert(c, "k-1", body, "t2");
-  ctx.Assert(other.Status == 201 && idOf(other) != idOf(first), "the same key from another tenant is another request, got %d %s", other.Status, other.Text());
+  const auto other = hUpsert(c, "k-1", body, "t2");
+  ctx.Assert(other.Status == 201 && hIdOf(other) != hIdOf(first), "the same key from another tenant is another request, got %d %s", other.Status, other.Text());
   const auto none = c.Post("/v1/entities", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(none.Status, 400, "an upsert without Idempotency-Key");
 }

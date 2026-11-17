@@ -828,17 +828,17 @@ import (
 	"leetbuild/harness"
 )
 
-var apiGood = map[string]any{"model": "gpt-4o", "input_tokens": 1200, "output_tokens": 300}
+var hApiGood = map[string]any{"model": "gpt-4o", "input_tokens": 1200, "output_tokens": 300}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(overrides map[string]any) map[string]any {
+func hApiWith(overrides map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiGood {
+	for k, v := range hApiGood {
 		out[k] = v
 	}
 	for k, v := range overrides {
@@ -847,23 +847,23 @@ func apiWith(overrides map[string]any) map[string]any {
 	return out
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/usage", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiRow(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiRow(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	row, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return row
 }
 
-func apiRows(ctx *harness.Ctx) []string {
+func hApiRows(ctx *harness.Ctx) []string {
 	keys := ctx.Redis.Keys("usage:*")
 	sort.Strings(keys)
 	return keys
 }
 
-func apiStored(ctx *harness.Ctx, key string) map[string]any {
+func hApiStored(ctx *harness.Ctx, key string) map[string]any {
 	raw, _ := ctx.Redis.Get(key)
 	var row map[string]any
 	ctx.NoError(json.Unmarshal([]byte(raw), &row), "the stored row is JSON: %s", raw)
@@ -871,76 +871,76 @@ func apiStored(ctx *harness.Ctx, key string) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "k-1", "t1")
 	ctx.Equal(r.Status, 202, "a valid report (%s)", r.Text())
-	row := apiRow(ctx, r)
+	row := hApiRow(ctx, r)
 	for _, field := range []string{"usage_id", "tenant", "model", "input_tokens", "output_tokens"} {
 		_, ok := row[field]
 		ctx.Assert(ok, "the 202 body lacks %s: %s", field, r.Text())
 	}
 	ctx.Assert(row["tenant"] == "t1" && row["model"] == "gpt-4o" && row["input_tokens"] == float64(1200) && row["output_tokens"] == float64(300), "the row echoes the tenant and the report: %s", r.Text())
-	keys := apiRows(ctx)
+	keys := hApiRows(ctx)
 	ctx.Equal(len(keys), 1, "one report must store one row in the usage store (%v); rows", keys)
-	ctx.Equal(apiStored(ctx, keys[0])["usage_id"], row["usage_id"], "the stored row must be the row the 202 answered; usage_id")
-	noTenant := c.Post("/v1/usage", apiGood, "Idempotency-Key", "k-2")
+	ctx.Equal(hApiStored(ctx, keys[0])["usage_id"], row["usage_id"], "the stored row must be the row the 202 answered; usage_id")
+	noTenant := c.Post("/v1/usage", hApiGood, "Idempotency-Key", "k-2")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the report")
 }
 
 func CheckTokenRange(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	bad := [][2]any{{-1, 10}, {10, -5}, {0, 1_000_001}, {1_000_001, 0}, {2.5, 10}, {10, 2.5}, {"300", 10}, {10, "300"}, {true, 10}, {4_294_967_306, 10}}
 	for i, counts := range bad {
-		r := apiPost(c, apiWith(map[string]any{"input_tokens": counts[0], "output_tokens": counts[1]}), fmt.Sprintf("k-bad-%d", i), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"input_tokens": counts[0], "output_tokens": counts[1]}), fmt.Sprintf("k-bad-%d", i), "t1")
 		ctx.Equal(r.Status, 400, "input_tokens=%v, output_tokens=%v (a negative count erases spend that happened, and only integers 0..1000000 are token counts)", counts[0], counts[1])
 	}
-	missing := apiPost(c, map[string]any{"model": "gpt-4o", "output_tokens": 10}, "k-bad-missing", "t1")
+	missing := hApiPost(c, map[string]any{"model": "gpt-4o", "output_tokens": 10}, "k-bad-missing", "t1")
 	ctx.Equal(missing.Status, 400, "a report without input_tokens (a missing count is not a count of 0)")
-	ctx.Equal(len(apiRows(ctx)), 0, "refused reports must store nothing (%v); rows", apiRows(ctx))
+	ctx.Equal(len(hApiRows(ctx)), 0, "refused reports must store nothing (%v); rows", hApiRows(ctx))
 	for i, n := range []int{0, 1_000_000} {
-		r := apiPost(c, apiWith(map[string]any{"input_tokens": n, "output_tokens": n}), fmt.Sprintf("k-ok-%d", i), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"input_tokens": n, "output_tokens": n}), fmt.Sprintf("k-ok-%d", i), "t1")
 		ctx.Equal(r.Status, 202, "counts of %d are within 0..1000000 inclusive (%s)", n, r.Text())
 	}
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/usage", apiGood, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/usage", hApiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a report without Idempotency-Key")
-	ctx.Equal(len(apiRows(ctx)), 0, "a report without a key must store nothing; rows")
-	first := apiPost(c, apiGood, "k-7", "t1")
+	ctx.Equal(len(hApiRows(ctx)), 0, "a report without a key must store nothing; rows")
+	first := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 202, "the first report (%s)", first.Text())
-	replay := apiPost(c, apiGood, "k-7", "t1")
+	replay := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored row (the gateway retried; finance must not bill it twice)")
-	ctx.Equal(apiRow(ctx, replay)["usage_id"], apiRow(ctx, first)["usage_id"], "the replay must answer the stored row; usage_id")
-	ctx.Equal(len(apiRows(ctx)), 1, "one key, one row: rows after a report and its replay (%v)", apiRows(ctx))
-	other := apiPost(c, apiGood, "k-7", "t2")
-	ctx.Assert(other.Status == 202 && apiRow(ctx, other)["usage_id"] != apiRow(ctx, first)["usage_id"], "another tenant reusing the key gets its own row (keys are per tenant), got %d: %s", other.Status, other.Text())
+	ctx.Equal(hApiRow(ctx, replay)["usage_id"], hApiRow(ctx, first)["usage_id"], "the replay must answer the stored row; usage_id")
+	ctx.Equal(len(hApiRows(ctx)), 1, "one key, one row: rows after a report and its replay (%v)", hApiRows(ctx))
+	other := hApiPost(c, hApiGood, "k-7", "t2")
+	ctx.Assert(other.Status == 202 && hApiRow(ctx, other)["usage_id"] != hApiRow(ctx, first)["usage_id"], "another tenant reusing the key gets its own row (keys are per tenant), got %d: %s", other.Status, other.Text())
 }
 
 func CheckKeyReuse(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := apiPost(c, apiGood, "k-9", "t1")
+	c := hApiClient(ctx)
+	first := hApiPost(c, hApiGood, "k-9", "t1")
 	ctx.Equal(first.Status, 202, "the first report (%s)", first.Text())
 	for _, change := range []map[string]any{{"output_tokens": 3000}, {"input_tokens": 1201}, {"model": "gpt-4o-mini"}} {
-		r := apiPost(c, apiWith(change), "k-9", "t1")
+		r := hApiPost(c, hApiWith(change), "k-9", "t1")
 		ctx.Equal(r.Status, 409, "Idempotency-Key k-9 reused with %v (answering the old row hides a report the client believes was billed)", change)
 	}
-	keys := apiRows(ctx)
+	keys := hApiRows(ctx)
 	ctx.Equal(len(keys), 1, "a conflicting report must store nothing (%v); rows", keys)
-	stored := apiStored(ctx, keys[0])
+	stored := hApiStored(ctx, keys[0])
 	ctx.Assert(stored["model"] == "gpt-4o" && stored["output_tokens"] == float64(300), "the stored row must stay the first report, it is %v", stored)
-	replay := apiPost(c, apiGood, "k-9", "t1")
+	replay := hApiPost(c, hApiGood, "k-9", "t1")
 	ctx.Equal(replay.Status, 200, "the original report replayed after a conflict")
 }
 
 func CheckValidateBeforeStore(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	for i, body := range []map[string]any{apiWith(map[string]any{"model": ""}), {"input_tokens": 10, "output_tokens": 10}, apiWith(map[string]any{"model": 42})} {
-		r := apiPost(c, body, fmt.Sprintf("k-m-%d", i), "t1")
+	c := hApiClient(ctx)
+	for i, body := range []map[string]any{hApiWith(map[string]any{"model": ""}), {"input_tokens": 10, "output_tokens": 10}, hApiWith(map[string]any{"model": 42})} {
+		r := hApiPost(c, body, fmt.Sprintf("k-m-%d", i), "t1")
 		ctx.Equal(r.Status, 400, "a report without a model name (%v): model is a non-empty string, and an unnamed model cannot be priced or audited", body)
 	}
-	r := apiPost(c, apiWith(map[string]any{"input_tokens": -40}), "k-neg", "t1")
+	r := hApiPost(c, hApiWith(map[string]any{"input_tokens": -40}), "k-neg", "t1")
 	ctx.Equal(r.Status, 400, "a negative count")
 	ctx.Equal(len(ctx.Redis.Keys("*")), 0, "rejected reports must leave nothing in Redis (%v): validate before usage.Put; keys", ctx.Redis.Keys("*"))
 }
@@ -957,118 +957,118 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGood = {{"model", "gpt-4o"}, {"input_tokens", 1200}, {"output_tokens", 300}};
+const json kHGood = {{"model", "gpt-4o"}, {"input_tokens", 1200}, {"output_tokens", 300}};
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& key = "k-1", const std::string& tenant = "t1") {
     return http.Post("/v1/usage", body.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
   }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json hWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-json rowOf(harness::Ctx& ctx, const harness::Response& r) {
+json hRowOf(harness::Ctx& ctx, const harness::Response& r) {
   const json row = json::parse(r.Text(), nullptr, false);
   ctx.Assert(row.is_object(), "the body must be a JSON object: %s", r.Text());
   return row;
 }
 
-std::vector<std::string> rows(harness::Ctx& ctx) {
+std::vector<std::string> hRows(harness::Ctx& ctx) {
   auto keys = ctx.Redis.Keys("usage:*");
   std::sort(keys.begin(), keys.end());
   return keys;
 }
 
-json stored(harness::Ctx& ctx, const std::string& key) {
+json hStored(harness::Ctx& ctx, const std::string& key) {
   return json::parse(ctx.Redis.Get(key).value_or("null"), nullptr, false);
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HApi api(ctx);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 202, "a valid report (%s)", r.Text());
-  const json row = rowOf(ctx, r);
+  const json row = hRowOf(ctx, r);
   for (const char* field : {"usage_id", "tenant", "model", "input_tokens", "output_tokens"}) {
     ctx.Assert(row.contains(field), "the 202 body lacks %s: %s", field, r.Text());
   }
   ctx.Assert(row["tenant"] == "t1" && row["model"] == "gpt-4o" && row["input_tokens"] == 1200 && row["output_tokens"] == 300,
              "the row echoes the tenant and the report: %s", r.Text());
-  const auto keys = rows(ctx);
+  const auto keys = hRows(ctx);
   ctx.Equal(keys.size(), 1, "one report must store one row in the usage store (%v); rows", keys);
-  ctx.Equal(stored(ctx, keys[0])["usage_id"], row["usage_id"], "the stored row must be the row the 202 answered; usage_id");
-  const auto noTenant = api.http.Post("/v1/usage", kGood.dump(), "Idempotency-Key", "k-2");
+  ctx.Equal(hStored(ctx, keys[0])["usage_id"], row["usage_id"], "the stored row must be the row the 202 answered; usage_id");
+  const auto noTenant = api.http.Post("/v1/usage", kHGood.dump(), "Idempotency-Key", "k-2");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the report");
 }
 
 void CheckTokenRange(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   const std::vector<std::pair<json, json>> bad = {{-1, 10}, {10, -5}, {0, 1000001}, {1000001, 0}, {2.5, 10},
                                                   {10, 2.5}, {"300", 10}, {10, "300"}, {true, 10}, {4294967306LL, 10}};
   int i = 0;
   for (const auto& [inp, out] : bad) {
-    const auto r = api.post(with(with(kGood, "input_tokens", inp), "output_tokens", out), "k-bad-" + std::to_string(i++));
+    const auto r = api.post(hWith(hWith(kHGood, "input_tokens", inp), "output_tokens", out), "k-bad-" + std::to_string(i++));
     ctx.Equal(r.Status, 400, "input_tokens=%s, output_tokens=%s (a negative count erases spend that happened, and only integers 0..1000000 are token counts)", inp.dump(), out.dump());
   }
   const auto missing = api.post(json{{"model", "gpt-4o"}, {"output_tokens", 10}}, "k-bad-missing");
   ctx.Equal(missing.Status, 400, "a report without input_tokens (a missing count is not a count of 0)");
-  ctx.Equal(rows(ctx).size(), 0, "refused reports must store nothing (%v); rows", rows(ctx));
+  ctx.Equal(hRows(ctx).size(), 0, "refused reports must store nothing (%v); rows", hRows(ctx));
   for (long long n : {0LL, 1000000LL}) {
-    const auto r = api.post(with(with(kGood, "input_tokens", n), "output_tokens", n), "k-ok-" + std::to_string(n));
+    const auto r = api.post(hWith(hWith(kHGood, "input_tokens", n), "output_tokens", n), "k-ok-" + std::to_string(n));
     ctx.Equal(r.Status, 202, "counts of %d are within 0..1000000 inclusive (%s)", n, r.Text());
   }
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/usage", kGood.dump(), "X-Tenant-Id", "t1");
+  HApi api(ctx);
+  const auto noKey = api.http.Post("/v1/usage", kHGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a report without Idempotency-Key");
-  ctx.Equal(rows(ctx).size(), 0, "a report without a key must store nothing; rows");
-  const auto first = api.post(kGood, "k-7");
+  ctx.Equal(hRows(ctx).size(), 0, "a report without a key must store nothing; rows");
+  const auto first = api.post(kHGood, "k-7");
   ctx.Equal(first.Status, 202, "the first report (%s)", first.Text());
-  const auto replay = api.post(kGood, "k-7");
+  const auto replay = api.post(kHGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored row (the gateway retried; finance must not bill it twice)");
-  ctx.Equal(rowOf(ctx, replay)["usage_id"], rowOf(ctx, first)["usage_id"], "the replay must answer the stored row; usage_id");
-  ctx.Equal(rows(ctx).size(), 1, "one key, one row: rows after a report and its replay (%v)", rows(ctx));
-  const auto other = api.post(kGood, "k-7", "t2");
-  ctx.Assert(other.Status == 202 && rowOf(ctx, other)["usage_id"] != rowOf(ctx, first)["usage_id"],
+  ctx.Equal(hRowOf(ctx, replay)["usage_id"], hRowOf(ctx, first)["usage_id"], "the replay must answer the stored row; usage_id");
+  ctx.Equal(hRows(ctx).size(), 1, "one key, one row: rows after a report and its replay (%v)", hRows(ctx));
+  const auto other = api.post(kHGood, "k-7", "t2");
+  ctx.Assert(other.Status == 202 && hRowOf(ctx, other)["usage_id"] != hRowOf(ctx, first)["usage_id"],
              "another tenant reusing the key gets its own row (keys are per tenant), got %d: %s", other.Status, other.Text());
 }
 
 void CheckKeyReuse(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto first = api.post(kGood, "k-9");
+  HApi api(ctx);
+  const auto first = api.post(kHGood, "k-9");
   ctx.Equal(first.Status, 202, "the first report (%s)", first.Text());
   for (const auto& [field, value] :
        std::vector<std::pair<std::string, json>>{{"output_tokens", 3000}, {"input_tokens", 1201}, {"model", "gpt-4o-mini"}}) {
-    const auto r = api.post(with(kGood, field, value), "k-9");
+    const auto r = api.post(hWith(kHGood, field, value), "k-9");
     ctx.Equal(r.Status, 409, "Idempotency-Key k-9 reused with %s=%s (answering the old row hides a report the client believes was billed)", field, value.dump());
   }
-  const auto keys = rows(ctx);
+  const auto keys = hRows(ctx);
   ctx.Equal(keys.size(), 1, "a conflicting report must store nothing (%v); rows", keys);
-  const json row = stored(ctx, keys[0]);
+  const json row = hStored(ctx, keys[0]);
   ctx.Assert(row.is_object() && row["model"] == "gpt-4o" && row["output_tokens"] == 300, "the stored row must stay the first report, it is %s", row.dump());
-  const auto replay = api.post(kGood, "k-9");
+  const auto replay = api.post(kHGood, "k-9");
   ctx.Equal(replay.Status, 200, "the original report replayed after a conflict");
 }
 
 void CheckValidateBeforeStore(harness::Ctx& ctx) {
-  Api api(ctx);
-  const std::vector<json> bodies = {with(kGood, "model", ""), json{{"input_tokens", 10}, {"output_tokens", 10}}, with(kGood, "model", 42)};
+  HApi api(ctx);
+  const std::vector<json> bodies = {hWith(kHGood, "model", ""), json{{"input_tokens", 10}, {"output_tokens", 10}}, hWith(kHGood, "model", 42)};
   int i = 0;
   for (const auto& body : bodies) {
     const auto r = api.post(body, "k-m-" + std::to_string(i++));
     ctx.Equal(r.Status, 400, "a report without a model name (%s): model is a non-empty string, and an unnamed model cannot be priced or audited", body.dump());
   }
-  const auto r = api.post(with(kGood, "input_tokens", -40), "k-neg");
+  const auto r = api.post(hWith(kHGood, "input_tokens", -40), "k-neg");
   ctx.Equal(r.Status, 400, "a negative count");
   ctx.Equal(ctx.Redis.Keys("*").size(), 0, "rejected reports must leave nothing in Redis (%v): validate before usage::put; keys", ctx.Redis.Keys("*"));
 }

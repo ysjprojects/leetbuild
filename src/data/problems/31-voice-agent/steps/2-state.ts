@@ -804,115 +804,115 @@ import (
 	"leetbuild/harness"
 )
 
-const stateHashKey = "voice:state:vs-1"
+const kHStateHashKey = "voice:state:vs-1"
 
 var (
-	stateBg     = context.Background()
-	stateBefore = TurnState{CurrentSpeaker: "agent", TurnIndex: 0, TTSOffset: 40}
+	hStateBg     = context.Background()
+	hStateBefore = TurnState{CurrentSpeaker: "agent", TurnIndex: 0, TTSOffset: 40}
 )
 
-func mustFrame(ctx *harness.Ctx, sessionID string, turn, offset int) bool {
-	applied, err := recordFrame(stateBg, sessionID, turn, offset)
+func hMustFrame(ctx *harness.Ctx, sessionID string, turn, offset int) bool {
+	applied, err := recordFrame(hStateBg, sessionID, turn, offset)
 	ctx.NoError(err, "recordFrame(%s, %d, %d) failed", sessionID, turn, offset)
 	return applied
 }
 
-func mustBargeIn(ctx *harness.Ctx, sessionID string, heard int) int {
-	stop, err := bargeIn(stateBg, sessionID, heard)
+func hMustBargeIn(ctx *harness.Ctx, sessionID string, heard int) int {
+	stop, err := bargeIn(hStateBg, sessionID, heard)
 	ctx.NoError(err, "bargeIn(%s, %d) failed", sessionID, heard)
 	return stop
 }
 
-func mustState(ctx *harness.Ctx, sessionID string) TurnState {
-	s, err := readState(stateBg, sessionID)
+func hMustState(ctx *harness.Ctx, sessionID string) TurnState {
+	s, err := readState(hStateBg, sessionID)
 	ctx.NoError(err, "readState(%s) failed", sessionID)
 	ctx.Assert(s != nil, "readState(%s) found no state", sessionID)
 	return *s
 }
 
 func CheckAtomicBargeIn(ctx *harness.Ctx) {
-	ctx.Equal(mustFrame(ctx, "vs-1", 0, 40), true, "the first frame of turn 0 must be recorded; applied")
+	ctx.Equal(hMustFrame(ctx, "vs-1", 0, 40), true, "the first frame of turn 0 must be recorded; applied")
 	// Another worker reads the state the instant the barge-in's first command has run.
 	var during *TurnState
-	probe := ctx.Redis.After(stateHashKey, func() any {
-		during, _ = readState(stateBg, "vs-1")
+	probe := ctx.Redis.After(kHStateHashKey, func() any {
+		during, _ = readState(hStateBg, "vs-1")
 		return nil
 	})
-	mustBargeIn(ctx, "vs-1", 25)
-	after := mustState(ctx, "vs-1")
-	ctx.Assert(probe.Fired, "nothing touched %s", stateHashKey)
+	hMustBargeIn(ctx, "vs-1", 25)
+	after := hMustState(ctx, "vs-1")
+	ctx.Assert(probe.Fired, "nothing touched %s", kHStateHashKey)
 	ctx.Assert(after.CurrentSpeaker == "user" && after.TurnIndex == 1, "after a barge-in the state is %+v, expected the caller on turn 1", after)
-	ctx.Assert(during != nil && (*during == stateBefore || *during == after), "a read that landed during the barge-in saw %+v: neither the state before (%+v) nor after (%+v). The speaker, the turn and the offset must change in one script", during, stateBefore, after)
+	ctx.Assert(during != nil && (*during == hStateBefore || *during == after), "a read that landed during the barge-in saw %+v: neither the state before (%+v) nor after (%+v). The speaker, the turn and the offset must change in one script", during, hStateBefore, after)
 }
 
 func CheckReadAtomic(ctx *harness.Ctx) {
-	mustFrame(ctx, "vs-1", 0, 40)
+	hMustFrame(ctx, "vs-1", 0, 40)
 	// A barge-in lands right after the read's first command.
-	rival := ctx.Redis.After(stateHashKey, func() any {
-		_, err := bargeIn(stateBg, "vs-1", 25)
+	rival := ctx.Redis.After(kHStateHashKey, func() any {
+		_, err := bargeIn(hStateBg, "vs-1", 25)
 		return err
 	})
-	seen := mustState(ctx, "vs-1")
-	ctx.Assert(rival.Fired, "nothing touched %s", stateHashKey)
-	after := mustState(ctx, "vs-1")
-	ctx.Assert(seen == stateBefore || seen == after, "readState racing a barge-in returned %+v: neither the state before (%+v) nor after (%+v). Read the three fields in one HMGET", seen, stateBefore, after)
+	seen := hMustState(ctx, "vs-1")
+	ctx.Assert(rival.Fired, "nothing touched %s", kHStateHashKey)
+	after := hMustState(ctx, "vs-1")
+	ctx.Assert(seen == hStateBefore || seen == after, "readState racing a barge-in returned %+v: neither the state before (%+v) nor after (%+v). Read the three fields in one HMGET", seen, hStateBefore, after)
 }
 
 func CheckStaleFrame(ctx *harness.Ctx) {
-	mustFrame(ctx, "vs-1", 0, 40)
-	mustBargeIn(ctx, "vs-1", 25)
-	late := mustFrame(ctx, "vs-1", 0, 41)
-	state := mustState(ctx, "vs-1")
+	hMustFrame(ctx, "vs-1", 0, 40)
+	hMustBargeIn(ctx, "vs-1", 25)
+	late := hMustFrame(ctx, "vs-1", 0, 41)
+	state := hMustState(ctx, "vs-1")
 	ctx.Equal(late, false, "a frame of the interrupted answer (turn 0) arrived after the barge-in; recordFrame must report it dropped; applied")
 	ctx.Assert(state.CurrentSpeaker == "user" && state.TurnIndex == 1, "a late frame of turn 0 changed the state to %+v: the agent took the floor back from the caller", state)
-	ctx.Equal(mustFrame(ctx, "vs-1", 1, 3), true, "a frame of the current turn (1) must be recorded; applied")
-	ctx.Equal(mustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "agent", TurnIndex: 1, TTSOffset: 3}, "after a frame of turn 1, the state")
-	ctx.Equal(mustFrame(ctx, "vs-1", 2, 9), false, "a frame of turn 2 arrived while the session is on turn 1: a frame counts only while turn_index is its own turn; applied")
-	ctx.Equal(mustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "agent", TurnIndex: 1, TTSOffset: 3}, "after a frame of turn 2 on turn 1, the state")
-	ctx.Equal(mustFrame(ctx, "vs-3", 1, 5), false, "a frame of turn 1 for a session with no state (an absent key is turn 0); applied")
-	orphan, err := readState(stateBg, "vs-3")
+	ctx.Equal(hMustFrame(ctx, "vs-1", 1, 3), true, "a frame of the current turn (1) must be recorded; applied")
+	ctx.Equal(hMustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "agent", TurnIndex: 1, TTSOffset: 3}, "after a frame of turn 1, the state")
+	ctx.Equal(hMustFrame(ctx, "vs-1", 2, 9), false, "a frame of turn 2 arrived while the session is on turn 1: a frame counts only while turn_index is its own turn; applied")
+	ctx.Equal(hMustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "agent", TurnIndex: 1, TTSOffset: 3}, "after a frame of turn 2 on turn 1, the state")
+	ctx.Equal(hMustFrame(ctx, "vs-3", 1, 5), false, "a frame of turn 1 for a session with no state (an absent key is turn 0); applied")
+	orphan, err := readState(hStateBg, "vs-3")
 	ctx.NoError(err, "readState(vs-3) failed")
 	ctx.Assert(orphan == nil, "a dropped frame of turn 1 left state %+v for a session that had none", orphan)
 }
 
 func CheckTruncate(ctx *harness.Ctx) {
-	mustFrame(ctx, "vs-1", 0, 40)
-	ctx.Equal(mustBargeIn(ctx, "vs-1", 25), 25, "the stream sent 40 tokens but the caller heard 25, and the answer stops at what was heard; bargeIn returned")
-	ctx.Equal(mustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "user", TurnIndex: 1, TTSOffset: 25}, "after the barge-in, the state")
-	mustFrame(ctx, "vs-2", 0, 12)
-	ctx.Equal(mustBargeIn(ctx, "vs-2", 30), 12, "the stream had sent 12 tokens and the caller cannot have heard more; bargeIn returned")
-	mustFrame(ctx, "vs-3", 0, 12)
+	hMustFrame(ctx, "vs-1", 0, 40)
+	ctx.Equal(hMustBargeIn(ctx, "vs-1", 25), 25, "the stream sent 40 tokens but the caller heard 25, and the answer stops at what was heard; bargeIn returned")
+	ctx.Equal(hMustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "user", TurnIndex: 1, TTSOffset: 25}, "after the barge-in, the state")
+	hMustFrame(ctx, "vs-2", 0, 12)
+	ctx.Equal(hMustBargeIn(ctx, "vs-2", 30), 12, "the stream had sent 12 tokens and the caller cannot have heard more; bargeIn returned")
+	hMustFrame(ctx, "vs-3", 0, 12)
 	// Playback reports token 20 of turn 0 the instant the barge-in's first command has run.
 	applied := false
 	rival := ctx.Redis.After("voice:state:vs-3", func() any {
-		ok, err := recordFrame(stateBg, "vs-3", 0, 20)
+		ok, err := recordFrame(hStateBg, "vs-3", 0, 20)
 		applied = ok
 		return err
 	})
-	stop := mustBargeIn(ctx, "vs-3", 30)
+	stop := hMustBargeIn(ctx, "vs-3", 30)
 	ctx.Assert(rival.Fired, "nothing touched voice:state:vs-3")
 	expected := 12
 	if applied {
 		expected = 20
 	}
-	raced := mustState(ctx, "vs-3")
+	raced := hMustState(ctx, "vs-3")
 	ctx.Assert(stop == expected && raced.TTSOffset == expected, "a frame of turn 0 played up to token 20 raced the barge-in (recorded: %v), yet bargeIn stopped at %d with the state %+v: expected %d. Read what was sent and truncate in the same script", applied, stop, raced, expected)
 }
 
 func CheckTtlRefresh(ctx *harness.Ctx) {
-	mustFrame(ctx, "vs-1", 0, 5)
-	ttl := ctx.Redis.TTL(stateHashKey)
-	ctx.Assert(0 < ttl && ttl <= 30, "after a frame %s has TTL %d: the state must expire 30 s after the last frame", stateHashKey, ttl)
+	hMustFrame(ctx, "vs-1", 0, 5)
+	ttl := ctx.Redis.TTL(kHStateHashKey)
+	ctx.Assert(0 < ttl && ttl <= 30, "after a frame %s has TTL %d: the state must expire 30 s after the last frame", kHStateHashKey, ttl)
 	ctx.Clock.Advance(20)
-	mustFrame(ctx, "vs-1", 0, 10)
-	ctx.Assert(ctx.Redis.TTL(stateHashKey) > 25, "a frame 20 s later left TTL %d: every frame must refresh the expiry", ctx.Redis.TTL(stateHashKey))
+	hMustFrame(ctx, "vs-1", 0, 10)
+	ctx.Assert(ctx.Redis.TTL(kHStateHashKey) > 25, "a frame 20 s later left TTL %d: every frame must refresh the expiry", ctx.Redis.TTL(kHStateHashKey))
 	ctx.Clock.Advance(20)
-	ctx.Equal(ctx.Redis.Exists(stateHashKey), int64(1), "the state must survive 20 s after a frame (a long answer keeps its session alive); exists")
-	mustBargeIn(ctx, "vs-1", 10)
-	ctx.Assert(ctx.Redis.TTL(stateHashKey) > 25, "a barge-in left TTL %d: it must refresh the expiry too", ctx.Redis.TTL(stateHashKey))
+	ctx.Equal(ctx.Redis.Exists(kHStateHashKey), int64(1), "the state must survive 20 s after a frame (a long answer keeps its session alive); exists")
+	hMustBargeIn(ctx, "vs-1", 10)
+	ctx.Assert(ctx.Redis.TTL(kHStateHashKey) > 25, "a barge-in left TTL %d: it must refresh the expiry too", ctx.Redis.TTL(kHStateHashKey))
 	ctx.Clock.Advance(31)
-	ctx.Equal(ctx.Redis.Exists(stateHashKey), int64(0), "31 s after the last write the state must be gone (a silent call ends); exists")
-	s, err := readState(stateBg, "vs-1")
+	ctx.Equal(ctx.Redis.Exists(kHStateHashKey), int64(0), "31 s after the last write the state must be gone (a silent call ends); exists")
+	s, err := readState(hStateBg, "vs-1")
 	ctx.NoError(err, "readState of an expired state failed")
 	ctx.Assert(s == nil, "an expired state must read as nil, got %+v", s)
 	const k2 = "voice:state:vs-2"
@@ -921,7 +921,7 @@ func CheckTtlRefresh(ctx *harness.Ctx) {
 		first = ctx.Redis.TTL(k2)
 		return nil
 	})
-	mustFrame(ctx, "vs-2", 0, 5)
+	hMustFrame(ctx, "vs-2", 0, 5)
 	ctx.Assert(created.Fired, "nothing touched %s", k2)
 	ctx.Assert(0 < first && first <= 30, "right after the frame's script created %s its TTL was %d: set the expiry in the same script, so the key never exists without one", k2, first)
 	ctx.Clock.Advance(20)
@@ -929,7 +929,7 @@ func CheckTtlRefresh(ctx *harness.Ctx) {
 		refreshed = ctx.Redis.TTL(k2)
 		return nil
 	})
-	mustBargeIn(ctx, "vs-2", 3)
+	hMustBargeIn(ctx, "vs-2", 3)
 	ctx.Assert(again.Fired, "nothing touched %s", k2)
 	ctx.Assert(refreshed > 25, "right after the barge-in's script ran, %s had TTL %d: refresh the expiry in the same script", k2, refreshed)
 }
@@ -942,20 +942,20 @@ func CheckTtlRefresh(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kKey = "voice:state:vs-1";
+const std::string kHKey = "voice:state:vs-1";
 
-bool same(const TurnState& a, const TurnState& b) {
+bool hSame(const TurnState& a, const TurnState& b) {
   return a.current_speaker == b.current_speaker && a.turn_index == b.turn_index && a.tts_offset == b.tts_offset;
 }
 
-std::string show(const std::optional<TurnState>& s) {
+std::string hShow(const std::optional<TurnState>& s) {
   if (!s) return "none";
   return "{" + s->current_speaker + ", turn " + std::to_string(s->turn_index) + ", offset " + std::to_string(s->tts_offset) + "}";
 }
 
-const TurnState kBefore{"agent", 0, 40};
+const TurnState kHBefore{"agent", 0, 40};
 
-TurnState mustState(harness::Ctx& ctx, const std::string& session_id) {
+TurnState hMustState(harness::Ctx& ctx, const std::string& session_id) {
   const auto s = readState(session_id);
   ctx.Assert(s.has_value(), "readState(%s) found no state", session_id);
   return *s;
@@ -968,57 +968,57 @@ void CheckAtomicBargeIn(harness::Ctx& ctx) {
   // Another worker reads the state the instant the barge-in's first command has run.
   auto during = std::make_shared<std::optional<TurnState>>();
   auto fired = std::make_shared<bool>(false);
-  ctx.Redis.After(kKey, [during, fired] {
+  ctx.Redis.After(kHKey, [during, fired] {
     *fired = true;
     *during = readState("vs-1");
   });
   bargeIn("vs-1", 25);
-  const TurnState after = mustState(ctx, "vs-1");
-  ctx.Assert(*fired, "nothing touched %s", kKey);
-  ctx.Assert(after.current_speaker == "user" && after.turn_index == 1, "after a barge-in the state is %s, expected the caller on turn 1", show(after));
-  ctx.Assert(during->has_value() && (same(**during, kBefore) || same(**during, after)),
+  const TurnState after = hMustState(ctx, "vs-1");
+  ctx.Assert(*fired, "nothing touched %s", kHKey);
+  ctx.Assert(after.current_speaker == "user" && after.turn_index == 1, "after a barge-in the state is %s, expected the caller on turn 1", hShow(after));
+  ctx.Assert(during->has_value() && (hSame(**during, kHBefore) || hSame(**during, after)),
              "a read that landed during the barge-in saw %s: neither the state before (%s) nor after (%s). The speaker, the turn and the offset must change in one script",
-             show(*during), show(kBefore), show(after));
+             hShow(*during), hShow(kHBefore), hShow(after));
 }
 
 void CheckReadAtomic(harness::Ctx& ctx) {
   recordFrame("vs-1", 0, 40);
   // A barge-in lands right after the read's first command.
   auto fired = std::make_shared<bool>(false);
-  ctx.Redis.After(kKey, [fired] {
+  ctx.Redis.After(kHKey, [fired] {
     *fired = true;
     bargeIn("vs-1", 25);
   });
-  const TurnState seen = mustState(ctx, "vs-1");
-  ctx.Assert(*fired, "nothing touched %s", kKey);
-  const TurnState after = mustState(ctx, "vs-1");
-  ctx.Assert(same(seen, kBefore) || same(seen, after),
+  const TurnState seen = hMustState(ctx, "vs-1");
+  ctx.Assert(*fired, "nothing touched %s", kHKey);
+  const TurnState after = hMustState(ctx, "vs-1");
+  ctx.Assert(hSame(seen, kHBefore) || hSame(seen, after),
              "readState racing a barge-in returned %s: neither the state before (%s) nor after (%s). Read the three fields in one HMGET",
-             show(seen), show(kBefore), show(after));
+             hShow(seen), hShow(kHBefore), hShow(after));
 }
 
 void CheckStaleFrame(harness::Ctx& ctx) {
   recordFrame("vs-1", 0, 40);
   bargeIn("vs-1", 25);
   const bool late = recordFrame("vs-1", 0, 41);
-  const TurnState state = mustState(ctx, "vs-1");
+  const TurnState state = hMustState(ctx, "vs-1");
   ctx.Equal(late, false, "a frame of the interrupted answer (turn 0) arrived after the barge-in; recordFrame must report it dropped; applied");
-  ctx.Assert(state.current_speaker == "user" && state.turn_index == 1, "a late frame of turn 0 changed the state to %s: the agent took the floor back from the caller", show(state));
+  ctx.Assert(state.current_speaker == "user" && state.turn_index == 1, "a late frame of turn 0 changed the state to %s: the agent took the floor back from the caller", hShow(state));
   ctx.Equal(recordFrame("vs-1", 1, 3), true, "a frame of the current turn (1) must be recorded; applied");
-  const TurnState now = mustState(ctx, "vs-1");
-  ctx.Assert(same(now, TurnState{"agent", 1, 3}), "after a frame of turn 1 the state is %s", show(now));
+  const TurnState now = hMustState(ctx, "vs-1");
+  ctx.Assert(hSame(now, TurnState{"agent", 1, 3}), "after a frame of turn 1 the state is %s", hShow(now));
   ctx.Equal(recordFrame("vs-1", 2, 9), false, "a frame of turn 2 arrived while the session is on turn 1: a frame counts only while turn_index is its own turn; applied");
-  const TurnState still = mustState(ctx, "vs-1");
-  ctx.Assert(same(still, TurnState{"agent", 1, 3}), "after a frame of turn 2 on turn 1 the state is %s", show(still));
+  const TurnState still = hMustState(ctx, "vs-1");
+  ctx.Assert(hSame(still, TurnState{"agent", 1, 3}), "after a frame of turn 2 on turn 1 the state is %s", hShow(still));
   ctx.Equal(recordFrame("vs-3", 1, 5), false, "a frame of turn 1 for a session with no state (an absent key is turn 0); applied");
-  ctx.Assert(!readState("vs-3").has_value(), "a dropped frame of turn 1 left state %s for a session that had none", show(readState("vs-3")));
+  ctx.Assert(!readState("vs-3").has_value(), "a dropped frame of turn 1 left state %s for a session that had none", hShow(readState("vs-3")));
 }
 
 void CheckTruncate(harness::Ctx& ctx) {
   recordFrame("vs-1", 0, 40);
   ctx.Equal(bargeIn("vs-1", 25), 25, "the stream sent 40 tokens but the caller heard 25, and the answer stops at what was heard; bargeIn returned");
-  const TurnState state = mustState(ctx, "vs-1");
-  ctx.Assert(same(state, TurnState{"user", 1, 25}), "after the barge-in the state is %s, expected the caller on turn 1 at offset 25", show(state));
+  const TurnState state = hMustState(ctx, "vs-1");
+  ctx.Assert(hSame(state, TurnState{"user", 1, 25}), "after the barge-in the state is %s, expected the caller on turn 1 at offset 25", hShow(state));
   recordFrame("vs-2", 0, 12);
   ctx.Equal(bargeIn("vs-2", 30), 12, "the stream had sent 12 tokens and the caller cannot have heard more; bargeIn returned");
   recordFrame("vs-3", 0, 12);
@@ -1032,25 +1032,25 @@ void CheckTruncate(harness::Ctx& ctx) {
   const long stop = bargeIn("vs-3", 30);
   ctx.Assert(*fired, "nothing touched voice:state:vs-3");
   const long expected = *applied ? 20 : 12;
-  const TurnState raced = mustState(ctx, "vs-3");
+  const TurnState raced = hMustState(ctx, "vs-3");
   ctx.Assert(stop == expected && raced.tts_offset == expected,
              "a frame of turn 0 played up to token 20 raced the barge-in (recorded: %v), yet bargeIn stopped at %d with the state %s: expected %d. Read what was sent and truncate in the same script",
-             *applied, stop, show(raced), expected);
+             *applied, stop, hShow(raced), expected);
 }
 
 void CheckTtlRefresh(harness::Ctx& ctx) {
   recordFrame("vs-1", 0, 5);
-  const long long ttl = ctx.Redis.TTL(kKey);
-  ctx.Assert(0 < ttl && ttl <= 30, "after a frame %s has TTL %d: the state must expire 30 s after the last frame", kKey, ttl);
+  const long long ttl = ctx.Redis.TTL(kHKey);
+  ctx.Assert(0 < ttl && ttl <= 30, "after a frame %s has TTL %d: the state must expire 30 s after the last frame", kHKey, ttl);
   ctx.Clock.Advance(20);
   recordFrame("vs-1", 0, 10);
-  ctx.Assert(ctx.Redis.TTL(kKey) > 25, "a frame 20 s later left TTL %d: every frame must refresh the expiry", ctx.Redis.TTL(kKey));
+  ctx.Assert(ctx.Redis.TTL(kHKey) > 25, "a frame 20 s later left TTL %d: every frame must refresh the expiry", ctx.Redis.TTL(kHKey));
   ctx.Clock.Advance(20);
-  ctx.Equal(ctx.Redis.Exists(kKey), 1, "the state must survive 20 s after a frame (a long answer keeps its session alive); exists");
+  ctx.Equal(ctx.Redis.Exists(kHKey), 1, "the state must survive 20 s after a frame (a long answer keeps its session alive); exists");
   bargeIn("vs-1", 10);
-  ctx.Assert(ctx.Redis.TTL(kKey) > 25, "a barge-in left TTL %d: it must refresh the expiry too", ctx.Redis.TTL(kKey));
+  ctx.Assert(ctx.Redis.TTL(kHKey) > 25, "a barge-in left TTL %d: it must refresh the expiry too", ctx.Redis.TTL(kHKey));
   ctx.Clock.Advance(31);
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "31 s after the last write the state must be gone (a silent call ends); exists");
+  ctx.Equal(ctx.Redis.Exists(kHKey), 0, "31 s after the last write the state must be gone (a silent call ends); exists");
   ctx.Assert(!readState("vs-1").has_value(), "an expired state must read as none");
   const std::string k2 = "voice:state:vs-2";
   auto first = std::make_shared<long long>(-3);

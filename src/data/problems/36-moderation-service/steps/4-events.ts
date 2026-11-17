@@ -1178,20 +1178,20 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "moderation.action"
+const kHEventsTopic = "moderation.action"
 
 var (
-	eventsBg      = context.Background()
-	eventsRemove  = ModerationAction{Action: "remove", Label: "harassment", Confidence: 0.99, ModelVersion: "clf-2026-10", Actor: "classifier"}
-	eventsRestore = ModerationAction{Action: "restore", Label: "harassment", Confidence: 0.99, ModelVersion: "clf-2026-10", Actor: "moderator"}
-	eventsFields  = []string{"action", "action_id", "actor", "case_id", "confidence", "content_id", "label", "model_version", "tenant"}
+	hEventsBg      = context.Background()
+	hEventsRemove  = ModerationAction{Action: "remove", Label: "harassment", Confidence: 0.99, ModelVersion: "clf-2026-10", Actor: "classifier"}
+	hEventsRestore = ModerationAction{Action: "restore", Label: "harassment", Confidence: 0.99, ModelVersion: "clf-2026-10", Actor: "moderator"}
+	hEventsFields  = []string{"action", "action_id", "actor", "case_id", "confidence", "content_id", "label", "model_version", "tenant"}
 )
 
-func eventsCase(reporter, contentID, detail string) *store.Case {
-	return store.InsertCase(eventsBg, "acme", contentID, reporter, "harassment", detail)
+func hEventsCase(reporter, contentID, detail string) *store.Case {
+	return store.InsertCase(hEventsBg, "acme", contentID, reporter, "harassment", detail)
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]string {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]string {
 	var rows []map[string]string
 	for _, raw := range ctx.Redis.LRange("outbox", 0, -1) {
 		row := map[string]string{}
@@ -1202,24 +1202,24 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]string {
 }
 
 func CheckContentKey(ctx *harness.Ctx) {
-	first := eventsCase("u-17", "c-1", "They keep posting my address")
-	second := eventsCase("u-18", "c-1", "They keep posting my address")
-	other := eventsCase("u-17", "c-2", "")
-	ctx.Equal(publishAction(eventsBg, first, eventsRemove), true, "publishAction(%s) on a healthy broker", first.CaseID)
-	ctx.Equal(publishAction(eventsBg, second, eventsRestore), true, "publishAction(%s) on a healthy broker", second.CaseID)
-	ctx.Equal(publishAction(eventsBg, other, eventsRemove), true, "publishAction(%s) on a healthy broker", other.CaseID)
+	first := hEventsCase("u-17", "c-1", "They keep posting my address")
+	second := hEventsCase("u-18", "c-1", "They keep posting my address")
+	other := hEventsCase("u-17", "c-2", "")
+	ctx.Equal(publishAction(hEventsBg, first, hEventsRemove), true, "publishAction(%s) on a healthy broker", first.CaseID)
+	ctx.Equal(publishAction(hEventsBg, second, hEventsRestore), true, "publishAction(%s) on a healthy broker", second.CaseID)
+	ctx.Equal(publishAction(hEventsBg, other, hEventsRemove), true, "publishAction(%s) on a healthy broker", other.CaseID)
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three actions must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"c-1", "c-1", "c-2"}, "records must be keyed by the content id (the removal and the restore of c-1 came from two cases)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three actions must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"c-1", "c-1", "c-2"}, "records must be keyed by the content id (the removal and the restore of c-1 came from two cases)")
 	ctx.Equal(records[0].Partition, records[1].Partition, "both actions on c-1 must share a partition, or the restore can be applied before the removal; their partitions")
 }
 
 func CheckNoReporter(ctx *harness.Ctx) {
-	reportCase := eventsCase("u-17", "c-1", "He posted my home address, 12 Elm St")
-	ctx.Equal(publishAction(eventsBg, reportCase, eventsRemove), true, "publishAction on a healthy broker")
+	reportCase := hEventsCase("u-17", "c-1", "He posted my home address, 12 Elm St")
+	ctx.Equal(publishAction(hEventsBg, reportCase, hEventsRemove), true, "publishAction on a healthy broker")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one action must produce one record; the records")
 	text := string(records[0].Value)
 	ctx.Assert(!strings.Contains(text, "u-17"), "the event names the reporter: %s. The topic is retained and every consumer reads it", text)
@@ -1231,49 +1231,49 @@ func CheckNoReporter(ctx *harness.Ctx) {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
-	ctx.Equal(fields, eventsFields, "the event's fields")
+	ctx.Equal(fields, hEventsFields, "the event's fields")
 	ctx.Assert(event["action_id"] == reportCase.CaseID+":remove" && event["content_id"] == "c-1" && event["tenant"] == "acme" && event["confidence"] == 0.99, "the event's values must come from the case and the action: %s", text)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	first := eventsCase("u-17", "c-1", "")
-	second := eventsCase("u-18", "c-1", "")
-	ctx.Kafka.LoseAcks(eventsTopic, 1)
-	ctx.Equal(publishAction(eventsBg, first, eventsRemove), true, "a lost acknowledgement is retried by the client, not reported; publishAction")
+	first := hEventsCase("u-17", "c-1", "")
+	second := hEventsCase("u-18", "c-1", "")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1)
+	ctx.Equal(publishAction(hEventsBg, first, hEventsRemove), true, "a lost acknowledgement is retried by the client, not reported; publishAction")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the retry wrote the action twice (enable.idempotence); the records")
-	publishAction(eventsBg, second, eventsRestore)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the retry wrote the action twice (enable.idempotence); the records")
+	publishAction(hEventsBg, second, hEventsRestore)
 	ctx.Settle()
-	lost := ctx.Kafka.Failover(eventsTopic)
+	lost := ctx.Kafka.Failover(kHEventsTopic)
 	ctx.Equal(lost, 0, "a leader failover lost records acknowledged by the leader alone (acks=all); records lost")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after a leader failover both records must still be on the topic; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "after a leader failover both records must still be on the topic; the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	reportCase := eventsCase("u-17", "c-1", "")
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	delivered := publishAction(eventsBg, reportCase, eventsRemove)
+	reportCase := hEventsCase("u-17", "c-1", "")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	delivered := publishAction(hEventsBg, reportCase, hEventsRemove)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "after the broker refused the produce the outbox must hold one row, or the removal has no record anywhere; rows")
-	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "c-1", "the outbox row must carry the topic and the record key (the content id) so the relay keeps the order: %v", rows[0])
+	ctx.Assert(rows[0]["topic"] == kHEventsTopic && rows[0]["key"] == "c-1", "the outbox row must carry the topic and the record key (the content id) so the relay keeps the order: %v", rows[0])
 	var payload map[string]any
 	json.Unmarshal([]byte(rows[0]["payload"]), &payload)
 	ctx.Equal(fmt.Sprint(payload["action_id"]), reportCase.CaseID+":remove", "the outbox row must carry the event; its action_id")
 	ctx.Equal(delivered, false, "publishAction for a delivery the broker refused")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a refused produce cannot be on the topic; the records")
-	ctx.Equal(publishAction(eventsBg, reportCase, eventsRestore), true, "once the broker answers again, publishAction")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "a refused produce cannot be on the topic; the records")
+	ctx.Equal(publishAction(hEventsBg, reportCase, hEventsRestore), true, "once the broker answers again, publishAction")
 	ctx.Settle()
-	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered action leaves no outbox row; rows")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Equal(len(hEventsOutbox(ctx)), 1, "a delivered action leaves no outbox row; rows")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	escalate := eventsRemove
+	escalate := hEventsRemove
 	escalate.Action = "escalate"
-	unanswered := publishAction(eventsBg, reportCase, escalate)
+	unanswered := publishAction(hEventsBg, reportCase, escalate)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishAction waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited)
 	ctx.Settle()
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	var later map[string]any
 	if len(rows) == 2 {
 		json.Unmarshal([]byte(rows[1]["payload"]), &later)
@@ -1282,42 +1282,42 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Equal(unanswered, false, "publishAction without a delivery report")
 }
 
-func eventsSeedActions(ctx *harness.Ctx, contentID string, caseActions ...[2]string) {
+func hEventsSeedActions(ctx *harness.Ctx, contentID string, caseActions ...[2]string) {
 	for _, ca := range caseActions {
 		event := map[string]any{"action_id": ca[0] + ":" + ca[1], "case_id": ca[0], "content_id": contentID, "tenant": "acme", "action": ca[1], "label": "harassment", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "moderator"}
 		raw, _ := json.Marshal(event)
-		ctx.Kafka.Seed(eventsTopic, contentID, string(raw))
+		ctx.Kafka.Seed(kHEventsTopic, contentID, string(raw))
 	}
 }
 
 func CheckPersistBeforeCommit(ctx *harness.Ctx) {
-	eventsSeedActions(ctx, "c-1", [2]string{"case-1", "remove"}, [2]string{"case-2", "restore"})
+	hEventsSeedActions(ctx, "c-1", [2]string{"case-1", "remove"}, [2]string{"case-2", "restore"})
 	commits := 0
 	var early []string
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
-		committed := int64(len(ctx.Kafka.Records(eventsTopic))) - ctx.Kafka.Lag("moderation-actions", eventsTopic)
+		committed := int64(len(ctx.Kafka.Records(kHEventsTopic))) - ctx.Kafka.Lag("moderation-actions", kHEventsTopic)
 		stored := ctx.Redis.LLen("actions:c-1") + ctx.Redis.LLen("actions:c-2")
 		commits++
 		if stored < committed {
 			early = append(early, fmt.Sprintf("%d records committed with %d actions stored", committed, stored))
 		}
 	})
-	ctx.Drain(func() { consumeActions(eventsBg) })
+	ctx.Drain(func() { consumeActions(hEventsBg) })
 	ctx.Assert(commits > 0, "the consumer committed nothing")
 	ctx.Assert(len(early) == 0, "%v: an offset committed before its action is written loses the action if the consumer crashes in between", early)
 	var actions []string
-	for _, a := range store.ActionsOf(eventsBg, "c-1") {
+	for _, a := range store.ActionsOf(hEventsBg, "c-1") {
 		actions = append(actions, fmt.Sprint(a["action"]))
 	}
 	ctx.Equal(actions, []string{"remove", "restore"}, "the actions stored for c-1")
-	ctx.Equal(ctx.Kafka.Lag("moderation-actions", eventsTopic), int64(0), "records the consumer left uncommitted")
+	ctx.Equal(ctx.Kafka.Lag("moderation-actions", kHEventsTopic), int64(0), "records the consumer left uncommitted")
 	// The store refuses the second action on c-2 (its id set is no longer a set): that record must stay uncommitted.
-	eventsSeedActions(ctx, "c-2", [2]string{"case-3", "remove"}, [2]string{"case-4", "restore"})
+	hEventsSeedActions(ctx, "c-2", [2]string{"case-3", "remove"}, [2]string{"case-4", "restore"})
 	broken := ctx.Redis.After("actions:c-2", func() any { return ctx.Redis.Set("actions:c-2:ids", "unreadable") })
-	ctx.Drain(func() { consumeActions(eventsBg) }) // a consumer may stop on a failed write; it may not commit it
+	ctx.Drain(func() { consumeActions(hEventsBg) }) // a consumer may stop on a failed write; it may not commit it
 	ctx.Assert(broken.Fired, "the first action on c-2 was never stored")
 	ctx.Assert(len(early) == 0, "%v: the store refused the second action on c-2 and its offset was committed anyway, so it is never retried", early)
-	ctx.Equal(ctx.Kafka.Lag("moderation-actions", eventsTopic), int64(1), "after the store refused the second action on c-2, only a written action may be committed; records left uncommitted")
+	ctx.Equal(ctx.Kafka.Lag("moderation-actions", kHEventsTopic), int64(1), "after the store refused the second action on c-2, only a written action may be committed; records left uncommitted")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1331,15 +1331,15 @@ func CheckPersistBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "moderation.action";
-const ModerationAction kRemove{"remove", "harassment", 0.99, "clf-2026-10", "classifier"};
-const ModerationAction kRestore{"restore", "harassment", 0.99, "clf-2026-10", "moderator"};
+const std::string kHEventsTopic = "moderation.action";
+const ModerationAction kHRemove{"remove", "harassment", 0.99, "clf-2026-10", "classifier"};
+const ModerationAction kHRestore{"restore", "harassment", 0.99, "clf-2026-10", "moderator"};
 
-store::Case eventsCase(const std::string& reporter, const std::string& content_id = "c-1", const std::string& detail = "They keep posting my address") {
+store::Case hEventsCase(const std::string& reporter, const std::string& content_id = "c-1", const std::string& detail = "They keep posting my address") {
   return store::insertCase("acme", content_id, reporter, "harassment", detail);
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& raw : ctx.Redis.LRange("outbox", 0, -1)) rows.push_back(nlohmann::json::parse(raw, nullptr, false));
   return rows;
@@ -1348,24 +1348,24 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckContentKey(harness::Ctx& ctx) {
-  const store::Case first = eventsCase("u-17");
-  const store::Case second = eventsCase("u-18");
-  const store::Case other = eventsCase("u-17", "c-2", "");
-  ctx.Equal(publishAction(first, kRemove), true, "publishAction(%s) on a healthy broker", first.case_id);
-  ctx.Equal(publishAction(second, kRestore), true, "publishAction(%s) on a healthy broker", second.case_id);
-  ctx.Equal(publishAction(other, kRemove), true, "publishAction(%s) on a healthy broker", other.case_id);
+  const store::Case first = hEventsCase("u-17");
+  const store::Case second = hEventsCase("u-18");
+  const store::Case other = hEventsCase("u-17", "c-2", "");
+  ctx.Equal(publishAction(first, kHRemove), true, "publishAction(%s) on a healthy broker", first.case_id);
+  ctx.Equal(publishAction(second, kHRestore), true, "publishAction(%s) on a healthy broker", second.case_id);
+  ctx.Equal(publishAction(other, kHRemove), true, "publishAction(%s) on a healthy broker", other.case_id);
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three actions must produce three records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"c-1", "c-1", "c-2"}, "records must be keyed by the content id (the removal and the restore of c-1 came from two cases)");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three actions must produce three records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"c-1", "c-1", "c-2"}, "records must be keyed by the content id (the removal and the restore of c-1 came from two cases)");
   ctx.Equal(records[0].Partition, records[1].Partition, "both actions on c-1 must share a partition, or the restore can be applied before the removal; their partitions");
 }
 
 void CheckNoReporter(harness::Ctx& ctx) {
-  const store::Case report_case = eventsCase("u-17", "c-1", "He posted my home address, 12 Elm St");
-  ctx.Equal(publishAction(report_case, kRemove), true, "publishAction on a healthy broker");
+  const store::Case report_case = hEventsCase("u-17", "c-1", "He posted my home address, 12 Elm St");
+  ctx.Equal(publishAction(report_case, kHRemove), true, "publishAction on a healthy broker");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 1, "one action must produce one record; the records");
   const std::string text = records[0].Value.value_or("");
   ctx.Assert(text.find("u-17") == std::string::npos, "the event names the reporter: %s. The topic is retained and every consumer reads it", text);
@@ -1382,43 +1382,43 @@ void CheckNoReporter(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  const store::Case first = eventsCase("u-17");
-  const store::Case second = eventsCase("u-18");
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);
-  ctx.Equal(publishAction(first, kRemove), true, "a lost acknowledgement is retried by the client, not reported; publishAction");
+  const store::Case first = hEventsCase("u-17");
+  const store::Case second = hEventsCase("u-18");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);
+  ctx.Equal(publishAction(first, kHRemove), true, "a lost acknowledgement is retried by the client, not reported; publishAction");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the retry wrote the action twice (enable.idempotence); the records");
-  publishAction(second, kRestore);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the retry wrote the action twice (enable.idempotence); the records");
+  publishAction(second, kHRestore);
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after a leader failover both records must still be on the topic (acks=all); the records");
+  ctx.Kafka.Failover(kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "after a leader failover both records must still be on the topic (acks=all); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  const store::Case report_case = eventsCase("u-17");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const bool delivered = publishAction(report_case, kRemove);
+  const store::Case report_case = hEventsCase("u-17");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const bool delivered = publishAction(report_case, kHRemove);
   ctx.Settle();
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "after the broker refused the produce the outbox must hold one row, or the removal has no record anywhere; rows");
-  ctx.Assert(rows[0].is_object() && rows[0].value("topic", "") == kEventsTopic && rows[0].value("key", "") == "c-1",
+  ctx.Assert(rows[0].is_object() && rows[0].value("topic", "") == kHEventsTopic && rows[0].value("key", "") == "c-1",
              "the outbox row must carry the topic and the record key (the content id) so the relay keeps the order: %s", rows[0].dump());
   const auto payload = nlohmann::json::parse(rows[0].value("payload", "{}"), nullptr, false);
   ctx.Equal(payload.is_object() ? payload.value("action_id", "") : "", report_case.case_id + ":remove", "the outbox row must carry the event; its action_id");
   ctx.Equal(delivered, false, "publishAction for a delivery the broker refused");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a refused produce cannot be on the topic; the records");
-  ctx.Equal(publishAction(report_case, kRestore), true, "once the broker answers again, publishAction");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "a refused produce cannot be on the topic; the records");
+  ctx.Equal(publishAction(report_case, kHRestore), true, "once the broker answers again, publishAction");
   ctx.Settle();
-  ctx.Equal(eventsOutbox(ctx).size(), 1, "a delivered action leaves no outbox row; rows");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Equal(hEventsOutbox(ctx).size(), 1, "a delivered action leaves no outbox row; rows");
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ModerationAction escalate = kRemove;
+  ModerationAction escalate = kHRemove;
   escalate.action = "escalate";
   const bool unanswered = publishAction(report_case, escalate);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishAction waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited);
   ctx.Settle();
-  const auto later = eventsOutbox(ctx);
+  const auto later = hEventsOutbox(ctx);
   const auto escalated = later.size() == 2 && later[1].is_object() ? nlohmann::json::parse(later[1].value("payload", "{}"), nullptr, false) : nlohmann::json();
   ctx.Assert(escalated.is_object() && escalated.value("action_id", "") == report_case.case_id + ":escalate",
              "no delivery report within 2 s and the outbox holds %d rows: an unanswered produce is a refusal", later.size());
@@ -1427,23 +1427,23 @@ void CheckOutbox(harness::Ctx& ctx) {
 
 namespace {
 
-void seedActions(harness::Ctx& ctx, const std::string& content_id, const std::vector<std::pair<std::string, std::string>>& case_actions) {
+void hSeedActions(harness::Ctx& ctx, const std::string& content_id, const std::vector<std::pair<std::string, std::string>>& case_actions) {
   for (const auto& [case_id, action] : case_actions) {
     const nlohmann::json event = {{"action_id", case_id + ":" + action}, {"case_id", case_id},  {"content_id", content_id},
                                   {"tenant", "acme"},                    {"action", action},    {"label", "harassment"},
                                   {"confidence", 0.99},                  {"model_version", "clf-2026-10"}, {"actor", "moderator"}};
-    ctx.Kafka.Seed(kEventsTopic, content_id, event.dump());
+    ctx.Kafka.Seed(kHEventsTopic, content_id, event.dump());
   }
 }
 
 }  // namespace
 
 void CheckPersistBeforeCommit(harness::Ctx& ctx) {
-  seedActions(ctx, "c-1", {{"case-1", "remove"}, {"case-2", "restore"}});
+  hSeedActions(ctx, "c-1", {{"case-1", "remove"}, {"case-2", "restore"}});
   auto commits = std::make_shared<int>(0);
   auto early = std::make_shared<std::vector<std::string>>();
   ctx.Kafka.OnCommit([&ctx, commits, early](const std::string&, const harness::KafkaOffsets&) {
-    const int64_t committed = static_cast<int64_t>(ctx.Kafka.Records(kEventsTopic).size()) - ctx.Kafka.Lag("moderation-actions", kEventsTopic);
+    const int64_t committed = static_cast<int64_t>(ctx.Kafka.Records(kHEventsTopic).size()) - ctx.Kafka.Lag("moderation-actions", kHEventsTopic);
     const int64_t stored = ctx.Redis.LLen("actions:c-1") + ctx.Redis.LLen("actions:c-2");
     ++*commits;
     if (stored < committed) early->push_back(std::to_string(committed) + " records committed with " + std::to_string(stored) + " actions stored");
@@ -1454,9 +1454,9 @@ void CheckPersistBeforeCommit(harness::Ctx& ctx) {
   std::vector<std::string> actions;
   for (const auto& a : store::actionsOf("c-1")) actions.push_back(a.value("action", ""));
   ctx.Equal(actions, std::vector<std::string>{"remove", "restore"}, "the actions stored for c-1");
-  ctx.Equal(ctx.Kafka.Lag("moderation-actions", kEventsTopic), 0, "records the consumer left uncommitted");
+  ctx.Equal(ctx.Kafka.Lag("moderation-actions", kHEventsTopic), 0, "records the consumer left uncommitted");
   // The store refuses the second action on c-2 (its id set is no longer a set): that record must stay uncommitted.
-  seedActions(ctx, "c-2", {{"case-3", "remove"}, {"case-4", "restore"}});
+  hSeedActions(ctx, "c-2", {{"case-3", "remove"}, {"case-4", "restore"}});
   auto broken = std::make_shared<bool>(false);
   ctx.Redis.After("actions:c-2", [&ctx, broken] {
     *broken = true;
@@ -1470,7 +1470,7 @@ void CheckPersistBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(*broken, "the first action on c-2 was never stored");
   ctx.Assert(early->empty(), "%s: the store refused the second action on c-2 and its offset was committed anyway, so it is never retried",
              early->empty() ? "" : early->front());
-  ctx.Equal(ctx.Kafka.Lag("moderation-actions", kEventsTopic), 1,
+  ctx.Equal(ctx.Kafka.Lag("moderation-actions", kHEventsTopic), 1,
             "after the store refused the second action on c-2, only a written action may be committed; records left uncommitted");
 }
 `,

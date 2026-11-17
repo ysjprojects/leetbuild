@@ -1014,14 +1014,14 @@ import (
 	"leetbuild/harness"
 )
 
-// limitsRouter is limitGuard wrapped around a route the harness registers, counting what got through.
-type limitsRouter struct {
+// HLimitsRouter is limitGuard wrapped around a route the harness registers, counting what got through.
+type HLimitsRouter struct {
 	served int
 	http   *harness.HTTP
 }
 
-func newLimitsRouter(ctx *harness.Ctx) *limitsRouter {
-	g := &limitsRouter{}
+func hNewLimitsRouter(ctx *harness.Ctx) *HLimitsRouter {
+	g := &HLimitsRouter{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/route", func(rw http.ResponseWriter, r *http.Request) {
 		g.served++
@@ -1032,20 +1032,20 @@ func newLimitsRouter(ctx *harness.Ctx) *limitsRouter {
 	return g
 }
 
-func (g *limitsRouter) route(body, tenant string) *harness.Response {
+func (g *HLimitsRouter) route(body, tenant string) *harness.Response {
 	return g.http.Post("/v1/route", body, "Authorization", "Bearer "+tenant, "Content-Type", "application/json")
 }
 
-func windowKey(ctx *harness.Ctx, tenant string) string {
+func hWindowKey(ctx *harness.Ctx, tenant string) string {
 	return fmt.Sprintf("limits:%s:%d", tenant, ctx.Clock.Now()/1000/60)
 }
 
-// limitsBody is a request worth promptBytes / 4 + max_tokens tokens.
-func limitsBody(tokens, promptBytes int) string {
+// hLimitsBody is a request worth promptBytes / 4 + max_tokens tokens.
+func hLimitsBody(tokens, promptBytes int) string {
 	return fmt.Sprintf(\`{"prompt":"%s","max_tokens":%d,"policy":"auto"}\`, strings.Repeat("x", promptBytes), tokens-promptBytes/4)
 }
 
-func windowHash(ctx *harness.Ctx, key string) map[string]int {
+func hWindowHash(ctx *harness.Ctx, key string) map[string]int {
 	out := map[string]int{}
 	for k, v := range ctx.Redis.HGetAll(key) {
 		out[k], _ = strconv.Atoi(v)
@@ -1054,8 +1054,8 @@ func windowHash(ctx *harness.Ctx, key string) map[string]int {
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	g := newLimitsRouter(ctx)
-	key := windowKey(ctx, "acme")
+	g := hNewLimitsRouter(ctx)
+	key := hWindowKey(ctx, "acme")
 	ctx.Redis.Do("HSET", key, "requests", 10, "tokens", 99000)
 	// Another replica lands right after the first command that touches the window, between a
 	// client-side read and its increments, and spends every token that is left.
@@ -1064,23 +1064,23 @@ func CheckAtomic(ctx *harness.Ctx) {
 		fired = true
 		return ctx.Redis.Do("HSET", key, "tokens", 100000)
 	})
-	g.route(limitsBody(164, 400), "acme")
+	g.route(hLimitsBody(164, 400), "acme")
 	ctx.Assert(fired, "a request from acme never touched %s: the window lives in limits:{tenant}:{minute} (keys: %v)", key, ctx.Redis.Keys("limits:*"))
-	tokens := windowHash(ctx, key)["tokens"]
+	tokens := hWindowHash(ctx, key)["tokens"]
 	ctx.Assert(tokens <= 100000, "%s holds %d tokens after another replica spent the window between your read and your increments: both requests spent the same tokens. Read, compare and increment inside one Lua script", key, tokens)
 	ctx.Equal(tokens, 100000, "%s tokens after another replica set them to 100000 between your commands (the replica's update was lost)", key)
-	second := g.route(limitsBody(164, 400), "acme")
+	second := g.route(hLimitsBody(164, 400), "acme")
 	ctx.Equal(second.Status, 429, "with the window spent by another replica the next request")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	g := newLimitsRouter(ctx)
+	g := hNewLimitsRouter(ctx)
 	// 25 s into the minute, so 35 s are left in the window.
 	ctx.Clock.Advance(float64((85 - (ctx.Clock.Now()/1000)%60) % 60))
-	key := windowKey(ctx, "acme")
+	key := hWindowKey(ctx, "acme")
 	// Right after the first command that touches the window: a crash before a later round trip must not leave the key without expiry.
 	atCreate := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
-	r := g.route(limitsBody(164, 400), "acme")
+	r := g.route(hLimitsBody(164, 400), "acme")
 	ctx.Equal(r.Status, 200, "the first request of the minute (%s)", r.Text())
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("limits:*"))
 	ttl := ctx.Redis.TTL(key)
@@ -1091,43 +1091,43 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Assert(atCreate.Result != int64(-1), "right after the request's first command on %s the key existed without expiry: a crash before the expiry is set leaves the window in Redis for good. Set the expiry in the same script", key)
 	ctx.Clock.Advance(61)
 	ctx.Assert(ctx.Redis.Exists(key) == 0, "%s still exists a minute after its window ended", key)
-	next := g.route(limitsBody(164, 400), "acme")
-	ctx.Assert(next.Status == 200 && windowHash(ctx, windowKey(ctx, "acme"))["tokens"] == 164, "the next minute starts a new window")
+	next := g.route(hLimitsBody(164, 400), "acme")
+	ctx.Assert(next.Status == 200 && hWindowHash(ctx, hWindowKey(ctx, "acme"))["tokens"] == 164, "the next minute starts a new window")
 }
 
 func CheckRejectHeaders(ctx *harness.Ctx) {
-	g := newLimitsRouter(ctx)
-	key := windowKey(ctx, "acme")
+	g := hNewLimitsRouter(ctx)
+	key := hWindowKey(ctx, "acme")
 	ctx.Redis.Do("HSET", key, "requests", 3, "tokens", 99950)
 	ctx.Redis.Do("EXPIRE", key, 30)
-	r := g.route(limitsBody(164, 400), "acme")
+	r := g.route(hLimitsBody(164, 400), "acme")
 	ctx.Equal(r.Status, 429, "a request worth 164 tokens against 50 left")
 	ctx.Equal(g.served, 0, "a rejected request must not reach the route behind the guard; the route ran")
 	retry := r.Header.Get("Retry-After")
 	ctx.Assert(retry == "30" || retry == "29", "Retry-After is %q, expected the key's TTL (30 s)", retry)
 	ctx.Equal(r.Header.Get("X-RateLimit-Remaining"), "50", "X-RateLimit-Remaining")
-	ctx.Equal(windowHash(ctx, key), map[string]int{"requests": 3, "tokens": 99950}, "a rejected request must not spend; %s", key)
-	small := g.route(limitsBody(2, 4), "acme")
+	ctx.Equal(hWindowHash(ctx, key), map[string]int{"requests": 3, "tokens": 99950}, "a rejected request must not spend; %s", key)
+	small := g.route(hLimitsBody(2, 4), "acme")
 	ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status)
-	ctx.Equal(windowHash(ctx, key), map[string]int{"requests": 4, "tokens": 99952}, "after a 2-token reservation %s", key)
-	exact := g.route(limitsBody(48, 4), "acme")
+	ctx.Equal(hWindowHash(ctx, key), map[string]int{"requests": 4, "tokens": 99952}, "after a 2-token reservation %s", key)
+	exact := g.route(hLimitsBody(48, 4), "acme")
 	ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d: a request that brings the window to 100 000 tokens fits", exact.Status)
-	ctx.Equal(windowHash(ctx, key), map[string]int{"requests": 5, "tokens": 100000}, "after a 48-token reservation %s", key)
+	ctx.Equal(hWindowHash(ctx, key), map[string]int{"requests": 5, "tokens": 100000}, "after a 48-token reservation %s", key)
 }
 
 func CheckRequestLimit(ctx *harness.Ctx) {
-	g := newLimitsRouter(ctx)
-	key := windowKey(ctx, "acme")
+	g := hNewLimitsRouter(ctx)
+	key := hWindowKey(ctx, "acme")
 	ctx.Redis.Do("HSET", key, "requests", 59, "tokens", 0)
 	ctx.Redis.Do("EXPIRE", key, 45)
-	sixtieth := g.route(limitsBody(2, 4), "acme")
+	sixtieth := g.route(hLimitsBody(2, 4), "acme")
 	ctx.Equal(sixtieth.Status, 200, "the 60th request of the minute (%s)", sixtieth.Text())
-	sixtyFirst := g.route(limitsBody(2, 4), "acme")
+	sixtyFirst := g.route(hLimitsBody(2, 4), "acme")
 	ctx.Equal(sixtyFirst.Status, 429, "the 61st request of the minute (2 tokens, the token budget nearly untouched; the window allows 60 requests)")
 	ctx.Equal(g.served, 1, "the route must run once; the route ran")
 	ctx.Equal(sixtyFirst.Header.Get("X-RateLimit-Remaining"), "0", "with the requests spent X-RateLimit-Remaining")
-	ctx.Equal(windowHash(ctx, key)["requests"], 60, "%s requests", key)
-	other := g.route(limitsBody(2, 4), "beta")
+	ctx.Equal(hWindowHash(ctx, key)["requests"], 60, "%s requests", key)
+	other := g.route(hLimitsBody(2, 4), "beta")
 	ctx.Equal(other.Status, 200, "beta's first request (each tenant has a window of its own)")
 }
 `,
@@ -1140,12 +1140,12 @@ func CheckRequestLimit(ctx *harness.Ctx) {
 namespace {
 
 // limit_guard wrapped around a route the harness registers, counting what got through.
-struct LimitsRouter {
+struct HLimitsRouter {
   int served = 0;
   httplib::Server svr;
   harness::HTTP http;
 
-  explicit LimitsRouter(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+  explicit HLimitsRouter(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
     svr.set_pre_routing_handler(limit_guard);
     svr.Post("/v1/route", [this](const httplib::Request&, httplib::Response& res) {
       served++;
@@ -1158,17 +1158,17 @@ struct LimitsRouter {
   }
 };
 
-std::string windowKey(harness::Ctx& ctx, const std::string& tenant = "acme") {
+std::string hWindowKey(harness::Ctx& ctx, const std::string& tenant = "acme") {
   return "limits:" + tenant + ":" + std::to_string(ctx.Clock.Now() / 1000 / 60);
 }
 
 // A request worth prompt_bytes / 4 + max_tokens tokens.
-std::string limitsBody(int tokens, int prompt_bytes = 400) {
+std::string hLimitsBody(int tokens, int prompt_bytes = 400) {
   return R"({"prompt":")" + std::string(prompt_bytes, 'x') + R"(","max_tokens":)" + std::to_string(tokens - prompt_bytes / 4) +
          R"(,"policy":"auto"})";
 }
 
-std::map<std::string, long long> windowHash(harness::Ctx& ctx, const std::string& key) {
+std::map<std::string, long long> hWindowHash(harness::Ctx& ctx, const std::string& key) {
   std::map<std::string, long long> out;
   for (const auto& [k, v] : ctx.Redis.HGetAll(key)) out[k] = std::atoll(v.c_str());
   return out;
@@ -1177,8 +1177,8 @@ std::map<std::string, long long> windowHash(harness::Ctx& ctx, const std::string
 }  // namespace
 
 void CheckAtomic(harness::Ctx& ctx) {
-  LimitsRouter g(ctx);
-  const std::string key = windowKey(ctx);
+  HLimitsRouter g(ctx);
+  const std::string key = hWindowKey(ctx);
   ctx.Redis.Do("HSET", key, "requests", 10, "tokens", 99000);
   // Another replica lands right after the first command that touches the window, between a
   // client-side read and its increments, and spends every token that is left.
@@ -1187,20 +1187,20 @@ void CheckAtomic(harness::Ctx& ctx) {
     fired = true;
     ctx.Redis.Do("HSET", key, "tokens", 100000);
   });
-  g.route(limitsBody(164));
+  g.route(hLimitsBody(164));
   ctx.Assert(fired, "a request from acme never touched %s: the window lives in limits:{tenant}:{minute} (keys: %v)", key, ctx.Redis.Keys("limits:*"));
-  const long long tokens = windowHash(ctx, key)["tokens"];
+  const long long tokens = hWindowHash(ctx, key)["tokens"];
   ctx.Assert(tokens <= 100000, "%s holds %d tokens after another replica spent the window between your read and your increments: both requests spent the same tokens. Read, compare and increment inside one Lua script", key, tokens);
   ctx.Equal(tokens, 100000LL, "%s tokens after another replica set them to 100000 between your commands (the replica's update was lost)", key);
-  const auto second = g.route(limitsBody(164));
+  const auto second = g.route(hLimitsBody(164));
   ctx.Equal(second.Status, 429, "with the window spent by another replica the next request");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  LimitsRouter g(ctx);
+  HLimitsRouter g(ctx);
   // 25 s into the minute, so 35 s are left in the window.
   ctx.Clock.Advance(static_cast<double>((85 - (ctx.Clock.Now() / 1000) % 60) % 60));
-  const std::string key = windowKey(ctx);
+  const std::string key = hWindowKey(ctx);
   // Right after the first command that touches the window: a crash before a later round trip must not leave the key without expiry.
   bool fired = false;
   long long ttl_then = 0;
@@ -1208,7 +1208,7 @@ void CheckTtl(harness::Ctx& ctx) {
     fired = true;
     ttl_then = ctx.Redis.TTL(key);
   });
-  const auto r = g.route(limitsBody(164));
+  const auto r = g.route(hLimitsBody(164));
   ctx.Equal(r.Status, 200, "the first request of the minute (%s)", r.Text());
   ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("limits:*"));
   const long long ttl = ctx.Redis.TTL(key);
@@ -1219,43 +1219,43 @@ void CheckTtl(harness::Ctx& ctx) {
   ctx.Assert(ttl_then != -1, "right after the request's first command on %s the key existed without expiry: a crash before the expiry is set leaves the window in Redis for good. Set the expiry in the same script", key);
   ctx.Clock.Advance(61);
   ctx.Assert(ctx.Redis.Exists(key) == 0, "%s still exists a minute after its window ended", key);
-  const auto next = g.route(limitsBody(164));
-  ctx.Assert(next.Status == 200 && windowHash(ctx, windowKey(ctx))["tokens"] == 164, "the next minute starts a new window");
+  const auto next = g.route(hLimitsBody(164));
+  ctx.Assert(next.Status == 200 && hWindowHash(ctx, hWindowKey(ctx))["tokens"] == 164, "the next minute starts a new window");
 }
 
 void CheckRejectHeaders(harness::Ctx& ctx) {
-  LimitsRouter g(ctx);
-  const std::string key = windowKey(ctx);
+  HLimitsRouter g(ctx);
+  const std::string key = hWindowKey(ctx);
   ctx.Redis.Do("HSET", key, "requests", 3, "tokens", 99950);
   ctx.Redis.Do("EXPIRE", key, 30);
-  const auto r = g.route(limitsBody(164));
+  const auto r = g.route(hLimitsBody(164));
   ctx.Equal(r.Status, 429, "a request worth 164 tokens against 50 left");
   ctx.Equal(g.served, 0, "a rejected request must not reach the route behind the guard; the route ran");
   const std::string retry = r.HeaderValue("Retry-After");
   ctx.Assert(retry == "30" || retry == "29", "Retry-After is %q, expected the key's TTL (30 s)", retry);
   ctx.Equal(r.HeaderValue("X-RateLimit-Remaining"), "50", "X-RateLimit-Remaining");
-  ctx.Assert(windowHash(ctx, key) == std::map<std::string, long long>{{"requests", 3}, {"tokens", 99950}}, "a rejected request must not spend: %s holds %v", key, windowHash(ctx, key));
-  const auto small = g.route(limitsBody(2, 4));
+  ctx.Assert(hWindowHash(ctx, key) == std::map<std::string, long long>{{"requests", 3}, {"tokens", 99950}}, "a rejected request must not spend: %s holds %v", key, hWindowHash(ctx, key));
+  const auto small = g.route(hLimitsBody(2, 4));
   ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status);
-  ctx.Assert(windowHash(ctx, key) == std::map<std::string, long long>{{"requests", 4}, {"tokens", 99952}}, "after a 2-token reservation %s holds %v, expected 4 requests and 99952 tokens", key, windowHash(ctx, key));
-  const auto exact = g.route(limitsBody(48, 4));
+  ctx.Assert(hWindowHash(ctx, key) == std::map<std::string, long long>{{"requests", 4}, {"tokens", 99952}}, "after a 2-token reservation %s holds %v, expected 4 requests and 99952 tokens", key, hWindowHash(ctx, key));
+  const auto exact = g.route(hLimitsBody(48, 4));
   ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d: a request that brings the window to 100 000 tokens fits", exact.Status);
-  ctx.Assert(windowHash(ctx, key) == std::map<std::string, long long>{{"requests", 5}, {"tokens", 100000}}, "after a 48-token reservation %s holds %v, expected 5 requests and 100000 tokens", key, windowHash(ctx, key));
+  ctx.Assert(hWindowHash(ctx, key) == std::map<std::string, long long>{{"requests", 5}, {"tokens", 100000}}, "after a 48-token reservation %s holds %v, expected 5 requests and 100000 tokens", key, hWindowHash(ctx, key));
 }
 
 void CheckRequestLimit(harness::Ctx& ctx) {
-  LimitsRouter g(ctx);
-  const std::string key = windowKey(ctx);
+  HLimitsRouter g(ctx);
+  const std::string key = hWindowKey(ctx);
   ctx.Redis.Do("HSET", key, "requests", 59, "tokens", 0);
   ctx.Redis.Do("EXPIRE", key, 45);
-  const auto sixtieth = g.route(limitsBody(2, 4));
+  const auto sixtieth = g.route(hLimitsBody(2, 4));
   ctx.Equal(sixtieth.Status, 200, "the 60th request of the minute (%s)", sixtieth.Text());
-  const auto sixty_first = g.route(limitsBody(2, 4));
+  const auto sixty_first = g.route(hLimitsBody(2, 4));
   ctx.Equal(sixty_first.Status, 429, "the 61st request of the minute (2 tokens, the token budget nearly untouched; the window allows 60 requests)");
   ctx.Equal(g.served, 1, "the route must run once; the route ran");
   ctx.Equal(sixty_first.HeaderValue("X-RateLimit-Remaining"), "0", "with the requests spent X-RateLimit-Remaining");
-  ctx.Equal(windowHash(ctx, key)["requests"], 60LL, "%s requests", key);
-  const auto other = g.route(limitsBody(2, 4), "beta");
+  ctx.Equal(hWindowHash(ctx, key)["requests"], 60LL, "%s requests", key);
+  const auto other = g.route(hLimitsBody(2, 4), "beta");
   ctx.Equal(other.Status, 200, "beta's first request (each tenant has a window of its own)");
 }
 `,

@@ -881,16 +881,16 @@ import (
 	"leetbuild/harness"
 )
 
-const clientWindow = "2026-11-02T14:00Z"
+const kHClientWindow = "2026-11-02T14:00Z"
 
 // poolPeer is the shared pool: free units in every window; a confirmation names generation pool-v42.
-type poolPeer struct {
+type HPoolPeer struct {
 	pb.UnimplementedCapacityServer
 	free     int64
 	restarts int // calls that wait out their latency, then fail UNAVAILABLE
 }
 
-func (p *poolPeer) Confirm(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
+func (p *HPoolPeer) Confirm(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
 	if p.restarts > 0 {
 		p.restarts--
 		return nil, status.Error(codes.Unavailable, "pool restarting")
@@ -901,37 +901,37 @@ func (p *poolPeer) Confirm(_ context.Context, req *pb.ConfirmRequest) (*pb.Confi
 	return &pb.ConfirmReply{SourceVersion: "pool-v42"}, nil
 }
 
-func client(ctx *harness.Ctx) *poolPeer {
-	pool := &poolPeer{free: 16}
+func hClient(ctx *harness.Ctx) *HPoolPeer {
+	pool := &HPoolPeer{free: 16}
 	pb.RegisterCapacityServer(ctx.GRPC.Server(""), pool)
 	return pool
 }
 
-func attempt(amount int64) (string, error) {
-	return reserveWithCapacity(context.Background(), "research", clientWindow, "gpu-a100", amount)
+func hAttempt(amount int64) (string, error) {
+	return reserveWithCapacity(context.Background(), "research", kHClientWindow, "gpu-a100", amount)
 }
 
-func expectErr(ctx *harness.Ctx, id string, err, target error, why string) {
+func hExpectErr(ctx *harness.Ctx, id string, err, target error, why string) {
 	ctx.Assert(err != nil, "%s: reserveWithCapacity returned %q instead of an error wrapping %v", why, id, target)
 	ctx.ErrorIs(err, target, "%s: reserveWithCapacity returned %v", why, err)
 }
 
-func untouched(ctx *harness.Ctx, why string) {
+func hUntouched(ctx *harness.Ctx, why string) {
 	written := append(ctx.Redis.Keys("quota:research*"), ctx.Redis.Keys("reservation:research:*")...)
 	ctx.Assert(len(written) == 0, "%s: the ledger was written (%q). Only a confirmation may reach ledger.Reserve", why, written)
 }
 
-func confirms(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Confirm", "")) }
+func hConfirms(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Confirm", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	pool := client(ctx)
-	id, err := attempt(4)
+	pool := hClient(ctx)
+	id, err := hAttempt(4)
 	ctx.Assert(err == nil && id != "", "with the pool answering, a reserve of 4 units must be granted, got %q %v", id, err)
 	ctx.Assert(len(ctx.GRPC.CallsTo("Confirm", "")) > 0, "no Confirm call was made")
 	// The first attempt fails UNAVAILABLE after 200 ms: the second still gets a deadline of its own.
 	ctx.GRPC.SetLatency("Confirm", 0.2, "")
 	pool.restarts = 1
-	id, err = attempt(4)
+	id, err = hAttempt(4)
 	ctx.Assert(err == nil && id != "", "with every Confirm taking 200 ms and the first failing UNAVAILABLE, the second attempt must confirm and the reserve be granted, got %q %v: every attempt carries its own deadline, not what is left of one shared deadline", id, err)
 	for _, call := range ctx.GRPC.CallsTo("Confirm", "") {
 		ctx.Assert(call.HasDeadline(), "a Confirm call carries no deadline: a stalled capacity service holds every reserve open")
@@ -940,61 +940,61 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.Fail("Confirm", codes.Unavailable, "pool restarting", 1, "")
-	id, err := attempt(4)
+	id, err := hAttempt(4)
 	ctx.Assert(err == nil && id != "", "one UNAVAILABLE, then an answer: the second attempt must confirm and the reserve be granted, got %q %v", id, err)
-	ctx.Equal(confirms(ctx), 2, "one UNAVAILABLE must cost exactly one more attempt; the Confirm calls")
+	ctx.Equal(hConfirms(ctx), 2, "one UNAVAILABLE must cost exactly one more attempt; the Confirm calls")
 	ctx.GRPC.Fail("Confirm", codes.DeadlineExceeded, "pool slow", 1, "")
-	before := confirms(ctx)
-	id, err = attempt(4)
+	before := hConfirms(ctx)
+	id, err = hAttempt(4)
 	ctx.Assert(err == nil && id != "", "one DEADLINE_EXCEEDED, then an answer: the second attempt must confirm and the reserve be granted, got %q %v", id, err)
-	ctx.Equal(confirms(ctx)-before, 2, "one DEADLINE_EXCEEDED must cost exactly one more attempt; the Confirm calls")
+	ctx.Equal(hConfirms(ctx)-before, 2, "one DEADLINE_EXCEEDED must cost exactly one more attempt; the Confirm calls")
 	for _, code := range []codes.Code{codes.Internal, codes.InvalidArgument, codes.PermissionDenied} {
 		ctx.GRPC.Fail("Confirm", code, "not a transient fault", 1, "")
-		before = confirms(ctx)
-		id, err = attempt(4)
-		ctx.Equal(confirms(ctx)-before, 1, "one %v is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Confirm calls", code)
-		expectErr(ctx, id, err, ErrCapacityUnavailable, fmt.Sprintf("with the pool answering %v", code))
+		before = hConfirms(ctx)
+		id, err = hAttempt(4)
+		ctx.Equal(hConfirms(ctx)-before, 1, "one %v is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Confirm calls", code)
+		hExpectErr(ctx, id, err, ErrCapacityUnavailable, fmt.Sprintf("with the pool answering %v", code))
 	}
 	ctx.GRPC.Fail("Confirm", codes.Unavailable, "pool down", 20, "")
-	before = confirms(ctx)
+	before = hConfirms(ctx)
 	started := ctx.Clock.Now()
-	id, err = attempt(4)
-	ctx.Equal(confirms(ctx)-before, 2, "with the pool down the reserve must stop at maxAttempts; the Confirm calls")
-	expectErr(ctx, id, err, ErrCapacityUnavailable, "with the pool down")
+	id, err = hAttempt(4)
+	ctx.Equal(hConfirms(ctx)-before, 2, "with the pool down the reserve must stop at maxAttempts; the Confirm calls")
+	hExpectErr(ctx, id, err, ErrCapacityUnavailable, "with the pool down")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited < 0.05, "with the pool failing at once the reserve took %.2f s: no sleep may stretch the reserve between attempts", waited)
 }
 
 func CheckExhaustedTerminal(ctx *harness.Ctx) {
-	pool := client(ctx)
+	pool := hClient(ctx)
 	pool.free = 2
-	id, err := attempt(4)
-	ctx.Equal(confirms(ctx), 1, "a pool that answered RESOURCE_EXHAUSTED is an answer, not a fault; the Confirm calls")
-	expectErr(ctx, id, err, ErrCapacityExhausted, "with 2 units free in the pool and 4 asked")
-	untouched(ctx, "the pool said it is full")
+	id, err := hAttempt(4)
+	ctx.Equal(hConfirms(ctx), 1, "a pool that answered RESOURCE_EXHAUSTED is an answer, not a fault; the Confirm calls")
+	hExpectErr(ctx, id, err, ErrCapacityExhausted, "with 2 units free in the pool and 4 asked")
+	hUntouched(ctx, "the pool said it is full")
 	ctx.GRPC.Fail("Confirm", codes.Unavailable, "pool restarting", 1, "")
-	id, err = attempt(4)
-	ctx.Equal(confirms(ctx), 3, "an UNAVAILABLE then RESOURCE_EXHAUSTED must take 2 more Confirm calls; the Confirm calls so far")
-	expectErr(ctx, id, err, ErrCapacityExhausted, "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked")
-	untouched(ctx, "the pool said it is full on the second attempt")
+	id, err = hAttempt(4)
+	ctx.Equal(hConfirms(ctx), 3, "an UNAVAILABLE then RESOURCE_EXHAUSTED must take 2 more Confirm calls; the Confirm calls so far")
+	hExpectErr(ctx, id, err, ErrCapacityExhausted, "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked")
+	hUntouched(ctx, "the pool said it is full on the second attempt")
 }
 
 func CheckDenyWhenUnsure(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.SetLatency("Confirm", 5.0, "")
 	before := ctx.Clock.Now()
-	id, err := attempt(4)
+	id, err := hAttempt(4)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 0.6, "the reserve waited %.2f s for a capacity service that takes 5 s: two attempts of 250 ms, then deny", waited)
-	expectErr(ctx, id, err, ErrCapacityUnavailable, "with the capacity service taking 5 s to answer")
-	untouched(ctx, "the capacity service never answered in time")
+	hExpectErr(ctx, id, err, ErrCapacityUnavailable, "with the capacity service taking 5 s to answer")
+	hUntouched(ctx, "the capacity service never answered in time")
 }
 
 func CheckSourceVersion(ctx *harness.Ctx) {
-	client(ctx)
-	id, err := attempt(4)
+	hClient(ctx)
+	id, err := hAttempt(4)
 	ctx.Assert(err == nil && id != "", "with the pool answering, a reserve of 4 units must be granted, got %q %v", id, err)
 	record := ctx.Redis.HGetAll("reservation:research:" + id)
 	ctx.Equal(record["source_version"], "pool-v42", "the reservation's source_version (a grant must be traceable to the pool generation that approved it, %s)", fmt.Sprint(record))
@@ -1009,10 +1009,10 @@ func CheckSourceVersion(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kW = "2026-11-02T14:00Z";
+const std::string kHW = "2026-11-02T14:00Z";
 
 // The shared pool: free units in every window; a confirmation names generation pool-v42.
-class PoolPeer final : public quota::Capacity::Service {
+class HPoolPeer final : public quota::Capacity::Service {
  public:
   long long free = 16;
   int restarts = 0;  // calls that wait out their latency, then fail UNAVAILABLE
@@ -1029,16 +1029,16 @@ class PoolPeer final : public quota::Capacity::Service {
   }
 };
 
-PoolPeer& client(harness::Ctx& ctx) {
-  static PoolPeer* pool = nullptr;
+HPoolPeer& hClient(harness::Ctx& ctx) {
+  static HPoolPeer* pool = nullptr;
   delete pool;
-  pool = new PoolPeer;
+  pool = new HPoolPeer;
   ctx.GRPC.Server("")->RegisterService(pool);
   return *pool;
 }
 
 // What reserveWithCapacity did: the id it returned, or the exception it threw.
-struct Outcome {
+struct HOutcome {
   std::optional<std::string> id;
   bool threw = false;
   bool exhausted = false;
@@ -1046,10 +1046,10 @@ struct Outcome {
   std::string what;
 };
 
-Outcome attempt(long long amount = 4) {
-  Outcome out;
+HOutcome hAttempt(long long amount = 4) {
+  HOutcome out;
   try {
-    out.id = reserveWithCapacity("research", kW, "gpu-a100", amount);
+    out.id = reserveWithCapacity("research", kHW, "gpu-a100", amount);
   } catch (const CapacityExhausted& e) {
     out.threw = out.exhausted = true;
     out.what = e.what();
@@ -1063,30 +1063,30 @@ Outcome attempt(long long amount = 4) {
   return out;
 }
 
-void expectThrow(harness::Ctx& ctx, const Outcome& got, bool matched, const std::string& expected, const std::string& why) {
+void hExpectThrow(harness::Ctx& ctx, const HOutcome& got, bool matched, const std::string& expected, const std::string& why) {
   ctx.Assert(got.threw, "%s: reserveWithCapacity returned %q instead of throwing %s", why, got.id.value_or("nothing"), expected);
   ctx.Assert(matched, "%s: reserveWithCapacity threw %s, expected %s", why, got.what, expected);
 }
 
-void untouched(harness::Ctx& ctx, const std::string& why) {
+void hUntouched(harness::Ctx& ctx, const std::string& why) {
   auto written = ctx.Redis.Keys("quota:research*");
   for (const auto& k : ctx.Redis.Keys("reservation:research:*")) written.push_back(k);
   ctx.Assert(written.empty(), "%s: the ledger was written (%q). Only a confirmation may reach ledger::reserve", why, written);
 }
 
-size_t confirms(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Confirm").size(); }
+size_t hConfirms(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Confirm").size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  PoolPeer& pool = client(ctx);
-  const Outcome got = attempt();
+  HPoolPeer& pool = hClient(ctx);
+  const HOutcome got = hAttempt();
   ctx.Assert(!got.threw && got.id, "with the pool answering, a reserve of 4 units must be granted, got %s", got.threw ? got.what : "nothing");
   ctx.Assert(!ctx.GRPC.CallsTo("Confirm").empty(), "no Confirm call was made");
   // The first attempt fails UNAVAILABLE after 200 ms: the second still gets a deadline of its own.
   ctx.GRPC.SetLatency("Confirm", 0.2);
   pool.restarts = 1;
-  const Outcome second = attempt();
+  const HOutcome second = hAttempt();
   ctx.Assert(!second.threw && second.id,
              "with every Confirm taking 200 ms and the first failing UNAVAILABLE, the second attempt must confirm and the reserve be granted, got %s: every attempt carries its own kDeadline, not what is left of one shared deadline",
              second.threw ? second.what : "nothing");
@@ -1097,63 +1097,63 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.Fail("Confirm", grpc::StatusCode::UNAVAILABLE, "pool restarting", 1);
-  const Outcome first = attempt();
+  const HOutcome first = hAttempt();
   ctx.Assert(!first.threw && first.id, "one UNAVAILABLE, then an answer: the second attempt must confirm and the reserve be granted, got %s", first.threw ? first.what : "nothing");
-  ctx.Equal(confirms(ctx), 2, "one UNAVAILABLE must cost exactly one more attempt; the Confirm calls");
+  ctx.Equal(hConfirms(ctx), 2, "one UNAVAILABLE must cost exactly one more attempt; the Confirm calls");
   ctx.GRPC.Fail("Confirm", grpc::StatusCode::DEADLINE_EXCEEDED, "pool slow", 1);
-  size_t before = confirms(ctx);
-  const Outcome slow = attempt();
+  size_t before = hConfirms(ctx);
+  const HOutcome slow = hAttempt();
   ctx.Assert(!slow.threw && slow.id, "one DEADLINE_EXCEEDED, then an answer: the second attempt must confirm and the reserve be granted, got %s", slow.threw ? slow.what : "nothing");
-  ctx.Equal(confirms(ctx) - before, 2, "one DEADLINE_EXCEEDED must cost exactly one more attempt; the Confirm calls");
+  ctx.Equal(hConfirms(ctx) - before, 2, "one DEADLINE_EXCEEDED must cost exactly one more attempt; the Confirm calls");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
   for (const auto& [code, name] : terminal) {
     ctx.GRPC.Fail("Confirm", code, "not a transient fault", 1);
-    before = confirms(ctx);
-    const Outcome got = attempt();
-    ctx.Equal(confirms(ctx) - before, 1, "one %s is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Confirm calls", name);
-    expectThrow(ctx, got, got.unavailable, "CapacityUnavailable", "with the pool answering " + name);
+    before = hConfirms(ctx);
+    const HOutcome got = hAttempt();
+    ctx.Equal(hConfirms(ctx) - before, 1, "one %s is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Confirm calls", name);
+    hExpectThrow(ctx, got, got.unavailable, "CapacityUnavailable", "with the pool answering " + name);
   }
   ctx.GRPC.Fail("Confirm", grpc::StatusCode::UNAVAILABLE, "pool down", 20);
-  before = confirms(ctx);
+  before = hConfirms(ctx);
   const int64_t started = ctx.Clock.Now();
-  const Outcome down = attempt();
-  ctx.Equal(confirms(ctx) - before, 2, "with the pool down the reserve must stop at kMaxAttempts; the Confirm calls");
-  expectThrow(ctx, down, down.unavailable, "CapacityUnavailable", "with the pool down");
+  const HOutcome down = hAttempt();
+  ctx.Equal(hConfirms(ctx) - before, 2, "with the pool down the reserve must stop at kMaxAttempts; the Confirm calls");
+  hExpectThrow(ctx, down, down.unavailable, "CapacityUnavailable", "with the pool down");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited < 0.05, "with the pool failing at once the reserve took %.2f s: no sleep may stretch the reserve between attempts", waited);
 }
 
 void CheckExhaustedTerminal(harness::Ctx& ctx) {
-  PoolPeer& pool = client(ctx);
+  HPoolPeer& pool = hClient(ctx);
   pool.free = 2;
-  const Outcome got = attempt(4);
-  ctx.Equal(confirms(ctx), 1, "a pool that answered RESOURCE_EXHAUSTED is an answer, not a fault; the Confirm calls");
-  expectThrow(ctx, got, got.exhausted, "CapacityExhausted", "with 2 units free in the pool and 4 asked");
-  untouched(ctx, "the pool said it is full");
+  const HOutcome got = hAttempt(4);
+  ctx.Equal(hConfirms(ctx), 1, "a pool that answered RESOURCE_EXHAUSTED is an answer, not a fault; the Confirm calls");
+  hExpectThrow(ctx, got, got.exhausted, "CapacityExhausted", "with 2 units free in the pool and 4 asked");
+  hUntouched(ctx, "the pool said it is full");
   ctx.GRPC.Fail("Confirm", grpc::StatusCode::UNAVAILABLE, "pool restarting", 1);
-  const Outcome second = attempt(4);
-  ctx.Equal(confirms(ctx), 3, "an UNAVAILABLE then RESOURCE_EXHAUSTED must take 2 more Confirm calls; the Confirm calls so far");
-  expectThrow(ctx, second, second.exhausted, "CapacityExhausted", "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked");
-  untouched(ctx, "the pool said it is full on the second attempt");
+  const HOutcome second = hAttempt(4);
+  ctx.Equal(hConfirms(ctx), 3, "an UNAVAILABLE then RESOURCE_EXHAUSTED must take 2 more Confirm calls; the Confirm calls so far");
+  hExpectThrow(ctx, second, second.exhausted, "CapacityExhausted", "with the first attempt UNAVAILABLE and the second answering that 2 units are free and 4 asked");
+  hUntouched(ctx, "the pool said it is full on the second attempt");
 }
 
 void CheckDenyWhenUnsure(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.SetLatency("Confirm", 5.0);
   const int64_t before = ctx.Clock.Now();
-  const Outcome got = attempt();
+  const HOutcome got = hAttempt();
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 0.6, "the reserve waited %.2f s for a capacity service that takes 5 s: two attempts of 250 ms, then deny", waited);
-  expectThrow(ctx, got, got.unavailable, "CapacityUnavailable", "with the capacity service taking 5 s to answer");
-  untouched(ctx, "the capacity service never answered in time");
+  hExpectThrow(ctx, got, got.unavailable, "CapacityUnavailable", "with the capacity service taking 5 s to answer");
+  hUntouched(ctx, "the capacity service never answered in time");
 }
 
 void CheckSourceVersion(harness::Ctx& ctx) {
-  client(ctx);
-  const Outcome got = attempt();
+  hClient(ctx);
+  const HOutcome got = hAttempt();
   ctx.Assert(!got.threw && got.id, "with the pool answering, a reserve of 4 units must be granted, got %s", got.threw ? got.what : "nothing");
   auto record = ctx.Redis.HGetAll("reservation:research:" + *got.id);
   ctx.Equal(record["source_version"], "pool-v42", "the reservation's source_version (a grant must be traceable to the pool generation that approved it)");

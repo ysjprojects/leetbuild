@@ -560,41 +560,41 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func mustCommit(ctx *harness.Ctx, token, next string) Commit {
-	result, err := commitPage(stateBg, "c-1", token, next)
+func hMustCommit(ctx *harness.Ctx, token, next string) Commit {
+	result, err := commitPage(hStateBg, "c-1", token, next)
 	ctx.NoError(err, "commitPage(c-1, %s, %s) failed", token, next)
 	return result
 }
 
-func mustLoad(ctx *harness.Ctx) string {
-	cursor, err := loadCursor(stateBg, "c-1")
+func hMustLoad(ctx *harness.Ctx) string {
+	cursor, err := loadCursor(hStateBg, "c-1")
 	ctx.NoError(err, "loadCursor(c-1) failed")
 	return cursor
 }
 
 func CheckDurableCursor(ctx *harness.Ctx) {
-	first := mustCommit(ctx, "t0", "t1")
+	first := hMustCommit(ctx, "t0", "t1")
 	ctx.Equal(first, Commit{Applied: true, Cursor: "t1"}, "the first commit of page t0")
 	for _, key := range []string{"cursor:c-1", "page:c-1:t0"} {
 		ctx.Equal(ctx.Redis.TTL(key), int64(-1), "%s must have no TTL (-2: missing): a checkpoint is not a cache, nothing can rebuild it but a full replay of the vendor; its TTL", key)
 	}
 	ctx.Clock.Advance(3 * 86400)
-	ctx.Equal(mustLoad(ctx), "t1", "three quiet days later loadCursor (or the next sync restarts from the vendor's first page)")
-	again := mustCommit(ctx, "t0", "t1")
+	ctx.Equal(hMustLoad(ctx), "t1", "three quiet days later loadCursor (or the next sync restarts from the vendor's first page)")
+	again := hMustCommit(ctx, "t0", "t1")
 	ctx.Equal(again.Applied, false, "three days later a re-fetch of page t0 must not apply again (its claim expired); applied")
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	mustCommit(ctx, "t0", "t1")
+	hMustCommit(ctx, "t0", "t1")
 	// A second worker fetched page t1 too (a rebalance) and commits it while this worker is committing it.
 	rival := ctx.Redis.After("page:c-1:t1", func() any {
-		result, err := commitPage(stateBg, "c-1", "t1", "t2")
+		result, err := commitPage(hStateBg, "c-1", "t1", "t2")
 		ctx.NoError(err, "the second worker's commitPage failed")
 		return result
 	})
-	mine := mustCommit(ctx, "t1", "t2")
+	mine := hMustCommit(ctx, "t1", "t2")
 	ctx.Assert(rival.Fired, "commitPage never touched page:c-1:t1")
 	ctx.Assert(rival.Err == nil, "the second worker's commitPage failed: %v", rival.Err)
 	theirs, _ := rival.Result.(Commit)
@@ -604,16 +604,16 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 		loser = theirs
 	}
 	ctx.Equal(loser.Cursor, "t2", "the worker that lost the claim must continue from the cursor the winner wrote (reading the ledger between the claim and the move gives the old one); its cursor")
-	ctx.Equal(mustLoad(ctx), "t2", "the cursor after page t1")
+	ctx.Equal(hMustLoad(ctx), "t2", "the cursor after page t1")
 }
 
 func CheckReplayCursor(ctx *harness.Ctx) {
-	mustCommit(ctx, "t0", "t1")
-	mustCommit(ctx, "t1", "t2")
-	replay := mustCommit(ctx, "t0", "t1")
+	hMustCommit(ctx, "t0", "t1")
+	hMustCommit(ctx, "t1", "t2")
+	replay := hMustCommit(ctx, "t0", "t1")
 	ctx.Equal(replay.Applied, false, "a replay of page t0 must not apply again; applied")
 	ctx.Equal(replay.Cursor, "t2", "a replay of page t0 must answer the cursor the ledger holds, or the worker fetches from the cursor it passed in and re-reads page t1; the cursor")
-	ctx.Equal(mustLoad(ctx), "t2", "a replayed page must leave the cursor")
+	ctx.Equal(hMustLoad(ctx), "t2", "a replayed page must leave the cursor")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -624,13 +624,13 @@ func CheckReplayCursor(ctx *harness.Ctx) {
 
 namespace {
 
-struct Rival {
+struct HRival {
   bool fired = false;
   Commit result;
   std::optional<std::string> err;
 };
 
-std::string loaded() { return loadCursor("c-1").value_or("(none)"); }
+std::string hLoaded() { return loadCursor("c-1").value_or("(none)"); }
 
 }  // namespace
 
@@ -641,14 +641,14 @@ void CheckDurableCursor(harness::Ctx& ctx) {
     ctx.Equal(ctx.Redis.TTL(key), -1LL, "%s must have no TTL (-2: missing): a checkpoint is not a cache, nothing can rebuild it but a full replay of the vendor; its TTL", key);
   }
   ctx.Clock.Advance(3 * 86400);
-  ctx.Equal(loaded(), "t1", "three quiet days later loadCursor (or the next sync restarts from the vendor's first page)");
+  ctx.Equal(hLoaded(), "t1", "three quiet days later loadCursor (or the next sync restarts from the vendor's first page)");
   ctx.Equal(commitPage("c-1", "t0", "t1").applied, false, "three days later a re-fetch of page t0 must not apply again (its claim expired); applied");
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   commitPage("c-1", "t0", "t1");
   // A second worker fetched page t1 too (a rebalance) and commits it while this worker is committing it.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After("page:c-1:t1", [rival] {
     rival->fired = true;
     try {
@@ -665,7 +665,7 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
              mine.applied, rival->result.applied);
   const Commit& loser = mine.applied ? rival->result : mine;
   ctx.Equal(loser.cursor, "t2", "the worker that lost the claim must continue from the cursor the winner wrote (reading the ledger between the claim and the move gives the old one); its cursor");
-  ctx.Equal(loaded(), "t2", "the cursor after page t1");
+  ctx.Equal(hLoaded(), "t2", "the cursor after page t1");
 }
 
 void CheckReplayCursor(harness::Ctx& ctx) {
@@ -674,7 +674,7 @@ void CheckReplayCursor(harness::Ctx& ctx) {
   const Commit replay = commitPage("c-1", "t0", "t1");
   ctx.Equal(replay.applied, false, "a replay of page t0 must not apply again; applied");
   ctx.Equal(replay.cursor, "t2", "a replay of page t0 must answer the cursor the ledger holds, or the worker fetches from the cursor it passed in and re-reads page t1; the cursor");
-  ctx.Equal(loaded(), "t2", "a replayed page must leave the cursor");
+  ctx.Equal(hLoaded(), "t2", "a replayed page must leave the cursor");
 }
 `,
   },

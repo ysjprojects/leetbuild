@@ -889,7 +889,7 @@ import (
 	"leetbuild/harness"
 )
 
-type statsView struct {
+type HStatsView struct {
 	Tenant string \`json:"tenant"\`
 	Slices []struct {
 		Version       int     \`json:"version"\`
@@ -901,34 +901,34 @@ type statsView struct {
 	} \`json:"slices"\`
 }
 
-func statsSeed(ctx *harness.Ctx, tenant string, version int, counts ...any) {
+func hStatsSeed(ctx *harness.Ctx, tenant string, version int, counts ...any) {
 	if len(counts) > 0 {
 		ctx.Redis.Do(append([]any{"HSET", "pc-stats:" + tenant + ":" + strconv.Itoa(version)}, counts...)...)
 	}
 	ctx.Redis.Do("SADD", "pc-versions:"+tenant, version)
 }
 
-func statsGet(ctx *harness.Ctx, tenant, query string) *harness.Response {
+func hStatsGet(ctx *harness.Ctx, tenant, query string) *harness.Response {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux).Get("/v1/cache/stats"+query, "X-Tenant-Id", tenant)
 }
 
-func statsRead(ctx *harness.Ctx, r *harness.Response) statsView {
+func hStatsRead(ctx *harness.Ctx, r *harness.Response) HStatsView {
 	ctx.Equal(r.Status, 200, "GET /v1/cache/stats (%s)", r.Text())
-	var view statsView
+	var view HStatsView
 	r.Decode(&view)
 	return view
 }
 
-func statsClose(got, want float64) bool { return math.Abs(got-want) < 1e-9 }
+func hStatsClose(got, want float64) bool { return math.Abs(got-want) < 1e-9 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	statsSeed(ctx, "t1", 7, "hits", 3, "misses", 1, "fill_ms", 900, "tokens_saved", 3000)
-	statsSeed(ctx, "t1", 8, "misses", 2, "fill_ms", 1000)
-	statsSeed(ctx, "t2", 7, "hits", 50, "misses", 50)
-	r := statsGet(ctx, "t1", "")
-	view := statsRead(ctx, r)
+	hStatsSeed(ctx, "t1", 7, "hits", 3, "misses", 1, "fill_ms", 900, "tokens_saved", 3000)
+	hStatsSeed(ctx, "t1", 8, "misses", 2, "fill_ms", 1000)
+	hStatsSeed(ctx, "t2", 7, "hits", 50, "misses", 50)
+	r := hStatsGet(ctx, "t1", "")
+	view := hStatsRead(ctx, r)
 	ctx.Equal(view.Tenant, "t1", "the body names the caller's tenant (%s)", r.Text())
 	ctx.Assert(len(view.Slices) == 2 && view.Slices[0].Version == 7 && view.Slices[1].Version == 8, "one slice per version in pc-versions:t1, sorted: %s", r.Text())
 	ctx.Assert(view.Slices[0].Hits == 3 && view.Slices[0].Misses == 1 && view.Slices[1].Misses == 2, "each slice carries its version's hits and misses: %s", r.Text())
@@ -938,50 +938,50 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckForeignTenant(ctx *harness.Ctx) {
-	statsSeed(ctx, "t1", 7, "hits", 3, "misses", 1)
-	statsSeed(ctx, "t2", 7, "hits", 50, "misses", 50)
-	r := statsGet(ctx, "t1", "?tenant=t2")
+	hStatsSeed(ctx, "t1", 7, "hits", 3, "misses", 1)
+	hStatsSeed(ctx, "t2", 7, "hits", 50, "misses", 50)
+	r := hStatsGet(ctx, "t1", "?tenant=t2")
 	ctx.Equal(r.Status, 403, "t1 asking for ?tenant=t2 (%s): another tenant's traffic is theirs", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "50"), "the refusal carries t2's numbers: %s", r.Text())
 	var refusal map[string]any
 	r.Decode(&refusal)
 	ctx.Assert(len(refusal) == 1 && refusal["error"] == "forbidden", "the 403 body must be {\\"error\\": \\"forbidden\\"}, got %.200s", r.Text())
-	ctx.Equal(statsGet(ctx, "t1", "?tenant=t3").Status, 403, "t1 asking for ?tenant=t3, a tenant with no stats: naming any other tenant is 403, whether or not it has traffic")
-	own := statsRead(ctx, statsGet(ctx, "t1", "?tenant=t1"))
+	ctx.Equal(hStatsGet(ctx, "t1", "?tenant=t3").Status, 403, "t1 asking for ?tenant=t3, a tenant with no stats: naming any other tenant is 403, whether or not it has traffic")
+	own := hStatsRead(ctx, hStatsGet(ctx, "t1", "?tenant=t1"))
 	ctx.Assert(len(own.Slices) == 1 && own.Slices[0].Hits == 3, "?tenant= naming the caller answers the caller's stats, got %+v", own)
 }
 
 func CheckHitRatio(ctx *harness.Ctx) {
-	statsSeed(ctx, "t1", 7, "hits", 3, "misses", 1)
-	statsSeed(ctx, "t1", 8)
-	statsSeed(ctx, "t1", 9, "misses", 4)
-	view := statsRead(ctx, statsGet(ctx, "t1", ""))
+	hStatsSeed(ctx, "t1", 7, "hits", 3, "misses", 1)
+	hStatsSeed(ctx, "t1", 8)
+	hStatsSeed(ctx, "t1", 9, "misses", 4)
+	view := hStatsRead(ctx, hStatsGet(ctx, "t1", ""))
 	ctx.Equal(len(view.Slices), 3, "slices for versions 7, 8, 9")
-	ctx.Assert(statsClose(view.Slices[0].HitRatio, 0.75), "hits 3, misses 1 must read hit_ratio 0.75 (hits over lookups), got %v", view.Slices[0].HitRatio)
-	ctx.Assert(statsClose(view.Slices[1].HitRatio, 0), "a version with no traffic reads hit_ratio 0, got %v", view.Slices[1].HitRatio)
-	ctx.Assert(statsClose(view.Slices[2].HitRatio, 0), "misses only must read hit_ratio 0, got %v", view.Slices[2].HitRatio)
+	ctx.Assert(hStatsClose(view.Slices[0].HitRatio, 0.75), "hits 3, misses 1 must read hit_ratio 0.75 (hits over lookups), got %v", view.Slices[0].HitRatio)
+	ctx.Assert(hStatsClose(view.Slices[1].HitRatio, 0), "a version with no traffic reads hit_ratio 0, got %v", view.Slices[1].HitRatio)
+	ctx.Assert(hStatsClose(view.Slices[2].HitRatio, 0), "misses only must read hit_ratio 0, got %v", view.Slices[2].HitRatio)
 }
 
 func CheckFillLatency(ctx *harness.Ctx) {
-	statsSeed(ctx, "t1", 7, "hits", 7, "misses", 3, "fill_ms", 900)
-	statsSeed(ctx, "t1", 8, "hits", 5)
-	statsSeed(ctx, "t1", 9, "misses", 3, "fill_ms", 1000)
-	view := statsRead(ctx, statsGet(ctx, "t1", ""))
+	hStatsSeed(ctx, "t1", 7, "hits", 7, "misses", 3, "fill_ms", 900)
+	hStatsSeed(ctx, "t1", 8, "hits", 5)
+	hStatsSeed(ctx, "t1", 9, "misses", 3, "fill_ms", 1000)
+	view := hStatsRead(ctx, hStatsGet(ctx, "t1", ""))
 	ctx.Equal(len(view.Slices), 3, "slices for versions 7, 8 and 9")
-	ctx.Assert(statsClose(view.Slices[0].FillLatencyMs, 300), "fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got %v", view.Slices[0].FillLatencyMs)
-	ctx.Assert(statsClose(view.Slices[1].FillLatencyMs, 0), "a version with no misses reads fill_latency_ms 0, got %v", view.Slices[1].FillLatencyMs)
-	ctx.Assert(statsClose(view.Slices[2].FillLatencyMs, 1000.0/3), "fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got %v", view.Slices[2].FillLatencyMs)
+	ctx.Assert(hStatsClose(view.Slices[0].FillLatencyMs, 300), "fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got %v", view.Slices[0].FillLatencyMs)
+	ctx.Assert(hStatsClose(view.Slices[1].FillLatencyMs, 0), "a version with no misses reads fill_latency_ms 0, got %v", view.Slices[1].FillLatencyMs)
+	ctx.Assert(hStatsClose(view.Slices[2].FillLatencyMs, 1000.0/3), "fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got %v", view.Slices[2].FillLatencyMs)
 }
 
 func CheckVersionPrice(ctx *harness.Ctx) {
 	for _, version := range []int{7, 8, 9} {
-		statsSeed(ctx, "t1", version, "hits", 10, "tokens_saved", 10000)
+		hStatsSeed(ctx, "t1", version, "hits", 10, "tokens_saved", 10000)
 	}
-	view := statsRead(ctx, statsGet(ctx, "t1", ""))
+	view := hStatsRead(ctx, hStatsGet(ctx, "t1", ""))
 	ctx.Equal(len(view.Slices), 3, "slices for versions 7, 8, 9")
 	for i, want := range []float64{0.02, 0.015, 0.02} {
 		s := view.Slices[i]
-		ctx.Assert(statsClose(s.SavingsUSD, want), "10 000 tokens saved on version %d must read savings_usd %v (config.PricePer1k), got %v", s.Version, want, s.SavingsUSD)
+		ctx.Assert(hStatsClose(s.SavingsUSD, want), "10 000 tokens saved on version %d must read savings_usd %v (config.PricePer1k), got %v", s.Version, want, s.SavingsUSD)
 	}
 }
 `,
@@ -996,7 +996,7 @@ namespace {
 
 using json = nlohmann::json;
 
-void statsSeed(harness::Ctx& ctx, const std::string& tenant, int version, long long hits = -1, long long misses = -1,
+void hStatsSeed(harness::Ctx& ctx, const std::string& tenant, int version, long long hits = -1, long long misses = -1,
                long long fill_ms = -1, long long tokens_saved = -1) {
   const std::string key = "pc-stats:" + tenant + ":" + std::to_string(version);
   if (hits >= 0) ctx.Redis.Do("HSET", key, "hits", hits);
@@ -1006,29 +1006,29 @@ void statsSeed(harness::Ctx& ctx, const std::string& tenant, int version, long l
   ctx.Redis.Do("SADD", "pc-versions:" + tenant, version);
 }
 
-harness::Response statsGet(harness::Ctx& ctx, const std::string& tenant, const std::string& query = "") {
+harness::Response hStatsGet(harness::Ctx& ctx, const std::string& tenant, const std::string& query = "") {
   httplib::Server svr;
   register_routes(svr);
   return ctx.HTTP(svr).Get("/v1/cache/stats" + query, "X-Tenant-Id", tenant);
 }
 
-json statsSlices(harness::Ctx& ctx, const harness::Response& r) {
+json hStatsSlices(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "GET /v1/cache/stats (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.contains("slices") && body["slices"].is_array(), "the body must carry a slices list: %s", r.Text());
   return body["slices"];
 }
 
-bool statsClose(const json& got, double want) { return got.is_number() && std::fabs(got.get<double>() - want) < 1e-9; }
+bool hStatsClose(const json& got, double want) { return got.is_number() && std::fabs(got.get<double>() - want) < 1e-9; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  statsSeed(ctx, "t1", 7, 3, 1, 900, 3000);
-  statsSeed(ctx, "t1", 8, -1, 2, 1000);
-  statsSeed(ctx, "t2", 7, 50, 50);
-  const auto r = statsGet(ctx, "t1");
-  const json slices = statsSlices(ctx, r);
+  hStatsSeed(ctx, "t1", 7, 3, 1, 900, 3000);
+  hStatsSeed(ctx, "t1", 8, -1, 2, 1000);
+  hStatsSeed(ctx, "t2", 7, 50, 50);
+  const auto r = hStatsGet(ctx, "t1");
+  const json slices = hStatsSlices(ctx, r);
   ctx.Assert(json::parse(r.Text()).value("tenant", "") == "t1", "the body names the caller's tenant: %s", r.Text());
   ctx.Assert(slices.size() == 2 && slices[0].value("version", 0) == 7 && slices[1].value("version", 0) == 8, "one slice per version in pc-versions:t1, sorted: %s", r.Text());
   ctx.Assert(slices[0].value("hits", -1) == 3 && slices[0].value("misses", -1) == 1 && slices[1].value("misses", -1) == 2, "each slice carries its version's hits and misses: %s", r.Text());
@@ -1038,47 +1038,47 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckForeignTenant(harness::Ctx& ctx) {
-  statsSeed(ctx, "t1", 7, 3, 1);
-  statsSeed(ctx, "t2", 7, 50, 50);
-  const auto r = statsGet(ctx, "t1", "?tenant=t2");
+  hStatsSeed(ctx, "t1", 7, 3, 1);
+  hStatsSeed(ctx, "t2", 7, 50, 50);
+  const auto r = hStatsGet(ctx, "t1", "?tenant=t2");
   ctx.Equal(r.Status, 403, "t1 asking for ?tenant=t2 (%s): another tenant's traffic is theirs", r.Text());
   ctx.Assert(r.Text().find("50") == std::string::npos, "the refusal carries t2's numbers: %s", r.Text());
   const json refusal = json::parse(r.Text(), nullptr, false);
   ctx.Assert(refusal == json{{"error", "forbidden"}}, "the 403 body must be {\\"error\\": \\"forbidden\\"}, got %s", r.Text().substr(0, 200));
-  ctx.Equal(statsGet(ctx, "t1", "?tenant=t3").Status, 403, "t1 asking for ?tenant=t3, a tenant with no stats: naming any other tenant is 403, whether or not it has traffic");
-  const json own = statsSlices(ctx, statsGet(ctx, "t1", "?tenant=t1"));
+  ctx.Equal(hStatsGet(ctx, "t1", "?tenant=t3").Status, 403, "t1 asking for ?tenant=t3, a tenant with no stats: naming any other tenant is 403, whether or not it has traffic");
+  const json own = hStatsSlices(ctx, hStatsGet(ctx, "t1", "?tenant=t1"));
   ctx.Assert(own.size() == 1 && own[0].value("hits", -1) == 3, "?tenant= naming the caller answers the caller's stats, got %s", own.dump());
 }
 
 void CheckHitRatio(harness::Ctx& ctx) {
-  statsSeed(ctx, "t1", 7, 3, 1);
-  statsSeed(ctx, "t1", 8);
-  statsSeed(ctx, "t1", 9, -1, 4);
-  const json s = statsSlices(ctx, statsGet(ctx, "t1"));
+  hStatsSeed(ctx, "t1", 7, 3, 1);
+  hStatsSeed(ctx, "t1", 8);
+  hStatsSeed(ctx, "t1", 9, -1, 4);
+  const json s = hStatsSlices(ctx, hStatsGet(ctx, "t1"));
   ctx.Equal(s.size(), 3, "slices for versions 7, 8, 9");
-  ctx.Assert(statsClose(s[0]["hit_ratio"], 0.75), "hits 3, misses 1 must read hit_ratio 0.75 (hits over lookups), got %s", s[0]["hit_ratio"].dump());
-  ctx.Assert(statsClose(s[1]["hit_ratio"], 0), "a version with no traffic reads hit_ratio 0, got %s", s[1]["hit_ratio"].dump());
-  ctx.Assert(statsClose(s[2]["hit_ratio"], 0), "misses only must read hit_ratio 0, got %s", s[2]["hit_ratio"].dump());
+  ctx.Assert(hStatsClose(s[0]["hit_ratio"], 0.75), "hits 3, misses 1 must read hit_ratio 0.75 (hits over lookups), got %s", s[0]["hit_ratio"].dump());
+  ctx.Assert(hStatsClose(s[1]["hit_ratio"], 0), "a version with no traffic reads hit_ratio 0, got %s", s[1]["hit_ratio"].dump());
+  ctx.Assert(hStatsClose(s[2]["hit_ratio"], 0), "misses only must read hit_ratio 0, got %s", s[2]["hit_ratio"].dump());
 }
 
 void CheckFillLatency(harness::Ctx& ctx) {
-  statsSeed(ctx, "t1", 7, 7, 3, 900);
-  statsSeed(ctx, "t1", 8, 5);
-  statsSeed(ctx, "t1", 9, -1, 3, 1000);
-  const json s = statsSlices(ctx, statsGet(ctx, "t1"));
+  hStatsSeed(ctx, "t1", 7, 7, 3, 900);
+  hStatsSeed(ctx, "t1", 8, 5);
+  hStatsSeed(ctx, "t1", 9, -1, 3, 1000);
+  const json s = hStatsSlices(ctx, hStatsGet(ctx, "t1"));
   ctx.Equal(s.size(), 3, "slices for versions 7, 8 and 9");
-  ctx.Assert(statsClose(s[0]["fill_latency_ms"], 300), "fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got %s", s[0]["fill_latency_ms"].dump());
-  ctx.Assert(statsClose(s[1]["fill_latency_ms"], 0), "a version with no misses reads fill_latency_ms 0, got %s", s[1]["fill_latency_ms"].dump());
-  ctx.Assert(statsClose(s[2]["fill_latency_ms"], 1000.0 / 3), "fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got %s", s[2]["fill_latency_ms"].dump());
+  ctx.Assert(hStatsClose(s[0]["fill_latency_ms"], 300), "fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got %s", s[0]["fill_latency_ms"].dump());
+  ctx.Assert(hStatsClose(s[1]["fill_latency_ms"], 0), "a version with no misses reads fill_latency_ms 0, got %s", s[1]["fill_latency_ms"].dump());
+  ctx.Assert(hStatsClose(s[2]["fill_latency_ms"], 1000.0 / 3), "fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got %s", s[2]["fill_latency_ms"].dump());
 }
 
 void CheckVersionPrice(harness::Ctx& ctx) {
-  for (int version : {7, 8, 9}) statsSeed(ctx, "t1", version, 10, -1, -1, 10000);
-  const json s = statsSlices(ctx, statsGet(ctx, "t1"));
+  for (int version : {7, 8, 9}) hStatsSeed(ctx, "t1", version, 10, -1, -1, 10000);
+  const json s = hStatsSlices(ctx, hStatsGet(ctx, "t1"));
   ctx.Equal(s.size(), 3, "slices for versions 7, 8, 9");
   const double want[] = {0.02, 0.015, 0.02};
   for (size_t i = 0; i < 3; i++) {
-    ctx.Assert(statsClose(s[i]["savings_usd"], want[i]), "10 000 tokens saved on version %d must read savings_usd %v (config::price_per_1k), got %s", s[i].value("version", 0), want[i], s[i]["savings_usd"].dump());
+    ctx.Assert(hStatsClose(s[i]["savings_usd"], want[i]), "10 000 tokens saved on version %d must read savings_usd %v (config::price_per_1k), got %s", s[i].value("version", 0), want[i], s[i]["savings_usd"].dump());
   }
 }
 `,

@@ -893,20 +893,20 @@ import (
 	"leetbuild/harness"
 )
 
-const clientDS = "imdb-reviews"
+const kHClientDS = "imdb-reviews"
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // validatorPeer scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A
 // cap truncates every scan; with shortView it reports the rows it scanned as the whole file.
-type validatorPeer struct {
+type HValidatorPeer struct {
 	pb.UnimplementedValidatorServer
 	cap       int64
 	shortView bool
 }
 
-func (v *validatorPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.ValidationReport, error) {
-	content, found := store.ReadObject(clientBg, req.GetContentSha256())
+func (v *HValidatorPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.ValidationReport, error) {
+	content, found := store.ReadObject(hClientBg, req.GetContentSha256())
 	if !found {
 		return nil, status.Errorf(codes.NotFound, "no object %s", req.GetContentSha256())
 	}
@@ -936,7 +936,7 @@ func (v *validatorPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*p
 	return &pb.ValidationReport{Passed: len(failures) == 0, RowsScanned: limit, RowsTotal: total, Failures: failures}, nil
 }
 
-func clientRegister(ctx *harness.Ctx, version string, n, badAt int) {
+func hClientRegister(ctx *harness.Ctx, version string, n, badAt int) {
 	var b strings.Builder
 	for i := 1; i <= n; i++ {
 		label := "pos"
@@ -946,42 +946,42 @@ func clientRegister(ctx *harness.Ctx, version string, n, badAt int) {
 		fmt.Fprintf(&b, "%d,review %d,%s\\n", i, i, label)
 	}
 	content := b.String()
-	sha := store.PutObject(clientBg, content)
-	err := store.PutVersion(clientBg, &store.VersionRecord{Tenant: "t1", Dataset: clientDS, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: int64(len(content)), RowCount: int64(n), Status: "registered"})
+	sha := store.PutObject(hClientBg, content)
+	err := store.PutVersion(hClientBg, &store.VersionRecord{Tenant: "t1", Dataset: kHClientDS, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: int64(len(content)), RowCount: int64(n), Status: "registered"})
 	ctx.NoError(err, "seeding %s", version)
 }
 
-func clientLatest(ctx *harness.Ctx) string {
-	latest, err := pointer.Latest(clientBg, clientDS)
+func hClientLatest(ctx *harness.Ctx) string {
+	latest, err := pointer.Latest(hClientBg, kHClientDS)
 	ctx.NoError(err, "reading the latest version")
 	return latest
 }
 
-func client(ctx *harness.Ctx) *validatorPeer {
-	peer := &validatorPeer{}
+func hClient(ctx *harness.Ctx) *HValidatorPeer {
+	peer := &HValidatorPeer{}
 	pb.RegisterValidatorServer(ctx.GRPC.Server(""), peer)
-	clientRegister(ctx, "2026-01", 10, 0)
-	got, err := validateAndPromote(clientBg, clientDS, "2026-01", "alice")
+	hClientRegister(ctx, "2026-01", 10, 0)
+	got, err := validateAndPromote(hClientBg, kHClientDS, "2026-01", "alice")
 	ctx.NoError(err, "a clean version with a healthy validator")
 	ctx.Equal(got, "validated", "a clean version with a healthy validator; its status")
-	ctx.Equal(clientLatest(ctx), "2026-01", "a validated version must be promoted; the latest")
+	ctx.Equal(hClientLatest(ctx), "2026-01", "a validated version must be promoted; the latest")
 	return peer
 }
 
-func clientPending(ctx *harness.Ctx, version, why string) {
-	got, err := validateAndPromote(clientBg, clientDS, version, "bob")
+func hClientPending(ctx *harness.Ctx, version, why string) {
+	got, err := validateAndPromote(hClientBg, kHClientDS, version, "bob")
 	ctx.Assert(err != nil, "%s: validateAndPromote returned %q instead of ErrValidationPending", why, got)
 	ctx.Assert(errors.Is(err, ErrValidationPending), "%s: validateAndPromote failed with %v, expected ErrValidationPending", why, err)
 }
 
-func clientHeld(ctx *harness.Ctx, version, status, why string) {
-	rec := store.Version(clientBg, clientDS, version)
+func hClientHeld(ctx *harness.Ctx, version, status, why string) {
+	rec := store.Version(hClientBg, kHClientDS, version)
 	ctx.Equal(rec.Status, status, "%s: the status of %s", why, version)
-	ctx.Equal(clientLatest(ctx), "2026-01", "%s: the latest version must stay 2026-01; latest", why)
+	ctx.Equal(hClientLatest(ctx), "2026-01", "%s: the latest version must stay 2026-01; latest", why)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	calls := ctx.GRPC.CallsTo("Validate", "")
 	ctx.Assert(len(calls) > 0, "no Validate call was made")
 	for _, call := range calls {
@@ -989,69 +989,69 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(29500*time.Millisecond <= call.Timeout && call.Timeout <= 30500*time.Millisecond, "the Validate call carries a %v deadline, expected 30 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Validate", 120, "")
-	clientRegister(ctx, "2026-02", 10, 0)
+	hClientRegister(ctx, "2026-02", 10, 0)
 	before := ctx.Clock.Now()
-	clientPending(ctx, "2026-02", "with the validator taking 120 s")
+	hClientPending(ctx, "2026-02", "with the validator taking 120 s")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 31, "the promotion waited %.0f s on the validator, expected at most the 30 s deadline", waited)
-	clientHeld(ctx, "2026-02", "pending", "after the deadline")
+	hClientHeld(ctx, "2026-02", "pending", "after the deadline")
 }
 
 func CheckTimeoutNoPromote(ctx *harness.Ctx) {
-	client(ctx)
-	clientRegister(ctx, "2026-02", 10, 0)
-	clientRegister(ctx, "2026-03", 10, 0)
+	hClient(ctx)
+	hClientRegister(ctx, "2026-02", 10, 0)
+	hClientRegister(ctx, "2026-03", 10, 0)
 	ctx.GRPC.Fail("Validate", codes.Unavailable, "validator restarting", 1, "")
-	clientPending(ctx, "2026-02", "with the validator UNAVAILABLE")
-	clientHeld(ctx, "2026-02", "pending", "with the validator UNAVAILABLE")
+	hClientPending(ctx, "2026-02", "with the validator UNAVAILABLE")
+	hClientHeld(ctx, "2026-02", "pending", "with the validator UNAVAILABLE")
 	for _, code := range []codes.Code{codes.Internal, codes.InvalidArgument} {
 		ctx.GRPC.Fail("Validate", code, "validator error", 1, "")
-		clientPending(ctx, "2026-02", "with the validator failing "+code.String())
-		clientHeld(ctx, "2026-02", "pending", "with the validator failing "+code.String())
+		hClientPending(ctx, "2026-02", "with the validator failing "+code.String())
+		hClientHeld(ctx, "2026-02", "pending", "with the validator failing "+code.String())
 	}
 	ctx.GRPC.SetLatency("Validate", 120, "")
-	clientPending(ctx, "2026-03", "with the validator past its deadline")
-	clientHeld(ctx, "2026-03", "pending", "with the validator past its deadline")
+	hClientPending(ctx, "2026-03", "with the validator past its deadline")
+	hClientHeld(ctx, "2026-03", "pending", "with the validator past its deadline")
 	ctx.GRPC.SetLatency("Validate", 0, "")
-	got, err := validateAndPromote(clientBg, clientDS, "2026-02", "bob")
+	got, err := validateAndPromote(hClientBg, kHClientDS, "2026-02", "bob")
 	ctx.NoError(err, "once the validator answers")
 	ctx.Equal(got, "validated", "once the validator answers, the pending version's status")
-	ctx.Equal(clientLatest(ctx), "2026-02", "the validated 2026-02 must be promoted; the latest")
+	ctx.Equal(hClientLatest(ctx), "2026-02", "the validated 2026-02 must be promoted; the latest")
 }
 
 func CheckRejectedHeld(ctx *harness.Ctx) {
-	client(ctx)
-	clientRegister(ctx, "2026-02", 10, 3)
-	got, err := validateAndPromote(clientBg, clientDS, "2026-02", "bob")
+	hClient(ctx)
+	hClientRegister(ctx, "2026-02", 10, 3)
+	got, err := validateAndPromote(hClientBg, kHClientDS, "2026-02", "bob")
 	ctx.NoError(err, "a failed report is a verdict, not an error")
 	ctx.Equal(got, "rejected", "a report with passed false; validateAndPromote returned")
-	clientHeld(ctx, "2026-02", "rejected", "after a failed report")
-	report := store.Version(clientBg, clientDS, "2026-02").Report
+	hClientHeld(ctx, "2026-02", "rejected", "after a failed report")
+	report := store.Version(hClientBg, kHClientDS, "2026-02").Report
 	ctx.Assert(report != nil && !report.Passed && len(report.Failures) > 0, "the rejected version must keep the validator's report, it holds %+v", report)
-	validated := store.Version(clientBg, clientDS, "2026-01").Report
+	validated := store.Version(hClientBg, kHClientDS, "2026-01").Report
 	ctx.Assert(validated != nil && validated.Passed && validated.RowsScanned == 10, "the validated 2026-01 must keep the validator's report as well, it holds %+v", validated)
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
-	peer := client(ctx)
-	clientRegister(ctx, "2026-02", 1500, 1200)
-	clientRegister(ctx, "2026-03", 1500, 0)
-	got, err := validateAndPromote(clientBg, clientDS, "2026-02", "bob")
+	peer := hClient(ctx)
+	hClientRegister(ctx, "2026-02", 1500, 1200)
+	hClientRegister(ctx, "2026-03", 1500, 0)
+	got, err := validateAndPromote(hClientBg, kHClientDS, "2026-02", "bob")
 	if errors.Is(err, ErrValidationPending) {
 		got = "pending"
 	}
 	calls := ctx.GRPC.CallsTo("Validate", "")
 	asked := calls[len(calls)-1].Request.(*pb.ValidateRequest).GetMaxRows()
 	ctx.Equal(got, "rejected", "a version with a bad row at 1200: the validator was asked for max_rows %d, so it must read that row (ask for every row, max_rows 0); the status", asked)
-	clientHeld(ctx, "2026-02", "rejected", "with a bad row at 1200")
+	hClientHeld(ctx, "2026-02", "rejected", "with a bad row at 1200")
 	peer.cap = 500
-	clientPending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows")
-	clientHeld(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows")
+	hClientPending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows")
+	hClientHeld(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows")
 	peer.shortView = true
 	peer.cap = 1000
-	clientRegister(ctx, "2026-04", 1500, 0)
-	clientPending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)")
-	clientHeld(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows")
+	hClientRegister(ctx, "2026-04", 1500, 0)
+	hClientPending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)")
+	hClientHeld(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1062,11 +1062,11 @@ func CheckCoverage(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDS = "imdb-reviews";
+const std::string kHDS = "imdb-reviews";
 
 // Scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A cap truncates
 // every scan; with short_view it reports the rows it scanned as the whole file.
-class ValidatorPeer final : public datasetregistry::Validator::Service {
+class HValidatorPeer final : public datasetregistry::Validator::Service {
  public:
   long long cap = 0;
   bool short_view = false;
@@ -1097,12 +1097,12 @@ class ValidatorPeer final : public datasetregistry::Validator::Service {
   }
 };
 
-void registerVersion(const std::string& version, int n, int bad_at = 0) {
+void hRegisterVersion(const std::string& version, int n, int bad_at = 0) {
   std::string content;
   for (int i = 1; i <= n; i++) content += std::to_string(i) + ",review " + std::to_string(i) + "," + (i == bad_at ? "BAD" : "pos") + "\\n";
   store::VersionRecord rec;
   rec.tenant = "t1";
-  rec.dataset = kDS;
+  rec.dataset = kHDS;
   rec.version = version;
   rec.content_sha256 = store::putObject(content);
   rec.license = "mit";
@@ -1112,21 +1112,21 @@ void registerVersion(const std::string& version, int n, int bad_at = 0) {
   store::putVersion(rec);
 }
 
-ValidatorPeer& client(harness::Ctx& ctx) {
-  static ValidatorPeer* peer = nullptr;
+HValidatorPeer& hClient(harness::Ctx& ctx) {
+  static HValidatorPeer* peer = nullptr;
   delete peer;
-  peer = new ValidatorPeer;
+  peer = new HValidatorPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
-  registerVersion("2026-01", 10);
-  ctx.Equal(validateAndPromote(kDS, "2026-01", "alice"), "validated", "a clean version with a healthy validator; its status");
-  ctx.Equal(pointer::latest(kDS), "2026-01", "a validated version must be promoted; the latest");
+  hRegisterVersion("2026-01", 10);
+  ctx.Equal(validateAndPromote(kHDS, "2026-01", "alice"), "validated", "a clean version with a healthy validator; its status");
+  ctx.Equal(pointer::latest(kHDS), "2026-01", "a validated version must be promoted; the latest");
   return *peer;
 }
 
-void pending(harness::Ctx& ctx, const std::string& version, const std::string& why) {
+void hPending(harness::Ctx& ctx, const std::string& version, const std::string& why) {
   std::string got;
   try {
-    got = validateAndPromote(kDS, version, "bob");
+    got = validateAndPromote(kHDS, version, "bob");
   } catch (const ValidationPending&) {
     return;
   } catch (const std::exception& e) {
@@ -1136,14 +1136,14 @@ void pending(harness::Ctx& ctx, const std::string& version, const std::string& w
 }
 
 void held(harness::Ctx& ctx, const std::string& version, const std::string& status, const std::string& why) {
-  ctx.Equal(store::version(kDS, version)->status, status, "%s: the status of %s", why, version);
-  ctx.Equal(pointer::latest(kDS), "2026-01", "%s: the latest version must stay 2026-01; latest", why);
+  ctx.Equal(store::version(kHDS, version)->status, status, "%s: the status of %s", why, version);
+  ctx.Equal(pointer::latest(kHDS), "2026-01", "%s: the latest version must stay 2026-01; latest", why);
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   const auto calls = ctx.GRPC.CallsTo("Validate");
   ctx.Assert(!calls.empty(), "no Validate call was made");
   for (const auto& call : calls) {
@@ -1151,54 +1151,54 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(29.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 30.5, "the Validate call carries a %v s deadline, expected kDeadline = 30 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Validate", 120.0);
-  registerVersion("2026-02", 10);
+  hRegisterVersion("2026-02", 10);
   const auto before = ctx.Clock.Now();
-  pending(ctx, "2026-02", "with the validator taking 120 s");
+  hPending(ctx, "2026-02", "with the validator taking 120 s");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 31, "the promotion waited %v s on the validator, expected at most the 30 s deadline", waited);
   held(ctx, "2026-02", "pending", "after the deadline");
 }
 
 void CheckTimeoutNoPromote(harness::Ctx& ctx) {
-  client(ctx);
-  registerVersion("2026-02", 10);
-  registerVersion("2026-03", 10);
+  hClient(ctx);
+  hRegisterVersion("2026-02", 10);
+  hRegisterVersion("2026-03", 10);
   ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "validator restarting", 1);
-  pending(ctx, "2026-02", "with the validator UNAVAILABLE");
+  hPending(ctx, "2026-02", "with the validator UNAVAILABLE");
   held(ctx, "2026-02", "pending", "with the validator UNAVAILABLE");
   for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}}) {
     ctx.GRPC.Fail("Validate", code, "validator error", 1);
-    pending(ctx, "2026-02", "with the validator failing " + name);
+    hPending(ctx, "2026-02", "with the validator failing " + name);
     held(ctx, "2026-02", "pending", "with the validator failing " + name);
   }
   ctx.GRPC.SetLatency("Validate", 120.0);
-  pending(ctx, "2026-03", "with the validator past its deadline");
+  hPending(ctx, "2026-03", "with the validator past its deadline");
   held(ctx, "2026-03", "pending", "with the validator past its deadline");
   ctx.GRPC.SetLatency("Validate", 0);
-  ctx.Equal(validateAndPromote(kDS, "2026-02", "bob"), "validated", "once the validator answers, the pending version's status");
-  ctx.Equal(pointer::latest(kDS), "2026-02", "the validated 2026-02 must be promoted; the latest");
+  ctx.Equal(validateAndPromote(kHDS, "2026-02", "bob"), "validated", "once the validator answers, the pending version's status");
+  ctx.Equal(pointer::latest(kHDS), "2026-02", "the validated 2026-02 must be promoted; the latest");
 }
 
 void CheckRejectedHeld(harness::Ctx& ctx) {
-  client(ctx);
-  registerVersion("2026-02", 10, 3);
-  ctx.Equal(validateAndPromote(kDS, "2026-02", "bob"), "rejected", "a report with passed false; validateAndPromote returned");
+  hClient(ctx);
+  hRegisterVersion("2026-02", 10, 3);
+  ctx.Equal(validateAndPromote(kHDS, "2026-02", "bob"), "rejected", "a report with passed false; validateAndPromote returned");
   held(ctx, "2026-02", "rejected", "after a failed report");
-  const auto report = store::version(kDS, "2026-02")->report;
+  const auto report = store::version(kHDS, "2026-02")->report;
   ctx.Assert(report && !report->value("passed", true) && !report->value("failures", nlohmann::json::array()).empty(),
              "the rejected version must keep the validator's report, it holds %s", report ? report->dump() : "nothing");
-  const auto validated = store::version(kDS, "2026-01")->report;
+  const auto validated = store::version(kHDS, "2026-01")->report;
   ctx.Assert(validated && validated->value("passed", false) && validated->value("rows_scanned", 0LL) == 10,
              "the validated 2026-01 must keep the validator's report as well, it holds %s", validated ? validated->dump() : "nothing");
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
-  ValidatorPeer& peer = client(ctx);
-  registerVersion("2026-02", 1500, 1200);
-  registerVersion("2026-03", 1500);
+  HValidatorPeer& peer = hClient(ctx);
+  hRegisterVersion("2026-02", 1500, 1200);
+  hRegisterVersion("2026-03", 1500);
   std::string got;
   try {
-    got = validateAndPromote(kDS, "2026-02", "bob");
+    got = validateAndPromote(kHDS, "2026-02", "bob");
   } catch (const ValidationPending&) {
     got = "pending";
   }
@@ -1207,12 +1207,12 @@ void CheckCoverage(harness::Ctx& ctx) {
   ctx.Equal(got, "rejected", "a version with a bad row at 1200: the validator was asked for max_rows %d, so it must read that row (ask for every row, max_rows 0); the status", asked);
   held(ctx, "2026-02", "rejected", "with a bad row at 1200");
   peer.cap = 500;
-  pending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows");
+  hPending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows");
   held(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows");
   peer.short_view = true;
   peer.cap = 1000;
-  registerVersion("2026-04", 1500);
-  pending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)");
+  hRegisterVersion("2026-04", 1500);
+  hPending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)");
   held(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows");
 }
 `,

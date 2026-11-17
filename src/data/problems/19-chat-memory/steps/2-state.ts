@@ -622,9 +622,9 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func turnN(n int, content string) sessions.Turn {
+func hTurnN(n int, content string) sessions.Turn {
 	if content == "" {
 		content = fmt.Sprintf("turn %d", n)
 	}
@@ -635,14 +635,14 @@ func turnN(n int, content string) sessions.Turn {
 	return sessions.Turn{TurnID: fmt.Sprintf("t-%d", n), Role: role, Content: content, Tokens: 2}
 }
 
-func mustAppend(ctx *harness.Ctx, tenant, sessionID string, turn sessions.Turn) int64 {
-	n, err := appendTurn(stateBg, tenant, sessionID, turn)
+func hMustAppend(ctx *harness.Ctx, tenant, sessionID string, turn sessions.Turn) int64 {
+	n, err := appendTurn(hStateBg, tenant, sessionID, turn)
 	ctx.NoError(err, "appendTurn(%s, %s, %s) failed", tenant, sessionID, turn.TurnID)
 	return n
 }
 
-func recentIDs(ctx *harness.Ctx, tenant, sessionID string, limit int) []string {
-	turns, err := recentTurns(stateBg, tenant, sessionID, limit)
+func hRecentIDs(ctx *harness.Ctx, tenant, sessionID string, limit int) []string {
+	turns, err := recentTurns(hStateBg, tenant, sessionID, limit)
 	ctx.NoError(err, "recentTurns(%s, %s) failed", tenant, sessionID)
 	out := []string{}
 	for _, t := range turns {
@@ -651,8 +651,8 @@ func recentIDs(ctx *harness.Ctx, tenant, sessionID string, limit int) []string {
 	return out
 }
 
-func recentContents(ctx *harness.Ctx, tenant, sessionID string) []string {
-	turns, err := recentTurns(stateBg, tenant, sessionID, maxTurns)
+func hRecentContents(ctx *harness.Ctx, tenant, sessionID string) []string {
+	turns, err := recentTurns(hStateBg, tenant, sessionID, maxTurns)
 	ctx.NoError(err, "recentTurns(%s, %s) failed", tenant, sessionID)
 	out := []string{}
 	for _, t := range turns {
@@ -661,28 +661,28 @@ func recentContents(ctx *harness.Ctx, tenant, sessionID string) []string {
 	return out
 }
 
-func onlyKey(ctx *harness.Ctx) string {
+func hOnlyKey(ctx *harness.Ctx) string {
 	keys := ctx.Redis.Keys("turns:*")
 	ctx.Assert(len(keys) == 1, "one session's appends must write one list, Redis holds %q", keys)
 	return keys[0]
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	mustAppend(ctx, "t1", "s-1", turnN(1, "t1: ship on the 14th"))
-	mustAppend(ctx, "t2", "s-1", turnN(1, "t2: cancel the order"))
-	seen := recentContents(ctx, "t1", "s-1")
+	hMustAppend(ctx, "t1", "s-1", hTurnN(1, "t1: ship on the 14th"))
+	hMustAppend(ctx, "t2", "s-1", hTurnN(1, "t2: cancel the order"))
+	seen := hRecentContents(ctx, "t1", "s-1")
 	ctx.Equal(seen, []string{"t1: ship on the 14th"}, "tenant t1 reads from its session s-1 (two tenants that pick the same session id must not share one buffer)")
-	ctx.Equal(recentContents(ctx, "t2", "s-1"), []string{"t2: cancel the order"}, "tenant t2 reads from its session s-1")
+	ctx.Equal(hRecentContents(ctx, "t2", "s-1"), []string{"t2: cancel the order"}, "tenant t2 reads from its session s-1")
 	ctx.Equal(ctx.Redis.Keys("turns:*"), []string{"turns:t1:s-1", "turns:t2:s-1"}, "the buffers must be turns:t1:s-1 and turns:t2:s-1 (bufferKey); Redis holds")
 }
 
 func CheckKeepsNewest(ctx *harness.Ctx) {
 	var length int64
 	for n := 1; n <= 60; n++ {
-		length = mustAppend(ctx, "t1", "s-1", turnN(n, ""))
+		length = hMustAppend(ctx, "t1", "s-1", hTurnN(n, ""))
 	}
 	ctx.Equal(length, int64(50), "after 60 appends appendTurn must report the cap of 50 turns")
-	held := recentIDs(ctx, "t1", "s-1", maxTurns)
+	held := hRecentIDs(ctx, "t1", "s-1", maxTurns)
 	last := ""
 	if len(held) > 0 {
 		last = held[len(held)-1]
@@ -693,37 +693,37 @@ func CheckKeepsNewest(ctx *harness.Ctx) {
 		want = append(want, fmt.Sprintf("t-%d", n))
 	}
 	ctx.Equal(held, want, "the buffer must hold t-11..t-60 oldest first")
-	ctx.Equal(recentIDs(ctx, "t1", "s-1", 5), []string{"t-56", "t-57", "t-58", "t-59", "t-60"}, "recentTurns with limit 5")
+	ctx.Equal(hRecentIDs(ctx, "t1", "s-1", 5), []string{"t-56", "t-57", "t-58", "t-59", "t-60"}, "recentTurns with limit 5")
 }
 
 func CheckIdleExpiry(ctx *harness.Ctx) {
-	mustAppend(ctx, "t1", "s-1", turnN(1, ""))
-	key := onlyKey(ctx)
+	hMustAppend(ctx, "t1", "s-1", hTurnN(1, ""))
+	key := hOnlyKey(ctx)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(86000 < ttl && ttl <= 86400, "the buffer %s has TTL %d after an append: an idle session's list must expire 24 hours after its last append", key, ttl)
 	ctx.Clock.Advance(80000)
-	mustAppend(ctx, "t1", "s-1", turnN(2, ""))
+	hMustAppend(ctx, "t1", "s-1", hTurnN(2, ""))
 	ctx.Assert(ctx.Redis.TTL(key) > 86000, "an append 80000 s later left TTL %d: every append pushes the expiry out to a day after it", ctx.Redis.TTL(key))
 	ctx.Clock.Advance(80000)
-	ctx.Equal(recentIDs(ctx, "t1", "s-1", maxTurns), []string{"t-1", "t-2"}, "a session appended to 80000 s ago must keep its turns")
+	ctx.Equal(hRecentIDs(ctx, "t1", "s-1", maxTurns), []string{"t-1", "t-2"}, "a session appended to 80000 s ago must keep its turns")
 	ctx.Clock.Advance(6500)
-	left := recentIDs(ctx, "t1", "s-1", maxTurns)
+	left := hRecentIDs(ctx, "t1", "s-1", maxTurns)
 	ctx.Assert(len(left) == 0, "a day after the last append the buffer still holds %q", left)
 }
 
 func CheckAtomicAppend(ctx *harness.Ctx) {
 	for n := 1; n <= 50; n++ {
-		mustAppend(ctx, "t1", "s-1", turnN(n, ""))
+		hMustAppend(ctx, "t1", "s-1", hTurnN(n, ""))
 	}
-	key := onlyKey(ctx)
+	key := hOnlyKey(ctx)
 	full := ctx.Redis.After(key, func() any { return ctx.Redis.LLen(key) })
-	mustAppend(ctx, "t1", "s-1", turnN(51, ""))
+	hMustAppend(ctx, "t1", "s-1", hTurnN(51, ""))
 	ctx.Assert(full.Fired, "appendTurn never touched %s", key)
 	held, _ := full.Result.(int64)
 	ctx.Assert(held <= 50, "right after appendTurn's first command %s held %d turns: a reader between the push and the trim sees more than the cap. Push, trim and expire in one script", key, held)
 	freshKey := strings.Replace(key, "s-1", "s-2", 1)
 	fresh := ctx.Redis.After(freshKey, func() any { return ctx.Redis.TTL(freshKey) })
-	mustAppend(ctx, "t1", "s-2", turnN(1, ""))
+	hMustAppend(ctx, "t1", "s-2", hTurnN(1, ""))
 	ctx.Assert(fresh.Fired, "appendTurn for session s-2 never touched %s", freshKey)
 	if ctx.Redis.TTL(freshKey) > 0 {
 		ttl, _ := fresh.Result.(int64)
@@ -740,30 +740,30 @@ func CheckAtomicAppend(ctx *harness.Ctx) {
 
 namespace {
 
-sessions::Turn turnN(int n, const std::string& content = "") {
+sessions::Turn hTurnN(int n, const std::string& content = "") {
   return sessions::Turn{"t-" + std::to_string(n), n % 2 ? "user" : "assistant", content.empty() ? "turn " + std::to_string(n) : content, 2};
 }
 
-std::vector<std::string> recentIds(const std::string& tenant, const std::string& session_id, long limit = kMaxTurns) {
+std::vector<std::string> hRecentIds(const std::string& tenant, const std::string& session_id, long limit = kMaxTurns) {
   std::vector<std::string> out;
   for (const auto& t : recentTurns(tenant, session_id, limit)) out.push_back(t.turn_id);
   return out;
 }
 
-std::vector<std::string> recentContents(const std::string& tenant, const std::string& session_id) {
+std::vector<std::string> hRecentContents(const std::string& tenant, const std::string& session_id) {
   std::vector<std::string> out;
   for (const auto& t : recentTurns(tenant, session_id)) out.push_back(t.content);
   return out;
 }
 
-std::string onlyKey(harness::Ctx& ctx) {
+std::string hOnlyKey(harness::Ctx& ctx) {
   const auto keys = ctx.Redis.Keys("turns:*");
   ctx.Assert(keys.size() == 1, "one session's appends must write one list, Redis holds %q", keys);
   return keys[0];
 }
 
 // What a probe saw: whether it fired and the number it read.
-struct Seen {
+struct HSeen {
   bool fired = false;
   long long value = 0;
 };
@@ -771,60 +771,60 @@ struct Seen {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  appendTurn("t1", "s-1", turnN(1, "t1: ship on the 14th"));
-  appendTurn("t2", "s-1", turnN(1, "t2: cancel the order"));
-  ctx.Equal(recentContents("t1", "s-1"), {"t1: ship on the 14th"}, "tenant t1 reads from its session s-1 (two tenants that pick the same session id must not share one buffer)");
-  ctx.Equal(recentContents("t2", "s-1"), {"t2: cancel the order"}, "tenant t2 reads from its session s-1");
+  appendTurn("t1", "s-1", hTurnN(1, "t1: ship on the 14th"));
+  appendTurn("t2", "s-1", hTurnN(1, "t2: cancel the order"));
+  ctx.Equal(hRecentContents("t1", "s-1"), {"t1: ship on the 14th"}, "tenant t1 reads from its session s-1 (two tenants that pick the same session id must not share one buffer)");
+  ctx.Equal(hRecentContents("t2", "s-1"), {"t2: cancel the order"}, "tenant t2 reads from its session s-1");
   ctx.Equal(ctx.Redis.Keys("turns:*"), {"turns:t1:s-1", "turns:t2:s-1"}, "the buffers must be turns:t1:s-1 and turns:t2:s-1 (bufferKey); Redis holds");
 }
 
 void CheckKeepsNewest(harness::Ctx& ctx) {
   long long length = 0;
-  for (int n = 1; n <= 60; n++) length = appendTurn("t1", "s-1", turnN(n));
+  for (int n = 1; n <= 60; n++) length = appendTurn("t1", "s-1", hTurnN(n));
   ctx.Equal(length, 50LL, "after 60 appends appendTurn must report the cap of 50 turns");
-  const auto held = recentIds("t1", "s-1");
+  const auto held = hRecentIds("t1", "s-1");
   const std::string last = held.empty() ? "" : held.back();
   ctx.Assert(last == "t-60", "the newest turn t-60 is gone: the buffer ends at %q. The list grows at the tail; trim the old end", last);
   std::vector<std::string> want;
   for (int n = 11; n <= 60; n++) want.push_back("t-" + std::to_string(n));
   ctx.Equal(held, want, "the buffer must hold t-11..t-60 oldest first");
-  ctx.Equal(recentIds("t1", "s-1", 5), {"t-56", "t-57", "t-58", "t-59", "t-60"}, "recentTurns with limit 5");
+  ctx.Equal(hRecentIds("t1", "s-1", 5), {"t-56", "t-57", "t-58", "t-59", "t-60"}, "recentTurns with limit 5");
 }
 
 void CheckIdleExpiry(harness::Ctx& ctx) {
-  appendTurn("t1", "s-1", turnN(1));
-  const std::string key = onlyKey(ctx);
+  appendTurn("t1", "s-1", hTurnN(1));
+  const std::string key = hOnlyKey(ctx);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(86000 < ttl && ttl <= 86400, "the buffer %s has TTL %d after an append: an idle session's list must expire 24 hours after its last append", key, ttl);
   ctx.Clock.Advance(80000);
-  appendTurn("t1", "s-1", turnN(2));
+  appendTurn("t1", "s-1", hTurnN(2));
   ctx.Assert(ctx.Redis.TTL(key) > 86000, "an append 80000 s later left TTL %d: every append pushes the expiry out to a day after it", ctx.Redis.TTL(key));
   ctx.Clock.Advance(80000);
-  ctx.Equal(recentIds("t1", "s-1"), {"t-1", "t-2"}, "a session appended to 80000 s ago must keep its turns");
+  ctx.Equal(hRecentIds("t1", "s-1"), {"t-1", "t-2"}, "a session appended to 80000 s ago must keep its turns");
   ctx.Clock.Advance(6500);
-  const auto left = recentIds("t1", "s-1");
+  const auto left = hRecentIds("t1", "s-1");
   ctx.Assert(left.empty(), "a day after the last append the buffer still holds %q", left);
 }
 
 void CheckAtomicAppend(harness::Ctx& ctx) {
-  for (int n = 1; n <= 50; n++) appendTurn("t1", "s-1", turnN(n));
-  const std::string key = onlyKey(ctx);
-  auto full = std::make_shared<Seen>();
+  for (int n = 1; n <= 50; n++) appendTurn("t1", "s-1", hTurnN(n));
+  const std::string key = hOnlyKey(ctx);
+  auto full = std::make_shared<HSeen>();
   ctx.Redis.After(key, [&ctx, full, key] {
     full->fired = true;
     full->value = ctx.Redis.LLen(key);
   });
-  appendTurn("t1", "s-1", turnN(51));
+  appendTurn("t1", "s-1", hTurnN(51));
   ctx.Assert(full->fired, "appendTurn never touched %s", key);
   ctx.Assert(full->value <= 50, "right after appendTurn's first command %s held %d turns: a reader between the push and the trim sees more than the cap. Push, trim and expire in one script", key, full->value);
   std::string fresh_key = key;
   fresh_key.replace(fresh_key.find("s-1"), 3, "s-2");
-  auto fresh = std::make_shared<Seen>();
+  auto fresh = std::make_shared<HSeen>();
   ctx.Redis.After(fresh_key, [&ctx, fresh, fresh_key] {
     fresh->fired = true;
     fresh->value = ctx.Redis.TTL(fresh_key);
   });
-  appendTurn("t1", "s-2", turnN(1));
+  appendTurn("t1", "s-2", hTurnN(1));
   ctx.Assert(fresh->fired, "appendTurn for session s-2 never touched %s", fresh_key);
   if (ctx.Redis.TTL(fresh_key) > 0) {
     ctx.Assert(fresh->value > 0, "right after appendTurn's first command %s had no TTL: a crash before the EXPIRE leaves the list for good. Push, trim and expire in one script", fresh_key);

@@ -1004,66 +1004,66 @@ import (
 	"leetbuild/harness"
 )
 
-var allocBg = context.Background()
+var hAllocBg = context.Background()
 
 // allocatorPeer is a healthy fleet: every match gets gs-{match id}.
-type allocatorPeer struct {
+type HAllocatorPeer struct {
 	pb.UnimplementedAllocatorServer
 }
 
-func (allocatorPeer) Allocate(_ context.Context, req *pb.AllocateRequest) (*pb.Allocation, error) {
+func (HAllocatorPeer) Allocate(_ context.Context, req *pb.AllocateRequest) (*pb.Allocation, error) {
 	return &pb.Allocation{ServerId: "gs-" + req.GetMatchId(), Address: "10.0.0.7:7777"}, nil
 }
 
-func allocServe(ctx *harness.Ctx) {
-	pb.RegisterAllocatorServer(ctx.GRPC.Server(""), allocatorPeer{})
+func hAllocServe(ctx *harness.Ctx) {
+	pb.RegisterAllocatorServer(ctx.GRPC.Server(""), HAllocatorPeer{})
 }
 
 // allocClaimed queues the tickets in pool:15 (t1 is a party of p1 and p2), claims them for matchID and records the match.
-func allocClaimed(ctx *harness.Ctx, matchID string, tickets ...string) {
+func hAllocClaimed(ctx *harness.Ctx, matchID string, tickets ...string) {
 	for _, ticketID := range tickets {
 		n, _ := strconv.Atoi(ticketID[1:])
 		participants := []string{fmt.Sprintf("p%d", n+1)}
 		if n == 1 {
 			participants = []string{"p1", "p2"}
 		}
-		store.Enqueue(allocBg, ticketID, participants[0], 1500+n, participants)
+		store.Enqueue(hAllocBg, ticketID, participants[0], 1500+n, participants)
 	}
-	ok, err := claims.ClaimTickets(allocBg, matchID, 15, tickets)
+	ok, err := claims.ClaimTickets(hAllocBg, matchID, 15, tickets)
 	ctx.Assert(ok && err == nil, "setup: claiming %v for %s failed (%v)", tickets, matchID, err)
-	store.CreateMatch(allocBg, matchID, 15, tickets)
+	store.CreateMatch(hAllocBg, matchID, 15, tickets)
 }
 
-func allocDepth(ctx *harness.Ctx) int {
+func hAllocDepth(ctx *harness.Ctx) int {
 	v, _ := ctx.Redis.HGet("pool:depth", "15")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
-func allocate(ctx *harness.Ctx, matchID string) string {
-	serverID, err := allocateMatch(allocBg, matchID)
+func hAllocate(ctx *harness.Ctx, matchID string) string {
+	serverID, err := allocateMatch(hAllocBg, matchID)
 	ctx.NoError(err, "allocateMatch(%s)", matchID)
 	return serverID
 }
 
-func release(ctx *harness.Ctx, matchID string) bool {
-	ok, err := releaseRoster(allocBg, matchID)
+func hRelease(ctx *harness.Ctx, matchID string) bool {
+	ok, err := releaseRoster(hAllocBg, matchID)
 	ctx.NoError(err, "releaseRoster(%s)", matchID)
 	return ok
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	allocServe(ctx)
-	allocClaimed(ctx, "m-1", "t1", "t2")
-	ctx.Equal(allocate(ctx, "m-1"), "gs-m-1", "with a healthy fleet the match must be placed on gs-m-1; the server")
+	hAllocServe(ctx)
+	hAllocClaimed(ctx, "m-1", "t1", "t2")
+	ctx.Equal(hAllocate(ctx, "m-1"), "gs-m-1", "with a healthy fleet the match must be placed on gs-m-1; the server")
 	for _, call := range ctx.GRPC.CallsTo("Allocate", "") {
 		ctx.Assert(call.HasDeadline(), "an Allocate call carries no deadline: a stalled allocator holds the matchmaker as long as it stalls")
 		ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "an Allocate call carries a %v deadline, expected allocatorDeadline = 3 s", call.Timeout)
 	}
-	allocClaimed(ctx, "m-2", "t3")
+	hAllocClaimed(ctx, "m-2", "t3")
 	ctx.GRPC.SetLatency("Allocate", 30.0, "")
 	before := ctx.Clock.Now()
-	allocate(ctx, "m-2")
+	hAllocate(ctx, "m-2")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 12, "allocateMatch waited %.0f s on an allocator that answers after 30 s: three 3-second attempts and their backoff end well before that", waited)
 	stalled := ctx.GRPC.CallsTo("Allocate", "")[1:]
@@ -1074,84 +1074,84 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	allocServe(ctx)
-	allocClaimed(ctx, "m-1", "t1", "t2")
+	hAllocServe(ctx)
+	hAllocClaimed(ctx, "m-1", "t1", "t2")
 	ctx.GRPC.Fail("Allocate", codes.Unavailable, "fleet busy", 2, "")
 	before := ctx.Clock.Now()
-	ctx.Equal(allocate(ctx, "m-1"), "gs-m-1", "two UNAVAILABLE answers, then a server: the third attempt must place the match; the server")
+	ctx.Equal(hAllocate(ctx, "m-1"), "gs-m-1", "two UNAVAILABLE answers, then a server: the third attempt must place the match; the server")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), 3, "Allocate calls for two failures and a success")
 	ctx.Assert(ctx.Clock.Sleeps() == 2 && waited >= 0.7, "the retries went out after %.2f s with %d sleeps: back off backoffBase << attempt (250 ms, then 500 ms) before asking a busy fleet again", waited, ctx.Clock.Sleeps())
-	allocClaimed(ctx, "m-2", "t3")
+	hAllocClaimed(ctx, "m-2", "t3")
 	ctx.GRPC.Fail("Allocate", codes.ResourceExhausted, "no free server", 3, "")
-	ctx.Equal(allocate(ctx, "m-2"), "", "a fleet with no free server cannot place the match; the server")
+	ctx.Equal(hAllocate(ctx, "m-2"), "", "a fleet with no free server cannot place the match; the server")
 	asked := len(ctx.GRPC.CallsTo("Allocate", "")) - 3
 	ctx.Equal(asked, 1, "RESOURCE_EXHAUSTED must not be retried (a full fleet stays full for the next millisecond, retrying only adds load); the calls")
 }
 
 func CheckReleaseOnFailure(ctx *harness.Ctx) {
-	allocServe(ctx)
-	store.Enqueue(allocBg, "t9", "p9", 1590, []string{"p9"})
-	allocClaimed(ctx, "m-1", "t1", "t2")
+	hAllocServe(ctx)
+	store.Enqueue(hAllocBg, "t9", "p9", 1590, []string{"p9"})
+	hAllocClaimed(ctx, "m-1", "t1", "t2")
 	ctx.GRPC.Fail("Allocate", codes.Unavailable, "fleet busy", 3, "")
-	ctx.Equal(allocate(ctx, "m-1"), "", "every attempt failed: allocateMatch must answer no server")
+	ctx.Equal(hAllocate(ctx, "m-1"), "", "every attempt failed: allocateMatch must answer no server")
 	for ticketID, skill := range map[string]float64{"t1": 1501, "t2": 1502} {
-		t := store.GetTicket(allocBg, ticketID)
+		t := store.GetTicket(hAllocBg, ticketID)
 		ctx.Assert(t.State == "waiting" && t.MatchID == "", "after the allocation failed %s is %+v: its players wait in neither the pool nor a game", ticketID, t)
 		got, ok := ctx.Redis.ZScore("pool:15", ticketID)
 		ctx.Assert(ok && got == skill, "%s is not back in pool:15 at its skill %v", ticketID, skill)
 	}
-	ctx.Equal(allocDepth(ctx), 3, "pool:depth with three tickets waiting")
-	m := store.GetMatch(allocBg, "m-1")
+	ctx.Equal(hAllocDepth(ctx), 3, "pool:depth with three tickets waiting")
+	m := store.GetMatch(hAllocBg, "m-1")
 	ctx.Assert(m.State == "abandoned" && m.Reason == "allocation_failed", "the match must be abandoned with reason allocation_failed, it is %+v", m)
-	ok, _ := claims.ClaimTickets(allocBg, "m-2", 15, []string{"t1", "t2"})
+	ok, _ := claims.ClaimTickets(hAllocBg, "m-2", 15, []string{"t1", "t2"})
 	ctx.Assert(ok, "the released tickets must be claimable by the next match")
 	// A full fleet ends the attempts at once: the roster goes back all the same.
-	allocClaimed(ctx, "m-3", "t3")
+	hAllocClaimed(ctx, "m-3", "t3")
 	ctx.GRPC.Fail("Allocate", codes.ResourceExhausted, "no free server", 3, "")
-	ctx.Equal(allocate(ctx, "m-3"), "", "a fleet with no free server cannot place m-3; the server")
-	t3 := store.GetTicket(allocBg, "t3")
+	ctx.Equal(hAllocate(ctx, "m-3"), "", "a fleet with no free server cannot place m-3; the server")
+	t3 := store.GetTicket(hAllocBg, "t3")
 	ctx.Assert(t3.State == "waiting" && t3.MatchID == "", "RESOURCE_EXHAUSTED ended the attempts and t3 is %+v: a full fleet leaves the roster claimed by a match that never starts. Release it whatever code ended the attempts", t3)
 	got, inPool := ctx.Redis.ZScore("pool:15", "t3")
 	ctx.Assert(inPool && got == 1503, "t3 is not back in pool:15 at its skill 1503")
-	ctx.Equal(allocDepth(ctx), 2, "pool:depth with t9 and t3 waiting")
-	m3 := store.GetMatch(allocBg, "m-3")
+	ctx.Equal(hAllocDepth(ctx), 2, "pool:depth with t9 and t3 waiting")
+	m3 := store.GetMatch(hAllocBg, "m-3")
 	ctx.Assert(m3.State == "abandoned" && m3.Reason == "allocation_failed", "m-3 could not be placed and must be abandoned with reason allocation_failed, it is %+v", m3)
 }
 
 func CheckIdempotentRelease(ctx *harness.Ctx) {
-	allocServe(ctx)
-	store.Enqueue(allocBg, "t9", "p9", 1590, []string{"p9"})
-	allocClaimed(ctx, "m-1", "t1", "t2")
+	hAllocServe(ctx)
+	store.Enqueue(hAllocBg, "t9", "p9", 1590, []string{"p9"})
+	hAllocClaimed(ctx, "m-1", "t1", "t2")
 	// Whether the guard is already set while the roster is still claimed, the moment released:m-1 is first touched.
 	atGuard := ctx.Redis.After("released:m-1", func() any {
 		_, t1Back := ctx.Redis.ZScore("pool:15", "t1")
 		_, t2Back := ctx.Redis.ZScore("pool:15", "t2")
 		return ctx.Redis.Exists("released:m-1") == 1 && !(t1Back && t2Back)
 	})
-	ctx.Equal(release(ctx, "m-1"), true, "the first release of m-1 must release it")
+	ctx.Equal(hRelease(ctx, "m-1"), true, "the first release of m-1 must release it")
 	ctx.Assert(atGuard.Fired, "releaseRoster never touched released:m-1")
 	ctx.Assert(atGuard.Err == nil, "the snapshot at released:m-1 failed: %v", atGuard.Err)
 	early, _ := atGuard.Result.(bool)
 	ctx.Assert(!early, "released:m-1 was set while t1 and t2 were still claimed: the guard and the tickets moved in separate steps, so a crash between them leaves the roster claimed and every later release refused. Set the guard in the script that returns the tickets")
 	ttl := ctx.Redis.TTL("released:m-1")
 	ctx.Assert(ttl > 0 && ttl <= 3600, "released:m-1 has TTL %d, expected at most 3600 s: a guard without an expiry stays in Redis for every match ever released", ttl)
-	ctx.Equal(release(ctx, "m-1"), false, "the second release of m-1 must answer false: the roster was already returned")
-	ctx.Assert(allocDepth(ctx) == 3 && ctx.Redis.ZCard("pool:15") == 3, "after a release that ran twice pool:depth is %d for %d waiting tickets: the tickets were counted back twice", allocDepth(ctx), ctx.Redis.ZCard("pool:15"))
-	ok, _ := claims.ClaimTickets(allocBg, "m-2", 15, []string{"t1", "t2"})
+	ctx.Equal(hRelease(ctx, "m-1"), false, "the second release of m-1 must answer false: the roster was already returned")
+	ctx.Assert(hAllocDepth(ctx) == 3 && ctx.Redis.ZCard("pool:15") == 3, "after a release that ran twice pool:depth is %d for %d waiting tickets: the tickets were counted back twice", hAllocDepth(ctx), ctx.Redis.ZCard("pool:15"))
+	ok, _ := claims.ClaimTickets(hAllocBg, "m-2", 15, []string{"t1", "t2"})
 	ctx.Assert(ok, "the released tickets must be claimable by m-2")
-	store.CreateMatch(allocBg, "m-2", 15, []string{"t1", "t2"})
-	release(ctx, "m-1") // a late cleanup of the dead match
+	store.CreateMatch(hAllocBg, "m-2", 15, []string{"t1", "t2"})
+	hRelease(ctx, "m-1") // a late cleanup of the dead match
 	for _, ticketID := range []string{"t1", "t2"} {
-		ctx.Equal(store.GetTicket(allocBg, ticketID).MatchID, "m-2", "a late release of m-1 must not take %s out of m-2; its match", ticketID)
+		ctx.Equal(store.GetTicket(hAllocBg, ticketID).MatchID, "m-2", "a late release of m-1 must not take %s out of m-2; its match", ticketID)
 	}
-	ctx.Equal(allocDepth(ctx), 1, "a late release of m-1 must not move pool:depth")
+	ctx.Equal(hAllocDepth(ctx), 1, "a late release of m-1 must not move pool:depth")
 	ctx.Clock.Advance(3601) // the guard has expired when a sweeper releases m-1 again
-	release(ctx, "m-1")
+	hRelease(ctx, "m-1")
 	for _, ticketID := range []string{"t1", "t2"} {
-		ctx.Equal(store.GetTicket(allocBg, ticketID).MatchID, "m-2", "a release of m-1 after its guard expired must not take %s out of m-2 (return only the tickets whose match_id is still this match); its match", ticketID)
+		ctx.Equal(store.GetTicket(hAllocBg, ticketID).MatchID, "m-2", "a release of m-1 after its guard expired must not take %s out of m-2 (return only the tickets whose match_id is still this match); its match", ticketID)
 	}
-	ctx.Assert(allocDepth(ctx) == 1 && ctx.Redis.ZCard("pool:15") == 1, "a release of m-1 after its guard expired moved pool:depth to %d with %d tickets in pool:15", allocDepth(ctx), ctx.Redis.ZCard("pool:15"))
+	ctx.Assert(hAllocDepth(ctx) == 1 && ctx.Redis.ZCard("pool:15") == 1, "a release of m-1 after its guard expired moved pool:depth to %d with %d tickets in pool:15", hAllocDepth(ctx), ctx.Redis.ZCard("pool:15"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1167,7 +1167,7 @@ func CheckIdempotentRelease(ctx *harness.Ctx) {
 namespace {
 
 // A healthy fleet: every match gets gs-{match id}.
-class AllocatorPeer final : public matchmakerd::Allocator::Service {
+class HAllocatorPeer final : public matchmakerd::Allocator::Service {
  public:
   grpc::Status Allocate(grpc::ServerContext*, const matchmakerd::AllocateRequest* req, matchmakerd::Allocation* out) override {
     out->set_server_id("gs-" + req->match_id());
@@ -1176,15 +1176,15 @@ class AllocatorPeer final : public matchmakerd::Allocator::Service {
   }
 };
 
-void allocServe(harness::Ctx& ctx) {
-  static AllocatorPeer* peer = nullptr;
+void hAllocServe(harness::Ctx& ctx) {
+  static HAllocatorPeer* peer = nullptr;
   delete peer;
-  peer = new AllocatorPeer;
+  peer = new HAllocatorPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
 // Queue the tickets in pool:15 (t1 is a party of p1 and p2), claim them for match_id, record the match.
-void allocClaimed(harness::Ctx& ctx, const std::string& match_id, const std::vector<std::string>& tickets) {
+void hAllocClaimed(harness::Ctx& ctx, const std::string& match_id, const std::vector<std::string>& tickets) {
   for (const std::string& ticket_id : tickets) {
     const int n = std::stoi(ticket_id.substr(1));
     const std::vector<std::string> participants = n == 1 ? std::vector<std::string>{"p1", "p2"} : std::vector<std::string>{"p" + std::to_string(n + 1)};
@@ -1194,24 +1194,24 @@ void allocClaimed(harness::Ctx& ctx, const std::string& match_id, const std::vec
   store::createMatch(match_id, 15, tickets);
 }
 
-long allocDepth(harness::Ctx& ctx) {
+long hAllocDepth(harness::Ctx& ctx) {
   const auto v = ctx.Redis.HGet("pool:depth", "15");
   return v && !v->empty() ? std::stol(*v) : 0;
 }
 
-std::string serverOf(const std::optional<std::string>& server) { return server.value_or("(none)"); }
+std::string hServerOf(const std::optional<std::string>& server) { return server.value_or("(none)"); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  allocServe(ctx);
-  allocClaimed(ctx, "m-1", {"t1", "t2"});
-  ctx.Equal(serverOf(allocateMatch("m-1")), "gs-m-1", "with a healthy fleet the match must be placed on gs-m-1; the server");
+  hAllocServe(ctx);
+  hAllocClaimed(ctx, "m-1", {"t1", "t2"});
+  ctx.Equal(hServerOf(allocateMatch("m-1")), "gs-m-1", "with a healthy fleet the match must be placed on gs-m-1; the server");
   for (const auto& call : ctx.GRPC.CallsTo("Allocate")) {
     ctx.Assert(call.HasDeadline(), "an Allocate call carries no deadline: a stalled allocator holds the matchmaker as long as it stalls");
     ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "an Allocate call carries a %v s deadline, expected kAllocatorDeadline = 3 s", call.TimeoutSeconds());
   }
-  allocClaimed(ctx, "m-2", {"t3"});
+  hAllocClaimed(ctx, "m-2", {"t3"});
   ctx.GRPC.SetLatency("Allocate", 30.0);
   const int64_t before = ctx.Clock.Now();
   allocateMatch("m-2");
@@ -1225,52 +1225,52 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  allocServe(ctx);
-  allocClaimed(ctx, "m-1", {"t1", "t2"});
+  hAllocServe(ctx);
+  hAllocClaimed(ctx, "m-1", {"t1", "t2"});
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::UNAVAILABLE, "fleet busy", 2);
   const int64_t before = ctx.Clock.Now();
-  ctx.Equal(serverOf(allocateMatch("m-1")), "gs-m-1", "two UNAVAILABLE answers, then a server: the third attempt must place the match; the server");
+  ctx.Equal(hServerOf(allocateMatch("m-1")), "gs-m-1", "two UNAVAILABLE answers, then a server: the third attempt must place the match; the server");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Equal(ctx.GRPC.CallsTo("Allocate").size(), 3, "Allocate calls for two failures and a success");
   ctx.Assert(ctx.Clock.Sleeps() == 2 && waited >= 0.7, "the retries went out after %.2f s with %d sleeps: back off kBackoffBase * 2^attempt (250 ms, then 500 ms) before asking a busy fleet again", waited, ctx.Clock.Sleeps());
-  allocClaimed(ctx, "m-2", {"t3"});
+  hAllocClaimed(ctx, "m-2", {"t3"});
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::RESOURCE_EXHAUSTED, "no free server", 3);
-  ctx.Equal(serverOf(allocateMatch("m-2")), "(none)", "a fleet with no free server cannot place the match; the server");
+  ctx.Equal(hServerOf(allocateMatch("m-2")), "(none)", "a fleet with no free server cannot place the match; the server");
   const size_t asked = ctx.GRPC.CallsTo("Allocate").size() - 3;
   ctx.Equal(asked, 1, "RESOURCE_EXHAUSTED must not be retried (a full fleet stays full for the next millisecond, retrying only adds load); the calls");
 }
 
 void CheckReleaseOnFailure(harness::Ctx& ctx) {
-  allocServe(ctx);
+  hAllocServe(ctx);
   store::enqueue("t9", "p9", 1590, {"p9"});
-  allocClaimed(ctx, "m-1", {"t1", "t2"});
+  hAllocClaimed(ctx, "m-1", {"t1", "t2"});
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::UNAVAILABLE, "fleet busy", 3);
-  ctx.Equal(serverOf(allocateMatch("m-1")), "(none)", "every attempt failed: allocateMatch must answer no server");
+  ctx.Equal(hServerOf(allocateMatch("m-1")), "(none)", "every attempt failed: allocateMatch must answer no server");
   for (const auto& [ticket_id, skill] : std::vector<std::pair<std::string, double>>{{"t1", 1501}, {"t2", 1502}}) {
     const auto t = store::getTicket(ticket_id);
     ctx.Assert(t && t->state == "waiting" && t->match_id.empty(), "after the allocation failed %s is %s (match %s): its players wait in neither the pool nor a game", ticket_id, t ? t->state : "gone", t ? t->match_id : "");
     ctx.Equal(ctx.Redis.ZScore("pool:15", ticket_id), std::optional<double>(skill), "%s back in pool:15 at its skill", ticket_id);
   }
-  ctx.Equal(allocDepth(ctx), 3, "pool:depth with three tickets waiting");
+  ctx.Equal(hAllocDepth(ctx), 3, "pool:depth with three tickets waiting");
   const auto m = store::getMatch("m-1");
   ctx.Assert(m && m->state == "abandoned" && m->reason == "allocation_failed", "the match must be abandoned with reason allocation_failed, it is %s (%s)", m ? m->state : "gone", m ? m->reason : "");
   ctx.Assert(claims::claimTickets("m-2", 15, {"t1", "t2"}), "the released tickets must be claimable by the next match");
   // A full fleet ends the attempts at once: the roster goes back all the same.
-  allocClaimed(ctx, "m-3", {"t3"});
+  hAllocClaimed(ctx, "m-3", {"t3"});
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::RESOURCE_EXHAUSTED, "no free server", 3);
-  ctx.Equal(serverOf(allocateMatch("m-3")), "(none)", "a fleet with no free server cannot place m-3; the server");
+  ctx.Equal(hServerOf(allocateMatch("m-3")), "(none)", "a fleet with no free server cannot place m-3; the server");
   const auto t3 = store::getTicket("t3");
   ctx.Assert(t3 && t3->state == "waiting" && t3->match_id.empty(), "RESOURCE_EXHAUSTED ended the attempts and t3 is %s (match %s): a full fleet leaves the roster claimed by a match that never starts. Release it whatever code ended the attempts", t3 ? t3->state : "gone", t3 ? t3->match_id : "");
   ctx.Equal(ctx.Redis.ZScore("pool:15", "t3"), std::optional<double>(1503), "t3 back in pool:15 at its skill");
-  ctx.Equal(allocDepth(ctx), 2, "pool:depth with t9 and t3 waiting");
+  ctx.Equal(hAllocDepth(ctx), 2, "pool:depth with t9 and t3 waiting");
   const auto m3 = store::getMatch("m-3");
   ctx.Assert(m3 && m3->state == "abandoned" && m3->reason == "allocation_failed", "m-3 could not be placed and must be abandoned with reason allocation_failed, it is %s (%s)", m3 ? m3->state : "gone", m3 ? m3->reason : "");
 }
 
 void CheckIdempotentRelease(harness::Ctx& ctx) {
-  allocServe(ctx);
+  hAllocServe(ctx);
   store::enqueue("t9", "p9", 1590, {"p9"});
-  allocClaimed(ctx, "m-1", {"t1", "t2"});
+  hAllocClaimed(ctx, "m-1", {"t1", "t2"});
   // Whether the guard is already set while the roster is still claimed, the moment released:m-1 is first touched.
   auto fired = std::make_shared<bool>(false);
   auto early = std::make_shared<bool>(false);
@@ -1285,7 +1285,7 @@ void CheckIdempotentRelease(harness::Ctx& ctx) {
   const long long ttl = ctx.Redis.TTL("released:m-1");
   ctx.Assert(ttl > 0 && ttl <= 3600, "released:m-1 has TTL %d, expected at most 3600 s: a guard without an expiry stays in Redis for every match ever released", ttl);
   ctx.Equal(releaseRoster("m-1"), false, "the second release of m-1 must answer false: the roster was already returned");
-  ctx.Assert(allocDepth(ctx) == 3 && ctx.Redis.ZCard("pool:15") == 3, "after a release that ran twice pool:depth is %d for %d waiting tickets: the tickets were counted back twice", allocDepth(ctx), ctx.Redis.ZCard("pool:15"));
+  ctx.Assert(hAllocDepth(ctx) == 3 && ctx.Redis.ZCard("pool:15") == 3, "after a release that ran twice pool:depth is %d for %d waiting tickets: the tickets were counted back twice", hAllocDepth(ctx), ctx.Redis.ZCard("pool:15"));
   ctx.Assert(claims::claimTickets("m-2", 15, {"t1", "t2"}), "the released tickets must be claimable by m-2");
   store::createMatch("m-2", 15, {"t1", "t2"});
   releaseRoster("m-1");  // a late cleanup of the dead match
@@ -1293,14 +1293,14 @@ void CheckIdempotentRelease(harness::Ctx& ctx) {
     const auto t = store::getTicket(ticket_id);
     ctx.Equal(t ? t->match_id : "", "m-2", "a late release of m-1 must not take %s out of m-2; its match", ticket_id);
   }
-  ctx.Equal(allocDepth(ctx), 1, "a late release of m-1 must not move pool:depth");
+  ctx.Equal(hAllocDepth(ctx), 1, "a late release of m-1 must not move pool:depth");
   ctx.Clock.Advance(3601);  // the guard has expired when a sweeper releases m-1 again
   releaseRoster("m-1");
   for (const std::string ticket_id : {"t1", "t2"}) {
     const auto t = store::getTicket(ticket_id);
     ctx.Equal(t ? t->match_id : "", "m-2", "a release of m-1 after its guard expired must not take %s out of m-2 (return only the tickets whose match_id is still this match); its match", ticket_id);
   }
-  ctx.Assert(allocDepth(ctx) == 1 && ctx.Redis.ZCard("pool:15") == 1, "a release of m-1 after its guard expired moved pool:depth to %d with %d tickets in pool:15", allocDepth(ctx), ctx.Redis.ZCard("pool:15"));
+  ctx.Assert(hAllocDepth(ctx) == 1 && ctx.Redis.ZCard("pool:15") == 1, "a release of m-1 after its guard expired moved pool:depth to %d with %d tickets in pool:15", hAllocDepth(ctx), ctx.Redis.ZCard("pool:15"));
 }
 `,
   },

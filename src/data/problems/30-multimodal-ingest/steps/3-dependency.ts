@@ -734,70 +734,70 @@ import (
 )
 
 var (
-	clientBg    = context.Background()
-	clientAsset = assets.Asset{AssetID: "a-1", Tenant: "t1", Checksum: "sha256:" + strings.Repeat("a", 64), Mime: "image/png", ByteSize: 48213, State: "pending"}
+	hClientBg    = context.Background()
+	hClientAsset = assets.Asset{AssetID: "a-1", Tenant: "t1", Checksum: "sha256:" + strings.Repeat("a", 64), Mime: "image/png", ByteSize: 48213, State: "pending"}
 )
 
 // visionPeer captions every image, except the ones the content policy refuses (refused: checksums).
-type visionPeer struct {
+type HVisionPeer struct {
 	pb.UnimplementedVisionServer
 	refused map[string]bool
 }
 
-func (v *visionPeer) Caption(_ context.Context, req *pb.CaptionRequest) (*pb.CaptionReply, error) {
+func (v *HVisionPeer) Caption(_ context.Context, req *pb.CaptionRequest) (*pb.CaptionReply, error) {
 	if v.refused[req.GetChecksum()] {
 		return nil, status.Errorf(codes.PermissionDenied, "image %s violates the content policy", req.GetAssetId())
 	}
 	return &pb.CaptionReply{Caption: fmt.Sprintf("a red kettle (%s)", req.GetAssetId()), Model: "vision-2026-10"}, nil
 }
 
-func visionServer(ctx *harness.Ctx) *visionPeer {
-	peer := &visionPeer{refused: map[string]bool{}}
+func hVisionServer(ctx *harness.Ctx) *HVisionPeer {
+	peer := &HVisionPeer{refused: map[string]bool{}}
 	pb.RegisterVisionServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func withID(a assets.Asset, id string) assets.Asset {
+func hWithID(a assets.Asset, id string) assets.Asset {
 	a.AssetID = id
 	return a
 }
 
-func mustCaption(ctx *harness.Ctx, a assets.Asset) assets.Captioned {
-	got, err := captionAsset(clientBg, a)
+func hMustCaption(ctx *harness.Ctx, a assets.Asset) assets.Captioned {
+	got, err := captionAsset(hClientBg, a)
 	ctx.NoError(err, "captionAsset(%s) failed", a.AssetID)
 	return got
 }
 
 func CheckUserCaption(ctx *harness.Ctx) {
-	visionServer(ctx)
-	mine := clientAsset
+	hVisionServer(ctx)
+	mine := hClientAsset
 	mine.Caption = "my kettle"
-	got := mustCaption(ctx, mine)
+	got := hMustCaption(ctx, mine)
 	ctx.Equal(got, assets.Captioned{Caption: "my kettle", Source: "user"}, "an asset with the uploader's caption")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Caption", "")), 0, "an asset with the uploader's caption needs no vision call; the calls")
-	got = mustCaption(ctx, clientAsset)
+	got = hMustCaption(ctx, hClientAsset)
 	ctx.Equal(got, assets.Captioned{Caption: "a red kettle (a-1)", Source: "vision"}, "an asset without a caption is captioned by the vision service")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	visionServer(ctx)
-	mustCaption(ctx, clientAsset)
+	hVisionServer(ctx)
+	hMustCaption(ctx, hClientAsset)
 	calls := ctx.GRPC.CallsTo("Caption", "")
 	ctx.Assert(len(calls) > 0, "no Caption call was made")
 	ctx.Assert(calls[0].HasDeadline(), "the Caption call carries no deadline: a stalled vision service holds the ingest worker as long as the connection lives")
 	ctx.Assert(2500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 3500*time.Millisecond, "the Caption call carries a %v deadline, expected 3 s", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Caption", 30.0, "")
 	before := ctx.Clock.Now()
-	got := mustCaption(ctx, withID(clientAsset, "a-2"))
+	got := hMustCaption(ctx, hWithID(hClientAsset, "a-2"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 4, "with the vision service stalled, captionAsset took %.0f s", waited)
 	ctx.Assert(got.Caption == "" && got.Degraded, "a caption that missed its deadline gave %+v: the asset is indexed without a caption, degraded", got)
 }
 
 func CheckPolicyTerminal(ctx *harness.Ctx) {
-	peer := visionServer(ctx)
-	peer.refused[clientAsset.Checksum] = true
-	got, err := captionAsset(clientBg, clientAsset)
+	peer := hVisionServer(ctx)
+	peer.refused[hClientAsset.Checksum] = true
+	got, err := captionAsset(hClientBg, hClientAsset)
 	ctx.Assert(err != nil, "a content-policy refusal (PERMISSION_DENIED) returned %+v: the refusal is a verdict about the image, so the asset fails with ErrContentPolicy", got)
 	ctx.ErrorIs(err, ErrContentPolicy, "a content-policy refusal returned %v", err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Caption", "")), 1, "PERMISSION_DENIED is final; the calls for the refused image")
@@ -806,9 +806,9 @@ func CheckPolicyTerminal(ctx *harness.Ctx) {
 }
 
 func CheckTextOnlyFallback(ctx *harness.Ctx) {
-	visionServer(ctx)
+	hVisionServer(ctx)
 	ctx.GRPC.Fail("Caption", codes.Unavailable, "vision is restarting", 1, "")
-	got := mustCaption(ctx, clientAsset)
+	got := hMustCaption(ctx, hClientAsset)
 	ctx.Assert(got.Caption != "an image", "an outage indexed the caption 'an image': every query about an image now matches every asset captioned during the outage")
 	ctx.Equal(got, assets.Captioned{Source: "none", Degraded: true}, "with the vision service unavailable, the asset is indexed without a caption (caption_source none, degraded)")
 	calls := len(ctx.GRPC.CallsTo("Caption", ""))
@@ -816,21 +816,21 @@ func CheckTextOnlyFallback(ctx *harness.Ctx) {
 	// Every failure other than a policy refusal says nothing about the image, whatever its code.
 	for i, code := range []codes.Code{codes.ResourceExhausted, codes.Internal, codes.Unauthenticated} {
 		ctx.GRPC.Fail("Caption", code, "vision failed", 1, "")
-		got, err := captionAsset(clientBg, withID(clientAsset, fmt.Sprintf("a-%d", i+2)))
+		got, err := captionAsset(hClientBg, hWithID(hClientAsset, fmt.Sprintf("a-%d", i+2)))
 		ctx.NoError(err, "a Caption that failed with %s must index the asset without a caption; only PERMISSION_DENIED fails it", code)
 		ctx.Equal(got, assets.Captioned{Source: "none", Degraded: true}, "a Caption that failed with %s indexes the asset without a caption (caption_source none, degraded)", code)
 	}
 }
 
 func CheckBackfill(ctx *harness.Ctx) {
-	visionServer(ctx)
-	mustCaption(ctx, clientAsset)
+	hVisionServer(ctx)
+	hMustCaption(ctx, hClientAsset)
 	ctx.Equal(len(ctx.Redis.SMembers("ingest:backfill")), 0, "a captioned asset must not be queued for the backfill; the backfill set's size")
 	ctx.GRPC.Fail("Caption", codes.Unavailable, "vision is restarting", 1, "")
-	mustCaption(ctx, withID(clientAsset, "a-2"))
+	hMustCaption(ctx, hWithID(hClientAsset, "a-2"))
 	ctx.Equal(ctx.Redis.SMembers("ingest:backfill"), []string{"a-2"}, "after an outage the backfill set must hold the uncaptioned asset, or nothing finds it later")
 	ctx.GRPC.SetLatency("Caption", 30.0, "")
-	mustCaption(ctx, withID(clientAsset, "a-3"))
+	hMustCaption(ctx, hWithID(hClientAsset, "a-3"))
 	queued := ctx.Redis.SMembers("ingest:backfill")
 	sort.Strings(queued)
 	ctx.Equal(queued, []string{"a-2", "a-3"}, "after a Caption missed its deadline the backfill set must hold every asset indexed without a caption, whatever the failure")
@@ -845,7 +845,7 @@ func CheckBackfill(ctx *harness.Ctx) {
 
 namespace {
 
-assets::Asset baseAsset(const std::string& asset_id) {
+assets::Asset hBaseAsset(const std::string& asset_id) {
   assets::Asset a;
   a.asset_id = asset_id;
   a.tenant = "t1";
@@ -857,7 +857,7 @@ assets::Asset baseAsset(const std::string& asset_id) {
 }
 
 // Captions every image, except the ones the content policy refuses (refused: checksums).
-class VisionPeer final : public ingest::Vision::Service {
+class HVisionPeer final : public ingest::Vision::Service {
  public:
   std::set<std::string> refused;
   grpc::Status Caption(grpc::ServerContext*, const ingest::CaptionRequest* req, ingest::CaptionReply* out) override {
@@ -868,15 +868,15 @@ class VisionPeer final : public ingest::Vision::Service {
   }
 };
 
-VisionPeer& visionServer(harness::Ctx& ctx) {
-  static VisionPeer* peer = nullptr;
+HVisionPeer& hVisionServer(harness::Ctx& ctx) {
+  static HVisionPeer* peer = nullptr;
   delete peer;
-  peer = new VisionPeer;
+  peer = new HVisionPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-assets::Captioned mustCaption(harness::Ctx& ctx, const assets::Asset& a) {
+assets::Captioned hMustCaption(harness::Ctx& ctx, const assets::Asset& a) {
   try {
     return captionAsset(a);
   } catch (const std::exception& e) {
@@ -888,38 +888,38 @@ assets::Captioned mustCaption(harness::Ctx& ctx, const assets::Asset& a) {
 }  // namespace
 
 void CheckUserCaption(harness::Ctx& ctx) {
-  visionServer(ctx);
-  assets::Asset mine = baseAsset("a-1");
+  hVisionServer(ctx);
+  assets::Asset mine = hBaseAsset("a-1");
   mine.caption = "my kettle";
-  auto got = mustCaption(ctx, mine);
+  auto got = hMustCaption(ctx, mine);
   ctx.Assert(got.caption == "my kettle" && got.source == "user" && !got.degraded, "an asset with the uploader's caption gave %q (%s)", got.caption, got.source);
   ctx.Equal(ctx.GRPC.CallsTo("Caption").size(), 0, "an asset with the uploader's caption needs no vision call; the calls");
-  got = mustCaption(ctx, baseAsset("a-1"));
+  got = hMustCaption(ctx, hBaseAsset("a-1"));
   ctx.Assert(got.caption == "a red kettle (a-1)" && got.source == "vision" && !got.degraded, "an asset without a caption gave %q (%s), expected the vision service's caption",
              got.caption, got.source);
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  visionServer(ctx);
-  mustCaption(ctx, baseAsset("a-1"));
+  hVisionServer(ctx);
+  hMustCaption(ctx, hBaseAsset("a-1"));
   const auto calls = ctx.GRPC.CallsTo("Caption");
   ctx.Assert(!calls.empty(), "no Caption call was made");
   ctx.Assert(calls[0].HasDeadline(), "the Caption call carries no deadline: a stalled vision service holds the ingest worker as long as the connection lives");
   ctx.Assert(2.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 3.5, "the Caption call carries a %v s deadline, expected kVisionDeadline = 3 s", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Caption", 30.0);
   const int64_t before = ctx.Clock.Now();
-  const auto got = mustCaption(ctx, baseAsset("a-2"));
+  const auto got = hMustCaption(ctx, hBaseAsset("a-2"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 4, "with the vision service stalled, captionAsset took %.0f s", waited);
   ctx.Assert(got.caption.empty() && got.degraded, "a caption that missed its deadline gave %q (degraded %t): the asset is indexed without a caption, degraded", got.caption, got.degraded);
 }
 
 void CheckPolicyTerminal(harness::Ctx& ctx) {
-  VisionPeer& peer = visionServer(ctx);
-  peer.refused.insert(baseAsset("a-1").checksum);
+  HVisionPeer& peer = hVisionServer(ctx);
+  peer.refused.insert(hBaseAsset("a-1").checksum);
   bool refused = false;
   try {
-    const auto got = captionAsset(baseAsset("a-1"));
+    const auto got = captionAsset(hBaseAsset("a-1"));
     ctx.Fatalf("a content-policy refusal (PERMISSION_DENIED) returned %q: the refusal is a verdict about the image, so the asset fails with ContentPolicyError", got.caption);
   } catch (const ContentPolicyError&) {
     refused = true;
@@ -933,9 +933,9 @@ void CheckPolicyTerminal(harness::Ctx& ctx) {
 }
 
 void CheckTextOnlyFallback(harness::Ctx& ctx) {
-  visionServer(ctx);
+  hVisionServer(ctx);
   ctx.GRPC.Fail("Caption", grpc::StatusCode::UNAVAILABLE, "vision is restarting", 1);
-  const auto got = mustCaption(ctx, baseAsset("a-1"));
+  const auto got = hMustCaption(ctx, hBaseAsset("a-1"));
   ctx.Assert(got.caption != "an image", "an outage indexed the caption 'an image': every query about an image now matches every asset captioned during the outage");
   ctx.Assert(got.caption.empty() && got.source == "none" && got.degraded,
              "with the vision service unavailable captionAsset gave %q (%s, degraded %t), expected no caption, caption_source none, degraded", got.caption, got.source,
@@ -950,7 +950,7 @@ void CheckTextOnlyFallback(harness::Ctx& ctx) {
     ctx.GRPC.Fail("Caption", codes[i].first, "vision failed", 1);
     assets::Captioned other;
     try {
-      other = captionAsset(baseAsset("a-" + std::to_string(i + 2)));
+      other = captionAsset(hBaseAsset("a-" + std::to_string(i + 2)));
     } catch (const std::exception& e) {
       ctx.Fatalf("a Caption that failed with %s threw %s: %s; only PERMISSION_DENIED fails the asset, any other failure indexes it without a caption", codes[i].second,
                  harness::CurrentExceptionType(), e.what());
@@ -961,14 +961,14 @@ void CheckTextOnlyFallback(harness::Ctx& ctx) {
 }
 
 void CheckBackfill(harness::Ctx& ctx) {
-  visionServer(ctx);
-  mustCaption(ctx, baseAsset("a-1"));
+  hVisionServer(ctx);
+  hMustCaption(ctx, hBaseAsset("a-1"));
   ctx.Equal(ctx.Redis.SCard("ingest:backfill"), 0, "a captioned asset must not be queued for the backfill; the backfill set's size");
   ctx.GRPC.Fail("Caption", grpc::StatusCode::UNAVAILABLE, "vision is restarting", 1);
-  mustCaption(ctx, baseAsset("a-2"));
+  hMustCaption(ctx, hBaseAsset("a-2"));
   ctx.Equal(ctx.Redis.SMembers("ingest:backfill"), {"a-2"}, "after an outage the backfill set must hold the uncaptioned asset, or nothing finds it later");
   ctx.GRPC.SetLatency("Caption", 30.0);
-  mustCaption(ctx, baseAsset("a-3"));
+  hMustCaption(ctx, hBaseAsset("a-3"));
   const auto members = ctx.Redis.SMembers("ingest:backfill");
   ctx.Assert(std::set<std::string>(members.begin(), members.end()) == std::set<std::string>{"a-2", "a-3"},
              "after a Caption missed its deadline the backfill set holds %d assets, expected a-2 and a-3: every asset indexed without a caption is captioned later, whatever the failure", members.size());

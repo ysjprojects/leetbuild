@@ -410,35 +410,35 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
 const (
-	ballotTTLSeconds = 30 * 24 * 3600
-	days10           = 10 * 24 * 3600
-	exactKey         = "ballot:t-acme:req-1:u-1"
+	kHBallotTTLSeconds = 30 * 24 * 3600
+	kHDays10           = 10 * 24 * 3600
+	kHExactKey         = "ballot:t-acme:req-1:u-1"
 	// The starter's layout, so the race is staged whichever key the code uses.
-	looseKey = "ballot:req-1:u-1"
+	kHLooseKey = "ballot:req-1:u-1"
 )
 
-func mustClaim(ctx *harness.Ctx, tenant, requestID, userID string) bool {
-	ok, err := claim(stateBg, tenant, requestID, userID)
+func hMustClaim(ctx *harness.Ctx, tenant, requestID, userID string) bool {
+	ok, err := claim(hStateBg, tenant, requestID, userID)
 	ctx.NoError(err, "claim(%s, %s, %s)", tenant, requestID, userID)
 	return ok
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
 	rival := func() any {
-		ok, err := claim(stateBg, "t-acme", "req-1", "u-1")
+		ok, err := claim(hStateBg, "t-acme", "req-1", "u-1")
 		if err != nil {
 			return err
 		}
 		return ok
 	}
 	// A second submit of the same vote lands right after this submit's first Redis command.
-	exact := ctx.Redis.After(exactKey, rival)
-	loose := ctx.Redis.After(looseKey, rival)
-	first := mustClaim(ctx, "t-acme", "req-1", "u-1")
-	ctx.Assert(exact.Fired || loose.Fired, "claim touched neither %s nor %s; Redis holds %q", exactKey, looseKey, ctx.Redis.Keys("*"))
+	exact := ctx.Redis.After(kHExactKey, rival)
+	loose := ctx.Redis.After(kHLooseKey, rival)
+	first := hMustClaim(ctx, "t-acme", "req-1", "u-1")
+	ctx.Assert(exact.Fired || loose.Fired, "claim touched neither %s nor %s; Redis holds %q", kHExactKey, kHLooseKey, ctx.Redis.Keys("*"))
 	second := exact.Result
 	if loose.Fired {
 		second = loose.Result
@@ -450,34 +450,34 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(claimed, 1, "a double-click must claim the ballot once (the two submits answered %v and %v): the test and the write must be one command; claims", first, second)
-	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-1"), false, "a third submit of the same vote must find the ballot taken")
+	ctx.Equal(hMustClaim(ctx, "t-acme", "req-1", "u-1"), false, "a third submit of the same vote must find the ballot taken")
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-1"), true, "the first vote of u-1 on req-1 in t-acme must take the ballot")
-	ctx.Equal(mustClaim(ctx, "t-other", "req-1", "u-1"), true, "tenant t-other has its own req-1 and its own u-1, and its vote was refused: the ballot key leaves the tenant out")
-	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-2"), true, "another user of the same request has a ballot of their own")
-	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-1"), false, "u-1 voting again on req-1 in t-acme must be refused")
+	ctx.Equal(hMustClaim(ctx, "t-acme", "req-1", "u-1"), true, "the first vote of u-1 on req-1 in t-acme must take the ballot")
+	ctx.Equal(hMustClaim(ctx, "t-other", "req-1", "u-1"), true, "tenant t-other has its own req-1 and its own u-1, and its vote was refused: the ballot key leaves the tenant out")
+	ctx.Equal(hMustClaim(ctx, "t-acme", "req-1", "u-2"), true, "another user of the same request has a ballot of their own")
+	ctx.Equal(hMustClaim(ctx, "t-acme", "req-1", "u-1"), false, "u-1 voting again on req-1 in t-acme must be refused")
 	keys := ctx.Redis.Keys("ballot:*")
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"ballot:t-acme:req-1:u-1", "ballot:t-acme:req-1:u-2", "ballot:t-other:req-1:u-1"}, "the ballots (ballot:{tenant}:{request_id}:{user_id})")
 }
 
 func CheckExpiry(ctx *harness.Ctx) {
-	atWrite := ctx.Redis.After(exactKey, func() any { return ctx.Redis.TTL(exactKey) })
-	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-1"), true, "the first vote must take the ballot")
+	atWrite := ctx.Redis.After(kHExactKey, func() any { return ctx.Redis.TTL(kHExactKey) })
+	ctx.Equal(hMustClaim(ctx, "t-acme", "req-1", "u-1"), true, "the first vote must take the ballot")
 	keys := ctx.Redis.Keys("ballot:*")
 	ctx.Assert(len(keys) > 0, "claim stored no ballot key")
 	ttl := ctx.Redis.TTL(keys[0])
-	ctx.Assert(ballotTTLSeconds-5 <= ttl && ttl <= ballotTTLSeconds, "the ballot %s has TTL %d, expected 30 days (%d s): a ballot without an expiry is kept forever", keys[0], ttl, ballotTTLSeconds)
+	ctx.Assert(kHBallotTTLSeconds-5 <= ttl && ttl <= kHBallotTTLSeconds, "the ballot %s has TTL %d, expected 30 days (%d s): a ballot without an expiry is kept forever", keys[0], ttl, kHBallotTTLSeconds)
 	if atWrite.Fired {
-		ctx.Assert(atWrite.Result != int64(-1), "right after the command that wrote %s it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)", exactKey)
+		ctx.Assert(atWrite.Result != int64(-1), "right after the command that wrote %s it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)", kHExactKey)
 	}
-	ctx.Clock.Advance(days10)
-	ctx.Equal(mustClaim(ctx, "t-acme", "req-1", "u-1"), false, "a second vote 10 days later must find the ballot taken")
-	left := ctx.Redis.TTL(exactKey)
-	ctx.Assert(ballotTTLSeconds-days10-5 <= left && left <= ballotTTLSeconds-days10, "10 days after the claim, and a refused second vote, the ballot has TTL %d, expected 20 days (%d s): a refused vote must not renew the expiry", left, ballotTTLSeconds-days10)
-	ctx.Clock.Advance(ballotTTLSeconds - days10 + 1)
+	ctx.Clock.Advance(kHDays10)
+	ctx.Equal(hMustClaim(ctx, "t-acme", "req-1", "u-1"), false, "a second vote 10 days later must find the ballot taken")
+	left := ctx.Redis.TTL(kHExactKey)
+	ctx.Assert(kHBallotTTLSeconds-kHDays10-5 <= left && left <= kHBallotTTLSeconds-kHDays10, "10 days after the claim, and a refused second vote, the ballot has TTL %d, expected 20 days (%d s): a refused vote must not renew the expiry", left, kHBallotTTLSeconds-kHDays10)
+	ctx.Clock.Advance(kHBallotTTLSeconds - kHDays10 + 1)
 	ctx.Equal(len(ctx.Redis.Keys("ballot:*")), 0, "30 days after the claim the ballot must be gone; ballots")
 }
 `,
@@ -490,21 +490,21 @@ func CheckExpiry(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kTtl = 30LL * 24 * 3600;
-constexpr long long kDays10 = 10LL * 24 * 3600;
-const std::string kKey = "ballot:t-acme:req-1:u-1";
+constexpr long long kHTtl = 30LL * 24 * 3600;
+constexpr long long kHDays10 = 10LL * 24 * 3600;
+const std::string kHKey = "ballot:t-acme:req-1:u-1";
 // The starter's layout, so the race is staged whichever key the code uses.
-const std::string kLooseKey = "ballot:req-1:u-1";
+const std::string kHLooseKey = "ballot:req-1:u-1";
 
-struct Rival {
+struct HRival {
   bool fired = false;
   bool claimed = false;
   long long ttl = 0;
   std::string err;
 };
 
-std::shared_ptr<Rival> rivalClaim(harness::Ctx& ctx, const std::string& key) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRivalClaim(harness::Ctx& ctx, const std::string& key) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out] {
     out->fired = true;
     try {
@@ -520,11 +520,11 @@ std::shared_ptr<Rival> rivalClaim(harness::Ctx& ctx, const std::string& key) {
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   // A second submit of the same vote lands right after this submit's first Redis command.
-  const auto exact = rivalClaim(ctx, kKey);
-  const auto loose = rivalClaim(ctx, kLooseKey);
+  const auto exact = hRivalClaim(ctx, kHKey);
+  const auto loose = hRivalClaim(ctx, kHLooseKey);
   const bool first = claim("t-acme", "req-1", "u-1");
-  ctx.Assert(exact->fired || loose->fired, "claim touched neither %s nor %s; Redis holds %q", kKey, kLooseKey, ctx.Redis.Keys("*"));
-  const Rival& rival = exact->fired ? *exact : *loose;
+  ctx.Assert(exact->fired || loose->fired, "claim touched neither %s nor %s; Redis holds %q", kHKey, kHLooseKey, ctx.Redis.Keys("*"));
+  const HRival& rival = exact->fired ? *exact : *loose;
   ctx.Assert(rival.err.empty(), "the second submit failed: %s", rival.err);
   const int claimed = (first ? 1 : 0) + (rival.claimed ? 1 : 0);
   ctx.Equal(claimed, 1, "a double-click must claim the ballot once (the two submits answered %t and %t): the test and the write must be one command; claims", first, rival.claimed);
@@ -542,24 +542,24 @@ void CheckTenantKey(harness::Ctx& ctx) {
 }
 
 void CheckExpiry(harness::Ctx& ctx) {
-  auto at_write = std::make_shared<Rival>();
-  ctx.Redis.After(kKey, [at_write, &ctx] {
+  auto at_write = std::make_shared<HRival>();
+  ctx.Redis.After(kHKey, [at_write, &ctx] {
     at_write->fired = true;
-    at_write->ttl = ctx.Redis.TTL(kKey);
+    at_write->ttl = ctx.Redis.TTL(kHKey);
   });
   ctx.Equal(claim("t-acme", "req-1", "u-1"), true, "the first vote must take the ballot");
   const auto keys = ctx.Redis.Keys("ballot:*");
   ctx.Assert(!keys.empty(), "claim stored no ballot key");
   const long long ttl = ctx.Redis.TTL(keys[0]);
-  ctx.Assert(kTtl - 5 <= ttl && ttl <= kTtl, "the ballot %s has TTL %d, expected 30 days (%d s): a ballot without an expiry is kept forever", keys[0], ttl, kTtl);
+  ctx.Assert(kHTtl - 5 <= ttl && ttl <= kHTtl, "the ballot %s has TTL %d, expected 30 days (%d s): a ballot without an expiry is kept forever", keys[0], ttl, kHTtl);
   if (at_write->fired) {
-    ctx.Assert(at_write->ttl != -1, "right after the command that wrote %s it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)", kKey);
+    ctx.Assert(at_write->ttl != -1, "right after the command that wrote %s it had no expiry: a crash before the EXPIRE leaves it forever. Set it in the same command (SET ... NX EX)", kHKey);
   }
-  ctx.Clock.Advance(kDays10);
+  ctx.Clock.Advance(kHDays10);
   ctx.Equal(claim("t-acme", "req-1", "u-1"), false, "a second vote 10 days later must find the ballot taken");
-  const long long left = ctx.Redis.TTL(kKey);
-  ctx.Assert(kTtl - kDays10 - 5 <= left && left <= kTtl - kDays10, "10 days after the claim, and a refused second vote, the ballot has TTL %d, expected 20 days (%d s): a refused vote must not renew the expiry", left, kTtl - kDays10);
-  ctx.Clock.Advance(kTtl - kDays10 + 1);
+  const long long left = ctx.Redis.TTL(kHKey);
+  ctx.Assert(kHTtl - kHDays10 - 5 <= left && left <= kHTtl - kHDays10, "10 days after the claim, and a refused second vote, the ballot has TTL %d, expected 20 days (%d s): a refused vote must not renew the expiry", left, kHTtl - kHDays10);
+  ctx.Clock.Advance(kHTtl - kHDays10 + 1);
   ctx.Equal(ctx.Redis.Keys("ballot:*").size(), 0, "30 days after the claim the ballot must be gone; ballots");
 }
 `,

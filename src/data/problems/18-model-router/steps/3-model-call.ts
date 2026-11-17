@@ -927,34 +927,34 @@ import (
 )
 
 const (
-	largeTarget = "gpt-4o:9000"
-	smallTarget = "gpt-4o-mini:9000"
+	kHLargeTarget = "gpt-4o:9000"
+	kHSmallTarget = "gpt-4o-mini:9000"
 )
 
-// deploymentPeer is a model deployment: it answers with its own name.
-type deploymentPeer struct {
+// HDeploymentPeer is a model deployment: it answers with its own name.
+type HDeploymentPeer struct {
 	pb.UnimplementedModelServer
 	name string
 }
 
-func (p *deploymentPeer) Complete(_ context.Context, _ *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (p *HDeploymentPeer) Complete(_ context.Context, _ *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	return &pb.CompleteReply{Text: p.name + " answers", Usage: &pb.Usage{InputTokens: 12, OutputTokens: 7}}, nil
 }
 
-func modelWorld(ctx *harness.Ctx) {
-	pb.RegisterModelServer(ctx.GRPC.Server(largeTarget), &deploymentPeer{name: "gpt-4o"})
-	pb.RegisterModelServer(ctx.GRPC.Server(smallTarget), &deploymentPeer{name: "gpt-4o-mini"})
+func hModelWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(kHLargeTarget), &HDeploymentPeer{name: "gpt-4o"})
+	pb.RegisterModelServer(ctx.GRPC.Server(kHSmallTarget), &HDeploymentPeer{name: "gpt-4o-mini"})
 }
 
-type modelOut struct {
+type HModelOut struct {
 	model, text string
 	err         error
 	ended       bool
 }
 
-// modelRun is one call: the model that answered, its text and the error; ended is false if it never returned.
-func modelRun(ctx *harness.Ctx, model string) modelOut {
-	var out modelOut
+// hModelRun is one call: the model that answered, its text and the error; ended is false if it never returned.
+func hModelRun(ctx *harness.Ctx, model string) HModelOut {
+	var out HModelOut
 	out.ended = ctx.Drain(func() {
 		served, reply, err := complete(context.Background(), model, "Summarise this ticket.", 64)
 		out.model, out.err = served, err
@@ -965,20 +965,20 @@ func modelRun(ctx *harness.Ctx, model string) modelOut {
 	return out
 }
 
-func modelCalls(ctx *harness.Ctx, target string) int {
+func hModelCalls(ctx *harness.Ctx, target string) int {
 	return len(ctx.GRPC.CallsTo("Complete", target))
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	modelWorld(ctx)
-	ctx.GRPC.SetLatency("Complete", 2.0, largeTarget)
-	out := modelRun(ctx, "gpt-4o")
-	ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", modelCalls(ctx, largeTarget))
-	large := ctx.GRPC.CallsTo("Complete", largeTarget)
+	hModelWorld(ctx)
+	ctx.GRPC.SetLatency("Complete", 2.0, kHLargeTarget)
+	out := hModelRun(ctx, "gpt-4o")
+	ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", hModelCalls(ctx, kHLargeTarget))
+	large := ctx.GRPC.CallsTo("Complete", kHLargeTarget)
 	ctx.Assert(len(large) > 0 && large[0].HasDeadline(), "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes")
 	timeouts := []time.Duration{}
 	full := true
-	for _, call := range append(large, ctx.GRPC.CallsTo("Complete", smallTarget)...) {
+	for _, call := range append(large, ctx.GRPC.CallsTo("Complete", kHSmallTarget)...) {
 		timeouts = append(timeouts, call.Timeout)
 		full = full && call.HasDeadline() && 700*time.Millisecond <= call.Timeout && call.Timeout <= 900*time.Millisecond
 	}
@@ -988,74 +988,74 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	modelWorld(ctx)
-	ctx.GRPC.Stop(largeTarget)
-	ctx.GRPC.Stop(smallTarget)
-	out := modelRun(ctx, "gpt-4o")
-	total := modelCalls(ctx, largeTarget) + modelCalls(ctx, smallTarget)
+	hModelWorld(ctx)
+	ctx.GRPC.Stop(kHLargeTarget)
+	ctx.GRPC.Stop(kHSmallTarget)
+	out := hModelRun(ctx, "gpt-4o")
+	total := hModelCalls(ctx, kHLargeTarget) + hModelCalls(ctx, kHSmallTarget)
 	ctx.Assert(out.ended, "with both deployments down the call never ended: %d attempts and counting. Bound the attempts per model", total)
 	ctx.Assert(out.err != nil, "with both deployments down the call must return an error, it returned model %q", out.model)
-	ctx.Assert(modelCalls(ctx, largeTarget) <= 3 && modelCalls(ctx, smallTarget) <= 3, "with both deployments down the call made %d attempts on gpt-4o and %d on gpt-4o-mini, expected at most 3 each", modelCalls(ctx, largeTarget), modelCalls(ctx, smallTarget))
+	ctx.Assert(hModelCalls(ctx, kHLargeTarget) <= 3 && hModelCalls(ctx, kHSmallTarget) <= 3, "with both deployments down the call made %d attempts on gpt-4o and %d on gpt-4o-mini, expected at most 3 each", hModelCalls(ctx, kHLargeTarget), hModelCalls(ctx, kHSmallTarget))
 }
 
 func CheckRetryable(ctx *harness.Ctx) {
-	modelWorld(ctx)
-	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "max_tokens exceeds the context window", 1, largeTarget)
-	out := modelRun(ctx, "gpt-4o")
+	hModelWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "max_tokens exceeds the context window", 1, kHLargeTarget)
+	out := hModelRun(ctx, "gpt-4o")
 	ctx.Assert(out.ended && out.err != nil, "INVALID_ARGUMENT from gpt-4o must be returned to the caller at once, the call returned model %q", out.model)
-	ctx.Equal(modelCalls(ctx, largeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls")
-	ctx.Equal(modelCalls(ctx, smallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls")
+	ctx.Equal(hModelCalls(ctx, kHLargeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls")
+	ctx.Equal(hModelCalls(ctx, kHSmallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls")
 	_, counted := ctx.Redis.Get("circuit:gpt-4o")
 	ctx.Assert(!counted, "a non-retryable failure must not count towards the breaker")
 	for _, code := range []codes.Code{codes.PermissionDenied, codes.ResourceExhausted, codes.NotFound} {
-		before := modelCalls(ctx, largeTarget)
-		ctx.GRPC.Fail("Complete", code, "refused", 1, largeTarget)
-		out = modelRun(ctx, "gpt-4o")
+		before := hModelCalls(ctx, kHLargeTarget)
+		ctx.GRPC.Fail("Complete", code, "refused", 1, kHLargeTarget)
+		out = hModelRun(ctx, "gpt-4o")
 		ctx.Assert(out.ended && out.err != nil, "%v from gpt-4o must be returned to the caller at once, the call returned model %q: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", code, out.model)
-		ctx.Assert(modelCalls(ctx, largeTarget) == before+1 && modelCalls(ctx, smallTarget) == 0, "%v is not retryable: gpt-4o was called %d times and gpt-4o-mini %d times, expected once and never", code, modelCalls(ctx, largeTarget)-before, modelCalls(ctx, smallTarget))
+		ctx.Assert(hModelCalls(ctx, kHLargeTarget) == before+1 && hModelCalls(ctx, kHSmallTarget) == 0, "%v is not retryable: gpt-4o was called %d times and gpt-4o-mini %d times, expected once and never", code, hModelCalls(ctx, kHLargeTarget)-before, hModelCalls(ctx, kHSmallTarget))
 	}
 	_, counted = ctx.Redis.Get("circuit:gpt-4o")
 	ctx.Assert(!counted, "a non-retryable failure must not count towards the breaker")
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o restarting", 1, largeTarget)
-	out = modelRun(ctx, "gpt-4o")
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o restarting", 1, kHLargeTarget)
+	out = hModelRun(ctx, "gpt-4o")
 	ctx.Assert(out.err == nil && out.model == "gpt-4o", "one UNAVAILABLE must be retried on gpt-4o, got model %q and %v", out.model, out.err)
-	ctx.Equal(modelCalls(ctx, largeTarget), 6, "gpt-4o calls in all (4 + 2: four refusals, then one retried failure)")
+	ctx.Equal(hModelCalls(ctx, kHLargeTarget), 6, "gpt-4o calls in all (4 + 2: four refusals, then one retried failure)")
 }
 
 func CheckFallback(ctx *harness.Ctx) {
-	modelWorld(ctx)
-	ctx.GRPC.Stop(largeTarget)
-	out := modelRun(ctx, "gpt-4o")
+	hModelWorld(ctx)
+	ctx.GRPC.Stop(kHLargeTarget)
+	out := hModelRun(ctx, "gpt-4o")
 	ctx.Assert(out.ended, "with gpt-4o down the call never ended: fall back to gpt-4o-mini once gpt-4o's attempts are spent")
 	ctx.Assert(out.err == nil && out.model == "gpt-4o-mini", "with gpt-4o down gpt-4o-mini must answer, got model %q and %v", out.model, out.err)
 	ctx.Equal(out.text, "gpt-4o-mini answers", "the reply must be gpt-4o-mini's")
-	ctx.Assert(modelCalls(ctx, largeTarget) == 3 && modelCalls(ctx, smallTarget) == 1, "expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got %d and %d", modelCalls(ctx, largeTarget), modelCalls(ctx, smallTarget))
-	ctx.GRPC.Stop(smallTarget)
-	out = modelRun(ctx, "gpt-4o-mini")
+	ctx.Assert(hModelCalls(ctx, kHLargeTarget) == 3 && hModelCalls(ctx, kHSmallTarget) == 1, "expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got %d and %d", hModelCalls(ctx, kHLargeTarget), hModelCalls(ctx, kHSmallTarget))
+	ctx.GRPC.Stop(kHSmallTarget)
+	out = hModelRun(ctx, "gpt-4o-mini")
 	ctx.Assert(out.ended && out.err != nil, "a call for gpt-4o-mini with gpt-4o-mini down has nothing to fall back to and must return an error")
-	ctx.Equal(modelCalls(ctx, largeTarget), 3, "a call for gpt-4o-mini must not fall back to gpt-4o; gpt-4o calls")
+	ctx.Equal(hModelCalls(ctx, kHLargeTarget), 3, "a call for gpt-4o-mini must not fall back to gpt-4o; gpt-4o calls")
 }
 
 func CheckBreaker(ctx *harness.Ctx) {
-	modelWorld(ctx)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o overloaded", 5, largeTarget)
-	first := modelRun(ctx, "gpt-4o")
+	hModelWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o overloaded", 5, kHLargeTarget)
+	first := hModelRun(ctx, "gpt-4o")
 	count, _ := ctx.Redis.Get("circuit:gpt-4o")
 	countTTL := ctx.Redis.TTL("circuit:gpt-4o")
 	ctx.Assert(count == "3" && 0 < countTTL && countTTL <= 30, "after three retryable failures circuit:gpt-4o is %q with TTL %d, expected the count 3 expiring within 30 s: a count that never expires opens the circuit on failures spread over days", count, countTTL)
-	second := modelRun(ctx, "gpt-4o")
+	second := hModelRun(ctx, "gpt-4o")
 	state, _ := ctx.Redis.Get("circuit:gpt-4o")
 	ctx.Equal(state, "open", "after five retryable failures circuit:gpt-4o")
 	ttl := ctx.Redis.TTL("circuit:gpt-4o")
 	ctx.Assert(0 < ttl && ttl <= 30, "circuit:gpt-4o must expire within 30 s, its TTL is %d", ttl)
-	ctx.Equal(modelCalls(ctx, largeTarget), 5, "once the circuit opened at the fifth failure the next attempt must not be made; gpt-4o calls")
+	ctx.Equal(hModelCalls(ctx, kHLargeTarget), 5, "once the circuit opened at the fifth failure the next attempt must not be made; gpt-4o calls")
 	ctx.Assert(first.model == "gpt-4o-mini" && second.model == "gpt-4o-mini", "while gpt-4o fails the fallback answers, got %q then %q", first.model, second.model)
-	third := modelRun(ctx, "gpt-4o")
-	ctx.Equal(modelCalls(ctx, largeTarget), 5, "while the circuit is open gpt-4o must be skipped without a call; gpt-4o calls")
+	third := hModelRun(ctx, "gpt-4o")
+	ctx.Equal(hModelCalls(ctx, kHLargeTarget), 5, "while the circuit is open gpt-4o must be skipped without a call; gpt-4o calls")
 	ctx.Assert(third.model == "gpt-4o-mini", "while the circuit is open gpt-4o-mini answers, got %q and %v", third.model, third.err)
 	ctx.Clock.Advance(31)
-	fourth := modelRun(ctx, "gpt-4o")
-	ctx.Assert(modelCalls(ctx, largeTarget) == 6 && fourth.model == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again")
+	fourth := hModelRun(ctx, "gpt-4o")
+	ctx.Assert(hModelCalls(ctx, kHLargeTarget) == 6 && fourth.model == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1067,13 +1067,13 @@ func CheckBreaker(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kLargeTarget = "gpt-4o:9000";
-const std::string kSmallTarget = "gpt-4o-mini:9000";
+const std::string kHLargeTarget = "gpt-4o:9000";
+const std::string kHSmallTarget = "gpt-4o-mini:9000";
 
 // A model deployment: answers with its own name.
-class DeploymentPeer final : public routerd::Model::Service {
+class HDeploymentPeer final : public routerd::Model::Service {
  public:
-  explicit DeploymentPeer(std::string name) : name_(std::move(name)) {}
+  explicit HDeploymentPeer(std::string name) : name_(std::move(name)) {}
 
   grpc::Status Complete(grpc::ServerContext*, const routerd::CompleteRequest*, routerd::CompleteReply* reply) override {
     reply->set_text(name_ + " answers");
@@ -1086,28 +1086,28 @@ class DeploymentPeer final : public routerd::Model::Service {
   std::string name_;
 };
 
-struct ModelWorld {
-  DeploymentPeer large{"gpt-4o"};
-  DeploymentPeer small{"gpt-4o-mini"};
+struct HModelWorld {
+  HDeploymentPeer large{"gpt-4o"};
+  HDeploymentPeer small{"gpt-4o-mini"};
 };
 
-void modelWorld(harness::Ctx& ctx) {
-  static ModelWorld* w = nullptr;
+void hModelWorld(harness::Ctx& ctx) {
+  static HModelWorld* w = nullptr;
   delete w;
-  w = new ModelWorld;
-  ctx.GRPC.Server(kLargeTarget)->RegisterService(&w->large);
-  ctx.GRPC.Server(kSmallTarget)->RegisterService(&w->small);
+  w = new HModelWorld;
+  ctx.GRPC.Server(kHLargeTarget)->RegisterService(&w->large);
+  ctx.GRPC.Server(kHSmallTarget)->RegisterService(&w->small);
 }
 
-struct ModelOut {
+struct HModelOut {
   std::string model, text;
   std::string error;  // what the call threw, "" if it returned
   bool ended = false;
 };
 
 // One call: the model that answered, its text and what it threw; ended is false if it never returned.
-ModelOut modelRun(harness::Ctx& ctx, const std::string& model = "gpt-4o") {
-  ModelOut out;
+HModelOut hModelRun(harness::Ctx& ctx, const std::string& model = "gpt-4o") {
+  HModelOut out;
   out.ended = ctx.Drain([&] {
     try {
       const auto answer = complete(model, "Summarise this ticket.", 64);
@@ -1120,20 +1120,20 @@ ModelOut modelRun(harness::Ctx& ctx, const std::string& model = "gpt-4o") {
   return out;
 }
 
-size_t modelCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("Complete", target).size(); }
+size_t hModelCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("Complete", target).size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  modelWorld(ctx);
-  ctx.GRPC.SetLatency("Complete", 2.0, kLargeTarget);
-  const auto out = modelRun(ctx);
-  ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", modelCalls(ctx, kLargeTarget));
-  const auto large = ctx.GRPC.CallsTo("Complete", kLargeTarget);
+  hModelWorld(ctx);
+  ctx.GRPC.SetLatency("Complete", 2.0, kHLargeTarget);
+  const auto out = hModelRun(ctx);
+  ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", hModelCalls(ctx, kHLargeTarget));
+  const auto large = ctx.GRPC.CallsTo("Complete", kHLargeTarget);
   ctx.Assert(!large.empty() && large[0].HasDeadline(), "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes");
   std::string timeouts;
   bool full = true;
-  for (const auto& target : {kLargeTarget, kSmallTarget}) {
+  for (const auto& target : {kHLargeTarget, kHSmallTarget}) {
     for (const auto& call : ctx.GRPC.CallsTo("Complete", target)) {
       timeouts += (timeouts.empty() ? "" : ", ") + (call.HasDeadline() ? std::to_string(call.TimeoutSeconds()) : std::string("none"));
       full = full && call.HasDeadline() && 0.7 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.9;
@@ -1145,23 +1145,23 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  modelWorld(ctx);
-  ctx.GRPC.Stop(kLargeTarget);
-  ctx.GRPC.Stop(kSmallTarget);
-  const auto out = modelRun(ctx);
-  const size_t total = modelCalls(ctx, kLargeTarget) + modelCalls(ctx, kSmallTarget);
+  hModelWorld(ctx);
+  ctx.GRPC.Stop(kHLargeTarget);
+  ctx.GRPC.Stop(kHSmallTarget);
+  const auto out = hModelRun(ctx);
+  const size_t total = hModelCalls(ctx, kHLargeTarget) + hModelCalls(ctx, kHSmallTarget);
   ctx.Assert(out.ended, "with both deployments down the call never ended: %d attempts and counting. Bound the attempts per model", total);
   ctx.Assert(!out.error.empty(), "with both deployments down the call must throw, it returned model %q", out.model);
-  ctx.Assert(modelCalls(ctx, kLargeTarget) <= 3 && modelCalls(ctx, kSmallTarget) <= 3, "with both deployments down the call made %d attempts on gpt-4o and %d on gpt-4o-mini, expected at most 3 each", modelCalls(ctx, kLargeTarget), modelCalls(ctx, kSmallTarget));
+  ctx.Assert(hModelCalls(ctx, kHLargeTarget) <= 3 && hModelCalls(ctx, kHSmallTarget) <= 3, "with both deployments down the call made %d attempts on gpt-4o and %d on gpt-4o-mini, expected at most 3 each", hModelCalls(ctx, kHLargeTarget), hModelCalls(ctx, kHSmallTarget));
 }
 
 void CheckRetryable(harness::Ctx& ctx) {
-  modelWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "max_tokens exceeds the context window", 1, kLargeTarget);
-  auto out = modelRun(ctx);
+  hModelWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "max_tokens exceeds the context window", 1, kHLargeTarget);
+  auto out = hModelRun(ctx);
   ctx.Assert(out.ended && !out.error.empty(), "INVALID_ARGUMENT from gpt-4o must be thrown to the caller at once, the call returned model %q", out.model);
-  ctx.Equal(modelCalls(ctx, kLargeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls");
-  ctx.Equal(modelCalls(ctx, kSmallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls");
+  ctx.Equal(hModelCalls(ctx, kHLargeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls");
+  ctx.Equal(hModelCalls(ctx, kHSmallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls");
   ctx.Assert(!ctx.Redis.Get("circuit:gpt-4o"), "a non-retryable failure must not count towards the breaker");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
@@ -1169,52 +1169,52 @@ void CheckRetryable(harness::Ctx& ctx) {
       {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
   };
   for (const auto& [code, name] : terminal) {
-    const size_t before = modelCalls(ctx, kLargeTarget);
-    ctx.GRPC.Fail("Complete", code, "refused", 1, kLargeTarget);
-    out = modelRun(ctx);
+    const size_t before = hModelCalls(ctx, kHLargeTarget);
+    ctx.GRPC.Fail("Complete", code, "refused", 1, kHLargeTarget);
+    out = hModelRun(ctx);
     ctx.Assert(out.ended && !out.error.empty(), "%s from gpt-4o must be thrown to the caller at once, the call returned model %q: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", name, out.model);
-    ctx.Assert(modelCalls(ctx, kLargeTarget) == before + 1 && modelCalls(ctx, kSmallTarget) == 0, "%s is not retryable: gpt-4o was called %d times and gpt-4o-mini %d times, expected once and never", name, modelCalls(ctx, kLargeTarget) - before, modelCalls(ctx, kSmallTarget));
+    ctx.Assert(hModelCalls(ctx, kHLargeTarget) == before + 1 && hModelCalls(ctx, kHSmallTarget) == 0, "%s is not retryable: gpt-4o was called %d times and gpt-4o-mini %d times, expected once and never", name, hModelCalls(ctx, kHLargeTarget) - before, hModelCalls(ctx, kHSmallTarget));
   }
   ctx.Assert(!ctx.Redis.Get("circuit:gpt-4o"), "a non-retryable failure must not count towards the breaker");
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o restarting", 1, kLargeTarget);
-  out = modelRun(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o restarting", 1, kHLargeTarget);
+  out = hModelRun(ctx);
   ctx.Assert(out.error.empty() && out.model == "gpt-4o", "one UNAVAILABLE must be retried on gpt-4o, got model %q and %s", out.model, out.error);
-  ctx.Equal(modelCalls(ctx, kLargeTarget), 6, "gpt-4o calls in all (4 + 2: four refusals, then one retried failure)");
+  ctx.Equal(hModelCalls(ctx, kHLargeTarget), 6, "gpt-4o calls in all (4 + 2: four refusals, then one retried failure)");
 }
 
 void CheckFallback(harness::Ctx& ctx) {
-  modelWorld(ctx);
-  ctx.GRPC.Stop(kLargeTarget);
-  auto out = modelRun(ctx);
+  hModelWorld(ctx);
+  ctx.GRPC.Stop(kHLargeTarget);
+  auto out = hModelRun(ctx);
   ctx.Assert(out.ended, "with gpt-4o down the call never ended: fall back to gpt-4o-mini once gpt-4o's attempts are spent");
   ctx.Assert(out.error.empty() && out.model == "gpt-4o-mini", "with gpt-4o down gpt-4o-mini must answer, got model %q and %s", out.model, out.error);
   ctx.Equal(out.text, "gpt-4o-mini answers", "the reply must be gpt-4o-mini's");
-  ctx.Assert(modelCalls(ctx, kLargeTarget) == 3 && modelCalls(ctx, kSmallTarget) == 1, "expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got %d and %d", modelCalls(ctx, kLargeTarget), modelCalls(ctx, kSmallTarget));
-  ctx.GRPC.Stop(kSmallTarget);
-  out = modelRun(ctx, "gpt-4o-mini");
+  ctx.Assert(hModelCalls(ctx, kHLargeTarget) == 3 && hModelCalls(ctx, kHSmallTarget) == 1, "expected 3 attempts on gpt-4o and 1 on gpt-4o-mini, got %d and %d", hModelCalls(ctx, kHLargeTarget), hModelCalls(ctx, kHSmallTarget));
+  ctx.GRPC.Stop(kHSmallTarget);
+  out = hModelRun(ctx, "gpt-4o-mini");
   ctx.Assert(out.ended && !out.error.empty(), "a call for gpt-4o-mini with gpt-4o-mini down has nothing to fall back to and must throw");
-  ctx.Equal(modelCalls(ctx, kLargeTarget), 3, "a call for gpt-4o-mini must not fall back to gpt-4o; gpt-4o calls");
+  ctx.Equal(hModelCalls(ctx, kHLargeTarget), 3, "a call for gpt-4o-mini must not fall back to gpt-4o; gpt-4o calls");
 }
 
 void CheckBreaker(harness::Ctx& ctx) {
-  modelWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o overloaded", 5, kLargeTarget);
-  const auto first = modelRun(ctx);
+  hModelWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o overloaded", 5, kHLargeTarget);
+  const auto first = hModelRun(ctx);
   const std::string count = ctx.Redis.Get("circuit:gpt-4o").value_or("");
   const long long count_ttl = ctx.Redis.TTL("circuit:gpt-4o");
   ctx.Assert(count == "3" && 0 < count_ttl && count_ttl <= 30, "after three retryable failures circuit:gpt-4o is %q with TTL %d, expected the count 3 expiring within 30 s: a count that never expires opens the circuit on failures spread over days", count, count_ttl);
-  const auto second = modelRun(ctx);
+  const auto second = hModelRun(ctx);
   ctx.Equal(ctx.Redis.Get("circuit:gpt-4o"), "open", "after five retryable failures circuit:gpt-4o");
   const long long ttl = ctx.Redis.TTL("circuit:gpt-4o");
   ctx.Assert(0 < ttl && ttl <= 30, "circuit:gpt-4o must expire within 30 s, its TTL is %d", ttl);
-  ctx.Equal(modelCalls(ctx, kLargeTarget), 5, "once the circuit opened at the fifth failure the next attempt must not be made; gpt-4o calls");
+  ctx.Equal(hModelCalls(ctx, kHLargeTarget), 5, "once the circuit opened at the fifth failure the next attempt must not be made; gpt-4o calls");
   ctx.Assert(first.model == "gpt-4o-mini" && second.model == "gpt-4o-mini", "while gpt-4o fails the fallback answers, got %q then %q", first.model, second.model);
-  const auto third = modelRun(ctx);
-  ctx.Equal(modelCalls(ctx, kLargeTarget), 5, "while the circuit is open gpt-4o must be skipped without a call; gpt-4o calls");
+  const auto third = hModelRun(ctx);
+  ctx.Equal(hModelCalls(ctx, kHLargeTarget), 5, "while the circuit is open gpt-4o must be skipped without a call; gpt-4o calls");
   ctx.Assert(third.model == "gpt-4o-mini", "while the circuit is open gpt-4o-mini answers, got %q and %s", third.model, third.error);
   ctx.Clock.Advance(31);
-  const auto fourth = modelRun(ctx);
-  ctx.Assert(modelCalls(ctx, kLargeTarget) == 6 && fourth.model == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again");
+  const auto fourth = hModelRun(ctx);
+  ctx.Assert(hModelCalls(ctx, kHLargeTarget) == 6 && fourth.model == "gpt-4o", "once the circuit has expired gpt-4o gets its turn again");
 }
 `,
   },

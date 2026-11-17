@@ -563,54 +563,54 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func entry(name, version, sideEffect, owner string) catalog.Entry {
+func hEntry(name, version, sideEffect, owner string) catalog.Entry {
 	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}}, "endpoint": "https://" + owner + ".internal/" + name, "credential_ref": "vault://" + owner + "/" + name, "review_ticket": "SEC-" + version}
 }
 
 // api: catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund (and payments.retired, in no catalog), not payments.void or docs.lookup.
-func api(ctx *harness.Ctx) *harness.HTTP {
-	v7 := map[string]catalog.Entry{"search": entry("search", "a1", "read", "search"), "payments.refund": entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": entry("payments.void", "d1", "write", "payments"), "docs.lookup": entry("docs.lookup", "l1", "read", "docs")}
-	v9 := map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "payments.refund": entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": entry("payments.void", "d2", "write", "payments"), "docs.lookup": entry("docs.lookup", "l2", "read", "docs")}
+func hApi(ctx *harness.Ctx) *harness.HTTP {
+	v7 := map[string]catalog.Entry{"search": hEntry("search", "a1", "read", "search"), "payments.refund": hEntry("payments.refund", "b1", "irreversible", "payments"), "payments.void": hEntry("payments.void", "d1", "write", "payments"), "docs.lookup": hEntry("docs.lookup", "l1", "read", "docs")}
+	v9 := map[string]catalog.Entry{"search": hEntry("search", "a2", "read", "search"), "payments.refund": hEntry("payments.refund", "b2", "irreversible", "payments"), "payments.void": hEntry("payments.void", "d2", "write", "payments"), "docs.lookup": hEntry("docs.lookup", "l2", "read", "docs")}
 	for _, cv := range []string{"7", "9"} {
-		ctx.NoError(catalog.RecordValidation(readBg, cv, "passed", ""), "seeding failed")
+		ctx.NoError(catalog.RecordValidation(hReadBg, cv, "passed", ""), "seeding failed")
 	}
-	ctx.NoError(catalog.Promote(readBg, "7", v7), "seeding failed")
-	ctx.NoError(catalog.PinRun(readBg, "run-1", "7"), "seeding failed")
-	ctx.NoError(catalog.Promote(readBg, "9", v9), "seeding failed")
-	ctx.NoError(store.Grant(readBg, "acme", "search", "payments.refund", "payments.retired"), "seeding failed")
+	ctx.NoError(catalog.Promote(hReadBg, "7", v7), "seeding failed")
+	ctx.NoError(catalog.PinRun(hReadBg, "run-1", "7"), "seeding failed")
+	ctx.NoError(catalog.Promote(hReadBg, "9", v9), "seeding failed")
+	ctx.NoError(store.Grant(hReadBg, "acme", "search", "payments.refund", "payments.retired"), "seeding failed")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func served(r *harness.Response) map[string]any {
+func hServed(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	r := c.Get("/v1/tools/search", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/tools/search (%s)", r.Text())
-	body := served(r)
+	body := hServed(r)
 	ctx.Assert(body["name"] == "search" && body["version"] == "a2", "the active catalog serves search a2, the response is %s", r.Text())
 	ctx.Equal(c.Get("/v1/tools/search").Status, 401, "a resolve without X-Tenant-Id")
 }
 
 func CheckRunPin(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	pinned := c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-1")
 	ctx.Equal(pinned.Status, 200, "a pinned resolve (%s)", pinned.Text())
-	ctx.Equal(served(pinned)["version"], "b1", "run-1 pinned catalog 7: a promotion must not switch a running agent to new definitions mid-plan; the payments.refund version served")
-	ctx.Equal(served(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme"))["version"], "b2", "without a run, the version the active catalog serves")
-	ctx.Equal(served(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-2"))["version"], "b2", "a run that pinned nothing is served the active catalog; the version")
+	ctx.Equal(hServed(pinned)["version"], "b1", "run-1 pinned catalog 7: a promotion must not switch a running agent to new definitions mid-plan; the payments.refund version served")
+	ctx.Equal(hServed(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme"))["version"], "b2", "without a run, the version the active catalog serves")
+	ctx.Equal(hServed(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-2"))["version"], "b2", "a run that pinned nothing is served the active catalog; the version")
 }
 
 func CheckAllowlist404(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	denied := c.Get("/v1/tools/payments.void", "X-Tenant-Id", "acme")
 	missing := c.Get("/v1/tools/payments.nothing", "X-Tenant-Id", "acme")
 	ctx.Equal(missing.Status, 404, "a missing tool")
@@ -624,10 +624,10 @@ func CheckAllowlist404(ctx *harness.Ctx) {
 }
 
 func CheckPublicFields(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	r := c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/tools/payments.refund (%s)", r.Text())
-	body := served(r)
+	body := hServed(r)
 	fields := make([]string, 0, len(body))
 	for k := range body {
 		fields = append(fields, k)
@@ -648,7 +648,7 @@ using json = nlohmann::json;
 
 namespace {
 
-json entry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
+json hEntry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
   return json{{"name", name},
               {"version", version},
               {"side_effect", side_effect},
@@ -660,15 +660,15 @@ json entry(const std::string& name, const std::string& version, const std::strin
 }
 
 // Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund (and payments.retired, in no catalog), not payments.void or docs.lookup.
-harness::HTTP api(harness::Ctx& ctx) {
-  const json v7 = {{"search", entry("search", "a1", "read", "search")},
-                   {"payments.refund", entry("payments.refund", "b1", "irreversible", "payments")},
-                   {"payments.void", entry("payments.void", "d1", "write", "payments")},
-                   {"docs.lookup", entry("docs.lookup", "l1", "read", "docs")}};
-  const json v9 = {{"search", entry("search", "a2", "read", "search")},
-                   {"payments.refund", entry("payments.refund", "b2", "irreversible", "payments")},
-                   {"payments.void", entry("payments.void", "d2", "write", "payments")},
-                   {"docs.lookup", entry("docs.lookup", "l2", "read", "docs")}};
+harness::HTTP hApi(harness::Ctx& ctx) {
+  const json v7 = {{"search", hEntry("search", "a1", "read", "search")},
+                   {"payments.refund", hEntry("payments.refund", "b1", "irreversible", "payments")},
+                   {"payments.void", hEntry("payments.void", "d1", "write", "payments")},
+                   {"docs.lookup", hEntry("docs.lookup", "l1", "read", "docs")}};
+  const json v9 = {{"search", hEntry("search", "a2", "read", "search")},
+                   {"payments.refund", hEntry("payments.refund", "b2", "irreversible", "payments")},
+                   {"payments.void", hEntry("payments.void", "d2", "write", "payments")},
+                   {"docs.lookup", hEntry("docs.lookup", "l2", "read", "docs")}};
   catalog::recordValidation("7", "passed", "");
   catalog::recordValidation("9", "passed", "");
   catalog::promote("7", v7);
@@ -682,7 +682,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string versionIn(const harness::Response& r) {
+std::string hVersionIn(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("version", "") : "";
 }
@@ -690,24 +690,24 @@ std::string versionIn(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/tools/search", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/tools/search (%s)", r.Text());
-  ctx.Assert(r.Text().find("\\"search\\"") != std::string::npos && versionIn(r) == "a2", "the active catalog serves search a2, the response is %s", r.Text());
+  ctx.Assert(r.Text().find("\\"search\\"") != std::string::npos && hVersionIn(r) == "a2", "the active catalog serves search a2, the response is %s", r.Text());
   ctx.Equal(c.Get("/v1/tools/search").Status, 401, "a resolve without X-Tenant-Id");
 }
 
 void CheckRunPin(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto pinned = c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-1");
   ctx.Equal(pinned.Status, 200, "a pinned resolve (%s)", pinned.Text());
-  ctx.Equal(versionIn(pinned), "b1", "run-1 pinned catalog 7: a promotion must not switch a running agent to new definitions mid-plan; the payments.refund version served");
-  ctx.Equal(versionIn(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme")), "b2", "without a run, the version the active catalog serves");
-  ctx.Equal(versionIn(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-2")), "b2", "a run that pinned nothing is served the active catalog; the version");
+  ctx.Equal(hVersionIn(pinned), "b1", "run-1 pinned catalog 7: a promotion must not switch a running agent to new definitions mid-plan; the payments.refund version served");
+  ctx.Equal(hVersionIn(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme")), "b2", "without a run, the version the active catalog serves");
+  ctx.Equal(hVersionIn(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme", "X-Run-Id", "run-2")), "b2", "a run that pinned nothing is served the active catalog; the version");
 }
 
 void CheckAllowlist404(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto denied = c.Get("/v1/tools/payments.void", "X-Tenant-Id", "acme");
   const auto missing = c.Get("/v1/tools/payments.nothing", "X-Tenant-Id", "acme");
   ctx.Equal(missing.Status, 404, "a missing tool");
@@ -721,7 +721,7 @@ void CheckAllowlist404(harness::Ctx& ctx) {
 }
 
 void CheckPublicFields(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/tools/payments.refund (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);

@@ -1002,22 +1002,22 @@ import (
 	"leetbuild/harness"
 )
 
-var apiGood = map[string]any{
+var hApiGood = map[string]any{
 	"name":      "support-reply",
 	"version":   3,
 	"template":  "Hi {{customer_name}}, thanks for asking about {{product}}.",
 	"variables": []string{"customer_name", "product"},
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(overrides map[string]any) map[string]any {
+func hApiWith(overrides map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiGood {
+	for k, v := range hApiGood {
 		out[k] = v
 	}
 	for k, v := range overrides {
@@ -1026,22 +1026,22 @@ func apiWith(overrides map[string]any) map[string]any {
 	return out
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
 	return c.Post("/v1/prompts", body, "X-Tenant-Id", tenant)
 }
 
-func apiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
-func apiSha(text string) string {
+func hApiSha(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(sum[:])
 }
 
-func apiStored(ctx *harness.Ctx, tenant string, version int) map[string]any {
+func hApiStored(ctx *harness.Ctx, tenant string, version int) map[string]any {
 	raw, ok := ctx.Redis.Get("prompts:version:" + tenant + ":support-reply:" + strconv.Itoa(version))
 	if !ok {
 		return nil
@@ -1052,34 +1052,34 @@ func apiStored(ctx *harness.Ctx, tenant string, version int) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "t1")
 	ctx.Equal(r.Status, 201, "a valid registration (%s)", r.Text())
-	body := apiBody(ctx, r)
+	body := hApiBody(ctx, r)
 	ctx.Equal(body["name"], "support-reply", "the 201 body's name (%s)", r.Text())
 	ctx.Equal(body["version"], float64(3), "the 201 body's version (%s)", r.Text())
-	ctx.Equal(body["content_hash"], apiSha(apiGood["template"].(string)), "the 201 body's content_hash, the SHA-256 of the template")
+	ctx.Equal(body["content_hash"], hApiSha(hApiGood["template"].(string)), "the 201 body's content_hash, the SHA-256 of the template")
 	ctx.Equal(body["variables"], []any{"customer_name", "product"}, "the 201 body's variables")
 	ctx.Equal(body["created"], true, "the 201 body's created")
-	stored := apiStored(ctx, "t1", 3)
-	ctx.Assert(stored != nil && stored["template"] == apiGood["template"], "version 3 must be in the version store (prompts:version:t1:support-reply:3), found %v", stored)
-	noTenant := c.Post("/v1/prompts", apiGood)
+	stored := hApiStored(ctx, "t1", 3)
+	ctx.Assert(stored != nil && stored["template"] == hApiGood["template"], "version 3 must be in the version store (prompts:version:t1:support-reply:3), found %v", stored)
+	noTenant := c.Post("/v1/prompts", hApiGood)
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the registration")
 }
 
 func CheckTemplateCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for n, template := range []string{strings.Repeat("x", 32*1024+1), strings.Repeat("é", 16*1024+1)} {
-		r := apiPost(c, apiWith(map[string]any{"version": 10 + n, "template": template, "variables": []string{}}), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"version": 10 + n, "template": template, "variables": []string{}}), "t1")
 		ctx.Equal(r.Status, 413, "a template of %d bytes (%d characters): the cap is 32 KiB of UTF-8 bytes", len(template), len([]rune(template)))
 	}
 	ctx.Equal(len(ctx.Redis.Keys("prompts:*")), 0, "a refused template must store nothing (%v); keys", ctx.Redis.Keys("prompts:*"))
-	r := apiPost(c, apiWith(map[string]any{"version": 12, "template": strings.Repeat("y", 32*1024), "variables": []string{}}), "t1")
+	r := hApiPost(c, hApiWith(map[string]any{"version": 12, "template": strings.Repeat("y", 32*1024), "variables": []string{}}), "t1")
 	ctx.Equal(r.Status, 201, "a template of exactly 32 KiB is within the cap (%s)", r.Text())
 }
 
 func CheckPlaceholderAllowlist(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	cases := []struct {
 		template  string
 		variables []string
@@ -1091,52 +1091,52 @@ func CheckPlaceholderAllowlist(ctx *harness.Ctx) {
 		{"Hi {{customer_name}}.", []string{"customer_name", "tone"}, "a declared variable the template never uses"},
 	}
 	for n, tc := range cases {
-		r := apiPost(c, apiWith(map[string]any{"version": 20 + n, "template": tc.template, "variables": tc.variables}), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"version": 20 + n, "template": tc.template, "variables": tc.variables}), "t1")
 		ctx.Equal(r.Status, 422, "%s (%q declares %v)", tc.what, tc.template, tc.variables)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("prompts:*")), 0, "a refused registration must store nothing (%v); keys", ctx.Redis.Keys("prompts:*"))
-	r := apiPost(c, apiWith(map[string]any{"version": 30, "template": "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end.", "variables": []string{"tone", "question"}}), "t1")
+	r := hApiPost(c, hApiWith(map[string]any{"version": 30, "template": "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end.", "variables": []string{"tone", "question"}}), "t1")
 	ctx.Equal(r.Status, 201, "placeholders equal to the declared variables, all allowed, must register, a placeholder used twice included (%s)", r.Text())
-	ctx.Equal(apiBody(ctx, r)["variables"], []any{"question", "tone"}, "the variables come back sorted")
+	ctx.Equal(hApiBody(ctx, r)["variables"], []any{"question", "tone"}, "the variables come back sorted")
 }
 
 func CheckImmutable(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := apiPost(c, apiGood, "t1")
+	c := hApiClient(ctx)
+	first := hApiPost(c, hApiGood, "t1")
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	r := apiPost(c, apiWith(map[string]any{"template": "Hi {{customer_name}}, {{product}} is discontinued."}), "t1")
+	r := hApiPost(c, hApiWith(map[string]any{"template": "Hi {{customer_name}}, {{product}} is discontinued."}), "t1")
 	ctx.Equal(r.Status, 409, "version 3 written again with other bytes: the store kept the first template, and the client was told its text is version 3")
-	ctx.Equal(apiStored(ctx, "t1", 3)["template"], apiGood["template"], "version 3 in the store")
-	replay := apiPost(c, apiGood, "t1")
+	ctx.Equal(hApiStored(ctx, "t1", 3)["template"], hApiGood["template"], "version 3 in the store")
+	replay := hApiPost(c, hApiGood, "t1")
 	ctx.Equal(replay.Status, 200, "a replay of version 3 with the same bytes (a client retrying after a timeout)")
-	body := apiBody(ctx, replay)
-	ctx.Assert(body["created"] == false && body["content_hash"] == apiBody(ctx, first)["content_hash"], "a replay answers the stored version with created false, got %s", replay.Text())
+	body := hApiBody(ctx, replay)
+	ctx.Assert(body["created"] == false && body["content_hash"] == hApiBody(ctx, first)["content_hash"], "a replay answers the stored version with created false, got %s", replay.Text())
 	// Another writer stores version 7 with other bytes after any lookup and before the write.
 	mine, theirs := "Hello {{customer_name}}, here is {{product}}.", "Hello {{customer_name}}, {{product}} is back."
 	key := "prompts:version:t1:support-reply:7"
-	rival, _ := json.Marshal(map[string]any{"name": "support-reply", "version": 7, "content_hash": apiSha(theirs), "template": theirs, "variables": []string{"customer_name", "product"}})
+	rival, _ := json.Marshal(map[string]any{"name": "support-reply", "version": 7, "content_hash": hApiSha(theirs), "template": theirs, "variables": []string{"customer_name", "product"}})
 	ctx.Redis.After(key, func() any { return ctx.Redis.Set(key, string(rival), "NX") })
-	raced := apiPost(c, apiWith(map[string]any{"version": 7, "template": mine}), "t1")
+	raced := hApiPost(c, hApiWith(map[string]any{"version": 7, "template": mine}), "t1")
 	kept, expected := "theirs", 409
-	if record := apiStored(ctx, "t1", 7); record != nil && record["template"] == mine {
+	if record := hApiStored(ctx, "t1", 7); record != nil && record["template"] == mine {
 		kept, expected = "yours", 201
 	}
 	ctx.Equal(raced.Status, expected, "version 7 raced another writer with other bytes and the store kept %s: the client would trust text the registry never stored", kept)
 }
 
 func CheckContentDedupe(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := apiPost(c, apiGood, "t1")
+	c := hApiClient(ctx)
+	first := hApiPost(c, hApiGood, "t1")
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	r := apiPost(c, apiWith(map[string]any{"version": 4}), "t1")
+	r := hApiPost(c, hApiWith(map[string]any{"version": 4}), "t1")
 	ctx.Equal(r.Status, 200, "the bytes of version 3 registered as version 4 must answer version 3: one template, one version")
-	body := apiBody(ctx, r)
+	body := hApiBody(ctx, r)
 	ctx.Assert(body["version"] == float64(3) && body["created"] == false, "the answer must be the existing version 3 with created false, got %s", r.Text())
-	ctx.Assert(apiStored(ctx, "t1", 4) == nil, "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing")
-	newline := apiPost(c, apiWith(map[string]any{"version": 5, "template": apiGood["template"].(string) + "\\n"}), "t1")
-	ctx.Assert(newline.Status == 201 && apiBody(ctx, newline)["content_hash"] == apiSha(apiGood["template"].(string)+"\\n"), "the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got %d: %s", newline.Status, newline.Text())
-	other := apiPost(c, apiWith(map[string]any{"version": 4}), "t2")
-	ctx.Assert(other.Status == 201 && apiBody(ctx, other)["version"] == float64(4), "another tenant registering the same bytes gets its own version (the store is per tenant), got %d: %s", other.Status, other.Text())
+	ctx.Assert(hApiStored(ctx, "t1", 4) == nil, "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing")
+	newline := hApiPost(c, hApiWith(map[string]any{"version": 5, "template": hApiGood["template"].(string) + "\\n"}), "t1")
+	ctx.Assert(newline.Status == 201 && hApiBody(ctx, newline)["content_hash"] == hApiSha(hApiGood["template"].(string)+"\\n"), "the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got %d: %s", newline.Status, newline.Text())
+	other := hApiPost(c, hApiWith(map[string]any{"version": 4}), "t2")
+	ctx.Assert(other.Status == 201 && hApiBody(ctx, other)["version"] == float64(4), "another tenant registering the same bytes gets its own version (the store is per tenant), got %d: %s", other.Status, other.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1153,33 +1153,33 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGood = {{"name", "support-reply"},
+const json kHGood = {{"name", "support-reply"},
                     {"version", 3},
                     {"template", "Hi {{customer_name}}, thanks for asking about {{product}}."},
                     {"variables", {"customer_name", "product"}}};
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& tenant = "t1") {
     return http.Post("/v1/prompts", body.dump(), "X-Tenant-Id", tenant);
   }
 };
 
-json with(json body, const json& overrides) {
+json hWith(json body, const json& overrides) {
   for (const auto& [key, value] : overrides.items()) body[key] = value;
   return body;
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
 }
 
-std::optional<json> stored(harness::Ctx& ctx, const std::string& tenant, int version) {
+std::optional<json> hStored(harness::Ctx& ctx, const std::string& tenant, int version) {
   const auto raw = ctx.Redis.Get("prompts:version:" + tenant + ":support-reply:" + std::to_string(version));
   if (!raw) return std::nullopt;
   return json::parse(*raw, nullptr, false);
@@ -1188,37 +1188,37 @@ std::optional<json> stored(harness::Ctx& ctx, const std::string& tenant, int ver
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HApi api(ctx);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 201, "a valid registration (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Equal(body.value("name", ""), "support-reply", "the 201 body's name (%s)", r.Text());
   ctx.Equal(body.value("version", 0), 3, "the 201 body's version (%s)", r.Text());
-  ctx.Equal(body.value("content_hash", ""), sha256_hex(kGood["template"].get<std::string>()), "the 201 body's content_hash, the SHA-256 of the template");
+  ctx.Equal(body.value("content_hash", ""), sha256_hex(kHGood["template"].get<std::string>()), "the 201 body's content_hash, the SHA-256 of the template");
   ctx.Equal(body.contains("variables") ? body["variables"] : json(), json({"customer_name", "product"}), "the 201 body's variables");
   ctx.Equal(body.value("created", false), true, "the 201 body's created");
-  const auto record = stored(ctx, "t1", 3);
-  ctx.Assert(record && record->value("template", "") == kGood["template"].get<std::string>(), "version 3 must be in the version store (prompts:version:t1:support-reply:3)");
-  const auto noTenant = api.http.Post("/v1/prompts", kGood.dump());
+  const auto record = hStored(ctx, "t1", 3);
+  ctx.Assert(record && record->value("template", "") == kHGood["template"].get<std::string>(), "version 3 must be in the version store (prompts:version:t1:support-reply:3)");
+  const auto noTenant = api.http.Post("/v1/prompts", kHGood.dump());
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the registration");
 }
 
 void CheckTemplateCap(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   std::string accented;
   for (int i = 0; i < 16 * 1024 + 1; i++) accented += "é";
   const std::vector<std::string> templates = {std::string(32 * 1024 + 1, 'x'), accented};
   for (size_t n = 0; n < templates.size(); n++) {
-    const auto r = api.post(with(kGood, {{"version", 10 + static_cast<int>(n)}, {"template", templates[n]}, {"variables", json::array()}}));
+    const auto r = api.post(hWith(kHGood, {{"version", 10 + static_cast<int>(n)}, {"template", templates[n]}, {"variables", json::array()}}));
     ctx.Equal(r.Status, 413, "a template of %d bytes: the cap is 32 KiB of UTF-8 bytes", templates[n].size());
   }
   ctx.Equal(ctx.Redis.Keys("prompts:*").size(), 0, "a refused template must store nothing (%v); keys", ctx.Redis.Keys("prompts:*"));
-  const auto r = api.post(with(kGood, {{"version", 12}, {"template", std::string(32 * 1024, 'y')}, {"variables", json::array()}}));
+  const auto r = api.post(hWith(kHGood, {{"version", 12}, {"template", std::string(32 * 1024, 'y')}, {"variables", json::array()}}));
   ctx.Equal(r.Status, 201, "a template of exactly 32 KiB is within the cap (%s)", r.Text());
 }
 
 void CheckPlaceholderAllowlist(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   struct Case {
     std::string template_text;
     std::vector<std::string> variables;
@@ -1231,28 +1231,28 @@ void CheckPlaceholderAllowlist(harness::Ctx& ctx) {
       {"Hi {{customer_name}}.", {"customer_name", "tone"}, "a declared variable the template never uses"},
   };
   for (size_t n = 0; n < cases.size(); n++) {
-    const auto r = api.post(with(kGood, {{"version", 20 + static_cast<int>(n)}, {"template", cases[n].template_text}, {"variables", cases[n].variables}}));
+    const auto r = api.post(hWith(kHGood, {{"version", 20 + static_cast<int>(n)}, {"template", cases[n].template_text}, {"variables", cases[n].variables}}));
     ctx.Equal(r.Status, 422, "%s (%q declares %v)", cases[n].what, cases[n].template_text, cases[n].variables);
   }
   ctx.Equal(ctx.Redis.Keys("prompts:*").size(), 0, "a refused registration must store nothing (%v); keys", ctx.Redis.Keys("prompts:*"));
-  const auto r = api.post(with(kGood, {{"version", 30}, {"template", "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end."}, {"variables", {"tone", "question"}}}));
+  const auto r = api.post(hWith(kHGood, {{"version", 30}, {"template", "Answer {{question}} in a {{tone}} tone, and keep the {{tone}} to the end."}, {"variables", {"tone", "question"}}}));
   ctx.Equal(r.Status, 201, "placeholders equal to the declared variables, all allowed, must register, a placeholder used twice included (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Equal(body.contains("variables") ? body["variables"] : json(), json({"question", "tone"}), "the variables come back sorted");
 }
 
 void CheckImmutable(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto first = api.post(kGood);
+  HApi api(ctx);
+  const auto first = api.post(kHGood);
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const auto r = api.post(with(kGood, {{"template", "Hi {{customer_name}}, {{product}} is discontinued."}}));
+  const auto r = api.post(hWith(kHGood, {{"template", "Hi {{customer_name}}, {{product}} is discontinued."}}));
   ctx.Equal(r.Status, 409, "version 3 written again with other bytes: the store kept the first template, and the client was told its text is version 3");
-  const auto record = stored(ctx, "t1", 3);
-  ctx.Equal(record ? record->value("template", "") : "", kGood["template"].get<std::string>(), "version 3 in the store");
-  const auto replay = api.post(kGood);
+  const auto record = hStored(ctx, "t1", 3);
+  ctx.Equal(record ? record->value("template", "") : "", kHGood["template"].get<std::string>(), "version 3 in the store");
+  const auto replay = api.post(kHGood);
   ctx.Equal(replay.Status, 200, "a replay of version 3 with the same bytes (a client retrying after a timeout)");
-  const json body = bodyOf(ctx, replay);
-  ctx.Assert(body.value("created", true) == false && body.value("content_hash", "") == bodyOf(ctx, first).value("content_hash", "-"),
+  const json body = hBodyOf(ctx, replay);
+  ctx.Assert(body.value("created", true) == false && body.value("content_hash", "") == hBodyOf(ctx, first).value("content_hash", "-"),
              "a replay answers the stored version with created false, got %s", replay.Text());
   // Another writer stores version 7 with other bytes after any lookup and before the write.
   const std::string mine = "Hello {{customer_name}}, here is {{product}}.";
@@ -1260,28 +1260,28 @@ void CheckImmutable(harness::Ctx& ctx) {
   const std::string key = "prompts:version:t1:support-reply:7";
   const json rival = {{"name", "support-reply"}, {"version", 7}, {"content_hash", sha256_hex(theirs)}, {"template", theirs}, {"variables", {"customer_name", "product"}}};
   ctx.Redis.After(key, [&] { ctx.Redis.Set(key, rival.dump(), "NX"); });
-  const auto raced = api.post(with(kGood, {{"version", 7}, {"template", mine}}));
-  const auto kept = stored(ctx, "t1", 7);
+  const auto raced = api.post(hWith(kHGood, {{"version", 7}, {"template", mine}}));
+  const auto kept = hStored(ctx, "t1", 7);
   const bool yours = kept && kept->value("template", "") == mine;
   ctx.Equal(raced.Status, yours ? 201 : 409, "version 7 raced another writer with other bytes and the store kept %s: the client would trust text the registry never stored",
             std::string(yours ? "yours" : "theirs"));
 }
 
 void CheckContentDedupe(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto first = api.post(kGood);
+  HApi api(ctx);
+  const auto first = api.post(kHGood);
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const auto r = api.post(with(kGood, {{"version", 4}}));
+  const auto r = api.post(hWith(kHGood, {{"version", 4}}));
   ctx.Equal(r.Status, 200, "the bytes of version 3 registered as version 4 must answer version 3: one template, one version");
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Assert(body.value("version", 0) == 3 && body.value("created", true) == false, "the answer must be the existing version 3 with created false, got %s", r.Text());
-  ctx.Assert(!stored(ctx, "t1", 4), "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing");
-  const std::string newline = kGood["template"].get<std::string>() + "\\n";
-  const auto fresh = api.post(with(kGood, {{"version", 5}, {"template", newline}}));
-  ctx.Assert(fresh.Status == 201 && bodyOf(ctx, fresh).value("content_hash", "") == sha256_hex(newline),
+  ctx.Assert(!hStored(ctx, "t1", 4), "version 4 was stored with the bytes of version 3: two numbers now name one template, and a rollback from 4 to 3 changes nothing");
+  const std::string newline = kHGood["template"].get<std::string>() + "\\n";
+  const auto fresh = api.post(hWith(kHGood, {{"version", 5}, {"template", newline}}));
+  ctx.Assert(fresh.Status == 201 && hBodyOf(ctx, fresh).value("content_hash", "") == sha256_hex(newline),
              "the template of version 3 plus a trailing newline is other bytes, a new version with its own SHA-256, got %d: %s", fresh.Status, fresh.Text());
-  const auto other = api.post(with(kGood, {{"version", 4}}), "t2");
-  ctx.Assert(other.Status == 201 && bodyOf(ctx, other).value("version", 0) == 4,
+  const auto other = api.post(hWith(kHGood, {{"version", 4}}), "t2");
+  ctx.Assert(other.Status == 201 && hBodyOf(ctx, other).value("version", 0) == 4,
              "another tenant registering the same bytes gets its own version (the store is per tenant), got %d: %s", other.Status, other.Text());
 }
 `,

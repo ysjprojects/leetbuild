@@ -577,24 +577,24 @@ import (
 )
 
 const (
-	readText  = "Rotate keys every 90 days."
-	readOther = "Revoke a leaked key at once."
+	kHReadText  = "Rotate keys every 90 days."
+	kHReadOther = "Revoke a leaked key at once."
 )
 
-func readSeed(ctx *harness.Ctx, tenant, version, text string) []float32 {
+func hReadSeed(ctx *harness.Ctx, tenant, version, text string) []float32 {
 	vector := model.VectorFor(version, text)
 	doc, _ := json.Marshal(vector)
 	ctx.Redis.Set(config.VectorKey(tenant, version, config.ContentHash(text)), string(doc), "EX", config.VectorTTLSeconds)
 	return vector
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, text, tenant, version string) *harness.Response {
+func hReadGet(c *harness.HTTP, text, tenant, version string) *harness.Response {
 	path := "/v1/embeddings/" + config.ContentHash(text)
 	if version != "" {
 		path += "?model_version=" + version
@@ -605,60 +605,60 @@ func readGet(c *harness.HTTP, text, tenant, version string) *harness.Response {
 	return c.Get(path, "X-Tenant-Id", tenant)
 }
 
-type readBody struct {
+type HReadBody struct {
 	Error        string    \`json:"error"\`
 	ModelVersion string    \`json:"model_version"\`
 	Dimension    int       \`json:"dimension"\`
 	Vector       []float32 \`json:"vector"\`
 }
 
-func readDecode(r *harness.Response) readBody {
-	var body readBody
+func hReadDecode(r *harness.Response) HReadBody {
+	var body HReadBody
 	json.Unmarshal(r.Body, &body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	vector := readSeed(ctx, "acme", config.ModelVersion, readText)
-	r := readGet(readAPI(ctx), readText, "acme", "")
+	vector := hReadSeed(ctx, "acme", config.ModelVersion, kHReadText)
+	r := hReadGet(hReadAPI(ctx), kHReadText, "acme", "")
 	ctx.Equal(r.Status, 200, "GET /v1/embeddings/{hash} of a cached vector (%s)", r.Text())
-	ctx.Equal(readDecode(r).Vector, vector, "the read must answer the stored vector")
+	ctx.Equal(hReadDecode(r).Vector, vector, "the read must answer the stored vector")
 }
 
 func CheckTenantRequired(ctx *harness.Ctx) {
-	readSeed(ctx, "acme", config.ModelVersion, readText)
-	c := readAPI(ctx)
-	r := readGet(c, readText, "", "")
+	hReadSeed(ctx, "acme", config.ModelVersion, kHReadText)
+	c := hReadAPI(ctx)
+	r := hReadGet(c, kHReadText, "", "")
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id must be 401 (%s)", r.Text())
-	empty := c.Get("/v1/embeddings/"+config.ContentHash(readText), "X-Tenant-Id", "")
+	empty := c.Get("/v1/embeddings/"+config.ContentHash(kHReadText), "X-Tenant-Id", "")
 	ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text())
 }
 
 func CheckExactKey(ctx *harness.Ctx) {
-	readSeed(ctx, "acme", config.ModelVersion, readText)
-	v1 := readSeed(ctx, "acme", config.PreviousVersion, readOther)
-	c := readAPI(ctx)
-	otherTenant := readGet(c, readText, "globex", "")
+	hReadSeed(ctx, "acme", config.ModelVersion, kHReadText)
+	v1 := hReadSeed(ctx, "acme", config.PreviousVersion, kHReadOther)
+	c := hReadAPI(ctx)
+	otherTenant := hReadGet(c, kHReadText, "globex", "")
 	ctx.Assert(otherTenant.Status == 404, "globex read acme's vector by its hash (%d %s): the read must be the exact key of the caller's tenant", otherTenant.Status, otherTenant.Text())
-	newer := readGet(c, readOther, "acme", "")
+	newer := hReadGet(c, kHReadOther, "acme", "")
 	ctx.Assert(newer.Status == 404, "an embed-v2 read of a text cached only under embed-v1 answered %d %s: a vector from another model is not this model's vector", newer.Status, newer.Text())
-	older := readGet(c, readOther, "acme", config.PreviousVersion)
+	older := hReadGet(c, kHReadOther, "acme", config.PreviousVersion)
 	ctx.Equal(older.Status, 200, "?model_version=embed-v1 must answer the embed-v1 vector (%s)", older.Text())
-	ctx.Equal(readDecode(older).Vector, v1, "the embed-v1 vector")
+	ctx.Equal(hReadDecode(older).Vector, v1, "the embed-v1 vector")
 }
 
 func CheckMiss404(ctx *harness.Ctx) {
-	r := readGet(readAPI(ctx), "Never embedded.", "acme", "")
+	r := hReadGet(hReadAPI(ctx), "Never embedded.", "acme", "")
 	ctx.Assert(r.Status == 404, "a hash with no vector answered %d %s: a miss is 404, and a 200 with [] gets cached as a real vector", r.Status, r.Text())
-	ctx.Equal(readDecode(r).Error, "not_embedded", "the 404's error")
+	ctx.Equal(hReadDecode(r).Error, "not_embedded", "the 404's error")
 }
 
 func CheckReportsShape(ctx *harness.Ctx) {
-	readSeed(ctx, "acme", config.ModelVersion, readText)
-	readSeed(ctx, "acme", config.PreviousVersion, readOther)
-	c := readAPI(ctx)
-	current := readDecode(readGet(c, readText, "acme", ""))
-	older := readDecode(readGet(c, readOther, "acme", config.PreviousVersion))
+	hReadSeed(ctx, "acme", config.ModelVersion, kHReadText)
+	hReadSeed(ctx, "acme", config.PreviousVersion, kHReadOther)
+	c := hReadAPI(ctx)
+	current := hReadDecode(hReadGet(c, kHReadText, "acme", ""))
+	older := hReadDecode(hReadGet(c, kHReadOther, "acme", config.PreviousVersion))
 	ctx.Assert(current.ModelVersion == config.ModelVersion && current.Dimension == 8, "a hit must carry model_version=embed-v2 and dimension=8, got %+v", current)
 	ctx.Assert(older.ModelVersion == config.PreviousVersion && older.Dimension == 4, "an embed-v1 hit must carry model_version=embed-v1 and dimension=4, got %+v", older)
 }
@@ -675,16 +675,16 @@ func CheckReportsShape(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Rotate keys every 90 days.";
-const std::string kOther = "Revoke a leaked key at once.";
+const std::string kHText = "Rotate keys every 90 days.";
+const std::string kHOther = "Revoke a leaked key at once.";
 
-std::vector<float> seed(harness::Ctx& ctx, const std::string& tenant, const std::string& version, const std::string& text) {
+std::vector<float> hSeed(harness::Ctx& ctx, const std::string& tenant, const std::string& version, const std::string& text) {
   const auto vector = model::vectorFor(version, text);
   ctx.Redis.Set(config::vectorKey(tenant, version, config::contentHash(text)), nlohmann::json(vector).dump(), "EX", config::kVectorTtlSeconds);
   return vector;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -692,60 +692,60 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response get(harness::HTTP& c, const std::string& text, const std::string& tenant, const std::string& version = "") {
+harness::Response hGet(harness::HTTP& c, const std::string& text, const std::string& tenant, const std::string& version = "") {
   std::string path = "/v1/embeddings/" + config::contentHash(text);
   if (!version.empty()) path += "?model_version=" + version;
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json parsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hParsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const auto vector = seed(ctx, "acme", config::kModelVersion, kText);
-  auto c = api(ctx);
-  const auto r = get(c, kText, "acme");
+  const auto vector = hSeed(ctx, "acme", config::kModelVersion, kHText);
+  auto c = hApi(ctx);
+  const auto r = hGet(c, kHText, "acme");
   ctx.Equal(r.Status, 200, "GET /v1/embeddings/{hash} of a cached vector (%s)", r.Text());
-  ctx.Equal(parsed(r).value("vector", nlohmann::json::array()), nlohmann::json(vector), "the read must answer the stored vector");
+  ctx.Equal(hParsed(r).value("vector", nlohmann::json::array()), nlohmann::json(vector), "the read must answer the stored vector");
 }
 
 void CheckTenantRequired(harness::Ctx& ctx) {
-  seed(ctx, "acme", config::kModelVersion, kText);
-  auto c = api(ctx);
-  const auto r = get(c, kText, "");
+  hSeed(ctx, "acme", config::kModelVersion, kHText);
+  auto c = hApi(ctx);
+  const auto r = hGet(c, kHText, "");
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id must be 401 (%s)", r.Text());
-  const auto empty = c.Get("/v1/embeddings/" + config::contentHash(kText), "X-Tenant-Id", "");
+  const auto empty = c.Get("/v1/embeddings/" + config::contentHash(kHText), "X-Tenant-Id", "");
   ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text());
 }
 
 void CheckExactKey(harness::Ctx& ctx) {
-  seed(ctx, "acme", config::kModelVersion, kText);
-  const auto v1 = seed(ctx, "acme", config::kPreviousVersion, kOther);
-  auto c = api(ctx);
-  const auto other_tenant = get(c, kText, "globex");
+  hSeed(ctx, "acme", config::kModelVersion, kHText);
+  const auto v1 = hSeed(ctx, "acme", config::kPreviousVersion, kHOther);
+  auto c = hApi(ctx);
+  const auto other_tenant = hGet(c, kHText, "globex");
   ctx.Assert(other_tenant.Status == 404, "globex read acme's vector by its hash (%d %s): the read must be the exact key of the caller's tenant", other_tenant.Status, other_tenant.Text());
-  const auto newer = get(c, kOther, "acme");
+  const auto newer = hGet(c, kHOther, "acme");
   ctx.Assert(newer.Status == 404, "an embed-v2 read of a text cached only under embed-v1 answered %d %s: a vector from another model is not this model's vector", newer.Status, newer.Text());
-  const auto older = get(c, kOther, "acme", config::kPreviousVersion);
+  const auto older = hGet(c, kHOther, "acme", config::kPreviousVersion);
   ctx.Equal(older.Status, 200, "?model_version=embed-v1 must answer the embed-v1 vector (%s)", older.Text());
-  ctx.Equal(parsed(older).value("vector", nlohmann::json::array()), nlohmann::json(v1), "the embed-v1 vector");
+  ctx.Equal(hParsed(older).value("vector", nlohmann::json::array()), nlohmann::json(v1), "the embed-v1 vector");
 }
 
 void CheckMiss404(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = get(c, "Never embedded.", "acme");
+  auto c = hApi(ctx);
+  const auto r = hGet(c, "Never embedded.", "acme");
   ctx.Assert(r.Status == 404, "a hash with no vector answered %d %s: a miss is 404, and a 200 with [] gets cached as a real vector", r.Status, r.Text());
-  ctx.Equal(parsed(r).value("error", ""), "not_embedded", "the 404's error");
+  ctx.Equal(hParsed(r).value("error", ""), "not_embedded", "the 404's error");
 }
 
 void CheckReportsShape(harness::Ctx& ctx) {
-  seed(ctx, "acme", config::kModelVersion, kText);
-  seed(ctx, "acme", config::kPreviousVersion, kOther);
-  auto c = api(ctx);
-  const auto current = parsed(get(c, kText, "acme"));
-  const auto older = parsed(get(c, kOther, "acme", config::kPreviousVersion));
+  hSeed(ctx, "acme", config::kModelVersion, kHText);
+  hSeed(ctx, "acme", config::kPreviousVersion, kHOther);
+  auto c = hApi(ctx);
+  const auto current = hParsed(hGet(c, kHText, "acme"));
+  const auto older = hParsed(hGet(c, kHOther, "acme", config::kPreviousVersion));
   ctx.Assert(current.value("model_version", "") == config::kModelVersion && current.value("dimension", 0) == 8, "a hit must carry model_version=embed-v2 and dimension=8, got %v", current);
   ctx.Assert(older.value("model_version", "") == config::kPreviousVersion && older.value("dimension", 0) == 4, "an embed-v1 hit must carry model_version=embed-v1 and dimension=4, got %v", older);
 }

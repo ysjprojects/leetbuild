@@ -887,44 +887,44 @@ import (
 	"leetbuild/harness"
 )
 
-const readBatch = "b1"
+const kHReadBatch = "b1"
 
 // readSeed is a batch of t1's as steps 1, 2 and 4 leave it: the job, the shard set, the pending list,
 // the folded outputs and totals.
-func readSeed(ctx *harness.Ctx, states []string, completed, failed int, outputs []int) {
-	job, _ := json.Marshal(map[string]any{"batch_id": readBatch, "status": "queued", "model": "sum-v7", "manifest_uri": "s3://acme/in.jsonl", "record_count": 2500, "shards": len(states), "tenant": "t1"})
-	ctx.Redis.Set("batch:job:"+readBatch, string(job))
-	ctx.Redis.Del("batch:pending:" + readBatch)
+func hReadSeed(ctx *harness.Ctx, states []string, completed, failed int, outputs []int) {
+	job, _ := json.Marshal(map[string]any{"batch_id": kHReadBatch, "status": "queued", "model": "sum-v7", "manifest_uri": "s3://acme/in.jsonl", "record_count": 2500, "shards": len(states), "tenant": "t1"})
+	ctx.Redis.Set("batch:job:"+kHReadBatch, string(job))
+	ctx.Redis.Del("batch:pending:" + kHReadBatch)
 	for i, s := range states {
-		ctx.Redis.Do("HSET", "batch:shards:"+readBatch, strconv.Itoa(i), s)
+		ctx.Redis.Do("HSET", "batch:shards:"+kHReadBatch, strconv.Itoa(i), s)
 		if s == "pending" {
-			ctx.Redis.Do("RPUSH", "batch:pending:"+readBatch, strconv.Itoa(i))
+			ctx.Redis.Do("RPUSH", "batch:pending:"+kHReadBatch, strconv.Itoa(i))
 		}
 	}
 	for _, shard := range outputs {
-		entry, _ := json.Marshal(map[string]any{"uri": fmt.Sprintf("s3://batch-outputs/%s/shard-%05d.jsonl", readBatch, shard), "checksum": fmt.Sprintf("c%d", shard), "completed": 998, "failed": 2})
-		ctx.Redis.Do("HSET", "batch:outputs:"+readBatch, strconv.Itoa(shard), string(entry))
+		entry, _ := json.Marshal(map[string]any{"uri": fmt.Sprintf("s3://batch-outputs/%s/shard-%05d.jsonl", kHReadBatch, shard), "checksum": fmt.Sprintf("c%d", shard), "completed": 998, "failed": 2})
+		ctx.Redis.Do("HSET", "batch:outputs:"+kHReadBatch, strconv.Itoa(shard), string(entry))
 	}
-	ctx.Redis.Do("HSET", "batch:totals:"+readBatch, "completed", completed, "failed", failed)
+	ctx.Redis.Do("HSET", "batch:totals:"+kHReadBatch, "completed", completed, "failed", failed)
 }
 
-func readGet(ctx *harness.Ctx, batchID string, header ...string) *harness.Response {
+func hReadGet(ctx *harness.Ctx, batchID string, header ...string) *harness.Response {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux).Get("/v1/batches/"+batchID, header...)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, []string{"done", "running", "pending"}, 998, 2, []int{0})
-	r := readGet(ctx, readBatch, "X-Tenant-Id", "t1")
+	hReadSeed(ctx, []string{"done", "running", "pending"}, 998, 2, []int{0})
+	r := hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "reading the batch (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	for _, key := range []string{"batch_id", "status", "model", "shards", "request_counts", "outputs"} {
 		_, ok := body[key]
 		ctx.Assert(ok, "the body lacks %s: %s", key, r.Text())
@@ -934,14 +934,14 @@ func CheckRoute(ctx *harness.Ctx) {
 	counts, _ := body["request_counts"].(map[string]any)
 	ctx.Equal(counts["total"], float64(2500), "request_counts.total is the batch's record_count")
 	ctx.Equal(body["outputs"], []any{map[string]any{"shard_id": float64(0), "uri": "s3://batch-outputs/b1/shard-00000.jsonl", "checksum": "c0"}}, "the outputs are the folded entries with their checksums")
-	ctx.Equal(readGet(ctx, "nope", "X-Tenant-Id", "t1").Status, 404, "an unknown batch id")
-	ctx.Equal(readGet(ctx, readBatch).Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(hReadGet(ctx, "nope", "X-Tenant-Id", "t1").Status, 404, "an unknown batch id")
+	ctx.Equal(hReadGet(ctx, kHReadBatch).Status, 401, "a read without X-Tenant-Id")
 	all := make([]int, 11)
 	for i := range all {
 		all[i] = i
 	}
-	readSeed(ctx, []string{"done", "done", "done", "done", "done", "done", "done", "done", "done", "done", "done"}, 0, 0, all)
-	outputs, _ := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))["outputs"].([]any)
+	hReadSeed(ctx, []string{"done", "done", "done", "done", "done", "done", "done", "done", "done", "done", "done"}, 0, 0, all)
+	outputs, _ := hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))["outputs"].([]any)
 	shardIDs := []any{}
 	for _, o := range outputs {
 		entry, _ := o.(map[string]any)
@@ -955,45 +955,45 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	readSeed(ctx, []string{"done", "done"}, 2000, 0, []int{0, 1})
-	r := readGet(ctx, readBatch, "X-Tenant-Id", "t2")
+	hReadSeed(ctx, []string{"done", "done"}, 2000, 0, []int{0, 1})
+	r := hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 read t1's batch: a batch id is not a secret, another tenant's batch must be 404 as an unknown id is")
-	ctx.Equal(readGet(ctx, readBatch, "X-Tenant-Id", "t1").Status, 200, "the batch's own tenant reads it")
-	foreign := readGet(ctx, readBatch, "X-Tenant-Id", "t2").Text()
-	unknown := readGet(ctx, "nope", "X-Tenant-Id", "t2").Text()
+	ctx.Equal(hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1").Status, 200, "the batch's own tenant reads it")
+	foreign := hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t2").Text()
+	unknown := hReadGet(ctx, "nope", "X-Tenant-Id", "t2").Text()
 	ctx.Assert(foreign == unknown, "another tenant's batch answered %q and an unknown id %q: the two answers must be the same, or the difference tells t2 which ids exist", foreign, unknown)
 }
 
 func CheckRunningNotFinished(ctx *harness.Ctx) {
-	readSeed(ctx, []string{"done", "running", "running"}, 998, 2, []int{0})
-	body := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"done", "running", "running"}, 998, 2, []int{0})
+	body := hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "in_progress", "with two shards still running the batch is in_progress (an empty pending list means every shard was claimed, not finished); status")
 	shards, _ := body["shards"].(map[string]any)
 	ctx.Equal(shards["running"], float64(2), "two shards are running")
-	readSeed(ctx, []string{"done", "done", "pending"}, 998, 2, []int{0}) // shard 2 requeued by the reaper: nothing runs, one shard waits
-	body = readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"done", "done", "pending"}, 998, 2, []int{0}) // shard 2 requeued by the reaper: nothing runs, one shard waits
+	body = hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "in_progress", "with shard 2 back on the pending list the batch is in_progress (a pending shard is unfinished work); status")
 }
 
 func CheckFailuresPartial(ctx *harness.Ctx) {
-	readSeed(ctx, []string{"done", "done", "failed"}, 1996, 4, []int{0, 1})
-	body := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"done", "done", "failed"}, 1996, 4, []int{0, 1})
+	body := hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "partial", "every shard is terminal and one failed: the batch is partial; status")
-	readSeed(ctx, []string{"done", "failed", "running"}, 998, 2, []int{0})
-	body = readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"done", "failed", "running"}, 998, 2, []int{0})
+	body = hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "in_progress", "a shard failed but another still runs: the batch is in_progress until every shard is terminal; status")
-	readSeed(ctx, []string{"done", "done", "done"}, 2497, 3, []int{0, 1, 2})
-	body = readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"done", "done", "done"}, 2497, 3, []int{0, 1, 2})
+	body = hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["status"], "completed", "every shard done is completed; status")
 }
 
 func CheckRecordCounts(ctx *harness.Ctx) {
-	readSeed(ctx, []string{"pending", "pending", "pending"}, 0, 0, nil)
-	ctx.Redis.Del("batch:totals:" + readBatch)
-	fresh := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"pending", "pending", "pending"}, 0, 0, nil)
+	ctx.Redis.Del("batch:totals:" + kHReadBatch)
+	fresh := hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(fresh["request_counts"], map[string]any{"total": float64(2500), "completed": float64(0), "failed": float64(0)}, "a batch with nothing folded yet (no batch:totals) reports completed 0 and failed 0; request_counts")
-	readSeed(ctx, []string{"done", "done", "done"}, 2497, 3, []int{0, 1, 2})
-	body := readBody(ctx, readGet(ctx, readBatch, "X-Tenant-Id", "t1"))
+	hReadSeed(ctx, []string{"done", "done", "done"}, 2497, 3, []int{0, 1, 2})
+	body := hReadBody(ctx, hReadGet(ctx, kHReadBatch, "X-Tenant-Id", "t1"))
 	ctx.Equal(body["request_counts"], map[string]any{"total": float64(2500), "completed": float64(2497), "failed": float64(3)}, "request_counts must be the batch's 2500 records with the folded totals (shard counts times ShardSize invent records)")
 }
 `,
@@ -1009,32 +1009,32 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kBatch = "b1";
+const std::string kHBatch = "b1";
 
 // A batch of t1's as steps 1, 2 and 4 leave it: the job, the shard set, the pending list, the folded
 // outputs and totals.
-void readSeed(harness::Ctx& ctx, const std::vector<std::string>& states, long long completed, long long failed, const std::vector<int>& outputs) {
-  ctx.Redis.Set("batch:job:" + kBatch, json{{"batch_id", kBatch}, {"status", "queued"}, {"model", "sum-v7"}, {"manifest_uri", "s3://acme/in.jsonl"}, {"record_count", 2500}, {"shards", states.size()}, {"tenant", "t1"}}.dump());
-  ctx.Redis.Del("batch:pending:" + kBatch);
+void hReadSeed(harness::Ctx& ctx, const std::vector<std::string>& states, long long completed, long long failed, const std::vector<int>& outputs) {
+  ctx.Redis.Set("batch:job:" + kHBatch, json{{"batch_id", kHBatch}, {"status", "queued"}, {"model", "sum-v7"}, {"manifest_uri", "s3://acme/in.jsonl"}, {"record_count", 2500}, {"shards", states.size()}, {"tenant", "t1"}}.dump());
+  ctx.Redis.Del("batch:pending:" + kHBatch);
   for (size_t i = 0; i < states.size(); i++) {
-    ctx.Redis.Do("HSET", "batch:shards:" + kBatch, std::to_string(i), states[i]);
-    if (states[i] == "pending") ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, std::to_string(i));
+    ctx.Redis.Do("HSET", "batch:shards:" + kHBatch, std::to_string(i), states[i]);
+    if (states[i] == "pending") ctx.Redis.Do("RPUSH", "batch:pending:" + kHBatch, std::to_string(i));
   }
   for (int shard : outputs) {
     char uri[64];
     std::snprintf(uri, sizeof uri, "s3://batch-outputs/b1/shard-%05d.jsonl", shard);
-    ctx.Redis.Do("HSET", "batch:outputs:" + kBatch, std::to_string(shard), json{{"uri", uri}, {"checksum", "c" + std::to_string(shard)}, {"completed", 998}, {"failed", 2}}.dump());
+    ctx.Redis.Do("HSET", "batch:outputs:" + kHBatch, std::to_string(shard), json{{"uri", uri}, {"checksum", "c" + std::to_string(shard)}, {"completed", 998}, {"failed", 2}}.dump());
   }
-  ctx.Redis.Do("HSET", "batch:totals:" + kBatch, "completed", completed, "failed", failed);
+  ctx.Redis.Do("HSET", "batch:totals:" + kHBatch, "completed", completed, "failed", failed);
 }
 
-struct Read {
+struct HRead {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Read(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HRead(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 };
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
@@ -1043,72 +1043,72 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readSeed(ctx, {"done", "running", "pending"}, 998, 2, {0});
-  Read read(ctx);
-  const auto r = read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1");
+  hReadSeed(ctx, {"done", "running", "pending"}, 998, 2, {0});
+  HRead read(ctx);
+  const auto r = read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "reading the batch (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   for (const char* key : {"batch_id", "status", "model", "shards", "request_counts", "outputs"}) ctx.Assert(body.contains(key), "the body lacks %s: %s", key, r.Text());
   ctx.Equal(body["status"], "in_progress", "a batch with a running and a pending shard is in_progress; status");
   ctx.Equal(body["shards"], json{{"total", 3}, {"pending", 1}, {"running", 1}, {"done", 1}, {"failed", 0}}, "the shard counts come from the shard set");
   ctx.Equal(body["request_counts"].value("total", -1), 2500, "request_counts.total is the batch's record_count");
   ctx.Equal(body["outputs"], json::array({json{{"shard_id", 0}, {"uri", "s3://batch-outputs/b1/shard-00000.jsonl"}, {"checksum", "c0"}}}), "the outputs are the folded entries with their checksums");
   ctx.Equal(read.http.Get("/v1/batches/nope", "X-Tenant-Id", "t1").Status, 404, "an unknown batch id");
-  ctx.Equal(read.http.Get("/v1/batches/" + kBatch).Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(read.http.Get("/v1/batches/" + kHBatch).Status, 401, "a read without X-Tenant-Id");
   std::vector<int> all;
   json want = json::array();
   for (int i = 0; i < 11; i++) {
     all.push_back(i);
     want.push_back(i);
   }
-  readSeed(ctx, std::vector<std::string>(11, "done"), 0, 0, all);
+  hReadSeed(ctx, std::vector<std::string>(11, "done"), 0, 0, all);
   json shardIds = json::array();
-  for (const auto& o : bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1")).value("outputs", json::array())) shardIds.push_back(o.value("shard_id", json()));
+  for (const auto& o : hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1")).value("outputs", json::array())) shardIds.push_back(o.value("shard_id", json()));
   ctx.Equal(shardIds, want, "the outputs of an 11-shard batch come by shard number, 0 to 10; shard ids");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  readSeed(ctx, {"done", "done"}, 2000, 0, {0, 1});
-  Read read(ctx);
-  ctx.Equal(read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t2").Status, 404, "tenant t2 read t1's batch: a batch id is not a secret, another tenant's batch must be 404 as an unknown id is");
-  ctx.Equal(read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1").Status, 200, "the batch's own tenant reads it");
-  const auto foreign = read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t2").Text();
+  hReadSeed(ctx, {"done", "done"}, 2000, 0, {0, 1});
+  HRead read(ctx);
+  ctx.Equal(read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t2").Status, 404, "tenant t2 read t1's batch: a batch id is not a secret, another tenant's batch must be 404 as an unknown id is");
+  ctx.Equal(read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1").Status, 200, "the batch's own tenant reads it");
+  const auto foreign = read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t2").Text();
   const auto unknown = read.http.Get("/v1/batches/nope", "X-Tenant-Id", "t2").Text();
   ctx.Assert(foreign == unknown, "another tenant's batch answered %q and an unknown id %q: the two answers must be the same, or the difference tells t2 which ids exist", foreign, unknown);
 }
 
 void CheckRunningNotFinished(harness::Ctx& ctx) {
-  readSeed(ctx, {"done", "running", "running"}, 998, 2, {0});
-  Read read(ctx);
-  const json body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  hReadSeed(ctx, {"done", "running", "running"}, 998, 2, {0});
+  HRead read(ctx);
+  const json body = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "in_progress", "with two shards still running the batch is in_progress (an empty pending list means every shard was claimed, not finished); status");
   ctx.Equal(body["shards"].value("running", -1), 2, "two shards are running");
-  readSeed(ctx, {"done", "done", "pending"}, 998, 2, {0});  // shard 2 requeued by the reaper: nothing runs, one shard waits
-  const json requeued = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  hReadSeed(ctx, {"done", "done", "pending"}, 998, 2, {0});  // shard 2 requeued by the reaper: nothing runs, one shard waits
+  const json requeued = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(requeued.value("status", ""), "in_progress", "with shard 2 back on the pending list the batch is in_progress (a pending shard is unfinished work); status");
 }
 
 void CheckFailuresPartial(harness::Ctx& ctx) {
-  readSeed(ctx, {"done", "done", "failed"}, 1996, 4, {0, 1});
-  Read read(ctx);
-  json body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  hReadSeed(ctx, {"done", "done", "failed"}, 1996, 4, {0, 1});
+  HRead read(ctx);
+  json body = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "partial", "every shard is terminal and one failed: the batch is partial; status");
-  readSeed(ctx, {"done", "failed", "running"}, 998, 2, {0});
-  body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  hReadSeed(ctx, {"done", "failed", "running"}, 998, 2, {0});
+  body = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "in_progress", "a shard failed but another still runs: the batch is in_progress until every shard is terminal; status");
-  readSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
-  body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  hReadSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
+  body = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body.value("status", ""), "completed", "every shard done is completed; status");
 }
 
 void CheckRecordCounts(harness::Ctx& ctx) {
-  Read read(ctx);
-  readSeed(ctx, {"pending", "pending", "pending"}, 0, 0, {});
-  ctx.Redis.Del("batch:totals:" + kBatch);
-  const json fresh = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  HRead read(ctx);
+  hReadSeed(ctx, {"pending", "pending", "pending"}, 0, 0, {});
+  ctx.Redis.Del("batch:totals:" + kHBatch);
+  const json fresh = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(fresh["request_counts"], json{{"total", 2500}, {"completed", 0}, {"failed", 0}}, "a batch with nothing folded yet (no batch:totals) reports completed 0 and failed 0; request_counts");
-  readSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
-  const json body = bodyOf(ctx, read.http.Get("/v1/batches/" + kBatch, "X-Tenant-Id", "t1"));
+  hReadSeed(ctx, {"done", "done", "done"}, 2497, 3, {0, 1, 2});
+  const json body = hBodyOf(ctx, read.http.Get("/v1/batches/" + kHBatch, "X-Tenant-Id", "t1"));
   ctx.Equal(body["request_counts"], json{{"total", 2500}, {"completed", 2497}, {"failed", 3}}, "request_counts must be the batch's 2500 records with the folded totals (shard counts times kShardSize invent records)");
 }
 `,

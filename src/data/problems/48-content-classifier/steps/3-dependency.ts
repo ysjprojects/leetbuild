@@ -931,41 +931,41 @@ import (
 	"leetbuild/harness"
 )
 
-const clientBroken = "my screen is broken"
+const kHClientBroken = "my screen is broken"
 
 // clientPeer is the stand-in model: answers from classifier/labeler.
-type clientPeer struct {
+type HClientPeer struct {
 	pb.UnimplementedModelServer
 }
 
-func (clientPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (HClientPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	labels, refused := labeler.Classify(req.GetText())
 	return &pb.ClassifyReply{Labels: labels, Refused: refused, ModelVersion: labeler.Version}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) {
-	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &clientPeer{})
+func hClientWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &HClientPeer{})
 }
 
-func clientClassify(ctx *harness.Ctx, text string) Result {
+func hClientClassify(ctx *harness.Ctx, text string) Result {
 	result, err := classify(context.Background(), text, "tx-support", 1)
 	ctx.NoError(err, "classify(%q)", text)
 	return result
 }
 
-func clientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Classify", "") }
+func hClientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Classify", "") }
 
-func clientFallbacks(ctx *harness.Ctx) int {
+func hClientFallbacks(ctx *harness.Ctx) int {
 	raw, _ := ctx.Redis.Get(config.FallbackKey)
 	n, _ := strconv.Atoi(raw)
 	return n
 }
 
-func clientOutage(ctx *harness.Ctx, times int) {
+func hClientOutage(ctx *harness.Ctx, times int) {
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "model down", times, config.Model)
 }
 
-func clientIs(labels []string, expected ...string) bool {
+func hClientIs(labels []string, expected ...string) bool {
 	if len(labels) != len(expected) {
 		return false
 	}
@@ -978,20 +978,20 @@ func clientIs(labels []string, expected ...string) bool {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientClassify(ctx, clientBroken)
-	ctx.Assert(clientIs(result.Labels, "support") && result.Provenance == "model", "a healthy model must answer, got %+v", result)
-	calls := clientCalls(ctx)
+	hClientWorld(ctx)
+	result := hClientClassify(ctx, kHClientBroken)
+	ctx.Assert(hClientIs(result.Labels, "support") && result.Provenance == "model", "a healthy model must answer, got %+v", result)
+	calls := hClientCalls(ctx)
 	ctx.Equal(len(calls), 1, "a healthy model must be called once; calls")
 	ctx.Assert(calls[0].HasDeadline(), "the Classify call carries no deadline: a hung model holds the request for as long as it hangs")
 	ctx.Assert(600*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 800*time.Millisecond, "the deadline must be 700 ms, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Classify", 5.0, config.Model)
 	started := ctx.Clock.Now()
-	result = clientClassify(ctx, clientBroken)
+	result = hClientClassify(ctx, kHClientBroken)
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 2.6, "classify waited %.1f s on a model that hangs: three attempts of 0.7 s, then the fallback", waited)
-	ctx.Assert(result.Provenance == "fallback" && clientIs(result.Labels, "support"), "a hung model must end in the rules fallback, got %+v", result)
-	hung := clientCalls(ctx)[1:]
+	ctx.Assert(result.Provenance == "fallback" && hClientIs(result.Labels, "support"), "a hung model must end in the rules fallback, got %+v", result)
+	hung := hClientCalls(ctx)[1:]
 	ctx.Equal(len(hung), 3, "a model that hangs past every deadline gets maxAttempts = 3 calls (DEADLINE_EXCEEDED is retried); calls")
 	for i, call := range hung {
 		ctx.Assert(call.HasDeadline() && 600*time.Millisecond <= call.Timeout && call.Timeout <= 800*time.Millisecond,
@@ -1000,68 +1000,68 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientClassify(ctx, "refuse: what is my password")
-	ctx.Equal(len(clientCalls(ctx)), 1, "a refusal is the model's answer and must end the attempts; calls")
-	ctx.Assert(result.Provenance == "fallback" && clientIs(result.Labels, "security"), "a refused text goes to the rules, got %+v", result)
-	clientOutage(ctx, 1)
-	result = clientClassify(ctx, clientBroken)
-	ctx.Assert(len(clientCalls(ctx)) == 3 && result.Provenance == "model", "one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw %d calls and %+v", len(clientCalls(ctx))-1, result)
-	clientOutage(ctx, 3)
-	result = clientClassify(ctx, clientBroken)
-	ctx.Equal(len(clientCalls(ctx)), 6, "a model that stays UNAVAILABLE gets maxAttempts = 3 calls; calls so far")
+	hClientWorld(ctx)
+	result := hClientClassify(ctx, "refuse: what is my password")
+	ctx.Equal(len(hClientCalls(ctx)), 1, "a refusal is the model's answer and must end the attempts; calls")
+	ctx.Assert(result.Provenance == "fallback" && hClientIs(result.Labels, "security"), "a refused text goes to the rules, got %+v", result)
+	hClientOutage(ctx, 1)
+	result = hClientClassify(ctx, kHClientBroken)
+	ctx.Assert(len(hClientCalls(ctx)) == 3 && result.Provenance == "model", "one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw %d calls and %+v", len(hClientCalls(ctx))-1, result)
+	hClientOutage(ctx, 3)
+	result = hClientClassify(ctx, kHClientBroken)
+	ctx.Equal(len(hClientCalls(ctx)), 6, "a model that stays UNAVAILABLE gets maxAttempts = 3 calls; calls so far")
 	ctx.Equal(result.Provenance, "fallback", "after three failures the rules answer; the provenance")
 	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "bad request", 1, config.Model)
-	result = clientClassify(ctx, clientBroken)
-	ctx.Equal(len(clientCalls(ctx)), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far")
+	result = hClientClassify(ctx, kHClientBroken)
+	ctx.Equal(len(hClientCalls(ctx)), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far")
 	ctx.Equal(result.Provenance, "fallback", "a terminal status ends in the rules; the provenance")
 	for _, code := range []codes.Code{codes.PermissionDenied, codes.ResourceExhausted, codes.Internal} {
-		before := len(clientCalls(ctx))
+		before := len(hClientCalls(ctx))
 		ctx.GRPC.Fail("Classify", code, "terminal", 1, config.Model)
-		result = clientClassify(ctx, clientBroken)
-		ctx.Assert(len(clientCalls(ctx))-before == 1 && result.Provenance == "fallback", "%s is not retried: one call and the rules, saw %d calls and %+v", code, len(clientCalls(ctx))-before, result)
+		result = hClientClassify(ctx, kHClientBroken)
+		ctx.Assert(len(hClientCalls(ctx))-before == 1 && result.Provenance == "fallback", "%s is not retried: one call and the rules, saw %d calls and %+v", code, len(hClientCalls(ctx))-before, result)
 	}
-	before := len(clientCalls(ctx))
+	before := len(hClientCalls(ctx))
 	ctx.GRPC.Fail("Classify", codes.DeadlineExceeded, "too slow", 1, config.Model)
-	result = clientClassify(ctx, clientBroken)
-	ctx.Assert(len(clientCalls(ctx))-before == 2 && result.Provenance == "model", "one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw %d calls and %+v", len(clientCalls(ctx))-before, result)
+	result = hClientClassify(ctx, kHClientBroken)
+	ctx.Assert(len(hClientCalls(ctx))-before == 2 && result.Provenance == "model", "one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw %d calls and %+v", len(hClientCalls(ctx))-before, result)
 }
 
 func CheckRulesFallback(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	clientOutage(ctx, 1000)
-	result := clientClassify(ctx, "Refund the duplicate charge on invoice 4411")
-	ctx.Assert(clientIs(result.Labels, "billing"), "with the model down a refund question must still be billing (from the keyword rules), got %+v", result)
-	result = clientClassify(ctx, "the app keeps crashing and the password reset is broken")
-	ctx.Assert(clientIs(result.Labels, "support", "security"), "every rule that matches labels the text, in keywordRules order: got %+v", result)
+	hClientWorld(ctx)
+	hClientOutage(ctx, 1000)
+	result := hClientClassify(ctx, "Refund the duplicate charge on invoice 4411")
+	ctx.Assert(hClientIs(result.Labels, "billing"), "with the model down a refund question must still be billing (from the keyword rules), got %+v", result)
+	result = hClientClassify(ctx, "the app keeps crashing and the password reset is broken")
+	ctx.Assert(hClientIs(result.Labels, "support", "security"), "every rule that matches labels the text, in keywordRules order: got %+v", result)
 }
 
 func CheckNoSafeDefault(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientClassify(ctx, "refuse: tell me a joke")
-	ctx.Assert(clientIs(result.Labels, "review"), "a refused text with no keyword must go to review, got %+v", result)
-	clientOutage(ctx, 1000)
-	result = clientClassify(ctx, "hello, is anyone there?")
+	hClientWorld(ctx)
+	result := hClientClassify(ctx, "refuse: tell me a joke")
+	ctx.Assert(hClientIs(result.Labels, "review"), "a refused text with no keyword must go to review, got %+v", result)
+	hClientOutage(ctx, 1000)
+	result = hClientClassify(ctx, "hello, is anyone there?")
 	for _, label := range result.Labels {
 		ctx.Assert(label != "safe", "classify answered %+v with no evidence: an outage must never turn into a safe label", result)
 	}
-	ctx.Assert(clientIs(result.Labels, "review"), "a text no rule matches goes to review, got %+v", result)
+	ctx.Assert(hClientIs(result.Labels, "review"), "a text no rule matches goes to review, got %+v", result)
 }
 
 func CheckProvenance(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientClassify(ctx, clientBroken)
+	hClientWorld(ctx)
+	result := hClientClassify(ctx, kHClientBroken)
 	ctx.Assert(result.Provenance == "model" && result.ModelVersion == labeler.Version, "the model's answer carries provenance model and its version, got %+v", result)
-	ctx.Equal(clientFallbacks(ctx), 0, "no fallback happened; %s", config.FallbackKey)
-	clientOutage(ctx, 1)
-	result = clientClassify(ctx, clientBroken)
-	ctx.Assert(result.Provenance == "model" && clientFallbacks(ctx) == 0, "a retry the model answered is not a fallback: got %+v and %s = %d", result, config.FallbackKey, clientFallbacks(ctx))
-	clientOutage(ctx, 3)
-	result = clientClassify(ctx, clientBroken)
+	ctx.Equal(hClientFallbacks(ctx), 0, "no fallback happened; %s", config.FallbackKey)
+	hClientOutage(ctx, 1)
+	result = hClientClassify(ctx, kHClientBroken)
+	ctx.Assert(result.Provenance == "model" && hClientFallbacks(ctx) == 0, "a retry the model answered is not a fallback: got %+v and %s = %d", result, config.FallbackKey, hClientFallbacks(ctx))
+	hClientOutage(ctx, 3)
+	result = hClientClassify(ctx, kHClientBroken)
 	ctx.Assert(result.Provenance == "fallback" && result.ModelVersion == "rules", "an answer from the rules must say provenance fallback and ModelVersion rules, got %+v", result)
-	ctx.Equal(clientFallbacks(ctx), 1, "after one fallback (count each one); %s", config.FallbackKey)
-	clientClassify(ctx, "refuse: "+clientBroken)
-	ctx.Equal(clientFallbacks(ctx), 2, "after two fallbacks; %s", config.FallbackKey)
+	ctx.Equal(hClientFallbacks(ctx), 1, "after one fallback (count each one); %s", config.FallbackKey)
+	hClientClassify(ctx, "refuse: "+kHClientBroken)
+	ctx.Equal(hClientFallbacks(ctx), 2, "after two fallbacks; %s", config.FallbackKey)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1075,10 +1075,10 @@ func CheckProvenance(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kBroken = "my screen is broken";
+const std::string kHBroken = "my screen is broken";
 
 // The stand-in model: answers from classifier/labeler.h.
-class ClientPeer final : public contentclassifier::Model::Service {
+class HClientPeer final : public contentclassifier::Model::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const contentclassifier::ClassifyRequest* req, contentclassifier::ClassifyReply* reply) override {
     const auto verdict = labeler::classify(req->text());
@@ -1089,40 +1089,40 @@ class ClientPeer final : public contentclassifier::Model::Service {
   }
 };
 
-void clientWorld(harness::Ctx& ctx) {
-  static ClientPeer* peer = nullptr;
+void hClientWorld(harness::Ctx& ctx) {
+  static HClientPeer* peer = nullptr;
   delete peer;
-  peer = new ClientPeer;
+  peer = new HClientPeer;
   ctx.GRPC.Server(config::kModel)->RegisterService(peer);
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
 
-long fallbacks(harness::Ctx& ctx) {
+long hFallbacks(harness::Ctx& ctx) {
   const auto raw = ctx.Redis.Get(config::kFallbackKey);
   return raw ? std::strtol(raw->c_str(), nullptr, 10) : 0;
 }
 
-void outage(harness::Ctx& ctx, int times) { ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "model down", times, config::kModel); }
+void hOutage(harness::Ctx& ctx, int times) { ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "model down", times, config::kModel); }
 
-bool is(const std::vector<std::string>& labels, const std::vector<std::string>& expected) { return labels == expected; }
+bool hIs(const std::vector<std::string>& labels, const std::vector<std::string>& expected) { return labels == expected; }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  Result result = classify(kBroken, "tx-support", 1);
-  ctx.Assert(is(result.labels, {"support"}) && result.provenance == "model", "a healthy model must answer, got %v from %q", result.labels, result.provenance);
+  hClientWorld(ctx);
+  Result result = classify(kHBroken, "tx-support", 1);
+  ctx.Assert(hIs(result.labels, {"support"}) && result.provenance == "model", "a healthy model must answer, got %v from %q", result.labels, result.provenance);
   const auto all = ctx.GRPC.CallsTo("Classify");
   ctx.Equal(all.size(), 1, "a healthy model must be called once; calls");
   ctx.Assert(all[0].HasDeadline(), "the Classify call carries no deadline: a hung model holds the request for as long as it hangs");
   ctx.Assert(0.6 <= all[0].TimeoutSeconds() && all[0].TimeoutSeconds() <= 0.8, "the deadline must be 700 ms, got %vs", all[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Classify", 5.0, config::kModel);
   const int64_t started = ctx.Clock.Now();
-  result = classify(kBroken, "tx-support", 1);
+  result = classify(kHBroken, "tx-support", 1);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 2.6, "classify waited %.1f s on a model that hangs: three attempts of 0.7 s, then the fallback", waited);
-  ctx.Assert(result.provenance == "fallback" && is(result.labels, {"support"}), "a hung model must end in the rules fallback, got %v from %q", result.labels, result.provenance);
+  ctx.Assert(result.provenance == "fallback" && hIs(result.labels, {"support"}), "a hung model must end in the rules fallback, got %v from %q", result.labels, result.provenance);
   const auto after = ctx.GRPC.CallsTo("Classify");
   ctx.Equal(after.size(), 4, "a model that hangs past every deadline gets kMaxAttempts = 3 calls (DEADLINE_EXCEEDED is retried); calls in all");
   for (size_t i = 1; i < after.size(); i++) {
@@ -1132,69 +1132,69 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   Result result = classify("refuse: what is my password", "tx-support", 1);
-  ctx.Equal(calls(ctx), 1, "a refusal is the model's answer and must end the attempts; calls");
-  ctx.Assert(result.provenance == "fallback" && is(result.labels, {"security"}), "a refused text goes to the rules, got %v from %q", result.labels, result.provenance);
-  outage(ctx, 1);
-  result = classify(kBroken, "tx-support", 1);
-  ctx.Assert(calls(ctx) == 3 && result.provenance == "model", "one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw %d calls and %q", calls(ctx) - 1, result.provenance);
-  outage(ctx, 3);
-  result = classify(kBroken, "tx-support", 1);
-  ctx.Equal(calls(ctx), 6, "a model that stays UNAVAILABLE gets kMaxAttempts = 3 calls; calls so far");
+  ctx.Equal(hCalls(ctx), 1, "a refusal is the model's answer and must end the attempts; calls");
+  ctx.Assert(result.provenance == "fallback" && hIs(result.labels, {"security"}), "a refused text goes to the rules, got %v from %q", result.labels, result.provenance);
+  hOutage(ctx, 1);
+  result = classify(kHBroken, "tx-support", 1);
+  ctx.Assert(hCalls(ctx) == 3 && result.provenance == "model", "one UNAVAILABLE earns one retry: expected 2 calls and the model's answer, saw %d calls and %q", hCalls(ctx) - 1, result.provenance);
+  hOutage(ctx, 3);
+  result = classify(kHBroken, "tx-support", 1);
+  ctx.Equal(hCalls(ctx), 6, "a model that stays UNAVAILABLE gets kMaxAttempts = 3 calls; calls so far");
   ctx.Equal(result.provenance, "fallback", "after three failures the rules answer; the provenance");
   ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "bad request", 1, config::kModel);
-  result = classify(kBroken, "tx-support", 1);
-  ctx.Equal(calls(ctx), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far");
+  result = classify(kHBroken, "tx-support", 1);
+  ctx.Equal(hCalls(ctx), 7, "INVALID_ARGUMENT will not change on a retry: one call; calls so far");
   ctx.Equal(result.provenance, "fallback", "a terminal status ends in the rules; the provenance");
   const std::pair<grpc::StatusCode, const char*> terminal[] = {
       {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}};
   for (const auto& [code, name] : terminal) {
-    const size_t before = calls(ctx);
+    const size_t before = hCalls(ctx);
     ctx.GRPC.Fail("Classify", code, "terminal", 1, config::kModel);
-    result = classify(kBroken, "tx-support", 1);
-    ctx.Assert(calls(ctx) - before == 1 && result.provenance == "fallback", "%s is not retried: one call and the rules, saw %d calls and %q", name, calls(ctx) - before, result.provenance);
+    result = classify(kHBroken, "tx-support", 1);
+    ctx.Assert(hCalls(ctx) - before == 1 && result.provenance == "fallback", "%s is not retried: one call and the rules, saw %d calls and %q", name, hCalls(ctx) - before, result.provenance);
   }
-  const size_t before = calls(ctx);
+  const size_t before = hCalls(ctx);
   ctx.GRPC.Fail("Classify", grpc::StatusCode::DEADLINE_EXCEEDED, "too slow", 1, config::kModel);
-  result = classify(kBroken, "tx-support", 1);
-  ctx.Assert(calls(ctx) - before == 2 && result.provenance == "model", "one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw %d calls and %q", calls(ctx) - before, result.provenance);
+  result = classify(kHBroken, "tx-support", 1);
+  ctx.Assert(hCalls(ctx) - before == 2 && result.provenance == "model", "one DEADLINE_EXCEEDED earns one retry: expected 2 calls and the model's answer, saw %d calls and %q", hCalls(ctx) - before, result.provenance);
 }
 
 void CheckRulesFallback(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  outage(ctx, 1000);
+  hClientWorld(ctx);
+  hOutage(ctx, 1000);
   Result result = classify("Refund the duplicate charge on invoice 4411", "tx-support", 1);
-  ctx.Assert(is(result.labels, {"billing"}), "with the model down a refund question must still be billing (from the keyword rules), got %v", result.labels);
+  ctx.Assert(hIs(result.labels, {"billing"}), "with the model down a refund question must still be billing (from the keyword rules), got %v", result.labels);
   result = classify("the app keeps crashing and the password reset is broken", "tx-support", 1);
-  ctx.Assert(is(result.labels, {"support", "security"}), "every rule that matches labels the text, in kKeywordRules order: got %v", result.labels);
+  ctx.Assert(hIs(result.labels, {"support", "security"}), "every rule that matches labels the text, in kKeywordRules order: got %v", result.labels);
 }
 
 void CheckNoSafeDefault(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   Result result = classify("refuse: tell me a joke", "tx-support", 1);
-  ctx.Assert(is(result.labels, {"review"}), "a refused text with no keyword must go to review, got %v", result.labels);
-  outage(ctx, 1000);
+  ctx.Assert(hIs(result.labels, {"review"}), "a refused text with no keyword must go to review, got %v", result.labels);
+  hOutage(ctx, 1000);
   result = classify("hello, is anyone there?", "tx-support", 1);
   ctx.Assert(std::find(result.labels.begin(), result.labels.end(), "safe") == result.labels.end(),
              "classify answered %v with no evidence: an outage must never turn into a safe label", result.labels);
-  ctx.Assert(is(result.labels, {"review"}), "a text no rule matches goes to review, got %v", result.labels);
+  ctx.Assert(hIs(result.labels, {"review"}), "a text no rule matches goes to review, got %v", result.labels);
 }
 
 void CheckProvenance(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  Result result = classify(kBroken, "tx-support", 1);
+  hClientWorld(ctx);
+  Result result = classify(kHBroken, "tx-support", 1);
   ctx.Assert(result.provenance == "model" && result.model_version == labeler::kVersion, "the model's answer carries provenance model and its version, got %q %q", result.provenance, result.model_version);
-  ctx.Equal(fallbacks(ctx), 0, "no fallback happened; %s", config::kFallbackKey);
-  outage(ctx, 1);
-  result = classify(kBroken, "tx-support", 1);
-  ctx.Assert(result.provenance == "model" && fallbacks(ctx) == 0, "a retry the model answered is not a fallback: got %q and %s = %d", result.provenance, config::kFallbackKey, fallbacks(ctx));
-  outage(ctx, 3);
-  result = classify(kBroken, "tx-support", 1);
+  ctx.Equal(hFallbacks(ctx), 0, "no fallback happened; %s", config::kFallbackKey);
+  hOutage(ctx, 1);
+  result = classify(kHBroken, "tx-support", 1);
+  ctx.Assert(result.provenance == "model" && hFallbacks(ctx) == 0, "a retry the model answered is not a fallback: got %q and %s = %d", result.provenance, config::kFallbackKey, hFallbacks(ctx));
+  hOutage(ctx, 3);
+  result = classify(kHBroken, "tx-support", 1);
   ctx.Assert(result.provenance == "fallback" && result.model_version == "rules", "an answer from the rules must say provenance fallback and model_version rules, got %q %q", result.provenance, result.model_version);
-  ctx.Equal(fallbacks(ctx), 1, "after one fallback (count each one); %s", config::kFallbackKey);
-  classify("refuse: " + kBroken, "tx-support", 1);
-  ctx.Equal(fallbacks(ctx), 2, "after two fallbacks; %s", config::kFallbackKey);
+  ctx.Equal(hFallbacks(ctx), 1, "after one fallback (count each one); %s", config::kFallbackKey);
+  classify("refuse: " + kHBroken, "tx-support", 1);
+  ctx.Equal(hFallbacks(ctx), 2, "after two fallbacks; %s", config::kFallbackKey);
 }
 `,
   },

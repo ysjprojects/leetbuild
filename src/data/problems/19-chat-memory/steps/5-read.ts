@@ -885,30 +885,30 @@ import (
 	"leetbuild/harness"
 )
 
-const summaryText = "Earlier: the team chose the 14th for the launch and asked finance for a budget."
+const kHSummaryText = "Earlier: the team chose the 14th for the launch and asked finance for a budget."
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func contextAPI(ctx *harness.Ctx) *harness.HTTP {
+func hContextAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Do("HSET", "apikeys", "key-t1", "t1", "key-t2", "t2")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-// seedTurns appends turns as the turn route does, numbered after start.
-func seedTurns(ctx *harness.Ctx, tenant string, contents []string, start int) {
+// hSeedTurns appends turns as the turn route does, numbered after start.
+func hSeedTurns(ctx *harness.Ctx, tenant string, contents []string, start int) {
 	if start > 0 {
 		ctx.Redis.Set("turnseq:"+tenant+":s-1", start)
 	}
 	for _, content := range contents {
-		turn := sessions.Turn{TurnID: sessions.NextTurnID(readBg, tenant, "s-1"), Role: "user", Content: content, Tokens: sessions.CountTokens(content)}
-		_, err := buffer.AppendTurn(readBg, tenant, "s-1", turn)
+		turn := sessions.Turn{TurnID: sessions.NextTurnID(hReadBg, tenant, "s-1"), Role: "user", Content: content, Tokens: sessions.CountTokens(content)}
+		_, err := buffer.AppendTurn(hReadBg, tenant, "s-1", turn)
 		ctx.NoError(err, "seeding %s's turns", tenant)
 	}
 }
 
-func repeated(s string, n int) []string {
+func hRepeated(s string, n int) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = s
@@ -916,22 +916,22 @@ func repeated(s string, n int) []string {
 	return out
 }
 
-type readBody struct {
+type HReadBody struct {
 	SessionID string          \`json:"session_id"\`
 	Summary   *string         \`json:"summary"\`
 	Turns     []sessions.Turn \`json:"turns"\`
 	Tokens    int             \`json:"tokens"\`
 }
 
-func readAs(ctx *harness.Ctx, c *harness.HTTP, tenant string) readBody {
+func hReadAs(ctx *harness.Ctx, c *harness.HTTP, tenant string) HReadBody {
 	r := c.Get("/v1/sessions/s-1/context", "Authorization", "Bearer key-"+tenant)
 	ctx.Equal(r.Status, 200, "GET /v1/sessions/s-1/context as %s (%s)", tenant, r.Text())
-	var body readBody
+	var body HReadBody
 	r.Decode(&body)
 	return body
 }
 
-func turnIDs(body readBody) []string {
+func hTurnIDs(body HReadBody) []string {
 	out := []string{}
 	for _, t := range body.Turns {
 		out = append(out, t.TurnID)
@@ -939,7 +939,7 @@ func turnIDs(body readBody) []string {
 	return out
 }
 
-func turnContents(body readBody) []string {
+func hTurnContents(body HReadBody) []string {
 	out := []string{}
 	for _, t := range body.Turns {
 		out = append(out, t.Content)
@@ -947,7 +947,7 @@ func turnContents(body readBody) []string {
 	return out
 }
 
-func totalTokens(body readBody) int {
+func hTotalTokens(body HReadBody) int {
 	total := 0
 	if body.Summary != nil {
 		total = sessions.CountTokens(*body.Summary)
@@ -959,21 +959,21 @@ func totalTokens(body readBody) int {
 }
 
 func CheckContextRoute(ctx *harness.Ctx) {
-	c := contextAPI(ctx)
-	ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", summaryText)
-	seedTurns(ctx, "t1", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 40)
-	body := readAs(ctx, c, "t1")
-	ctx.Assert(body.Summary != nil && *body.Summary == summaryText, "the context must carry the latest summary")
-	ctx.Equal(turnIDs(body), []string{"t-41", "t-42", "t-43"}, "the context must carry the turns oldest first with their turn_id")
-	ctx.Equal(turnContents(body), []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, "the turns' content")
+	c := hContextAPI(ctx)
+	ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", kHSummaryText)
+	hSeedTurns(ctx, "t1", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 40)
+	body := hReadAs(ctx, c, "t1")
+	ctx.Assert(body.Summary != nil && *body.Summary == kHSummaryText, "the context must carry the latest summary")
+	ctx.Equal(hTurnIDs(body), []string{"t-41", "t-42", "t-43"}, "the context must carry the turns oldest first with their turn_id")
+	ctx.Equal(hTurnContents(body), []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, "the turns' content")
 	ctx.Equal(c.Get("/v1/sessions/s-1/context").Status, 401, "a read with no API key")
 }
 
 func CheckNewestKept(ctx *harness.Ctx) {
-	c := contextAPI(ctx)
-	seedTurns(ctx, "t1", repeated(strings.Repeat("x", 800), 50), 0) // 50 turns of 200 tokens: 10,000 in all
-	body := readAs(ctx, c, "t1")
-	held := turnIDs(body)
+	c := hContextAPI(ctx)
+	hSeedTurns(ctx, "t1", hRepeated(strings.Repeat("x", 800), 50), 0) // 50 turns of 200 tokens: 10,000 in all
+	body := hReadAs(ctx, c, "t1")
+	held := hTurnIDs(body)
 	last := ""
 	if len(held) > 0 {
 		last = held[len(held)-1]
@@ -984,51 +984,51 @@ func CheckNewestKept(ctx *harness.Ctx) {
 		want = append(want, fmt.Sprintf("t-%d", n))
 	}
 	ctx.Equal(held, want, "the context must hold the 30 newest turns t-21..t-50 oldest first")
-	ctx.Assert(totalTokens(body) <= 6000, "the context is %d tokens, over maxContextTokens = 6000", totalTokens(body))
-	seedTurns(ctx, "t2", []string{strings.Repeat("a", 40), strings.Repeat("b", 20800), strings.Repeat("c", 4000)}, 0) // 10, 5200 and 1000 tokens
-	gap := turnIDs(readAs(ctx, c, "t2"))
+	ctx.Assert(hTotalTokens(body) <= 6000, "the context is %d tokens, over maxContextTokens = 6000", hTotalTokens(body))
+	hSeedTurns(ctx, "t2", []string{strings.Repeat("a", 40), strings.Repeat("b", 20800), strings.Repeat("c", 4000)}, 0) // 10, 5200 and 1000 tokens
+	gap := hTurnIDs(hReadAs(ctx, c, "t2"))
 	ctx.Assert(len(gap) == 1 && gap[0] == "t-3", "with t-1 (10 tokens), t-2 (5200) and t-3 (1000) the context holds %q: stop at the first turn that does not fit, so it holds t-3 alone; reaching past t-2 for t-1 leaves a hole in the conversation", gap)
 }
 
 func CheckSummaryInBudget(ctx *harness.Ctx) {
-	c := contextAPI(ctx)
+	c := hContextAPI(ctx)
 	summary := strings.Repeat("s", 4001) // 1001 tokens
 	ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", summary)
-	seedTurns(ctx, "t1", repeated(strings.Repeat("y", 2400), 10), 40) // 10 turns of 600 tokens
-	body := readAs(ctx, c, "t1")
+	hSeedTurns(ctx, "t1", hRepeated(strings.Repeat("y", 2400), 10), 40) // 10 turns of 600 tokens
+	body := hReadAs(ctx, c, "t1")
 	ctx.Assert(body.Summary != nil && *body.Summary == summary, "the context must carry the summary")
-	total := totalTokens(body)
+	total := hTotalTokens(body)
 	ctx.Assert(total <= 6000, "the summary (1001 tokens) and %d turns of 600 make %d tokens: the summary is part of the prompt and counts against maxContextTokens = 6000", len(body.Turns), total)
 	ctx.Equal(len(body.Turns), 8, "1001 tokens of summary leave room for 8 turns of 600; the turns")
 	ctx.Equal(body.Tokens, total, "tokens must report the summary and the turns together")
 }
 
 func CheckFreshCache(ctx *harness.Ctx) {
-	c := contextAPI(ctx)
-	seedTurns(ctx, "t1", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 0)
-	ctx.Equal(turnIDs(readAs(ctx, c, "t1")), []string{"t-1", "t-2", "t-3"}, "the first read")
-	seedTurns(ctx, "t1", []string{"Which venue?"}, 0)
-	second := turnIDs(readAs(ctx, c, "t1"))
+	c := hContextAPI(ctx)
+	hSeedTurns(ctx, "t1", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 0)
+	ctx.Equal(hTurnIDs(hReadAs(ctx, c, "t1")), []string{"t-1", "t-2", "t-3"}, "the first read")
+	hSeedTurns(ctx, "t1", []string{"Which venue?"}, 0)
+	second := hTurnIDs(hReadAs(ctx, c, "t1"))
 	ctx.Assert(len(second) == 4 && second[3] == "t-4", "a read right after t-4 was appended answered %q: the cache served the context from before the append. Key it by the latest turn id", second)
 	ttl := ctx.Redis.TTL("context:t1:s-1:t-4")
 	ctx.Assert(0 < ttl && ttl <= 60, "context:t1:s-1:t-4 has TTL %d: the read must cache the context under the latest turn id for 60 s", ttl)
-	seedTurns(ctx, "t2", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 0)
+	hSeedTurns(ctx, "t2", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 0)
 	probe := ctx.Redis.After("turns:t2:s-1", func() any {
 		ctx.Redis.Do("INCR", "turnseq:t2:s-1")
 		return ctx.Redis.Do("RPUSH", "turns:t2:s-1", \`{"turn_id": "t-4", "role": "user", "content": "Which venue?", "tokens": 3}\`)
 	})
-	readAs(ctx, c, "t2")
+	hReadAs(ctx, c, "t2")
 	ctx.Assert(probe.Fired, "the read never touched turns:t2:s-1")
-	again := turnIDs(readAs(ctx, c, "t2"))
+	again := hTurnIDs(hReadAs(ctx, c, "t2"))
 	ctx.Equal(again, []string{"t-1", "t-2", "t-3", "t-4"}, "t-4 was appended while a read was assembling t-1..t-3: the context was cached under a turn id it does not contain; the next read")
 }
 
 func CheckTenantCache(ctx *harness.Ctx) {
-	c := contextAPI(ctx)
-	seedTurns(ctx, "t1", []string{"t1: launch on the 14th", "t1: budget 40k", "t1: book the venue"}, 0)
-	seedTurns(ctx, "t2", []string{"t2: cancel the order", "t2: refund the card", "t2: close the ticket"}, 0)
-	readAs(ctx, c, "t1")
-	seen := turnContents(readAs(ctx, c, "t2"))
+	c := hContextAPI(ctx)
+	hSeedTurns(ctx, "t1", []string{"t1: launch on the 14th", "t1: budget 40k", "t1: book the venue"}, 0)
+	hSeedTurns(ctx, "t2", []string{"t2: cancel the order", "t2: refund the card", "t2: close the ticket"}, 0)
+	hReadAs(ctx, c, "t1")
+	seen := hTurnContents(hReadAs(ctx, c, "t2"))
 	ctx.Assert(len(seen) == 3 && seen[0] == "t2: cancel the order", "tenant t2 reading its own session s-1 got %q: the cache served tenant t1's conversation. Key it by tenant", seen)
 }
 `,
@@ -1042,9 +1042,9 @@ func CheckTenantCache(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSummary = "Earlier: the team chose the 14th for the launch and asked finance for a budget.";
+const std::string kHSummary = "Earlier: the team chose the 14th for the launch and asked finance for a budget.";
 
-harness::HTTP contextApi(harness::Ctx& ctx) {
+harness::HTTP hContextApi(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "apikeys", "key-t1", "t1", "key-t2", "t2");
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -1054,14 +1054,14 @@ harness::HTTP contextApi(harness::Ctx& ctx) {
 }
 
 // Append turns as the turn route does, numbered after start.
-void seedTurns(harness::Ctx& ctx, const std::string& tenant, const std::vector<std::string>& contents, int start = 0) {
+void hSeedTurns(harness::Ctx& ctx, const std::string& tenant, const std::vector<std::string>& contents, int start = 0) {
   if (start > 0) ctx.Redis.Set("turnseq:" + tenant + ":s-1", std::to_string(start));
   for (const std::string& content : contents) {
     buffer::appendTurn(tenant, "s-1", sessions::Turn{sessions::nextTurnId(tenant, "s-1"), "user", content, sessions::countTokens(content)});
   }
 }
 
-nlohmann::json readAs(harness::Ctx& ctx, harness::HTTP& c, const std::string& tenant) {
+nlohmann::json hReadAs(harness::Ctx& ctx, harness::HTTP& c, const std::string& tenant) {
   const auto r = c.Get("/v1/sessions/s-1/context", "Authorization", "Bearer key-" + tenant);
   ctx.Equal(r.Status, 200, "GET /v1/sessions/s-1/context as %s (%s)", tenant, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -1069,7 +1069,7 @@ nlohmann::json readAs(harness::Ctx& ctx, harness::HTTP& c, const std::string& te
   return body;
 }
 
-std::vector<std::string> fieldOfTurns(const nlohmann::json& body, const std::string& field) {
+std::vector<std::string> hFieldOfTurns(const nlohmann::json& body, const std::string& field) {
   std::vector<std::string> out;
   if (body.contains("turns") && body["turns"].is_array()) {
     for (const auto& t : body["turns"]) out.push_back(t.value(field, ""));
@@ -1077,7 +1077,7 @@ std::vector<std::string> fieldOfTurns(const nlohmann::json& body, const std::str
   return out;
 }
 
-long totalTokens(const nlohmann::json& body) {
+long hTotalTokens(const nlohmann::json& body) {
   long total = body.contains("summary") && body["summary"].is_string() ? sessions::countTokens(body["summary"].get<std::string>()) : 0;
   if (body.contains("turns") && body["turns"].is_array()) {
     for (const auto& t : body["turns"]) total += t.value("tokens", 0L);
@@ -1088,71 +1088,71 @@ long totalTokens(const nlohmann::json& body) {
 }  // namespace
 
 void CheckContextRoute(harness::Ctx& ctx) {
-  auto c = contextApi(ctx);
-  ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", kSummary);
-  seedTurns(ctx, "t1", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 40);
-  const auto body = readAs(ctx, c, "t1");
-  ctx.Assert(body.value("summary", nlohmann::json()) == kSummary, "the context must carry the latest summary, got %s", body.value("summary", nlohmann::json()).dump());
-  ctx.Equal(fieldOfTurns(body, "turn_id"), {"t-41", "t-42", "t-43"}, "the context must carry the turns oldest first with their turn_id");
-  ctx.Equal(fieldOfTurns(body, "content"), {"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, "the turns' content");
+  auto c = hContextApi(ctx);
+  ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", kHSummary);
+  hSeedTurns(ctx, "t1", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 40);
+  const auto body = hReadAs(ctx, c, "t1");
+  ctx.Assert(body.value("summary", nlohmann::json()) == kHSummary, "the context must carry the latest summary, got %s", body.value("summary", nlohmann::json()).dump());
+  ctx.Equal(hFieldOfTurns(body, "turn_id"), {"t-41", "t-42", "t-43"}, "the context must carry the turns oldest first with their turn_id");
+  ctx.Equal(hFieldOfTurns(body, "content"), {"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, "the turns' content");
   ctx.Equal(c.Get("/v1/sessions/s-1/context").Status, 401, "a read with no API key");
 }
 
 void CheckNewestKept(harness::Ctx& ctx) {
-  auto c = contextApi(ctx);
-  seedTurns(ctx, "t1", std::vector<std::string>(50, std::string(800, 'x')));  // 50 turns of 200 tokens: 10,000 in all
-  const auto body = readAs(ctx, c, "t1");
-  const auto held = fieldOfTurns(body, "turn_id");
+  auto c = hContextApi(ctx);
+  hSeedTurns(ctx, "t1", std::vector<std::string>(50, std::string(800, 'x')));  // 50 turns of 200 tokens: 10,000 in all
+  const auto body = hReadAs(ctx, c, "t1");
+  const auto held = hFieldOfTurns(body, "turn_id");
   const std::string last = held.empty() ? "" : held.back();
   ctx.Assert(last == "t-50", "the context ends at %q: the newest turn, the one the model is answering, was dropped. Spend the budget from the newest end", last);
   std::vector<std::string> want;
   for (int n = 21; n <= 50; n++) want.push_back("t-" + std::to_string(n));
   ctx.Equal(held, want, "the context must hold the 30 newest turns t-21..t-50 oldest first");
-  ctx.Assert(totalTokens(body) <= 6000, "the context is %d tokens, over kMaxContextTokens = 6000", totalTokens(body));
+  ctx.Assert(hTotalTokens(body) <= 6000, "the context is %d tokens, over kMaxContextTokens = 6000", hTotalTokens(body));
 }
 
 void CheckSummaryInBudget(harness::Ctx& ctx) {
-  auto c = contextApi(ctx);
+  auto c = hContextApi(ctx);
   const std::string summary(4001, 's');  // 1001 tokens
   ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", summary);
-  seedTurns(ctx, "t1", std::vector<std::string>(10, std::string(2400, 'y')), 40);  // 10 turns of 600 tokens
-  const auto body = readAs(ctx, c, "t1");
+  hSeedTurns(ctx, "t1", std::vector<std::string>(10, std::string(2400, 'y')), 40);  // 10 turns of 600 tokens
+  const auto body = hReadAs(ctx, c, "t1");
   ctx.Assert(body.value("summary", nlohmann::json()) == summary, "the context must carry the summary");
-  const long total = totalTokens(body);
-  const size_t kept = fieldOfTurns(body, "turn_id").size();
+  const long total = hTotalTokens(body);
+  const size_t kept = hFieldOfTurns(body, "turn_id").size();
   ctx.Assert(total <= 6000, "the summary (1001 tokens) and %d turns of 600 make %d tokens: the summary is part of the prompt and counts against kMaxContextTokens = 6000", kept, total);
   ctx.Equal(kept, 8, "1001 tokens of summary leave room for 8 turns of 600; the turns");
   ctx.Equal(body.value("tokens", 0L), total, "tokens must report the summary and the turns together");
 }
 
 void CheckFreshCache(harness::Ctx& ctx) {
-  auto c = contextApi(ctx);
-  seedTurns(ctx, "t1", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."});
-  ctx.Equal(fieldOfTurns(readAs(ctx, c, "t1"), "turn_id"), {"t-1", "t-2", "t-3"}, "the first read");
-  seedTurns(ctx, "t1", {"Which venue?"});
-  const auto second = fieldOfTurns(readAs(ctx, c, "t1"), "turn_id");
+  auto c = hContextApi(ctx);
+  hSeedTurns(ctx, "t1", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."});
+  ctx.Equal(hFieldOfTurns(hReadAs(ctx, c, "t1"), "turn_id"), {"t-1", "t-2", "t-3"}, "the first read");
+  hSeedTurns(ctx, "t1", {"Which venue?"});
+  const auto second = hFieldOfTurns(hReadAs(ctx, c, "t1"), "turn_id");
   ctx.Assert(second.size() == 4 && second[3] == "t-4", "a read right after t-4 was appended answered %q: the cache served the context from before the append. Key it by the latest turn id", second);
   const long long ttl = ctx.Redis.TTL("context:t1:s-1:t-4");
   ctx.Assert(0 < ttl && ttl <= 60, "context:t1:s-1:t-4 has TTL %d: the read must cache the context under the latest turn id for 60 s", ttl);
-  seedTurns(ctx, "t2", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."});
+  hSeedTurns(ctx, "t2", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."});
   auto fired = std::make_shared<bool>(false);
   ctx.Redis.After("turns:t2:s-1", [&ctx, fired] {
     *fired = true;
     ctx.Redis.Do("INCR", "turnseq:t2:s-1");
     ctx.Redis.Do("RPUSH", "turns:t2:s-1", R"({"turn_id": "t-4", "role": "user", "content": "Which venue?", "tokens": 3})");
   });
-  readAs(ctx, c, "t2");
+  hReadAs(ctx, c, "t2");
   ctx.Assert(*fired, "the read never touched turns:t2:s-1");
-  ctx.Equal(fieldOfTurns(readAs(ctx, c, "t2"), "turn_id"), {"t-1", "t-2", "t-3", "t-4"},
+  ctx.Equal(hFieldOfTurns(hReadAs(ctx, c, "t2"), "turn_id"), {"t-1", "t-2", "t-3", "t-4"},
             "t-4 was appended while a read was assembling t-1..t-3: the context was cached under a turn id it does not contain; the next read");
 }
 
 void CheckTenantCache(harness::Ctx& ctx) {
-  auto c = contextApi(ctx);
-  seedTurns(ctx, "t1", {"t1: launch on the 14th", "t1: budget 40k", "t1: book the venue"});
-  seedTurns(ctx, "t2", {"t2: cancel the order", "t2: refund the card", "t2: close the ticket"});
-  readAs(ctx, c, "t1");
-  const auto seen = fieldOfTurns(readAs(ctx, c, "t2"), "content");
+  auto c = hContextApi(ctx);
+  hSeedTurns(ctx, "t1", {"t1: launch on the 14th", "t1: budget 40k", "t1: book the venue"});
+  hSeedTurns(ctx, "t2", {"t2: cancel the order", "t2: refund the card", "t2: close the ticket"});
+  hReadAs(ctx, c, "t1");
+  const auto seen = hFieldOfTurns(hReadAs(ctx, c, "t2"), "content");
   ctx.Assert(seen.size() == 3 && seen[0] == "t2: cancel the order", "tenant t2 reading its own session s-1 got %q: the cache served tenant t1's conversation. Key it by tenant", seen);
 }
 `,

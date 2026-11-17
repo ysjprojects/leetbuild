@@ -849,9 +849,9 @@ import (
 	"leetbuild/harness"
 )
 
-var cpBg = context.Background()
+var hCpBg = context.Background()
 
-func cpPlan() []jobs.Task {
+func hCpPlan() []jobs.Task {
 	var plan []jobs.Task
 	for i := 1; i <= 3; i++ {
 		plan = append(plan, jobs.Task{ID: fmt.Sprintf("t-%d", i), Objective: fmt.Sprintf("Find the board members of bank %d", i),
@@ -860,7 +860,7 @@ func cpPlan() []jobs.Task {
 	return plan
 }
 
-func ids(tasks []jobs.Task) []string {
+func hIds(tasks []jobs.Task) []string {
 	out := []string{}
 	for _, t := range tasks {
 		out = append(out, t.ID)
@@ -868,21 +868,21 @@ func ids(tasks []jobs.Task) []string {
 	return out
 }
 
-func mustResume(ctx *harness.Ctx, jobID string) ([]jobs.Task, map[string]string) {
-	pending, results, err := resume(cpBg, jobID)
+func hMustResume(ctx *harness.Ctx, jobID string) ([]jobs.Task, map[string]string) {
+	pending, results, err := resume(hCpBg, jobID)
 	ctx.NoError(err, "resume(%s) failed", jobID)
 	return pending, results
 }
 
-func mustReserve(ctx *harness.Ctx, jobID string, max int) bool {
-	granted, err := reserveToolCall(cpBg, jobID, max)
+func hMustReserve(ctx *harness.Ctx, jobID string, max int) bool {
+	granted, err := reserveToolCall(hCpBg, jobID, max)
 	ctx.NoError(err, "reserveToolCall(%s) failed", jobID)
 	return granted
 }
 
 func CheckResume(ctx *harness.Ctx) {
-	plan := cpPlan()
-	ctx.NoError(startJob(cpBg, "job-1", plan), "startJob failed")
+	plan := hCpPlan()
+	ctx.NoError(startJob(hCpBg, "job-1", plan), "startJob failed")
 	raw, _ := ctx.Redis.HGet("research:job-1", "plan")
 	var stored []jobs.Task
 	json.Unmarshal([]byte(raw), &stored)
@@ -891,33 +891,33 @@ func CheckResume(ctx *harness.Ctx) {
 	ctx.Equal(status, "running", "after startJob the field status of research:job-1")
 	// research:job-9 holds a string, so saving its plan fails (WRONGTYPE): the lead must hear about it.
 	ctx.Redis.Set("research:job-9", "not a hash")
-	ctx.Assert(startJob(cpBg, "job-9", plan) != nil, "startJob returned no error although writing research:job-9 failed (WRONGTYPE): a checkpoint write that fails must reach the caller, or the lead believes a plan is saved that is not")
+	ctx.Assert(startJob(hCpBg, "job-9", plan) != nil, "startJob returned no error although writing research:job-9 failed (WRONGTYPE): a checkpoint write that fails must reach the caller, or the lead believes a plan is saved that is not")
 	// The lead that started job-7 crashed after t-1 came back; a restarted process resumes it.
 	data, _ := json.Marshal(plan)
 	ctx.Redis.Do("HSET", "research:job-7", "status", "running", "plan", string(data))
-	ctx.NoError(saveResult(cpBg, "job-7", "t-1", "chair: A. Jones"), "saveResult failed")
-	pending, results := mustResume(ctx, "job-7")
-	ctx.Equal(ids(pending), []string{"t-2", "t-3"}, "a restarted lead resuming job-7; the pending tasks")
+	ctx.NoError(saveResult(hCpBg, "job-7", "t-1", "chair: A. Jones"), "saveResult failed")
+	pending, results := hMustResume(ctx, "job-7")
+	ctx.Equal(hIds(pending), []string{"t-2", "t-3"}, "a restarted lead resuming job-7; the pending tasks")
 	ctx.Equal(pending, plan[1:], "resume must answer the pending tasks whole")
 	ctx.Equal(results, map[string]string{"t-1": "chair: A. Jones"}, "resume's results")
 }
 
 func CheckConcurrentResults(ctx *harness.Ctx) {
-	ctx.NoError(startJob(cpBg, "job-1", cpPlan()), "startJob failed")
+	ctx.NoError(startJob(hCpBg, "job-1", hCpPlan()), "startJob failed")
 	// t-2's subagent finishes while t-1's result is being written.
-	rival := ctx.Redis.After("research:job-1:results", func() any { return saveResult(cpBg, "job-1", "t-2", "CFO: B. Smith") })
-	ctx.NoError(saveResult(cpBg, "job-1", "t-1", "chair: A. Jones"), "saveResult failed")
+	rival := ctx.Redis.After("research:job-1:results", func() any { return saveResult(hCpBg, "job-1", "t-2", "CFO: B. Smith") })
+	ctx.NoError(saveResult(hCpBg, "job-1", "t-1", "chair: A. Jones"), "saveResult failed")
 	ctx.Assert(rival.Fired, "nothing touched research:job-1:results")
-	pending, results := mustResume(ctx, "job-1")
+	pending, results := hMustResume(ctx, "job-1")
 	ctx.Equal(results, map[string]string{"t-1": "chair: A. Jones", "t-2": "CFO: B. Smith"}, "two results saved at the same time must both survive (one overwrote the other: store each result as its own field of the hash); the results")
-	ctx.Equal(ids(pending), []string{"t-3"}, "the pending tasks")
+	ctx.Equal(hIds(pending), []string{"t-3"}, "the pending tasks")
 	ctx.Equal(ctx.Redis.Type("research:job-1:results"), "hash", "research:job-1:results must be a hash with one field per task; its type")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	ctx.NoError(startJob(cpBg, "job-1", cpPlan()), "startJob failed")
-	ctx.NoError(saveResult(cpBg, "job-1", "t-1", "chair: A. Jones"), "saveResult failed")
-	ctx.Assert(mustReserve(ctx, "job-1", 10), "the first tool call of a budget of 10 must be granted")
+	ctx.NoError(startJob(hCpBg, "job-1", hCpPlan()), "startJob failed")
+	ctx.NoError(saveResult(hCpBg, "job-1", "t-1", "chair: A. Jones"), "saveResult failed")
+	ctx.Assert(hMustReserve(ctx, "job-1", 10), "the first tool call of a budget of 10 must be granted")
 	for _, key := range []string{"research:job-1", "research:job-1:results", "research:job-1:tools"} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(86000 < ttl && ttl <= 86400, "%s has a TTL of %d: every checkpoint key must expire checkpointTTL = 24 h after its last write", key, ttl)
@@ -928,12 +928,12 @@ func CheckTtl(ctx *harness.Ctx) {
 		ttl = ctx.Redis.TTL("research:job-2:tools")
 		return nil
 	})
-	mustReserve(ctx, "job-2", 10)
+	hMustReserve(ctx, "job-2", 10)
 	ctx.Assert(seen.Fired, "nothing touched research:job-2:tools")
 	ctx.Assert(86000 < ttl && ttl <= 86400, "right after the reservation's first command touched research:job-2:tools its TTL was %d: refresh the expiry inside the reservation script, in the same step as the INCR", ttl)
 	ctx.Clock.Advance(3600)
-	ctx.NoError(saveResult(cpBg, "job-1", "t-2", "CFO: B. Smith"), "saveResult failed")
-	mustReserve(ctx, "job-1", 10)
+	ctx.NoError(saveResult(hCpBg, "job-1", "t-2", "CFO: B. Smith"), "saveResult failed")
+	hMustReserve(ctx, "job-1", 10)
 	for _, key := range []string{"research:job-1:results", "research:job-1:tools"} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl > 86000, "an hour later %s was written again but its TTL is %d: each write refreshes the expiry", key, ttl)
@@ -943,7 +943,7 @@ func CheckTtl(ctx *harness.Ctx) {
 func CheckAtomicReserve(ctx *harness.Ctx) {
 	var granted []bool
 	for i := 0; i < 4; i++ {
-		granted = append(granted, mustReserve(ctx, "job-1", 3))
+		granted = append(granted, hMustReserve(ctx, "job-1", 3))
 	}
 	ctx.Equal(granted, []bool{true, true, true, false}, "four reservations on a budget of 3")
 	used, _ := ctx.Redis.Get("research:job-1:tools")
@@ -951,10 +951,10 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 	// job-2 has used 9 of its 10 tool calls; two subagents ask for the last one at the same time.
 	ctx.Redis.Set("research:job-2:tools", "9")
 	rival := ctx.Redis.After("research:job-2:tools", func() any {
-		granted, _ := reserveToolCall(cpBg, "job-2", 10)
+		granted, _ := reserveToolCall(hCpBg, "job-2", 10)
 		return granted
 	})
-	mine := mustReserve(ctx, "job-2", 10)
+	mine := hMustReserve(ctx, "job-2", 10)
 	ctx.Assert(rival.Fired, "nothing touched research:job-2:tools")
 	theirs, _ := rival.Result.(bool)
 	ctx.Assert(!(mine && theirs), "two concurrent reservations for the last tool call of the budget were both granted: count and compare in one Lua script")
@@ -968,7 +968,7 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 		seenUsed, _ = ctx.Redis.Get("research:job-3:tools")
 		return nil
 	})
-	ctx.Assert(!mustReserve(ctx, "job-3", 10), "a reservation on a spent budget of 10 was granted")
+	ctx.Assert(!hMustReserve(ctx, "job-3", 10), "a reservation on a spent budget of 10 was granted")
 	ctx.Assert(seen.Fired, "nothing touched research:job-3:tools")
 	ctx.Equal(seenUsed, "10", "a subagent reading the counter must never see the budget overspent (count, compare and roll back in one Lua script); research:job-3:tools right after the refused reservation's first command")
 }
@@ -985,7 +985,7 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 
 namespace {
 
-std::vector<jobs::Task> cpPlan() {
+std::vector<jobs::Task> hCpPlan() {
   std::vector<jobs::Task> plan;
   for (int i = 1; i <= 3; i++) {
     plan.push_back({"t-" + std::to_string(i), "Find the board members of bank " + std::to_string(i), "one line per member", {"search", "fetch"}, "annual reports from 2024 on"});
@@ -993,7 +993,7 @@ std::vector<jobs::Task> cpPlan() {
   return plan;
 }
 
-std::vector<std::string> ids(const std::vector<jobs::Task>& tasks) {
+std::vector<std::string> hIds(const std::vector<jobs::Task>& tasks) {
   std::vector<std::string> out;
   for (const auto& t : tasks) out.push_back(t.id);
   return out;
@@ -1002,7 +1002,7 @@ std::vector<std::string> ids(const std::vector<jobs::Task>& tasks) {
 }  // namespace
 
 void CheckResume(harness::Ctx& ctx) {
-  const auto plan = cpPlan();
+  const auto plan = hCpPlan();
   startJob("job-1", plan);
   const auto raw = ctx.Redis.HGet("research:job-1", "plan");
   ctx.Assert(raw && nlohmann::json::parse(*raw, nullptr, false) == nlohmann::json(plan),
@@ -1021,13 +1021,13 @@ void CheckResume(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "research:job-7", "status", "running", "plan", nlohmann::json(plan).dump());
   saveResult("job-7", "t-1", "chair: A. Jones");
   const Resumed r = resume("job-7");
-  ctx.Equal(ids(r.pending), {"t-2", "t-3"}, "a restarted lead resuming job-7; the pending tasks");
+  ctx.Equal(hIds(r.pending), {"t-2", "t-3"}, "a restarted lead resuming job-7; the pending tasks");
   ctx.Assert(nlohmann::json(r.pending) == nlohmann::json(std::vector<jobs::Task>(plan.begin() + 1, plan.end())), "resume must answer the pending tasks whole");
   ctx.Equal(r.results, std::map<std::string, std::string>{{"t-1", "chair: A. Jones"}}, "resume's results");
 }
 
 void CheckConcurrentResults(harness::Ctx& ctx) {
-  startJob("job-1", cpPlan());
+  startJob("job-1", hCpPlan());
   // t-2's subagent finishes while t-1's result is being written.
   bool fired = false;
   ctx.Redis.After("research:job-1:results", [&fired] {
@@ -1039,12 +1039,12 @@ void CheckConcurrentResults(harness::Ctx& ctx) {
   const Resumed r = resume("job-1");
   ctx.Equal(r.results, std::map<std::string, std::string>{{"t-1", "chair: A. Jones"}, {"t-2", "CFO: B. Smith"}},
             "two results saved at the same time must both survive (one overwrote the other: store each result as its own field of the hash); the results");
-  ctx.Equal(ids(r.pending), {"t-3"}, "the pending tasks");
+  ctx.Equal(hIds(r.pending), {"t-3"}, "the pending tasks");
   ctx.Equal(ctx.Redis.Type("research:job-1:results"), "hash", "research:job-1:results must be a hash with one field per task; its type");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  startJob("job-1", cpPlan());
+  startJob("job-1", hCpPlan());
   saveResult("job-1", "t-1", "chair: A. Jones");
   ctx.Assert(reserveToolCall("job-1", 10), "the first tool call of a budget of 10 must be granted");
   for (const std::string key : {"research:job-1", "research:job-1:results", "research:job-1:tools"}) {

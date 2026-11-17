@@ -591,54 +591,54 @@ import (
 	"leetbuild/harness"
 )
 
-const readText = "Reach Ada at ada@example.com or 415-555-0132."
+const kHReadText = "Reach Ada at ada@example.com or 415-555-0132."
 
 // readMixed has the phone first and two emails: the types appear out of order and one of them twice.
-const readMixed = "Call 415-555-0132, mail ada@example.com or bob@example.org."
+const kHReadMixed = "Call 415-555-0132, mail ada@example.com or bob@example.org."
 
-func readSeed(ctx *harness.Ctx, documentID, tenant, text string) string {
+func hReadSeed(ctx *harness.Ctx, documentID, tenant, text string) string {
 	found := spans.Scan(text, []string{"EMAIL", "PHONE"})
 	redacted := spans.ApplySpans(text, found)
 	ctx.NoError(store.Save(context.Background(), tenant, documentID, found, "ner-2026.10", redacted), "store.Save")
 	return redacted
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, documentID, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, documentID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/documents/" + documentID + "/redaction")
 	}
 	return c.Get("/v1/documents/"+documentID+"/redaction", "X-Tenant-Id", tenant)
 }
 
-func readBody(r *harness.Response) map[string]any {
+func hReadBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, "d-1", "acme", readText)
-	r := readGet(readClient(ctx), "d-1", "acme")
+	hReadSeed(ctx, "d-1", "acme", kHReadText)
+	r := hReadGet(hReadClient(ctx), "d-1", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/documents/d-1/redaction (%s)", r.Text())
-	body := readBody(r)
+	body := hReadBody(r)
 	ctx.Assert(body["document_id"] == "d-1" && body["detector_version"] == "ner-2026.10", "the answer must name the document and the detector version, got %s", r.Text())
 	ctx.Equal(body["entity_counts"], map[string]any{"EMAIL": float64(1), "PHONE": float64(1)}, "the entity counts")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	readSeed(ctx, "d-1", "acme", readText)
-	c := readClient(ctx)
-	foreign := readGet(c, "d-1", "globex")
-	missing := readGet(c, "d-none", "globex")
-	anonymous := readGet(c, "d-1", "")
-	anonymousMissing := readGet(c, "d-none", "")
-	own := readGet(c, "d-1", "acme")
+	hReadSeed(ctx, "d-1", "acme", kHReadText)
+	c := hReadClient(ctx)
+	foreign := hReadGet(c, "d-1", "globex")
+	missing := hReadGet(c, "d-none", "globex")
+	anonymous := hReadGet(c, "d-1", "")
+	anonymousMissing := hReadGet(c, "d-none", "")
+	own := hReadGet(c, "d-1", "acme")
 	ctx.Equal(foreign.Status, 404, "tenant globex read acme's document d-1 (%.200s); the record's tenant must be the caller's", foreign.Text())
 	ctx.Equal(foreign.Text(), missing.Text(), "another tenant's record must answer exactly what a missing one does")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
@@ -647,25 +647,25 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	r := readGet(readClient(ctx), "d-none", "acme")
+	r := hReadGet(hReadClient(ctx), "d-none", "acme")
 	ctx.Equal(r.Status, 404, "a document with no record (%s): an empty 200 reads as processed with nothing found", r.Text())
 }
 
 func CheckNoText(ctx *harness.Ctx) {
-	redacted := readSeed(ctx, "d-1", "acme", readText)
-	r := readGet(readClient(ctx), "d-1", "acme")
+	redacted := hReadSeed(ctx, "d-1", "acme", kHReadText)
+	r := hReadGet(hReadClient(ctx), "d-1", "acme")
 	ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text())
-	_, has := readBody(r)["redacted_text"]
+	_, has := hReadBody(r)["redacted_text"]
 	ctx.Assert(!has, "the audit read returns the stored output: %s. It is a second copy of the document", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "Reach Ada") && !strings.Contains(r.Text(), redacted), "the audit read carries text: %s", r.Text())
 }
 
 func CheckOffsets(ctx *harness.Ctx) {
-	c := readClient(ctx)
-	for _, seeded := range [][2]string{{"d-1", readText}, {"d-2", readMixed}} {
+	c := hReadClient(ctx)
+	for _, seeded := range [][2]string{{"d-1", kHReadText}, {"d-2", kHReadMixed}} {
 		documentID := seeded[0]
-		redacted := readSeed(ctx, documentID, "acme", seeded[1])
-		body := readBody(readGet(c, documentID, "acme"))
+		redacted := hReadSeed(ctx, documentID, "acme", seeded[1])
+		body := hReadBody(hReadGet(c, documentID, "acme"))
 		found, _ := body["spans"].([]any)
 		ctx.Assert(len(found) > 0, "the answer for %s must carry the spans with their replacements, got %v", documentID, body["spans"])
 		ctx.Equal(body["entity_types"], []any{"EMAIL", "PHONE"}, "entity_types must be the sorted types, each once, for %s", documentID)
@@ -692,18 +692,18 @@ func CheckOffsets(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Reach Ada at ada@example.com or 415-555-0132.";
+const std::string kHText = "Reach Ada at ada@example.com or 415-555-0132.";
 // the phone first and two emails: the types appear out of order and one of them twice
-const std::string kMixed = "Call 415-555-0132, mail ada@example.com or bob@example.org.";
+const std::string kHMixed = "Call 415-555-0132, mail ada@example.com or bob@example.org.";
 
-std::string seed(const std::string& document_id, const std::string& tenant, const std::string& text = kText) {
+std::string hSeed(const std::string& document_id, const std::string& tenant, const std::string& text = kHText) {
   const auto found = spans::scan(text, {"EMAIL", "PHONE"});
   const std::string redacted = spans::apply_spans(text, found);
   store::save(tenant, document_id, found, "ner-2026.10", redacted);
   return redacted;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -711,33 +711,33 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response get(harness::HTTP& c, const std::string& document_id, const std::string& tenant) {
+harness::Response hGet(harness::HTTP& c, const std::string& document_id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/documents/" + document_id + "/redaction");
   return c.Get("/v1/documents/" + document_id + "/redaction", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json parsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hParsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  seed("d-1", "acme");
-  auto c = api(ctx);
-  const auto r = get(c, "d-1", "acme");
+  hSeed("d-1", "acme");
+  auto c = hApi(ctx);
+  const auto r = hGet(c, "d-1", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/documents/d-1/redaction (%s)", r.Text());
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   ctx.Assert(body.value("document_id", "") == "d-1" && body.value("detector_version", "") == "ner-2026.10", "the answer must name the document and the detector version, got %s", r.Text());
   ctx.Equal(body.value("entity_counts", nlohmann::json()), nlohmann::json({{"EMAIL", 1}, {"PHONE", 1}}), "the entity counts");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  seed("d-1", "acme");
-  auto c = api(ctx);
-  const auto foreign = get(c, "d-1", "globex");
-  const auto missing = get(c, "d-none", "globex");
-  const auto anonymous = get(c, "d-1", "");
-  const auto anonymous_missing = get(c, "d-none", "");
-  const auto own = get(c, "d-1", "acme");
+  hSeed("d-1", "acme");
+  auto c = hApi(ctx);
+  const auto foreign = hGet(c, "d-1", "globex");
+  const auto missing = hGet(c, "d-none", "globex");
+  const auto anonymous = hGet(c, "d-1", "");
+  const auto anonymous_missing = hGet(c, "d-none", "");
+  const auto own = hGet(c, "d-1", "acme");
   ctx.Equal(foreign.Status, 404, "tenant globex read acme's document d-1 (%s); the record's tenant must be the caller's", foreign.Text().substr(0, 200));
   ctx.Equal(foreign.Text(), missing.Text(), "another tenant's record must answer exactly what a missing one does");
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
@@ -746,25 +746,25 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = get(c, "d-none", "acme");
+  auto c = hApi(ctx);
+  const auto r = hGet(c, "d-none", "acme");
   ctx.Equal(r.Status, 404, "a document with no record (%s): an empty 200 reads as processed with nothing found", r.Text());
 }
 
 void CheckNoText(harness::Ctx& ctx) {
-  const std::string redacted = seed("d-1", "acme");
-  auto c = api(ctx);
-  const auto r = get(c, "d-1", "acme");
+  const std::string redacted = hSeed("d-1", "acme");
+  auto c = hApi(ctx);
+  const auto r = hGet(c, "d-1", "acme");
   ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text());
-  ctx.Assert(!parsed(r).contains("redacted_text"), "the audit read returns the stored output: %s. It is a second copy of the document", r.Text());
+  ctx.Assert(!hParsed(r).contains("redacted_text"), "the audit read returns the stored output: %s. It is a second copy of the document", r.Text());
   ctx.Assert(r.Text().find("Reach Ada") == std::string::npos && r.Text().find(redacted) == std::string::npos, "the audit read carries text: %s", r.Text());
 }
 
 void CheckOffsets(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const auto& [document_id, text] : std::vector<std::pair<std::string, std::string>>{{"d-1", kText}, {"d-2", kMixed}}) {
-    const std::string redacted = seed(document_id, "acme", text);
-    const auto body = parsed(get(c, document_id, "acme"));
+  auto c = hApi(ctx);
+  for (const auto& [document_id, text] : std::vector<std::pair<std::string, std::string>>{{"d-1", kHText}, {"d-2", kHMixed}}) {
+    const std::string redacted = hSeed(document_id, "acme", text);
+    const auto body = hParsed(hGet(c, document_id, "acme"));
     const auto found = body.value("spans", nlohmann::json::array());
     ctx.Assert(!found.empty(), "the answer for %s must carry the spans with their replacements, got %s", document_id, body.dump());
     ctx.Equal(body.value("entity_types", nlohmann::json()), nlohmann::json::array({"EMAIL", "PHONE"}), "entity_types must be the sorted types, each once, for %s", document_id);

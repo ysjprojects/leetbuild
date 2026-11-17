@@ -985,19 +985,19 @@ import (
 	"leetbuild/harness"
 )
 
-const apiText = "I was charged twice, please refund"
+const kHApiText = "I was charged twice, please refund"
 
 // modelPeer is the stand-in model: answers from classifier/labeler.
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedModelServer
 }
 
-func (modelPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (HModelPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	labels, refused := labeler.Classify(req.GetText())
 	return &pb.ClassifyReply{Labels: labels, Refused: refused, ModelVersion: labeler.Version}, nil
 }
 
-type apiReply struct {
+type HApiReply struct {
 	TaxonomyID      string   \`json:"taxonomy_id"\`
 	TaxonomyVersion int      \`json:"taxonomy_version"\`
 	Labels          []string \`json:"labels"\`
@@ -1006,8 +1006,8 @@ type apiReply struct {
 	ModelVersion    string   \`json:"model_version"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &modelPeer{})
+func hApi(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &HModelPeer{})
 	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security"})
 	ctx.NoError(err, "seeding tx-support")
 	_, err = taxonomies.PutVersion(context.Background(), "globex", "tx-legal", []string{"billing", "legal"})
@@ -1017,7 +1017,7 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, tenant, mimeType, text string, version int) *harness.Response {
+func hApiPost(c *harness.HTTP, tenant, mimeType, text string, version int) *harness.Response {
 	body := map[string]any{"taxonomy_id": "tx-support", "mime_type": mimeType, "text": text}
 	if version > 0 {
 		body["taxonomy_version"] = version
@@ -1028,100 +1028,100 @@ func apiPost(c *harness.HTTP, tenant, mimeType, text string, version int) *harne
 	return c.Post("/v1/classify", body, "X-Tenant-Id", tenant)
 }
 
-func apiDecode(r *harness.Response) apiReply {
-	var reply apiReply
+func hApiDecode(r *harness.Response) HApiReply {
+	var reply HApiReply
 	r.Decode(&reply)
 	return reply
 }
 
-func apiCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Classify", "")) }
+func hApiCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Classify", "")) }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := apiPost(c, "acme", "text/plain", apiText, 0)
+	c := hApi(ctx)
+	r := hApiPost(c, "acme", "text/plain", kHApiText, 0)
 	ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text())
-	reply := apiDecode(r)
+	reply := hApiDecode(r)
 	ctx.Equal(reply.Labels, []string{"billing"}, "a refund question must be labeled billing (%s)", r.Text())
 	ctx.Assert(reply.TaxonomyID == "tx-support" && reply.TaxonomyVersion == 1, "the response must name taxonomy tx-support version 1, got %s", r.Text())
 	ctx.Assert(reply.Provenance == "model" && reply.ModelVersion == labeler.Version, "the response must carry the model's provenance and version, got %s", r.Text())
-	ctx.Equal(apiCalls(ctx), 1, "one document must cost one model call; Classify calls")
+	ctx.Equal(hApiCalls(ctx), 1, "one document must cost one model call; Classify calls")
 }
 
 func CheckContentType(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := apiPost(c, "acme", "image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ", 0)
+	c := hApi(ctx)
+	r := hApiPost(c, "acme", "image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ", 0)
 	ctx.Equal(r.Status, 415, "a document of type image/png (%s)", r.Text())
-	ctx.Equal(apiCalls(ctx), 0, "the image's bytes reached the model: only text/* may be classified; Classify calls")
-	r = apiPost(c, "acme", "application/octet-stream", apiText, 0)
+	ctx.Equal(hApiCalls(ctx), 0, "the image's bytes reached the model: only text/* may be classified; Classify calls")
+	r = hApiPost(c, "acme", "application/octet-stream", kHApiText, 0)
 	ctx.Equal(r.Status, 415, "a document of type application/octet-stream")
-	ctx.Equal(apiCalls(ctx), 0, "an octet stream reached the model; Classify calls")
-	r = apiPost(c, "acme", "application/pdf", apiText, 0)
+	ctx.Equal(hApiCalls(ctx), 0, "an octet stream reached the model; Classify calls")
+	r = hApiPost(c, "acme", "application/pdf", kHApiText, 0)
 	ctx.Equal(r.Status, 415, "a document of type application/pdf: every type outside text/* is refused, not only images and octet streams")
-	ctx.Equal(apiCalls(ctx), 0, "a PDF reached the model; Classify calls")
-	r = apiPost(c, "acme", "text/csv", apiText, 0)
+	ctx.Equal(hApiCalls(ctx), 0, "a PDF reached the model; Classify calls")
+	r = hApiPost(c, "acme", "text/csv", kHApiText, 0)
 	ctx.Equal(r.Status, 200, "a text/csv document is text and must be classified (%s)", r.Text())
-	r = apiPost(c, "acme", "text/markdown", apiText, 0)
+	r = hApiPost(c, "acme", "text/markdown", kHApiText, 0)
 	ctx.Equal(r.Status, 200, "a text/markdown document is text and must be classified (%s)", r.Text())
 }
 
 func CheckSizeAndEmpty(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := apiPost(c, "acme", "text/plain", "   \\n\\t  ", 0)
+	c := hApi(ctx)
+	r := hApiPost(c, "acme", "text/plain", "   \\n\\t  ", 0)
 	ctx.Equal(r.Status, 400, "a document of whitespace")
-	ctx.Equal(apiCalls(ctx), 0, "an empty document reached the model; Classify calls")
-	r = apiPost(c, "acme", "text/plain", strings.Repeat("a", 64*1024+1), 0)
+	ctx.Equal(hApiCalls(ctx), 0, "an empty document reached the model; Classify calls")
+	r = hApiPost(c, "acme", "text/plain", strings.Repeat("a", 64*1024+1), 0)
 	ctx.Equal(r.Status, 413, "a document of 64 KiB + 1 byte")
-	r = apiPost(c, "acme", "text/plain", strings.Repeat("é", 40000), 0)
+	r = hApiPost(c, "acme", "text/plain", strings.Repeat("é", 40000), 0)
 	ctx.Equal(r.Status, 413, "40000 accented letters are 80000 bytes of UTF-8: the cap counts bytes, not characters")
-	ctx.Equal(apiCalls(ctx), 0, "an oversized document reached the model; Classify calls")
-	r = apiPost(c, "acme", "text/plain", "  "+strings.Repeat("a", 64*1024)+"  ", 0)
+	ctx.Equal(hApiCalls(ctx), 0, "an oversized document reached the model; Classify calls")
+	r = hApiPost(c, "acme", "text/plain", "  "+strings.Repeat("a", 64*1024)+"  ", 0)
 	ctx.Equal(r.Status, 200, "64 KiB of text with surrounding spaces: the cap applies to the trimmed text")
-	r = apiPost(c, "acme", "text/plain", "  refuse: please refund  ", 0)
-	ctx.Assert(r.Status == 200 && apiDecode(r).Provenance == "fallback", "the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got %d %s", r.Status, r.Text())
+	r = hApiPost(c, "acme", "text/plain", "  refuse: please refund  ", 0)
+	ctx.Assert(r.Status == 200 && hApiDecode(r).Provenance == "fallback", "the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got %d %s", r.Status, r.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := apiPost(c, "", "text/plain", apiText, 0)
+	c := hApi(ctx)
+	r := hApiPost(c, "", "text/plain", kHApiText, 0)
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
-	r = apiPost(c, "globex", "text/plain", apiText, 0)
+	r = hApiPost(c, "globex", "text/plain", kHApiText, 0)
 	ctx.Equal(r.Status, 404, "tenant globex classified against acme's taxonomy tx-support")
-	ctx.Equal(apiCalls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls")
-	r = apiPost(c, "acme", "text/plain", apiText, 2)
+	ctx.Equal(hApiCalls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls")
+	r = hApiPost(c, "acme", "text/plain", kHApiText, 2)
 	ctx.Equal(r.Status, 404, "a request for version 2 of a taxonomy that has only version 1")
-	ctx.Equal(apiCalls(ctx), 0, "a request for a version that does not exist reached the model; Classify calls")
+	ctx.Equal(hApiCalls(ctx), 0, "a request for a version that does not exist reached the model; Classify calls")
 	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security", "abuse"})
 	ctx.NoError(err, "publishing version 2")
-	r = apiPost(c, "acme", "text/plain", apiText, 1)
-	ctx.Assert(r.Status == 200 && apiDecode(r).TaxonomyVersion == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text())
-	r = apiPost(c, "acme", "text/plain", apiText, 0)
-	ctx.Assert(r.Status == 200 && apiDecode(r).TaxonomyVersion == 2, "without a version the latest (2) applies, got %d %s", r.Status, r.Text())
+	r = hApiPost(c, "acme", "text/plain", kHApiText, 1)
+	ctx.Assert(r.Status == 200 && hApiDecode(r).TaxonomyVersion == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text())
+	r = hApiPost(c, "acme", "text/plain", kHApiText, 0)
+	ctx.Assert(r.Status == 200 && hApiDecode(r).TaxonomyVersion == 2, "without a version the latest (2) applies, got %d %s", r.Status, r.Text())
 }
 
 func CheckTaxonomyBinding(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := apiPost(c, "acme", "text/plain", "refund my invoice #urgent", 0)
+	c := hApi(ctx)
+	r := hApiPost(c, "acme", "text/plain", "refund my invoice #urgent", 0)
 	ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text())
-	reply := apiDecode(r)
+	reply := hApiDecode(r)
 	ctx.Equal(reply.Labels, []string{"billing", "review"}, "the model invented 'urgent', which tx-support does not contain; the labels")
 	ctx.Equal(reply.UnknownLabels, []string{"urgent"}, "the invented label must be reported in unknown_labels")
-	r = apiPost(c, "acme", "text/plain", "hello there #weather", 0)
-	reply = apiDecode(r)
+	r = hApiPost(c, "acme", "text/plain", "hello there #weather", 0)
+	reply = hApiDecode(r)
 	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "review" && len(reply.UnknownLabels) == 1 && reply.UnknownLabels[0] == "weather", "with no known label the document goes to review alone, got %s", r.Text())
-	r = apiPost(c, "acme", "text/plain", "hello there", 0)
-	reply = apiDecode(r)
+	r = hApiPost(c, "acme", "text/plain", "hello there", 0)
+	reply = hApiDecode(r)
 	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "review" && len(reply.UnknownLabels) == 0, "a document the model gave no label goes to review, got %s", r.Text())
-	r = apiPost(c, "acme", "text/plain", "my screen is broken", 0)
-	reply = apiDecode(r)
+	r = hApiPost(c, "acme", "text/plain", "my screen is broken", 0)
+	reply = hApiDecode(r)
 	ctx.Assert(len(reply.Labels) == 1 && reply.Labels[0] == "support" && len(reply.UnknownLabels) == 0, "known labels pass through unchanged, got %s", r.Text())
 	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", []string{"billing", "support", "security", "urgent"})
 	ctx.NoError(err, "publishing version 2")
-	r = apiPost(c, "acme", "text/plain", "refund my invoice #urgent", 1)
-	reply = apiDecode(r)
+	r = hApiPost(c, "acme", "text/plain", "refund my invoice #urgent", 1)
+	reply = hApiDecode(r)
 	ctx.Assert(len(reply.Labels) == 2 && reply.Labels[0] == "billing" && reply.Labels[1] == "review" && len(reply.UnknownLabels) == 1 && reply.UnknownLabels[0] == "urgent",
 		"version 2 added 'urgent', but a request for version 1 binds to version 1's labels, got %s", r.Text())
-	r = apiPost(c, "acme", "text/plain", "refund my invoice #urgent", 0)
-	reply = apiDecode(r)
+	r = hApiPost(c, "acme", "text/plain", "refund my invoice #urgent", 0)
+	reply = hApiDecode(r)
 	ctx.Assert(len(reply.Labels) == 2 && reply.Labels[0] == "billing" && reply.Labels[1] == "urgent" && len(reply.UnknownLabels) == 0, "the latest version (2) contains 'urgent', got %s", r.Text())
 }
 `,
@@ -1135,10 +1135,10 @@ func CheckTaxonomyBinding(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "I was charged twice, please refund";
+const std::string kHText = "I was charged twice, please refund";
 
 // The stand-in model: answers from classifier/labeler.h.
-class ModelPeer final : public contentclassifier::Model::Service {
+class HModelPeer final : public contentclassifier::Model::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const contentclassifier::ClassifyRequest* req, contentclassifier::ClassifyReply* reply) override {
     const auto verdict = labeler::classify(req->text());
@@ -1149,10 +1149,10 @@ class ModelPeer final : public contentclassifier::Model::Service {
   }
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  static HModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer;
+  peer = new HModelPeer;
   ctx.GRPC.Server(config::kModel)->RegisterService(peer);
   taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security"});
   taxonomies::putVersion("globex", "tx-legal", {"billing", "legal"});
@@ -1163,120 +1163,120 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const std::string& tenant, const std::string& mime_type, const std::string& text, long version = 0) {
+harness::Response hPost(harness::HTTP& c, const std::string& tenant, const std::string& mime_type, const std::string& text, long version = 0) {
   nlohmann::json body = {{"taxonomy_id", "tx-support"}, {"mime_type", mime_type}, {"text", text}};
   if (version > 0) body["taxonomy_version"] = version;
   if (tenant.empty()) return c.Post("/v1/classify", body.dump(), "Content-Type", "application/json");
   return c.Post("/v1/classify", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json decode(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hDecode(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::vector<std::string> strings(const nlohmann::json& body, const std::string& field) {
+std::vector<std::string> hStrings(const nlohmann::json& body, const std::string& field) {
   return body.is_object() && body.contains(field) && body[field].is_array() ? body[field].get<std::vector<std::string>>() : std::vector<std::string>{"<missing>"};
 }
 
-long versionOf(const harness::Response& r) {
-  const auto body = decode(r);
+long hVersionOf(const harness::Response& r) {
+  const auto body = hDecode(r);
   return body.is_object() ? body.value("taxonomy_version", 0L) : 0L;
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, "acme", "text/plain", kText);
+  auto c = hApi(ctx);
+  const auto r = hPost(c, "acme", "text/plain", kHText);
   ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text());
-  const auto body = decode(r);
-  ctx.Equal(strings(body, "labels"), {"billing"}, "a refund question must be labeled billing (%s)", r.Text());
-  ctx.Assert(body.value("taxonomy_id", "") == "tx-support" && versionOf(r) == 1, "the response must name taxonomy tx-support version 1, got %s", r.Text());
+  const auto body = hDecode(r);
+  ctx.Equal(hStrings(body, "labels"), {"billing"}, "a refund question must be labeled billing (%s)", r.Text());
+  ctx.Assert(body.value("taxonomy_id", "") == "tx-support" && hVersionOf(r) == 1, "the response must name taxonomy tx-support version 1, got %s", r.Text());
   ctx.Assert(body.value("provenance", "") == "model" && body.value("model_version", "") == labeler::kVersion, "the response must carry the model's provenance and version, got %s", r.Text());
-  ctx.Equal(calls(ctx), 1, "one document must cost one model call; Classify calls");
+  ctx.Equal(hCalls(ctx), 1, "one document must cost one model call; Classify calls");
 }
 
 void CheckContentType(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "acme", "image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ");
+  auto c = hApi(ctx);
+  auto r = hPost(c, "acme", "image/png", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ");
   ctx.Equal(r.Status, 415, "a document of type image/png (%s)", r.Text());
-  ctx.Equal(calls(ctx), 0, "the image's bytes reached the model: only text/* may be classified; Classify calls");
-  r = post(c, "acme", "application/octet-stream", kText);
+  ctx.Equal(hCalls(ctx), 0, "the image's bytes reached the model: only text/* may be classified; Classify calls");
+  r = hPost(c, "acme", "application/octet-stream", kHText);
   ctx.Equal(r.Status, 415, "a document of type application/octet-stream");
-  ctx.Equal(calls(ctx), 0, "an octet stream reached the model; Classify calls");
-  r = post(c, "acme", "application/pdf", kText);
+  ctx.Equal(hCalls(ctx), 0, "an octet stream reached the model; Classify calls");
+  r = hPost(c, "acme", "application/pdf", kHText);
   ctx.Equal(r.Status, 415, "a document of type application/pdf: every type outside text/* is refused, not only images and octet streams");
-  ctx.Equal(calls(ctx), 0, "a PDF reached the model; Classify calls");
-  r = post(c, "acme", "text/csv", kText);
+  ctx.Equal(hCalls(ctx), 0, "a PDF reached the model; Classify calls");
+  r = hPost(c, "acme", "text/csv", kHText);
   ctx.Equal(r.Status, 200, "a text/csv document is text and must be classified (%s)", r.Text());
-  r = post(c, "acme", "text/markdown", kText);
+  r = hPost(c, "acme", "text/markdown", kHText);
   ctx.Equal(r.Status, 200, "a text/markdown document is text and must be classified (%s)", r.Text());
 }
 
 void CheckSizeAndEmpty(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "acme", "text/plain", "   \\n\\t  ");
+  auto c = hApi(ctx);
+  auto r = hPost(c, "acme", "text/plain", "   \\n\\t  ");
   ctx.Equal(r.Status, 400, "a document of whitespace");
-  ctx.Equal(calls(ctx), 0, "an empty document reached the model; Classify calls");
-  r = post(c, "acme", "text/plain", std::string(64 * 1024 + 1, 'a'));
+  ctx.Equal(hCalls(ctx), 0, "an empty document reached the model; Classify calls");
+  r = hPost(c, "acme", "text/plain", std::string(64 * 1024 + 1, 'a'));
   ctx.Equal(r.Status, 413, "a document of 64 KiB + 1 byte");
   std::string accented;
   for (int i = 0; i < 40000; i++) accented += "é";
-  r = post(c, "acme", "text/plain", accented);
+  r = hPost(c, "acme", "text/plain", accented);
   ctx.Equal(r.Status, 413, "40000 accented letters are 80000 bytes of UTF-8: the cap counts bytes, not characters");
-  ctx.Equal(calls(ctx), 0, "an oversized document reached the model; Classify calls");
-  r = post(c, "acme", "text/plain", "  " + std::string(64 * 1024, 'a') + "  ");
+  ctx.Equal(hCalls(ctx), 0, "an oversized document reached the model; Classify calls");
+  r = hPost(c, "acme", "text/plain", "  " + std::string(64 * 1024, 'a') + "  ");
   ctx.Equal(r.Status, 200, "64 KiB of text with surrounding spaces: the cap applies to the trimmed text");
-  r = post(c, "acme", "text/plain", "  refuse: please refund  ");
-  const auto refused = decode(r);
+  r = hPost(c, "acme", "text/plain", "  refuse: please refund  ");
+  const auto refused = hDecode(r);
   ctx.Assert(r.Status == 200 && refused.is_object() && refused.value("provenance", "") == "fallback",
              "the model must receive the trimmed text: it declines a document that starts with 'refuse:', yet '  refuse: please refund  ' got %d %s", r.Status, r.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "", "text/plain", kText);
+  auto c = hApi(ctx);
+  auto r = hPost(c, "", "text/plain", kHText);
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
-  r = post(c, "globex", "text/plain", kText);
+  r = hPost(c, "globex", "text/plain", kHText);
   ctx.Equal(r.Status, 404, "tenant globex classified against acme's taxonomy tx-support");
-  ctx.Equal(calls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls");
-  r = post(c, "acme", "text/plain", kText, 2);
+  ctx.Equal(hCalls(ctx), 0, "a request for another tenant's taxonomy reached the model; Classify calls");
+  r = hPost(c, "acme", "text/plain", kHText, 2);
   ctx.Equal(r.Status, 404, "a request for version 2 of a taxonomy that has only version 1");
-  ctx.Equal(calls(ctx), 0, "a request for a version that does not exist reached the model; Classify calls");
+  ctx.Equal(hCalls(ctx), 0, "a request for a version that does not exist reached the model; Classify calls");
   taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security", "abuse"});
-  r = post(c, "acme", "text/plain", kText, 1);
-  ctx.Assert(r.Status == 200 && versionOf(r) == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text());
-  r = post(c, "acme", "text/plain", kText);
-  ctx.Assert(r.Status == 200 && versionOf(r) == 2, "without a version the latest (2) applies, got %d %s", r.Status, r.Text());
+  r = hPost(c, "acme", "text/plain", kHText, 1);
+  ctx.Assert(r.Status == 200 && hVersionOf(r) == 1, "a request for version 1 must be classified against version 1, got %d %s", r.Status, r.Text());
+  r = hPost(c, "acme", "text/plain", kHText);
+  ctx.Assert(r.Status == 200 && hVersionOf(r) == 2, "without a version the latest (2) applies, got %d %s", r.Status, r.Text());
 }
 
 void CheckTaxonomyBinding(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "acme", "text/plain", "refund my invoice #urgent");
+  auto c = hApi(ctx);
+  auto r = hPost(c, "acme", "text/plain", "refund my invoice #urgent");
   ctx.Equal(r.Status, 200, "POST /v1/classify (%s)", r.Text());
-  auto body = decode(r);
-  ctx.Equal(strings(body, "labels"), {"billing", "review"}, "the model invented 'urgent', which tx-support does not contain; the labels");
-  ctx.Equal(strings(body, "unknown_labels"), {"urgent"}, "the invented label must be reported in unknown_labels");
-  r = post(c, "acme", "text/plain", "hello there #weather");
-  body = decode(r);
-  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"review"} && strings(body, "unknown_labels") == std::vector<std::string>{"weather"},
+  auto body = hDecode(r);
+  ctx.Equal(hStrings(body, "labels"), {"billing", "review"}, "the model invented 'urgent', which tx-support does not contain; the labels");
+  ctx.Equal(hStrings(body, "unknown_labels"), {"urgent"}, "the invented label must be reported in unknown_labels");
+  r = hPost(c, "acme", "text/plain", "hello there #weather");
+  body = hDecode(r);
+  ctx.Assert(hStrings(body, "labels") == std::vector<std::string>{"review"} && hStrings(body, "unknown_labels") == std::vector<std::string>{"weather"},
              "with no known label the document goes to review alone, got %s", r.Text());
-  r = post(c, "acme", "text/plain", "hello there");
-  body = decode(r);
-  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"review"} && strings(body, "unknown_labels").empty(),
+  r = hPost(c, "acme", "text/plain", "hello there");
+  body = hDecode(r);
+  ctx.Assert(hStrings(body, "labels") == std::vector<std::string>{"review"} && hStrings(body, "unknown_labels").empty(),
              "a document the model gave no label goes to review, got %s", r.Text());
-  r = post(c, "acme", "text/plain", "my screen is broken");
-  body = decode(r);
-  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"support"} && strings(body, "unknown_labels").empty(),
+  r = hPost(c, "acme", "text/plain", "my screen is broken");
+  body = hDecode(r);
+  ctx.Assert(hStrings(body, "labels") == std::vector<std::string>{"support"} && hStrings(body, "unknown_labels").empty(),
              "known labels pass through unchanged, got %s", r.Text());
   taxonomies::putVersion("acme", "tx-support", {"billing", "support", "security", "urgent"});
-  r = post(c, "acme", "text/plain", "refund my invoice #urgent", 1);
-  body = decode(r);
-  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"billing", "review"} && strings(body, "unknown_labels") == std::vector<std::string>{"urgent"},
+  r = hPost(c, "acme", "text/plain", "refund my invoice #urgent", 1);
+  body = hDecode(r);
+  ctx.Assert(hStrings(body, "labels") == std::vector<std::string>{"billing", "review"} && hStrings(body, "unknown_labels") == std::vector<std::string>{"urgent"},
              "version 2 added 'urgent', but a request for version 1 binds to version 1's labels, got %s", r.Text());
-  r = post(c, "acme", "text/plain", "refund my invoice #urgent");
-  body = decode(r);
-  ctx.Assert(strings(body, "labels") == std::vector<std::string>{"billing", "urgent"} && strings(body, "unknown_labels").empty(),
+  r = hPost(c, "acme", "text/plain", "refund my invoice #urgent");
+  body = hDecode(r);
+  ctx.Assert(hStrings(body, "labels") == std::vector<std::string>{"billing", "urgent"} && hStrings(body, "unknown_labels").empty(),
              "the latest version (2) contains 'urgent', got %s", r.Text());
 }
 `,

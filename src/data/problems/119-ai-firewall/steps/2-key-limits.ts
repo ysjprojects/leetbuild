@@ -810,36 +810,36 @@ import (
 )
 
 const (
-	limitKeyName    = "key-7f3a"
-	limitBody       = \`{"model":"assistant-v2","input":{"prompt":"What is the capital of France?"}}\`
-	limitCheckCount = 120
+	kHLimitKeyName    = "key-7f3a"
+	kHLimitBody       = \`{"model":"assistant-v2","input":{"prompt":"What is the capital of France?"}}\`
+	kHLimitCheckCount = 120
 )
 
 // limitWindowKey is the key of the current window: aifw:rl:key-7f3a:{floor(now / 60)} on the virtual clock.
-func limitWindowKey(ctx *harness.Ctx) string {
+func hLimitWindowKey(ctx *harness.Ctx) string {
 	return fmt.Sprintf("aifw:rl:key-7f3a:%d", ctx.Clock.Now()/60000)
 }
 
-type limitGuard struct{ pb.UnimplementedPromptGuardServer }
+type HLimitGuard struct{ pb.UnimplementedPromptGuardServer }
 
-func (limitGuard) Detect(_ context.Context, _ *pb.DetectRequest) (*pb.DetectReply, error) {
+func (HLimitGuard) Detect(_ context.Context, _ *pb.DetectRequest) (*pb.DetectReply, error) {
 	return &pb.DetectReply{Score: 99}, nil
 }
 
-type limitAssistant struct{ pb.UnimplementedAssistantServer }
+type HLimitAssistant struct{ pb.UnimplementedAssistantServer }
 
-func (limitAssistant) Chat(_ context.Context, _ *pb.ChatRequest) (*pb.ChatReply, error) {
+func (HLimitAssistant) Chat(_ context.Context, _ *pb.ChatRequest) (*pb.ChatReply, error) {
 	return &pb.ChatReply{Text: "Paris is the capital of France."}, nil
 }
 
 // limitedProxy is rateLimit wrapped around step 1's handler. The Go runtime compiles one step's
 // file at a time, so the handler is stood in here: a key check, the detector, the application.
-func limitedProxy(ctx *harness.Ctx) *harness.HTTP {
+func hLimitedProxy(ctx *harness.Ctx) *harness.HTTP {
 	// Start 15 s into a minute: the window cannot roll over mid-check, and a window's TTL (60 s from
 	// its first request) outlasts the minute it counts, so Retry-After is the TTL, not the minute's rest.
 	ctx.Clock.Advance(75 - float64(ctx.Clock.Now()%60000)/1000)
-	pb.RegisterPromptGuardServer(ctx.GRPC.Server(""), &limitGuard{})
-	pb.RegisterAssistantServer(ctx.GRPC.Server(""), &limitAssistant{})
+	pb.RegisterPromptGuardServer(ctx.GRPC.Server(""), &HLimitGuard{})
+	pb.RegisterAssistantServer(ctx.GRPC.Server(""), &HLimitAssistant{})
 	guardConn, _ := grpc.NewClient("promptguard:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	guard := pb.NewPromptGuardClient(guardConn)
 	appConn, _ := grpc.NewClient("llm-app:9001", grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -871,19 +871,19 @@ func limitedProxy(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(rateLimit(mux))
 }
 
-func limitPost(c *harness.HTTP, header ...string) *harness.Response {
-	return c.Post("/v1/chat", limitBody, append([]string{"Content-Type", "application/json"}, header...)...)
+func hLimitPost(c *harness.HTTP, header ...string) *harness.Response {
+	return c.Post("/v1/chat", kHLimitBody, append([]string{"Content-Type", "application/json"}, header...)...)
 }
 
-func limitBurst(c *harness.HTTP, n int) []int {
+func hLimitBurst(c *harness.HTTP, n int) []int {
 	statuses := make([]int, 0, n)
 	for range n {
-		statuses = append(statuses, limitPost(c, "X-Api-Key", limitKeyName).Status)
+		statuses = append(statuses, hLimitPost(c, "X-Api-Key", kHLimitKeyName).Status)
 	}
 	return statuses
 }
 
-func limitStatuses(n, status int, tail ...int) []int {
+func hLimitStatuses(n, status int, tail ...int) []int {
 	out := make([]int, 0, n+len(tail))
 	for range n {
 		out = append(out, status)
@@ -892,84 +892,84 @@ func limitStatuses(n, status int, tail ...int) []int {
 }
 
 // limitRetryAfter is Retry-After as a number, checked against the window key's TTL at the time of the answer.
-func limitRetryAfter(ctx *harness.Ctx, r *harness.Response, what string) int64 {
+func hLimitRetryAfter(ctx *harness.Ctx, r *harness.Response, what string) int64 {
 	value := r.Header.Get("Retry-After")
 	ctx.Assert(value != "", "%s: the 429 carries no Retry-After header; send the TTL the script returned", what)
-	ttl := ctx.Redis.TTL(limitWindowKey(ctx))
+	ttl := ctx.Redis.TTL(hLimitWindowKey(ctx))
 	n, err := strconv.ParseInt(value, 10, 64)
 	ctx.Assert(err == nil && n-ttl <= 1 && ttl-n <= 1, "%s: Retry-After is %q while the window's TTL is %d: Retry-After is the TTL the script returned, in seconds", what, value, ttl)
 	return n
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	c := limitedProxy(ctx)
+	c := hLimitedProxy(ctx)
 	// Another replica's requests land right after the first command that touches the window, so the
 	// window is full by the time this request is counted.
 	fill := func() any {
 		for _, key := range ctx.Redis.Keys("aifw:rl:*") {
-			ctx.Redis.Do("SET", key, limitCheckCount, "KEEPTTL")
+			ctx.Redis.Do("SET", key, kHLimitCheckCount, "KEEPTTL")
 		}
 		return nil
 	}
-	windowKey := limitWindowKey(ctx)
+	windowKey := hLimitWindowKey(ctx)
 	a, b := ctx.Redis.After(windowKey, fill), ctx.Redis.After("aifw:rl:key-7f3a", fill)
-	first := limitPost(c, "X-Api-Key", limitKeyName)
+	first := hLimitPost(c, "X-Api-Key", kHLimitKeyName)
 	ctx.Equal(first.Status, 200, "the first request on a fresh key (%s)", first.Text())
 	ctx.Assert(a.Fired || b.Fired, "the request touched none of %s / aifw:rl:key-7f3a in Redis (keys: %v)", windowKey, ctx.Redis.Keys("aifw:rl:*"))
 	keys := ctx.Redis.Keys("aifw:rl:*")
 	raw, _ := ctx.Redis.Get(keys[0])
 	count, _ := strconv.Atoi(raw)
-	ctx.Assert(count <= limitCheckCount, "the window holds %d after a request that was admitted: another replica filled it between your read and your increment, and your check used the stale count. Increment and check must be one server-side step (EVAL with INCR), not GET then INCR", count)
-	second := limitPost(c, "X-Api-Key", limitKeyName)
+	ctx.Assert(count <= kHLimitCheckCount, "the window holds %d after a request that was admitted: another replica filled it between your read and your increment, and your check used the stale count. Increment and check must be one server-side step (EVAL with INCR), not GET then INCR", count)
+	second := hLimitPost(c, "X-Api-Key", kHLimitKeyName)
 	ctx.Equal(second.Status, 429, "with the window filled by another replica the next request")
 }
 
 func CheckWindowTtl(ctx *harness.Ctx) {
-	c := limitedProxy(ctx)
-	windowKey := limitWindowKey(ctx)
+	c := hLimitedProxy(ctx)
+	windowKey := hLimitWindowKey(ctx)
 	// The key's TTL the moment the first command that touched it has run: one script has already set it.
 	bornTTL := int64(0)
 	born := ctx.Redis.After(windowKey, func() any {
 		bornTTL = ctx.Redis.TTL(windowKey)
 		return nil
 	})
-	ctx.Equal(limitBurst(c, limitCheckCount+1), limitStatuses(limitCheckCount, 200, 429), "a fresh key gets %d requests, then 429", limitCheckCount)
+	ctx.Equal(hLimitBurst(c, kHLimitCheckCount+1), hLimitStatuses(kHLimitCheckCount, 200, 429), "a fresh key gets %d requests, then 429", kHLimitCheckCount)
 	ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), []string{windowKey}, "the window keys (aifw:rl:%%s:%%d with window = floor(now / 60))")
 	ttl := ctx.Redis.TTL(windowKey)
 	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the script must EXPIRE the key it created (60 s), or the count lives forever", windowKey, ttl)
 	ctx.Assert(born.Fired && bornTTL > 0 && bornTTL <= 60, "right after the first command that touched %s its TTL was %d: EXPIRE ran in a command of its own, so a replica that dies in between leaves a count that never expires. The script sets EXPIRE when it creates the key", windowKey, bornTTL)
 	ctx.Clock.Advance(61)
-	r := limitPost(c, "X-Api-Key", limitKeyName)
+	r := hLimitPost(c, "X-Api-Key", kHLimitKeyName)
 	ctx.Equal(r.Status, 200, "61 s later, in a new window, the caller (the window must reset)")
-	ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), []string{limitWindowKey(ctx)}, "the window keys 61 s later (the old window expired)")
+	ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), []string{hLimitWindowKey(ctx)}, "the window keys 61 s later (the old window expired)")
 }
 
 func CheckRetryAfter(ctx *harness.Ctx) {
-	c := limitedProxy(ctx)
-	limitBurst(c, limitCheckCount)
-	r := limitPost(c, "X-Api-Key", limitKeyName)
-	ctx.Equal(r.Status, 429, "request %d", limitCheckCount+1)
-	first := limitRetryAfter(ctx, r, "on the first refusal")
+	c := hLimitedProxy(ctx)
+	hLimitBurst(c, kHLimitCheckCount)
+	r := hLimitPost(c, "X-Api-Key", kHLimitKeyName)
+	ctx.Equal(r.Status, 429, "request %d", kHLimitCheckCount+1)
+	first := hLimitRetryAfter(ctx, r, "on the first refusal")
 	ctx.Assert(first <= 60, "Retry-After is %d right after the window was created, expected at most 60", first)
 	ctx.Clock.Advance(20)
-	r = limitPost(c, "X-Api-Key", limitKeyName)
-	ctx.Equal(r.Status, 429, "20 s into the window request %d", limitCheckCount+2)
-	later := limitRetryAfter(ctx, r, "20 s into the window")
+	r = hLimitPost(c, "X-Api-Key", kHLimitKeyName)
+	ctx.Equal(r.Status, 429, "20 s into the window request %d", kHLimitCheckCount+2)
+	later := hLimitRetryAfter(ctx, r, "20 s into the window")
 	ctx.Assert(later <= first-19, "Retry-After went from %d to %d over 20 s: it must follow the TTL down, not restate a constant", first, later)
-	other := limitPost(c, "X-Api-Key", "key-b2c9")
+	other := hLimitPost(c, "X-Api-Key", "key-b2c9")
 	ctx.Equal(other.Status, 200, "another key (windows are per key)")
 }
 
 func CheckLimitFirst(ctx *harness.Ctx) {
-	c := limitedProxy(ctx)
-	statuses := limitBurst(c, limitCheckCount+1)
-	ctx.Equal(statuses[len(statuses)-1], 429, "request %d", limitCheckCount+1)
+	c := hLimitedProxy(ctx)
+	statuses := hLimitBurst(c, kHLimitCheckCount+1)
+	ctx.Equal(statuses[len(statuses)-1], 429, "request %d", kHLimitCheckCount+1)
 	detects := len(ctx.GRPC.CallsTo("Detect", ""))
 	chats := len(ctx.GRPC.CallsTo("Chat", ""))
-	ctx.Equal(detects, limitCheckCount, "%d requests' Detect calls: the refused request was scored before the limit answered. The limit runs before next.ServeHTTP; a refused request costs nothing", limitCheckCount+1)
-	ctx.Equal(chats, limitCheckCount, "%d requests' Chat calls: the refused request reached the application", limitCheckCount+1)
+	ctx.Equal(detects, kHLimitCheckCount, "%d requests' Detect calls: the refused request was scored before the limit answered. The limit runs before next.ServeHTTP; a refused request costs nothing", kHLimitCheckCount+1)
+	ctx.Equal(chats, kHLimitCheckCount, "%d requests' Chat calls: the refused request reached the application", kHLimitCheckCount+1)
 	before := ctx.Redis.Keys("aifw:rl:*")
-	r := limitPost(c)
+	r := hLimitPost(c)
 	ctx.Equal(r.Status, 401, "a request without a key (the route's 401)")
 	ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), before, "the window keys after a request without a key (it is the route's 401, not a window of its own)")
 }
@@ -984,14 +984,14 @@ func CheckLimitFirst(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kLimitKeyName = "key-7f3a";
+const std::string kHLimitKeyName = "key-7f3a";
 
 // The key of the current window: aifw:rl:key-7f3a:{floor(now / 60)} on the virtual clock.
-std::string limitWindowKey(harness::Ctx& ctx) { return "aifw:rl:key-7f3a:" + std::to_string(ctx.Clock.Now() / 60000); }
-const std::string kLimitBody = R"({"model":"assistant-v2","input":{"prompt":"What is the capital of France?"}})";
-constexpr int kLimitCount = 120;
+std::string hLimitWindowKey(harness::Ctx& ctx) { return "aifw:rl:key-7f3a:" + std::to_string(ctx.Clock.Now() / 60000); }
+const std::string kHLimitBody = R"({"model":"assistant-v2","input":{"prompt":"What is the capital of France?"}})";
+constexpr int kHLimitCount = 120;
 
-class LimitGuard final : public firewall::PromptGuard::Service {
+class HLimitGuard final : public firewall::PromptGuard::Service {
  public:
   grpc::Status Detect(grpc::ServerContext*, const firewall::DetectRequest*, firewall::DetectReply* reply) override {
     reply->set_score(99);
@@ -999,7 +999,7 @@ class LimitGuard final : public firewall::PromptGuard::Service {
   }
 };
 
-class LimitAssistant final : public firewall::Assistant::Service {
+class HLimitAssistant final : public firewall::Assistant::Service {
  public:
   grpc::Status Chat(grpc::ServerContext*, const firewall::ChatRequest*, firewall::ChatReply* reply) override {
     reply->set_text("Paris is the capital of France.");
@@ -1008,49 +1008,49 @@ class LimitAssistant final : public firewall::Assistant::Service {
 };
 
 // Step 1's handler with the limit installed ahead of it.
-struct LimitedProxy {
-  LimitGuard guard;
-  LimitAssistant assistant;
+struct HLimitedProxy {
+  HLimitGuard guard;
+  HLimitAssistant assistant;
   httplib::Server svr;
 };
 
-LimitedProxy* proxy = nullptr;
+HLimitedProxy* hProxy = nullptr;
 
-harness::HTTP limitedProxy(harness::Ctx& ctx) {
+harness::HTTP hLimitedProxy(harness::Ctx& ctx) {
   // Start 15 s into a minute: the window cannot roll over mid-check, and a window's TTL (60 s from
   // its first request) outlasts the minute it counts, so Retry-After is the TTL, not the minute's rest.
   ctx.Clock.Advance(75 - static_cast<double>(ctx.Clock.Now() % 60000) / 1000);
-  delete proxy;
-  proxy = new LimitedProxy;
-  ctx.GRPC.Server("")->RegisterService(&proxy->guard);
-  ctx.GRPC.Server("")->RegisterService(&proxy->assistant);
-  install_rate_limit(proxy->svr);
-  register_chat(proxy->svr);
-  return ctx.HTTP(proxy->svr);
+  delete hProxy;
+  hProxy = new HLimitedProxy;
+  ctx.GRPC.Server("")->RegisterService(&hProxy->guard);
+  ctx.GRPC.Server("")->RegisterService(&hProxy->assistant);
+  install_rate_limit(hProxy->svr);
+  register_chat(hProxy->svr);
+  return ctx.HTTP(hProxy->svr);
 }
 
 template <class... H>
-harness::Response limitPost(harness::HTTP& c, const H&... header) {
-  return c.Post("/v1/chat", kLimitBody, "Content-Type", "application/json", header...);
+harness::Response hLimitPost(harness::HTTP& c, const H&... header) {
+  return c.Post("/v1/chat", kHLimitBody, "Content-Type", "application/json", header...);
 }
 
-std::vector<int> limitBurst(harness::HTTP& c, int n) {
+std::vector<int> hLimitBurst(harness::HTTP& c, int n) {
   std::vector<int> statuses;
-  for (int i = 0; i < n; i++) statuses.push_back(limitPost(c, "X-Api-Key", kLimitKeyName).Status);
+  for (int i = 0; i < n; i++) statuses.push_back(hLimitPost(c, "X-Api-Key", kHLimitKeyName).Status);
   return statuses;
 }
 
-std::vector<int> limitStatuses(int n, int status, std::vector<int> tail = {}) {
+std::vector<int> hLimitStatuses(int n, int status, std::vector<int> tail = {}) {
   std::vector<int> out(static_cast<size_t>(n), status);
   out.insert(out.end(), tail.begin(), tail.end());
   return out;
 }
 
 // Retry-After as a number, checked against the window key's TTL at the time of the answer.
-long long limitRetryAfter(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+long long hLimitRetryAfter(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   const std::string value = r.HeaderValue("Retry-After");
   ctx.Assert(!value.empty(), "%s: the 429 carries no Retry-After header; send the TTL the script returned", what);
-  const long long ttl = ctx.Redis.TTL(limitWindowKey(ctx));
+  const long long ttl = ctx.Redis.TTL(hLimitWindowKey(ctx));
   char* end = nullptr;
   const long long n = std::strtoll(value.c_str(), &end, 10);
   ctx.Assert(end != value.c_str() && *end == 0 && n - ttl <= 1 && ttl - n <= 1,
@@ -1062,35 +1062,35 @@ long long limitRetryAfter(harness::Ctx& ctx, const harness::Response& r, const s
 }  // namespace
 
 void CheckAtomic(harness::Ctx& ctx) {
-  auto c = limitedProxy(ctx);
+  auto c = hLimitedProxy(ctx);
   // Another replica's requests land right after the first command that touches the window, so the
   // window is full by the time this request is counted.
   bool fired = false;
   const auto fill = [&ctx, &fired] {
     fired = true;
-    for (const auto& key : ctx.Redis.Keys("aifw:rl:*")) ctx.Redis.Do("SET", key, kLimitCount, "KEEPTTL");
+    for (const auto& key : ctx.Redis.Keys("aifw:rl:*")) ctx.Redis.Do("SET", key, kHLimitCount, "KEEPTTL");
   };
-  const std::string windowKey = limitWindowKey(ctx);
+  const std::string windowKey = hLimitWindowKey(ctx);
   ctx.Redis.After(windowKey, fill);
   ctx.Redis.After("aifw:rl:key-7f3a", fill);
-  const auto first = limitPost(c, "X-Api-Key", kLimitKeyName);
+  const auto first = hLimitPost(c, "X-Api-Key", kHLimitKeyName);
   ctx.Equal(first.Status, 200, "the first request on a fresh key (%s)", first.Text());
   ctx.Assert(fired, "the request touched none of %s / aifw:rl:key-7f3a in Redis (keys: %v)", windowKey,
              ctx.Redis.Keys("aifw:rl:*"));
   const auto keys = ctx.Redis.Keys("aifw:rl:*");
   const long long count = std::strtoll(ctx.Redis.Get(keys[0]).value_or("0").c_str(), nullptr, 10);
-  ctx.Assert(count <= kLimitCount,
+  ctx.Assert(count <= kHLimitCount,
              "the window holds %d after a request that was admitted: another replica filled it between your read and "
              "your increment, and your check used the stale count. Increment and check must be one server-side step "
              "(EVAL with INCR), not GET then INCR",
              count);
-  const auto second = limitPost(c, "X-Api-Key", kLimitKeyName);
+  const auto second = hLimitPost(c, "X-Api-Key", kHLimitKeyName);
   ctx.Equal(second.Status, 429, "with the window filled by another replica the next request");
 }
 
 void CheckWindowTtl(harness::Ctx& ctx) {
-  auto c = limitedProxy(ctx);
-  const std::string windowKey = limitWindowKey(ctx);
+  auto c = hLimitedProxy(ctx);
+  const std::string windowKey = hLimitWindowKey(ctx);
   // The key's TTL the moment the first command that touched it has run: one script has already set it.
   bool born = false;
   long long bornTtl = 0;
@@ -1098,8 +1098,8 @@ void CheckWindowTtl(harness::Ctx& ctx) {
     born = true;
     bornTtl = ctx.Redis.TTL(windowKey);
   });
-  ctx.Equal(limitBurst(c, kLimitCount + 1), limitStatuses(kLimitCount, 200, {429}), "a fresh key gets %d requests, then 429",
-            kLimitCount);
+  ctx.Equal(hLimitBurst(c, kHLimitCount + 1), hLimitStatuses(kHLimitCount, 200, {429}), "a fresh key gets %d requests, then 429",
+            kHLimitCount);
   ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), {windowKey},
             "the window keys (aifw:rl:{api_key}:{window} with window = floor(now / 60))");
   const long long ttl = ctx.Redis.TTL(windowKey);
@@ -1111,41 +1111,41 @@ void CheckWindowTtl(harness::Ctx& ctx) {
              "the key",
              windowKey, bornTtl);
   ctx.Clock.Advance(61);
-  const auto r = limitPost(c, "X-Api-Key", kLimitKeyName);
+  const auto r = hLimitPost(c, "X-Api-Key", kHLimitKeyName);
   ctx.Equal(r.Status, 200, "61 s later, in a new window, the caller (the window must reset)");
-  ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), {limitWindowKey(ctx)}, "the window keys 61 s later (the old window expired)");
+  ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), {hLimitWindowKey(ctx)}, "the window keys 61 s later (the old window expired)");
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {
-  auto c = limitedProxy(ctx);
-  limitBurst(c, kLimitCount);
-  auto r = limitPost(c, "X-Api-Key", kLimitKeyName);
-  ctx.Equal(r.Status, 429, "request %d", kLimitCount + 1);
-  const long long first = limitRetryAfter(ctx, r, "on the first refusal");
+  auto c = hLimitedProxy(ctx);
+  hLimitBurst(c, kHLimitCount);
+  auto r = hLimitPost(c, "X-Api-Key", kHLimitKeyName);
+  ctx.Equal(r.Status, 429, "request %d", kHLimitCount + 1);
+  const long long first = hLimitRetryAfter(ctx, r, "on the first refusal");
   ctx.Assert(first <= 60, "Retry-After is %d right after the window was created, expected at most 60", first);
   ctx.Clock.Advance(20);
-  r = limitPost(c, "X-Api-Key", kLimitKeyName);
-  ctx.Equal(r.Status, 429, "20 s into the window request %d", kLimitCount + 2);
-  const long long later = limitRetryAfter(ctx, r, "20 s into the window");
+  r = hLimitPost(c, "X-Api-Key", kHLimitKeyName);
+  ctx.Equal(r.Status, 429, "20 s into the window request %d", kHLimitCount + 2);
+  const long long later = hLimitRetryAfter(ctx, r, "20 s into the window");
   ctx.Assert(later <= first - 19, "Retry-After went from %d to %d over 20 s: it must follow the TTL down, not restate a constant",
              first, later);
-  const auto other = limitPost(c, "X-Api-Key", "key-b2c9");
+  const auto other = hLimitPost(c, "X-Api-Key", "key-b2c9");
   ctx.Equal(other.Status, 200, "another key (windows are per key)");
 }
 
 void CheckLimitFirst(harness::Ctx& ctx) {
-  auto c = limitedProxy(ctx);
-  const auto statuses = limitBurst(c, kLimitCount + 1);
-  ctx.Equal(statuses.back(), 429, "request %d", kLimitCount + 1);
+  auto c = hLimitedProxy(ctx);
+  const auto statuses = hLimitBurst(c, kHLimitCount + 1);
+  ctx.Equal(statuses.back(), 429, "request %d", kHLimitCount + 1);
   const auto detects = ctx.GRPC.CallsTo("Detect").size();
   const auto chats = ctx.GRPC.CallsTo("Chat").size();
-  ctx.Equal(detects, kLimitCount,
+  ctx.Equal(detects, kHLimitCount,
             "%d requests' Detect calls: the refused request was scored before the limit answered. The limit runs in a "
             "pre-routing handler; a refused request costs nothing",
-            kLimitCount + 1);
-  ctx.Equal(chats, kLimitCount, "%d requests' Chat calls: the refused request reached the application", kLimitCount + 1);
+            kHLimitCount + 1);
+  ctx.Equal(chats, kHLimitCount, "%d requests' Chat calls: the refused request reached the application", kHLimitCount + 1);
   const auto before = ctx.Redis.Keys("aifw:rl:*");
-  const auto r = limitPost(c);
+  const auto r = hLimitPost(c);
   ctx.Equal(r.Status, 401, "a request without a key (the route's 401)");
   ctx.Equal(ctx.Redis.Keys("aifw:rl:*"), before,
             "the window keys after a request without a key (it is the route's 401, not a window of its own)");

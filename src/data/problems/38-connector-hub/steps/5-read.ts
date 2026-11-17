@@ -783,16 +783,16 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readWorld(ctx *harness.Ctx) (*harness.HTTP, string, int64) {
+func hReadWorld(ctx *harness.Ctx) (*harness.HTTP, string, int64) {
 	mux := http.NewServeMux()
 	register(mux)
-	cid := store.Create(readBg, "acme", "github", "api.github.com", "vault:acme/github#4", 900).ConnectorID
+	cid := store.Create(hReadBg, "acme", "github", "api.github.com", "vault:acme/github#4", 900).ConnectorID
 	return ctx.HTTP(mux), cid, ctx.Clock.Now() / 1000
 }
 
-func seedHealth(ctx *harness.Ctx, connectorID string, fields map[string]int64) {
+func hSeedHealth(ctx *harness.Ctx, connectorID string, fields map[string]int64) {
 	args := []any{"HSET", "health:" + connectorID}
 	for k, v := range fields {
 		args = append(args, k, v)
@@ -800,7 +800,7 @@ func seedHealth(ctx *harness.Ctx, connectorID string, fields map[string]int64) {
 	ctx.Redis.Do(args...)
 }
 
-func readHealth(c *harness.HTTP, connectorID, tenant string) *harness.Response {
+func hReadHealth(c *harness.HTTP, connectorID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/connectors/" + connectorID + "/health")
 	}
@@ -808,7 +808,7 @@ func readHealth(c *harness.HTTP, connectorID, tenant string) *harness.Response {
 }
 
 func healthBody(ctx *harness.Ctx, c *harness.HTTP, connectorID, what string) map[string]any {
-	r := readHealth(c, connectorID, "acme")
+	r := hReadHealth(c, connectorID, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/connectors/%s/health %s (%s)", connectorID, what, r.Text())
 	var body map[string]any
 	r.Decode(&body)
@@ -816,8 +816,8 @@ func healthBody(ctx *harness.Ctx, c *harness.HTTP, connectorID, what string) map
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, cid, now := readWorld(ctx)
-	seedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0, "pages": 4, "records": 8})
+	c, cid, now := hReadWorld(ctx)
+	hSeedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0, "pages": 4, "records": 8})
 	body := healthBody(ctx, c, cid, "for a connector synced a minute ago")
 	ctx.Assert(body["connector_id"] == cid && body["status"] == "healthy", "a connector synced a minute ago must read healthy, got %v", body)
 	var absent []string
@@ -832,13 +832,13 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c, cid, now := readWorld(ctx)
-	other := store.Create(readBg, "globex", "slack", "slack.com", "vault:globex/slack#1", 900).ConnectorID
-	seedHealth(ctx, other, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60})
-	anon := readHealth(c, cid, "")
+	c, cid, now := hReadWorld(ctx)
+	other := store.Create(hReadBg, "globex", "slack", "slack.com", "vault:globex/slack#1", 900).ConnectorID
+	hSeedHealth(ctx, other, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60})
+	anon := hReadHealth(c, cid, "")
 	blank := c.Get("/v1/connectors/"+cid+"/health", "X-Tenant-Id", "")
-	foreign := readHealth(c, other, "acme")
-	missing := readHealth(c, "c-404", "acme")
+	foreign := hReadHealth(c, other, "acme")
+	missing := hReadHealth(c, "c-404", "acme")
 	ctx.Equal(anon.Status, 401, "a health read without X-Tenant-Id")
 	ctx.Equal(blank.Status, 401, "a health read with an empty X-Tenant-Id (an empty header names no tenant)")
 	ctx.Equal(foreign.Status, 404, "acme read globex's connector %s (%s): another tenant's connector", other, foreign.Text())
@@ -846,18 +846,18 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckStaleFromSuccess(ctx *harness.Ctx) {
-	c, cid, now := readWorld(ctx)
+	c, cid, now := hReadWorld(ctx)
 	// Every run fails, so last_run_at stays fresh; the last page landed three intervals ago.
-	seedHealth(ctx, cid, map[string]int64{"last_run_at": now - 30, "last_success_at": now - 2700, "consecutive_failures": 3, "open_until": 0})
-	daily := store.Create(readBg, "acme", "notion", "api.notion.com", "vault:acme/notion#1", 86400).ConnectorID
-	seedHealth(ctx, daily, map[string]int64{"last_run_at": now - 7200, "last_success_at": now - 7200, "consecutive_failures": 0, "open_until": 0})
-	never := store.Create(readBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
-	seedHealth(ctx, never, map[string]int64{"last_run_at": now - 30, "consecutive_failures": 1, "open_until": 0})
+	hSeedHealth(ctx, cid, map[string]int64{"last_run_at": now - 30, "last_success_at": now - 2700, "consecutive_failures": 3, "open_until": 0})
+	daily := store.Create(hReadBg, "acme", "notion", "api.notion.com", "vault:acme/notion#1", 86400).ConnectorID
+	hSeedHealth(ctx, daily, map[string]int64{"last_run_at": now - 7200, "last_success_at": now - 7200, "consecutive_failures": 0, "open_until": 0})
+	never := store.Create(hReadBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
+	hSeedHealth(ctx, never, map[string]int64{"last_run_at": now - 30, "consecutive_failures": 1, "open_until": 0})
 	// Exactly two intervals is not past them; one second more is.
-	edge := store.Create(readBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#1", 900).ConnectorID
-	seedHealth(ctx, edge, map[string]int64{"last_run_at": now - 1800, "last_success_at": now - 1800, "consecutive_failures": 0, "open_until": 0})
-	late := store.Create(readBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).ConnectorID
-	seedHealth(ctx, late, map[string]int64{"last_run_at": now - 30, "last_success_at": now - 1801, "consecutive_failures": 0, "open_until": 0})
+	edge := store.Create(hReadBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#1", 900).ConnectorID
+	hSeedHealth(ctx, edge, map[string]int64{"last_run_at": now - 1800, "last_success_at": now - 1800, "consecutive_failures": 0, "open_until": 0})
+	late := store.Create(hReadBg, "acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).ConnectorID
+	hSeedHealth(ctx, late, map[string]int64{"last_run_at": now - 30, "last_success_at": now - 1801, "consecutive_failures": 0, "open_until": 0})
 	failing := healthBody(ctx, c, cid, "for a connector whose runs fail")
 	quiet := healthBody(ctx, c, daily, "for a daily connector")
 	empty := healthBody(ctx, c, never, "for a connector that never landed a page")
@@ -873,8 +873,8 @@ func CheckStaleFromSuccess(ctx *harness.Ctx) {
 }
 
 func CheckBreakerState(ctx *harness.Ctx) {
-	c, cid, now := readWorld(ctx)
-	seedHealth(ctx, cid, map[string]int64{"last_run_at": now - 5, "last_success_at": now - 300, "consecutive_failures": 5, "open_until": now + 20})
+	c, cid, now := hReadWorld(ctx)
+	hSeedHealth(ctx, cid, map[string]int64{"last_run_at": now - 5, "last_success_at": now - 300, "consecutive_failures": 5, "open_until": now + 20})
 	body := healthBody(ctx, c, cid, "with the breaker open")
 	ctx.Assert(body["breaker"] == "open" && body["consecutive_failures"] == float64(5), "five consecutive failures and open_until 20 s ahead read %v: the answer must show breaker open and consecutive_failures 5", body)
 	ctx.Clock.Advance(30)
@@ -883,13 +883,13 @@ func CheckBreakerState(ctx *harness.Ctx) {
 }
 
 func CheckDisabledStatus(ctx *harness.Ctx) {
-	c, cid, now := readWorld(ctx)
-	seedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0})
-	store.Disable(readBg, cid, "vendor rejected the OAuth token (401)")
+	c, cid, now := hReadWorld(ctx)
+	hSeedHealth(ctx, cid, map[string]int64{"last_run_at": now - 60, "last_success_at": now - 60, "consecutive_failures": 0, "open_until": 0})
+	store.Disable(hReadBg, cid, "vendor rejected the OAuth token (401)")
 	// Disabled long ago: no page has landed since, and the read must still say why.
-	stale := store.Create(readBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
-	seedHealth(ctx, stale, map[string]int64{"last_run_at": now - 86400, "last_success_at": now - 86400, "consecutive_failures": 0, "open_until": 0})
-	store.Disable(readBg, stale, "vendor rejected the OAuth token (401)")
+	stale := store.Create(hReadBg, "acme", "slack", "slack.com", "vault:acme/slack#1", 900).ConnectorID
+	hSeedHealth(ctx, stale, map[string]int64{"last_run_at": now - 86400, "last_success_at": now - 86400, "consecutive_failures": 0, "open_until": 0})
+	store.Disable(hReadBg, stale, "vendor rejected the OAuth token (401)")
 	body := healthBody(ctx, c, cid, "for a disabled connector")
 	old := healthBody(ctx, c, stale, "for a connector disabled a day ago")
 	ctx.Equal(body["status"], "disabled", "a connector disabled on a rejected token syncs nothing until a human acts, and must say so (%v); the status", body)
@@ -908,32 +908,32 @@ func CheckDisabledStatus(ctx *harness.Ctx) {
 
 namespace {
 
-struct World {
+struct HWorld {
   harness::HTTP c;
   std::string cid;
   long long now;
 };
 
-World readWorld(harness::Ctx& ctx) {
+HWorld hReadWorld(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
   register_routes(*svr);
   const std::string cid = store::create("acme", "github", "api.github.com", "vault:acme/github#4", 900).connector_id;
-  return World{ctx.HTTP(*svr), cid, ctx.Clock.Now() / 1000};
+  return HWorld{ctx.HTTP(*svr), cid, ctx.Clock.Now() / 1000};
 }
 
-void seedHealth(harness::Ctx& ctx, const std::string& connector_id, const std::map<std::string, long long>& fields) {
+void hSeedHealth(harness::Ctx& ctx, const std::string& connector_id, const std::map<std::string, long long>& fields) {
   for (const auto& [k, v] : fields) ctx.Redis.Do("HSET", "health:" + connector_id, k, v);
 }
 
-harness::Response readHealth(harness::HTTP& c, const std::string& connector_id, const std::string& tenant) {
+harness::Response hReadHealth(harness::HTTP& c, const std::string& connector_id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/connectors/" + connector_id + "/health");
   return c.Get("/v1/connectors/" + connector_id + "/health", "X-Tenant-Id", tenant);
 }
 
 nlohmann::json healthBody(harness::Ctx& ctx, harness::HTTP& c, const std::string& connector_id, const std::string& what) {
-  const auto r = readHealth(c, connector_id, "acme");
+  const auto r = hReadHealth(c, connector_id, "acme");
   ctx.Equal(r.Status, 200, "GET /v1/connectors/%s/health %s (%s)", connector_id, what, r.Text());
   try {
     return nlohmann::json::parse(r.Text());
@@ -945,8 +945,8 @@ nlohmann::json healthBody(harness::Ctx& ctx, harness::HTTP& c, const std::string
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  World w = readWorld(ctx);
-  seedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}, {"pages", 4}, {"records", 8}});
+  HWorld w = hReadWorld(ctx);
+  hSeedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}, {"pages", 4}, {"records", 8}});
   const auto body = healthBody(ctx, w.c, w.cid, "for a connector synced a minute ago");
   ctx.Assert(body.value("connector_id", "") == w.cid && body.value("status", "") == "healthy", "a connector synced a minute ago must read healthy, got %s", body.dump());
   std::vector<std::string> absent;
@@ -959,13 +959,13 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  World w = readWorld(ctx);
+  HWorld w = hReadWorld(ctx);
   const std::string other = store::create("globex", "slack", "slack.com", "vault:globex/slack#1", 900).connector_id;
-  seedHealth(ctx, other, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}});
-  const auto anon = readHealth(w.c, w.cid, "");
+  hSeedHealth(ctx, other, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}});
+  const auto anon = hReadHealth(w.c, w.cid, "");
   const auto blank = w.c.Get("/v1/connectors/" + w.cid + "/health", "X-Tenant-Id", "");
-  const auto foreign = readHealth(w.c, other, "acme");
-  const auto missing = readHealth(w.c, "c-404", "acme");
+  const auto foreign = hReadHealth(w.c, other, "acme");
+  const auto missing = hReadHealth(w.c, "c-404", "acme");
   ctx.Equal(anon.Status, 401, "a health read without X-Tenant-Id");
   ctx.Equal(blank.Status, 401, "a health read with an empty X-Tenant-Id (an empty header names no tenant)");
   ctx.Equal(foreign.Status, 404, "acme read globex's connector %s (%s): another tenant's connector", other, foreign.Text());
@@ -974,18 +974,18 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckStaleFromSuccess(harness::Ctx& ctx) {
-  World w = readWorld(ctx);
+  HWorld w = hReadWorld(ctx);
   // Every run fails, so last_run_at stays fresh; the last page landed three intervals ago.
-  seedHealth(ctx, w.cid, {{"last_run_at", w.now - 30}, {"last_success_at", w.now - 2700}, {"consecutive_failures", 3}, {"open_until", 0}});
+  hSeedHealth(ctx, w.cid, {{"last_run_at", w.now - 30}, {"last_success_at", w.now - 2700}, {"consecutive_failures", 3}, {"open_until", 0}});
   const std::string daily = store::create("acme", "notion", "api.notion.com", "vault:acme/notion#1", 86400).connector_id;
-  seedHealth(ctx, daily, {{"last_run_at", w.now - 7200}, {"last_success_at", w.now - 7200}, {"consecutive_failures", 0}, {"open_until", 0}});
+  hSeedHealth(ctx, daily, {{"last_run_at", w.now - 7200}, {"last_success_at", w.now - 7200}, {"consecutive_failures", 0}, {"open_until", 0}});
   const std::string never = store::create("acme", "slack", "slack.com", "vault:acme/slack#1", 900).connector_id;
-  seedHealth(ctx, never, {{"last_run_at", w.now - 30}, {"consecutive_failures", 1}, {"open_until", 0}});
+  hSeedHealth(ctx, never, {{"last_run_at", w.now - 30}, {"consecutive_failures", 1}, {"open_until", 0}});
   // Exactly two intervals is not past them; one second more is.
   const std::string edge = store::create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#1", 900).connector_id;
-  seedHealth(ctx, edge, {{"last_run_at", w.now - 1800}, {"last_success_at", w.now - 1800}, {"consecutive_failures", 0}, {"open_until", 0}});
+  hSeedHealth(ctx, edge, {{"last_run_at", w.now - 1800}, {"last_success_at", w.now - 1800}, {"consecutive_failures", 0}, {"open_until", 0}});
   const std::string late = store::create("acme", "stripe", "api.stripe.com", "vault:acme/stripe#2", 900).connector_id;
-  seedHealth(ctx, late, {{"last_run_at", w.now - 30}, {"last_success_at", w.now - 1801}, {"consecutive_failures", 0}, {"open_until", 0}});
+  hSeedHealth(ctx, late, {{"last_run_at", w.now - 30}, {"last_success_at", w.now - 1801}, {"consecutive_failures", 0}, {"open_until", 0}});
   const auto failing = healthBody(ctx, w.c, w.cid, "for a connector whose runs fail");
   const auto quiet = healthBody(ctx, w.c, daily, "for a daily connector");
   const auto empty = healthBody(ctx, w.c, never, "for a connector that never landed a page");
@@ -1002,8 +1002,8 @@ void CheckStaleFromSuccess(harness::Ctx& ctx) {
 }
 
 void CheckBreakerState(harness::Ctx& ctx) {
-  World w = readWorld(ctx);
-  seedHealth(ctx, w.cid, {{"last_run_at", w.now - 5}, {"last_success_at", w.now - 300}, {"consecutive_failures", 5}, {"open_until", w.now + 20}});
+  HWorld w = hReadWorld(ctx);
+  hSeedHealth(ctx, w.cid, {{"last_run_at", w.now - 5}, {"last_success_at", w.now - 300}, {"consecutive_failures", 5}, {"open_until", w.now + 20}});
   auto body = healthBody(ctx, w.c, w.cid, "with the breaker open");
   ctx.Assert(body.value("breaker", "") == "open" && body.value("consecutive_failures", 0) == 5,
              "five consecutive failures and open_until 20 s ahead read %s: the answer must show breaker open and consecutive_failures 5", body.dump());
@@ -1013,12 +1013,12 @@ void CheckBreakerState(harness::Ctx& ctx) {
 }
 
 void CheckDisabledStatus(harness::Ctx& ctx) {
-  World w = readWorld(ctx);
-  seedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}});
+  HWorld w = hReadWorld(ctx);
+  hSeedHealth(ctx, w.cid, {{"last_run_at", w.now - 60}, {"last_success_at", w.now - 60}, {"consecutive_failures", 0}, {"open_until", 0}});
   store::disable(w.cid, "vendor rejected the OAuth token (401)");
   // Disabled long ago: no page has landed since, and the read must still say why.
   const std::string stale = store::create("acme", "slack", "slack.com", "vault:acme/slack#1", 900).connector_id;
-  seedHealth(ctx, stale, {{"last_run_at", w.now - 86400}, {"last_success_at", w.now - 86400}, {"consecutive_failures", 0}, {"open_until", 0}});
+  hSeedHealth(ctx, stale, {{"last_run_at", w.now - 86400}, {"last_success_at", w.now - 86400}, {"consecutive_failures", 0}, {"open_until", 0}});
   store::disable(stale, "vendor rejected the OAuth token (401)");
   const auto body = healthBody(ctx, w.c, w.cid, "for a disabled connector");
   const auto old = healthBody(ctx, w.c, stale, "for a connector disabled a day ago");

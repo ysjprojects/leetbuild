@@ -798,9 +798,9 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-func apiRows(n int) string {
+func hApiRows(n int) string {
 	var b strings.Builder
 	for i := 1; i <= n; i++ {
 		fmt.Fprintf(&b, "%d,review %d,pos\\n", i, i)
@@ -808,14 +808,14 @@ func apiRows(n int) string {
 	return b.String()
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // apiBody is a valid register body for sha with changes applied (a nil value removes the field).
-func apiBody(sha string, changes map[string]any) map[string]any {
+func hApiBody(sha string, changes map[string]any) map[string]any {
 	out := map[string]any{"dataset": "imdb-reviews", "version": "2026-01", "content_sha256": sha, "license": "cc-by-4.0", "owner": "team-lm"}
 	for k, v := range changes {
 		if v == nil {
@@ -828,9 +828,9 @@ func apiBody(sha string, changes map[string]any) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	sha := store.PutObject(apiBg, apiRows(12))
-	r := c.Post("/v1/datasets", apiBody(sha, nil), "X-Tenant-Id", "t1")
+	c := hApi(ctx)
+	sha := store.PutObject(hApiBg, hApiRows(12))
+	r := c.Post("/v1/datasets", hApiBody(sha, nil), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/datasets (%s)", r.Text())
 	var got struct {
 		Dataset       string \`json:"dataset"\`
@@ -839,19 +839,19 @@ func CheckRoute(ctx *harness.Ctx) {
 	}
 	r.Decode(&got)
 	ctx.Assert(got.Dataset == "imdb-reviews" && got.Version == "2026-01" && got.ContentSHA256 == sha, "the 201 must carry the record, got %s", r.Text())
-	rec := store.Version(apiBg, "imdb-reviews", "2026-01")
+	rec := store.Version(hApiBg, "imdb-reviews", "2026-01")
 	ctx.Assert(rec != nil && rec.Tenant == "t1", "the store holds %+v, expected the version under tenant t1", rec)
 }
 
 func CheckImmutable(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := store.PutObject(apiBg, apiRows(12))
-	second := store.PutObject(apiBg, apiRows(13))
-	r := c.Post("/v1/datasets", apiBody(first, nil), "X-Tenant-Id", "t1")
+	c := hApi(ctx)
+	first := store.PutObject(hApiBg, hApiRows(12))
+	second := store.PutObject(hApiBg, hApiRows(13))
+	r := c.Post("/v1/datasets", hApiBody(first, nil), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "the first register (%s)", r.Text())
-	again := c.Post("/v1/datasets", apiBody(second, nil), "X-Tenant-Id", "t1")
+	again := c.Post("/v1/datasets", hApiBody(second, nil), "X-Tenant-Id", "t1")
 	ctx.Equal(again.Status, 409, "re-registering imdb-reviews@2026-01 with other bytes")
-	rec := store.Version(apiBg, "imdb-reviews", "2026-01")
+	rec := store.Version(hApiBg, "imdb-reviews", "2026-01")
 	ctx.Equal(rec.ContentSHA256, first, "imdb-reviews@2026-01 must keep its first object (a run that quoted the version would read other bytes); its content_sha256")
 	// Another replica registers imdb-reviews@2026-02 right after the handler's first command on that
 	// key: whoever HSETNX picked as the winner, the answer must agree with what the store holds.
@@ -863,10 +863,10 @@ func CheckImmutable(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	raced := c.Post("/v1/datasets", apiBody(first, map[string]any{"version": "2026-02"}), "X-Tenant-Id", "t1")
+	raced := c.Post("/v1/datasets", hApiBody(first, map[string]any{"version": "2026-02"}), "X-Tenant-Id", "t1")
 	ctx.Assert(probe.Fired, "the register of imdb-reviews@2026-02 never touched its version record")
 	ctx.NoError(probe.Err, "the racing register")
-	held := store.Version(apiBg, "imdb-reviews", "2026-02")
+	held := store.Version(hApiBg, "imdb-reviews", "2026-02")
 	if raced.Status == 201 {
 		ctx.Assert(held.ContentSHA256 == first && held.Tenant == "t1", "two registers of imdb-reviews@2026-02 raced and both were told 201, but the store holds the other one's object: the existence check and the write are two round trips")
 	} else {
@@ -876,45 +876,45 @@ func CheckImmutable(ctx *harness.Ctx) {
 }
 
 func CheckLicense(ctx *harness.Ctx) {
-	c := api(ctx)
-	sha := store.PutObject(apiBg, apiRows(12))
-	r := c.Post("/v1/datasets", apiBody(sha, map[string]any{"license": "proprietary"}), "X-Tenant-Id", "t1")
+	c := hApi(ctx)
+	sha := store.PutObject(hApiBg, hApiRows(12))
+	r := c.Post("/v1/datasets", hApiBody(sha, map[string]any{"license": "proprietary"}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register under license proprietary")
-	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-01") == nil, "a refused license must leave nothing in the store")
-	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"license": "cc-by-nc-4.0"}), "X-Tenant-Id", "t1")
+	ctx.Assert(store.Version(hApiBg, "imdb-reviews", "2026-01") == nil, "a refused license must leave nothing in the store")
+	r = c.Post("/v1/datasets", hApiBody(sha, map[string]any{"license": "cc-by-nc-4.0"}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register under license cc-by-nc-4.0 (not on the allowlist)")
-	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-01") == nil, "a refused license must leave nothing in the store")
-	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-02", "license": nil}), "X-Tenant-Id", "t1")
+	ctx.Assert(store.Version(hApiBg, "imdb-reviews", "2026-01") == nil, "a refused license must leave nothing in the store")
+	r = c.Post("/v1/datasets", hApiBody(sha, map[string]any{"version": "2026-02", "license": nil}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register with no license")
-	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-03", "license": "mit"}), "X-Tenant-Id", "t1")
+	r = c.Post("/v1/datasets", hApiBody(sha, map[string]any{"version": "2026-03", "license": "mit"}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "a register under license mit (%s)", r.Text())
 }
 
 func CheckMeasuredSize(ctx *harness.Ctx) {
-	c := api(ctx)
-	rows := apiRows(12)
-	sha := store.PutObject(apiBg, rows)
-	r := c.Post("/v1/datasets", apiBody(sha, map[string]any{"size_bytes": 1, "row_count": 1}), "X-Tenant-Id", "t1")
+	c := hApi(ctx)
+	rows := hApiRows(12)
+	sha := store.PutObject(hApiBg, rows)
+	r := c.Post("/v1/datasets", hApiBody(sha, map[string]any{"size_bytes": 1, "row_count": 1}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "the register (%s)", r.Text())
-	rec := store.Version(apiBg, "imdb-reviews", "2026-01")
+	rec := store.Version(hApiBg, "imdb-reviews", "2026-01")
 	ctx.Assert(rec.SizeBytes == int64(len(rows)) && rec.RowCount == 12, "the record says %d bytes and %d rows, the object holds %d bytes in 12 rows: the caller's numbers were stored", rec.SizeBytes, rec.RowCount, len(rows))
-	r = c.Post("/v1/datasets", apiBody(strings.Repeat("0", 64), map[string]any{"version": "2026-02"}), "X-Tenant-Id", "t1")
+	r = c.Post("/v1/datasets", hApiBody(strings.Repeat("0", 64), map[string]any{"version": "2026-02"}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register naming a hash no object has")
-	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-02") == nil, "a version with no object behind it must not be stored")
+	ctx.Assert(store.Version(hApiBg, "imdb-reviews", "2026-02") == nil, "a version with no object behind it must not be stored")
 }
 
 func CheckRequiredFields(ctx *harness.Ctx) {
-	c := api(ctx)
-	sha := store.PutObject(apiBg, apiRows(12))
-	r := c.Post("/v1/datasets", apiBody(sha, map[string]any{"owner": nil}), "X-Tenant-Id", "t1")
+	c := hApi(ctx)
+	sha := store.PutObject(hApiBg, hApiRows(12))
+	r := c.Post("/v1/datasets", hApiBody(sha, map[string]any{"owner": nil}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register with no owner")
-	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-01") == nil, "a version with no owner must not be stored")
-	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-02", "tenant": "t1"}))
+	ctx.Assert(store.Version(hApiBg, "imdb-reviews", "2026-01") == nil, "a version with no owner must not be stored")
+	r = c.Post("/v1/datasets", hApiBody(sha, map[string]any{"version": "2026-02", "tenant": "t1"}))
 	ctx.Equal(r.Status, 401, "a register without X-Tenant-Id (its body naming tenant t1; the tenant comes from the header only)")
-	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-02") == nil, "a version with no tenant must not be stored")
-	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-03"}), "X-Tenant-Id", "t2")
+	ctx.Assert(store.Version(hApiBg, "imdb-reviews", "2026-02") == nil, "a version with no tenant must not be stored")
+	r = c.Post("/v1/datasets", hApiBody(sha, map[string]any{"version": "2026-03"}), "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 201, "a complete register (%s)", r.Text())
-	ctx.Equal(store.Version(apiBg, "imdb-reviews", "2026-03").Tenant, "t2", "the record must carry the caller's tenant")
+	ctx.Equal(store.Version(hApiBg, "imdb-reviews", "2026-03").Tenant, "t2", "the record must carry the caller's tenant")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -925,13 +925,13 @@ func CheckRequiredFields(ctx *harness.Ctx) {
 
 namespace {
 
-std::string rows(int n) {
+std::string hRows(int n) {
   std::string out;
   for (int i = 1; i <= n; i++) out += std::to_string(i) + ",review " + std::to_string(i) + ",pos\\n";
   return out;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -940,7 +940,7 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // A valid register body for sha with changes applied (a null value removes the field).
-std::string body(const std::string& sha, const nlohmann::json& changes = nlohmann::json::object()) {
+std::string hBody(const std::string& sha, const nlohmann::json& changes = nlohmann::json::object()) {
   nlohmann::json out = {{"dataset", "imdb-reviews"}, {"version", "2026-01"}, {"content_sha256", sha}, {"license", "cc-by-4.0"}, {"owner", "team-lm"}};
   for (const auto& [k, v] : changes.items()) {
     if (v.is_null()) out.erase(k);
@@ -949,7 +949,7 @@ std::string body(const std::string& sha, const nlohmann::json& changes = nlohman
   return out.dump();
 }
 
-harness::Response post(harness::HTTP& c, const std::string& payload, const std::string& tenant) {
+harness::Response hPost(harness::HTTP& c, const std::string& payload, const std::string& tenant) {
   if (tenant.empty()) return c.Post("/v1/datasets", payload, "Content-Type", "application/json");
   return c.Post("/v1/datasets", payload, "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
@@ -957,9 +957,9 @@ harness::Response post(harness::HTTP& c, const std::string& payload, const std::
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string sha = store::putObject(rows(12));
-  const auto r = post(c, body(sha), "t1");
+  auto c = hApi(ctx);
+  const std::string sha = store::putObject(hRows(12));
+  const auto r = hPost(c, hBody(sha), "t1");
   ctx.Equal(r.Status, 201, "POST /v1/datasets (%s)", r.Text());
   const auto got = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(got.is_object() && got.value("dataset", "") == "imdb-reviews" && got.value("version", "") == "2026-01" && got.value("content_sha256", "") == sha,
@@ -969,12 +969,12 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckImmutable(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string first = store::putObject(rows(12));
-  const std::string second = store::putObject(rows(13));
-  const auto r = post(c, body(first), "t1");
+  auto c = hApi(ctx);
+  const std::string first = store::putObject(hRows(12));
+  const std::string second = store::putObject(hRows(13));
+  const auto r = hPost(c, hBody(first), "t1");
   ctx.Equal(r.Status, 201, "the first register (%s)", r.Text());
-  const auto again = post(c, body(second), "t1");
+  const auto again = hPost(c, hBody(second), "t1");
   ctx.Equal(again.Status, 409, "re-registering imdb-reviews@2026-01 with other bytes");
   ctx.Equal(store::version("imdb-reviews", "2026-01")->content_sha256, first,
             "imdb-reviews@2026-01 must keep its first object (a run that quoted the version would read other bytes); its content_sha256");
@@ -990,7 +990,7 @@ void CheckImmutable(harness::Ctx& ctx) {
       ctx.Redis.Do("SADD", "dataset:imdb-reviews:versions", "2026-02");
     }
   });
-  const auto raced = post(c, body(first, {{"version", "2026-02"}}), "t1");
+  const auto raced = hPost(c, hBody(first, {{"version", "2026-02"}}), "t1");
   ctx.Assert(fired, "the register of imdb-reviews@2026-02 never touched its version record");
   const auto held = store::version("imdb-reviews", "2026-02");
   ctx.Assert(held.has_value(), "imdb-reviews@2026-02 is not in the store after two registers");
@@ -1004,45 +1004,45 @@ void CheckImmutable(harness::Ctx& ctx) {
 }
 
 void CheckLicense(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string sha = store::putObject(rows(12));
-  auto r = post(c, body(sha, {{"license", "proprietary"}}), "t1");
+  auto c = hApi(ctx);
+  const std::string sha = store::putObject(hRows(12));
+  auto r = hPost(c, hBody(sha, {{"license", "proprietary"}}), "t1");
   ctx.Equal(r.Status, 422, "a register under license proprietary");
   ctx.Assert(!store::version("imdb-reviews", "2026-01"), "a refused license must leave nothing in the store");
-  r = post(c, body(sha, {{"license", "cc-by-nc-4.0"}}), "t1");
+  r = hPost(c, hBody(sha, {{"license", "cc-by-nc-4.0"}}), "t1");
   ctx.Equal(r.Status, 422, "a register under license cc-by-nc-4.0 (not on the allowlist)");
   ctx.Assert(!store::version("imdb-reviews", "2026-01"), "a refused license must leave nothing in the store");
-  r = post(c, body(sha, {{"version", "2026-02"}, {"license", nullptr}}), "t1");
+  r = hPost(c, hBody(sha, {{"version", "2026-02"}, {"license", nullptr}}), "t1");
   ctx.Equal(r.Status, 422, "a register with no license");
-  r = post(c, body(sha, {{"version", "2026-03"}, {"license", "mit"}}), "t1");
+  r = hPost(c, hBody(sha, {{"version", "2026-03"}, {"license", "mit"}}), "t1");
   ctx.Equal(r.Status, 201, "a register under license mit (%s)", r.Text());
 }
 
 void CheckMeasuredSize(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string content = rows(12);
+  auto c = hApi(ctx);
+  const std::string content = hRows(12);
   const std::string sha = store::putObject(content);
-  auto r = post(c, body(sha, {{"size_bytes", 1}, {"row_count", 1}}), "t1");
+  auto r = hPost(c, hBody(sha, {{"size_bytes", 1}, {"row_count", 1}}), "t1");
   ctx.Equal(r.Status, 201, "the register (%s)", r.Text());
   const auto rec = store::version("imdb-reviews", "2026-01");
   ctx.Assert(rec && rec->size_bytes == static_cast<long long>(content.size()) && rec->row_count == 12,
              "the record says %d bytes and %d rows, the object holds %d bytes in 12 rows: the caller's numbers were stored",
              rec ? rec->size_bytes : 0LL, rec ? rec->row_count : 0LL, content.size());
-  r = post(c, body(std::string(64, '0'), {{"version", "2026-02"}}), "t1");
+  r = hPost(c, hBody(std::string(64, '0'), {{"version", "2026-02"}}), "t1");
   ctx.Equal(r.Status, 422, "a register naming a hash no object has");
   ctx.Assert(!store::version("imdb-reviews", "2026-02"), "a version with no object behind it must not be stored");
 }
 
 void CheckRequiredFields(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string sha = store::putObject(rows(12));
-  auto r = post(c, body(sha, {{"owner", nullptr}}), "t1");
+  auto c = hApi(ctx);
+  const std::string sha = store::putObject(hRows(12));
+  auto r = hPost(c, hBody(sha, {{"owner", nullptr}}), "t1");
   ctx.Equal(r.Status, 422, "a register with no owner");
   ctx.Assert(!store::version("imdb-reviews", "2026-01"), "a version with no owner must not be stored");
-  r = post(c, body(sha, {{"version", "2026-02"}, {"tenant", "t1"}}), "");
+  r = hPost(c, hBody(sha, {{"version", "2026-02"}, {"tenant", "t1"}}), "");
   ctx.Equal(r.Status, 401, "a register without X-Tenant-Id (its body naming tenant t1; the tenant comes from the header only)");
   ctx.Assert(!store::version("imdb-reviews", "2026-02"), "a version with no tenant must not be stored");
-  r = post(c, body(sha, {{"version", "2026-03"}}), "t2");
+  r = hPost(c, hBody(sha, {{"version", "2026-03"}}), "t2");
   ctx.Equal(r.Status, 201, "a complete register (%s)", r.Text());
   ctx.Equal(store::version("imdb-reviews", "2026-03")->tenant, "t2", "the record must carry the caller's tenant");
 }

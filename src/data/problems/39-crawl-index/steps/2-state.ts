@@ -941,52 +941,52 @@ import (
 )
 
 const (
-	stateJob = "nightly"
-	blogHost = "blog.example.com"
-	docsHost = "docs.example.com"
+	kHStateJob = "nightly"
+	kHBlogHost = "blog.example.com"
+	kHDocsHost = "docs.example.com"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func pageURL(host string, n int) string { return fmt.Sprintf("https://%s/p/%d", host, n) }
+func hPageURL(host string, n int) string { return fmt.Sprintf("https://%s/p/%d", host, n) }
 
-func mustEnqueue(ctx *harness.Ctx, host string, n int) {
-	ctx.NoError(enqueue(stateBg, stateJob, host, pageURL(host, n)), "enqueue(%s) failed", pageURL(host, n))
+func hMustEnqueue(ctx *harness.Ctx, host string, n int) {
+	ctx.NoError(enqueue(hStateBg, kHStateJob, host, hPageURL(host, n)), "enqueue(%s) failed", hPageURL(host, n))
 }
 
-func mustTake(ctx *harness.Ctx, host string, rate int) string {
-	url, err := take(stateBg, stateJob, host, rate)
-	ctx.NoError(err, "take(%s, %s) failed", stateJob, host)
+func hMustTake(ctx *harness.Ctx, host string, rate int) string {
+	url, err := take(hStateBg, kHStateJob, host, rate)
+	ctx.NoError(err, "take(%s, %s) failed", kHStateJob, host)
 	return url
 }
 
 func hostQueue(ctx *harness.Ctx, host string) []string {
-	return ctx.Redis.LRange("frontier:"+stateJob+":"+host, 0, -1)
+	return ctx.Redis.LRange("frontier:"+kHStateJob+":"+host, 0, -1)
 }
 
 func CheckPerHostQueue(ctx *harness.Ctx) {
-	mustEnqueue(ctx, blogHost, 1)
-	mustEnqueue(ctx, docsHost, 1)
-	mustEnqueue(ctx, blogHost, 2)
-	got := mustTake(ctx, docsHost, 60)
-	ctx.Equal(got, pageURL(docsHost, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", docsHost, stateJob, docsHost)
-	ctx.Equal(hostQueue(ctx, blogHost), []string{pageURL(blogHost, 1), pageURL(blogHost, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", stateJob, blogHost)
-	ctx.Equal(mustTake(ctx, blogHost, 60), pageURL(blogHost, 1), "a take for the blog must pop the blog's first URL")
-	ctx.Equal(ctx.Redis.ZCard("pending:"+stateJob), 3, "pending:%s must hold the 3 enqueued URLs", stateJob)
+	hMustEnqueue(ctx, kHBlogHost, 1)
+	hMustEnqueue(ctx, kHDocsHost, 1)
+	hMustEnqueue(ctx, kHBlogHost, 2)
+	got := hMustTake(ctx, kHDocsHost, 60)
+	ctx.Equal(got, hPageURL(kHDocsHost, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", kHDocsHost, kHStateJob, kHDocsHost)
+	ctx.Equal(hostQueue(ctx, kHBlogHost), []string{hPageURL(kHBlogHost, 1), hPageURL(kHBlogHost, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kHStateJob, kHBlogHost)
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), hPageURL(kHBlogHost, 1), "a take for the blog must pop the blog's first URL")
+	ctx.Equal(ctx.Redis.ZCard("pending:"+kHStateJob), 3, "pending:%s must hold the 3 enqueued URLs", kHStateJob)
 }
 
 func CheckAtomicTake(ctx *harness.Ctx) {
 	for n := 0; n < 3; n++ {
-		mustEnqueue(ctx, blogHost, n)
+		hMustEnqueue(ctx, kHBlogHost, n)
 	}
-	ctx.Equal(mustTake(ctx, blogHost, 1), pageURL(blogHost, 0), "the first take of a new bucket must hand out the first URL")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 1), hPageURL(kHBlogHost, 0), "the first take of a new bucket must hand out the first URL")
 	// One token is left. A second worker's take lands while this one is between its Redis commands.
-	rival := ctx.Redis.After("bucket:"+stateJob+":"+blogHost, func() any {
-		url, _ := take(stateBg, stateJob, blogHost, 1)
+	rival := ctx.Redis.After("bucket:"+kHStateJob+":"+kHBlogHost, func() any {
+		url, _ := take(hStateBg, kHStateJob, kHBlogHost, 1)
 		return url
 	})
-	mine := mustTake(ctx, blogHost, 1)
-	ctx.Assert(rival.Fired, "take never touched bucket:%s:%s", stateJob, blogHost)
+	mine := hMustTake(ctx, kHBlogHost, 1)
+	ctx.Assert(rival.Fired, "take never touched bucket:%s:%s", kHStateJob, kHBlogHost)
 	theirs, _ := rival.Result.(string)
 	var taken []string
 	for _, u := range []string{mine, theirs} {
@@ -995,24 +995,24 @@ func CheckAtomicTake(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(taken) == 1, "one token was left and two workers took %q: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script", taken)
-	ctx.Equal(hostQueue(ctx, blogHost), []string{pageURL(blogHost, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", stateJob, blogHost)
+	ctx.Equal(hostQueue(ctx, kHBlogHost), []string{hPageURL(kHBlogHost, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kHStateJob, kHBlogHost)
 }
 
 func CheckRefillCap(ctx *harness.Ctx) {
-	ctx.Equal(mustTake(ctx, blogHost, 60), "", "a take on an empty queue must answer nothing")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), "", "a take on an empty queue must answer nothing")
 	for n := 0; n < 8; n++ {
-		mustEnqueue(ctx, blogHost, n)
+		hMustEnqueue(ctx, kHBlogHost, n)
 	}
-	first := []string{mustTake(ctx, blogHost, 60), mustTake(ctx, blogHost, 60), mustTake(ctx, blogHost, 60)}
+	first := []string{hMustTake(ctx, kHBlogHost, 60), hMustTake(ctx, kHBlogHost, 60), hMustTake(ctx, kHBlogHost, 60)}
 	ctx.Assert(first[0] != "" && first[1] != "" && first[2] == "", "a new bucket holds BURST = 2 tokens and a take on an empty queue spends none: three takes answered %q", first)
 	ctx.Clock.Advance(0.5)
-	ctx.Equal(mustTake(ctx, blogHost, 60), "", "half a second at 60 per minute refills half a token: the take must answer nothing")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), "", "half a second at 60 per minute refills half a token: the take must answer nothing")
 	ctx.Clock.Advance(0.5)
-	ctx.Assert(mustTake(ctx, blogHost, 60) != "", "a second at 60 per minute refills one token: the take must answer a URL")
+	ctx.Assert(hMustTake(ctx, kHBlogHost, 60) != "", "a second at 60 per minute refills one token: the take must answer a URL")
 	ctx.Clock.Advance(3600)
 	got := 0
 	for i := 0; i < 5; i++ {
-		if mustTake(ctx, blogHost, 60) != "" {
+		if hMustTake(ctx, kHBlogHost, 60) != "" {
 			got++
 		}
 	}
@@ -1020,31 +1020,31 @@ func CheckRefillCap(ctx *harness.Ctx) {
 }
 
 func CheckThrottle(ctx *harness.Ctx) {
-	mustEnqueue(ctx, blogHost, 1)
-	mustEnqueue(ctx, blogHost, 2)
-	mustEnqueue(ctx, docsHost, 1)
-	ctx.NoError(throttle(stateBg, stateJob, blogHost, 30), "throttle failed")
-	ctx.Equal(mustTake(ctx, blogHost, 60), "", "right after a 429 with Retry-After 30 take must hand the throttled host nothing until the not-before time; take answered")
-	ctx.Equal(mustTake(ctx, docsHost, 60), pageURL(docsHost, 1), "a throttle on one host must not stop the others")
+	hMustEnqueue(ctx, kHBlogHost, 1)
+	hMustEnqueue(ctx, kHBlogHost, 2)
+	hMustEnqueue(ctx, kHDocsHost, 1)
+	ctx.NoError(throttle(hStateBg, kHStateJob, kHBlogHost, 30), "throttle failed")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), "", "right after a 429 with Retry-After 30 take must hand the throttled host nothing until the not-before time; take answered")
+	ctx.Equal(hMustTake(ctx, kHDocsHost, 60), hPageURL(kHDocsHost, 1), "a throttle on one host must not stop the others")
 	ctx.Clock.Advance(29)
-	ctx.Equal(mustTake(ctx, blogHost, 60), "", "29 s into a 30 s Retry-After the host must still get nothing")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), "", "29 s into a 30 s Retry-After the host must still get nothing")
 	ctx.Clock.Advance(2)
-	ctx.Equal(mustTake(ctx, blogHost, 60), pageURL(blogHost, 1), "once Retry-After has passed the host's next URL must be handed out")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), hPageURL(kHBlogHost, 1), "once Retry-After has passed the host's next URL must be handed out")
 }
 
 func CheckBucketTtl(ctx *harness.Ctx) {
-	mustEnqueue(ctx, blogHost, 1)
-	mustEnqueue(ctx, blogHost, 2)
-	key := "bucket:" + stateJob + ":" + blogHost
+	hMustEnqueue(ctx, kHBlogHost, 1)
+	hMustEnqueue(ctx, kHBlogHost, 2)
+	key := "bucket:" + kHStateJob + ":" + kHBlogHost
 	probe := ctx.Redis.After(key, func() any { return ctx.Redis.PTTL(key) })
-	mustTake(ctx, blogHost, 60)
+	hMustTake(ctx, kHBlogHost, 60)
 	ctx.Assert(probe.Fired, "take never touched %s", key)
 	early, _ := probe.Result.(int64)
 	ctx.Assert(early > 0, "right after the command that wrote %s its PTTL was %d: the expiry is set in the same script as the write, or a crash in between leaves a bucket that never expires", key, early)
 	ttl := ctx.Redis.PTTL(key)
 	ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl)
 	ctx.Clock.Advance(3000)
-	ctx.Equal(mustTake(ctx, blogHost, 60), pageURL(blogHost, 2), "the host's second URL must be handed out 3000 s later")
+	ctx.Equal(hMustTake(ctx, kHBlogHost, 60), hPageURL(kHBlogHost, 2), "the host's second URL must be handed out 3000 s later")
 	ttl = ctx.Redis.PTTL(key)
 	ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d right after a take: every take sets the expiry to BUCKET_TTL_MS again, not only the take that created the bucket", key, ttl)
 	ctx.Clock.Advance(3590)
@@ -1062,97 +1062,97 @@ func CheckBucketTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "nightly";
-const std::string kBlog = "blog.example.com";
-const std::string kDocs = "docs.example.com";
+const std::string kHJob = "nightly";
+const std::string kHBlog = "blog.example.com";
+const std::string kHDocs = "docs.example.com";
 
-std::string pageUrl(const std::string& host, int n) { return "https://" + host + "/p/" + std::to_string(n); }
+std::string hPageUrl(const std::string& host, int n) { return "https://" + host + "/p/" + std::to_string(n); }
 
 std::vector<std::string> hostQueue(harness::Ctx& ctx, const std::string& host) {
-  return ctx.Redis.LRange("frontier:" + kJob + ":" + host, 0, -1);
+  return ctx.Redis.LRange("frontier:" + kHJob + ":" + host, 0, -1);
 }
 
-std::string taken(const std::optional<std::string>& url) { return url.value_or(""); }
+std::string hTaken(const std::optional<std::string>& url) { return url.value_or(""); }
 
 }  // namespace
 
 void CheckPerHostQueue(harness::Ctx& ctx) {
-  enqueue(kJob, kBlog, pageUrl(kBlog, 1));
-  enqueue(kJob, kDocs, pageUrl(kDocs, 1));
-  enqueue(kJob, kBlog, pageUrl(kBlog, 2));
-  ctx.Equal(taken(take(kJob, kDocs, 60)), pageUrl(kDocs, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", kDocs, kJob, kDocs);
-  ctx.Equal(hostQueue(ctx, kBlog), {pageUrl(kBlog, 1), pageUrl(kBlog, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kJob, kBlog);
-  ctx.Equal(taken(take(kJob, kBlog, 60)), pageUrl(kBlog, 1), "a take for the blog must pop the blog's first URL");
-  ctx.Equal(ctx.Redis.ZCard("pending:" + kJob), 3, "pending:%s must hold the 3 enqueued URLs", kJob);
+  enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 1));
+  enqueue(kHJob, kHDocs, hPageUrl(kHDocs, 1));
+  enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 2));
+  ctx.Equal(hTaken(take(kHJob, kHDocs, 60)), hPageUrl(kHDocs, 1), "a take for %s must pop that host's URL, from frontier:%s:%s; take answered", kHDocs, kHJob, kHDocs);
+  ctx.Equal(hostQueue(ctx, kHBlog), {hPageUrl(kHBlog, 1), hPageUrl(kHBlog, 2)}, "frontier:%s:%s must hold the blog's two URLs in order", kHJob, kHBlog);
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), hPageUrl(kHBlog, 1), "a take for the blog must pop the blog's first URL");
+  ctx.Equal(ctx.Redis.ZCard("pending:" + kHJob), 3, "pending:%s must hold the 3 enqueued URLs", kHJob);
 }
 
 void CheckAtomicTake(harness::Ctx& ctx) {
-  for (int n = 0; n < 3; n++) enqueue(kJob, kBlog, pageUrl(kBlog, n));
-  ctx.Equal(taken(take(kJob, kBlog, 1)), pageUrl(kBlog, 0), "the first take of a new bucket must hand out the first URL");
+  for (int n = 0; n < 3; n++) enqueue(kHJob, kHBlog, hPageUrl(kHBlog, n));
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 1)), hPageUrl(kHBlog, 0), "the first take of a new bucket must hand out the first URL");
   // One token is left. A second worker's take lands while this one is between its Redis commands.
   auto fired = std::make_shared<bool>(false);
   auto theirs = std::make_shared<std::string>();
-  ctx.Redis.After("bucket:" + kJob + ":" + kBlog, [fired, theirs] {
+  ctx.Redis.After("bucket:" + kHJob + ":" + kHBlog, [fired, theirs] {
     *fired = true;
-    *theirs = take(kJob, kBlog, 1).value_or("");
+    *theirs = take(kHJob, kHBlog, 1).value_or("");
   });
-  const std::string mine = taken(take(kJob, kBlog, 1));
-  ctx.Assert(*fired, "take never touched bucket:%s:%s", kJob, kBlog);
+  const std::string mine = hTaken(take(kHJob, kHBlog, 1));
+  ctx.Assert(*fired, "take never touched bucket:%s:%s", kHJob, kHBlog);
   std::vector<std::string> both;
   for (const std::string& u : {mine, *theirs}) {
     if (!u.empty()) both.push_back(u);
   }
   ctx.Assert(both.size() == 1, "one token was left and two workers took %q: the bucket was read, then written, with the other worker in between. Read, refill, spend and pop in one Lua script", both);
-  ctx.Equal(hostQueue(ctx, kBlog), {pageUrl(kBlog, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kJob, kBlog);
+  ctx.Equal(hostQueue(ctx, kHBlog), {hPageUrl(kHBlog, 2)}, "frontier:%s:%s must keep the one URL nobody had a token for", kHJob, kHBlog);
 }
 
 void CheckRefillCap(harness::Ctx& ctx) {
-  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "a take on an empty queue must answer nothing");
-  for (int n = 0; n < 8; n++) enqueue(kJob, kBlog, pageUrl(kBlog, n));
-  const std::vector<std::string> first = {taken(take(kJob, kBlog, 60)), taken(take(kJob, kBlog, 60)), taken(take(kJob, kBlog, 60))};
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), "", "a take on an empty queue must answer nothing");
+  for (int n = 0; n < 8; n++) enqueue(kHJob, kHBlog, hPageUrl(kHBlog, n));
+  const std::vector<std::string> first = {hTaken(take(kHJob, kHBlog, 60)), hTaken(take(kHJob, kHBlog, 60)), hTaken(take(kHJob, kHBlog, 60))};
   ctx.Assert(!first[0].empty() && !first[1].empty() && first[2].empty(), "a new bucket holds kBurst = 2 tokens and a take on an empty queue spends none: three takes answered %q", first);
   ctx.Clock.Advance(0.5);
-  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "half a second at 60 per minute refills half a token: the take must answer nothing");
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), "", "half a second at 60 per minute refills half a token: the take must answer nothing");
   ctx.Clock.Advance(0.5);
-  ctx.Assert(!taken(take(kJob, kBlog, 60)).empty(), "a second at 60 per minute refills one token: the take must answer a URL");
+  ctx.Assert(!hTaken(take(kHJob, kHBlog, 60)).empty(), "a second at 60 per minute refills one token: the take must answer a URL");
   ctx.Clock.Advance(3600);
   int got = 0;
   for (int i = 0; i < 5; i++) {
-    if (take(kJob, kBlog, 60)) got++;
+    if (take(kHJob, kHBlog, 60)) got++;
   }
   ctx.Equal(got, 2, "after an hour idle the host got URLs back to back: tokens are capped at kBurst = 2, or an idle host gets hammered; the URLs");
 }
 
 void CheckThrottle(harness::Ctx& ctx) {
-  enqueue(kJob, kBlog, pageUrl(kBlog, 1));
-  enqueue(kJob, kBlog, pageUrl(kBlog, 2));
-  enqueue(kJob, kDocs, pageUrl(kDocs, 1));
-  throttle(kJob, kBlog, 30);
-  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "right after a 429 with Retry-After 30 take must hand the throttled host nothing until the not-before time; take answered");
-  ctx.Equal(taken(take(kJob, kDocs, 60)), pageUrl(kDocs, 1), "a throttle on one host must not stop the others");
+  enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 1));
+  enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 2));
+  enqueue(kHJob, kHDocs, hPageUrl(kHDocs, 1));
+  throttle(kHJob, kHBlog, 30);
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), "", "right after a 429 with Retry-After 30 take must hand the throttled host nothing until the not-before time; take answered");
+  ctx.Equal(hTaken(take(kHJob, kHDocs, 60)), hPageUrl(kHDocs, 1), "a throttle on one host must not stop the others");
   ctx.Clock.Advance(29);
-  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "29 s into a 30 s Retry-After the host must still get nothing");
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), "", "29 s into a 30 s Retry-After the host must still get nothing");
   ctx.Clock.Advance(2);
-  ctx.Equal(taken(take(kJob, kBlog, 60)), pageUrl(kBlog, 1), "once Retry-After has passed the host's next URL must be handed out");
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), hPageUrl(kHBlog, 1), "once Retry-After has passed the host's next URL must be handed out");
 }
 
 void CheckBucketTtl(harness::Ctx& ctx) {
-  enqueue(kJob, kBlog, pageUrl(kBlog, 1));
-  enqueue(kJob, kBlog, pageUrl(kBlog, 2));
-  const std::string key = "bucket:" + kJob + ":" + kBlog;
+  enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 1));
+  enqueue(kHJob, kHBlog, hPageUrl(kHBlog, 2));
+  const std::string key = "bucket:" + kHJob + ":" + kHBlog;
   auto fired = std::make_shared<bool>(false);
   auto early = std::make_shared<long long>(0);
   ctx.Redis.After(key, [&ctx, key, fired, early] {
     *fired = true;
     *early = ctx.Redis.PTTL(key);
   });
-  take(kJob, kBlog, 60);
+  take(kHJob, kHBlog, 60);
   ctx.Assert(*fired, "take never touched %s", key);
   ctx.Assert(*early > 0, "right after the command that wrote %s its PTTL was %d: the expiry is set in the same script as the write, or a crash in between leaves a bucket that never expires", key, *early);
   long long ttl = ctx.Redis.PTTL(key);
   ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire kBucketTtlMs (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl);
   ctx.Clock.Advance(3000);
-  ctx.Equal(taken(take(kJob, kBlog, 60)), pageUrl(kBlog, 2), "the host's second URL must be handed out 3000 s later");
+  ctx.Equal(hTaken(take(kHJob, kHBlog, 60)), hPageUrl(kHBlog, 2), "the host's second URL must be handed out 3000 s later");
   ttl = ctx.Redis.PTTL(key);
   ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d right after a take: every take sets the expiry to kBucketTtlMs again, not only the take that created the bucket", key, ttl);
   ctx.Clock.Advance(3590);

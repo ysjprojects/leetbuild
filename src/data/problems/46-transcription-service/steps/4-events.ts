@@ -709,24 +709,24 @@ import (
 )
 
 const (
-	eventsRaw      = "Call me back at 415-555-0199 or write to ana@example.com."
-	eventsRedacted = "Call me back at [PHONE] or write to [EMAIL]."
+	kHEventsRaw      = "Call me back at 415-555-0199 or write to ana@example.com."
+	kHEventsRedacted = "Call me back at [PHONE] or write to [EMAIL]."
 )
 
-func eventsSegments(index int) []jobs.Segment {
+func hEventsSegments(index int) []jobs.Segment {
 	base := index * 30000
 	return []jobs.Segment{
 		{ChunkIndex: index, StartMs: base, EndMs: base + 10000, Speaker: "A", Text: "Thanks for holding."},
-		{ChunkIndex: index, StartMs: base + 10000, EndMs: base + 20000, Speaker: "B", Text: eventsRaw},
+		{ChunkIndex: index, StartMs: base + 10000, EndMs: base + 20000, Speaker: "B", Text: kHEventsRaw},
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, jobID string, segments []jobs.Segment) {
+func hEventsPublish(ctx *harness.Ctx, jobID string, segments []jobs.Segment) {
 	publishSegments(context.Background(), jobID, segments)
 	ctx.Settle()
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, v := range ctx.Kafka.Values(topic) {
 		var e map[string]any
@@ -741,7 +741,7 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("outbox", 0, -1) {
 		var r map[string]any
@@ -752,9 +752,9 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckJobKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, "tr-1", eventsSegments(1))
-	eventsPublish(ctx, "tr-1", eventsSegments(0))
-	eventsPublish(ctx, "tr-2", eventsSegments(0))
+	hEventsPublish(ctx, "tr-1", hEventsSegments(1))
+	hEventsPublish(ctx, "tr-1", hEventsSegments(0))
+	hEventsPublish(ctx, "tr-2", hEventsSegments(0))
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 6, "three chunks of two segments; the records on %s", topic)
 	keys := ctx.Kafka.Keys(topic)
@@ -781,7 +781,7 @@ func CheckJobKey(ctx *harness.Ctx) {
 }
 
 func CheckRedactBeforePublish(ctx *harness.Ctx) {
-	eventsPublish(ctx, "tr-1", eventsSegments(1))
+	hEventsPublish(ctx, "tr-1", hEventsSegments(1))
 	values := ctx.Kafka.Values(topic)
 	ctx.Equal(len(values), 2, "two segments; records")
 	for _, v := range values {
@@ -791,14 +791,14 @@ func CheckRedactBeforePublish(ctx *harness.Ctx) {
 	for _, s := range jobs.Segments(context.Background(), "tr-1") {
 		saved = append(saved, s.Text)
 	}
-	ctx.Equal(saved, []string{"Thanks for holding.", eventsRedacted}, "the job's saved transcript")
+	ctx.Equal(saved, []string{"Thanks for holding.", kHEventsRedacted}, "the job's saved transcript")
 }
 
 func CheckSegmentPayload(ctx *harness.Ctx) {
-	eventsPublish(ctx, "tr-1", eventsSegments(1))
-	all := eventsAll(ctx)
+	hEventsPublish(ctx, "tr-1", hEventsSegments(1))
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 2, "two segments; records")
-	for i, s := range eventsSegments(1) {
+	for i, s := range hEventsSegments(1) {
 		want := map[string]any{"job_id": "tr-1", "chunk_index": float64(s.ChunkIndex), "start_ms": float64(s.StartMs), "end_ms": float64(s.EndMs), "speaker": s.Speaker}
 		for name, value := range want {
 			ctx.Equal(all[i][name], value, "the record must carry %s (%v)", name, all[i])
@@ -808,8 +808,8 @@ func CheckSegmentPayload(ctx *harness.Ctx) {
 
 func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 	// The broker refuses the first record, the one with the phone number and the e-mail address.
-	segments := eventsSegments(1)
-	segments[0].Text, segments[1].Text = eventsRaw, "Thanks for holding."
+	segments := hEventsSegments(1)
+	segments[0].Text, segments[1].Text = kHEventsRaw, "Thanks for holding."
 	ctx.Kafka.FailNext(topic, 1)
 	func() {
 		defer func() {
@@ -820,7 +820,7 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 		// No Settle: the worker marks the chunk done as soon as publishSegments returns.
 		publishSegments(context.Background(), "tr-1", segments)
 	}()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	var refused map[string]any
 	outboxed := []int{}
 	for _, row := range rows {
@@ -835,9 +835,9 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(refused != nil, "the broker refused the record of start_ms 30000 and when publishSegments returned the outbox held %v: the refusal arrives as the returned write error, which must write the row before publishSegments returns (the worker marks the chunk done then)", rows)
-	ctx.Equal(refused["text"], eventsRedacted, "the refused payload's text")
+	ctx.Equal(refused["text"], kHEventsRedacted, "the refused payload's text")
 	published := []int{}
-	for _, e := range eventsAll(ctx) {
+	for _, e := range hEventsAll(ctx) {
 		start, _ := e["start_ms"].(float64)
 		published = append(published, int(start))
 	}
@@ -846,11 +846,11 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 	ctx.Equal(all, []int{30000, 40000}, "each segment once, on the topic (start_ms %v) or in the outbox (start_ms %v), when publishSegments returned; every start_ms", published, outboxed)
 	ctx.Settle()
 	later := []int{}
-	for _, e := range eventsAll(ctx) {
+	for _, e := range hEventsAll(ctx) {
 		start, _ := e["start_ms"].(float64)
 		later = append(later, int(start))
 	}
-	for _, row := range eventsOutbox(ctx) {
+	for _, row := range hEventsOutbox(ctx) {
 		payload, _ := row["payload"].(map[string]any)
 		start, _ := payload["start_ms"].(float64)
 		later = append(later, int(start))
@@ -860,9 +860,9 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	eventsPublish(ctx, "tr-1", eventsSegments(1)[:1])
+	hEventsPublish(ctx, "tr-1", hEventsSegments(1)[:1])
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one segment; the records on the topic")
-	eventsPublish(ctx, "tr-1", eventsSegments(2)[:1])
+	hEventsPublish(ctx, "tr-1", hEventsSegments(2)[:1])
 	lost := ctx.Kafka.Failover(topic)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the segment. Use RequireAll; the records on the topic", lost)
 }
@@ -879,27 +879,27 @@ func CheckIdempotentProducer(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRaw = "Call me back at 415-555-0199 or write to ana@example.com.";
-const std::string kRedacted = "Call me back at [PHONE] or write to [EMAIL].";
+const std::string kHRaw = "Call me back at 415-555-0199 or write to ana@example.com.";
+const std::string kHRedacted = "Call me back at [PHONE] or write to [EMAIL].";
 
-std::vector<jobs::Segment> eventsSegments(int index) {
+std::vector<jobs::Segment> hEventsSegments(int index) {
   const int base = index * 30000;
-  return {{index, base, base + 10000, "A", "Thanks for holding."}, {index, base + 10000, base + 20000, "B", kRaw}};
+  return {{index, base, base + 10000, "A", "Thanks for holding."}, {index, base + 10000, base + 20000, "B", kHRaw}};
 }
 
-void eventsPublish(harness::Ctx& ctx, const std::string& job_id, const std::vector<jobs::Segment>& segments) {
+void hEventsPublish(harness::Ctx& ctx, const std::string& job_id, const std::vector<jobs::Segment>& segments) {
   publishSegments(job_id, segments);
   ctx.Settle();
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& v : ctx.Kafka.Values(kTopic)) out.push_back(nlohmann::json::parse(v, nullptr, false));
   std::sort(out.begin(), out.end(), [](const nlohmann::json& a, const nlohmann::json& b) { return a.value("start_ms", 0) < b.value("start_ms", 0); });
   return out;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("outbox", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
@@ -908,9 +908,9 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckJobKey(harness::Ctx& ctx) {
-  eventsPublish(ctx, "tr-1", eventsSegments(1));
-  eventsPublish(ctx, "tr-1", eventsSegments(0));
-  eventsPublish(ctx, "tr-2", eventsSegments(0));
+  hEventsPublish(ctx, "tr-1", hEventsSegments(1));
+  hEventsPublish(ctx, "tr-1", hEventsSegments(0));
+  hEventsPublish(ctx, "tr-2", hEventsSegments(0));
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 6, "three chunks of two segments; the records on %s", kTopic);
   auto keys = ctx.Kafka.Keys(kTopic);
@@ -931,7 +931,7 @@ void CheckJobKey(harness::Ctx& ctx) {
 }
 
 void CheckRedactBeforePublish(harness::Ctx& ctx) {
-  eventsPublish(ctx, "tr-1", eventsSegments(1));
+  hEventsPublish(ctx, "tr-1", hEventsSegments(1));
   const auto values = ctx.Kafka.Values(kTopic);
   ctx.Equal(values.size(), 2, "two segments; records");
   for (const auto& v : values) {
@@ -939,14 +939,14 @@ void CheckRedactBeforePublish(harness::Ctx& ctx) {
   }
   std::vector<std::string> saved;
   for (const auto& s : jobs::segments("tr-1")) saved.push_back(s.text);
-  ctx.Equal(saved, std::vector<std::string>{"Thanks for holding.", kRedacted}, "the job's saved transcript");
+  ctx.Equal(saved, std::vector<std::string>{"Thanks for holding.", kHRedacted}, "the job's saved transcript");
 }
 
 void CheckSegmentPayload(harness::Ctx& ctx) {
-  eventsPublish(ctx, "tr-1", eventsSegments(1));
-  const auto all = eventsAll(ctx);
+  hEventsPublish(ctx, "tr-1", hEventsSegments(1));
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 2, "two segments; records");
-  const auto segments = eventsSegments(1);
+  const auto segments = hEventsSegments(1);
   for (size_t i = 0; i < segments.size() && i < all.size(); i++) {
     const nlohmann::json want = {{"job_id", "tr-1"}, {"chunk_index", segments[i].chunk_index}, {"start_ms", segments[i].start_ms}, {"end_ms", segments[i].end_ms}, {"speaker", segments[i].speaker}};
     for (const auto& [name, value] : want.items()) {
@@ -957,8 +957,8 @@ void CheckSegmentPayload(harness::Ctx& ctx) {
 
 void CheckOutboxFromDelivery(harness::Ctx& ctx) {
   // The broker refuses the first record, the one with the phone number and the e-mail address.
-  auto segments = eventsSegments(1);
-  segments[0].text = kRaw;
+  auto segments = hEventsSegments(1);
+  segments[0].text = kHRaw;
   segments[1].text = "Thanks for holding.";
   ctx.Kafka.FailNext(kTopic, 1);
   try {
@@ -967,7 +967,7 @@ void CheckOutboxFromDelivery(harness::Ctx& ctx) {
   } catch (const std::exception& e) {
     ctx.Fatalf("publishSegments threw when the broker refused a record: %s; the record goes to the outbox, the worker goes on", e.what());
   }
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   nlohmann::json refused;
   std::vector<int> outboxed;
   for (const auto& row : rows) {
@@ -980,17 +980,17 @@ void CheckOutboxFromDelivery(harness::Ctx& ctx) {
     if (start == 30000) refused = row["payload"];
   }
   ctx.Assert(refused.is_object(), "the broker refused the record of start_ms 30000 and when publishSegments returned the outbox held %s: the refusal arrives in the delivery report (dr_cb), which must write the row before publishSegments returns (the worker marks the chunk done then)", nlohmann::json(rows).dump());
-  ctx.Equal(refused.value("text", ""), kRedacted, "the refused payload's text");
+  ctx.Equal(refused.value("text", ""), kHRedacted, "the refused payload's text");
   std::vector<int> published;
-  for (const auto& e : eventsAll(ctx)) published.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
+  for (const auto& e : hEventsAll(ctx)) published.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
   std::vector<int> all = published;
   all.insert(all.end(), outboxed.begin(), outboxed.end());
   std::sort(all.begin(), all.end());
   ctx.Equal(all, {30000, 40000}, "each segment once, on the topic (start_ms %v) or in the outbox (start_ms %v), when publishSegments returned; every start_ms", published, outboxed);
   ctx.Settle();
   std::vector<int> later;
-  for (const auto& e : eventsAll(ctx)) later.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
-  for (const auto& row : eventsOutbox(ctx)) {
+  for (const auto& e : hEventsAll(ctx)) later.push_back(e.is_object() ? e.value("start_ms", -1) : -1);
+  for (const auto& row : hEventsOutbox(ctx)) {
     later.push_back(row.is_object() && row.contains("payload") && row["payload"].is_object() ? row["payload"].value("start_ms", -1) : -1);
   }
   std::sort(later.begin(), later.end());
@@ -999,9 +999,9 @@ void CheckOutboxFromDelivery(harness::Ctx& ctx) {
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic, 1);
-  eventsPublish(ctx, "tr-1", {eventsSegments(1)[0]});
+  hEventsPublish(ctx, "tr-1", {hEventsSegments(1)[0]});
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one segment whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence (with acks=all); the records on the topic");
-  eventsPublish(ctx, "tr-1", {eventsSegments(2)[0]});
+  hEventsPublish(ctx, "tr-1", {hEventsSegments(2)[0]});
   const int lost = ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the segment. Use acks=all; the records on the topic", lost);
 }

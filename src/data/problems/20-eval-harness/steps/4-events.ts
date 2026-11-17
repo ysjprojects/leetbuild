@@ -833,23 +833,23 @@ import (
 )
 
 const (
-	eventsTopic  = "eval.sample"
-	eventsSecret = "account 4417-2290"
+	kHEventsTopic  = "eval.sample"
+	kHEventsSecret = "account 4417-2290"
 )
 
-func eventsSample(sampleID, runID string, score float64, judge string) samples.ScoredSample {
-	return samples.ScoredSample{RunID: runID, SampleID: sampleID, ModelVersion: "support-bot-2026-10", Score: score, Judge: judge, Output: "Your refund for " + eventsSecret + " was approved."}
+func hEventsSample(sampleID, runID string, score float64, judge string) samples.ScoredSample {
+	return samples.ScoredSample{RunID: runID, SampleID: sampleID, ModelVersion: "support-bot-2026-10", Score: score, Judge: judge, Output: "Your refund for " + kHEventsSecret + " was approved."}
 }
 
-func eventsPublish(ctx *harness.Ctx, s samples.ScoredSample) bool {
+func hEventsPublish(ctx *harness.Ctx, s samples.ScoredSample) bool {
 	ok, err := publishResult(context.Background(), s)
 	ctx.NoError(err, "publishResult(%s)", s.SampleID)
 	return ok
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "the event is JSON: %s", v)
 		out = append(out, e)
@@ -857,7 +857,7 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("evals:outbox", 0, -1) {
 		var e map[string]any
@@ -868,21 +868,21 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckRunKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "model"))
-	eventsPublish(ctx, eventsSample("s-2", "r2", 0.75, "model"))
-	eventsPublish(ctx, eventsSample("s-3", "r1", 0.75, "model"))
+	hEventsPublish(ctx, hEventsSample("s-1", "r1", 0.75, "model"))
+	hEventsPublish(ctx, hEventsSample("s-2", "r2", 0.75, "model"))
+	hEventsPublish(ctx, hEventsSample("s-3", "r1", 0.75, "model"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three published samples must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the run ids (keyed by sample, one run's results scatter over every partition)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three published samples must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the run ids (keyed by sample, one run's results scatter over every partition)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both r1 samples must land on one partition, or the warehouse folds the run out of order; the partitions")
 }
 
 func CheckEventPayload(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsSample("s-1", "r1", 1.0, "fallback"))
-	eventsPublish(ctx, eventsSample("s-2", "r1", 0.25, "model"))
+	hEventsPublish(ctx, hEventsSample("s-1", "r1", 1.0, "fallback"))
+	hEventsPublish(ctx, hEventsSample("s-2", "r1", 0.25, "model"))
 	ctx.Settle()
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 2, "two published samples; records")
 	for key, value := range map[string]any{"run_id": "r1", "sample_id": "s-1", "model_version": "support-bot-2026-10", "score": 1.0, "passed": true, "judge": "fallback"} {
 		ctx.Equal(all[0][key], value, "the event's %s (%v)", key, all[0])
@@ -903,42 +903,42 @@ func CheckNoOutputText(ctx *harness.Ctx) {
 	previous := log.Writer()
 	log.SetOutput(&logged)
 	defer log.SetOutput(previous)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "model"))
-	eventsPublish(ctx, eventsSample("s-2", "r1", 0.75, "model"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsPublish(ctx, hEventsSample("s-1", "r1", 0.75, "model"))
+	hEventsPublish(ctx, hEventsSample("s-2", "r1", 0.75, "model"))
 	ctx.Settle()
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
-		ctx.Assert(!strings.Contains(value, eventsSecret), "the event carries the model's output: %s; the topic is retained and replicated, ids and scores only", value)
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
+		ctx.Assert(!strings.Contains(value, kHEventsSecret), "the event carries the model's output: %s; the topic is retained and replicated, ids and scores only", value)
 		var e map[string]any
 		json.Unmarshal([]byte(value), &e)
 		_, has := e["output"]
 		ctx.Assert(!has, "the event has an output field: %s", value)
 	}
 	for _, row := range ctx.Redis.LRange("evals:outbox", 0, -1) {
-		ctx.Assert(!strings.Contains(row, eventsSecret), "the outbox row carries the model's output: %s", row)
+		ctx.Assert(!strings.Contains(row, kHEventsSecret), "the outbox row carries the model's output: %s", row)
 	}
-	ctx.Assert(!strings.Contains(logged.String(), eventsSecret), "a log line carries the model's output: %q", strings.TrimSpace(logged.String()))
+	ctx.Assert(!strings.Contains(logged.String(), kHEventsSecret), "a log line carries the model's output: %q", strings.TrimSpace(logged.String()))
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "model"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsSample("s-1", "r1", 0.75, "model"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the sample twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsSample("s-2", "r1", 0.75, "model"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the sample twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsSample("s-2", "r1", 0.75, "model"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := eventsPublish(ctx, eventsSample("s-0", "r1", 0.75, "model"))
+	ok := hEventsPublish(ctx, hEventsSample("s-0", "r1", 0.75, "model"))
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "the broker acknowledged s-0 and publishResult returned %v with outbox rows %v: an acknowledged event returns true and leaves no row", ok, eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "fallback"))
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "the broker acknowledged s-0 and publishResult returned %v with outbox rows %v: an acknowledged event returns true and leaves no row", ok, hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsPublish(ctx, hEventsSample("s-1", "r1", 0.75, "fallback"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the sample is missing from the warehouse for good; the rows")
 	want := map[string]any{"run_id": "r1", "sample_id": "s-1", "model_version": "support-bot-2026-10", "score": 0.75, "passed": true, "judge": "fallback"}
 	ctx.Equal(len(rows[0]), len(want), "the outbox row must be the event itself, %v, got %v; its fields", want, rows[0])
@@ -946,12 +946,12 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 		ctx.Equal(rows[0][key], value, "the outbox row must be the event itself (%v); its %s", rows[0], key)
 	}
 	ctx.Equal(ok, false, "publishResult's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsSample("s-2", "r1", 0.75, "model"))
+	ok = hEventsPublish(ctx, hEventsSample("s-2", "r1", 0.75, "model"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishResult waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["sample_id"] == "s-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishResult's result without an acknowledgement")
 }
@@ -967,53 +967,53 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "eval.sample";
-const std::string kSecret = "account 4417-2290";
+const std::string kHEventsTopic = "eval.sample";
+const std::string kHSecret = "account 4417-2290";
 
-samples::ScoredSample eventsSample(const std::string& sample_id, const std::string& run_id = "r1", double score = 0.75, const std::string& judge = "model") {
-  return {run_id, sample_id, "support-bot-2026-10", score, judge, "Your refund for " + kSecret + " was approved."};
+samples::ScoredSample hEventsSample(const std::string& sample_id, const std::string& run_id = "r1", double score = 0.75, const std::string& judge = "model") {
+  return {run_id, sample_id, "support-bot-2026-10", score, judge, "Your refund for " + kHSecret + " was approved."};
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) out.push_back(nlohmann::json::parse(v, nullptr, false));
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) out.push_back(nlohmann::json::parse(v, nullptr, false));
   return out;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("evals:outbox", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckRunKey(harness::Ctx& ctx) {
-  publish_result(eventsSample("s-1", "r1"));
-  publish_result(eventsSample("s-2", "r2"));
-  publish_result(eventsSample("s-3", "r1"));
+  publish_result(hEventsSample("s-1", "r1"));
+  publish_result(hEventsSample("s-2", "r2"));
+  publish_result(hEventsSample("s-3", "r1"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three published samples must produce three records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the run ids (keyed by sample, one run's results scatter over every partition)");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three published samples must produce three records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the run ids (keyed by sample, one run's results scatter over every partition)");
   ctx.Equal(records[0].Partition, records[2].Partition, "both r1 samples must land on one partition, or the warehouse folds the run out of order; the partitions");
 }
 
 void CheckEventPayload(harness::Ctx& ctx) {
-  publish_result(eventsSample("s-1", "r1", 1.0, "fallback"));
-  publish_result(eventsSample("s-2", "r1", 0.25, "model"));
+  publish_result(hEventsSample("s-1", "r1", 1.0, "fallback"));
+  publish_result(hEventsSample("s-2", "r1", 0.25, "model"));
   ctx.Settle();
-  const auto all = eventsAll(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 2, "two published samples; records");
   const nlohmann::json expected = {{"run_id", "r1"}, {"sample_id", "s-1"}, {"model_version", "support-bot-2026-10"}, {"score", 1.0}, {"passed", true}, {"judge", "fallback"}};
   for (const auto& [key, value] : expected.items()) {
     ctx.Equal(all[0].is_object() && all[0].contains(key) ? all[0][key] : nlohmann::json(), value, "the event's %s (%s)", key, all[0].dump());
   }
-  ctx.Assert(all[1].value("passed", true) == false && eventsField(all[1], "judge") == "model", "a 0.25 judged by the model is passed false, judge model: %s", all[1].dump());
+  ctx.Assert(all[1].value("passed", true) == false && hEventsField(all[1], "judge") == "model", "a 0.25 judged by the model is passed false, judge model: %s", all[1].dump());
   for (const auto& e : all) {
     std::vector<std::string> fields;
     if (e.is_object())
@@ -1027,54 +1027,54 @@ void CheckNoOutputText(harness::Ctx& ctx) {
   auto* err = std::cerr.rdbuf(logged.rdbuf());
   auto* clg = std::clog.rdbuf(logged.rdbuf());
   auto* out = std::cout.rdbuf(logged.rdbuf());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  publish_result(eventsSample("s-1"));
-  publish_result(eventsSample("s-2"));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  publish_result(hEventsSample("s-1"));
+  publish_result(hEventsSample("s-2"));
   ctx.Settle();
   std::cerr.rdbuf(err);
   std::clog.rdbuf(clg);
   std::cout.rdbuf(out);
-  for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
-    ctx.Assert(value.find(kSecret) == std::string::npos, "the event carries the model's output: %s; the topic is retained and replicated, ids and scores only", value);
+  for (const auto& value : ctx.Kafka.Values(kHEventsTopic)) {
+    ctx.Assert(value.find(kHSecret) == std::string::npos, "the event carries the model's output: %s; the topic is retained and replicated, ids and scores only", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(!e.is_object() || !e.contains("output"), "the event has an output field: %s", value);
   }
   for (const auto& row : ctx.Redis.LRange("evals:outbox", 0, -1)) {
-    ctx.Assert(row.find(kSecret) == std::string::npos, "the outbox row carries the model's output: %s", row);
+    ctx.Assert(row.find(kHSecret) == std::string::npos, "the outbox row carries the model's output: %s", row);
   }
-  ctx.Assert(logged.str().find(kSecret) == std::string::npos, "a log line carries the model's output: %q", logged.str());
+  ctx.Assert(logged.str().find(kHSecret) == std::string::npos, "a log line carries the model's output: %q", logged.str());
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish_result(eventsSample("s-1"));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publish_result(hEventsSample("s-1"));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the sample twice (enable.idempotence); the records");
-  publish_result(eventsSample("s-2"));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the sample twice (enable.idempotence); the records");
+  publish_result(hEventsSample("s-2"));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publish_result(eventsSample("s-0"));
+  bool ok = publish_result(hEventsSample("s-0"));
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty(), "the broker acknowledged s-0 and publish_result returned %t with %d outbox rows: an acknowledged event returns true and leaves no row", ok, eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publish_result(eventsSample("s-1", "r1", 0.75, "fallback"));
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(), "the broker acknowledged s-0 and publish_result returned %t with %d outbox rows: an acknowledged event returns true and leaves no row", ok, hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publish_result(hEventsSample("s-1", "r1", 0.75, "fallback"));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the sample is missing from the warehouse for good; the rows");
   const nlohmann::json want = {{"run_id", "r1"}, {"sample_id", "s-1"}, {"model_version", "support-bot-2026-10"}, {"score", 0.75}, {"passed", true}, {"judge", "fallback"}};
   ctx.Assert(!rows.empty() && rows[0] == want, "the outbox row must be the event itself, %s, got %s", want.dump(), rows.empty() ? std::string("none") : rows[0].dump());
   ctx.Equal(ok, false, "publish_result's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publish_result(eventsSample("s-2"));
+  ok = publish_result(hEventsSample("s-2"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publish_result waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && eventsField(rows[1], "sample_id") == "s-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hEventsField(rows[1], "sample_id") == "s-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish_result's result without an acknowledgement");
 }
 `,

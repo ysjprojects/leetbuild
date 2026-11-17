@@ -770,9 +770,9 @@ import (
 	"leetbuild/harness"
 )
 
-var pushBg = context.Background()
+var hPushBg = context.Background()
 
-type pushReply struct {
+type HPushReply struct {
 	Applied []struct {
 		DocID    string \`json:"doc_id"\`
 		Revision int64  \`json:"revision"\`
@@ -784,17 +784,17 @@ type pushReply struct {
 	} \`json:"conflicts"\`
 }
 
-func pushAPI(ctx *harness.Ctx) *harness.HTTP {
+func hPushAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func pushChange(docID string, base int64, body string) map[string]any {
+func hPushChange(docID string, base int64, body string) map[string]any {
 	return map[string]any{"doc_id": docID, "base_revision": base, "content_hash": store.ContentHash(body), "body": body}
 }
 
-func pushAs(c *harness.HTTP, device string, changes ...map[string]any) *harness.Response {
+func hPushAs(c *harness.HTTP, device string, changes ...map[string]any) *harness.Response {
 	payload := map[string]any{"changes": changes}
 	if device == "" {
 		return c.Post("/v1/sync/push", payload)
@@ -802,37 +802,37 @@ func pushAs(c *harness.HTTP, device string, changes ...map[string]any) *harness.
 	return c.Post("/v1/sync/push", payload, "X-Device-Id", device)
 }
 
-func pushOK(ctx *harness.Ctx, r *harness.Response, what string) pushReply {
+func hPushOK(ctx *harness.Ctx, r *harness.Response, what string) HPushReply {
 	ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text())
-	var out pushReply
+	var out HPushReply
 	r.Decode(&out)
 	return out
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := pushAPI(ctx)
-	out := pushOK(ctx, pushAs(c, "laptop", pushChange("d-1", 0, "groceries: milk"), pushChange("d-2", 0, "call the plumber")), "a push of two new documents")
+	c := hPushAPI(ctx)
+	out := hPushOK(ctx, hPushAs(c, "laptop", hPushChange("d-1", 0, "groceries: milk"), hPushChange("d-2", 0, "call the plumber")), "a push of two new documents")
 	applied := map[string]int64{}
 	for _, a := range out.Applied {
 		applied[a.DocID] = a.Revision
 	}
 	ctx.Assert(len(applied) == 2 && applied["d-1"] > 0 && applied["d-2"] > 0 && len(out.Conflicts) == 0, "both new documents must be applied with no conflicts, got %+v", out)
-	head := store.Head(pushBg, "d-1")
+	head := store.Head(hPushBg, "d-1")
 	ctx.Assert(head != nil && head.Body == "groceries: milk" && head.Device == "laptop", "d-1's head is %+v, expected the laptop's body", head)
 	ctx.Equal(applied["d-1"], head.Revision, "the push must answer d-1's head revision; the answered revision")
 }
 
 func CheckStaleBase(ctx *harness.Ctx) {
-	c := pushAPI(ctx)
-	rev1 := pushOK(ctx, pushAs(c, "laptop", pushChange("d-1", 0, "draft agenda")), "the laptop's first push").Applied[0].Revision
-	rev2 := pushOK(ctx, pushAs(c, "phone", pushChange("d-1", rev1, "agenda: budget, hiring")), "the phone's edit of revision 1").Applied[0].Revision
+	c := hPushAPI(ctx)
+	rev1 := hPushOK(ctx, hPushAs(c, "laptop", hPushChange("d-1", 0, "draft agenda")), "the laptop's first push").Applied[0].Revision
+	rev2 := hPushOK(ctx, hPushAs(c, "phone", hPushChange("d-1", rev1, "agenda: budget, hiring")), "the phone's edit of revision 1").Applied[0].Revision
 	// The laptop was offline: it still edits revision 1, and it brings a new note along.
-	stale := pushOK(ctx, pushAs(c, "laptop", pushChange("d-1", rev1, "agenda: offsite"), pushChange("d-9", 0, "packing list")), "the laptop's push of a stale edit")
+	stale := hPushOK(ctx, hPushAs(c, "laptop", hPushChange("d-1", rev1, "agenda: offsite"), hPushChange("d-9", 0, "packing list")), "the laptop's push of a stale edit")
 	// The laptop pulled the phone's text and pushes it back unedited: nothing new, but the device is told where d-1 stands.
-	echo := pushOK(ctx, pushAs(c, "laptop", pushChange("d-1", rev2, "agenda: budget, hiring")), "the laptop's push of d-1's current body")
+	echo := hPushOK(ctx, hPushAs(c, "laptop", hPushChange("d-1", rev2, "agenda: budget, hiring")), "the laptop's push of d-1's current body")
 	ctx.Assert(len(stale.Conflicts) == 1 && stale.Conflicts[0].DocID == "d-1" && stale.Conflicts[0].BaseRevision == rev1 && stale.Conflicts[0].CurrentRevision == rev2,
 		"the laptop edited revision %d of d-1 while its head is at %d: the push must answer that conflict, got conflicts %+v", rev1, rev2, stale.Conflicts)
-	head := store.Head(pushBg, "d-1")
+	head := store.Head(hPushBg, "d-1")
 	ctx.Equal(head.Body, "agenda: budget, hiring", "the stale edit was written over the phone's (apply only against the revision the device edited); d-1's body")
 	ctx.Assert(len(stale.Applied) == 1 && stale.Applied[0].DocID == "d-9", "the rest of the batch must still apply, got applied %+v", stale.Applied)
 	ctx.Assert(len(echo.Applied) == 1 && echo.Applied[0].DocID == "d-1" && echo.Applied[0].Revision == rev2 && len(echo.Conflicts) == 0,
@@ -840,39 +840,39 @@ func CheckStaleBase(ctx *harness.Ctx) {
 }
 
 func CheckContentHash(ctx *harness.Ctx) {
-	c := pushAPI(ctx)
-	good := pushChange("d-1", 0, "meeting notes")
-	cut := pushChange("d-2", 0, "budget 2026: final figures")
+	c := hPushAPI(ctx)
+	good := hPushChange("d-1", 0, "meeting notes")
+	cut := hPushChange("d-2", 0, "budget 2026: final figures")
 	cut["body"] = "budget 2026: fin" // truncated in transit, the hash of the whole body
-	r := pushAs(c, "laptop", good, cut)
+	r := hPushAs(c, "laptop", good, cut)
 	ctx.Equal(r.Status, 400, "a change whose body does not match its content_hash (%s)", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "d-2"), "the 400 must name the change (d-2), got %s", r.Text())
-	ctx.Assert(store.Head(pushBg, "d-2") == nil, "the truncated body reached storage: %+v", store.Head(pushBg, "d-2"))
-	ctx.Assert(store.Head(pushBg, "d-1") == nil, "d-1 was written before d-2's hash was checked: check every change before applying any")
-	r = pushAs(c, "laptop", good)
-	ctx.Assert(r.Status == 200 && store.Head(pushBg, "d-1") != nil, "the intact change on its own must be applied, got %d: %s", r.Status, r.Text())
+	ctx.Assert(store.Head(hPushBg, "d-2") == nil, "the truncated body reached storage: %+v", store.Head(hPushBg, "d-2"))
+	ctx.Assert(store.Head(hPushBg, "d-1") == nil, "d-1 was written before d-2's hash was checked: check every change before applying any")
+	r = hPushAs(c, "laptop", good)
+	ctx.Assert(r.Status == 200 && store.Head(hPushBg, "d-1") != nil, "the intact change on its own must be applied, got %d: %s", r.Status, r.Text())
 }
 
 func CheckBatchCap(ctx *harness.Ctx) {
-	c := pushAPI(ctx)
+	c := hPushAPI(ctx)
 	changes := make([]map[string]any, 501)
 	for i := range changes {
-		changes[i] = pushChange(fmt.Sprintf("d-%d", i), 0, fmt.Sprintf("note %d", i))
+		changes[i] = hPushChange(fmt.Sprintf("d-%d", i), 0, fmt.Sprintf("note %d", i))
 	}
-	r := pushAs(c, "laptop", changes...)
+	r := hPushAs(c, "laptop", changes...)
 	ctx.Equal(r.Status, 413, "a push of 501 changes (MAX_CHANGES is 500)")
 	ctx.Equal(ctx.Redis.ZCard("changes"), int64(0), "the refused push must write nothing (check the size before applying anything); documents written")
-	out := pushOK(ctx, pushAs(c, "laptop", changes[:500]...), "a push of exactly 500 changes")
+	out := hPushOK(ctx, hPushAs(c, "laptop", changes[:500]...), "a push of exactly 500 changes")
 	ctx.Equal(len(out.Applied), 500, "a push of exactly 500 changes must be applied; applied")
 }
 
 func CheckDeviceAuth(ctx *harness.Ctx) {
-	c := pushAPI(ctx)
-	r := pushAs(c, "", pushChange("d-1", 0, "shopping list"))
+	c := hPushAPI(ctx)
+	r := hPushAs(c, "", hPushChange("d-1", 0, "shopping list"))
 	ctx.Equal(r.Status, 401, "a push without X-Device-Id (%s)", r.Text())
-	empty := c.Post("/v1/sync/push", map[string]any{"changes": []map[string]any{pushChange("d-1", 0, "shopping list")}}, "X-Device-Id", "")
+	empty := c.Post("/v1/sync/push", map[string]any{"changes": []map[string]any{hPushChange("d-1", 0, "shopping list")}}, "X-Device-Id", "")
 	ctx.Equal(empty.Status, 401, "a push with an empty X-Device-Id (%s)", empty.Text())
-	ctx.Assert(store.Head(pushBg, "d-1") == nil, "a push without a device must write nothing")
+	ctx.Assert(store.Head(hPushBg, "d-1") == nil, "a push without a device must write nothing")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -886,9 +886,9 @@ func CheckDeviceAuth(ctx *harness.Ctx) {
 
 namespace {
 
-using Json = nlohmann::json;
+using HJson = nlohmann::json;
 
-harness::HTTP pushApi(harness::Ctx& ctx) {
+harness::HTTP hPushApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -896,90 +896,90 @@ harness::HTTP pushApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-Json pushChange(const std::string& doc_id, long long base, const std::string& body) {
-  return Json{{"doc_id", doc_id}, {"base_revision", base}, {"content_hash", store::contentHash(body)}, {"body", body}};
+HJson hPushChange(const std::string& doc_id, long long base, const std::string& body) {
+  return HJson{{"doc_id", doc_id}, {"base_revision", base}, {"content_hash", store::contentHash(body)}, {"body", body}};
 }
 
-harness::Response pushAs(harness::HTTP& c, const Json& changes, const std::string& device = "laptop") {
-  const std::string payload = Json{{"changes", changes}}.dump();
+harness::Response hPushAs(harness::HTTP& c, const HJson& changes, const std::string& device = "laptop") {
+  const std::string payload = HJson{{"changes", changes}}.dump();
   if (device.empty()) return c.Post("/v1/sync/push", payload, "Content-Type", "application/json");
   return c.Post("/v1/sync/push", payload, "Content-Type", "application/json", "X-Device-Id", device);
 }
 
-Json pushOk(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+HJson hPushOk(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text());
-  return Json::parse(r.Text(), nullptr, false);
+  return HJson::parse(r.Text(), nullptr, false);
 }
 
-long long firstRevision(const Json& body) {
-  return body.value("applied", Json::array()).empty() ? 0LL : body["applied"][0].value("revision", 0LL);
+long long hFirstRevision(const HJson& body) {
+  return body.value("applied", HJson::array()).empty() ? 0LL : body["applied"][0].value("revision", 0LL);
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = pushApi(ctx);
-  const Json body = pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", 0, "groceries: milk"), pushChange("d-2", 0, "call the plumber")})), "a push of two new documents");
+  auto c = hPushApi(ctx);
+  const HJson body = hPushOk(ctx, hPushAs(c, HJson::array({hPushChange("d-1", 0, "groceries: milk"), hPushChange("d-2", 0, "call the plumber")})), "a push of two new documents");
   long long d1 = 0;
   size_t count = 0;
-  for (const Json& a : body.value("applied", Json::array())) {
+  for (const HJson& a : body.value("applied", HJson::array())) {
     count++;
     if (a.value("doc_id", "") == "d-1") d1 = a.value("revision", 0LL);
   }
-  ctx.Assert(count == 2 && d1 > 0 && body.value("conflicts", Json::array()).empty(), "both new documents must be applied with no conflicts, got %s", body.dump());
+  ctx.Assert(count == 2 && d1 > 0 && body.value("conflicts", HJson::array()).empty(), "both new documents must be applied with no conflicts, got %s", body.dump());
   const auto head = store::head("d-1");
   ctx.Assert(head && head->body == "groceries: milk" && head->device == "laptop", "d-1's head must hold the laptop's body, got %s", head ? head->body : "nothing");
   ctx.Equal(d1, head->revision, "the push must answer d-1's head revision; the answered revision");
 }
 
 void CheckStaleBase(harness::Ctx& ctx) {
-  auto c = pushApi(ctx);
-  const long long rev1 = firstRevision(pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", 0, "draft agenda")})), "the laptop's first push"));
-  const long long rev2 = firstRevision(pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", rev1, "agenda: budget, hiring")}), "phone"), "the phone's edit of revision 1"));
+  auto c = hPushApi(ctx);
+  const long long rev1 = hFirstRevision(hPushOk(ctx, hPushAs(c, HJson::array({hPushChange("d-1", 0, "draft agenda")})), "the laptop's first push"));
+  const long long rev2 = hFirstRevision(hPushOk(ctx, hPushAs(c, HJson::array({hPushChange("d-1", rev1, "agenda: budget, hiring")}), "phone"), "the phone's edit of revision 1"));
   // The laptop was offline: it still edits revision 1, and it brings a new note along.
-  const Json stale = pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", rev1, "agenda: offsite"), pushChange("d-9", 0, "packing list")})), "the laptop's push of a stale edit");
+  const HJson stale = hPushOk(ctx, hPushAs(c, HJson::array({hPushChange("d-1", rev1, "agenda: offsite"), hPushChange("d-9", 0, "packing list")})), "the laptop's push of a stale edit");
   // The laptop pulled the phone's text and pushes it back unedited: nothing new, but the device is told where d-1 stands.
-  const Json echo = pushOk(ctx, pushAs(c, Json::array({pushChange("d-1", rev2, "agenda: budget, hiring")})), "the laptop's push of d-1's current body");
-  const Json want = Json::array({Json{{"doc_id", "d-1"}, {"base_revision", rev1}, {"current_revision", rev2}}});
-  ctx.Assert(stale.value("conflicts", Json::array()) == want, "the laptop edited revision %d of d-1 while its head is at %d: the push must answer that conflict, got %s", rev1, rev2, stale.dump());
+  const HJson echo = hPushOk(ctx, hPushAs(c, HJson::array({hPushChange("d-1", rev2, "agenda: budget, hiring")})), "the laptop's push of d-1's current body");
+  const HJson want = HJson::array({HJson{{"doc_id", "d-1"}, {"base_revision", rev1}, {"current_revision", rev2}}});
+  ctx.Assert(stale.value("conflicts", HJson::array()) == want, "the laptop edited revision %d of d-1 while its head is at %d: the push must answer that conflict, got %s", rev1, rev2, stale.dump());
   ctx.Equal(store::head("d-1")->body, "agenda: budget, hiring", "the stale edit was written over the phone's (apply only against the revision the device edited); d-1's body");
-  const Json applied = stale.value("applied", Json::array());
+  const HJson applied = stale.value("applied", HJson::array());
   ctx.Assert(applied.size() == 1 && applied[0].value("doc_id", "") == "d-9", "the rest of the batch must still apply, got applied %s", applied.dump());
-  const Json echoWant = Json::array({Json{{"doc_id", "d-1"}, {"revision", rev2}}});
-  ctx.Assert(echo.value("applied", Json::array()) == echoWant && echo.value("conflicts", Json::array()).empty(), "a push of the body d-1 already holds is an unchanged outcome and must be answered in applied at revision %d, got %s", rev2, echo.dump());
+  const HJson echoWant = HJson::array({HJson{{"doc_id", "d-1"}, {"revision", rev2}}});
+  ctx.Assert(echo.value("applied", HJson::array()) == echoWant && echo.value("conflicts", HJson::array()).empty(), "a push of the body d-1 already holds is an unchanged outcome and must be answered in applied at revision %d, got %s", rev2, echo.dump());
 }
 
 void CheckContentHash(harness::Ctx& ctx) {
-  auto c = pushApi(ctx);
-  const Json good = pushChange("d-1", 0, "meeting notes");
-  Json cut = pushChange("d-2", 0, "budget 2026: final figures");
+  auto c = hPushApi(ctx);
+  const HJson good = hPushChange("d-1", 0, "meeting notes");
+  HJson cut = hPushChange("d-2", 0, "budget 2026: final figures");
   cut["body"] = "budget 2026: fin";  // truncated in transit, the hash of the whole body
-  auto r = pushAs(c, Json::array({good, cut}));
+  auto r = hPushAs(c, HJson::array({good, cut}));
   ctx.Equal(r.Status, 400, "a change whose body does not match its content_hash (%s)", r.Text());
   ctx.Assert(r.Text().find("d-2") != std::string::npos, "the 400 must name the change (d-2), got %s", r.Text());
   ctx.Assert(!store::head("d-2"), "the truncated body reached storage");
   ctx.Assert(!store::head("d-1"), "d-1 was written before d-2's hash was checked: check every change before applying any");
-  r = pushAs(c, Json::array({good}));
+  r = hPushAs(c, HJson::array({good}));
   ctx.Assert(r.Status == 200 && store::head("d-1").has_value(), "the intact change on its own must be applied, got %d: %s", r.Status, r.Text());
 }
 
 void CheckBatchCap(harness::Ctx& ctx) {
-  auto c = pushApi(ctx);
-  Json changes = Json::array();
-  for (int i = 0; i < 501; i++) changes.push_back(pushChange("d-" + std::to_string(i), 0, "note " + std::to_string(i)));
-  auto r = pushAs(c, changes);
+  auto c = hPushApi(ctx);
+  HJson changes = HJson::array();
+  for (int i = 0; i < 501; i++) changes.push_back(hPushChange("d-" + std::to_string(i), 0, "note " + std::to_string(i)));
+  auto r = hPushAs(c, changes);
   ctx.Equal(r.Status, 413, "a push of 501 changes (MAX_CHANGES is 500)");
   ctx.Equal(ctx.Redis.ZCard("changes"), 0LL, "the refused push must write nothing (check the size before applying anything); documents written");
   changes.erase(changes.end() - 1);
-  const Json body = pushOk(ctx, pushAs(c, changes), "a push of exactly 500 changes");
-  ctx.Equal(body.value("applied", Json::array()).size(), size_t{500}, "a push of exactly 500 changes must be applied; applied");
+  const HJson body = hPushOk(ctx, hPushAs(c, changes), "a push of exactly 500 changes");
+  ctx.Equal(body.value("applied", HJson::array()).size(), size_t{500}, "a push of exactly 500 changes must be applied; applied");
 }
 
 void CheckDeviceAuth(harness::Ctx& ctx) {
-  auto c = pushApi(ctx);
-  const auto r = pushAs(c, Json::array({pushChange("d-1", 0, "shopping list")}), "");
+  auto c = hPushApi(ctx);
+  const auto r = hPushAs(c, HJson::array({hPushChange("d-1", 0, "shopping list")}), "");
   ctx.Equal(r.Status, 401, "a push without X-Device-Id (%s)", r.Text());
-  const std::string payload = Json{{"changes", Json::array({pushChange("d-1", 0, "shopping list")})}}.dump();
+  const std::string payload = HJson{{"changes", HJson::array({hPushChange("d-1", 0, "shopping list")})}}.dump();
   const auto empty = c.Post("/v1/sync/push", payload, "Content-Type", "application/json", "X-Device-Id", "");
   ctx.Equal(empty.Status, 401, "a push with an empty X-Device-Id (%s)", empty.Text());
   ctx.Assert(!store::head("d-1"), "a push without a device must write nothing");

@@ -833,105 +833,105 @@ import (
 )
 
 const (
-	readJob  = "nightly"
-	readHost = "blog.example.com"
+	kHReadJob  = "nightly"
+	kHReadHost = "blog.example.com"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readURL(n int) string { return fmt.Sprintf("https://%s/p/%d", readHost, n) }
+func hReadURL(n int) string { return fmt.Sprintf("https://%s/p/%d", kHReadHost, n) }
 
-func readWorld(ctx *harness.Ctx, urls ...string) *harness.HTTP {
-	registry.Insert(readBg, readJob, readURL(0), "acme")
+func hReadWorld(ctx *harness.Ctx, urls ...string) *harness.HTTP {
+	registry.Insert(hReadBg, kHReadJob, hReadURL(0), "acme")
 	for _, u := range urls {
-		ctx.NoError(frontier.Enqueue(readBg, readJob, readHost, u), "enqueue %s", u)
+		ctx.NoError(frontier.Enqueue(hReadBg, kHReadJob, kHReadHost, u), "enqueue %s", u)
 	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func reportOf(ctx *harness.Ctx, c *harness.HTTP) map[string]any {
-	r := c.Get("/v1/crawl/jobs/"+readJob, "X-Tenant-Id", "acme")
-	ctx.Equal(r.Status, 200, "GET /v1/crawl/jobs/%s (%s)", readJob, r.Text())
+func hReportOf(ctx *harness.Ctx, c *harness.HTTP) map[string]any {
+	r := c.Get("/v1/crawl/jobs/"+kHReadJob, "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/crawl/jobs/%s (%s)", kHReadJob, r.Text())
 	m, _ := r.JSON().(map[string]any)
 	ctx.Assert(m != nil, "the report is not a JSON object: %s", r.Text())
 	return m
 }
 
-func numberIn(ctx *harness.Ctx, report map[string]any, name string) float64 {
+func hNumberIn(ctx *harness.Ctx, report map[string]any, name string) float64 {
 	n, ok := report[name].(float64)
 	ctx.Assert(ok, "the report's %s is %v, expected a number: %v", name, report[name], report)
 	return n
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	c := readWorld(ctx, readURL(1))
-	own := c.Get("/v1/crawl/jobs/"+readJob, "X-Tenant-Id", "acme")
-	other := c.Get("/v1/crawl/jobs/"+readJob, "X-Tenant-Id", "globex")
+	c := hReadWorld(ctx, hReadURL(1))
+	own := c.Get("/v1/crawl/jobs/"+kHReadJob, "X-Tenant-Id", "acme")
+	other := c.Get("/v1/crawl/jobs/"+kHReadJob, "X-Tenant-Id", "globex")
 	unknown := c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme")
-	anonymous := c.Get("/v1/crawl/jobs/" + readJob)
+	anonymous := c.Get("/v1/crawl/jobs/" + kHReadJob)
 	ctx.Equal(own.Status, 200, "the job's own tenant (%s)", own.Text())
 	ctx.Equal(unknown.Status, 404, "an unknown job")
 	ctx.Equal(other.Status, 404, "another tenant's job must answer like an unknown job, or the difference tells a probe which job ids exist; the status")
-	ctx.Equal(strings.ReplaceAll(other.Text(), readJob, "<job>"), strings.ReplaceAll(unknown.Text(), "weekly", "<job>"), "another tenant's job must answer exactly like an unknown job, or the body tells a probe which job ids exist; its body")
+	ctx.Equal(strings.ReplaceAll(other.Text(), kHReadJob, "<job>"), strings.ReplaceAll(unknown.Text(), "weekly", "<job>"), "another tenant's job must answer exactly like an unknown job, or the body tells a probe which job ids exist; its body")
 	ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckLiveCounts(ctx *harness.Ctx) {
-	c := readWorld(ctx, readURL(1), readURL(2))
-	first := reportOf(ctx, c)
+	c := hReadWorld(ctx, hReadURL(1), hReadURL(2))
+	first := hReportOf(ctx, c)
 	ctx.Assert(first["pending"] == float64(2) && first["fetched"] == float64(0), "a job with two queued URLs reports %v", first)
-	records.MarkFetched(readBg, readJob, readURL(1), "sha256:1", "pages/1")
-	records.MarkIndexed(readBg, readJob, readURL(1))
-	second := reportOf(ctx, c)
+	records.MarkFetched(hReadBg, kHReadJob, hReadURL(1), "sha256:1", "pages/1")
+	records.MarkIndexed(hReadBg, kHReadJob, hReadURL(1))
+	second := hReportOf(ctx, c)
 	ctx.Assert(second["fetched"] == float64(1) && second["indexed"] == float64(1) && second["pending"] == float64(1), "right after a page was fetched and indexed the report still says %v: every request must read the live counts", second)
 }
 
 func CheckStalled(ctx *harness.Ctx) {
-	c := readWorld(ctx, readURL(1))
+	c := hReadWorld(ctx, hReadURL(1))
 	ctx.Clock.Advance(600)
-	edge := reportOf(ctx, c)
-	ctx.Assert(numberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge["stalled"] == false, "a URL that has waited exactly STALL_AFTER_S = 600 s is not stalled yet (stalled means longer than 600 s), the report says %v", edge)
+	edge := hReportOf(ctx, c)
+	ctx.Assert(hNumberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge["stalled"] == false, "a URL that has waited exactly STALL_AFTER_S = 600 s is not stalled yet (stalled means longer than 600 s), the report says %v", edge)
 	ctx.Clock.Advance(100)
-	ctx.NoError(frontier.Enqueue(readBg, readJob, readHost, readURL(2)), "enqueue")
-	report := reportOf(ctx, c)
+	ctx.NoError(frontier.Enqueue(hReadBg, kHReadJob, kHReadHost, hReadURL(2)), "enqueue")
+	report := hReportOf(ctx, c)
 	ctx.Equal(report["pending"], 2, "two URLs are pending; the report's pending")
-	age := numberIn(ctx, report, "oldest_pending_age_s")
-	ctx.Assert(699 <= age && age <= 701, "the oldest pending URL has waited 700 s, the report says %v: age the oldest member of pending:%s", age, readJob)
+	age := hNumberIn(ctx, report, "oldest_pending_age_s")
+	ctx.Assert(699 <= age && age <= 701, "the oldest pending URL has waited 700 s, the report says %v: age the oldest member of pending:%s", age, kHReadJob)
 	ctx.Equal(report["stalled"], true, "a URL waiting 700 s (STALL_AFTER_S = 600) must make the report say stalled; stalled")
-	records.MarkFetched(readBg, readJob, readURL(1), "sha256:1", "pages/1")
+	records.MarkFetched(hReadBg, kHReadJob, hReadURL(1), "sha256:1", "pages/1")
 	ctx.Clock.Advance(1)
-	fresh := reportOf(ctx, c)
-	ctx.Assert(fresh["stalled"] == false && numberIn(ctx, fresh, "oldest_pending_age_s") <= 2, "once the old URL is fetched the one left was queued a second ago: stalled false, got %v", fresh)
+	fresh := hReportOf(ctx, c)
+	ctx.Assert(fresh["stalled"] == false && hNumberIn(ctx, fresh, "oldest_pending_age_s") <= 2, "once the old URL is fetched the one left was queued a second ago: stalled false, got %v", fresh)
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
-	urls := []string{readURL(1), readURL(2), readURL(3), readURL(4), readURL(5)}
-	c := readWorld(ctx, urls...)
-	records.MarkFetched(readBg, readJob, urls[0], "sha256:1", "pages/1")
-	records.MarkIndexed(readBg, readJob, urls[0])
-	records.MarkRefused(readBg, readJob, urls[1], "forbidden")
-	records.MarkGone(readBg, readJob, urls[2])
-	records.MarkFetched(readBg, readJob, urls[3], "sha256:4", "pages/4")
-	cov := numberIn(ctx, reportOf(ctx, c), "coverage")
+	urls := []string{hReadURL(1), hReadURL(2), hReadURL(3), hReadURL(4), hReadURL(5)}
+	c := hReadWorld(ctx, urls...)
+	records.MarkFetched(hReadBg, kHReadJob, urls[0], "sha256:1", "pages/1")
+	records.MarkIndexed(hReadBg, kHReadJob, urls[0])
+	records.MarkRefused(hReadBg, kHReadJob, urls[1], "forbidden")
+	records.MarkGone(hReadBg, kHReadJob, urls[2])
+	records.MarkFetched(hReadBg, kHReadJob, urls[3], "sha256:4", "pages/4")
+	cov := hNumberIn(ctx, hReportOf(ctx, c), "coverage")
 	ctx.Assert(math.Abs(cov-0.333) < 1e-9, "1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333 (rounded to 3 places), the report says %v: refused and gone pages are the site's answer, not work the crawl owes", cov)
-	records.MarkFailed(readBg, readJob, urls[4], "UNAVAILABLE")
+	records.MarkFailed(hReadBg, kHReadJob, urls[4], "UNAVAILABLE")
 	ctx.Clock.Advance(1)
-	drained := reportOf(ctx, c)
-	cov = numberIn(ctx, drained, "coverage")
+	drained := hReportOf(ctx, c)
+	cov = hNumberIn(ctx, drained, "coverage")
 	ctx.Assert(drained["pending"] == float64(0) && math.Abs(cov-0.333) < 1e-9, "with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says %v: a drained queue is no reason to answer 1.0", cov)
-	records.MarkIndexed(readBg, readJob, urls[3])
-	cov = numberIn(ctx, reportOf(ctx, c), "coverage")
+	records.MarkIndexed(hReadBg, kHReadJob, urls[3])
+	cov = hNumberIn(ctx, hReportOf(ctx, c), "coverage")
 	ctx.Assert(math.Abs(cov-0.667) < 1e-9, "2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says %v", cov)
-	registry.Insert(readBg, "weekly", readURL(9), "acme")
-	ctx.NoError(frontier.Enqueue(readBg, "weekly", readHost, readURL(9)), "enqueue")
-	records.MarkRefused(readBg, "weekly", readURL(9), "forbidden")
+	registry.Insert(hReadBg, "weekly", hReadURL(9), "acme")
+	ctx.NoError(frontier.Enqueue(hReadBg, "weekly", kHReadHost, hReadURL(9)), "enqueue")
+	records.MarkRefused(hReadBg, "weekly", hReadURL(9), "forbidden")
 	r := c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "a job whose only page was refused (%s)", r.Text())
 	owedNothing, _ := r.JSON().(map[string]any)
 	ctx.Assert(owedNothing != nil, "the report is not a JSON object: %s", r.Text())
-	ctx.Equal(numberIn(ctx, owedNothing, "coverage"), 0.0, "a job that owes nothing (its only page was refused) must report coverage 0; the coverage")
+	ctx.Equal(hNumberIn(ctx, owedNothing, "coverage"), 0.0, "a job that owes nothing (its only page was refused) must report coverage 0; the coverage")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -946,14 +946,14 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kJob = "nightly";
+const std::string kHJob = "nightly";
 const std::string kHost = "blog.example.com";
 
-std::string readUrl(int n) { return "https://" + kHost + "/p/" + std::to_string(n); }
+std::string hReadUrl(int n) { return "https://" + kHost + "/p/" + std::to_string(n); }
 
-harness::HTTP readWorld(harness::Ctx& ctx, const std::vector<std::string>& urls) {
-  registry::insert(kJob, readUrl(0), "acme");
-  for (const std::string& u : urls) frontier::enqueue(kJob, kHost, u);
+harness::HTTP hReadWorld(harness::Ctx& ctx, const std::vector<std::string>& urls) {
+  registry::insert(kHJob, hReadUrl(0), "acme");
+  for (const std::string& u : urls) frontier::enqueue(kHJob, kHost, u);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -961,9 +961,9 @@ harness::HTTP readWorld(harness::Ctx& ctx, const std::vector<std::string>& urls)
   return ctx.HTTP(*svr);
 }
 
-json reportOf(harness::Ctx& ctx, harness::HTTP& c) {
-  const auto r = c.Get("/v1/crawl/jobs/" + kJob, "X-Tenant-Id", "acme");
-  ctx.Equal(r.Status, 200, "GET /v1/crawl/jobs/%s (%s)", kJob, r.Text());
+json hReportOf(harness::Ctx& ctx, harness::HTTP& c) {
+  const auto r = c.Get("/v1/crawl/jobs/" + kHJob, "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/crawl/jobs/%s (%s)", kHJob, r.Text());
   try {
     return json::parse(r.Text());
   } catch (const std::exception&) {
@@ -971,13 +971,13 @@ json reportOf(harness::Ctx& ctx, harness::HTTP& c) {
   }
 }
 
-double numberIn(harness::Ctx& ctx, const json& report, const std::string& name) {
+double hNumberIn(harness::Ctx& ctx, const json& report, const std::string& name) {
   ctx.Assert(report.contains(name) && report[name].is_number(), "the report's %s is not a number: %s", name, report.dump());
   return report[name].get<double>();
 }
 
 // The body with the job id masked, so two answers for two ids compare.
-std::string masked(std::string text, const std::string& job) {
+std::string hMasked(std::string text, const std::string& job) {
   for (size_t at = text.find(job); at != std::string::npos; at = text.find(job, at + 5)) text.replace(at, job.size(), "<job>");
   return text;
 }
@@ -985,70 +985,70 @@ std::string masked(std::string text, const std::string& job) {
 }  // namespace
 
 void CheckTenant404(harness::Ctx& ctx) {
-  auto c = readWorld(ctx, {readUrl(1)});
-  const auto own = c.Get("/v1/crawl/jobs/" + kJob, "X-Tenant-Id", "acme");
-  const auto other = c.Get("/v1/crawl/jobs/" + kJob, "X-Tenant-Id", "globex");
+  auto c = hReadWorld(ctx, {hReadUrl(1)});
+  const auto own = c.Get("/v1/crawl/jobs/" + kHJob, "X-Tenant-Id", "acme");
+  const auto other = c.Get("/v1/crawl/jobs/" + kHJob, "X-Tenant-Id", "globex");
   const auto unknown = c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme");
-  const auto anonymous = c.Get("/v1/crawl/jobs/" + kJob);
+  const auto anonymous = c.Get("/v1/crawl/jobs/" + kHJob);
   ctx.Equal(own.Status, 200, "the job's own tenant (%s)", own.Text());
   ctx.Equal(unknown.Status, 404, "an unknown job");
   ctx.Equal(other.Status, 404, "another tenant's job must answer like an unknown job, or the difference tells a probe which job ids exist; the status");
-  ctx.Equal(masked(other.Text(), kJob), masked(unknown.Text(), "weekly"), "another tenant's job must answer exactly like an unknown job, or the body tells a probe which job ids exist; its body");
+  ctx.Equal(hMasked(other.Text(), kHJob), hMasked(unknown.Text(), "weekly"), "another tenant's job must answer exactly like an unknown job, or the body tells a probe which job ids exist; its body");
   ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckLiveCounts(harness::Ctx& ctx) {
-  auto c = readWorld(ctx, {readUrl(1), readUrl(2)});
-  const json first = reportOf(ctx, c);
+  auto c = hReadWorld(ctx, {hReadUrl(1), hReadUrl(2)});
+  const json first = hReportOf(ctx, c);
   ctx.Assert(first.value("pending", -1) == 2 && first.value("fetched", -1) == 0, "a job with two queued URLs reports %s", first.dump());
-  records::markFetched(kJob, readUrl(1), "sha256:1", "pages/1");
-  records::markIndexed(kJob, readUrl(1));
-  const json second = reportOf(ctx, c);
+  records::markFetched(kHJob, hReadUrl(1), "sha256:1", "pages/1");
+  records::markIndexed(kHJob, hReadUrl(1));
+  const json second = hReportOf(ctx, c);
   ctx.Assert(second.value("fetched", -1) == 1 && second.value("indexed", -1) == 1 && second.value("pending", -1) == 1,
              "right after a page was fetched and indexed the report still says %s: every request must read the live counts", second.dump());
 }
 
 void CheckStalled(harness::Ctx& ctx) {
-  auto c = readWorld(ctx, {readUrl(1)});
+  auto c = hReadWorld(ctx, {hReadUrl(1)});
   ctx.Clock.Advance(600);
-  const json edge = reportOf(ctx, c);
-  ctx.Assert(numberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge.contains("stalled") && edge["stalled"] == false,
+  const json edge = hReportOf(ctx, c);
+  ctx.Assert(hNumberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge.contains("stalled") && edge["stalled"] == false,
              "a URL that has waited exactly kStallAfterS = 600 s is not stalled yet (stalled means longer than 600 s), the report says %s", edge.dump());
   ctx.Clock.Advance(100);
-  frontier::enqueue(kJob, kHost, readUrl(2));
-  const json report = reportOf(ctx, c);
+  frontier::enqueue(kHJob, kHost, hReadUrl(2));
+  const json report = hReportOf(ctx, c);
   ctx.Equal(report.value("pending", -1), 2, "two URLs are pending; the report's pending");
-  const double age = numberIn(ctx, report, "oldest_pending_age_s");
-  ctx.Assert(699 <= age && age <= 701, "the oldest pending URL has waited 700 s, the report says %v: age the oldest member of pending:%s", age, kJob);
+  const double age = hNumberIn(ctx, report, "oldest_pending_age_s");
+  ctx.Assert(699 <= age && age <= 701, "the oldest pending URL has waited 700 s, the report says %v: age the oldest member of pending:%s", age, kHJob);
   ctx.Assert(report.contains("stalled") && report["stalled"] == true, "a URL waiting 700 s (kStallAfterS = 600) must make the report say stalled: true, got %s", report.dump());
-  records::markFetched(kJob, readUrl(1), "sha256:1", "pages/1");
+  records::markFetched(kHJob, hReadUrl(1), "sha256:1", "pages/1");
   ctx.Clock.Advance(1);
-  const json fresh = reportOf(ctx, c);
-  ctx.Assert(fresh.contains("stalled") && fresh["stalled"] == false && numberIn(ctx, fresh, "oldest_pending_age_s") <= 2,
+  const json fresh = hReportOf(ctx, c);
+  ctx.Assert(fresh.contains("stalled") && fresh["stalled"] == false && hNumberIn(ctx, fresh, "oldest_pending_age_s") <= 2,
              "once the old URL is fetched the one left was queued a second ago: stalled false, got %s", fresh.dump());
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
-  const std::vector<std::string> urls = {readUrl(1), readUrl(2), readUrl(3), readUrl(4), readUrl(5)};
-  auto c = readWorld(ctx, urls);
-  records::markFetched(kJob, urls[0], "sha256:1", "pages/1");
-  records::markIndexed(kJob, urls[0]);
-  records::markRefused(kJob, urls[1], "forbidden");
-  records::markGone(kJob, urls[2]);
-  records::markFetched(kJob, urls[3], "sha256:4", "pages/4");
-  double cov = numberIn(ctx, reportOf(ctx, c), "coverage");
+  const std::vector<std::string> urls = {hReadUrl(1), hReadUrl(2), hReadUrl(3), hReadUrl(4), hReadUrl(5)};
+  auto c = hReadWorld(ctx, urls);
+  records::markFetched(kHJob, urls[0], "sha256:1", "pages/1");
+  records::markIndexed(kHJob, urls[0]);
+  records::markRefused(kHJob, urls[1], "forbidden");
+  records::markGone(kHJob, urls[2]);
+  records::markFetched(kHJob, urls[3], "sha256:4", "pages/4");
+  double cov = hNumberIn(ctx, hReportOf(ctx, c), "coverage");
   ctx.Assert(std::abs(cov - 0.333) < 1e-9, "1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333 (rounded to 3 places), the report says %v: refused and gone pages are the site's answer, not work the crawl owes", cov);
-  records::markFailed(kJob, urls[4], "UNAVAILABLE");
+  records::markFailed(kHJob, urls[4], "UNAVAILABLE");
   ctx.Clock.Advance(1);
-  const json drained = reportOf(ctx, c);
-  cov = numberIn(ctx, drained, "coverage");
+  const json drained = hReportOf(ctx, c);
+  cov = hNumberIn(ctx, drained, "coverage");
   ctx.Assert(drained.value("pending", -1) == 0 && std::abs(cov - 0.333) < 1e-9, "with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says %v: a drained queue is no reason to answer 1.0", cov);
-  records::markIndexed(kJob, urls[3]);
-  cov = numberIn(ctx, reportOf(ctx, c), "coverage");
+  records::markIndexed(kHJob, urls[3]);
+  cov = hNumberIn(ctx, hReportOf(ctx, c), "coverage");
   ctx.Assert(std::abs(cov - 0.667) < 1e-9, "2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says %v", cov);
-  registry::insert("weekly", readUrl(9), "acme");
-  frontier::enqueue("weekly", kHost, readUrl(9));
-  records::markRefused("weekly", readUrl(9), "forbidden");
+  registry::insert("weekly", hReadUrl(9), "acme");
+  frontier::enqueue("weekly", kHost, hReadUrl(9));
+  records::markRefused("weekly", hReadUrl(9), "forbidden");
   const auto r = c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "a job whose only page was refused (%s)", r.Text());
   json owedNothing;
@@ -1057,7 +1057,7 @@ void CheckCoverage(harness::Ctx& ctx) {
   } catch (const std::exception&) {
     ctx.Fatalf("the report is not JSON: %s", r.Text());
   }
-  ctx.Equal(numberIn(ctx, owedNothing, "coverage"), 0.0, "a job that owes nothing (its only page was refused) must report coverage 0; the coverage");
+  ctx.Equal(hNumberIn(ctx, owedNothing, "coverage"), 0.0, "a job that owes nothing (its only page was refused) must report coverage 0; the coverage");
 }
 `,
   },

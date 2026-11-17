@@ -1029,46 +1029,46 @@ import (
 )
 
 var (
-	clientBg     = context.Background()
-	clientQuery  = []float64{1, 0, 0, 0}
-	shardTargets = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
+	hClientBg     = context.Background()
+	hClientQuery  = []float64{1, 0, 0, 0}
+	hShardTargets = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
 )
 
-type sliceHit struct {
+type HSliceHit struct {
 	id    string
 	score float64
 }
 
-// shardSlices is each shard's slice of acme's namespace in idx-42: the best documents live on shard-2.
-var shardSlices = map[string][]sliceHit{
+// hShardSlices is each shard's slice of acme's namespace in idx-42: the best documents live on shard-2.
+var hShardSlices = map[string][]HSliceHit{
 	"shard-0:9000": {{"s0-a", 0.40}, {"s0-b", 0.30}, {"s0-c", 0.20}},
 	"shard-1:9000": {{"s1-a", 0.70}, {"s1-b", 0.10}},
 	"shard-2:9000": {{"s2-a", 0.95}, {"s2-b", 0.60}},
 }
 
-// tiedSlices is tenant ties: one document per shard, every score equal, so only the id orders them.
-var tiedSlices = map[string][]sliceHit{
+// hTiedSlices is tenant ties: one document per shard, every score equal, so only the id orders them.
+var hTiedSlices = map[string][]HSliceHit{
 	"shard-0:9000": {{"t-c", 0.5}},
 	"shard-1:9000": {{"t-b", 0.5}},
 	"shard-2:9000": {{"t-a", 0.5}},
 }
 
-// shardPeer answers its slice's best k for acme (or ties) in idx-42, nothing for anyone else. For
+// HShardPeer answers its slice's best k for acme (or ties) in idx-42, nothing for anyone else. For
 // tenant flaky, shard-1 answers UNAVAILABLE once its latency has passed: a shard that fails late.
-type shardPeer struct {
+type HShardPeer struct {
 	pb.UnimplementedShardServer
 	target string
 }
 
-func (p *shardPeer) Search(_ context.Context, req *pb.ShardRequest) (*pb.ShardReply, error) {
+func (p *HShardPeer) Search(_ context.Context, req *pb.ShardRequest) (*pb.ShardReply, error) {
 	if req.GetTenant() == "flaky" && p.target == "shard-1:9000" {
 		return nil, status.Error(codes.Unavailable, "shard restarting")
 	}
-	slices := map[string]map[string][]sliceHit{"acme": shardSlices, "ties": tiedSlices}[req.GetTenant()]
+	slices := map[string]map[string][]HSliceHit{"acme": hShardSlices, "ties": hTiedSlices}[req.GetTenant()]
 	if slices == nil || req.GetIndexVersion() != "idx-42" {
 		return &pb.ShardReply{}, nil
 	}
-	best := append([]sliceHit(nil), slices[p.target]...)
+	best := append([]HSliceHit(nil), slices[p.target]...)
 	sort.Slice(best, func(i, j int) bool { return best[i].score > best[j].score })
 	if int(req.GetK()) < len(best) {
 		best = best[:req.GetK()]
@@ -1080,15 +1080,15 @@ func (p *shardPeer) Search(_ context.Context, req *pb.ShardRequest) (*pb.ShardRe
 	return reply, nil
 }
 
-func serveShards(ctx *harness.Ctx) {
-	for _, target := range shardTargets {
+func hServeShards(ctx *harness.Ctx) {
+	for _, target := range hShardTargets {
 		// Bound to a variable first: the Go runtime reuses one &T{} literal passed straight to a call in a loop.
-		peer := &shardPeer{target: target}
+		peer := &HShardPeer{target: target}
 		pb.RegisterShardServer(ctx.GRPC.Server(target), peer)
 	}
 }
 
-func gatheredIDs(g Gathered) string {
+func hGatheredIDs(g Gathered) string {
 	ids := []string{}
 	for _, h := range g.Hits {
 		ids = append(ids, h.ID)
@@ -1096,29 +1096,29 @@ func gatheredIDs(g Gathered) string {
 	return strings.Join(ids, ",")
 }
 
-func mustGather(ctx *harness.Ctx) Gathered {
-	g, err := searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+func hMustGather(ctx *harness.Ctx) Gathered {
+	g, err := searchShards(hClientBg, "acme", "idx-42", hClientQuery, 3)
 	ctx.NoError(err, "searchShards(acme, idx-42, …, 3)")
 	return g
 }
 
-func callCount(ctx *harness.Ctx, target string) int { return len(ctx.GRPC.CallsTo("Search", target)) }
+func hCallCount(ctx *harness.Ctx, target string) int { return len(ctx.GRPC.CallsTo("Search", target)) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	ctx.GRPC.SetLatency("Search", 5, "shard-2:9000")
-	g := mustGather(ctx)
+	g := hMustGather(ctx)
 	for _, call := range ctx.GRPC.CallsTo("Search", "") {
 		ctx.Assert(call.HasDeadline(), "a Search call to %s carries no deadline: a stalled shard holds the search open for as long as it stalls", call.Target)
 		ctx.Assert(call.Timeout >= 300*time.Millisecond && call.Timeout <= 500*time.Millisecond, "a Search call carries a %v deadline, expected 400 ms", call.Timeout)
 	}
 	ctx.Assert(g.Partial && g.Answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so Partial must be true and Answered 2, got %+v", g)
-	ctx.Equal(gatheredIDs(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1")
+	ctx.Equal(hGatheredIDs(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1")
 	// shard-1 now answers UNAVAILABLE only after 300 ms: the retry must still get its own 400 ms.
 	ctx.GRPC.SetLatency("Search", 0, "shard-2:9000")
 	ctx.GRPC.SetLatency("Search", 0.3, "shard-1:9000")
-	before := callCount(ctx, "shard-1:9000")
-	searchShards(clientBg, "flaky", "idx-42", clientQuery, 3)
+	before := hCallCount(ctx, "shard-1:9000")
+	searchShards(hClientBg, "flaky", "idx-42", hClientQuery, 3)
 	late := ctx.GRPC.CallsTo("Search", "shard-1:9000")[before:]
 	ctx.Equal(len(late), 2, "shard-1 answered UNAVAILABLE after 300 ms: a first call and one retry; calls")
 	for _, call := range late {
@@ -1127,55 +1127,55 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	ctx.GRPC.Fail("Search", codes.Unavailable, "shard restarting", 1, "shard-1:9000")
-	g := mustGather(ctx)
-	ctx.Assert(callCount(ctx, "shard-1:9000") == 2 && g.Answered == 3, "shard-1 answered UNAVAILABLE once: one more call must reach it, got %d calls and %+v", callCount(ctx, "shard-1:9000"), g)
+	g := hMustGather(ctx)
+	ctx.Assert(hCallCount(ctx, "shard-1:9000") == 2 && g.Answered == 3, "shard-1 answered UNAVAILABLE once: one more call must reach it, got %d calls and %+v", hCallCount(ctx, "shard-1:9000"), g)
 	ctx.GRPC.Stop("shard-2:9000")
-	before := callCount(ctx, "shard-2:9000")
-	searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
-	ctx.Equal(callCount(ctx, "shard-2:9000")-before, 2, "a shard that is down must be called maxAttempts = 2 times in one search; calls")
+	before := hCallCount(ctx, "shard-2:9000")
+	searchShards(hClientBg, "acme", "idx-42", hClientQuery, 3)
+	ctx.Equal(hCallCount(ctx, "shard-2:9000")-before, 2, "a shard that is down must be called maxAttempts = 2 times in one search; calls")
 	for _, code := range []codes.Code{codes.DeadlineExceeded, codes.Internal, codes.ResourceExhausted, codes.InvalidArgument} {
 		ctx.GRPC.Fail("Search", code, "terminal", 1, "shard-0:9000")
-		before = callCount(ctx, "shard-0:9000")
-		searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
-		ctx.Equal(callCount(ctx, "shard-0:9000")-before, 1, "a shard that answered %v must not be called again in the same search (only UNAVAILABLE is retried); calls", code)
+		before = hCallCount(ctx, "shard-0:9000")
+		searchShards(hClientBg, "acme", "idx-42", hClientQuery, 3)
+		ctx.Equal(hCallCount(ctx, "shard-0:9000")-before, 1, "a shard that answered %v must not be called again in the same search (only UNAVAILABLE is retried); calls", code)
 	}
 }
 
 func CheckPartial(ctx *harness.Ctx) {
-	serveShards(ctx)
-	empty, err := searchShards(clientBg, "globex", "idx-42", clientQuery, 3)
+	hServeShards(ctx)
+	empty, err := searchShards(hClientBg, "globex", "idx-42", hClientQuery, 3)
 	ctx.Assert(err == nil, "every shard answered globex with no hits and searchShards returned %v: an empty answer is an answer, only a shard that did not answer is missing", err)
 	ctx.Assert(len(empty.Hits) == 0 && !empty.Partial && empty.Answered == 3, "every shard answered globex with no hits: the answer is complete and empty (Answered 3, Partial false), got %+v", empty)
 	ctx.GRPC.Stop("shard-1:9000")
-	g := mustGather(ctx)
+	g := hMustGather(ctx)
 	ctx.Assert(g.Partial, "with shard-1 down the answer must say Partial, got %+v: a dead shard is not an empty one", g)
 	ctx.Assert(g.Answered == 2 && g.Required == 2, "Answered must count the 2 shards that answered (Required 2), got %+v", g)
-	ctx.Equal(gatheredIDs(g), "s2-a,s2-b,s0-a", "the answer must be the top 3 of shard-0 and shard-2")
+	ctx.Equal(hGatheredIDs(g), "s2-a,s2-b,s0-a", "the answer must be the top 3 of shard-0 and shard-2")
 }
 
 func CheckQuorum(ctx *harness.Ctx) {
-	serveShards(ctx)
+	hServeShards(ctx)
 	ctx.GRPC.Stop("shard-1:9000")
 	ctx.GRPC.Stop("shard-2:9000")
-	g, err := searchShards(clientBg, "acme", "idx-42", clientQuery, 3)
+	g, err := searchShards(hClientBg, "acme", "idx-42", hClientQuery, 3)
 	ctx.Assert(err != nil, "with 2 of 3 shards down searchShards answered %+v: below a quorum of 2 it must return ErrQuorumLost", g)
 	ctx.Assert(errors.Is(err, ErrQuorumLost), "searchShards returned %v, expected an error wrapping ErrQuorumLost", err)
 }
 
 func CheckMerge(ctx *harness.Ctx) {
-	serveShards(ctx)
-	g := mustGather(ctx)
+	hServeShards(ctx)
+	g := hMustGather(ctx)
 	for _, call := range ctx.GRPC.CallsTo("Search", "") {
 		r, _ := call.Request.(*pb.ShardRequest)
-		ctx.Assert(r != nil && r.GetTenant() == "acme" && r.GetIndexVersion() == "idx-42" && r.GetK() == 3 && fmt.Sprint(r.GetQuery()) == fmt.Sprint(clientQuery), "every shard must be asked for acme's top 3 in idx-42, %s got %v", call.Target, r)
+		ctx.Assert(r != nil && r.GetTenant() == "acme" && r.GetIndexVersion() == "idx-42" && r.GetK() == 3 && fmt.Sprint(r.GetQuery()) == fmt.Sprint(hClientQuery), "every shard must be asked for acme's top 3 in idx-42, %s got %v", call.Target, r)
 	}
-	ctx.Equal(gatheredIDs(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge")
+	ctx.Equal(hGatheredIDs(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge")
 	ctx.Assert(!g.Partial && g.Answered == 3, "with every shard healthy the answer is complete, got %+v", g)
-	ties, err := searchShards(clientBg, "ties", "idx-42", clientQuery, 2)
+	ties, err := searchShards(hClientBg, "ties", "idx-42", hClientQuery, 2)
 	ctx.NoError(err, "searchShards(ties, idx-42, …, 2)")
-	ctx.Equal(gatheredIDs(ties), "t-a,t-b", "t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 by id are t-a and t-b; the merge")
+	ctx.Equal(hGatheredIDs(ties), "t-a,t-b", "t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 by id are t-a and t-b; the merge")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1188,18 +1188,18 @@ func CheckMerge(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kTargets = {"shard-0:9000", "shard-1:9000", "shard-2:9000"};
-const std::vector<double> kQuery = {1, 0, 0, 0};
+const std::vector<std::string> kHTargets = {"shard-0:9000", "shard-1:9000", "shard-2:9000"};
+const std::vector<double> kHQuery = {1, 0, 0, 0};
 
 // Each shard's slice of acme's namespace in idx-42: the best documents live on shard-2.
-const std::map<std::string, std::vector<std::pair<std::string, double>>> kSlices = {
+const std::map<std::string, std::vector<std::pair<std::string, double>>> kHSlices = {
     {"shard-0:9000", {{"s0-a", 0.40}, {"s0-b", 0.30}, {"s0-c", 0.20}}},
     {"shard-1:9000", {{"s1-a", 0.70}, {"s1-b", 0.10}}},
     {"shard-2:9000", {{"s2-a", 0.95}, {"s2-b", 0.60}}},
 };
 
 // Tenant ties: one document per shard, every score equal, so only the id orders them.
-const std::map<std::string, std::vector<std::pair<std::string, double>>> kTies = {
+const std::map<std::string, std::vector<std::pair<std::string, double>>> kHTies = {
     {"shard-0:9000", {{"t-c", 0.5}}},
     {"shard-1:9000", {{"t-b", 0.5}}},
     {"shard-2:9000", {{"t-a", 0.5}}},
@@ -1207,12 +1207,12 @@ const std::map<std::string, std::vector<std::pair<std::string, double>>> kTies =
 
 // One shard: its slice's best k for acme (or ties) in idx-42, nothing for anyone else. For tenant
 // flaky, shard-1 answers UNAVAILABLE once its latency has passed: a shard that fails late.
-class ShardPeer final : public searchd::Shard::Service {
+class HShardPeer final : public searchd::Shard::Service {
  public:
-  explicit ShardPeer(std::string target) : target_(std::move(target)) {}
+  explicit HShardPeer(std::string target) : target_(std::move(target)) {}
   grpc::Status Search(grpc::ServerContext*, const searchd::ShardRequest* req, searchd::ShardReply* out) override {
     if (req->tenant() == "flaky" && target_ == "shard-1:9000") return grpc::Status(grpc::StatusCode::UNAVAILABLE, "shard restarting");
-    const auto* slices = req->tenant() == "acme" ? &kSlices : req->tenant() == "ties" ? &kTies : nullptr;
+    const auto* slices = req->tenant() == "acme" ? &kHSlices : req->tenant() == "ties" ? &kHTies : nullptr;
     if (slices == nullptr || req->index_version() != "idx-42") return grpc::Status::OK;
     auto best = slices->at(target_);
     std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -1229,38 +1229,38 @@ class ShardPeer final : public searchd::Shard::Service {
   std::string target_;
 };
 
-void serveShards(harness::Ctx& ctx) {
-  static std::vector<ShardPeer*> peers;
-  for (ShardPeer* p : peers) delete p;
+void hServeShards(harness::Ctx& ctx) {
+  static std::vector<HShardPeer*> peers;
+  for (HShardPeer* p : peers) delete p;
   peers.clear();
-  for (const std::string& target : kTargets) {
-    peers.push_back(new ShardPeer(target));
+  for (const std::string& target : kHTargets) {
+    peers.push_back(new HShardPeer(target));
     ctx.GRPC.Server(target)->RegisterService(peers.back());
   }
 }
 
-std::string ids(const Gathered& g) {
+std::string hIds(const Gathered& g) {
   std::string out;
   for (const auto& h : g.hits) out += (out.empty() ? "" : ",") + h.id;
   return out;
 }
 
-std::string show(const Gathered& g) {
-  return "{hits: [" + ids(g) + "], partial: " + (g.partial ? "true" : "false") + ", answered: " + std::to_string(g.answered) + ", required: " + std::to_string(g.required) + "}";
+std::string hShow(const Gathered& g) {
+  return "{hits: [" + hIds(g) + "], partial: " + (g.partial ? "true" : "false") + ", answered: " + std::to_string(g.answered) + ", required: " + std::to_string(g.required) + "}";
 }
 
-int calls(harness::Ctx& ctx, const std::string& target) { return static_cast<int>(ctx.GRPC.CallsTo("Search", target).size()); }
+int hCalls(harness::Ctx& ctx, const std::string& target) { return static_cast<int>(ctx.GRPC.CallsTo("Search", target).size()); }
 
-Gathered gather(harness::Ctx& ctx) {
+Gathered hGather(harness::Ctx& ctx) {
   try {
-    return searchShards("acme", "idx-42", kQuery, 3);
+    return searchShards("acme", "idx-42", kHQuery, 3);
   } catch (const std::exception& e) {
     ctx.Fatalf("searchShards(acme, idx-42, …, 3) threw %s: %s", harness::CurrentExceptionType(), e.what());
   }
   return {};
 }
 
-void quietly(const std::function<void()>& fn) {
+void hQuietly(const std::function<void()>& fn) {
   try {
     fn();
   } catch (const std::exception&) {
@@ -1270,20 +1270,20 @@ void quietly(const std::function<void()>& fn) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   ctx.GRPC.SetLatency("Search", 5, "shard-2:9000");
-  const Gathered g = gather(ctx);
+  const Gathered g = hGather(ctx);
   for (const auto& call : ctx.GRPC.CallsTo("Search")) {
     ctx.Assert(call.HasDeadline(), "a Search call to %s carries no deadline: a stalled shard holds the search open for as long as it stalls", call.Target);
     ctx.Assert(call.TimeoutSeconds() >= 0.3 && call.TimeoutSeconds() <= 0.5, "a Search call carries a %v s deadline, expected 400 ms", call.TimeoutSeconds());
   }
-  ctx.Assert(g.partial && g.answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got %s", show(g));
-  ctx.Equal(ids(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1");
+  ctx.Assert(g.partial && g.answered == 2, "shard-2 answers after 5 s, past the deadline: it is missing, so partial must be true and answered 2, got %s", hShow(g));
+  ctx.Equal(hIds(g), "s1-a,s0-a,s0-b", "the answer must be the top 3 of shard-0 and shard-1");
   // shard-1 now answers UNAVAILABLE only after 300 ms: the retry must still get its own 400 ms.
   ctx.GRPC.SetLatency("Search", 0, "shard-2:9000");
   ctx.GRPC.SetLatency("Search", 0.3, "shard-1:9000");
-  const int before = calls(ctx, "shard-1:9000");
-  quietly([] { searchShards("flaky", "idx-42", kQuery, 3); });
+  const int before = hCalls(ctx, "shard-1:9000");
+  hQuietly([] { searchShards("flaky", "idx-42", kHQuery, 3); });
   const auto all = ctx.GRPC.CallsTo("Search", "shard-1:9000");
   ctx.Equal(static_cast<int>(all.size()) - before, 2, "shard-1 answered UNAVAILABLE after 300 ms: a first call and one retry; calls");
   for (size_t i = static_cast<size_t>(before); i < all.size(); ++i) {
@@ -1292,14 +1292,14 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   ctx.GRPC.Fail("Search", grpc::StatusCode::UNAVAILABLE, "shard restarting", 1, "shard-1:9000");
-  const Gathered g = gather(ctx);
-  ctx.Assert(calls(ctx, "shard-1:9000") == 2 && g.answered == 3, "shard-1 answered UNAVAILABLE once: one more call must reach it, got %d calls and %s", calls(ctx, "shard-1:9000"), show(g));
+  const Gathered g = hGather(ctx);
+  ctx.Assert(hCalls(ctx, "shard-1:9000") == 2 && g.answered == 3, "shard-1 answered UNAVAILABLE once: one more call must reach it, got %d calls and %s", hCalls(ctx, "shard-1:9000"), hShow(g));
   ctx.GRPC.Stop("shard-2:9000");
-  int before = calls(ctx, "shard-2:9000");
-  quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
-  ctx.Equal(calls(ctx, "shard-2:9000") - before, 2, "a shard that is down must be called kMaxAttempts = 2 times in one search; calls");
+  int before = hCalls(ctx, "shard-2:9000");
+  hQuietly([] { searchShards("acme", "idx-42", kHQuery, 3); });
+  ctx.Equal(hCalls(ctx, "shard-2:9000") - before, 2, "a shard that is down must be called kMaxAttempts = 2 times in one search; calls");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::DEADLINE_EXCEEDED, "DEADLINE_EXCEEDED"},
       {grpc::StatusCode::INTERNAL, "INTERNAL"},
@@ -1308,50 +1308,50 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   };
   for (const auto& [code, name] : terminal) {
     ctx.GRPC.Fail("Search", code, "terminal", 1, "shard-0:9000");
-    before = calls(ctx, "shard-0:9000");
-    quietly([] { searchShards("acme", "idx-42", kQuery, 3); });
-    ctx.Equal(calls(ctx, "shard-0:9000") - before, 1, "a shard that answered %s must not be called again in the same search (only UNAVAILABLE is retried); calls", name);
+    before = hCalls(ctx, "shard-0:9000");
+    hQuietly([] { searchShards("acme", "idx-42", kHQuery, 3); });
+    ctx.Equal(hCalls(ctx, "shard-0:9000") - before, 1, "a shard that answered %s must not be called again in the same search (only UNAVAILABLE is retried); calls", name);
   }
 }
 
 void CheckPartial(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   try {
-    const Gathered empty = searchShards("globex", "idx-42", kQuery, 3);
-    ctx.Assert(empty.hits.empty() && !empty.partial && empty.answered == 3, "every shard answered globex with no hits: the answer is complete and empty (answered 3, partial false), got %s", show(empty));
+    const Gathered empty = searchShards("globex", "idx-42", kHQuery, 3);
+    ctx.Assert(empty.hits.empty() && !empty.partial && empty.answered == 3, "every shard answered globex with no hits: the answer is complete and empty (answered 3, partial false), got %s", hShow(empty));
   } catch (const QuorumLost&) {
     ctx.Fatalf("every shard answered globex with no hits and searchShards threw QuorumLost: an empty answer is an answer, only a shard that did not answer is missing");
   }
   ctx.GRPC.Stop("shard-1:9000");
-  const Gathered g = gather(ctx);
-  ctx.Assert(g.partial, "with shard-1 down the answer must say partial, got %s: a dead shard is not an empty one", show(g));
-  ctx.Assert(g.answered == 2 && g.required == 2, "answered must count the 2 shards that answered (required 2), got %s", show(g));
-  ctx.Equal(ids(g), "s2-a,s2-b,s0-a", "the answer must be the top 3 of shard-0 and shard-2");
+  const Gathered g = hGather(ctx);
+  ctx.Assert(g.partial, "with shard-1 down the answer must say partial, got %s: a dead shard is not an empty one", hShow(g));
+  ctx.Assert(g.answered == 2 && g.required == 2, "answered must count the 2 shards that answered (required 2), got %s", hShow(g));
+  ctx.Equal(hIds(g), "s2-a,s2-b,s0-a", "the answer must be the top 3 of shard-0 and shard-2");
 }
 
 void CheckQuorum(harness::Ctx& ctx) {
-  serveShards(ctx);
+  hServeShards(ctx);
   ctx.GRPC.Stop("shard-1:9000");
   ctx.GRPC.Stop("shard-2:9000");
   try {
-    const Gathered g = searchShards("acme", "idx-42", kQuery, 3);
-    ctx.Fatalf("with 2 of 3 shards down searchShards answered %s: below a quorum of 2 it must throw QuorumLost", show(g));
+    const Gathered g = searchShards("acme", "idx-42", kHQuery, 3);
+    ctx.Fatalf("with 2 of 3 shards down searchShards answered %s: below a quorum of 2 it must throw QuorumLost", hShow(g));
   } catch (const QuorumLost&) {
   }
 }
 
 void CheckMerge(harness::Ctx& ctx) {
-  serveShards(ctx);
-  const Gathered g = gather(ctx);
+  hServeShards(ctx);
+  const Gathered g = hGather(ctx);
   for (const auto& call : ctx.GRPC.CallsTo("Search")) {
     const auto r = call.Request<searchd::ShardRequest>();
     const std::vector<double> query(r.query().begin(), r.query().end());
-    ctx.Assert(r.tenant() == "acme" && r.index_version() == "idx-42" && r.k() == 3 && query == kQuery, "every shard must be asked for acme's top 3 in idx-42, %s got tenant %q version %q k %d", call.Target, r.tenant(), r.index_version(), r.k());
+    ctx.Assert(r.tenant() == "acme" && r.index_version() == "idx-42" && r.k() == 3 && query == kHQuery, "every shard must be asked for acme's top 3 in idx-42, %s got tenant %q version %q k %d", call.Target, r.tenant(), r.index_version(), r.k());
   }
-  ctx.Equal(ids(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge");
-  ctx.Assert(!g.partial && g.answered == 3, "with every shard healthy the answer is complete, got %s", show(g));
+  ctx.Equal(hIds(g), "s2-a,s1-a,s2-b", "the global top 3 by score are s2-a (0.95), s1-a (0.70), s2-b (0.60); the merge");
+  ctx.Assert(!g.partial && g.answered == 3, "with every shard healthy the answer is complete, got %s", hShow(g));
   try {
-    ctx.Equal(ids(searchShards("ties", "idx-42", kQuery, 2)), "t-a,t-b", "t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 by id are t-a and t-b; the merge");
+    ctx.Equal(hIds(searchShards("ties", "idx-42", kHQuery, 2)), "t-a,t-b", "t-c (shard-0), t-b (shard-1) and t-a (shard-2) all score 0.5, so the top 2 by id are t-a and t-b; the merge");
   } catch (const QuorumLost&) {
     ctx.Fatalf("with every shard healthy searchShards(ties, idx-42, …, 2) threw QuorumLost");
   }

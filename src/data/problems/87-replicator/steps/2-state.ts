@@ -550,54 +550,54 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func mustAdvance(ctx *harness.Ctx, shard int, offset int64) int64 {
-	after, err := advanceOffset(stateBg, "rep-1", shard, offset)
+func hMustAdvance(ctx *harness.Ctx, shard int, offset int64) int64 {
+	after, err := advanceOffset(hStateBg, "rep-1", shard, offset)
 	ctx.NoError(err, "advanceOffset(rep-1, %d, %d)", shard, offset)
 	return after
 }
 
-func mustResume(ctx *harness.Ctx, shard int) int64 {
-	offset, err := resumeOffset(stateBg, "rep-1", shard)
+func hMustResume(ctx *harness.Ctx, shard int) int64 {
+	offset, err := resumeOffset(hStateBg, "rep-1", shard)
 	ctx.NoError(err, "resumeOffset(rep-1, %d)", shard)
 	return offset
 }
 
 func CheckDurableOffset(ctx *harness.Ctx) {
-	mustAdvance(ctx, 0, 42)
+	hMustAdvance(ctx, 0, 42)
 	for _, key := range ctx.Redis.Keys("offset:*") {
 		ctx.Equal(ctx.Redis.TTL(key), int64(-1), "%s expires: a shard that is quiet that long forgets its offset and the target re-applies its history; its TTL", key)
 	}
 	ctx.Clock.Advance(7200)
-	ctx.Equal(mustResume(ctx, 0), int64(42), "after two quiet hours resumeOffset(rep-1, 0) must be the confirmed offset")
+	ctx.Equal(hMustResume(ctx, 0), int64(42), "after two quiet hours resumeOffset(rep-1, 0) must be the confirmed offset")
 }
 
 func CheckNumericCompare(ctx *harness.Ctx) {
-	mustAdvance(ctx, 0, 9)
-	after := mustAdvance(ctx, 0, 10)
-	resumed := mustResume(ctx, 0)
+	hMustAdvance(ctx, 0, 9)
+	after := hMustAdvance(ctx, 0, 10)
+	resumed := hMustResume(ctx, 0)
 	ctx.Assert(resumed == 10 && after == 10, "confirming 9 then 10 left the shard at %d (advance returned %d): offsets compared as strings put \\"10\\" before \\"9\\"", resumed, after)
-	mustAdvance(ctx, 0, 11)
-	late := mustAdvance(ctx, 0, 7)
-	now := mustResume(ctx, 0)
+	hMustAdvance(ctx, 0, 11)
+	late := hMustAdvance(ctx, 0, 7)
+	now := hMustResume(ctx, 0)
 	ctx.Assert(now == 11 && late == 11, "a late confirmation of 7 after 11 left the shard at %d (advance returned %d), expected 11", now, late)
 }
 
 func CheckAtomicAdvance(ctx *harness.Ctx) {
-	mustAdvance(ctx, 0, 1)
+	hMustAdvance(ctx, 0, 1)
 	fired := false
 	for _, key := range []string{"offset:rep-1:0", "offset:rep-1"} {
 		ctx.Redis.After(key, func() any {
 			fired = true
-			after, err := advanceOffset(stateBg, "rep-1", 0, 20)
+			after, err := advanceOffset(hStateBg, "rep-1", 0, 20)
 			ctx.NoError(err, "the rival advance failed")
 			return after
 		})
 	}
-	mustAdvance(ctx, 0, 15)
+	hMustAdvance(ctx, 0, 15)
 	ctx.Assert(fired, "advanceOffset never touched the shard's offset key")
-	ctx.Equal(mustResume(ctx, 0), int64(20), "a worker confirmed 20 while this one advanced to 15: read, compare and write must run in one script, or the older confirmation wins; the shard's offset")
+	ctx.Equal(hMustResume(ctx, 0), int64(20), "a worker confirmed 20 while this one advanced to 15: read, compare and write must run in one script, or the older confirmation wins; the shard's offset")
 	for _, rivalKey := range []string{"offset:rep-1:0", "offset:rep-1"} {
 		key := rivalKey
 		ctx.Redis.After(key, func() any {
@@ -609,15 +609,15 @@ func CheckAtomicAdvance(ctx *harness.Ctx) {
 			return nil
 		})
 	}
-	after := mustAdvance(ctx, 0, 40)
-	resumed := mustResume(ctx, 0)
+	after := hMustAdvance(ctx, 0, 40)
+	resumed := hMustResume(ctx, 0)
 	ctx.Assert(resumed == 40 && after == 40, "another worker advanced the shard to 30 while this one confirmed 40, and the shard ended at %d (advance returned %d): the larger confirmation must win, so a compare-and-set that lost the race retries", resumed, after)
 }
 
 func CheckShardKey(ctx *harness.Ctx) {
-	mustAdvance(ctx, 0, 30)
-	mustAdvance(ctx, 1, 12)
-	first, second := mustResume(ctx, 0), mustResume(ctx, 1)
+	hMustAdvance(ctx, 0, 30)
+	hMustAdvance(ctx, 1, 12)
+	first, second := hMustResume(ctx, 0), hMustResume(ctx, 1)
 	ctx.Assert(first == 30 && second == 12, "shards 0 and 1 resume at %d and %d, expected 30 and 12: each shard needs its own offset key", first, second)
 	a, _ := ctx.Redis.Get("offset:rep-1:0")
 	b, _ := ctx.Redis.Get("offset:rep-1:1")
@@ -632,13 +632,13 @@ func CheckShardKey(ctx *harness.Ctx) {
 
 namespace {
 
-struct Rival {
+struct HRival {
   bool fired = false;
   std::optional<std::string> err;
 };
 
-std::shared_ptr<Rival> rivalAdvance(harness::Ctx& ctx, const std::string& key) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRivalAdvance(harness::Ctx& ctx, const std::string& key) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out] {
     out->fired = true;
     try {
@@ -674,8 +674,8 @@ void CheckNumericCompare(harness::Ctx& ctx) {
 
 void CheckAtomicAdvance(harness::Ctx& ctx) {
   advanceOffset("rep-1", 0, 1);
-  const auto shardKey = rivalAdvance(ctx, "offset:rep-1:0");
-  const auto sharedKey = rivalAdvance(ctx, "offset:rep-1");
+  const auto shardKey = hRivalAdvance(ctx, "offset:rep-1:0");
+  const auto sharedKey = hRivalAdvance(ctx, "offset:rep-1");
   advanceOffset("rep-1", 0, 15);
   ctx.Assert(shardKey->fired || sharedKey->fired, "advanceOffset never touched the shard's offset key");
   ctx.Assert(!shardKey->err && !sharedKey->err, "the rival advance failed: %s", shardKey->err.value_or(sharedKey->err.value_or("")));

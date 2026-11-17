@@ -735,11 +735,11 @@ import (
 )
 
 const (
-	apiJob   = "nightly"
-	apiPosts = "https://blog.example.com/posts"
+	kHApiJob   = "nightly"
+	kHApiPosts = "https://blog.example.com/posts"
 )
 
-var refusedTargets = []string{
+var hRefusedTargets = []string{
 	"ftp://blog.example.com/archive.tar",
 	"https://evil.example.net/",
 	"http://169.254.169.254/latest/meta-data/",
@@ -750,17 +750,17 @@ var refusedTargets = []string{
 	"wss://blog.example.com/live",
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postTarget(c *harness.HTTP, url string) *harness.Response {
-	return c.Post("/v1/crawl/targets", map[string]string{"job_id": apiJob, "url": url}, "X-Tenant-Id", "acme")
+func hPostTarget(c *harness.HTTP, url string) *harness.Response {
+	return c.Post("/v1/crawl/targets", map[string]string{"job_id": kHApiJob, "url": url}, "X-Tenant-Id", "acme")
 }
 
-func answeredID(r *harness.Response) string {
+func hAnsweredID(r *harness.Response) string {
 	var body struct {
 		TargetID string \`json:"target_id"\`
 	}
@@ -768,74 +768,74 @@ func answeredID(r *harness.Response) string {
 	return body.TargetID
 }
 
-func blogQueue(ctx *harness.Ctx) []string {
-	return ctx.Redis.LRange("frontier:"+apiJob+":blog.example.com", 0, -1)
+func hBlogQueue(ctx *harness.Ctx) []string {
+	return ctx.Redis.LRange("frontier:"+kHApiJob+":blog.example.com", 0, -1)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := postTarget(c, apiPosts)
+	c := hApi(ctx)
+	r := hPostTarget(c, kHApiPosts)
 	ctx.Equal(r.Status, 200, "POST /v1/crawl/targets (%s)", r.Text())
-	ctx.Assert(strings.Contains(r.Text(), \`"accepted"\`) && answeredID(r) != "", "an accepted target must answer {target_id, status: accepted}, got %s", r.Text())
-	target := registry.Find(context.Background(), apiJob, apiPosts)
-	ctx.Assert(target != nil && target.TargetID == answeredID(r), "the registry holds %+v for %s, expected target %s", target, apiPosts, answeredID(r))
-	ctx.Equal(blogQueue(ctx), []string{apiPosts}, "the host's queue frontier:%s:blog.example.com must hold the accepted URL", apiJob)
-	anonymous := c.Post("/v1/crawl/targets", map[string]string{"job_id": apiJob, "url": "https://blog.example.com/about"})
+	ctx.Assert(strings.Contains(r.Text(), \`"accepted"\`) && hAnsweredID(r) != "", "an accepted target must answer {target_id, status: accepted}, got %s", r.Text())
+	target := registry.Find(context.Background(), kHApiJob, kHApiPosts)
+	ctx.Assert(target != nil && target.TargetID == hAnsweredID(r), "the registry holds %+v for %s, expected target %s", target, kHApiPosts, hAnsweredID(r))
+	ctx.Equal(hBlogQueue(ctx), []string{kHApiPosts}, "the host's queue frontier:%s:blog.example.com must hold the accepted URL", kHApiJob)
+	anonymous := c.Post("/v1/crawl/targets", map[string]string{"job_id": kHApiJob, "url": "https://blog.example.com/about"})
 	ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckHostPolicy(ctx *harness.Ctx) {
-	c := api(ctx)
-	for _, url := range refusedTargets {
-		r := postTarget(c, url)
+	c := hApi(ctx)
+	for _, url := range hRefusedTargets {
+		r := hPostTarget(c, url)
 		ctx.Equal(r.Status, 400, "POST %s answered %s: only http and https URLs on an allowedHosts host are registered, anything else is 400; the status", url, r.Text())
 	}
-	ok := postTarget(c, "https://docs.example.com/guide")
+	ok := hPostTarget(c, "https://docs.example.com/guide")
 	ctx.Equal(ok.Status, 200, "https://docs.example.com/guide is on the allowlist (%s)", ok.Text())
-	registered := ctx.Redis.HGetAll("targets:" + apiJob)
+	registered := ctx.Redis.HGetAll("targets:" + kHApiJob)
 	_, hasDocs := registered["https://docs.example.com/guide"]
 	ctx.Assert(len(registered) == 1 && hasDocs, "the registry holds %v: a refused URL must register nothing", registered)
 }
 
 func CheckRejectBeforeFetch(ctx *harness.Ctx) {
-	c := api(ctx)
-	for _, url := range refusedTargets {
-		postTarget(c, url)
+	c := hApi(ctx)
+	for _, url := range hRefusedTargets {
+		hPostTarget(c, url)
 	}
 	fetched := ctx.Redis.LRange("web:fetches", 0, -1)
 	ctx.Assert(len(fetched) == 0, "refusing targets fetched %q: the service reached an address a caller chose before deciding to refuse it. Decide from the URL first", fetched)
-	r := postTarget(c, apiPosts)
-	ctx.Equal(r.Status, 200, "POST %s (%s)", apiPosts, r.Text())
-	ctx.Equal(ctx.Redis.LRange("web:fetches", 0, -1), []string{"https://blog.example.com/robots.txt"}, "registering %s must read robots.txt and nothing else (the page is the fetcher's job); the fetches", apiPosts)
+	r := hPostTarget(c, kHApiPosts)
+	ctx.Equal(r.Status, 200, "POST %s (%s)", kHApiPosts, r.Text())
+	ctx.Equal(ctx.Redis.LRange("web:fetches", 0, -1), []string{"https://blog.example.com/robots.txt"}, "registering %s must read robots.txt and nothing else (the page is the fetcher's job); the fetches", kHApiPosts)
 }
 
 func CheckRobots(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	ctx.Redis.Do("RPUSH", "web:robots:blog.example.com", "/private", "/drafts")
 	ctx.Redis.Do("RPUSH", "web:robots:docs.example.com", "/")
-	r := postTarget(c, "https://blog.example.com/private/notes")
+	r := hPostTarget(c, "https://blog.example.com/private/notes")
 	ctx.Equal(r.Status, 403, "a path robots.txt disallows (/private) answered %s; the status", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "disallowed by robots: /private"), "the 403 must quote the rule (disallowed by robots: /private), got %s", r.Text())
-	everything := postTarget(c, "https://docs.example.com/guide")
+	everything := hPostTarget(c, "https://docs.example.com/guide")
 	ctx.Assert(everything.Status == 403 && strings.Contains(everything.Text(), "disallowed by robots: /"), "Disallow: / covers every path, yet docs.example.com/guide answered %d %s", everything.Status, everything.Text())
-	ok := postTarget(c, "https://blog.example.com/posts/private-notes")
+	ok := hPostTarget(c, "https://blog.example.com/posts/private-notes")
 	ctx.Equal(ok.Status, 200, "a path no rule starts (/posts/private-notes; rules are path prefixes) (%s)", ok.Text())
-	ctx.Assert(registry.Find(context.Background(), apiJob, "https://blog.example.com/private/notes") == nil, "a disallowed URL was registered")
-	ctx.Equal(blogQueue(ctx), []string{"https://blog.example.com/posts/private-notes"}, "only the allowed URL may be queued; the host's queue")
+	ctx.Assert(registry.Find(context.Background(), kHApiJob, "https://blog.example.com/private/notes") == nil, "a disallowed URL was registered")
+	ctx.Equal(hBlogQueue(ctx), []string{"https://blog.example.com/posts/private-notes"}, "only the allowed URL may be queued; the host's queue")
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := postTarget(c, apiPosts)
-	replay := postTarget(c, apiPosts)
-	other := postTarget(c, "https://blog.example.com/about")
+	c := hApi(ctx)
+	first := hPostTarget(c, kHApiPosts)
+	replay := hPostTarget(c, kHApiPosts)
+	other := hPostTarget(c, "https://blog.example.com/about")
 	ctx.Assert(first.Status == 200 && replay.Status == 200, "registration answered %d, then %d for its replay", first.Status, replay.Status)
-	ctx.Equal(answeredID(replay), answeredID(first), "a replay of (%s, %s) must answer the first target (one target per (job_id, url)); the replay's target_id", apiJob, apiPosts)
-	ctx.Assert(answeredID(other) != answeredID(first), "another URL must get its own target")
-	ctx.Equal(blogQueue(ctx), []string{apiPosts, "https://blog.example.com/about"}, "a replay must not queue the URL a second time; the host's queue")
-	weekly := c.Post("/v1/crawl/targets", map[string]string{"job_id": "weekly", "url": apiPosts}, "X-Tenant-Id", "acme")
-	ctx.Assert(weekly.Status == 200 && answeredID(weekly) != "" && answeredID(weekly) != answeredID(first), "the same URL under another job (weekly) answered %d %s: one target per (job_id, url), so it is a new target", weekly.Status, weekly.Text())
-	ctx.Equal(ctx.Redis.LRange("frontier:weekly:blog.example.com", 0, -1), []string{apiPosts}, "the same URL under another job is queued for that job; the weekly job's queue")
+	ctx.Equal(hAnsweredID(replay), hAnsweredID(first), "a replay of (%s, %s) must answer the first target (one target per (job_id, url)); the replay's target_id", kHApiJob, kHApiPosts)
+	ctx.Assert(hAnsweredID(other) != hAnsweredID(first), "another URL must get its own target")
+	ctx.Equal(hBlogQueue(ctx), []string{kHApiPosts, "https://blog.example.com/about"}, "a replay must not queue the URL a second time; the host's queue")
+	weekly := c.Post("/v1/crawl/targets", map[string]string{"job_id": "weekly", "url": kHApiPosts}, "X-Tenant-Id", "acme")
+	ctx.Assert(weekly.Status == 200 && hAnsweredID(weekly) != "" && hAnsweredID(weekly) != hAnsweredID(first), "the same URL under another job (weekly) answered %d %s: one target per (job_id, url), so it is a new target", weekly.Status, weekly.Text())
+	ctx.Equal(ctx.Redis.LRange("frontier:weekly:blog.example.com", 0, -1), []string{kHApiPosts}, "the same URL under another job is queued for that job; the weekly job's queue")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -847,9 +847,9 @@ func CheckDedupe(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "nightly";
-const std::string kPosts = "https://blog.example.com/posts";
-const std::vector<std::string> kRefused = {
+const std::string kHJob = "nightly";
+const std::string kHPosts = "https://blog.example.com/posts";
+const std::vector<std::string> kHRefused = {
     "ftp://blog.example.com/archive.tar",
     "https://evil.example.net/",
     "http://169.254.169.254/latest/meta-data/",
@@ -860,7 +860,7 @@ const std::vector<std::string> kRefused = {
     "wss://blog.example.com/live",
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -868,11 +868,11 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postTarget(harness::HTTP& c, const std::string& url) {
-  return c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", kJob}, {"url", url}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+harness::Response hPostTarget(harness::HTTP& c, const std::string& url) {
+  return c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", kHJob}, {"url", url}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
 }
 
-std::string answeredId(const harness::Response& r) {
+std::string hAnsweredId(const harness::Response& r) {
   try {
     return nlohmann::json::parse(r.Text()).value("target_id", "");
   } catch (const std::exception&) {
@@ -880,71 +880,71 @@ std::string answeredId(const harness::Response& r) {
   }
 }
 
-std::vector<std::string> blogQueue(harness::Ctx& ctx) { return ctx.Redis.LRange("frontier:" + kJob + ":blog.example.com", 0, -1); }
+std::vector<std::string> hBlogQueue(harness::Ctx& ctx) { return ctx.Redis.LRange("frontier:" + kHJob + ":blog.example.com", 0, -1); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = postTarget(c, kPosts);
+  auto c = hApi(ctx);
+  const auto r = hPostTarget(c, kHPosts);
   ctx.Equal(r.Status, 200, "POST /v1/crawl/targets (%s)", r.Text());
-  ctx.Assert(r.Text().find("accepted") != std::string::npos && !answeredId(r).empty(), "an accepted target must answer {target_id, status: accepted}, got %s", r.Text());
-  const auto target = registry::find(kJob, kPosts);
-  ctx.Assert(target && target->target_id == answeredId(r), "the registry holds target %q for %s, expected target %s", target ? target->target_id : "", kPosts, answeredId(r));
-  ctx.Equal(blogQueue(ctx), {kPosts}, "the host's queue frontier:%s:blog.example.com must hold the accepted URL", kJob);
-  const auto anonymous = c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", kJob}, {"url", "https://blog.example.com/about"}}.dump(), "Content-Type", "application/json");
+  ctx.Assert(r.Text().find("accepted") != std::string::npos && !hAnsweredId(r).empty(), "an accepted target must answer {target_id, status: accepted}, got %s", r.Text());
+  const auto target = registry::find(kHJob, kHPosts);
+  ctx.Assert(target && target->target_id == hAnsweredId(r), "the registry holds target %q for %s, expected target %s", target ? target->target_id : "", kHPosts, hAnsweredId(r));
+  ctx.Equal(hBlogQueue(ctx), {kHPosts}, "the host's queue frontier:%s:blog.example.com must hold the accepted URL", kHJob);
+  const auto anonymous = c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", kHJob}, {"url", "https://blog.example.com/about"}}.dump(), "Content-Type", "application/json");
   ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckHostPolicy(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const std::string& url : kRefused) {
-    const auto r = postTarget(c, url);
+  auto c = hApi(ctx);
+  for (const std::string& url : kHRefused) {
+    const auto r = hPostTarget(c, url);
     ctx.Equal(r.Status, 400, "POST %s answered %s: only http and https URLs on a kAllowedHosts host are registered, anything else is 400; the status", url, r.Text());
   }
-  const auto ok = postTarget(c, "https://docs.example.com/guide");
+  const auto ok = hPostTarget(c, "https://docs.example.com/guide");
   ctx.Equal(ok.Status, 200, "https://docs.example.com/guide is on the allowlist (%s)", ok.Text());
-  const auto registered = ctx.Redis.HGetAll("targets:" + kJob);
+  const auto registered = ctx.Redis.HGetAll("targets:" + kHJob);
   ctx.Assert(registered.size() == 1 && registered.count("https://docs.example.com/guide"), "the registry holds %v: a refused URL must register nothing", registered);
 }
 
 void CheckRejectBeforeFetch(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const std::string& url : kRefused) postTarget(c, url);
+  auto c = hApi(ctx);
+  for (const std::string& url : kHRefused) hPostTarget(c, url);
   const auto fetched = ctx.Redis.LRange("web:fetches", 0, -1);
   ctx.Assert(fetched.empty(), "refusing targets fetched %q: the service reached an address a caller chose before deciding to refuse it. Decide from the URL first", fetched);
-  const auto r = postTarget(c, kPosts);
-  ctx.Equal(r.Status, 200, "POST %s (%s)", kPosts, r.Text());
-  ctx.Equal(ctx.Redis.LRange("web:fetches", 0, -1), {std::string("https://blog.example.com/robots.txt")}, "registering %s must read robots.txt and nothing else (the page is the fetcher's job); the fetches", kPosts);
+  const auto r = hPostTarget(c, kHPosts);
+  ctx.Equal(r.Status, 200, "POST %s (%s)", kHPosts, r.Text());
+  ctx.Equal(ctx.Redis.LRange("web:fetches", 0, -1), {std::string("https://blog.example.com/robots.txt")}, "registering %s must read robots.txt and nothing else (the page is the fetcher's job); the fetches", kHPosts);
 }
 
 void CheckRobots(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   ctx.Redis.Do("RPUSH", "web:robots:blog.example.com", "/private", "/drafts");
   ctx.Redis.Do("RPUSH", "web:robots:docs.example.com", "/");
-  const auto r = postTarget(c, "https://blog.example.com/private/notes");
+  const auto r = hPostTarget(c, "https://blog.example.com/private/notes");
   ctx.Equal(r.Status, 403, "a path robots.txt disallows (/private) answered %s; the status", r.Text());
   ctx.Assert(r.Text().find("disallowed by robots: /private") != std::string::npos, "the 403 must quote the rule (disallowed by robots: /private), got %s", r.Text());
-  const auto everything = postTarget(c, "https://docs.example.com/guide");
+  const auto everything = hPostTarget(c, "https://docs.example.com/guide");
   ctx.Assert(everything.Status == 403 && everything.Text().find("disallowed by robots: /") != std::string::npos, "Disallow: / covers every path, yet docs.example.com/guide answered %d %s", everything.Status, everything.Text());
-  const auto ok = postTarget(c, "https://blog.example.com/posts/private-notes");
+  const auto ok = hPostTarget(c, "https://blog.example.com/posts/private-notes");
   ctx.Equal(ok.Status, 200, "a path no rule starts (/posts/private-notes; rules are path prefixes) (%s)", ok.Text());
-  ctx.Assert(!registry::find(kJob, "https://blog.example.com/private/notes"), "a disallowed URL was registered");
-  ctx.Equal(blogQueue(ctx), {std::string("https://blog.example.com/posts/private-notes")}, "only the allowed URL may be queued; the host's queue");
+  ctx.Assert(!registry::find(kHJob, "https://blog.example.com/private/notes"), "a disallowed URL was registered");
+  ctx.Equal(hBlogQueue(ctx), {std::string("https://blog.example.com/posts/private-notes")}, "only the allowed URL may be queued; the host's queue");
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = postTarget(c, kPosts);
-  const auto replay = postTarget(c, kPosts);
-  const auto other = postTarget(c, "https://blog.example.com/about");
+  auto c = hApi(ctx);
+  const auto first = hPostTarget(c, kHPosts);
+  const auto replay = hPostTarget(c, kHPosts);
+  const auto other = hPostTarget(c, "https://blog.example.com/about");
   ctx.Assert(first.Status == 200 && replay.Status == 200, "registration answered %d, then %d for its replay", first.Status, replay.Status);
-  ctx.Equal(answeredId(replay), answeredId(first), "a replay of (%s, %s) must answer the first target (one target per (job_id, url)); the replay's target_id", kJob, kPosts);
-  ctx.Assert(answeredId(other) != answeredId(first), "another URL must get its own target");
-  ctx.Equal(blogQueue(ctx), {kPosts, std::string("https://blog.example.com/about")}, "a replay must not queue the URL a second time; the host's queue");
-  const auto weekly = c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", "weekly"}, {"url", kPosts}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
-  ctx.Assert(weekly.Status == 200 && !answeredId(weekly).empty() && answeredId(weekly) != answeredId(first), "the same URL under another job (weekly) answered %d %s: one target per (job_id, url), so it is a new target", weekly.Status, weekly.Text());
-  ctx.Equal(ctx.Redis.LRange("frontier:weekly:blog.example.com", 0, -1), {kPosts}, "the same URL under another job is queued for that job; the weekly job's queue");
+  ctx.Equal(hAnsweredId(replay), hAnsweredId(first), "a replay of (%s, %s) must answer the first target (one target per (job_id, url)); the replay's target_id", kHJob, kHPosts);
+  ctx.Assert(hAnsweredId(other) != hAnsweredId(first), "another URL must get its own target");
+  ctx.Equal(hBlogQueue(ctx), {kHPosts, std::string("https://blog.example.com/about")}, "a replay must not queue the URL a second time; the host's queue");
+  const auto weekly = c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", "weekly"}, {"url", kHPosts}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  ctx.Assert(weekly.Status == 200 && !hAnsweredId(weekly).empty() && hAnsweredId(weekly) != hAnsweredId(first), "the same URL under another job (weekly) answered %d %s: one target per (job_id, url), so it is a new target", weekly.Status, weekly.Text());
+  ctx.Equal(ctx.Redis.LRange("frontier:weekly:blog.example.com", 0, -1), {kHPosts}, "the same URL under another job is queued for that job; the weekly job's queue");
 }
 `,
   },

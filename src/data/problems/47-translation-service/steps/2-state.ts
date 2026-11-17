@@ -1029,62 +1029,62 @@ import (
 )
 
 const (
-	stateSample = "Open the Dashboard"
-	stateBase   = "glossary:acme:en:fr"
+	kHStateSample = "Open the Dashboard"
+	kHStateBase   = "glossary:acme:en:fr"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateSha(s string) string {
+func hStateSha(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
 
 // publishRaw is another replica publishing acme's en->fr glossary by the contract: copy the active
 // version, apply, mint, move the pointer.
-func publishRaw(ctx *harness.Ctx, changes map[string]string) int64 {
+func hPublishRaw(ctx *harness.Ctx, changes map[string]string) int64 {
 	merged := map[string]string{}
-	if active, ok := ctx.Redis.Get(stateBase + ":active"); ok {
-		for term, translation := range ctx.Redis.HGetAll(stateBase + ":v" + active) {
+	if active, ok := ctx.Redis.Get(kHStateBase + ":active"); ok {
+		for term, translation := range ctx.Redis.HGetAll(kHStateBase + ":v" + active) {
 			merged[term] = translation
 		}
 	}
 	for term, translation := range changes {
 		merged[term] = translation
 	}
-	version := ctx.Redis.Do("INCR", stateBase+":seq").(int64)
-	args := []any{"HSET", stateBase + ":v" + strconv.FormatInt(version, 10)}
+	version := ctx.Redis.Do("INCR", kHStateBase+":seq").(int64)
+	args := []any{"HSET", kHStateBase + ":v" + strconv.FormatInt(version, 10)}
 	for term, translation := range merged {
 		args = append(args, term, translation)
 	}
 	ctx.Redis.Do(args...)
-	ctx.Redis.Set(stateBase+":active", version)
+	ctx.Redis.Set(kHStateBase+":active", version)
 	return version
 }
 
-func mustResolve(ctx *harness.Ctx, tenant string, version int64) *Glossary {
-	g, err := resolveGlossary(stateBg, tenant, "en", "fr", version)
+func hMustResolve(ctx *harness.Ctx, tenant string, version int64) *Glossary {
+	g, err := resolveGlossary(hStateBg, tenant, "en", "fr", version)
 	ctx.NoError(err, "resolveGlossary(%s, en, fr, %d) failed", tenant, version)
 	return g
 }
 
 func CheckTmKey(ctx *harness.Ctx) {
-	ctx.NoError(tmPut(stateBg, "acme", "en", "fr", 1, stateSample, "Ouvrir le Tableau de bord"), "tmPut failed")
-	key := "tm:acme:en:fr:v1:" + stateSha(stateSample)
+	ctx.NoError(tmPut(hStateBg, "acme", "en", "fr", 1, kHStateSample, "Ouvrir le Tableau de bord"), "tmPut failed")
+	key := "tm:acme:en:fr:v1:" + hStateSha(kHStateSample)
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "tmPut wrote %q, expected %s: the key names the tenant, the pair, the glossary version and the text's hash", ctx.Redis.Keys("tm:*"), key)
-	got, ok := tmGet(stateBg, "acme", "en", "fr", 1, stateSample)
+	got, ok := tmGet(hStateBg, "acme", "en", "fr", 1, kHStateSample)
 	ctx.Assert(ok && got == "Ouvrir le Tableau de bord", "tmGet must answer what tmPut remembered, got %q", got)
-	other, ok := tmGet(stateBg, "globex", "en", "fr", 1, stateSample)
+	other, ok := tmGet(hStateBg, "globex", "en", "fr", 1, kHStateSample)
 	ctx.Assert(!ok, "tenant globex was served acme's translation %q: a translation made with one tenant's glossary must not reach another", other)
-	stale, ok := tmGet(stateBg, "acme", "en", "fr", 2, stateSample)
+	stale, ok := tmGet(hStateBg, "acme", "en", "fr", 2, kHStateSample)
 	ctx.Assert(!ok, "under glossary version 2 tmGet answered %q, the translation made under version 1: translation memory must not undo a glossary update", stale)
 }
 
 func CheckTmTtl(ctx *harness.Ctx) {
-	key := tmKey("acme", "en", "fr", 1, stateSample)
+	key := tmKey("acme", "en", "fr", 1, kHStateSample)
 	born := int64(-3)
 	probe := ctx.Redis.After(key, func() any { born = ctx.Redis.TTL(key); return nil }) // the entry as the command that created it left it
-	ctx.NoError(tmPut(stateBg, "acme", "en", "fr", 1, stateSample, "Ouvrir le Tableau de bord"), "tmPut failed")
+	ctx.NoError(tmPut(hStateBg, "acme", "en", "fr", 1, kHStateSample, "Ouvrir le Tableau de bord"), "tmPut failed")
 	keys := ctx.Redis.Keys("tm:*")
 	ctx.Equal(len(keys), 1, "one tmPut wrote %q; the keys", keys)
 	ttl := ctx.Redis.TTL(keys[0])
@@ -1093,47 +1093,47 @@ func CheckTmTtl(ctx *harness.Ctx) {
 }
 
 func CheckNewVersion(ctx *harness.Ctx) {
-	v1, err := publishTerms(stateBg, "acme", "en", "fr", map[string]string{"Dashboard": "Tableau de bord", "Invoice": "Facture"})
+	v1, err := publishTerms(hStateBg, "acme", "en", "fr", map[string]string{"Dashboard": "Tableau de bord", "Invoice": "Facture"})
 	ctx.NoError(err, "the first publish failed")
 	ctx.Equal(v1, int64(1), "the first publish's version")
-	v2, err := publishTerms(stateBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
+	v2, err := publishTerms(hStateBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
 	ctx.NoError(err, "the update failed")
-	ctx.Equal(ctx.Redis.HGetAll(stateBase+":v1"), map[string]string{"Dashboard": "Tableau de bord", "Invoice": "Facture"}, "after an update version 1 must keep its terms, or a request that pinned version 1 translates with half of the update. Publish the change as the next version; version 1")
+	ctx.Equal(ctx.Redis.HGetAll(kHStateBase+":v1"), map[string]string{"Dashboard": "Tableau de bord", "Invoice": "Facture"}, "after an update version 1 must keep its terms, or a request that pinned version 1 translates with half of the update. Publish the change as the next version; version 1")
 	ctx.Equal(v2, int64(2), "an update's version")
-	active := mustResolve(ctx, "acme", 0)
+	active := hMustResolve(ctx, "acme", 0)
 	ctx.Assert(active != nil && active.Version == 2, "the active glossary must be version 2, got %+v", active)
 	ctx.Equal(active.Terms, map[string]string{"Dashboard": "Panneau", "Invoice": "Facture"}, "version 2 is version 1's terms with the change applied; its terms")
 	// A second editor publishes while this one is mid-publish.
-	probe := ctx.Redis.After(stateBase+":active", func() any { return publishRaw(ctx, map[string]string{"Refund": "Remboursement"}) })
-	_, err = publishTerms(stateBg, "acme", "en", "fr", map[string]string{"Invoice": "Note"})
+	probe := ctx.Redis.After(kHStateBase+":active", func() any { return hPublishRaw(ctx, map[string]string{"Refund": "Remboursement"}) })
+	_, err = publishTerms(hStateBg, "acme", "en", "fr", map[string]string{"Invoice": "Note"})
 	ctx.NoError(err, "the third publish failed")
 	ctx.Assert(probe.Fired, "publishTerms never touched the :active pointer")
-	final := mustResolve(ctx, "acme", 0)
+	final := hMustResolve(ctx, "acme", 0)
 	ctx.Assert(final != nil && final.Terms["Invoice"] == "Note" && final.Terms["Refund"] == "Remboursement", "two editors published at once and the active glossary is %+v: one change was lost. Copy, write and move the pointer in one script", final)
 	// A second editor publishes right after this one mints its version number.
-	race := ctx.Redis.After(stateBase+":seq", func() any { return publishRaw(ctx, map[string]string{"Credit": "Avoir"}) })
-	mine, err := publishTerms(stateBg, "acme", "en", "fr", map[string]string{"Refund": "Rembourser"})
+	race := ctx.Redis.After(kHStateBase+":seq", func() any { return hPublishRaw(ctx, map[string]string{"Credit": "Avoir"}) })
+	mine, err := publishTerms(hStateBg, "acme", "en", "fr", map[string]string{"Refund": "Rembourser"})
 	ctx.NoError(err, "the fourth publish failed")
 	ctx.Assert(race.Fired, "publishTerms never touched the :seq counter")
-	seq, _ := ctx.Redis.Get(stateBase + ":seq")
-	latest := mustResolve(ctx, "acme", 0)
+	seq, _ := ctx.Redis.Get(kHStateBase + ":seq")
+	latest := hMustResolve(ctx, "acme", 0)
 	ctx.Assert(latest != nil && strconv.FormatInt(latest.Version, 10) == seq && latest.Terms["Refund"] == "Rembourser" && latest.Terms["Credit"] == "Avoir", "another editor published version %s while publishTerms (version %d) was in flight, and the active glossary is %+v: :active must name the newest version, with both changes. Mint, copy, write and move the pointer in one script", seq, mine, latest)
 }
 
 func CheckPointerOnce(ctx *harness.Ctx) {
-	ctx.Redis.Do("HSET", stateBase+":v1", "Dashboard", "Tableau de bord")
-	ctx.Redis.Set(stateBase+":seq", 1)
-	ctx.Redis.Set(stateBase+":active", 1)
+	ctx.Redis.Do("HSET", kHStateBase+":v1", "Dashboard", "Tableau de bord")
+	ctx.Redis.Set(kHStateBase+":seq", 1)
+	ctx.Redis.Set(kHStateBase+":active", 1)
 	// An edit lands right after the request first reads the pointer.
-	probe := ctx.Redis.After(stateBase+":active", func() any { return publishRaw(ctx, map[string]string{"Dashboard": "Panneau"}) })
-	got := mustResolve(ctx, "acme", 0)
+	probe := ctx.Redis.After(kHStateBase+":active", func() any { return hPublishRaw(ctx, map[string]string{"Dashboard": "Panneau"}) })
+	got := hMustResolve(ctx, "acme", 0)
 	ctx.Assert(probe.Fired, "resolveGlossary never read the :active pointer")
 	expected := map[int64]string{1: "Tableau de bord", 2: "Panneau"}
 	ctx.Assert(got != nil && got.Terms["Dashboard"] == expected[got.Version], "an edit landed mid-read and resolveGlossary answered %+v: one version's number with another version's terms. Read the pointer once and load exactly that version", got)
-	pinned := mustResolve(ctx, "acme", 1)
+	pinned := hMustResolve(ctx, "acme", 1)
 	ctx.Assert(pinned != nil && pinned.Version == 1 && pinned.Terms["Dashboard"] == "Tableau de bord", "a pinned version 1 must load version 1's terms, got %+v", pinned)
-	ctx.Assert(mustResolve(ctx, "acme", 7) == nil, "a version that does not exist must resolve to nil")
-	ctx.Assert(mustResolve(ctx, "globex", 0) == nil, "globex has no en->fr glossary and must resolve to nil")
+	ctx.Assert(hMustResolve(ctx, "acme", 7) == nil, "a version that does not exist must resolve to nil")
+	ctx.Assert(hMustResolve(ctx, "globex", 0) == nil, "globex has no en->fr glossary and must resolve to nil")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1146,10 +1146,10 @@ func CheckPointerOnce(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSample = "Open the Dashboard";
-const std::string kBase = "glossary:acme:en:fr";
+const std::string kHSample = "Open the Dashboard";
+const std::string kHBase = "glossary:acme:en:fr";
 
-std::string sha(const std::string& s) {
+std::string hSha(const std::string& s) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), digest);
   static const char* hex = "0123456789abcdef";
@@ -1163,22 +1163,22 @@ std::string sha(const std::string& s) {
 
 // Another replica publishing acme's en->fr glossary by the contract: copy the active version, apply,
 // mint, move the pointer.
-long long publishRaw(harness::Ctx& ctx, const std::map<std::string, std::string>& changes) {
+long long hPublishRaw(harness::Ctx& ctx, const std::map<std::string, std::string>& changes) {
   std::map<std::string, std::string> merged;
-  if (const auto active = ctx.Redis.Get(kBase + ":active")) merged = ctx.Redis.HGetAll(kBase + ":v" + *active);
+  if (const auto active = ctx.Redis.Get(kHBase + ":active")) merged = ctx.Redis.HGetAll(kHBase + ":v" + *active);
   for (const auto& [term, translation] : changes) merged[term] = translation;
-  const long long version = ctx.Redis.Do("INCR", kBase + ":seq").Int();
-  std::vector<std::string> args = {"HSET", kBase + ":v" + std::to_string(version)};
+  const long long version = ctx.Redis.Do("INCR", kHBase + ":seq").Int();
+  std::vector<std::string> args = {"HSET", kHBase + ":v" + std::to_string(version)};
   for (const auto& [term, translation] : merged) {
     args.push_back(term);
     args.push_back(translation);
   }
   ctx.Redis.Must(args);
-  ctx.Redis.Set(kBase + ":active", std::to_string(version));
+  ctx.Redis.Set(kHBase + ":active", std::to_string(version));
   return version;
 }
 
-std::string describe(const std::optional<Glossary>& g) {
+std::string hDescribe(const std::optional<Glossary>& g) {
   if (!g) return "none";
   std::string out = "version " + std::to_string(g->version) + " {";
   for (const auto& [term, translation] : g->terms) out += " " + term + "=" + translation;
@@ -1188,25 +1188,25 @@ std::string describe(const std::optional<Glossary>& g) {
 }  // namespace
 
 void CheckTmKey(harness::Ctx& ctx) {
-  tmPut("acme", "en", "fr", 1, kSample, "Ouvrir le Tableau de bord");
-  const std::string key = "tm:acme:en:fr:v1:" + sha(kSample);
+  tmPut("acme", "en", "fr", 1, kHSample, "Ouvrir le Tableau de bord");
+  const std::string key = "tm:acme:en:fr:v1:" + hSha(kHSample);
   ctx.Assert(ctx.Redis.Exists(key) == 1, "tmPut wrote %q, expected %s: the key names the tenant, the pair, the glossary version and the text's hash", ctx.Redis.Keys("tm:*"), key);
-  ctx.Equal(tmGet("acme", "en", "fr", 1, kSample), std::optional<std::string>("Ouvrir le Tableau de bord"), "tmGet must answer what tmPut remembered");
-  const auto other = tmGet("globex", "en", "fr", 1, kSample);
+  ctx.Equal(tmGet("acme", "en", "fr", 1, kHSample), std::optional<std::string>("Ouvrir le Tableau de bord"), "tmGet must answer what tmPut remembered");
+  const auto other = tmGet("globex", "en", "fr", 1, kHSample);
   ctx.Assert(!other, "tenant globex was served acme's translation %q: a translation made with one tenant's glossary must not reach another", other.value_or(""));
-  const auto stale = tmGet("acme", "en", "fr", 2, kSample);
+  const auto stale = tmGet("acme", "en", "fr", 2, kHSample);
   ctx.Assert(!stale, "under glossary version 2 tmGet answered %q, the translation made under version 1: translation memory must not undo a glossary update", stale.value_or(""));
 }
 
 void CheckTmTtl(harness::Ctx& ctx) {
-  const std::string key = tmKey("acme", "en", "fr", 1, kSample);
+  const std::string key = tmKey("acme", "en", "fr", 1, kHSample);
   bool fired = false;
   long long born = -3;
   ctx.Redis.After(key, [&] {  // the entry as the command that created it left it
     fired = true;
     born = ctx.Redis.TTL(key);
   });
-  tmPut("acme", "en", "fr", 1, kSample, "Ouvrir le Tableau de bord");
+  tmPut("acme", "en", "fr", 1, kHSample, "Ouvrir le Tableau de bord");
   const auto keys = ctx.Redis.Keys("tm:*");
   ctx.Equal(keys.size(), 1, "one tmPut wrote %q; the keys", keys);
   const auto ttl = ctx.Redis.TTL(keys[0]);
@@ -1218,55 +1218,55 @@ void CheckNewVersion(harness::Ctx& ctx) {
   const long v1 = publishTerms("acme", "en", "fr", {{"Dashboard", "Tableau de bord"}, {"Invoice", "Facture"}});
   ctx.Equal(v1, 1, "the first publish's version");
   const long v2 = publishTerms("acme", "en", "fr", {{"Dashboard", "Panneau"}});
-  ctx.Equal(ctx.Redis.HGetAll(kBase + ":v1"), std::map<std::string, std::string>{{"Dashboard", "Tableau de bord"}, {"Invoice", "Facture"}},
+  ctx.Equal(ctx.Redis.HGetAll(kHBase + ":v1"), std::map<std::string, std::string>{{"Dashboard", "Tableau de bord"}, {"Invoice", "Facture"}},
             "after an update version 1 must keep its terms, or a request that pinned version 1 translates with half of the update. Publish the change as the next version; version 1");
   ctx.Equal(v2, 2, "an update's version");
   const auto active = resolveGlossary("acme", "en", "fr");
   ctx.Assert(active && active->version == 2 && active->terms == std::map<std::string, std::string>{{"Dashboard", "Panneau"}, {"Invoice", "Facture"}},
-             "the active glossary is %s: version 2 is version 1's terms with the change applied", describe(active));
+             "the active glossary is %s: version 2 is version 1's terms with the change applied", hDescribe(active));
   // A second editor publishes while this one is mid-publish.
   bool fired = false;
-  ctx.Redis.After(kBase + ":active", [&] {
+  ctx.Redis.After(kHBase + ":active", [&] {
     fired = true;
-    publishRaw(ctx, {{"Refund", "Remboursement"}});
+    hPublishRaw(ctx, {{"Refund", "Remboursement"}});
   });
   publishTerms("acme", "en", "fr", {{"Invoice", "Note"}});
   ctx.Assert(fired, "publishTerms never touched the :active pointer");
   const auto final = resolveGlossary("acme", "en", "fr");
   ctx.Assert(final && final->terms.count("Invoice") && final->terms.at("Invoice") == "Note" && final->terms.count("Refund"),
-             "two editors published at once and the active glossary is %s: one change was lost. Copy, write and move the pointer in one script", describe(final));
+             "two editors published at once and the active glossary is %s: one change was lost. Copy, write and move the pointer in one script", hDescribe(final));
   // A second editor publishes right after this one mints its version number.
   bool raced = false;
-  ctx.Redis.After(kBase + ":seq", [&] {
+  ctx.Redis.After(kHBase + ":seq", [&] {
     raced = true;
-    publishRaw(ctx, {{"Credit", "Avoir"}});
+    hPublishRaw(ctx, {{"Credit", "Avoir"}});
   });
   const long mine = publishTerms("acme", "en", "fr", {{"Refund", "Rembourser"}});
   ctx.Assert(raced, "publishTerms never touched the :seq counter");
-  const std::string newest = ctx.Redis.Get(kBase + ":seq").value_or("none");
+  const std::string newest = ctx.Redis.Get(kHBase + ":seq").value_or("none");
   const auto latest = resolveGlossary("acme", "en", "fr");
   ctx.Assert(latest && std::to_string(latest->version) == newest && latest->terms.count("Refund") && latest->terms.at("Refund") == "Rembourser" && latest->terms.count("Credit"),
              "another editor published version %s while publishTerms (version %d) was in flight, and the active glossary is %s: :active must name the newest version, with both changes. Mint, copy, write and move the pointer in one script", newest, mine,
-             describe(latest));
+             hDescribe(latest));
 }
 
 void CheckPointerOnce(harness::Ctx& ctx) {
-  ctx.Redis.Do("HSET", kBase + ":v1", "Dashboard", "Tableau de bord");
-  ctx.Redis.Set(kBase + ":seq", "1");
-  ctx.Redis.Set(kBase + ":active", "1");
+  ctx.Redis.Do("HSET", kHBase + ":v1", "Dashboard", "Tableau de bord");
+  ctx.Redis.Set(kHBase + ":seq", "1");
+  ctx.Redis.Set(kHBase + ":active", "1");
   // An edit lands right after the request first reads the pointer.
   bool fired = false;
-  ctx.Redis.After(kBase + ":active", [&] {
+  ctx.Redis.After(kHBase + ":active", [&] {
     fired = true;
-    publishRaw(ctx, {{"Dashboard", "Panneau"}});
+    hPublishRaw(ctx, {{"Dashboard", "Panneau"}});
   });
   const auto got = resolveGlossary("acme", "en", "fr");
   ctx.Assert(fired, "resolveGlossary never read the :active pointer");
   const std::map<long, std::string> expected = {{1, "Tableau de bord"}, {2, "Panneau"}};
   ctx.Assert(got && expected.count(got->version) && got->terms.count("Dashboard") && got->terms.at("Dashboard") == expected.at(got->version),
-             "an edit landed mid-read and resolveGlossary answered %s: one version's number with another version's terms. Read the pointer once and load exactly that version", describe(got));
+             "an edit landed mid-read and resolveGlossary answered %s: one version's number with another version's terms. Read the pointer once and load exactly that version", hDescribe(got));
   const auto pinned = resolveGlossary("acme", "en", "fr", 1);
-  ctx.Assert(pinned && pinned->version == 1 && pinned->terms.at("Dashboard") == "Tableau de bord", "a pinned version 1 must load version 1's terms, got %s", describe(pinned));
+  ctx.Assert(pinned && pinned->version == 1 && pinned->terms.at("Dashboard") == "Tableau de bord", "a pinned version 1 must load version 1's terms, got %s", hDescribe(pinned));
   ctx.Assert(!resolveGlossary("acme", "en", "fr", 7), "a version that does not exist must resolve to none");
   ctx.Assert(!resolveGlossary("globex", "en", "fr"), "globex has no en->fr glossary and must resolve to none");
 }

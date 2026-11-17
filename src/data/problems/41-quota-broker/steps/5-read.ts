@@ -716,13 +716,13 @@ import (
 )
 
 const (
-	readW  = "2026-11-02T14:00Z"
-	readW2 = "2026-11-02T15:00Z"
+	kHReadW  = "2026-11-02T14:00Z"
+	kHReadW2 = "2026-11-02T15:00Z"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type quotaView struct {
+type HQuotaView struct {
 	Team      string \`json:"team"\`
 	Window    string \`json:"window"\`
 	Quota     int64  \`json:"quota"\`
@@ -731,13 +731,13 @@ type quotaView struct {
 	Available int64  \`json:"available"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readAs(c *harness.HTTP, team, caller, window string) *harness.Response {
+func hReadAs(c *harness.HTTP, team, caller, window string) *harness.Response {
 	path := "/v1/quotas/" + team
 	if window != "" {
 		path += "?window=" + window
@@ -748,75 +748,75 @@ func readAs(c *harness.HTTP, team, caller, window string) *harness.Response {
 	return c.Get(path, "X-Team-Id", caller)
 }
 
-func view(r *harness.Response) quotaView {
-	var v quotaView
+func hView(r *harness.Response) HQuotaView {
+	var v HQuotaView
 	r.Decode(&v)
 	return v
 }
 
 // rollup is what the nightly job last wrote.
-func rollup(ctx *harness.Ctx, limit, reserved, consumed int) {
+func hRollup(ctx *harness.Ctx, limit, reserved, consumed int) {
 	ctx.Redis.Do("HSET", "quota:aggregate:research", "limit", limit, "reserved", reserved, "consumed", consumed)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r := readAs(api(ctx), "research", "research", readW)
-	ctx.Equal(r.Status, 200, "GET /v1/quotas/research?window=%s (%s); the status", readW, r.Text())
-	ctx.Equal(view(r).Team, "research", "the read's team (%s)", r.Text())
+	r := hReadAs(hApi(ctx), "research", "research", kHReadW)
+	ctx.Equal(r.Status, 200, "GET /v1/quotas/research?window=%s (%s); the status", kHReadW, r.Text())
+	ctx.Equal(hView(r).Team, "research", "the read's team (%s)", r.Text())
 }
 
 func CheckTeamScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	ctx.Equal(readAs(c, "research", "", readW).Status, 401, "a read without X-Team-Id; the status")
-	ctx.Equal(readAs(c, "research", "", "").Status, 401, "a read without X-Team-Id and without a window (the caller is checked before the window); the status")
-	foreign := readAs(c, "vision", "research", readW)
+	c := hApi(ctx)
+	ctx.Equal(hReadAs(c, "research", "", kHReadW).Status, 401, "a read without X-Team-Id; the status")
+	ctx.Equal(hReadAs(c, "research", "", "").Status, 401, "a read without X-Team-Id and without a window (the caller is checked before the window); the status")
+	foreign := hReadAs(c, "vision", "research", kHReadW)
 	ctx.Equal(foreign.Status, 403, "team research reading /v1/quotas/vision (another team's usage is not research's to read, %s); the status", foreign.Text())
-	foreign = readAs(c, "vision", "research", "tomorrow")
+	foreign = hReadAs(c, "vision", "research", "tomorrow")
 	ctx.Equal(foreign.Status, 403, "team research reading /v1/quotas/vision with a bad window (the caller is checked before the window, %s); the status", foreign.Text())
-	own := readAs(c, "research", "research", readW)
+	own := hReadAs(c, "research", "research", kHReadW)
 	ctx.Equal(own.Status, 200, "research reading its own quota (%s); the status", own.Text())
 }
 
 func CheckWindowValidated(ctx *harness.Ctx) {
-	c := api(ctx)
-	missing := readAs(c, "research", "research", "")
+	c := hApi(ctx)
+	missing := hReadAs(c, "research", "research", "")
 	ctx.Equal(missing.Status, 400, "a read without a window (capacity is per window, %s); the status", missing.Text())
 	for _, window := range []string{"tomorrow", "2026-11-02", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"} {
-		ctx.Equal(readAs(c, "research", "research", window).Status, 400, "a read for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window)
+		ctx.Equal(hReadAs(c, "research", "research", window).Status, 400, "a read for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window)
 	}
-	r := readAs(c, "research", "research", readW)
-	ctx.Equal(r.Status, 200, "a read for window %s (%s); the status", readW, r.Text())
+	r := hReadAs(c, "research", "research", kHReadW)
+	ctx.Equal(r.Status, 200, "a read for window %s (%s); the status", kHReadW, r.Text())
 }
 
 func CheckSameLedger(ctx *harness.Ctx) {
-	rollup(ctx, 8, 5, 1)
-	id, err := ledger.Reserve(readBg, "research", readW, "gpu-a100", 3, "")
+	hRollup(ctx, 8, 5, 1)
+	id, err := ledger.Reserve(hReadBg, "research", kHReadW, "gpu-a100", 3, "")
 	ctx.Assert(err == nil && id != "", "the ledger refused 3 units: %v", err)
-	c := api(ctx)
-	now := readAs(c, "research", "research", readW)
-	other := readAs(c, "research", "research", readW2)
-	ctx.Equal(view(now).Reserved, int64(3), "after 3 units were reserved at 14:00 the read must report them (read quota:research:%s, the hash the reserve script writes, not last night's rollup: %s); reserved", readW, now.Text())
-	ctx.Assert(view(other).Reserved == 0 && view(other).Consumed == 0 && view(other).Available == 8, "the 15:00 window reports %s, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held", other.Text())
-	ctx.Equal(ctx.Redis.Exists("quota:research:"+readW2), int64(0), "reading the 15:00 window must not write quota:research:%s (a read must not write the ledger, %v); the key exists", readW2, ctx.Redis.HGetAll("quota:research:"+readW2))
+	c := hApi(ctx)
+	now := hReadAs(c, "research", "research", kHReadW)
+	other := hReadAs(c, "research", "research", kHReadW2)
+	ctx.Equal(hView(now).Reserved, int64(3), "after 3 units were reserved at 14:00 the read must report them (read quota:research:%s, the hash the reserve script writes, not last night's rollup: %s); reserved", kHReadW, now.Text())
+	ctx.Assert(hView(other).Reserved == 0 && hView(other).Consumed == 0 && hView(other).Available == 8, "the 15:00 window reports %s, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held", other.Text())
+	ctx.Equal(ctx.Redis.Exists("quota:research:"+kHReadW2), int64(0), "reading the 15:00 window must not write quota:research:%s (a read must not write the ledger, %v); the key exists", kHReadW2, ctx.Redis.HGetAll("quota:research:"+kHReadW2))
 }
 
 func CheckAvailableFormula(ctx *harness.Ctx) {
-	id, err := ledger.Reserve(readBg, "research", readW, "gpu-a100", 3, "")
+	id, err := ledger.Reserve(hReadBg, "research", kHReadW, "gpu-a100", 3, "")
 	ctx.Assert(err == nil && id != "", "the ledger refused 3 units: %v", err)
-	running, _ := ledger.Reserve(readBg, "research", readW, "gpu-a100", 2, "")
-	consumed, _ := ledger.Consume(readBg, "research", running)
+	running, _ := ledger.Reserve(hReadBg, "research", kHReadW, "gpu-a100", 2, "")
+	consumed, _ := ledger.Consume(hReadBg, "research", running)
 	ctx.Assert(running != "" && consumed, "the ledger refused to reserve and consume 2 units")
-	rollup(ctx, 8, 3, 2) // the rollup is current: only the formula is under test
-	c := api(ctx)
-	body := readAs(c, "research", "research", readW)
-	ctx.Equal(view(body), quotaView{Team: "research", Window: readW, Quota: 8, Reserved: 3, Consumed: 2, Available: 3}, "with 8 units, 3 reserved and 2 consumed (a running job's units are not free, %s); the read", body.Text())
-	granted, _ := ledger.Reserve(readBg, "research", readW, "gpu-a100", view(body).Available, "")
+	hRollup(ctx, 8, 3, 2) // the rollup is current: only the formula is under test
+	c := hApi(ctx)
+	body := hReadAs(c, "research", "research", kHReadW)
+	ctx.Equal(hView(body), HQuotaView{Team: "research", Window: kHReadW, Quota: 8, Reserved: 3, Consumed: 2, Available: 3}, "with 8 units, 3 reserved and 2 consumed (a running job's units are not free, %s); the read", body.Text())
+	granted, _ := ledger.Reserve(hReadBg, "research", kHReadW, "gpu-a100", hView(body).Available, "")
 	ctx.Assert(granted != "", "a reserve of the reported available units was refused")
-	ledger.Release(readBg, "research", granted)
+	ledger.Release(hReadBg, "research", granted)
 	ctx.Redis.Do("HSET", "quota:limits", "research", 4) // the team's limit was cut below what it holds
-	rollup(ctx, 4, 3, 2)
-	cut := readAs(c, "research", "research", readW)
-	ctx.Assert(view(cut).Quota == 4 && view(cut).Available == 0, "with the limit cut to 4 while 5 units are held the read reports %s, expected quota 4 and available 0: quota is ledger.LimitOf(team), and available is floored at 0", cut.Text())
+	hRollup(ctx, 4, 3, 2)
+	cut := hReadAs(c, "research", "research", kHReadW)
+	ctx.Assert(hView(cut).Quota == 4 && hView(cut).Available == 0, "with the limit cut to 4 while 5 units are held the read reports %s, expected quota 4 and available 0: quota is ledger.LimitOf(team), and available is floored at 0", cut.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -827,10 +827,10 @@ func CheckAvailableFormula(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kW = "2026-11-02T14:00Z";
-const std::string kW2 = "2026-11-02T15:00Z";
+const std::string kHW = "2026-11-02T14:00Z";
+const std::string kHW2 = "2026-11-02T15:00Z";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -838,83 +838,83 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& team, const std::string& caller, const std::string& window) {
+harness::Response hReadAs(harness::HTTP& c, const std::string& team, const std::string& caller, const std::string& window) {
   const std::string path = "/v1/quotas/" + team + (window.empty() ? "" : "?window=" + window);
   if (caller.empty()) return c.Get(path);
   return c.Get(path, "X-Team-Id", caller);
 }
 
-long long field(const harness::Response& r, const std::string& name) {
+long long hField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains(name) && body[name].is_number() ? body[name].get<long long>() : -999;
 }
 
 // What the nightly job last wrote.
-void rollup(harness::Ctx& ctx, int limit, int reserved, int consumed) {
+void hRollup(harness::Ctx& ctx, int limit, int reserved, int consumed) {
   ctx.Redis.Do("HSET", "quota:aggregate:research", "limit", limit, "reserved", reserved, "consumed", consumed);
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = readAs(c, "research", "research", kW);
-  ctx.Equal(r.Status, 200, "GET /v1/quotas/research?window=%s (%s); the status", kW, r.Text());
+  auto c = hApi(ctx);
+  const auto r = hReadAs(c, "research", "research", kHW);
+  ctx.Equal(r.Status, 200, "GET /v1/quotas/research?window=%s (%s); the status", kHW, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Equal(body.is_object() ? body.value("team", "") : "", "research", "the read's team (%s)", r.Text());
 }
 
 void CheckTeamScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  ctx.Equal(readAs(c, "research", "", kW).Status, 401, "a read without X-Team-Id; the status");
-  ctx.Equal(readAs(c, "research", "", "").Status, 401, "a read without X-Team-Id and without a window (the caller is checked before the window); the status");
-  const auto foreign = readAs(c, "vision", "research", kW);
+  auto c = hApi(ctx);
+  ctx.Equal(hReadAs(c, "research", "", kHW).Status, 401, "a read without X-Team-Id; the status");
+  ctx.Equal(hReadAs(c, "research", "", "").Status, 401, "a read without X-Team-Id and without a window (the caller is checked before the window); the status");
+  const auto foreign = hReadAs(c, "vision", "research", kHW);
   ctx.Equal(foreign.Status, 403, "team research reading /v1/quotas/vision (another team's usage is not research's to read, %s); the status", foreign.Text());
-  const auto foreign_bad = readAs(c, "vision", "research", "tomorrow");
+  const auto foreign_bad = hReadAs(c, "vision", "research", "tomorrow");
   ctx.Equal(foreign_bad.Status, 403, "team research reading /v1/quotas/vision with a bad window (the caller is checked before the window, %s); the status", foreign_bad.Text());
-  const auto own = readAs(c, "research", "research", kW);
+  const auto own = hReadAs(c, "research", "research", kHW);
   ctx.Equal(own.Status, 200, "research reading its own quota (%s); the status", own.Text());
 }
 
 void CheckWindowValidated(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto missing = readAs(c, "research", "research", "");
+  auto c = hApi(ctx);
+  const auto missing = hReadAs(c, "research", "research", "");
   ctx.Equal(missing.Status, 400, "a read without a window (capacity is per window, %s); the status", missing.Text());
   for (const std::string window : {"tomorrow", "2026-11-02", "2026-11-02T14:00Zx", "x2026-11-02T14:00Z"}) {
-    ctx.Equal(readAs(c, "research", "research", window).Status, 400, "a read for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window);
+    ctx.Equal(hReadAs(c, "research", "research", window).Status, 400, "a read for window %q (the whole window must match YYYY-MM-DDTHH:MMZ); the status", window);
   }
-  const auto r = readAs(c, "research", "research", kW);
-  ctx.Equal(r.Status, 200, "a read for window %s (%s); the status", kW, r.Text());
+  const auto r = hReadAs(c, "research", "research", kHW);
+  ctx.Equal(r.Status, 200, "a read for window %s (%s); the status", kHW, r.Text());
 }
 
 void CheckSameLedger(harness::Ctx& ctx) {
-  rollup(ctx, 8, 5, 1);
-  ctx.Assert(ledger::reserve("research", kW, "gpu-a100", 3).has_value(), "the ledger refused 3 units");
-  auto c = api(ctx);
-  const auto now = readAs(c, "research", "research", kW);
-  const auto other = readAs(c, "research", "research", kW2);
-  ctx.Equal(field(now, "reserved"), 3, "after 3 units were reserved at 14:00 the read must report them (read quota:research:%s, the hash the reserve script writes, not last night's rollup: %s); reserved", kW, now.Text());
-  ctx.Assert(field(other, "reserved") == 0 && field(other, "consumed") == 0 && field(other, "available") == 8,
+  hRollup(ctx, 8, 5, 1);
+  ctx.Assert(ledger::reserve("research", kHW, "gpu-a100", 3).has_value(), "the ledger refused 3 units");
+  auto c = hApi(ctx);
+  const auto now = hReadAs(c, "research", "research", kHW);
+  const auto other = hReadAs(c, "research", "research", kHW2);
+  ctx.Equal(hField(now, "reserved"), 3, "after 3 units were reserved at 14:00 the read must report them (read quota:research:%s, the hash the reserve script writes, not last night's rollup: %s); reserved", kHW, now.Text());
+  ctx.Assert(hField(other, "reserved") == 0 && hField(other, "consumed") == 0 && hField(other, "available") == 8,
              "the 15:00 window reports %s, expected nothing reserved or consumed and 8 available: capacity is per window, and a window with no hash yet has nothing held", other.Text());
-  ctx.Equal(ctx.Redis.Exists("quota:research:" + kW2), 0, "reading the 15:00 window must not write quota:research:%s (a read must not write the ledger); the key exists", kW2);
+  ctx.Equal(ctx.Redis.Exists("quota:research:" + kHW2), 0, "reading the 15:00 window must not write quota:research:%s (a read must not write the ledger); the key exists", kHW2);
 }
 
 void CheckAvailableFormula(harness::Ctx& ctx) {
-  ctx.Assert(ledger::reserve("research", kW, "gpu-a100", 3).has_value(), "the ledger refused 3 units");
-  const auto running = ledger::reserve("research", kW, "gpu-a100", 2);
+  ctx.Assert(ledger::reserve("research", kHW, "gpu-a100", 3).has_value(), "the ledger refused 3 units");
+  const auto running = ledger::reserve("research", kHW, "gpu-a100", 2);
   ctx.Assert(running && ledger::consume("research", *running), "the ledger refused to reserve and consume 2 units");
-  rollup(ctx, 8, 3, 2);  // the rollup is current: only the formula is under test
-  auto c = api(ctx);
-  const auto body = readAs(c, "research", "research", kW);
-  const nlohmann::json expected = {{"team", "research"}, {"window", kW}, {"quota", 8}, {"reserved", 3}, {"consumed", 2}, {"available", 3}};
+  hRollup(ctx, 8, 3, 2);  // the rollup is current: only the formula is under test
+  auto c = hApi(ctx);
+  const auto body = hReadAs(c, "research", "research", kHW);
+  const nlohmann::json expected = {{"team", "research"}, {"window", kHW}, {"quota", 8}, {"reserved", 3}, {"consumed", 2}, {"available", 3}};
   ctx.Equal(nlohmann::json::parse(body.Text(), nullptr, false), expected, "with 8 units, 3 reserved and 2 consumed (a running job's units are not free); the read");
-  const auto granted = ledger::reserve("research", kW, "gpu-a100", field(body, "available"));
+  const auto granted = ledger::reserve("research", kHW, "gpu-a100", hField(body, "available"));
   ctx.Assert(granted.has_value(), "a reserve of the reported available units was refused");
   ledger::release("research", *granted);
   ctx.Redis.Do("HSET", "quota:limits", "research", 4);  // the team's limit was cut below what it holds
-  rollup(ctx, 4, 3, 2);
-  const auto cut = readAs(c, "research", "research", kW);
-  ctx.Assert(field(cut, "quota") == 4 && field(cut, "available") == 0,
+  hRollup(ctx, 4, 3, 2);
+  const auto cut = hReadAs(c, "research", "research", kHW);
+  ctx.Assert(hField(cut, "quota") == 4 && hField(cut, "available") == 0,
              "with the limit cut to 4 while 5 units are held the read reports %s, expected quota 4 and available 0: quota is ledger::limitOf(team), and available is floored at 0", cut.Text());
 }
 `,

@@ -811,45 +811,45 @@ import (
 )
 
 const (
-	stateRun      = "r1"
-	stateProgress = "evals:progress:" + stateRun
-	stateSeen     = "evals:seen:" + stateRun
-	stateTTL      = 604_800
+	kHStateRun      = "r1"
+	kHStateProgress = "evals:progress:" + kHStateRun
+	kHStateSeen     = "evals:seen:" + kHStateRun
+	kHStateTTL      = 604_800
 )
 
-func stateRecord(ctx *harness.Ctx, sampleID string, score float64, judge string) Progress {
-	p, err := recordSample(context.Background(), stateRun, sampleID, score, judge)
+func hStateRecord(ctx *harness.Ctx, sampleID string, score float64, judge string) Progress {
+	p, err := recordSample(context.Background(), kHStateRun, sampleID, score, judge)
 	ctx.NoError(err, "recordSample(%q)", sampleID)
 	return p
 }
 
-func stateCount(ctx *harness.Ctx, field string) int64 {
-	n, _ := strconv.ParseInt(ctx.Redis.HGetAll(stateProgress)[field], 10, 64)
+func hStateCount(ctx *harness.Ctx, field string) int64 {
+	n, _ := strconv.ParseInt(ctx.Redis.HGetAll(kHStateProgress)[field], 10, 64)
 	return n
 }
 
-func stateCounts(ctx *harness.Ctx) []int64 {
-	return []int64{stateCount(ctx, "scored"), stateCount(ctx, "passed"), stateCount(ctx, "failed")}
+func hStateCounts(ctx *harness.Ctx) []int64 {
+	return []int64{hStateCount(ctx, "scored"), hStateCount(ctx, "passed"), hStateCount(ctx, "failed")}
 }
 
 func CheckFold(ctx *harness.Ctx) {
-	stateRecord(ctx, "s-1", 0.9, "model")
-	stateRecord(ctx, "s-2", 0.2, "model")
-	last := stateRecord(ctx, "s-3", 0.5, "model")
-	ctx.Equal(stateCounts(ctx), []int64{3, 2, 1}, "samples scoring 0.9, 0.2 and 0.5 (a score of PassScore 0.5 passes) must read scored 3, passed 2, failed 1 (%v); scored, passed, failed", ctx.Redis.HGetAll(stateProgress))
+	hStateRecord(ctx, "s-1", 0.9, "model")
+	hStateRecord(ctx, "s-2", 0.2, "model")
+	last := hStateRecord(ctx, "s-3", 0.5, "model")
+	ctx.Equal(hStateCounts(ctx), []int64{3, 2, 1}, "samples scoring 0.9, 0.2 and 0.5 (a score of PassScore 0.5 passes) must read scored 3, passed 2, failed 1 (%v); scored, passed, failed", ctx.Redis.HGetAll(kHStateProgress))
 	ctx.Equal(last.Verdict, "counted", "a new sample's verdict")
 	ctx.Equal([]int64{last.Scored, last.Passed, last.Failed}, []int64{3, 2, 1}, "recordSample answers the counters after the fold")
 }
 
 func CheckDedupeSample(ctx *harness.Ctx) {
-	stateRecord(ctx, "s-1", 0.9, "model")
-	again := stateRecord(ctx, "s-1", 0.9, "model") // the topic redelivered it after a rebalance
-	ctx.Equal(stateCounts(ctx), []int64{1, 1, 0}, "sample s-1 arrived twice: a redelivered sample must be counted once; scored, passed, failed")
+	hStateRecord(ctx, "s-1", 0.9, "model")
+	again := hStateRecord(ctx, "s-1", 0.9, "model") // the topic redelivered it after a rebalance
+	ctx.Equal(hStateCounts(ctx), []int64{1, 1, 0}, "sample s-1 arrived twice: a redelivered sample must be counted once; scored, passed, failed")
 	ctx.Equal(again.Verdict, "duplicate", "the second delivery of s-1's verdict")
 	ctx.Equal([]int64{again.Scored, again.Passed, again.Failed}, []int64{1, 1, 0}, "a duplicate answers the run's counters unchanged")
-	ctx.Assert(ctx.Redis.SIsMember(stateSeen, "s-1"), "the counted sample id must be in %s, it holds %v", stateSeen, ctx.Redis.SMembers(stateSeen))
-	stateRecord(ctx, "s-2", 0.1, "model")
-	ctx.Equal(stateCounts(ctx), []int64{2, 1, 1}, "a new sample after the duplicate is counted; scored, passed, failed")
+	ctx.Assert(ctx.Redis.SIsMember(kHStateSeen, "s-1"), "the counted sample id must be in %s, it holds %v", kHStateSeen, ctx.Redis.SMembers(kHStateSeen))
+	hStateRecord(ctx, "s-2", 0.1, "model")
+	ctx.Equal(hStateCounts(ctx), []int64{2, 1, 1}, "a new sample after the duplicate is counted; scored, passed, failed")
 }
 
 func CheckAtomicScript(ctx *harness.Ctx) {
@@ -862,66 +862,66 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 			return nil
 		}
 		landed = true
-		claimed, counted = ctx.Redis.SCard(stateSeen), stateCount(ctx, "scored")
-		if n, _ := ctx.Redis.Do("SADD", stateSeen, "s-1").(int64); n == 0 {
+		claimed, counted = ctx.Redis.SCard(kHStateSeen), hStateCount(ctx, "scored")
+		if n, _ := ctx.Redis.Do("SADD", kHStateSeen, "s-1").(int64); n == 0 {
 			other = "duplicate"
 			return nil
 		}
-		ctx.Redis.Do("HINCRBY", stateProgress, "scored", 1)
-		ctx.Redis.Do("HINCRBY", stateProgress, "passed", 1)
+		ctx.Redis.Do("HINCRBY", kHStateProgress, "scored", 1)
+		ctx.Redis.Do("HINCRBY", kHStateProgress, "passed", 1)
 		other = "counted"
 		return nil
 	}
-	ctx.Redis.After(stateSeen, otherWorker)
-	ctx.Redis.After(stateProgress, otherWorker)
-	mine := stateRecord(ctx, "s-1", 0.9, "model")
+	ctx.Redis.After(kHStateSeen, otherWorker)
+	ctx.Redis.After(kHStateProgress, otherWorker)
+	mine := hStateRecord(ctx, "s-1", 0.9, "model")
 	ctx.Assert(landed, "recordSample never touched the run's keys")
-	ctx.Assert(claimed == counted, "between two of recordSample's commands another worker saw %d sample id(s) in %s and scored %d: a claim and its count must land together in one script, or a worker that dies between them loses the sample", claimed, stateSeen, counted)
-	ctx.Equal(stateCount(ctx, "scored"), 1, "two workers folded sample s-1 at the same moment: the dedupe test and the increments must run in one script, so exactly one of them counts it; scored")
+	ctx.Assert(claimed == counted, "between two of recordSample's commands another worker saw %d sample id(s) in %s and scored %d: a claim and its count must land together in one script, or a worker that dies between them loses the sample", claimed, kHStateSeen, counted)
+	ctx.Equal(hStateCount(ctx, "scored"), 1, "two workers folded sample s-1 at the same moment: the dedupe test and the increments must run in one script, so exactly one of them counts it; scored")
 	verdicts := []string{mine.Verdict, other}
 	sort.Strings(verdicts)
 	ctx.Equal(verdicts, []string{"counted", "duplicate"}, "two workers, one sample: one counted and one duplicate; the verdicts")
 }
 
 func CheckFallbackCount(ctx *harness.Ctx) {
-	stateRecord(ctx, "s-1", 1.0, "fallback")
-	stateRecord(ctx, "s-2", 0.75, "model")
-	stateRecord(ctx, "s-3", 0.0, "fallback")
-	ctx.Equal(stateCount(ctx, "fallback"), 2, "two of three samples were scored by the string metric (%v): the release gate cannot tell a judged run from a string-matched one; fallback", ctx.Redis.HGetAll(stateProgress))
-	stateRecord(ctx, "s-3", 0.0, "fallback") // redelivered
-	ctx.Equal(stateCount(ctx, "fallback"), 2, "a redelivered fallback sample: a duplicate moves no counter, fallback included; fallback")
-	ctx.Equal(stateCounts(ctx), []int64{3, 2, 1}, "fallback samples still count as scored and passed or failed; scored, passed, failed")
+	hStateRecord(ctx, "s-1", 1.0, "fallback")
+	hStateRecord(ctx, "s-2", 0.75, "model")
+	hStateRecord(ctx, "s-3", 0.0, "fallback")
+	ctx.Equal(hStateCount(ctx, "fallback"), 2, "two of three samples were scored by the string metric (%v): the release gate cannot tell a judged run from a string-matched one; fallback", ctx.Redis.HGetAll(kHStateProgress))
+	hStateRecord(ctx, "s-3", 0.0, "fallback") // redelivered
+	ctx.Equal(hStateCount(ctx, "fallback"), 2, "a redelivered fallback sample: a duplicate moves no counter, fallback included; fallback")
+	ctx.Equal(hStateCounts(ctx), []int64{3, 2, 1}, "fallback samples still count as scored and passed or failed; scored, passed, failed")
 }
 
 func CheckKeyTtl(ctx *harness.Ctx) {
 	var atFold []int64
-	probe := ctx.Redis.After(stateProgress, func() any {
-		atFold = []int64{ctx.Redis.TTL(stateProgress), ctx.Redis.TTL(stateSeen)}
+	probe := ctx.Redis.After(kHStateProgress, func() any {
+		atFold = []int64{ctx.Redis.TTL(kHStateProgress), ctx.Redis.TTL(kHStateSeen)}
 		return nil
 	})
-	stateRecord(ctx, "s-1", 0.9, "model")
-	ctx.Assert(probe.Fired, "recordSample never wrote %s", stateProgress)
-	ctx.Assert(atFold[0] != -1 && atFold[1] != -1, "right after the command that wrote %s, its TTL and %s's were %v: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script", stateProgress, stateSeen, atFold)
+	hStateRecord(ctx, "s-1", 0.9, "model")
+	ctx.Assert(probe.Fired, "recordSample never wrote %s", kHStateProgress)
+	ctx.Assert(atFold[0] != -1 && atFold[1] != -1, "right after the command that wrote %s, its TTL and %s's were %v: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script", kHStateProgress, kHStateSeen, atFold)
 	fresh := func(when string) {
-		for _, key := range []string{stateProgress, stateSeen} {
+		for _, key := range []string{kHStateProgress, kHStateSeen} {
 			ttl := ctx.Redis.TTL(key)
 			ctx.Assert(ttl != -2, "%s does not exist after a sample was recorded %s", key, when)
-			ctx.Assert(stateTTL-60 <= ttl && ttl <= stateTTL, "%s has TTL %d after a sample was recorded %s: every key the run owns expires TTLSeconds (%d s) after its last move", key, ttl, when, stateTTL)
+			ctx.Assert(kHStateTTL-60 <= ttl && ttl <= kHStateTTL, "%s has TTL %d after a sample was recorded %s: every key the run owns expires TTLSeconds (%d s) after its last move", key, ttl, when, kHStateTTL)
 		}
-		stamp, ok := ctx.Redis.HGet(stateProgress, "updated_at")
-		ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(stateProgress))
+		stamp, ok := ctx.Redis.HGet(kHStateProgress, "updated_at")
+		ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(kHStateProgress))
 		at, _ := strconv.ParseInt(stamp, 10, 64)
 		now := ctx.Clock.Now() / 1000
 		ctx.Assert(at-now <= 2 && now-at <= 2, "updated_at is %s after a sample was recorded %s, the clock reads %d: it is the unix time in seconds of the run's last move", stamp, when, now)
 	}
 	fresh("now")
 	ctx.Clock.Advance(5 * 86_400)
-	stateRecord(ctx, "s-2", 0.1, "model")
+	hStateRecord(ctx, "s-2", 0.1, "model")
 	fresh("five days later")
-	ctx.Clock.Advance(stateTTL - 3_600)
-	ctx.Equal(ctx.Redis.Exists(stateProgress, stateSeen), 2, "a run that moved %d s ago must still be there (%v); keys", stateTTL-3_600, ctx.Redis.Keys("evals:*:"+stateRun))
+	ctx.Clock.Advance(kHStateTTL - 3_600)
+	ctx.Equal(ctx.Redis.Exists(kHStateProgress, kHStateSeen), 2, "a run that moved %d s ago must still be there (%v); keys", kHStateTTL-3_600, ctx.Redis.Keys("evals:*:"+kHStateRun))
 	ctx.Clock.Advance(3_601)
-	ctx.Equal(len(ctx.Redis.Keys("evals:*:"+stateRun)), 0, "a week after its last move the run must be gone (%v); keys left", ctx.Redis.Keys("evals:*:"+stateRun))
+	ctx.Equal(len(ctx.Redis.Keys("evals:*:"+kHStateRun)), 0, "a week after its last move the run must be gone (%v); keys left", ctx.Redis.Keys("evals:*:"+kHStateRun))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -933,40 +933,40 @@ func CheckKeyTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRun = "r1";
-const std::string kProgress = "evals:progress:" + kRun;
-const std::string kSeen = "evals:seen:" + kRun;
-constexpr long long kTtl = 604800;
+const std::string kHRun = "r1";
+const std::string kHProgress = "evals:progress:" + kHRun;
+const std::string kHSeen = "evals:seen:" + kHRun;
+constexpr long long kHTtl = 604800;
 
-long long stateCount(harness::Ctx& ctx, const std::string& field) {
-  const auto all = ctx.Redis.HGetAll(kProgress);
+long long hStateCount(harness::Ctx& ctx, const std::string& field) {
+  const auto all = ctx.Redis.HGetAll(kHProgress);
   const auto it = all.find(field);
   return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
 }
 
-std::vector<long long> stateCounts(harness::Ctx& ctx) { return {stateCount(ctx, "scored"), stateCount(ctx, "passed"), stateCount(ctx, "failed")}; }
+std::vector<long long> hStateCounts(harness::Ctx& ctx) { return {hStateCount(ctx, "scored"), hStateCount(ctx, "passed"), hStateCount(ctx, "failed")}; }
 
 }  // namespace
 
 void CheckFold(harness::Ctx& ctx) {
-  record_sample(kRun, "s-1", 0.9, "model");
-  record_sample(kRun, "s-2", 0.2, "model");
-  const Progress last = record_sample(kRun, "s-3", 0.5, "model");
-  ctx.Equal(stateCounts(ctx), std::vector<long long>{3, 2, 1},
-            "samples scoring 0.9, 0.2 and 0.5 (a score of kPassScore 0.5 passes) must read scored 3, passed 2, failed 1 (%v); scored, passed, failed", ctx.Redis.HGetAll(kProgress));
+  record_sample(kHRun, "s-1", 0.9, "model");
+  record_sample(kHRun, "s-2", 0.2, "model");
+  const Progress last = record_sample(kHRun, "s-3", 0.5, "model");
+  ctx.Equal(hStateCounts(ctx), std::vector<long long>{3, 2, 1},
+            "samples scoring 0.9, 0.2 and 0.5 (a score of kPassScore 0.5 passes) must read scored 3, passed 2, failed 1 (%v); scored, passed, failed", ctx.Redis.HGetAll(kHProgress));
   ctx.Equal(last.verdict, "counted", "a new sample's verdict");
   ctx.Equal(std::vector<long long>{last.scored, last.passed, last.failed}, std::vector<long long>{3, 2, 1}, "record_sample answers the counters after the fold");
 }
 
 void CheckDedupeSample(harness::Ctx& ctx) {
-  record_sample(kRun, "s-1", 0.9, "model");
-  const Progress again = record_sample(kRun, "s-1", 0.9, "model");  // the topic redelivered it after a rebalance
-  ctx.Equal(stateCounts(ctx), std::vector<long long>{1, 1, 0}, "sample s-1 arrived twice: a redelivered sample must be counted once; scored, passed, failed");
+  record_sample(kHRun, "s-1", 0.9, "model");
+  const Progress again = record_sample(kHRun, "s-1", 0.9, "model");  // the topic redelivered it after a rebalance
+  ctx.Equal(hStateCounts(ctx), std::vector<long long>{1, 1, 0}, "sample s-1 arrived twice: a redelivered sample must be counted once; scored, passed, failed");
   ctx.Equal(again.verdict, "duplicate", "the second delivery of s-1's verdict");
   ctx.Equal(std::vector<long long>{again.scored, again.passed, again.failed}, std::vector<long long>{1, 1, 0}, "a duplicate answers the run's counters unchanged");
-  ctx.Assert(ctx.Redis.SIsMember(kSeen, "s-1"), "the counted sample id must be in %s, it holds %v", kSeen, ctx.Redis.SMembers(kSeen));
-  record_sample(kRun, "s-2", 0.1, "model");
-  ctx.Equal(stateCounts(ctx), std::vector<long long>{2, 1, 1}, "a new sample after the duplicate is counted; scored, passed, failed");
+  ctx.Assert(ctx.Redis.SIsMember(kHSeen, "s-1"), "the counted sample id must be in %s, it holds %v", kHSeen, ctx.Redis.SMembers(kHSeen));
+  record_sample(kHRun, "s-2", 0.1, "model");
+  ctx.Equal(hStateCounts(ctx), std::vector<long long>{2, 1, 1}, "a new sample after the duplicate is counted; scored, passed, failed");
 }
 
 void CheckAtomicScript(harness::Ctx& ctx) {
@@ -978,70 +978,70 @@ void CheckAtomicScript(harness::Ctx& ctx) {
   const auto otherWorker = [&] {
     if (landed) return;
     landed = true;
-    claimed = ctx.Redis.SCard(kSeen);
-    counted = stateCount(ctx, "scored");
-    if (ctx.Redis.Do("SADD", kSeen, "s-1").Int() == 0) {
+    claimed = ctx.Redis.SCard(kHSeen);
+    counted = hStateCount(ctx, "scored");
+    if (ctx.Redis.Do("SADD", kHSeen, "s-1").Int() == 0) {
       other = "duplicate";
       return;
     }
-    ctx.Redis.Do("HINCRBY", kProgress, "scored", 1);
-    ctx.Redis.Do("HINCRBY", kProgress, "passed", 1);
+    ctx.Redis.Do("HINCRBY", kHProgress, "scored", 1);
+    ctx.Redis.Do("HINCRBY", kHProgress, "passed", 1);
     other = "counted";
   };
-  ctx.Redis.After(kSeen, otherWorker);
-  ctx.Redis.After(kProgress, otherWorker);
-  const Progress mine = record_sample(kRun, "s-1", 0.9, "model");
+  ctx.Redis.After(kHSeen, otherWorker);
+  ctx.Redis.After(kHProgress, otherWorker);
+  const Progress mine = record_sample(kHRun, "s-1", 0.9, "model");
   ctx.Assert(landed, "record_sample never touched the run's keys");
-  ctx.Assert(claimed == counted, "between two of record_sample's commands another worker saw %d sample id(s) in %s and scored %d: a claim and its count must land together in one script, or a worker that dies between them loses the sample", claimed, kSeen, counted);
-  ctx.Equal(stateCount(ctx, "scored"), 1, "two workers folded sample s-1 at the same moment: the dedupe test and the increments must run in one script, so exactly one of them counts it; scored");
+  ctx.Assert(claimed == counted, "between two of record_sample's commands another worker saw %d sample id(s) in %s and scored %d: a claim and its count must land together in one script, or a worker that dies between them loses the sample", claimed, kHSeen, counted);
+  ctx.Equal(hStateCount(ctx, "scored"), 1, "two workers folded sample s-1 at the same moment: the dedupe test and the increments must run in one script, so exactly one of them counts it; scored");
   std::vector<std::string> verdicts = {mine.verdict, other};
   std::sort(verdicts.begin(), verdicts.end());
   ctx.Equal(verdicts, {"counted", "duplicate"}, "two workers, one sample: one counted and one duplicate; the verdicts");
 }
 
 void CheckFallbackCount(harness::Ctx& ctx) {
-  record_sample(kRun, "s-1", 1.0, "fallback");
-  record_sample(kRun, "s-2", 0.75, "model");
-  record_sample(kRun, "s-3", 0.0, "fallback");
-  ctx.Equal(stateCount(ctx, "fallback"), 2, "two of three samples were scored by the string metric (%v): the release gate cannot tell a judged run from a string-matched one; fallback", ctx.Redis.HGetAll(kProgress));
-  record_sample(kRun, "s-3", 0.0, "fallback");  // redelivered
-  ctx.Equal(stateCount(ctx, "fallback"), 2, "a redelivered fallback sample: a duplicate moves no counter, fallback included; fallback");
-  ctx.Equal(stateCounts(ctx), std::vector<long long>{3, 2, 1}, "fallback samples still count as scored and passed or failed; scored, passed, failed");
+  record_sample(kHRun, "s-1", 1.0, "fallback");
+  record_sample(kHRun, "s-2", 0.75, "model");
+  record_sample(kHRun, "s-3", 0.0, "fallback");
+  ctx.Equal(hStateCount(ctx, "fallback"), 2, "two of three samples were scored by the string metric (%v): the release gate cannot tell a judged run from a string-matched one; fallback", ctx.Redis.HGetAll(kHProgress));
+  record_sample(kHRun, "s-3", 0.0, "fallback");  // redelivered
+  ctx.Equal(hStateCount(ctx, "fallback"), 2, "a redelivered fallback sample: a duplicate moves no counter, fallback included; fallback");
+  ctx.Equal(hStateCounts(ctx), std::vector<long long>{3, 2, 1}, "fallback samples still count as scored and passed or failed; scored, passed, failed");
 }
 
 void CheckKeyTtl(harness::Ctx& ctx) {
   bool fired = false;
   long long progressTtl = 0;
   long long seenTtl = 0;
-  ctx.Redis.After(kProgress, [&] {
+  ctx.Redis.After(kHProgress, [&] {
     fired = true;
-    progressTtl = ctx.Redis.TTL(kProgress);
-    seenTtl = ctx.Redis.TTL(kSeen);
+    progressTtl = ctx.Redis.TTL(kHProgress);
+    seenTtl = ctx.Redis.TTL(kHSeen);
   });
-  record_sample(kRun, "s-1", 0.9, "model");
-  ctx.Assert(fired, "record_sample never wrote %s", kProgress);
-  ctx.Assert(progressTtl != -1 && seenTtl != -1, "right after the command that wrote %s, its TTL was %d and %s's %d: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script", kProgress, progressTtl, kSeen, seenTtl);
+  record_sample(kHRun, "s-1", 0.9, "model");
+  ctx.Assert(fired, "record_sample never wrote %s", kHProgress);
+  ctx.Assert(progressTtl != -1 && seenTtl != -1, "right after the command that wrote %s, its TTL was %d and %s's %d: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script", kHProgress, progressTtl, kHSeen, seenTtl);
   const auto fresh = [&](const std::string& when) {
-    for (const std::string& key : {kProgress, kSeen}) {
+    for (const std::string& key : {kHProgress, kHSeen}) {
       const long long ttl = ctx.Redis.TTL(key);
       ctx.Assert(ttl != -2, "%s does not exist after a sample was recorded %s", key, when);
-      ctx.Assert(kTtl - 60 <= ttl && ttl <= kTtl, "%s has TTL %d after a sample was recorded %s: every key the run owns expires kTtlSeconds (%d s) after its last move", key, ttl, when, kTtl);
+      ctx.Assert(kHTtl - 60 <= ttl && ttl <= kHTtl, "%s has TTL %d after a sample was recorded %s: every key the run owns expires kTtlSeconds (%d s) after its last move", key, ttl, when, kHTtl);
     }
-    const auto stamp = ctx.Redis.HGet(kProgress, "updated_at");
+    const auto stamp = ctx.Redis.HGet(kHProgress, "updated_at");
     ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
-               "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(kProgress));
+               "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(kHProgress));
     const long long at = std::strtoll(stamp->c_str(), nullptr, 10);
     const long long now = ctx.Clock.Now() / 1000;
     ctx.Assert(at - now <= 2 && now - at <= 2, "updated_at is %s after a sample was recorded %s, the clock reads %d: it is the unix time in seconds of the run's last move", *stamp, when, now);
   };
   fresh("now");
   ctx.Clock.Advance(5 * 86400);
-  record_sample(kRun, "s-2", 0.1, "model");
+  record_sample(kHRun, "s-2", 0.1, "model");
   fresh("five days later");
-  ctx.Clock.Advance(kTtl - 3600);
-  ctx.Equal(ctx.Redis.Exists(kProgress, kSeen), 2, "a run that moved %d s ago must still be there (%v); keys", kTtl - 3600, ctx.Redis.Keys("evals:*:" + kRun));
+  ctx.Clock.Advance(kHTtl - 3600);
+  ctx.Equal(ctx.Redis.Exists(kHProgress, kHSeen), 2, "a run that moved %d s ago must still be there (%v); keys", kHTtl - 3600, ctx.Redis.Keys("evals:*:" + kHRun));
   ctx.Clock.Advance(3601);
-  ctx.Equal(ctx.Redis.Keys("evals:*:" + kRun).size(), 0, "a week after its last move the run must be gone (%v); keys left", ctx.Redis.Keys("evals:*:" + kRun));
+  ctx.Equal(ctx.Redis.Keys("evals:*:" + kHRun).size(), 0, "a week after its last move the run must be gone (%v); keys left", ctx.Redis.Keys("evals:*:" + kHRun));
 }
 `,
   },

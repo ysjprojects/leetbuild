@@ -754,19 +754,19 @@ import (
 )
 
 var (
-	readV1 = []string{"billing", "support", "security"}
-	readV2 = []string{"billing", "support", "security", "abuse"}
-	readV3 = []string{"billing", "support", "abuse"}
+	hReadV1 = []string{"billing", "support", "security"}
+	hReadV2 = []string{"billing", "support", "security", "abuse"}
+	hReadV3 = []string{"billing", "support", "abuse"}
 )
 
-type readBody struct {
+type HReadBody struct {
 	Version   int                 \`json:"version"\`
 	Labels    []string            \`json:"labels"\`
 	Changelog []taxonomies.Change \`json:"changelog"\`
 }
 
-func readWorld(ctx *harness.Ctx) *harness.HTTP {
-	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", readV1)
+func hReadWorld(ctx *harness.Ctx) *harness.HTTP {
+	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", hReadV1)
 	ctx.NoError(err, "seeding tx-support")
 	_, err = taxonomies.PutVersion(context.Background(), "globex", "tx-legal", []string{"legal"})
 	ctx.NoError(err, "seeding tx-legal")
@@ -775,88 +775,88 @@ func readWorld(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, path, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, path, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get(path)
 	}
 	return c.Get(path, "X-Tenant-Id", tenant)
 }
 
-func readDecode(r *harness.Response) readBody {
-	var body readBody
+func hReadDecode(r *harness.Response) HReadBody {
+	var body HReadBody
 	r.Decode(&body)
 	return body
 }
 
-func readPut(ctx *harness.Ctx, labels []string) {
+func hReadPut(ctx *harness.Ctx, labels []string) {
 	_, err := taxonomies.PutVersion(context.Background(), "acme", "tx-support", labels)
 	ctx.NoError(err, "publishing a version")
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	r := readGet(c, "/v1/taxonomies/tx-support", "acme")
+	c := hReadWorld(ctx)
+	r := hReadGet(c, "/v1/taxonomies/tx-support", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/taxonomies/tx-support (%s)", r.Text())
-	ctx.Equal(readDecode(r).Labels, readV1, "the read must answer the taxonomy's labels")
+	ctx.Equal(hReadDecode(r).Labels, hReadV1, "the read must answer the taxonomy's labels")
 }
 
 func CheckTenantScoped404(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	ctx.Equal(readGet(c, "/v1/taxonomies/tx-support", "").Status, 401, "a read without X-Tenant-Id")
-	r := readGet(c, "/v1/taxonomies/tx-support", "globex")
+	c := hReadWorld(ctx)
+	ctx.Equal(hReadGet(c, "/v1/taxonomies/tx-support", "").Status, 401, "a read without X-Tenant-Id")
+	r := hReadGet(c, "/v1/taxonomies/tx-support", "globex")
 	ctx.Equal(r.Status, 404, "tenant globex read acme's taxonomy (%s)", r.Text())
-	r = readGet(c, "/v1/taxonomies/tx-legal", "globex")
-	ctx.Assert(r.Status == 200 && len(readDecode(r).Labels) == 1, "globex reads its own taxonomy, got %d %s", r.Status, r.Text())
+	r = hReadGet(c, "/v1/taxonomies/tx-legal", "globex")
+	ctx.Assert(r.Status == 200 && len(hReadDecode(r).Labels) == 1, "globex reads its own taxonomy, got %d %s", r.Status, r.Text())
 }
 
 func CheckImmutableVersions(ctx *harness.Ctx) {
-	readWorld(ctx)
-	version, err := publishVersion(context.Background(), "acme", "tx-support", readV2)
+	hReadWorld(ctx)
+	version, err := publishVersion(context.Background(), "acme", "tx-support", hReadV2)
 	ctx.NoError(err, "publishVersion")
 	ctx.Equal(version, 2, "publishing an edit must mint version 2; the version")
 	v1, err := taxonomies.Load(context.Background(), "acme", "tx-support", 1)
 	ctx.NoError(err, "loading version 1")
 	ctx.Assert(v1 != nil, "version 1 is gone")
-	ctx.Equal(v1.Labels, readV1, "version 1 must keep its labels: an edit rewrote the labels old classifications were made against")
+	ctx.Equal(v1.Labels, hReadV1, "version 1 must keep its labels: an edit rewrote the labels old classifications were made against")
 	v2, err := taxonomies.Load(context.Background(), "acme", "tx-support", 2)
 	ctx.NoError(err, "loading version 2")
 	ctx.Assert(v2 != nil, "version 2 does not exist")
-	ctx.Equal(v2.Labels, readV2, "version 2's labels")
-	version, err = publishVersion(context.Background(), "acme", "tx-support", readV3)
+	ctx.Equal(v2.Labels, hReadV2, "version 2's labels")
+	version, err = publishVersion(context.Background(), "acme", "tx-support", hReadV3)
 	ctx.NoError(err, "publishVersion")
 	ctx.Equal(version, 3, "the next edit must mint version 3")
 }
 
 func CheckChangelog(ctx *harness.Ctx) {
-	c := readWorld(ctx)
-	readPut(ctx, readV2)
-	readPut(ctx, readV3)
-	r := readGet(c, "/v1/taxonomies/tx-support?since=1", "acme")
-	body := readDecode(r)
+	c := hReadWorld(ctx)
+	hReadPut(ctx, hReadV2)
+	hReadPut(ctx, hReadV3)
+	r := hReadGet(c, "/v1/taxonomies/tx-support?since=1", "acme")
+	body := hReadDecode(r)
 	ctx.Equal(body.Version, 3, "the read must name the version it serves (%s)", r.Text())
 	want, _ := json.Marshal([]taxonomies.Change{{Version: 2, Added: []string{"abuse"}, Removed: []string{}}, {Version: 3, Added: []string{}, Removed: []string{"security"}}})
 	got, _ := json.Marshal(body.Changelog)
 	ctx.Equal(string(got), string(want), "?since=1 must list the changes of versions 2 and 3")
-	r = readGet(c, "/v1/taxonomies/tx-support?version=1", "acme")
-	body = readDecode(r)
+	r = hReadGet(c, "/v1/taxonomies/tx-support?version=1", "acme")
+	body = hReadDecode(r)
 	ctx.Assert(body.Version == 1 && len(body.Labels) == 3 && body.Labels[2] == "security", "?version=1 must serve version 1 as it was, got %s", r.Text())
 	var raw map[string]any
 	_ = json.Unmarshal([]byte(r.Text()), &raw)
 	empty, isList := raw["changelog"].([]any)
 	ctx.Assert(isList && len(empty) == 0, "without ?since the changelog is an empty list, got %s", r.Text())
-	r = readGet(c, "/v1/taxonomies/tx-support?version=9", "acme")
+	r = hReadGet(c, "/v1/taxonomies/tx-support?version=9", "acme")
 	ctx.Equal(r.Status, 404, "?version=9 of a taxonomy with three versions (%s)", r.Text())
-	body = readDecode(readGet(c, "/v1/taxonomies/tx-support?version=1&since=0", "acme"))
+	body = hReadDecode(hReadGet(c, "/v1/taxonomies/tx-support?version=1&since=0", "acme"))
 	got, _ = json.Marshal(body.Changelog)
 	ctx.Equal(string(got), \`[{"version":1,"added":["billing","support","security"],"removed":[]}]\`, "?since=0 lists every change up to the version, the creation of version 1 included")
-	body = readDecode(readGet(c, "/v1/taxonomies/tx-support?version=2&since=1", "acme"))
+	body = hReadDecode(hReadGet(c, "/v1/taxonomies/tx-support?version=2&since=1", "acme"))
 	got, _ = json.Marshal(body.Changelog)
 	ctx.Equal(string(got), \`[{"version":2,"added":["abuse"],"removed":[]}]\`, "the changelog runs up to the requested version")
 }
 
 func CheckVersionNamed(ctx *harness.Ctx) {
-	readWorld(ctx)
-	readPut(ctx, readV2) // version 2 lands between the classification and its record
+	hReadWorld(ctx)
+	hReadPut(ctx, hReadV2) // version 2 lands between the classification and its record
 	record, err := recordClassification(context.Background(), "acme", "tx-support", 1, []string{"billing"})
 	ctx.NoError(err, "recordClassification")
 	rows := ctx.Redis.LRange(config.ClassificationsKey("acme"), 0, -1)
@@ -876,12 +876,12 @@ func CheckVersionNamed(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kV1 = {"billing", "support", "security"};
-const std::vector<std::string> kV2 = {"billing", "support", "security", "abuse"};
-const std::vector<std::string> kV3 = {"billing", "support", "abuse"};
+const std::vector<std::string> kHV1 = {"billing", "support", "security"};
+const std::vector<std::string> kHV2 = {"billing", "support", "security", "abuse"};
+const std::vector<std::string> kHV3 = {"billing", "support", "abuse"};
 
-harness::HTTP readWorld(harness::Ctx& ctx) {
-  taxonomies::putVersion("acme", "tx-support", kV1);
+harness::HTTP hReadWorld(harness::Ctx& ctx) {
+  taxonomies::putVersion("acme", "tx-support", kHV1);
   taxonomies::putVersion("globex", "tx-legal", {"legal"});
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -890,81 +890,81 @@ harness::HTTP readWorld(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& path, const std::string& tenant = "acme") {
+harness::Response hReadGet(harness::HTTP& c, const std::string& path, const std::string& tenant = "acme") {
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json decode(const harness::Response& r) {
+nlohmann::json hDecode(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-std::vector<std::string> labelsOf(const nlohmann::json& body) { return body.value("labels", std::vector<std::string>{}); }
+std::vector<std::string> hLabelsOf(const nlohmann::json& body) { return body.value("labels", std::vector<std::string>{}); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  const auto r = readGet(c, "/v1/taxonomies/tx-support");
+  auto c = hReadWorld(ctx);
+  const auto r = hReadGet(c, "/v1/taxonomies/tx-support");
   ctx.Equal(r.Status, 200, "GET /v1/taxonomies/tx-support (%s)", r.Text());
-  ctx.Equal(labelsOf(decode(r)), kV1, "the read must answer the taxonomy's labels");
+  ctx.Equal(hLabelsOf(hDecode(r)), kHV1, "the read must answer the taxonomy's labels");
 }
 
 void CheckTenantScoped404(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  ctx.Equal(readGet(c, "/v1/taxonomies/tx-support", "").Status, 401, "a read without X-Tenant-Id");
-  auto r = readGet(c, "/v1/taxonomies/tx-support", "globex");
+  auto c = hReadWorld(ctx);
+  ctx.Equal(hReadGet(c, "/v1/taxonomies/tx-support", "").Status, 401, "a read without X-Tenant-Id");
+  auto r = hReadGet(c, "/v1/taxonomies/tx-support", "globex");
   ctx.Equal(r.Status, 404, "tenant globex read acme's taxonomy (%s)", r.Text());
-  r = readGet(c, "/v1/taxonomies/tx-legal", "globex");
-  ctx.Assert(r.Status == 200 && labelsOf(decode(r)) == std::vector<std::string>{"legal"}, "globex reads its own taxonomy, got %d %s", r.Status, r.Text());
+  r = hReadGet(c, "/v1/taxonomies/tx-legal", "globex");
+  ctx.Assert(r.Status == 200 && hLabelsOf(hDecode(r)) == std::vector<std::string>{"legal"}, "globex reads its own taxonomy, got %d %s", r.Status, r.Text());
 }
 
 void CheckImmutableVersions(harness::Ctx& ctx) {
-  readWorld(ctx);
-  ctx.Equal(publishVersion("acme", "tx-support", kV2), 2, "publishing an edit must mint version 2; the version");
+  hReadWorld(ctx);
+  ctx.Equal(publishVersion("acme", "tx-support", kHV2), 2, "publishing an edit must mint version 2; the version");
   const auto v1 = taxonomies::load("acme", "tx-support", 1);
   ctx.Assert(v1.has_value(), "version 1 is gone");
-  ctx.Equal(v1->labels, kV1, "version 1 must keep its labels: an edit rewrote the labels old classifications were made against");
+  ctx.Equal(v1->labels, kHV1, "version 1 must keep its labels: an edit rewrote the labels old classifications were made against");
   const auto v2 = taxonomies::load("acme", "tx-support", 2);
   ctx.Assert(v2.has_value(), "version 2 does not exist");
-  ctx.Equal(v2->labels, kV2, "version 2's labels");
-  ctx.Equal(publishVersion("acme", "tx-support", kV3), 3, "the next edit must mint version 3");
+  ctx.Equal(v2->labels, kHV2, "version 2's labels");
+  ctx.Equal(publishVersion("acme", "tx-support", kHV3), 3, "the next edit must mint version 3");
 }
 
 void CheckChangelog(harness::Ctx& ctx) {
-  auto c = readWorld(ctx);
-  taxonomies::putVersion("acme", "tx-support", kV2);
-  taxonomies::putVersion("acme", "tx-support", kV3);
-  auto r = readGet(c, "/v1/taxonomies/tx-support?since=1");
-  auto body = decode(r);
+  auto c = hReadWorld(ctx);
+  taxonomies::putVersion("acme", "tx-support", kHV2);
+  taxonomies::putVersion("acme", "tx-support", kHV3);
+  auto r = hReadGet(c, "/v1/taxonomies/tx-support?since=1");
+  auto body = hDecode(r);
   ctx.Equal(body.value("version", 0L), 3, "the read must name the version it serves (%s)", r.Text());
   const auto want = nlohmann::json::parse(R"([{"version":2,"added":["abuse"],"removed":[]},{"version":3,"added":[],"removed":["security"]}])");
   ctx.Equal(body.value("changelog", nlohmann::json::array()).dump(), want.dump(), "?since=1 must list the changes of versions 2 and 3");
-  r = readGet(c, "/v1/taxonomies/tx-support?version=1");
-  body = decode(r);
-  ctx.Assert(body.value("version", 0L) == 1 && labelsOf(body) == kV1, "?version=1 must serve version 1 as it was, got %s", r.Text());
+  r = hReadGet(c, "/v1/taxonomies/tx-support?version=1");
+  body = hDecode(r);
+  ctx.Assert(body.value("version", 0L) == 1 && hLabelsOf(body) == kHV1, "?version=1 must serve version 1 as it was, got %s", r.Text());
   ctx.Assert(body.is_object() && body.contains("changelog") && body["changelog"] == nlohmann::json::array(), "without ?since the changelog is empty, got %s", r.Text());
-  r = readGet(c, "/v1/taxonomies/tx-support?version=9");
+  r = hReadGet(c, "/v1/taxonomies/tx-support?version=9");
   ctx.Equal(r.Status, 404, "?version=9 of a taxonomy with three versions (%s)", r.Text());
-  body = decode(readGet(c, "/v1/taxonomies/tx-support?version=1&since=0"));
+  body = hDecode(hReadGet(c, "/v1/taxonomies/tx-support?version=1&since=0"));
   ctx.Equal(body.value("changelog", nlohmann::json::array()).dump(), nlohmann::json::parse(R"([{"version":1,"added":["billing","support","security"],"removed":[]}])").dump(),
             "?since=0 lists every change up to the version, the creation of version 1 included");
-  body = decode(readGet(c, "/v1/taxonomies/tx-support?version=2&since=1"));
+  body = hDecode(hReadGet(c, "/v1/taxonomies/tx-support?version=2&since=1"));
   ctx.Equal(body.value("changelog", nlohmann::json::array()).dump(), R"([{"added":["abuse"],"removed":[],"version":2}])",
             "the changelog runs up to the requested version");
 }
 
 void CheckVersionNamed(harness::Ctx& ctx) {
-  readWorld(ctx);
-  taxonomies::putVersion("acme", "tx-support", kV2);  // version 2 lands between the classification and its record
+  hReadWorld(ctx);
+  taxonomies::putVersion("acme", "tx-support", kHV2);  // version 2 lands between the classification and its record
   const auto record = recordClassification("acme", "tx-support", 1, {"billing"});
   const auto rows = ctx.Redis.LRange(config::classificationsKey("acme"), 0, -1);
   ctx.Equal(rows.size(), 1, "one recordClassification must append one record; the records");
   const auto row = nlohmann::json::parse(rows[0], nullptr, false);
   ctx.Assert(row.is_object(), "a record must be JSON, got %s", rows[0]);
   ctx.Equal(row.value("taxonomy_version", 0L), 1, "the text was classified against version 1: the record must name the version it was given; the record's version");
-  ctx.Assert(row.value("taxonomy_id", "") == "tx-support" && row.value("tenant", "") == "acme" && labelsOf(row) == std::vector<std::string>{"billing"},
+  ctx.Assert(row.value("taxonomy_id", "") == "tx-support" && row.value("tenant", "") == "acme" && hLabelsOf(row) == std::vector<std::string>{"billing"},
              "the record is %s", rows[0]);
   ctx.Equal(record.value("taxonomy_version", 0L), 1, "the returned record's version");
 }

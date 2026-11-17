@@ -1076,24 +1076,24 @@ import (
 	pb "gateway/gen/providers"
 )
 
-var failoverTokens = []string{"The", " capital", " of", " France", " is", " Paris", "."}
+var hFailoverTokens = []string{"The", " capital", " of", " France", " is", " Paris", "."}
 
 const (
-	failoverPrimary  = "primary:9000"
-	failoverFallback = "fallback:9000"
+	kHFailoverPrimary  = "primary:9000"
+	kHFailoverFallback = "fallback:9000"
 )
 
-var failoverRequest = &pb.CompleteRequest{Model: "gpt-4o-mini", Messages: []*pb.Message{{Role: "user", Content: "What is the capital of France?"}}, MaxTokens: 64}
+var hFailoverRequest = &pb.CompleteRequest{Model: "gpt-4o-mini", Messages: []*pb.Message{{Role: "user", Content: "What is the capital of France?"}}, MaxTokens: 64}
 
-// failoverPeer is a model provider: streams the answer; with breakAfter >= 0 it fails UNAVAILABLE after that many chunks.
-type failoverPeer struct {
+// HFailoverPeer is a model provider: streams the answer; with breakAfter >= 0 it fails UNAVAILABLE after that many chunks.
+type HFailoverPeer struct {
 	pb.UnimplementedProviderServer
 	name       string
 	breakAfter int
 }
 
-func (p *failoverPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_StreamCompleteServer) error {
-	for i, t := range failoverTokens {
+func (p *HFailoverPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_StreamCompleteServer) error {
+	for i, t := range hFailoverTokens {
 		if p.breakAfter >= 0 && i == p.breakAfter {
 			return status.Error(codes.Unavailable, p.name+" lost its upstream")
 		}
@@ -1104,102 +1104,102 @@ func (p *failoverPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_Str
 	return nil
 }
 
-func failoverWorld(ctx *harness.Ctx, primaryBreakAfter int) {
-	pb.RegisterProviderServer(ctx.GRPC.Server(failoverPrimary), &failoverPeer{name: "primary", breakAfter: primaryBreakAfter})
-	pb.RegisterProviderServer(ctx.GRPC.Server(failoverFallback), &failoverPeer{name: "fallback", breakAfter: -1})
+func hFailoverWorld(ctx *harness.Ctx, primaryBreakAfter int) {
+	pb.RegisterProviderServer(ctx.GRPC.Server(kHFailoverPrimary), &HFailoverPeer{name: "primary", breakAfter: primaryBreakAfter})
+	pb.RegisterProviderServer(ctx.GRPC.Server(kHFailoverFallback), &HFailoverPeer{name: "fallback", breakAfter: -1})
 }
 
-type failoverOut struct {
+type HFailoverOut struct {
 	chunks []string
 	err    error
 	ended  bool
 }
 
-// failoverRun is one call: the chunk texts it handed over and the error it ended with; ended is false if it never did.
-func failoverRun(ctx *harness.Ctx, key string) failoverOut {
-	out := failoverOut{chunks: []string{}}
+// hFailoverRun is one call: the chunk texts it handed over and the error it ended with; ended is false if it never did.
+func hFailoverRun(ctx *harness.Ctx, key string) HFailoverOut {
+	out := HFailoverOut{chunks: []string{}}
 	out.ended = ctx.Drain(func() {
-		out.err = streamWithFailover(context.Background(), failoverRequest, key, func(c *pb.Chunk) { out.chunks = append(out.chunks, c.GetText()) })
+		out.err = streamWithFailover(context.Background(), hFailoverRequest, key, func(c *pb.Chunk) { out.chunks = append(out.chunks, c.GetText()) })
 	})
 	return out
 }
 
-func failoverCalls(ctx *harness.Ctx, target string) []harness.Call {
+func hFailoverCalls(ctx *harness.Ctx, target string) []harness.Call {
 	return ctx.GRPC.CallsTo("StreamComplete", target)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	failoverWorld(ctx, -1)
-	ctx.GRPC.SetLatency("StreamComplete", 20.0, failoverPrimary)
-	out := failoverRun(ctx, "k-1")
-	ctx.Assert(out.ended, "with the primary stalled the call never ended (%d attempts on it): every attempt needs a deadline", len(failoverCalls(ctx, failoverPrimary)))
-	primary := failoverCalls(ctx, failoverPrimary)
+	hFailoverWorld(ctx, -1)
+	ctx.GRPC.SetLatency("StreamComplete", 20.0, kHFailoverPrimary)
+	out := hFailoverRun(ctx, "k-1")
+	ctx.Assert(out.ended, "with the primary stalled the call never ended (%d attempts on it): every attempt needs a deadline", len(hFailoverCalls(ctx, kHFailoverPrimary)))
+	primary := hFailoverCalls(ctx, kHFailoverPrimary)
 	ctx.Assert(len(primary) > 0 && primary[0].HasDeadline(), "the StreamComplete call carries no deadline: a stalled provider holds the request open forever")
 	ctx.Assert(7500*time.Millisecond <= primary[0].Timeout && primary[0].Timeout <= 8500*time.Millisecond, "the deadline must be the 8 s stream deadline, got %v", primary[0].Timeout)
 	ctx.NoError(out.err, "after the primary timed out the fallback must serve the answer")
-	ctx.Equal(out.chunks, failoverTokens, "after the primary timed out the fallback must serve the answer")
-	ctx.Assert(len(primary) == 1 && len(failoverCalls(ctx, failoverFallback)) == 1, "expected one attempt on each provider, got %d on primary and %d on fallback", len(primary), len(failoverCalls(ctx, failoverFallback)))
-	fallback := failoverCalls(ctx, failoverFallback)[0]
+	ctx.Equal(out.chunks, hFailoverTokens, "after the primary timed out the fallback must serve the answer")
+	ctx.Assert(len(primary) == 1 && len(hFailoverCalls(ctx, kHFailoverFallback)) == 1, "expected one attempt on each provider, got %d on primary and %d on fallback", len(primary), len(hFailoverCalls(ctx, kHFailoverFallback)))
+	fallback := hFailoverCalls(ctx, kHFailoverFallback)[0]
 	ctx.Assert(fallback.HasDeadline() && 7500*time.Millisecond <= fallback.Timeout && fallback.Timeout <= 8500*time.Millisecond, "the fallback attempt, made after the primary used up its 8 s, carried a deadline of %v: every attempt carries its own full 8 s deadline, not what is left of a shared one", fallback.Timeout)
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	failoverWorld(ctx, -1)
-	ctx.GRPC.Stop(failoverPrimary)
-	ctx.GRPC.Stop(failoverFallback)
-	out := failoverRun(ctx, "k-1")
-	total := len(failoverCalls(ctx, failoverPrimary)) + len(failoverCalls(ctx, failoverFallback))
+	hFailoverWorld(ctx, -1)
+	ctx.GRPC.Stop(kHFailoverPrimary)
+	ctx.GRPC.Stop(kHFailoverFallback)
+	out := hFailoverRun(ctx, "k-1")
+	total := len(hFailoverCalls(ctx, kHFailoverPrimary)) + len(hFailoverCalls(ctx, kHFailoverFallback))
 	ctx.Assert(out.ended, "with both providers down the call never ended: %d attempts and counting. Bound the attempts by the provider list", total)
 	ctx.Assert(out.err != nil, "with both providers down the call must end with an error, it returned nil")
 	ctx.Assert(total <= 2, "with both providers down the call made %d attempts, expected at most 2 (one per provider)", total)
 }
 
 func CheckRetryableAndIdempotent(ctx *harness.Ctx) {
-	failoverWorld(ctx, -1)
+	hFailoverWorld(ctx, -1)
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.ResourceExhausted, codes.Internal, codes.NotFound} {
-		ctx.GRPC.Fail("StreamComplete", code, "refused", 1, failoverPrimary)
-		refused := failoverRun(ctx, "k-1")
+		ctx.GRPC.Fail("StreamComplete", code, "refused", 1, kHFailoverPrimary)
+		refused := hFailoverRun(ctx, "k-1")
 		ctx.Assert(refused.ended && refused.err != nil, "%v from the primary must be returned to the caller at once", code)
-		ctx.Equal(len(failoverCalls(ctx, failoverFallback)), 0, "%v is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on); fallback attempts", code)
+		ctx.Equal(len(hFailoverCalls(ctx, kHFailoverFallback)), 0, "%v is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on); fallback attempts", code)
 	}
 	state, _ := ctx.Redis.Get("circuit:primary")
 	ctx.Equal(state, "", "a non-retryable failure must not count towards the breaker; circuit:primary")
-	out := failoverRun(ctx, "k-7")
+	out := hFailoverRun(ctx, "k-7")
 	ctx.NoError(out.err, "a healthy primary must serve the answer")
-	ctx.Equal(out.chunks, failoverTokens, "a healthy primary must serve the answer")
-	calls := failoverCalls(ctx, failoverPrimary)
+	ctx.Equal(out.chunks, hFailoverTokens, "a healthy primary must serve the answer")
+	calls := hFailoverCalls(ctx, kHFailoverPrimary)
 	md := calls[len(calls)-1].Metadata
 	ctx.Equal(md.Get("idempotency-key"), []string{"k-7"}, "the attempt carried metadata %v; idempotency-key", md)
-	ctx.GRPC.Fail("StreamComplete", codes.DeadlineExceeded, "deadline exceeded", 1, failoverPrimary)
-	out = failoverRun(ctx, "k-8")
-	ctx.Assert(out.err == nil && len(out.chunks) == len(failoverTokens), "DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer, got %q and %v", out.chunks, out.err)
-	fallbackCalls := failoverCalls(ctx, failoverFallback)
+	ctx.GRPC.Fail("StreamComplete", codes.DeadlineExceeded, "deadline exceeded", 1, kHFailoverPrimary)
+	out = hFailoverRun(ctx, "k-8")
+	ctx.Assert(out.err == nil && len(out.chunks) == len(hFailoverTokens), "DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer, got %q and %v", out.chunks, out.err)
+	fallbackCalls := hFailoverCalls(ctx, kHFailoverFallback)
 	ctx.Assert(len(fallbackCalls) > 0, "DEADLINE_EXCEEDED from the primary is retryable: the fallback was never tried")
 	fallbackKey := fallbackCalls[len(fallbackCalls)-1].Metadata.Get("idempotency-key")
 	ctx.Assert(len(fallbackKey) > 0 && fallbackKey[0] == "k-8", "the fallback attempt carried idempotency-key %q, expected k-8 (every attempt carries the key)", fallbackKey)
-	before := len(failoverCalls(ctx, failoverPrimary))
-	out = failoverRun(ctx, "")
-	ctx.Assert(out.err != nil && len(failoverCalls(ctx, failoverPrimary)) == before, "without an idempotency key the call must be refused before any attempt")
-	ctx.GRPC.Stop(failoverPrimary)
-	pb.RegisterProviderServer(ctx.GRPC.Server(failoverPrimary), &failoverPeer{name: "primary", breakAfter: 0})
-	out = failoverRun(ctx, "k-10")
-	ctx.Assert(out.err == nil && len(out.chunks) == len(failoverTokens), "the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; got %q and %v", out.chunks, out.err)
-	ctx.GRPC.Stop(failoverPrimary)
-	pb.RegisterProviderServer(ctx.GRPC.Server(failoverPrimary), &failoverPeer{name: "primary", breakAfter: 2})
-	fallbackBefore := len(failoverCalls(ctx, failoverFallback))
-	out = failoverRun(ctx, "k-9")
-	ctx.Equal(out.chunks, failoverTokens[:2], "the caller must receive the two chunks the primary streamed before failing")
+	before := len(hFailoverCalls(ctx, kHFailoverPrimary))
+	out = hFailoverRun(ctx, "")
+	ctx.Assert(out.err != nil && len(hFailoverCalls(ctx, kHFailoverPrimary)) == before, "without an idempotency key the call must be refused before any attempt")
+	ctx.GRPC.Stop(kHFailoverPrimary)
+	pb.RegisterProviderServer(ctx.GRPC.Server(kHFailoverPrimary), &HFailoverPeer{name: "primary", breakAfter: 0})
+	out = hFailoverRun(ctx, "k-10")
+	ctx.Assert(out.err == nil && len(out.chunks) == len(hFailoverTokens), "the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; got %q and %v", out.chunks, out.err)
+	ctx.GRPC.Stop(kHFailoverPrimary)
+	pb.RegisterProviderServer(ctx.GRPC.Server(kHFailoverPrimary), &HFailoverPeer{name: "primary", breakAfter: 2})
+	fallbackBefore := len(hFailoverCalls(ctx, kHFailoverFallback))
+	out = hFailoverRun(ctx, "k-9")
+	ctx.Equal(out.chunks, hFailoverTokens[:2], "the caller must receive the two chunks the primary streamed before failing")
 	ctx.Assert(out.err != nil, "a failure after the first chunk must be returned: a retry would replay output the user already read")
-	ctx.Equal(len(failoverCalls(ctx, failoverFallback)), fallbackBefore, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts")
+	ctx.Equal(len(hFailoverCalls(ctx, kHFailoverFallback)), fallbackBefore, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts")
 }
 
 func CheckCircuitBreaker(ctx *harness.Ctx) {
-	failoverWorld(ctx, -1)
+	hFailoverWorld(ctx, -1)
 	failOnce := func(key string) {
-		ctx.GRPC.Fail("StreamComplete", codes.Unavailable, "primary restarting", 1, failoverPrimary)
-		out := failoverRun(ctx, key)
+		ctx.GRPC.Fail("StreamComplete", codes.Unavailable, "primary restarting", 1, kHFailoverPrimary)
+		out := hFailoverRun(ctx, key)
 		ctx.NoError(out.err, "%s: the fallback must serve the answer while the primary fails", key)
-		ctx.Equal(out.chunks, failoverTokens, "%s: the fallback must serve the answer while the primary fails", key)
+		ctx.Equal(out.chunks, hFailoverTokens, "%s: the fallback must serve the answer while the primary fails", key)
 	}
 	// Four failures, then the 30 s window passes: the count starts over.
 	for i := range 4 {
@@ -1211,7 +1211,7 @@ func CheckCircuitBreaker(ctx *harness.Ctx) {
 	ctx.Assert(quiet != "open", "four failures, 31 s of quiet, then one more opened circuit:primary: the count must expire 30 s after it started")
 	ctx.Clock.Advance(31)
 	// Five failures, 5 s apart: the breaker opens at the fifth, for a full 30 s.
-	first := len(failoverCalls(ctx, failoverPrimary))
+	first := len(hFailoverCalls(ctx, kHFailoverPrimary))
 	for i := range 5 {
 		if i == 4 {
 			early, _ := ctx.Redis.Get("circuit:primary")
@@ -1222,29 +1222,29 @@ func CheckCircuitBreaker(ctx *harness.Ctx) {
 			ctx.Clock.Advance(5)
 		}
 	}
-	ctx.Equal(len(failoverCalls(ctx, failoverPrimary))-first, 5, "five requests with the primary failing; primary attempts")
+	ctx.Equal(len(hFailoverCalls(ctx, kHFailoverPrimary))-first, 5, "five requests with the primary failing; primary attempts")
 	state, _ := ctx.Redis.Get("circuit:primary")
 	ctx.Equal(state, "open", "after five retryable failures circuit:primary")
 	ttl := ctx.Redis.TTL("circuit:primary")
 	ctx.Assert(28 <= ttl && ttl <= 30, "circuit:primary must stay open for 30 s from the fifth failure, its TTL is %d", ttl)
-	before := len(failoverCalls(ctx, failoverPrimary))
-	out := failoverRun(ctx, "k-open")
-	ctx.Equal(len(failoverCalls(ctx, failoverPrimary)), before, "while the breaker is open the primary must be skipped; primary attempts")
-	ctx.Assert(out.err == nil && len(out.chunks) == len(failoverTokens), "while the breaker is open the fallback serves the answer")
+	before := len(hFailoverCalls(ctx, kHFailoverPrimary))
+	out := hFailoverRun(ctx, "k-open")
+	ctx.Equal(len(hFailoverCalls(ctx, kHFailoverPrimary)), before, "while the breaker is open the primary must be skipped; primary attempts")
+	ctx.Assert(out.err == nil && len(out.chunks) == len(hFailoverTokens), "while the breaker is open the fallback serves the answer")
 	ctx.Clock.Advance(31)
-	out = failoverRun(ctx, "k-closed")
-	ctx.Equal(len(failoverCalls(ctx, failoverPrimary)), before+1, "once the breaker has expired the primary gets its turn again; primary attempts")
+	out = hFailoverRun(ctx, "k-closed")
+	ctx.Equal(len(hFailoverCalls(ctx, kHFailoverPrimary)), before+1, "once the breaker has expired the primary gets its turn again; primary attempts")
 }
 
 func CheckFallback(ctx *harness.Ctx) {
-	failoverWorld(ctx, -1)
-	ctx.GRPC.Stop(failoverPrimary)
-	out := failoverRun(ctx, "k-1")
+	hFailoverWorld(ctx, -1)
+	ctx.GRPC.Stop(kHFailoverPrimary)
+	out := hFailoverRun(ctx, "k-1")
 	ctx.Assert(out.ended, "with the primary down the call never ended: dial the fallback instead of the primary again")
 	ctx.NoError(out.err, "with the primary down the fallback must serve the whole answer")
-	ctx.Equal(out.chunks, failoverTokens, "with the primary down the fallback must serve the whole answer")
-	ctx.Equal(len(failoverCalls(ctx, failoverPrimary)), 1, "the primary must be dialled once; primary attempts")
-	ctx.Equal(len(failoverCalls(ctx, failoverFallback)), 1, "the fallback must be dialled once; fallback attempts")
+	ctx.Equal(out.chunks, hFailoverTokens, "with the primary down the fallback must serve the whole answer")
+	ctx.Equal(len(hFailoverCalls(ctx, kHFailoverPrimary)), 1, "the primary must be dialled once; primary attempts")
+	ctx.Equal(len(hFailoverCalls(ctx, kHFailoverFallback)), 1, "the fallback must be dialled once; fallback attempts")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1257,11 +1257,11 @@ func CheckFallback(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kFailoverTokens = {"The", " capital", " of", " France", " is", " Paris", "."};
-const std::string kPrimary = "primary:9000";
-const std::string kFallback = "fallback:9000";
+const std::vector<std::string> kHFailoverTokens = {"The", " capital", " of", " France", " is", " Paris", "."};
+const std::string kHPrimary = "primary:9000";
+const std::string kHFallback = "fallback:9000";
 
-gateway::CompleteRequest failoverRequest() {
+gateway::CompleteRequest hFailoverRequest() {
   gateway::CompleteRequest req;
   req.set_model("gpt-4o-mini");
   auto* m = req.add_messages();
@@ -1272,18 +1272,18 @@ gateway::CompleteRequest failoverRequest() {
 }
 
 // A model provider: streams the answer; with break_after >= 0 it fails UNAVAILABLE after that many chunks.
-class FailoverPeer final : public gateway::Provider::Service {
+class HFailoverPeer final : public gateway::Provider::Service {
  public:
-  FailoverPeer(std::string name, int break_after) : break_after_(break_after), name_(std::move(name)) {}
+  HFailoverPeer(std::string name, int break_after) : break_after_(break_after), name_(std::move(name)) {}
 
   grpc::Status StreamComplete(grpc::ServerContext*, const gateway::CompleteRequest*,
                               grpc::ServerWriter<gateway::Chunk>* srv) override {
-    for (size_t i = 0; i < kFailoverTokens.size(); i++) {
+    for (size_t i = 0; i < kHFailoverTokens.size(); i++) {
       if (break_after_ >= 0 && static_cast<int>(i) == break_after_) {
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, name_ + " lost its upstream");
       }
       gateway::Chunk chunk;
-      chunk.set_text(kFailoverTokens[i]);
+      chunk.set_text(kHFailoverTokens[i]);
       if (!srv->Write(chunk)) return grpc::Status::CANCELLED;
     }
     return grpc::Status::OK;
@@ -1296,33 +1296,33 @@ class FailoverPeer final : public gateway::Provider::Service {
   std::string name_;
 };
 
-struct FailoverWorld {
-  FailoverPeer primary;
-  FailoverPeer fallback{"fallback", -1};
-  explicit FailoverWorld(int primary_break_after) : primary("primary", primary_break_after) {}
+struct HFailoverWorld {
+  HFailoverPeer primary;
+  HFailoverPeer fallback{"fallback", -1};
+  explicit HFailoverWorld(int primary_break_after) : primary("primary", primary_break_after) {}
 };
 
-FailoverWorld* gFailover = nullptr;
+HFailoverWorld* hGFailover = nullptr;
 
-void failoverWorld(harness::Ctx& ctx, int primary_break_after = -1) {
-  delete gFailover;
-  gFailover = new FailoverWorld(primary_break_after);
-  ctx.GRPC.Server(kPrimary)->RegisterService(&gFailover->primary);
-  ctx.GRPC.Server(kFallback)->RegisterService(&gFailover->fallback);
+void hFailoverWorld(harness::Ctx& ctx, int primary_break_after = -1) {
+  delete hGFailover;
+  hGFailover = new HFailoverWorld(primary_break_after);
+  ctx.GRPC.Server(kHPrimary)->RegisterService(&hGFailover->primary);
+  ctx.GRPC.Server(kHFallback)->RegisterService(&hGFailover->fallback);
 }
 
-struct FailoverOut {
+struct HFailoverOut {
   std::vector<std::string> chunks;
   std::string error;  // what the call threw, "" if it returned
   bool ended = false;
 };
 
 // One call: the chunk texts it handed over and what it threw; ended is false if it never did.
-FailoverOut failoverRun(harness::Ctx& ctx, const std::string& key) {
-  FailoverOut out;
+HFailoverOut hFailoverRun(harness::Ctx& ctx, const std::string& key) {
+  HFailoverOut out;
   out.ended = ctx.Drain([&] {
     try {
-      stream_with_failover(failoverRequest(), key, [&](const gateway::Chunk& c) { out.chunks.push_back(c.text()); });
+      stream_with_failover(hFailoverRequest(), key, [&](const gateway::Chunk& c) { out.chunks.push_back(c.text()); });
     } catch (const std::exception& e) {
       out.error = e.what()[0] ? e.what() : "an exception";
     }
@@ -1330,39 +1330,39 @@ FailoverOut failoverRun(harness::Ctx& ctx, const std::string& key) {
   return out;
 }
 
-size_t failoverCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("StreamComplete", target).size(); }
+size_t hFailoverCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("StreamComplete", target).size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  failoverWorld(ctx);
-  ctx.GRPC.SetLatency("StreamComplete", 20.0, kPrimary);
-  const auto out = failoverRun(ctx, "k-1");
-  ctx.Assert(out.ended, "with the primary stalled the call never ended (%d attempts on it): every attempt needs a deadline", failoverCalls(ctx, kPrimary));
-  const auto primary = ctx.GRPC.CallsTo("StreamComplete", kPrimary);
+  hFailoverWorld(ctx);
+  ctx.GRPC.SetLatency("StreamComplete", 20.0, kHPrimary);
+  const auto out = hFailoverRun(ctx, "k-1");
+  ctx.Assert(out.ended, "with the primary stalled the call never ended (%d attempts on it): every attempt needs a deadline", hFailoverCalls(ctx, kHPrimary));
+  const auto primary = ctx.GRPC.CallsTo("StreamComplete", kHPrimary);
   ctx.Assert(!primary.empty() && primary[0].HasDeadline(), "the StreamComplete call carries no deadline: a stalled provider holds the request open forever");
   ctx.Assert(7.5 <= primary[0].TimeoutSeconds() && primary[0].TimeoutSeconds() <= 8.5, "the deadline must be the 8 s stream deadline, got %vs", primary[0].TimeoutSeconds());
   ctx.Assert(out.error.empty(), "after the primary timed out the fallback must serve the answer; the call threw %s", out.error);
-  ctx.Equal(out.chunks, kFailoverTokens, "after the primary timed out the fallback must serve the answer");
-  ctx.Assert(primary.size() == 1 && failoverCalls(ctx, kFallback) == 1, "expected one attempt on each provider, got %d on primary and %d on fallback", primary.size(), failoverCalls(ctx, kFallback));
-  const auto fallback = ctx.GRPC.CallsTo("StreamComplete", kFallback).front();
+  ctx.Equal(out.chunks, kHFailoverTokens, "after the primary timed out the fallback must serve the answer");
+  ctx.Assert(primary.size() == 1 && hFailoverCalls(ctx, kHFallback) == 1, "expected one attempt on each provider, got %d on primary and %d on fallback", primary.size(), hFailoverCalls(ctx, kHFallback));
+  const auto fallback = ctx.GRPC.CallsTo("StreamComplete", kHFallback).front();
   ctx.Assert(fallback.HasDeadline() && 7.5 <= fallback.TimeoutSeconds() && fallback.TimeoutSeconds() <= 8.5,
              "the fallback attempt, made after the primary used up its 8 s, carried a deadline of %vs: every attempt carries its own full 8 s deadline, not what is left of a shared one", fallback.TimeoutSeconds());
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  failoverWorld(ctx);
-  ctx.GRPC.Stop(kPrimary);
-  ctx.GRPC.Stop(kFallback);
-  const auto out = failoverRun(ctx, "k-1");
-  const size_t total = failoverCalls(ctx, kPrimary) + failoverCalls(ctx, kFallback);
+  hFailoverWorld(ctx);
+  ctx.GRPC.Stop(kHPrimary);
+  ctx.GRPC.Stop(kHFallback);
+  const auto out = hFailoverRun(ctx, "k-1");
+  const size_t total = hFailoverCalls(ctx, kHPrimary) + hFailoverCalls(ctx, kHFallback);
   ctx.Assert(out.ended, "with both providers down the call never ended: %d attempts and counting. Bound the attempts by the provider list", total);
   ctx.Assert(!out.error.empty(), "with both providers down the call must end with an error, it returned normally");
   ctx.Assert(total <= 2, "with both providers down the call made %d attempts, expected at most 2 (one per provider)", total);
 }
 
 void CheckRetryableAndIdempotent(harness::Ctx& ctx) {
-  failoverWorld(ctx);
+  hFailoverWorld(ctx);
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
       {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
@@ -1370,49 +1370,49 @@ void CheckRetryableAndIdempotent(harness::Ctx& ctx) {
       {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
   };
   for (const auto& [code, name] : terminal) {
-    ctx.GRPC.Fail("StreamComplete", code, "refused", 1, kPrimary);
-    const auto refused = failoverRun(ctx, "k-1");
+    ctx.GRPC.Fail("StreamComplete", code, "refused", 1, kHPrimary);
+    const auto refused = hFailoverRun(ctx, "k-1");
     ctx.Assert(refused.ended && !refused.error.empty(), "%s from the primary must be thrown to the caller at once", name);
-    ctx.Equal(failoverCalls(ctx, kFallback), 0, "%s is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on); fallback attempts", name);
+    ctx.Equal(hFailoverCalls(ctx, kHFallback), 0, "%s is not retryable: the fallback must not be tried (only UNAVAILABLE and DEADLINE_EXCEEDED move on); fallback attempts", name);
   }
   const auto state = ctx.Redis.Get("circuit:primary");
   ctx.Assert(!state, "a non-retryable failure must not count towards the breaker, circuit:primary is %q", state.value_or(""));
-  auto out = failoverRun(ctx, "k-7");
+  auto out = hFailoverRun(ctx, "k-7");
   ctx.Assert(out.error.empty(), "a healthy primary must serve the answer; the call threw %s", out.error);
-  ctx.Equal(out.chunks, kFailoverTokens, "a healthy primary must serve the answer");
-  const auto md = ctx.GRPC.CallsTo("StreamComplete", kPrimary).back().Metadata;
+  ctx.Equal(out.chunks, kHFailoverTokens, "a healthy primary must serve the answer");
+  const auto md = ctx.GRPC.CallsTo("StreamComplete", kHPrimary).back().Metadata;
   std::vector<std::string> keys;
   for (auto [it, end] = md.equal_range("idempotency-key"); it != end; ++it) keys.push_back(it->second);
   ctx.Equal(keys, {"k-7"}, "the attempt carried metadata %v; idempotency-key", md);
-  ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1, kPrimary);
-  out = failoverRun(ctx, "k-8");
-  ctx.Assert(out.error.empty() && out.chunks.size() == kFailoverTokens.size(), "DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer; the call threw %q", out.error);
-  const auto fallbackCalls = ctx.GRPC.CallsTo("StreamComplete", kFallback);
+  ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1, kHPrimary);
+  out = hFailoverRun(ctx, "k-8");
+  ctx.Assert(out.error.empty() && out.chunks.size() == kHFailoverTokens.size(), "DEADLINE_EXCEEDED from the primary is retryable: the fallback must serve the answer; the call threw %q", out.error);
+  const auto fallbackCalls = ctx.GRPC.CallsTo("StreamComplete", kHFallback);
   ctx.Assert(!fallbackCalls.empty(), "DEADLINE_EXCEEDED from the primary is retryable: the fallback was never tried");
   const auto fallbackMd = fallbackCalls.back().Metadata;
   const auto fallbackKey = fallbackMd.find("idempotency-key");
   ctx.Assert(fallbackKey != fallbackMd.end() && fallbackKey->second == "k-8", "the fallback attempt carried metadata %v, expected idempotency-key: k-8 (every attempt carries the key)", fallbackMd);
-  const size_t before = failoverCalls(ctx, kPrimary);
-  out = failoverRun(ctx, "");
-  ctx.Assert(!out.error.empty() && failoverCalls(ctx, kPrimary) == before, "without an idempotency key the call must be refused before any attempt");
-  gFailover->primary.break_after_ = 0;
-  out = failoverRun(ctx, "k-10");
-  ctx.Assert(out.error.empty() && out.chunks.size() == kFailoverTokens.size(), "the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; the call threw %q", out.error);
-  gFailover->primary.break_after_ = 2;
-  const size_t fallbackBefore = failoverCalls(ctx, kFallback);
-  out = failoverRun(ctx, "k-9");
-  ctx.Equal(out.chunks, std::vector<std::string>(kFailoverTokens.begin(), kFailoverTokens.begin() + 2), "the caller must receive the two chunks the primary streamed before failing");
+  const size_t before = hFailoverCalls(ctx, kHPrimary);
+  out = hFailoverRun(ctx, "");
+  ctx.Assert(!out.error.empty() && hFailoverCalls(ctx, kHPrimary) == before, "without an idempotency key the call must be refused before any attempt");
+  hGFailover->primary.break_after_ = 0;
+  out = hFailoverRun(ctx, "k-10");
+  ctx.Assert(out.error.empty() && out.chunks.size() == kHFailoverTokens.size(), "the primary failed UNAVAILABLE before streaming any chunk: nothing was delivered, so the fallback must serve the answer; the call threw %q", out.error);
+  hGFailover->primary.break_after_ = 2;
+  const size_t fallbackBefore = hFailoverCalls(ctx, kHFallback);
+  out = hFailoverRun(ctx, "k-9");
+  ctx.Equal(out.chunks, std::vector<std::string>(kHFailoverTokens.begin(), kHFailoverTokens.begin() + 2), "the caller must receive the two chunks the primary streamed before failing");
   ctx.Assert(!out.error.empty(), "a failure after the first chunk must be thrown: a retry would replay output the user already read");
-  ctx.Equal(failoverCalls(ctx, kFallback), fallbackBefore, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts");
+  ctx.Equal(hFailoverCalls(ctx, kHFallback), fallbackBefore, "after a chunk was delivered the fallback must not be tried (it would replay and bill the answer twice); fallback attempts");
 }
 
 void CheckCircuitBreaker(harness::Ctx& ctx) {
-  failoverWorld(ctx);
+  hFailoverWorld(ctx);
   auto failOnce = [&](const std::string& key) {
-    ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::UNAVAILABLE, "primary restarting", 1, kPrimary);
-    const auto out = failoverRun(ctx, key);
+    ctx.GRPC.Fail("StreamComplete", grpc::StatusCode::UNAVAILABLE, "primary restarting", 1, kHPrimary);
+    const auto out = hFailoverRun(ctx, key);
     ctx.Assert(out.error.empty(), "%s: the fallback must serve the answer while the primary fails; the call threw %s", key, out.error);
-    ctx.Equal(out.chunks, kFailoverTokens, "%s: the fallback must serve the answer while the primary fails", key);
+    ctx.Equal(out.chunks, kHFailoverTokens, "%s: the fallback must serve the answer while the primary fails", key);
   };
   // Four failures, then the 30 s window passes: the count starts over.
   for (int i = 0; i < 4; i++) failOnce("k-a" + std::to_string(i));
@@ -1422,7 +1422,7 @@ void CheckCircuitBreaker(harness::Ctx& ctx) {
   ctx.Assert(!quiet || *quiet != "open", "four failures, 31 s of quiet, then one more opened circuit:primary: the count must expire 30 s after it started");
   ctx.Clock.Advance(31);
   // Five failures, 5 s apart: the breaker opens at the fifth, for a full 30 s.
-  const size_t first = failoverCalls(ctx, kPrimary);
+  const size_t first = hFailoverCalls(ctx, kHPrimary);
   for (int i = 0; i < 5; i++) {
     if (i == 4) {
       const auto early = ctx.Redis.Get("circuit:primary");
@@ -1431,29 +1431,29 @@ void CheckCircuitBreaker(harness::Ctx& ctx) {
     failOnce("k-" + std::to_string(i));
     if (i < 4) ctx.Clock.Advance(5);
   }
-  ctx.Equal(failoverCalls(ctx, kPrimary) - first, 5, "five requests with the primary failing; primary attempts");
+  ctx.Equal(hFailoverCalls(ctx, kHPrimary) - first, 5, "five requests with the primary failing; primary attempts");
   const auto state = ctx.Redis.Get("circuit:primary");
   ctx.Equal(state, "open", "after five retryable failures circuit:primary");
   const long long ttl = ctx.Redis.TTL("circuit:primary");
   ctx.Assert(28 <= ttl && ttl <= 30, "circuit:primary must stay open for 30 s from the fifth failure, its TTL is %d", ttl);
-  const size_t before = failoverCalls(ctx, kPrimary);
-  auto out = failoverRun(ctx, "k-open");
-  ctx.Equal(failoverCalls(ctx, kPrimary), before, "while the breaker is open the primary must be skipped; primary attempts");
-  ctx.Assert(out.error.empty() && out.chunks.size() == kFailoverTokens.size(), "while the breaker is open the fallback serves the answer");
+  const size_t before = hFailoverCalls(ctx, kHPrimary);
+  auto out = hFailoverRun(ctx, "k-open");
+  ctx.Equal(hFailoverCalls(ctx, kHPrimary), before, "while the breaker is open the primary must be skipped; primary attempts");
+  ctx.Assert(out.error.empty() && out.chunks.size() == kHFailoverTokens.size(), "while the breaker is open the fallback serves the answer");
   ctx.Clock.Advance(31);
-  out = failoverRun(ctx, "k-closed");
-  ctx.Equal(failoverCalls(ctx, kPrimary), before + 1, "once the breaker has expired the primary gets its turn again; primary attempts");
+  out = hFailoverRun(ctx, "k-closed");
+  ctx.Equal(hFailoverCalls(ctx, kHPrimary), before + 1, "once the breaker has expired the primary gets its turn again; primary attempts");
 }
 
 void CheckFallback(harness::Ctx& ctx) {
-  failoverWorld(ctx);
-  ctx.GRPC.Stop(kPrimary);
-  const auto out = failoverRun(ctx, "k-1");
+  hFailoverWorld(ctx);
+  ctx.GRPC.Stop(kHPrimary);
+  const auto out = hFailoverRun(ctx, "k-1");
   ctx.Assert(out.ended, "with the primary down the call never ended: dial the fallback instead of the primary again");
   ctx.Assert(out.error.empty(), "with the primary down the fallback must serve the whole answer; the call threw %s", out.error);
-  ctx.Equal(out.chunks, kFailoverTokens, "with the primary down the fallback must serve the whole answer");
-  ctx.Equal(failoverCalls(ctx, kPrimary), 1, "the primary must be dialled once; primary attempts");
-  ctx.Equal(failoverCalls(ctx, kFallback), 1, "the fallback must be dialled once; fallback attempts");
+  ctx.Equal(out.chunks, kHFailoverTokens, "with the primary down the fallback must serve the whole answer");
+  ctx.Equal(hFailoverCalls(ctx, kHPrimary), 1, "the primary must be dialled once; primary attempts");
+  ctx.Equal(hFailoverCalls(ctx, kHFallback), 1, "the fallback must be dialled once; fallback attempts");
 }
 `,
   },

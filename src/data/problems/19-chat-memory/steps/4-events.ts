@@ -758,33 +758,33 @@ import (
 )
 
 const (
-	eventsTopic = "session.turn"
-	card        = "My card is 4111 1111 1111 1111, book the flight."
+	kHEventsTopic = "session.turn"
+	kHCard        = "My card is 4111 1111 1111 1111, book the flight."
 )
 
-func eventTurn(n int, content string) sessions.Turn {
+func hEventTurn(n int, content string) sessions.Turn {
 	if content == "" {
 		content = "Ship it on the 14th."
 	}
 	return sessions.Turn{TurnID: fmt.Sprintf("t-%d", n), Role: "user", Content: content, Tokens: 9}
 }
 
-func mustPublish(ctx *harness.Ctx, tenant, sessionID string, turn sessions.Turn) bool {
+func hMustPublish(ctx *harness.Ctx, tenant, sessionID string, turn sessions.Turn) bool {
 	ok, err := publishTurnEvent(context.Background(), tenant, sessionID, turn)
 	ctx.NoError(err, "publishTurnEvent(%s, %s, %s)", tenant, sessionID, turn.TurnID)
 	return ok
 }
 
-type outboxRow struct {
+type HOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outboxRows(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutboxRows(ctx *harness.Ctx) []HOutboxRow {
+	var rows []HOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row HOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -792,21 +792,21 @@ func outboxRows(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckConversationKey(ctx *harness.Ctx) {
-	mustPublish(ctx, "t1", "s-1", eventTurn(1, ""))
-	mustPublish(ctx, "t1", "s-2", eventTurn(1, ""))
-	mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
-	mustPublish(ctx, "t2", "s-1", eventTurn(1, ""))
+	hMustPublish(ctx, "t1", "s-1", hEventTurn(1, ""))
+	hMustPublish(ctx, "t1", "s-2", hEventTurn(1, ""))
+	hMustPublish(ctx, "t1", "s-1", hEventTurn(2, ""))
+	hMustPublish(ctx, "t2", "s-1", hEventTurn(1, ""))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 4, "four publishTurnEvent calls must produce four records on session.turn; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"t1:s-1", "t1:s-2", "t1:s-1", "t2:s-1"}, "the records must be keyed by the conversation {tenant}:{session_id}")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"t1:s-1", "t1:s-2", "t1:s-1", "t2:s-1"}, "the records must be keyed by the conversation {tenant}:{session_id}")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both turns of t1:s-1 must land on one partition, or the worker reads a conversation out of order; the partitions")
 }
 
 func CheckNoContent(ctx *harness.Ctx) {
-	mustPublish(ctx, "t1", "s-1", eventTurn(1, card))
+	hMustPublish(ctx, "t1", "s-1", hEventTurn(1, kHCard))
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one publishTurnEvent must produce one record; the records")
 	ctx.Assert(!strings.Contains(values[0], "4111"), "the event carries the turn's text into a retained topic: %s", values[0])
 	var value map[string]any
@@ -815,35 +815,35 @@ func CheckNoContent(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	mustPublish(ctx, "t1", "s-1", eventTurn(1, ""))
-	mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hMustPublish(ctx, "t1", "s-1", hEventTurn(1, ""))
+	hMustPublish(ctx, "t1", "s-1", hEventTurn(2, ""))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after one lost acknowledgement the producer's retry must not write an event twice (enable.idempotence); the records for two turns")
-	mustPublish(ctx, "t1", "s-1", eventTurn(3, ""))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "after one lost acknowledgement the producer's retry must not write an event twice (enable.idempotence); the records for two turns")
+	hMustPublish(ctx, "t1", "s-1", hEventTurn(3, ""))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 3, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 3, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := mustPublish(ctx, "t1", "s-0", eventTurn(1, ""))
+	ok := hMustPublish(ctx, "t1", "s-0", hEventTurn(1, ""))
 	ctx.Settle()
-	ctx.Assert(ok && len(outboxRows(ctx)) == 0, "a delivered event returned %v and left the outbox %v: once the broker acknowledges, return true and write no row", ok, outboxRows(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = mustPublish(ctx, "t1", "s-1", eventTurn(1, card))
+	ctx.Assert(ok && len(hOutboxRows(ctx)) == 0, "a delivered event returned %v and left the outbox %v: once the broker acknowledges, return true and write no row", ok, hOutboxRows(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hMustPublish(ctx, "t1", "s-1", hEventTurn(1, kHCard))
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the worker never hears of the turn; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "t1:s-1" && rows[0].Payload["turn_id"] == "t-1", "the outbox row is %v, expected the topic, the key t1:s-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "t1:s-1" && rows[0].Payload["turn_id"] == "t-1", "the outbox row is %v, expected the topic, the key t1:s-1 and the payload", rows[0])
 	ctx.Equal(rows[0].Payload, map[string]any{"type": "session.turn", "tenant": "t1", "session_id": "s-1", "turn_id": "t-1", "role": "user", "tokens": 9}, "the outbox row must carry the event's payload, exactly what the topic would have held; its payload")
 	ctx.Equal(ok, false, "publishTurnEvent's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
+	ok = hMustPublish(ctx, "t1", "s-1", hEventTurn(2, ""))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishTurnEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = outboxRows(ctx)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["turn_id"] == "t-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishTurnEvent's result without a delivery report")
 }
@@ -857,45 +857,45 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "session.turn";
-const std::string kCard = "My card is 4111 1111 1111 1111, book the flight.";
+const std::string kHEventsTopic = "session.turn";
+const std::string kHCard = "My card is 4111 1111 1111 1111, book the flight.";
 
-sessions::Turn eventTurn(int n, const std::string& content = "Ship it on the 14th.") {
+sessions::Turn hEventTurn(int n, const std::string& content = "Ship it on the 14th.") {
   return sessions::Turn{"t-" + std::to_string(n), "user", content, 9};
 }
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
-  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
-    const auto row = nlohmann::json::parse(text, nullptr, false);
-    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", text);
+  for (const auto& hText : ctx.Redis.LRange("outbox", 0, -1)) {
+    const auto row = nlohmann::json::parse(hText, nullptr, false);
+    ctx.Assert(row.is_object(), "an outbox row must be JSON with topic, key and payload, got %s", hText);
     rows.push_back(row);
   }
   return rows;
 }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckConversationKey(harness::Ctx& ctx) {
-  publishTurnEvent("t1", "s-1", eventTurn(1));
-  publishTurnEvent("t1", "s-2", eventTurn(1));
-  publishTurnEvent("t1", "s-1", eventTurn(2));
-  publishTurnEvent("t2", "s-1", eventTurn(1));
+  publishTurnEvent("t1", "s-1", hEventTurn(1));
+  publishTurnEvent("t1", "s-2", hEventTurn(1));
+  publishTurnEvent("t1", "s-1", hEventTurn(2));
+  publishTurnEvent("t2", "s-1", hEventTurn(1));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 4, "four publishTurnEvent calls must produce four records on session.turn; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"t1:s-1", "t1:s-2", "t1:s-1", "t2:s-1"}, "the records must be keyed by the conversation {tenant}:{session_id}");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"t1:s-1", "t1:s-2", "t1:s-1", "t2:s-1"}, "the records must be keyed by the conversation {tenant}:{session_id}");
   ctx.Equal(records[0].Partition, records[2].Partition, "both turns of t1:s-1 must land on one partition, or the worker reads a conversation out of order; the partitions");
 }
 
 void CheckNoContent(harness::Ctx& ctx) {
-  publishTurnEvent("t1", "s-1", eventTurn(1, kCard));
+  publishTurnEvent("t1", "s-1", hEventTurn(1, kHCard));
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one publishTurnEvent must produce one record; the records");
   ctx.Assert(values[0].find("4111") == std::string::npos, "the event carries the turn's text into a retained topic: %s", values[0]);
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
@@ -904,38 +904,38 @@ void CheckNoContent(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishTurnEvent("t1", "s-1", eventTurn(1));
-  publishTurnEvent("t1", "s-1", eventTurn(2));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishTurnEvent("t1", "s-1", hEventTurn(1));
+  publishTurnEvent("t1", "s-1", hEventTurn(2));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after one lost acknowledgement the producer's retry must not write an event twice (enable.idempotence); the records for two turns");
-  publishTurnEvent("t1", "s-1", eventTurn(3));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "after one lost acknowledgement the producer's retry must not write an event twice (enable.idempotence); the records for two turns");
+  publishTurnEvent("t1", "s-1", hEventTurn(3));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 3, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 3, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publishTurnEvent("t1", "s-0", eventTurn(1));
+  bool ok = publishTurnEvent("t1", "s-0", hEventTurn(1));
   ctx.Settle();
-  ctx.Assert(ok && outboxRows(ctx).empty(), "a delivered event returned %v and left %d outbox rows: once the broker acknowledges, return true and write no row", ok, outboxRows(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publishTurnEvent("t1", "s-1", eventTurn(1, kCard));
+  ctx.Assert(ok && hOutboxRows(ctx).empty(), "a delivered event returned %v and left %d outbox rows: once the broker acknowledges, return true and write no row", ok, hOutboxRows(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishTurnEvent("t1", "s-1", hEventTurn(1, kHCard));
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the worker never hears of the turn; the rows");
-  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "t1:s-1" && rows[0].contains("payload") && text(rows[0]["payload"], "turn_id") == "t-1",
+  ctx.Assert(hText(rows[0], "topic") == kHEventsTopic && hText(rows[0], "key") == "t1:s-1" && rows[0].contains("payload") && hText(rows[0]["payload"], "turn_id") == "t-1",
              "the outbox row is %s, expected the topic, the key t1:s-1 and the payload", rows[0].dump());
   const nlohmann::json want = {{"type", "session.turn"}, {"tenant", "t1"}, {"session_id", "s-1"}, {"turn_id", "t-1"}, {"role", "user"}, {"tokens", 9}};
   ctx.Assert(rows[0]["payload"] == want, "the outbox row carries %s, expected the event's payload %s: the relay produces exactly what the topic would have held", rows[0]["payload"].dump(), want.dump());
   ctx.Equal(ok, false, "publishTurnEvent's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishTurnEvent("t1", "s-1", eventTurn(2));
+  ok = publishTurnEvent("t1", "s-1", hEventTurn(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishTurnEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && text(rows[1]["payload"], "turn_id") == "t-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hText(rows[1]["payload"], "turn_id") == "t-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishTurnEvent's result without a delivery report");
 }
 `,

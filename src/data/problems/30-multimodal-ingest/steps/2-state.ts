@@ -734,17 +734,17 @@ import (
 )
 
 var (
-	stateBg = context.Background()
-	stateH1 = "sha256:" + strings.Repeat("a", 64)
-	stateH2 = "sha256:" + strings.Repeat("b", 64)
+	hStateBg = context.Background()
+	hStateH1 = "sha256:" + strings.Repeat("a", 64)
+	hStateH2 = "sha256:" + strings.Repeat("b", 64)
 )
 
 // freshWindow moves the clock one second into a minute window, so a check never straddles two.
-func freshWindow(ctx *harness.Ctx) {
+func hFreshWindow(ctx *harness.Ctx) {
 	ctx.Clock.Advance(60 - float64(ctx.Clock.Now()%60000)/1000 + 1)
 }
 
-func quotaUsed(ctx *harness.Ctx, tenant string) int {
+func hQuotaUsed(ctx *harness.Ctx, tenant string) int {
 	used := 0
 	for _, k := range ctx.Redis.Keys("ingest:quota:" + tenant + "*") {
 		v, _ := ctx.Redis.Get(k)
@@ -755,7 +755,7 @@ func quotaUsed(ctx *harness.Ctx, tenant string) int {
 }
 
 // fillQuota sets every counter of the tenant to n: the tenant has used its minute.
-func fillQuota(ctx *harness.Ctx, tenant string, n int) {
+func hFillQuota(ctx *harness.Ctx, tenant string, n int) {
 	for _, k := range ctx.Redis.Keys("ingest:quota:" + tenant + "*") {
 		v, _ := ctx.Redis.Get(k)
 		have, _ := strconv.Atoi(v)
@@ -763,35 +763,35 @@ func fillQuota(ctx *harness.Ctx, tenant string, n int) {
 	}
 }
 
-func mustReserve(ctx *harness.Ctx, tenant, checksum, assetID string) Reservation {
-	got, err := reserve(stateBg, tenant, checksum, assetID)
+func hMustReserve(ctx *harness.Ctx, tenant, checksum, assetID string) Reservation {
+	got, err := reserve(hStateBg, tenant, checksum, assetID)
 	ctx.NoError(err, "reserve(%s, %s, %s) failed", tenant, checksum, assetID)
 	return got
 }
 
 func CheckTenantDedupe(ctx *harness.Ctx) {
-	first := mustReserve(ctx, "t1", stateH1, "a-1")
+	first := hMustReserve(ctx, "t1", hStateH1, "a-1")
 	ctx.Assert(first.Outcome == "reserved" && first.AssetID == "a-1", "the first reservation answered %+v", first)
-	other := mustReserve(ctx, "t2", stateH1, "a-2")
+	other := hMustReserve(ctx, "t2", hStateH1, "a-2")
 	ctx.Assert(other.Outcome == "reserved" && other.AssetID == "a-2", "tenant t2 uploading an image t1 already has was answered %+v: t2 would get an asset id from t1's library. The dedupe key is ingest:dedupe:{tenant}:{checksum}", other)
-	again := mustReserve(ctx, "t1", stateH1, "a-3")
+	again := hMustReserve(ctx, "t1", hStateH1, "a-3")
 	ctx.Assert(again.Outcome == "duplicate" && again.AssetID == "a-1", "t1 uploading its image again was answered %+v, expected duplicate of a-1", again)
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
 	// Another API replica registers the same upload, right after this reserve's first command on the dedupe key.
-	keys := []string{"ingest:dedupe:t1:" + stateH1, "ingest:dedupe:" + stateH1}
+	keys := []string{"ingest:dedupe:t1:" + hStateH1, "ingest:dedupe:" + hStateH1}
 	first := ctx.Redis.After(keys[0], func() any { return ctx.Redis.Set(keys[0], "a-9", "NX", "EX", 86400) })
 	second := ctx.Redis.After(keys[1], func() any { return ctx.Redis.Set(keys[1], "a-9", "NX", "EX", 86400) })
-	got := mustReserve(ctx, "t1", stateH1, "a-1")
+	got := hMustReserve(ctx, "t1", hStateH1, "a-1")
 	ctx.Assert(first.Fired || second.Fired, "reserve touched no dedupe key for the upload")
 	if first.Result == true || second.Result == true {
 		ctx.Assert(got.Outcome == "duplicate" && got.AssetID == "a-9", "another replica reserved the same upload (as a-9) between two of reserve's commands, and reserve answered %+v: both replicas register the image. The check and the mark must run in one script", got)
 	} else {
-		mark, _ := ctx.Redis.Get("ingest:dedupe:t1:" + stateH1)
+		mark, _ := ctx.Redis.Get("ingest:dedupe:t1:" + hStateH1)
 		ctx.Assert(got.Outcome == "reserved" && mark == "a-1", "reserve answered %+v and the mark holds %q", got, mark)
 	}
-	fillQuota(ctx, "t1", 499)
+	hFillQuota(ctx, "t1", 499)
 	counters := ctx.Redis.Keys("ingest:quota:t1*")
 	// Another replica takes the tenant's last reservation of the minute, between this reserve's commands.
 	takeLast := func() any {
@@ -806,18 +806,18 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 	for _, k := range counters {
 		ctx.Redis.After(k, takeLast)
 	}
-	mustReserve(ctx, "t1", stateH2, "a-2")
-	used := quotaUsed(ctx, "t1")
+	hMustReserve(ctx, "t1", hStateH2, "a-2")
+	used := hQuotaUsed(ctx, "t1")
 	ctx.Assert(used <= 500, "two replicas each took the tenant's last reservation of the minute: the counter reads %d. The quota check and the increment must run in one script", used)
 }
 
 func CheckWindowTtl(ctx *harness.Ctx) {
-	freshWindow(ctx)
+	hFreshWindow(ctx)
 	// Each key's TTL, read right after the command that created it: a TTL set by a later command is lost when the replica dies in between.
-	dedupeKey, quotaKey := "ingest:dedupe:t1:"+stateH1, "ingest:quota:t1:"+strconv.FormatInt(ctx.Clock.Now()/60000, 10)
+	dedupeKey, quotaKey := "ingest:dedupe:t1:"+hStateH1, "ingest:quota:t1:"+strconv.FormatInt(ctx.Clock.Now()/60000, 10)
 	dedupe := ctx.Redis.After(dedupeKey, func() any { return ctx.Redis.TTL(dedupeKey) })
 	quota := ctx.Redis.After(quotaKey, func() any { return ctx.Redis.TTL(quotaKey) })
-	mustReserve(ctx, "t1", stateH1, "a-1")
+	hMustReserve(ctx, "t1", hStateH1, "a-1")
 	ctx.Assert(!dedupe.Fired || dedupe.Result != int64(-1), "right after the command that created %s, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script", dedupeKey)
 	ctx.Assert(!quota.Fired || quota.Result != int64(-1), "right after the command that created %s, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script", quotaKey)
 	keys := ctx.Redis.Keys("ingest:*")
@@ -831,39 +831,39 @@ func CheckWindowTtl(ctx *harness.Ctx) {
 			ctx.Assert(ttl > 3600 && ttl <= 86400, "%s expires in %d s, expected a day", key, ttl)
 		}
 	}
-	fillQuota(ctx, "t1", 500)
+	hFillQuota(ctx, "t1", 500)
 	ctx.Clock.Advance(61)
-	later := mustReserve(ctx, "t1", stateH2, "a-2")
+	later := hMustReserve(ctx, "t1", hStateH2, "a-2")
 	ctx.Equal(later.Outcome, "reserved", "a minute after the tenant used its whole quota, a new upload must be reserved (the counter is per minute window); the outcome")
-	ctx.Equal(quotaUsed(ctx, "t1"), 1, "the new window's counters")
+	ctx.Equal(hQuotaUsed(ctx, "t1"), 1, "the new window's counters")
 }
 
 func CheckDuplicateFree(ctx *harness.Ctx) {
-	freshWindow(ctx)
-	mustReserve(ctx, "t1", stateH1, "a-1")
+	hFreshWindow(ctx)
+	hMustReserve(ctx, "t1", hStateH1, "a-1")
 	for n := 2; n <= 4; n++ {
-		again := mustReserve(ctx, "t1", stateH1, "a-"+strconv.Itoa(n))
+		again := hMustReserve(ctx, "t1", hStateH1, "a-"+strconv.Itoa(n))
 		ctx.Assert(again.Outcome == "duplicate" && again.AssetID == "a-1", "a re-upload was answered %+v, expected duplicate of a-1", again)
 	}
-	used := quotaUsed(ctx, "t1")
+	used := hQuotaUsed(ctx, "t1")
 	ctx.Equal(used, 1, "one upload and three re-uploads of it must spend one reservation (a duplicate answers before the counter moves); the reservations spent")
-	fillQuota(ctx, "t1", 500)
-	again := mustReserve(ctx, "t1", stateH1, "a-9")
+	hFillQuota(ctx, "t1", 500)
+	again := hMustReserve(ctx, "t1", hStateH1, "a-9")
 	ctx.Assert(again.Outcome == "duplicate" && again.AssetID == "a-1", "with the quota used up, a re-upload of a registered image was answered %+v: it costs nothing, so it is answered as a duplicate", again)
 }
 
 func CheckRetryAfter(ctx *harness.Ctx) {
-	freshWindow(ctx)
-	mustReserve(ctx, "t1", stateH1, "a-1")
-	fillQuota(ctx, "t1", 499)
-	last := mustReserve(ctx, "t1", "sha256:"+strings.Repeat("c", 64), "a-3")
+	hFreshWindow(ctx)
+	hMustReserve(ctx, "t1", hStateH1, "a-1")
+	hFillQuota(ctx, "t1", 499)
+	last := hMustReserve(ctx, "t1", "sha256:"+strings.Repeat("c", 64), "a-3")
 	ctx.Equal(last.Outcome, "reserved", "the 500th upload of the minute (the quota is 500 reservations a minute)")
-	refused := mustReserve(ctx, "t1", stateH2, "a-2")
+	refused := hMustReserve(ctx, "t1", hStateH2, "a-2")
 	ctx.Equal(refused.Outcome, "throttled", "the 501st upload of the minute")
 	ctx.Assert(refused.RetryAfter >= 57 && refused.RetryAfter <= 59, "one second into the minute a refusal says retry_after %d: it is the seconds left in the window (59), when the counter resets", refused.RetryAfter)
-	ctx.Equal(quotaUsed(ctx, "t1"), 500, "a refused upload must not move the counter")
+	ctx.Equal(hQuotaUsed(ctx, "t1"), 500, "a refused upload must not move the counter")
 	ctx.Clock.Advance(float64(refused.RetryAfter))
-	later := mustReserve(ctx, "t1", stateH2, "a-2")
+	later := hMustReserve(ctx, "t1", hStateH2, "a-2")
 	ctx.Equal(later.Outcome, "reserved", "retried after retry_after the upload must be reserved (a refusal leaves no mark); the outcome")
 }
 `,
@@ -878,16 +878,16 @@ const std::string kH1 = "sha256:" + std::string(64, 'a');
 const std::string kH2 = "sha256:" + std::string(64, 'b');
 
 // One second into a minute window, so a check never straddles two.
-void freshWindow(harness::Ctx& ctx) { ctx.Clock.Advance(60 - static_cast<double>(ctx.Clock.Now() % 60000) / 1000 + 1); }
+void hFreshWindow(harness::Ctx& ctx) { ctx.Clock.Advance(60 - static_cast<double>(ctx.Clock.Now() % 60000) / 1000 + 1); }
 
-long long quotaUsed(harness::Ctx& ctx, const std::string& tenant) {
+long long hQuotaUsed(harness::Ctx& ctx, const std::string& tenant) {
   long long used = 0;
   for (const auto& k : ctx.Redis.Keys("ingest:quota:" + tenant + "*")) used += std::stoll(ctx.Redis.Get(k).value_or("0"));
   return used;
 }
 
 // Every counter of the tenant at n: the tenant has used its minute.
-void fillQuota(harness::Ctx& ctx, const std::string& tenant, long long n) {
+void hFillQuota(harness::Ctx& ctx, const std::string& tenant, long long n) {
   for (const auto& k : ctx.Redis.Keys("ingest:quota:" + tenant + "*")) ctx.Redis.Do("INCRBY", k, n - std::stoll(ctx.Redis.Get(k).value_or("0")));
 }
 
@@ -924,7 +924,7 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
     const std::string mark = ctx.Redis.Get("ingest:dedupe:t1:" + kH1).value_or("");
     ctx.Assert(got.outcome == "reserved" && mark == "a-1", "reserve answered %s %s and the mark holds %q", got.outcome, got.asset_id, mark);
   }
-  fillQuota(ctx, "t1", 499);
+  hFillQuota(ctx, "t1", 499);
   const std::vector<std::string> counters = ctx.Redis.Keys("ingest:quota:t1*");
   // Another replica takes the tenant's last reservation of the minute, between this reserve's commands.
   for (const auto& k : counters) {
@@ -934,12 +934,12 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
     });
   }
   reserve("t1", kH2, "a-2");
-  const long long used = quotaUsed(ctx, "t1");
+  const long long used = hQuotaUsed(ctx, "t1");
   ctx.Assert(used <= 500, "two replicas each took the tenant's last reservation of the minute: the counter reads %d. The quota check and the increment must run in one script", used);
 }
 
 void CheckWindowTtl(harness::Ctx& ctx) {
-  freshWindow(ctx);
+  hFreshWindow(ctx);
   // Each key's TTL, read right after the command that created it: a TTL set by a later command is lost when the replica dies in between.
   const std::vector<std::string> created = {"ingest:dedupe:t1:" + kH1, "ingest:quota:t1:" + std::to_string(ctx.Clock.Now() / 60000)};
   std::vector<long long> ttls(created.size(), -2);
@@ -956,22 +956,22 @@ void CheckWindowTtl(harness::Ctx& ctx) {
     if (key.rfind("ingest:quota:", 0) == 0) ctx.Assert(ttl <= 60, "%s expires in %d s: a counter lives as long as its minute window", key, ttl);
     else ctx.Assert(ttl > 3600 && ttl <= 86400, "%s expires in %d s, expected a day", key, ttl);
   }
-  fillQuota(ctx, "t1", 500);
+  hFillQuota(ctx, "t1", 500);
   ctx.Clock.Advance(61);
   const Reservation later = reserve("t1", kH2, "a-2");
   ctx.Equal(later.outcome, "reserved", "a minute after the tenant used its whole quota, a new upload must be reserved (the counter is per minute window); the outcome");
-  ctx.Equal(quotaUsed(ctx, "t1"), 1, "the new window's counters");
+  ctx.Equal(hQuotaUsed(ctx, "t1"), 1, "the new window's counters");
 }
 
 void CheckDuplicateFree(harness::Ctx& ctx) {
-  freshWindow(ctx);
+  hFreshWindow(ctx);
   reserve("t1", kH1, "a-1");
   for (int n = 2; n <= 4; n++) {
     const Reservation again = reserve("t1", kH1, "a-" + std::to_string(n));
     ctx.Assert(again.outcome == "duplicate" && again.asset_id == "a-1", "a re-upload was answered %s %s, expected duplicate of a-1", again.outcome, again.asset_id);
   }
-  ctx.Equal(quotaUsed(ctx, "t1"), 1, "one upload and three re-uploads of it must spend one reservation (a duplicate answers before the counter moves); the reservations spent");
-  fillQuota(ctx, "t1", 500);
+  ctx.Equal(hQuotaUsed(ctx, "t1"), 1, "one upload and three re-uploads of it must spend one reservation (a duplicate answers before the counter moves); the reservations spent");
+  hFillQuota(ctx, "t1", 500);
   const Reservation again = reserve("t1", kH1, "a-9");
   ctx.Assert(again.outcome == "duplicate" && again.asset_id == "a-1",
              "with the quota used up, a re-upload of a registered image was answered %s %s: it costs nothing, so it is answered as a duplicate", again.outcome,
@@ -979,16 +979,16 @@ void CheckDuplicateFree(harness::Ctx& ctx) {
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {
-  freshWindow(ctx);
+  hFreshWindow(ctx);
   reserve("t1", kH1, "a-1");
-  fillQuota(ctx, "t1", 499);
+  hFillQuota(ctx, "t1", 499);
   const Reservation last = reserve("t1", "sha256:" + std::string(64, 'c'), "a-3");
   ctx.Equal(last.outcome, "reserved", "the 500th upload of the minute (the quota is 500 reservations a minute)");
   const Reservation refused = reserve("t1", kH2, "a-2");
   ctx.Equal(refused.outcome, "throttled", "the 501st upload of the minute");
   ctx.Assert(refused.retry_after >= 57 && refused.retry_after <= 59,
              "one second into the minute a refusal says retry_after %d: it is the seconds left in the window (59), when the counter resets", refused.retry_after);
-  ctx.Equal(quotaUsed(ctx, "t1"), 500, "a refused upload must not move the counter");
+  ctx.Equal(hQuotaUsed(ctx, "t1"), 500, "a refused upload must not move the counter");
   ctx.Clock.Advance(static_cast<double>(refused.retry_after));
   const Reservation later = reserve("t1", kH2, "a-2");
   ctx.Equal(later.outcome, "reserved", "retried after retry_after the upload must be reserved (a refusal leaves no mark); the outcome");

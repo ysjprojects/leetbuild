@@ -1069,14 +1069,14 @@ import (
 	"leetbuild/harness"
 )
 
-// budgetGateway is budgetGuard wrapped around a route the harness registers, counting what got through.
-type budgetGateway struct {
+// HBudgetGateway is budgetGuard wrapped around a route the harness registers, counting what got through.
+type HBudgetGateway struct {
 	served int
 	http   *harness.HTTP
 }
 
-func newBudgetGateway(ctx *harness.Ctx) *budgetGateway {
-	g := &budgetGateway{}
+func hNewBudgetGateway(ctx *harness.Ctx) *HBudgetGateway {
+	g := &HBudgetGateway{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat", func(rw http.ResponseWriter, r *http.Request) {
 		g.served++
@@ -1087,24 +1087,24 @@ func newBudgetGateway(ctx *harness.Ctx) *budgetGateway {
 	return g
 }
 
-func budgetDay(ctx *harness.Ctx) string {
+func hBudgetDay(ctx *harness.Ctx) string {
 	return time.UnixMilli(ctx.Clock.Now()).UTC().Format("20060102")
 }
 
-// budgetBody is a request worth contentChars / 4 + max_tokens tokens.
-func budgetBody(tokens, contentChars int) string {
+// hBudgetBody is a request worth contentChars / 4 + max_tokens tokens.
+func hBudgetBody(tokens, contentChars int) string {
 	return fmt.Sprintf(\`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"%s"}],"max_tokens":%d}\`, strings.Repeat("x", contentChars), tokens-contentChars/4)
 }
 
-func budgetValue(ctx *harness.Ctx, key string) int {
+func hBudgetValue(ctx *harness.Ctx, key string) int {
 	v, _ := ctx.Redis.Get(key)
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	g := newBudgetGateway(ctx)
-	key := "budget:acme:" + budgetDay(ctx)
+	g := hNewBudgetGateway(ctx)
+	key := "budget:acme:" + hBudgetDay(ctx)
 	ctx.Redis.Set(key, 10000)
 	// Another gateway replica lands right after the first command that touches the budget, between a
 	// client-side read and its decrement, and spends everything that is left.
@@ -1113,25 +1113,25 @@ func CheckAtomic(ctx *harness.Ctx) {
 		fired = true
 		return ctx.Redis.Do("SET", key, 0)
 	})
-	g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Assert(fired, "a request from acme never touched %s: the budget lives in budget:{tenant}:{yyyymmdd} (keys: %v)", key, ctx.Redis.Keys("budget:*"))
-	left := budgetValue(ctx, key)
+	left := hBudgetValue(ctx, key)
 	ctx.Assert(left >= 0, "%s holds %d after another replica emptied it between your read and your decrement: both requests spent the same budget. Read, compare and decrement inside one Lua script", key, left)
 	ctx.Equal(left, 0, "%s after another replica set it to 0 between your commands (the replica's update was lost; read, compare and decrement inside one Lua script)", key)
-	second := g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	second := g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Equal(second.Status, 429, "with the budget emptied by another replica the next request")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	g := newBudgetGateway(ctx)
-	key := "budget:acme:" + budgetDay(ctx)
+	g := hNewBudgetGateway(ctx)
+	key := "budget:acme:" + hBudgetDay(ctx)
 	// The TTL as another replica would see it right after the command that created the key.
 	seen := []int64{}
 	ctx.Redis.After(key, func() any {
 		seen = append(seen, int64(ctx.Redis.TTL(key)))
 		return nil
 	})
-	r := g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	r := g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Equal(r.Status, 200, "the first request of the day (%s)", r.Text())
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("budget:*"))
 	ctx.Assert(len(seen) > 0 && seen[0] > 0, "right after the command that created %s its TTL was %v: a key created without its expiry lives forever if the next command never comes. Create it with its expiry in the same script", key, seen)
@@ -1140,49 +1140,49 @@ func CheckTtl(ctx *harness.Ctx) {
 	midnight := 86400 - (ctx.Clock.Now()/1000)%86400
 	ctx.Assert(ttl-midnight <= 2 && midnight-ttl <= 2, "%s expires in %d s, expected the %d s left until midnight UTC", key, ttl, midnight)
 	ctx.Clock.Advance(100)
-	g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	later := ctx.Redis.TTL(key)
 	want := midnight - 100
 	ctx.Assert(later-want <= 2 && want-later <= 2, "after 100 s and a second reservation the TTL is %d s, expected about %d: the expiry is set when the key is created, a reservation must not extend it", later, want)
 }
 
 func CheckRejectHeaders(ctx *harness.Ctx) {
-	g := newBudgetGateway(ctx)
-	key := "budget:acme:" + budgetDay(ctx)
+	g := hNewBudgetGateway(ctx)
+	key := "budget:acme:" + hBudgetDay(ctx)
 	ctx.Redis.Do("SET", key, 50, "EX", 1234)
-	r := g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	r := g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Equal(r.Status, 429, "a request worth 164 tokens against 50 remaining")
 	ctx.Equal(g.served, 0, "a rejected request must not reach the route behind the guard; the route ran")
 	retry := r.Header.Get("Retry-After")
 	ctx.Assert(retry == "1234" || retry == "1233", "Retry-After is %q, expected the key's TTL (1234 s)", retry)
 	ctx.Equal(r.Header.Get("X-RateLimit-Remaining"), "50", "X-RateLimit-Remaining")
-	ctx.Equal(budgetValue(ctx, key), 50, "a rejected request must not spend; %s", key)
-	small := g.http.Post("/v1/chat", budgetBody(2, 4), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	ctx.Equal(hBudgetValue(ctx, key), 50, "a rejected request must not spend; %s", key)
+	small := g.http.Post("/v1/chat", hBudgetBody(2, 4), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status)
-	ctx.Equal(budgetValue(ctx, key), 48, "after a 2-token reservation %s", key)
-	exact := g.http.Post("/v1/chat", budgetBody(48, 4), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	ctx.Equal(hBudgetValue(ctx, key), 48, "after a 2-token reservation %s", key)
+	exact := g.http.Post("/v1/chat", hBudgetBody(48, 4), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d, expected 200", exact.Status)
-	ctx.Equal(budgetValue(ctx, key), 0, "after spending the last 48 tokens %s", key)
-	empty := g.http.Post("/v1/chat", budgetBody(1, 0), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	ctx.Equal(hBudgetValue(ctx, key), 0, "after spending the last 48 tokens %s", key)
+	empty := g.http.Post("/v1/chat", hBudgetBody(1, 0), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Assert(empty.Status == 429 && empty.Header.Get("X-RateLimit-Remaining") == "0", "one token against an empty budget answered %d with X-RateLimit-Remaining %q, expected 429 and 0", empty.Status, empty.Header.Get("X-RateLimit-Remaining"))
-	huge := g.http.Post("/v1/chat", budgetBody(1_000_001, 400), "Authorization", "Bearer beta", "Content-Type", "application/json")
+	huge := g.http.Post("/v1/chat", hBudgetBody(1_000_001, 400), "Authorization", "Bearer beta", "Content-Type", "application/json")
 	ctx.Assert(huge.Status == 429 && g.served == 2, "beta's first request of the day, worth 1000001 tokens against a fresh 1000000 budget, answered %d, expected 429: the first reservation is compared too", huge.Status)
 	ctx.Equal(huge.Header.Get("X-RateLimit-Remaining"), "1000000", "X-RateLimit-Remaining for beta's oversized first request")
 }
 
 func CheckTenantDayKey(ctx *harness.Ctx) {
-	g := newBudgetGateway(ctx)
-	today := budgetDay(ctx)
-	g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
-	g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer beta", "Content-Type", "application/json")
+	g := hNewBudgetGateway(ctx)
+	today := hBudgetDay(ctx)
+	g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer beta", "Content-Type", "application/json")
 	ctx.Equal(ctx.Redis.Keys("budget:*"), []string{"budget:acme:" + today, "budget:beta:" + today}, "after one request each from acme and beta the budget keys")
-	ctx.Equal(budgetValue(ctx, "budget:acme:"+today), 1_000_000-164, "budget:acme:%s (1000000 - 164)", today)
+	ctx.Equal(hBudgetValue(ctx, "budget:acme:"+today), 1_000_000-164, "budget:acme:%s (1000000 - 164)", today)
 	ctx.Clock.Advance(86400)
-	tomorrow := budgetDay(ctx)
-	r := g.http.Post("/v1/chat", budgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
+	tomorrow := hBudgetDay(ctx)
+	r := g.http.Post("/v1/chat", hBudgetBody(164, 400), "Authorization", "Bearer acme", "Content-Type", "application/json")
 	ctx.Equal(r.Status, 200, "the first request of the next day")
 	ctx.Assert(ctx.Redis.Exists("budget:acme:"+tomorrow) == 1, "the next day's request must open budget:acme:%s; keys: %v", tomorrow, ctx.Redis.Keys("budget:*"))
-	ctx.Equal(budgetValue(ctx, "budget:acme:"+tomorrow), 1_000_000-164, "the next day starts from a full budget; budget:acme:%s", tomorrow)
+	ctx.Equal(hBudgetValue(ctx, "budget:acme:"+tomorrow), 1_000_000-164, "the next day starts from a full budget; budget:acme:%s", tomorrow)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1195,12 +1195,12 @@ func CheckTenantDayKey(ctx *harness.Ctx) {
 namespace {
 
 // budget_guard wrapped around a route the harness registers, counting what got through.
-struct BudgetGateway {
+struct HBudgetGateway {
   int served = 0;
   httplib::Server svr;
   harness::HTTP http;
 
-  explicit BudgetGateway(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+  explicit HBudgetGateway(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
     svr.set_pre_routing_handler(budget_guard);
     svr.Post("/v1/chat", [this](const httplib::Request&, httplib::Response& res) {
       served++;
@@ -1213,7 +1213,7 @@ struct BudgetGateway {
   }
 };
 
-std::string budgetDay(harness::Ctx& ctx) {
+std::string hBudgetDay(harness::Ctx& ctx) {
   const std::time_t t = ctx.Clock.Now() / 1000;
   char day[9];
   std::strftime(day, sizeof day, "%Y%m%d", std::gmtime(&t));
@@ -1221,12 +1221,12 @@ std::string budgetDay(harness::Ctx& ctx) {
 }
 
 // A request worth content_chars / 4 + max_tokens tokens.
-std::string budgetBody(int tokens, int content_chars = 400) {
+std::string hBudgetBody(int tokens, int content_chars = 400) {
   return R"({"model":"gpt-4o-mini","messages":[{"role":"user","content":")" + std::string(content_chars, 'x') +
          R"("}],"max_tokens":)" + std::to_string(tokens - content_chars / 4) + "}";
 }
 
-long long budgetValue(harness::Ctx& ctx, const std::string& key) {
+long long hBudgetValue(harness::Ctx& ctx, const std::string& key) {
   const auto v = ctx.Redis.Get(key);
   return v ? std::atoll(v->c_str()) : -1;
 }
@@ -1234,8 +1234,8 @@ long long budgetValue(harness::Ctx& ctx, const std::string& key) {
 }  // namespace
 
 void CheckAtomic(harness::Ctx& ctx) {
-  BudgetGateway g(ctx);
-  const std::string key = "budget:acme:" + budgetDay(ctx);
+  HBudgetGateway g(ctx);
+  const std::string key = "budget:acme:" + hBudgetDay(ctx);
   ctx.Redis.Set(key, 10000);
   // Another gateway replica lands right after the first command that touches the budget, between a
   // client-side read and its decrement, and spends everything that is left.
@@ -1244,22 +1244,22 @@ void CheckAtomic(harness::Ctx& ctx) {
     fired = true;
     ctx.Redis.Do("SET", key, 0);
   });
-  g.chat(budgetBody(164));
+  g.chat(hBudgetBody(164));
   ctx.Assert(fired, "a request from acme never touched %s: the budget lives in budget:{tenant}:{yyyymmdd} (keys: %v)", key, ctx.Redis.Keys("budget:*"));
-  const long long left = budgetValue(ctx, key);
+  const long long left = hBudgetValue(ctx, key);
   ctx.Assert(left >= 0, "%s holds %d after another replica emptied it between your read and your decrement: both requests spent the same budget. Read, compare and decrement inside one Lua script", key, left);
   ctx.Equal(left, 0, "%s after another replica set it to 0 between your commands (the replica's update was lost; read, compare and decrement inside one Lua script)", key);
-  const auto second = g.chat(budgetBody(164));
+  const auto second = g.chat(hBudgetBody(164));
   ctx.Equal(second.Status, 429, "with the budget emptied by another replica the next request");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  BudgetGateway g(ctx);
-  const std::string key = "budget:acme:" + budgetDay(ctx);
+  HBudgetGateway g(ctx);
+  const std::string key = "budget:acme:" + hBudgetDay(ctx);
   // The TTL as another replica would see it right after the command that created the key.
   std::vector<long long> seen;
   ctx.Redis.After(key, [&] { seen.push_back(ctx.Redis.TTL(key)); });
-  const auto r = g.chat(budgetBody(164));
+  const auto r = g.chat(hBudgetBody(164));
   ctx.Equal(r.Status, 200, "the first request of the day (%s)", r.Text());
   ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("budget:*"));
   ctx.Assert(!seen.empty() && seen[0] > 0, "right after the command that created %s its TTL was %d: a key created without its expiry lives forever if the next command never comes. Create it with its expiry in the same script", key, seen.empty() ? -2 : seen[0]);
@@ -1268,50 +1268,50 @@ void CheckTtl(harness::Ctx& ctx) {
   const long long midnight = 86400 - (ctx.Clock.Now() / 1000) % 86400;
   ctx.Assert(std::llabs(ttl - midnight) <= 2, "%s expires in %d s, expected the %d s left until midnight UTC", key, ttl, midnight);
   ctx.Clock.Advance(100);
-  g.chat(budgetBody(164));
+  g.chat(hBudgetBody(164));
   const long long later = ctx.Redis.TTL(key);
   ctx.Assert(std::llabs(later - (midnight - 100)) <= 2, "after 100 s and a second reservation the TTL is %d s, expected about %d: the expiry is set when the key is created, a reservation must not extend it", later, midnight - 100);
 }
 
 void CheckRejectHeaders(harness::Ctx& ctx) {
-  BudgetGateway g(ctx);
-  const std::string key = "budget:acme:" + budgetDay(ctx);
+  HBudgetGateway g(ctx);
+  const std::string key = "budget:acme:" + hBudgetDay(ctx);
   ctx.Redis.Do("SET", key, 50, "EX", 1234);
-  const auto r = g.chat(budgetBody(164));
+  const auto r = g.chat(hBudgetBody(164));
   ctx.Equal(r.Status, 429, "a request worth 164 tokens against 50 remaining");
   ctx.Equal(g.served, 0, "a rejected request must not reach the route behind the guard; the route ran");
   const std::string retry = r.HeaderValue("Retry-After");
   ctx.Assert(retry == "1234" || retry == "1233", "Retry-After is %q, expected the key's TTL (1234 s)", retry);
   ctx.Equal(r.HeaderValue("X-RateLimit-Remaining"), "50", "X-RateLimit-Remaining");
-  ctx.Equal(budgetValue(ctx, key), 50, "a rejected request must not spend; %s", key);
-  const auto small = g.chat(budgetBody(2, 4));
+  ctx.Equal(hBudgetValue(ctx, key), 50, "a rejected request must not spend; %s", key);
+  const auto small = g.chat(hBudgetBody(2, 4));
   ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status);
-  ctx.Equal(budgetValue(ctx, key), 48, "after a 2-token reservation %s", key);
-  const auto exact = g.chat(budgetBody(48, 4));
+  ctx.Equal(hBudgetValue(ctx, key), 48, "after a 2-token reservation %s", key);
+  const auto exact = g.chat(hBudgetBody(48, 4));
   ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d, expected 200", exact.Status);
-  ctx.Equal(budgetValue(ctx, key), 0, "after spending the last 48 tokens %s", key);
-  const auto empty = g.chat(budgetBody(1, 0));
+  ctx.Equal(hBudgetValue(ctx, key), 0, "after spending the last 48 tokens %s", key);
+  const auto empty = g.chat(hBudgetBody(1, 0));
   ctx.Assert(empty.Status == 429 && empty.HeaderValue("X-RateLimit-Remaining") == "0", "one token against an empty budget answered %d with X-RateLimit-Remaining %q, expected 429 and 0", empty.Status, empty.HeaderValue("X-RateLimit-Remaining"));
-  const auto huge = g.chat(budgetBody(1000001), "beta");
+  const auto huge = g.chat(hBudgetBody(1000001), "beta");
   ctx.Assert(huge.Status == 429 && g.served == 2, "beta's first request of the day, worth 1000001 tokens against a fresh 1000000 budget, answered %d, expected 429: the first reservation is compared too", huge.Status);
   ctx.Equal(huge.HeaderValue("X-RateLimit-Remaining"), "1000000", "X-RateLimit-Remaining for beta's oversized first request");
 }
 
 void CheckTenantDayKey(harness::Ctx& ctx) {
-  BudgetGateway g(ctx);
-  const std::string today = budgetDay(ctx);
-  g.chat(budgetBody(164));
-  g.chat(budgetBody(164), "beta");
+  HBudgetGateway g(ctx);
+  const std::string today = hBudgetDay(ctx);
+  g.chat(hBudgetBody(164));
+  g.chat(hBudgetBody(164), "beta");
   auto keys = ctx.Redis.Keys("budget:*");
   std::sort(keys.begin(), keys.end());
   ctx.Equal(keys, {"budget:acme:" + today, "budget:beta:" + today}, "after one request each from acme and beta the budget keys");
-  ctx.Equal(budgetValue(ctx, "budget:acme:" + today), 1000000 - 164, "budget:acme:%s (1000000 - 164)", today);
+  ctx.Equal(hBudgetValue(ctx, "budget:acme:" + today), 1000000 - 164, "budget:acme:%s (1000000 - 164)", today);
   ctx.Clock.Advance(86400);
-  const std::string tomorrow = budgetDay(ctx);
-  const auto r = g.chat(budgetBody(164));
+  const std::string tomorrow = hBudgetDay(ctx);
+  const auto r = g.chat(hBudgetBody(164));
   ctx.Equal(r.Status, 200, "the first request of the next day");
   ctx.Assert(ctx.Redis.Exists("budget:acme:" + tomorrow) == 1, "the next day's request must open budget:acme:%s; keys: %v", tomorrow, ctx.Redis.Keys("budget:*"));
-  ctx.Equal(budgetValue(ctx, "budget:acme:" + tomorrow), 1000000 - 164, "the next day starts from a full budget; budget:acme:%s", tomorrow);
+  ctx.Equal(hBudgetValue(ctx, "budget:acme:" + tomorrow), 1000000 - 164, "the next day starts from a full budget; budget:acme:%s", tomorrow);
 }
 `,
   },

@@ -710,18 +710,18 @@ import (
 	"leetbuild/harness"
 )
 
-func setup(ctx *harness.Ctx, shards []int) string {
+func hSetup(ctx *harness.Ctx, shards []int) string {
 	replication, err := store.Create(context.Background(), "ops-a", "us-east-1", "eu-west-1", shards, "source-wins")
 	ctx.NoError(err, "store.Create")
 	return replication.ID
 }
 
-func shardAt(ctx *harness.Ctx, rid string, shard int, offset, head int64) {
+func hShardAt(ctx *harness.Ctx, rid string, shard int, offset, head int64) {
 	ctx.Redis.Set(fmt.Sprintf("offset:%s:%d", rid, shard), offset)
 	ctx.Redis.Set(fmt.Sprintf("head:%s:%d", rid, shard), head)
 }
 
-func rows(ctx *harness.Ctx, region string, shard int, kv ...string) {
+func hRows(ctx *harness.Ctx, region string, shard int, kv ...string) {
 	args := []any{"HSET", fmt.Sprintf("digest:%s:%d", region, shard)}
 	for _, s := range kv {
 		args = append(args, s)
@@ -729,13 +729,13 @@ func rows(ctx *harness.Ctx, region string, shard int, kv ...string) {
 	ctx.Redis.Do(args...)
 }
 
-func lag(ctx *harness.Ctx, rid string, header ...string) *harness.Response {
+func hLag(ctx *harness.Ctx, rid string, header ...string) *harness.Response {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux).Get("/v1/replications/"+rid+"/lag", header...)
 }
 
-type lagBody struct {
+type HLagBody struct {
 	ReplicationID   string \`json:"replication_id"\`
 	SampledKeys     int    \`json:"sampled_keys"\`
 	DivergentShards []int  \`json:"divergent_shards"\`
@@ -749,34 +749,34 @@ type lagBody struct {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	rid := setup(ctx, []int{0})
-	shardAt(ctx, rid, 0, 5, 5)
-	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
+	rid := hSetup(ctx, []int{0})
+	hShardAt(ctx, rid, 0, 5, 5)
+	r := hLag(ctx, rid, "X-Operator-Id", "ops-a")
 	ctx.Equal(r.Status, 200, "GET /v1/replications/%s/lag (%s)", rid, r.Text())
-	var body lagBody
+	var body HLagBody
 	r.Decode(&body)
 	ctx.Equal(body.ReplicationID, rid, "the lag read must name the replication")
 }
 
 func CheckOwner404(ctx *harness.Ctx) {
-	rid := setup(ctx, []int{0})
-	shardAt(ctx, rid, 0, 5, 5)
-	r := lag(ctx, rid, "X-Operator-Id", "ops-b")
+	rid := hSetup(ctx, []int{0})
+	hShardAt(ctx, rid, 0, 5, 5)
+	r := hLag(ctx, rid, "X-Operator-Id", "ops-b")
 	ctx.Equal(r.Status, 404, "another operator read %s: a guessed id must reveal nothing", rid)
-	r = lag(ctx, rid)
+	r = hLag(ctx, rid)
 	ctx.Equal(r.Status, 401, "a read without X-Operator-Id")
-	r = lag(ctx, rid, "X-Operator-Id", "ops-a")
+	r = hLag(ctx, rid, "X-Operator-Id", "ops-a")
 	ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text())
 }
 
 func CheckPerShardLag(ctx *harness.Ctx) {
-	rid := setup(ctx, []int{0, 1, 2})
-	shardAt(ctx, rid, 0, 90, 100)
-	shardAt(ctx, rid, 1, 50, 50)
-	shardAt(ctx, rid, 2, 70, 60) // the head was sampled before the last confirmation
-	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
+	rid := hSetup(ctx, []int{0, 1, 2})
+	hShardAt(ctx, rid, 0, 90, 100)
+	hShardAt(ctx, rid, 1, 50, 50)
+	hShardAt(ctx, rid, 2, 70, 60) // the head was sampled before the last confirmation
+	r := hLag(ctx, rid, "X-Operator-Id", "ops-a")
 	ctx.Equal(r.Status, 200, "the lag read (%s)", r.Text())
-	var body lagBody
+	var body HLagBody
 	r.Decode(&body)
 	ctx.Assert(len(body.Shards) == 3, "the response must list the three shards, got %s. One number cannot say which shard is behind", r.Text())
 	var seen [][4]int64
@@ -787,25 +787,25 @@ func CheckPerShardLag(ctx *harness.Ctx) {
 }
 
 func CheckDivergentShards(ctx *harness.Ctx) {
-	rid := setup(ctx, []int{0, 1, 2, 3})
-	shardAt(ctx, rid, 0, 30, 40) // shard 0 is behind and holds a stale row
+	rid := hSetup(ctx, []int{0, 1, 2, 3})
+	hShardAt(ctx, rid, 0, 30, 40) // shard 0 is behind and holds a stale row
 	for _, shard := range []int{1, 2, 3} {
-		shardAt(ctx, rid, shard, 40, 40)
+		hShardAt(ctx, rid, shard, 40, 40)
 	}
-	rows(ctx, "us-east-1", 0, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
-	rows(ctx, "eu-west-1", 0, "orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3")
-	rows(ctx, "us-east-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
-	rows(ctx, "eu-west-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
-	rows(ctx, "us-east-1", 2, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
-	rows(ctx, "eu-west-1", 2, "orders/a", "d1", "orders/b", "d2")
+	hRows(ctx, "us-east-1", 0, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	hRows(ctx, "eu-west-1", 0, "orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3")
+	hRows(ctx, "us-east-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	hRows(ctx, "eu-west-1", 1, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	hRows(ctx, "us-east-1", 2, "orders/a", "d1", "orders/b", "d2", "orders/c", "d3")
+	hRows(ctx, "eu-west-1", 2, "orders/a", "d1", "orders/b", "d2")
 	var many []string
 	for i := 0; i < 300; i++ {
 		many = append(many, fmt.Sprintf("orders/k%03d", i), fmt.Sprintf("d%d", i))
 	}
-	rows(ctx, "us-east-1", 3, many...)
-	rows(ctx, "eu-west-1", 3, append(many, "orders/k100", "stale", "orders/k299", "stale")...)
-	r := lag(ctx, rid, "X-Operator-Id", "ops-a")
-	var body lagBody
+	hRows(ctx, "us-east-1", 3, many...)
+	hRows(ctx, "eu-west-1", 3, append(many, "orders/k100", "stale", "orders/k299", "stale")...)
+	r := hLag(ctx, rid, "X-Operator-Id", "ops-a")
+	var body HLagBody
 	r.Decode(&body)
 	ctx.Equal(body.DivergentShards, []int{0, 2, 3}, "shard 0 holds a stale row 10 changes behind, shard 2 misses one at zero lag, shard 3 differs at its 101st key (%s); divergent_shards", r.Text())
 	ctx.Equal(body.SampledKeys, 256, "sampled_keys must be SAMPLE_KEYS, the sample size")
@@ -830,20 +830,20 @@ func CheckDivergentShards(ctx *harness.Ctx) {
 
 namespace {
 
-std::string setup(const std::vector<int>& shards) { return store::create("ops-a", "us-east-1", "eu-west-1", shards, "source-wins").id; }
+std::string hSetup(const std::vector<int>& shards) { return store::create("ops-a", "us-east-1", "eu-west-1", shards, "source-wins").id; }
 
-void shardAt(harness::Ctx& ctx, const std::string& rid, int shard, long long offset, long long head) {
+void hShardAt(harness::Ctx& ctx, const std::string& rid, int shard, long long offset, long long head) {
   ctx.Redis.Set("offset:" + rid + ":" + std::to_string(shard), std::to_string(offset));
   ctx.Redis.Set("head:" + rid + ":" + std::to_string(shard), std::to_string(head));
 }
 
-void rows(harness::Ctx& ctx, const std::string& region, int shard, const std::vector<std::string>& kv) {
+void hRows(harness::Ctx& ctx, const std::string& region, int shard, const std::vector<std::string>& kv) {
   std::vector<std::string> args = {"HSET", "digest:" + region + ":" + std::to_string(shard)};
   args.insert(args.end(), kv.begin(), kv.end());
   ctx.Redis.Must(args);
 }
 
-harness::Response lag(harness::Ctx& ctx, const std::string& rid, const std::string& op) {
+harness::Response hLag(harness::Ctx& ctx, const std::string& rid, const std::string& op) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -853,9 +853,9 @@ harness::Response lag(harness::Ctx& ctx, const std::string& rid, const std::stri
   return c.Get("/v1/replications/" + rid + "/lag", "X-Operator-Id", op);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-nlohmann::json shardEntry(const nlohmann::json& body, int shard) {
+nlohmann::json hShardEntry(const nlohmann::json& body, int shard) {
   if (body.is_object() && body.contains("shards") && body["shards"].is_array()) {
     for (const auto& s : body["shards"]) {
       if (s.value("shard", -1) == shard) return s;
@@ -867,31 +867,31 @@ nlohmann::json shardEntry(const nlohmann::json& body, int shard) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string rid = setup({0});
-  shardAt(ctx, rid, 0, 5, 5);
-  const auto r = lag(ctx, rid, "ops-a");
+  const std::string rid = hSetup({0});
+  hShardAt(ctx, rid, 0, 5, 5);
+  const auto r = hLag(ctx, rid, "ops-a");
   ctx.Equal(r.Status, 200, "GET /v1/replications/%s/lag (%s)", rid, r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.value("replication_id", "") == rid, "the lag read must name the replication, got %s", r.Text());
 }
 
 void CheckOwner404(harness::Ctx& ctx) {
-  const std::string rid = setup({0});
-  shardAt(ctx, rid, 0, 5, 5);
-  ctx.Equal(lag(ctx, rid, "ops-b").Status, 404, "another operator read %s: a guessed id must reveal nothing", rid);
-  ctx.Equal(lag(ctx, rid, "").Status, 401, "a read without X-Operator-Id");
-  const auto r = lag(ctx, rid, "ops-a");
+  const std::string rid = hSetup({0});
+  hShardAt(ctx, rid, 0, 5, 5);
+  ctx.Equal(hLag(ctx, rid, "ops-b").Status, 404, "another operator read %s: a guessed id must reveal nothing", rid);
+  ctx.Equal(hLag(ctx, rid, "").Status, 401, "a read without X-Operator-Id");
+  const auto r = hLag(ctx, rid, "ops-a");
   ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text());
 }
 
 void CheckPerShardLag(harness::Ctx& ctx) {
-  const std::string rid = setup({0, 1, 2});
-  shardAt(ctx, rid, 0, 90, 100);
-  shardAt(ctx, rid, 1, 50, 50);
-  shardAt(ctx, rid, 2, 70, 60);  // the head was sampled before the last confirmation
-  const auto r = lag(ctx, rid, "ops-a");
+  const std::string rid = hSetup({0, 1, 2});
+  hShardAt(ctx, rid, 0, 90, 100);
+  hShardAt(ctx, rid, 1, 50, 50);
+  hShardAt(ctx, rid, 2, 70, 60);  // the head was sampled before the last confirmation
+  const auto r = hLag(ctx, rid, "ops-a");
   ctx.Equal(r.Status, 200, "the lag read (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.contains("shards") && body["shards"].is_array() && body["shards"].size() == 3,
              "the response must list the three shards, got %s. One number cannot say which shard is behind", r.Text());
   std::vector<std::vector<long long>> seen;
@@ -903,36 +903,36 @@ void CheckPerShardLag(harness::Ctx& ctx) {
 }
 
 void CheckDivergentShards(harness::Ctx& ctx) {
-  const std::string rid = setup({0, 1, 2, 3});
-  shardAt(ctx, rid, 0, 30, 40);  // shard 0 is behind and holds a stale row
-  for (const int shard : {1, 2, 3}) shardAt(ctx, rid, shard, 40, 40);
+  const std::string rid = hSetup({0, 1, 2, 3});
+  hShardAt(ctx, rid, 0, 30, 40);  // shard 0 is behind and holds a stale row
+  for (const int shard : {1, 2, 3}) hShardAt(ctx, rid, shard, 40, 40);
   const std::vector<std::string> all = {"orders/a", "d1", "orders/b", "d2", "orders/c", "d3"};
-  rows(ctx, "us-east-1", 0, all);
-  rows(ctx, "eu-west-1", 0, {"orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3"});
-  rows(ctx, "us-east-1", 1, all);
-  rows(ctx, "eu-west-1", 1, all);
-  rows(ctx, "us-east-1", 2, all);
-  rows(ctx, "eu-west-1", 2, {"orders/a", "d1", "orders/b", "d2"});
+  hRows(ctx, "us-east-1", 0, all);
+  hRows(ctx, "eu-west-1", 0, {"orders/a", "d1", "orders/b", "d2-stale", "orders/c", "d3"});
+  hRows(ctx, "us-east-1", 1, all);
+  hRows(ctx, "eu-west-1", 1, all);
+  hRows(ctx, "us-east-1", 2, all);
+  hRows(ctx, "eu-west-1", 2, {"orders/a", "d1", "orders/b", "d2"});
   std::vector<std::string> many;
   for (int i = 0; i < 300; i++) {
     const std::string n = std::to_string(i);
     many.push_back("orders/k" + std::string(3 - n.size(), '0') + n);
     many.push_back("d" + n);
   }
-  rows(ctx, "us-east-1", 3, many);
+  hRows(ctx, "us-east-1", 3, many);
   many.insert(many.end(), {"orders/k100", "stale", "orders/k299", "stale"});
-  rows(ctx, "eu-west-1", 3, many);
-  const auto r = lag(ctx, rid, "ops-a");
-  const auto body = bodyOf(r);
+  hRows(ctx, "eu-west-1", 3, many);
+  const auto r = hLag(ctx, rid, "ops-a");
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.contains("divergent_shards") && body["divergent_shards"] == nlohmann::json::array({0, 2, 3}),
              "divergent_shards must be [0, 2, 3]: shard 0 holds a stale row 10 changes behind, shard 2 misses one at zero lag, shard 3 differs at its 101st key (%s)", r.Text());
   ctx.Equal(body.value("sampled_keys", 0), 256, "sampled_keys must be kSampleKeys, the sample size");
-  ctx.Assert(shardEntry(body, 0).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/b"}), "shard 0 must list orders/b as divergent whatever its lag, got %s", shardEntry(body, 0).dump());
-  ctx.Assert(shardEntry(body, 2).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/c"}), "shard 2 must list orders/c (missing at the target), got %s", shardEntry(body, 2).dump());
-  ctx.Assert(shardEntry(body, 1).contains("divergent_keys") && shardEntry(body, 1)["divergent_keys"].empty(), "shard 1 is identical in both regions, got %s", shardEntry(body, 1).dump());
-  ctx.Assert(shardEntry(body, 3).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/k100"}),
+  ctx.Assert(hShardEntry(body, 0).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/b"}), "shard 0 must list orders/b as divergent whatever its lag, got %s", hShardEntry(body, 0).dump());
+  ctx.Assert(hShardEntry(body, 2).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/c"}), "shard 2 must list orders/c (missing at the target), got %s", hShardEntry(body, 2).dump());
+  ctx.Assert(hShardEntry(body, 1).contains("divergent_keys") && hShardEntry(body, 1)["divergent_keys"].empty(), "shard 1 is identical in both regions, got %s", hShardEntry(body, 1).dump());
+  ctx.Assert(hShardEntry(body, 3).value("divergent_keys", nlohmann::json::array()) == nlohmann::json::array({"orders/k100"}),
              "shard 3 holds 300 rows and differs at orders/k100 (inside the first kSampleKeys = 256) and orders/k299 (outside them); its divergent_keys are %s, expected [\\"orders/k100\\"]",
-             shardEntry(body, 3).value("divergent_keys", nlohmann::json::array()).dump());
+             hShardEntry(body, 3).value("divergent_keys", nlohmann::json::array()).dump());
 }
 `,
   },

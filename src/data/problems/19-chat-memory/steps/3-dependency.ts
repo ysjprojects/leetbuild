@@ -902,11 +902,11 @@ import (
 	"leetbuild/harness"
 )
 
-const rival = "rival: the team agreed to ship on the 14th"
+const kHRival = "rival: the team agreed to ship on the 14th"
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-func spanTurns(first, last int, tenant string) []sessions.Turn {
+func hSpanTurns(first, last int, tenant string) []sessions.Turn {
 	out := []sessions.Turn{}
 	for n := first; n <= last; n++ {
 		role := "assistant"
@@ -918,13 +918,13 @@ func spanTurns(first, last int, tenant string) []sessions.Turn {
 	return out
 }
 
-// summarizerStandIn summarizes any span with turns; beforeReply runs first when set (another worker finishing first).
-type summarizerStandIn struct {
+// HSummarizerStandIn summarizes any span with turns; beforeReply runs first when set (another worker finishing first).
+type HSummarizerStandIn struct {
 	pb.UnimplementedSummarizerServer
 	beforeReply func()
 }
 
-func (s *summarizerStandIn) Summarize(_ context.Context, req *pb.SummarizeRequest) (*pb.Summary, error) {
+func (s *HSummarizerStandIn) Summarize(_ context.Context, req *pb.SummarizeRequest) (*pb.Summary, error) {
 	span := req.GetTurns()
 	if len(span) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no turns to summarize")
@@ -936,26 +936,26 @@ func (s *summarizerStandIn) Summarize(_ context.Context, req *pb.SummarizeReques
 	return &pb.Summary{Text: text, Tokens: 12}, nil
 }
 
-func standIn(ctx *harness.Ctx) *summarizerStandIn {
-	s := &summarizerStandIn{}
+func hStandIn(ctx *harness.Ctx) *HSummarizerStandIn {
+	s := &HSummarizerStandIn{}
 	pb.RegisterSummarizerServer(ctx.GRPC.Server(""), s)
 	return s
 }
 
-func mustSummarize(ctx *harness.Ctx, tenant string, turns []sessions.Turn) string {
-	text, err := summarizeSpan(clientBg, tenant, "s-1", turns)
+func hMustSummarize(ctx *harness.Ctx, tenant string, turns []sessions.Turn) string {
+	text, err := summarizeSpan(hClientBg, tenant, "s-1", turns)
 	ctx.NoError(err, "summarizeSpan(%s, s-1, %s..%s) failed", tenant, turns[0].TurnID, turns[len(turns)-1].TurnID)
 	return text
 }
 
-func mustFailSummarizer(ctx *harness.Ctx, text string, err error, why string) {
+func hMustFailSummarizer(ctx *harness.Ctx, text string, err error, why string) {
 	ctx.Assert(err != nil, "%s: summarizeSpan returned %q instead of an error wrapping ErrSummarizer", why, text)
 	ctx.Assert(errors.Is(err, ErrSummarizer), "%s: summarizeSpan returned %v, expected an error wrapping ErrSummarizer", why, err)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	standIn(ctx)
-	text := mustSummarize(ctx, "t1", spanTurns(1, 10, "t1"))
+	hStandIn(ctx)
+	text := hMustSummarize(ctx, "t1", hSpanTurns(1, 10, "t1"))
 	ctx.Assert(strings.Contains(text, "t-1..t-10"), "with a healthy summarizer summarizeSpan returned %q", text)
 	for _, call := range ctx.GRPC.CallsTo("Summarize", "") {
 		ctx.Assert(call.HasDeadline(), "a Summarize call carries no deadline: a summarizer that hangs holds the worker indefinitely")
@@ -964,10 +964,10 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("Summarize", 30.0, "")
 	start := len(ctx.GRPC.CallsTo("Summarize", ""))
 	before := ctx.Clock.Now()
-	text, err := summarizeSpan(clientBg, "t1", "s-1", spanTurns(11, 20, "t1"))
+	text, err := summarizeSpan(hClientBg, "t1", "s-1", hSpanTurns(11, 20, "t1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 3.5, "summarizeSpan waited %.1f s on a summarizer that takes 30 s: two attempts of 1.5 s at most", waited)
-	mustFailSummarizer(ctx, text, err, "with a summarizer that takes 30 s")
+	hMustFailSummarizer(ctx, text, err, "with a summarizer that takes 30 s")
 	stalled := []string{}
 	ownDeadlines := true
 	for _, call := range ctx.GRPC.CallsTo("Summarize", "")[start:] {
@@ -979,46 +979,46 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	standIn(ctx)
+	hStandIn(ctx)
 	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model overloaded", 1, "")
-	text := mustSummarize(ctx, "t1", spanTurns(1, 10, "t1"))
+	text := hMustSummarize(ctx, "t1", hSpanTurns(1, 10, "t1"))
 	calls := len(ctx.GRPC.CallsTo("Summarize", ""))
 	ctx.Assert(strings.Contains(text, "t-1..t-10") && calls == 2, "one UNAVAILABLE then an answer must take two calls and return the summary, got %d calls and %q", calls, text)
 	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model overloaded", 2, "")
 	before := len(ctx.GRPC.CallsTo("Summarize", ""))
-	text, err := summarizeSpan(clientBg, "t1", "s-1", spanTurns(11, 20, "t1"))
+	text, err := summarizeSpan(hClientBg, "t1", "s-1", hSpanTurns(11, 20, "t1"))
 	made := len(ctx.GRPC.CallsTo("Summarize", "")) - before
 	ctx.Assert(made == 2, "summarizeSpan made %d calls to a summarizer that answered UNAVAILABLE twice: at most maxAttempts = 2 per span", made)
-	mustFailSummarizer(ctx, text, err, "after two UNAVAILABLE answers")
+	hMustFailSummarizer(ctx, text, err, "after two UNAVAILABLE answers")
 	ctx.GRPC.Fail("Summarize", codes.InvalidArgument, "span out of order", 1, "")
 	before = len(ctx.GRPC.CallsTo("Summarize", ""))
-	text, err = summarizeSpan(clientBg, "t1", "s-1", spanTurns(21, 30, "t1"))
+	text, err = summarizeSpan(hClientBg, "t1", "s-1", hSpanTurns(21, 30, "t1"))
 	made = len(ctx.GRPC.CallsTo("Summarize", "")) - before
 	ctx.Assert(made == 1, "summarizeSpan sent a request the summarizer called INVALID_ARGUMENT %d times: a bad request is not retried", made)
-	mustFailSummarizer(ctx, text, err, "after INVALID_ARGUMENT")
+	hMustFailSummarizer(ctx, text, err, "after INVALID_ARGUMENT")
 	for n, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.NotFound} {
 		ctx.GRPC.Fail("Summarize", code, "not retryable", 1, "")
 		before = len(ctx.GRPC.CallsTo("Summarize", ""))
-		text, err = summarizeSpan(clientBg, "t1", "s-1", spanTurns(31+10*n, 40+10*n, "t1"))
+		text, err = summarizeSpan(hClientBg, "t1", "s-1", hSpanTurns(31+10*n, 40+10*n, "t1"))
 		made = len(ctx.GRPC.CallsTo("Summarize", "")) - before
 		ctx.Assert(made == 1, "summarizeSpan made %d calls after %v: only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt", made, code)
-		mustFailSummarizer(ctx, text, err, "after "+code.String())
+		hMustFailSummarizer(ctx, text, err, "after "+code.String())
 	}
 	ctx.GRPC.Fail("Summarize", codes.DeadlineExceeded, "deadline exceeded", 1, "")
 	before = len(ctx.GRPC.CallsTo("Summarize", ""))
-	text, err = summarizeSpan(clientBg, "t1", "s-1", spanTurns(61, 70, "t1"))
+	text, err = summarizeSpan(hClientBg, "t1", "s-1", hSpanTurns(61, 70, "t1"))
 	made = len(ctx.GRPC.CallsTo("Summarize", "")) - before
 	ctx.Assert(err == nil && made == 2, "one DEADLINE_EXCEEDED then an answer must take two calls and return the summary, got %d calls, %q and error %v", made, text, err)
 }
 
 func CheckSpanIdentity(ctx *harness.Ctx) {
-	standIn(ctx)
-	first := mustSummarize(ctx, "t1", spanTurns(1, 10, "t1"))
-	second := mustSummarize(ctx, "t1", spanTurns(11, 20, "t1"))
-	other := mustSummarize(ctx, "t2", spanTurns(1, 10, "t2"))
+	hStandIn(ctx)
+	first := hMustSummarize(ctx, "t1", hSpanTurns(1, 10, "t1"))
+	second := hMustSummarize(ctx, "t1", hSpanTurns(11, 20, "t1"))
+	other := hMustSummarize(ctx, "t2", hSpanTurns(1, 10, "t2"))
 	ctx.Equal(ctx.Redis.HGetAll("summaries:t1:s-1"), map[string]string{"t-1:t-10": first, "t-11:t-20": second}, "summaries:t1:s-1 must hold each span under its own id {first}:{last}, so a later span adds a summary instead of replacing one")
 	ctx.Equal(ctx.Redis.HGetAll("summaries:t2:s-1"), map[string]string{"t-1:t-10": other}, "summaries:t2:s-1 must hold tenant t2's span")
-	latest, err := summaries.LatestSummary(clientBg, "t1", "s-1")
+	latest, err := summaries.LatestSummary(hClientBg, "t1", "s-1")
 	ctx.NoError(err, "summaries.LatestSummary failed")
 	ctx.Assert(latest != nil && latest.Span == "t-11:t-20" && latest.Text == second, "summaries.LatestSummary reads %+v, expected the t-11:t-20 summary", latest)
 	ttl := ctx.Redis.TTL("summaries:t1:s-1")
@@ -1026,14 +1026,14 @@ func CheckSpanIdentity(ctx *harness.Ctx) {
 }
 
 func CheckFirstWriterWins(ctx *harness.Ctx) {
-	s := standIn(ctx)
-	s.beforeReply = func() { ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-10", rival) }
-	text := mustSummarize(ctx, "t1", spanTurns(1, 10, "t1"))
-	ctx.Assert(text == rival, "another worker stored the summary of t-1:t-10 while this call was in flight, and summarizeSpan returned its own %q: the first summary of a span wins, so return the stored one", text)
+	s := hStandIn(ctx)
+	s.beforeReply = func() { ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-10", kHRival) }
+	text := hMustSummarize(ctx, "t1", hSpanTurns(1, 10, "t1"))
+	ctx.Assert(text == kHRival, "another worker stored the summary of t-1:t-10 while this call was in flight, and summarizeSpan returned its own %q: the first summary of a span wins, so return the stored one", text)
 	stored, _ := ctx.Redis.HGet("summaries:t1:s-1", "t-1:t-10")
-	ctx.Equal(stored, rival, "the summary the other worker stored must stay")
+	ctx.Equal(stored, kHRival, "the summary the other worker stored must stay")
 	s.beforeReply = nil
-	ctx.Equal(mustSummarize(ctx, "t1", spanTurns(1, 10, "t1")), rival, "a retry of the span must return the stored summary")
+	ctx.Equal(hMustSummarize(ctx, "t1", hSpanTurns(1, 10, "t1")), kHRival, "a retry of the span must return the stored summary")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1047,16 +1047,16 @@ func CheckFirstWriterWins(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRival = "rival: the team agreed to ship on the 14th";
+const std::string kHRival = "rival: the team agreed to ship on the 14th";
 
-std::vector<sessions::Turn> spanTurns(int first, int last, const std::string& tenant = "t1") {
+std::vector<sessions::Turn> hSpanTurns(int first, int last, const std::string& tenant = "t1") {
   std::vector<sessions::Turn> out;
   for (int n = first; n <= last; n++) out.push_back({"t-" + std::to_string(n), n % 2 ? "user" : "assistant", tenant + " turn " + std::to_string(n), 3});
   return out;
 }
 
 // Summarizes any span with turns; before_reply runs first when set (another worker finishing first).
-class SummarizerStandIn final : public memory::Summarizer::Service {
+class HSummarizerStandIn final : public memory::Summarizer::Service {
  public:
   std::function<void()> before_reply;
   grpc::Status Summarize(grpc::ServerContext*, const memory::SummarizeRequest* req, memory::Summary* out) override {
@@ -1070,24 +1070,24 @@ class SummarizerStandIn final : public memory::Summarizer::Service {
   }
 };
 
-SummarizerStandIn& standIn(harness::Ctx& ctx) {
-  static SummarizerStandIn* s = nullptr;
+HSummarizerStandIn& hStandIn(harness::Ctx& ctx) {
+  static HSummarizerStandIn* s = nullptr;
   delete s;
-  s = new SummarizerStandIn;
+  s = new HSummarizerStandIn;
   ctx.GRPC.Server("")->RegisterService(s);
   return *s;
 }
 
 // What summarizeSpan did: the text it returned, or that it threw (and whether a SummarizerError).
-struct Outcome {
+struct HOutcome {
   std::string text;
   bool threw = false;
   bool summarizer_error = false;
   std::string what;
 };
 
-Outcome outcome(const std::string& tenant, const std::vector<sessions::Turn>& turns) {
-  Outcome out;
+HOutcome hOutcome(const std::string& tenant, const std::vector<sessions::Turn>& turns) {
+  HOutcome out;
   try {
     out.text = summarizeSpan(tenant, "s-1", turns);
   } catch (const SummarizerError& e) {
@@ -1100,13 +1100,13 @@ Outcome outcome(const std::string& tenant, const std::vector<sessions::Turn>& tu
   return out;
 }
 
-void mustFailSummarizer(harness::Ctx& ctx, const Outcome& o, const std::string& why) {
+void hMustFailSummarizer(harness::Ctx& ctx, const HOutcome& o, const std::string& why) {
   ctx.Assert(o.threw, "%s: summarizeSpan returned %q instead of throwing SummarizerError", why, o.text);
   ctx.Assert(o.summarizer_error, "%s: summarizeSpan threw %s, expected SummarizerError", why, o.what);
 }
 
-std::string mustSummarize(harness::Ctx& ctx, const std::string& tenant, const std::vector<sessions::Turn>& turns) {
-  const Outcome o = outcome(tenant, turns);
+std::string hMustSummarize(harness::Ctx& ctx, const std::string& tenant, const std::vector<sessions::Turn>& turns) {
+  const HOutcome o = hOutcome(tenant, turns);
   ctx.Assert(!o.threw, "summarizeSpan(%s, s-1, %s..%s) threw %s", tenant, turns.front().turn_id, turns.back().turn_id, o.what);
   return o.text;
 }
@@ -1114,8 +1114,8 @@ std::string mustSummarize(harness::Ctx& ctx, const std::string& tenant, const st
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  standIn(ctx);
-  const std::string text = mustSummarize(ctx, "t1", spanTurns(1, 10));
+  hStandIn(ctx);
+  const std::string text = hMustSummarize(ctx, "t1", hSpanTurns(1, 10));
   ctx.Assert(text.find("t-1..t-10") != std::string::npos, "with a healthy summarizer summarizeSpan returned %q", text);
   for (const auto& call : ctx.GRPC.CallsTo("Summarize")) {
     ctx.Assert(call.HasDeadline(), "a Summarize call carries no deadline: a summarizer that hangs holds the worker indefinitely");
@@ -1124,10 +1124,10 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Summarize", 30.0);
   const size_t start = ctx.GRPC.CallsTo("Summarize").size();
   const int64_t before = ctx.Clock.Now();
-  const Outcome o = outcome("t1", spanTurns(11, 20));
+  const HOutcome o = hOutcome("t1", hSpanTurns(11, 20));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 3.5, "summarizeSpan waited %.1f s on a summarizer that takes 30 s: two attempts of 1.5 s at most", waited);
-  mustFailSummarizer(ctx, o, "with a summarizer that takes 30 s");
+  hMustFailSummarizer(ctx, o, "with a summarizer that takes 30 s");
   const auto calls = ctx.GRPC.CallsTo("Summarize");
   std::string stalled;
   bool own_deadlines = true;
@@ -1140,45 +1140,45 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  standIn(ctx);
+  hStandIn(ctx);
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model overloaded", 1);
-  const std::string text = mustSummarize(ctx, "t1", spanTurns(1, 10));
+  const std::string text = hMustSummarize(ctx, "t1", hSpanTurns(1, 10));
   const size_t calls = ctx.GRPC.CallsTo("Summarize").size();
   ctx.Assert(text.find("t-1..t-10") != std::string::npos && calls == 2, "one UNAVAILABLE then an answer must take two calls and return the summary, got %d calls and %q", calls, text);
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model overloaded", 2);
   size_t before = ctx.GRPC.CallsTo("Summarize").size();
-  Outcome o = outcome("t1", spanTurns(11, 20));
+  HOutcome o = hOutcome("t1", hSpanTurns(11, 20));
   size_t made = ctx.GRPC.CallsTo("Summarize").size() - before;
   ctx.Assert(made == 2, "summarizeSpan made %d calls to a summarizer that answered UNAVAILABLE twice: at most kMaxAttempts = 2 per span", made);
-  mustFailSummarizer(ctx, o, "after two UNAVAILABLE answers");
+  hMustFailSummarizer(ctx, o, "after two UNAVAILABLE answers");
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::INVALID_ARGUMENT, "span out of order", 1);
   before = ctx.GRPC.CallsTo("Summarize").size();
-  o = outcome("t1", spanTurns(21, 30));
+  o = hOutcome("t1", hSpanTurns(21, 30));
   made = ctx.GRPC.CallsTo("Summarize").size() - before;
   ctx.Assert(made == 1, "summarizeSpan sent a request the summarizer called INVALID_ARGUMENT %d times: a bad request is not retried", made);
-  mustFailSummarizer(ctx, o, "after INVALID_ARGUMENT");
+  hMustFailSummarizer(ctx, o, "after INVALID_ARGUMENT");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"}};
   for (size_t n = 0; n < terminal.size(); n++) {
     ctx.GRPC.Fail("Summarize", terminal[n].first, "not retryable", 1);
     before = ctx.GRPC.CallsTo("Summarize").size();
-    o = outcome("t1", spanTurns(31 + 10 * static_cast<int>(n), 40 + 10 * static_cast<int>(n)));
+    o = hOutcome("t1", hSpanTurns(31 + 10 * static_cast<int>(n), 40 + 10 * static_cast<int>(n)));
     made = ctx.GRPC.CallsTo("Summarize").size() - before;
     ctx.Assert(made == 1, "summarizeSpan made %d calls after %s: only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt", made, terminal[n].second);
-    mustFailSummarizer(ctx, o, "after " + terminal[n].second);
+    hMustFailSummarizer(ctx, o, "after " + terminal[n].second);
   }
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1);
   before = ctx.GRPC.CallsTo("Summarize").size();
-  o = outcome("t1", spanTurns(61, 70));
+  o = hOutcome("t1", hSpanTurns(61, 70));
   made = ctx.GRPC.CallsTo("Summarize").size() - before;
   ctx.Assert(!o.threw && made == 2, "one DEADLINE_EXCEEDED then an answer must take two calls and return the summary, got %d calls, %q and %s", made, o.text, o.what);
 }
 
 void CheckSpanIdentity(harness::Ctx& ctx) {
-  standIn(ctx);
-  const std::string first = mustSummarize(ctx, "t1", spanTurns(1, 10));
-  const std::string second = mustSummarize(ctx, "t1", spanTurns(11, 20));
-  const std::string other = mustSummarize(ctx, "t2", spanTurns(1, 10, "t2"));
+  hStandIn(ctx);
+  const std::string first = hMustSummarize(ctx, "t1", hSpanTurns(1, 10));
+  const std::string second = hMustSummarize(ctx, "t1", hSpanTurns(11, 20));
+  const std::string other = hMustSummarize(ctx, "t2", hSpanTurns(1, 10, "t2"));
   ctx.Equal(ctx.Redis.HGetAll("summaries:t1:s-1"), std::map<std::string, std::string>{{"t-1:t-10", first}, {"t-11:t-20", second}},
             "summaries:t1:s-1 must hold each span under its own id {first}:{last}, so a later span adds a summary instead of replacing one");
   ctx.Equal(ctx.Redis.HGetAll("summaries:t2:s-1"), std::map<std::string, std::string>{{"t-1:t-10", other}}, "summaries:t2:s-1 must hold tenant t2's span");
@@ -1190,13 +1190,13 @@ void CheckSpanIdentity(harness::Ctx& ctx) {
 }
 
 void CheckFirstWriterWins(harness::Ctx& ctx) {
-  SummarizerStandIn& s = standIn(ctx);
-  s.before_reply = [&ctx] { ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-10", kRival); };
-  const std::string text = mustSummarize(ctx, "t1", spanTurns(1, 10));
-  ctx.Assert(text == kRival, "another worker stored the summary of t-1:t-10 while this call was in flight, and summarizeSpan returned its own %q: the first summary of a span wins, so return the stored one", text);
-  ctx.Equal(ctx.Redis.HGet("summaries:t1:s-1", "t-1:t-10").value_or(""), kRival, "the summary the other worker stored must stay");
+  HSummarizerStandIn& s = hStandIn(ctx);
+  s.before_reply = [&ctx] { ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-10", kHRival); };
+  const std::string text = hMustSummarize(ctx, "t1", hSpanTurns(1, 10));
+  ctx.Assert(text == kHRival, "another worker stored the summary of t-1:t-10 while this call was in flight, and summarizeSpan returned its own %q: the first summary of a span wins, so return the stored one", text);
+  ctx.Equal(ctx.Redis.HGet("summaries:t1:s-1", "t-1:t-10").value_or(""), kHRival, "the summary the other worker stored must stay");
   s.before_reply = nullptr;
-  ctx.Equal(mustSummarize(ctx, "t1", spanTurns(1, 10)), kRival, "a retry of the span must return the stored summary");
+  ctx.Equal(hMustSummarize(ctx, "t1", hSpanTurns(1, 10)), kHRival, "a retry of the span must return the stored summary");
 }
 `,
   },

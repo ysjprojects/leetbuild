@@ -769,47 +769,47 @@ import (
 )
 
 var (
-	clientBg   = context.Background()
-	candidates = []string{"c-1", "c-2", "c-3", "c-4"}
-	modelOrder = []string{"c-2", "c-4", "c-1", "c-3"} // the ranker's order
-	popular    = []string{"c-3", "c-1", "c-4", "c-2"} // popularity:home; c-2 was never engaged with
+	hClientBg   = context.Background()
+	hCandidates = []string{"c-1", "c-2", "c-3", "c-4"}
+	hModelOrder = []string{"c-2", "c-4", "c-1", "c-3"} // the ranker's order
+	hPopular    = []string{"c-3", "c-1", "c-4", "c-2"} // popularity:home; c-2 was never engaged with
 )
 
-func modelScore(id string) float64 {
+func hModelScore(id string) float64 {
 	n, _ := strconv.Atoi(strings.TrimPrefix(id, "c-"))
 	return float64(n*37%101) / 100
 }
 
 // slowUnavailable: the next calls that answer UNAVAILABLE only after 400 ms.
-var slowUnavailable int
+var hSlowUnavailable int
 
-type rankerPeer struct {
+type HRankerPeer struct {
 	pb.UnimplementedRankerServer
 	ctx *harness.Ctx
 }
 
-func (p rankerPeer) Rank(_ context.Context, req *pb.RankRequest) (*pb.RankResponse, error) {
-	if slowUnavailable > 0 {
-		slowUnavailable--
+func (p HRankerPeer) Rank(_ context.Context, req *pb.RankRequest) (*pb.RankResponse, error) {
+	if hSlowUnavailable > 0 {
+		hSlowUnavailable--
 		p.ctx.Clock.Advance(0.4)
 		return nil, status.Error(codes.Unavailable, "replica restarting")
 	}
 	items := []*pb.ScoredItem{}
 	for _, id := range req.GetCandidateIds() {
-		items = append(items, &pb.ScoredItem{Id: id, Score: modelScore(id)})
+		items = append(items, &pb.ScoredItem{Id: id, Score: hModelScore(id)})
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].Score > items[j].Score })
 	return &pb.RankResponse{Items: items, ModelVersion: "ranker-v7"}, nil
 }
 
-func client(ctx *harness.Ctx) {
-	slowUnavailable = 0
-	pb.RegisterRankerServer(ctx.GRPC.Server(""), rankerPeer{ctx: ctx})
+func hClient(ctx *harness.Ctx) {
+	hSlowUnavailable = 0
+	pb.RegisterRankerServer(ctx.GRPC.Server(""), HRankerPeer{ctx: ctx})
 	loadFeatures = func(context.Context, string, string) *types.Features { return &types.Features{Values: []float64{0.5}} }
 	ctx.Redis.Do("ZADD", "popularity:home", 40, "c-3", 25, "c-1", 10, "c-4")
 }
 
-func ids(r types.Ranked) []string {
+func hIds(r types.Ranked) []string {
 	out := []string{}
 	for _, item := range r.Items {
 		out = append(out, item.ID)
@@ -817,33 +817,33 @@ func ids(r types.Ranked) []string {
 	return out
 }
 
-func rankCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Rank", "")) }
+func hRankCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Rank", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	result := rank(clientBg, "t1", "u-1", "home", candidates)
-	ctx.Equal(ids(result), modelOrder, "with the ranker healthy, the order rank answered")
+	hClient(ctx)
+	result := rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	ctx.Equal(hIds(result), hModelOrder, "with the ranker healthy, the order rank answered")
 	// Two replicas answer UNAVAILABLE only after 400 ms: each retry still gets its own 500 ms.
-	slowUnavailable = 2
-	result = rank(clientBg, "t1", "u-1", "home", candidates)
-	ctx.Equal(ids(result), modelOrder, "with two replicas answering UNAVAILABLE after 400 ms each, the third attempt reaches a healthy replica and must get the model's order; rank answered")
+	hSlowUnavailable = 2
+	result = rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	ctx.Equal(hIds(result), hModelOrder, "with two replicas answering UNAVAILABLE after 400 ms each, the third attempt reaches a healthy replica and must get the model's order; rank answered")
 	for i, call := range ctx.GRPC.CallsTo("Rank", "") {
 		ctx.Assert(call.HasDeadline(), "a Rank call carries no deadline: one ranker replica that hangs holds the request open as long as it hangs")
 		ctx.Assert(call.Timeout.Seconds() >= 0.4 && call.Timeout.Seconds() <= 0.6, "Rank call %d carries a %v deadline, expected rankDeadline = 500 ms: every attempt gets its own 500 ms, not what an earlier attempt left over", i+1, call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Rank", 5.0, "")
 	before := ctx.Clock.Now()
-	rank(clientBg, "t1", "u-1", "home", candidates)
+	rank(hClientBg, "t1", "u-1", "home", hCandidates)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 1.0, "with the ranker answering in 5 s, rank took %.1f s: the deadline must end the call at 500 ms, and a missed deadline is not retried", waited)
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.Fail("Rank", codes.Unavailable, "replica restarting", 2, "")
-	result := rank(clientBg, "t1", "u-1", "home", candidates)
-	calls := rankCalls(ctx)
-	ctx.Assert(calls == 3 && fmt.Sprint(ids(result)) == fmt.Sprint(modelOrder), "with two UNAVAILABLE answers and then a healthy replica, rank made %d calls and answered %v: UNAVAILABLE is retried, up to 3 attempts", calls, ids(result))
+	result := rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	calls := hRankCalls(ctx)
+	ctx.Assert(calls == 3 && fmt.Sprint(hIds(result)) == fmt.Sprint(hModelOrder), "with two UNAVAILABLE answers and then a healthy replica, rank made %d calls and answered %v: UNAVAILABLE is retried, up to 3 attempts", calls, hIds(result))
 	refusals := []struct {
 		code    codes.Code
 		name    string
@@ -855,36 +855,36 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 		{codes.PermissionDenied, "PERMISSION_DENIED", "tenant may not use this model"},
 	}
 	for _, refusal := range refusals {
-		before := rankCalls(ctx)
+		before := hRankCalls(ctx)
 		ctx.GRPC.Fail("Rank", refusal.code, refusal.details, 1, "")
-		rank(clientBg, "t1", "u-1", "home", candidates)
-		ctx.Equal(rankCalls(ctx)-before, 1, "only UNAVAILABLE is retried, every other status ends the attempts; the times a request answered %s was sent", refusal.name)
+		rank(hClientBg, "t1", "u-1", "home", hCandidates)
+		ctx.Equal(hRankCalls(ctx)-before, 1, "only UNAVAILABLE is retried, every other status ends the attempts; the times a request answered %s was sent", refusal.name)
 	}
-	before := rankCalls(ctx)
+	before := hRankCalls(ctx)
 	ctx.GRPC.Fail("Rank", codes.Unavailable, "every replica restarting", 5, "")
-	rank(clientBg, "t1", "u-1", "home", candidates)
-	ctx.Equal(rankCalls(ctx)-before, 3, "with every replica UNAVAILABLE rank must stop at maxAttempts = 3; the attempts")
+	rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	ctx.Equal(hRankCalls(ctx)-before, 3, "with every replica UNAVAILABLE rank must stop at maxAttempts = 3; the attempts")
 }
 
 func CheckFallbackOrder(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.Fail("Rank", codes.Unavailable, "every replica restarting", 3, "")
-	result := rank(clientBg, "t1", "u-1", "home", candidates)
-	ctx.Equal(ids(result), popular, "with the ranker down the page must still fill, in the popularity order; rank answered")
+	result := rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	ctx.Equal(hIds(result), hPopular, "with the ranker down the page must still fill, in the popularity order; rank answered")
 	ctx.GRPC.Fail("Rank", codes.InvalidArgument, "feature vector has the wrong width", 1, "")
-	result = rank(clientBg, "t1", "u-1", "home", candidates)
-	ctx.Equal(ids(result), popular, "with the request refused (INVALID_ARGUMENT) the attempts ended without an answer, so serve the popularity order; rank answered")
+	result = rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	ctx.Equal(hIds(result), hPopular, "with the request refused (INVALID_ARGUMENT) the attempts ended without an answer, so serve the popularity order; rank answered")
 	ctx.GRPC.SetLatency("Rank", 5.0, "")
-	result = rank(clientBg, "t1", "u-1", "home", candidates)
-	ctx.Equal(ids(result), popular, "with the ranker past its deadline, the order rank answered")
+	result = rank(hClientBg, "t1", "u-1", "home", hCandidates)
+	ctx.Equal(hIds(result), hPopular, "with the ranker past its deadline, the order rank answered")
 }
 
 func CheckFallbackTag(ctx *harness.Ctx) {
-	client(ctx)
-	healthy := rank(clientBg, "t1", "u-1", "home", candidates)
+	hClient(ctx)
+	healthy := rank(hClientBg, "t1", "u-1", "home", hCandidates)
 	ctx.Assert(!healthy.Fallback && healthy.ModelVersion == "ranker-v7", "a model answer must be stamped ranker-v7 with fallback false, got %+v", healthy)
 	ctx.GRPC.Fail("Rank", codes.Unavailable, "every replica restarting", 3, "")
-	degraded := rank(clientBg, "t1", "u-1", "home", candidates)
+	degraded := rank(hClientBg, "t1", "u-1", "home", hCandidates)
 	ctx.Equal(degraded.Fallback, true, "the list served with the ranker down must be marked: unmarked, its impressions count as the model's in every A/B read; fallback")
 	ctx.Equal(degraded.ModelVersion, "popularity-v1", "the list served with the ranker down; its model_version")
 }
@@ -901,15 +901,15 @@ std::optional<recs::Features> loadFeatures(const std::string&, const std::string
 
 namespace {
 
-const std::vector<std::string> kCandidates{"c-1", "c-2", "c-3", "c-4"};
-const std::vector<std::string> kModelOrder{"c-2", "c-4", "c-1", "c-3"};  // the ranker's order
-const std::vector<std::string> kPopular{"c-3", "c-1", "c-4", "c-2"};     // popularity:home; c-2 was never engaged with
+const std::vector<std::string> kHCandidates{"c-1", "c-2", "c-3", "c-4"};
+const std::vector<std::string> kHModelOrder{"c-2", "c-4", "c-1", "c-3"};  // the ranker's order
+const std::vector<std::string> kHPopular{"c-3", "c-1", "c-4", "c-2"};     // popularity:home; c-2 was never engaged with
 
-double modelScore(const std::string& id) { return static_cast<double>(std::stoi(id.substr(2)) * 37 % 101) / 100; }
+double hModelScore(const std::string& id) { return static_cast<double>(std::stoi(id.substr(2)) * 37 % 101) / 100; }
 
-class RankerPeer final : public recsys::Ranker::Service {
+class HRankerPeer final : public recsys::Ranker::Service {
  public:
-  explicit RankerPeer(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HRankerPeer(harness::Ctx& ctx) : ctx_(ctx) {}
   int slowUnavailable = 0;  // the next calls that answer UNAVAILABLE only after 400 ms
 
   grpc::Status Rank(grpc::ServerContext*, const recsys::RankRequest* req, recsys::RankResponse* out) override {
@@ -918,12 +918,12 @@ class RankerPeer final : public recsys::Ranker::Service {
       ctx_.Clock.Advance(0.4);
       return grpc::Status(grpc::StatusCode::UNAVAILABLE, "replica restarting");
     }
-    std::vector<std::string> ids(req->candidate_ids().begin(), req->candidate_ids().end());
-    std::stable_sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return modelScore(a) > modelScore(b); });
-    for (const auto& id : ids) {
+    std::vector<std::string> hIds(req->candidate_ids().begin(), req->candidate_ids().end());
+    std::stable_sort(hIds.begin(), hIds.end(), [](const std::string& a, const std::string& b) { return hModelScore(a) > hModelScore(b); });
+    for (const auto& id : hIds) {
       auto* item = out->add_items();
       item->set_id(id);
-      item->set_score(modelScore(id));
+      item->set_score(hModelScore(id));
     }
     out->set_model_version("ranker-v7");
     return grpc::Status::OK;
@@ -933,33 +933,33 @@ class RankerPeer final : public recsys::Ranker::Service {
   harness::Ctx& ctx_;
 };
 
-RankerPeer& client(harness::Ctx& ctx) {
-  static RankerPeer* peer = nullptr;
+HRankerPeer& hClient(harness::Ctx& ctx) {
+  static HRankerPeer* peer = nullptr;
   delete peer;
-  peer = new RankerPeer(ctx);
+  peer = new HRankerPeer(ctx);
   ctx.GRPC.Server("")->RegisterService(peer);
   ctx.Redis.Do("ZADD", "popularity:home", 40, "c-3", 25, "c-1", 10, "c-4");
   return *peer;
 }
 
-std::vector<std::string> ids(const recs::Ranked& r) {
+std::vector<std::string> hIds(const recs::Ranked& r) {
   std::vector<std::string> out;
   for (const auto& item : r.items) out.push_back(item.id);
   return out;
 }
 
-size_t rankCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Rank").size(); }
+size_t hRankCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Rank").size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto& ranker = client(ctx);
-  auto result = rank("t1", "u-1", "home", kCandidates);
-  ctx.Equal(ids(result), kModelOrder, "with the ranker healthy, the order rank answered");
+  auto& ranker = hClient(ctx);
+  auto result = rank("t1", "u-1", "home", kHCandidates);
+  ctx.Equal(hIds(result), kHModelOrder, "with the ranker healthy, the order rank answered");
   // Two replicas answer UNAVAILABLE only after 400 ms: each retry still gets its own 500 ms.
   ranker.slowUnavailable = 2;
-  result = rank("t1", "u-1", "home", kCandidates);
-  ctx.Equal(ids(result), kModelOrder, "with two replicas answering UNAVAILABLE after 400 ms each, the third attempt reaches a healthy replica and must get the model's order; rank answered");
+  result = rank("t1", "u-1", "home", kHCandidates);
+  ctx.Equal(hIds(result), kHModelOrder, "with two replicas answering UNAVAILABLE after 400 ms each, the third attempt reaches a healthy replica and must get the model's order; rank answered");
   const auto calls = ctx.GRPC.CallsTo("Rank");
   for (size_t i = 0; i < calls.size(); i++) {
     ctx.Assert(calls[i].HasDeadline(), "a Rank call carries no deadline: one ranker replica that hangs holds the request open as long as it hangs");
@@ -967,17 +967,17 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Rank", 5.0);
   const int64_t before = ctx.Clock.Now();
-  rank("t1", "u-1", "home", kCandidates);
+  rank("t1", "u-1", "home", kHCandidates);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 1.0, "with the ranker answering in 5 s, rank took %.1f s: the deadline must end the call at 500 ms, and a missed deadline is not retried", waited);
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.Fail("Rank", grpc::StatusCode::UNAVAILABLE, "replica restarting", 2);
-  const auto result = rank("t1", "u-1", "home", kCandidates);
-  const size_t calls = rankCalls(ctx);
-  ctx.Assert(calls == 3 && ids(result) == kModelOrder, "with two UNAVAILABLE answers and then a healthy replica, rank made %d calls: UNAVAILABLE is retried, up to 3 attempts", calls);
+  const auto result = rank("t1", "u-1", "home", kHCandidates);
+  const size_t calls = hRankCalls(ctx);
+  ctx.Assert(calls == 3 && hIds(result) == kHModelOrder, "with two UNAVAILABLE answers and then a healthy replica, rank made %d calls: UNAVAILABLE is retried, up to 3 attempts", calls);
   struct Refusal {
     grpc::StatusCode code;
     const char* name;
@@ -987,36 +987,36 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
                                  Refusal{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "tenant quota exceeded"},
                                  Refusal{grpc::StatusCode::INTERNAL, "INTERNAL", "model crashed"},
                                  Refusal{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", "tenant may not use this model"}}) {
-    const size_t sentBefore = rankCalls(ctx);
+    const size_t sentBefore = hRankCalls(ctx);
     ctx.GRPC.Fail("Rank", refusal.code, refusal.details);
-    rank("t1", "u-1", "home", kCandidates);
-    ctx.Equal(rankCalls(ctx) - sentBefore, 1, "only UNAVAILABLE is retried, every other status ends the attempts; the times a request answered %s was sent", refusal.name);
+    rank("t1", "u-1", "home", kHCandidates);
+    ctx.Equal(hRankCalls(ctx) - sentBefore, 1, "only UNAVAILABLE is retried, every other status ends the attempts; the times a request answered %s was sent", refusal.name);
   }
-  const size_t before = rankCalls(ctx);
+  const size_t before = hRankCalls(ctx);
   ctx.GRPC.Fail("Rank", grpc::StatusCode::UNAVAILABLE, "every replica restarting", 5);
-  rank("t1", "u-1", "home", kCandidates);
-  ctx.Equal(rankCalls(ctx) - before, 3, "with every replica UNAVAILABLE rank must stop at kMaxAttempts = 3; the attempts");
+  rank("t1", "u-1", "home", kHCandidates);
+  ctx.Equal(hRankCalls(ctx) - before, 3, "with every replica UNAVAILABLE rank must stop at kMaxAttempts = 3; the attempts");
 }
 
 void CheckFallbackOrder(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.Fail("Rank", grpc::StatusCode::UNAVAILABLE, "every replica restarting", 3);
-  auto result = rank("t1", "u-1", "home", kCandidates);
-  ctx.Equal(ids(result), kPopular, "with the ranker down the page must still fill, in the popularity order; rank answered");
+  auto result = rank("t1", "u-1", "home", kHCandidates);
+  ctx.Equal(hIds(result), kHPopular, "with the ranker down the page must still fill, in the popularity order; rank answered");
   ctx.GRPC.Fail("Rank", grpc::StatusCode::INVALID_ARGUMENT, "feature vector has the wrong width");
-  result = rank("t1", "u-1", "home", kCandidates);
-  ctx.Equal(ids(result), kPopular, "with the request refused (INVALID_ARGUMENT) the attempts ended without an answer, so serve the popularity order; rank answered");
+  result = rank("t1", "u-1", "home", kHCandidates);
+  ctx.Equal(hIds(result), kHPopular, "with the request refused (INVALID_ARGUMENT) the attempts ended without an answer, so serve the popularity order; rank answered");
   ctx.GRPC.SetLatency("Rank", 5.0);
-  result = rank("t1", "u-1", "home", kCandidates);
-  ctx.Equal(ids(result), kPopular, "with the ranker past its deadline, the order rank answered");
+  result = rank("t1", "u-1", "home", kHCandidates);
+  ctx.Equal(hIds(result), kHPopular, "with the ranker past its deadline, the order rank answered");
 }
 
 void CheckFallbackTag(harness::Ctx& ctx) {
-  client(ctx);
-  const auto healthy = rank("t1", "u-1", "home", kCandidates);
+  hClient(ctx);
+  const auto healthy = rank("t1", "u-1", "home", kHCandidates);
   ctx.Assert(!healthy.fallback && healthy.model_version == "ranker-v7", "a model answer must be stamped ranker-v7 with fallback false, got %q fallback %t", healthy.model_version, healthy.fallback);
   ctx.GRPC.Fail("Rank", grpc::StatusCode::UNAVAILABLE, "every replica restarting", 3);
-  const auto degraded = rank("t1", "u-1", "home", kCandidates);
+  const auto degraded = rank("t1", "u-1", "home", kHCandidates);
   ctx.Equal(degraded.fallback, true, "the list served with the ranker down must be marked: unmarked, its impressions count as the model's in every A/B read; fallback");
   ctx.Equal(degraded.model_version, "popularity-v1", "the list served with the ranker down; its model_version");
 }

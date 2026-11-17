@@ -752,17 +752,17 @@ import (
 	"leetbuild/harness"
 )
 
-var poolBg = context.Background()
+var hPoolBg = context.Background()
 
 // poolSetup queues t1..tn in pool:15, each a solo ticket of p1..pn holding open:{p}.
-func poolSetup(ctx *harness.Ctx, n int) {
+func hPoolSetup(ctx *harness.Ctx, n int) {
 	for i := 1; i <= n; i++ {
-		store.Enqueue(poolBg, fmt.Sprintf("t%d", i), fmt.Sprintf("p%d", i), 1500+i, []string{fmt.Sprintf("p%d", i)})
+		store.Enqueue(hPoolBg, fmt.Sprintf("t%d", i), fmt.Sprintf("p%d", i), 1500+i, []string{fmt.Sprintf("p%d", i)})
 		ctx.Redis.Set(fmt.Sprintf("open:p%d", i), fmt.Sprintf("t%d", i))
 	}
 }
 
-func poolMembers(ctx *harness.Ctx) []string {
+func hPoolMembers(ctx *harness.Ctx) []string {
 	ids := []string{}
 	for _, z := range ctx.Redis.ZRangeWithScores("pool:15", 0, -1) {
 		ids = append(ids, z.Member)
@@ -771,91 +771,91 @@ func poolMembers(ctx *harness.Ctx) []string {
 	return ids
 }
 
-func poolDepth(ctx *harness.Ctx) int {
+func hPoolDepth(ctx *harness.Ctx) int {
 	v, _ := ctx.Redis.HGet("pool:depth", "15")
 	n, _ := strconv.Atoi(v)
 	return n
 }
 
-func poolHas(ctx *harness.Ctx, ticketID string) bool {
+func hPoolHas(ctx *harness.Ctx, ticketID string) bool {
 	_, ok := ctx.Redis.ZScore("pool:15", ticketID)
 	return ok
 }
 
-func poolWaiting(ticketID string) bool {
-	t := store.GetTicket(poolBg, ticketID)
+func hPoolWaiting(ticketID string) bool {
+	t := store.GetTicket(hPoolBg, ticketID)
 	return t != nil && t.State == "waiting" && t.MatchID == ""
 }
 
-func mustClaim(ctx *harness.Ctx, matchID string, ticketIDs ...string) bool {
-	ok, err := claimTickets(poolBg, matchID, 15, ticketIDs)
+func hMustClaim(ctx *harness.Ctx, matchID string, ticketIDs ...string) bool {
+	ok, err := claimTickets(hPoolBg, matchID, 15, ticketIDs)
 	ctx.NoError(err, "claimTickets(%s, 15, %v)", matchID, ticketIDs)
 	return ok
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	poolSetup(ctx, 3)
+	hPoolSetup(ctx, 3)
 	// A second matchmaker claims [t2, t3] the moment this one first touches t2.
 	rival := ctx.Redis.After("ticket:t2", func() any {
-		ok, err := claimTickets(poolBg, "m-2", 15, []string{"t2", "t3"})
+		ok, err := claimTickets(hPoolBg, "m-2", 15, []string{"t2", "t3"})
 		ctx.NoError(err, "the rival claim")
 		return ok
 	})
-	mine := mustClaim(ctx, "m-1", "t1", "t2")
+	mine := hMustClaim(ctx, "m-1", "t1", "t2")
 	ctx.Assert(rival.Fired, "claimTickets never touched ticket:t2")
 	ctx.Assert(rival.Err == nil, "the rival claim failed: %v", rival.Err)
 	theirs, _ := rival.Result.(bool)
-	ctx.Assert(mine != theirs, "two matchmakers claimed the overlapping rosters [t1, t2] and [t2, t3] and got m-1: %t, m-2: %t; t2 is now %+v. Exactly one claim may win, or a player is placed in two games", mine, theirs, store.GetTicket(poolBg, "t2"))
+	ctx.Assert(mine != theirs, "two matchmakers claimed the overlapping rosters [t1, t2] and [t2, t3] and got m-1: %t, m-2: %t; t2 is now %+v. Exactly one claim may win, or a player is placed in two games", mine, theirs, store.GetTicket(hPoolBg, "t2"))
 	winner, other := "m-2", "t1"
 	if mine {
 		winner, other = "m-1", "t3"
 	}
-	ctx.Equal(store.GetTicket(poolBg, "t2").MatchID, winner, "t2's match (the claim that won was %s's)", winner)
-	ctx.Assert(poolWaiting(other) && poolHas(ctx, other), "%s was only on the losing roster and must still wait in pool:15: %+v, pool %v", other, store.GetTicket(poolBg, other), poolMembers(ctx))
-	ctx.Equal(poolDepth(ctx), len(poolMembers(ctx)), "pool:depth must equal what waits in pool:15 %v; the depth", poolMembers(ctx))
+	ctx.Equal(store.GetTicket(hPoolBg, "t2").MatchID, winner, "t2's match (the claim that won was %s's)", winner)
+	ctx.Assert(hPoolWaiting(other) && hPoolHas(ctx, other), "%s was only on the losing roster and must still wait in pool:15: %+v, pool %v", other, store.GetTicket(hPoolBg, other), hPoolMembers(ctx))
+	ctx.Equal(hPoolDepth(ctx), len(hPoolMembers(ctx)), "pool:depth must equal what waits in pool:15 %v; the depth", hPoolMembers(ctx))
 }
 
 func CheckAllOrNothing(ctx *harness.Ctx) {
-	poolSetup(ctx, 3)
-	ctx.Equal(mustClaim(ctx, "m-0", "t2"), true, "claiming the waiting ticket t2")
-	ctx.Equal(mustClaim(ctx, "m-1", "t1", "t2"), false, "t2 is already in m-0: claiming the roster [t1, t2]")
-	ctx.Assert(poolWaiting("t1") && poolHas(ctx, "t1"), "the refused claim left t1 as %+v (pool %v): a ticket claimed by a match that never forms, its player stuck in neither", store.GetTicket(poolBg, "t1"), poolMembers(ctx))
-	ctx.Equal(store.GetTicket(poolBg, "t2").MatchID, "m-0", "the refused claim must not take t2 from m-0; t2's match")
-	ctx.Equal(mustClaim(ctx, "m-3", "t3", "t9"), false, "a roster with an unknown ticket t9")
-	ctx.Assert(poolWaiting("t3") && poolHas(ctx, "t3"), "the claim refused for the unknown t9 left t3 as %+v", store.GetTicket(poolBg, "t3"))
+	hPoolSetup(ctx, 3)
+	ctx.Equal(hMustClaim(ctx, "m-0", "t2"), true, "claiming the waiting ticket t2")
+	ctx.Equal(hMustClaim(ctx, "m-1", "t1", "t2"), false, "t2 is already in m-0: claiming the roster [t1, t2]")
+	ctx.Assert(hPoolWaiting("t1") && hPoolHas(ctx, "t1"), "the refused claim left t1 as %+v (pool %v): a ticket claimed by a match that never forms, its player stuck in neither", store.GetTicket(hPoolBg, "t1"), hPoolMembers(ctx))
+	ctx.Equal(store.GetTicket(hPoolBg, "t2").MatchID, "m-0", "the refused claim must not take t2 from m-0; t2's match")
+	ctx.Equal(hMustClaim(ctx, "m-3", "t3", "t9"), false, "a roster with an unknown ticket t9")
+	ctx.Assert(hPoolWaiting("t3") && hPoolHas(ctx, "t3"), "the claim refused for the unknown t9 left t3 as %+v", store.GetTicket(hPoolBg, "t3"))
 }
 
 func CheckDepthCounter(ctx *harness.Ctx) {
-	poolSetup(ctx, 3)
-	ctx.Equal(poolDepth(ctx), 3, "three tickets were queued; pool:depth")
-	ctx.Equal(mustClaim(ctx, "m-1", "t1", "t2"), true, "claiming t1 and t2")
-	ctx.Assert(poolDepth(ctx) == 1 && len(poolMembers(ctx)) == 1, "after a claim of two tickets pool:depth is %d and pool:15 holds %v: the counter must move by the tickets claimed", poolDepth(ctx), poolMembers(ctx))
-	ctx.Equal(mustClaim(ctx, "m-2", "t1"), false, "t1 is already claimed")
-	ctx.Equal(poolDepth(ctx), 1, "a refused claim must not move pool:depth")
-	ctx.Equal(mustClaim(ctx, "m-3", "t3"), true, "claiming t3")
-	ctx.Equal(poolDepth(ctx), 0, "after the last ticket was claimed, pool:depth")
+	hPoolSetup(ctx, 3)
+	ctx.Equal(hPoolDepth(ctx), 3, "three tickets were queued; pool:depth")
+	ctx.Equal(hMustClaim(ctx, "m-1", "t1", "t2"), true, "claiming t1 and t2")
+	ctx.Assert(hPoolDepth(ctx) == 1 && len(hPoolMembers(ctx)) == 1, "after a claim of two tickets pool:depth is %d and pool:15 holds %v: the counter must move by the tickets claimed", hPoolDepth(ctx), hPoolMembers(ctx))
+	ctx.Equal(hMustClaim(ctx, "m-2", "t1"), false, "t1 is already claimed")
+	ctx.Equal(hPoolDepth(ctx), 1, "a refused claim must not move pool:depth")
+	ctx.Equal(hMustClaim(ctx, "m-3", "t3"), true, "claiming t3")
+	ctx.Equal(hPoolDepth(ctx), 0, "after the last ticket was claimed, pool:depth")
 }
 
 func CheckCancelLeavesPool(ctx *harness.Ctx) {
-	store.Enqueue(poolBg, "t1", "p1", 1501, []string{"p1", "p2", "p5"})
+	store.Enqueue(hPoolBg, "t1", "p1", 1501, []string{"p1", "p2", "p5"})
 	ctx.Redis.Set("open:p1", "t1")
 	ctx.Redis.Set("open:p2", "t7") // p2's pointer to t1 expired and p2 queued again on t7
 	ctx.Redis.Set("open:p5", "t1")
-	store.Enqueue(poolBg, "t2", "p3", 1502, []string{"p3"})
+	store.Enqueue(hPoolBg, "t2", "p3", 1502, []string{"p3"})
 	ctx.Redis.Set("open:p3", "t2")
-	store.Enqueue(poolBg, "t4", "p4", 1504, []string{"p4"})
+	store.Enqueue(hPoolBg, "t4", "p4", 1504, []string{"p4"})
 	ctx.Redis.Set("open:p4", "t4")
-	ctx.Equal(mustClaim(ctx, "m-1", "t2"), true, "claiming t2")
+	ctx.Equal(hMustClaim(ctx, "m-1", "t2"), true, "claiming t2")
 	// What the world looks like the moment the cancel first touches open:p1.
 	atPointer := ctx.Redis.After("open:p1", func() any {
 		pointer, _ := ctx.Redis.Get("open:p1")
 		return ctx.Redis.Exists("ticket:t1") == 0 && pointer == "t1"
 	})
-	ok, err := cancelTicket(poolBg, "t1")
+	ok, err := cancelTicket(hPoolBg, "t1")
 	ctx.NoError(err, "cancelTicket(t1)")
 	ctx.Equal(ok, true, "cancelling the waiting ticket t1")
-	ctx.Assert(!poolHas(ctx, "t1"), "the cancelled t1 still waits in pool:15 %v: the next matchmaker claims a ticket nobody is behind", poolMembers(ctx))
-	ctx.Equal(poolDepth(ctx), len(poolMembers(ctx)), "after the cancel pool:depth must equal what waits in pool:15 %v; the depth", poolMembers(ctx))
+	ctx.Assert(!hPoolHas(ctx, "t1"), "the cancelled t1 still waits in pool:15 %v: the next matchmaker claims a ticket nobody is behind", hPoolMembers(ctx))
+	ctx.Equal(hPoolDepth(ctx), len(hPoolMembers(ctx)), "after the cancel pool:depth must equal what waits in pool:15 %v; the depth", hPoolMembers(ctx))
 	ctx.Equal(ctx.Redis.Exists("ticket:t1"), 0, "the cancelled ticket's hash must be gone")
 	ctx.Equal(ctx.Redis.Exists("open:p1"), 0, "open:p1 still points at the cancelled ticket (p1 cannot queue again until it expires); open:p1 exists")
 	ctx.Equal(ctx.Redis.Exists("open:p5"), 0, "open:p5, a party member's pointer, still points at the cancelled ticket (p5 cannot queue again until it expires; every participant's pointer that holds the ticket goes); open:p5 exists")
@@ -867,28 +867,28 @@ func CheckCancelLeavesPool(ctx *harness.Ctx) {
 	ctx.Assert(!dangling, "when cancelTicket first touched open:p1, ticket:t1 was already deleted and open:p1 still pointed at it: a crash there leaves p1 holding a pointer to a ticket that no longer exists. The pointers go in the same script as the ticket")
 	// A matchmaker claims t4 into m-2 the moment the cancel of t4 first touches the ticket.
 	rival := ctx.Redis.After("ticket:t4", func() any {
-		won, err := claims.ClaimTickets(poolBg, "m-2", 15, []string{"t4"})
+		won, err := claims.ClaimTickets(hPoolBg, "m-2", 15, []string{"t4"})
 		ctx.NoError(err, "the rival claim")
 		return won
 	})
-	cancelled, err := cancelTicket(poolBg, "t4")
+	cancelled, err := cancelTicket(hPoolBg, "t4")
 	ctx.NoError(err, "cancelTicket(t4)")
 	ctx.Assert(rival.Fired, "cancelTicket never touched ticket:t4")
 	ctx.Assert(rival.Err == nil, "the rival claim failed: %v", rival.Err)
 	if claimed, _ := rival.Result.(bool); claimed {
-		t4 := store.GetTicket(poolBg, "t4")
+		t4 := store.GetTicket(hPoolBg, "t4")
 		ctx.Assert(!cancelled, "a matchmaker claimed t4 into m-2 while cancelTicket(t4) ran, and the cancel still answered true (t4 is now %+v): m-2 waits for a player who left. The state check and the cleanup must be one script", t4)
 		p4Open, _ := ctx.Redis.Get("open:p4")
 		ctx.Assert(t4 != nil && t4.MatchID == "m-2" && p4Open == "t4", "the refused cancel changed t4, claimed by m-2: %+v, open:p4 = %q", t4, p4Open)
 	} else {
 		ctx.Assert(cancelled && ctx.Redis.Exists("ticket:t4") == 0, "cancelTicket(t4) ran before any claim and answered %t", cancelled)
 	}
-	ctx.Equal(poolDepth(ctx), len(poolMembers(ctx)), "after the cancel of t4 pool:depth must equal what waits in pool:15 %v; the depth", poolMembers(ctx))
-	ok, err = cancelTicket(poolBg, "t2")
+	ctx.Equal(hPoolDepth(ctx), len(hPoolMembers(ctx)), "after the cancel of t4 pool:depth must equal what waits in pool:15 %v; the depth", hPoolMembers(ctx))
+	ok, err = cancelTicket(hPoolBg, "t2")
 	ctx.NoError(err, "cancelTicket(t2)")
 	ctx.Equal(ok, false, "t2 is in match m-1: cancelling it must be refused")
 	pointer, _ := ctx.Redis.Get("open:p3")
-	ctx.Assert(store.GetTicket(poolBg, "t2").MatchID == "m-1" && pointer == "t2", "a refused cancel changed t2: %+v, open:p3 = %q", store.GetTicket(poolBg, "t2"), pointer)
+	ctx.Assert(store.GetTicket(hPoolBg, "t2").MatchID == "m-1" && pointer == "t2", "a refused cancel changed t2: %+v, open:p3 = %q", store.GetTicket(hPoolBg, "t2"), pointer)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -905,33 +905,33 @@ func CheckCancelLeavesPool(ctx *harness.Ctx) {
 namespace {
 
 // t1..tn wait in pool:15, each a solo ticket of p1..pn holding open:{p}.
-void poolSetup(harness::Ctx& ctx, int n) {
+void hPoolSetup(harness::Ctx& ctx, int n) {
   for (int i = 1; i <= n; i++) {
     store::enqueue("t" + std::to_string(i), "p" + std::to_string(i), 1500 + i, {"p" + std::to_string(i)});
     ctx.Redis.Set("open:p" + std::to_string(i), "t" + std::to_string(i));
   }
 }
 
-std::vector<std::string> poolMembers(harness::Ctx& ctx) {
+std::vector<std::string> hPoolMembers(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& z : ctx.Redis.ZRangeWithScores("pool:15", 0, -1)) ids.push_back(z.Member);
   std::sort(ids.begin(), ids.end());
   return ids;
 }
 
-long poolDepth(harness::Ctx& ctx) {
+long hPoolDepth(harness::Ctx& ctx) {
   const auto v = ctx.Redis.HGet("pool:depth", "15");
   return v && !v->empty() ? std::stol(*v) : 0;
 }
 
-bool poolHas(harness::Ctx& ctx, const std::string& ticket_id) { return ctx.Redis.ZScore("pool:15", ticket_id).has_value(); }
+bool hPoolHas(harness::Ctx& ctx, const std::string& ticket_id) { return ctx.Redis.ZScore("pool:15", ticket_id).has_value(); }
 
-bool poolWaiting(const std::string& ticket_id) {
+bool hPoolWaiting(const std::string& ticket_id) {
   const auto t = store::getTicket(ticket_id);
   return t && t->state == "waiting" && t->match_id.empty();
 }
 
-std::string matchOf(const std::string& ticket_id) {
+std::string hMatchOf(const std::string& ticket_id) {
   const auto t = store::getTicket(ticket_id);
   return t ? t->match_id : "(no ticket)";
 }
@@ -939,7 +939,7 @@ std::string matchOf(const std::string& ticket_id) {
 }  // namespace
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  poolSetup(ctx, 3);
+  hPoolSetup(ctx, 3);
   // A second matchmaker claims [t2, t3] the moment this one first touches t2.
   auto fired = std::make_shared<bool>(false);
   auto theirs = std::make_shared<bool>(false);
@@ -955,33 +955,33 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   const bool mine = claimTickets("m-1", 15, {"t1", "t2"});
   ctx.Assert(*fired, "claimTickets never touched ticket:t2");
   ctx.Assert(failed->empty(), "the rival claim failed: %s", *failed);
-  ctx.Assert(mine != *theirs, "two matchmakers claimed the overlapping rosters [t1, t2] and [t2, t3] and got m-1: %t, m-2: %t; t2 now belongs to %s. Exactly one claim may win, or a player is placed in two games", mine, *theirs, matchOf("t2"));
+  ctx.Assert(mine != *theirs, "two matchmakers claimed the overlapping rosters [t1, t2] and [t2, t3] and got m-1: %t, m-2: %t; t2 now belongs to %s. Exactly one claim may win, or a player is placed in two games", mine, *theirs, hMatchOf("t2"));
   const std::string winner = mine ? "m-1" : "m-2";
   const std::string other = mine ? "t3" : "t1";
-  ctx.Equal(matchOf("t2"), winner, "t2's match (the claim that won was %s's)", winner);
-  ctx.Assert(poolWaiting(other) && poolHas(ctx, other), "%s was only on the losing roster and must still wait in pool:15 (pool %q)", other, poolMembers(ctx));
-  ctx.Equal(poolDepth(ctx), static_cast<long>(poolMembers(ctx).size()), "pool:depth must equal what waits in pool:15 %q; the depth", poolMembers(ctx));
+  ctx.Equal(hMatchOf("t2"), winner, "t2's match (the claim that won was %s's)", winner);
+  ctx.Assert(hPoolWaiting(other) && hPoolHas(ctx, other), "%s was only on the losing roster and must still wait in pool:15 (pool %q)", other, hPoolMembers(ctx));
+  ctx.Equal(hPoolDepth(ctx), static_cast<long>(hPoolMembers(ctx).size()), "pool:depth must equal what waits in pool:15 %q; the depth", hPoolMembers(ctx));
 }
 
 void CheckAllOrNothing(harness::Ctx& ctx) {
-  poolSetup(ctx, 3);
+  hPoolSetup(ctx, 3);
   ctx.Equal(claimTickets("m-0", 15, {"t2"}), true, "claiming the waiting ticket t2");
   ctx.Equal(claimTickets("m-1", 15, {"t1", "t2"}), false, "t2 is already in m-0: claiming the roster [t1, t2]");
-  ctx.Assert(poolWaiting("t1") && poolHas(ctx, "t1"), "the refused claim left t1 claimed by %s (pool %q): a ticket claimed by a match that never forms, its player stuck in neither", matchOf("t1"), poolMembers(ctx));
-  ctx.Equal(matchOf("t2"), "m-0", "the refused claim must not take t2 from m-0; t2's match");
+  ctx.Assert(hPoolWaiting("t1") && hPoolHas(ctx, "t1"), "the refused claim left t1 claimed by %s (pool %q): a ticket claimed by a match that never forms, its player stuck in neither", hMatchOf("t1"), hPoolMembers(ctx));
+  ctx.Equal(hMatchOf("t2"), "m-0", "the refused claim must not take t2 from m-0; t2's match");
   ctx.Equal(claimTickets("m-3", 15, {"t3", "t9"}), false, "a roster with an unknown ticket t9");
-  ctx.Assert(poolWaiting("t3") && poolHas(ctx, "t3"), "the claim refused for the unknown t9 left t3 claimed by %s", matchOf("t3"));
+  ctx.Assert(hPoolWaiting("t3") && hPoolHas(ctx, "t3"), "the claim refused for the unknown t9 left t3 claimed by %s", hMatchOf("t3"));
 }
 
 void CheckDepthCounter(harness::Ctx& ctx) {
-  poolSetup(ctx, 3);
-  ctx.Equal(poolDepth(ctx), 3, "three tickets were queued; pool:depth");
+  hPoolSetup(ctx, 3);
+  ctx.Equal(hPoolDepth(ctx), 3, "three tickets were queued; pool:depth");
   ctx.Equal(claimTickets("m-1", 15, {"t1", "t2"}), true, "claiming t1 and t2");
-  ctx.Assert(poolDepth(ctx) == 1 && poolMembers(ctx).size() == 1, "after a claim of two tickets pool:depth is %d and pool:15 holds %q: the counter must move by the tickets claimed", poolDepth(ctx), poolMembers(ctx));
+  ctx.Assert(hPoolDepth(ctx) == 1 && hPoolMembers(ctx).size() == 1, "after a claim of two tickets pool:depth is %d and pool:15 holds %q: the counter must move by the tickets claimed", hPoolDepth(ctx), hPoolMembers(ctx));
   ctx.Equal(claimTickets("m-2", 15, {"t1"}), false, "t1 is already claimed");
-  ctx.Equal(poolDepth(ctx), 1, "a refused claim must not move pool:depth");
+  ctx.Equal(hPoolDepth(ctx), 1, "a refused claim must not move pool:depth");
   ctx.Equal(claimTickets("m-3", 15, {"t3"}), true, "claiming t3");
-  ctx.Equal(poolDepth(ctx), 0, "after the last ticket was claimed, pool:depth");
+  ctx.Equal(hPoolDepth(ctx), 0, "after the last ticket was claimed, pool:depth");
 }
 
 void CheckCancelLeavesPool(harness::Ctx& ctx) {
@@ -1002,8 +1002,8 @@ void CheckCancelLeavesPool(harness::Ctx& ctx) {
     *dangling = ctx.Redis.Exists("ticket:t1") == 0 && ctx.Redis.Get("open:p1") == std::optional<std::string>("t1");
   });
   ctx.Equal(cancelTicket("t1"), true, "cancelling the waiting ticket t1");
-  ctx.Assert(!poolHas(ctx, "t1"), "the cancelled t1 still waits in pool:15 %q: the next matchmaker claims a ticket nobody is behind", poolMembers(ctx));
-  ctx.Equal(poolDepth(ctx), static_cast<long>(poolMembers(ctx).size()), "after the cancel pool:depth must equal what waits in pool:15 %q; the depth", poolMembers(ctx));
+  ctx.Assert(!hPoolHas(ctx, "t1"), "the cancelled t1 still waits in pool:15 %q: the next matchmaker claims a ticket nobody is behind", hPoolMembers(ctx));
+  ctx.Equal(hPoolDepth(ctx), static_cast<long>(hPoolMembers(ctx).size()), "after the cancel pool:depth must equal what waits in pool:15 %q; the depth", hPoolMembers(ctx));
   ctx.Equal(ctx.Redis.Exists("ticket:t1"), 0, "the cancelled ticket's hash must be gone");
   ctx.Equal(ctx.Redis.Exists("open:p1"), 0, "open:p1 still points at the cancelled ticket (p1 cannot queue again until it expires); open:p1 exists");
   ctx.Equal(ctx.Redis.Exists("open:p5"), 0, "open:p5, a party member's pointer, still points at the cancelled ticket (p5 cannot queue again until it expires; every participant's pointer that holds the ticket goes); open:p5 exists");
@@ -1027,14 +1027,14 @@ void CheckCancelLeavesPool(harness::Ctx& ctx) {
   ctx.Assert(*fired, "cancelTicket never touched ticket:t4");
   ctx.Assert(failed->empty(), "the rival claim failed: %s", *failed);
   if (*claimed) {
-    ctx.Assert(!cancelled, "a matchmaker claimed t4 into m-2 while cancelTicket(t4) ran, and the cancel still answered true (t4's match is now %s): m-2 waits for a player who left. The state check and the cleanup must be one script", matchOf("t4"));
-    ctx.Assert(matchOf("t4") == "m-2" && ctx.Redis.Get("open:p4") == std::optional<std::string>("t4"), "the refused cancel changed t4, claimed by m-2 (match %s) or open:p4", matchOf("t4"));
+    ctx.Assert(!cancelled, "a matchmaker claimed t4 into m-2 while cancelTicket(t4) ran, and the cancel still answered true (t4's match is now %s): m-2 waits for a player who left. The state check and the cleanup must be one script", hMatchOf("t4"));
+    ctx.Assert(hMatchOf("t4") == "m-2" && ctx.Redis.Get("open:p4") == std::optional<std::string>("t4"), "the refused cancel changed t4, claimed by m-2 (match %s) or open:p4", hMatchOf("t4"));
   } else {
     ctx.Assert(cancelled && ctx.Redis.Exists("ticket:t4") == 0, "cancelTicket(t4) ran before any claim and answered %t", cancelled);
   }
-  ctx.Equal(poolDepth(ctx), static_cast<long>(poolMembers(ctx).size()), "after the cancel of t4 pool:depth must equal what waits in pool:15 %q; the depth", poolMembers(ctx));
+  ctx.Equal(hPoolDepth(ctx), static_cast<long>(hPoolMembers(ctx).size()), "after the cancel of t4 pool:depth must equal what waits in pool:15 %q; the depth", hPoolMembers(ctx));
   ctx.Equal(cancelTicket("t2"), false, "t2 is in match m-1: cancelling it must be refused");
-  ctx.Assert(matchOf("t2") == "m-1" && ctx.Redis.Get("open:p3") == std::optional<std::string>("t2"), "a refused cancel changed t2 (match %s) or open:p3", matchOf("t2"));
+  ctx.Assert(hMatchOf("t2") == "m-1" && ctx.Redis.Get("open:p3") == std::optional<std::string>("t2"), "a refused cancel changed t2 (match %s) or open:p3", hMatchOf("t2"));
 }
 `,
   },

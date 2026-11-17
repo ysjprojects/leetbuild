@@ -895,36 +895,36 @@ import (
 )
 
 const (
-	clientRef  = "s3://calls/2026-11-02/support-0412.wav"
-	audioMs    = 90000
-	segmentMs  = 10000
-	speakers   = "AB"
-	noBreaking = -1
+	kHClientRef  = "s3://calls/2026-11-02/support-0412.wav"
+	kHAudioMs    = 90000
+	kHSegmentMs  = 10000
+	kHSpeakers   = "AB"
+	kHNoBreaking = -1
 )
 
 // asrPeer is ninety seconds of audio, one 10-second segment after another; with breakAfter >= 0,
 // the next stream fails UNAVAILABLE after that many segments (with breakAlways, every stream
 // fails, even one that reached the end of its span).
-type asrPeer struct {
+type HAsrPeer struct {
 	pb.UnimplementedAsrServer
 	breakAfter  int
 	breakAlways bool
 }
 
-func (p *asrPeer) TranscribeChunk(req *pb.ChunkRequest, srv pb.Asr_TranscribeChunkServer) error {
-	end := audioMs
+func (p *HAsrPeer) TranscribeChunk(req *pb.ChunkRequest, srv pb.Asr_TranscribeChunkServer) error {
+	end := kHAudioMs
 	if req.GetDurationMs() != 0 {
-		end = min(audioMs, int(req.GetOffsetMs()+req.GetDurationMs()))
+		end = min(kHAudioMs, int(req.GetOffsetMs()+req.GetDurationMs()))
 	}
 	sent := 0
-	for t := int(req.GetOffsetMs()); t < end; t += segmentMs {
+	for t := int(req.GetOffsetMs()); t < end; t += kHSegmentMs {
 		if p.breakAfter >= 0 && sent == p.breakAfter {
 			if !p.breakAlways {
-				p.breakAfter = noBreaking
+				p.breakAfter = kHNoBreaking
 			}
 			return status.Error(codes.Unavailable, "asr worker restarted mid-stream")
 		}
-		seg := &pb.Segment{StartMs: int32(t), EndMs: int32(min(t+segmentMs, end)), Speaker: string(speakers[(t/segmentMs)%2]), Text: fmt.Sprintf("words at %d s", t/1000)}
+		seg := &pb.Segment{StartMs: int32(t), EndMs: int32(min(t+kHSegmentMs, end)), Speaker: string(kHSpeakers[(t/kHSegmentMs)%2]), Text: fmt.Sprintf("words at %d s", t/1000)}
 		if err := srv.Send(seg); err != nil {
 			return err
 		}
@@ -936,15 +936,15 @@ func (p *asrPeer) TranscribeChunk(req *pb.ChunkRequest, srv pb.Asr_TranscribeChu
 	return nil
 }
 
-func asrWorld(ctx *harness.Ctx) *asrPeer {
-	peer := &asrPeer{breakAfter: noBreaking}
+func hAsrWorld(ctx *harness.Ctx) *HAsrPeer {
+	peer := &HAsrPeer{breakAfter: kHNoBreaking}
 	pb.RegisterAsrServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func asrCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("TranscribeChunk", "") }
+func hAsrCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("TranscribeChunk", "") }
 
-func startsOf(segments []jobs.Segment) []int {
+func hStartsOf(segments []jobs.Segment) []int {
 	out := []int{}
 	for _, s := range segments {
 		out = append(out, s.StartMs)
@@ -952,23 +952,23 @@ func startsOf(segments []jobs.Segment) []int {
 	return out
 }
 
-func mustTranscribe(ctx *harness.Ctx, index int) []jobs.Segment {
-	segments, err := transcribeChunk(context.Background(), "tr-1", clientRef, index)
+func hMustTranscribe(ctx *harness.Ctx, index int) []jobs.Segment {
+	segments, err := transcribeChunk(context.Background(), "tr-1", kHClientRef, index)
 	ctx.NoError(err, "transcribeChunk(chunk %d) failed", index)
 	return segments
 }
 
-func mustFail(ctx *harness.Ctx, target error, why string) {
-	segments, err := transcribeChunk(context.Background(), "tr-1", clientRef, 1)
+func hMustFail(ctx *harness.Ctx, target error, why string) {
+	segments, err := transcribeChunk(context.Background(), "tr-1", kHClientRef, 1)
 	ctx.Assert(err != nil, "%s: transcribeChunk returned %d segments instead of an error wrapping %v", why, len(segments), target)
 	ctx.ErrorIs(err, target, "%s: transcribeChunk returned %v", why, err)
 }
 
 func CheckChunkSpan(ctx *harness.Ctx) {
-	asrWorld(ctx)
-	segments := mustTranscribe(ctx, 1)
-	req := asrCalls(ctx)[0].Request.(*pb.ChunkRequest)
-	ctx.Equal(startsOf(segments), []int{30000, 40000, 50000}, "chunk 1 is the 30 s from 30 000 ms; the request asked for offset %d ms, duration %d ms (0 is the whole file); the segment starts", req.GetOffsetMs(), req.GetDurationMs())
+	hAsrWorld(ctx)
+	segments := hMustTranscribe(ctx, 1)
+	req := hAsrCalls(ctx)[0].Request.(*pb.ChunkRequest)
+	ctx.Equal(hStartsOf(segments), []int{30000, 40000, 50000}, "chunk 1 is the 30 s from 30 000 ms; the request asked for offset %d ms, duration %d ms (0 is the whole file); the segment starts", req.GetOffsetMs(), req.GetDurationMs())
 	ctx.Assert(req.GetChunkIndex() == 1 && req.GetOffsetMs() == 30000 && req.GetDurationMs() == 30000, "the request was chunk %d, offset %d, duration %d; expected 1, 30000, 30000", req.GetChunkIndex(), req.GetOffsetMs(), req.GetDurationMs())
 	for _, s := range segments {
 		ctx.Equal(s.ChunkIndex, 1, "every segment belongs to chunk 1 (%+v)", s)
@@ -976,21 +976,21 @@ func CheckChunkSpan(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer := asrWorld(ctx)
-	mustTranscribe(ctx, 0)
-	call := asrCalls(ctx)[0]
+	peer := hAsrWorld(ctx)
+	hMustTranscribe(ctx, 0)
+	call := hAsrCalls(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "the TranscribeChunk stream carries no deadline: a stalled provider holds the worker and its chunk indefinitely")
 	ctx.Assert(59*time.Second <= call.Timeout && call.Timeout <= 61*time.Second, "the TranscribeChunk stream carries a %v deadline, expected 60 s", call.Timeout)
 	ctx.GRPC.SetLatency("TranscribeChunk", 120.0, "")
-	mustFail(ctx, ErrAsrUnavailable, "with the provider stalled past the deadline")
-	ctx.Equal(len(asrCalls(ctx))-1, 2, "a stalled provider gets its two attempts, then the chunk is given up; attempts")
+	hMustFail(ctx, ErrAsrUnavailable, "with the provider stalled past the deadline")
+	ctx.Equal(len(hAsrCalls(ctx))-1, 2, "a stalled provider gets its two attempts, then the chunk is given up; attempts")
 	// A slow provider answers 59 s into each stream, and the first stream breaks after one segment.
 	ctx.GRPC.SetLatency("TranscribeChunk", 59.0, "")
 	peer.breakAfter = 1
-	_, err := transcribeChunk(context.Background(), "tr-1", clientRef, 1)
+	_, err := transcribeChunk(context.Background(), "tr-1", kHClientRef, 1)
 	var timeouts []time.Duration
 	ok := true
-	for _, c := range asrCalls(ctx)[3:] {
+	for _, c := range hAsrCalls(ctx)[3:] {
 		timeouts = append(timeouts, c.Timeout)
 		ok = ok && c.HasDeadline() && 59*time.Second <= c.Timeout && c.Timeout <= 61*time.Second
 	}
@@ -999,33 +999,33 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckMaxAttempts(ctx *harness.Ctx) {
-	peer := asrWorld(ctx)
+	peer := hAsrWorld(ctx)
 	// Every stream breaks after one segment: the chunk is never whole.
 	peer.breakAfter, peer.breakAlways = 1, true
-	mustFail(ctx, ErrAsrUnavailable, "with every stream breaking after one segment (the chunk is never complete)")
-	ctx.Equal(len(asrCalls(ctx)), 2, "a provider whose streams keep breaking is asked MAX_ATTEMPTS = 2 times for one chunk; attempts")
-	peer.breakAfter, peer.breakAlways = noBreaking, false
+	hMustFail(ctx, ErrAsrUnavailable, "with every stream breaking after one segment (the chunk is never complete)")
+	ctx.Equal(len(hAsrCalls(ctx)), 2, "a provider whose streams keep breaking is asked MAX_ATTEMPTS = 2 times for one chunk; attempts")
+	peer.breakAfter, peer.breakAlways = kHNoBreaking, false
 	ctx.GRPC.Fail("TranscribeChunk", codes.Unavailable, "asr overloaded", 10, "")
-	mustFail(ctx, ErrAsrUnavailable, "with the provider unavailable")
-	ctx.Equal(len(asrCalls(ctx))-2, 2, "an unavailable provider is asked MAX_ATTEMPTS = 2 times for one chunk (each attempt is billed); attempts")
+	hMustFail(ctx, ErrAsrUnavailable, "with the provider unavailable")
+	ctx.Equal(len(hAsrCalls(ctx))-2, 2, "an unavailable provider is asked MAX_ATTEMPTS = 2 times for one chunk (each attempt is billed); attempts")
 }
 
 func CheckResumeOffset(ctx *harness.Ctx) {
-	peer := asrWorld(ctx)
+	peer := hAsrWorld(ctx)
 	peer.breakAfter = 1
-	segments := mustTranscribe(ctx, 1)
-	ctx.Equal(startsOf(segments), []int{30000, 40000, 50000}, "after a stream broke one segment into chunk 1, every segment of the chunk once; the segment starts")
-	calls := asrCalls(ctx)
+	segments := hMustTranscribe(ctx, 1)
+	ctx.Equal(hStartsOf(segments), []int{30000, 40000, 50000}, "after a stream broke one segment into chunk 1, every segment of the chunk once; the segment starts")
+	calls := hAsrCalls(ctx)
 	ctx.Equal(len(calls), 2, "one broken stream and its retry; calls")
 	retry := calls[1].Request.(*pb.ChunkRequest)
 	ctx.Assert(retry.GetOffsetMs() == 40000 && retry.GetDurationMs() == 20000, "the retry asked for offset %d ms, duration %d ms; expected 40 000 (where the first stream stopped) for the remaining 20 000 ms", retry.GetOffsetMs(), retry.GetDurationMs())
 }
 
 func CheckCorruptTerminal(ctx *harness.Ctx) {
-	asrWorld(ctx)
+	hAsrWorld(ctx)
 	ctx.GRPC.Fail("TranscribeChunk", codes.InvalidArgument, "corrupt audio: no decodable frames", 5, "")
-	mustFail(ctx, ErrCorruptAudio, "with audio the provider cannot decode")
-	ctx.Equal(len(asrCalls(ctx)), 1, "INVALID_ARGUMENT fails the same way on every attempt; attempts")
+	hMustFail(ctx, ErrCorruptAudio, "with audio the provider cannot decode")
+	ctx.Equal(len(hAsrCalls(ctx)), 1, "INVALID_ARGUMENT fails the same way on every attempt; attempts")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1037,30 +1037,30 @@ func CheckCorruptTerminal(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kClientRef = "s3://calls/2026-11-02/support-0412.wav";
-constexpr int kAudioMs = 90000;
-constexpr int kSegmentMs = 10000;
+const std::string kHClientRef = "s3://calls/2026-11-02/support-0412.wav";
+constexpr int kHAudioMs = 90000;
+constexpr int kHSegmentMs = 10000;
 
 // Ninety seconds of audio, one 10-second segment after another; with break_after >= 0, the next
 // stream fails UNAVAILABLE after that many segments (with break_always, every stream fails, even
 // one that reached the end of its span).
-class AsrPeer final : public transcribe::Asr::Service {
+class HAsrPeer final : public transcribe::Asr::Service {
  public:
   int break_after = -1;
   bool break_always = false;
 
   grpc::Status TranscribeChunk(grpc::ServerContext*, const transcribe::ChunkRequest* req, grpc::ServerWriter<transcribe::Segment>* srv) override {
-    const int end = req->duration_ms() == 0 ? kAudioMs : std::min(kAudioMs, req->offset_ms() + req->duration_ms());
+    const int end = req->duration_ms() == 0 ? kHAudioMs : std::min(kHAudioMs, req->offset_ms() + req->duration_ms());
     int sent = 0;
-    for (int t = req->offset_ms(); t < end; t += kSegmentMs) {
+    for (int t = req->offset_ms(); t < end; t += kHSegmentMs) {
       if (break_after >= 0 && sent == break_after) {
         if (!break_always) break_after = -1;
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "asr worker restarted mid-stream");
       }
       transcribe::Segment seg;
       seg.set_start_ms(t);
-      seg.set_end_ms(std::min(t + kSegmentMs, end));
-      seg.set_speaker((t / kSegmentMs) % 2 == 0 ? "A" : "B");
+      seg.set_end_ms(std::min(t + kHSegmentMs, end));
+      seg.set_speaker((t / kHSegmentMs) % 2 == 0 ? "A" : "B");
       seg.set_text("words at " + std::to_string(t / 1000) + " s");
       if (!srv->Write(seg)) return grpc::Status::CANCELLED;
       sent++;
@@ -1070,23 +1070,23 @@ class AsrPeer final : public transcribe::Asr::Service {
   }
 };
 
-AsrPeer& asrWorld(harness::Ctx& ctx) {
-  static AsrPeer* peer = nullptr;
+HAsrPeer& hAsrWorld(harness::Ctx& ctx) {
+  static HAsrPeer* peer = nullptr;
   delete peer;
-  peer = new AsrPeer;
+  peer = new HAsrPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::vector<int> startsOf(const std::vector<jobs::Segment>& segments) {
+std::vector<int> hStartsOf(const std::vector<jobs::Segment>& segments) {
   std::vector<int> out;
   for (const auto& s : segments) out.push_back(s.start_ms);
   return out;
 }
 
-std::vector<jobs::Segment> mustTranscribe(harness::Ctx& ctx, int index) {
+std::vector<jobs::Segment> hMustTranscribe(harness::Ctx& ctx, int index) {
   try {
-    return transcribeChunk("tr-1", kClientRef, index);
+    return transcribeChunk("tr-1", kHClientRef, index);
   } catch (const std::exception& e) {
     ctx.Fatalf("transcribeChunk(chunk %d) threw %s: %s", index, harness::CurrentExceptionType(), e.what());
   }
@@ -1094,10 +1094,10 @@ std::vector<jobs::Segment> mustTranscribe(harness::Ctx& ctx, int index) {
 }
 
 template <class E>
-void mustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& why) {
+void hMustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& why) {
   size_t got = 0;
   try {
-    got = transcribeChunk("tr-1", kClientRef, 1).size();
+    got = transcribeChunk("tr-1", kHClientRef, 1).size();
   } catch (const E&) {
     return;
   } catch (const std::exception& e) {
@@ -1109,29 +1109,29 @@ void mustThrow(harness::Ctx& ctx, const std::string& expected, const std::string
 }  // namespace
 
 void CheckChunkSpan(harness::Ctx& ctx) {
-  asrWorld(ctx);
-  const auto segments = mustTranscribe(ctx, 1);
+  hAsrWorld(ctx);
+  const auto segments = hMustTranscribe(ctx, 1);
   const auto req = ctx.GRPC.CallsTo("TranscribeChunk")[0].Request<transcribe::ChunkRequest>();
-  ctx.Equal(startsOf(segments), {30000, 40000, 50000}, "chunk 1 is the 30 s from 30 000 ms; the request asked for offset %d ms, duration %d ms (0 is the whole file); the segment starts", req.offset_ms(), req.duration_ms());
+  ctx.Equal(hStartsOf(segments), {30000, 40000, 50000}, "chunk 1 is the 30 s from 30 000 ms; the request asked for offset %d ms, duration %d ms (0 is the whole file); the segment starts", req.offset_ms(), req.duration_ms());
   ctx.Assert(req.chunk_index() == 1 && req.offset_ms() == 30000 && req.duration_ms() == 30000, "the request was chunk %d, offset %d, duration %d; expected 1, 30000, 30000", req.chunk_index(), req.offset_ms(), req.duration_ms());
   for (const auto& s : segments) ctx.Equal(s.chunk_index, 1, "every segment belongs to chunk 1; its chunk_index");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  AsrPeer& peer = asrWorld(ctx);
-  mustTranscribe(ctx, 0);
+  HAsrPeer& peer = hAsrWorld(ctx);
+  hMustTranscribe(ctx, 0);
   const auto call = ctx.GRPC.CallsTo("TranscribeChunk")[0];
   ctx.Assert(call.HasDeadline(), "the TranscribeChunk stream carries no deadline: a stalled provider holds the worker and its chunk indefinitely");
   ctx.Assert(59 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 61, "the TranscribeChunk stream carries a %v s deadline, expected kDeadline = 60 s", call.TimeoutSeconds());
   ctx.GRPC.SetLatency("TranscribeChunk", 120.0);
-  mustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with the provider stalled past the deadline");
+  hMustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with the provider stalled past the deadline");
   ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size() - 1, 2, "a stalled provider gets its two attempts, then the chunk is given up; attempts");
   // A slow provider answers 59 s into each stream, and the first stream breaks after one segment.
   ctx.GRPC.SetLatency("TranscribeChunk", 59.0);
   peer.break_after = 1;
   std::string error;
   try {
-    transcribeChunk("tr-1", kClientRef, 1);
+    transcribeChunk("tr-1", kHClientRef, 1);
   } catch (const std::exception& e) {
     error = std::string(harness::CurrentExceptionType()) + ": " + e.what();
   }
@@ -1147,24 +1147,24 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckMaxAttempts(harness::Ctx& ctx) {
-  AsrPeer& peer = asrWorld(ctx);
+  HAsrPeer& peer = hAsrWorld(ctx);
   // Every stream breaks after one segment: the chunk is never whole.
   peer.break_after = 1;
   peer.break_always = true;
-  mustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with every stream breaking after one segment (the chunk is never complete)");
+  hMustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with every stream breaking after one segment (the chunk is never complete)");
   ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size(), 2, "a provider whose streams keep breaking is asked kMaxAttempts = 2 times for one chunk; attempts");
   peer.break_after = -1;
   peer.break_always = false;
   ctx.GRPC.Fail("TranscribeChunk", grpc::StatusCode::UNAVAILABLE, "asr overloaded", 10);
-  mustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with the provider unavailable");
+  hMustThrow<AsrUnavailable>(ctx, "AsrUnavailable", "with the provider unavailable");
   ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size() - 2, 2, "an unavailable provider is asked kMaxAttempts = 2 times for one chunk (each attempt is billed); attempts");
 }
 
 void CheckResumeOffset(harness::Ctx& ctx) {
-  AsrPeer& peer = asrWorld(ctx);
+  HAsrPeer& peer = hAsrWorld(ctx);
   peer.break_after = 1;
-  const auto segments = mustTranscribe(ctx, 1);
-  ctx.Equal(startsOf(segments), {30000, 40000, 50000}, "after a stream broke one segment into chunk 1, every segment of the chunk once; the segment starts");
+  const auto segments = hMustTranscribe(ctx, 1);
+  ctx.Equal(hStartsOf(segments), {30000, 40000, 50000}, "after a stream broke one segment into chunk 1, every segment of the chunk once; the segment starts");
   const auto calls = ctx.GRPC.CallsTo("TranscribeChunk");
   ctx.Equal(calls.size(), 2, "one broken stream and its retry; calls");
   const auto retry = calls[1].Request<transcribe::ChunkRequest>();
@@ -1172,9 +1172,9 @@ void CheckResumeOffset(harness::Ctx& ctx) {
 }
 
 void CheckCorruptTerminal(harness::Ctx& ctx) {
-  asrWorld(ctx);
+  hAsrWorld(ctx);
   ctx.GRPC.Fail("TranscribeChunk", grpc::StatusCode::INVALID_ARGUMENT, "corrupt audio: no decodable frames", 5);
-  mustThrow<CorruptAudio>(ctx, "CorruptAudio", "with audio the provider cannot decode");
+  hMustThrow<CorruptAudio>(ctx, "CorruptAudio", "with audio the provider cannot decode");
   ctx.Equal(ctx.GRPC.CallsTo("TranscribeChunk").size(), 1, "INVALID_ARGUMENT fails the same way on every attempt; attempts");
 }
 `,

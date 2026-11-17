@@ -1002,114 +1002,114 @@ import (
 	"leetbuild/harness"
 )
 
-const readJobID = "j1"
+const kHReadJobID = "j1"
 
-func readSeed(ctx *harness.Ctx, sampled, accepted, rejected, duplicate int, reasons map[string]int, updatedAt int64) {
-	row, _ := json.Marshal(map[string]any{"job_id": readJobID, "status": "running", "teacher": "teach-70b-v3", "dataset_id": "ds-support", "sample_cap": 1000, "sampled": 0, "accepted": 0, "rejected": 0, "tenant": "t1"})
-	ctx.Redis.Set("distill:job:"+readJobID, string(row))
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "sampled", sampled, "accepted", accepted, "rejected", rejected, "duplicate", duplicate, "updated_at", updatedAt)
+func hReadSeed(ctx *harness.Ctx, sampled, accepted, rejected, duplicate int, reasons map[string]int, updatedAt int64) {
+	row, _ := json.Marshal(map[string]any{"job_id": kHReadJobID, "status": "running", "teacher": "teach-70b-v3", "dataset_id": "ds-support", "sample_cap": 1000, "sampled": 0, "accepted": 0, "rejected": 0, "tenant": "t1"})
+	ctx.Redis.Set("distill:job:"+kHReadJobID, string(row))
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "sampled", sampled, "accepted", accepted, "rejected", rejected, "duplicate", duplicate, "updated_at", updatedAt)
 	for reason, n := range reasons {
-		ctx.Redis.Do("HSET", "distill:reasons:"+readJobID, reason, n)
+		ctx.Redis.Do("HSET", "distill:reasons:"+kHReadJobID, reason, n)
 	}
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readReport(c *harness.HTTP, jobID string, header ...string) *harness.Response {
+func hReadReport(c *harness.HTTP, jobID string, header ...string) *harness.Response {
 	if len(header) == 0 {
 		header = []string{"X-Tenant-Id", "t1"}
 	}
 	return c.Get("/v1/distill/jobs/"+jobID, header...)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the report must be a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, 10, 7, 3, 4, map[string]int{"refusal": 3}, 1_700_000_000)
-	c := readClient(ctx)
-	r := c.Get("/v1/distill/jobs/" + readJobID)
+	hReadSeed(ctx, 10, 7, 3, 4, map[string]int{"refusal": 3}, 1_700_000_000)
+	c := hReadClient(ctx)
+	r := c.Get("/v1/distill/jobs/" + kHReadJobID)
 	ctx.Equal(r.Status, 401, "without X-Tenant-Id the report")
-	r = readReport(c, "nope")
+	r = hReadReport(c, "nope")
 	ctx.Equal(r.Status, 404, "an unknown job")
-	r = readReport(c, readJobID, "X-Tenant-Id", "t2")
+	r = hReadReport(c, kHReadJobID, "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "another tenant's job")
-	r = readReport(c, readJobID)
+	r = hReadReport(c, kHReadJobID)
 	ctx.Equal(r.Status, 200, "the report (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	for _, key := range []string{"job_id", "status", "sampled", "accepted", "rejected", "acceptance_rate"} {
 		_, ok := body[key]
 		ctx.Assert(ok, "the report lacks %s: %s", key, r.Text())
 	}
-	ctx.Assert(body["job_id"] == readJobID && body["status"] == "running", "the report names the job and its status: %s", r.Text())
+	ctx.Assert(body["job_id"] == kHReadJobID && body["status"] == "running", "the report names the job and its status: %s", r.Text())
 	ctx.Equal([]any{body["sampled"], body["accepted"], body["rejected"]}, []any{10, 7, 3}, "the counts must be the job's")
 	rate, _ := body["acceptance_rate"].(float64)
 	ctx.Assert(math.Abs(rate-0.7) < 1e-9, "acceptance_rate must be accepted / sampled = 0.7, got %v", body["acceptance_rate"])
 }
 
 func CheckReconcile(ctx *harness.Ctx) {
-	readSeed(ctx, 10, 3, 5, 0, map[string]int{"refusal": 5}, 1_700_000_000) // two samples reserved by a worker that died before it recorded
-	c := readClient(ctx)
-	r := readReport(c, readJobID)
+	hReadSeed(ctx, 10, 3, 5, 0, map[string]int{"refusal": 5}, 1_700_000_000) // two samples reserved by a worker that died before it recorded
+	c := hReadClient(ctx)
+	r := hReadReport(c, kHReadJobID)
 	ctx.Equal(r.Status, 409, "sampled 10, accepted 3, rejected 5 do not reconcile (%s): accepted = sampled - rejected would call the two lost samples accepted; the status", r.Text())
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "rejected", 7)
-	r = readReport(c, readJobID)
-	body := readBody(ctx, r)
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "rejected", 7)
+	r = hReadReport(c, kHReadJobID)
+	body := hReadBody(ctx, r)
 	ctx.Assert(r.Status == 200 && body["accepted"] == float64(3) && body["rejected"] == float64(7), "once the counts reconcile the report is 200 with the live accepted and rejected, got %d: %s", r.Status, r.Text())
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 5)
-	r = readReport(c, readJobID)
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "accepted", 5)
+	r = hReadReport(c, kHReadJobID)
 	ctx.Equal(r.Status, 409, "sampled 10, accepted 5, rejected 7: more outcomes than samples do not reconcile either (a sample recorded twice) (%s); the status", r.Text())
 }
 
 func CheckReasons(ctx *harness.Ctx) {
-	readSeed(ctx, 10, 5, 5, 0, map[string]int{"refusal": 3, "empty": 1, "deadline": 1}, 1_700_000_000)
-	c := readClient(ctx)
-	r := readReport(c, readJobID)
+	hReadSeed(ctx, 10, 5, 5, 0, map[string]int{"refusal": 3, "empty": 1, "deadline": 1}, 1_700_000_000)
+	c := hReadClient(ctx)
+	r := hReadReport(c, kHReadJobID)
 	ctx.Equal(r.Status, 200, "the report (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	ctx.Equal(body["reasons"], map[string]any{"refusal": 3, "empty": 1, "deadline": 1}, "reasons must be the distill:reasons hash as numbers")
 	ctx.Equal(body["rejected"], 5, "rejected stays the count")
 }
 
 func CheckImplausibleRate(ctx *harness.Ctx) {
-	readSeed(ctx, 100, 98, 2, 0, map[string]int{"refusal": 2}, 1_700_000_000)
-	c := readClient(ctx)
-	r := readReport(c, readJobID)
-	body := readBody(ctx, r)
+	hReadSeed(ctx, 100, 98, 2, 0, map[string]int{"refusal": 2}, 1_700_000_000)
+	c := hReadClient(ctx)
+	r := hReadReport(c, kHReadJobID)
+	body := hReadBody(ctx, r)
 	rate, _ := body["acceptance_rate"].(float64)
 	ctx.Assert(r.Status == 200 && math.Abs(rate-0.98) < 1e-9, "a 98 percent run is reported, got %d: %s", r.Status, r.Text())
 	ctx.Equal(body["flagged"], "implausible_acceptance_rate", "98 percent accepted is above the 95 percent ceiling and must be flagged; flagged")
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 90, "rejected", 10)
-	body = readBody(ctx, readReport(c, readJobID))
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "accepted", 90, "rejected", 10)
+	body = hReadBody(ctx, hReadReport(c, kHReadJobID))
 	ctx.Assert(body["flagged"] == nil, "90 percent is within the ceiling: flagged must be null, got %v", body["flagged"])
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 95, "rejected", 5)
-	body = readBody(ctx, readReport(c, readJobID))
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "accepted", 95, "rejected", 5)
+	body = hReadBody(ctx, hReadReport(c, kHReadJobID))
 	ctx.Assert(body["flagged"] == nil, "exactly 95 percent is at the ceiling, not above it: flagged must be null, got %v", body["flagged"])
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "accepted", 96, "rejected", 4)
-	body = readBody(ctx, readReport(c, readJobID))
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "accepted", 96, "rejected", 4)
+	body = hReadBody(ctx, hReadReport(c, kHReadJobID))
 	ctx.Equal(body["flagged"], "implausible_acceptance_rate", "96 percent is above the ceiling and must be flagged; flagged")
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "sampled", 0, "accepted", 0, "rejected", 0)
-	r = readReport(c, readJobID)
-	body = readBody(ctx, r)
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "sampled", 0, "accepted", 0, "rejected", 0)
+	r = hReadReport(c, kHReadJobID)
+	body = hReadBody(ctx, r)
 	ctx.Assert(r.Status == 200 && body["flagged"] == nil && body["acceptance_rate"] == float64(0), "an empty job has rate 0 and no flag, got %d: %s", r.Status, r.Text())
 }
 
 func CheckLiveCounters(ctx *harness.Ctx) {
-	readSeed(ctx, 10, 7, 3, 2, map[string]int{"refusal": 3}, 1_700_000_000)
-	c := readClient(ctx)
-	first := readBody(ctx, readReport(c, readJobID))
+	hReadSeed(ctx, 10, 7, 3, 2, map[string]int{"refusal": 3}, 1_700_000_000)
+	c := hReadClient(ctx)
+	first := hReadBody(ctx, hReadReport(c, kHReadJobID))
 	ctx.Equal(first["updated_at"], 1_700_000_000, "the report must carry the progress hash's updated_at")
 	ctx.Equal(first["duplicate"], 2, "the report carries the duplicate count")
-	ctx.Redis.Do("HSET", "distill:progress:"+readJobID, "sampled", 12, "rejected", 5, "updated_at", 1_700_000_300)
-	ctx.Redis.Do("HINCRBY", "distill:reasons:"+readJobID, "deadline", 2)
-	second := readBody(ctx, readReport(c, readJobID))
+	ctx.Redis.Do("HSET", "distill:progress:"+kHReadJobID, "sampled", 12, "rejected", 5, "updated_at", 1_700_000_300)
+	ctx.Redis.Do("HINCRBY", "distill:reasons:"+kHReadJobID, "deadline", 2)
+	second := hReadBody(ctx, hReadReport(c, kHReadJobID))
 	ctx.Equal([]any{second["sampled"], second["accepted"], second["rejected"]}, []any{12, 7, 5}, "two rejections landed after the first read (read the live counters on every request); sampled, accepted, rejected")
 	ctx.Equal(second["updated_at"], 1_700_000_300, "the second report must carry the new updated_at")
 	reasons, _ := second["reasons"].(map[string]any)
@@ -1128,25 +1128,25 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kJob = "j1";
+const std::string kHJob = "j1";
 
-void readSeed(harness::Ctx& ctx, int sampled, int accepted, int rejected, int duplicate, const std::map<std::string, int>& reasons, long long updated_at) {
-  const json row = {{"job_id", kJob}, {"status", "running"}, {"teacher", "teach-70b-v3"}, {"dataset_id", "ds-support"}, {"sample_cap", 1000}, {"sampled", 0}, {"accepted", 0}, {"rejected", 0}, {"tenant", "t1"}};
-  ctx.Redis.Set("distill:job:" + kJob, row.dump());
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "sampled", sampled, "accepted", accepted, "rejected", rejected, "duplicate", duplicate, "updated_at", updated_at);
-  for (const auto& [reason, n] : reasons) ctx.Redis.Do("HSET", "distill:reasons:" + kJob, reason, n);
+void hReadSeed(harness::Ctx& ctx, int sampled, int accepted, int rejected, int duplicate, const std::map<std::string, int>& reasons, long long updated_at) {
+  const json row = {{"job_id", kHJob}, {"status", "running"}, {"teacher", "teach-70b-v3"}, {"dataset_id", "ds-support"}, {"sample_cap", 1000}, {"sampled", 0}, {"accepted", 0}, {"rejected", 0}, {"tenant", "t1"}};
+  ctx.Redis.Set("distill:job:" + kHJob, row.dump());
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "sampled", sampled, "accepted", accepted, "rejected", rejected, "duplicate", duplicate, "updated_at", updated_at);
+  for (const auto& [reason, n] : reasons) ctx.Redis.Do("HSET", "distill:reasons:" + kHJob, reason, n);
 }
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
-  harness::Response report(const std::string& job_id = kJob, const std::string& tenant = "t1") {
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  harness::Response report(const std::string& job_id = kHJob, const std::string& tenant = "t1") {
     return http.Get("/v1/distill/jobs/" + job_id, "X-Tenant-Id", tenant);
   }
 };
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the report must be a JSON object: %s", r.Text());
   return body;
@@ -1155,78 +1155,78 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readSeed(ctx, 10, 7, 3, 4, {{"refusal", 3}}, 1700000000);
-  Api api(ctx);
-  auto r = api.http.Get("/v1/distill/jobs/" + kJob);
+  hReadSeed(ctx, 10, 7, 3, 4, {{"refusal", 3}}, 1700000000);
+  HApi api(ctx);
+  auto r = api.http.Get("/v1/distill/jobs/" + kHJob);
   ctx.Equal(r.Status, 401, "without X-Tenant-Id the report");
   r = api.report("nope");
   ctx.Equal(r.Status, 404, "an unknown job");
-  r = api.report(kJob, "t2");
+  r = api.report(kHJob, "t2");
   ctx.Equal(r.Status, 404, "another tenant's job");
   r = api.report();
   ctx.Equal(r.Status, 200, "the report (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   for (const char* key : {"job_id", "status", "sampled", "accepted", "rejected", "acceptance_rate"}) ctx.Assert(body.contains(key), "the report lacks %s: %s", key, r.Text());
-  ctx.Assert(body["job_id"] == kJob && body["status"] == "running", "the report names the job and its status: %s", r.Text());
+  ctx.Assert(body["job_id"] == kHJob && body["status"] == "running", "the report names the job and its status: %s", r.Text());
   ctx.Assert(body["sampled"] == 10 && body["accepted"] == 7 && body["rejected"] == 3, "the counts must be the job's: %s", r.Text());
   ctx.Assert(body["acceptance_rate"].is_number() && std::fabs(body["acceptance_rate"].get<double>() - 0.7) < 1e-9, "acceptance_rate must be accepted / sampled = 0.7, got %s", body["acceptance_rate"].dump());
 }
 
 void CheckReconcile(harness::Ctx& ctx) {
-  readSeed(ctx, 10, 3, 5, 0, {{"refusal", 5}}, 1700000000);  // two samples reserved by a worker that died before it recorded
-  Api api(ctx);
+  hReadSeed(ctx, 10, 3, 5, 0, {{"refusal", 5}}, 1700000000);  // two samples reserved by a worker that died before it recorded
+  HApi api(ctx);
   auto r = api.report();
   ctx.Equal(r.Status, 409, "sampled 10, accepted 3, rejected 5 do not reconcile (%s): accepted = sampled - rejected would call the two lost samples accepted; the status", r.Text());
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "rejected", 7);
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "rejected", 7);
   r = api.report();
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Assert(r.Status == 200 && body["accepted"] == 3 && body["rejected"] == 7, "once the counts reconcile the report is 200 with the live accepted and rejected, got %d: %s", r.Status, r.Text());
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 5);
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "accepted", 5);
   r = api.report();
   ctx.Equal(r.Status, 409, "sampled 10, accepted 5, rejected 7: more outcomes than samples do not reconcile either (a sample recorded twice) (%s); the status", r.Text());
 }
 
 void CheckReasons(harness::Ctx& ctx) {
-  readSeed(ctx, 10, 5, 5, 0, {{"refusal", 3}, {"empty", 1}, {"deadline", 1}}, 1700000000);
-  Api api(ctx);
+  hReadSeed(ctx, 10, 5, 5, 0, {{"refusal", 3}, {"empty", 1}, {"deadline", 1}}, 1700000000);
+  HApi api(ctx);
   const auto r = api.report();
   ctx.Equal(r.Status, 200, "the report (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Equal(body.value("reasons", json()), json({{"refusal", 3}, {"empty", 1}, {"deadline", 1}}), "reasons must be the distill:reasons hash as numbers");
   ctx.Equal(body.value("rejected", json()), json(5), "rejected stays the count");
 }
 
 void CheckImplausibleRate(harness::Ctx& ctx) {
-  readSeed(ctx, 100, 98, 2, 0, {{"refusal", 2}}, 1700000000);
-  Api api(ctx);
+  hReadSeed(ctx, 100, 98, 2, 0, {{"refusal", 2}}, 1700000000);
+  HApi api(ctx);
   auto r = api.report();
-  json body = bodyOf(ctx, r);
+  json body = hBodyOf(ctx, r);
   ctx.Assert(r.Status == 200 && body["acceptance_rate"].is_number() && std::fabs(body["acceptance_rate"].get<double>() - 0.98) < 1e-9, "a 98 percent run is reported, got %d: %s", r.Status, r.Text());
   ctx.Equal(body.value("flagged", json()), json("implausible_acceptance_rate"), "98 percent accepted is above the 95 percent ceiling and must be flagged; flagged");
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 90, "rejected", 10);
-  body = bodyOf(ctx, api.report());
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "accepted", 90, "rejected", 10);
+  body = hBodyOf(ctx, api.report());
   ctx.Assert(!body.contains("flagged") || body["flagged"].is_null(), "90 percent is within the ceiling: flagged must be null, got %s", body.value("flagged", json()).dump());
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 95, "rejected", 5);
-  body = bodyOf(ctx, api.report());
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "accepted", 95, "rejected", 5);
+  body = hBodyOf(ctx, api.report());
   ctx.Assert(!body.contains("flagged") || body["flagged"].is_null(), "exactly 95 percent is at the ceiling, not above it: flagged must be null, got %s", body.value("flagged", json()).dump());
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "accepted", 96, "rejected", 4);
-  body = bodyOf(ctx, api.report());
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "accepted", 96, "rejected", 4);
+  body = hBodyOf(ctx, api.report());
   ctx.Equal(body.value("flagged", json()), json("implausible_acceptance_rate"), "96 percent is above the ceiling and must be flagged; flagged");
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "sampled", 0, "accepted", 0, "rejected", 0);
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "sampled", 0, "accepted", 0, "rejected", 0);
   r = api.report();
-  body = bodyOf(ctx, r);
+  body = hBodyOf(ctx, r);
   ctx.Assert(r.Status == 200 && (!body.contains("flagged") || body["flagged"].is_null()) && body["acceptance_rate"] == 0, "an empty job has rate 0 and no flag, got %d: %s", r.Status, r.Text());
 }
 
 void CheckLiveCounters(harness::Ctx& ctx) {
-  readSeed(ctx, 10, 7, 3, 2, {{"refusal", 3}}, 1700000000);
-  Api api(ctx);
-  const json first = bodyOf(ctx, api.report());
+  hReadSeed(ctx, 10, 7, 3, 2, {{"refusal", 3}}, 1700000000);
+  HApi api(ctx);
+  const json first = hBodyOf(ctx, api.report());
   ctx.Equal(first.value("updated_at", json()), json(1700000000), "the report must carry the progress hash's updated_at");
   ctx.Equal(first.value("duplicate", json()), json(2), "the report carries the duplicate count");
-  ctx.Redis.Do("HSET", "distill:progress:" + kJob, "sampled", 12, "rejected", 5, "updated_at", 1700000300);
-  ctx.Redis.Do("HINCRBY", "distill:reasons:" + kJob, "deadline", 2);
-  const json second = bodyOf(ctx, api.report());
+  ctx.Redis.Do("HSET", "distill:progress:" + kHJob, "sampled", 12, "rejected", 5, "updated_at", 1700000300);
+  ctx.Redis.Do("HINCRBY", "distill:reasons:" + kHJob, "deadline", 2);
+  const json second = hBodyOf(ctx, api.report());
   ctx.Assert(second["sampled"] == 12 && second["accepted"] == 7 && second["rejected"] == 5, "two rejections landed after the first read and the report still says %s: read the live counters on every request", second.dump());
   ctx.Equal(second.value("updated_at", json()), json(1700000300), "the second report must carry the new updated_at");
   ctx.Equal(second.value("reasons", json()).value("deadline", json()), json(2), "the reasons are read live too");

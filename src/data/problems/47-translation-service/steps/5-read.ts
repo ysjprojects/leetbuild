@@ -607,23 +607,23 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readApi(ctx *harness.Ctx) *harness.HTTP {
-	_, err := glossary.PublishTerms(readBg, "acme", "en", "fr", map[string]string{"Dashboard": "Tableau de bord", "Invoice": "Facture"})
+func hReadApi(ctx *harness.Ctx) *harness.HTTP {
+	_, err := glossary.PublishTerms(hReadBg, "acme", "en", "fr", map[string]string{"Dashboard": "Tableau de bord", "Invoice": "Facture"})
 	ctx.NoError(err, "seeding acme's glossary")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func bodyOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hBodyOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the answer is not a JSON object: %d %s", r.Status, r.Text())
 	return body
 }
 
-func directives(r *harness.Response) map[string]bool {
+func hDirectives(r *harness.Response) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range strings.Split(r.Header.Get("Cache-Control"), ",") {
 		if d = strings.TrimSpace(d); d != "" {
@@ -633,17 +633,17 @@ func directives(r *harness.Response) map[string]bool {
 	return out
 }
 
-var v1Terms = map[string]any{"Dashboard": "Tableau de bord", "Invoice": "Facture"}
+var hV1Terms = map[string]any{"Dashboard": "Tableau de bord", "Invoice": "Facture"}
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readApi(ctx)
+	c := hReadApi(ctx)
 	r := c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/glossaries/en/fr (%s)", r.Text())
-	ctx.Equal(bodyOf(ctx, r)["terms"], v1Terms, "acme's en->fr terms")
+	ctx.Equal(hBodyOf(ctx, r)["terms"], hV1Terms, "acme's en->fr terms")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readApi(ctx)
+	c := hReadApi(ctx)
 	other := c.Get("/v1/glossaries/en/fr?tenant=acme", "X-Tenant-Id", "globex")
 	ctx.Assert(!strings.Contains(other.Text(), "Tableau de bord"), "globex read acme's glossary with ?tenant=acme: %d %s", other.Status, other.Text())
 	ctx.Equal(other.Status, 403, "globex asking for ?tenant=acme")
@@ -654,19 +654,19 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckVersion(ctx *harness.Ctx) {
-	c := readApi(ctx)
-	_, err := glossary.PublishTerms(readBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
+	c := hReadApi(ctx)
+	_, err := glossary.PublishTerms(hReadBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
 	ctx.NoError(err, "publishing version 2")
-	active := bodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"))
+	active := hBodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"))
 	ctx.Assert(active["version"] == float64(2) && active["term_count"] == float64(2), "the active glossary answered %v: it must name its version (2) and term_count (2) beside the terms", active)
 	pinned := c.Get("/v1/glossaries/en/fr?version=1", "X-Tenant-Id", "acme")
-	body := bodyOf(ctx, pinned)
+	body := hBodyOf(ctx, pinned)
 	ctx.Assert(pinned.Status == 200 && body["version"] == float64(1), "?version=1 answered %d %s: a translator must be able to open the version a translation used", pinned.Status, pinned.Text())
-	ctx.Equal(body["terms"], v1Terms, "version 1's terms")
+	ctx.Equal(body["terms"], hV1Terms, "version 1's terms")
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	c := readApi(ctx)
+	c := hReadApi(ctx)
 	pair := c.Get("/v1/glossaries/en/de", "X-Tenant-Id", "acme")
 	ctx.Equal(pair.Status, 404, "acme has no en->de glossary (%s)", pair.Text())
 	tenant := c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "globex")
@@ -678,14 +678,14 @@ func CheckNotFound(ctx *harness.Ctx) {
 }
 
 func CheckFreshness(ctx *harness.Ctx) {
-	c := readApi(ctx)
+	c := hReadApi(ctx)
 	r := c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme")
-	d := directives(r)
+	d := hDirectives(r)
 	ctx.Assert(!d["public"], "the read answered Cache-Control %q: public lets a shared cache hand acme's terms to the next caller of the URL", r.Header.Get("Cache-Control"))
 	ctx.Assert(d["private"] && (d["no-cache"] || d["max-age=0"]), "the read answered Cache-Control %q, expected private, no-cache", r.Header.Get("Cache-Control"))
-	_, err := glossary.PublishTerms(readBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
+	_, err := glossary.PublishTerms(hReadBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
 	ctx.NoError(err, "publishing a correction")
-	again := bodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"))
+	again := hBodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"))
 	terms, _ := again["terms"].(map[string]any)
 	ctx.Equal(terms["Dashboard"], "Panneau", "after a correction, the term the read answered")
 }
@@ -702,9 +702,9 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kV1 = {{"Dashboard", "Tableau de bord"}, {"Invoice", "Facture"}};
+const json kHV1 = {{"Dashboard", "Tableau de bord"}, {"Invoice", "Facture"}};
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   glossary::publishTerms("acme", "en", "fr", {{"Dashboard", "Tableau de bord"}, {"Invoice", "Facture"}});
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -713,13 +713,13 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the answer is not a JSON object: %d %s", r.Status, r.Text());
   return body;
 }
 
-std::set<std::string> directives(const harness::Response& r) {
+std::set<std::string> hDirectives(const harness::Response& r) {
   std::set<std::string> out;
   std::stringstream in(r.HeaderValue("Cache-Control"));
   std::string d;
@@ -733,14 +733,14 @@ std::set<std::string> directives(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/glossaries/en/fr (%s)", r.Text());
-  ctx.Equal(bodyOf(ctx, r).value("terms", json()), kV1, "acme's en->fr terms");
+  ctx.Equal(hBodyOf(ctx, r).value("terms", json()), kHV1, "acme's en->fr terms");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto other = c.Get("/v1/glossaries/en/fr?tenant=acme", "X-Tenant-Id", "globex");
   ctx.Assert(other.Text().find("Tableau de bord") == std::string::npos, "globex read acme's glossary with ?tenant=acme: %d %s", other.Status, other.Text());
   ctx.Equal(other.Status, 403, "globex asking for ?tenant=acme");
@@ -751,18 +751,18 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckVersion(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   glossary::publishTerms("acme", "en", "fr", {{"Dashboard", "Panneau"}});
-  const json active = bodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"));
+  const json active = hBodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"));
   ctx.Assert(active.value("version", 0L) == 2 && active.value("term_count", 0L) == 2, "the active glossary answered %s: it must name its version (2) and term_count (2) beside the terms", active.dump());
   const auto pinned = c.Get("/v1/glossaries/en/fr?version=1", "X-Tenant-Id", "acme");
-  const json body = bodyOf(ctx, pinned);
+  const json body = hBodyOf(ctx, pinned);
   ctx.Assert(pinned.Status == 200 && body.value("version", 0L) == 1, "?version=1 answered %d %s: a translator must be able to open the version a translation used", pinned.Status, pinned.Text());
-  ctx.Equal(body.value("terms", json()), kV1, "version 1's terms");
+  ctx.Equal(body.value("terms", json()), kHV1, "version 1's terms");
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto pair = c.Get("/v1/glossaries/en/de", "X-Tenant-Id", "acme");
   ctx.Equal(pair.Status, 404, "acme has no en->de glossary (%s)", pair.Text());
   const auto tenant = c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "globex");
@@ -774,13 +774,13 @@ void CheckNotFound(harness::Ctx& ctx) {
 }
 
 void CheckFreshness(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme");
-  const auto d = directives(r);
+  const auto d = hDirectives(r);
   ctx.Assert(!d.count("public"), "the read answered Cache-Control %q: public lets a shared cache hand acme's terms to the next caller of the URL", r.HeaderValue("Cache-Control"));
   ctx.Assert(d.count("private") && (d.count("no-cache") || d.count("max-age=0")), "the read answered Cache-Control %q, expected private, no-cache", r.HeaderValue("Cache-Control"));
   glossary::publishTerms("acme", "en", "fr", {{"Dashboard", "Panneau"}});
-  const json again = bodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"));
+  const json again = hBodyOf(ctx, c.Get("/v1/glossaries/en/fr", "X-Tenant-Id", "acme"));
   ctx.Equal(again.value("terms", json::object()).value("Dashboard", ""), "Panneau", "after a correction, the term the read answered");
 }
 `,

@@ -619,26 +619,26 @@ import (
 	"labeling/store"
 )
 
-func eventsLabel(n int, task, annotator string) store.Label {
+func hEventsLabel(n int, task, annotator string) store.Label {
 	return store.Label{LabelID: fmt.Sprintf("l-%d", n), TaskID: task, ItemID: fmt.Sprintf("i-%d", n), Annotator: annotator, SpecVersion: "2026-10", Value: "cat"}
 }
 
-func eventsRecord(ctx *harness.Ctx, label store.Label) bool {
+func hEventsRecord(ctx *harness.Ctx, label store.Label) bool {
 	ok, err := recordLabel(context.Background(), label)
 	ctx.NoError(err, "recordLabel")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -646,8 +646,8 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckTaskKey(ctx *harness.Ctx) {
-	oks := []bool{eventsRecord(ctx, eventsLabel(1, "t-1", "ana")), eventsRecord(ctx, eventsLabel(2, "t-2", "bo")), eventsRecord(ctx, eventsLabel(3, "t-1", "cy"))}
-	ctx.Assert(oks[0] && oks[1] && oks[2] && len(eventsOutbox(ctx)) == 0, "three acknowledged events answered %v and left the outbox %v: an acknowledged event answers true and writes no outbox row", oks, eventsOutbox(ctx))
+	oks := []bool{hEventsRecord(ctx, hEventsLabel(1, "t-1", "ana")), hEventsRecord(ctx, hEventsLabel(2, "t-2", "bo")), hEventsRecord(ctx, hEventsLabel(3, "t-1", "cy"))}
+	ctx.Assert(oks[0] && oks[1] && oks[2] && len(hEventsOutbox(ctx)) == 0, "three acknowledged events answered %v and left the outbox %v: an acknowledged event answers true and writes no outbox row", oks, hEventsOutbox(ctx))
 	ctx.Settle()
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 3, "three recordLabel calls must produce three records on label.submitted; the records")
@@ -655,34 +655,34 @@ func CheckTaskKey(ctx *harness.Ctx) {
 	ctx.Equal(records[0].Partition, records[2].Partition, "both t-1 events must land on one partition, or the agreement consumer sees one task out of order; the partitions")
 	var first store.Label
 	ctx.NoError(json.Unmarshal([]byte(ctx.Kafka.Values(topic)[0]), &first), "the event must be the label as JSON")
-	ctx.Equal(first, eventsLabel(1, "t-1", "ana"), "the event must carry the label")
+	ctx.Equal(first, hEventsLabel(1, "t-1", "ana"), "the event must carry the label")
 }
 
 func CheckSaveFirst(ctx *harness.Ctx) {
 	probe := ctx.Redis.After("labels:t-1", func() any { return len(ctx.Kafka.Records(topic)) })
-	eventsRecord(ctx, eventsLabel(1, "t-1", "ana"))
+	hEventsRecord(ctx, hEventsLabel(1, "t-1", "ana"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "recordLabel never saved the label (no write to labels:t-1)")
 	ctx.Equal(probe.Result, 0, "when the label was saved the topic already held records: an event for a label nobody can read yet is a phantom. Save first, then produce; the records at save time")
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "the event must still be produced after the save; the records")
 	// A save that fails must not leave an event, or an outbox row, for a label nobody can read.
 	ctx.Redis.Set("labels:t-9", "not a list")
-	recordLabel(context.Background(), eventsLabel(9, "t-9", "ana")) // the save failure reaching the caller is fine
+	recordLabel(context.Background(), hEventsLabel(9, "t-9", "ana")) // the save failure reaching the caller is fine
 	ctx.Settle()
 	for _, key := range ctx.Kafka.Keys(topic) {
 		ctx.Assert(key != "t-9", "the save of l-9 failed (labels:t-9 holds a string) and its event went out anyway, keys %v: an event for a label nobody can read is a phantom", ctx.Kafka.Keys(topic))
 	}
-	for _, row := range eventsOutbox(ctx) {
-		ctx.Assert(row.Key != "t-9", "the save of l-9 failed and the outbox holds %v: the relay would publish a label nobody can read", eventsOutbox(ctx))
+	for _, row := range hEventsOutbox(ctx) {
+		ctx.Assert(row.Key != "t-9", "the save of l-9 failed and the outbox holds %v: the relay would publish a label nobody can read", hEventsOutbox(ctx))
 	}
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(topic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsRecord(ctx, eventsLabel(1, "t-1", "ana"))
+	hEventsRecord(ctx, hEventsLabel(1, "t-1", "ana"))
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one lost acknowledgement the producer's retry must not write the label twice (enable.idempotence); the records")
-	eventsRecord(ctx, eventsLabel(2, "t-1", "ana"))
+	hEventsRecord(ctx, hEventsLabel(2, "t-1", "ana"))
 	ctx.Settle()
 	ctx.Kafka.Failover(topic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
@@ -690,23 +690,23 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext(topic, 1)
-	ok := eventsRecord(ctx, eventsLabel(1, "t-1", "ana"))
+	ok := hEventsRecord(ctx, hEventsLabel(1, "t-1", "ana"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the label is missing from every agreement count; the rows")
 	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "t-1", "the outbox row is %v, expected the topic and the key t-1", rows[0])
 	var want map[string]any
-	raw, _ := json.Marshal(eventsLabel(1, "t-1", "ana"))
+	raw, _ := json.Marshal(hEventsLabel(1, "t-1", "ana"))
 	json.Unmarshal(raw, &want)
 	ctx.Equal(rows[0].Payload, want, "the outbox row's payload must be the label")
 	ctx.Equal(ok, false, "recordLabel's result after a failed delivery")
 	ctx.Equal(ctx.Redis.LLen("labels:t-1"), int64(1), "the label must stay saved when only the produce failed")
 	ctx.Kafka.Stall(topic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsRecord(ctx, eventsLabel(2, "t-1", "ana"))
+	ok = hEventsRecord(ctx, hEventsLabel(2, "t-1", "ana"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "recordLabel waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["label_id"] == "l-2", "no report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "recordLabel's result without a delivery report")
 }
@@ -720,11 +720,11 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-store::Label eventsLabel(int n, const std::string& task = "t-1", const std::string& annotator = "ana") {
+store::Label hEventsLabel(int n, const std::string& task = "t-1", const std::string& annotator = "ana") {
   return store::Label{"l-" + std::to_string(n), task, "i-" + std::to_string(n), annotator, "2026-10", "cat"};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -734,21 +734,21 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckTaskKey(harness::Ctx& ctx) {
-  const bool oks[] = {recordLabel(eventsLabel(1, "t-1", "ana")), recordLabel(eventsLabel(2, "t-2", "bo")), recordLabel(eventsLabel(3, "t-1", "cy"))};
-  ctx.Assert(oks[0] && oks[1] && oks[2] && eventsOutbox(ctx).empty(), "three acknowledged events answered %v, %v, %v and left %d outbox rows: an acknowledged event answers true and writes no outbox row", oks[0], oks[1], oks[2], eventsOutbox(ctx).size());
+  const bool oks[] = {recordLabel(hEventsLabel(1, "t-1", "ana")), recordLabel(hEventsLabel(2, "t-2", "bo")), recordLabel(hEventsLabel(3, "t-1", "cy"))};
+  ctx.Assert(oks[0] && oks[1] && oks[2] && hEventsOutbox(ctx).empty(), "three acknowledged events answered %v, %v, %v and left %d outbox rows: an acknowledged event answers true and writes no outbox row", oks[0], oks[1], oks[2], hEventsOutbox(ctx).size());
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 3, "three recordLabel calls must produce three records on label.submitted; the records");
   ctx.Equal(ctx.Kafka.Keys(kTopic), {"t-1", "t-2", "t-1"}, "the records must be keyed by the task ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both t-1 events must land on one partition, or the agreement consumer sees one task out of order; the partitions");
-  ctx.Equal(nlohmann::json::parse(ctx.Kafka.Values(kTopic)[0], nullptr, false), store::toJson(eventsLabel(1, "t-1", "ana")), "the event must carry the label");
+  ctx.Equal(nlohmann::json::parse(ctx.Kafka.Values(kTopic)[0], nullptr, false), store::toJson(hEventsLabel(1, "t-1", "ana")), "the event must carry the label");
 }
 
 void CheckSaveFirst(harness::Ctx& ctx) {
@@ -758,7 +758,7 @@ void CheckSaveFirst(harness::Ctx& ctx) {
     fired = true;
     atSave = ctx.Kafka.Records(kTopic).size();
   });
-  recordLabel(eventsLabel(1));
+  recordLabel(hEventsLabel(1));
   ctx.Settle();
   ctx.Assert(fired, "recordLabel never saved the label (no write to labels:t-1)");
   ctx.Equal(atSave, 0, "when the label was saved the topic already held records: an event for a label nobody can read yet is a phantom. Save first, then produce; the records at save time");
@@ -766,7 +766,7 @@ void CheckSaveFirst(harness::Ctx& ctx) {
   // A save that fails must not leave an event, or an outbox row, for a label nobody can read.
   ctx.Redis.Set("labels:t-9", "not a list");
   try {
-    recordLabel(eventsLabel(9, "t-9"));
+    recordLabel(hEventsLabel(9, "t-9"));
   } catch (const std::exception&) {
     // the save failure reaching the caller is fine
   }
@@ -774,17 +774,17 @@ void CheckSaveFirst(harness::Ctx& ctx) {
   for (const auto& key : ctx.Kafka.Keys(kTopic)) {
     ctx.Assert(key != "t-9", "the save of l-9 failed (labels:t-9 holds a string) and its event went out anyway: an event for a label nobody can read is a phantom");
   }
-  for (const auto& row : eventsOutbox(ctx)) {
-    ctx.Assert(eventsField(row, "key") != "t-9", "the save of l-9 failed and the outbox holds %s: the relay would publish a label nobody can read", row.dump());
+  for (const auto& row : hEventsOutbox(ctx)) {
+    ctx.Assert(hEventsField(row, "key") != "t-9", "the save of l-9 failed and the outbox holds %s: the relay would publish a label nobody can read", row.dump());
   }
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  recordLabel(eventsLabel(1));
+  recordLabel(hEventsLabel(1));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the label twice (enable.idempotence); the records");
-  recordLabel(eventsLabel(2));
+  recordLabel(hEventsLabel(2));
   ctx.Settle();
   ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
@@ -792,21 +792,21 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
-  bool ok = recordLabel(eventsLabel(1));
+  bool ok = recordLabel(hEventsLabel(1));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the label is missing from every agreement count; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kTopic && eventsField(rows[0], "key") == "t-1", "the outbox row is %s, expected the topic and the key t-1", rows[0].dump());
-  ctx.Equal(rows[0].value("payload", nlohmann::json()), store::toJson(eventsLabel(1)), "the outbox row's payload must be the label");
+  ctx.Assert(hEventsField(rows[0], "topic") == kTopic && hEventsField(rows[0], "key") == "t-1", "the outbox row is %s, expected the topic and the key t-1", rows[0].dump());
+  ctx.Equal(rows[0].value("payload", nlohmann::json()), store::toJson(hEventsLabel(1)), "the outbox row's payload must be the label");
   ctx.Equal(ok, false, "recordLabel's result after a failed delivery");
   ctx.Equal(ctx.Redis.LLen("labels:t-1"), 1LL, "the label must stay saved when only the produce failed");
   ctx.Kafka.Stall(kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = recordLabel(eventsLabel(2));
+  ok = recordLabel(hEventsLabel(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "recordLabel waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "label_id") == "l-2", "no report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "label_id") == "l-2", "no report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "recordLabel's result without a delivery report");
 }
 `,

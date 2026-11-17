@@ -713,36 +713,36 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // registryPeer knows the requests in known ("tenant/request" → model, prompt, route); any other is NOT_FOUND.
-type registryPeer struct {
+type HRegistryPeer struct {
 	pb.UnimplementedAttributionServer
 }
 
-var known = map[string][3]string{
+var hKnown = map[string][3]string{
 	"t-acme/req-1":  {"support-llm-2026-09", "triage-v4", "primary"},
 	"t-acme/req-2":  {"support-llm-2026-09", "triage-v4", "primary"},
 	"t-other/req-1": {"support-llm-2026-10", "triage-v5", "canary"},
 }
 
-func (registryPeer) GetAttribution(_ context.Context, req *pb.AttributionRequest) (*pb.AttributionReply, error) {
-	found, ok := known[req.GetTenant()+"/"+req.GetRequestId()]
+func (HRegistryPeer) GetAttribution(_ context.Context, req *pb.AttributionRequest) (*pb.AttributionReply, error) {
+	found, ok := hKnown[req.GetTenant()+"/"+req.GetRequestId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no request %s for %s", req.GetRequestId(), req.GetTenant())
 	}
 	return &pb.AttributionReply{ModelVersion: found[0], PromptVersion: found[1], Route: found[2]}, nil
 }
 
-func serveRegistry(ctx *harness.Ctx) {
-	pb.RegisterAttributionServer(ctx.GRPC.Server(""), registryPeer{})
+func hServeRegistry(ctx *harness.Ctx) {
+	pb.RegisterAttributionServer(ctx.GRPC.Server(""), HRegistryPeer{})
 }
 
-func registryCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("GetAttribution", "")) }
+func hRegistryCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("GetAttribution", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveRegistry(ctx)
-	got := attribute(clientBg, "t-acme", "req-1")
+	hServeRegistry(ctx)
+	got := attribute(hClientBg, "t-acme", "req-1")
 	ctx.Equal(got.ModelVersion, "support-llm-2026-09", "with the registry healthy, the attributed model")
 	calls := ctx.GRPC.CallsTo("GetAttribution", "")
 	ctx.Assert(len(calls) > 0, "no GetAttribution call was made")
@@ -750,44 +750,44 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(150*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 250*time.Millisecond, "the lookup carries a %v deadline, expected 200 ms", calls[0].Timeout)
 	ctx.GRPC.SetLatency("GetAttribution", 1.0, "")
 	started := ctx.Clock.Now()
-	slow := attribute(clientBg, "t-acme", "req-2")
+	slow := attribute(hClientBg, "t-acme", "req-2")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Equal(slow.ModelVersion, "unattributed", "a registry that answers after 1 s (past 200 ms the vote goes on unattributed), the model")
 	ctx.Assert(waited <= 0.25, "a registry that answers after 1 s held the vote %.2f s: one lookup of 200 ms, then the vote goes on unattributed", waited)
 }
 
 func CheckUnattributed(ctx *harness.Ctx) {
-	serveRegistry(ctx)
+	hServeRegistry(ctx)
 	ctx.GRPC.Fail("GetAttribution", codes.Unavailable, "registry restarting", 1, "")
-	down := attribute(clientBg, "t-acme", "req-1")
+	down := attribute(hClientBg, "t-acme", "req-1")
 	ctx.Equal(down.ModelVersion, "unattributed", "with the registry unavailable (a failed lookup is unattributed, not the model serving now), the model")
 	ctx.Assert(down.PromptVersion == "" && down.Route == "", "an unattributed answer has no prompt version or route, got %+v", down)
-	unknown := attribute(clientBg, "t-acme", "req-404")
+	unknown := attribute(hClientBg, "t-acme", "req-404")
 	ctx.Equal(unknown.ModelVersion, "unattributed", "for a request the registry does not know, the model")
 	ctx.GRPC.Fail("GetAttribution", codes.Internal, "registry bug", 1, "")
-	broken := attribute(clientBg, "t-acme", "req-2")
+	broken := attribute(hClientBg, "t-acme", "req-2")
 	ctx.Equal(broken.ModelVersion, "unattributed", "with the registry answering INTERNAL (any failure is unattributed), the model")
 }
 
 func CheckRetryAfterFailure(ctx *harness.Ctx) {
-	serveRegistry(ctx)
+	hServeRegistry(ctx)
 	ctx.GRPC.Fail("GetAttribution", codes.Unavailable, "registry restarting", 1, "")
-	attribute(clientBg, "t-acme", "req-1")
-	before := registryCalls(ctx)
-	again := attribute(clientBg, "t-acme", "req-1")
-	ctx.Equal(registryCalls(ctx), before+1, "after one failed lookup the next request for req-1 must ask the registry again (a failure is not remembered); the calls")
+	attribute(hClientBg, "t-acme", "req-1")
+	before := hRegistryCalls(ctx)
+	again := attribute(hClientBg, "t-acme", "req-1")
+	ctx.Equal(hRegistryCalls(ctx), before+1, "after one failed lookup the next request for req-1 must ask the registry again (a failure is not remembered); the calls")
 	ctx.Equal(again.ModelVersion, "support-llm-2026-09", "once the registry answers, the attributed model")
-	third := attribute(clientBg, "t-acme", "req-1")
-	ctx.Assert(registryCalls(ctx) == before+1 && third == again, "a successful lookup is cached: a third request for req-1 must not call the registry")
-	attribute(clientBg, "t-acme", "req-404")
-	attribute(clientBg, "t-acme", "req-404")
-	ctx.Equal(registryCalls(ctx), before+3, "a NOT_FOUND must not be remembered: the second request for req-404 asks the registry again, which may know it by then (only a success is cached); the calls")
+	third := attribute(hClientBg, "t-acme", "req-1")
+	ctx.Assert(hRegistryCalls(ctx) == before+1 && third == again, "a successful lookup is cached: a third request for req-1 must not call the registry")
+	attribute(hClientBg, "t-acme", "req-404")
+	attribute(hClientBg, "t-acme", "req-404")
+	ctx.Equal(hRegistryCalls(ctx), before+3, "a NOT_FOUND must not be remembered: the second request for req-404 asks the registry again, which may know it by then (only a success is cached); the calls")
 }
 
 func CheckTenantCache(ctx *harness.Ctx) {
-	serveRegistry(ctx)
-	acme := attribute(clientBg, "t-acme", "req-1")
-	other := attribute(clientBg, "t-other", "req-1")
+	hServeRegistry(ctx)
+	acme := attribute(hClientBg, "t-acme", "req-1")
+	other := attribute(hClientBg, "t-other", "req-1")
 	ctx.Equal(acme.ModelVersion, "support-llm-2026-09", "t-acme's req-1, the model")
 	ctx.Equal(other.ModelVersion, "support-llm-2026-10", "t-other's req-1 got t-acme's attribution: the cache key leaves the tenant out; the model")
 	var asked []string
@@ -797,9 +797,9 @@ func CheckTenantCache(ctx *harness.Ctx) {
 	}
 	sort.Strings(asked)
 	ctx.Equal(asked, []string{"t-acme/req-1", "t-other/req-1"}, "the requests the registry was asked about")
-	attribute(clientBg, "t-acme", "req-1")
-	attribute(clientBg, "t-other", "req-1")
-	ctx.Equal(registryCalls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again; the calls")
+	attribute(hClientBg, "t-acme", "req-1")
+	attribute(hClientBg, "t-other", "req-1")
+	ctx.Equal(hRegistryCalls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again; the calls")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -812,17 +812,17 @@ func CheckTenantCache(ctx *harness.Ctx) {
 namespace {
 
 // "tenant/request" → model, prompt, route; any other request is NOT_FOUND.
-const std::map<std::string, std::vector<std::string>> kKnown = {
+const std::map<std::string, std::vector<std::string>> kHKnown = {
     {"t-acme/req-1", {"support-llm-2026-09", "triage-v4", "primary"}},
     {"t-acme/req-2", {"support-llm-2026-09", "triage-v4", "primary"}},
     {"t-other/req-1", {"support-llm-2026-10", "triage-v5", "canary"}},
 };
 
-class RegistryPeer final : public feedback::Attribution::Service {
+class HRegistryPeer final : public feedback::Attribution::Service {
  public:
   grpc::Status GetAttribution(grpc::ServerContext*, const feedback::AttributionRequest* req, feedback::AttributionReply* out) override {
-    const auto found = kKnown.find(req->tenant() + "/" + req->request_id());
-    if (found == kKnown.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no request " + req->request_id() + " for " + req->tenant());
+    const auto found = kHKnown.find(req->tenant() + "/" + req->request_id());
+    if (found == kHKnown.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no request " + req->request_id() + " for " + req->tenant());
     out->set_model_version(found->second[0]);
     out->set_prompt_version(found->second[1]);
     out->set_route(found->second[2]);
@@ -830,20 +830,20 @@ class RegistryPeer final : public feedback::Attribution::Service {
   }
 };
 
-void serveRegistry(harness::Ctx& ctx) {
-  static RegistryPeer* peer = nullptr;
+void hServeRegistry(harness::Ctx& ctx) {
+  static HRegistryPeer* peer = nullptr;
   delete peer;
-  peer = new RegistryPeer;
+  peer = new HRegistryPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   cache.clear();
 }
 
-size_t registryCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetAttribution").size(); }
+size_t hRegistryCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetAttribution").size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveRegistry(ctx);
+  hServeRegistry(ctx);
   const Attribution got = attribute("t-acme", "req-1");
   ctx.Equal(got.model_version, "support-llm-2026-09", "with the registry healthy, the attributed model");
   const auto calls = ctx.GRPC.CallsTo("GetAttribution");
@@ -859,7 +859,7 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckUnattributed(harness::Ctx& ctx) {
-  serveRegistry(ctx);
+  hServeRegistry(ctx);
   ctx.GRPC.Fail("GetAttribution", grpc::StatusCode::UNAVAILABLE, "registry restarting", 1);
   const Attribution down = attribute("t-acme", "req-1");
   ctx.Equal(down.model_version, "unattributed", "with the registry unavailable (a failed lookup is unattributed, not the model serving now), the model");
@@ -872,22 +872,22 @@ void CheckUnattributed(harness::Ctx& ctx) {
 }
 
 void CheckRetryAfterFailure(harness::Ctx& ctx) {
-  serveRegistry(ctx);
+  hServeRegistry(ctx);
   ctx.GRPC.Fail("GetAttribution", grpc::StatusCode::UNAVAILABLE, "registry restarting", 1);
   attribute("t-acme", "req-1");
-  const size_t before = registryCalls(ctx);
+  const size_t before = hRegistryCalls(ctx);
   const Attribution again = attribute("t-acme", "req-1");
-  ctx.Equal(registryCalls(ctx), before + 1, "after one failed lookup the next request for req-1 must ask the registry again (a failure is not remembered); the calls");
+  ctx.Equal(hRegistryCalls(ctx), before + 1, "after one failed lookup the next request for req-1 must ask the registry again (a failure is not remembered); the calls");
   ctx.Equal(again.model_version, "support-llm-2026-09", "once the registry answers, the attributed model");
   const Attribution third = attribute("t-acme", "req-1");
-  ctx.Assert(registryCalls(ctx) == before + 1 && third.model_version == again.model_version, "a successful lookup is cached: a third request for req-1 must not call the registry");
+  ctx.Assert(hRegistryCalls(ctx) == before + 1 && third.model_version == again.model_version, "a successful lookup is cached: a third request for req-1 must not call the registry");
   attribute("t-acme", "req-404");
   attribute("t-acme", "req-404");
-  ctx.Equal(registryCalls(ctx), before + 3, "a NOT_FOUND must not be remembered: the second request for req-404 asks the registry again, which may know it by then (only a success is cached); the calls");
+  ctx.Equal(hRegistryCalls(ctx), before + 3, "a NOT_FOUND must not be remembered: the second request for req-404 asks the registry again, which may know it by then (only a success is cached); the calls");
 }
 
 void CheckTenantCache(harness::Ctx& ctx) {
-  serveRegistry(ctx);
+  hServeRegistry(ctx);
   const Attribution acme = attribute("t-acme", "req-1");
   const Attribution other = attribute("t-other", "req-1");
   ctx.Equal(acme.model_version, "support-llm-2026-09", "t-acme's req-1, the model");
@@ -901,7 +901,7 @@ void CheckTenantCache(harness::Ctx& ctx) {
   ctx.Equal(asked, {"t-acme/req-1", "t-other/req-1"}, "the requests the registry was asked about");
   attribute("t-acme", "req-1");
   attribute("t-other", "req-1");
-  ctx.Equal(registryCalls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again; the calls");
+  ctx.Equal(hRegistryCalls(ctx), 2, "each tenant's attribution is cached: repeating both lookups must not call the registry again; the calls");
 }
 `,
   },

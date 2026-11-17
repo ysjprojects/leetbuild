@@ -654,54 +654,54 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 // readSetup is m-1 in pool 15: t1 is a party of p1 and p2, t3 a solo p3.
-func readSetup() {
-	store.Enqueue(readBg, "t1", "p1", 1500, []string{"p1", "p2"})
-	store.Enqueue(readBg, "t3", "p3", 1510, []string{"p3"})
-	store.CreateMatch(readBg, "m-1", 15, []string{"t1", "t3"})
+func hReadSetup() {
+	store.Enqueue(hReadBg, "t1", "p1", 1500, []string{"p1", "p2"})
+	store.Enqueue(hReadBg, "t3", "p3", 1510, []string{"p3"})
+	store.CreateMatch(hReadBg, "m-1", 15, []string{"t1", "t3"})
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readAs(c *harness.HTTP, player, matchID string) *harness.Response {
+func hReadAs(c *harness.HTTP, player, matchID string) *harness.Response {
 	if player == "" {
 		return c.Get("/v1/matches/" + matchID)
 	}
 	return c.Get("/v1/matches/"+matchID, "X-Player-Id", player)
 }
 
-type readPlayer struct {
+type HReadPlayer struct {
 	PlayerID  string \`json:"player_id"\`
 	JoinState string \`json:"join_state"\`
 }
 
-type readView struct {
+type HReadView struct {
 	MatchID  string       \`json:"match_id"\`
 	State    string       \`json:"state"\`
 	ServerID *string      \`json:"server_id"\`
-	Players  []readPlayer \`json:"players"\`
+	Players  []HReadPlayer \`json:"players"\`
 }
 
-func readDecode(r *harness.Response) readView {
-	var v readView
+func hReadDecode(r *harness.Response) HReadView {
+	var v HReadView
 	r.Decode(&v)
 	return v
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSetup()
-	store.SetServer(readBg, "m-1", "gs-m-1")
-	store.ConfirmJoin(readBg, "m-1", "p1")
-	c := readClient(ctx)
-	r := readAs(c, "p1", "m-1")
+	hReadSetup()
+	store.SetServer(hReadBg, "m-1", "gs-m-1")
+	store.ConfirmJoin(hReadBg, "m-1", "p1")
+	c := hReadClient(ctx)
+	r := hReadAs(c, "p1", "m-1")
 	ctx.Equal(r.Status, 200, "GET /v1/matches/m-1 as p1 (%s)", r.Text())
-	v := readDecode(r)
+	v := hReadDecode(r)
 	ctx.Assert(v.MatchID == "m-1" && v.ServerID != nil && *v.ServerID == "gs-m-1", "the read must carry the match id and its server, got %s", r.Text())
 	found := false
 	for _, p := range v.Players {
@@ -711,13 +711,13 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckParticipantScope(ctx *harness.Ctx) {
-	readSetup()
-	store.SetServer(readBg, "m-1", "gs-m-1")
-	c := readClient(ctx)
-	missing := readAs(c, "", "m-1")
-	outsider := readAs(c, "p9", "m-1")
-	unknown := readAs(c, "p1", "m-404")
-	member := readAs(c, "p2", "m-1")
+	hReadSetup()
+	store.SetServer(hReadBg, "m-1", "gs-m-1")
+	c := hReadClient(ctx)
+	missing := hReadAs(c, "", "m-1")
+	outsider := hReadAs(c, "p9", "m-1")
+	unknown := hReadAs(c, "p1", "m-404")
+	member := hReadAs(c, "p2", "m-1")
 	ctx.Equal(missing.Status, 401, "a read without X-Player-Id")
 	ctx.Equal(outsider.Status, 403, "p9 is not in m-1; the read")
 	ctx.Assert(!strings.Contains(outsider.Text(), "gs-m-1") && !strings.Contains(outsider.Text(), "p1"), "the refusal leaks the roster or the server: %s", outsider.Text())
@@ -726,34 +726,34 @@ func CheckParticipantScope(ctx *harness.Ctx) {
 }
 
 func CheckPendingVisible(ctx *harness.Ctx) {
-	readSetup()
-	store.SetServer(readBg, "m-1", "gs-m-1")
-	store.ConfirmJoin(readBg, "m-1", "p3")
-	c := readClient(ctx)
-	r := readAs(c, "p2", "m-1")
+	hReadSetup()
+	store.SetServer(hReadBg, "m-1", "gs-m-1")
+	store.ConfirmJoin(hReadBg, "m-1", "p3")
+	c := hReadClient(ctx)
+	r := hReadAs(c, "p2", "m-1")
 	ctx.Equal(r.Status, 200, "p2 reading its own match (%s)", r.Text())
-	want := []readPlayer{{"p1", "pending"}, {"p2", "pending"}, {"p3", "joined"}}
-	ctx.Equal(readDecode(r).Players, want, "the roster must list every participant in roster order with its join state (a lobby cannot show who it is waiting for)")
+	want := []HReadPlayer{{"p1", "pending"}, {"p2", "pending"}, {"p3", "joined"}}
+	ctx.Equal(hReadDecode(r).Players, want, "the roster must list every participant in roster order with its join state (a lobby cannot show who it is waiting for)")
 }
 
 func CheckStateFromJoins(ctx *harness.Ctx) {
-	readSetup()
-	c := readClient(ctx)
-	states := []string{readDecode(readAs(c, "p1", "m-1")).State}
-	store.SetServer(readBg, "m-1", "gs-m-1")
-	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
-	store.ConfirmJoin(readBg, "m-1", "p1")
-	store.ConfirmJoin(readBg, "m-1", "p2")
-	store.ConfirmJoin(readBg, "m-1", "p9") // a stray join from a client that is not on the roster
-	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
-	store.ConfirmJoin(readBg, "m-1", "p3")
-	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
-	store.Abandon(readBg, "m-1", "server_lost")
-	states = append(states, readDecode(readAs(c, "p1", "m-1")).State)
-	store.Enqueue(readBg, "t4", "p4", 1520, []string{"p4"})
-	store.CreateMatch(readBg, "m-2", 15, []string{"t4"})
-	store.Abandon(readBg, "m-2", "allocation_failed")
-	abandoned := readDecode(readAs(c, "p4", "m-2")).State
+	hReadSetup()
+	c := hReadClient(ctx)
+	states := []string{hReadDecode(hReadAs(c, "p1", "m-1")).State}
+	store.SetServer(hReadBg, "m-1", "gs-m-1")
+	states = append(states, hReadDecode(hReadAs(c, "p1", "m-1")).State)
+	store.ConfirmJoin(hReadBg, "m-1", "p1")
+	store.ConfirmJoin(hReadBg, "m-1", "p2")
+	store.ConfirmJoin(hReadBg, "m-1", "p9") // a stray join from a client that is not on the roster
+	states = append(states, hReadDecode(hReadAs(c, "p1", "m-1")).State)
+	store.ConfirmJoin(hReadBg, "m-1", "p3")
+	states = append(states, hReadDecode(hReadAs(c, "p1", "m-1")).State)
+	store.Abandon(hReadBg, "m-1", "server_lost")
+	states = append(states, hReadDecode(hReadAs(c, "p1", "m-1")).State)
+	store.Enqueue(hReadBg, "t4", "p4", 1520, []string{"p4"})
+	store.CreateMatch(hReadBg, "m-2", 15, []string{"t4"})
+	store.Abandon(hReadBg, "m-2", "allocation_failed")
+	abandoned := hReadDecode(hReadAs(c, "p4", "m-2")).State
 	ctx.Equal(states, []string{"allocating", "joining", "joining", "in_game", "abandoned"}, "through allocation, the joins (p9, not on the roster, among them) and an abandon the state must read allocating, joining, joining, in_game, abandoned (in_game sends every client out of the lobby, and only the roster's joins count)")
 	ctx.Equal(abandoned, "abandoned", "an abandoned match's state")
 }
@@ -770,13 +770,13 @@ func CheckStateFromJoins(ctx *harness.Ctx) {
 namespace {
 
 // m-1 in pool 15: t1 is a party of p1 and p2, t3 a solo p3.
-void readSetup() {
+void hReadSetup() {
   store::enqueue("t1", "p1", 1500, {"p1", "p2"});
   store::enqueue("t3", "p3", 1510, {"p3"});
   store::createMatch("m-1", 15, {"t1", "t3"});
 }
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -784,28 +784,28 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& player, const std::string& match_id) {
+harness::Response hReadAs(harness::HTTP& c, const std::string& player, const std::string& match_id) {
   if (player.empty()) return c.Get("/v1/matches/" + match_id);
   return c.Get("/v1/matches/" + match_id, "X-Player-Id", player);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::string stateOf(const harness::Response& r) {
-  const auto body = bodyOf(r);
+std::string hStateOf(const harness::Response& r) {
+  const auto body = hBodyOf(r);
   return body.is_object() && body.contains("state") && body["state"].is_string() ? body["state"].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readSetup();
+  hReadSetup();
   store::setServer("m-1", "gs-m-1");
   store::confirmJoin("m-1", "p1");
-  auto c = readClient(ctx);
-  const auto r = readAs(c, "p1", "m-1");
+  auto c = hReadClient(ctx);
+  const auto r = hReadAs(c, "p1", "m-1");
   ctx.Equal(r.Status, 200, "GET /v1/matches/m-1 as p1 (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.value("match_id", nlohmann::json()) == "m-1" && body.value("server_id", nlohmann::json()) == "gs-m-1", "the read must carry the match id and its server, got %s", r.Text());
   bool found = false;
   for (const auto& p : body.is_object() ? body.value("players", nlohmann::json::array()) : nlohmann::json::array()) {
@@ -815,13 +815,13 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckParticipantScope(harness::Ctx& ctx) {
-  readSetup();
+  hReadSetup();
   store::setServer("m-1", "gs-m-1");
-  auto c = readClient(ctx);
-  const auto missing = readAs(c, "", "m-1");
-  const auto outsider = readAs(c, "p9", "m-1");
-  const auto unknown = readAs(c, "p1", "m-404");
-  const auto member = readAs(c, "p2", "m-1");
+  auto c = hReadClient(ctx);
+  const auto missing = hReadAs(c, "", "m-1");
+  const auto outsider = hReadAs(c, "p9", "m-1");
+  const auto unknown = hReadAs(c, "p1", "m-404");
+  const auto member = hReadAs(c, "p2", "m-1");
   ctx.Equal(missing.Status, 401, "a read without X-Player-Id");
   ctx.Equal(outsider.Status, 403, "p9 is not in m-1; the read");
   ctx.Assert(outsider.Text().find("gs-m-1") == std::string::npos && outsider.Text().find("p1") == std::string::npos, "the refusal leaks the roster or the server: %s", outsider.Text());
@@ -830,35 +830,35 @@ void CheckParticipantScope(harness::Ctx& ctx) {
 }
 
 void CheckPendingVisible(harness::Ctx& ctx) {
-  readSetup();
+  hReadSetup();
   store::setServer("m-1", "gs-m-1");
   store::confirmJoin("m-1", "p3");
-  auto c = readClient(ctx);
-  const auto r = readAs(c, "p2", "m-1");
+  auto c = hReadClient(ctx);
+  const auto r = hReadAs(c, "p2", "m-1");
   ctx.Equal(r.Status, 200, "p2 reading its own match (%s)", r.Text());
   const nlohmann::json want = nlohmann::json::array({{{"player_id", "p1"}, {"join_state", "pending"}}, {{"player_id", "p2"}, {"join_state", "pending"}}, {{"player_id", "p3"}, {"join_state", "joined"}}});
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.value("players", nlohmann::json()) == want, "the roster is %s, expected every participant in roster order with its join state: a lobby cannot show who it is waiting for", body.is_object() ? body.value("players", nlohmann::json()).dump() : r.Text());
 }
 
 void CheckStateFromJoins(harness::Ctx& ctx) {
-  readSetup();
-  auto c = readClient(ctx);
-  std::vector<std::string> states = {stateOf(readAs(c, "p1", "m-1"))};
+  hReadSetup();
+  auto c = hReadClient(ctx);
+  std::vector<std::string> states = {hStateOf(hReadAs(c, "p1", "m-1"))};
   store::setServer("m-1", "gs-m-1");
-  states.push_back(stateOf(readAs(c, "p1", "m-1")));
+  states.push_back(hStateOf(hReadAs(c, "p1", "m-1")));
   store::confirmJoin("m-1", "p1");
   store::confirmJoin("m-1", "p2");
   store::confirmJoin("m-1", "p9");  // a stray join from a client that is not on the roster
-  states.push_back(stateOf(readAs(c, "p1", "m-1")));
+  states.push_back(hStateOf(hReadAs(c, "p1", "m-1")));
   store::confirmJoin("m-1", "p3");
-  states.push_back(stateOf(readAs(c, "p1", "m-1")));
+  states.push_back(hStateOf(hReadAs(c, "p1", "m-1")));
   store::abandon("m-1", "server_lost");
-  states.push_back(stateOf(readAs(c, "p1", "m-1")));
+  states.push_back(hStateOf(hReadAs(c, "p1", "m-1")));
   store::enqueue("t4", "p4", 1520, {"p4"});
   store::createMatch("m-2", 15, {"t4"});
   store::abandon("m-2", "allocation_failed");
-  const std::string abandoned = stateOf(readAs(c, "p4", "m-2"));
+  const std::string abandoned = hStateOf(hReadAs(c, "p4", "m-2"));
   ctx.Equal(states, std::vector<std::string>{"allocating", "joining", "joining", "in_game", "abandoned"}, "through allocation, the joins (p9, not on the roster, among them) and an abandon the state must read allocating, joining, joining, in_game, abandoned (in_game sends every client out of the lobby, and only the roster's joins count)");
   ctx.Equal(abandoned, "abandoned", "an abandoned match's state");
 }

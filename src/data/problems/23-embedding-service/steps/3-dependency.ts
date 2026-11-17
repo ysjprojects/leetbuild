@@ -766,18 +766,18 @@ import (
 	"leetbuild/harness"
 )
 
-const clientText = "Rotate keys every 90 days."
+const kHClientText = "Rotate keys every 90 days."
 
-// clientPeer is the stand-in model server: answers from embedding/model; answerAs plays a replica on another model,
+// HClientPeer is the stand-in model server: answers from embedding/model; answerAs plays a replica on another model,
 // unavailable one that is draining.
-type clientPeer struct {
+type HClientPeer struct {
 	pb.UnimplementedEmbedderServer
 	answerAs    string
 	truncate    int
 	unavailable int
 }
 
-func (p *clientPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedReply, error) {
+func (p *HClientPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedReply, error) {
 	if p.unavailable > 0 {
 		p.unavailable--
 		return nil, status.Error(codes.Unavailable, "replica draining")
@@ -793,19 +793,19 @@ func (p *clientPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedRe
 	return &pb.EmbedReply{ModelVersion: version, Values: values}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) *clientPeer {
-	peer := &clientPeer{}
+func hClientWorld(ctx *harness.Ctx) *HClientPeer {
+	peer := &HClientPeer{}
 	pb.RegisterEmbedderServer(ctx.GRPC.Server(config.ModelServer), peer)
 	return peer
 }
 
-// clientAttempt is what embed returned and the *config.EmbedError it failed with (nil when it returned a vector).
-func clientAttempt(ctx *harness.Ctx, text string) ([]float32, *config.EmbedError) {
-	return clientAttemptAs(ctx, text, config.ModelVersion)
+// hClientAttempt is what embed returned and the *config.EmbedError it failed with (nil when it returned a vector).
+func hClientAttempt(ctx *harness.Ctx, text string) ([]float32, *config.EmbedError) {
+	return hClientAttemptAs(ctx, text, config.ModelVersion)
 }
 
-// clientAttemptAs is clientAttempt for a request under modelVersion.
-func clientAttemptAs(ctx *harness.Ctx, text, modelVersion string) ([]float32, *config.EmbedError) {
+// hClientAttemptAs is clientAttempt for a request under modelVersion.
+func hClientAttemptAs(ctx *harness.Ctx, text, modelVersion string) ([]float32, *config.EmbedError) {
 	got, err := embed(context.Background(), text, modelVersion)
 	if err == nil {
 		return got, nil
@@ -816,22 +816,22 @@ func clientAttemptAs(ctx *harness.Ctx, text, modelVersion string) ([]float32, *c
 }
 
 func CheckHealthy(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	got, err := clientAttempt(ctx, clientText)
+	hClientWorld(ctx)
+	got, err := hClientAttempt(ctx, kHClientText)
 	ctx.Assert(err == nil, "a healthy model server answered and embed failed: %v", err)
-	ctx.Equal(got, model.VectorFor(config.ModelVersion, clientText), "embed must return the reply's values")
+	ctx.Equal(got, model.VectorFor(config.ModelVersion, kHClientText), "embed must return the reply's values")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Embed", "")), 1, "a healthy model server is called once per input; Embed calls")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer := clientWorld(ctx)
-	clientAttempt(ctx, clientText)
+	peer := hClientWorld(ctx)
+	hClientAttempt(ctx, kHClientText)
 	calls := ctx.GRPC.CallsTo("Embed", "")
 	ctx.Assert(len(calls) == 1 && calls[0].HasDeadline(), "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs")
 	ctx.Assert(1500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 2500*time.Millisecond, "the deadline must be 2 s, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Embed", 5.0, config.ModelServer)
 	started := ctx.Clock.Now()
-	got, err := clientAttempt(ctx, "Revoke a leaked key at once.")
+	got, err := hClientAttempt(ctx, "Revoke a leaked key at once.")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(err != nil, "a model server that takes 5 s answered after %.1f s and embed returned %v: the deadline must cut the call at 2 s and return an EmbedError", waited, got)
 	ctx.Assert(waited <= 2.6, "embed waited %.1f s on a hung model server: the deadline must cut it at about 2 s", waited)
@@ -840,7 +840,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	// A replica that fails late: 1.5 s pass before its UNAVAILABLE, and the retry must still get a full deadline of its own.
 	ctx.GRPC.SetLatency("Embed", 1.5, config.ModelServer)
 	peer.unavailable = 1
-	got, err = clientAttempt(ctx, "Audit key use weekly.")
+	got, err = hClientAttempt(ctx, "Audit key use weekly.")
 	late := ctx.GRPC.CallsTo("Embed", "")[2:]
 	ctx.Assert(len(late) == 2, "an UNAVAILABLE after 1.5 s earns one retry: expected 2 calls, saw %d", len(late))
 	ctx.Assert(late[1].HasDeadline() && 1500*time.Millisecond <= late[1].Timeout && late[1].Timeout <= 2500*time.Millisecond, "the retry carried a deadline of %v: every attempt gets 2 s of its own, not what the first attempt left over", late[1].Timeout)
@@ -849,22 +849,22 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("Embed", codes.Unavailable, "replica restarting", 1, config.ModelServer)
-	got, err := clientAttempt(ctx, clientText)
+	got, err := hClientAttempt(ctx, kHClientText)
 	ctx.Assert(err == nil && len(ctx.GRPC.CallsTo("Embed", "")) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw %d calls and %v (%v)", len(ctx.GRPC.CallsTo("Embed", "")), got, err)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the second attempt")
 	ctx.GRPC.Fail("Embed", codes.Unavailable, "model server down", 5, config.ModelServer)
-	got, err = clientAttempt(ctx, "Audit key use weekly.")
+	got, err = hClientAttempt(ctx, "Audit key use weekly.")
 	n := len(ctx.GRPC.CallsTo("Embed", "")) - 2
 	ctx.Assert(n == 2, "a model server that stays UNAVAILABLE gets maxAttempts = 2 calls, then an EmbedError: saw %d calls, each one more load on a server that is already down", n)
 	ctx.Assert(err != nil, "after its attempts embed must return an EmbedError, it returned %v", got)
 }
 
 func CheckUnavailableOnly(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("Embed", codes.InvalidArgument, "input is empty", 1, config.ModelServer)
-	got, err := clientAttempt(ctx, "")
+	got, err := hClientAttempt(ctx, "")
 	n := len(ctx.GRPC.CallsTo("Embed", ""))
 	ctx.Assert(n == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", n)
 	ctx.Assert(err != nil, "an INVALID_ARGUMENT must return an EmbedError, embed returned %v", got)
@@ -872,28 +872,28 @@ func CheckUnavailableOnly(ctx *harness.Ctx) {
 	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.PermissionDenied} {
 		before := len(ctx.GRPC.CallsTo("Embed", ""))
 		ctx.GRPC.Fail("Embed", code, "refused", 1, config.ModelServer)
-		got, err := clientAttempt(ctx, "An input for "+code.String()+".")
+		got, err := hClientAttempt(ctx, "An input for "+code.String()+".")
 		n := len(ctx.GRPC.CallsTo("Embed", "")) - before
 		ctx.Assert(n == 1 && err != nil, "%v is not UNAVAILABLE and earns no retry: expected one Embed call and an EmbedError, saw %d calls and %v (%v)", code, n, got, err)
 	}
 }
 
 func CheckModelCheck(ctx *harness.Ctx) {
-	peer := clientWorld(ctx)
+	peer := hClientWorld(ctx)
 	peer.answerAs = config.PreviousVersion
-	got, err := clientAttempt(ctx, clientText)
+	got, err := hClientAttempt(ctx, kHClientText)
 	ctx.Assert(err != nil, "a replica still on embed-v1 answered an embed-v2 request and embed returned its vector %v: it would be cached and ranked as an embed-v2 vector", got)
 	ctx.Equal(err.Reason, "model_mismatch", "the EmbedError's reason")
 	peer.answerAs, peer.truncate = "", 4
-	got, err = clientAttempt(ctx, clientText)
+	got, err = hClientAttempt(ctx, kHClientText)
 	ctx.Assert(err != nil && err.Reason == "model_mismatch", "a reply that says embed-v2 but carries 4 values must return EmbedError{model_mismatch}, embed returned %v", got)
 	peer.truncate = 0
-	got, err = clientAttempt(ctx, clientText)
+	got, err = hClientAttempt(ctx, kHClientText)
 	ctx.Assert(err == nil, "a matching reply is returned, embed failed: %v", err)
-	ctx.Equal(got, model.VectorFor(config.ModelVersion, clientText), "a matching reply is returned")
-	got, err = clientAttemptAs(ctx, clientText, config.PreviousVersion)
+	ctx.Equal(got, model.VectorFor(config.ModelVersion, kHClientText), "a matching reply is returned")
+	got, err = hClientAttemptAs(ctx, kHClientText, config.PreviousVersion)
 	ctx.Assert(err == nil, "an embed-v1 request answered by embed-v1 with its 4 values is a match (Dimensions of the model asked for), yet embed failed: %v", err)
-	ctx.Equal(got, model.VectorFor(config.PreviousVersion, clientText), "an embed-v1 request returns the embed-v1 vector")
+	ctx.Equal(got, model.VectorFor(config.PreviousVersion, kHClientText), "an embed-v1 request returns the embed-v1 vector")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -909,11 +909,11 @@ func CheckModelCheck(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Rotate keys every 90 days.";
+const std::string kHText = "Rotate keys every 90 days.";
 
 // The stand-in model server: answers from embedding/model.h; answer_as plays a replica on another model,
 // unavailable one that is draining.
-class ModelPeer final : public embedding::Embedder::Service {
+class HModelPeer final : public embedding::Embedder::Service {
  public:
   std::string answer_as;
   int truncate = 0;
@@ -933,21 +933,21 @@ class ModelPeer final : public embedding::Embedder::Service {
   }
 };
 
-ModelPeer& clientWorld(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+HModelPeer& hClientWorld(harness::Ctx& ctx) {
+  static HModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer;
+  peer = new HModelPeer;
   ctx.GRPC.Server(config::kModelServer)->RegisterService(peer);
   return *peer;
 }
 
 // What embed returned, and the EmbedError's reason when it threw one.
-struct Attempt {
+struct HAttempt {
   std::vector<float> value;
   std::optional<std::string> reason;
 };
 
-Attempt clientAttempt(harness::Ctx& ctx, const std::string& text, const std::string& model_version = config::kModelVersion) {
+HAttempt hClientAttempt(harness::Ctx& ctx, const std::string& text, const std::string& model_version = config::kModelVersion) {
   try {
     return {embed(text, model_version), std::nullopt};
   } catch (const config::EmbedError& e) {
@@ -958,36 +958,36 @@ Attempt clientAttempt(harness::Ctx& ctx, const std::string& text, const std::str
   return {};
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Embed").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Embed").size(); }
 
 }  // namespace
 
 void CheckHealthy(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  const Attempt a = clientAttempt(ctx, kText);
+  hClientWorld(ctx);
+  const HAttempt a = hClientAttempt(ctx, kHText);
   ctx.Assert(!a.reason, "a healthy model server answered and embed threw %s", a.reason.value_or(""));
-  ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kText), "embed must return the reply's values");
-  ctx.Equal(calls(ctx), 1, "a healthy model server is called once per input; Embed calls");
+  ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kHText), "embed must return the reply's values");
+  ctx.Equal(hCalls(ctx), 1, "a healthy model server is called once per input; Embed calls");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  ModelPeer& peer = clientWorld(ctx);
-  clientAttempt(ctx, kText);
+  HModelPeer& peer = hClientWorld(ctx);
+  hClientAttempt(ctx, kHText);
   const auto first = ctx.GRPC.CallsTo("Embed");
   ctx.Assert(first.size() == 1 && first[0].HasDeadline(), "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs");
   ctx.Assert(1.5 <= first[0].TimeoutSeconds() && first[0].TimeoutSeconds() <= 2.5, "the deadline must be 2 s, got %vs", first[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Embed", 5.0, config::kModelServer);
   const int64_t started = ctx.Clock.Now();
-  const Attempt a = clientAttempt(ctx, "Revoke a leaked key at once.");
+  const HAttempt a = hClientAttempt(ctx, "Revoke a leaked key at once.");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(a.reason.has_value(), "a model server that takes 5 s answered after %.1f s and embed returned %v: the deadline must cut the call at 2 s and throw EmbedError", waited, a.value);
   ctx.Assert(waited <= 2.6, "embed waited %.1f s on a hung model server: the deadline must cut it at about 2 s", waited);
-  ctx.Equal(calls(ctx), 2, "a call cut by its deadline is not retried; Embed calls so far");
+  ctx.Equal(hCalls(ctx), 2, "a call cut by its deadline is not retried; Embed calls so far");
   ctx.Equal(a.reason.value_or(""), "deadline_exceeded", "the EmbedError of a call cut by its deadline must name the status");
   // A replica that fails late: 1.5 s pass before its UNAVAILABLE, and the retry must still get a full deadline of its own.
   ctx.GRPC.SetLatency("Embed", 1.5, config::kModelServer);
   peer.unavailable = 1;
-  const Attempt late = clientAttempt(ctx, "Audit key use weekly.");
+  const HAttempt late = hClientAttempt(ctx, "Audit key use weekly.");
   const auto all = ctx.GRPC.CallsTo("Embed");
   ctx.Assert(all.size() == 4, "an UNAVAILABLE after 1.5 s earns one retry: expected 2 calls, saw %d", all.size() - 2);
   ctx.Assert(all[3].HasDeadline() && 1.5 <= all[3].TimeoutSeconds() && all[3].TimeoutSeconds() <= 2.5, "the retry carried a deadline of %vs: every attempt gets 2 s of its own, not what the first attempt left over", all[3].TimeoutSeconds());
@@ -996,53 +996,53 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "replica restarting", 1, config::kModelServer);
-  Attempt a = clientAttempt(ctx, kText);
-  ctx.Assert(!a.reason && calls(ctx) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw %d calls (%s)", calls(ctx), a.reason.value_or("a vector"));
+  HAttempt a = hClientAttempt(ctx, kHText);
+  ctx.Assert(!a.reason && hCalls(ctx) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and the vector, saw %d calls (%s)", hCalls(ctx), a.reason.value_or("a vector"));
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the second attempt");
   ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "model server down", 5, config::kModelServer);
-  a = clientAttempt(ctx, "Audit key use weekly.");
-  const size_t n = calls(ctx) - 2;
+  a = hClientAttempt(ctx, "Audit key use weekly.");
+  const size_t n = hCalls(ctx) - 2;
   ctx.Assert(n == 2, "a model server that stays UNAVAILABLE gets kMaxAttempts = 2 calls, then EmbedError: saw %d calls, each one more load on a server that is already down", n);
   ctx.Assert(a.reason.has_value(), "after its attempts embed must throw EmbedError, it returned %v", a.value);
 }
 
 void CheckUnavailableOnly(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("Embed", grpc::StatusCode::INVALID_ARGUMENT, "input is empty", 1, config::kModelServer);
-  const Attempt a = clientAttempt(ctx, "");
-  ctx.Assert(calls(ctx) == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", calls(ctx));
+  const HAttempt a = hClientAttempt(ctx, "");
+  ctx.Assert(hCalls(ctx) == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", hCalls(ctx));
   ctx.Assert(a.reason.has_value(), "an INVALID_ARGUMENT must throw EmbedError, embed returned %v", a.value);
   ctx.Equal(a.reason.value_or(""), "invalid_argument", "the EmbedError must name the status");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
   for (const auto& [code, name] : terminal) {
-    const size_t before = calls(ctx);
+    const size_t before = hCalls(ctx);
     ctx.GRPC.Fail("Embed", code, "refused", 1, config::kModelServer);
-    const Attempt t = clientAttempt(ctx, "An input for " + name + ".");
-    const size_t n = calls(ctx) - before;
+    const HAttempt t = hClientAttempt(ctx, "An input for " + name + ".");
+    const size_t n = hCalls(ctx) - before;
     ctx.Assert(n == 1 && t.reason.has_value(), "%s is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw %d calls and %s", name, n, t.reason.value_or("a vector"));
   }
 }
 
 void CheckModelCheck(harness::Ctx& ctx) {
-  ModelPeer& peer = clientWorld(ctx);
+  HModelPeer& peer = hClientWorld(ctx);
   peer.answer_as = config::kPreviousVersion;
-  Attempt a = clientAttempt(ctx, kText);
+  HAttempt a = hClientAttempt(ctx, kHText);
   ctx.Assert(a.reason.has_value(), "a replica still on embed-v1 answered an embed-v2 request and embed returned its vector %v: it would be cached and ranked as an embed-v2 vector", a.value);
   ctx.Equal(a.reason.value_or(""), "model_mismatch", "the EmbedError's reason");
   peer.answer_as = "";
   peer.truncate = 4;
-  a = clientAttempt(ctx, kText);
+  a = hClientAttempt(ctx, kHText);
   ctx.Assert(a.reason.value_or("") == "model_mismatch", "a reply that says embed-v2 but carries 4 values must throw EmbedError(model_mismatch), embed returned %v", a.value);
   peer.truncate = 0;
-  a = clientAttempt(ctx, kText);
+  a = hClientAttempt(ctx, kHText);
   ctx.Assert(!a.reason, "a matching reply is returned, embed threw %s", a.reason.value_or(""));
-  ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kText), "a matching reply is returned");
-  a = clientAttempt(ctx, kText, config::kPreviousVersion);
+  ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kHText), "a matching reply is returned");
+  a = hClientAttempt(ctx, kHText, config::kPreviousVersion);
   ctx.Assert(!a.reason, "an embed-v1 request answered by embed-v1 with its 4 values is a match (kDimensions of the model asked for), yet embed threw %s", a.reason.value_or(""));
-  ctx.Equal(a.value, model::vectorFor(config::kPreviousVersion, kText), "an embed-v1 request returns the embed-v1 vector");
+  ctx.Equal(a.value, model::vectorFor(config::kPreviousVersion, kHText), "an embed-v1 request returns the embed-v1 vector");
 }
 `,
   },

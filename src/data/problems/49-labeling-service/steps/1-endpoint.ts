@@ -928,24 +928,24 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBody = map[string]any{"items": []string{"a cat on a mat", "a dog in the fog"}, "spec_version": "2026-10", "overlap": 3}
+var hApiBody = map[string]any{"items": []string{"a cat on a mat", "a dog in the fog"}, "spec_version": "2026-10", "overlap": 3}
 
 // SHA-256 hex of the UTF-8 bytes of "a fox", "a cat" and "a dog".
 const (
-	foxHash = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c"
-	catHash = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22"
-	dogHash = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401"
+	kHFoxHash = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c"
+	kHCatHash = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22"
+	kHDogHash = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401"
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func with(change map[string]any) map[string]any {
+func hWith(change map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiBody {
+	for k, v := range hApiBody {
 		out[k] = v
 	}
 	for k, v := range change {
@@ -958,17 +958,17 @@ func with(change map[string]any) map[string]any {
 	return out
 }
 
-func create(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hCreate(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/tasks", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func answer(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hAnswer(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	m, _ := r.JSON().(map[string]any)
 	ctx.Assert(m != nil, "the response body is not a JSON object: %s", r.Text())
 	return m
 }
 
-func items(n int) []string {
+func hItems(n int) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = fmt.Sprintf("item %d", i)
@@ -977,10 +977,10 @@ func items(n int) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := create(c, apiBody, "k-1", "t1")
+	c := hApi(ctx)
+	r := hCreate(c, hApiBody, "k-1", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/tasks (%s)", r.Text())
-	body := answer(ctx, r)
+	body := hAnswer(ctx, r)
 	taskID, _ := body["task_id"].(string)
 	task := store.GetTask(context.Background(), taskID)
 	ctx.Assert(task != nil, "the create answered %s but the store holds no task %q", r.Text(), taskID)
@@ -989,86 +989,86 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckSpecPinned(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for n, spec := range []any{nil, "", "   "} {
-		body := with(map[string]any{"spec_version": nil})
+		body := hWith(map[string]any{"spec_version": nil})
 		if spec != nil {
 			body["spec_version"] = spec
 		}
-		r := create(c, body, fmt.Sprintf("k-%d", n), "t1")
+		r := hCreate(c, body, fmt.Sprintf("k-%d", n), "t1")
 		ctx.Equal(r.Status, 400, "a create with spec_version %v answered %s. A task must be pinned to a named spec version; the status", spec, r.Text())
 	}
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "the rejected creates must leave no task; tasks")
-	r := create(c, apiBody, "k-9", "t1")
+	r := hCreate(c, hApiBody, "k-9", "t1")
 	ctx.Equal(r.Status, 201, "a create with spec_version 2026-10 (%s)", r.Text())
-	body := answer(ctx, r)
+	body := hAnswer(ctx, r)
 	ctx.Equal(body["spec_version"], "2026-10", "the create's spec_version")
 	taskID, _ := body["task_id"].(string)
 	ctx.Equal(store.GetTask(context.Background(), taskID).SpecVersion, "2026-10", "the spec version the stored task is pinned to")
 }
 
 func CheckBatchBounds(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	cases := []struct {
 		change map[string]any
 		what   string
 	}{
 		{map[string]any{"items": []string{}}, "an empty batch"},
-		{map[string]any{"items": items(201)}, "a batch of 201 items"},
-		{map[string]any{"items": append(items(200), "item 0")}, "a batch of 201 items with one repeat"},
+		{map[string]any{"items": hItems(201)}, "a batch of 201 items"},
+		{map[string]any{"items": append(hItems(200), "item 0")}, "a batch of 201 items with one repeat"},
 		{map[string]any{"items": []string{"a cat", ""}}, "a batch with an empty item"},
 		{map[string]any{"overlap": 0}, "overlap 0"},
 		{map[string]any{"overlap": 6}, "overlap 6"},
 	}
 	for n, tc := range cases {
-		r := create(c, with(tc.change), fmt.Sprintf("k-%d", n), "t1")
+		r := hCreate(c, hWith(tc.change), fmt.Sprintf("k-%d", n), "t1")
 		ctx.Equal(r.Status, 400, "%s answered %s. Items are 1..maxBatchItems = 200 non-empty strings and overlap 1..maxOverlap = 5; the status", tc.what, r.Text())
 	}
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "the rejected creates must leave no task; tasks")
-	r := create(c, with(map[string]any{"items": items(200), "overlap": 5}), "k-ok", "t1")
+	r := hCreate(c, hWith(map[string]any{"items": hItems(200), "overlap": 5}), "k-ok", "t1")
 	ctx.Equal(r.Status, 201, "200 items with overlap 5 are within bounds (%s)", r.Text())
-	one := create(c, with(map[string]any{"items": []string{"one item"}, "overlap": 1}), "k-one", "t1")
+	one := hCreate(c, hWith(map[string]any{"items": []string{"one item"}, "overlap": 1}), "k-one", "t1")
 	ctx.Equal(one.Status, 201, "one item with overlap 1 is within bounds (%s)", one.Text())
 }
 
 func CheckContentDedupe(ctx *harness.Ctx) {
-	c := api(ctx)
-	store.AddHashes(context.Background(), "2026-10", []string{foxHash}) // "a fox" was queued under 2026-10 by an earlier create
-	r := create(c, with(map[string]any{"items": []string{"a cat", "a dog", "a cat", "a fox"}}), "k-1", "t1")
+	c := hApi(ctx)
+	store.AddHashes(context.Background(), "2026-10", []string{kHFoxHash}) // "a fox" was queued under 2026-10 by an earlier create
+	r := hCreate(c, hWith(map[string]any{"items": []string{"a cat", "a dog", "a cat", "a fox"}}), "k-1", "t1")
 	ctx.Equal(r.Status, 201, "the first create (%s)", r.Text())
-	first := answer(ctx, r)
+	first := hAnswer(ctx, r)
 	ctx.Assert(first["accepted"] == float64(2) && first["deduped"] == float64(2), "a batch repeating 'a cat', with 'a fox' already queued under its SHA-256 hash, answered %s: both must be dropped and counted (accepted 2, deduped 2)", r.Text())
 	taskID, _ := first["task_id"].(string)
 	ctx.Equal(store.GetTask(context.Background(), taskID).TotalItems, 2, "the task must hold the 2 distinct items; its items")
 	hashes := store.SeenHashes(context.Background(), "2026-10")
-	ctx.Assert(len(hashes) == 3 && hashes[foxHash] && hashes[catHash] && hashes[dogHash], "the spec's registered hashes are %v, expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'", hashes)
-	r = create(c, with(map[string]any{"items": []string{"a dog", "a bird", "A bird "}}), "k-2", "t1")
-	second := answer(ctx, r)
+	ctx.Assert(len(hashes) == 3 && hashes[kHFoxHash] && hashes[kHCatHash] && hashes[kHDogHash], "the spec's registered hashes are %v, expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'", hashes)
+	r = hCreate(c, hWith(map[string]any{"items": []string{"a dog", "a bird", "A bird "}}), "k-2", "t1")
+	second := hAnswer(ctx, r)
 	ctx.Assert(r.Status == 201 && second["accepted"] == float64(2) && second["deduped"] == float64(1), "'a dog' is already queued under 2026-10 and 'A bird ' is other bytes than 'a bird': the second batch answered %d %s, expected accepted 2, deduped 1", r.Status, r.Text())
-	r = create(c, with(map[string]any{"items": []string{"a cat", "a bird"}}), "k-3", "t1")
-	ctx.Assert(r.Status == 409 && answer(ctx, r)["error"] == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text())
+	r = hCreate(c, hWith(map[string]any{"items": []string{"a cat", "a bird"}}), "k-3", "t1")
+	ctx.Assert(r.Status == 409 && hAnswer(ctx, r)["error"] == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text())
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 2, "the all-duplicate batch must leave no task; tasks")
-	r = create(c, with(map[string]any{"spec_version": "2026-11", "items": []string{"a cat"}}), "k-4", "t1")
-	ctx.Assert(r.Status == 201 && answer(ctx, r)["accepted"] == float64(1), "under another spec the same item is a new question: answered %d %s", r.Status, r.Text())
+	r = hCreate(c, hWith(map[string]any{"spec_version": "2026-11", "items": []string{"a cat"}}), "k-4", "t1")
+	ctx.Assert(r.Status == 201 && hAnswer(ctx, r)["accepted"] == float64(1), "under another spec the same item is a new question: answered %d %s", r.Status, r.Text())
 }
 
 func CheckIdempotentCreate(ctx *harness.Ctx) {
-	c := api(ctx)
-	none := c.Post("/v1/tasks", apiBody, "X-Tenant-Id", "t1")
+	c := hApi(ctx)
+	none := c.Post("/v1/tasks", hApiBody, "X-Tenant-Id", "t1")
 	ctx.Equal(none.Status, 400, "a create without Idempotency-Key")
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "a create without Idempotency-Key must leave no task; tasks")
-	first := create(c, apiBody, "k-1", "t1")
+	first := hCreate(c, hApiBody, "k-1", "t1")
 	ctx.Equal(first.Status, 201, "the first create (%s)", first.Text())
-	replay := create(c, apiBody, "k-1", "t1")
+	replay := hCreate(c, hApiBody, "k-1", "t1")
 	ctx.Equal(replay.Status, 200, "a retry with the same Idempotency-Key (%s)", replay.Text())
-	ctx.Equal(answer(ctx, replay), answer(ctx, first), "a retry with the same Idempotency-Key must answer the first answer")
+	ctx.Equal(hAnswer(ctx, replay), hAnswer(ctx, first), "a retry with the same Idempotency-Key must answer the first answer")
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 1, "a retried create must not make a second task; tasks")
-	other := create(c, with(map[string]any{"items": []string{"a bird"}}), "k-1", "t2")
-	ctx.Assert(other.Status == 201 && answer(ctx, other)["task_id"] != answer(ctx, first)["task_id"], "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text())
-	dup := create(c, apiBody, "k-2", "t1")
+	other := hCreate(c, hWith(map[string]any{"items": []string{"a bird"}}), "k-1", "t2")
+	ctx.Assert(other.Status == 201 && hAnswer(ctx, other)["task_id"] != hAnswer(ctx, first)["task_id"], "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text())
+	dup := hCreate(c, hApiBody, "k-2", "t1")
 	ctx.Equal(dup.Status, 409, "a batch whose items are all queued (%s)", dup.Text())
-	retry := create(c, apiBody, "k-2", "t1")
-	ctx.Assert(retry.Status == 409 && answer(ctx, retry)["error"] == "no_new_items", "only a 201 answer is recorded: the retry of a create that answered 409 answered %d %s, expected 409 no_new_items again", retry.Status, retry.Text())
+	retry := hCreate(c, hApiBody, "k-2", "t1")
+	ctx.Assert(retry.Status == 409 && hAnswer(ctx, retry)["error"] == "no_new_items", "only a 201 answer is recorded: the retry of a create that answered 409 answered %d %s, expected 409 no_new_items again", retry.Status, retry.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1083,13 +1083,13 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kBody = {{"items", {"a cat on a mat", "a dog in the fog"}}, {"spec_version", "2026-10"}, {"overlap", 3}};
+const json kHBody = {{"items", {"a cat on a mat", "a dog in the fog"}}, {"spec_version", "2026-10"}, {"overlap", 3}};
 // SHA-256 hex of the UTF-8 bytes of "a fox", "a cat" and "a dog".
-const std::string kFox = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c";
-const std::string kCat = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22";
-const std::string kDog = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401";
+const std::string kHFox = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c";
+const std::string kHCat = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22";
+const std::string kHDog = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1097,8 +1097,8 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json with(const json& change) {
-  json out = kBody;
+json hWith(const json& change) {
+  json out = kHBody;
   for (const auto& [k, v] : change.items()) {
     if (v.is_null()) {
       out.erase(k);
@@ -1109,31 +1109,31 @@ json with(const json& change) {
   return out;
 }
 
-harness::Response create(harness::HTTP& c, const json& body, const std::string& key, const std::string& tenant = "t1") {
+harness::Response hCreate(harness::HTTP& c, const json& body, const std::string& key, const std::string& tenant = "t1") {
   return c.Post("/v1/tasks", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-json answer(harness::Ctx& ctx, const harness::Response& r) {
+json hAnswer(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the response body is not a JSON object: %s", r.Text());
   return body;
 }
 
-json items(int n) {
+json hItems(int n) {
   json out = json::array();
   for (int i = 0; i < n; i++) out.push_back("item " + std::to_string(i));
   return out;
 }
 
-size_t taskCount(harness::Ctx& ctx) { return ctx.Redis.Keys("task:t-*").size(); }
+size_t hTaskCount(harness::Ctx& ctx) { return ctx.Redis.Keys("task:t-*").size(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = create(c, kBody, "k-1");
+  auto c = hApi(ctx);
+  const auto r = hCreate(c, kHBody, "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/tasks (%s)", r.Text());
-  const json body = answer(ctx, r);
+  const json body = hAnswer(ctx, r);
   const std::string task_id = body.value("task_id", "");
   const auto task = store::getTask(task_id);
   ctx.Assert(task.has_value(), "the create answered %s but the store holds no task %q", r.Text(), task_id);
@@ -1142,82 +1142,82 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckSpecPinned(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<json> specs = {json(), json(""), json("   ")};
   for (size_t n = 0; n < specs.size(); n++) {
-    json body = with(json{{"spec_version", nullptr}});
+    json body = hWith(json{{"spec_version", nullptr}});
     if (!specs[n].is_null()) body["spec_version"] = specs[n];
-    const auto r = create(c, body, "k-" + std::to_string(n));
+    const auto r = hCreate(c, body, "k-" + std::to_string(n));
     ctx.Equal(r.Status, 400, "a create with spec_version %s answered %s. A task must be pinned to a named spec version; the status", specs[n].dump(), r.Text());
   }
-  ctx.Equal(taskCount(ctx), 0, "the rejected creates must leave no task; tasks");
-  const auto r = create(c, kBody, "k-9");
+  ctx.Equal(hTaskCount(ctx), 0, "the rejected creates must leave no task; tasks");
+  const auto r = hCreate(c, kHBody, "k-9");
   ctx.Equal(r.Status, 201, "a create with spec_version 2026-10 (%s)", r.Text());
-  const json body = answer(ctx, r);
+  const json body = hAnswer(ctx, r);
   ctx.Equal(body.value("spec_version", ""), "2026-10", "the create's spec_version");
   ctx.Equal(store::getTask(body.value("task_id", ""))->spec_version, "2026-10", "the spec version the stored task is pinned to");
 }
 
 void CheckBatchBounds(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<std::pair<json, std::string>> cases = {
       {json{{"items", json::array()}}, "an empty batch"},
-      {json{{"items", items(201)}}, "a batch of 201 items"},
-      {json{{"items", [] { json out = items(200); out.push_back("item 0"); return out; }()}}, "a batch of 201 items with one repeat"},
+      {json{{"items", hItems(201)}}, "a batch of 201 items"},
+      {json{{"items", [] { json out = hItems(200); out.push_back("item 0"); return out; }()}}, "a batch of 201 items with one repeat"},
       {json{{"items", {"a cat", ""}}}, "a batch with an empty item"},
       {json{{"overlap", 0}}, "overlap 0"},
       {json{{"overlap", 6}}, "overlap 6"},
   };
   for (size_t n = 0; n < cases.size(); n++) {
-    const auto r = create(c, with(cases[n].first), "k-" + std::to_string(n));
+    const auto r = hCreate(c, hWith(cases[n].first), "k-" + std::to_string(n));
     ctx.Equal(r.Status, 400, "%s answered %s. Items are 1..kMaxBatchItems = 200 non-empty strings and overlap 1..kMaxOverlap = 5; the status", cases[n].second, r.Text());
   }
-  ctx.Equal(taskCount(ctx), 0, "the rejected creates must leave no task; tasks");
-  const auto r = create(c, with(json{{"items", items(200)}, {"overlap", 5}}), "k-ok");
+  ctx.Equal(hTaskCount(ctx), 0, "the rejected creates must leave no task; tasks");
+  const auto r = hCreate(c, hWith(json{{"items", hItems(200)}, {"overlap", 5}}), "k-ok");
   ctx.Equal(r.Status, 201, "200 items with overlap 5 are within bounds (%s)", r.Text());
-  const auto one = create(c, with(json{{"items", {"one item"}}, {"overlap", 1}}), "k-one");
+  const auto one = hCreate(c, hWith(json{{"items", {"one item"}}, {"overlap", 1}}), "k-one");
   ctx.Equal(one.Status, 201, "one item with overlap 1 is within bounds (%s)", one.Text());
 }
 
 void CheckContentDedupe(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  store::addHashes("2026-10", {kFox});  // "a fox" was queued under 2026-10 by an earlier create
-  auto r = create(c, with(json{{"items", {"a cat", "a dog", "a cat", "a fox"}}}), "k-1");
+  auto c = hApi(ctx);
+  store::addHashes("2026-10", {kHFox});  // "a fox" was queued under 2026-10 by an earlier create
+  auto r = hCreate(c, hWith(json{{"items", {"a cat", "a dog", "a cat", "a fox"}}}), "k-1");
   ctx.Equal(r.Status, 201, "the first create (%s)", r.Text());
-  const json first = answer(ctx, r);
+  const json first = hAnswer(ctx, r);
   ctx.Assert(first.value("accepted", 0L) == 2 && first.value("deduped", 0L) == 2, "a batch repeating 'a cat', with 'a fox' already queued under its SHA-256 hash, answered %s: both must be dropped and counted (accepted 2, deduped 2)", r.Text());
   ctx.Equal(store::getTask(first.value("task_id", ""))->total_items, 2L, "the task must hold the 2 distinct items; its items");
   const auto hashes = store::seenHashes("2026-10");
   std::string listed;
   for (const auto& h : hashes) listed += (listed.empty() ? "" : ", ") + h;
-  ctx.Assert(hashes == std::set<std::string>{kFox, kCat, kDog}, "the spec's registered hashes are [%s], expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'", listed);
-  r = create(c, with(json{{"items", {"a dog", "a bird", "A bird "}}}), "k-2");
-  const json second = answer(ctx, r);
+  ctx.Assert(hashes == std::set<std::string>{kHFox, kHCat, kHDog}, "the spec's registered hashes are [%s], expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'", listed);
+  r = hCreate(c, hWith(json{{"items", {"a dog", "a bird", "A bird "}}}), "k-2");
+  const json second = hAnswer(ctx, r);
   ctx.Assert(r.Status == 201 && second.value("accepted", 0L) == 2 && second.value("deduped", 0L) == 1, "'a dog' is already queued under 2026-10 and 'A bird ' is other bytes than 'a bird': the second batch answered %d %s, expected accepted 2, deduped 1", r.Status, r.Text());
-  r = create(c, with(json{{"items", {"a cat", "a bird"}}}), "k-3");
-  ctx.Assert(r.Status == 409 && answer(ctx, r).value("error", "") == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text());
-  ctx.Equal(taskCount(ctx), 2, "the all-duplicate batch must leave no task; tasks");
-  r = create(c, with(json{{"spec_version", "2026-11"}, {"items", {"a cat"}}}), "k-4");
-  ctx.Assert(r.Status == 201 && answer(ctx, r).value("accepted", 0L) == 1, "under another spec the same item is a new question: answered %d %s", r.Status, r.Text());
+  r = hCreate(c, hWith(json{{"items", {"a cat", "a bird"}}}), "k-3");
+  ctx.Assert(r.Status == 409 && hAnswer(ctx, r).value("error", "") == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text());
+  ctx.Equal(hTaskCount(ctx), 2, "the all-duplicate batch must leave no task; tasks");
+  r = hCreate(c, hWith(json{{"spec_version", "2026-11"}, {"items", {"a cat"}}}), "k-4");
+  ctx.Assert(r.Status == 201 && hAnswer(ctx, r).value("accepted", 0L) == 1, "under another spec the same item is a new question: answered %d %s", r.Status, r.Text());
 }
 
 void CheckIdempotentCreate(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto none = c.Post("/v1/tasks", kBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  auto c = hApi(ctx);
+  const auto none = c.Post("/v1/tasks", kHBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(none.Status, 400, "a create without Idempotency-Key");
-  ctx.Equal(taskCount(ctx), 0, "a create without Idempotency-Key must leave no task; tasks");
-  const auto first = create(c, kBody, "k-1");
+  ctx.Equal(hTaskCount(ctx), 0, "a create without Idempotency-Key must leave no task; tasks");
+  const auto first = hCreate(c, kHBody, "k-1");
   ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
-  const auto replay = create(c, kBody, "k-1");
+  const auto replay = hCreate(c, kHBody, "k-1");
   ctx.Equal(replay.Status, 200, "a retry with the same Idempotency-Key (%s)", replay.Text());
-  ctx.Equal(answer(ctx, replay), answer(ctx, first), "a retry with the same Idempotency-Key must answer the first answer");
-  ctx.Equal(taskCount(ctx), 1, "a retried create must not make a second task; tasks");
-  const auto other = create(c, with(json{{"items", {"a bird"}}}), "k-1", "t2");
-  ctx.Assert(other.Status == 201 && answer(ctx, other).value("task_id", "") != answer(ctx, first).value("task_id", ""), "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text());
-  const auto dup = create(c, kBody, "k-2");
+  ctx.Equal(hAnswer(ctx, replay), hAnswer(ctx, first), "a retry with the same Idempotency-Key must answer the first answer");
+  ctx.Equal(hTaskCount(ctx), 1, "a retried create must not make a second task; tasks");
+  const auto other = hCreate(c, hWith(json{{"items", {"a bird"}}}), "k-1", "t2");
+  ctx.Assert(other.Status == 201 && hAnswer(ctx, other).value("task_id", "") != hAnswer(ctx, first).value("task_id", ""), "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text());
+  const auto dup = hCreate(c, kHBody, "k-2");
   ctx.Equal(dup.Status, 409, "a batch whose items are all queued (%s)", dup.Text());
-  const auto retry = create(c, kBody, "k-2");
-  ctx.Assert(retry.Status == 409 && answer(ctx, retry).value("error", "") == "no_new_items", "only a 201 answer is recorded: the retry of a create that answered 409 answered %d %s, expected 409 no_new_items again", retry.Status, retry.Text());
+  const auto retry = hCreate(c, kHBody, "k-2");
+  ctx.Assert(retry.Status == 409 && hAnswer(ctx, retry).value("error", "") == "no_new_items", "only a 201 answer is recorded: the retry of a create that answered 409 answered %d %s, expected 409 no_new_items again", retry.Status, retry.Text());
 }
 `,
   },

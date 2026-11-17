@@ -569,94 +569,94 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func newStored(state, category, recipient string) string {
-	id := store.Enqueue(readBg, "t-1", recipient, "welcome", "Welcome", map[string]string{"first_name": "Ana"})
+func hNewStored(state, category, recipient string) string {
+	id := store.Enqueue(hReadBg, "t-1", recipient, "welcome", "Welcome", map[string]string{"first_name": "Ana"})
 	if state != "queued" {
-		store.SetState(readBg, id, state, category)
+		store.SetState(hReadBg, id, state, category)
 	}
 	return id
 }
 
-func readAs(c *harness.HTTP, id, tenant string) *harness.Response {
+func hReadAs(c *harness.HTTP, id, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/messages/" + id)
 	}
 	return c.Get("/v1/messages/"+id, "X-Tenant-Id", tenant)
 }
 
-func bodyOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hBodyOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the read answered %d %s, expected a JSON object", r.Status, r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := newStored("sent", "", "ana@example.com")
-	r := readAs(c, id, "t-1")
+	c := hApi(ctx)
+	id := hNewStored("sent", "", "ana@example.com")
+	r := hReadAs(c, id, "t-1")
 	ctx.Equal(r.Status, 200, "GET /v1/messages/%s (%s)", id, r.Text())
-	body := bodyOf(ctx, r)
+	body := hBodyOf(ctx, r)
 	ctx.Assert(body["message_id"] == id && body["state"] == "sent", "a sent message reads %s", r.Text())
-	ctx.Equal(readAs(c, "m-404", "t-1").Status, 404, "an unknown id")
+	ctx.Equal(hReadAs(c, "m-404", "t-1").Status, 404, "an unknown id")
 }
 
 func CheckStateFromRecord(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	cases := [][2]string{
-		{newStored("queued", "", "ana@example.com"), "queued"},
-		{newStored("deferred", "", "ana@example.com"), "deferred"},
-		{newStored("suppressed", "", "blocked@example.com"), "suppressed"},
+		{hNewStored("queued", "", "ana@example.com"), "queued"},
+		{hNewStored("deferred", "", "ana@example.com"), "deferred"},
+		{hNewStored("suppressed", "", "blocked@example.com"), "suppressed"},
 	}
 	for _, tc := range cases {
-		r := readAs(c, tc[0], "t-1")
+		r := hReadAs(c, tc[0], "t-1")
 		ctx.Equal(r.Status, 200, "GET /v1/messages/%s (%s)", tc[0], r.Text())
-		ctx.Equal(bodyOf(ctx, r)["state"], tc[1], "a %s message must not read as sent while the relay never accepted it (report the record's state); the state", tc[1])
+		ctx.Equal(hBodyOf(ctx, r)["state"], tc[1], "a %s message must not read as sent while the relay never accepted it (report the record's state); the state", tc[1])
 	}
 }
 
 func CheckBounceCategory(ctx *harness.Ctx) {
-	c := api(ctx)
-	bounced := newStored("bounced", "mailbox_unknown", "bounce@example.com")
+	c := hApi(ctx)
+	bounced := hNewStored("bounced", "mailbox_unknown", "bounce@example.com")
 	ctx.Redis.Do("SADD", "mail:suppressed", "bounce@example.com")
-	sent := newStored("sent", "", "ana@example.com")
-	body := bodyOf(ctx, readAs(c, bounced, "t-1"))
-	clean := bodyOf(ctx, readAs(c, sent, "t-1"))
+	sent := hNewStored("sent", "", "ana@example.com")
+	body := hBodyOf(ctx, hReadAs(c, bounced, "t-1"))
+	clean := hBodyOf(ctx, hReadAs(c, sent, "t-1"))
 	ctx.Equal(body["state"], "bounced", "a bounced message's state")
 	ctx.Equal(body["bounce_category"], "mailbox_unknown", "without bounce_category support cannot tell a dead mailbox from a full one; a bounced message's bounce_category")
 	ctx.Equal(body["suppressed"], true, "the bounced address is suppressed; the read's suppressed")
 	ctx.Assert(clean["bounce_category"] == "" && clean["suppressed"] == false, "a sent message must carry an empty bounce_category and suppressed false, got %v", clean)
 	ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com")
-	ctx.Equal(bodyOf(ctx, readAs(c, sent, "t-1"))["suppressed"], true, "ana unsubscribed after her message was sent (suppressed is the gate's answer for the recipient now, not a property of the message's state); the read's suppressed")
+	ctx.Equal(hBodyOf(ctx, hReadAs(c, sent, "t-1"))["suppressed"], true, "ana unsubscribed after her message was sent (suppressed is the gate's answer for the recipient now, not a property of the message's state); the read's suppressed")
 }
 
 func CheckForeign404(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := newStored("sent", "", "ana@example.com")
-	foreign := readAs(c, id, "t-2")
+	c := hApi(ctx)
+	id := hNewStored("sent", "", "ana@example.com")
+	foreign := hReadAs(c, id, "t-2")
 	ctx.Equal(foreign.Status, 404, "tenant t-2 read t-1's message %s (%s): compare the message's tenant with X-Tenant-Id and answer 404", id, foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), "ana@example.com"), "the answer to another tenant carries the recipient: %s", foreign.Text())
-	missing := readAs(c, "m-404", "t-2")
+	missing := hReadAs(c, "m-404", "t-2")
 	ctx.Equal(strings.ReplaceAll(foreign.Text(), id, "{id}"), strings.ReplaceAll(missing.Text(), "m-404", "{id}"), "another tenant's message must answer the same 404 as a missing id (a difference confirms the id exists); the bodies")
-	ctx.Equal(readAs(c, id, "T-1").Status, 404, "tenant T-1 reading t-1's message (tenant ids are compared exactly)")
-	ctx.Equal(readAs(c, id, "").Status, 404, "a read without X-Tenant-Id")
-	ctx.Equal(readAs(c, id, "t-1").Status, 200, "the owning tenant's read")
+	ctx.Equal(hReadAs(c, id, "T-1").Status, 404, "tenant T-1 reading t-1's message (tenant ids are compared exactly)")
+	ctx.Equal(hReadAs(c, id, "").Status, 404, "a read without X-Tenant-Id")
+	ctx.Equal(hReadAs(c, id, "t-1").Status, 200, "the owning tenant's read")
 }
 
 func CheckTimeline(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := newStored("queued", "", "ana@example.com")
-	store.RecordAttempt(readBg, id, "unavailable")
-	store.RecordAttempt(readBg, id, "accepted")
-	store.SetState(readBg, id, "sent", "")
-	body := bodyOf(ctx, readAs(c, id, "t-1"))
+	c := hApi(ctx)
+	id := hNewStored("queued", "", "ana@example.com")
+	store.RecordAttempt(hReadBg, id, "unavailable")
+	store.RecordAttempt(hReadBg, id, "accepted")
+	store.SetState(hReadBg, id, "sent", "")
+	body := hBodyOf(ctx, hReadAs(c, id, "t-1"))
 	want := []any{map[string]any{"attempt": 1, "outcome": "unavailable"}, map[string]any{"attempt": 2, "outcome": "accepted"}}
 	ctx.Equal(body["attempts"], want, "the retry behind the delivery is invisible; the read's attempts")
 }
@@ -673,7 +673,7 @@ func CheckTimeline(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -681,18 +681,18 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string newStored(const std::string& state, const std::string& category, const std::string& recipient) {
+std::string hNewStored(const std::string& state, const std::string& category, const std::string& recipient) {
   const std::string id = mail::store::enqueue("t-1", recipient, "welcome", "Welcome", {{"first_name", "Ana"}});
   if (state != "queued") mail::store::setState(id, state, category);
   return id;
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& id, const std::string& tenant) {
+harness::Response hReadAs(harness::HTTP& c, const std::string& id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/messages/" + id);
   return c.Get("/v1/messages/" + id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the read answered %d %s, expected a JSON object", r.Status, r.Text());
   return body;
@@ -701,68 +701,68 @@ nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string id = newStored("sent", "", "ana@example.com");
-  const auto r = readAs(c, id, "t-1");
+  auto c = hApi(ctx);
+  const std::string id = hNewStored("sent", "", "ana@example.com");
+  const auto r = hReadAs(c, id, "t-1");
   ctx.Equal(r.Status, 200, "GET /v1/messages/%s (%s)", id, r.Text());
-  const auto body = bodyOf(ctx, r);
+  const auto body = hBodyOf(ctx, r);
   ctx.Assert(body.value("message_id", "") == id && body.value("state", "") == "sent", "a sent message reads %s", r.Text());
-  ctx.Equal(readAs(c, "m-404", "t-1").Status, 404, "an unknown id");
+  ctx.Equal(hReadAs(c, "m-404", "t-1").Status, 404, "an unknown id");
 }
 
 void CheckStateFromRecord(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<std::pair<std::string, std::string>> cases = {
-      {newStored("queued", "", "ana@example.com"), "queued"},
-      {newStored("deferred", "", "ana@example.com"), "deferred"},
-      {newStored("suppressed", "", "blocked@example.com"), "suppressed"}};
+      {hNewStored("queued", "", "ana@example.com"), "queued"},
+      {hNewStored("deferred", "", "ana@example.com"), "deferred"},
+      {hNewStored("suppressed", "", "blocked@example.com"), "suppressed"}};
   for (const auto& [id, want] : cases) {
-    const auto r = readAs(c, id, "t-1");
+    const auto r = hReadAs(c, id, "t-1");
     ctx.Equal(r.Status, 200, "GET /v1/messages/%s (%s)", id, r.Text());
-    ctx.Equal(bodyOf(ctx, r).value("state", ""), want, "a %s message must not read as sent while the relay never accepted it (report the record's state); the state", want);
+    ctx.Equal(hBodyOf(ctx, r).value("state", ""), want, "a %s message must not read as sent while the relay never accepted it (report the record's state); the state", want);
   }
 }
 
 void CheckBounceCategory(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string bounced = newStored("bounced", "mailbox_unknown", "bounce@example.com");
+  auto c = hApi(ctx);
+  const std::string bounced = hNewStored("bounced", "mailbox_unknown", "bounce@example.com");
   ctx.Redis.Do("SADD", "mail:suppressed", "bounce@example.com");
-  const std::string sent = newStored("sent", "", "ana@example.com");
-  const auto body = bodyOf(ctx, readAs(c, bounced, "t-1"));
-  const auto clean = bodyOf(ctx, readAs(c, sent, "t-1"));
+  const std::string sent = hNewStored("sent", "", "ana@example.com");
+  const auto body = hBodyOf(ctx, hReadAs(c, bounced, "t-1"));
+  const auto clean = hBodyOf(ctx, hReadAs(c, sent, "t-1"));
   ctx.Equal(body.value("state", ""), "bounced", "a bounced message's state");
   ctx.Equal(body.value("bounce_category", "(missing)"), "mailbox_unknown", "without bounce_category support cannot tell a dead mailbox from a full one; a bounced message's bounce_category");
   ctx.Equal(body.value("suppressed", false), true, "the bounced address is suppressed; the read's suppressed");
   ctx.Assert(clean.value("bounce_category", "(missing)").empty() && clean.value("suppressed", true) == false, "a sent message must carry an empty bounce_category and suppressed false, got %s", clean.dump());
   ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com");
-  ctx.Equal(bodyOf(ctx, readAs(c, sent, "t-1")).value("suppressed", false), true,
+  ctx.Equal(hBodyOf(ctx, hReadAs(c, sent, "t-1")).value("suppressed", false), true,
             "ana unsubscribed after her message was sent (suppressed is the gate's answer for the recipient now, not a property of the message's state); the read's suppressed");
 }
 
 void CheckForeign404(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string id = newStored("sent", "", "ana@example.com");
-  const auto foreign = readAs(c, id, "t-2");
+  auto c = hApi(ctx);
+  const std::string id = hNewStored("sent", "", "ana@example.com");
+  const auto foreign = hReadAs(c, id, "t-2");
   ctx.Equal(foreign.Status, 404, "tenant t-2 read t-1's message %s (%s): compare the message's tenant with X-Tenant-Id and answer 404", id, foreign.Text());
   ctx.Assert(foreign.Text().find("ana@example.com") == std::string::npos, "the answer to another tenant carries the recipient: %s", foreign.Text());
   const auto masked = [](std::string text, const std::string& id_in_text) {
     for (auto at = text.find(id_in_text); at != std::string::npos; at = text.find(id_in_text, at + 4)) text.replace(at, id_in_text.size(), "{id}");
     return text;
   };
-  ctx.Equal(masked(foreign.Text(), id), masked(readAs(c, "m-404", "t-2").Text(), "m-404"),
+  ctx.Equal(masked(foreign.Text(), id), masked(hReadAs(c, "m-404", "t-2").Text(), "m-404"),
             "another tenant's message must answer the same 404 as a missing id (a difference confirms the id exists); the bodies");
-  ctx.Equal(readAs(c, id, "T-1").Status, 404, "tenant T-1 reading t-1's message (tenant ids are compared exactly)");
-  ctx.Equal(readAs(c, id, "").Status, 404, "a read without X-Tenant-Id");
-  ctx.Equal(readAs(c, id, "t-1").Status, 200, "the owning tenant's read");
+  ctx.Equal(hReadAs(c, id, "T-1").Status, 404, "tenant T-1 reading t-1's message (tenant ids are compared exactly)");
+  ctx.Equal(hReadAs(c, id, "").Status, 404, "a read without X-Tenant-Id");
+  ctx.Equal(hReadAs(c, id, "t-1").Status, 200, "the owning tenant's read");
 }
 
 void CheckTimeline(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string id = newStored("queued", "", "ana@example.com");
+  auto c = hApi(ctx);
+  const std::string id = hNewStored("queued", "", "ana@example.com");
   mail::store::recordAttempt(id, "unavailable");
   mail::store::recordAttempt(id, "accepted");
   mail::store::setState(id, "sent");
-  const auto body = bodyOf(ctx, readAs(c, id, "t-1"));
+  const auto body = hBodyOf(ctx, hReadAs(c, id, "t-1"));
   const nlohmann::json want = nlohmann::json::array({{{"attempt", 1}, {"outcome", "unavailable"}}, {{"attempt", 2}, {"outcome", "accepted"}}});
   ctx.Assert(body.contains("attempts") && body["attempts"] == want, "the read shows attempts %s, expected %s: the retry behind the delivery is invisible",
              body.contains("attempts") ? body["attempts"].dump() : "(none)", want.dump());

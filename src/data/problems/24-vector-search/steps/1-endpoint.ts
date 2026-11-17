@@ -749,11 +749,11 @@ import (
 	"leetbuild/harness"
 )
 
-var apiQuery = []float64{1, 0, 0, 0}
+var hApiQuery = []float64{1, 0, 0, 0}
 
-// api seeds acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and
+// hApi seeds acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and
 // acme's old-1 in the retired idx-41.
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	bg := context.Background()
 	corpus.Activate(bg, "idx-42", 4)
 	corpus.PutDocument(bg, "acme", "idx-42", "a1", []float64{0.9, 0.1, 0, 0})
@@ -766,7 +766,7 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-type apiAnswer struct {
+type HApiAnswer struct {
 	Hits []struct {
 		ID string \`json:"id"\`
 	} \`json:"hits"\`
@@ -774,21 +774,21 @@ type apiAnswer struct {
 	IndexVersion string \`json:"index_version"\`
 }
 
-func answerOf(r *harness.Response) apiAnswer {
-	var a apiAnswer
+func hAnswerOf(r *harness.Response) HApiAnswer {
+	var a HApiAnswer
 	json.Unmarshal(r.Body, &a)
 	return a
 }
 
-func idsOf(r *harness.Response) []string {
+func hIdsOf(r *harness.Response) []string {
 	out := []string{}
-	for _, h := range answerOf(r).Hits {
+	for _, h := range hAnswerOf(r).Hits {
 		out = append(out, h.ID)
 	}
 	return out
 }
 
-func searchAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
+func hSearchAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Post("/v1/search", body)
 	}
@@ -796,66 +796,66 @@ func searchAs(c *harness.HTTP, body map[string]any, tenant string) *harness.Resp
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := searchAs(c, map[string]any{"query": apiQuery, "k": 2}, "acme")
+	c := hApi(ctx)
+	r := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2}, "acme")
 	ctx.Equal(r.Status, 200, "POST /v1/search (%s)", r.Text())
-	ctx.Equal(idsOf(r), []string{"a1", "a2"}, "acme's two nearest documents to [1 0 0 0] are a1 and a2 (%s)", r.Text())
-	a := answerOf(r)
+	ctx.Equal(hIdsOf(r), []string{"a1", "a2"}, "acme's two nearest documents to [1 0 0 0] are a1 and a2 (%s)", r.Text())
+	a := hAnswerOf(r)
 	ctx.Assert(a.K == 2 && a.IndexVersion == "idx-42", "the response must carry k 2 and the active version idx-42, got %s", r.Text())
 }
 
 func CheckTenantHeader(ctx *harness.Ctx) {
-	c := api(ctx)
-	anonymous := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "globex"}, "")
-	bare := searchAs(c, map[string]any{"query": apiQuery, "k": 2}, "")
-	empty := c.Post("/v1/search", map[string]any{"query": apiQuery, "k": 2}, "X-Tenant-Id", "")
-	forged := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "globex"}, "acme")
-	agreeing := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "tenant": "acme"}, "acme")
+	c := hApi(ctx)
+	anonymous := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2, "tenant": "globex"}, "")
+	bare := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2}, "")
+	empty := c.Post("/v1/search", map[string]any{"query": hApiQuery, "k": 2}, "X-Tenant-Id", "")
+	forged := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2, "tenant": "globex"}, "acme")
+	agreeing := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2, "tenant": "acme"}, "acme")
 	ctx.Assert(!strings.Contains(forged.Text(), "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text())
 	ctx.Assert(!strings.Contains(anonymous.Text(), "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text())
 	ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id")
 	ctx.Equal(bare.Status, 401, "a search with neither X-Tenant-Id nor a body tenant (%s)", bare.Text())
 	ctx.Equal(empty.Status, 401, "a search with an empty X-Tenant-Id names no tenant (%s)", empty.Text())
 	ctx.Equal(forged.Status, 403, "a body tenant globex under X-Tenant-Id acme")
-	ctx.Assert(agreeing.Status == 200 && strings.Join(idsOf(agreeing), ",") == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text())
+	ctx.Assert(agreeing.Status == 200 && strings.Join(hIdsOf(agreeing), ",") == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text())
 }
 
 func CheckKCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	big := searchAs(c, map[string]any{"query": apiQuery, "k": 500}, "acme")
-	over := searchAs(c, map[string]any{"query": apiQuery, "k": 101}, "acme")
-	zero := searchAs(c, map[string]any{"query": apiQuery, "k": 0}, "acme")
-	one := searchAs(c, map[string]any{"query": apiQuery, "k": 1}, "acme")
-	limit := searchAs(c, map[string]any{"query": apiQuery, "k": 100}, "acme")
+	c := hApi(ctx)
+	big := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 500}, "acme")
+	over := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 101}, "acme")
+	zero := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 0}, "acme")
+	one := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 1}, "acme")
+	limit := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 100}, "acme")
 	ctx.Equal(big.Status, 400, "k 500 answered %s: a request above the cap of 100 must be rejected with 400, not clamped; the status", big.Text())
 	ctx.Equal(over.Status, 400, "k 101 answered %s: the cap is 100; the status", over.Text())
 	ctx.Equal(zero.Status, 400, "k 0 (%s)", zero.Text())
-	ctx.Assert(one.Status == 200 && answerOf(one).K == 1 && strings.Join(idsOf(one), ",") == "a1", "k 1 is allowed and answers acme's nearest document a1, got %d %s", one.Status, one.Text())
-	ctx.Assert(limit.Status == 200 && answerOf(limit).K == 100 && len(idsOf(limit)) == 3, "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text())
+	ctx.Assert(one.Status == 200 && hAnswerOf(one).K == 1 && strings.Join(hIdsOf(one), ",") == "a1", "k 1 is allowed and answers acme's nearest document a1, got %d %s", one.Status, one.Text())
+	ctx.Assert(limit.Status == 200 && hAnswerOf(limit).K == 100 && len(hIdsOf(limit)) == 3, "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text())
 }
 
 func CheckDimension(ctx *harness.Ctx) {
-	c := api(ctx)
-	narrow := searchAs(c, map[string]any{"query": []float64{1, 0, 0}, "k": 2}, "acme")
-	wide := searchAs(c, map[string]any{"query": []float64{1, 0, 0, 0, 0}, "k": 2}, "acme")
+	c := hApi(ctx)
+	narrow := hSearchAs(c, map[string]any{"query": []float64{1, 0, 0}, "k": 2}, "acme")
+	wide := hSearchAs(c, map[string]any{"query": []float64{1, 0, 0, 0, 0}, "k": 2}, "acme")
 	ctx.Equal(narrow.Status, 400, "a 3-number query against the 4-dimension index answered %s: it was scored against vectors of another width. Reject it with 400; the status", narrow.Text())
 	ctx.Assert(strings.Contains(narrow.Text(), "idx-42"), "the 400 must name the active index version it compared against (idx-42), got %s", narrow.Text())
 	ctx.Equal(wide.Status, 400, "a 5-number query against the 4-dimension index (%s)", wide.Text())
 }
 
 func CheckActiveVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	retired := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-41"}, "acme")
-	current := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-42"}, "acme")
+	c := hApi(ctx)
+	retired := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2, "index_version": "idx-41"}, "acme")
+	current := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2, "index_version": "idx-42"}, "acme")
 	bg := context.Background()
 	corpus.Activate(bg, "idx-43", 4)
 	corpus.PutDocument(bg, "acme", "idx-43", "n1", []float64{1, 0, 0, 0})
-	switched := searchAs(c, map[string]any{"query": apiQuery, "k": 2}, "acme")
-	pinned := searchAs(c, map[string]any{"query": apiQuery, "k": 2, "index_version": "idx-42"}, "acme")
+	switched := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2}, "acme")
+	pinned := hSearchAs(c, map[string]any{"query": hApiQuery, "k": 2, "index_version": "idx-42"}, "acme")
 	ctx.Assert(!strings.Contains(retired.Text(), "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text())
 	ctx.Assert(retired.Status == 409 && strings.Contains(retired.Text(), "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text())
-	ctx.Assert(current.Status == 200 && strings.Join(idsOf(current), ",") == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text())
-	ctx.Assert(switched.Status == 200 && strings.Join(idsOf(switched), ",") == "n1" && answerOf(switched).IndexVersion == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text())
+	ctx.Assert(current.Status == 200 && strings.Join(hIdsOf(current), ",") == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text())
+	ctx.Assert(switched.Status == 200 && strings.Join(hIdsOf(switched), ",") == "n1" && hAnswerOf(switched).IndexVersion == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text())
 	ctx.Assert(pinned.Status == 409 && strings.Contains(pinned.Text(), "idx-43"), "after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got %d %s", pinned.Status, pinned.Text())
 }
 `,
@@ -868,11 +868,11 @@ func CheckActiveVersion(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQuery = "[1.0, 0.0, 0.0, 0.0]";
+const std::string kHQuery = "[1.0, 0.0, 0.0, 0.0]";
 
 // acme's namespace in the active idx-42 (4 dimensions), globex's g1 beside it, and acme's old-1 in
 // the retired idx-41.
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   corpus::activate("idx-42", 4);
   corpus::putDocument("acme", "idx-42", "a1", {0.9, 0.1, 0, 0});
   corpus::putDocument("acme", "idx-42", "a2", {0.5, 0.5, 0, 0});
@@ -886,13 +886,13 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json parsed(const harness::Response& r) {
+nlohmann::json hParsed(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_discarded() ? nlohmann::json::object() : j;
 }
 
-std::string ids(const harness::Response& r) {
-  const auto j = parsed(r);
+std::string hIds(const harness::Response& r) {
+  const auto j = hParsed(r);
   std::string out;
   if (j.is_object() && j.contains("hits") && j["hits"].is_array()) {
     for (const auto& h : j["hits"]) out += (out.empty() ? "" : ",") + h.value("id", std::string());
@@ -902,7 +902,7 @@ std::string ids(const harness::Response& r) {
 
 bool has(const harness::Response& r, const std::string& needle) { return r.Text().find(needle) != std::string::npos; }
 
-harness::Response searchAs(harness::HTTP& c, const std::string& body, const std::string& tenant) {
+harness::Response hSearchAs(harness::HTTP& c, const std::string& body, const std::string& tenant) {
   if (tenant.empty()) return c.Post("/v1/search", body, "Content-Type", "application/json");
   return c.Post("/v1/search", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
@@ -910,65 +910,65 @@ harness::Response searchAs(harness::HTTP& c, const std::string& body, const std:
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
+  auto c = hApi(ctx);
+  const auto r = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
   ctx.Equal(r.Status, 200, "POST /v1/search (%s)", r.Text());
-  ctx.Equal(ids(r), "a1,a2", "acme's two nearest documents to [1, 0, 0, 0] are a1 and a2 (%s)", r.Text());
-  const auto body = parsed(r);
+  ctx.Equal(hIds(r), "a1,a2", "acme's two nearest documents to [1, 0, 0, 0] are a1 and a2 (%s)", r.Text());
+  const auto body = hParsed(r);
   ctx.Assert(body.value("k", 0L) == 2 && body.value("index_version", std::string()) == "idx-42", "the response must carry k 2 and the active version idx-42, got %s", r.Text());
 }
 
 void CheckTenantHeader(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto anonymous = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "");
-  const auto bare = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "");
+  auto c = hApi(ctx);
+  const auto anonymous = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "");
+  const auto bare = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "");
   const auto empty = c.Post("/v1/search", R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "Content-Type", "application/json", "X-Tenant-Id", "");
-  const auto forged = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "acme");
-  const auto agreeing = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "acme"})", "acme");
+  const auto forged = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "globex"})", "acme");
+  const auto agreeing = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "tenant": "acme"})", "acme");
   ctx.Assert(!has(forged, "g1"), "a caller authenticated as acme read globex's document g1 by naming globex in the body: %d %s", forged.Status, forged.Text());
   ctx.Assert(!has(anonymous, "g1"), "a caller with no X-Tenant-Id read globex's document g1 by naming globex in the body: %d %s", anonymous.Status, anonymous.Text());
   ctx.Equal(anonymous.Status, 401, "a search without X-Tenant-Id");
   ctx.Equal(bare.Status, 401, "a search with neither X-Tenant-Id nor a body tenant (%s)", bare.Text());
   ctx.Equal(empty.Status, 401, "a search with an empty X-Tenant-Id names no tenant (%s)", empty.Text());
   ctx.Equal(forged.Status, 403, "a body tenant globex under X-Tenant-Id acme");
-  ctx.Assert(agreeing.Status == 200 && ids(agreeing) == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text());
+  ctx.Assert(agreeing.Status == 200 && hIds(agreeing) == "a1,a2", "a body tenant that agrees with the header is allowed: got %d %s", agreeing.Status, agreeing.Text());
 }
 
 void CheckKCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto big = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 500})", "acme");
-  const auto over = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 101})", "acme");
-  const auto zero = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 0})", "acme");
-  const auto one = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 1})", "acme");
-  const auto limit = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 100})", "acme");
+  auto c = hApi(ctx);
+  const auto big = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 500})", "acme");
+  const auto over = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 101})", "acme");
+  const auto zero = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 0})", "acme");
+  const auto one = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 1})", "acme");
+  const auto limit = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 100})", "acme");
   ctx.Equal(big.Status, 400, "k 500 answered %s: a request above the cap of 100 must be rejected with 400, not clamped; the status", big.Text());
   ctx.Equal(over.Status, 400, "k 101 answered %s: the cap is 100; the status", over.Text());
   ctx.Equal(zero.Status, 400, "k 0 (%s)", zero.Text());
-  ctx.Assert(one.Status == 200 && parsed(one).value("k", 0L) == 1 && ids(one) == "a1", "k 1 is allowed and answers acme's nearest document a1, got %d %s", one.Status, one.Text());
-  ctx.Assert(limit.Status == 200 && parsed(limit).value("k", 0L) == 100 && ids(limit) == "a1,a2,a3", "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text());
+  ctx.Assert(one.Status == 200 && hParsed(one).value("k", 0L) == 1 && hIds(one) == "a1", "k 1 is allowed and answers acme's nearest document a1, got %d %s", one.Status, one.Text());
+  ctx.Assert(limit.Status == 200 && hParsed(limit).value("k", 0L) == 100 && hIds(limit) == "a1,a2,a3", "k 100 is allowed and answers acme's three documents, got %d %s", limit.Status, limit.Text());
 }
 
 void CheckDimension(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto narrow = searchAs(c, R"({"query": [1.0, 0.0, 0.0], "k": 2})", "acme");
-  const auto wide = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
+  auto c = hApi(ctx);
+  const auto narrow = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0], "k": 2})", "acme");
+  const auto wide = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
   ctx.Equal(narrow.Status, 400, "a 3-number query against the 4-dimension index answered %s: it was scored against vectors of another width. Reject it with 400; the status", narrow.Text());
   ctx.Assert(has(narrow, "idx-42"), "the 400 must name the active index version it compared against (idx-42), got %s", narrow.Text());
   ctx.Equal(wide.Status, 400, "a 5-number query against the 4-dimension index (%s)", wide.Text());
 }
 
 void CheckActiveVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto retired = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-41"})", "acme");
-  const auto current = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
+  auto c = hApi(ctx);
+  const auto retired = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-41"})", "acme");
+  const auto current = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
   corpus::activate("idx-43", 4);
   corpus::putDocument("acme", "idx-43", "n1", {1, 0, 0, 0});
-  const auto switched = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
-  const auto pinned = searchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
+  const auto switched = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2})", "acme");
+  const auto pinned = hSearchAs(c, R"({"query": [1.0, 0.0, 0.0, 0.0], "k": 2, "index_version": "idx-42"})", "acme");
   ctx.Assert(!has(retired, "old-1"), "a caller searched the retired version idx-41 by naming it in the body: %d %s", retired.Status, retired.Text());
   ctx.Assert(retired.Status == 409 && has(retired, "idx-42"), "a body index_version idx-41 must be 409 naming the active idx-42, got %d %s", retired.Status, retired.Text());
-  ctx.Assert(current.Status == 200 && ids(current) == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text());
-  ctx.Assert(switched.Status == 200 && ids(switched) == "n1" && parsed(switched).value("index_version", std::string()) == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text());
+  ctx.Assert(current.Status == 200 && hIds(current) == "a1,a2", "a body index_version equal to the active one is allowed, got %d %s", current.Status, current.Text());
+  ctx.Assert(switched.Status == 200 && hIds(switched) == "n1" && hParsed(switched).value("index_version", std::string()) == "idx-43", "after the switch to idx-43 a search must run in idx-43 (acme's n1) and say so, got %d %s: the active version is read on every request", switched.Status, switched.Text());
   ctx.Assert(pinned.Status == 409 && has(pinned, "idx-43"), "after the switch to idx-43 a body index_version idx-42 must be 409 naming idx-43, got %d %s", pinned.Status, pinned.Text());
 }
 `,

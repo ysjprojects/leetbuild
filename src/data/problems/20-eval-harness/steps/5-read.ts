@@ -1017,19 +1017,19 @@ import (
 	"leetbuild/harness"
 )
 
-func readSeed(ctx *harness.Ctx, runID string, scored, passed, fallback int, tenant string, updatedAt int64) {
+func hReadSeed(ctx *harness.Ctx, runID string, scored, passed, fallback int, tenant string, updatedAt int64) {
 	row, _ := json.Marshal(map[string]any{"run_id": runID, "status": "queued", "dataset_id": "gs-support-v3", "model_version": "support-bot-2026-10", "sample_budget": 500, "tenant": tenant})
 	ctx.Redis.Set("evals:run:"+runID, string(row))
 	ctx.Redis.Do("HSET", "evals:progress:"+runID, "scored", scored, "passed", passed, "failed", scored-passed, "fallback", fallback, "updated_at", updatedAt)
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(ctx *harness.Ctx, c *harness.HTTP, path string) map[string]any {
+func hReadBody(ctx *harness.Ctx, c *harness.HTTP, path string) map[string]any {
 	r := c.Get(path, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "the report %s (%s)", path, r.Text())
 	body, ok := r.JSON().(map[string]any)
@@ -1038,11 +1038,11 @@ func readBody(ctx *harness.Ctx, c *harness.HTTP, path string) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
-	c := readClient(ctx)
+	hReadSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
+	c := hReadClient(ctx)
 	ctx.Equal(c.Get("/v1/evals/runs/r1").Status, 401, "without X-Tenant-Id the report")
 	ctx.Equal(c.Get("/v1/evals/runs/nope", "X-Tenant-Id", "t1").Status, 404, "an unknown run")
-	body := readBody(ctx, c, "/v1/evals/runs/r1")
+	body := hReadBody(ctx, c, "/v1/evals/runs/r1")
 	for _, key := range []string{"run_id", "status", "scored", "passed", "failed", "pass_rate"} {
 		_, ok := body[key]
 		ctx.Assert(ok, "the report lacks %s: %v", key, body)
@@ -1054,9 +1054,9 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readClient(ctx)
+	c := hReadClient(ctx)
 	unknown := c.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2")
-	readSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
 	r := c.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 asked for tenant t1's run (%s): another tenant's run answers 404, like one that does not exist", r.Text())
 	ctx.Equal(r.Text(), unknown.Text(), "tenant t2 asking for t1's run must get the answer the same id got before the run existed (a different answer tells t2 the run exists); the body")
@@ -1064,48 +1064,48 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckMinSamples(ctx *harness.Ctx) {
-	readSeed(ctx, "r0", 0, 0, 0, "t1", 1_700_000_000)
-	readSeed(ctx, "r12", 12, 12, 0, "t1", 1_700_000_000)
-	readSeed(ctx, "r199", 199, 199, 0, "t1", 1_700_000_000)
-	readSeed(ctx, "r200", 200, 190, 0, "t1", 1_700_000_000)
-	c := readClient(ctx)
+	hReadSeed(ctx, "r0", 0, 0, 0, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r12", 12, 12, 0, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r199", 199, 199, 0, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r200", 200, 190, 0, "t1", 1_700_000_000)
+	c := hReadClient(ctx)
 	for _, runID := range []string{"r12", "r199", "r0"} {
-		body := readBody(ctx, c, "/v1/evals/runs/"+runID)
+		body := hReadBody(ctx, c, "/v1/evals/runs/"+runID)
 		ctx.Equal(body["status"], "pending", "a run with %v scored samples, all of them passing: below minScoredSamples = 200 it is pending, not judged; the status", body["scored"])
 	}
-	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r200")["status"], "passed", "200 scored samples at 0.95 are judged and pass; the status")
+	ctx.Equal(hReadBody(ctx, c, "/v1/evals/runs/r200")["status"], "passed", "200 scored samples at 0.95 are judged and pass; the status")
 }
 
 func CheckThresholdConfig(ctx *harness.Ctx) {
-	readSeed(ctx, "r85", 300, 255, 0, "t1", 1_700_000_000)
-	readSeed(ctx, "r90", 300, 270, 0, "t1", 1_700_000_000)
-	c := readClient(ctx)
-	body := readBody(ctx, c, "/v1/evals/runs/r85?threshold=0.5")
+	hReadSeed(ctx, "r85", 300, 255, 0, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r90", 300, 270, 0, "t1", 1_700_000_000)
+	c := hReadClient(ctx)
+	body := hReadBody(ctx, c, "/v1/evals/runs/r85?threshold=0.5")
 	ctx.Equal(body["status"], "failed", "a run at 0.85 asked with ?threshold=0.5: the bar is releaseThreshold = 0.9 from server config, not the caller's; the status")
 	ctx.Equal(body["threshold"], 0.9, "the report states the bar it applied")
-	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r90")["status"], "passed", "a run at exactly 0.9 meets releaseThreshold and passes; the status")
+	ctx.Equal(hReadBody(ctx, c, "/v1/evals/runs/r90")["status"], "passed", "a run at exactly 0.9 meets releaseThreshold and passes; the status")
 }
 
 func CheckFallbackShare(ctx *harness.Ctx) {
-	readSeed(ctx, "r-fb", 300, 290, 120, "t1", 1_700_000_000)
-	readSeed(ctx, "r-ok", 300, 290, 30, "t1", 1_700_000_000)
-	readSeed(ctx, "r-60", 300, 290, 60, "t1", 1_700_000_000)
-	readSeed(ctx, "r-61", 300, 290, 61, "t1", 1_700_000_000)
-	c := readClient(ctx)
-	body := readBody(ctx, c, "/v1/evals/runs/r-fb")
+	hReadSeed(ctx, "r-fb", 300, 290, 120, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r-ok", 300, 290, 30, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r-60", 300, 290, 60, "t1", 1_700_000_000)
+	hReadSeed(ctx, "r-61", 300, 290, 61, "t1", 1_700_000_000)
+	c := hReadClient(ctx)
+	body := hReadBody(ctx, c, "/v1/evals/runs/r-fb")
 	ctx.Equal(body["status"], "unreliable", "120 of 300 samples were scored by the string metric: above maxFallbackShare = 0.2 the judge barely saw the run, so it is unreliable; the status")
 	ctx.Equal(body["fallback"], 120, "the report carries the fallback count")
-	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r-ok")["status"], "passed", "30 of 300 fallbacks is within the share: the run is judged and passes at 0.97; the status")
-	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r-60")["status"], "passed", "60 of 300 fallbacks is exactly 20%%, not more than maxFallbackShare: the run is judged and passes at 0.97; the status")
-	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r-61")["status"], "unreliable", "61 of 300 fallbacks is more than 20%%: the run is unreliable; the status")
+	ctx.Equal(hReadBody(ctx, c, "/v1/evals/runs/r-ok")["status"], "passed", "30 of 300 fallbacks is within the share: the run is judged and passes at 0.97; the status")
+	ctx.Equal(hReadBody(ctx, c, "/v1/evals/runs/r-60")["status"], "passed", "60 of 300 fallbacks is exactly 20%%, not more than maxFallbackShare: the run is judged and passes at 0.97; the status")
+	ctx.Equal(hReadBody(ctx, c, "/v1/evals/runs/r-61")["status"], "unreliable", "61 of 300 fallbacks is more than 20%%: the run is unreliable; the status")
 }
 
 func CheckFreshReport(ctx *harness.Ctx) {
-	readSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
-	c := readClient(ctx)
-	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r1")["status"], "passed", "250 samples at 0.96 pass; the status")
+	hReadSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
+	c := hReadClient(ctx)
+	ctx.Equal(hReadBody(ctx, c, "/v1/evals/runs/r1")["status"], "passed", "250 samples at 0.96 pass; the status")
 	ctx.Redis.Do("HSET", "evals:progress:r1", "scored", 300, "failed", 60, "updated_at", 1_700_000_300)
-	second := readBody(ctx, c, "/v1/evals/runs/r1")
+	second := hReadBody(ctx, c, "/v1/evals/runs/r1")
 	ctx.Equal([]any{second["scored"], second["passed"], second["failed"]}, []any{300, 240, 60}, "the last 50 samples all failed after the first read (read the counters on every request); scored, passed, failed")
 	ctx.Equal(second["status"], "failed", "240 of 300 is 0.8, below the bar: the gate must close the moment the counters move; the status")
 	ctx.Equal(second["updated_at"], 1_700_000_300, "the report carries the progress hash's updated_at")
@@ -1122,19 +1122,19 @@ namespace {
 
 using json = nlohmann::json;
 
-void readSeed(harness::Ctx& ctx, const std::string& run_id, int scored, int passed, int fallback = 0, const std::string& tenant = "t1", long long updated_at = 1700000000) {
+void hReadSeed(harness::Ctx& ctx, const std::string& run_id, int scored, int passed, int fallback = 0, const std::string& tenant = "t1", long long updated_at = 1700000000) {
   const json row = {{"run_id", run_id}, {"status", "queued"}, {"dataset_id", "gs-support-v3"}, {"model_version", "support-bot-2026-10"}, {"sample_budget", 500}, {"tenant", tenant}};
   ctx.Redis.Set("evals:run:" + run_id, row.dump());
   ctx.Redis.Do("HSET", "evals:progress:" + run_id, "scored", scored, "passed", passed, "failed", scored - passed, "fallback", fallback, "updated_at", updated_at);
 }
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 };
 
-json readBody(harness::Ctx& ctx, Api& api, const std::string& path) {
+json hReadBody(harness::Ctx& ctx, HApi& api, const std::string& path) {
   const auto r = api.http.Get(path, "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "the report %s (%s)", path, r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
@@ -1142,26 +1142,26 @@ json readBody(harness::Ctx& ctx, Api& api, const std::string& path) {
   return body;
 }
 
-json field(const json& body, const std::string& key) { return body.is_object() && body.contains(key) ? body[key] : json(); }
+json hField(const json& body, const std::string& key) { return body.is_object() && body.contains(key) ? body[key] : json(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readSeed(ctx, "r1", 250, 240);
-  Api api(ctx);
+  hReadSeed(ctx, "r1", 250, 240);
+  HApi api(ctx);
   ctx.Equal(api.http.Get("/v1/evals/runs/r1").Status, 401, "without X-Tenant-Id the report");
   ctx.Equal(api.http.Get("/v1/evals/runs/nope", "X-Tenant-Id", "t1").Status, 404, "an unknown run");
-  const json body = readBody(ctx, api, "/v1/evals/runs/r1");
+  const json body = hReadBody(ctx, api, "/v1/evals/runs/r1");
   for (const char* key : {"run_id", "status", "scored", "passed", "failed", "pass_rate"}) ctx.Assert(body.contains(key), "the report lacks %s: %s", key, body.dump());
   ctx.Assert(body["run_id"] == "r1" && body["scored"] == 250 && body["passed"] == 240 && body["failed"] == 10, "the report carries the run's counters: %s", body.dump());
-  ctx.Assert(body["pass_rate"].is_number() && std::fabs(body["pass_rate"].get<double>() - 0.96) < 1e-9, "pass_rate is passed / scored = 0.96, got %s", field(body, "pass_rate").dump());
-  ctx.Equal(field(body, "status"), json("passed"), "250 samples at 0.96 pass; the status");
+  ctx.Assert(body["pass_rate"].is_number() && std::fabs(body["pass_rate"].get<double>() - 0.96) < 1e-9, "pass_rate is passed / scored = 0.96, got %s", hField(body, "pass_rate").dump());
+  ctx.Equal(hField(body, "status"), json("passed"), "250 samples at 0.96 pass; the status");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   const auto unknown = api.http.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2");
-  readSeed(ctx, "r1", 250, 240, 0, "t1");
+  hReadSeed(ctx, "r1", 250, 240, 0, "t1");
   const auto r = api.http.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2");
   ctx.Equal(r.Status, 404, "tenant t2 asked for tenant t1's run (%s): another tenant's run answers 404, like one that does not exist", r.Text());
   ctx.Equal(r.Text(), unknown.Text(), "tenant t2 asking for t1's run must get the answer the same id got before the run existed (a different answer tells t2 the run exists); the body");
@@ -1169,51 +1169,51 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckMinSamples(harness::Ctx& ctx) {
-  readSeed(ctx, "r0", 0, 0);
-  readSeed(ctx, "r12", 12, 12);
-  readSeed(ctx, "r199", 199, 199);
-  readSeed(ctx, "r200", 200, 190);
-  Api api(ctx);
+  hReadSeed(ctx, "r0", 0, 0);
+  hReadSeed(ctx, "r12", 12, 12);
+  hReadSeed(ctx, "r199", 199, 199);
+  hReadSeed(ctx, "r200", 200, 190);
+  HApi api(ctx);
   for (const std::string run_id : {"r12", "r199", "r0"}) {
-    const json body = readBody(ctx, api, "/v1/evals/runs/" + run_id);
-    ctx.Equal(field(body, "status"), json("pending"), "a run with %s scored samples, all of them passing: below kMinScoredSamples = 200 it is pending, not judged; the status", field(body, "scored").dump());
+    const json body = hReadBody(ctx, api, "/v1/evals/runs/" + run_id);
+    ctx.Equal(hField(body, "status"), json("pending"), "a run with %s scored samples, all of them passing: below kMinScoredSamples = 200 it is pending, not judged; the status", hField(body, "scored").dump());
   }
-  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r200"), "status"), json("passed"), "200 scored samples at 0.95 are judged and pass; the status");
+  ctx.Equal(hField(hReadBody(ctx, api, "/v1/evals/runs/r200"), "status"), json("passed"), "200 scored samples at 0.95 are judged and pass; the status");
 }
 
 void CheckThresholdConfig(harness::Ctx& ctx) {
-  readSeed(ctx, "r85", 300, 255);
-  readSeed(ctx, "r90", 300, 270);
-  Api api(ctx);
-  const json body = readBody(ctx, api, "/v1/evals/runs/r85?threshold=0.5");
-  ctx.Equal(field(body, "status"), json("failed"), "a run at 0.85 asked with ?threshold=0.5: the bar is kReleaseThreshold = 0.9 from server config, not the caller's; the status");
-  ctx.Equal(field(body, "threshold"), json(0.9), "the report states the bar it applied");
-  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r90"), "status"), json("passed"), "a run at exactly 0.9 meets kReleaseThreshold and passes; the status");
+  hReadSeed(ctx, "r85", 300, 255);
+  hReadSeed(ctx, "r90", 300, 270);
+  HApi api(ctx);
+  const json body = hReadBody(ctx, api, "/v1/evals/runs/r85?threshold=0.5");
+  ctx.Equal(hField(body, "status"), json("failed"), "a run at 0.85 asked with ?threshold=0.5: the bar is kReleaseThreshold = 0.9 from server config, not the caller's; the status");
+  ctx.Equal(hField(body, "threshold"), json(0.9), "the report states the bar it applied");
+  ctx.Equal(hField(hReadBody(ctx, api, "/v1/evals/runs/r90"), "status"), json("passed"), "a run at exactly 0.9 meets kReleaseThreshold and passes; the status");
 }
 
 void CheckFallbackShare(harness::Ctx& ctx) {
-  readSeed(ctx, "r-fb", 300, 290, 120);
-  readSeed(ctx, "r-ok", 300, 290, 30);
-  readSeed(ctx, "r-60", 300, 290, 60);
-  readSeed(ctx, "r-61", 300, 290, 61);
-  Api api(ctx);
-  const json body = readBody(ctx, api, "/v1/evals/runs/r-fb");
-  ctx.Equal(field(body, "status"), json("unreliable"), "120 of 300 samples were scored by the string metric: above kMaxFallbackShare = 0.2 the judge barely saw the run, so it is unreliable; the status");
-  ctx.Equal(field(body, "fallback"), json(120), "the report carries the fallback count");
-  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r-ok"), "status"), json("passed"), "30 of 300 fallbacks is within the share: the run is judged and passes at 0.97; the status");
-  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r-60"), "status"), json("passed"), "60 of 300 fallbacks is exactly 20%%, not more than kMaxFallbackShare: the run is judged and passes at 0.97; the status");
-  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r-61"), "status"), json("unreliable"), "61 of 300 fallbacks is more than 20%%: the run is unreliable; the status");
+  hReadSeed(ctx, "r-fb", 300, 290, 120);
+  hReadSeed(ctx, "r-ok", 300, 290, 30);
+  hReadSeed(ctx, "r-60", 300, 290, 60);
+  hReadSeed(ctx, "r-61", 300, 290, 61);
+  HApi api(ctx);
+  const json body = hReadBody(ctx, api, "/v1/evals/runs/r-fb");
+  ctx.Equal(hField(body, "status"), json("unreliable"), "120 of 300 samples were scored by the string metric: above kMaxFallbackShare = 0.2 the judge barely saw the run, so it is unreliable; the status");
+  ctx.Equal(hField(body, "fallback"), json(120), "the report carries the fallback count");
+  ctx.Equal(hField(hReadBody(ctx, api, "/v1/evals/runs/r-ok"), "status"), json("passed"), "30 of 300 fallbacks is within the share: the run is judged and passes at 0.97; the status");
+  ctx.Equal(hField(hReadBody(ctx, api, "/v1/evals/runs/r-60"), "status"), json("passed"), "60 of 300 fallbacks is exactly 20%%, not more than kMaxFallbackShare: the run is judged and passes at 0.97; the status");
+  ctx.Equal(hField(hReadBody(ctx, api, "/v1/evals/runs/r-61"), "status"), json("unreliable"), "61 of 300 fallbacks is more than 20%%: the run is unreliable; the status");
 }
 
 void CheckFreshReport(harness::Ctx& ctx) {
-  readSeed(ctx, "r1", 250, 240);
-  Api api(ctx);
-  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r1"), "status"), json("passed"), "250 samples at 0.96 pass; the status");
+  hReadSeed(ctx, "r1", 250, 240);
+  HApi api(ctx);
+  ctx.Equal(hField(hReadBody(ctx, api, "/v1/evals/runs/r1"), "status"), json("passed"), "250 samples at 0.96 pass; the status");
   ctx.Redis.Do("HSET", "evals:progress:r1", "scored", 300, "failed", 60, "updated_at", 1700000300);
-  const json second = readBody(ctx, api, "/v1/evals/runs/r1");
+  const json second = hReadBody(ctx, api, "/v1/evals/runs/r1");
   ctx.Assert(second["scored"] == 300 && second["passed"] == 240 && second["failed"] == 60, "the last 50 samples all failed after the first read and the report still says %s: read the counters on every request", second.dump());
-  ctx.Equal(field(second, "status"), json("failed"), "240 of 300 is 0.8, below the bar: the gate must close the moment the counters move; the status");
-  ctx.Equal(field(second, "updated_at"), json(1700000300), "the report carries the progress hash's updated_at");
+  ctx.Equal(hField(second, "status"), json("failed"), "240 of 300 is 0.8, below the bar: the gate must close the moment the counters move; the status");
+  ctx.Equal(hField(second, "updated_at"), json(1700000300), "the report carries the progress hash's updated_at");
 }
 `,
   },

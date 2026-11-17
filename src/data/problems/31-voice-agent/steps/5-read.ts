@@ -699,44 +699,44 @@ import (
 )
 
 const (
-	readSpoken   = "Sure, call me back on 415 555 0134 after six."
-	readRedacted = "Sure, call me back on [redacted] after six."
-	readT0       = int64(1_700_000_000_000)
+	kHReadSpoken   = "Sure, call me back on 415 555 0134 after six."
+	kHReadRedacted = "Sure, call me back on [redacted] after six."
+	kHReadT0       = int64(1_700_000_000_000)
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 // seedCall is a session of tenant with turns stored the way the transcript consumer stores them.
-func seedCall(ctx *harness.Ctx, turns int, tenant string) string {
-	sessionID := sessions.Create(readBg, tenant, "pcm16", 24000, 1800).SessionID
+func hSeedCall(ctx *harness.Ctx, turns int, tenant string) string {
+	sessionID := sessions.Create(hReadBg, tenant, "pcm16", 24000, 1800).SessionID
 	for i := 0; i < turns; i++ {
-		ref := transcripts.Redact(readBg, sessionID, i, readSpoken)
-		err := transcripts.InsertTurn(readBg, transcripts.Event{SessionID: sessionID, Tenant: tenant, TurnIndex: i, StartedAt: readT0 + int64(i)*4000, EndedAt: readT0 + int64(i)*4000 + 3200, TranscriptRef: ref})
+		ref := transcripts.Redact(hReadBg, sessionID, i, kHReadSpoken)
+		err := transcripts.InsertTurn(hReadBg, transcripts.Event{SessionID: sessionID, Tenant: tenant, TurnIndex: i, StartedAt: kHReadT0 + int64(i)*4000, EndedAt: kHReadT0 + int64(i)*4000 + 3200, TranscriptRef: ref})
 		ctx.NoError(err, "seeding turn %d failed", i)
 	}
 	return sessionID
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type page struct {
+type HPage struct {
 	Turns      []map[string]any \`json:"turns"\`
 	NextCursor any              \`json:"next_cursor"\` // a string or a number; null on the last page
 }
 
-func pageOf(r *harness.Response) (page, map[string]any) {
-	var p page
+func hPageOf(r *harness.Response) (HPage, map[string]any) {
+	var p HPage
 	var raw map[string]any
 	r.Decode(&p)
 	r.Decode(&raw)
 	return p, raw
 }
 
-func turnIndexes(p page) []any {
+func hTurnIndexes(p HPage) []any {
 	out := []any{}
 	for _, t := range p.Turns {
 		out = append(out, t["turn_index"])
@@ -745,19 +745,19 @@ func turnIndexes(p page) []any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	sessionID := seedCall(ctx, 3, "acme")
-	r := readAPI(ctx).Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme")
+	sessionID := hSeedCall(ctx, 3, "acme")
+	r := hReadAPI(ctx).Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/voice/sessions/%s (%s)", sessionID, r.Text())
-	p, _ := pageOf(r)
-	ctx.Equal(turnIndexes(p), []any{0, 1, 2}, "the transcript must list turns 0, 1, 2 in order")
+	p, _ := hPageOf(r)
+	ctx.Equal(hTurnIndexes(p), []any{0, 1, 2}, "the transcript must list turns 0, 1, 2 in order")
 	for _, t := range p.Turns {
-		ctx.Equal(t["text"], readRedacted, "each turn carries its redacted text")
+		ctx.Equal(t["text"], kHReadRedacted, "each turn carries its redacted text")
 	}
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	sessionID := seedCall(ctx, 2, "acme")
-	c := readAPI(ctx)
+	sessionID := hSeedCall(ctx, 2, "acme")
+	c := hReadAPI(ctx)
 	foreign := c.Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "globex")
 	missing := c.Get("/v1/voice/sessions/vs-999", "X-Tenant-Id", "globex")
 	anonymous := c.Get("/v1/voice/sessions/" + sessionID)
@@ -769,31 +769,31 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckTurnCap(ctx *harness.Ctx) {
-	sessionID := seedCall(ctx, 520, "acme")
-	c := readAPI(ctx)
+	sessionID := hSeedCall(ctx, 520, "acme")
+	c := hReadAPI(ctx)
 	big := c.Get("/v1/voice/sessions/"+sessionID+"?limit=1000", "X-Tenant-Id", "acme")
 	ctx.Equal(big.Status, 200, "limit=1000 (%.200s)", big.Text())
-	p, _ := pageOf(big)
+	p, _ := hPageOf(big)
 	ctx.Equal(len(p.Turns), 500, "limit=1000 on a 520-turn call: a page holds at most maxTurns (500); the turns")
-	fallback, _ := pageOf(c.Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme"))
+	fallback, _ := hPageOf(c.Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme"))
 	ctx.Equal(len(fallback.Turns), 100, "without limit, the page must hold defaultLimit (100) turns; the turns")
 	for _, value := range []string{"0", "-1", "abc"} {
 		bad := c.Get("/v1/voice/sessions/"+sessionID+"?limit="+value, "X-Tenant-Id", "acme")
 		ctx.Equal(bad.Status, 400, "limit=%s: a limit must be a positive integer; the status", value)
 	}
 	one := c.Get("/v1/voice/sessions/"+sessionID+"?limit=1", "X-Tenant-Id", "acme")
-	onePage, _ := pageOf(one)
+	onePage, _ := hPageOf(one)
 	ctx.Assert(one.Status == 200 && len(onePage.Turns) == 1, "limit=1 answered %d: %.200s, expected 1 turn", one.Status, one.Text())
 }
 
 func CheckCursor(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	// 200 turns are exactly two pages: the second one is the last, so its next_cursor is null.
 	for _, walk := range []struct {
 		total    int
 		expected []int
 	}{{250, []int{100, 100, 50}}, {200, []int{100, 100}}} {
-		sessionID := seedCall(ctx, walk.total, "acme")
+		sessionID := hSeedCall(ctx, walk.total, "acme")
 		seen := []any{}
 		sizes := []int{}
 		cursor := ""
@@ -804,7 +804,7 @@ func CheckCursor(ctx *harness.Ctx) {
 			}
 			r := c.Get(path, "X-Tenant-Id", "acme")
 			ctx.Equal(r.Status, 200, "a page (%.200s)", r.Text())
-			p, raw := pageOf(r)
+			p, raw := hPageOf(r)
 			_, has := raw["next_cursor"]
 			keys := []string{}
 			for k := range raw {
@@ -812,7 +812,7 @@ func CheckCursor(ctx *harness.Ctx) {
 			}
 			sort.Strings(keys)
 			ctx.Assert(has, "the response carries no next_cursor: a client cannot walk past the first page (keys: %v)", keys)
-			seen = append(seen, turnIndexes(p)...)
+			seen = append(seen, hTurnIndexes(p)...)
 			sizes = append(sizes, len(p.Turns))
 			if p.NextCursor == nil {
 				break
@@ -829,10 +829,10 @@ func CheckCursor(ctx *harness.Ctx) {
 }
 
 func CheckNoAudioPath(ctx *harness.Ctx) {
-	sessionID := seedCall(ctx, 2, "acme")
-	r := readAPI(ctx).Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme")
+	sessionID := hSeedCall(ctx, 2, "acme")
+	r := hReadAPI(ctx).Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme")
 	ctx.Assert(!strings.Contains(r.Text(), "s3://"), "the transcript hands out the recording's location: %.300s. Answer the redacted text and its spans only", r.Text())
-	p, _ := pageOf(r)
+	p, _ := hPageOf(r)
 	for _, t := range p.Turns {
 		keys := []string{}
 		for k := range t {
@@ -857,22 +857,22 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kSpoken = "Sure, call me back on 415 555 0134 after six.";
-const std::string kRedacted = "Sure, call me back on [redacted] after six.";
-const long long kT0 = 1700000000000LL;
+const std::string kHSpoken = "Sure, call me back on 415 555 0134 after six.";
+const std::string kHRedacted = "Sure, call me back on [redacted] after six.";
+const long long kHT0 = 1700000000000LL;
 
 // A session of tenant with turns stored the way the transcript consumer stores them.
-std::string seedCall(long turns, const std::string& tenant = "acme") {
+std::string hSeedCall(long turns, const std::string& tenant = "acme") {
   const std::string session_id = sessions::create(tenant, "pcm16", 24000, 1800).session_id;
   for (long i = 0; i < turns; i++) {
-    const std::string ref = transcripts::redact(session_id, i, kSpoken);
-    transcripts::insertTurn({{"session_id", session_id}, {"tenant", tenant}, {"turn_index", i}, {"started_at", kT0 + i * 4000},
-                             {"ended_at", kT0 + i * 4000 + 3200}, {"transcript_ref", ref}});
+    const std::string ref = transcripts::redact(session_id, i, kHSpoken);
+    transcripts::insertTurn({{"session_id", session_id}, {"tenant", tenant}, {"turn_index", i}, {"started_at", kHT0 + i * 4000},
+                             {"ended_at", kHT0 + i * 4000 + 3200}, {"transcript_ref", ref}});
   }
   return session_id;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -880,7 +880,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   try {
     return json::parse(r.Text());
   } catch (const std::exception&) {
@@ -888,7 +888,7 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
   }
 }
 
-std::vector<long> indexes(const json& body) {
+std::vector<long> hIndexes(const json& body) {
   std::vector<long> out;
   for (const auto& t : body.value("turns", json::array())) out.push_back(t.value("turn_index", -1L));
   return out;
@@ -897,18 +897,18 @@ std::vector<long> indexes(const json& body) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string session_id = seedCall(3);
-  auto c = api(ctx);
+  const std::string session_id = hSeedCall(3);
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/voice/sessions/%s (%s)", session_id, r.Text());
-  const json body = bodyOf(ctx, r);
-  ctx.Equal(indexes(body), std::vector<long>{0, 1, 2}, "the transcript must list turns 0, 1, 2 in order");
-  for (const auto& t : body["turns"]) ctx.Equal(t.value("text", ""), kRedacted, "each turn carries its redacted text");
+  const json body = hBodyOf(ctx, r);
+  ctx.Equal(hIndexes(body), std::vector<long>{0, 1, 2}, "the transcript must list turns 0, 1, 2 in order");
+  for (const auto& t : body["turns"]) ctx.Equal(t.value("text", ""), kHRedacted, "each turn carries its redacted text");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const std::string session_id = seedCall(2, "acme");
-  auto c = api(ctx);
+  const std::string session_id = hSeedCall(2, "acme");
+  auto c = hApi(ctx);
   const auto foreign = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "globex");
   const auto missing = c.Get("/v1/voice/sessions/vs-999", "X-Tenant-Id", "globex");
   const auto anonymous = c.Get("/v1/voice/sessions/" + session_id);
@@ -920,28 +920,28 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckTurnCap(harness::Ctx& ctx) {
-  const std::string session_id = seedCall(520);
-  auto c = api(ctx);
+  const std::string session_id = hSeedCall(520);
+  auto c = hApi(ctx);
   const auto big = c.Get("/v1/voice/sessions/" + session_id + "?limit=1000", "X-Tenant-Id", "acme");
   ctx.Equal(big.Status, 200, "limit=1000 (%.200s)", big.Text());
-  ctx.Equal(bodyOf(ctx, big)["turns"].size(), 500, "limit=1000 on a 520-turn call: a page holds at most kMaxTurns (500); the turns");
+  ctx.Equal(hBodyOf(ctx, big)["turns"].size(), 500, "limit=1000 on a 520-turn call: a page holds at most kMaxTurns (500); the turns");
   const auto fallback = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "acme");
-  ctx.Equal(bodyOf(ctx, fallback)["turns"].size(), 100, "without limit, the page must hold kDefaultLimit (100) turns; the turns");
+  ctx.Equal(hBodyOf(ctx, fallback)["turns"].size(), 100, "without limit, the page must hold kDefaultLimit (100) turns; the turns");
   for (const std::string value : {"0", "-1", "abc"}) {
     const auto bad = c.Get("/v1/voice/sessions/" + session_id + "?limit=" + value, "X-Tenant-Id", "acme");
     ctx.Equal(bad.Status, 400, "limit=%s: a limit must be a positive integer; the status", value);
   }
   const auto one = c.Get("/v1/voice/sessions/" + session_id + "?limit=1", "X-Tenant-Id", "acme");
   ctx.Equal(one.Status, 200, "limit=1 (%.200s)", one.Text());
-  ctx.Equal(bodyOf(ctx, one)["turns"].size(), 1, "limit=1; the turns");
+  ctx.Equal(hBodyOf(ctx, one)["turns"].size(), 1, "limit=1; the turns");
 }
 
 void CheckCursor(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   // 200 turns are exactly two pages: the second one is the last, so its next_cursor is null.
   const std::vector<std::pair<long, std::vector<size_t>>> walks = {{250, {100, 100, 50}}, {200, {100, 100}}};
   for (const auto& [total, expected] : walks) {
-    const std::string session_id = seedCall(total);
+    const std::string session_id = hSeedCall(total);
     std::vector<long> seen;
     std::vector<size_t> sizes;
     std::string cursor;
@@ -949,9 +949,9 @@ void CheckCursor(harness::Ctx& ctx) {
       const std::string path = "/v1/voice/sessions/" + session_id + "?limit=100" + (cursor.empty() ? "" : "&cursor=" + cursor);
       const auto r = c.Get(path, "X-Tenant-Id", "acme");
       ctx.Equal(r.Status, 200, "a page (%.200s)", r.Text());
-      const json body = bodyOf(ctx, r);
+      const json body = hBodyOf(ctx, r);
       ctx.Assert(body.contains("next_cursor"), "the response carries no next_cursor: a client cannot walk past the first page (%.200s)", r.Text());
-      for (const long t : indexes(body)) seen.push_back(t);
+      for (const long t : hIndexes(body)) seen.push_back(t);
       sizes.push_back(body["turns"].size());
       const json& next = body["next_cursor"];
       if (next.is_null()) break;
@@ -965,11 +965,11 @@ void CheckCursor(harness::Ctx& ctx) {
 }
 
 void CheckNoAudioPath(harness::Ctx& ctx) {
-  const std::string session_id = seedCall(2);
-  auto c = api(ctx);
+  const std::string session_id = hSeedCall(2);
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "acme");
   ctx.Assert(r.Text().find("s3://") == std::string::npos, "the transcript hands out the recording's location: %.300s. Answer the redacted text and its spans only", r.Text());
-  for (const auto& t : bodyOf(ctx, r)["turns"]) {
+  for (const auto& t : hBodyOf(ctx, r)["turns"]) {
     std::vector<std::string> keys;
     for (const auto& [k, v] : t.items()) keys.push_back(k);
     ctx.Equal(keys, std::vector<std::string>{"ended_at", "redaction_spans", "started_at", "text", "turn_index"}, "the fields of a turn");

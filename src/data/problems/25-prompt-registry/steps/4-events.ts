@@ -810,24 +810,24 @@ import (
 )
 
 const (
-	eventsTopic    = "prompt.lifecycle"
-	eventsTemplate = "Hi {{customer_name}}, your refund for order 4411 is approved."
+	kHEventsTopic    = "prompt.lifecycle"
+	kHEventsTemplate = "Hi {{customer_name}}, your refund for order 4411 is approved."
 )
 
-func eventsEvent(n int, name, actor, action string, version int) lifecycle.Event {
+func hEventsEvent(n int, name, actor, action string, version int) lifecycle.Event {
 	return lifecycle.Event{
 		EventID: fmt.Sprintf("ev-%d", n), Tenant: "t1", Name: name, Version: version, Action: action,
-		ContentHash: fmt.Sprintf("sha-%s-%d", name, version), Actor: actor, EvalID: fmt.Sprintf("eval-%d", version), Template: eventsTemplate,
+		ContentHash: fmt.Sprintf("sha-%s-%d", name, version), Actor: actor, EvalID: fmt.Sprintf("eval-%d", version), Template: kHEventsTemplate,
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, e lifecycle.Event) bool {
+func hEventsPublish(ctx *harness.Ctx, e lifecycle.Event) bool {
 	ok, err := publish(context.Background(), e)
 	ctx.NoError(err, "publish(%s)", e.EventID)
 	return ok
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, text := range ctx.Redis.LRange("prompts:outbox", 0, -1) {
 		var row map[string]any
@@ -843,19 +843,19 @@ func CheckNameKey(ctx *harness.Ctx) {
 		version             int
 	}{{"support-reply", "alice", "promoted", 4}, {"support-reply", "oncall", "rolled_back", 3}, {"support-reply", "alice", "promoted", 5}, {"welcome", "bob", "registered", 1}}
 	for n, mv := range moves {
-		ctx.Assert(eventsPublish(ctx, eventsEvent(n, mv.name, mv.actor, mv.action, mv.version)), "publishing %s of %s v%d returned false on a healthy broker", mv.action, mv.name, mv.version)
+		ctx.Assert(hEventsPublish(ctx, hEventsEvent(n, mv.name, mv.actor, mv.action, mv.version)), "publishing %s of %s v%d returned false on a healthy broker", mv.action, mv.name, mv.version)
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 4, "four moves must produce four records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"support-reply", "support-reply", "support-reply", "welcome"}, "the records must be keyed by the prompt names (keyed by actor, a rollback can overtake the promotion it undoes)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 4, "four moves must produce four records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"support-reply", "support-reply", "support-reply", "welcome"}, "the records must be keyed by the prompt names (keyed by actor, a rollback can overtake the promotion it undoes)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "one prompt's moves must land on one partition so a consumer applies them in order")
 }
 
 func CheckEventIdentity(ctx *harness.Ctx) {
-	ctx.Assert(eventsPublish(ctx, eventsEvent(1, "support-reply", "alice", "promoted", 4)), "publish returned false on a healthy broker")
+	ctx.Assert(hEventsPublish(ctx, hEventsEvent(1, "support-reply", "alice", "promoted", 4)), "publish returned false on a healthy broker")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one move must produce one record; the records")
 	var got map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &got), "the event must be JSON")
@@ -867,13 +867,13 @@ func CheckNoTemplate(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
 	defer log.SetOutput(os.Stderr)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish(ctx, eventsEvent(1, "support-reply", "alice", "promoted", 4))
-	eventsPublish(ctx, eventsEvent(2, "support-reply", "alice", "promoted", 5))
-	ctx.Kafka.Stall(eventsTopic) // no acknowledgement: the event goes to the outbox, and nothing logs its template
-	eventsPublish(ctx, eventsEvent(3, "support-reply", "alice", "promoted", 6))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsPublish(ctx, hEventsEvent(1, "support-reply", "alice", "promoted", 4))
+	hEventsPublish(ctx, hEventsEvent(2, "support-reply", "alice", "promoted", 5))
+	ctx.Kafka.Stall(kHEventsTopic) // no acknowledgement: the event goes to the outbox, and nothing logs its template
+	hEventsPublish(ctx, hEventsEvent(3, "support-reply", "alice", "promoted", 6))
 	ctx.Settle()
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
 		ctx.Assert(!strings.Contains(value, "refund for order 4411"), "the event carries the template text: %s; the topic is retained and replicated", value)
 		var e map[string]any
 		json.Unmarshal([]byte(value), &e)
@@ -887,30 +887,30 @@ func CheckNoTemplate(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsEvent(1, "support-reply", "alice", "promoted", 4))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsEvent(1, "support-reply", "alice", "promoted", 4))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsEvent(2, "support-reply", "alice", "promoted", 5))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsEvent(2, "support-reply", "alice", "promoted", 5))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsEvent(1, "support-reply", "alice", "promoted", 4))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, hEventsEvent(1, "support-reply", "alice", "promoted", 4))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused the produce: without an outbox row the move vanishes from every consumer; the rows")
 	ctx.Assert(rows[0]["event_id"] == "ev-1" && rows[0]["content_hash"] == "sha-support-reply-4", "the outbox row must be the event itself, got %v", rows[0])
 	ctx.Equal(ok, false, "publish's result after a refused produce")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsEvent(2, "support-reply", "alice", "promoted", 5))
+	ok = hEventsPublish(ctx, hEventsEvent(2, "support-reply", "alice", "promoted", 5))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["event_id"] == "ev-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publish's result without an acknowledgement")
 }
@@ -926,16 +926,16 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "prompt.lifecycle";
-const std::string kTemplate = "Hi {{customer_name}}, your refund for order 4411 is approved.";
+const std::string kHEventsTopic = "prompt.lifecycle";
+const std::string kHTemplate = "Hi {{customer_name}}, your refund for order 4411 is approved.";
 
-lifecycle::Event eventsEvent(int n, const std::string& name = "support-reply", const std::string& actor = "alice",
+lifecycle::Event hEventsEvent(int n, const std::string& name = "support-reply", const std::string& actor = "alice",
                              const std::string& action = "promoted", int version = 4) {
   return lifecycle::Event{"ev-" + std::to_string(n), "t1", name, version, action, "sha-" + name + "-" + std::to_string(version), actor,
-                          "eval-" + std::to_string(version), kTemplate};
+                          "eval-" + std::to_string(version), kHTemplate};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("prompts:outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -945,30 +945,30 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& key) {
+std::string hField(const nlohmann::json& j, const std::string& key) {
   return j.is_object() && j.contains(key) && j[key].is_string() ? j[key].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckNameKey(harness::Ctx& ctx) {
-  ctx.Assert(publish(eventsEvent(0, "support-reply", "alice", "promoted", 4)), "publishing promoted of support-reply v4 returned false on a healthy broker");
-  ctx.Assert(publish(eventsEvent(1, "support-reply", "oncall", "rolled_back", 3)), "publishing rolled_back of support-reply v3 returned false on a healthy broker");
-  ctx.Assert(publish(eventsEvent(2, "support-reply", "alice", "promoted", 5)), "publishing promoted of support-reply v5 returned false on a healthy broker");
-  ctx.Assert(publish(eventsEvent(3, "welcome", "bob", "registered", 1)), "publishing registered of welcome v1 returned false on a healthy broker");
+  ctx.Assert(publish(hEventsEvent(0, "support-reply", "alice", "promoted", 4)), "publishing promoted of support-reply v4 returned false on a healthy broker");
+  ctx.Assert(publish(hEventsEvent(1, "support-reply", "oncall", "rolled_back", 3)), "publishing rolled_back of support-reply v3 returned false on a healthy broker");
+  ctx.Assert(publish(hEventsEvent(2, "support-reply", "alice", "promoted", 5)), "publishing promoted of support-reply v5 returned false on a healthy broker");
+  ctx.Assert(publish(hEventsEvent(3, "welcome", "bob", "registered", 1)), "publishing registered of welcome v1 returned false on a healthy broker");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 4, "four moves must produce four records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"support-reply", "support-reply", "support-reply", "welcome"},
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 4, "four moves must produce four records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"support-reply", "support-reply", "support-reply", "welcome"},
             "the records must be keyed by the prompt names (keyed by actor, a rollback can overtake the promotion it undoes)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "one prompt's moves must land on one partition so a consumer applies them in order");
 }
 
 void CheckEventIdentity(harness::Ctx& ctx) {
-  ctx.Assert(publish(eventsEvent(1)), "publish returned false on a healthy broker");
+  ctx.Assert(publish(hEventsEvent(1)), "publish returned false on a healthy broker");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one move must produce one record; the records");
   const auto got = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Equal(got,
@@ -981,15 +981,15 @@ void CheckNoTemplate(harness::Ctx& ctx) {
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  publish(eventsEvent(1));
-  publish(eventsEvent(2, "support-reply", "alice", "promoted", 5));
-  ctx.Kafka.Stall(kEventsTopic);  // no acknowledgement: the event goes to the outbox, and nothing logs its template
-  publish(eventsEvent(3, "support-reply", "alice", "promoted", 6));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  publish(hEventsEvent(1));
+  publish(hEventsEvent(2, "support-reply", "alice", "promoted", 5));
+  ctx.Kafka.Stall(kHEventsTopic);  // no acknowledgement: the event goes to the outbox, and nothing logs its template
+  publish(hEventsEvent(3, "support-reply", "alice", "promoted", 6));
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Settle();
-  for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
+  for (const auto& value : ctx.Kafka.Values(kHEventsTopic)) {
     ctx.Assert(value.find("refund for order 4411") == std::string::npos, "the event carries the template text: %s; the topic is retained and replicated", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(!e.is_object() || !e.contains("template"), "the event has a template field: %s", value);
@@ -1001,31 +1001,31 @@ void CheckNoTemplate(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish(eventsEvent(1));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publish(hEventsEvent(1));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publish(eventsEvent(2, "support-reply", "alice", "promoted", 5));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publish(hEventsEvent(2, "support-reply", "alice", "promoted", 5));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publish(eventsEvent(1));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  bool ok = publish(hEventsEvent(1));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused the produce: without an outbox row the move vanishes from every consumer; the rows");
-  ctx.Assert(field(rows[0], "event_id") == "ev-1" && field(rows[0], "content_hash") == "sha-support-reply-4", "the outbox row must be the event itself, got %s", rows[0].dump());
+  ctx.Assert(hField(rows[0], "event_id") == "ev-1" && hField(rows[0], "content_hash") == "sha-support-reply-4", "the outbox row must be the event itself, got %s", rows[0].dump());
   ctx.Equal(ok, false, "publish's result after a refused produce");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publish(eventsEvent(2, "support-reply", "alice", "promoted", 5));
+  ok = publish(hEventsEvent(2, "support-reply", "alice", "promoted", 5));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait at most 2 s, then keep the event in the outbox", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && field(rows[1], "event_id") == "ev-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hField(rows[1], "event_id") == "ev-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish's result without an acknowledgement");
 }
 `,

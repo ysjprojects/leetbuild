@@ -891,13 +891,13 @@ import (
 	"leetbuild/harness"
 )
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func queue(c *harness.HTTP, player string, skill int, party []string) *harness.Response {
+func hQueue(c *harness.HTTP, player string, skill int, party []string) *harness.Response {
 	body := map[string]any{"skill": skill}
 	if party != nil {
 		body["party"] = party
@@ -908,21 +908,21 @@ func queue(c *harness.HTTP, player string, skill int, party []string) *harness.R
 	return c.Post("/v1/matchmaking/tickets", body, "X-Player-Id", player)
 }
 
-type queuedTicket struct {
+type HQueuedTicket struct {
 	TicketID     string   \`json:"ticket_id"\`
 	Skill        int      \`json:"skill"\`
 	Bucket       int      \`json:"bucket"\`
 	Participants []string \`json:"participants"\`
 }
 
-func decodeTicket(r *harness.Response) queuedTicket {
-	var t queuedTicket
+func hDecodeTicket(r *harness.Response) HQueuedTicket {
+	var t HQueuedTicket
 	r.Decode(&t)
 	return t
 }
 
 // queued is every ticket id waiting in any pool, sorted.
-func queued(ctx *harness.Ctx) []string {
+func hQueued(ctx *harness.Ctx) []string {
 	ids := []string{}
 	for _, k := range ctx.Redis.Keys("pool:*") {
 		if k == "pool:depth" {
@@ -937,46 +937,46 @@ func queued(ctx *harness.Ctx) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := queue(c, "p1", 1520, []string{"p2", "p3"})
+	c := hApiClient(ctx)
+	r := hQueue(c, "p1", 1520, []string{"p2", "p3"})
 	ctx.Equal(r.Status, 201, "POST /v1/matchmaking/tickets (%s)", r.Text())
-	t := decodeTicket(r)
+	t := hDecodeTicket(r)
 	ctx.Assert(t.Skill == 1520 && t.Bucket == 15, "a 1520 rating must wait in bucket 15, the response is %s", r.Text())
 	ctx.Equal(t.Participants, []string{"p1", "p2", "p3"}, "the participants are the owner, then the party")
 	score, ok := ctx.Redis.ZScore("pool:15", t.TicketID)
-	ctx.Assert(ok && score == 1520, "ticket %s is not in pool:15 scored 1520 (pools: %v)", t.TicketID, queued(ctx))
+	ctx.Assert(ok && score == 1520, "ticket %s is not in pool:15 scored 1520 (pools: %v)", t.TicketID, hQueued(ctx))
 	ctx.Equal(store.GetTicket(context.Background(), t.TicketID).Owner, "p1", "the ticket's owner")
 }
 
 func CheckPlayerRequired(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	missing := queue(c, "-", 1520, nil)
-	empty := queue(c, "", 1520, nil)
+	c := hApiClient(ctx)
+	missing := hQueue(c, "-", 1520, nil)
+	empty := hQueue(c, "", 1520, nil)
 	ctx.Equal(missing.Status, 401, "a request without X-Player-Id")
 	ctx.Equal(empty.Status, 401, "a request with an empty X-Player-Id")
-	ctx.Equal(queued(ctx), []string{}, "tickets nobody owns must not wait in the pool (a matchmaker would claim them and no client would ever join); the pool")
+	ctx.Equal(hQueued(ctx), []string{}, "tickets nobody owns must not wait in the pool (a matchmaker would claim them and no client would ever join); the pool")
 }
 
 func CheckPartyCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	six := queue(c, "a1", 1500, []string{"a2", "a3", "a4", "a5", "a6", "a7"})
-	five := queue(c, "b1", 1500, []string{"b2", "b3", "b4", "b5", "b6"})
-	twice := queue(c, "c1", 1500, []string{"c2", "c2"})
-	owner := queue(c, "d1", 1500, []string{"d1"})
+	c := hApiClient(ctx)
+	six := hQueue(c, "a1", 1500, []string{"a2", "a3", "a4", "a5", "a6", "a7"})
+	five := hQueue(c, "b1", 1500, []string{"b2", "b3", "b4", "b5", "b6"})
+	twice := hQueue(c, "c1", 1500, []string{"c2", "c2"})
+	owner := hQueue(c, "d1", 1500, []string{"d1"})
 	ctx.Equal(six.Status, 400, "a party of six (no server seats that roster)")
 	ctx.Equal(five.Status, 201, "a party of five (%s)", five.Text())
 	ctx.Equal(twice.Status, 400, "a party listing c2 twice")
 	ctx.Equal(owner.Status, 400, "a party listing its owner")
-	ctx.Equal(queued(ctx), []string{decodeTicket(five).TicketID}, "only the party of five may wait in the pool; the pool")
+	ctx.Equal(hQueued(ctx), []string{hDecodeTicket(five).TicketID}, "only the party of five may wait in the pool; the pool")
 }
 
 func CheckSkillBand(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	low := queue(c, "p1", -50, nil)
-	high := queue(c, "p2", 9000, nil)
-	zero := queue(c, "p3", 0, nil)
+	c := hApiClient(ctx)
+	low := hQueue(c, "p1", -50, nil)
+	high := hQueue(c, "p2", 9000, nil)
+	zero := hQueue(c, "p3", 0, nil)
 	ctx.Assert(low.Status == 201 && high.Status == 201, "out-of-band ratings are clamped, not refused: %d %d", low.Status, high.Status)
-	l, h, z := decodeTicket(low), decodeTicket(high), decodeTicket(zero)
+	l, h, z := hDecodeTicket(low), hDecodeTicket(high), hDecodeTicket(zero)
 	ctx.Assert(l.Skill == 0 && l.Bucket == 0, "a rating of -50 must be clamped to 0 in bucket 0, the response is %s", low.Text())
 	ctx.Assert(h.Skill == 4000 && h.Bucket == 40, "a rating of 9000 must be clamped to 4000 in bucket 40, the response is %s", high.Text())
 	ctx.Assert(zero.Status == 201 && z.Skill == 0 && z.Bucket == 0, "a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is %d %s", zero.Status, zero.Text())
@@ -990,28 +990,28 @@ func CheckSkillBand(ctx *harness.Ctx) {
 }
 
 func CheckOneOpenTicket(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := queue(c, "p1", 1520, nil)
+	c := hApiClient(ctx)
+	first := hQueue(c, "p1", 1520, nil)
 	ctx.Equal(first.Status, 201, "the first ticket (%s)", first.Text())
-	original := decodeTicket(first).TicketID
-	second := queue(c, "p1", 1600, nil)
+	original := hDecodeTicket(first).TicketID
+	second := hQueue(c, "p1", 1600, nil)
 	ctx.Equal(second.Status, 409, "a second ticket for p1 (p1 now waits twice and can be claimed into two games)")
-	ctx.Equal(decodeTicket(second).TicketID, original, "the 409 must carry the open ticket")
-	member := queue(c, "p9", 1500, []string{"p1"})
-	ctx.Assert(member.Status == 409 && decodeTicket(member).TicketID == original, "a party with p1, who already waits on %s, answered %d %s, expected 409 with %s", original, member.Status, member.Text(), original)
-	alone := queue(c, "p9", 1500, nil)
+	ctx.Equal(hDecodeTicket(second).TicketID, original, "the 409 must carry the open ticket")
+	member := hQueue(c, "p9", 1500, []string{"p1"})
+	ctx.Assert(member.Status == 409 && hDecodeTicket(member).TicketID == original, "a party with p1, who already waits on %s, answered %d %s, expected 409 with %s", original, member.Status, member.Text(), original)
+	alone := hQueue(c, "p9", 1500, nil)
 	ctx.Equal(alone.Status, 201, "p9 alone, after the refused party request (it must not leave open:p9 behind): %s", alone.Text())
-	party := queue(c, "p5", 1500, []string{"p6"})
-	later := queue(c, "p6", 1500, nil)
-	ctx.Assert(later.Status == 409 && decodeTicket(later).TicketID == decodeTicket(party).TicketID, "p6 is queued in p5's party, yet a ticket of p6's own answered %d %s", later.Status, later.Text())
+	party := hQueue(c, "p5", 1500, []string{"p6"})
+	later := hQueue(c, "p6", 1500, nil)
+	ctx.Assert(later.Status == 409 && hDecodeTicket(later).TicketID == hDecodeTicket(party).TicketID, "p6 is queued in p5's party, yet a ticket of p6's own answered %d %s", later.Status, later.Text())
 	ttl := ctx.Redis.TTL("open:p1")
 	ctx.Assert(ttl > 0 && ttl <= 900, "open:p1 has TTL %d: the pointer must expire with the ticket (EX 900)", ttl)
-	own := queue(c, "p7", 1500, nil)
+	own := hQueue(c, "p7", 1500, nil)
 	ctx.Equal(own.Status, 201, "p7 alone (%s)", own.Text())
-	ownID := decodeTicket(own).TicketID
+	ownID := hDecodeTicket(own).TicketID
 	// p8's party names p1, who waits on the original ticket, and p7, who waits on a ticket of their own.
-	refused := queue(c, "p8", 1500, []string{"p1", "p7"})
-	ctx.Assert(refused.Status == 409 && decodeTicket(refused).TicketID == original, "p8's party with p1, who waits on %s, answered %d %s, expected 409 with %s", original, refused.Status, refused.Text(), original)
+	refused := hQueue(c, "p8", 1500, []string{"p1", "p7"})
+	ctx.Assert(refused.Status == 409 && hDecodeTicket(refused).TicketID == original, "p8's party with p1, who waits on %s, answered %d %s, expected 409 with %s", original, refused.Status, refused.Text(), original)
 	p1Open, _ := ctx.Redis.Get("open:p1")
 	p7Open, _ := ctx.Redis.Get("open:p7")
 	ctx.Assert(p1Open == original && p7Open == ownID, "after the refused request for p8's party open:p1 is %q and open:p7 is %q, expected %q and %q: a refused request deleted pointers it never took, so those players can queue a second ticket", p1Open, p7Open, original, ownID)
@@ -1021,23 +1021,23 @@ func CheckOneOpenTicket(ctx *harness.Ctx) {
 	rival := ctx.Redis.After("open:r1", func() any {
 		return []any{ctx.Redis.Set("open:r1", "t-rival", "EX", 900, "NX"), ctx.Redis.TTL("open:r1")}
 	})
-	raced := queue(c, "r1", 1500, nil)
+	raced := hQueue(c, "r1", 1500, nil)
 	ctx.Assert(rival.Fired, "the request for r1 never touched open:r1")
 	ctx.Assert(rival.Err == nil, "the rival request failed: %v", rival.Err)
 	got, _ := rival.Result.([]any)
 	rivalWon, _ := got[0].(bool)
 	ttlThen, _ := got[1].(int64)
-	want := []string{original, decodeTicket(alone).TicketID, decodeTicket(party).TicketID, ownID}
+	want := []string{original, hDecodeTicket(alone).TicketID, hDecodeTicket(party).TicketID, ownID}
 	if rivalWon {
-		ctx.Assert(raced.Status == 409 && decodeTicket(raced).TicketID == "t-rival", "another request took open:r1 between this request's first command on it and its write, yet this one answered %d %s, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command", raced.Status, raced.Text())
+		ctx.Assert(raced.Status == 409 && hDecodeTicket(raced).TicketID == "t-rival", "another request took open:r1 between this request's first command on it and its write, yet this one answered %d %s, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command", raced.Status, raced.Text())
 	} else {
 		ctx.Equal(raced.Status, 201, "r1's request took open:r1 first; its answer (%s)", raced.Text())
 		ctx.Assert(ttlThen > 0 && ttlThen <= 900, "right after r1's request took open:r1 its TTL was %d: a crash before the expiry is set leaves r1 unable to queue again. Set the pointer and its expiry in one command", ttlThen)
-		want = append(want, decodeTicket(raced).TicketID)
+		want = append(want, hDecodeTicket(raced).TicketID)
 	}
 	// pool:25 is not a sorted set, so the enqueue fails after the pointers were taken.
 	ctx.Redis.Set("pool:25", "not-a-pool")
-	failed := queue(c, "q1", 2500, []string{"q2"})
+	failed := hQueue(c, "q1", 2500, []string{"q2"})
 	held := []string{}
 	for _, k := range []string{"open:q1", "open:q2"} {
 		if ctx.Redis.Exists(k) == 1 {
@@ -1047,11 +1047,11 @@ func CheckOneOpenTicket(ctx *harness.Ctx) {
 	ctx.Redis.Del("pool:25")
 	ctx.Assert(failed.Status != 201, "the enqueue into pool:25 failed, yet the request answered 201")
 	ctx.Assert(len(held) == 0, "the enqueue failed and the request answered %d, yet it left %v behind: q1 and q2 cannot queue again until the pointers expire. Delete the pointers the request took when the enqueue fails", failed.Status, held)
-	retry := queue(c, "q1", 2500, []string{"q2"})
+	retry := hQueue(c, "q1", 2500, []string{"q2"})
 	ctx.Equal(retry.Status, 201, "q1 queued again once the pool was back; the answer (%s)", retry.Text())
-	want = append(want, decodeTicket(retry).TicketID)
+	want = append(want, hDecodeTicket(retry).TicketID)
 	sort.Strings(want)
-	ctx.Equal(queued(ctx), want, "the pool")
+	ctx.Equal(hQueued(ctx), want, "the pool")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1067,7 +1067,7 @@ func CheckOneOpenTicket(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1075,27 +1075,27 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response queue(harness::HTTP& c, const std::string& player, long skill, const std::vector<std::string>& party = {}) {
+harness::Response hQueue(harness::HTTP& c, const std::string& player, long skill, const std::vector<std::string>& party = {}) {
   nlohmann::json body{{"skill", skill}};
   if (!party.empty()) body["party"] = party;
   if (player == "-") return c.Post("/v1/matchmaking/tickets", body.dump(), "Content-Type", "application/json");
   return c.Post("/v1/matchmaking/tickets", body.dump(), "Content-Type", "application/json", "X-Player-Id", player);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::string ticketIdOf(const harness::Response& r) {
-  const auto body = bodyOf(r);
+std::string hTicketIdOf(const harness::Response& r) {
+  const auto body = hBodyOf(r);
   return body.is_object() && body.contains("ticket_id") && body["ticket_id"].is_string() ? body["ticket_id"].get<std::string>() : "";
 }
 
-long numberOf(const harness::Response& r, const char* field) {
-  const auto body = bodyOf(r);
+long hNumberOf(const harness::Response& r, const char* field) {
+  const auto body = hBodyOf(r);
   return body.is_object() && body.contains(field) && body[field].is_number() ? body[field].get<long>() : -999;
 }
 
 // Every ticket id waiting in any pool, sorted.
-std::vector<std::string> queued(harness::Ctx& ctx) {
+std::vector<std::string> hQueued(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& k : ctx.Redis.Keys("pool:*")) {
     if (k == "pool:depth") continue;
@@ -1108,49 +1108,49 @@ std::vector<std::string> queued(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto r = queue(c, "p1", 1520, {"p2", "p3"});
+  auto c = hApiClient(ctx);
+  const auto r = hQueue(c, "p1", 1520, {"p2", "p3"});
   ctx.Equal(r.Status, 201, "POST /v1/matchmaking/tickets (%s)", r.Text());
-  ctx.Assert(numberOf(r, "skill") == 1520 && numberOf(r, "bucket") == 15, "a 1520 rating must wait in bucket 15, the response is %s", r.Text());
-  const auto body = bodyOf(r);
+  ctx.Assert(hNumberOf(r, "skill") == 1520 && hNumberOf(r, "bucket") == 15, "a 1520 rating must wait in bucket 15, the response is %s", r.Text());
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.value("participants", nlohmann::json()) == nlohmann::json({"p1", "p2", "p3"}), "the participants are the owner, then the party: %s", r.Text());
-  const std::string ticket_id = ticketIdOf(r);
+  const std::string ticket_id = hTicketIdOf(r);
   ctx.Equal(ctx.Redis.ZScore("pool:15", ticket_id), std::optional<double>(1520), "ticket %s in pool:15 (its score)", ticket_id);
   const auto ticket = store::getTicket(ticket_id);
   ctx.Assert(ticket && ticket->owner == "p1", "the ticket must be owned by p1");
 }
 
 void CheckPlayerRequired(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto missing = queue(c, "-", 1520);
-  const auto empty = queue(c, "", 1520);
+  auto c = hApiClient(ctx);
+  const auto missing = hQueue(c, "-", 1520);
+  const auto empty = hQueue(c, "", 1520);
   ctx.Equal(missing.Status, 401, "a request without X-Player-Id");
   ctx.Equal(empty.Status, 401, "a request with an empty X-Player-Id");
-  ctx.Equal(queued(ctx), std::vector<std::string>{}, "tickets nobody owns must not wait in the pool (a matchmaker would claim them and no client would ever join); the pool");
+  ctx.Equal(hQueued(ctx), std::vector<std::string>{}, "tickets nobody owns must not wait in the pool (a matchmaker would claim them and no client would ever join); the pool");
 }
 
 void CheckPartyCap(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto six = queue(c, "a1", 1500, {"a2", "a3", "a4", "a5", "a6", "a7"});
-  const auto five = queue(c, "b1", 1500, {"b2", "b3", "b4", "b5", "b6"});
-  const auto twice = queue(c, "c1", 1500, {"c2", "c2"});
-  const auto owner = queue(c, "d1", 1500, {"d1"});
+  auto c = hApiClient(ctx);
+  const auto six = hQueue(c, "a1", 1500, {"a2", "a3", "a4", "a5", "a6", "a7"});
+  const auto five = hQueue(c, "b1", 1500, {"b2", "b3", "b4", "b5", "b6"});
+  const auto twice = hQueue(c, "c1", 1500, {"c2", "c2"});
+  const auto owner = hQueue(c, "d1", 1500, {"d1"});
   ctx.Equal(six.Status, 400, "a party of six (no server seats that roster)");
   ctx.Equal(five.Status, 201, "a party of five (%s)", five.Text());
   ctx.Equal(twice.Status, 400, "a party listing c2 twice");
   ctx.Equal(owner.Status, 400, "a party listing its owner");
-  ctx.Equal(queued(ctx), std::vector<std::string>{ticketIdOf(five)}, "only the party of five may wait in the pool; the pool");
+  ctx.Equal(hQueued(ctx), std::vector<std::string>{hTicketIdOf(five)}, "only the party of five may wait in the pool; the pool");
 }
 
 void CheckSkillBand(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto low = queue(c, "p1", -50);
-  const auto high = queue(c, "p2", 9000);
-  const auto zero = queue(c, "p3", 0);
+  auto c = hApiClient(ctx);
+  const auto low = hQueue(c, "p1", -50);
+  const auto high = hQueue(c, "p2", 9000);
+  const auto zero = hQueue(c, "p3", 0);
   ctx.Assert(low.Status == 201 && high.Status == 201, "out-of-band ratings are clamped, not refused: %d %d", low.Status, high.Status);
-  ctx.Assert(numberOf(low, "skill") == 0 && numberOf(low, "bucket") == 0, "a rating of -50 must be clamped to 0 in bucket 0, the response is %s", low.Text());
-  ctx.Assert(numberOf(high, "skill") == 4000 && numberOf(high, "bucket") == 40, "a rating of 9000 must be clamped to 4000 in bucket 40, the response is %s", high.Text());
-  ctx.Assert(zero.Status == 201 && numberOf(zero, "skill") == 0 && numberOf(zero, "bucket") == 0, "a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is %d %s", zero.Status, zero.Text());
+  ctx.Assert(hNumberOf(low, "skill") == 0 && hNumberOf(low, "bucket") == 0, "a rating of -50 must be clamped to 0 in bucket 0, the response is %s", low.Text());
+  ctx.Assert(hNumberOf(high, "skill") == 4000 && hNumberOf(high, "bucket") == 40, "a rating of 9000 must be clamped to 4000 in bucket 40, the response is %s", high.Text());
+  ctx.Assert(zero.Status == 201 && hNumberOf(zero, "skill") == 0 && hNumberOf(zero, "bucket") == 0, "a rating of exactly 0 is the bottom of the band and must wait as 0 in bucket 0, the response is %d %s", zero.Status, zero.Text());
   std::vector<std::string> stray;
   for (const auto& k : ctx.Redis.Keys("pool:*")) {
     if (k != "pool:0" && k != "pool:40" && k != "pool:depth") stray.push_back(k);
@@ -1159,28 +1159,28 @@ void CheckSkillBand(harness::Ctx& ctx) {
 }
 
 void CheckOneOpenTicket(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto first = queue(c, "p1", 1520);
+  auto c = hApiClient(ctx);
+  const auto first = hQueue(c, "p1", 1520);
   ctx.Equal(first.Status, 201, "the first ticket (%s)", first.Text());
-  const std::string original = ticketIdOf(first);
-  const auto second = queue(c, "p1", 1600);
+  const std::string original = hTicketIdOf(first);
+  const auto second = hQueue(c, "p1", 1600);
   ctx.Equal(second.Status, 409, "a second ticket for p1 (p1 now waits twice and can be claimed into two games)");
-  ctx.Equal(ticketIdOf(second), original, "the 409 must carry the open ticket");
-  const auto member = queue(c, "p9", 1500, {"p1"});
-  ctx.Assert(member.Status == 409 && ticketIdOf(member) == original, "a party with p1, who already waits on %s, answered %d %s, expected 409 with %s", original, member.Status, member.Text(), original);
-  const auto alone = queue(c, "p9", 1500);
+  ctx.Equal(hTicketIdOf(second), original, "the 409 must carry the open ticket");
+  const auto member = hQueue(c, "p9", 1500, {"p1"});
+  ctx.Assert(member.Status == 409 && hTicketIdOf(member) == original, "a party with p1, who already waits on %s, answered %d %s, expected 409 with %s", original, member.Status, member.Text(), original);
+  const auto alone = hQueue(c, "p9", 1500);
   ctx.Equal(alone.Status, 201, "p9 alone, after the refused party request (it must not leave open:p9 behind): %s", alone.Text());
-  const auto party = queue(c, "p5", 1500, {"p6"});
-  const auto later = queue(c, "p6", 1500);
-  ctx.Assert(later.Status == 409 && ticketIdOf(later) == ticketIdOf(party), "p6 is queued in p5's party, yet a ticket of p6's own answered %d %s", later.Status, later.Text());
+  const auto party = hQueue(c, "p5", 1500, {"p6"});
+  const auto later = hQueue(c, "p6", 1500);
+  ctx.Assert(later.Status == 409 && hTicketIdOf(later) == hTicketIdOf(party), "p6 is queued in p5's party, yet a ticket of p6's own answered %d %s", later.Status, later.Text());
   const long long ttl = ctx.Redis.TTL("open:p1");
   ctx.Assert(ttl > 0 && ttl <= 900, "open:p1 has TTL %d: the pointer must expire with the ticket (EX 900)", ttl);
-  const auto own = queue(c, "p7", 1500);
+  const auto own = hQueue(c, "p7", 1500);
   ctx.Equal(own.Status, 201, "p7 alone (%s)", own.Text());
-  const std::string own_id = ticketIdOf(own);
+  const std::string own_id = hTicketIdOf(own);
   // p8's party names p1, who waits on the original ticket, and p7, who waits on a ticket of their own.
-  const auto refused = queue(c, "p8", 1500, {"p1", "p7"});
-  ctx.Assert(refused.Status == 409 && ticketIdOf(refused) == original, "p8's party with p1, who waits on %s, answered %d %s, expected 409 with %s", original, refused.Status, refused.Text(), original);
+  const auto refused = hQueue(c, "p8", 1500, {"p1", "p7"});
+  ctx.Assert(refused.Status == 409 && hTicketIdOf(refused) == original, "p8's party with p1, who waits on %s, answered %d %s, expected 409 with %s", original, refused.Status, refused.Text(), original);
   const std::string p1_open = ctx.Redis.Get("open:p1").value_or("");
   const std::string p7_open = ctx.Redis.Get("open:p7").value_or("");
   ctx.Assert(p1_open == original && p7_open == own_id, "after the refused request for p8's party open:p1 is %s and open:p7 is %s, expected %s and %s: a refused request deleted pointers it never took, so those players can queue a second ticket", p1_open, p7_open, original, own_id);
@@ -1199,20 +1199,20 @@ void CheckOneOpenTicket(harness::Ctx& ctx) {
       *failed = e.what();
     }
   });
-  const auto raced = queue(c, "r1", 1500);
+  const auto raced = hQueue(c, "r1", 1500);
   ctx.Assert(*fired, "the request for r1 never touched open:r1");
   ctx.Assert(failed->empty(), "the rival request failed: %s", *failed);
-  std::vector<std::string> want = {original, ticketIdOf(alone), ticketIdOf(party), own_id};
+  std::vector<std::string> want = {original, hTicketIdOf(alone), hTicketIdOf(party), own_id};
   if (*rival_won) {
-    ctx.Assert(raced.Status == 409 && ticketIdOf(raced) == "t-rival", "another request took open:r1 between this request's first command on it and its write, yet this one answered %d %s, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command", raced.Status, raced.Text());
+    ctx.Assert(raced.Status == 409 && hTicketIdOf(raced) == "t-rival", "another request took open:r1 between this request's first command on it and its write, yet this one answered %d %s, expected 409 with t-rival: r1 now waits on two tickets. Check and take the pointer in one command", raced.Status, raced.Text());
   } else {
     ctx.Equal(raced.Status, 201, "r1's request took open:r1 first; its answer (%s)", raced.Text());
     ctx.Assert(*ttl_then > 0 && *ttl_then <= 900, "right after r1's request took open:r1 its TTL was %d: a crash before the expiry is set leaves r1 unable to queue again. Set the pointer and its expiry in one command", *ttl_then);
-    want.push_back(ticketIdOf(raced));
+    want.push_back(hTicketIdOf(raced));
   }
   // pool:25 is not a sorted set, so the enqueue fails after the pointers were taken.
   ctx.Redis.Set("pool:25", "not-a-pool");
-  const auto refused_enqueue = queue(c, "q1", 2500, {"q2"});
+  const auto refused_enqueue = hQueue(c, "q1", 2500, {"q2"});
   std::vector<std::string> held;
   for (const std::string k : {"open:q1", "open:q2"}) {
     if (ctx.Redis.Exists(k) == 1) held.push_back(k);
@@ -1220,11 +1220,11 @@ void CheckOneOpenTicket(harness::Ctx& ctx) {
   ctx.Redis.Del("pool:25");
   ctx.Assert(refused_enqueue.Status != 201, "the enqueue into pool:25 failed, yet the request answered 201");
   ctx.Assert(held.empty(), "the enqueue failed and the request answered %d, yet it left %q behind: q1 and q2 cannot queue again until the pointers expire. Delete the pointers the request took when the enqueue fails", refused_enqueue.Status, held);
-  const auto retry = queue(c, "q1", 2500, {"q2"});
+  const auto retry = hQueue(c, "q1", 2500, {"q2"});
   ctx.Equal(retry.Status, 201, "q1 queued again once the pool was back; the answer (%s)", retry.Text());
-  want.push_back(ticketIdOf(retry));
+  want.push_back(hTicketIdOf(retry));
   std::sort(want.begin(), want.end());
-  ctx.Equal(queued(ctx), want, "the pool");
+  ctx.Equal(hQueued(ctx), want, "the pool");
 }
 `,
   },

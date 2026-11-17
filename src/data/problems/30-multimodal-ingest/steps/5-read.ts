@@ -676,12 +676,12 @@ import (
 )
 
 var (
-	readBg = context.Background()
-	readH1 = "sha256:" + strings.Repeat("a", 64)
-	readH2 = "sha256:" + strings.Repeat("b", 64)
+	hReadBg = context.Background()
+	hReadH1 = "sha256:" + strings.Repeat("a", 64)
+	hReadH2 = "sha256:" + strings.Repeat("b", 64)
 )
 
-func readImage() []byte {
+func hReadImage() []byte {
 	image := []byte{0x89, 'P', 'N', 'G'}
 	for i := 0; i < 65536; i++ {
 		image = append(image, byte(i%256))
@@ -689,60 +689,60 @@ func readImage() []byte {
 	return image
 }
 
-func readServer(ctx *harness.Ctx) *harness.HTTP {
-	_, err := assets.Create(readBg, "t1", readH1, "image/png", int64(len(readImage())), "a red kettle on a stove")
+func hReadServer(ctx *harness.Ctx) *harness.HTTP {
+	_, err := assets.Create(hReadBg, "t1", hReadH1, "image/png", int64(len(hReadImage())), "a red kettle on a stove")
 	ctx.NoError(err, "seeding a-1")
-	_, err = assets.Create(readBg, "t2", readH2, "image/jpeg", 1024, "t2's private photo")
+	_, err = assets.Create(hReadBg, "t2", hReadH2, "image/jpeg", 1024, "t2's private photo")
 	ctx.NoError(err, "seeding a-2")
-	ctx.Redis.Set("object:"+readH1, readImage())
+	ctx.Redis.Set("object:"+hReadH1, hReadImage())
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, assetID, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, assetID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/assets/" + assetID)
 	}
 	return c.Get("/v1/assets/"+assetID, "X-Tenant-Id", tenant)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the answer must be a JSON object, got %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	r := readGet(c, "a-1", "t1")
+	c := hReadServer(ctx)
+	r := hReadGet(c, "a-1", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/assets/a-1 by its owner (%s)", r.Text())
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	got := map[string]any{}
 	for _, k := range []string{"asset_id", "mime", "checksum", "caption", "degraded"} {
 		got[k] = body[k]
 	}
-	ctx.Equal(got, map[string]any{"asset_id": "a-1", "mime": "image/png", "checksum": readH1, "caption": "a red kettle on a stove", "degraded": false}, "the answer's fields")
+	ctx.Equal(got, map[string]any{"asset_id": "a-1", "mime": "image/png", "checksum": hReadH1, "caption": "a red kettle on a stove", "degraded": false}, "the answer's fields")
 	url, _ := body["url"].(string)
 	ctx.Assert(strings.HasPrefix(url, objects.BaseURL+"/"), "the answer's url is %q, expected an object-store URL", url)
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	foreign := readGet(c, "a-2", "t1")
+	c := hReadServer(ctx)
+	foreign := hReadGet(c, "a-2", "t1")
 	ctx.Equal(foreign.Status, 404, "t1 reading t2's asset a-2 (another tenant's asset is 404, the answer for an id that does not exist)")
 	ctx.Assert(!strings.Contains(foreign.Text(), "private"), "the refusal leaked t2's caption")
-	unknown := readGet(c, "a-404", "t1")
+	unknown := hReadGet(c, "a-404", "t1")
 	ctx.Equal(unknown.Status, 404, "an unknown asset id")
 	ctx.Equal(strings.ReplaceAll(foreign.Text(), "a-2", "{id}"), strings.ReplaceAll(unknown.Text(), "a-404", "{id}"), "t2's asset and an unknown id must answer t1 alike, or the difference tells t1 the id is real; the answers")
-	ctx.Equal(readGet(c, "a-1", "").Status, 401, "a request without X-Tenant-Id")
+	ctx.Equal(hReadGet(c, "a-1", "").Status, 401, "a request without X-Tenant-Id")
 	ctx.Equal(c.Get("/v1/assets/a-1", "X-Tenant-Id", "").Status, 401, "a request with an empty X-Tenant-Id, which names no tenant")
 }
 
 func CheckUrlExpiry(ctx *harness.Ctx) {
-	c := readServer(ctx)
+	c := hReadServer(ctx)
 	now := float64(ctx.Clock.Now()) / 1000
-	body := readBody(ctx, readGet(c, "a-1", "t1"))
+	body := hReadBody(ctx, hReadGet(c, "a-1", "t1"))
 	expiresAt, _ := body["expires_at"].(float64)
 	ctx.Assert(expiresAt >= now+890 && expiresAt <= now+910, "the signed URL expires %.0f s from now: a read URL lives 15 minutes (900 s), so a leaked link dies quickly", expiresAt-now)
 	url, _ := body["url"].(string)
@@ -752,8 +752,8 @@ func CheckUrlExpiry(ctx *harness.Ctx) {
 }
 
 func CheckSignatureBinds(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	url, _ := readBody(ctx, readGet(c, "a-1", "t1"))["url"].(string)
+	c := hReadServer(ctx)
+	url, _ := hReadBody(ctx, hReadGet(c, "a-1", "t1"))["url"].(string)
 	ctx.Assert(objects.Verify(url, "t1"), "the object store refuses %s for t1: sig must be objects.Mac(checksum|tenant|expires_at)", url)
 	ctx.Assert(!objects.Verify(strings.Replace(url, "tenant=t1", "tenant=t2", 1), "t2"), "a URL handed to t1, edited to name t2, is served to t2: the MAC must cover the tenant")
 	later := regexp.MustCompile(\`expires=(\\d+)\`).ReplaceAllStringFunc(url, func(m string) string {
@@ -764,11 +764,11 @@ func CheckSignatureBinds(ctx *harness.Ctx) {
 }
 
 func CheckNoBytes(ctx *harness.Ctx) {
-	c := readServer(ctx)
-	r := readGet(c, "a-1", "t1")
+	c := hReadServer(ctx)
+	r := hReadGet(c, "a-1", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/assets/a-1")
-	ctx.Assert(len(r.Body) < 4096, "GET /v1/assets/a-1 answered %d bytes for a %d-byte image: the API carried the image itself. Answer metadata and the signed URL; the client fetches the bytes from the object store", len(r.Body), len(readImage()))
-	for k, v := range readBody(ctx, r) {
+	ctx.Assert(len(r.Body) < 4096, "GET /v1/assets/a-1 answered %d bytes for a %d-byte image: the API carried the image itself. Answer metadata and the signed URL; the client fetches the bytes from the object store", len(r.Body), len(hReadImage()))
+	for k, v := range hReadBody(ctx, r) {
 		s, isText := v.(string)
 		ctx.Assert(!isText || len(s) <= 1024, "the answer carries %s (%d characters): no image data in the API's answer", k, len(s))
 	}
@@ -786,16 +786,16 @@ namespace {
 const std::string kH1 = "sha256:" + std::string(64, 'a');
 const std::string kH2 = "sha256:" + std::string(64, 'b');
 
-std::string image() {
+std::string hImage() {
   std::string data = "\\x89PNG";
   for (int i = 0; i < 65536; i++) data += static_cast<char>(i % 256);
   return data;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
-  assets::create("t1", kH1, "image/png", static_cast<long long>(image().size()), "a red kettle on a stove");
+harness::HTTP hApi(harness::Ctx& ctx) {
+  assets::create("t1", kH1, "image/png", static_cast<long long>(hImage().size()), "a red kettle on a stove");
   assets::create("t2", kH2, "image/jpeg", 1024, "t2's private photo");
-  ctx.Redis.Set("object:" + kH1, image());
+  ctx.Redis.Set("object:" + kH1, hImage());
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -803,12 +803,12 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& asset_id, const std::string& tenant) {
+harness::Response hReadGet(harness::HTTP& c, const std::string& asset_id, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/assets/" + asset_id);
   return c.Get("/v1/assets/" + asset_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the answer must be a JSON object, got %s", r.Text().substr(0, 200));
   return body;
@@ -817,10 +817,10 @@ nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = readGet(c, "a-1", "t1");
+  auto c = hApi(ctx);
+  const auto r = hReadGet(c, "a-1", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/assets/a-1 by its owner (%s)", r.Text().substr(0, 200));
-  const auto body = bodyOf(ctx, r);
+  const auto body = hBodyOf(ctx, r);
   nlohmann::json got = nlohmann::json::object();
   for (const std::string k : {"asset_id", "mime", "checksum", "caption", "degraded"}) got[k] = body.contains(k) ? body[k] : nlohmann::json();
   const nlohmann::json want = {{"asset_id", "a-1"}, {"mime", "image/png"}, {"checksum", kH1}, {"caption", "a red kettle on a stove"}, {"degraded", false}};
@@ -830,25 +830,25 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto foreign = readGet(c, "a-2", "t1");
+  auto c = hApi(ctx);
+  const auto foreign = hReadGet(c, "a-2", "t1");
   ctx.Equal(foreign.Status, 404, "t1 reading t2's asset a-2 (another tenant's asset is 404, the answer for an id that does not exist)");
   ctx.Assert(foreign.Text().find("private") == std::string::npos, "the refusal leaked t2's caption");
-  const auto unknown = readGet(c, "a-404", "t1");
+  const auto unknown = hReadGet(c, "a-404", "t1");
   ctx.Equal(unknown.Status, 404, "an unknown asset id");
   const auto masked = [](std::string text, const std::string& id) {
     for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
     return text;
   };
   ctx.Equal(masked(foreign.Text(), "a-2"), masked(unknown.Text(), "a-404"), "t2's asset and an unknown id must answer t1 alike, or the difference tells t1 the id is real; the answers");
-  ctx.Equal(readGet(c, "a-1", "").Status, 401, "a request without X-Tenant-Id");
+  ctx.Equal(hReadGet(c, "a-1", "").Status, 401, "a request without X-Tenant-Id");
   ctx.Equal(c.Get("/v1/assets/a-1", "X-Tenant-Id", "").Status, 401, "a request with an empty X-Tenant-Id, which names no tenant");
 }
 
 void CheckUrlExpiry(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
-  const auto body = bodyOf(ctx, readGet(c, "a-1", "t1"));
+  const auto body = hBodyOf(ctx, hReadGet(c, "a-1", "t1"));
   const long long expires_at = body.value("expires_at", 0LL);
   ctx.Assert(expires_at >= now + 890 && expires_at <= now + 910, "the signed URL expires %.0f s from now: a read URL lives 15 minutes (900 s), so a leaked link dies quickly",
              static_cast<double>(expires_at) - now);
@@ -859,8 +859,8 @@ void CheckUrlExpiry(harness::Ctx& ctx) {
 }
 
 void CheckSignatureBinds(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string url = bodyOf(ctx, readGet(c, "a-1", "t1")).value("url", "");
+  auto c = hApi(ctx);
+  const std::string url = hBodyOf(ctx, hReadGet(c, "a-1", "t1")).value("url", "");
   ctx.Assert(objects::verify(url, "t1"), "the object store refuses %s for t1: sig must be objects::mac(checksum|tenant|expires_at)", url);
   std::string other = url;
   const size_t at = other.find("tenant=t1");
@@ -873,13 +873,13 @@ void CheckSignatureBinds(harness::Ctx& ctx) {
 }
 
 void CheckNoBytes(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = readGet(c, "a-1", "t1");
+  auto c = hApi(ctx);
+  const auto r = hReadGet(c, "a-1", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/assets/a-1");
   ctx.Assert(r.Text().size() < 4096,
              "GET /v1/assets/a-1 answered %d bytes for a %d-byte image: the API carried the image itself. Answer metadata and the signed URL; the client fetches the bytes from the object store",
-             r.Text().size(), image().size());
-  for (const auto& [k, v] : bodyOf(ctx, r).items()) {
+             r.Text().size(), hImage().size());
+  for (const auto& [k, v] : hBodyOf(ctx, r).items()) {
     ctx.Assert(!v.is_string() || v.get<std::string>().size() <= 1024, "the answer carries %s (%d characters): no image data in the API's answer", k,
                v.is_string() ? v.get<std::string>().size() : 0);
   }

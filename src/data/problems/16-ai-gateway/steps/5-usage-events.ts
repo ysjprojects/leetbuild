@@ -1184,17 +1184,17 @@ import (
 	"leetbuild/harness"
 )
 
-const usageCanary = "CANARY-7731 my account number is 4111"
+const kHUsageCanary = "CANARY-7731 my account number is 4111"
 
-func usageRequest(id, tenant, content string) AnsweredRequest {
+func hUsageRequest(id, tenant, content string) AnsweredRequest {
 	return AnsweredRequest{ID: id, Tenant: tenant, Model: "gpt-4o-mini", Messages: []chatMessage{{Role: "user", Content: content}}, LatencyMs: 812.5, Status: 200}
 }
 
-func usageDay(ctx *harness.Ctx) string {
+func hUsageDay(ctx *harness.Ctx) string {
 	return time.UnixMilli(ctx.Clock.Now()).UTC().Format("20060102")
 }
 
-func usageIDs(ctx *harness.Ctx) []string {
+func hUsageIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
 	for _, r := range ctx.Kafka.Records("usage") {
 		var v map[string]any
@@ -1205,7 +1205,7 @@ func usageIDs(ctx *harness.Ctx) []string {
 	return ids
 }
 
-func usageOutbox(ctx *harness.Ctx) []map[string]any {
+func hUsageOutbox(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, row := range ctx.Redis.LRange("outbox:usage", 0, -1) {
 		var v map[string]any
@@ -1216,9 +1216,9 @@ func usageOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	emitUsage(context.Background(), buildEvent(usageRequest("r-1", "acme", "hi"), Usage{100, 50}))
-	emitUsage(context.Background(), buildEvent(usageRequest("r-2", "beta", "hi"), Usage{7, 3}))
-	emitUsage(context.Background(), buildEvent(usageRequest("r-3", "acme", "hi"), Usage{10, 5}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-1", "acme", "hi"), Usage{100, 50}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-2", "beta", "hi"), Usage{7, 3}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-3", "acme", "hi"), Usage{10, 5}))
 	ctx.Settle()
 	records := ctx.Kafka.Records("usage")
 	ctx.Equal(len(records), 3, "three emitUsage calls must produce three records on usage; the records")
@@ -1243,17 +1243,17 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	emitUsage(context.Background(), buildEvent(usageRequest("r-2", "acme", "hi"), Usage{100, 50}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-2", "acme", "hi"), Usage{100, 50}))
 	ctx.Settle()
-	ctx.Equal(usageIDs(ctx), []string{"r-2"}, "one emitUsage call; the records on usage")
+	ctx.Equal(hUsageIDs(ctx), []string{"r-2"}, "one emitUsage call; the records on usage")
 	ctx.Kafka.Failover("usage")
-	ctx.Equal(usageIDs(ctx), []string{"r-2"}, "a leader failover right after the acknowledgement must keep the record: wait for all in-sync replicas (RequireAll); the records")
+	ctx.Equal(hUsageIDs(ctx), []string{"r-2"}, "a leader failover right after the acknowledgement must keep the record: wait for all in-sync replicas (RequireAll); the records")
 }
 
 func CheckNoPromptContent(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	emitUsage(context.Background(), buildEvent(usageRequest("r-1", "acme", usageCanary), Usage{100, 50}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-1", "acme", kHUsageCanary), Usage{100, 50}))
 	ctx.Settle()
 	records := ctx.Kafka.Records("usage")
 	ctx.Equal(len(records), 1, "one emitUsage call; the records")
@@ -1274,28 +1274,28 @@ func CheckOutbox(ctx *harness.Ctx) {
 				ctx.Fatalf("emitUsage failed the request when the broker refused the record: %v. Write the event to the outbox instead", e)
 			}
 		}()
-		emitUsage(context.Background(), buildEvent(usageRequest("r-9", "acme", "hi"), Usage{100, 50}))
+		emitUsage(context.Background(), buildEvent(hUsageRequest("r-9", "acme", "hi"), Usage{100, 50}))
 	}()
 	ctx.Settle()
-	rows := usageOutbox(ctx)
+	rows := hUsageOutbox(ctx)
 	ctx.Assert(len(rows) > 0, "the broker refused the record and nothing reached outbox:usage: handle the failed write (Completion, or WriteMessages' error) with outbox.Insert")
 	event, _ := rows[0]["event"].(map[string]any)
 	ctx.Equal(event["id"], "r-9", "the outbox row must carry the event; the row %v; its id", rows[0])
-	emitUsage(context.Background(), buildEvent(usageRequest("r-10", "acme", "hi"), Usage{100, 50}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-10", "acme", "hi"), Usage{100, 50}))
 	ctx.Settle()
-	ctx.Equal(usageIDs(ctx), []string{"r-10"}, "once the broker accepts records again they flow to the topic; the records")
-	ctx.Equal(len(usageOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
+	ctx.Equal(hUsageIDs(ctx), []string{"r-10"}, "once the broker accepts records again they flow to the topic; the records")
+	ctx.Equal(len(hUsageOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
 	// The broker stops answering: emitUsage still returns at once, the answered request does not wait.
 	ctx.Kafka.Stall("usage")
 	started := ctx.Clock.Now()
-	emitUsage(context.Background(), buildEvent(usageRequest("r-11", "acme", "hi"), Usage{100, 50}))
+	emitUsage(context.Background(), buildEvent(hUsageRequest("r-11", "acme", "hi"), Usage{100, 50}))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited < 0.5, "with the broker not answering emitUsage held the request for %.1f s: write asynchronously and handle the failure in the completion", waited)
 	ctx.Kafka.Resume("usage")
 }
 
 func CheckCommitAfterIncrement(ctx *harness.Ctx) {
-	day := usageDay(ctx)
+	day := hUsageDay(ctx)
 	for _, r := range []struct {
 		id, tenant string
 		in, out    int
@@ -1334,9 +1334,9 @@ func CheckCommitAfterIncrement(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kUsageCanary = "CANARY-7731 my account number is 4111";
+const std::string kHUsageCanary = "CANARY-7731 my account number is 4111";
 
-nlohmann::json usageRequest(const std::string& id, const std::string& tenant, const std::string& content) {
+nlohmann::json hUsageRequest(const std::string& id, const std::string& tenant, const std::string& content) {
   nlohmann::json r;
   r["id"] = id;
   r["tenant"] = tenant;
@@ -1347,16 +1347,16 @@ nlohmann::json usageRequest(const std::string& id, const std::string& tenant, co
   return r;
 }
 
-nlohmann::json usageOf(int in, int out) { return {{"input_tokens", in}, {"output_tokens", out}}; }
+nlohmann::json hUsageOf(int in, int out) { return {{"input_tokens", in}, {"output_tokens", out}}; }
 
-std::string usageDay(harness::Ctx& ctx) {
+std::string hUsageDay(harness::Ctx& ctx) {
   const std::time_t t = ctx.Clock.Now() / 1000;
   char day[9];
   std::strftime(day, sizeof day, "%Y%m%d", std::gmtime(&t));
   return day;
 }
 
-std::vector<std::string> usageIDs(harness::Ctx& ctx) {
+std::vector<std::string> hUsageIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& r : ctx.Kafka.Records("usage")) {
     const auto v = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
@@ -1365,7 +1365,7 @@ std::vector<std::string> usageIDs(harness::Ctx& ctx) {
   return ids;
 }
 
-std::vector<nlohmann::json> usageOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hUsageOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& row : ctx.Redis.LRange("outbox:usage", 0, -1)) rows.push_back(nlohmann::json::parse(row, nullptr, false));
   return rows;
@@ -1374,9 +1374,9 @@ std::vector<nlohmann::json> usageOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  emit_usage(build_event(usageRequest("r-1", "acme", "hi"), usageOf(100, 50)));
-  emit_usage(build_event(usageRequest("r-2", "beta", "hi"), usageOf(7, 3)));
-  emit_usage(build_event(usageRequest("r-3", "acme", "hi"), usageOf(10, 5)));
+  emit_usage(build_event(hUsageRequest("r-1", "acme", "hi"), hUsageOf(100, 50)));
+  emit_usage(build_event(hUsageRequest("r-2", "beta", "hi"), hUsageOf(7, 3)));
+  emit_usage(build_event(hUsageRequest("r-3", "acme", "hi"), hUsageOf(10, 5)));
   ctx.Settle();
   const auto records = ctx.Kafka.Records("usage");
   ctx.Equal(records.size(), 3, "three emit_usage calls must produce three records on usage; the records");
@@ -1389,16 +1389,16 @@ void CheckTenantKey(harness::Ctx& ctx) {
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks("usage", 1);
-  emit_usage(build_event(usageRequest("r-1", "acme", "hi"), usageOf(100, 50)));
+  emit_usage(build_event(hUsageRequest("r-1", "acme", "hi"), hUsageOf(100, 50)));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(usageIDs(ctx), {"r-1"},
+  ctx.Equal(hUsageIDs(ctx), {"r-1"},
             "after one produce whose acknowledgement was lost the topic must hold the record once (the producer's retry wrote it again: enable idempotence so the broker recognises the retry); the records");
-  emit_usage(build_event(usageRequest("r-2", "acme", "hi"), usageOf(100, 50)));
+  emit_usage(build_event(hUsageRequest("r-2", "acme", "hi"), hUsageOf(100, 50)));
   producer->poll(0);
   ctx.Settle();
   ctx.Kafka.Failover("usage");
-  const auto ids = usageIDs(ctx);
+  const auto ids = hUsageIDs(ctx);
   ctx.Assert(std::find(ids.begin(), ids.end(), "r-2") != ids.end(), "a leader failover right after the acknowledgement lost the record: wait for all in-sync replicas (acks=all)");
 }
 
@@ -1406,11 +1406,11 @@ void CheckNoPromptContent(harness::Ctx& ctx) {
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  emit_usage(build_event(usageRequest("r-1", "acme", kUsageCanary), usageOf(100, 50)));
+  emit_usage(build_event(hUsageRequest("r-1", "acme", kHUsageCanary), hUsageOf(100, 50)));
   // A client that also sent the prompt in a field of its own: the event lists its fields, it does not copy the request.
-  auto withInput = usageRequest("r-2", "acme", kUsageCanary);
-  withInput["input"] = kUsageCanary;
-  emit_usage(build_event(withInput, usageOf(100, 50)));
+  auto withInput = hUsageRequest("r-2", "acme", kHUsageCanary);
+  withInput["input"] = kHUsageCanary;
+  emit_usage(build_event(withInput, hUsageOf(100, 50)));
   producer->poll(0);
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
@@ -1429,32 +1429,32 @@ void CheckNoPromptContent(harness::Ctx& ctx) {
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext("usage", 1);
   try {
-    emit_usage(build_event(usageRequest("r-9", "acme", "hi"), usageOf(100, 50)));
+    emit_usage(build_event(hUsageRequest("r-9", "acme", "hi"), hUsageOf(100, 50)));
   } catch (const std::exception& e) {
     ctx.Fatalf("emit_usage failed the request when the broker refused the record: %s. Write the event to the outbox instead", e.what());
   }
   producer->poll(0);
   ctx.Settle();
-  const auto rows = usageOutbox(ctx);
+  const auto rows = hUsageOutbox(ctx);
   ctx.Assert(!rows.empty(), "the broker refused the record and nothing reached outbox:usage: handle the delivery report (dr_cb) with gateway::outbox::insert");
   ctx.Assert(rows[0].is_object() && rows[0].contains("event") && rows[0]["event"].value("id", "") == "r-9", "the outbox row must carry the event: %s", rows[0].dump());
   ctx.Equal(ctx.Kafka.Flushes(), 0, "emit_usage must not flush (the answered request would wait for the broker); the flushes");
-  emit_usage(build_event(usageRequest("r-10", "acme", "hi"), usageOf(100, 50)));
+  emit_usage(build_event(hUsageRequest("r-10", "acme", "hi"), hUsageOf(100, 50)));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(usageIDs(ctx), {"r-10"}, "once the broker accepts records again they flow to the topic; the records");
-  ctx.Equal(usageOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
+  ctx.Equal(hUsageIDs(ctx), {"r-10"}, "once the broker accepts records again they flow to the topic; the records");
+  ctx.Equal(hUsageOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
   // The broker stops answering: emit_usage still returns at once, the answered request does not wait.
   ctx.Kafka.Stall("usage");
   const int64_t started = ctx.Clock.Now();
-  emit_usage(build_event(usageRequest("r-11", "acme", "hi"), usageOf(100, 50)));
+  emit_usage(build_event(hUsageRequest("r-11", "acme", "hi"), hUsageOf(100, 50)));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited < 0.5, "with the broker not answering emit_usage held the request for %vs: serve delivery reports without waiting (poll(0))", waited);
   ctx.Kafka.Resume("usage");
 }
 
 void CheckCommitAfterIncrement(harness::Ctx& ctx) {
-  const std::string day = usageDay(ctx);
+  const std::string day = hUsageDay(ctx);
   struct Seed {
     const char* id;
     const char* tenant;

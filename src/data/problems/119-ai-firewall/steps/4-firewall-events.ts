@@ -898,22 +898,22 @@ import (
 )
 
 const (
-	eventsTopicName = "ai.firewall.events"
-	eventsKey       = "key-7f3a"
-	eventsAnswer    = "The zebra-pangolin tunnel opens at dawn."
-	eventsLeaky     = "Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card" +
+	kHEventsTopicName = "ai.firewall.events"
+	kHEventsKey       = "key-7f3a"
+	kHEventsAnswer    = "The zebra-pangolin tunnel opens at dawn."
+	kHEventsLeaky     = "Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card" +
 		" 6011-0009-9013-9424-123 expired. Use sk-AbCdEfGhIjKlMnOpQrStUv123456 or key-ABCDEFGHIJKLMNOPQRSTUV12" +
 		" for the API, done."
-	eventsRedactedLeaky = "Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired." +
+	kHEventsRedactedLeaky = "Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired." +
 		" Use [REDACTED] or [REDACTED] for the API, done."
 )
 
-var eventsSecrets = []string{"4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC"}
+var hEventsSecrets = []string{"4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC"}
 
-var eventsFields = []string{"request_id", "key_hash", "action", "score", "tags", "reason", "latency_ms", "redactions"}
+var hEventsFields = []string{"request_id", "key_hash", "action", "score", "tags", "reason", "latency_ms", "redactions"}
 
-func eventsKeyHash() string {
-	sum := sha256.Sum256([]byte(eventsKey))
+func hEventsKeyHash() string {
+	sum := sha256.Sum256([]byte(kHEventsKey))
 	return hex.EncodeToString(sum[:])[:16]
 }
 
@@ -926,11 +926,11 @@ type Decision struct {
 	Reason string
 }
 
-func allowDecision() Decision { return Decision{Action: "allow", Score: 90, Tags: []string{"travel"}} }
+func hAllowDecision() Decision { return Decision{Action: "allow", Score: 90, Tags: []string{"travel"}} }
 
 // eventAt is the i-th record's payload.
-func eventAt(ctx *harness.Ctx, i int) (map[string]any, harness.KafkaRecord) {
-	records := ctx.Kafka.Records(eventsTopicName)
+func hEventAt(ctx *harness.Ctx, i int) (map[string]any, harness.KafkaRecord) {
+	records := ctx.Kafka.Records(kHEventsTopicName)
 	ctx.Assert(len(records) > i, "the topic holds %d record(s), expected at least %d (topics: %v)", len(records), i+1, ctx.Kafka.Topics())
 	var event map[string]any
 	ctx.NoError(json.Unmarshal(records[i].Value, &event), "the record's value is not JSON: %s", records[i].Value)
@@ -939,21 +939,21 @@ func eventAt(ctx *harness.Ctx, i int) (map[string]any, harness.KafkaRecord) {
 
 func CheckKeyHash(ctx *harness.Ctx) {
 	now := time.Now()
-	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, now)
-	finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, now)
-	finish(context.Background(), "key-b2c9", "r-3", allowDecision(), eventsAnswer, now)
-	records := ctx.Kafka.Records(eventsTopicName)
-	ctx.Equal(len(records), 3, "three finish() calls must produce three records on %s; the records", eventsTopicName)
-	keys := ctx.Kafka.Keys(eventsTopicName)
+	finish(context.Background(), kHEventsKey, "r-1", hAllowDecision(), kHEventsAnswer, now)
+	finish(context.Background(), kHEventsKey, "r-2", hAllowDecision(), kHEventsAnswer, now)
+	finish(context.Background(), "key-b2c9", "r-3", hAllowDecision(), kHEventsAnswer, now)
+	records := ctx.Kafka.Records(kHEventsTopicName)
+	ctx.Equal(len(records), 3, "three finish() calls must produce three records on %s; the records", kHEventsTopicName)
+	keys := ctx.Kafka.Keys(kHEventsTopicName)
 	ctx.Assert(keys[0] != "r-1", "the record is keyed by the request id: one caller's events scatter across partitions and a replay of one caller is a scan of the whole topic")
-	ctx.Equal(keys[0], eventsKeyHash(), "the record key must be the first 16 hex characters of the SHA-256 of the API key")
-	ctx.Assert(keys[1] == eventsKeyHash() && keys[2] != eventsKeyHash(), "keys over three calls were %q: the same API key must give the same key, another key another", keys)
+	ctx.Equal(keys[0], hEventsKeyHash(), "the record key must be the first 16 hex characters of the SHA-256 of the API key")
+	ctx.Assert(keys[1] == hEventsKeyHash() && keys[2] != hEventsKeyHash(), "keys over three calls were %q: the same API key must give the same key, another key another", keys)
 	ctx.Equal(records[0].Partition, records[1].Partition, "two events of one caller landed on different partitions: the key must be the same for every request of a caller, and the writer needs Balancer: &kafka.Hash{} (kafka-go's default is round robin); k1's partitions")
-	event, record := eventAt(ctx, 0)
-	ctx.Equal(event["key_hash"], eventsKeyHash(), "the payload's key_hash")
-	ctx.Assert(!strings.Contains(string(record.Value), eventsKey), "the API key itself is in the payload: %s. Only its hash may reach a retained topic", record.Value)
+	event, record := hEventAt(ctx, 0)
+	ctx.Equal(event["key_hash"], hEventsKeyHash(), "the payload's key_hash")
+	ctx.Assert(!strings.Contains(string(record.Value), kHEventsKey), "the API key itself is in the payload: %s. Only its hash may reach a retained topic", record.Value)
 	var missing []string
-	for _, f := range eventsFields {
+	for _, f := range hEventsFields {
 		if _, ok := event[f]; !ok {
 			missing = append(missing, f)
 		}
@@ -962,16 +962,16 @@ func CheckKeyHash(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, time.Now())
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopicName)), 1, "one finish() must leave one record; the records")
-	lost := ctx.Kafka.Failover(eventsTopicName)
-	ctx.Assert(lost == 0 && len(ctx.Kafka.Records(eventsTopicName)) == 1, "after a leader failover the event is gone: it was acknowledged by nobody or the leader alone (kafka-go's default RequiredAcks is RequireNone), the writer needs RequiredAcks: kafka.RequireAll")
-	finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, time.Now())
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopicName)), 2, "after the failover the writer must keep producing; the records")
+	finish(context.Background(), kHEventsKey, "r-1", hAllowDecision(), kHEventsAnswer, time.Now())
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopicName)), 1, "one finish() must leave one record; the records")
+	lost := ctx.Kafka.Failover(kHEventsTopicName)
+	ctx.Assert(lost == 0 && len(ctx.Kafka.Records(kHEventsTopicName)) == 1, "after a leader failover the event is gone: it was acknowledged by nobody or the leader alone (kafka-go's default RequiredAcks is RequireNone), the writer needs RequiredAcks: kafka.RequireAll")
+	finish(context.Background(), kHEventsKey, "r-2", hAllowDecision(), kHEventsAnswer, time.Now())
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopicName)), 2, "after the failover the writer must keep producing; the records")
 }
 
 // textLeak is the first 8-byte piece of text found in the log, or "".
-func textLeak(text, logged string) string {
+func hTextLeak(text, logged string) string {
 	for i := 0; i+8 <= len(text); i++ {
 		if strings.Contains(logged, text[i:i+8]) {
 			return text[i : i+8]
@@ -985,15 +985,15 @@ func CheckNoText(ctx *harness.Ctx) {
 	log.SetOutput(&logged)
 	started := time.Now()
 	ctx.Clock.Advance(0.25)
-	finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsAnswer, started)
-	event, record := eventAt(ctx, 0)
+	finish(context.Background(), kHEventsKey, "r-1", hAllowDecision(), kHEventsAnswer, started)
+	event, record := hEventAt(ctx, 0)
 	ctx.Assert(!strings.Contains(string(record.Value), "zebra-pangolin"), "the event carries the model's answer: %s. The topic is retained and replicated; the answer stays out", record.Value)
-	finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsLeaky, time.Now())
-	for _, tc := range []struct{ what, text string }{{"the model's answer", eventsAnswer}, {"an answer that needed redacting, before or after", eventsLeaky}} {
-		piece := textLeak(tc.text, logged.String())
+	finish(context.Background(), kHEventsKey, "r-2", hAllowDecision(), kHEventsLeaky, time.Now())
+	for _, tc := range []struct{ what, text string }{{"the model's answer", kHEventsAnswer}, {"an answer that needed redacting, before or after", kHEventsLeaky}} {
+		piece := hTextLeak(tc.text, logged.String())
 		ctx.Assert(piece == "", "a log line carries %s (%q of it): %q. Log the request id, the action and the counts", tc.what, piece, logged.String())
 	}
-	ctx.Assert(!strings.Contains(logged.String(), eventsKey), "a log line carries the API key itself: %q. The key appears nowhere; its key_hash identifies the caller", logged.String())
+	ctx.Assert(!strings.Contains(logged.String(), kHEventsKey), "a log line carries the API key itself: %q. The key appears nowhere; its key_hash identifies the caller", logged.String())
 	latency, _ := event["latency_ms"].(float64)
 	ctx.Assert(latency >= 200 && latency <= 2000, "latency_ms is %v for a request started 250 ms ago, expected around 250", event["latency_ms"])
 	ctx.Assert(event["action"] == "allow" && event["score"] == float64(90), "the payload must carry the decision's action and score: %s", record.Value)
@@ -1001,23 +1001,23 @@ func CheckNoText(ctx *harness.Ctx) {
 }
 
 func CheckRedact(ctx *harness.Ctx) {
-	out := finish(context.Background(), eventsKey, "r-1", allowDecision(), eventsLeaky, time.Now())
+	out := finish(context.Background(), kHEventsKey, "r-1", hAllowDecision(), kHEventsLeaky, time.Now())
 	var left []string
-	for _, secret := range eventsSecrets {
+	for _, secret := range hEventsSecrets {
 		if strings.Contains(out, secret) {
 			left = append(left, secret)
 		}
 	}
 	ctx.Assert(len(left) == 0, "the response reached the client with %q still in it: %q. cardPattern covers 13 to 19 digits, apiKeyPattern sk- and key- keys of any case", left, out)
-	ctx.Equal(out, eventsRedactedLeaky, "the response (every card number and key replaced with [REDACTED], the rest untouched)")
-	event, record := eventAt(ctx, 0)
+	ctx.Equal(out, kHEventsRedactedLeaky, "the response (every card number and key replaced with [REDACTED], the rest untouched)")
+	event, record := hEventAt(ctx, 0)
 	ctx.Equal(event["redactions"], 6, "the event's redactions (four card numbers and two keys, one per hit)")
 	ctx.Assert(!strings.Contains(string(record.Value), "4111"), "the card number is in the event: %s", record.Value)
-	clean := finish(context.Background(), eventsKey, "r-2", allowDecision(), eventsAnswer, time.Now())
-	ctx.Equal(clean, eventsAnswer, "a clean answer must come through unchanged")
-	event, _ = eventAt(ctx, 1)
+	clean := finish(context.Background(), kHEventsKey, "r-2", hAllowDecision(), kHEventsAnswer, time.Now())
+	ctx.Equal(clean, kHEventsAnswer, "a clean answer must come through unchanged")
+	event, _ = hEventAt(ctx, 1)
 	ctx.Equal(event["redactions"], 0, "a clean answer's event's redactions")
-	dashed := finish(context.Background(), eventsKey, "r-3", allowDecision(), "Try 4111-1111-1111-1111 next.", time.Now())
+	dashed := finish(context.Background(), kHEventsKey, "r-3", hAllowDecision(), "Try 4111-1111-1111-1111 next.", time.Now())
 	ctx.Equal(dashed, "Try [REDACTED] next.", "a dashed card number must be redacted too")
 }
 `,
@@ -1035,32 +1035,32 @@ func CheckRedact(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopicName = "ai.firewall.events";
-const std::string kEventsKey = "key-7f3a";
-const std::string kEventsAnswer = "The zebra-pangolin tunnel opens at dawn.";
-const std::string kEventsLeaky =
+const std::string kHEventsTopicName = "ai.firewall.events";
+const std::string kHEventsKey = "key-7f3a";
+const std::string kHEventsAnswer = "The zebra-pangolin tunnel opens at dawn.";
+const std::string kHEventsLeaky =
     "Card 4111 1111 1111 1111 is on file, Amex 3782 822463 10005 and 4222222222222 too; old card"
     " 6011-0009-9013-9424-123 expired. Use sk-AbCdEfGhIjKlMnOpQrStUv123456 or key-ABCDEFGHIJKLMNOPQRSTUV12"
     " for the API, done.";
-const std::string kEventsRedactedLeaky =
+const std::string kHEventsRedactedLeaky =
     "Card [REDACTED] is on file, Amex [REDACTED] and [REDACTED] too; old card [REDACTED] expired."
     " Use [REDACTED] or [REDACTED] for the API, done.";
-const std::vector<std::string> kEventsSecrets = {"4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC"};
-const std::vector<std::string> kEventsFields = {"request_id", "key_hash", "action", "score",
+const std::vector<std::string> kHEventsSecrets = {"4111", "3782", "10005", "4222222222222", "6011", "sk-AbC", "key-ABC"};
+const std::vector<std::string> kHEventsFields = {"request_id", "key_hash", "action", "score",
                                                 "tags",       "reason",   "latency_ms", "redactions"};
 
-std::string eventsKeyHash() {
+std::string hEventsKeyHash() {
   unsigned char digest[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char*>(kEventsKey.data()), kEventsKey.size(), digest);
+  SHA256(reinterpret_cast<const unsigned char*>(kHEventsKey.data()), kHEventsKey.size(), digest);
   std::ostringstream hex;
   for (unsigned char byte : digest) hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
   return hex.str().substr(0, 16);
 }
 
-Decision allowDecision() { return Decision{"allow", 90, {"travel"}, ""}; }
+Decision hAllowDecision() { return Decision{"allow", 90, {"travel"}, ""}; }
 
 // The first 8-byte piece of text found in the log, or "".
-std::string textLeak(const std::string& text, const std::string& logged) {
+std::string hTextLeak(const std::string& text, const std::string& logged) {
   for (size_t i = 0; i + 8 <= text.size(); i++) {
     if (logged.find(text.substr(i, 8)) != std::string::npos) return text.substr(i, 8);
   }
@@ -1068,8 +1068,8 @@ std::string textLeak(const std::string& text, const std::string& logged) {
 }
 
 // The i-th record's payload.
-std::pair<nlohmann::json, harness::KafkaRecord> eventAt(harness::Ctx& ctx, size_t i) {
-  const auto records = ctx.Kafka.Records(kEventsTopicName);
+std::pair<nlohmann::json, harness::KafkaRecord> hEventAt(harness::Ctx& ctx, size_t i) {
+  const auto records = ctx.Kafka.Records(kHEventsTopicName);
   ctx.Assert(records.size() > i, "the topic holds %d record(s), expected at least %d (topics: %v)", records.size(), i + 1,
              ctx.Kafka.Topics());
   nlohmann::json event = nlohmann::json::parse(records[i].Value.value_or(""), nullptr, false);
@@ -1078,13 +1078,13 @@ std::pair<nlohmann::json, harness::KafkaRecord> eventAt(harness::Ctx& ctx, size_
 }
 
 // Everything the learner writes to cerr, clog or cout while alive.
-struct CaptureLogs {
+struct HCaptureLogs {
   std::ostringstream lines;
   std::streambuf* err;
   std::streambuf* clg;
   std::streambuf* out;
-  CaptureLogs() : err(std::cerr.rdbuf(lines.rdbuf())), clg(std::clog.rdbuf(lines.rdbuf())), out(std::cout.rdbuf(lines.rdbuf())) {}
-  ~CaptureLogs() {
+  HCaptureLogs() : err(std::cerr.rdbuf(lines.rdbuf())), clg(std::clog.rdbuf(lines.rdbuf())), out(std::cout.rdbuf(lines.rdbuf())) {}
+  ~HCaptureLogs() {
     std::cerr.rdbuf(err);
     std::clog.rdbuf(clg);
     std::cout.rdbuf(out);
@@ -1095,45 +1095,45 @@ struct CaptureLogs {
 
 void CheckKeyHash(harness::Ctx& ctx) {
   const auto now = std::chrono::steady_clock::now();
-  finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, now);
-  finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, now);
-  finish("key-b2c9", "r-3", allowDecision(), kEventsAnswer, now);
-  const auto records = ctx.Kafka.Records(kEventsTopicName);
-  ctx.Equal(records.size(), 3, "three finish() calls must produce three records on %s; the records", kEventsTopicName);
-  const auto keys = ctx.Kafka.Keys(kEventsTopicName);
+  finish(kHEventsKey, "r-1", hAllowDecision(), kHEventsAnswer, now);
+  finish(kHEventsKey, "r-2", hAllowDecision(), kHEventsAnswer, now);
+  finish("key-b2c9", "r-3", hAllowDecision(), kHEventsAnswer, now);
+  const auto records = ctx.Kafka.Records(kHEventsTopicName);
+  ctx.Equal(records.size(), 3, "three finish() calls must produce three records on %s; the records", kHEventsTopicName);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopicName);
   ctx.Assert(keys[0] != "r-1",
              "the record is keyed by the request id: one caller's events scatter across partitions and a replay of one "
              "caller is a scan of the whole topic");
-  ctx.Equal(keys[0], eventsKeyHash(), "the record key must be the first 16 hex characters of the SHA-256 of the API key");
-  ctx.Assert(keys[1] == eventsKeyHash() && keys[2] != eventsKeyHash(),
+  ctx.Equal(keys[0], hEventsKeyHash(), "the record key must be the first 16 hex characters of the SHA-256 of the API key");
+  ctx.Assert(keys[1] == hEventsKeyHash() && keys[2] != hEventsKeyHash(),
              "keys over three calls were %q: the same API key must give the same key, another key another", keys);
   ctx.Equal(records[0].Partition, records[1].Partition,
             "two events of one caller landed on different partitions: the key must be the same for every request of a "
             "caller; k1's partitions");
-  const auto [event, record] = eventAt(ctx, 0);
-  ctx.Equal(event.value("key_hash", ""), eventsKeyHash(), "the payload's key_hash");
-  ctx.Assert(record.Value.value_or("").find(kEventsKey) == std::string::npos,
+  const auto [event, record] = hEventAt(ctx, 0);
+  ctx.Equal(event.value("key_hash", ""), hEventsKeyHash(), "the payload's key_hash");
+  ctx.Assert(record.Value.value_or("").find(kHEventsKey) == std::string::npos,
              "the API key itself is in the payload: %s. Only its hash may reach a retained topic", record.Value.value_or(""));
   std::vector<std::string> missing;
-  for (const auto& f : kEventsFields)
+  for (const auto& f : kHEventsFields)
     if (!event.contains(f)) missing.push_back(f);
   ctx.Assert(missing.empty(), "the payload lacks %v: %s", missing, record.Value.value_or(""));
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopicName, 1);
-  finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());
+  ctx.Kafka.LoseAcks(kHEventsTopicName, 1);
+  finish(kHEventsKey, "r-1", hAllowDecision(), kHEventsAnswer, std::chrono::steady_clock::now());
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopicName).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopicName).size(), 1,
             "one finish() whose acknowledgement was lost must leave one record on the topic: the producer retried and "
             "the broker wrote it again, enable.idempotence makes the retry a no-op (it needs acks=all); the records");
-  ctx.Kafka.Failover(kEventsTopicName);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopicName).size(), 1,
+  ctx.Kafka.Failover(kHEventsTopicName);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopicName).size(), 1,
             "after a leader failover the event is gone: it was acknowledged by the leader alone, the producer needs "
             "acks=all; the records");
-  finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());
+  finish(kHEventsKey, "r-2", hAllowDecision(), kHEventsAnswer, std::chrono::steady_clock::now());
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopicName).size(), 2, "after the failover the producer must keep producing; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopicName).size(), 2, "after the failover the producer must keep producing; the records");
 }
 
 void CheckNoText(harness::Ctx& ctx) {
@@ -1141,23 +1141,23 @@ void CheckNoText(harness::Ctx& ctx) {
   ctx.Clock.Advance(0.25);
   std::string logged;
   {
-    CaptureLogs capture;
-    finish(kEventsKey, "r-1", allowDecision(), kEventsAnswer, started);
-    finish(kEventsKey, "r-2", allowDecision(), kEventsLeaky, std::chrono::steady_clock::now());
+    HCaptureLogs capture;
+    finish(kHEventsKey, "r-1", hAllowDecision(), kHEventsAnswer, started);
+    finish(kHEventsKey, "r-2", hAllowDecision(), kHEventsLeaky, std::chrono::steady_clock::now());
     logged = capture.lines.str();
   }
-  const auto [event, record] = eventAt(ctx, 0);
+  const auto [event, record] = hEventAt(ctx, 0);
   ctx.Assert(record.Value.value_or("").find("zebra-pangolin") == std::string::npos,
              "the event carries the model's answer: %s. The topic is retained and replicated; the answer stays out",
              record.Value.value_or(""));
   const std::pair<std::string, std::string> texts[] = {
-      {"the model's answer", kEventsAnswer}, {"an answer that needed redacting, before or after", kEventsLeaky}};
+      {"the model's answer", kHEventsAnswer}, {"an answer that needed redacting, before or after", kHEventsLeaky}};
   for (const auto& [what, text] : texts) {
-    const std::string piece = textLeak(text, logged);
+    const std::string piece = hTextLeak(text, logged);
     ctx.Assert(piece.empty(), "a log line carries %s (%q of it): %q. Log the request id, the action and the counts", what,
                piece, logged);
   }
-  ctx.Assert(logged.find(kEventsKey) == std::string::npos,
+  ctx.Assert(logged.find(kHEventsKey) == std::string::npos,
              "a log line carries the API key itself: %q. The key appears nowhere; its key_hash identifies the caller",
              logged);
   const double latency = event.value("latency_ms", -1.0);
@@ -1170,25 +1170,25 @@ void CheckNoText(harness::Ctx& ctx) {
 }
 
 void CheckRedact(harness::Ctx& ctx) {
-  const std::string out = finish(kEventsKey, "r-1", allowDecision(), kEventsLeaky, std::chrono::steady_clock::now());
+  const std::string out = finish(kHEventsKey, "r-1", hAllowDecision(), kHEventsLeaky, std::chrono::steady_clock::now());
   std::vector<std::string> left;
-  for (const auto& secret : kEventsSecrets)
+  for (const auto& secret : kHEventsSecrets)
     if (out.find(secret) != std::string::npos) left.push_back(secret);
   ctx.Assert(left.empty(),
              "the response reached the client with %v still in it: %q. kCardPattern covers 13 to 19 digits, "
              "kApiKeyPattern sk- and key- keys of any case",
              left, out);
-  ctx.Equal(out, kEventsRedactedLeaky,
+  ctx.Equal(out, kHEventsRedactedLeaky,
             "the response (every card number and key replaced with [REDACTED], the rest untouched)");
-  const auto [event, record] = eventAt(ctx, 0);
+  const auto [event, record] = hEventAt(ctx, 0);
   ctx.Equal(event.value("redactions", -1), 6, "the event's redactions (four card numbers and two keys, one per hit)");
   ctx.Assert(record.Value.value_or("").find("4111") == std::string::npos, "the card number is in the event: %s",
              record.Value.value_or(""));
-  const std::string clean = finish(kEventsKey, "r-2", allowDecision(), kEventsAnswer, std::chrono::steady_clock::now());
-  ctx.Equal(clean, kEventsAnswer, "a clean answer must come through unchanged");
-  ctx.Equal(eventAt(ctx, 1).first.value("redactions", -1), 0, "a clean answer's event's redactions");
+  const std::string clean = finish(kHEventsKey, "r-2", hAllowDecision(), kHEventsAnswer, std::chrono::steady_clock::now());
+  ctx.Equal(clean, kHEventsAnswer, "a clean answer must come through unchanged");
+  ctx.Equal(hEventAt(ctx, 1).first.value("redactions", -1), 0, "a clean answer's event's redactions");
   const std::string dashed =
-      finish(kEventsKey, "r-3", allowDecision(), "Try 4111-1111-1111-1111 next.", std::chrono::steady_clock::now());
+      finish(kHEventsKey, "r-3", hAllowDecision(), "Try 4111-1111-1111-1111 next.", std::chrono::steady_clock::now());
   ctx.Equal(dashed, "Try [REDACTED] next.", "a dashed card number must be redacted too");
 }
 `,

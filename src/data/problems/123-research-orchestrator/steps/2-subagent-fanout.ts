@@ -837,14 +837,14 @@ import (
 )
 
 var (
-	leadBg        = context.Background()
-	factBudget    = jobs.Budget{MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000}
-	compareBudget = jobs.Budget{MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000}
-	deepBudget    = jobs.Budget{MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000}
-	transcript    = strings.Repeat("PAGE-DUMP annual report 2024, page 1 of 300. ", 1000)
+	hLeadBg        = context.Background()
+	hFactBudget    = jobs.Budget{MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000}
+	hCompareBudget = jobs.Budget{MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000}
+	hDeepBudget    = jobs.Budget{MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000}
+	hTranscript    = strings.Repeat("PAGE-DUMP annual report 2024, page 1 of 300. ", 1000)
 )
 
-func testPlan(n int) []jobs.Task {
+func hTestPlan(n int) []jobs.Task {
 	plan := make([]jobs.Task, n)
 	for i := range plan {
 		plan[i] = jobs.Task{
@@ -856,13 +856,13 @@ func testPlan(n int) []jobs.Task {
 	return plan
 }
 
-func findingsOf(taskID string, chars int) string {
+func hFindingsOf(taskID string, chars int) string {
 	return string([]rune(strings.Repeat(taskID+": présidente, CEO and nine non-executive directors; ", 200))[:chars])
 }
 
 // subagentPeer answers every task after its delay; a 10 s latency makes the calls' start times show
 // how many ran together.
-type subagentPeer struct {
+type HSubagentPeer struct {
 	pb.UnimplementedSubagentServer
 	size   int
 	delays map[string]time.Duration // extra work per task
@@ -870,27 +870,27 @@ type subagentPeer struct {
 	empty  map[string]bool          // tasks whose subagent found nothing
 }
 
-func (p *subagentPeer) Run(_ context.Context, req *pb.RunRequest) (*pb.RunReply, error) {
+func (p *HSubagentPeer) Run(_ context.Context, req *pb.RunRequest) (*pb.RunReply, error) {
 	id := req.GetTaskId()
 	time.Sleep(p.delays[id])
 	if p.crash[id] {
 		return nil, status.Error(codes.Unavailable, "subagent crashed")
 	}
 	if p.empty[id] {
-		return &pb.RunReply{Transcript: transcript, Tokens: 1200}, nil
+		return &pb.RunReply{Transcript: hTranscript, Tokens: 1200}, nil
 	}
-	return &pb.RunReply{Findings: findingsOf(id, p.size), Transcript: transcript, Tokens: 1200}, nil
+	return &pb.RunReply{Findings: hFindingsOf(id, p.size), Transcript: hTranscript, Tokens: 1200}, nil
 }
 
-func lead(ctx *harness.Ctx, size int) *subagentPeer {
-	peer := &subagentPeer{size: size}
+func hLead(ctx *harness.Ctx, size int) *HSubagentPeer {
+	peer := &HSubagentPeer{size: size}
 	pb.RegisterSubagentServer(ctx.GRPC.Server(""), peer)
 	ctx.GRPC.SetLatency("Run", 10, "")
 	return peer
 }
 
 // peak is the most calls (from the n-th on) that started at the same instant.
-func peak(ctx *harness.Ctx, from int) int {
+func hPeak(ctx *harness.Ctx, from int) int {
 	counts := map[time.Time]int{}
 	best := 0
 	for _, c := range ctx.GRPC.CallsTo("Run", "")[from:] {
@@ -900,7 +900,7 @@ func peak(ctx *harness.Ctx, from int) int {
 	return best
 }
 
-func ran(ctx *harness.Ctx) []string {
+func hRan(ctx *harness.Ctx) []string {
 	var ids []string
 	for _, c := range ctx.GRPC.CallsTo("Run", "") {
 		ids = append(ids, c.Request.(*pb.RunRequest).GetTaskId())
@@ -910,34 +910,34 @@ func ran(ctx *harness.Ctx) []string {
 }
 
 func CheckParallel(ctx *harness.Ctx) {
-	lead(ctx, 120)
-	notes := runSubagents(leadBg, "job-1", testPlan(10), deepBudget)
+	hLead(ctx, 120)
+	notes := runSubagents(hLeadBg, "job-1", hTestPlan(10), hDeepBudget)
 	ctx.Equal(len(notes), 10, "a deep job over a plan of 10 tasks; the notes")
-	ctx.Equal(peak(ctx, 0), 5, "subagents must run in parallel batches of maxParallelSubagents = 5; the most that started together on a deep job of 10 tasks")
+	ctx.Equal(hPeak(ctx, 0), 5, "subagents must run in parallel batches of maxParallelSubagents = 5; the most that started together on a deep job of 10 tasks")
 	before := len(ctx.GRPC.CallsTo("Run", ""))
-	runSubagents(leadBg, "job-2", testPlan(4), compareBudget)
-	ctx.Equal(peak(ctx, before), 4, "a compare job (MaxSubagents 4) must run its 4 together; the most that started together")
+	runSubagents(hLeadBg, "job-2", hTestPlan(4), hCompareBudget)
+	ctx.Equal(hPeak(ctx, before), 4, "a compare job (MaxSubagents 4) must run its 4 together; the most that started together")
 }
 
 func CheckFanoutCap(ctx *harness.Ctx) {
-	lead(ctx, 120)
-	notes := runSubagents(leadBg, "job-1", testPlan(12), compareBudget)
-	ctx.Equal(ran(ctx), []string{"t-1", "t-2", "t-3", "t-4"}, "a planner that returned 12 tasks on a budget of 4 subagents: run only the first MaxSubagents tasks; the tasks run")
+	hLead(ctx, 120)
+	notes := runSubagents(hLeadBg, "job-1", hTestPlan(12), hCompareBudget)
+	ctx.Equal(hRan(ctx), []string{"t-1", "t-2", "t-3", "t-4"}, "a planner that returned 12 tasks on a budget of 4 subagents: run only the first MaxSubagents tasks; the tasks run")
 	ctx.Equal(len(notes), 4, "the notes")
-	runSubagents(leadBg, "job-2", testPlan(3), factBudget)
+	runSubagents(hLeadBg, "job-2", hTestPlan(3), hFactBudget)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Run", ""))-4, 1, "a fact job; the subagents run")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer := lead(ctx, 120)
-	runSubagents(leadBg, "job-1", testPlan(3), compareBudget)
+	peer := hLead(ctx, 120)
+	runSubagents(hLeadBg, "job-1", hTestPlan(3), hCompareBudget)
 	for _, call := range ctx.GRPC.CallsTo("Run", "") {
 		ctx.Assert(call.HasDeadline(), "a Subagent.Run call carries no deadline: one hung subagent holds the whole job")
 		ctx.Assert(119*time.Second <= call.Timeout && call.Timeout <= 121*time.Second, "a Subagent.Run call carries a %v deadline, expected subagentDeadline = 120 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Run", 600, "")
 	started := ctx.Clock.Now()
-	notes := runSubagents(leadBg, "job-2", testPlan(2), compareBudget)
+	notes := runSubagents(hLeadBg, "job-2", hTestPlan(2), hCompareBudget)
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	for _, note := range notes {
 		ctx.Assert(strings.Contains(note, "no result"), "a subagent that hangs for 600 s gave the note %.60q: after 120 s it must be a 'no result' note", note)
@@ -947,8 +947,8 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("Run", 100, "")
 	peer.crash = map[string]bool{"t-3": true}
 	before := len(ctx.GRPC.CallsTo("Run", ""))
-	plan := testPlan(10)
-	notes = runSubagents(leadBg, "job-3", plan, deepBudget)
+	plan := hTestPlan(10)
+	notes = runSubagents(hLeadBg, "job-3", plan, hDeepBudget)
 	for _, call := range ctx.GRPC.CallsTo("Run", "")[before:] {
 		ctx.Assert(call.HasDeadline() && 119*time.Second <= call.Timeout && call.Timeout <= 121*time.Second,
 			"on a deep job of two batches Subagent.Run for %s carried a %v deadline: every call gets subagentDeadline of its own, not what is left of one deadline for the fan-out",
@@ -960,14 +960,14 @@ func CheckDeadline(ctx *harness.Ctx) {
 			ctx.Assert(strings.HasPrefix(notes[i], "[t-3] no result"), "the subagent for t-3 failed Unavailable but its note is %.60q, expected a 'no result' note", notes[i])
 			continue
 		}
-		ctx.Assert(notes[i] == "["+task.ID+"] "+findingsOf(task.ID, 120), "the note for %s is %.60q, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did", task.ID, notes[i])
+		ctx.Assert(notes[i] == "["+task.ID+"] "+hFindingsOf(task.ID, 120), "the note for %s is %.60q, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did", task.ID, notes[i])
 	}
 }
 
 func CheckTaskSpec(ctx *harness.Ctx) {
-	lead(ctx, 120)
-	plan := testPlan(3)
-	runSubagents(leadBg, "job-1", plan, compareBudget)
+	hLead(ctx, 120)
+	plan := hTestPlan(3)
+	runSubagents(hLeadBg, "job-1", plan, hCompareBudget)
 	sent := map[string]*pb.RunRequest{}
 	for _, c := range ctx.GRPC.CallsTo("Run", "") {
 		req := c.Request.(*pb.RunRequest)
@@ -983,12 +983,12 @@ func CheckTaskSpec(ctx *harness.Ctx) {
 }
 
 func CheckCondense(ctx *harness.Ctx) {
-	peer := lead(ctx, 6000)
+	peer := hLead(ctx, 6000)
 	// t-1 works longest and t-4 answers first; t-2's subagent found nothing.
 	peer.delays = map[string]time.Duration{"t-1": 30 * time.Second, "t-2": 20 * time.Second, "t-3": 10 * time.Second}
 	peer.empty = map[string]bool{"t-2": true}
-	plan := testPlan(4)
-	notes := runSubagents(leadBg, "job-1", plan, compareBudget)
+	plan := hTestPlan(4)
+	notes := runSubagents(hLeadBg, "job-1", plan, hCompareBudget)
 	ctx.Equal(len(notes), 4, "a compare job over a plan of 4 tasks; the notes")
 	order := []string{}
 	for i, task := range plan {
@@ -997,7 +997,7 @@ func CheckCondense(ctx *harness.Ctx) {
 	}
 	ctx.Equal(order, []string{"[t-1]", "[t-2]", "[t-3]", "[t-4]"}, "keep the plan's order, not the order the subagents answered in; the notes' order")
 	for i, task := range plan {
-		found := findingsOf(task.ID, 4000)
+		found := hFindingsOf(task.ID, 4000)
 		if task.ID == "t-2" {
 			found = ""
 		}
@@ -1020,19 +1020,19 @@ func CheckCondense(ctx *harness.Ctx) {
 
 namespace {
 
-const jobs::Budget kFact{1, 10, 50000};
-const jobs::Budget kCompare{4, 60, 250000};
-const jobs::Budget kDeep{10, 150, 1000000};
+const jobs::Budget kHFact{1, 10, 50000};
+const jobs::Budget kHCompare{4, 60, 250000};
+const jobs::Budget kHDeep{10, 150, 1000000};
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
 }
 
-const std::string kTranscript = repeat("PAGE-DUMP annual report 2024, page 1 of 300. ", 1000);
+const std::string kHTranscript = hRepeat("PAGE-DUMP annual report 2024, page 1 of 300. ", 1000);
 
-std::vector<jobs::Task> testPlan(int n) {
+std::vector<jobs::Task> hTestPlan(int n) {
   std::vector<jobs::Task> plan;
   for (int i = 1; i <= n; i++) {
     plan.push_back({"t-" + std::to_string(i), "Find the board members of bank " + std::to_string(i), "one line per member: name, role, since",
@@ -1042,7 +1042,7 @@ std::vector<jobs::Task> testPlan(int n) {
 }
 
 // The first n characters of UTF-8 text (a continuation byte is 10xxxxxx).
-std::string utf8Prefix(const std::string& s, size_t n) {
+std::string hUtf8Prefix(const std::string& s, size_t n) {
   size_t end = 0;
   for (size_t chars = 0; end < s.size() && chars < n; chars++) {
     end++;
@@ -1051,12 +1051,12 @@ std::string utf8Prefix(const std::string& s, size_t n) {
   return s.substr(0, end);
 }
 
-std::string findingsOf(const std::string& task_id, size_t chars) {
-  return utf8Prefix(repeat(task_id + ": présidente, CEO and nine non-executive directors; ", 200), chars);
+std::string hFindingsOf(const std::string& task_id, size_t chars) {
+  return hUtf8Prefix(hRepeat(task_id + ": présidente, CEO and nine non-executive directors; ", 200), chars);
 }
 
 // Answers every task after its delay; a 10 s latency makes the calls' start times show how many ran together.
-class SubagentPeer final : public researchd::Subagent::Service {
+class HSubagentPeer final : public researchd::Subagent::Service {
  public:
   size_t size = 120;
   std::map<std::string, int> delay_s;  // extra work per task
@@ -1066,17 +1066,17 @@ class SubagentPeer final : public researchd::Subagent::Service {
     const auto delay = delay_s.find(req->task_id());
     if (delay != delay_s.end()) std::this_thread::sleep_for(std::chrono::seconds(delay->second));
     if (crash.count(req->task_id())) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "subagent crashed");
-    if (!empty.count(req->task_id())) out->set_findings(findingsOf(req->task_id(), size));
-    out->set_transcript(kTranscript);
+    if (!empty.count(req->task_id())) out->set_findings(hFindingsOf(req->task_id(), size));
+    out->set_transcript(kHTranscript);
     out->set_tokens(1200);
     return grpc::Status::OK;
   }
 };
 
-SubagentPeer& lead(harness::Ctx& ctx, size_t size) {
-  static SubagentPeer* peer = nullptr;
+HSubagentPeer& hLead(harness::Ctx& ctx, size_t size) {
+  static HSubagentPeer* peer = nullptr;
   delete peer;
-  peer = new SubagentPeer;
+  peer = new HSubagentPeer;
   peer->size = size;
   ctx.GRPC.Server("")->RegisterService(peer);
   ctx.GRPC.SetLatency("Run", 10);
@@ -1084,7 +1084,7 @@ SubagentPeer& lead(harness::Ctx& ctx, size_t size) {
 }
 
 // The most calls (from the n-th on) that started at the same instant.
-int peak(harness::Ctx& ctx, size_t from) {
+int hPeak(harness::Ctx& ctx, size_t from) {
   std::map<long long, int> counts;
   int best = 0;
   const auto calls = ctx.GRPC.CallsTo("Run");
@@ -1094,7 +1094,7 @@ int peak(harness::Ctx& ctx, size_t from) {
   return best;
 }
 
-std::vector<std::string> ran(harness::Ctx& ctx) {
+std::vector<std::string> hRan(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& c : ctx.GRPC.CallsTo("Run")) ids.push_back(c.Request<researchd::RunRequest>().task_id());
   std::sort(ids.begin(), ids.end());
@@ -1104,34 +1104,34 @@ std::vector<std::string> ran(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckParallel(harness::Ctx& ctx) {
-  lead(ctx, 120);
-  const auto notes = runSubagents("job-1", testPlan(10), kDeep);
+  hLead(ctx, 120);
+  const auto notes = runSubagents("job-1", hTestPlan(10), kHDeep);
   ctx.Equal(notes.size(), 10, "a deep job over a plan of 10 tasks; the notes");
-  ctx.Equal(peak(ctx, 0), 5, "subagents must run in parallel batches of kMaxParallelSubagents = 5; the most that started together on a deep job of 10 tasks");
+  ctx.Equal(hPeak(ctx, 0), 5, "subagents must run in parallel batches of kMaxParallelSubagents = 5; the most that started together on a deep job of 10 tasks");
   const size_t before = ctx.GRPC.CallsTo("Run").size();
-  runSubagents("job-2", testPlan(4), kCompare);
-  ctx.Equal(peak(ctx, before), 4, "a compare job (max_subagents 4) must run its 4 together; the most that started together");
+  runSubagents("job-2", hTestPlan(4), kHCompare);
+  ctx.Equal(hPeak(ctx, before), 4, "a compare job (max_subagents 4) must run its 4 together; the most that started together");
 }
 
 void CheckFanoutCap(harness::Ctx& ctx) {
-  lead(ctx, 120);
-  const auto notes = runSubagents("job-1", testPlan(12), kCompare);
-  ctx.Equal(ran(ctx), {"t-1", "t-2", "t-3", "t-4"}, "a planner that returned 12 tasks on a budget of 4 subagents: run only the first max_subagents tasks; the tasks run");
+  hLead(ctx, 120);
+  const auto notes = runSubagents("job-1", hTestPlan(12), kHCompare);
+  ctx.Equal(hRan(ctx), {"t-1", "t-2", "t-3", "t-4"}, "a planner that returned 12 tasks on a budget of 4 subagents: run only the first max_subagents tasks; the tasks run");
   ctx.Equal(notes.size(), 4, "the notes");
-  runSubagents("job-2", testPlan(3), kFact);
+  runSubagents("job-2", hTestPlan(3), kHFact);
   ctx.Equal(ctx.GRPC.CallsTo("Run").size() - 4, 1, "a fact job; the subagents run");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  SubagentPeer& peer = lead(ctx, 120);
-  runSubagents("job-1", testPlan(3), kCompare);
+  HSubagentPeer& peer = hLead(ctx, 120);
+  runSubagents("job-1", hTestPlan(3), kHCompare);
   for (const auto& call : ctx.GRPC.CallsTo("Run")) {
     ctx.Assert(call.HasDeadline(), "a Subagent.Run call carries no deadline: one hung subagent holds the whole job");
     ctx.Assert(119 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 121, "a Subagent.Run call carries a %v s deadline, expected kSubagentDeadlineS = 120", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Run", 600);
   const int64_t started = ctx.Clock.Now();
-  auto notes = runSubagents("job-2", testPlan(2), kCompare);
+  auto notes = runSubagents("job-2", hTestPlan(2), kHCompare);
   const double waited = (ctx.Clock.Now() - started) / 1000.0;
   for (const auto& note : notes) {
     ctx.Assert(note.find("no result") != std::string::npos, "a subagent that hangs for 600 s gave the note %q: after 120 s it must be a 'no result' note", note.substr(0, 60));
@@ -1141,8 +1141,8 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Run", 100);
   peer.crash = {"t-3"};
   const size_t before = ctx.GRPC.CallsTo("Run").size();
-  const auto plan = testPlan(10);
-  notes = runSubagents("job-3", plan, kDeep);
+  const auto plan = hTestPlan(10);
+  notes = runSubagents("job-3", plan, kHDeep);
   const auto calls = ctx.GRPC.CallsTo("Run");
   for (size_t i = before; i < calls.size(); i++) {
     ctx.Assert(calls[i].HasDeadline() && 119 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 121,
@@ -1154,16 +1154,16 @@ void CheckDeadline(harness::Ctx& ctx) {
     if (plan[i].id == "t-3") {
       ctx.Assert(notes[i].rfind("[t-3] no result", 0) == 0, "the subagent for t-3 failed UNAVAILABLE but its note is %q, expected a 'no result' note", notes[i].substr(0, 60));
     } else {
-      ctx.Assert(notes[i] == "[" + plan[i].id + "] " + findingsOf(plan[i].id, 120),
+      ctx.Assert(notes[i] == "[" + plan[i].id + "] " + hFindingsOf(plan[i].id, 120),
                  "the note for %s is %q, expected its findings: a subagent that answers within its deadline keeps its result, whatever its batch or a sibling did", plan[i].id, notes[i].substr(0, 60));
     }
   }
 }
 
 void CheckTaskSpec(harness::Ctx& ctx) {
-  lead(ctx, 120);
-  const auto plan = testPlan(3);
-  runSubagents("job-1", plan, kCompare);
+  hLead(ctx, 120);
+  const auto plan = hTestPlan(3);
+  runSubagents("job-1", plan, kHCompare);
   std::map<std::string, researchd::RunRequest> sent;
   for (const auto& c : ctx.GRPC.CallsTo("Run")) {
     const auto req = c.Request<researchd::RunRequest>();
@@ -1181,12 +1181,12 @@ void CheckTaskSpec(harness::Ctx& ctx) {
 }
 
 void CheckCondense(harness::Ctx& ctx) {
-  SubagentPeer& peer = lead(ctx, 6000);
+  HSubagentPeer& peer = hLead(ctx, 6000);
   // t-1 works longest and t-4 answers first; t-2's subagent found nothing.
   peer.delay_s = {{"t-1", 30}, {"t-2", 20}, {"t-3", 10}};
   peer.empty = {"t-2"};
-  const auto plan = testPlan(4);
-  const auto notes = runSubagents("job-1", plan, kCompare);
+  const auto plan = hTestPlan(4);
+  const auto notes = runSubagents("job-1", plan, kHCompare);
   ctx.Equal(notes.size(), 4, "a compare job over a plan of 4 tasks; the notes");
   std::vector<std::string> order;
   for (size_t i = 0; i < plan.size(); i++) {
@@ -1195,7 +1195,7 @@ void CheckCondense(harness::Ctx& ctx) {
   }
   ctx.Equal(order, {"[t-1]", "[t-2]", "[t-3]", "[t-4]"}, "keep the plan's order, not the order the subagents answered in; the notes' order");
   for (size_t i = 0; i < plan.size(); i++) {
-    const std::string found = plan[i].id == "t-2" ? "" : findingsOf(plan[i].id, 4000);
+    const std::string found = plan[i].id == "t-2" ? "" : hFindingsOf(plan[i].id, 4000);
     ctx.Assert(notes[i] == "[" + plan[i].id + "] " + found,
                "the note for %s is %d bytes, expected '[%s] ' and the findings cut to kMaxFindingsChars = 4000 characters (not bytes: a byte cut splits a character)", plan[i].id, notes[i].size(), plan[i].id);
   }

@@ -798,30 +798,30 @@ import (
 )
 
 const (
-	eventsTopic   = "billing.usage"
-	eventsText    = "Your refund for order 4417 was approved on Monday."
-	eventsVersion = "rates-2026-11-01"
+	kHEventsTopic   = "billing.usage"
+	kHEventsText    = "Your refund for order 4417 was approved on Monday."
+	kHEventsVersion = "rates-2026-11-01"
 )
 
 // pieces of the completion: a preview or a slice of it leaks it as surely as the whole text
-var eventsFragments = []string{"Your refund", "order 4417", "approved on Monday"}
+var hEventsFragments = []string{"Your refund", "order 4417", "approved on Monday"}
 
-// eventsEvent is the event for eventsUsage(n, "t1", "gpt-4o"), as JSON decodes it.
-func eventsEvent(n string) map[string]any {
-	return map[string]any{"usage_id": "u-" + n, "idempotency_key": "k-" + n, "tenant_id": "t1", "model": "gpt-4o", "input_tokens": float64(1200), "output_tokens": float64(300), "cost_micros": float64(6000), "rate_version": eventsVersion}
+// hEventsEvent is the event for eventsUsage(n, "t1", "gpt-4o"), as JSON decodes it.
+func hEventsEvent(n string) map[string]any {
+	return map[string]any{"usage_id": "u-" + n, "idempotency_key": "k-" + n, "tenant_id": "t1", "model": "gpt-4o", "input_tokens": float64(1200), "output_tokens": float64(300), "cost_micros": float64(6000), "rate_version": kHEventsVersion}
 }
 
-func eventsUsage(n, tenant, model string) records.UsageRecord {
-	return records.UsageRecord{UsageID: "u-" + n, IdempotencyKey: "k-" + n, TenantID: tenant, Model: model, InputTokens: 1200, OutputTokens: 300, CostMicros: 6000, RateVersion: eventsVersion, OutputText: eventsText}
+func hEventsUsage(n, tenant, model string) records.UsageRecord {
+	return records.UsageRecord{UsageID: "u-" + n, IdempotencyKey: "k-" + n, TenantID: tenant, Model: model, InputTokens: 1200, OutputTokens: 300, CostMicros: 6000, RateVersion: kHEventsVersion, OutputText: kHEventsText}
 }
 
-func eventsPublish(ctx *harness.Ctx, u records.UsageRecord) bool {
+func hEventsPublish(ctx *harness.Ctx, u records.UsageRecord) bool {
 	ok, err := publishUsage(context.Background(), u)
 	ctx.NoError(err, "publishUsage(%s)", u.UsageID)
 	return ok
 }
 
-func eventsDecode(ctx *harness.Ctx, raw []string) []map[string]any {
+func hEventsDecode(ctx *harness.Ctx, raw []string) []map[string]any {
 	var out []map[string]any
 	for _, r := range raw {
 		var e map[string]any
@@ -831,71 +831,71 @@ func eventsDecode(ctx *harness.Ctx, raw []string) []map[string]any {
 	return out
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
-	return eventsDecode(ctx, ctx.Redis.LRange("billing:outbox", 0, -1))
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
+	return hEventsDecode(ctx, ctx.Redis.LRange("billing:outbox", 0, -1))
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsUsage("1", "t1", "gpt-4o"))
-	eventsPublish(ctx, eventsUsage("2", "t2", "gpt-4o"))
-	eventsPublish(ctx, eventsUsage("3", "t1", "gpt-4o-mini"))
+	hEventsPublish(ctx, hEventsUsage("1", "t1", "gpt-4o"))
+	hEventsPublish(ctx, hEventsUsage("2", "t2", "gpt-4o"))
+	hEventsPublish(ctx, hEventsUsage("3", "t1", "gpt-4o-mini"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three reports must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"t1", "t2", "t1"}, "the records must be keyed by the tenant ids (keyed by model, one tenant's charges spread over partitions)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three reports must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"t1", "t2", "t1"}, "the records must be keyed by the tenant ids (keyed by model, one tenant's charges spread over partitions)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both t1 events must land on one partition, or the ledger applies t1's charges out of order; the partitions")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsUsage("7", "t1", "gpt-4o"))
+	hEventsPublish(ctx, hEventsUsage("7", "t1", "gpt-4o"))
 	ctx.Settle()
-	all := eventsDecode(ctx, ctx.Kafka.Values(eventsTopic))
+	all := hEventsDecode(ctx, ctx.Kafka.Values(kHEventsTopic))
 	ctx.Equal(len(all), 1, "one report; records")
-	ctx.Equal(all[0], eventsEvent("7"),
+	ctx.Equal(all[0], hEventsEvent("7"),
 		"the event must carry usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, and nothing else (without the idempotency key the ledger cannot tell a retry from a second charge, and a field outside the contract is where tenant content leaks)")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsUsage("1", "t1", "gpt-4o"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsUsage("1", "t1", "gpt-4o"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not bill the report twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsUsage("2", "t1", "gpt-4o"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not bill the report twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsUsage("2", "t1", "gpt-4o"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a charge (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a charge (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsUsage("1", "t1", "gpt-4o"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, hEventsUsage("1", "t1", "gpt-4o"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: a refused charge must be kept for the relay, not dropped; outbox rows")
-	ctx.Equal(rows[0], eventsEvent("1"), "the outbox row must be the event itself")
+	ctx.Equal(rows[0], hEventsEvent("1"), "the outbox row must be the event itself")
 	ctx.Equal(ok, false, "publishUsage's result after a refused produce")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
-	ctx.Assert(eventsPublish(ctx, eventsUsage("2", "t1", "gpt-4o")), "a healthy produce returns true")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing reached the topic for the refused produce; records")
+	ctx.Assert(hEventsPublish(ctx, hEventsUsage("2", "t1", "gpt-4o")), "a healthy produce returns true")
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsUsage("3", "t1", "gpt-4o"))
+	ok = hEventsPublish(ctx, hEventsUsage("3", "t1", "gpt-4o"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishUsage waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["usage_id"] == "u-3", "no report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishUsage's result without a delivery report")
 }
 
 func CheckNoContent(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsPublish(ctx, eventsUsage("1", "t1", "gpt-4o"))
-	eventsPublish(ctx, eventsUsage("2", "t1", "gpt-4o"))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsPublish(ctx, hEventsUsage("1", "t1", "gpt-4o"))
+	hEventsPublish(ctx, hEventsUsage("2", "t1", "gpt-4o"))
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) > 0, "the healthy report must reach the topic")
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
-		for _, fragment := range eventsFragments {
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) > 0, "the healthy report must reach the topic")
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
+		for _, fragment := range hEventsFragments {
 			ctx.Assert(!strings.Contains(value, fragment), "the event carries the completion text: %s; the topic is retained and replicated", value)
 		}
 		var e map[string]any
@@ -904,7 +904,7 @@ func CheckNoContent(ctx *harness.Ctx) {
 		ctx.Assert(!has, "the event has an output_text field: %s", value)
 	}
 	for _, row := range ctx.Redis.LRange("billing:outbox", 0, -1) {
-		for _, fragment := range eventsFragments {
+		for _, fragment := range hEventsFragments {
 			ctx.Assert(!strings.Contains(row, fragment), "the outbox row carries the completion text: %s", row)
 		}
 	}
@@ -920,114 +920,114 @@ func CheckNoContent(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "billing.usage";
-const std::string kText = "Your refund for order 4417 was approved on Monday.";
-const std::string kVersion = "rates-2026-11-01";
+const std::string kHEventsTopic = "billing.usage";
+const std::string kHText = "Your refund for order 4417 was approved on Monday.";
+const std::string kHVersion = "rates-2026-11-01";
 // pieces of the completion: a preview or a slice of it leaks it as surely as the whole text
-const std::vector<std::string> kFragments = {"Your refund", "order 4417", "approved on Monday"};
+const std::vector<std::string> kHFragments = {"Your refund", "order 4417", "approved on Monday"};
 
-records::UsageRecord eventsUsage(const std::string& n, const std::string& tenant, const std::string& model) {
-  return {"u-" + n, "k-" + n, tenant, model, 1200, 300, 6000, kVersion, kText};
+records::UsageRecord hEventsUsage(const std::string& n, const std::string& tenant, const std::string& model) {
+  return {"u-" + n, "k-" + n, tenant, model, 1200, 300, 6000, kHVersion, kHText};
 }
 
 // The event for eventsUsage(n, "t1", "gpt-4o").
-nlohmann::json eventsEvent(const std::string& n) {
+nlohmann::json hEventsEvent(const std::string& n) {
   return {{"usage_id", "u-" + n}, {"idempotency_key", "k-" + n}, {"tenant_id", "t1"}, {"model", "gpt-4o"}, {"input_tokens", 1200},
-          {"output_tokens", 300}, {"cost_micros", 6000}, {"rate_version", kVersion}};
+          {"output_tokens", 300}, {"cost_micros", 6000}, {"rate_version", kHVersion}};
 }
 
-bool leaks(const std::string& text) {
-  for (const auto& fragment : kFragments) {
+bool hLeaks(const std::string& text) {
+  for (const auto& fragment : kHFragments) {
     if (text.find(fragment) != std::string::npos) return true;
   }
   return false;
 }
 
-std::vector<nlohmann::json> decode(const std::vector<std::string>& raw) {
+std::vector<nlohmann::json> hDecode(const std::vector<std::string>& raw) {
   std::vector<nlohmann::json> out;
   for (const auto& r : raw) out.push_back(nlohmann::json::parse(r, nullptr, false));
   return out;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) { return decode(ctx.Redis.LRange("billing:outbox", 0, -1)); }
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) { return hDecode(ctx.Redis.LRange("billing:outbox", 0, -1)); }
 
-std::string str(const nlohmann::json& j, const std::string& field) {
+std::string hStr(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  publish_usage(eventsUsage("1", "t1", "gpt-4o"));
-  publish_usage(eventsUsage("2", "t2", "gpt-4o"));
-  publish_usage(eventsUsage("3", "t1", "gpt-4o-mini"));
+  publish_usage(hEventsUsage("1", "t1", "gpt-4o"));
+  publish_usage(hEventsUsage("2", "t2", "gpt-4o"));
+  publish_usage(hEventsUsage("3", "t1", "gpt-4o-mini"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three reports must produce three records on billing.usage; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"t1", "t2", "t1"}, "the records must be keyed by the tenant ids (keyed by model, one tenant's charges spread over partitions)");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"t1", "t2", "t1"}, "the records must be keyed by the tenant ids (keyed by model, one tenant's charges spread over partitions)");
   ctx.Equal(records[0].Partition, records[2].Partition, "both t1 events must land on one partition, or the ledger applies t1's charges out of order; the partitions");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  publish_usage(eventsUsage("7", "t1", "gpt-4o"));
+  publish_usage(hEventsUsage("7", "t1", "gpt-4o"));
   ctx.Settle();
-  const auto all = decode(ctx.Kafka.Values(kEventsTopic));
+  const auto all = hDecode(ctx.Kafka.Values(kHEventsTopic));
   ctx.Equal(all.size(), 1, "one report; records");
-  ctx.Equal(all[0], eventsEvent("7"),
+  ctx.Equal(all[0], hEventsEvent("7"),
             "the event must carry usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, and nothing else (without the idempotency key the ledger cannot tell a retry from a second charge, and a field outside the contract is where tenant content leaks)");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publish_usage(eventsUsage("1", "t1", "gpt-4o"));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publish_usage(hEventsUsage("1", "t1", "gpt-4o"));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not bill the report twice (enable.idempotence); the records");
-  publish_usage(eventsUsage("2", "t1", "gpt-4o"));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not bill the report twice (enable.idempotence); the records");
+  publish_usage(hEventsUsage("2", "t1", "gpt-4o"));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a charge (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a charge (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = true;
   try {
-    ok = publish_usage(eventsUsage("1", "t1", "gpt-4o"));
+    ok = publish_usage(hEventsUsage("1", "t1", "gpt-4o"));
   } catch (const std::exception& e) {
     ctx.Fatalf("publish_usage threw when the broker refused the produce: %s; the event goes to the outbox", e.what());
   }
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: a refused charge must be kept for the relay, not dropped; outbox rows");
-  ctx.Equal(rows[0], eventsEvent("1"), "the outbox row must be the event itself");
+  ctx.Equal(rows[0], hEventsEvent("1"), "the outbox row must be the event itself");
   ctx.Equal(ok, false, "publish_usage's result after a refused produce");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
-  ctx.Assert(publish_usage(eventsUsage("2", "t1", "gpt-4o")), "a healthy produce returns true");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
+  ctx.Assert(publish_usage(hEventsUsage("2", "t1", "gpt-4o")), "a healthy produce returns true");
   ctx.Settle();
-  ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Assert(ctx.Kafka.Records(kHEventsTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publish_usage(eventsUsage("3", "t1", "gpt-4o"));
+  ok = publish_usage(hEventsUsage("3", "t1", "gpt-4o"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publish_usage waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && str(rows[1], "usage_id") == "u-3", "no report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hStr(rows[1], "usage_id") == "u-3", "no report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish_usage's result without a delivery report");
 }
 
 void CheckNoContent(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  publish_usage(eventsUsage("1", "t1", "gpt-4o"));
-  publish_usage(eventsUsage("2", "t1", "gpt-4o"));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  publish_usage(hEventsUsage("1", "t1", "gpt-4o"));
+  publish_usage(hEventsUsage("2", "t1", "gpt-4o"));
   ctx.Settle();
-  ctx.Assert(!ctx.Kafka.Records(kEventsTopic).empty(), "the healthy report must reach the topic");
-  for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
-    ctx.Assert(!leaks(value), "the event carries the completion text: %s; the topic is retained and replicated", value);
+  ctx.Assert(!ctx.Kafka.Records(kHEventsTopic).empty(), "the healthy report must reach the topic");
+  for (const auto& value : ctx.Kafka.Values(kHEventsTopic)) {
+    ctx.Assert(!hLeaks(value), "the event carries the completion text: %s; the topic is retained and replicated", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(!e.is_object() || !e.contains("output_text"), "the event has an output_text field: %s", value);
   }
   for (const auto& row : ctx.Redis.LRange("billing:outbox", 0, -1)) {
-    ctx.Assert(!leaks(row), "the outbox row carries the completion text: %s", row);
+    ctx.Assert(!hLeaks(row), "the outbox row carries the completion text: %s", row);
   }
 }
 `,

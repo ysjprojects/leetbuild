@@ -952,125 +952,125 @@ import (
 )
 
 const (
-	stateTenant = "t1"
-	stateName   = "support-reply"
+	kHStateTenant = "t1"
+	kHStateName   = "support-reply"
 )
 
 var (
-	stateLive    = config.LiveKey(stateTenant, stateName)
-	stateHistory = config.HistoryKey(stateTenant, stateName)
-	stateAudit   = config.AuditKey(stateTenant, stateName)
+	hStateLive    = config.LiveKey(kHStateTenant, kHStateName)
+	hStateHistory = config.HistoryKey(kHStateTenant, kHStateName)
+	hStateAudit   = config.AuditKey(kHStateTenant, kHStateName)
 )
 
-func stateRegister(ctx *harness.Ctx, versions ...int) {
+func hStateRegister(ctx *harness.Ctx, versions ...int) {
 	for _, v := range versions {
-		record, _ := json.Marshal(map[string]any{"name": stateName, "version": v, "content_hash": fmt.Sprintf("h%d", v), "template": fmt.Sprintf("text %d", v), "variables": []string{}})
-		ctx.Redis.Set(config.VersionKey(stateTenant, stateName, v), string(record))
+		record, _ := json.Marshal(map[string]any{"name": kHStateName, "version": v, "content_hash": fmt.Sprintf("h%d", v), "template": fmt.Sprintf("text %d", v), "variables": []string{}})
+		ctx.Redis.Set(config.VersionKey(kHStateTenant, kHStateName, v), string(record))
 	}
 }
 
-func statePromote(ctx *harness.Ctx, version int) *Swap {
-	swap, err := promote(context.Background(), stateTenant, stateName, version, "alice")
+func hStatePromote(ctx *harness.Ctx, version int) *Swap {
+	swap, err := promote(context.Background(), kHStateTenant, kHStateName, version, "alice")
 	ctx.NoError(err, "promote(%d)", version)
 	return swap
 }
 
-func stateRollback(ctx *harness.Ctx) *Swap {
-	swap, err := rollback(context.Background(), stateTenant, stateName, "oncall")
+func hStateRollback(ctx *harness.Ctx) *Swap {
+	swap, err := rollback(context.Background(), kHStateTenant, kHStateName, "oncall")
 	ctx.NoError(err, "rollback")
 	return swap
 }
 
-func stateLiveNow(ctx *harness.Ctx) string {
-	live, _ := ctx.Redis.Get(stateLive)
+func hStateLiveNow(ctx *harness.Ctx) string {
+	live, _ := ctx.Redis.Get(hStateLive)
 	return live
 }
 
-func stateAuditEntries(ctx *harness.Ctx) [][]string {
+func hStateAuditEntries(ctx *harness.Ctx) [][]string {
 	var out [][]string
-	for _, entry := range ctx.Redis.LRange(stateAudit, 0, -1) {
+	for _, entry := range ctx.Redis.LRange(hStateAudit, 0, -1) {
 		out = append(out, strings.Split(entry, "|"))
 	}
 	return out
 }
 
-func stateSnapshot(ctx *harness.Ctx) string {
-	return fmt.Sprint(stateLiveNow(ctx), ctx.Redis.LRange(stateHistory, 0, -1), ctx.Redis.LRange(stateAudit, 0, -1))
+func hStateSnapshot(ctx *harness.Ctx) string {
+	return fmt.Sprint(hStateLiveNow(ctx), ctx.Redis.LRange(hStateHistory, 0, -1), ctx.Redis.LRange(hStateAudit, 0, -1))
 }
 
 func CheckAtomicPromote(ctx *harness.Ctx) {
-	stateRegister(ctx, 1, 4, 5)
-	ctx.Assert(statePromote(ctx, 1) != nil, "promoting registered version 1 returned nil")
+	hStateRegister(ctx, 1, 4, 5)
+	ctx.Assert(hStatePromote(ctx, 1) != nil, "promoting registered version 1 returned nil")
 	fired := false
 	// another operator promotes version 5 with one atomic script, between two of this promotion's commands
-	ctx.Redis.After(stateLive, func() any {
+	ctx.Redis.After(hStateLive, func() any {
 		fired = true
-		previous, ok := ctx.Redis.Get(stateLive)
+		previous, ok := ctx.Redis.Get(hStateLive)
 		if !ok {
 			previous = "0"
 		}
-		ctx.Redis.Set(stateLive, "5")
-		ctx.Redis.Do("RPUSH", stateHistory, "5")
-		ctx.Redis.Do("RPUSH", stateAudit, "promote|"+previous+"|5|bob|0")
+		ctx.Redis.Set(hStateLive, "5")
+		ctx.Redis.Do("RPUSH", hStateHistory, "5")
+		ctx.Redis.Do("RPUSH", hStateAudit, "promote|"+previous+"|5|bob|0")
 		return nil
 	})
-	statePromote(ctx, 4)
+	hStatePromote(ctx, 4)
 	ctx.Assert(fired, "promote never touched the live pointer")
-	entries := stateAuditEntries(ctx)
+	entries := hStateAuditEntries(ctx)
 	for i := 1; i < len(entries); i++ {
 		before, after := entries[i-1], entries[i]
-		ctx.Assert(after[1] == before[2], "the audit says %s %s to %s, then %s from %s: another promotion landed between two of this one's commands, and the audit no longer describes what happened (%v)", before[0], before[1], before[2], after[0], after[1], ctx.Redis.LRange(stateAudit, 0, -1))
+		ctx.Assert(after[1] == before[2], "the audit says %s %s to %s, then %s from %s: another promotion landed between two of this one's commands, and the audit no longer describes what happened (%v)", before[0], before[1], before[2], after[0], after[1], ctx.Redis.LRange(hStateAudit, 0, -1))
 	}
-	live := stateLiveNow(ctx)
+	live := hStateLiveNow(ctx)
 	ctx.Equal(entries[len(entries)-1][2], live, "the last audit entry's version against the live one")
-	history := ctx.Redis.LRange(stateHistory, -1, -1)
+	history := ctx.Redis.LRange(hStateHistory, -1, -1)
 	ctx.Assert(len(history) == 1 && history[0] == live, "the history ends at %v but version %s is live: a rollback would restore the wrong version", history, live)
 }
 
 func CheckRegisteredOnly(ctx *harness.Ctx) {
-	stateRegister(ctx, 1)
-	statePromote(ctx, 1)
-	before := stateSnapshot(ctx)
-	result := statePromote(ctx, 9)
+	hStateRegister(ctx, 1)
+	hStatePromote(ctx, 1)
+	before := hStateSnapshot(ctx)
+	result := hStatePromote(ctx, 9)
 	ctx.Assert(result == nil, "promoting version 9, which was never registered, returned %+v, expected nil", result)
-	ctx.Equal(stateSnapshot(ctx), before, "promoting an unregistered version must leave the pointer (live, history, audit) as it was, or every read of the prompt fails")
-	stateRegister(ctx, 9)
-	result = statePromote(ctx, 9)
-	ctx.Assert(result != nil && result.From == 1 && result.To == 9 && stateLiveNow(ctx) == "9", "once registered, version 9 promotes from 1: got %+v, live %s", result, stateLiveNow(ctx))
+	ctx.Equal(hStateSnapshot(ctx), before, "promoting an unregistered version must leave the pointer (live, history, audit) as it was, or every read of the prompt fails")
+	hStateRegister(ctx, 9)
+	result = hStatePromote(ctx, 9)
+	ctx.Assert(result != nil && result.From == 1 && result.To == 9 && hStateLiveNow(ctx) == "9", "once registered, version 9 promotes from 1: got %+v, live %s", result, hStateLiveNow(ctx))
 }
 
 func CheckRollbackPrevious(ctx *harness.Ctx) {
-	stateRegister(ctx, 1, 4, 7)
+	hStateRegister(ctx, 1, 4, 7)
 	for _, v := range []int{1, 4, 7} {
-		statePromote(ctx, v)
+		hStatePromote(ctx, v)
 	}
-	swap := stateRollback(ctx)
-	ctx.Equal(stateLiveNow(ctx), "4", "rolling back from 7 must put 4 live, the version live before 7 (6 was never promoted); the live version")
+	swap := hStateRollback(ctx)
+	ctx.Equal(hStateLiveNow(ctx), "4", "rolling back from 7 must put 4 live, the version live before 7 (6 was never promoted); the live version")
 	ctx.Assert(swap != nil && swap.From == 7 && swap.To == 4, "the rollback must answer from 7 to 4, got %+v", swap)
-	stateRollback(ctx)
-	ctx.Equal(stateLiveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version")
-	third := stateRollback(ctx)
-	ctx.Assert(third == nil && stateLiveNow(ctx) == "1", "with nothing earlier a rollback returns nil and leaves 1 live: got %+v, live %s", third, stateLiveNow(ctx))
-	ctx.Equal(ctx.Redis.LRange(stateHistory, 0, -1), []string{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history")
-	tail := ctx.Redis.LRange(stateAudit, -2, -1)
-	ctx.Assert(len(tail) == 2 && strings.HasPrefix(tail[0], "rollback|7|4|oncall|") && strings.HasPrefix(tail[1], "rollback|4|1|oncall|"), "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(stateAudit, 0, -1))
+	hStateRollback(ctx)
+	ctx.Equal(hStateLiveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version")
+	third := hStateRollback(ctx)
+	ctx.Assert(third == nil && hStateLiveNow(ctx) == "1", "with nothing earlier a rollback returns nil and leaves 1 live: got %+v, live %s", third, hStateLiveNow(ctx))
+	ctx.Equal(ctx.Redis.LRange(hStateHistory, 0, -1), []string{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history")
+	tail := ctx.Redis.LRange(hStateAudit, -2, -1)
+	ctx.Assert(len(tail) == 2 && strings.HasPrefix(tail[0], "rollback|7|4|oncall|") && strings.HasPrefix(tail[1], "rollback|4|1|oncall|"), "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(hStateAudit, 0, -1))
 }
 
 func CheckLiveUncached(ctx *harness.Ctx) {
-	none, err := liveVersion(context.Background(), stateTenant, "never-promoted")
+	none, err := liveVersion(context.Background(), kHStateTenant, "never-promoted")
 	ctx.NoError(err, "liveVersion")
 	ctx.Equal(none, 0, "before any promotion liveVersion is 0")
-	stateRegister(ctx, 1, 4)
-	statePromote(ctx, 1)
-	statePromote(ctx, 4)
-	seen, err := liveVersion(context.Background(), stateTenant, stateName)
+	hStateRegister(ctx, 1, 4)
+	hStatePromote(ctx, 1)
+	hStatePromote(ctx, 4)
+	seen, err := liveVersion(context.Background(), kHStateTenant, kHStateName)
 	ctx.NoError(err, "liveVersion")
 	ctx.Equal(seen, 4, "after promoting 4 the reader must see 4")
 	// another replica rolls back to 1
-	ctx.Redis.Set(stateLive, "1")
-	ctx.Redis.Do("RPOP", stateHistory)
-	ctx.Redis.Do("RPUSH", stateAudit, "rollback|4|1|oncall|0")
-	seen, err = liveVersion(context.Background(), stateTenant, stateName)
+	ctx.Redis.Set(hStateLive, "1")
+	ctx.Redis.Do("RPOP", hStateHistory)
+	ctx.Redis.Do("RPUSH", hStateAudit, "rollback|4|1|oncall|0")
+	seen, err = liveVersion(context.Background(), kHStateTenant, kHStateName)
 	ctx.NoError(err, "liveVersion")
 	ctx.Equal(seen, 1, "the next read after a rollback: a cached pointer keeps the bad version live for minutes on every replica; the version served")
 }
@@ -1085,22 +1085,22 @@ func CheckLiveUncached(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kT = "t1";
-const std::string kN = "support-reply";
-const std::string kLive = "prompts:live:" + kT + ":" + kN;
-const std::string kHistory = "prompts:history:" + kT + ":" + kN;
-const std::string kAudit = "prompts:audit:" + kT + ":" + kN;
+const std::string kHT = "t1";
+const std::string kHN = "support-reply";
+const std::string kHLive = "prompts:live:" + kHT + ":" + kHN;
+const std::string kHistory = "prompts:history:" + kHT + ":" + kHN;
+const std::string kHAudit = "prompts:audit:" + kHT + ":" + kHN;
 
-void stateRegister(harness::Ctx& ctx, std::initializer_list<int> versions) {
+void hStateRegister(harness::Ctx& ctx, std::initializer_list<int> versions) {
   for (int v : versions) {
-    const nlohmann::json record = {{"name", kN}, {"version", v}, {"content_hash", "h" + std::to_string(v)}, {"template", "text " + std::to_string(v)}, {"variables", nlohmann::json::array()}};
-    ctx.Redis.Set("prompts:version:" + kT + ":" + kN + ":" + std::to_string(v), record.dump());
+    const nlohmann::json record = {{"name", kHN}, {"version", v}, {"content_hash", "h" + std::to_string(v)}, {"template", "text " + std::to_string(v)}, {"variables", nlohmann::json::array()}};
+    ctx.Redis.Set("prompts:version:" + kHT + ":" + kHN + ":" + std::to_string(v), record.dump());
   }
 }
 
-std::string liveNow(harness::Ctx& ctx) { return ctx.Redis.Get(kLive).value_or(""); }
+std::string hLiveNow(harness::Ctx& ctx) { return ctx.Redis.Get(kHLive).value_or(""); }
 
-std::vector<std::string> split(const std::string& entry) {
+std::vector<std::string> hSplit(const std::string& entry) {
   std::vector<std::string> out;
   std::stringstream in(entry);
   std::string part;
@@ -1109,82 +1109,82 @@ std::vector<std::string> split(const std::string& entry) {
   return out;
 }
 
-std::string snapshot(harness::Ctx& ctx) {
-  std::string out = liveNow(ctx) + " [";
+std::string hSnapshot(harness::Ctx& ctx) {
+  std::string out = hLiveNow(ctx) + " [";
   for (const auto& v : ctx.Redis.LRange(kHistory, 0, -1)) out += v + " ";
   out += "] [";
-  for (const auto& e : ctx.Redis.LRange(kAudit, 0, -1)) out += e + " ";
+  for (const auto& e : ctx.Redis.LRange(kHAudit, 0, -1)) out += e + " ";
   return out + "]";
 }
 
 }  // namespace
 
 void CheckAtomicPromote(harness::Ctx& ctx) {
-  stateRegister(ctx, {1, 4, 5});
-  ctx.Assert(promote(kT, kN, 1, "alice").has_value(), "promoting registered version 1 returned nullopt");
+  hStateRegister(ctx, {1, 4, 5});
+  ctx.Assert(promote(kHT, kHN, 1, "alice").has_value(), "promoting registered version 1 returned nullopt");
   bool fired = false;
   // another operator promotes version 5 with one atomic script, between two of this promotion's commands
-  ctx.Redis.After(kLive, [&] {
+  ctx.Redis.After(kHLive, [&] {
     fired = true;
-    const std::string previous = ctx.Redis.Get(kLive).value_or("0");
-    ctx.Redis.Set(kLive, "5");
+    const std::string previous = ctx.Redis.Get(kHLive).value_or("0");
+    ctx.Redis.Set(kHLive, "5");
     ctx.Redis.Do("RPUSH", kHistory, "5");
-    ctx.Redis.Do("RPUSH", kAudit, "promote|" + previous + "|5|bob|0");
+    ctx.Redis.Do("RPUSH", kHAudit, "promote|" + previous + "|5|bob|0");
   });
-  promote(kT, kN, 4, "alice");
+  promote(kHT, kHN, 4, "alice");
   ctx.Assert(fired, "promote never touched the live pointer");
-  const auto raw = ctx.Redis.LRange(kAudit, 0, -1);
+  const auto raw = ctx.Redis.LRange(kHAudit, 0, -1);
   for (size_t i = 1; i < raw.size(); i++) {
-    const auto before = split(raw[i - 1]);
-    const auto after = split(raw[i]);
+    const auto before = hSplit(raw[i - 1]);
+    const auto after = hSplit(raw[i]);
     ctx.Assert(after[1] == before[2], "the audit says %s %s to %s, then %s from %s: another promotion landed between two of this one's commands, and the audit no longer describes what happened (%v)",
                before[0], before[1], before[2], after[0], after[1], raw);
   }
-  const std::string live = liveNow(ctx);
-  ctx.Equal(split(raw.back())[2], live, "the last audit entry's version against the live one");
+  const std::string live = hLiveNow(ctx);
+  ctx.Equal(hSplit(raw.back())[2], live, "the last audit entry's version against the live one");
   const auto history = ctx.Redis.LRange(kHistory, -1, -1);
   ctx.Assert(history.size() == 1 && history[0] == live, "the history ends at %v but version %s is live: a rollback would restore the wrong version", history, live);
 }
 
 void CheckRegisteredOnly(harness::Ctx& ctx) {
-  stateRegister(ctx, {1});
-  promote(kT, kN, 1, "alice");
-  const std::string before = snapshot(ctx);
-  auto result = promote(kT, kN, 9, "alice");
+  hStateRegister(ctx, {1});
+  promote(kHT, kHN, 1, "alice");
+  const std::string before = hSnapshot(ctx);
+  auto result = promote(kHT, kHN, 9, "alice");
   ctx.Assert(!result.has_value(), "promoting version 9, which was never registered, returned a swap, expected nullopt");
-  ctx.Equal(snapshot(ctx), before, "promoting an unregistered version must leave the pointer (live, history, audit) as it was, or every read of the prompt fails");
-  stateRegister(ctx, {9});
-  result = promote(kT, kN, 9, "alice");
-  ctx.Assert(result && result->from == 1 && result->to == 9 && liveNow(ctx) == "9", "once registered, version 9 promotes from 1: live %s", liveNow(ctx));
+  ctx.Equal(hSnapshot(ctx), before, "promoting an unregistered version must leave the pointer (live, history, audit) as it was, or every read of the prompt fails");
+  hStateRegister(ctx, {9});
+  result = promote(kHT, kHN, 9, "alice");
+  ctx.Assert(result && result->from == 1 && result->to == 9 && hLiveNow(ctx) == "9", "once registered, version 9 promotes from 1: live %s", hLiveNow(ctx));
 }
 
 void CheckRollbackPrevious(harness::Ctx& ctx) {
-  stateRegister(ctx, {1, 4, 7});
-  for (int v : {1, 4, 7}) promote(kT, kN, v, "alice");
-  const auto swap = rollback(kT, kN, "oncall");
-  ctx.Equal(liveNow(ctx), "4", "rolling back from 7 must put 4 live, the version live before 7 (6 was never promoted); the live version");
+  hStateRegister(ctx, {1, 4, 7});
+  for (int v : {1, 4, 7}) promote(kHT, kHN, v, "alice");
+  const auto swap = rollback(kHT, kHN, "oncall");
+  ctx.Equal(hLiveNow(ctx), "4", "rolling back from 7 must put 4 live, the version live before 7 (6 was never promoted); the live version");
   ctx.Assert(swap && swap->from == 7 && swap->to == 4, "the rollback must answer from 7 to 4");
-  rollback(kT, kN, "oncall");
-  ctx.Equal(liveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version");
-  const auto third = rollback(kT, kN, "oncall");
-  ctx.Assert(!third && liveNow(ctx) == "1", "with nothing earlier a rollback returns nullopt and leaves 1 live: live %s", liveNow(ctx));
+  rollback(kHT, kHN, "oncall");
+  ctx.Equal(hLiveNow(ctx), "1", "a second rollback must restore 1, the version live before 4; the live version");
+  const auto third = rollback(kHT, kHN, "oncall");
+  ctx.Assert(!third && hLiveNow(ctx) == "1", "with nothing earlier a rollback returns nullopt and leaves 1 live: live %s", hLiveNow(ctx));
   ctx.Equal(ctx.Redis.LRange(kHistory, 0, -1), std::vector<std::string>{"1"}, "a rollback with nothing earlier must change nothing (the next promotion has no version to roll back to); the history");
-  const auto tail = ctx.Redis.LRange(kAudit, -2, -1);
+  const auto tail = ctx.Redis.LRange(kHAudit, -2, -1);
   ctx.Assert(tail.size() == 2 && tail[0].rfind("rollback|7|4|oncall|", 0) == 0 && tail[1].rfind("rollback|4|1|oncall|", 0) == 0,
-             "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(kAudit, 0, -1));
+             "each rollback is audited as rollback|from|to|actor: %v", ctx.Redis.LRange(kHAudit, 0, -1));
 }
 
 void CheckLiveUncached(harness::Ctx& ctx) {
-  ctx.Assert(!live_version(kT, "never-promoted").has_value(), "before any promotion live_version is nullopt");
-  stateRegister(ctx, {1, 4});
-  promote(kT, kN, 1, "alice");
-  promote(kT, kN, 4, "alice");
-  ctx.Equal(live_version(kT, kN).value_or(0), 4, "after promoting 4 the reader must see 4");
+  ctx.Assert(!live_version(kHT, "never-promoted").has_value(), "before any promotion live_version is nullopt");
+  hStateRegister(ctx, {1, 4});
+  promote(kHT, kHN, 1, "alice");
+  promote(kHT, kHN, 4, "alice");
+  ctx.Equal(live_version(kHT, kHN).value_or(0), 4, "after promoting 4 the reader must see 4");
   // another replica rolls back to 1
-  ctx.Redis.Set(kLive, "1");
+  ctx.Redis.Set(kHLive, "1");
   ctx.Redis.Do("RPOP", kHistory);
-  ctx.Redis.Do("RPUSH", kAudit, "rollback|4|1|oncall|0");
-  ctx.Equal(live_version(kT, kN).value_or(0), 1, "the next read after a rollback: a cached pointer keeps the bad version live for minutes on every replica; the version served");
+  ctx.Redis.Do("RPUSH", kHAudit, "rollback|4|1|oncall|0");
+  ctx.Equal(live_version(kHT, kHN).value_or(0), 1, "the next read after a rollback: a cached pointer keeps the bad version live for minutes on every replica; the version served");
 }
 `,
   },

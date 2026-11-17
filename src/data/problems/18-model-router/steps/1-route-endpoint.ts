@@ -1041,21 +1041,21 @@ import (
 )
 
 const (
-	routeCanary = "CANARY-7731 my card number is 4111"
-	routePrompt = "Summarise this ticket in one line."
+	kHRouteCanary = "CANARY-7731 my card number is 4111"
+	kHRoutePrompt = "Summarise this ticket in one line."
 )
 
-func routeServer(ctx *harness.Ctx) *harness.HTTP {
+func hRouteServer(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func routeBody(prompt string, maxTokens int, policy string) map[string]any {
+func hRouteBody(prompt string, maxTokens int, policy string) map[string]any {
 	return map[string]any{"prompt": prompt, "max_tokens": maxTokens, "policy": policy}
 }
 
-func routeAs(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hRouteAs(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	header := []string{"Content-Type", "application/json"}
 	if tenant != "" {
 		header = append(header, "Authorization", "Bearer "+tenant)
@@ -1066,93 +1066,93 @@ func routeAs(c *harness.HTTP, body map[string]any, key, tenant string) *harness.
 	return c.Post("/v1/route", body, header...)
 }
 
-func routeOut(r *harness.Response) map[string]any {
+func hRouteOut(r *harness.Response) map[string]any {
 	out, _ := r.JSON().(map[string]any)
 	return out
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := routeServer(ctx)
-	r := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-1", "acme")
+	c := hRouteServer(ctx)
+	r := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "k-1", "acme")
 	ctx.Equal(r.Status, 200, "POST /v1/route (%s)", r.Text())
 	ctype := r.Header.Get("Content-Type")
 	ctx.Assert(strings.HasPrefix(ctype, "application/json"), "the answer must be JSON, got Content-Type %q", ctype)
-	out := routeOut(r)
+	out := hRouteOut(r)
 	id, _ := out["id"].(string)
 	ctx.Assert(id != "", "the decision carries no id: %s", r.Text())
 	ctx.Equal(out["policy"], "auto", "the decision must name the policy it applied")
 	ctx.Equal(out["estimated_tokens"], float64(9+256), "estimated_tokens (tokens.Estimate(prompt, 256) = 265)")
-	anonymous := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-1", "")
+	anonymous := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "k-1", "")
 	ctx.Equal(anonymous.Status, 401, "a request without a bearer token")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := routeServer(ctx)
+	c := hRouteServer(ctx)
 	bad := []struct {
 		what   string
 		body   map[string]any
 		status int
 	}{
-		{"a prompt of 256 KiB + 1 byte", routeBody(strings.Repeat("x", 1<<18+1), 256, "auto"), 413},
-		{"a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", routeBody(strings.Repeat("é", 1<<17+1), 256, "auto"), 413},
-		{"an empty prompt", routeBody("", 256, "auto"), 400},
-		{"max_tokens 0", routeBody(routePrompt, 0, "auto"), 400},
-		{"max_tokens 4097", routeBody(routePrompt, 4097, "auto"), 400},
+		{"a prompt of 256 KiB + 1 byte", hRouteBody(strings.Repeat("x", 1<<18+1), 256, "auto"), 413},
+		{"a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", hRouteBody(strings.Repeat("é", 1<<17+1), 256, "auto"), 413},
+		{"an empty prompt", hRouteBody("", 256, "auto"), 400},
+		{"max_tokens 0", hRouteBody(kHRoutePrompt, 0, "auto"), 400},
+		{"max_tokens 4097", hRouteBody(kHRoutePrompt, 4097, "auto"), 400},
 	}
 	for i, b := range bad {
-		r := routeAs(c, b.body, fmt.Sprintf("bad-%d", i), "acme")
+		r := hRouteAs(c, b.body, fmt.Sprintf("bad-%d", i), "acme")
 		ctx.Equal(r.Status, b.status, "%s", b.what)
 	}
 	stored := ctx.Redis.Keys("decision:*")
 	ctx.Assert(len(stored) == 0, "rejected requests stored decisions: %v", stored)
-	ok := routeAs(c, routeBody(strings.Repeat("x", 1<<18), 4096, "large"), "edge", "acme")
+	ok := hRouteAs(c, hRouteBody(strings.Repeat("x", 1<<18), 4096, "large"), "edge", "acme")
 	ctx.Equal(ok.Status, 200, "a request at the limits (256 KiB, max_tokens 4096) (%s)", ok.Text())
-	least := routeAs(c, routeBody(routePrompt, 1, "auto"), "edge-1", "acme")
+	least := hRouteAs(c, hRouteBody(kHRoutePrompt, 1, "auto"), "edge-1", "acme")
 	ctx.Equal(least.Status, 200, "a request with max_tokens 1 (%s)", least.Text())
 }
 
 func CheckPolicy(ctx *harness.Ctx) {
-	c := routeServer(ctx)
+	c := hRouteServer(ctx)
 	cases := []struct {
 		what  string
 		body  map[string]any
 		model string
 	}{
-		{"policy small with a long prompt", routeBody(strings.Repeat("x", 20000), 256, "small"), "gpt-4o-mini"},
-		{"policy large with a short prompt", routeBody(routePrompt, 256, "large"), "gpt-4o"},
-		{"policy auto at exactly 2048 estimated tokens", routeBody(strings.Repeat("x", 7168), 256, "auto"), "gpt-4o-mini"},
-		{"policy auto at 2049 estimated tokens", routeBody(strings.Repeat("x", 7172), 256, "auto"), "gpt-4o"},
+		{"policy small with a long prompt", hRouteBody(strings.Repeat("x", 20000), 256, "small"), "gpt-4o-mini"},
+		{"policy large with a short prompt", hRouteBody(kHRoutePrompt, 256, "large"), "gpt-4o"},
+		{"policy auto at exactly 2048 estimated tokens", hRouteBody(strings.Repeat("x", 7168), 256, "auto"), "gpt-4o-mini"},
+		{"policy auto at 2049 estimated tokens", hRouteBody(strings.Repeat("x", 7172), 256, "auto"), "gpt-4o"},
 	}
 	for i, tc := range cases {
-		r := routeAs(c, tc.body, fmt.Sprintf("p-%d", i), "acme")
+		r := hRouteAs(c, tc.body, fmt.Sprintf("p-%d", i), "acme")
 		ctx.Equal(r.Status, 200, "%s (%s)", tc.what, r.Text())
-		ctx.Equal(routeOut(r)["model"], tc.model, "%s: the model", tc.what)
+		ctx.Equal(hRouteOut(r)["model"], tc.model, "%s: the model", tc.what)
 	}
 	for i, policy := range []string{"gpt-4o", "o1-pro"} {
-		r := routeAs(c, routeBody(routePrompt, 256, policy), fmt.Sprintf("x-%d", i), "acme")
+		r := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, policy), fmt.Sprintf("x-%d", i), "acme")
 		ctx.Equal(r.Status, 400, "policy %q answered %s: only auto, small and large are policies, the caller does not name the model; the status", policy, r.Text())
 	}
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := routeServer(ctx)
-	first := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-1", "acme")
+	c := hRouteServer(ctx)
+	first := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "k-1", "acme")
 	ctx.Equal(first.Status, 200, "POST /v1/route (%s)", first.Text())
-	retry := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-1", "acme")
+	retry := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "k-1", "acme")
 	ctx.Equal(retry.Status, 200, "the retry (%s)", retry.Text())
-	ctx.Equal(routeOut(retry)["id"], routeOut(first)["id"], "a retry with the same Idempotency-Key answered a new decision (the client now holds two); the id")
+	ctx.Equal(hRouteOut(retry)["id"], hRouteOut(first)["id"], "a retry with the same Idempotency-Key answered a new decision (the client now holds two); the id")
 	ttl := ctx.Redis.TTL("decision:acme:k-1")
 	ctx.Assert(86000 <= ttl && ttl <= 86400, "decision:acme:k-1 has TTL %d (keys: %v), expected the decision stored for 86400 s", ttl, ctx.Redis.Keys("decision:*"))
-	other := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-1", "beta")
-	ctx.Assert(other.Status == 200 && routeOut(other)["id"] != routeOut(first)["id"], "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant")
-	missing := routeAs(c, routeBody(routePrompt, 256, "auto"), "", "acme")
+	other := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "k-1", "beta")
+	ctx.Assert(other.Status == 200 && hRouteOut(other)["id"] != hRouteOut(first)["id"], "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant")
+	missing := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "", "acme")
 	ctx.Equal(missing.Status, 400, "a request without Idempotency-Key")
 	// Another replica stores its decision for k-2 right after this request's first command on the key.
 	rivalDecision := "{\\"id\\":\\"d-rival\\",\\"model\\":\\"gpt-4o-mini\\",\\"policy\\":\\"auto\\",\\"estimated_tokens\\":265}"
 	rival := ctx.Redis.After("decision:acme:k-2", func() any {
 		return []any{ctx.Redis.Set("decision:acme:k-2", rivalDecision, "EX", 86400, "NX"), ctx.Redis.TTL("decision:acme:k-2")}
 	})
-	raced := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-2", "acme")
+	raced := hRouteAs(c, hRouteBody(kHRoutePrompt, 256, "auto"), "k-2", "acme")
 	ctx.Assert(rival.Fired, "the request with Idempotency-Key k-2 never touched decision:acme:k-2")
 	ctx.Assert(rival.Err == nil, "the rival request failed: %v", rival.Err)
 	got, _ := rival.Result.([]any)
@@ -1165,17 +1165,17 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 			ID string \`json:"id"\`
 		}
 		json.Unmarshal([]byte(stored), &held)
-		ctx.Assert(routeOut(raced)["id"] == "d-rival" && held.ID == "d-rival", "another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered %v and decision:acme:k-2 holds %q: the client holds two decisions. Check and store in one command", routeOut(raced)["id"], held.ID)
+		ctx.Assert(hRouteOut(raced)["id"] == "d-rival" && held.ID == "d-rival", "another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered %v and decision:acme:k-2 holds %q: the client holds two decisions. Check and store in one command", hRouteOut(raced)["id"], held.ID)
 	} else {
 		ctx.Assert(ttlThen > 0 && ttlThen <= 86400, "right after the request stored decision:acme:k-2 its TTL was %d: a crash before the expiry is set keeps the decision for good. Store the decision and its expiry in one command", ttlThen)
 	}
 }
 
 func CheckNoPromptLog(ctx *harness.Ctx) {
-	c := routeServer(ctx)
+	c := hRouteServer(ctx)
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	r := routeAs(c, routeBody(routeCanary, 256, "auto"), "k-1", "acme")
+	r := hRouteAs(c, hRouteBody(kHRouteCanary, 256, "auto"), "k-1", "acme")
 	ctx.Equal(r.Status, 200, "POST /v1/route (%s)", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "CANARY-7731"), "the answer echoes the prompt: %s", r.Text())
 	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was printed or logged: %q", strings.TrimSpace(logged.String()))
@@ -1200,10 +1200,10 @@ func CheckNoPromptLog(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRouteCanary = "CANARY-7731 my card number is 4111";
-const std::string kRoutePrompt = "Summarise this ticket in one line.";
+const std::string kHRouteCanary = "CANARY-7731 my card number is 4111";
+const std::string kHRoutePrompt = "Summarise this ticket in one line.";
 
-harness::HTTP routeServer(harness::Ctx& ctx) {
+harness::HTTP hRouteServer(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1211,17 +1211,17 @@ harness::HTTP routeServer(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string routeBody(const std::string& prompt = kRoutePrompt, int max_tokens = 256, const std::string& policy = "auto") {
+std::string hRouteBody(const std::string& prompt = kHRoutePrompt, int max_tokens = 256, const std::string& policy = "auto") {
   return nlohmann::json{{"prompt", prompt}, {"max_tokens", max_tokens}, {"policy", policy}}.dump();
 }
 
-harness::Response routeAs(harness::HTTP& c, const std::string& body, const std::string& key = "k-1", const std::string& tenant = "acme") {
+harness::Response hRouteAs(harness::HTTP& c, const std::string& body, const std::string& key = "k-1", const std::string& tenant = "acme") {
   if (tenant.empty()) return c.Post("/v1/route", body, "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/route", body, "Authorization", "Bearer " + tenant);
   return c.Post("/v1/route", body, "Authorization", "Bearer " + tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json routeOut(const harness::Response& r) {
+nlohmann::json hRouteOut(const harness::Response& r) {
   const auto out = nlohmann::json::parse(r.Text(), nullptr, false);
   return out.is_object() ? out : nlohmann::json::object();
 }
@@ -1229,21 +1229,21 @@ nlohmann::json routeOut(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = routeServer(ctx);
-  const auto r = routeAs(c, routeBody());
+  auto c = hRouteServer(ctx);
+  const auto r = hRouteAs(c, hRouteBody());
   ctx.Equal(r.Status, 200, "POST /v1/route (%s)", r.Text());
   const std::string ctype = r.HeaderValue("Content-Type");
   ctx.Assert(ctype.rfind("application/json", 0) == 0, "the answer must be JSON, got Content-Type %q", ctype);
-  const auto out = routeOut(r);
+  const auto out = hRouteOut(r);
   ctx.Assert(!out.value("id", "").empty(), "the decision carries no id: %s", r.Text());
   ctx.Equal(out.value("policy", ""), "auto", "the decision must name the policy it applied");
   ctx.Equal(out.value("estimated_tokens", -1LL), 9 + 256LL, "estimated_tokens (routerd::estimate_tokens(prompt, 256) = 265)");
-  const auto anonymous = routeAs(c, routeBody(), "k-1", "");
+  const auto anonymous = hRouteAs(c, hRouteBody(), "k-1", "");
   ctx.Equal(anonymous.Status, 401, "a request without a bearer token");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = routeServer(ctx);
+  auto c = hRouteServer(ctx);
   struct Bad {
     std::string what, body;
     int status;
@@ -1251,59 +1251,59 @@ void CheckValidate(harness::Ctx& ctx) {
   std::string two_byte;
   for (int i = 0; i < (1 << 17) + 1; i++) two_byte += "é";
   const std::vector<Bad> bad = {
-      {"a prompt of 256 KiB + 1 byte", routeBody(std::string((1 << 18) + 1, 'x')), 413},
-      {"a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", routeBody(two_byte), 413},
-      {"an empty prompt", routeBody(""), 400},
-      {"max_tokens 0", routeBody(kRoutePrompt, 0), 400},
-      {"max_tokens 4097", routeBody(kRoutePrompt, 4097), 400},
+      {"a prompt of 256 KiB + 1 byte", hRouteBody(std::string((1 << 18) + 1, 'x')), 413},
+      {"a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", hRouteBody(two_byte), 413},
+      {"an empty prompt", hRouteBody(""), 400},
+      {"max_tokens 0", hRouteBody(kHRoutePrompt, 0), 400},
+      {"max_tokens 4097", hRouteBody(kHRoutePrompt, 4097), 400},
   };
   for (size_t i = 0; i < bad.size(); i++) {
-    const auto r = routeAs(c, bad[i].body, "bad-" + std::to_string(i));
+    const auto r = hRouteAs(c, bad[i].body, "bad-" + std::to_string(i));
     ctx.Equal(r.Status, bad[i].status, "%s", bad[i].what);
   }
   const auto stored = ctx.Redis.Keys("decision:*");
   ctx.Assert(stored.empty(), "rejected requests stored decisions: %v", stored);
-  const auto ok = routeAs(c, routeBody(std::string(1 << 18, 'x'), 4096, "large"), "edge");
+  const auto ok = hRouteAs(c, hRouteBody(std::string(1 << 18, 'x'), 4096, "large"), "edge");
   ctx.Equal(ok.Status, 200, "a request at the limits (256 KiB, max_tokens 4096) (%s)", ok.Text());
-  const auto least = routeAs(c, routeBody(kRoutePrompt, 1), "edge-1");
+  const auto least = hRouteAs(c, hRouteBody(kHRoutePrompt, 1), "edge-1");
   ctx.Equal(least.Status, 200, "a request with max_tokens 1 (%s)", least.Text());
 }
 
 void CheckPolicy(harness::Ctx& ctx) {
-  auto c = routeServer(ctx);
+  auto c = hRouteServer(ctx);
   struct Case {
     std::string what, body, model;
   };
   const std::vector<Case> cases = {
-      {"policy small with a long prompt", routeBody(std::string(20000, 'x'), 256, "small"), "gpt-4o-mini"},
-      {"policy large with a short prompt", routeBody(kRoutePrompt, 256, "large"), "gpt-4o"},
-      {"policy auto at exactly 2048 estimated tokens", routeBody(std::string(7168, 'x')), "gpt-4o-mini"},
-      {"policy auto at 2049 estimated tokens", routeBody(std::string(7172, 'x')), "gpt-4o"},
+      {"policy small with a long prompt", hRouteBody(std::string(20000, 'x'), 256, "small"), "gpt-4o-mini"},
+      {"policy large with a short prompt", hRouteBody(kHRoutePrompt, 256, "large"), "gpt-4o"},
+      {"policy auto at exactly 2048 estimated tokens", hRouteBody(std::string(7168, 'x')), "gpt-4o-mini"},
+      {"policy auto at 2049 estimated tokens", hRouteBody(std::string(7172, 'x')), "gpt-4o"},
   };
   for (size_t i = 0; i < cases.size(); i++) {
-    const auto r = routeAs(c, cases[i].body, "p-" + std::to_string(i));
+    const auto r = hRouteAs(c, cases[i].body, "p-" + std::to_string(i));
     ctx.Equal(r.Status, 200, "%s (%s)", cases[i].what, r.Text());
-    ctx.Equal(routeOut(r).value("model", ""), cases[i].model, "%s: the model", cases[i].what);
+    ctx.Equal(hRouteOut(r).value("model", ""), cases[i].model, "%s: the model", cases[i].what);
   }
   const std::vector<std::string> policies = {"gpt-4o", "o1-pro"};
   for (size_t i = 0; i < policies.size(); i++) {
-    const auto r = routeAs(c, routeBody(kRoutePrompt, 256, policies[i]), "x-" + std::to_string(i));
+    const auto r = hRouteAs(c, hRouteBody(kHRoutePrompt, 256, policies[i]), "x-" + std::to_string(i));
     ctx.Equal(r.Status, 400, "policy %q answered %s: only auto, small and large are policies, the caller does not name the model; the status", policies[i], r.Text());
   }
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = routeServer(ctx);
-  const auto first = routeAs(c, routeBody(), "k-1");
+  auto c = hRouteServer(ctx);
+  const auto first = hRouteAs(c, hRouteBody(), "k-1");
   ctx.Equal(first.Status, 200, "POST /v1/route (%s)", first.Text());
-  const auto retry = routeAs(c, routeBody(), "k-1");
+  const auto retry = hRouteAs(c, hRouteBody(), "k-1");
   ctx.Equal(retry.Status, 200, "the retry (%s)", retry.Text());
-  ctx.Equal(routeOut(retry).value("id", ""), routeOut(first).value("id", ""), "a retry with the same Idempotency-Key answered a new decision (the client now holds two); the id");
+  ctx.Equal(hRouteOut(retry).value("id", ""), hRouteOut(first).value("id", ""), "a retry with the same Idempotency-Key answered a new decision (the client now holds two); the id");
   const long long ttl = ctx.Redis.TTL("decision:acme:k-1");
   ctx.Assert(86000 <= ttl && ttl <= 86400, "decision:acme:k-1 has TTL %d (keys: %v), expected the decision stored for 86400 s", ttl, ctx.Redis.Keys("decision:*"));
-  const auto other = routeAs(c, routeBody(), "k-1", "beta");
-  ctx.Assert(other.Status == 200 && routeOut(other).value("id", "") != routeOut(first).value("id", ""), "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant");
-  const auto missing = routeAs(c, routeBody(), "", "acme");
+  const auto other = hRouteAs(c, hRouteBody(), "k-1", "beta");
+  ctx.Assert(other.Status == 200 && hRouteOut(other).value("id", "") != hRouteOut(first).value("id", ""), "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant");
+  const auto missing = hRouteAs(c, hRouteBody(), "", "acme");
   ctx.Equal(missing.Status, 400, "a request without Idempotency-Key");
   // Another replica stores its decision for k-2 right after this request's first command on the key.
   const std::string rival_decision = nlohmann::json{{"id", "d-rival"}, {"model", "gpt-4o-mini"}, {"policy", "auto"}, {"estimated_tokens", 265}}.dump();
@@ -1320,25 +1320,25 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
       *failed = e.what();
     }
   });
-  const auto raced = routeAs(c, routeBody(), "k-2");
+  const auto raced = hRouteAs(c, hRouteBody(), "k-2");
   ctx.Assert(*fired, "the request with Idempotency-Key k-2 never touched decision:acme:k-2");
   ctx.Assert(failed->empty(), "the rival request failed: %s", *failed);
   ctx.Equal(raced.Status, 200, "the request with Idempotency-Key k-2 (%s)", raced.Text());
   if (*rival_won) {
     const auto held = nlohmann::json::parse(ctx.Redis.Get("decision:acme:k-2").value_or("{}"), nullptr, false);
     const std::string held_id = held.is_object() ? held.value("id", "") : "";
-    ctx.Assert(routeOut(raced).value("id", "") == "d-rival" && held_id == "d-rival", "another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered %s and decision:acme:k-2 holds %s: the client holds two decisions. Check and store in one command", routeOut(raced).value("id", ""), held_id);
+    ctx.Assert(hRouteOut(raced).value("id", "") == "d-rival" && held_id == "d-rival", "another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered %s and decision:acme:k-2 holds %s: the client holds two decisions. Check and store in one command", hRouteOut(raced).value("id", ""), held_id);
   } else {
     ctx.Assert(*ttl_then > 0 && *ttl_then <= 86400, "right after the request stored decision:acme:k-2 its TTL was %d: a crash before the expiry is set keeps the decision for good. Store the decision and its expiry in one command", *ttl_then);
   }
 }
 
 void CheckNoPromptLog(harness::Ctx& ctx) {
-  auto c = routeServer(ctx);
+  auto c = hRouteServer(ctx);
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  const auto r = routeAs(c, routeBody(kRouteCanary));
+  const auto r = hRouteAs(c, hRouteBody(kHRouteCanary));
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Equal(r.Status, 200, "POST /v1/route (%s)", r.Text());

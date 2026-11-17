@@ -977,17 +977,17 @@ import (
 	"booking/store"
 )
 
-const stateResource = "r1"
+const kHStateResource = "r1"
 
 // Four consecutive 30-minute slots, as epoch minutes.
-var stateFields = []string{"29520480", "29520510", "29520540", "29520570"}
+var hStateFields = []string{"29520480", "29520510", "29520540", "29520570"}
 
-func stateOwner(ctx *harness.Ctx, field string) (string, bool) {
-	return ctx.Redis.HGet(slots.Key(stateResource), field)
+func hStateOwner(ctx *harness.Ctx, field string) (string, bool) {
+	return ctx.Redis.HGet(slots.Key(kHStateResource), field)
 }
 
-func stateHold(ctx *harness.Ctx, fields []string) *store.Hold {
-	hold, err := takeHold(context.Background(), stateResource, fields)
+func hStateHold(ctx *harness.Ctx, fields []string) *store.Hold {
+	hold, err := takeHold(context.Background(), kHStateResource, fields)
 	ctx.NoError(err, "takeHold")
 	return hold
 }
@@ -996,8 +996,8 @@ func CheckAtomicHold(ctx *harness.Ctx) {
 	// Another instance's request for the same slot lands right after the learner's first command on
 	// the map, before the next one: it takes the slot if it is free.
 	won := int64(0)
-	ctx.Redis.After(slots.Key(stateResource), func() any {
-		if v, ok := ctx.Redis.Do("HSETNX", slots.Key(stateResource), stateFields[0], "h-other").(int64); ok {
+	ctx.Redis.After(slots.Key(kHStateResource), func() any {
+		if v, ok := ctx.Redis.Do("HSETNX", slots.Key(kHStateResource), hStateFields[0], "h-other").(int64); ok {
 			won = v
 		}
 		if won == 1 {
@@ -1005,7 +1005,7 @@ func CheckAtomicHold(ctx *harness.Ctx) {
 		}
 		return won
 	})
-	hold := stateHold(ctx, stateFields[:1])
+	hold := hStateHold(ctx, hStateFields[:1])
 	winners := int(won)
 	if hold != nil {
 		winners++
@@ -1015,7 +1015,7 @@ func CheckAtomicHold(ctx *harness.Ctx) {
 	if won == 0 {
 		expected = hold.HoldID
 	}
-	owner, _ := stateOwner(ctx, stateFields[0])
+	owner, _ := hStateOwner(ctx, hStateFields[0])
 	ctx.Equal(owner, expected, "the slot's owner must be the request that won it")
 }
 
@@ -1023,99 +1023,99 @@ func CheckHoldTtl(ctx *harness.Ctx) {
 	// A rival request reads the map right after the learner's first command on it: every slot it
 	// finds written must point at a hold whose key already exists, or the rival sees the slot free.
 	seen := map[string]int64{}
-	probe := ctx.Redis.After(slots.Key(stateResource), func() any {
-		for _, f := range stateFields[:2] {
-			if owner, ok := stateOwner(ctx, f); ok {
+	probe := ctx.Redis.After(slots.Key(kHStateResource), func() any {
+		for _, f := range hStateFields[:2] {
+			if owner, ok := hStateOwner(ctx, f); ok {
 				seen[f] = ctx.Redis.Exists(slots.HoldKey(owner))
 			}
 		}
 		return nil
 	})
-	hold := stateHold(ctx, stateFields[:2])
+	hold := hStateHold(ctx, hStateFields[:2])
 	ctx.Assert(hold != nil, "takeHold refused a free range")
 	ttl := ctx.Redis.TTL(slots.HoldKey(hold.HoldID))
 	ctx.Assert(850 <= ttl && ttl <= 900, "hold:{id} has TTL %d, expected the 900 s payment window (SET … EX 900 in the script)", ttl)
-	ctx.Assert(probe.Fired && len(seen) == 2 && seen[stateFields[0]] == 1 && seen[stateFields[1]] == 1, "right after takeHold's first command on resource:r1:slots, a rival request found %v (written slot: 1 if its hold:{id} key exists), expected both slots written and their hold key alive: in that gap the rival sees the slots free and takes them. Write the hold key in the same script as the slots", seen)
-	ctx.Equal(ctx.Redis.TTL(slots.Key(stateResource)), -1, "resource:r1:slots carries confirmed bookings and must never expire; its TTL")
+	ctx.Assert(probe.Fired && len(seen) == 2 && seen[hStateFields[0]] == 1 && seen[hStateFields[1]] == 1, "right after takeHold's first command on resource:r1:slots, a rival request found %v (written slot: 1 if its hold:{id} key exists), expected both slots written and their hold key alive: in that gap the rival sees the slots free and takes them. Write the hold key in the same script as the slots", seen)
+	ctx.Equal(ctx.Redis.TTL(slots.Key(kHStateResource)), -1, "resource:r1:slots carries confirmed bookings and must never expire; its TTL")
 	ctx.Clock.Advance(901)
 	ctx.Equal(ctx.Redis.Exists(slots.HoldKey(hold.HoldID)), 0, "hold:{id} after the payment window")
-	again := stateHold(ctx, stateFields[:2])
+	again := hStateHold(ctx, hStateFields[:2])
 	ctx.Assert(again != nil, "the hold expired but takeHold still refuses the slots: a slot whose hold:{id} key is gone is free again")
 }
 
 func CheckSingleWinner(ctx *harness.Ctx) {
-	first := stateHold(ctx, []string{stateFields[1], stateFields[2]})
+	first := hStateHold(ctx, []string{hStateFields[1], hStateFields[2]})
 	ctx.Assert(first != nil, "takeHold refused a free range")
-	second := stateHold(ctx, []string{stateFields[0], stateFields[1]})
+	second := hStateHold(ctx, []string{hStateFields[0], hStateFields[1]})
 	ctx.Assert(second == nil, "a range overlapping a held slot was granted (%v)", second)
-	owner, written := stateOwner(ctx, stateFields[0])
-	ctx.Assert(!written, "the refused request still wrote slot %s (owner %q) before it saw %s was taken: check every slot, then write", stateFields[0], owner, stateFields[1])
+	owner, written := hStateOwner(ctx, hStateFields[0])
+	ctx.Assert(!written, "the refused request still wrote slot %s (owner %q) before it saw %s was taken: check every slot, then write", hStateFields[0], owner, hStateFields[1])
 	ctx.Equal(ctx.Redis.Keys("hold:*"), []string{slots.HoldKey(first.HoldID)}, "hold keys after one granted and one refused request (expected only the first)")
 }
 
 func CheckReleaseGuarded(ctx *harness.Ctx) {
-	first := stateHold(ctx, []string{stateFields[1], stateFields[2]})
+	first := hStateHold(ctx, []string{hStateFields[1], hStateFields[2]})
 	ctx.Assert(first != nil, "takeHold refused a free range")
 	ctx.Clock.Advance(901) // the first checkout was abandoned
-	second := stateHold(ctx, []string{stateFields[2], stateFields[3]})
-	ctx.Assert(second != nil, "slot %s points at an expired hold and must be free again", stateFields[2])
-	freed, err := releaseHold(context.Background(), stateResource, []string{stateFields[1], stateFields[2]}, first.HoldID)
+	second := hStateHold(ctx, []string{hStateFields[2], hStateFields[3]})
+	ctx.Assert(second != nil, "slot %s points at an expired hold and must be free again", hStateFields[2])
+	freed, err := releaseHold(context.Background(), kHStateResource, []string{hStateFields[1], hStateFields[2]}, first.HoldID)
 	ctx.NoError(err, "releaseHold")
-	owner, _ := stateOwner(ctx, stateFields[2])
-	ctx.Assert(owner == second.HoldID, "the sweeper freed slot %s (owner now %q) which a later request holds: release only the slots still pointing at this hold", stateFields[2], owner)
-	owner, written := stateOwner(ctx, stateFields[1])
-	ctx.Assert(!written, "slot %s still points at %q after its hold was released", stateFields[1], owner)
+	owner, _ := hStateOwner(ctx, hStateFields[2])
+	ctx.Assert(owner == second.HoldID, "the sweeper freed slot %s (owner now %q) which a later request holds: release only the slots still pointing at this hold", hStateFields[2], owner)
+	owner, written := hStateOwner(ctx, hStateFields[1])
+	ctx.Assert(!written, "slot %s still points at %q after its hold was released", hStateFields[1], owner)
 	ctx.Equal(freed, 1, "releaseHold's count of freed slots")
 	// Another abandoned checkout: while the sweeper releases it, a new request takes the free slot the
 	// moment the release first touches the map. The comparison and the delete must not let it in between.
-	third := stateHold(ctx, stateFields[:1])
+	third := hStateHold(ctx, hStateFields[:1])
 	ctx.Assert(third != nil, "takeHold refused a free range")
 	ctx.Clock.Advance(901)
-	ctx.Redis.After(slots.Key(stateResource), func() any {
-		if owner, ok := stateOwner(ctx, stateFields[0]); !ok || ctx.Redis.Exists(slots.HoldKey(owner)) == 0 {
-			ctx.Redis.Do("HSET", slots.Key(stateResource), stateFields[0], "h-other")
+	ctx.Redis.After(slots.Key(kHStateResource), func() any {
+		if owner, ok := hStateOwner(ctx, hStateFields[0]); !ok || ctx.Redis.Exists(slots.HoldKey(owner)) == 0 {
+			ctx.Redis.Do("HSET", slots.Key(kHStateResource), hStateFields[0], "h-other")
 			ctx.Redis.Do("SET", slots.HoldKey("h-other"), "held", "EX", 900)
 		}
 		return nil
 	})
-	_, err = releaseHold(context.Background(), stateResource, stateFields[:1], third.HoldID)
+	_, err = releaseHold(context.Background(), kHStateResource, hStateFields[:1], third.HoldID)
 	ctx.NoError(err, "releaseHold")
-	owner, _ = stateOwner(ctx, stateFields[0])
-	ctx.Assert(owner == "h-other", "a new request took slot %s while the release ran, and the release then deleted it (owner now %q): compare and delete inside one script", stateFields[0], owner)
+	owner, _ = hStateOwner(ctx, hStateFields[0])
+	ctx.Assert(owner == "h-other", "a new request took slot %s while the release ran, and the release then deleted it (owner now %q): compare and delete inside one script", hStateFields[0], owner)
 	// The rejection path releases a hold that is still alive: its key goes with its slot.
-	fourth := stateHold(ctx, []string{stateFields[1]})
+	fourth := hStateHold(ctx, []string{hStateFields[1]})
 	ctx.Assert(fourth != nil, "takeHold refused a free range")
-	freed, err = releaseHold(context.Background(), stateResource, []string{stateFields[1]}, fourth.HoldID)
+	freed, err = releaseHold(context.Background(), kHStateResource, []string{hStateFields[1]}, fourth.HoldID)
 	ctx.NoError(err, "releaseHold")
 	ctx.Equal(freed, 1, "releasing a live hold must free its slot; the count of freed slots")
 	ctx.Equal(ctx.Redis.Exists(slots.HoldKey(fourth.HoldID)), 0, "releaseHold must delete the hold key too; hold:{id} after the release")
 }
 
 func CheckConfirmConverts(ctx *harness.Ctx) {
-	hold := stateHold(ctx, stateFields[:2])
+	hold := hStateHold(ctx, hStateFields[:2])
 	ctx.Assert(hold != nil, "takeHold refused a free range")
-	_, err := confirmHold(context.Background(), stateResource, stateFields[:2], hold.HoldID, "b-1")
+	_, err := confirmHold(context.Background(), kHStateResource, hStateFields[:2], hold.HoldID, "b-1")
 	ctx.NoError(err, "confirmHold")
 	owners := func() []string {
-		a, _ := stateOwner(ctx, stateFields[0])
-		b, _ := stateOwner(ctx, stateFields[1])
+		a, _ := hStateOwner(ctx, hStateFields[0])
+		b, _ := hStateOwner(ctx, hStateFields[1])
 		return []string{a, b}
 	}
 	ctx.Equal(owners(), []string{"booked:b-1", "booked:b-1"}, "the slots after confirmation")
 	ctx.Clock.Advance(3601) // the payment window is long over
 	ctx.Equal(owners(), []string{"booked:b-1", "booked:b-1"}, "the slots an hour after confirmation (a confirmed booking must never expire back into the free set)")
-	ctx.Assert(stateHold(ctx, stateFields[:1]) == nil, "a confirmed slot was granted to a new hold")
-	ctx.Equal(ctx.Redis.TTL(slots.Key(stateResource)), -1, "resource:r1:slots must never expire; its TTL")
+	ctx.Assert(hStateHold(ctx, hStateFields[:1]) == nil, "a confirmed slot was granted to a new hold")
+	ctx.Equal(ctx.Redis.TTL(slots.Key(kHStateResource)), -1, "resource:r1:slots must never expire; its TTL")
 	// A payment that completes after its window: the hold expired and a new request took one of its slots.
-	late := stateHold(ctx, stateFields[2:])
+	late := hStateHold(ctx, hStateFields[2:])
 	ctx.Assert(late != nil, "takeHold refused a free range")
 	ctx.Clock.Advance(901)
-	newer := stateHold(ctx, stateFields[3:])
-	ctx.Assert(newer != nil, "slot %s points at an expired hold and must be free again", stateFields[3])
-	_, err = confirmHold(context.Background(), stateResource, stateFields[2:], late.HoldID, "b-2")
+	newer := hStateHold(ctx, hStateFields[3:])
+	ctx.Assert(newer != nil, "slot %s points at an expired hold and must be free again", hStateFields[3])
+	_, err = confirmHold(context.Background(), kHStateResource, hStateFields[2:], late.HoldID, "b-2")
 	ctx.NoError(err, "confirmHold")
-	owner, _ := stateOwner(ctx, stateFields[3])
-	ctx.Assert(owner == newer.HoldID, "a late confirmation rewrote slot %s to %q, which another hold had taken: a double booking. Convert only the slots this hold still owns", stateFields[3], owner)
+	owner, _ := hStateOwner(ctx, hStateFields[3])
+	ctx.Assert(owner == newer.HoldID, "a late confirmation rewrote slot %s to %q, which another hold had taken: a double booking. Convert only the slots this hold still owns", hStateFields[3], owner)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1126,12 +1126,12 @@ func CheckConfirmConverts(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateResource = "r1";
+const std::string kHStateResource = "r1";
 // Four consecutive 30-minute slots, as epoch minutes.
-const std::vector<std::string> kStateFields = {"29520480", "29520510", "29520540", "29520570"};
+const std::vector<std::string> kHStateFields = {"29520480", "29520510", "29520540", "29520570"};
 
-std::optional<std::string> stateOwner(harness::Ctx& ctx, const std::string& field) {
-  return ctx.Redis.HGet(booking::slots::Key(kStateResource), field);
+std::optional<std::string> hStateOwner(harness::Ctx& ctx, const std::string& field) {
+  return ctx.Redis.HGet(booking::slots::Key(kHStateResource), field);
 }
 
 }  // namespace
@@ -1140,18 +1140,18 @@ void CheckAtomicHold(harness::Ctx& ctx) {
   // Another instance's request for the same slot lands right after the learner's first command on
   // the map, before the next one: it takes the slot if it is free.
   long long won = 0;
-  ctx.Redis.After(booking::slots::Key(kStateResource), [&] {
-    won = ctx.Redis.Do("HSETNX", booking::slots::Key(kStateResource), kStateFields[0], "h-other").Int();
+  ctx.Redis.After(booking::slots::Key(kHStateResource), [&] {
+    won = ctx.Redis.Do("HSETNX", booking::slots::Key(kHStateResource), kHStateFields[0], "h-other").Int();
     if (won == 1) ctx.Redis.Do("SET", booking::slots::HoldKey("h-other"), "held", "EX", 900);
   });
-  const auto hold = takeHold(kStateResource, {kStateFields[0]});
+  const auto hold = takeHold(kHStateResource, {kHStateFields[0]});
   const int winners = static_cast<int>(won) + (hold ? 1 : 0);
   ctx.Assert(winners == 1,
              "two requests for one slot and %d won: the other request took the slot between your check and your "
              "write, so the check and the write must be one Lua script",
              winners);
   const std::string expected = won == 1 ? "h-other" : hold->hold_id;
-  ctx.Equal(stateOwner(ctx, kStateFields[0]), expected, "the slot's owner must be the request that won it");
+  ctx.Equal(hStateOwner(ctx, kHStateFields[0]), expected, "the slot's owner must be the request that won it");
 }
 
 void CheckHoldTtl(harness::Ctx& ctx) {
@@ -1160,17 +1160,17 @@ void CheckHoldTtl(harness::Ctx& ctx) {
   bool fired = false;
   std::string seen;
   int live = 0;
-  ctx.Redis.After(booking::slots::Key(kStateResource), [&] {
+  ctx.Redis.After(booking::slots::Key(kHStateResource), [&] {
     fired = true;
     for (size_t i = 0; i < 2; ++i) {
-      const auto owner = stateOwner(ctx, kStateFields[i]);
+      const auto owner = hStateOwner(ctx, kHStateFields[i]);
       if (!owner) continue;
       const long long exists = ctx.Redis.Exists(booking::slots::HoldKey(*owner));
-      seen += kStateFields[i] + ":" + std::to_string(exists) + " ";
+      seen += kHStateFields[i] + ":" + std::to_string(exists) + " ";
       live += exists == 1 ? 1 : 0;
     }
   });
-  const auto hold = takeHold(kStateResource, {kStateFields[0], kStateFields[1]});
+  const auto hold = takeHold(kHStateResource, {kHStateFields[0], kHStateFields[1]});
   ctx.Assert(hold.has_value(), "takeHold refused a free range");
   const long long ttl = ctx.Redis.TTL(booking::slots::HoldKey(hold->hold_id));
   ctx.Assert(850 <= ttl && ttl <= 900, "hold:{id} has TTL %d, expected the 900 s payment window (SET … EX 900 in the script)", ttl);
@@ -1179,96 +1179,96 @@ void CheckHoldTtl(harness::Ctx& ctx) {
              "its hold:{id} key exists), expected both slots written and their hold key alive: in that gap the rival "
              "sees the slots free and takes them. Write the hold key in the same script as the slots",
              seen);
-  ctx.Equal(ctx.Redis.TTL(booking::slots::Key(kStateResource)), -1,
+  ctx.Equal(ctx.Redis.TTL(booking::slots::Key(kHStateResource)), -1,
             "resource:r1:slots carries confirmed bookings and must never expire; its TTL");
   ctx.Clock.Advance(901);
   ctx.Equal(ctx.Redis.Exists(booking::slots::HoldKey(hold->hold_id)), 0, "hold:{id} after the payment window");
-  const auto again = takeHold(kStateResource, {kStateFields[0], kStateFields[1]});
+  const auto again = takeHold(kHStateResource, {kHStateFields[0], kHStateFields[1]});
   ctx.Assert(again.has_value(),
              "the hold expired but takeHold still refuses the slots: a slot whose hold:{id} key is gone is free again");
 }
 
 void CheckSingleWinner(harness::Ctx& ctx) {
-  const auto first = takeHold(kStateResource, {kStateFields[1], kStateFields[2]});
+  const auto first = takeHold(kHStateResource, {kHStateFields[1], kHStateFields[2]});
   ctx.Assert(first.has_value(), "takeHold refused a free range");
-  const auto second = takeHold(kStateResource, {kStateFields[0], kStateFields[1]});
+  const auto second = takeHold(kHStateResource, {kHStateFields[0], kHStateFields[1]});
   ctx.Assert(!second.has_value(), "a range overlapping a held slot was granted (%s)", second ? second->hold_id : "");
-  const auto owner = stateOwner(ctx, kStateFields[0]);
+  const auto owner = hStateOwner(ctx, kHStateFields[0]);
   ctx.Assert(!owner.has_value(),
              "the refused request still wrote slot %s (owner %q) before it saw %s was taken: check every slot, then write",
-             kStateFields[0], owner, kStateFields[1]);
+             kHStateFields[0], owner, kHStateFields[1]);
   ctx.Equal(ctx.Redis.Keys("hold:*"), {booking::slots::HoldKey(first->hold_id)},
             "hold keys after one granted and one refused request (expected only the first)");
 }
 
 void CheckReleaseGuarded(harness::Ctx& ctx) {
-  const auto first = takeHold(kStateResource, {kStateFields[1], kStateFields[2]});
+  const auto first = takeHold(kHStateResource, {kHStateFields[1], kHStateFields[2]});
   ctx.Assert(first.has_value(), "takeHold refused a free range");
   ctx.Clock.Advance(901);  // the first checkout was abandoned
-  const auto second = takeHold(kStateResource, {kStateFields[2], kStateFields[3]});
-  ctx.Assert(second.has_value(), "slot %s points at an expired hold and must be free again", kStateFields[2]);
-  const long long freed = releaseHold(kStateResource, {kStateFields[1], kStateFields[2]}, first->hold_id);
-  const auto owner = stateOwner(ctx, kStateFields[2]);
+  const auto second = takeHold(kHStateResource, {kHStateFields[2], kHStateFields[3]});
+  ctx.Assert(second.has_value(), "slot %s points at an expired hold and must be free again", kHStateFields[2]);
+  const long long freed = releaseHold(kHStateResource, {kHStateFields[1], kHStateFields[2]}, first->hold_id);
+  const auto owner = hStateOwner(ctx, kHStateFields[2]);
   ctx.Assert(owner == second->hold_id,
              "the sweeper freed slot %s (owner now %q) which a later request holds: release only the slots still "
              "pointing at this hold",
-             kStateFields[2], owner);
-  const auto freedOwner = stateOwner(ctx, kStateFields[1]);
-  ctx.Assert(!freedOwner.has_value(), "slot %s still points at %q after its hold was released", kStateFields[1], freedOwner);
+             kHStateFields[2], owner);
+  const auto freedOwner = hStateOwner(ctx, kHStateFields[1]);
+  ctx.Assert(!freedOwner.has_value(), "slot %s still points at %q after its hold was released", kHStateFields[1], freedOwner);
   ctx.Equal(freed, 1, "releaseHold's count of freed slots");
   // Another abandoned checkout: while the sweeper releases it, a new request takes the free slot the
   // moment the release first touches the map. The comparison and the delete must not let it in between.
-  const auto third = takeHold(kStateResource, {kStateFields[0]});
+  const auto third = takeHold(kHStateResource, {kHStateFields[0]});
   ctx.Assert(third.has_value(), "takeHold refused a free range");
   ctx.Clock.Advance(901);
-  ctx.Redis.After(booking::slots::Key(kStateResource), [&] {
-    const auto current = stateOwner(ctx, kStateFields[0]);
+  ctx.Redis.After(booking::slots::Key(kHStateResource), [&] {
+    const auto current = hStateOwner(ctx, kHStateFields[0]);
     if (!current || ctx.Redis.Exists(booking::slots::HoldKey(*current)) == 0) {
-      ctx.Redis.Do("HSET", booking::slots::Key(kStateResource), kStateFields[0], "h-other");
+      ctx.Redis.Do("HSET", booking::slots::Key(kHStateResource), kHStateFields[0], "h-other");
       ctx.Redis.Do("SET", booking::slots::HoldKey("h-other"), "held", "EX", 900);
     }
   });
-  releaseHold(kStateResource, {kStateFields[0]}, third->hold_id);
-  const auto retaken = stateOwner(ctx, kStateFields[0]);
+  releaseHold(kHStateResource, {kHStateFields[0]}, third->hold_id);
+  const auto retaken = hStateOwner(ctx, kHStateFields[0]);
   ctx.Assert(retaken == std::string("h-other"),
              "a new request took slot %s while the release ran, and the release then deleted it (owner now %q): "
              "compare and delete inside one script",
-             kStateFields[0], retaken);
+             kHStateFields[0], retaken);
   // The rejection path releases a hold that is still alive: its key goes with its slot.
-  const auto fourth = takeHold(kStateResource, {kStateFields[1]});
+  const auto fourth = takeHold(kHStateResource, {kHStateFields[1]});
   ctx.Assert(fourth.has_value(), "takeHold refused a free range");
-  ctx.Equal(releaseHold(kStateResource, {kStateFields[1]}, fourth->hold_id), 1LL,
+  ctx.Equal(releaseHold(kHStateResource, {kHStateFields[1]}, fourth->hold_id), 1LL,
             "releasing a live hold must free its slot; the count of freed slots");
   ctx.Equal(ctx.Redis.Exists(booking::slots::HoldKey(fourth->hold_id)), 0LL,
             "releaseHold must delete the hold key too; hold:{id} after the release");
 }
 
 void CheckConfirmConverts(harness::Ctx& ctx) {
-  const auto hold = takeHold(kStateResource, {kStateFields[0], kStateFields[1]});
+  const auto hold = takeHold(kHStateResource, {kHStateFields[0], kHStateFields[1]});
   ctx.Assert(hold.has_value(), "takeHold refused a free range");
-  confirmHold(kStateResource, {kStateFields[0], kStateFields[1]}, hold->hold_id, "b-1");
+  confirmHold(kHStateResource, {kHStateFields[0], kHStateFields[1]}, hold->hold_id, "b-1");
   const auto owners = [&] {
-    return std::vector<std::string>{stateOwner(ctx, kStateFields[0]).value_or(""),
-                                    stateOwner(ctx, kStateFields[1]).value_or("")};
+    return std::vector<std::string>{hStateOwner(ctx, kHStateFields[0]).value_or(""),
+                                    hStateOwner(ctx, kHStateFields[1]).value_or("")};
   };
   ctx.Equal(owners(), {"booked:b-1", "booked:b-1"}, "the slots after confirmation");
   ctx.Clock.Advance(3601);  // the payment window is long over
   ctx.Equal(owners(), {"booked:b-1", "booked:b-1"},
             "the slots an hour after confirmation (a confirmed booking must never expire back into the free set)");
-  ctx.Assert(!takeHold(kStateResource, {kStateFields[0]}).has_value(), "a confirmed slot was granted to a new hold");
-  ctx.Equal(ctx.Redis.TTL(booking::slots::Key(kStateResource)), -1, "resource:r1:slots must never expire; its TTL");
+  ctx.Assert(!takeHold(kHStateResource, {kHStateFields[0]}).has_value(), "a confirmed slot was granted to a new hold");
+  ctx.Equal(ctx.Redis.TTL(booking::slots::Key(kHStateResource)), -1, "resource:r1:slots must never expire; its TTL");
   // A payment that completes after its window: the hold expired and a new request took one of its slots.
-  const auto late = takeHold(kStateResource, {kStateFields[2], kStateFields[3]});
+  const auto late = takeHold(kHStateResource, {kHStateFields[2], kHStateFields[3]});
   ctx.Assert(late.has_value(), "takeHold refused a free range");
   ctx.Clock.Advance(901);
-  const auto newer = takeHold(kStateResource, {kStateFields[3]});
-  ctx.Assert(newer.has_value(), "slot %s points at an expired hold and must be free again", kStateFields[3]);
-  confirmHold(kStateResource, {kStateFields[2], kStateFields[3]}, late->hold_id, "b-2");
-  const auto lateOwner = stateOwner(ctx, kStateFields[3]);
+  const auto newer = takeHold(kHStateResource, {kHStateFields[3]});
+  ctx.Assert(newer.has_value(), "slot %s points at an expired hold and must be free again", kHStateFields[3]);
+  confirmHold(kHStateResource, {kHStateFields[2], kHStateFields[3]}, late->hold_id, "b-2");
+  const auto lateOwner = hStateOwner(ctx, kHStateFields[3]);
   ctx.Assert(lateOwner == newer->hold_id,
              "a late confirmation rewrote slot %s to %q, which another hold had taken: a double booking. Convert only "
              "the slots this hold still owns",
-             kStateFields[3], lateOwner);
+             kHStateFields[3], lateOwner);
 }
 `,
   },

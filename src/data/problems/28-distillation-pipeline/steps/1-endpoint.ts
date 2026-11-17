@@ -865,15 +865,15 @@ import (
 	"leetbuild/harness"
 )
 
-var apiGood = map[string]any{"teacher": "teach-70b-v3", "dataset_id": "ds-support-2026", "sample_cap": 1000}
+var hApiGood = map[string]any{"teacher": "teach-70b-v3", "dataset_id": "ds-support-2026", "sample_cap": 1000}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(body map[string]any, overrides map[string]any) map[string]any {
+func hApiWith(body map[string]any, overrides map[string]any) map[string]any {
 	out := map[string]any{}
 	for k, v := range body {
 		out[k] = v
@@ -884,21 +884,21 @@ func apiWith(body map[string]any, overrides map[string]any) map[string]any {
 	return out
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/distill/jobs", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	job, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return job
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "k-1", "t1")
 	ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text())
-	job := apiJob(ctx, r)
+	job := hApiJob(ctx, r)
 	for _, key := range []string{"job_id", "status", "teacher", "dataset_id", "sample_cap", "sampled", "accepted", "rejected"} {
 		_, ok := job[key]
 		ctx.Assert(ok, "the 201 body lacks %s: %s", key, r.Text())
@@ -909,66 +909,66 @@ func CheckRoute(ctx *harness.Ctx) {
 	ctx.Assert(id != "", "the job needs a job_id")
 	_, stored := ctx.Redis.Get("distill:job:" + id)
 	ctx.Assert(stored, "the job %s must be in the job store (distill:job:{id}): keys %v", id, ctx.Redis.Keys("distill:*"))
-	noTenant := c.Post("/v1/distill/jobs", apiGood, "Idempotency-Key", "k-1")
+	noTenant := c.Post("/v1/distill/jobs", hApiGood, "Idempotency-Key", "k-1")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the start")
 }
 
 func CheckApprovedTeacher(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, teacher := range []string{"gpt-5-max", "teach-405b-v1", "teach-70b"} {
-		r := apiPost(c, apiWith(apiGood, map[string]any{"teacher": teacher}), "k-bad", "t1")
+		r := hApiPost(c, hApiWith(hApiGood, map[string]any{"teacher": teacher}), "k-bad", "t1")
 		ctx.Equal(r.Status, 400, "a teacher outside the catalog (%s): the caller must not pick the model that spends the budget, and the catalog is exact names", teacher)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("distill:job:*")), 0, "a refused start must store no job; jobs stored")
-	r := apiPost(c, apiWith(apiGood, map[string]any{"teacher": "teach-13b-v2"}), "k-ok", "t1")
+	r := hApiPost(c, hApiWith(hApiGood, map[string]any{"teacher": "teach-13b-v2"}), "k-ok", "t1")
 	ctx.Equal(r.Status, 201, "teach-13b-v2 is in the catalog (%s)", r.Text())
 }
 
 func CheckSampleCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, cap := range []int{99, 10001, 0, -5} {
-		r := apiPost(c, apiWith(apiGood, map[string]any{"sample_cap": cap}), "k-cap", "t1")
+		r := hApiPost(c, hApiWith(hApiGood, map[string]any{"sample_cap": cap}), "k-cap", "t1")
 		ctx.Equal(r.Status, 400, "sample_cap=%d (the cap is the job's budget: 100..10000)", cap)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("distill:job:*")), 0, "refused caps must store no job; jobs stored")
 	for _, cap := range []int{100, 10000} {
-		r := apiPost(c, apiWith(apiGood, map[string]any{"sample_cap": cap}), "k-"+harness.Show(cap), "t1")
+		r := hApiPost(c, hApiWith(hApiGood, map[string]any{"sample_cap": cap}), "k-"+harness.Show(cap), "t1")
 		ctx.Equal(r.Status, 201, "sample_cap=%d is within 100..10000 inclusive (%s)", cap, r.Text())
 	}
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/distill/jobs", apiGood, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/distill/jobs", hApiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
-	emptyKey := apiPost(c, apiGood, "", "t1")
+	emptyKey := hApiPost(c, hApiGood, "", "t1")
 	ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key")
 	ctx.Equal(len(ctx.Redis.Keys("distill:job:*")), 0, "a start without a key must store no job; jobs stored")
-	first := apiPost(c, apiGood, "k-7", "t1")
+	first := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first start (%s)", first.Text())
-	replay := apiPost(c, apiGood, "k-7", "t1")
+	replay := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored job (the client retried; it must not get a second job)")
-	ctx.Equal(apiJob(ctx, replay)["job_id"], apiJob(ctx, first)["job_id"], "the replay must resume the same job")
+	ctx.Equal(hApiJob(ctx, replay)["job_id"], hApiJob(ctx, first)["job_id"], "the replay must resume the same job")
 	ctx.Equal(len(ctx.Redis.Keys("distill:job:*")), 1, "one key, one job: jobs stored after a start and its replay")
-	other := apiPost(c, apiGood, "k-7", "t2")
-	ctx.Assert(other.Status == 201 && apiJob(ctx, other)["job_id"] != apiJob(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)")
+	other := hApiPost(c, hApiGood, "k-7", "t2")
+	ctx.Assert(other.Status == 201 && hApiJob(ctx, other)["job_id"] != hApiJob(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)")
 }
 
 func CheckValidateBeforeCreate(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	wrote := false
 	ctx.Redis.After("distill:idem:t1:k-bad", func() any {
 		keys := ctx.Redis.Keys("distill:*")
 		wrote = len(keys) > 0
 		return keys
 	})
-	r := apiPost(c, apiWith(apiGood, map[string]any{"sample_cap": 5}), "k-bad", "t1")
+	r := hApiPost(c, hApiWith(hApiGood, map[string]any{"sample_cap": 5}), "k-bad", "t1")
 	ctx.Equal(r.Status, 400, "sample_cap=5")
 	ctx.Assert(!wrote, "a rejected start wrote the job store: validate before jobs.Put, so nothing has to be unwound")
 	ctx.Equal(len(ctx.Redis.Keys("distill:*")), 0, "a rejected start must leave nothing in Redis; keys")
-	r = apiPost(c, apiWith(apiGood, map[string]any{"teacher": "gpt-5-max"}), "k-bad", "t1")
+	r = hApiPost(c, hApiWith(hApiGood, map[string]any{"teacher": "gpt-5-max"}), "k-bad", "t1")
 	ctx.Assert(r.Status == 400 && len(ctx.Redis.Keys("distill:*")) == 0, "a refused teacher must leave nothing in Redis either")
-	r = apiPost(c, apiWith(apiGood, map[string]any{"dataset_id": ""}), "k-bad", "t1")
+	r = hApiPost(c, hApiWith(hApiGood, map[string]any{"dataset_id": ""}), "k-bad", "t1")
 	ctx.Equal(r.Status, 400, "an empty dataset_id")
 	ctx.Equal(len(ctx.Redis.Keys("distill:*")), 0, "a start with no dataset must leave nothing in Redis; keys")
 }
@@ -984,24 +984,24 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGood = {{"teacher", "teach-70b-v3"}, {"dataset_id", "ds-support-2026"}, {"sample_cap", 1000}};
+const json kHGood = {{"teacher", "teach-70b-v3"}, {"dataset_id", "ds-support-2026"}, {"sample_cap", 1000}};
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& key = "k-1", const std::string& tenant = "t1") {
     return http.Post("/v1/distill/jobs", body.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
   }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json hWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-json jobOf(harness::Ctx& ctx, const harness::Response& r) {
+json hJobOf(harness::Ctx& ctx, const harness::Response& r) {
   const json job = json::parse(r.Text(), nullptr, false);
   ctx.Assert(job.is_object(), "the body must be a JSON object: %s", r.Text());
   return job;
@@ -1010,10 +1010,10 @@ json jobOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HApi api(ctx);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text());
-  const json job = jobOf(ctx, r);
+  const json job = hJobOf(ctx, r);
   for (const char* key : {"job_id", "status", "teacher", "dataset_id", "sample_cap", "sampled", "accepted", "rejected"}) {
     ctx.Assert(job.contains(key), "the 201 body lacks %s: %s", key, r.Text());
   }
@@ -1023,62 +1023,62 @@ void CheckRoute(harness::Ctx& ctx) {
   const std::string id = job["job_id"].is_string() ? job["job_id"].get<std::string>() : "";
   ctx.Assert(!id.empty(), "the job needs a job_id");
   ctx.Assert(ctx.Redis.Get("distill:job:" + id).has_value(), "the job %s must be in the job store (distill:job:{id}): keys %v", id, ctx.Redis.Keys("distill:*"));
-  const auto noTenant = api.http.Post("/v1/distill/jobs", kGood.dump(), "Idempotency-Key", "k-1");
+  const auto noTenant = api.http.Post("/v1/distill/jobs", kHGood.dump(), "Idempotency-Key", "k-1");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the start");
 }
 
 void CheckApprovedTeacher(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   for (const std::string teacher : {"gpt-5-max", "teach-405b-v1", "teach-70b"}) {
-    const auto bad = api.post(with(kGood, "teacher", teacher), "k-bad");
+    const auto bad = api.post(hWith(kHGood, "teacher", teacher), "k-bad");
     ctx.Equal(bad.Status, 400, "a teacher outside the catalog (%s): the caller must not pick the model that spends the budget, and the catalog is exact names", teacher);
   }
   ctx.Equal(ctx.Redis.Keys("distill:job:*").size(), 0, "a refused start must store no job; jobs stored");
-  const auto r = api.post(with(kGood, "teacher", "teach-13b-v2"), "k-ok");
+  const auto r = api.post(hWith(kHGood, "teacher", "teach-13b-v2"), "k-ok");
   ctx.Equal(r.Status, 201, "teach-13b-v2 is in the catalog (%s)", r.Text());
 }
 
 void CheckSampleCap(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   for (int cap : {99, 10001, 0, -5}) {
-    const auto r = api.post(with(kGood, "sample_cap", cap), "k-cap");
+    const auto r = api.post(hWith(kHGood, "sample_cap", cap), "k-cap");
     ctx.Equal(r.Status, 400, "sample_cap=%d (the cap is the job's budget: 100..10000)", cap);
   }
   ctx.Equal(ctx.Redis.Keys("distill:job:*").size(), 0, "refused caps must store no job; jobs stored");
   for (int cap : {100, 10000}) {
-    const auto r = api.post(with(kGood, "sample_cap", cap), "k-" + std::to_string(cap));
+    const auto r = api.post(hWith(kHGood, "sample_cap", cap), "k-" + std::to_string(cap));
     ctx.Equal(r.Status, 201, "sample_cap=%d is within 100..10000 inclusive (%s)", cap, r.Text());
   }
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/distill/jobs", kGood.dump(), "X-Tenant-Id", "t1");
+  HApi api(ctx);
+  const auto noKey = api.http.Post("/v1/distill/jobs", kHGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
-  const auto emptyKey = api.post(kGood, "");
+  const auto emptyKey = api.post(kHGood, "");
   ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key");
   ctx.Equal(ctx.Redis.Keys("distill:job:*").size(), 0, "a start without a key must store no job; jobs stored");
-  const auto first = api.post(kGood, "k-7");
+  const auto first = api.post(kHGood, "k-7");
   ctx.Equal(first.Status, 201, "the first start (%s)", first.Text());
-  const auto replay = api.post(kGood, "k-7");
+  const auto replay = api.post(kHGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored job (the client retried; it must not get a second job)");
-  ctx.Equal(jobOf(ctx, replay)["job_id"], jobOf(ctx, first)["job_id"], "the replay must resume the same job");
+  ctx.Equal(hJobOf(ctx, replay)["job_id"], hJobOf(ctx, first)["job_id"], "the replay must resume the same job");
   ctx.Equal(ctx.Redis.Keys("distill:job:*").size(), 1, "one key, one job: jobs stored after a start and its replay");
-  const auto other = api.post(kGood, "k-7", "t2");
-  ctx.Assert(other.Status == 201 && jobOf(ctx, other)["job_id"] != jobOf(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)");
+  const auto other = api.post(kHGood, "k-7", "t2");
+  ctx.Assert(other.Status == 201 && hJobOf(ctx, other)["job_id"] != hJobOf(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)");
 }
 
 void CheckValidateBeforeCreate(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   bool wrote = false;
   ctx.Redis.After("distill:idem:t1:k-bad", [&ctx, &wrote] { wrote = !ctx.Redis.Keys("distill:*").empty(); });
-  auto r = api.post(with(kGood, "sample_cap", 5), "k-bad");
+  auto r = api.post(hWith(kHGood, "sample_cap", 5), "k-bad");
   ctx.Equal(r.Status, 400, "sample_cap=5");
   ctx.Assert(!wrote, "a rejected start wrote the job store: validate before jobs::put, so nothing has to be unwound");
   ctx.Equal(ctx.Redis.Keys("distill:*").size(), 0, "a rejected start must leave nothing in Redis; keys");
-  r = api.post(with(kGood, "teacher", "gpt-5-max"), "k-bad");
+  r = api.post(hWith(kHGood, "teacher", "gpt-5-max"), "k-bad");
   ctx.Assert(r.Status == 400 && ctx.Redis.Keys("distill:*").empty(), "a refused teacher must leave nothing in Redis either");
-  r = api.post(with(kGood, "dataset_id", ""), "k-bad");
+  r = api.post(hWith(kHGood, "dataset_id", ""), "k-bad");
   ctx.Equal(r.Status, 400, "an empty dataset_id");
   ctx.Equal(ctx.Redis.Keys("distill:*").size(), 0, "a start with no dataset must leave nothing in Redis; keys");
 }

@@ -925,38 +925,38 @@ import (
 	"leetbuild/harness"
 )
 
-const stateDS = "imdb-reviews"
+const kHStateDS = "imdb-reviews"
 
 var (
-	stateBg     = context.Background()
-	stateLatest = "dataset:" + stateDS + ":latest"
-	stateAudit  = "dataset:" + stateDS + ":audit"
-	statePins   = "dataset:" + stateDS + ":pins"
+	hStateBg     = context.Background()
+	hStateLatest = "dataset:" + kHStateDS + ":latest"
+	hStateAudit  = "dataset:" + kHStateDS + ":audit"
+	hStatePins   = "dataset:" + kHStateDS + ":pins"
 )
 
-func stateSetup(ctx *harness.Ctx) {
+func hStateSetup(ctx *harness.Ctx) {
 	for _, v := range []string{"2025-12", "2026-01", "2026-02"} {
-		err := store.PutVersion(stateBg, &store.VersionRecord{Tenant: "t1", Dataset: stateDS, Version: v, ContentSHA256: strings.Repeat("0", 64), License: "mit", Owner: "team-lm", SizeBytes: 20, RowCount: 2, Status: "validated"})
+		err := store.PutVersion(hStateBg, &store.VersionRecord{Tenant: "t1", Dataset: kHStateDS, Version: v, ContentSHA256: strings.Repeat("0", 64), License: "mit", Owner: "team-lm", SizeBytes: 20, RowCount: 2, Status: "validated"})
 		ctx.NoError(err, "seeding %s", v)
 	}
 }
 
-func mustPromote(ctx *harness.Ctx, version, actor string) string {
-	previous, err := promote(stateBg, stateDS, version, actor)
+func hMustPromote(ctx *harness.Ctx, version, actor string) string {
+	previous, err := promote(hStateBg, kHStateDS, version, actor)
 	ctx.NoError(err, "promote(%s) failed", version)
 	return previous
 }
 
-func stateRefused(ctx *harness.Ctx, version, why string) {
-	err := purge(stateBg, stateDS, version)
+func hStateRefused(ctx *harness.Ctx, version, why string) {
+	err := purge(hStateBg, kHStateDS, version)
 	ctx.Assert(err != nil, "purge(%q) went through while %s: a run reading it loses its data. Return ErrVersionPinned", version, why)
 	ctx.Assert(errors.Is(err, ErrVersionPinned), "purge(%q) failed with %v, expected ErrVersionPinned", version, err)
 }
 
 // statePurgeRaced purges version while another client lands rival right after the purge's first
 // command on key.
-func statePurgeRaced(ctx *harness.Ctx, key, version string, rival func(), what string) {
-	vkey := store.VersionKey(stateDS, version)
+func hStatePurgeRaced(ctx *harness.Ctx, key, version string, rival func(), what string) {
+	vkey := store.VersionKey(kHStateDS, version)
 	probe := ctx.Redis.After(key, func() any {
 		if ctx.Redis.Exists(vkey) != 1 {
 			return false
@@ -964,44 +964,44 @@ func statePurgeRaced(ctx *harness.Ctx, key, version string, rival func(), what s
 		rival()
 		return true
 	})
-	err := purge(stateBg, stateDS, version)
+	err := purge(hStateBg, kHStateDS, version)
 	ctx.Assert(probe.Fired, "purge(%q) never touched %s", version, key)
 	ctx.NoError(probe.Err, "the racing client")
 	if landed, _ := probe.Result.(bool); landed {
-		ctx.Assert(errors.Is(err, ErrVersionPinned) && store.Version(stateBg, stateDS, version) != nil, "%s between the purge's check and its delete, and purge(%q) deleted it anyway: the check and the delete must be one script", what, version)
+		ctx.Assert(errors.Is(err, ErrVersionPinned) && store.Version(hStateBg, kHStateDS, version) != nil, "%s between the purge's check and its delete, and purge(%q) deleted it anyway: the check and the delete must be one script", what, version)
 	} else {
 		ctx.NoError(err, "purging %s, which nobody pins and is not the latest", version)
-		ctx.Assert(store.Version(stateBg, stateDS, version) == nil, "purge(%q) must delete a version nobody pins and that is not the latest", version)
+		ctx.Assert(store.Version(hStateBg, kHStateDS, version) == nil, "purge(%q) must delete a version nobody pins and that is not the latest", version)
 	}
 }
 
 func CheckAtomicPromotion(ctx *harness.Ctx) {
-	stateSetup(ctx)
-	ctx.Equal(mustPromote(ctx, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned")
-	seen := ctx.Redis.After(stateAudit, func() any {
-		latest, _ := ctx.Redis.Get(stateLatest)
-		return fmt.Sprintf("%s/%d", latest, ctx.Redis.LLen(stateAudit))
+	hStateSetup(ctx)
+	ctx.Equal(hMustPromote(ctx, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned")
+	seen := ctx.Redis.After(hStateAudit, func() any {
+		latest, _ := ctx.Redis.Get(hStateLatest)
+		return fmt.Sprintf("%s/%d", latest, ctx.Redis.LLen(hStateAudit))
 	})
-	previous := mustPromote(ctx, "2026-02", "bob")
+	previous := hMustPromote(ctx, "2026-02", "bob")
 	ctx.Assert(seen.Fired, "the promotion of 2026-02 never touched the audit list")
 	state, _ := seen.Result.(string)
 	ctx.Assert(state == "2026-01/1" || state == "2026-02/2", "a reader between the commands saw latest/audit entries %s: the pointer and its audit entry must change together, in one Lua script", state)
 	ctx.Equal(previous, "2026-01", "promote must return the previous latest")
-	ctx.Equal(ctx.Redis.LRange(stateAudit, 0, -1), []string{"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list")
-	latest, _ := ctx.Redis.Get(stateLatest)
+	ctx.Equal(ctx.Redis.LRange(hStateAudit, 0, -1), []string{"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list")
+	latest, _ := ctx.Redis.Get(hStateLatest)
 	ctx.Equal(latest, "2026-02", "the pointer after promoting 2026-02")
 	// Another promoter lands right after this promotion's first command on the pointer: every audit
 	// entry must name the version the one before it promoted.
-	raced := ctx.Redis.After(stateLatest, func() any {
-		before, _ := ctx.Redis.Get(stateLatest)
-		ctx.Redis.Set(stateLatest, "2026-03")
-		ctx.Redis.Do("RPUSH", stateAudit, before+"->2026-03 by carol")
+	raced := ctx.Redis.After(hStateLatest, func() any {
+		before, _ := ctx.Redis.Get(hStateLatest)
+		ctx.Redis.Set(hStateLatest, "2026-03")
+		ctx.Redis.Do("RPUSH", hStateAudit, before+"->2026-03 by carol")
 		return nil
 	})
-	returned := mustPromote(ctx, "2025-12", "dave")
+	returned := hMustPromote(ctx, "2025-12", "dave")
 	ctx.Assert(raced.Fired, "the promotion of 2025-12 never touched the pointer")
 	ctx.NoError(raced.Err, "the racing promotion")
-	all := ctx.Redis.LRange(stateAudit, 0, -1)
+	all := ctx.Redis.LRange(hStateAudit, 0, -1)
 	promoted, own := "", false
 	for i, entry := range all {
 		moved := strings.SplitN(strings.SplitN(entry, " by ", 2)[0], "->", 2)
@@ -1010,55 +1010,55 @@ func CheckAtomicPromotion(ctx *harness.Ctx) {
 		promoted = moved[1]
 		own = own || entry == returned+"->2025-12 by dave"
 	}
-	latest, _ = ctx.Redis.Get(stateLatest)
+	latest, _ = ctx.Redis.Get(hStateLatest)
 	ctx.Equal(promoted, latest, "the last audit entry against the pointer; the entry names")
 	ctx.Assert(own, "promote returned %q, which its own audit entry does not name: %q", returned, all)
 }
 
 func CheckDurablePointer(ctx *harness.Ctx) {
-	stateSetup(ctx)
-	mustPromote(ctx, "2026-01", "alice")
-	mustPromote(ctx, "2026-02", "bob")
-	latest, _ := ctx.Redis.Get(stateLatest)
+	hStateSetup(ctx)
+	hMustPromote(ctx, "2026-01", "alice")
+	hMustPromote(ctx, "2026-02", "bob")
+	latest, _ := ctx.Redis.Get(hStateLatest)
 	ctx.Equal(latest, "2026-02", "the pointer after two promotions")
-	ttl := ctx.Redis.TTL(stateLatest)
-	ctx.Equal(ttl, int64(-1), "%s expires in %d s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire; its TTL", stateLatest, ttl)
+	ttl := ctx.Redis.TTL(hStateLatest)
+	ctx.Equal(ttl, int64(-1), "%s expires in %d s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire; its TTL", hStateLatest, ttl)
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	stateSetup(ctx)
-	got, err := latest(stateBg, "wiki-text")
+	hStateSetup(ctx)
+	got, err := latest(hStateBg, "wiki-text")
 	ctx.Assert(err != nil, "latest(wiki-text) returned %q for a dataset with no promoted version: a caller passes that on as a version. Return ErrLatestVersionMissing", got)
 	ctx.Assert(errors.Is(err, ErrLatestVersionMissing), "latest(wiki-text) failed with %v, expected ErrLatestVersionMissing", err)
-	mustPromote(ctx, "2026-01", "alice")
-	got, err = latest(stateBg, stateDS)
+	hMustPromote(ctx, "2026-01", "alice")
+	got, err = latest(hStateBg, kHStateDS)
 	ctx.NoError(err, "latest after a promotion")
 	ctx.Equal(got, "2026-01", "latest after promoting 2026-01")
 }
 
 func CheckPinsIndependent(ctx *harness.Ctx) {
-	stateSetup(ctx)
-	mustPromote(ctx, "2026-01", "alice")
-	ctx.NoError(pin(stateBg, stateDS, "run-7", "2026-01"), "pin")
-	mustPromote(ctx, "2026-02", "bob")
-	pinned, _ := ctx.Redis.HGet(statePins, "run-7")
+	hStateSetup(ctx)
+	hMustPromote(ctx, "2026-01", "alice")
+	ctx.NoError(pin(hStateBg, kHStateDS, "run-7", "2026-01"), "pin")
+	hMustPromote(ctx, "2026-02", "bob")
+	pinned, _ := ctx.Redis.HGet(hStatePins, "run-7")
 	ctx.Equal(pinned, "2026-01", "run-7 pinned 2026-01: a promotion must leave the pins alone; run-7 reads")
-	stateRefused(ctx, "2026-01", "run-7 pins it")
-	ctx.Assert(store.Version(stateBg, stateDS, "2026-01") != nil, "the pinned version's record is gone")
-	stateRefused(ctx, "2026-02", "it is the latest")
-	ctx.Assert(store.Version(stateBg, stateDS, "2026-02") != nil, "the latest version's record is gone")
-	ctx.NoError(purge(stateBg, stateDS, "2025-12"), "purging a version nobody pins")
-	ctx.Assert(store.Version(stateBg, stateDS, "2025-12") == nil, "a version nobody pins and that is not the latest must be purged")
-	ctx.Equal(store.Versions(stateBg, stateDS), []string{"2026-01", "2026-02"}, "the versions left after the purge")
+	hStateRefused(ctx, "2026-01", "run-7 pins it")
+	ctx.Assert(store.Version(hStateBg, kHStateDS, "2026-01") != nil, "the pinned version's record is gone")
+	hStateRefused(ctx, "2026-02", "it is the latest")
+	ctx.Assert(store.Version(hStateBg, kHStateDS, "2026-02") != nil, "the latest version's record is gone")
+	ctx.NoError(purge(hStateBg, kHStateDS, "2025-12"), "purging a version nobody pins")
+	ctx.Assert(store.Version(hStateBg, kHStateDS, "2025-12") == nil, "a version nobody pins and that is not the latest must be purged")
+	ctx.Equal(store.Versions(hStateBg, kHStateDS), []string{"2026-01", "2026-02"}, "the versions left after the purge")
 	for _, v := range []string{"2025-10", "2025-11"} {
-		err := store.PutVersion(stateBg, &store.VersionRecord{Tenant: "t1", Dataset: stateDS, Version: v, ContentSHA256: strings.Repeat("0", 64), License: "mit", Owner: "team-lm", SizeBytes: 20, RowCount: 2, Status: "validated"})
+		err := store.PutVersion(hStateBg, &store.VersionRecord{Tenant: "t1", Dataset: kHStateDS, Version: v, ContentSHA256: strings.Repeat("0", 64), License: "mit", Owner: "team-lm", SizeBytes: 20, RowCount: 2, Status: "validated"})
 		ctx.NoError(err, "seeding %s", v)
 	}
-	statePurgeRaced(ctx, stateLatest, "2025-11", func() {
-		ctx.Redis.Set(stateLatest, "2025-11")
-		ctx.Redis.Do("RPUSH", stateAudit, "2026-02->2025-11 by carol")
+	hStatePurgeRaced(ctx, hStateLatest, "2025-11", func() {
+		ctx.Redis.Set(hStateLatest, "2025-11")
+		ctx.Redis.Do("RPUSH", hStateAudit, "2026-02->2025-11 by carol")
 	}, "carol promoted 2025-11")
-	statePurgeRaced(ctx, statePins, "2025-10", func() { ctx.Redis.Do("HSET", statePins, "run-9", "2025-10") }, "run-9 pinned 2025-10")
+	hStatePurgeRaced(ctx, hStatePins, "2025-10", func() { ctx.Redis.Do("HSET", hStatePins, "run-9", "2025-10") }, "run-9 pinned 2025-10")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1070,16 +1070,16 @@ func CheckPinsIndependent(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDS = "imdb-reviews";
-const std::string kLatest = "dataset:" + kDS + ":latest";
-const std::string kAudit = "dataset:" + kDS + ":audit";
-const std::string kPins = "dataset:" + kDS + ":pins";
+const std::string kHDS = "imdb-reviews";
+const std::string kHLatest = "dataset:" + kHDS + ":latest";
+const std::string kHAudit = "dataset:" + kHDS + ":audit";
+const std::string kHPins = "dataset:" + kHDS + ":pins";
 
-void setup() {
+void hSetup() {
   for (const std::string version : {"2025-12", "2026-01", "2026-02"}) {
     store::VersionRecord rec;
     rec.tenant = "t1";
-    rec.dataset = kDS;
+    rec.dataset = kHDS;
     rec.version = version;
     rec.content_sha256 = std::string(64, '0');
     rec.license = "mit";
@@ -1091,9 +1091,9 @@ void setup() {
   }
 }
 
-void refused(harness::Ctx& ctx, const std::string& version, const std::string& why) {
+void hRefused(harness::Ctx& ctx, const std::string& version, const std::string& why) {
   try {
-    purge(kDS, version);
+    purge(kHDS, version);
   } catch (const VersionPinned&) {
     return;
   }
@@ -1101,8 +1101,8 @@ void refused(harness::Ctx& ctx, const std::string& version, const std::string& w
 }
 
 // Purge version while another client lands rival right after the purge's first command on key.
-void purgeRaced(harness::Ctx& ctx, const std::string& key, const std::string& version, const std::function<void()>& rival, const std::string& what) {
-  const std::string vkey = store::versionKey(kDS, version);
+void hPurgeRaced(harness::Ctx& ctx, const std::string& key, const std::string& version, const std::function<void()>& rival, const std::string& what) {
+  const std::string vkey = store::versionKey(kHDS, version);
   bool fired = false;
   bool landed = false;
   ctx.Redis.After(key, [&] {
@@ -1113,45 +1113,45 @@ void purgeRaced(harness::Ctx& ctx, const std::string& key, const std::string& ve
   });
   bool isRefused = false;
   try {
-    purge(kDS, version);
+    purge(kHDS, version);
   } catch (const VersionPinned&) {
     isRefused = true;
   }
   ctx.Assert(fired, "purge(%q) never touched %s", version, key);
   if (landed) {
-    ctx.Assert(isRefused && store::version(kDS, version).has_value(),
+    ctx.Assert(isRefused && store::version(kHDS, version).has_value(),
                "%s between the purge's check and its delete, and purge(%q) deleted it anyway: the check and the delete must be one script", what, version);
   } else {
-    ctx.Assert(!isRefused && !store::version(kDS, version), "purge(%q) must delete a version nobody pins and that is not the latest", version);
+    ctx.Assert(!isRefused && !store::version(kHDS, version), "purge(%q) must delete a version nobody pins and that is not the latest", version);
   }
 }
 
 }  // namespace
 
 void CheckAtomicPromotion(harness::Ctx& ctx) {
-  setup();
-  ctx.Equal(promote(kDS, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned");
+  hSetup();
+  ctx.Equal(promote(kHDS, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned");
   std::string seen;
-  ctx.Redis.After(kAudit, [&] { seen = ctx.Redis.Get(kLatest).value_or("") + "/" + std::to_string(ctx.Redis.LLen(kAudit)); });
-  const std::string previous = promote(kDS, "2026-02", "bob");
+  ctx.Redis.After(kHAudit, [&] { seen = ctx.Redis.Get(kHLatest).value_or("") + "/" + std::to_string(ctx.Redis.LLen(kHAudit)); });
+  const std::string previous = promote(kHDS, "2026-02", "bob");
   ctx.Assert(!seen.empty(), "the promotion of 2026-02 never touched the audit list");
   ctx.Assert(seen == "2026-01/1" || seen == "2026-02/2",
              "a reader between the commands saw latest/audit entries %s: the pointer and its audit entry must change together, in one Lua script", seen);
   ctx.Equal(previous, "2026-01", "promote must return the previous latest");
-  ctx.Equal(ctx.Redis.LRange(kAudit, 0, -1), {"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list");
-  ctx.Equal(ctx.Redis.Get(kLatest).value_or(""), "2026-02", "the pointer after promoting 2026-02");
+  ctx.Equal(ctx.Redis.LRange(kHAudit, 0, -1), {"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list");
+  ctx.Equal(ctx.Redis.Get(kHLatest).value_or(""), "2026-02", "the pointer after promoting 2026-02");
   // Another promoter lands right after this promotion's first command on the pointer: every audit
   // entry must name the version the one before it promoted.
   bool raced = false;
-  ctx.Redis.After(kLatest, [&] {
+  ctx.Redis.After(kHLatest, [&] {
     raced = true;
-    const std::string before = ctx.Redis.Get(kLatest).value_or("");
-    ctx.Redis.Set(kLatest, "2026-03");
-    ctx.Redis.Do("RPUSH", kAudit, before + "->2026-03 by carol");
+    const std::string before = ctx.Redis.Get(kHLatest).value_or("");
+    ctx.Redis.Set(kHLatest, "2026-03");
+    ctx.Redis.Do("RPUSH", kHAudit, before + "->2026-03 by carol");
   });
-  const std::string returned = promote(kDS, "2025-12", "dave");
+  const std::string returned = promote(kHDS, "2025-12", "dave");
   ctx.Assert(raced, "the promotion of 2025-12 never touched the pointer");
-  const auto all = ctx.Redis.LRange(kAudit, 0, -1);
+  const auto all = ctx.Redis.LRange(kHAudit, 0, -1);
   std::string promoted;
   bool own = false;
   for (size_t i = 0; i < all.size(); i++) {
@@ -1163,48 +1163,48 @@ void CheckAtomicPromotion(harness::Ctx& ctx) {
     promoted = moved.substr(arrow + 2);
     own = own || all[i] == returned + "->2025-12 by dave";
   }
-  ctx.Equal(promoted, ctx.Redis.Get(kLatest).value_or(""), "the last audit entry against the pointer; the entry names");
+  ctx.Equal(promoted, ctx.Redis.Get(kHLatest).value_or(""), "the last audit entry against the pointer; the entry names");
   ctx.Assert(own, "promote returned %q, which its own audit entry does not name: %v", returned, all);
 }
 
 void CheckDurablePointer(harness::Ctx& ctx) {
-  setup();
-  promote(kDS, "2026-01", "alice");
-  promote(kDS, "2026-02", "bob");
-  ctx.Equal(ctx.Redis.Get(kLatest).value_or(""), "2026-02", "the pointer after two promotions");
-  const long long ttl = ctx.Redis.TTL(kLatest);
-  ctx.Equal(ttl, -1LL, "%s expires in %d s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire; its TTL", kLatest, ttl);
+  hSetup();
+  promote(kHDS, "2026-01", "alice");
+  promote(kHDS, "2026-02", "bob");
+  ctx.Equal(ctx.Redis.Get(kHLatest).value_or(""), "2026-02", "the pointer after two promotions");
+  const long long ttl = ctx.Redis.TTL(kHLatest);
+  ctx.Equal(ttl, -1LL, "%s expires in %d s: a dataset nobody promotes for that long loses its latest version. The pointer must not expire; its TTL", kHLatest, ttl);
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  setup();
+  hSetup();
   std::string got;
   try {
     got = latest("wiki-text");
     ctx.Fatalf("latest(wiki-text) returned %q for a dataset with no promoted version: a caller passes that on as a version. Throw LatestVersionMissing", got);
   } catch (const LatestVersionMissing&) {
   }
-  promote(kDS, "2026-01", "alice");
-  ctx.Equal(latest(kDS), "2026-01", "latest after promoting 2026-01");
+  promote(kHDS, "2026-01", "alice");
+  ctx.Equal(latest(kHDS), "2026-01", "latest after promoting 2026-01");
 }
 
 void CheckPinsIndependent(harness::Ctx& ctx) {
-  setup();
-  promote(kDS, "2026-01", "alice");
-  pin(kDS, "run-7", "2026-01");
-  promote(kDS, "2026-02", "bob");
-  ctx.Equal(ctx.Redis.HGet(kPins, "run-7").value_or(""), "2026-01", "run-7 pinned 2026-01: a promotion must leave the pins alone; run-7 reads");
-  refused(ctx, "2026-01", "run-7 pins it");
-  ctx.Assert(store::version(kDS, "2026-01").has_value(), "the pinned version's record is gone");
-  refused(ctx, "2026-02", "it is the latest");
-  ctx.Assert(store::version(kDS, "2026-02").has_value(), "the latest version's record is gone");
-  purge(kDS, "2025-12");
-  ctx.Assert(!store::version(kDS, "2025-12"), "a version nobody pins and that is not the latest must be purged");
-  ctx.Equal(store::versions(kDS), {"2026-01", "2026-02"}, "the versions left after the purge");
+  hSetup();
+  promote(kHDS, "2026-01", "alice");
+  pin(kHDS, "run-7", "2026-01");
+  promote(kHDS, "2026-02", "bob");
+  ctx.Equal(ctx.Redis.HGet(kHPins, "run-7").value_or(""), "2026-01", "run-7 pinned 2026-01: a promotion must leave the pins alone; run-7 reads");
+  hRefused(ctx, "2026-01", "run-7 pins it");
+  ctx.Assert(store::version(kHDS, "2026-01").has_value(), "the pinned version's record is gone");
+  hRefused(ctx, "2026-02", "it is the latest");
+  ctx.Assert(store::version(kHDS, "2026-02").has_value(), "the latest version's record is gone");
+  purge(kHDS, "2025-12");
+  ctx.Assert(!store::version(kHDS, "2025-12"), "a version nobody pins and that is not the latest must be purged");
+  ctx.Equal(store::versions(kHDS), {"2026-01", "2026-02"}, "the versions left after the purge");
   for (const std::string version : {"2025-10", "2025-11"}) {
     store::VersionRecord rec;
     rec.tenant = "t1";
-    rec.dataset = kDS;
+    rec.dataset = kHDS;
     rec.version = version;
     rec.content_sha256 = std::string(64, '0');
     rec.license = "mit";
@@ -1214,11 +1214,11 @@ void CheckPinsIndependent(harness::Ctx& ctx) {
     rec.status = "validated";
     store::putVersion(rec);
   }
-  purgeRaced(ctx, kLatest, "2025-11", [&] {
-    ctx.Redis.Set(kLatest, "2025-11");
-    ctx.Redis.Do("RPUSH", kAudit, "2026-02->2025-11 by carol");
+  hPurgeRaced(ctx, kHLatest, "2025-11", [&] {
+    ctx.Redis.Set(kHLatest, "2025-11");
+    ctx.Redis.Do("RPUSH", kHAudit, "2026-02->2025-11 by carol");
   }, "carol promoted 2025-11");
-  purgeRaced(ctx, kPins, "2025-10", [&] { ctx.Redis.Do("HSET", kPins, "run-9", "2025-10"); }, "run-9 pinned 2025-10");
+  hPurgeRaced(ctx, kHPins, "2025-10", [&] { ctx.Redis.Do("HSET", kHPins, "run-9", "2025-10"); }, "run-9 pinned 2025-10");
 }
 `,
   },

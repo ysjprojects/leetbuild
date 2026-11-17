@@ -1189,12 +1189,12 @@ import (
 )
 
 const (
-	eventsTopic = "batch.shard"
-	eventsGroup = "batch-coordinator"
+	kHEventsTopic = "batch.shard"
+	kHEventsGroup = "batch-coordinator"
 )
 
 // eventsResult is a shard of three records: two answered, one the model could not parse.
-func eventsResult(batchID string, shardID int) records.ShardResult {
+func hEventsResult(batchID string, shardID int) records.ShardResult {
 	return records.ShardResult{
 		BatchID: batchID, ShardID: shardID, Model: "sum-v7", Completed: 2, Failed: 1,
 		Outputs: []records.Output{{RecordID: fmt.Sprintf("r%d-0", shardID), Output: "summary[sum-v7]: refund", Model: "sum-v7"}, {RecordID: fmt.Sprintf("r%d-1", shardID), Output: "summary[sum-v7]: login", Model: "sum-v7"}},
@@ -1202,15 +1202,15 @@ func eventsResult(batchID string, shardID int) records.ShardResult {
 	}
 }
 
-func eventsURI(shardID int) string { return fmt.Sprintf("s3://batch-outputs/b1/shard-%05d.jsonl", shardID) }
+func hEventsURI(shardID int) string { return fmt.Sprintf("s3://batch-outputs/b1/shard-%05d.jsonl", shardID) }
 
-func eventsEvent(shardID int) string {
-	e, _ := json.Marshal(map[string]any{"batch_id": "b1", "shard_id": shardID, "model": "sum-v7", "completed": 2, "failed": 1, "output_uri": eventsURI(shardID), "checksum": fmt.Sprintf("c%d", shardID)})
+func hEventsEvent(shardID int) string {
+	e, _ := json.Marshal(map[string]any{"batch_id": "b1", "shard_id": shardID, "model": "sum-v7", "completed": 2, "failed": 1, "output_uri": hEventsURI(shardID), "checksum": fmt.Sprintf("c%d", shardID)})
 	return string(e)
 }
 
 // eventsPublish is publishShard, reporting a panic as an error instead of ending the check.
-func eventsPublish(result records.ShardResult) (err error) {
+func hEventsPublish(result records.ShardResult) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			err = errors.New("panic: " + harness.Show(e))
@@ -1219,7 +1219,7 @@ func eventsPublish(result records.ShardResult) (err error) {
 	return publishShard(context.Background(), result)
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("batch:outbox", 0, -1) {
 		var e map[string]any
@@ -1229,7 +1229,7 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsFolded(ctx *harness.Ctx) []string {
+func hEventsFolded(ctx *harness.Ctx) []string {
 	keys := []string{}
 	for k := range ctx.Redis.HGetAll("batch:outputs:b1") {
 		keys = append(keys, k)
@@ -1240,62 +1240,62 @@ func eventsFolded(ctx *harness.Ctx) []string {
 
 func CheckBatchKey(ctx *harness.Ctx) {
 	for _, shard := range []int{0, 1, 2} {
-		ctx.NoError(eventsPublish(eventsResult("b1", shard)), "publishShard on a healthy broker")
+		ctx.NoError(hEventsPublish(hEventsResult("b1", shard)), "publishShard on a healthy broker")
 	}
-	ctx.NoError(eventsPublish(eventsResult("b2", 0)), "publishShard on a healthy broker")
+	ctx.NoError(hEventsPublish(hEventsResult("b2", 0)), "publishShard on a healthy broker")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 4, "four finished shards must produce four records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"b1", "b1", "b1", "b2"}, "records must be keyed by the batch id (keyed by shard, one batch spreads over partitions and its shards arrive in no order)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 4, "four finished shards must produce four records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"b1", "b1", "b1", "b2"}, "records must be keyed by the batch id (keyed by shard, one batch spreads over partitions and its shards arrive in no order)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "one batch must land on one partition so the coordinator sees its shards in order")
 }
 
 func CheckOutputBeforeEvent(ctx *harness.Ctx) {
 	fired, onTopic := false, 0
-	ctx.Redis.After("batch:object:"+eventsURI(0), func() any {
-		fired, onTopic = true, len(ctx.Kafka.Records(eventsTopic))
+	ctx.Redis.After("batch:object:"+hEventsURI(0), func() any {
+		fired, onTopic = true, len(ctx.Kafka.Records(kHEventsTopic))
 		return nil
 	})
-	ctx.NoError(eventsPublish(eventsResult("b1", 0)), "publishShard on a healthy broker")
+	ctx.NoError(hEventsPublish(hEventsResult("b1", 0)), "publishShard on a healthy broker")
 	ctx.Settle()
-	ctx.Assert(fired, "publishShard never wrote the output object %s", eventsURI(0))
+	ctx.Assert(fired, "publishShard never wrote the output object %s", hEventsURI(0))
 	ctx.Equal(onTopic, 0, "the event was on the topic before its output object was written (a coordinator that reads it first finds no object, and a crash in between announces an output that never existed); records on the topic at the write")
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one shard must produce one record; the records")
 	var e map[string]any
 	ctx.NoError(json.Unmarshal(records[0].Value, &e), "the event is JSON: %s", records[0].Value)
-	body, _ := ctx.Redis.Get("batch:object:" + eventsURI(0))
+	body, _ := ctx.Redis.Get("batch:object:" + hEventsURI(0))
 	sum := sha256.Sum256([]byte(body))
-	ctx.Equal(e["output_uri"], eventsURI(0), "the event must carry output_uri (%v)", e)
+	ctx.Equal(e["output_uri"], hEventsURI(0), "the event must carry output_uri (%v)", e)
 	ctx.Equal(e["checksum"], hex.EncodeToString(sum[:]), "the event must carry the SHA-256 of the stored object as checksum")
 	ctx.Assert(e["batch_id"] == "b1" && e["shard_id"] == float64(0) && e["model"] == "sum-v7" && e["completed"] == float64(2) && e["failed"] == float64(1), "the event must carry batch_id, shard_id, model and the counts: %v", e)
 }
 
 func CheckOutboxOnReject(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	err := eventsPublish(eventsResult("b1", 0))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	err := hEventsPublish(hEventsResult("b1", 0))
 	ctx.Assert(err == nil, "publishShard failed when the broker refused the produce: %v; the event goes to the outbox, the worker goes on", err)
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: the refusal arrives as the write's error, and a shard whose event is lost never reaches the batch; outbox rows")
 	ctx.Assert(rows[0]["batch_id"] == "b1" && rows[0]["shard_id"] == float64(0), "the outbox row must be the event itself, got %v", rows[0])
 	checksum, _ := rows[0]["checksum"].(string)
-	ctx.Assert(rows[0]["output_uri"] == eventsURI(0) && checksum != "" && rows[0]["completed"] == float64(2) && rows[0]["failed"] == float64(1), "the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: %v", rows[0])
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
-	ctx.NoError(eventsPublish(eventsResult("b1", 1)), "a healthy produce")
+	ctx.Assert(rows[0]["output_uri"] == hEventsURI(0) && checksum != "" && rows[0]["completed"] == float64(2) && rows[0]["failed"] == float64(1), "the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: %v", rows[0])
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing reached the topic for the refused produce; records")
+	ctx.NoError(hEventsPublish(hEventsResult("b1", 1)), "a healthy produce")
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
 }
 
 func CheckFoldBeforeCommit(ctx *harness.Ctx) {
 	for _, shard := range []int{0, 1} {
-		ctx.Kafka.Seed(eventsTopic, "b1", eventsEvent(shard))
+		ctx.Kafka.Seed(kHEventsTopic, "b1", hEventsEvent(shard))
 	}
 	// Last on the same partition, a shard of b9 whose fold fails: batch:outputs:b9 is not a hash.
-	ctx.Kafka.Seed(eventsTopic, "b1", strings.Replace(eventsEvent(2), \`"batch_id":"b1"\`, \`"batch_id":"b9"\`, 1))
+	ctx.Kafka.Seed(kHEventsTopic, "b1", strings.Replace(hEventsEvent(2), \`"batch_id":"b1"\`, \`"batch_id":"b9"\`, 1))
 	ctx.Redis.Set("batch:outputs:b9", "not-a-hash")
 	var atCommit [][]string
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, eventsFolded(ctx)) })
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, hEventsFolded(ctx)) })
 	ctx.Drain(func() { consumeShards(context.Background()) })
 	ctx.Assert(len(atCommit) > 0, "the coordinator never committed an offset")
 	has0 := false
@@ -1306,25 +1306,25 @@ func CheckFoldBeforeCommit(ctx *harness.Ctx) {
 	raw, _ := ctx.Redis.HGet("batch:outputs:b1", "0")
 	var entry map[string]any
 	json.Unmarshal([]byte(raw), &entry)
-	ctx.Assert(entry["uri"] == eventsURI(0) && entry["checksum"] == "c0" && entry["completed"] == float64(2) && entry["failed"] == float64(1), "the folded entry carries the event's uri, checksum and counts, got %s", raw)
-	ctx.Equal(eventsFolded(ctx), []string{"0", "1"}, "both shards must be folded; batch:outputs:b1 holds")
-	lag := ctx.Kafka.Lag(eventsGroup, eventsTopic)
+	ctx.Assert(entry["uri"] == hEventsURI(0) && entry["checksum"] == "c0" && entry["completed"] == float64(2) && entry["failed"] == float64(1), "the folded entry carries the event's uri, checksum and counts, got %s", raw)
+	ctx.Equal(hEventsFolded(ctx), []string{"0", "1"}, "both shards must be folded; batch:outputs:b1 holds")
+	lag := ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic)
 	ctx.Assert(lag <= 1, "the coordinator left %d record(s) uncommitted: every shard it folded must be committed", lag)
 	ctx.Assert(lag == 1, "the fold of b9's shard failed (WRONGTYPE) and its offset was committed anyway: the shard is lost for good. Commit only after the fold succeeded")
 }
 
 func CheckFoldOnce(ctx *harness.Ctx) {
 	for _, shard := range []int{0, 0, 1} { // shard 0 twice: a replay after a crash before the commit
-		ctx.Kafka.Seed(eventsTopic, "b1", eventsEvent(shard))
+		ctx.Kafka.Seed(kHEventsTopic, "b1", hEventsEvent(shard))
 	}
 	entries, completed := 0, ""
 	ctx.Redis.After("batch:outputs:b1", func() any {
-		entries = len(eventsFolded(ctx))
+		entries = len(hEventsFolded(ctx))
 		completed, _ = ctx.Redis.HGet("batch:totals:b1", "completed")
 		return nil
 	})
 	ctx.Drain(func() { consumeShards(context.Background()) })
-	ctx.Equal(eventsFolded(ctx), []string{"0", "1"}, "two shards, two entries; batch:outputs:b1 holds")
+	ctx.Equal(hEventsFolded(ctx), []string{"0", "1"}, "two shards, two entries; batch:outputs:b1 holds")
 	totals := ctx.Redis.HGetAll("batch:totals:b1")
 	ctx.Assert(totals["completed"] == "4" && totals["failed"] == "2", "two shards of 2 completed and 1 failed record are completed 4, failed 2; batch:totals:b1 holds %v: the replayed shard was counted twice", totals)
 	ctx.Assert(completed == strconv.Itoa(2*entries) || (entries == 0 && completed == ""), "right after the coordinator's first command on batch:outputs:b1 it held %d entries and the totals said completed %q: the entry and its counts must land in one script, or a crash between them leaves a shard folded and never counted", entries, completed)
@@ -1344,11 +1344,11 @@ func CheckFoldOnce(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "batch.shard";
-const std::string kEventsGroup = "batch-coordinator";
+const std::string kHEventsTopic = "batch.shard";
+const std::string kHEventsGroup = "batch-coordinator";
 
 // A shard of three records: two answered, one the model could not parse.
-records::ShardResult eventsResult(const std::string& batch_id, int shard_id) {
+records::ShardResult hEventsResult(const std::string& batch_id, int shard_id) {
   records::ShardResult r{batch_id, shard_id, "sum-v7", 2, 1};
   const std::string s = std::to_string(shard_id);
   r.outputs = {{"r" + s + "-0", "summary[sum-v7]: refund", "sum-v7"}, {"r" + s + "-1", "summary[sum-v7]: login", "sum-v7"}};
@@ -1356,18 +1356,18 @@ records::ShardResult eventsResult(const std::string& batch_id, int shard_id) {
   return r;
 }
 
-std::string eventsUri(int shard_id) {
+std::string hEventsUri(int shard_id) {
   char buf[64];
   std::snprintf(buf, sizeof buf, "s3://batch-outputs/b1/shard-%05d.jsonl", shard_id);
   return buf;
 }
 
-std::string eventsEvent(int shard_id) {
-  return nlohmann::json{{"batch_id", "b1"}, {"shard_id", shard_id}, {"model", "sum-v7"}, {"completed", 2}, {"failed", 1}, {"output_uri", eventsUri(shard_id)}, {"checksum", "c" + std::to_string(shard_id)}}.dump();
+std::string hEventsEvent(int shard_id) {
+  return nlohmann::json{{"batch_id", "b1"}, {"shard_id", shard_id}, {"model", "sum-v7"}, {"completed", 2}, {"failed", 1}, {"output_uri", hEventsUri(shard_id)}, {"checksum", "c" + std::to_string(shard_id)}}.dump();
 }
 
 // publish_shard, reporting what it threw (empty when nothing) instead of ending the check.
-std::string eventsPublish(const records::ShardResult& result) {
+std::string hEventsPublish(const records::ShardResult& result) {
   try {
     publish_shard(result);
     return "";
@@ -1376,13 +1376,13 @@ std::string eventsPublish(const records::ShardResult& result) {
   }
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("batch:outbox", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
 }
 
-std::vector<std::string> eventsFolded(harness::Ctx& ctx) {
+std::vector<std::string> hEventsFolded(harness::Ctx& ctx) {
   std::vector<std::string> keys;
   for (const auto& [k, v] : ctx.Redis.HGetAll("batch:outputs:b1")) keys.push_back(k);
   std::sort(keys.begin(), keys.end());
@@ -1392,62 +1392,62 @@ std::vector<std::string> eventsFolded(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckBatchKey(harness::Ctx& ctx) {
-  for (int shard : {0, 1, 2}) ctx.Equal(eventsPublish(eventsResult("b1", shard)), "", "publish_shard on a healthy broker threw");
-  ctx.Equal(eventsPublish(eventsResult("b2", 0)), "", "publish_shard on a healthy broker threw");
+  for (int shard : {0, 1, 2}) ctx.Equal(hEventsPublish(hEventsResult("b1", shard)), "", "publish_shard on a healthy broker threw");
+  ctx.Equal(hEventsPublish(hEventsResult("b2", 0)), "", "publish_shard on a healthy broker threw");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 4, "four finished shards must produce four records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"b1", "b1", "b1", "b2"}, "records must be keyed by the batch id (keyed by shard, one batch spreads over partitions and its shards arrive in no order)");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 4, "four finished shards must produce four records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"b1", "b1", "b1", "b2"}, "records must be keyed by the batch id (keyed by shard, one batch spreads over partitions and its shards arrive in no order)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "one batch must land on one partition so the coordinator sees its shards in order");
 }
 
 void CheckOutputBeforeEvent(harness::Ctx& ctx) {
   bool fired = false;
   size_t onTopic = 0;
-  ctx.Redis.After("batch:object:" + eventsUri(0), [&] {
+  ctx.Redis.After("batch:object:" + hEventsUri(0), [&] {
     fired = true;
-    onTopic = ctx.Kafka.Records(kEventsTopic).size();
+    onTopic = ctx.Kafka.Records(kHEventsTopic).size();
   });
-  ctx.Equal(eventsPublish(eventsResult("b1", 0)), "", "publish_shard on a healthy broker threw");
+  ctx.Equal(hEventsPublish(hEventsResult("b1", 0)), "", "publish_shard on a healthy broker threw");
   ctx.Settle();
-  ctx.Assert(fired, "publish_shard never wrote the output object %s", eventsUri(0));
+  ctx.Assert(fired, "publish_shard never wrote the output object %s", hEventsUri(0));
   ctx.Equal(onTopic, 0, "the event was on the topic before its output object was written (a coordinator that reads it first finds no object, and a crash in between announces an output that never existed); records on the topic at the write");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 1, "one shard must produce one record; the records");
   const auto e = nlohmann::json::parse(records[0].Value.value_or(""), nullptr, false);
   ctx.Assert(e.is_object(), "the event must be JSON: %s", records[0].Value.value_or(""));
-  const std::string body = ctx.Redis.Get("batch:object:" + eventsUri(0)).value_or("");
-  ctx.Equal(e.value("output_uri", ""), eventsUri(0), "the event must carry output_uri (%v)", e);
+  const std::string body = ctx.Redis.Get("batch:object:" + hEventsUri(0)).value_or("");
+  ctx.Equal(e.value("output_uri", ""), hEventsUri(0), "the event must carry output_uri (%v)", e);
   ctx.Equal(e.value("checksum", ""), sha256_hex(body), "the event must carry the SHA-256 of the stored object as checksum");
   ctx.Assert(e.value("batch_id", "") == "b1" && e.value("shard_id", -1) == 0 && e.value("model", "") == "sum-v7" && e.value("completed", -1) == 2 && e.value("failed", -1) == 1, "the event must carry batch_id, shard_id, model and the counts: %v", e);
 }
 
 void CheckOutboxOnReject(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const std::string raised = eventsPublish(eventsResult("b1", 0));
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const std::string raised = hEventsPublish(hEventsResult("b1", 0));
   ctx.Assert(raised.empty(), "publish_shard threw when the broker refused the produce: %s; the event goes to the outbox, the worker goes on", raised);
   ctx.Settle();
   producer->poll(0);  // the worker's loop serves delivery reports between shards
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: the refusal arrives in the delivery report, and a shard whose event is lost never reaches the batch; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].value("batch_id", "") == "b1" && rows[0].value("shard_id", -1) == 0, "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
-  ctx.Assert(rows[0].value("output_uri", "") == eventsUri(0) && !rows[0].value("checksum", "").empty() && rows[0].value("completed", -1) == 2 && rows[0].value("failed", -1) == 1, "the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: %v", rows[0]);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
-  ctx.Equal(eventsPublish(eventsResult("b1", 1)), "", "a healthy produce threw");
+  ctx.Assert(rows[0].value("output_uri", "") == hEventsUri(0) && !rows[0].value("checksum", "").empty() && rows[0].value("completed", -1) == 2 && rows[0].value("failed", -1) == 1, "the outbox row must be the whole event the broker refused (output_uri, checksum and counts too), so the relay can republish it: %v", rows[0]);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
+  ctx.Equal(hEventsPublish(hEventsResult("b1", 1)), "", "a healthy produce threw");
   ctx.Settle();
   producer->poll(0);
-  ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
+  ctx.Assert(ctx.Kafka.Records(kHEventsTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
 }
 
 void CheckFoldBeforeCommit(harness::Ctx& ctx) {
-  for (int shard : {0, 1}) ctx.Kafka.Seed(kEventsTopic, "b1", eventsEvent(shard));
+  for (int shard : {0, 1}) ctx.Kafka.Seed(kHEventsTopic, "b1", hEventsEvent(shard));
   // Last on the same partition, a shard of b9 whose fold fails: batch:outputs:b9 is not a hash.
-  auto failing = nlohmann::json::parse(eventsEvent(2));
+  auto failing = nlohmann::json::parse(hEventsEvent(2));
   failing["batch_id"] = "b9";
-  ctx.Kafka.Seed(kEventsTopic, "b1", failing.dump());
+  ctx.Kafka.Seed(kHEventsTopic, "b1", failing.dump());
   ctx.Redis.Set("batch:outputs:b9", "not-a-hash");
   std::vector<std::vector<std::string>> atCommit;
-  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(eventsFolded(ctx)); });
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(hEventsFolded(ctx)); });
   try {
     ctx.Drain([] { consume_shards(); });
   } catch (const std::exception&) {
@@ -1456,23 +1456,23 @@ void CheckFoldBeforeCommit(harness::Ctx& ctx) {
   ctx.Assert(!atCommit.empty(), "the coordinator never committed an offset");
   ctx.Assert(std::find(atCommit[0].begin(), atCommit[0].end(), "0") != atCommit[0].end(), "at the first commit batch:outputs:b1 held %v: shard 0's offset was committed before it was folded, and a crash between the two loses the shard for good", atCommit[0]);
   const auto entry = nlohmann::json::parse(ctx.Redis.HGet("batch:outputs:b1", "0").value_or("{}"), nullptr, false);
-  ctx.Assert(entry.is_object() && entry.value("uri", "") == eventsUri(0) && entry.value("checksum", "") == "c0" && entry.value("completed", -1) == 2 && entry.value("failed", -1) == 1, "the folded entry carries the event's uri, checksum and counts, got %v", entry);
-  ctx.Equal(eventsFolded(ctx), {"0", "1"}, "both shards must be folded; batch:outputs:b1 holds");
-  const auto lag = ctx.Kafka.Lag(kEventsGroup, kEventsTopic);
+  ctx.Assert(entry.is_object() && entry.value("uri", "") == hEventsUri(0) && entry.value("checksum", "") == "c0" && entry.value("completed", -1) == 2 && entry.value("failed", -1) == 1, "the folded entry carries the event's uri, checksum and counts, got %v", entry);
+  ctx.Equal(hEventsFolded(ctx), {"0", "1"}, "both shards must be folded; batch:outputs:b1 holds");
+  const auto lag = ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic);
   ctx.Assert(lag <= 1, "the coordinator left %d record(s) uncommitted: every shard it folded must be committed", lag);
   ctx.Assert(lag == 1, "the fold of b9's shard failed (WRONGTYPE) and its offset was committed anyway: the shard is lost for good. Commit only after the fold succeeded");
 }
 
 void CheckFoldOnce(harness::Ctx& ctx) {
-  for (int shard : {0, 0, 1}) ctx.Kafka.Seed(kEventsTopic, "b1", eventsEvent(shard));  // shard 0 twice: a replay after a crash before the commit
+  for (int shard : {0, 0, 1}) ctx.Kafka.Seed(kHEventsTopic, "b1", hEventsEvent(shard));  // shard 0 twice: a replay after a crash before the commit
   size_t entries = 0;
   std::string completed;
   ctx.Redis.After("batch:outputs:b1", [&] {
-    entries = eventsFolded(ctx).size();
+    entries = hEventsFolded(ctx).size();
     completed = ctx.Redis.HGet("batch:totals:b1", "completed").value_or("");
   });
   ctx.Drain([] { consume_shards(); });
-  ctx.Equal(eventsFolded(ctx), {"0", "1"}, "two shards, two entries; batch:outputs:b1 holds");
+  ctx.Equal(hEventsFolded(ctx), {"0", "1"}, "two shards, two entries; batch:outputs:b1 holds");
   const auto totals = ctx.Redis.HGetAll("batch:totals:b1");
   const auto field = [&](const char* f) { return totals.count(f) ? totals.at(f) : std::string(); };
   ctx.Assert(field("completed") == "4" && field("failed") == "2", "two shards of 2 completed and 1 failed record are completed 4, failed 2; batch:totals:b1 holds %v: the replayed shard was counted twice", totals);

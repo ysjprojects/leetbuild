@@ -682,34 +682,34 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "graph.changed"
+const kHEventsTopic = "graph.changed"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsEntities(names ...string) []string {
+func hEventsEntities(names ...string) []string {
 	ids := []string{}
 	for _, name := range names {
-		ids = append(ids, store.CreateEntity(eventsBg, "t1", "person", name, nil).ID)
+		ids = append(ids, store.CreateEntity(hEventsBg, "t1", "person", name, nil).ID)
 	}
 	return ids
 }
 
-func eventsRename(ctx *harness.Ctx, entityID, newName string) bool {
-	ok, err := renameEntity(eventsBg, "t1", entityID, newName)
+func hEventsRename(ctx *harness.Ctx, entityID, newName string) bool {
+	ok, err := renameEntity(hEventsBg, "t1", entityID, newName)
 	ctx.NoError(err, "renameEntity(t1, %s) failed", entityID)
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	rows := []eventsRow{}
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	rows := []HEventsRow{}
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		row := eventsRow{}
+		row := HEventsRow{}
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -717,23 +717,23 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckEntityKey(ctx *harness.Ctx) {
-	ids := eventsEntities("Ada", "Grace")
+	ids := hEventsEntities("Ada", "Grace")
 	ada, grace := ids[0], ids[1]
-	eventsRename(ctx, ada, "Ada Lovelace")
-	eventsRename(ctx, grace, "Grace Hopper")
-	eventsRename(ctx, ada, "Augusta Ada King")
+	hEventsRename(ctx, ada, "Ada Lovelace")
+	hEventsRename(ctx, grace, "Grace Hopper")
+	hEventsRename(ctx, ada, "Augusta Ada King")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three renames must produce three records on graph.changed; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{ada, grace, ada}, "the records must be keyed by the entity ids, or one entity's renames spread over partitions")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{ada, grace, ada}, "the records must be keyed by the entity ids, or one entity's renames spread over partitions")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both renames of %s must land on one partition, or a consumer applies them out of order; the partitions", ada)
 }
 
 func CheckPayloadFields(ctx *harness.Ctx) {
-	ada := eventsEntities("Ada")[0]
-	eventsRename(ctx, ada, "Ada Lovelace")
+	ada := hEventsEntities("Ada")[0]
+	hEventsRename(ctx, ada, "Ada Lovelace")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one rename must produce one record; the records")
 	value := map[string]any{}
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
@@ -743,7 +743,7 @@ func CheckPayloadFields(ctx *harness.Ctx) {
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
-	ada := eventsEntities("Ada")[0]
+	ada := hEventsEntities("Ada")[0]
 	atCommit := -1
 	// The topic at the command that commits the new name; a read of the entity before it decides nothing.
 	var watch func() any
@@ -751,39 +751,39 @@ func CheckAfterCommit(ctx *harness.Ctx) {
 		if name, _ := ctx.Redis.HGet("entity:"+ada, "name"); name != "Ada Lovelace" {
 			ctx.Redis.After("entity:"+ada, watch)
 		} else if atCommit < 0 {
-			atCommit = len(ctx.Kafka.Records(eventsTopic))
+			atCommit = len(ctx.Kafka.Records(kHEventsTopic))
 		}
 		return nil
 	}
 	ctx.Redis.After("entity:"+ada, watch)
-	eventsRename(ctx, ada, "Ada Lovelace")
+	hEventsRename(ctx, ada, "Ada Lovelace")
 	ctx.Settle()
 	ctx.Assert(atCommit >= 0, "renameEntity never committed the rename (entity:%s never got the new name)", ada)
 	ctx.Assert(atCommit == 0, "when the rename reached the store the topic already held %d record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce", atCommit)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
-	renameEntity(eventsBg, "t1", "e-404", "Nobody")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the commit; the records")
+	renameEntity(hEventsBg, "t1", "e-404", "Nobody")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a rename whose commit failed (there is no e-404) must produce nothing, or consumers hear of a change that never happened; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "a rename whose commit failed (there is no e-404) must produce nothing, or consumers hear of a change that never happened; the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ids := eventsEntities("Ada", "Grace")
+	ids := hEventsEntities("Ada", "Grace")
 	ada, grace := ids[0], ids[1]
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsRename(ctx, ada, "Ada Lovelace")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsRename(ctx, ada, "Ada Lovelace")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the rename is committed and no consumer will ever hear of it; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == ada && rows[0].Payload["new_name"] == "Ada Lovelace", "the outbox row is %+v, expected the topic, the key %s and the payload", rows[0], ada)
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == ada && rows[0].Payload["new_name"] == "Ada Lovelace", "the outbox row is %+v, expected the topic, the key %s and the payload", rows[0], ada)
 	ctx.Assert(rows[0].Payload["old_name"] == "Ada" && rows[0].Payload["version"] == float64(2), "the outbox payload is %v: the relay produces it later, so it is the event itself, old_name and version included", rows[0].Payload)
 	ctx.Equal(ok, false, "renameEntity's result after a failed delivery")
-	ctx.Equal(store.GetEntity(eventsBg, ada).Name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Equal(store.GetEntity(hEventsBg, ada).Name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name")
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsRename(ctx, grace, "Grace Hopper")
+	ok = hEventsRename(ctx, grace, "Grace Hopper")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "renameEntity waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s (ackTimeout), then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == grace, "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "renameEntity's result without a delivery report")
 }
@@ -799,11 +799,11 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "graph.changed";
+const std::string kHEventsTopic = "graph.changed";
 
-std::string eventsEntity(const std::string& name) { return store::createEntity("t1", "person", name, {}).id; }
+std::string hEventsEntity(const std::string& name) { return store::createEntity("t1", "person", name, {}).id; }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -813,41 +813,41 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckEntityKey(harness::Ctx& ctx) {
-  const std::string ada = eventsEntity("Ada");
-  const std::string grace = eventsEntity("Grace");
+  const std::string ada = hEventsEntity("Ada");
+  const std::string grace = hEventsEntity("Grace");
   renameEntity("t1", ada, "Ada Lovelace");
   renameEntity("t1", grace, "Grace Hopper");
   renameEntity("t1", ada, "Augusta Ada King");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three renames must produce three records on graph.changed; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), std::vector<std::string>{ada, grace, ada}, "the records must be keyed by the entity ids, or one entity's renames spread over partitions");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), std::vector<std::string>{ada, grace, ada}, "the records must be keyed by the entity ids, or one entity's renames spread over partitions");
   ctx.Equal(records[0].Partition, records[2].Partition, "both renames of %s must land on one partition, or a consumer applies them out of order; the partitions", ada);
 }
 
 void CheckPayloadFields(harness::Ctx& ctx) {
-  const std::string ada = eventsEntity("Ada");
+  const std::string ada = hEventsEntity("Ada");
   renameEntity("t1", ada, "Ada Lovelace");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one rename must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(eventsField(value, "entity_id") == ada && eventsField(value, "tenant") == "t1" && eventsField(value, "new_name") == "Ada Lovelace",
+  ctx.Assert(hEventsField(value, "entity_id") == ada && hEventsField(value, "tenant") == "t1" && hEventsField(value, "new_name") == "Ada Lovelace",
              "the payload is %s, expected entity_id, tenant and new_name", values[0]);
-  ctx.Equal(eventsField(value, "old_name"), "Ada", "the payload's old_name (a consumer that missed an event cannot tell what changed without it)");
+  ctx.Equal(hEventsField(value, "old_name"), "Ada", "the payload's old_name (a consumer that missed an event cannot tell what changed without it)");
   ctx.Equal(value.is_object() && value.contains("version") && value["version"].is_number() ? value["version"].get<long>() : 0L, 2L,
             "the payload's version, the entity's version after the rename (without it a replayed event looks like a new one)");
 }
 
 void CheckAfterCommit(harness::Ctx& ctx) {
-  const std::string ada = eventsEntity("Ada");
+  const std::string ada = hEventsEntity("Ada");
   size_t atCommit = 999;
   bool committed = false;
   // The topic at the command that commits the new name; a read of the entity before it decides nothing.
@@ -856,7 +856,7 @@ void CheckAfterCommit(harness::Ctx& ctx) {
       ctx.Redis.After("entity:" + ada, watch);
     } else if (!committed) {
       committed = true;
-      atCommit = ctx.Kafka.Records(kEventsTopic).size();
+      atCommit = ctx.Kafka.Records(kHEventsTopic).size();
     }
   };
   ctx.Redis.After("entity:" + ada, watch);
@@ -864,38 +864,38 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Assert(committed, "renameEntity never committed the rename (entity:%s never got the new name)", ada);
   ctx.Assert(atCommit == 0, "when the rename reached the store the topic already held %d record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce", atCommit);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
   try {
     renameEntity("t1", "e-404", "Nobody");
   } catch (const std::exception&) {
     // the commit failed, as it should for an unknown entity
   }
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "a rename whose commit failed (there is no e-404) must produce nothing, or consumers hear of a change that never happened; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "a rename whose commit failed (there is no e-404) must produce nothing, or consumers hear of a change that never happened; the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  const std::string ada = eventsEntity("Ada");
-  const std::string grace = eventsEntity("Grace");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  const std::string ada = hEventsEntity("Ada");
+  const std::string grace = hEventsEntity("Grace");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = renameEntity("t1", ada, "Ada Lovelace");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the rename is committed and no consumer will ever hear of it; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == ada && rows[0].contains("payload") && eventsField(rows[0]["payload"], "new_name") == "Ada Lovelace",
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == ada && rows[0].contains("payload") && hEventsField(rows[0]["payload"], "new_name") == "Ada Lovelace",
              "the outbox row is %s, expected the topic, the key %s and the payload", rows[0].dump(), ada);
   const auto& parked = rows[0]["payload"];
-  ctx.Assert(eventsField(parked, "old_name") == "Ada" && parked.contains("version") && parked["version"].is_number() && parked["version"].get<long>() == 2,
+  ctx.Assert(hEventsField(parked, "old_name") == "Ada" && parked.contains("version") && parked["version"].is_number() && parked["version"].get<long>() == 2,
              "the outbox payload is %s: the relay produces it later, so it is the event itself, old_name and version included", parked.dump());
   ctx.Equal(ok, false, "renameEntity's result after a failed delivery");
   ctx.Equal(store::getEntity(ada)->name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = renameEntity("t1", grace, "Grace Hopper");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "renameEntity waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s (kAckTimeoutMs), then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && eventsField(rows[1], "key") == grace, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hEventsField(rows[1], "key") == grace, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "renameEntity's result without a delivery report");
 }
 `,

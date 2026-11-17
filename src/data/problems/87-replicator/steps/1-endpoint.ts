@@ -990,13 +990,13 @@ import (
 	"leetbuild/harness"
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func body(source, target, policy string) map[string]any {
+func hBody(source, target, policy string) map[string]any {
 	b := map[string]any{"source_region": source, "target_region": target, "shards": []int{0, 1}}
 	if policy != "" {
 		b["conflict_policy"] = policy
@@ -1004,11 +1004,11 @@ func body(source, target, policy string) map[string]any {
 	return b
 }
 
-func create(c *harness.HTTP, source, target, policy string) *harness.Response {
-	return c.Post("/v1/replications", body(source, target, policy), "X-Operator-Id", "ops-a")
+func hCreate(c *harness.HTTP, source, target, policy string) *harness.Response {
+	return c.Post("/v1/replications", hBody(source, target, policy), "X-Operator-Id", "ops-a")
 }
 
-func stored(ctx *harness.Ctx) []string {
+func hStored(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, k := range ctx.Redis.Keys("replication:*") {
 		if k != "replication:seq" {
@@ -1018,7 +1018,7 @@ func stored(ctx *harness.Ctx) []string {
 	return out
 }
 
-func idOf(r *harness.Response) string {
+func hIdOf(r *harness.Response) string {
 	var created struct {
 		ID string \`json:"id"\`
 	}
@@ -1027,65 +1027,65 @@ func idOf(r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := create(c, "us-east-1", "eu-west-1", "source-wins")
+	c := hApi(ctx)
+	r := hCreate(c, "us-east-1", "eu-west-1", "source-wins")
 	ctx.Equal(r.Status, 201, "POST /v1/replications (%s)", r.Text())
-	id := idOf(r)
+	id := hIdOf(r)
 	row, err := store.Get(context.Background(), id)
 	ctx.NoError(err, "store.Get")
 	ctx.Assert(row != nil && len(row.Shards) == 2 && row.ConflictPolicy == "source-wins", "the store holds %+v for the answer %s", row, r.Text())
 	r = c.Patch("/v1/replications/"+id, map[string]string{"conflict_policy": "source-wins"}, "X-Operator-Id", "ops-a")
 	ctx.Equal(r.Status, 200, "PATCH with the same policy (%s)", r.Text())
-	r = c.Post("/v1/replications", body("us-east-1", "eu-west-1", "source-wins"))
+	r = c.Post("/v1/replications", hBody("us-east-1", "eu-west-1", "source-wins"))
 	ctx.Equal(r.Status, 401, "a create without X-Operator-Id")
 }
 
 func CheckApprovedRegions(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := create(c, "us-east-1", "ap-south-1", "source-wins")
+	c := hApi(ctx)
+	r := hCreate(c, "us-east-1", "ap-south-1", "source-wins")
 	ctx.Equal(r.Status, 400, "us-east-1 -> ap-south-1 is not an approved pair")
-	r = create(c, "us-west-2", "us-east-1", "source-wins")
+	r = hCreate(c, "us-west-2", "us-east-1", "source-wins")
 	ctx.Equal(r.Status, 400, "us-west-2 -> us-east-1: only us-east-1 -> us-west-2 is approved, the pair is ordered")
-	ctx.Equal(stored(ctx), []string{}, "refused requests must store nothing; stored")
-	r = create(c, "eu-west-1", "us-east-1", "source-wins")
+	ctx.Equal(hStored(ctx), []string{}, "refused requests must store nothing; stored")
+	r = hCreate(c, "eu-west-1", "us-east-1", "source-wins")
 	ctx.Equal(r.Status, 201, "the approved pair eu-west-1 -> us-east-1 (%s)", r.Text())
 }
 
 func CheckConflictPolicy(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := create(c, "us-east-1", "eu-west-1", "")
+	c := hApi(ctx)
+	r := hCreate(c, "us-east-1", "eu-west-1", "")
 	ctx.Equal(r.Status, 400, "a create without conflict_policy (%s): no policy may be chosen for the operator", r.Text())
-	r = create(c, "us-east-1", "eu-west-1", "newest-wins")
+	r = hCreate(c, "us-east-1", "eu-west-1", "newest-wins")
 	ctx.Equal(r.Status, 400, "the unknown policy newest-wins")
-	r = create(c, "us-east-1", "eu-west-1", "toString")
+	r = hCreate(c, "us-east-1", "eu-west-1", "toString")
 	ctx.Equal(r.Status, 400, "the unknown policy toString")
 	ctx.Redis.Set("skew:us-east-1:eu-west-1", "400")
-	r = create(c, "us-east-1", "eu-west-1", "Last-Write-Wins")
+	r = hCreate(c, "us-east-1", "eu-west-1", "Last-Write-Wins")
 	ctx.Equal(r.Status, 400, "conflict_policy Last-Write-Wins with the clocks 400 ms apart: it is not a documented policy, and as last-write-wins the skew refuses it")
-	ctx.Equal(stored(ctx), []string{}, "refused requests must store nothing; stored")
-	r = create(c, "us-east-1", "eu-west-1", "manual")
+	ctx.Equal(hStored(ctx), []string{}, "refused requests must store nothing; stored")
+	r = hCreate(c, "us-east-1", "eu-west-1", "manual")
 	ctx.Assert(r.Status == 201 && strings.Contains(r.Text(), \`"manual"\`), "a create with manual answered %d %s", r.Status, r.Text())
 }
 
 func CheckSkewBound(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	ctx.Redis.Set("skew:us-east-1:eu-west-1", "400")
-	r := create(c, "us-east-1", "eu-west-1", "last-write-wins")
+	r := hCreate(c, "us-east-1", "eu-west-1", "last-write-wins")
 	ctx.Equal(r.Status, 400, "last-write-wins with the clocks 400 ms apart (skewBoundMS is 250)")
-	ctx.Equal(stored(ctx), []string{}, "a refused last-write-wins must store nothing; stored")
-	r = create(c, "us-east-1", "eu-west-1", "source-wins")
+	ctx.Equal(hStored(ctx), []string{}, "a refused last-write-wins must store nothing; stored")
+	r = hCreate(c, "us-east-1", "eu-west-1", "source-wins")
 	ctx.Equal(r.Status, 201, "source-wins reads no clock and must be accepted at any skew (%s)", r.Text())
 	ctx.Redis.Set("skew:us-east-1:eu-west-1", "250")
-	r = create(c, "us-east-1", "eu-west-1", "last-write-wins")
+	r = hCreate(c, "us-east-1", "eu-west-1", "last-write-wins")
 	ctx.Equal(r.Status, 201, "last-write-wins with the clocks exactly 250 ms apart (%s): only a skew above skewBoundMS is refused", r.Text())
 	ctx.Redis.Set("skew:us-east-1:eu-west-1", "251")
-	r = create(c, "us-east-1", "eu-west-1", "last-write-wins")
+	r = hCreate(c, "us-east-1", "eu-west-1", "last-write-wins")
 	ctx.Equal(r.Status, 400, "last-write-wins with the clocks 251 ms apart (skewBoundMS is 250)")
 }
 
 func CheckPolicyImmutable(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := idOf(create(c, "us-east-1", "eu-west-1", "source-wins"))
+	c := hApi(ctx)
+	id := hIdOf(hCreate(c, "us-east-1", "eu-west-1", "source-wins"))
 	r := c.Patch("/v1/replications/"+id, map[string]string{"conflict_policy": "version-vector"}, "X-Operator-Id", "ops-a")
 	ctx.Equal(r.Status, 409, "changing the policy of a running replication")
 	ctx.Assert(strings.Contains(r.Text(), "immutable"), "the 409 must say the policy is immutable, got %s", r.Text())
@@ -1093,7 +1093,7 @@ func CheckPolicyImmutable(ctx *harness.Ctx) {
 	ctx.Equal(row.ConflictPolicy, "source-wins", "a refused PATCH must not write; the stored policy")
 	r = c.Patch("/v1/replications/"+id, map[string]string{"conflict_policy": "source-wins"}, "X-Operator-Id", "ops-a")
 	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"source-wins"\`), "a PATCH with the same policy answered %d %s", r.Status, r.Text())
-	manual := idOf(create(c, "us-east-1", "eu-west-1", "manual"))
+	manual := hIdOf(hCreate(c, "us-east-1", "eu-west-1", "manual"))
 	r = c.Patch("/v1/replications/"+manual, map[string]string{"conflict_policy": "last-write-wins"}, "X-Operator-Id", "ops-a")
 	ctx.Equal(r.Status, 409, "switching a manual replication to last-write-wins: manual is a policy like any other and is frozen too")
 	row, _ = store.Get(context.Background(), manual)
@@ -1109,7 +1109,7 @@ func CheckPolicyImmutable(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1117,22 +1117,22 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string body(const std::string& source, const std::string& target, const std::string& policy) {
+std::string hBody(const std::string& source, const std::string& target, const std::string& policy) {
   nlohmann::json b = {{"source_region", source}, {"target_region", target}, {"shards", {0, 1}}};
   if (!policy.empty()) b["conflict_policy"] = policy;
   return b.dump();
 }
 
-harness::Response create(harness::HTTP& c, const std::string& source, const std::string& target, const std::string& policy) {
-  return c.Post("/v1/replications", body(source, target, policy), "Content-Type", "application/json", "X-Operator-Id", "ops-a");
+harness::Response hCreate(harness::HTTP& c, const std::string& source, const std::string& target, const std::string& policy) {
+  return c.Post("/v1/replications", hBody(source, target, policy), "Content-Type", "application/json", "X-Operator-Id", "ops-a");
 }
 
-harness::Response patch(harness::HTTP& c, const std::string& id, const std::string& policy) {
+harness::Response hPatch(harness::HTTP& c, const std::string& id, const std::string& policy) {
   return c.Patch("/v1/replications/" + id, nlohmann::json{{"conflict_policy", policy}}.dump(), "Content-Type", "application/json",
                  "X-Operator-Id", "ops-a");
 }
 
-std::vector<std::string> stored(harness::Ctx& ctx) {
+std::vector<std::string> hStored(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& k : ctx.Redis.Keys("replication:*")) {
     if (k != "replication:seq") out.push_back(k);
@@ -1140,7 +1140,7 @@ std::vector<std::string> stored(harness::Ctx& ctx) {
   return out;
 }
 
-std::string field(const harness::Response& r, const std::string& name) {
+std::string hField(const harness::Response& r, const std::string& name) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
@@ -1148,72 +1148,72 @@ std::string field(const harness::Response& r, const std::string& name) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, "us-east-1", "eu-west-1", "source-wins");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, "us-east-1", "eu-west-1", "source-wins");
   ctx.Equal(r.Status, 201, "POST /v1/replications (%s)", r.Text());
-  const std::string id = field(r, "id");
+  const std::string id = hField(r, "id");
   const auto row = store::get(id);
   ctx.Assert(row && row->shards.size() == 2 && row->conflict_policy == "source-wins", "the store holds no matching replication for the answer %s", r.Text());
-  r = patch(c, id, "source-wins");
+  r = hPatch(c, id, "source-wins");
   ctx.Equal(r.Status, 200, "PATCH with the same policy (%s)", r.Text());
-  r = c.Post("/v1/replications", body("us-east-1", "eu-west-1", "source-wins"), "Content-Type", "application/json");
+  r = c.Post("/v1/replications", hBody("us-east-1", "eu-west-1", "source-wins"), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a create without X-Operator-Id");
 }
 
 void CheckApprovedRegions(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, "us-east-1", "ap-south-1", "source-wins");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, "us-east-1", "ap-south-1", "source-wins");
   ctx.Equal(r.Status, 400, "us-east-1 -> ap-south-1 is not an approved pair");
-  r = create(c, "us-west-2", "us-east-1", "source-wins");
+  r = hCreate(c, "us-west-2", "us-east-1", "source-wins");
   ctx.Equal(r.Status, 400, "us-west-2 -> us-east-1: only us-east-1 -> us-west-2 is approved, the pair is ordered");
-  ctx.Equal(stored(ctx), std::vector<std::string>{}, "refused requests must store nothing; stored");
-  r = create(c, "eu-west-1", "us-east-1", "source-wins");
+  ctx.Equal(hStored(ctx), std::vector<std::string>{}, "refused requests must store nothing; stored");
+  r = hCreate(c, "eu-west-1", "us-east-1", "source-wins");
   ctx.Equal(r.Status, 201, "the approved pair eu-west-1 -> us-east-1 (%s)", r.Text());
 }
 
 void CheckConflictPolicy(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, "us-east-1", "eu-west-1", "");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, "us-east-1", "eu-west-1", "");
   ctx.Equal(r.Status, 400, "a create without conflict_policy (%s): no policy may be chosen for the operator", r.Text());
-  r = create(c, "us-east-1", "eu-west-1", "newest-wins");
+  r = hCreate(c, "us-east-1", "eu-west-1", "newest-wins");
   ctx.Equal(r.Status, 400, "the unknown policy newest-wins");
-  r = create(c, "us-east-1", "eu-west-1", "toString");
+  r = hCreate(c, "us-east-1", "eu-west-1", "toString");
   ctx.Equal(r.Status, 400, "the unknown policy toString");
   ctx.Redis.Set("skew:us-east-1:eu-west-1", "400");
-  r = create(c, "us-east-1", "eu-west-1", "Last-Write-Wins");
+  r = hCreate(c, "us-east-1", "eu-west-1", "Last-Write-Wins");
   ctx.Equal(r.Status, 400, "conflict_policy Last-Write-Wins with the clocks 400 ms apart: it is not a documented policy, and as last-write-wins the skew refuses it");
-  ctx.Equal(stored(ctx), std::vector<std::string>{}, "refused requests must store nothing; stored");
-  r = create(c, "us-east-1", "eu-west-1", "manual");
-  ctx.Assert(r.Status == 201 && field(r, "conflict_policy") == "manual", "a create with manual answered %d %s", r.Status, r.Text());
+  ctx.Equal(hStored(ctx), std::vector<std::string>{}, "refused requests must store nothing; stored");
+  r = hCreate(c, "us-east-1", "eu-west-1", "manual");
+  ctx.Assert(r.Status == 201 && hField(r, "conflict_policy") == "manual", "a create with manual answered %d %s", r.Status, r.Text());
 }
 
 void CheckSkewBound(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   ctx.Redis.Set("skew:us-east-1:eu-west-1", "400");
-  auto r = create(c, "us-east-1", "eu-west-1", "last-write-wins");
+  auto r = hCreate(c, "us-east-1", "eu-west-1", "last-write-wins");
   ctx.Equal(r.Status, 400, "last-write-wins with the clocks 400 ms apart (kSkewBoundMs is 250)");
-  ctx.Equal(stored(ctx), std::vector<std::string>{}, "a refused last-write-wins must store nothing; stored");
-  r = create(c, "us-east-1", "eu-west-1", "source-wins");
+  ctx.Equal(hStored(ctx), std::vector<std::string>{}, "a refused last-write-wins must store nothing; stored");
+  r = hCreate(c, "us-east-1", "eu-west-1", "source-wins");
   ctx.Equal(r.Status, 201, "source-wins reads no clock and must be accepted at any skew (%s)", r.Text());
   ctx.Redis.Set("skew:us-east-1:eu-west-1", "250");
-  r = create(c, "us-east-1", "eu-west-1", "last-write-wins");
+  r = hCreate(c, "us-east-1", "eu-west-1", "last-write-wins");
   ctx.Equal(r.Status, 201, "last-write-wins with the clocks exactly 250 ms apart (%s): only a skew above kSkewBoundMs is refused", r.Text());
   ctx.Redis.Set("skew:us-east-1:eu-west-1", "251");
-  r = create(c, "us-east-1", "eu-west-1", "last-write-wins");
+  r = hCreate(c, "us-east-1", "eu-west-1", "last-write-wins");
   ctx.Equal(r.Status, 400, "last-write-wins with the clocks 251 ms apart (kSkewBoundMs is 250)");
 }
 
 void CheckPolicyImmutable(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string id = field(create(c, "us-east-1", "eu-west-1", "source-wins"), "id");
-  auto r = patch(c, id, "version-vector");
+  auto c = hApi(ctx);
+  const std::string id = hField(hCreate(c, "us-east-1", "eu-west-1", "source-wins"), "id");
+  auto r = hPatch(c, id, "version-vector");
   ctx.Equal(r.Status, 409, "changing the policy of a running replication");
   ctx.Assert(r.Text().find("immutable") != std::string::npos, "the 409 must say the policy is immutable, got %s", r.Text());
   ctx.Equal(store::get(id)->conflict_policy, "source-wins", "a refused PATCH must not write; the stored policy");
-  r = patch(c, id, "source-wins");
-  ctx.Assert(r.Status == 200 && field(r, "conflict_policy") == "source-wins", "a PATCH with the same policy answered %d %s", r.Status, r.Text());
-  const std::string manual = field(create(c, "us-east-1", "eu-west-1", "manual"), "id");
-  r = patch(c, manual, "last-write-wins");
+  r = hPatch(c, id, "source-wins");
+  ctx.Assert(r.Status == 200 && hField(r, "conflict_policy") == "source-wins", "a PATCH with the same policy answered %d %s", r.Status, r.Text());
+  const std::string manual = hField(hCreate(c, "us-east-1", "eu-west-1", "manual"), "id");
+  r = hPatch(c, manual, "last-write-wins");
   ctx.Equal(r.Status, 409, "switching a manual replication to last-write-wins: manual is a policy like any other and is frozen too");
   ctx.Equal(store::get(manual)->conflict_policy, "manual", "a refused PATCH must not write; the stored policy of the manual replication");
 }

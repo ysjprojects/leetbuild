@@ -924,17 +924,17 @@ import (
 )
 
 const (
-	ttsTarget = "tts:9000"
-	ttsTokens = 10
-	ttsAnswer = "Your order ships tomorrow and arrives on Friday before noon, signed for."
+	kHTtsTarget = "tts:9000"
+	kHTtsTokens = 10
+	kHTtsAnswer = "Your order ships tomorrow and arrives on Friday before noon, signed for."
 )
 
-var speechBg = context.Background()
+var hSpeechBg = context.Background()
 
 // ttsPeer is the TTS provider: one chunk per token after resume_offset; stream n fails UNAVAILABLE after failAfter[n] chunks.
 // With played set it streams in step with playback: each chunk after the first waits until the caller played the one before,
 // or the stream is cancelled; ended then receives how its first stream ended.
-type ttsPeer struct {
+type HTtsPeer struct {
 	pb.UnimplementedSpeechServer
 	failAfter []int
 	resumes   []int
@@ -942,13 +942,13 @@ type ttsPeer struct {
 	ended     chan error
 }
 
-func (p *ttsPeer) Synthesize(req *pb.SynthesizeRequest, srv pb.Speech_SynthesizeServer) error {
+func (p *HTtsPeer) Synthesize(req *pb.SynthesizeRequest, srv pb.Speech_SynthesizeServer) error {
 	p.resumes = append(p.resumes, int(req.GetResumeOffset()))
 	drop := -1
 	if stream := len(p.resumes) - 1; stream < len(p.failAfter) {
 		drop = p.failAfter[stream]
 	}
-	for i, token := 0, int(req.GetResumeOffset()); token < ttsTokens; i, token = i+1, token+1 {
+	for i, token := 0, int(req.GetResumeOffset()); token < kHTtsTokens; i, token = i+1, token+1 {
 		if i == drop {
 			return status.Error(codes.Unavailable, "tts node restarting")
 		}
@@ -973,13 +973,13 @@ func (p *ttsPeer) Synthesize(req *pb.SynthesizeRequest, srv pb.Speech_Synthesize
 	return nil
 }
 
-func ttsWorld(ctx *harness.Ctx, failAfter ...int) *ttsPeer {
-	peer := &ttsPeer{failAfter: failAfter}
-	pb.RegisterSpeechServer(ctx.GRPC.Server(ttsTarget), peer)
+func hTtsWorld(ctx *harness.Ctx, failAfter ...int) *HTtsPeer {
+	peer := &HTtsPeer{failAfter: failAfter}
+	pb.RegisterSpeechServer(ctx.GRPC.Server(kHTtsTarget), peer)
 	return peer
 }
 
-type turnOut struct {
+type HTurnOut struct {
 	played []int
 	spoken int
 	err    error
@@ -987,10 +987,10 @@ type turnOut struct {
 }
 
 // speakTurn is one turn: the offsets played, what speak returned, and whether it ended at all.
-func speakTurn(ctx *harness.Ctx, onPlay func(*pb.AudioChunk)) turnOut {
-	out := turnOut{played: []int{}}
+func hSpeakTurn(ctx *harness.Ctx, onPlay func(*pb.AudioChunk)) HTurnOut {
+	out := HTurnOut{played: []int{}}
 	out.ended = ctx.Drain(func() {
-		out.spoken, out.err = speak(speechBg, "vs-1", ttsAnswer, func(chunk *pb.AudioChunk) {
+		out.spoken, out.err = speak(hSpeechBg, "vs-1", kHTtsAnswer, func(chunk *pb.AudioChunk) {
 			out.played = append(out.played, int(chunk.GetOffset()))
 			if onPlay != nil {
 				onPlay(chunk)
@@ -1000,23 +1000,23 @@ func speakTurn(ctx *harness.Ctx, onPlay func(*pb.AudioChunk)) turnOut {
 	return out
 }
 
-func synthesizeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Synthesize", ttsTarget) }
+func hSynthesizeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Synthesize", kHTtsTarget) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	ttsWorld(ctx, 3)
+	hTtsWorld(ctx, 3)
 	// The first stream drops after three tokens, each played over 3 s: the retry needs a full deadline of its own.
-	out := speakTurn(ctx, func(chunk *pb.AudioChunk) {
+	out := hSpeakTurn(ctx, func(chunk *pb.AudioChunk) {
 		if chunk.GetOffset() <= 3 {
 			ctx.Clock.Advance(3)
 		}
 	})
-	calls := synthesizeCalls(ctx)
+	calls := hSynthesizeCalls(ctx)
 	ctx.Assert(len(calls) > 0 && calls[0].HasDeadline(), "the Synthesize call carries no deadline: a TTS that stops answering holds the turn open")
 	ctx.Assert(out.ended && out.err == nil && len(calls) == 2, "a stream that dropped once must be resumed, the turn ended with %v after %d attempts", out.err, len(calls))
 	ctx.Assert(calls[1].HasDeadline() && 9500*time.Millisecond <= calls[1].Timeout && calls[1].Timeout <= 10500*time.Millisecond, "the first attempt played for 9 s before the stream dropped and the retry carried a deadline of %v: every attempt carries its own full 10 s", calls[1].Timeout)
-	ctx.GRPC.SetLatency("Synthesize", 20.0, ttsTarget)
-	out = speakTurn(ctx, nil)
-	calls = synthesizeCalls(ctx)[2:]
+	ctx.GRPC.SetLatency("Synthesize", 20.0, kHTtsTarget)
+	out = hSpeakTurn(ctx, nil)
+	calls = hSynthesizeCalls(ctx)[2:]
 	ctx.Assert(out.ended, "with the TTS stalled the turn never ended (%d attempts): every attempt needs a deadline", len(calls))
 	ctx.Assert(len(calls) > 0 && calls[0].HasDeadline(), "the Synthesize call carries no deadline: a TTS that stops answering holds the turn open")
 	ctx.Assert(9500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 10500*time.Millisecond, "the deadline must be 10 s, got %v", calls[0].Timeout)
@@ -1025,18 +1025,18 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBargeIn(ctx *harness.Ctx) {
-	peer := ttsWorld(ctx)
-	peer.played = make(chan struct{}, ttsTokens)
+	peer := hTtsWorld(ctx)
+	peer.played = make(chan struct{}, kHTtsTokens)
 	peer.ended = make(chan error, 1)
-	out := speakTurn(ctx, func(chunk *pb.AudioChunk) {
+	out := hSpeakTurn(ctx, func(chunk *pb.AudioChunk) {
 		if chunk.GetOffset() == 5 {
-			turnstate.BargeIn(speechBg, "vs-1", 4) // the caller talks over the fifth token, having heard four
+			turnstate.BargeIn(hSpeechBg, "vs-1", 4) // the caller talks over the fifth token, having heard four
 		}
 		peer.played <- struct{}{}
 	})
 	ctx.Assert(out.ended && out.err == nil, "the turn must end normally after a barge-in, it ended with %v", out.err)
 	ctx.Equal(out.played, []int{1, 2, 3, 4, 5}, "the caller barged in during offset 5; speak must stop once RecordFrame reports the turn moved on; the offsets played")
-	state, err := turnstate.ReadState(speechBg, "vs-1")
+	state, err := turnstate.ReadState(hSpeechBg, "vs-1")
 	ctx.NoError(err, "ReadState failed")
 	ctx.Assert(state != nil && *state == turnstate.State{CurrentSpeaker: "user", TurnIndex: 1, TTSOffset: 4}, "after the barge-in the turn state is %+v, expected the caller on turn 1 at offset 4", state)
 	ctx.Equal(out.spoken, 5, "speak must return the offset played")
@@ -1050,31 +1050,31 @@ func CheckBargeIn(ctx *harness.Ctx) {
 }
 
 func CheckResume(ctx *harness.Ctx) {
-	peer := ttsWorld(ctx, 3, 2)
-	_, err := turnstate.RecordFrame(speechBg, "vs-1", 0, 7)
+	peer := hTtsWorld(ctx, 3, 2)
+	_, err := turnstate.RecordFrame(hSpeechBg, "vs-1", 0, 7)
 	ctx.NoError(err, "RecordFrame failed")
-	_, err = turnstate.BargeIn(speechBg, "vs-1", 7) // the previous answer was cut at token 7; this is the agent's next turn
+	_, err = turnstate.BargeIn(hSpeechBg, "vs-1", 7) // the previous answer was cut at token 7; this is the agent's next turn
 	ctx.NoError(err, "BargeIn failed")
-	out := speakTurn(ctx, nil)
+	out := hSpeakTurn(ctx, nil)
 	ctx.Assert(out.ended && out.err == nil, "a stream that dropped twice must be resumed, the turn ended with %v", out.err)
 	ctx.Equal(out.played, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, "after the stream dropped at offsets 3 and 5 the retries must neither replay what the caller heard nor skip what they had not (send resume_offset); the offsets played")
 	ctx.Equal(peer.resumes, []int{0, 3, 5}, "0 for a new answer, then the offsets played; the resume_offset of each attempt")
-	ctx.Equal(out.spoken, ttsTokens, "speak must return the offset played")
+	ctx.Equal(out.spoken, kHTtsTokens, "speak must return the offset played")
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	ttsWorld(ctx)
+	hTtsWorld(ctx)
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.Internal, codes.ResourceExhausted, codes.PermissionDenied} {
-		before := len(synthesizeCalls(ctx))
-		ctx.GRPC.Fail("Synthesize", code, "refused", 1, ttsTarget)
-		out := speakTurn(ctx, nil)
+		before := len(hSynthesizeCalls(ctx))
+		ctx.GRPC.Fail("Synthesize", code, "refused", 1, kHTtsTarget)
+		out := hSpeakTurn(ctx, nil)
 		ctx.Assert(out.ended && out.err != nil, "%v must fail the turn at once, speak returned %d", code, out.spoken)
-		ctx.Equal(len(synthesizeCalls(ctx))-before, 1, "only UNAVAILABLE is retried and %v fails the same way again; the attempts", code)
+		ctx.Equal(len(hSynthesizeCalls(ctx))-before, 1, "only UNAVAILABLE is retried and %v fails the same way again; the attempts", code)
 	}
-	ctx.GRPC.Stop(ttsTarget)
-	before := len(synthesizeCalls(ctx))
-	out := speakTurn(ctx, nil)
-	attempts := len(synthesizeCalls(ctx)) - before
+	ctx.GRPC.Stop(kHTtsTarget)
+	before := len(hSynthesizeCalls(ctx))
+	out := hSpeakTurn(ctx, nil)
+	attempts := len(hSynthesizeCalls(ctx)) - before
 	ctx.Assert(out.ended, "with the TTS down the turn never ended: %d attempts and counting. Bound the attempts by maxAttempts", attempts)
 	ctx.Assert(out.err != nil, "with the TTS down speak must fail the turn, it returned nil")
 	ctx.Equal(attempts, 3, "with the TTS down, the attempts (maxAttempts)")
@@ -1093,22 +1093,22 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTts = "tts:9000";
-constexpr int kTokens = 10;
-const std::string kAnswer = "Your order ships tomorrow and arrives on Friday before noon, signed for.";
+const std::string kHTts = "tts:9000";
+constexpr int kHTokens = 10;
+const std::string kHAnswer = "Your order ships tomorrow and arrives on Friday before noon, signed for.";
 
 // The TTS provider: one chunk per token after resume_offset; stream n fails UNAVAILABLE after fail_after[n] chunks.
 // With lockstep it streams in step with playback: each chunk after the first waits until the caller played the one before, or the
 // stream is cancelled; ended is then 1 for a stream that finished, 2 for one the client cancelled.
-class TtsPeer final : public voice::Speech::Service {
+class HTtsPeer final : public voice::Speech::Service {
  public:
-  explicit TtsPeer(std::vector<int> fail_after) : fail_after_(std::move(fail_after)) {}
+  explicit HTtsPeer(std::vector<int> fail_after) : fail_after_(std::move(fail_after)) {}
 
   grpc::Status Synthesize(grpc::ServerContext* context, const voice::SynthesizeRequest* request, grpc::ServerWriter<voice::AudioChunk>* srv) override {
     resumes.push_back(request->resume_offset());
     const size_t stream = resumes.size() - 1;
     const int drop = stream < fail_after_.size() ? fail_after_[stream] : -1;
-    for (int token = request->resume_offset(), i = 0; token < kTokens; token++, i++) {
+    for (int token = request->resume_offset(), i = 0; token < kHTokens; token++, i++) {
       if (i == drop) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "tts node restarting");
       for (int waited = 0; lockstep && i > 0 && played.load() < i && !context->IsCancelled() && waited < 2000; waited++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1138,15 +1138,15 @@ class TtsPeer final : public voice::Speech::Service {
   std::vector<int> fail_after_;
 };
 
-TtsPeer& ttsWorld(harness::Ctx& ctx, std::vector<int> fail_after = {}) {
-  static TtsPeer* peer = nullptr;
+HTtsPeer& hTtsWorld(harness::Ctx& ctx, std::vector<int> fail_after = {}) {
+  static HTtsPeer* peer = nullptr;
   delete peer;
-  peer = new TtsPeer(std::move(fail_after));
-  ctx.GRPC.Server(kTts)->RegisterService(peer);
+  peer = new HTtsPeer(std::move(fail_after));
+  ctx.GRPC.Server(kHTts)->RegisterService(peer);
   return *peer;
 }
 
-struct TurnOut {
+struct HTurnOut {
   std::vector<int> played;
   long spoken = -1;
   std::string error;  // what speak threw, "" if it returned
@@ -1154,11 +1154,11 @@ struct TurnOut {
 };
 
 // One turn: the offsets played, what speak returned or threw, and whether it ended at all.
-TurnOut speakTurn(harness::Ctx& ctx, const std::function<void(const voice::AudioChunk&)>& on_play = nullptr) {
-  TurnOut out;
+HTurnOut hSpeakTurn(harness::Ctx& ctx, const std::function<void(const voice::AudioChunk&)>& on_play = nullptr) {
+  HTurnOut out;
   out.ended = ctx.Drain([&] {
     try {
-      out.spoken = speak("vs-1", kAnswer, [&](const voice::AudioChunk& chunk) {
+      out.spoken = speak("vs-1", kHAnswer, [&](const voice::AudioChunk& chunk) {
         out.played.push_back(chunk.offset());
         if (on_play) on_play(chunk);
       });
@@ -1169,24 +1169,24 @@ TurnOut speakTurn(harness::Ctx& ctx, const std::function<void(const voice::Audio
   return out;
 }
 
-std::vector<harness::Call> synthesizeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Synthesize", kTts); }
+std::vector<harness::Call> hSynthesizeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Synthesize", kHTts); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  ttsWorld(ctx, {3});
+  hTtsWorld(ctx, {3});
   // The first stream drops after three tokens, each played over 3 s: the retry needs a full deadline of its own.
-  auto out = speakTurn(ctx, [&ctx](const voice::AudioChunk& chunk) {
+  auto out = hSpeakTurn(ctx, [&ctx](const voice::AudioChunk& chunk) {
     if (chunk.offset() <= 3) ctx.Clock.Advance(3);
   });
-  auto calls = synthesizeCalls(ctx);
+  auto calls = hSynthesizeCalls(ctx);
   ctx.Assert(!calls.empty() && calls[0].HasDeadline(), "the Synthesize call carries no deadline: a TTS that stops answering holds the turn open");
   ctx.Assert(out.ended && out.error.empty() && calls.size() == 2, "a stream that dropped once must be resumed, the turn threw %s after %d attempts", out.error, calls.size());
   ctx.Assert(calls[1].HasDeadline() && 9.5 <= calls[1].TimeoutSeconds() && calls[1].TimeoutSeconds() <= 10.5,
              "the first attempt played for 9 s before the stream dropped and the retry carried a deadline of %vs: every attempt carries its own full 10 s", calls[1].TimeoutSeconds());
-  ctx.GRPC.SetLatency("Synthesize", 20.0, kTts);
-  out = speakTurn(ctx);
-  calls = synthesizeCalls(ctx);
+  ctx.GRPC.SetLatency("Synthesize", 20.0, kHTts);
+  out = hSpeakTurn(ctx);
+  calls = hSynthesizeCalls(ctx);
   calls.erase(calls.begin(), calls.begin() + 2);
   ctx.Assert(out.ended, "with the TTS stalled the turn never ended (%d attempts): every attempt needs a deadline", calls.size());
   ctx.Assert(!calls.empty() && calls[0].HasDeadline(), "the Synthesize call carries no deadline: a TTS that stops answering holds the turn open");
@@ -1196,9 +1196,9 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBargeIn(harness::Ctx& ctx) {
-  auto& peer = ttsWorld(ctx);
+  auto& peer = hTtsWorld(ctx);
   peer.lockstep = true;
-  const auto out = speakTurn(ctx, [&peer](const voice::AudioChunk& chunk) {
+  const auto out = hSpeakTurn(ctx, [&peer](const voice::AudioChunk& chunk) {
     if (chunk.offset() == 5) turnstate::bargeIn("vs-1", 4);  // the caller talks over the fifth token, having heard four
     peer.played++;
   });
@@ -1214,33 +1214,33 @@ void CheckBargeIn(harness::Ctx& ctx) {
 }
 
 void CheckResume(harness::Ctx& ctx) {
-  auto& peer = ttsWorld(ctx, {3, 2});
+  auto& peer = hTtsWorld(ctx, {3, 2});
   turnstate::recordFrame("vs-1", 0, 7);
   turnstate::bargeIn("vs-1", 7);  // the previous answer was cut at token 7; this is the agent's next turn
-  const auto out = speakTurn(ctx);
+  const auto out = hSpeakTurn(ctx);
   ctx.Assert(out.ended && out.error.empty(), "a stream that dropped twice must be resumed, the turn threw %s", out.error);
   ctx.Equal(out.played, std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, "after the stream dropped at offsets 3 and 5 the retries must neither replay what the caller heard nor skip what they had not (send resume_offset); the offsets played");
   ctx.Equal(peer.resumes, std::vector<int>{0, 3, 5}, "0 for a new answer, then the offsets played; the resume_offset of each attempt");
-  ctx.Equal(out.spoken, kTokens, "speak must return the offset played");
+  ctx.Equal(out.spoken, kHTokens, "speak must return the offset played");
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  ttsWorld(ctx);
+  hTtsWorld(ctx);
   const std::vector<std::pair<grpc::StatusCode, std::string>> refused = {{grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
                                                                          {grpc::StatusCode::INTERNAL, "INTERNAL"},
                                                                          {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
                                                                          {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
   for (const auto& [code, name] : refused) {
-    const size_t before = synthesizeCalls(ctx).size();
-    ctx.GRPC.Fail("Synthesize", code, "refused", 1, kTts);
-    const auto out = speakTurn(ctx);
+    const size_t before = hSynthesizeCalls(ctx).size();
+    ctx.GRPC.Fail("Synthesize", code, "refused", 1, kHTts);
+    const auto out = hSpeakTurn(ctx);
     ctx.Assert(out.ended && !out.error.empty(), "%s must fail the turn at once, speak returned %d", name, out.spoken);
-    ctx.Equal(synthesizeCalls(ctx).size() - before, 1, "only UNAVAILABLE is retried and %s fails the same way again; the attempts", name);
+    ctx.Equal(hSynthesizeCalls(ctx).size() - before, 1, "only UNAVAILABLE is retried and %s fails the same way again; the attempts", name);
   }
-  ctx.GRPC.Stop(kTts);
-  const size_t before = synthesizeCalls(ctx).size();
-  const auto out = speakTurn(ctx);
-  const size_t attempts = synthesizeCalls(ctx).size() - before;
+  ctx.GRPC.Stop(kHTts);
+  const size_t before = hSynthesizeCalls(ctx).size();
+  const auto out = hSpeakTurn(ctx);
+  const size_t attempts = hSynthesizeCalls(ctx).size() - before;
   ctx.Assert(out.ended, "with the TTS down the turn never ended: %d attempts and counting. Bound the attempts by kMaxAttempts", attempts);
   ctx.Assert(!out.error.empty(), "with the TTS down speak must fail the turn, it returned normally");
   ctx.Equal(attempts, 3, "with the TTS down, the attempts (kMaxAttempts)");

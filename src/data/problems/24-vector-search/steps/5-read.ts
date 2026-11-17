@@ -674,23 +674,23 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-// readAPI seeds acme's d1..d4 and globex's g1, g2 in the active idx-42 (4 dimensions).
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
-	corpus.Activate(readBg, "idx-42", 4)
-	corpus.PutDocument(readBg, "acme", "idx-42", "d1", []float64{1, 0, 0, 0})
-	corpus.PutDocument(readBg, "acme", "idx-42", "d2", []float64{0.9, 0.1, 0, 0})
-	corpus.PutDocument(readBg, "acme", "idx-42", "d3", []float64{0.6, 0.4, 0, 0})
-	corpus.PutDocument(readBg, "acme", "idx-42", "d4", []float64{0, 1, 0, 0})
-	corpus.PutDocument(readBg, "globex", "idx-42", "g1", []float64{1, 0, 0, 0})
-	corpus.PutDocument(readBg, "globex", "idx-42", "g2", []float64{0.95, 0.05, 0, 0})
+// hReadAPI seeds acme's d1..d4 and globex's g1, g2 in the active idx-42 (4 dimensions).
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
+	corpus.Activate(hReadBg, "idx-42", 4)
+	corpus.PutDocument(hReadBg, "acme", "idx-42", "d1", []float64{1, 0, 0, 0})
+	corpus.PutDocument(hReadBg, "acme", "idx-42", "d2", []float64{0.9, 0.1, 0, 0})
+	corpus.PutDocument(hReadBg, "acme", "idx-42", "d3", []float64{0.6, 0.4, 0, 0})
+	corpus.PutDocument(hReadBg, "acme", "idx-42", "d4", []float64{0, 1, 0, 0})
+	corpus.PutDocument(hReadBg, "globex", "idx-42", "g1", []float64{1, 0, 0, 0})
+	corpus.PutDocument(hReadBg, "globex", "idx-42", "g2", []float64{0.95, 0.05, 0, 0})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type readAnswer struct {
+type HReadAnswer struct {
 	DocumentID string \`json:"document_id"\`
 	Neighbors  []struct {
 		ID string \`json:"id"\`
@@ -698,22 +698,22 @@ type readAnswer struct {
 	IndexVersion string \`json:"index_version"\`
 }
 
-func readOf(r *harness.Response) readAnswer {
-	var a readAnswer
+func hReadOf(r *harness.Response) HReadAnswer {
+	var a HReadAnswer
 	json.Unmarshal(r.Body, &a)
 	return a
 }
 
-func neighborIDs(r *harness.Response) string {
+func hNeighborIDs(r *harness.Response) string {
 	ids := []string{}
-	for _, h := range readOf(r).Neighbors {
+	for _, h := range hReadOf(r).Neighbors {
 		ids = append(ids, h.ID)
 	}
 	return strings.Join(ids, ",")
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	r := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme")
 	anonymous := c.Get("/v1/documents/d1/neighbors?k=2")
 	empty := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "")
@@ -721,8 +721,8 @@ func CheckRoute(ctx *harness.Ctx) {
 	zero := c.Get("/v1/documents/d1/neighbors?k=0", "X-Tenant-Id", "acme")
 	limit := c.Get("/v1/documents/d1/neighbors?k=20", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/documents/d1/neighbors (%s)", r.Text())
-	a := readOf(r)
-	ctx.Assert(strings.Contains(neighborIDs(r), "d2") && a.DocumentID == "d1" && a.IndexVersion == "idx-42", "d1's neighbours must include d2, labelled idx-42, got %s", r.Text())
+	a := hReadOf(r)
+	ctx.Assert(strings.Contains(hNeighborIDs(r), "d2") && a.DocumentID == "d1" && a.IndexVersion == "idx-42", "d1's neighbours must include d2, labelled idx-42, got %s", r.Text())
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
 	ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id")
 	ctx.Equal(big.Status, 400, "k 21")
@@ -731,7 +731,7 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	foreign := c.Get("/v1/documents/g1/neighbors?k=2", "X-Tenant-Id", "acme")
 	reverse := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "globex")
 	missing := c.Get("/v1/documents/nope/neighbors?k=2", "X-Tenant-Id", "acme")
@@ -740,28 +740,28 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	ctx.Equal(reverse.Status, 404, "globex asked for the neighbours of acme's d1 (%s)", reverse.Text())
 	ctx.Equal(missing.Status, 404, "a missing document")
 	ctx.Equal(strings.ReplaceAll(foreign.Text(), "g1", "{id}"), strings.ReplaceAll(missing.Text(), "nope", "{id}"), "globex's g1 answered acme differently from a missing id, which tells acme the id exists in another tenant; answer both the same way. The answers, ids replaced by {id}")
-	ctx.Assert(own.Status == 200 && neighborIDs(own) == "g2", "globex reading its own g1 must answer g2, got %d %s", own.Status, own.Text())
+	ctx.Assert(own.Status == 200 && hNeighborIDs(own) == "g2", "globex reading its own g1 must answer g2, got %d %s", own.Status, own.Text())
 }
 
 func CheckExcludesSelf(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	r := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme")
 	// d3 [0.6, 0.4] scores d1 (0.6) and d2 (0.58) above itself (0.52): it is not the first hit of its own search.
 	inner := c.Get("/v1/documents/d3/neighbors?k=2", "X-Tenant-Id", "acme")
-	ctx.Assert(!strings.Contains(neighborIDs(r), "d1"), "d1's neighbours include d1 itself: %s. Ask for k + 1 and drop the document", r.Text())
-	ctx.Equal(neighborIDs(r), "d2,d3", "d1's two nearest other documents")
-	ctx.Equal(neighborIDs(inner), "d1,d2", "d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52): drop the document by its id, wherever it ranks; d3's neighbours")
+	ctx.Assert(!strings.Contains(hNeighborIDs(r), "d1"), "d1's neighbours include d1 itself: %s. Ask for k + 1 and drop the document", r.Text())
+	ctx.Equal(hNeighborIDs(r), "d2,d3", "d1's two nearest other documents")
+	ctx.Equal(hNeighborIDs(inner), "d1,d2", "d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52): drop the document by its id, wherever it ranks; d3's neighbours")
 }
 
 func CheckDocumentVersion(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	corpus.Activate(readBg, "idx-43", 4)
-	corpus.PutDocument(readBg, "acme", "idx-43", "e1", []float64{1, 0, 0, 0})
-	corpus.PutDocument(readBg, "acme", "idx-43", "e2", []float64{0.8, 0.2, 0, 0})
+	c := hReadAPI(ctx)
+	corpus.Activate(hReadBg, "idx-43", 4)
+	corpus.PutDocument(hReadBg, "acme", "idx-43", "e1", []float64{1, 0, 0, 0})
+	corpus.PutDocument(hReadBg, "acme", "idx-43", "e2", []float64{0.8, 0.2, 0, 0})
 	r := c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme")
-	ids := neighborIDs(r)
+	ids := hNeighborIDs(r)
 	ctx.Assert(!strings.Contains(ids, "e1") && !strings.Contains(ids, "e2"), "d1 was embedded for idx-42 but was compared with idx-43 vectors: %s. Search the version the document was embedded for", r.Text())
-	ctx.Assert(ids == "d2,d3" && readOf(r).IndexVersion == "idx-42", "d1's neighbours must come from idx-42 and be labelled idx-42, got %s", r.Text())
+	ctx.Assert(ids == "d2,d3" && hReadOf(r).IndexVersion == "idx-42", "d1's neighbours must come from idx-42 and be labelled idx-42, got %s", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -773,7 +773,7 @@ func CheckDocumentVersion(ctx *harness.Ctx) {
 namespace {
 
 // acme's d1..d4 and globex's g1, g2 in the active idx-42 (4 dimensions).
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   corpus::activate("idx-42", 4);
   corpus::putDocument("acme", "idx-42", "d1", {1, 0, 0, 0});
   corpus::putDocument("acme", "idx-42", "d2", {0.9, 0.1, 0, 0});
@@ -788,13 +788,13 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json parsed(const harness::Response& r) {
+nlohmann::json hParsed(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_discarded() || !j.is_object() ? nlohmann::json::object() : j;
 }
 
-std::string ids(const harness::Response& r) {
-  const auto j = parsed(r);
+std::string hIds(const harness::Response& r) {
+  const auto j = hParsed(r);
   std::string out;
   if (j.contains("neighbors") && j["neighbors"].is_array()) {
     for (const auto& h : j["neighbors"]) out += (out.empty() ? "" : ",") + h.value("id", std::string());
@@ -802,10 +802,10 @@ std::string ids(const harness::Response& r) {
   return out;
 }
 
-bool contains(const std::string& haystack, const std::string& needle) { return haystack.find(needle) != std::string::npos; }
+bool hContains(const std::string& haystack, const std::string& needle) { return haystack.find(needle) != std::string::npos; }
 
 // text with every occurrence of id written as {id}: two answers that differ only by the id they name compare equal.
-std::string withoutId(std::string text, const std::string& id) {
+std::string hWithoutId(std::string text, const std::string& id) {
   for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
   return text;
 }
@@ -813,7 +813,7 @@ std::string withoutId(std::string text, const std::string& id) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme");
   const auto anonymous = c.Get("/v1/documents/d1/neighbors?k=2");
   const auto empty = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "");
@@ -821,8 +821,8 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto zero = c.Get("/v1/documents/d1/neighbors?k=0", "X-Tenant-Id", "acme");
   const auto limit = c.Get("/v1/documents/d1/neighbors?k=20", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/documents/d1/neighbors (%s)", r.Text());
-  const auto body = parsed(r);
-  ctx.Assert(contains(ids(r), "d2") && body.value("document_id", std::string()) == "d1" && body.value("index_version", std::string()) == "idx-42",
+  const auto body = hParsed(r);
+  ctx.Assert(hContains(hIds(r), "d2") && body.value("document_id", std::string()) == "d1" && body.value("index_version", std::string()) == "idx-42",
              "d1's neighbours must include d2, labelled idx-42, got %s", r.Text());
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
   ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id");
@@ -832,7 +832,7 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto foreign = c.Get("/v1/documents/g1/neighbors?k=2", "X-Tenant-Id", "acme");
   const auto reverse = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "globex");
   const auto missing = c.Get("/v1/documents/nope/neighbors?k=2", "X-Tenant-Id", "acme");
@@ -840,28 +840,28 @@ void CheckTenantScope(harness::Ctx& ctx) {
   ctx.Equal(foreign.Status, 404, "acme asked for the neighbours of globex's g1 and got %s: another tenant's document must be 404, like a missing one; the status", foreign.Text());
   ctx.Equal(reverse.Status, 404, "globex asked for the neighbours of acme's d1 (%s)", reverse.Text());
   ctx.Equal(missing.Status, 404, "a missing document");
-  ctx.Equal(withoutId(foreign.Text(), "g1"), withoutId(missing.Text(), "nope"), "globex's g1 answered acme differently from a missing id, which tells acme the id exists in another tenant; answer both the same way. The answers, ids replaced by {id}");
-  ctx.Assert(own.Status == 200 && ids(own) == "g2", "globex reading its own g1 must answer g2, got %d %s", own.Status, own.Text());
+  ctx.Equal(hWithoutId(foreign.Text(), "g1"), hWithoutId(missing.Text(), "nope"), "globex's g1 answered acme differently from a missing id, which tells acme the id exists in another tenant; answer both the same way. The answers, ids replaced by {id}");
+  ctx.Assert(own.Status == 200 && hIds(own) == "g2", "globex reading its own g1 must answer g2, got %d %s", own.Status, own.Text());
 }
 
 void CheckExcludesSelf(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme");
   // d3 [0.6, 0.4] scores d1 (0.6) and d2 (0.58) above itself (0.52): it is not the first hit of its own search.
   const auto inner = c.Get("/v1/documents/d3/neighbors?k=2", "X-Tenant-Id", "acme");
-  ctx.Assert(!contains(ids(r), "d1"), "d1's neighbours include d1 itself: %s. Ask for k + 1 and drop the document", r.Text());
-  ctx.Equal(ids(r), "d2,d3", "d1's two nearest other documents");
-  ctx.Equal(ids(inner), "d1,d2", "d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52): drop the document by its id, wherever it ranks; d3's neighbours");
+  ctx.Assert(!hContains(hIds(r), "d1"), "d1's neighbours include d1 itself: %s. Ask for k + 1 and drop the document", r.Text());
+  ctx.Equal(hIds(r), "d2,d3", "d1's two nearest other documents");
+  ctx.Equal(hIds(inner), "d1,d2", "d3's two nearest other documents are d1 (0.6) and d2 (0.58), which outscore d3 itself (0.52): drop the document by its id, wherever it ranks; d3's neighbours");
 }
 
 void CheckDocumentVersion(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   corpus::activate("idx-43", 4);
   corpus::putDocument("acme", "idx-43", "e1", {1, 0, 0, 0});
   corpus::putDocument("acme", "idx-43", "e2", {0.8, 0.2, 0, 0});
   const auto r = c.Get("/v1/documents/d1/neighbors?k=2", "X-Tenant-Id", "acme");
-  ctx.Assert(!contains(ids(r), "e1") && !contains(ids(r), "e2"), "d1 was embedded for idx-42 but was compared with idx-43 vectors: %s. Search the version the document was embedded for", r.Text());
-  ctx.Assert(ids(r) == "d2,d3" && parsed(r).value("index_version", std::string()) == "idx-42", "d1's neighbours must come from idx-42 and be labelled idx-42, got %s", r.Text());
+  ctx.Assert(!hContains(hIds(r), "e1") && !hContains(hIds(r), "e2"), "d1 was embedded for idx-42 but was compared with idx-43 vectors: %s. Search the version the document was embedded for", r.Text());
+  ctx.Assert(hIds(r) == "d2,d3" && hParsed(r).value("index_version", std::string()) == "idx-42", "d1's neighbours must come from idx-42 and be labelled idx-42, got %s", r.Text());
 }
 `,
   },

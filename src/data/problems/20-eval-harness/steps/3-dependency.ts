@@ -1013,75 +1013,75 @@ import (
 	"leetbuild/harness"
 )
 
-// judgePeer is the stand-in judge: grades from evals/judge.
-type judgePeer struct {
+// HJudgePeer is the stand-in judge: grades from evals/judge.
+type HJudgePeer struct {
 	pb.UnimplementedJudgeServer
 }
 
-func (judgePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
+func (HJudgePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
 	return &pb.ScoreReply{Score: judge.Grade(req.GetExpected(), req.GetOutput()), JudgeVersion: judge.Version}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) {
-	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), &judgePeer{})
+func hClientWorld(ctx *harness.Ctx) {
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), &HJudgePeer{})
 }
 
-func clientSample(n int, expected, output string) samples.GoldenSample {
+func hClientSample(n int, expected, output string) samples.GoldenSample {
 	return samples.GoldenSample{RunID: "r1", SampleID: fmt.Sprintf("s-%d", n), Expected: expected, Output: output}
 }
 
-func clientScore(n int) SampleScore {
-	return scoreSample(context.Background(), clientSample(n, "Paris", "The capital of France is Paris."))
+func hClientScore(n int) SampleScore {
+	return scoreSample(context.Background(), hClientSample(n, "Paris", "The capital of France is Paris."))
 }
 
-func clientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Score", "")) }
+func hClientCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Score", "")) }
 
-func clientJudged(s SampleScore) bool {
+func hClientJudged(s SampleScore) bool {
 	return s.Status == "scored" && s.Judge == "model" && math.Abs(s.Score-0.75) < 1e-9
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientScore(1)
-	ctx.Assert(clientJudged(result), "a healthy judge grades 'Paris' in '...is Paris.' 0.75: expected status scored, judge model, score 0.75, got %+v", result)
+	hClientWorld(ctx)
+	result := hClientScore(1)
+	ctx.Assert(hClientJudged(result), "a healthy judge grades 'Paris' in '...is Paris.' 0.75: expected status scored, judge model, score 0.75, got %+v", result)
 	ctx.Equal(result.Attempts, 1, "a healthy judge is called once; attempts")
 	calls := ctx.GRPC.CallsTo("Score", "")
 	ctx.Equal(len(calls), 1, "a healthy judge must be called exactly once; Score calls")
 	ctx.Assert(calls[0].HasDeadline(), "the Score call carries no deadline: a judge that hangs holds the worker for as long as it hangs")
 	ctx.Assert(600*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= time.Second, "the deadline must be 800 ms, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Score", 0.5, config.Judge)
-	result = clientScore(2)
-	ctx.Assert(clientJudged(result) && clientCalls(ctx) == 2, "a judge answering in 500 ms is within the deadline and used on the first call: %d calls, %+v", clientCalls(ctx), result)
+	result = hClientScore(2)
+	ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == 2, "a judge answering in 500 ms is within the deadline and used on the first call: %d calls, %+v", hClientCalls(ctx), result)
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	for n, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.NotFound} {
 		ctx.GRPC.Fail("Score", code, "judge refused", 1, config.Judge)
-		refused := clientScore(10 + n)
-		ctx.Assert(clientCalls(ctx) == n+1, "%v is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw %d", code, clientCalls(ctx)-n)
+		refused := hClientScore(10 + n)
+		ctx.Assert(hClientCalls(ctx) == n+1, "%v is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw %d", code, hClientCalls(ctx)-n)
 		ctx.Assert(refused.Judge != "model", "%v on the only call leaves no model score, got %+v", code, refused)
 	}
-	base := clientCalls(ctx)
+	base := hClientCalls(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge restarting", 1, config.Judge)
-	result := clientScore(1)
-	ctx.Assert(clientJudged(result), "one UNAVAILABLE then a healthy judge: the retry must get the model's score, got %+v", result)
-	ctx.Assert(result.Attempts == 2 && clientCalls(ctx) == base+2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", clientCalls(ctx)-base, result)
+	result := hClientScore(1)
+	ctx.Assert(hClientJudged(result), "one UNAVAILABLE then a healthy judge: the retry must get the model's score, got %+v", result)
+	ctx.Assert(result.Attempts == 2 && hClientCalls(ctx) == base+2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", hClientCalls(ctx)-base, result)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	ctx.GRPC.Fail("Score", codes.DeadlineExceeded, "judge slow", 1, config.Judge)
-	result = clientScore(2)
-	ctx.Assert(clientJudged(result) && clientCalls(ctx) == base+4, "one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw %d calls and %+v", clientCalls(ctx)-base-2, result)
+	result = hClientScore(2)
+	ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == base+4, "one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw %d calls and %+v", hClientCalls(ctx)-base-2, result)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 3, config.Judge)
-	result = clientScore(3)
-	ctx.Equal(clientCalls(ctx)-base-4, 3, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls for the sample; calls")
+	result = hClientScore(3)
+	ctx.Equal(hClientCalls(ctx)-base-4, 3, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls for the sample; calls")
 	ctx.Assert(result.Attempts == 3 && result.Judge != "model", "three failed attempts: Attempts 3 and no model score, got %+v", result)
 }
 
 func CheckFallbackMetric(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.SetLatency("Score", 5.0, config.Judge) // the judge hangs
 	started := ctx.Clock.Now()
-	result := scoreSample(context.Background(), clientSample(1, "Paris", " paris "))
+	result := scoreSample(context.Background(), hClientSample(1, "Paris", " paris "))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(result.Judge == "fallback" && result.Status == "scored", "the judge hung on every attempt and the sample came back %+v: score it with metrics.ExactMatch and mark it Judge \\"fallback\\"", result)
 	ctx.Equal(result.Score, 1.0, "metrics.ExactMatch(\\"Paris\\", \\" paris \\") is 1 (trimmed, case-insensitive); the score")
@@ -1093,45 +1093,45 @@ func CheckFallbackMetric(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Score", 0, config.Judge)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 3, config.Judge)
-	result = clientScore(2)
+	result = hClientScore(2)
 	ctx.Assert(result.Judge == "fallback" && result.Score == 0, "with the judge UNAVAILABLE, 'The capital of France is Paris.' against 'Paris' is an ExactMatch 0 marked fallback, got %+v", result)
 }
 
 func CheckInvalidArgument(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("Score", codes.InvalidArgument, "output exceeds the judge's context", 1, config.Judge)
-	result := clientScore(1)
+	result := hClientScore(1)
 	ctx.Equal(result.Status, "invalid", "INVALID_ARGUMENT is the sample's fault (%+v); the status", result)
-	ctx.Assert(clientCalls(ctx) == 1 && ctx.Clock.Sleeps() == 0, "no retry fixes an invalid sample: expected 1 call and no backoff, saw %d calls and %d sleeps", clientCalls(ctx), ctx.Clock.Sleeps())
+	ctx.Assert(hClientCalls(ctx) == 1 && ctx.Clock.Sleeps() == 0, "no retry fixes an invalid sample: expected 1 call and no backoff, saw %d calls and %d sleeps", hClientCalls(ctx), ctx.Clock.Sleeps())
 	ctx.Assert(result.Judge != "fallback", "an invalid sample is reported, not scored by the fallback: %+v", result)
 	ctx.GRPC.Fail("Score", codes.InvalidArgument, "malformed sample", 5, config.Judge)
 	for n := 2; n <= 6; n++ {
-		ctx.Equal(clientScore(n).Status, "invalid", "sample %d's status", n)
+		ctx.Equal(hClientScore(n).Status, "invalid", "sample %d's status", n)
 	}
-	result = clientScore(7)
-	ctx.Assert(clientJudged(result) && clientCalls(ctx) == 7, "five invalid samples are not judge failures: the breaker stays closed and the next sample reaches the judge, got %+v after %d calls", result, clientCalls(ctx))
+	result = hClientScore(7)
+	ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == 7, "five invalid samples are not judge failures: the breaker stays closed and the next sample reaches the judge, got %+v after %d calls", result, hClientCalls(ctx))
 }
 
 func CheckBreaker(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge restarting", 4, config.Judge)
-	first := clientScore(1)
-	second := clientScore(2)
-	ctx.Assert(first.Judge == "fallback" && clientJudged(second) && clientCalls(ctx) == 5, "four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw %d calls, %+v and %+v", clientCalls(ctx), first, second)
+	first := hClientScore(1)
+	second := hClientScore(2)
+	ctx.Assert(first.Judge == "fallback" && hClientJudged(second) && hClientCalls(ctx) == 5, "four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw %d calls, %+v and %+v", hClientCalls(ctx), first, second)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 5, config.Judge)
-	first = clientScore(3)
-	ctx.Assert(first.Judge == "fallback" && clientCalls(ctx) == 8, "the judge is down after a success: the next sample makes 3 calls and falls back, saw %d calls and %+v", clientCalls(ctx)-5, first)
-	second = clientScore(4)
-	ctx.Assert(second.Judge == "fallback" && clientCalls(ctx) == 10, "the fifth failed attempt in a row opens the breaker (breakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %+v", clientCalls(ctx)-8, second)
+	first = hClientScore(3)
+	ctx.Assert(first.Judge == "fallback" && hClientCalls(ctx) == 8, "the judge is down after a success: the next sample makes 3 calls and falls back, saw %d calls and %+v", hClientCalls(ctx)-5, first)
+	second = hClientScore(4)
+	ctx.Assert(second.Judge == "fallback" && hClientCalls(ctx) == 10, "the fifth failed attempt in a row opens the breaker (breakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %+v", hClientCalls(ctx)-8, second)
 	for n := 5; n <= 8; n++ {
-		ctx.Equal(clientScore(n).Judge, "fallback", "sample %d's judge with the breaker open", n)
+		ctx.Equal(hClientScore(n).Judge, "fallback", "sample %d's judge with the breaker open", n)
 	}
-	ctx.Equal(clientCalls(ctx), 10, "while the breaker is open samples skip the judge; calls")
+	ctx.Equal(hClientCalls(ctx), 10, "while the breaker is open samples skip the judge; calls")
 	ctx.Clock.Advance(29)
-	ctx.Assert(clientScore(9).Judge == "fallback" && clientCalls(ctx) == 10, "29 seconds into a 30 s cooldown the breaker is still open")
+	ctx.Assert(hClientScore(9).Judge == "fallback" && hClientCalls(ctx) == 10, "29 seconds into a 30 s cooldown the breaker is still open")
 	ctx.Clock.Advance(2)
-	result := clientScore(10)
-	ctx.Assert(clientJudged(result) && clientCalls(ctx) == 11, "after the 30 s cooldown a trial call reaches the judge, which is back: got %+v after %d calls", result, clientCalls(ctx))
+	result := hClientScore(10)
+	ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == 11, "after the 30 s cooldown a trial call reaches the judge, which is back: got %+v after %d calls", result, hClientCalls(ctx))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1144,7 +1144,7 @@ func CheckBreaker(ctx *harness.Ctx) {
 namespace {
 
 // The stand-in judge: grades from evals/judge.h.
-class JudgePeer final : public evals::Judge::Service {
+class HJudgePeer final : public evals::Judge::Service {
  public:
   grpc::Status Score(grpc::ServerContext*, const evals::ScoreRequest* req, evals::ScoreReply* reply) override {
     reply->set_score(judge::grade(req->expected(), req->output()));
@@ -1153,71 +1153,71 @@ class JudgePeer final : public evals::Judge::Service {
   }
 };
 
-void clientWorld(harness::Ctx& ctx) {
-  static JudgePeer peer;
+void hClientWorld(harness::Ctx& ctx) {
+  static HJudgePeer peer;
   ctx.GRPC.Server(config::kJudge)->RegisterService(&peer);
 }
 
-samples::GoldenSample clientSample(int n, const std::string& expected = "Paris", const std::string& output = "The capital of France is Paris.") {
+samples::GoldenSample hClientSample(int n, const std::string& expected = "Paris", const std::string& output = "The capital of France is Paris.") {
   return {"r1", "s-" + std::to_string(n), expected, output};
 }
 
-size_t clientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Score").size(); }
+size_t hClientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Score").size(); }
 
-bool clientJudged(const SampleScore& s) { return s.status == "scored" && s.judge == "model" && std::fabs(s.score - 0.75) < 1e-9; }
+bool hClientJudged(const SampleScore& s) { return s.status == "scored" && s.judge == "model" && std::fabs(s.score - 0.75) < 1e-9; }
 
-std::string show(const SampleScore& s) {
+std::string hShow(const SampleScore& s) {
   return "{status " + s.status + ", score " + harness::FormatFloat(s.score) + ", judge " + s.judge + ", attempts " + std::to_string(s.attempts) + "}";
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  SampleScore result = score_sample(clientSample(1));
-  ctx.Assert(clientJudged(result), "a healthy judge grades 'Paris' in '...is Paris.' 0.75: expected status scored, judge model, score 0.75, got %s", show(result));
+  hClientWorld(ctx);
+  SampleScore result = score_sample(hClientSample(1));
+  ctx.Assert(hClientJudged(result), "a healthy judge grades 'Paris' in '...is Paris.' 0.75: expected status scored, judge model, score 0.75, got %s", hShow(result));
   ctx.Equal(result.attempts, 1, "a healthy judge is called once; attempts");
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Equal(calls.size(), 1, "a healthy judge must be called exactly once; Score calls");
   ctx.Assert(calls[0].HasDeadline(), "the Score call carries no deadline: a judge that hangs holds the worker for as long as it hangs");
   ctx.Assert(0.6 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 1.0, "the deadline must be 800 ms, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Score", 0.5, config::kJudge);
-  result = score_sample(clientSample(2));
-  ctx.Assert(clientJudged(result) && clientCalls(ctx) == 2, "a judge answering in 500 ms is within the deadline and used on the first call: %d calls, %s", clientCalls(ctx), show(result));
+  result = score_sample(hClientSample(2));
+  ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == 2, "a judge answering in 500 ms is within the deadline and used on the first call: %d calls, %s", hClientCalls(ctx), hShow(result));
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   const grpc::StatusCode terminal[] = {grpc::StatusCode::INTERNAL, grpc::StatusCode::PERMISSION_DENIED, grpc::StatusCode::NOT_FOUND};
   const char* terminalNames[] = {"INTERNAL", "PERMISSION_DENIED", "NOT_FOUND"};
   for (size_t n = 0; n < 3; n++) {
     ctx.GRPC.Fail("Score", terminal[n], "judge refused", 1, config::kJudge);
-    const SampleScore refused = score_sample(clientSample(10 + static_cast<int>(n)));
-    ctx.Assert(clientCalls(ctx) == n + 1, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw %d", terminalNames[n], clientCalls(ctx) - n);
-    ctx.Assert(refused.judge != "model", "%s on the only call leaves no model score, got %s", terminalNames[n], show(refused));
+    const SampleScore refused = score_sample(hClientSample(10 + static_cast<int>(n)));
+    ctx.Assert(hClientCalls(ctx) == n + 1, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw %d", terminalNames[n], hClientCalls(ctx) - n);
+    ctx.Assert(refused.judge != "model", "%s on the only call leaves no model score, got %s", terminalNames[n], hShow(refused));
   }
-  const size_t base = clientCalls(ctx);
+  const size_t base = hClientCalls(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge restarting", 1, config::kJudge);
-  SampleScore result = score_sample(clientSample(1));
-  ctx.Assert(clientJudged(result), "one UNAVAILABLE then a healthy judge: the retry must get the model's score, got %s", show(result));
-  ctx.Assert(result.attempts == 2 && clientCalls(ctx) == base + 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and %s", clientCalls(ctx) - base, show(result));
+  SampleScore result = score_sample(hClientSample(1));
+  ctx.Assert(hClientJudged(result), "one UNAVAILABLE then a healthy judge: the retry must get the model's score, got %s", hShow(result));
+  ctx.Assert(result.attempts == 2 && hClientCalls(ctx) == base + 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and %s", hClientCalls(ctx) - base, hShow(result));
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   ctx.GRPC.Fail("Score", grpc::StatusCode::DEADLINE_EXCEEDED, "judge slow", 1, config::kJudge);
-  result = score_sample(clientSample(2));
-  ctx.Assert(clientJudged(result) && clientCalls(ctx) == base + 4, "one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw %d calls and %s", clientCalls(ctx) - base - 2, show(result));
+  result = score_sample(hClientSample(2));
+  ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == base + 4, "one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw %d calls and %s", hClientCalls(ctx) - base - 2, hShow(result));
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 3, config::kJudge);
-  result = score_sample(clientSample(3));
-  ctx.Equal(clientCalls(ctx) - base - 4, 3, "a judge that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the sample; calls");
-  ctx.Assert(result.attempts == 3 && result.judge != "model", "three failed attempts: attempts 3 and no model score, got %s", show(result));
+  result = score_sample(hClientSample(3));
+  ctx.Equal(hClientCalls(ctx) - base - 4, 3, "a judge that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the sample; calls");
+  ctx.Assert(result.attempts == 3 && result.judge != "model", "three failed attempts: attempts 3 and no model score, got %s", hShow(result));
 }
 
 void CheckFallbackMetric(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.SetLatency("Score", 5.0, config::kJudge);  // the judge hangs
   const int64_t started = ctx.Clock.Now();
-  SampleScore result = score_sample(clientSample(1, "Paris", " paris "));
+  SampleScore result = score_sample(hClientSample(1, "Paris", " paris "));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  ctx.Assert(result.judge == "fallback" && result.status == "scored", "the judge hung on every attempt and the sample came back %s: score it with metrics::exact_match and mark it judge \\"fallback\\"", show(result));
+  ctx.Assert(result.judge == "fallback" && result.status == "scored", "the judge hung on every attempt and the sample came back %s: score it with metrics::exact_match and mark it judge \\"fallback\\"", hShow(result));
   ctx.Equal(result.score, 1.0, "metrics::exact_match(\\"Paris\\", \\" paris \\") is 1 (trimmed, case-insensitive); the score");
   ctx.Assert(waited <= 3.5, "the worker waited %.1f s on a judge that hangs: three 800 ms attempts and their backoffs, then the fallback", waited);
   const auto calls = ctx.GRPC.CallsTo("Score");
@@ -1227,41 +1227,41 @@ void CheckFallbackMetric(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Score", 0, config::kJudge);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 3, config::kJudge);
-  result = score_sample(clientSample(2));
-  ctx.Assert(result.judge == "fallback" && result.score == 0, "with the judge UNAVAILABLE, 'The capital of France is Paris.' against 'Paris' is an exact_match 0 marked fallback, got %s", show(result));
+  result = score_sample(hClientSample(2));
+  ctx.Assert(result.judge == "fallback" && result.score == 0, "with the judge UNAVAILABLE, 'The capital of France is Paris.' against 'Paris' is an exact_match 0 marked fallback, got %s", hShow(result));
 }
 
 void CheckInvalidArgument(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::INVALID_ARGUMENT, "output exceeds the judge's context", 1, config::kJudge);
-  SampleScore result = score_sample(clientSample(1));
-  ctx.Equal(result.status, "invalid", "INVALID_ARGUMENT is the sample's fault (%s); the status", show(result));
-  ctx.Assert(clientCalls(ctx) == 1 && ctx.Clock.Sleeps() == 0, "no retry fixes an invalid sample: expected 1 call and no backoff, saw %d calls and %d sleeps", clientCalls(ctx), ctx.Clock.Sleeps());
-  ctx.Assert(result.judge != "fallback", "an invalid sample is reported, not scored by the fallback: %s", show(result));
+  SampleScore result = score_sample(hClientSample(1));
+  ctx.Equal(result.status, "invalid", "INVALID_ARGUMENT is the sample's fault (%s); the status", hShow(result));
+  ctx.Assert(hClientCalls(ctx) == 1 && ctx.Clock.Sleeps() == 0, "no retry fixes an invalid sample: expected 1 call and no backoff, saw %d calls and %d sleeps", hClientCalls(ctx), ctx.Clock.Sleeps());
+  ctx.Assert(result.judge != "fallback", "an invalid sample is reported, not scored by the fallback: %s", hShow(result));
   ctx.GRPC.Fail("Score", grpc::StatusCode::INVALID_ARGUMENT, "malformed sample", 5, config::kJudge);
-  for (int n = 2; n <= 6; n++) ctx.Equal(score_sample(clientSample(n)).status, "invalid", "sample %d's status", n);
-  result = score_sample(clientSample(7));
-  ctx.Assert(clientJudged(result) && clientCalls(ctx) == 7, "five invalid samples are not judge failures: the breaker stays closed and the next sample reaches the judge, got %s after %d calls", show(result), clientCalls(ctx));
+  for (int n = 2; n <= 6; n++) ctx.Equal(score_sample(hClientSample(n)).status, "invalid", "sample %d's status", n);
+  result = score_sample(hClientSample(7));
+  ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == 7, "five invalid samples are not judge failures: the breaker stays closed and the next sample reaches the judge, got %s after %d calls", hShow(result), hClientCalls(ctx));
 }
 
 void CheckBreaker(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge restarting", 4, config::kJudge);
-  SampleScore first = score_sample(clientSample(1));
-  SampleScore second = score_sample(clientSample(2));
-  ctx.Assert(first.judge == "fallback" && clientJudged(second) && clientCalls(ctx) == 5, "four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw %d calls, %s and %s", clientCalls(ctx), show(first), show(second));
+  SampleScore first = score_sample(hClientSample(1));
+  SampleScore second = score_sample(hClientSample(2));
+  ctx.Assert(first.judge == "fallback" && hClientJudged(second) && hClientCalls(ctx) == 5, "four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw %d calls, %s and %s", hClientCalls(ctx), hShow(first), hShow(second));
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 5, config::kJudge);
-  first = score_sample(clientSample(3));
-  ctx.Assert(first.judge == "fallback" && clientCalls(ctx) == 8, "the judge is down after a success: the next sample makes 3 calls and falls back, saw %d calls and %s", clientCalls(ctx) - 5, show(first));
-  second = score_sample(clientSample(4));
-  ctx.Assert(second.judge == "fallback" && clientCalls(ctx) == 10, "the fifth failed attempt in a row opens the breaker (kBreakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %s", clientCalls(ctx) - 8, show(second));
-  for (int n = 5; n <= 8; n++) ctx.Equal(score_sample(clientSample(n)).judge, "fallback", "sample %d's judge with the breaker open", n);
-  ctx.Equal(clientCalls(ctx), 10, "while the breaker is open samples skip the judge; calls");
+  first = score_sample(hClientSample(3));
+  ctx.Assert(first.judge == "fallback" && hClientCalls(ctx) == 8, "the judge is down after a success: the next sample makes 3 calls and falls back, saw %d calls and %s", hClientCalls(ctx) - 5, hShow(first));
+  second = score_sample(hClientSample(4));
+  ctx.Assert(second.judge == "fallback" && hClientCalls(ctx) == 10, "the fifth failed attempt in a row opens the breaker (kBreakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %s", hClientCalls(ctx) - 8, hShow(second));
+  for (int n = 5; n <= 8; n++) ctx.Equal(score_sample(hClientSample(n)).judge, "fallback", "sample %d's judge with the breaker open", n);
+  ctx.Equal(hClientCalls(ctx), 10, "while the breaker is open samples skip the judge; calls");
   ctx.Clock.Advance(29);
-  ctx.Assert(score_sample(clientSample(9)).judge == "fallback" && clientCalls(ctx) == 10, "29 seconds into a 30 s cooldown the breaker is still open");
+  ctx.Assert(score_sample(hClientSample(9)).judge == "fallback" && hClientCalls(ctx) == 10, "29 seconds into a 30 s cooldown the breaker is still open");
   ctx.Clock.Advance(2);
-  const SampleScore result = score_sample(clientSample(10));
-  ctx.Assert(clientJudged(result) && clientCalls(ctx) == 11, "after the 30 s cooldown a trial call reaches the judge, which is back: got %s after %d calls", show(result), clientCalls(ctx));
+  const SampleScore result = score_sample(hClientSample(10));
+  ctx.Assert(hClientJudged(result) && hClientCalls(ctx) == 11, "after the 30 s cooldown a trial call reaches the judge, which is back: got %s after %d calls", hShow(result), hClientCalls(ctx));
 }
 `,
   },

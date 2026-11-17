@@ -994,18 +994,18 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // classifierPeer labels everything spam, with the confidence the check set per content id (0.5 by
 // default); while restarting is set, the next call takes 0.3 s and then fails UNAVAILABLE.
-type classifierPeer struct {
+type HClassifierPeer struct {
 	pb.UnimplementedClassifierServer
 	ctx        *harness.Ctx
 	scores     map[string]float64
 	restarting bool
 }
 
-func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.Verdict, error) {
+func (p *HClassifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.Verdict, error) {
 	if p.restarting {
 		p.restarting = false
 		p.ctx.Clock.Advance(0.3)
@@ -1018,13 +1018,13 @@ func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*
 	return &pb.Verdict{Label: "spam", Confidence: score, ModelVersion: "clf-2026-10"}, nil
 }
 
-func clientPeer(ctx *harness.Ctx) *classifierPeer {
-	peer := &classifierPeer{ctx: ctx, scores: map[string]float64{}}
+func hClientPeer(ctx *harness.Ctx) *HClassifierPeer {
+	peer := &HClassifierPeer{ctx: ctx, scores: map[string]float64{}}
 	pb.RegisterClassifierServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func clientQueued(ctx *harness.Ctx) []string {
+func hClientQueued(ctx *harness.Ctx) []string {
 	var out []string
 	for _, z := range ctx.Redis.ZRangeWithScores("moderation:pending", 0, -1) {
 		out = append(out, z.Member)
@@ -1033,8 +1033,8 @@ func clientQueued(ctx *harness.Ctx) []string {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer := clientPeer(ctx)
-	triage(clientBg, "case-1", "c-1", "Buy followers now", nil)
+	peer := hClientPeer(ctx)
+	triage(hClientBg, "case-1", "c-1", "Buy followers now", nil)
 	calls := ctx.GRPC.CallsTo("Classify", "")
 	ctx.Assert(len(calls) > 0, "no Classify call was made")
 	for _, call := range calls {
@@ -1043,76 +1043,76 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	peer.scores["c-3"] = 0.3
 	peer.restarting = true
-	d := triage(clientBg, "case-3", "c-3", "hello", nil)
+	d := triage(hClientBg, "case-3", "c-3", "hello", nil)
 	calls = ctx.GRPC.CallsTo("Classify", "")
 	retry := calls[len(calls)-1]
 	ctx.Assert(retry.HasDeadline() && 350*time.Millisecond <= retry.Timeout && retry.Timeout <= 450*time.Millisecond, "after a first attempt that failed UNAVAILABLE at 0.3 s, the retry carries a %v deadline: every attempt gets its own 400 ms", retry.Timeout)
 	ctx.Assert(d.Confidence == 0.3 && d.Reason == "below_threshold", "the retry's verdict must decide case-3, got %+v", d)
 	ctx.GRPC.SetLatency("Classify", 5.0, "")
-	d = triage(clientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
+	d = triage(hClientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
 	ctx.Assert(d.Route == "human_review" && d.Reason == "classifier_unavailable", "with the classifier taking 5 s triage answered %+v, expected human_review for classifier_unavailable", d)
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	peer := clientPeer(ctx)
+	peer := hClientPeer(ctx)
 	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "text is empty", 1, "")
-	d := triage(clientBg, "case-1", "c-1", "", nil)
+	d := triage(hClientBg, "case-1", "c-1", "", nil)
 	calls := len(ctx.GRPC.CallsTo("Classify", ""))
 	ctx.Equal(calls, 1, "a request the classifier answered INVALID_ARGUMENT must be sent once: the code says the request is wrong, a retry gets the same answer; the calls")
 	ctx.Equal(d.Route, "human_review", "an unclassifiable item's route")
-	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "an unclassifiable item answered human_review must be queued for people; moderation:pending")
+	ctx.Equal(hClientQueued(ctx), []string{"case-1"}, "an unclassifiable item answered human_review must be queued for people; moderation:pending")
 	ctx.GRPC.Fail("Classify", codes.PermissionDenied, "caller not allowed", 1, "")
-	d = triage(clientBg, "case-4", "c-4", "hello", nil)
+	d = triage(hClientBg, "case-4", "c-4", "hello", nil)
 	calls = len(ctx.GRPC.CallsTo("Classify", ""))
 	ctx.Equal(calls-1, 1, "a request the classifier answered PERMISSION_DENIED must be sent once: only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for case-4")
 	ctx.Equal(d.Route, "human_review", "case-4, refused with PERMISSION_DENIED; the route")
-	ctx.Equal(clientQueued(ctx), []string{"case-1", "case-4"}, "case-4, refused with PERMISSION_DENIED, must be queued for people; moderation:pending")
+	ctx.Equal(hClientQueued(ctx), []string{"case-1", "case-4"}, "case-4, refused with PERMISSION_DENIED, must be queued for people; moderation:pending")
 	peer.scores["c-2"] = 0.3
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "", 1, "")
-	d = triage(clientBg, "case-2", "c-2", "hello", nil)
+	d = triage(hClientBg, "case-2", "c-2", "hello", nil)
 	calls = len(ctx.GRPC.CallsTo("Classify", ""))
 	ctx.Equal(calls-2, 2, "one UNAVAILABLE must be retried once; the calls for case-2")
 	ctx.Assert(d.Confidence == 0.3 && d.Reason == "below_threshold", "the retry's verdict must decide case-2, got %+v", d)
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "", 5, "")
-	triage(clientBg, "case-3", "c-3", "hello", nil)
+	triage(hClientBg, "case-3", "c-3", "hello", nil)
 	calls = len(ctx.GRPC.CallsTo("Classify", ""))
 	ctx.Equal(calls-4, 2, "a classifier that stays unavailable must be asked maxAttempts = 2 times; the calls for case-3")
 }
 
 func CheckAutoThreshold(ctx *harness.Ctx) {
-	peer := clientPeer(ctx)
+	peer := hClientPeer(ctx)
 	peer.scores["c-1"] = 0.9
 	peer.scores["c-2"] = 0.985
 	peer.scores["c-3"] = 0.98
-	d := triage(clientBg, "case-1", "c-1", "Buy followers now", []string{"hash_match"})
+	d := triage(hClientBg, "case-1", "c-1", "Buy followers now", []string{"hash_match"})
 	ctx.Equal(d.Route, "human_review", "a 0.9 score with a hash match: an automatic removal needs at least 0.98; the route")
-	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "case-1 must wait for a person; moderation:pending")
-	d = triage(clientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
+	ctx.Equal(hClientQueued(ctx), []string{"case-1"}, "case-1 must wait for a person; moderation:pending")
+	d = triage(hClientBg, "case-2", "c-2", "Buy followers now", []string{"hash_match"})
 	ctx.Equal(d.Route, "auto_remove", "a 0.985 score with a hash match; the route")
 	ctx.Assert(d.Label == "spam" && d.Confidence == 0.985 && d.ModelVersion == "clf-2026-10", "an automatic removal must carry the verdict as its evidence, got %+v", d)
-	d = triage(clientBg, "case-3", "c-3", "Buy followers now", []string{"hash_match"})
+	d = triage(hClientBg, "case-3", "c-3", "Buy followers now", []string{"hash_match"})
 	ctx.Equal(d.Route, "auto_remove", "a score of exactly 0.98 with a hash match: at least 0.98 acts; the route")
-	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "an automatic removal must not also be queued; moderation:pending")
+	ctx.Equal(hClientQueued(ctx), []string{"case-1"}, "an automatic removal must not also be queued; moderation:pending")
 }
 
 func CheckCorroboration(ctx *harness.Ctx) {
-	peer := clientPeer(ctx)
+	peer := hClientPeer(ctx)
 	peer.scores["c-1"] = 0.99
-	alone := triage(clientBg, "case-1", "c-1", "Buy followers now", nil)
-	weak := triage(clientBg, "case-2", "c-1", "Buy followers now", []string{"user_report"})
-	backed := triage(clientBg, "case-3", "c-1", "Buy followers now", []string{"user_report", "trusted_flagger"})
+	alone := triage(hClientBg, "case-1", "c-1", "Buy followers now", nil)
+	weak := triage(hClientBg, "case-2", "c-1", "Buy followers now", []string{"user_report"})
+	backed := triage(hClientBg, "case-3", "c-1", "Buy followers now", []string{"user_report", "trusted_flagger"})
 	ctx.Equal(alone.Route, "human_review", "a 0.99 score with no signal: an automatic removal needs a corroborating signal; the route")
 	ctx.Equal(weak.Route, "human_review", "a 0.99 score with only a user report (user_report is not in corroboratingSignals); the route")
 	ctx.Equal(backed.Route, "auto_remove", "a 0.99 score with a trusted flagger; the route")
-	ctx.Equal(clientQueued(ctx), []string{"case-1", "case-2"}, "moderation:pending must hold the two uncorroborated cases")
+	ctx.Equal(hClientQueued(ctx), []string{"case-1", "case-2"}, "moderation:pending must hold the two uncorroborated cases")
 }
 
 func CheckUnavailableToHuman(ctx *harness.Ctx) {
-	clientPeer(ctx)
+	hClientPeer(ctx)
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "", 10, "")
-	d := triage(clientBg, "case-1", "c-1", "Buy followers now", []string{"hash_match"})
+	d := triage(hClientBg, "case-1", "c-1", "Buy followers now", []string{"hash_match"})
 	ctx.Assert(d.Route == "human_review" && d.Reason == "classifier_unavailable", "with the classifier down triage answered %+v: a report nobody classified must go to a person", d)
-	ctx.Equal(clientQueued(ctx), []string{"case-1"}, "moderation:pending")
+	ctx.Equal(hClientQueued(ctx), []string{"case-1"}, "moderation:pending")
 	pending, _ := ctx.Redis.HGet("moderation:counters", "pending")
 	ctx.Equal(pending, "1", "the queued case must be counted as pending")
 }
@@ -1127,9 +1127,9 @@ namespace {
 
 // Labels everything spam, with the confidence the check set per content id (0.5 by default); while
 // restarting is set, the next call takes 0.3 s and then fails UNAVAILABLE.
-class ClassifierPeer final : public moderated::Classifier::Service {
+class HClassifierPeer final : public moderated::Classifier::Service {
  public:
-  explicit ClassifierPeer(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HClassifierPeer(harness::Ctx& ctx) : ctx_(ctx) {}
   std::map<std::string, double> scores;
   bool restarting = false;
   grpc::Status Classify(grpc::ServerContext*, const moderated::ClassifyRequest* req, moderated::Verdict* out) override {
@@ -1148,15 +1148,15 @@ class ClassifierPeer final : public moderated::Classifier::Service {
   harness::Ctx& ctx_;
 };
 
-ClassifierPeer& clientPeer(harness::Ctx& ctx) {
-  static ClassifierPeer* peer = nullptr;
+HClassifierPeer& hClientPeer(harness::Ctx& ctx) {
+  static HClassifierPeer* peer = nullptr;
   delete peer;
-  peer = new ClassifierPeer(ctx);
+  peer = new HClassifierPeer(ctx);
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::vector<std::string> clientQueued(harness::Ctx& ctx) {
+std::vector<std::string> hClientQueued(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& z : ctx.Redis.ZRangeWithScores("moderation:pending", 0, -1)) out.push_back(z.Member);
   return out;
@@ -1165,7 +1165,7 @@ std::vector<std::string> clientQueued(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  ClassifierPeer& peer = clientPeer(ctx);
+  HClassifierPeer& peer = hClientPeer(ctx);
   triage("case-1", "c-1", "Buy followers now", {});
   const auto calls = ctx.GRPC.CallsTo("Classify");
   ctx.Assert(!calls.empty(), "no Classify call was made");
@@ -1187,19 +1187,19 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  ClassifierPeer& peer = clientPeer(ctx);
+  HClassifierPeer& peer = hClientPeer(ctx);
   ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "text is empty");
   Decision d = triage("case-1", "c-1", "", {});
   size_t calls = ctx.GRPC.CallsTo("Classify").size();
   ctx.Equal(calls, 1, "a request the classifier answered INVALID_ARGUMENT must be sent once: the code says the request is wrong, a retry gets the same answer; the calls");
   ctx.Equal(d.route, "human_review", "an unclassifiable item's route");
-  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "an unclassifiable item answered human_review must be queued for people; moderation:pending");
+  ctx.Equal(hClientQueued(ctx), std::vector<std::string>{"case-1"}, "an unclassifiable item answered human_review must be queued for people; moderation:pending");
   ctx.GRPC.Fail("Classify", grpc::StatusCode::PERMISSION_DENIED, "caller not allowed");
   d = triage("case-4", "c-4", "hello", {});
   calls = ctx.GRPC.CallsTo("Classify").size();
   ctx.Equal(calls - 1, 1, "a request the classifier answered PERMISSION_DENIED must be sent once: only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for case-4");
   ctx.Equal(d.route, "human_review", "case-4, refused with PERMISSION_DENIED; the route");
-  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1", "case-4"}, "case-4, refused with PERMISSION_DENIED, must be queued for people; moderation:pending");
+  ctx.Equal(hClientQueued(ctx), std::vector<std::string>{"case-1", "case-4"}, "case-4, refused with PERMISSION_DENIED, must be queued for people; moderation:pending");
   peer.scores["c-2"] = 0.3;
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE);
   d = triage("case-2", "c-2", "hello", {});
@@ -1213,24 +1213,24 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
 }
 
 void CheckAutoThreshold(harness::Ctx& ctx) {
-  ClassifierPeer& peer = clientPeer(ctx);
+  HClassifierPeer& peer = hClientPeer(ctx);
   peer.scores["c-1"] = 0.9;
   peer.scores["c-2"] = 0.985;
   peer.scores["c-3"] = 0.98;
   Decision d = triage("case-1", "c-1", "Buy followers now", {"hash_match"});
   ctx.Equal(d.route, "human_review", "a 0.9 score with a hash match: an automatic removal needs at least 0.98; the route");
-  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "case-1 must wait for a person; moderation:pending");
+  ctx.Equal(hClientQueued(ctx), std::vector<std::string>{"case-1"}, "case-1 must wait for a person; moderation:pending");
   d = triage("case-2", "c-2", "Buy followers now", {"hash_match"});
   ctx.Equal(d.route, "auto_remove", "a 0.985 score with a hash match; the route");
   ctx.Assert(d.label == "spam" && d.confidence == 0.985 && d.model_version == "clf-2026-10",
              "an automatic removal must carry the verdict as its evidence, got label %q confidence %v model %q", d.label, d.confidence, d.model_version);
   d = triage("case-3", "c-3", "Buy followers now", {"hash_match"});
   ctx.Equal(d.route, "auto_remove", "a score of exactly 0.98 with a hash match: at least 0.98 acts; the route");
-  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "an automatic removal must not also be queued; moderation:pending");
+  ctx.Equal(hClientQueued(ctx), std::vector<std::string>{"case-1"}, "an automatic removal must not also be queued; moderation:pending");
 }
 
 void CheckCorroboration(harness::Ctx& ctx) {
-  ClassifierPeer& peer = clientPeer(ctx);
+  HClassifierPeer& peer = hClientPeer(ctx);
   peer.scores["c-1"] = 0.99;
   const Decision alone = triage("case-1", "c-1", "Buy followers now", {});
   const Decision weak = triage("case-2", "c-1", "Buy followers now", {"user_report"});
@@ -1238,16 +1238,16 @@ void CheckCorroboration(harness::Ctx& ctx) {
   ctx.Equal(alone.route, "human_review", "a 0.99 score with no signal: an automatic removal needs a corroborating signal; the route");
   ctx.Equal(weak.route, "human_review", "a 0.99 score with only a user report (user_report is not in kCorroboratingSignals); the route");
   ctx.Equal(backed.route, "auto_remove", "a 0.99 score with a trusted flagger; the route");
-  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1", "case-2"}, "moderation:pending must hold the two uncorroborated cases");
+  ctx.Equal(hClientQueued(ctx), std::vector<std::string>{"case-1", "case-2"}, "moderation:pending must hold the two uncorroborated cases");
 }
 
 void CheckUnavailableToHuman(harness::Ctx& ctx) {
-  clientPeer(ctx);
+  hClientPeer(ctx);
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "", 10);
   const Decision d = triage("case-1", "c-1", "Buy followers now", {"hash_match"});
   ctx.Assert(d.route == "human_review" && d.reason == "classifier_unavailable",
              "with the classifier down triage answered route %q reason %q: a report nobody classified must go to a person", d.route, d.reason);
-  ctx.Equal(clientQueued(ctx), std::vector<std::string>{"case-1"}, "moderation:pending");
+  ctx.Equal(hClientQueued(ctx), std::vector<std::string>{"case-1"}, "moderation:pending");
   ctx.Equal(ctx.Redis.HGet("moderation:counters", "pending").value_or(""), "1", "the queued case must be counted as pending");
 }
 `,

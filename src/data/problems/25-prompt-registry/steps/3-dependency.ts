@@ -1149,29 +1149,29 @@ import (
 )
 
 const (
-	gateTenant = "t1"
-	gateName   = "support-reply"
-	gateSafe   = "Hi {{customer_name}}, thanks for asking about {{product}}."
-	gateSafe4  = "Hello {{customer_name}}, here is what we know about {{product}}."
-	gateUnsafe = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}."
+	kHGateTenant = "t1"
+	kHGateName   = "support-reply"
+	kHGateSafe   = "Hi {{customer_name}}, thanks for asking about {{product}}."
+	kHGateSafe4  = "Hello {{customer_name}}, here is what we know about {{product}}."
+	kHGateUnsafe = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}."
 )
 
-// evaluatorPeer is the stand-in eval service: verdicts from prompts/judge.
-type evaluatorPeer struct {
+// HEvaluatorPeer is the stand-in eval service: verdicts from prompts/judge.
+type HEvaluatorPeer struct {
 	pb.UnimplementedEvaluatorServer
 }
 
-func (evaluatorPeer) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.EvaluateReply, error) {
+func (HEvaluatorPeer) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.EvaluateReply, error) {
 	evalID, passed, score := judge.Verdict(req.GetContentHash(), req.GetTemplateText())
 	return &pb.EvaluateReply{EvalId: evalID, Passed: passed, Score: score, ContentHash: req.GetContentHash()}, nil
 }
 
-// gatePointer stands in for the step-2 live pointer over the harness's Redis.
-type gatePointer struct {
+// HGatePointer stands in for the step-2 live pointer over the harness's Redis.
+type HGatePointer struct {
 	ctx *harness.Ctx
 }
 
-func (p gatePointer) Promote(_ context.Context, tenant, name string, version int, actor string) (*Swap, error) {
+func (p HGatePointer) Promote(_ context.Context, tenant, name string, version int, actor string) (*Swap, error) {
 	if p.ctx.Redis.Exists(config.VersionKey(tenant, name, version)) == 0 {
 		return nil, nil
 	}
@@ -1186,42 +1186,42 @@ func (p gatePointer) Promote(_ context.Context, tenant, name string, version int
 	return &Swap{From: from, To: version}, nil
 }
 
-func gateSha(text string) string {
+func hGateSha(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(sum[:])
 }
 
-func gateWorld(ctx *harness.Ctx) gatePointer {
-	pb.RegisterEvaluatorServer(ctx.GRPC.Server(config.Evaluator), &evaluatorPeer{})
-	for version, template := range map[int]string{2: gateSafe, 3: gateUnsafe, 4: gateSafe4} {
-		record, _ := json.Marshal(map[string]any{"name": gateName, "version": version, "content_hash": gateSha(template), "template": template, "variables": []string{"customer_name", "product"}})
-		ctx.Redis.Set(config.VersionKey(gateTenant, gateName, version), string(record))
+func hGateWorld(ctx *harness.Ctx) HGatePointer {
+	pb.RegisterEvaluatorServer(ctx.GRPC.Server(config.Evaluator), &HEvaluatorPeer{})
+	for version, template := range map[int]string{2: kHGateSafe, 3: kHGateUnsafe, 4: kHGateSafe4} {
+		record, _ := json.Marshal(map[string]any{"name": kHGateName, "version": version, "content_hash": hGateSha(template), "template": template, "variables": []string{"customer_name", "product"}})
+		ctx.Redis.Set(config.VersionKey(kHGateTenant, kHGateName, version), string(record))
 	}
-	return gatePointer{ctx: ctx}
+	return HGatePointer{ctx: ctx}
 }
 
-func gateRun(ctx *harness.Ctx, state gatePointer, version int) GateResult {
-	result, err := gate(context.Background(), state, gateTenant, gateName, version, "alice")
+func hGateRun(ctx *harness.Ctx, state HGatePointer, version int) GateResult {
+	result, err := gate(context.Background(), state, kHGateTenant, kHGateName, version, "alice")
 	ctx.NoError(err, "gate(%d)", version)
 	return result
 }
 
-func gateCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Evaluate", "") }
+func hGateCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Evaluate", "") }
 
-func gateLive(ctx *harness.Ctx) string {
-	live, _ := ctx.Redis.Get(config.LiveKey(gateTenant, gateName))
+func hGateLive(ctx *harness.Ctx) string {
+	live, _ := ctx.Redis.Get(config.LiveKey(kHGateTenant, kHGateName))
 	return live
 }
 
-func gateExpect(ctx *harness.Ctx, result GateResult, decision, reason string) {
+func hGateExpect(ctx *harness.Ctx, result GateResult, decision, reason string) {
 	ctx.Equal(result.Decision, decision, "the gate's decision (%+v)", result)
 	if reason != "" {
 		ctx.Equal(result.Reason, reason, "the gate's reason (%+v)", result)
 	}
 }
 
-func gateEval(ctx *harness.Ctx, template string) map[string]any {
-	raw, ok := ctx.Redis.Get(config.EvalKey(gateTenant, gateName, gateSha(template)))
+func hGateEval(ctx *harness.Ctx, template string) map[string]any {
+	raw, ok := ctx.Redis.Get(config.EvalKey(kHGateTenant, kHGateName, hGateSha(template)))
 	if !ok {
 		return nil
 	}
@@ -1231,81 +1231,81 @@ func gateEval(ctx *harness.Ctx, template string) map[string]any {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	state := gateWorld(ctx)
-	gateExpect(ctx, gateRun(ctx, state, 2), "promoted", "")
-	calls := gateCalls(ctx)
+	state := hGateWorld(ctx)
+	hGateExpect(ctx, hGateRun(ctx, state, 2), "promoted", "")
+	calls := hGateCalls(ctx)
 	ctx.Equal(len(calls), 1, "a healthy evaluator is called once; Evaluate calls")
 	ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a hung evaluator holds the promotion, and the operator waiting on it, open")
 	ctx.Assert(calls[0].Timeout.Seconds() >= 2.5 && calls[0].Timeout.Seconds() <= 3.5, "the deadline must be 3 s, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Evaluate", 5.0, config.Evaluator)
 	started := ctx.Clock.Now()
-	result := gateRun(ctx, state, 4)
+	result := hGateRun(ctx, state, 4)
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	gateExpect(ctx, result, "blocked", "deadline")
-	ctx.Equal(len(gateCalls(ctx)), 4, "an evaluator that hangs gets maxAttempts = 3 calls, each cut at the deadline; calls so far")
+	hGateExpect(ctx, result, "blocked", "deadline")
+	ctx.Equal(len(hGateCalls(ctx)), 4, "an evaluator that hangs gets maxAttempts = 3 calls, each cut at the deadline; calls so far")
 	ctx.Assert(waited <= 11, "the gate waited %.1f s on a hung evaluator: three 3-second attempts and their backoffs end well before that", waited)
-	for n, call := range gateCalls(ctx)[1:] {
+	for n, call := range hGateCalls(ctx)[1:] {
 		ctx.Assert(call.HasDeadline() && call.Timeout.Seconds() >= 2.5 && call.Timeout.Seconds() <= 3.5, "attempt %d on the hung evaluator carried a deadline of %v: every attempt gets its own 3 s, not what is left of the first one's", n+1, call.Timeout)
 	}
-	ctx.Equal(gateLive(ctx), "2", "a version nobody could evaluate must not go live; the live version")
+	ctx.Equal(hGateLive(ctx), "2", "a version nobody could evaluate must not go live; the live version")
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	state := gateWorld(ctx)
+	state := hGateWorld(ctx)
 	ctx.GRPC.Fail("Evaluate", codes.Unavailable, "evaluator restarting", 1, config.Evaluator)
-	result := gateRun(ctx, state, 2)
-	gateExpect(ctx, result, "promoted", "")
-	ctx.Assert(result.Attempts == 2 && len(gateCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", len(gateCalls(ctx)), result)
+	result := hGateRun(ctx, state, 2)
+	hGateExpect(ctx, result, "promoted", "")
+	ctx.Assert(result.Attempts == 2 && len(hGateCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", len(hGateCalls(ctx)), result)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	ctx.GRPC.Fail("Evaluate", codes.Unavailable, "evaluator down", 3, config.Evaluator)
-	result = gateRun(ctx, state, 4)
-	gateExpect(ctx, result, "blocked", "unavailable")
-	ctx.Assert(len(gateCalls(ctx)) == 5 && result.Attempts == 3, "an evaluator that stays UNAVAILABLE gets maxAttempts = 3 calls: saw %d calls, %+v", len(gateCalls(ctx))-2, result)
+	result = hGateRun(ctx, state, 4)
+	hGateExpect(ctx, result, "blocked", "unavailable")
+	ctx.Assert(len(hGateCalls(ctx)) == 5 && result.Attempts == 3, "an evaluator that stays UNAVAILABLE gets maxAttempts = 3 calls: saw %d calls, %+v", len(hGateCalls(ctx))-2, result)
 	for n, code := range []codes.Code{codes.InvalidArgument, codes.ResourceExhausted, codes.Aborted, codes.FailedPrecondition} {
 		ctx.GRPC.Fail("Evaluate", code, "the suite refused the request", 1, config.Evaluator)
-		result = gateRun(ctx, state, 4)
-		ctx.Equal(len(gateCalls(ctx)), 6+n, "%s is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer; calls so far", code)
-		gateExpect(ctx, result, "blocked", "error")
+		result = hGateRun(ctx, state, 4)
+		ctx.Equal(len(hGateCalls(ctx)), 6+n, "%s is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer; calls so far", code)
+		hGateExpect(ctx, result, "blocked", "error")
 	}
 }
 
 func CheckBlockOnError(ctx *harness.Ctx) {
-	state := gateWorld(ctx)
+	state := hGateWorld(ctx)
 	ctx.GRPC.Fail("Evaluate", codes.Internal, "eval suite crashed", 1, config.Evaluator)
-	result := gateRun(ctx, state, 2)
-	ctx.Equal(gateLive(ctx), "", "the eval suite crashed: an eval that did not run is not a pass; the live version")
-	gateExpect(ctx, result, "blocked", "error")
+	result := hGateRun(ctx, state, 2)
+	ctx.Equal(hGateLive(ctx), "", "the eval suite crashed: an eval that did not run is not a pass; the live version")
+	hGateExpect(ctx, result, "blocked", "error")
 	ctx.GRPC.Stop(config.Evaluator)
-	result = gateRun(ctx, state, 2)
-	ctx.Equal(gateLive(ctx), "", "with the evaluator down: no verdict, no promotion; the live version")
-	gateExpect(ctx, result, "blocked", "unavailable")
+	result = hGateRun(ctx, state, 2)
+	ctx.Equal(hGateLive(ctx), "", "with the evaluator down: no verdict, no promotion; the live version")
+	hGateExpect(ctx, result, "blocked", "unavailable")
 }
 
 func CheckFailTerminal(ctx *harness.Ctx) {
-	state := gateWorld(ctx)
-	result := gateRun(ctx, state, 3)
-	gateExpect(ctx, result, "blocked", "failed")
-	ctx.Equal(len(gateCalls(ctx)), 1, "a failed verdict is an answer, not an outage: asking again is shopping for a pass; calls")
-	ctx.Equal(result.EvalID, "ev-"+gateSha(gateUnsafe)[:12], "a blocked result names the eval that failed it")
-	ctx.Equal(gateLive(ctx), "", "a version that failed its eval must not go live; the live version")
+	state := hGateWorld(ctx)
+	result := hGateRun(ctx, state, 3)
+	hGateExpect(ctx, result, "blocked", "failed")
+	ctx.Equal(len(hGateCalls(ctx)), 1, "a failed verdict is an answer, not an outage: asking again is shopping for a pass; calls")
+	ctx.Equal(result.EvalID, "ev-"+hGateSha(kHGateUnsafe)[:12], "a blocked result names the eval that failed it")
+	ctx.Equal(hGateLive(ctx), "", "a version that failed its eval must not go live; the live version")
 }
 
 func CheckRecordByHash(ctx *harness.Ctx) {
-	state := gateWorld(ctx)
-	first := gateRun(ctx, state, 2)
-	gateExpect(ctx, first, "promoted", "")
-	record := gateEval(ctx, gateSafe)
-	ctx.Assert(record != nil, "the verdict on version 2 must be recorded under its content hash (prompts:eval:%s:%s:<sha256>), found %v", gateTenant, gateName, ctx.Redis.Keys("prompts:eval*"))
-	ctx.Assert(record["eval_id"] == first.EvalID && record["passed"] == true && record["version"] == float64(2) && record["score"] == 0.93 && record["content_hash"] == gateSha(gateSafe), "the record carries eval_id, passed, score, content_hash and version: %v", record)
-	second := gateRun(ctx, state, 3)
-	calls := gateCalls(ctx)
+	state := hGateWorld(ctx)
+	first := hGateRun(ctx, state, 2)
+	hGateExpect(ctx, first, "promoted", "")
+	record := hGateEval(ctx, kHGateSafe)
+	ctx.Assert(record != nil, "the verdict on version 2 must be recorded under its content hash (prompts:eval:%s:%s:<sha256>), found %v", kHGateTenant, kHGateName, ctx.Redis.Keys("prompts:eval*"))
+	ctx.Assert(record["eval_id"] == first.EvalID && record["passed"] == true && record["version"] == float64(2) && record["score"] == 0.93 && record["content_hash"] == hGateSha(kHGateSafe), "the record carries eval_id, passed, score, content_hash and version: %v", record)
+	second := hGateRun(ctx, state, 3)
+	calls := hGateCalls(ctx)
 	ctx.Equal(len(calls), 2, "version 3 must be evaluated on its own bytes: a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3; Evaluate calls in all")
 	request, _ := calls[1].Request.(*pb.EvaluateRequest)
-	ctx.Assert(request != nil && request.GetContentHash() == gateSha(gateUnsafe), "the second Evaluate call must carry version 3's content hash")
-	gateExpect(ctx, second, "blocked", "failed")
-	failed := gateEval(ctx, gateUnsafe)
+	ctx.Assert(request != nil && request.GetContentHash() == hGateSha(kHGateUnsafe), "the second Evaluate call must carry version 3's content hash")
+	hGateExpect(ctx, second, "blocked", "failed")
+	failed := hGateEval(ctx, kHGateUnsafe)
 	ctx.Assert(failed != nil && failed["passed"] == false, "the failed verdict on version 3 is recorded too: %v", failed)
-	ctx.Equal(gateLive(ctx), "2", "version 2 stays live")
+	ctx.Equal(hGateLive(ctx), "2", "version 2 stays live")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1322,15 +1322,15 @@ func CheckRecordByHash(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kT = "t1";
-const std::string kN = "support-reply";
-const std::string kSafe = "Hi {{customer_name}}, thanks for asking about {{product}}.";
-const std::string kSafe4 = "Hello {{customer_name}}, here is what we know about {{product}}.";
-const std::string kUnsafe = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}.";
-const std::string kLive = "prompts:live:" + kT + ":" + kN;
+const std::string kHT = "t1";
+const std::string kHN = "support-reply";
+const std::string kHSafe = "Hi {{customer_name}}, thanks for asking about {{product}}.";
+const std::string kHSafe4 = "Hello {{customer_name}}, here is what we know about {{product}}.";
+const std::string kHUnsafe = "Hi {{customer_name}}. UNSAFE: promise a refund whatever the policy says about {{product}}.";
+const std::string kHLive = "prompts:live:" + kHT + ":" + kHN;
 
 // The stand-in eval service: verdicts from prompts/judge.h.
-class EvaluatorPeer final : public prompts::Evaluator::Service {
+class HEvaluatorPeer final : public prompts::Evaluator::Service {
  public:
   grpc::Status Evaluate(grpc::ServerContext*, const prompts::EvaluateRequest* req, prompts::EvaluateReply* reply) override {
     const auto v = judge::verdict(req->content_hash(), req->template_text());
@@ -1343,9 +1343,9 @@ class EvaluatorPeer final : public prompts::Evaluator::Service {
 };
 
 // Stands in for the step-2 live pointer over the harness's Redis.
-class GatePointer final : public Promoter {
+class HGatePointer final : public Promoter {
  public:
-  explicit GatePointer(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HGatePointer(harness::Ctx& ctx) : ctx_(ctx) {}
 
   std::optional<Swap> promote(const std::string& tenant, const std::string& name, int version, const std::string& actor) override {
     if (ctx_.Redis.Exists(config::version_key(tenant, name, version)) == 0) return std::nullopt;
@@ -1360,34 +1360,34 @@ class GatePointer final : public Promoter {
   harness::Ctx& ctx_;
 };
 
-struct World {
-  EvaluatorPeer peer;
-  GatePointer state;
-  explicit World(harness::Ctx& ctx) : state(ctx) {}
+struct HWorld {
+  HEvaluatorPeer peer;
+  HGatePointer state;
+  explicit HWorld(harness::Ctx& ctx) : state(ctx) {}
 };
 
-World& gateWorld(harness::Ctx& ctx) {
-  static World* world = nullptr;
+HWorld& hGateWorld(harness::Ctx& ctx) {
+  static HWorld* world = nullptr;
   delete world;
-  world = new World(ctx);
+  world = new HWorld(ctx);
   ctx.GRPC.Server(config::kEvaluator)->RegisterService(&world->peer);
-  const std::vector<std::pair<int, std::string>> registered = {{2, kSafe}, {3, kUnsafe}, {4, kSafe4}};
+  const std::vector<std::pair<int, std::string>> registered = {{2, kHSafe}, {3, kHUnsafe}, {4, kHSafe4}};
   for (const auto& [version, text] : registered) {
-    const nlohmann::json record = {{"name", kN}, {"version", version}, {"content_hash", sha256_hex(text)}, {"template", text}, {"variables", {"customer_name", "product"}}};
-    ctx.Redis.Set(config::version_key(kT, kN, version), record.dump());
+    const nlohmann::json record = {{"name", kHN}, {"version", version}, {"content_hash", sha256_hex(text)}, {"template", text}, {"variables", {"customer_name", "product"}}};
+    ctx.Redis.Set(config::version_key(kHT, kHN, version), record.dump());
   }
   return *world;
 }
 
-std::string liveNow(harness::Ctx& ctx) { return ctx.Redis.Get(kLive).value_or(""); }
+std::string hLiveNow(harness::Ctx& ctx) { return ctx.Redis.Get(kHLive).value_or(""); }
 
-void gateExpect(harness::Ctx& ctx, const GateResult& result, const std::string& decision, const std::string& reason = "") {
+void hGateExpect(harness::Ctx& ctx, const GateResult& result, const std::string& decision, const std::string& reason = "") {
   ctx.Equal(result.decision, decision, "the gate's decision (reason %q, eval %q, attempts %d)", result.reason, result.eval_id, result.attempts);
   if (!reason.empty()) ctx.Equal(result.reason, reason, "the gate's reason");
 }
 
-std::optional<nlohmann::json> evalOf(harness::Ctx& ctx, const std::string& text) {
-  const auto raw = ctx.Redis.Get(config::eval_key(kT, kN, sha256_hex(text)));
+std::optional<nlohmann::json> hEvalOf(harness::Ctx& ctx, const std::string& text) {
+  const auto raw = ctx.Redis.Get(config::eval_key(kHT, kHN, sha256_hex(text)));
   if (!raw) return std::nullopt;
   return nlohmann::json::parse(*raw, nullptr, false);
 }
@@ -1395,36 +1395,36 @@ std::optional<nlohmann::json> evalOf(harness::Ctx& ctx, const std::string& text)
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto& w = gateWorld(ctx);
-  gateExpect(ctx, gate(w.state, kT, kN, 2, "alice"), "promoted");
+  auto& w = hGateWorld(ctx);
+  hGateExpect(ctx, gate(w.state, kHT, kHN, 2, "alice"), "promoted");
   const auto calls = ctx.GRPC.CallsTo("Evaluate");
   ctx.Equal(calls.size(), 1, "a healthy evaluator is called once; Evaluate calls");
   ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a hung evaluator holds the promotion, and the operator waiting on it, open");
   ctx.Assert(2.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 3.5, "the deadline must be 3 s, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Evaluate", 5.0, config::kEvaluator);
   const int64_t started = ctx.Clock.Now();
-  const GateResult result = gate(w.state, kT, kN, 4, "alice");
+  const GateResult result = gate(w.state, kHT, kHN, 4, "alice");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  gateExpect(ctx, result, "blocked", "deadline");
+  hGateExpect(ctx, result, "blocked", "deadline");
   ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 4, "an evaluator that hangs gets kMaxAttempts = 3 calls, each cut at the deadline; calls so far");
   ctx.Assert(waited <= 11, "the gate waited %.1f s on a hung evaluator: three 3-second attempts and their backoffs end well before that", waited);
   const auto hung = ctx.GRPC.CallsTo("Evaluate");
   for (size_t n = 1; n < hung.size(); n++)
     ctx.Assert(hung[n].HasDeadline() && 2.5 <= hung[n].TimeoutSeconds() && hung[n].TimeoutSeconds() <= 3.5,
                "attempt %d on the hung evaluator carried a deadline of %vs: every attempt gets its own 3 s, not what is left of the first one's", n, hung[n].TimeoutSeconds());
-  ctx.Equal(liveNow(ctx), "2", "a version nobody could evaluate must not go live; the live version");
+  ctx.Equal(hLiveNow(ctx), "2", "a version nobody could evaluate must not go live; the live version");
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  auto& w = gateWorld(ctx);
+  auto& w = hGateWorld(ctx);
   ctx.GRPC.Fail("Evaluate", grpc::StatusCode::UNAVAILABLE, "evaluator restarting", 1, config::kEvaluator);
-  GateResult result = gate(w.state, kT, kN, 2, "alice");
-  gateExpect(ctx, result, "promoted");
+  GateResult result = gate(w.state, kHT, kHN, 2, "alice");
+  hGateExpect(ctx, result, "promoted");
   ctx.Assert(result.attempts == 2 && ctx.GRPC.CallsTo("Evaluate").size() == 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and attempts %d", ctx.GRPC.CallsTo("Evaluate").size(), result.attempts);
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   ctx.GRPC.Fail("Evaluate", grpc::StatusCode::UNAVAILABLE, "evaluator down", 3, config::kEvaluator);
-  result = gate(w.state, kT, kN, 4, "alice");
-  gateExpect(ctx, result, "blocked", "unavailable");
+  result = gate(w.state, kHT, kHN, 4, "alice");
+  hGateExpect(ctx, result, "blocked", "unavailable");
   ctx.Assert(ctx.GRPC.CallsTo("Evaluate").size() == 5 && result.attempts == 3, "an evaluator that stays UNAVAILABLE gets kMaxAttempts = 3 calls: saw %d calls, attempts %d", ctx.GRPC.CallsTo("Evaluate").size() - 2, result.attempts);
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
                                                                           {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
@@ -1432,50 +1432,50 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
                                                                           {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"}};
   for (size_t n = 0; n < terminal.size(); n++) {
     ctx.GRPC.Fail("Evaluate", terminal[n].first, "the suite refused the request", 1, config::kEvaluator);
-    result = gate(w.state, kT, kN, 4, "alice");
+    result = gate(w.state, kHT, kHN, 4, "alice");
     ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 6 + n, "%s is neither UNAVAILABLE nor DEADLINE_EXCEEDED, so a retry gets the same answer; calls so far", terminal[n].second);
-    gateExpect(ctx, result, "blocked", "error");
+    hGateExpect(ctx, result, "blocked", "error");
   }
 }
 
 void CheckBlockOnError(harness::Ctx& ctx) {
-  auto& w = gateWorld(ctx);
+  auto& w = hGateWorld(ctx);
   ctx.GRPC.Fail("Evaluate", grpc::StatusCode::INTERNAL, "eval suite crashed", 1, config::kEvaluator);
-  GateResult result = gate(w.state, kT, kN, 2, "alice");
-  ctx.Equal(liveNow(ctx), "", "the eval suite crashed: an eval that did not run is not a pass; the live version");
-  gateExpect(ctx, result, "blocked", "error");
+  GateResult result = gate(w.state, kHT, kHN, 2, "alice");
+  ctx.Equal(hLiveNow(ctx), "", "the eval suite crashed: an eval that did not run is not a pass; the live version");
+  hGateExpect(ctx, result, "blocked", "error");
   ctx.GRPC.Stop(config::kEvaluator);
-  result = gate(w.state, kT, kN, 2, "alice");
-  ctx.Equal(liveNow(ctx), "", "with the evaluator down: no verdict, no promotion; the live version");
-  gateExpect(ctx, result, "blocked", "unavailable");
+  result = gate(w.state, kHT, kHN, 2, "alice");
+  ctx.Equal(hLiveNow(ctx), "", "with the evaluator down: no verdict, no promotion; the live version");
+  hGateExpect(ctx, result, "blocked", "unavailable");
 }
 
 void CheckFailTerminal(harness::Ctx& ctx) {
-  auto& w = gateWorld(ctx);
-  const GateResult result = gate(w.state, kT, kN, 3, "alice");
-  gateExpect(ctx, result, "blocked", "failed");
+  auto& w = hGateWorld(ctx);
+  const GateResult result = gate(w.state, kHT, kHN, 3, "alice");
+  hGateExpect(ctx, result, "blocked", "failed");
   ctx.Equal(ctx.GRPC.CallsTo("Evaluate").size(), 1, "a failed verdict is an answer, not an outage: asking again is shopping for a pass; calls");
-  ctx.Equal(result.eval_id, "ev-" + sha256_hex(kUnsafe).substr(0, 12), "a blocked result names the eval that failed it");
-  ctx.Equal(liveNow(ctx), "", "a version that failed its eval must not go live; the live version");
+  ctx.Equal(result.eval_id, "ev-" + sha256_hex(kHUnsafe).substr(0, 12), "a blocked result names the eval that failed it");
+  ctx.Equal(hLiveNow(ctx), "", "a version that failed its eval must not go live; the live version");
 }
 
 void CheckRecordByHash(harness::Ctx& ctx) {
-  auto& w = gateWorld(ctx);
-  const GateResult first = gate(w.state, kT, kN, 2, "alice");
-  gateExpect(ctx, first, "promoted");
-  const auto record = evalOf(ctx, kSafe);
+  auto& w = hGateWorld(ctx);
+  const GateResult first = gate(w.state, kHT, kHN, 2, "alice");
+  hGateExpect(ctx, first, "promoted");
+  const auto record = hEvalOf(ctx, kHSafe);
   ctx.Assert(record.has_value(), "the verdict on version 2 must be recorded under its content hash (prompts:eval:t1:support-reply:<sha256>), found %v", ctx.Redis.Keys("prompts:eval*"));
   ctx.Assert(record->value("eval_id", "") == first.eval_id && record->value("passed", false) && record->value("version", 0) == 2 && record->value("score", 0.0) == 0.93 &&
-                 record->value("content_hash", "") == sha256_hex(kSafe),
+                 record->value("content_hash", "") == sha256_hex(kHSafe),
              "the record carries eval_id, passed, score, content_hash and version: %s", record->dump());
-  const GateResult second = gate(w.state, kT, kN, 3, "alice");
+  const GateResult second = gate(w.state, kHT, kHN, 3, "alice");
   const auto calls = ctx.GRPC.CallsTo("Evaluate");
   ctx.Equal(calls.size(), 2, "version 3 must be evaluated on its own bytes: a verdict belongs to the bytes it judged, and version 2's pass says nothing about version 3; Evaluate calls in all");
-  ctx.Equal(calls[1].Request<prompts::EvaluateRequest>().content_hash(), sha256_hex(kUnsafe), "the second Evaluate call must carry version 3's content hash");
-  gateExpect(ctx, second, "blocked", "failed");
-  const auto failed = evalOf(ctx, kUnsafe);
+  ctx.Equal(calls[1].Request<prompts::EvaluateRequest>().content_hash(), sha256_hex(kHUnsafe), "the second Evaluate call must carry version 3's content hash");
+  hGateExpect(ctx, second, "blocked", "failed");
+  const auto failed = hEvalOf(ctx, kHUnsafe);
   ctx.Assert(failed && failed->contains("passed") && (*failed)["passed"] == false, "the failed verdict on version 3 is recorded too");
-  ctx.Equal(liveNow(ctx), "2", "version 2 stays live");
+  ctx.Equal(hLiveNow(ctx), "2", "version 2 stays live");
 }
 `,
   },

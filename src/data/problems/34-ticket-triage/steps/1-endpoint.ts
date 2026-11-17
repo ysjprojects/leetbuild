@@ -683,17 +683,17 @@ import (
 )
 
 const (
-	triagePath = "/v1/tickets/triage"
-	invoice    = "Refund for invoice 4411: the payment was charged twice"
+	kHTriagePath = "/v1/tickets/triage"
+	kHInvoice    = "Refund for invoice 4411: the payment was charged twice"
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func post(c *harness.HTTP, body any, tenant, key string) *harness.Response {
+func hPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
 	var header []string
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -701,72 +701,72 @@ func post(c *harness.HTTP, body any, tenant, key string) *harness.Response {
 	if key != "" {
 		header = append(header, "Idempotency-Key", key)
 	}
-	return c.Post(triagePath, body, header...)
+	return c.Post(kHTriagePath, body, header...)
 }
 
-func routingOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
-	ctx.Equal(r.Status, 200, "POST %s answered %s", triagePath, r.Text())
+func hRoutingOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
+	ctx.Equal(r.Status, 200, "POST %s answered %s", kHTriagePath, r.Text())
 	body, _ := r.JSON().(map[string]any)
 	return body
 }
 
-func ticketSeq(ctx *harness.Ctx) string {
+func hTicketSeq(ctx *harness.Ctx) string {
 	seq, _ := ctx.Redis.Get("ticket:seq")
 	return seq
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	body := routingOf(ctx, post(c, map[string]string{"text": invoice}, "acme", "k-1"))
+	c := hApi(ctx)
+	body := hRoutingOf(ctx, hPost(c, map[string]string{"text": kHInvoice}, "acme", "k-1"))
 	ctx.Assert(body["queue"] == "billing" && body["priority"] == "normal", "an invoice ticket must be routed to billing at normal priority, got %v", body)
 	id, _ := body["ticket_id"].(string)
 	ctx.Assert(strings.HasPrefix(id, "t-") && body["tenant"] == "acme", "the routing must carry the minted ticket id and the tenant, got %v", body)
 	ctx.Equal(body["ruleset_version"], "v3", "the routing must name the ruleset that decided")
-	r := post(c, map[string]string{"text": invoice}, "", "k-2")
+	r := hPost(c, map[string]string{"text": kHInvoice}, "", "k-2")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckServerSideRouting(ctx *harness.Ctx) {
-	c := api(ctx)
-	body := routingOf(ctx, post(c, map[string]string{"text": invoice, "priority": "urgent", "queue": "delivery"}, "acme", "k-1"))
+	c := hApi(ctx)
+	body := hRoutingOf(ctx, hPost(c, map[string]string{"text": kHInvoice, "priority": "urgent", "queue": "delivery"}, "acme", "k-1"))
 	ctx.Equal(body["priority"], "normal", "the caller sent priority urgent: priority comes from the text (normal for an invoice), the body's priority is ignored; the routed priority")
 	ctx.Equal(body["queue"], "billing", "the caller sent queue delivery: the queue comes from the text (billing), the body's queue is ignored even when it names a real queue; the routed queue")
 	recorded := store.DecisionForKey(context.Background(), "acme", "k-1")
 	ctx.Assert(recorded != nil && recorded["queue"] == "billing" && recorded["priority"] == "normal", "the recorded routing must be the server's decision, got %v", recorded)
-	body = routingOf(ctx, post(c, map[string]string{"text": "Production outage: every login fails", "priority": "low"}, "acme", "k-2"))
+	body = hRoutingOf(ctx, hPost(c, map[string]string{"text": "Production outage: every login fails", "priority": "low"}, "acme", "k-2"))
 	ctx.Assert(body["priority"] == "urgent" && body["queue"] == "account", "an outage that blocks logins must be routed to account as urgent whatever the body says, got %v", body)
 }
 
 func CheckTextCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, map[string]string{"text": strings.Repeat("x", 32*1024+1)}, "acme", "k-big")
+	c := hApi(ctx)
+	r := hPost(c, map[string]string{"text": strings.Repeat("x", 32*1024+1)}, "acme", "k-big")
 	ctx.Equal(r.Status, 413, "a 32 769-byte ticket must be refused before any work (the cap is 32 KiB)")
-	r = post(c, map[string]string{"text": strings.Repeat("\\u00e9", 16*1024+1)}, "acme", "k-wide")
+	r = hPost(c, map[string]string{"text": strings.Repeat("\\u00e9", 16*1024+1)}, "acme", "k-wide")
 	ctx.Equal(r.Status, 413, "a ticket of 16 385 characters (32 770 bytes of UTF-8) must be refused: the cap counts bytes, not characters")
 	for _, blank := range []string{"", "   "} {
-		r = post(c, map[string]string{"text": blank}, "acme", "k-blank-"+strings.Repeat("s", len(blank)))
+		r = hPost(c, map[string]string{"text": blank}, "acme", "k-blank-"+strings.Repeat("s", len(blank)))
 		ctx.Equal(r.Status, 400, "a ticket with text %q", blank)
 	}
-	r = post(c, map[string]string{"priority": "low"}, "acme", "k-none")
+	r = hPost(c, map[string]string{"priority": "low"}, "acme", "k-none")
 	ctx.Equal(r.Status, 400, "a ticket without text")
-	r = post(c, map[string]string{"text": strings.Repeat("a", 32*1024) + "\\n"}, "acme", "k-pad")
+	r = hPost(c, map[string]string{"text": strings.Repeat("a", 32*1024) + "\\n"}, "acme", "k-pad")
 	ctx.Equal(r.Status, 413, "a ticket of 32 KiB of text plus a trailing newline (32 769 bytes) must be refused: the cap measures the text as sent")
-	ctx.Equal(ticketSeq(ctx), "", "a blank or oversized ticket must be refused before a ticket id is minted; ticket:seq")
-	r = post(c, map[string]string{"text": strings.Repeat("a", 32*1024)}, "acme", "k-max")
+	ctx.Equal(hTicketSeq(ctx), "", "a blank or oversized ticket must be refused before a ticket id is minted; ticket:seq")
+	r = hPost(c, map[string]string{"text": strings.Repeat("a", 32*1024)}, "acme", "k-max")
 	ctx.Equal(r.Status, 200, "a ticket of exactly 32 KiB")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := post(c, map[string]string{"text": invoice}, "acme", "hook-77")
+	c := hApi(ctx)
+	first := hPost(c, map[string]string{"text": kHInvoice}, "acme", "hook-77")
 	ctx.Equal(first.Status, 200, "the first delivery (%s)", first.Text())
-	retry := post(c, map[string]string{"text": invoice}, "acme", "hook-77")
+	retry := hPost(c, map[string]string{"text": kHInvoice}, "acme", "hook-77")
 	ctx.Assert(retry.Status == 200 && strings.TrimSpace(retry.Text()) == strings.TrimSpace(first.Text()), "a webhook retry with the same Idempotency-Key must answer the recorded routing: first %s, retry %s", first.Text(), retry.Text())
-	ctx.Equal(ticketSeq(ctx), "1", "the retry must not mint another ticket (look (tenant, key) up before triaging); ticket:seq")
-	other := routingOf(ctx, post(c, map[string]string{"text": invoice}, "globex", "hook-77"))
+	ctx.Equal(hTicketSeq(ctx), "1", "the retry must not mint another ticket (look (tenant, key) up before triaging); ticket:seq")
+	other := hRoutingOf(ctx, hPost(c, map[string]string{"text": kHInvoice}, "globex", "hook-77"))
 	firstBody, _ := first.JSON().(map[string]any)
 	ctx.Assert(other["tenant"] == "globex" && other["ticket_id"] != firstBody["ticket_id"], "globex sending the key acme used is another ticket, got %v", other)
-	none := post(c, map[string]string{"text": invoice}, "acme", "")
+	none := hPost(c, map[string]string{"text": kHInvoice}, "acme", "")
 	ctx.Equal(none.Status, 400, "a request without Idempotency-Key")
 }
 `,
@@ -779,10 +779,10 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kPath = "/v1/tickets/triage";
-const std::string kInvoice = "Refund for invoice 4411: the payment was charged twice";
+const std::string kHPath = "/v1/tickets/triage";
+const std::string kHInvoice = "Refund for invoice 4411: the payment was charged twice";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -790,19 +790,19 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
   std::vector<std::string> headers = {"Content-Type", "application/json"};
   if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
   if (!key.empty()) headers.insert(headers.end(), {"Idempotency-Key", key});
-  return c.Send("POST", kPath, body.dump(), headers);
+  return c.Send("POST", kHPath, body.dump(), headers);
 }
 
-nlohmann::json routingOf(harness::Ctx& ctx, const harness::Response& r) {
-  ctx.Equal(r.Status, 200, "POST %s answered %s", kPath, r.Text());
+nlohmann::json hRoutingOf(harness::Ctx& ctx, const harness::Response& r) {
+  ctx.Equal(r.Status, 200, "POST %s answered %s", kHPath, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-std::string repeat(const std::string& s, size_t n) {
+std::string hRepeat(const std::string& s, size_t n) {
   std::string out;
   for (size_t i = 0; i < n; ++i) out += s;
   return out;
@@ -811,57 +811,57 @@ std::string repeat(const std::string& s, size_t n) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto body = routingOf(ctx, post(c, {{"text", kInvoice}}, "acme", "k-1"));
+  auto c = hApi(ctx);
+  const auto body = hRoutingOf(ctx, hPost(c, {{"text", kHInvoice}}, "acme", "k-1"));
   ctx.Assert(body.value("queue", "") == "billing" && body.value("priority", "") == "normal", "an invoice ticket must be routed to billing at normal priority, got %s", body.dump());
   ctx.Assert(body.value("ticket_id", "").rfind("t-", 0) == 0 && body.value("tenant", "") == "acme", "the routing must carry the minted ticket id and the tenant, got %s", body.dump());
   ctx.Equal(body.value("ruleset_version", ""), "v3", "the routing must name the ruleset that decided");
-  const auto r = post(c, {{"text", kInvoice}}, "", "k-2");
+  const auto r = hPost(c, {{"text", kHInvoice}}, "", "k-2");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckServerSideRouting(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto body = routingOf(ctx, post(c, {{"text", kInvoice}, {"priority", "urgent"}, {"queue", "delivery"}}, "acme", "k-1"));
+  auto c = hApi(ctx);
+  auto body = hRoutingOf(ctx, hPost(c, {{"text", kHInvoice}, {"priority", "urgent"}, {"queue", "delivery"}}, "acme", "k-1"));
   ctx.Equal(body.value("priority", ""), "normal", "the caller sent priority urgent: priority comes from the text (normal for an invoice), the body's priority is ignored; the routed priority");
   ctx.Equal(body.value("queue", ""), "billing", "the caller sent queue delivery: the queue comes from the text (billing), the body's queue is ignored even when it names a real queue; the routed queue");
   const auto recorded = store::decisionForKey("acme", "k-1");
   ctx.Assert(recorded && recorded->value("queue", "") == "billing" && recorded->value("priority", "") == "normal", "the recorded routing must be the server's decision, got %s", recorded ? recorded->dump() : "none");
-  body = routingOf(ctx, post(c, {{"text", "Production outage: every login fails"}, {"priority", "low"}}, "acme", "k-2"));
+  body = hRoutingOf(ctx, hPost(c, {{"text", "Production outage: every login fails"}, {"priority", "low"}}, "acme", "k-2"));
   ctx.Assert(body.value("priority", "") == "urgent" && body.value("queue", "") == "account", "an outage that blocks logins must be routed to account as urgent whatever the body says, got %s", body.dump());
 }
 
 void CheckTextCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, {{"text", repeat("x", 32 * 1024 + 1)}}, "acme", "k-big");
+  auto c = hApi(ctx);
+  auto r = hPost(c, {{"text", hRepeat("x", 32 * 1024 + 1)}}, "acme", "k-big");
   ctx.Equal(r.Status, 413, "a 32 769-byte ticket must be refused before any work (the cap is 32 KiB)");
-  r = post(c, {{"text", repeat("\\u00e9", 16 * 1024 + 1)}}, "acme", "k-wide");
+  r = hPost(c, {{"text", hRepeat("\\u00e9", 16 * 1024 + 1)}}, "acme", "k-wide");
   ctx.Equal(r.Status, 413, "a ticket of 16 385 characters (32 770 bytes of UTF-8) must be refused: the cap counts bytes, not characters");
   for (const std::string blank : {"", "   "}) {
-    r = post(c, {{"text", blank}}, "acme", "k-blank-" + std::to_string(blank.size()));
+    r = hPost(c, {{"text", blank}}, "acme", "k-blank-" + std::to_string(blank.size()));
     ctx.Equal(r.Status, 400, "a ticket with text %q", blank);
   }
-  r = post(c, {{"priority", "low"}}, "acme", "k-none");
+  r = hPost(c, {{"priority", "low"}}, "acme", "k-none");
   ctx.Equal(r.Status, 400, "a ticket without text");
-  r = post(c, {{"text", repeat("a", 32 * 1024) + "\\n"}}, "acme", "k-pad");
+  r = hPost(c, {{"text", hRepeat("a", 32 * 1024) + "\\n"}}, "acme", "k-pad");
   ctx.Equal(r.Status, 413, "a ticket of 32 KiB of text plus a trailing newline (32 769 bytes) must be refused: the cap measures the text as sent");
   ctx.Assert(!ctx.Redis.Get("ticket:seq"), "a blank or oversized ticket was given a ticket id (ticket:seq is %s): reject it before minting one", ctx.Redis.Get("ticket:seq").value_or(""));
-  r = post(c, {{"text", repeat("a", 32 * 1024)}}, "acme", "k-max");
+  r = hPost(c, {{"text", hRepeat("a", 32 * 1024)}}, "acme", "k-max");
   ctx.Equal(r.Status, 200, "a ticket of exactly 32 KiB");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, {{"text", kInvoice}}, "acme", "hook-77");
+  auto c = hApi(ctx);
+  const auto first = hPost(c, {{"text", kHInvoice}}, "acme", "hook-77");
   ctx.Equal(first.Status, 200, "the first delivery (%s)", first.Text());
-  const auto retry = post(c, {{"text", kInvoice}}, "acme", "hook-77");
+  const auto retry = hPost(c, {{"text", kHInvoice}}, "acme", "hook-77");
   ctx.Assert(retry.Status == 200 && nlohmann::json::parse(retry.Text(), nullptr, false) == nlohmann::json::parse(first.Text(), nullptr, false),
              "a webhook retry with the same Idempotency-Key must answer the recorded routing: first %s, retry %s", first.Text(), retry.Text());
   ctx.Equal(ctx.Redis.Get("ticket:seq"), std::optional<std::string>("1"), "the retry must not mint another ticket (look (tenant, key) up before triaging); ticket:seq");
-  const auto other = routingOf(ctx, post(c, {{"text", kInvoice}}, "globex", "hook-77"));
+  const auto other = hRoutingOf(ctx, hPost(c, {{"text", kHInvoice}}, "globex", "hook-77"));
   const auto firstBody = nlohmann::json::parse(first.Text(), nullptr, false);
   ctx.Assert(other.value("tenant", "") == "globex" && other.value("ticket_id", "") != firstBody.value("ticket_id", ""), "globex sending the key acme used is another ticket, got %s", other.dump());
-  const auto none = post(c, {{"text", kInvoice}}, "acme", "");
+  const auto none = hPost(c, {{"text", kHInvoice}}, "acme", "");
   ctx.Equal(none.Status, 400, "a request without Idempotency-Key");
 }
 `,

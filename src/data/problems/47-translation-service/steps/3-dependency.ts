@@ -869,23 +869,23 @@ import (
 )
 
 const (
-	clientSample     = "Open the Dashboard"
-	clientTranslated = "[fr] Open the Tableau de bord"
+	kHClientSample     = "Open the Dashboard"
+	kHClientTranslated = "[fr] Open the Tableau de bord"
 )
 
 var (
-	clientBg = context.Background()
-	pinned   = glossary.Glossary{Version: 2, Terms: map[string]string{"Dashboard": "Tableau de bord"}}
-	served   = map[string]bool{"en": true, "fr": true, "de": true, "es": true, "ja": true, "pt": true}
+	hClientBg = context.Background()
+	hPinned   = glossary.Glossary{Version: 2, Terms: map[string]string{"Dashboard": "Tableau de bord"}}
+	hServed   = map[string]bool{"en": true, "fr": true, "de": true, "es": true, "ja": true, "pt": true}
 )
 
 // modelPeer answers '[target] text' with every glossary term applied; a pair it does not serve is InvalidArgument.
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedTranslatorServer
 }
 
-func (modelPeer) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.TranslateReply, error) {
-	if !served[req.GetSource()] || !served[req.GetTarget()] || req.GetSource() == req.GetTarget() {
+func (HModelPeer) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.TranslateReply, error) {
+	if !hServed[req.GetSource()] || !hServed[req.GetTarget()] || req.GetSource() == req.GetTarget() {
 		return nil, status.Errorf(codes.InvalidArgument, "pair %s->%s is not served", req.GetSource(), req.GetTarget())
 	}
 	text := req.GetText()
@@ -895,22 +895,22 @@ func (modelPeer) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.Tra
 	return &pb.TranslateReply{Text: "[" + req.GetTarget() + "] " + text, Model: "mt-2026-10"}, nil
 }
 
-func serveModel(ctx *harness.Ctx) {
-	pb.RegisterTranslatorServer(ctx.GRPC.Server(""), modelPeer{})
+func hServeModel(ctx *harness.Ctx) {
+	pb.RegisterTranslatorServer(ctx.GRPC.Server(""), HModelPeer{})
 }
 
-func mustTranslate(ctx *harness.Ctx, text string) Translation {
-	result, err := translateSegment(clientBg, "acme", text, "en", "fr", pinned)
+func hMustTranslate(ctx *harness.Ctx, text string) Translation {
+	result, err := translateSegment(hClientBg, "acme", text, "en", "fr", hPinned)
 	ctx.NoError(err, "translateSegment(%q) failed", text)
 	return result
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveModel(ctx)
-	healthy := mustTranslate(ctx, clientSample)
-	ctx.Assert(healthy.Text == clientTranslated && healthy.Marker == "", "with the model healthy translateSegment answered %+v, expected %q", healthy, clientTranslated)
+	hServeModel(ctx)
+	healthy := hMustTranslate(ctx, kHClientSample)
+	ctx.Assert(healthy.Text == kHClientTranslated && healthy.Marker == "", "with the model healthy translateSegment answered %+v, expected %q", healthy, kHClientTranslated)
 	ctx.GRPC.SetLatency("Translate", 10.0, "")
-	result := mustTranslate(ctx, "Close the Dashboard")
+	result := hMustTranslate(ctx, "Close the Dashboard")
 	calls := ctx.GRPC.CallsTo("Translate", "")[1:]
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "a Translate call carries no deadline: a stalled model holds every request as long as it stalls")
@@ -921,21 +921,21 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRetriableOnly(ctx *harness.Ctx) {
-	serveModel(ctx)
-	result, err := translateSegment(clientBg, "acme", clientSample, "en", "tlh", pinned)
+	hServeModel(ctx)
+	result, err := translateSegment(hClientBg, "acme", kHClientSample, "en", "tlh", hPinned)
 	ctx.Assert(err != nil, "a pair the model rejects (InvalidArgument) returned %+v instead of an error wrapping ErrPairRejected", result)
 	ctx.Assert(errors.Is(err, ErrPairRejected), "a pair the model rejects returned %v, expected an error wrapping ErrPairRejected", err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 1, "a rejected language pair is a caller bug, retrying cannot change it; the calls")
 	ctx.GRPC.Fail("Translate", codes.Unavailable, "", 2, "")
-	second := mustTranslate(ctx, clientSample)
-	ctx.Assert(second.Text == clientTranslated && second.Marker == "", "two Unavailable answers then a reply: translateSegment answered %+v, expected the translation from the third attempt", second)
+	second := hMustTranslate(ctx, kHClientSample)
+	ctx.Assert(second.Text == kHClientTranslated && second.Marker == "", "two Unavailable answers then a reply: translateSegment answered %+v, expected the translation from the third attempt", second)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "Unavailable is retried: three attempts for the second segment; the calls")
 	// Any other failure is final: one call, then the marked fallback (one code per segment).
 	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.ResourceExhausted} {
 		before := len(ctx.GRPC.CallsTo("Translate", ""))
 		ctx.GRPC.Fail("Translate", code, "", 1, "")
 		text := "Open the " + code.String() + " report"
-		after, err := translateSegment(clientBg, "acme", text, "en", "fr", pinned)
+		after, err := translateSegment(hClientBg, "acme", text, "en", "fr", hPinned)
 		ctx.NoError(err, "%v from the model must end in the marked fallback, not an error: only InvalidArgument is ErrPairRejected", code)
 		ctx.Equal(len(ctx.GRPC.CallsTo("Translate", ""))-before, 1, "only Unavailable and DeadlineExceeded are retried; the calls for %v", code)
 		ctx.Assert(after.Text == text && after.Marker == "untranslated", "after %v translateSegment answered %+v, expected the source text marked untranslated", code, after)
@@ -943,26 +943,26 @@ func CheckRetriableOnly(ctx *harness.Ctx) {
 }
 
 func CheckMarkedFallback(ctx *harness.Ctx) {
-	serveModel(ctx)
+	hServeModel(ctx)
 	ctx.GRPC.Fail("Translate", codes.Unavailable, "", 3, "")
-	result := mustTranslate(ctx, clientSample)
+	result := hMustTranslate(ctx, kHClientSample)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 3, "an outage's attempts")
-	ctx.Assert(result.Text == clientSample && result.Marker == "untranslated", "after three Unavailable attempts translateSegment answered %+v: the caller cannot tell English from French. Return the source text with Marker untranslated", result)
+	ctx.Assert(result.Text == kHClientSample && result.Marker == "untranslated", "after three Unavailable attempts translateSegment answered %+v: the caller cannot tell English from French. Return the source text with Marker untranslated", result)
 }
 
 func CheckNoCachedFallback(ctx *harness.Ctx) {
-	serveModel(ctx)
+	hServeModel(ctx)
 	ctx.GRPC.Fail("Translate", codes.Unavailable, "", 3, "")
-	mustTranslate(ctx, clientSample)
-	key := glossary.TMKey("acme", "en", "fr", 2, clientSample)
+	hMustTranslate(ctx, kHClientSample)
+	key := glossary.TMKey("acme", "en", "fr", 2, kHClientSample)
 	held, _ := ctx.Redis.Get(key)
 	ctx.Assert(ctx.Redis.Exists(key) == 0, "translation memory holds %q for a segment the model never translated: it is served as French for the next hour", held)
-	result := mustTranslate(ctx, clientSample)
-	ctx.Assert(result.Text == clientTranslated && result.Marker == "", "once the model recovered translateSegment answered %+v", result)
+	result := hMustTranslate(ctx, kHClientSample)
+	ctx.Assert(result.Text == kHClientTranslated && result.Marker == "", "once the model recovered translateSegment answered %+v", result)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "after the outage the next request must reach the model; the calls")
 	remembered, _ := ctx.Redis.Get(key)
-	ctx.Equal(remembered, clientTranslated, "the model's translation must be remembered under %s", key)
-	mustTranslate(ctx, clientSample)
+	ctx.Equal(remembered, kHClientTranslated, "the model's translation must be remembered under %s", key)
+	hMustTranslate(ctx, kHClientSample)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "a remembered translation is answered without a call; the calls")
 }
 `,
@@ -973,12 +973,12 @@ func CheckNoCachedFallback(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSample = "Open the Dashboard";
-const std::string kTranslated = "[fr] Open the Tableau de bord";
-const glossary::Glossary kPinned{2, {{"Dashboard", "Tableau de bord"}}};
+const std::string kHSample = "Open the Dashboard";
+const std::string kHTranslated = "[fr] Open the Tableau de bord";
+const glossary::Glossary kHPinned{2, {{"Dashboard", "Tableau de bord"}}};
 
 // The model: '[target] text' with every glossary term applied; a pair it does not serve is INVALID_ARGUMENT.
-class ModelPeer final : public translationsvc::Translator::Service {
+class HModelPeer final : public translationsvc::Translator::Service {
  public:
   grpc::Status Translate(grpc::ServerContext*, const translationsvc::TranslateRequest* req, translationsvc::TranslateReply* out) override {
     static const std::set<std::string> served = {"en", "fr", "de", "es", "ja", "pt"};
@@ -997,16 +997,16 @@ class ModelPeer final : public translationsvc::Translator::Service {
   }
 };
 
-void serveModel(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+void hServeModel(harness::Ctx& ctx) {
+  static HModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer;
+  peer = new HModelPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-Translation mustTranslate(harness::Ctx& ctx, const std::string& text) {
+Translation hMustTranslate(harness::Ctx& ctx, const std::string& text) {
   try {
-    return translateSegment("acme", text, "en", "fr", kPinned);
+    return translateSegment("acme", text, "en", "fr", kHPinned);
   } catch (const std::exception& e) {
     ctx.Fatalf("translateSegment(%q) threw %s: %s", text, harness::CurrentExceptionType(), e.what());
   }
@@ -1016,11 +1016,11 @@ Translation mustTranslate(harness::Ctx& ctx, const std::string& text) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveModel(ctx);
-  const Translation healthy = mustTranslate(ctx, kSample);
-  ctx.Assert(healthy.text == kTranslated && healthy.marker.empty(), "with the model healthy translateSegment answered %q (marker %q), expected %q", healthy.text, healthy.marker, kTranslated);
+  hServeModel(ctx);
+  const Translation healthy = hMustTranslate(ctx, kHSample);
+  ctx.Assert(healthy.text == kHTranslated && healthy.marker.empty(), "with the model healthy translateSegment answered %q (marker %q), expected %q", healthy.text, healthy.marker, kHTranslated);
   ctx.GRPC.SetLatency("Translate", 10.0);
-  const Translation result = mustTranslate(ctx, "Close the Dashboard");
+  const Translation result = hMustTranslate(ctx, "Close the Dashboard");
   auto calls = ctx.GRPC.CallsTo("Translate");
   calls.erase(calls.begin());
   for (const auto& call : calls) {
@@ -1032,9 +1032,9 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRetriableOnly(harness::Ctx& ctx) {
-  serveModel(ctx);
+  hServeModel(ctx);
   try {
-    const Translation result = translateSegment("acme", kSample, "en", "tlh", kPinned);
+    const Translation result = translateSegment("acme", kHSample, "en", "tlh", kHPinned);
     ctx.Fatalf("a pair the model rejects (INVALID_ARGUMENT) returned %q instead of throwing PairRejected", result.text);
   } catch (const PairRejected&) {
   } catch (const std::exception& e) {
@@ -1042,8 +1042,8 @@ void CheckRetriableOnly(harness::Ctx& ctx) {
   }
   ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 1, "a rejected language pair is a caller bug, retrying cannot change it; the calls");
   ctx.GRPC.Fail("Translate", grpc::StatusCode::UNAVAILABLE, "", 2);
-  const Translation second = mustTranslate(ctx, kSample);
-  ctx.Assert(second.text == kTranslated && second.marker.empty(), "two UNAVAILABLE answers then a reply: translateSegment answered %q (marker %q), expected the translation from the third attempt", second.text, second.marker);
+  const Translation second = hMustTranslate(ctx, kHSample);
+  ctx.Assert(second.text == kHTranslated && second.marker.empty(), "two UNAVAILABLE answers then a reply: translateSegment answered %q (marker %q), expected the translation from the third attempt", second.text, second.marker);
   ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "UNAVAILABLE is retried: three attempts for the second segment; the calls");
   // Any other failure is final: one call, then the marked fallback (one code per segment).
   for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
@@ -1053,7 +1053,7 @@ void CheckRetriableOnly(harness::Ctx& ctx) {
     const std::string text = "Open the " + name + " report";
     Translation after;
     try {
-      after = translateSegment("acme", text, "en", "fr", kPinned);
+      after = translateSegment("acme", text, "en", "fr", kHPinned);
     } catch (const std::exception& e) {
       ctx.Fatalf("%s from the model threw %s: %s; only INVALID_ARGUMENT is PairRejected, another failure ends in the marked fallback", name, harness::CurrentExceptionType(), e.what());
     }
@@ -1063,24 +1063,24 @@ void CheckRetriableOnly(harness::Ctx& ctx) {
 }
 
 void CheckMarkedFallback(harness::Ctx& ctx) {
-  serveModel(ctx);
+  hServeModel(ctx);
   ctx.GRPC.Fail("Translate", grpc::StatusCode::UNAVAILABLE, "", 3);
-  const Translation result = mustTranslate(ctx, kSample);
+  const Translation result = hMustTranslate(ctx, kHSample);
   ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 3, "an outage's attempts");
-  ctx.Assert(result.text == kSample && result.marker == "untranslated", "after three UNAVAILABLE attempts translateSegment answered %q (marker %q): the caller cannot tell English from French. Return the source text with marker untranslated", result.text, result.marker);
+  ctx.Assert(result.text == kHSample && result.marker == "untranslated", "after three UNAVAILABLE attempts translateSegment answered %q (marker %q): the caller cannot tell English from French. Return the source text with marker untranslated", result.text, result.marker);
 }
 
 void CheckNoCachedFallback(harness::Ctx& ctx) {
-  serveModel(ctx);
+  hServeModel(ctx);
   ctx.GRPC.Fail("Translate", grpc::StatusCode::UNAVAILABLE, "", 3);
-  mustTranslate(ctx, kSample);
-  const std::string key = glossary::tmKey("acme", "en", "fr", 2, kSample);
+  hMustTranslate(ctx, kHSample);
+  const std::string key = glossary::tmKey("acme", "en", "fr", 2, kHSample);
   ctx.Assert(ctx.Redis.Exists(key) == 0, "translation memory holds %q for a segment the model never translated: it is served as French for the next hour", ctx.Redis.Get(key).value_or(""));
-  const Translation result = mustTranslate(ctx, kSample);
-  ctx.Assert(result.text == kTranslated && result.marker.empty(), "once the model recovered translateSegment answered %q (marker %q)", result.text, result.marker);
+  const Translation result = hMustTranslate(ctx, kHSample);
+  ctx.Assert(result.text == kHTranslated && result.marker.empty(), "once the model recovered translateSegment answered %q (marker %q)", result.text, result.marker);
   ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "after the outage the next request must reach the model; the calls");
-  ctx.Equal(ctx.Redis.Get(key), std::optional<std::string>(kTranslated), "the model's translation must be remembered under %s", key);
-  mustTranslate(ctx, kSample);
+  ctx.Equal(ctx.Redis.Get(key), std::optional<std::string>(kHTranslated), "the model's translation must be remembered under %s", key);
+  hMustTranslate(ctx, kHSample);
   ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "a remembered translation is answered without a call; the calls");
 }
 `,

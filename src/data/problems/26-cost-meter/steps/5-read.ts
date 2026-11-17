@@ -780,27 +780,27 @@ import (
 )
 
 const (
-	readWindow = 3600
-	readBudget = 5_000_000
+	kHReadWindow = 3600
+	kHReadBudget = 5_000_000
 )
 
-// readMidWindow moves the clock to half past the next hour; the bucket it falls in.
-func readMidWindow(ctx *harness.Ctx) int64 {
+// hReadMidWindow moves the clock to half past the next hour; the bucket it falls in.
+func hReadMidWindow(ctx *harness.Ctx) int64 {
 	now := float64(ctx.Clock.Now()) / 1000
-	ctx.Clock.Advance(readWindow - math.Mod(now, readWindow) + 1800)
-	return ctx.Clock.Now() / 1000 / readWindow
+	ctx.Clock.Advance(kHReadWindow - math.Mod(now, kHReadWindow) + 1800)
+	return ctx.Clock.Now() / 1000 / kHReadWindow
 }
 
-func readKey(tenant string, bucket int64) string {
+func hReadKey(tenant string, bucket int64) string {
 	return "meter:" + tenant + ":" + strconv.FormatInt(bucket, 10)
 }
 
-// readSeed writes a window as step 2's script leaves it.
-func readSeed(ctx *harness.Ctx, tenant string, bucket int64, in, out, cost, events int64) {
-	ctx.Redis.Do("HSET", readKey(tenant, bucket), "input_tokens", in, "output_tokens", out, "cost_micros", cost, "events", events)
+// hReadSeed writes a window as step 2's script leaves it.
+func hReadSeed(ctx *harness.Ctx, tenant string, bucket int64, in, out, cost, events int64) {
+	ctx.Redis.Do("HSET", hReadKey(tenant, bucket), "input_tokens", in, "output_tokens", out, "cost_micros", cost, "events", events)
 }
 
-func readGet(ctx *harness.Ctx, tenant, caller string) *harness.Response {
+func hReadGet(ctx *harness.Ctx, tenant, caller string) *harness.Response {
 	mux := http.NewServeMux()
 	register(mux)
 	if caller == "" {
@@ -809,57 +809,57 @@ func readGet(ctx *harness.Ctx, tenant, caller string) *harness.Response {
 	return ctx.HTTP(mux).Get("/v1/tenants/"+tenant+"/spend", "X-Tenant-Id", caller)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	ctx.Equal(r.Status, 200, "the spend read (%s)", r.Text())
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
-func readNumbers(b map[string]any) []any {
+func hReadNumbers(b map[string]any) []any {
 	return []any{b["input_tokens"], b["output_tokens"], b["events"], b["spend_micros"]}
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	bucket := readMidWindow(ctx)
-	readSeed(ctx, "t1", bucket, 1200, 300, 6000, 1)
-	readSeed(ctx, "t2", bucket, 9000, 900, 99_000, 3)
-	own := readBody(ctx, readGet(ctx, "t1", "t1"))
+	bucket := hReadMidWindow(ctx)
+	hReadSeed(ctx, "t1", bucket, 1200, 300, 6000, 1)
+	hReadSeed(ctx, "t2", bucket, 9000, 900, 99_000, 3)
+	own := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
 	ctx.Assert(own["tenant"] == "t1" && own["spend_micros"] == float64(6000), "t1 reading its own spend got %v", own)
-	r := readGet(ctx, "t2", "t1")
+	r := hReadGet(ctx, "t2", "t1")
 	ctx.Equal(r.Status, 403, "t1 reading t2's spend: another tenant's spend is one URL away")
 	ctx.Assert(!strings.Contains(r.Text(), "99000"), "the 403 must not carry t2's numbers: %s", r.Text())
-	ctx.Equal(readGet(ctx, "t3", "t1").Status, 403, "t1 reading t3, a tenant with no window (the caller decides, not whether the other tenant has spend)")
-	ctx.Equal(readGet(ctx, "t1", "").Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(hReadGet(ctx, "t3", "t1").Status, 403, "t1 reading t3, a tenant with no window (the caller decides, not whether the other tenant has spend)")
+	ctx.Equal(hReadGet(ctx, "t1", "").Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckCurrentWindow(ctx *harness.Ctx) {
-	bucket := readMidWindow(ctx)
-	readSeed(ctx, "t1", bucket-1, 800_000, 200_000, 4_000_000, 40) // last hour, still in its grace hour
-	readSeed(ctx, "t1", bucket, 1200, 300, 6000, 1)
-	b := readBody(ctx, readGet(ctx, "t1", "t1"))
-	ctx.Equal(readNumbers(b), []any{float64(1200), float64(300), float64(1), float64(6000)}, "the current window's tokens, events and spend (last hour's window is not what the limiter enforces now)")
+	bucket := hReadMidWindow(ctx)
+	hReadSeed(ctx, "t1", bucket-1, 800_000, 200_000, 4_000_000, 40) // last hour, still in its grace hour
+	hReadSeed(ctx, "t1", bucket, 1200, 300, 6000, 1)
+	b := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
+	ctx.Equal(hReadNumbers(b), []any{float64(1200), float64(300), float64(1), float64(6000)}, "the current window's tokens, events and spend (last hour's window is not what the limiter enforces now)")
 	ctx.Equal(b["bucket"], float64(bucket), "the answer must name the window it read; bucket")
-	ctx.Clock.Advance(readWindow/2 - 1)
-	late := readBody(ctx, readGet(ctx, "t1", "t1"))
+	ctx.Clock.Advance(kHReadWindow/2 - 1)
+	late := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
 	ctx.Assert(late["bucket"] == float64(bucket) && late["spend_micros"] == float64(6000), "in the last second of the hour the read is still bucket %d with spend 6000, got %v", bucket, late)
 	ctx.Clock.Advance(2)
-	fresh := readBody(ctx, readGet(ctx, "t1", "t1"))
-	ctx.Equal(append([]any{fresh["bucket"]}, readNumbers(fresh)...), []any{float64(bucket + 1), float64(0), float64(0), float64(0), float64(0)}, "a second into the next hour the read is the next bucket, empty so far; bucket, tokens, events and spend")
+	fresh := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
+	ctx.Equal(append([]any{fresh["bucket"]}, hReadNumbers(fresh)...), []any{float64(bucket + 1), float64(0), float64(0), float64(0), float64(0)}, "a second into the next hour the read is the next bucket, empty so far; bucket, tokens, events and spend")
 }
 
 func CheckCounterSource(ctx *harness.Ctx) {
-	bucket := readMidWindow(ctx)
-	readSeed(ctx, "t1", bucket, 1000, 1000, 18_000, 1) // claude-sonnet-4: 3000 + 15000 micro-dollars
-	b := readBody(ctx, readGet(ctx, "t1", "t1"))
+	bucket := hReadMidWindow(ctx)
+	hReadSeed(ctx, "t1", bucket, 1000, 1000, 18_000, 1) // claude-sonnet-4: 3000 + 15000 micro-dollars
+	b := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
 	ctx.Equal(b["spend_micros"], float64(18_000), "the window's cost_micros is 18000 (re-pricing tokens at one rate disagrees with what the limiter enforces); spend_micros")
-	ctx.Assert(b["budget_micros"] == float64(readBudget) && b["remaining_micros"] == float64(readBudget-18_000), "budget and remainder follow from the same spend: %v", b)
+	ctx.Assert(b["budget_micros"] == float64(kHReadBudget) && b["remaining_micros"] == float64(kHReadBudget-18_000), "budget and remainder follow from the same spend: %v", b)
 }
 
 func CheckSnapshotRead(ctx *harness.Ctx) {
-	bucket := readMidWindow(ctx)
-	key := readKey("t1", bucket)
-	readSeed(ctx, "t1", bucket, 1000, 0, 2500, 1)
+	bucket := hReadMidWindow(ctx)
+	key := hReadKey("t1", bucket)
+	hReadSeed(ctx, "t1", bucket, 1000, 0, 2500, 1)
 	fired := false
 	// step 2's script recording another report while the read is under way
 	ctx.Redis.After(key, func() any {
@@ -870,21 +870,21 @@ func CheckSnapshotRead(ctx *harness.Ctx) {
 		ctx.Redis.Do("HINCRBY", key, "events", 1)
 		return nil
 	})
-	b := readBody(ctx, readGet(ctx, "t1", "t1"))
+	b := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
 	ctx.Assert(fired, "the read never touched %s", key)
-	got := harness.Show(readNumbers(b))
+	got := harness.Show(hReadNumbers(b))
 	ctx.Assert(got == harness.Show([]any{float64(1000), float64(0), float64(1), float64(2500)}) || got == harness.Show([]any{float64(2000), float64(500), float64(2), float64(10000)}),
 		"a report landed during the read and the answer %s pairs one moment's numbers with another's: read the window in one command", got)
 }
 
 func CheckRemainingFloor(ctx *harness.Ctx) {
-	bucket := readMidWindow(ctx)
-	readSeed(ctx, "t1", bucket, 900_000, 300_000, 5_250_000, 80)
-	b := readBody(ctx, readGet(ctx, "t1", "t1"))
+	bucket := hReadMidWindow(ctx)
+	hReadSeed(ctx, "t1", bucket, 900_000, 300_000, 5_250_000, 80)
+	b := hReadBody(ctx, hReadGet(ctx, "t1", "t1"))
 	ctx.Equal(b["spend_micros"], float64(5_250_000), "spend_micros must be the window's cost_micros")
 	ctx.Equal(b["remaining_micros"], float64(0), "a tenant 250000 micro-dollars over budget has no negative budget; remaining_micros")
-	fresh := readBody(ctx, readGet(ctx, "t9", "t9"))
-	ctx.Equal([]any{fresh["spend_micros"], fresh["events"], fresh["remaining_micros"]}, []any{float64(0), float64(0), float64(readBudget)}, "a tenant with no reports this hour reads spend 0, events 0, the whole budget")
+	fresh := hReadBody(ctx, hReadGet(ctx, "t9", "t9"))
+	ctx.Equal([]any{fresh["spend_micros"], fresh["events"], fresh["remaining_micros"]}, []any{float64(0), float64(0), float64(kHReadBudget)}, "a tenant with no reports this hour reads spend 0, events 0, the whole budget")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -898,24 +898,24 @@ namespace {
 
 using json = nlohmann::json;
 
-constexpr long long kWindow = 3600;
-constexpr long long kBudget = 5000000;
+constexpr long long kHWindow = 3600;
+constexpr long long kHBudget = 5000000;
 
 // Move the clock to half past the next hour; the bucket it falls in.
-long long midWindow(harness::Ctx& ctx) {
+long long hMidWindow(harness::Ctx& ctx) {
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
-  ctx.Clock.Advance(kWindow - std::fmod(now, kWindow) + 1800);
-  return ctx.Clock.Now() / 1000 / kWindow;
+  ctx.Clock.Advance(kHWindow - std::fmod(now, kHWindow) + 1800);
+  return ctx.Clock.Now() / 1000 / kHWindow;
 }
 
-std::string windowOf(const std::string& tenant, long long bucket) { return "meter:" + tenant + ":" + std::to_string(bucket); }
+std::string hWindowOf(const std::string& tenant, long long bucket) { return "meter:" + tenant + ":" + std::to_string(bucket); }
 
 // A window as step 2's script leaves it.
-void seed(harness::Ctx& ctx, const std::string& tenant, long long bucket, long long in, long long out, long long cost, long long events) {
-  ctx.Redis.Do("HSET", windowOf(tenant, bucket), "input_tokens", in, "output_tokens", out, "cost_micros", cost, "events", events);
+void hSeed(harness::Ctx& ctx, const std::string& tenant, long long bucket, long long in, long long out, long long cost, long long events) {
+  ctx.Redis.Do("HSET", hWindowOf(tenant, bucket), "input_tokens", in, "output_tokens", out, "cost_micros", cost, "events", events);
 }
 
-harness::Response get(harness::Ctx& ctx, const std::string& tenant, const std::string& caller) {
+harness::Response hGet(harness::Ctx& ctx, const std::string& tenant, const std::string& caller) {
   httplib::Server svr;
   register_routes(svr);
   auto http = ctx.HTTP(svr);
@@ -923,58 +923,58 @@ harness::Response get(harness::Ctx& ctx, const std::string& tenant, const std::s
   return http.Get("/v1/tenants/" + tenant + "/spend", "X-Tenant-Id", caller);
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "the spend read (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
 }
 
-json numbers(const json& b) { return json::array({b.value("input_tokens", json()), b.value("output_tokens", json()), b.value("events", json()), b.value("spend_micros", json())}); }
+json hNumbers(const json& b) { return json::array({b.value("input_tokens", json()), b.value("output_tokens", json()), b.value("events", json()), b.value("spend_micros", json())}); }
 
 }  // namespace
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  seed(ctx, "t1", bucket, 1200, 300, 6000, 1);
-  seed(ctx, "t2", bucket, 9000, 900, 99000, 3);
-  const json own = bodyOf(ctx, get(ctx, "t1", "t1"));
+  const long long bucket = hMidWindow(ctx);
+  hSeed(ctx, "t1", bucket, 1200, 300, 6000, 1);
+  hSeed(ctx, "t2", bucket, 9000, 900, 99000, 3);
+  const json own = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
   ctx.Assert(own.value("tenant", "") == "t1" && own.value("spend_micros", json()) == 6000, "t1 reading its own spend got %s", own.dump());
-  const auto r = get(ctx, "t2", "t1");
+  const auto r = hGet(ctx, "t2", "t1");
   ctx.Equal(r.Status, 403, "t1 reading t2's spend: another tenant's spend is one URL away");
   ctx.Assert(r.Text().find("99000") == std::string::npos, "the 403 must not carry t2's numbers: %s", r.Text());
-  ctx.Equal(get(ctx, "t3", "t1").Status, 403, "t1 reading t3, a tenant with no window (the caller decides, not whether the other tenant has spend)");
-  ctx.Equal(get(ctx, "t1", "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hGet(ctx, "t3", "t1").Status, 403, "t1 reading t3, a tenant with no window (the caller decides, not whether the other tenant has spend)");
+  ctx.Equal(hGet(ctx, "t1", "").Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckCurrentWindow(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  seed(ctx, "t1", bucket - 1, 800000, 200000, 4000000, 40);  // last hour, still in its grace hour
-  seed(ctx, "t1", bucket, 1200, 300, 6000, 1);
-  const json b = bodyOf(ctx, get(ctx, "t1", "t1"));
-  ctx.Equal(numbers(b), json::array({1200, 300, 1, 6000}), "the current window's tokens, events and spend (last hour's window is not what the limiter enforces now)");
+  const long long bucket = hMidWindow(ctx);
+  hSeed(ctx, "t1", bucket - 1, 800000, 200000, 4000000, 40);  // last hour, still in its grace hour
+  hSeed(ctx, "t1", bucket, 1200, 300, 6000, 1);
+  const json b = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
+  ctx.Equal(hNumbers(b), json::array({1200, 300, 1, 6000}), "the current window's tokens, events and spend (last hour's window is not what the limiter enforces now)");
   ctx.Equal(b.value("bucket", json()), json(bucket), "the answer must name the window it read; bucket");
-  ctx.Clock.Advance(kWindow / 2 - 1);
-  const json late = bodyOf(ctx, get(ctx, "t1", "t1"));
+  ctx.Clock.Advance(kHWindow / 2 - 1);
+  const json late = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
   ctx.Assert(late.value("bucket", json()) == json(bucket) && late.value("spend_micros", json()) == 6000, "in the last second of the hour the read is still bucket %d with spend 6000, got %s", bucket, late.dump());
   ctx.Clock.Advance(2);
-  const json fresh = bodyOf(ctx, get(ctx, "t1", "t1"));
+  const json fresh = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
   ctx.Equal(fresh.value("bucket", json()), json(bucket + 1), "a second into the next hour the read is the next bucket; bucket");
-  ctx.Equal(numbers(fresh), json::array({0, 0, 0, 0}), "a second into the next hour the window is empty so far; tokens, events and spend");
+  ctx.Equal(hNumbers(fresh), json::array({0, 0, 0, 0}), "a second into the next hour the window is empty so far; tokens, events and spend");
 }
 
 void CheckCounterSource(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  seed(ctx, "t1", bucket, 1000, 1000, 18000, 1);  // claude-sonnet-4: 3000 + 15000 micro-dollars
-  const json b = bodyOf(ctx, get(ctx, "t1", "t1"));
+  const long long bucket = hMidWindow(ctx);
+  hSeed(ctx, "t1", bucket, 1000, 1000, 18000, 1);  // claude-sonnet-4: 3000 + 15000 micro-dollars
+  const json b = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
   ctx.Equal(b.value("spend_micros", json()), json(18000), "the window's cost_micros is 18000 (re-pricing tokens at one rate disagrees with what the limiter enforces); spend_micros");
-  ctx.Assert(b.value("budget_micros", json()) == kBudget && b.value("remaining_micros", json()) == kBudget - 18000, "budget and remainder follow from the same spend: %s", b.dump());
+  ctx.Assert(b.value("budget_micros", json()) == kHBudget && b.value("remaining_micros", json()) == kHBudget - 18000, "budget and remainder follow from the same spend: %s", b.dump());
 }
 
 void CheckSnapshotRead(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  const std::string key = windowOf("t1", bucket);
-  seed(ctx, "t1", bucket, 1000, 0, 2500, 1);
+  const long long bucket = hMidWindow(ctx);
+  const std::string key = hWindowOf("t1", bucket);
+  hSeed(ctx, "t1", bucket, 1000, 0, 2500, 1);
   bool fired = false;
   // step 2's script recording another report while the read is under way
   ctx.Redis.After(key, [&] {
@@ -984,21 +984,21 @@ void CheckSnapshotRead(harness::Ctx& ctx) {
     ctx.Redis.Do("HINCRBY", key, "cost_micros", 7500);
     ctx.Redis.Do("HINCRBY", key, "events", 1);
   });
-  const json b = bodyOf(ctx, get(ctx, "t1", "t1"));
+  const json b = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
   ctx.Assert(fired, "the read never touched %s", key);
-  const json got = numbers(b);
+  const json got = hNumbers(b);
   ctx.Assert(got == json::array({1000, 0, 1, 2500}) || got == json::array({2000, 500, 2, 10000}),
              "a report landed during the read and the answer %s pairs one moment's numbers with another's: read the window in one command", got.dump());
 }
 
 void CheckRemainingFloor(harness::Ctx& ctx) {
-  const long long bucket = midWindow(ctx);
-  seed(ctx, "t1", bucket, 900000, 300000, 5250000, 80);
-  const json b = bodyOf(ctx, get(ctx, "t1", "t1"));
+  const long long bucket = hMidWindow(ctx);
+  hSeed(ctx, "t1", bucket, 900000, 300000, 5250000, 80);
+  const json b = hBodyOf(ctx, hGet(ctx, "t1", "t1"));
   ctx.Equal(b.value("spend_micros", json()), json(5250000), "spend_micros must be the window's cost_micros");
   ctx.Equal(b.value("remaining_micros", json()), json(0), "a tenant 250000 micro-dollars over budget has no negative budget; remaining_micros");
-  const json fresh = bodyOf(ctx, get(ctx, "t9", "t9"));
-  ctx.Equal(json::array({fresh.value("spend_micros", json()), fresh.value("events", json()), fresh.value("remaining_micros", json())}), json::array({0, 0, kBudget}),
+  const json fresh = hBodyOf(ctx, hGet(ctx, "t9", "t9"));
+  ctx.Equal(json::array({fresh.value("spend_micros", json()), fresh.value("events", json()), fresh.value("remaining_micros", json())}), json::array({0, 0, kHBudget}),
             "a tenant with no reports this hour reads spend 0, events 0, the whole budget");
 }
 `,

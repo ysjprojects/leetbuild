@@ -1303,66 +1303,66 @@ import (
 )
 
 const (
-	chatCanary = "CANARY-7731 my account number is 4111"
-	chatAnswer = "The capital of France is Paris."
+	kHChatCanary = "CANARY-7731 my account number is 4111"
+	kHChatAnswer = "The capital of France is Paris."
 )
 
-// providerPeer is the model provider: a fixed answer, usage numbers a text estimate cannot reproduce.
-type providerPeer struct {
+// HProviderPeer is the model provider: a fixed answer, usage numbers a text estimate cannot reproduce.
+type HProviderPeer struct {
 	pb.UnimplementedProviderServer
 	requests []*pb.CompleteRequest
 }
 
-func (p *providerPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (p *HProviderPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	p.requests = append(p.requests, req)
 	chars := 0
 	for _, m := range req.GetMessages() {
 		chars += len(m.GetContent())
 	}
-	return &pb.CompleteReply{Content: chatAnswer, Usage: &pb.Usage{InputTokens: int32(chars/4 + 11), OutputTokens: 42}}, nil
+	return &pb.CompleteReply{Content: kHChatAnswer, Usage: &pb.Usage{InputTokens: int32(chars/4 + 11), OutputTokens: 42}}, nil
 }
 
-var chatPeer *providerPeer
+var hChatPeer *HProviderPeer
 
-func chatGateway(ctx *harness.Ctx) *harness.HTTP {
-	chatPeer = &providerPeer{}
-	pb.RegisterProviderServer(ctx.GRPC.Server(""), chatPeer)
+func hChatGateway(ctx *harness.Ctx) *harness.HTTP {
+	hChatPeer = &HProviderPeer{}
+	pb.RegisterProviderServer(ctx.GRPC.Server(""), hChatPeer)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type chatBody struct {
+type HChatBody struct {
 	Model     string           \`json:"model"\`
 	Messages  []map[string]any \`json:"messages"\`
 	MaxTokens int              \`json:"max_tokens"\`
 }
 
-func chatWith(content, role string, maxTokens int) chatBody {
-	return chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": role, "content": content}}, MaxTokens: maxTokens}
+func hChatWith(content, role string, maxTokens int) HChatBody {
+	return HChatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": role, "content": content}}, MaxTokens: maxTokens}
 }
 
-func chatOK() chatBody { return chatWith("What is the capital of France?", "user", 64) }
+func hChatOK() HChatBody { return hChatWith("What is the capital of France?", "user", 64) }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := chatGateway(ctx)
-	r := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	c := hChatGateway(ctx)
+	r := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text())
 	ctype := r.Header.Get("Content-Type")
 	ctx.Assert(strings.HasPrefix(ctype, "application/json"), "the answer must be JSON, got Content-Type %q", ctype)
 	out, _ := r.JSON().(map[string]any)
-	ctx.Equal(out["content"], chatAnswer, "the answer's content must be the provider's completion")
+	ctx.Equal(out["content"], kHChatAnswer, "the answer's content must be the provider's completion")
 	id, _ := out["id"].(string)
 	ctx.Assert(id != "", "the answer carries no request id: %s", r.Text())
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 1, "one chat must make exactly one Complete call; the calls made")
-	anonymous := c.Post("/v1/chat", chatOK())
+	anonymous := c.Post("/v1/chat", hChatOK())
 	ctx.Equal(anonymous.Status, 401, "a request without a bearer token")
 	sent := []map[string]any{{"role": "system", "content": "Answer in one word."}, {"role": "user", "content": "Capital of Peru?"}}
-	peru := c.Post("/v1/chat", chatBody{Model: "gpt-4o", Messages: sent, MaxTokens: 32}, "Authorization", "Bearer acme")
+	peru := c.Post("/v1/chat", HChatBody{Model: "gpt-4o", Messages: sent, MaxTokens: 32}, "Authorization", "Bearer acme")
 	ctx.Equal(peru.Status, 200, "a chat with a system message (%s)", peru.Text())
 	seen := "none"
-	if n := len(chatPeer.requests); n > 0 {
-		got := chatPeer.requests[n-1]
+	if n := len(hChatPeer.requests); n > 0 {
+		got := hChatPeer.requests[n-1]
 		parts := []string{}
 		for _, m := range got.GetMessages() {
 			parts = append(parts, m.GetRole()+":"+m.GetContent())
@@ -1373,20 +1373,20 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := chatGateway(ctx)
+	c := hChatGateway(ctx)
 	bad := []struct {
 		what string
-		body chatBody
+		body HChatBody
 	}{
-		{"an empty messages list", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{}, MaxTokens: 64}},
-		{"an unknown role", chatWith("hi", "operator", 64)},
-		{"an unknown role in a later message", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "user", "content": "hi"}, {"role": "tool", "content": "ok"}}, MaxTokens: 64}},
-		{"an input over 8192 tokens", chatWith(strings.Repeat("x", 8192*4+4), "user", 64)},
-		{"an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", chatWith(strings.Repeat("x", 8192*4+1), "user", 64)},
-		{"an input over 8192 tokens across two messages", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "system", "content": strings.Repeat("x", 4096*4)}, {"role": "user", "content": strings.Repeat("x", 4096*4+1)}}, MaxTokens: 64}},
-		{"max_tokens 0", chatWith("hi", "user", 0)},
-		{"max_tokens 4097", chatWith("hi", "user", 4097)},
-		{"max_tokens 5000", chatWith("hi", "user", 5000)},
+		{"an empty messages list", HChatBody{Model: "gpt-4o-mini", Messages: []map[string]any{}, MaxTokens: 64}},
+		{"an unknown role", hChatWith("hi", "operator", 64)},
+		{"an unknown role in a later message", HChatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "user", "content": "hi"}, {"role": "tool", "content": "ok"}}, MaxTokens: 64}},
+		{"an input over 8192 tokens", hChatWith(strings.Repeat("x", 8192*4+4), "user", 64)},
+		{"an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", hChatWith(strings.Repeat("x", 8192*4+1), "user", 64)},
+		{"an input over 8192 tokens across two messages", HChatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "system", "content": strings.Repeat("x", 4096*4)}, {"role": "user", "content": strings.Repeat("x", 4096*4+1)}}, MaxTokens: 64}},
+		{"max_tokens 0", hChatWith("hi", "user", 0)},
+		{"max_tokens 4097", hChatWith("hi", "user", 4097)},
+		{"max_tokens 5000", hChatWith("hi", "user", 5000)},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/chat", b.body, "Authorization", "Bearer acme")
@@ -1394,63 +1394,63 @@ func CheckValidate(ctx *harness.Ctx) {
 		calls := len(ctx.GRPC.CallsTo("Complete", ""))
 		ctx.Assert(calls == 0, "%s was answered 400 but the provider was called (%d Complete call(s) so far): validate before the paid call", b.what, calls)
 	}
-	ok := c.Post("/v1/chat", chatWith(strings.Repeat("x", 8192*4), "user", 4096), "Authorization", "Bearer acme")
+	ok := c.Post("/v1/chat", hChatWith(strings.Repeat("x", 8192*4), "user", 4096), "Authorization", "Bearer acme")
 	ctx.Equal(ok.Status, 200, "a request at the limits (8192 input tokens, max_tokens 4096) (%s)", ok.Text())
-	split := c.Post("/v1/chat", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "system", "content": strings.Repeat("x", 4096*4)}, {"role": "assistant", "content": strings.Repeat("x", 4096*4)}}, MaxTokens: 1}, "Authorization", "Bearer acme")
+	split := c.Post("/v1/chat", HChatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "system", "content": strings.Repeat("x", 4096*4)}, {"role": "assistant", "content": strings.Repeat("x", 4096*4)}}, MaxTokens: 1}, "Authorization", "Bearer acme")
 	ctx.Equal(split.Status, 200, "a request at the limits across two messages (8192 input tokens, max_tokens 1) (%s)", split.Text())
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	c := chatGateway(ctx)
-	r := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	c := hChatGateway(ctx)
+	r := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text())
 	calls := ctx.GRPC.CallsTo("Complete", "")
 	call := calls[len(calls)-1]
 	ctx.Assert(call.HasDeadline(), "the Complete call carries no deadline: a hung provider would hold the worker forever")
 	ctx.Assert(7500*time.Millisecond <= call.Timeout && call.Timeout <= 8500*time.Millisecond, "the deadline must be about 8 s, got %v", call.Timeout)
 	ctx.GRPC.SetLatency("Complete", 20.0, "")
-	slow := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	slow := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(slow.Status, 504, "a provider slower than the deadline (DEADLINE_EXCEEDED)")
 	ctx.GRPC.SetLatency("Complete", 0, "")
 	ctx.GRPC.Fail("Complete", codes.Unavailable, "provider restarting", 1, "")
-	down := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	down := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(down.Status, 502, "UNAVAILABLE from the provider")
 	ctx.GRPC.Fail("Complete", codes.ResourceExhausted, "rate limited", 1, "")
-	limited := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	limited := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(limited.Status, 502, "RESOURCE_EXHAUSTED from the provider")
 	ctx.GRPC.Fail("Complete", codes.InvalidArgument, "unknown model", 1, "")
-	refused := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	refused := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(refused.Status, 502, "INVALID_ARGUMENT from the provider")
 	ctx.GRPC.Fail("Complete", codes.DeadlineExceeded, "deadline exceeded", 1, "")
-	expired := c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme")
+	expired := c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme")
 	ctx.Equal(expired.Status, 504, "DEADLINE_EXCEEDED reported by the provider")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 6, "the six requests' Complete calls (the gateway must not retry on the client's behalf)")
 	_ = status.Code
 }
 
 func CheckUsage(ctx *harness.Ctx) {
-	c := chatGateway(ctx)
+	c := hChatGateway(ctx)
 	content := "Tell me about the weather in Lisbon this week"
-	r := c.Post("/v1/chat", chatWith(content, "user", 64), "Authorization", "Bearer acme")
+	r := c.Post("/v1/chat", hChatWith(content, "user", 64), "Authorization", "Bearer acme")
 	ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text())
 	out, _ := r.JSON().(map[string]any)
 	ctx.Equal(out["usage"], map[string]any{"input_tokens": float64(len(content)/4 + 11), "output_tokens": float64(42)}, "usage must be the provider's own numbers (an estimate from text lengths disagrees with the invoice)")
-	second, _ := c.Post("/v1/chat", chatWith(content, "user", 64), "Authorization", "Bearer acme").JSON().(map[string]any)
+	second, _ := c.Post("/v1/chat", hChatWith(content, "user", 64), "Authorization", "Bearer acme").JSON().(map[string]any)
 	ctx.Assert(out["id"] != second["id"], "two requests answered the same id: the request id must be fresh per request")
 }
 
 func CheckNoPromptEcho(ctx *harness.Ctx) {
-	c := chatGateway(ctx)
+	c := hChatGateway(ctx)
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	r := c.Post("/v1/chat", chatWith(chatCanary, "user", 64), "Authorization", "Bearer acme")
-	rejected := c.Post("/v1/chat", chatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "user", "content": chatCanary}, {"role": "operator", "content": chatCanary}}, MaxTokens: 64}, "Authorization", "Bearer acme")
+	r := c.Post("/v1/chat", hChatWith(kHChatCanary, "user", 64), "Authorization", "Bearer acme")
+	rejected := c.Post("/v1/chat", HChatBody{Model: "gpt-4o-mini", Messages: []map[string]any{{"role": "user", "content": kHChatCanary}, {"role": "operator", "content": kHChatCanary}}, MaxTokens: 64}, "Authorization", "Bearer acme")
 	ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "CANARY-7731"), "the answer echoes the prompt: %s", r.Text())
 	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was printed or logged (on success or on a 400): %q", strings.TrimSpace(logged.String()))
 	ctx.Assert(!strings.Contains(rejected.Text(), "CANARY-7731"), "the 400 for an unknown role echoes the prompt: %s", rejected.Text())
 	ctx.GRPC.Fail("Complete", codes.Unavailable, "provider restarting", 1, "")
-	failed := c.Post("/v1/chat", chatWith(chatCanary, "user", 64), "Authorization", "Bearer acme")
+	failed := c.Post("/v1/chat", hChatWith(kHChatCanary, "user", 64), "Authorization", "Bearer acme")
 	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was logged on a provider failure: %q", strings.TrimSpace(logged.String()))
 	ctx.Assert(!strings.Contains(failed.Text(), "CANARY-7731"), "the answer to a failed provider call echoes the prompt: %s", failed.Text())
 }
@@ -1465,40 +1465,40 @@ func CheckNoPromptEcho(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kChatCanary = "CANARY-7731 my account number is 4111";
-const std::string kChatAnswer = "The capital of France is Paris.";
+const std::string kHChatCanary = "CANARY-7731 my account number is 4111";
+const std::string kHChatAnswer = "The capital of France is Paris.";
 
 // The model provider: a fixed answer, usage numbers a text estimate cannot reproduce.
-class ProviderPeer final : public gateway::Provider::Service {
+class HProviderPeer final : public gateway::Provider::Service {
  public:
   std::vector<gateway::CompleteRequest> requests;
   grpc::Status Complete(grpc::ServerContext*, const gateway::CompleteRequest* req, gateway::CompleteReply* reply) override {
     requests.push_back(*req);
     size_t chars = 0;
     for (const auto& m : req->messages()) chars += m.content().size();
-    reply->set_content(kChatAnswer);
+    reply->set_content(kHChatAnswer);
     reply->mutable_usage()->set_input_tokens(static_cast<int32_t>(chars / 4 + 11));
     reply->mutable_usage()->set_output_tokens(42);
     return grpc::Status::OK;
   }
 };
 
-struct ChatGateway {
-  ProviderPeer peer;
+struct HChatGateway {
+  HProviderPeer peer;
   httplib::Server svr;
 };
 
-ChatGateway* gChat = nullptr;
+HChatGateway* hGChat = nullptr;
 
-harness::HTTP chatGateway(harness::Ctx& ctx) {
-  delete gChat;
-  gChat = new ChatGateway;
-  ctx.GRPC.Server("")->RegisterService(&gChat->peer);
-  register_routes(gChat->svr);
-  return ctx.HTTP(gChat->svr);
+harness::HTTP hChatGateway(harness::Ctx& ctx) {
+  delete hGChat;
+  hGChat = new HChatGateway;
+  ctx.GRPC.Server("")->RegisterService(&hGChat->peer);
+  register_routes(hGChat->svr);
+  return ctx.HTTP(hGChat->svr);
 }
 
-std::string chatMessages(const nlohmann::json& messages, int max_tokens = 64, const std::string& model = "gpt-4o-mini") {
+std::string hChatMessages(const nlohmann::json& messages, int max_tokens = 64, const std::string& model = "gpt-4o-mini") {
   nlohmann::json b;
   b["model"] = model;
   b["messages"] = messages;
@@ -1506,9 +1506,9 @@ std::string chatMessages(const nlohmann::json& messages, int max_tokens = 64, co
   return b.dump();
 }
 
-nlohmann::json chatMsg(const std::string& role, const std::string& content) { return {{"role", role}, {"content", content}}; }
+nlohmann::json hChatMsg(const std::string& role, const std::string& content) { return {{"role", role}, {"content", content}}; }
 
-std::string chatWith(const std::string& content, const std::string& role = "user", int max_tokens = 64) {
+std::string hChatWith(const std::string& content, const std::string& role = "user", int max_tokens = 64) {
   nlohmann::json b;
   b["model"] = "gpt-4o-mini";
   b["messages"] = nlohmann::json::array({{{"role", role}, {"content", content}}});
@@ -1516,27 +1516,27 @@ std::string chatWith(const std::string& content, const std::string& role = "user
   return b.dump();
 }
 
-std::string chatOK() { return chatWith("What is the capital of France?"); }
+std::string hChatOK() { return hChatWith("What is the capital of France?"); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = chatGateway(ctx);
-  auto r = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto c = hChatGateway(ctx);
+  auto r = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text());
   const std::string ctype = r.HeaderValue("Content-Type");
   ctx.Assert(ctype.rfind("application/json", 0) == 0, "the answer must be JSON, got Content-Type %q", ctype);
   const auto out = nlohmann::json::parse(r.Text());
-  ctx.Equal(out.value("content", ""), kChatAnswer, "the answer's content must be the provider's completion");
+  ctx.Equal(out.value("content", ""), kHChatAnswer, "the answer's content must be the provider's completion");
   ctx.Assert(!out.value("id", "").empty(), "the answer carries no request id: %s", r.Text());
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 1, "one chat must make exactly one Complete call; the calls made");
-  auto anonymous = c.Post("/v1/chat", chatOK());
+  auto anonymous = c.Post("/v1/chat", hChatOK());
   ctx.Equal(anonymous.Status, 401, "a request without a bearer token");
-  auto peru = c.Post("/v1/chat", chatMessages(nlohmann::json::array({chatMsg("system", "Answer in one word."), chatMsg("user", "Capital of Peru?")}), 32, "gpt-4o"), "Authorization", "Bearer acme");
+  auto peru = c.Post("/v1/chat", hChatMessages(nlohmann::json::array({hChatMsg("system", "Answer in one word."), hChatMsg("user", "Capital of Peru?")}), 32, "gpt-4o"), "Authorization", "Bearer acme");
   ctx.Equal(peru.Status, 200, "a chat with a system message (%s)", peru.Text());
   std::string seen = "none";
-  if (!gChat->peer.requests.empty()) {
-    const auto& got = gChat->peer.requests.back();
+  if (!hGChat->peer.requests.empty()) {
+    const auto& got = hGChat->peer.requests.back();
     seen = "model=" + got.model() + " messages=[";
     for (int i = 0; i < got.messages_size(); ++i) seen += (i ? " " : "") + got.messages(i).role() + ":" + got.messages(i).content();
     seen += "] max_tokens=" + std::to_string(got.max_tokens());
@@ -1545,21 +1545,21 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = chatGateway(ctx);
+  auto c = hChatGateway(ctx);
   nlohmann::json empty;
   empty["model"] = "gpt-4o-mini";
   empty["messages"] = nlohmann::json::array();
   empty["max_tokens"] = 64;
   const std::vector<std::pair<std::string, std::string>> bad = {
       {"an empty messages list", empty.dump()},
-      {"an unknown role", chatWith("hi", "operator")},
-      {"an unknown role in a later message", chatMessages(nlohmann::json::array({chatMsg("user", "hi"), chatMsg("tool", "ok")}))},
-      {"an input over 8192 tokens", chatWith(std::string(8192 * 4 + 4, 'x'))},
-      {"an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", chatWith(std::string(8192 * 4 + 1, 'x'))},
-      {"an input over 8192 tokens across two messages", chatMessages(nlohmann::json::array({chatMsg("system", std::string(4096 * 4, 'x')), chatMsg("user", std::string(4096 * 4 + 1, 'x'))}))},
-      {"max_tokens 0", chatWith("hi", "user", 0)},
-      {"max_tokens 4097", chatWith("hi", "user", 4097)},
-      {"max_tokens 5000", chatWith("hi", "user", 5000)},
+      {"an unknown role", hChatWith("hi", "operator")},
+      {"an unknown role in a later message", hChatMessages(nlohmann::json::array({hChatMsg("user", "hi"), hChatMsg("tool", "ok")}))},
+      {"an input over 8192 tokens", hChatWith(std::string(8192 * 4 + 4, 'x'))},
+      {"an input one character over 8192 tokens (ceil(32769 / 4) = 8193)", hChatWith(std::string(8192 * 4 + 1, 'x'))},
+      {"an input over 8192 tokens across two messages", hChatMessages(nlohmann::json::array({hChatMsg("system", std::string(4096 * 4, 'x')), hChatMsg("user", std::string(4096 * 4 + 1, 'x'))}))},
+      {"max_tokens 0", hChatWith("hi", "user", 0)},
+      {"max_tokens 4097", hChatWith("hi", "user", 4097)},
+      {"max_tokens 5000", hChatWith("hi", "user", 5000)},
   };
   for (const auto& [what, body] : bad) {
     auto r = c.Post("/v1/chat", body, "Authorization", "Bearer acme");
@@ -1567,60 +1567,60 @@ void CheckValidate(harness::Ctx& ctx) {
     const size_t calls = ctx.GRPC.CallsTo("Complete").size();
     ctx.Assert(calls == 0, "%s was answered 400 but the provider was called (%d Complete call(s) so far): validate before the paid call", what, calls);
   }
-  auto ok = c.Post("/v1/chat", chatWith(std::string(8192 * 4, 'x'), "user", 4096), "Authorization", "Bearer acme");
+  auto ok = c.Post("/v1/chat", hChatWith(std::string(8192 * 4, 'x'), "user", 4096), "Authorization", "Bearer acme");
   ctx.Equal(ok.Status, 200, "a request at the limits (8192 input tokens, max_tokens 4096) (%s)", ok.Text());
-  auto split = c.Post("/v1/chat", chatMessages(nlohmann::json::array({chatMsg("system", std::string(4096 * 4, 'x')), chatMsg("assistant", std::string(4096 * 4, 'x'))}), 1), "Authorization", "Bearer acme");
+  auto split = c.Post("/v1/chat", hChatMessages(nlohmann::json::array({hChatMsg("system", std::string(4096 * 4, 'x')), hChatMsg("assistant", std::string(4096 * 4, 'x'))}), 1), "Authorization", "Bearer acme");
   ctx.Equal(split.Status, 200, "a request at the limits across two messages (8192 input tokens, max_tokens 1) (%s)", split.Text());
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto c = chatGateway(ctx);
-  auto r = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto c = hChatGateway(ctx);
+  auto r = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text());
   const auto calls = ctx.GRPC.CallsTo("Complete");
   const auto& call = calls.back();
   ctx.Assert(call.HasDeadline(), "the Complete call carries no deadline: a hung provider would hold the worker forever");
   ctx.Assert(7.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 8.5, "the deadline must be about 8 s, got %vs", call.TimeoutSeconds());
   ctx.GRPC.SetLatency("Complete", 20.0);
-  auto slow = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto slow = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(slow.Status, 504, "a provider slower than the deadline (DEADLINE_EXCEEDED)");
   ctx.GRPC.SetLatency("Complete", 0.0);
   ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "provider restarting", 1);
-  auto down = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto down = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(down.Status, 502, "UNAVAILABLE from the provider");
   ctx.GRPC.Fail("Complete", grpc::StatusCode::RESOURCE_EXHAUSTED, "rate limited", 1);
-  auto limited = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto limited = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(limited.Status, 502, "RESOURCE_EXHAUSTED from the provider");
   ctx.GRPC.Fail("Complete", grpc::StatusCode::INVALID_ARGUMENT, "unknown model", 1);
-  auto refused = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto refused = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(refused.Status, 502, "INVALID_ARGUMENT from the provider");
   ctx.GRPC.Fail("Complete", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1);
-  auto expired = c.Post("/v1/chat", chatOK(), "Authorization", "Bearer acme");
+  auto expired = c.Post("/v1/chat", hChatOK(), "Authorization", "Bearer acme");
   ctx.Equal(expired.Status, 504, "DEADLINE_EXCEEDED reported by the provider");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 6, "the six requests' Complete calls (the gateway must not retry on the client's behalf)");
 }
 
 void CheckUsage(harness::Ctx& ctx) {
-  auto c = chatGateway(ctx);
+  auto c = hChatGateway(ctx);
   const std::string content = "Tell me about the weather in Lisbon this week";
-  auto r = c.Post("/v1/chat", chatWith(content), "Authorization", "Bearer acme");
+  auto r = c.Post("/v1/chat", hChatWith(content), "Authorization", "Bearer acme");
   ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text());
   const auto out = nlohmann::json::parse(r.Text());
   nlohmann::json expected = {{"input_tokens", static_cast<int>(content.size() / 4 + 11)}, {"output_tokens", 42}};
   ctx.Equal(out.value("usage", nlohmann::json()), expected, "usage must be the provider's own numbers (an estimate from text lengths disagrees with the invoice)");
-  const auto second = nlohmann::json::parse(c.Post("/v1/chat", chatWith(content), "Authorization", "Bearer acme").Text());
+  const auto second = nlohmann::json::parse(c.Post("/v1/chat", hChatWith(content), "Authorization", "Bearer acme").Text());
   ctx.Assert(out.value("id", "") != second.value("id", ""), "two requests answered the same id: the request id must be fresh per request");
 }
 
 void CheckNoPromptEcho(harness::Ctx& ctx) {
-  auto c = chatGateway(ctx);
+  auto c = hChatGateway(ctx);
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  auto r = c.Post("/v1/chat", chatWith(kChatCanary), "Authorization", "Bearer acme");
-  auto rejected = c.Post("/v1/chat", chatMessages(nlohmann::json::array({chatMsg("user", kChatCanary), chatMsg("operator", kChatCanary)})), "Authorization", "Bearer acme");
+  auto r = c.Post("/v1/chat", hChatWith(kHChatCanary), "Authorization", "Bearer acme");
+  auto rejected = c.Post("/v1/chat", hChatMessages(nlohmann::json::array({hChatMsg("user", kHChatCanary), hChatMsg("operator", kHChatCanary)})), "Authorization", "Bearer acme");
   ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "provider restarting", 1);
-  auto failed = c.Post("/v1/chat", chatWith(kChatCanary), "Authorization", "Bearer acme");
+  auto failed = c.Post("/v1/chat", hChatWith(kHChatCanary), "Authorization", "Bearer acme");
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   ctx.Equal(r.Status, 200, "POST /v1/chat (%s)", r.Text());

@@ -734,9 +734,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type readPage struct {
+type HReadPage struct {
 	Entries []struct {
 		DocID       string \`json:"doc_id"\`
 		Revision    int64  \`json:"revision"\`
@@ -747,26 +747,26 @@ type readPage struct {
 	HasMore bool  \`json:"has_more"\`
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readWrite(ctx *harness.Ctx, docID string, base int64, body string) {
-	_, err := revisions.ApplyChange(readBg, docID, base, store.ContentHash(body), body, "laptop")
+func hReadWrite(ctx *harness.Ctx, docID string, base int64, body string) {
+	_, err := revisions.ApplyChange(hReadBg, docID, base, store.ContentHash(body), body, "laptop")
 	ctx.NoError(err, "writing %s", docID)
 }
 
-func readPull(ctx *harness.Ctx, c *harness.HTTP, query string) readPage {
+func hReadPull(ctx *harness.Ctx, c *harness.HTTP, query string) HReadPage {
 	r := c.Get("/v1/sync/pull?"+query, "X-Device-Id", "phone")
 	ctx.Equal(r.Status, 200, "GET /v1/sync/pull?%s (%s)", query, r.Text())
-	var page readPage
+	var page HReadPage
 	r.Decode(&page)
 	return page
 }
 
-func readIDs(page readPage) []string {
+func hReadIDs(page HReadPage) []string {
 	ids := []string{}
 	for _, e := range page.Entries {
 		ids = append(ids, e.DocID)
@@ -775,12 +775,12 @@ func readIDs(page readPage) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	for n, body := range []string{"groceries", "call the plumber", "packing list"} {
-		readWrite(ctx, fmt.Sprintf("d-%d", n+1), 0, body)
+		hReadWrite(ctx, fmt.Sprintf("d-%d", n+1), 0, body)
 	}
-	page := readPull(ctx, c, "cursor=0")
-	ctx.Equal(readIDs(page), []string{"d-1", "d-2", "d-3"}, "a device at cursor 0 must get every document in revision order")
+	page := hReadPull(ctx, c, "cursor=0")
+	ctx.Equal(hReadIDs(page), []string{"d-1", "d-2", "d-3"}, "a device at cursor 0 must get every document in revision order")
 	first := page.Entries[0]
 	ctx.Assert(first.DocID == "d-1" && first.Revision == 1 && first.ContentHash == store.ContentHash("groceries") && first.Body == "groceries", "an entry must be the head's doc_id, revision, content_hash and body, got %+v", first)
 	ctx.Assert(page.Cursor == 3 && !page.HasMore, "after every change the answer must be cursor 3 and has_more false, got cursor %d has_more %v", page.Cursor, page.HasMore)
@@ -788,43 +788,43 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckRevisionCursor(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	readWrite(ctx, "d-1", 0, "groceries")
-	readWrite(ctx, "d-2", 0, "call the plumber")
-	readWrite(ctx, "d-3", 0, "packing list")
-	readWrite(ctx, "d-1", 1, "groceries: milk") // revision 4: d-1 moves to the end of the log
-	page := readPull(ctx, c, "cursor=2")
-	ctx.Equal(readIDs(page), []string{"d-3", "d-1"}, "a device at cursor 2 must get what changed after revision 2, d-3 at 3 and d-1 at 4 (the cursor is a revision, not a position in the log)")
+	c := hReadAPI(ctx)
+	hReadWrite(ctx, "d-1", 0, "groceries")
+	hReadWrite(ctx, "d-2", 0, "call the plumber")
+	hReadWrite(ctx, "d-3", 0, "packing list")
+	hReadWrite(ctx, "d-1", 1, "groceries: milk") // revision 4: d-1 moves to the end of the log
+	page := hReadPull(ctx, c, "cursor=2")
+	ctx.Equal(hReadIDs(page), []string{"d-3", "d-1"}, "a device at cursor 2 must get what changed after revision 2, d-3 at 3 and d-1 at 4 (the cursor is a revision, not a position in the log)")
 	ctx.Assert(page.Entries[1].Body == "groceries: milk" && page.Cursor == 4, "the page must end with d-1's new body at cursor 4, got %+v", page)
 }
 
 func CheckPageCursor(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	for n := 1; n <= 4; n++ {
-		readWrite(ctx, fmt.Sprintf("d-%d", n), 0, fmt.Sprintf("note %d", n))
+		hReadWrite(ctx, fmt.Sprintf("d-%d", n), 0, fmt.Sprintf("note %d", n))
 	}
-	first := readPull(ctx, c, "cursor=0&limit=2")
-	ctx.Equal(readIDs(first), []string{"d-1", "d-2"}, "the first page of 2")
+	first := hReadPull(ctx, c, "cursor=0&limit=2")
+	ctx.Equal(hReadIDs(first), []string{"d-1", "d-2"}, "the first page of 2")
 	ctx.Equal(first.Cursor, int64(2), "the first page returned revisions 1 and 2: a device resuming from a later cursor skips everything in between. The cursor is the last revision returned; the cursor")
 	ctx.Equal(first.HasMore, true, "two of four changes were returned; has_more")
-	second := readPull(ctx, c, fmt.Sprintf("cursor=%d&limit=2", first.Cursor))
-	ctx.Assert(len(second.Entries) == 2 && second.Entries[0].DocID == "d-3" && second.Entries[1].DocID == "d-4" && second.Cursor == 4, "resuming from cursor 2 must give d-3, d-4 and cursor 4, got %v and cursor %d", readIDs(second), second.Cursor)
+	second := hReadPull(ctx, c, fmt.Sprintf("cursor=%d&limit=2", first.Cursor))
+	ctx.Assert(len(second.Entries) == 2 && second.Entries[0].DocID == "d-3" && second.Entries[1].DocID == "d-4" && second.Cursor == 4, "resuming from cursor 2 must give d-3, d-4 and cursor 4, got %v and cursor %d", hReadIDs(second), second.Cursor)
 	ctx.Equal(second.HasMore, false, "the second page returned the last two changes (the device would ask again for nothing: read one row past the page); has_more")
-	caughtUp := readPull(ctx, c, "cursor=4&limit=2")
+	caughtUp := hReadPull(ctx, c, "cursor=4&limit=2")
 	ctx.Assert(len(caughtUp.Entries) == 0 && caughtUp.Cursor == 4 && !caughtUp.HasMore, "a device caught up at cursor 4 must get no entries, cursor 4 and has_more false, got %+v: any other cursor makes it pull everything again or skip what comes next", caughtUp)
 	for n := 5; n <= 7; n++ {
-		readWrite(ctx, fmt.Sprintf("d-%d", n), 0, fmt.Sprintf("note %d", n))
+		hReadWrite(ctx, fmt.Sprintf("d-%d", n), 0, fmt.Sprintf("note %d", n))
 	}
 	// The laptop edits d-6 (revision 8) while the phone's pull is between reading the log and reading the heads.
 	ctx.Redis.After("changes", func() any {
-		readWrite(ctx, "d-6", 6, "note 6: edited")
+		hReadWrite(ctx, "d-6", 6, "note 6: edited")
 		return nil
 	})
 	seen := map[string]bool{}
 	cursor := int64(4)
 	for i := 0; i < 4; i++ {
-		page := readPull(ctx, c, fmt.Sprintf("cursor=%d&limit=2", cursor))
-		for _, id := range readIDs(page) {
+		page := hReadPull(ctx, c, fmt.Sprintf("cursor=%d&limit=2", cursor))
+		for _, id := range hReadIDs(page) {
 			seen[id] = true
 		}
 		cursor = page.Cursor
@@ -837,23 +837,23 @@ func CheckPageCursor(ctx *harness.Ctx) {
 }
 
 func CheckLimitCap(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	for n := 1; n <= 1005; n++ {
 		docID, body := fmt.Sprintf("d-%d", n), fmt.Sprintf("note %d", n)
 		ctx.Redis.Do("HSET", "doc:"+docID, "doc_id", docID, "revision", n, "content_hash", store.ContentHash(body), "body", body, "device", "laptop")
 		ctx.Redis.Do("ZADD", "changes", n, docID)
 	}
 	ctx.Redis.Set("rev:seq", 1005)
-	page := readPull(ctx, c, "cursor=0&limit=5000")
+	page := hReadPull(ctx, c, "cursor=0&limit=5000")
 	ctx.Equal(len(page.Entries), 1000, "a pull asking for 5000 entries must be capped at MAX_LIMIT (1000); the entries")
 	ctx.Assert(page.Cursor == 1000 && page.HasMore, "a capped page must answer cursor 1000 and has_more true, got cursor %d has_more %v", page.Cursor, page.HasMore)
 	for _, tc := range [][2]int64{{1000, 0}, {1001, -5}} {
 		cursor, limit := tc[0], tc[1]
-		small := readPull(ctx, c, fmt.Sprintf("cursor=%d&limit=%d", cursor, limit))
+		small := hReadPull(ctx, c, fmt.Sprintf("cursor=%d&limit=%d", cursor, limit))
 		want := fmt.Sprintf("d-%d", cursor+1)
 		ctx.Assert(len(small.Entries) == 1 && small.Entries[0].DocID == want && small.Cursor == cursor+1 && small.HasMore,
 			"a pull at cursor %d with limit=%d must read one entry (%s, cursor %d, has_more true), got %v, cursor %d, has_more %v: an empty page that says has_more keeps a device asking forever. Clamp the limit to at least 1",
-			cursor, limit, want, cursor+1, readIDs(small), small.Cursor, small.HasMore)
+			cursor, limit, want, cursor+1, hReadIDs(small), small.Cursor, small.HasMore)
 	}
 }
 `,
@@ -871,9 +871,9 @@ func CheckLimitCap(ctx *harness.Ctx) {
 
 namespace {
 
-using Json = nlohmann::json;
+using HJson = nlohmann::json;
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -881,69 +881,69 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-void readWrite(const std::string& doc_id, long long base, const std::string& body) {
+void hReadWrite(const std::string& doc_id, long long base, const std::string& body) {
   revisions::applyChange(doc_id, base, store::contentHash(body), body, "laptop");
 }
 
-Json readPull(harness::Ctx& ctx, harness::HTTP& c, const std::string& query) {
+HJson hReadPull(harness::Ctx& ctx, harness::HTTP& c, const std::string& query) {
   const auto r = c.Get("/v1/sync/pull?" + query, "X-Device-Id", "phone");
   ctx.Equal(r.Status, 200, "GET /v1/sync/pull?%s (%s)", query, r.Text());
-  return Json::parse(r.Text(), nullptr, false);
+  return HJson::parse(r.Text(), nullptr, false);
 }
 
-std::vector<std::string> readIds(const Json& page) {
+std::vector<std::string> hReadIds(const HJson& page) {
   std::vector<std::string> ids;
-  for (const Json& e : page.value("entries", Json::array())) ids.push_back(e.value("doc_id", ""));
+  for (const HJson& e : page.value("entries", HJson::array())) ids.push_back(e.value("doc_id", ""));
   return ids;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  readWrite("d-1", 0, "groceries");
-  readWrite("d-2", 0, "call the plumber");
-  readWrite("d-3", 0, "packing list");
-  const Json page = readPull(ctx, c, "cursor=0");
-  ctx.Equal(readIds(page), {"d-1", "d-2", "d-3"}, "a device at cursor 0 must get every document in revision order");
-  const Json want = {{"doc_id", "d-1"}, {"revision", 1}, {"content_hash", store::contentHash("groceries")}, {"body", "groceries"}};
+  auto c = hReadApi(ctx);
+  hReadWrite("d-1", 0, "groceries");
+  hReadWrite("d-2", 0, "call the plumber");
+  hReadWrite("d-3", 0, "packing list");
+  const HJson page = hReadPull(ctx, c, "cursor=0");
+  ctx.Equal(hReadIds(page), {"d-1", "d-2", "d-3"}, "a device at cursor 0 must get every document in revision order");
+  const HJson want = {{"doc_id", "d-1"}, {"revision", 1}, {"content_hash", store::contentHash("groceries")}, {"body", "groceries"}};
   ctx.Assert(page["entries"][0] == want, "an entry must be the head's doc_id, revision, content_hash and body, got %s", page["entries"][0].dump());
   ctx.Assert(page.value("cursor", 0LL) == 3 && page.value("has_more", true) == false, "after every change the answer must be cursor 3 and has_more false, got %s", page.dump());
   ctx.Equal(c.Get("/v1/sync/pull").Status, 401, "a pull without X-Device-Id");
 }
 
 void CheckRevisionCursor(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  readWrite("d-1", 0, "groceries");
-  readWrite("d-2", 0, "call the plumber");
-  readWrite("d-3", 0, "packing list");
-  readWrite("d-1", 1, "groceries: milk");  // revision 4: d-1 moves to the end of the log
-  const Json page = readPull(ctx, c, "cursor=2");
-  ctx.Equal(readIds(page), {"d-3", "d-1"}, "a device at cursor 2 must get what changed after revision 2, d-3 at 3 and d-1 at 4 (the cursor is a revision, not a position in the log)");
+  auto c = hReadApi(ctx);
+  hReadWrite("d-1", 0, "groceries");
+  hReadWrite("d-2", 0, "call the plumber");
+  hReadWrite("d-3", 0, "packing list");
+  hReadWrite("d-1", 1, "groceries: milk");  // revision 4: d-1 moves to the end of the log
+  const HJson page = hReadPull(ctx, c, "cursor=2");
+  ctx.Equal(hReadIds(page), {"d-3", "d-1"}, "a device at cursor 2 must get what changed after revision 2, d-3 at 3 and d-1 at 4 (the cursor is a revision, not a position in the log)");
   ctx.Assert(page["entries"][1].value("body", "") == "groceries: milk" && page.value("cursor", 0LL) == 4, "the page must end with d-1's new body at cursor 4, got %s", page.dump());
 }
 
 void CheckPageCursor(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  for (int n = 1; n <= 4; n++) readWrite("d-" + std::to_string(n), 0, "note " + std::to_string(n));
-  const Json first = readPull(ctx, c, "cursor=0&limit=2");
-  ctx.Equal(readIds(first), {"d-1", "d-2"}, "the first page of 2");
+  auto c = hReadApi(ctx);
+  for (int n = 1; n <= 4; n++) hReadWrite("d-" + std::to_string(n), 0, "note " + std::to_string(n));
+  const HJson first = hReadPull(ctx, c, "cursor=0&limit=2");
+  ctx.Equal(hReadIds(first), {"d-1", "d-2"}, "the first page of 2");
   ctx.Equal(first.value("cursor", 0LL), 2LL, "the first page returned revisions 1 and 2: a device resuming from a later cursor skips everything in between. The cursor is the last revision returned; the cursor");
   ctx.Equal(first.value("has_more", false), true, "two of four changes were returned; has_more");
-  const Json second = readPull(ctx, c, "cursor=" + std::to_string(first.value("cursor", 0LL)) + "&limit=2");
-  ctx.Assert(readIds(second) == std::vector<std::string>{"d-3", "d-4"} && second.value("cursor", 0LL) == 4, "resuming from cursor 2 must give d-3, d-4 and cursor 4, got %s", second.dump());
+  const HJson second = hReadPull(ctx, c, "cursor=" + std::to_string(first.value("cursor", 0LL)) + "&limit=2");
+  ctx.Assert(hReadIds(second) == std::vector<std::string>{"d-3", "d-4"} && second.value("cursor", 0LL) == 4, "resuming from cursor 2 must give d-3, d-4 and cursor 4, got %s", second.dump());
   ctx.Equal(second.value("has_more", true), false, "the second page returned the last two changes (the device would ask again for nothing: read one row past the page); has_more");
-  const Json caughtUp = readPull(ctx, c, "cursor=4&limit=2");
-  ctx.Assert(readIds(caughtUp).empty() && caughtUp.value("cursor", 0LL) == 4 && caughtUp.value("has_more", true) == false,
+  const HJson caughtUp = hReadPull(ctx, c, "cursor=4&limit=2");
+  ctx.Assert(hReadIds(caughtUp).empty() && caughtUp.value("cursor", 0LL) == 4 && caughtUp.value("has_more", true) == false,
              "a device caught up at cursor 4 must get no entries, cursor 4 and has_more false, got %s: any other cursor makes it pull everything again or skip what comes next", caughtUp.dump());
-  for (int n = 5; n <= 7; n++) readWrite("d-" + std::to_string(n), 0, "note " + std::to_string(n));
+  for (int n = 5; n <= 7; n++) hReadWrite("d-" + std::to_string(n), 0, "note " + std::to_string(n));
   // The laptop edits d-6 (revision 8) while the phone's pull is between reading the log and reading the heads.
-  ctx.Redis.After("changes", [] { readWrite("d-6", 6, "note 6: edited"); });
+  ctx.Redis.After("changes", [] { hReadWrite("d-6", 6, "note 6: edited"); });
   std::set<std::string> seen;
   long long cursor = 4;
   for (int i = 0; i < 4; i++) {
-    const Json page = readPull(ctx, c, "cursor=" + std::to_string(cursor) + "&limit=2");
-    for (const auto& id : readIds(page)) seen.insert(id);
+    const HJson page = hReadPull(ctx, c, "cursor=" + std::to_string(cursor) + "&limit=2");
+    for (const auto& id : hReadIds(page)) seen.insert(id);
     cursor = page.value("cursor", 0LL);
     if (!page.value("has_more", false)) break;
   }
@@ -953,20 +953,20 @@ void CheckPageCursor(harness::Ctx& ctx) {
 }
 
 void CheckLimitCap(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   for (int n = 1; n <= 1005; n++) {
     const std::string doc_id = "d-" + std::to_string(n), body = "note " + std::to_string(n);
     ctx.Redis.Do("HSET", "doc:" + doc_id, "doc_id", doc_id, "revision", n, "content_hash", store::contentHash(body), "body", body, "device", "laptop");
     ctx.Redis.Do("ZADD", "changes", n, doc_id);
   }
   ctx.Redis.Set("rev:seq", 1005);
-  const Json page = readPull(ctx, c, "cursor=0&limit=5000");
-  ctx.Equal(page.value("entries", Json::array()).size(), size_t{1000}, "a pull asking for 5000 entries must be capped at MAX_LIMIT (1000); the entries");
+  const HJson page = hReadPull(ctx, c, "cursor=0&limit=5000");
+  ctx.Equal(page.value("entries", HJson::array()).size(), size_t{1000}, "a pull asking for 5000 entries must be capped at MAX_LIMIT (1000); the entries");
   ctx.Assert(page.value("cursor", 0LL) == 1000 && page.value("has_more", false), "a capped page must answer cursor 1000 and has_more true, got cursor %d", page.value("cursor", 0LL));
   for (const auto& [cursor, limit] : std::vector<std::pair<long long, long long>>{{1000, 0}, {1001, -5}}) {
-    const Json small = readPull(ctx, c, "cursor=" + std::to_string(cursor) + "&limit=" + std::to_string(limit));
+    const HJson small = hReadPull(ctx, c, "cursor=" + std::to_string(cursor) + "&limit=" + std::to_string(limit));
     const std::string want = "d-" + std::to_string(cursor + 1);
-    ctx.Assert(readIds(small) == std::vector<std::string>{want} && small.value("cursor", 0LL) == cursor + 1 && small.value("has_more", false),
+    ctx.Assert(hReadIds(small) == std::vector<std::string>{want} && small.value("cursor", 0LL) == cursor + 1 && small.value("has_more", false),
                "a pull at cursor %d with limit=%d must read one entry (%s, cursor %d, has_more true), got %s: an empty page that says has_more keeps a device asking forever. Clamp the limit to at least 1",
                cursor, limit, want, cursor + 1, small.dump());
   }

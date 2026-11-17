@@ -852,52 +852,52 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "tool.lifecycle"
+const kHTopic = "tool.lifecycle"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func entry(name, version, sideEffect, owner string) catalog.Entry {
+func hEntry(name, version, sideEffect, owner string) catalog.Entry {
 	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object"}, "endpoint": "https://" + owner + ".internal/" + name, "credential_ref": "vault://" + owner + "/" + name}
 }
 
 var (
-	v9 = map[string]catalog.Entry{
-		"payments.refund": entry("payments.refund", "b2", "irreversible", "payments"),
-		"payments.void":   entry("payments.void", "d1", "write", "payments"),
-		"search":          entry("search", "a2", "read", "search"),
+	hV9 = map[string]catalog.Entry{
+		"payments.refund": hEntry("payments.refund", "b2", "irreversible", "payments"),
+		"payments.void":   hEntry("payments.void", "d1", "write", "payments"),
+		"search":          hEntry("search", "a2", "read", "search"),
 	}
-	v10 = map[string]catalog.Entry{"payments.refund": entry("payments.refund", "b3", "irreversible", "payments")}
+	hV10 = map[string]catalog.Entry{"payments.refund": hEntry("payments.refund", "b3", "irreversible", "payments")}
 )
 
-func seedVerdicts(ctx *harness.Ctx) {
-	ctx.NoError(catalog.RecordValidation(eventsBg, "9", "passed", ""), "seeding verdicts failed")
-	ctx.NoError(catalog.RecordValidation(eventsBg, "10", "passed", ""), "seeding verdicts failed")
+func hSeedVerdicts(ctx *harness.Ctx) {
+	ctx.NoError(catalog.RecordValidation(hEventsBg, "9", "passed", ""), "seeding verdicts failed")
+	ctx.NoError(catalog.RecordValidation(hEventsBg, "10", "passed", ""), "seeding verdicts failed")
 }
 
-func mustAnnounce(ctx *harness.Ctx, cv string, entries map[string]catalog.Entry) {
-	_, err := announce(eventsBg, cv, entries)
+func hMustAnnounce(ctx *harness.Ctx, cv string, entries map[string]catalog.Entry) {
+	_, err := announce(hEventsBg, cv, entries)
 	ctx.NoError(err, "announce(%s) failed", cv)
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func sortedKeys(ctx *harness.Ctx) []string {
-	keys := append([]string{}, ctx.Kafka.Keys(topic)...)
+func hSortedKeys(ctx *harness.Ctx) []string {
+	keys := append([]string{}, ctx.Kafka.Keys(kHTopic)...)
 	sort.Strings(keys)
 	return keys
 }
 
 func CheckToolKey(ctx *harness.Ctx) {
-	seedVerdicts(ctx)
-	mustAnnounce(ctx, "9", v9)
-	mustAnnounce(ctx, "10", v10)
-	ctx.Equal(sortedKeys(ctx), []string{"payments.refund", "payments.refund", "payments.void", "search"}, "records must be keyed by the tool name (keyed by anything else, one tool's history scatters across partitions); the keys")
+	hSeedVerdicts(ctx)
+	hMustAnnounce(ctx, "9", hV9)
+	hMustAnnounce(ctx, "10", hV10)
+	ctx.Equal(hSortedKeys(ctx), []string{"payments.refund", "payments.refund", "payments.void", "search"}, "records must be keyed by the tool name (keyed by anything else, one tool's history scatters across partitions); the keys")
 	partitions := map[int]bool{}
-	for _, r := range ctx.Kafka.Records(topic) {
+	for _, r := range ctx.Kafka.Records(kHTopic) {
 		if string(r.Key) == "payments.refund" {
 			partitions[r.Partition] = true
 		}
@@ -906,12 +906,12 @@ func CheckToolKey(ctx *harness.Ctx) {
 }
 
 func CheckPublicPayload(ctx *harness.Ctx) {
-	seedVerdicts(ctx)
-	mustAnnounce(ctx, "9", v9)
-	records := ctx.Kafka.Records(topic)
+	hSeedVerdicts(ctx)
+	hMustAnnounce(ctx, "9", hV9)
+	records := ctx.Kafka.Records(kHTopic)
 	ctx.Equal(len(records), 3, "three tools, the records")
 	for _, r := range records {
-		p := payloadOf(ctx, r.Value)
+		p := hPayloadOf(ctx, r.Value)
 		fields := make([]string, 0, len(p))
 		for k := range p {
 			fields = append(fields, k)
@@ -927,57 +927,57 @@ func CheckPublicPayload(ctx *harness.Ctx) {
 }
 
 func CheckVerdictOutcome(ctx *harness.Ctx) {
-	ctx.NoError(catalog.RecordValidation(eventsBg, "8", "rejected", "tool payments.void: the sandbox cannot build arguments from its schema"), "seeding failed")
-	mustAnnounce(ctx, "8", v9)
-	for _, r := range ctx.Kafka.Records(topic) {
-		ctx.Equal(payloadOf(ctx, r.Value)["outcome"], "rejected", "a candidate the sandbox rejected must be announced with the recorded verdict; the outcome")
+	ctx.NoError(catalog.RecordValidation(hEventsBg, "8", "rejected", "tool payments.void: the sandbox cannot build arguments from its schema"), "seeding failed")
+	hMustAnnounce(ctx, "8", hV9)
+	for _, r := range ctx.Kafka.Records(kHTopic) {
+		ctx.Equal(hPayloadOf(ctx, r.Value)["outcome"], "rejected", "a candidate the sandbox rejected must be announced with the recorded verdict; the outcome")
 	}
-	ctx.NoError(catalog.RecordValidation(eventsBg, "9", "passed", ""), "seeding failed")
-	mustAnnounce(ctx, "9", v9)
-	for _, r := range ctx.Kafka.Records(topic)[3:] {
-		ctx.Equal(payloadOf(ctx, r.Value)["outcome"], "passed", "a validated candidate's outcome")
+	ctx.NoError(catalog.RecordValidation(hEventsBg, "9", "passed", ""), "seeding failed")
+	hMustAnnounce(ctx, "9", hV9)
+	for _, r := range ctx.Kafka.Records(kHTopic)[3:] {
+		ctx.Equal(hPayloadOf(ctx, r.Value)["outcome"], "passed", "a validated candidate's outcome")
 	}
-	ctx.NoError(catalog.RecordValidation(eventsBg, "10", "unavailable", "UNAVAILABLE"), "seeding failed")
-	mustAnnounce(ctx, "10", v10)
-	unjudged := ctx.Kafka.Records(topic)[6:]
+	ctx.NoError(catalog.RecordValidation(hEventsBg, "10", "unavailable", "UNAVAILABLE"), "seeding failed")
+	hMustAnnounce(ctx, "10", hV10)
+	unjudged := ctx.Kafka.Records(kHTopic)[6:]
 	ctx.Equal(len(unjudged), 1, "candidate 10 has one tool; its records")
 	for _, r := range unjudged {
-		ctx.Equal(payloadOf(ctx, r.Value)["outcome"], "unavailable", "a candidate the sandbox never answered on must be announced with the recorded verdict, unavailable included; the outcome")
+		ctx.Equal(hPayloadOf(ctx, r.Value)["outcome"], "unavailable", "a candidate the sandbox never answered on must be announced with the recorded verdict, unavailable included; the outcome")
 	}
-	before := len(ctx.Kafka.Records(topic))
-	_, err := announce(eventsBg, "11", v9)
+	before := len(ctx.Kafka.Records(kHTopic))
+	_, err := announce(hEventsBg, "11", hV9)
 	ctx.Assert(err != nil, "announce for catalog 11, which has no recorded verdict, went through: return ErrNoVerdict, there is nothing true to announce yet")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), before, "a candidate with no verdict must produce nothing; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHTopic)), before, "a candidate with no verdict must produce nothing; the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	seedVerdicts(ctx)
-	ctx.Kafka.FailNext(topic, 1)
-	mustAnnounce(ctx, "9", v9)
+	hSeedVerdicts(ctx)
+	ctx.Kafka.FailNext(kHTopic, 1)
+	hMustAnnounce(ctx, "9", hV9)
 	parked := ctx.Redis.LRange("tools:outbox", 0, -1)
 	ctx.Equal(len(parked), 1, "the broker refused one record: it must be parked in tools:outbox for the relay, not logged and dropped; the outbox rows")
 	var row map[string]string
 	ctx.Assert(json.Unmarshal([]byte(parked[0]), &row) == nil, "the outbox row is not JSON: %s", parked[0])
-	value := payloadOf(ctx, []byte(row["value"]))
-	ctx.Assert(row["topic"] == topic && value["tool"] == row["key"], "the outbox row is %v, expected the topic, the key and the record's value", row)
-	parkedEntry := v9[row["key"]]
+	value := hPayloadOf(ctx, []byte(row["value"]))
+	ctx.Assert(row["topic"] == kHTopic && value["tool"] == row["key"], "the outbox row is %v, expected the topic, the key and the record's value", row)
+	parkedEntry := hV9[row["key"]]
 	expected := map[string]any{"tool": row["key"], "version": parkedEntry["version"], "side_effect": parkedEntry["side_effect"], "catalog_version": "9", "outcome": "passed"}
 	got, _ := json.Marshal(value)
 	want, _ := json.Marshal(expected)
 	ctx.Equal(string(got), string(want), "the relay republishes the parked value as is, so it must be the record that was refused; the parked value")
 	covered := map[string]bool{row["key"]: true}
-	for _, k := range ctx.Kafka.Keys(topic) {
+	for _, k := range ctx.Kafka.Keys(kHTopic) {
 		covered[k] = true
 	}
 	ctx.Equal(len(covered), 3, "delivered plus parked records must cover every tool; the tools covered")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	seedVerdicts(ctx)
-	mustAnnounce(ctx, "10", v10)
-	mustAnnounce(ctx, "9", v9)
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 4, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged them. Use RequireAll; the records on the topic", lost)
+	hSeedVerdicts(ctx)
+	hMustAnnounce(ctx, "10", hV10)
+	hMustAnnounce(ctx, "9", hV9)
+	lost := ctx.Kafka.Failover(kHTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHTopic)), 4, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged them. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -993,9 +993,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "tool.lifecycle";
+const std::string kHTopic = "tool.lifecycle";
 
-json entry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
+json hEntry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
   return json{{"name", name},
               {"version", version},
               {"side_effect", side_effect},
@@ -1005,24 +1005,24 @@ json entry(const std::string& name, const std::string& version, const std::strin
               {"credential_ref", "vault://" + owner + "/" + name}};
 }
 
-const json kV9 = {{"payments.refund", entry("payments.refund", "b2", "irreversible", "payments")},
-                  {"payments.void", entry("payments.void", "d1", "write", "payments")},
-                  {"search", entry("search", "a2", "read", "search")}};
-const json kV10 = {{"payments.refund", entry("payments.refund", "b3", "irreversible", "payments")}};
+const json kHV9 = {{"payments.refund", hEntry("payments.refund", "b2", "irreversible", "payments")},
+                  {"payments.void", hEntry("payments.void", "d1", "write", "payments")},
+                  {"search", hEntry("search", "a2", "read", "search")}};
+const json kHV10 = {{"payments.refund", hEntry("payments.refund", "b3", "irreversible", "payments")}};
 
-void seedVerdicts() {
+void hSeedVerdicts() {
   catalog::recordValidation("9", "passed", "");
   catalog::recordValidation("10", "passed", "");
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   const json p = json::parse(record.Value.value_or(""), nullptr, false);
   ctx.Assert(p.is_object(), "the record's value is not JSON: %s", record.Value.value_or(""));
   return p;
 }
 
-std::vector<std::string> sortedKeys(harness::Ctx& ctx) {
-  std::vector<std::string> keys = ctx.Kafka.Keys(kTopic);
+std::vector<std::string> hSortedKeys(harness::Ctx& ctx) {
+  std::vector<std::string> keys = ctx.Kafka.Keys(kHTopic);
   std::sort(keys.begin(), keys.end());
   return keys;
 }
@@ -1030,24 +1030,24 @@ std::vector<std::string> sortedKeys(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckToolKey(harness::Ctx& ctx) {
-  seedVerdicts();
-  announce("9", kV9);
-  announce("10", kV10);
-  ctx.Equal(sortedKeys(ctx), {"payments.refund", "payments.refund", "payments.void", "search"}, "records must be keyed by the tool name (keyed by anything else, one tool's history scatters across partitions); the keys");
+  hSeedVerdicts();
+  announce("9", kHV9);
+  announce("10", kHV10);
+  ctx.Equal(hSortedKeys(ctx), {"payments.refund", "payments.refund", "payments.void", "search"}, "records must be keyed by the tool name (keyed by anything else, one tool's history scatters across partitions); the keys");
   std::set<int> partitions;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) {
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) {
     if (r.Key.value_or("") == "payments.refund") partitions.insert(r.Partition);
   }
   ctx.Equal(partitions.size(), 1, "payments.refund's records must stay on one partition, in order; the partitions they landed on");
 }
 
 void CheckPublicPayload(harness::Ctx& ctx) {
-  seedVerdicts();
-  announce("9", kV9);
-  const auto records = ctx.Kafka.Records(kTopic);
+  hSeedVerdicts();
+  announce("9", kHV9);
+  const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 3, "three tools, the records");
   for (const auto& r : records) {
-    const json p = payloadOf(ctx, r);
+    const json p = hPayloadOf(ctx, r);
     std::vector<std::string> fields;
     for (const auto& [k, v] : p.items()) fields.push_back(k);
     ctx.Equal(fields, {"catalog_version", "outcome", "side_effect", "tool", "version"}, "the topic is retained and replicated, the rest stays in the registry; the record's fields");
@@ -1061,43 +1061,43 @@ void CheckPublicPayload(harness::Ctx& ctx) {
 
 void CheckVerdictOutcome(harness::Ctx& ctx) {
   catalog::recordValidation("8", "rejected", "tool payments.void: the sandbox cannot build arguments from its schema");
-  announce("8", kV9);
-  for (const auto& r : ctx.Kafka.Records(kTopic)) {
-    ctx.Equal(payloadOf(ctx, r).value("outcome", ""), "rejected", "a candidate the sandbox rejected must be announced with the recorded verdict; the outcome");
+  announce("8", kHV9);
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) {
+    ctx.Equal(hPayloadOf(ctx, r).value("outcome", ""), "rejected", "a candidate the sandbox rejected must be announced with the recorded verdict; the outcome");
   }
   catalog::recordValidation("9", "passed", "");
-  announce("9", kV9);
-  const auto records = ctx.Kafka.Records(kTopic);
-  for (size_t i = 3; i < records.size(); i++) ctx.Equal(payloadOf(ctx, records[i]).value("outcome", ""), "passed", "a validated candidate's outcome");
+  announce("9", kHV9);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  for (size_t i = 3; i < records.size(); i++) ctx.Equal(hPayloadOf(ctx, records[i]).value("outcome", ""), "passed", "a validated candidate's outcome");
   catalog::recordValidation("10", "unavailable", "UNAVAILABLE");
-  announce("10", kV10);
-  const auto all = ctx.Kafka.Records(kTopic);
+  announce("10", kHV10);
+  const auto all = ctx.Kafka.Records(kHTopic);
   ctx.Equal(all.size(), records.size() + 1, "candidate 10 has one tool; the records");
   for (size_t i = records.size(); i < all.size(); i++) {
-    ctx.Equal(payloadOf(ctx, all[i]).value("outcome", ""), "unavailable", "a candidate the sandbox never answered on must be announced with the recorded verdict, unavailable included; the outcome");
+    ctx.Equal(hPayloadOf(ctx, all[i]).value("outcome", ""), "unavailable", "a candidate the sandbox never answered on must be announced with the recorded verdict, unavailable included; the outcome");
   }
   const size_t before = all.size();
   bool refused = false;
   try {
-    announce("11", kV9);
+    announce("11", kHV9);
   } catch (const std::exception&) {
     refused = true;
   }
   ctx.Assert(refused, "announce for catalog 11, which has no recorded verdict, went through: throw NoVerdict, there is nothing true to announce yet");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), before, "a candidate with no verdict must produce nothing; the records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), before, "a candidate with no verdict must produce nothing; the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  seedVerdicts();
-  ctx.Kafka.FailNext(kTopic, 1);
-  announce("9", kV9);
+  hSeedVerdicts();
+  ctx.Kafka.FailNext(kHTopic, 1);
+  announce("9", kHV9);
   const auto parked = ctx.Redis.LRange("tools:outbox", 0, -1);
   ctx.Equal(parked.size(), 1, "the broker refused one record: it must be parked in tools:outbox for the relay, not logged and dropped; the outbox rows");
   const json row = json::parse(parked[0], nullptr, false);
-  ctx.Assert(row.is_object() && row.value("topic", "") == kTopic && json::parse(row.value("value", "{}")).value("tool", "") == row.value("key", ""),
+  ctx.Assert(row.is_object() && row.value("topic", "") == kHTopic && json::parse(row.value("value", "{}")).value("tool", "") == row.value("key", ""),
              "the outbox row is %s, expected the topic, the key and the record's value", parked[0]);
   const std::string key = row.is_object() ? row.value("key", "") : "";
-  const json parkedEntry = kV9.contains(key) ? kV9[key] : json::object();
+  const json parkedEntry = kHV9.contains(key) ? kHV9[key] : json::object();
   const json expected = {{"tool", key},
                          {"version", parkedEntry.value("version", "")},
                          {"side_effect", parkedEntry.value("side_effect", "")},
@@ -1105,18 +1105,18 @@ void CheckOutbox(harness::Ctx& ctx) {
                          {"outcome", "passed"}};
   ctx.Equal(json::parse(row.value("value", "{}"), nullptr, false), expected, "the relay republishes the parked value as is, so it must be the record that was refused; the parked value");
   std::set<std::string> covered = {row.value("key", "")};
-  for (const auto& k : ctx.Kafka.Keys(kTopic)) covered.insert(k);
+  for (const auto& k : ctx.Kafka.Keys(kHTopic)) covered.insert(k);
   ctx.Equal(covered.size(), 3, "delivered plus parked records must cover every tool; the tools covered");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  seedVerdicts();
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  announce("10", kV10);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one record whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence (with acks=all); the records on the topic");
-  announce("9", kV9);
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 4, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged them. Use acks=all; the records on the topic", lost);
+  hSeedVerdicts();
+  ctx.Kafka.LoseAcks(kHTopic, 1);
+  announce("10", kHV10);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "one record whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence (with acks=all); the records on the topic");
+  announce("9", kHV9);
+  const int lost = ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 4, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged them. Use acks=all; the records on the topic", lost);
 }
 `,
   },

@@ -1104,15 +1104,15 @@ import (
 )
 
 const (
-	feedbackCanary  = "CANARY-7731 my card number is 4111"
-	feedbackQuality = "quality:acme:gpt-4o-mini"
+	kHFeedbackCanary  = "CANARY-7731 my card number is 4111"
+	kHFeedbackQuality = "quality:acme:gpt-4o-mini"
 )
 
-func feedbackRouted(id, tenant, prompt, outcome string) routedRequest {
+func hFeedbackRouted(id, tenant, prompt, outcome string) routedRequest {
 	return routedRequest{ID: id, Tenant: tenant, Policy: "auto", Model: "gpt-4o-mini", Prompt: prompt, Outcome: outcome, LatencyMs: 812.5}
 }
 
-func feedbackIDs(ctx *harness.Ctx) []string {
+func hFeedbackIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
 	for _, r := range ctx.Kafka.Records("route.feedback") {
 		var v map[string]any
@@ -1123,7 +1123,7 @@ func feedbackIDs(ctx *harness.Ctx) []string {
 	return ids
 }
 
-func feedbackOutbox(ctx *harness.Ctx) []map[string]any {
+func hFeedbackOutbox(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, row := range ctx.Redis.LRange("outbox:feedback", 0, -1) {
 		var v map[string]any
@@ -1133,9 +1133,9 @@ func feedbackOutbox(ctx *harness.Ctx) []map[string]any {
 	return rows
 }
 
-func qualityTotal(ctx *harness.Ctx) int {
+func hQualityTotal(ctx *harness.Ctx) int {
 	total := 0
-	for _, v := range ctx.Redis.HGetAll(feedbackQuality) {
+	for _, v := range ctx.Redis.HGetAll(kHFeedbackQuality) {
 		n, _ := strconv.Atoi(v)
 		total += n
 	}
@@ -1143,9 +1143,9 @@ func qualityTotal(ctx *harness.Ctx) int {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	emitFeedback(context.Background(), buildEvent(feedbackRouted("r-1", "acme", "hi", "good")))
-	emitFeedback(context.Background(), buildEvent(feedbackRouted("r-2", "beta", "hi", "bad")))
-	emitFeedback(context.Background(), buildEvent(feedbackRouted("r-3", "acme", "hi", "good")))
+	emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-1", "acme", "hi", "good")))
+	emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-2", "beta", "hi", "bad")))
+	emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-3", "acme", "hi", "good")))
 	ctx.Settle()
 	records := ctx.Kafka.Records("route.feedback")
 	ctx.Equal(len(records), 3, "three emitFeedback calls must produce three records on route.feedback; the records")
@@ -1173,17 +1173,17 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	emitFeedback(context.Background(), buildEvent(feedbackRouted("r-2", "acme", "hi", "good")))
+	emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-2", "acme", "hi", "good")))
 	ctx.Settle()
-	ctx.Equal(feedbackIDs(ctx), []string{"r-2"}, "one emitFeedback call; the records on route.feedback")
+	ctx.Equal(hFeedbackIDs(ctx), []string{"r-2"}, "one emitFeedback call; the records on route.feedback")
 	ctx.Kafka.Failover("route.feedback")
-	ctx.Equal(feedbackIDs(ctx), []string{"r-2"}, "a leader failover right after the acknowledgement must keep the record: wait for all in-sync replicas (RequireAll); the records")
+	ctx.Equal(hFeedbackIDs(ctx), []string{"r-2"}, "a leader failover right after the acknowledgement must keep the record: wait for all in-sync replicas (RequireAll); the records")
 }
 
 func CheckNoPrompt(ctx *harness.Ctx) {
 	var logged bytes.Buffer
 	log.SetOutput(&logged)
-	emitFeedback(context.Background(), buildEvent(feedbackRouted("r-1", "acme", feedbackCanary, "good")))
+	emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-1", "acme", kHFeedbackCanary, "good")))
 	ctx.Settle()
 	records := ctx.Kafka.Records("route.feedback")
 	ctx.Equal(len(records), 1, "one emitFeedback call; the records")
@@ -1210,17 +1210,17 @@ func CheckOutbox(ctx *harness.Ctx) {
 				ctx.Fatalf("emitFeedback failed the request when the broker refused the record: %v. Write the event to the outbox instead", e)
 			}
 		}()
-		emitFeedback(context.Background(), buildEvent(feedbackRouted("r-9", "acme", "hi", "good")))
+		emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-9", "acme", "hi", "good")))
 	}()
 	ctx.Settle()
-	rows := feedbackOutbox(ctx)
+	rows := hFeedbackOutbox(ctx)
 	ctx.Assert(len(rows) > 0, "the broker refused the record and nothing reached outbox:feedback: an async writer reports the refusal to Completion, and that is where outbox.Insert belongs")
 	event, _ := rows[0]["event"].(map[string]any)
 	ctx.Equal(event["id"], "r-9", "the outbox row must carry the event; the row %v; its id", rows[0])
-	emitFeedback(context.Background(), buildEvent(feedbackRouted("r-10", "acme", "hi", "good")))
+	emitFeedback(context.Background(), buildEvent(hFeedbackRouted("r-10", "acme", "hi", "good")))
 	ctx.Settle()
-	ctx.Equal(feedbackIDs(ctx), []string{"r-10"}, "once the broker accepts records again they flow to the topic; the records")
-	ctx.Equal(len(feedbackOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
+	ctx.Equal(hFeedbackIDs(ctx), []string{"r-10"}, "once the broker accepts records again they flow to the topic; the records")
+	ctx.Equal(len(hFeedbackOutbox(ctx)), 1, "a delivered record must not be written to the outbox; the rows")
 }
 
 func CheckCommitAfterIncrement(ctx *harness.Ctx) {
@@ -1233,11 +1233,11 @@ func CheckCommitAfterIncrement(ctx *harness.Ctx) {
 	ctx.Kafka.Seed("route.feedback", "acme", string(failing))
 	ctx.Redis.Set("quality:acme:gpt-4o", "not-a-hash")
 	var atCommit []int
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, qualityTotal(ctx)) })
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, hQualityTotal(ctx)) })
 	ctx.Drain(func() { runQuality(context.Background()) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
-	ctx.Assert(atCommit[0] >= 1, "at the first commit %s counted %d verdicts: the increment must come before the commit, or a crash in between loses the verdict", feedbackQuality, atCommit[0])
-	ctx.Equal(ctx.Redis.HGetAll(feedbackQuality), map[string]string{"good": "2", "bad": "1"}, "%s (good 2, bad 1)", feedbackQuality)
+	ctx.Assert(atCommit[0] >= 1, "at the first commit %s counted %d verdicts: the increment must come before the commit, or a crash in between loses the verdict", kHFeedbackQuality, atCommit[0])
+	ctx.Equal(ctx.Redis.HGetAll(kHFeedbackQuality), map[string]string{"good": "2", "bad": "1"}, "%s (good 2, bad 1)", kHFeedbackQuality)
 	lag := ctx.Kafka.Lag("quality", "route.feedback")
 	ctx.Assert(lag <= 1, "the lag is %d: every record whose increment succeeded must be committed", lag)
 	ctx.Assert(lag == 1, "the increment of r-4 failed (WRONGTYPE) and its offset was committed anyway: the verdict is lost for good. Commit only after the increment succeeded")
@@ -1257,16 +1257,16 @@ func CheckCommitAfterIncrement(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kFeedbackCanary = "CANARY-7731 my card number is 4111";
-const std::string kFeedbackQuality = "quality:acme:gpt-4o-mini";
+const std::string kHFeedbackCanary = "CANARY-7731 my card number is 4111";
+const std::string kHFeedbackQuality = "quality:acme:gpt-4o-mini";
 
-nlohmann::json feedbackRouted(const std::string& id, const std::string& tenant, const std::string& prompt = "hi",
+nlohmann::json hFeedbackRouted(const std::string& id, const std::string& tenant, const std::string& prompt = "hi",
                               const std::string& outcome = "good") {
   return {{"id", id}, {"tenant", tenant}, {"policy", "auto"}, {"model", "gpt-4o-mini"},
           {"prompt", prompt}, {"outcome", outcome}, {"latency_ms", 812.5}};
 }
 
-std::vector<std::string> feedbackIDs(harness::Ctx& ctx) {
+std::vector<std::string> hFeedbackIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& r : ctx.Kafka.Records("route.feedback")) {
     const auto v = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
@@ -1275,24 +1275,24 @@ std::vector<std::string> feedbackIDs(harness::Ctx& ctx) {
   return ids;
 }
 
-std::vector<nlohmann::json> feedbackOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hFeedbackOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& row : ctx.Redis.LRange("outbox:feedback", 0, -1)) rows.push_back(nlohmann::json::parse(row, nullptr, false));
   return rows;
 }
 
-long long qualityTotal(harness::Ctx& ctx) {
+long long hQualityTotal(harness::Ctx& ctx) {
   long long total = 0;
-  for (const auto& [field, value] : ctx.Redis.HGetAll(kFeedbackQuality)) total += std::atoll(value.c_str());
+  for (const auto& [field, value] : ctx.Redis.HGetAll(kHFeedbackQuality)) total += std::atoll(value.c_str());
   return total;
 }
 
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  emit_feedback(build_event(feedbackRouted("r-1", "acme")));
-  emit_feedback(build_event(feedbackRouted("r-2", "beta", "hi", "bad")));
-  emit_feedback(build_event(feedbackRouted("r-3", "acme")));
+  emit_feedback(build_event(hFeedbackRouted("r-1", "acme")));
+  emit_feedback(build_event(hFeedbackRouted("r-2", "beta", "hi", "bad")));
+  emit_feedback(build_event(hFeedbackRouted("r-3", "acme")));
   ctx.Settle();
   const auto records = ctx.Kafka.Records("route.feedback");
   ctx.Equal(records.size(), 3, "three emit_feedback calls must produce three records on route.feedback; the records");
@@ -1308,16 +1308,16 @@ void CheckTenantKey(harness::Ctx& ctx) {
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks("route.feedback", 1);
-  emit_feedback(build_event(feedbackRouted("r-1", "acme")));
+  emit_feedback(build_event(hFeedbackRouted("r-1", "acme")));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(feedbackIDs(ctx), {"r-1"},
+  ctx.Equal(hFeedbackIDs(ctx), {"r-1"},
             "after one produce whose acknowledgement was lost the topic must hold the record once (the producer's retry wrote it again: enable idempotence so the broker recognises the retry); the records");
-  emit_feedback(build_event(feedbackRouted("r-2", "acme")));
+  emit_feedback(build_event(hFeedbackRouted("r-2", "acme")));
   producer->poll(0);
   ctx.Settle();
   ctx.Kafka.Failover("route.feedback");
-  const auto ids = feedbackIDs(ctx);
+  const auto ids = hFeedbackIDs(ctx);
   ctx.Assert(std::find(ids.begin(), ids.end(), "r-2") != ids.end(), "a leader failover right after the acknowledgement lost the record: wait for all in-sync replicas (acks=all)");
 }
 
@@ -1326,7 +1326,7 @@ void CheckNoPrompt(harness::Ctx& ctx) {
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
   // The rated request also carries the model's answer: content that has no place in the event either.
-  auto rated = feedbackRouted("r-1", "acme", kFeedbackCanary);
+  auto rated = hFeedbackRouted("r-1", "acme", kHFeedbackCanary);
   rated["answer"] = "CANARY-7731 the card ends in 4111";
   emit_feedback(build_event(rated));
   producer->poll(0);
@@ -1348,45 +1348,45 @@ void CheckNoPrompt(harness::Ctx& ctx) {
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext("route.feedback", 1);
   try {
-    emit_feedback(build_event(feedbackRouted("r-9", "acme")));
+    emit_feedback(build_event(hFeedbackRouted("r-9", "acme")));
   } catch (const std::exception& e) {
     ctx.Fatalf("emit_feedback failed the request when the broker refused the record: %s. Write the event to the outbox instead", e.what());
   }
   producer->poll(0);
   ctx.Settle();
-  const auto rows = feedbackOutbox(ctx);
+  const auto rows = hFeedbackOutbox(ctx);
   ctx.Assert(!rows.empty(), "the broker refused the record and nothing reached outbox:feedback: the refusal arrives in the delivery report (dr_cb), and that is where routerd::outbox::insert belongs");
   ctx.Assert(rows[0].is_object() && rows[0].contains("event") && rows[0]["event"].value("id", "") == "r-9", "the outbox row must carry the event: %s", rows[0].dump());
   ctx.Equal(ctx.Kafka.Flushes(), 0, "emit_feedback must not flush (the request would wait for the broker); the flushes");
-  emit_feedback(build_event(feedbackRouted("r-10", "acme")));
+  emit_feedback(build_event(hFeedbackRouted("r-10", "acme")));
   producer->poll(0);
   ctx.Settle();
-  ctx.Equal(feedbackIDs(ctx), {"r-10"}, "once the broker accepts records again they flow to the topic; the records");
-  ctx.Equal(feedbackOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
+  ctx.Equal(hFeedbackIDs(ctx), {"r-10"}, "once the broker accepts records again they flow to the topic; the records");
+  ctx.Equal(hFeedbackOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
 }
 
 void CheckCommitAfterIncrement(harness::Ctx& ctx) {
   for (const auto& [id, outcome] : std::vector<std::pair<std::string, std::string>>{{"r-1", "good"}, {"r-2", "good"}, {"r-3", "bad"}}) {
-    auto event = feedbackRouted(id, "acme", "", outcome);
+    auto event = hFeedbackRouted(id, "acme", "", outcome);
     event.erase("prompt");
     ctx.Kafka.Seed("route.feedback", "acme", event.dump());
   }
   // The last record's increment fails: quality:acme:gpt-4o is not a hash.
-  auto failing = feedbackRouted("r-4", "acme");
+  auto failing = hFeedbackRouted("r-4", "acme");
   failing.erase("prompt");
   failing["model"] = "gpt-4o";
   ctx.Kafka.Seed("route.feedback", "acme", failing.dump());
   ctx.Redis.Set("quality:acme:gpt-4o", "not-a-hash");
   std::vector<long long> atCommit;
-  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(qualityTotal(ctx)); });
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(hQualityTotal(ctx)); });
   try {
     ctx.Drain([] { run_quality(); });
   } catch (const std::exception&) {
     // The failed increment may end the consumer; the offsets are the verdict.
   }
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
-  ctx.Assert(atCommit[0] >= 1, "at the first commit %s counted %d verdicts: the increment must come before the commit, or a crash in between loses the verdict", kFeedbackQuality, atCommit[0]);
-  ctx.Assert(ctx.Redis.HGetAll(kFeedbackQuality) == std::map<std::string, std::string>{{"good", "2"}, {"bad", "1"}}, "%s is %v, expected good 2 and bad 1", kFeedbackQuality, ctx.Redis.HGetAll(kFeedbackQuality));
+  ctx.Assert(atCommit[0] >= 1, "at the first commit %s counted %d verdicts: the increment must come before the commit, or a crash in between loses the verdict", kHFeedbackQuality, atCommit[0]);
+  ctx.Assert(ctx.Redis.HGetAll(kHFeedbackQuality) == std::map<std::string, std::string>{{"good", "2"}, {"bad", "1"}}, "%s is %v, expected good 2 and bad 1", kHFeedbackQuality, ctx.Redis.HGetAll(kHFeedbackQuality));
   const auto lag = ctx.Kafka.Lag("quality", "route.feedback");
   ctx.Assert(lag <= 1, "the lag is %d: every record whose increment succeeded must be committed", lag);
   ctx.Assert(lag == 1, "the increment of r-4 failed (WRONGTYPE) and its offset was committed anyway: the verdict is lost for good. Commit only after the increment succeeded");

@@ -889,17 +889,17 @@ import (
 )
 
 // Three items, overlap 3: ana, bo and cy label honestly, spam (flagged by quality review) disagrees on purpose.
-var readLabels = [][3]string{
+var hReadLabels = [][3]string{
 	{"ana", "i-1", "cat"}, {"ana", "i-2", "dog"}, {"ana", "i-3", "cat"},
 	{"bo", "i-1", "cat"}, {"bo", "i-2", "cat"}, {"bo", "i-3", "cat"},
 	{"cy", "i-1", "cat"}, {"cy", "i-2", "dog"},
 	{"spam", "i-1", "dog"}, {"spam", "i-2", "cat"}, {"spam", "i-3", "dog"},
 }
 
-func readTask(ctx *harness.Ctx) (*harness.HTTP, string) {
+func hReadTask(ctx *harness.Ctx) (*harness.HTTP, string) {
 	bg := context.Background()
 	taskID := store.CreateTask(bg, "t1", "2026-10", 3, []string{"a cat on a mat", "a dog in the fog", "a cat in a hat"}).TaskID
-	for n, l := range readLabels {
+	for n, l := range hReadLabels {
 		store.SaveLabel(bg, store.Label{LabelID: fmt.Sprintf("l-%d", n+1), TaskID: taskID, ItemID: l[1], Annotator: l[0], SpecVersion: "2026-10", Value: l[2]})
 	}
 	ctx.Redis.Do("SADD", "flagged:"+taskID, "spam")
@@ -908,11 +908,11 @@ func readTask(ctx *harness.Ctx) (*harness.HTTP, string) {
 	return ctx.HTTP(mux), taskID
 }
 
-func readGet(c *harness.HTTP, taskID, tenant, annotator string) *harness.Response {
+func hReadGet(c *harness.HTTP, taskID, tenant, annotator string) *harness.Response {
 	return c.Get("/v1/tasks/"+taskID+"/progress", "X-Tenant-Id", tenant, "X-Annotator-Id", annotator)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, map[string]map[string]any) {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, map[string]map[string]any) {
 	body, _ := r.JSON().(map[string]any)
 	ctx.Assert(body != nil, "the response body is not a JSON object: %s", r.Text())
 	rows := map[string]map[string]any{}
@@ -927,10 +927,10 @@ func readBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, map[string
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, taskID := readTask(ctx)
-	r := readGet(c, taskID, "t1", "ana")
+	c, taskID := hReadTask(ctx)
+	r := hReadGet(c, taskID, "t1", "ana")
 	ctx.Equal(r.Status, 200, "GET /v1/tasks/%s/progress (%s)", taskID, r.Text())
-	body, rows := readBody(ctx, r)
+	body, rows := hReadBody(ctx, r)
 	ctx.Assert(body["task_id"] == taskID && body["total"] == float64(3), "the progress of %s answered %s, expected task_id %s and total 3", taskID, r.Text(), taskID)
 	names := make([]string, 0, len(rows))
 	for name := range rows {
@@ -941,29 +941,29 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c, taskID := readTask(ctx)
-	foreign := readGet(c, taskID, "t2", "ana")
+	c, taskID := hReadTask(ctx)
+	foreign := hReadGet(c, taskID, "t2", "ana")
 	ctx.Equal(foreign.Status, 404, "tenant t2 read tenant t1's task %s (%s). Another tenant's task must be 404, as an unknown one; the status", taskID, foreign.Text())
-	unknown := readGet(c, "t-99", "t1", "ana")
+	unknown := hReadGet(c, "t-99", "t1", "ana")
 	ctx.Equal(unknown.Status, 404, "an unknown task")
 	ctx.Assert(strings.ReplaceAll(foreign.Text(), taskID, "<id>") == strings.ReplaceAll(unknown.Text(), "t-99", "<id>"), "another tenant's task answered %q and an unknown one %q: a different answer tells the caller the id exists", foreign.Text(), unknown.Text())
 	ctx.Equal(c.Get("/v1/tasks/"+taskID+"/progress", "X-Annotator-Id", "ana").Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckBlindPeers(ctx *harness.Ctx) {
-	c, taskID := readTask(ctx)
-	_, rows := readBody(ctx, readGet(c, taskID, "t1", "ana"))
+	c, taskID := hReadTask(ctx)
+	_, rows := hReadBody(ctx, hReadGet(c, taskID, "t1", "ana"))
 	ctx.Equal(rows["ana"]["labels"], map[string]any{"i-1": "cat", "i-2": "dog", "i-3": "cat"}, "ana's own row must carry her three labels")
 	for name, row := range rows {
 		if name != "ana" {
 			ctx.Assert(row["labels"] == nil, "ana can read %s's answers %v: before she labels an item she can copy them, and agreement measures copying. A peer's row has labels null", name, row["labels"])
 		}
 	}
-	_, rows = readBody(ctx, readGet(c, taskID, "t1", "bo"))
+	_, rows = hReadBody(ctx, hReadGet(c, taskID, "t1", "bo"))
 	ctx.Equal(rows["bo"]["labels"], map[string]any{"i-1": "cat", "i-2": "cat", "i-3": "cat"}, "asking as bo, bo's own labels")
 	ctx.Assert(rows["ana"]["labels"] == nil, "asking as bo, ana's labels are %v: the caller sees only their own", rows["ana"]["labels"])
 	ctx.Equal(rows["ana"]["submitted"], float64(3), "a peer's row must still count what they submitted; ana's submitted")
-	_, anonymous := readBody(ctx, c.Get("/v1/tasks/"+taskID+"/progress", "X-Tenant-Id", "t1"))
+	_, anonymous := hReadBody(ctx, c.Get("/v1/tasks/"+taskID+"/progress", "X-Tenant-Id", "t1"))
 	ctx.Equal(len(anonymous), 4, "a read without X-Annotator-Id must still list every annotator; the rows")
 	for name, row := range anonymous {
 		ctx.Assert(row["labels"] == nil, "a read without X-Annotator-Id is nobody's: it showed %s's labels %v, expected labels null on every row", name, row["labels"])
@@ -971,8 +971,8 @@ func CheckBlindPeers(ctx *harness.Ctx) {
 }
 
 func CheckFlaggedExcluded(ctx *harness.Ctx) {
-	c, taskID := readTask(ctx)
-	body, rows := readBody(ctx, readGet(c, taskID, "t1", "ana"))
+	c, taskID := hReadTask(ctx)
+	body, rows := hReadBody(ctx, hReadGet(c, taskID, "t1", "ana"))
 	ctx.Equal(rows["spam"]["excluded"], true, "spam is flagged by quality review: its row's excluded")
 	for _, name := range []string{"ana", "bo", "cy"} {
 		ctx.Equal(rows[name]["excluded"], false, "only spam is flagged: %s's excluded", name)
@@ -986,7 +986,7 @@ func CheckFlaggedExcluded(ctx *harness.Ctx) {
 		store.SaveLabel(bg, store.Label{LabelID: fmt.Sprintf("m-%d", n+1), TaskID: lone, ItemID: l[0], Annotator: l[2], SpecVersion: "2026-10", Value: l[1]})
 	}
 	ctx.Redis.Do("SADD", "flagged:"+lone, "spam")
-	alone, _ := readBody(ctx, readGet(c, lone, "t1", "ana"))
+	alone, _ := hReadBody(ctx, hReadGet(c, lone, "t1", "ana"))
 	agreement, present := alone["agreement"]
 	ctx.Assert(present && agreement == nil && alone["completed"] == float64(0), "task %s has one label per item from annotators who count, and answered agreement %v, completed %v: expected agreement null and completed 0", lone, agreement, alone["completed"])
 }
@@ -1004,21 +1004,21 @@ using json = nlohmann::json;
 namespace {
 
 // Three items, overlap 3: ana, bo and cy label honestly, spam (flagged by quality review) disagrees on purpose.
-const std::vector<std::tuple<std::string, std::string, std::string>> kLabels = {
+const std::vector<std::tuple<std::string, std::string, std::string>> kHLabels = {
     {"ana", "i-1", "cat"}, {"ana", "i-2", "dog"}, {"ana", "i-3", "cat"},  {"bo", "i-1", "cat"},
     {"bo", "i-2", "cat"},  {"bo", "i-3", "cat"},  {"cy", "i-1", "cat"},   {"cy", "i-2", "dog"},
     {"spam", "i-1", "dog"}, {"spam", "i-2", "cat"}, {"spam", "i-3", "dog"},
 };
 
-struct Fixture {
+struct HFixture {
   harness::HTTP c;
   std::string task_id;
 };
 
-Fixture readTask(harness::Ctx& ctx) {
+HFixture hReadTask(harness::Ctx& ctx) {
   const std::string task_id = store::createTask("t1", "2026-10", 3, {"a cat on a mat", "a dog in the fog", "a cat in a hat"}).task_id;
   int n = 0;
-  for (const auto& [annotator, item_id, value] : kLabels) {
+  for (const auto& [annotator, item_id, value] : kHLabels) {
     store::saveLabel(store::Label{"l-" + std::to_string(++n), task_id, item_id, annotator, "2026-10", value});
   }
   ctx.Redis.Do("SADD", "flagged:" + task_id, "spam");
@@ -1029,11 +1029,11 @@ Fixture readTask(harness::Ctx& ctx) {
   return {ctx.HTTP(*svr), task_id};
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& task_id, const std::string& tenant = "t1", const std::string& annotator = "ana") {
+harness::Response hReadGet(harness::HTTP& c, const std::string& task_id, const std::string& tenant = "t1", const std::string& annotator = "ana") {
   return c.Get("/v1/tasks/" + task_id + "/progress", "X-Tenant-Id", tenant, "X-Annotator-Id", annotator);
 }
 
-json rowsOf(harness::Ctx& ctx, const harness::Response& r) {
+json hRowsOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.contains("annotators"), "the response body is not a progress object: %s", r.Text());
   json rows = json::object();
@@ -1041,27 +1041,27 @@ json rowsOf(harness::Ctx& ctx, const harness::Response& r) {
   return rows;
 }
 
-json field(const json& j, const std::string& name) { return j.is_object() && j.contains(name) ? j[name] : json(); }
+json hField(const json& j, const std::string& name) { return j.is_object() && j.contains(name) ? j[name] : json(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto [c, task_id] = readTask(ctx);
-  const auto r = readGet(c, task_id);
+  auto [c, task_id] = hReadTask(ctx);
+  const auto r = hReadGet(c, task_id);
   ctx.Equal(r.Status, 200, "GET /v1/tasks/%s/progress (%s)", task_id, r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
-  ctx.Assert(field(body, "task_id") == task_id && field(body, "total") == 3, "the progress of %s answered %s, expected task_id %s and total 3", task_id, r.Text(), task_id);
+  ctx.Assert(hField(body, "task_id") == task_id && hField(body, "total") == 3, "the progress of %s answered %s, expected task_id %s and total 3", task_id, r.Text(), task_id);
   std::vector<std::string> names;
-  const json rows = rowsOf(ctx, r);
+  const json rows = hRowsOf(ctx, r);
   for (const auto& [name, row] : rows.items()) names.push_back(name);
   ctx.Equal(names, {"ana", "bo", "cy", "spam"}, "the progress must list every annotator who labeled");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto [c, task_id] = readTask(ctx);
-  const auto foreign = readGet(c, task_id, "t2");
+  auto [c, task_id] = hReadTask(ctx);
+  const auto foreign = hReadGet(c, task_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 read tenant t1's task %s (%s). Another tenant's task must be 404, as an unknown one; the status", task_id, foreign.Text());
-  const auto unknown = readGet(c, "t-99");
+  const auto unknown = hReadGet(c, "t-99");
   ctx.Equal(unknown.Status, 404, "an unknown task");
   const auto masked = [](std::string text, const std::string& id) {
     for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "<id>");
@@ -1072,33 +1072,33 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckBlindPeers(harness::Ctx& ctx) {
-  auto [c, task_id] = readTask(ctx);
-  json rows = rowsOf(ctx, readGet(c, task_id, "t1", "ana"));
-  ctx.Equal(field(rows["ana"], "labels"), json{{"i-1", "cat"}, {"i-2", "dog"}, {"i-3", "cat"}}, "ana's own row must carry her three labels");
+  auto [c, task_id] = hReadTask(ctx);
+  json rows = hRowsOf(ctx, hReadGet(c, task_id, "t1", "ana"));
+  ctx.Equal(hField(rows["ana"], "labels"), json{{"i-1", "cat"}, {"i-2", "dog"}, {"i-3", "cat"}}, "ana's own row must carry her three labels");
   for (const auto& [name, row] : rows.items()) {
     if (name == "ana") continue;
-    ctx.Assert(field(row, "labels").is_null(), "ana can read %s's answers %s: before she labels an item she can copy them, and agreement measures copying. A peer's row has labels null", name, field(row, "labels").dump());
+    ctx.Assert(hField(row, "labels").is_null(), "ana can read %s's answers %s: before she labels an item she can copy them, and agreement measures copying. A peer's row has labels null", name, hField(row, "labels").dump());
   }
-  rows = rowsOf(ctx, readGet(c, task_id, "t1", "bo"));
-  ctx.Equal(field(rows["bo"], "labels"), json{{"i-1", "cat"}, {"i-2", "cat"}, {"i-3", "cat"}}, "asking as bo, bo's own labels");
-  ctx.Assert(field(rows["ana"], "labels").is_null(), "asking as bo, ana's labels are %s: the caller sees only their own", field(rows["ana"], "labels").dump());
-  ctx.Equal(field(rows["ana"], "submitted"), json(3), "a peer's row must still count what they submitted; ana's submitted");
-  const json anonymous = rowsOf(ctx, c.Get("/v1/tasks/" + task_id + "/progress", "X-Tenant-Id", "t1"));
+  rows = hRowsOf(ctx, hReadGet(c, task_id, "t1", "bo"));
+  ctx.Equal(hField(rows["bo"], "labels"), json{{"i-1", "cat"}, {"i-2", "cat"}, {"i-3", "cat"}}, "asking as bo, bo's own labels");
+  ctx.Assert(hField(rows["ana"], "labels").is_null(), "asking as bo, ana's labels are %s: the caller sees only their own", hField(rows["ana"], "labels").dump());
+  ctx.Equal(hField(rows["ana"], "submitted"), json(3), "a peer's row must still count what they submitted; ana's submitted");
+  const json anonymous = hRowsOf(ctx, c.Get("/v1/tasks/" + task_id + "/progress", "X-Tenant-Id", "t1"));
   ctx.Equal(anonymous.size(), 4, "a read without X-Annotator-Id must still list every annotator; the rows");
   for (const auto& [name, row] : anonymous.items()) {
-    ctx.Assert(field(row, "labels").is_null(), "a read without X-Annotator-Id is nobody's: it showed %s's labels %s, expected labels null on every row", name, field(row, "labels").dump());
+    ctx.Assert(hField(row, "labels").is_null(), "a read without X-Annotator-Id is nobody's: it showed %s's labels %s, expected labels null on every row", name, hField(row, "labels").dump());
   }
 }
 
 void CheckFlaggedExcluded(harness::Ctx& ctx) {
-  auto [c, task_id] = readTask(ctx);
-  const auto r = readGet(c, task_id);
+  auto [c, task_id] = hReadTask(ctx);
+  const auto r = hReadGet(c, task_id);
   const json body = json::parse(r.Text(), nullptr, false);
-  json rows = rowsOf(ctx, r);
-  ctx.Equal(field(rows["spam"], "excluded"), json(true), "spam is flagged by quality review: its row's excluded");
-  for (const std::string name : {"ana", "bo", "cy"}) ctx.Equal(field(rows[name], "excluded"), json(false), "only spam is flagged: %s's excluded", name);
-  ctx.Equal(field(body, "agreement"), json(0.889), "without the flagged annotator ana, bo and cy agree on i-1 and i-3 and 2 of 3 on i-2, which is 0.889; the flagged annotator must not count. agreement");
-  ctx.Equal(field(body, "completed"), json(2), "only i-1 and i-2 have three labels from annotators who count (overlap 3); completed");
+  json rows = hRowsOf(ctx, r);
+  ctx.Equal(hField(rows["spam"], "excluded"), json(true), "spam is flagged by quality review: its row's excluded");
+  for (const std::string name : {"ana", "bo", "cy"}) ctx.Equal(hField(rows[name], "excluded"), json(false), "only spam is flagged: %s's excluded", name);
+  ctx.Equal(hField(body, "agreement"), json(0.889), "without the flagged annotator ana, bo and cy agree on i-1 and i-3 and 2 of 3 on i-2, which is 0.889; the flagged annotator must not count. agreement");
+  ctx.Equal(hField(body, "completed"), json(2), "only i-1 and i-2 have three labels from annotators who count (overlap 3); completed");
   // Overlap 2, labeled by ana and the flagged spam only: no item has two labels that count.
   const std::string lone = store::createTask("t1", "2026-10", 2, {"a fox", "a bird"}).task_id;
   const std::vector<std::tuple<std::string, std::string, std::string>> loneLabels = {{"i-1", "cat", "ana"}, {"i-2", "dog", "ana"}, {"i-1", "dog", "spam"}, {"i-2", "cat", "spam"}};
@@ -1107,8 +1107,8 @@ void CheckFlaggedExcluded(harness::Ctx& ctx) {
     store::saveLabel(store::Label{"m-" + std::to_string(++n), lone, item_id, annotator, "2026-10", value});
   }
   ctx.Redis.Do("SADD", "flagged:" + lone, "spam");
-  const json alone = json::parse(readGet(c, lone).Text(), nullptr, false);
-  ctx.Assert(alone.is_object() && alone.contains("agreement") && alone["agreement"].is_null() && field(alone, "completed") == json(0), "task %s has one label per item from annotators who count, and answered agreement %s, completed %s: expected agreement null and completed 0", lone, field(alone, "agreement").dump(), field(alone, "completed").dump());
+  const json alone = json::parse(hReadGet(c, lone).Text(), nullptr, false);
+  ctx.Assert(alone.is_object() && alone.contains("agreement") && alone["agreement"].is_null() && hField(alone, "completed") == json(0), "task %s has one label per item from annotators who count, and answered agreement %s, completed %s: expected agreement null and completed 0", lone, hField(alone, "agreement").dump(), hField(alone, "completed").dump());
 }
 `,
   },

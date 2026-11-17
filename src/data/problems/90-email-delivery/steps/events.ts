@@ -802,20 +802,20 @@ import (
 	"leetbuild/harness"
 )
 
-const topicName = "email.event"
+const kHTopicName = "email.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 // eventsRelay accepts every recipient but bounce@ (a hard bounce), blocked@ (on its own list) and
 // full@ (a soft bounce every time), noting how many events were on the topic at each call.
-type eventsRelay struct {
+type HEventsRelay struct {
 	pb.UnimplementedRelayServer
 	ctx          *harness.Ctx
 	eventsAtCall []int
 }
 
-func (p *eventsRelay) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.Delivery, error) {
-	p.eventsAtCall = append(p.eventsAtCall, len(p.ctx.Kafka.Records(topicName)))
+func (p *HEventsRelay) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.Delivery, error) {
+	p.eventsAtCall = append(p.eventsAtCall, len(p.ctx.Kafka.Records(kHTopicName)))
 	switch {
 	case strings.HasPrefix(req.GetRecipient(), "bounce@"):
 		return &pb.Delivery{Outcome: "hard_bounce", BounceCategory: "mailbox_unknown"}, nil
@@ -827,83 +827,83 @@ func (p *eventsRelay) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.
 	return &pb.Delivery{Outcome: "accepted"}, nil
 }
 
-func (p *eventsRelay) GetStatus(context.Context, *pb.StatusRequest) (*pb.Delivery, error) {
+func (p *HEventsRelay) GetStatus(context.Context, *pb.StatusRequest) (*pb.Delivery, error) {
 	return &pb.Delivery{Outcome: "unknown"}, nil
 }
 
-func serveEventsRelay(ctx *harness.Ctx) *eventsRelay {
-	peer := &eventsRelay{ctx: ctx}
+func hServeEventsRelay(ctx *harness.Ctx) *HEventsRelay {
+	peer := &HEventsRelay{ctx: ctx}
 	pb.RegisterRelayServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func dispatchTo(ctx *harness.Ctx, recipient, tenant string) map[string]any {
-	messageID := store.Enqueue(eventsBg, tenant, recipient, "welcome", "Welcome", map[string]string{"first_name": "Ana"})
-	event, err := dispatch(eventsBg, messageID)
+func hDispatchTo(ctx *harness.Ctx, recipient, tenant string) map[string]any {
+	messageID := store.Enqueue(hEventsBg, tenant, recipient, "welcome", "Welcome", map[string]string{"first_name": "Ana"})
+	event, err := dispatch(hEventsBg, messageID)
 	ctx.NoError(err, "dispatch(%s) failed", messageID)
 	return event
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
 func CheckRecipientKey(ctx *harness.Ctx) {
-	serveEventsRelay(ctx)
-	dispatchTo(ctx, "ana@example.com", "t-1")
-	dispatchTo(ctx, "ana@example.com", "t-2")
-	dispatchTo(ctx, "Ana@Example.com", "t-1")
-	records := ctx.Kafka.Records(topicName)
-	ctx.Equal(len(records), 3, "three dispatches, the records on %s", topicName)
+	hServeEventsRelay(ctx)
+	hDispatchTo(ctx, "ana@example.com", "t-1")
+	hDispatchTo(ctx, "ana@example.com", "t-2")
+	hDispatchTo(ctx, "Ana@Example.com", "t-1")
+	records := ctx.Kafka.Records(kHTopicName)
+	ctx.Equal(len(records), 3, "three dispatches, the records on %s", kHTopicName)
 	want := address.RecipientHash("ana@example.com")
-	ctx.Equal(ctx.Kafka.Keys(topicName), []string{want, want, want}, "one recipient's events must be keyed by the recipient hash (keyed by anything else, one recipient's lifecycle scatters across partitions); the keys")
+	ctx.Equal(ctx.Kafka.Keys(kHTopicName), []string{want, want, want}, "one recipient's events must be keyed by the recipient hash (keyed by anything else, one recipient's lifecycle scatters across partitions); the keys")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
 		"one recipient's events landed on partitions %d, %d, %d: a consumer can see bounced before accepted", records[0].Partition, records[1].Partition, records[2].Partition)
 }
 
 func CheckOutcomeAfterRelay(ctx *harness.Ctx) {
-	relay := serveEventsRelay(ctx)
-	dispatchTo(ctx, "bounce@example.com", "t-1")
+	relay := hServeEventsRelay(ctx)
+	hDispatchTo(ctx, "bounce@example.com", "t-1")
 	ctx.Equal(relay.eventsAtCall, []int{0}, "when the relay was called the topic already held an event: an event reported an outcome the relay had not given yet. Deliver, then publish; the events on the topic at the call")
-	records := ctx.Kafka.Records(topicName)
+	records := ctx.Kafka.Records(kHTopicName)
 	var types []string
 	for _, r := range records {
-		t, _ := payloadOf(ctx, r.Value)["type"].(string)
+		t, _ := hPayloadOf(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
 	ctx.Equal(types, []string{"email.bounced"}, "a message the relay hard-bounced must produce one email.bounced; the types")
-	ctx.Equal(payloadOf(ctx, records[0].Value)["bounce_category"], "mailbox_unknown", "the bounce event's bounce_category")
-	dispatchTo(ctx, "ana@example.com", "t-1")
-	dispatchTo(ctx, "blocked@example.com", "t-1")
-	dispatchTo(ctx, "full@example.com", "t-1")
+	ctx.Equal(hPayloadOf(ctx, records[0].Value)["bounce_category"], "mailbox_unknown", "the bounce event's bounce_category")
+	hDispatchTo(ctx, "ana@example.com", "t-1")
+	hDispatchTo(ctx, "blocked@example.com", "t-1")
+	hDispatchTo(ctx, "full@example.com", "t-1")
 	types = nil
-	for _, r := range ctx.Kafka.Records(topicName) {
-		t, _ := payloadOf(ctx, r.Value)["type"].(string)
+	for _, r := range ctx.Kafka.Records(kHTopicName) {
+		t, _ := hPayloadOf(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
 	ctx.Equal(types, []string{"email.bounced", "email.accepted", "email.suppressed", "email.deferred"}, "a bounced, an accepted, a suppressed and a deferred message must each publish their own type; the types on the topic")
 }
 
 func CheckHashedPayload(ctx *harness.Ctx) {
-	serveEventsRelay(ctx)
-	dispatchTo(ctx, "Ana@Lindqvist.example", "t-1")
-	record := ctx.Kafka.Records(topicName)[0]
+	hServeEventsRelay(ctx)
+	hDispatchTo(ctx, "Ana@Lindqvist.example", "t-1")
+	record := ctx.Kafka.Records(kHTopicName)[0]
 	text := string(record.Value)
 	ctx.Assert(!strings.Contains(strings.ToLower(text), "lindqvist"), "the event carries the address or its domain: %s. The topic is retained and every consumer reads it; carry recipient_hash alone", text)
-	p := payloadOf(ctx, record.Value)
+	p := hPayloadOf(ctx, record.Value)
 	ctx.Equal(p["recipient_hash"], address.RecipientHash("ana@lindqvist.example"), "recipient_hash must be the SHA-256 of the normalized address")
 	ctx.Assert(p["message_id"] != nil && p["tenant"] == "t-1", "the event must carry message_id and tenant, got %s", text)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	serveEventsRelay(ctx)
-	dispatchTo(ctx, "ana@example.com", "t-1")
-	ctx.Equal(len(ctx.Kafka.Records(topicName)), 1, "one dispatch, the records on the topic")
-	dispatchTo(ctx, "bo@example.com", "t-1")
-	lost := ctx.Kafka.Failover(topicName)
-	ctx.Equal(len(ctx.Kafka.Records(topicName)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	hServeEventsRelay(ctx)
+	hDispatchTo(ctx, "ana@example.com", "t-1")
+	ctx.Equal(len(ctx.Kafka.Records(kHTopicName)), 1, "one dispatch, the records on the topic")
+	hDispatchTo(ctx, "bo@example.com", "t-1")
+	lost := ctx.Kafka.Failover(kHTopicName)
+	ctx.Equal(len(ctx.Kafka.Records(kHTopicName)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -921,17 +921,17 @@ func CheckIdempotentProducer(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic = "email.event";
+const std::string kHTopic = "email.event";
 
 // Accepts every recipient but bounce@ (a hard bounce), blocked@ (on its own list) and full@ (a soft
 // bounce every time), noting how many events were on the topic at each call.
-class EventsRelay final : public smtprelay::Relay::Service {
+class HEventsRelay final : public smtprelay::Relay::Service {
  public:
   harness::Ctx* ctx = nullptr;
   std::vector<int> events_at_call;
 
   grpc::Status SendMail(grpc::ServerContext*, const smtprelay::SendMailRequest* req, smtprelay::Delivery* out) override {
-    events_at_call.push_back(static_cast<int>(ctx->Kafka.Records(kTopic).size()));
+    events_at_call.push_back(static_cast<int>(ctx->Kafka.Records(kHTopic).size()));
     if (req->recipient().rfind("bounce@", 0) == 0) {
       out->set_outcome("hard_bounce");
       out->set_bounce_category("mailbox_unknown");
@@ -952,16 +952,16 @@ class EventsRelay final : public smtprelay::Relay::Service {
   }
 };
 
-EventsRelay& serveEventsRelay(harness::Ctx& ctx) {
-  static EventsRelay* peer = nullptr;
+HEventsRelay& hServeEventsRelay(harness::Ctx& ctx) {
+  static HEventsRelay* peer = nullptr;
   delete peer;
-  peer = new EventsRelay;
+  peer = new HEventsRelay;
   peer->ctx = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-nlohmann::json dispatchTo(harness::Ctx& ctx, const std::string& recipient, const std::string& tenant) {
+nlohmann::json hDispatchTo(harness::Ctx& ctx, const std::string& recipient, const std::string& tenant) {
   const std::string message_id = mail::store::enqueue(tenant, recipient, "welcome", "Welcome", {{"first_name", "Ana"}});
   try {
     return dispatch(message_id);
@@ -970,66 +970,66 @@ nlohmann::json dispatchTo(harness::Ctx& ctx, const std::string& recipient, const
   }
 }
 
-nlohmann::json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+nlohmann::json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   const auto p = nlohmann::json::parse(record.Value.value_or(""), nullptr, false);
   ctx.Assert(p.is_object(), "the record's value is not JSON: %s", record.Value.value_or(""));
   return p;
 }
 
-std::vector<std::string> typesOn(harness::Ctx& ctx) {
+std::vector<std::string> hTypesOn(harness::Ctx& ctx) {
   std::vector<std::string> types;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) types.push_back(payloadOf(ctx, r).value("type", ""));
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) types.push_back(hPayloadOf(ctx, r).value("type", ""));
   return types;
 }
 
 }  // namespace
 
 void CheckRecipientKey(harness::Ctx& ctx) {
-  serveEventsRelay(ctx);
-  dispatchTo(ctx, "ana@example.com", "t-1");
-  dispatchTo(ctx, "ana@example.com", "t-2");
-  dispatchTo(ctx, "Ana@Example.com", "t-1");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three dispatches, the records on %s", kTopic);
+  hServeEventsRelay(ctx);
+  hDispatchTo(ctx, "ana@example.com", "t-1");
+  hDispatchTo(ctx, "ana@example.com", "t-2");
+  hDispatchTo(ctx, "Ana@Example.com", "t-1");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 3, "three dispatches, the records on %s", kHTopic);
   const std::string want = mail::address::recipientHash("ana@example.com");
-  ctx.Equal(ctx.Kafka.Keys(kTopic), std::vector<std::string>{want, want, want}, "one recipient's events must be keyed by the recipient hash (keyed by anything else, one recipient's lifecycle scatters across partitions); the keys");
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), std::vector<std::string>{want, want, want}, "one recipient's events must be keyed by the recipient hash (keyed by anything else, one recipient's lifecycle scatters across partitions); the keys");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "one recipient's events landed on partitions %d, %d, %d: a consumer can see bounced before accepted", records[0].Partition, records[1].Partition, records[2].Partition);
 }
 
 void CheckOutcomeAfterRelay(harness::Ctx& ctx) {
-  EventsRelay& relay = serveEventsRelay(ctx);
-  dispatchTo(ctx, "bounce@example.com", "t-1");
+  HEventsRelay& relay = hServeEventsRelay(ctx);
+  hDispatchTo(ctx, "bounce@example.com", "t-1");
   ctx.Equal(relay.events_at_call, std::vector<int>{0}, "when the relay was called the topic already held an event: an event reported an outcome the relay had not given yet. Deliver, then publish; the events on the topic at the call");
-  ctx.Equal(typesOn(ctx), std::vector<std::string>{"email.bounced"}, "a message the relay hard-bounced must produce one email.bounced; the types");
-  ctx.Equal(payloadOf(ctx, ctx.Kafka.Records(kTopic)[0]).value("bounce_category", ""), "mailbox_unknown", "the bounce event's bounce_category");
-  dispatchTo(ctx, "ana@example.com", "t-1");
-  dispatchTo(ctx, "blocked@example.com", "t-1");
-  dispatchTo(ctx, "full@example.com", "t-1");
-  ctx.Equal(typesOn(ctx), std::vector<std::string>{"email.bounced", "email.accepted", "email.suppressed", "email.deferred"},
+  ctx.Equal(hTypesOn(ctx), std::vector<std::string>{"email.bounced"}, "a message the relay hard-bounced must produce one email.bounced; the types");
+  ctx.Equal(hPayloadOf(ctx, ctx.Kafka.Records(kHTopic)[0]).value("bounce_category", ""), "mailbox_unknown", "the bounce event's bounce_category");
+  hDispatchTo(ctx, "ana@example.com", "t-1");
+  hDispatchTo(ctx, "blocked@example.com", "t-1");
+  hDispatchTo(ctx, "full@example.com", "t-1");
+  ctx.Equal(hTypesOn(ctx), std::vector<std::string>{"email.bounced", "email.accepted", "email.suppressed", "email.deferred"},
             "a bounced, an accepted, a suppressed and a deferred message must each publish their own type; the types on the topic");
 }
 
 void CheckHashedPayload(harness::Ctx& ctx) {
-  serveEventsRelay(ctx);
-  dispatchTo(ctx, "Ana@Lindqvist.example", "t-1");
-  const auto record = ctx.Kafka.Records(kTopic)[0];
+  hServeEventsRelay(ctx);
+  hDispatchTo(ctx, "Ana@Lindqvist.example", "t-1");
+  const auto record = ctx.Kafka.Records(kHTopic)[0];
   std::string lower = record.Value.value_or("");
   std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   ctx.Assert(lower.find("lindqvist") == std::string::npos, "the event carries the address or its domain: %s. The topic is retained and every consumer reads it; carry recipient_hash alone", record.Value.value_or(""));
-  const auto p = payloadOf(ctx, record);
+  const auto p = hPayloadOf(ctx, record);
   ctx.Equal(p.value("recipient_hash", ""), mail::address::recipientHash("ana@lindqvist.example"), "recipient_hash must be the SHA-256 of the normalized address");
   ctx.Assert(!p.value("message_id", "").empty() && p.value("tenant", "") == "t-1", "the event must carry message_id and tenant, got %s", p.dump());
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  serveEventsRelay(ctx);
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  dispatchTo(ctx, "ana@example.com", "t-1");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one dispatch whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
-  dispatchTo(ctx, "bo@example.com", "t-1");
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  hServeEventsRelay(ctx);
+  ctx.Kafka.LoseAcks(kHTopic, 1);
+  hDispatchTo(ctx, "ana@example.com", "t-1");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "one dispatch whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
+  hDispatchTo(ctx, "bo@example.com", "t-1");
+  const int lost = ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

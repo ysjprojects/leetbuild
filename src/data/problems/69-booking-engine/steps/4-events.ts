@@ -804,31 +804,31 @@ import (
 	"booking/store"
 )
 
-const eventsTopic = "booking.event"
+const kHEventsTopic = "booking.event"
 
-func eventsBooking(n int, resource string) *store.Booking {
+func hEventsBooking(n int, resource string) *store.Booking {
 	return &store.Booking{
 		BookingID: fmt.Sprintf("b-%d", n), Tenant: "t1", ResourceID: resource, Start: "2026-03-10T09:00:00Z", End: "2026-03-10T10:00:00Z",
 		HoldID: fmt.Sprintf("h-%d", n), IdempotencyKey: fmt.Sprintf("k-%d", n), State: "held",
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, b *store.Booking) bool {
+func hEventsPublish(ctx *harness.Ctx, b *store.Booking) bool {
 	ok, err := publishEvent(context.Background(), b, "created")
 	ctx.NoError(err, "publishEvent")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -836,20 +836,20 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckResourceKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsBooking(1, "r1"))
-	eventsPublish(ctx, eventsBooking(2, "r2"))
-	eventsPublish(ctx, eventsBooking(3, "r1"))
+	hEventsPublish(ctx, hEventsBooking(1, "r1"))
+	hEventsPublish(ctx, hEventsBooking(2, "r2"))
+	hEventsPublish(ctx, hEventsBooking(3, "r1"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishEvent calls must produce three records on booking.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the resource ids")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"r1", "r2", "r1"}, "the records must be keyed by the resource ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both r1 events must land on one partition, or a consumer sees one room's schedule out of order; the partitions")
 }
 
 func CheckEventPayload(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsBooking(1, "r1"))
+	hEventsPublish(ctx, hEventsBooking(1, "r1"))
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one publishEvent must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
@@ -859,50 +859,50 @@ func CheckEventPayload(ctx *harness.Ctx) {
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("booking:b-1", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsPublish(ctx, eventsBooking(1, "r1"))
+	probe := ctx.Redis.After("booking:b-1", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsPublish(ctx, hEventsBooking(1, "r1"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "publishEvent never committed the booking (no write to booking:b-1)")
 	ctx.Equal(probe.Result, 0, "when the booking was committed the topic already held records: an event for a booking nobody can read yet is a phantom. Commit first, then produce; the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the commit; the records")
 	// The store refuses the next commit (booking:b-2 holds a value of another type): no event may go out.
 	ctx.Redis.Set("booking:b-2", "not a booking")
-	records, rows := len(ctx.Kafka.Records(eventsTopic)), len(eventsOutbox(ctx))
-	_, _ = publishEvent(context.Background(), eventsBooking(2, "r1"), "created") // the commit's error reaching the caller is fine
+	records, rows := len(ctx.Kafka.Records(kHEventsTopic)), len(hEventsOutbox(ctx))
+	_, _ = publishEvent(context.Background(), hEventsBooking(2, "r1"), "created") // the commit's error reaching the caller is fine
 	ctx.Settle()
-	produced, queued := len(ctx.Kafka.Records(eventsTopic))-records, len(eventsOutbox(ctx))-rows
+	produced, queued := len(ctx.Kafka.Records(kHEventsTopic))-records, len(hEventsOutbox(ctx))-rows
 	ctx.Assert(produced == 0 && queued == 0, "a booking whose commit failed still produced an event (%d record(s), %d outbox row(s)): produce only once the commit has succeeded", produced, queued)
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, eventsBooking(1, "r1"))
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, hEventsBooking(1, "r1"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, eventsBooking(2, "r1"))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, hEventsBooking(2, "r1"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ok := eventsPublish(ctx, eventsBooking(3, "r1"))
+	ok := hEventsPublish(ctx, hEventsBooking(3, "r1"))
 	ctx.Settle()
-	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered event returned %v and left the outbox %v, expected true and no row: only a failed or unacknowledged delivery goes to the outbox", ok, eventsOutbox(ctx))
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = eventsPublish(ctx, eventsBooking(1, "r1"))
+	ctx.Assert(ok && len(hEventsOutbox(ctx)) == 0, "a delivered event returned %v and left the outbox %v, expected true and no row: only a failed or unacknowledged delivery goes to the outbox", ok, hEventsOutbox(ctx))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hEventsPublish(ctx, hEventsBooking(1, "r1"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the booking vanishes from every downstream calendar; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "r1" && rows[0].Payload["booking_id"] == "b-1", "the outbox row is %v, expected the topic, the key r1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "r1" && rows[0].Payload["booking_id"] == "b-1", "the outbox row is %v, expected the topic, the key r1 and the payload", rows[0])
 	ctx.Equal(ok, false, "publishEvent's result after a failed delivery")
 	ctx.Equal(ctx.Redis.Exists("booking:b-1"), 1, "the booking must stay committed when only the produce failed")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, eventsBooking(2, "r1"))
+	ok = hEventsPublish(ctx, hEventsBooking(2, "r1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["booking_id"] == "b-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishEvent's result without an acknowledgement")
 }
@@ -916,14 +916,14 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "booking.event";
+const std::string kHEventsTopic = "booking.event";
 
-booking::Booking eventsBooking(int n, const std::string& resource = "r1") {
+booking::Booking hEventsBooking(int n, const std::string& resource = "r1") {
   return booking::Booking{"b-" + std::to_string(n), "t1", resource, "2026-03-10T09:00:00Z", "2026-03-10T10:00:00Z",
                           "h-" + std::to_string(n), "k-" + std::to_string(n), "held", ""};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -933,33 +933,33 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckResourceKey(harness::Ctx& ctx) {
-  publishEvent(eventsBooking(1, "r1"), "created");
-  publishEvent(eventsBooking(2, "r2"), "created");
-  publishEvent(eventsBooking(3, "r1"), "created");
+  publishEvent(hEventsBooking(1, "r1"), "created");
+  publishEvent(hEventsBooking(2, "r2"), "created");
+  publishEvent(hEventsBooking(3, "r1"), "created");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishEvent calls must produce three records on booking.event; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the resource ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"r1", "r2", "r1"}, "the records must be keyed by the resource ids");
   ctx.Equal(records[0].Partition, records[2].Partition,
             "both r1 events must land on one partition, or a consumer sees one room's schedule out of order; the partitions");
 }
 
 void CheckEventPayload(harness::Ctx& ctx) {
-  publishEvent(eventsBooking(1), "created");
+  publishEvent(hEventsBooking(1), "created");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one publishEvent must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(eventsField(value, "type") == "created" && eventsField(value, "booking_id") == "b-1" && eventsField(value, "resource_id") == "r1",
+  ctx.Assert(hEventsField(value, "type") == "created" && hEventsField(value, "booking_id") == "b-1" && hEventsField(value, "resource_id") == "r1",
              "the payload is %s, expected type, booking_id and resource_id", values[0]);
-  ctx.Equal(eventsField(value, "hold_id"), "h-1", "the payload's hold_id (a consumer cannot match the event to the hold it saw without it)");
+  ctx.Equal(hEventsField(value, "hold_id"), "h-1", "the payload's hold_id (a consumer cannot match the event to the hold it saw without it)");
   ctx.Equal(value.is_object() && value.contains("range") ? value["range"] : nlohmann::json(),
             nlohmann::json{{"start", "2026-03-10T09:00:00Z"}, {"end", "2026-03-10T10:00:00Z"}}, "the payload's range");
 }
@@ -969,27 +969,27 @@ void CheckPublishAfterCommit(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("booking:b-1", [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kEventsTopic).size();
+    atCommit = ctx.Kafka.Records(kHEventsTopic).size();
   });
-  publishEvent(eventsBooking(1), "created");
+  publishEvent(hEventsBooking(1), "created");
   ctx.Settle();
   ctx.Assert(fired, "publishEvent never committed the booking (no write to booking:b-1)");
   ctx.Equal(atCommit, 0,
             "when the booking was committed the topic already held records: an event for a booking nobody can read yet is a "
             "phantom. Commit first, then produce; the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
   // The store refuses the next commit (booking:b-2 holds a value of another type): no event may go out.
   ctx.Redis.Do("SET", "booking:b-2", "not a booking");
-  const size_t records = ctx.Kafka.Records(kEventsTopic).size();
-  const size_t rows = eventsOutbox(ctx).size();
+  const size_t records = ctx.Kafka.Records(kHEventsTopic).size();
+  const size_t rows = hEventsOutbox(ctx).size();
   try {
-    publishEvent(eventsBooking(2), "created");
+    publishEvent(hEventsBooking(2), "created");
   } catch (const std::exception&) {
     // the commit's error reaching the caller is fine
   }
   ctx.Settle();
-  const size_t produced = ctx.Kafka.Records(kEventsTopic).size() - records;
-  const size_t queued = eventsOutbox(ctx).size() - rows;
+  const size_t produced = ctx.Kafka.Records(kHEventsTopic).size() - records;
+  const size_t queued = hEventsOutbox(ctx).size() - rows;
   ctx.Assert(produced == 0 && queued == 0,
              "a booking whose commit failed still produced an event (%d record(s), %d outbox row(s)): produce only once the "
              "commit has succeeded",
@@ -997,42 +997,42 @@ void CheckPublishAfterCommit(harness::Ctx& ctx) {
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishEvent(eventsBooking(1), "created");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishEvent(hEventsBooking(1), "created");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishEvent(eventsBooking(2), "created");
+  publishEvent(hEventsBooking(2), "created");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2,
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2,
             "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  bool ok = publishEvent(eventsBooking(3), "created");
+  bool ok = publishEvent(hEventsBooking(3), "created");
   ctx.Settle();
-  ctx.Assert(ok && eventsOutbox(ctx).empty(),
+  ctx.Assert(ok && hEventsOutbox(ctx).empty(),
              "a delivered event returned %v and left %d outbox rows, expected true and no row: only a failed or "
              "unacknowledged delivery goes to the outbox",
-             ok, eventsOutbox(ctx).size());
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publishEvent(eventsBooking(1), "created");
+             ok, hEventsOutbox(ctx).size());
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishEvent(hEventsBooking(1), "created");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the booking vanishes from every downstream calendar; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "r1" &&
-                 rows[0].contains("payload") && eventsField(rows[0]["payload"], "booking_id") == "b-1",
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "r1" &&
+                 rows[0].contains("payload") && hEventsField(rows[0]["payload"], "booking_id") == "b-1",
              "the outbox row is %s, expected the topic, the key r1 and the payload", rows[0].dump());
   ctx.Equal(ok, false, "publishEvent's result after a failed delivery");
   ctx.Equal(ctx.Redis.Exists("booking:b-1"), 1, "the booking must stay committed when only the produce failed");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishEvent(eventsBooking(2), "created");
+  ok = publishEvent(hEventsBooking(2), "created");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "booking_id") == "b-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "booking_id") == "b-2",
              "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishEvent's result without an acknowledgement");
 }

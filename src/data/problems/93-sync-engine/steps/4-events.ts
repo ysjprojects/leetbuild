@@ -735,33 +735,33 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "sync.change"
+const kHEventsTopic = "sync.change"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-type eventsEvent struct {
+type HEventsEvent struct {
 	DocID       string \`json:"doc_id"\`
 	Revision    int64  \`json:"revision"\`
 	ContentHash string \`json:"content_hash"\`
 	Device      string \`json:"device"\`
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string      \`json:"topic"\`
 	Key     string      \`json:"key"\`
-	Payload eventsEvent \`json:"payload"\`
+	Payload HEventsEvent \`json:"payload"\`
 }
 
-func eventsPublish(ctx *harness.Ctx, docID string, base int64, body, device string) map[string]any {
-	event, err := applyAndPublish(eventsBg, docID, base, store.ContentHash(body), body, device)
+func hEventsPublish(ctx *harness.Ctx, docID string, base int64, body, device string) map[string]any {
+	event, err := applyAndPublish(hEventsBg, docID, base, store.ContentHash(body), body, device)
 	ctx.NoError(err, "applyAndPublish(%s, %d) failed", docID, base)
 	return event
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -769,79 +769,79 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckDocKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, "d-1", 0, "groceries", "laptop")
-	eventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
-	eventsPublish(ctx, "d-1", 1, "groceries: milk", "phone")
+	hEventsPublish(ctx, "d-1", 0, "groceries", "laptop")
+	hEventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
+	hEventsPublish(ctx, "d-1", 1, "groceries: milk", "phone")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three applies must produce three records on sync.change; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"d-1", "d-2", "d-1"}, "the records must be keyed by the document ids (keyed by device, one document's revisions land on two partitions and a consumer applies them out of order)")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"d-1", "d-2", "d-1"}, "the records must be keyed by the document ids (keyed by device, one document's revisions land on two partitions and a consumer applies them out of order)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both d-1 events must land on one partition; the partitions")
 }
 
 func CheckEventPayload(ctx *harness.Ctx) {
 	// Another device's note takes revision 1 first, so d-1's revision is not its base plus one.
-	_, err := revisions.ApplyChange(eventsBg, "d-9", 0, store.ContentHash("packing list"), "packing list", "phone")
+	_, err := revisions.ApplyChange(hEventsBg, "d-9", 0, store.ContentHash("packing list"), "packing list", "phone")
 	ctx.NoError(err, "seeding d-9")
-	event := eventsPublish(ctx, "d-1", 0, "salary review: draft", "laptop")
+	event := hEventsPublish(ctx, "d-1", 0, "salary review: draft", "laptop")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one apply must produce one record; the records")
-	var value eventsEvent
+	var value HEventsEvent
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
-	head := store.Head(eventsBg, "d-1")
-	ctx.Equal(value, eventsEvent{DocID: "d-1", Revision: head.Revision, ContentHash: head.ContentHash, Device: "laptop"}, "the event must carry doc_id, the applied revision, its content_hash and the device")
+	head := store.Head(hEventsBg, "d-1")
+	ctx.Equal(value, HEventsEvent{DocID: "d-1", Revision: head.Revision, ContentHash: head.ContentHash, Device: "laptop"}, "the event must carry doc_id, the applied revision, its content_hash and the device")
 	ctx.Assert(!strings.Contains(values[0], "body") && !strings.Contains(values[0], "salary review"), "the event carries the document's text: %s. The topic is retained and read by every consumer; send the revision and the hash, the body stays in the store", values[0])
 	answered, _ := json.Marshal(event)
-	var back eventsEvent
+	var back HEventsEvent
 	json.Unmarshal(answered, &back)
 	ctx.Equal(back, value, "applyAndPublish must answer the event it produced")
 }
 
 func CheckApplyBeforeProduce(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("doc:d-1", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	eventsPublish(ctx, "d-1", 0, "draft agenda", "laptop")
+	probe := ctx.Redis.After("doc:d-1", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hEventsPublish(ctx, "d-1", 0, "draft agenda", "laptop")
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "applyAndPublish never applied the change (no command touched doc:d-1)")
 	ctx.Equal(probe.Result, 0, "when the change was applied the topic already held records: an event for a revision that may never exist. Apply first, then produce; the records at apply time")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the apply; the records")
-	stale := eventsPublish(ctx, "d-1", 0, "agenda: offsite", "phone")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the apply; the records")
+	stale := hEventsPublish(ctx, "d-1", 0, "agenda: offsite", "phone")
 	ctx.Settle()
 	ctx.Assert(stale == nil, "an edit of a stale base is a conflict and must answer nil, got %v", stale)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a conflict must not produce an event; the records")
-	head := store.Head(eventsBg, "d-1")
-	echo := eventsPublish(ctx, "d-1", head.Revision, "draft agenda", "phone")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "a conflict must not produce an event; the records")
+	head := store.Head(hEventsBg, "d-1")
+	echo := hEventsPublish(ctx, "d-1", head.Revision, "draft agenda", "phone")
 	ctx.Settle()
 	ctx.Assert(echo == nil, "a push of the body d-1 already holds is unchanged and must answer nil, got %v", echo)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "an unchanged body must not produce an event (every device would fetch a revision that is not new); the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "an unchanged body must not produce an event (every device would fetch a revision that is not new); the records")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, "d-1", 0, "draft agenda", "laptop")
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, "d-1", 0, "draft agenda", "laptop")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	event := eventsPublish(ctx, "d-1", 0, "packing list", "laptop")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	event := hEventsPublish(ctx, "d-1", 0, "packing list", "laptop")
 	ctx.Settle()
-	head := store.Head(eventsBg, "d-1")
+	head := store.Head(hEventsBg, "d-1")
 	ctx.Assert(head != nil && event != nil, "the change must stay applied and be answered when only the produce failed, got %v", event)
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker rejected the record: without an outbox row no other device hears of the revision; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "d-1" && rows[0].Payload.Revision == head.Revision, "the outbox row is %+v, expected the topic, the key d-1 and the event", rows[0])
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "d-1" && rows[0].Payload.Revision == head.Revision, "the outbox row is %+v, expected the topic, the key d-1 and the event", rows[0])
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	eventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
+	hEventsPublish(ctx, "d-2", 0, "call the plumber", "laptop")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "applyAndPublish waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == "d-2", "no delivery report within the window and the outbox holds %+v", rows)
 }
 `,
@@ -858,13 +858,13 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "sync.change";
+const std::string kHEventsTopic = "sync.change";
 
-std::optional<nlohmann::json> eventsPublish(const std::string& doc_id, long long base, const std::string& body, const std::string& device = "laptop") {
+std::optional<nlohmann::json> hEventsPublish(const std::string& doc_id, long long base, const std::string& body, const std::string& device = "laptop") {
   return applyAndPublish(doc_id, base, store::contentHash(body), body, device);
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -874,24 +874,24 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsText(const nlohmann::json& j, const std::string& field) {
+std::string hEventsText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
-long long eventsNumber(const nlohmann::json& j, const std::string& field) {
+long long hEventsNumber(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_number() ? j[field].get<long long>() : -1;
 }
 
 }  // namespace
 
 void CheckDocKey(harness::Ctx& ctx) {
-  eventsPublish("d-1", 0, "groceries", "laptop");
-  eventsPublish("d-2", 0, "call the plumber", "laptop");
-  eventsPublish("d-1", 1, "groceries: milk", "phone");
+  hEventsPublish("d-1", 0, "groceries", "laptop");
+  hEventsPublish("d-2", 0, "call the plumber", "laptop");
+  hEventsPublish("d-1", 1, "groceries: milk", "phone");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), size_t{3}, "three applies must produce three records on sync.change; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"d-1", "d-2", "d-1"},
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"d-1", "d-2", "d-1"},
             "the records must be keyed by the document ids (keyed by device, one document's revisions land on two partitions and a consumer applies them out of order)");
   ctx.Equal(records[0].Partition, records[2].Partition, "both d-1 events must land on one partition; the partitions");
 }
@@ -899,14 +899,14 @@ void CheckDocKey(harness::Ctx& ctx) {
 void CheckEventPayload(harness::Ctx& ctx) {
   // Another device's note takes revision 1 first, so d-1's revision is not its base plus one.
   revisions::applyChange("d-9", 0, store::contentHash("packing list"), "packing list", "phone");
-  const auto event = eventsPublish("d-1", 0, "salary review: draft", "laptop");
+  const auto event = hEventsPublish("d-1", 0, "salary review: draft", "laptop");
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), size_t{1}, "one apply must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   const auto head = store::head("d-1");
-  ctx.Assert(eventsText(value, "doc_id") == "d-1" && eventsNumber(value, "revision") == head->revision && eventsText(value, "content_hash") == head->content_hash &&
-                 eventsText(value, "device") == "laptop",
+  ctx.Assert(hEventsText(value, "doc_id") == "d-1" && hEventsNumber(value, "revision") == head->revision && hEventsText(value, "content_hash") == head->content_hash &&
+                 hEventsText(value, "device") == "laptop",
              "the event is %s, expected doc_id, the applied revision %d, its content_hash and the device", values[0], head->revision);
   ctx.Assert(values[0].find("body") == std::string::npos && values[0].find("salary review") == std::string::npos,
              "the event carries the document's text: %s. The topic is retained and read by every consumer; send the revision and the hash, the body stays in the store", values[0]);
@@ -918,53 +918,53 @@ void CheckApplyBeforeProduce(harness::Ctx& ctx) {
   bool fired = false;
   ctx.Redis.After("doc:d-1", [&] {
     fired = true;
-    atApply = ctx.Kafka.Records(kEventsTopic).size();
+    atApply = ctx.Kafka.Records(kHEventsTopic).size();
   });
-  eventsPublish("d-1", 0, "draft agenda");
+  hEventsPublish("d-1", 0, "draft agenda");
   ctx.Settle();
   ctx.Assert(fired, "applyAndPublish never applied the change (no command touched doc:d-1)");
   ctx.Equal(atApply, size_t{0}, "when the change was applied the topic already held records: an event for a revision that may never exist. Apply first, then produce; the records at apply time");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{1}, "the event must still be produced after the apply; the records");
-  const auto stale = eventsPublish("d-1", 0, "agenda: offsite", "phone");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), size_t{1}, "the event must still be produced after the apply; the records");
+  const auto stale = hEventsPublish("d-1", 0, "agenda: offsite", "phone");
   ctx.Settle();
   ctx.Assert(!stale, "an edit of a stale base is a conflict and must answer nothing, got %s", stale ? stale->dump() : "");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{1}, "a conflict must not produce an event; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), size_t{1}, "a conflict must not produce an event; the records");
   const auto head = store::head("d-1");
-  const auto echo = eventsPublish("d-1", head->revision, "draft agenda", "phone");
+  const auto echo = hEventsPublish("d-1", head->revision, "draft agenda", "phone");
   ctx.Settle();
   ctx.Assert(!echo, "a push of the body d-1 already holds is unchanged and must answer nothing, got %s", echo ? echo->dump() : "");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{1}, "an unchanged body must not produce an event (every device would fetch a revision that is not new); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), size_t{1}, "an unchanged body must not produce an event (every device would fetch a revision that is not new); the records");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  eventsPublish("d-1", 0, "draft agenda");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hEventsPublish("d-1", 0, "draft agenda");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{1}, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  eventsPublish("d-2", 0, "call the plumber");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), size_t{1}, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  hEventsPublish("d-2", 0, "call the plumber");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), size_t{2}, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), size_t{2}, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const auto event = eventsPublish("d-1", 0, "packing list");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const auto event = hEventsPublish("d-1", 0, "packing list");
   ctx.Settle();
   const auto head = store::head("d-1");
   ctx.Assert(head.has_value() && event.has_value(), "the change must stay applied and be answered when only the produce failed");
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), size_t{1}, "the broker rejected the record: without an outbox row no other device hears of the revision; the rows");
-  ctx.Assert(eventsText(rows[0], "topic") == kEventsTopic && eventsText(rows[0], "key") == "d-1" && rows[0].contains("payload") &&
-                 eventsNumber(rows[0]["payload"], "revision") == head->revision,
+  ctx.Assert(hEventsText(rows[0], "topic") == kHEventsTopic && hEventsText(rows[0], "key") == "d-1" && rows[0].contains("payload") &&
+                 hEventsNumber(rows[0]["payload"], "revision") == head->revision,
              "the outbox row is %s, expected the topic, the key d-1 and the event", rows[0].dump());
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  eventsPublish("d-2", 0, "call the plumber");
+  hEventsPublish("d-2", 0, "call the plumber");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "applyAndPublish waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && eventsText(rows[1], "key") == "d-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hEventsText(rows[1], "key") == "d-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
 }
 `,
   },

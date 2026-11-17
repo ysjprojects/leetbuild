@@ -628,91 +628,91 @@ import (
 	"leetbuild/harness"
 )
 
-const stateClaim = "triage:dedupe:acme:h-1"
+const kHStateClaim = "triage:dedupe:acme:h-1"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func mustAdmit(ctx *harness.Ctx, tenant, queue, hash string) Admission {
-	a, err := admit(stateBg, tenant, queue, hash)
+func hMustAdmit(ctx *harness.Ctx, tenant, queue, hash string) Admission {
+	a, err := admit(hStateBg, tenant, queue, hash)
 	ctx.NoError(err, "admit(%s, %s, %s) failed", tenant, queue, hash)
 	return a
 }
 
-func counterKey(ctx *harness.Ctx, tenant, queue string) string {
+func hCounterKey(ctx *harness.Ctx, tenant, queue string) string {
 	keys := ctx.Redis.Keys("admit:" + tenant + ":" + queue + ":*")
 	ctx.Assert(len(keys) == 1, "expected one counter for %s/%s in this minute, Redis holds %q", tenant, queue, keys)
 	return keys[0]
 }
 
 // alignMinute moves the clock to one second into a minute, so a burst of admissions shares one window.
-func alignMinute(ctx *harness.Ctx) {
+func hAlignMinute(ctx *harness.Ctx) {
 	ctx.Clock.Advance(float64(61 - (ctx.Clock.Now()/1000)%60))
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
 	claimTTL := int64(-2)
-	rival := ctx.Redis.After(stateClaim, func() any {
-		claimTTL = ctx.Redis.TTL(stateClaim)
-		return mustAdmit(ctx, "acme", "billing", "h-1")
+	rival := ctx.Redis.After(kHStateClaim, func() any {
+		claimTTL = ctx.Redis.TTL(kHStateClaim)
+		return hMustAdmit(ctx, "acme", "billing", "h-1")
 	})
-	first := mustAdmit(ctx, "acme", "billing", "h-1")
-	ctx.Assert(rival.Fired, "admit never touched %s: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}", stateClaim)
+	first := hMustAdmit(ctx, "acme", "billing", "h-1")
+	ctx.Assert(rival.Fired, "admit never touched %s: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}", kHStateClaim)
 	ctx.Assert(rival.Err == nil, "the second delivery failed: %v", rival.Err)
 	other, _ := rival.Result.(Admission)
 	got := map[string]int{first.Status: 1}
 	got[other.Status]++
-	ctx.Assert(got["admitted"] == 1 && got["duplicate"] == 1, "a second delivery of h-1 landed right after admit first touched %s and the two got %s and %s: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script", stateClaim, first.Status, other.Status)
-	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-1").Status, "duplicate", "a third delivery of h-1")
-	ctx.Assert(claimTTL != -1, "right after admit first wrote %s the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good", stateClaim)
-	ttl := ctx.Redis.TTL(stateClaim)
-	ctx.Assert(86400-60 <= ttl && ttl <= 86400, "%s expires in %d s, expected DEDUPE_TTL_S (a day)", stateClaim, ttl)
+	ctx.Assert(got["admitted"] == 1 && got["duplicate"] == 1, "a second delivery of h-1 landed right after admit first touched %s and the two got %s and %s: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script", kHStateClaim, first.Status, other.Status)
+	ctx.Equal(hMustAdmit(ctx, "acme", "billing", "h-1").Status, "duplicate", "a third delivery of h-1")
+	ctx.Assert(claimTTL != -1, "right after admit first wrote %s the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good", kHStateClaim)
+	ttl := ctx.Redis.TTL(kHStateClaim)
+	ctx.Assert(86400-60 <= ttl && ttl <= 86400, "%s expires in %d s, expected DEDUPE_TTL_S (a day)", kHStateClaim, ttl)
 }
 
 func CheckWindowExpiry(ctx *harness.Ctx) {
-	alignMinute(ctx)
+	hAlignMinute(ctx)
 	opened := fmt.Sprintf("admit:acme:billing:%d", ctx.Clock.Now()/1000/60)
 	firstTTL := ctx.Redis.After(opened, func() any { return ctx.Redis.TTL(opened) })
-	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-1").Status, "admitted", "a fresh ticket in an empty queue")
+	ctx.Equal(hMustAdmit(ctx, "acme", "billing", "h-1").Status, "admitted", "a fresh ticket in an empty queue")
 	ctx.Assert(!firstTTL.Fired || firstTTL.Result != int64(-1), "right after admit first wrote %s the counter had no TTL: EXPIRE it in the script that creates it, or a crash in between leaves the key for good", opened)
-	counter := counterKey(ctx, "acme", "billing")
+	counter := hCounterKey(ctx, "acme", "billing")
 	ttl := ctx.Redis.TTL(counter)
 	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its window (EXPIRE on its first write), or every minute leaves a key behind for good", counter, ttl)
 	ctx.Clock.Advance(61)
 	ctx.Equal(ctx.Redis.Exists(counter), int64(0), "%s must be gone a minute after its window closed", counter)
-	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-2").Status, "admitted", "a ticket in the next minute")
+	ctx.Equal(hMustAdmit(ctx, "acme", "billing", "h-2").Status, "admitted", "a ticket in the next minute")
 }
 
 func CheckDuplicatesFree(ctx *harness.Ctx) {
-	alignMinute(ctx)
+	hAlignMinute(ctx)
 	var statuses []string
 	var last Admission
 	for i := 0; i < 3; i++ {
-		last = mustAdmit(ctx, "acme", "billing", "h-1")
+		last = hMustAdmit(ctx, "acme", "billing", "h-1")
 		statuses = append(statuses, last.Status)
 	}
 	ctx.Equal(statuses, []string{"admitted", "duplicate", "duplicate"}, "one ticket delivered three times")
-	used, _ := ctx.Redis.Get(counterKey(ctx, "acme", "billing"))
+	used, _ := ctx.Redis.Get(hCounterKey(ctx, "acme", "billing"))
 	ctx.Equal(used, "1", "one ticket delivered three times must use one slot of the queue's minute (a duplicate must not count against the cap); the counter")
 	ctx.Equal(last.Remaining, queueCap-1, "after one admitted ticket, the slots left")
-	ctx.Equal(mustAdmit(ctx, "globex", "billing", "h-1").Status, "admitted", "the claim is per tenant: globex's ticket with the same hash")
+	ctx.Equal(hMustAdmit(ctx, "globex", "billing", "h-1").Status, "admitted", "the claim is per tenant: globex's ticket with the same hash")
 }
 
 func CheckFullReleasesClaim(ctx *harness.Ctx) {
-	alignMinute(ctx)
+	hAlignMinute(ctx)
 	for i := 0; i < queueCap; i++ {
-		ctx.Equal(mustAdmit(ctx, "acme", "billing", fmt.Sprintf("h-%d", i)).Status, "admitted", "ticket %d of %d", i+1, queueCap)
+		ctx.Equal(hMustAdmit(ctx, "acme", "billing", fmt.Sprintf("h-%d", i)).Status, "admitted", "ticket %d of %d", i+1, queueCap)
 		if i == 0 {
 			ctx.Clock.Advance(30) // the minute's first ticket opened the window 30 s before the queue filled
 		}
 	}
-	late := mustAdmit(ctx, "acme", "billing", "h-late")
+	late := hMustAdmit(ctx, "acme", "billing", "h-late")
 	ctx.Equal(late.Status, "full", "ticket %d in one minute", queueCap+1)
 	ctx.Equal(ctx.Redis.Exists("triage:dedupe:acme:h-late"), int64(0), "the full queue refused h-late and must not claim it (its retry next minute would be dropped as a duplicate: answer full before claiming); the claim")
-	used, _ := ctx.Redis.Get(counterKey(ctx, "acme", "billing"))
+	used, _ := ctx.Redis.Get(hCounterKey(ctx, "acme", "billing"))
 	ctx.Equal(used, strconv.Itoa(queueCap), "a refused ticket must not take a slot; the counter")
 	ctx.Assert(late.RetryAfter > 0 && late.RetryAfter <= 31, "the refusal says retry after %d s, but the minute's counter was opened 30 s earlier and expires in about 30 s: retry_after is the counter's TTL, set once on its first write", late.RetryAfter)
 	ctx.Clock.Advance(float64(late.RetryAfter + 1))
-	ctx.Equal(mustAdmit(ctx, "acme", "billing", "h-late").Status, "admitted", "h-late came back after retry_after")
+	ctx.Equal(hMustAdmit(ctx, "acme", "billing", "h-late").Status, "admitted", "h-late came back after retry_after")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -724,46 +724,46 @@ func CheckFullReleasesClaim(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kClaim = "triage:dedupe:acme:h-1";
+const std::string kHClaim = "triage:dedupe:acme:h-1";
 
-std::string counterKey(harness::Ctx& ctx, const std::string& tenant, const std::string& queue) {
+std::string hCounterKey(harness::Ctx& ctx, const std::string& tenant, const std::string& queue) {
   const auto keys = ctx.Redis.Keys("admit:" + tenant + ":" + queue + ":*");
   ctx.Assert(keys.size() == 1, "expected one counter for %s/%s in this minute, Redis holds %q", tenant, queue, keys);
   return keys[0];
 }
 
 // Move the clock to one second into a minute, so a burst of admissions shares one window.
-void alignMinute(harness::Ctx& ctx) { ctx.Clock.Advance(static_cast<double>(61 - (ctx.Clock.Now() / 1000) % 60)); }
+void hAlignMinute(harness::Ctx& ctx) { ctx.Clock.Advance(static_cast<double>(61 - (ctx.Clock.Now() / 1000) % 60)); }
 
 }  // namespace
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   auto rival = std::make_shared<std::optional<Admission>>();
   auto claimTtl = std::make_shared<long long>(-2);
-  ctx.Redis.After(kClaim, [&ctx, rival, claimTtl] {
-    *claimTtl = ctx.Redis.TTL(kClaim);
+  ctx.Redis.After(kHClaim, [&ctx, rival, claimTtl] {
+    *claimTtl = ctx.Redis.TTL(kHClaim);
     *rival = admit("acme", "billing", "h-1");
   });
   const Admission first = admit("acme", "billing", "h-1");
-  ctx.Assert(rival->has_value(), "admit never touched %s: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}", kClaim);
+  ctx.Assert(rival->has_value(), "admit never touched %s: claim the ticket under triage:dedupe:{tenant}:{ticket_hash}", kHClaim);
   const std::string other = (*rival)->status;
   ctx.Assert((first.status == "admitted" && other == "duplicate") || (first.status == "duplicate" && other == "admitted"),
              "a second delivery of h-1 landed right after admit first touched %s and the two got %s and %s: exactly one may be admitted, or the ticket is classified twice. Check and claim in one script",
-             kClaim, first.status, other);
+             kHClaim, first.status, other);
   ctx.Equal(admit("acme", "billing", "h-1").status, "duplicate", "a third delivery of h-1");
-  ctx.Assert(*claimTtl != -1, "right after admit first wrote %s the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good", kClaim);
-  const long long ttl = ctx.Redis.TTL(kClaim);
-  ctx.Assert(86400 - 60 <= ttl && ttl <= 86400, "%s expires in %d s, expected kDedupeTtlSeconds (a day)", kClaim, ttl);
+  ctx.Assert(*claimTtl != -1, "right after admit first wrote %s the claim had no TTL: write it with its expiry in the same command (SET NX EX), or a crash before a later EXPIRE keeps the ticket a duplicate for good", kHClaim);
+  const long long ttl = ctx.Redis.TTL(kHClaim);
+  ctx.Assert(86400 - 60 <= ttl && ttl <= 86400, "%s expires in %d s, expected kDedupeTtlSeconds (a day)", kHClaim, ttl);
 }
 
 void CheckWindowExpiry(harness::Ctx& ctx) {
-  alignMinute(ctx);
+  hAlignMinute(ctx);
   const std::string opened = "admit:acme:billing:" + std::to_string(ctx.Clock.Now() / 1000 / 60);
   auto firstTtl = std::make_shared<long long>(-2);
   ctx.Redis.After(opened, [&ctx, opened, firstTtl] { *firstTtl = ctx.Redis.TTL(opened); });
   ctx.Equal(admit("acme", "billing", "h-1").status, "admitted", "a fresh ticket in an empty queue");
   ctx.Assert(*firstTtl != -1, "right after admit first wrote %s the counter had no TTL: EXPIRE it in the script that creates it, or a crash in between leaves the key for good", opened);
-  const std::string counter = counterKey(ctx, "acme", "billing");
+  const std::string counter = hCounterKey(ctx, "acme", "billing");
   const long long ttl = ctx.Redis.TTL(counter);
   ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its window (EXPIRE on its first write), or every minute leaves a key behind for good", counter, ttl);
   ctx.Clock.Advance(61);
@@ -772,7 +772,7 @@ void CheckWindowExpiry(harness::Ctx& ctx) {
 }
 
 void CheckDuplicatesFree(harness::Ctx& ctx) {
-  alignMinute(ctx);
+  hAlignMinute(ctx);
   std::vector<std::string> statuses;
   Admission last;
   for (int i = 0; i < 3; ++i) {
@@ -780,14 +780,14 @@ void CheckDuplicatesFree(harness::Ctx& ctx) {
     statuses.push_back(last.status);
   }
   ctx.Equal(statuses, {"admitted", "duplicate", "duplicate"}, "one ticket delivered three times");
-  ctx.Equal(ctx.Redis.Get(counterKey(ctx, "acme", "billing")), std::optional<std::string>("1"),
+  ctx.Equal(ctx.Redis.Get(hCounterKey(ctx, "acme", "billing")), std::optional<std::string>("1"),
             "one ticket delivered three times must use one slot of the queue's minute (a duplicate must not count against the cap); the counter");
   ctx.Equal(last.remaining, kQueueCap - 1, "after one admitted ticket, the slots left");
   ctx.Equal(admit("globex", "billing", "h-1").status, "admitted", "the claim is per tenant: globex's ticket with the same hash");
 }
 
 void CheckFullReleasesClaim(harness::Ctx& ctx) {
-  alignMinute(ctx);
+  hAlignMinute(ctx);
   for (long long i = 0; i < kQueueCap; ++i) {
     ctx.Equal(admit("acme", "billing", "h-" + std::to_string(i)).status, "admitted", "ticket %d of %d", i + 1, kQueueCap);
     if (i == 0) ctx.Clock.Advance(30);  // the minute's first ticket opened the window 30 s before the queue filled
@@ -795,7 +795,7 @@ void CheckFullReleasesClaim(harness::Ctx& ctx) {
   const Admission late = admit("acme", "billing", "h-late");
   ctx.Equal(late.status, "full", "ticket %d in one minute", kQueueCap + 1);
   ctx.Equal(ctx.Redis.Exists("triage:dedupe:acme:h-late"), 0, "the full queue refused h-late and must not claim it (its retry next minute would be dropped as a duplicate: answer full before claiming); the claim");
-  ctx.Equal(ctx.Redis.Get(counterKey(ctx, "acme", "billing")), std::optional<std::string>(std::to_string(kQueueCap)), "a refused ticket must not take a slot; the counter");
+  ctx.Equal(ctx.Redis.Get(hCounterKey(ctx, "acme", "billing")), std::optional<std::string>(std::to_string(kQueueCap)), "a refused ticket must not take a slot; the counter");
   ctx.Assert(late.retry_after > 0 && late.retry_after <= 31, "the refusal says retry after %d s, but the minute's counter was opened 30 s earlier and expires in about 30 s: retry_after is the counter's TTL, set once on its first write", late.retry_after);
   ctx.Clock.Advance(static_cast<double>(late.retry_after + 1));
   ctx.Equal(admit("acme", "billing", "h-late").status, "admitted", "h-late came back after retry_after");

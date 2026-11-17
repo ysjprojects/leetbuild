@@ -720,16 +720,16 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // modelPeer labels every item "cat", except: refuse:… is INVALID_ARGUMENT, down:… is UNAVAILABLE,
 // flaky:… is UNAVAILABLE on its first call.
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedPrelabelServer
 	seen map[string]int
 }
 
-func (m *modelPeer) Predict(_ context.Context, req *pb.PredictRequest) (*pb.PredictResponse, error) {
+func (m *HModelPeer) Predict(_ context.Context, req *pb.PredictRequest) (*pb.PredictResponse, error) {
 	m.seen[req.GetItemId()]++
 	text := req.GetText()
 	if strings.HasPrefix(text, "refuse:") {
@@ -741,11 +741,11 @@ func (m *modelPeer) Predict(_ context.Context, req *pb.PredictRequest) (*pb.Pred
 	return &pb.PredictResponse{Labels: []string{"cat"}, ModelVersion: "m-7"}, nil
 }
 
-func serveModel(ctx *harness.Ctx) {
-	pb.RegisterPrelabelServer(ctx.GRPC.Server(""), &modelPeer{seen: map[string]int{}})
+func hServeModel(ctx *harness.Ctx) {
+	pb.RegisterPrelabelServer(ctx.GRPC.Server(""), &HModelPeer{seen: map[string]int{}})
 }
 
-func callsFor(ctx *harness.Ctx, itemID string) int {
+func hCallsFor(ctx *harness.Ctx, itemID string) int {
 	n := 0
 	for _, c := range ctx.GRPC.CallsTo("Predict", "") {
 		if c.Request.(*pb.PredictRequest).GetItemId() == itemID {
@@ -756,8 +756,8 @@ func callsFor(ctx *harness.Ctx, itemID string) int {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveModel(ctx)
-	prelabelItem(clientBg, "i-1", "a cat on a mat", "2026-10")
+	hServeModel(ctx)
+	prelabelItem(hClientBg, "i-1", "a cat on a mat", "2026-10")
 	calls := ctx.GRPC.CallsTo("Predict", "")
 	ctx.Assert(len(calls) > 0, "no Predict call reached the model")
 	for _, call := range calls {
@@ -766,7 +766,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	// A slow model fails i-3 after 1.5 s: the second attempt gets a full deadline of its own, not what is left of the first.
 	ctx.GRPC.SetLatency("Predict", 1.5, "")
-	slow, err := prelabelItem(clientBg, "i-3", "flaky: a bird", "2026-10")
+	slow, err := prelabelItem(hClientBg, "i-3", "flaky: a bird", "2026-10")
 	var timeouts []time.Duration
 	for _, call := range ctx.GRPC.CallsTo("Predict", "") {
 		if call.Request.(*pb.PredictRequest).GetItemId() == "i-3" {
@@ -778,37 +778,37 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(err == nil && slow.Status == "prelabeled", "the second attempt for i-3 answers within its own 2 s deadline, prelabelItem answered %+v, %v", slow, err)
 	ctx.GRPC.SetLatency("Predict", 30.0, "")
 	before := ctx.Clock.Now()
-	prelabelItem(clientBg, "i-2", "a dog in the fog", "2026-10")
+	prelabelItem(hClientBg, "i-2", "a dog in the fog", "2026-10")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 4.5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited)
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
-	serveModel(ctx)
-	prelabelItem(clientBg, "i-1", "refuse: a cat", "2026-10")
-	ctx.Equal(callsFor(ctx, "i-1"), 1, "the model refused i-1 (INVALID_ARGUMENT): a refusal answers the same way every time, call once; the calls")
-	prelabelItem(clientBg, "i-2", "down: a dog", "2026-10")
-	ctx.Equal(callsFor(ctx, "i-2"), 2, "with the model UNAVAILABLE, the calls for i-2 (maxAttempts = 2)")
-	result, err := prelabelItem(clientBg, "i-3", "flaky: a bird", "2026-10")
-	ctx.Equal(callsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls")
+	hServeModel(ctx)
+	prelabelItem(hClientBg, "i-1", "refuse: a cat", "2026-10")
+	ctx.Equal(hCallsFor(ctx, "i-1"), 1, "the model refused i-1 (INVALID_ARGUMENT): a refusal answers the same way every time, call once; the calls")
+	prelabelItem(hClientBg, "i-2", "down: a dog", "2026-10")
+	ctx.Equal(hCallsFor(ctx, "i-2"), 2, "with the model UNAVAILABLE, the calls for i-2 (maxAttempts = 2)")
+	result, err := prelabelItem(hClientBg, "i-3", "flaky: a bird", "2026-10")
+	ctx.Equal(hCallsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls")
 	ctx.Assert(err == nil && result.Status == "prelabeled", "the second attempt for i-3 succeeded, prelabelItem answered %+v, %v", result, err)
 	ctx.GRPC.Fail("Predict", codes.DeadlineExceeded, "the model ran out of time", 1, "")
-	timedOut, err := prelabelItem(clientBg, "i-4", "a fox", "2026-10")
-	ctx.Assert(callsFor(ctx, "i-4") == 2 && err == nil && timedOut.Status == "prelabeled", "i-4 failed DEADLINE_EXCEEDED once and was sent %d times, answering %+v, %v: a timeout is retried once", callsFor(ctx, "i-4"), timedOut, err)
+	timedOut, err := prelabelItem(hClientBg, "i-4", "a fox", "2026-10")
+	ctx.Assert(hCallsFor(ctx, "i-4") == 2 && err == nil && timedOut.Status == "prelabeled", "i-4 failed DEADLINE_EXCEEDED once and was sent %d times, answering %+v, %v: a timeout is retried once", hCallsFor(ctx, "i-4"), timedOut, err)
 	terminal := []codes.Code{codes.NotFound, codes.PermissionDenied, codes.ResourceExhausted, codes.FailedPrecondition, codes.Internal}
 	for n, code := range terminal {
 		itemID := fmt.Sprintf("i-%d", n+5)
 		ctx.GRPC.Fail("Predict", code, "the model said no", 1, "")
-		prelabelItem(clientBg, itemID, "a fox", "2026-10")
-		ctx.Equal(callsFor(ctx, itemID), 1, "the model failed %s with %v: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final; the calls", itemID, code)
+		prelabelItem(hClientBg, itemID, "a fox", "2026-10")
+		ctx.Equal(hCallsFor(ctx, itemID), 1, "the model failed %s with %v: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final; the calls", itemID, code)
 	}
 }
 
 func CheckDegradeUnlabeled(ctx *harness.Ctx) {
-	serveModel(ctx)
+	hServeModel(ctx)
 	cases := [][4]string{{"i-1", "down: a dog", "UNAVAILABLE", "the model is restarting"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT", "the item is outside the label spec"}}
 	for _, tc := range cases {
-		result, err := prelabelItem(clientBg, tc[0], tc[1], "2026-10")
+		result, err := prelabelItem(hClientBg, tc[0], tc[1], "2026-10")
 		ctx.Assert(err == nil, "with the model failing %s, prelabelItem returned the error %v. Answer an unlabeled item so the annotator labels it by hand", tc[2], err)
 		ctx.Assert(result.Status == "unlabeled" && len(result.Labels) == 0, "a failed pre-label answered %+v, expected status unlabeled with no labels", result)
 		ctx.Equal(result.Error, tc[2]+": "+tc[3], "the unlabeled item's error must be the last status and its details")
@@ -816,9 +816,9 @@ func CheckDegradeUnlabeled(ctx *harness.Ctx) {
 	}
 	// The first attempt is UNAVAILABLE, the second a refusal: the error names the last status.
 	ctx.GRPC.Fail("Predict", codes.Unavailable, "the model is restarting", 1, "")
-	last, err := prelabelItem(clientBg, "i-4", "refuse: a bird", "2026-10")
+	last, err := prelabelItem(hClientBg, "i-4", "refuse: a bird", "2026-10")
 	ctx.Assert(err == nil && last.Error == "INVALID_ARGUMENT: the item is outside the label spec", "i-4 failed UNAVAILABLE, then INVALID_ARGUMENT: prelabelItem answered %+v, %v, expected the last status in error", last, err)
-	ok, err := prelabelItem(clientBg, "i-3", "a cat on a mat", "2026-10")
+	ok, err := prelabelItem(hClientBg, "i-3", "a cat on a mat", "2026-10")
 	ctx.Assert(err == nil && ok.Status == "prelabeled" && len(ok.Labels) == 1 && ok.Labels[0] == "cat", "a healthy model's answer must come back prelabeled with its labels, got %+v, %v", ok, err)
 }
 `,
@@ -832,7 +832,7 @@ namespace {
 
 // Labels every item "cat", except: refuse:… is INVALID_ARGUMENT, down:… is UNAVAILABLE, flaky:… is
 // UNAVAILABLE on its first call.
-class ModelPeer final : public labeld::Prelabel::Service {
+class HModelPeer final : public labeld::Prelabel::Service {
  public:
   std::map<std::string, int> seen;
   grpc::Status Predict(grpc::ServerContext*, const labeld::PredictRequest* req, labeld::PredictResponse* out) override {
@@ -848,20 +848,20 @@ class ModelPeer final : public labeld::Prelabel::Service {
   }
 };
 
-void serveModel(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+void hServeModel(harness::Ctx& ctx) {
+  static HModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer;
+  peer = new HModelPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
 // What prelabelItem answered, or what it threw.
-struct Outcome {
+struct HOutcome {
   std::optional<Prelabel> result;
   std::string thrown;
 };
 
-Outcome call(const std::string& item_id, const std::string& text) {
+HOutcome hCall(const std::string& item_id, const std::string& text) {
   try {
     return {prelabelItem(item_id, text, "2026-10"), ""};
   } catch (const std::exception& e) {
@@ -869,7 +869,7 @@ Outcome call(const std::string& item_id, const std::string& text) {
   }
 }
 
-int callsFor(harness::Ctx& ctx, const std::string& item_id) {
+int hCallsFor(harness::Ctx& ctx, const std::string& item_id) {
   int n = 0;
   for (const auto& c : ctx.GRPC.CallsTo("Predict")) {
     if (c.Request<labeld::PredictRequest>().item_id() == item_id) n++;
@@ -880,8 +880,8 @@ int callsFor(harness::Ctx& ctx, const std::string& item_id) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveModel(ctx);
-  call("i-1", "a cat on a mat");
+  hServeModel(ctx);
+  hCall("i-1", "a cat on a mat");
   const auto calls = ctx.GRPC.CallsTo("Predict");
   ctx.Assert(!calls.empty(), "no Predict call reached the model");
   for (const auto& c : calls) {
@@ -890,7 +890,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   // A slow model fails i-3 after 1.5 s: the second attempt gets a full deadline of its own, not what is left of the first.
   ctx.GRPC.SetLatency("Predict", 1.5);
-  const Outcome slow = call("i-3", "flaky: a bird");
+  const HOutcome slow = hCall("i-3", "flaky: a bird");
   int slowCalls = 0;
   for (const auto& c : ctx.GRPC.CallsTo("Predict")) {
     if (c.Request<labeld::PredictRequest>().item_id() != "i-3") continue;
@@ -901,23 +901,23 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(slow.result && slow.result->status == "prelabeled", "the second attempt for i-3 answers within its own 2 s deadline, prelabelItem answered %s", slow.result ? slow.result->status : "an exception: " + slow.thrown);
   ctx.GRPC.SetLatency("Predict", 30.0);
   const int64_t before = ctx.Clock.Now();
-  call("i-2", "a dog in the fog");
+  hCall("i-2", "a dog in the fog");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 4.5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited);
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
-  serveModel(ctx);
-  call("i-1", "refuse: a cat");
-  ctx.Equal(callsFor(ctx, "i-1"), 1, "the model refused i-1 (INVALID_ARGUMENT): a refusal answers the same way every time, call once; the calls");
-  call("i-2", "down: a dog");
-  ctx.Equal(callsFor(ctx, "i-2"), 2, "with the model UNAVAILABLE, the calls for i-2 (kMaxAttempts = 2)");
-  const Outcome flaky = call("i-3", "flaky: a bird");
-  ctx.Equal(callsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls");
+  hServeModel(ctx);
+  hCall("i-1", "refuse: a cat");
+  ctx.Equal(hCallsFor(ctx, "i-1"), 1, "the model refused i-1 (INVALID_ARGUMENT): a refusal answers the same way every time, call once; the calls");
+  hCall("i-2", "down: a dog");
+  ctx.Equal(hCallsFor(ctx, "i-2"), 2, "with the model UNAVAILABLE, the calls for i-2 (kMaxAttempts = 2)");
+  const HOutcome flaky = hCall("i-3", "flaky: a bird");
+  ctx.Equal(hCallsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls");
   ctx.Assert(flaky.result && flaky.result->status == "prelabeled", "the second attempt for i-3 succeeded, prelabelItem answered %s", flaky.result ? flaky.result->status : "an exception: " + flaky.thrown);
   ctx.GRPC.Fail("Predict", grpc::StatusCode::DEADLINE_EXCEEDED, "the model ran out of time", 1);
-  const Outcome timedOut = call("i-4", "a fox");
-  ctx.Assert(callsFor(ctx, "i-4") == 2 && timedOut.result && timedOut.result->status == "prelabeled", "i-4 failed DEADLINE_EXCEEDED once and was sent %d times, answering %s: a timeout is retried once", callsFor(ctx, "i-4"), timedOut.result ? timedOut.result->status : "an exception: " + timedOut.thrown);
+  const HOutcome timedOut = hCall("i-4", "a fox");
+  ctx.Assert(hCallsFor(ctx, "i-4") == 2 && timedOut.result && timedOut.result->status == "prelabeled", "i-4 failed DEADLINE_EXCEEDED once and was sent %d times, answering %s: a timeout is retried once", hCallsFor(ctx, "i-4"), timedOut.result ? timedOut.result->status : "an exception: " + timedOut.thrown);
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
       {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
@@ -928,16 +928,16 @@ void CheckRetryTransient(harness::Ctx& ctx) {
   for (size_t n = 0; n < terminal.size(); n++) {
     const std::string item_id = "i-" + std::to_string(n + 5);
     ctx.GRPC.Fail("Predict", terminal[n].first, "the model said no", 1);
-    call(item_id, "a fox");
-    ctx.Equal(callsFor(ctx, item_id), 1, "the model failed %s with %s: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final; the calls", item_id, terminal[n].second);
+    hCall(item_id, "a fox");
+    ctx.Equal(hCallsFor(ctx, item_id), 1, "the model failed %s with %s: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final; the calls", item_id, terminal[n].second);
   }
 }
 
 void CheckDegradeUnlabeled(harness::Ctx& ctx) {
-  serveModel(ctx);
+  hServeModel(ctx);
   const std::vector<std::vector<std::string>> cases = {{"i-1", "down: a dog", "UNAVAILABLE", "the model is restarting"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT", "the item is outside the label spec"}};
   for (const auto& tc : cases) {
-    const Outcome o = call(tc[0], tc[1]);
+    const HOutcome o = hCall(tc[0], tc[1]);
     ctx.Assert(o.result.has_value(), "with the model failing %s, prelabelItem threw: %s. Answer an unlabeled item so the annotator labels it by hand", tc[2], o.thrown);
     ctx.Assert(o.result->status == "unlabeled" && o.result->labels.empty(), "a failed pre-label answered status %q with %d labels, expected status unlabeled with no labels", o.result->status, o.result->labels.size());
     ctx.Equal(o.result->error, tc[2] + ": " + tc[3], "the unlabeled item's error must be the last status and its details");
@@ -945,9 +945,9 @@ void CheckDegradeUnlabeled(harness::Ctx& ctx) {
   }
   // The first attempt is UNAVAILABLE, the second a refusal: the error names the last status.
   ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "the model is restarting", 1);
-  const Outcome last = call("i-4", "refuse: a bird");
+  const HOutcome last = hCall("i-4", "refuse: a bird");
   ctx.Assert(last.result && last.result->error == "INVALID_ARGUMENT: the item is outside the label spec", "i-4 failed UNAVAILABLE, then INVALID_ARGUMENT: prelabelItem answered the error %q, expected the last status in error", last.result ? last.result->error : "an exception: " + last.thrown);
-  const Outcome ok = call("i-3", "a cat on a mat");
+  const HOutcome ok = hCall("i-3", "a cat on a mat");
   ctx.Assert(ok.result && ok.result->status == "prelabeled" && ok.result->labels == std::vector<std::string>{"cat"}, "a healthy model's answer must come back prelabeled with its labels, got %s", ok.result ? ok.result->status : "an exception: " + ok.thrown);
 }
 `,

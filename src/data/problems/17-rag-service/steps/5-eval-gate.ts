@@ -1055,13 +1055,13 @@ import (
 )
 
 const (
-	evalSamples = "eval.samples"
-	evalMetrics = "eval.metrics"
+	kHEvalSamples = "eval.samples"
+	kHEvalMetrics = "eval.metrics"
 )
 
-func evalSeed(ctx *harness.Ctx, release string, n, ungrounded int, recall float64) {
+func hEvalSeed(ctx *harness.Ctx, release string, n, ungrounded int, recall float64) {
 	for i := 0; i < n; i++ {
-		ctx.Kafka.Seed(evalSamples, release, map[string]any{
+		ctx.Kafka.Seed(kHEvalSamples, release, map[string]any{
 			"release":       release,
 			"sample_id":     fmt.Sprintf("%s-%03d", release, i),
 			"grounded":      i >= ungrounded,
@@ -1073,16 +1073,16 @@ func evalSeed(ctx *harness.Ctx, release string, n, ungrounded int, recall float6
 	}
 }
 
-func evalRun(ctx *harness.Ctx) {
+func hEvalRun(ctx *harness.Ctx) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	ctx.Drain(func() { _ = run(runCtx) })
 	cancel()
 	ctx.Settle()
 }
 
-func evalVerdicts(ctx *harness.Ctx) []map[string]any {
+func hEvalVerdicts(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, v := range ctx.Kafka.Values(evalMetrics) {
+	for _, v := range ctx.Kafka.Values(kHEvalMetrics) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "a verdict is JSON: %s", v)
 		out = append(out, e)
@@ -1090,15 +1090,15 @@ func evalVerdicts(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func evalCount(ctx *harness.Ctx, release string) int {
+func hEvalCount(ctx *harness.Ctx, release string) int {
 	raw, _ := ctx.Redis.HGet("rag:eval:"+release, "samples")
 	n, _ := strconv.Atoi(raw)
 	return n
 }
 
-func evalVerdictsOf(ctx *harness.Ctx, release string) []map[string]any {
+func hEvalVerdictsOf(ctx *harness.Ctx, release string) []map[string]any {
 	var out []map[string]any
-	for _, v := range evalVerdicts(ctx) {
+	for _, v := range hEvalVerdicts(ctx) {
 		if v["release"] == release {
 			out = append(out, v)
 		}
@@ -1107,50 +1107,50 @@ func evalVerdictsOf(ctx *harness.Ctx, release string) []map[string]any {
 }
 
 func CheckConsumerGroup(ctx *harness.Ctx) {
-	evalSeed(ctx, "r1", 3, 0, 0.95)
-	evalRun(ctx)
+	hEvalSeed(ctx, "r1", 3, 0, 0.95)
+	hEvalRun(ctx)
 	subs := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subs) > 0, "the gate never subscribed to a topic")
 	last := subs[len(subs)-1]
 	ctx.Equal(last.Group, "rag-eval", "the gate's group (rag-eval owns this stream's offsets and the dashboards read it; another id starts counting from scratch)")
-	ctx.Assert(slices.Contains(last.Topics, evalSamples), "the gate must subscribe to %s, got %v", evalSamples, last.Topics)
-	ctx.Equal(ctx.Kafka.Lag("rag-eval", evalSamples), int64(0), "samples left uncommitted in rag-eval")
-	ctx.Equal(evalCount(ctx, "r1"), 3, "three samples consumed; rag:eval:r1 counts")
+	ctx.Assert(slices.Contains(last.Topics, kHEvalSamples), "the gate must subscribe to %s, got %v", kHEvalSamples, last.Topics)
+	ctx.Equal(ctx.Kafka.Lag("rag-eval", kHEvalSamples), int64(0), "samples left uncommitted in rag-eval")
+	ctx.Equal(hEvalCount(ctx, "r1"), 3, "three samples consumed; rag:eval:r1 counts")
 }
 
 func CheckCommitAfterStore(ctx *harness.Ctx) {
-	evalSeed(ctx, "r1", 5, 0, 0.95)
+	hEvalSeed(ctx, "r1", 5, 0, 0.95)
 	type snapshot struct{ committed, counted int64 }
 	var seen []snapshot
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		var committed int64
 		for tp, offset := range offsets {
-			if tp.Topic == evalSamples {
+			if tp.Topic == kHEvalSamples {
 				committed += offset
 			}
 		}
-		seen = append(seen, snapshot{committed, int64(evalCount(ctx, "r1"))})
+		seen = append(seen, snapshot{committed, int64(hEvalCount(ctx, "r1"))})
 	})
-	evalRun(ctx)
+	hEvalRun(ctx)
 	ctx.Assert(len(seen) > 0, "no offset was ever committed")
 	for _, s := range seen {
 		ctx.Assert(s.committed <= s.counted, "an offset covering %d samples was committed while rag:eval:r1 counted %d: a crash right then loses the samples in between; commit after evalstore.Record", s.committed, s.counted)
 	}
-	evalSeed(ctx, "r2", 200, 0, 0.95)
-	ctx.Kafka.FailNext(evalMetrics, 1) // r2's verdict is not acknowledged
-	evalRun(ctx)
-	ctx.Assert(ctx.Kafka.Lag("rag-eval", evalSamples) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit")
-	evalRun(ctx) // the 200th sample, redelivered
-	r2 := evalVerdictsOf(ctx, "r2")
-	ctx.Assert(len(r2) == 1 && ctx.Kafka.Lag("rag-eval", evalSamples) == 0, "redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: %d verdicts, lag %d", len(r2), ctx.Kafka.Lag("rag-eval", evalSamples))
+	hEvalSeed(ctx, "r2", 200, 0, 0.95)
+	ctx.Kafka.FailNext(kHEvalMetrics, 1) // r2's verdict is not acknowledged
+	hEvalRun(ctx)
+	ctx.Assert(ctx.Kafka.Lag("rag-eval", kHEvalSamples) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit")
+	hEvalRun(ctx) // the 200th sample, redelivered
+	r2 := hEvalVerdictsOf(ctx, "r2")
+	ctx.Assert(len(r2) == 1 && ctx.Kafka.Lag("rag-eval", kHEvalSamples) == 0, "redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: %d verdicts, lag %d", len(r2), ctx.Kafka.Lag("rag-eval", kHEvalSamples))
 }
 
 func CheckMinSamples(ctx *harness.Ctx) {
-	evalSeed(ctx, "r1", 205, 0, 0.95)
-	evalSeed(ctx, "r2", 199, 0, 0.95)
-	evalRun(ctx)
+	hEvalSeed(ctx, "r1", 205, 0, 0.95)
+	hEvalSeed(ctx, "r2", 199, 0, 0.95)
+	hEvalRun(ctx)
 	var r1, r2 []map[string]any
-	for _, v := range evalVerdicts(ctx) {
+	for _, v := range hEvalVerdicts(ctx) {
 		switch fmt.Sprint(v["release"]) {
 		case "r1":
 			r1 = append(r1, v)
@@ -1165,12 +1165,12 @@ func CheckMinSamples(ctx *harness.Ctx) {
 
 func CheckReleaseThresholds(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "rag:eval:baseline", "release", "r0", "groundedness", "0.98")
-	evalSeed(ctx, "r1", 200, 4, 0.85) // groundedness 0.98, recall 0.85
-	evalSeed(ctx, "r2", 200, 8, 0.95) // groundedness 0.96: 0.02 under the baseline
-	evalSeed(ctx, "r3", 200, 2, 0.95) // groundedness 0.99
-	evalRun(ctx)
+	hEvalSeed(ctx, "r1", 200, 4, 0.85) // groundedness 0.98, recall 0.85
+	hEvalSeed(ctx, "r2", 200, 8, 0.95) // groundedness 0.96: 0.02 under the baseline
+	hEvalSeed(ctx, "r3", 200, 2, 0.95) // groundedness 0.99
+	hEvalRun(ctx)
 	final := map[string]string{}
-	for _, v := range evalVerdicts(ctx) {
+	for _, v := range hEvalVerdicts(ctx) {
 		if v["samples"] == float64(200) {
 			final[fmt.Sprint(v["release"])] = fmt.Sprint(v["verdict"])
 		}
@@ -1181,21 +1181,21 @@ func CheckReleaseThresholds(ctx *harness.Ctx) {
 	ctx.Equal(final["r3"], "pass", "r3 clears every bar (0.99, 0.95): its verdict")
 	release, _ := ctx.Redis.HGet("rag:eval:baseline", "release")
 	ctx.Equal(release, "r3", "a release that passes becomes the baseline")
-	evalSeed(ctx, "r4", 200, 3, 0.95) // groundedness 0.985: 0.005 under r3's 0.99
-	evalRun(ctx)
-	r4 := evalVerdictsOf(ctx, "r4")
+	hEvalSeed(ctx, "r4", 200, 3, 0.95) // groundedness 0.985: 0.005 under r3's 0.99
+	hEvalRun(ctx)
+	r4 := hEvalVerdictsOf(ctx, "r4")
 	ctx.Assert(len(r4) == 1 && r4[0]["verdict"] == "pass", "r4 is 0.005 under the baseline, within maxRegression = 0.01: it must pass, got %v", r4)
 	ctx.Redis.Do("DEL", "rag:eval:baseline")
-	evalSeed(ctx, "r5", 200, 10, 0.90) // exactly 0.95 and 0.90, no baseline
-	evalRun(ctx)
-	r5 := evalVerdictsOf(ctx, "r5")
+	hEvalSeed(ctx, "r5", 200, 10, 0.90) // exactly 0.95 and 0.90, no baseline
+	hEvalRun(ctx)
+	r5 := hEvalVerdictsOf(ctx, "r5")
 	ctx.Assert(len(r5) == 1 && r5[0]["verdict"] == "pass", "r5 sits exactly on the bars (groundedness 0.95, recall@k 0.90): only below them is a block, got %v", r5)
 }
 
 func CheckNoRawText(ctx *harness.Ctx) {
-	evalSeed(ctx, "r1", 200, 0, 0.95)
-	evalRun(ctx)
-	values := ctx.Kafka.Values(evalMetrics)
+	hEvalSeed(ctx, "r1", 200, 0, 0.95)
+	hEvalRun(ctx)
+	values := ctx.Kafka.Values(kHEvalMetrics)
 	ctx.Assert(len(values) > 0, "200 samples published no verdict")
 	for _, value := range values {
 		ctx.Assert(!strings.Contains(value, "refund window"), "a verdict carries question text: %.160s; eval.metrics is an analytics topic, ids and aggregates only", value)
@@ -1226,10 +1226,10 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kSamples = "eval.samples";
-const std::string kMetrics = "eval.metrics";
+const std::string kHSamples = "eval.samples";
+const std::string kHMetrics = "eval.metrics";
 
-void evalSeed(harness::Ctx& ctx, const std::string& release, int n, int ungrounded = 0, double recall = 0.95) {
+void hEvalSeed(harness::Ctx& ctx, const std::string& release, int n, int ungrounded = 0, double recall = 0.95) {
   for (int i = 0; i < n; i++) {
     char id[32];
     std::snprintf(id, sizeof id, "%s-%03d", release.c_str(), i);
@@ -1240,26 +1240,26 @@ void evalSeed(harness::Ctx& ctx, const std::string& release, int n, int unground
                          {"should_refuse", i % 10 == 0},
                          {"refused", i % 10 == 0},
                          {"question", "What is the refund window for order " + std::to_string(i) + "?"}};
-    ctx.Kafka.Seed(kSamples, release, sample);
+    ctx.Kafka.Seed(kHSamples, release, sample);
   }
 }
 
-void evalRun(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+void hEvalRun(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
 
-std::vector<json> evalVerdicts(harness::Ctx& ctx) {
+std::vector<json> hEvalVerdicts(harness::Ctx& ctx) {
   std::vector<json> out;
-  for (const auto& v : ctx.Kafka.Values(kMetrics)) out.push_back(json::parse(v, nullptr, false));
+  for (const auto& v : ctx.Kafka.Values(kHMetrics)) out.push_back(json::parse(v, nullptr, false));
   return out;
 }
 
-long long evalCount(harness::Ctx& ctx, const std::string& release) {
+long long hEvalCount(harness::Ctx& ctx, const std::string& release) {
   const auto raw = ctx.Redis.HGet("rag:eval:" + release, "samples");
   return raw ? std::stoll(*raw) : 0;
 }
 
-std::vector<json> evalVerdictsOf(harness::Ctx& ctx, const std::string& release) {
+std::vector<json> hEvalVerdictsOf(harness::Ctx& ctx, const std::string& release) {
   std::vector<json> out;
-  for (const auto& v : evalVerdicts(ctx))
+  for (const auto& v : hEvalVerdicts(ctx))
     if (v.is_object() && v.value("release", "") == release) out.push_back(v);
   return out;
 }
@@ -1267,49 +1267,49 @@ std::vector<json> evalVerdictsOf(harness::Ctx& ctx, const std::string& release) 
 }  // namespace
 
 void CheckConsumerGroup(harness::Ctx& ctx) {
-  evalSeed(ctx, "r1", 3);
-  evalRun(ctx);
+  hEvalSeed(ctx, "r1", 3);
+  hEvalRun(ctx);
   const auto subs = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subs.empty(), "the gate never subscribed to a topic");
   const auto& last = subs.back();
   ctx.Equal(last.Group, "rag-eval", "the gate's group (rag-eval owns this stream's offsets and the dashboards read it; another id starts counting from scratch)");
-  ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), kSamples) != last.Topics.end(), "the gate must subscribe to %s, got %v", kSamples, last.Topics);
-  ctx.Equal(ctx.Kafka.Lag("rag-eval", kSamples), 0, "samples left uncommitted in rag-eval");
-  ctx.Equal(evalCount(ctx, "r1"), 3, "three samples consumed; rag:eval:r1 counts");
+  ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), kHSamples) != last.Topics.end(), "the gate must subscribe to %s, got %v", kHSamples, last.Topics);
+  ctx.Equal(ctx.Kafka.Lag("rag-eval", kHSamples), 0, "samples left uncommitted in rag-eval");
+  ctx.Equal(hEvalCount(ctx, "r1"), 3, "three samples consumed; rag:eval:r1 counts");
 }
 
 void CheckCommitAfterStore(harness::Ctx& ctx) {
-  evalSeed(ctx, "r1", 5);
+  hEvalSeed(ctx, "r1", 5);
   std::vector<std::pair<long long, long long>> seen;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
     long long committed = 0;
     for (const auto& [tp, offset] : offsets)
-      if (tp.Topic == kSamples) committed += offset;
-    seen.push_back({committed, evalCount(ctx, "r1")});
+      if (tp.Topic == kHSamples) committed += offset;
+    seen.push_back({committed, hEvalCount(ctx, "r1")});
   });
-  evalRun(ctx);
+  hEvalRun(ctx);
   ctx.Assert(!seen.empty(), "no offset was ever committed");
   for (const auto& [committed, counted] : seen)
     ctx.Assert(committed <= counted, "an offset covering %d samples was committed while rag:eval:r1 counted %d: a crash right then loses the samples in between; commit after evalstore::record", committed, counted);
-  evalSeed(ctx, "r2", 200);
-  ctx.Kafka.FailNext(kMetrics, 1);  // r2's verdict is not acknowledged
+  hEvalSeed(ctx, "r2", 200);
+  ctx.Kafka.FailNext(kHMetrics, 1);  // r2's verdict is not acknowledged
   try {
-    evalRun(ctx);
+    hEvalRun(ctx);
   } catch (const std::exception&) {
     // the failure reaching run() is what is expected
   }
-  ctx.Assert(ctx.Kafka.Lag("rag-eval", kSamples) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit");
-  evalRun(ctx);  // the 200th sample, redelivered
-  const auto r2 = evalVerdictsOf(ctx, "r2");
-  ctx.Assert(r2.size() == 1 && ctx.Kafka.Lag("rag-eval", kSamples) == 0, "redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: %d verdicts, lag %d", r2.size(), ctx.Kafka.Lag("rag-eval", kSamples));
+  ctx.Assert(ctx.Kafka.Lag("rag-eval", kHSamples) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit");
+  hEvalRun(ctx);  // the 200th sample, redelivered
+  const auto r2 = hEvalVerdictsOf(ctx, "r2");
+  ctx.Assert(r2.size() == 1 && ctx.Kafka.Lag("rag-eval", kHSamples) == 0, "redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: %d verdicts, lag %d", r2.size(), ctx.Kafka.Lag("rag-eval", kHSamples));
 }
 
 void CheckMinSamples(harness::Ctx& ctx) {
-  evalSeed(ctx, "r1", 205);
-  evalSeed(ctx, "r2", 199);
-  evalRun(ctx);
+  hEvalSeed(ctx, "r1", 205);
+  hEvalSeed(ctx, "r2", 199);
+  hEvalRun(ctx);
   std::vector<json> r1, r2;
-  for (const auto& v : evalVerdicts(ctx)) {
+  for (const auto& v : hEvalVerdicts(ctx)) {
     if (v.value("release", "") == "r1") r1.push_back(v);
     if (v.value("release", "") == "r2") r2.push_back(v);
   }
@@ -1320,33 +1320,33 @@ void CheckMinSamples(harness::Ctx& ctx) {
 
 void CheckReleaseThresholds(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "rag:eval:baseline", "release", "r0", "groundedness", "0.98");
-  evalSeed(ctx, "r1", 200, 4, 0.85);  // groundedness 0.98, recall 0.85
-  evalSeed(ctx, "r2", 200, 8, 0.95);  // groundedness 0.96: 0.02 under the baseline
-  evalSeed(ctx, "r3", 200, 2, 0.95);  // groundedness 0.99
-  evalRun(ctx);
+  hEvalSeed(ctx, "r1", 200, 4, 0.85);  // groundedness 0.98, recall 0.85
+  hEvalSeed(ctx, "r2", 200, 8, 0.95);  // groundedness 0.96: 0.02 under the baseline
+  hEvalSeed(ctx, "r3", 200, 2, 0.95);  // groundedness 0.99
+  hEvalRun(ctx);
   std::map<std::string, std::string> final;
-  for (const auto& v : evalVerdicts(ctx))
+  for (const auto& v : hEvalVerdicts(ctx))
     if (v.value("samples", 0) == 200) final[v.value("release", "")] = v.value("verdict", "");
   ctx.Equal(final.size(), 3, "each release gets a verdict at 200 samples (%v); releases judged", final);
   ctx.Equal(final["r1"], "block", "r1's recall@k is 0.85, under 0.90: its verdict");
   ctx.Equal(final["r2"], "block", "r2's groundedness 0.96 is 0.02 under the last release that passed (0.98), a regression over 0.01: its verdict");
   ctx.Equal(final["r3"], "pass", "r3 clears every bar (0.99, 0.95): its verdict");
   ctx.Equal(ctx.Redis.HGet("rag:eval:baseline", "release").value_or(""), "r3", "a release that passes becomes the baseline");
-  evalSeed(ctx, "r4", 200, 3, 0.95);  // groundedness 0.985: 0.005 under r3's 0.99
-  evalRun(ctx);
-  const auto r4 = evalVerdictsOf(ctx, "r4");
+  hEvalSeed(ctx, "r4", 200, 3, 0.95);  // groundedness 0.985: 0.005 under r3's 0.99
+  hEvalRun(ctx);
+  const auto r4 = hEvalVerdictsOf(ctx, "r4");
   ctx.Assert(r4.size() == 1 && r4[0].value("verdict", "") == "pass", "r4 is 0.005 under the baseline, within kMaxRegression = 0.01: it must pass, got %v", r4);
   ctx.Redis.Do("DEL", "rag:eval:baseline");
-  evalSeed(ctx, "r5", 200, 10, 0.90);  // exactly 0.95 and 0.90, no baseline
-  evalRun(ctx);
-  const auto r5 = evalVerdictsOf(ctx, "r5");
+  hEvalSeed(ctx, "r5", 200, 10, 0.90);  // exactly 0.95 and 0.90, no baseline
+  hEvalRun(ctx);
+  const auto r5 = hEvalVerdictsOf(ctx, "r5");
   ctx.Assert(r5.size() == 1 && r5[0].value("verdict", "") == "pass", "r5 sits exactly on the bars (groundedness 0.95, recall@k 0.90): only below them is a block, got %v", r5);
 }
 
 void CheckNoRawText(harness::Ctx& ctx) {
-  evalSeed(ctx, "r1", 200);
-  evalRun(ctx);
-  const auto values = ctx.Kafka.Values(kMetrics);
+  hEvalSeed(ctx, "r1", 200);
+  hEvalRun(ctx);
+  const auto values = ctx.Kafka.Values(kHMetrics);
   ctx.Assert(!values.empty(), "200 samples published no verdict");
   for (const auto& value : values) {
     ctx.Assert(value.find("refund window") == std::string::npos, "a verdict carries question text: %s; eval.metrics is an analytics topic, ids and aggregates only", value.substr(0, 160));

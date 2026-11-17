@@ -1085,70 +1085,70 @@ import (
 )
 
 const (
-	eventsTopic  = "search.query"
-	eventsGroup  = "search-analytics"
-	eventsOutbox = "outbox:search.query"
+	kHEventsTopic  = "search.query"
+	kHEventsGroup  = "search-analytics"
+	kHEventsOutbox = "outbox:search.query"
 )
 
 var (
-	eventsBg    = context.Background()
-	eventsQuery = []float64{0.125, -0.5, 0.75, 0.0625}
-	eventsWire  = []string{"request_id", "tenant", "index_version", "k", "latency_ms", "query_digest"}
+	hEventsBg    = context.Background()
+	hEventsQuery = []float64{0.125, -0.5, 0.75, 0.0625}
+	hEventsWire  = []string{"request_id", "tenant", "index_version", "k", "latency_ms", "query_digest"}
 )
 
-func eventsPublish(tenant, requestID string) bool {
-	return publishSearchEvent(eventsBg, tenant, requestID, eventsQuery, 10, "idx-42", 12)
+func hEventsPublish(tenant, requestID string) bool {
+	return publishSearchEvent(hEventsBg, tenant, requestID, hEventsQuery, 10, "idx-42", 12)
 }
 
-func seededEvent(requestID string, latencyMs int, indexVersion string) string {
-	raw, _ := json.Marshal(map[string]any{"request_id": requestID, "tenant": "acme", "index_version": indexVersion, "k": 10, "latency_ms": latencyMs, "query_digest": fingerprint.QueryDigest(eventsQuery)})
+func hSeededEvent(requestID string, latencyMs int, indexVersion string) string {
+	raw, _ := json.Marshal(map[string]any{"request_id": requestID, "tenant": "acme", "index_version": indexVersion, "k": 10, "latency_ms": latencyMs, "query_digest": fingerprint.QueryDigest(hEventsQuery)})
 	return string(raw)
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
 	for _, in := range [][2]string{{"acme", "r-1"}, {"globex", "r-2"}, {"acme", "r-3"}} {
-		ctx.Equal(eventsPublish(in[0], in[1]), true, "publishSearchEvent on a healthy broker must report the event delivered")
+		ctx.Equal(hEventsPublish(in[0], in[1]), true, "publishSearchEvent on a healthy broker must report the event delivered")
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three searches must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"acme", "globex", "acme"}, "records must be keyed by the tenant")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three searches must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"acme", "globex", "acme"}, "records must be keyed by the tenant")
 	ctx.Equal(records[0].Partition, records[2].Partition, "acme's two events must land on one partition so they are read in order; acme's partitions")
 }
 
 func CheckNoVector(ctx *harness.Ctx) {
-	eventsPublish("acme", "r-1")
+	hEventsPublish("acme", "r-1")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one search must produce one record; the records")
 	text := string(records[0].Value)
 	var event map[string]any
 	ctx.NoError(json.Unmarshal(records[0].Value, &event), "the event must be JSON (%s)", text)
 	_, hasQuery := event["query"]
 	ctx.Assert(!hasQuery && !strings.Contains(text, "0.125") && !strings.Contains(text, "0.0625"), "the event carries the query vector: %s. The topic is retained and copied to every consumer; the digest is enough to group repeated queries", text)
-	for _, field := range eventsWire {
+	for _, field := range hEventsWire {
 		_, ok := event[field]
 		ctx.Assert(ok, "the event %s lacks %s", text, field)
 	}
-	ctx.Equal(event["query_digest"], fingerprint.QueryDigest(eventsQuery), "query_digest must be fingerprint.QueryDigest(query)")
+	ctx.Equal(event["query_digest"], fingerprint.QueryDigest(hEventsQuery), "query_digest must be fingerprint.QueryDigest(query)")
 	ctx.Assert(event["request_id"] == "r-1" && event["tenant"] == "acme" && event["k"] == float64(10) && event["index_version"] == "idx-42" && event["latency_ms"] == float64(12), "the event's fields must be the search's: %s", text)
 }
 
 func CheckDelivery(ctx *harness.Ctx) {
-	ctx.Equal(eventsPublish("acme", "r-1"), true, "publishSearchEvent on a healthy broker must report the event delivered")
+	ctx.Equal(hEventsPublish("acme", "r-1"), true, "publishSearchEvent on a healthy broker must report the event delivered")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one search must produce one record; the records")
-	lost := ctx.Kafka.Failover(eventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one search must produce one record; the records")
+	lost := ctx.Kafka.Failover(kHEventsTopic)
 	ctx.Equal(lost, 0, "a leader failover right after the write lost the record: it was acknowledged by the leader alone (RequiredAcks: kafka.RequireAll, a synchronous write); records lost")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after a leader failover the record must still be on the topic; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after a leader failover the record must still be on the topic; the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	delivered := eventsPublish("acme", "r-1")
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	delivered := hEventsPublish("acme", "r-1")
 	ctx.Settle()
-	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
-	ctx.Equal(len(rows), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", eventsOutbox, rows)
+	rows := ctx.Redis.LRange(kHEventsOutbox, 0, -1)
+	ctx.Equal(len(rows), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kHEventsOutbox, rows)
 	var row map[string]any
 	ctx.NoError(json.Unmarshal([]byte(rows[0]), &row), "the outbox row must be JSON (%s)", rows[0])
 	ctx.Equal(row["key"], "acme", "the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition (%s)", rows[0])
@@ -1160,26 +1160,26 @@ func CheckOutbox(ctx *harness.Ctx) {
 		payload = p
 	}
 	ctx.Assert(payload != nil && payload["request_id"] == "r-1", "the outbox row must carry the event payload: %s", rows[0])
-	ctx.Assert(!strings.Contains(rows[0], "0.125") && !strings.Contains(rows[0], "0.0625") && payload["query_digest"] == fingerprint.QueryDigest(eventsQuery), "the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: %s", rows[0])
+	ctx.Assert(!strings.Contains(rows[0], "0.125") && !strings.Contains(rows[0], "0.0625") && payload["query_digest"] == fingerprint.QueryDigest(hEventsQuery), "the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: %s", rows[0])
 	ctx.Equal(delivered, false, "publishSearchEvent must report a rejected event as not delivered")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
-	ctx.Equal(eventsPublish("globex", "r-2"), true, "once the broker answers again the event is delivered")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
+	ctx.Equal(hEventsPublish("globex", "r-2"), true, "once the broker answers again the event is delivered")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Redis.LRange(eventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
+	ctx.Equal(len(ctx.Redis.LRange(kHEventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
 }
 
 func CheckCommitAfterApply(ctx *harness.Ctx) {
-	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-1", 10, "idx-42"))
-	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-2", 30, "idx-42"))
+	ctx.Kafka.Seed(kHEventsTopic, "acme", hSeededEvent("r-1", 10, "idx-42"))
+	ctx.Kafka.Seed(kHEventsTopic, "acme", hSeededEvent("r-2", 30, "idx-42"))
 	// r-3's counters cannot be written (searchstats:acme:idx-43 holds a string): it is never counted.
 	ctx.Redis.Set("searchstats:acme:idx-43", "not a hash")
-	ctx.Kafka.Seed(eventsTopic, "acme", seededEvent("r-3", 50, "idx-43"))
+	ctx.Kafka.Seed(kHEventsTopic, "acme", hSeededEvent("r-3", 50, "idx-43"))
 	seen := []string{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		searches, _ := ctx.Redis.HGet("searchstats:acme:idx-42", "searches")
 		seen = append(seen, searches)
 	})
-	ctx.Drain(func() { consumeSearchEvents(eventsBg) })
+	ctx.Drain(func() { consumeSearchEvents(hEventsBg) })
 	stats := ctx.Redis.HGetAll("searchstats:acme:idx-42")
 	ctx.Assert(stats["searches"] == "2" && stats["latency_ms_total"] == "40", "searchstats:acme:idx-42 holds %v, expected searches 2 and latency_ms_total 40", stats)
 	first := seen
@@ -1187,7 +1187,7 @@ func CheckCommitAfterApply(ctx *harness.Ctx) {
 		first = first[:2]
 	}
 	ctx.Equal(first, []string{"1", "2"}, "at each commit the counter must already count the committed event; a commit before the count means a crash between the two skips the event; the counter at each commit")
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 1, "r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE): an event that was not counted must not be committed, or it is skipped for good; records left uncommitted (exactly r-3)")
+	ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), 1, "r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE): an event that was not counted must not be committed, or it is skipped for good; records left uncommitted (exactly r-3)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1203,23 +1203,23 @@ func CheckCommitAfterApply(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "search.query";
-const std::string kEventsGroup = "search-analytics";
-const std::string kEventsOutbox = "outbox:search.query";
-const std::vector<double> kEventsQuery = {0.125, -0.5, 0.75, 0.0625};
-const std::vector<std::string> kWire = {"request_id", "tenant", "index_version", "k", "latency_ms", "query_digest"};
+const std::string kHEventsTopic = "search.query";
+const std::string kHEventsGroup = "search-analytics";
+const std::string kHEventsOutbox = "outbox:search.query";
+const std::vector<double> kHEventsQuery = {0.125, -0.5, 0.75, 0.0625};
+const std::vector<std::string> kHWire = {"request_id", "tenant", "index_version", "k", "latency_ms", "query_digest"};
 
-bool eventsPublish(const std::string& tenant, const std::string& request_id) {
-  return publishSearchEvent(tenant, request_id, kEventsQuery, 10, "idx-42", 12);
+bool hEventsPublish(const std::string& tenant, const std::string& request_id) {
+  return publishSearchEvent(tenant, request_id, kHEventsQuery, 10, "idx-42", 12);
 }
 
-std::string seededEvent(const std::string& request_id, long latency_ms, const std::string& index_version) {
+std::string hSeededEvent(const std::string& request_id, long latency_ms, const std::string& index_version) {
   return nlohmann::json{{"request_id", request_id}, {"tenant", "acme"}, {"index_version", index_version}, {"k", 10}, {"latency_ms", latency_ms},
-                        {"query_digest", fingerprint::queryDigest(kEventsQuery)}}
+                        {"query_digest", fingerprint::queryDigest(kHEventsQuery)}}
       .dump();
 }
 
-nlohmann::json parsed(const std::string& text) {
+nlohmann::json hParsed(const std::string& text) {
   const auto j = nlohmann::json::parse(text, nullptr, false);
   return j.is_discarded() ? nlohmann::json() : j;
 }
@@ -1227,69 +1227,69 @@ nlohmann::json parsed(const std::string& text) {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  ctx.Equal(eventsPublish("acme", "r-1"), true, "publishSearchEvent on a healthy broker must report the event delivered");
-  ctx.Equal(eventsPublish("globex", "r-2"), true, "publishSearchEvent on a healthy broker must report the event delivered");
-  ctx.Equal(eventsPublish("acme", "r-3"), true, "publishSearchEvent on a healthy broker must report the event delivered");
+  ctx.Equal(hEventsPublish("acme", "r-1"), true, "publishSearchEvent on a healthy broker must report the event delivered");
+  ctx.Equal(hEventsPublish("globex", "r-2"), true, "publishSearchEvent on a healthy broker must report the event delivered");
+  ctx.Equal(hEventsPublish("acme", "r-3"), true, "publishSearchEvent on a healthy broker must report the event delivered");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three searches must produce three records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"acme", "globex", "acme"}, "records must be keyed by the tenant");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three searches must produce three records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"acme", "globex", "acme"}, "records must be keyed by the tenant");
   ctx.Equal(records[0].Partition, records[2].Partition, "acme's two events must land on one partition so they are read in order; acme's partitions");
 }
 
 void CheckNoVector(harness::Ctx& ctx) {
-  eventsPublish("acme", "r-1");
+  hEventsPublish("acme", "r-1");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 1, "one search must produce one record; the records");
   const std::string text = records[0].Value.value_or("");
-  const auto event = parsed(text);
+  const auto event = hParsed(text);
   ctx.Assert(event.is_object(), "the event must be JSON: %s", text);
   ctx.Assert(!event.contains("query") && text.find("0.125") == std::string::npos && text.find("0.0625") == std::string::npos,
              "the event carries the query vector: %s. The topic is retained and copied to every consumer; the digest is enough to group repeated queries", text);
-  for (const auto& f : kWire) ctx.Assert(event.contains(f), "the event %s lacks %s", text, f);
-  ctx.Equal(event.value("query_digest", std::string()), fingerprint::queryDigest(kEventsQuery), "query_digest must be fingerprint::queryDigest(query)");
+  for (const auto& f : kHWire) ctx.Assert(event.contains(f), "the event %s lacks %s", text, f);
+  ctx.Equal(event.value("query_digest", std::string()), fingerprint::queryDigest(kHEventsQuery), "query_digest must be fingerprint::queryDigest(query)");
   ctx.Assert(event["request_id"] == "r-1" && event["tenant"] == "acme" && event["k"] == 10 && event["index_version"] == "idx-42" && event["latency_ms"] == 12,
              "the event's fields must be the search's: %s", text);
 }
 
 void CheckDelivery(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);
-  ctx.Equal(eventsPublish("acme", "r-1"), true, "publishSearchEvent must report the event delivered: a lost acknowledgement is retried by the client, not reported");
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);
+  ctx.Equal(hEventsPublish("acme", "r-1"), true, "publishSearchEvent must report the event delivered: a lost acknowledgement is retried by the client, not reported");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the topic must hold one record: the retry duplicated the event (enable.idempotence); the records");
-  eventsPublish("acme", "r-2");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the topic must hold one record: the retry duplicated the event (enable.idempotence); the records");
+  hEventsPublish("acme", "r-2");
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after a leader failover the topic must hold both records: a record acknowledged by the leader alone is lost (acks=all); the records");
+  ctx.Kafka.Failover(kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "after a leader failover the topic must hold both records: a record acknowledged by the leader alone is lost (acks=all); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  const bool delivered = eventsPublish("acme", "r-1");
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  const bool delivered = hEventsPublish("acme", "r-1");
   ctx.Settle();
-  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
-  ctx.Equal(rows.size(), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kEventsOutbox, rows);
-  const auto row = parsed(rows[0]);
+  const auto rows = ctx.Redis.LRange(kHEventsOutbox, 0, -1);
+  ctx.Equal(rows.size(), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kHEventsOutbox, rows);
+  const auto row = hParsed(rows[0]);
   ctx.Assert(row.is_object() && row.value("key", std::string()) == "acme", "the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition (%s)", rows[0]);
   nlohmann::json payload;
-  if (row.contains("payload")) payload = row["payload"].is_string() ? parsed(row["payload"].get<std::string>()) : row["payload"];
+  if (row.contains("payload")) payload = row["payload"].is_string() ? hParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("request_id", std::string()) == "r-1", "the outbox row must carry the event payload: %s", rows[0]);
-  ctx.Assert(rows[0].find("0.125") == std::string::npos && rows[0].find("0.0625") == std::string::npos && payload.value("query_digest", std::string()) == fingerprint::queryDigest(kEventsQuery),
+  ctx.Assert(rows[0].find("0.125") == std::string::npos && rows[0].find("0.0625") == std::string::npos && payload.value("query_digest", std::string()) == fingerprint::queryDigest(kHEventsQuery),
              "the outbox row must carry the event as it would have been published, with query_digest and no element of the vector: %s", rows[0]);
   ctx.Equal(delivered, false, "publishSearchEvent must report a rejected event as not delivered");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
-  ctx.Equal(eventsPublish("globex", "r-2"), true, "once the broker answers again the event is delivered");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
+  ctx.Equal(hEventsPublish("globex", "r-2"), true, "once the broker answers again the event is delivered");
   ctx.Settle();
-  ctx.Equal(ctx.Redis.LRange(kEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
+  ctx.Equal(ctx.Redis.LRange(kHEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
 }
 
 void CheckCommitAfterApply(harness::Ctx& ctx) {
-  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-1", 10, "idx-42"));
-  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-2", 30, "idx-42"));
+  ctx.Kafka.Seed(kHEventsTopic, std::string("acme"), hSeededEvent("r-1", 10, "idx-42"));
+  ctx.Kafka.Seed(kHEventsTopic, std::string("acme"), hSeededEvent("r-2", 30, "idx-42"));
   // r-3's counters cannot be written (searchstats:acme:idx-43 holds a string): it is never counted.
   ctx.Redis.Set("searchstats:acme:idx-43", "not a hash");
-  ctx.Kafka.Seed(kEventsTopic, std::string("acme"), seededEvent("r-3", 50, "idx-43"));
+  ctx.Kafka.Seed(kHEventsTopic, std::string("acme"), hSeededEvent("r-3", 50, "idx-43"));
   auto seen = std::make_shared<std::vector<std::string>>();
   ctx.Kafka.OnCommit([&ctx, seen](const std::string&, const harness::KafkaOffsets&) {
     seen->push_back(ctx.Redis.HGet("searchstats:acme:idx-42", "searches").value_or(""));
@@ -1306,7 +1306,7 @@ void CheckCommitAfterApply(harness::Ctx& ctx) {
   ctx.Assert(field("searches") == "2" && field("latency_ms_total") == "40", "searchstats:acme:idx-42 holds %v, expected searches 2 and latency_ms_total 40", stats);
   const std::vector<std::string> first(seen->begin(), seen->begin() + static_cast<long>(std::min<size_t>(seen->size(), 2)));
   ctx.Equal(first, std::vector<std::string>{"1", "2"}, "at each commit the counter must already count the committed event; a commit before the count means a crash between the two skips the event; the counter at each commit");
-  ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 1, "r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE): an event that was not counted must not be committed, or it is skipped for good; records left uncommitted (exactly r-3)");
+  ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), 1, "r-1 and r-2 were counted and r-3 could not be (its counter update failed with WRONGTYPE): an event that was not counted must not be committed, or it is skipped for good; records left uncommitted (exactly r-3)");
 }
 `,
   },

@@ -1202,15 +1202,15 @@ import (
 	pb "gateway/gen/providers"
 )
 
-var streamTokens = []string{"The", " capital", " of", " France", " is", " Paris", "."}
+var hStreamTokens = []string{"The", " capital", " of", " France", " is", " Paris", "."}
 
 const (
-	streamGap  = 50 * time.Millisecond
-	streamBody = \`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}\`
+	kHStreamGap  = 50 * time.Millisecond
+	kHStreamBody = \`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}\`
 )
 
-// streamPeer is the model provider, streaming: one Chunk per token, streamGap of virtual time between two.
-type streamPeer struct {
+// HStreamPeer is the model provider, streaming: one Chunk per token, streamGap of virtual time between two.
+type HStreamPeer struct {
 	pb.UnimplementedProviderServer
 	mu        sync.Mutex
 	produced  int
@@ -1219,8 +1219,8 @@ type streamPeer struct {
 	breakAfter int
 }
 
-func (p *streamPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_StreamCompleteServer) error {
-	for _, t := range streamTokens {
+func (p *HStreamPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_StreamCompleteServer) error {
+	for _, t := range hStreamTokens {
 		if srv.Context().Err() != nil {
 			p.mu.Lock()
 			p.cancelled = true
@@ -1237,21 +1237,21 @@ func (p *streamPeer) StreamComplete(_ *pb.CompleteRequest, srv pb.Provider_Strea
 		if err := srv.Send(&pb.Chunk{Text: t}); err != nil {
 			return err
 		}
-		time.Sleep(streamGap)
+		time.Sleep(kHStreamGap)
 	}
 	return nil
 }
 
-func (p *streamPeer) state() (int, bool) {
+func (p *HStreamPeer) state() (int, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.produced, p.cancelled
 }
 
-// sseWriter is the connection as net/http presents it to the handler: writes are recorded, and
+// HSseWriter is the connection as net/http presents it to the handler: writes are recorded, and
 // after disconnectAfter frames the client hangs up: the request's context is cancelled (as the
 // server does) and further writes fail.
-type sseWriter struct {
+type HSseWriter struct {
 	rec             *httptest.ResponseRecorder
 	disconnectAfter int
 	cancel          context.CancelFunc
@@ -1261,11 +1261,11 @@ type sseWriter struct {
 	disconnected    bool
 }
 
-func (w *sseWriter) Header() http.Header  { return w.rec.Header() }
-func (w *sseWriter) WriteHeader(code int) { w.rec.WriteHeader(code) }
-func (w *sseWriter) Flush()               {}
+func (w *HSseWriter) Header() http.Header  { return w.rec.Header() }
+func (w *HSseWriter) WriteHeader(code int) { w.rec.WriteHeader(code) }
+func (w *HSseWriter) Flush()               {}
 
-func (w *sseWriter) Write(b []byte) (int, error) {
+func (w *HSseWriter) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.disconnected {
@@ -1281,7 +1281,7 @@ func (w *sseWriter) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-type streamOut struct {
+type HStreamOut struct {
 	status  int
 	headers http.Header
 	frames  []string // the frames the client received
@@ -1289,27 +1289,27 @@ type streamOut struct {
 	done    bool
 }
 
-func streamGateway(ctx *harness.Ctx) (*http.ServeMux, *streamPeer) {
-	peer := &streamPeer{}
+func hStreamGateway(ctx *harness.Ctx) (*http.ServeMux, *HStreamPeer) {
+	peer := &HStreamPeer{}
 	pb.RegisterProviderServer(ctx.GRPC.Server(""), peer)
 	mux := http.NewServeMux()
 	register(mux)
 	return mux, peer
 }
 
-// streamOnce drives the handler as the server would; after disconnectAfter frames (0: never) the client hangs up.
-func streamOnce(ctx *harness.Ctx, mux *http.ServeMux, disconnectAfter int) streamOut {
+// hStreamOnce drives the handler as the server would; after disconnectAfter frames (0: never) the client hangs up.
+func hStreamOnce(ctx *harness.Ctx, mux *http.ServeMux, disconnectAfter int) HStreamOut {
 	reqCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req := httptest.NewRequest("POST", "http://gateway/v1/chat/stream", strings.NewReader(streamBody)).WithContext(reqCtx)
+	req := httptest.NewRequest("POST", "http://gateway/v1/chat/stream", strings.NewReader(kHStreamBody)).WithContext(reqCtx)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer acme")
-	w := &sseWriter{rec: httptest.NewRecorder(), disconnectAfter: disconnectAfter, cancel: cancel}
+	w := &HSseWriter{rec: httptest.NewRecorder(), disconnectAfter: disconnectAfter, cancel: cancel}
 	done := ctx.Drain(func() { mux.ServeHTTP(w, req) })
 	ctx.Settle() // whatever the handler left running gets to run
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	out := streamOut{status: w.rec.Code, headers: w.rec.Header(), after: w.after.String(), done: done}
+	out := HStreamOut{status: w.rec.Code, headers: w.rec.Header(), after: w.after.String(), done: done}
 	for _, block := range strings.Split(w.body.String(), "\\n\\n") {
 		if block != "" {
 			out.frames = append(out.frames, block)
@@ -1318,8 +1318,8 @@ func streamOnce(ctx *harness.Ctx, mux *http.ServeMux, disconnectAfter int) strea
 	return out
 }
 
-// streamEvents is each frame's text after "data: ".
-func streamEvents(ctx *harness.Ctx, out streamOut) []string {
+// hStreamEvents is each frame's text after "data: ".
+func hStreamEvents(ctx *harness.Ctx, out HStreamOut) []string {
 	var events []string
 	for _, f := range out.frames {
 		ctx.Assert(strings.HasPrefix(f, "data: "), "a frame must start with 'data: ', got %q", f)
@@ -1329,13 +1329,13 @@ func streamEvents(ctx *harness.Ctx, out streamOut) []string {
 }
 
 func CheckSseFrames(ctx *harness.Ctx) {
-	mux, _ := streamGateway(ctx)
-	out := streamOnce(ctx, mux, 0)
+	mux, _ := hStreamGateway(ctx)
+	out := hStreamOnce(ctx, mux, 0)
 	ctx.Assert(out.done, "the stream handler did not return")
 	ctx.Equal(out.status, 200, "POST /v1/chat/stream")
 	ctx.Assert(len(out.frames) > 0, "the stream wrote nothing")
 	var deltas []string
-	for _, e := range streamEvents(ctx, out) {
+	for _, e := range hStreamEvents(ctx, out) {
 		var v map[string]any
 		if json.Unmarshal([]byte(e), &v) == nil {
 			if d, ok := v["delta"].(string); ok {
@@ -1343,47 +1343,47 @@ func CheckSseFrames(ctx *harness.Ctx) {
 			}
 		}
 	}
-	ctx.Equal(deltas, streamTokens, "the delta frames must relay the provider's chunks in order")
+	ctx.Equal(deltas, hStreamTokens, "the delta frames must relay the provider's chunks in order")
 }
 
 func CheckContentType(ctx *harness.Ctx) {
-	mux, _ := streamGateway(ctx)
-	out := streamOnce(ctx, mux, 0)
+	mux, _ := hStreamGateway(ctx)
+	out := hStreamOnce(ctx, mux, 0)
 	ctx.Equal(out.status, 200, "POST /v1/chat/stream")
 	ctype := out.headers.Get("Content-Type")
 	ctx.Assert(strings.HasPrefix(ctype, "text/event-stream"), "Content-Type is %q, expected text/event-stream: without it proxies buffer the stream and the browser does not see events", ctype)
 }
 
 func CheckDisconnect(ctx *harness.Ctx) {
-	mux, _ := streamGateway(ctx)
-	out := streamOnce(ctx, mux, 2)
+	mux, _ := hStreamGateway(ctx)
+	out := hStreamOnce(ctx, mux, 2)
 	ctx.Equal(len(out.frames), 2, "the client hung up after 2 frames; the frames the server had written")
 	ctx.Assert(out.after == "", "after the client hung up the stream wrote %d more byte(s) into the closed connection: %q. Bind the upstream call to r.Context() and stop when it ends", len(out.after), out.after)
 }
 
 func CheckCancelUpstream(ctx *harness.Ctx) {
-	mux, peer := streamGateway(ctx)
-	streamOnce(ctx, mux, 2)
+	mux, peer := hStreamGateway(ctx)
+	hStreamOnce(ctx, mux, 2)
 	produced, cancelled := peer.state()
-	ctx.Assert(cancelled, "the client hung up after 2 frames but the provider call was not cancelled: it generated %d of %d tokens nobody read. Derive the upstream context from r.Context() so the disconnect cancels the call", produced, len(streamTokens))
-	ctx.Assert(produced < len(streamTokens), "the provider generated all %d tokens after the client hung up at 2: the cancel came too late", len(streamTokens))
+	ctx.Assert(cancelled, "the client hung up after 2 frames but the provider call was not cancelled: it generated %d of %d tokens nobody read. Derive the upstream context from r.Context() so the disconnect cancels the call", produced, len(hStreamTokens))
+	ctx.Assert(produced < len(hStreamTokens), "the provider generated all %d tokens after the client hung up at 2: the cancel came too late", len(hStreamTokens))
 }
 
 func CheckDoneAndUsage(ctx *harness.Ctx) {
-	mux, peer := streamGateway(ctx)
-	out := streamOnce(ctx, mux, 0)
-	events := streamEvents(ctx, out)
+	mux, peer := hStreamGateway(ctx)
+	out := hStreamOnce(ctx, mux, 0)
+	events := hStreamEvents(ctx, out)
 	ctx.Assert(len(events) > 0 && events[len(events)-1] == "[DONE]", "a stream that completes must end with 'data: [DONE]', the frames were %q", events)
 	ctx.Assert(len(events) >= 2, "the usage frame must come before [DONE]")
 	var usage map[string]any
 	ctx.NoError(json.Unmarshal([]byte(events[len(events)-2]), &usage), "the frame before [DONE] must be JSON, got %q", events[len(events)-2])
-	ctx.Equal(usage, map[string]any{"usage": map[string]any{"output_tokens": float64(len(streamTokens))}}, "the frame before [DONE] (%d chunks relayed)", len(streamTokens))
+	ctx.Equal(usage, map[string]any{"usage": map[string]any{"output_tokens": float64(len(hStreamTokens))}}, "the frame before [DONE] (%d chunks relayed)", len(hStreamTokens))
 	// The provider fails UNAVAILABLE after three tokens: the stream did not complete, and the client
 	// must not be told it did.
 	peer.mu.Lock()
 	peer.produced, peer.breakAfter = 0, 3
 	peer.mu.Unlock()
-	broken := streamEvents(ctx, streamOnce(ctx, mux, 0))
+	broken := hStreamEvents(ctx, hStreamOnce(ctx, mux, 0))
 	for _, e := range broken {
 		ctx.Assert(e != "[DONE]", "the provider failed after 3 tokens, yet the stream ended with 'data: [DONE]' (frames: %q): a client takes [DONE] as a complete answer. End the stream without it", broken)
 	}
@@ -1401,17 +1401,17 @@ func CheckDoneAndUsage(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kStreamTokens = {"The", " capital", " of", " France", " is", " Paris", "."};
-constexpr std::chrono::milliseconds kStreamGap{50};
-const std::string kStreamBody =
+const std::vector<std::string> kHStreamTokens = {"The", " capital", " of", " France", " is", " Paris", "."};
+constexpr std::chrono::milliseconds kHStreamGap{50};
+const std::string kHStreamBody =
     R"({"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64})";
 
 // The model provider, streaming: one Chunk per token, kStreamGap of virtual time between two.
-class StreamPeer final : public gateway::Provider::Service {
+class HStreamPeer final : public gateway::Provider::Service {
  public:
   grpc::Status StreamComplete(grpc::ServerContext* context, const gateway::CompleteRequest*,
                               grpc::ServerWriter<gateway::Chunk>* srv) override {
-    for (const auto& t : kStreamTokens) {
+    for (const auto& t : kHStreamTokens) {
       if (context->IsCancelled()) {
         std::lock_guard<std::mutex> lock(mu_);
         cancelled_ = true;
@@ -1431,7 +1431,7 @@ class StreamPeer final : public gateway::Provider::Service {
         cancelled_ = true;
         return grpc::Status::CANCELLED;
       }
-      std::this_thread::sleep_for(kStreamGap);
+      std::this_thread::sleep_for(kHStreamGap);
     }
     return grpc::Status::OK;
   }
@@ -1458,15 +1458,15 @@ class StreamPeer final : public gateway::Provider::Service {
   int break_after_ = 0;
 };
 
-struct StreamGateway {
-  StreamPeer peer;
+struct HStreamGateway {
+  HStreamPeer peer;
   httplib::Server svr;
 };
 
-StreamGateway& streamGateway(harness::Ctx& ctx) {
-  static StreamGateway* g = nullptr;
+HStreamGateway& hStreamGateway(harness::Ctx& ctx) {
+  static HStreamGateway* g = nullptr;
   delete g;
-  g = new StreamGateway;
+  g = new HStreamGateway;
   ctx.GRPC.Server("")->RegisterService(&g->peer);
   register_routes(g->svr);
   return *g;
@@ -1474,12 +1474,12 @@ StreamGateway& streamGateway(harness::Ctx& ctx) {
 
 // One request, driven through the server; the client reads at most client_reads bytes of the body
 // and hangs up (the sink stops being writable), as a browser closing an event stream.
-httplib::Response streamOnce(harness::Ctx& ctx, StreamGateway& g, size_t client_reads = static_cast<size_t>(-1)) {
+httplib::Response hStreamOnce(harness::Ctx& ctx, HStreamGateway& g, size_t client_reads = static_cast<size_t>(-1)) {
   httplib::Request req;
   req.method = "POST";
   req.path = "/v1/chat/stream";
   req.target = req.path;
-  req.body = kStreamBody;
+  req.body = kHStreamBody;
   req.headers.emplace("Content-Type", "application/json");
   req.headers.emplace("Authorization", "Bearer acme");
   req.client_reads = client_reads;
@@ -1489,7 +1489,7 @@ httplib::Response streamOnce(harness::Ctx& ctx, StreamGateway& g, size_t client_
 }
 
 // The frames of a body: each block terminated by a blank line.
-std::vector<std::string> streamFrames(const std::string& body) {
+std::vector<std::string> hStreamFrames(const std::string& body) {
   std::vector<std::string> frames;
   size_t start = 0;
   while (true) {
@@ -1502,9 +1502,9 @@ std::vector<std::string> streamFrames(const std::string& body) {
 }
 
 // Each frame's text after "data: ".
-std::vector<std::string> streamEvents(harness::Ctx& ctx, const std::string& body) {
+std::vector<std::string> hStreamEvents(harness::Ctx& ctx, const std::string& body) {
   std::vector<std::string> events;
-  for (const auto& f : streamFrames(body)) {
+  for (const auto& f : hStreamFrames(body)) {
     ctx.Assert(f.rfind("data: ", 0) == 0, "a frame must start with 'data: ', got %q", f);
     events.push_back(f.substr(6));
   }
@@ -1512,9 +1512,9 @@ std::vector<std::string> streamEvents(harness::Ctx& ctx, const std::string& body
 }
 
 // The byte offset at which the client has read exactly n frames, learned from a full stream.
-size_t streamBytesOfFrames(harness::Ctx& ctx, StreamGateway& g, size_t n) {
-  const auto full = streamOnce(ctx, g);
-  ctx.Assert(streamFrames(full.body).size() > n, "the stream wrote fewer than %d frames: %q", n + 1, full.body);
+size_t hStreamBytesOfFrames(harness::Ctx& ctx, HStreamGateway& g, size_t n) {
+  const auto full = hStreamOnce(ctx, g);
+  ctx.Assert(hStreamFrames(full.body).size() > n, "the stream wrote fewer than %d frames: %q", n + 1, full.body);
   size_t offset = 0;
   for (size_t i = 0; i < n; i++) offset = full.body.find("\\n\\n", offset) + 2;
   return offset;
@@ -1523,22 +1523,22 @@ size_t streamBytesOfFrames(harness::Ctx& ctx, StreamGateway& g, size_t n) {
 }  // namespace
 
 void CheckSseFrames(harness::Ctx& ctx) {
-  auto& g = streamGateway(ctx);
-  const auto res = streamOnce(ctx, g);
+  auto& g = hStreamGateway(ctx);
+  const auto res = hStreamOnce(ctx, g);
   ctx.Equal(res.status, 200, "POST /v1/chat/stream");
   ctx.Assert(!res.body.empty(), "the stream wrote nothing");
   std::vector<std::string> deltas;
-  for (const auto& e : streamEvents(ctx, res.body)) {
+  for (const auto& e : hStreamEvents(ctx, res.body)) {
     if (e == "[DONE]") continue;
     const auto v = nlohmann::json::parse(e, nullptr, false);
     if (v.is_object() && v.contains("delta")) deltas.push_back(v["delta"].get<std::string>());
   }
-  ctx.Equal(deltas, kStreamTokens, "the delta frames must relay the provider's chunks in order");
+  ctx.Equal(deltas, kHStreamTokens, "the delta frames must relay the provider's chunks in order");
 }
 
 void CheckContentType(harness::Ctx& ctx) {
-  auto& g = streamGateway(ctx);
-  const auto res = streamOnce(ctx, g);
+  auto& g = hStreamGateway(ctx);
+  const auto res = hStreamOnce(ctx, g);
   ctx.Equal(res.status, 200, "POST /v1/chat/stream");
   const std::string ctype = res.get_header_value("Content-Type");
   ctx.Assert(ctype.rfind("text/event-stream", 0) == 0,
@@ -1546,10 +1546,10 @@ void CheckContentType(harness::Ctx& ctx) {
 }
 
 void CheckDisconnect(harness::Ctx& ctx) {
-  auto& g = streamGateway(ctx);
-  const size_t two = streamBytesOfFrames(ctx, g, 2);
+  auto& g = hStreamGateway(ctx);
+  const size_t two = hStreamBytesOfFrames(ctx, g, 2);
   const int before = g.peer.state().produced;
-  streamOnce(ctx, g, two);
+  hStreamOnce(ctx, g, two);
   const auto s = g.peer.state();
   ctx.Assert(s.produced - before <= 3,
              "the client hung up after 2 frames but the handler kept reading: the provider generated %d tokens for that stream. Stop when sink.write() returns false (the client is gone)",
@@ -1557,28 +1557,28 @@ void CheckDisconnect(harness::Ctx& ctx) {
 }
 
 void CheckCancelUpstream(harness::Ctx& ctx) {
-  auto& g = streamGateway(ctx);
-  const size_t two = streamBytesOfFrames(ctx, g, 2);
+  auto& g = hStreamGateway(ctx);
+  const size_t two = hStreamBytesOfFrames(ctx, g, 2);
   const int before = g.peer.state().produced;
-  streamOnce(ctx, g, two);
+  hStreamOnce(ctx, g, two);
   const auto s = g.peer.state();
   ctx.Assert(s.cancelled, "the client hung up after 2 frames but the provider call was not cancelled: it generated %d of %d tokens nobody read. TryCancel() the upstream context when the client leaves",
-             s.produced - before, static_cast<int>(kStreamTokens.size()));
+             s.produced - before, static_cast<int>(kHStreamTokens.size()));
 }
 
 void CheckDoneAndUsage(harness::Ctx& ctx) {
-  auto& g = streamGateway(ctx);
-  const auto res = streamOnce(ctx, g);
-  const auto events = streamEvents(ctx, res.body);
+  auto& g = hStreamGateway(ctx);
+  const auto res = hStreamOnce(ctx, g);
+  const auto events = hStreamEvents(ctx, res.body);
   ctx.Assert(!events.empty() && events.back() == "[DONE]", "a stream that completes must end with 'data: [DONE]', the frames were %v", events);
   ctx.Assert(events.size() >= 2, "the usage frame must come before [DONE]");
   const auto usage = nlohmann::json::parse(events[events.size() - 2], nullptr, false);
-  nlohmann::json expected = {{"usage", {{"output_tokens", static_cast<int>(kStreamTokens.size())}}}};
-  ctx.Equal(usage, expected, "the frame before [DONE] (%d chunks relayed)", static_cast<int>(kStreamTokens.size()));
+  nlohmann::json expected = {{"usage", {{"output_tokens", static_cast<int>(kHStreamTokens.size())}}}};
+  ctx.Equal(usage, expected, "the frame before [DONE] (%d chunks relayed)", static_cast<int>(kHStreamTokens.size()));
   // The provider fails UNAVAILABLE after three tokens: the stream did not complete, and the client
   // must not be told it did.
   g.peer.breakAfter(3);
-  const auto broken = streamEvents(ctx, streamOnce(ctx, g).body);
+  const auto broken = hStreamEvents(ctx, hStreamOnce(ctx, g).body);
   for (const auto& e : broken) {
     ctx.Assert(e != "[DONE]", "the provider failed after 3 tokens, yet the stream ended with 'data: [DONE]' (frames: %v): a client takes [DONE] as a complete answer. End the stream without it", broken);
   }

@@ -816,23 +816,23 @@ import (
 )
 
 const (
-	eventsTopic  = "distill.sample"
-	eventsPrompt = "How do I reset my password after a phone change?"
+	kHEventsTopic  = "distill.sample"
+	kHEventsPrompt = "How do I reset my password after a phone change?"
 )
 
-func eventsSample(sampleID, jobID, datasetID, hash string, tokens int) samples.SampleRecord {
-	return samples.SampleRecord{SampleID: sampleID, JobID: jobID, DatasetID: datasetID, TeacherVersion: "teach-70b-v3.2", DedupeHash: hash, Tokens: tokens, Prompt: eventsPrompt}
+func hEventsSample(sampleID, jobID, datasetID, hash string, tokens int) samples.SampleRecord {
+	return samples.SampleRecord{SampleID: sampleID, JobID: jobID, DatasetID: datasetID, TeacherVersion: "teach-70b-v3.2", DedupeHash: hash, Tokens: tokens, Prompt: kHEventsPrompt}
 }
 
-func eventsPublish(ctx *harness.Ctx, s samples.SampleRecord) bool {
+func hEventsPublish(ctx *harness.Ctx, s samples.SampleRecord) bool {
 	ok, err := publish(context.Background(), s)
 	ctx.NoError(err, "publish(%s)", s.SampleID)
 	return ok
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, r := range ctx.Kafka.Records(eventsTopic) {
+	for _, r := range ctx.Kafka.Records(kHEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal(r.Value, &e), "the event is JSON: %s", r.Value)
 		out = append(out, e)
@@ -840,7 +840,7 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("distill:outbox", 0, -1) {
 		var e map[string]any
@@ -851,68 +851,68 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckDatasetKey(ctx *harness.Ctx) {
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-1", 120)), "the first sample is published")
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-2", "j2", "ds-support", "h-2", 120)), "the second sample is published")
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-3", "j1", "ds-support", "h-3", 120)), "the third sample is published")
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-1", "j1", "ds-support", "h-1", 120)), "the first sample is published")
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-2", "j2", "ds-support", "h-2", 120)), "the second sample is published")
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-3", "j1", "ds-support", "h-3", 120)), "the third sample is published")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three accepted samples must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"ds-support", "ds-support", "ds-support"}, "records must be keyed by the dataset id (keyed by job, two jobs over one dataset interleave for the trainer)")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three accepted samples must produce three records on %s; the records", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"ds-support", "ds-support", "ds-support"}, "records must be keyed by the dataset id (keyed by job, two jobs over one dataset interleave for the trainer)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "one dataset must land on one partition so the trainer sees it in one order")
 }
 
 func CheckDedupeFilter(ctx *harness.Ctx) {
 	ctx.Redis.Do("SADD", "distill:published:ds-support", "h-old") // another worker published this hash earlier
-	ctx.Assert(!eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-old", 120)), "a hash the dataset already published must be dropped (publish returns false)")
+	ctx.Assert(!hEventsPublish(ctx, hEventsSample("s-1", "j1", "ds-support", "h-old", 120)), "a hash the dataset already published must be dropped (publish returns false)")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a duplicate reached the topic (%v); the index is consulted before the produce; records", eventsAll(ctx))
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-2", "j1", "ds-support", "h-new", 120)), "a fresh hash is published")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "a duplicate reached the topic (%v); the index is consulted before the produce; records", hEventsAll(ctx))
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-2", "j1", "ds-support", "h-new", 120)), "a fresh hash is published")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a fresh hash is published; records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "a fresh hash is published; records")
 	ctx.Assert(ctx.Redis.SIsMember("distill:published:ds-support", "h-new"), "a published hash must be marked in the dataset's index so other workers see it")
 	other := ctx.Instance() // another worker process
-	ok, _ := other.Get("publish").(func(context.Context, samples.SampleRecord) (bool, error))(context.Background(), eventsSample("s-3", "j1", "ds-support", "h-new", 120))
+	ok, _ := other.Get("publish").(func(context.Context, samples.SampleRecord) (bool, error))(context.Background(), hEventsSample("s-3", "j1", "ds-support", "h-new", 120))
 	ctx.Assert(!ok, "another worker publishing the same hash must be stopped by the shared index, not a set of its own")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the duplicate from another worker reached the topic (%v); records", eventsAll(ctx))
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-4", "j1", "ds-other", "h-new", 120)), "the index is per dataset: another dataset may publish the same hash")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the duplicate from another worker reached the topic (%v); records", hEventsAll(ctx))
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-4", "j1", "ds-other", "h-new", 120)), "the index is per dataset: another dataset may publish the same hash")
 }
 
 func CheckVersionAndHash(ctx *harness.Ctx) {
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-1", 77)), "the sample is published")
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-1", "j1", "ds-support", "h-1", 77)), "the sample is published")
 	ctx.Settle()
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 1, "one accepted sample; records")
 	ctx.Equal(all[0], map[string]any{"sample_id": "s-1", "job_id": "j1", "dataset_id": "ds-support", "teacher_version": "teach-70b-v3.2", "dedupe_hash": "h-1", "tokens": float64(77)}, "the event must carry the ids, teacher_version, dedupe_hash and tokens")
-	other := eventsSample("s-2", "j1", "ds-support", "h-2", 120)
+	other := hEventsSample("s-2", "j1", "ds-support", "h-2", 120)
 	other.TeacherVersion = "teach-13b-v2.1"
-	ctx.Assert(eventsPublish(ctx, other), "the second sample is published")
+	ctx.Assert(hEventsPublish(ctx, other), "the second sample is published")
 	ctx.Settle()
-	all = eventsAll(ctx)
+	all = hEventsAll(ctx)
 	ctx.Assert(len(all) == 2 && all[1]["teacher_version"] == "teach-13b-v2.1", "a sample from teacher teach-13b-v2.1 must carry that version, the one on its record: got %v", all[1:])
 }
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
 	func() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Fatalf("publish panicked when the broker refused the produce: %v; the event goes to the outbox, the worker goes on", e)
 			}
 		}()
-		eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-1", 120))
+		hEventsPublish(ctx, hEventsSample("s-1", "j1", "ds-support", "h-1", 120))
 	}()
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: a rejected produce must be kept for the relay, not dropped; outbox rows")
 	ctx.Assert(rows[0]["sample_id"] == "s-1" && rows[0]["dedupe_hash"] == "h-1", "the outbox row must be the event itself, got %v", rows[0])
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing reached the topic for the refused produce; records")
 	ctx.Assert(ctx.Redis.SIsMember("distill:published:ds-support", "h-1"), "the refused event is kept in the outbox for the relay, so its hash still counts as published: mark it, or another worker produces a second copy")
-	ctx.Assert(eventsPublish(ctx, eventsSample("s-2", "j1", "ds-support", "h-2", 120)), "a healthy produce is published")
+	ctx.Assert(hEventsPublish(ctx, hEventsSample("s-2", "j1", "ds-support", "h-2", 120)), "a healthy produce is published")
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
-	ctx.Kafka.Failover(eventsTopic)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The writer must wait for every in-sync replica (RequiredAcks: kafka.RequireAll); records")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Kafka.Failover(kHEventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The writer must wait for every in-sync replica (RequiredAcks: kafka.RequireAll); records")
 }
 
 func CheckNoPromptText(ctx *harness.Ctx) {
@@ -921,12 +921,12 @@ func CheckNoPromptText(ctx *harness.Ctx) {
 	log.SetOutput(&logged)
 	func() {
 		defer log.SetOutput(previous)
-		ctx.Kafka.FailNext(eventsTopic, 1)
-		eventsPublish(ctx, eventsSample("s-1", "j1", "ds-support", "h-1", 120))
-		eventsPublish(ctx, eventsSample("s-2", "j1", "ds-support", "h-2", 120))
+		ctx.Kafka.FailNext(kHEventsTopic, 1)
+		hEventsPublish(ctx, hEventsSample("s-1", "j1", "ds-support", "h-1", 120))
+		hEventsPublish(ctx, hEventsSample("s-2", "j1", "ds-support", "h-2", 120))
 		ctx.Settle()
 	}()
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
+	for _, value := range ctx.Kafka.Values(kHEventsTopic) {
 		ctx.Assert(!strings.Contains(value, "reset my password"), "the event carries the prompt text: %s; the topic is retained and replicated, ids only", value)
 		var e map[string]any
 		json.Unmarshal([]byte(value), &e)
@@ -953,21 +953,21 @@ func CheckNoPromptText(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic = "distill.sample";
-const std::string kPrompt = "How do I reset my password after a phone change?";
+const std::string kHTopic = "distill.sample";
+const std::string kHPrompt = "How do I reset my password after a phone change?";
 
-samples::SampleRecord eventsSample(const std::string& sample_id, const std::string& job_id, const std::string& dataset_id,
+samples::SampleRecord hEventsSample(const std::string& sample_id, const std::string& job_id, const std::string& dataset_id,
                                    const std::string& hash, int tokens) {
-  return {sample_id, job_id, dataset_id, "teach-70b-v3.2", hash, tokens, kPrompt};
+  return {sample_id, job_id, dataset_id, "teach-70b-v3.2", hash, tokens, kHPrompt};
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or("null"), nullptr, false));
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or("null"), nullptr, false));
   return out;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("distill:outbox", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
@@ -976,13 +976,13 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckDatasetKey(harness::Ctx& ctx) {
-  ctx.Assert(publish(eventsSample("s-1", "j1", "ds-support", "h-1", 120)), "the first sample is published");
-  ctx.Assert(publish(eventsSample("s-2", "j2", "ds-support", "h-2", 120)), "the second sample is published");
-  ctx.Assert(publish(eventsSample("s-3", "j1", "ds-support", "h-3", 120)), "the third sample is published");
+  ctx.Assert(publish(hEventsSample("s-1", "j1", "ds-support", "h-1", 120)), "the first sample is published");
+  ctx.Assert(publish(hEventsSample("s-2", "j2", "ds-support", "h-2", 120)), "the second sample is published");
+  ctx.Assert(publish(hEventsSample("s-3", "j1", "ds-support", "h-3", 120)), "the third sample is published");
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three accepted samples must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"ds-support", "ds-support", "ds-support"},
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 3, "three accepted samples must produce three records on %s; the records", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"ds-support", "ds-support", "ds-support"},
             "records must be keyed by the dataset id (keyed by job, two jobs over one dataset interleave for the trainer)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "one dataset must land on one partition so the trainer sees it in one order");
@@ -990,62 +990,62 @@ void CheckDatasetKey(harness::Ctx& ctx) {
 
 void CheckDedupeFilter(harness::Ctx& ctx) {
   ctx.Redis.Do("SADD", "distill:published:ds-support", "h-old");  // another worker published this hash earlier
-  ctx.Assert(!publish(eventsSample("s-1", "j1", "ds-support", "h-old", 120)), "a hash the dataset already published must be dropped (publish returns false)");
+  ctx.Assert(!publish(hEventsSample("s-1", "j1", "ds-support", "h-old", 120)), "a hash the dataset already published must be dropped (publish returns false)");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "a duplicate reached the topic (%v); the index is consulted before the produce; records", eventsAll(ctx));
-  ctx.Assert(publish(eventsSample("s-2", "j1", "ds-support", "h-new", 120)), "a fresh hash is published");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 0, "a duplicate reached the topic (%v); the index is consulted before the produce; records", hEventsAll(ctx));
+  ctx.Assert(publish(hEventsSample("s-2", "j1", "ds-support", "h-new", 120)), "a fresh hash is published");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "a fresh hash is published; records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "a fresh hash is published; records");
   ctx.Assert(ctx.Redis.SIsMember("distill:published:ds-support", "h-new"), "a published hash must be marked in the dataset's index so other workers see it");
   // another worker: a process of its own would share nothing but Redis and the broker, so a set in
   // this process must not be what stops the duplicate
-  ctx.Assert(!publish(eventsSample("s-3", "j1", "ds-support", "h-new", 120)), "a second publish of a hash the dataset already has must be stopped by the shared index");
+  ctx.Assert(!publish(hEventsSample("s-3", "j1", "ds-support", "h-new", 120)), "a second publish of a hash the dataset already has must be stopped by the shared index");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the duplicate reached the topic (%v); records", eventsAll(ctx));
-  ctx.Assert(publish(eventsSample("s-4", "j1", "ds-other", "h-new", 120)), "the index is per dataset: another dataset may publish the same hash");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "the duplicate reached the topic (%v); records", hEventsAll(ctx));
+  ctx.Assert(publish(hEventsSample("s-4", "j1", "ds-other", "h-new", 120)), "the index is per dataset: another dataset may publish the same hash");
 }
 
 void CheckVersionAndHash(harness::Ctx& ctx) {
-  ctx.Assert(publish(eventsSample("s-1", "j1", "ds-support", "h-1", 77)), "the sample is published");
+  ctx.Assert(publish(hEventsSample("s-1", "j1", "ds-support", "h-1", 77)), "the sample is published");
   ctx.Settle();
-  const auto all = eventsAll(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 1, "one accepted sample; records");
   ctx.Equal(all[0], nlohmann::json({{"sample_id", "s-1"}, {"job_id", "j1"}, {"dataset_id", "ds-support"}, {"teacher_version", "teach-70b-v3.2"}, {"dedupe_hash", "h-1"}, {"tokens", 77}}),
             "the event must carry the ids, teacher_version, dedupe_hash and tokens");
-  auto other = eventsSample("s-2", "j1", "ds-support", "h-2", 120);
+  auto other = hEventsSample("s-2", "j1", "ds-support", "h-2", 120);
   other.teacher_version = "teach-13b-v2.1";
   ctx.Assert(publish(other), "the second sample is published");
   ctx.Settle();
-  const auto later = eventsAll(ctx);
+  const auto later = hEventsAll(ctx);
   ctx.Assert(later.size() == 2 && later[1].value("teacher_version", "") == "teach-13b-v2.1", "a sample from teacher teach-13b-v2.1 must carry that version, the one on its record: got %v", later.size() == 2 ? later[1] : nlohmann::json());
 }
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
+  ctx.Kafka.FailNext(kHTopic, 1);
   try {
-    publish(eventsSample("s-1", "j1", "ds-support", "h-1", 120));
+    publish(hEventsSample("s-1", "j1", "ds-support", "h-1", 120));
   } catch (const std::exception& e) {
     ctx.Fatalf("publish threw when the broker refused the produce: %s; the event goes to the outbox, the worker goes on", e.what());
   }
   ctx.Settle();
   producer->poll(0);  // the worker's loop serves delivery reports between samples
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: a rejected produce must be kept for the relay, not dropped; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].value("sample_id", "") == "s-1" && rows[0].value("dedupe_hash", "") == "h-1", "the outbox row must be the event itself, got %v", rows.empty() ? nlohmann::json() : rows[0]);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused produce; records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 0, "nothing reached the topic for the refused produce; records");
   ctx.Assert(ctx.Redis.SIsMember("distill:published:ds-support", "h-1"), "the refused event is kept in the outbox for the relay, so its hash still counts as published: mark it, or another worker produces a second copy");
-  ctx.Assert(publish(eventsSample("s-2", "j1", "ds-support", "h-2", 120)), "a healthy produce is published");
+  ctx.Assert(publish(hEventsSample("s-2", "j1", "ds-support", "h-2", 120)), "a healthy produce is published");
   ctx.Settle();
   producer->poll(0);
-  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
-  ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The producer must wait for every in-sync replica (acks=all); records");
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  ctx.Assert(publish(eventsSample("s-3", "j1", "ds-support", "h-3", 120)), "s-3 is published");
+  ctx.Assert(ctx.Kafka.Records(kHTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "publish returned, then the partition leader failed and distill.sample lost s-2: it had been acknowledged by the leader alone. The producer must wait for every in-sync replica (acks=all); records");
+  ctx.Kafka.LoseAcks(kHTopic, 1);
+  ctx.Assert(publish(hEventsSample("s-3", "j1", "ds-support", "h-3", 120)), "s-3 is published");
   ctx.Settle();
   producer->poll(0);
   std::vector<std::string> ids;
-  for (const auto& e : eventsAll(ctx)) ids.push_back(e.value("sample_id", ""));
+  for (const auto& e : hEventsAll(ctx)) ids.push_back(e.value("sample_id", ""));
   ctx.Equal(ids, {"s-2", "s-3"}, "the acknowledgement of s-3 was lost and the producer retried: distill.sample must hold s-2 and s-3 once each (enable.idempotence)");
 }
 
@@ -1053,21 +1053,21 @@ void CheckNoPromptText(harness::Ctx& ctx) {
   std::ostringstream logged;
   {
     // the learner's log lines (std::cerr, std::cout) land in logged until the scope ends, however it ends
-    struct Capture {
+    struct HCapture {
       std::streambuf* err;
       std::streambuf* out;
-      ~Capture() {
+      ~HCapture() {
         std::cerr.rdbuf(err);
         std::cout.rdbuf(out);
       }
     } capture{std::cerr.rdbuf(logged.rdbuf()), std::cout.rdbuf(logged.rdbuf())};
-    ctx.Kafka.FailNext(kTopic, 1);
-    publish(eventsSample("s-1", "j1", "ds-support", "h-1", 120));
-    publish(eventsSample("s-2", "j1", "ds-support", "h-2", 120));
+    ctx.Kafka.FailNext(kHTopic, 1);
+    publish(hEventsSample("s-1", "j1", "ds-support", "h-1", 120));
+    publish(hEventsSample("s-2", "j1", "ds-support", "h-2", 120));
     ctx.Settle();
     producer->poll(0);
   }
-  for (const auto& value : ctx.Kafka.Values(kTopic)) {
+  for (const auto& value : ctx.Kafka.Values(kHTopic)) {
     ctx.Assert(value.find("reset my password") == std::string::npos, "the event carries the prompt text: %s; the topic is retained and replicated, ids only", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(!e.is_object() || !e.contains("prompt"), "the event has a prompt field: %s", value);

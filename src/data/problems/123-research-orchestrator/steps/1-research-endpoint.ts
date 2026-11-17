@@ -919,23 +919,23 @@ import (
 	"leetbuild/harness"
 )
 
-const apiQuery = "Compare the board composition of the five largest European banks"
+const kHApiQuery = "Compare the board composition of the five largest European banks"
 
 var (
-	factBudget    = jobs.Budget{MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000}
-	compareBudget = jobs.Budget{MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000}
-	deepBudget    = jobs.Budget{MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000}
+	hFactBudget    = jobs.Budget{MaxSubagents: 1, MaxToolCalls: 10, TokenBudget: 50000}
+	hCompareBudget = jobs.Budget{MaxSubagents: 4, MaxToolCalls: 60, TokenBudget: 250000}
+	hDeepBudget    = jobs.Budget{MaxSubagents: 10, MaxToolCalls: 150, TokenBudget: 1000000}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // start posts a research request; tenant or key "" leaves that header out.
-func start(c *harness.HTTP, tenant, key string, body map[string]any) *harness.Response {
-	payload := map[string]any{"query": apiQuery, "effort": "compare"}
+func hStart(c *harness.HTTP, tenant, key string, body map[string]any) *harness.Response {
+	payload := map[string]any{"query": kHApiQuery, "effort": "compare"}
 	for k, v := range body {
 		payload[k] = v
 	}
@@ -949,85 +949,85 @@ func start(c *harness.HTTP, tenant, key string, body map[string]any) *harness.Re
 	return c.Post("/v1/research", payload, headers...)
 }
 
-func jobOf(r *harness.Response) jobs.Job {
+func hJobOf(r *harness.Response) jobs.Job {
 	var job jobs.Job
 	r.Decode(&job)
 	return job
 }
 
-func queue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("research:queue", 0, -1) }
+func hQueue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("research:queue", 0, -1) }
 
 func CheckRoutes(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := start(c, "acme", "k-1", nil)
+	c := hApi(ctx)
+	r := hStart(c, "acme", "k-1", nil)
 	ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text())
-	job := jobOf(r)
+	job := hJobOf(r)
 	ctx.Assert(job.Status == "queued" && job.JobID != "", "the 202 must carry the queued job, got %s", r.Text())
-	ctx.Equal(queue(ctx), []string{job.JobID}, "the job must be enqueued for the lead agent workers; research:queue")
+	ctx.Equal(hQueue(ctx), []string{job.JobID}, "the job must be enqueued for the lead agent workers; research:queue")
 	s := c.Get("/v1/research/"+job.JobID, "X-Tenant-Id", "acme")
 	ctx.Equal(s.Status, 200, "GET /v1/research/%s (%s)", job.JobID, s.Text())
-	ctx.Equal(jobOf(s).JobID, job.JobID, "the status route's job_id")
+	ctx.Equal(hJobOf(s).JobID, job.JobID, "the status route's job_id")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := api(ctx)
-	ctx.Equal(start(c, "", "k-1", nil).Status, 401, "a request without X-Tenant-Id")
-	ctx.Equal(start(c, "acme", "k-2", map[string]any{"effort": "exhaustive"}).Status, 400, "an effort outside fact, compare and deep")
-	ctx.Equal(start(c, "acme", "k-6", map[string]any{"effort": "constructor"}).Status, 400, "the effort 'constructor' (only fact, compare and deep are efforts)")
-	ctx.Equal(start(c, "acme", "k-3", map[string]any{"query": strings.Repeat("é", 4097)}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)")
-	ctx.Equal(start(c, "acme", "k-4", map[string]any{"query": ""}).Status, 400, "an empty query")
-	ctx.Equal(len(queue(ctx)), 0, "refused requests must not enqueue a job; research:queue length")
-	r := start(c, "acme", "k-5", map[string]any{"query": strings.Repeat("q", 8192)})
+	c := hApi(ctx)
+	ctx.Equal(hStart(c, "", "k-1", nil).Status, 401, "a request without X-Tenant-Id")
+	ctx.Equal(hStart(c, "acme", "k-2", map[string]any{"effort": "exhaustive"}).Status, 400, "an effort outside fact, compare and deep")
+	ctx.Equal(hStart(c, "acme", "k-6", map[string]any{"effort": "constructor"}).Status, 400, "the effort 'constructor' (only fact, compare and deep are efforts)")
+	ctx.Equal(hStart(c, "acme", "k-3", map[string]any{"query": strings.Repeat("é", 4097)}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)")
+	ctx.Equal(hStart(c, "acme", "k-4", map[string]any{"query": ""}).Status, 400, "an empty query")
+	ctx.Equal(len(hQueue(ctx)), 0, "refused requests must not enqueue a job; research:queue length")
+	r := hStart(c, "acme", "k-5", map[string]any{"query": strings.Repeat("q", 8192)})
 	ctx.Equal(r.Status, 202, "a query of exactly 8192 bytes (%s)", r.Text())
-	ctx.Equal(len(queue(ctx)), 1, "the one valid job; research:queue length")
+	ctx.Equal(len(hQueue(ctx)), 1, "the one valid job; research:queue length")
 }
 
 func CheckBudgetTable(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := start(c, "acme", "k-1", map[string]any{"effort": "fact", "max_subagents": 50, "max_tool_calls": 100000, "token_budget": 1000000000})
+	c := hApi(ctx)
+	r := hStart(c, "acme", "k-1", map[string]any{"effort": "fact", "max_subagents": 50, "max_tool_calls": 100000, "token_budget": 1000000000})
 	ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text())
-	job := jobOf(r)
-	ctx.Equal(job.Budget, factBudget, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from effortBudgets, not the body")
-	ctx.Equal(jobs.GetJob(context.Background(), job.JobID).Budget, factBudget, "the stored job's budget")
-	ctx.Equal(jobOf(start(c, "acme", "k-2", map[string]any{"effort": "deep", "max_subagents": 1, "max_tool_calls": 3})).Budget, deepBudget, "a deep job asking for 3 tool calls must get the deep budget: a budget field in the body is ignored, larger or smaller")
-	ctx.Equal(jobOf(start(c, "acme", "k-3", nil)).Budget, compareBudget, "a compare job's budget")
-	r = c.Post("/v1/research", map[string]any{"query": apiQuery}, "X-Tenant-Id", "acme", "Idempotency-Key", "k-4")
+	job := hJobOf(r)
+	ctx.Equal(job.Budget, hFactBudget, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from effortBudgets, not the body")
+	ctx.Equal(jobs.GetJob(context.Background(), job.JobID).Budget, hFactBudget, "the stored job's budget")
+	ctx.Equal(hJobOf(hStart(c, "acme", "k-2", map[string]any{"effort": "deep", "max_subagents": 1, "max_tool_calls": 3})).Budget, hDeepBudget, "a deep job asking for 3 tool calls must get the deep budget: a budget field in the body is ignored, larger or smaller")
+	ctx.Equal(hJobOf(hStart(c, "acme", "k-3", nil)).Budget, hCompareBudget, "a compare job's budget")
+	r = c.Post("/v1/research", map[string]any{"query": kHApiQuery}, "X-Tenant-Id", "acme", "Idempotency-Key", "k-4")
 	ctx.Equal(r.Status, 202, "a request without an effort (%s)", r.Text())
-	ctx.Equal(jobOf(r).Budget, factBudget, "a request without an effort must get the fact budget")
+	ctx.Equal(hJobOf(r).Budget, hFactBudget, "a request without an effort must get the fact budget")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := start(c, "acme", "k-1", nil)
+	c := hApi(ctx)
+	first := hStart(c, "acme", "k-1", nil)
 	ctx.Equal(first.Status, 202, "the first start (%s)", first.Text())
-	replay := start(c, "acme", "k-1", nil)
-	ctx.Equal(jobOf(replay).JobID, jobOf(first).JobID, "a retry with the same Idempotency-Key must answer the first job; the job_id")
-	ctx.Equal(queue(ctx), []string{jobOf(first).JobID}, "a retry must not enqueue a second job; research:queue")
+	replay := hStart(c, "acme", "k-1", nil)
+	ctx.Equal(hJobOf(replay).JobID, hJobOf(first).JobID, "a retry with the same Idempotency-Key must answer the first job; the job_id")
+	ctx.Equal(hQueue(ctx), []string{hJobOf(first).JobID}, "a retry must not enqueue a second job; research:queue")
 	stored := ctx.Redis.Keys("research:job-*")
 	sort.Strings(stored)
-	ctx.Equal(stored, []string{jobs.JobKey(jobOf(first).JobID)}, "a retry must find its job with JobForKey, not create another; the job hashes after a start and its retry")
+	ctx.Equal(stored, []string{jobs.JobKey(hJobOf(first).JobID)}, "a retry must find its job with JobForKey, not create another; the job hashes after a start and its retry")
 	// A concurrent retry with key k-9 records its job between this request's lookup and its own record.
-	rival := jobs.CreateJob(context.Background(), "acme", apiQuery, "compare", compareBudget).JobID
+	rival := jobs.CreateJob(context.Background(), "acme", kHApiQuery, "compare", hCompareBudget).JobID
 	probe := ctx.Redis.After("research:idem:acme:k-9", func() any { return ctx.Redis.Set("research:idem:acme:k-9", rival) })
-	lost := start(c, "acme", "k-9", nil)
+	lost := hStart(c, "acme", "k-9", nil)
 	ctx.Assert(probe.Fired, "the start with Idempotency-Key k-9 never looked the key up")
-	ctx.Assert(lost.Status == 202 && jobOf(lost).JobID == rival, "a concurrent retry recorded %s under the key first, but the start answered %d %s: answer the job RememberKey says the key belongs to", rival, lost.Status, lost.Text())
-	ctx.Equal(queue(ctx), []string{jobOf(first).JobID}, "after a start lost the key to a concurrent retry, enqueue only your own job and only when the key is yours; research:queue")
-	other := start(c, "beta", "k-1", nil)
-	ctx.Assert(other.Status == 202 && jobOf(other).JobID != jobOf(first).JobID, "the same key from another tenant is another request: it must start its own job, got %s", other.Text())
-	ctx.Equal(start(c, "acme", "", nil).Status, 400, "a start without Idempotency-Key")
-	ctx.Equal(len(queue(ctx)), 2, "acme's job and beta's; research:queue length")
+	ctx.Assert(lost.Status == 202 && hJobOf(lost).JobID == rival, "a concurrent retry recorded %s under the key first, but the start answered %d %s: answer the job RememberKey says the key belongs to", rival, lost.Status, lost.Text())
+	ctx.Equal(hQueue(ctx), []string{hJobOf(first).JobID}, "after a start lost the key to a concurrent retry, enqueue only your own job and only when the key is yours; research:queue")
+	other := hStart(c, "beta", "k-1", nil)
+	ctx.Assert(other.Status == 202 && hJobOf(other).JobID != hJobOf(first).JobID, "the same key from another tenant is another request: it must start its own job, got %s", other.Text())
+	ctx.Equal(hStart(c, "acme", "", nil).Status, 400, "a start without Idempotency-Key")
+	ctx.Equal(len(hQueue(ctx)), 2, "acme's job and beta's; research:queue length")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	job := jobOf(start(c, "acme", "k-1", nil))
+	c := hApi(ctx)
+	job := hJobOf(hStart(c, "acme", "k-1", nil))
 	path := "/v1/research/" + job.JobID
 	other := c.Get(path, "X-Tenant-Id", "beta")
 	ctx.Equal(other.Status, 404, "tenant beta read acme's job (%s); another tenant's job is 404", other.Text())
 	ctx.Equal(c.Get(path).Status, 401, "a status request without X-Tenant-Id")
 	own := c.Get(path, "X-Tenant-Id", "acme")
-	ctx.Assert(own.Status == 200 && jobOf(own).JobID == job.JobID, "acme must read its own job, got %d %s", own.Status, own.Text())
+	ctx.Assert(own.Status == 200 && hJobOf(own).JobID == job.JobID, "acme must read its own job, got %d %s", own.Status, own.Text())
 	ctx.Equal(c.Get("/v1/research/job-999", "X-Tenant-Id", "acme").Status, 404, "an unknown job")
 }
 `,
@@ -1043,12 +1043,12 @@ func CheckTenantScope(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQuery = "Compare the board composition of the five largest European banks";
-const nlohmann::json kFact = {{"max_subagents", 1}, {"max_tool_calls", 10}, {"token_budget", 50000}};
-const nlohmann::json kCompare = {{"max_subagents", 4}, {"max_tool_calls", 60}, {"token_budget", 250000}};
-const nlohmann::json kDeep = {{"max_subagents", 10}, {"max_tool_calls", 150}, {"token_budget", 1000000}};
+const std::string kHQuery = "Compare the board composition of the five largest European banks";
+const nlohmann::json kHFact = {{"max_subagents", 1}, {"max_tool_calls", 10}, {"token_budget", 50000}};
+const nlohmann::json kHCompare = {{"max_subagents", 4}, {"max_tool_calls", 60}, {"token_budget", 250000}};
+const nlohmann::json kHDeep = {{"max_subagents", 10}, {"max_tool_calls", 150}, {"token_budget", 1000000}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1057,8 +1057,8 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // A research request; an empty tenant or key leaves that header out.
-harness::Response start(harness::HTTP& c, const std::string& tenant, const std::string& key, nlohmann::json body = nlohmann::json::object()) {
-  nlohmann::json payload = {{"query", kQuery}, {"effort", "compare"}};
+harness::Response hStart(harness::HTTP& c, const std::string& tenant, const std::string& key, nlohmann::json body = nlohmann::json::object()) {
+  nlohmann::json payload = {{"query", kHQuery}, {"effort", "compare"}};
   payload.update(body);
   std::vector<std::string> headers = {"Content-Type", "application/json"};
   if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
@@ -1066,96 +1066,96 @@ harness::Response start(harness::HTTP& c, const std::string& tenant, const std::
   return c.Send("POST", "/v1/research", payload.dump(), headers);
 }
 
-nlohmann::json jobOf(const harness::Response& r) {
+nlohmann::json hJobOf(const harness::Response& r) {
   const auto job = nlohmann::json::parse(r.Text(), nullptr, false);
   return job.is_object() ? job : nlohmann::json::object();
 }
 
-std::vector<std::string> queue(harness::Ctx& ctx) { return ctx.Redis.LRange("research:queue", 0, -1); }
+std::vector<std::string> hQueue(harness::Ctx& ctx) { return ctx.Redis.LRange("research:queue", 0, -1); }
 
 }  // namespace
 
 void CheckRoutes(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = start(c, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto r = hStart(c, "acme", "k-1");
   ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text());
-  const auto job = jobOf(r);
+  const auto job = hJobOf(r);
   const std::string job_id = job.value("job_id", "");
   ctx.Assert(job.value("status", "") == "queued" && !job_id.empty(), "the 202 must carry the queued job, got %s", r.Text());
-  ctx.Equal(queue(ctx), {job_id}, "the job must be enqueued for the lead agent workers; research:queue");
+  ctx.Equal(hQueue(ctx), {job_id}, "the job must be enqueued for the lead agent workers; research:queue");
   const auto s = c.Get("/v1/research/" + job_id, "X-Tenant-Id", "acme");
   ctx.Equal(s.Status, 200, "GET /v1/research/%s (%s)", job_id, s.Text());
-  ctx.Equal(jobOf(s).value("job_id", ""), job_id, "the status route's job_id");
+  ctx.Equal(hJobOf(s).value("job_id", ""), job_id, "the status route's job_id");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  ctx.Equal(start(c, "", "k-1").Status, 401, "a request without X-Tenant-Id");
-  ctx.Equal(start(c, "acme", "k-2", {{"effort", "exhaustive"}}).Status, 400, "an effort outside fact, compare and deep");
-  ctx.Equal(start(c, "acme", "k-6", {{"effort", "constructor"}}).Status, 400, "the effort 'constructor' (only fact, compare and deep are efforts)");
+  auto c = hApi(ctx);
+  ctx.Equal(hStart(c, "", "k-1").Status, 401, "a request without X-Tenant-Id");
+  ctx.Equal(hStart(c, "acme", "k-2", {{"effort", "exhaustive"}}).Status, 400, "an effort outside fact, compare and deep");
+  ctx.Equal(hStart(c, "acme", "k-6", {{"effort", "constructor"}}).Status, 400, "the effort 'constructor' (only fact, compare and deep are efforts)");
   std::string wide;
   for (int i = 0; i < 4097; i++) wide += "é";
-  ctx.Equal(start(c, "acme", "k-3", {{"query", wide}}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)");
-  ctx.Equal(start(c, "acme", "k-4", {{"query", ""}}).Status, 400, "an empty query");
-  ctx.Equal(queue(ctx).size(), 0, "refused requests must not enqueue a job; research:queue length");
-  const auto r = start(c, "acme", "k-5", {{"query", std::string(8192, 'q')}});
+  ctx.Equal(hStart(c, "acme", "k-3", {{"query", wide}}).Status, 413, "a query of 8194 bytes (4097 characters of UTF-8; the cap counts bytes)");
+  ctx.Equal(hStart(c, "acme", "k-4", {{"query", ""}}).Status, 400, "an empty query");
+  ctx.Equal(hQueue(ctx).size(), 0, "refused requests must not enqueue a job; research:queue length");
+  const auto r = hStart(c, "acme", "k-5", {{"query", std::string(8192, 'q')}});
   ctx.Equal(r.Status, 202, "a query of exactly 8192 bytes (%s)", r.Text());
-  ctx.Equal(queue(ctx).size(), 1, "the one valid job; research:queue length");
+  ctx.Equal(hQueue(ctx).size(), 1, "the one valid job; research:queue length");
 }
 
 void CheckBudgetTable(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = start(c, "acme", "k-1", {{"effort", "fact"}, {"max_subagents", 50}, {"max_tool_calls", 100000}, {"token_budget", 1000000000}});
+  auto c = hApi(ctx);
+  auto r = hStart(c, "acme", "k-1", {{"effort", "fact"}, {"max_subagents", 50}, {"max_tool_calls", 100000}, {"token_budget", 1000000000}});
   ctx.Equal(r.Status, 202, "POST /v1/research (%s)", r.Text());
-  const auto job = jobOf(r);
-  ctx.Equal(job.value("budget", nlohmann::json()), kFact, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from kEffortBudgets, not the body");
+  const auto job = hJobOf(r);
+  ctx.Equal(job.value("budget", nlohmann::json()), kHFact, "a fact job asking for 100000 tool calls must get the fact budget: the budget comes from kEffortBudgets, not the body");
   ctx.Equal(jobs::getJob(job.value("job_id", ""))->budget.max_tool_calls, 10, "the stored job's max_tool_calls");
-  ctx.Equal(jobOf(start(c, "acme", "k-2", {{"effort", "deep"}, {"max_subagents", 1}, {"max_tool_calls", 3}})).value("budget", nlohmann::json()), kDeep,
+  ctx.Equal(hJobOf(hStart(c, "acme", "k-2", {{"effort", "deep"}, {"max_subagents", 1}, {"max_tool_calls", 3}})).value("budget", nlohmann::json()), kHDeep,
             "a deep job asking for 3 tool calls must get the deep budget: a budget field in the body is ignored, larger or smaller");
-  ctx.Equal(jobOf(start(c, "acme", "k-3")).value("budget", nlohmann::json()), kCompare, "a compare job's budget");
-  r = c.Post("/v1/research", nlohmann::json{{"query", kQuery}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "Idempotency-Key", "k-4");
+  ctx.Equal(hJobOf(hStart(c, "acme", "k-3")).value("budget", nlohmann::json()), kHCompare, "a compare job's budget");
+  r = c.Post("/v1/research", nlohmann::json{{"query", kHQuery}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "Idempotency-Key", "k-4");
   ctx.Equal(r.Status, 202, "a request without an effort (%s)", r.Text());
-  ctx.Equal(jobOf(r).value("budget", nlohmann::json()), kFact, "a request without an effort must get the fact budget");
+  ctx.Equal(hJobOf(r).value("budget", nlohmann::json()), kHFact, "a request without an effort must get the fact budget");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = start(c, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto first = hStart(c, "acme", "k-1");
   ctx.Equal(first.Status, 202, "the first start (%s)", first.Text());
-  const std::string first_id = jobOf(first).value("job_id", "");
-  const auto replay = start(c, "acme", "k-1");
-  ctx.Equal(jobOf(replay).value("job_id", ""), first_id, "a retry with the same Idempotency-Key must answer the first job; the job_id");
-  ctx.Equal(queue(ctx), {first_id}, "a retry must not enqueue a second job; research:queue");
+  const std::string first_id = hJobOf(first).value("job_id", "");
+  const auto replay = hStart(c, "acme", "k-1");
+  ctx.Equal(hJobOf(replay).value("job_id", ""), first_id, "a retry with the same Idempotency-Key must answer the first job; the job_id");
+  ctx.Equal(hQueue(ctx), {first_id}, "a retry must not enqueue a second job; research:queue");
   auto stored = ctx.Redis.Keys("research:job-*");
   std::sort(stored.begin(), stored.end());
   ctx.Equal(stored, {jobs::jobKey(first_id)}, "a retry must find its job with jobs::jobForKey, not create another; the job hashes after a start and its retry");
   // A concurrent retry with key k-9 records its job between this request's lookup and its own record.
-  const std::string rival = jobs::createJob("acme", kQuery, "compare", {4, 60, 250000}).job_id;
+  const std::string rival = jobs::createJob("acme", kHQuery, "compare", {4, 60, 250000}).job_id;
   bool fired = false;
   ctx.Redis.After("research:idem:acme:k-9", [&ctx, &fired, rival] {
     fired = true;
     ctx.Redis.Set("research:idem:acme:k-9", rival);
   });
-  const auto lost = start(c, "acme", "k-9");
+  const auto lost = hStart(c, "acme", "k-9");
   ctx.Assert(fired, "the start with Idempotency-Key k-9 never looked the key up");
-  ctx.Assert(lost.Status == 202 && jobOf(lost).value("job_id", "") == rival,
+  ctx.Assert(lost.Status == 202 && hJobOf(lost).value("job_id", "") == rival,
              "a concurrent retry recorded %s under the key first, but the start answered %d %s: answer the job jobs::rememberKey says the key belongs to", rival, lost.Status, lost.Text());
-  ctx.Equal(queue(ctx), {first_id}, "after a start lost the key to a concurrent retry, enqueue only your own job and only when the key is yours; research:queue");
-  const auto other = start(c, "beta", "k-1");
-  ctx.Assert(other.Status == 202 && jobOf(other).value("job_id", "") != first_id, "the same key from another tenant is another request: it must start its own job, got %s", other.Text());
-  ctx.Equal(start(c, "acme", "").Status, 400, "a start without Idempotency-Key");
-  ctx.Equal(queue(ctx).size(), 2, "acme's job and beta's; research:queue length");
+  ctx.Equal(hQueue(ctx), {first_id}, "after a start lost the key to a concurrent retry, enqueue only your own job and only when the key is yours; research:queue");
+  const auto other = hStart(c, "beta", "k-1");
+  ctx.Assert(other.Status == 202 && hJobOf(other).value("job_id", "") != first_id, "the same key from another tenant is another request: it must start its own job, got %s", other.Text());
+  ctx.Equal(hStart(c, "acme", "").Status, 400, "a start without Idempotency-Key");
+  ctx.Equal(hQueue(ctx).size(), 2, "acme's job and beta's; research:queue length");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string job_id = jobOf(start(c, "acme", "k-1")).value("job_id", "");
+  auto c = hApi(ctx);
+  const std::string job_id = hJobOf(hStart(c, "acme", "k-1")).value("job_id", "");
   const std::string path = "/v1/research/" + job_id;
   const auto other = c.Get(path, "X-Tenant-Id", "beta");
   ctx.Equal(other.Status, 404, "tenant beta read acme's job (%s); another tenant's job is 404", other.Text());
   ctx.Equal(c.Get(path).Status, 401, "a status request without X-Tenant-Id");
   const auto own = c.Get(path, "X-Tenant-Id", "acme");
-  ctx.Assert(own.Status == 200 && jobOf(own).value("job_id", "") == job_id, "acme must read its own job, got %d %s", own.Status, own.Text());
+  ctx.Assert(own.Status == 200 && hJobOf(own).value("job_id", "") == job_id, "acme must read its own job, got %d %s", own.Status, own.Text());
   ctx.Equal(c.Get("/v1/research/job-999", "X-Tenant-Id", "acme").Status, 404, "an unknown job");
 }
 `,

@@ -760,10 +760,10 @@ import (
 	"leetbuild/harness"
 )
 
-const readQuoted = \`Tom & Jerry said "hi" & 'bye' &amp; <b>\`
+const kHReadQuoted = \`Tom & Jerry said "hi" & 'bye' &amp; <b>\`
 
 // readRawAmpersand reports whether s holds an & that starts no entity.
-func readRawAmpersand(s string) bool {
+func hReadRawAmpersand(s string) bool {
 	for i := strings.IndexByte(s, '&'); i >= 0; i = strings.IndexByte(s, '&') {
 		s = s[i:]
 		entity := false
@@ -778,36 +778,36 @@ func readRawAmpersand(s string) bool {
 	return false
 }
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readSeed(detail, reporter string) string {
-	created := store.InsertCase(readBg, "acme", "c-1", reporter, "spam", detail)
-	store.PutAction(readBg, map[string]any{"action_id": created.CaseID + ":remove", "case_id": created.CaseID, "content_id": "c-1", "tenant": "acme", "action": "remove", "label": "spam", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "classifier"})
+func hReadSeed(detail, reporter string) string {
+	created := store.InsertCase(hReadBg, "acme", "c-1", reporter, "spam", detail)
+	store.PutAction(hReadBg, map[string]any{"action_id": created.CaseID + ":remove", "case_id": created.CaseID, "content_id": "c-1", "tenant": "acme", "action": "remove", "label": "spam", "confidence": 0.99, "model_version": "clf-2026-10", "actor": "classifier"})
 	return created.CaseID
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(r *harness.Response) map[string]any {
+func hReadBody(r *harness.Response) map[string]any {
 	body, _ := r.JSON().(map[string]any)
 	return body
 }
 
-func readDetail(c *harness.HTTP, caseID string) string {
-	detail, _ := readBody(c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"))["detail"].(string)
+func hReadDetail(c *harness.HTTP, caseID string) string {
+	detail, _ := hReadBody(c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"))["detail"].(string)
 	return detail
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	caseID := readSeed("Spam link in bio", "u-17")
-	c := readClient(ctx)
+	caseID := hReadSeed("Spam link in bio", "u-17")
+	c := hReadClient(ctx)
 	r := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")
 	ctx.Equal(r.Status, 200, "GET /v1/moderation/items/%s (%s)", caseID, r.Text())
-	body := readBody(r)
+	body := hReadBody(r)
 	ctx.Assert(body["case_id"] == caseID && body["content_id"] == "c-1" && body["status"] == "open", "the case file must carry the case id, the content id and the status: %s", r.Text())
 	actions, _ := body["actions"].([]any)
 	ctx.Assert(len(actions) == 1 && actions[0].(map[string]any)["action"] == "remove", "the case file must list the actions persisted on c-1: %v", body["actions"])
@@ -816,8 +816,8 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	caseID := readSeed("Spam link in bio", "u-17")
-	c := readClient(ctx)
+	caseID := hReadSeed("Spam link in bio", "u-17")
+	c := hReadClient(ctx)
 	foreign := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor")
 	unknown := c.Get("/v1/moderation/items/case-404", "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor")
 	ctx.Equal(foreign.Status, 404, "globex read acme's case %s (%s)", caseID, foreign.Text())
@@ -825,8 +825,8 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckSurveyorOnly(ctx *harness.Ctx) {
-	caseID := readSeed("Spam link in bio", "u-17")
-	c := readClient(ctx)
+	caseID := hReadSeed("Spam link in bio", "u-17")
+	c := hReadClient(ctx)
 	for who, r := range map[string]*harness.Response{
 		"a moderator":                 c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"),
 		"a caller with no role":       c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme"),
@@ -834,40 +834,40 @@ func CheckSurveyorOnly(ctx *harness.Ctx) {
 		"the role 'surveyor-trainee'": c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor-trainee"),
 	} {
 		ctx.Equal(r.Status, 200, "%s (%s)", who, r.Text())
-		_, shown := readBody(r)["reporter_id"]
+		_, shown := hReadBody(r)["reporter_id"]
 		ctx.Assert(!shown && !strings.Contains(r.Text(), "u-17"), "%s was shown the reporter: %s. Only the role equal to surveyorRole sees it", who, r.Text())
 	}
 	surveyor := c.Get("/v1/moderation/items/"+caseID, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor")
-	ctx.Assert(surveyor.Status == 200 && readBody(surveyor)["reporter_id"] == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text())
+	ctx.Assert(surveyor.Status == 200 && hReadBody(surveyor)["reporter_id"] == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text())
 }
 
 func CheckDetailEscaped(ctx *harness.Ctx) {
-	caseID := readSeed(\`<img src=x onerror="alert(1)">\`, "u-17")
-	quotedCase := readSeed(readQuoted, "u-18")
-	c := readClient(ctx)
-	detail := readDetail(c, caseID)
+	caseID := hReadSeed(\`<img src=x onerror="alert(1)">\`, "u-17")
+	quotedCase := hReadSeed(kHReadQuoted, "u-18")
+	c := hReadClient(ctx)
+	detail := hReadDetail(c, caseID)
 	ctx.Assert(!strings.Contains(detail, "<img"), "the case file returned the detail as markup: %q. It runs in the moderator's console", detail)
 	ctx.Assert(strings.HasPrefix(detail, "&lt;img src=x onerror=") && strings.HasSuffix(detail, "&gt;"), "the detail must come back HTML-escaped, got %q", detail)
-	quoted := readDetail(c, quotedCase)
-	ctx.Assert(!strings.ContainsAny(quoted, "<>\\"'") && !readRawAmpersand(quoted), "the detail %q came back as %q: a character is left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in", readQuoted, quoted)
-	ctx.Equal(html.UnescapeString(quoted), readQuoted, "the detail must unescape to what the reporter wrote (it came back as %q)", quoted)
+	quoted := hReadDetail(c, quotedCase)
+	ctx.Assert(!strings.ContainsAny(quoted, "<>\\"'") && !hReadRawAmpersand(quoted), "the detail %q came back as %q: a character is left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in", kHReadQuoted, quoted)
+	ctx.Equal(html.UnescapeString(quoted), kHReadQuoted, "the detail must unescape to what the reporter wrote (it came back as %q)", quoted)
 }
 
 func CheckDetailBounded(ctx *harness.Ctx) {
-	longCase := readSeed(strings.Repeat("a", 279)+"<b>"+strings.Repeat("x", 5000), "u-17")
-	accentedCase := readSeed(strings.Repeat("é", 300), "u-18")
-	shortCase := readSeed(strings.Repeat("é", 200), "u-19")
-	emojiCase := readSeed(strings.Repeat("a", 279)+"😀"+strings.Repeat("b", 10), "u-20")
-	c := readClient(ctx)
-	long := readDetail(c, longCase)
+	longCase := hReadSeed(strings.Repeat("a", 279)+"<b>"+strings.Repeat("x", 5000), "u-17")
+	accentedCase := hReadSeed(strings.Repeat("é", 300), "u-18")
+	shortCase := hReadSeed(strings.Repeat("é", 200), "u-19")
+	emojiCase := hReadSeed(strings.Repeat("a", 279)+"😀"+strings.Repeat("b", 10), "u-20")
+	c := hReadClient(ctx)
+	long := hReadDetail(c, longCase)
 	ctx.Assert(long == strings.Repeat("a", 279)+"&lt;", "a 5282-character detail came back as %d characters ending %q, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)", utf8.RuneCountInString(long), long[max(0, len(long)-12):])
-	accented := readDetail(c, accentedCase)
+	accented := hReadDetail(c, accentedCase)
 	ctx.Equal(accented, strings.Repeat("é", 280), "300 accented characters must come back as the first 280; got %d characters", utf8.RuneCountInString(accented))
 	short := c.Get("/v1/moderation/items/"+shortCase, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")
 	ctx.Equal(short.Status, 200, "200 accented characters (400 bytes, under 280 characters) must come back whole")
-	whole, _ := readBody(short)["detail"].(string)
+	whole, _ := hReadBody(short)["detail"].(string)
 	ctx.Equal(whole, strings.Repeat("é", 200), "200 accented characters (400 bytes, under 280 characters) must come back whole; got %d characters", utf8.RuneCountInString(whole))
-	emoji := readDetail(c, emojiCase)
+	emoji := hReadDetail(c, emojiCase)
 	ctx.Equal(emoji, strings.Repeat("a", 279)+"😀", "279 a's, an emoji and 10 b's must come back as the first 280 characters (the emoji is one character); got %d characters", utf8.RuneCountInString(emoji))
 }
 `,
@@ -882,14 +882,14 @@ func CheckDetailBounded(ctx *harness.Ctx) {
 
 namespace {
 
-std::string readSeed(const std::string& detail, const std::string& reporter = "u-17") {
+std::string hReadSeed(const std::string& detail, const std::string& reporter = "u-17") {
   const store::Case created = store::insertCase("acme", "c-1", reporter, "spam", detail);
   store::putAction({{"action_id", created.case_id + ":remove"}, {"case_id", created.case_id}, {"content_id", "c-1"}, {"tenant", "acme"}, {"action", "remove"},
                     {"label", "spam"}, {"confidence", 0.99}, {"model_version", "clf-2026-10"}, {"actor", "classifier"}});
   return created.case_id;
 }
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -897,27 +897,27 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json readBody(const harness::Response& r) {
+nlohmann::json hReadBody(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-std::string readDetail(harness::HTTP& c, const std::string& case_id) {
-  return readBody(c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")).value("detail", "");
+std::string hReadDetail(harness::HTTP& c, const std::string& case_id) {
+  return hReadBody(c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator")).value("detail", "");
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
 }
 
-const std::string kQuoted = R"text(Tom & Jerry said "hi" & 'bye' &amp; <b>)text";
-const std::vector<std::pair<std::string, std::string>> kEntities = {{"&amp;", "&"}, {"&lt;", "<"},  {"&gt;", ">"},   {"&quot;", "\\""}, {"&apos;", "'"},
+const std::string kHQuoted = R"text(Tom & Jerry said "hi" & 'bye' &amp; <b>)text";
+const std::vector<std::pair<std::string, std::string>> kHEntities = {{"&amp;", "&"}, {"&lt;", "<"},  {"&gt;", ">"},   {"&quot;", "\\""}, {"&apos;", "'"},
                                                                     {"&#34;", "\\""}, {"&#39;", "'"}, {"&#x27;", "'"}, {"&#x22;", "\\""}};
 
 // The text with every entity of kEntities decoded; nullopt when an & starts none of them.
-std::optional<std::string> unescapeHtml(const std::string& text) {
+std::optional<std::string> hUnescapeHtml(const std::string& text) {
   std::string out;
   for (size_t i = 0; i < text.size();) {
     if (text[i] != '&') {
@@ -925,7 +925,7 @@ std::optional<std::string> unescapeHtml(const std::string& text) {
       continue;
     }
     bool entity = false;
-    for (const auto& [name, ch] : kEntities) {
+    for (const auto& [name, ch] : kHEntities) {
       if (text.compare(i, name.size(), name) == 0) {
         out += ch;
         i += name.size();
@@ -941,11 +941,11 @@ std::optional<std::string> unescapeHtml(const std::string& text) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string case_id = readSeed("Spam link in bio");
-  auto c = readClient(ctx);
+  const std::string case_id = hReadSeed("Spam link in bio");
+  auto c = hReadClient(ctx);
   const auto r = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator");
   ctx.Equal(r.Status, 200, "GET /v1/moderation/items/%s (%s)", case_id, r.Text());
-  const auto body = readBody(r);
+  const auto body = hReadBody(r);
   ctx.Assert(body.value("case_id", "") == case_id && body.value("content_id", "") == "c-1" && body.value("status", "") == "open",
              "the case file must carry the case id, the content id and the status: %s", r.Text());
   const auto actions = body.value("actions", nlohmann::json::array());
@@ -955,8 +955,8 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const std::string case_id = readSeed("Spam link in bio");
-  auto c = readClient(ctx);
+  const std::string case_id = hReadSeed("Spam link in bio");
+  auto c = hReadClient(ctx);
   const auto foreign = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor");
   const auto unknown = c.Get("/v1/moderation/items/case-404", "X-Tenant-Id", "globex", "X-Reviewer-Role", "surveyor");
   ctx.Equal(foreign.Status, 404, "globex read acme's case %s (%s)", case_id, foreign.Text());
@@ -964,8 +964,8 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckSurveyorOnly(harness::Ctx& ctx) {
-  const std::string case_id = readSeed("Spam link in bio");
-  auto c = readClient(ctx);
+  const std::string case_id = hReadSeed("Spam link in bio");
+  auto c = hReadClient(ctx);
   std::vector<std::pair<std::string, harness::Response>> readers;
   readers.emplace_back("a moderator", c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator"));
   readers.emplace_back("a caller with no role", c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme"));
@@ -974,43 +974,43 @@ void CheckSurveyorOnly(harness::Ctx& ctx) {
   }
   for (const auto& [who, r] : readers) {
     ctx.Equal(r.Status, 200, "%s (%s)", who, r.Text());
-    ctx.Assert(!readBody(r).contains("reporter_id") && r.Text().find("u-17") == std::string::npos,
+    ctx.Assert(!hReadBody(r).contains("reporter_id") && r.Text().find("u-17") == std::string::npos,
                "%s was shown the reporter: %s. Only the role equal to kSurveyorRole sees it", who, r.Text());
   }
   const auto surveyor = c.Get("/v1/moderation/items/" + case_id, "X-Tenant-Id", "acme", "X-Reviewer-Role", "surveyor");
-  ctx.Assert(surveyor.Status == 200 && readBody(surveyor).value("reporter_id", "") == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text());
+  ctx.Assert(surveyor.Status == 200 && hReadBody(surveyor).value("reporter_id", "") == "u-17", "a surveyor must see reporter_id u-17, got %s", surveyor.Text());
 }
 
 void CheckDetailEscaped(harness::Ctx& ctx) {
-  const std::string case_id = readSeed(R"html(<img src=x onerror="alert(1)">)html");
-  const std::string quoted_case = readSeed(kQuoted, "u-18");
-  auto c = readClient(ctx);
-  const std::string detail = readDetail(c, case_id);
+  const std::string case_id = hReadSeed(R"html(<img src=x onerror="alert(1)">)html");
+  const std::string quoted_case = hReadSeed(kHQuoted, "u-18");
+  auto c = hReadClient(ctx);
+  const std::string detail = hReadDetail(c, case_id);
   ctx.Assert(detail.find("<img") == std::string::npos, "the case file returned the detail as markup: %q. It runs in the moderator's console", detail);
   ctx.Assert(detail.rfind("&lt;img src=x onerror=", 0) == 0 && detail.size() >= 4 && detail.substr(detail.size() - 4) == "&gt;",
              "the detail must come back HTML-escaped, got %q", detail);
-  const std::string quoted = readDetail(c, quoted_case);
-  const auto decoded = unescapeHtml(quoted);
+  const std::string quoted = hReadDetail(c, quoted_case);
+  const auto decoded = hUnescapeHtml(quoted);
   ctx.Assert(quoted.find_first_of("<>\\"'") == std::string::npos && decoded,
-             "the detail %q came back as %q: a character is left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in", kQuoted, quoted);
-  ctx.Equal(decoded.value_or(""), kQuoted, "the detail must unescape to what the reporter wrote (it came back as %q)", quoted);
+             "the detail %q came back as %q: a character is left raw. Escape &, <, > and both quotes, or a quote closes the attribute the console puts it in", kHQuoted, quoted);
+  ctx.Equal(decoded.value_or(""), kHQuoted, "the detail must unescape to what the reporter wrote (it came back as %q)", quoted);
 }
 
 void CheckDetailBounded(harness::Ctx& ctx) {
-  const std::string long_case = readSeed(repeat("a", 279) + "<b>" + repeat("x", 5000));
-  const std::string accented_case = readSeed(repeat("é", 300), "u-18");
-  const std::string short_case = readSeed(repeat("é", 200), "u-19");
-  const std::string emoji_case = readSeed(repeat("a", 279) + "😀" + repeat("b", 10), "u-20");
-  auto c = readClient(ctx);
-  const std::string long_detail = readDetail(c, long_case);
-  ctx.Assert(long_detail == repeat("a", 279) + "&lt;",
+  const std::string long_case = hReadSeed(hRepeat("a", 279) + "<b>" + hRepeat("x", 5000));
+  const std::string accented_case = hReadSeed(hRepeat("é", 300), "u-18");
+  const std::string short_case = hReadSeed(hRepeat("é", 200), "u-19");
+  const std::string emoji_case = hReadSeed(hRepeat("a", 279) + "😀" + hRepeat("b", 10), "u-20");
+  auto c = hReadClient(ctx);
+  const std::string long_detail = hReadDetail(c, long_case);
+  ctx.Assert(long_detail == hRepeat("a", 279) + "&lt;",
              "a 5282-character detail came back as %d bytes ending %q, expected its first 280 characters escaped: 279 a's then &lt; (cut first, then escape)",
              long_detail.size(), long_detail.substr(long_detail.size() > 12 ? long_detail.size() - 12 : 0));
-  ctx.Equal(readDetail(c, accented_case), repeat("é", 280), "300 accented characters must come back as the first 280");
+  ctx.Equal(hReadDetail(c, accented_case), hRepeat("é", 280), "300 accented characters must come back as the first 280");
   const auto short_read = c.Get("/v1/moderation/items/" + short_case, "X-Tenant-Id", "acme", "X-Reviewer-Role", "moderator");
   ctx.Equal(short_read.Status, 200, "200 accented characters (400 bytes, under 280 characters) must come back whole");
-  ctx.Equal(readBody(short_read).value("detail", ""), repeat("é", 200), "200 accented characters (400 bytes, under 280 characters) must come back whole");
-  ctx.Equal(readDetail(c, emoji_case), repeat("a", 279) + "😀", "279 a's, an emoji and 10 b's must come back as the first 280 characters (the emoji is one character)");
+  ctx.Equal(hReadBody(short_read).value("detail", ""), hRepeat("é", 200), "200 accented characters (400 bytes, under 280 characters) must come back whole");
+  ctx.Equal(hReadDetail(c, emoji_case), hRepeat("a", 279) + "😀", "279 a's, an emoji and 10 b's must come back as the first 280 characters (the emoji is one character)");
 }
 `,
   },

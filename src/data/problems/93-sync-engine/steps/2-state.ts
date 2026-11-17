@@ -522,26 +522,26 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateApply(ctx *harness.Ctx, docID string, base int64, body, device string) store.Outcome {
-	outcome, err := applyChange(stateBg, docID, base, store.ContentHash(body), body, device)
+func hStateApply(ctx *harness.Ctx, docID string, base int64, body, device string) store.Outcome {
+	outcome, err := applyChange(hStateBg, docID, base, store.ContentHash(body), body, device)
 	ctx.NoError(err, "applyChange(%s, %d) failed", docID, base)
 	return outcome
 }
 
 func CheckAtomicApply(ctx *harness.Ctx) {
-	first := stateApply(ctx, "d-1", 0, "draft agenda", "laptop")
+	first := hStateApply(ctx, "d-1", 0, "draft agenda", "laptop")
 	ctx.Equal(first, store.Outcome{Status: "applied", Revision: 1}, "the first apply of d-1")
 	// The phone's edit of revision 1 lands while the laptop's edit of revision 1 is being applied.
 	rival := ctx.Redis.After("doc:d-1", func() any {
-		outcome, err := applyChange(stateBg, "d-1", 1, store.ContentHash("agenda: budget"), "agenda: budget", "phone")
+		outcome, err := applyChange(hStateBg, "d-1", 1, store.ContentHash("agenda: budget"), "agenda: budget", "phone")
 		if err != nil {
 			panic(err)
 		}
 		return outcome
 	})
-	mine := stateApply(ctx, "d-1", 1, "agenda: offsite", "laptop")
+	mine := hStateApply(ctx, "d-1", 1, "agenda: offsite", "laptop")
 	ctx.Assert(rival.Fired, "the apply never touched doc:d-1")
 	ctx.Assert(rival.Err == nil, "the phone's apply failed: %v", rival.Err)
 	theirs, _ := rival.Result.(store.Outcome)
@@ -552,13 +552,13 @@ func CheckAtomicApply(ctx *harness.Ctx) {
 	if theirs.Status == "applied" {
 		winner = "agenda: budget"
 	}
-	ctx.Equal(store.Head(stateBg, "d-1").Body, winner, "d-1 must hold the applied edit; its body")
+	ctx.Equal(store.Head(hStateBg, "d-1").Body, winner, "d-1 must hold the applied edit; its body")
 }
 
 func CheckGlobalRevision(ctx *harness.Ctx) {
-	a := stateApply(ctx, "d-1", 0, "groceries", "laptop")
-	b := stateApply(ctx, "d-2", 0, "call the plumber", "laptop")
-	c := stateApply(ctx, "d-1", a.Revision, "groceries: milk", "laptop")
+	a := hStateApply(ctx, "d-1", 0, "groceries", "laptop")
+	b := hStateApply(ctx, "d-2", 0, "call the plumber", "laptop")
+	c := hStateApply(ctx, "d-1", a.Revision, "groceries: milk", "laptop")
 	revisions := []int64{a.Revision, b.Revision, c.Revision}
 	ctx.Equal(revisions, []int64{1, 2, 3}, "three applies across two documents: when d-2 shares a revision with d-1, a device whose cursor is on it never sees one of them. Take every revision from INCR rev:seq; the revisions")
 	seq, _ := ctx.Redis.Get("rev:seq")
@@ -575,14 +575,14 @@ func CheckGlobalRevision(ctx *harness.Ctx) {
 		seen   float64
 	}
 	rival := ctx.Redis.After("rev:seq", func() any {
-		theirs, err := applyChange(stateBg, "d-3", 0, store.ContentHash("concert tickets"), "concert tickets", "phone")
+		theirs, err := applyChange(hStateBg, "d-3", 0, store.ContentHash("concert tickets"), "concert tickets", "phone")
 		if err != nil {
 			panic(err)
 		}
 		seen, _ := ctx.Redis.ZScore("changes", "d-2")
 		return rivalResult{theirs, seen}
 	})
-	mine := stateApply(ctx, "d-2", b.Revision, "call the plumber at 9", "laptop")
+	mine := hStateApply(ctx, "d-2", b.Revision, "call the plumber at 9", "laptop")
 	ctx.Assert(rival.Fired, "the apply never touched rev:seq")
 	ctx.Assert(rival.Err == nil, "d-3's apply failed: %v", rival.Err)
 	got, _ := rival.Result.(rivalResult)
@@ -592,16 +592,16 @@ func CheckGlobalRevision(ctx *harness.Ctx) {
 }
 
 func CheckSameContent(ctx *harness.Ctx) {
-	first := stateApply(ctx, "d-1", 0, "flight AF123, seat 14C", "laptop")
+	first := hStateApply(ctx, "d-1", 0, "flight AF123, seat 14C", "laptop")
 	// The phone saved the same confirmation before it heard of the laptop's revision.
-	twin := stateApply(ctx, "d-1", 0, "flight AF123, seat 14C", "phone")
+	twin := hStateApply(ctx, "d-1", 0, "flight AF123, seat 14C", "phone")
 	ctx.Equal(twin, store.Outcome{Status: "unchanged", Revision: first.Revision}, "the phone pushed the body the head already has (base 0): identical edits converge, answered unchanged at the head's revision")
-	echo := stateApply(ctx, "d-1", first.Revision, "flight AF123, seat 14C", "laptop")
+	echo := hStateApply(ctx, "d-1", first.Revision, "flight AF123, seat 14C", "laptop")
 	ctx.Equal(echo, store.Outcome{Status: "unchanged", Revision: first.Revision}, "the laptop pushed back the body it just wrote: an echo must not mint a revision every device downloads again")
-	ctx.Equal(store.Head(stateBg, "d-1").Revision, first.Revision, "d-1 must stay at its revision without a change of content; its revision")
+	ctx.Equal(store.Head(hStateBg, "d-1").Revision, first.Revision, "d-1 must stay at its revision without a change of content; its revision")
 	seq, _ := ctx.Redis.Get("rev:seq")
 	ctx.Equal(seq, fmt.Sprint(first.Revision), "rev:seq moves only when a revision is written; rev:seq after one applied revision and two unchanged pushes")
-	changed := stateApply(ctx, "d-1", first.Revision, "flight AF123, seat 15A", "laptop")
+	changed := hStateApply(ctx, "d-1", first.Revision, "flight AF123, seat 15A", "laptop")
 	ctx.Assert(changed.Status == "applied" && changed.Revision > first.Revision, "a real edit after the echoes must apply, got %+v", changed)
 }
 `,
@@ -614,42 +614,42 @@ func CheckSameContent(ctx *harness.Ctx) {
 
 namespace {
 
-store::Outcome stateApply(const std::string& doc_id, long long base, const std::string& body, const std::string& device = "laptop") {
+store::Outcome hStateApply(const std::string& doc_id, long long base, const std::string& body, const std::string& device = "laptop") {
   return applyChange(doc_id, base, store::contentHash(body), body, device);
 }
 
-std::string outcomeText(const store::Outcome& o) { return o.status + " at " + std::to_string(o.revision); }
+std::string hOutcomeText(const store::Outcome& o) { return o.status + " at " + std::to_string(o.revision); }
 
 }  // namespace
 
 void CheckAtomicApply(harness::Ctx& ctx) {
-  const store::Outcome first = stateApply("d-1", 0, "draft agenda");
-  ctx.Assert(first.status == "applied" && first.revision == 1, "the first apply of d-1 answered %s, expected applied at revision 1", outcomeText(first));
+  const store::Outcome first = hStateApply("d-1", 0, "draft agenda");
+  ctx.Assert(first.status == "applied" && first.revision == 1, "the first apply of d-1 answered %s, expected applied at revision 1", hOutcomeText(first));
   // The phone's edit of revision 1 lands while the laptop's edit of revision 1 is being applied.
   std::optional<store::Outcome> theirs;
   std::optional<std::string> failed;
   ctx.Redis.After("doc:d-1", [&] {
     try {
-      theirs = stateApply("d-1", 1, "agenda: budget", "phone");
+      theirs = hStateApply("d-1", 1, "agenda: budget", "phone");
     } catch (const std::exception& e) {
       failed = e.what();
     }
   });
-  const store::Outcome mine = stateApply("d-1", 1, "agenda: offsite", "laptop");
+  const store::Outcome mine = hStateApply("d-1", 1, "agenda: offsite", "laptop");
   ctx.Assert(!failed, "the phone's apply failed: %s", failed.value_or(""));
   ctx.Assert(theirs.has_value(), "the apply never touched doc:d-1");
   const bool one = (theirs->status == "applied") != (mine.status == "applied");
   ctx.Assert(one && (theirs->status == "conflict" || mine.status == "conflict"),
              "two edits of revision 1 landed together and were answered %s (phone) and %s (laptop): exactly one may apply, the other is a conflict. Run the compare and the writes in one script",
-             outcomeText(*theirs), outcomeText(mine));
+             hOutcomeText(*theirs), hOutcomeText(mine));
   const std::string winner = theirs->status == "applied" ? "agenda: budget" : "agenda: offsite";
   ctx.Equal(store::head("d-1")->body, winner, "d-1 must hold the applied edit; its body");
 }
 
 void CheckGlobalRevision(harness::Ctx& ctx) {
-  const store::Outcome a = stateApply("d-1", 0, "groceries");
-  const store::Outcome b = stateApply("d-2", 0, "call the plumber");
-  const store::Outcome c = stateApply("d-1", a.revision, "groceries: milk");
+  const store::Outcome a = hStateApply("d-1", 0, "groceries");
+  const store::Outcome b = hStateApply("d-2", 0, "call the plumber");
+  const store::Outcome c = hStateApply("d-1", a.revision, "groceries: milk");
   ctx.Assert(a.revision == 1 && b.revision == 2 && c.revision == 3,
              "three applies across two documents got revisions %d, %d, %d: when d-2 shares a revision with d-1, a device whose cursor is on it never sees one of them. Take every revision from INCR rev:seq",
              a.revision, b.revision, c.revision);
@@ -666,13 +666,13 @@ void CheckGlobalRevision(harness::Ctx& ctx) {
   std::optional<std::string> failed;
   ctx.Redis.After("rev:seq", [&] {
     try {
-      theirs = stateApply("d-3", 0, "concert tickets", "phone");
+      theirs = hStateApply("d-3", 0, "concert tickets", "phone");
       seen = ctx.Redis.ZScore("changes", "d-2");
     } catch (const std::exception& e) {
       failed = e.what();
     }
   });
-  const store::Outcome mine = stateApply("d-2", b.revision, "call the plumber at 9");
+  const store::Outcome mine = hStateApply("d-2", b.revision, "call the plumber at 9");
   ctx.Assert(!failed, "d-3's apply failed: %s", failed.value_or(""));
   ctx.Assert(theirs.has_value(), "the apply never touched rev:seq");
   ctx.Assert(seen == std::optional<double>(static_cast<double>(mine.revision)) && theirs->revision > mine.revision,
@@ -681,18 +681,18 @@ void CheckGlobalRevision(harness::Ctx& ctx) {
 }
 
 void CheckSameContent(harness::Ctx& ctx) {
-  const store::Outcome first = stateApply("d-1", 0, "flight AF123, seat 14C", "laptop");
+  const store::Outcome first = hStateApply("d-1", 0, "flight AF123, seat 14C", "laptop");
   // The phone saved the same confirmation before it heard of the laptop's revision.
-  const store::Outcome twin = stateApply("d-1", 0, "flight AF123, seat 14C", "phone");
+  const store::Outcome twin = hStateApply("d-1", 0, "flight AF123, seat 14C", "phone");
   ctx.Assert(twin.status == "unchanged" && twin.revision == first.revision,
-             "the phone pushed the body the head already has (base 0) and got %s: identical edits converge. Answer unchanged at the head's revision", outcomeText(twin));
-  const store::Outcome echo = stateApply("d-1", first.revision, "flight AF123, seat 14C", "laptop");
+             "the phone pushed the body the head already has (base 0) and got %s: identical edits converge. Answer unchanged at the head's revision", hOutcomeText(twin));
+  const store::Outcome echo = hStateApply("d-1", first.revision, "flight AF123, seat 14C", "laptop");
   ctx.Assert(echo.status == "unchanged" && echo.revision == first.revision,
-             "the laptop pushed back the body it just wrote and got %s: an echo must not mint a revision every device downloads again", outcomeText(echo));
+             "the laptop pushed back the body it just wrote and got %s: an echo must not mint a revision every device downloads again", hOutcomeText(echo));
   ctx.Equal(store::head("d-1")->revision, first.revision, "d-1 must stay at its revision without a change of content; its revision");
   ctx.Equal(ctx.Redis.Get("rev:seq"), std::optional<std::string>(std::to_string(first.revision)), "rev:seq moves only when a revision is written; rev:seq after one applied revision and two unchanged pushes");
-  const store::Outcome changed = stateApply("d-1", first.revision, "flight AF123, seat 15A");
-  ctx.Assert(changed.status == "applied" && changed.revision > first.revision, "a real edit after the echoes must apply, got %s", outcomeText(changed));
+  const store::Outcome changed = hStateApply("d-1", first.revision, "flight AF123, seat 15A");
+  ctx.Assert(changed.status == "applied" && changed.revision > first.revision, "a real edit after the echoes must apply, got %s", hOutcomeText(changed));
 }
 `,
   },

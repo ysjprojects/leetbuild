@@ -877,17 +877,17 @@ import (
 )
 
 var (
-	apiBg     = context.Background()
-	apiServed = map[string]bool{"en": true, "fr": true, "de": true, "es": true, "ja": true, "pt": true}
+	hApiBg     = context.Background()
+	hApiServed = map[string]bool{"en": true, "fr": true, "de": true, "es": true, "ja": true, "pt": true}
 )
 
 // apiModel answers '[target] text' with every glossary term applied; a pair it does not serve is InvalidArgument.
-type apiModel struct {
+type HApiModel struct {
 	pb.UnimplementedTranslatorServer
 }
 
-func (apiModel) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.TranslateReply, error) {
-	if !apiServed[req.GetSource()] || !apiServed[req.GetTarget()] || req.GetSource() == req.GetTarget() {
+func (HApiModel) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.TranslateReply, error) {
+	if !hApiServed[req.GetSource()] || !hApiServed[req.GetTarget()] || req.GetSource() == req.GetTarget() {
 		return nil, status.Errorf(codes.InvalidArgument, "pair %s->%s is not served", req.GetSource(), req.GetTarget())
 	}
 	out := req.GetText()
@@ -897,95 +897,95 @@ func (apiModel) Translate(_ context.Context, req *pb.TranslateRequest) (*pb.Tran
 	return &pb.TranslateReply{Text: "[" + req.GetTarget() + "] " + out, Model: "mt-2026-10"}, nil
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterTranslatorServer(ctx.GRPC.Server(""), apiModel{})
+func hApi(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterTranslatorServer(ctx.GRPC.Server(""), HApiModel{})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Translate", "")) }
+func hApiCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Translate", "")) }
 
-func post(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
+func hPost(c *harness.HTTP, body map[string]any, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Post("/v1/translations", body)
 	}
 	return c.Post("/v1/translations", body, "X-Tenant-Id", tenant)
 }
 
-func answer(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hAnswer(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the answer is not a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, map[string]any{"text": "the invoice is ready", "source": "en", "target": "fr"}, "acme")
+	c := hApi(ctx)
+	r := hPost(c, map[string]any{"text": "the invoice is ready", "source": "en", "target": "fr"}, "acme")
 	ctx.Equal(r.Status, 200, "POST /v1/translations (%s)", r.Text())
-	body := answer(ctx, r)
+	body := hAnswer(ctx, r)
 	ctx.Assert(body["translation"] == "[fr] the invoice is ready" && body["marker"] == nil && body["glossary_version"] == float64(0), "a tenant with no glossary got %s", r.Text())
-	missing := post(c, map[string]any{"text": "the invoice is ready", "source": "en", "target": "fr"}, "")
+	missing := hPost(c, map[string]any{"text": "the invoice is ready", "source": "en", "target": "fr"}, "")
 	ctx.Equal(missing.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckTextCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	atCap := post(c, map[string]any{"text": strings.Repeat("a", 16384), "source": "en", "target": "fr"}, "acme")
+	c := hApi(ctx)
+	atCap := hPost(c, map[string]any{"text": strings.Repeat("a", 16384), "source": "en", "target": "fr"}, "acme")
 	ctx.Equal(atCap.Status, 200, "a text of exactly 16 KiB (%s)", atCap.Text())
-	over := post(c, map[string]any{"text": strings.Repeat("a", 16385), "source": "en", "target": "fr"}, "acme")
+	over := hPost(c, map[string]any{"text": strings.Repeat("a", 16385), "source": "en", "target": "fr"}, "acme")
 	ctx.Equal(over.Status, 413, "a text of 16 KiB + 1 byte")
-	wide := post(c, map[string]any{"text": strings.Repeat("日", 6000), "source": "ja", "target": "en"}, "acme")
+	wide := hPost(c, map[string]any{"text": strings.Repeat("日", 6000), "source": "ja", "target": "en"}, "acme")
 	ctx.Equal(wide.Status, 413, "6000 kanji are 18000 bytes of UTF-8: the cap is in bytes, not characters; the status")
-	empty := post(c, map[string]any{"text": "", "source": "en", "target": "fr"}, "acme")
+	empty := hPost(c, map[string]any{"text": "", "source": "en", "target": "fr"}, "acme")
 	ctx.Equal(empty.Status, 400, "an empty text")
-	number := post(c, map[string]any{"text": 42, "source": "en", "target": "fr"}, "acme")
+	number := hPost(c, map[string]any{"text": 42, "source": "en", "target": "fr"}, "acme")
 	ctx.Equal(number.Status, 400, "a text that is not a string")
-	ctx.Equal(apiCalls(ctx), 1, "only the text within the cap may reach the model; the Translate calls")
+	ctx.Equal(hApiCalls(ctx), 1, "only the text within the cap may reach the model; the Translate calls")
 }
 
 func CheckLanguagePair(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, pair := range [][2]string{{"en", "tlh"}, {"xx", "fr"}, {"en", "en"}} {
-		r := post(c, map[string]any{"text": "the invoice is ready", "source": pair[0], "target": pair[1]}, "acme")
+		r := hPost(c, map[string]any{"text": "the invoice is ready", "source": pair[0], "target": pair[1]}, "acme")
 		ctx.Equal(r.Status, 400, "%s->%s (%s)", pair[0], pair[1], r.Text())
 	}
-	ctx.Equal(apiCalls(ctx), 0, "unsupported pairs reached the model: check allowedLanguages and source != target before the text leaves the service; the Translate calls")
+	ctx.Equal(hApiCalls(ctx), 0, "unsupported pairs reached the model: check allowedLanguages and source != target before the text leaves the service; the Translate calls")
 }
 
 func CheckIdentityMarker(ctx *harness.Ctx) {
-	c := api(ctx)
-	same := post(c, map[string]any{"text": "le chat est sur la table", "source": "en", "target": "fr"}, "acme")
+	c := hApi(ctx)
+	same := hPost(c, map[string]any{"text": "le chat est sur la table", "source": "en", "target": "fr"}, "acme")
 	ctx.Equal(same.Status, 200, "French text sent for French (%s)", same.Text())
-	body := answer(ctx, same)
+	body := hAnswer(ctx, same)
 	ctx.Assert(body["marker"] == "untranslated" && body["translation"] == "le chat est sur la table", "French text sent for French answered %s: without marker untranslated a cache keeps it as a translation", same.Text())
-	ctx.Equal(apiCalls(ctx), 0, "text already in the target language must not be sent to the model; the Translate calls")
-	other := post(c, map[string]any{"text": "the cat is on the table", "source": "en", "target": "fr"}, "acme")
-	ctx.Assert(other.Status == 200 && answer(ctx, other)["marker"] == nil, "English text for French answered %d %s, expected a translation with no marker", other.Status, other.Text())
+	ctx.Equal(hApiCalls(ctx), 0, "text already in the target language must not be sent to the model; the Translate calls")
+	other := hPost(c, map[string]any{"text": "the cat is on the table", "source": "en", "target": "fr"}, "acme")
+	ctx.Assert(other.Status == 200 && hAnswer(ctx, other)["marker"] == nil, "English text for French answered %d %s, expected a translation with no marker", other.Status, other.Text())
 }
 
 func CheckGlossaryBinding(ctx *harness.Ctx) {
-	c := api(ctx)
-	_, err := glossary.PublishTerms(apiBg, "acme", "en", "fr", map[string]string{"Dashboard": "Tableau de bord"})
+	c := hApi(ctx)
+	_, err := glossary.PublishTerms(hApiBg, "acme", "en", "fr", map[string]string{"Dashboard": "Tableau de bord"})
 	ctx.NoError(err, "seeding glossary version 1")
-	_, err = glossary.PublishTerms(apiBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
+	_, err = glossary.PublishTerms(hApiBg, "acme", "en", "fr", map[string]string{"Dashboard": "Panneau"})
 	ctx.NoError(err, "seeding glossary version 2")
-	pinned := post(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 1}, "acme")
+	pinned := hPost(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 1}, "acme")
 	ctx.Equal(pinned.Status, 200, "a request pinning glossary version 1 (%s)", pinned.Text())
-	body := answer(ctx, pinned)
+	body := hAnswer(ctx, pinned)
 	ctx.Assert(body["glossary_version"] == float64(1) && body["translation"] == "[fr] Open the Tableau de bord", "a request pinning glossary version 1 got %s: it was translated with another version's terms", pinned.Text())
 	sent := ctx.GRPC.CallsTo("Translate", "")
 	ctx.Equal(sent[len(sent)-1].Request.(*pb.TranslateRequest).GetGlossaryVersion(), int64(1), "the glossary version the model was told")
-	active := answer(ctx, post(c, map[string]any{"text": "Close the Dashboard", "source": "en", "target": "fr"}, "acme"))
+	active := hAnswer(ctx, hPost(c, map[string]any{"text": "Close the Dashboard", "source": "en", "target": "fr"}, "acme"))
 	ctx.Assert(active["glossary_version"] == float64(2) && active["translation"] == "[fr] Close the Panneau", "with no version pinned the active version 2 applies, got %v", active)
-	before := apiCalls(ctx)
-	unknown := post(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 7}, "acme")
+	before := hApiCalls(ctx)
+	unknown := hPost(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 7}, "acme")
 	ctx.Equal(unknown.Status, 404, "an unknown glossary version (%s)", unknown.Text())
-	other := post(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 1}, "globex")
+	other := hPost(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 1}, "globex")
 	ctx.Equal(other.Status, 404, "globex pinning acme's version 1")
-	zero := post(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 0}, "acme")
+	zero := hPost(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 0}, "acme")
 	ctx.Equal(zero.Status, 404, "versions start at 1, and a pinned 0 is not the active version; glossary version 0")
-	ctx.Equal(apiCalls(ctx), before, "a request with an unknown glossary version must not reach the model; the Translate calls")
+	ctx.Equal(hApiCalls(ctx), before, "a request with an unknown glossary version must not reach the model; the Translate calls")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1000,7 +1000,7 @@ namespace {
 using json = nlohmann::json;
 
 // The model: '[target] text' with every glossary term applied; a pair it does not serve is INVALID_ARGUMENT.
-class ApiModel final : public translationsvc::Translator::Service {
+class HApiModel final : public translationsvc::Translator::Service {
  public:
   grpc::Status Translate(grpc::ServerContext*, const translationsvc::TranslateRequest* req, translationsvc::TranslateReply* out) override {
     static const std::set<std::string> served = {"en", "fr", "de", "es", "ja", "pt"};
@@ -1019,11 +1019,11 @@ class ApiModel final : public translationsvc::Translator::Service {
   }
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
-  static ApiModel* model = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  static HApiModel* model = nullptr;
   static httplib::Server* svr = nullptr;
   delete model;
-  model = new ApiModel;
+  model = new HApiModel;
   ctx.GRPC.Server("")->RegisterService(model);
   delete svr;
   svr = new httplib::Server;
@@ -1031,14 +1031,14 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Translate").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Translate").size(); }
 
-harness::Response post(harness::HTTP& c, const json& body, const std::string& tenant = "acme") {
+harness::Response hPost(harness::HTTP& c, const json& body, const std::string& tenant = "acme") {
   if (tenant.empty()) return c.Post("/v1/translations", body.dump(), "Content-Type", "application/json");
   return c.Post("/v1/translations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-json answer(harness::Ctx& ctx, const harness::Response& r) {
+json hAnswer(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the answer is not a JSON object: %s", r.Text());
   return body;
@@ -1047,73 +1047,73 @@ json answer(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, {{"text", "the invoice is ready"}, {"source", "en"}, {"target", "fr"}});
+  auto c = hApi(ctx);
+  const auto r = hPost(c, {{"text", "the invoice is ready"}, {"source", "en"}, {"target", "fr"}});
   ctx.Equal(r.Status, 200, "POST /v1/translations (%s)", r.Text());
-  ctx.Equal(answer(ctx, r), json{{"translation", "[fr] the invoice is ready"}, {"marker", nullptr}, {"glossary_version", 0}}, "a tenant with no glossary; the answer");
-  const auto missing = post(c, {{"text", "the invoice is ready"}, {"source", "en"}, {"target", "fr"}}, "");
+  ctx.Equal(hAnswer(ctx, r), json{{"translation", "[fr] the invoice is ready"}, {"marker", nullptr}, {"glossary_version", 0}}, "a tenant with no glossary; the answer");
+  const auto missing = hPost(c, {{"text", "the invoice is ready"}, {"source", "en"}, {"target", "fr"}}, "");
   ctx.Equal(missing.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckTextCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto atCap = post(c, {{"text", std::string(16384, 'a')}, {"source", "en"}, {"target", "fr"}});
+  auto c = hApi(ctx);
+  const auto atCap = hPost(c, {{"text", std::string(16384, 'a')}, {"source", "en"}, {"target", "fr"}});
   ctx.Equal(atCap.Status, 200, "a text of exactly 16 KiB (%s)", atCap.Text());
-  const auto over = post(c, {{"text", std::string(16385, 'a')}, {"source", "en"}, {"target", "fr"}});
+  const auto over = hPost(c, {{"text", std::string(16385, 'a')}, {"source", "en"}, {"target", "fr"}});
   ctx.Equal(over.Status, 413, "a text of 16 KiB + 1 byte");
   std::string kanji;
   for (int i = 0; i < 6000; i++) kanji += "日";
-  const auto wide = post(c, {{"text", kanji}, {"source", "ja"}, {"target", "en"}});
+  const auto wide = hPost(c, {{"text", kanji}, {"source", "ja"}, {"target", "en"}});
   ctx.Equal(wide.Status, 413, "6000 kanji are 18000 bytes of UTF-8: the cap is in bytes, not characters; the status");
-  const auto empty = post(c, {{"text", ""}, {"source", "en"}, {"target", "fr"}});
+  const auto empty = hPost(c, {{"text", ""}, {"source", "en"}, {"target", "fr"}});
   ctx.Equal(empty.Status, 400, "an empty text");
-  const auto number = post(c, {{"text", 42}, {"source", "en"}, {"target", "fr"}});
+  const auto number = hPost(c, {{"text", 42}, {"source", "en"}, {"target", "fr"}});
   ctx.Equal(number.Status, 400, "a text that is not a string");
-  ctx.Equal(calls(ctx), 1, "only the text within the cap may reach the model; the Translate calls");
+  ctx.Equal(hCalls(ctx), 1, "only the text within the cap may reach the model; the Translate calls");
 }
 
 void CheckLanguagePair(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const auto& [source, target] : std::vector<std::pair<std::string, std::string>>{{"en", "tlh"}, {"xx", "fr"}, {"en", "en"}}) {
-    const auto r = post(c, {{"text", "the invoice is ready"}, {"source", source}, {"target", target}});
+    const auto r = hPost(c, {{"text", "the invoice is ready"}, {"source", source}, {"target", target}});
     ctx.Equal(r.Status, 400, "%s->%s (%s)", source, target, r.Text());
   }
-  ctx.Equal(calls(ctx), 0, "unsupported pairs reached the model: check kAllowedLanguages and source != target before the text leaves the service; the Translate calls");
+  ctx.Equal(hCalls(ctx), 0, "unsupported pairs reached the model: check kAllowedLanguages and source != target before the text leaves the service; the Translate calls");
 }
 
 void CheckIdentityMarker(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto same = post(c, {{"text", "le chat est sur la table"}, {"source", "en"}, {"target", "fr"}});
+  auto c = hApi(ctx);
+  const auto same = hPost(c, {{"text", "le chat est sur la table"}, {"source", "en"}, {"target", "fr"}});
   ctx.Equal(same.Status, 200, "French text sent for French (%s)", same.Text());
-  const json body = answer(ctx, same);
+  const json body = hAnswer(ctx, same);
   ctx.Assert(body.value("marker", json()) == "untranslated" && body.value("translation", "") == "le chat est sur la table",
              "French text sent for French answered %s: without marker untranslated a cache keeps it as a translation", same.Text());
-  ctx.Equal(calls(ctx), 0, "text already in the target language must not be sent to the model; the Translate calls");
-  const auto other = post(c, {{"text", "the cat is on the table"}, {"source", "en"}, {"target", "fr"}});
-  ctx.Assert(other.Status == 200 && answer(ctx, other).value("marker", json("absent")).is_null(), "English text for French answered %d %s, expected a translation with no marker", other.Status, other.Text());
+  ctx.Equal(hCalls(ctx), 0, "text already in the target language must not be sent to the model; the Translate calls");
+  const auto other = hPost(c, {{"text", "the cat is on the table"}, {"source", "en"}, {"target", "fr"}});
+  ctx.Assert(other.Status == 200 && hAnswer(ctx, other).value("marker", json("absent")).is_null(), "English text for French answered %d %s, expected a translation with no marker", other.Status, other.Text());
 }
 
 void CheckGlossaryBinding(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   glossary::publishTerms("acme", "en", "fr", {{"Dashboard", "Tableau de bord"}});
   glossary::publishTerms("acme", "en", "fr", {{"Dashboard", "Panneau"}});
-  const auto pinned = post(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 1}});
+  const auto pinned = hPost(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 1}});
   ctx.Equal(pinned.Status, 200, "a request pinning glossary version 1 (%s)", pinned.Text());
-  const json body = answer(ctx, pinned);
+  const json body = hAnswer(ctx, pinned);
   ctx.Assert(body.value("glossary_version", 0L) == 1 && body.value("translation", "") == "[fr] Open the Tableau de bord",
              "a request pinning glossary version 1 got %s: it was translated with another version's terms", pinned.Text());
   const auto sent = ctx.GRPC.CallsTo("Translate");
   ctx.Equal(sent.back().Request<translationsvc::TranslateRequest>().glossary_version(), 1, "the glossary version the model was told");
-  const json active = answer(ctx, post(c, {{"text", "Close the Dashboard"}, {"source", "en"}, {"target", "fr"}}));
+  const json active = hAnswer(ctx, hPost(c, {{"text", "Close the Dashboard"}, {"source", "en"}, {"target", "fr"}}));
   ctx.Assert(active.value("glossary_version", 0L) == 2 && active.value("translation", "") == "[fr] Close the Panneau", "with no version pinned the active version 2 applies, got %s", active.dump());
-  const size_t before = calls(ctx);
-  const auto unknown = post(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 7}});
+  const size_t before = hCalls(ctx);
+  const auto unknown = hPost(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 7}});
   ctx.Equal(unknown.Status, 404, "an unknown glossary version (%s)", unknown.Text());
-  const auto other = post(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 1}}, "globex");
+  const auto other = hPost(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 1}}, "globex");
   ctx.Equal(other.Status, 404, "globex pinning acme's version 1");
-  const auto zero = post(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 0}});
+  const auto zero = hPost(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 0}});
   ctx.Equal(zero.Status, 404, "versions start at 1, and a pinned 0 is not the active version; glossary version 0");
-  ctx.Equal(calls(ctx), before, "a request with an unknown glossary version must not reach the model; the Translate calls");
+  ctx.Equal(hCalls(ctx), before, "a request with an unknown glossary version must not reach the model; the Translate calls");
 }
 `,
   },

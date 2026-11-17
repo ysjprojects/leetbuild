@@ -911,22 +911,22 @@ import (
 )
 
 const (
-	eventsTopic = "triage.decided"
-	eventsText  = "Refund for invoice 4411: my card ending 4242 was charged twice"
+	kHEventsTopic = "triage.decided"
+	kHEventsText  = "Refund for invoice 4411: my card ending 4242 was charged twice"
 )
 
-func eventsTicket(ticketID, tenant string) Ticket {
-	return Ticket{TicketID: ticketID, Tenant: tenant, Text: eventsText, ReceivedAt: 1760000000}
+func hEventsTicket(ticketID, tenant string) Ticket {
+	return Ticket{TicketID: ticketID, Tenant: tenant, Text: kHEventsText, ReceivedAt: 1760000000}
 }
 
-func eventsDecision(queue, priority, reason string) rules.Decision {
+func hEventsDecision(queue, priority, reason string) rules.Decision {
 	if reason != "" {
 		return rules.Decision{Queue: queue, Priority: priority, Confidence: 0.5, FallbackReason: reason, RulesetVersion: "v3"}
 	}
 	return rules.Decision{Queue: queue, Priority: priority, Confidence: 0.92}
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, row := range ctx.Redis.LRange("outbox:triage.decided", 0, -1) {
 		var v map[string]any
@@ -937,13 +937,13 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	publishDecision(context.Background(), eventsTicket("t-1", "acme"), eventsDecision("billing", "normal", ""))
-	publishDecision(context.Background(), eventsTicket("t-2", "globex"), eventsDecision("delivery", "normal", ""))
-	publishDecision(context.Background(), eventsTicket("t-3", "acme"), eventsDecision("account", "urgent", ""))
+	publishDecision(context.Background(), hEventsTicket("t-1", "acme"), hEventsDecision("billing", "normal", ""))
+	publishDecision(context.Background(), hEventsTicket("t-2", "globex"), hEventsDecision("delivery", "normal", ""))
+	publishDecision(context.Background(), hEventsTicket("t-3", "acme"), hEventsDecision("account", "urgent", ""))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three routed tickets must produce three records on %s; the records", eventsTopic)
-	keys := ctx.Kafka.Keys(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three routed tickets must produce three records on %s; the records", kHEventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"acme", "acme", "globex"}, "records must be keyed by the tenant (keyed by queue, one tenant's tickets scatter over partitions and reach the routing consumer out of order; an async writer batches per partition, so the order across tenants is free)")
 	var acme []int
@@ -956,9 +956,9 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckIdsNotText(ctx *harness.Ctx) {
-	publishDecision(context.Background(), eventsTicket("t-1", "acme"), eventsDecision("billing", "normal", "classifier_timeout"))
+	publishDecision(context.Background(), hEventsTicket("t-1", "acme"), hEventsDecision("billing", "normal", "classifier_timeout"))
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one routed ticket; the records")
 	ctx.Assert(!strings.Contains(values[0], "4242") && !strings.Contains(values[0], "charged twice"), "the event carries the ticket text: %s. The topic is retained and replicated to every consumer: ids and scores only", values[0])
 	var event map[string]any
@@ -968,33 +968,33 @@ func CheckIdsNotText(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnReject(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
 	func() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Fatalf("publishDecision panicked when the broker refused the record: %v; the event goes to the outbox and the request goes on", e)
 			}
 		}()
-		publishDecision(context.Background(), eventsTicket("t-1", "acme"), eventsDecision("billing", "normal", ""))
+		publishDecision(context.Background(), hEventsTicket("t-1", "acme"), hEventsDecision("billing", "normal", ""))
 	}()
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one record: the refusal reaches the writer's Completion, after WriteMessages has returned; outbox:triage.decided rows")
 	ctx.Equal(rows[0], map[string]any{"ticket_id": "t-1", "tenant": "acme", "queue": "billing", "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000},
 		"the outbox row must be the event the topic would have carried: the relay republishes it as it is")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing may reach the topic for the refused record; the records")
-	publishDecision(context.Background(), eventsTicket("t-2", "acme"), eventsDecision("billing", "normal", ""))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "nothing may reach the topic for the refused record; the records")
+	publishDecision(context.Background(), hEventsTicket("t-2", "acme"), hEventsDecision("billing", "normal", ""))
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 1, "a delivered record reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(kHEventsTopic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a delivered record reaches the topic and adds no outbox row")
 }
 
 func CheckRecordBeforeCommit(ctx *harness.Ctx) {
 	seeded := [][3]string{{"t-1", "acme", "billing"}, {"t-2", "acme", "billing"}, {"t-3", "globex", "delivery"}}
 	for _, s := range seeded {
 		value, _ := json.Marshal(map[string]any{"ticket_id": s[0], "tenant": s[1], "queue": s[2], "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000})
-		ctx.Kafka.Seed(eventsTopic, s[1], string(value))
+		ctx.Kafka.Seed(kHEventsTopic, s[1], string(value))
 	}
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	var early []string
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		for _, r := range records {
@@ -1002,26 +1002,26 @@ func CheckRecordBeforeCommit(ctx *harness.Ctx) {
 			json.Unmarshal(r.Value, &event)
 			tenant, _ := event["tenant"].(string)
 			ticketID, _ := event["ticket_id"].(string)
-			if offsets[harness.KafkaTopicPartition{Topic: eventsTopic, Partition: r.Partition}] > r.Offset && ctx.Redis.Exists("routing:"+tenant+":"+ticketID) == 0 {
+			if offsets[harness.KafkaTopicPartition{Topic: kHEventsTopic, Partition: r.Partition}] > r.Offset && ctx.Redis.Exists("routing:"+tenant+":"+ticketID) == 0 {
 				early = append(early, ticketID)
 			}
 		}
 	})
 	ctx.Drain(func() { run(context.Background()) })
-	_, committed := ctx.Kafka.Committed("routing", eventsTopic, records[0].Partition)
-	ctx.Assert(committed, "group routing never committed an offset on %s", eventsTopic)
+	_, committed := ctx.Kafka.Committed("routing", kHEventsTopic, records[0].Partition)
+	ctx.Assert(committed, "group routing never committed an offset on %s", kHEventsTopic)
 	ctx.Assert(len(early) == 0, "group routing committed past %v before their routing records were written: a consumer that dies between the commit and the write loses those tickets for good. Record, then commit", early)
 	for _, s := range seeded {
 		status, _ := ctx.Redis.HGet("routing:"+s[1]+":"+s[0], "status")
 		ctx.Equal(status, "open", "%s must be recorded; its status", s[0])
 	}
-	ctx.Equal(ctx.Kafka.Lag("routing", eventsTopic), int64(0), "every recorded event must be committed; the lag")
+	ctx.Equal(ctx.Kafka.Lag("routing", kHEventsTopic), int64(0), "every recorded event must be committed; the lag")
 	// A record whose routing cannot be written (the key holds a string: WRONGTYPE) must not be committed.
 	ctx.Redis.Set("routing:acme:t-4", "not a routing record")
 	value, _ := json.Marshal(map[string]any{"ticket_id": "t-4", "tenant": "acme", "queue": "billing", "priority": "normal", "confidence": 0.92, "fallback_reason": "", "received_at": 1760000000})
-	failing := ctx.Kafka.Seed(eventsTopic, "acme", string(value))
+	failing := ctx.Kafka.Seed(kHEventsTopic, "acme", string(value))
 	ctx.Drain(func() { run(context.Background()) })
-	offset, ok := ctx.Kafka.Committed("routing", eventsTopic, failing.Partition)
+	offset, ok := ctx.Kafka.Committed("routing", kHEventsTopic, failing.Partition)
 	ctx.Assert(ok && offset <= failing.Offset, "recording t-4 failed (WRONGTYPE) and group routing committed its offset anyway (%d): a write that failed must leave the record uncommitted, to be redelivered, not be logged and skipped", offset)
 }
 `,
@@ -1036,16 +1036,16 @@ func CheckRecordBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Refund for invoice 4411: my card ending 4242 was charged twice";
+const std::string kHText = "Refund for invoice 4411: my card ending 4242 was charged twice";
 
-Ticket eventsTicket(const std::string& ticket_id, const std::string& tenant) { return {ticket_id, tenant, kText, 1760000000}; }
+Ticket hEventsTicket(const std::string& ticket_id, const std::string& tenant) { return {ticket_id, tenant, kHText, 1760000000}; }
 
-rules::Decision eventsDecision(const std::string& queue, const std::string& priority = "normal", const std::string& reason = "") {
+rules::Decision hEventsDecision(const std::string& queue, const std::string& priority = "normal", const std::string& reason = "") {
   if (!reason.empty()) return {queue, priority, 0.5, reason, "v3"};
   return {queue, priority, 0.92, "", ""};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& row : ctx.Redis.LRange("outbox:triage.decided", 0, -1)) rows.push_back(nlohmann::json::parse(row, nullptr, false));
   return rows;
@@ -1054,9 +1054,9 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  publish_decision(eventsTicket("t-1", "acme"), eventsDecision("billing"));
-  publish_decision(eventsTicket("t-2", "globex"), eventsDecision("delivery"));
-  publish_decision(eventsTicket("t-3", "acme"), eventsDecision("account", "urgent"));
+  publish_decision(hEventsTicket("t-1", "acme"), hEventsDecision("billing"));
+  publish_decision(hEventsTicket("t-2", "globex"), hEventsDecision("delivery"));
+  publish_decision(hEventsTicket("t-3", "acme"), hEventsDecision("account", "urgent"));
   producer->poll(0);
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kTopic);
@@ -1067,7 +1067,7 @@ void CheckTenantKey(harness::Ctx& ctx) {
 }
 
 void CheckIdsNotText(harness::Ctx& ctx) {
-  publish_decision(eventsTicket("t-1", "acme"), eventsDecision("billing", "normal", "classifier_timeout"));
+  publish_decision(hEventsTicket("t-1", "acme"), hEventsDecision("billing", "normal", "classifier_timeout"));
   producer->poll(0);
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kTopic);
@@ -1083,21 +1083,21 @@ void CheckIdsNotText(harness::Ctx& ctx) {
 void CheckOutboxOnReject(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
   try {
-    publish_decision(eventsTicket("t-1", "acme"), eventsDecision("billing"));
+    publish_decision(hEventsTicket("t-1", "acme"), hEventsDecision("billing"));
   } catch (const std::exception& e) {
     ctx.Fatalf("publish_decision threw when the broker refused the record: %s; the event goes to the outbox and the request goes on", e.what());
   }
   producer->poll(0);  // the service's loop serves delivery reports between tickets
   ctx.Settle();
-  const auto rows = eventsOutbox(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one record: the refusal arrives in the delivery report (dr_cb), after produce has returned; outbox:triage.decided rows");
   const nlohmann::json expected = {{"ticket_id", "t-1"}, {"tenant", "acme"}, {"queue", "billing"}, {"priority", "normal"}, {"confidence", 0.92}, {"fallback_reason", ""}, {"received_at", 1760000000}};
   ctx.Equal(rows[0], expected, "the outbox row must be the event the topic would have carried: the relay republishes it as it is");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing may reach the topic for the refused record; the records");
-  publish_decision(eventsTicket("t-2", "acme"), eventsDecision("billing"));
+  publish_decision(hEventsTicket("t-2", "acme"), hEventsDecision("billing"));
   producer->poll(0);
   ctx.Settle();
-  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a delivered record reaches the topic and adds no outbox row");
+  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a delivered record reaches the topic and adds no outbox row");
 }
 
 void CheckRecordBeforeCommit(harness::Ctx& ctx) {

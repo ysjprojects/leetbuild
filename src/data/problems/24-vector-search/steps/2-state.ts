@@ -641,28 +641,28 @@ import (
 )
 
 var (
-	stateBg     = context.Background()
-	stateQuery  = []float64{1, 0, 0, 0}
-	stateDigest = fingerprint.QueryDigest(stateQuery)
+	hStateBg     = context.Background()
+	hStateQuery  = []float64{1, 0, 0, 0}
+	hStateDigest = fingerprint.QueryDigest(hStateQuery)
 )
 
-// seedState puts acme and globex in the active idx-42 and acme's b1 in idx-43, built but not live.
-func seedState() {
-	corpus.Activate(stateBg, "idx-42", 4)
-	corpus.PutDocument(stateBg, "acme", "idx-42", "a1", []float64{0.9, 0.1, 0, 0})
-	corpus.PutDocument(stateBg, "acme", "idx-42", "a2", []float64{0.5, 0.5, 0, 0})
-	corpus.PutDocument(stateBg, "acme", "idx-42", "a3", []float64{0.1, 0.9, 0, 0})
-	corpus.PutDocument(stateBg, "globex", "idx-42", "g1", []float64{1, 0, 0, 0})
-	corpus.PutDocument(stateBg, "acme", "idx-43", "b1", []float64{1, 0, 0, 0})
+// hSeedState puts acme and globex in the active idx-42 and acme's b1 in idx-43, built but not live.
+func hSeedState() {
+	corpus.Activate(hStateBg, "idx-42", 4)
+	corpus.PutDocument(hStateBg, "acme", "idx-42", "a1", []float64{0.9, 0.1, 0, 0})
+	corpus.PutDocument(hStateBg, "acme", "idx-42", "a2", []float64{0.5, 0.5, 0, 0})
+	corpus.PutDocument(hStateBg, "acme", "idx-42", "a3", []float64{0.1, 0.9, 0, 0})
+	corpus.PutDocument(hStateBg, "globex", "idx-42", "g1", []float64{1, 0, 0, 0})
+	corpus.PutDocument(hStateBg, "acme", "idx-43", "b1", []float64{1, 0, 0, 0})
 }
 
-func mustSearch(ctx *harness.Ctx, tenant string, k int) Result {
-	result, err := cachedSearch(stateBg, tenant, stateQuery, k)
+func hMustSearch(ctx *harness.Ctx, tenant string, k int) Result {
+	result, err := cachedSearch(hStateBg, tenant, hStateQuery, k)
 	ctx.NoError(err, "cachedSearch(%s, …, %d) failed", tenant, k)
 	return result
 }
 
-func resultIDs(result Result) string {
+func hResultIDs(result Result) string {
 	ids := []string{}
 	for _, h := range result.Hits {
 		ids = append(ids, h.ID)
@@ -671,40 +671,40 @@ func resultIDs(result Result) string {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	seedState()
-	first := mustSearch(ctx, "acme", 2)
-	ctx.Assert(resultIDs(first) == "a1,a2" && !first.Cached, "acme's first search must miss and answer a1, a2, got %+v", first)
-	again := mustSearch(ctx, "acme", 2)
-	ctx.Assert(again.Cached && resultIDs(again) == "a1,a2", "the same search repeated must be served from the cache, got %+v", again)
-	globex := mustSearch(ctx, "globex", 2)
-	ctx.Assert(!strings.Contains(resultIDs(globex), "a1"), "globex ran the query acme ran and received acme's documents %+v: the key must carry the tenant", globex)
-	ctx.Assert(resultIDs(globex) == "g1" && !globex.Cached, "globex's search must miss and answer g1, got %+v", globex)
-	key := fmt.Sprintf("search:globex:idx-42:%s:2", stateDigest)
+	hSeedState()
+	first := hMustSearch(ctx, "acme", 2)
+	ctx.Assert(hResultIDs(first) == "a1,a2" && !first.Cached, "acme's first search must miss and answer a1, a2, got %+v", first)
+	again := hMustSearch(ctx, "acme", 2)
+	ctx.Assert(again.Cached && hResultIDs(again) == "a1,a2", "the same search repeated must be served from the cache, got %+v", again)
+	globex := hMustSearch(ctx, "globex", 2)
+	ctx.Assert(!strings.Contains(hResultIDs(globex), "a1"), "globex ran the query acme ran and received acme's documents %+v: the key must carry the tenant", globex)
+	ctx.Assert(hResultIDs(globex) == "g1" && !globex.Cached, "globex's search must miss and answer g1, got %+v", globex)
+	key := fmt.Sprintf("search:globex:idx-42:%s:2", hStateDigest)
 	ctx.Equal(ctx.Redis.Exists(key), int64(1), "globex's entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"))
 }
 
 func CheckVersionKey(ctx *harness.Ctx) {
-	seedState()
-	before := mustSearch(ctx, "acme", 2)
+	hSeedState()
+	before := hMustSearch(ctx, "acme", 2)
 	ctx.Equal(before.IndexVersion, "idx-42", "the first search's index version")
-	corpus.Activate(stateBg, "idx-43", 4)
-	after := mustSearch(ctx, "acme", 2)
-	ctx.Assert(after.IndexVersion == "idx-43" && resultIDs(after) == "b1", "after the switch to idx-43 the search answered %+v: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key", after)
-	key := fmt.Sprintf("search:acme:idx-43:%s:2", stateDigest)
+	corpus.Activate(hStateBg, "idx-43", 4)
+	after := hMustSearch(ctx, "acme", 2)
+	ctx.Assert(after.IndexVersion == "idx-43" && hResultIDs(after) == "b1", "after the switch to idx-43 the search answered %+v: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key", after)
+	key := fmt.Sprintf("search:acme:idx-43:%s:2", hStateDigest)
 	ctx.Equal(ctx.Redis.Exists(key), int64(1), "the idx-43 entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"))
 }
 
 func CheckKKey(ctx *harness.Ctx) {
-	seedState()
-	two := mustSearch(ctx, "acme", 2)
-	ctx.Equal(resultIDs(two), "a1,a2", "a search for 2")
-	three := mustSearch(ctx, "acme", 3)
-	ctx.Assert(three.K == 3 && resultIDs(three) == "a1,a2,a3", "a search for 3 after a search for 2 answered %+v: the entry for k 2 was served. The key must carry k", three)
+	hSeedState()
+	two := hMustSearch(ctx, "acme", 2)
+	ctx.Equal(hResultIDs(two), "a1,a2", "a search for 2")
+	three := hMustSearch(ctx, "acme", 3)
+	ctx.Assert(three.K == 3 && hResultIDs(three) == "a1,a2,a3", "a search for 3 after a search for 2 answered %+v: the entry for k 2 was served. The key must carry k", three)
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	seedState()
-	mustSearch(ctx, "acme", 2)
+	hSeedState()
+	hMustSearch(ctx, "acme", 2)
 	keys := ctx.Redis.Keys("search:*")
 	ctx.Equal(len(keys), 1, "one search must write one entry; Redis holds %q; entries", keys)
 	key := keys[0]
@@ -725,16 +725,16 @@ func CheckTtl(ctx *harness.Ctx) {
 		return n
 	}
 	ctx.Redis.After(key, watch)
-	mustSearch(ctx, "acme", 2)
+	hMustSearch(ctx, "acme", 2)
 	ctx.Assert(written, "the same search repeated after %s was deleted never wrote it again; Redis holds %q", key, ctx.Redis.Keys("search:*"))
 	ctx.Assert(writtenTTL > 0, "right after the command that wrote %s its TTL was %d: a crash before the EXPIRE leaves an entry that never expires. The TTL belongs in the SET", key, writtenTTL)
-	corpus.PutDocument(stateBg, "acme", "idx-42", "a0", []float64{1, 0, 0, 0})
+	corpus.PutDocument(hStateBg, "acme", "idx-42", "a0", []float64{1, 0, 0, 0})
 	ctx.Clock.Advance(59)
-	held := mustSearch(ctx, "acme", 2)
-	ctx.Assert(held.Cached && resultIDs(held) == "a1,a2", "59 seconds after the write the search answered %+v: an entry lives for the full 60 seconds", held)
+	held := hMustSearch(ctx, "acme", 2)
+	ctx.Assert(held.Cached && hResultIDs(held) == "a1,a2", "59 seconds after the write the search answered %+v: an entry lives for the full 60 seconds", held)
 	ctx.Clock.Advance(2)
-	later := mustSearch(ctx, "acme", 2)
-	ctx.Assert(!later.Cached && resultIDs(later) == "a0,a1", "61 seconds after the write, after a0 was added, the search answered %+v: the entry must have expired 60 seconds after it was written, whatever read it since", later)
+	later := hMustSearch(ctx, "acme", 2)
+	ctx.Assert(!later.Cached && hResultIDs(later) == "a0,a1", "61 seconds after the write, after a0 was added, the search answered %+v: the entry must have expired 60 seconds after it was written, whatever read it since", later)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -746,10 +746,10 @@ func CheckTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<double> kQuery = {1, 0, 0, 0};
+const std::vector<double> kHQuery = {1, 0, 0, 0};
 
 // acme and globex in the active idx-42; acme's b1 in idx-43, built but not live.
-void seedState() {
+void hSeedState() {
   corpus::activate("idx-42", 4);
   corpus::putDocument("acme", "idx-42", "a1", {0.9, 0.1, 0, 0});
   corpus::putDocument("acme", "idx-42", "a2", {0.5, 0.5, 0, 0});
@@ -758,52 +758,52 @@ void seedState() {
   corpus::putDocument("acme", "idx-43", "b1", {1, 0, 0, 0});
 }
 
-std::string ids(const nlohmann::json& result) {
+std::string hIds(const nlohmann::json& result) {
   std::string out;
   for (const auto& h : result.value("hits", nlohmann::json::array())) out += (out.empty() ? "" : ",") + h.value("id", std::string());
   return out;
 }
 
-bool cached(const nlohmann::json& result) { return result.value("cached", false); }
+bool hCached(const nlohmann::json& result) { return result.value("cached", false); }
 
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  seedState();
-  const auto first = cachedSearch("acme", kQuery, 2);
-  ctx.Assert(ids(first) == "a1,a2" && !cached(first), "acme's first search must miss and answer a1, a2, got %s", first.dump());
-  const auto again = cachedSearch("acme", kQuery, 2);
-  ctx.Assert(cached(again) && ids(again) == "a1,a2", "the same search repeated must be served from the cache, got %s", again.dump());
-  const auto globex = cachedSearch("globex", kQuery, 2);
-  ctx.Assert(ids(globex).find("a1") == std::string::npos, "globex ran the query acme ran and received acme's documents %s: the key must carry the tenant", globex.dump());
-  ctx.Assert(ids(globex) == "g1" && !cached(globex), "globex's search must miss and answer g1, got %s", globex.dump());
-  const std::string key = "search:globex:idx-42:" + fingerprint::queryDigest(kQuery) + ":2";
+  hSeedState();
+  const auto first = cachedSearch("acme", kHQuery, 2);
+  ctx.Assert(hIds(first) == "a1,a2" && !hCached(first), "acme's first search must miss and answer a1, a2, got %s", first.dump());
+  const auto again = cachedSearch("acme", kHQuery, 2);
+  ctx.Assert(hCached(again) && hIds(again) == "a1,a2", "the same search repeated must be served from the cache, got %s", again.dump());
+  const auto globex = cachedSearch("globex", kHQuery, 2);
+  ctx.Assert(hIds(globex).find("a1") == std::string::npos, "globex ran the query acme ran and received acme's documents %s: the key must carry the tenant", globex.dump());
+  ctx.Assert(hIds(globex) == "g1" && !hCached(globex), "globex's search must miss and answer g1, got %s", globex.dump());
+  const std::string key = "search:globex:idx-42:" + fingerprint::queryDigest(kHQuery) + ":2";
   ctx.Equal(ctx.Redis.Exists(key), 1, "globex's entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"));
 }
 
 void CheckVersionKey(harness::Ctx& ctx) {
-  seedState();
-  const auto before = cachedSearch("acme", kQuery, 2);
+  hSeedState();
+  const auto before = cachedSearch("acme", kHQuery, 2);
   ctx.Equal(before.value("index_version", std::string()), "idx-42", "the first search's index version");
   corpus::activate("idx-43", 4);
-  const auto after = cachedSearch("acme", kQuery, 2);
-  ctx.Assert(after.value("index_version", std::string()) == "idx-43" && ids(after) == "b1",
+  const auto after = cachedSearch("acme", kHQuery, 2);
+  ctx.Assert(after.value("index_version", std::string()) == "idx-43" && hIds(after) == "b1",
              "after the switch to idx-43 the search answered %s: an entry written for idx-42 was served. Resolve the active version before the lookup and put it in the key", after.dump());
-  const std::string key = "search:acme:idx-43:" + fingerprint::queryDigest(kQuery) + ":2";
+  const std::string key = "search:acme:idx-43:" + fingerprint::queryDigest(kHQuery) + ":2";
   ctx.Equal(ctx.Redis.Exists(key), 1, "the idx-43 entry must be %s; Redis holds %q; exists", key, ctx.Redis.Keys("search:*"));
 }
 
 void CheckKKey(harness::Ctx& ctx) {
-  seedState();
-  const auto two = cachedSearch("acme", kQuery, 2);
-  ctx.Equal(ids(two), "a1,a2", "a search for 2");
-  const auto three = cachedSearch("acme", kQuery, 3);
-  ctx.Assert(three.value("k", 0L) == 3 && ids(three) == "a1,a2,a3", "a search for 3 after a search for 2 answered %s: the entry for k 2 was served. The key must carry k", three.dump());
+  hSeedState();
+  const auto two = cachedSearch("acme", kHQuery, 2);
+  ctx.Equal(hIds(two), "a1,a2", "a search for 2");
+  const auto three = cachedSearch("acme", kHQuery, 3);
+  ctx.Assert(three.value("k", 0L) == 3 && hIds(three) == "a1,a2,a3", "a search for 3 after a search for 2 answered %s: the entry for k 2 was served. The key must carry k", three.dump());
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  seedState();
-  cachedSearch("acme", kQuery, 2);
+  hSeedState();
+  cachedSearch("acme", kHQuery, 2);
   const auto keys = ctx.Redis.Keys("search:*");
   ctx.Equal(keys.size(), 1, "one search must write one entry; Redis holds %q; entries", keys);
   const std::string key = keys[0];
@@ -823,16 +823,16 @@ void CheckTtl(harness::Ctx& ctx) {
     }
   };
   ctx.Redis.After(key, watch);
-  cachedSearch("acme", kQuery, 2);
+  cachedSearch("acme", kHQuery, 2);
   ctx.Assert(written, "the same search repeated after %s was deleted never wrote it again; Redis holds %q", key, ctx.Redis.Keys("search:*"));
   ctx.Assert(writtenTtl > 0, "right after the command that wrote %s its TTL was %d: a crash before the EXPIRE leaves an entry that never expires. The TTL belongs in the SET", key, writtenTtl);
   corpus::putDocument("acme", "idx-42", "a0", {1, 0, 0, 0});
   ctx.Clock.Advance(59);
-  const auto held = cachedSearch("acme", kQuery, 2);
-  ctx.Assert(cached(held) && ids(held) == "a1,a2", "59 seconds after the write the search answered %s: an entry lives for the full 60 seconds", held.dump());
+  const auto held = cachedSearch("acme", kHQuery, 2);
+  ctx.Assert(hCached(held) && hIds(held) == "a1,a2", "59 seconds after the write the search answered %s: an entry lives for the full 60 seconds", held.dump());
   ctx.Clock.Advance(2);
-  const auto later = cachedSearch("acme", kQuery, 2);
-  ctx.Assert(!cached(later) && ids(later) == "a0,a1", "61 seconds after the write, after a0 was added, the search answered %s: the entry must have expired 60 seconds after it was written, whatever read it since", later.dump());
+  const auto later = cachedSearch("acme", kHQuery, 2);
+  ctx.Assert(!hCached(later) && hIds(later) == "a0,a1", "61 seconds after the write, after a0 was added, the search answered %s: the entry must have expired 60 seconds after it was written, whatever read it since", later.dump());
 }
 `,
   },

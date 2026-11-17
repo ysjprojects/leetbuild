@@ -786,28 +786,28 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsWindow = "2026-11-02T14:00Z"
+const kHEventsWindow = "2026-11-02T14:00Z"
 
-func eventsReservation(n int, team, class string) Reservation {
-	return Reservation{ReservationID: fmt.Sprintf("r-%d", n), Team: team, Window: eventsWindow, ResourceClass: class, Amount: 4, RequestedBy: "ana@" + team + ".example"}
+func hEventsReservation(n int, team, class string) Reservation {
+	return Reservation{ReservationID: fmt.Sprintf("r-%d", n), Team: team, Window: kHEventsWindow, ResourceClass: class, Amount: 4, RequestedBy: "ana@" + team + ".example"}
 }
 
-func eventsPublish(ctx *harness.Ctx, kind string, r Reservation) bool {
+func hEventsPublish(ctx *harness.Ctx, kind string, r Reservation) bool {
 	ok, err := publishQuotaEvent(context.Background(), kind, r)
 	ctx.NoError(err, "publishQuotaEvent")
 	return ok
 }
 
-type eventsRow struct {
+type HEventsRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []HEventsRow {
+	var rows []HEventsRow
 	for _, text := range ctx.Redis.LRange("outbox:quota", 0, -1) {
-		var row eventsRow
+		var row HEventsRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -815,9 +815,9 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckTeamKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, "reserved", eventsReservation(1, "research", "gpu-a100"))
-	eventsPublish(ctx, "reserved", eventsReservation(2, "vision", "gpu-a100"))
-	eventsPublish(ctx, "released", eventsReservation(1, "research", "tpu-v5"))
+	hEventsPublish(ctx, "reserved", hEventsReservation(1, "research", "gpu-a100"))
+	hEventsPublish(ctx, "reserved", hEventsReservation(2, "vision", "gpu-a100"))
+	hEventsPublish(ctx, "released", hEventsReservation(1, "research", "tpu-v5"))
 	ctx.Settle()
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 3, "three publishQuotaEvent calls must produce three records on quota.event; the records")
@@ -826,7 +826,7 @@ func CheckTeamKey(ctx *harness.Ctx) {
 }
 
 func CheckNoRequester(ctx *harness.Ctx) {
-	eventsPublish(ctx, "reserved", eventsReservation(1, "research", "gpu-a100"))
+	hEventsPublish(ctx, "reserved", hEventsReservation(1, "research", "gpu-a100"))
 	ctx.Settle()
 	values := ctx.Kafka.Values(topic)
 	ctx.Equal(len(values), 1, "one publishQuotaEvent must produce one record; the records")
@@ -834,22 +834,22 @@ func CheckNoRequester(ctx *harness.Ctx) {
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
 	_, named := value["requested_by"]
 	ctx.Assert(!named, "the payload names the requester (%v): the topic is retained and replicated, so it records who asked for every GPU", value["requested_by"])
-	ctx.Equal(value, map[string]any{"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": eventsWindow, "resource_class": "gpu-a100", "amount": float64(4)}, "the payload")
-	eventsPublish(ctx, "consumed", eventsReservation(2, "vision", "tpu-v5"))
+	ctx.Equal(value, map[string]any{"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": kHEventsWindow, "resource_class": "gpu-a100", "amount": float64(4)}, "the payload")
+	hEventsPublish(ctx, "consumed", hEventsReservation(2, "vision", "tpu-v5"))
 	ctx.Settle()
 	values = ctx.Kafka.Values(topic)
 	ctx.Equal(len(values), 2, "a second publishQuotaEvent must produce a second record; the records")
 	var consumed map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[1]), &consumed), "the payload must be JSON")
-	ctx.Equal(consumed, map[string]any{"kind": "consumed", "reservation_id": "r-2", "team": "vision", "window": eventsWindow, "resource_class": "tpu-v5", "amount": float64(4)}, "the payload of a consumed event for vision's r-2")
+	ctx.Equal(consumed, map[string]any{"kind": "consumed", "reservation_id": "r-2", "team": "vision", "window": kHEventsWindow, "resource_class": "tpu-v5", "amount": float64(4)}, "the payload of a consumed event for vision's r-2")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(topic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, "reserved", eventsReservation(1, "research", "gpu-a100"))
+	hEventsPublish(ctx, "reserved", hEventsReservation(1, "research", "gpu-a100"))
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, "reserved", eventsReservation(2, "research", "gpu-a100"))
+	hEventsPublish(ctx, "reserved", hEventsReservation(2, "research", "gpu-a100"))
 	ctx.Settle()
 	ctx.Kafka.Failover(topic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
@@ -857,23 +857,23 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext(topic, 1)
-	ok := eventsPublish(ctx, "reserved", eventsReservation(1, "research", "gpu-a100"))
+	ok := hEventsPublish(ctx, "reserved", hEventsReservation(1, "research", "gpu-a100"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox:quota row the grant never reaches the ledger consumer; the rows")
 	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "research", "the outbox row is %v, expected the topic and the key research", rows[0])
-	ctx.Equal(rows[0].Payload, map[string]any{"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": eventsWindow, "resource_class": "gpu-a100", "amount": float64(4)}, "the outbox row's payload")
+	ctx.Equal(rows[0].Payload, map[string]any{"kind": "reserved", "reservation_id": "r-1", "team": "research", "window": kHEventsWindow, "resource_class": "gpu-a100", "amount": float64(4)}, "the outbox row's payload")
 	ctx.Equal(ok, false, "publishQuotaEvent's result after a failed delivery")
-	ok = eventsPublish(ctx, "reserved", eventsReservation(0, "research", "gpu-a100"))
+	ok = hEventsPublish(ctx, "reserved", hEventsReservation(0, "research", "gpu-a100"))
 	ctx.Settle()
 	ctx.Equal(ok, true, "after the failed delivery, publishQuotaEvent's result for a record the broker acknowledged")
-	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered event must add no outbox:quota row, or the relay produces it a second time; the rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 1, "a delivered event must add no outbox:quota row, or the relay produces it a second time; the rows")
 	ctx.Kafka.Stall(topic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, "released", eventsReservation(2, "research", "gpu-a100"))
+	ok = hEventsPublish(ctx, "released", hEventsReservation(2, "research", "gpu-a100"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishQuotaEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
+	rows = hEventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["reservation_id"] == "r-2", "no delivery report within the window and outbox:quota holds %v", rows)
 	ctx.Equal(ok, false, "publishQuotaEvent's result without a delivery report")
 }
@@ -887,13 +887,13 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsWindow = "2026-11-02T14:00Z";
+const std::string kHEventsWindow = "2026-11-02T14:00Z";
 
-Reservation eventsReservation(int n, const std::string& team = "research", const std::string& resource_class = "gpu-a100") {
-  return Reservation{"r-" + std::to_string(n), team, kEventsWindow, resource_class, 4, "ana@" + team + ".example"};
+Reservation hEventsReservation(int n, const std::string& team = "research", const std::string& resource_class = "gpu-a100") {
+  return Reservation{"r-" + std::to_string(n), team, kHEventsWindow, resource_class, 4, "ana@" + team + ".example"};
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox:quota", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -903,16 +903,16 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckTeamKey(harness::Ctx& ctx) {
-  publishQuotaEvent("reserved", eventsReservation(1, "research", "gpu-a100"));
-  publishQuotaEvent("reserved", eventsReservation(2, "vision", "gpu-a100"));
-  publishQuotaEvent("released", eventsReservation(1, "research", "tpu-v5"));
+  publishQuotaEvent("reserved", hEventsReservation(1, "research", "gpu-a100"));
+  publishQuotaEvent("reserved", hEventsReservation(2, "vision", "gpu-a100"));
+  publishQuotaEvent("released", hEventsReservation(1, "research", "tpu-v5"));
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 3, "three publishQuotaEvent calls must produce three records on quota.event; the records");
@@ -922,30 +922,30 @@ void CheckTeamKey(harness::Ctx& ctx) {
 }
 
 void CheckNoRequester(harness::Ctx& ctx) {
-  publishQuotaEvent("reserved", eventsReservation(1));
+  publishQuotaEvent("reserved", hEventsReservation(1));
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kTopic);
   ctx.Equal(values.size(), 1, "one publishQuotaEvent must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(value.is_object() && !value.contains("requested_by"),
              "the payload %s names the requester: the topic is retained and replicated, so it records who asked for every GPU", values[0]);
-  const nlohmann::json expected = {{"kind", "reserved"}, {"reservation_id", "r-1"}, {"team", "research"}, {"window", kEventsWindow}, {"resource_class", "gpu-a100"}, {"amount", 4}};
+  const nlohmann::json expected = {{"kind", "reserved"}, {"reservation_id", "r-1"}, {"team", "research"}, {"window", kHEventsWindow}, {"resource_class", "gpu-a100"}, {"amount", 4}};
   ctx.Equal(value, expected, "the payload");
-  publishQuotaEvent("consumed", eventsReservation(2, "vision", "tpu-v5"));
+  publishQuotaEvent("consumed", hEventsReservation(2, "vision", "tpu-v5"));
   ctx.Settle();
   const auto after = ctx.Kafka.Values(kTopic);
   ctx.Equal(after.size(), 2, "a second publishQuotaEvent must produce a second record; the records");
-  const nlohmann::json expected_consumed = {{"kind", "consumed"}, {"reservation_id", "r-2"}, {"team", "vision"}, {"window", kEventsWindow}, {"resource_class", "tpu-v5"}, {"amount", 4}};
+  const nlohmann::json expected_consumed = {{"kind", "consumed"}, {"reservation_id", "r-2"}, {"team", "vision"}, {"window", kHEventsWindow}, {"resource_class", "tpu-v5"}, {"amount", 4}};
   ctx.Equal(nlohmann::json::parse(after[1], nullptr, false), expected_consumed, "the payload of a consumed event for vision's r-2");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishQuotaEvent("reserved", eventsReservation(1));
+  publishQuotaEvent("reserved", hEventsReservation(1));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishQuotaEvent("reserved", eventsReservation(2));
+  publishQuotaEvent("reserved", hEventsReservation(2));
   ctx.Settle();
   ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
@@ -953,25 +953,25 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
-  bool ok = publishQuotaEvent("reserved", eventsReservation(1));
+  bool ok = publishQuotaEvent("reserved", hEventsReservation(1));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox:quota row the grant never reaches the ledger consumer; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kTopic && eventsField(rows[0], "key") == "research", "the outbox row is %s, expected the topic and the key research", rows[0].dump());
-  const nlohmann::json expected = {{"kind", "reserved"}, {"reservation_id", "r-1"}, {"team", "research"}, {"window", kEventsWindow}, {"resource_class", "gpu-a100"}, {"amount", 4}};
+  ctx.Assert(hEventsField(rows[0], "topic") == kTopic && hEventsField(rows[0], "key") == "research", "the outbox row is %s, expected the topic and the key research", rows[0].dump());
+  const nlohmann::json expected = {{"kind", "reserved"}, {"reservation_id", "r-1"}, {"team", "research"}, {"window", kHEventsWindow}, {"resource_class", "gpu-a100"}, {"amount", 4}};
   ctx.Equal(rows[0].value("payload", nlohmann::json()), expected, "the outbox row's payload");
   ctx.Equal(ok, false, "publishQuotaEvent's result after a failed delivery");
-  ok = publishQuotaEvent("reserved", eventsReservation(0));
+  ok = publishQuotaEvent("reserved", hEventsReservation(0));
   ctx.Settle();
   ctx.Equal(ok, true, "after the failed delivery, publishQuotaEvent's result for a record the broker acknowledged");
-  ctx.Equal(eventsOutbox(ctx).size(), 1, "a delivered event must add no outbox:quota row, or the relay produces it a second time; the rows");
+  ctx.Equal(hEventsOutbox(ctx).size(), 1, "a delivered event must add no outbox:quota row, or the relay produces it a second time; the rows");
   ctx.Kafka.Stall(kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishQuotaEvent("released", eventsReservation(2));
+  ok = publishQuotaEvent("released", hEventsReservation(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishQuotaEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "reservation_id") == "r-2",
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hEventsField(rows[1]["payload"], "reservation_id") == "r-2",
              "no delivery report within the window and outbox:quota holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishQuotaEvent's result without a delivery report");
 }

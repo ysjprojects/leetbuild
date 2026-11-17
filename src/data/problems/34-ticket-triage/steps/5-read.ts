@@ -741,29 +741,29 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func summaryAPI(ctx *harness.Ctx) *harness.HTTP {
+func hSummaryAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // seed records a routed ticket that has waited wait seconds.
-func seed(ctx *harness.Ctx, tenant, queue, ticketID string, wait int64, reason string, closed bool) {
+func hSeed(ctx *harness.Ctx, tenant, queue, ticketID string, wait int64, reason string, closed bool) {
 	r := store.Routing{TicketID: ticketID, Tenant: tenant, Queue: queue, Priority: "normal", Confidence: 0.9, FallbackReason: reason, ReceivedAt: ctx.Clock.Now()/1000 - wait}
-	ctx.NoError(store.RecordRouting(readBg, r), "recording %s", ticketID)
+	ctx.NoError(store.RecordRouting(hReadBg, r), "recording %s", ticketID)
 	if closed {
-		store.CloseTicket(readBg, tenant, ticketID)
+		store.CloseTicket(hReadBg, tenant, ticketID)
 	}
 }
 
-func summaryOf(ctx *harness.Ctx, queueID, tenant string) (*harness.Response, map[string]any) {
+func hSummaryOf(ctx *harness.Ctx, queueID, tenant string) (*harness.Response, map[string]any) {
 	var header []string
 	if tenant != "" {
 		header = []string{"X-Tenant-Id", tenant}
 	}
-	r := summaryAPI(ctx).Get("/v1/queues/"+queueID+"/summary", header...)
+	r := hSummaryAPI(ctx).Get("/v1/queues/"+queueID+"/summary", header...)
 	if r.Status != 200 {
 		return r, nil
 	}
@@ -771,7 +771,7 @@ func summaryOf(ctx *harness.Ctx, queueID, tenant string) (*harness.Response, map
 	return r, body
 }
 
-func number(body map[string]any, field string) float64 {
+func hNumber(body map[string]any, field string) float64 {
 	v, ok := body[field].(float64)
 	if !ok {
 		return -1
@@ -779,81 +779,81 @@ func number(body map[string]any, field string) float64 {
 	return v
 }
 
-func near(got, want float64) bool { return got >= want-1 && got <= want+1 }
+func hNear(got, want float64) bool { return got >= want-1 && got <= want+1 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	queueID := store.CreateQueue(readBg, "acme", "billing")
-	seed(ctx, "acme", "billing", "t-1", 60, "", false)
-	seed(ctx, "acme", "billing", "t-2", 120, "", false)
-	r, body := summaryOf(ctx, queueID, "acme")
+	queueID := store.CreateQueue(hReadBg, "acme", "billing")
+	hSeed(ctx, "acme", "billing", "t-1", 60, "", false)
+	hSeed(ctx, "acme", "billing", "t-2", 120, "", false)
+	r, body := hSummaryOf(ctx, queueID, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/queues/%s/summary (%s)", queueID, r.Text())
-	ctx.Assert(body["queue_id"] == queueID && body["queue"] == "billing" && number(body, "depth") == 2, "acme's billing queue holds two open tickets, the summary says %v", body)
-	r, _ = summaryOf(ctx, queueID, "")
+	ctx.Assert(body["queue_id"] == queueID && body["queue"] == "billing" && hNumber(body, "depth") == 2, "acme's billing queue holds two open tickets, the summary says %v", body)
+	r, _ = hSummaryOf(ctx, queueID, "")
 	ctx.Equal(r.Status, 401, "a summary without X-Tenant-Id")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	acme := store.CreateQueue(readBg, "acme", "billing")
-	globex := store.CreateQueue(readBg, "globex", "billing")
-	seed(ctx, "acme", "billing", "t-1", 60, "", false)
-	seed(ctx, "acme", "billing", "t-2", 90, "", false)
-	seed(ctx, "globex", "billing", "t-9", 30, "", false)
-	r, _ := summaryOf(ctx, acme, "globex")
+	acme := store.CreateQueue(hReadBg, "acme", "billing")
+	globex := store.CreateQueue(hReadBg, "globex", "billing")
+	hSeed(ctx, "acme", "billing", "t-1", 60, "", false)
+	hSeed(ctx, "acme", "billing", "t-2", 90, "", false)
+	hSeed(ctx, "globex", "billing", "t-9", 30, "", false)
+	r, _ := hSummaryOf(ctx, acme, "globex")
 	ctx.Assert(r.Status == 404, "globex asked for acme's queue %s and got %d %s: a queue the caller does not own is 404, the same as an unknown id", acme, r.Status, r.Text())
 	foreign := strings.ReplaceAll(r.Text(), acme, "{id}")
-	r, _ = summaryOf(ctx, "q-404", "acme")
+	r, _ = hSummaryOf(ctx, "q-404", "acme")
 	ctx.Equal(r.Status, 404, "an unknown queue id")
 	ctx.Equal(strings.ReplaceAll(r.Text(), "q-404", "{id}"), foreign, "another tenant's queue and an unknown id must answer alike, or a caller learns which ids exist; the unknown id's answer")
-	r, body := summaryOf(ctx, globex, "globex")
-	ctx.Assert(r.Status == 200 && number(body, "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text())
+	r, body := hSummaryOf(ctx, globex, "globex")
+	ctx.Assert(r.Status == 200 && hNumber(body, "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text())
 }
 
 func CheckOpenDepth(ctx *harness.Ctx) {
-	queueID := store.CreateQueue(readBg, "acme", "billing")
+	queueID := store.CreateQueue(hReadBg, "acme", "billing")
 	for i, wait := range []int64{30, 60, 90} {
-		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
+		hSeed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
 	}
-	seed(ctx, "acme", "billing", "t-closed-1", 5000, "", true)
-	seed(ctx, "acme", "billing", "t-closed-2", 9000, "", true)
-	seed(ctx, "acme", "delivery", "t-other", 10, "", false)
-	_, body := summaryOf(ctx, queueID, "acme")
-	ctx.Equal(number(body, "depth"), 3.0, "acme's billing queue holds 3 open tickets and 2 closed ones: a closed ticket has left the queue; the depth")
-	ctx.Assert(near(number(body, "median_wait_s"), 60), "the open tickets waited 30, 60 and 90 s, the summary says median_wait_s %v: closed tickets do not wait", body["median_wait_s"])
+	hSeed(ctx, "acme", "billing", "t-closed-1", 5000, "", true)
+	hSeed(ctx, "acme", "billing", "t-closed-2", 9000, "", true)
+	hSeed(ctx, "acme", "delivery", "t-other", 10, "", false)
+	_, body := hSummaryOf(ctx, queueID, "acme")
+	ctx.Equal(hNumber(body, "depth"), 3.0, "acme's billing queue holds 3 open tickets and 2 closed ones: a closed ticket has left the queue; the depth")
+	ctx.Assert(hNear(hNumber(body, "median_wait_s"), 60), "the open tickets waited 30, 60 and 90 s, the summary says median_wait_s %v: closed tickets do not wait", body["median_wait_s"])
 }
 
 func CheckMedianWait(ctx *harness.Ctx) {
-	queueID := store.CreateQueue(readBg, "acme", "billing")
+	queueID := store.CreateQueue(hReadBg, "acme", "billing")
 	for i, wait := range []int64{30, 61, 90, 7200} {
-		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
+		hSeed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), wait, "", false)
 	}
-	_, body := summaryOf(ctx, queueID, "acme")
-	median := number(body, "median_wait_s")
+	_, body := hSummaryOf(ctx, queueID, "acme")
+	median := hNumber(body, "median_wait_s")
 	ctx.Assert(median > 75.25 && median < 75.75, "four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says %v. A mean is dragged by the one stuck ticket", body["median_wait_s"])
-	seed(ctx, "acme", "billing", "t-4", 120, "", false)
-	_, body = summaryOf(ctx, queueID, "acme")
-	ctx.Assert(near(number(body, "median_wait_s"), 90), "five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says %v", body["median_wait_s"])
-	empty := store.CreateQueue(readBg, "acme", "account")
-	_, body = summaryOf(ctx, empty, "acme")
-	ctx.Assert(number(body, "depth") == 0 && number(body, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %v", body)
+	hSeed(ctx, "acme", "billing", "t-4", 120, "", false)
+	_, body = hSummaryOf(ctx, queueID, "acme")
+	ctx.Assert(hNear(hNumber(body, "median_wait_s"), 90), "five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says %v", body["median_wait_s"])
+	empty := store.CreateQueue(hReadBg, "acme", "account")
+	_, body = hSummaryOf(ctx, empty, "acme")
+	ctx.Assert(hNumber(body, "depth") == 0 && hNumber(body, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %v", body)
 }
 
 func CheckFallbackShare(ctx *harness.Ctx) {
-	queueID := store.CreateQueue(readBg, "acme", "billing")
-	seed(ctx, "acme", "billing", "t-closed", 60, "breaker_open", true)
+	queueID := store.CreateQueue(hReadBg, "acme", "billing")
+	hSeed(ctx, "acme", "billing", "t-closed", 60, "breaker_open", true)
 	for i, reason := range []string{"", "classifier_timeout", "classifier_unavailable", "breaker_open"} {
-		seed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), 60, reason, false)
+		hSeed(ctx, "acme", "billing", fmt.Sprintf("t-%d", i), 60, reason, false)
 	}
-	_, body := summaryOf(ctx, queueID, "acme")
-	ctx.Equal(number(body, "fallback_count"), 3.0, "three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue; fallback_count")
-	share := number(body, "fallback_share")
+	_, body := hSummaryOf(ctx, queueID, "acme")
+	ctx.Equal(hNumber(body, "fallback_count"), 3.0, "three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue; fallback_count")
+	share := hNumber(body, "fallback_share")
 	ctx.Assert(share > 0.749 && share < 0.751, "fallback_share must be 3 of 4 = 0.75, the summary says %v", body["fallback_share"])
-	account := store.CreateQueue(readBg, "acme", "account")
+	account := store.CreateQueue(hReadBg, "acme", "account")
 	for i, reason := range []string{"", "classifier_refused", "classifier_timeout"} {
-		seed(ctx, "acme", "account", fmt.Sprintf("t-a%d", i), 60, reason, false)
+		hSeed(ctx, "acme", "account", fmt.Sprintf("t-a%d", i), 60, reason, false)
 	}
-	_, other := summaryOf(ctx, account, "acme")
-	share = number(other, "fallback_share")
-	ctx.Assert(number(other, "fallback_count") == 2 && share > 0.666999 && share < 0.667001, "two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says %v and %v", other["fallback_count"], other["fallback_share"])
+	_, other := hSummaryOf(ctx, account, "acme")
+	share = hNumber(other, "fallback_share")
+	ctx.Assert(hNumber(other, "fallback_count") == 2 && share > 0.666999 && share < 0.667001, "two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says %v and %v", other["fallback_count"], other["fallback_share"])
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -866,7 +866,7 @@ func CheckFallbackShare(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -875,27 +875,27 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // A routed ticket that has waited wait seconds.
-void seed(harness::Ctx& ctx, const std::string& tenant, const std::string& queue, const std::string& ticket_id, long long wait,
+void hSeed(harness::Ctx& ctx, const std::string& tenant, const std::string& queue, const std::string& ticket_id, long long wait,
           const std::string& reason = "", bool closed = false) {
   store::recordRouting({{"ticket_id", ticket_id}, {"tenant", tenant}, {"queue", queue}, {"priority", "normal"}, {"confidence", 0.9},
                         {"fallback_reason", reason}, {"received_at", ctx.Clock.Now() / 1000 - wait}});
   if (closed) store::closeTicket(tenant, ticket_id);
 }
 
-harness::Response summary(harness::Ctx& ctx, const std::string& queue_id, const std::string& tenant = "acme") {
-  auto c = api(ctx);
+harness::Response hSummary(harness::Ctx& ctx, const std::string& queue_id, const std::string& tenant = "acme") {
+  auto c = hApi(ctx);
   const std::string path = "/v1/queues/" + queue_id + "/summary";
   return tenant.empty() ? c.Get(path) : c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json body(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-double number(const nlohmann::json& b, const std::string& field) {
+double hNumber(const nlohmann::json& b, const std::string& field) {
   return b.is_object() && b.contains(field) && b[field].is_number() ? b[field].get<double>() : -1;
 }
 
 // The answer's text with the queue id it names replaced, so two answers can be compared.
-std::string withoutId(std::string text, const std::string& id) {
+std::string hWithoutId(std::string text, const std::string& id) {
   for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at)) text.replace(at, id.size(), "{id}");
   return text;
 }
@@ -904,72 +904,72 @@ std::string withoutId(std::string text, const std::string& id) {
 
 void CheckRoute(harness::Ctx& ctx) {
   const std::string queue_id = store::createQueue("acme", "billing");
-  seed(ctx, "acme", "billing", "t-1", 60);
-  seed(ctx, "acme", "billing", "t-2", 120);
-  auto r = summary(ctx, queue_id);
+  hSeed(ctx, "acme", "billing", "t-1", 60);
+  hSeed(ctx, "acme", "billing", "t-2", 120);
+  auto r = hSummary(ctx, queue_id);
   ctx.Equal(r.Status, 200, "GET /v1/queues/%s/summary (%s)", queue_id, r.Text());
-  const auto b = body(r);
-  ctx.Assert(b.value("queue_id", "") == queue_id && b.value("queue", "") == "billing" && number(b, "depth") == 2, "acme's billing queue holds two open tickets, the summary says %s", r.Text());
-  r = summary(ctx, queue_id, "");
+  const auto b = hBody(r);
+  ctx.Assert(b.value("queue_id", "") == queue_id && b.value("queue", "") == "billing" && hNumber(b, "depth") == 2, "acme's billing queue holds two open tickets, the summary says %s", r.Text());
+  r = hSummary(ctx, queue_id, "");
   ctx.Equal(r.Status, 401, "a summary without X-Tenant-Id");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
   const std::string acme = store::createQueue("acme", "billing");
   const std::string globex = store::createQueue("globex", "billing");
-  seed(ctx, "acme", "billing", "t-1", 60);
-  seed(ctx, "acme", "billing", "t-2", 90);
-  seed(ctx, "globex", "billing", "t-9", 30);
-  auto r = summary(ctx, acme, "globex");
+  hSeed(ctx, "acme", "billing", "t-1", 60);
+  hSeed(ctx, "acme", "billing", "t-2", 90);
+  hSeed(ctx, "globex", "billing", "t-9", 30);
+  auto r = hSummary(ctx, acme, "globex");
   ctx.Assert(r.Status == 404, "globex asked for acme's queue %s and got %d %s: a queue the caller does not own is 404, the same as an unknown id", acme, r.Status, r.Text());
-  const std::string foreign = withoutId(r.Text(), acme);
-  r = summary(ctx, "q-404");
+  const std::string foreign = hWithoutId(r.Text(), acme);
+  r = hSummary(ctx, "q-404");
   ctx.Equal(r.Status, 404, "an unknown queue id");
-  ctx.Equal(withoutId(r.Text(), "q-404"), foreign, "another tenant's queue and an unknown id must answer alike, or a caller learns which ids exist; the unknown id's answer");
-  r = summary(ctx, globex, "globex");
-  ctx.Assert(r.Status == 200 && number(body(r), "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text());
+  ctx.Equal(hWithoutId(r.Text(), "q-404"), foreign, "another tenant's queue and an unknown id must answer alike, or a caller learns which ids exist; the unknown id's answer");
+  r = hSummary(ctx, globex, "globex");
+  ctx.Assert(r.Status == 200 && hNumber(hBody(r), "depth") == 1, "globex's own billing queue holds one ticket, got %d %s", r.Status, r.Text());
 }
 
 void CheckOpenDepth(harness::Ctx& ctx) {
   const std::string queue_id = store::createQueue("acme", "billing");
   const std::vector<long long> waits = {30, 60, 90};
-  for (size_t i = 0; i < waits.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
-  seed(ctx, "acme", "billing", "t-closed-1", 5000, "", true);
-  seed(ctx, "acme", "billing", "t-closed-2", 9000, "", true);
-  seed(ctx, "acme", "delivery", "t-other", 10);
-  const auto b = body(summary(ctx, queue_id));
-  ctx.Equal(number(b, "depth"), 3, "acme's billing queue holds 3 open tickets and 2 closed ones: a closed ticket has left the queue; the depth");
-  ctx.Assert(std::fabs(number(b, "median_wait_s") - 60) <= 1, "the open tickets waited 30, 60 and 90 s, the summary says median_wait_s %v: closed tickets do not wait", number(b, "median_wait_s"));
+  for (size_t i = 0; i < waits.size(); ++i) hSeed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
+  hSeed(ctx, "acme", "billing", "t-closed-1", 5000, "", true);
+  hSeed(ctx, "acme", "billing", "t-closed-2", 9000, "", true);
+  hSeed(ctx, "acme", "delivery", "t-other", 10);
+  const auto b = hBody(hSummary(ctx, queue_id));
+  ctx.Equal(hNumber(b, "depth"), 3, "acme's billing queue holds 3 open tickets and 2 closed ones: a closed ticket has left the queue; the depth");
+  ctx.Assert(std::fabs(hNumber(b, "median_wait_s") - 60) <= 1, "the open tickets waited 30, 60 and 90 s, the summary says median_wait_s %v: closed tickets do not wait", hNumber(b, "median_wait_s"));
 }
 
 void CheckMedianWait(harness::Ctx& ctx) {
   const std::string queue_id = store::createQueue("acme", "billing");
   const std::vector<long long> waits = {30, 61, 90, 7200};
-  for (size_t i = 0; i < waits.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
-  auto b = body(summary(ctx, queue_id));
-  ctx.Assert(std::fabs(number(b, "median_wait_s") - 75.5) < 0.25, "four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says %v. A mean is dragged by the one stuck ticket", number(b, "median_wait_s"));
-  seed(ctx, "acme", "billing", "t-4", 120);
-  b = body(summary(ctx, queue_id));
-  ctx.Assert(std::fabs(number(b, "median_wait_s") - 90) <= 1, "five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says %v", number(b, "median_wait_s"));
+  for (size_t i = 0; i < waits.size(); ++i) hSeed(ctx, "acme", "billing", "t-" + std::to_string(i), waits[i]);
+  auto b = hBody(hSummary(ctx, queue_id));
+  ctx.Assert(std::fabs(hNumber(b, "median_wait_s") - 75.5) < 0.25, "four tickets waited 30, 61, 90 and 7200 s: the median is the mean of the middle two, 75.5, the summary says %v. A mean is dragged by the one stuck ticket", hNumber(b, "median_wait_s"));
+  hSeed(ctx, "acme", "billing", "t-4", 120);
+  b = hBody(hSummary(ctx, queue_id));
+  ctx.Assert(std::fabs(hNumber(b, "median_wait_s") - 90) <= 1, "five tickets waited 30, 61, 90, 120 and 7200 s: the median is 90, the summary says %v", hNumber(b, "median_wait_s"));
   const std::string empty = store::createQueue("acme", "account");
-  b = body(summary(ctx, empty));
-  ctx.Assert(number(b, "depth") == 0 && number(b, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %s", b.dump());
+  b = hBody(hSummary(ctx, empty));
+  ctx.Assert(hNumber(b, "depth") == 0 && hNumber(b, "median_wait_s") == 0, "an empty queue has depth 0 and median_wait_s 0, the summary says %s", b.dump());
 }
 
 void CheckFallbackShare(harness::Ctx& ctx) {
   const std::string queue_id = store::createQueue("acme", "billing");
-  seed(ctx, "acme", "billing", "t-closed", 60, "breaker_open", true);
+  hSeed(ctx, "acme", "billing", "t-closed", 60, "breaker_open", true);
   const std::vector<std::string> reasons = {"", "classifier_timeout", "classifier_unavailable", "breaker_open"};
-  for (size_t i = 0; i < reasons.size(); ++i) seed(ctx, "acme", "billing", "t-" + std::to_string(i), 60, reasons[i]);
-  const auto b = body(summary(ctx, queue_id));
-  ctx.Equal(number(b, "fallback_count"), 3, "three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue; fallback_count");
-  ctx.Assert(std::fabs(number(b, "fallback_share") - 0.75) < 0.001, "fallback_share must be 3 of 4 = 0.75, the summary says %v", number(b, "fallback_share"));
+  for (size_t i = 0; i < reasons.size(); ++i) hSeed(ctx, "acme", "billing", "t-" + std::to_string(i), 60, reasons[i]);
+  const auto b = hBody(hSummary(ctx, queue_id));
+  ctx.Equal(hNumber(b, "fallback_count"), 3, "three of four open tickets were routed by the rules (a timeout, an unavailable classifier, an open breaker) and a closed one has left the queue; fallback_count");
+  ctx.Assert(std::fabs(hNumber(b, "fallback_share") - 0.75) < 0.001, "fallback_share must be 3 of 4 = 0.75, the summary says %v", hNumber(b, "fallback_share"));
   const std::string account = store::createQueue("acme", "account");
   const std::vector<std::string> accountReasons = {"", "classifier_refused", "classifier_timeout"};
-  for (size_t i = 0; i < accountReasons.size(); ++i) seed(ctx, "acme", "account", "t-a" + std::to_string(i), 60, accountReasons[i]);
-  const auto other = body(summary(ctx, account));
-  ctx.Assert(number(other, "fallback_count") == 2 && std::fabs(number(other, "fallback_share") - 0.667) < 1e-6,
-             "two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says %v and %v", number(other, "fallback_count"), number(other, "fallback_share"));
+  for (size_t i = 0; i < accountReasons.size(); ++i) hSeed(ctx, "acme", "account", "t-a" + std::to_string(i), 60, accountReasons[i]);
+  const auto other = hBody(hSummary(ctx, account));
+  ctx.Assert(hNumber(other, "fallback_count") == 2 && std::fabs(hNumber(other, "fallback_share") - 0.667) < 1e-6,
+             "two of three open tickets were routed by the rules: fallback_count 2 and fallback_share 2/3 rounded to three decimals, 0.667, the summary says %v and %v", hNumber(other, "fallback_count"), hNumber(other, "fallback_share"));
 }
 `,
   },

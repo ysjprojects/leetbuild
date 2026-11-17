@@ -767,30 +767,30 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "recsys.impression"
+const kHEventsTopic = "recsys.impression"
 
 var (
-	eventsBg = context.Background()
-	ranked   = types.Ranked{Items: []types.Item{{ID: "c-2", Score: 0.74}, {ID: "c-4", Score: 0.47}, {ID: "c-1", Score: 0.37}}, ModelVersion: "ranker-v7"}
-	degraded = types.Ranked{Items: []types.Item{{ID: "c-3", Score: 40}, {ID: "c-1", Score: 25}}, ModelVersion: "popularity-v1", Fallback: true}
+	hEventsBg = context.Background()
+	hRanked   = types.Ranked{Items: []types.Item{{ID: "c-2", Score: 0.74}, {ID: "c-4", Score: 0.47}, {ID: "c-1", Score: 0.37}}, ModelVersion: "ranker-v7"}
+	hDegraded = types.Ranked{Items: []types.Item{{ID: "c-3", Score: 40}, {ID: "c-1", Score: 25}}, ModelVersion: "popularity-v1", Fallback: true}
 )
 
-func publish(ctx *harness.Ctx, userID string, r types.Ranked) bool {
-	ok, err := publishImpression(eventsBg, "t1", userID, "home", r)
+func hPublish(ctx *harness.Ctx, userID string, r types.Ranked) bool {
+	ok, err := publishImpression(hEventsBg, "t1", userID, "home", r)
 	ctx.NoError(err, "publishImpression")
 	return ok
 }
 
-type outboxRow struct {
+type HOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outboxRows(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutboxRows(ctx *harness.Ctx) []HOutboxRow {
+	var rows []HOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row HOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -798,20 +798,20 @@ func outboxRows(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckUserKey(ctx *harness.Ctx) {
-	publish(ctx, "u-1", ranked)
-	publish(ctx, "u-2", ranked)
-	publish(ctx, "u-1", ranked)
+	hPublish(ctx, "u-1", hRanked)
+	hPublish(ctx, "u-2", hRanked)
+	hPublish(ctx, "u-1", hRanked)
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three publishImpression calls must produce three records on recsys.impression; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"u-1", "u-2", "u-1"}, "the impressions must be keyed by the user ids (keyed by surface, every home impression lands on one partition)")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"u-1", "u-2", "u-1"}, "the impressions must be keyed by the user ids (keyed by surface, every home impression lands on one partition)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both impressions of u-1 must land on one partition, or a consumer reads the user's history out of order; the partitions")
 }
 
 func CheckImpressionPayload(ctx *harness.Ctx) {
-	publish(ctx, "u-1", degraded)
+	hPublish(ctx, "u-1", hDegraded)
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one publishImpression must produce one record; the records")
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the impression must be JSON")
@@ -822,44 +822,44 @@ func CheckImpressionPayload(ctx *harness.Ctx) {
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	publish(ctx, "u-1", ranked)
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hPublish(ctx, "u-1", hRanked)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records")
-	publish(ctx, "u-2", ranked)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records")
+	hPublish(ctx, "u-2", hRanked)
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an impression (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose an impression (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := publish(ctx, "u-1", ranked)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hPublish(ctx, "u-1", hRanked)
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the impression is lost and the list never reaches offline evaluation; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "u-1" && rows[0].Payload["user_id"] == "u-1", "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "u-1" && rows[0].Payload["user_id"] == "u-1", "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
 	ctx.Equal(ok, false, "publishImpression's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = publish(ctx, "u-2", ranked)
+	ok = hPublish(ctx, "u-2", hRanked)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishImpression waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
-	rows = outboxRows(ctx)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["user_id"] == "u-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishImpression's result without a delivery report")
 	// The broker answers again: the abandoned delivery report arrives, and must neither stall the
 	// producer nor be read as another request's outcome.
-	ctx.Kafka.Resume(eventsTopic)
+	ctx.Kafka.Resume(kHEventsTopic)
 	ctx.Settle()
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok = publish(ctx, "u-3", ranked)
-	rows = outboxRows(ctx)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok = hPublish(ctx, "u-3", hRanked)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 3 && rows[2].Payload["user_id"] == "u-3" && !ok, "after the broker came back, u-3's delivery failed and publishImpression answered %t with the outbox holding %v: each request must read its own delivery report, not one left over from an earlier request", ok, rows)
 	before = ctx.Clock.Now()
-	ok = publish(ctx, "u-4", ranked)
+	ok = hPublish(ctx, "u-4", hRanked)
 	waited = float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(ok && len(outboxRows(ctx)) == 3, "after the broker came back, a healthy delivery of u-4 answered %t after %.1f s: an earlier request's abandoned delivery report must not block the producer's later reports", ok, waited)
+	ctx.Assert(ok && len(hOutboxRows(ctx)) == 3, "after the broker came back, a healthy delivery of u-4 answered %t after %.1f s: an earlier request's abandoned delivery report must not block the producer's later reports", ok, waited)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -871,11 +871,11 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "recsys.impression";
-const recs::Ranked kRanked{{{"c-2", 0.74}, {"c-4", 0.47}, {"c-1", 0.37}}, "ranker-v7", false};
-const recs::Ranked kDegraded{{{"c-3", 40}, {"c-1", 25}}, "popularity-v1", true};
+const std::string kHEventsTopic = "recsys.impression";
+const recs::Ranked kHRanked{{{"c-2", 0.74}, {"c-4", 0.47}, {"c-1", 0.37}}, "ranker-v7", false};
+const recs::Ranked kHDegraded{{{"c-3", 40}, {"c-1", 25}}, "popularity-v1", true};
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -885,79 +885,79 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckUserKey(harness::Ctx& ctx) {
-  publishImpression("t1", "u-1", "home", kRanked);
-  publishImpression("t1", "u-2", "home", kRanked);
-  publishImpression("t1", "u-1", "home", kRanked);
+  publishImpression("t1", "u-1", "home", kHRanked);
+  publishImpression("t1", "u-2", "home", kHRanked);
+  publishImpression("t1", "u-1", "home", kHRanked);
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishImpression calls must produce three records on recsys.impression; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"u-1", "u-2", "u-1"}, "the impressions must be keyed by the user ids (keyed by surface, every home impression lands on one partition)");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"u-1", "u-2", "u-1"}, "the impressions must be keyed by the user ids (keyed by surface, every home impression lands on one partition)");
   ctx.Equal(records[0].Partition, records[2].Partition, "both impressions of u-1 must land on one partition, or a consumer reads the user's history out of order; the partitions");
 }
 
 void CheckImpressionPayload(harness::Ctx& ctx) {
-  publishImpression("t1", "u-1", "home", kDegraded);
+  publishImpression("t1", "u-1", "home", kHDegraded);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one publishImpression must produce one record; the records");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(field(event, "tenant") == "t1" && field(event, "user_id") == "u-1" && field(event, "surface") == "home", "the impression is %s, expected tenant, user_id and surface", values[0]);
+  ctx.Assert(hField(event, "tenant") == "t1" && hField(event, "user_id") == "u-1" && hField(event, "surface") == "home", "the impression is %s, expected tenant, user_id and surface", values[0]);
   const nlohmann::json want = nlohmann::json::array({{{"id", "c-3"}, {"position", 0}}, {{"id", "c-1"}, {"position", 1}}});
   const nlohmann::json items = event.is_object() && event.contains("items") ? event["items"] : nlohmann::json();
   ctx.Assert(items == want, "the impression's items are %s: each must be {id, position}, the zero-based slot the user saw it in, with no score", items.dump());
   const bool fallback = event.is_object() && event.contains("fallback") && event["fallback"] == true;
-  ctx.Assert(field(event, "model_version") == "popularity-v1" && fallback, "the impression is %s: offline evaluation needs model_version popularity-v1 and fallback true to leave the popularity order out of the model's numbers", values[0]);
+  ctx.Assert(hField(event, "model_version") == "popularity-v1" && fallback, "the impression is %s: offline evaluation needs model_version popularity-v1 and fallback true to leave the popularity order out of the model's numbers", values[0]);
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishImpression("t1", "u-1", "home", kRanked);
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishImpression("t1", "u-1", "home", kHRanked);
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records");
-  publishImpression("t1", "u-2", "home", kRanked);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the impression twice (enable.idempotence); the records");
+  publishImpression("t1", "u-2", "home", kHRanked);
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an impression (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose an impression (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishImpression("t1", "u-1", "home", kRanked);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  bool ok = publishImpression("t1", "u-1", "home", kHRanked);
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the impression is lost and the list never reaches offline evaluation; the rows");
-  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "u-1" && rows[0].contains("payload") && field(rows[0]["payload"], "user_id") == "u-1",
+  ctx.Assert(hField(rows[0], "topic") == kHEventsTopic && hField(rows[0], "key") == "u-1" && rows[0].contains("payload") && hField(rows[0]["payload"], "user_id") == "u-1",
              "the outbox row is %s, expected the topic, the key u-1 and the payload", rows[0].dump());
   ctx.Equal(ok, false, "publishImpression's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishImpression("t1", "u-2", "home", kRanked);
+  ok = publishImpression("t1", "u-2", "home", kHRanked);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishImpression waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeout = 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "user_id") == "u-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hField(rows[1]["payload"], "user_id") == "u-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishImpression's result without a delivery report");
   // The broker answers again: the abandoned delivery report arrives, and must neither stall the
   // producer nor be read as another request's outcome.
-  ctx.Kafka.Resume(kEventsTopic);
+  ctx.Kafka.Resume(kHEventsTopic);
   ctx.Settle();
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  ok = publishImpression("t1", "u-3", "home", kRanked);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishImpression("t1", "u-3", "home", kHRanked);
   ctx.Settle();
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 3 && rows[2].contains("payload") && field(rows[2]["payload"], "user_id") == "u-3" && !ok,
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 3 && rows[2].contains("payload") && hField(rows[2]["payload"], "user_id") == "u-3" && !ok,
              "after the broker came back, u-3's delivery failed and publishImpression answered %t with the outbox holding %d rows: each request must read its own delivery report, not one left over from an earlier request", ok, rows.size());
   const int64_t resumed = ctx.Clock.Now();
-  ok = publishImpression("t1", "u-4", "home", kRanked);
+  ok = publishImpression("t1", "u-4", "home", kHRanked);
   ctx.Settle();
-  ctx.Assert(ok && outboxRows(ctx).size() == 3, "after the broker came back, a healthy delivery of u-4 answered %t after %.1f s: an earlier request's abandoned delivery report must not block the producer's later reports", ok,
+  ctx.Assert(ok && hOutboxRows(ctx).size() == 3, "after the broker came back, a healthy delivery of u-4 answered %t after %.1f s: an earlier request's abandoned delivery report must not block the producer's later reports", ok,
              static_cast<double>(ctx.Clock.Now() - resumed) / 1000);
 }
 `,

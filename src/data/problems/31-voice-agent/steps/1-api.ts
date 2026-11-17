@@ -722,36 +722,36 @@ import (
 	"leetbuild/harness"
 )
 
-var sessionBody = map[string]any{"codec": "pcm16", "sample_rate": 24000}
+var hSessionBody = map[string]any{"codec": "pcm16", "sample_rate": 24000}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type sessionAnswer struct {
+type HSessionAnswer struct {
 	SessionID    string \`json:"session_id"\`
 	MaxDurationS int    \`json:"max_duration_s"\`
 	TurnCount    int    \`json:"turn_count"\`
 }
 
-func answerOf(r *harness.Response) sessionAnswer {
-	var a sessionAnswer
+func hAnswerOf(r *harness.Response) HSessionAnswer {
+	var a HSessionAnswer
 	if r.Status == 200 || r.Status == 201 {
 		r.Decode(&a)
 	}
 	return a
 }
 
-func withDuration(seconds int) map[string]any {
+func hWithDuration(seconds int) map[string]any {
 	return map[string]any{"codec": "pcm16", "sample_rate": 24000, "max_duration_s": seconds}
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r := api(ctx).Post("/v1/voice/sessions", withDuration(600), "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	r := hApi(ctx).Post("/v1/voice/sessions", hWithDuration(600), "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/voice/sessions (%s)", r.Text())
-	a := answerOf(r)
+	a := hAnswerOf(r)
 	stored := sessions.Get(context.Background(), a.SessionID)
 	ctx.Assert(stored != nil, "the answer names session %q, which the session store does not hold", a.SessionID)
 	ctx.Assert(stored.Tenant == "acme" && stored.Codec == "pcm16" && stored.SampleRate == 24000, "the stored session is %+v, expected tenant acme, pcm16 at 24000 Hz", stored)
@@ -759,9 +759,9 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	c := api(ctx)
-	missing := c.Post("/v1/voice/sessions", sessionBody, "Idempotency-Key", "k-1")
-	empty := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "", "Idempotency-Key", "k-2")
+	c := hApi(ctx)
+	missing := c.Post("/v1/voice/sessions", hSessionBody, "Idempotency-Key", "k-1")
+	empty := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "", "Idempotency-Key", "k-2")
 	ctx.Equal(missing.Status, 401, "a request without X-Tenant-Id (%s): an anonymous caller must not get a session; the status", missing.Text())
 	ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id; the status")
 	created := ctx.Redis.Keys("voice:session:vs-*")
@@ -769,7 +769,7 @@ func CheckTenant(ctx *harness.Ctx) {
 }
 
 func CheckFormats(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, f := range []struct {
 		codec string
 		rate  int
@@ -787,37 +787,37 @@ func CheckFormats(ctx *harness.Ctx) {
 }
 
 func CheckDuration(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	c := hApi(ctx)
+	r := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
 	ctx.Equal(r.Status, 201, "a session without max_duration_s (%s)", r.Text())
-	ctx.Equal(answerOf(r).MaxDurationS, 1800, "an omitted max_duration_s must become the 1800 s default; it became")
+	ctx.Equal(hAnswerOf(r).MaxDurationS, 1800, "an omitted max_duration_s must become the 1800 s default; it became")
 	for _, value := range []int{1801, 3600, 86400, 0, -5, 4294969096} {
-		r = c.Post("/v1/voice/sessions", withDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%d", value))
+		r = c.Post("/v1/voice/sessions", hWithDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%d", value))
 		ctx.Equal(r.Status, 400, "max_duration_s = %d: a session lasts 1 to 1800 s; the status", value)
 	}
 	for _, value := range []int{1800, 1} {
-		r = c.Post("/v1/voice/sessions", withDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-ok-%d", value))
-		ctx.Assert(r.Status == 201 && answerOf(r).MaxDurationS == value, "max_duration_s = %d is allowed, it answered %d %s", value, r.Status, r.Text())
+		r = c.Post("/v1/voice/sessions", hWithDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-ok-%d", value))
+		ctx.Assert(r.Status == 201 && hAnswerOf(r).MaxDurationS == value, "max_duration_s = %d is allowed, it answered %d %s", value, r.Status, r.Text())
 	}
 }
 
 func CheckIdempotentResume(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	c := hApi(ctx)
+	first := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
 	ctx.Equal(first.Status, 201, "the first create (%s)", first.Text())
-	sessionID := answerOf(first).SessionID
+	sessionID := hAnswerOf(first).SessionID
 	ctx.Redis.Do("HSET", "voice:session:"+sessionID, "turn_count", 3) // three turns in, the network drops
-	replay := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
+	replay := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
 	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer 200 with the session it created; the status")
-	ctx.Equal(answerOf(replay).SessionID, sessionID, "a replay forked the call; the session it answered")
-	ctx.Equal(answerOf(replay).TurnCount, 3, "a replay must answer the stored session; its turn_count")
-	other := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "globex", "Idempotency-Key", "k-1")
-	ctx.Assert(other.Status == 201 && answerOf(other).SessionID != sessionID, "another tenant with the same key got %d %s: keys are scoped by tenant", other.Status, other.Text())
-	fresh := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-2")
-	ctx.Assert(fresh.Status == 201 && answerOf(fresh).SessionID != sessionID, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text())
-	none := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme")
+	ctx.Equal(hAnswerOf(replay).SessionID, sessionID, "a replay forked the call; the session it answered")
+	ctx.Equal(hAnswerOf(replay).TurnCount, 3, "a replay must answer the stored session; its turn_count")
+	other := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "globex", "Idempotency-Key", "k-1")
+	ctx.Assert(other.Status == 201 && hAnswerOf(other).SessionID != sessionID, "another tenant with the same key got %d %s: keys are scoped by tenant", other.Status, other.Text())
+	fresh := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-2")
+	ctx.Assert(fresh.Status == 201 && hAnswerOf(fresh).SessionID != sessionID, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text())
+	none := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "acme")
 	ctx.Equal(none.Status, 400, "a create without Idempotency-Key; the status")
-	blank := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "")
+	blank := c.Post("/v1/voice/sessions", hSessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "")
 	ctx.Equal(blank.Status, 400, "a create with an empty Idempotency-Key; the status")
 }
 `,
@@ -831,9 +831,9 @@ func CheckIdempotentResume(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kBody = R"({"codec": "pcm16", "sample_rate": 24000})";
+const std::string kHBody = R"({"codec": "pcm16", "sample_rate": 24000})";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -841,29 +841,29 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response create(harness::HTTP& c, const std::string& body, const std::string& tenant, const std::string& key) {
+harness::Response hCreate(harness::HTTP& c, const std::string& body, const std::string& tenant, const std::string& key) {
   return c.Post("/v1/voice/sessions", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json answerOf(const harness::Response& r) {
+nlohmann::json hAnswerOf(const harness::Response& r) {
   return r.Status == 200 || r.Status == 201 ? nlohmann::json::parse(r.Text()) : nlohmann::json::object();
 }
 
-std::string withDuration(long long seconds) {
+std::string hWithDuration(long long seconds) {
   return R"({"codec": "pcm16", "sample_rate": 24000, "max_duration_s": )" + std::to_string(seconds) + "}";
 }
 
-std::string format(const std::string& codec, long rate) {
+std::string hFormat(const std::string& codec, long rate) {
   return R"({"codec": ")" + codec + R"(", "sample_rate": )" + std::to_string(rate) + "}";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = create(c, withDuration(600), "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto r = hCreate(c, hWithDuration(600), "acme", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/voice/sessions (%s)", r.Text());
-  const auto a = answerOf(r);
+  const auto a = hAnswerOf(r);
   const auto stored = sessions::get(a.value("session_id", ""));
   ctx.Assert(stored.has_value(), "the answer names session %q, which the session store does not hold", a.value("session_id", ""));
   ctx.Assert(stored->tenant == "acme" && stored->codec == "pcm16" && stored->sample_rate == 24000, "the stored session is %s, expected tenant acme, pcm16 at 24000 Hz", sessions::toJson(*stored).dump());
@@ -871,9 +871,9 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto missing = c.Post("/v1/voice/sessions", kBody, "Content-Type", "application/json", "Idempotency-Key", "k-1");
-  const auto empty = create(c, kBody, "", "k-2");
+  auto c = hApi(ctx);
+  const auto missing = c.Post("/v1/voice/sessions", kHBody, "Content-Type", "application/json", "Idempotency-Key", "k-1");
+  const auto empty = hCreate(c, kHBody, "", "k-2");
   ctx.Equal(missing.Status, 401, "a request without X-Tenant-Id (%s): an anonymous caller must not get a session; the status", missing.Text());
   ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id; the status");
   const auto created = ctx.Redis.Keys("voice:session:vs-*");
@@ -881,51 +881,51 @@ void CheckTenant(harness::Ctx& ctx) {
 }
 
 void CheckFormats(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<std::pair<std::string, long>> refused = {{"flac", 44100}, {"opus", 44100}, {"g711_ulaw", 48000}, {"pcm16", 8000}};
   for (const auto& [codec, rate] : refused) {
-    const auto r = create(c, format(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
+    const auto r = hCreate(c, hFormat(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
     ctx.Equal(r.Status, 415, "%s at %d Hz: the media pipeline cannot decode that pair; the status", codec, rate);
   }
   const std::vector<std::pair<std::string, long>> accepted = {{"opus", 16000}, {"opus", 48000}, {"pcm16", 16000}, {"pcm16", 24000}, {"g711_ulaw", 8000}};
   for (const auto& [codec, rate] : accepted) {
-    const auto r = create(c, format(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
+    const auto r = hCreate(c, hFormat(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
     ctx.Equal(r.Status, 201, "%s at %d Hz is a supported pair (%s); the status", codec, rate, r.Text());
   }
 }
 
 void CheckDuration(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, kBody, "acme", "k-1");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, kHBody, "acme", "k-1");
   ctx.Equal(r.Status, 201, "a session without max_duration_s (%s)", r.Text());
-  ctx.Equal(answerOf(r).value("max_duration_s", 0L), 1800, "an omitted max_duration_s must become the 1800 s default; it became");
+  ctx.Equal(hAnswerOf(r).value("max_duration_s", 0L), 1800, "an omitted max_duration_s must become the 1800 s default; it became");
   for (const long long value : {1801LL, 3600LL, 86400LL, 0LL, -5LL, 4294969096LL}) {
-    r = create(c, withDuration(value), "acme", "k-" + std::to_string(value));
+    r = hCreate(c, hWithDuration(value), "acme", "k-" + std::to_string(value));
     ctx.Equal(r.Status, 400, "max_duration_s = %d: a session lasts 1 to 1800 s; the status", value);
   }
   for (const long long value : {1800LL, 1LL}) {
-    r = create(c, withDuration(value), "acme", "k-ok-" + std::to_string(value));
-    ctx.Assert(r.Status == 201 && answerOf(r).value("max_duration_s", 0LL) == value, "max_duration_s = %d is allowed, it answered %d %s", value, r.Status, r.Text());
+    r = hCreate(c, hWithDuration(value), "acme", "k-ok-" + std::to_string(value));
+    ctx.Assert(r.Status == 201 && hAnswerOf(r).value("max_duration_s", 0LL) == value, "max_duration_s = %d is allowed, it answered %d %s", value, r.Status, r.Text());
   }
 }
 
 void CheckIdempotentResume(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = create(c, kBody, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto first = hCreate(c, kHBody, "acme", "k-1");
   ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
-  const std::string session_id = answerOf(first).value("session_id", "");
+  const std::string session_id = hAnswerOf(first).value("session_id", "");
   ctx.Redis.Do("HSET", "voice:session:" + session_id, "turn_count", "3");  // three turns in, the network drops
-  const auto replay = create(c, kBody, "acme", "k-1");
+  const auto replay = hCreate(c, kHBody, "acme", "k-1");
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer 200 with the session it created; the status");
-  ctx.Equal(answerOf(replay).value("session_id", ""), session_id, "a replay forked the call; the session it answered");
-  ctx.Equal(answerOf(replay).value("turn_count", 0L), 3, "a replay must answer the stored session; its turn_count");
-  const auto other = create(c, kBody, "globex", "k-1");
-  ctx.Assert(other.Status == 201 && answerOf(other).value("session_id", "") != session_id, "another tenant with the same key got %d %s: keys are scoped by tenant", other.Status, other.Text());
-  const auto fresh = create(c, kBody, "acme", "k-2");
-  ctx.Assert(fresh.Status == 201 && answerOf(fresh).value("session_id", "") != session_id, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text());
-  const auto none = c.Post("/v1/voice/sessions", kBody, "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  ctx.Equal(hAnswerOf(replay).value("session_id", ""), session_id, "a replay forked the call; the session it answered");
+  ctx.Equal(hAnswerOf(replay).value("turn_count", 0L), 3, "a replay must answer the stored session; its turn_count");
+  const auto other = hCreate(c, kHBody, "globex", "k-1");
+  ctx.Assert(other.Status == 201 && hAnswerOf(other).value("session_id", "") != session_id, "another tenant with the same key got %d %s: keys are scoped by tenant", other.Status, other.Text());
+  const auto fresh = hCreate(c, kHBody, "acme", "k-2");
+  ctx.Assert(fresh.Status == 201 && hAnswerOf(fresh).value("session_id", "") != session_id, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text());
+  const auto none = c.Post("/v1/voice/sessions", kHBody, "Content-Type", "application/json", "X-Tenant-Id", "acme");
   ctx.Equal(none.Status, 400, "a create without Idempotency-Key; the status");
-  const auto blank = create(c, kBody, "acme", "");
+  const auto blank = hCreate(c, kHBody, "acme", "");
   ctx.Equal(blank.Status, 400, "a create with an empty Idempotency-Key; the status");
 }
 `,

@@ -1017,96 +1017,96 @@ import (
 	"leetbuild/harness"
 )
 
-const leaseBatch = "b1"
+const kHLeaseBatch = "b1"
 
 // leaseSeed leaves shards 0..n-1 pending, as shards.Seed does.
-func leaseSeed(ctx *harness.Ctx, n int) {
+func hLeaseSeed(ctx *harness.Ctx, n int) {
 	for i := 0; i < n; i++ {
 		id := strconv.Itoa(i)
-		ctx.Redis.Do("RPUSH", "batch:pending:"+leaseBatch, id)
-		ctx.Redis.Do("HSET", "batch:shards:"+leaseBatch, id, "pending")
+		ctx.Redis.Do("RPUSH", "batch:pending:"+kHLeaseBatch, id)
+		ctx.Redis.Do("HSET", "batch:shards:"+kHLeaseBatch, id, "pending")
 	}
 }
 
-func leaseClaim(ctx *harness.Ctx, worker string) string {
-	shard, err := claim(context.Background(), leaseBatch, worker)
+func hLeaseClaim(ctx *harness.Ctx, worker string) string {
+	shard, err := claim(context.Background(), kHLeaseBatch, worker)
 	ctx.NoError(err, "claim(%s)", worker)
 	return shard
 }
 
-func leaseHeartbeat(ctx *harness.Ctx, shard, worker string) bool {
-	ok, err := heartbeat(context.Background(), leaseBatch, shard, worker)
+func hLeaseHeartbeat(ctx *harness.Ctx, shard, worker string) bool {
+	ok, err := heartbeat(context.Background(), kHLeaseBatch, shard, worker)
 	ctx.NoError(err, "heartbeat(%s, %s)", shard, worker)
 	return ok
 }
 
-func leaseComplete(ctx *harness.Ctx, shard, worker, outcome string) bool {
-	ok, err := complete(context.Background(), leaseBatch, shard, worker, outcome)
+func hLeaseComplete(ctx *harness.Ctx, shard, worker, outcome string) bool {
+	ok, err := complete(context.Background(), kHLeaseBatch, shard, worker, outcome)
 	ctx.NoError(err, "complete(%s, %s)", shard, worker)
 	return ok
 }
 
-func leaseReap(ctx *harness.Ctx) []string {
-	reaped, err := reap(context.Background(), leaseBatch)
+func hLeaseReap(ctx *harness.Ctx) []string {
+	reaped, err := reap(context.Background(), kHLeaseBatch)
 	ctx.NoError(err, "reap")
 	return reaped
 }
 
-func leaseStates(ctx *harness.Ctx) map[string]string { return ctx.Redis.HGetAll("batch:shards:" + leaseBatch) }
-func leaseOwners(ctx *harness.Ctx) map[string]string { return ctx.Redis.HGetAll("batch:owners:" + leaseBatch) }
-func leasePending(ctx *harness.Ctx) []string         { return ctx.Redis.LRange("batch:pending:"+leaseBatch, 0, -1) }
+func hLeaseStates(ctx *harness.Ctx) map[string]string { return ctx.Redis.HGetAll("batch:shards:" + kHLeaseBatch) }
+func hLeaseOwners(ctx *harness.Ctx) map[string]string { return ctx.Redis.HGetAll("batch:owners:" + kHLeaseBatch) }
+func hLeasePending(ctx *harness.Ctx) []string         { return ctx.Redis.LRange("batch:pending:"+kHLeaseBatch, 0, -1) }
 
-func leaseDeadline(ctx *harness.Ctx, shard string) (float64, bool) {
-	return ctx.Redis.ZScore("batch:deadlines:"+leaseBatch, shard)
+func hLeaseDeadline(ctx *harness.Ctx, shard string) (float64, bool) {
+	return ctx.Redis.ZScore("batch:deadlines:"+kHLeaseBatch, shard)
 }
 
-func leaseNear(ctx *harness.Ctx, score float64) bool {
+func hLeaseNear(ctx *harness.Ctx, score float64) bool {
 	now := float64(ctx.Clock.Now()) / 1000
 	return score-(now+30) <= 1 && (now+30)-score <= 1
 }
 
 // leaseView is a shard's lease on one line: its owner, whether it has a deadline, its state, how often it is queued.
-func leaseView(ctx *harness.Ctx, shard string) string {
+func hLeaseView(ctx *harness.Ctx, shard string) string {
 	deadline := "no"
-	if _, ok := leaseDeadline(ctx, shard); ok {
+	if _, ok := hLeaseDeadline(ctx, shard); ok {
 		deadline = "yes"
 	}
 	queued := 0
-	for _, s := range leasePending(ctx) {
+	for _, s := range hLeasePending(ctx) {
 		if s == shard {
 			queued++
 		}
 	}
-	return fmt.Sprintf("owner=%s deadline=%s state=%s queued=%d", leaseOwners(ctx)[shard], deadline, leaseStates(ctx)[shard], queued)
+	return fmt.Sprintf("owner=%s deadline=%s state=%s queued=%d", hLeaseOwners(ctx)[shard], deadline, hLeaseStates(ctx)[shard], queued)
 }
 
 // leaseReaperBetween is another process's reaper, landing right after the learner's first command on
 // batch:owners: it requeues the shard if its deadline has passed, as reap does.
-func leaseReaperBetween(ctx *harness.Ctx, shard string) {
-	ctx.Redis.After("batch:owners:"+leaseBatch, func() any {
-		score, ok := leaseDeadline(ctx, shard)
+func hLeaseReaperBetween(ctx *harness.Ctx, shard string) {
+	ctx.Redis.After("batch:owners:"+kHLeaseBatch, func() any {
+		score, ok := hLeaseDeadline(ctx, shard)
 		if !ok || score > float64(ctx.Clock.Now())/1000 {
 			return nil
 		}
-		ctx.Redis.Do("ZREM", "batch:deadlines:"+leaseBatch, shard)
-		ctx.Redis.Do("HDEL", "batch:owners:"+leaseBatch, shard)
-		ctx.Redis.Do("HSET", "batch:shards:"+leaseBatch, shard, "pending")
-		ctx.Redis.Do("RPUSH", "batch:pending:"+leaseBatch, shard)
+		ctx.Redis.Do("ZREM", "batch:deadlines:"+kHLeaseBatch, shard)
+		ctx.Redis.Do("HDEL", "batch:owners:"+kHLeaseBatch, shard)
+		ctx.Redis.Do("HSET", "batch:shards:"+kHLeaseBatch, shard, "pending")
+		ctx.Redis.Do("RPUSH", "batch:pending:"+kHLeaseBatch, shard)
 		return nil
 	})
 }
 
 func CheckClaimAtomic(ctx *harness.Ctx) {
-	leaseSeed(ctx, 3)
+	hLeaseSeed(ctx, 3)
 	var seenPending []string
 	var seenOwners map[string]string
 	fired := false
-	ctx.Redis.After("batch:pending:"+leaseBatch, func() any {
+	ctx.Redis.After("batch:pending:"+kHLeaseBatch, func() any {
 		fired = true
-		seenPending, seenOwners = leasePending(ctx), leaseOwners(ctx)
+		seenPending, seenOwners = hLeasePending(ctx), hLeaseOwners(ctx)
 		return nil
 	})
-	first := leaseClaim(ctx, "w-a")
+	first := hLeaseClaim(ctx, "w-a")
 	ctx.Assert(fired, "claim never touched batch:pending")
 	for _, s := range []string{"0", "1", "2"} {
 		inPending := false
@@ -1117,80 +1117,80 @@ func CheckClaimAtomic(ctx *harness.Ctx) {
 		ctx.Assert(inPending || owned, "right after claim's first command shard %s was in neither batch:pending (%v) nor batch:owners (%v): a worker that dies there loses it, and no reaper can find it again. The pop and the lease must be one script", s, seenPending, seenOwners)
 	}
 	ctx.Equal(first, "0", "the first claim takes shard 0")
-	ctx.Assert(leaseOwners(ctx)["0"] == "w-a" && leaseStates(ctx)["0"] == "running", "a claimed shard has its owner and state running: owners %v, shards %v", leaseOwners(ctx), leaseStates(ctx))
-	d, ok := leaseDeadline(ctx, "0")
-	ctx.Assert(ok && leaseNear(ctx, d), "the lease runs LeaseSeconds = 30 s: batch:deadlines scores shard 0 at %v, now is %d", d, ctx.Clock.Now()/1000)
-	ctx.Assert(leaseClaim(ctx, "w-b") == "1" && leaseClaim(ctx, "w-c") == "2", "claims hand out shards in order, one each")
-	ctx.Equal(leaseClaim(ctx, "w-d"), "", "an empty pending list claims nothing")
+	ctx.Assert(hLeaseOwners(ctx)["0"] == "w-a" && hLeaseStates(ctx)["0"] == "running", "a claimed shard has its owner and state running: owners %v, shards %v", hLeaseOwners(ctx), hLeaseStates(ctx))
+	d, ok := hLeaseDeadline(ctx, "0")
+	ctx.Assert(ok && hLeaseNear(ctx, d), "the lease runs LeaseSeconds = 30 s: batch:deadlines scores shard 0 at %v, now is %d", d, ctx.Clock.Now()/1000)
+	ctx.Assert(hLeaseClaim(ctx, "w-b") == "1" && hLeaseClaim(ctx, "w-c") == "2", "claims hand out shards in order, one each")
+	ctx.Equal(hLeaseClaim(ctx, "w-d"), "", "an empty pending list claims nothing")
 }
 
 func CheckOwnerHeartbeat(ctx *harness.Ctx) {
-	leaseSeed(ctx, 1)
-	ctx.Equal(leaseClaim(ctx, "w-a"), "0", "the first claim")
-	ctx.Assert(!leaseHeartbeat(ctx, "0", "w-b"), "w-b heartbeated shard 0, which w-a holds, and was told the lease is its own")
-	ctx.Equal(leaseOwners(ctx)["0"], "w-a", "a heartbeat from w-b must not take shard 0 from w-a (two workers would run it); the owner")
+	hLeaseSeed(ctx, 1)
+	ctx.Equal(hLeaseClaim(ctx, "w-a"), "0", "the first claim")
+	ctx.Assert(!hLeaseHeartbeat(ctx, "0", "w-b"), "w-b heartbeated shard 0, which w-a holds, and was told the lease is its own")
+	ctx.Equal(hLeaseOwners(ctx)["0"], "w-a", "a heartbeat from w-b must not take shard 0 from w-a (two workers would run it); the owner")
 	ctx.Clock.Advance(20)
-	ctx.Assert(leaseHeartbeat(ctx, "0", "w-a"), "the owner's heartbeat must succeed")
-	d, ok := leaseDeadline(ctx, "0")
-	ctx.Assert(ok && leaseNear(ctx, d), "the owner's heartbeat moves the deadline to now + 30, batch:deadlines scores shard 0 at %v, now is %d", d, ctx.Clock.Now()/1000)
+	ctx.Assert(hLeaseHeartbeat(ctx, "0", "w-a"), "the owner's heartbeat must succeed")
+	d, ok := hLeaseDeadline(ctx, "0")
+	ctx.Assert(ok && hLeaseNear(ctx, d), "the owner's heartbeat moves the deadline to now + 30, batch:deadlines scores shard 0 at %v, now is %d", d, ctx.Clock.Now()/1000)
 	ctx.Clock.Advance(20)
-	reaped := leaseReap(ctx)
-	ctx.Assert(len(reaped) == 0 && leaseOwners(ctx)["0"] == "w-a", "40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took %v", reaped)
+	reaped := hLeaseReap(ctx)
+	ctx.Assert(len(reaped) == 0 && hLeaseOwners(ctx)["0"] == "w-a", "40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took %v", reaped)
 	ctx.Clock.Advance(11) // w-a's next heartbeat comes late, just as a reaper runs
-	leaseReaperBetween(ctx, "0")
-	extended := leaseHeartbeat(ctx, "0", "w-a")
-	view := leaseView(ctx, "0")
+	hLeaseReaperBetween(ctx, "0")
+	extended := hLeaseHeartbeat(ctx, "0", "w-a")
+	view := hLeaseView(ctx, "0")
 	ctx.Assert((extended && view == "owner=w-a deadline=yes state=running queued=0") || (!extended && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between heartbeat's commands; heartbeat answered %t and shard 0 ended up %s: the owner check and the deadline write must be one script, or a requeued shard gets a deadline again and is handed out twice", extended, view)
 }
 
 func CheckReaperRequeue(ctx *harness.Ctx) {
-	leaseSeed(ctx, 1)
-	ctx.Equal(leaseClaim(ctx, "w-a"), "0", "the first claim")
+	hLeaseSeed(ctx, 1)
+	ctx.Equal(hLeaseClaim(ctx, "w-a"), "0", "the first claim")
 	ctx.Clock.Advance(30) // w-a died: no heartbeat, and its deadline is now
-	ctx.Equal(leaseReap(ctx), []string{"0"}, "reap must return the shard whose lease ran out")
-	ctx.Equal(leaseStates(ctx)["0"], "pending", "the shard of a worker that died must go back to pending (a crash the shard did not cause would fail the batch); its state")
-	ctx.Equal(leasePending(ctx), []string{"0"}, "the reaped shard must be on batch:pending again; it holds")
-	_, owned := leaseOwners(ctx)["0"]
-	_, hasDeadline := leaseDeadline(ctx, "0")
-	ctx.Assert(!owned && !hasDeadline, "a reaped shard has no owner and no deadline: owners %v", leaseOwners(ctx))
-	ctx.Equal(leaseClaim(ctx, "w-b"), "0", "another worker must be able to claim the reaped shard")
-	ctx.Equal(len(leaseReap(ctx)), 0, "a fresh lease is not reaped; shards reaped")
+	ctx.Equal(hLeaseReap(ctx), []string{"0"}, "reap must return the shard whose lease ran out")
+	ctx.Equal(hLeaseStates(ctx)["0"], "pending", "the shard of a worker that died must go back to pending (a crash the shard did not cause would fail the batch); its state")
+	ctx.Equal(hLeasePending(ctx), []string{"0"}, "the reaped shard must be on batch:pending again; it holds")
+	_, owned := hLeaseOwners(ctx)["0"]
+	_, hasDeadline := hLeaseDeadline(ctx, "0")
+	ctx.Assert(!owned && !hasDeadline, "a reaped shard has no owner and no deadline: owners %v", hLeaseOwners(ctx))
+	ctx.Equal(hLeaseClaim(ctx, "w-b"), "0", "another worker must be able to claim the reaped shard")
+	ctx.Equal(len(hLeaseReap(ctx)), 0, "a fresh lease is not reaped; shards reaped")
 }
 
 func CheckFencedComplete(ctx *harness.Ctx) {
-	leaseSeed(ctx, 1)
-	ctx.Equal(leaseClaim(ctx, "w-a"), "0", "the first claim")
+	hLeaseSeed(ctx, 1)
+	ctx.Equal(hLeaseClaim(ctx, "w-a"), "0", "the first claim")
 	ctx.Clock.Advance(31) // w-a stalled (a long GC pause) past its lease; the reaper requeued the shard
-	ctx.Redis.Do("ZREM", "batch:deadlines:"+leaseBatch, "0")
-	ctx.Redis.Do("HDEL", "batch:owners:"+leaseBatch, "0")
-	ctx.Redis.Do("HSET", "batch:shards:"+leaseBatch, "0", "pending")
-	ctx.Redis.Do("RPUSH", "batch:pending:"+leaseBatch, "0")
-	ctx.Equal(leaseClaim(ctx, "w-b"), "0", "w-b must be able to claim the requeued shard")
-	ctx.Assert(!leaseComplete(ctx, "0", "w-a", "done"), "w-a, whose lease was taken over, completed shard 0 and was told it worked: only the owner may complete")
-	ctx.Assert(leaseStates(ctx)["0"] == "running" && leaseOwners(ctx)["0"] == "w-b", "a completion from w-a changed the shard w-b is running: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx))
-	ctx.Assert(leaseComplete(ctx, "0", "w-b", "done"), "the owner's completion must succeed")
-	_, owned := leaseOwners(ctx)["0"]
-	ctx.Assert(leaseStates(ctx)["0"] == "done" && !owned, "after w-b completes, shard 0 is done with no owner: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx))
-	ctx.Redis.Do("RPUSH", "batch:pending:"+leaseBatch, "1")
-	ctx.Redis.Do("HSET", "batch:shards:"+leaseBatch, "1", "pending")
-	ctx.Equal(leaseClaim(ctx, "w-c"), "1", "w-c must be able to claim shard 1")
+	ctx.Redis.Do("ZREM", "batch:deadlines:"+kHLeaseBatch, "0")
+	ctx.Redis.Do("HDEL", "batch:owners:"+kHLeaseBatch, "0")
+	ctx.Redis.Do("HSET", "batch:shards:"+kHLeaseBatch, "0", "pending")
+	ctx.Redis.Do("RPUSH", "batch:pending:"+kHLeaseBatch, "0")
+	ctx.Equal(hLeaseClaim(ctx, "w-b"), "0", "w-b must be able to claim the requeued shard")
+	ctx.Assert(!hLeaseComplete(ctx, "0", "w-a", "done"), "w-a, whose lease was taken over, completed shard 0 and was told it worked: only the owner may complete")
+	ctx.Assert(hLeaseStates(ctx)["0"] == "running" && hLeaseOwners(ctx)["0"] == "w-b", "a completion from w-a changed the shard w-b is running: shards %v, owners %v", hLeaseStates(ctx), hLeaseOwners(ctx))
+	ctx.Assert(hLeaseComplete(ctx, "0", "w-b", "done"), "the owner's completion must succeed")
+	_, owned := hLeaseOwners(ctx)["0"]
+	ctx.Assert(hLeaseStates(ctx)["0"] == "done" && !owned, "after w-b completes, shard 0 is done with no owner: shards %v, owners %v", hLeaseStates(ctx), hLeaseOwners(ctx))
+	ctx.Redis.Do("RPUSH", "batch:pending:"+kHLeaseBatch, "1")
+	ctx.Redis.Do("HSET", "batch:shards:"+kHLeaseBatch, "1", "pending")
+	ctx.Equal(hLeaseClaim(ctx, "w-c"), "1", "w-c must be able to claim shard 1")
 	ctx.Clock.Advance(31) // w-c finishes past its lease, just as a reaper runs
-	leaseReaperBetween(ctx, "1")
-	done := leaseComplete(ctx, "1", "w-c", "done")
-	view := leaseView(ctx, "1")
+	hLeaseReaperBetween(ctx, "1")
+	done := hLeaseComplete(ctx, "1", "w-c", "done")
+	view := hLeaseView(ctx, "1")
 	ctx.Assert((done && view == "owner= deadline=no state=done queued=0") || (!done && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between complete's commands; complete answered %t and shard 1 ended up %s: the owner check and the writes must be one script, or a requeued shard is marked done and still run again", done, view)
 }
 
 func CheckCompleteClearsDeadline(ctx *harness.Ctx) {
-	leaseSeed(ctx, 1)
-	ctx.Equal(leaseClaim(ctx, "w-a"), "0", "the first claim")
-	ctx.Assert(leaseComplete(ctx, "0", "w-a", "done"), "the owner's completion must succeed")
-	d, has := leaseDeadline(ctx, "0")
+	hLeaseSeed(ctx, 1)
+	ctx.Equal(hLeaseClaim(ctx, "w-a"), "0", "the first claim")
+	ctx.Assert(hLeaseComplete(ctx, "0", "w-a", "done"), "the owner's completion must succeed")
+	d, has := hLeaseDeadline(ctx, "0")
 	ctx.Assert(!has, "complete left shard 0 in batch:deadlines (score %v): the reaper will find it once the old deadline passes", d)
 	ctx.Clock.Advance(31)
-	reaped := leaseReap(ctx)
+	reaped := hLeaseReap(ctx)
 	ctx.Assert(len(reaped) == 0, "reap took %v 31 s after shard 0 was done: a finished shard would run again", reaped)
-	ctx.Assert(leaseStates(ctx)["0"] == "done" && len(leasePending(ctx)) == 0, "shard 0 must stay done and off the pending list: shards %v, pending %v", leaseStates(ctx), leasePending(ctx))
+	ctx.Assert(hLeaseStates(ctx)["0"] == "done" && len(hLeasePending(ctx)) == 0, "shard 0 must stay done and off the pending list: shards %v, pending %v", hLeaseStates(ctx), hLeasePending(ctx))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1203,63 +1203,63 @@ func CheckCompleteClearsDeadline(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kBatch = "b1";
+const std::string kHBatch = "b1";
 
 // Shards 0..n-1 pending, as shards::seed leaves them.
-void leaseSeed(harness::Ctx& ctx, int n) {
+void hLeaseSeed(harness::Ctx& ctx, int n) {
   for (int i = 0; i < n; i++) {
-    ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, std::to_string(i));
-    ctx.Redis.Do("HSET", "batch:shards:" + kBatch, std::to_string(i), "pending");
+    ctx.Redis.Do("RPUSH", "batch:pending:" + kHBatch, std::to_string(i));
+    ctx.Redis.Do("HSET", "batch:shards:" + kHBatch, std::to_string(i), "pending");
   }
 }
 
-std::string field(const std::map<std::string, std::string>& h, const std::string& f) {
+std::string hField(const std::map<std::string, std::string>& h, const std::string& f) {
   const auto it = h.find(f);
   return it == h.end() ? "" : it->second;
 }
 
-std::map<std::string, std::string> leaseStates(harness::Ctx& ctx) { return ctx.Redis.HGetAll("batch:shards:" + kBatch); }
-std::map<std::string, std::string> leaseOwners(harness::Ctx& ctx) { return ctx.Redis.HGetAll("batch:owners:" + kBatch); }
-std::vector<std::string> leasePending(harness::Ctx& ctx) { return ctx.Redis.LRange("batch:pending:" + kBatch, 0, -1); }
-std::optional<double> leaseDeadline(harness::Ctx& ctx, const std::string& shard) { return ctx.Redis.ZScore("batch:deadlines:" + kBatch, shard); }
+std::map<std::string, std::string> hLeaseStates(harness::Ctx& ctx) { return ctx.Redis.HGetAll("batch:shards:" + kHBatch); }
+std::map<std::string, std::string> hLeaseOwners(harness::Ctx& ctx) { return ctx.Redis.HGetAll("batch:owners:" + kHBatch); }
+std::vector<std::string> hLeasePending(harness::Ctx& ctx) { return ctx.Redis.LRange("batch:pending:" + kHBatch, 0, -1); }
+std::optional<double> hLeaseDeadline(harness::Ctx& ctx, const std::string& shard) { return ctx.Redis.ZScore("batch:deadlines:" + kHBatch, shard); }
 
-bool leaseNear(harness::Ctx& ctx, std::optional<double> score) {
+bool hLeaseNear(harness::Ctx& ctx, std::optional<double> score) {
   return score.has_value() && std::fabs(*score - (static_cast<double>(ctx.Clock.Now()) / 1000 + 30)) <= 1;
 }
 
 // A shard's lease on one line: its owner, whether it has a deadline, its state, how often it is queued.
-std::string leaseView(harness::Ctx& ctx, const std::string& shard) {
-  const auto pending = leasePending(ctx);
-  return "owner=" + field(leaseOwners(ctx), shard) + " deadline=" + (leaseDeadline(ctx, shard).has_value() ? "yes" : "no") +
-         " state=" + field(leaseStates(ctx), shard) + " queued=" + std::to_string(std::count(pending.begin(), pending.end(), shard));
+std::string hLeaseView(harness::Ctx& ctx, const std::string& shard) {
+  const auto pending = hLeasePending(ctx);
+  return "owner=" + hField(hLeaseOwners(ctx), shard) + " deadline=" + (hLeaseDeadline(ctx, shard).has_value() ? "yes" : "no") +
+         " state=" + hField(hLeaseStates(ctx), shard) + " queued=" + std::to_string(std::count(pending.begin(), pending.end(), shard));
 }
 
 // Another process's reaper, landing right after the learner's first command on batch:owners: it
 // requeues the shard if its deadline has passed, as reap does.
-void leaseReaperBetween(harness::Ctx& ctx, const std::string& shard) {
-  ctx.Redis.After("batch:owners:" + kBatch, [&ctx, shard] {
-    const auto score = leaseDeadline(ctx, shard);
+void hLeaseReaperBetween(harness::Ctx& ctx, const std::string& shard) {
+  ctx.Redis.After("batch:owners:" + kHBatch, [&ctx, shard] {
+    const auto score = hLeaseDeadline(ctx, shard);
     if (!score.has_value() || *score > static_cast<double>(ctx.Clock.Now()) / 1000) return;
-    ctx.Redis.Do("ZREM", "batch:deadlines:" + kBatch, shard);
-    ctx.Redis.Do("HDEL", "batch:owners:" + kBatch, shard);
-    ctx.Redis.Do("HSET", "batch:shards:" + kBatch, shard, "pending");
-    ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, shard);
+    ctx.Redis.Do("ZREM", "batch:deadlines:" + kHBatch, shard);
+    ctx.Redis.Do("HDEL", "batch:owners:" + kHBatch, shard);
+    ctx.Redis.Do("HSET", "batch:shards:" + kHBatch, shard, "pending");
+    ctx.Redis.Do("RPUSH", "batch:pending:" + kHBatch, shard);
   });
 }
 
 }  // namespace
 
 void CheckClaimAtomic(harness::Ctx& ctx) {
-  leaseSeed(ctx, 3);
+  hLeaseSeed(ctx, 3);
   std::vector<std::string> seenPending;
   std::map<std::string, std::string> seenOwners;
   bool fired = false;
-  ctx.Redis.After("batch:pending:" + kBatch, [&] {
+  ctx.Redis.After("batch:pending:" + kHBatch, [&] {
     fired = true;
-    seenPending = leasePending(ctx);
-    seenOwners = leaseOwners(ctx);
+    seenPending = hLeasePending(ctx);
+    seenOwners = hLeaseOwners(ctx);
   });
-  const auto first = claim(kBatch, "w-a");
+  const auto first = claim(kHBatch, "w-a");
   ctx.Assert(fired, "claim never touched batch:pending");
   for (const std::string s : {"0", "1", "2"}) {
     const bool inPending = std::find(seenPending.begin(), seenPending.end(), s) != seenPending.end();
@@ -1268,74 +1268,74 @@ void CheckClaimAtomic(harness::Ctx& ctx) {
                s, seenPending, seenOwners);
   }
   ctx.Equal(first, std::optional<std::string>("0"), "the first claim takes shard 0");
-  ctx.Assert(field(leaseOwners(ctx), "0") == "w-a" && field(leaseStates(ctx), "0") == "running", "a claimed shard has its owner and state running: owners %v, shards %v", leaseOwners(ctx), leaseStates(ctx));
-  ctx.Assert(leaseNear(ctx, leaseDeadline(ctx, "0")), "the lease runs kLeaseSeconds = 30 s: batch:deadlines scores shard 0 at %v, now is %d", leaseDeadline(ctx, "0"), ctx.Clock.Now() / 1000);
-  ctx.Assert(claim(kBatch, "w-b") == std::optional<std::string>("1") && claim(kBatch, "w-c") == std::optional<std::string>("2"), "claims hand out shards in order, one each");
-  ctx.Assert(!claim(kBatch, "w-d").has_value(), "an empty pending list claims nothing");
+  ctx.Assert(hField(hLeaseOwners(ctx), "0") == "w-a" && hField(hLeaseStates(ctx), "0") == "running", "a claimed shard has its owner and state running: owners %v, shards %v", hLeaseOwners(ctx), hLeaseStates(ctx));
+  ctx.Assert(hLeaseNear(ctx, hLeaseDeadline(ctx, "0")), "the lease runs kLeaseSeconds = 30 s: batch:deadlines scores shard 0 at %v, now is %d", hLeaseDeadline(ctx, "0"), ctx.Clock.Now() / 1000);
+  ctx.Assert(claim(kHBatch, "w-b") == std::optional<std::string>("1") && claim(kHBatch, "w-c") == std::optional<std::string>("2"), "claims hand out shards in order, one each");
+  ctx.Assert(!claim(kHBatch, "w-d").has_value(), "an empty pending list claims nothing");
 }
 
 void CheckOwnerHeartbeat(harness::Ctx& ctx) {
-  leaseSeed(ctx, 1);
-  ctx.Equal(claim(kBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
-  ctx.Assert(!heartbeat(kBatch, "0", "w-b"), "w-b heartbeated shard 0, which w-a holds, and was told the lease is its own");
-  ctx.Equal(field(leaseOwners(ctx), "0"), "w-a", "a heartbeat from w-b must not take shard 0 from w-a (two workers would run it); the owner");
+  hLeaseSeed(ctx, 1);
+  ctx.Equal(claim(kHBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
+  ctx.Assert(!heartbeat(kHBatch, "0", "w-b"), "w-b heartbeated shard 0, which w-a holds, and was told the lease is its own");
+  ctx.Equal(hField(hLeaseOwners(ctx), "0"), "w-a", "a heartbeat from w-b must not take shard 0 from w-a (two workers would run it); the owner");
   ctx.Clock.Advance(20);
-  ctx.Assert(heartbeat(kBatch, "0", "w-a"), "the owner's heartbeat must succeed");
-  ctx.Assert(leaseNear(ctx, leaseDeadline(ctx, "0")), "the owner's heartbeat moves the deadline to now + 30, batch:deadlines scores shard 0 at %v, now is %d", leaseDeadline(ctx, "0"), ctx.Clock.Now() / 1000);
+  ctx.Assert(heartbeat(kHBatch, "0", "w-a"), "the owner's heartbeat must succeed");
+  ctx.Assert(hLeaseNear(ctx, hLeaseDeadline(ctx, "0")), "the owner's heartbeat moves the deadline to now + 30, batch:deadlines scores shard 0 at %v, now is %d", hLeaseDeadline(ctx, "0"), ctx.Clock.Now() / 1000);
   ctx.Clock.Advance(20);
-  const auto reaped = reap(kBatch);
-  ctx.Assert(reaped.empty() && field(leaseOwners(ctx), "0") == "w-a", "40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took %v", reaped);
+  const auto reaped = reap(kHBatch);
+  ctx.Assert(reaped.empty() && hField(hLeaseOwners(ctx), "0") == "w-a", "40 s after the claim and 20 s after a heartbeat the lease is alive, but reap took %v", reaped);
   ctx.Clock.Advance(11);  // w-a's next heartbeat comes late, just as a reaper runs
-  leaseReaperBetween(ctx, "0");
-  const bool extended = heartbeat(kBatch, "0", "w-a");
-  const std::string view = leaseView(ctx, "0");
+  hLeaseReaperBetween(ctx, "0");
+  const bool extended = heartbeat(kHBatch, "0", "w-a");
+  const std::string view = hLeaseView(ctx, "0");
   ctx.Assert((extended && view == "owner=w-a deadline=yes state=running queued=0") || (!extended && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between heartbeat's commands; heartbeat answered %t and shard 0 ended up %s: the owner check and the deadline write must be one script, or a requeued shard gets a deadline again and is handed out twice", extended, view);
 }
 
 void CheckReaperRequeue(harness::Ctx& ctx) {
-  leaseSeed(ctx, 1);
-  ctx.Equal(claim(kBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
+  hLeaseSeed(ctx, 1);
+  ctx.Equal(claim(kHBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
   ctx.Clock.Advance(30);  // w-a died: no heartbeat, and its deadline is now
-  ctx.Equal(reap(kBatch), {"0"}, "reap must return the shard whose lease ran out");
-  ctx.Equal(field(leaseStates(ctx), "0"), "pending", "the shard of a worker that died must go back to pending (a crash the shard did not cause would fail the batch); its state");
-  ctx.Equal(leasePending(ctx), {"0"}, "the reaped shard must be on batch:pending again; it holds");
-  ctx.Assert(leaseOwners(ctx).count("0") == 0 && !leaseDeadline(ctx, "0").has_value(), "a reaped shard has no owner and no deadline: owners %v", leaseOwners(ctx));
-  ctx.Equal(claim(kBatch, "w-b"), std::optional<std::string>("0"), "another worker must be able to claim the reaped shard");
-  ctx.Equal(reap(kBatch).size(), 0, "a fresh lease is not reaped; shards reaped");
+  ctx.Equal(reap(kHBatch), {"0"}, "reap must return the shard whose lease ran out");
+  ctx.Equal(hField(hLeaseStates(ctx), "0"), "pending", "the shard of a worker that died must go back to pending (a crash the shard did not cause would fail the batch); its state");
+  ctx.Equal(hLeasePending(ctx), {"0"}, "the reaped shard must be on batch:pending again; it holds");
+  ctx.Assert(hLeaseOwners(ctx).count("0") == 0 && !hLeaseDeadline(ctx, "0").has_value(), "a reaped shard has no owner and no deadline: owners %v", hLeaseOwners(ctx));
+  ctx.Equal(claim(kHBatch, "w-b"), std::optional<std::string>("0"), "another worker must be able to claim the reaped shard");
+  ctx.Equal(reap(kHBatch).size(), 0, "a fresh lease is not reaped; shards reaped");
 }
 
 void CheckFencedComplete(harness::Ctx& ctx) {
-  leaseSeed(ctx, 1);
-  ctx.Equal(claim(kBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
+  hLeaseSeed(ctx, 1);
+  ctx.Equal(claim(kHBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
   ctx.Clock.Advance(31);  // w-a stalled (a long GC pause) past its lease; the reaper requeued the shard
-  ctx.Redis.Do("ZREM", "batch:deadlines:" + kBatch, "0");
-  ctx.Redis.Do("HDEL", "batch:owners:" + kBatch, "0");
-  ctx.Redis.Do("HSET", "batch:shards:" + kBatch, "0", "pending");
-  ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, "0");
-  ctx.Equal(claim(kBatch, "w-b"), std::optional<std::string>("0"), "w-b must be able to claim the requeued shard");
-  ctx.Assert(!complete(kBatch, "0", "w-a", "done"), "w-a, whose lease was taken over, completed shard 0 and was told it worked: only the owner may complete");
-  ctx.Assert(field(leaseStates(ctx), "0") == "running" && field(leaseOwners(ctx), "0") == "w-b", "a completion from w-a changed the shard w-b is running: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx));
-  ctx.Assert(complete(kBatch, "0", "w-b", "done"), "the owner's completion must succeed");
-  ctx.Assert(field(leaseStates(ctx), "0") == "done" && leaseOwners(ctx).count("0") == 0, "after w-b completes, shard 0 is done with no owner: shards %v, owners %v", leaseStates(ctx), leaseOwners(ctx));
-  ctx.Redis.Do("RPUSH", "batch:pending:" + kBatch, "1");
-  ctx.Redis.Do("HSET", "batch:shards:" + kBatch, "1", "pending");
-  ctx.Equal(claim(kBatch, "w-c"), std::optional<std::string>("1"), "w-c must be able to claim shard 1");
+  ctx.Redis.Do("ZREM", "batch:deadlines:" + kHBatch, "0");
+  ctx.Redis.Do("HDEL", "batch:owners:" + kHBatch, "0");
+  ctx.Redis.Do("HSET", "batch:shards:" + kHBatch, "0", "pending");
+  ctx.Redis.Do("RPUSH", "batch:pending:" + kHBatch, "0");
+  ctx.Equal(claim(kHBatch, "w-b"), std::optional<std::string>("0"), "w-b must be able to claim the requeued shard");
+  ctx.Assert(!complete(kHBatch, "0", "w-a", "done"), "w-a, whose lease was taken over, completed shard 0 and was told it worked: only the owner may complete");
+  ctx.Assert(hField(hLeaseStates(ctx), "0") == "running" && hField(hLeaseOwners(ctx), "0") == "w-b", "a completion from w-a changed the shard w-b is running: shards %v, owners %v", hLeaseStates(ctx), hLeaseOwners(ctx));
+  ctx.Assert(complete(kHBatch, "0", "w-b", "done"), "the owner's completion must succeed");
+  ctx.Assert(hField(hLeaseStates(ctx), "0") == "done" && hLeaseOwners(ctx).count("0") == 0, "after w-b completes, shard 0 is done with no owner: shards %v, owners %v", hLeaseStates(ctx), hLeaseOwners(ctx));
+  ctx.Redis.Do("RPUSH", "batch:pending:" + kHBatch, "1");
+  ctx.Redis.Do("HSET", "batch:shards:" + kHBatch, "1", "pending");
+  ctx.Equal(claim(kHBatch, "w-c"), std::optional<std::string>("1"), "w-c must be able to claim shard 1");
   ctx.Clock.Advance(31);  // w-c finishes past its lease, just as a reaper runs
-  leaseReaperBetween(ctx, "1");
-  const bool done = complete(kBatch, "1", "w-c", "done");
-  const std::string view = leaseView(ctx, "1");
+  hLeaseReaperBetween(ctx, "1");
+  const bool done = complete(kHBatch, "1", "w-c", "done");
+  const std::string view = hLeaseView(ctx, "1");
   ctx.Assert((done && view == "owner= deadline=no state=done queued=0") || (!done && view == "owner= deadline=no state=pending queued=1"), "a reaper ran between complete's commands; complete answered %t and shard 1 ended up %s: the owner check and the writes must be one script, or a requeued shard is marked done and still run again", done, view);
 }
 
 void CheckCompleteClearsDeadline(harness::Ctx& ctx) {
-  leaseSeed(ctx, 1);
-  ctx.Equal(claim(kBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
-  ctx.Assert(complete(kBatch, "0", "w-a", "done"), "the owner's completion must succeed");
-  ctx.Assert(!leaseDeadline(ctx, "0").has_value(), "complete left shard 0 in batch:deadlines (score %v): the reaper will find it once the old deadline passes", leaseDeadline(ctx, "0"));
+  hLeaseSeed(ctx, 1);
+  ctx.Equal(claim(kHBatch, "w-a"), std::optional<std::string>("0"), "the first claim");
+  ctx.Assert(complete(kHBatch, "0", "w-a", "done"), "the owner's completion must succeed");
+  ctx.Assert(!hLeaseDeadline(ctx, "0").has_value(), "complete left shard 0 in batch:deadlines (score %v): the reaper will find it once the old deadline passes", hLeaseDeadline(ctx, "0"));
   ctx.Clock.Advance(31);
-  const auto reaped = reap(kBatch);
+  const auto reaped = reap(kHBatch);
   ctx.Assert(reaped.empty(), "reap took %v 31 s after shard 0 was done: a finished shard would run again", reaped);
-  ctx.Assert(field(leaseStates(ctx), "0") == "done" && leasePending(ctx).empty(), "shard 0 must stay done and off the pending list: shards %v, pending %v", leaseStates(ctx), leasePending(ctx));
+  ctx.Assert(hField(hLeaseStates(ctx), "0") == "done" && hLeasePending(ctx).empty(), "shard 0 must stay done and off the pending list: shards %v, pending %v", hLeaseStates(ctx), hLeasePending(ctx));
 }
 `,
   },

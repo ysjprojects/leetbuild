@@ -844,17 +844,17 @@ import (
 	"leetbuild/harness"
 )
 
-var apiGood = map[string]any{"dataset_id": "gs-support-v3", "model_version": "support-bot-2026-10", "sample_budget": 500}
+var hApiGood = map[string]any{"dataset_id": "gs-support-v3", "model_version": "support-bot-2026-10", "sample_budget": 500}
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiWith(overrides map[string]any, drop ...string) map[string]any {
+func hApiWith(overrides map[string]any, drop ...string) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiGood {
+	for k, v := range hApiGood {
 		out[k] = v
 	}
 	for k, v := range overrides {
@@ -866,17 +866,17 @@ func apiWith(overrides map[string]any, drop ...string) map[string]any {
 	return out
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/evals/runs", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiRun(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiRun(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	run, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return run
 }
 
-func apiRow(ctx *harness.Ctx, runID any) map[string]any {
+func hApiRow(ctx *harness.Ctx, runID any) map[string]any {
 	id, _ := runID.(string)
 	raw, ok := ctx.Redis.Get("evals:run:" + id)
 	ctx.Assert(ok, "the run %s must be in the run store (evals:run:{id}), keys %v", id, ctx.Redis.Keys("evals:*"))
@@ -886,73 +886,73 @@ func apiRow(ctx *harness.Ctx, runID any) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood, "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiGood, "k-1", "t1")
 	ctx.Equal(r.Status, 202, "a valid start (%s)", r.Text())
-	run := apiRun(ctx, r)
+	run := hApiRun(ctx, r)
 	for _, key := range []string{"run_id", "status", "dataset_id", "model_version", "sample_budget"} {
 		_, ok := run[key]
 		ctx.Assert(ok, "the 202 body lacks %s: %s", key, r.Text())
 	}
 	ctx.Assert(run["status"] == "queued" && run["dataset_id"] == "gs-support-v3" && run["model_version"] == "support-bot-2026-10" && run["sample_budget"] == float64(500), "the run echoes the request with status queued: %s", r.Text())
-	ctx.Equal(apiRow(ctx, run["run_id"])["tenant"], "t1", "the stored row's tenant")
+	ctx.Equal(hApiRow(ctx, run["run_id"])["tenant"], "t1", "the stored row's tenant")
 }
 
 func CheckDataset404(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith(map[string]any{"dataset_id": "gs-suport-v3"}), "k-typo", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiWith(map[string]any{"dataset_id": "gs-suport-v3"}), "k-typo", "t1")
 	ctx.Equal(r.Status, 404, "a dataset id the registry does not know (gs-suport-v3): the run would score against a golden set that does not exist")
 	for _, near := range []string{"GS-SUPPORT-V3", " gs-support-v3"} {
-		r = apiPost(c, apiWith(map[string]any{"dataset_id": near}), "k-near", "t1")
+		r = hApiPost(c, hApiWith(map[string]any{"dataset_id": near}), "k-near", "t1")
 		ctx.Equal(r.Status, 404, "the registry holds gs-support-v3, not %q: a dataset id names a golden set exactly, or the run stores an id no golden set has", near)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("evals:run:*")), 0, "a start for an unknown dataset must store no run; runs stored")
-	r = apiPost(c, apiWith(map[string]any{"dataset_id": "gs-billing-v2"}), "k-ok", "t1")
+	r = hApiPost(c, hApiWith(map[string]any{"dataset_id": "gs-billing-v2"}), "k-ok", "t1")
 	ctx.Equal(r.Status, 202, "gs-billing-v2 is in the registry (%s)", r.Text())
 }
 
 func CheckBudgetCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, budget := range []int{0, -5, 5001, 1_000_000} {
-		r := apiPost(c, apiWith(map[string]any{"sample_budget": budget}), "k-budget", "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"sample_budget": budget}), "k-budget", "t1")
 		ctx.Equal(r.Status, 400, "sample_budget=%d (the budget is 1..5000 judge calls)", budget)
 	}
-	r := apiPost(c, apiWith(nil, "sample_budget"), "k-missing", "t1")
+	r := hApiPost(c, hApiWith(nil, "sample_budget"), "k-missing", "t1")
 	ctx.Equal(r.Status, 400, "a start without sample_budget: a default budget is one the caller never chose")
 	ctx.Equal(len(ctx.Redis.Keys("evals:run:*")), 0, "refused budgets must store no run; runs stored")
 	for _, budget := range []int{1, 5000} {
-		r := apiPost(c, apiWith(map[string]any{"sample_budget": budget}), "k-"+harness.Show(budget), "t1")
+		r := hApiPost(c, hApiWith(map[string]any{"sample_budget": budget}), "k-"+harness.Show(budget), "t1")
 		ctx.Equal(r.Status, 202, "sample_budget=%d is within 1..5000 inclusive (%s)", budget, r.Text())
 	}
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/evals/runs", apiGood, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/evals/runs", hApiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
-	emptyKey := apiPost(c, apiGood, "", "t1")
+	emptyKey := hApiPost(c, hApiGood, "", "t1")
 	ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key")
 	ctx.Equal(len(ctx.Redis.Keys("evals:run:*")), 0, "a start without a usable Idempotency-Key must store no run; runs stored")
-	first := apiPost(c, apiGood, "k-7", "t1")
+	first := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 202, "the first start (%s)", first.Text())
-	replay := apiPost(c, apiGood, "k-7", "t1")
+	replay := hApiPost(c, hApiGood, "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the CI client retried; it must not get a second run)")
-	ctx.Equal(apiRun(ctx, replay)["run_id"], apiRun(ctx, first)["run_id"], "the replay must resume the same run")
+	ctx.Equal(hApiRun(ctx, replay)["run_id"], hApiRun(ctx, first)["run_id"], "the replay must resume the same run")
 	ctx.Equal(len(ctx.Redis.Keys("evals:run:*")), 1, "one key, one run: runs stored after a start and its replay")
-	other := apiPost(c, apiGood, "k-7", "t2")
-	ctx.Assert(other.Status == 202 && apiRun(ctx, other)["run_id"] != apiRun(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)")
+	other := hApiPost(c, hApiGood, "k-7", "t2")
+	ctx.Assert(other.Status == 202 && hApiRun(ctx, other)["run_id"] != hApiRun(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)")
 }
 
 func CheckTenantRequired(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := c.Post("/v1/evals/runs", apiGood, "Idempotency-Key", "k-anon")
+	c := hApiClient(ctx)
+	r := c.Post("/v1/evals/runs", hApiGood, "Idempotency-Key", "k-anon")
 	ctx.Equal(r.Status, 401, "a start without X-Tenant-Id: a run without a tenant lands where every team can read it")
-	r = apiPost(c, apiGood, "k-anon", "")
+	r = hApiPost(c, hApiGood, "k-anon", "")
 	ctx.Equal(r.Status, 401, "a start with an empty X-Tenant-Id")
 	ctx.Equal(len(ctx.Redis.Keys("evals:*")), 0, "a refused start must leave nothing in Redis (%v); keys", ctx.Redis.Keys("evals:*"))
-	r = apiPost(c, apiGood, "k-9", "t9")
+	r = hApiPost(c, hApiGood, "k-9", "t9")
 	ctx.Equal(r.Status, 202, "a start with a tenant (%s)", r.Text())
-	ctx.Equal(apiRow(ctx, apiRun(ctx, r)["run_id"])["tenant"], "t9", "the stored row must carry the caller's tenant")
+	ctx.Equal(hApiRow(ctx, hApiRun(ctx, r)["run_id"])["tenant"], "t9", "the stored row must carry the caller's tenant")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -965,30 +965,30 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGood = {{"dataset_id", "gs-support-v3"}, {"model_version", "support-bot-2026-10"}, {"sample_budget", 500}};
+const json kHGood = {{"dataset_id", "gs-support-v3"}, {"model_version", "support-bot-2026-10"}, {"sample_budget", 500}};
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& key = "k-1", const std::string& tenant = "t1") {
     return http.Post("/v1/evals/runs", body.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
   }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json hWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-json runOf(harness::Ctx& ctx, const harness::Response& r) {
+json hRunOf(harness::Ctx& ctx, const harness::Response& r) {
   const json run = json::parse(r.Text(), nullptr, false);
   ctx.Assert(run.is_object(), "the body must be a JSON object: %s", r.Text());
   return run;
 }
 
-json rowOf(harness::Ctx& ctx, const json& run) {
+json hRowOf(harness::Ctx& ctx, const json& run) {
   const std::string id = run.contains("run_id") && run["run_id"].is_string() ? run["run_id"].get<std::string>() : "";
   const auto raw = ctx.Redis.Get("evals:run:" + id);
   ctx.Assert(raw.has_value(), "the run %s must be in the run store (evals:run:{id}), keys %v", id, ctx.Redis.Keys("evals:*"));
@@ -998,73 +998,73 @@ json rowOf(harness::Ctx& ctx, const json& run) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HApi api(ctx);
+  const auto r = api.post(kHGood);
   ctx.Equal(r.Status, 202, "a valid start (%s)", r.Text());
-  const json run = runOf(ctx, r);
+  const json run = hRunOf(ctx, r);
   for (const char* key : {"run_id", "status", "dataset_id", "model_version", "sample_budget"}) ctx.Assert(run.contains(key), "the 202 body lacks %s: %s", key, r.Text());
   ctx.Assert(run["status"] == "queued" && run["dataset_id"] == "gs-support-v3" && run["model_version"] == "support-bot-2026-10" && run["sample_budget"] == 500,
              "the run echoes the request with status queued: %s", r.Text());
-  ctx.Equal(rowOf(ctx, run).value("tenant", ""), "t1", "the stored row's tenant");
+  ctx.Equal(hRowOf(ctx, run).value("tenant", ""), "t1", "the stored row's tenant");
 }
 
 void CheckDataset404(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(kGood, "dataset_id", "gs-suport-v3"), "k-typo");
+  HApi api(ctx);
+  auto r = api.post(hWith(kHGood, "dataset_id", "gs-suport-v3"), "k-typo");
   ctx.Equal(r.Status, 404, "a dataset id the registry does not know (gs-suport-v3): the run would score against a golden set that does not exist");
   for (const char* near : {"GS-SUPPORT-V3", " gs-support-v3"}) {
-    r = api.post(with(kGood, "dataset_id", near), "k-near");
+    r = api.post(hWith(kHGood, "dataset_id", near), "k-near");
     ctx.Equal(r.Status, 404, "the registry holds gs-support-v3, not \\"%s\\": a dataset id names a golden set exactly, or the run stores an id no golden set has", near);
   }
   ctx.Equal(ctx.Redis.Keys("evals:run:*").size(), 0, "a start for an unknown dataset must store no run; runs stored");
-  r = api.post(with(kGood, "dataset_id", "gs-billing-v2"), "k-ok");
+  r = api.post(hWith(kHGood, "dataset_id", "gs-billing-v2"), "k-ok");
   ctx.Equal(r.Status, 202, "gs-billing-v2 is in the registry (%s)", r.Text());
 }
 
 void CheckBudgetCap(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   for (int budget : {0, -5, 5001, 1000000}) {
-    const auto r = api.post(with(kGood, "sample_budget", budget), "k-budget");
+    const auto r = api.post(hWith(kHGood, "sample_budget", budget), "k-budget");
     ctx.Equal(r.Status, 400, "sample_budget=%d (the budget is 1..5000 judge calls)", budget);
   }
-  json missing = kGood;
+  json missing = kHGood;
   missing.erase("sample_budget");
   const auto r = api.post(missing, "k-missing");
   ctx.Equal(r.Status, 400, "a start without sample_budget: a default budget is one the caller never chose");
   ctx.Equal(ctx.Redis.Keys("evals:run:*").size(), 0, "refused budgets must store no run; runs stored");
   for (int budget : {1, 5000}) {
-    const auto ok = api.post(with(kGood, "sample_budget", budget), "k-" + std::to_string(budget));
+    const auto ok = api.post(hWith(kHGood, "sample_budget", budget), "k-" + std::to_string(budget));
     ctx.Equal(ok.Status, 202, "sample_budget=%d is within 1..5000 inclusive (%s)", budget, ok.Text());
   }
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/evals/runs", kGood.dump(), "X-Tenant-Id", "t1");
+  HApi api(ctx);
+  const auto noKey = api.http.Post("/v1/evals/runs", kHGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
-  const auto emptyKey = api.post(kGood, "");
+  const auto emptyKey = api.post(kHGood, "");
   ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key");
   ctx.Equal(ctx.Redis.Keys("evals:run:*").size(), 0, "a start without a usable Idempotency-Key must store no run; runs stored");
-  const auto first = api.post(kGood, "k-7");
+  const auto first = api.post(kHGood, "k-7");
   ctx.Equal(first.Status, 202, "the first start (%s)", first.Text());
-  const auto replay = api.post(kGood, "k-7");
+  const auto replay = api.post(kHGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the CI client retried; it must not get a second run)");
-  ctx.Equal(runOf(ctx, replay)["run_id"], runOf(ctx, first)["run_id"], "the replay must resume the same run");
+  ctx.Equal(hRunOf(ctx, replay)["run_id"], hRunOf(ctx, first)["run_id"], "the replay must resume the same run");
   ctx.Equal(ctx.Redis.Keys("evals:run:*").size(), 1, "one key, one run: runs stored after a start and its replay");
-  const auto other = api.post(kGood, "k-7", "t2");
-  ctx.Assert(other.Status == 202 && runOf(ctx, other)["run_id"] != runOf(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)");
+  const auto other = api.post(kHGood, "k-7", "t2");
+  ctx.Assert(other.Status == 202 && hRunOf(ctx, other)["run_id"] != hRunOf(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)");
 }
 
 void CheckTenantRequired(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.http.Post("/v1/evals/runs", kGood.dump(), "Idempotency-Key", "k-anon");
+  HApi api(ctx);
+  auto r = api.http.Post("/v1/evals/runs", kHGood.dump(), "Idempotency-Key", "k-anon");
   ctx.Equal(r.Status, 401, "a start without X-Tenant-Id: a run without a tenant lands where every team can read it");
-  r = api.post(kGood, "k-anon", "");
+  r = api.post(kHGood, "k-anon", "");
   ctx.Equal(r.Status, 401, "a start with an empty X-Tenant-Id");
   ctx.Equal(ctx.Redis.Keys("evals:*").size(), 0, "a refused start must leave nothing in Redis (%v); keys", ctx.Redis.Keys("evals:*"));
-  r = api.post(kGood, "k-9", "t9");
+  r = api.post(kHGood, "k-9", "t9");
   ctx.Equal(r.Status, 202, "a start with a tenant (%s)", r.Text());
-  ctx.Equal(rowOf(ctx, runOf(ctx, r)).value("tenant", ""), "t9", "the stored row must carry the caller's tenant");
+  ctx.Equal(hRowOf(ctx, hRunOf(ctx, r)).value("tenant", ""), "t9", "the stored row must carry the caller's tenant");
 }
 `,
   },

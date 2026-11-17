@@ -882,9 +882,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type readAnswer struct {
+type HReadAnswer struct {
 	EntityID  string \`json:"entity_id"\`
 	Neighbors []struct {
 		ID       string \`json:"id"\`
@@ -893,20 +893,20 @@ type readAnswer struct {
 	Truncated *bool \`json:"truncated"\`
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readEntity(tenant string) string { return store.CreateEntity(readBg, tenant, "person", "node", nil).ID }
+func hReadEntity(tenant string) string { return store.CreateEntity(hReadBg, tenant, "person", "node", nil).ID }
 
-func readEdge(ctx *harness.Ctx, left, right string) {
+func hReadEdge(ctx *harness.Ctx, left, right string) {
 	ctx.Redis.Do("SADD", "edges:"+left, right)
 	ctx.Redis.Do("SADD", "edges:"+right, left)
 }
 
-func readGet(c *harness.HTTP, entityID, query, tenant string) *harness.Response {
+func hReadGet(c *harness.HTTP, entityID, query, tenant string) *harness.Response {
 	path := "/v1/entities/" + entityID + "/neighbors" + query
 	if tenant == "" {
 		return c.Get(path)
@@ -914,29 +914,29 @@ func readGet(c *harness.HTTP, entityID, query, tenant string) *harness.Response 
 	return c.Get(path, "X-Tenant-Id", tenant)
 }
 
-func readDecode(r *harness.Response) readAnswer {
-	out := readAnswer{}
+func hReadDecode(r *harness.Response) HReadAnswer {
+	out := HReadAnswer{}
 	r.Decode(&out)
 	return out
 }
 
 // readPairs is the answer's neighbours as sorted "id@distance".
-func readPairs(r *harness.Response) string {
+func hReadPairs(r *harness.Response) string {
 	pairs := []string{}
-	for _, n := range readDecode(r).Neighbors {
+	for _, n := range hReadDecode(r).Neighbors {
 		pairs = append(pairs, fmt.Sprintf("%s@%d", n.ID, n.Distance))
 	}
 	sort.Strings(pairs)
 	return strings.Join(pairs, ",")
 }
 
-func readExpect(pairs ...string) string {
+func hReadExpect(pairs ...string) string {
 	sort.Strings(pairs)
 	return strings.Join(pairs, ",")
 }
 
 // readFill adds the extra members and n neighbours prefix-000, prefix-001, ... to the entity's edge set.
-func readFill(ctx *harness.Ctx, entityID, prefix string, n int, extra ...string) {
+func hReadFill(ctx *harness.Ctx, entityID, prefix string, n int, extra ...string) {
 	args := []any{"SADD", "edges:" + entityID}
 	for _, member := range extra {
 		args = append(args, member)
@@ -948,101 +948,101 @@ func readFill(ctx *harness.Ctx, entityID, prefix string, n int, extra ...string)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	root, left, right := readEntity("t1"), readEntity("t1"), readEntity("t1")
-	readEdge(ctx, root, left)
-	readEdge(ctx, root, right)
-	r := readGet(readAPI(ctx), root, "?depth=1", "t1")
+	root, left, right := hReadEntity("t1"), hReadEntity("t1"), hReadEntity("t1")
+	hReadEdge(ctx, root, left)
+	hReadEdge(ctx, root, right)
+	r := hReadGet(hReadAPI(ctx), root, "?depth=1", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/entities/%s/neighbors?depth=1 (%s)", root, r.Text())
-	ctx.Assert(readDecode(r).EntityID == root && readPairs(r) == readExpect(left+"@1", right+"@1"), "the neighbours of %s at depth 1 are %s and %s, got %s", root, left, right, r.Text())
+	ctx.Assert(hReadDecode(r).EntityID == root && hReadPairs(r) == hReadExpect(left+"@1", right+"@1"), "the neighbours of %s at depth 1 are %s and %s, got %s", root, left, right, r.Text())
 	ctx.Equal(ctx.Redis.Exists("adj:"+root), 1, "the walk must read through the adjacency cache (adjacency.ReadNeighbors); adj:%s exists", root)
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	mine, theirs, friend := readEntity("t1"), readEntity("t2"), readEntity("t2")
-	readEdge(ctx, theirs, friend)
-	c := readAPI(ctx)
-	foreign := readGet(c, theirs, "?depth=1", "t1")
+	mine, theirs, friend := hReadEntity("t1"), hReadEntity("t2"), hReadEntity("t2")
+	hReadEdge(ctx, theirs, friend)
+	c := hReadAPI(ctx)
+	foreign := hReadGet(c, theirs, "?depth=1", "t1")
 	ctx.Assert(foreign.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, foreign.Status, foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), friend), "the answer to t1 leaks %s, a neighbour in t2", friend)
-	unknown := readGet(c, "e-999", "?depth=1", "t1")
+	unknown := hReadGet(c, "e-999", "?depth=1", "t1")
 	ctx.Equal(unknown.Status, 404, "an unknown entity")
 	ctx.Assert(strings.ReplaceAll(foreign.Text(), theirs, "{id}") == strings.ReplaceAll(unknown.Text(), "e-999", "{id}"), "another tenant's entity answered %s and an unknown one %s: the two 404s must be the same answer, or the difference confirms that the id exists", foreign.Text(), unknown.Text())
-	ctx.Equal(readGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id")
-	r := readGet(c, theirs, "?depth=1", "t2")
-	ctx.Assert(r.Status == 200 && readPairs(r) == friend+"@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text())
+	ctx.Equal(hReadGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id")
+	r := hReadGet(c, theirs, "?depth=1", "t2")
+	ctx.Assert(r.Status == 200 && hReadPairs(r) == friend+"@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text())
 }
 
 func CheckDepthCap(ctx *harness.Ctx) {
-	a, b, c3, d := readEntity("t1"), readEntity("t1"), readEntity("t1"), readEntity("t1")
-	readEdge(ctx, a, b)
-	readEdge(ctx, b, c3)
-	readEdge(ctx, c3, d)
-	c := readAPI(ctx)
-	r := readGet(c, a, "", "t1")
-	ctx.Assert(r.Status == 200 && readPairs(r) == b+"@1", "without depth the walk must stop after 1 hop (depth defaults to 1), got %d %s", r.Status, r.Text())
-	r = readGet(c, a, "?depth=2", "t1")
-	ctx.Assert(r.Status == 200 && readPairs(r) == readExpect(b+"@1", c3+"@2"), "depth=2 on the chain must reach %s and %s, got %d %s", b, c3, r.Status, r.Text())
+	a, b, c3, d := hReadEntity("t1"), hReadEntity("t1"), hReadEntity("t1"), hReadEntity("t1")
+	hReadEdge(ctx, a, b)
+	hReadEdge(ctx, b, c3)
+	hReadEdge(ctx, c3, d)
+	c := hReadAPI(ctx)
+	r := hReadGet(c, a, "", "t1")
+	ctx.Assert(r.Status == 200 && hReadPairs(r) == b+"@1", "without depth the walk must stop after 1 hop (depth defaults to 1), got %d %s", r.Status, r.Text())
+	r = hReadGet(c, a, "?depth=2", "t1")
+	ctx.Assert(r.Status == 200 && hReadPairs(r) == hReadExpect(b+"@1", c3+"@2"), "depth=2 on the chain must reach %s and %s, got %d %s", b, c3, r.Status, r.Text())
 	for _, bad := range []string{"3", "0", "ten"} {
-		r = readGet(c, a, "?depth="+bad, "t1")
+		r = hReadGet(c, a, "?depth="+bad, "t1")
 		ctx.Assert(r.Status == 400, "depth=%s answered %d: a depth outside 1..maxDepth (2) is 400 before any traversal", bad, r.Status)
 	}
 }
 
 func CheckBoundedTraversal(ctx *harness.Ctx) {
-	a, b, c3, d := readEntity("t1"), readEntity("t1"), readEntity("t1"), readEntity("t1")
-	readEdge(ctx, a, b)
-	readEdge(ctx, a, c3)
-	readEdge(ctx, b, d)
-	readEdge(ctx, c3, d)
-	r := readGet(readAPI(ctx), a, "?depth=2", "t1")
+	a, b, c3, d := hReadEntity("t1"), hReadEntity("t1"), hReadEntity("t1"), hReadEntity("t1")
+	hReadEdge(ctx, a, b)
+	hReadEdge(ctx, a, c3)
+	hReadEdge(ctx, b, d)
+	hReadEdge(ctx, c3, d)
+	r := hReadGet(hReadAPI(ctx), a, "?depth=2", "t1")
 	ctx.Equal(r.Status, 200, "depth=2 (%s)", r.Text())
-	got := readPairs(r)
-	ctx.Assert(got == readExpect(b+"@1", c3+"@1", d+"@2"), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a)
-	x, y, z := readEntity("t1"), readEntity("t1"), readEntity("t1")
-	readEdge(ctx, x, y)
-	readEdge(ctx, y, z)
-	readEdge(ctx, x, z)
-	r = readGet(readAPI(ctx), x, "?depth=2", "t1")
-	got = readPairs(r)
-	ctx.Assert(r.Status == 200 && got == readExpect(y+"@1", z+"@1"), "a depth-2 walk over the triangle %s-%s-%s answered %d %s: %s is a direct neighbour of %s, so its distance is 1. A depth-first walk reaches it through %s first; walk breadth-first", x, y, z, r.Status, got, z, x, y)
+	got := hReadPairs(r)
+	ctx.Assert(got == hReadExpect(b+"@1", c3+"@1", d+"@2"), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a)
+	x, y, z := hReadEntity("t1"), hReadEntity("t1"), hReadEntity("t1")
+	hReadEdge(ctx, x, y)
+	hReadEdge(ctx, y, z)
+	hReadEdge(ctx, x, z)
+	r = hReadGet(hReadAPI(ctx), x, "?depth=2", "t1")
+	got = hReadPairs(r)
+	ctx.Assert(r.Status == 200 && got == hReadExpect(y+"@1", z+"@1"), "a depth-2 walk over the triangle %s-%s-%s answered %d %s: %s is a direct neighbour of %s, so its distance is 1. A depth-first walk reaches it through %s first; walk breadth-first", x, y, z, r.Status, got, z, x, y)
 }
 
 func CheckResultCap(ctx *harness.Ctx) {
-	hub, small := readEntity("t1"), readEntity("t1")
+	hub, small := hReadEntity("t1"), hReadEntity("t1")
 	args := []any{"SADD", "edges:" + hub}
 	for i := 0; i < 600; i++ {
 		args = append(args, fmt.Sprintf("l-%03d", i))
 	}
 	ctx.Redis.Do(args...)
-	readEdge(ctx, small, "l-000")
-	c := readAPI(ctx)
-	r := readGet(c, hub, "?depth=1", "t1")
+	hReadEdge(ctx, small, "l-000")
+	c := hReadAPI(ctx)
+	r := hReadGet(c, hub, "?depth=1", "t1")
 	ctx.Equal(r.Status, 200, "the hub's neighbours (%s)", r.Text())
-	answer := readDecode(r)
+	answer := hReadDecode(r)
 	unique := map[string]bool{}
 	for _, n := range answer.Neighbors {
 		unique[n.ID] = true
 	}
 	ctx.Assert(len(answer.Neighbors) == 500 && len(unique) == 500, "a hub with 600 neighbours answered %d entries: cap the answer at maxResults = 500", len(answer.Neighbors))
 	ctx.Assert(answer.Truncated != nil && *answer.Truncated, "the answer was cut at 500 and does not say truncated true: a client cannot tell a complete answer from a clipped one")
-	r = readGet(c, small, "?depth=1", "t1")
-	complete := readDecode(r)
-	ctx.Assert(complete.Truncated != nil && !*complete.Truncated && readPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text())
+	r = hReadGet(c, small, "?depth=1", "t1")
+	complete := hReadDecode(r)
+	ctx.Assert(complete.Truncated != nil && !*complete.Truncated && hReadPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text())
 	// Exactly maxResults neighbours: nothing was left, so the answer is complete.
-	exact, deep := readEntity("t1"), readEntity("t1")
-	readFill(ctx, exact, "m", 500)
-	r = readGet(c, exact, "?depth=1", "t1")
-	full := readDecode(r)
+	exact, deep := hReadEntity("t1"), hReadEntity("t1")
+	hReadFill(ctx, exact, "m", 500)
+	r = hReadGet(c, exact, "?depth=1", "t1")
+	full := hReadDecode(r)
 	seen := map[string]bool{}
 	for _, n := range full.Neighbors {
 		seen[n.ID] = true
 	}
 	ctx.Assert(r.Status == 200 && len(seen) == 500 && full.Truncated != nil && !*full.Truncated, "a hub with exactly 500 neighbours answered %d entries without truncated false: nothing was left out, so the answer is complete", len(full.Neighbors))
 	// The cut keeps the walk's order: every distance-1 neighbour before any distance-2 one.
-	readFill(ctx, deep, "z", 499)
-	readFill(ctx, "z-000", "a", 10, deep)
-	r = readGet(c, deep, "?depth=2", "t1")
-	cut := readDecode(r)
+	hReadFill(ctx, deep, "z", 499)
+	hReadFill(ctx, "z-000", "a", 10, deep)
+	r = hReadGet(c, deep, "?depth=2", "t1")
+	cut := hReadDecode(r)
 	near := 0
 	for _, n := range cut.Neighbors {
 		if n.Distance == 1 {
@@ -1064,7 +1064,7 @@ func CheckResultCap(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1072,24 +1072,24 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string readEntity(const std::string& tenant) { return store::createEntity(tenant, "person", "node", {}).id; }
+std::string hReadEntity(const std::string& tenant) { return store::createEntity(tenant, "person", "node", {}).id; }
 
-void readEdge(harness::Ctx& ctx, const std::string& left, const std::string& right) {
+void hReadEdge(harness::Ctx& ctx, const std::string& left, const std::string& right) {
   ctx.Redis.Do("SADD", "edges:" + left, right);
   ctx.Redis.Do("SADD", "edges:" + right, left);
 }
 
-harness::Response readGet(harness::HTTP& c, const std::string& entity_id, const std::string& query, const std::string& tenant) {
+harness::Response hReadGet(harness::HTTP& c, const std::string& entity_id, const std::string& query, const std::string& tenant) {
   const std::string path = "/v1/entities/" + entity_id + "/neighbors" + query;
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json readBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hReadBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 // The answer's neighbours as sorted "id@distance".
-std::string readPairs(const harness::Response& r) {
-  const auto body = readBody(r);
+std::string hReadPairs(const harness::Response& r) {
+  const auto body = hReadBody(r);
   std::vector<std::string> pairs;
   if (body.is_object() && body.contains("neighbors") && body["neighbors"].is_array()) {
     for (const auto& n : body["neighbors"]) pairs.push_back(n.value("id", "") + "@" + std::to_string(n.value("distance", 0)));
@@ -1100,7 +1100,7 @@ std::string readPairs(const harness::Response& r) {
   return out;
 }
 
-std::string readExpect(std::vector<std::string> pairs) {
+std::string hReadExpect(std::vector<std::string> pairs) {
   std::sort(pairs.begin(), pairs.end());
   std::string out;
   for (const auto& p : pairs) out += (out.empty() ? "" : ",") + p;
@@ -1108,7 +1108,7 @@ std::string readExpect(std::vector<std::string> pairs) {
 }
 
 // Adds n neighbours prefix-000, prefix-001, ... to the entity's edge set.
-void readFill(harness::Ctx& ctx, const std::string& entity_id, const std::string& prefix, int n) {
+void hReadFill(harness::Ctx& ctx, const std::string& entity_id, const std::string& prefix, int n) {
   for (int i = 0; i < n; i++) {
     char member[16];
     std::snprintf(member, sizeof member, "%s-%03d", prefix.c_str(), i);
@@ -1116,7 +1116,7 @@ void readFill(harness::Ctx& ctx, const std::string& entity_id, const std::string
   }
 }
 
-std::string readReplaced(std::string text, const std::string& from, const std::string& to) {
+std::string hReadReplaced(std::string text, const std::string& from, const std::string& to) {
   for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
   return text;
 }
@@ -1124,79 +1124,79 @@ std::string readReplaced(std::string text, const std::string& from, const std::s
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string root = readEntity("t1"), left = readEntity("t1"), right = readEntity("t1");
-  readEdge(ctx, root, left);
-  readEdge(ctx, root, right);
-  auto c = readAPI(ctx);
-  const auto r = readGet(c, root, "?depth=1", "t1");
+  const std::string root = hReadEntity("t1"), left = hReadEntity("t1"), right = hReadEntity("t1");
+  hReadEdge(ctx, root, left);
+  hReadEdge(ctx, root, right);
+  auto c = hReadAPI(ctx);
+  const auto r = hReadGet(c, root, "?depth=1", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/entities/%s/neighbors?depth=1 (%s)", root, r.Text());
-  ctx.Assert(readBody(r).value("entity_id", "") == root && readPairs(r) == readExpect({left + "@1", right + "@1"}), "the neighbours of %s at depth 1 are %s and %s, got %s", root, left, right, r.Text());
+  ctx.Assert(hReadBody(r).value("entity_id", "") == root && hReadPairs(r) == hReadExpect({left + "@1", right + "@1"}), "the neighbours of %s at depth 1 are %s and %s, got %s", root, left, right, r.Text());
   ctx.Equal(ctx.Redis.Exists("adj:" + root), 1, "the walk must read through the adjacency cache (adjacency::readNeighbors); adj:%s exists", root);
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const std::string mine = readEntity("t1"), theirs = readEntity("t2"), friend_ = readEntity("t2");
-  readEdge(ctx, theirs, friend_);
-  auto c = readAPI(ctx);
-  const auto foreign = readGet(c, theirs, "?depth=1", "t1");
+  const std::string mine = hReadEntity("t1"), theirs = hReadEntity("t2"), friend_ = hReadEntity("t2");
+  hReadEdge(ctx, theirs, friend_);
+  auto c = hReadAPI(ctx);
+  const auto foreign = hReadGet(c, theirs, "?depth=1", "t1");
   ctx.Assert(foreign.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, foreign.Status, foreign.Text());
   ctx.Assert(foreign.Text().find(friend_) == std::string::npos, "the answer to t1 leaks %s, a neighbour in t2", friend_);
-  const auto unknown = readGet(c, "e-999", "?depth=1", "t1");
+  const auto unknown = hReadGet(c, "e-999", "?depth=1", "t1");
   ctx.Equal(unknown.Status, 404, "an unknown entity");
-  ctx.Assert(readReplaced(foreign.Text(), theirs, "{id}") == readReplaced(unknown.Text(), "e-999", "{id}"), "another tenant's entity answered %s and an unknown one %s: the two 404s must be the same answer, or the difference confirms that the id exists", foreign.Text(), unknown.Text());
-  ctx.Equal(readGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id");
-  auto r = readGet(c, theirs, "?depth=1", "t2");
-  ctx.Assert(r.Status == 200 && readPairs(r) == friend_ + "@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text());
+  ctx.Assert(hReadReplaced(foreign.Text(), theirs, "{id}") == hReadReplaced(unknown.Text(), "e-999", "{id}"), "another tenant's entity answered %s and an unknown one %s: the two 404s must be the same answer, or the difference confirms that the id exists", foreign.Text(), unknown.Text());
+  ctx.Equal(hReadGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id");
+  auto r = hReadGet(c, theirs, "?depth=1", "t2");
+  ctx.Assert(r.Status == 200 && hReadPairs(r) == friend_ + "@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text());
 }
 
 void CheckDepthCap(harness::Ctx& ctx) {
-  const std::string a = readEntity("t1"), b = readEntity("t1"), c3 = readEntity("t1"), d = readEntity("t1");
-  readEdge(ctx, a, b);
-  readEdge(ctx, b, c3);
-  readEdge(ctx, c3, d);
-  auto c = readAPI(ctx);
-  auto r = readGet(c, a, "", "t1");
-  ctx.Assert(r.Status == 200 && readPairs(r) == b + "@1", "without depth the walk must stop after 1 hop (depth defaults to 1), got %d %s", r.Status, r.Text());
-  r = readGet(c, a, "?depth=2", "t1");
-  ctx.Assert(r.Status == 200 && readPairs(r) == readExpect({b + "@1", c3 + "@2"}), "depth=2 on the chain must reach %s and %s, got %d %s", b, c3, r.Status, r.Text());
+  const std::string a = hReadEntity("t1"), b = hReadEntity("t1"), c3 = hReadEntity("t1"), d = hReadEntity("t1");
+  hReadEdge(ctx, a, b);
+  hReadEdge(ctx, b, c3);
+  hReadEdge(ctx, c3, d);
+  auto c = hReadAPI(ctx);
+  auto r = hReadGet(c, a, "", "t1");
+  ctx.Assert(r.Status == 200 && hReadPairs(r) == b + "@1", "without depth the walk must stop after 1 hop (depth defaults to 1), got %d %s", r.Status, r.Text());
+  r = hReadGet(c, a, "?depth=2", "t1");
+  ctx.Assert(r.Status == 200 && hReadPairs(r) == hReadExpect({b + "@1", c3 + "@2"}), "depth=2 on the chain must reach %s and %s, got %d %s", b, c3, r.Status, r.Text());
   for (const std::string bad : {"3", "0", "ten"}) {
-    r = readGet(c, a, "?depth=" + bad, "t1");
+    r = hReadGet(c, a, "?depth=" + bad, "t1");
     ctx.Assert(r.Status == 400, "depth=%s answered %d: a depth outside 1..kMaxDepth (2) is 400 before any traversal", bad, r.Status);
   }
 }
 
 void CheckBoundedTraversal(harness::Ctx& ctx) {
-  const std::string a = readEntity("t1"), b = readEntity("t1"), c3 = readEntity("t1"), d = readEntity("t1");
-  readEdge(ctx, a, b);
-  readEdge(ctx, a, c3);
-  readEdge(ctx, b, d);
-  readEdge(ctx, c3, d);
-  auto c = readAPI(ctx);
-  const auto r = readGet(c, a, "?depth=2", "t1");
+  const std::string a = hReadEntity("t1"), b = hReadEntity("t1"), c3 = hReadEntity("t1"), d = hReadEntity("t1");
+  hReadEdge(ctx, a, b);
+  hReadEdge(ctx, a, c3);
+  hReadEdge(ctx, b, d);
+  hReadEdge(ctx, c3, d);
+  auto c = hReadAPI(ctx);
+  const auto r = hReadGet(c, a, "?depth=2", "t1");
   ctx.Equal(r.Status, 200, "depth=2 (%s)", r.Text());
-  const std::string got = readPairs(r);
-  ctx.Assert(got == readExpect({b + "@1", c3 + "@1", d + "@2"}), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a);
-  const std::string x = readEntity("t1"), y = readEntity("t1"), z = readEntity("t1");
-  readEdge(ctx, x, y);
-  readEdge(ctx, y, z);
-  readEdge(ctx, x, z);
-  const auto tri = readGet(c, x, "?depth=2", "t1");
-  const std::string triangle = readPairs(tri);
-  ctx.Assert(tri.Status == 200 && triangle == readExpect({y + "@1", z + "@1"}), "a depth-2 walk over the triangle %s-%s-%s answered %d %s: %s is a direct neighbour of %s, so its distance is 1. A depth-first walk reaches it through %s first; walk breadth-first", x, y, z, tri.Status, triangle, z, x, y);
+  const std::string got = hReadPairs(r);
+  ctx.Assert(got == hReadExpect({b + "@1", c3 + "@1", d + "@2"}), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a);
+  const std::string x = hReadEntity("t1"), y = hReadEntity("t1"), z = hReadEntity("t1");
+  hReadEdge(ctx, x, y);
+  hReadEdge(ctx, y, z);
+  hReadEdge(ctx, x, z);
+  const auto tri = hReadGet(c, x, "?depth=2", "t1");
+  const std::string triangle = hReadPairs(tri);
+  ctx.Assert(tri.Status == 200 && triangle == hReadExpect({y + "@1", z + "@1"}), "a depth-2 walk over the triangle %s-%s-%s answered %d %s: %s is a direct neighbour of %s, so its distance is 1. A depth-first walk reaches it through %s first; walk breadth-first", x, y, z, tri.Status, triangle, z, x, y);
 }
 
 void CheckResultCap(harness::Ctx& ctx) {
-  const std::string hub = readEntity("t1"), small = readEntity("t1");
+  const std::string hub = hReadEntity("t1"), small = hReadEntity("t1");
   for (int i = 0; i < 600; i++) {
     char leaf[8];
     std::snprintf(leaf, sizeof leaf, "l-%03d", i);
     ctx.Redis.Do("SADD", "edges:" + hub, std::string(leaf));
   }
-  readEdge(ctx, small, "l-000");
-  auto c = readAPI(ctx);
-  auto r = readGet(c, hub, "?depth=1", "t1");
+  hReadEdge(ctx, small, "l-000");
+  auto c = hReadAPI(ctx);
+  auto r = hReadGet(c, hub, "?depth=1", "t1");
   ctx.Equal(r.Status, 200, "the hub's neighbours (%s)", r.Text().substr(0, 200));
-  const auto body = readBody(r);
+  const auto body = hReadBody(r);
   std::set<std::string> unique;
   size_t count = 0;
   if (body.is_object() && body.contains("neighbors") && body["neighbors"].is_array()) {
@@ -1207,25 +1207,25 @@ void CheckResultCap(harness::Ctx& ctx) {
   }
   ctx.Assert(count == 500 && unique.size() == 500, "a hub with 600 neighbours answered %d entries: cap the answer at kMaxResults = 500", count);
   ctx.Assert(body.value("truncated", false) == true, "the answer was cut at 500 and does not say truncated true: a client cannot tell a complete answer from a clipped one");
-  r = readGet(c, small, "?depth=1", "t1");
-  const auto complete = readBody(r);
-  ctx.Assert(complete.is_object() && complete.contains("truncated") && complete["truncated"] == false && readPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text());
+  r = hReadGet(c, small, "?depth=1", "t1");
+  const auto complete = hReadBody(r);
+  ctx.Assert(complete.is_object() && complete.contains("truncated") && complete["truncated"] == false && hReadPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text());
   // Exactly kMaxResults neighbours: nothing was left, so the answer is complete.
-  const std::string exact = readEntity("t1"), deep = readEntity("t1");
-  readFill(ctx, exact, "m", 500);
-  r = readGet(c, exact, "?depth=1", "t1");
-  const auto full = readBody(r);
+  const std::string exact = hReadEntity("t1"), deep = hReadEntity("t1");
+  hReadFill(ctx, exact, "m", 500);
+  r = hReadGet(c, exact, "?depth=1", "t1");
+  const auto full = hReadBody(r);
   std::set<std::string> seen;
   if (full.is_object() && full.contains("neighbors") && full["neighbors"].is_array()) {
     for (const auto& n : full["neighbors"]) seen.insert(n.value("id", ""));
   }
   ctx.Assert(r.Status == 200 && seen.size() == 500 && full.is_object() && full.value("truncated", true) == false, "a hub with exactly 500 neighbours answered %d distinct entries without truncated false: nothing was left out, so the answer is complete", seen.size());
   // The cut keeps the walk's order: every distance-1 neighbour before any distance-2 one.
-  readFill(ctx, deep, "z", 499);
-  readFill(ctx, "z-000", "a", 10);
+  hReadFill(ctx, deep, "z", 499);
+  hReadFill(ctx, "z-000", "a", 10);
   ctx.Redis.Do("SADD", "edges:z-000", deep);
-  r = readGet(c, deep, "?depth=2", "t1");
-  const auto cut = readBody(r);
+  r = hReadGet(c, deep, "?depth=2", "t1");
+  const auto cut = hReadBody(r);
   size_t total = 0;
   size_t near = 0;
   if (cut.is_object() && cut.contains("neighbors") && cut["neighbors"].is_array()) {

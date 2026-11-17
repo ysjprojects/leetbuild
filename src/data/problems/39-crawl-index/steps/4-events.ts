@@ -750,65 +750,65 @@ import (
 )
 
 const (
-	eventsJob = "nightly"
-	eventBlog = "blog.example.com"
-	eventDocs = "docs.example.com"
-	pageBody  = "<html><body>How to descale a kettle</body></html>"
+	kHEventsJob = "nightly"
+	kHEventBlog = "blog.example.com"
+	kHEventDocs = "docs.example.com"
+	kHPageBody  = "<html><body>How to descale a kettle</body></html>"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func pageAt(host, path string) string { return "https://" + host + path }
+func hPageAt(host, path string) string { return "https://" + host + path }
 
-func fetchedPage(path, body string) FetchedPage {
+func hFetchedPage(path, body string) FetchedPage {
 	return FetchedPage{Status: 200, ContentHash: "sha256:" + path, BodyRef: "pages" + path, Body: body}
 }
 
-func mustIndex(ctx *harness.Ctx, host, path string) map[string]any {
-	url := pageAt(host, path)
-	records.MarkFetched(eventsBg, eventsJob, url, "sha256:"+path, "pages"+path)
-	event, err := indexPage(eventsBg, eventsJob, url, fetchedPage(path, pageBody))
+func hMustIndex(ctx *harness.Ctx, host, path string) map[string]any {
+	url := hPageAt(host, path)
+	records.MarkFetched(hEventsBg, kHEventsJob, url, "sha256:"+path, "pages"+path)
+	event, err := indexPage(hEventsBg, kHEventsJob, url, hFetchedPage(path, kHPageBody))
 	ctx.NoError(err, "indexPage(%s) failed", url)
 	return event
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
 func CheckHostKey(ctx *harness.Ctx) {
-	mustIndex(ctx, eventBlog, "/posts/1")
-	mustIndex(ctx, eventBlog, "/posts/2")
-	mustIndex(ctx, eventDocs, "/guide")
-	mustIndex(ctx, eventBlog, "/posts/1")
-	mustIndex(ctx, "Blog.Example.com:8443", "/posts/3")
+	hMustIndex(ctx, kHEventBlog, "/posts/1")
+	hMustIndex(ctx, kHEventBlog, "/posts/2")
+	hMustIndex(ctx, kHEventDocs, "/guide")
+	hMustIndex(ctx, kHEventBlog, "/posts/1")
+	hMustIndex(ctx, "Blog.Example.com:8443", "/posts/3")
 	recs := ctx.Kafka.Records(topic)
 	ctx.Equal(len(recs), 5, "five indexed pages; the records on %s", topic)
 	keys := ctx.Kafka.Keys(topic)
 	sort.Strings(keys)
-	ctx.Equal(keys, []string{eventBlog, eventBlog, eventBlog, eventBlog, eventDocs}, "records must be keyed by the URL's host as web.SplitURL gives it (lower-cased, no port; one URL is https://Blog.Example.com:8443/posts/3); the keys")
-	ctx.Equal(payloadOf(ctx, recs[4].Value)["host"], eventBlog, "the event for https://Blog.Example.com:8443/posts/3 must carry the host as web.SplitURL gives it; its host")
+	ctx.Equal(keys, []string{kHEventBlog, kHEventBlog, kHEventBlog, kHEventBlog, kHEventDocs}, "records must be keyed by the URL's host as web.SplitURL gives it (lower-cased, no port; one URL is https://Blog.Example.com:8443/posts/3); the keys")
+	ctx.Equal(hPayloadOf(ctx, recs[4].Value)["host"], kHEventBlog, "the event for https://Blog.Example.com:8443/posts/3 must carry the host as web.SplitURL gives it; its host")
 	partitions := map[int]bool{}
 	for _, r := range recs {
-		if string(r.Key) == eventBlog {
+		if string(r.Key) == kHEventBlog {
 			partitions[r.Partition] = true
 		}
 	}
-	ctx.Equal(len(partitions), 1, "a host's pages and their re-crawls must stay on one partition, in order; the partitions %s's pages landed on", eventBlog)
+	ctx.Equal(len(partitions), 1, "a host's pages and their re-crawls must stay on one partition, in order; the partitions %s's pages landed on", kHEventBlog)
 }
 
 func CheckReferencesOnly(ctx *harness.Ctx) {
-	mustIndex(ctx, eventBlog, "/posts/1")
+	hMustIndex(ctx, kHEventBlog, "/posts/1")
 	value := ctx.Kafka.Records(topic)[0].Value
-	p := payloadOf(ctx, value)
+	p := hPayloadOf(ctx, value)
 	for _, name := range []string{"content", "body", "html"} {
 		_, present := p[name]
 		ctx.Assert(!present, "the event carries the page as %q: %v. The topic is retained and replicated; carry body_ref, not the body", name, p)
 	}
 	ctx.Assert(!strings.Contains(string(value), "descale"), "the event carries the page's text: %s", value)
-	expected := map[string]any{"job_id": eventsJob, "url": pageAt(eventBlog, "/posts/1"), "host": eventBlog, "status": 200, "content_hash": "sha256:/posts/1", "body_ref": "pages/posts/1"}
+	expected := map[string]any{"job_id": kHEventsJob, "url": hPageAt(kHEventBlog, "/posts/1"), "host": kHEventBlog, "status": 200, "content_hash": "sha256:/posts/1", "body_ref": "pages/posts/1"}
 	for k, v := range expected {
 		ctx.Equal(p[k], v, "the event must carry %v; it has %v; its %s", expected, p, k)
 	}
@@ -816,27 +816,27 @@ func CheckReferencesOnly(ctx *harness.Ctx) {
 }
 
 func CheckIndexBeforeAnnounce(ctx *harness.Ctx) {
-	url := pageAt(eventBlog, "/posts/1")
-	records.MarkFetched(eventsBg, eventsJob, url, "sha256:/posts/1", "pages/posts/1")
+	url := hPageAt(kHEventBlog, "/posts/1")
+	records.MarkFetched(hEventsBg, kHEventsJob, url, "sha256:/posts/1", "pages/posts/1")
 	atIndex := ctx.Redis.After("index:"+url, func() any { return len(ctx.Kafka.Records(topic)) })
-	atMark := ctx.Redis.After("page:"+eventsJob+":"+url, func() any { return len(ctx.Kafka.Records(topic)) })
-	_, err := indexPage(eventsBg, eventsJob, url, fetchedPage("/posts/1", pageBody))
+	atMark := ctx.Redis.After("page:"+kHEventsJob+":"+url, func() any { return len(ctx.Kafka.Records(topic)) })
+	_, err := indexPage(hEventsBg, kHEventsJob, url, hFetchedPage("/posts/1", kHPageBody))
 	ctx.NoError(err, "indexPage failed")
 	ctx.Assert(atIndex.Fired, "indexPage never wrote index:%s", url)
 	ctx.Equal(atIndex.Result, 0, "when the index entry was written the topic already held records: a consumer could read the event before the entry it points at exists. Write the index, then produce; the records at the index write")
 	ctx.Assert(atMark.Fired, "indexPage never marked the page indexed")
 	ctx.Equal(atMark.Result, 0, "when the page was marked indexed the topic already held records: mark it, then produce; the records at the mark")
-	ctx.Assert(len(ctx.Kafka.Records(topic)) == 1 && search.Get(eventsBg, url) != nil, "after indexPage the page must be in the index and announced once")
-	empty := pageAt(eventBlog, "/empty")
-	records.MarkFetched(eventsBg, eventsJob, empty, "sha256:/empty", "pages/empty")
-	indexPage(eventsBg, eventsJob, empty, fetchedPage("/empty", ""))
+	ctx.Assert(len(ctx.Kafka.Records(topic)) == 1 && search.Get(hEventsBg, url) != nil, "after indexPage the page must be in the index and announced once")
+	empty := hPageAt(kHEventBlog, "/empty")
+	records.MarkFetched(hEventsBg, kHEventsJob, empty, "sha256:/empty", "pages/empty")
+	indexPage(hEventsBg, kHEventsJob, empty, hFetchedPage("/empty", ""))
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "a page the index refused (empty body) must not be announced; the records")
-	ctx.Equal(records.PageOf(eventsBg, eventsJob, empty)["status"], "fetched", "a page the index refused was never indexed; its record")
+	ctx.Equal(records.PageOf(hEventsBg, kHEventsJob, empty)["status"], "fetched", "a page the index refused was never indexed; its record")
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	mustIndex(ctx, eventBlog, "/posts/1")
-	mustIndex(ctx, eventBlog, "/posts/2")
+	hMustIndex(ctx, kHEventBlog, "/posts/1")
+	hMustIndex(ctx, kHEventBlog, "/posts/2")
 	lost := ctx.Kafka.Failover(topic)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d acknowledged event(s) were lost: with RequireOne the leader alone had them. Use RequireAll; the records", lost)
 }
@@ -855,26 +855,26 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kJob = "nightly";
-const std::string kBlog = "blog.example.com";
-const std::string kDocs = "docs.example.com";
-const std::string kBody = "<html><body>How to descale a kettle</body></html>";
+const std::string kHJob = "nightly";
+const std::string kHBlog = "blog.example.com";
+const std::string kHDocs = "docs.example.com";
+const std::string kHBody = "<html><body>How to descale a kettle</body></html>";
 
-std::string pageAt(const std::string& host, const std::string& path) { return "https://" + host + path; }
+std::string hPageAt(const std::string& host, const std::string& path) { return "https://" + host + path; }
 
-FetchedPage fetchedPage(const std::string& path, const std::string& body) { return FetchedPage{200, "sha256:" + path, "pages" + path, body}; }
+FetchedPage hFetchedPage(const std::string& path, const std::string& body) { return FetchedPage{200, "sha256:" + path, "pages" + path, body}; }
 
-json mustIndex(harness::Ctx& ctx, const std::string& host, const std::string& path) {
-  const std::string url = pageAt(host, path);
-  records::markFetched(kJob, url, "sha256:" + path, "pages" + path);
+json hMustIndex(harness::Ctx& ctx, const std::string& host, const std::string& path) {
+  const std::string url = hPageAt(host, path);
+  records::markFetched(kHJob, url, "sha256:" + path, "pages" + path);
   try {
-    return indexPage(kJob, url, fetchedPage(path, kBody));
+    return indexPage(kHJob, url, hFetchedPage(path, kHBody));
   } catch (const std::exception& e) {
     ctx.Fatalf("indexPage(%s) threw %s: %s", url, harness::CurrentExceptionType(), e.what());
   }
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -885,31 +885,31 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
 }  // namespace
 
 void CheckHostKey(harness::Ctx& ctx) {
-  mustIndex(ctx, kBlog, "/posts/1");
-  mustIndex(ctx, kBlog, "/posts/2");
-  mustIndex(ctx, kDocs, "/guide");
-  mustIndex(ctx, kBlog, "/posts/1");
-  mustIndex(ctx, "Blog.Example.com:8443", "/posts/3");
+  hMustIndex(ctx, kHBlog, "/posts/1");
+  hMustIndex(ctx, kHBlog, "/posts/2");
+  hMustIndex(ctx, kHDocs, "/guide");
+  hMustIndex(ctx, kHBlog, "/posts/1");
+  hMustIndex(ctx, "Blog.Example.com:8443", "/posts/3");
   const auto recs = ctx.Kafka.Records(kTopic);
   ctx.Equal(recs.size(), 5, "five indexed pages; the records on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {kBlog, kBlog, kDocs, kBlog, kBlog}, "records must be keyed by the URL's host as web::splitUrl gives it (lower-cased, no port; the last URL is https://Blog.Example.com:8443/posts/3); the keys");
-  ctx.Equal(payloadOf(ctx, recs.at(4)).value("host", ""), kBlog, "the event for https://Blog.Example.com:8443/posts/3 must carry the host as web::splitUrl gives it; its host");
+  ctx.Equal(ctx.Kafka.Keys(kTopic), {kHBlog, kHBlog, kHDocs, kHBlog, kHBlog}, "records must be keyed by the URL's host as web::splitUrl gives it (lower-cased, no port; the last URL is https://Blog.Example.com:8443/posts/3); the keys");
+  ctx.Equal(hPayloadOf(ctx, recs.at(4)).value("host", ""), kHBlog, "the event for https://Blog.Example.com:8443/posts/3 must carry the host as web::splitUrl gives it; its host");
   std::set<int> partitions;
   for (const auto& r : recs) {
-    if (r.Key && *r.Key == kBlog) partitions.insert(r.Partition);
+    if (r.Key && *r.Key == kHBlog) partitions.insert(r.Partition);
   }
-  ctx.Equal(partitions.size(), 1, "a host's pages and their re-crawls must stay on one partition, in order; the partitions %s's pages landed on", kBlog);
+  ctx.Equal(partitions.size(), 1, "a host's pages and their re-crawls must stay on one partition, in order; the partitions %s's pages landed on", kHBlog);
 }
 
 void CheckReferencesOnly(harness::Ctx& ctx) {
-  mustIndex(ctx, kBlog, "/posts/1");
+  hMustIndex(ctx, kHBlog, "/posts/1");
   const auto record = ctx.Kafka.Records(kTopic).at(0);
-  const json p = payloadOf(ctx, record);
+  const json p = hPayloadOf(ctx, record);
   for (const std::string name : {"content", "body", "html"}) {
     ctx.Assert(!p.contains(name), "the event carries the page as %q: %s. The topic is retained and replicated; carry body_ref, not the body", name, p.dump());
   }
   ctx.Assert(record.Value.value_or("").find("descale") == std::string::npos, "the event carries the page's text: %s", record.Value.value_or(""));
-  const json expected = {{"job_id", kJob}, {"url", pageAt(kBlog, "/posts/1")}, {"host", kBlog}, {"status", 200}, {"content_hash", "sha256:/posts/1"}, {"body_ref", "pages/posts/1"}};
+  const json expected = {{"job_id", kHJob}, {"url", hPageAt(kHBlog, "/posts/1")}, {"host", kHBlog}, {"status", 200}, {"content_hash", "sha256:/posts/1"}, {"body_ref", "pages/posts/1"}};
   for (const auto& [k, v] : expected.items()) {
     ctx.Assert(p.contains(k) && p[k] == v, "the event must carry %s; it has %s", expected.dump(), p.dump());
   }
@@ -917,14 +917,14 @@ void CheckReferencesOnly(harness::Ctx& ctx) {
 }
 
 void CheckIndexBeforeAnnounce(harness::Ctx& ctx) {
-  const std::string url = pageAt(kBlog, "/posts/1");
-  records::markFetched(kJob, url, "sha256:/posts/1", "pages/posts/1");
+  const std::string url = hPageAt(kHBlog, "/posts/1");
+  records::markFetched(kHJob, url, "sha256:/posts/1", "pages/posts/1");
   auto atIndex = std::make_shared<int>(-1);
   auto atMark = std::make_shared<int>(-1);
   ctx.Redis.After("index:" + url, [&ctx, atIndex] { *atIndex = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  ctx.Redis.After("page:" + kJob + ":" + url, [&ctx, atMark] { *atMark = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
+  ctx.Redis.After("page:" + kHJob + ":" + url, [&ctx, atMark] { *atMark = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
   try {
-    indexPage(kJob, url, fetchedPage("/posts/1", kBody));
+    indexPage(kHJob, url, hFetchedPage("/posts/1", kHBody));
   } catch (const std::exception& e) {
     ctx.Fatalf("indexPage threw %s: %s", harness::CurrentExceptionType(), e.what());
   }
@@ -933,20 +933,20 @@ void CheckIndexBeforeAnnounce(harness::Ctx& ctx) {
   ctx.Assert(*atMark >= 0, "indexPage never marked the page indexed");
   ctx.Equal(*atMark, 0, "when the page was marked indexed the topic already held records: mark it, then produce; the records at the mark");
   ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && search::get(url).has_value(), "after indexPage the page must be in the index and announced once");
-  const std::string empty = pageAt(kBlog, "/empty");
-  records::markFetched(kJob, empty, "sha256:/empty", "pages/empty");
+  const std::string empty = hPageAt(kHBlog, "/empty");
+  records::markFetched(kHJob, empty, "sha256:/empty", "pages/empty");
   try {
-    indexPage(kJob, empty, fetchedPage("/empty", ""));
+    indexPage(kHJob, empty, hFetchedPage("/empty", ""));
   } catch (const std::exception&) {
     // the index refused the page
   }
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "a page the index refused (empty body) must not be announced; the records");
-  ctx.Equal(records::pageOf(kJob, empty)->at("status"), "fetched", "a page the index refused was never indexed; its record");
+  ctx.Equal(records::pageOf(kHJob, empty)->at("status"), "fetched", "a page the index refused was never indexed; its record");
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
-  mustIndex(ctx, kBlog, "/posts/1");
-  mustIndex(ctx, kBlog, "/posts/2");
+  hMustIndex(ctx, kHBlog, "/posts/1");
+  hMustIndex(ctx, kHBlog, "/posts/2");
   const int lost = ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d acknowledged event(s) were lost: with acks=1 the leader alone had them. Use acks=all; the records", lost);
 }

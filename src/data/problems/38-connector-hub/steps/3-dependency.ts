@@ -1070,14 +1070,14 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // vendorPeer serves two records a page; the next cursor is the page's cursor plus one.
-type vendorPeer struct {
+type HVendorPeer struct {
 	pb.UnimplementedVendorServer
 }
 
-func (vendorPeer) FetchPage(_ context.Context, req *pb.FetchPageRequest) (*pb.Page, error) {
+func (HVendorPeer) FetchPage(_ context.Context, req *pb.FetchPageRequest) (*pb.Page, error) {
 	n, _ := strconv.Atoi(req.GetCursor())
 	records := []*pb.SourceRecord{
 		{Id: fmt.Sprintf("r-%d-0", n), Body: fmt.Sprintf("record 0 of page %d", n)},
@@ -1086,34 +1086,34 @@ func (vendorPeer) FetchPage(_ context.Context, req *pb.FetchPageRequest) (*pb.Pa
 	return &pb.Page{Records: records, NextCursor: strconv.Itoa(n + 1)}, nil
 }
 
-func client(ctx *harness.Ctx) string {
-	pb.RegisterVendorServer(ctx.GRPC.Server(""), vendorPeer{})
-	return store.Create(clientBg, "acme", "github", "api.github.com", "vault:acme/github#4", 900).ConnectorID
+func hClient(ctx *harness.Ctx) string {
+	pb.RegisterVendorServer(ctx.GRPC.Server(""), HVendorPeer{})
+	return store.Create(hClientBg, "acme", "github", "api.github.com", "vault:acme/github#4", 900).ConnectorID
 }
 
 // fetch is fetchPage, reporting a panic as an error instead of ending the check.
-func fetch(connectorID, cursor string) (page *pb.Page, err error) {
+func hFetch(connectorID, cursor string) (page *pb.Page, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			err = errors.New("panic: " + harness.Show(e))
 		}
 	}()
-	return fetchPage(clientBg, connectorID, cursor)
+	return fetchPage(hClientBg, connectorID, cursor)
 }
 
-func fetchCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("FetchPage", "") }
+func hFetchCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("FetchPage", "") }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	cid := client(ctx)
-	page, err := fetch(cid, "0")
+	cid := hClient(ctx)
+	page, err := hFetch(cid, "0")
 	ctx.Assert(err == nil && page.GetNextCursor() == "1", "with a healthy vendor fetchPage failed: %v", err)
-	calls := fetchCalls(ctx)
+	calls := hFetchCalls(ctx)
 	call := calls[len(calls)-1]
 	ctx.Assert(call.HasDeadline(), "FetchPage carries no deadline: a vendor that stops answering holds the worker for as long as it likes")
 	ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "FetchPage carries a %v deadline, expected 2 s", call.Timeout)
 	ctx.GRPC.SetLatency("FetchPage", 30.0, "")
 	started := ctx.Clock.Now()
-	_, err = fetch(cid, "1")
+	_, err = hFetch(cid, "1")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(errors.Is(err, ErrVendorUnavailable), "with the vendor 30 s slow fetchPage returned %v after %.1f s, expected ErrVendorUnavailable after the 2 s deadline", err, waited)
 	ctx.Assert(waited <= 3, "fetchPage waited %.1f s on a stalled vendor", waited)
@@ -1122,10 +1122,10 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBackoff(ctx *harness.Ctx) {
-	cid := client(ctx)
+	cid := hClient(ctx)
 	ctx.GRPC.Fail("FetchPage", codes.ResourceExhausted, "rate limited", 3, "")
-	page, err := fetch(cid, "0")
-	calls := fetchCalls(ctx)
+	page, err := hFetch(cid, "0")
+	calls := hFetchCalls(ctx)
 	ctx.Assert(err == nil && page != nil, "three 429s then an answer: fetchPage returned %v, it must back off and retry a rate limit", err)
 	ctx.Equal(len(calls), 4, "three 429s then an answer; the calls")
 	var gaps []float64
@@ -1135,17 +1135,17 @@ func CheckBackoff(ctx *harness.Ctx) {
 	ctx.Assert(gaps[0] >= 0.1, "the retries came %v s apart: retrying a 429 at once is the flood the vendor asked you to stop", gaps)
 	ctx.Assert(gaps[2] > 1.5*gaps[0], "the waits between retries were %v s: they must grow with the attempt (backoffBase doubling)", gaps)
 	ctx.GRPC.Fail("FetchPage", codes.ResourceExhausted, "rate limited", 5, "")
-	_, err = fetch(cid, "1")
+	_, err = hFetch(cid, "1")
 	ctx.Assert(errors.Is(err, ErrVendorUnavailable), "a vendor answering 429 to every attempt: fetchPage returned %v, expected ErrVendorUnavailable", err)
-	ctx.Equal(len(fetchCalls(ctx))-4, 5, "a vendor answering 429 to every attempt; the calls (maxAttempts)")
+	ctx.Equal(len(hFetchCalls(ctx))-4, 5, "a vendor answering 429 to every attempt; the calls (maxAttempts)")
 	var deadlines []time.Duration
 	ownDeadline := true
-	for _, call := range fetchCalls(ctx) {
+	for _, call := range hFetchCalls(ctx) {
 		deadlines = append(deadlines, call.Timeout)
 		ownDeadline = ownDeadline && call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond
 	}
 	ctx.Assert(ownDeadline, "the attempts carried deadlines of %v: every attempt gets its own deadline (2 s), not what is left of the first one's", deadlines)
-	again := fetchCalls(ctx)[4:]
+	again := hFetchCalls(ctx)[4:]
 	var gapsAgain []float64
 	for i := 1; i < len(again); i++ {
 		gapsAgain = append(gapsAgain, again[i].Started.Sub(again[i-1].Started).Seconds())
@@ -1164,30 +1164,30 @@ func CheckBackoff(ctx *harness.Ctx) {
 }
 
 func CheckAuthTerminal(ctx *harness.Ctx) {
-	cid := client(ctx)
+	cid := hClient(ctx)
 	ctx.GRPC.Fail("FetchPage", codes.Unauthenticated, "token revoked", 5, "")
-	_, err := fetch(cid, "0")
+	_, err := hFetch(cid, "0")
 	ctx.Assert(errors.Is(err, ErrVendorAuthFailed), "after a 401 fetchPage returned %v, expected ErrVendorAuthFailed", err)
-	ctx.Equal(len(fetchCalls(ctx)), 1, "a 401 does not get better by retrying; the calls with a rejected token")
-	row := store.Get(clientBg, cid)
+	ctx.Equal(len(hFetchCalls(ctx)), 1, "a 401 does not get better by retrying; the calls with a rejected token")
+	row := store.Get(hClientBg, cid)
 	ctx.Assert(row.Status == "disabled" && row.DisabledReason != "", "after a 401 the connector is %q with reason %q: disable it with a reason an operator can read", row.Status, row.DisabledReason)
-	_, err = fetch(cid, "1")
+	_, err = hFetch(cid, "1")
 	ctx.Assert(errors.Is(err, ErrVendorAuthFailed), "a disabled connector: fetchPage returned %v, expected ErrVendorAuthFailed", err)
-	ctx.Equal(len(fetchCalls(ctx)), 1, "a disabled connector must not call the vendor again; the calls")
+	ctx.Equal(len(hFetchCalls(ctx)), 1, "a disabled connector must not call the vendor again; the calls")
 }
 
 func CheckBreaker(ctx *harness.Ctx) {
-	cid := client(ctx)
+	cid := hClient(ctx)
 	// A 500 counts like a 503: it is not a rate limit, so it is neither retried nor left out of the count.
 	answers := []string{"503", "503", "500", "503", "503"}
 	ctx.GRPC.Fail("FetchPage", codes.Unavailable, "vendor 503", 2, "")
 	ctx.GRPC.Fail("FetchPage", codes.Internal, "vendor 500", 1, "")
 	ctx.GRPC.Fail("FetchPage", codes.Unavailable, "vendor 503", 2, "")
 	for run := 1; run <= 5; run++ {
-		_, err := fetch(cid, strconv.Itoa(run))
+		_, err := hFetch(cid, strconv.Itoa(run))
 		ctx.Assert(errors.Is(err, ErrVendorUnavailable), "run %d against a vendor answering %s: fetchPage returned %v, expected ErrVendorUnavailable", run, answers[run-1], err)
 	}
-	ctx.Equal(len(fetchCalls(ctx)), 5, "five runs against a vendor answering 503, 503, 500, 503, 503 must make one call a run (a 5xx goes back to the scheduler); the calls")
+	ctx.Equal(len(hFetchCalls(ctx)), 5, "five runs against a vendor answering 503, 503, 500, 503, 503 must make one call a run (a 5xx goes back to the scheduler); the calls")
 	health := ctx.Redis.HGetAll("health:" + cid)
 	now := ctx.Clock.Now() / 1000
 	ctx.Equal(health["consecutive_failures"], "5", "after 503, 503, 500, 503, 503 (every failure but a rate limit counts) health:%s consecutive_failures (it holds %v)", cid, health)
@@ -1195,14 +1195,14 @@ func CheckBreaker(ctx *harness.Ctx) {
 	ctx.Assert(now+29 <= openUntil && openUntil <= now+31, "after five consecutive failures at %d health:%s holds %v: open_until must be now plus breakerCooldownS (30 s), in seconds", now, cid, health)
 	lastRun, _ := strconv.ParseInt(health["last_run_at"], 10, 64)
 	ctx.Assert(now-1 <= lastRun && lastRun <= now+1, "the vendor answered a failure at %d, health:%s holds %v: every answered call sets last_run_at", now, cid, health)
-	_, err := fetch(cid, "6")
+	_, err := hFetch(cid, "6")
 	ctx.Assert(errors.Is(err, ErrBreakerOpen), "the sixth run after five consecutive failures: fetchPage returned %v, expected ErrBreakerOpen", err)
 	ctx.Clock.Advance(29)
-	_, err = fetch(cid, "6")
+	_, err = hFetch(cid, "6")
 	ctx.Assert(errors.Is(err, ErrBreakerOpen), "29 s after the breaker opened, inside its 30 s cooldown: fetchPage returned %v, expected ErrBreakerOpen", err)
-	ctx.Equal(len(fetchCalls(ctx)), 5, "with the breaker open the vendor must not be called; the calls")
+	ctx.Equal(len(hFetchCalls(ctx)), 5, "with the breaker open the vendor must not be called; the calls")
 	ctx.Clock.Advance(2)
-	page, err := fetch(cid, "6")
+	page, err := hFetch(cid, "6")
 	ctx.Assert(err == nil && page != nil, "31 s later a recovered vendor must be tried again: fetchPage returned %v", err)
 	health = ctx.Redis.HGetAll("health:" + cid)
 	ctx.Equal(health["consecutive_failures"], "0", "a success must reset the failure count; consecutive_failures")
@@ -1220,7 +1220,7 @@ func CheckBreaker(ctx *harness.Ctx) {
 namespace {
 
 // Two records a page; the next cursor is the page's cursor plus one.
-class VendorPeer final : public hub::Vendor::Service {
+class HVendorPeer final : public hub::Vendor::Service {
  public:
   grpc::Status FetchPage(grpc::ServerContext*, const hub::FetchPageRequest* req, hub::Page* out) override {
     const long n = req->cursor().empty() ? 0 : std::stol(req->cursor());
@@ -1234,21 +1234,21 @@ class VendorPeer final : public hub::Vendor::Service {
   }
 };
 
-std::string client(harness::Ctx& ctx) {
-  static VendorPeer* peer = nullptr;
+std::string hClient(harness::Ctx& ctx) {
+  static HVendorPeer* peer = nullptr;
   delete peer;
-  peer = new VendorPeer;
+  peer = new HVendorPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return store::create("acme", "github", "api.github.com", "vault:acme/github#4", 900).connector_id;
 }
 
 // What fetchPage did: the exception it threw ("" when it returned) and the page's next cursor.
-struct Outcome {
+struct HOutcome {
   std::string thrown;
   std::string next_cursor;
 };
 
-Outcome fetch(const std::string& connector_id, const std::string& cursor) {
+HOutcome hFetch(const std::string& connector_id, const std::string& cursor) {
   try {
     const hub::Page page = fetchPage(connector_id, cursor);
     return {"", page.next_cursor()};
@@ -1263,13 +1263,13 @@ Outcome fetch(const std::string& connector_id, const std::string& cursor) {
   }
 }
 
-double seconds(std::chrono::system_clock::duration d) { return std::chrono::duration<double>(d).count(); }
+double hSeconds(std::chrono::system_clock::duration d) { return std::chrono::duration<double>(d).count(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  const std::string cid = client(ctx);
-  Outcome out = fetch(cid, "0");
+  const std::string cid = hClient(ctx);
+  HOutcome out = hFetch(cid, "0");
   ctx.Assert(out.thrown.empty() && out.next_cursor == "1", "with a healthy vendor fetchPage threw %s", out.thrown);
   const auto calls = ctx.GRPC.CallsTo("FetchPage");
   const auto& call = calls.back();
@@ -1277,7 +1277,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "FetchPage carries a %v s deadline, expected kDeadline = 2 s", call.TimeoutSeconds());
   ctx.GRPC.SetLatency("FetchPage", 30.0);
   const int64_t started = ctx.Clock.Now();
-  out = fetch(cid, "1");
+  out = hFetch(cid, "1");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Equal(out.thrown, "VendorUnavailable", "with the vendor 30 s slow (waited %v s), fetchPage must throw VendorUnavailable after the 2 s deadline; it threw", waited);
   ctx.Assert(waited <= 3, "fetchPage waited %v s on a stalled vendor", waited);
@@ -1285,18 +1285,18 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBackoff(harness::Ctx& ctx) {
-  const std::string cid = client(ctx);
+  const std::string cid = hClient(ctx);
   ctx.GRPC.Fail("FetchPage", grpc::StatusCode::RESOURCE_EXHAUSTED, "rate limited", 3);
-  Outcome out = fetch(cid, "0");
+  HOutcome out = hFetch(cid, "0");
   const auto calls = ctx.GRPC.CallsTo("FetchPage");
   ctx.Assert(out.thrown.empty(), "three 429s then an answer: fetchPage threw %s, it must back off and retry a rate limit", out.thrown);
   ctx.Equal(calls.size(), 4, "three 429s then an answer; the calls");
   std::vector<double> gaps;
-  for (size_t i = 1; i < calls.size(); i++) gaps.push_back(seconds(calls[i].Started - calls[i - 1].Started));
+  for (size_t i = 1; i < calls.size(); i++) gaps.push_back(hSeconds(calls[i].Started - calls[i - 1].Started));
   ctx.Assert(gaps[0] >= 0.1, "the retries came %v s apart: retrying a 429 at once is the flood the vendor asked you to stop", gaps);
   ctx.Assert(gaps[2] > 1.5 * gaps[0], "the waits between retries were %v s: they must grow with the attempt (kBackoffBase doubling)", gaps);
   ctx.GRPC.Fail("FetchPage", grpc::StatusCode::RESOURCE_EXHAUSTED, "rate limited", 5);
-  out = fetch(cid, "1");
+  out = hFetch(cid, "1");
   ctx.Equal(out.thrown, "VendorUnavailable", "a vendor answering 429 to every attempt; fetchPage threw");
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size() - 4, 5, "a vendor answering 429 to every attempt; the calls (kMaxAttempts)");
   const auto all = ctx.GRPC.CallsTo("FetchPage");
@@ -1308,7 +1308,7 @@ void CheckBackoff(harness::Ctx& ctx) {
   }
   ctx.Assert(own_deadline, "the attempts carried deadlines of %v s (-1: none): every attempt gets its own kDeadline (2 s), not what is left of the first one's", deadlines);
   std::vector<double> gaps_again;
-  for (size_t i = 5; i < all.size(); i++) gaps_again.push_back(seconds(all[i].Started - all[i - 1].Started));
+  for (size_t i = 5; i < all.size(); i++) gaps_again.push_back(hSeconds(all[i].Started - all[i - 1].Started));
   for (const auto* waits : {&gaps, &gaps_again}) {
     for (size_t attempt = 0; attempt < waits->size(); attempt++) {
       const double ceiling = 0.25 * static_cast<double>(1 << attempt);  // under kBackoffMax for every attempt of a run
@@ -1323,27 +1323,27 @@ void CheckBackoff(harness::Ctx& ctx) {
 }
 
 void CheckAuthTerminal(harness::Ctx& ctx) {
-  const std::string cid = client(ctx);
+  const std::string cid = hClient(ctx);
   ctx.GRPC.Fail("FetchPage", grpc::StatusCode::UNAUTHENTICATED, "token revoked", 5);
-  Outcome out = fetch(cid, "0");
+  HOutcome out = hFetch(cid, "0");
   ctx.Equal(out.thrown, "VendorAuthFailed", "after a 401, fetchPage threw");
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 1, "a 401 does not get better by retrying; the calls with a rejected token");
   const auto row = store::get(cid);
   ctx.Assert(row->status == "disabled" && !row->disabled_reason.empty(), "after a 401 the connector is %q with reason %q: disable it with a reason an operator can read", row->status, row->disabled_reason);
-  out = fetch(cid, "1");
+  out = hFetch(cid, "1");
   ctx.Equal(out.thrown, "VendorAuthFailed", "a disabled connector; fetchPage threw");
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 1, "a disabled connector must not call the vendor again; the calls");
 }
 
 void CheckBreaker(harness::Ctx& ctx) {
-  const std::string cid = client(ctx);
+  const std::string cid = hClient(ctx);
   // A 500 counts like a 503: it is not a rate limit, so it is neither retried nor left out of the count.
   const std::vector<std::string> answers = {"503", "503", "500", "503", "503"};
   ctx.GRPC.Fail("FetchPage", grpc::StatusCode::UNAVAILABLE, "vendor 503", 2);
   ctx.GRPC.Fail("FetchPage", grpc::StatusCode::INTERNAL, "vendor 500", 1);
   ctx.GRPC.Fail("FetchPage", grpc::StatusCode::UNAVAILABLE, "vendor 503", 2);
   for (int run = 1; run <= 5; run++) {
-    const Outcome out = fetch(cid, std::to_string(run));
+    const HOutcome out = hFetch(cid, std::to_string(run));
     ctx.Equal(out.thrown, "VendorUnavailable", "run %d against a vendor answering %s; fetchPage threw", run, answers[run - 1]);
   }
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 5, "five runs against a vendor answering 503, 503, 500, 503, 503 must make one call a run (a 5xx goes back to the scheduler); the calls");
@@ -1361,14 +1361,14 @@ void CheckBreaker(harness::Ctx& ctx) {
   const long long open_until = number("open_until");
   ctx.Assert(now + 29 <= open_until && open_until <= now + 31, "after five consecutive failures at %d health:%s holds %v: open_until must be now plus kBreakerCooldownS (30 s), in seconds", now, cid, health);
   ctx.Assert(now - 1 <= number("last_run_at") && number("last_run_at") <= now + 1, "the vendor answered a failure at %d, health:%s holds %v: every answered call sets last_run_at", now, cid, health);
-  Outcome out = fetch(cid, "6");
+  HOutcome out = hFetch(cid, "6");
   ctx.Equal(out.thrown, "BreakerOpen", "the sixth run after five consecutive failures; fetchPage threw");
   ctx.Clock.Advance(29);
-  out = fetch(cid, "6");
+  out = hFetch(cid, "6");
   ctx.Equal(out.thrown, "BreakerOpen", "29 s after the breaker opened, inside its 30 s cooldown; fetchPage threw");
   ctx.Equal(ctx.GRPC.CallsTo("FetchPage").size(), 5, "with the breaker open the vendor must not be called; the calls");
   ctx.Clock.Advance(2);
-  out = fetch(cid, "6");
+  out = hFetch(cid, "6");
   ctx.Assert(out.thrown.empty(), "31 s later a recovered vendor must be tried again: fetchPage threw %s", out.thrown);
   health = ctx.Redis.HGetAll("health:" + cid);
   ctx.Equal(health.count("consecutive_failures") ? health.at("consecutive_failures") : std::string(), "0", "a success must reset the failure count; consecutive_failures");

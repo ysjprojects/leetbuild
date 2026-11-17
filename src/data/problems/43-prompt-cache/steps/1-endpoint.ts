@@ -993,18 +993,18 @@ import (
 	"leetbuild/harness"
 )
 
-const apiPrefix = "You are the support assistant for Acme Bank. Answer in two sentences: how do I reset my card PIN?"
+const kHApiPrefix = "You are the support assistant for Acme Bank. Answer in two sentences: how do I reset my card PIN?"
 
-var apiModelCalls int
+var hApiModelCalls int
 
-func apiDigest(prefix string) string {
+func hApiDigest(prefix string) string {
 	sum := sha256.Sum256([]byte(prefix))
 	return hex.EncodeToString(sum[:])
 }
 
 // apiClient serves the learner's handler with steps 2-4 stood in over the harness's Redis.
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
-	apiModelCalls = 0
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
+	hApiModelCalls = 0
 	lookup = func(_ context.Context, key string) (*record.Record, error) {
 		raw, ok := ctx.Redis.Get(key)
 		if !ok {
@@ -1015,7 +1015,7 @@ func apiClient(ctx *harness.Ctx) *harness.HTTP {
 		return &rec, err
 	}
 	completeMiss = func(_ context.Context, key, tenant string, version int, prefix string, temperature float64) (record.Miss, error) {
-		apiModelCalls++
+		hApiModelCalls++
 		text, _, tokens := llm.Complete(prefix, temperature)
 		raw, _ := json.Marshal(record.Record{Tenant: tenant, Version: version, Completion: text, Tokens: tokens})
 		ctx.Redis.Set(key, string(raw), "EX", config.VersionTTLSeconds, "NX")
@@ -1027,82 +1027,82 @@ func apiClient(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiBody(prefix string, version any) map[string]any {
+func hApiBody(prefix string, version any) map[string]any {
 	return map[string]any{"prefix": prefix, "prompt_version": version, "temperature": 0}
 }
 
-func apiStatus(ctx *harness.Ctx, r *harness.Response) string {
+func hApiStatus(ctx *harness.Ctx, r *harness.Response) string {
 	var out map[string]any
 	r.Decode(&out)
 	status, _ := out["status"].(string)
 	return status
 }
 
-func apiEntries(ctx *harness.Ctx) []string {
+func hApiEntries(ctx *harness.Ctx) []string {
 	keys := ctx.Redis.Keys("pc:*")
 	sort.Strings(keys)
 	return keys
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	answer, _, _ := llm.Complete(apiPrefix, 0)
-	first := c.Post("/v1/completions/cached", apiBody(apiPrefix, 7), "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	answer, _, _ := llm.Complete(kHApiPrefix, 0)
+	first := c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, 7), "X-Tenant-Id", "t1")
 	ctx.Equal(first.Status, 200, "a first request (%s)", first.Text())
 	ctx.Equal(first.JSON(), map[string]any{"status": "miss", "completion": answer}, "a first request is a miss with the model's completion")
-	second := c.Post("/v1/completions/cached", apiBody(apiPrefix, 7), "X-Tenant-Id", "t1")
+	second := c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, 7), "X-Tenant-Id", "t1")
 	ctx.Equal(second.JSON(), map[string]any{"status": "hit", "completion": answer}, "the same request again is a hit with the same completion")
-	ctx.Equal(apiModelCalls, 1, "a hit must not call the model; model calls for two requests")
+	ctx.Equal(hApiModelCalls, 1, "a hit must not call the model; model calls for two requests")
 }
 
 func CheckTenantHeader(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	claimed := apiBody(apiPrefix, 7)
+	c := hApiClient(ctx)
+	claimed := hApiBody(kHApiPrefix, 7)
 	claimed["tenant"] = "t1"
 	r := c.Post("/v1/completions/cached", claimed)
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id whose body names a tenant: the body is the caller's claim, the header is its identity")
-	ctx.Equal(apiStatus(ctx, c.Post("/v1/completions/cached", apiBody(apiPrefix, 7), "X-Tenant-Id", "t1")), "miss", "t1 warms the prefix")
+	ctx.Equal(hApiStatus(ctx, c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, 7), "X-Tenant-Id", "t1")), "miss", "t1 warms the prefix")
 	steered := c.Post("/v1/completions/cached", claimed, "X-Tenant-Id", "t2")
-	ctx.Equal(apiStatus(ctx, steered), "miss", "t2 naming tenant t1 in the body must be served as t2 (a miss), not from t1's entries (%s)", steered.Text())
-	key := "pc:t2:7:" + apiDigest(apiPrefix)
-	ctx.Assert(ctx.Redis.Exists(key) == 1, "t2's request must fill %s, found %v", key, apiEntries(ctx))
+	ctx.Equal(hApiStatus(ctx, steered), "miss", "t2 naming tenant t1 in the body must be served as t2 (a miss), not from t1's entries (%s)", steered.Text())
+	key := "pc:t2:7:" + hApiDigest(kHApiPrefix)
+	ctx.Assert(ctx.Redis.Exists(key) == 1, "t2's request must fill %s, found %v", key, hApiEntries(ctx))
 }
 
 func CheckScopedKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	ctx.Equal(apiStatus(ctx, c.Post("/v1/completions/cached", apiBody(apiPrefix, 7), "X-Tenant-Id", "t1")), "miss", "t1's first request")
-	other := c.Post("/v1/completions/cached", apiBody(apiPrefix, 7), "X-Tenant-Id", "t2")
-	ctx.Equal(apiStatus(ctx, other), "miss", "t2 asked for the prefix t1 warmed (%s): one tenant's completion served to another. The key must carry the tenant", other.Text())
-	bumped := c.Post("/v1/completions/cached", apiBody(apiPrefix, 8), "X-Tenant-Id", "t1")
-	ctx.Equal(apiStatus(ctx, bumped), "miss", "t1 at prompt version 8 (%s): a version bump must start a fresh namespace. The key must carry the version", bumped.Text())
-	d := apiDigest(apiPrefix)
-	ctx.Equal(apiEntries(ctx), []string{"pc:t1:7:" + d, "pc:t1:8:" + d, "pc:t2:7:" + d}, "the entries must be pc:{tenant}:{version}:{sha256(prefix)}")
+	c := hApiClient(ctx)
+	ctx.Equal(hApiStatus(ctx, c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, 7), "X-Tenant-Id", "t1")), "miss", "t1's first request")
+	other := c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, 7), "X-Tenant-Id", "t2")
+	ctx.Equal(hApiStatus(ctx, other), "miss", "t2 asked for the prefix t1 warmed (%s): one tenant's completion served to another. The key must carry the tenant", other.Text())
+	bumped := c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, 8), "X-Tenant-Id", "t1")
+	ctx.Equal(hApiStatus(ctx, bumped), "miss", "t1 at prompt version 8 (%s): a version bump must start a fresh namespace. The key must carry the version", bumped.Text())
+	d := hApiDigest(kHApiPrefix)
+	ctx.Equal(hApiEntries(ctx), []string{"pc:t1:7:" + d, "pc:t1:8:" + d, "pc:t2:7:" + d}, "the entries must be pc:{tenant}:{version}:{sha256(prefix)}")
 }
 
 func CheckVersionRequired(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := c.Post("/v1/completions/cached", map[string]any{"prefix": apiPrefix, "temperature": 0}, "X-Tenant-Id", "t1")
+	c := hApiClient(ctx)
+	r := c.Post("/v1/completions/cached", map[string]any{"prefix": kHApiPrefix, "temperature": 0}, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 400, "a body without prompt_version (%s): a missing version must be 400, not version 1", r.Text())
-	r = c.Post("/v1/completions/cached", apiBody(apiPrefix, "7"), "X-Tenant-Id", "t1")
+	r = c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, "7"), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 400, "prompt_version \\"7\\" (a string)")
-	r = c.Post("/v1/completions/cached", apiBody(apiPrefix, true), "X-Tenant-Id", "t1")
+	r = c.Post("/v1/completions/cached", hApiBody(kHApiPrefix, true), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 400, "prompt_version true (a boolean)")
-	ctx.Assert(apiModelCalls == 0 && len(apiEntries(ctx)) == 0, "a rejected request must not reach the model or the cache: %d calls, entries %v", apiModelCalls, apiEntries(ctx))
+	ctx.Assert(hApiModelCalls == 0 && len(hApiEntries(ctx)) == 0, "a rejected request must not reach the model or the cache: %d calls, entries %v", hApiModelCalls, hApiEntries(ctx))
 }
 
 func CheckNoEcho(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	secret := "ACME-INTERNAL-ESCALATION-POLICY "
-	r := c.Post("/v1/completions/cached", apiBody(strings.Repeat(secret, 300), 7), "X-Tenant-Id", "t1")
+	r := c.Post("/v1/completions/cached", hApiBody(strings.Repeat(secret, 300), 7), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 413, "a %d-byte prefix", len(secret)*300)
 	ctx.Assert(!strings.Contains(r.Text(), "ACME-INTERNAL"), "the 413 body quotes the prompt: %.200s. Error bodies end up in logs and trackers; say the limit, not the text", r.Text())
 	var out map[string]any
 	r.Decode(&out)
 	ctx.Equal(out["error"], "prefix_too_large", "the 413 body's error")
 	ctx.Assert(out["limit_bytes"] == float64(8192), "the 413 body states the limit, limit_bytes 8192, got %.200s", r.Text())
-	ctx.Assert(apiModelCalls == 0 && len(apiEntries(ctx)) == 0, "an oversized prefix must not reach the model or the cache")
-	ctx.Equal(c.Post("/v1/completions/cached", apiBody(strings.Repeat("a", 8192), 7), "X-Tenant-Id", "t1").Status, 200, "exactly 8192 bytes is within the cap")
-	ctx.Equal(c.Post("/v1/completions/cached", apiBody(strings.Repeat("é", 4097), 7), "X-Tenant-Id", "t1").Status, 413, "4097 two-byte characters are 8194 bytes")
+	ctx.Assert(hApiModelCalls == 0 && len(hApiEntries(ctx)) == 0, "an oversized prefix must not reach the model or the cache")
+	ctx.Equal(c.Post("/v1/completions/cached", hApiBody(strings.Repeat("a", 8192), 7), "X-Tenant-Id", "t1").Status, 200, "exactly 8192 bytes is within the cap")
+	ctx.Equal(c.Post("/v1/completions/cached", hApiBody(strings.Repeat("é", 4097), 7), "X-Tenant-Id", "t1").Status, 413, "4097 two-byte characters are 8194 bytes")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1120,25 +1120,25 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kPrefix = "You are the support assistant for Acme Bank. Answer in two sentences: how do I reset my card PIN?";
+const std::string kHPrefix = "You are the support assistant for Acme Bank. Answer in two sentences: how do I reset my card PIN?";
 
-harness::Ctx* apiCtx = nullptr;
-int apiModelCalls = 0;
+harness::Ctx* hApiCtx = nullptr;
+int hApiModelCalls = 0;
 
 }  // namespace
 
 // Steps 2-4 stood in over the harness's Redis.
 std::optional<record::Record> lookup(const std::string& key) {
-  const auto raw = apiCtx->Redis.Get(key);
+  const auto raw = hApiCtx->Redis.Get(key);
   if (!raw) return std::nullopt;
   return record::decode(*raw);
 }
 
 record::Miss complete_miss(const std::string& key, const std::string& tenant, int version, const std::string& prefix,
                            double temperature) {
-  apiModelCalls++;
+  hApiModelCalls++;
   const llm::Completion c = llm::complete(prefix, temperature);
-  apiCtx->Redis.Set(key, record::encode({tenant, version, c.text, c.tokens}), "EX", config::kVersionTtlSeconds, "NX");
+  hApiCtx->Redis.Set(key, record::encode({tenant, version, c.text, c.tokens}), "EX", config::kVersionTtlSeconds, "NX");
   return {"cached", c.text, c.tokens};
 }
 
@@ -1146,12 +1146,12 @@ void emit_decision(const std::string&, int, const std::string&, const std::strin
 
 namespace {
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
-    apiCtx = &ctx;
-    apiModelCalls = 0;
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    hApiCtx = &ctx;
+    hApiModelCalls = 0;
     register_routes(svr);
   }
 
@@ -1160,16 +1160,16 @@ struct Api {
   }
 };
 
-json apiBody(const std::string& prefix, const json& version) {
+json hApiBody(const std::string& prefix, const json& version) {
   return {{"prefix", prefix}, {"prompt_version", version}, {"temperature", 0}};
 }
 
-std::string apiStatus(const harness::Response& r) {
+std::string hApiStatus(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("status", "") : "";
 }
 
-std::vector<std::string> apiEntries(harness::Ctx& ctx) {
+std::vector<std::string> hApiEntries(harness::Ctx& ctx) {
   auto keys = ctx.Redis.Keys("pc:*");
   std::sort(keys.begin(), keys.end());
   return keys;
@@ -1178,66 +1178,66 @@ std::vector<std::string> apiEntries(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const std::string answer = llm::complete(kPrefix, 0).text;
-  const auto first = api.post(apiBody(kPrefix, 7));
+  HApi api(ctx);
+  const std::string answer = llm::complete(kHPrefix, 0).text;
+  const auto first = api.post(hApiBody(kHPrefix, 7));
   ctx.Equal(first.Status, 200, "a first request (%s)", first.Text());
   ctx.Assert(json::parse(first.Text(), nullptr, false) == json{{"status", "miss"}, {"completion", answer}}, "a first request is a miss with the model's completion, got %s", first.Text());
-  const auto second = api.post(apiBody(kPrefix, 7));
+  const auto second = api.post(hApiBody(kHPrefix, 7));
   ctx.Assert(json::parse(second.Text(), nullptr, false) == json{{"status", "hit"}, {"completion", answer}}, "the same request again is a hit with the same completion, got %s", second.Text());
-  ctx.Equal(apiModelCalls, 1, "a hit must not call the model; model calls for two requests");
+  ctx.Equal(hApiModelCalls, 1, "a hit must not call the model; model calls for two requests");
 }
 
 void CheckTenantHeader(harness::Ctx& ctx) {
-  Api api(ctx);
-  json claimed = apiBody(kPrefix, 7);
+  HApi api(ctx);
+  json claimed = hApiBody(kHPrefix, 7);
   claimed["tenant"] = "t1";
   const auto r = api.http.Post("/v1/completions/cached", claimed.dump());
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id whose body names a tenant: the body is the caller's claim, the header is its identity");
-  ctx.Equal(apiStatus(api.post(apiBody(kPrefix, 7))), "miss", "t1 warms the prefix");
+  ctx.Equal(hApiStatus(api.post(hApiBody(kHPrefix, 7))), "miss", "t1 warms the prefix");
   const auto steered = api.post(claimed, "t2");
-  ctx.Equal(apiStatus(steered), "miss", "t2 naming tenant t1 in the body must be served as t2 (a miss), not from t1's entries (%s)", steered.Text());
-  const std::string key = "pc:t2:7:" + sha256_hex(kPrefix);
-  ctx.Assert(ctx.Redis.Exists(key) == 1, "t2's request must fill %s, found %v", key, apiEntries(ctx));
+  ctx.Equal(hApiStatus(steered), "miss", "t2 naming tenant t1 in the body must be served as t2 (a miss), not from t1's entries (%s)", steered.Text());
+  const std::string key = "pc:t2:7:" + sha256_hex(kHPrefix);
+  ctx.Assert(ctx.Redis.Exists(key) == 1, "t2's request must fill %s, found %v", key, hApiEntries(ctx));
 }
 
 void CheckScopedKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  ctx.Equal(apiStatus(api.post(apiBody(kPrefix, 7), "t1")), "miss", "t1's first request");
-  const auto other = api.post(apiBody(kPrefix, 7), "t2");
-  ctx.Equal(apiStatus(other), "miss", "t2 asked for the prefix t1 warmed (%s): one tenant's completion served to another. The key must carry the tenant", other.Text());
-  const auto bumped = api.post(apiBody(kPrefix, 8), "t1");
-  ctx.Equal(apiStatus(bumped), "miss", "t1 at prompt version 8 (%s): a version bump must start a fresh namespace. The key must carry the version", bumped.Text());
-  const std::string d = sha256_hex(kPrefix);
-  ctx.Equal(apiEntries(ctx), {"pc:t1:7:" + d, "pc:t1:8:" + d, "pc:t2:7:" + d}, "the entries must be pc:{tenant}:{version}:{sha256(prefix)}");
+  HApi api(ctx);
+  ctx.Equal(hApiStatus(api.post(hApiBody(kHPrefix, 7), "t1")), "miss", "t1's first request");
+  const auto other = api.post(hApiBody(kHPrefix, 7), "t2");
+  ctx.Equal(hApiStatus(other), "miss", "t2 asked for the prefix t1 warmed (%s): one tenant's completion served to another. The key must carry the tenant", other.Text());
+  const auto bumped = api.post(hApiBody(kHPrefix, 8), "t1");
+  ctx.Equal(hApiStatus(bumped), "miss", "t1 at prompt version 8 (%s): a version bump must start a fresh namespace. The key must carry the version", bumped.Text());
+  const std::string d = sha256_hex(kHPrefix);
+  ctx.Equal(hApiEntries(ctx), {"pc:t1:7:" + d, "pc:t1:8:" + d, "pc:t2:7:" + d}, "the entries must be pc:{tenant}:{version}:{sha256(prefix)}");
 }
 
 void CheckVersionRequired(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(json{{"prefix", kPrefix}, {"temperature", 0}});
+  HApi api(ctx);
+  auto r = api.post(json{{"prefix", kHPrefix}, {"temperature", 0}});
   ctx.Equal(r.Status, 400, "a body without prompt_version (%s): a missing version must be 400, not version 1", r.Text());
-  r = api.post(apiBody(kPrefix, "7"));
+  r = api.post(hApiBody(kHPrefix, "7"));
   ctx.Equal(r.Status, 400, "prompt_version \\"7\\" (a string)");
-  r = api.post(apiBody(kPrefix, true));
+  r = api.post(hApiBody(kHPrefix, true));
   ctx.Equal(r.Status, 400, "prompt_version true (a boolean)");
-  ctx.Assert(apiModelCalls == 0 && apiEntries(ctx).empty(), "a rejected request must not reach the model or the cache: %d calls, entries %v", apiModelCalls, apiEntries(ctx));
+  ctx.Assert(hApiModelCalls == 0 && hApiEntries(ctx).empty(), "a rejected request must not reach the model or the cache: %d calls, entries %v", hApiModelCalls, hApiEntries(ctx));
 }
 
 void CheckNoEcho(harness::Ctx& ctx) {
-  Api api(ctx);
+  HApi api(ctx);
   std::string big;
   for (int i = 0; i < 300; i++) big += "ACME-INTERNAL-ESCALATION-POLICY ";
-  const auto r = api.post(apiBody(big, 7));
+  const auto r = api.post(hApiBody(big, 7));
   ctx.Equal(r.Status, 413, "a %d-byte prefix", big.size());
   ctx.Assert(r.Text().find("ACME-INTERNAL") == std::string::npos, "the 413 body quotes the prompt: %s. Error bodies end up in logs and trackers; say the limit, not the text", r.Text().substr(0, 200));
   const json out = json::parse(r.Text(), nullptr, false);
   ctx.Assert(out.is_object() && out.value("error", "") == "prefix_too_large", "the 413 body carries error prefix_too_large, got %s", r.Text().substr(0, 200));
   ctx.Assert(out.is_object() && out.contains("limit_bytes") && out["limit_bytes"].is_number_integer() && out["limit_bytes"].get<long long>() == 8192, "the 413 body states the limit, limit_bytes 8192, got %s", r.Text().substr(0, 200));
-  ctx.Assert(apiModelCalls == 0 && apiEntries(ctx).empty(), "an oversized prefix must not reach the model or the cache");
-  ctx.Equal(api.post(apiBody(std::string(8192, 'a'), 7)).Status, 200, "exactly 8192 bytes is within the cap");
+  ctx.Assert(hApiModelCalls == 0 && hApiEntries(ctx).empty(), "an oversized prefix must not reach the model or the cache");
+  ctx.Equal(api.post(hApiBody(std::string(8192, 'a'), 7)).Status, 200, "exactly 8192 bytes is within the cap");
   std::string wide;
   for (int i = 0; i < 4097; i++) wide += "\\u00e9";
-  ctx.Equal(api.post(apiBody(wide, 7)).Status, 413, "4097 two-byte characters are 8194 bytes");
+  ctx.Equal(api.post(hApiBody(wide, 7)).Status, 413, "4097 two-byte characters are 8194 bytes");
 }
 `,
   },

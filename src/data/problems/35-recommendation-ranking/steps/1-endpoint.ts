@@ -748,16 +748,16 @@ import (
 // rank as step 3 builds it, without the network: the model scores a candidate by its number; with
 // the ranker down the candidates come back in their own order, stamped as the popularity fallback.
 var (
-	rankedFor  []string
-	rankerDown bool
+	hRankedFor  []string
+	hRankerDown bool
 )
 
-func modelScore(id string) float64 {
+func hModelScore(id string) float64 {
 	n, _ := strconv.Atoi(strings.TrimPrefix(id, "c-"))
 	return float64(n*37%101) / 100
 }
 
-func candidates(n int) []string {
+func hCandidates(n int) []string {
 	out := []string{}
 	for i := 1; i <= n; i++ {
 		out = append(out, fmt.Sprintf("c-%d", i))
@@ -765,9 +765,9 @@ func candidates(n int) []string {
 	return out
 }
 
-func modelOrder(ids []string, surface string) []string {
+func hModelOrder(ids []string, surface string) []string {
 	out := append([]string{}, ids...)
-	sort.SliceStable(out, func(i, j int) bool { return modelScore(out[i]) > modelScore(out[j]) })
+	sort.SliceStable(out, func(i, j int) bool { return hModelScore(out[i]) > hModelScore(out[j]) })
 	// On the promo surface the ranker pins its lowest-scored candidate, a sponsored slot, on top.
 	if surface == "promo" && len(out) > 0 {
 		out = append([]string{out[len(out)-1]}, out[:len(out)-1]...)
@@ -775,20 +775,20 @@ func modelOrder(ids []string, surface string) []string {
 	return out
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	rankedFor = []string{}
-	rankerDown = false
+func hApi(ctx *harness.Ctx) *harness.HTTP {
+	hRankedFor = []string{}
+	hRankerDown = false
 	rank = func(_ context.Context, tenant, userID, surface string, candidateIDs []string) types.Ranked {
-		rankedFor = append(rankedFor, userID)
+		hRankedFor = append(hRankedFor, userID)
 		ids := candidateIDs
-		if !rankerDown {
-			ids = modelOrder(candidateIDs, surface)
+		if !hRankerDown {
+			ids = hModelOrder(candidateIDs, surface)
 		}
 		items := []types.Item{}
 		for _, id := range ids {
-			items = append(items, types.Item{ID: id, Score: modelScore(id)})
+			items = append(items, types.Item{ID: id, Score: hModelScore(id)})
 		}
-		if rankerDown {
+		if hRankerDown {
 			return types.Ranked{Items: items, ModelVersion: "popularity-v1", Fallback: true}
 		}
 		return types.Ranked{Items: items, ModelVersion: "ranker-v7"}
@@ -798,32 +798,32 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-type servedItem struct {
+type HServedItem struct {
 	ID       string  \`json:"id"\`
 	Score    float64 \`json:"score"\`
 	Position *int    \`json:"position"\`
 }
 
-type recommendation struct {
-	Items        []servedItem \`json:"items"\`
+type HRecommendation struct {
+	Items        []HServedItem \`json:"items"\`
 	ModelVersion string       \`json:"model_version"\`
 	Fallback     *bool        \`json:"fallback"\`
 }
 
-func recommendFor(c *harness.HTTP, userID string, body map[string]any) (*harness.Response, recommendation) {
+func hRecommendFor(c *harness.HTTP, userID string, body map[string]any) (*harness.Response, HRecommendation) {
 	headers := []string{"X-Tenant-Id", "t1"}
 	if userID != "" {
 		headers = append(headers, "X-User-Id", userID)
 	}
 	r := c.Post("/v1/recommendations", body, headers...)
-	var out recommendation
+	var out HRecommendation
 	if r.Status == 200 {
 		r.Decode(&out)
 	}
 	return r, out
 }
 
-func idsOf(rec recommendation) []string {
+func hIdsOf(rec HRecommendation) []string {
 	out := []string{}
 	for _, item := range rec.Items {
 		out = append(out, item.ID)
@@ -832,59 +832,59 @@ func idsOf(rec recommendation) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	c := hApi(ctx)
+	r, rec := hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(5)})
 	ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text())
-	ctx.Equal(idsOf(rec), modelOrder(candidates(5), "home"), "the response must list the ranker's order; it lists")
-	_, rec = recommendFor(c, "u-1", map[string]any{"surface": "promo", "candidate_ids": candidates(5)})
-	ctx.Equal(idsOf(rec), modelOrder(candidates(5), "promo"), "on the promo surface the ranker's order is not by score: the response must keep it as rank returns it; it lists")
+	ctx.Equal(hIdsOf(rec), hModelOrder(hCandidates(5), "home"), "the response must list the ranker's order; it lists")
+	_, rec = hRecommendFor(c, "u-1", map[string]any{"surface": "promo", "candidate_ids": hCandidates(5)})
+	ctx.Equal(hIdsOf(rec), hModelOrder(hCandidates(5), "promo"), "on the promo surface the ranker's order is not by score: the response must keep it as rank returns it; it lists")
 }
 
 func CheckAuthUser(ctx *harness.Ctx) {
-	c := api(ctx)
-	r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5), "user_id": "u-2"})
+	c := hApi(ctx)
+	r, _ := hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(5), "user_id": "u-2"})
 	refused := r.Status == 400 || r.Status == 422
 	ctx.Assert(r.Status == 200 || refused, "a request from u-1 carrying a body user_id answered %d (%s): rank it for u-1, or refuse the field with 400 or 422", r.Status, r.Text())
 	want := []string{"u-1"}
 	if refused {
 		want = []string{}
 	}
-	ctx.Equal(rankedFor, want, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for")
-	r, _ = recommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": candidates(5), "user_id": "u-2"})
+	ctx.Equal(hRankedFor, want, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for")
+	r, _ = hRecommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": hCandidates(5), "user_id": "u-2"})
 	ctx.Assert(r.Status == 401 || (refused && (r.Status == 400 || r.Status == 422)), "a request without X-User-Id naming user_id u-2 in its body answered %d, expected 401: a caller without the header must not choose the user", r.Status)
-	r, _ = recommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	r, _ = hRecommendFor(c, "", map[string]any{"surface": "home", "candidate_ids": hCandidates(5)})
 	ctx.Equal(r.Status, 401, "a request without X-User-Id")
-	ctx.Equal(rankedFor, want, "a request without X-User-Id must not reach the ranker; the list was ranked for")
+	ctx.Equal(hRankedFor, want, "a request without X-User-Id must not reach the ranker; the list was ranked for")
 }
 
 func CheckCandidateCap(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, n := range []int{501, 0} {
-		r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(n)})
+		r, _ := hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(n)})
 		ctx.Equal(r.Status, 400, "a request with %d candidates (candidate_ids holds 1 to 500 ids)", n)
 	}
-	ctx.Equal(len(rankedFor), 0, "a rejected request must not reach the ranker; the rank calls")
-	r, _ := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(500)})
+	ctx.Equal(len(hRankedFor), 0, "a rejected request must not reach the ranker; the rank calls")
+	r, _ := hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(500)})
 	ctx.Equal(r.Status, 200, "a request with 500 candidates (%s)", r.Text())
 }
 
 func CheckTopK(ctx *harness.Ctx) {
-	c := api(ctx)
-	r, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(100)})
+	c := hApi(ctx)
+	r, rec := hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(100)})
 	ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text())
 	ctx.Equal(len(rec.Items), 30, "a request with 100 candidates must answer the top maxItems = 30, not grow with the request; the items")
-	ctx.Equal(idsOf(rec), modelOrder(candidates(100), "home")[:30], "the 30 items must be the top of the ranked order; they are")
+	ctx.Equal(hIdsOf(rec), hModelOrder(hCandidates(100), "home")[:30], "the 30 items must be the top of the ranked order; they are")
 	for i, item := range rec.Items {
 		ctx.Assert(item.Position != nil && *item.Position == i, "item %d (%s) carries position %v, expected %d: each item carries its zero-based position in served order", i, item.ID, item.Position, i)
 	}
 }
 
 func CheckModelVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	_, rec := recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	c := hApi(ctx)
+	_, rec := hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(5)})
 	ctx.Assert(rec.ModelVersion == "ranker-v7" && rec.Fallback != nil && !*rec.Fallback, "the response is stamped model_version %q, fallback %v: expected the ranker's ranker-v7 and false", rec.ModelVersion, rec.Fallback)
-	rankerDown = true
-	_, rec = recommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": candidates(5)})
+	hRankerDown = true
+	_, rec = hRecommendFor(c, "u-1", map[string]any{"surface": "home", "candidate_ids": hCandidates(5)})
 	ctx.Assert(rec.ModelVersion == "popularity-v1" && rec.Fallback != nil && *rec.Fallback, "with the ranker down the response is stamped model_version %q, fallback %v: expected the popularity fallback's popularity-v1 and true", rec.ModelVersion, rec.Fallback)
 }
 `,
@@ -900,27 +900,27 @@ namespace {
 
 // rank as step 3 builds it, without the network: the model scores a candidate by its number; with
 // the ranker down the candidates come back in their own order, stamped as the popularity fallback.
-std::vector<std::string> rankedFor;
-bool rankerDown = false;
+std::vector<std::string> hRankedFor;
+bool hRankerDown = false;
 
-double modelScore(const std::string& id) { return static_cast<double>(std::stoi(id.substr(2)) * 37 % 101) / 100; }
+double hModelScore(const std::string& id) { return static_cast<double>(std::stoi(id.substr(2)) * 37 % 101) / 100; }
 
-std::vector<std::string> candidates(int n) {
+std::vector<std::string> hCandidates(int n) {
   std::vector<std::string> out;
   for (int i = 1; i <= n; i++) out.push_back("c-" + std::to_string(i));
   return out;
 }
 
-std::vector<std::string> modelOrder(std::vector<std::string> ids, const std::string& surface = "home") {
-  std::stable_sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return modelScore(a) > modelScore(b); });
+std::vector<std::string> hModelOrder(std::vector<std::string> ids, const std::string& surface = "home") {
+  std::stable_sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) { return hModelScore(a) > hModelScore(b); });
   // On the promo surface the ranker pins its lowest-scored candidate, a sponsored slot, on top.
   if (surface == "promo" && !ids.empty()) std::rotate(ids.begin(), ids.end() - 1, ids.end());
   return ids;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
-  rankedFor.clear();
-  rankerDown = false;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  hRankedFor.clear();
+  hRankerDown = false;
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -928,17 +928,17 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& user_id = "u-1") {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body, const std::string& user_id = "u-1") {
   if (user_id.empty()) return c.Post("/v1/recommendations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
   return c.Post("/v1/recommendations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "X-User-Id", user_id);
 }
 
-nlohmann::json parsed(const harness::Response& r) {
+nlohmann::json hParsed(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-std::vector<std::string> idsOf(const nlohmann::json& body) {
+std::vector<std::string> hIdsOf(const nlohmann::json& body) {
   std::vector<std::string> out;
   if (body.contains("items") && body["items"].is_array()) {
     for (const auto& item : body["items"]) out.push_back(item.value("id", ""));
@@ -949,56 +949,56 @@ std::vector<std::string> idsOf(const nlohmann::json& body) {
 }  // namespace
 
 recs::Ranked rank(const std::string&, const std::string& user_id, const std::string& surface, const std::vector<std::string>& candidate_ids) {
-  rankedFor.push_back(user_id);
+  hRankedFor.push_back(user_id);
   recs::Ranked out;
-  for (const auto& id : rankerDown ? candidate_ids : modelOrder(candidate_ids, surface)) out.items.push_back(recs::Item{id, modelScore(id)});
-  out.model_version = rankerDown ? "popularity-v1" : "ranker-v7";
-  out.fallback = rankerDown;
+  for (const auto& id : hRankerDown ? candidate_ids : hModelOrder(candidate_ids, surface)) out.items.push_back(recs::Item{id, hModelScore(id)});
+  out.model_version = hRankerDown ? "popularity-v1" : "ranker-v7";
+  out.fallback = hRankerDown;
   return out;
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}});
+  auto c = hApi(ctx);
+  auto r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(5)}});
   ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text());
-  ctx.Equal(idsOf(parsed(r)), modelOrder(candidates(5)), "the response must list the ranker's order; it lists");
-  r = post(c, {{"surface", "promo"}, {"candidate_ids", candidates(5)}});
-  ctx.Equal(idsOf(parsed(r)), modelOrder(candidates(5), "promo"), "on the promo surface the ranker's order is not by score: the response must keep it as rank returns it; it lists");
+  ctx.Equal(hIdsOf(hParsed(r)), hModelOrder(hCandidates(5)), "the response must list the ranker's order; it lists");
+  r = hPost(c, {{"surface", "promo"}, {"candidate_ids", hCandidates(5)}});
+  ctx.Equal(hIdsOf(hParsed(r)), hModelOrder(hCandidates(5), "promo"), "on the promo surface the ranker's order is not by score: the response must keep it as rank returns it; it lists");
 }
 
 void CheckAuthUser(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}, {"user_id", "u-2"}}, "u-1");
+  auto c = hApi(ctx);
+  auto r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(5)}, {"user_id", "u-2"}}, "u-1");
   const bool refused = r.Status == 400 || r.Status == 422;
   ctx.Assert(r.Status == 200 || refused, "a request from u-1 carrying a body user_id answered %d (%s): rank it for u-1, or refuse the field with 400 or 422", r.Status, r.Text());
   const std::vector<std::string> want = refused ? std::vector<std::string>{} : std::vector<std::string>{"u-1"};
-  ctx.Equal(rankedFor, want, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for");
-  r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}, {"user_id", "u-2"}}, "");
+  ctx.Equal(hRankedFor, want, "the body's user_id must not choose whose personalization comes back (the user is the authenticated X-User-Id); the list was ranked for");
+  r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(5)}, {"user_id", "u-2"}}, "");
   ctx.Assert(r.Status == 401 || (refused && (r.Status == 400 || r.Status == 422)), "a request without X-User-Id naming user_id u-2 in its body answered %d, expected 401: a caller without the header must not choose the user", r.Status);
-  r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}, "");
+  r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(5)}}, "");
   ctx.Equal(r.Status, 401, "a request without X-User-Id");
-  ctx.Equal(rankedFor, want, "a request without X-User-Id must not reach the ranker; the list was ranked for");
+  ctx.Equal(hRankedFor, want, "a request without X-User-Id must not reach the ranker; the list was ranked for");
 }
 
 void CheckCandidateCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const int n : {501, 0}) {
-    const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(n)}});
+    const auto r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(n)}});
     ctx.Equal(r.Status, 400, "a request with %d candidates (candidate_ids holds 1 to 500 ids)", n);
   }
-  ctx.Equal(rankedFor.size(), 0, "a rejected request must not reach the ranker; the rank calls");
-  const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(500)}});
+  ctx.Equal(hRankedFor.size(), 0, "a rejected request must not reach the ranker; the rank calls");
+  const auto r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(500)}});
   ctx.Equal(r.Status, 200, "a request with 500 candidates (%s)", r.Text());
 }
 
 void CheckTopK(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, {{"surface", "home"}, {"candidate_ids", candidates(100)}});
+  auto c = hApi(ctx);
+  const auto r = hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(100)}});
   ctx.Equal(r.Status, 200, "POST /v1/recommendations (%s)", r.Text());
-  const auto body = parsed(r);
-  const auto ids = idsOf(body);
+  const auto body = hParsed(r);
+  const auto ids = hIdsOf(body);
   ctx.Equal(ids.size(), 30, "a request with 100 candidates must answer the top kMaxItems = 30, not grow with the request; the items");
-  const auto order = modelOrder(candidates(100));
+  const auto order = hModelOrder(hCandidates(100));
   ctx.Equal(ids, std::vector<std::string>(order.begin(), order.begin() + 30), "the 30 items must be the top of the ranked order; they are");
   for (size_t i = 0; i < body["items"].size(); i++) {
     const auto& item = body["items"][i];
@@ -1007,11 +1007,11 @@ void CheckTopK(harness::Ctx& ctx) {
 }
 
 void CheckModelVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto body = parsed(post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}));
+  auto c = hApi(ctx);
+  auto body = hParsed(hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(5)}}));
   ctx.Assert(body.value("model_version", "") == "ranker-v7" && body.contains("fallback") && body["fallback"] == false, "the response is %s: expected model_version ranker-v7 and fallback false", body.dump());
-  rankerDown = true;
-  body = parsed(post(c, {{"surface", "home"}, {"candidate_ids", candidates(5)}}));
+  hRankerDown = true;
+  body = hParsed(hPost(c, {{"surface", "home"}, {"candidate_ids", hCandidates(5)}}));
   ctx.Assert(body.value("model_version", "") == "popularity-v1" && body.contains("fallback") && body["fallback"] == true, "with the ranker down the response is %s: expected model_version popularity-v1 and fallback true", body.dump());
 }
 `,

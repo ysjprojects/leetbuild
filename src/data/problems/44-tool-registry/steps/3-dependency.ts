@@ -932,25 +932,25 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-func entry(name, version, sideEffect, owner string) catalog.Entry {
+func hEntry(name, version, sideEffect, owner string) catalog.Entry {
 	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object"}, "endpoint": "https://" + owner + ".internal", "credential_ref": "vault://" + owner}
 }
 
 var (
-	v7     = map[string]catalog.Entry{"search": entry("search", "a1", "read", "search"), "refund": entry("refund", "b1", "irreversible", "payments")}
-	v9     = map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "refund": entry("refund", "b2", "irreversible", "payments")}
-	v10    = map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "refund": entry("refund", "b1", "irreversible", "payments")}
-	broken = map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "broken.refund": entry("broken.refund", "c1", "irreversible", "payments")}
+	hV7     = map[string]catalog.Entry{"search": hEntry("search", "a1", "read", "search"), "refund": hEntry("refund", "b1", "irreversible", "payments")}
+	hV9     = map[string]catalog.Entry{"search": hEntry("search", "a2", "read", "search"), "refund": hEntry("refund", "b2", "irreversible", "payments")}
+	hV10    = map[string]catalog.Entry{"search": hEntry("search", "a2", "read", "search"), "refund": hEntry("refund", "b1", "irreversible", "payments")}
+	hBroken = map[string]catalog.Entry{"search": hEntry("search", "a2", "read", "search"), "broken.refund": hEntry("broken.refund", "c1", "irreversible", "payments")}
 )
 
 // sandboxPeer exercises every tool; a tool named broken.* has a schema it cannot build arguments from.
-type sandboxPeer struct {
+type HSandboxPeer struct {
 	pb.UnimplementedSandboxServer
 }
 
-func (sandboxPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.ValidateReport, error) {
+func (HSandboxPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.ValidateReport, error) {
 	for _, tool := range req.GetTools() {
 		if strings.HasPrefix(tool.GetName(), "broken.") {
 			return nil, status.Errorf(codes.InvalidArgument, "tool %s: the sandbox cannot build arguments from its schema", tool.GetName())
@@ -959,26 +959,26 @@ func (sandboxPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.Val
 	return &pb.ValidateReport{CallsExercised: int32(len(req.GetTools()))}, nil
 }
 
-func client(ctx *harness.Ctx) {
-	pb.RegisterSandboxServer(ctx.GRPC.Server(""), sandboxPeer{})
-	ctx.NoError(catalog.RecordValidation(clientBg, "7", "passed", ""), "seeding catalog 7 failed")
-	ctx.NoError(catalog.Promote(clientBg, "7", v7), "seeding catalog 7 failed")
+func hClient(ctx *harness.Ctx) {
+	pb.RegisterSandboxServer(ctx.GRPC.Server(""), HSandboxPeer{})
+	ctx.NoError(catalog.RecordValidation(hClientBg, "7", "passed", ""), "seeding catalog 7 failed")
+	ctx.NoError(catalog.Promote(hClientBg, "7", hV7), "seeding catalog 7 failed")
 }
 
-func outcomeOf(ctx *harness.Ctx, cv string, entries map[string]catalog.Entry) string {
-	outcome, err := validateAndPromote(clientBg, cv, entries)
+func hOutcomeOf(ctx *harness.Ctx, cv string, entries map[string]catalog.Entry) string {
+	outcome, err := validateAndPromote(hClientBg, cv, entries)
 	ctx.NoError(err, "validateAndPromote(%s) failed", cv)
 	return outcome
 }
 
-func active(ctx *harness.Ctx) string {
+func hActive(ctx *harness.Ctx) string {
 	cv, _ := ctx.Redis.Get("catalog:active")
 	return cv
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Equal(outcomeOf(ctx, "9", v9), "passed", "with the sandbox healthy, the outcome")
+	hClient(ctx)
+	ctx.Equal(hOutcomeOf(ctx, "9", hV9), "passed", "with the sandbox healthy, the outcome")
 	calls := ctx.GRPC.CallsTo("Validate", "")
 	ctx.Assert(len(calls) > 0, "no Validate call was made")
 	for _, call := range calls {
@@ -986,15 +986,15 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(9500*time.Millisecond <= call.Timeout && call.Timeout <= 10500*time.Millisecond, "the Validate call carries a %v deadline, expected validateDeadline = 10 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Validate", 60.0, "")
-	ctx.Equal(outcomeOf(ctx, "10", v10), "unavailable", "a sandbox slower than the deadline; the outcome")
-	ctx.Equal(active(ctx), "9", "catalog:active after a timed-out validation")
-	verdict, _ := catalog.Validation(clientBg, "10")
+	ctx.Equal(hOutcomeOf(ctx, "10", hV10), "unavailable", "a sandbox slower than the deadline; the outcome")
+	ctx.Equal(hActive(ctx), "9", "catalog:active after a timed-out validation")
+	verdict, _ := catalog.Validation(hClientBg, "10")
 	ctx.Equal(verdict["outcome"], "unavailable", "catalog:validation:10 after a timed-out validation; its outcome")
 }
 
 func CheckScopedCredential(ctx *harness.Ctx) {
-	client(ctx)
-	outcomeOf(ctx, "9", v9)
+	hClient(ctx)
+	hOutcomeOf(ctx, "9", hV9)
 	calls := ctx.GRPC.CallsTo("Validate", "")
 	ctx.Assert(len(calls) > 0, "no Validate call was made")
 	for _, call := range calls {
@@ -1008,14 +1008,14 @@ func CheckScopedCredential(ctx *harness.Ctx) {
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.Fail("Validate", codes.Unavailable, "sandbox pool drained", 5, "")
-	ctx.Equal(outcomeOf(ctx, "9", v9), "unavailable", "a sandbox that answered UNAVAILABLE gave no verdict, and no answer is not a pass; the outcome")
-	ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live; catalog:active")
-	verdict, err := catalog.Validation(clientBg, "9")
+	ctx.Equal(hOutcomeOf(ctx, "9", hV9), "unavailable", "a sandbox that answered UNAVAILABLE gave no verdict, and no answer is not a pass; the outcome")
+	ctx.Equal(hActive(ctx), "7", "a candidate nobody validated must not go live; catalog:active")
+	verdict, err := catalog.Validation(hClientBg, "9")
 	ctx.NoError(err, "catalog.Validation failed")
 	ctx.Assert(verdict["outcome"] == "unavailable" && verdict["reason"] != "", "catalog:validation:9 is %v, expected outcome unavailable with a reason", verdict)
-	e, _ := catalog.Resolve(clientBg, "search", "")
+	e, _ := catalog.Resolve(hClientBg, "search", "")
 	ctx.Equal(e["version"], "a1", "agents must still resolve catalog 7; the search version")
 	// Only INVALID_ARGUMENT judges the candidate: any other error says nothing about it.
 	for _, c := range []struct {
@@ -1024,28 +1024,28 @@ func CheckFailClosed(ctx *harness.Ctx) {
 	}{{"11", codes.Internal}, {"12", codes.ResourceExhausted}} {
 		ctx.GRPC.ClearFailures()
 		ctx.GRPC.Fail("Validate", c.code, "sandbox error", 5, "")
-		ctx.Equal(outcomeOf(ctx, c.cv, v10), "unavailable", "a sandbox that answered %s says nothing about the candidate (only INVALID_ARGUMENT judges it); candidate %s's outcome", c.code, c.cv)
-		recorded, _ := catalog.Validation(clientBg, c.cv)
+		ctx.Equal(hOutcomeOf(ctx, c.cv, hV10), "unavailable", "a sandbox that answered %s says nothing about the candidate (only INVALID_ARGUMENT judges it); candidate %s's outcome", c.code, c.cv)
+		recorded, _ := catalog.Validation(hClientBg, c.cv)
 		ctx.Equal(recorded["outcome"], "unavailable", "catalog:validation:%s after %s; its outcome", c.cv, c.code)
-		ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live after %s; catalog:active", c.code)
+		ctx.Equal(hActive(ctx), "7", "a candidate nobody validated must not go live after %s; catalog:active", c.code)
 	}
 }
 
 func CheckTerminalRejection(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Equal(outcomeOf(ctx, "9", broken), "rejected", "a candidate the sandbox refused with INVALID_ARGUMENT; the outcome")
+	hClient(ctx)
+	ctx.Equal(hOutcomeOf(ctx, "9", hBroken), "rejected", "a candidate the sandbox refused with INVALID_ARGUMENT; the outcome")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), 1, "a schema rejection is terminal for the candidate, not retried; the Validate calls")
-	verdict, _ := catalog.Validation(clientBg, "9")
+	verdict, _ := catalog.Validation(hClientBg, "9")
 	ctx.Assert(verdict["outcome"] == "rejected" && strings.Contains(verdict["reason"], "broken.refund"), "catalog:validation:9 is %v, expected outcome rejected with the sandbox's details", verdict)
-	ctx.Equal(outcomeOf(ctx, "9", broken), "rejected", "a re-request for the rejected candidate")
+	ctx.Equal(hOutcomeOf(ctx, "9", hBroken), "rejected", "a re-request for the rejected candidate")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), 1, "a re-request for a rejected candidate must be answered from catalog:validation:9; the Validate calls")
-	ctx.Equal(active(ctx), "7", "a rejected candidate must not go live; catalog:active")
+	ctx.Equal(hActive(ctx), "7", "a rejected candidate must not go live; catalog:active")
 	ctx.GRPC.Fail("Validate", codes.Unavailable, "sandbox pool drained", 1, "")
-	ctx.Equal(outcomeOf(ctx, "10", v10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome")
-	ctx.Equal(outcomeOf(ctx, "10", v10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome")
-	ctx.Equal(active(ctx), "10", "catalog:active after validating candidate 10")
+	ctx.Equal(hOutcomeOf(ctx, "10", hV10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome")
+	ctx.Equal(hOutcomeOf(ctx, "10", hV10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome")
+	ctx.Equal(hActive(ctx), "10", "catalog:active after validating candidate 10")
 	before := len(ctx.GRPC.CallsTo("Validate", ""))
-	ctx.Equal(outcomeOf(ctx, "10", v10), "passed", "a re-request for candidate 10, which passed")
+	ctx.Equal(hOutcomeOf(ctx, "10", hV10), "passed", "a re-request for candidate 10, which passed")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), before, "a re-request for candidate 10, which passed, must be answered from catalog:validation:10; the Validate calls")
 }
 `,
@@ -1062,18 +1062,18 @@ using json = nlohmann::json;
 
 namespace {
 
-json entry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
+json hEntry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
   return json{{"name", name},   {"version", version},  {"side_effect", side_effect}, {"owner", owner}, {"schema", {{"type", "object"}}},
               {"endpoint", "https://" + owner + ".internal"}, {"credential_ref", "vault://" + owner}};
 }
 
-const json kV7 = {{"search", entry("search", "a1", "read", "search")}, {"refund", entry("refund", "b1", "irreversible", "payments")}};
-const json kV9 = {{"search", entry("search", "a2", "read", "search")}, {"refund", entry("refund", "b2", "irreversible", "payments")}};
-const json kV10 = {{"search", entry("search", "a2", "read", "search")}, {"refund", entry("refund", "b1", "irreversible", "payments")}};
-const json kBroken = {{"search", entry("search", "a2", "read", "search")}, {"broken.refund", entry("broken.refund", "c1", "irreversible", "payments")}};
+const json kHV7 = {{"search", hEntry("search", "a1", "read", "search")}, {"refund", hEntry("refund", "b1", "irreversible", "payments")}};
+const json kHV9 = {{"search", hEntry("search", "a2", "read", "search")}, {"refund", hEntry("refund", "b2", "irreversible", "payments")}};
+const json kHV10 = {{"search", hEntry("search", "a2", "read", "search")}, {"refund", hEntry("refund", "b1", "irreversible", "payments")}};
+const json kHBroken = {{"search", hEntry("search", "a2", "read", "search")}, {"broken.refund", hEntry("broken.refund", "c1", "irreversible", "payments")}};
 
 // Exercises every tool; a tool named broken.* has a schema it cannot build arguments from.
-class SandboxPeer final : public toolsd::Sandbox::Service {
+class HSandboxPeer final : public toolsd::Sandbox::Service {
  public:
   grpc::Status Validate(grpc::ServerContext*, const toolsd::ValidateRequest* req, toolsd::ValidateReport* out) override {
     for (const auto& tool : req->tools()) {
@@ -1086,18 +1086,18 @@ class SandboxPeer final : public toolsd::Sandbox::Service {
   }
 };
 
-void client(harness::Ctx& ctx) {
-  static SandboxPeer* peer = nullptr;
+void hClient(harness::Ctx& ctx) {
+  static HSandboxPeer* peer = nullptr;
   delete peer;
-  peer = new SandboxPeer;
+  peer = new HSandboxPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   catalog::recordValidation("7", "passed", "");
-  catalog::promote("7", kV7);
+  catalog::promote("7", kHV7);
 }
 
-std::string active(harness::Ctx& ctx) { return ctx.Redis.Get("catalog:active").value_or(""); }
+std::string hActive(harness::Ctx& ctx) { return ctx.Redis.Get("catalog:active").value_or(""); }
 
-std::string verdictOf(const std::string& cv, const std::string& field) {
+std::string hVerdictOf(const std::string& cv, const std::string& field) {
   const auto verdict = catalog::validation(cv);
   if (!verdict) return "";
   const auto found = verdict->find(field);
@@ -1107,8 +1107,8 @@ std::string verdictOf(const std::string& cv, const std::string& field) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Equal(validateAndPromote("9", kV9), "passed", "with the sandbox healthy, the outcome");
+  hClient(ctx);
+  ctx.Equal(validateAndPromote("9", kHV9), "passed", "with the sandbox healthy, the outcome");
   const auto calls = ctx.GRPC.CallsTo("Validate");
   ctx.Assert(!calls.empty(), "no Validate call was made");
   for (const auto& call : calls) {
@@ -1116,14 +1116,14 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(9.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 10.5, "the Validate call carries a %v s deadline, expected kValidateDeadline = 10 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Validate", 60.0);
-  ctx.Equal(validateAndPromote("10", kV10), "unavailable", "a sandbox slower than the deadline; the outcome");
-  ctx.Equal(active(ctx), "9", "catalog:active after a timed-out validation");
-  ctx.Equal(verdictOf("10", "outcome"), "unavailable", "catalog:validation:10 after a timed-out validation; its outcome");
+  ctx.Equal(validateAndPromote("10", kHV10), "unavailable", "a sandbox slower than the deadline; the outcome");
+  ctx.Equal(hActive(ctx), "9", "catalog:active after a timed-out validation");
+  ctx.Equal(hVerdictOf("10", "outcome"), "unavailable", "catalog:validation:10 after a timed-out validation; its outcome");
 }
 
 void CheckScopedCredential(harness::Ctx& ctx) {
-  client(ctx);
-  validateAndPromote("9", kV9);
+  hClient(ctx);
+  validateAndPromote("9", kHV9);
   const auto calls = ctx.GRPC.CallsTo("Validate");
   ctx.Assert(!calls.empty(), "no Validate call was made");
   for (const auto& call : calls) {
@@ -1137,11 +1137,11 @@ void CheckScopedCredential(harness::Ctx& ctx) {
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "sandbox pool drained", 5);
-  ctx.Equal(validateAndPromote("9", kV9), "unavailable", "a sandbox that answered UNAVAILABLE gave no verdict, and no answer is not a pass; the outcome");
-  ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live; catalog:active");
-  ctx.Assert(verdictOf("9", "outcome") == "unavailable" && !verdictOf("9", "reason").empty(), "catalog:validation:9 has outcome %q and reason %q, expected unavailable with a reason", verdictOf("9", "outcome"), verdictOf("9", "reason"));
+  ctx.Equal(validateAndPromote("9", kHV9), "unavailable", "a sandbox that answered UNAVAILABLE gave no verdict, and no answer is not a pass; the outcome");
+  ctx.Equal(hActive(ctx), "7", "a candidate nobody validated must not go live; catalog:active");
+  ctx.Assert(hVerdictOf("9", "outcome") == "unavailable" && !hVerdictOf("9", "reason").empty(), "catalog:validation:9 has outcome %q and reason %q, expected unavailable with a reason", hVerdictOf("9", "outcome"), hVerdictOf("9", "reason"));
   const auto search = catalog::resolve("search");
   ctx.Equal(search ? search->value("version", "") : "", "a1", "agents must still resolve catalog 7; the search version");
   // Only INVALID_ARGUMENT judges the candidate: any other error says nothing about it.
@@ -1150,26 +1150,26 @@ void CheckFailClosed(harness::Ctx& ctx) {
   for (const auto& [cv, code, name] : others) {
     ctx.GRPC.ClearFailures();
     ctx.GRPC.Fail("Validate", code, "sandbox error", 5);
-    ctx.Equal(validateAndPromote(cv, kV10), "unavailable", "a sandbox that answered %s says nothing about the candidate (only INVALID_ARGUMENT judges it); candidate %s's outcome", name, cv);
-    ctx.Equal(verdictOf(cv, "outcome"), "unavailable", "catalog:validation:%s after %s; its outcome", cv, name);
-    ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live after %s; catalog:active", name);
+    ctx.Equal(validateAndPromote(cv, kHV10), "unavailable", "a sandbox that answered %s says nothing about the candidate (only INVALID_ARGUMENT judges it); candidate %s's outcome", name, cv);
+    ctx.Equal(hVerdictOf(cv, "outcome"), "unavailable", "catalog:validation:%s after %s; its outcome", cv, name);
+    ctx.Equal(hActive(ctx), "7", "a candidate nobody validated must not go live after %s; catalog:active", name);
   }
 }
 
 void CheckTerminalRejection(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Equal(validateAndPromote("9", kBroken), "rejected", "a candidate the sandbox refused with INVALID_ARGUMENT; the outcome");
+  hClient(ctx);
+  ctx.Equal(validateAndPromote("9", kHBroken), "rejected", "a candidate the sandbox refused with INVALID_ARGUMENT; the outcome");
   ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), 1, "a schema rejection is terminal for the candidate, not retried; the Validate calls");
-  ctx.Assert(verdictOf("9", "outcome") == "rejected" && verdictOf("9", "reason").find("broken.refund") != std::string::npos, "catalog:validation:9 has outcome %q and reason %q, expected rejected with the sandbox's details", verdictOf("9", "outcome"), verdictOf("9", "reason"));
-  ctx.Equal(validateAndPromote("9", kBroken), "rejected", "a re-request for the rejected candidate");
+  ctx.Assert(hVerdictOf("9", "outcome") == "rejected" && hVerdictOf("9", "reason").find("broken.refund") != std::string::npos, "catalog:validation:9 has outcome %q and reason %q, expected rejected with the sandbox's details", hVerdictOf("9", "outcome"), hVerdictOf("9", "reason"));
+  ctx.Equal(validateAndPromote("9", kHBroken), "rejected", "a re-request for the rejected candidate");
   ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), 1, "a re-request for a rejected candidate must be answered from catalog:validation:9; the Validate calls");
-  ctx.Equal(active(ctx), "7", "a rejected candidate must not go live; catalog:active");
+  ctx.Equal(hActive(ctx), "7", "a rejected candidate must not go live; catalog:active");
   ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "sandbox pool drained", 1);
-  ctx.Equal(validateAndPromote("10", kV10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome");
-  ctx.Equal(validateAndPromote("10", kV10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome");
-  ctx.Equal(active(ctx), "10", "catalog:active after validating candidate 10");
+  ctx.Equal(validateAndPromote("10", kHV10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome");
+  ctx.Equal(validateAndPromote("10", kHV10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome");
+  ctx.Equal(hActive(ctx), "10", "catalog:active after validating candidate 10");
   const auto before = ctx.GRPC.CallsTo("Validate").size();
-  ctx.Equal(validateAndPromote("10", kV10), "passed", "a re-request for candidate 10, which passed");
+  ctx.Equal(validateAndPromote("10", kHV10), "passed", "a re-request for candidate 10, which passed");
   ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), before, "a re-request for candidate 10, which passed, must be answered from catalog:validation:10; the Validate calls");
 }
 `,

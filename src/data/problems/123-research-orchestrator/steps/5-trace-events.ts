@@ -1011,20 +1011,20 @@ import (
 	"leetbuild/harness"
 )
 
-var traceBg = context.Background()
+var hTraceBg = context.Background()
 
-func decisionOf(agentID string) Decision {
+func hDecisionOf(agentID string) Decision {
 	return Decision{JobID: "job-1", AgentID: agentID, Tool: "fetch", LatencyMs: 840, Tokens: 1200, Outcome: "tool.call",
 		Query: "CANARY-QUERY board members of every bank in the index", Findings: "CANARY-FINDINGS chair: A. Jones"}
 }
 
-func mustTrace(ctx *harness.Ctx, agentID string) map[string]any {
-	event, err := trace(traceBg, decisionOf(agentID))
+func hMustTrace(ctx *harness.Ctx, agentID string) map[string]any {
+	event, err := trace(hTraceBg, hDecisionOf(agentID))
 	ctx.NoError(err, "trace(%s) failed", agentID)
 	return event
 }
 
-func sortedKeys(m map[string]any) []string {
+func hSortedKeys(m map[string]any) []string {
 	keys := []string{}
 	for k := range m {
 		keys = append(keys, k)
@@ -1033,11 +1033,11 @@ func sortedKeys(m map[string]any) []string {
 	return keys
 }
 
-var traceFieldsWant = []string{"agent_id", "job_id", "latency_ms", "outcome", "tokens", "tool", "version"}
+var hTraceFieldsWant = []string{"agent_id", "job_id", "latency_ms", "outcome", "tokens", "tool", "version"}
 
 func CheckJobKey(ctx *harness.Ctx) {
 	for _, agent := range []string{"lead", "sub-1", "sub-2"} {
-		mustTrace(ctx, agent)
+		hMustTrace(ctx, agent)
 	}
 	records := ctx.Kafka.Records(traceTopic)
 	ctx.Equal(len(records), 3, "three decisions; the records on %s", traceTopic)
@@ -1046,22 +1046,22 @@ func CheckJobKey(ctx *harness.Ctx) {
 }
 
 func CheckNoContent(ctx *harness.Ctx) {
-	event := mustTrace(ctx, "sub-1")
+	event := hMustTrace(ctx, "sub-1")
 	records := ctx.Kafka.Records(traceTopic)
 	ctx.Equal(len(records), 1, "one decision; the records on %s", traceTopic)
 	value := string(records[0].Value)
 	ctx.Assert(!strings.Contains(value, "CANARY"), "the trace event carries the query or the findings: %s", value)
 	var payload map[string]any
 	ctx.NoError(json.Unmarshal([]byte(value), &payload), "the event is not JSON: %s", value)
-	ctx.Equal(sortedKeys(payload), traceFieldsWant, "the event must carry traceFields and version only; its fields")
+	ctx.Equal(hSortedKeys(payload), hTraceFieldsWant, "the event must carry traceFields and version only; its fields")
 	ctx.Assert(payload["version"] == "2.3.0" && payload["latency_ms"] == 840.0 && payload["agent_id"] == "sub-1", "the event must keep the ids, the numbers and the version, got %s", value)
-	ctx.Equal(sortedKeys(event), traceFieldsWant, "trace must return the event it sent; its fields")
+	ctx.Equal(hSortedKeys(event), hTraceFieldsWant, "trace must return the event it sent; its fields")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	mustTrace(ctx, "lead")
+	hMustTrace(ctx, "lead")
 	ctx.Equal(len(ctx.Kafka.Records(traceTopic)), 1, "one decision; the records")
-	mustTrace(ctx, "sub-1")
+	hMustTrace(ctx, "sub-1")
 	lost := ctx.Kafka.Failover(traceTopic)
 	ctx.Equal(len(ctx.Kafka.Records(traceTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged them. Use RequireAll; the records", lost)
 }
@@ -1090,7 +1090,7 @@ func CheckCommitAfterWrite(ctx *harness.Ctx) {
 		ctx.Clock.Advance(6)
 		return nil
 	})
-	ctx.Drain(func() { runEval(traceBg) }) // job-2's failed write may end the loop; the record must then stay uncommitted
+	ctx.Drain(func() { runEval(hTraceBg) }) // job-2's failed write may end the loop; the record must then stay uncommitted
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
 	for _, at := range atCommit {
 		if at.lag <= 1 {
@@ -1116,23 +1116,23 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::vector<std::string> kFields = {"agent_id", "job_id", "latency_ms", "outcome", "tokens", "tool", "version"};
+const std::vector<std::string> kHFields = {"agent_id", "job_id", "latency_ms", "outcome", "tokens", "tool", "version"};
 
-json decisionOf(const std::string& agent_id) {
+json hDecisionOf(const std::string& agent_id) {
   return {{"job_id", "job-1"}, {"agent_id", agent_id}, {"tool", "fetch"}, {"latency_ms", 840}, {"tokens", 1200}, {"outcome", "tool.call"},
           {"query", "CANARY-QUERY board members of every bank in the index"}, {"findings", "CANARY-FINDINGS chair: A. Jones"},
           // A field added to decisions later: the event picks kTraceFields rather than dropping a known list.
           {"prompt", "CANARY-PROMPT summarise every board member"}};
 }
 
-json traced(harness::Ctx& ctx, const std::string& agent_id) {
-  const json event = trace(decisionOf(agent_id));
+json hTraced(harness::Ctx& ctx, const std::string& agent_id) {
+  const json event = trace(hDecisionOf(agent_id));
   producer->flush(1000);
   ctx.Settle();
   return event;
 }
 
-std::vector<std::string> keysOf(const json& j) {
+std::vector<std::string> hKeysOf(const json& j) {
   std::vector<std::string> keys;
   for (const auto& [k, v] : j.items()) keys.push_back(k);
   std::sort(keys.begin(), keys.end());
@@ -1142,7 +1142,7 @@ std::vector<std::string> keysOf(const json& j) {
 }  // namespace
 
 void CheckJobKey(harness::Ctx& ctx) {
-  for (const std::string agent : {"lead", "sub-1", "sub-2"}) traced(ctx, agent);
+  for (const std::string agent : {"lead", "sub-1", "sub-2"}) hTraced(ctx, agent);
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 3, "three decisions; the records on %s", kTopic);
   ctx.Equal(ctx.Kafka.Keys(kTopic), {"job-1", "job-1", "job-1"}, "records must be keyed by the job id (keyed by agent, one job's decisions spread over partitions and replay out of order)");
@@ -1151,24 +1151,24 @@ void CheckJobKey(harness::Ctx& ctx) {
 }
 
 void CheckNoContent(harness::Ctx& ctx) {
-  const json event = traced(ctx, "sub-1");
+  const json event = hTraced(ctx, "sub-1");
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 1, "one decision; the records on %s", kTopic);
   const std::string value = records[0].Value.value_or("");
   ctx.Assert(value.find("CANARY") == std::string::npos, "the trace event carries the query, the findings or the prompt: %s", value);
   const json payload = json::parse(value, nullptr, false);
   ctx.Assert(payload.is_object(), "the event is not JSON: %s", value);
-  ctx.Equal(keysOf(payload), kFields, "the event must carry kTraceFields and version only; its fields");
+  ctx.Equal(hKeysOf(payload), kHFields, "the event must carry kTraceFields and version only; its fields");
   ctx.Assert(payload.value("version", "") == "2.3.0" && payload.value("latency_ms", 0) == 840 && payload.value("agent_id", "") == "sub-1",
              "the event must keep the ids, the numbers and the version, got %s", value);
-  ctx.Equal(keysOf(event), kFields, "trace must return the event it sent; its fields");
+  ctx.Equal(hKeysOf(event), kHFields, "trace must return the event it sent; its fields");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic, 1);
-  traced(ctx, "lead");
+  hTraced(ctx, "lead");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one decision whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence (with acks=all); the records");
-  traced(ctx, "sub-1");
+  hTraced(ctx, "sub-1");
   const int lost = ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: wait for every in-sync replica (acks=all); the records", lost);
 }

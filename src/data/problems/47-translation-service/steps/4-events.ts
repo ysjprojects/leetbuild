@@ -1279,88 +1279,88 @@ import (
 )
 
 var (
-	eventsBg = context.Background()
-	segment  = Segment{Tenant: "acme", Source: "en", Target: "fr", GlossaryVersion: 2, Text: "Open the Dashboard", Translation: "[fr] Open the Tableau de bord", LatencyMs: 180, QualityScore: 0.92}
+	hEventsBg = context.Background()
+	hSegment  = Segment{Tenant: "acme", Source: "en", Target: "fr", GlossaryVersion: 2, Text: "Open the Dashboard", Translation: "[fr] Open the Tableau de bord", LatencyMs: 180, QualityScore: 0.92}
 )
 
-func eventsSha(s string) string {
+func hEventsSha(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func mustPublish(ctx *harness.Ctx, seg Segment) {
-	ctx.NoError(publishDone(eventsBg, seg), "publishDone failed: a refused event goes to the outbox, the request goes on")
+func hMustPublish(ctx *harness.Ctx, seg Segment) {
+	ctx.NoError(publishDone(hEventsBg, seg), "publishDone failed: a refused event goes to the outbox, the request goes on")
 	ctx.Settle()
 }
 
 func CheckLocaleKey(ctx *harness.Ctx) {
-	mustPublish(ctx, segment)
-	globex := segment
+	hMustPublish(ctx, hSegment)
+	globex := hSegment
 	globex.Tenant = "globex"
-	mustPublish(ctx, globex)
-	german := segment
+	hMustPublish(ctx, globex)
+	german := hSegment
 	german.Target = "de"
-	mustPublish(ctx, german)
+	hMustPublish(ctx, german)
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(ctx.Kafka.Keys(topic), []string{"en->fr", "en->fr", "en->de"}, "records must be keyed by the locale pair (keyed by tenant, one pair's events spread over every partition)")
 	ctx.Assert(records[0].Partition == records[1].Partition, "acme's and globex's en->fr events landed on partitions %d and %d: one pair must share a partition so the quality consumer reads it in order", records[0].Partition, records[1].Partition)
 }
 
 func CheckNoText(ctx *harness.Ctx) {
-	mustPublish(ctx, segment)
+	hMustPublish(ctx, hSegment)
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 1, "one segment; the records")
-	p := payloadOf(ctx, records[0].Value)
+	p := hPayloadOf(ctx, records[0].Value)
 	for name, value := range p {
-		ctx.Assert(value != segment.Text && value != segment.Translation, "the event carries customer text in %s: %v. The topic is retained and replicated; carry hashes", name, p)
+		ctx.Assert(value != hSegment.Text && value != hSegment.Translation, "the event carries customer text in %s: %v. The topic is retained and replicated; carry hashes", name, p)
 	}
 	for _, word := range []string{"Open", "Dashboard", "Tableau"} {
 		ctx.Assert(!strings.Contains(string(records[0].Value), word), "the event carries customer text (%s) in %s: no field, nested or cut short, may hold the text. The topic is retained and replicated; carry hashes", word, records[0].Value)
 	}
-	ctx.Assert(p["source_sha256"] == eventsSha(segment.Text) && p["target_sha256"] == eventsSha(segment.Translation), "the event must carry source_sha256 and target_sha256 of the two texts, got %v", p)
+	ctx.Assert(p["source_sha256"] == hEventsSha(hSegment.Text) && p["target_sha256"] == hEventsSha(hSegment.Translation), "the event must carry source_sha256 and target_sha256 of the two texts, got %v", p)
 	ctx.Assert(p["glossary_version"] == float64(2) && p["quality_score"] == 0.92 && p["tenant"] == "acme", "the event lost its fields: %v", p)
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext(topic, 1)
-	mustPublish(ctx, segment)
+	hMustPublish(ctx, hSegment)
 	rows := ctx.Redis.LRange("outbox:translation.done", 0, -1)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: the returned write error is where the refusal arrives, and the event must be kept; outbox rows")
-	row := payloadOf(ctx, []byte(rows[0]))
+	row := hPayloadOf(ctx, []byte(rows[0]))
 	ctx.Assert(row["source"] == "en" && row["glossary_version"] == float64(2), "the outbox row must be the event itself, got %v", row)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "nothing reached the topic for the refused produce; the records")
-	next := segment
+	next := hSegment
 	next.Text = "Close the Dashboard"
-	mustPublish(ctx, next)
+	hMustPublish(ctx, next)
 	ctx.Assert(len(ctx.Kafka.Records(topic)) == 1 && len(ctx.Redis.LRange("outbox:translation.done", 0, -1)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	mustPublish(ctx, segment)
+	hMustPublish(ctx, hSegment)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one segment, the records on the topic")
-	next := segment
+	next := hSegment
 	next.Text = "Close the Dashboard"
-	mustPublish(ctx, next)
+	hMustPublish(ctx, next)
 	lost := ctx.Kafka.Failover(topic)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone had the event. Use RequireAll; the records on the topic", lost)
 }
 
-func seedDone(ctx *harness.Ctx, source, target string, score float64) {
+func hSeedDone(ctx *harness.Ctx, source, target string, score float64) {
 	value, _ := json.Marshal(map[string]any{"tenant": "acme", "source": source, "target": target, "glossary_version": 2, "latency_ms": 180, "quality_score": score})
 	ctx.Kafka.Seed(topic, source+"->"+target, value)
 }
 
 func CheckCountersBeforeCommit(ctx *harness.Ctx) {
-	seedDone(ctx, "en", "fr", 0.9)
-	seedDone(ctx, "en", "fr", 0.8)
-	seedDone(ctx, "en", "de", 0.5)
-	seedDone(ctx, "en", "es", 0.7)
+	hSeedDone(ctx, "en", "fr", 0.9)
+	hSeedDone(ctx, "en", "fr", 0.8)
+	hSeedDone(ctx, "en", "de", 0.5)
+	hSeedDone(ctx, "en", "es", 0.7)
 	var counted []int // records counted in Redis at the moment of each commit
 	// en->es as the consumer's first command on it left it (the harness reads it only once this fired).
 	var firstSeen map[string]string
@@ -1392,7 +1392,7 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 	}
 	// A count that fails (quality:en->ja is not a hash) leaves its record uncommitted, to be replayed.
 	ctx.Redis.Set("quality:en->ja", "corrupt")
-	seedDone(ctx, "en", "ja", 0.6)
+	hSeedDone(ctx, "en", "ja", 0.6)
 	ctx.Drain(func() { run(context.Background()) }) // returning the error is a correct outcome
 	ctx.Equal(ctx.Kafka.Lag("quality", topic), int64(1), "the count of an en->ja record failed (WRONGTYPE): a record whose counts failed must not be committed, or it is lost; the lag")
 }
@@ -1409,9 +1409,9 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const Segment kSegment{"acme", "en", "fr", 2, "Open the Dashboard", "[fr] Open the Tableau de bord", 180, 0.92};
+const Segment kHSegment{"acme", "en", "fr", 2, "Open the Dashboard", "[fr] Open the Tableau de bord", 180, 0.92};
 
-std::string sha(const std::string& s) {
+std::string hSha(const std::string& s) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), digest);
   static const char* hex = "0123456789abcdef";
@@ -1423,13 +1423,13 @@ std::string sha(const std::string& s) {
   return out;
 }
 
-json payloadOf(harness::Ctx& ctx, const std::string& value) {
+json hPayloadOf(harness::Ctx& ctx, const std::string& value) {
   const json p = json::parse(value, nullptr, false);
   ctx.Assert(p.is_object(), "the record's value is not JSON: %s", value);
   return p;
 }
 
-void mustPublish(harness::Ctx& ctx, const Segment& seg) {
+void hMustPublish(harness::Ctx& ctx, const Segment& seg) {
   try {
     publishDone(seg);
   } catch (const std::exception& e) {
@@ -1439,7 +1439,7 @@ void mustPublish(harness::Ctx& ctx, const Segment& seg) {
   producer->flush(5000);  // the service's poll loop serves the delivery reports
 }
 
-void seedDone(harness::Ctx& ctx, const std::string& source, const std::string& target, double score) {
+void hSeedDone(harness::Ctx& ctx, const std::string& source, const std::string& target, double score) {
   const json event = {{"tenant", "acme"}, {"source", source}, {"target", target}, {"glossary_version", 2}, {"latency_ms", 180}, {"quality_score", score}};
   ctx.Kafka.Seed(kTopic, source + "->" + target, event.dump());
 }
@@ -1447,64 +1447,64 @@ void seedDone(harness::Ctx& ctx, const std::string& source, const std::string& t
 }  // namespace
 
 void CheckLocaleKey(harness::Ctx& ctx) {
-  mustPublish(ctx, kSegment);
-  Segment globex = kSegment;
+  hMustPublish(ctx, kHSegment);
+  Segment globex = kHSegment;
   globex.tenant = "globex";
-  mustPublish(ctx, globex);
-  Segment german = kSegment;
+  hMustPublish(ctx, globex);
+  Segment german = kHSegment;
   german.target = "de";
-  mustPublish(ctx, german);
+  hMustPublish(ctx, german);
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(ctx.Kafka.Keys(kTopic), {"en->fr", "en->fr", "en->de"}, "records must be keyed by the locale pair (keyed by tenant, one pair's events spread over every partition)");
   ctx.Assert(records.size() >= 2 && records[0].Partition == records[1].Partition, "acme's and globex's en->fr events must share a partition so the quality consumer reads the pair in order");
 }
 
 void CheckNoText(harness::Ctx& ctx) {
-  mustPublish(ctx, kSegment);
+  hMustPublish(ctx, kHSegment);
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 1, "one segment; the records");
-  const json p = payloadOf(ctx, records[0].Value.value_or(""));
+  const json p = hPayloadOf(ctx, records[0].Value.value_or(""));
   for (const auto& [name, value] : p.items()) {
-    ctx.Assert(value != kSegment.text && value != kSegment.translation, "the event carries customer text in %s: %s. The topic is retained and replicated; carry hashes", name, p.dump());
+    ctx.Assert(value != kHSegment.text && value != kHSegment.translation, "the event carries customer text in %s: %s. The topic is retained and replicated; carry hashes", name, p.dump());
   }
   const std::string raw = records[0].Value.value_or("");
   for (const std::string word : {"Open", "Dashboard", "Tableau"}) {
     ctx.Assert(raw.find(word) == std::string::npos, "the event carries customer text (%s) in %s: no field, nested or cut short, may hold the text. The topic is retained and replicated; carry hashes", word, raw);
   }
-  ctx.Assert(p.value("source_sha256", "") == sha(kSegment.text) && p.value("target_sha256", "") == sha(kSegment.translation), "the event must carry source_sha256 and target_sha256 of the two texts, got %s", p.dump());
+  ctx.Assert(p.value("source_sha256", "") == hSha(kHSegment.text) && p.value("target_sha256", "") == hSha(kHSegment.translation), "the event must carry source_sha256 and target_sha256 of the two texts, got %s", p.dump());
   ctx.Assert(p.value("glossary_version", 0L) == 2 && p.value("tenant", "") == "acme", "the event lost its fields: %s", p.dump());
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
-  mustPublish(ctx, kSegment);
+  hMustPublish(ctx, kHSegment);
   const auto rows = ctx.Redis.LRange("outbox:translation.done", 0, -1);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: the delivery report is where the refusal arrives, and the event must be kept; outbox rows");
-  const json row = payloadOf(ctx, rows.empty() ? "{}" : rows[0]);
+  const json row = hPayloadOf(ctx, rows.empty() ? "{}" : rows[0]);
   ctx.Assert(row.value("source", "") == "en" && row.value("glossary_version", 0L) == 2, "the outbox row must be the event itself, got %s", row.dump());
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused produce; the records");
-  Segment next = kSegment;
+  Segment next = kHSegment;
   next.text = "Close the Dashboard";
-  mustPublish(ctx, next);
+  hMustPublish(ctx, next);
   ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && ctx.Redis.LRange("outbox:translation.done", 0, -1).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic, 1);
-  mustPublish(ctx, kSegment);
+  hMustPublish(ctx, kHSegment);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one segment whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence (with acks=all); the records on the topic");
-  Segment next = kSegment;
+  Segment next = kHSegment;
   next.text = "Close the Dashboard";
-  mustPublish(ctx, next);
+  hMustPublish(ctx, next);
   const int lost = ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone had the event. Use acks=all; the records on the topic", lost);
 }
 
 void CheckCountersBeforeCommit(harness::Ctx& ctx) {
-  seedDone(ctx, "en", "fr", 0.9);
-  seedDone(ctx, "en", "fr", 0.8);
-  seedDone(ctx, "en", "de", 0.5);
-  seedDone(ctx, "en", "es", 0.7);
+  hSeedDone(ctx, "en", "fr", 0.9);
+  hSeedDone(ctx, "en", "fr", 0.8);
+  hSeedDone(ctx, "en", "de", 0.5);
+  hSeedDone(ctx, "en", "es", 0.7);
   std::vector<long> counted;  // records counted in Redis at the moment of each commit
   // en->es as the consumer's first command on it left it (the harness reads it only once this fired).
   std::atomic<bool> fired{false};
@@ -1533,7 +1533,7 @@ void CheckCountersBeforeCommit(harness::Ctx& ctx) {
   }
   // A count that fails (quality:en->ja is not a hash) leaves its record uncommitted, to be replayed.
   ctx.Redis.Set("quality:en->ja", "corrupt");
-  seedDone(ctx, "en", "ja", 0.6);
+  hSeedDone(ctx, "en", "ja", 0.6);
   try {
     ctx.Drain([] { run(); });
   } catch (const std::exception&) {

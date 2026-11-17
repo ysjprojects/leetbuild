@@ -714,35 +714,35 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "match.event"
+const kHEventsTopic = "match.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
 // eventsMatch is a match in pool 15: t{first} is a party of p{first} and p{first+1}, t{first+2} a solo p{first+2}.
-func eventsMatch(matchID string, first int) []string {
+func hEventsMatch(matchID string, first int) []string {
 	players := []string{fmt.Sprintf("p%d", first), fmt.Sprintf("p%d", first+1), fmt.Sprintf("p%d", first+2)}
-	store.Enqueue(eventsBg, fmt.Sprintf("t%d", first), players[0], 1500, players[:2])
-	store.Enqueue(eventsBg, fmt.Sprintf("t%d", first+2), players[2], 1510, players[2:])
-	store.CreateMatch(eventsBg, matchID, 15, []string{fmt.Sprintf("t%d", first), fmt.Sprintf("t%d", first+2)})
+	store.Enqueue(hEventsBg, fmt.Sprintf("t%d", first), players[0], 1500, players[:2])
+	store.Enqueue(hEventsBg, fmt.Sprintf("t%d", first+2), players[2], 1510, players[2:])
+	store.CreateMatch(hEventsBg, matchID, 15, []string{fmt.Sprintf("t%d", first), fmt.Sprintf("t%d", first+2)})
 	return players
 }
 
-func eventsReady(matchID string, players []string) {
-	store.SetServer(eventsBg, matchID, "gs-"+matchID)
+func hEventsReady(matchID string, players []string) {
+	store.SetServer(hEventsBg, matchID, "gs-"+matchID)
 	for _, p := range players {
-		store.ConfirmJoin(eventsBg, matchID, p)
+		store.ConfirmJoin(hEventsBg, matchID, p)
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, matchID, kind string) bool {
-	ok, err := publishEvent(eventsBg, matchID, kind)
+func hEventsPublish(ctx *harness.Ctx, matchID, kind string) bool {
+	ok, err := publishEvent(hEventsBg, matchID, kind)
 	ctx.NoError(err, "publishEvent(%s, %s)", matchID, kind)
 	return ok
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func hEventsAll(ctx *harness.Ctx) []map[string]any {
 	out := []map[string]any{}
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
+	for _, v := range ctx.Kafka.Values(kHEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "an event must be JSON: %s", v)
 		out = append(out, e)
@@ -750,7 +750,7 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	out := []map[string]any{}
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
 		var row map[string]any
@@ -760,9 +760,9 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsOfType(ctx *harness.Ctx, kind string) []map[string]any {
+func hEventsOfType(ctx *harness.Ctx, kind string) []map[string]any {
 	out := []map[string]any{}
-	for _, e := range eventsAll(ctx) {
+	for _, e := range hEventsAll(ctx) {
 		if e["type"] == kind {
 			out = append(out, e)
 		}
@@ -771,17 +771,17 @@ func eventsOfType(ctx *harness.Ctx, kind string) []map[string]any {
 }
 
 func CheckMatchKey(ctx *harness.Ctx) {
-	eventsReady("m-1", eventsMatch("m-1", 1))
-	eventsReady("m-2", eventsMatch("m-2", 4))
+	hEventsReady("m-1", hEventsMatch("m-1", 1))
+	hEventsReady("m-2", hEventsMatch("m-2", 4))
 	for _, kind := range []string{"found", "started"} {
 		for _, matchID := range []string{"m-1", "m-2"} {
-			eventsPublish(ctx, matchID, kind)
+			hEventsPublish(ctx, matchID, kind)
 		}
 	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 4, "four publishEvent calls must produce four records on match.event; the records")
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	count := map[string]int{}
 	partition := map[string]map[int]bool{}
 	for i, k := range keys {
@@ -798,12 +798,12 @@ func CheckMatchKey(ctx *harness.Ctx) {
 }
 
 func CheckEventPayload(ctx *harness.Ctx) {
-	eventsMatch("m-1", 1)
-	eventsPublish(ctx, "m-1", "found")
-	store.Abandon(eventsBg, "m-1", "allocation_failed")
-	eventsPublish(ctx, "m-1", "abandoned")
+	hEventsMatch("m-1", 1)
+	hEventsPublish(ctx, "m-1", "found")
+	store.Abandon(hEventsBg, "m-1", "allocation_failed")
+	hEventsPublish(ctx, "m-1", "abandoned")
 	ctx.Settle()
-	all := eventsAll(ctx)
+	all := hEventsAll(ctx)
 	ctx.Equal(len(all), 2, "two publishEvent calls must produce two events; the events")
 	found, abandoned := all[0], all[1]
 	ctx.Assert(found["type"] == "match.found" && found["match_id"] == "m-1", "the first event is %v", found)
@@ -814,37 +814,37 @@ func CheckEventPayload(ctx *harness.Ctx) {
 }
 
 func CheckStartedGate(ctx *harness.Ctx) {
-	eventsMatch("m-1", 1)
-	store.SetServer(eventsBg, "m-1", "gs-m-1")
-	store.ConfirmJoin(eventsBg, "m-1", "p1")
-	store.ConfirmJoin(eventsBg, "m-1", "p2")
-	ctx.Equal(eventsPublish(ctx, "m-1", "started"), false, "p3 has not joined: publishEvent(m-1, started)")
+	hEventsMatch("m-1", 1)
+	store.SetServer(hEventsBg, "m-1", "gs-m-1")
+	store.ConfirmJoin(hEventsBg, "m-1", "p1")
+	store.ConfirmJoin(hEventsBg, "m-1", "p2")
+	ctx.Equal(hEventsPublish(ctx, "m-1", "started"), false, "p3 has not joined: publishEvent(m-1, started)")
 	ctx.Settle()
-	ctx.Equal(len(eventsOfType(ctx, "match.started")), 0, "match.started must not go out while p3 is still connecting; the started events")
-	ctx.Equal(len(eventsOutbox(ctx)), 0, "a refused started is not a failed delivery; the outbox rows")
-	store.ConfirmJoin(eventsBg, "m-1", "p3")
-	ctx.Equal(eventsPublish(ctx, "m-1", "started"), true, "with every join confirmed match.started must be published")
+	ctx.Equal(len(hEventsOfType(ctx, "match.started")), 0, "match.started must not go out while p3 is still connecting; the started events")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "a refused started is not a failed delivery; the outbox rows")
+	store.ConfirmJoin(hEventsBg, "m-1", "p3")
+	ctx.Equal(hEventsPublish(ctx, "m-1", "started"), true, "with every join confirmed match.started must be published")
 	ctx.Settle()
-	started := eventsOfType(ctx, "match.started")
+	started := hEventsOfType(ctx, "match.started")
 	ctx.Assert(len(started) == 1 && started[0]["server_id"] == "gs-m-1", "the topic holds %v, expected one match.started on gs-m-1", started)
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	eventsMatch("m-1", 1)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, "m-1", "found")
+	hEventsMatch("m-1", 1)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, "m-1", "found")
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker rejected the produce: without an outbox row the event is gone; the rows")
 	payload, _ := rows[0]["payload"].(map[string]any)
-	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "m-1" && payload["type"] == "match.found", "the outbox row is %v, expected the topic, the key m-1 and the payload", rows[0])
+	ctx.Assert(rows[0]["topic"] == kHEventsTopic && rows[0]["key"] == "m-1" && payload["type"] == "match.found", "the outbox row is %v, expected the topic, the key m-1 and the payload", rows[0])
 	ctx.Equal(ok, false, "publishEvent's result after a rejected produce")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, "m-1", "found")
+	ok = hEventsPublish(ctx, "m-1", "found")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s)", waited)
-	ctx.Equal(len(eventsOutbox(ctx)), 2, "no delivery report within the window; the outbox rows")
+	ctx.Equal(len(hEventsOutbox(ctx)), 2, "no delivery report within the window; the outbox rows")
 	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
 }
 `,
@@ -861,10 +861,10 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "match.event";
+const std::string kHEventsTopic = "match.event";
 
 // A match in pool 15: t{first} is a party of p{first} and p{first+1}, t{first+2} a solo p{first+2}.
-std::vector<std::string> eventsMatch(const std::string& match_id, int first) {
+std::vector<std::string> hEventsMatch(const std::string& match_id, int first) {
   const std::vector<std::string> players = {"p" + std::to_string(first), "p" + std::to_string(first + 1), "p" + std::to_string(first + 2)};
   store::enqueue("t" + std::to_string(first), players[0], 1500, {players[0], players[1]});
   store::enqueue("t" + std::to_string(first + 2), players[2], 1510, {players[2]});
@@ -872,31 +872,31 @@ std::vector<std::string> eventsMatch(const std::string& match_id, int first) {
   return players;
 }
 
-void eventsReady(const std::string& match_id, const std::vector<std::string>& players) {
+void hEventsReady(const std::string& match_id, const std::vector<std::string>& players) {
   store::setServer(match_id, "gs-" + match_id);
   for (const auto& p : players) store::confirmJoin(match_id, p);
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& v : ctx.Kafka.Values(kEventsTopic)) out.push_back(nlohmann::json::parse(v, nullptr, false));
+  for (const auto& v : ctx.Kafka.Values(kHEventsTopic)) out.push_back(nlohmann::json::parse(v, nullptr, false));
   return out;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) out.push_back(nlohmann::json::parse(text, nullptr, false));
   return out;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
-std::vector<nlohmann::json> eventsOfType(harness::Ctx& ctx, const std::string& type) {
+std::vector<nlohmann::json> hEventsOfType(harness::Ctx& ctx, const std::string& type) {
   std::vector<nlohmann::json> out;
-  for (const auto& e : eventsAll(ctx)) {
-    if (field(e, "type") == type) out.push_back(e);
+  for (const auto& e : hEventsAll(ctx)) {
+    if (hField(e, "type") == type) out.push_back(e);
   }
   return out;
 }
@@ -904,15 +904,15 @@ std::vector<nlohmann::json> eventsOfType(harness::Ctx& ctx, const std::string& t
 }  // namespace
 
 void CheckMatchKey(harness::Ctx& ctx) {
-  eventsReady("m-1", eventsMatch("m-1", 1));
-  eventsReady("m-2", eventsMatch("m-2", 4));
+  hEventsReady("m-1", hEventsMatch("m-1", 1));
+  hEventsReady("m-2", hEventsMatch("m-2", 4));
   for (const std::string kind : {"found", "started"}) {
     for (const std::string match_id : {"m-1", "m-2"}) publishEvent(match_id, kind);
   }
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 4, "four publishEvent calls must produce four records on match.event; the records");
-  const auto keys = ctx.Kafka.Keys(kEventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
   std::map<std::string, int> count;
   std::map<std::string, std::set<int>> partitions;
   for (size_t i = 0; i < keys.size() && i < records.size(); i++) {
@@ -926,53 +926,53 @@ void CheckMatchKey(harness::Ctx& ctx) {
 }
 
 void CheckEventPayload(harness::Ctx& ctx) {
-  eventsMatch("m-1", 1);
+  hEventsMatch("m-1", 1);
   publishEvent("m-1", "found");
   store::abandon("m-1", "allocation_failed");
   publishEvent("m-1", "abandoned");
   ctx.Settle();
-  const auto all = eventsAll(ctx);
+  const auto all = hEventsAll(ctx);
   ctx.Equal(all.size(), 2, "two publishEvent calls must produce two events; the events");
   const nlohmann::json found = all[0];
   const nlohmann::json abandoned = all[1];
-  ctx.Assert(field(found, "type") == "match.found" && field(found, "match_id") == "m-1", "the first event is %s", found.dump());
+  ctx.Assert(hField(found, "type") == "match.found" && hField(found, "match_id") == "m-1", "the first event is %s", found.dump());
   ctx.Assert(found.is_object() && found.value("players", nlohmann::json()) == nlohmann::json({"p1", "p2", "p3"}), "match.found names players %s, expected [\\"p1\\",\\"p2\\",\\"p3\\"]: p2 is in p1's party, and a client nobody names never hears it was matched", found.is_object() ? found.value("players", nlohmann::json()).dump() : "");
   ctx.Assert(found.is_object() && found.contains("server_id") && found["server_id"].is_null(), "before allocation server_id must be null, the event is %s", found.dump());
-  ctx.Assert(field(abandoned, "type") == "match.abandoned" && field(abandoned, "reason") == "allocation_failed", "match.abandoned must carry reason allocation_failed, the event is %s", abandoned.dump());
+  ctx.Assert(hField(abandoned, "type") == "match.abandoned" && hField(abandoned, "reason") == "allocation_failed", "match.abandoned must carry reason allocation_failed, the event is %s", abandoned.dump());
 }
 
 void CheckStartedGate(harness::Ctx& ctx) {
-  eventsMatch("m-1", 1);
+  hEventsMatch("m-1", 1);
   store::setServer("m-1", "gs-m-1");
   store::confirmJoin("m-1", "p1");
   store::confirmJoin("m-1", "p2");
   ctx.Equal(publishEvent("m-1", "started"), false, "p3 has not joined: publishEvent(m-1, started)");
   ctx.Settle();
-  ctx.Equal(eventsOfType(ctx, "match.started").size(), 0, "match.started must not go out while p3 is still connecting; the started events");
-  ctx.Equal(eventsOutbox(ctx).size(), 0, "a refused started is not a failed delivery; the outbox rows");
+  ctx.Equal(hEventsOfType(ctx, "match.started").size(), 0, "match.started must not go out while p3 is still connecting; the started events");
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "a refused started is not a failed delivery; the outbox rows");
   store::confirmJoin("m-1", "p3");
   ctx.Equal(publishEvent("m-1", "started"), true, "with every join confirmed match.started must be published");
   ctx.Settle();
-  const auto started = eventsOfType(ctx, "match.started");
-  ctx.Assert(started.size() == 1 && field(started[0], "server_id") == "gs-m-1", "the topic holds %d match.started events, expected one on gs-m-1", started.size());
+  const auto started = hEventsOfType(ctx, "match.started");
+  ctx.Assert(started.size() == 1 && hField(started[0], "server_id") == "gs-m-1", "the topic holds %d match.started events, expected one on gs-m-1", started.size());
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  eventsMatch("m-1", 1);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  hEventsMatch("m-1", 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = publishEvent("m-1", "found");
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker rejected the produce: without an outbox row the event is gone; the rows");
-  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "m-1" && rows[0].contains("payload") && field(rows[0]["payload"], "type") == "match.found",
+  ctx.Assert(hField(rows[0], "topic") == kHEventsTopic && hField(rows[0], "key") == "m-1" && rows[0].contains("payload") && hField(rows[0]["payload"], "type") == "match.found",
              "the outbox row is %s, expected the topic, the key m-1 and the payload", rows[0].dump());
   ctx.Equal(ok, false, "publishEvent's result after a rejected produce");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishEvent("m-1", "found");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s)", waited);
-  ctx.Equal(eventsOutbox(ctx).size(), 2, "no delivery report within the window; the outbox rows");
+  ctx.Equal(hEventsOutbox(ctx).size(), 2, "no delivery report within the window; the outbox rows");
   ctx.Equal(ok, false, "publishEvent's result without a delivery report");
 }
 `,

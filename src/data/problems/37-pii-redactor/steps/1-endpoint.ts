@@ -906,16 +906,16 @@ import (
 )
 
 const (
-	apiText = "Reach Ada at ada@example.com or 415-555-0132."
-	apiCap  = 256 * 1024
+	kHApiText = "Reach Ada at ada@example.com or 415-555-0132."
+	kHApiCap  = 256 * 1024
 )
 
 // detectorPeer is the NER model's stand-in: every requested type a pattern covers, by its pattern.
-type detectorPeer struct {
+type HDetectorPeer struct {
 	pb.UnimplementedDetectorServer
 }
 
-func (detectorPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
+func (HDetectorPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
 	var found []*pb.EntitySpan
 	for _, s := range spans.Scan(req.GetText(), req.GetEntities()) {
 		found = append(found, &pb.EntitySpan{Start: int32(s.Start), End: int32(s.End), Entity: s.Entity})
@@ -923,101 +923,101 @@ func (detectorPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.Detect
 	return &pb.DetectResponse{Spans: found, ModelVersion: "ner-2026.10"}, nil
 }
 
-func apiClient(ctx *harness.Ctx, detector bool) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx, detector bool) *harness.HTTP {
 	if detector {
-		pb.RegisterDetectorServer(ctx.GRPC.Server(""), detectorPeer{})
+		pb.RegisterDetectorServer(ctx.GRPC.Server(""), HDetectorPeer{})
 	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiRedact(c *harness.HTTP, body map[string]any) *harness.Response {
+func hApiRedact(c *harness.HTTP, body map[string]any) *harness.Response {
 	return c.Post("/v1/redact", body, "X-Tenant-Id", "acme")
 }
 
-func apiBody(r *harness.Response) map[string]any {
+func hApiBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
-func apiLoad(ctx *harness.Ctx, documentID string) *store.Redaction {
+func hApiLoad(ctx *harness.Ctx, documentID string) *store.Redaction {
 	saved, err := store.Load(context.Background(), documentID)
 	ctx.NoError(err, "store.Load(%s)", documentID)
 	return saved
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx, true)
-	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText})
+	c := hApiClient(ctx, true)
+	r := hApiRedact(c, map[string]any{"document_id": "d-1", "text": kHApiText})
 	ctx.Equal(r.Status, 200, "POST /v1/redact (%s)", r.Text())
-	body := apiBody(r)
+	body := hApiBody(r)
 	ctx.Equal(body["redacted_text"], "Reach Ada at [EMAIL] or [PHONE].", "the redacted text")
-	email, phone := strings.Index(apiText, "ada@"), strings.Index(apiText, "415")
+	email, phone := strings.Index(kHApiText, "ada@"), strings.Index(kHApiText, "415")
 	var got [][]any
 	for _, s := range body["spans"].([]any) {
 		m := s.(map[string]any)
 		got = append(got, []any{m["start"], m["end"], m["entity"]})
 	}
 	ctx.Equal(got, [][]any{{float64(email), float64(email + 15), "EMAIL"}, {float64(phone), float64(phone + 12), "PHONE"}}, "the spans")
-	saved := apiLoad(ctx, "d-1")
+	saved := hApiLoad(ctx, "d-1")
 	ctx.Assert(saved != nil && saved.Tenant == "acme" && len(saved.Spans) == 2, "the redaction must be saved for tenant acme, the store holds %+v", saved)
-	r = c.Post("/v1/redact", map[string]any{"document_id": "d-2", "text": apiText})
+	r = c.Post("/v1/redact", map[string]any{"document_id": "d-2", "text": kHApiText})
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckSizeCap(ctx *harness.Ctx) {
-	c := apiClient(ctx, true)
+	c := hApiClient(ctx, true)
 	big := "Call 415-555-0132 now. " + strings.Repeat("lorem ipsum dolor sit amet ", 10000)
-	r := apiRedact(c, map[string]any{"document_id": "d-big", "text": big})
+	r := hApiRedact(c, map[string]any{"document_id": "d-big", "text": big})
 	ctx.Equal(r.Status, 413, "a %d-byte text", len(big))
 	ctx.Assert(!strings.Contains(r.Text(), "415-555-0132") && !strings.Contains(r.Text(), "lorem"), "the 413 body quotes the payload: %.200s. An error body is logged and traced; keep it constant", r.Text())
-	wide := strings.Repeat("\\u00e9", apiCap/2+1)
-	r = apiRedact(c, map[string]any{"document_id": "d-wide", "text": wide})
-	ctx.Equal(r.Status, 413, "a text of %d characters and %d bytes (the cap is in bytes)", apiCap/2+1, len(wide))
-	exact := "x@example.com " + strings.Repeat("lorem ipsum ", 30000)[:apiCap-14]
-	r = apiRedact(c, map[string]any{"document_id": "d-cap", "text": exact, "entities": []string{"EMAIL"}})
+	wide := strings.Repeat("\\u00e9", kHApiCap/2+1)
+	r = hApiRedact(c, map[string]any{"document_id": "d-wide", "text": wide})
+	ctx.Equal(r.Status, 413, "a text of %d characters and %d bytes (the cap is in bytes)", kHApiCap/2+1, len(wide))
+	exact := "x@example.com " + strings.Repeat("lorem ipsum ", 30000)[:kHApiCap-14]
+	r = hApiRedact(c, map[string]any{"document_id": "d-cap", "text": exact, "entities": []string{"EMAIL"}})
 	ctx.Equal(r.Status, 200, "a text of exactly 256 KiB")
 }
 
 func CheckEntityWhitelist(ctx *harness.Ctx) {
-	c := apiClient(ctx, true)
-	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText, "entities": []string{"EMAIL", "PHONE_NUMBER"}})
+	c := hApiClient(ctx, true)
+	r := hApiRedact(c, map[string]any{"document_id": "d-1", "text": kHApiText, "entities": []string{"EMAIL", "PHONE_NUMBER"}})
 	ctx.Equal(r.Status, 400, "an unknown entity type (PHONE_NUMBER) must be rejected, the phone number went back unredacted")
-	r = apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText, "entities": []string{"email"}})
+	r = hApiRedact(c, map[string]any{"document_id": "d-1", "text": kHApiText, "entities": []string{"email"}})
 	ctx.Equal(r.Status, 400, "the entity type email (not EMAIL) must be rejected: ENTITY_TYPES is the whole list")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", "")), 0, "the detector was called for a request with an unknown entity type: reject it first; Detect calls")
-	ctx.Assert(apiLoad(ctx, "d-1") == nil, "a rejected request must not be saved")
-	r = apiRedact(c, map[string]any{"document_id": "d-2", "text": apiText, "entities": []string{"EMAIL"}})
-	ctx.Assert(r.Status == 200 && apiBody(r)["redacted_text"] == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text())
-	r = apiRedact(c, map[string]any{"document_id": "d-3", "text": apiText, "entities": []string{"LOCATION", "ORGANIZATION"}})
+	ctx.Assert(hApiLoad(ctx, "d-1") == nil, "a rejected request must not be saved")
+	r = hApiRedact(c, map[string]any{"document_id": "d-2", "text": kHApiText, "entities": []string{"EMAIL"}})
+	ctx.Assert(r.Status == 200 && hApiBody(r)["redacted_text"] == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text())
+	r = hApiRedact(c, map[string]any{"document_id": "d-3", "text": kHApiText, "entities": []string{"LOCATION", "ORGANIZATION"}})
 	ctx.Equal(r.Status, 200, "a request for LOCATION and ORGANIZATION, both in ENTITY_TYPES (%s)", r.Text())
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	c := apiClient(ctx, false)
-	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": "Ada Lovelace, ada@example.com", "entities": []string{"EMAIL", "PERSON"}})
+	c := hApiClient(ctx, false)
+	r := hApiRedact(c, map[string]any{"document_id": "d-1", "text": "Ada Lovelace, ada@example.com", "entities": []string{"EMAIL", "PERSON"}})
 	ctx.Equal(r.Status, 503, "with the detector down and PERSON requested (no pattern covers it)")
 	ctx.Assert(!strings.Contains(r.Text(), "ada@example.com") && !strings.Contains(r.Text(), "Lovelace"), "the 503 body carries the customer text: %s", r.Text())
-	ctx.Equal(apiBody(r), map[string]any{"error": "detector_unavailable"}, "the 503 body")
-	ctx.Assert(apiLoad(ctx, "d-1") == nil, "a request that could not be redacted must not be saved")
-	r = apiRedact(c, map[string]any{"document_id": "d-2", "text": apiText})
-	ctx.Assert(r.Status == 200 && apiBody(r)["degraded"] == true && apiBody(r)["source"] == "regex", "with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got %d %s", r.Status, r.Text())
+	ctx.Equal(hApiBody(r), map[string]any{"error": "detector_unavailable"}, "the 503 body")
+	ctx.Assert(hApiLoad(ctx, "d-1") == nil, "a request that could not be redacted must not be saved")
+	r = hApiRedact(c, map[string]any{"document_id": "d-2", "text": kHApiText})
+	ctx.Assert(r.Status == 200 && hApiBody(r)["degraded"] == true && hApiBody(r)["source"] == "regex", "with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got %d %s", r.Status, r.Text())
 }
 
 func CheckProcessed(ctx *harness.Ctx) {
-	c := apiClient(ctx, true)
+	c := hApiClient(ctx, true)
 	clean := "Nothing personal in this sentence."
-	r := apiRedact(c, map[string]any{"document_id": "d-clean", "text": clean})
+	r := hApiRedact(c, map[string]any{"document_id": "d-clean", "text": clean})
 	ctx.Equal(r.Status, 200, "a text with nothing to redact (%s)", r.Text())
-	body := apiBody(r)
+	body := hApiBody(r)
 	ctx.Equal(body["status"], "processed", "a text with nothing to redact must answer status processed (%s); the status", r.Text())
 	ctx.Equal(body["spans"], []any{}, "the spans of a text with nothing to redact")
 	ctx.Equal(body["entity_counts"], map[string]any{}, "the entity counts of a text with nothing to redact")
 	ctx.Equal(body["redacted_text"], clean, "the redacted text")
 	ctx.Equal(body["detector_version"], "ner-2026.10", "the answer must name the detector version")
-	saved := apiLoad(ctx, "d-clean")
+	saved := hApiLoad(ctx, "d-clean")
 	ctx.Assert(saved != nil && len(saved.Spans) == 0, "a text with nothing to redact must be saved like any other (the audit read shows it was processed), the store holds %+v", saved)
 }
 `,
@@ -1029,11 +1029,11 @@ func CheckProcessed(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Reach Ada at ada@example.com or 415-555-0132.";
-constexpr size_t kCap = 256 * 1024;
+const std::string kHText = "Reach Ada at ada@example.com or 415-555-0132.";
+constexpr size_t kHCap = 256 * 1024;
 
 // The NER model's stand-in: every requested type a pattern covers, by its pattern.
-class DetectorPeer final : public redactor::Detector::Service {
+class HDetectorPeer final : public redactor::Detector::Service {
  public:
   grpc::Status Detect(grpc::ServerContext*, const redactor::DetectRequest* req, redactor::DetectResponse* out) override {
     for (const spans::Span& s : spans::scan(req->text(), {req->entities().begin(), req->entities().end()})) {
@@ -1047,10 +1047,10 @@ class DetectorPeer final : public redactor::Detector::Service {
   }
 };
 
-harness::HTTP api(harness::Ctx& ctx, bool detector) {
-  static DetectorPeer* peer = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx, bool detector) {
+  static HDetectorPeer* peer = nullptr;
   delete peer;
-  peer = new DetectorPeer;
+  peer = new HDetectorPeer;
   if (detector) ctx.GRPC.Server("")->RegisterService(peer);
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -1059,82 +1059,82 @@ harness::HTTP api(harness::Ctx& ctx, bool detector) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/redact", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
 }
 
-nlohmann::json parsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hParsed(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx, true);
-  auto r = post(c, {{"document_id", "d-1"}, {"text", kText}});
+  auto c = hApi(ctx, true);
+  auto r = hPost(c, {{"document_id", "d-1"}, {"text", kHText}});
   ctx.Equal(r.Status, 200, "POST /v1/redact (%s)", r.Text());
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   ctx.Equal(body.value("redacted_text", ""), "Reach Ada at [EMAIL] or [PHONE].", "the redacted text");
-  const long email = static_cast<long>(kText.find("ada@"));
-  const long phone = static_cast<long>(kText.find("415"));
+  const long email = static_cast<long>(kHText.find("ada@"));
+  const long phone = static_cast<long>(kHText.find("415"));
   nlohmann::json got = nlohmann::json::array();
   for (const auto& s : body.value("spans", nlohmann::json::array())) got.push_back({s.value("start", -1L), s.value("end", -1L), s.value("entity", "")});
   ctx.Equal(got, nlohmann::json({{email, email + 15, "EMAIL"}, {phone, phone + 12, "PHONE"}}), "the spans");
   const auto saved = store::load("d-1");
   ctx.Assert(saved && saved->tenant == "acme" && saved->spans.size() == 2, "the redaction must be saved for tenant acme with its two spans");
-  r = c.Post("/v1/redact", nlohmann::json{{"document_id", "d-2"}, {"text", kText}}.dump(), "Content-Type", "application/json");
+  r = c.Post("/v1/redact", nlohmann::json{{"document_id", "d-2"}, {"text", kHText}}.dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckSizeCap(harness::Ctx& ctx) {
-  auto c = api(ctx, true);
+  auto c = hApi(ctx, true);
   std::string big = "Call 415-555-0132 now. ";
   for (int i = 0; i < 10000; i++) big += "lorem ipsum dolor sit amet ";
-  auto r = post(c, {{"document_id", "d-big"}, {"text", big}});
+  auto r = hPost(c, {{"document_id", "d-big"}, {"text", big}});
   ctx.Equal(r.Status, 413, "a %d-byte text", big.size());
   ctx.Assert(r.Text().find("415-555-0132") == std::string::npos && r.Text().find("lorem") == std::string::npos,
              "the 413 body quotes the payload: %s. An error body is logged and traced; keep it constant", r.Text().substr(0, 200));
   std::string wide;
-  for (size_t i = 0; i <= kCap / 2; i++) wide += "\\xc3\\xa9";
-  r = post(c, {{"document_id", "d-wide"}, {"text", wide}});
-  ctx.Equal(r.Status, 413, "a text of %d characters and %d bytes (the cap is in bytes)", kCap / 2 + 1, wide.size());
+  for (size_t i = 0; i <= kHCap / 2; i++) wide += "\\xc3\\xa9";
+  r = hPost(c, {{"document_id", "d-wide"}, {"text", wide}});
+  ctx.Equal(r.Status, 413, "a text of %d characters and %d bytes (the cap is in bytes)", kHCap / 2 + 1, wide.size());
   std::string filler;
-  while (filler.size() < kCap) filler += "lorem ipsum ";
-  const std::string exact = "x@example.com " + filler.substr(0, kCap - 14);
-  r = post(c, {{"document_id", "d-cap"}, {"text", exact}, {"entities", nlohmann::json::array({"EMAIL"})}});
+  while (filler.size() < kHCap) filler += "lorem ipsum ";
+  const std::string exact = "x@example.com " + filler.substr(0, kHCap - 14);
+  r = hPost(c, {{"document_id", "d-cap"}, {"text", exact}, {"entities", nlohmann::json::array({"EMAIL"})}});
   ctx.Equal(r.Status, 200, "a text of exactly 256 KiB");
 }
 
 void CheckEntityWhitelist(harness::Ctx& ctx) {
-  auto c = api(ctx, true);
-  auto r = post(c, {{"document_id", "d-1"}, {"text", kText}, {"entities", nlohmann::json::array({"EMAIL", "PHONE_NUMBER"})}});
+  auto c = hApi(ctx, true);
+  auto r = hPost(c, {{"document_id", "d-1"}, {"text", kHText}, {"entities", nlohmann::json::array({"EMAIL", "PHONE_NUMBER"})}});
   ctx.Equal(r.Status, 400, "an unknown entity type (PHONE_NUMBER) must be rejected, the phone number went back unredacted");
-  r = post(c, {{"document_id", "d-1"}, {"text", kText}, {"entities", nlohmann::json::array({"email"})}});
+  r = hPost(c, {{"document_id", "d-1"}, {"text", kHText}, {"entities", nlohmann::json::array({"email"})}});
   ctx.Equal(r.Status, 400, "the entity type email (not EMAIL) must be rejected: ENTITY_TYPES is the whole list");
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size(), 0, "the detector was called for a request with an unknown entity type: reject it first; Detect calls");
   ctx.Assert(!store::load("d-1"), "a rejected request must not be saved");
-  r = post(c, {{"document_id", "d-2"}, {"text", kText}, {"entities", nlohmann::json::array({"EMAIL"})}});
-  ctx.Assert(r.Status == 200 && parsed(r).value("redacted_text", "") == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text());
-  r = post(c, {{"document_id", "d-3"}, {"text", kText}, {"entities", nlohmann::json::array({"LOCATION", "ORGANIZATION"})}});
+  r = hPost(c, {{"document_id", "d-2"}, {"text", kHText}, {"entities", nlohmann::json::array({"EMAIL"})}});
+  ctx.Assert(r.Status == 200 && hParsed(r).value("redacted_text", "") == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text());
+  r = hPost(c, {{"document_id", "d-3"}, {"text", kHText}, {"entities", nlohmann::json::array({"LOCATION", "ORGANIZATION"})}});
   ctx.Equal(r.Status, 200, "a request for LOCATION and ORGANIZATION, both in ENTITY_TYPES (%s)", r.Text());
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  auto c = api(ctx, false);
-  auto r = post(c, {{"document_id", "d-1"}, {"text", "Ada Lovelace, ada@example.com"}, {"entities", nlohmann::json::array({"EMAIL", "PERSON"})}});
+  auto c = hApi(ctx, false);
+  auto r = hPost(c, {{"document_id", "d-1"}, {"text", "Ada Lovelace, ada@example.com"}, {"entities", nlohmann::json::array({"EMAIL", "PERSON"})}});
   ctx.Equal(r.Status, 503, "with the detector down and PERSON requested (no pattern covers it)");
   ctx.Assert(r.Text().find("ada@example.com") == std::string::npos && r.Text().find("Lovelace") == std::string::npos, "the 503 body carries the customer text: %s", r.Text());
-  ctx.Equal(parsed(r), nlohmann::json({{"error", "detector_unavailable"}}), "the 503 body");
+  ctx.Equal(hParsed(r), nlohmann::json({{"error", "detector_unavailable"}}), "the 503 body");
   ctx.Assert(!store::load("d-1"), "a request that could not be redacted must not be saved");
-  r = post(c, {{"document_id", "d-2"}, {"text", kText}});
-  ctx.Assert(r.Status == 200 && parsed(r).value("degraded", false) && parsed(r).value("source", "") == "regex",
+  r = hPost(c, {{"document_id", "d-2"}, {"text", kHText}});
+  ctx.Assert(r.Status == 200 && hParsed(r).value("degraded", false) && hParsed(r).value("source", "") == "regex",
              "with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got %d %s", r.Status, r.Text());
 }
 
 void CheckProcessed(harness::Ctx& ctx) {
-  auto c = api(ctx, true);
+  auto c = hApi(ctx, true);
   const std::string clean = "Nothing personal in this sentence.";
-  const auto r = post(c, {{"document_id", "d-clean"}, {"text", clean}});
+  const auto r = hPost(c, {{"document_id", "d-clean"}, {"text", clean}});
   ctx.Equal(r.Status, 200, "a text with nothing to redact (%s)", r.Text());
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   ctx.Equal(body.value("status", ""), "processed", "a text with nothing to redact must answer status processed (%s); the status", r.Text());
   ctx.Equal(body.value("spans", nlohmann::json()), nlohmann::json::array(), "the spans of a text with nothing to redact");
   ctx.Equal(body.value("entity_counts", nlohmann::json()), nlohmann::json::object(), "the entity counts of a text with nothing to redact");

@@ -802,23 +802,23 @@ import (
 	"leetbuild/harness"
 )
 
-func validBody() map[string]any {
+func hValidBody() map[string]any {
 	return map[string]any{"recipient": "ana@example.com", "template_id": "welcome", "subject": "Welcome, Ana", "variables": map[string]string{"first_name": "Ana"}}
 }
 
-func withField(name string, value any) map[string]any {
-	body := validBody()
+func hWithField(name string, value any) map[string]any {
+	body := hValidBody()
 	body[name] = value
 	return body
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func post(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	header := []string{"X-Tenant-Id", tenant}
 	if key != "" {
 		header = append(header, "Idempotency-Key", key)
@@ -826,7 +826,7 @@ func post(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Res
 	return c.Post("/v1/emails", body, header...)
 }
 
-func idOf(r *harness.Response) string {
+func hIdOf(r *harness.Response) string {
 	var body struct {
 		MessageID string \`json:"message_id"\`
 	}
@@ -834,76 +834,76 @@ func idOf(r *harness.Response) string {
 	return body.MessageID
 }
 
-func queue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("mail:queue", 0, -1) }
+func hQueue(ctx *harness.Ctx) []string { return ctx.Redis.LRange("mail:queue", 0, -1) }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, validBody(), "k-1", "t-1")
+	c := hApi(ctx)
+	r := hPost(c, hValidBody(), "k-1", "t-1")
 	ctx.Equal(r.Status, 202, "POST /v1/emails (%s)", r.Text())
-	messageID := idOf(r)
+	messageID := hIdOf(r)
 	ctx.Assert(messageID != "", "the 202 must carry the message_id, got %s", r.Text())
 	message := ctx.Redis.HGetAll("mail:msg:" + messageID)
 	ctx.Assert(message["state"] == "queued" && message["recipient"] == "ana@example.com" && message["tenant"] == "t-1", "mail:msg:%s holds %v, expected a queued message to ana@example.com for t-1", messageID, message)
-	ctx.Equal(queue(ctx), []string{messageID}, "mail:queue")
+	ctx.Equal(hQueue(ctx), []string{messageID}, "mail:queue")
 }
 
 func CheckSuppressionFirst(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	ctx.Redis.Do("SADD", "mail:suppressed", "gone@example.com")
-	r := post(c, withField("recipient", "gone@example.com"), "k-1", "t-1")
+	r := hPost(c, hWithField("recipient", "gone@example.com"), "k-1", "t-1")
 	ctx.Equal(r.Status, 409, "a send to a suppressed recipient")
-	ctx.Assert(len(queue(ctx)) == 0, "the send was refused with 409, yet mail:queue holds %q: the relay will mail the customer who unsubscribed. Ask the gate before enqueueing", queue(ctx))
+	ctx.Assert(len(hQueue(ctx)) == 0, "the send was refused with 409, yet mail:queue holds %q: the relay will mail the customer who unsubscribed. Ask the gate before enqueueing", hQueue(ctx))
 	var codes []int
 	for n := 0; n < 6; n++ {
-		codes = append(codes, post(c, withField("recipient", "busy@example.com"), fmt.Sprintf("r-%d", n), "t-1").Status)
+		codes = append(codes, hPost(c, hWithField("recipient", "busy@example.com"), fmt.Sprintf("r-%d", n), "t-1").Status)
 	}
 	ctx.Equal(codes, []int{202, 202, 202, 202, 202, 429}, "six sends to one recipient within a minute (five 202 and a 429)")
-	ctx.Equal(len(queue(ctx)), 5, "after five admitted sends and one refused, the messages on mail:queue (a refused send must not be queued)")
+	ctx.Equal(len(hQueue(ctx)), 5, "after five admitted sends and one refused, the messages on mail:queue (a refused send must not be queued)")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := post(c, validBody(), "k-1", "t-1")
+	c := hApi(ctx)
+	first := hPost(c, hValidBody(), "k-1", "t-1")
 	ctx.Equal(first.Status, 202, "the first send (%s)", first.Text())
-	replay := post(c, validBody(), "k-1", "t-1")
-	ctx.Assert(replay.Status == 202 && idOf(replay) == idOf(first), "a retry with the same Idempotency-Key must answer the first message id: first %s, retry %d %s", first.Text(), replay.Status, replay.Text())
-	ctx.Equal(len(queue(ctx)), 1, "a retry with the same Idempotency-Key must not queue a second copy; the messages on mail:queue")
-	other := post(c, validBody(), "k-1", "t-2")
-	ctx.Assert(other.Status == 202 && idOf(other) != idOf(first), "another tenant using the same key is another send, got %d %s", other.Status, other.Text())
-	missing := post(c, validBody(), "", "t-1")
+	replay := hPost(c, hValidBody(), "k-1", "t-1")
+	ctx.Assert(replay.Status == 202 && hIdOf(replay) == hIdOf(first), "a retry with the same Idempotency-Key must answer the first message id: first %s, retry %d %s", first.Text(), replay.Status, replay.Text())
+	ctx.Equal(len(hQueue(ctx)), 1, "a retry with the same Idempotency-Key must not queue a second copy; the messages on mail:queue")
+	other := hPost(c, hValidBody(), "k-1", "t-2")
+	ctx.Assert(other.Status == 202 && hIdOf(other) != hIdOf(first), "another tenant using the same key is another send, got %d %s", other.Status, other.Text())
+	missing := hPost(c, hValidBody(), "", "t-1")
 	ctx.Equal(missing.Status, 400, "a send without Idempotency-Key")
-	ctx.Equal(len(queue(ctx)), 2, "the two distinct sends on mail:queue")
+	ctx.Equal(len(hQueue(ctx)), 2, "the two distinct sends on mail:queue")
 	ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com")
-	late := post(c, validBody(), "k-1", "t-1")
-	ctx.Assert(late.Status == 202 && idOf(late) == idOf(first), "ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered %d %s: the first message is already queued, so the retry must answer its id (202) before the gate is asked", late.Status, late.Text())
+	late := hPost(c, hValidBody(), "k-1", "t-1")
+	ctx.Assert(late.Status == 202 && hIdOf(late) == hIdOf(first), "ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered %d %s: the first message is already queued, so the retry must answer its id (202) before the gate is asked", late.Status, late.Text())
 }
 
 func CheckValidateTemplateVariables(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, withField("template_id", "promo_blast"), "k-1", "t-1")
+	c := hApi(ctx)
+	r := hPost(c, hWithField("template_id", "promo_blast"), "k-1", "t-1")
 	ctx.Equal(r.Status, 400, "an unknown template_id")
-	r = post(c, withField("variables", map[string]string{"note": strings.Repeat("x", 9000)}), "k-2", "t-1")
+	r = hPost(c, hWithField("variables", map[string]string{"note": strings.Repeat("x", 9000)}), "k-2", "t-1")
 	ctx.Equal(r.Status, 413, "9 KB of variables")
-	r = post(c, withField("variables", map[string]string{strings.Repeat("n", 9000): ""}), "k-4", "t-1")
+	r = hPost(c, hWithField("variables", map[string]string{strings.Repeat("n", 9000): ""}), "k-4", "t-1")
 	ctx.Equal(r.Status, 413, "a 9000-byte variable name with an empty value (the cap counts names and values)")
-	r = post(c, withField("variables", map[string]string{"note": strings.Repeat("é", 4500)}), "k-5", "t-1")
+	r = hPost(c, hWithField("variables", map[string]string{"note": strings.Repeat("é", 4500)}), "k-5", "t-1")
 	ctx.Equal(r.Status, 413, "4500 'é' (4500 characters, 9000 bytes of UTF-8; the cap counts bytes, not characters)")
-	ctx.Assert(len(queue(ctx)) == 0, "refused sends were queued: %q", queue(ctx))
-	r = post(c, withField("variables", map[string]string{"note": strings.Repeat("x", 8192-4)}), "k-3", "t-1")
+	ctx.Assert(len(hQueue(ctx)) == 0, "refused sends were queued: %q", hQueue(ctx))
+	r = hPost(c, hWithField("variables", map[string]string{"note": strings.Repeat("x", 8192-4)}), "k-3", "t-1")
 	ctx.Equal(r.Status, 202, "exactly 8 KiB of variables (name and value)")
-	ctx.Equal(len(queue(ctx)), 1, "the one valid send on mail:queue")
+	ctx.Equal(len(hQueue(ctx)), 1, "the one valid send on mail:queue")
 }
 
 func CheckRejectCrlf(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, withField("subject", "Welcome\\r\\nBcc: list@example.net"), "k-1", "t-1")
+	c := hApi(ctx)
+	r := hPost(c, hWithField("subject", "Welcome\\r\\nBcc: list@example.net"), "k-1", "t-1")
 	ctx.Equal(r.Status, 400, "a subject with CRLF (the relay writes it into a header line)")
-	r = post(c, withField("subject", "Welcome\\rBcc: list@example.net"), "k-4", "t-1")
+	r = hPost(c, hWithField("subject", "Welcome\\rBcc: list@example.net"), "k-4", "t-1")
 	ctx.Equal(r.Status, 400, "a subject with a bare carriage return (a lone \\\\r ends a header line too)")
-	r = post(c, withField("variables", map[string]string{"first_name": "Ana\\nBcc: list@example.net"}), "k-2", "t-1")
+	r = hPost(c, hWithField("variables", map[string]string{"first_name": "Ana\\nBcc: list@example.net"}), "k-2", "t-1")
 	ctx.Equal(r.Status, 400, "a variable value with a line feed")
-	ctx.Assert(len(queue(ctx)) == 0, "sends carrying header injections were queued: %q", queue(ctx))
-	r = post(c, validBody(), "k-3", "t-1")
+	ctx.Assert(len(hQueue(ctx)) == 0, "sends carrying header injections were queued: %q", hQueue(ctx))
+	r = hPost(c, hValidBody(), "k-3", "t-1")
 	ctx.Equal(r.Status, 202, "a clean send (%s)", r.Text())
 }
 `,
@@ -916,17 +916,17 @@ func CheckRejectCrlf(ctx *harness.Ctx) {
 
 namespace {
 
-nlohmann::json validBody() {
+nlohmann::json hValidBody() {
   return {{"recipient", "ana@example.com"}, {"template_id", "welcome"}, {"subject", "Welcome, Ana"}, {"variables", {{"first_name", "Ana"}}}};
 }
 
-nlohmann::json withField(const std::string& name, const nlohmann::json& value) {
-  nlohmann::json body = validBody();
+nlohmann::json hWithField(const std::string& name, const nlohmann::json& value) {
+  nlohmann::json body = hValidBody();
   body[name] = value;
   return body;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -934,92 +934,92 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& key, const std::string& tenant) {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body, const std::string& key, const std::string& tenant) {
   if (key.empty()) return c.Post("/v1/emails", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/emails", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-std::string idOf(const harness::Response& r) {
+std::string hIdOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("message_id", "") : "";
 }
 
-std::vector<std::string> queue(harness::Ctx& ctx) { return ctx.Redis.LRange("mail:queue", 0, -1); }
+std::vector<std::string> hQueue(harness::Ctx& ctx) { return ctx.Redis.LRange("mail:queue", 0, -1); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, validBody(), "k-1", "t-1");
+  auto c = hApi(ctx);
+  const auto r = hPost(c, hValidBody(), "k-1", "t-1");
   ctx.Equal(r.Status, 202, "POST /v1/emails (%s)", r.Text());
-  const std::string message_id = idOf(r);
+  const std::string message_id = hIdOf(r);
   ctx.Assert(!message_id.empty(), "the 202 must carry the message_id, got %s", r.Text());
   auto message = ctx.Redis.HGetAll("mail:msg:" + message_id);
   ctx.Assert(message["state"] == "queued" && message["recipient"] == "ana@example.com" && message["tenant"] == "t-1",
              "mail:msg:%s holds %v, expected a queued message to ana@example.com for t-1", message_id, message);
-  ctx.Equal(queue(ctx), std::vector<std::string>{message_id}, "mail:queue");
+  ctx.Equal(hQueue(ctx), std::vector<std::string>{message_id}, "mail:queue");
 }
 
 void CheckSuppressionFirst(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   ctx.Redis.Do("SADD", "mail:suppressed", "gone@example.com");
-  const auto r = post(c, withField("recipient", "gone@example.com"), "k-1", "t-1");
+  const auto r = hPost(c, hWithField("recipient", "gone@example.com"), "k-1", "t-1");
   ctx.Equal(r.Status, 409, "a send to a suppressed recipient");
-  ctx.Assert(queue(ctx).empty(), "the send was refused with 409, yet mail:queue holds %q: the relay will mail the customer who unsubscribed. Ask the gate before enqueueing", queue(ctx));
+  ctx.Assert(hQueue(ctx).empty(), "the send was refused with 409, yet mail:queue holds %q: the relay will mail the customer who unsubscribed. Ask the gate before enqueueing", hQueue(ctx));
   std::vector<int> codes;
-  for (int n = 0; n < 6; n++) codes.push_back(post(c, withField("recipient", "busy@example.com"), "r-" + std::to_string(n), "t-1").Status);
+  for (int n = 0; n < 6; n++) codes.push_back(hPost(c, hWithField("recipient", "busy@example.com"), "r-" + std::to_string(n), "t-1").Status);
   ctx.Equal(codes, std::vector<int>{202, 202, 202, 202, 202, 429}, "six sends to one recipient within a minute (five 202 and a 429)");
-  ctx.Equal(queue(ctx).size(), 5, "after five admitted sends and one refused, the messages on mail:queue (a refused send must not be queued)");
+  ctx.Equal(hQueue(ctx).size(), 5, "after five admitted sends and one refused, the messages on mail:queue (a refused send must not be queued)");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, validBody(), "k-1", "t-1");
+  auto c = hApi(ctx);
+  const auto first = hPost(c, hValidBody(), "k-1", "t-1");
   ctx.Equal(first.Status, 202, "the first send (%s)", first.Text());
-  const auto replay = post(c, validBody(), "k-1", "t-1");
-  ctx.Assert(replay.Status == 202 && idOf(replay) == idOf(first), "a retry with the same Idempotency-Key must answer the first message id: first %s, retry %d %s",
+  const auto replay = hPost(c, hValidBody(), "k-1", "t-1");
+  ctx.Assert(replay.Status == 202 && hIdOf(replay) == hIdOf(first), "a retry with the same Idempotency-Key must answer the first message id: first %s, retry %d %s",
              first.Text(), replay.Status, replay.Text());
-  ctx.Equal(queue(ctx).size(), 1, "a retry with the same Idempotency-Key must not queue a second copy; the messages on mail:queue");
-  const auto other = post(c, validBody(), "k-1", "t-2");
-  ctx.Assert(other.Status == 202 && idOf(other) != idOf(first), "another tenant using the same key is another send, got %d %s", other.Status, other.Text());
-  const auto missing = post(c, validBody(), "", "t-1");
+  ctx.Equal(hQueue(ctx).size(), 1, "a retry with the same Idempotency-Key must not queue a second copy; the messages on mail:queue");
+  const auto other = hPost(c, hValidBody(), "k-1", "t-2");
+  ctx.Assert(other.Status == 202 && hIdOf(other) != hIdOf(first), "another tenant using the same key is another send, got %d %s", other.Status, other.Text());
+  const auto missing = hPost(c, hValidBody(), "", "t-1");
   ctx.Equal(missing.Status, 400, "a send without Idempotency-Key");
-  ctx.Equal(queue(ctx).size(), 2, "the two distinct sends on mail:queue");
+  ctx.Equal(hQueue(ctx).size(), 2, "the two distinct sends on mail:queue");
   ctx.Redis.Do("SADD", "mail:suppressed", "ana@example.com");
-  const auto late = post(c, validBody(), "k-1", "t-1");
-  ctx.Assert(late.Status == 202 && idOf(late) == idOf(first),
+  const auto late = hPost(c, hValidBody(), "k-1", "t-1");
+  ctx.Assert(late.Status == 202 && hIdOf(late) == hIdOf(first),
              "ana unsubscribed after the first send was queued, and a retry with its Idempotency-Key answered %d %s: the first message is already queued, so the retry must answer its id (202) before the gate is asked",
              late.Status, late.Text());
 }
 
 void CheckValidateTemplateVariables(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, withField("template_id", "promo_blast"), "k-1", "t-1");
+  auto c = hApi(ctx);
+  auto r = hPost(c, hWithField("template_id", "promo_blast"), "k-1", "t-1");
   ctx.Equal(r.Status, 400, "an unknown template_id");
-  r = post(c, withField("variables", {{"note", std::string(9000, 'x')}}), "k-2", "t-1");
+  r = hPost(c, hWithField("variables", {{"note", std::string(9000, 'x')}}), "k-2", "t-1");
   ctx.Equal(r.Status, 413, "9 KB of variables");
-  r = post(c, withField("variables", {{std::string(9000, 'n'), ""}}), "k-4", "t-1");
+  r = hPost(c, hWithField("variables", {{std::string(9000, 'n'), ""}}), "k-4", "t-1");
   ctx.Equal(r.Status, 413, "a 9000-byte variable name with an empty value (the cap counts names and values)");
   std::string accents;
   for (int n = 0; n < 4500; n++) accents += "é";
-  r = post(c, withField("variables", {{"note", accents}}), "k-5", "t-1");
+  r = hPost(c, hWithField("variables", {{"note", accents}}), "k-5", "t-1");
   ctx.Equal(r.Status, 413, "4500 'é' (4500 characters, 9000 bytes of UTF-8; the cap counts bytes, not characters)");
-  ctx.Assert(queue(ctx).empty(), "refused sends were queued: %q", queue(ctx));
-  r = post(c, withField("variables", {{"note", std::string(8192 - 4, 'x')}}), "k-3", "t-1");
+  ctx.Assert(hQueue(ctx).empty(), "refused sends were queued: %q", hQueue(ctx));
+  r = hPost(c, hWithField("variables", {{"note", std::string(8192 - 4, 'x')}}), "k-3", "t-1");
   ctx.Equal(r.Status, 202, "exactly 8 KiB of variables (name and value)");
-  ctx.Equal(queue(ctx).size(), 1, "the one valid send on mail:queue");
+  ctx.Equal(hQueue(ctx).size(), 1, "the one valid send on mail:queue");
 }
 
 void CheckRejectCrlf(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, withField("subject", "Welcome\\r\\nBcc: list@example.net"), "k-1", "t-1");
+  auto c = hApi(ctx);
+  auto r = hPost(c, hWithField("subject", "Welcome\\r\\nBcc: list@example.net"), "k-1", "t-1");
   ctx.Equal(r.Status, 400, "a subject with CRLF (the relay writes it into a header line)");
-  r = post(c, withField("subject", "Welcome\\rBcc: list@example.net"), "k-4", "t-1");
+  r = hPost(c, hWithField("subject", "Welcome\\rBcc: list@example.net"), "k-4", "t-1");
   ctx.Equal(r.Status, 400, "a subject with a bare carriage return (a lone \\\\r ends a header line too)");
-  r = post(c, withField("variables", {{"first_name", "Ana\\nBcc: list@example.net"}}), "k-2", "t-1");
+  r = hPost(c, hWithField("variables", {{"first_name", "Ana\\nBcc: list@example.net"}}), "k-2", "t-1");
   ctx.Equal(r.Status, 400, "a variable value with a line feed");
-  ctx.Assert(queue(ctx).empty(), "sends carrying header injections were queued: %q", queue(ctx));
-  r = post(c, validBody(), "k-3", "t-1");
+  ctx.Assert(hQueue(ctx).empty(), "sends carrying header injections were queued: %q", hQueue(ctx));
+  r = hPost(c, hValidBody(), "k-3", "t-1");
   ctx.Equal(r.Status, 202, "a clean send (%s)", r.Text());
 }
 `,

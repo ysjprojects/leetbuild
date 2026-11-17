@@ -752,28 +752,28 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "dataset.event"
+const kHEventsTopic = "dataset.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsSetup(ctx *harness.Ctx) {
+func hEventsSetup(ctx *harness.Ctx) {
 	rows := "1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n"
-	sha := store.PutObject(eventsBg, rows)
+	sha := store.PutObject(hEventsBg, rows)
 	for _, dataset := range []string{"imdb-reviews", "wiki-text"} {
 		for _, version := range []string{"2026-01", "2026-02"} {
-			err := store.PutVersion(eventsBg, &store.VersionRecord{Tenant: "t1", Dataset: dataset, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: int64(len(rows)), RowCount: 3, Status: "validated"})
+			err := store.PutVersion(hEventsBg, &store.VersionRecord{Tenant: "t1", Dataset: dataset, Version: version, ContentSHA256: sha, License: "mit", Owner: "team-lm", SizeBytes: int64(len(rows)), RowCount: 3, Status: "validated"})
 			ctx.NoError(err, "seeding %s@%s", dataset, version)
 		}
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, dataset, version string) bool {
-	ok, err := publishPromotion(eventsBg, dataset, version, "alice")
+func hEventsPublish(ctx *harness.Ctx, dataset, version string) bool {
+	ok, err := publishPromotion(hEventsBg, dataset, version, "alice")
 	ctx.NoError(err, "publishPromotion(%s, %s)", dataset, version)
 	return ok
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var rows []map[string]any
 	for _, raw := range ctx.Redis.LRange("outbox", 0, -1) {
 		var row map[string]any
@@ -783,27 +783,27 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 	return rows
 }
 
-func eventsLatest(ctx *harness.Ctx) string {
-	latest, err := pointer.Latest(eventsBg, "imdb-reviews")
+func hEventsLatest(ctx *harness.Ctx) string {
+	latest, err := pointer.Latest(hEventsBg, "imdb-reviews")
 	ctx.NoError(err, "reading the latest version")
 	return latest
 }
 
 func CheckKeyByDataset(ctx *harness.Ctx) {
-	eventsSetup(ctx)
+	hEventsSetup(ctx)
 	for _, pair := range [][2]string{{"imdb-reviews", "2026-01"}, {"wiki-text", "2026-01"}, {"imdb-reviews", "2026-02"}} {
-		ctx.Assert(eventsPublish(ctx, pair[0], pair[1]), "promoting %s@%s with a healthy broker must return true", pair[0], pair[1])
+		ctx.Assert(hEventsPublish(ctx, pair[0], pair[1]), "promoting %s@%s with a healthy broker must return true", pair[0], pair[1])
 	}
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three promotions; the records on %s", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"imdb-reviews", "wiki-text", "imdb-reviews"}, "the records must be keyed by the dataset names (one dataset's promotions must share a partition to stay in order); the keys")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three promotions; the records on %s", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"imdb-reviews", "wiki-text", "imdb-reviews"}, "the records must be keyed by the dataset names (one dataset's promotions must share a partition to stay in order); the keys")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both imdb-reviews events must land on one partition")
 }
 
 func CheckNoContentSample(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	eventsPublish(ctx, "imdb-reviews", "2026-01")
-	records := ctx.Kafka.Records(eventsTopic)
+	hEventsSetup(ctx)
+	hEventsPublish(ctx, "imdb-reviews", "2026-01")
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one promotion; the records")
 	raw := string(records[0].Value)
 	var payload map[string]any
@@ -814,41 +814,41 @@ func CheckNoContentSample(ctx *harness.Ctx) {
 	ctx.Equal(payload["dataset"], "imdb-reviews", "the event's dataset")
 	ctx.Equal(payload["version"], "2026-01", "the event's version")
 	ctx.Equal(payload["actor"], "alice", "the event's actor")
-	ctx.Equal(payload["content_sha256"], store.Version(eventsBg, "imdb-reviews", "2026-01").ContentSHA256, "the event's content hash")
+	ctx.Equal(payload["content_sha256"], store.Version(hEventsBg, "imdb-reviews", "2026-01").ContentSHA256, "the event's content hash")
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	atCommit := ctx.Redis.After("dataset:imdb-reviews:latest", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	ctx.Assert(eventsPublish(ctx, "imdb-reviews", "2026-01"), "a promotion with a healthy broker must return true")
+	hEventsSetup(ctx)
+	atCommit := ctx.Redis.After("dataset:imdb-reviews:latest", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	ctx.Assert(hEventsPublish(ctx, "imdb-reviews", "2026-01"), "a promotion with a healthy broker must return true")
 	ctx.Assert(atCommit.Fired, "publishPromotion never moved dataset:imdb-reviews:latest")
 	ctx.Equal(atCommit.Result, 0, "when the pointer moved the topic already held events: a consumer could read the event and find latest still on the old version. Promote, then produce; events at the commit")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the promotion; the records")
-	ctx.Equal(eventsLatest(ctx), "2026-01", "the latest version")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the promotion; the records")
+	ctx.Equal(hEventsLatest(ctx), "2026-01", "the latest version")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	eventsSetup(ctx)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, "imdb-reviews", "2026-01")
-	rows := eventsOutbox(ctx)
+	hEventsSetup(ctx)
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hEventsPublish(ctx, "imdb-reviews", "2026-01")
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without a row the consumers never hear of the promotion; the outbox rows")
 	payload, _ := rows[0]["payload"].(map[string]any)
-	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "imdb-reviews" && payload != nil && payload["version"] == "2026-01", "the outbox row is %v, expected the topic, the key imdb-reviews and the payload", rows[0])
+	ctx.Assert(rows[0]["topic"] == kHEventsTopic && rows[0]["key"] == "imdb-reviews" && payload != nil && payload["version"] == "2026-01", "the outbox row is %v, expected the topic, the key imdb-reviews and the payload", rows[0])
 	ctx.Equal(ok, false, "publishPromotion after a failed delivery returned")
-	ctx.Equal(eventsLatest(ctx), "2026-01", "the promotion itself must stand when only the event failed; the latest")
-	ctx.Assert(eventsPublish(ctx, "imdb-reviews", "2026-02"), "with the broker healthy again the promotion must return true")
-	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered event must not add an outbox row; the outbox rows")
-	ctx.Kafka.Stall(eventsTopic)
+	ctx.Equal(hEventsLatest(ctx), "2026-01", "the promotion itself must stand when only the event failed; the latest")
+	ctx.Assert(hEventsPublish(ctx, "imdb-reviews", "2026-02"), "with the broker healthy again the promotion must return true")
+	ctx.Equal(len(hEventsOutbox(ctx)), 1, "a delivered event must not add an outbox row; the outbox rows")
+	ctx.Kafka.Stall(kHEventsTopic)
 	before := ctx.Clock.Now()
-	stalled := eventsPublish(ctx, "wiki-text", "2026-01")
+	stalled := hEventsPublish(ctx, "wiki-text", "2026-01")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Kafka.Resume(eventsTopic)
+	ctx.Kafka.Resume(kHEventsTopic)
 	ctx.Assert(waited <= 5.5, "with the broker stalled, publishPromotion waited %.1f s for the delivery, expected at most deliveryTimeout = 5 s", waited)
-	after := eventsOutbox(ctx)
+	after := hEventsOutbox(ctx)
 	ctx.Assert(len(after) == 2 && after[1]["key"] == "wiki-text", "with the broker stalled past the 5 s window the write never succeeded and the outbox holds %v: a write that times out must add the row too", after)
 	ctx.Equal(stalled, false, "publishPromotion with the broker stalled returned")
-	latest, err := pointer.Latest(eventsBg, "wiki-text")
+	latest, err := pointer.Latest(hEventsBg, "wiki-text")
 	ctx.NoError(err, "reading the latest wiki-text version")
 	ctx.Equal(latest, "2026-01", "the promotion itself must stand when the broker is stalled; the latest")
 }
@@ -864,9 +864,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "dataset.event";
+const std::string kHTopic = "dataset.event";
 
-void setup() {
+void hSetup() {
   const std::string rows = "1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n";
   const std::string sha = store::putObject(rows);
   for (const std::string dataset : {"imdb-reviews", "wiki-text"}) {
@@ -886,7 +886,7 @@ void setup() {
   }
 }
 
-std::vector<json> outbox(harness::Ctx& ctx) {
+std::vector<json> hOutbox(harness::Ctx& ctx) {
   std::vector<json> rows;
   for (const auto& raw : ctx.Redis.LRange("outbox", 0, -1)) rows.push_back(json::parse(raw));
   return rows;
@@ -895,20 +895,20 @@ std::vector<json> outbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckKeyByDataset(harness::Ctx& ctx) {
-  setup();
+  hSetup();
   for (const auto& [dataset, version] : std::vector<std::pair<std::string, std::string>>{{"imdb-reviews", "2026-01"}, {"wiki-text", "2026-01"}, {"imdb-reviews", "2026-02"}}) {
     ctx.Assert(publishPromotion(dataset, version, "alice"), "promoting %s@%s with a healthy broker must return true", dataset, version);
   }
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three promotions; the records on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"imdb-reviews", "wiki-text", "imdb-reviews"}, "the records must be keyed by the dataset names (one dataset's promotions must share a partition to stay in order); the keys");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 3, "three promotions; the records on %s", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"imdb-reviews", "wiki-text", "imdb-reviews"}, "the records must be keyed by the dataset names (one dataset's promotions must share a partition to stay in order); the keys");
   ctx.Equal(records[0].Partition, records[2].Partition, "both imdb-reviews events must land on one partition");
 }
 
 void CheckNoContentSample(harness::Ctx& ctx) {
-  setup();
+  hSetup();
   publishPromotion("imdb-reviews", "2026-01", "alice");
-  const auto records = ctx.Kafka.Records(kTopic);
+  const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 1, "one promotion; the records");
   const std::string raw = records[0].Value.value_or("");
   const json payload = json::parse(raw, nullptr, false);
@@ -923,35 +923,35 @@ void CheckNoContentSample(harness::Ctx& ctx) {
 }
 
 void CheckPublishAfterCommit(harness::Ctx& ctx) {
-  setup();
+  hSetup();
   int atCommit = -1;
-  ctx.Redis.After("dataset:imdb-reviews:latest", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
+  ctx.Redis.After("dataset:imdb-reviews:latest", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kHTopic).size()); });
   ctx.Assert(publishPromotion("imdb-reviews", "2026-01", "alice"), "a promotion with a healthy broker must return true");
   ctx.Assert(atCommit >= 0, "publishPromotion never moved dataset:imdb-reviews:latest");
   ctx.Equal(atCommit, 0, "when the pointer moved the topic already held events: a consumer could read the event and find latest still on the old version. Promote, then produce; events at the commit");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the event must still be produced after the promotion; the records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "the event must still be produced after the promotion; the records");
   ctx.Equal(pointer::latest("imdb-reviews"), "2026-01", "the latest version");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  setup();
-  ctx.Kafka.FailNext(kTopic, 1);
+  hSetup();
+  ctx.Kafka.FailNext(kHTopic, 1);
   const bool ok = publishPromotion("imdb-reviews", "2026-01", "alice");
-  const auto rows = outbox(ctx);
+  const auto rows = hOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without a row the consumers never hear of the promotion; the outbox rows");
-  ctx.Assert(rows[0].value("topic", "") == kTopic && rows[0].value("key", "") == "imdb-reviews" && rows[0]["payload"].value("version", "") == "2026-01",
+  ctx.Assert(rows[0].value("topic", "") == kHTopic && rows[0].value("key", "") == "imdb-reviews" && rows[0]["payload"].value("version", "") == "2026-01",
              "the outbox row is %s, expected the topic, the key imdb-reviews and the payload", rows[0].dump());
   ctx.Equal(ok, false, "publishPromotion after a failed delivery returned");
   ctx.Equal(pointer::latest("imdb-reviews"), "2026-01", "the promotion itself must stand when only the event failed; the latest");
   ctx.Assert(publishPromotion("imdb-reviews", "2026-02", "alice"), "with the broker healthy again the promotion must return true");
-  ctx.Equal(outbox(ctx).size(), 1, "a delivered event must not add an outbox row; the outbox rows");
-  ctx.Kafka.Stall(kTopic);
+  ctx.Equal(hOutbox(ctx).size(), 1, "a delivered event must not add an outbox row; the outbox rows");
+  ctx.Kafka.Stall(kHTopic);
   const auto before = ctx.Clock.Now();
   const bool stalled = publishPromotion("wiki-text", "2026-01", "alice");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Kafka.Resume(kTopic);
+  ctx.Kafka.Resume(kHTopic);
   ctx.Assert(waited <= 5.5, "with the broker stalled, publishPromotion waited %v s for the delivery report, expected at most kDeliveryTimeoutMs = 5000", waited);
-  const auto after = outbox(ctx);
+  const auto after = hOutbox(ctx);
   ctx.Assert(after.size() == 2 && after[1].value("key", "") == "wiki-text",
              "with the broker stalled past the 5 s window no delivery report came and the outbox holds %s: a missing report must write the row too", json(after).dump());
   ctx.Equal(stalled, false, "publishPromotion with the broker stalled returned");

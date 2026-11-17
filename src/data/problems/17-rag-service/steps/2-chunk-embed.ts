@@ -1030,14 +1030,14 @@ import (
 	"leetbuild/harness"
 )
 
-const chunkDoc = "rag:doc:t1:handbook:3"
+const kHChunkDoc = "rag:doc:t1:handbook:3"
 
-// embedderPeer is the stand-in embedder: one rag/embed vector per text.
-type embedderPeer struct {
+// HEmbedderPeer is the stand-in embedder: one rag/embed vector per text.
+type HEmbedderPeer struct {
 	pb.UnimplementedEmbedderServer
 }
 
-func (embedderPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedReply, error) {
+func (HEmbedderPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedReply, error) {
 	out := &pb.EmbedReply{Model: embed.Model}
 	for _, t := range req.GetTexts() {
 		out.Vectors = append(out.Vectors, &pb.Vector{Values: embed.Vector(t)})
@@ -1045,7 +1045,7 @@ func (embedderPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedRep
 	return out, nil
 }
 
-func chunkText(n int) string {
+func hChunkText(n int) string {
 	var b strings.Builder
 	for i := 0; b.Len() < n; i++ {
 		if i > 0 {
@@ -1056,45 +1056,45 @@ func chunkText(n int) string {
 	return b.String()[:n]
 }
 
-func chunkWorld(ctx *harness.Ctx, n int) string {
-	pb.RegisterEmbedderServer(ctx.GRPC.Server(config.Embedder), &embedderPeer{})
-	content := chunkText(n)
-	ctx.Redis.Do("HSET", chunkDoc, "sha256", "-", "job_id", "j1", "content_type", "text/plain", "content", content)
+func hChunkWorld(ctx *harness.Ctx, n int) string {
+	pb.RegisterEmbedderServer(ctx.GRPC.Server(config.Embedder), &HEmbedderPeer{})
+	content := hChunkText(n)
+	ctx.Redis.Do("HSET", kHChunkDoc, "sha256", "-", "job_id", "j1", "content_type", "text/plain", "content", content)
 	return content
 }
 
-func chunkIndex() (int, error) { return indexDocument(context.Background(), "t1", "handbook", 3) }
+func hChunkIndex() (int, error) { return indexDocument(context.Background(), "t1", "handbook", 3) }
 
-type storedChunk struct {
+type HStoredChunk struct {
 	id, docID  string
 	start, end int
 	text, vec  string
 }
 
-func chunkRows(ctx *harness.Ctx) []storedChunk {
-	var out []storedChunk
+func hChunkRows(ctx *harness.Ctx) []HStoredChunk {
+	var out []HStoredChunk
 	for _, id := range ctx.Redis.SMembers("rag:chunks:t1") {
 		h := ctx.Redis.HGetAll("rag:chunk:" + id)
 		start, _ := strconv.Atoi(h["start"])
 		end, _ := strconv.Atoi(h["end"])
-		out = append(out, storedChunk{id, h["doc_id"], start, end, h["text"], h["vec"]})
+		out = append(out, HStoredChunk{id, h["doc_id"], start, end, h["text"], h["vec"]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
 	return out
 }
 
-// chunkStore stores another document version for the worker to index.
-func chunkStore(ctx *harness.Ctx, docID string, n int) {
-	ctx.Redis.Do("HSET", "rag:doc:t1:"+docID+":1", "sha256", "-", "job_id", "j2", "content_type", "text/plain", "content", chunkText(n))
+// hChunkStore stores another document version for the worker to index.
+func hChunkStore(ctx *harness.Ctx, docID string, n int) {
+	ctx.Redis.Do("HSET", "rag:doc:t1:"+docID+":1", "sha256", "-", "job_id", "j2", "content_type", "text/plain", "content", hChunkText(n))
 }
 
-func chunkCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Embed", "") }
+func hChunkCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Embed", "") }
 
 func CheckOverlap(ctx *harness.Ctx) {
-	content := chunkWorld(ctx, 2000)
-	n, err := chunkIndex()
+	content := hChunkWorld(ctx, 2000)
+	n, err := hChunkIndex()
 	ctx.NoError(err, "indexDocument")
-	rows := chunkRows(ctx)
+	rows := hChunkRows(ctx)
 	var spans [][2]int
 	for _, c := range rows {
 		spans = append(spans, [2]int{c.start, c.end})
@@ -1109,11 +1109,11 @@ func CheckOverlap(ctx *harness.Ctx) {
 		expected [][2]int
 	}{{1500, [][2]int{{0, 800}, {700, 1500}}}, {800, [][2]int{{0, 800}}}} {
 		docID := fmt.Sprintf("len%d", tc.size)
-		chunkStore(ctx, docID, tc.size)
+		hChunkStore(ctx, docID, tc.size)
 		count, err := indexDocument(context.Background(), "t1", docID, 1)
 		ctx.NoError(err, "indexDocument of a %d-character document", tc.size)
 		var got [][2]int
-		for _, c := range chunkRows(ctx) {
+		for _, c := range hChunkRows(ctx) {
 			if c.docID == docID {
 				got = append(got, [2]int{c.start, c.end})
 			}
@@ -1123,16 +1123,16 @@ func CheckOverlap(ctx *harness.Ctx) {
 }
 
 func CheckStableId(ctx *harness.Ctx) {
-	chunkWorld(ctx, 2000)
-	_, err := chunkIndex()
+	hChunkWorld(ctx, 2000)
+	_, err := hChunkIndex()
 	ctx.NoError(err, "indexDocument")
 	first := ctx.Redis.SMembers("rag:chunks:t1")
-	_, err = chunkIndex() // the event redelivered
+	_, err = hChunkIndex() // the event redelivered
 	ctx.NoError(err, "indexDocument, redelivered")
 	again := ctx.Redis.SMembers("rag:chunks:t1")
 	ctx.Assert(len(again) == len(first), "a redelivered event changed the index: %d chunks before, %d after; a chunk's id must come from what it is, not from a random draw", len(first), len(again))
 	var expected []string
-	for _, c := range chunkRows(ctx) {
+	for _, c := range hChunkRows(ctx) {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("t1:handbook:3:%d", c.start)))
 		expected = append(expected, hex.EncodeToString(sum[:]))
 	}
@@ -1141,20 +1141,20 @@ func CheckStableId(ctx *harness.Ctx) {
 }
 
 func CheckBatchSize(ctx *harness.Ctx) {
-	chunkWorld(ctx, 700*39+800)
-	n, err := chunkIndex()
+	hChunkWorld(ctx, 700*39+800)
+	n, err := hChunkIndex()
 	ctx.NoError(err, "indexDocument")
 	var sizes []int
 	most := 0
-	for _, c := range chunkCalls(ctx) {
+	for _, c := range hChunkCalls(ctx) {
 		size := len(c.Request.(*pb.EmbedRequest).GetTexts())
 		sizes = append(sizes, size)
 		most = max(most, size)
 	}
 	ctx.Assert(most <= 32, "an Embed call carried %d texts; at most 32 per call", most)
 	ctx.Assert(len(sizes) == (n+31)/32, "%d chunks were embedded in %d calls of %v texts; batches of 32 need %d", n, len(sizes), sizes, (n+31)/32)
-	ctx.Equal(len(chunkRows(ctx)), n, "every chunk is written: indexDocument's count against the index")
-	for _, c := range chunkRows(ctx) {
+	ctx.Equal(len(hChunkRows(ctx)), n, "every chunk is written: indexDocument's count against the index")
+	for _, c := range hChunkRows(ctx) {
 		want := embed.Vector(c.text)
 		parts := strings.Split(c.vec, ",")
 		same := len(parts) == len(want)
@@ -1164,22 +1164,22 @@ func CheckBatchSize(ctx *harness.Ctx) {
 		}
 		ctx.Assert(same, "the chunk at %d was written with another text's vector: each chunk is upserted with the vector the embedder returned for its own text", c.start)
 	}
-	chunkStore(ctx, "wide", 700*63+800)
-	before := len(chunkCalls(ctx))
+	hChunkStore(ctx, "wide", 700*63+800)
+	before := len(hChunkCalls(ctx))
 	wide, err := indexDocument(context.Background(), "t1", "wide", 1)
 	ctx.NoError(err, "indexDocument of a 64-chunk document")
 	var wideSizes []int
-	for _, c := range chunkCalls(ctx)[before:] {
+	for _, c := range hChunkCalls(ctx)[before:] {
 		wideSizes = append(wideSizes, len(c.Request.(*pb.EmbedRequest).GetTexts()))
 	}
 	ctx.Assert(wide == 64 && fmt.Sprint(wideSizes) == "[32 32]", "a 64-chunk document is exactly two batches of 32: got %d chunks in calls of %v texts", wide, wideSizes)
 }
 
 func CheckCallDeadline(ctx *harness.Ctx) {
-	chunkWorld(ctx, 2000)
-	_, err := chunkIndex()
+	hChunkWorld(ctx, 2000)
+	_, err := hChunkIndex()
 	ctx.NoError(err, "indexDocument")
-	calls := chunkCalls(ctx)
+	calls := hChunkCalls(ctx)
 	ctx.Assert(len(calls) > 0, "no Embed call was made")
 	for _, c := range calls {
 		ctx.Assert(c.HasDeadline(), "an Embed call carries no deadline: a hung embedder holds the worker, and the partition behind it, until it answers")
@@ -1187,37 +1187,37 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Embed", 5.0, config.Embedder)
 	before, started := len(calls), ctx.Clock.Now()
-	_, err = chunkIndex()
-	waited, hung := float64(ctx.Clock.Now()-started)/1000, len(chunkCalls(ctx))-before
+	_, err = hChunkIndex()
+	waited, hung := float64(ctx.Clock.Now()-started)/1000, len(hChunkCalls(ctx))-before
 	ctx.Assert(err != nil, "an embedder that hangs 5 s on every call must end indexDocument with an error once the attempts are spent; it returned after %.1f s and %d calls", waited, hung)
 	ctx.Equal(hung, 3, "a hung call is cut at the deadline and retried; calls")
-	for _, c := range chunkCalls(ctx)[before:] {
+	for _, c := range hChunkCalls(ctx)[before:] {
 		ctx.Assert(c.HasDeadline() && 1500*time.Millisecond <= c.Timeout && c.Timeout <= 2500*time.Millisecond, "every attempt carries its own 2 s deadline, a retry included; a call carried %v", c.Timeout)
 	}
 	ctx.Assert(waited <= 8.0, "indexDocument waited %.1f s on a hung embedder: three 2-second deadlines and two backoffs fit in 8", waited)
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	chunkWorld(ctx, 500)
+	hChunkWorld(ctx, 500)
 	ctx.GRPC.Fail("Embed", codes.Unavailable, "embedder restarting", 1, config.Embedder)
-	n, err := chunkIndex()
+	n, err := hChunkIndex()
 	ctx.NoError(err, "indexDocument after one UNAVAILABLE")
 	ctx.Equal(n, 1, "chunks")
-	ctx.Assert(len(chunkCalls(ctx)) == 2 && ctx.Clock.Sleeps() >= 1, "one UNAVAILABLE earns one retry after a backoff: saw %d calls and %d sleeps", len(chunkCalls(ctx)), ctx.Clock.Sleeps())
+	ctx.Assert(len(hChunkCalls(ctx)) == 2 && ctx.Clock.Sleeps() >= 1, "one UNAVAILABLE earns one retry after a backoff: saw %d calls and %d sleeps", len(hChunkCalls(ctx)), ctx.Clock.Sleeps())
 	ctx.GRPC.Fail("Embed", codes.DeadlineExceeded, "embedder slow", 1, config.Embedder)
-	n, err = chunkIndex()
-	ctx.Assert(err == nil && n == 1 && len(chunkCalls(ctx)) == 4, "one DEADLINE_EXCEEDED earns one retry: saw %d calls and error %v", len(chunkCalls(ctx))-2, err)
+	n, err = hChunkIndex()
+	ctx.Assert(err == nil && n == 1 && len(hChunkCalls(ctx)) == 4, "one DEADLINE_EXCEEDED earns one retry: saw %d calls and error %v", len(hChunkCalls(ctx))-2, err)
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated, codes.FailedPrecondition} {
 		ctx.GRPC.Fail("Embed", code, "text rejected", 1, config.Embedder)
-		before, sleeps := len(chunkCalls(ctx)), ctx.Clock.Sleeps()
-		_, err = chunkIndex()
-		ctx.Assert(err != nil && len(chunkCalls(ctx)) == before+1, "%v is permanent: one call, then an error; saw %d calls and error %v", code, len(chunkCalls(ctx))-before, err)
+		before, sleeps := len(hChunkCalls(ctx)), ctx.Clock.Sleeps()
+		_, err = hChunkIndex()
+		ctx.Assert(err != nil && len(hChunkCalls(ctx)) == before+1, "%v is permanent: one call, then an error; saw %d calls and error %v", code, len(hChunkCalls(ctx))-before, err)
 		ctx.Equal(ctx.Clock.Sleeps(), sleeps, "%v is permanent: it returns at once, without a backoff first; sleeps", code)
 	}
 	ctx.GRPC.Fail("Embed", codes.Unavailable, "embedder down", 5, config.Embedder)
-	before, sleeps := len(chunkCalls(ctx)), ctx.Clock.Sleeps()
-	_, err = chunkIndex()
-	ctx.Assert(err != nil && len(chunkCalls(ctx)) == before+3, "an embedder that stays UNAVAILABLE gets maxAttempts = 3 calls, then an error; saw %d calls and error %v", len(chunkCalls(ctx))-before, err)
+	before, sleeps := len(hChunkCalls(ctx)), ctx.Clock.Sleeps()
+	_, err = hChunkIndex()
+	ctx.Assert(err != nil && len(hChunkCalls(ctx)) == before+3, "an embedder that stays UNAVAILABLE gets maxAttempts = 3 calls, then an error; saw %d calls and error %v", len(hChunkCalls(ctx))-before, err)
 	ctx.Equal(ctx.Clock.Sleeps()-sleeps, 2, "three attempts take two backoffs, none after the last failure; sleeps")
 }
 `,
@@ -1234,10 +1234,10 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDocKey = "rag:doc:t1:handbook:3";
+const std::string kHDocKey = "rag:doc:t1:handbook:3";
 
 // The stand-in embedder: one rag/embed.h vector per text.
-class EmbedderPeer final : public rag::Embedder::Service {
+class HEmbedderPeer final : public rag::Embedder::Service {
  public:
   grpc::Status Embed(grpc::ServerContext*, const rag::EmbedRequest* req, rag::EmbedReply* reply) override {
     for (const auto& t : req->texts()) {
@@ -1249,23 +1249,23 @@ class EmbedderPeer final : public rag::Embedder::Service {
   }
 };
 
-std::string chunkText(size_t n) {
+std::string hChunkText(size_t n) {
   std::string out;
   for (int i = 0; out.size() < n; i++) out += (i ? " word" : "word") + std::to_string(i);
   return out.substr(0, n);
 }
 
-std::string chunkWorld(harness::Ctx& ctx, size_t n) {
-  static EmbedderPeer* peer = nullptr;
+std::string hChunkWorld(harness::Ctx& ctx, size_t n) {
+  static HEmbedderPeer* peer = nullptr;
   delete peer;
-  peer = new EmbedderPeer();
+  peer = new HEmbedderPeer();
   ctx.GRPC.Server(config::kEmbedder)->RegisterService(peer);
-  const std::string content = chunkText(n);
-  ctx.Redis.Do("HSET", kDocKey, "sha256", "-", "job_id", "j1", "content_type", "text/plain", "content", content);
+  const std::string content = hChunkText(n);
+  ctx.Redis.Do("HSET", kHDocKey, "sha256", "-", "job_id", "j1", "content_type", "text/plain", "content", content);
   return content;
 }
 
-bool chunkRaises() {
+bool hChunkRaises() {
   try {
     index_document("t1", "handbook", 3);
   } catch (...) {
@@ -1274,7 +1274,7 @@ bool chunkRaises() {
   return false;
 }
 
-struct Stored {
+struct HStored {
   std::string id;
   std::string doc_id;
   int start = 0;
@@ -1283,27 +1283,27 @@ struct Stored {
   std::string vec;
 };
 
-std::vector<Stored> chunkRows(harness::Ctx& ctx) {
-  std::vector<Stored> out;
+std::vector<HStored> hChunkRows(harness::Ctx& ctx) {
+  std::vector<HStored> out;
   for (const auto& id : ctx.Redis.SMembers("rag:chunks:t1")) {
     auto h = ctx.Redis.HGetAll("rag:chunk:" + id);
     out.push_back({id, h["doc_id"], std::stoi(h["start"]), std::stoi(h["end"]), h["text"], h["vec"]});
   }
-  std::sort(out.begin(), out.end(), [](const Stored& a, const Stored& b) { return a.start < b.start; });
+  std::sort(out.begin(), out.end(), [](const HStored& a, const HStored& b) { return a.start < b.start; });
   return out;
 }
 
 // Another document version for the worker to index.
-void chunkStore(harness::Ctx& ctx, const std::string& doc_id, size_t n) {
-  ctx.Redis.Do("HSET", "rag:doc:t1:" + doc_id + ":1", "sha256", "-", "job_id", "j2", "content_type", "text/plain", "content", chunkText(n));
+void hChunkStore(harness::Ctx& ctx, const std::string& doc_id, size_t n) {
+  ctx.Redis.Do("HSET", "rag:doc:t1:" + doc_id + ":1", "sha256", "-", "job_id", "j2", "content_type", "text/plain", "content", hChunkText(n));
 }
 
 }  // namespace
 
 void CheckOverlap(harness::Ctx& ctx) {
-  const std::string content = chunkWorld(ctx, 2000);
+  const std::string content = hChunkWorld(ctx, 2000);
   const int n = index_document("t1", "handbook", 3);
-  const auto rows = chunkRows(ctx);
+  const auto rows = hChunkRows(ctx);
   std::vector<std::vector<int>> spans;
   for (const auto& c : rows) spans.push_back({c.start, c.end});
   ctx.Equal(spans, std::vector<std::vector<int>>{{0, 800}, {700, 1500}, {1400, 2000}}, "a 2000-character document's chunks (800 characters, each starting 100 before the previous one ended)");
@@ -1312,30 +1312,30 @@ void CheckOverlap(harness::Ctx& ctx) {
   const std::vector<std::pair<size_t, std::vector<std::vector<int>>>> shorter = {{1500, {{0, 800}, {700, 1500}}}, {800, {{0, 800}}}};
   for (const auto& [size, expected] : shorter) {
     const std::string doc_id = "len" + std::to_string(size);
-    chunkStore(ctx, doc_id, size);
+    hChunkStore(ctx, doc_id, size);
     const int count = index_document("t1", doc_id, 1);
     std::vector<std::vector<int>> got;
-    for (const auto& c : chunkRows(ctx))
+    for (const auto& c : hChunkRows(ctx))
       if (c.doc_id == doc_id) got.push_back({c.start, c.end});
     ctx.Assert(got == expected && count == static_cast<int>(expected.size()), "a %d-character document must be chunked %v: the chunk that reaches the end is the last; got %v, returned %d", size, expected, got, count);
   }
 }
 
 void CheckStableId(harness::Ctx& ctx) {
-  chunkWorld(ctx, 2000);
+  hChunkWorld(ctx, 2000);
   index_document("t1", "handbook", 3);
   const auto first = ctx.Redis.SMembers("rag:chunks:t1");
   index_document("t1", "handbook", 3);  // the event redelivered
   const auto again = ctx.Redis.SMembers("rag:chunks:t1");
   ctx.Assert(again.size() == first.size(), "a redelivered event changed the index: %d chunks before, %d after; a chunk's id must come from what it is, not from a random draw", first.size(), again.size());
   std::vector<std::string> expected;
-  for (const auto& c : chunkRows(ctx)) expected.push_back(sha256_hex("t1:handbook:3:" + std::to_string(c.start)));
+  for (const auto& c : hChunkRows(ctx)) expected.push_back(sha256_hex("t1:handbook:3:" + std::to_string(c.start)));
   std::sort(expected.begin(), expected.end());
   ctx.Equal(first, expected, "chunk ids must be sha256('{tenant}:{doc_id}:{version}:{start}')");
 }
 
 void CheckBatchSize(harness::Ctx& ctx) {
-  chunkWorld(ctx, 700 * 39 + 800);
+  hChunkWorld(ctx, 700 * 39 + 800);
   const int n = index_document("t1", "handbook", 3);
   std::vector<int> sizes;
   int most = 0;
@@ -1345,8 +1345,8 @@ void CheckBatchSize(harness::Ctx& ctx) {
   }
   ctx.Assert(most <= 32, "an Embed call carried %d texts; at most 32 per call", most);
   ctx.Assert(static_cast<int>(sizes.size()) == (n + 31) / 32, "%d chunks were embedded in %d calls of %v texts; batches of 32 need %d", n, sizes.size(), sizes, (n + 31) / 32);
-  ctx.Equal(chunkRows(ctx).size(), n, "every chunk is written: index_document's count against the index");
-  for (const auto& c : chunkRows(ctx)) {
+  ctx.Equal(hChunkRows(ctx).size(), n, "every chunk is written: index_document's count against the index");
+  for (const auto& c : hChunkRows(ctx)) {
     const auto want = embed::vector(c.text);
     std::stringstream parts(c.vec);
     std::string part;
@@ -1355,7 +1355,7 @@ void CheckBatchSize(harness::Ctx& ctx) {
     for (; std::getline(parts, part, ','); i++) same = same && i < want.size() && std::fabs(std::stod(part) - want[i]) < 1e-9;
     ctx.Assert(same && i == want.size(), "the chunk at %d was written with another text's vector: each chunk is upserted with the vector the embedder returned for its own text", c.start);
   }
-  chunkStore(ctx, "wide", 700 * 63 + 800);
+  hChunkStore(ctx, "wide", 700 * 63 + 800);
   const size_t before = ctx.GRPC.CallsTo("Embed").size();
   const int wide = index_document("t1", "wide", 1);
   std::vector<int> wideSizes;
@@ -1365,7 +1365,7 @@ void CheckBatchSize(harness::Ctx& ctx) {
 }
 
 void CheckCallDeadline(harness::Ctx& ctx) {
-  chunkWorld(ctx, 2000);
+  hChunkWorld(ctx, 2000);
   index_document("t1", "handbook", 3);
   const auto calls = ctx.GRPC.CallsTo("Embed");
   ctx.Assert(!calls.empty(), "no Embed call was made");
@@ -1376,7 +1376,7 @@ void CheckCallDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Embed", 5.0, config::kEmbedder);
   const size_t before = calls.size();
   const int64_t started = ctx.Clock.Now();
-  const bool raised = chunkRaises();
+  const bool raised = hChunkRaises();
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   const size_t hung = ctx.GRPC.CallsTo("Embed").size() - before;
   ctx.Assert(raised, "an embedder that hangs 5 s on every call must end index_document with an error once the attempts are spent; it returned after %.1f s and %d calls", waited, hung);
@@ -1388,7 +1388,7 @@ void CheckCallDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  chunkWorld(ctx, 500);
+  hChunkWorld(ctx, 500);
   ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "embedder restarting", 1, config::kEmbedder);
   ctx.Equal(index_document("t1", "handbook", 3), 1, "chunks after one UNAVAILABLE");
   ctx.Assert(ctx.GRPC.CallsTo("Embed").size() == 2 && ctx.Clock.Sleeps() >= 1, "one UNAVAILABLE earns one retry after a backoff: saw %d calls and %d sleeps", ctx.GRPC.CallsTo("Embed").size(), ctx.Clock.Sleeps());
@@ -1403,14 +1403,14 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
     ctx.GRPC.Fail("Embed", code, "text rejected", 1, config::kEmbedder);
     const size_t before = ctx.GRPC.CallsTo("Embed").size();
     const auto sleeps = ctx.Clock.Sleeps();
-    const bool raised = chunkRaises();
+    const bool raised = hChunkRaises();
     ctx.Assert(raised && ctx.GRPC.CallsTo("Embed").size() == before + 1, "%s is permanent: one call, then an error; saw %d calls (raised: %t)", name, ctx.GRPC.CallsTo("Embed").size() - before, raised);
     ctx.Equal(ctx.Clock.Sleeps(), sleeps, "%s is permanent: it raises at once, without a backoff first; sleeps", name);
   }
   ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "embedder down", 5, config::kEmbedder);
   const size_t before = ctx.GRPC.CallsTo("Embed").size();
   const auto sleeps = ctx.Clock.Sleeps();
-  const bool raised = chunkRaises();
+  const bool raised = hChunkRaises();
   ctx.Assert(raised && ctx.GRPC.CallsTo("Embed").size() == before + 3, "an embedder that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then an error; saw %d calls (raised: %t)", ctx.GRPC.CallsTo("Embed").size() - before, raised);
   ctx.Equal(ctx.Clock.Sleeps() - sleeps, 2, "three attempts take two backoffs, none after the last failure; sleeps");
 }

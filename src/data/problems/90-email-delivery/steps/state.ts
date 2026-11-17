@@ -705,20 +705,20 @@ import (
 
 const harnessAddr = "ana@example.com"
 
-var admissionBg = context.Background()
+var hAdmissionBg = context.Background()
 
-func mustAdmit(ctx *harness.Ctx, addr string) string {
-	verdict, err := admit(admissionBg, addr)
+func hMustAdmit(ctx *harness.Ctx, addr string) string {
+	verdict, err := admit(hAdmissionBg, addr)
 	ctx.NoError(err, "admit(%q) failed", addr)
 	return verdict
 }
 
 func CheckDurableSuppression(ctx *harness.Ctx) {
-	ctx.NoError(suppress(admissionBg, harnessAddr), "suppress failed")
-	ctx.Equal(mustAdmit(ctx, harnessAddr), "suppressed", "right after suppress, admit")
+	ctx.NoError(suppress(hAdmissionBg, harnessAddr), "suppress failed")
+	ctx.Equal(hMustAdmit(ctx, harnessAddr), "suppressed", "right after suppress, admit")
 	ctx.Clock.Advance(2 * 3600)
-	ctx.Equal(mustAdmit(ctx, harnessAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit")
-	suppressed, err := isSuppressed(admissionBg, harnessAddr)
+	ctx.Equal(hMustAdmit(ctx, harnessAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit")
+	suppressed, err := isSuppressed(hAdmissionBg, harnessAddr)
 	ctx.NoError(err, "isSuppressed failed")
 	ctx.Equal(suppressed, true, "isSuppressed two hours later")
 	ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", harnessAddr), "mail:suppressed does not hold %s; Redis holds %q", harnessAddr, ctx.Redis.Keys("mail:*"))
@@ -727,16 +727,16 @@ func CheckDurableSuppression(ctx *harness.Ctx) {
 
 func CheckAtomicAdmission(ctx *harness.Ctx) {
 	for n := 0; n < 4; n++ {
-		ctx.Equal(mustAdmit(ctx, harnessAddr), "ok", "send %d of a 5-per-minute limit", n+1)
+		ctx.Equal(hMustAdmit(ctx, harnessAddr), "ok", "send %d of a 5-per-minute limit", n+1)
 	}
 	keys := ctx.Redis.Keys("mail:rate:*")
 	ctx.Equal(len(keys), 1, "four sends to one address must leave one mail:rate:{address}:{window} counter (%q); counters", keys)
 	// Another send lands between the fifth send's commands on the counter.
 	rival := ctx.Redis.After(keys[0], func() any {
-		verdict, _ := admit(admissionBg, harnessAddr)
+		verdict, _ := admit(hAdmissionBg, harnessAddr)
 		return verdict
 	})
-	fifth := mustAdmit(ctx, harnessAddr)
+	fifth := hMustAdmit(ctx, harnessAddr)
 	ctx.Assert(rival.Fired, "nothing touched %s", keys[0])
 	racing, _ := rival.Result.(string)
 	ctx.Assert(!(fifth == "rate_limited" && racing == "rate_limited"), "the fifth send of the minute and a send racing it were both refused: the limit admits RATE_LIMIT (5) sends a minute, so only the sixth is rate_limited")
@@ -748,7 +748,7 @@ func CheckAtomicAdmission(ctx *harness.Ctx) {
 		ctx.Redis.Do("SADD", "mail:suppressed", "cy@example.com")
 		return counters
 	})
-	verdict := mustAdmit(ctx, "cy@example.com")
+	verdict := hMustAdmit(ctx, "cy@example.com")
 	if seen.Fired {
 		counted, _ := seen.Result.([]string)
 		ctx.Assert(len(counted) > 0 || verdict == "suppressed", "an unsubscribe landed after admission read mail:suppressed and before it counted the send, and the send was answered %q: the check and the count are separate commands, so a customer who just unsubscribed is mailed. Check the set and count in one Lua script", verdict)
@@ -756,7 +756,7 @@ func CheckAtomicAdmission(ctx *harness.Ctx) {
 }
 
 func CheckRateWindow(ctx *harness.Ctx) {
-	ctx.Equal(mustAdmit(ctx, "lee@example.com"), "ok", "the first send to lee@example.com")
+	ctx.Equal(hMustAdmit(ctx, "lee@example.com"), "ok", "the first send to lee@example.com")
 	first := ctx.Redis.Keys("mail:rate:*")
 	ctx.Equal(len(first), 1, "one send must leave one mail:rate:{address}:{window} counter (%q); counters", first)
 	created := strings.ReplaceAll(first[0], "lee@example.com", harnessAddr)
@@ -764,7 +764,7 @@ func CheckRateWindow(ctx *harness.Ctx) {
 	snapshot := ctx.Redis.After(created, func() any { return ctx.Redis.TTL(created) })
 	var verdicts []string
 	for n := 0; n < 6; n++ {
-		verdicts = append(verdicts, mustAdmit(ctx, harnessAddr))
+		verdicts = append(verdicts, hMustAdmit(ctx, harnessAddr))
 	}
 	ctx.Equal(verdicts, []string{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends in one minute")
 	ctx.Assert(snapshot.Fired, "nothing touched %s", created)
@@ -776,17 +776,17 @@ func CheckRateWindow(ctx *harness.Ctx) {
 		ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window", key, ttl)
 	}
 	ctx.Clock.Advance(61)
-	ctx.Equal(mustAdmit(ctx, harnessAddr), "ok", "a minute later the next send")
+	ctx.Equal(hMustAdmit(ctx, harnessAddr), "ok", "a minute later the next send")
 }
 
 func CheckNormalizedAddress(ctx *harness.Ctx) {
-	ctx.NoError(suppress(admissionBg, "  Ana@Example.COM"), "suppress failed")
-	ctx.Equal(mustAdmit(ctx, "ana@example.com"), "suppressed", "after suppress('  Ana@Example.COM') one mailbox has two spellings (normalize the address before every key); admit('ana@example.com')")
-	suppressed, _ := isSuppressed(admissionBg, "ANA@example.com ")
+	ctx.NoError(suppress(hAdmissionBg, "  Ana@Example.COM"), "suppress failed")
+	ctx.Equal(hMustAdmit(ctx, "ana@example.com"), "suppressed", "after suppress('  Ana@Example.COM') one mailbox has two spellings (normalize the address before every key); admit('ana@example.com')")
+	suppressed, _ := isSuppressed(hAdmissionBg, "ANA@example.com ")
 	ctx.Equal(suppressed, true, "isSuppressed('ANA@example.com ')")
 	var verdicts []string
 	for _, s := range []string{"bo@example.com", "Bo@example.com", "BO@EXAMPLE.COM", " bo@example.com", "bo@Example.com", "Bo@Example.Com"} {
-		verdicts = append(verdicts, mustAdmit(ctx, s))
+		verdicts = append(verdicts, hMustAdmit(ctx, s))
 	}
 	ctx.Equal(verdicts, []string{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends to one mailbox spelled six ways (each spelling got its own counter)")
 }
@@ -800,28 +800,28 @@ func CheckNormalizedAddress(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kAddr = "ana@example.com";
+const std::string kHAddr = "ana@example.com";
 
 }  // namespace
 
 void CheckDurableSuppression(harness::Ctx& ctx) {
-  suppress(kAddr);
-  ctx.Equal(admit(kAddr), "suppressed", "right after suppress, admit");
+  suppress(kHAddr);
+  ctx.Equal(admit(kHAddr), "suppressed", "right after suppress, admit");
   ctx.Clock.Advance(2 * 3600);
-  ctx.Equal(admit(kAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit");
-  ctx.Equal(isSuppressed(kAddr), true, "isSuppressed two hours later");
-  ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", kAddr), "mail:suppressed does not hold %s; Redis holds %q", kAddr, ctx.Redis.Keys("mail:*"));
+  ctx.Equal(admit(kHAddr), "suppressed", "two hours after the unsubscribe the suppression expired and the customer is mailed again (keep suppressed addresses in a set with no expiry); admit");
+  ctx.Equal(isSuppressed(kHAddr), true, "isSuppressed two hours later");
+  ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", kHAddr), "mail:suppressed does not hold %s; Redis holds %q", kHAddr, ctx.Redis.Keys("mail:*"));
   ctx.Equal(ctx.Redis.TTL("mail:suppressed"), -1LL, "the TTL of mail:suppressed (when it runs out every unsubscribe lapses at once; the set never expires)");
 }
 
 void CheckAtomicAdmission(harness::Ctx& ctx) {
-  for (int n = 0; n < 4; n++) ctx.Equal(admit(kAddr), "ok", "send %d of a 5-per-minute limit", n + 1);
+  for (int n = 0; n < 4; n++) ctx.Equal(admit(kHAddr), "ok", "send %d of a 5-per-minute limit", n + 1);
   const auto keys = ctx.Redis.Keys("mail:rate:*");
   ctx.Equal(keys.size(), 1, "four sends to one address must leave one mail:rate:{address}:{window} counter (%q); counters", keys);
   // Another send lands between the fifth send's commands on the counter.
   auto racing = std::make_shared<std::string>();
-  ctx.Redis.After(keys[0], [racing] { *racing = admit(kAddr); });
-  const std::string fifth = admit(kAddr);
+  ctx.Redis.After(keys[0], [racing] { *racing = admit(kHAddr); });
+  const std::string fifth = admit(kHAddr);
   ctx.Assert(!racing->empty(), "nothing touched %s", keys[0]);
   ctx.Assert(!(fifth == "rate_limited" && *racing == "rate_limited"),
              "the fifth send of the minute and a send racing it were both refused: the limit admits RATE_LIMIT (5) sends a minute, so only the sixth is rate_limited");
@@ -847,12 +847,12 @@ void CheckRateWindow(harness::Ctx& ctx) {
   const auto first = ctx.Redis.Keys("mail:rate:*");
   ctx.Equal(first.size(), 1, "one send must leave one mail:rate:{address}:{window} counter (%q); counters", first);
   std::string created = first[0];
-  if (const auto at = created.find("lee@example.com"); at != std::string::npos) created.replace(at, std::string("lee@example.com").size(), kAddr);
+  if (const auto at = created.find("lee@example.com"); at != std::string::npos) created.replace(at, std::string("lee@example.com").size(), kHAddr);
   // A snapshot of the counter's TTL right after the command that creates it.
   auto snapshot = std::make_shared<std::optional<long long>>();
   ctx.Redis.After(created, [&ctx, created, snapshot] { *snapshot = ctx.Redis.TTL(created); });
   std::vector<std::string> verdicts;
-  for (int n = 0; n < 6; n++) verdicts.push_back(admit(kAddr));
+  for (int n = 0; n < 6; n++) verdicts.push_back(admit(kHAddr));
   ctx.Equal(verdicts, std::vector<std::string>{"ok", "ok", "ok", "ok", "ok", "rate_limited"}, "six sends in one minute");
   ctx.Assert(snapshot->has_value(), "nothing touched %s", created);
   const long long created_ttl = snapshot->value_or(0);
@@ -865,7 +865,7 @@ void CheckRateWindow(harness::Ctx& ctx) {
     ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: a counter without an expiry stays in Redis for good, one per recipient per minute. EXPIRE it with the window", key, ttl);
   }
   ctx.Clock.Advance(61);
-  ctx.Equal(admit(kAddr), "ok", "a minute later the next send");
+  ctx.Equal(admit(kHAddr), "ok", "a minute later the next send");
 }
 
 void CheckNormalizedAddress(harness::Ctx& ctx) {

@@ -908,37 +908,37 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func entry(name, version, sideEffect, owner string) map[string]any {
+func hEntry(name, version, sideEffect, owner string) map[string]any {
 	return map[string]any{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object"}, "endpoint": "https://" + owner + ".internal", "credential_ref": "vault://" + owner}
 }
 
 var (
-	s1 = entry("search", "a1", "read", "search")
-	s2 = entry("search", "a2", "read", "search")
-	r1 = entry("refund", "b1", "irreversible", "payments")
-	r2 = entry("refund", "b2", "irreversible", "payments")
-	v7 = map[string]map[string]any{"search": s1, "refund": r1}
-	v9 = map[string]map[string]any{"search": s2, "refund": r2}
-	x1 = entry("export", "e1", "read", "data")
+	hS1 = hEntry("search", "a1", "read", "search")
+	hS2 = hEntry("search", "a2", "read", "search")
+	hR1 = hEntry("refund", "b1", "irreversible", "payments")
+	hR2 = hEntry("refund", "b2", "irreversible", "payments")
+	hV7 = map[string]map[string]any{"search": hS1, "refund": hR1}
+	hV9 = map[string]map[string]any{"search": hS2, "refund": hR2}
+	hX1 = hEntry("export", "e1", "read", "data")
 )
 
-func verdict(ctx *harness.Ctx, cv, outcome string) {
+func hVerdict(ctx *harness.Ctx, cv, outcome string) {
 	ctx.Redis.Do("HSET", "catalog:validation:"+cv, "outcome", outcome, "reason", "")
 }
 
-func sameJSON(a, b any) bool {
+func hSameJSON(a, b any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return string(x) == string(y)
 }
 
 // pair is what an agent resolves for both tools, as versions ("" when absent).
-func pair(runID string) [2]string {
+func hPair(runID string) [2]string {
 	var out [2]string
 	for i, name := range []string{"search", "refund"} {
-		e, _ := resolve(stateBg, name, runID)
+		e, _ := resolve(hStateBg, name, runID)
 		if v, ok := e["version"].(string); ok {
 			out[i] = v
 		}
@@ -947,35 +947,35 @@ func pair(runID string) [2]string {
 }
 
 // watch records what an agent resolves right after each of the next left commands touching key.
-func watch(ctx *harness.Ctx, key string, seen *[][2]string, left int) {
+func hWatch(ctx *harness.Ctx, key string, seen *[][2]string, left int) {
 	ctx.Redis.After(key, func() any {
-		*seen = append(*seen, pair(""))
+		*seen = append(*seen, hPair(""))
 		if left > 1 {
-			watch(ctx, key, seen, left-1)
+			hWatch(ctx, key, seen, left-1)
 		}
 		return nil
 	})
 }
 
-func mustPromote(ctx *harness.Ctx, cv string, entries map[string]map[string]any) {
-	ctx.NoError(promote(stateBg, cv, entries), "promote(%s) of a validated candidate failed", cv)
+func hMustPromote(ctx *harness.Ctx, cv string, entries map[string]map[string]any) {
+	ctx.NoError(promote(hStateBg, cv, entries), "promote(%s) of a validated candidate failed", cv)
 }
 
 func CheckVersionSwap(ctx *harness.Ctx) {
-	verdict(ctx, "7", "passed")
-	verdict(ctx, "9", "passed")
-	mustPromote(ctx, "7", v7)
-	ctx.Equal(pair(""), [2]string{"a1", "b1"}, "after promoting catalog 7, the versions agents resolve")
+	hVerdict(ctx, "7", "passed")
+	hVerdict(ctx, "9", "passed")
+	hMustPromote(ctx, "7", hV7)
+	ctx.Equal(hPair(""), [2]string{"a1", "b1"}, "after promoting catalog 7, the versions agents resolve")
 	// An agent resolves both tools while catalog 9 is being written and the pointer moves.
 	var seen [][2]string
 	for _, key := range []string{"catalog:tools", "catalog:version:9", "catalog:active"} {
-		watch(ctx, key, &seen, 4)
+		hWatch(ctx, key, &seen, 4)
 	}
-	mustPromote(ctx, "9", v9)
+	hMustPromote(ctx, "9", hV9)
 	for _, s := range append([][2]string(nil), seen...) {
 		ctx.Assert(s == [2]string{"a1", "b1"} || s == [2]string{"a2", "b2"}, "an agent resolving during the promotion of catalog 9 got versions %v: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active", s)
 	}
-	ctx.Equal(pair(""), [2]string{"a2", "b2"}, "after promoting catalog 9, the versions agents resolve")
+	ctx.Equal(hPair(""), [2]string{"a2", "b2"}, "after promoting catalog 9, the versions agents resolve")
 	active, _ := ctx.Redis.Get("catalog:active")
 	ctx.Equal(active, "9", "catalog:active after promoting 9")
 	kept := map[string]any{}
@@ -984,71 +984,71 @@ func CheckVersionSwap(ctx *harness.Ctx) {
 		json.Unmarshal([]byte(raw), &e)
 		kept[name] = e
 	}
-	ctx.Assert(sameJSON(kept, v7), "catalog:version:7 holds %v: a promotion must leave the version it replaced whole, one hash per version", kept)
+	ctx.Assert(hSameJSON(kept, hV7), "catalog:version:7 holds %v: a promotion must leave the version it replaced whole, one hash per version", kept)
 }
 
 func CheckValidationGuard(ctx *harness.Ctx) {
-	verdict(ctx, "7", "passed")
-	mustPromote(ctx, "7", v7)
-	verdict(ctx, "8", "rejected")
-	verdict(ctx, "10", "unavailable")
+	hVerdict(ctx, "7", "passed")
+	hMustPromote(ctx, "7", hV7)
+	hVerdict(ctx, "8", "rejected")
+	hVerdict(ctx, "10", "unavailable")
 	for _, c := range []struct{ cv, why string }{{"8", "the sandbox rejected"}, {"10", "the sandbox never answered on"}, {"11", "nobody validated"}} {
-		err := promote(stateBg, c.cv, v9)
+		err := promote(hStateBg, c.cv, hV9)
 		ctx.Assert(errors.Is(err, ErrNotValidated), "promote(%s) for a candidate %s returned %v: return ErrNotValidated unless catalog:validation:%s says passed", c.cv, c.why, err, c.cv)
 		ctx.Equal(ctx.Redis.Exists("catalog:version:"+c.cv), int64(0), "a refused promotion of %s must write nothing; catalog:version:%s exists", c.cv, c.cv)
 	}
 	active, _ := ctx.Redis.Get("catalog:active")
 	ctx.Equal(active, "7", "catalog:active after refused promotions")
-	ctx.Equal(pair(""), [2]string{"a1", "b1"}, "after refused promotions, the versions agents resolve")
-	verdict(ctx, "9", "passed")
-	mustPromote(ctx, "9", v9)
-	ctx.Equal(pair(""), [2]string{"a2", "b2"}, "a validated candidate must promote; the versions agents resolve")
+	ctx.Equal(hPair(""), [2]string{"a1", "b1"}, "after refused promotions, the versions agents resolve")
+	hVerdict(ctx, "9", "passed")
+	hMustPromote(ctx, "9", hV9)
+	ctx.Equal(hPair(""), [2]string{"a2", "b2"}, "a validated candidate must promote; the versions agents resolve")
 }
 
 func CheckRunPin(ctx *harness.Ctx) {
-	verdict(ctx, "7", "passed")
-	verdict(ctx, "9", "passed")
-	mustPromote(ctx, "7", v7)
+	hVerdict(ctx, "7", "passed")
+	hVerdict(ctx, "9", "passed")
+	hMustPromote(ctx, "7", hV7)
 	var ttlAtWrite []int64
 	ctx.Redis.After("catalog:pin:run-1", func() any {
 		ttlAtWrite = append(ttlAtWrite, ctx.Redis.TTL("catalog:pin:run-1"))
 		return nil
 	})
-	ctx.NoError(pinRun(stateBg, "run-1", "7"), "pinRun failed")
-	mustPromote(ctx, "9", map[string]map[string]any{"search": s2, "refund": r2, "export": x1})
-	ctx.Equal(pair("run-1"), [2]string{"a1", "b1"}, "run-1 pinned catalog 7: a promotion must not move a running agent onto new definitions mid-plan; the versions run-1 resolves")
-	added, _ := resolve(stateBg, "export", "run-1")
+	ctx.NoError(pinRun(hStateBg, "run-1", "7"), "pinRun failed")
+	hMustPromote(ctx, "9", map[string]map[string]any{"search": hS2, "refund": hR2, "export": hX1})
+	ctx.Equal(hPair("run-1"), [2]string{"a1", "b1"}, "run-1 pinned catalog 7: a promotion must not move a running agent onto new definitions mid-plan; the versions run-1 resolves")
+	added, _ := resolve(hStateBg, "export", "run-1")
 	ctx.Assert(added == nil, "run-1 pinned catalog 7, which has no export tool, and resolves export %v: a pinned run resolves in its pinned version only", added)
-	active, _ := resolve(stateBg, "export", "")
+	active, _ := resolve(hStateBg, "export", "")
 	ctx.Assert(active != nil && active["version"] == "e1", "a caller without a run resolves export in the active catalog 9, got %v", active)
-	ctx.Equal(pair(""), [2]string{"a2", "b2"}, "a caller without a run resolves the active catalog 9")
-	ctx.Equal(pair("run-2"), [2]string{"a2", "b2"}, "a run that pinned nothing resolves the active catalog 9")
+	ctx.Equal(hPair(""), [2]string{"a2", "b2"}, "a caller without a run resolves the active catalog 9")
+	ctx.Equal(hPair("run-2"), [2]string{"a2", "b2"}, "a run that pinned nothing resolves the active catalog 9")
 	ttl := ctx.Redis.TTL("catalog:pin:run-1")
 	ctx.Assert(6*3600-60 <= ttl && ttl <= 6*3600, "catalog:pin:run-1 has TTL %d, expected pinTTL (6 hours): a pin without a TTL keeps every old catalog alive", ttl)
 	ctx.Assert(len(ttlAtWrite) > 0 && 6*3600-60 <= ttlAtWrite[0] && ttlAtWrite[0] <= 6*3600, "right after the command that wrote catalog:pin:run-1 its TTL was %v: a pin written without its TTL lives forever if the next command never runs. Set it in the same command", ttlAtWrite)
 }
 
 func CheckRollback(ctx *harness.Ctx) {
-	back, err := rollback(stateBg)
+	back, err := rollback(hStateBg)
 	ctx.NoError(err, "rollback failed")
 	ctx.Equal(back, "", "with nothing promoted, rollback must answer \\"\\"")
-	verdict(ctx, "7", "passed")
-	verdict(ctx, "8", "rejected")
-	verdict(ctx, "9", "passed")
-	mustPromote(ctx, "7", v7)
-	back, err = rollback(stateBg)
+	hVerdict(ctx, "7", "passed")
+	hVerdict(ctx, "8", "rejected")
+	hVerdict(ctx, "9", "passed")
+	hMustPromote(ctx, "7", hV7)
+	back, err = rollback(hStateBg)
 	ctx.NoError(err, "rollback failed")
 	ctx.Equal(back, "", "with only catalog 7 ever promoted there is no replaced version to go back to; rollback must answer \\"\\"")
 	active, _ := ctx.Redis.Get("catalog:active")
 	ctx.Equal(active, "7", "catalog:active after a rollback with nothing to go back to")
-	mustPromote(ctx, "9", v9) // 8 was a candidate the sandbox rejected: it never went live
-	mustPromote(ctx, "9", v9) // a retried promotion of the active version replaces nothing
-	back, err = rollback(stateBg)
+	hMustPromote(ctx, "9", hV9) // 8 was a candidate the sandbox rejected: it never went live
+	hMustPromote(ctx, "9", hV9) // a retried promotion of the active version replaces nothing
+	back, err = rollback(hStateBg)
 	ctx.NoError(err, "rollback failed")
 	ctx.Equal(back, "7", "the version catalog 9 replaced is 7 (8 was a rejected candidate, and promoting 9 again replaced nothing); record it at promotion. rollback answered")
 	active, _ = ctx.Redis.Get("catalog:active")
 	ctx.Equal(active, "7", "catalog:active after the rollback")
-	ctx.Equal(pair(""), [2]string{"a1", "b1"}, "after the rollback, the versions agents resolve")
+	ctx.Equal(hPair(""), [2]string{"a1", "b1"}, "after the rollback, the versions agents resolve")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1066,21 +1066,21 @@ using json = nlohmann::json;
 
 namespace {
 
-json entry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
+json hEntry(const std::string& name, const std::string& version, const std::string& side_effect, const std::string& owner) {
   return json{{"name", name},   {"version", version},  {"side_effect", side_effect}, {"owner", owner}, {"schema", {{"type", "object"}}},
               {"endpoint", "https://" + owner + ".internal"}, {"credential_ref", "vault://" + owner}};
 }
 
-const json kV7 = {{"search", entry("search", "a1", "read", "search")}, {"refund", entry("refund", "b1", "irreversible", "payments")}};
-const json kV9 = {{"search", entry("search", "a2", "read", "search")}, {"refund", entry("refund", "b2", "irreversible", "payments")}};
-const json kX1 = entry("export", "e1", "read", "data");
+const json kHV7 = {{"search", hEntry("search", "a1", "read", "search")}, {"refund", hEntry("refund", "b1", "irreversible", "payments")}};
+const json kHV9 = {{"search", hEntry("search", "a2", "read", "search")}, {"refund", hEntry("refund", "b2", "irreversible", "payments")}};
+const json kHX1 = hEntry("export", "e1", "read", "data");
 
-void verdict(harness::Ctx& ctx, const std::string& cv, const std::string& outcome) {
+void hVerdict(harness::Ctx& ctx, const std::string& cv, const std::string& outcome) {
   ctx.Redis.Do("HSET", "catalog:validation:" + cv, "outcome", outcome, "reason", "");
 }
 
 // What an agent resolves for both tools, as versions ("" when absent).
-std::vector<std::string> pair(const std::string& run_id = "") {
+std::vector<std::string> hPair(const std::string& run_id = "") {
   std::vector<std::string> out;
   for (const std::string name : {"search", "refund"}) {
     const auto e = resolve(name, run_id);
@@ -1089,41 +1089,41 @@ std::vector<std::string> pair(const std::string& run_id = "") {
   return out;
 }
 
-const std::vector<std::string> k7 = {"a1", "b1"};
-const std::vector<std::string> k9 = {"a2", "b2"};
+const std::vector<std::string> kH7 = {"a1", "b1"};
+const std::vector<std::string> kH9 = {"a2", "b2"};
 
-struct Seen {
+struct HSeen {
   std::mutex mu;
   std::vector<std::vector<std::string>> versions;
   std::vector<std::string> errs;
 };
 
 // What an agent resolves right after each of the next \`left\` commands touching key.
-void watch(harness::Ctx& ctx, const std::string& key, const std::shared_ptr<Seen>& out, int left = 4) {
+void hWatch(harness::Ctx& ctx, const std::string& key, const std::shared_ptr<HSeen>& out, int left = 4) {
   ctx.Redis.After(key, [&ctx, key, out, left] {
     try {
-      auto versions = pair();
+      auto versions = hPair();
       std::lock_guard<std::mutex> lock(out->mu);
       out->versions.push_back(std::move(versions));
     } catch (const std::exception& e) {
       std::lock_guard<std::mutex> lock(out->mu);
       out->errs.push_back(e.what());
     }
-    if (left > 1) watch(ctx, key, out, left - 1);
+    if (left > 1) hWatch(ctx, key, out, left - 1);
   });
 }
 
 }  // namespace
 
 void CheckVersionSwap(harness::Ctx& ctx) {
-  verdict(ctx, "7", "passed");
-  verdict(ctx, "9", "passed");
-  promote("7", kV7);
-  ctx.Equal(pair(), k7, "after promoting catalog 7, the versions agents resolve");
+  hVerdict(ctx, "7", "passed");
+  hVerdict(ctx, "9", "passed");
+  promote("7", kHV7);
+  ctx.Equal(hPair(), kH7, "after promoting catalog 7, the versions agents resolve");
   // An agent resolves both tools while catalog 9 is being written and the pointer moves.
-  const auto seen = std::make_shared<Seen>();
-  for (const std::string key : {"catalog:tools", "catalog:version:9", "catalog:active"}) watch(ctx, key, seen);
-  promote("9", kV9);
+  const auto seen = std::make_shared<HSeen>();
+  for (const std::string key : {"catalog:tools", "catalog:version:9", "catalog:active"}) hWatch(ctx, key, seen);
+  promote("9", kHV9);
   std::vector<std::vector<std::string>> during;
   std::vector<std::string> errs;
   {
@@ -1133,25 +1133,25 @@ void CheckVersionSwap(harness::Ctx& ctx) {
   }
   ctx.Assert(errs.empty(), "a resolve during the promotion failed: %s", errs.empty() ? "" : errs.front());
   for (const auto& versions : during) {
-    ctx.Assert(versions == k7 || versions == k9, "an agent resolving during the promotion of catalog 9 got versions %q: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active", versions);
+    ctx.Assert(versions == kH7 || versions == kH9, "an agent resolving during the promotion of catalog 9 got versions %q: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active", versions);
   }
-  ctx.Equal(pair(), k9, "after promoting catalog 9, the versions agents resolve");
+  ctx.Equal(hPair(), kH9, "after promoting catalog 9, the versions agents resolve");
   ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("9"), "catalog:active after promoting 9");
   json kept = json::object();
   for (const auto& [name, raw] : ctx.Redis.HGetAll("catalog:version:7")) kept[name] = json::parse(raw);
-  ctx.Assert(kept == kV7, "catalog:version:7 holds %s: a promotion must leave the version it replaced whole, one hash per version", kept.dump());
+  ctx.Assert(kept == kHV7, "catalog:version:7 holds %s: a promotion must leave the version it replaced whole, one hash per version", kept.dump());
 }
 
 void CheckValidationGuard(harness::Ctx& ctx) {
-  verdict(ctx, "7", "passed");
-  promote("7", kV7);
-  verdict(ctx, "8", "rejected");
-  verdict(ctx, "10", "unavailable");
+  hVerdict(ctx, "7", "passed");
+  promote("7", kHV7);
+  hVerdict(ctx, "8", "rejected");
+  hVerdict(ctx, "10", "unavailable");
   const std::vector<std::pair<std::string, std::string>> cases = {{"8", "the sandbox rejected"}, {"10", "the sandbox never answered on"}, {"11", "nobody validated"}};
   for (const auto& [cv, why] : cases) {
     bool refused = false;
     try {
-      promote(cv, kV9);
+      promote(cv, kHV9);
     } catch (const NotValidated&) {
       refused = true;
     }
@@ -1159,29 +1159,29 @@ void CheckValidationGuard(harness::Ctx& ctx) {
     ctx.Equal(ctx.Redis.Exists("catalog:version:" + cv), 0, "a refused promotion of %s must write nothing; catalog:version:%s exists", cv, cv);
   }
   ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("7"), "catalog:active after refused promotions");
-  ctx.Equal(pair(), k7, "after refused promotions, the versions agents resolve");
-  verdict(ctx, "9", "passed");
-  promote("9", kV9);
-  ctx.Equal(pair(), k9, "a validated candidate must promote; the versions agents resolve");
+  ctx.Equal(hPair(), kH7, "after refused promotions, the versions agents resolve");
+  hVerdict(ctx, "9", "passed");
+  promote("9", kHV9);
+  ctx.Equal(hPair(), kH9, "a validated candidate must promote; the versions agents resolve");
 }
 
 void CheckRunPin(harness::Ctx& ctx) {
-  verdict(ctx, "7", "passed");
-  verdict(ctx, "9", "passed");
-  promote("7", kV7);
+  hVerdict(ctx, "7", "passed");
+  hVerdict(ctx, "9", "passed");
+  promote("7", kHV7);
   auto ttl_at_write = std::make_shared<std::atomic<long long>>(-3);
   ctx.Redis.After("catalog:pin:run-1", [&ctx, ttl_at_write] { *ttl_at_write = ctx.Redis.TTL("catalog:pin:run-1"); });
   pinRun("run-1", "7");
-  json v9x = kV9;
-  v9x["export"] = kX1;
+  json v9x = kHV9;
+  v9x["export"] = kHX1;
   promote("9", v9x);
-  ctx.Equal(pair("run-1"), k7, "run-1 pinned catalog 7: a promotion must not move a running agent onto new definitions mid-plan; the versions run-1 resolves");
+  ctx.Equal(hPair("run-1"), kH7, "run-1 pinned catalog 7: a promotion must not move a running agent onto new definitions mid-plan; the versions run-1 resolves");
   const auto added = resolve("export", "run-1");
   ctx.Assert(!added, "run-1 pinned catalog 7, which has no export tool, and resolves export %s: a pinned run resolves in its pinned version only", added ? added->dump() : "");
   const auto active = resolve("export", "");
   ctx.Assert(active && active->value("version", "") == "e1", "a caller without a run resolves export in the active catalog 9, got %s", active ? active->dump() : "nothing");
-  ctx.Equal(pair(), k9, "a caller without a run resolves the active catalog 9");
-  ctx.Equal(pair("run-2"), k9, "a run that pinned nothing resolves the active catalog 9");
+  ctx.Equal(hPair(), kH9, "a caller without a run resolves the active catalog 9");
+  ctx.Equal(hPair("run-2"), kH9, "a run that pinned nothing resolves the active catalog 9");
   const long long ttl = ctx.Redis.TTL("catalog:pin:run-1");
   ctx.Assert(6 * 3600 - 60 <= ttl && ttl <= 6 * 3600, "catalog:pin:run-1 has TTL %d, expected kPinTtl (6 hours): a pin without a TTL keeps every old catalog alive", ttl);
   const long long first = *ttl_at_write;
@@ -1190,19 +1190,19 @@ void CheckRunPin(harness::Ctx& ctx) {
 
 void CheckRollback(harness::Ctx& ctx) {
   ctx.Assert(!rollback(), "with nothing promoted, rollback must answer nothing");
-  verdict(ctx, "7", "passed");
-  verdict(ctx, "8", "rejected");
-  verdict(ctx, "9", "passed");
-  promote("7", kV7);
+  hVerdict(ctx, "7", "passed");
+  hVerdict(ctx, "8", "rejected");
+  hVerdict(ctx, "9", "passed");
+  promote("7", kHV7);
   const auto first = rollback();
   ctx.Assert(!first, "with only catalog 7 ever promoted there is no replaced version to go back to, and rollback answered %s: answer nothing", first.value_or(""));
   ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("7"), "catalog:active after a rollback with nothing to go back to");
-  promote("9", kV9);  // 8 was a candidate the sandbox rejected: it never went live
-  promote("9", kV9);  // a retried promotion of the active version replaces nothing
+  promote("9", kHV9);  // 8 was a candidate the sandbox rejected: it never went live
+  promote("9", kHV9);  // a retried promotion of the active version replaces nothing
   const auto back = rollback();
   ctx.Equal(back, std::optional<std::string>("7"), "the version catalog 9 replaced is 7 (8 was a rejected candidate, and promoting 9 again replaced nothing); record it at promotion. rollback answered");
   ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("7"), "catalog:active after the rollback");
-  ctx.Equal(pair(), k7, "after the rollback, the versions agents resolve");
+  ctx.Equal(hPair(), kH7, "after the rollback, the versions agents resolve");
 }
 `,
   },

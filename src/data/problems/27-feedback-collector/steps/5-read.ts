@@ -738,127 +738,127 @@ import (
 	"leetbuild/harness"
 )
 
-const readVersion = "support-llm-2026-09"
-const otherVersion = "support-llm-2026-10"
+const kHReadVersion = "support-llm-2026-09"
+const kHOtherVersion = "support-llm-2026-10"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
 // align moves the clock to the middle of an hour, so the buckets a check writes are the ones the read sums.
-func align(ctx *harness.Ctx) int64 {
+func hAlign(ctx *harness.Ctx) int64 {
 	now := ctx.Clock.Now() / 1000
 	ctx.Clock.Advance(float64(3600 - now%3600 + 1800))
 	return ctx.Clock.Now() / 1000
 }
 
-func seed(n, positive int, at int64) {
+func hSeed(n, positive int, at int64) {
 	for i := 0; i < n; i++ {
 		rating := -1
 		if i < positive {
 			rating = 1
 		}
-		store.RecordQuality(readBg, readVersion, rating, at)
+		store.RecordQuality(hReadBg, kHReadVersion, rating, at)
 	}
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func getScore(c *harness.HTTP, query string) *harness.Response {
-	return c.Get("/v1/models/" + readVersion + "/satisfaction" + query)
+func hGetScore(c *harness.HTTP, query string) *harness.Response {
+	return c.Get("/v1/models/" + kHReadVersion + "/satisfaction" + query)
 }
 
-func body(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	m, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the read must answer a JSON object, got %d %s", r.Status, r.Text())
 	return m
 }
 
-func near(v any, want float64) bool {
+func hNear(v any, want float64) bool {
 	f, ok := v.(float64)
 	return ok && f-want < 1e-9 && want-f < 1e-9
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	seed(60, 30, align(ctx))
-	c := readAPI(ctx)
-	def := getScore(c, "")
-	hour := getScore(c, "?window=1h")
-	week := getScore(c, "?window=7d")
-	everything := getScore(c, "?window=all")
-	month := getScore(c, "?window=30d")
-	ctx.Assert(def.Status == 200 && body(ctx, def)["window"] == "24h", "without ?window= the read answered %d %s, expected the 24h window", def.Status, def.Text())
-	ctx.Assert(hour.Status == 200 && body(ctx, hour)["window"] == "1h", "?window=1h answered %d %s", hour.Status, hour.Text())
-	ctx.Assert(week.Status == 200 && body(ctx, week)["window"] == "7d", "?window=7d answered %d %s", week.Status, week.Text())
+	hSeed(60, 30, hAlign(ctx))
+	c := hReadAPI(ctx)
+	def := hGetScore(c, "")
+	hour := hGetScore(c, "?window=1h")
+	week := hGetScore(c, "?window=7d")
+	everything := hGetScore(c, "?window=all")
+	month := hGetScore(c, "?window=30d")
+	ctx.Assert(def.Status == 200 && hBody(ctx, def)["window"] == "24h", "without ?window= the read answered %d %s, expected the 24h window", def.Status, def.Text())
+	ctx.Assert(hour.Status == 200 && hBody(ctx, hour)["window"] == "1h", "?window=1h answered %d %s", hour.Status, hour.Text())
+	ctx.Assert(week.Status == 200 && hBody(ctx, week)["window"] == "7d", "?window=7d answered %d %s", week.Status, week.Text())
 	ctx.Equal(everything.Status, 400, "?window=all (the windows are 1h, 24h and 7d)")
 	ctx.Equal(month.Status, 400, "?window=30d")
 }
 
 func CheckRecentWindow(ctx *harness.Ctx) {
-	now := align(ctx)
-	seed(80, 80, now-8*86400) // last week: every vote a thumbs-up
+	now := hAlign(ctx)
+	hSeed(80, 80, now-8*86400) // last week: every vote a thumbs-up
 	for i := 0; i < 60; i++ { // the last day: 15 of 60
 		rating := -1
 		if i < 15 {
 			rating = 1
 		}
-		store.RecordQuality(readBg, readVersion, rating, now-int64(i%20)*3600)
+		store.RecordQuality(hReadBg, kHReadVersion, rating, now-int64(i%20)*3600)
 	}
 	// Thumbs-up on each side of the windows' oldest bucket: 23 h and 24 h ago, 167 h and 168 h ago.
 	for _, hoursAgo := range []int64{23, 24, 167, 168} {
-		store.RecordQuality(readBg, readVersion, 1, now-hoursAgo*3600)
+		store.RecordQuality(hReadBg, kHReadVersion, 1, now-hoursAgo*3600)
 	}
-	c := readAPI(ctx)
-	hour := getScore(c, "?window=1h")
-	day := getScore(c, "?window=24h")
-	week := getScore(c, "?window=7d")
+	c := hReadAPI(ctx)
+	hour := hGetScore(c, "?window=1h")
+	day := hGetScore(c, "?window=24h")
+	week := hGetScore(c, "?window=7d")
 	ctx.Equal(day.Status, 200, "?window=24h (%s)", day.Text())
-	b := body(ctx, day)
+	b := hBody(ctx, day)
 	ctx.Equal(b["samples"], 61, "the 24h window must count 61 ratings: the last day's 60 and the vote 23 h ago, not the one 24 h ago or 8 days ago (the hours now / 3600 - 23 to now / 3600); samples")
-	ctx.Assert(near(b["score"], 16.0/61), "the 24h score is %v, expected 16 / 61", b["score"])
-	ctx.Equal(body(ctx, hour)["samples"], 3, "the 1h window must count the 3 ratings of the current hour; samples")
-	ctx.Equal(body(ctx, week)["samples"], 63, "the 7d window must count 63 ratings: the votes up to 167 h ago, not the one 168 h ago or 8 days ago; samples")
+	ctx.Assert(hNear(b["score"], 16.0/61), "the 24h score is %v, expected 16 / 61", b["score"])
+	ctx.Equal(hBody(ctx, hour)["samples"], 3, "the 1h window must count the 3 ratings of the current hour; samples")
+	ctx.Equal(hBody(ctx, week)["samples"], 63, "the 7d window must count 63 ratings: the votes up to 167 h ago, not the one 168 h ago or 8 days ago; samples")
 }
 
 func CheckSampleFloor(ctx *harness.Ctx) {
-	now := align(ctx)
-	seed(49, 49, now)
-	c := readAPI(ctx)
-	thin := getScore(c, "?window=24h")
-	store.RecordQuality(readBg, readVersion, -1, now)
+	now := hAlign(ctx)
+	hSeed(49, 49, now)
+	c := hReadAPI(ctx)
+	thin := hGetScore(c, "?window=24h")
+	store.RecordQuality(hReadBg, kHReadVersion, -1, now)
 	ctx.Clock.Advance(61)
-	enough := getScore(c, "?window=24h")
+	enough := hGetScore(c, "?window=24h")
 	ctx.Equal(thin.Status, 200, "the read (%s)", thin.Text())
-	b := body(ctx, thin)
+	b := hBody(ctx, thin)
 	ctx.Equal(b["samples"], 49, "49 ratings; samples")
 	ctx.Assert(b["status"] == "insufficient_data" && b["score"] == nil, "49 ratings answered %s: below 50 samples the read reports insufficient_data and no score", thin.Text())
-	b = body(ctx, enough)
-	ctx.Assert(b["status"] == "ok" && near(b["samples"], 50), "50 ratings answered %s, expected status ok", enough.Text())
-	ctx.Assert(near(b["score"], 0.98), "49 thumbs-up of 50 scored %v, expected 0.98", b["score"])
+	b = hBody(ctx, enough)
+	ctx.Assert(b["status"] == "ok" && hNear(b["samples"], 50), "50 ratings answered %s, expected status ok", enough.Text())
+	ctx.Assert(hNear(b["score"], 0.98), "49 thumbs-up of 50 scored %v, expected 0.98", b["score"])
 }
 
 func CheckCacheTtl(ctx *harness.Ctx) {
-	now := align(ctx)
-	seed(60, 60, now)
-	c := readAPI(ctx)
-	first := getScore(c, "?window=24h")
-	seed(60, 0, now)
-	cached := getScore(c, "?window=24h")
-	hour := body(ctx, getScore(c, "?window=1h"))
-	other := body(ctx, c.Get("/v1/models/"+otherVersion+"/satisfaction?window=24h"))
+	now := hAlign(ctx)
+	hSeed(60, 60, now)
+	c := hReadAPI(ctx)
+	first := hGetScore(c, "?window=24h")
+	hSeed(60, 0, now)
+	cached := hGetScore(c, "?window=24h")
+	hour := hBody(ctx, hGetScore(c, "?window=1h"))
+	other := hBody(ctx, c.Get("/v1/models/"+kHOtherVersion+"/satisfaction?window=24h"))
 	ctx.Clock.Advance(59)
-	late := getScore(c, "?window=24h")
+	late := hGetScore(c, "?window=24h")
 	ctx.Clock.Advance(2)
-	fresh := body(ctx, getScore(c, "?window=24h"))
-	f := body(ctx, first)
-	ctx.Assert(near(f["samples"], 60) && near(f["score"], 1), "60 thumbs-up answered %s", first.Text())
+	fresh := hBody(ctx, hGetScore(c, "?window=24h"))
+	f := hBody(ctx, first)
+	ctx.Assert(hNear(f["samples"], 60) && hNear(f["score"], 1), "60 thumbs-up answered %s", first.Text())
 	ctx.Equal(cached.Text(), first.Text(), "a second read right away must answer the cached body (the score is cached for 60 s)")
-	ctx.Assert(hour["window"] == "1h" && near(hour["samples"], 120), "?window=1h answered %v: the cache is per version and window, so the 1h read computes its own body", hour)
-	ctx.Assert(other["model_version"] == otherVersion && near(other["samples"], 0), "the 24h read of %s, a version with no ratings, answered %v: the cache is per version and window", otherVersion, other)
+	ctx.Assert(hour["window"] == "1h" && hNear(hour["samples"], 120), "?window=1h answered %v: the cache is per version and window, so the 1h read computes its own body", hour)
+	ctx.Assert(other["model_version"] == kHOtherVersion && hNear(other["samples"], 0), "the 24h read of %s, a version with no ratings, answered %v: the cache is per version and window", kHOtherVersion, other)
 	ctx.Equal(late.Text(), first.Text(), "59 s after the first read the 24h read must answer the cached body (the score is cached for 60 s)")
-	ctx.Assert(near(fresh["samples"], 120) && near(fresh["score"], 0.5), "61 s later the 24h read answered %v: a cached score expires after 60 s", fresh)
+	ctx.Assert(hNear(fresh["samples"], 120) && hNear(fresh["score"], 0.5), "61 s later the 24h read answered %v: a cached score expires after 60 s", fresh)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -868,21 +868,21 @@ func CheckCacheTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kVersion = "support-llm-2026-09";
-const std::string kOtherVersion = "support-llm-2026-10";
+const std::string kHVersion = "support-llm-2026-09";
+const std::string kHOtherVersion = "support-llm-2026-10";
 
 // Move the clock to the middle of an hour, so the buckets a check writes are the ones the read sums.
-long long align(harness::Ctx& ctx) {
+long long hAlign(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
   ctx.Clock.Advance(static_cast<double>(3600 - now % 3600 + 1800));
   return ctx.Clock.Now() / 1000;
 }
 
-void seed(int n, int positive, long long at) {
-  for (int i = 0; i < n; i++) store::recordQuality(kVersion, i < positive ? 1 : -1, at);
+void hSeed(int n, int positive, long long at) {
+  for (int i = 0; i < n; i++) store::recordQuality(kHVersion, i < positive ? 1 : -1, at);
 }
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -890,88 +890,88 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response getScore(harness::HTTP& c, const std::string& query) { return c.Get("/v1/models/" + kVersion + "/satisfaction" + query); }
+harness::Response hGetScore(harness::HTTP& c, const std::string& query) { return c.Get("/v1/models/" + kHVersion + "/satisfaction" + query); }
 
-nlohmann::json body(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hBody(harness::Ctx& ctx, const harness::Response& r) {
   const auto b = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(b.is_object(), "the read must answer a JSON object, got %d %s", r.Status, r.Text());
   return b;
 }
 
-bool near(const nlohmann::json& v, double want) { return v.is_number() && std::fabs(v.get<double>() - want) < 1e-9; }
+bool hNear(const nlohmann::json& v, double want) { return v.is_number() && std::fabs(v.get<double>() - want) < 1e-9; }
 
 }  // namespace
 
 void CheckWindow(harness::Ctx& ctx) {
-  seed(60, 30, align(ctx));
-  auto c = readApi(ctx);
-  const auto def = getScore(c, "");
-  const auto hour = getScore(c, "?window=1h");
-  const auto week = getScore(c, "?window=7d");
-  const auto everything = getScore(c, "?window=all");
-  const auto month = getScore(c, "?window=30d");
-  ctx.Assert(def.Status == 200 && body(ctx, def).value("window", "") == "24h", "without ?window= the read answered %d %s, expected the 24h window", def.Status, def.Text());
-  ctx.Assert(hour.Status == 200 && body(ctx, hour).value("window", "") == "1h", "?window=1h answered %d %s", hour.Status, hour.Text());
-  ctx.Assert(week.Status == 200 && body(ctx, week).value("window", "") == "7d", "?window=7d answered %d %s", week.Status, week.Text());
+  hSeed(60, 30, hAlign(ctx));
+  auto c = hReadApi(ctx);
+  const auto def = hGetScore(c, "");
+  const auto hour = hGetScore(c, "?window=1h");
+  const auto week = hGetScore(c, "?window=7d");
+  const auto everything = hGetScore(c, "?window=all");
+  const auto month = hGetScore(c, "?window=30d");
+  ctx.Assert(def.Status == 200 && hBody(ctx, def).value("window", "") == "24h", "without ?window= the read answered %d %s, expected the 24h window", def.Status, def.Text());
+  ctx.Assert(hour.Status == 200 && hBody(ctx, hour).value("window", "") == "1h", "?window=1h answered %d %s", hour.Status, hour.Text());
+  ctx.Assert(week.Status == 200 && hBody(ctx, week).value("window", "") == "7d", "?window=7d answered %d %s", week.Status, week.Text());
   ctx.Equal(everything.Status, 400, "?window=all (the windows are 1h, 24h and 7d)");
   ctx.Equal(month.Status, 400, "?window=30d");
 }
 
 void CheckRecentWindow(harness::Ctx& ctx) {
-  const long long now = align(ctx);
-  seed(80, 80, now - 8 * 86400);  // last week: every vote a thumbs-up
-  for (int i = 0; i < 60; i++) store::recordQuality(kVersion, i < 15 ? 1 : -1, now - (i % 20) * 3600LL);  // the last day: 15 of 60
+  const long long now = hAlign(ctx);
+  hSeed(80, 80, now - 8 * 86400);  // last week: every vote a thumbs-up
+  for (int i = 0; i < 60; i++) store::recordQuality(kHVersion, i < 15 ? 1 : -1, now - (i % 20) * 3600LL);  // the last day: 15 of 60
   // Thumbs-up on each side of the windows' oldest bucket: 23 h and 24 h ago, 167 h and 168 h ago.
-  for (const long long hours_ago : {23LL, 24LL, 167LL, 168LL}) store::recordQuality(kVersion, 1, now - hours_ago * 3600);
-  auto c = readApi(ctx);
-  const auto hour = getScore(c, "?window=1h");
-  const auto day = getScore(c, "?window=24h");
-  const auto week = getScore(c, "?window=7d");
+  for (const long long hours_ago : {23LL, 24LL, 167LL, 168LL}) store::recordQuality(kHVersion, 1, now - hours_ago * 3600);
+  auto c = hReadApi(ctx);
+  const auto hour = hGetScore(c, "?window=1h");
+  const auto day = hGetScore(c, "?window=24h");
+  const auto week = hGetScore(c, "?window=7d");
   ctx.Equal(day.Status, 200, "?window=24h (%s)", day.Text());
-  const auto b = body(ctx, day);
+  const auto b = hBody(ctx, day);
   ctx.Equal(b.value("samples", 0LL), 61, "the 24h window must count 61 ratings: the last day's 60 and the vote 23 h ago, not the one 24 h ago or 8 days ago (the hours now / 3600 - 23 to now / 3600); samples");
-  ctx.Assert(near(b.value("score", nlohmann::json()), 16.0 / 61), "the 24h score is %s, expected 16 / 61", b.value("score", nlohmann::json()).dump());
-  ctx.Equal(body(ctx, hour).value("samples", 0LL), 3, "the 1h window must count the 3 ratings of the current hour; samples");
-  ctx.Equal(body(ctx, week).value("samples", 0LL), 63, "the 7d window must count 63 ratings: the votes up to 167 h ago, not the one 168 h ago or 8 days ago; samples");
+  ctx.Assert(hNear(b.value("score", nlohmann::json()), 16.0 / 61), "the 24h score is %s, expected 16 / 61", b.value("score", nlohmann::json()).dump());
+  ctx.Equal(hBody(ctx, hour).value("samples", 0LL), 3, "the 1h window must count the 3 ratings of the current hour; samples");
+  ctx.Equal(hBody(ctx, week).value("samples", 0LL), 63, "the 7d window must count 63 ratings: the votes up to 167 h ago, not the one 168 h ago or 8 days ago; samples");
 }
 
 void CheckSampleFloor(harness::Ctx& ctx) {
-  const long long now = align(ctx);
-  seed(49, 49, now);
-  auto c = readApi(ctx);
-  const auto thin = getScore(c, "?window=24h");
-  store::recordQuality(kVersion, -1, now);
+  const long long now = hAlign(ctx);
+  hSeed(49, 49, now);
+  auto c = hReadApi(ctx);
+  const auto thin = hGetScore(c, "?window=24h");
+  store::recordQuality(kHVersion, -1, now);
   ctx.Clock.Advance(61);
-  const auto enough = getScore(c, "?window=24h");
+  const auto enough = hGetScore(c, "?window=24h");
   ctx.Equal(thin.Status, 200, "the read (%s)", thin.Text());
-  auto b = body(ctx, thin);
+  auto b = hBody(ctx, thin);
   ctx.Equal(b.value("samples", 0LL), 49, "49 ratings; samples");
   ctx.Assert(b.value("status", "") == "insufficient_data" && b.contains("score") && b["score"].is_null(), "49 ratings answered %s: below 50 samples the read reports insufficient_data and no score", thin.Text());
-  b = body(ctx, enough);
+  b = hBody(ctx, enough);
   ctx.Assert(b.value("status", "") == "ok" && b.value("samples", 0LL) == 50, "50 ratings answered %s, expected status ok", enough.Text());
-  ctx.Assert(near(b.value("score", nlohmann::json()), 0.98), "49 thumbs-up of 50 scored %s, expected 0.98", b.value("score", nlohmann::json()).dump());
+  ctx.Assert(hNear(b.value("score", nlohmann::json()), 0.98), "49 thumbs-up of 50 scored %s, expected 0.98", b.value("score", nlohmann::json()).dump());
 }
 
 void CheckCacheTtl(harness::Ctx& ctx) {
-  const long long now = align(ctx);
-  seed(60, 60, now);
-  auto c = readApi(ctx);
-  const auto first = getScore(c, "?window=24h");
-  seed(60, 0, now);
-  const auto cached = getScore(c, "?window=24h");
-  const auto hour = body(ctx, getScore(c, "?window=1h"));
-  const auto other = body(ctx, c.Get("/v1/models/" + kOtherVersion + "/satisfaction?window=24h"));
+  const long long now = hAlign(ctx);
+  hSeed(60, 60, now);
+  auto c = hReadApi(ctx);
+  const auto first = hGetScore(c, "?window=24h");
+  hSeed(60, 0, now);
+  const auto cached = hGetScore(c, "?window=24h");
+  const auto hour = hBody(ctx, hGetScore(c, "?window=1h"));
+  const auto other = hBody(ctx, c.Get("/v1/models/" + kHOtherVersion + "/satisfaction?window=24h"));
   ctx.Clock.Advance(59);
-  const auto late = getScore(c, "?window=24h");
+  const auto late = hGetScore(c, "?window=24h");
   ctx.Clock.Advance(2);
-  const auto fresh = body(ctx, getScore(c, "?window=24h"));
-  const auto f = body(ctx, first);
-  ctx.Assert(f.value("samples", 0LL) == 60 && near(f.value("score", nlohmann::json()), 1.0), "60 thumbs-up answered %s", first.Text());
+  const auto fresh = hBody(ctx, hGetScore(c, "?window=24h"));
+  const auto f = hBody(ctx, first);
+  ctx.Assert(f.value("samples", 0LL) == 60 && hNear(f.value("score", nlohmann::json()), 1.0), "60 thumbs-up answered %s", first.Text());
   ctx.Equal(cached.Text(), first.Text(), "a second read right away must answer the cached body (the score is cached for 60 s)");
   ctx.Assert(hour.value("window", "") == "1h" && hour.value("samples", 0LL) == 120, "?window=1h answered %s: the cache is per version and window, so the 1h read computes its own body", hour.dump());
-  ctx.Assert(other.value("model_version", "") == kOtherVersion && other.value("samples", -1LL) == 0, "the 24h read of %s, a version with no ratings, answered %s: the cache is per version and window", kOtherVersion, other.dump());
+  ctx.Assert(other.value("model_version", "") == kHOtherVersion && other.value("samples", -1LL) == 0, "the 24h read of %s, a version with no ratings, answered %s: the cache is per version and window", kHOtherVersion, other.dump());
   ctx.Equal(late.Text(), first.Text(), "59 s after the first read the 24h read must answer the cached body (the score is cached for 60 s)");
-  ctx.Assert(fresh.value("samples", 0LL) == 120 && near(fresh.value("score", nlohmann::json()), 0.5), "61 s later the 24h read answered %s: a cached score expires after 60 s", fresh.dump());
+  ctx.Assert(fresh.value("samples", 0LL) == 120 && hNear(fresh.value("score", nlohmann::json()), 0.5), "61 s later the 24h read answered %s: a cached score expires after 60 s", fresh.dump());
 }
 `,
   },

@@ -829,18 +829,18 @@ import (
 )
 
 var (
-	missKey  = "pc:t1:7:" + strings.Repeat("b", 64)
-	rivalKey = "pc:t1:7:" + strings.Repeat("e", 64)
+	hMissKey  = "pc:t1:7:" + strings.Repeat("b", 64)
+	hRivalKey = "pc:t1:7:" + strings.Repeat("e", 64)
 )
 
-const missQuestion = "What is the capital of France?"
+const kHMissQuestion = "What is the capital of France?"
 
 // modelPeer is the stand-in model server: answers from pcache/llm; a "tool:" prefix ends in a tool call.
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedModelServer
 }
 
-func (modelPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (HModelPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	if strings.HasPrefix(req.GetPrefix(), "tool:") {
 		return &pb.CompleteReply{Text: "Answer: calling get_weather", FinishReason: "tool_calls", CompletionTokens: 4}, nil
 	}
@@ -848,8 +848,8 @@ func (modelPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 	return &pb.CompleteReply{Text: text, FinishReason: reason, CompletionTokens: int32(tokens)}, nil
 }
 
-func missWorld(ctx *harness.Ctx) {
-	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &modelPeer{})
+func hMissWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.Model), &HModelPeer{})
 	// Step 2's fill over the harness's Redis: one SET NX EX, the stored record when it loses.
 	fill = func(_ context.Context, key string, rec record.Record) (record.Record, error) {
 		raw, _ := json.Marshal(rec)
@@ -863,97 +863,97 @@ func missWorld(ctx *harness.Ctx) {
 	}
 }
 
-func missCall(ctx *harness.Ctx, prefix string, temperature float64) record.Miss {
-	miss, err := completeMiss(context.Background(), missKey, "t1", 7, prefix, temperature)
+func hMissCall(ctx *harness.Ctx, prefix string, temperature float64) record.Miss {
+	miss, err := completeMiss(context.Background(), hMissKey, "t1", 7, prefix, temperature)
 	ctx.NoError(err, "completeMiss(%q)", prefix)
 	return miss
 }
 
-func missCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Complete", "") }
+func hMissCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Complete", "") }
 
 func CheckCachedAnswer(ctx *harness.Ctx) {
-	missWorld(ctx)
-	miss := missCall(ctx, missQuestion, 0)
-	text, _, tokens := llm.Complete(missQuestion, 0)
+	hMissWorld(ctx)
+	miss := hMissCall(ctx, kHMissQuestion, 0)
+	text, _, tokens := llm.Complete(kHMissQuestion, 0)
 	ctx.Equal(miss.Status, "cached", "a temperature-0 answer that finished with stop is stored; the status (%+v)", miss)
 	ctx.Equal(miss.Completion, text, "the miss answers the model's completion")
-	ctx.Equal(len(missCalls(ctx)), 1, "one miss, one model call; Complete calls")
-	raw, ok := ctx.Redis.Get(missKey)
-	ctx.Assert(ok, "the answer must be filled under %s, found %v", missKey, ctx.Redis.Keys("pc:*"))
+	ctx.Equal(len(hMissCalls(ctx)), 1, "one miss, one model call; Complete calls")
+	raw, ok := ctx.Redis.Get(hMissKey)
+	ctx.Assert(ok, "the answer must be filled under %s, found %v", hMissKey, ctx.Redis.Keys("pc:*"))
 	var rec record.Record
 	ctx.NoError(json.Unmarshal([]byte(raw), &rec), "the entry is a record's JSON (%s)", raw)
 	ctx.Equal(rec, record.Record{Tenant: "t1", Version: 7, Completion: text, Tokens: tokens}, "the entry must be the record {tenant, version, completion, tokens}")
 	rival := record.Record{Tenant: "t1", Version: 7, Completion: "Answer from replica B", Tokens: 4}
 	rivalRaw, _ := json.Marshal(rival)
-	ctx.Redis.Set(rivalKey, string(rivalRaw), "EX", config.VersionTTLSeconds) // another replica filled this key first
-	lost, err := completeMiss(context.Background(), rivalKey, "t1", 7, missQuestion, 0)
+	ctx.Redis.Set(hRivalKey, string(rivalRaw), "EX", config.VersionTTLSeconds) // another replica filled this key first
+	lost, err := completeMiss(context.Background(), hRivalKey, "t1", 7, kHMissQuestion, 0)
 	ctx.NoError(err, "completeMiss over a key another replica filled")
 	ctx.Assert(lost.Status == "cached" && lost.Completion == rival.Completion, "another replica filled the key first, so the fill keeps its record and the miss must answer the stored completion %q, got %+v", rival.Completion, lost)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	missWorld(ctx)
+	hMissWorld(ctx)
 	ctx.GRPC.SetLatency("Complete", 10.0, config.Model)
 	started := ctx.Clock.Now()
-	miss := missCall(ctx, missQuestion, 0)
+	miss := hMissCall(ctx, kHMissQuestion, 0)
 	waited := float64(ctx.Clock.Now()-started) / 1000
-	calls := missCalls(ctx)
+	calls := hMissCalls(ctx)
 	ctx.Assert(len(calls) > 0 && calls[0].HasDeadline(), "the Complete call carries no deadline: a model server that hangs holds the request for as long as it likes")
 	ctx.Assert(2500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 3500*time.Millisecond, "the deadline must be 3 s, got %v", calls[0].Timeout)
 	ctx.Assert(waited <= 3.5, "the miss waited %.1f s on a model that takes 10 s: the deadline must cut it at 3 s", waited)
 	ctx.Equal(miss.Status, "error", "a call cut at the deadline answers status")
 	ctx.Equal(len(ctx.Redis.Keys("pc:*")), 0, "a call cut at the deadline stores nothing; entries")
 	ctx.GRPC.SetLatency("Complete", 2.0, config.Model)
-	ctx.Equal(missCall(ctx, missQuestion, 0).Status, "cached", "a model that answers in 2 s is within the deadline and its answer is stored; the status")
+	ctx.Equal(hMissCall(ctx, kHMissQuestion, 0).Status, "cached", "a model that answers in 2 s is within the deadline and its answer is stored; the status")
 }
 
 func CheckTemperatureGate(ctx *harness.Ctx) {
-	missWorld(ctx)
-	miss := missCall(ctx, missQuestion, 0.7)
-	sampled, _, _ := llm.Complete(missQuestion, 0.7)
+	hMissWorld(ctx)
+	miss := hMissCall(ctx, kHMissQuestion, 0.7)
+	sampled, _, _ := llm.Complete(kHMissQuestion, 0.7)
 	ctx.Equal(miss.Status, "uncached", "a temperature-0.7 answer is a sample, served to its caller and not stored; the status")
 	ctx.Equal(miss.Completion, sampled, "the caller still gets the sampled completion")
 	ctx.Equal(len(ctx.Redis.Keys("pc:*")), 0, "a sampled answer was stored: every later caller of this prefix would get the first caller's sample; entries")
-	low := missCall(ctx, missQuestion, 0.05)
+	low := hMissCall(ctx, kHMissQuestion, 0.05)
 	ctx.Assert(low.Status == "uncached" && len(ctx.Redis.Keys("pc:*")) == 0, "temperature 0.05 is still sampled and must not be stored, got %+v and entries %v", low, ctx.Redis.Keys("pc:*"))
-	ctx.Equal(missCall(ctx, missQuestion, 0).Status, "cached", "the same prefix at temperature 0 is stored; the status")
+	ctx.Equal(hMissCall(ctx, kHMissQuestion, 0).Status, "cached", "the same prefix at temperature 0 is stored; the status")
 }
 
 func CheckStopOnly(ctx *harness.Ctx) {
-	missWorld(ctx)
-	miss := missCall(ctx, "long: summarise the attached master services agreement", 0)
+	hMissWorld(ctx)
+	miss := hMissCall(ctx, "long: summarise the attached master services agreement", 0)
 	ctx.Equal(miss.Status, "uncached", "a reply cut at the token limit (finish_reason length) is served and not stored; the status")
 	ctx.Assert(strings.HasPrefix(miss.Completion, "Answer:"), "the caller still gets the truncated completion, got %q", miss.Completion)
 	ctx.Equal(len(ctx.Redis.Keys("pc:*")), 0, "a truncated answer was stored: it would be served as the whole answer for six hours; entries")
-	tool := missCall(ctx, "tool: what is the weather in Paris?", 0)
+	tool := hMissCall(ctx, "tool: what is the weather in Paris?", 0)
 	ctx.Assert(tool.Status == "uncached" && len(ctx.Redis.Keys("pc:*")) == 0, "a reply that finished with tool_calls is not a finished answer: only stop is stored, got %+v and entries %v", tool, ctx.Redis.Keys("pc:*"))
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
-	missWorld(ctx)
-	miss := missCall(ctx, "refuse: how do I pick a lock?", 0)
+	hMissWorld(ctx)
+	miss := hMissCall(ctx, "refuse: how do I pick a lock?", 0)
 	ctx.Equal(miss.Status, "refused", "a content_filter reply answers status")
 	ctx.Equal(miss.Completion, "", "a refusal carries no completion")
-	ctx.Equal(len(missCalls(ctx)), 1, "a refusal is the model's decision, not a transient failure; Complete calls")
+	ctx.Equal(len(hMissCalls(ctx)), 1, "a refusal is the model's decision, not a transient failure; Complete calls")
 	ctx.Equal(len(ctx.Redis.Keys("pc:*")), 0, "a refusal was stored: the empty text would be served as an answer; entries")
 }
 
 func CheckErrorUncached(ctx *harness.Ctx) {
-	missWorld(ctx)
+	hMissWorld(ctx)
 	ctx.GRPC.Fail("Complete", codes.Unavailable, "model server restarting", 1, config.Model)
-	miss := missCall(ctx, missQuestion, 0)
+	miss := hMissCall(ctx, kHMissQuestion, 0)
 	ctx.Equal(miss.Status, "error", "a failed model call answers status")
 	ctx.Equal(miss.Completion, "", "a failed call carries no completion")
-	stored, has := ctx.Redis.Get(missKey)
+	stored, has := ctx.Redis.Get(hMissKey)
 	ctx.Assert(!has, "a failed call stored %s under the key: every caller of this prefix would get it for six hours", stored)
 	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
 		ctx.GRPC.Fail("Complete", code, "model server failed", 1, config.Model)
-		failed := missCall(ctx, missQuestion, 0)
+		failed := hMissCall(ctx, kHMissQuestion, 0)
 		ctx.Assert(failed.Status == "error" && failed.Completion == "", "a call failing with %v answers status error with no completion, got %+v", code, failed)
-		_, has = ctx.Redis.Get(missKey)
+		_, has = ctx.Redis.Get(hMissKey)
 		ctx.Assert(!has, "a call failing with %v stored an entry under the key", code)
 	}
-	again := missCall(ctx, missQuestion, 0)
+	again := hMissCall(ctx, kHMissQuestion, 0)
 	ctx.Assert(again.Status == "cached" && strings.HasPrefix(again.Completion, "Answer:"), "once the model answers again the miss is filled, got %+v", again)
 }
 `,
@@ -966,12 +966,12 @@ func CheckErrorUncached(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kKey = "pc:t1:7:" + std::string(64, 'b');
-const std::string kRivalKey = "pc:t1:7:" + std::string(64, 'e');
-const std::string kQuestion = "What is the capital of France?";
+const std::string kHKey = "pc:t1:7:" + std::string(64, 'b');
+const std::string kHRivalKey = "pc:t1:7:" + std::string(64, 'e');
+const std::string kHQuestion = "What is the capital of France?";
 
 // The stand-in model server: answers from pcache/llm.h; a "tool:" prefix ends in a tool call.
-class ModelPeer final : public pcache::Model::Service {
+class HModelPeer final : public pcache::Model::Service {
  public:
   grpc::Status Complete(grpc::ServerContext*, const pcache::CompleteRequest* req, pcache::CompleteReply* reply) override {
     if (req->prefix().rfind("tool:", 0) == 0) {
@@ -988,40 +988,40 @@ class ModelPeer final : public pcache::Model::Service {
   }
 };
 
-void missWorld(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+void hMissWorld(harness::Ctx& ctx) {
+  static HModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer();
+  peer = new HModelPeer();
   ctx.GRPC.Server(config::kModel)->RegisterService(peer);
 }
 
-record::Miss missCall(const std::string& prefix, double temperature) { return complete_miss(kKey, "t1", 7, prefix, temperature); }
+record::Miss hMissCall(const std::string& prefix, double temperature) { return complete_miss(kHKey, "t1", 7, prefix, temperature); }
 
 }  // namespace
 
 void CheckCachedAnswer(harness::Ctx& ctx) {
-  missWorld(ctx);
-  const record::Miss miss = missCall(kQuestion, 0);
-  const llm::Completion expected = llm::complete(kQuestion, 0);
+  hMissWorld(ctx);
+  const record::Miss miss = hMissCall(kHQuestion, 0);
+  const llm::Completion expected = llm::complete(kHQuestion, 0);
   ctx.Equal(miss.status, "cached", "a temperature-0 answer that finished with stop is stored; the status");
   ctx.Equal(miss.completion, expected.text, "the miss answers the model's completion");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 1, "one miss, one model call; Complete calls");
-  const auto raw = ctx.Redis.Get(kKey);
-  ctx.Assert(raw.has_value(), "the answer must be filled under %s, found %v", kKey, ctx.Redis.Keys("pc:*"));
+  const auto raw = ctx.Redis.Get(kHKey);
+  ctx.Assert(raw.has_value(), "the answer must be filled under %s, found %v", kHKey, ctx.Redis.Keys("pc:*"));
   const record::Record rec = record::decode(*raw);
   ctx.Assert(rec.tenant == "t1" && rec.version == 7 && rec.completion == expected.text && rec.tokens == expected.tokens,
              "the entry must be the record {tenant, version, completion, tokens}, got %s", *raw);
   const record::Record rival{"t1", 7, "Answer from replica B", 4};
-  ctx.Redis.Set(kRivalKey, record::encode(rival), "EX", config::kVersionTtlSeconds);  // another replica filled this key first
-  const record::Miss lost = complete_miss(kRivalKey, "t1", 7, kQuestion, 0);
+  ctx.Redis.Set(kHRivalKey, record::encode(rival), "EX", config::kVersionTtlSeconds);  // another replica filled this key first
+  const record::Miss lost = complete_miss(kHRivalKey, "t1", 7, kHQuestion, 0);
   ctx.Assert(lost.status == "cached" && lost.completion == rival.completion, "another replica filled the key first, so the fill keeps its record and the miss must answer the stored completion %q, got status %q completion %q", rival.completion, lost.status, lost.completion);
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  missWorld(ctx);
+  hMissWorld(ctx);
   ctx.GRPC.SetLatency("Complete", 10.0, config::kModel);
   const int64_t started = ctx.Clock.Now();
-  const record::Miss miss = missCall(kQuestion, 0);
+  const record::Miss miss = hMissCall(kHQuestion, 0);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   const auto calls = ctx.GRPC.CallsTo("Complete");
   ctx.Assert(!calls.empty() && calls[0].HasDeadline(), "the Complete call carries no deadline: a model server that hangs holds the request for as long as it likes");
@@ -1030,33 +1030,33 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Equal(miss.status, "error", "a call cut at the deadline answers status");
   ctx.Equal(ctx.Redis.Keys("pc:*").size(), 0, "a call cut at the deadline stores nothing; entries");
   ctx.GRPC.SetLatency("Complete", 2.0, config::kModel);
-  ctx.Equal(missCall(kQuestion, 0).status, "cached", "a model that answers in 2 s is within the deadline and its answer is stored; the status");
+  ctx.Equal(hMissCall(kHQuestion, 0).status, "cached", "a model that answers in 2 s is within the deadline and its answer is stored; the status");
 }
 
 void CheckTemperatureGate(harness::Ctx& ctx) {
-  missWorld(ctx);
-  const record::Miss miss = missCall(kQuestion, 0.7);
+  hMissWorld(ctx);
+  const record::Miss miss = hMissCall(kHQuestion, 0.7);
   ctx.Equal(miss.status, "uncached", "a temperature-0.7 answer is a sample, served to its caller and not stored; the status");
-  ctx.Equal(miss.completion, llm::complete(kQuestion, 0.7).text, "the caller still gets the sampled completion");
+  ctx.Equal(miss.completion, llm::complete(kHQuestion, 0.7).text, "the caller still gets the sampled completion");
   ctx.Equal(ctx.Redis.Keys("pc:*").size(), 0, "a sampled answer was stored: every later caller of this prefix would get the first caller's sample; entries");
-  const record::Miss low = missCall(kQuestion, 0.05);
+  const record::Miss low = hMissCall(kHQuestion, 0.05);
   ctx.Assert(low.status == "uncached" && ctx.Redis.Keys("pc:*").empty(), "temperature 0.05 is still sampled and must not be stored, got status %q and entries %v", low.status, ctx.Redis.Keys("pc:*"));
-  ctx.Equal(missCall(kQuestion, 0).status, "cached", "the same prefix at temperature 0 is stored; the status");
+  ctx.Equal(hMissCall(kHQuestion, 0).status, "cached", "the same prefix at temperature 0 is stored; the status");
 }
 
 void CheckStopOnly(harness::Ctx& ctx) {
-  missWorld(ctx);
-  const record::Miss miss = missCall("long: summarise the attached master services agreement", 0);
+  hMissWorld(ctx);
+  const record::Miss miss = hMissCall("long: summarise the attached master services agreement", 0);
   ctx.Equal(miss.status, "uncached", "a reply cut at the token limit (finish_reason length) is served and not stored; the status");
   ctx.Assert(miss.completion.rfind("Answer:", 0) == 0, "the caller still gets the truncated completion, got %q", miss.completion);
   ctx.Equal(ctx.Redis.Keys("pc:*").size(), 0, "a truncated answer was stored: it would be served as the whole answer for six hours; entries");
-  const record::Miss tool = missCall("tool: what is the weather in Paris?", 0);
+  const record::Miss tool = hMissCall("tool: what is the weather in Paris?", 0);
   ctx.Assert(tool.status == "uncached" && ctx.Redis.Keys("pc:*").empty(), "a reply that finished with tool_calls is not a finished answer: only stop is stored, got status %q and entries %v", tool.status, ctx.Redis.Keys("pc:*"));
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
-  missWorld(ctx);
-  const record::Miss miss = missCall("refuse: how do I pick a lock?", 0);
+  hMissWorld(ctx);
+  const record::Miss miss = hMissCall("refuse: how do I pick a lock?", 0);
   ctx.Equal(miss.status, "refused", "a content_filter reply answers status");
   ctx.Equal(miss.completion, "", "a refusal carries no completion");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 1, "a refusal is the model's decision, not a transient failure; Complete calls");
@@ -1064,19 +1064,19 @@ void CheckRefusalTerminal(harness::Ctx& ctx) {
 }
 
 void CheckErrorUncached(harness::Ctx& ctx) {
-  missWorld(ctx);
+  hMissWorld(ctx);
   ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "model server restarting", 1, config::kModel);
-  const record::Miss miss = missCall(kQuestion, 0);
+  const record::Miss miss = hMissCall(kHQuestion, 0);
   ctx.Equal(miss.status, "error", "a failed model call answers status");
   ctx.Equal(miss.completion, "", "a failed call carries no completion");
-  ctx.Assert(!ctx.Redis.Get(kKey).has_value(), "a failed call stored %s under the key: every caller of this prefix would get it for six hours", ctx.Redis.Get(kKey).value_or(""));
+  ctx.Assert(!ctx.Redis.Get(kHKey).has_value(), "a failed call stored %s under the key: every caller of this prefix would get it for six hours", ctx.Redis.Get(kHKey).value_or(""));
   for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
     ctx.GRPC.Fail("Complete", code, "model server failed", 1, config::kModel);
-    const record::Miss failed = missCall(kQuestion, 0);
+    const record::Miss failed = hMissCall(kHQuestion, 0);
     ctx.Assert(failed.status == "error" && failed.completion.empty(), "a call failing with %s answers status error with no completion, got status %q", name, failed.status);
-    ctx.Assert(!ctx.Redis.Get(kKey).has_value(), "a call failing with %s stored an entry under the key", name);
+    ctx.Assert(!ctx.Redis.Get(kHKey).has_value(), "a call failing with %s stored an entry under the key", name);
   }
-  const record::Miss again = missCall(kQuestion, 0);
+  const record::Miss again = hMissCall(kHQuestion, 0);
   ctx.Assert(again.status == "cached" && again.completion.rfind("Answer:", 0) == 0, "once the model answers again the miss is filled, got status %q", again.status);
 }
 `,

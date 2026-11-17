@@ -723,18 +723,18 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsComment = "The answer cited the 2023 refund policy"
+const kHEventsComment = "The answer cited the 2023 refund policy"
 
-func eventsRow(feedbackID, tenant, requestID string, rating int) store.Feedback {
-	return store.Feedback{FeedbackID: feedbackID, Tenant: tenant, UserID: "u-1", RequestID: requestID, Rating: rating, Comment: eventsComment,
+func hEventsRow(feedbackID, tenant, requestID string, rating int) store.Feedback {
+	return store.Feedback{FeedbackID: feedbackID, Tenant: tenant, UserID: "u-1", RequestID: requestID, Rating: rating, Comment: kHEventsComment,
 		ModelVersion: "support-llm-2026-09", PromptVersion: "triage-v4", Route: "primary"}
 }
 
-func eventsPublish(ctx *harness.Ctx, row store.Feedback) {
+func hEventsPublish(ctx *harness.Ctx, row store.Feedback) {
 	ctx.NoError(publishRecorded(context.Background(), row), "publishRecorded(%s) failed", row.FeedbackID)
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]any {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, row := range ctx.Redis.LRange("outbox:feedback.recorded", 0, -1) {
 		var e map[string]any
@@ -745,10 +745,10 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRow("fb-1", "t-acme", "req-1", 1))
-	eventsPublish(ctx, eventsRow("fb-2", "t-acme", "req-2", 1))
-	eventsPublish(ctx, eventsRow("fb-3", "t-other", "req-1", 1))
-	eventsPublish(ctx, eventsRow("fb-4", "t-acme", "req-3", 1))
+	hEventsPublish(ctx, hEventsRow("fb-1", "t-acme", "req-1", 1))
+	hEventsPublish(ctx, hEventsRow("fb-2", "t-acme", "req-2", 1))
+	hEventsPublish(ctx, hEventsRow("fb-3", "t-other", "req-1", 1))
+	hEventsPublish(ctx, hEventsRow("fb-4", "t-acme", "req-3", 1))
 	ctx.Settle()
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 4, "four rows must produce four records on %s; the records", topic)
@@ -764,11 +764,11 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckCommentFingerprint(ctx *harness.Ctx) {
-	rows := []store.Feedback{eventsRow("fb-1", "t-acme", "req-1", 1), eventsRow("fb-2", "t-acme", "req-2", -1)}
+	rows := []store.Feedback{hEventsRow("fb-1", "t-acme", "req-1", 1), hEventsRow("fb-2", "t-acme", "req-2", -1)}
 	// Non-ASCII and a trailing space: the fingerprint is of the comment's exact UTF-8 bytes.
 	rows[1].Comment = "Très utile, merci 👍 "
 	for _, row := range rows {
-		eventsPublish(ctx, row)
+		hEventsPublish(ctx, row)
 	}
 	ctx.Settle()
 	values := ctx.Kafka.Values(topic)
@@ -796,7 +796,7 @@ func CheckCommentFingerprint(ctx *harness.Ctx) {
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsRow("fb-1", "t-acme", "req-1", 1))
+	hEventsPublish(ctx, hEventsRow("fb-1", "t-acme", "req-1", 1))
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one row must produce one record; the records")
 	ctx.Kafka.Failover(topic)
@@ -811,20 +811,20 @@ func CheckOutbox(ctx *harness.Ctx) {
 				ctx.Fatalf("publishRecorded panicked when the broker refused the produce: %v", e)
 			}
 		}()
-		eventsPublish(ctx, eventsRow("fb-1", "t-acme", "req-1", 1))
+		hEventsPublish(ctx, hEventsRow("fb-1", "t-acme", "req-1", 1))
 	}()
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: the returned error must write the outbox row; outbox rows")
 	ctx.Assert(rows[0]["feedback_id"] == "fb-1" && rows[0]["rating"] == float64(1), "the outbox row must be the event, got %v", rows[0])
 	_, hasComment := rows[0]["comment"]
 	ctx.Assert(!hasComment && !strings.Contains(fmt.Sprint(rows[0]), "refund policy"), "the outbox row carries the comment text: %v; it holds the event, with the fingerprint", rows[0])
-	sum := sha256.Sum256([]byte(eventsComment))
+	sum := sha256.Sum256([]byte(kHEventsComment))
 	ctx.Equal(rows[0]["comment_fingerprint"], hex.EncodeToString(sum[:]), "the outbox row must be the event with its comment_fingerprint")
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "nothing reached the topic for the refused produce; records")
-	eventsPublish(ctx, eventsRow("fb-2", "t-acme", "req-2", 1))
+	hEventsPublish(ctx, hEventsRow("fb-2", "t-acme", "req-2", 1))
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(topic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(topic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -840,19 +840,19 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kComment = "The answer cited the 2023 refund policy";
+const std::string kHComment = "The answer cited the 2023 refund policy";
 
-store::Feedback eventsRow(const std::string& feedback_id, const std::string& tenant, const std::string& request_id, int rating) {
-  return store::Feedback{feedback_id, tenant, "u-1", request_id, rating, kComment, "support-llm-2026-09", "triage-v4", "primary"};
+store::Feedback hEventsRow(const std::string& feedback_id, const std::string& tenant, const std::string& request_id, int rating) {
+  return store::Feedback{feedback_id, tenant, "u-1", request_id, rating, kHComment, "support-llm-2026-09", "triage-v4", "primary"};
 }
 
 // Serve the producer's delivery reports, as the service loop does between requests.
-void settle(harness::Ctx& ctx) {
+void hSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("outbox:feedback.recorded", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
@@ -861,11 +861,11 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  publish_recorded(eventsRow("fb-1", "t-acme", "req-1", 1));
-  publish_recorded(eventsRow("fb-2", "t-acme", "req-2", 1));
-  publish_recorded(eventsRow("fb-3", "t-other", "req-1", 1));
-  publish_recorded(eventsRow("fb-4", "t-acme", "req-3", 1));
-  settle(ctx);
+  publish_recorded(hEventsRow("fb-1", "t-acme", "req-1", 1));
+  publish_recorded(hEventsRow("fb-2", "t-acme", "req-2", 1));
+  publish_recorded(hEventsRow("fb-3", "t-other", "req-1", 1));
+  publish_recorded(hEventsRow("fb-4", "t-acme", "req-3", 1));
+  hSettle(ctx);
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 4, "four rows must produce four records on %s; the records", kTopic);
   const auto keys = ctx.Kafka.Keys(kTopic);
@@ -878,11 +878,11 @@ void CheckTenantKey(harness::Ctx& ctx) {
 }
 
 void CheckCommentFingerprint(harness::Ctx& ctx) {
-  std::vector<store::Feedback> rows = {eventsRow("fb-1", "t-acme", "req-1", 1), eventsRow("fb-2", "t-acme", "req-2", -1)};
+  std::vector<store::Feedback> rows = {hEventsRow("fb-1", "t-acme", "req-1", 1), hEventsRow("fb-2", "t-acme", "req-2", -1)};
   // Non-ASCII and a trailing space: the fingerprint is of the comment's exact UTF-8 bytes.
   rows[1].comment = "Très utile, merci 👍 ";
   for (const auto& row : rows) publish_recorded(row);
-  settle(ctx);
+  hSettle(ctx);
   const auto values = ctx.Kafka.Values(kTopic);
   ctx.Equal(values.size(), 2, "two rows must produce two records; the records");
   for (size_t i = 0; i < values.size() && i < rows.size(); i++) {
@@ -904,8 +904,8 @@ void CheckCommentFingerprint(harness::Ctx& ctx) {
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
-  publish_recorded(eventsRow("fb-1", "t-acme", "req-1", 1));
-  settle(ctx);
+  publish_recorded(hEventsRow("fb-1", "t-acme", "req-1", 1));
+  hSettle(ctx);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one row must produce one record; the records");
   ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the partition leader failed right after the write and took the event with it: a write acknowledged by the leader alone (acks=1) is not on the followers yet. Produce with acks=all; the records");
@@ -914,21 +914,21 @@ void CheckAcksAll(harness::Ctx& ctx) {
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
   try {
-    publish_recorded(eventsRow("fb-1", "t-acme", "req-1", 1));
+    publish_recorded(hEventsRow("fb-1", "t-acme", "req-1", 1));
   } catch (const std::exception& e) {
     ctx.Fatalf("publish_recorded threw when the broker refused the produce: %s; the event goes to the outbox and the vote goes on", e.what());
   }
-  settle(ctx);
-  const auto rows = eventsOutbox(ctx);
+  hSettle(ctx);
+  const auto rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: the delivery report (dr_cb) must write the outbox row; outbox rows");
   ctx.Assert(!rows.empty() && rows[0].is_object() && rows[0].value("feedback_id", "") == "fb-1" && rows[0].value("rating", 0) == 1,
              "the outbox row must be the event, got %v", rows.empty() ? nlohmann::json() : rows[0]);
   ctx.Assert(!rows[0].contains("comment") && rows[0].dump().find("refund policy") == std::string::npos, "the outbox row carries the comment text: %v; it holds the event, with the fingerprint", rows[0]);
-  ctx.Equal(rows[0].value("comment_fingerprint", ""), sha256_hex(kComment), "the outbox row must be the event with its comment_fingerprint");
+  ctx.Equal(rows[0].value("comment_fingerprint", ""), sha256_hex(kHComment), "the outbox row must be the event with its comment_fingerprint");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "nothing reached the topic for the refused produce; records");
-  publish_recorded(eventsRow("fb-2", "t-acme", "req-2", 1));
-  settle(ctx);
-  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && eventsOutbox(ctx).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
+  publish_recorded(hEventsRow("fb-2", "t-acme", "req-2", 1));
+  hSettle(ctx);
+  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && hEventsOutbox(ctx).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
 }
 `,
   },

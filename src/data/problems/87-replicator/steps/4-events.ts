@@ -786,24 +786,24 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "replication.applied"
+const kHEventsTopic = "replication.applied"
 
-func confirm(ctx *harness.Ctx, shard int, b Batch) bool {
+func hConfirm(ctx *harness.Ctx, shard int, b Batch) bool {
 	ok, err := confirmBatch(context.Background(), "rep-1", shard, b)
 	ctx.NoError(err, "confirmBatch")
 	return ok
 }
 
-type outboxRow struct {
+type HOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outboxRows(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutboxRows(ctx *harness.Ctx) []HOutboxRow {
+	var rows []HOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row HOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -811,20 +811,20 @@ func outboxRows(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckShardKey(ctx *harness.Ctx) {
-	confirm(ctx, 0, Batch{Offset: 10, Applied: 10})
-	confirm(ctx, 1, Batch{Offset: 5, Applied: 5})
-	confirm(ctx, 0, Batch{Offset: 20, Applied: 10})
+	hConfirm(ctx, 0, Batch{Offset: 10, Applied: 10})
+	hConfirm(ctx, 1, Batch{Offset: 5, Applied: 5})
+	hConfirm(ctx, 0, Batch{Offset: 20, Applied: 10})
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 3, "three confirmBatch calls must produce three records on replication.applied; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"rep-1:0", "rep-1:1", "rep-1:0"}, "the records must be keyed {replication}:{shard}")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"rep-1:0", "rep-1:1", "rep-1:0"}, "the records must be keyed {replication}:{shard}")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both events of shard 0 must land on one partition, or the lag consumer sees offset 20 before 10; the partitions")
 }
 
 func CheckRejectedCount(ctx *harness.Ctx) {
-	confirm(ctx, 0, Batch{Offset: 20, Applied: 18, Rejected: 2})
+	hConfirm(ctx, 0, Batch{Offset: 20, Applied: 18, Rejected: 2})
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 1, "one confirmBatch must produce one record; the records")
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
@@ -833,9 +833,9 @@ func CheckRejectedCount(ctx *harness.Ctx) {
 		seen[k] = event[k]
 	}
 	ctx.Equal(seen, map[string]any{"replication_id": "rep-1", "shard": 0, "offset": 20, "applied": 18, "rejected": 2}, "without rejected, a shard the target refuses looks healthy; the event")
-	confirm(ctx, 0, Batch{Offset: 10, Applied: 5})
+	hConfirm(ctx, 0, Batch{Offset: 10, Applied: 5})
 	ctx.Settle()
-	values = ctx.Kafka.Values(eventsTopic)
+	values = ctx.Kafka.Values(kHEventsTopic)
 	ctx.Equal(len(values), 2, "two confirmBatch calls must produce two records; the records")
 	var late map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[1]), &late), "the event must be JSON")
@@ -843,53 +843,53 @@ func CheckRejectedCount(ctx *harness.Ctx) {
 }
 
 func CheckAdvanceBeforeProduce(ctx *harness.Ctx) {
-	probe := ctx.Redis.After("offset:rep-1:0", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	confirm(ctx, 0, Batch{Offset: 10, Applied: 10})
+	probe := ctx.Redis.After("offset:rep-1:0", func() any { return len(ctx.Kafka.Records(kHEventsTopic)) })
+	hConfirm(ctx, 0, Batch{Offset: 10, Applied: 10})
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "confirmBatch never advanced the shard's offset (no write to offset:rep-1:0)")
 	ctx.Equal(probe.Result, 0, "when the offset moved the topic already held records: a consumer could read an event whose offset the store does not hold yet; the records at that moment")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the offset moved; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "the event must still be produced after the offset moved; the records")
 	offset, _ := ctx.Redis.Get("offset:rep-1:0")
 	ctx.Equal(offset, "10", "offset:rep-1:0")
 	ctx.Redis.Do("HSET", "offset:rep-1:1", "broken", "1") // shard 1's offset write fails (WRONGTYPE)
 	confirmBatch(context.Background(), "rep-1", 1, Batch{Offset: 5, Applied: 5})
 	ctx.Settle()
-	for _, key := range ctx.Kafka.Keys(eventsTopic) {
+	for _, key := range ctx.Kafka.Keys(kHEventsTopic) {
 		ctx.Assert(key != "rep-1:1", "the offset write of shard 1 failed and its event was produced anyway: produce only after AdvanceOffset returned")
 	}
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	confirm(ctx, 0, Batch{Offset: 10, Applied: 10})
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hConfirm(ctx, 0, Batch{Offset: 10, Applied: 10})
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	confirm(ctx, 0, Batch{Offset: 20, Applied: 10})
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hConfirm(ctx, 0, Batch{Offset: 20, Applied: 10})
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(kHEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := confirm(ctx, 0, Batch{Offset: 10, Applied: 9, Rejected: 1})
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	ok := hConfirm(ctx, 0, Batch{Offset: 10, Applied: 9, Rejected: 1})
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the lag consumer never hears of the batch; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "rep-1:0" && rows[0].Payload["offset"] == float64(10), "the outbox row is %+v, expected the topic, the key rep-1:0 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == kHEventsTopic && rows[0].Key == "rep-1:0" && rows[0].Payload["offset"] == float64(10), "the outbox row is %+v, expected the topic, the key rep-1:0 and the payload", rows[0])
 	ctx.Equal(ok, false, "confirmBatch's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(kHEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = confirm(ctx, 0, Batch{Offset: 20, Applied: 10})
+	ok = hConfirm(ctx, 0, Batch{Offset: 20, Applied: 10})
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 2.5, "confirmBatch waited %.1f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited)
-	rows = outboxRows(ctx)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["offset"] == float64(20), "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "confirmBatch's result without a delivery report")
-	ctx.Kafka.Resume(eventsTopic) // the broker answers again; the timed-out record's report arrives late
-	ok = confirm(ctx, 0, Batch{Offset: 30, Applied: 10})
+	ctx.Kafka.Resume(kHEventsTopic) // the broker answers again; the timed-out record's report arrives late
+	ok = hConfirm(ctx, 0, Batch{Offset: 30, Applied: 10})
 	ctx.Settle()
-	rows = outboxRows(ctx)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(ok && len(rows) == 2, "once the broker answered again confirmBatch returned %v with %d outbox rows, expected true and no new row: the late report of the timed-out batch must not hold up the next one", ok, len(rows))
 }
 `,
@@ -902,9 +902,9 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "replication.applied";
+const std::string kHEventsTopic = "replication.applied";
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -914,7 +914,7 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-long long payloadOffset(const nlohmann::json& row) {
+long long hPayloadOffset(const nlohmann::json& row) {
   return row.contains("payload") && row["payload"].is_object() ? row["payload"].value("offset", -1LL) : -1;
 }
 
@@ -925,16 +925,16 @@ void CheckShardKey(harness::Ctx& ctx) {
   confirmBatch("rep-1", 1, Batch{5, 5, 0});
   confirmBatch("rep-1", 0, Batch{20, 10, 0});
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three confirmBatch calls must produce three records on replication.applied; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"rep-1:0", "rep-1:1", "rep-1:0"}, "the records must be keyed {replication}:{shard}");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"rep-1:0", "rep-1:1", "rep-1:0"}, "the records must be keyed {replication}:{shard}");
   ctx.Equal(records[0].Partition, records[2].Partition, "both events of shard 0 must land on one partition, or the lag consumer sees offset 20 before 10; the partitions");
 }
 
 void CheckRejectedCount(harness::Ctx& ctx) {
   confirmBatch("rep-1", 0, Batch{20, 18, 2});
   ctx.Settle();
-  auto values = ctx.Kafka.Values(kEventsTopic);
+  auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one confirmBatch must produce one record; the records");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(event.is_object() && event.value("replication_id", "") == "rep-1" && event.value("shard", -1) == 0 && event.value("offset", -1LL) == 20 &&
@@ -942,7 +942,7 @@ void CheckRejectedCount(harness::Ctx& ctx) {
              "the event is %s, expected replication_id rep-1, shard 0, offset 20, applied 18, rejected 2: without rejected, a shard the target refuses looks healthy", values[0]);
   confirmBatch("rep-1", 0, Batch{10, 5, 0});
   ctx.Settle();
-  values = ctx.Kafka.Values(kEventsTopic);
+  values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 2, "two confirmBatch calls must produce two records; the records");
   const auto late = nlohmann::json::parse(values[1], nullptr, false);
   ctx.Assert(late.is_object() && late.value("offset", -1LL) == 20,
@@ -954,13 +954,13 @@ void CheckAdvanceBeforeProduce(harness::Ctx& ctx) {
   std::size_t atAdvance = 0;
   ctx.Redis.After("offset:rep-1:0", [&] {
     fired = true;
-    atAdvance = ctx.Kafka.Records(kEventsTopic).size();
+    atAdvance = ctx.Kafka.Records(kHEventsTopic).size();
   });
   confirmBatch("rep-1", 0, Batch{10, 10, 0});
   ctx.Settle();
   ctx.Assert(fired, "confirmBatch never advanced the shard's offset (no write to offset:rep-1:0)");
   ctx.Equal(atAdvance, 0, "when the offset moved the topic already held records: a consumer could read an event whose offset the store does not hold yet; the records at that moment");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the offset moved; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "the event must still be produced after the offset moved; the records");
   ctx.Equal(ctx.Redis.Get("offset:rep-1:0").value_or(""), "10", "offset:rep-1:0");
   ctx.Redis.Do("HSET", "offset:rep-1:1", "broken", "1");  // shard 1's offset write fails (WRONGTYPE)
   try {
@@ -968,43 +968,43 @@ void CheckAdvanceBeforeProduce(harness::Ctx& ctx) {
   } catch (const std::exception&) {
   }
   ctx.Settle();
-  for (const auto& key : ctx.Kafka.Keys(kEventsTopic)) {
+  for (const auto& key : ctx.Kafka.Keys(kHEventsTopic)) {
     ctx.Assert(key != "rep-1:1", "the offset write of shard 1 failed and its event was produced anyway: produce only after advanceOffset returned");
   }
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   confirmBatch("rep-1", 0, Batch{10, 10, 0});
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
   confirmBatch("rep-1", 0, Batch{20, 10, 0});
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
   bool ok = confirmBatch("rep-1", 0, Batch{10, 9, 1});
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the lag consumer never hears of the batch; the rows");
-  ctx.Assert(rows[0].value("topic", "") == kEventsTopic && rows[0].value("key", "") == "rep-1:0" && payloadOffset(rows[0]) == 10,
+  ctx.Assert(rows[0].value("topic", "") == kHEventsTopic && rows[0].value("key", "") == "rep-1:0" && hPayloadOffset(rows[0]) == 10,
              "the outbox row is %s, expected the topic, the key rep-1:0 and the payload", rows[0].dump());
   ctx.Equal(ok, false, "confirmBatch's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = confirmBatch("rep-1", 0, Batch{20, 10, 0});
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 2.5, "confirmBatch waited %.1f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && payloadOffset(rows[1]) == 20, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && hPayloadOffset(rows[1]) == 20, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "confirmBatch's result without a delivery report");
-  ctx.Kafka.Resume(kEventsTopic);  // the broker answers again; the timed-out record's report arrives late
+  ctx.Kafka.Resume(kHEventsTopic);  // the broker answers again; the timed-out record's report arrives late
   ok = confirmBatch("rep-1", 0, Batch{30, 10, 0});
   ctx.Settle();
-  rows = outboxRows(ctx);
+  rows = hOutboxRows(ctx);
   ctx.Assert(ok && rows.size() == 2, "once the broker answered again confirmBatch returned %v with %d outbox rows, expected true and no new row: the late report of the timed-out batch must not hold up the next one", ok, rows.size());
 }
 `,

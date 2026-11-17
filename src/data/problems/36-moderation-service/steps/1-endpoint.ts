@@ -794,77 +794,77 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hApiBg = context.Background()
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
-	store.AddContent(apiBg, "c-1", "acme", "Buy followers now")
-	store.AddContent(apiBg, "c-2", "globex", "Quarterly results")
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
+	store.AddContent(hApiBg, "c-1", "acme", "Buy followers now")
+	store.AddContent(hApiBg, "c-2", "globex", "Quarterly results")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiReport(c *harness.HTTP, contentID, reason, detail string, header ...string) *harness.Response {
+func hApiReport(c *harness.HTTP, contentID, reason, detail string, header ...string) *harness.Response {
 	if len(header) == 0 {
 		header = []string{"X-Tenant-Id", "acme", "X-Reporter-Id", "u-17"}
 	}
 	return c.Post("/v1/reports", map[string]string{"content_id": contentID, "reason": reason, "detail": detail}, header...)
 }
 
-func apiField(r *harness.Response, name string) string {
+func hApiField(r *harness.Response, name string) string {
 	body, _ := r.JSON().(map[string]any)
 	s, _ := body[name].(string)
 	return s
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiReport(c, "c-1", "spam", "Spam link in bio")
+	c := hApiClient(ctx)
+	r := hApiReport(c, "c-1", "spam", "Spam link in bio")
 	ctx.Equal(r.Status, 201, "a report from the content owner (%s)", r.Text())
-	caseID := apiField(r, "case_id")
-	ctx.Assert(apiField(r, "status") == "created" && caseID != "", "a new report must answer {case_id, status: created}, got %s", r.Text())
-	stored := store.GetCase(apiBg, caseID)
+	caseID := hApiField(r, "case_id")
+	ctx.Assert(hApiField(r, "status") == "created" && caseID != "", "a new report must answer {case_id, status: created}, got %s", r.Text())
+	stored := store.GetCase(hApiBg, caseID)
 	ctx.Assert(stored != nil && stored.Tenant == "acme" && stored.ContentID == "c-1" && stored.ReporterID == "u-17" && stored.Reason == "spam" && stored.Detail == "Spam link in bio", "the stored case is %+v", stored)
 	r = c.Post("/v1/reports", map[string]string{"content_id": "c-1", "reason": "spam"}, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 401, "a report without X-Reporter-Id")
-	r = apiReport(c, "c-404", "spam", "")
+	r = hApiReport(c, "c-404", "spam", "")
 	ctx.Equal(r.Status, 404, "a report on unknown content")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	foreign := apiReport(c, "c-2", "spam", "")
-	unknown := apiReport(c, "c-404", "spam", "")
+	c := hApiClient(ctx)
+	foreign := hApiReport(c, "c-2", "spam", "")
+	unknown := hApiReport(c, "c-404", "spam", "")
 	ctx.Equal(foreign.Status, 404, "acme reported globex's content c-2 (%s); the content must belong to the calling tenant", foreign.Text())
 	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 0, "a report on another tenant's content must open no case; cases")
 	ctx.Equal(foreign.Text(), unknown.Text(), "a foreign id must answer exactly as an unknown one, or the difference tells acme what globex hosts; the foreign answer")
 }
 
 func CheckReasonAllowlist(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hApiClient(ctx)
 	for _, reason := range []string{"spamm", "other", "SPAM", ""} {
-		r := apiReport(c, "c-1", reason, "")
+		r := hApiReport(c, "c-1", reason, "")
 		ctx.Equal(r.Status, 400, "a report with reason %q", reason)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 0, "rejected reasons must open no case; cases")
-	r := apiReport(c, "c-1", "self_harm", "")
+	r := hApiReport(c, "c-1", "self_harm", "")
 	ctx.Equal(r.Status, 201, "a report with reason self_harm (%s)", r.Text())
-	caseID := apiField(r, "case_id")
-	ctx.Equal(store.GetCase(apiBg, caseID).Reason, "self_harm", "the case must keep the reason the reporter chose")
-	repeat := apiReport(c, "c-1", "spamm", "")
+	caseID := hApiField(r, "case_id")
+	ctx.Equal(store.GetCase(hApiBg, caseID).Reason, "self_harm", "the case must keep the reason the reporter chose")
+	repeat := hApiReport(c, "c-1", "spamm", "")
 	ctx.Equal(repeat.Status, 400, "u-17 reporting c-1 again with reason spamm: a repeat report is held to the same allowlist")
-	stored := store.GetCase(apiBg, caseID)
+	stored := store.GetCase(hApiBg, caseID)
 	ctx.Assert(stored.Reason == "self_harm" && stored.Reports == 1, "a rejected repeat report changed the case: %+v", stored)
 }
 
 func CheckDetailBytes(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	accented := apiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
-	long := apiReport(c, "c-1", "spam", strings.Repeat("a", 4097))
-	cjk := apiReport(c, "c-1", "spam", strings.Repeat("界", 2000))
-	exact := apiReport(c, "c-1", "spam", strings.Repeat("é", 2048))
-	ascii := apiReport(c, "c-1", "spam", strings.Repeat("a", 3000), "X-Tenant-Id", "acme", "X-Reporter-Id", "u-18")
-	repeat := apiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
+	c := hApiClient(ctx)
+	accented := hApiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
+	long := hApiReport(c, "c-1", "spam", strings.Repeat("a", 4097))
+	cjk := hApiReport(c, "c-1", "spam", strings.Repeat("界", 2000))
+	exact := hApiReport(c, "c-1", "spam", strings.Repeat("é", 2048))
+	ascii := hApiReport(c, "c-1", "spam", strings.Repeat("a", 3000), "X-Tenant-Id", "acme", "X-Reporter-Id", "u-18")
+	repeat := hApiReport(c, "c-1", "spam", strings.Repeat("é", 3000))
 	ctx.Equal(accented.Status, 413, "a detail of 3000 accented characters (6000 bytes of UTF-8): the cap is in bytes")
 	ctx.Equal(long.Status, 413, "a detail of 4097 bytes")
 	ctx.Equal(cjk.Status, 413, "a detail of 2000 CJK characters (6000 bytes of UTF-8): the cap is in bytes")
@@ -872,21 +872,21 @@ func CheckDetailBytes(ctx *harness.Ctx) {
 	ctx.Equal(ascii.Status, 201, "a detail of 3000 ASCII characters (3000 bytes) (%s)", ascii.Text())
 	ctx.Equal(repeat.Status, 413, "u-17 reporting c-1 again with a 6000-byte detail: a repeat report is held to the same cap")
 	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 2, "only the reports within the cap may open a case; cases")
-	stored := store.GetCase(apiBg, apiField(exact, "case_id"))
+	stored := store.GetCase(hApiBg, hApiField(exact, "case_id"))
 	ctx.Assert(stored != nil && stored.Detail == strings.Repeat("é", 2048) && stored.Reports == 1, "a rejected repeat report changed the case: it holds %d reports and a %d-byte detail", stored.Reports, len(stored.Detail))
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := apiReport(c, "c-1", "spam", "first look")
-	again := apiReport(c, "c-1", "harassment", "second look")
-	other := apiReport(c, "c-1", "spam", "", "X-Tenant-Id", "acme", "X-Reporter-Id", "u-18")
+	c := hApiClient(ctx)
+	first := hApiReport(c, "c-1", "spam", "first look")
+	again := hApiReport(c, "c-1", "harassment", "second look")
+	other := hApiReport(c, "c-1", "spam", "", "X-Tenant-Id", "acme", "X-Reporter-Id", "u-18")
 	ctx.Equal(first.Status, 201, "the first report (%s)", first.Text())
-	caseID := apiField(first, "case_id")
-	ctx.Assert(again.Status == 200 && apiField(again, "case_id") == caseID && apiField(again, "status") == "updated", "the same reporter reporting c-1 again answered %d %s, expected 200 {case_id: %s, status: updated}", again.Status, again.Text(), caseID)
-	stored := store.GetCase(apiBg, caseID)
+	caseID := hApiField(first, "case_id")
+	ctx.Assert(again.Status == 200 && hApiField(again, "case_id") == caseID && hApiField(again, "status") == "updated", "the same reporter reporting c-1 again answered %d %s, expected 200 {case_id: %s, status: updated}", again.Status, again.Text(), caseID)
+	stored := store.GetCase(hApiBg, caseID)
 	ctx.Assert(stored.Reports == 2 && stored.Reason == "harassment" && stored.Detail == "second look", "the repeat report must update the case, it holds %+v", stored)
-	ctx.Assert(other.Status == 201 && apiField(other, "case_id") != caseID, "another reporter on the same content must open their own case, got %d %s", other.Status, other.Text())
+	ctx.Assert(other.Status == 201 && hApiField(other, "case_id") != caseID, "another reporter on the same content must open their own case, got %d %s", other.Status, other.Text())
 	ctx.Equal(len(ctx.Redis.Keys("case:case-*")), 2, "two reporters must leave two cases; cases")
 }
 `,
@@ -898,7 +898,7 @@ func CheckDedupe(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   store::addContent("c-1", "acme", "Buy followers now");
   store::addContent("c-2", "globex", "Quarterly results");
   static httplib::Server* svr = nullptr;
@@ -908,22 +908,22 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string apiBody(const std::string& content_id, const std::string& reason, const std::string& detail) {
+std::string hApiBody(const std::string& content_id, const std::string& reason, const std::string& detail) {
   return nlohmann::json{{"content_id", content_id}, {"reason", reason}, {"detail", detail}}.dump();
 }
 
-harness::Response apiReport(harness::HTTP& c, const std::string& content_id, const std::string& reason, const std::string& detail,
+harness::Response hApiReport(harness::HTTP& c, const std::string& content_id, const std::string& reason, const std::string& detail,
                             const std::string& reporter = "u-17") {
-  return c.Post("/v1/reports", apiBody(content_id, reason, detail), "Content-Type", "application/json", "X-Tenant-Id", "acme",
+  return c.Post("/v1/reports", hApiBody(content_id, reason, detail), "Content-Type", "application/json", "X-Tenant-Id", "acme",
                 "X-Reporter-Id", reporter);
 }
 
-std::string apiField(const harness::Response& r, const std::string& name) {
+std::string hApiField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value(name, "") : "";
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
@@ -932,43 +932,43 @@ std::string repeat(const std::string& s, int n) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto r = apiReport(c, "c-1", "spam", "Spam link in bio");
+  auto c = hApiClient(ctx);
+  auto r = hApiReport(c, "c-1", "spam", "Spam link in bio");
   ctx.Equal(r.Status, 201, "a report from the content owner (%s)", r.Text());
-  const std::string case_id = apiField(r, "case_id");
-  ctx.Assert(apiField(r, "status") == "created" && !case_id.empty(), "a new report must answer {case_id, status: created}, got %s", r.Text());
+  const std::string case_id = hApiField(r, "case_id");
+  ctx.Assert(hApiField(r, "status") == "created" && !case_id.empty(), "a new report must answer {case_id, status: created}, got %s", r.Text());
   const auto stored = store::getCase(case_id);
   ctx.Assert(stored && stored->tenant == "acme" && stored->content_id == "c-1" && stored->reporter_id == "u-17" && stored->reason == "spam" &&
                  stored->detail == "Spam link in bio",
              "the stored case for %s is missing or wrong (reason %q, detail %q)", case_id, stored ? stored->reason : "", stored ? stored->detail : "");
-  r = c.Post("/v1/reports", apiBody("c-1", "spam", ""), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  r = c.Post("/v1/reports", hApiBody("c-1", "spam", ""), "Content-Type", "application/json", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 401, "a report without X-Reporter-Id");
-  r = apiReport(c, "c-404", "spam", "");
+  r = hApiReport(c, "c-404", "spam", "");
   ctx.Equal(r.Status, 404, "a report on unknown content");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto foreign = apiReport(c, "c-2", "spam", "");
-  const auto unknown = apiReport(c, "c-404", "spam", "");
+  auto c = hApiClient(ctx);
+  const auto foreign = hApiReport(c, "c-2", "spam", "");
+  const auto unknown = hApiReport(c, "c-404", "spam", "");
   ctx.Equal(foreign.Status, 404, "acme reported globex's content c-2 (%s); the content must belong to the calling tenant", foreign.Text());
   ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 0, "a report on another tenant's content must open no case; cases");
   ctx.Equal(foreign.Text(), unknown.Text(), "a foreign id must answer exactly as an unknown one, or the difference tells acme what globex hosts; the foreign answer");
 }
 
 void CheckReasonAllowlist(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
+  auto c = hApiClient(ctx);
   for (const std::string reason : {"spamm", "other", "SPAM", ""}) {
-    const auto r = apiReport(c, "c-1", reason, "");
+    const auto r = hApiReport(c, "c-1", reason, "");
     ctx.Equal(r.Status, 400, "a report with reason %q", reason);
   }
   ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 0, "rejected reasons must open no case; cases");
-  const auto r = apiReport(c, "c-1", "self_harm", "");
+  const auto r = hApiReport(c, "c-1", "self_harm", "");
   ctx.Equal(r.Status, 201, "a report with reason self_harm (%s)", r.Text());
-  const std::string case_id = apiField(r, "case_id");
+  const std::string case_id = hApiField(r, "case_id");
   const auto stored = store::getCase(case_id);
   ctx.Equal(stored ? stored->reason : "", "self_harm", "the case must keep the reason the reporter chose");
-  const auto again = apiReport(c, "c-1", "spamm", "");
+  const auto again = hApiReport(c, "c-1", "spamm", "");
   ctx.Equal(again.Status, 400, "u-17 reporting c-1 again with reason spamm: a repeat report is held to the same allowlist");
   const auto after = store::getCase(case_id);
   ctx.Assert(after && after->reason == "self_harm" && after->reports == 1, "a rejected repeat report changed the case: reports %v, reason %q",
@@ -976,13 +976,13 @@ void CheckReasonAllowlist(harness::Ctx& ctx) {
 }
 
 void CheckDetailBytes(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto accented = apiReport(c, "c-1", "spam", repeat("é", 3000));
-  const auto long_detail = apiReport(c, "c-1", "spam", repeat("a", 4097));
-  const auto cjk = apiReport(c, "c-1", "spam", repeat("界", 2000));
-  const auto exact = apiReport(c, "c-1", "spam", repeat("é", 2048));
-  const auto ascii = apiReport(c, "c-1", "spam", repeat("a", 3000), "u-18");
-  const auto again = apiReport(c, "c-1", "spam", repeat("é", 3000));
+  auto c = hApiClient(ctx);
+  const auto accented = hApiReport(c, "c-1", "spam", hRepeat("é", 3000));
+  const auto long_detail = hApiReport(c, "c-1", "spam", hRepeat("a", 4097));
+  const auto cjk = hApiReport(c, "c-1", "spam", hRepeat("界", 2000));
+  const auto exact = hApiReport(c, "c-1", "spam", hRepeat("é", 2048));
+  const auto ascii = hApiReport(c, "c-1", "spam", hRepeat("a", 3000), "u-18");
+  const auto again = hApiReport(c, "c-1", "spam", hRepeat("é", 3000));
   ctx.Equal(accented.Status, 413, "a detail of 3000 accented characters (6000 bytes of UTF-8): the cap is in bytes");
   ctx.Equal(long_detail.Status, 413, "a detail of 4097 bytes");
   ctx.Equal(cjk.Status, 413, "a detail of 2000 CJK characters (6000 bytes of UTF-8): the cap is in bytes");
@@ -990,26 +990,26 @@ void CheckDetailBytes(harness::Ctx& ctx) {
   ctx.Equal(ascii.Status, 201, "a detail of 3000 ASCII characters (3000 bytes) (%s)", ascii.Text());
   ctx.Equal(again.Status, 413, "u-17 reporting c-1 again with a 6000-byte detail: a repeat report is held to the same cap");
   ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 2, "only the reports within the cap may open a case; cases");
-  const auto stored = store::getCase(apiField(exact, "case_id"));
-  ctx.Assert(stored && stored->detail == repeat("é", 2048) && stored->reports == 1,
+  const auto stored = store::getCase(hApiField(exact, "case_id"));
+  ctx.Assert(stored && stored->detail == hRepeat("é", 2048) && stored->reports == 1,
              "a rejected repeat report changed the case: it holds %v reports and a %v-byte detail", stored ? stored->reports : 0L,
              stored ? static_cast<long>(stored->detail.size()) : 0L);
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto first = apiReport(c, "c-1", "spam", "first look");
-  const auto again = apiReport(c, "c-1", "harassment", "second look");
-  const auto other = apiReport(c, "c-1", "spam", "", "u-18");
+  auto c = hApiClient(ctx);
+  const auto first = hApiReport(c, "c-1", "spam", "first look");
+  const auto again = hApiReport(c, "c-1", "harassment", "second look");
+  const auto other = hApiReport(c, "c-1", "spam", "", "u-18");
   ctx.Equal(first.Status, 201, "the first report (%s)", first.Text());
-  const std::string case_id = apiField(first, "case_id");
-  ctx.Assert(again.Status == 200 && apiField(again, "case_id") == case_id && apiField(again, "status") == "updated",
+  const std::string case_id = hApiField(first, "case_id");
+  ctx.Assert(again.Status == 200 && hApiField(again, "case_id") == case_id && hApiField(again, "status") == "updated",
              "the same reporter reporting c-1 again answered %d %s, expected 200 {case_id: %s, status: updated}", again.Status, again.Text(), case_id);
   const auto stored = store::getCase(case_id);
   ctx.Assert(stored && stored->reports == 2 && stored->reason == "harassment" && stored->detail == "second look",
              "the repeat report must update the case: reports %v, reason %q, detail %q", stored ? stored->reports : 0L, stored ? stored->reason : "",
              stored ? stored->detail : "");
-  ctx.Assert(other.Status == 201 && apiField(other, "case_id") != case_id, "another reporter on the same content must open their own case, got %d %s",
+  ctx.Assert(other.Status == 201 && hApiField(other, "case_id") != case_id, "another reporter on the same content must open their own case, got %d %s",
              other.Status, other.Text());
   ctx.Equal(ctx.Redis.Keys("case:case-*").size(), 2, "two reporters must leave two cases; cases");
 }

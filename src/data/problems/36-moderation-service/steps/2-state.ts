@@ -826,39 +826,39 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateSeed(caseIDs ...string) {
+func hStateSeed(caseIDs ...string) {
 	for _, caseID := range caseIDs {
-		queue.Enqueue(stateBg, caseID)
+		queue.Enqueue(hStateBg, caseID)
 	}
 }
 
-func stateClaim(ctx *harness.Ctx, moderator string, now int64) string {
-	caseID, err := claim(stateBg, moderator, now)
+func hStateClaim(ctx *harness.Ctx, moderator string, now int64) string {
+	caseID, err := claim(hStateBg, moderator, now)
 	ctx.NoError(err, "claim(%s, %d)", moderator, now)
 	return caseID
 }
 
-func stateRenew(ctx *harness.Ctx, caseID, moderator string, now int64) bool {
-	renewed, err := renew(stateBg, caseID, moderator, now)
+func hStateRenew(ctx *harness.Ctx, caseID, moderator string, now int64) bool {
+	renewed, err := renew(hStateBg, caseID, moderator, now)
 	ctx.NoError(err, "renew(%s, %s, %d)", caseID, moderator, now)
 	return renewed
 }
 
-func stateSweep(ctx *harness.Ctx, now int64) int {
-	n, err := requeueExpired(stateBg, now)
+func hStateSweep(ctx *harness.Ctx, now int64) int {
+	n, err := requeueExpired(hStateBg, now)
 	ctx.NoError(err, "requeueExpired(%d)", now)
 	return n
 }
 
-func stateLease(ctx *harness.Ctx, caseID string) float64 {
+func hStateLease(ctx *harness.Ctx, caseID string) float64 {
 	deadline, _ := ctx.Redis.ZScore("moderation:leases", caseID)
 	return deadline
 }
 
 // stateAccounted lists the cases that are pending or claimed, sorted.
-func stateAccounted(ctx *harness.Ctx) []string {
+func hStateAccounted(ctx *harness.Ctx) []string {
 	var out []string
 	for _, z := range ctx.Redis.ZRangeWithScores("moderation:pending", 0, -1) {
 		out = append(out, z.Member)
@@ -870,19 +870,19 @@ func stateAccounted(ctx *harness.Ctx) []string {
 	return out
 }
 
-type stateView struct {
+type HStateView struct {
 	counters        map[string]string
 	pending, owned int64
 }
 
-func stateSnapshot(ctx *harness.Ctx) stateView {
-	return stateView{ctx.Redis.HGetAll("moderation:counters"), ctx.Redis.ZCard("moderation:pending"), ctx.Redis.HLen("moderation:owners")}
+func hStateSnapshot(ctx *harness.Ctx) HStateView {
+	return HStateView{ctx.Redis.HGetAll("moderation:counters"), ctx.Redis.ZCard("moderation:pending"), ctx.Redis.HLen("moderation:owners")}
 }
 
-func stateDashboard(ctx *harness.Ctx, fired bool, err error, result any, during string) {
+func hStateDashboard(ctx *harness.Ctx, fired bool, err error, result any, during string) {
 	ctx.Assert(fired, "nothing touched moderation:counters during %s", during)
 	ctx.Assert(err == nil, "reading the counters during %s failed: %v", during, err)
-	view, _ := result.(stateView)
+	view, _ := result.(HStateView)
 	waiting, _ := strconv.ParseInt(view.counters["pending"], 10, 64)
 	held, _ := strconv.ParseInt(view.counters["in_review"], 10, 64)
 	ctx.Equal(waiting+held, int64(3), "a dashboard reading the counters during %s saw %v; move both counters in the script that moves the case; the cases counted", during, view.counters)
@@ -890,15 +890,15 @@ func stateDashboard(ctx *harness.Ctx, fired bool, err error, result any, during 
 }
 
 func CheckClaimAtomic(ctx *harness.Ctx) {
-	stateSeed("case-1", "case-2")
+	hStateSeed("case-1", "case-2")
 	var seen []string
 	rival := ctx.Redis.After("moderation:pending", func() any {
-		seen = stateAccounted(ctx)
-		caseID, err := claim(stateBg, "bob", 0)
+		seen = hStateAccounted(ctx)
+		caseID, err := claim(hStateBg, "bob", 0)
 		ctx.NoError(err, "bob's claim")
 		return caseID
 	})
-	mine := stateClaim(ctx, "alice", 0)
+	mine := hStateClaim(ctx, "alice", 0)
 	ctx.Assert(rival.Fired, "nothing touched moderation:pending")
 	ctx.Assert(rival.Err == nil, "bob's claim failed: %v", rival.Err)
 	ctx.Equal(seen, []string{"case-1", "case-2"}, "right after alice's claim first touched moderation:pending, a case was neither pending nor claimed: a crash at that point loses the case; the cases pending or claimed")
@@ -906,12 +906,12 @@ func CheckClaimAtomic(ctx *harness.Ctx) {
 	ctx.Assert(mine != "" && theirs != "", "two moderators claiming from a queue of two got %q and %q", mine, theirs)
 	ctx.Assert(mine != theirs, "alice and bob both claimed %s: between the read of the queue head and its removal, the other claim read the same head", mine)
 	ctx.Equal(ctx.Redis.HGetAll("moderation:owners"), map[string]string{mine: "alice", theirs: "bob"}, "moderation:owners")
-	ctx.Equal(stateClaim(ctx, "carol", 0), "", "a claim on an empty queue must answer \\"\\"")
+	ctx.Equal(hStateClaim(ctx, "carol", 0), "", "a claim on an empty queue must answer \\"\\"")
 }
 
 func CheckLeaseDeadline(ctx *harness.Ctx) {
-	stateSeed("case-1")
-	ctx.Equal(stateClaim(ctx, "alice", 1000), "case-1", "alice must claim case-1")
+	hStateSeed("case-1")
+	ctx.Equal(hStateClaim(ctx, "alice", 1000), "case-1", "alice must claim case-1")
 	deadline, ok := ctx.Redis.ZScore("moderation:leases", "case-1")
 	ctx.Assert(ok && deadline == 1600, "the lease on case-1 claimed at 1000 is %v (present: %v) in moderation:leases, expected 1600 (now + leaseS): without a deadline a crashed moderator holds the case forever", deadline, ok)
 	owner, _ := ctx.Redis.HGet("moderation:owners", "case-1")
@@ -919,21 +919,21 @@ func CheckLeaseDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRenewOwner(ctx *harness.Ctx) {
-	stateSeed("case-1")
-	stateClaim(ctx, "alice", 0)
-	ctx.Equal(stateRenew(ctx, "case-1", "bob", 300), false, "bob renewed the lease on alice's case: renew must answer false for a case the caller does not hold; renewed")
-	ctx.Equal(stateLease(ctx, "case-1"), 600.0, "bob's refused renewal must leave the deadline")
-	ctx.Equal(stateRenew(ctx, "case-1", "alice", 500), true, "alice must be able to renew her own case; renewed")
-	ctx.Equal(stateLease(ctx, "case-1"), 1100.0, "alice's renewal at 500; the deadline")
-	ctx.Equal(stateRenew(ctx, "case-9", "alice", 500), false, "renewing a case nobody claimed; renewed")
+	hStateSeed("case-1")
+	hStateClaim(ctx, "alice", 0)
+	ctx.Equal(hStateRenew(ctx, "case-1", "bob", 300), false, "bob renewed the lease on alice's case: renew must answer false for a case the caller does not hold; renewed")
+	ctx.Equal(hStateLease(ctx, "case-1"), 600.0, "bob's refused renewal must leave the deadline")
+	ctx.Equal(hStateRenew(ctx, "case-1", "alice", 500), true, "alice must be able to renew her own case; renewed")
+	ctx.Equal(hStateLease(ctx, "case-1"), 1100.0, "alice's renewal at 500; the deadline")
+	ctx.Equal(hStateRenew(ctx, "case-9", "alice", 500), false, "renewing a case nobody claimed; renewed")
 	_, ok := ctx.Redis.ZScore("moderation:leases", "case-9")
 	ctx.Assert(!ok, "a refused renewal must not create a lease")
 	sweep := ctx.Redis.After("moderation:owners", func() any {
-		n, err := requeueExpired(stateBg, 5000)
+		n, err := requeueExpired(hStateBg, 5000)
 		ctx.NoError(err, "requeueExpired(5000)")
 		return n
 	})
-	stateRenew(ctx, "case-1", "alice", 1000)
+	hStateRenew(ctx, "case-1", "alice", 1000)
 	ctx.Assert(sweep.Fired, "nothing touched moderation:owners")
 	ctx.Assert(sweep.Err == nil, "the sweep failed: %v", sweep.Err)
 	lease, leased := ctx.Redis.ZScore("moderation:leases", "case-1")
@@ -942,30 +942,30 @@ func CheckRenewOwner(ctx *harness.Ctx) {
 }
 
 func CheckCounters(ctx *harness.Ctx) {
-	stateSeed("case-1", "case-2", "case-3")
-	seen := ctx.Redis.After("moderation:counters", func() any { return stateSnapshot(ctx) })
-	stateClaim(ctx, "alice", 0)
-	stateDashboard(ctx, seen.Fired, seen.Err, seen.Result, "a claim")
+	hStateSeed("case-1", "case-2", "case-3")
+	seen := ctx.Redis.After("moderation:counters", func() any { return hStateSnapshot(ctx) })
+	hStateClaim(ctx, "alice", 0)
+	hStateDashboard(ctx, seen.Fired, seen.Err, seen.Result, "a claim")
 	for _, moderator := range []string{"bob", "carol", "dave"} {
-		stateClaim(ctx, moderator, 0)
+		hStateClaim(ctx, moderator, 0)
 	}
 	ctx.Equal(ctx.Redis.HGetAll("moderation:counters"), map[string]string{"pending": "0", "in_review": "3"}, "after three claims (and one on an empty queue) the counters")
-	seen = ctx.Redis.After("moderation:counters", func() any { return stateSnapshot(ctx) })
-	ctx.Equal(stateSweep(ctx, 700), 3, "at 700 all three leases (600) have run out; swept")
-	stateDashboard(ctx, seen.Fired, seen.Err, seen.Result, "a sweep")
+	seen = ctx.Redis.After("moderation:counters", func() any { return hStateSnapshot(ctx) })
+	ctx.Equal(hStateSweep(ctx, 700), 3, "at 700 all three leases (600) have run out; swept")
+	hStateDashboard(ctx, seen.Fired, seen.Err, seen.Result, "a sweep")
 	ctx.Equal(ctx.Redis.HGetAll("moderation:counters"), map[string]string{"pending": "3", "in_review": "0"}, "after sweeping all three the counters")
 }
 
 func CheckRequeueExpired(ctx *harness.Ctx) {
-	stateSeed("case-1", "case-2", "case-3")
-	ctx.Assert(stateClaim(ctx, "alice", 0) == "case-1" && stateClaim(ctx, "bob", 300) == "case-2", "alice and bob must claim case-1 and case-2")
-	ctx.Equal(stateSweep(ctx, 600), 0, "a lease that ends at 600 has not expired at 600; swept")
+	hStateSeed("case-1", "case-2", "case-3")
+	ctx.Assert(hStateClaim(ctx, "alice", 0) == "case-1" && hStateClaim(ctx, "bob", 300) == "case-2", "alice and bob must claim case-1 and case-2")
+	ctx.Equal(hStateSweep(ctx, 600), 0, "a lease that ends at 600 has not expired at 600; swept")
 	rival := ctx.Redis.After("moderation:leases", func() any {
-		n, err := requeueExpired(stateBg, 700)
+		n, err := requeueExpired(hStateBg, 700)
 		ctx.NoError(err, "the second requeueExpired(700)")
 		return n
 	})
-	swept := stateSweep(ctx, 700)
+	swept := hStateSweep(ctx, 700)
 	ctx.Assert(rival.Fired, "nothing touched moderation:leases")
 	ctx.Assert(rival.Err == nil, "the second sweep failed: %v", rival.Err)
 	again, _ := rival.Result.(int)
@@ -975,9 +975,9 @@ func CheckRequeueExpired(ctx *harness.Ctx) {
 	_, leased := ctx.Redis.ZScore("moderation:leases", "case-1")
 	ctx.Assert(!owned && !leased, "the swept case still has an owner (%v) or a lease (%v)", owned, leased)
 	ctx.Equal(ctx.Redis.HGetAll("moderation:counters"), map[string]string{"pending": "2", "in_review": "1"}, "after the sweep the counters (the case requeued once)")
-	ctx.Equal(stateSweep(ctx, 800), 0, "the next sweep found case-1 again: the sweep must remove the lease it acted on; swept")
-	ctx.Equal(stateRenew(ctx, "case-1", "alice", 800), false, "alice's lease ran out and the case went back to the queue: her renewal must be refused; renewed")
-	ctx.Equal(stateClaim(ctx, "carol", 800), "case-1", "the swept case must be the next one claimed, ahead of case-3")
+	ctx.Equal(hStateSweep(ctx, 800), 0, "the next sweep found case-1 again: the sweep must remove the lease it acted on; swept")
+	ctx.Equal(hStateRenew(ctx, "case-1", "alice", 800), false, "alice's lease ran out and the case went back to the queue: her renewal must be refused; renewed")
+	ctx.Equal(hStateClaim(ctx, "carol", 800), "case-1", "the swept case must be the next one claimed, ahead of case-3")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -993,52 +993,52 @@ func CheckRequeueExpired(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStatePending = "moderation:pending";
-const std::string kStateLeases = "moderation:leases";
-const std::string kStateOwners = "moderation:owners";
-const std::string kStateCounters = "moderation:counters";
+const std::string kHStatePending = "moderation:pending";
+const std::string kHStateLeases = "moderation:leases";
+const std::string kHStateOwners = "moderation:owners";
+const std::string kHStateCounters = "moderation:counters";
 
-void stateSeed(const std::vector<std::string>& case_ids) {
+void hStateSeed(const std::vector<std::string>& case_ids) {
   for (const auto& case_id : case_ids) queue::enqueue(case_id);
 }
 
-std::string claimed(const std::optional<std::string>& case_id) { return case_id.value_or(""); }
+std::string hClaimed(const std::optional<std::string>& case_id) { return case_id.value_or(""); }
 
-long long count(const std::map<std::string, std::string>& h, const std::string& field) {
+long long hCount(const std::map<std::string, std::string>& h, const std::string& field) {
   return h.count(field) && !h.at(field).empty() ? std::stoll(h.at(field)) : 0;
 }
 
 // The cases that are pending or claimed, sorted.
-std::vector<std::string> accounted(harness::Ctx& ctx) {
+std::vector<std::string> hAccounted(harness::Ctx& ctx) {
   std::vector<std::string> out;
-  for (const auto& z : ctx.Redis.ZRangeWithScores(kStatePending, 0, -1)) out.push_back(z.Member);
-  for (const auto& [case_id, owner] : ctx.Redis.HGetAll(kStateOwners)) out.push_back(case_id);
+  for (const auto& z : ctx.Redis.ZRangeWithScores(kHStatePending, 0, -1)) out.push_back(z.Member);
+  for (const auto& [case_id, owner] : ctx.Redis.HGetAll(kHStateOwners)) out.push_back(case_id);
   std::sort(out.begin(), out.end());
   return out;
 }
 
-struct View {
+struct HView {
   bool fired = false;
   std::map<std::string, std::string> counters;
   long long pending = 0;
   long long owned = 0;
 };
 
-std::shared_ptr<View> watchCounters(harness::Ctx& ctx) {
-  auto view = std::make_shared<View>();
-  ctx.Redis.After(kStateCounters, [&ctx, view] {
+std::shared_ptr<HView> hWatchCounters(harness::Ctx& ctx) {
+  auto view = std::make_shared<HView>();
+  ctx.Redis.After(kHStateCounters, [&ctx, view] {
     view->fired = true;
-    view->counters = ctx.Redis.HGetAll(kStateCounters);
-    view->pending = ctx.Redis.ZCard(kStatePending);
-    view->owned = ctx.Redis.HLen(kStateOwners);
+    view->counters = ctx.Redis.HGetAll(kHStateCounters);
+    view->pending = ctx.Redis.ZCard(kHStatePending);
+    view->owned = ctx.Redis.HLen(kHStateOwners);
   });
   return view;
 }
 
-void dashboard(harness::Ctx& ctx, const View& view, const std::string& during) {
+void hDashboard(harness::Ctx& ctx, const HView& view, const std::string& during) {
   ctx.Assert(view.fired, "nothing touched moderation:counters during %s", during);
-  const long long waiting = count(view.counters, "pending");
-  const long long held = count(view.counters, "in_review");
+  const long long waiting = hCount(view.counters, "pending");
+  const long long held = hCount(view.counters, "in_review");
   ctx.Equal(waiting + held, 3LL, "a dashboard reading the counters during %s saw %v; move both counters in the script that moves the case; the cases counted", during,
             view.counters);
   ctx.Assert(waiting == view.pending && held == view.owned,
@@ -1049,92 +1049,92 @@ void dashboard(harness::Ctx& ctx, const View& view, const std::string& during) {
 }  // namespace
 
 void CheckClaimAtomic(harness::Ctx& ctx) {
-  stateSeed({"case-1", "case-2"});
+  hStateSeed({"case-1", "case-2"});
   auto rival = std::make_shared<std::optional<std::string>>();
   auto seen = std::make_shared<std::vector<std::string>>();
   auto fired = std::make_shared<bool>(false);
-  ctx.Redis.After(kStatePending, [&ctx, rival, seen, fired] {
+  ctx.Redis.After(kHStatePending, [&ctx, rival, seen, fired] {
     *fired = true;
-    *seen = accounted(ctx);
+    *seen = hAccounted(ctx);
     *rival = claim("bob", 0);
   });
-  const std::string mine = claimed(claim("alice", 0));
+  const std::string mine = hClaimed(claim("alice", 0));
   ctx.Assert(*fired, "nothing touched moderation:pending");
   ctx.Equal(*seen, std::vector<std::string>{"case-1", "case-2"},
             "right after alice's claim first touched moderation:pending, a case was neither pending nor claimed: a crash at that point loses the case; the cases pending or claimed");
-  const std::string theirs = claimed(*rival);
+  const std::string theirs = hClaimed(*rival);
   ctx.Assert(!mine.empty() && !theirs.empty(), "two moderators claiming from a queue of two got %q and %q", mine, theirs);
   ctx.Assert(mine != theirs, "alice and bob both claimed %s: between the read of the queue head and its removal, the other claim read the same head", mine);
-  ctx.Equal(ctx.Redis.HGetAll(kStateOwners), std::map<std::string, std::string>{{mine, "alice"}, {theirs, "bob"}}, "moderation:owners");
-  ctx.Equal(claimed(claim("carol", 0)), "", "a claim on an empty queue must answer none");
+  ctx.Equal(ctx.Redis.HGetAll(kHStateOwners), std::map<std::string, std::string>{{mine, "alice"}, {theirs, "bob"}}, "moderation:owners");
+  ctx.Equal(hClaimed(claim("carol", 0)), "", "a claim on an empty queue must answer none");
 }
 
 void CheckLeaseDeadline(harness::Ctx& ctx) {
-  stateSeed({"case-1"});
-  ctx.Equal(claimed(claim("alice", 1000)), "case-1", "alice must claim case-1");
-  const auto deadline = ctx.Redis.ZScore(kStateLeases, "case-1");
+  hStateSeed({"case-1"});
+  ctx.Equal(hClaimed(claim("alice", 1000)), "case-1", "alice must claim case-1");
+  const auto deadline = ctx.Redis.ZScore(kHStateLeases, "case-1");
   ctx.Assert(deadline && *deadline == 1600,
              "the lease on case-1 claimed at 1000 is %v in moderation:leases, expected 1600 (now + kLeaseS): without a deadline a crashed moderator holds the case forever",
              deadline.value_or(-1));
-  ctx.Equal(ctx.Redis.HGet(kStateOwners, "case-1").value_or(""), "alice", "the owner of case-1 in moderation:owners");
+  ctx.Equal(ctx.Redis.HGet(kHStateOwners, "case-1").value_or(""), "alice", "the owner of case-1 in moderation:owners");
 }
 
 void CheckRenewOwner(harness::Ctx& ctx) {
-  stateSeed({"case-1"});
+  hStateSeed({"case-1"});
   claim("alice", 0);
   ctx.Equal(renew("case-1", "bob", 300), false, "bob renewed the lease on alice's case: renew must answer false for a case the caller does not hold; renewed");
-  ctx.Equal(ctx.Redis.ZScore(kStateLeases, "case-1").value_or(-1), 600.0, "bob's refused renewal must leave the deadline");
+  ctx.Equal(ctx.Redis.ZScore(kHStateLeases, "case-1").value_or(-1), 600.0, "bob's refused renewal must leave the deadline");
   ctx.Equal(renew("case-1", "alice", 500), true, "alice must be able to renew her own case; renewed");
-  ctx.Equal(ctx.Redis.ZScore(kStateLeases, "case-1").value_or(-1), 1100.0, "alice's renewal at 500; the deadline");
+  ctx.Equal(ctx.Redis.ZScore(kHStateLeases, "case-1").value_or(-1), 1100.0, "alice's renewal at 500; the deadline");
   ctx.Equal(renew("case-9", "alice", 500), false, "renewing a case nobody claimed; renewed");
-  ctx.Assert(!ctx.Redis.ZScore(kStateLeases, "case-9"), "a refused renewal must not create a lease");
+  ctx.Assert(!ctx.Redis.ZScore(kHStateLeases, "case-9"), "a refused renewal must not create a lease");
   auto fired = std::make_shared<bool>(false);
-  ctx.Redis.After(kStateOwners, [fired] {
+  ctx.Redis.After(kHStateOwners, [fired] {
     *fired = true;
     requeueExpired(5000);
   });
   renew("case-1", "alice", 1000);
   ctx.Assert(*fired, "nothing touched moderation:owners");
-  const auto lease = ctx.Redis.ZScore(kStateLeases, "case-1");
-  const auto owner = ctx.Redis.HGet(kStateOwners, "case-1");
+  const auto lease = ctx.Redis.ZScore(kHStateLeases, "case-1");
+  const auto owner = ctx.Redis.HGet(kHStateOwners, "case-1");
   ctx.Assert(!lease && !owner,
              "a sweep at 5000 landed during alice's renewal and put case-1 back in the queue, yet it is left with lease %v and owner %q: the owner was checked and the deadline written in separate steps",
              lease.value_or(-1), owner.value_or(""));
 }
 
 void CheckCounters(harness::Ctx& ctx) {
-  stateSeed({"case-1", "case-2", "case-3"});
-  auto view = watchCounters(ctx);
+  hStateSeed({"case-1", "case-2", "case-3"});
+  auto view = hWatchCounters(ctx);
   claim("alice", 0);
-  dashboard(ctx, *view, "a claim");
+  hDashboard(ctx, *view, "a claim");
   for (const std::string moderator : {"bob", "carol", "dave"}) claim(moderator, 0);
-  ctx.Equal(ctx.Redis.HGetAll(kStateCounters), std::map<std::string, std::string>{{"pending", "0"}, {"in_review", "3"}},
+  ctx.Equal(ctx.Redis.HGetAll(kHStateCounters), std::map<std::string, std::string>{{"pending", "0"}, {"in_review", "3"}},
             "after three claims (and one on an empty queue) the counters");
-  view = watchCounters(ctx);
+  view = hWatchCounters(ctx);
   ctx.Equal(requeueExpired(700), 3, "at 700 all three leases (600) have run out; swept");
-  dashboard(ctx, *view, "a sweep");
-  ctx.Equal(ctx.Redis.HGetAll(kStateCounters), std::map<std::string, std::string>{{"pending", "3"}, {"in_review", "0"}}, "after sweeping all three the counters");
+  hDashboard(ctx, *view, "a sweep");
+  ctx.Equal(ctx.Redis.HGetAll(kHStateCounters), std::map<std::string, std::string>{{"pending", "3"}, {"in_review", "0"}}, "after sweeping all three the counters");
 }
 
 void CheckRequeueExpired(harness::Ctx& ctx) {
-  stateSeed({"case-1", "case-2", "case-3"});
-  ctx.Assert(claimed(claim("alice", 0)) == "case-1" && claimed(claim("bob", 300)) == "case-2", "alice and bob must claim case-1 and case-2");
+  hStateSeed({"case-1", "case-2", "case-3"});
+  ctx.Assert(hClaimed(claim("alice", 0)) == "case-1" && hClaimed(claim("bob", 300)) == "case-2", "alice and bob must claim case-1 and case-2");
   ctx.Equal(requeueExpired(600), 0, "a lease that ends at 600 has not expired at 600; swept");
   auto again = std::make_shared<int>(-1);
-  ctx.Redis.After(kStateLeases, [again] { *again = requeueExpired(700); });
+  ctx.Redis.After(kHStateLeases, [again] { *again = requeueExpired(700); });
   const int swept = requeueExpired(700);
   ctx.Assert(*again != -1, "nothing touched moderation:leases");
   ctx.Assert(swept == 1 && *again == 0,
              "at 700 alice's lease (600) has run out and bob's (900) has not: a sweep returned %v and a second sweep landing in the middle of it returned %v, expected 1 and 0",
              swept, *again);
   std::string queued;
-  for (const auto& z : ctx.Redis.ZRangeWithScores(kStatePending, 0, -1)) queued += z.Member + ":" + std::to_string(static_cast<long long>(z.Score)) + " ";
+  for (const auto& z : ctx.Redis.ZRangeWithScores(kHStatePending, 0, -1)) queued += z.Member + ":" + std::to_string(static_cast<long long>(z.Score)) + " ";
   ctx.Equal(queued, "case-1:0 case-3:3 ", "moderation:pending (member:score) must hold case-1 back at the head (score 0) before case-3");
-  ctx.Assert(!ctx.Redis.HGet(kStateOwners, "case-1") && !ctx.Redis.ZScore(kStateLeases, "case-1"), "the swept case still has an owner or a lease");
-  ctx.Equal(ctx.Redis.HGetAll(kStateCounters), std::map<std::string, std::string>{{"pending", "2"}, {"in_review", "1"}}, "after the sweep the counters (the case requeued once)");
+  ctx.Assert(!ctx.Redis.HGet(kHStateOwners, "case-1") && !ctx.Redis.ZScore(kHStateLeases, "case-1"), "the swept case still has an owner or a lease");
+  ctx.Equal(ctx.Redis.HGetAll(kHStateCounters), std::map<std::string, std::string>{{"pending", "2"}, {"in_review", "1"}}, "after the sweep the counters (the case requeued once)");
   ctx.Equal(requeueExpired(800), 0, "the next sweep found case-1 again: the sweep must remove the lease it acted on; swept");
   ctx.Equal(renew("case-1", "alice", 800), false, "alice's lease ran out and the case went back to the queue: her renewal must be refused; renewed");
-  ctx.Equal(claimed(claim("carol", 800)), "case-1", "the swept case must be the next one claimed, ahead of case-3");
+  ctx.Equal(hClaimed(claim("carol", 800)), "case-1", "the swept case must be the next one claimed, ahead of case-3");
 }
 `,
   },

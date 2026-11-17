@@ -995,12 +995,12 @@ import (
 	"leetbuild/harness"
 )
 
-var dispatchBg = context.Background()
+var hDispatchBg = context.Background()
 
 // relayPeer accepts every recipient but bounce@ (hard bounce), blocked@ (on its own list) and soft@ (a
 // soft bounce on each message's first try, accepted after); an id it took answers its first verdict,
 // and the first loseReplies replies are lost after it took the message.
-type relayPeer struct {
+type HRelayPeer struct {
 	pb.UnimplementedRelayServer
 	verdicts    map[string]*pb.Delivery
 	softBounced map[string]bool
@@ -1008,7 +1008,7 @@ type relayPeer struct {
 	loseReplies int
 }
 
-func (p *relayPeer) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.Delivery, error) {
+func (p *HRelayPeer) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.Delivery, error) {
 	if strings.HasPrefix(req.GetRecipient(), "soft@") && !p.softBounced[req.GetMessageId()] {
 		p.softBounced[req.GetMessageId()] = true
 		return &pb.Delivery{Outcome: "soft_bounce", BounceCategory: "mailbox_full"}, nil
@@ -1033,30 +1033,30 @@ func (p *relayPeer) SendMail(_ context.Context, req *pb.SendMailRequest) (*pb.De
 	return verdict, nil
 }
 
-func (p *relayPeer) GetStatus(_ context.Context, req *pb.StatusRequest) (*pb.Delivery, error) {
+func (p *HRelayPeer) GetStatus(_ context.Context, req *pb.StatusRequest) (*pb.Delivery, error) {
 	if verdict, seen := p.verdicts[req.GetMessageId()]; seen {
 		return verdict, nil
 	}
 	return &pb.Delivery{Outcome: "unknown"}, nil
 }
 
-func serveRelay(ctx *harness.Ctx) *relayPeer {
-	peer := &relayPeer{verdicts: map[string]*pb.Delivery{}, softBounced: map[string]bool{}}
+func hServeRelay(ctx *harness.Ctx) *HRelayPeer {
+	peer := &HRelayPeer{verdicts: map[string]*pb.Delivery{}, softBounced: map[string]bool{}}
 	pb.RegisterRelayServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func newMessage(recipient string) string {
-	return store.Enqueue(dispatchBg, "t-1", recipient, "welcome", "Welcome", map[string]string{"first_name": "Ana"})
+func hNewMessage(recipient string) string {
+	return store.Enqueue(hDispatchBg, "t-1", recipient, "welcome", "Welcome", map[string]string{"first_name": "Ana"})
 }
 
-func mustDeliver(ctx *harness.Ctx, messageID string) string {
-	state, err := deliver(dispatchBg, messageID)
+func hMustDeliver(ctx *harness.Ctx, messageID string) string {
+	state, err := deliver(hDispatchBg, messageID)
 	ctx.NoError(err, "deliver(%s) failed", messageID)
 	return state
 }
 
-func countOf(list []string, item string) int {
+func hCountOf(list []string, item string) int {
 	n := 0
 	for _, v := range list {
 		if v == item {
@@ -1067,12 +1067,12 @@ func countOf(list []string, item string) int {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	relay := serveRelay(ctx)
-	ctx.Equal(mustDeliver(ctx, newMessage("ana@example.com")), "sent", "with a healthy relay, deliver")
+	relay := hServeRelay(ctx)
+	ctx.Equal(hMustDeliver(ctx, hNewMessage("ana@example.com")), "sent", "with a healthy relay, deliver")
 	// A lost reply: the GetStatus that follows carries the deadline too. How the timeout is settled
 	// is reconcile-timeout's concern; this check reads the deadlines.
 	relay.loseReplies = 1
-	_, _ = deliver(dispatchBg, newMessage("bo@example.com"))
+	_, _ = deliver(hDispatchBg, hNewMessage("bo@example.com"))
 	ctx.Assert(len(ctx.GRPC.CallsTo("SendMail", "")) > 0, "no SendMail call was made")
 	for _, method := range []string{"SendMail", "GetStatus"} {
 		for _, call := range ctx.GRPC.CallsTo(method, "") {
@@ -1083,56 +1083,56 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckSameMessageId(ctx *harness.Ctx) {
-	relay := serveRelay(ctx)
+	relay := hServeRelay(ctx)
 	ctx.GRPC.Fail("SendMail", codes.Unavailable, "relay restarting", 1, "")
-	messageID := newMessage("ana@example.com")
-	ctx.Equal(mustDeliver(ctx, messageID), "sent", "after one UNAVAILABLE, deliver")
+	messageID := hNewMessage("ana@example.com")
+	ctx.Equal(hMustDeliver(ctx, messageID), "sent", "after one UNAVAILABLE, deliver")
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "after UNAVAILABLE deliver sent again at once: a relay that is restarting is hit again before it is back. Sleep the backoff before the retry")
 	var ids []string
 	for _, c := range ctx.GRPC.CallsTo("SendMail", "") {
 		ids = append(ids, c.Request.(*pb.SendMailRequest).GetMessageId())
 	}
 	ctx.Equal(ids, []string{messageID, messageID}, "the two attempts must carry the message's own id (a new id per attempt is a new email to the relay, which cannot tell a retry from a second message); the ids")
-	attempts := store.Attempts(dispatchBg, messageID)
+	attempts := store.Attempts(hDispatchBg, messageID)
 	ctx.Assert(len(attempts) == 2 && attempts[1].Outcome == "accepted", "the timeline holds %v, expected the failed attempt and then accepted", attempts)
 	ctx.Equal(relay.mailed, []string{"ana@example.com"}, "the recipients the relay mailed")
 }
 
 func CheckTerminalOutcomes(ctx *harness.Ctx) {
-	serveRelay(ctx)
-	bounced := newMessage("bounce@example.com")
-	state := mustDeliver(ctx, bounced)
+	hServeRelay(ctx)
+	bounced := hNewMessage("bounce@example.com")
+	state := hMustDeliver(ctx, bounced)
 	ctx.Equal(len(ctx.GRPC.CallsTo("SendMail", "")), 1, "a hard bounce was asked again (the mailbox does not exist, asking again cannot change that); the SendMail calls")
 	ctx.Equal(state, "bounced", "after a hard bounce, deliver")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a hard bounce must not be slept on and retried; the sleeps")
-	message := store.Load(dispatchBg, bounced)
+	message := store.Load(hDispatchBg, bounced)
 	ctx.Assert(message.State == "bounced" && message.BounceCategory == "mailbox_unknown", "the message holds state %q, bounce_category %q, expected bounced with mailbox_unknown", message.State, message.BounceCategory)
 	ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", "bounce@example.com"), "after a hard bounce the address is not in mail:suppressed: the next send mails a mailbox that does not exist. Suppress it through the gate")
-	state = mustDeliver(ctx, newMessage("blocked@example.com"))
+	state = hMustDeliver(ctx, hNewMessage("blocked@example.com"))
 	ctx.Assert(state == "suppressed" && len(ctx.GRPC.CallsTo("SendMail", "")) == 2, "a recipient on the relay's own list answered %q after %d call(s), expected suppressed after one", state, len(ctx.GRPC.CallsTo("SendMail", ""))-1)
 	// A soft bounce is not terminal: the mailbox may take the message after the backoff.
-	state = mustDeliver(ctx, newMessage("soft@example.com"))
+	state = hMustDeliver(ctx, hNewMessage("soft@example.com"))
 	sent := len(ctx.GRPC.CallsTo("SendMail", "")) - 2
 	ctx.Assert(state == "sent" && sent == 2 && ctx.Clock.Sleeps() >= 1, "a soft bounce followed by accepted answered %q after %d SendMail call(s) and %d sleep(s), expected sent after a backoff and a second call: a full mailbox is retried, not given up on", state, sent, ctx.Clock.Sleeps())
 	// Any other error is not retried: sending again cannot fix it.
 	ctx.GRPC.Fail("SendMail", codes.InvalidArgument, "template rejected", 1, "")
-	state, err := deliver(dispatchBg, newMessage("cy@example.com"))
+	state, err := deliver(hDispatchBg, hNewMessage("cy@example.com"))
 	sent = len(ctx.GRPC.CallsTo("SendMail", "")) - 4
 	ctx.Assert(sent == 1 && (err != nil || state != "sent"), "after INVALID_ARGUMENT SendMail was called %d time(s) and deliver answered %q (error %v): only UNAVAILABLE and soft bounces are retried", sent, state, err)
 }
 
 func CheckReconcileTimeout(ctx *harness.Ctx) {
-	relay := serveRelay(ctx)
+	relay := hServeRelay(ctx)
 	relay.loseReplies = 1
-	state := mustDeliver(ctx, newMessage("ana@example.com"))
+	state := hMustDeliver(ctx, hNewMessage("ana@example.com"))
 	ctx.Equal(relay.mailed, []string{"ana@example.com"}, "the relay took the message, its reply was lost, and a resend reached the customer as a second email (ask GetStatus before sending again); the recipients the relay mailed")
 	ctx.Equal(state, "sent", "the relay accepted the message (its reply was lost); deliver")
 	ctx.Assert(len(ctx.GRPC.CallsTo("GetStatus", "")) > 0, "after DEADLINE_EXCEEDED no GetStatus call was made")
 	ctx.Equal(len(ctx.GRPC.CallsTo("SendMail", "")), 1, "GetStatus said accepted, so nothing is resent; the SendMail calls")
 	// A timeout the relay never saw: GetStatus answers unknown, and the same id is sent again.
 	ctx.GRPC.Fail("SendMail", codes.DeadlineExceeded, "no answer", 1, "")
-	state = mustDeliver(ctx, newMessage("bo@example.com"))
-	ctx.Assert(state == "sent" && countOf(relay.mailed, "bo@example.com") == 1, "after a timeout the relay never saw, deliver answered %q and the relay mailed %q", state, relay.mailed)
+	state = hMustDeliver(ctx, hNewMessage("bo@example.com"))
+	ctx.Assert(state == "sent" && hCountOf(relay.mailed, "bo@example.com") == 1, "after a timeout the relay never saw, deliver answered %q and the relay mailed %q", state, relay.mailed)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1150,7 +1150,7 @@ namespace {
 // Accepts every recipient but bounce@ (hard bounce), blocked@ (on its own list) and soft@ (a soft
 // bounce on each message's first try, accepted after); an id it took answers its first verdict, and
 // the first lose_replies replies are lost after it took the message.
-class RelayPeer final : public smtprelay::Relay::Service {
+class HRelayPeer final : public smtprelay::Relay::Service {
  public:
   std::map<std::string, smtprelay::Delivery> verdicts;
   std::set<std::string> soft_bounced;
@@ -1196,19 +1196,19 @@ class RelayPeer final : public smtprelay::Relay::Service {
   }
 };
 
-RelayPeer& serveRelay(harness::Ctx& ctx) {
-  static RelayPeer* peer = nullptr;
+HRelayPeer& hServeRelay(harness::Ctx& ctx) {
+  static HRelayPeer* peer = nullptr;
   delete peer;
-  peer = new RelayPeer;
+  peer = new HRelayPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::string newMessage(const std::string& recipient) {
+std::string hNewMessage(const std::string& recipient) {
   return mail::store::enqueue("t-1", recipient, "welcome", "Welcome", {{"first_name", "Ana"}});
 }
 
-std::string mustDeliver(harness::Ctx& ctx, const std::string& message_id) {
+std::string hMustDeliver(harness::Ctx& ctx, const std::string& message_id) {
   try {
     return deliver(message_id);
   } catch (const std::exception& e) {
@@ -1216,7 +1216,7 @@ std::string mustDeliver(harness::Ctx& ctx, const std::string& message_id) {
   }
 }
 
-long countOf(const std::vector<std::string>& list, const std::string& item) {
+long hCountOf(const std::vector<std::string>& list, const std::string& item) {
   long n = 0;
   for (const auto& v : list) n += v == item ? 1 : 0;
   return n;
@@ -1225,12 +1225,12 @@ long countOf(const std::vector<std::string>& list, const std::string& item) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  RelayPeer& relay = serveRelay(ctx);
-  ctx.Equal(mustDeliver(ctx, newMessage("ana@example.com")), "sent", "with a healthy relay, deliver");
+  HRelayPeer& relay = hServeRelay(ctx);
+  ctx.Equal(hMustDeliver(ctx, hNewMessage("ana@example.com")), "sent", "with a healthy relay, deliver");
   // A lost reply: the GetStatus that follows carries the deadline too.
   relay.lose_replies = 1;
   try {
-    deliver(newMessage("bo@example.com"));
+    deliver(hNewMessage("bo@example.com"));
   } catch (const std::exception&) {
     // how the timeout is settled is reconcile-timeout's concern; this check reads the deadlines
   }
@@ -1245,10 +1245,10 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckSameMessageId(harness::Ctx& ctx) {
-  RelayPeer& relay = serveRelay(ctx);
+  HRelayPeer& relay = hServeRelay(ctx);
   ctx.GRPC.Fail("SendMail", grpc::StatusCode::UNAVAILABLE, "relay restarting", 1);
-  const std::string message_id = newMessage("ana@example.com");
-  ctx.Equal(mustDeliver(ctx, message_id), "sent", "after one UNAVAILABLE, deliver");
+  const std::string message_id = hNewMessage("ana@example.com");
+  ctx.Equal(hMustDeliver(ctx, message_id), "sent", "after one UNAVAILABLE, deliver");
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "after UNAVAILABLE deliver sent again at once: a relay that is restarting is hit again before it is back. Sleep kBackoff before the retry");
   std::vector<std::string> ids;
   for (const auto& c : ctx.GRPC.CallsTo("SendMail")) ids.push_back(c.Request<smtprelay::SendMailRequest>().message_id());
@@ -1259,9 +1259,9 @@ void CheckSameMessageId(harness::Ctx& ctx) {
 }
 
 void CheckTerminalOutcomes(harness::Ctx& ctx) {
-  serveRelay(ctx);
-  const std::string bounced = newMessage("bounce@example.com");
-  std::string state = mustDeliver(ctx, bounced);
+  hServeRelay(ctx);
+  const std::string bounced = hNewMessage("bounce@example.com");
+  std::string state = hMustDeliver(ctx, bounced);
   ctx.Equal(ctx.GRPC.CallsTo("SendMail").size(), 1, "a hard bounce was asked again (the mailbox does not exist, asking again cannot change that); the SendMail calls");
   ctx.Equal(state, "bounced", "after a hard bounce, deliver");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a hard bounce must not be slept on and retried; the sleeps");
@@ -1269,11 +1269,11 @@ void CheckTerminalOutcomes(harness::Ctx& ctx) {
   ctx.Assert(message && message->state == "bounced" && message->bounce_category == "mailbox_unknown", "the message holds state %q, bounce_category %q, expected bounced with mailbox_unknown",
              message ? message->state : "", message ? message->bounce_category : "");
   ctx.Assert(ctx.Redis.SIsMember("mail:suppressed", "bounce@example.com"), "after a hard bounce the address is not in mail:suppressed: the next send mails a mailbox that does not exist. Suppress it through the gate");
-  state = mustDeliver(ctx, newMessage("blocked@example.com"));
+  state = hMustDeliver(ctx, hNewMessage("blocked@example.com"));
   ctx.Assert(state == "suppressed" && ctx.GRPC.CallsTo("SendMail").size() == 2, "a recipient on the relay's own list answered %q after %d call(s), expected suppressed after one", state,
              static_cast<int>(ctx.GRPC.CallsTo("SendMail").size()) - 1);
   // A soft bounce is not terminal: the mailbox may take the message after the backoff.
-  state = mustDeliver(ctx, newMessage("soft@example.com"));
+  state = hMustDeliver(ctx, hNewMessage("soft@example.com"));
   int sent = static_cast<int>(ctx.GRPC.CallsTo("SendMail").size()) - 2;
   ctx.Assert(state == "sent" && sent == 2 && ctx.Clock.Sleeps() >= 1,
              "a soft bounce followed by accepted answered %q after %d SendMail call(s) and %d sleep(s), expected sent after a backoff and a second call: a full mailbox is retried, not given up on", state, sent,
@@ -1281,7 +1281,7 @@ void CheckTerminalOutcomes(harness::Ctx& ctx) {
   // Any other error is not retried: sending again cannot fix it.
   ctx.GRPC.Fail("SendMail", grpc::StatusCode::INVALID_ARGUMENT, "template rejected", 1);
   try {
-    state = deliver(newMessage("cy@example.com"));
+    state = deliver(hNewMessage("cy@example.com"));
   } catch (const std::exception&) {
     state = "threw";
   }
@@ -1290,17 +1290,17 @@ void CheckTerminalOutcomes(harness::Ctx& ctx) {
 }
 
 void CheckReconcileTimeout(harness::Ctx& ctx) {
-  RelayPeer& relay = serveRelay(ctx);
+  HRelayPeer& relay = hServeRelay(ctx);
   relay.lose_replies = 1;
-  std::string state = mustDeliver(ctx, newMessage("ana@example.com"));
+  std::string state = hMustDeliver(ctx, hNewMessage("ana@example.com"));
   ctx.Equal(relay.mailed, std::vector<std::string>{"ana@example.com"}, "the relay took the message, its reply was lost, and a resend reached the customer as a second email (ask GetStatus before sending again); the recipients the relay mailed");
   ctx.Equal(state, "sent", "the relay accepted the message (its reply was lost); deliver");
   ctx.Assert(!ctx.GRPC.CallsTo("GetStatus").empty(), "after DEADLINE_EXCEEDED no GetStatus call was made");
   ctx.Equal(ctx.GRPC.CallsTo("SendMail").size(), 1, "GetStatus said accepted, so nothing is resent; the SendMail calls");
   // A timeout the relay never saw: GetStatus answers unknown, and the same id is sent again.
   ctx.GRPC.Fail("SendMail", grpc::StatusCode::DEADLINE_EXCEEDED, "no answer", 1);
-  state = mustDeliver(ctx, newMessage("bo@example.com"));
-  ctx.Assert(state == "sent" && countOf(relay.mailed, "bo@example.com") == 1, "after a timeout the relay never saw, deliver answered %q and the relay mailed %q", state, relay.mailed);
+  state = hMustDeliver(ctx, hNewMessage("bo@example.com"));
+  ctx.Assert(state == "sent" && hCountOf(relay.mailed, "bo@example.com") == 1, "after a timeout the relay never saw, deliver answered %q and the relay mailed %q", state, relay.mailed);
 }
 `,
   },

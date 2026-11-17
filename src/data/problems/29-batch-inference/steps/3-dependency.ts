@@ -951,16 +951,16 @@ import (
 	"leetbuild/harness"
 )
 
-const clientBatch = "b1"
+const kHClientBatch = "b1"
 
 // modelPeer is the stand-in model server: answers from batch/model, InvalidArgument for a poisoned
 // input; the first call for record "late" ends Unavailable once its latency has passed (a restart mid-call).
-type modelPeer struct {
+type HModelPeer struct {
 	pb.UnimplementedModelServer
 	restarted atomic.Bool
 }
 
-func (p *modelPeer) Infer(_ context.Context, req *pb.InferRequest) (*pb.InferReply, error) {
+func (p *HModelPeer) Infer(_ context.Context, req *pb.InferRequest) (*pb.InferReply, error) {
 	if req.GetRecordId() == "late" && p.restarted.CompareAndSwap(false, true) {
 		return nil, status.Error(codes.Unavailable, "model server restarting")
 	}
@@ -971,11 +971,11 @@ func (p *modelPeer) Infer(_ context.Context, req *pb.InferRequest) (*pb.InferRep
 	return &pb.InferReply{Output: output, Model: used}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) {
-	pb.RegisterModelServer(ctx.GRPC.Server(config.ModelServer), &modelPeer{})
+func hClientWorld(ctx *harness.Ctx) {
+	pb.RegisterModelServer(ctx.GRPC.Server(config.ModelServer), &HModelPeer{})
 }
 
-func clientRecords(n, poisonAt int) []records.Record {
+func hClientRecords(n, poisonAt int) []records.Record {
 	out := make([]records.Record, 0, n)
 	for i := 0; i < n; i++ {
 		input := fmt.Sprintf("ticket %d: the printer jams on page two", i)
@@ -987,13 +987,13 @@ func clientRecords(n, poisonAt int) []records.Record {
 	return out
 }
 
-func clientRun(shardID int, recs []records.Record) records.ShardResult {
-	return runShard(context.Background(), clientBatch, "sum-v7", shardID, recs)
+func hClientRun(shardID int, recs []records.Record) records.ShardResult {
+	return runShard(context.Background(), kHClientBatch, "sum-v7", shardID, recs)
 }
 
-func clientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Infer", "") }
+func hClientCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Infer", "") }
 
-func clientErrors(r records.ShardResult) []string {
+func hClientErrors(r records.ShardResult) []string {
 	out := []string{}
 	for _, e := range r.Errors {
 		out = append(out, e.RecordID+":"+e.Reason)
@@ -1002,78 +1002,78 @@ func clientErrors(r records.ShardResult) []string {
 }
 
 func CheckAttemptDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientRun(0, clientRecords(1, -1))
-	ctx.Assert(result.Completed == 1 && result.Failed == 0, "a healthy model server answers the record: completed %d, failed %d, errors %v", result.Completed, result.Failed, clientErrors(result))
-	calls := clientCalls(ctx)
+	hClientWorld(ctx)
+	result := hClientRun(0, hClientRecords(1, -1))
+	ctx.Assert(result.Completed == 1 && result.Failed == 0, "a healthy model server answers the record: completed %d, failed %d, errors %v", result.Completed, result.Failed, hClientErrors(result))
+	calls := hClientCalls(ctx)
 	ctx.Equal(len(calls), 1, "a healthy model server must be called once per record; Infer calls")
 	ctx.Assert(calls[0].HasDeadline(), "the Infer call carries no deadline: a hung model server holds the worker for as long as it hangs")
 	ctx.Assert(4500*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 5500*time.Millisecond, "the deadline must be 5 s, got %v", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Infer", 4.0, config.ModelServer)
-	slow := clientRun(1, clientRecords(2, -1))
-	ctx.Assert(slow.Completed == 2 && len(clientCalls(ctx)) == 3, "a model server that answers in 4 s is within the deadline for every record of the shard: completed %d, errors %v, %d calls", slow.Completed, clientErrors(slow), len(clientCalls(ctx)))
+	slow := hClientRun(1, hClientRecords(2, -1))
+	ctx.Assert(slow.Completed == 2 && len(hClientCalls(ctx)) == 3, "a model server that answers in 4 s is within the deadline for every record of the shard: completed %d, errors %v, %d calls", slow.Completed, hClientErrors(slow), len(hClientCalls(ctx)))
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.Fail("Infer", codes.Unavailable, "model server restarting", 1, config.ModelServer)
-	result := clientRun(0, clientRecords(1, -1))
-	ctx.Assert(result.Completed == 1 && len(clientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected the record answered after 2 calls, got completed %d after %d calls", result.Completed, len(clientCalls(ctx)))
+	result := hClientRun(0, hClientRecords(1, -1))
+	ctx.Assert(result.Completed == 1 && len(hClientCalls(ctx)) == 2, "one UNAVAILABLE earns one retry: expected the record answered after 2 calls, got completed %d after %d calls", result.Completed, len(hClientCalls(ctx)))
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
 	ctx.GRPC.Fail("Infer", codes.Unavailable, "model server down", 5, config.ModelServer)
-	result = clientRun(1, clientRecords(1, -1))
-	ctx.Equal(len(clientCalls(ctx))-2, 3, "a model server that stays UNAVAILABLE gets maxAttempts = 3 calls for the record; calls")
-	ctx.Assert(result.Failed == 1 && strings.Join(clientErrors(result), ",") == "r0:unavailable", "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.Failed, clientErrors(result))
+	result = hClientRun(1, hClientRecords(1, -1))
+	ctx.Equal(len(hClientCalls(ctx))-2, 3, "a model server that stays UNAVAILABLE gets maxAttempts = 3 calls for the record; calls")
+	ctx.Assert(result.Failed == 1 && strings.Join(hClientErrors(result), ",") == "r0:unavailable", "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.Failed, hClientErrors(result))
 	ctx.GRPC.ClearFailures() // the two UNAVAILABLE the record above did not use
 	for _, terminal := range []struct {
 		code   codes.Code
 		reason string
 	}{{codes.ResourceExhausted, "resource_exhausted"}, {codes.FailedPrecondition, "failed_precondition"}} {
-		before := len(clientCalls(ctx))
+		before := len(hClientCalls(ctx))
 		ctx.GRPC.Fail("Infer", terminal.code, "refused", 1, config.ModelServer)
-		result = clientRun(2, clientRecords(1, -1))
-		n := len(clientCalls(ctx)) - before
-		ctx.Assert(n == 1 && strings.Join(clientErrors(result), ",") == "r0:"+terminal.reason, "%s is final: the record fails with reason %s after one call, it got %d calls and errors %v; only UNAVAILABLE is retried", terminal.reason, terminal.reason, n, clientErrors(result))
+		result = hClientRun(2, hClientRecords(1, -1))
+		n := len(hClientCalls(ctx)) - before
+		ctx.Assert(n == 1 && strings.Join(hClientErrors(result), ",") == "r0:"+terminal.reason, "%s is final: the record fails with reason %s after one call, it got %d calls and errors %v; only UNAVAILABLE is retried", terminal.reason, terminal.reason, n, hClientErrors(result))
 	}
 	ctx.GRPC.SetLatency("Infer", 3.0, config.ModelServer)
-	before := len(clientCalls(ctx))
-	result = clientRun(3, []records.Record{{RecordID: "late", Input: "ticket 9: the queue stalls"}})
-	late := clientCalls(ctx)[before:]
+	before := len(hClientCalls(ctx))
+	result = hClientRun(3, []records.Record{{RecordID: "late", Input: "ticket 9: the queue stalls"}})
+	late := hClientCalls(ctx)[before:]
 	fresh := len(late) == 2
 	timeouts := []time.Duration{}
 	for _, c := range late {
 		timeouts = append(timeouts, c.Timeout)
 		fresh = fresh && c.HasDeadline() && 4500*time.Millisecond <= c.Timeout && c.Timeout <= 5500*time.Millisecond
 	}
-	ctx.Assert(result.Completed == 1 && fresh, "a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed %d, errors %v, the attempts carried deadlines %v; every attempt carries its own 5 s deadline, not what is left of the first one's", result.Completed, clientErrors(result), timeouts)
+	ctx.Assert(result.Completed == 1 && fresh, "a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed %d, errors %v, the attempts carried deadlines %v; every attempt carries its own 5 s deadline, not what is left of the first one's", result.Completed, hClientErrors(result), timeouts)
 }
 
 func CheckHungCallCut(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	hClientWorld(ctx)
 	ctx.GRPC.SetLatency("Infer", 8.0, config.ModelServer)
 	started := ctx.Clock.Now()
-	result := clientRun(0, clientRecords(1, -1))
+	result := hClientRun(0, hClientRecords(1, -1))
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 5.6, "the worker waited %.1f s on a model server that takes 8 s: the deadline must cut the call at about 5 s", waited)
-	ctx.Equal(len(clientCalls(ctx)), 1, "a call cut at its deadline is not retried; calls")
-	ctx.Equal(clientCalls(ctx)[0].Code, codes.DeadlineExceeded, "the call must end DEADLINE_EXCEEDED")
-	ctx.Assert(result.Failed == 1 && strings.Join(clientErrors(result), ",") == "r0:deadline", "the record fails with reason deadline: failed %d, errors %v", result.Failed, clientErrors(result))
+	ctx.Equal(len(hClientCalls(ctx)), 1, "a call cut at its deadline is not retried; calls")
+	ctx.Equal(hClientCalls(ctx)[0].Code, codes.DeadlineExceeded, "the call must end DEADLINE_EXCEEDED")
+	ctx.Assert(result.Failed == 1 && strings.Join(hClientErrors(result), ",") == "r0:deadline", "the record fails with reason deadline: failed %d, errors %v", result.Failed, hClientErrors(result))
 	ctx.GRPC.SetLatency("Infer", 0, config.ModelServer)
-	ctx.Equal(clientRun(1, clientRecords(1, -1)).Completed, 1, "once the model server is fast again records are answered; completed")
+	ctx.Equal(hClientRun(1, hClientRecords(1, -1)).Completed, 1, "once the model server is fast again records are answered; completed")
 }
 
 func CheckPoisonContained(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientRun(0, clientRecords(4, 1))
-	ctx.Assert(result.Completed == 3 && result.Failed == 1, "one record the model cannot parse fails alone: expected completed 3, failed 1, got completed %d, failed %d, errors %v", result.Completed, result.Failed, clientErrors(result))
-	ctx.Equal(clientErrors(result), []string{"r1:invalid_argument"}, "the poisoned record fails with reason invalid_argument; errors")
+	hClientWorld(ctx)
+	result := hClientRun(0, hClientRecords(4, 1))
+	ctx.Assert(result.Completed == 3 && result.Failed == 1, "one record the model cannot parse fails alone: expected completed 3, failed 1, got completed %d, failed %d, errors %v", result.Completed, result.Failed, hClientErrors(result))
+	ctx.Equal(hClientErrors(result), []string{"r1:invalid_argument"}, "the poisoned record fails with reason invalid_argument; errors")
 	ids := []string{}
 	for _, o := range result.Outputs {
 		ids = append(ids, o.RecordID)
 	}
 	ctx.Equal(ids, []string{"r0", "r2", "r3"}, "the other three records are answered; outputs")
 	poison := 0
-	for _, c := range clientCalls(ctx) {
+	for _, c := range hClientCalls(ctx) {
 		if req, ok := c.Request.(*pb.InferRequest); ok && req.GetRecordId() == "r1" {
 			poison++
 		}
@@ -1082,9 +1082,9 @@ func CheckPoisonContained(ctx *harness.Ctx) {
 }
 
 func CheckPinnedModel(ctx *harness.Ctx) {
-	clientWorld(ctx)
-	result := clientRun(0, clientRecords(3, -1))
-	ctx.Equal(result.Completed, 3, "a healthy shard answers every record (errors %v); completed", clientErrors(result))
+	hClientWorld(ctx)
+	result := hClientRun(0, hClientRecords(3, -1))
+	ctx.Equal(result.Completed, 3, "a healthy shard answers every record (errors %v); completed", hClientErrors(result))
 	versions := []string{}
 	for _, o := range result.Outputs {
 		versions = append(versions, o.Model)
@@ -1106,11 +1106,11 @@ func CheckPinnedModel(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kBatch = "b1";
+const std::string kHBatch = "b1";
 
 // The stand-in model server: answers from batch/model.h, INVALID_ARGUMENT for a poisoned input; the
 // first call for record "late" ends UNAVAILABLE once its latency has passed (a restart mid-call).
-class ModelPeer final : public batch::Model::Service {
+class HModelPeer final : public batch::Model::Service {
  public:
   grpc::Status Infer(grpc::ServerContext*, const batch::InferRequest* req, batch::InferReply* reply) override {
     if (req->record_id() == "late" && !restarted_.exchange(true)) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "model server restarting");
@@ -1125,14 +1125,14 @@ class ModelPeer final : public batch::Model::Service {
   std::atomic<bool> restarted_{false};
 };
 
-void clientWorld(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+void hClientWorld(harness::Ctx& ctx) {
+  static HModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer();
+  peer = new HModelPeer();
   ctx.GRPC.Server(config::kModelServer)->RegisterService(peer);
 }
 
-std::vector<records::Record> clientRecords(int n, int poisonAt = -1) {
+std::vector<records::Record> hClientRecords(int n, int poisonAt = -1) {
   std::vector<records::Record> out;
   for (int i = 0; i < n; i++) {
     out.push_back({"r" + std::to_string(i), i == poisonAt ? std::string("poison:\\x01\\x01") : "ticket " + std::to_string(i) + ": the printer jams on page two"});
@@ -1140,7 +1140,7 @@ std::vector<records::Record> clientRecords(int n, int poisonAt = -1) {
   return out;
 }
 
-std::vector<std::string> clientErrors(const records::ShardResult& r) {
+std::vector<std::string> hClientErrors(const records::ShardResult& r) {
   std::vector<std::string> out;
   for (const auto& e : r.errors) out.push_back(e.record_id + ":" + e.reason);
   return out;
@@ -1149,39 +1149,39 @@ std::vector<std::string> clientErrors(const records::ShardResult& r) {
 }  // namespace
 
 void CheckAttemptDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  const auto result = run_shard(kBatch, "sum-v7", 0, clientRecords(1));
-  ctx.Assert(result.completed == 1 && result.failed == 0, "a healthy model server answers the record: completed %d, failed %d, errors %v", result.completed, result.failed, clientErrors(result));
+  hClientWorld(ctx);
+  const auto result = run_shard(kHBatch, "sum-v7", 0, hClientRecords(1));
+  ctx.Assert(result.completed == 1 && result.failed == 0, "a healthy model server answers the record: completed %d, failed %d, errors %v", result.completed, result.failed, hClientErrors(result));
   const auto calls = ctx.GRPC.CallsTo("Infer");
   ctx.Equal(calls.size(), 1, "a healthy model server must be called once per record; Infer calls");
   ctx.Assert(calls[0].HasDeadline(), "the Infer call carries no deadline: a hung model server holds the worker for as long as it hangs");
   ctx.Assert(4.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 5.5, "the deadline must be 5 s, got %vs", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Infer", 4.0, config::kModelServer);
-  const auto slow = run_shard(kBatch, "sum-v7", 1, clientRecords(2));
-  ctx.Assert(slow.completed == 2 && ctx.GRPC.CallsTo("Infer").size() == 3, "a model server that answers in 4 s is within the deadline for every record of the shard: completed %d, errors %v, %d calls", slow.completed, clientErrors(slow), ctx.GRPC.CallsTo("Infer").size());
+  const auto slow = run_shard(kHBatch, "sum-v7", 1, hClientRecords(2));
+  ctx.Assert(slow.completed == 2 && ctx.GRPC.CallsTo("Infer").size() == 3, "a model server that answers in 4 s is within the deadline for every record of the shard: completed %d, errors %v, %d calls", slow.completed, hClientErrors(slow), ctx.GRPC.CallsTo("Infer").size());
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("Infer", grpc::StatusCode::UNAVAILABLE, "model server restarting", 1, config::kModelServer);
-  auto result = run_shard(kBatch, "sum-v7", 0, clientRecords(1));
+  auto result = run_shard(kHBatch, "sum-v7", 0, hClientRecords(1));
   ctx.Assert(result.completed == 1 && ctx.GRPC.CallsTo("Infer").size() == 2, "one UNAVAILABLE earns one retry: expected the record answered after 2 calls, got completed %d after %d calls", result.completed, ctx.GRPC.CallsTo("Infer").size());
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   ctx.GRPC.Fail("Infer", grpc::StatusCode::UNAVAILABLE, "model server down", 5, config::kModelServer);
-  result = run_shard(kBatch, "sum-v7", 1, clientRecords(1));
+  result = run_shard(kHBatch, "sum-v7", 1, hClientRecords(1));
   ctx.Equal(ctx.GRPC.CallsTo("Infer").size() - 2, 3, "a model server that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the record; calls");
-  ctx.Assert(result.failed == 1 && clientErrors(result) == std::vector<std::string>{"r0:unavailable"}, "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.failed, clientErrors(result));
+  ctx.Assert(result.failed == 1 && hClientErrors(result) == std::vector<std::string>{"r0:unavailable"}, "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.failed, hClientErrors(result));
   ctx.GRPC.ClearFailures();  // the two UNAVAILABLE the record above did not use
   for (const auto& [code, reason] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::FAILED_PRECONDITION, "failed_precondition"}}) {
     const auto before = ctx.GRPC.CallsTo("Infer").size();
     ctx.GRPC.Fail("Infer", code, "refused", 1, config::kModelServer);
-    result = run_shard(kBatch, "sum-v7", 2, clientRecords(1));
+    result = run_shard(kHBatch, "sum-v7", 2, hClientRecords(1));
     const auto n = ctx.GRPC.CallsTo("Infer").size() - before;
-    ctx.Assert(n == 1 && clientErrors(result) == std::vector<std::string>{"r0:" + reason}, "%s is final: the record fails with reason %s after one call, it got %d calls and errors %v; only UNAVAILABLE is retried", reason, reason, n, clientErrors(result));
+    ctx.Assert(n == 1 && hClientErrors(result) == std::vector<std::string>{"r0:" + reason}, "%s is final: the record fails with reason %s after one call, it got %d calls and errors %v; only UNAVAILABLE is retried", reason, reason, n, hClientErrors(result));
   }
   ctx.GRPC.SetLatency("Infer", 3.0, config::kModelServer);
   const auto before = ctx.GRPC.CallsTo("Infer").size();
-  result = run_shard(kBatch, "sum-v7", 3, {{"late", "ticket 9: the queue stalls"}});
+  result = run_shard(kHBatch, "sum-v7", 3, {{"late", "ticket 9: the queue stalls"}});
   const auto all = ctx.GRPC.CallsTo("Infer");
   bool fresh = all.size() - before == 2;
   std::vector<double> timeouts;
@@ -1189,28 +1189,28 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
     timeouts.push_back(all[i].HasDeadline() ? all[i].TimeoutSeconds() : -1);
     fresh = fresh && all[i].HasDeadline() && 4.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 5.5;
   }
-  ctx.Assert(result.completed == 1 && fresh, "a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed %d, errors %v, the attempts carried deadlines %v; every attempt carries its own 5 s deadline, not what is left of the first one's", result.completed, clientErrors(result), timeouts);
+  ctx.Assert(result.completed == 1 && fresh, "a model server that answers UNAVAILABLE after 3 s, then answers in 3 s: completed %d, errors %v, the attempts carried deadlines %v; every attempt carries its own 5 s deadline, not what is left of the first one's", result.completed, hClientErrors(result), timeouts);
 }
 
 void CheckHungCallCut(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.SetLatency("Infer", 8.0, config::kModelServer);
   const int64_t started = ctx.Clock.Now();
-  const auto result = run_shard(kBatch, "sum-v7", 0, clientRecords(1));
+  const auto result = run_shard(kHBatch, "sum-v7", 0, hClientRecords(1));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 5.6, "the worker waited %.1f s on a model server that takes 8 s: the deadline must cut the call at about 5 s", waited);
   ctx.Equal(ctx.GRPC.CallsTo("Infer").size(), 1, "a call cut at its deadline is not retried; calls");
   ctx.Equal(ctx.GRPC.CallsTo("Infer")[0].Code, grpc::StatusCode::DEADLINE_EXCEEDED, "the call must end DEADLINE_EXCEEDED");
-  ctx.Assert(result.failed == 1 && clientErrors(result) == std::vector<std::string>{"r0:deadline"}, "the record fails with reason deadline: failed %d, errors %v", result.failed, clientErrors(result));
+  ctx.Assert(result.failed == 1 && hClientErrors(result) == std::vector<std::string>{"r0:deadline"}, "the record fails with reason deadline: failed %d, errors %v", result.failed, hClientErrors(result));
   ctx.GRPC.SetLatency("Infer", 0, config::kModelServer);
-  ctx.Equal(run_shard(kBatch, "sum-v7", 1, clientRecords(1)).completed, 1, "once the model server is fast again records are answered; completed");
+  ctx.Equal(run_shard(kHBatch, "sum-v7", 1, hClientRecords(1)).completed, 1, "once the model server is fast again records are answered; completed");
 }
 
 void CheckPoisonContained(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  const auto result = run_shard(kBatch, "sum-v7", 0, clientRecords(4, 1));
-  ctx.Assert(result.completed == 3 && result.failed == 1, "one record the model cannot parse fails alone: expected completed 3, failed 1, got completed %d, failed %d, errors %v", result.completed, result.failed, clientErrors(result));
-  ctx.Equal(clientErrors(result), {"r1:invalid_argument"}, "the poisoned record fails with reason invalid_argument; errors");
+  hClientWorld(ctx);
+  const auto result = run_shard(kHBatch, "sum-v7", 0, hClientRecords(4, 1));
+  ctx.Assert(result.completed == 3 && result.failed == 1, "one record the model cannot parse fails alone: expected completed 3, failed 1, got completed %d, failed %d, errors %v", result.completed, result.failed, hClientErrors(result));
+  ctx.Equal(hClientErrors(result), {"r1:invalid_argument"}, "the poisoned record fails with reason invalid_argument; errors");
   std::vector<std::string> ids;
   for (const auto& o : result.outputs) ids.push_back(o.record_id);
   ctx.Equal(ids, {"r0", "r2", "r3"}, "the other three records are answered; outputs");
@@ -1222,9 +1222,9 @@ void CheckPoisonContained(harness::Ctx& ctx) {
 }
 
 void CheckPinnedModel(harness::Ctx& ctx) {
-  clientWorld(ctx);
-  const auto result = run_shard(kBatch, "sum-v7", 0, clientRecords(3));
-  ctx.Equal(result.completed, 3, "a healthy shard answers every record (errors %v); completed", clientErrors(result));
+  hClientWorld(ctx);
+  const auto result = run_shard(kHBatch, "sum-v7", 0, hClientRecords(3));
+  ctx.Equal(result.completed, 3, "a healthy shard answers every record (errors %v); completed", hClientErrors(result));
   std::vector<std::string> versions;
   for (const auto& o : result.outputs) versions.push_back(o.model);
   ctx.Assert(versions == std::vector<std::string>{"sum-v7", "sum-v7", "sum-v7"}, "the batch was submitted for sum-v7 and its records were answered by %v: a request that names no model gets the server's latest (%s), so a rollout mid-batch mixes two versions", versions, model::kLatest);

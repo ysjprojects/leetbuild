@@ -832,24 +832,24 @@ import (
 )
 
 const (
-	clientInvoice = "Refund for invoice 4411: the payment was charged twice"
-	clientOutage  = "Production outage: every login fails"
+	kHClientInvoice = "Refund for invoice 4411: the payment was charged twice"
+	kHClientOutage  = "Production outage: every login fails"
 )
 
-var modelDecision = rules.Decision{Queue: "billing", Priority: "high", Confidence: 0.92}
+var hModelDecision = rules.Decision{Queue: "billing", Priority: "high", Confidence: 0.92}
 
-func rulesDecision(reason, queue, priority string) rules.Decision {
+func hRulesDecision(reason, queue, priority string) rules.Decision {
 	return rules.Decision{Queue: queue, Priority: priority, Confidence: 0.5, FallbackReason: reason, RulesetVersion: "v3"}
 }
 
 // classifierPeer is the model: billing for invoices, account for logins, else general, at priority
 // high; UNAVAILABLE while down.
-type classifierPeer struct {
+type HClassifierPeer struct {
 	pb.UnimplementedClassifierServer
 	down bool
 }
 
-func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
+func (p *HClassifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
 	if p.down {
 		return nil, status.Error(codes.Unavailable, "classifier overloaded")
 	}
@@ -863,97 +863,97 @@ func (p *classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*
 	return &pb.ClassifyReply{Queue: queue, Priority: "high", Confidence: 0.92}, nil
 }
 
-func peer(ctx *harness.Ctx) *classifierPeer {
-	p := &classifierPeer{}
+func hPeer(ctx *harness.Ctx) *HClassifierPeer {
+	p := &HClassifierPeer{}
 	pb.RegisterClassifierServer(ctx.GRPC.Server(""), p)
 	return p
 }
 
-func classifyCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Classify", "")) }
+func hClassifyCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Classify", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer(ctx)
-	ctx.Equal(classify(context.Background(), "acme", clientInvoice), modelDecision, "with the classifier healthy classify must answer its decision")
+	hPeer(ctx)
+	ctx.Equal(classify(context.Background(), "acme", kHClientInvoice), hModelDecision, "with the classifier healthy classify must answer its decision")
 	ctx.GRPC.SetLatency("Classify", 10.0, "")
-	d := classify(context.Background(), "acme", clientInvoice)
+	d := classify(context.Background(), "acme", kHClientInvoice)
 	for _, call := range ctx.GRPC.CallsTo("Classify", "") {
 		ctx.Assert(call.HasDeadline(), "a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open")
 		ctx.Assert(500*time.Millisecond <= call.Timeout && call.Timeout <= 1500*time.Millisecond, "a Classify call carries a %v deadline, expected 1 s", call.Timeout)
 	}
-	ctx.Equal(d, rulesDecision("classifier_timeout", "billing", "normal"), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout")
-	ctx.Equal(classifyCalls(ctx)-1, 3, "a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make MAX_ATTEMPTS = 3 tries, each under its own 1 s deadline; the tries")
+	ctx.Equal(d, hRulesDecision("classifier_timeout", "billing", "normal"), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout")
+	ctx.Equal(hClassifyCalls(ctx)-1, 3, "a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make MAX_ATTEMPTS = 3 tries, each under its own 1 s deadline; the tries")
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	peer(ctx)
+	hPeer(ctx)
 	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "the classifier does not read this language", 1, "")
-	d := classify(context.Background(), "acme", clientInvoice)
-	ctx.Equal(classifyCalls(ctx), 1, "a refusal (INVALID_ARGUMENT) is not tried again: the model gives the same answer for the same ticket; the calls")
-	ctx.Equal(d, rulesDecision("classifier_refused", "billing", "normal"), "a refused ticket must be routed by the rules with fallback_reason classifier_refused")
+	d := classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Equal(hClassifyCalls(ctx), 1, "a refusal (INVALID_ARGUMENT) is not tried again: the model gives the same answer for the same ticket; the calls")
+	ctx.Equal(d, hRulesDecision("classifier_refused", "billing", "normal"), "a refused ticket must be routed by the rules with fallback_reason classifier_refused")
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "classifier overloaded", 2, "")
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) == 4 && d == modelDecision, "after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made %d and answered %+v", classifyCalls(ctx)-1, d)
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) == 4 && d == hModelDecision, "after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made %d and answered %+v", hClassifyCalls(ctx)-1, d)
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "classifier overloaded", 3, "")
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Equal(classifyCalls(ctx)-4, 3, "with the classifier UNAVAILABLE classify must make MAX_ATTEMPTS tries; the tries")
-	ctx.Equal(d, rulesDecision("classifier_unavailable", "billing", "normal"), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable")
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Equal(hClassifyCalls(ctx)-4, 3, "with the classifier UNAVAILABLE classify must make MAX_ATTEMPTS tries; the tries")
+	ctx.Equal(d, hRulesDecision("classifier_unavailable", "billing", "normal"), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable")
 	for _, code := range []codes.Code{codes.PermissionDenied, codes.Internal, codes.Unimplemented} {
-		before := classifyCalls(ctx)
+		before := hClassifyCalls(ctx)
 		ctx.GRPC.Fail("Classify", code, "the classifier will not take this ticket", 1, "")
-		d = classify(context.Background(), "acme", clientInvoice)
-		ctx.Equal(classifyCalls(ctx)-before, 1, "a ticket the classifier answered %s must not be tried again (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", code)
+		d = classify(context.Background(), "acme", kHClientInvoice)
+		ctx.Equal(hClassifyCalls(ctx)-before, 1, "a ticket the classifier answered %s must not be tried again (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", code)
 		ctx.Assert(d.Queue == "billing" && d.RulesetVersion == "v3" && d.FallbackReason != "", "a ticket the classifier answered %s must be routed by the rules, saying why, got %+v", code, d)
 	}
 }
 
 func CheckRulesFallback(ctx *harness.Ctx) {
-	p := peer(ctx)
+	p := hPeer(ctx)
 	p.down = true
-	ctx.Equal(classify(context.Background(), "acme", clientInvoice), rulesDecision("classifier_unavailable", "billing", "normal"),
+	ctx.Equal(classify(context.Background(), "acme", kHClientInvoice), hRulesDecision("classifier_unavailable", "billing", "normal"),
 		"with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable)")
-	ctx.Equal(classify(context.Background(), "acme", clientOutage), rulesDecision("classifier_unavailable", "account", "urgent"),
+	ctx.Equal(classify(context.Background(), "acme", kHClientOutage), hRulesDecision("classifier_unavailable", "account", "urgent"),
 		"with the classifier down an outage that blocks logins must be routed by the rules to account as urgent")
 }
 
 func CheckBreakerCooldown(ctx *harness.Ctx) {
-	p := peer(ctx)
+	p := hPeer(ctx)
 	p.down = true
-	classify(context.Background(), "acme", clientInvoice)
+	classify(context.Background(), "acme", kHClientInvoice)
 	p.down = false
-	before := classifyCalls(ctx)
-	d := classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) == before+1 && d == modelDecision, "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %+v. One failure must not take a healthy classifier out of service", classifyCalls(ctx)-before, d)
+	before := hClassifyCalls(ctx)
+	d := classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) == before+1 && d == hModelDecision, "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %+v. One failure must not take a healthy classifier out of service", hClassifyCalls(ctx)-before, d)
 	ctx.GRPC.Fail("Classify", codes.InvalidArgument, "the classifier does not read this language", 5, "")
 	for i := 0; i < 5; i++ {
-		classify(context.Background(), "acme", clientInvoice)
+		classify(context.Background(), "acme", kHClientInvoice)
 	}
-	before = classifyCalls(ctx)
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) == before+1 && d == modelDecision, "five refused tickets benched the classifier: the next ticket made %d calls and was routed %+v. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker", classifyCalls(ctx)-before, d)
+	before = hClassifyCalls(ctx)
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) == before+1 && d == hModelDecision, "five refused tickets benched the classifier: the next ticket made %d calls and was routed %+v. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker", hClassifyCalls(ctx)-before, d)
 	p.down = true
 	for i := 0; i < 4; i++ {
-		classify(context.Background(), "acme", clientInvoice)
+		classify(context.Background(), "acme", kHClientInvoice)
 	}
-	before = classifyCalls(ctx)
-	classify(context.Background(), "acme", clientInvoice)
-	ctx.Equal(classifyCalls(ctx)-before, 3, "after four tickets in a row failed the fifth must make MAX_ATTEMPTS tries: the breaker counts failed tickets, not tries, from the last success, and opens at BREAKER_THRESHOLD = 5; the fifth ticket's calls")
-	before = classifyCalls(ctx)
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	before = hClassifyCalls(ctx)
+	classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Equal(hClassifyCalls(ctx)-before, 3, "after four tickets in a row failed the fifth must make MAX_ATTEMPTS tries: the breaker counts failed tickets, not tries, from the last success, and opens at BREAKER_THRESHOLD = 5; the fifth ticket's calls")
+	before = hClassifyCalls(ctx)
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) == before && d == hRulesDecision("breaker_open", "billing", "normal"), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %+v", hClassifyCalls(ctx)-before, d)
 	ctx.Clock.Advance(29)
-	before = classifyCalls(ctx)
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "29 s after the breaker opened it must still skip the classifier (BREAKER_COOLDOWN = 30 s); it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	before = hClassifyCalls(ctx)
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) == before && d == hRulesDecision("breaker_open", "billing", "normal"), "29 s after the breaker opened it must still skip the classifier (BREAKER_COOLDOWN = 30 s); it made %d calls and answered %+v", hClassifyCalls(ctx)-before, d)
 	ctx.Clock.Advance(2)
-	before = classifyCalls(ctx)
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) > before && d == rulesDecision("classifier_unavailable", "billing", "normal"), "31 s after the breaker opened one ticket must probe the classifier; it made %d calls and answered %+v", classifyCalls(ctx)-before, d)
-	before = classifyCalls(ctx)
-	d = classify(context.Background(), "acme", clientInvoice)
-	ctx.Assert(classifyCalls(ctx) == before && d == rulesDecision("breaker_open", "billing", "normal"), "the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made %d calls and answered %+v", classifyCalls(ctx)-before, d)
+	before = hClassifyCalls(ctx)
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) > before && d == hRulesDecision("classifier_unavailable", "billing", "normal"), "31 s after the breaker opened one ticket must probe the classifier; it made %d calls and answered %+v", hClassifyCalls(ctx)-before, d)
+	before = hClassifyCalls(ctx)
+	d = classify(context.Background(), "acme", kHClientInvoice)
+	ctx.Assert(hClassifyCalls(ctx) == before && d == hRulesDecision("breaker_open", "billing", "normal"), "the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made %d calls and answered %+v", hClassifyCalls(ctx)-before, d)
 	p.down = false
 	ctx.Clock.Advance(31)
-	ctx.Equal(classify(context.Background(), "acme", clientInvoice), modelDecision, "31 s after the breaker opened again the classifier is healthy and must be asked")
+	ctx.Equal(classify(context.Background(), "acme", kHClientInvoice), hModelDecision, "31 s after the breaker opened again the classifier is healthy and must be asked")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -964,11 +964,11 @@ func CheckBreakerCooldown(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kInvoice = "Refund for invoice 4411: the payment was charged twice";
-const std::string kOutage = "Production outage: every login fails";
+const std::string kHInvoice = "Refund for invoice 4411: the payment was charged twice";
+const std::string kHOutage = "Production outage: every login fails";
 
 // The model: billing for invoices, account for logins, else general, at priority high; UNAVAILABLE while down.
-class ClassifierPeer final : public triage::Classifier::Service {
+class HClassifierPeer final : public triage::Classifier::Service {
  public:
   bool down = false;
   grpc::Status Classify(grpc::ServerContext*, const triage::ClassifyRequest* req, triage::ClassifyReply* out) override {
@@ -981,116 +981,116 @@ class ClassifierPeer final : public triage::Classifier::Service {
   }
 };
 
-ClassifierPeer& peer(harness::Ctx& ctx) {
-  static ClassifierPeer* p = nullptr;
+HClassifierPeer& hPeer(harness::Ctx& ctx) {
+  static HClassifierPeer* p = nullptr;
   delete p;
-  p = new ClassifierPeer;
+  p = new HClassifierPeer;
   ctx.GRPC.Server("")->RegisterService(p);
   breaker = Breaker{};
   return *p;
 }
 
-const rules::Decision kModel{"billing", "high", 0.92, "", ""};
+const rules::Decision kHModel{"billing", "high", 0.92, "", ""};
 
-rules::Decision rulesDecision(const std::string& reason, const std::string& queue = "billing", const std::string& priority = "normal") {
+rules::Decision hRulesDecision(const std::string& reason, const std::string& queue = "billing", const std::string& priority = "normal") {
   return {queue, priority, 0.5, reason, "v3"};
 }
 
-bool same(const rules::Decision& a, const rules::Decision& b) {
+bool hSame(const rules::Decision& a, const rules::Decision& b) {
   return a.queue == b.queue && a.priority == b.priority && a.confidence == b.confidence && a.fallback_reason == b.fallback_reason && a.ruleset_version == b.ruleset_version;
 }
 
-std::string show(const rules::Decision& d) {
+std::string hShow(const rules::Decision& d) {
   return "{queue " + d.queue + ", priority " + d.priority + ", confidence " + std::to_string(d.confidence) + ", fallback_reason \\"" + d.fallback_reason + "\\", ruleset_version \\"" + d.ruleset_version + "\\"}";
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Classify").size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  peer(ctx);
-  rules::Decision d = classify("acme", kInvoice);
-  ctx.Assert(same(d, kModel), "with the classifier healthy classify must answer its decision %s, got %s", show(kModel), show(d));
+  hPeer(ctx);
+  rules::Decision d = classify("acme", kHInvoice);
+  ctx.Assert(hSame(d, kHModel), "with the classifier healthy classify must answer its decision %s, got %s", hShow(kHModel), hShow(d));
   ctx.GRPC.SetLatency("Classify", 10.0);
-  d = classify("acme", kInvoice);
+  d = classify("acme", kHInvoice);
   for (const auto& call : ctx.GRPC.CallsTo("Classify")) {
     ctx.Assert(call.HasDeadline(), "a Classify call carries no deadline: a stalled classifier holds the ticket, and the webhook behind it, open");
     ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.5, "a Classify call carries a %v s deadline, expected kDeadline = 1 s", call.TimeoutSeconds());
   }
-  ctx.Assert(same(d, rulesDecision("classifier_timeout")), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got %s", show(d));
-  ctx.Equal(calls(ctx) - 1, 3, "a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make kMaxAttempts = 3 tries, each under its own 1 s deadline; the tries");
+  ctx.Assert(hSame(d, hRulesDecision("classifier_timeout")), "with the classifier slower than the deadline the ticket must be routed by the rules with fallback_reason classifier_timeout, got %s", hShow(d));
+  ctx.Equal(hCalls(ctx) - 1, 3, "a stalled classifier answers DEADLINE_EXCEEDED, a retryable status: the ticket must make kMaxAttempts = 3 tries, each under its own 1 s deadline; the tries");
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  peer(ctx);
+  hPeer(ctx);
   ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "the classifier does not read this language", 1);
-  rules::Decision d = classify("acme", kInvoice);
-  ctx.Equal(calls(ctx), 1, "a refusal (INVALID_ARGUMENT) is not tried again: the model gives the same answer for the same ticket; the calls");
-  ctx.Assert(same(d, rulesDecision("classifier_refused")), "a refused ticket must be routed by the rules with fallback_reason classifier_refused, got %s", show(d));
+  rules::Decision d = classify("acme", kHInvoice);
+  ctx.Equal(hCalls(ctx), 1, "a refusal (INVALID_ARGUMENT) is not tried again: the model gives the same answer for the same ticket; the calls");
+  ctx.Assert(hSame(d, hRulesDecision("classifier_refused")), "a refused ticket must be routed by the rules with fallback_reason classifier_refused, got %s", hShow(d));
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "classifier overloaded", 2);
-  d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) == 4 && same(d, kModel), "after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made %d and answered %s", calls(ctx) - 1, show(d));
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) == 4 && hSame(d, kHModel), "after two UNAVAILABLE answers the third try succeeds: classify must answer the model's decision after 3 calls, it made %d and answered %s", hCalls(ctx) - 1, hShow(d));
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "classifier overloaded", 3);
-  d = classify("acme", kInvoice);
-  ctx.Equal(calls(ctx) - 4, 3, "with the classifier UNAVAILABLE classify must make kMaxAttempts tries; the tries");
-  ctx.Assert(same(d, rulesDecision("classifier_unavailable")), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got %s", show(d));
+  d = classify("acme", kHInvoice);
+  ctx.Equal(hCalls(ctx) - 4, 3, "with the classifier UNAVAILABLE classify must make kMaxAttempts tries; the tries");
+  ctx.Assert(hSame(d, hRulesDecision("classifier_unavailable")), "after three UNAVAILABLE tries the ticket must be routed by the rules with fallback_reason classifier_unavailable, got %s", hShow(d));
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
       {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNIMPLEMENTED, "UNIMPLEMENTED"}};
   for (const auto& [code, name] : terminal) {
-    const size_t before = calls(ctx);
+    const size_t before = hCalls(ctx);
     ctx.GRPC.Fail("Classify", code, "the classifier will not take this ticket", 1);
-    d = classify("acme", kInvoice);
-    ctx.Equal(calls(ctx) - before, 1, "a ticket the classifier answered %s must not be tried again (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", name);
-    ctx.Assert(d.queue == "billing" && d.ruleset_version == "v3" && !d.fallback_reason.empty(), "a ticket the classifier answered %s must be routed by the rules, saying why, got %s", name, show(d));
+    d = classify("acme", kHInvoice);
+    ctx.Equal(hCalls(ctx) - before, 1, "a ticket the classifier answered %s must not be tried again (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", name);
+    ctx.Assert(d.queue == "billing" && d.ruleset_version == "v3" && !d.fallback_reason.empty(), "a ticket the classifier answered %s must be routed by the rules, saying why, got %s", name, hShow(d));
   }
 }
 
 void CheckRulesFallback(harness::Ctx& ctx) {
-  ClassifierPeer& p = peer(ctx);
+  HClassifierPeer& p = hPeer(ctx);
   p.down = true;
-  rules::Decision d = classify("acme", kInvoice);
-  ctx.Assert(same(d, rulesDecision("classifier_unavailable")), "with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable), got %s", show(d));
-  d = classify("acme", kOutage);
-  ctx.Assert(same(d, rulesDecision("classifier_unavailable", "account", "urgent")), "with the classifier down an outage that blocks logins must be routed by the rules to account as urgent, got %s", show(d));
+  rules::Decision d = classify("acme", kHInvoice);
+  ctx.Assert(hSame(d, hRulesDecision("classifier_unavailable")), "with the classifier down an invoice ticket must be routed by ruleset v3 to billing at normal priority, saying why (fallback_reason classifier_unavailable), got %s", hShow(d));
+  d = classify("acme", kHOutage);
+  ctx.Assert(hSame(d, hRulesDecision("classifier_unavailable", "account", "urgent")), "with the classifier down an outage that blocks logins must be routed by the rules to account as urgent, got %s", hShow(d));
 }
 
 void CheckBreakerCooldown(harness::Ctx& ctx) {
-  ClassifierPeer& p = peer(ctx);
+  HClassifierPeer& p = hPeer(ctx);
   p.down = true;
-  classify("acme", kInvoice);
+  classify("acme", kHInvoice);
   p.down = false;
-  size_t before = calls(ctx);
-  rules::Decision d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) == before + 1 && same(d, kModel), "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %s. One failure must not take a healthy classifier out of service", calls(ctx) - before, show(d));
+  size_t before = hCalls(ctx);
+  rules::Decision d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) == before + 1 && hSame(d, kHModel), "one ticket that failed benched the classifier: the next ticket made %d calls and was routed %s. One failure must not take a healthy classifier out of service", hCalls(ctx) - before, hShow(d));
   ctx.GRPC.Fail("Classify", grpc::StatusCode::INVALID_ARGUMENT, "the classifier does not read this language", 5);
-  for (int i = 0; i < 5; ++i) classify("acme", kInvoice);
-  before = calls(ctx);
-  d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) == before + 1 && same(d, kModel), "five refused tickets benched the classifier: the next ticket made %d calls and was routed %s. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker", calls(ctx) - before, show(d));
+  for (int i = 0; i < 5; ++i) classify("acme", kHInvoice);
+  before = hCalls(ctx);
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) == before + 1 && hSame(d, kHModel), "five refused tickets benched the classifier: the next ticket made %d calls and was routed %s. A refusal is about the ticket, not the classifier's health, so only retryable failures count toward the breaker", hCalls(ctx) - before, hShow(d));
   p.down = true;
-  for (int i = 0; i < 4; ++i) classify("acme", kInvoice);
-  before = calls(ctx);
-  classify("acme", kInvoice);
-  ctx.Equal(calls(ctx) - before, 3, "after four tickets in a row failed the fifth must make kMaxAttempts tries: the breaker counts failed tickets, not tries, from the last success, and opens at kBreakerThreshold = 5; the fifth ticket's calls");
-  before = calls(ctx);
-  d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %s", calls(ctx) - before, show(d));
+  for (int i = 0; i < 4; ++i) classify("acme", kHInvoice);
+  before = hCalls(ctx);
+  classify("acme", kHInvoice);
+  ctx.Equal(hCalls(ctx) - before, 3, "after four tickets in a row failed the fifth must make kMaxAttempts tries: the breaker counts failed tickets, not tries, from the last success, and opens at kBreakerThreshold = 5; the fifth ticket's calls");
+  before = hCalls(ctx);
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) == before && hSame(d, hRulesDecision("breaker_open")), "after five tickets in a row failed, the next one must skip the classifier (fallback_reason breaker_open); it made %d calls and answered %s", hCalls(ctx) - before, hShow(d));
   ctx.Clock.Advance(29);
-  before = calls(ctx);
-  d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "29 s after the breaker opened it must still skip the classifier (kBreakerCooldown = 30 s); it made %d calls and answered %s", calls(ctx) - before, show(d));
+  before = hCalls(ctx);
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) == before && hSame(d, hRulesDecision("breaker_open")), "29 s after the breaker opened it must still skip the classifier (kBreakerCooldown = 30 s); it made %d calls and answered %s", hCalls(ctx) - before, hShow(d));
   ctx.Clock.Advance(2);
-  before = calls(ctx);
-  d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) > before && same(d, rulesDecision("classifier_unavailable")), "31 s after the breaker opened one ticket must probe the classifier; it made %d calls and answered %s", calls(ctx) - before, show(d));
-  before = calls(ctx);
-  d = classify("acme", kInvoice);
-  ctx.Assert(calls(ctx) == before && same(d, rulesDecision("breaker_open")), "the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made %d calls and answered %s", calls(ctx) - before, show(d));
+  before = hCalls(ctx);
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) > before && hSame(d, hRulesDecision("classifier_unavailable")), "31 s after the breaker opened one ticket must probe the classifier; it made %d calls and answered %s", hCalls(ctx) - before, hShow(d));
+  before = hCalls(ctx);
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hCalls(ctx) == before && hSame(d, hRulesDecision("breaker_open")), "the probe failed, so the breaker must open again at once instead of letting another five tickets wait on a down classifier; the next ticket made %d calls and answered %s", hCalls(ctx) - before, hShow(d));
   p.down = false;
   ctx.Clock.Advance(31);
-  d = classify("acme", kInvoice);
-  ctx.Assert(same(d, kModel), "31 s after the breaker opened again the classifier is healthy and must be asked, got %s", show(d));
+  d = classify("acme", kHInvoice);
+  ctx.Assert(hSame(d, kHModel), "31 s after the breaker opened again the classifier is healthy and must be asked, got %s", hShow(d));
 }
 `,
   },

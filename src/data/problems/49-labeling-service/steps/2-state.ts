@@ -944,31 +944,31 @@ import (
 	"leetbuild/harness"
 )
 
-const ttlMs = 900_000
+const kHTtlMs = 900_000
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func poolTask(items ...string) string {
+func hPoolTask(items ...string) string {
 	if len(items) == 0 {
 		items = []string{"a cat", "a dog"}
 	}
-	return store.CreateTask(stateBg, "t1", "2026-10", 1, items).TaskID
+	return store.CreateTask(hStateBg, "t1", "2026-10", 1, items).TaskID
 }
 
-func mustClaim(ctx *harness.Ctx, taskID, annotator string) *Lease {
-	lease, err := claim(stateBg, taskID, annotator)
+func hMustClaim(ctx *harness.Ctx, taskID, annotator string) *Lease {
+	lease, err := claim(hStateBg, taskID, annotator)
 	ctx.NoError(err, "claim(%s, %s) failed", taskID, annotator)
 	return lease
 }
 
-func mustRenew(ctx *harness.Ctx, taskID, itemID, annotator string) int64 {
-	deadline, err := renew(stateBg, taskID, itemID, annotator)
+func hMustRenew(ctx *harness.Ctx, taskID, itemID, annotator string) int64 {
+	deadline, err := renew(hStateBg, taskID, itemID, annotator)
 	ctx.NoError(err, "renew(%s, %s, %s) failed", taskID, itemID, annotator)
 	return deadline
 }
 
-func mustReclaim(ctx *harness.Ctx, taskID string) int {
-	n, err := reclaimExpired(stateBg, taskID)
+func hMustReclaim(ctx *harness.Ctx, taskID string) int {
+	n, err := reclaimExpired(hStateBg, taskID)
 	ctx.NoError(err, "reclaimExpired(%s) failed", taskID)
 	return n
 }
@@ -979,7 +979,7 @@ func holderOf(ctx *harness.Ctx, taskID, itemID string) string {
 }
 
 func CheckLeaseTtl(ctx *harness.Ctx) {
-	taskID := poolTask()
+	taskID := hPoolTask()
 	// Right after the claim's first command on the pool, the popped item must already carry its lease.
 	probe := ctx.Redis.After("pool:"+taskID, func() any {
 		if s, ok := ctx.Redis.ZScore("lease:"+taskID, "i-1"); ok {
@@ -987,54 +987,54 @@ func CheckLeaseTtl(ctx *harness.Ctx) {
 		}
 		return nil
 	})
-	lease := mustClaim(ctx, taskID, "ana")
+	lease := hMustClaim(ctx, taskID, "ana")
 	ctx.Assert(lease != nil && lease.ItemID == "i-1", "the first claim on a fresh pool returned %+v, expected item i-1", lease)
-	want := ctx.Clock.Now() + ttlMs
+	want := ctx.Clock.Now() + kHTtlMs
 	ctx.Assert(lease.LeasedUntilMs == want, "the lease runs until %d, %d ms from now: expected now + 900 000 ms (leaseTTL = 15 minutes)", lease.LeasedUntilMs, lease.LeasedUntilMs-ctx.Clock.Now())
 	score, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Equal(int64(score), want, "lease:%s must score i-1 at the deadline", taskID)
 	ctx.Assert(probe.Fired, "claim never touched pool:%s", taskID)
 	ctx.Assert(probe.Result == any(want), "right after the claim took i-1 from pool:%s, lease:%s scored it %v: the item was in neither the pool nor a lease. Pop and lease in the same script", taskID, taskID, probe.Result)
 	ctx.Clock.Advance(899)
-	ctx.Equal(mustReclaim(ctx, taskID), 0, "a second before the fifteen-minute deadline nothing has expired; reclaimExpired")
+	ctx.Equal(hMustReclaim(ctx, taskID), 0, "a second before the fifteen-minute deadline nothing has expired; reclaimExpired")
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "a live lease must stay with its holder")
 	ctx.Clock.Advance(1.5)
-	ctx.Equal(mustReclaim(ctx, taskID), 1, "half a second after its deadline ana's lease has expired; reclaimExpired")
+	ctx.Equal(hMustReclaim(ctx, taskID), 1, "half a second after its deadline ana's lease has expired; reclaimExpired")
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	taskID := poolTask()
+	taskID := hPoolTask()
 	// Bo presses "next" while Ana's claim is between its first and second command on the pool.
 	rival := ctx.Redis.After("pool:"+taskID, func() any {
-		lease, err := claim(stateBg, taskID, "bo")
+		lease, err := claim(hStateBg, taskID, "bo")
 		ctx.NoError(err, "bo's claim failed")
 		return lease
 	})
-	mine := mustClaim(ctx, taskID, "ana")
+	mine := hMustClaim(ctx, taskID, "ana")
 	ctx.Assert(rival.Fired, "claim never touched pool:%s", taskID)
 	ctx.Assert(rival.Err == nil, "bo's claim failed: %v", rival.Err)
 	theirs, _ := rival.Result.(*Lease)
 	ctx.Assert(mine != nil && theirs != nil, "two annotators claimed from a pool of two items and got %+v and %+v", mine, theirs)
 	ctx.Assert(mine.ItemID != theirs.ItemID, "ana and bo were both handed %s: a claim landing between another claim's read of the pool and its removal takes the same item. Pop and lease in one script", mine.ItemID)
 	ctx.Equal(ctx.Redis.HGetAll("holder:"+taskID), map[string]string{mine.ItemID: "ana", theirs.ItemID: "bo"}, "each item must be held by the annotator who got it; holder:%s", taskID)
-	ctx.Assert(mustClaim(ctx, taskID, "cy") == nil, "with both items leased the pool is empty: claim must answer nil")
+	ctx.Assert(hMustClaim(ctx, taskID, "cy") == nil, "with both items leased the pool is empty: claim must answer nil")
 }
 
 func CheckHolderOnly(ctx *harness.Ctx) {
-	taskID := poolTask()
-	lease := mustClaim(ctx, taskID, "ana")
+	taskID := hPoolTask()
+	lease := hMustClaim(ctx, taskID, "ana")
 	before, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Clock.Advance(60)
-	stolen := mustRenew(ctx, taskID, "i-1", "bo")
+	stolen := hMustRenew(ctx, taskID, "i-1", "bo")
 	ctx.Equal(stolen, int64(0), "bo renewed ana's lease on i-1: only the holder may extend a lease; renew's answer")
 	after, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Equal(after, before, "bo's renew moved the deadline of ana's lease")
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "bo's renew changed the holder of i-1")
-	ghost := mustRenew(ctx, taskID, "i-2", "bo")
+	ghost := hMustRenew(ctx, taskID, "i-2", "bo")
 	_, leased := ctx.Redis.ZScore("lease:"+taskID, "i-2")
 	ctx.Assert(ghost == 0 && !leased, "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost)
-	renewed := mustRenew(ctx, taskID, "i-1", "ana")
-	ctx.Equal(renewed, ctx.Clock.Now()+ttlMs, "ana's own renew must answer now + 900 000 ms; the deadline")
+	renewed := hMustRenew(ctx, taskID, "i-1", "ana")
+	ctx.Equal(renewed, ctx.Clock.Now()+kHTtlMs, "ana's own renew must answer now + 900 000 ms; the deadline")
 	score, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Equal(int64(score), renewed, "the renewed deadline must be the lease score")
 	// The sweeper returns i-1 right after the renew's first command on the holder: the renew must not lease it again.
@@ -1045,24 +1045,24 @@ func CheckHolderOnly(ctx *harness.Ctx) {
 		ctx.Redis.Do("ZADD", "pool:"+taskID, 0, "i-1")
 		return nil
 	})
-	mustRenew(ctx, taskID, "i-1", "ana")
+	hMustRenew(ctx, taskID, "i-1", "ana")
 	ctx.Assert(sweep.Fired, "renew never touched holder:%s", taskID)
 	_, released := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Assert(!released, "the sweeper returned i-1 to pool:%s between the renew's holder check and its write, and the renew leased it again: check the holder and move the deadline in one script", taskID)
 }
 
 func CheckExpiredReturn(ctx *harness.Ctx) {
-	taskID := poolTask()
-	mustClaim(ctx, taskID, "ana")
+	taskID := hPoolTask()
+	hMustClaim(ctx, taskID, "ana")
 	ctx.Clock.Advance(901) // ana closed the tab
-	ctx.Equal(mustReclaim(ctx, taskID), 1, "after ana's lease expired, reclaimExpired")
+	ctx.Equal(hMustReclaim(ctx, taskID), 1, "after ana's lease expired, reclaimExpired")
 	_, inPool := ctx.Redis.ZScore("pool:"+taskID, "i-1")
 	ctx.Assert(inPool, "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", taskID)
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "", "an expired lease must lose its holder")
-	again := mustClaim(ctx, taskID, "bo")
+	again := hMustClaim(ctx, taskID, "bo")
 	ctx.Assert(again != nil && again.ItemID == "i-1", "after the sweeper ran bo's claim returned %+v, expected the returned item i-1 at the front of the pool", again)
 	ctx.Clock.Advance(901) // bo leaves too, and no sweeper runs
-	third := mustClaim(ctx, taskID, "cy")
+	third := hMustClaim(ctx, taskID, "cy")
 	ctx.Assert(third != nil && third.ItemID == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %+v. A claim must return expired leases to the front of the pool before it pops", third)
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "cy", "i-1 must now be held by cy")
 }
@@ -1079,9 +1079,9 @@ func CheckExpiredReturn(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kTtlMs = 900000;
+constexpr long long kHTtlMs = 900000;
 
-std::string poolTask(const std::vector<std::string>& items = {"a cat", "a dog"}) {
+std::string hPoolTask(const std::vector<std::string>& items = {"a cat", "a dog"}) {
   return store::createTask("t1", "2026-10", 1, items).task_id;
 }
 
@@ -1092,7 +1092,7 @@ std::string holderOf(harness::Ctx& ctx, const std::string& task_id, const std::s
 }  // namespace
 
 void CheckLeaseTtl(harness::Ctx& ctx) {
-  const std::string task_id = poolTask();
+  const std::string task_id = hPoolTask();
   // Right after the claim's first command on the pool, the popped item must already carry its lease.
   auto fired = std::make_shared<bool>(false);
   auto seen = std::make_shared<std::optional<double>>();
@@ -1102,7 +1102,7 @@ void CheckLeaseTtl(harness::Ctx& ctx) {
   });
   const auto lease = claim(task_id, "ana");
   ctx.Assert(lease && lease->item_id == "i-1", "the first claim on a fresh pool returned %q, expected item i-1", lease ? lease->item_id : "nothing");
-  const long long want = ctx.Clock.Now() + kTtlMs;
+  const long long want = ctx.Clock.Now() + kHTtlMs;
   ctx.Assert(lease->leased_until_ms == want, "the lease runs until %d, %d ms from now: expected now + 900 000 ms (kLeaseTtl = 900 s)", lease->leased_until_ms, lease->leased_until_ms - ctx.Clock.Now());
   ctx.Equal(static_cast<long long>(ctx.Redis.ZScore("lease:" + task_id, "i-1").value_or(0)), want, "lease:%s must score i-1 at the deadline", task_id);
   ctx.Assert(*fired, "claim never touched pool:%s", task_id);
@@ -1115,7 +1115,7 @@ void CheckLeaseTtl(harness::Ctx& ctx) {
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  const std::string task_id = poolTask();
+  const std::string task_id = hPoolTask();
   // Bo presses "next" while Ana's claim is between its first and second command on the pool.
   auto fired = std::make_shared<bool>(false);
   auto theirs = std::make_shared<std::optional<Lease>>();
@@ -1139,7 +1139,7 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
 }
 
 void CheckHolderOnly(harness::Ctx& ctx) {
-  const std::string task_id = poolTask();
+  const std::string task_id = hPoolTask();
   const auto lease = claim(task_id, "ana");
   const auto before = ctx.Redis.ZScore("lease:" + task_id, "i-1");
   ctx.Clock.Advance(60);
@@ -1150,7 +1150,7 @@ void CheckHolderOnly(harness::Ctx& ctx) {
   const long long ghost = renew(task_id, "i-2", "bo");
   ctx.Assert(ghost == 0 && !ctx.Redis.ZScore("lease:" + task_id, "i-2"), "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost);
   const long long renewed = renew(task_id, "i-1", "ana");
-  ctx.Equal(renewed, ctx.Clock.Now() + kTtlMs, "ana's own renew must answer now + 900 000 ms; the deadline");
+  ctx.Equal(renewed, ctx.Clock.Now() + kHTtlMs, "ana's own renew must answer now + 900 000 ms; the deadline");
   ctx.Equal(static_cast<long long>(ctx.Redis.ZScore("lease:" + task_id, "i-1").value_or(0)), renewed, "the renewed deadline must be the lease score");
   // The sweeper returns i-1 right after the renew's first command on the holder: the renew must not lease it again.
   auto swept = std::make_shared<bool>(false);
@@ -1167,7 +1167,7 @@ void CheckHolderOnly(harness::Ctx& ctx) {
 }
 
 void CheckExpiredReturn(harness::Ctx& ctx) {
-  const std::string task_id = poolTask();
+  const std::string task_id = hPoolTask();
   claim(task_id, "ana");
   ctx.Clock.Advance(901);  // ana closed the tab
   ctx.Equal(reclaimExpired(task_id), 1LL, "after ana's lease expired, reclaimExpired");

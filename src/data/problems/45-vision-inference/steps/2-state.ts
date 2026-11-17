@@ -685,23 +685,23 @@ import (
 	"leetbuild/harness"
 )
 
-const statePool = "vision:gpu:t1"
+const kHStatePool = "vision:gpu:t1"
 
-func stateAdmit(ctx *harness.Ctx) Admission {
+func hStateAdmit(ctx *harness.Ctx) Admission {
 	a, err := admit(context.Background(), "t1")
 	ctx.NoError(err, "admit")
 	return a
 }
 
-func stateRelease(ctx *harness.Ctx, ticket string) bool {
+func hStateRelease(ctx *harness.Ctx, ticket string) bool {
 	ok, err := release(context.Background(), "t1", ticket)
 	ctx.NoError(err, "release")
 	return ok
 }
 
-func stateHeld(ctx *harness.Ctx) []string {
+func hStateHeld(ctx *harness.Ctx) []string {
 	var out []string
-	for _, z := range ctx.Redis.ZRangeWithScores(statePool, 0, -1) {
+	for _, z := range ctx.Redis.ZRangeWithScores(kHStatePool, 0, -1) {
 		out = append(out, z.Member)
 	}
 	sort.Strings(out)
@@ -711,20 +711,20 @@ func stateHeld(ctx *harness.Ctx) []string {
 func CheckAtomicAdmit(ctx *harness.Ctx) {
 	now := ctx.Clock.Now() / 1000
 	for i := 0; i < 9; i++ {
-		ctx.Redis.Do("ZADD", statePool, now+300, "other-"+string(rune('a'+i))) // nine slots other workers hold
+		ctx.Redis.Do("ZADD", kHStatePool, now+300, "other-"+string(rune('a'+i))) // nine slots other workers hold
 	}
 	other := ""
 	// another worker admitting into the last slot, landing between two of this worker's commands
-	ctx.Redis.After(statePool, func() any {
-		if ctx.Redis.ZCard(statePool) < 10 {
-			ctx.Redis.Do("ZADD", statePool, now+300, "other-racer")
+	ctx.Redis.After(kHStatePool, func() any {
+		if ctx.Redis.ZCard(kHStatePool) < 10 {
+			ctx.Redis.Do("ZADD", kHStatePool, now+300, "other-racer")
 			other = "admitted"
 			return nil
 		}
 		other = "refused"
 		return nil
 	})
-	mine := stateAdmit(ctx)
+	mine := hStateAdmit(ctx)
 	ctx.Assert(other != "", "admit never touched the pool")
 	outcomes := []string{other, "refused"}
 	if mine.Ticket != "" {
@@ -732,44 +732,44 @@ func CheckAtomicAdmit(ctx *harness.Ctx) {
 	}
 	sort.Strings(outcomes)
 	ctx.Equal(outcomes, []string{"admitted", "refused"}, "two workers raced for the last slot: the count and the add must run in one script, so exactly one of them gets it; the outcomes")
-	ctx.Equal(ctx.Redis.ZCard(statePool), 10, "a 10-slot pool after the race; tickets held")
+	ctx.Equal(ctx.Redis.ZCard(kHStatePool), 10, "a 10-slot pool after the race; tickets held")
 }
 
 func CheckLeaseExpiry(ctx *harness.Ctx) {
 	firstTTL := int64(-3)
-	ctx.Redis.After(statePool, func() any {
-		firstTTL = ctx.Redis.TTL(statePool)
+	ctx.Redis.After(kHStatePool, func() any {
+		firstTTL = ctx.Redis.TTL(kHStatePool)
 		return nil
 	})
 	for i := 0; i < 9; i++ {
-		ctx.Assert(stateAdmit(ctx).Ticket != "", "nine admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i+1)
+		ctx.Assert(hStateAdmit(ctx).Ticket != "", "nine admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i+1)
 	}
 	ctx.Clock.Advance(100)
-	ctx.Assert(stateAdmit(ctx).Ticket != "", "the tenth admission into a 10-slot pool must get a ticket")
-	refreshed := ctx.Redis.TTL(statePool)
-	ctx.Equal(stateAdmit(ctx).Ticket, "", "the eleventh admission must be refused; its ticket")
+	ctx.Assert(hStateAdmit(ctx).Ticket != "", "the tenth admission into a 10-slot pool must get a ticket")
+	refreshed := ctx.Redis.TTL(kHStatePool)
+	ctx.Equal(hStateAdmit(ctx).Ticket, "", "the eleventh admission must be refused; its ticket")
 	ctx.Clock.Advance(199) // the first nine holders crashed without releasing; their leases end in one second
-	early := stateAdmit(ctx)
+	early := hStateAdmit(ctx)
 	ctx.Assert(early.Ticket == "", "one second before the nine leases end the pool is still full, yet admit answered %+v", early)
 	ctx.Clock.Advance(1) // exactly LeaseSeconds after the nine were admitted: their leases have ended
-	again := stateAdmit(ctx)
+	again := hStateAdmit(ctx)
 	ctx.Assert(again.Ticket != "", "five minutes after nine holders crashed the tenant is still locked out (%+v): a lease ends on its own, at its expiry", again)
-	ctx.Equal(ctx.Redis.ZCard(statePool), 2, "the nine expired leases must be gone and the live one kept; tickets held")
-	score, ok := ctx.Redis.ZScore(statePool, again.Ticket)
+	ctx.Equal(ctx.Redis.ZCard(kHStatePool), 2, "the nine expired leases must be gone and the live one kept; tickets held")
+	score, ok := ctx.Redis.ZScore(kHStatePool, again.Ticket)
 	ctx.Assert(ok && math.Abs(score-float64(ctx.Clock.Now()/1000+300)) <= 1, "a ticket is scored with its lease expiry (now + LeaseSeconds), got %v", score)
 	ctx.Assert(firstTTL >= 299 && firstTTL <= 300, "right after the admitting script the pool's key has TTL %d: the script itself sets the key's expiry to LeaseSeconds", firstTTL)
 	ctx.Assert(refreshed >= 299 && refreshed <= 300, "every admission refreshes the key's expiry to LeaseSeconds, yet 100 s after the first the TTL was %d: the key would vanish under a live lease", refreshed)
 }
 
 func CheckOwnerRelease(ctx *harness.Ctx) {
-	a, b, c := stateAdmit(ctx).Ticket, stateAdmit(ctx).Ticket, stateAdmit(ctx).Ticket
+	a, b, c := hStateAdmit(ctx).Ticket, hStateAdmit(ctx).Ticket, hStateAdmit(ctx).Ticket
 	want := []string{a, c}
 	sort.Strings(want)
-	ctx.Assert(stateRelease(ctx, b), "releasing a held ticket must answer true")
-	ctx.Equal(stateHeld(ctx), want, "release(b) must free b's slot only; the pool holds")
-	ctx.Assert(!stateRelease(ctx, b), "a second release of the same ticket must answer false")
-	ctx.Assert(!stateRelease(ctx, "forged-ticket"), "an unknown ticket must answer false")
-	ctx.Equal(stateHeld(ctx), want, "a stale or unknown release must free nothing; the pool holds")
+	ctx.Assert(hStateRelease(ctx, b), "releasing a held ticket must answer true")
+	ctx.Equal(hStateHeld(ctx), want, "release(b) must free b's slot only; the pool holds")
+	ctx.Assert(!hStateRelease(ctx, b), "a second release of the same ticket must answer false")
+	ctx.Assert(!hStateRelease(ctx, "forged-ticket"), "an unknown ticket must answer false")
+	ctx.Equal(hStateHeld(ctx), want, "a stale or unknown release must free nothing; the pool holds")
 }
 
 func CheckRetryAfter(ctx *harness.Ctx) {
@@ -777,10 +777,10 @@ func CheckRetryAfter(ctx *harness.Ctx) {
 		if i == 5 {
 			ctx.Clock.Advance(50)
 		}
-		ctx.Assert(stateAdmit(ctx).Ticket != "", "admission %d into an empty pool", i+1)
+		ctx.Assert(hStateAdmit(ctx).Ticket != "", "admission %d into an empty pool", i+1)
 	}
 	ctx.Clock.Advance(50)
-	refused := stateAdmit(ctx)
+	refused := hStateAdmit(ctx)
 	ctx.Equal(refused.Ticket, "", "a full pool must refuse; the ticket")
 	ctx.Assert(refused.RetryAfter >= 199 && refused.RetryAfter <= 201, "the earliest lease ends in 200 s (the latest in 250 s), RetryAfter says %d: a client told to come back in 1 s polls 200 times", refused.RetryAfter)
 }
@@ -794,11 +794,11 @@ func CheckRetryAfter(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kPool = "vision:gpu:t1";
+const std::string kHPool = "vision:gpu:t1";
 
 std::vector<std::string> held(harness::Ctx& ctx) {
   std::vector<std::string> out;
-  for (const auto& z : ctx.Redis.ZRangeWithScores(kPool, 0, -1)) out.push_back(z.Member);
+  for (const auto& z : ctx.Redis.ZRangeWithScores(kHPool, 0, -1)) out.push_back(z.Member);
   std::sort(out.begin(), out.end());
   return out;
 }
@@ -807,12 +807,12 @@ std::vector<std::string> held(harness::Ctx& ctx) {
 
 void CheckAtomicAdmit(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now() / 1000;
-  for (int i = 0; i < 9; i++) ctx.Redis.Do("ZADD", kPool, now + 300, "other-" + std::to_string(i));  // nine slots other workers hold
+  for (int i = 0; i < 9; i++) ctx.Redis.Do("ZADD", kHPool, now + 300, "other-" + std::to_string(i));  // nine slots other workers hold
   std::string other;
   // another worker admitting into the last slot, landing between two of this worker's commands
-  ctx.Redis.After(kPool, [&] {
-    if (ctx.Redis.ZCard(kPool) < 10) {
-      ctx.Redis.Do("ZADD", kPool, now + 300, "other-racer");
+  ctx.Redis.After(kHPool, [&] {
+    if (ctx.Redis.ZCard(kHPool) < 10) {
+      ctx.Redis.Do("ZADD", kHPool, now + 300, "other-racer");
       other = "admitted";
       return;
     }
@@ -823,16 +823,16 @@ void CheckAtomicAdmit(harness::Ctx& ctx) {
   std::vector<std::string> outcomes = {mine.ticket.empty() ? "refused" : "admitted", other};
   std::sort(outcomes.begin(), outcomes.end());
   ctx.Equal(outcomes, {"admitted", "refused"}, "two workers raced for the last slot: the count and the add must run in one script, so exactly one of them gets it; the outcomes");
-  ctx.Equal(ctx.Redis.ZCard(kPool), 10, "a 10-slot pool after the race; tickets held");
+  ctx.Equal(ctx.Redis.ZCard(kHPool), 10, "a 10-slot pool after the race; tickets held");
 }
 
 void CheckLeaseExpiry(harness::Ctx& ctx) {
   long long firstTtl = -3;
-  ctx.Redis.After(kPool, [&] { firstTtl = ctx.Redis.TTL(kPool); });
+  ctx.Redis.After(kHPool, [&] { firstTtl = ctx.Redis.TTL(kHPool); });
   for (int i = 0; i < 9; i++) ctx.Assert(!admit("t1").ticket.empty(), "nine admissions into an empty 10-slot pool must all get a ticket (admission %d did not)", i + 1);
   ctx.Clock.Advance(100);
   ctx.Assert(!admit("t1").ticket.empty(), "the tenth admission into a 10-slot pool must get a ticket");
-  const long long refreshed = ctx.Redis.TTL(kPool);
+  const long long refreshed = ctx.Redis.TTL(kHPool);
   ctx.Equal(admit("t1").ticket, "", "the eleventh admission must be refused; its ticket");
   ctx.Clock.Advance(199);  // the first nine holders crashed without releasing; their leases end in one second
   const Admission early = admit("t1");
@@ -840,8 +840,8 @@ void CheckLeaseExpiry(harness::Ctx& ctx) {
   ctx.Clock.Advance(1);  // exactly kLeaseSeconds after the nine were admitted: their leases have ended
   const Admission again = admit("t1");
   ctx.Assert(!again.ticket.empty(), "five minutes after nine holders crashed the tenant is still locked out (retry_after %d): a lease ends on its own, at its expiry", again.retry_after);
-  ctx.Equal(ctx.Redis.ZCard(kPool), 2, "the nine expired leases must be gone and the live one kept; tickets held");
-  const auto score = ctx.Redis.ZScore(kPool, again.ticket);
+  ctx.Equal(ctx.Redis.ZCard(kHPool), 2, "the nine expired leases must be gone and the live one kept; tickets held");
+  const auto score = ctx.Redis.ZScore(kHPool, again.ticket);
   ctx.Assert(score && std::abs(*score - static_cast<double>(ctx.Clock.Now() / 1000 + 300)) <= 1, "a ticket is scored with its lease expiry (now + kLeaseSeconds), got %v", score.value_or(-1));
   ctx.Assert(firstTtl >= 299 && firstTtl <= 300, "right after the admitting script the pool's key has TTL %d: the script itself sets the key's expiry to kLeaseSeconds", firstTtl);
   ctx.Assert(refreshed >= 299 && refreshed <= 300, "every admission refreshes the key's expiry to kLeaseSeconds, yet 100 s after the first the TTL was %d: the key would vanish under a live lease", refreshed);

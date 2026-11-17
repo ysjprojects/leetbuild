@@ -1007,42 +1007,42 @@ import (
 	"leetbuild/harness"
 )
 
-const rolloutKey = "rollout:auto"
+const kHRolloutKey = "rollout:auto"
 
-func rolloutServer(ctx *harness.Ctx) *harness.HTTP {
+func hRolloutServer(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func rolloutSeed(ctx *harness.Ctx, canary, percentage int) {
-	ctx.Redis.Do("HSET", rolloutKey, "stable", 3, "canary", canary, "percentage", percentage)
+func hRolloutSeed(ctx *harness.Ctx, canary, percentage int) {
+	ctx.Redis.Do("HSET", kHRolloutKey, "stable", 3, "canary", canary, "percentage", percentage)
 }
 
-func rolloutEval(ctx *harness.Ctx, version int, status string, score float64) {
+func hRolloutEval(ctx *harness.Ctx, version int, status string, score float64) {
 	ctx.Redis.Do("HSET", fmt.Sprintf("eval:auto:%d", version), "status", status, "score", score)
 }
 
-func rolloutPost(c *harness.HTTP, policy string, version, percentage int) *harness.Response {
+func hRolloutPost(c *harness.HTTP, policy string, version, percentage int) *harness.Response {
 	return c.Post("/v1/policies/"+policy+"/rollout", map[string]any{"version": version, "percentage": percentage}, "Authorization", "Bearer ops", "Content-Type", "application/json")
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := rolloutServer(ctx)
-	rolloutSeed(ctx, 4, 10)
-	rolloutEval(ctx, 4, "passed", 0.92)
-	r := rolloutPost(c, "auto", 4, 25)
+	c := hRolloutServer(ctx)
+	hRolloutSeed(ctx, 4, 10)
+	hRolloutEval(ctx, 4, "passed", 0.92)
+	r := hRolloutPost(c, "auto", 4, 25)
 	ctx.Equal(r.Status, 200, "raising v4 from 10 %% to 25 %% with a passing eval (%s)", r.Text())
 	ctx.Equal(r.JSON(), map[string]any{"policy": "auto", "stable": 3, "canary": 4, "percentage": 25}, "the answer must be the rollout record after the change")
-	ctx.Equal(ctx.Redis.HGetAll(rolloutKey)["percentage"], "25", "%s percentage after the change", rolloutKey)
+	ctx.Equal(ctx.Redis.HGetAll(kHRolloutKey)["percentage"], "25", "%s percentage after the change", kHRolloutKey)
 	anonymous := c.Post("/v1/policies/auto/rollout", map[string]any{"version": 4, "percentage": 30}, "Content-Type", "application/json")
 	ctx.Equal(anonymous.Status, 401, "a rollout without a bearer token")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := rolloutServer(ctx)
-	rolloutSeed(ctx, 4, 10)
-	rolloutEval(ctx, 4, "passed", 0.92)
+	c := hRolloutServer(ctx)
+	hRolloutSeed(ctx, 4, 10)
+	hRolloutEval(ctx, 4, "passed", 0.92)
 	bad := []struct {
 		what                string
 		policy              string
@@ -1057,70 +1057,70 @@ func CheckValidate(ctx *harness.Ctx) {
 		{"a policy name of 33 characters", "auto-" + strings.Repeat("x", 28), 4, 20},
 	}
 	for _, b := range bad {
-		r := rolloutPost(c, b.policy, b.version, b.percentage)
+		r := hRolloutPost(c, b.policy, b.version, b.percentage)
 		ctx.Equal(r.Status, 400, "%s", b.what)
 	}
-	ctx.Equal(ctx.Redis.HGetAll(rolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "10"}, "rejected requests must not change %s", rolloutKey)
-	ctx.Equal(ctx.Redis.Keys("rollout:*"), []string{rolloutKey}, "rejected requests must write no rollout record; the records")
+	ctx.Equal(ctx.Redis.HGetAll(kHRolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "10"}, "rejected requests must not change %s", kHRolloutKey)
+	ctx.Equal(ctx.Redis.Keys("rollout:*"), []string{kHRolloutKey}, "rejected requests must write no rollout record; the records")
 	longest := "auto-" + strings.Repeat("x", 27)
-	r := rolloutPost(c, longest, 1, 0)
+	r := hRolloutPost(c, longest, 1, 0)
 	ctx.Equal(r.Status, 200, "a policy name of 32 characters (%s): %s", longest, r.Text())
-	r = rolloutPost(c, "auto", 4, 100)
-	ctx.Assert(r.Status == 200 && ctx.Redis.HGetAll(rolloutKey)["percentage"] == "100", "v4 to 100 %% with a passing eval answered %d and left %v: 0 and 100 are both allowed", r.Status, ctx.Redis.HGetAll(rolloutKey))
+	r = hRolloutPost(c, "auto", 4, 100)
+	ctx.Assert(r.Status == 200 && ctx.Redis.HGetAll(kHRolloutKey)["percentage"] == "100", "v4 to 100 %% with a passing eval answered %d and left %v: 0 and 100 are both allowed", r.Status, ctx.Redis.HGetAll(kHRolloutKey))
 }
 
 func CheckEvalGate(ctx *harness.Ctx) {
-	c := rolloutServer(ctx)
-	rolloutSeed(ctx, 4, 10)
-	rolloutEval(ctx, 5, "passed", 0.70)
-	r := rolloutPost(c, "auto", 5, 20)
+	c := hRolloutServer(ctx)
+	hRolloutSeed(ctx, 4, 10)
+	hRolloutEval(ctx, 5, "passed", 0.70)
+	r := hRolloutPost(c, "auto", 5, 20)
 	ctx.Equal(r.Status, 409, "v5 passed its eval with score 0.70 and a rollout to 20 %% (the score must be at least 0.85)")
-	r = rolloutPost(c, "auto", 6, 20)
+	r = hRolloutPost(c, "auto", 6, 20)
 	ctx.Equal(r.Status, 409, "v6 has no eval record and a rollout to 20 %%")
-	rolloutEval(ctx, 4, "failed", 0.91)
-	r = rolloutPost(c, "auto", 4, 30)
+	hRolloutEval(ctx, 4, "failed", 0.91)
+	r = hRolloutPost(c, "auto", 4, 30)
 	ctx.Equal(r.Status, 409, "raising v4 from 10 %% to 30 %% with a failed eval")
-	ctx.Equal(ctx.Redis.HGetAll(rolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "10"}, "refused rollouts must not change %s", rolloutKey)
-	rolloutEval(ctx, 5, "passed", 0.85)
-	r = rolloutPost(c, "auto", 5, 20)
+	ctx.Equal(ctx.Redis.HGetAll(kHRolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "10"}, "refused rollouts must not change %s", kHRolloutKey)
+	hRolloutEval(ctx, 5, "passed", 0.85)
+	r = hRolloutPost(c, "auto", 5, 20)
 	ctx.Equal(r.Status, 200, "v5 with a passing eval at exactly 0.85 (%s)", r.Text())
-	record := ctx.Redis.HGetAll(rolloutKey)
-	ctx.Assert(record["canary"] == "5" && record["percentage"] == "20", "%s is %v, expected canary 5 at 20 %%", rolloutKey, record)
+	record := ctx.Redis.HGetAll(kHRolloutKey)
+	ctx.Assert(record["canary"] == "5" && record["percentage"] == "20", "%s is %v, expected canary 5 at 20 %%", kHRolloutKey, record)
 }
 
 func CheckRollback(ctx *harness.Ctx) {
-	c := rolloutServer(ctx)
-	rolloutSeed(ctx, 4, 25)
-	rolloutEval(ctx, 4, "failed", 0.41)
-	r := rolloutPost(c, "auto", 4, 5)
+	c := hRolloutServer(ctx)
+	hRolloutSeed(ctx, 4, 25)
+	hRolloutEval(ctx, 4, "failed", 0.41)
+	r := hRolloutPost(c, "auto", 4, 5)
 	ctx.Equal(r.Status, 200, "lowering canary v4 from 25 %% to 5 %% (its eval now fails; a rollback must not wait for a passing eval)")
-	ctx.Equal(ctx.Redis.HGetAll(rolloutKey)["percentage"], "5", "%s percentage after the rollback to 5 %%", rolloutKey)
-	r = rolloutPost(c, "auto", 7, 3)
+	ctx.Equal(ctx.Redis.HGetAll(kHRolloutKey)["percentage"], "5", "%s percentage after the rollback to 5 %%", kHRolloutKey)
+	r = hRolloutPost(c, "auto", 7, 3)
 	ctx.Equal(r.Status, 409, "sending 3 %% to v7, which has no eval, while v4 holds 5 %% (a lower share for another version is a new canary, not a rollback)")
-	ctx.Equal(ctx.Redis.HGetAll(rolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "5"}, "the refused switch to v7 must not change %s", rolloutKey)
-	r = rolloutPost(c, "auto", 4, 0)
-	ctx.Assert(r.Status == 200 && ctx.Redis.HGetAll(rolloutKey)["percentage"] == "0", "rolling v4 back to 0 %% answered %d and left %v", r.Status, ctx.Redis.HGetAll(rolloutKey))
-	r = rolloutPost(c, "auto", 7, 3)
+	ctx.Equal(ctx.Redis.HGetAll(kHRolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "5"}, "the refused switch to v7 must not change %s", kHRolloutKey)
+	r = hRolloutPost(c, "auto", 4, 0)
+	ctx.Assert(r.Status == 200 && ctx.Redis.HGetAll(kHRolloutKey)["percentage"] == "0", "rolling v4 back to 0 %% answered %d and left %v", r.Status, ctx.Redis.HGetAll(kHRolloutKey))
+	r = hRolloutPost(c, "auto", 7, 3)
 	ctx.Equal(r.Status, 409, "sending 3 %% to v7, which has no eval (only lowering the current canary skips the gate)")
 }
 
 func CheckNoLostUpdate(ctx *harness.Ctx) {
-	c := rolloutServer(ctx)
-	rolloutSeed(ctx, 4, 10)
-	rolloutEval(ctx, 4, "passed", 0.92)
-	warm := rolloutPost(c, "auto", 4, 10)
+	c := hRolloutServer(ctx)
+	hRolloutSeed(ctx, 4, 10)
+	hRolloutEval(ctx, 4, "passed", 0.92)
+	warm := hRolloutPost(c, "auto", 4, 10)
 	ctx.Equal(warm.Status, 200, "re-applying v4 at its current 10 %% (%s)", warm.Text())
 	// Another operator rolls the canary back to 0 right after the first command of this raise touches the record.
 	fired := false
-	ctx.Redis.After(rolloutKey, func() any {
+	ctx.Redis.After(kHRolloutKey, func() any {
 		fired = true
-		return ctx.Redis.Do("HSET", rolloutKey, "percentage", 0)
+		return ctx.Redis.Do("HSET", kHRolloutKey, "percentage", 0)
 	})
-	r := rolloutPost(c, "auto", 4, 50)
-	ctx.Assert(fired, "the raise never touched %s", rolloutKey)
+	r := hRolloutPost(c, "auto", 4, 50)
+	ctx.Assert(fired, "the raise never touched %s", kHRolloutKey)
 	ctx.Assert(r.Status == 200 || r.Status == 409, "the raise answered %d: %s", r.Status, r.Text())
-	got := ctx.Redis.HGetAll(rolloutKey)["percentage"]
-	ctx.Assert(got == "0", "another operator rolled v4 back to 0 %% while this raise to 50 %% was in flight, and %s now says %s %%: the raise read the record, then overwrote the rollback. Read, gate and write in one Lua script", rolloutKey, got)
+	got := ctx.Redis.HGetAll(kHRolloutKey)["percentage"]
+	ctx.Assert(got == "0", "another operator rolled v4 back to 0 %% while this raise to 50 %% was in flight, and %s now says %s %%: the raise read the record, then overwrote the rollback. Read, gate and write in one Lua script", kHRolloutKey, got)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1131,9 +1131,9 @@ func CheckNoLostUpdate(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRolloutKey = "rollout:auto";
+const std::string kHRolloutKey = "rollout:auto";
 
-harness::HTTP rolloutServer(harness::Ctx& ctx) {
+harness::HTTP hRolloutServer(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1141,43 +1141,43 @@ harness::HTTP rolloutServer(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-void rolloutSeed(harness::Ctx& ctx, int canary = 4, int percentage = 10) {
-  ctx.Redis.Do("HSET", kRolloutKey, "stable", 3, "canary", canary, "percentage", percentage);
+void hRolloutSeed(harness::Ctx& ctx, int canary = 4, int percentage = 10) {
+  ctx.Redis.Do("HSET", kHRolloutKey, "stable", 3, "canary", canary, "percentage", percentage);
 }
 
-void rolloutEval(harness::Ctx& ctx, int version, const std::string& status, const std::string& score) {
+void hRolloutEval(harness::Ctx& ctx, int version, const std::string& status, const std::string& score) {
   ctx.Redis.Do("HSET", "eval:auto:" + std::to_string(version), "status", status, "score", score);
 }
 
-harness::Response rolloutPost(harness::HTTP& c, int version, int percentage, const std::string& policy = "auto") {
+harness::Response hRolloutPost(harness::HTTP& c, int version, int percentage, const std::string& policy = "auto") {
   const std::string body = R"({"version":)" + std::to_string(version) + R"(,"percentage":)" + std::to_string(percentage) + "}";
   return c.Post("/v1/policies/" + policy + "/rollout", body, "Authorization", "Bearer ops", "Content-Type", "application/json");
 }
 
-std::map<std::string, std::string> rolloutRecord(harness::Ctx& ctx) { return ctx.Redis.HGetAll(kRolloutKey); }
+std::map<std::string, std::string> hRolloutRecord(harness::Ctx& ctx) { return ctx.Redis.HGetAll(kHRolloutKey); }
 
-const std::map<std::string, std::string> kSeeded = {{"stable", "3"}, {"canary", "4"}, {"percentage", "10"}};
+const std::map<std::string, std::string> kHSeeded = {{"stable", "3"}, {"canary", "4"}, {"percentage", "10"}};
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = rolloutServer(ctx);
-  rolloutSeed(ctx);
-  rolloutEval(ctx, 4, "passed", "0.92");
-  const auto r = rolloutPost(c, 4, 25);
+  auto c = hRolloutServer(ctx);
+  hRolloutSeed(ctx);
+  hRolloutEval(ctx, 4, "passed", "0.92");
+  const auto r = hRolloutPost(c, 4, 25);
   ctx.Equal(r.Status, 200, "raising v4 from 10 %% to 25 %% with a passing eval (%s)", r.Text());
   const nlohmann::json expected = {{"policy", "auto"}, {"stable", 3}, {"canary", 4}, {"percentage", 25}};
   const auto out = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(out == expected, "the answer is %s, expected the rollout record after the change %s", r.Text(), expected.dump());
-  ctx.Equal(rolloutRecord(ctx)["percentage"], "25", "%s percentage after the change", kRolloutKey);
+  ctx.Equal(hRolloutRecord(ctx)["percentage"], "25", "%s percentage after the change", kHRolloutKey);
   const auto anonymous = c.Post("/v1/policies/auto/rollout", R"({"version":4,"percentage":30})", "Content-Type", "application/json");
   ctx.Equal(anonymous.Status, 401, "a rollout without a bearer token");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = rolloutServer(ctx);
-  rolloutSeed(ctx);
-  rolloutEval(ctx, 4, "passed", "0.92");
+  auto c = hRolloutServer(ctx);
+  hRolloutSeed(ctx);
+  hRolloutEval(ctx, 4, "passed", "0.92");
   struct Bad {
     std::string what, policy;
     int version, percentage;
@@ -1192,70 +1192,70 @@ void CheckValidate(harness::Ctx& ctx) {
       {"a policy name of 33 characters", "auto-" + std::string(28, 'x'), 4, 20},
   };
   for (const auto& b : bad) {
-    const auto r = rolloutPost(c, b.version, b.percentage, b.policy);
+    const auto r = hRolloutPost(c, b.version, b.percentage, b.policy);
     ctx.Equal(r.Status, 400, "%s", b.what);
   }
-  ctx.Assert(rolloutRecord(ctx) == kSeeded, "rejected requests changed %s: %v", kRolloutKey, rolloutRecord(ctx));
-  ctx.Equal(ctx.Redis.Keys("rollout:*"), {kRolloutKey}, "rejected requests must write no rollout record; the records");
+  ctx.Assert(hRolloutRecord(ctx) == kHSeeded, "rejected requests changed %s: %v", kHRolloutKey, hRolloutRecord(ctx));
+  ctx.Equal(ctx.Redis.Keys("rollout:*"), {kHRolloutKey}, "rejected requests must write no rollout record; the records");
   const std::string longest = "auto-" + std::string(27, 'x');
-  auto r = rolloutPost(c, 1, 0, longest);
+  auto r = hRolloutPost(c, 1, 0, longest);
   ctx.Equal(r.Status, 200, "a policy name of 32 characters (%s): %s", longest, r.Text());
-  r = rolloutPost(c, 4, 100);
-  ctx.Assert(r.Status == 200 && rolloutRecord(ctx)["percentage"] == "100", "v4 to 100 %% with a passing eval answered %d and left %v: 0 and 100 are both allowed", r.Status, rolloutRecord(ctx));
+  r = hRolloutPost(c, 4, 100);
+  ctx.Assert(r.Status == 200 && hRolloutRecord(ctx)["percentage"] == "100", "v4 to 100 %% with a passing eval answered %d and left %v: 0 and 100 are both allowed", r.Status, hRolloutRecord(ctx));
 }
 
 void CheckEvalGate(harness::Ctx& ctx) {
-  auto c = rolloutServer(ctx);
-  rolloutSeed(ctx);
-  rolloutEval(ctx, 5, "passed", "0.70");
-  auto r = rolloutPost(c, 5, 20);
+  auto c = hRolloutServer(ctx);
+  hRolloutSeed(ctx);
+  hRolloutEval(ctx, 5, "passed", "0.70");
+  auto r = hRolloutPost(c, 5, 20);
   ctx.Equal(r.Status, 409, "v5 passed its eval with score 0.70 and a rollout to 20 %% (the score must be at least 0.85)");
-  r = rolloutPost(c, 6, 20);
+  r = hRolloutPost(c, 6, 20);
   ctx.Equal(r.Status, 409, "v6 has no eval record and a rollout to 20 %%");
-  rolloutEval(ctx, 4, "failed", "0.91");
-  r = rolloutPost(c, 4, 30);
+  hRolloutEval(ctx, 4, "failed", "0.91");
+  r = hRolloutPost(c, 4, 30);
   ctx.Equal(r.Status, 409, "raising v4 from 10 %% to 30 %% with a failed eval");
-  ctx.Assert(rolloutRecord(ctx) == kSeeded, "refused rollouts changed %s: %v", kRolloutKey, rolloutRecord(ctx));
-  rolloutEval(ctx, 5, "passed", "0.85");
-  r = rolloutPost(c, 5, 20);
+  ctx.Assert(hRolloutRecord(ctx) == kHSeeded, "refused rollouts changed %s: %v", kHRolloutKey, hRolloutRecord(ctx));
+  hRolloutEval(ctx, 5, "passed", "0.85");
+  r = hRolloutPost(c, 5, 20);
   ctx.Equal(r.Status, 200, "v5 with a passing eval at exactly 0.85 (%s)", r.Text());
-  auto record = rolloutRecord(ctx);
-  ctx.Assert(record["canary"] == "5" && record["percentage"] == "20", "%s is %v, expected canary 5 at 20 %%", kRolloutKey, record);
+  auto record = hRolloutRecord(ctx);
+  ctx.Assert(record["canary"] == "5" && record["percentage"] == "20", "%s is %v, expected canary 5 at 20 %%", kHRolloutKey, record);
 }
 
 void CheckRollback(harness::Ctx& ctx) {
-  auto c = rolloutServer(ctx);
-  rolloutSeed(ctx, 4, 25);
-  rolloutEval(ctx, 4, "failed", "0.41");
-  auto r = rolloutPost(c, 4, 5);
+  auto c = hRolloutServer(ctx);
+  hRolloutSeed(ctx, 4, 25);
+  hRolloutEval(ctx, 4, "failed", "0.41");
+  auto r = hRolloutPost(c, 4, 5);
   ctx.Equal(r.Status, 200, "lowering canary v4 from 25 %% to 5 %% (its eval now fails; a rollback must not wait for a passing eval)");
-  ctx.Equal(rolloutRecord(ctx)["percentage"], "5", "%s percentage after the rollback to 5 %%", kRolloutKey);
-  r = rolloutPost(c, 7, 3);
+  ctx.Equal(hRolloutRecord(ctx)["percentage"], "5", "%s percentage after the rollback to 5 %%", kHRolloutKey);
+  r = hRolloutPost(c, 7, 3);
   ctx.Equal(r.Status, 409, "sending 3 %% to v7, which has no eval, while v4 holds 5 %% (a lower share for another version is a new canary, not a rollback)");
-  ctx.Assert(rolloutRecord(ctx) == std::map<std::string, std::string>{{"stable", "3"}, {"canary", "4"}, {"percentage", "5"}}, "the refused switch to v7 changed %s: %v", kRolloutKey, rolloutRecord(ctx));
-  r = rolloutPost(c, 4, 0);
-  ctx.Assert(r.Status == 200 && rolloutRecord(ctx)["percentage"] == "0", "rolling v4 back to 0 %% answered %d and left %v", r.Status, rolloutRecord(ctx));
-  r = rolloutPost(c, 7, 3);
+  ctx.Assert(hRolloutRecord(ctx) == std::map<std::string, std::string>{{"stable", "3"}, {"canary", "4"}, {"percentage", "5"}}, "the refused switch to v7 changed %s: %v", kHRolloutKey, hRolloutRecord(ctx));
+  r = hRolloutPost(c, 4, 0);
+  ctx.Assert(r.Status == 200 && hRolloutRecord(ctx)["percentage"] == "0", "rolling v4 back to 0 %% answered %d and left %v", r.Status, hRolloutRecord(ctx));
+  r = hRolloutPost(c, 7, 3);
   ctx.Equal(r.Status, 409, "sending 3 %% to v7, which has no eval (only lowering the current canary skips the gate)");
 }
 
 void CheckNoLostUpdate(harness::Ctx& ctx) {
-  auto c = rolloutServer(ctx);
-  rolloutSeed(ctx);
-  rolloutEval(ctx, 4, "passed", "0.92");
-  const auto warm = rolloutPost(c, 4, 10);
+  auto c = hRolloutServer(ctx);
+  hRolloutSeed(ctx);
+  hRolloutEval(ctx, 4, "passed", "0.92");
+  const auto warm = hRolloutPost(c, 4, 10);
   ctx.Equal(warm.Status, 200, "re-applying v4 at its current 10 %% (%s)", warm.Text());
   // Another operator rolls the canary back to 0 right after the first command of this raise touches the record.
   bool fired = false;
-  ctx.Redis.After(kRolloutKey, [&] {
+  ctx.Redis.After(kHRolloutKey, [&] {
     fired = true;
-    ctx.Redis.Do("HSET", kRolloutKey, "percentage", 0);
+    ctx.Redis.Do("HSET", kHRolloutKey, "percentage", 0);
   });
-  const auto r = rolloutPost(c, 4, 50);
-  ctx.Assert(fired, "the raise never touched %s", kRolloutKey);
+  const auto r = hRolloutPost(c, 4, 50);
+  ctx.Assert(fired, "the raise never touched %s", kHRolloutKey);
   ctx.Assert(r.Status == 200 || r.Status == 409, "the raise answered %d: %s", r.Status, r.Text());
-  const std::string got = rolloutRecord(ctx)["percentage"];
-  ctx.Assert(got == "0", "another operator rolled v4 back to 0 %% while this raise to 50 %% was in flight, and %s now says %s %%: the raise read the record, then overwrote the rollback. Read, gate and write in one Lua script", kRolloutKey, got);
+  const std::string got = hRolloutRecord(ctx)["percentage"];
+  ctx.Assert(got == "0", "another operator rolled v4 back to 0 %% while this raise to 50 %% was in flight, and %s now says %s %%: the raise read the record, then overwrote the rollback. Read, gate and write in one Lua script", kHRolloutKey, got);
 }
 `,
   },

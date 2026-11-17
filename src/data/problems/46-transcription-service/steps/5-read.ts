@@ -775,9 +775,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type readView struct {
+type HReadView struct {
 	JobID           string         \`json:"job_id"\`
 	Status          string         \`json:"status"\`
 	CompletedChunks int            \`json:"completed_chunks"\`
@@ -786,34 +786,34 @@ type readView struct {
 	NextCursor      any            \`json:"next_cursor"\` // a string, or a number
 }
 
-func readSegment(index, startMs int, text string) jobs.Segment {
+func hReadSegment(index, startMs int, text string) jobs.Segment {
 	return jobs.Segment{ChunkIndex: index, StartMs: startMs, EndMs: startMs + 10000, Speaker: "A", Text: text}
 }
 
-func readJob(tenant string, total int) string {
-	return jobs.Create(readBg, tenant, "s3://calls/a.wav", "s3://calls/a.wav", total*30, "en", total).JobID
+func hReadJob(tenant string, total int) string {
+	return jobs.Create(hReadBg, tenant, "s3://calls/a.wav", "s3://calls/a.wav", total*30, "en", total).JobID
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readOne(c *harness.HTTP, jobID, tenant, cursor string) (*harness.Response, readView) {
+func hReadOne(c *harness.HTTP, jobID, tenant, cursor string) (*harness.Response, HReadView) {
 	path := "/v1/transcriptions/" + jobID
 	if cursor != "" {
 		path += "?cursor=" + cursor
 	}
 	r := c.Get(path, "X-Tenant-Id", tenant)
-	var v readView
+	var v HReadView
 	if r.Status == 200 {
 		r.Decode(&v)
 	}
 	return r, v
 }
 
-func startsIn(segments []jobs.Segment) []int {
+func hStartsIn(segments []jobs.Segment) []int {
 	out := []int{}
 	for _, s := range segments {
 		out = append(out, s.StartMs)
@@ -822,78 +822,78 @@ func startsIn(segments []jobs.Segment) []int {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	job := readJob("t-1", 3)
-	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
-	r, v := readOne(c, job, "t-1", "")
+	c := hReadAPI(ctx)
+	job := hReadJob("t-1", 3)
+	jobs.SaveSegments(hReadBg, job, []jobs.Segment{hReadSegment(0, 0, "words"), hReadSegment(0, 10000, "words")})
+	r, v := hReadOne(c, job, "t-1", "")
 	ctx.Equal(r.Status, 200, "GET /v1/transcriptions/%s (%s)", job, r.Text())
 	ctx.Assert(v.JobID == job && v.TotalChunks == 3 && len(v.Segments) == 2, "the read must answer the job, its chunk count and its segments, got %s", r.Text())
-	missing, _ := readOne(c, "tr-404", "t-1", "")
+	missing, _ := hReadOne(c, "tr-404", "t-1", "")
 	ctx.Equal(missing.Status, 404, "a missing job")
 	ctx.Equal(c.Get("/v1/transcriptions/"+job).Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	job := readJob("t-1", 3)
-	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "the account number is on the letter")})
-	foreign, _ := readOne(c, job, "t-2", "")
+	c := hReadAPI(ctx)
+	job := hReadJob("t-1", 3)
+	jobs.SaveSegments(hReadBg, job, []jobs.Segment{hReadSegment(0, 0, "the account number is on the letter")})
+	foreign, _ := hReadOne(c, job, "t-2", "")
 	ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's job must get the same answer as a missing id (%s)", foreign.Text())
-	missing, _ := readOne(c, "tr-404", "t-2", "")
+	missing, _ := hReadOne(c, "tr-404", "t-2", "")
 	ctx.Equal(missing.Status, 404, "a missing job")
 }
 
 func CheckHonestStatus(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	job := readJob("t-1", 3)
-	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
+	c := hReadAPI(ctx)
+	job := hReadJob("t-1", 3)
+	jobs.SaveSegments(hReadBg, job, []jobs.Segment{hReadSegment(0, 0, "words"), hReadSegment(0, 10000, "words")})
 	ledger := "job:" + job + ":chunks"
 	// The ledger counts every chunk done, but the job record has not been marked done yet.
 	ctx.Redis.Do("HSET", ledger, "0", "done", "1", "done", "2", "done")
-	_, unmarked := readOne(c, job, "t-1", "")
+	_, unmarked := hReadOne(c, job, "t-1", "")
 	ctx.Assert(unmarked.Status == "partial" && unmarked.CompletedChunks == 3, "a job whose ledger counts 3 of 3 chunks done but whose record is still queued reads %q with %d chunks completed, expected partial with 3: only the job record says it is done", unmarked.Status, unmarked.CompletedChunks)
 	ctx.Redis.Del(ledger)
 	ctx.Redis.Do("HSET", ledger, "0", "done", "1", "failed")
-	_, partial := readOne(c, job, "t-1", "")
+	_, partial := hReadOne(c, job, "t-1", "")
 	ctx.Assert(partial.Status == "partial" && partial.CompletedChunks == 1, "a job with chunk 1 failed and chunk 2 pending reads %q with %d chunks completed, expected partial with 1", partial.Status, partial.CompletedChunks)
 	// Every chunk finished, and 24 hours later the ledger has expired.
-	jobs.MarkDone(readBg, job)
+	jobs.MarkDone(hReadBg, job)
 	ctx.Redis.Del(ledger)
-	_, done := readOne(c, job, "t-1", "")
+	_, done := hReadOne(c, job, "t-1", "")
 	ctx.Assert(done.Status == "done" && done.CompletedChunks == 3, "a finished job whose ledger expired reads %q with %d of 3 chunks completed, expected done with 3: the job record is what says it finished", done.Status, done.CompletedChunks)
 }
 
 func CheckSegmentOrder(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	job := readJob("t-1", 3)
+	c := hReadAPI(ctx)
+	job := hReadJob("t-1", 3)
 	// Chunks finish out of order: chunk 2, then chunk 0, then chunk 1.
-	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(2, 60000, "words"), readSegment(2, 70000, "words")})
-	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(0, 0, "words"), readSegment(0, 10000, "words")})
-	jobs.SaveSegments(readBg, job, []jobs.Segment{readSegment(1, 30000, "words")})
+	jobs.SaveSegments(hReadBg, job, []jobs.Segment{hReadSegment(2, 60000, "words"), hReadSegment(2, 70000, "words")})
+	jobs.SaveSegments(hReadBg, job, []jobs.Segment{hReadSegment(0, 0, "words"), hReadSegment(0, 10000, "words")})
+	jobs.SaveSegments(hReadBg, job, []jobs.Segment{hReadSegment(1, 30000, "words")})
 	// 150 segments whose chunks finish last to first: the first page is the first 100 spoken.
-	long := readJob("t-1", 50)
+	long := hReadJob("t-1", 50)
 	for chunk := 49; chunk >= 0; chunk-- {
-		jobs.SaveSegments(readBg, long, []jobs.Segment{readSegment(chunk, chunk*30000, "words"), readSegment(chunk, chunk*30000+10000, "words"), readSegment(chunk, chunk*30000+20000, "words")})
+		jobs.SaveSegments(hReadBg, long, []jobs.Segment{hReadSegment(chunk, chunk*30000, "words"), hReadSegment(chunk, chunk*30000+10000, "words"), hReadSegment(chunk, chunk*30000+20000, "words")})
 	}
-	_, v := readOne(c, job, "t-1", "")
-	ctx.Equal(startsIn(v.Segments), []int{0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts")
-	_, first := readOne(c, long, "t-1", "")
+	_, v := hReadOne(c, job, "t-1", "")
+	ctx.Equal(hStartsIn(v.Segments), []int{0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts")
+	_, first := hReadOne(c, long, "t-1", "")
 	want := []int{}
 	for i := 0; i < 100; i++ {
 		want = append(want, i*10000)
 	}
-	ctx.Equal(startsIn(first.Segments), want, "the first page of 150 segments saved last chunk first must be the first 100 spoken, 0 to 990 000 ms (sort the whole transcript before cutting the page); the segment starts")
+	ctx.Equal(hStartsIn(first.Segments), want, "the first page of 150 segments saved last chunk first must be the first 100 spoken, 0 to 990 000 ms (sort the whole transcript before cutting the page); the segment starts")
 }
 
 // readWalk follows next_cursor from the first page: every segment start it saw, and the pages it took.
-func readWalk(c *harness.HTTP, job string) ([]int, int) {
+func hReadWalk(c *harness.HTTP, job string) ([]int, int) {
 	seen := []int{}
 	cursor := ""
 	pages := 0
 	for pages < 5 {
-		_, v := readOne(c, job, "t-1", cursor)
+		_, v := hReadOne(c, job, "t-1", cursor)
 		pages++
-		seen = append(seen, startsIn(v.Segments)...)
+		seen = append(seen, hStartsIn(v.Segments)...)
 		if v.NextCursor == nil {
 			break
 		}
@@ -903,27 +903,27 @@ func readWalk(c *harness.HTTP, job string) ([]int, int) {
 }
 
 func CheckCursorPagination(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	job := readJob("t-1", 84)
+	c := hReadAPI(ctx)
+	job := hReadJob("t-1", 84)
 	all := make([]jobs.Segment, 0, 250)
 	want := make([]int, 0, 250)
 	for i := 0; i < 250; i++ {
-		all = append(all, readSegment(i/3, i*10000, "words"))
+		all = append(all, hReadSegment(i/3, i*10000, "words"))
 		want = append(want, i*10000)
 	}
-	jobs.SaveSegments(readBg, job, all)
-	exact := readJob("t-1", 67)
-	jobs.SaveSegments(readBg, exact, all[:200])
-	seen, pages := readWalk(c, job)
+	jobs.SaveSegments(hReadBg, job, all)
+	exact := hReadJob("t-1", 67)
+	jobs.SaveSegments(hReadBg, exact, all[:200])
+	seen, pages := hReadWalk(c, job)
 	ctx.Assert(len(seen) == 250, "walking next_cursor returned %d of 250 segments in %d pages: a long recording must be readable past the first page", len(seen), pages)
 	ctx.Equal(seen, want, "every segment once, in order, across the pages")
 	ctx.Equal(pages, 3, "250 segments at 100 a page; pages")
-	seen, pages = readWalk(c, exact)
+	seen, pages = hReadWalk(c, exact)
 	ctx.Assert(pages == 2 && len(seen) == 200, "200 segments are 2 pages, the second with next_cursor null; walking next_cursor took %d pages for %d segments", pages, len(seen))
-	_, middle := readOne(c, job, "t-1", "150")
-	starts := startsIn(middle.Segments)
+	_, middle := hReadOne(c, job, "t-1", "150")
+	starts := hStartsIn(middle.Segments)
 	ctx.Assert(len(starts) == 100 && starts[0] == 1500000 && middle.NextCursor == nil, "?cursor=150 starts the page at segment 150: got %d segments from %v ms with next_cursor %v, expected the 100 from 1 500 000 ms and null", len(starts), starts[:min(1, len(starts))], middle.NextCursor)
-	negative, _ := readOne(c, job, "t-1", "-1")
+	negative, _ := hReadOne(c, job, "t-1", "-1")
 	ctx.Assert(negative.Status >= 400 && negative.Status < 500, "?cursor=-1 answered %d, expected 400: a cursor is a segment offset, and a negative one is the client's error", negative.Status)
 }
 `,
@@ -937,11 +937,11 @@ func CheckCursorPagination(ctx *harness.Ctx) {
 
 namespace {
 
-jobs::Segment readSegment(int index, int start_ms, const std::string& text = "words") { return {index, start_ms, start_ms + 10000, "A", text}; }
+jobs::Segment hReadSegment(int index, int start_ms, const std::string& text = "words") { return {index, start_ms, start_ms + 10000, "A", text}; }
 
-std::string readJob(const std::string& tenant, long total) { return jobs::create(tenant, "s3://calls/a.wav", "s3://calls/a.wav", total * 30, "en", total).job_id; }
+std::string hReadJob(const std::string& tenant, long total) { return jobs::create(tenant, "s3://calls/a.wav", "s3://calls/a.wav", total * 30, "en", total).job_id; }
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -949,13 +949,13 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readOne(harness::HTTP& c, const std::string& job_id, const std::string& tenant, const std::string& cursor = "") {
+harness::Response hReadOne(harness::HTTP& c, const std::string& job_id, const std::string& tenant, const std::string& cursor = "") {
   return c.Get("/v1/transcriptions/" + job_id + (cursor.empty() ? "" : "?cursor=" + cursor), "X-Tenant-Id", tenant);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::vector<int> startsIn(const nlohmann::json& body) {
+std::vector<int> hStartsIn(const nlohmann::json& body) {
   std::vector<int> out;
   if (body.is_object() && body.contains("segments")) {
     for (const auto& s : body["segments"]) out.push_back(s.value("start_ms", 0));
@@ -964,7 +964,7 @@ std::vector<int> startsIn(const nlohmann::json& body) {
 }
 
 // The cursor a page names for the next one (a string, or a number), empty on the last page.
-std::string nextCursor(const nlohmann::json& body) {
+std::string hNextCursor(const nlohmann::json& body) {
   if (!body.is_object() || !body.contains("next_cursor")) return "";
   const auto& next = body["next_cursor"];
   if (next.is_string()) return next.get<std::string>();
@@ -973,15 +973,15 @@ std::string nextCursor(const nlohmann::json& body) {
 }
 
 // Follow next_cursor from the first page: every segment start seen, and the pages it took.
-std::pair<std::vector<int>, int> readWalk(harness::HTTP& c, const std::string& job) {
+std::pair<std::vector<int>, int> hReadWalk(harness::HTTP& c, const std::string& job) {
   std::vector<int> seen;
   std::string cursor;
   int pages = 0;
   while (pages < 5) {
-    const auto body = bodyOf(readOne(c, job, "t-1", cursor));
+    const auto body = hBodyOf(hReadOne(c, job, "t-1", cursor));
     pages++;
-    for (int s : startsIn(body)) seen.push_back(s);
-    cursor = nextCursor(body);
+    for (int s : hStartsIn(body)) seen.push_back(s);
+    cursor = hNextCursor(body);
     if (cursor.empty()) break;
   }
   return {seen, pages};
@@ -990,87 +990,87 @@ std::pair<std::vector<int>, int> readWalk(harness::HTTP& c, const std::string& j
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string job = readJob("t-1", 3);
-  jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
-  const auto r = readOne(c, job, "t-1");
+  auto c = hReadAPI(ctx);
+  const std::string job = hReadJob("t-1", 3);
+  jobs::saveSegments(job, {hReadSegment(0, 0), hReadSegment(0, 10000)});
+  const auto r = hReadOne(c, job, "t-1");
   ctx.Equal(r.Status, 200, "GET /v1/transcriptions/%s (%s)", job, r.Text());
-  const auto body = bodyOf(r);
-  ctx.Assert(body.is_object() && body.value("job_id", "") == job && body.value("total_chunks", 0) == 3 && startsIn(body).size() == 2, "the read must answer the job, its chunk count and its segments, got %s", r.Text());
-  ctx.Equal(readOne(c, "tr-404", "t-1").Status, 404, "a missing job");
+  const auto body = hBodyOf(r);
+  ctx.Assert(body.is_object() && body.value("job_id", "") == job && body.value("total_chunks", 0) == 3 && hStartsIn(body).size() == 2, "the read must answer the job, its chunk count and its segments, got %s", r.Text());
+  ctx.Equal(hReadOne(c, "tr-404", "t-1").Status, 404, "a missing job");
   ctx.Equal(c.Get("/v1/transcriptions/" + job).Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string job = readJob("t-1", 3);
-  jobs::saveSegments(job, {readSegment(0, 0, "the account number is on the letter")});
-  const auto foreign = readOne(c, job, "t-2");
+  auto c = hReadAPI(ctx);
+  const std::string job = hReadJob("t-1", 3);
+  jobs::saveSegments(job, {hReadSegment(0, 0, "the account number is on the letter")});
+  const auto foreign = hReadOne(c, job, "t-2");
   ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's job must get the same answer as a missing id (%s)", foreign.Text());
-  ctx.Equal(readOne(c, "tr-404", "t-2").Status, 404, "a missing job");
+  ctx.Equal(hReadOne(c, "tr-404", "t-2").Status, 404, "a missing job");
 }
 
 void CheckHonestStatus(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string job = readJob("t-1", 3);
-  jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
+  auto c = hReadAPI(ctx);
+  const std::string job = hReadJob("t-1", 3);
+  jobs::saveSegments(job, {hReadSegment(0, 0), hReadSegment(0, 10000)});
   const std::string ledger = "job:" + job + ":chunks";
   // The ledger counts every chunk done, but the job record has not been marked done yet.
   ctx.Redis.Do("HSET", ledger, "0", "done", "1", "done", "2", "done");
-  const auto unmarked = bodyOf(readOne(c, job, "t-1"));
+  const auto unmarked = hBodyOf(hReadOne(c, job, "t-1"));
   ctx.Assert(unmarked.is_object() && unmarked.value("status", "") == "partial" && unmarked.value("completed_chunks", -1) == 3, "a job whose ledger counts 3 of 3 chunks done but whose record is still queued must read partial with 3 chunks completed (only the job record says it is done), got %s", unmarked.dump());
   ctx.Redis.Del(ledger);
   ctx.Redis.Do("HSET", ledger, "0", "done", "1", "failed");
-  const auto partial = bodyOf(readOne(c, job, "t-1"));
+  const auto partial = hBodyOf(hReadOne(c, job, "t-1"));
   ctx.Assert(partial.is_object() && partial.value("status", "") == "partial" && partial.value("completed_chunks", -1) == 1, "a job with chunk 1 failed and chunk 2 pending must read partial with 1 chunk completed, got %s", partial.dump());
   // Every chunk finished, and 24 hours later the ledger has expired.
   jobs::markDone(job);
   ctx.Redis.Del(ledger);
-  const auto done = bodyOf(readOne(c, job, "t-1"));
+  const auto done = hBodyOf(hReadOne(c, job, "t-1"));
   ctx.Assert(done.is_object() && done.value("status", "") == "done" && done.value("completed_chunks", -1) == 3, "a finished job whose ledger expired must read done with 3 of 3 chunks completed (the job record is what says it finished), got %s", done.dump());
 }
 
 void CheckSegmentOrder(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string job = readJob("t-1", 3);
+  auto c = hReadAPI(ctx);
+  const std::string job = hReadJob("t-1", 3);
   // Chunks finish out of order: chunk 2, then chunk 0, then chunk 1.
-  jobs::saveSegments(job, {readSegment(2, 60000), readSegment(2, 70000)});
-  jobs::saveSegments(job, {readSegment(0, 0), readSegment(0, 10000)});
-  jobs::saveSegments(job, {readSegment(1, 30000)});
+  jobs::saveSegments(job, {hReadSegment(2, 60000), hReadSegment(2, 70000)});
+  jobs::saveSegments(job, {hReadSegment(0, 0), hReadSegment(0, 10000)});
+  jobs::saveSegments(job, {hReadSegment(1, 30000)});
   // 150 segments whose chunks finish last to first: the first page is the first 100 spoken.
-  const std::string long_job = readJob("t-1", 50);
+  const std::string long_job = hReadJob("t-1", 50);
   for (int chunk = 49; chunk >= 0; chunk--) {
-    jobs::saveSegments(long_job, {readSegment(chunk, chunk * 30000), readSegment(chunk, chunk * 30000 + 10000), readSegment(chunk, chunk * 30000 + 20000)});
+    jobs::saveSegments(long_job, {hReadSegment(chunk, chunk * 30000), hReadSegment(chunk, chunk * 30000 + 10000), hReadSegment(chunk, chunk * 30000 + 20000)});
   }
-  ctx.Equal(startsIn(bodyOf(readOne(c, job, "t-1"))), {0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts");
+  ctx.Equal(hStartsIn(hBodyOf(hReadOne(c, job, "t-1"))), {0, 10000, 30000, 60000, 70000}, "the transcript must read in the order it was spoken; the segment starts");
   std::vector<int> want;
   for (int i = 0; i < 100; i++) want.push_back(i * 10000);
-  ctx.Equal(startsIn(bodyOf(readOne(c, long_job, "t-1"))), want, "the first page of 150 segments saved last chunk first must be the first 100 spoken, 0 to 990 000 ms (sort the whole transcript before cutting the page); the segment starts");
+  ctx.Equal(hStartsIn(hBodyOf(hReadOne(c, long_job, "t-1"))), want, "the first page of 150 segments saved last chunk first must be the first 100 spoken, 0 to 990 000 ms (sort the whole transcript before cutting the page); the segment starts");
 }
 
 void CheckCursorPagination(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string job = readJob("t-1", 84);
+  auto c = hReadAPI(ctx);
+  const std::string job = hReadJob("t-1", 84);
   std::vector<jobs::Segment> all;
   std::vector<int> want;
   for (int i = 0; i < 250; i++) {
-    all.push_back(readSegment(i / 3, i * 10000));
+    all.push_back(hReadSegment(i / 3, i * 10000));
     want.push_back(i * 10000);
   }
   jobs::saveSegments(job, all);
-  const std::string exact = readJob("t-1", 67);
+  const std::string exact = hReadJob("t-1", 67);
   jobs::saveSegments(exact, std::vector<jobs::Segment>(all.begin(), all.begin() + 200));
-  const auto [seen, pages] = readWalk(c, job);
+  const auto [seen, pages] = hReadWalk(c, job);
   ctx.Assert(seen.size() == 250, "walking next_cursor returned %d of 250 segments in %d pages: a long recording must be readable past the first page", seen.size(), pages);
   ctx.Equal(seen, want, "every segment once, in order, across the pages");
   ctx.Equal(pages, 3, "250 segments at 100 a page; pages");
-  const auto [even, evenPages] = readWalk(c, exact);
+  const auto [even, evenPages] = hReadWalk(c, exact);
   ctx.Assert(evenPages == 2 && even.size() == 200, "200 segments are 2 pages, the second with next_cursor null; walking next_cursor took %d pages for %d segments", evenPages, even.size());
-  const auto middle = bodyOf(readOne(c, job, "t-1", "150"));
-  const auto starts = startsIn(middle);
+  const auto middle = hBodyOf(hReadOne(c, job, "t-1", "150"));
+  const auto starts = hStartsIn(middle);
   const bool last = middle.is_object() && middle.contains("next_cursor") && middle["next_cursor"].is_null();
   ctx.Assert(starts.size() == 100 && starts[0] == 1500000 && last, "?cursor=150 starts the page at segment 150, expected the 100 from 1 500 000 ms and next_cursor null, got %d segments: %s", starts.size(), middle.is_object() && middle.contains("next_cursor") ? middle["next_cursor"].dump() : middle.dump());
-  const auto negative = readOne(c, job, "t-1", "-1");
+  const auto negative = hReadOne(c, job, "t-1", "-1");
   ctx.Assert(negative.Status >= 400 && negative.Status < 500, "?cursor=-1 answered %d, expected 400: a cursor is a segment offset, and a negative one is the client's error", negative.Status);
 }
 `,

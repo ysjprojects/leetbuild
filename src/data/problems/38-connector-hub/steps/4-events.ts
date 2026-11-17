@@ -1161,15 +1161,15 @@ import (
 )
 
 const (
-	eventsTopic  = "connector.sync"
-	eventsGroup  = "connector-health"
-	eventsOutbox = "outbox:connector.sync"
-	eventsToken  = "vault:acme/github#4"
+	kHEventsTopic  = "connector.sync"
+	kHEventsGroup  = "connector-health"
+	kHEventsOutbox = "outbox:connector.sync"
+	kHEventsToken  = "vault:acme/github#4"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsPage(n int) *pb.Page {
+func hEventsPage(n int) *pb.Page {
 	return &pb.Page{
 		Records: []*pb.SourceRecord{
 			{Id: fmt.Sprintf("r-%d-0", n), Body: fmt.Sprintf("customer %d0: jane@example.com", n)},
@@ -1179,48 +1179,48 @@ func eventsPage(n int) *pb.Page {
 	}
 }
 
-func eventsWorld() (store.Connector, store.Connector) {
-	a := store.Create(eventsBg, "acme", "github", "api.github.com", eventsToken, 900)
-	b := store.Create(eventsBg, "acme", "github", "api.github.com", "vault:acme/github#5", 900)
+func hEventsWorld() (store.Connector, store.Connector) {
+	a := store.Create(hEventsBg, "acme", "github", "api.github.com", kHEventsToken, 900)
+	b := store.Create(hEventsBg, "acme", "github", "api.github.com", "vault:acme/github#5", 900)
 	return *a, *b
 }
 
 // eventsSync is syncPage, reporting a panic as an error instead of ending the check.
-func eventsSync(ctx *harness.Ctx, connector store.Connector, n int) (event *SyncEvent, err error) {
+func hEventsSync(ctx *harness.Ctx, connector store.Connector, n int) (event *SyncEvent, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			err = errors.New("panic: " + harness.Show(e))
 		}
 		ctx.Settle()
 	}()
-	return syncPage(eventsBg, connector, fmt.Sprintf("t%d", n), eventsPage(n))
+	return syncPage(hEventsBg, connector, fmt.Sprintf("t%d", n), hEventsPage(n))
 }
 
 func CheckConnectorKey(ctx *harness.Ctx) {
-	a, b := eventsWorld()
+	a, b := hEventsWorld()
 	for _, step := range []struct {
 		c store.Connector
 		n int
 	}{{a, 0}, {b, 0}, {a, 1}} {
-		_, err := eventsSync(ctx, step.c, step.n)
+		_, err := hEventsSync(ctx, step.c, step.n)
 		ctx.NoError(err, "syncPage(%s, t%d) on a healthy broker", step.c.ConnectorID, step.n)
 	}
-	replay, err := eventsSync(ctx, a, 1)
+	replay, err := hEventsSync(ctx, a, 1)
 	ctx.Assert(err == nil && replay == nil, "a page already applied must not be announced again, got %+v (%v)", replay, err)
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three applied pages; the records on %s", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{a.ConnectorID, b.ConnectorID, a.ConnectorID}, "records must be keyed by the connector id (keyed by source, every GitHub connector shares one partition and one backlog); the keys")
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 3, "three applied pages; the records on %s", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{a.ConnectorID, b.ConnectorID, a.ConnectorID}, "records must be keyed by the connector id (keyed by source, every GitHub connector shares one partition and one backlog); the keys")
 	ctx.Equal(records[0].Partition, records[2].Partition, "one connector's events must stay on one partition, in order; the partitions")
 }
 
 func CheckNoSecrets(ctx *harness.Ctx) {
-	a, _ := eventsWorld()
-	_, err := eventsSync(ctx, a, 0)
+	a, _ := hEventsWorld()
+	_, err := hEventsSync(ctx, a, 0)
 	ctx.NoError(err, "syncPage on a healthy broker")
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one applied page; the records")
 	text := string(records[0].Value)
-	ctx.Assert(!strings.Contains(text, eventsToken), "the event carries the token reference: %s. The topic is retained and replicated; the registry keeps the reference", text)
+	ctx.Assert(!strings.Contains(text, kHEventsToken), "the event carries the token reference: %s. The topic is retained and replicated; the registry keeps the reference", text)
 	ctx.Assert(!strings.Contains(text, "jane@example.com"), "the event carries record contents: %s. Count the records; their contents stay with the vendor and the destination", text)
 	var event map[string]any
 	ctx.NoError(json.Unmarshal(records[0].Value, &event), "the event must be JSON (%s)", text)
@@ -1237,21 +1237,21 @@ func CheckNoSecrets(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	a, _ := eventsWorld()
-	_, err := eventsSync(ctx, a, 0)
+	a, _ := hEventsWorld()
+	_, err := hEventsSync(ctx, a, 0)
 	ctx.NoError(err, "syncPage on a healthy broker")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one applied page; the records")
-	lost := ctx.Kafka.Failover(eventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one applied page; the records")
+	lost := ctx.Kafka.Failover(kHEventsTopic)
 	ctx.Equal(lost, 0, "a leader failover right after the write lost the event: it was acknowledged by the leader alone (RequiredAcks: kafka.RequireAll); records lost")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after a leader failover the event must still be on the topic; the records")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "after a leader failover the event must still be on the topic; the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	a, _ := eventsWorld()
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	eventsSync(ctx, a, 0)
-	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
-	ctx.Equal(len(rows), 1, "after the broker rejected the event %s must hold one row (logged and dropped, the page never reaches the health read); it holds %v; rows", eventsOutbox, rows)
+	a, _ := hEventsWorld()
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	hEventsSync(ctx, a, 0)
+	rows := ctx.Redis.LRange(kHEventsOutbox, 0, -1)
+	ctx.Equal(len(rows), 1, "after the broker rejected the event %s must hold one row (logged and dropped, the page never reaches the health read); it holds %v; rows", kHEventsOutbox, rows)
 	var row map[string]any
 	ctx.NoError(json.Unmarshal([]byte(rows[0]), &row), "the outbox row must be JSON (%s)", rows[0])
 	ctx.Equal(row["key"], a.ConnectorID, "the outbox row must carry the message key (the connector id) so the relay keeps the order (%s)", rows[0])
@@ -1262,19 +1262,19 @@ func CheckOutbox(ctx *harness.Ctx) {
 		payload = object
 	}
 	ctx.Assert(payload != nil && payload["cursor"] == "t1", "the outbox row must carry the event: %s", rows[0])
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a rejected event cannot be on the topic; the records")
-	cursor, _ := ledger.LoadCursor(eventsBg, a.ConnectorID)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 0, "a rejected event cannot be on the topic; the records")
+	cursor, _ := ledger.LoadCursor(hEventsBg, a.ConnectorID)
 	ctx.Equal(cursor, "t1", "the page stays committed whatever the broker said; the cursor")
-	_, err := eventsSync(ctx, a, 1)
+	_, err := hEventsSync(ctx, a, 1)
 	ctx.NoError(err, "syncPage after the broker recovered")
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "once the broker answers again events flow; the records")
-	ctx.Equal(len(ctx.Redis.LRange(eventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "once the broker answers again events flow; the records")
+	ctx.Equal(len(ctx.Redis.LRange(kHEventsOutbox, 0, -1)), 1, "a delivered event leaves no outbox row; the rows")
 }
 
 func CheckApplyBeforeCommit(ctx *harness.Ctx) {
-	a, _ := eventsWorld()
+	a, _ := hEventsWorld()
 	for n := 0; n < 3; n++ {
-		_, err := eventsSync(ctx, a, n)
+		_, err := hEventsSync(ctx, a, n)
 		ctx.NoError(err, "syncPage(t%d) on a healthy broker", n)
 	}
 	var atCommit []int
@@ -1284,7 +1284,7 @@ func CheckApplyBeforeCommit(ctx *harness.Ctx) {
 		atCommit = append(atCommit, n)
 	})
 	var last map[string]any
-	all := ctx.Kafka.Records(eventsTopic)
+	all := ctx.Kafka.Records(kHEventsTopic)
 	json.Unmarshal(all[len(all)-1].Value, &last)
 	landed, _ := last["at"].(float64)
 	ctx.Clock.Advance(600) // the consumer runs ten minutes behind the producer
@@ -1296,7 +1296,7 @@ func CheckApplyBeforeCommit(ctx *harness.Ctx) {
 	health := ctx.Redis.HGetAll("health:" + a.ConnectorID)
 	ctx.Assert(health["pages"] == "3" && health["records"] == "6" && health["last_success_at"] != "", "health:%s holds %v, expected pages 3, records 6 and last_success_at", a.ConnectorID, health)
 	ctx.Equal(health["last_success_at"], strconv.FormatInt(int64(landed), 10), "a consumer ten minutes behind must write the event's at, or a lagging consumer reports a stale connector as fresh; last_success_at")
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "records the consumer left uncommitted")
+	ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), 0, "records the consumer left uncommitted")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1311,12 +1311,12 @@ func CheckApplyBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "connector.sync";
-const std::string kEventsGroup = "connector-health";
-const std::string kEventsOutbox = "outbox:connector.sync";
-const std::string kEventsToken = "vault:acme/github#4";
+const std::string kHEventsTopic = "connector.sync";
+const std::string kHEventsGroup = "connector-health";
+const std::string kHEventsOutbox = "outbox:connector.sync";
+const std::string kHEventsToken = "vault:acme/github#4";
 
-hub::Page eventsPage(int n) {
+hub::Page hEventsPage(int n) {
   hub::Page page;
   for (int i = 0; i < 2; i++) {
     hub::SourceRecord* record = page.add_records();
@@ -1328,15 +1328,15 @@ hub::Page eventsPage(int n) {
 }
 
 // syncPage, reporting what it threw ("" when nothing) and whether it answered an event.
-struct Synced {
+struct HSynced {
   std::string thrown;
   bool announced = false;
 };
 
-Synced eventsSync(harness::Ctx& ctx, const store::Connector& connector, int n) {
-  Synced out;
+HSynced hEventsSync(harness::Ctx& ctx, const store::Connector& connector, int n) {
+  HSynced out;
   try {
-    out.announced = syncPage(connector, "t" + std::to_string(n), eventsPage(n)).has_value();
+    out.announced = syncPage(connector, "t" + std::to_string(n), hEventsPage(n)).has_value();
   } catch (const std::exception& e) {
     out.thrown = std::string(harness::CurrentExceptionType()) + ": " + e.what();
   }
@@ -1344,7 +1344,7 @@ Synced eventsSync(harness::Ctx& ctx, const store::Connector& connector, int n) {
   return out;
 }
 
-nlohmann::json parsed(const std::string& text) {
+nlohmann::json hParsed(const std::string& text) {
   try {
     return nlohmann::json::parse(text);
   } catch (const std::exception&) {
@@ -1355,28 +1355,28 @@ nlohmann::json parsed(const std::string& text) {
 }  // namespace
 
 void CheckConnectorKey(harness::Ctx& ctx) {
-  const store::Connector a = store::create("acme", "github", "api.github.com", kEventsToken, 900);
+  const store::Connector a = store::create("acme", "github", "api.github.com", kHEventsToken, 900);
   const store::Connector b = store::create("acme", "github", "api.github.com", "vault:acme/github#5", 900);
-  ctx.Equal(eventsSync(ctx, a, 0).thrown, "", "syncPage on a healthy broker threw");
-  ctx.Equal(eventsSync(ctx, b, 0).thrown, "", "syncPage on a healthy broker threw");
-  ctx.Equal(eventsSync(ctx, a, 1).thrown, "", "syncPage on a healthy broker threw");
-  ctx.Equal(eventsSync(ctx, a, 1).announced, false, "a page already applied must not be announced again; announced");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three applied pages; the records on %s", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {a.connector_id, b.connector_id, a.connector_id},
+  ctx.Equal(hEventsSync(ctx, a, 0).thrown, "", "syncPage on a healthy broker threw");
+  ctx.Equal(hEventsSync(ctx, b, 0).thrown, "", "syncPage on a healthy broker threw");
+  ctx.Equal(hEventsSync(ctx, a, 1).thrown, "", "syncPage on a healthy broker threw");
+  ctx.Equal(hEventsSync(ctx, a, 1).announced, false, "a page already applied must not be announced again; announced");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three applied pages; the records on %s", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {a.connector_id, b.connector_id, a.connector_id},
             "records must be keyed by the connector id (keyed by source, every GitHub connector shares one partition and one backlog); the keys");
   ctx.Equal(records[0].Partition, records[2].Partition, "one connector's events must stay on one partition, in order; the partitions");
 }
 
 void CheckNoSecrets(harness::Ctx& ctx) {
-  const store::Connector a = store::create("acme", "github", "api.github.com", kEventsToken, 900);
-  ctx.Equal(eventsSync(ctx, a, 0).thrown, "", "syncPage on a healthy broker threw");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const store::Connector a = store::create("acme", "github", "api.github.com", kHEventsToken, 900);
+  ctx.Equal(hEventsSync(ctx, a, 0).thrown, "", "syncPage on a healthy broker threw");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 1, "one applied page; the records");
   const std::string text = records[0].Value.value_or("");
-  ctx.Assert(text.find(kEventsToken) == std::string::npos, "the event carries the token reference: %s. The topic is retained and replicated; the registry keeps the reference", text);
+  ctx.Assert(text.find(kHEventsToken) == std::string::npos, "the event carries the token reference: %s. The topic is retained and replicated; the registry keeps the reference", text);
   ctx.Assert(text.find("jane@example.com") == std::string::npos, "the event carries record contents: %s. Count the records; their contents stay with the vendor and the destination", text);
-  const auto event = parsed(text);
+  const auto event = hParsed(text);
   ctx.Assert(event.is_object(), "the event must be JSON: %s", text);
   std::vector<std::string> fields;
   for (const auto& [k, v] : event.items()) fields.push_back(k);
@@ -1390,43 +1390,43 @@ void CheckNoSecrets(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  const store::Connector a = store::create("acme", "github", "api.github.com", kEventsToken, 900);
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);
-  ctx.Equal(eventsSync(ctx, a, 0).thrown, "", "syncPage threw: a lost acknowledgement is retried by the client, not reported;");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "one page whose acknowledgement was lost: the producer's retry wrote the event twice (enable.idempotence); the records");
-  eventsSync(ctx, a, 1);
-  ctx.Kafka.Failover(kEventsTopic);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after a leader failover the topic must hold both events: a record acknowledged by the leader alone is lost (acks=all); the records");
+  const store::Connector a = store::create("acme", "github", "api.github.com", kHEventsToken, 900);
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);
+  ctx.Equal(hEventsSync(ctx, a, 0).thrown, "", "syncPage threw: a lost acknowledgement is retried by the client, not reported;");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "one page whose acknowledgement was lost: the producer's retry wrote the event twice (enable.idempotence); the records");
+  hEventsSync(ctx, a, 1);
+  ctx.Kafka.Failover(kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "after a leader failover the topic must hold both events: a record acknowledged by the leader alone is lost (acks=all); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  const store::Connector a = store::create("acme", "github", "api.github.com", kEventsToken, 900);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  eventsSync(ctx, a, 0);
-  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
-  ctx.Equal(rows.size(), 1, "after the broker rejected the event %s must hold one row (logged and dropped, the page never reaches the health read); it holds %v; rows", kEventsOutbox, rows);
-  const auto row = parsed(rows[0]);
+  const store::Connector a = store::create("acme", "github", "api.github.com", kHEventsToken, 900);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  hEventsSync(ctx, a, 0);
+  const auto rows = ctx.Redis.LRange(kHEventsOutbox, 0, -1);
+  ctx.Equal(rows.size(), 1, "after the broker rejected the event %s must hold one row (logged and dropped, the page never reaches the health read); it holds %v; rows", kHEventsOutbox, rows);
+  const auto row = hParsed(rows[0]);
   ctx.Assert(row.is_object() && row.value("key", "") == a.connector_id, "the outbox row must carry the message key (the connector id) so the relay keeps the order (%s)", rows[0]);
   nlohmann::json payload;
-  if (row.contains("payload")) payload = row["payload"].is_string() ? parsed(row["payload"].get<std::string>()) : row["payload"];
+  if (row.contains("payload")) payload = row["payload"].is_string() ? hParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("cursor", "") == "t1", "the outbox row must carry the event: %s", rows[0]);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a rejected event cannot be on the topic; the records");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 0, "a rejected event cannot be on the topic; the records");
   ctx.Equal(ledger::loadCursor(a.connector_id).value_or(""), "t1", "the page stays committed whatever the broker said; the cursor");
-  ctx.Equal(eventsSync(ctx, a, 1).thrown, "", "syncPage after the broker recovered threw");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "once the broker answers again events flow; the records");
-  ctx.Equal(ctx.Redis.LRange(kEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
+  ctx.Equal(hEventsSync(ctx, a, 1).thrown, "", "syncPage after the broker recovered threw");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "once the broker answers again events flow; the records");
+  ctx.Equal(ctx.Redis.LRange(kHEventsOutbox, 0, -1).size(), 1, "a delivered event leaves no outbox row; the rows");
 }
 
 void CheckApplyBeforeCommit(harness::Ctx& ctx) {
-  const store::Connector a = store::create("acme", "github", "api.github.com", kEventsToken, 900);
-  for (int n = 0; n < 3; n++) ctx.Equal(eventsSync(ctx, a, n).thrown, "", "syncPage on a healthy broker threw");
+  const store::Connector a = store::create("acme", "github", "api.github.com", kHEventsToken, 900);
+  for (int n = 0; n < 3; n++) ctx.Equal(hEventsSync(ctx, a, n).thrown, "", "syncPage on a healthy broker threw");
   const std::string key = "health:" + a.connector_id;
   std::vector<long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
     const auto pages = ctx.Redis.HGet(key, "pages");
     atCommit.push_back(pages && !pages->empty() ? std::stol(*pages) : 0);
   });
-  const auto last = parsed(ctx.Kafka.Records(kEventsTopic).back().Value.value_or(""));
+  const auto last = hParsed(ctx.Kafka.Records(kHEventsTopic).back().Value.value_or(""));
   const long long landed = last.is_object() ? last.value("at", 0LL) : 0;
   ctx.Clock.Advance(600);  // the consumer runs ten minutes behind the producer
   ctx.Drain([] { consumeSync(); });
@@ -1440,7 +1440,7 @@ void CheckApplyBeforeCommit(harness::Ctx& ctx) {
   const auto field = [&health](const std::string& f) { return health.count(f) ? health.at(f) : std::string(); };
   ctx.Assert(field("pages") == "3" && field("records") == "6" && !field("last_success_at").empty(), "%s holds %v, expected pages 3, records 6 and last_success_at", key, health);
   ctx.Equal(field("last_success_at"), std::to_string(landed), "a consumer ten minutes behind must write the event's at, or a lagging consumer reports a stale connector as fresh; last_success_at");
-  ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 0, "records the consumer left uncommitted");
+  ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), 0, "records the consumer left uncommitted");
 }
 `,
   },

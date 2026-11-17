@@ -995,26 +995,26 @@ import (
 )
 
 const (
-	readTenant   = "t1"
-	readName     = "support-reply"
-	readTemplate = "Hi {{customer_name}}, answer in a {{tone}} tone."
-	readInjected     = "{{tone}}"
-	readInjectedName = "{{customer_name}}"
+	kHReadTenant   = "t1"
+	kHReadName     = "support-reply"
+	kHReadTemplate = "Hi {{customer_name}}, answer in a {{tone}} tone."
+	kHReadInjected     = "{{tone}}"
+	kHReadInjectedName = "{{customer_name}}"
 )
 
-func readSha(text string) string {
+func hReadSha(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(sum[:])
 }
 
-func readRegister(ctx *harness.Ctx, version int, template string) map[string]any {
-	record := map[string]any{"name": readName, "version": version, "content_hash": readSha(template), "template": template, "variables": []string{"customer_name", "tone"}}
+func hReadRegister(ctx *harness.Ctx, version int, template string) map[string]any {
+	record := map[string]any{"name": kHReadName, "version": version, "content_hash": hReadSha(template), "template": template, "variables": []string{"customer_name", "tone"}}
 	raw, _ := json.Marshal(record)
-	ctx.Redis.Set(config.VersionKey(readTenant, readName, version), string(raw))
+	ctx.Redis.Set(config.VersionKey(kHReadTenant, kHReadName, version), string(raw))
 	return record
 }
 
-func readJudge(ctx *harness.Ctx, record map[string]any, passed bool) map[string]any {
+func hReadJudge(ctx *harness.Ctx, record map[string]any, passed bool) map[string]any {
 	hash := record["content_hash"].(string)
 	score := 0.41
 	if passed {
@@ -1022,89 +1022,89 @@ func readJudge(ctx *harness.Ctx, record map[string]any, passed bool) map[string]
 	}
 	verdict := map[string]any{"eval_id": "ev-" + hash[:12], "passed": passed, "score": score, "content_hash": hash, "version": float64(record["version"].(int))}
 	raw, _ := json.Marshal(verdict)
-	ctx.Redis.Set(config.EvalKey(readTenant, readName, hash), string(raw))
-	ctx.Redis.Set(config.EvalLatestKey(readTenant, readName), hash)
+	ctx.Redis.Set(config.EvalKey(kHReadTenant, kHReadName, hash), string(raw))
+	ctx.Redis.Set(config.EvalLatestKey(kHReadTenant, kHReadName), hash)
 	return verdict
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readGet(c *harness.HTTP, version int, tenant string) *harness.Response {
-	return c.Get("/v1/prompts/"+readName+"/versions/"+strconv.Itoa(version), "X-Tenant-Id", tenant)
+func hReadGet(c *harness.HTTP, version int, tenant string) *harness.Response {
+	return c.Get("/v1/prompts/"+kHReadName+"/versions/"+strconv.Itoa(version), "X-Tenant-Id", tenant)
 }
 
-func readRender(c *harness.HTTP, version int, values map[string]any, tenant string) *harness.Response {
-	return c.Post("/v1/prompts/"+readName+"/versions/"+strconv.Itoa(version)+"/render", map[string]any{"values": values}, "X-Tenant-Id", tenant)
+func hReadRender(c *harness.HTTP, version int, values map[string]any, tenant string) *harness.Response {
+	return c.Post("/v1/prompts/"+kHReadName+"/versions/"+strconv.Itoa(version)+"/render", map[string]any{"values": values}, "X-Tenant-Id", tenant)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckReadRoute(ctx *harness.Ctx) {
-	readRegister(ctx, 3, readTemplate)
-	c := readClient(ctx)
-	r := readGet(c, 3, readTenant)
+	hReadRegister(ctx, 3, kHReadTemplate)
+	c := hReadClient(ctx)
+	r := hReadGet(c, 3, kHReadTenant)
 	ctx.Equal(r.Status, 200, "reading version 3 (%s)", r.Text())
-	body := readBody(ctx, r)
-	ctx.Equal(body["name"], readName, "the read's name")
+	body := hReadBody(ctx, r)
+	ctx.Equal(body["name"], kHReadName, "the read's name")
 	ctx.Equal(body["version"], float64(3), "the read's version")
-	ctx.Equal(body["content_hash"], readSha(readTemplate), "the read's content_hash")
-	ctx.Equal(body["template"], readTemplate, "the read's template")
+	ctx.Equal(body["content_hash"], hReadSha(kHReadTemplate), "the read's content_hash")
+	ctx.Equal(body["template"], kHReadTemplate, "the read's template")
 	ctx.Equal(body["variables"], []any{"customer_name", "tone"}, "the read's variables")
 	_, has := body["eval_record"]
 	ctx.Assert(has, "the read carries an eval_record field (null when none), got %s", r.Text())
-	ctx.Equal(c.Get("/v1/prompts/"+readName+"/versions/3").Status, 401, "a read without X-Tenant-Id")
-	r = readRender(c, 3, map[string]any{"customer_name": "Ada", "tone": "warm"}, readTenant)
-	ctx.Assert(r.Status == 200 && readBody(ctx, r)["rendered"] == "Hi Ada, answer in a warm tone.", "rendering with every value answered %d: %s", r.Status, r.Text())
-	ctx.Equal(c.Post("/v1/prompts/"+readName+"/versions/3/render", map[string]any{"values": map[string]any{"customer_name": "Ada", "tone": "warm"}}).Status, 401, "a render without X-Tenant-Id")
+	ctx.Equal(c.Get("/v1/prompts/"+kHReadName+"/versions/3").Status, 401, "a read without X-Tenant-Id")
+	r = hReadRender(c, 3, map[string]any{"customer_name": "Ada", "tone": "warm"}, kHReadTenant)
+	ctx.Assert(r.Status == 200 && hReadBody(ctx, r)["rendered"] == "Hi Ada, answer in a warm tone.", "rendering with every value answered %d: %s", r.Status, r.Text())
+	ctx.Equal(c.Post("/v1/prompts/"+kHReadName+"/versions/3/render", map[string]any{"values": map[string]any{"customer_name": "Ada", "tone": "warm"}}).Status, 401, "a render without X-Tenant-Id")
 }
 
 func CheckMissing404(ctx *harness.Ctx) {
-	readRegister(ctx, 3, readTemplate)
-	c := readClient(ctx)
-	r := readGet(c, 9, readTenant)
+	hReadRegister(ctx, 3, kHReadTemplate)
+	c := hReadClient(ctx)
+	r := hReadGet(c, 9, kHReadTenant)
 	ctx.Equal(r.Status, 404, "a version that was never registered (%s): a client caches a 200 as an empty prompt", r.Text())
-	r = readGet(c, 3, "t2")
+	r = hReadGet(c, 3, "t2")
 	ctx.Equal(r.Status, 404, "another tenant's read of version 3")
 	ctx.Assert(!strings.Contains(r.Text(), "Hi {{customer_name}}"), "another tenant's read carries the template: %s", r.Text())
-	r = readRender(c, 9, map[string]any{"customer_name": "Ada", "tone": "warm"}, readTenant)
+	r = hReadRender(c, 9, map[string]any{"customer_name": "Ada", "tone": "warm"}, kHReadTenant)
 	ctx.Equal(r.Status, 404, "rendering a version that was never registered (%s)", r.Text())
 }
 
 func CheckEvalByHash(ctx *harness.Ctx) {
-	v3 := readRegister(ctx, 3, readTemplate)
-	v4 := readRegister(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.")
-	readRegister(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.")
-	passed := readJudge(ctx, v3, true)
-	readJudge(ctx, v4, false) // judged later: the name's latest verdict is on version 4
-	c := readClient(ctx)
-	body := readBody(ctx, readGet(c, 3, readTenant))
+	v3 := hReadRegister(ctx, 3, kHReadTemplate)
+	v4 := hReadRegister(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.")
+	hReadRegister(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.")
+	passed := hReadJudge(ctx, v3, true)
+	hReadJudge(ctx, v4, false) // judged later: the name's latest verdict is on version 4
+	c := hReadClient(ctx)
+	body := hReadBody(ctx, hReadGet(c, 3, kHReadTenant))
 	ctx.Equal(body["eval_record"], passed, "version 3 must carry the verdict on its own bytes (the name's latest verdict judged version 4); the eval_record")
-	body = readBody(ctx, readGet(c, 5, readTenant))
+	body = hReadBody(ctx, hReadGet(c, 5, kHReadTenant))
 	ctx.Assert(body["eval_record"] == nil, "version 5 was never evaluated, so its eval_record is null, got %v", body["eval_record"])
 }
 
 func CheckRenderOnePass(ctx *harness.Ctx) {
-	readRegister(ctx, 3, readTemplate)
-	r := readRender(readClient(ctx), 3, map[string]any{"customer_name": readInjected, "tone": "rude"}, readTenant)
+	hReadRegister(ctx, 3, kHReadTemplate)
+	r := hReadRender(hReadClient(ctx), 3, map[string]any{"customer_name": kHReadInjected, "tone": "rude"}, kHReadTenant)
 	ctx.Equal(r.Status, 200, "a value that looks like a placeholder is still a string within the limit (%s)", r.Text())
-	ctx.Equal(readBody(ctx, r)["rendered"], "Hi "+readInjected+", answer in a rude tone.", "customer_name %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", readInjected)
+	ctx.Equal(hReadBody(ctx, r)["rendered"], "Hi "+kHReadInjected+", answer in a rude tone.", "customer_name %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kHReadInjected)
 	// The other direction: whichever order the values are filled in, none is scanned again.
-	back := readRender(readClient(ctx), 3, map[string]any{"customer_name": "Ada", "tone": readInjectedName}, readTenant)
+	back := hReadRender(hReadClient(ctx), 3, map[string]any{"customer_name": "Ada", "tone": kHReadInjectedName}, kHReadTenant)
 	ctx.Equal(back.Status, 200, "a value that looks like a placeholder is still a string within the limit (%s)", back.Text())
-	ctx.Equal(readBody(ctx, back)["rendered"], "Hi Ada, answer in a "+readInjectedName+" tone.", "tone %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", readInjectedName)
+	ctx.Equal(hReadBody(ctx, back)["rendered"], "Hi Ada, answer in a "+kHReadInjectedName+" tone.", "tone %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kHReadInjectedName)
 }
 
 func CheckValueLimits(ctx *harness.Ctx) {
-	readRegister(ctx, 3, readTemplate)
-	c := readClient(ctx)
+	hReadRegister(ctx, 3, kHReadTemplate)
+	c := hReadClient(ctx)
 	cases := []struct {
 		values map[string]any
 		what   string
@@ -1116,10 +1116,10 @@ func CheckValueLimits(ctx *harness.Ctx) {
 		{map[string]any{"customer_name": strings.Repeat("é", 513), "tone": "warm"}, "a value of 1026 bytes in 513 characters"},
 	}
 	for _, tc := range cases {
-		ctx.Equal(readRender(c, 3, tc.values, readTenant).Status, 422, "%s", tc.what)
+		ctx.Equal(hReadRender(c, 3, tc.values, kHReadTenant).Status, 422, "%s", tc.what)
 	}
 	for _, value := range []string{strings.Repeat("a", 1024), strings.Repeat("é", 512)} {
-		r := readRender(c, 3, map[string]any{"customer_name": value, "tone": "warm"}, readTenant)
+		r := hReadRender(c, 3, map[string]any{"customer_name": value, "tone": "warm"}, kHReadTenant)
 		ctx.Equal(r.Status, 200, "a value of exactly 1024 bytes (%d characters) is within the limit", len([]rune(value)))
 	}
 }
@@ -1137,40 +1137,40 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kT = "t1";
-const std::string kN = "support-reply";
-const std::string kTemplate = "Hi {{customer_name}}, answer in a {{tone}} tone.";
-const std::string kInjected = "{{tone}}";
-const std::string kInjectedName = "{{customer_name}}";
+const std::string kHT = "t1";
+const std::string kHN = "support-reply";
+const std::string kHTemplate = "Hi {{customer_name}}, answer in a {{tone}} tone.";
+const std::string kHInjected = "{{tone}}";
+const std::string kHInjectedName = "{{customer_name}}";
 
-json readRegister(harness::Ctx& ctx, int version, const std::string& text = kTemplate) {
-  const json record = {{"name", kN}, {"version", version}, {"content_hash", sha256_hex(text)}, {"template", text}, {"variables", {"customer_name", "tone"}}};
-  ctx.Redis.Set("prompts:version:" + kT + ":" + kN + ":" + std::to_string(version), record.dump());
+json hReadRegister(harness::Ctx& ctx, int version, const std::string& text = kHTemplate) {
+  const json record = {{"name", kHN}, {"version", version}, {"content_hash", sha256_hex(text)}, {"template", text}, {"variables", {"customer_name", "tone"}}};
+  ctx.Redis.Set("prompts:version:" + kHT + ":" + kHN + ":" + std::to_string(version), record.dump());
   return record;
 }
 
-json readJudge(harness::Ctx& ctx, const json& record, bool passed) {
+json hReadJudge(harness::Ctx& ctx, const json& record, bool passed) {
   const std::string hash = record["content_hash"].get<std::string>();
   const json verdict = {{"eval_id", "ev-" + hash.substr(0, 12)}, {"passed", passed}, {"score", passed ? 0.93 : 0.41}, {"content_hash", hash}, {"version", record["version"]}};
-  ctx.Redis.Set("prompts:eval:" + kT + ":" + kN + ":" + hash, verdict.dump());
-  ctx.Redis.Set("prompts:eval_latest:" + kT + ":" + kN, hash);
+  ctx.Redis.Set("prompts:eval:" + kHT + ":" + kHN + ":" + hash, verdict.dump());
+  ctx.Redis.Set("prompts:eval_latest:" + kHT + ":" + kHN, hash);
   return verdict;
 }
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
-  harness::Response get(int version, const std::string& tenant = kT) {
-    return http.Get("/v1/prompts/" + kN + "/versions/" + std::to_string(version), "X-Tenant-Id", tenant);
+  harness::Response get(int version, const std::string& tenant = kHT) {
+    return http.Get("/v1/prompts/" + kHN + "/versions/" + std::to_string(version), "X-Tenant-Id", tenant);
   }
-  harness::Response render(int version, const json& values, const std::string& tenant = kT) {
-    return http.Post("/v1/prompts/" + kN + "/versions/" + std::to_string(version) + "/render", json({{"values", values}}).dump(), "X-Tenant-Id", tenant);
+  harness::Response render(int version, const json& values, const std::string& tenant = kHT) {
+    return http.Post("/v1/prompts/" + kHN + "/versions/" + std::to_string(version) + "/render", json({{"values", values}}).dump(), "X-Tenant-Id", tenant);
   }
 };
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
@@ -1179,25 +1179,25 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckReadRoute(harness::Ctx& ctx) {
-  const json record = readRegister(ctx, 3);
-  Api api(ctx);
+  const json record = hReadRegister(ctx, 3);
+  HApi api(ctx);
   auto r = api.get(3);
   ctx.Equal(r.Status, 200, "reading version 3 (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   for (const char* key : {"name", "version", "content_hash", "template", "variables"}) {
     ctx.Equal(body.contains(key) ? body[key] : json(), record[key], "the read's %s", key);
   }
   ctx.Assert(body.contains("eval_record"), "the read carries an eval_record field (null when none), got %s", r.Text());
-  ctx.Equal(api.http.Get("/v1/prompts/" + kN + "/versions/3").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(api.http.Get("/v1/prompts/" + kHN + "/versions/3").Status, 401, "a read without X-Tenant-Id");
   r = api.render(3, {{"customer_name", "Ada"}, {"tone", "warm"}});
-  ctx.Assert(r.Status == 200 && bodyOf(ctx, r).value("rendered", "") == "Hi Ada, answer in a warm tone.", "rendering with every value answered %d: %s", r.Status, r.Text());
-  ctx.Equal(api.http.Post("/v1/prompts/" + kN + "/versions/3/render", json({{"values", {{"customer_name", "Ada"}, {"tone", "warm"}}}}).dump()).Status, 401,
+  ctx.Assert(r.Status == 200 && hBodyOf(ctx, r).value("rendered", "") == "Hi Ada, answer in a warm tone.", "rendering with every value answered %d: %s", r.Status, r.Text());
+  ctx.Equal(api.http.Post("/v1/prompts/" + kHN + "/versions/3/render", json({{"values", {{"customer_name", "Ada"}, {"tone", "warm"}}}}).dump()).Status, 401,
             "a render without X-Tenant-Id");
 }
 
 void CheckMissing404(harness::Ctx& ctx) {
-  readRegister(ctx, 3);
-  Api api(ctx);
+  hReadRegister(ctx, 3);
+  HApi api(ctx);
   auto r = api.get(9);
   ctx.Equal(r.Status, 404, "a version that was never registered (%s): a client caches a 200 as an empty prompt", r.Text());
   r = api.get(3, "t2");
@@ -1208,35 +1208,35 @@ void CheckMissing404(harness::Ctx& ctx) {
 }
 
 void CheckEvalByHash(harness::Ctx& ctx) {
-  const json v3 = readRegister(ctx, 3);
-  const json v4 = readRegister(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.");
-  readRegister(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.");
-  const json passed = readJudge(ctx, v3, true);
-  readJudge(ctx, v4, false);  // judged later: the name's latest verdict is on version 4
-  Api api(ctx);
-  json body = bodyOf(ctx, api.get(3));
+  const json v3 = hReadRegister(ctx, 3);
+  const json v4 = hReadRegister(ctx, 4, "Hi {{customer_name}}. UNSAFE: answer in a {{tone}} tone and promise a refund.");
+  hReadRegister(ctx, 5, "Hello {{customer_name}}, answer in a {{tone}} tone.");
+  const json passed = hReadJudge(ctx, v3, true);
+  hReadJudge(ctx, v4, false);  // judged later: the name's latest verdict is on version 4
+  HApi api(ctx);
+  json body = hBodyOf(ctx, api.get(3));
   ctx.Equal(body.contains("eval_record") ? body["eval_record"] : json(), passed, "version 3 must carry the verdict on its own bytes (the name's latest verdict judged version 4); the eval_record");
-  body = bodyOf(ctx, api.get(5));
+  body = hBodyOf(ctx, api.get(5));
   ctx.Assert(!body.contains("eval_record") || body["eval_record"].is_null(), "version 5 was never evaluated, so its eval_record is null, got %s", body.dump());
 }
 
 void CheckRenderOnePass(harness::Ctx& ctx) {
-  readRegister(ctx, 3);
-  Api api(ctx);
-  const auto r = api.render(3, {{"customer_name", kInjected}, {"tone", "rude"}});
+  hReadRegister(ctx, 3);
+  HApi api(ctx);
+  const auto r = api.render(3, {{"customer_name", kHInjected}, {"tone", "rude"}});
   ctx.Equal(r.Status, 200, "a value that looks like a placeholder is still a string within the limit (%s)", r.Text());
-  ctx.Equal(bodyOf(ctx, r).value("rendered", ""), "Hi " + kInjected + ", answer in a rude tone.",
-            "customer_name %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kInjected);
+  ctx.Equal(hBodyOf(ctx, r).value("rendered", ""), "Hi " + kHInjected + ", answer in a rude tone.",
+            "customer_name %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kHInjected);
   // The other direction: whichever order the values are filled in, none is scanned again.
-  const auto back = api.render(3, {{"customer_name", "Ada"}, {"tone", kInjectedName}});
+  const auto back = api.render(3, {{"customer_name", "Ada"}, {"tone", kHInjectedName}});
   ctx.Equal(back.Status, 200, "a value that looks like a placeholder is still a string within the limit (%s)", back.Text());
-  ctx.Equal(bodyOf(ctx, back).value("rendered", ""), "Hi Ada, answer in a " + kInjectedName + " tone.",
-            "tone %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kInjectedName);
+  ctx.Equal(hBodyOf(ctx, back).value("rendered", ""), "Hi Ada, answer in a " + kHInjectedName + " tone.",
+            "tone %q must be inserted as text: scanned again, it fills a slot the caller does not own; the rendered prompt", kHInjectedName);
 }
 
 void CheckValueLimits(harness::Ctx& ctx) {
-  readRegister(ctx, 3);
-  Api api(ctx);
+  hReadRegister(ctx, 3);
+  HApi api(ctx);
   std::string accented;  // 512 two-byte characters: exactly 1024 bytes
   for (int i = 0; i < 512; i++) accented += "é";
   const std::vector<std::pair<json, std::string>> cases = {

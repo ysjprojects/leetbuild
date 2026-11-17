@@ -1050,47 +1050,47 @@ import (
 )
 
 const (
-	eventsTopic = "voice.turn"
-	eventsGroup = "transcripts"
-	spoken      = "Sure, call me back on 415 555 0134 after six."
-	redacted    = "Sure, call me back on [redacted] after six."
-	t0          = int64(1_700_000_000_000)
+	kHEventsTopic = "voice.turn"
+	kHEventsGroup = "transcripts"
+	kHSpoken      = "Sure, call me back on 415 555 0134 after six."
+	kHRedacted    = "Sure, call me back on [redacted] after six."
+	kHT0          = int64(1_700_000_000_000)
 )
 
 var (
-	eventsBg  = context.Background()
-	callOne   = sessions.Session{SessionID: "vs-1", Tenant: "acme", Codec: "pcm16", SampleRate: 24000, MaxDurationS: 1800}
-	callOther = sessions.Session{SessionID: "vs-2", Tenant: "acme", Codec: "pcm16", SampleRate: 24000, MaxDurationS: 1800}
+	hEventsBg  = context.Background()
+	hCallOne   = sessions.Session{SessionID: "vs-1", Tenant: "acme", Codec: "pcm16", SampleRate: 24000, MaxDurationS: 1800}
+	hCallOther = sessions.Session{SessionID: "vs-2", Tenant: "acme", Codec: "pcm16", SampleRate: 24000, MaxDurationS: 1800}
 )
 
-func turnAt(i int) Turn {
-	return Turn{TurnIndex: i, StartedAt: t0 + int64(i)*4000, EndedAt: t0 + int64(i)*4000 + 3200, Text: spoken}
+func hTurnAt(i int) Turn {
+	return Turn{TurnIndex: i, StartedAt: kHT0 + int64(i)*4000, EndedAt: kHT0 + int64(i)*4000 + 3200, Text: kHSpoken}
 }
 
-func mustRecord(ctx *harness.Ctx, session sessions.Session, turn Turn) map[string]any {
-	event, err := recordTurn(eventsBg, session, turn)
+func hMustRecord(ctx *harness.Ctx, session sessions.Session, turn Turn) map[string]any {
+	event, err := recordTurn(hEventsBg, session, turn)
 	ctx.NoError(err, "recordTurn(%s, turn %d) failed", session.SessionID, turn.TurnIndex)
 	return event
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func seedTurn(ctx *harness.Ctx, turnIndex int, ref string) {
-	event, _ := json.Marshal(transcripts.Event{SessionID: "vs-1", Tenant: "acme", TurnIndex: turnIndex, StartedAt: t0, EndedAt: t0 + 3200, TranscriptRef: ref})
-	ctx.Kafka.Seed(eventsTopic, "vs-1", event)
+func hSeedTurn(ctx *harness.Ctx, turnIndex int, ref string) {
+	event, _ := json.Marshal(transcripts.Event{SessionID: "vs-1", Tenant: "acme", TurnIndex: turnIndex, StartedAt: kHT0, EndedAt: kHT0 + 3200, TranscriptRef: ref})
+	ctx.Kafka.Seed(kHEventsTopic, "vs-1", event)
 }
 
 func CheckSessionKey(ctx *harness.Ctx) {
 	for i := 0; i < 3; i++ {
-		mustRecord(ctx, callOne, turnAt(i))
-		mustRecord(ctx, callOther, turnAt(i))
+		hMustRecord(ctx, hCallOne, hTurnAt(i))
+		hMustRecord(ctx, hCallOther, hTurnAt(i))
 	}
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 6, "six turns must produce six records on %s; the records", eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 6, "six turns must produce six records on %s; the records", kHEventsTopic)
 	keys := map[string]bool{}
 	partitions := map[int]bool{}
 	type placed struct {
@@ -1099,7 +1099,7 @@ func CheckSessionKey(ctx *harness.Ctx) {
 	}
 	var mine []placed
 	for _, r := range records {
-		p := payloadOf(ctx, r.Value)
+		p := hPayloadOf(ctx, r.Value)
 		if p["session_id"] != "vs-1" {
 			continue
 		}
@@ -1118,47 +1118,47 @@ func CheckSessionKey(ctx *harness.Ctx) {
 }
 
 func CheckRedactedPayload(ctx *harness.Ctx) {
-	event := mustRecord(ctx, callOne, turnAt(3))
-	records := ctx.Kafka.Records(eventsTopic)
+	event := hMustRecord(ctx, hCallOne, hTurnAt(3))
+	records := ctx.Kafka.Records(kHEventsTopic)
 	ctx.Equal(len(records), 1, "one turn; the records")
 	raw := string(records[0].Value)
 	ctx.Assert(!strings.Contains(raw, "415 555 0134") && !strings.Contains(raw, "call me back"), "the voice.turn record carries the caller's words: %s. The topic is retained and replicated; carry transcript_ref, not the text", raw)
-	p := payloadOf(ctx, records[0].Value)
-	for name, value := range map[string]any{"session_id": "vs-1", "tenant": "acme", "turn_index": 3, "started_at": t0 + 12000, "ended_at": t0 + 15200} {
+	p := hPayloadOf(ctx, records[0].Value)
+	for name, value := range map[string]any{"session_id": "vs-1", "tenant": "acme", "turn_index": 3, "started_at": kHT0 + 12000, "ended_at": kHT0 + 15200} {
 		ctx.Equal(p[name], value, "the event's %s (%s)", name, raw)
 	}
 	ref, _ := p["transcript_ref"].(string)
 	text, _ := ctx.Redis.HGet(ref, "text")
-	ctx.Equal(text, redacted, "transcript_ref %q must name the redacted text Redact stored; its text", ref)
+	ctx.Equal(text, kHRedacted, "transcript_ref %q must name the redacted text Redact stored; its text", ref)
 	ctx.Equal(event["transcript_ref"], p["transcript_ref"], "recordTurn must return the event it produced; its transcript_ref")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1)
-	mustRecord(ctx, callOne, turnAt(0))
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one turn whose acknowledgement was lost: the producer's retry wrote the turn twice. Enable idempotence (with acks=all); the records")
-	mustRecord(ctx, callOne, turnAt(1))
-	lost := ctx.Kafka.Failover(eventsTopic)
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost)
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1)
+	hMustRecord(ctx, hCallOne, hTurnAt(0))
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 1, "one turn whose acknowledgement was lost: the producer's retry wrote the turn twice. Enable idempotence (with acks=all); the records")
+	hMustRecord(ctx, hCallOne, hTurnAt(1))
+	lost := ctx.Kafka.Failover(kHEventsTopic)
+	ctx.Equal(len(ctx.Kafka.Records(kHEventsTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost)
 	// The broker refuses the next turn: the caller must hear about it, not lose the turn silently.
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	_, err := recordTurn(eventsBg, callOne, turnAt(2))
+	ctx.Kafka.FailNext(kHEventsTopic, 1)
+	_, err := recordTurn(hEventsBg, hCallOne, hTurnAt(2))
 	ctx.Assert(err != nil, "the broker refused turn 2 and recordTurn returned no error: a refused delivery must fail, or the turn is lost without anyone knowing")
 }
 
 func CheckPersistBeforeCommit(ctx *harness.Ctx) {
-	seedTurn(ctx, 0, transcripts.Redact(eventsBg, "vs-1", 0, spoken))
+	hSeedTurn(ctx, 0, transcripts.Redact(hEventsBg, "vs-1", 0, kHSpoken))
 	// Turn 1's write fails and turn 2 is behind it: turn 1's offset must stay uncommitted, so it is redelivered.
-	seedTurn(ctx, 1, "voice:redacted:vs-1:missing")
-	seedTurn(ctx, 2, transcripts.Redact(eventsBg, "vs-1", 2, spoken))
+	hSeedTurn(ctx, 1, "voice:redacted:vs-1:missing")
+	hSeedTurn(ctx, 2, transcripts.Redact(hEventsBg, "vs-1", 2, kHSpoken))
 	var atCommit []int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.Exists("voice:turn:vs-1:0")) })
-	ctx.Drain(func() { run(eventsBg) })
+	ctx.Drain(func() { run(hEventsBg) })
 	ctx.Assert(len(atCommit) > 0, "the transcript consumer never committed an offset")
 	ctx.Equal(atCommit[0], int64(1), "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and InsertTurn loses the turn; the row at the commit")
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), int64(2), "turn 0 was stored and InsertTurn failed for turn 1: the commit must cover turn 0 (else a restart redelivers it) and nothing at or past turn 1 (else the turn is lost); turns 1 and 2 uncommitted, the lag")
-	stored := transcripts.ListTurns(eventsBg, "vs-1", -1, 10)
-	ctx.Assert(len(stored) == 1 && stored[0].Text == redacted, "the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds %+v", stored)
+	ctx.Equal(ctx.Kafka.Lag(kHEventsGroup, kHEventsTopic), int64(2), "turn 0 was stored and InsertTurn failed for turn 1: the commit must cover turn 0 (else a restart redelivers it) and nothing at or past turn 1 (else the turn is lost); turns 1 and 2 uncommitted, the lag")
+	stored := transcripts.ListTurns(hEventsBg, "vs-1", -1, 10)
+	ctx.Assert(len(stored) == 1 && stored[0].Text == kHRedacted, "the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds %+v", stored)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1176,17 +1176,17 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "voice.turn";
-const std::string kGroup = "transcripts";
-const std::string kSpoken = "Sure, call me back on 415 555 0134 after six.";
-const std::string kRedacted = "Sure, call me back on [redacted] after six.";
-const long long kT0 = 1700000000000LL;
-const sessions::Session kCall{"vs-1", "acme", "pcm16", 24000, 1800, 0};
-const sessions::Session kOther{"vs-2", "acme", "pcm16", 24000, 1800, 0};
+const std::string kHTopic = "voice.turn";
+const std::string kHGroup = "transcripts";
+const std::string kHSpoken = "Sure, call me back on 415 555 0134 after six.";
+const std::string kHRedacted = "Sure, call me back on [redacted] after six.";
+const long long kHT0 = 1700000000000LL;
+const sessions::Session kHCall{"vs-1", "acme", "pcm16", 24000, 1800, 0};
+const sessions::Session kHOther{"vs-2", "acme", "pcm16", 24000, 1800, 0};
 
-Turn turnAt(long i) { return Turn{i, kT0 + i * 4000, kT0 + i * 4000 + 3200, kSpoken}; }
+Turn hTurnAt(long i) { return Turn{i, kHT0 + i * 4000, kHT0 + i * 4000 + 3200, kHSpoken}; }
 
-json mustRecord(harness::Ctx& ctx, const sessions::Session& session, const Turn& turn) {
+json hMustRecord(harness::Ctx& ctx, const sessions::Session& session, const Turn& turn) {
   try {
     return record_turn(session, turn);
   } catch (const std::exception& e) {
@@ -1194,7 +1194,7 @@ json mustRecord(harness::Ctx& ctx, const sessions::Session& session, const Turn&
   }
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -1202,25 +1202,25 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   }
 }
 
-void seedTurn(harness::Ctx& ctx, long turn_index, const std::string& ref) {
-  const json event = {{"session_id", "vs-1"}, {"tenant", "acme"}, {"turn_index", turn_index}, {"started_at", kT0}, {"ended_at", kT0 + 3200}, {"transcript_ref", ref}};
-  ctx.Kafka.Seed(kTopic, std::string("vs-1"), event.dump());
+void hSeedTurn(harness::Ctx& ctx, long turn_index, const std::string& ref) {
+  const json event = {{"session_id", "vs-1"}, {"tenant", "acme"}, {"turn_index", turn_index}, {"started_at", kHT0}, {"ended_at", kHT0 + 3200}, {"transcript_ref", ref}};
+  ctx.Kafka.Seed(kHTopic, std::string("vs-1"), event.dump());
 }
 
 }  // namespace
 
 void CheckSessionKey(harness::Ctx& ctx) {
   for (long i = 0; i < 3; i++) {
-    mustRecord(ctx, kCall, turnAt(i));
-    mustRecord(ctx, kOther, turnAt(i));
+    hMustRecord(ctx, kHCall, hTurnAt(i));
+    hMustRecord(ctx, kHOther, hTurnAt(i));
   }
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 6, "six turns must produce six records on %s; the records", kTopic);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 6, "six turns must produce six records on %s; the records", kHTopic);
   std::set<std::string> keys;
   std::set<int> partitions;
   std::vector<std::pair<int64_t, long>> mine;
   for (const auto& r : records) {
-    const json p = payloadOf(ctx, r);
+    const json p = hPayloadOf(ctx, r);
     if (p.value("session_id", "") != "vs-1") continue;
     keys.insert(r.Key.value_or("(no key)"));
     partitions.insert(r.Partition);
@@ -1235,33 +1235,33 @@ void CheckSessionKey(harness::Ctx& ctx) {
 }
 
 void CheckRedactedPayload(harness::Ctx& ctx) {
-  const json event = mustRecord(ctx, kCall, turnAt(3));
-  const auto records = ctx.Kafka.Records(kTopic);
+  const json event = hMustRecord(ctx, kHCall, hTurnAt(3));
+  const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 1, "one turn; the records");
   const std::string raw = records[0].Value.value_or("");
   ctx.Assert(raw.find("415 555 0134") == std::string::npos && raw.find("call me back") == std::string::npos,
              "the voice.turn record carries the caller's words: %s. The topic is retained and replicated; carry transcript_ref, not the text", raw);
-  const json p = payloadOf(ctx, records[0]);
+  const json p = hPayloadOf(ctx, records[0]);
   ctx.Assert(p.value("session_id", "") == "vs-1" && p.value("tenant", "") == "acme" && p.value("turn_index", -1L) == 3 &&
-                 p.value("started_at", 0LL) == kT0 + 12000 && p.value("ended_at", 0LL) == kT0 + 15200,
+                 p.value("started_at", 0LL) == kHT0 + 12000 && p.value("ended_at", 0LL) == kHT0 + 15200,
              "the event must carry session_id, tenant, turn_index and the timings, got %s", raw);
   const std::string ref = p.value("transcript_ref", "");
-  ctx.Equal(ctx.Redis.HGet(ref, "text").value_or(""), kRedacted, "transcript_ref %q must name the redacted text redact stored; its text", ref);
+  ctx.Equal(ctx.Redis.HGet(ref, "text").value_or(""), kHRedacted, "transcript_ref %q must name the redacted text redact stored; its text", ref);
   ctx.Equal(event.dump(), p.dump(), "record_turn must return the event it produced");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  mustRecord(ctx, kCall, turnAt(0));
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one turn whose acknowledgement was lost: the producer's retry wrote the turn twice. Set enable.idempotence (with acks=all); the records");
-  mustRecord(ctx, kCall, turnAt(1));
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost);
+  ctx.Kafka.LoseAcks(kHTopic, 1);
+  hMustRecord(ctx, kHCall, hTurnAt(0));
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "one turn whose acknowledgement was lost: the producer's retry wrote the turn twice. Set enable.idempotence (with acks=all); the records");
+  hMustRecord(ctx, kHCall, hTurnAt(1));
+  const int lost = ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost);
   // The broker refuses the next turn: the caller must hear about it, not lose the turn silently.
-  ctx.Kafka.FailNext(kTopic, 1);
+  ctx.Kafka.FailNext(kHTopic, 1);
   bool threw = false;
   try {
-    record_turn(kCall, turnAt(2));
+    record_turn(kHCall, hTurnAt(2));
   } catch (const std::exception&) {
     threw = true;
   }
@@ -1269,10 +1269,10 @@ void CheckIdempotentProducer(harness::Ctx& ctx) {
 }
 
 void CheckPersistBeforeCommit(harness::Ctx& ctx) {
-  seedTurn(ctx, 0, transcripts::redact("vs-1", 0, kSpoken));
+  hSeedTurn(ctx, 0, transcripts::redact("vs-1", 0, kHSpoken));
   // Turn 1's write fails and turn 2 is behind it: turn 1's offset must stay uncommitted, so it is redelivered.
-  seedTurn(ctx, 1, "voice:redacted:vs-1:missing");
-  seedTurn(ctx, 2, transcripts::redact("vs-1", 2, kSpoken));
+  hSeedTurn(ctx, 1, "voice:redacted:vs-1:missing");
+  hSeedTurn(ctx, 2, transcripts::redact("vs-1", 2, kHSpoken));
   std::vector<long long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.Exists("voice:turn:vs-1:0")); });
   ctx.Drain([] {
@@ -1284,9 +1284,9 @@ void CheckPersistBeforeCommit(harness::Ctx& ctx) {
   });
   ctx.Assert(!atCommit.empty(), "the transcript consumer never committed an offset");
   ctx.Equal(atCommit[0], 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn; the row at the commit");
-  ctx.Equal(ctx.Kafka.Lag(kGroup, kTopic), 2, "turn 0 was stored and insertTurn failed for turn 1: the commit must cover turn 0 (else a restart redelivers it) and nothing at or past turn 1 (else the turn is lost); turns 1 and 2 uncommitted, the lag");
+  ctx.Equal(ctx.Kafka.Lag(kHGroup, kHTopic), 2, "turn 0 was stored and insertTurn failed for turn 1: the commit must cover turn 0 (else a restart redelivers it) and nothing at or past turn 1 (else the turn is lost); turns 1 and 2 uncommitted, the lag");
   const auto stored = transcripts::listTurns("vs-1", -1, 10);
-  ctx.Assert(stored.size() == 1 && stored[0].text == kRedacted, "the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds %d turn(s)", stored.size());
+  ctx.Assert(stored.size() == 1 && stored[0].text == kHRedacted, "the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds %d turn(s)", stored.size());
 }
 `,
   },

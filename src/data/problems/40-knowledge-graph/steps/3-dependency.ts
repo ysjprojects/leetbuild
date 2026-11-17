@@ -705,16 +705,16 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
 // resolverPeer scores a pair from scores (0 when unknown) and refuses the pairs in refused ("left/right").
-type resolverPeer struct {
+type HResolverPeer struct {
 	pb.UnimplementedResolverServer
 	scores  map[string]float64
 	refused map[string]bool
 }
 
-func (p *resolverPeer) Score(_ context.Context, req *pb.PairRequest) (*pb.PairScore, error) {
+func (p *HResolverPeer) Score(_ context.Context, req *pb.PairRequest) (*pb.PairScore, error) {
 	pair := req.GetLeft() + "/" + req.GetRight()
 	if p.refused[pair] {
 		return nil, status.Errorf(codes.FailedPrecondition, "do-not-merge rule for %s and %s", req.GetLeft(), req.GetRight())
@@ -722,43 +722,43 @@ func (p *resolverPeer) Score(_ context.Context, req *pb.PairRequest) (*pb.PairSc
 	return &pb.PairScore{Score: p.scores[pair], Model: "er-2026-10"}, nil
 }
 
-type parkedRow struct {
+type HParkedRow struct {
 	Left   string   \`json:"left"\`
 	Right  string   \`json:"right"\`
 	Reason string   \`json:"reason"\`
 	Score  *float64 \`json:"score"\`
 }
 
-func clientWorld(ctx *harness.Ctx) (*resolverPeer, string, string) {
-	peer := &resolverPeer{scores: map[string]float64{}, refused: map[string]bool{}}
+func hClientWorld(ctx *harness.Ctx) (*HResolverPeer, string, string) {
+	peer := &HResolverPeer{scores: map[string]float64{}, refused: map[string]bool{}}
 	pb.RegisterResolverServer(ctx.GRPC.Server(""), peer)
-	left := store.CreateEntity(clientBg, "t1", "person", "Ada Lovelace", []string{"ada"}).ID
-	right := store.CreateEntity(clientBg, "t1", "person", "A. Lovelace", []string{"a. lovelace"}).ID
+	left := store.CreateEntity(hClientBg, "t1", "person", "Ada Lovelace", []string{"ada"}).ID
+	right := store.CreateEntity(hClientBg, "t1", "person", "A. Lovelace", []string{"a. lovelace"}).ID
 	return peer, left, right
 }
 
-func clientResolve(ctx *harness.Ctx, left, right string) string {
-	outcome, err := resolvePair(clientBg, "t1", left, right)
+func hClientResolve(ctx *harness.Ctx, left, right string) string {
+	outcome, err := resolvePair(hClientBg, "t1", left, right)
 	ctx.NoError(err, "resolvePair(t1, %s, %s) failed", left, right)
 	return outcome
 }
 
-func clientParked(ctx *harness.Ctx) []parkedRow {
-	rows := []parkedRow{}
+func hClientParked(ctx *harness.Ctx) []HParkedRow {
+	rows := []HParkedRow{}
 	for _, text := range ctx.Redis.LRange("review:t1", 0, -1) {
-		row := parkedRow{}
+		row := HParkedRow{}
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "a review row must be JSON")
 		rows = append(rows, row)
 	}
 	return rows
 }
 
-func mergedInto(entityID string) string { return store.GetEntity(clientBg, entityID).MergedInto }
+func hMergedInto(entityID string) string { return store.GetEntity(hClientBg, entityID).MergedInto }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peer, left, right := clientWorld(ctx)
+	peer, left, right := hClientWorld(ctx)
 	peer.scores[left+"/"+right] = 0.95
-	ctx.Equal(clientResolve(ctx, left, right), "merged", "a 0.95 score from a healthy resolver")
+	ctx.Equal(hClientResolve(ctx, left, right), "merged", "a 0.95 score from a healthy resolver")
 	calls := ctx.GRPC.CallsTo("Score", "")
 	ctx.Assert(len(calls) > 0, "no Score call was made")
 	for _, call := range calls {
@@ -768,13 +768,13 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckTimeoutParks(ctx *harness.Ctx) {
-	peer, left, right := clientWorld(ctx)
+	peer, left, right := hClientWorld(ctx)
 	peer.scores[left+"/"+right] = 0.95
 	ctx.GRPC.SetLatency("Score", 5.0, "")
-	outcome := clientResolve(ctx, left, right)
-	ctx.Assert(mergedInto(right) == "", "a resolver slower than the 1-second deadline still produced a merge (%s into %s): a timeout decides nothing", right, mergedInto(right))
+	outcome := hClientResolve(ctx, left, right)
+	ctx.Assert(hMergedInto(right) == "", "a resolver slower than the 1-second deadline still produced a merge (%s into %s): a timeout decides nothing", right, hMergedInto(right))
 	ctx.Equal(outcome, "parked", "a resolver that timed out must park the pair (no answer is not a mismatch); the outcome")
-	rows := clientParked(ctx)
+	rows := hClientParked(ctx)
 	ctx.Assert(len(rows) == 1 && rows[0].Left == left && rows[0].Right == right && rows[0].Reason == "unresolved", "the review queue holds %+v, expected the pair with reason unresolved", rows)
 	calls := len(ctx.GRPC.CallsTo("Score", ""))
 	ctx.Assert(calls == 1, "a resolver that timed out was called %d times: one call under the 1-second deadline, no retry loop, or one stalled resolver holds the caller for every attempt", calls)
@@ -783,46 +783,46 @@ func CheckTimeoutParks(ctx *harness.Ctx) {
 	failures := []codes.Code{codes.Unavailable, codes.Internal}
 	names := []string{"unavailable", "internal"}
 	for i, code := range failures {
-		twin := store.CreateEntity(clientBg, "t1", "person", "Ada King", []string{"ada king " + names[i]}).ID
+		twin := store.CreateEntity(hClientBg, "t1", "person", "Ada King", []string{"ada king " + names[i]}).ID
 		peer.scores[left+"/"+twin] = 0.95
 		before := len(ctx.GRPC.CallsTo("Score", ""))
 		ctx.GRPC.Fail("Score", code, "", 1, "")
-		got := clientResolve(ctx, left, twin)
+		got := hClientResolve(ctx, left, twin)
 		made := len(ctx.GRPC.CallsTo("Score", "")) - before
-		ctx.Assert(mergedInto(twin) == "" && got == "parked" && made == 1, "a resolver answering %v gave %q after %d calls and %s is merged into %q: any error other than FAILED_PRECONDITION parks the pair after one call", code, got, made, twin, mergedInto(twin))
-		queue := clientParked(ctx)
+		ctx.Assert(hMergedInto(twin) == "" && got == "parked" && made == 1, "a resolver answering %v gave %q after %d calls and %s is merged into %q: any error other than FAILED_PRECONDITION parks the pair after one call", code, got, made, twin, hMergedInto(twin))
+		queue := hClientParked(ctx)
 		last := queue[len(queue)-1]
 		ctx.Assert(last.Right == twin && last.Reason == "unresolved", "after %v the review queue ends with %+v, expected (%s, %s) with reason unresolved", code, last, left, twin)
 	}
 }
 
 func CheckRejectionTerminal(ctx *harness.Ctx) {
-	peer, left, right := clientWorld(ctx)
+	peer, left, right := hClientWorld(ctx)
 	peer.refused[left+"/"+right] = true
-	outcome := clientResolve(ctx, left, right)
-	ctx.Assert(mergedInto(right) == "", "a pair the resolver refused was merged (%s into %s): FAILED_PRECONDITION is terminal", right, mergedInto(right))
+	outcome := hClientResolve(ctx, left, right)
+	ctx.Assert(hMergedInto(right) == "", "a pair the resolver refused was merged (%s into %s): FAILED_PRECONDITION is terminal", right, hMergedInto(right))
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 1, "a refused pair must be sent to the resolver once (the refusal will not change on a retry); the calls")
 	ctx.Equal(outcome, "rejected", "a refused pair; the outcome")
-	ctx.Equal(len(clientParked(ctx)), 0, "a rejected pair is settled; the review queue rows")
+	ctx.Equal(len(hClientParked(ctx)), 0, "a rejected pair is settled; the review queue rows")
 }
 
 func CheckThresholdMerge(ctx *harness.Ctx) {
-	peer, left, right := clientWorld(ctx)
+	peer, left, right := hClientWorld(ctx)
 	peer.scores[left+"/"+right] = 0.6
-	outcome := clientResolve(ctx, left, right)
-	ctx.Assert(mergedInto(right) == "", "a 0.6 score merged %s into %s: below the 0.9 threshold a pair goes to review", right, mergedInto(right))
+	outcome := hClientResolve(ctx, left, right)
+	ctx.Assert(hMergedInto(right) == "", "a 0.6 score merged %s into %s: below the 0.9 threshold a pair goes to review", right, hMergedInto(right))
 	ctx.Equal(outcome, "parked", "a 0.6 score; the outcome")
-	rows := clientParked(ctx)
+	rows := hClientParked(ctx)
 	ctx.Assert(len(rows) == 1 && rows[0].Reason == "below_threshold" && rows[0].Score != nil && *rows[0].Score == 0.6, "the review queue holds %+v, expected the pair with reason below_threshold and score 0.6", rows)
 	// The threshold itself, on both sides: 0.89 parks, exactly 0.9 merges.
 	peer.scores[left+"/"+right] = 0.89
-	outcome = clientResolve(ctx, left, right)
-	rows = clientParked(ctx)
-	ctx.Assert(outcome == "parked" && mergedInto(right) == "" && len(rows) == 2 && rows[1].Score != nil && *rows[1].Score == 0.89, "a 0.89 score gave %q and the review queue holds %+v: below the 0.9 threshold a pair is parked with its score", outcome, rows)
+	outcome = hClientResolve(ctx, left, right)
+	rows = hClientParked(ctx)
+	ctx.Assert(outcome == "parked" && hMergedInto(right) == "" && len(rows) == 2 && rows[1].Score != nil && *rows[1].Score == 0.89, "a 0.89 score gave %q and the review queue holds %+v: below the 0.9 threshold a pair is parked with its score", outcome, rows)
 	peer.scores[left+"/"+right] = 0.9
-	outcome = clientResolve(ctx, left, right)
-	ctx.Assert(outcome == "merged" && mergedInto(right) == left, "a score of exactly 0.9 gave %q and %s is merged into %q: a score at or above the threshold merges into %s", outcome, right, mergedInto(right), left)
-	ctx.Assert(len(store.GetEntity(clientBg, left).Aliases) == 2, "the merge must move the aliases to %s: %+v", left, store.GetEntity(clientBg, left))
+	outcome = hClientResolve(ctx, left, right)
+	ctx.Assert(outcome == "merged" && hMergedInto(right) == left, "a score of exactly 0.9 gave %q and %s is merged into %q: a score at or above the threshold merges into %s", outcome, right, hMergedInto(right), left)
+	ctx.Assert(len(store.GetEntity(hClientBg, left).Aliases) == 2, "the merge must move the aliases to %s: %+v", left, store.GetEntity(hClientBg, left))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -838,7 +838,7 @@ func CheckThresholdMerge(ctx *harness.Ctx) {
 namespace {
 
 // Scores a pair from scores (0 when unknown); refuses the pairs in refused ("left/right").
-class ResolverPeer final : public graph::Resolver::Service {
+class HResolverPeer final : public graph::Resolver::Service {
  public:
   std::map<std::string, double> scores;
   std::set<std::string> refused;
@@ -851,35 +851,35 @@ class ResolverPeer final : public graph::Resolver::Service {
   }
 };
 
-struct World {
-  ResolverPeer& peer;
+struct HWorld {
+  HResolverPeer& peer;
   std::string left;
   std::string right;
   std::string pair() const { return left + "/" + right; }
 };
 
-World clientWorld(harness::Ctx& ctx) {
-  static ResolverPeer* peer = nullptr;
+HWorld hClientWorld(harness::Ctx& ctx) {
+  static HResolverPeer* peer = nullptr;
   delete peer;
-  peer = new ResolverPeer;
+  peer = new HResolverPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   const std::string left = store::createEntity("t1", "person", "Ada Lovelace", {"ada"}).id;
   const std::string right = store::createEntity("t1", "person", "A. Lovelace", {"a. lovelace"}).id;
-  return World{*peer, left, right};
+  return HWorld{*peer, left, right};
 }
 
-std::vector<nlohmann::json> clientParked(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hClientParked(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("review:t1", 0, -1)) rows.push_back(nlohmann::json::parse(text, nullptr, false));
   return rows;
 }
 
-std::string mergedInto(const std::string& entity_id) { return store::getEntity(entity_id)->merged_into; }
+std::string hMergedInto(const std::string& entity_id) { return store::getEntity(entity_id)->merged_into; }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  World w = clientWorld(ctx);
+  HWorld w = hClientWorld(ctx);
   w.peer.scores[w.pair()] = 0.95;
   ctx.Equal(resolvePair("t1", w.left, w.right), "merged", "a 0.95 score from a healthy resolver");
   const auto calls = ctx.GRPC.CallsTo("Score");
@@ -891,13 +891,13 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckTimeoutParks(harness::Ctx& ctx) {
-  World w = clientWorld(ctx);
+  HWorld w = hClientWorld(ctx);
   w.peer.scores[w.pair()] = 0.95;
   ctx.GRPC.SetLatency("Score", 5.0);
   const std::string outcome = resolvePair("t1", w.left, w.right);
-  ctx.Assert(mergedInto(w.right).empty(), "a resolver slower than the 1-second deadline still produced a merge (%s into %s): a timeout decides nothing", w.right, mergedInto(w.right));
+  ctx.Assert(hMergedInto(w.right).empty(), "a resolver slower than the 1-second deadline still produced a merge (%s into %s): a timeout decides nothing", w.right, hMergedInto(w.right));
   ctx.Equal(outcome, "parked", "a resolver that timed out must park the pair (no answer is not a mismatch); the outcome");
-  const auto rows = clientParked(ctx);
+  const auto rows = hClientParked(ctx);
   ctx.Assert(rows.size() == 1 && rows[0].value("left", "") == w.left && rows[0].value("right", "") == w.right && rows[0].value("reason", "") == "unresolved",
              "the review queue holds %d rows (%s), expected the pair with reason unresolved", rows.size(), rows.empty() ? "" : rows[0].dump());
   const size_t calls = ctx.GRPC.CallsTo("Score").size();
@@ -912,40 +912,40 @@ void CheckTimeoutParks(harness::Ctx& ctx) {
     ctx.GRPC.Fail("Score", code);
     const std::string got = resolvePair("t1", w.left, twin);
     const size_t made = ctx.GRPC.CallsTo("Score").size() - before;
-    ctx.Assert(mergedInto(twin).empty() && got == "parked" && made == 1, "a resolver answering %s gave %q after %d calls and %s is merged into %q: any error other than FAILED_PRECONDITION parks the pair after one call", name, got, made, twin, mergedInto(twin));
-    const auto queue = clientParked(ctx);
+    ctx.Assert(hMergedInto(twin).empty() && got == "parked" && made == 1, "a resolver answering %s gave %q after %d calls and %s is merged into %q: any error other than FAILED_PRECONDITION parks the pair after one call", name, got, made, twin, hMergedInto(twin));
+    const auto queue = hClientParked(ctx);
     ctx.Assert(!queue.empty() && queue.back().value("right", "") == twin && queue.back().value("reason", "") == "unresolved", "after %s the review queue ends with %s, expected (%s, %s) with reason unresolved", name, queue.empty() ? "" : queue.back().dump(), w.left, twin);
   }
 }
 
 void CheckRejectionTerminal(harness::Ctx& ctx) {
-  World w = clientWorld(ctx);
+  HWorld w = hClientWorld(ctx);
   w.peer.refused.insert(w.pair());
   const std::string outcome = resolvePair("t1", w.left, w.right);
-  ctx.Assert(mergedInto(w.right).empty(), "a pair the resolver refused was merged (%s into %s): FAILED_PRECONDITION is terminal", w.right, mergedInto(w.right));
+  ctx.Assert(hMergedInto(w.right).empty(), "a pair the resolver refused was merged (%s into %s): FAILED_PRECONDITION is terminal", w.right, hMergedInto(w.right));
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 1, "a refused pair must be sent to the resolver once (the refusal will not change on a retry); the calls");
   ctx.Equal(outcome, "rejected", "a refused pair; the outcome");
-  ctx.Equal(clientParked(ctx).size(), 0, "a rejected pair is settled; the review queue rows");
+  ctx.Equal(hClientParked(ctx).size(), 0, "a rejected pair is settled; the review queue rows");
 }
 
 void CheckThresholdMerge(harness::Ctx& ctx) {
-  World w = clientWorld(ctx);
+  HWorld w = hClientWorld(ctx);
   w.peer.scores[w.pair()] = 0.6;
   std::string outcome = resolvePair("t1", w.left, w.right);
-  ctx.Assert(mergedInto(w.right).empty(), "a 0.6 score merged %s into %s: below kMergeThreshold (0.9) a pair goes to review", w.right, mergedInto(w.right));
+  ctx.Assert(hMergedInto(w.right).empty(), "a 0.6 score merged %s into %s: below kMergeThreshold (0.9) a pair goes to review", w.right, hMergedInto(w.right));
   ctx.Equal(outcome, "parked", "a 0.6 score; the outcome");
-  const auto rows = clientParked(ctx);
+  const auto rows = hClientParked(ctx);
   ctx.Assert(rows.size() == 1 && rows[0].value("reason", "") == "below_threshold" && rows[0].contains("score") && rows[0]["score"].is_number() && rows[0]["score"].get<double>() == 0.6,
              "the review queue holds %d rows (%s), expected the pair with reason below_threshold and score 0.6", rows.size(), rows.empty() ? "" : rows[0].dump());
   // The threshold itself, on both sides: 0.89 parks, exactly 0.9 merges.
   w.peer.scores[w.pair()] = 0.89;
   outcome = resolvePair("t1", w.left, w.right);
-  const auto after = clientParked(ctx);
-  ctx.Assert(outcome == "parked" && mergedInto(w.right).empty() && after.size() == 2 && after[1].contains("score") && after[1]["score"].is_number() && after[1]["score"].get<double>() == 0.89,
+  const auto after = hClientParked(ctx);
+  ctx.Assert(outcome == "parked" && hMergedInto(w.right).empty() && after.size() == 2 && after[1].contains("score") && after[1]["score"].is_number() && after[1]["score"].get<double>() == 0.89,
              "a 0.89 score gave %q and the review queue holds %d rows (last %s): below kMergeThreshold (0.9) a pair is parked with its score", outcome, after.size(), after.empty() ? "" : after.back().dump());
   w.peer.scores[w.pair()] = 0.9;
   outcome = resolvePair("t1", w.left, w.right);
-  ctx.Assert(outcome == "merged" && mergedInto(w.right) == w.left, "a score of exactly 0.9 gave %q and %s is merged into %q: a score at or above kMergeThreshold merges into %s", outcome, w.right, mergedInto(w.right), w.left);
+  ctx.Assert(outcome == "merged" && hMergedInto(w.right) == w.left, "a score of exactly 0.9 gave %q and %s is merged into %q: a score at or above kMergeThreshold merges into %s", outcome, w.right, hMergedInto(w.right), w.left);
   ctx.Equal(store::getEntity(w.left)->aliases.size(), 2, "the merge must move the aliases to %s; its alias count", w.left);
 }
 `,

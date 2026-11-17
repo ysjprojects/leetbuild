@@ -676,35 +676,35 @@ import (
 )
 
 const (
-	readDay   = 86_400
-	readLarge = "vision-large-3.1.0"
+	kHReadDay   = 86_400
+	kHReadLarge = "vision-large-3.1.0"
 )
 
-func readRow(ctx *harness.Ctx, inferenceID, tenant, status string, ageSeconds int64) {
+func hReadRow(ctx *harness.Ctx, inferenceID, tenant, status string, ageSeconds int64) {
 	row := map[string]any{"inference_id": inferenceID, "tenant": tenant, "status": status, "task": "classify", "image": "tenants/" + tenant + "/images/cat.jpg", "content_hash": "9f2c41aa", "created_at": ctx.Clock.Now()/1000 - ageSeconds}
 	if status == "complete" {
 		row["label"] = "tabby_cat"
 		row["confidence"] = 0.92
-		row["model_version"] = readLarge
+		row["model_version"] = kHReadLarge
 		row["downgraded"] = false
 	}
 	doc, _ := json.Marshal(row)
 	ctx.Redis.Set("vision:inference:"+inferenceID, string(doc))
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hReadBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
-func readKeys(m map[string]any) []string {
+func hReadKeys(m map[string]any) []string {
 	keys := make([]string, 0, len(m))
 	for key := range m {
 		keys = append(keys, key)
@@ -714,21 +714,21 @@ func readKeys(m map[string]any) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readRow(ctx, "inf-1", "t1", "complete", 0)
-	c := readClient(ctx)
+	hReadRow(ctx, "inf-1", "t1", "complete", 0)
+	c := hReadClient(ctx)
 	r := c.Get("/v1/inferences/inf-1", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "the tenant's own complete inference (%s)", r.Text())
-	body := readBody(ctx, r)
-	ctx.Assert(body["label"] == "tabby_cat" && body["confidence"] == 0.92 && body["model_version"] == readLarge && body["downgraded"] == false, "the 200 carries label, confidence, model_version and downgraded: %s", r.Text())
+	body := hReadBody(ctx, r)
+	ctx.Assert(body["label"] == "tabby_cat" && body["confidence"] == 0.92 && body["model_version"] == kHReadLarge && body["downgraded"] == false, "the 200 carries label, confidence, model_version and downgraded: %s", r.Text())
 	ctx.Equal(c.Get("/v1/inferences/inf-1").Status, 401, "without X-Tenant-Id the read")
 	ctx.Equal(c.Get("/v1/inferences/inf-missing", "X-Tenant-Id", "t1").Status, 404, "an unknown id")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	readRow(ctx, "inf-t2", "t2", "complete", 0)
-	readRow(ctx, "inf-t2-pending", "t2", "pending", 0)
-	readRow(ctx, "inf-t2-old", "t2", "complete", 31*readDay)
-	c := readClient(ctx)
+	hReadRow(ctx, "inf-t2", "t2", "complete", 0)
+	hReadRow(ctx, "inf-t2-pending", "t2", "pending", 0)
+	hReadRow(ctx, "inf-t2-old", "t2", "complete", 31*kHReadDay)
+	c := hReadClient(ctx)
 	r := c.Get("/v1/inferences/inf-t2", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 404, "tenant t1 read t2's inference (%s): another tenant's id must be 404, like an id that does not exist", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "tabby_cat"), "the refusal leaks t2's prediction: %s", r.Text())
@@ -743,35 +743,35 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckPending202(ctx *harness.Ctx) {
-	readRow(ctx, "inf-1", "t1", "pending", 0)
-	c := readClient(ctx)
+	hReadRow(ctx, "inf-1", "t1", "pending", 0)
+	c := hReadClient(ctx)
 	r := c.Get("/v1/inferences/inf-1", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 202, "an inference the worker has not finished (a 200 with a null label is cached as the answer)")
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	ctx.Assert(body["status"] == "pending" && body["inference_id"] == "inf-1", "the 202 says which inference and that it is pending: %s", r.Text())
-	ctx.Equal(readKeys(body), []string{"inference_id", "status"}, "a pending inference is {inference_id, status} and nothing more; the 202's fields")
-	readRow(ctx, "inf-1", "t1", "complete", 0)
+	ctx.Equal(hReadKeys(body), []string{"inference_id", "status"}, "a pending inference is {inference_id, status} and nothing more; the 202's fields")
+	hReadRow(ctx, "inf-1", "t1", "complete", 0)
 	r = c.Get("/v1/inferences/inf-1", "X-Tenant-Id", "t1")
-	ctx.Assert(r.Status == 200 && readBody(ctx, r)["label"] == "tabby_cat", "once complete the same id answers 200 with the label, got %d: %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hReadBody(ctx, r)["label"] == "tabby_cat", "once complete the same id answers 200 with the label, got %d: %s", r.Status, r.Text())
 }
 
 func CheckResultExpiry(ctx *harness.Ctx) {
-	readRow(ctx, "inf-old", "t1", "complete", 31*readDay)
-	readRow(ctx, "inf-recent", "t1", "complete", 29*readDay)
-	readRow(ctx, "inf-edge-old", "t1", "complete", 30*readDay+60)
-	readRow(ctx, "inf-edge-recent", "t1", "complete", 30*readDay-60)
-	c := readClient(ctx)
+	hReadRow(ctx, "inf-old", "t1", "complete", 31*kHReadDay)
+	hReadRow(ctx, "inf-recent", "t1", "complete", 29*kHReadDay)
+	hReadRow(ctx, "inf-edge-old", "t1", "complete", 30*kHReadDay+60)
+	hReadRow(ctx, "inf-edge-recent", "t1", "complete", 30*kHReadDay-60)
+	c := hReadClient(ctx)
 	r := c.Get("/v1/inferences/inf-old", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 410, "a 31-day-old result: results are kept for ResultTTLSeconds (30 days)")
-	body := readBody(ctx, r)
+	body := hReadBody(ctx, r)
 	_, hasConfidence := body["confidence"]
 	ctx.Assert(!strings.Contains(r.Text(), "tabby_cat") && !hasConfidence, "an expired result must not carry the label or the confidence: %s", r.Text())
 	ctx.Assert(body["status"] == "expired" && body["inference_id"] == "inf-old", "the 410 names the inference and says expired: %s", r.Text())
 	metadata, _ := body["metadata"].(map[string]any)
-	ctx.Assert(metadata["task"] == "classify" && metadata["content_hash"] == "9f2c41aa" && metadata["model_version"] == readLarge, "the 410 metadata must keep task, content_hash and model_version, got %v", metadata)
+	ctx.Assert(metadata["task"] == "classify" && metadata["content_hash"] == "9f2c41aa" && metadata["model_version"] == kHReadLarge, "the 410 metadata must keep task, content_hash and model_version, got %v", metadata)
 	_, hasCreated := metadata["created_at"].(float64)
 	ctx.Assert(hasCreated, "the 410 metadata keeps created_at: %v", metadata)
-	ctx.Equal(readKeys(metadata), []string{"content_hash", "created_at", "model_version", "task"}, "the 410 metadata is task, content_hash, model_version and created_at and nothing more; its fields")
+	ctx.Equal(hReadKeys(metadata), []string{"content_hash", "created_at", "model_version", "task"}, "the 410 metadata is task, content_hash, model_version and created_at and nothing more; its fields")
 	ctx.Equal(c.Get("/v1/inferences/inf-recent", "X-Tenant-Id", "t1").Status, 200, "a 29-day-old result is still inside the window")
 	ctx.Equal(c.Get("/v1/inferences/inf-edge-old", "X-Tenant-Id", "t1").Status, 410, "a result 30 days and one minute old: the window is ResultTTLSeconds seconds, not whole days")
 	ctx.Equal(c.Get("/v1/inferences/inf-edge-recent", "X-Tenant-Id", "t1").Status, 200, "a result one minute short of 30 days is still inside ResultTTLSeconds")
@@ -788,42 +788,42 @@ namespace {
 
 using json = nlohmann::json;
 
-constexpr long long kDay = 86400;
-const std::string kLarge = "vision-large-3.1.0";
+constexpr long long kHDay = 86400;
+const std::string kHLarge = "vision-large-3.1.0";
 
-void readRow(harness::Ctx& ctx, const std::string& inference_id, const std::string& tenant = "t1", const std::string& status = "complete", long long age_seconds = 0) {
+void hReadRow(harness::Ctx& ctx, const std::string& inference_id, const std::string& tenant = "t1", const std::string& status = "complete", long long age_seconds = 0) {
   json row = {{"inference_id", inference_id}, {"tenant", tenant}, {"status", status}, {"task", "classify"}, {"image", "tenants/" + tenant + "/images/cat.jpg"}, {"content_hash", "9f2c41aa"}, {"created_at", ctx.Clock.Now() / 1000 - age_seconds}};
   if (status == "complete") {
     row["label"] = "tabby_cat";
     row["confidence"] = 0.92;
-    row["model_version"] = kLarge;
+    row["model_version"] = kHLarge;
     row["downgraded"] = false;
   }
   ctx.Redis.Set("vision:inference:" + inference_id, row.dump());
 }
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
   harness::Response read(const std::string& inference_id, const std::string& tenant = "t1") {
     return http.Get("/v1/inferences/" + inference_id, "X-Tenant-Id", tenant);
   }
 };
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
 }
 
-std::vector<std::string> keysOf(const json& object) {
+std::vector<std::string> hKeysOf(const json& object) {
   std::vector<std::string> keys;
   for (const auto& [key, value] : object.items()) keys.push_back(key);
   return keys;  // nlohmann::json keeps an object's keys sorted
 }
 
-std::string withId(std::string text, const std::string& id) {
+std::string hWithId(std::string text, const std::string& id) {
   for (auto at = text.find(id); at != std::string::npos; at = text.find(id, at)) text.replace(at, id.size(), "{id}");
   return text;
 }
@@ -831,27 +831,27 @@ std::string withId(std::string text, const std::string& id) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  readRow(ctx, "inf-1");
-  Api api(ctx);
+  hReadRow(ctx, "inf-1");
+  HApi api(ctx);
   const auto r = api.read("inf-1");
   ctx.Equal(r.Status, 200, "the tenant's own complete inference (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
-  ctx.Assert(body.value("label", "") == "tabby_cat" && body.value("confidence", 0.0) == 0.92 && body.value("model_version", "") == kLarge && body.contains("downgraded") && body["downgraded"] == false,
+  const json body = hBodyOf(ctx, r);
+  ctx.Assert(body.value("label", "") == "tabby_cat" && body.value("confidence", 0.0) == 0.92 && body.value("model_version", "") == kHLarge && body.contains("downgraded") && body["downgraded"] == false,
              "the 200 carries label, confidence, model_version and downgraded: %s", r.Text());
   ctx.Equal(api.http.Get("/v1/inferences/inf-1").Status, 401, "without X-Tenant-Id the read");
   ctx.Equal(api.read("inf-missing").Status, 404, "an unknown id");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  readRow(ctx, "inf-t2", "t2");
-  readRow(ctx, "inf-t2-pending", "t2", "pending");
-  readRow(ctx, "inf-t2-old", "t2", "complete", 31 * kDay);
-  Api api(ctx);
+  hReadRow(ctx, "inf-t2", "t2");
+  hReadRow(ctx, "inf-t2-pending", "t2", "pending");
+  hReadRow(ctx, "inf-t2-old", "t2", "complete", 31 * kHDay);
+  HApi api(ctx);
   const auto r = api.read("inf-t2", "t1");
   ctx.Equal(r.Status, 404, "tenant t1 read t2's inference (%s): another tenant's id must be 404, like an id that does not exist", r.Text());
   ctx.Assert(r.Text().find("tabby_cat") == std::string::npos, "the refusal leaks t2's prediction: %s", r.Text());
   ctx.Equal(api.read("inf-t2", "t2").Status, 200, "t2 reads its own inference");
-  ctx.Equal(withId(api.read("inf-t2", "t1").Text(), "inf-t2"), withId(api.read("inf-t9", "t1").Text(), "inf-t9"), "another tenant's id must answer exactly like an id that does not exist; the bodies");
+  ctx.Equal(hWithId(api.read("inf-t2", "t1").Text(), "inf-t2"), hWithId(api.read("inf-t9", "t1").Text(), "inf-t9"), "another tenant's id must answer exactly like an id that does not exist; the bodies");
   for (const char* id : {"inf-t2-pending", "inf-t2-old"}) {
     const auto foreign = api.read(id, "t1");
     ctx.Equal(foreign.Status, 404, "tenant t1 read t2's %s (%s): the tenant is compared before the status or the age says anything", id, foreign.Text());
@@ -859,34 +859,34 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckPending202(harness::Ctx& ctx) {
-  readRow(ctx, "inf-1", "t1", "pending");
-  Api api(ctx);
+  hReadRow(ctx, "inf-1", "t1", "pending");
+  HApi api(ctx);
   auto r = api.read("inf-1");
   ctx.Equal(r.Status, 202, "an inference the worker has not finished (a 200 with a null label is cached as the answer)");
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Assert(body.value("status", "") == "pending" && body.value("inference_id", "") == "inf-1", "the 202 says which inference and that it is pending: %s", r.Text());
-  ctx.Equal(keysOf(body), std::vector<std::string>{"inference_id", "status"}, "a pending inference is {inference_id, status} and nothing more; the 202's fields");
-  readRow(ctx, "inf-1");
+  ctx.Equal(hKeysOf(body), std::vector<std::string>{"inference_id", "status"}, "a pending inference is {inference_id, status} and nothing more; the 202's fields");
+  hReadRow(ctx, "inf-1");
   r = api.read("inf-1");
-  ctx.Assert(r.Status == 200 && bodyOf(ctx, r).value("label", "") == "tabby_cat", "once complete the same id answers 200 with the label, got %d: %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hBodyOf(ctx, r).value("label", "") == "tabby_cat", "once complete the same id answers 200 with the label, got %d: %s", r.Status, r.Text());
 }
 
 void CheckResultExpiry(harness::Ctx& ctx) {
-  readRow(ctx, "inf-old", "t1", "complete", 31 * kDay);
-  readRow(ctx, "inf-recent", "t1", "complete", 29 * kDay);
-  readRow(ctx, "inf-edge-old", "t1", "complete", 30 * kDay + 60);
-  readRow(ctx, "inf-edge-recent", "t1", "complete", 30 * kDay - 60);
-  Api api(ctx);
+  hReadRow(ctx, "inf-old", "t1", "complete", 31 * kHDay);
+  hReadRow(ctx, "inf-recent", "t1", "complete", 29 * kHDay);
+  hReadRow(ctx, "inf-edge-old", "t1", "complete", 30 * kHDay + 60);
+  hReadRow(ctx, "inf-edge-recent", "t1", "complete", 30 * kHDay - 60);
+  HApi api(ctx);
   const auto r = api.read("inf-old");
   ctx.Equal(r.Status, 410, "a 31-day-old result: results are kept for kResultTtlSeconds (30 days)");
-  const json body = bodyOf(ctx, r);
+  const json body = hBodyOf(ctx, r);
   ctx.Assert(r.Text().find("tabby_cat") == std::string::npos && !body.contains("confidence"), "an expired result must not carry the label or the confidence: %s", r.Text());
   ctx.Assert(body.value("status", "") == "expired" && body.value("inference_id", "") == "inf-old", "the 410 names the inference and says expired: %s", r.Text());
   const json metadata = body.contains("metadata") && body["metadata"].is_object() ? body["metadata"] : json::object();
-  ctx.Assert(metadata.value("task", "") == "classify" && metadata.value("content_hash", "") == "9f2c41aa" && metadata.value("model_version", "") == kLarge,
+  ctx.Assert(metadata.value("task", "") == "classify" && metadata.value("content_hash", "") == "9f2c41aa" && metadata.value("model_version", "") == kHLarge,
              "the 410 metadata must keep task, content_hash and model_version, got %s", metadata.dump());
   ctx.Assert(metadata.contains("created_at") && metadata["created_at"].is_number_integer(), "the 410 metadata keeps created_at: %s", metadata.dump());
-  ctx.Equal(keysOf(metadata), std::vector<std::string>{"content_hash", "created_at", "model_version", "task"}, "the 410 metadata is task, content_hash, model_version and created_at and nothing more; its fields");
+  ctx.Equal(hKeysOf(metadata), std::vector<std::string>{"content_hash", "created_at", "model_version", "task"}, "the 410 metadata is task, content_hash, model_version and created_at and nothing more; its fields");
   ctx.Equal(api.read("inf-recent").Status, 200, "a 29-day-old result is still inside the window");
   ctx.Equal(api.read("inf-edge-old").Status, 410, "a result 30 days and one minute old: the window is kResultTtlSeconds seconds, not whole days");
   ctx.Equal(api.read("inf-edge-recent").Status, 200, "a result one minute short of 30 days is still inside kResultTtlSeconds");

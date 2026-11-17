@@ -799,18 +799,18 @@ import (
 )
 
 const (
-	clientText = "Mail ada@example.com, SSN 123-45-6789."
-	clientName = "Ada Lovelace"
+	kHClientText = "Mail ada@example.com, SSN 123-45-6789."
+	kHClientName = "Ada Lovelace"
 )
 
 // clientPeer is the NER model's stand-in: pattern types by their patterns, PERSON for one known
 // name; failing with code when it is not OK.
-type clientPeer struct {
+type HClientPeer struct {
 	pb.UnimplementedDetectorServer
 	code codes.Code
 }
 
-func (p *clientPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
+func (p *HClientPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
 	if p.code != codes.OK {
 		return nil, status.Error(p.code, "the detector is failing")
 	}
@@ -818,26 +818,26 @@ func (p *clientPeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.Detec
 	for _, s := range spans.Scan(req.GetText(), req.GetEntities()) {
 		found = append(found, &pb.EntitySpan{Start: int32(s.Start), End: int32(s.End), Entity: s.Entity})
 	}
-	if at := strings.Index(req.GetText(), clientName); at >= 0 && slices.Contains(req.GetEntities(), "PERSON") {
-		found = append(found, &pb.EntitySpan{Start: int32(at), End: int32(at + len(clientName)), Entity: "PERSON"})
+	if at := strings.Index(req.GetText(), kHClientName); at >= 0 && slices.Contains(req.GetEntities(), "PERSON") {
+		found = append(found, &pb.EntitySpan{Start: int32(at), End: int32(at + len(kHClientName)), Entity: "PERSON"})
 	}
 	sort.Slice(found, func(i, j int) bool { return found[i].Start < found[j].Start })
 	return &pb.DetectResponse{Spans: found, ModelVersion: "ner-2026.10"}, nil
 }
 
-func clientServe(ctx *harness.Ctx) *clientPeer {
-	peer := &clientPeer{}
+func hClientServe(ctx *harness.Ctx) *HClientPeer {
+	peer := &HClientPeer{}
 	pb.RegisterDetectorServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func clientDetect(ctx *harness.Ctx, text string, entities ...string) spans.Detection {
+func hClientDetect(ctx *harness.Ctx, text string, entities ...string) spans.Detection {
 	detection, err := detect(context.Background(), text, entities)
 	ctx.NoError(err, "detect(%v)", entities)
 	return detection
 }
 
-func clientFound(detection spans.Detection, text string) []string {
+func hClientFound(detection spans.Detection, text string) []string {
 	out := []string{}
 	for _, s := range detection.Spans {
 		out = append(out, text[s.Start:s.End]+" "+s.Entity)
@@ -846,75 +846,75 @@ func clientFound(detection spans.Detection, text string) []string {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientServe(ctx)
-	clientDetect(ctx, clientText, "EMAIL")
+	hClientServe(ctx)
+	hClientDetect(ctx, kHClientText, "EMAIL")
 	ctx.GRPC.SetLatency("Detect", 5.0, "")
-	detection := clientDetect(ctx, clientText, "EMAIL")
+	detection := hClientDetect(ctx, kHClientText, "EMAIL")
 	calls := ctx.GRPC.CallsTo("Detect", "")
 	ctx.Assert(len(calls) > 0, "detect made no Detect call")
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "a Detect call carries no deadline: a detector answering in 5 s holds the request for 5 s")
 		ctx.Assert(500*time.Millisecond <= call.Timeout && call.Timeout <= 700*time.Millisecond, "a Detect call carries a %v deadline, expected 600ms", call.Timeout)
 	}
-	ctx.Equal(clientFound(detection, clientText), []string{"ada@example.com EMAIL"}, "after the deadlines the fallback must still redact the email")
+	ctx.Equal(hClientFound(detection, kHClientText), []string{"ada@example.com EMAIL"}, "after the deadlines the fallback must still redact the email")
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	peer := clientServe(ctx)
+	peer := hClientServe(ctx)
 	peer.code = codes.Unavailable
-	detect(context.Background(), clientText, []string{"EMAIL"})
+	detect(context.Background(), kHClientText, []string{"EMAIL"})
 	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", "")), 2, "with the detector UNAVAILABLE, detect must make MAX_ATTEMPTS = 2 attempts (every extra one is load on a detector that is already down); attempts")
 	peer.code = codes.InvalidArgument
-	detect(context.Background(), clientText, []string{"EMAIL"})
+	detect(context.Background(), kHClientText, []string{"EMAIL"})
 	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", ""))-2, 1, "an INVALID_ARGUMENT means the request itself was refused, and a second attempt fails the same way; attempts")
 	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.ResourceExhausted, codes.Unauthenticated} {
 		peer.code = code
 		before := len(ctx.GRPC.CallsTo("Detect", ""))
-		detect(context.Background(), clientText, []string{"EMAIL"})
+		detect(context.Background(), kHClientText, []string{"EMAIL"})
 		ctx.Equal(len(ctx.GRPC.CallsTo("Detect", ""))-before, 1, "the code %v was retried: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a second attempt; attempts", code)
 	}
 	peer.code = codes.DeadlineExceeded
 	before := len(ctx.GRPC.CallsTo("Detect", ""))
-	detect(context.Background(), clientText, []string{"EMAIL"})
+	detect(context.Background(), kHClientText, []string{"EMAIL"})
 	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", ""))-before, 2, "with the detector answering DEADLINE_EXCEEDED, detect must make MAX_ATTEMPTS = 2 attempts: a deadline is transient and earns the second attempt; attempts")
 }
 
 func CheckDegradedMarker(ctx *harness.Ctx) {
-	peer := clientServe(ctx)
+	peer := hClientServe(ctx)
 	peer.code = codes.Unavailable
-	detection := clientDetect(ctx, clientText, "EMAIL", "SSN")
-	ctx.Equal(clientFound(detection, clientText), []string{"ada@example.com EMAIL", "123-45-6789 SSN"}, "the fallback must redact the email and the SSN")
+	detection := hClientDetect(ctx, kHClientText, "EMAIL", "SSN")
+	ctx.Equal(hClientFound(detection, kHClientText), []string{"ada@example.com EMAIL", "123-45-6789 SSN"}, "the fallback must redact the email and the SSN")
 	ctx.Assert(detection.Source == "regex" && detection.Degraded, "a regex answer must say so (source regex, degraded), got source=%q degraded=%t", detection.Source, detection.Degraded)
 	ctx.Equal(detection.DetectorVersion, spans.PatternsVersion, "a regex answer reports the patterns' version")
 	peer.code = codes.OK
-	detection = clientDetect(ctx, clientText, "EMAIL", "SSN")
+	detection = hClientDetect(ctx, kHClientText, "EMAIL", "SSN")
 	ctx.Assert(detection.Source == "model" && !detection.Degraded && detection.DetectorVersion == "ner-2026.10", "the model's answer is source model, not degraded, version ner-2026.10; got %+v", detection)
 }
 
 func CheckSizeIndependent(ctx *harness.Ctx) {
-	peer := clientServe(ctx)
+	peer := hClientServe(ctx)
 	peer.code = codes.Unavailable
 	// an email across the 10 KiB mark, where the starter stopped scanning, and one at the end of about 200 KiB
 	head := strings.Repeat("lorem ipsum dolor sit amet ", 400)[:10*1024-6]
 	text := head + " ada@example.com " + strings.Repeat("lorem ipsum dolor sit amet ", 7000) + "Write to bob@example.org."
-	detection := clientDetect(ctx, text, "EMAIL")
-	ctx.Equal(clientFound(detection, text), []string{"ada@example.com EMAIL", "bob@example.org EMAIL"}, "a %d-character text: the fallback must scan the whole text, whatever its size; the spans", len(text))
+	detection := hClientDetect(ctx, text, "EMAIL")
+	ctx.Equal(hClientFound(detection, text), []string{"ada@example.com EMAIL", "bob@example.org EMAIL"}, "a %d-character text: the fallback must scan the whole text, whatever its size; the spans", len(text))
 }
 
 func CheckUncoveredFailsClosed(ctx *harness.Ctx) {
-	peer := clientServe(ctx)
+	peer := hClientServe(ctx)
 	peer.code = codes.Unavailable
-	text := clientName + ", ada@example.com"
+	text := kHClientName + ", ada@example.com"
 	detection, err := detect(context.Background(), text, []string{"EMAIL", "PERSON"})
-	ctx.Assert(err != nil, "with the detector down, a PERSON request answered %v: no pattern covers PERSON, so the name went back in place. Return spans.ErrDetectorUnavailable", clientFound(detection, text))
+	ctx.Assert(err != nil, "with the detector down, a PERSON request answered %v: no pattern covers PERSON, so the name went back in place. Return spans.ErrDetectorUnavailable", hClientFound(detection, text))
 	ctx.Assert(errors.Is(err, spans.ErrDetectorUnavailable), "detect returned %v, expected an error wrapping spans.ErrDetectorUnavailable", err)
 	for _, entities := range [][]string{{"LOCATION"}, {"EMAIL", "ORGANIZATION"}} {
 		detection, err := detect(context.Background(), text, entities)
-		ctx.Assert(errors.Is(err, spans.ErrDetectorUnavailable), "with the detector down, a request for %v answered %v (error %v): no pattern covers %s. Every type without a pattern fails closed, not only PERSON", entities, clientFound(detection, text), err, entities[len(entities)-1])
+		ctx.Assert(errors.Is(err, spans.ErrDetectorUnavailable), "with the detector down, a request for %v answered %v (error %v): no pattern covers %s. Every type without a pattern fails closed, not only PERSON", entities, hClientFound(detection, text), err, entities[len(entities)-1])
 	}
 	peer.code = codes.OK
-	detection = clientDetect(ctx, text, "EMAIL", "PERSON")
-	got := clientFound(detection, text)
+	detection = hClientDetect(ctx, text, "EMAIL", "PERSON")
+	got := hClientFound(detection, text)
 	sort.Strings(got)
 	ctx.Equal(got, []string{"Ada Lovelace PERSON", "ada@example.com EMAIL"}, "with the detector up the model answers both types")
 }
@@ -928,21 +928,21 @@ func CheckUncoveredFailsClosed(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Mail ada@example.com, SSN 123-45-6789.";
-const std::string kName = "Ada Lovelace";
+const std::string kHText = "Mail ada@example.com, SSN 123-45-6789.";
+const std::string kHName = "Ada Lovelace";
 
 // The NER model's stand-in: pattern types by their patterns, PERSON for one known name; failing
 // with code when it is not OK.
-class DetectorPeer final : public redactor::Detector::Service {
+class HDetectorPeer final : public redactor::Detector::Service {
  public:
   grpc::StatusCode code = grpc::StatusCode::OK;
   grpc::Status Detect(grpc::ServerContext*, const redactor::DetectRequest* req, redactor::DetectResponse* out) override {
     if (code != grpc::StatusCode::OK) return grpc::Status(code, "the detector is failing");
     const std::vector<std::string> entities(req->entities().begin(), req->entities().end());
     std::vector<spans::Span> found = spans::scan(req->text(), entities);
-    const size_t at = req->text().find(kName);
+    const size_t at = req->text().find(kHName);
     if (at != std::string::npos && std::find(entities.begin(), entities.end(), "PERSON") != entities.end()) {
-      found.push_back(spans::span(static_cast<int>(at), static_cast<int>(at + kName.size()), "PERSON"));
+      found.push_back(spans::span(static_cast<int>(at), static_cast<int>(at + kHName.size()), "PERSON"));
     }
     std::sort(found.begin(), found.end(), [](const spans::Span& a, const spans::Span& b) { return a.start < b.start; });
     for (const spans::Span& s : found) {
@@ -956,15 +956,15 @@ class DetectorPeer final : public redactor::Detector::Service {
   }
 };
 
-DetectorPeer& serve(harness::Ctx& ctx) {
-  static DetectorPeer* peer = nullptr;
+HDetectorPeer& hServe(harness::Ctx& ctx) {
+  static HDetectorPeer* peer = nullptr;
   delete peer;
-  peer = new DetectorPeer;
+  peer = new HDetectorPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::vector<std::string> found_in(const spans::Detection& detection, const std::string& text) {
+std::vector<std::string> hFoundIn(const spans::Detection& detection, const std::string& text) {
   std::vector<std::string> out;
   for (const spans::Span& s : detection.spans) out.push_back(text.substr(s.start, s.end - s.start) + " " + s.entity);
   return out;
@@ -973,26 +973,26 @@ std::vector<std::string> found_in(const spans::Detection& detection, const std::
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serve(ctx);
-  detect(kText, {"EMAIL"});
+  hServe(ctx);
+  detect(kHText, {"EMAIL"});
   ctx.GRPC.SetLatency("Detect", 5.0);
-  const spans::Detection detection = detect(kText, {"EMAIL"});
+  const spans::Detection detection = detect(kHText, {"EMAIL"});
   const auto calls = ctx.GRPC.CallsTo("Detect");
   ctx.Assert(!calls.empty(), "detect made no Detect call");
   for (const auto& call : calls) {
     ctx.Assert(call.HasDeadline(), "a Detect call carries no deadline: a detector answering in 5 s holds the request for 5 s");
     ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.7, "a Detect call carries a %v s deadline, expected 0.6 s", call.TimeoutSeconds());
   }
-  ctx.Equal(found_in(detection, kText), {"ada@example.com EMAIL"}, "after the deadlines the fallback must still redact the email");
+  ctx.Equal(hFoundIn(detection, kHText), {"ada@example.com EMAIL"}, "after the deadlines the fallback must still redact the email");
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  DetectorPeer& peer = serve(ctx);
+  HDetectorPeer& peer = hServe(ctx);
   peer.code = grpc::StatusCode::UNAVAILABLE;
-  detect(kText, {"EMAIL"});
+  detect(kHText, {"EMAIL"});
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size(), 2, "with the detector UNAVAILABLE, detect must make kMaxAttempts = 2 attempts (every extra one is load on a detector that is already down); attempts");
   peer.code = grpc::StatusCode::INVALID_ARGUMENT;
-  detect(kText, {"EMAIL"});
+  detect(kHText, {"EMAIL"});
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size() - 2, 1, "an INVALID_ARGUMENT means the request itself was refused, and a second attempt fails the same way; attempts");
   const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INTERNAL, "INTERNAL"},
                                                                           {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
@@ -1001,30 +1001,30 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   for (const auto& [code, name] : terminal) {
     peer.code = code;
     const size_t before = ctx.GRPC.CallsTo("Detect").size();
-    detect(kText, {"EMAIL"});
+    detect(kHText, {"EMAIL"});
     ctx.Equal(ctx.GRPC.CallsTo("Detect").size() - before, 1, "the code %s was retried: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a second attempt; attempts", name);
   }
   peer.code = grpc::StatusCode::DEADLINE_EXCEEDED;
   const size_t before = ctx.GRPC.CallsTo("Detect").size();
-  detect(kText, {"EMAIL"});
+  detect(kHText, {"EMAIL"});
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size() - before, 2,
             "with the detector answering DEADLINE_EXCEEDED, detect must make kMaxAttempts = 2 attempts: a deadline is transient and earns the second attempt; attempts");
 }
 
 void CheckDegradedMarker(harness::Ctx& ctx) {
-  DetectorPeer& peer = serve(ctx);
+  HDetectorPeer& peer = hServe(ctx);
   peer.code = grpc::StatusCode::UNAVAILABLE;
-  spans::Detection detection = detect(kText, {"EMAIL", "SSN"});
-  ctx.Equal(found_in(detection, kText), {"ada@example.com EMAIL", "123-45-6789 SSN"}, "the fallback must redact the email and the SSN");
+  spans::Detection detection = detect(kHText, {"EMAIL", "SSN"});
+  ctx.Equal(hFoundIn(detection, kHText), {"ada@example.com EMAIL", "123-45-6789 SSN"}, "the fallback must redact the email and the SSN");
   ctx.Assert(detection.source == "regex" && detection.degraded, "a regex answer must say so (source regex, degraded), got source=%q degraded=%t", detection.source, detection.degraded);
   ctx.Equal(detection.detector_version, spans::kPatternsVersion, "a regex answer reports the patterns' version");
   peer.code = grpc::StatusCode::OK;
-  detection = detect(kText, {"EMAIL", "SSN"});
+  detection = detect(kHText, {"EMAIL", "SSN"});
   ctx.Assert(detection.source == "model" && !detection.degraded && detection.detector_version == "ner-2026.10", "the model's answer is source model, not degraded, version ner-2026.10; got source=%q version=%q", detection.source, detection.detector_version);
 }
 
 void CheckSizeIndependent(harness::Ctx& ctx) {
-  DetectorPeer& peer = serve(ctx);
+  HDetectorPeer& peer = hServe(ctx);
   peer.code = grpc::StatusCode::UNAVAILABLE;
   // an email across the 10 KiB mark, where the starter stopped scanning, and one at the end of about 200 KiB
   std::string text;
@@ -1033,17 +1033,17 @@ void CheckSizeIndependent(harness::Ctx& ctx) {
   for (int i = 0; i < 7000; i++) text += "lorem ipsum dolor sit amet ";
   text += "Write to bob@example.org.";
   const spans::Detection detection = detect(text, {"EMAIL"});
-  ctx.Equal(found_in(detection, text), {"ada@example.com EMAIL", "bob@example.org EMAIL"}, "a %d-character text: the fallback must scan the whole text, whatever its size; the spans", text.size());
+  ctx.Equal(hFoundIn(detection, text), {"ada@example.com EMAIL", "bob@example.org EMAIL"}, "a %d-character text: the fallback must scan the whole text, whatever its size; the spans", text.size());
 }
 
 void CheckUncoveredFailsClosed(harness::Ctx& ctx) {
-  DetectorPeer& peer = serve(ctx);
+  HDetectorPeer& peer = hServe(ctx);
   peer.code = grpc::StatusCode::UNAVAILABLE;
-  const std::string text = kName + ", ada@example.com";
+  const std::string text = kHName + ", ada@example.com";
   bool refused = false;
   std::vector<std::string> answered;
   try {
-    answered = found_in(detect(text, {"EMAIL", "PERSON"}), text);
+    answered = hFoundIn(detect(text, {"EMAIL", "PERSON"}), text);
   } catch (const spans::DetectorUnavailable&) {
     refused = true;
   }
@@ -1052,14 +1052,14 @@ void CheckUncoveredFailsClosed(harness::Ctx& ctx) {
     refused = false;
     answered.clear();
     try {
-      answered = found_in(detect(text, entities), text);
+      answered = hFoundIn(detect(text, entities), text);
     } catch (const spans::DetectorUnavailable&) {
       refused = true;
     }
     ctx.Assert(refused, "with the detector down, a request for %v answered %v: no pattern covers %s. Every type without a pattern fails closed, not only PERSON", entities, answered, entities.back());
   }
   peer.code = grpc::StatusCode::OK;
-  std::vector<std::string> got = found_in(detect(text, {"EMAIL", "PERSON"}), text);
+  std::vector<std::string> got = hFoundIn(detect(text, {"EMAIL", "PERSON"}), text);
   std::sort(got.begin(), got.end());
   ctx.Equal(got, {"Ada Lovelace PERSON", "ada@example.com EMAIL"}, "with the detector up the model answers both types");
 }

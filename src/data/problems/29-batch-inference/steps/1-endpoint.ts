@@ -969,16 +969,16 @@ import (
 	"leetbuild/harness"
 )
 
-const apiManifest = "s3://acme-batches/2026-11/support-tickets.jsonl"
+const kHApiManifest = "s3://acme-batches/2026-11/support-tickets.jsonl"
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hApiClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 // apiSeedManifest is what the uploader leaves in the object store's metadata.
-func apiSeedManifest(ctx *harness.Ctx, uri string, records int, sealed bool) {
+func hApiSeedManifest(ctx *harness.Ctx, uri string, records int, sealed bool) {
 	flag := "0"
 	if sealed {
 		flag = "1"
@@ -986,24 +986,24 @@ func apiSeedManifest(ctx *harness.Ctx, uri string, records int, sealed bool) {
 	ctx.Redis.Do("HSET", "batch:manifest:"+uri, "record_count", records, "sealed", flag)
 }
 
-func apiBody(uri string) map[string]any { return map[string]any{"manifest_uri": uri, "model": "sum-v7"} }
+func hApiBody(uri string) map[string]any { return map[string]any{"manifest_uri": uri, "model": "sum-v7"} }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
+func hApiPost(c *harness.HTTP, body map[string]any, key, tenant string) *harness.Response {
 	return c.Post("/v1/batches", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func apiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hApiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	job, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return job
 }
 
-func apiPending(ctx *harness.Ctx, batchID any) []string {
+func hApiPending(ctx *harness.Ctx, batchID any) []string {
 	return ctx.Redis.LRange(fmt.Sprint("batch:pending:", batchID), 0, -1)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	apiSeedManifest(ctx, apiManifest, 2000, true)
+	hApiSeedManifest(ctx, kHApiManifest, 2000, true)
 	const idem = "batch:idem:t1:k-1"
 	var queuedAtPut [][]string
 	// jobs.Get reads the key before jobs.Put writes it: wait for the write
@@ -1017,90 +1017,90 @@ func CheckRoute(ctx *harness.Ctx) {
 		return nil
 	}
 	ctx.Redis.After(idem, atIdem)
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(apiManifest), "k-1", "t1")
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(kHApiManifest), "k-1", "t1")
 	ctx.Equal(r.Status, 202, "a submit over a sealed 2000-record manifest (%s)", r.Text())
-	job := apiJob(ctx, r)
+	job := hApiJob(ctx, r)
 	for _, key := range []string{"batch_id", "status", "model", "manifest_uri", "record_count", "shards"} {
 		_, ok := job[key]
 		ctx.Assert(ok, "the 202 body lacks %s: %s", key, r.Text())
 	}
-	ctx.Assert(job["status"] == "queued" && job["model"] == "sum-v7" && job["manifest_uri"] == apiManifest, "the batch echoes the request with status queued: %s", r.Text())
+	ctx.Assert(job["status"] == "queued" && job["model"] == "sum-v7" && job["manifest_uri"] == kHApiManifest, "the batch echoes the request with status queued: %s", r.Text())
 	ctx.Assert(job["record_count"] == float64(2000) && job["shards"] == float64(2), "2000 records are 2 shards of 1000: %s", r.Text())
 	_, stored := ctx.Redis.Get(fmt.Sprint("batch:job:", job["batch_id"]))
 	ctx.Assert(stored, "the batch must be in the store (batch:job:{id}): keys %v", ctx.Redis.Keys("batch:*"))
-	ctx.Equal(apiPending(ctx, job["batch_id"]), []string{"0", "1"}, "shards 0 and 1 must be pending; batch:pending holds")
+	ctx.Equal(hApiPending(ctx, job["batch_id"]), []string{"0", "1"}, "shards 0 and 1 must be pending; batch:pending holds")
 	ctx.Assert(len(queuedAtPut) == 0 || len(queuedAtPut[0]) == 0, "when the batch was stored under (t1, k-1), shards were already queued on %v: the shards are seeded after store.put, so a submit that dies in between never leaves queued shards of a batch nobody can find", queuedAtPut)
-	noTenant := c.Post("/v1/batches", apiBody(apiManifest), "Idempotency-Key", "k-1")
+	noTenant := c.Post("/v1/batches", hApiBody(kHApiManifest), "Idempotency-Key", "k-1")
 	ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the submit")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	apiSeedManifest(ctx, apiManifest, 2000, true)
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/batches", apiBody(apiManifest), "X-Tenant-Id", "t1")
+	hApiSeedManifest(ctx, kHApiManifest, 2000, true)
+	c := hApiClient(ctx)
+	noKey := c.Post("/v1/batches", hApiBody(kHApiManifest), "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a submit without Idempotency-Key")
 	ctx.Equal(len(ctx.Redis.Keys("batch:job:*")), 0, "a refused submit must store no batch; batches stored")
-	first := apiPost(c, apiBody(apiManifest), "k-7", "t1")
+	first := hApiPost(c, hApiBody(kHApiManifest), "k-7", "t1")
 	ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text())
-	replay := apiPost(c, apiBody(apiManifest), "k-7", "t1")
+	replay := hApiPost(c, hApiBody(kHApiManifest), "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored batch (the client retried, it must not start a second run)")
-	batchID := apiJob(ctx, first)["batch_id"]
-	ctx.Equal(apiJob(ctx, replay)["batch_id"], batchID, "the replay must answer the same batch")
+	batchID := hApiJob(ctx, first)["batch_id"]
+	ctx.Equal(hApiJob(ctx, replay)["batch_id"], batchID, "the replay must answer the same batch")
 	ctx.Equal(len(ctx.Redis.Keys("batch:job:*")), 1, "one key, one batch: batches stored after a submit and its replay")
-	ctx.Equal(apiPending(ctx, batchID), []string{"0", "1"}, "the replay must not seed the shards again; batch:pending holds")
-	other := apiPost(c, apiBody(apiManifest), "k-7", "t2")
-	ctx.Assert(other.Status == 202 && apiJob(ctx, other)["batch_id"] != batchID, "another tenant reusing the key gets its own batch (keys are per tenant)")
-	ctx.Redis.Del("batch:manifest:" + apiManifest)
-	again := apiPost(c, apiBody(apiManifest), "k-7", "t1")
-	ctx.Assert(again.Status == 200 && apiJob(ctx, again)["batch_id"] == batchID, "with the manifest since removed from the object store, a replay of (t1, k-7) answered %d: %s; the stored batch answers a replay before the manifest is read", again.Status, again.Text())
+	ctx.Equal(hApiPending(ctx, batchID), []string{"0", "1"}, "the replay must not seed the shards again; batch:pending holds")
+	other := hApiPost(c, hApiBody(kHApiManifest), "k-7", "t2")
+	ctx.Assert(other.Status == 202 && hApiJob(ctx, other)["batch_id"] != batchID, "another tenant reusing the key gets its own batch (keys are per tenant)")
+	ctx.Redis.Del("batch:manifest:" + kHApiManifest)
+	again := hApiPost(c, hApiBody(kHApiManifest), "k-7", "t1")
+	ctx.Assert(again.Status == 200 && hApiJob(ctx, again)["batch_id"] == batchID, "with the manifest since removed from the object store, a replay of (t1, k-7) answered %d: %s; the stored batch answers a replay before the manifest is read", again.Status, again.Text())
 }
 
 func CheckRecordCap(ctx *harness.Ctx) {
 	big := "s3://acme-batches/2026-11/everything.jsonl"
-	apiSeedManifest(ctx, big, 1_000_001, true)
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(big), "k-big", "t1")
+	hApiSeedManifest(ctx, big, 1_000_001, true)
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(big), "k-big", "t1")
 	ctx.Equal(r.Status, 400, "a manifest of 1 000 001 records: a batch holds at most MaxRecords")
 	ctx.Assert(len(ctx.Redis.Keys("batch:job:*")) == 0 && len(ctx.Redis.Keys("batch:pending:*")) == 0, "a refused batch must store nothing and queue nothing, found %v", ctx.Redis.Keys("batch:*"))
 	atCap := "s3://acme-batches/2026-11/one-million.jsonl"
-	apiSeedManifest(ctx, atCap, 1_000_000, true)
-	r = apiPost(c, apiBody(atCap), "k-cap", "t1")
+	hApiSeedManifest(ctx, atCap, 1_000_000, true)
+	r = hApiPost(c, hApiBody(atCap), "k-cap", "t1")
 	ctx.Equal(r.Status, 202, "exactly 1 000 000 records is within the cap (%s)", r.Text())
-	job := apiJob(ctx, r)
-	ctx.Assert(job["shards"] == float64(1000) && len(apiPending(ctx, job["batch_id"])) == 1000, "1 000 000 records are 1000 shards: %s", r.Text())
+	job := hApiJob(ctx, r)
+	ctx.Assert(job["shards"] == float64(1000) && len(hApiPending(ctx, job["batch_id"])) == 1000, "1 000 000 records are 1000 shards: %s", r.Text())
 }
 
 func CheckSealedManifest(ctx *harness.Ctx) {
-	apiSeedManifest(ctx, apiManifest, 1200, false)
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(apiManifest), "k-up", "t1")
+	hApiSeedManifest(ctx, kHApiManifest, 1200, false)
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(kHApiManifest), "k-up", "t1")
 	ctx.Equal(r.Status, 409, "a manifest still uploading (1200 records so far, sealed false): the batch would be sized from the parts that landed")
 	ctx.Assert(len(ctx.Redis.Keys("batch:job:*")) == 0 && len(ctx.Redis.Keys("batch:pending:*")) == 0, "a 409 must store nothing and queue nothing, found %v", ctx.Redis.Keys("batch:*"))
-	apiSeedManifest(ctx, apiManifest, 2500, true)
-	r = apiPost(c, apiBody(apiManifest), "k-up", "t1")
+	hApiSeedManifest(ctx, kHApiManifest, 2500, true)
+	r = hApiPost(c, hApiBody(kHApiManifest), "k-up", "t1")
 	ctx.Equal(r.Status, 202, "once the manifest is sealed the same request and key must start the batch (%s)", r.Text())
-	ctx.Equal(apiJob(ctx, r)["record_count"], float64(2500), "the batch must be sized from the sealed manifest; record_count")
-	r = apiPost(c, apiBody("s3://acme-batches/missing.jsonl"), "k-none", "t1")
+	ctx.Equal(hApiJob(ctx, r)["record_count"], float64(2500), "the batch must be sized from the sealed manifest; record_count")
+	r = hApiPost(c, hApiBody("s3://acme-batches/missing.jsonl"), "k-none", "t1")
 	ctx.Equal(r.Status, 404, "no object at manifest_uri")
 }
 
 func CheckShardCount(ctx *harness.Ctx) {
-	apiSeedManifest(ctx, apiManifest, 2500, true)
-	c := apiClient(ctx)
-	r := apiPost(c, apiBody(apiManifest), "k-2500", "t1")
+	hApiSeedManifest(ctx, kHApiManifest, 2500, true)
+	c := hApiClient(ctx)
+	r := hApiPost(c, hApiBody(kHApiManifest), "k-2500", "t1")
 	ctx.Equal(r.Status, 202, "a 2500-record submit (%s)", r.Text())
-	job := apiJob(ctx, r)
+	job := hApiJob(ctx, r)
 	ctx.Equal(job["shards"], float64(3), "2500 records at 1000 per shard are 3 shards (with fewer, the last 500 records belong to no shard and are never run); shards")
-	ctx.Equal(apiPending(ctx, job["batch_id"]), []string{"0", "1", "2"}, "shards 0, 1 and 2 must be pending; batch:pending holds")
+	ctx.Equal(hApiPending(ctx, job["batch_id"]), []string{"0", "1", "2"}, "shards 0, 1 and 2 must be pending; batch:pending holds")
 	small := "s3://acme-batches/2026-11/small.jsonl"
-	apiSeedManifest(ctx, small, 999, true)
-	r = apiPost(c, apiBody(small), "k-999", "t1")
-	ctx.Assert(r.Status == 202 && apiJob(ctx, r)["shards"] == float64(1), "999 records are one shard: %s", r.Text())
+	hApiSeedManifest(ctx, small, 999, true)
+	r = hApiPost(c, hApiBody(small), "k-999", "t1")
+	ctx.Assert(r.Status == 202 && hApiJob(ctx, r)["shards"] == float64(1), "999 records are one shard: %s", r.Text())
 	exact := "s3://acme-batches/2026-11/exact.jsonl"
-	apiSeedManifest(ctx, exact, 3000, true)
-	r = apiPost(c, apiBody(exact), "k-3000", "t1")
-	ctx.Assert(r.Status == 202 && apiJob(ctx, r)["shards"] == float64(3), "3000 records are exactly 3 shards: %s", r.Text())
+	hApiSeedManifest(ctx, exact, 3000, true)
+	r = hApiPost(c, hApiBody(exact), "k-3000", "t1")
+	ctx.Assert(r.Status == 202 && hApiJob(ctx, r)["shards"] == float64(3), "3000 records are exactly 3 shards: %s", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1114,12 +1114,12 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kManifest = "s3://acme-batches/2026-11/support-tickets.jsonl";
+const std::string kHManifest = "s3://acme-batches/2026-11/support-tickets.jsonl";
 
-struct Api {
+struct HApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const std::string& uri, const std::string& key, const std::string& tenant = "t1") {
     return http.Post("/v1/batches", json{{"manifest_uri", uri}, {"model", "sum-v7"}}.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
@@ -1127,24 +1127,24 @@ struct Api {
 };
 
 // What the uploader leaves in the object store's metadata.
-void seedManifest(harness::Ctx& ctx, const std::string& uri, long long records, bool sealed) {
+void hSeedManifest(harness::Ctx& ctx, const std::string& uri, long long records, bool sealed) {
   ctx.Redis.Do("HSET", "batch:manifest:" + uri, "record_count", records, "sealed", sealed ? "1" : "0");
 }
 
-json jobOf(harness::Ctx& ctx, const harness::Response& r) {
+json hJobOf(harness::Ctx& ctx, const harness::Response& r) {
   const json job = json::parse(r.Text(), nullptr, false);
   ctx.Assert(job.is_object(), "the body must be a JSON object: %s", r.Text());
   return job;
 }
 
-std::vector<std::string> pendingOf(harness::Ctx& ctx, const json& batchId) {
+std::vector<std::string> hPendingOf(harness::Ctx& ctx, const json& batchId) {
   return ctx.Redis.LRange("batch:pending:" + (batchId.is_string() ? batchId.get<std::string>() : std::string()), 0, -1);
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  seedManifest(ctx, kManifest, 2000, true);
+  hSeedManifest(ctx, kHManifest, 2000, true);
   const std::string idem = "batch:idem:t1:k-1";
   std::vector<std::vector<std::string>> queuedAtPut;
   // store.get reads the key before store.put writes it: wait for the write
@@ -1156,88 +1156,88 @@ void CheckRoute(harness::Ctx& ctx) {
     }
   };
   ctx.Redis.After(idem, atIdem);
-  Api api(ctx);
-  const auto r = api.post(kManifest, "k-1");
+  HApi api(ctx);
+  const auto r = api.post(kHManifest, "k-1");
   ctx.Equal(r.Status, 202, "a submit over a sealed 2000-record manifest (%s)", r.Text());
-  const json job = jobOf(ctx, r);
+  const json job = hJobOf(ctx, r);
   for (const char* key : {"batch_id", "status", "model", "manifest_uri", "record_count", "shards"}) {
     ctx.Assert(job.contains(key), "the 202 body lacks %s: %s", key, r.Text());
   }
-  ctx.Assert(job["status"] == "queued" && job["model"] == "sum-v7" && job["manifest_uri"] == kManifest, "the batch echoes the request with status queued: %s", r.Text());
+  ctx.Assert(job["status"] == "queued" && job["model"] == "sum-v7" && job["manifest_uri"] == kHManifest, "the batch echoes the request with status queued: %s", r.Text());
   ctx.Assert(job["record_count"] == 2000 && job["shards"] == 2, "2000 records are 2 shards of 1000: %s", r.Text());
   ctx.Assert(ctx.Redis.Get("batch:job:" + job["batch_id"].get<std::string>()).has_value(), "the batch must be in the store (batch:job:{id}): keys %v", ctx.Redis.Keys("batch:*"));
-  ctx.Equal(pendingOf(ctx, job["batch_id"]), {"0", "1"}, "shards 0 and 1 must be pending; batch:pending holds");
+  ctx.Equal(hPendingOf(ctx, job["batch_id"]), {"0", "1"}, "shards 0 and 1 must be pending; batch:pending holds");
   ctx.Assert(queuedAtPut.empty() || queuedAtPut[0].empty(), "when the batch was stored under (t1, k-1), shards were already queued on %v: the shards are seeded after store.put, so a submit that dies in between never leaves queued shards of a batch nobody can find", queuedAtPut.empty() ? std::vector<std::string>{} : queuedAtPut[0]);
-  const auto noTenant = api.http.Post("/v1/batches", json{{"manifest_uri", kManifest}, {"model", "sum-v7"}}.dump(), "Idempotency-Key", "k-1");
+  const auto noTenant = api.http.Post("/v1/batches", json{{"manifest_uri", kHManifest}, {"model", "sum-v7"}}.dump(), "Idempotency-Key", "k-1");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the submit");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  seedManifest(ctx, kManifest, 2000, true);
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/batches", json{{"manifest_uri", kManifest}, {"model", "sum-v7"}}.dump(), "X-Tenant-Id", "t1");
+  hSeedManifest(ctx, kHManifest, 2000, true);
+  HApi api(ctx);
+  const auto noKey = api.http.Post("/v1/batches", json{{"manifest_uri", kHManifest}, {"model", "sum-v7"}}.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a submit without Idempotency-Key");
   ctx.Equal(ctx.Redis.Keys("batch:job:*").size(), 0, "a refused submit must store no batch; batches stored");
-  const auto first = api.post(kManifest, "k-7");
+  const auto first = api.post(kHManifest, "k-7");
   ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text());
-  const auto replay = api.post(kManifest, "k-7");
+  const auto replay = api.post(kHManifest, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored batch (the client retried, it must not start a second run)");
-  const json batchId = jobOf(ctx, first)["batch_id"];
-  ctx.Equal(jobOf(ctx, replay)["batch_id"], batchId, "the replay must answer the same batch");
+  const json batchId = hJobOf(ctx, first)["batch_id"];
+  ctx.Equal(hJobOf(ctx, replay)["batch_id"], batchId, "the replay must answer the same batch");
   ctx.Equal(ctx.Redis.Keys("batch:job:*").size(), 1, "one key, one batch: batches stored after a submit and its replay");
-  ctx.Equal(pendingOf(ctx, batchId), {"0", "1"}, "the replay must not seed the shards again; batch:pending holds");
-  const auto other = api.post(kManifest, "k-7", "t2");
-  ctx.Assert(other.Status == 202 && jobOf(ctx, other)["batch_id"] != batchId, "another tenant reusing the key gets its own batch (keys are per tenant)");
-  ctx.Redis.Del("batch:manifest:" + std::string(kManifest));
-  const auto again = api.post(kManifest, "k-7");
-  ctx.Assert(again.Status == 200 && jobOf(ctx, again)["batch_id"] == batchId, "with the manifest since removed from the object store, a replay of (t1, k-7) answered %d: %s; the stored batch answers a replay before the manifest is read", again.Status, again.Text());
+  ctx.Equal(hPendingOf(ctx, batchId), {"0", "1"}, "the replay must not seed the shards again; batch:pending holds");
+  const auto other = api.post(kHManifest, "k-7", "t2");
+  ctx.Assert(other.Status == 202 && hJobOf(ctx, other)["batch_id"] != batchId, "another tenant reusing the key gets its own batch (keys are per tenant)");
+  ctx.Redis.Del("batch:manifest:" + std::string(kHManifest));
+  const auto again = api.post(kHManifest, "k-7");
+  ctx.Assert(again.Status == 200 && hJobOf(ctx, again)["batch_id"] == batchId, "with the manifest since removed from the object store, a replay of (t1, k-7) answered %d: %s; the stored batch answers a replay before the manifest is read", again.Status, again.Text());
 }
 
 void CheckRecordCap(harness::Ctx& ctx) {
   const std::string big = "s3://acme-batches/2026-11/everything.jsonl";
-  seedManifest(ctx, big, 1000001, true);
-  Api api(ctx);
+  hSeedManifest(ctx, big, 1000001, true);
+  HApi api(ctx);
   auto r = api.post(big, "k-big");
   ctx.Equal(r.Status, 400, "a manifest of 1 000 001 records: a batch holds at most kMaxRecords");
   ctx.Assert(ctx.Redis.Keys("batch:job:*").empty() && ctx.Redis.Keys("batch:pending:*").empty(), "a refused batch must store nothing and queue nothing, found %v", ctx.Redis.Keys("batch:*"));
   const std::string atCap = "s3://acme-batches/2026-11/one-million.jsonl";
-  seedManifest(ctx, atCap, 1000000, true);
+  hSeedManifest(ctx, atCap, 1000000, true);
   r = api.post(atCap, "k-cap");
   ctx.Equal(r.Status, 202, "exactly 1 000 000 records is within the cap (%s)", r.Text());
-  const json job = jobOf(ctx, r);
-  ctx.Assert(job["shards"] == 1000 && pendingOf(ctx, job["batch_id"]).size() == 1000, "1 000 000 records are 1000 shards: %s", r.Text());
+  const json job = hJobOf(ctx, r);
+  ctx.Assert(job["shards"] == 1000 && hPendingOf(ctx, job["batch_id"]).size() == 1000, "1 000 000 records are 1000 shards: %s", r.Text());
 }
 
 void CheckSealedManifest(harness::Ctx& ctx) {
-  seedManifest(ctx, kManifest, 1200, false);
-  Api api(ctx);
-  auto r = api.post(kManifest, "k-up");
+  hSeedManifest(ctx, kHManifest, 1200, false);
+  HApi api(ctx);
+  auto r = api.post(kHManifest, "k-up");
   ctx.Equal(r.Status, 409, "a manifest still uploading (1200 records so far, sealed false): the batch would be sized from the parts that landed");
   ctx.Assert(ctx.Redis.Keys("batch:job:*").empty() && ctx.Redis.Keys("batch:pending:*").empty(), "a 409 must store nothing and queue nothing, found %v", ctx.Redis.Keys("batch:*"));
-  seedManifest(ctx, kManifest, 2500, true);
-  r = api.post(kManifest, "k-up");
+  hSeedManifest(ctx, kHManifest, 2500, true);
+  r = api.post(kHManifest, "k-up");
   ctx.Equal(r.Status, 202, "once the manifest is sealed the same request and key must start the batch (%s)", r.Text());
-  ctx.Equal(jobOf(ctx, r)["record_count"], 2500, "the batch must be sized from the sealed manifest; record_count");
+  ctx.Equal(hJobOf(ctx, r)["record_count"], 2500, "the batch must be sized from the sealed manifest; record_count");
   r = api.post("s3://acme-batches/missing.jsonl", "k-none");
   ctx.Equal(r.Status, 404, "no object at manifest_uri");
 }
 
 void CheckShardCount(harness::Ctx& ctx) {
-  seedManifest(ctx, kManifest, 2500, true);
-  Api api(ctx);
-  auto r = api.post(kManifest, "k-2500");
+  hSeedManifest(ctx, kHManifest, 2500, true);
+  HApi api(ctx);
+  auto r = api.post(kHManifest, "k-2500");
   ctx.Equal(r.Status, 202, "a 2500-record submit (%s)", r.Text());
-  const json job = jobOf(ctx, r);
+  const json job = hJobOf(ctx, r);
   ctx.Equal(job["shards"], 3, "2500 records at 1000 per shard are 3 shards (with fewer, the last 500 records belong to no shard and are never run); shards");
-  ctx.Equal(pendingOf(ctx, job["batch_id"]), {"0", "1", "2"}, "shards 0, 1 and 2 must be pending; batch:pending holds");
+  ctx.Equal(hPendingOf(ctx, job["batch_id"]), {"0", "1", "2"}, "shards 0, 1 and 2 must be pending; batch:pending holds");
   const std::string small = "s3://acme-batches/2026-11/small.jsonl";
-  seedManifest(ctx, small, 999, true);
+  hSeedManifest(ctx, small, 999, true);
   r = api.post(small, "k-999");
-  ctx.Assert(r.Status == 202 && jobOf(ctx, r)["shards"] == 1, "999 records are one shard: %s", r.Text());
+  ctx.Assert(r.Status == 202 && hJobOf(ctx, r)["shards"] == 1, "999 records are one shard: %s", r.Text());
   const std::string exact = "s3://acme-batches/2026-11/exact.jsonl";
-  seedManifest(ctx, exact, 3000, true);
+  hSeedManifest(ctx, exact, 3000, true);
   r = api.post(exact, "k-3000");
-  ctx.Assert(r.Status == 202 && jobOf(ctx, r)["shards"] == 3, "3000 records are exactly 3 shards: %s", r.Text());
+  ctx.Assert(r.Status == 202 && hJobOf(ctx, r)["shards"] == 3, "3000 records are exactly 3 shards: %s", r.Text());
 }
 `,
   },

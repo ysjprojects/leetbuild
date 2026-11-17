@@ -861,16 +861,16 @@ import (
 )
 
 const (
-	stateCap  = 2_000_000
-	stateText = "Reach Ada at ada@example.com."
+	kHStateCap  = 2_000_000
+	kHStateText = "Reach Ada at ada@example.com."
 )
 
 // statePeer is the NER model's stand-in: every requested type a pattern covers, by its pattern.
-type statePeer struct {
+type HStatePeer struct {
 	pb.UnimplementedDetectorServer
 }
 
-func (statePeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
+func (HStatePeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectResponse, error) {
 	var found []*pb.EntitySpan
 	for _, s := range spans.Scan(req.GetText(), req.GetEntities()) {
 		found = append(found, &pb.EntitySpan{Start: int32(s.Start), End: int32(s.End), Entity: s.Entity})
@@ -879,33 +879,33 @@ func (statePeer) Detect(_ context.Context, req *pb.DetectRequest) (*pb.DetectRes
 }
 
 // stateWindow moves the clock to into seconds after the start of the next hourly window and returns that window.
-func stateWindow(ctx *harness.Ctx, into float64) int64 {
+func hStateWindow(ctx *harness.Ctx, into float64) int64 {
 	now := float64(ctx.Clock.Now()) / 1000
 	ctx.Clock.Advance(3600 - math.Mod(now, 3600) + into)
 	return ctx.Clock.Now() / 1000 / 3600
 }
 
-func stateKey(tenant string, window int64) string { return fmt.Sprintf("budget:%s:%d", tenant, window) }
+func hStateKey(tenant string, window int64) string { return fmt.Sprintf("budget:%s:%d", tenant, window) }
 
-func stateUsed(ctx *harness.Ctx, key string) int64 {
+func hStateUsed(ctx *harness.Ctx, key string) int64 {
 	v, _ := ctx.Redis.Get(key)
 	n, _ := strconv.ParseInt(v, 10, 64)
 	return n
 }
 
-func stateReserve(ctx *harness.Ctx, tenant string, chars int64) Reservation {
+func hStateReserve(ctx *harness.Ctx, tenant string, chars int64) Reservation {
 	res, err := reserveBudget(context.Background(), tenant, chars)
 	ctx.NoError(err, "reserveBudget(%s, %d)", tenant, chars)
 	return res
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
-	key := stateKey("acme", stateWindow(ctx, 10))
+	key := hStateKey("acme", hStateWindow(ctx, 10))
 	ctx.Redis.Set(key, 1_000_000)
 	other := ""
 	// another replica reserving 600 000 characters for the same tenant, between two of this one's commands
 	probe := ctx.Redis.After(key, func() any {
-		if stateUsed(ctx, key)+600_000 > stateCap {
+		if hStateUsed(ctx, key)+600_000 > kHStateCap {
 			other = "refused"
 			return nil
 		}
@@ -913,29 +913,29 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 		other = "charged"
 		return nil
 	})
-	mine := stateReserve(ctx, "acme", 600_000)
+	mine := hStateReserve(ctx, "acme", 600_000)
 	ctx.Assert(probe.Fired, "reserveBudget never touched %s", key)
-	total := stateUsed(ctx, key)
-	ctx.Assert(total <= stateCap, "two reservations of 600 000 on 1 000 000 used both went through: %d charged against a cap of %d. The read and the charge must be one script", total, stateCap)
+	total := hStateUsed(ctx, key)
+	ctx.Assert(total <= kHStateCap, "two reservations of 600 000 on 1 000 000 used both went through: %d charged against a cap of %d. The read and the charge must be one script", total, kHStateCap)
 	ctx.Assert(mine.Allowed != (other == "charged"), "exactly one of the two requests may be charged (this one allowed=%t, the other %s)", mine.Allowed, other)
 }
 
 func CheckFitsWhole(ctx *harness.Ctx) {
-	key := stateKey("acme", stateWindow(ctx, 10))
+	key := hStateKey("acme", hStateWindow(ctx, 10))
 	ctx.Redis.Set(key, 1_900_000)
-	res := stateReserve(ctx, "acme", 200_000)
-	ctx.Assert(!res.Allowed, "with 1 900 000 of 2 000 000 used, a 200 000-character request was allowed: the tenant ends the hour at %d", stateUsed(ctx, key))
-	ctx.Equal(stateUsed(ctx, key), 1_900_000, "a refused reservation must charge nothing; the budget")
+	res := hStateReserve(ctx, "acme", 200_000)
+	ctx.Assert(!res.Allowed, "with 1 900 000 of 2 000 000 used, a 200 000-character request was allowed: the tenant ends the hour at %d", hStateUsed(ctx, key))
+	ctx.Equal(hStateUsed(ctx, key), 1_900_000, "a refused reservation must charge nothing; the budget")
 	ctx.Equal(res.Remaining, 100_000, "a refusal must say what the cap still allows; remaining")
-	res = stateReserve(ctx, "acme", 100_000)
+	res = hStateReserve(ctx, "acme", 100_000)
 	ctx.Assert(res.Allowed && res.Remaining == 0, "a request that exactly fits must be allowed with nothing remaining, got %+v", res)
-	ctx.Equal(stateUsed(ctx, key), stateCap, "the budget must hold exactly the cap")
-	otherKey := stateKey("globex", stateWindow(ctx, 10))
+	ctx.Equal(hStateUsed(ctx, key), kHStateCap, "the budget must hold exactly the cap")
+	otherKey := hStateKey("globex", hStateWindow(ctx, 10))
 	ctx.Redis.Set(otherKey, 1_900_000)
 	other := ""
 	// another replica reserving the 100 000 globex still has, between two of this one's commands
 	probe := ctx.Redis.After(otherKey, func() any {
-		if stateUsed(ctx, otherKey)+100_000 > stateCap {
+		if hStateUsed(ctx, otherKey)+100_000 > kHStateCap {
 			other = "refused"
 			return nil
 		}
@@ -943,48 +943,48 @@ func CheckFitsWhole(ctx *harness.Ctx) {
 		other = "charged"
 		return nil
 	})
-	res = stateReserve(ctx, "globex", 200_000)
+	res = hStateReserve(ctx, "globex", 200_000)
 	ctx.Assert(!res.Allowed && probe.Fired, "with 1 900 000 used, a 200 000-character request must be refused, got %+v", res)
 	ctx.Equal(other, "charged", "while a 200 000-character request was being refused, another request for the 100 000 left was refused too: the refusal charged the budget for a moment. A refusal charges nothing; the other request")
-	ctx.Equal(stateUsed(ctx, otherKey), stateCap, "the budget must hold exactly the cap")
+	ctx.Equal(hStateUsed(ctx, otherKey), kHStateCap, "the budget must hold exactly the cap")
 }
 
 func CheckHourlyWindow(ctx *harness.Ctx) {
-	key := stateKey("acme", stateWindow(ctx, 1800))
+	key := hStateKey("acme", hStateWindow(ctx, 1800))
 	var created int64
 	probe := ctx.Redis.After(key, func() any {
 		created = ctx.Redis.TTL(key)
 		return nil
 	})
-	res := stateReserve(ctx, "acme", 1_000)
+	res := hStateReserve(ctx, "acme", 1_000)
 	ctx.Assert(res.Allowed, "the first reservation of the hour was refused: %+v", res)
 	// -2: the first command only read the key, before anything created it
 	ctx.Assert(probe.Fired && (created == -2 || (created >= 1790 && created <= 1800)), "right after the command that created %s its TTL was %d: the TTL must be set by the same script that charges, or a crash in between leaves a key that never expires", key, created)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl >= 1790 && ttl <= 1800, "halfway through the hour %s has TTL %d, expected the 1800 s left in its window: a key without one outlives its hour", key, ttl)
-	res = stateReserve(ctx, "acme", stateCap)
+	res = hStateReserve(ctx, "acme", kHStateCap)
 	ctx.Assert(!res.Allowed, "a request over what is left must be refused")
 	ctx.Assert(res.RetryAfter >= 1790 && res.RetryAfter <= 1800, "halfway through the hour a refusal said RetryAfter=%d, expected the 1800 s until the next window", res.RetryAfter)
 	ctx.Clock.Advance(1800)
 	ctx.Equal(ctx.Redis.Exists(key), 0, "%s outlived its hour; it exists", key)
-	res = stateReserve(ctx, "acme", 1_500_000)
+	res = hStateReserve(ctx, "acme", 1_500_000)
 	ctx.Assert(res.Allowed, "a new window starts with the whole budget, got %+v", res)
 }
 
 func CheckReserveBeforeDetect(ctx *harness.Ctx) {
-	pb.RegisterDetectorServer(ctx.GRPC.Server(""), statePeer{})
-	window := stateWindow(ctx, 10)
-	ctx.Redis.Set(stateKey("acme", window), stateCap)
-	_, err := detectWithinBudget(context.Background(), "acme", stateText, []string{"EMAIL"})
+	pb.RegisterDetectorServer(ctx.GRPC.Server(""), HStatePeer{})
+	window := hStateWindow(ctx, 10)
+	ctx.Redis.Set(hStateKey("acme", window), kHStateCap)
+	_, err := detectWithinBudget(context.Background(), "acme", kHStateText, []string{"EMAIL"})
 	var exhausted *BudgetExhausted
 	ctx.Assert(errors.As(err, &exhausted), "an exhausted tenant must get a *BudgetExhausted, got %v", err)
 	ctx.Assert(exhausted.Reservation.RetryAfter > 0, "a refusal must say when to retry, got %+v", exhausted.Reservation)
 	calls := len(ctx.GRPC.CallsTo("Detect", ""))
 	ctx.Equal(calls, 0, "an over-budget tenant must not cost a detector call: reserve first; Detect calls")
-	detection, err := detectWithinBudget(context.Background(), "globex", stateText, []string{"EMAIL"})
+	detection, err := detectWithinBudget(context.Background(), "globex", kHStateText, []string{"EMAIL"})
 	ctx.NoError(err, "a tenant within budget")
 	ctx.Assert(len(detection.Spans) == 1 && detection.Spans[0].Entity == "EMAIL", "a tenant within budget gets its detection, got %+v", detection)
-	ctx.Equal(stateUsed(ctx, stateKey("globex", window)), len(stateText), "the text's characters must be charged to globex; the budget")
+	ctx.Equal(hStateUsed(ctx, hStateKey("globex", window)), len(kHStateText), "the text's characters must be charged to globex; the budget")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -996,11 +996,11 @@ func CheckReserveBeforeDetect(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kCap = 2000000;
-const std::string kText = "Reach Ada at ada@example.com.";
+constexpr long long kHCap = 2000000;
+const std::string kHText = "Reach Ada at ada@example.com.";
 
 // The NER model's stand-in: every requested type a pattern covers, by its pattern.
-class DetectorPeer final : public redactor::Detector::Service {
+class HDetectorPeer final : public redactor::Detector::Service {
  public:
   grpc::Status Detect(grpc::ServerContext*, const redactor::DetectRequest* req, redactor::DetectResponse* out) override {
     for (const spans::Span& s : spans::scan(req->text(), {req->entities().begin(), req->entities().end()})) {
@@ -1015,15 +1015,15 @@ class DetectorPeer final : public redactor::Detector::Service {
 };
 
 // Move the clock to into seconds after the start of the next hourly window; that window.
-long long window_at(harness::Ctx& ctx, double into) {
+long long hWindowAt(harness::Ctx& ctx, double into) {
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
   ctx.Clock.Advance(3600 - std::fmod(now, 3600) + into);
   return ctx.Clock.Now() / 1000 / 3600;
 }
 
-std::string key_of(const std::string& tenant, long long window) { return "budget:" + tenant + ":" + std::to_string(window); }
+std::string hKeyOf(const std::string& tenant, long long window) { return "budget:" + tenant + ":" + std::to_string(window); }
 
-long long used(harness::Ctx& ctx, const std::string& key) {
+long long hUsed(harness::Ctx& ctx, const std::string& key) {
   const auto v = ctx.Redis.Get(key);
   return v ? std::stoll(*v) : 0;
 }
@@ -1031,12 +1031,12 @@ long long used(harness::Ctx& ctx, const std::string& key) {
 }  // namespace
 
 void CheckAtomicReserve(harness::Ctx& ctx) {
-  const std::string key = key_of("acme", window_at(ctx, 10));
+  const std::string key = hKeyOf("acme", hWindowAt(ctx, 10));
   ctx.Redis.Set(key, 1000000);
   std::string other;
   // another replica reserving 600 000 characters for the same tenant, between two of this one's commands
   ctx.Redis.After(key, [&] {
-    if (used(ctx, key) + 600000 > kCap) {
+    if (hUsed(ctx, key) + 600000 > kHCap) {
       other = "refused";
       return;
     }
@@ -1045,27 +1045,27 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
   });
   const Reservation mine = reserve_budget("acme", 600000);
   ctx.Assert(!other.empty(), "reserve_budget never touched %s", key);
-  const long long total = used(ctx, key);
-  ctx.Assert(total <= kCap, "two reservations of 600 000 on 1 000 000 used both went through: %d charged against a cap of %d. The read and the charge must be one script", total, kCap);
+  const long long total = hUsed(ctx, key);
+  ctx.Assert(total <= kHCap, "two reservations of 600 000 on 1 000 000 used both went through: %d charged against a cap of %d. The read and the charge must be one script", total, kHCap);
   ctx.Assert(mine.allowed != (other == "charged"), "exactly one of the two requests may be charged (this one allowed=%t, the other %s)", mine.allowed, other);
 }
 
 void CheckFitsWhole(harness::Ctx& ctx) {
-  const std::string key = key_of("acme", window_at(ctx, 10));
+  const std::string key = hKeyOf("acme", hWindowAt(ctx, 10));
   ctx.Redis.Set(key, 1900000);
   Reservation res = reserve_budget("acme", 200000);
-  ctx.Assert(!res.allowed, "with 1 900 000 of 2 000 000 used, a 200 000-character request was allowed: the tenant ends the hour at %d", used(ctx, key));
-  ctx.Equal(used(ctx, key), 1900000, "a refused reservation must charge nothing; the budget");
+  ctx.Assert(!res.allowed, "with 1 900 000 of 2 000 000 used, a 200 000-character request was allowed: the tenant ends the hour at %d", hUsed(ctx, key));
+  ctx.Equal(hUsed(ctx, key), 1900000, "a refused reservation must charge nothing; the budget");
   ctx.Equal(res.remaining, 100000, "a refusal must say what the cap still allows; remaining");
   res = reserve_budget("acme", 100000);
   ctx.Assert(res.allowed && res.remaining == 0, "a request that exactly fits must be allowed with nothing remaining, got allowed=%t remaining=%d", res.allowed, res.remaining);
-  ctx.Equal(used(ctx, key), kCap, "the budget must hold exactly the cap");
-  const std::string other_key = key_of("globex", window_at(ctx, 10));
+  ctx.Equal(hUsed(ctx, key), kHCap, "the budget must hold exactly the cap");
+  const std::string other_key = hKeyOf("globex", hWindowAt(ctx, 10));
   ctx.Redis.Set(other_key, 1900000);
   std::string other;
   // another replica reserving the 100 000 globex still has, between two of this one's commands
   ctx.Redis.After(other_key, [&] {
-    if (used(ctx, other_key) + 100000 > kCap) {
+    if (hUsed(ctx, other_key) + 100000 > kHCap) {
       other = "refused";
       return;
     }
@@ -1076,11 +1076,11 @@ void CheckFitsWhole(harness::Ctx& ctx) {
   ctx.Assert(!res.allowed && !other.empty(), "with 1 900 000 used, a 200 000-character request must be refused, got allowed=%t", res.allowed);
   ctx.Equal(other, "charged",
             "while a 200 000-character request was being refused, another request for the 100 000 left was refused too: the refusal charged the budget for a moment. A refusal charges nothing; the other request");
-  ctx.Equal(used(ctx, other_key), kCap, "the budget must hold exactly the cap");
+  ctx.Equal(hUsed(ctx, other_key), kHCap, "the budget must hold exactly the cap");
 }
 
 void CheckHourlyWindow(harness::Ctx& ctx) {
-  const std::string key = key_of("acme", window_at(ctx, 1800));
+  const std::string key = hKeyOf("acme", hWindowAt(ctx, 1800));
   bool fired = false;
   long long created = 0;
   ctx.Redis.After(key, [&] {
@@ -1094,7 +1094,7 @@ void CheckHourlyWindow(harness::Ctx& ctx) {
              "right after the command that created %s its TTL was %d: the TTL must be set by the same script that charges, or a crash in between leaves a key that never expires", key, created);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl >= 1790 && ttl <= 1800, "halfway through the hour %s has TTL %d, expected the 1800 s left in its window: a key without one outlives its hour", key, ttl);
-  res = reserve_budget("acme", kCap);
+  res = reserve_budget("acme", kHCap);
   ctx.Assert(!res.allowed, "a request over what is left must be refused");
   ctx.Assert(res.retry_after >= 1790 && res.retry_after <= 1800, "halfway through the hour a refusal said retry_after=%d, expected the 1800 s until the next window", res.retry_after);
   ctx.Clock.Advance(1800);
@@ -1104,24 +1104,24 @@ void CheckHourlyWindow(harness::Ctx& ctx) {
 }
 
 void CheckReserveBeforeDetect(harness::Ctx& ctx) {
-  static DetectorPeer* peer = nullptr;
+  static HDetectorPeer* peer = nullptr;
   delete peer;
-  peer = new DetectorPeer;
+  peer = new HDetectorPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
-  const long long window = window_at(ctx, 10);
-  ctx.Redis.Set(key_of("acme", window), kCap);
+  const long long window = hWindowAt(ctx, 10);
+  ctx.Redis.Set(hKeyOf("acme", window), kHCap);
   bool refused = false;
   try {
-    detect_within_budget("acme", kText, {"EMAIL"});
+    detect_within_budget("acme", kHText, {"EMAIL"});
   } catch (const BudgetExhausted& e) {
     refused = true;
     ctx.Assert(e.reservation.retry_after > 0, "a refusal must say when to retry, got retry_after=%d", e.reservation.retry_after);
   }
   ctx.Assert(refused, "an exhausted tenant got a detection: detect_within_budget must throw BudgetExhausted");
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size(), 0, "an over-budget tenant must not cost a detector call: reserve first; Detect calls");
-  const spans::Detection detection = detect_within_budget("globex", kText, {"EMAIL"});
+  const spans::Detection detection = detect_within_budget("globex", kHText, {"EMAIL"});
   ctx.Assert(detection.spans.size() == 1 && detection.spans[0].entity == "EMAIL", "a tenant within budget gets its detection, got %d span(s)", detection.spans.size());
-  ctx.Equal(used(ctx, key_of("globex", window)), kText.size(), "the text's characters must be charged to globex; the budget");
+  ctx.Equal(hUsed(ctx, hKeyOf("globex", window)), kHText.size(), "the text's characters must be charged to globex; the budget");
 }
 `,
   },

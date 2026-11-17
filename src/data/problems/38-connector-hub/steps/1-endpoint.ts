@@ -783,17 +783,17 @@ import (
 	"leetbuild/harness"
 )
 
-const token = "vault:acme/github#4"
+const kHToken = "vault:acme/github#4"
 
-var github = map[string]any{"source_type": "github", "token_ref": token, "base_url": "https://api.github.com"}
+var hGithub = map[string]any{"source_type": "github", "token_ref": kHToken, "base_url": "https://api.github.com"}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func post(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+func hPost(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
 	var header []string
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -804,7 +804,7 @@ func post(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Res
 	return c.Post("/v1/connectors", body, header...)
 }
 
-func with(base map[string]any, key string, value any) map[string]any {
+func hWith(base map[string]any, key string, value any) map[string]any {
 	out := map[string]any{}
 	for k, v := range base {
 		out[k] = v
@@ -817,7 +817,7 @@ func with(base map[string]any, key string, value any) map[string]any {
 	return out
 }
 
-func connectorOf(r *harness.Response) string {
+func hConnectorOf(r *harness.Response) string {
 	var body struct {
 		ConnectorID string \`json:"connector_id"\`
 	}
@@ -826,7 +826,7 @@ func connectorOf(r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r := post(api(ctx), github, "acme", "k-1")
+	r := hPost(hApi(ctx), hGithub, "acme", "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/connectors (%s)", r.Text())
 	var body struct {
 		ConnectorID string \`json:"connector_id"\`
@@ -841,52 +841,52 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantAndSource(ctx *harness.Ctx) {
-	c := api(ctx)
-	anon := post(c, github, "", "k-1")
+	c := hApi(ctx)
+	anon := hPost(c, hGithub, "", "k-1")
 	ctx.Equal(anon.Status, 401, "a registration without X-Tenant-Id")
-	blank := c.Post("/v1/connectors", github, "X-Tenant-Id", "", "Idempotency-Key", "k-blank")
+	blank := c.Post("/v1/connectors", hGithub, "X-Tenant-Id", "", "Idempotency-Key", "k-blank")
 	ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id (an empty header names no tenant)")
-	ftp := post(c, map[string]any{"source_type": "ftp", "token_ref": token}, "acme", "k-2")
+	ftp := hPost(c, map[string]any{"source_type": "ftp", "token_ref": kHToken}, "acme", "k-2")
 	ctx.Equal(ftp.Status, 400, "a registration for source_type ftp (only the sources in registeredHosts have a host the platform registered)")
 	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 0, "refused registrations must create nothing; the connectors")
 }
 
 func CheckRegisteredHost(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hApi(ctx)
 	for _, url := range []string{"https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com", "https://evil.io/?next=https://api.github.com", "https://api.github.com@169.254.169.254/"} {
-		r := post(c, with(github, "base_url", url), "acme", url)
+		r := hPost(c, hWith(hGithub, "base_url", url), "acme", url)
 		ctx.Equal(r.Status, 403, "base_url %s: the sync worker would call a host the platform never registered for github, with the customer's token; the status", url)
 	}
-	slack := post(c, map[string]any{"source_type": "slack", "token_ref": token, "base_url": "https://evilslack.com"}, "acme", "k-slack")
+	slack := hPost(c, map[string]any{"source_type": "slack", "token_ref": kHToken, "base_url": "https://evilslack.com"}, "acme", "k-slack")
 	ctx.Equal(slack.Status, 403, "a slack registration with base_url https://evilslack.com (the host must be exactly slack.com, not a name that ends with it); the status")
 	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 0, "refused registrations must create nothing; the connectors")
-	r := post(c, with(github, "base_url", nil), "acme", "k-none")
+	r := hPost(c, hWith(hGithub, "base_url", nil), "acme", "k-none")
 	ctx.Assert(r.Status == 201 && strings.Contains(r.Text(), \`"api.github.com"\`), "a registration without base_url must take the registered host, got %d %s", r.Status, r.Text())
 }
 
 func CheckTokenRedacted(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := post(c, github, "acme", "k-1")
+	c := hApi(ctx)
+	first := hPost(c, hGithub, "acme", "k-1")
 	ctx.Equal(first.Status, 201, "POST /v1/connectors (%s)", first.Text())
-	replay := post(c, github, "acme", "k-1")
+	replay := hPost(c, hGithub, "acme", "k-1")
 	for _, r := range []*harness.Response{first, replay} {
-		ctx.Assert(!strings.Contains(r.Text(), token), "the answer carries the token reference: %s. Answer {connector_id, source_type, host, status}; the reference stays in the registry", r.Text())
+		ctx.Assert(!strings.Contains(r.Text(), kHToken), "the answer carries the token reference: %s. Answer {connector_id, source_type, host, status}; the reference stays in the registry", r.Text())
 	}
-	row := store.Get(context.Background(), connectorOf(first))
-	ctx.Assert(row != nil && row.TokenRef == token, "the registry must keep the token reference, it holds %+v", row)
+	row := store.Get(context.Background(), hConnectorOf(first))
+	ctx.Assert(row != nil && row.TokenRef == kHToken, "the registry must keep the token reference, it holds %+v", row)
 }
 
 func CheckIdempotentRegister(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := post(c, github, "acme", "k-1")
+	c := hApi(ctx)
+	first := hPost(c, hGithub, "acme", "k-1")
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	replay := post(c, github, "acme", "k-1")
+	replay := hPost(c, hGithub, "acme", "k-1")
 	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the connector the first attempt created")
-	ctx.Equal(connectorOf(replay), connectorOf(first), "the connector a replay answers")
+	ctx.Equal(hConnectorOf(replay), hConnectorOf(first), "the connector a replay answers")
 	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 1, "two registrations with one key; the connectors")
-	other := post(c, github, "globex", "k-1")
-	ctx.Assert(other.Status == 201 && connectorOf(other) != connectorOf(first), "the same key from another tenant is another registration, got %d %s", other.Status, other.Text())
-	missing := post(c, github, "acme", "")
+	other := hPost(c, hGithub, "globex", "k-1")
+	ctx.Assert(other.Status == 201 && hConnectorOf(other) != hConnectorOf(first), "the same key from another tenant is another registration, got %d %s", other.Status, other.Text())
+	missing := hPost(c, hGithub, "acme", "")
 	ctx.Equal(missing.Status, 400, "a registration without Idempotency-Key")
 	ctx.Equal(len(ctx.Redis.Keys("connector:c-*")), 2, "a registration without Idempotency-Key must create nothing; the connectors")
 }
@@ -899,10 +899,10 @@ func CheckIdempotentRegister(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kToken = "vault:acme/github#4";
-const nlohmann::json kGithub = {{"source_type", "github"}, {"token_ref", kToken}, {"base_url", "https://api.github.com"}};
+const std::string kHToken = "vault:acme/github#4";
+const nlohmann::json kHGithub = {{"source_type", "github"}, {"token_ref", kHToken}, {"base_url", "https://api.github.com"}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -910,14 +910,14 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
   const std::string text = body.dump();
   if (tenant.empty()) return c.Post("/v1/connectors", text, "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/connectors", text, "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/connectors", text, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) {
+nlohmann::json hBodyOf(const harness::Response& r) {
   try {
     return nlohmann::json::parse(r.Text());
   } catch (const std::exception&) {
@@ -925,19 +925,19 @@ nlohmann::json bodyOf(const harness::Response& r) {
   }
 }
 
-std::string connectorOf(const harness::Response& r) {
-  const auto body = bodyOf(r);
+std::string hConnectorOf(const harness::Response& r) {
+  const auto body = hBodyOf(r);
   return body.is_object() ? body.value("connector_id", "") : "";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kGithub, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto r = hPost(c, kHGithub, "acme", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/connectors (%s)", r.Text());
-  const auto body = bodyOf(r);
-  const auto row = store::get(connectorOf(r));
+  const auto body = hBodyOf(r);
+  const auto row = store::get(hConnectorOf(r));
   ctx.Assert(row.has_value(), "the answer %s names no connector the registry holds", r.Text());
   ctx.Assert(row->tenant == "acme" && row->source_type == "github" && row->host == "api.github.com",
              "the registry holds tenant %q, source %q, host %q, expected acme, github, api.github.com", row->tenant, row->source_type, row->host);
@@ -945,56 +945,56 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantAndSource(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto anon = post(c, kGithub, "", "k-1");
+  auto c = hApi(ctx);
+  const auto anon = hPost(c, kHGithub, "", "k-1");
   ctx.Equal(anon.Status, 401, "a registration without X-Tenant-Id");
-  const auto blank = c.Post("/v1/connectors", kGithub.dump(), "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", "k-blank");
+  const auto blank = c.Post("/v1/connectors", kHGithub.dump(), "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", "k-blank");
   ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id (an empty header names no tenant)");
-  const auto ftp = post(c, {{"source_type", "ftp"}, {"token_ref", kToken}}, "acme", "k-2");
+  const auto ftp = hPost(c, {{"source_type", "ftp"}, {"token_ref", kHToken}}, "acme", "k-2");
   ctx.Equal(ftp.Status, 400, "a registration for source_type ftp (only the sources in kRegisteredHosts have a host the platform registered)");
   ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 0, "refused registrations must create nothing; the connectors");
 }
 
 void CheckRegisteredHost(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const std::string url : {"https://169.254.169.254/latest/meta-data", "https://api.github.com.evil.io", "http://api.github.com",
                                 "https://evil.io/?next=https://api.github.com", "https://api.github.com@169.254.169.254/"}) {
-    nlohmann::json body = kGithub;
+    nlohmann::json body = kHGithub;
     body["base_url"] = url;
-    const auto r = post(c, body, "acme", url);
+    const auto r = hPost(c, body, "acme", url);
     ctx.Equal(r.Status, 403, "base_url %s: the sync worker would call a host the platform never registered for github, with the customer's token; the status", url);
   }
-  const auto slack = post(c, {{"source_type", "slack"}, {"token_ref", kToken}, {"base_url", "https://evilslack.com"}}, "acme", "k-slack");
+  const auto slack = hPost(c, {{"source_type", "slack"}, {"token_ref", kHToken}, {"base_url", "https://evilslack.com"}}, "acme", "k-slack");
   ctx.Equal(slack.Status, 403, "a slack registration with base_url https://evilslack.com (the host must be exactly slack.com, not a name that ends with it); the status");
   ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 0, "refused registrations must create nothing; the connectors");
-  const auto r = post(c, {{"source_type", "github"}, {"token_ref", kToken}}, "acme", "k-none");
-  ctx.Assert(r.Status == 201 && bodyOf(r).value("host", "") == "api.github.com", "a registration without base_url must take the registered host, got %d %s", r.Status, r.Text());
+  const auto r = hPost(c, {{"source_type", "github"}, {"token_ref", kHToken}}, "acme", "k-none");
+  ctx.Assert(r.Status == 201 && hBodyOf(r).value("host", "") == "api.github.com", "a registration without base_url must take the registered host, got %d %s", r.Status, r.Text());
 }
 
 void CheckTokenRedacted(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, kGithub, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto first = hPost(c, kHGithub, "acme", "k-1");
   ctx.Equal(first.Status, 201, "POST /v1/connectors (%s)", first.Text());
-  const auto replay = post(c, kGithub, "acme", "k-1");
+  const auto replay = hPost(c, kHGithub, "acme", "k-1");
   for (const auto* r : {&first, &replay}) {
-    ctx.Assert(r->Text().find(kToken) == std::string::npos,
+    ctx.Assert(r->Text().find(kHToken) == std::string::npos,
                "the answer carries the token reference: %s. Answer {connector_id, source_type, host, status}; the reference stays in the registry", r->Text());
   }
-  const auto row = store::get(connectorOf(first));
-  ctx.Assert(row && row->token_ref == kToken, "the registry must keep the token reference, it holds %q", row ? row->token_ref : "");
+  const auto row = store::get(hConnectorOf(first));
+  ctx.Assert(row && row->token_ref == kHToken, "the registry must keep the token reference, it holds %q", row ? row->token_ref : "");
 }
 
 void CheckIdempotentRegister(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, kGithub, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto first = hPost(c, kHGithub, "acme", "k-1");
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const auto replay = post(c, kGithub, "acme", "k-1");
+  const auto replay = hPost(c, kHGithub, "acme", "k-1");
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the connector the first attempt created");
-  ctx.Equal(connectorOf(replay), connectorOf(first), "the connector a replay answers");
+  ctx.Equal(hConnectorOf(replay), hConnectorOf(first), "the connector a replay answers");
   ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 1, "two registrations with one key; the connectors");
-  const auto other = post(c, kGithub, "globex", "k-1");
-  ctx.Assert(other.Status == 201 && connectorOf(other) != connectorOf(first), "the same key from another tenant is another registration, got %d %s", other.Status, other.Text());
-  const auto missing = post(c, kGithub, "acme", "");
+  const auto other = hPost(c, kHGithub, "globex", "k-1");
+  ctx.Assert(other.Status == 201 && hConnectorOf(other) != hConnectorOf(first), "the same key from another tenant is another registration, got %d %s", other.Status, other.Text());
+  const auto missing = hPost(c, kHGithub, "acme", "");
   ctx.Equal(missing.Status, 400, "a registration without Idempotency-Key");
   ctx.Equal(ctx.Redis.Keys("connector:c-*").size(), 2, "a registration without Idempotency-Key must create nothing; the connectors");
 }

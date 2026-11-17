@@ -686,15 +686,15 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsText = "Mail ada@example.com or call 415-555-0132."
+const kHEventsText = "Mail ada@example.com or call 415-555-0132."
 
-func eventsEmit(ctx *harness.Ctx, documentID, text string) {
+func hEventsEmit(ctx *harness.Ctx, documentID, text string) {
 	detection := spans.Detection{Spans: spans.Scan(text, []string{"EMAIL", "PHONE"}), Source: "model", DetectorVersion: "ner-2026.10"}
 	ctx.NoError(emitRedacted(context.Background(), "acme", documentID, text, detection), "emitRedacted(%s)", documentID)
 	ctx.Settle()
 }
 
-func eventsParsed(ctx *harness.Ctx) []map[string]any {
+func hEventsParsed(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, value := range ctx.Kafka.Values(topic) {
 		var e map[string]any
@@ -705,20 +705,20 @@ func eventsParsed(ctx *harness.Ctx) []map[string]any {
 }
 
 // eventsStrings is every string value in a decoded event, at any depth (the keys left out).
-func eventsStrings(value any) []string {
+func hEventsStrings(value any) []string {
 	switch v := value.(type) {
 	case string:
 		return []string{v}
 	case map[string]any:
 		var out []string
 		for _, e := range v {
-			out = append(out, eventsStrings(e)...)
+			out = append(out, hEventsStrings(e)...)
 		}
 		return out
 	case []any:
 		var out []string
 		for _, e := range v {
-			out = append(out, eventsStrings(e)...)
+			out = append(out, hEventsStrings(e)...)
 		}
 		return out
 	}
@@ -726,22 +726,22 @@ func eventsStrings(value any) []string {
 }
 
 func CheckDocumentKey(ctx *harness.Ctx) {
-	eventsEmit(ctx, "d-1", eventsText)
-	eventsEmit(ctx, "d-2", "Nothing personal in this sentence.")
+	hEventsEmit(ctx, "d-1", kHEventsText)
+	hEventsEmit(ctx, "d-2", "Nothing personal in this sentence.")
 	ctx.Equal(ctx.Kafka.Keys(topic), []string{"d-1", "d-2"}, "a redaction with two spans and one with none must leave one record each keyed by the document id (keyed by entity, a document's audit spreads over partitions and a clean one leaves no trace); the keys")
 }
 
 func CheckContentFree(ctx *harness.Ctx) {
-	eventsEmit(ctx, "d-1", eventsText)
+	hEventsEmit(ctx, "d-1", kHEventsText)
 	for _, value := range ctx.Kafka.Values(topic) {
 		ctx.Assert(!strings.Contains(value, "ada@example.com") && !strings.Contains(value, "415-555-0132"), "the audit event carries a removed value: %s. The topic is retained and replicated; offsets and types only", value)
 	}
-	all := eventsParsed(ctx)
+	all := hEventsParsed(ctx)
 	for _, event := range all {
-		for _, s := range eventsStrings(event) {
+		for _, s := range hEventsStrings(event) {
 			var leaked []string
 			for i := 0; i+4 <= len(s); i++ {
-				if strings.Contains(eventsText, s[i:i+4]) {
+				if strings.Contains(kHEventsText, s[i:i+4]) {
 					leaked = append(leaked, s[i:i+4])
 				}
 			}
@@ -749,13 +749,13 @@ func CheckContentFree(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(len(all), 1, "one redaction; the records")
-	email, phone := strings.Index(eventsText, "ada@"), strings.Index(eventsText, "415")
+	email, phone := strings.Index(kHEventsText, "ada@"), strings.Index(kHEventsText, "415")
 	ctx.Equal(all[0]["spans"], []any{
 		map[string]any{"start": float64(email), "end": float64(email + 15), "entity": "EMAIL"},
 		map[string]any{"start": float64(phone), "end": float64(phone + 12), "entity": "PHONE"},
 	}, "the event's spans must be the offsets and types")
 	ctx.Equal(all[0]["entity_counts"], map[string]any{"EMAIL": float64(1), "PHONE": float64(1)}, "the event's entity_counts")
-	ctx.Assert(all[0]["text_length"] == float64(len(eventsText)) && all[0]["detector_version"] == "ner-2026.10" && all[0]["tenant"] == "acme", "the event must carry tenant, text_length and detector_version, got %v", all[0])
+	ctx.Assert(all[0]["text_length"] == float64(len(kHEventsText)) && all[0]["detector_version"] == "ner-2026.10" && all[0]["tenant"] == "acme", "the event must carry tenant, text_length and detector_version, got %v", all[0])
 	ctx.Equal(all[0]["source"], "model", "the event must carry the detection's source")
 }
 
@@ -767,7 +767,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 				ctx.Fatalf("emitRedacted panicked when the broker refused the delivery: %v; the event goes to the outbox and the redaction goes on", e)
 			}
 		}()
-		eventsEmit(ctx, "d-1", eventsText)
+		hEventsEmit(ctx, "d-1", kHEventsText)
 	}()
 	rows, err := store.OutboxRows(context.Background())
 	ctx.NoError(err, "store.OutboxRows")
@@ -775,14 +775,14 @@ func CheckOutbox(ctx *harness.Ctx) {
 	var event map[string]any
 	json.Unmarshal(rows[0].Event, &event)
 	ctx.Equal(event["document_id"], "d-1", "the outbox row must hold the event; its document_id")
-	email, phone := strings.Index(eventsText, "ada@"), strings.Index(eventsText, "415")
+	email, phone := strings.Index(kHEventsText, "ada@"), strings.Index(kHEventsText, "415")
 	ctx.Equal(event["spans"], []any{
 		map[string]any{"start": float64(email), "end": float64(email + 15), "entity": "EMAIL"},
 		map[string]any{"start": float64(phone), "end": float64(phone + 12), "entity": "PHONE"},
 	}, "the outbox row must hold the whole event the relay will produce; its spans")
-	ctx.Equal(event["text_length"], float64(len(eventsText)), "the outbox row must hold the whole event the relay will produce; its text_length")
+	ctx.Equal(event["text_length"], float64(len(kHEventsText)), "the outbox row must hold the whole event the relay will produce; its text_length")
 	ctx.Assert(!strings.Contains(string(rows[0].Event), "ada@example.com"), "the outbox row carries a removed value: %s", rows[0].Event)
-	eventsEmit(ctx, "d-2", eventsText)
+	hEventsEmit(ctx, "d-2", kHEventsText)
 	rows, _ = store.OutboxRows(context.Background())
 	ctx.Assert(len(rows) == 1 && len(ctx.Kafka.Records(topic)) >= 1, "a healthy delivery after the failure reaches the topic and adds no outbox row")
 }
@@ -790,9 +790,9 @@ func CheckOutbox(ctx *harness.Ctx) {
 func CheckDurableProducer(ctx *harness.Ctx) {
 	text := "Mail ada@example.com."
 	ctx.Kafka.LoseAcks(topic, 1)
-	eventsEmit(ctx, "d-1", text)
+	hEventsEmit(ctx, "d-1", text)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one redaction whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records")
-	eventsEmit(ctx, "d-2", text)
+	hEventsEmit(ctx, "d-2", text)
 	lost := ctx.Kafka.Failover(topic)
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records", lost)
 }
@@ -807,65 +807,65 @@ func CheckDurableProducer(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kText = "Mail ada@example.com or call 415-555-0132.";
+const std::string kHText = "Mail ada@example.com or call 415-555-0132.";
 
-void emit(harness::Ctx& ctx, const std::string& document_id, const std::string& text) {
+void hEmit(harness::Ctx& ctx, const std::string& document_id, const std::string& text) {
   emit_redacted("acme", document_id, text, spans::Detection{spans::scan(text, {"EMAIL", "PHONE"}), "model", false, "ner-2026.10"});
   ctx.Settle();
   producer->flush(1000);  // serve the delivery reports, as the service's loop would
 }
 
-std::vector<nlohmann::json> parsed(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hParsed(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& value : ctx.Kafka.Values(kTopic)) out.push_back(nlohmann::json::parse(value, nullptr, false));
   return out;
 }
 
 // Every string value in a decoded event, at any depth (the keys left out).
-void strings_in(const nlohmann::json& value, std::vector<std::string>& out) {
+void hStringsIn(const nlohmann::json& value, std::vector<std::string>& out) {
   if (value.is_string()) {
     out.push_back(value.get<std::string>());
   } else if (value.is_structured()) {
-    for (const auto& e : value) strings_in(e, out);
+    for (const auto& e : value) hStringsIn(e, out);
   }
 }
 
 }  // namespace
 
 void CheckDocumentKey(harness::Ctx& ctx) {
-  emit(ctx, "d-1", kText);
-  emit(ctx, "d-2", "Nothing personal in this sentence.");
+  hEmit(ctx, "d-1", kHText);
+  hEmit(ctx, "d-2", "Nothing personal in this sentence.");
   ctx.Equal(ctx.Kafka.Keys(kTopic), {"d-1", "d-2"}, "a redaction with two spans and one with none must leave one record each keyed by the document id (keyed by entity, a document's audit spreads over partitions and a clean one leaves no trace); the keys");
 }
 
 void CheckContentFree(harness::Ctx& ctx) {
-  emit(ctx, "d-1", kText);
+  hEmit(ctx, "d-1", kHText);
   for (const auto& value : ctx.Kafka.Values(kTopic)) {
     ctx.Assert(value.find("ada@example.com") == std::string::npos && value.find("415-555-0132") == std::string::npos, "the audit event carries a removed value: %s. The topic is retained and replicated; offsets and types only", value);
   }
-  const auto all = parsed(ctx);
+  const auto all = hParsed(ctx);
   std::vector<std::string> values;
-  for (const auto& event : all) strings_in(event, values);
+  for (const auto& event : all) hStringsIn(event, values);
   for (const std::string& s : values) {
     std::vector<std::string> leaked;
     for (size_t i = 0; i + 4 <= s.size(); i++) {
-      if (kText.find(s.substr(i, 4)) != std::string::npos) leaked.push_back(s.substr(i, 4));
+      if (kHText.find(s.substr(i, 4)) != std::string::npos) leaked.push_back(s.substr(i, 4));
     }
     ctx.Assert(leaked.empty(), "the audit event carries text from the document (%s shares %v with it). Neither part of a removed value nor the text around it belongs in the topic", s, leaked);
   }
   ctx.Equal(all.size(), 1, "one redaction; the records");
-  const long email = static_cast<long>(kText.find("ada@"));
-  const long phone = static_cast<long>(kText.find("415"));
+  const long email = static_cast<long>(kHText.find("ada@"));
+  const long phone = static_cast<long>(kHText.find("415"));
   ctx.Equal(all[0].value("spans", nlohmann::json()), nlohmann::json::array({{{"start", email}, {"end", email + 15}, {"entity", "EMAIL"}}, {{"start", phone}, {"end", phone + 12}, {"entity", "PHONE"}}}), "the event's spans must be the offsets and types");
   ctx.Equal(all[0].value("entity_counts", nlohmann::json()), nlohmann::json({{"EMAIL", 1}, {"PHONE", 1}}), "the event's entity_counts");
-  ctx.Assert(all[0].value("text_length", 0L) == static_cast<long>(kText.size()) && all[0].value("detector_version", "") == "ner-2026.10" && all[0].value("tenant", "") == "acme", "the event must carry tenant, text_length and detector_version, got %s", all[0].dump());
+  ctx.Assert(all[0].value("text_length", 0L) == static_cast<long>(kHText.size()) && all[0].value("detector_version", "") == "ner-2026.10" && all[0].value("tenant", "") == "acme", "the event must carry tenant, text_length and detector_version, got %s", all[0].dump());
   ctx.Equal(all[0].value("source", ""), "model", "the event must carry the detection's source");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
   try {
-    emit(ctx, "d-1", kText);
+    hEmit(ctx, "d-1", kHText);
   } catch (const std::exception& e) {
     ctx.Fatalf("emit_redacted threw when the broker refused the delivery: %s; the event goes to the outbox and the redaction goes on", e.what());
   }
@@ -873,13 +873,13 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(rows.size(), 1, "the broker refused one delivery: without an outbox row the audit fact of that redaction is gone; outbox rows");
   const nlohmann::json event = rows[0]["event"];
   ctx.Equal(event.value("document_id", ""), "d-1", "the outbox row must hold the event; its document_id");
-  const long email = static_cast<long>(kText.find("ada@"));
-  const long phone = static_cast<long>(kText.find("415"));
+  const long email = static_cast<long>(kHText.find("ada@"));
+  const long phone = static_cast<long>(kHText.find("415"));
   ctx.Equal(event.value("spans", nlohmann::json()), nlohmann::json::array({{{"start", email}, {"end", email + 15}, {"entity", "EMAIL"}}, {{"start", phone}, {"end", phone + 12}, {"entity", "PHONE"}}}),
             "the outbox row must hold the whole event the relay will produce; its spans");
-  ctx.Equal(event.value("text_length", 0L), static_cast<long>(kText.size()), "the outbox row must hold the whole event the relay will produce; its text_length");
+  ctx.Equal(event.value("text_length", 0L), static_cast<long>(kHText.size()), "the outbox row must hold the whole event the relay will produce; its text_length");
   ctx.Assert(rows[0].dump().find("ada@example.com") == std::string::npos, "the outbox row carries a removed value: %s", rows[0].dump());
-  emit(ctx, "d-2", kText);
+  hEmit(ctx, "d-2", kHText);
   rows = store::outbox_rows();
   ctx.Assert(rows.size() == 1 && !ctx.Kafka.Records(kTopic).empty(), "a healthy delivery after the failure reaches the topic and adds no outbox row");
 }
@@ -887,9 +887,9 @@ void CheckOutbox(harness::Ctx& ctx) {
 void CheckDurableProducer(harness::Ctx& ctx) {
   const std::string text = "Mail ada@example.com.";
   ctx.Kafka.LoseAcks(kTopic, 1);
-  emit(ctx, "d-1", text);
+  hEmit(ctx, "d-1", text);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one redaction whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records");
-  emit(ctx, "d-2", text);
+  hEmit(ctx, "d-2", text);
   const int lost = ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records", lost);
 }

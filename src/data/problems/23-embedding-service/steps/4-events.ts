@@ -677,13 +677,13 @@ import (
 )
 
 const (
-	eventsTenant = "acme"
-	eventsDoc    = "doc-42"
+	kHEventsTenant = "acme"
+	kHEventsDoc    = "doc-42"
 )
 
-var eventsTexts = []string{"Rotate keys every 90 days.", "Revoke a leaked key at once.", "Audit key use weekly."}
+var hEventsTexts = []string{"Rotate keys every 90 days.", "Revoke a leaked key at once.", "Audit key use weekly."}
 
-func eventsChunks(texts []string) []config.Chunk {
+func hEventsChunks(texts []string) []config.Chunk {
 	out := make([]config.Chunk, 0, len(texts))
 	for _, t := range texts {
 		out = append(out, config.Chunk{Text: t, Vector: model.VectorFor(config.ModelVersion, t)})
@@ -691,7 +691,7 @@ func eventsChunks(texts []string) []config.Chunk {
 	return out
 }
 
-func eventsHashes(texts []string) []string {
+func hEventsHashes(texts []string) []string {
 	out := make([]string, 0, len(texts))
 	for _, t := range texts {
 		out = append(out, config.ContentHash(t))
@@ -699,12 +699,12 @@ func eventsHashes(texts []string) []string {
 	return out
 }
 
-func eventsPublish(ctx *harness.Ctx, documentID string, texts []string) {
-	_, err := publishReady(context.Background(), eventsTenant, documentID, eventsChunks(texts))
+func hEventsPublish(ctx *harness.Ctx, documentID string, texts []string) {
+	_, err := publishReady(context.Background(), kHEventsTenant, documentID, hEventsChunks(texts))
 	ctx.NoError(err, "publishReady(%s)", documentID)
 }
 
-func eventsOutbox(ctx *harness.Ctx) []map[string]string {
+func hEventsOutbox(ctx *harness.Ctx) []map[string]string {
 	var out []map[string]string
 	for _, row := range ctx.Redis.LRange("outbox:embed", 0, -1) {
 		var r map[string]string
@@ -715,58 +715,58 @@ func eventsOutbox(ctx *harness.Ctx) []map[string]string {
 }
 
 func CheckDocumentEvent(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsDoc, eventsTexts)
-	eventsPublish(ctx, "doc-43", []string{"Use one key per service."})
+	hEventsPublish(ctx, kHEventsDoc, hEventsTexts)
+	hEventsPublish(ctx, "doc-43", []string{"Use one key per service."})
 	ctx.Settle()
 	records := ctx.Kafka.Records(config.Topic)
 	ctx.Equal(len(records), 2, "two documents (three chunks and one) must produce one event each on %s, so the indexer knows a document is complete; records", config.Topic)
 	keys := ctx.Kafka.Keys(config.Topic)
-	ctx.Assert(len(keys) == 2 && ((keys[0] == eventsDoc && keys[1] == "doc-43") || (keys[0] == "doc-43" && keys[1] == eventsDoc)), "records must be keyed by document id, got %v", keys)
+	ctx.Assert(len(keys) == 2 && ((keys[0] == kHEventsDoc && keys[1] == "doc-43") || (keys[0] == "doc-43" && keys[1] == kHEventsDoc)), "records must be keyed by document id, got %v", keys)
 	var event map[string]any
 	for _, r := range records {
-		if string(r.Key) == eventsDoc {
+		if string(r.Key) == kHEventsDoc {
 			ctx.NoError(json.Unmarshal(r.Value, &event), "the event is JSON: %s", r.Value)
 		}
 	}
-	ctx.Equal(event["tenant"], eventsTenant, "the event's tenant (%v)", event)
-	ctx.Equal(event["document_id"], eventsDoc, "the event's document_id (%v)", event)
+	ctx.Equal(event["tenant"], kHEventsTenant, "the event's tenant (%v)", event)
+	ctx.Equal(event["document_id"], kHEventsDoc, "the event's document_id (%v)", event)
 	ctx.Equal(event["model_version"], config.ModelVersion, "the event's model_version (%v)", event)
 	hashes := []any{}
-	for _, h := range eventsHashes(eventsTexts) {
+	for _, h := range hEventsHashes(hEventsTexts) {
 		hashes = append(hashes, h)
 	}
 	ctx.Equal(event["content_hashes"], hashes, "the event must list every chunk's content hash in order")
 	ctx.Equal(event["chunk_count"], 3, "the event's chunk_count")
 	for _, r := range records {
-		for _, t := range eventsTexts {
+		for _, t := range hEventsTexts {
 			ctx.Assert(!strings.Contains(string(r.Value), t), "the event carries chunk text (%q): it names the chunks by content hash, and the text stays with the tenant's data", t)
 		}
 	}
 }
 
 func CheckAfterWrite(ctx *harness.Ctx) {
-	last := config.VectorKey(eventsTenant, config.ModelVersion, config.ContentHash(eventsTexts[2]))
+	last := config.VectorKey(kHEventsTenant, config.ModelVersion, config.ContentHash(hEventsTexts[2]))
 	probe := ctx.Redis.After(last, func() any { return len(ctx.Kafka.Records(config.Topic)) })
-	eventsPublish(ctx, eventsDoc, eventsTexts)
+	hEventsPublish(ctx, kHEventsDoc, hEventsTexts)
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "publishReady never wrote the last chunk's vector (%s)", last)
 	ctx.Equal(probe.Result, 0, "when the last chunk's vector was being stored, records were already on %s: the indexer would fetch a vector that is not there yet; records at that moment", config.Topic)
-	for _, t := range eventsTexts {
-		_, ok := ctx.Redis.Get(config.VectorKey(eventsTenant, config.ModelVersion, config.ContentHash(t)))
+	for _, t := range hEventsTexts {
+		_, ok := ctx.Redis.Get(config.VectorKey(kHEventsTenant, config.ModelVersion, config.ContentHash(t)))
 		ctx.Assert(ok, "every chunk's vector is stored; %q is missing", t)
 	}
 	ctx.Assert(len(ctx.Kafka.Records(config.Topic)) >= 1, "the document is announced once its vectors are stored")
 	// A store that fails (the key holds another type) holds the event back: the indexer would fetch a vector that is not there.
 	broken := "Rotate the signing key."
-	ctx.Redis.Do("RPUSH", config.VectorKey(eventsTenant, config.ModelVersion, config.ContentHash(broken)), "not a vector")
+	ctx.Redis.Do("RPUSH", config.VectorKey(kHEventsTenant, config.ModelVersion, config.ContentHash(broken)), "not a vector")
 	before := len(ctx.Kafka.Records(config.Topic))
 	func() {
 		defer func() { recover() }() // the failure may reach the caller; an event may not
-		publishReady(context.Background(), eventsTenant, "doc-44", eventsChunks([]string{eventsTexts[0], broken}))
+		publishReady(context.Background(), kHEventsTenant, "doc-44", hEventsChunks([]string{hEventsTexts[0], broken}))
 	}()
 	ctx.Settle()
 	announced := len(ctx.Kafka.Records(config.Topic)) - before
-	for _, row := range eventsOutbox(ctx) {
+	for _, row := range hEventsOutbox(ctx) {
 		if row["key"] == "doc-44" {
 			announced++
 		}
@@ -775,7 +775,7 @@ func CheckAfterWrite(ctx *harness.Ctx) {
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	eventsPublish(ctx, eventsDoc, eventsTexts)
+	hEventsPublish(ctx, kHEventsDoc, hEventsTexts)
 	ctx.Settle()
 	produced := len(ctx.Kafka.Records(config.Topic))
 	ctx.Assert(produced >= 1, "publishReady produced nothing on %s", config.Topic)
@@ -792,19 +792,19 @@ func CheckOutbox(ctx *harness.Ctx) {
 				ctx.Fatalf("publishReady panicked when the broker refused the record: %v; the event goes to the outbox and the worker goes on", e)
 			}
 		}()
-		eventsPublish(ctx, eventsDoc, eventsTexts)
+		hEventsPublish(ctx, kHEventsDoc, hEventsTexts)
 	}()
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused the record: the refusal arrives as the WriteMessages error, which is where the outbox row is written; outbox rows")
-	ctx.Assert(rows[0]["topic"] == config.Topic && rows[0]["key"] == eventsDoc, "the outbox row must carry the topic and the document key, got %v", rows[0])
+	ctx.Assert(rows[0]["topic"] == config.Topic && rows[0]["key"] == kHEventsDoc, "the outbox row must carry the topic and the document key, got %v", rows[0])
 	var event map[string]any
 	json.Unmarshal([]byte(rows[0]["value"]), &event)
-	ctx.Equal(event["document_id"], eventsDoc, "the outbox row's value must be the event (%v)", rows[0])
+	ctx.Equal(event["document_id"], kHEventsDoc, "the outbox row's value must be the event (%v)", rows[0])
 	ctx.Equal(len(ctx.Kafka.Records(config.Topic)), 0, "nothing reached the topic for the refused record; records")
-	eventsPublish(ctx, "doc-43", []string{"Use one key per service."})
+	hEventsPublish(ctx, "doc-43", []string{"Use one key per service."})
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(config.Topic)) == 1 && len(eventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(config.Topic)) == 1 && len(hEventsOutbox(ctx)) == 1, "a healthy produce after the failure reaches the topic and adds no outbox row")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -820,11 +820,11 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTenant = "acme";
-const std::string kDoc = "doc-42";
-const std::vector<std::string> kTexts = {"Rotate keys every 90 days.", "Revoke a leaked key at once.", "Audit key use weekly."};
+const std::string kHTenant = "acme";
+const std::string kHDoc = "doc-42";
+const std::vector<std::string> kHTexts = {"Rotate keys every 90 days.", "Revoke a leaked key at once.", "Audit key use weekly."};
 
-std::vector<config::Chunk> chunksOf(const std::vector<std::string>& texts) {
+std::vector<config::Chunk> hChunksOf(const std::vector<std::string>& texts) {
   std::vector<config::Chunk> out;
   for (const auto& t : texts) out.push_back({t, model::vectorFor(config::kModelVersion, t)});
   return out;
@@ -837,12 +837,12 @@ std::vector<std::string> hashesOf(const std::vector<std::string>& texts) {
 }
 
 // The worker's loop serves delivery reports between documents.
-void settle(harness::Ctx& ctx) {
+void hSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);
 }
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& row : ctx.Redis.LRange("outbox:embed", 0, -1)) out.push_back(nlohmann::json::parse(row, nullptr, false));
   return out;
@@ -851,53 +851,53 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckDocumentEvent(harness::Ctx& ctx) {
-  publishReady(kTenant, kDoc, chunksOf(kTexts));
-  publishReady(kTenant, "doc-43", chunksOf({"Use one key per service."}));
-  settle(ctx);
+  publishReady(kHTenant, kHDoc, hChunksOf(kHTexts));
+  publishReady(kHTenant, "doc-43", hChunksOf({"Use one key per service."}));
+  hSettle(ctx);
   const auto records = ctx.Kafka.Records(config::kTopic);
   ctx.Equal(records.size(), 2, "two documents (three chunks and one) must produce one event each on %s, so the indexer knows a document is complete; records", config::kTopic);
-  ctx.Equal(ctx.Kafka.Keys(config::kTopic), std::vector<std::string>{kDoc, "doc-43"}, "records must be keyed by document id");
+  ctx.Equal(ctx.Kafka.Keys(config::kTopic), std::vector<std::string>{kHDoc, "doc-43"}, "records must be keyed by document id");
   const auto event = nlohmann::json::parse(records[0].Value.value_or("null"), nullptr, false);
-  ctx.Equal(event.value("tenant", ""), kTenant, "the event's tenant (%v)", event);
-  ctx.Equal(event.value("document_id", ""), kDoc, "the event's document_id (%v)", event);
+  ctx.Equal(event.value("tenant", ""), kHTenant, "the event's tenant (%v)", event);
+  ctx.Equal(event.value("document_id", ""), kHDoc, "the event's document_id (%v)", event);
   ctx.Equal(event.value("model_version", ""), config::kModelVersion, "the event's model_version (%v)", event);
-  ctx.Equal(event.value("content_hashes", nlohmann::json::array()), nlohmann::json(hashesOf(kTexts)), "the event must list every chunk's content hash in order");
+  ctx.Equal(event.value("content_hashes", nlohmann::json::array()), nlohmann::json(hashesOf(kHTexts)), "the event must list every chunk's content hash in order");
   ctx.Equal(event.value("chunk_count", 0), 3, "the event's chunk_count");
-  for (const auto& t : kTexts) ctx.Assert(records[0].Value.value_or("").find(t) == std::string::npos, "the event carries chunk text (%q): it names the chunks by content hash, and the text stays with the tenant's data", t);
+  for (const auto& t : kHTexts) ctx.Assert(records[0].Value.value_or("").find(t) == std::string::npos, "the event carries chunk text (%q): it names the chunks by content hash, and the text stays with the tenant's data", t);
 }
 
 void CheckAfterWrite(harness::Ctx& ctx) {
-  const std::string last = config::vectorKey(kTenant, config::kModelVersion, config::contentHash(kTexts[2]));
+  const std::string last = config::vectorKey(kHTenant, config::kModelVersion, config::contentHash(kHTexts[2]));
   bool fired = false;
   size_t seen = 0;
   ctx.Redis.After(last, [&] {
     fired = true;
     seen = ctx.Kafka.Records(config::kTopic).size();
   });
-  publishReady(kTenant, kDoc, chunksOf(kTexts));
-  settle(ctx);
+  publishReady(kHTenant, kHDoc, hChunksOf(kHTexts));
+  hSettle(ctx);
   ctx.Assert(fired, "publishReady never wrote the last chunk's vector (%s)", last);
   ctx.Assert(seen == 0, "when the last chunk's vector was being stored, %d record(s) were already on %s: the indexer would fetch a vector that is not there yet", seen, config::kTopic);
-  for (const auto& t : kTexts) ctx.Assert(ctx.Redis.Get(config::vectorKey(kTenant, config::kModelVersion, config::contentHash(t))).has_value(), "every chunk's vector is stored; %q is missing", t);
+  for (const auto& t : kHTexts) ctx.Assert(ctx.Redis.Get(config::vectorKey(kHTenant, config::kModelVersion, config::contentHash(t))).has_value(), "every chunk's vector is stored; %q is missing", t);
   ctx.Assert(!ctx.Kafka.Records(config::kTopic).empty(), "the document is announced once its vectors are stored");
   // A store that fails (the key holds another type) holds the event back: the indexer would fetch a vector that is not there.
   const std::string broken = "Rotate the signing key.";
-  ctx.Redis.Do("RPUSH", config::vectorKey(kTenant, config::kModelVersion, config::contentHash(broken)), "not a vector");
+  ctx.Redis.Do("RPUSH", config::vectorKey(kHTenant, config::kModelVersion, config::contentHash(broken)), "not a vector");
   const size_t before = ctx.Kafka.Records(config::kTopic).size();
   try {
-    publishReady(kTenant, "doc-44", chunksOf({kTexts[0], broken}));
+    publishReady(kHTenant, "doc-44", hChunksOf({kHTexts[0], broken}));
   } catch (const std::exception&) {
     // The failure may reach the caller; an event may not.
   }
-  settle(ctx);
+  hSettle(ctx);
   size_t announced = ctx.Kafka.Records(config::kTopic).size() - before;
-  for (const auto& row : outboxRows(ctx)) announced += row.value("key", "") == "doc-44" ? 1 : 0;
+  for (const auto& row : hOutboxRows(ctx)) announced += row.value("key", "") == "doc-44" ? 1 : 0;
   ctx.Equal(announced, 0, "storing one chunk's vector failed, yet doc-44 was announced: an event for a document whose vectors are not all stored sends the indexer to a vector that is not there; events and outbox rows for doc-44");
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
-  publishReady(kTenant, kDoc, chunksOf(kTexts));
-  settle(ctx);
+  publishReady(kHTenant, kHDoc, hChunksOf(kHTexts));
+  hSettle(ctx);
   const size_t produced = ctx.Kafka.Records(config::kTopic).size();
   ctx.Assert(produced >= 1, "publishReady produced nothing on %s", config::kTopic);
   ctx.Kafka.Failover(config::kTopic);
@@ -908,20 +908,20 @@ void CheckAcksAll(harness::Ctx& ctx) {
 void CheckOutbox(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(config::kTopic, 1);
   try {
-    publishReady(kTenant, kDoc, chunksOf(kTexts));
+    publishReady(kHTenant, kHDoc, hChunksOf(kHTexts));
   } catch (const std::exception& e) {
     ctx.Fatalf("publishReady threw when the broker refused the record: %s; the event goes to the outbox and the worker goes on", e.what());
   }
-  settle(ctx);
-  const auto rows = outboxRows(ctx);
+  hSettle(ctx);
+  const auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused the record: the refusal arrives in the delivery report (dr_cb), which is where the outbox row is written; outbox rows");
-  ctx.Assert(rows[0].value("topic", "") == config::kTopic && rows[0].value("key", "") == kDoc, "the outbox row must carry the topic and the document key, got %v", rows[0]);
+  ctx.Assert(rows[0].value("topic", "") == config::kTopic && rows[0].value("key", "") == kHDoc, "the outbox row must carry the topic and the document key, got %v", rows[0]);
   const auto event = nlohmann::json::parse(rows[0].value("value", "{}"), nullptr, false);
-  ctx.Equal(event.value("document_id", ""), kDoc, "the outbox row's value must be the event (%v)", rows[0]);
+  ctx.Equal(event.value("document_id", ""), kHDoc, "the outbox row's value must be the event (%v)", rows[0]);
   ctx.Equal(ctx.Kafka.Records(config::kTopic).size(), 0, "nothing reached the topic for the refused record; records");
-  publishReady(kTenant, "doc-43", chunksOf({"Use one key per service."}));
-  settle(ctx);
-  ctx.Assert(ctx.Kafka.Records(config::kTopic).size() == 1 && outboxRows(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
+  publishReady(kHTenant, "doc-43", hChunksOf({"Use one key per service."}));
+  hSettle(ctx);
+  ctx.Assert(ctx.Kafka.Records(config::kTopic).size() == 1 && hOutboxRows(ctx).size() == 1, "a healthy produce after the failure reaches the topic and adds no outbox row");
 }
 `,
   },

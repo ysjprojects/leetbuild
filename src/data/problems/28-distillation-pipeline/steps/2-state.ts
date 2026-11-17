@@ -1106,135 +1106,135 @@ import (
 )
 
 const (
-	stateJob  = "j1"
-	stateCost = 512
+	kHStateJob  = "j1"
+	kHStateCost = 512
 )
 
-func stateStart(ctx *harness.Ctx, cap int) {
-	ctx.NoError(startJob(context.Background(), stateJob, cap), "startJob")
+func hStateStart(ctx *harness.Ctx, cap int) {
+	ctx.NoError(startJob(context.Background(), kHStateJob, cap), "startJob")
 }
 
-func stateReserve(ctx *harness.Ctx, prompt string) Reservation {
-	r, err := reserve(context.Background(), stateJob, prompt)
+func hStateReserve(ctx *harness.Ctx, prompt string) Reservation {
+	r, err := reserve(context.Background(), kHStateJob, prompt)
 	ctx.NoError(err, "reserve(%q)", prompt)
 	return r
 }
 
-func stateBudget(ctx *harness.Ctx) int64 {
-	raw, _ := ctx.Redis.Get("distill:budget:" + stateJob)
+func hStateBudget(ctx *harness.Ctx) int64 {
+	raw, _ := ctx.Redis.Get("distill:budget:" + kHStateJob)
 	n, _ := strconv.ParseInt(raw, 10, 64)
 	return n
 }
 
-func stateCount(ctx *harness.Ctx, field string) int64 {
-	n, _ := strconv.ParseInt(ctx.Redis.HGetAll("distill:progress:"+stateJob)[field], 10, 64)
+func hStateCount(ctx *harness.Ctx, field string) int64 {
+	n, _ := strconv.ParseInt(ctx.Redis.HGetAll("distill:progress:"+kHStateJob)[field], 10, 64)
 	return n
 }
 
-func stateSha(prompt string) string {
+func hStateSha(prompt string) string {
 	sum := sha256.Sum256([]byte(prompt))
 	return hex.EncodeToString(sum[:])
 }
 
 func CheckDedupeBeforeSpend(ctx *harness.Ctx) {
-	stateStart(ctx, 2)
-	first := stateReserve(ctx, "What is the capital of France?")
+	hStateStart(ctx, 2)
+	first := hStateReserve(ctx, "What is the capital of France?")
 	ctx.Equal(first.Verdict, "ok", "a fresh prompt must be reserved; the verdict")
-	ctx.Equal(first.Remaining, int64(stateCost), "reserve answers the tokens left after the draw as Remaining")
-	ctx.Equal(stateBudget(ctx), stateCost, "one reservation draws one call; the budget")
-	again := stateReserve(ctx, "What is the capital of France?")
+	ctx.Equal(first.Remaining, int64(kHStateCost), "reserve answers the tokens left after the draw as Remaining")
+	ctx.Equal(hStateBudget(ctx), kHStateCost, "one reservation draws one call; the budget")
+	again := hStateReserve(ctx, "What is the capital of France?")
 	ctx.Equal(again.Verdict, "duplicate", "the same prompt again; the verdict")
-	ctx.Equal(stateBudget(ctx), stateCost, "a duplicate costs nothing (DECRBY ran before SISMEMBER); the budget after the repeat")
-	ctx.Assert(stateCount(ctx, "duplicate") == 1 && stateCount(ctx, "sampled") == 1, "a duplicate counts as duplicate, not sampled: %v", ctx.Redis.HGetAll("distill:progress:"+stateJob))
-	second := stateReserve(ctx, "What is the capital of Peru?")
-	ctx.Assert(second.Verdict == "ok" && stateBudget(ctx) == 0, "the second unique prompt spends the last call: %+v, budget %d", second, stateBudget(ctx))
-	third := stateReserve(ctx, "What is the capital of Chile?")
+	ctx.Equal(hStateBudget(ctx), kHStateCost, "a duplicate costs nothing (DECRBY ran before SISMEMBER); the budget after the repeat")
+	ctx.Assert(hStateCount(ctx, "duplicate") == 1 && hStateCount(ctx, "sampled") == 1, "a duplicate counts as duplicate, not sampled: %v", ctx.Redis.HGetAll("distill:progress:"+kHStateJob))
+	second := hStateReserve(ctx, "What is the capital of Peru?")
+	ctx.Assert(second.Verdict == "ok" && hStateBudget(ctx) == 0, "the second unique prompt spends the last call: %+v, budget %d", second, hStateBudget(ctx))
+	third := hStateReserve(ctx, "What is the capital of Chile?")
 	ctx.Equal(third.Verdict, "budget", "with no budget left; the verdict")
-	ctx.Equal(stateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget")
-	reason, _ := ctx.Redis.HGet("distill:reasons:"+stateJob, "budget")
-	ctx.Assert(stateCount(ctx, "rejected") == 1 && reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:"+stateJob), ctx.Redis.HGetAll("distill:reasons:"+stateJob))
-	ctx.Equal(stateCount(ctx, "sampled"), 3, "a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded (%v); sampled", ctx.Redis.HGetAll("distill:progress:"+stateJob))
-	ctx.Redis.Do("SET", "distill:budget:"+stateJob, stateCost-1)
-	short := stateReserve(ctx, "What is the capital of Bolivia?")
-	ctx.Equal(short.Verdict, "budget", "with %d tokens left, less than one call (%d); the verdict", stateCost-1, stateCost)
-	ctx.Equal(stateBudget(ctx), stateCost-1, "a budget refusal draws nothing; the budget")
+	ctx.Equal(hStateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget")
+	reason, _ := ctx.Redis.HGet("distill:reasons:"+kHStateJob, "budget")
+	ctx.Assert(hStateCount(ctx, "rejected") == 1 && reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:"+kHStateJob), ctx.Redis.HGetAll("distill:reasons:"+kHStateJob))
+	ctx.Equal(hStateCount(ctx, "sampled"), 3, "a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded (%v); sampled", ctx.Redis.HGetAll("distill:progress:"+kHStateJob))
+	ctx.Redis.Do("SET", "distill:budget:"+kHStateJob, kHStateCost-1)
+	short := hStateReserve(ctx, "What is the capital of Bolivia?")
+	ctx.Equal(short.Verdict, "budget", "with %d tokens left, less than one call (%d); the verdict", kHStateCost-1, kHStateCost)
+	ctx.Equal(hStateBudget(ctx), kHStateCost-1, "a budget refusal draws nothing; the budget")
 }
 
 func CheckAtomicScript(ctx *harness.Ctx) {
-	stateStart(ctx, 100)
+	hStateStart(ctx, 100)
 	prompt := "Explain photosynthesis to a ten-year-old."
-	hash := stateSha(prompt)
+	hash := hStateSha(prompt)
 	other := ""
 	// another worker reserving the same prompt, landing between two of this worker's commands;
 	// first a snapshot of what this worker's reservation had done at that moment
 	seenThen, budgetThen, sampledThen := false, int64(0), int64(0)
-	ctx.Redis.After("distill:seen:"+stateJob, func() any {
-		seenThen, budgetThen, sampledThen = ctx.Redis.SIsMember("distill:seen:"+stateJob, hash), stateBudget(ctx), stateCount(ctx, "sampled")
+	ctx.Redis.After("distill:seen:"+kHStateJob, func() any {
+		seenThen, budgetThen, sampledThen = ctx.Redis.SIsMember("distill:seen:"+kHStateJob, hash), hStateBudget(ctx), hStateCount(ctx, "sampled")
 		if seenThen {
 			other = "duplicate"
 			return nil
 		}
-		ctx.Redis.Do("SADD", "distill:seen:"+stateJob, hash)
-		ctx.Redis.Do("DECRBY", "distill:budget:"+stateJob, stateCost)
-		ctx.Redis.Do("HINCRBY", "distill:progress:"+stateJob, "sampled", 1)
+		ctx.Redis.Do("SADD", "distill:seen:"+kHStateJob, hash)
+		ctx.Redis.Do("DECRBY", "distill:budget:"+kHStateJob, kHStateCost)
+		ctx.Redis.Do("HINCRBY", "distill:progress:"+kHStateJob, "sampled", 1)
 		other = "ok"
 		return nil
 	})
-	mine := stateReserve(ctx, prompt)
+	mine := hStateReserve(ctx, prompt)
 	ctx.Assert(other != "", "reserve never touched the seen set")
 	verdicts := []string{mine.Verdict, other}
 	sort.Strings(verdicts)
 	ctx.Equal(verdicts, []string{"duplicate", "ok"}, "two workers reserved the same prompt: the membership test and the spend must run in one script, so exactly one of them pays; the verdicts")
-	ctx.Equal(stateBudget(ctx), 100*stateCost-stateCost, "two workers, one prompt: one call drawn; the budget")
-	ctx.Equal(stateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled")
-	ctx.Assert(!seenThen || (budgetThen == 100*stateCost-stateCost && sampledThen == 1), "the moment the hash was in the seen set, the budget was %d and sampled %d: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step", budgetThen, sampledThen)
+	ctx.Equal(hStateBudget(ctx), 100*kHStateCost-kHStateCost, "two workers, one prompt: one call drawn; the budget")
+	ctx.Equal(hStateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled")
+	ctx.Assert(!seenThen || (budgetThen == 100*kHStateCost-kHStateCost && sampledThen == 1), "the moment the hash was in the seen set, the budget was %d and sampled %d: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step", budgetThen, sampledThen)
 }
 
 func CheckHashedPrompt(ctx *harness.Ctx) {
-	stateStart(ctx, 100)
+	hStateStart(ctx, 100)
 	prompt := "Summarise the attached contract in three bullet points."
-	r := stateReserve(ctx, prompt)
-	members := ctx.Redis.SMembers("distill:seen:" + stateJob)
+	r := hStateReserve(ctx, prompt)
+	members := ctx.Redis.SMembers("distill:seen:" + kHStateJob)
 	hasRaw, hasHash := false, false
 	for _, m := range members {
 		hasRaw = hasRaw || m == prompt
-		hasHash = hasHash || m == stateSha(prompt)
+		hasHash = hasHash || m == hStateSha(prompt)
 	}
 	ctx.Assert(!hasRaw, "the seen set holds the raw prompt: tenant content must not be stored in Redis")
-	ctx.Assert(hasHash, "the seen set must hold the hex SHA-256 of the prompt (%s…), it holds %v", stateSha(prompt)[:12], members)
-	ctx.Equal(r.DedupeHash, stateSha(prompt), "reserve must answer the hash as DedupeHash")
+	ctx.Assert(hasHash, "the seen set must hold the hex SHA-256 of the prompt (%s…), it holds %v", hStateSha(prompt)[:12], members)
+	ctx.Equal(r.DedupeHash, hStateSha(prompt), "reserve must answer the hash as DedupeHash")
 	for _, key := range ctx.Redis.Keys("*") {
 		ctx.Assert(!regexp.MustCompile("contract").MatchString(key), "the prompt leaked into a key name: %s", key)
 	}
 }
 
 func CheckRejectReason(ctx *harness.Ctx) {
-	stateStart(ctx, 100)
+	hStateStart(ctx, 100)
 	type snapshot struct {
 		fired             bool
 		rejected, refusal int64
 	}
 	snapshots := []*snapshot{{}, {}}
 	for _, s := range [][3]string{{"p1", "accepted", ""}, {"p2", "rejected", "refusal"}, {"p3", "rejected", "refusal"}, {"p4", "rejected", "empty"}} {
-		ctx.Equal(stateReserve(ctx, s[0]).Verdict, "ok", "reserve %s", s[0])
+		ctx.Equal(hStateReserve(ctx, s[0]).Verdict, "ok", "reserve %s", s[0])
 		if s[0] == "p2" {
 			// whichever key the record writes first, the other must already agree with it
-			for i, key := range []string{"distill:progress:" + stateJob, "distill:reasons:" + stateJob} {
+			for i, key := range []string{"distill:progress:" + kHStateJob, "distill:reasons:" + kHStateJob} {
 				snap := snapshots[i]
 				ctx.Redis.After(key, func() any {
-					raw, _ := ctx.Redis.HGet("distill:reasons:"+stateJob, "refusal")
+					raw, _ := ctx.Redis.HGet("distill:reasons:"+kHStateJob, "refusal")
 					refusal, _ := strconv.ParseInt(raw, 10, 64)
-					*snap = snapshot{true, stateCount(ctx, "rejected"), refusal}
+					*snap = snapshot{true, hStateCount(ctx, "rejected"), refusal}
 					return nil
 				})
 			}
 		}
-		ctx.NoError(record(context.Background(), stateJob, s[1], s[2]), "record")
+		ctx.NoError(record(context.Background(), kHStateJob, s[1], s[2]), "record")
 	}
-	progress := ctx.Redis.HGetAll("distill:progress:" + stateJob)
-	ctx.Equal([]int64{stateCount(ctx, "sampled"), stateCount(ctx, "accepted"), stateCount(ctx, "rejected")}, []int64{4, 1, 3}, "four reservations, one accepted, three rejected (%v); sampled, accepted, rejected", progress)
-	reasons := ctx.Redis.HGetAll("distill:reasons:" + stateJob)
-	ctx.Assert(reasons["refusal"] == "2" && reasons["empty"] == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", stateJob, reasons)
+	progress := ctx.Redis.HGetAll("distill:progress:" + kHStateJob)
+	ctx.Equal([]int64{hStateCount(ctx, "sampled"), hStateCount(ctx, "accepted"), hStateCount(ctx, "rejected")}, []int64{4, 1, 3}, "four reservations, one accepted, three rejected (%v); sampled, accepted, rejected", progress)
+	reasons := ctx.Redis.HGetAll("distill:reasons:" + kHStateJob)
+	ctx.Assert(reasons["refusal"] == "2" && reasons["empty"] == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", kHStateJob, reasons)
 	_, acc := reasons["accepted"]
 	_, blank := reasons[""]
 	ctx.Assert(!acc && !blank, "only rejections carry a reason: %v", reasons)
@@ -1244,24 +1244,24 @@ func CheckRejectReason(ctx *harness.Ctx) {
 }
 
 func CheckKeyTtl(ctx *harness.Ctx) {
-	stateStart(ctx, 100)
-	stateReserve(ctx, "p1")
-	ctx.NoError(record(context.Background(), stateJob, "rejected", "deadline"), "record")
+	hStateStart(ctx, 100)
+	hStateReserve(ctx, "p1")
+	ctx.NoError(record(context.Background(), kHStateJob, "rejected", "deadline"), "record")
 	ctx.Clock.Advance(50_000)
-	stateReserve(ctx, "p2")
-	ctx.NoError(record(context.Background(), stateJob, "rejected", "refusal"), "record")
-	for _, key := range []string{"distill:budget:" + stateJob, "distill:seen:" + stateJob, "distill:progress:" + stateJob, "distill:reasons:" + stateJob} {
+	hStateReserve(ctx, "p2")
+	ctx.NoError(record(context.Background(), kHStateJob, "rejected", "refusal"), "record")
+	for _, key := range []string{"distill:budget:" + kHStateJob, "distill:seen:" + kHStateJob, "distill:progress:" + kHStateJob, "distill:reasons:" + kHStateJob} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl != -2, "%s does not exist after a reservation and a record", key)
 		ctx.Assert(86_400-50_000 < ttl && ttl <= 86_400, "%s has TTL %d right after a reservation and a record 50000 s into the job: every key the job owns expires TTLSeconds (86400 s) after its last move, so each script refreshes the expiry of the keys it touches", key, ttl)
 	}
-	stamp, ok := ctx.Redis.HGet("distill:progress:"+stateJob, "updated_at")
-	ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:"+stateJob))
+	stamp, ok := ctx.Redis.HGet("distill:progress:"+kHStateJob, "updated_at")
+	ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:"+kHStateJob))
 	stamped, _ := strconv.ParseInt(stamp, 10, 64)
 	nowS := ctx.Clock.Now() / 1000
 	ctx.Assert(stamped-nowS <= 5 && nowS-stamped <= 5, "updated_at is %d after the last record, the clock reads %d: every script stamps the time of its move in unix seconds", stamped, nowS)
 	ctx.Clock.Advance(86_401)
-	ctx.Equal(len(ctx.Redis.Keys("distill:*:"+stateJob)), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:"+stateJob))
+	ctx.Equal(len(ctx.Redis.Keys("distill:*:"+kHStateJob)), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:"+kHStateJob))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1275,16 +1275,16 @@ func CheckKeyTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "j1";
-constexpr long long kCost = 512;
+const std::string kHJob = "j1";
+constexpr long long kHCost = 512;
 
-long long stateBudget(harness::Ctx& ctx) {
-  const auto raw = ctx.Redis.Get("distill:budget:" + kJob);
+long long hStateBudget(harness::Ctx& ctx) {
+  const auto raw = ctx.Redis.Get("distill:budget:" + kHJob);
   return raw ? std::strtoll(raw->c_str(), nullptr, 10) : 0;
 }
 
-long long stateCount(harness::Ctx& ctx, const std::string& field) {
-  const auto all = ctx.Redis.HGetAll("distill:progress:" + kJob);
+long long hStateCount(harness::Ctx& ctx, const std::string& field) {
+  const auto all = ctx.Redis.HGetAll("distill:progress:" + kHJob);
   const auto it = all.find(field);
   return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
 }
@@ -1292,31 +1292,31 @@ long long stateCount(harness::Ctx& ctx, const std::string& field) {
 }  // namespace
 
 void CheckDedupeBeforeSpend(harness::Ctx& ctx) {
-  start_job(kJob, 2);
-  const auto first = reserve(kJob, "What is the capital of France?");
+  start_job(kHJob, 2);
+  const auto first = reserve(kHJob, "What is the capital of France?");
   ctx.Equal(first.verdict, "ok", "a fresh prompt must be reserved; the verdict");
-  ctx.Equal(first.remaining, kCost, "reserve answers the tokens left after the draw as remaining");
-  ctx.Equal(stateBudget(ctx), kCost, "one reservation draws one call; the budget");
-  const auto again = reserve(kJob, "What is the capital of France?");
+  ctx.Equal(first.remaining, kHCost, "reserve answers the tokens left after the draw as remaining");
+  ctx.Equal(hStateBudget(ctx), kHCost, "one reservation draws one call; the budget");
+  const auto again = reserve(kHJob, "What is the capital of France?");
   ctx.Equal(again.verdict, "duplicate", "the same prompt again; the verdict");
-  ctx.Equal(stateBudget(ctx), kCost, "a duplicate costs nothing (DECRBY ran before SISMEMBER); the budget after the repeat");
-  ctx.Assert(stateCount(ctx, "duplicate") == 1 && stateCount(ctx, "sampled") == 1, "a duplicate counts as duplicate, not sampled: %v", ctx.Redis.HGetAll("distill:progress:" + kJob));
-  const auto second = reserve(kJob, "What is the capital of Peru?");
-  ctx.Assert(second.verdict == "ok" && stateBudget(ctx) == 0, "the second unique prompt spends the last call: verdict %s, budget %d", second.verdict, stateBudget(ctx));
-  const auto third = reserve(kJob, "What is the capital of Chile?");
+  ctx.Equal(hStateBudget(ctx), kHCost, "a duplicate costs nothing (DECRBY ran before SISMEMBER); the budget after the repeat");
+  ctx.Assert(hStateCount(ctx, "duplicate") == 1 && hStateCount(ctx, "sampled") == 1, "a duplicate counts as duplicate, not sampled: %v", ctx.Redis.HGetAll("distill:progress:" + kHJob));
+  const auto second = reserve(kHJob, "What is the capital of Peru?");
+  ctx.Assert(second.verdict == "ok" && hStateBudget(ctx) == 0, "the second unique prompt spends the last call: verdict %s, budget %d", second.verdict, hStateBudget(ctx));
+  const auto third = reserve(kHJob, "What is the capital of Chile?");
   ctx.Equal(third.verdict, "budget", "with no budget left; the verdict");
-  ctx.Equal(stateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget");
-  const auto reason = ctx.Redis.HGet("distill:reasons:" + kJob, "budget");
-  ctx.Assert(stateCount(ctx, "rejected") == 1 && reason && *reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:" + kJob), ctx.Redis.HGetAll("distill:reasons:" + kJob));
-  ctx.Equal(stateCount(ctx, "sampled"), 3, "a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded (%v); sampled", ctx.Redis.HGetAll("distill:progress:" + kJob));
-  ctx.Redis.Do("SET", "distill:budget:" + kJob, kCost - 1);
-  const auto shortOf = reserve(kJob, "What is the capital of Bolivia?");
-  ctx.Equal(shortOf.verdict, "budget", "with %d tokens left, less than one call (%d); the verdict", kCost - 1, kCost);
-  ctx.Equal(stateBudget(ctx), kCost - 1, "a budget refusal draws nothing; the budget");
+  ctx.Equal(hStateBudget(ctx), 0, "a job must stop at zero, not run negative; the budget");
+  const auto reason = ctx.Redis.HGet("distill:reasons:" + kHJob, "budget");
+  ctx.Assert(hStateCount(ctx, "rejected") == 1 && reason && *reason == "1", "a budget refusal is a rejected sample with reason budget: %v, reasons %v", ctx.Redis.HGetAll("distill:progress:" + kHJob), ctx.Redis.HGetAll("distill:reasons:" + kHJob));
+  ctx.Equal(hStateCount(ctx, "sampled"), 3, "a budget refusal counts as sampled too, so sampled == accepted + rejected holds once it is recorded (%v); sampled", ctx.Redis.HGetAll("distill:progress:" + kHJob));
+  ctx.Redis.Do("SET", "distill:budget:" + kHJob, kHCost - 1);
+  const auto shortOf = reserve(kHJob, "What is the capital of Bolivia?");
+  ctx.Equal(shortOf.verdict, "budget", "with %d tokens left, less than one call (%d); the verdict", kHCost - 1, kHCost);
+  ctx.Equal(hStateBudget(ctx), kHCost - 1, "a budget refusal draws nothing; the budget");
 }
 
 void CheckAtomicScript(harness::Ctx& ctx) {
-  start_job(kJob, 100);
+  start_job(kHJob, 100);
   const std::string prompt = "Explain photosynthesis to a ten-year-old.";
   const std::string hash = sha256_hex(prompt);
   std::string other;
@@ -1324,34 +1324,34 @@ void CheckAtomicScript(harness::Ctx& ctx) {
   // first a snapshot of what this worker's reservation had done at that moment
   bool seenThen = false;
   long long budgetThen = 0, sampledThen = 0;
-  ctx.Redis.After("distill:seen:" + kJob, [&] {
-    seenThen = ctx.Redis.SIsMember("distill:seen:" + kJob, hash);
-    budgetThen = stateBudget(ctx);
-    sampledThen = stateCount(ctx, "sampled");
+  ctx.Redis.After("distill:seen:" + kHJob, [&] {
+    seenThen = ctx.Redis.SIsMember("distill:seen:" + kHJob, hash);
+    budgetThen = hStateBudget(ctx);
+    sampledThen = hStateCount(ctx, "sampled");
     if (seenThen) {
       other = "duplicate";
       return;
     }
-    ctx.Redis.Do("SADD", "distill:seen:" + kJob, hash);
-    ctx.Redis.Do("DECRBY", "distill:budget:" + kJob, kCost);
-    ctx.Redis.Do("HINCRBY", "distill:progress:" + kJob, "sampled", 1);
+    ctx.Redis.Do("SADD", "distill:seen:" + kHJob, hash);
+    ctx.Redis.Do("DECRBY", "distill:budget:" + kHJob, kHCost);
+    ctx.Redis.Do("HINCRBY", "distill:progress:" + kHJob, "sampled", 1);
     other = "ok";
   });
-  const auto mine = reserve(kJob, prompt);
+  const auto mine = reserve(kHJob, prompt);
   ctx.Assert(!other.empty(), "reserve never touched the seen set");
   std::vector<std::string> verdicts = {mine.verdict, other};
   std::sort(verdicts.begin(), verdicts.end());
   ctx.Equal(verdicts, {"duplicate", "ok"}, "two workers reserved the same prompt: the membership test and the spend must run in one script, so exactly one of them pays; the verdicts");
-  ctx.Equal(stateBudget(ctx), 100 * kCost - kCost, "two workers, one prompt: one call drawn; the budget");
-  ctx.Equal(stateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled");
-  ctx.Assert(!seenThen || (budgetThen == 100 * kCost - kCost && sampledThen == 1), "the moment the hash was in the seen set, the budget was %d and sampled %d: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step", budgetThen, sampledThen);
+  ctx.Equal(hStateBudget(ctx), 100 * kHCost - kHCost, "two workers, one prompt: one call drawn; the budget");
+  ctx.Equal(hStateCount(ctx, "sampled"), 1, "two workers, one prompt; sampled");
+  ctx.Assert(!seenThen || (budgetThen == 100 * kHCost - kHCost && sampledThen == 1), "the moment the hash was in the seen set, the budget was %d and sampled %d: the draw and the count must land with the SADD, in the same script, or a worker that dies between them leaves the counters out of step", budgetThen, sampledThen);
 }
 
 void CheckHashedPrompt(harness::Ctx& ctx) {
-  start_job(kJob, 100);
+  start_job(kHJob, 100);
   const std::string prompt = "Summarise the attached contract in three bullet points.";
-  const auto r = reserve(kJob, prompt);
-  const auto members = ctx.Redis.SMembers("distill:seen:" + kJob);
+  const auto r = reserve(kHJob, prompt);
+  const auto members = ctx.Redis.SMembers("distill:seen:" + kHJob);
   const bool hasRaw = std::find(members.begin(), members.end(), prompt) != members.end();
   const bool hasHash = std::find(members.begin(), members.end(), sha256_hex(prompt)) != members.end();
   ctx.Assert(!hasRaw, "the seen set holds the raw prompt: tenant content must not be stored in Redis");
@@ -1361,31 +1361,31 @@ void CheckHashedPrompt(harness::Ctx& ctx) {
 }
 
 void CheckRejectReason(harness::Ctx& ctx) {
-  start_job(kJob, 100);
+  start_job(kHJob, 100);
   const std::vector<std::vector<std::string>> samples = {{"p1", "accepted", ""}, {"p2", "rejected", "refusal"}, {"p3", "rejected", "refusal"}, {"p4", "rejected", "empty"}};
-  struct Snapshot {
+  struct HSnapshot {
     bool fired = false;
     long long rejected = 0, refusal = 0;
   };
-  Snapshot snapshots[2];
+  HSnapshot snapshots[2];
   for (const auto& s : samples) {
-    ctx.Equal(reserve(kJob, s[0]).verdict, "ok", "reserve %s", s[0]);
+    ctx.Equal(reserve(kHJob, s[0]).verdict, "ok", "reserve %s", s[0]);
     if (s[0] == "p2") {
       // whichever key the record writes first, the other must already agree with it
-      const std::string keys[2] = {"distill:progress:" + kJob, "distill:reasons:" + kJob};
+      const std::string keys[2] = {"distill:progress:" + kHJob, "distill:reasons:" + kHJob};
       for (int i = 0; i < 2; ++i) {
         ctx.Redis.After(keys[i], [&ctx, &snap = snapshots[i]] {
-          const auto refusal = ctx.Redis.HGet("distill:reasons:" + kJob, "refusal");
-          snap = Snapshot{true, stateCount(ctx, "rejected"), refusal ? std::strtoll(refusal->c_str(), nullptr, 10) : 0};
+          const auto refusal = ctx.Redis.HGet("distill:reasons:" + kHJob, "refusal");
+          snap = HSnapshot{true, hStateCount(ctx, "rejected"), refusal ? std::strtoll(refusal->c_str(), nullptr, 10) : 0};
         });
       }
     }
-    record(kJob, s[1], s[2]);
+    record(kHJob, s[1], s[2]);
   }
-  ctx.Equal(std::vector<long long>{stateCount(ctx, "sampled"), stateCount(ctx, "accepted"), stateCount(ctx, "rejected")}, std::vector<long long>{4, 1, 3},
-            "four reservations, one accepted, three rejected (%v); sampled, accepted, rejected", ctx.Redis.HGetAll("distill:progress:" + kJob));
-  const auto reasons = ctx.Redis.HGetAll("distill:reasons:" + kJob);
-  ctx.Assert(reasons.count("refusal") && reasons.at("refusal") == "2" && reasons.count("empty") && reasons.at("empty") == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", kJob, reasons);
+  ctx.Equal(std::vector<long long>{hStateCount(ctx, "sampled"), hStateCount(ctx, "accepted"), hStateCount(ctx, "rejected")}, std::vector<long long>{4, 1, 3},
+            "four reservations, one accepted, three rejected (%v); sampled, accepted, rejected", ctx.Redis.HGetAll("distill:progress:" + kHJob));
+  const auto reasons = ctx.Redis.HGetAll("distill:reasons:" + kHJob);
+  ctx.Assert(reasons.count("refusal") && reasons.at("refusal") == "2" && reasons.count("empty") && reasons.at("empty") == "1", "distill:reasons:%s must count refusal 2 and empty 1, holds %v", kHJob, reasons);
   ctx.Assert(!reasons.count("accepted") && !reasons.count(""), "only rejections carry a reason: %v", reasons);
   for (const auto& snap : snapshots) {
     ctx.Assert(snap.fired && snap.rejected == 1 && snap.refusal == 1, "right after the first rejection's record touched Redis, rejected read %d and refusal %d: the counter and its reason must move in one script, never one command apart", snap.rejected, snap.refusal);
@@ -1393,25 +1393,25 @@ void CheckRejectReason(harness::Ctx& ctx) {
 }
 
 void CheckKeyTtl(harness::Ctx& ctx) {
-  start_job(kJob, 100);
-  reserve(kJob, "p1");
-  record(kJob, "rejected", "deadline");
+  start_job(kHJob, 100);
+  reserve(kHJob, "p1");
+  record(kHJob, "rejected", "deadline");
   ctx.Clock.Advance(50000);
-  reserve(kJob, "p2");
-  record(kJob, "rejected", "refusal");
-  for (const std::string key : {"distill:budget:" + kJob, "distill:seen:" + kJob, "distill:progress:" + kJob, "distill:reasons:" + kJob}) {
+  reserve(kHJob, "p2");
+  record(kHJob, "rejected", "refusal");
+  for (const std::string key : {"distill:budget:" + kHJob, "distill:seen:" + kHJob, "distill:progress:" + kHJob, "distill:reasons:" + kHJob}) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl != -2, "%s does not exist after a reservation and a record", key);
     ctx.Assert(86400 - 50000 < ttl && ttl <= 86400, "%s has TTL %d right after a reservation and a record 50000 s into the job: every key the job owns expires kTtlSeconds (86400 s) after its last move, so each script refreshes the expiry of the keys it touches", key, ttl);
   }
-  const auto stamp = ctx.Redis.HGet("distill:progress:" + kJob, "updated_at");
+  const auto stamp = ctx.Redis.HGet("distill:progress:" + kHJob, "updated_at");
   ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
-             "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:" + kJob));
+             "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("distill:progress:" + kHJob));
   const long long stamped = std::strtoll(stamp->c_str(), nullptr, 10);
   const long long nowS = ctx.Clock.Now() / 1000;
   ctx.Assert(std::llabs(stamped - nowS) <= 5, "updated_at is %d after the last record, the clock reads %d: every script stamps the time of its move in unix seconds", stamped, nowS);
   ctx.Clock.Advance(86401);
-  ctx.Equal(ctx.Redis.Keys("distill:*:" + kJob).size(), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:" + kJob));
+  ctx.Equal(ctx.Redis.Keys("distill:*:" + kHJob).size(), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("distill:*:" + kHJob));
 }
 `,
   },

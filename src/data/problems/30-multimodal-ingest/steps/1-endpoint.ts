@@ -740,30 +740,30 @@ import (
 )
 
 var (
-	apiBg  = context.Background()
-	apiH1  = "sha256:" + strings.Repeat("a", 64)
-	apiH2  = "sha256:" + strings.Repeat("b", 64)
-	apiPNG = map[string]any{"mime": "image/png", "byte_size": 48213, "caption": "a red kettle on a stove"}
+	hApiBg  = context.Background()
+	hApiH1  = "sha256:" + strings.Repeat("a", 64)
+	hApiH2  = "sha256:" + strings.Repeat("b", 64)
+	hApiPNG = map[string]any{"mime": "image/png", "byte_size": 48213, "caption": "a red kettle on a stove"}
 )
 
-func apiKey(i int) string { return "sha256:" + strings.Repeat(string(rune('0'+i)), 64) }
+func hApiKey(i int) string { return "sha256:" + strings.Repeat(string(rune('0'+i)), 64) }
 
-func apiWith(name string, value any) map[string]any {
+func hApiWith(name string, value any) map[string]any {
 	body := map[string]any{}
-	for k, v := range apiPNG {
+	for k, v := range hApiPNG {
 		body[k] = v
 	}
 	body[name] = value
 	return body
 }
 
-func apiServer(ctx *harness.Ctx) *harness.HTTP {
+func hApiServer(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postAsset(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+func hPostAsset(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
 	header := []string{}
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -774,84 +774,84 @@ func postAsset(c *harness.HTTP, body map[string]any, tenant, key string) *harnes
 	return c.Post("/v1/assets", body, header...)
 }
 
-func assetOf(r *harness.Response) assets.Asset {
+func hAssetOf(r *harness.Response) assets.Asset {
 	var a assets.Asset
 	r.Decode(&a)
 	return a
 }
 
-func seq(ctx *harness.Ctx) string {
+func hSeq(ctx *harness.Ctx) string {
 	n, _ := ctx.Redis.Get("asset:seq")
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	r := postAsset(c, apiPNG, "t1", apiH1)
+	c := hApiServer(ctx)
+	r := hPostAsset(c, hApiPNG, "t1", hApiH1)
 	ctx.Equal(r.Status, 201, "POST /v1/assets (%s)", r.Text())
-	body := assetOf(r)
-	ctx.Assert(body.AssetID != "" && body.Checksum == apiH1 && body.State == "pending" && body.Tenant == "t1", "the answer must be the pending asset with its asset_id, checksum and tenant, got %s", r.Text())
-	stored := assets.Get(apiBg, body.AssetID)
+	body := hAssetOf(r)
+	ctx.Assert(body.AssetID != "" && body.Checksum == hApiH1 && body.State == "pending" && body.Tenant == "t1", "the answer must be the pending asset with its asset_id, checksum and tenant, got %s", r.Text())
+	stored := assets.Get(hApiBg, body.AssetID)
 	ctx.Assert(stored != nil && stored.Tenant == "t1" && stored.Mime == "image/png", "the store holds %+v for %s", stored, body.AssetID)
 }
 
 func CheckTenantHeader(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	r := postAsset(c, apiWith("tenant", "t2"), "t1", apiH1)
+	c := hApiServer(ctx)
+	r := hPostAsset(c, hApiWith("tenant", "t2"), "t1", hApiH1)
 	ctx.Equal(r.Status, 201, "a registration by t1 (%s)", r.Text())
-	ctx.Assert(assetOf(r).Tenant == "t1" && assets.Find(apiBg, "t2", apiH1) == nil, "a request authenticated as t1 named tenant t2 in its body and the asset was registered for %q: the tenant is X-Tenant-Id, never the body", assetOf(r).Tenant)
-	missing := postAsset(c, apiPNG, "", apiH2)
+	ctx.Assert(hAssetOf(r).Tenant == "t1" && assets.Find(hApiBg, "t2", hApiH1) == nil, "a request authenticated as t1 named tenant t2 in its body and the asset was registered for %q: the tenant is X-Tenant-Id, never the body", hAssetOf(r).Tenant)
+	missing := hPostAsset(c, hApiPNG, "", hApiH2)
 	ctx.Equal(missing.Status, 401, "a registration without X-Tenant-Id (%s)", missing.Text())
-	blank := c.Post("/v1/assets", apiPNG, "X-Tenant-Id", "", "Idempotency-Key", apiH2)
+	blank := c.Post("/v1/assets", hApiPNG, "X-Tenant-Id", "", "Idempotency-Key", hApiH2)
 	ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id, which names no tenant (%s)", blank.Text())
-	ctx.Equal(seq(ctx), "1", "a registration without a tenant must not create an asset; the assets created")
+	ctx.Equal(hSeq(ctx), "1", "a registration without a tenant must not create an asset; the assets created")
 }
 
 func CheckMimeAllowlist(ctx *harness.Ctx) {
-	c := apiServer(ctx)
+	c := hApiServer(ctx)
 	for i, mime := range []string{"image/svg+xml", "text/html", "application/pdf", "image/tiff", "image/heic"} {
-		r := postAsset(c, apiWith("mime", mime), "t1", apiKey(i))
+		r := hPostAsset(c, hApiWith("mime", mime), "t1", hApiKey(i))
 		ctx.Equal(r.Status, 415, "a registration declaring %s (only the allowed mime types reach the indexer)", mime)
-		ctx.Assert(assets.Find(apiBg, "t1", apiKey(i)) == nil, "the %s registration was stored", mime)
+		ctx.Assert(assets.Find(hApiBg, "t1", hApiKey(i)) == nil, "the %s registration was stored", mime)
 	}
 	for i, mime := range []string{"image/jpeg", "image/webp", "image/gif", "image/avif"} {
-		r := postAsset(c, apiWith("mime", mime), "t1", apiKey(i+5))
+		r := hPostAsset(c, hApiWith("mime", mime), "t1", hApiKey(i+5))
 		ctx.Equal(r.Status, 201, "a registration declaring %s (%s)", mime, r.Text())
 	}
 }
 
 func CheckSizeCaps(ctx *harness.Ctx) {
-	c := apiServer(ctx)
+	c := hApiServer(ctx)
 	cases := []struct {
 		body map[string]any
 		want int
 		what string
 	}{
-		{apiWith("byte_size", 20<<20), 201, "an image of exactly 20 MiB"},
-		{apiWith("byte_size", 20<<20+1), 413, "an image one byte over 20 MiB"},
-		{apiWith("caption", strings.Repeat("k", 4096)), 201, "a caption of exactly 4096 bytes"},
-		{apiWith("caption", strings.Repeat("\\u20ac", 1366)), 413, "a caption of 1366 euro signs (1366 characters, 4098 bytes of UTF-8)"},
+		{hApiWith("byte_size", 20<<20), 201, "an image of exactly 20 MiB"},
+		{hApiWith("byte_size", 20<<20+1), 413, "an image one byte over 20 MiB"},
+		{hApiWith("caption", strings.Repeat("k", 4096)), 201, "a caption of exactly 4096 bytes"},
+		{hApiWith("caption", strings.Repeat("\\u20ac", 1366)), 413, "a caption of 1366 euro signs (1366 characters, 4098 bytes of UTF-8)"},
 	}
 	for i, tc := range cases {
-		r := postAsset(c, tc.body, "t1", apiKey(i))
+		r := hPostAsset(c, tc.body, "t1", hApiKey(i))
 		ctx.Equal(r.Status, tc.want, "%s", tc.what)
 	}
 }
 
 func CheckContentHash(ctx *harness.Ctx) {
-	c := apiServer(ctx)
-	first := postAsset(c, apiPNG, "t1", apiH1)
+	c := hApiServer(ctx)
+	first := hPostAsset(c, hApiPNG, "t1", hApiH1)
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	original := assetOf(first).AssetID
-	retry := postAsset(c, apiWith("caption", "retried"), "t1", apiH1)
-	ctx.Assert(retry.Status == 200 && assetOf(retry).AssetID == original, "a retry with the same content hash answered %d %s; expected 200 with the original asset %s, or search returns the image twice", retry.Status, retry.Text(), original)
-	other := postAsset(c, apiPNG, "t2", apiH1)
-	ctx.Assert(other.Status == 201 && assetOf(other).AssetID != original, "the same image registered by another tenant answered %d %s: each tenant gets its own asset", other.Status, other.Text())
+	original := hAssetOf(first).AssetID
+	retry := hPostAsset(c, hApiWith("caption", "retried"), "t1", hApiH1)
+	ctx.Assert(retry.Status == 200 && hAssetOf(retry).AssetID == original, "a retry with the same content hash answered %d %s; expected 200 with the original asset %s, or search returns the image twice", retry.Status, retry.Text(), original)
+	other := hPostAsset(c, hApiPNG, "t2", hApiH1)
+	ctx.Assert(other.Status == 201 && hAssetOf(other).AssetID != original, "the same image registered by another tenant answered %d %s: each tenant gets its own asset", other.Status, other.Text())
 	for _, key := range []string{"", "md5:0cc175b9c0f1b6a831c399e269772661", "sha256:" + strings.Repeat("z", 64), "sha256:" + strings.Repeat("A", 64), "SHA256:" + strings.Repeat("a", 64), "sha256:" + strings.Repeat("a", 63), "sha256:" + strings.Repeat("a", 65), "x-sha256:" + strings.Repeat("a", 64)} {
-		r := postAsset(c, apiPNG, "t1", key)
+		r := hPostAsset(c, hApiPNG, "t1", key)
 		ctx.Equal(r.Status, 400, "Idempotency-Key %q (the key is the content hash, sha256:<64 lowercase hex>)", key)
 	}
-	ctx.Equal(seq(ctx), "2", "the assets created (t1's and t2's)")
+	ctx.Equal(hSeq(ctx), "2", "the assets created (t1's and t2's)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -865,17 +865,17 @@ namespace {
 
 const std::string kH1 = "sha256:" + std::string(64, 'a');
 const std::string kH2 = "sha256:" + std::string(64, 'b');
-const nlohmann::json kPng = {{"mime", "image/png"}, {"byte_size", 48213}, {"caption", "a red kettle on a stove"}};
+const nlohmann::json kHPng = {{"mime", "image/png"}, {"byte_size", 48213}, {"caption", "a red kettle on a stove"}};
 
-std::string keyOf(int i) { return "sha256:" + std::string(64, static_cast<char>('0' + i)); }
+std::string hKeyOf(int i) { return "sha256:" + std::string(64, static_cast<char>('0' + i)); }
 
-nlohmann::json with(const std::string& name, const nlohmann::json& value) {
-  nlohmann::json body = kPng;
+nlohmann::json hWith(const std::string& name, const nlohmann::json& value) {
+  nlohmann::json body = kHPng;
   body[name] = value;
   return body;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -883,7 +883,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postAsset(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+harness::Response hPostAsset(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
   const std::string text = body.dump();
   if (tenant.empty() && key.empty()) return c.Post("/v1/assets", text, "Content-Type", "application/json");
   if (tenant.empty()) return c.Post("/v1/assets", text, "Content-Type", "application/json", "Idempotency-Key", key);
@@ -891,20 +891,20 @@ harness::Response postAsset(harness::HTTP& c, const nlohmann::json& body, const 
   return c.Post("/v1/assets", text, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) {
+nlohmann::json hBodyOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-std::string seq(harness::Ctx& ctx) { return ctx.Redis.Get("asset:seq").value_or(""); }
+std::string hSeq(harness::Ctx& ctx) { return ctx.Redis.Get("asset:seq").value_or(""); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = postAsset(c, kPng, "t1", kH1);
+  auto c = hApi(ctx);
+  const auto r = hPostAsset(c, kHPng, "t1", kH1);
   ctx.Equal(r.Status, 201, "POST /v1/assets (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   const std::string asset_id = body.value("asset_id", "");
   ctx.Assert(!asset_id.empty() && body.value("checksum", "") == kH1 && body.value("state", "") == "pending" && body.value("tenant", "") == "t1",
              "the answer must be the pending asset with its asset_id, checksum and tenant, got %s", r.Text());
@@ -913,69 +913,69 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantHeader(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = postAsset(c, with("tenant", "t2"), "t1", kH1);
+  auto c = hApi(ctx);
+  const auto r = hPostAsset(c, hWith("tenant", "t2"), "t1", kH1);
   ctx.Equal(r.Status, 201, "a registration by t1 (%s)", r.Text());
-  ctx.Assert(bodyOf(r).value("tenant", "") == "t1" && !assets::find("t2", kH1),
+  ctx.Assert(hBodyOf(r).value("tenant", "") == "t1" && !assets::find("t2", kH1),
              "a request authenticated as t1 named tenant t2 in its body and the asset was registered for %q: the tenant is X-Tenant-Id, never the body",
-             bodyOf(r).value("tenant", ""));
-  const auto missing = postAsset(c, kPng, "", kH2);
+             hBodyOf(r).value("tenant", ""));
+  const auto missing = hPostAsset(c, kHPng, "", kH2);
   ctx.Equal(missing.Status, 401, "a registration without X-Tenant-Id (%s)", missing.Text());
-  const auto blank = c.Post("/v1/assets", kPng.dump(), "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", kH2);
+  const auto blank = c.Post("/v1/assets", kHPng.dump(), "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", kH2);
   ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id, which names no tenant (%s)", blank.Text());
-  ctx.Equal(seq(ctx), "1", "a registration without a tenant must not create an asset; the assets created");
+  ctx.Equal(hSeq(ctx), "1", "a registration without a tenant must not create an asset; the assets created");
 }
 
 void CheckMimeAllowlist(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<std::string> refused = {"image/svg+xml", "text/html", "application/pdf", "image/tiff", "image/heic"};
   for (int i = 0; i < static_cast<int>(refused.size()); i++) {
-    const auto r = postAsset(c, with("mime", refused[i]), "t1", keyOf(i));
+    const auto r = hPostAsset(c, hWith("mime", refused[i]), "t1", hKeyOf(i));
     ctx.Equal(r.Status, 415, "a registration declaring %s (only the allowed mime types reach the indexer)", refused[i]);
-    ctx.Assert(!assets::find("t1", keyOf(i)), "the %s registration was stored", refused[i]);
+    ctx.Assert(!assets::find("t1", hKeyOf(i)), "the %s registration was stored", refused[i]);
   }
   const std::vector<std::string> accepted = {"image/jpeg", "image/webp", "image/gif", "image/avif"};
   for (int i = 0; i < static_cast<int>(accepted.size()); i++) {
-    const auto r = postAsset(c, with("mime", accepted[i]), "t1", keyOf(i + 5));
+    const auto r = hPostAsset(c, hWith("mime", accepted[i]), "t1", hKeyOf(i + 5));
     ctx.Equal(r.Status, 201, "a registration declaring %s (%s)", accepted[i], r.Text());
   }
 }
 
 void CheckSizeCaps(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::string euros;
   for (int i = 0; i < 1366; i++) euros += "\\xe2\\x82\\xac";
   const std::vector<std::tuple<nlohmann::json, int, std::string>> cases = {
-      {with("byte_size", 20LL << 20), 201, "an image of exactly 20 MiB"},
-      {with("byte_size", (20LL << 20) + 1), 413, "an image one byte over 20 MiB"},
-      {with("caption", std::string(4096, 'k')), 201, "a caption of exactly 4096 bytes"},
-      {with("caption", euros), 413, "a caption of 1366 euro signs (1366 characters, 4098 bytes of UTF-8)"},
+      {hWith("byte_size", 20LL << 20), 201, "an image of exactly 20 MiB"},
+      {hWith("byte_size", (20LL << 20) + 1), 413, "an image one byte over 20 MiB"},
+      {hWith("caption", std::string(4096, 'k')), 201, "a caption of exactly 4096 bytes"},
+      {hWith("caption", euros), 413, "a caption of 1366 euro signs (1366 characters, 4098 bytes of UTF-8)"},
   };
   for (int i = 0; i < static_cast<int>(cases.size()); i++) {
     const auto& [body, want, what] = cases[i];
-    const auto r = postAsset(c, body, "t1", keyOf(i));
+    const auto r = hPostAsset(c, body, "t1", hKeyOf(i));
     ctx.Equal(r.Status, want, "%s", what);
   }
 }
 
 void CheckContentHash(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = postAsset(c, kPng, "t1", kH1);
+  auto c = hApi(ctx);
+  const auto first = hPostAsset(c, kHPng, "t1", kH1);
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const std::string original = bodyOf(first).value("asset_id", "");
-  const auto retry = postAsset(c, with("caption", "retried"), "t1", kH1);
-  ctx.Assert(retry.Status == 200 && bodyOf(retry).value("asset_id", "") == original,
+  const std::string original = hBodyOf(first).value("asset_id", "");
+  const auto retry = hPostAsset(c, hWith("caption", "retried"), "t1", kH1);
+  ctx.Assert(retry.Status == 200 && hBodyOf(retry).value("asset_id", "") == original,
              "a retry with the same content hash answered %d %s; expected 200 with the original asset %s, or search returns the image twice",
              retry.Status, retry.Text(), original);
-  const auto other = postAsset(c, kPng, "t2", kH1);
-  ctx.Assert(other.Status == 201 && bodyOf(other).value("asset_id", "") != original,
+  const auto other = hPostAsset(c, kHPng, "t2", kH1);
+  ctx.Assert(other.Status == 201 && hBodyOf(other).value("asset_id", "") != original,
              "the same image registered by another tenant answered %d %s: each tenant gets its own asset", other.Status, other.Text());
   for (const std::string key : {std::string(), std::string("md5:0cc175b9c0f1b6a831c399e269772661"), "sha256:" + std::string(64, 'z'), "sha256:" + std::string(64, 'A'),
                                 "SHA256:" + std::string(64, 'a'), "sha256:" + std::string(63, 'a'), "sha256:" + std::string(65, 'a'), "x-sha256:" + std::string(64, 'a')}) {
-    const auto r = postAsset(c, kPng, "t1", key);
+    const auto r = hPostAsset(c, kHPng, "t1", key);
     ctx.Equal(r.Status, 400, "Idempotency-Key %q (the key is the content hash, sha256:<64 lowercase hex>)", key);
   }
-  ctx.Equal(seq(ctx), "2", "the assets created (t1's and t2's)");
+  ctx.Equal(hSeq(ctx), "2", "the assets created (t1's and t2's)");
 }
 `,
   },
