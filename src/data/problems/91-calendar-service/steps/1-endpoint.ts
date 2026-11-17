@@ -60,7 +60,7 @@ Rules, in this order, before anything is stored:
       id: 'unknown-parts',
       title: 'Refuses rule parts the expander does not know',
       detail:
-        '`BYSECOND=30`, `BYDAY=MO,WE`, `FREQ=SECONDLY` and a part without a value are **422** `unsupported_rrule_part`, and nothing is stored. The starter stores the rule with the unknown parts trimmed, so the meeting repeats on days nobody chose.',
+        '`BYSECOND=30`, `BYDAY=MO,WE`, `FREQ=SECONDLY`, a rule without `FREQ` and a part without a value are **422** `unsupported_rrule_part`, and nothing is stored; the rule is judged before the instants. The starter stores the rule with the unknown parts trimmed, so the meeting repeats on days nobody chose.',
       match: {
         python: {all: [/unsupported_rrule_part/, /not in SUPPORTED_PARTS/, /not in FREQUENCIES/]},
         typescript: {all: [/unsupported_rrule_part/, /SUPPORTED_PARTS\.includes\(/, /FREQUENCIES/]},
@@ -73,7 +73,7 @@ Rules, in this order, before anything is stored:
       id: 'rule-terminates',
       title: 'Refuses a rule that never ends',
       detail:
-        'A rule without `UNTIL` or `COUNT`, a `COUNT` of 0 or 6000 and `INTERVAL=0` are **422** `rule_not_terminating`, and nothing is stored; `COUNT=5000` and an `UNTIL` are accepted. The starter stores `FREQ=DAILY`, which every unbounded reader of the rule walks forever.',
+        'A rule without `UNTIL` or `COUNT`, a `COUNT` of 0, 5001 or a word, and an `INTERVAL` of 0, -1 or a word are **422** `rule_not_terminating`, nothing is stored, and the rule is judged before the instants; `COUNT=1`, `COUNT=5000` and an `UNTIL` are accepted. The starter stores `FREQ=DAILY`, which every unbounded reader of the rule walks forever.',
       match: {
         python: {all: [/rule_not_terminating/, /MAX_COUNT/]},
         typescript: {all: [/rule_not_terminating/, /MAX_COUNT/]},
@@ -86,7 +86,7 @@ Rules, in this order, before anything is stored:
       id: 'tz-aware',
       title: 'Refuses instants without an offset',
       detail:
-        'A `dtstart`, `dtend` or `UNTIL` without `Z` or an offset is **422** `invalid_instant`; `10:00+01:00` is stored as `09:00Z`. The starter appends `Z` to a time without an offset, which moves a Berlin meeting by an hour for every attendee.',
+        'A `dtstart`, `dtend` or `UNTIL` without `Z` or an offset is **422** `invalid_instant`, before the range is compared; `10:00+01:00` to `10:30+01:00` is stored as `09:00Z` to `09:30Z`. The starter appends `Z` to a time without an offset, which moves a Berlin meeting by an hour for every attendee.',
       match: {
         python: {all: [/parse_instant\(\s*parts\[["']UNTIL["']\]\s*\)/], none: [/\+\s*["']Z["']/]},
         typescript: {all: [/parseInstant\(\s*parts\.UNTIL\s*\)/], none: [/\+\s*['"]Z['"]/]},
@@ -99,7 +99,7 @@ Rules, in this order, before anything is stored:
       id: 'range-order',
       title: 'Refuses an event that ends before it starts',
       detail:
-        'A `dtend` equal to or before `dtstart` is **422** `invalid_range`, and nothing is stored. The starter stores it, and every occurrence the expander derives has a negative length.',
+        'A `dtend` equal to or before `dtstart` is **422** `invalid_range`, and nothing is stored. The instants are compared, not their text: `09:00Z` to `09:30+01:00` is refused, `10:00+02:00` to `09:30Z` is accepted. The starter stores it, and every occurrence the expander derives has a negative length.',
       match: {
         python: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
         typescript: {all: [/invalid_range/, /\bend\s*<=\s*start\b|\bstart\s*>=\s*end\b/]},
@@ -929,17 +929,21 @@ async def check_route(ctx):
 
 async def check_unknown_parts(ctx):
     m = ctx.load("api")
-    for rule in ("FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT"):
+    for rule in ("FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT", "COUNT=3", "FREQ=DAILY;BYDAY=MO"):
         await _refused(ctx, m, 422, "unsupported_rrule_part", f"the rule {rule!r}", rrule=rule)
+    # The rule is judged before the instants.
+    await _refused(ctx, m, 422, "unsupported_rrule_part", "the rule 'FREQ=WEEKLY;COUNT=4;BYDAY=MO' with a dtstart without an offset", rrule="FREQ=WEEKLY;COUNT=4;BYDAY=MO", dtstart="2026-03-02T09:00:00")
     r = await _post(ctx, m, rrule="")
     assert r.status_code == 201, f"an empty rule (one occurrence) answered {r.status_code}: {r.text}"
 
 
 async def check_rule_terminates(ctx):
     m = ctx.load("api")
-    for rule in ("FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z"):
+    for rule in ("FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=5001", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=many", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=-1;COUNT=3", "FREQ=DAILY;INTERVAL=two;COUNT=3"):
         await _refused(ctx, m, 422, "rule_not_terminating", f"the rule {rule!r}", rrule=rule)
-    for rule in ("FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000"):
+    # The rule is judged before the instants.
+    await _refused(ctx, m, 422, "rule_not_terminating", "the rule 'FREQ=DAILY;COUNT=0' with a dtstart without an offset", rrule="FREQ=DAILY;COUNT=0", dtstart="2026-03-02T09:00:00")
+    for rule in ("FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000", "FREQ=WEEKLY;COUNT=1"):
         r = await _post(ctx, m, rrule=rule)
         assert r.status_code == 201, f"the rule {rule!r} ends and answered {r.status_code}: {r.text}"
 
@@ -949,16 +953,21 @@ async def check_tz_aware(ctx):
     await _refused(ctx, m, 422, "invalid_instant", "a dtstart without an offset", dtstart="2026-03-02T09:00:00")
     await _refused(ctx, m, 422, "invalid_instant", "a dtend without an offset", dtend="2026-03-02T09:30:00")
     await _refused(ctx, m, 422, "invalid_instant", "an UNTIL without an offset", rrule="FREQ=DAILY;UNTIL=2026-06-01T00:00:00")
+    await _refused(ctx, m, 422, "invalid_instant", "a dtstart without an offset after its dtend", dtstart="2026-03-02T10:00:00")
     r = await _post(ctx, m, dtstart="2026-03-02T10:00:00+01:00", dtend="2026-03-02T10:30:00+01:00")
     assert r.status_code == 201, f"instants with a +01:00 offset answered {r.status_code}: {r.text}"
     stored = ctx.redis.hgetall(f"event:{r.json()['event_id']}")
-    assert stored.get("dtstart") == "2026-03-02T09:00:00Z", f"10:00+01:00 was stored as {stored.get('dtstart')!r}, expected 2026-03-02T09:00:00Z"
+    assert stored.get("dtstart") == "2026-03-02T09:00:00Z" and stored.get("dtend") == "2026-03-02T09:30:00Z", f"10:00+01:00 to 10:30+01:00 was stored as {stored.get('dtstart')!r} to {stored.get('dtend')!r}, expected 2026-03-02T09:00:00Z to 2026-03-02T09:30:00Z"
 
 
 async def check_range_order(ctx):
     m = ctx.load("api")
     await _refused(ctx, m, 422, "invalid_range", "an event that ends when it starts", dtend=BODY["dtstart"])
     await _refused(ctx, m, 422, "invalid_range", "an event that ends before it starts", dtend="2026-03-02T08:00:00Z")
+    await _refused(ctx, m, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", dtend="2026-03-02T09:30:00+01:00")
+    # Instants are compared, not their text: 10:00+02:00 is 08:00Z.
+    r = await _post(ctx, m, dtstart="2026-03-02T10:00:00+02:00", dtend="2026-03-02T09:30:00Z")
+    assert r.status_code == 201, f"10:00+02:00 (08:00Z) to 09:30Z answered {r.status_code}: {r.text}"
 `,
     typescript: `const H = {'X-Tenant-Id': 't1'};
 // A weekly 30-minute standup, four times from Monday 2 March 2026.
@@ -1003,19 +1012,23 @@ export async function check_route(ctx) {
 
 export async function check_unknown_parts(ctx) {
   const m = ctx.load('api');
-  for (const rule of ['FREQ=WEEKLY;COUNT=4;BYSECOND=30', 'FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE', 'FREQ=SECONDLY;COUNT=10', 'FREQ=WEEKLY;COUNT']) {
+  for (const rule of ['FREQ=WEEKLY;COUNT=4;BYSECOND=30', 'FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE', 'FREQ=SECONDLY;COUNT=10', 'FREQ=WEEKLY;COUNT', 'COUNT=3', 'FREQ=DAILY;BYDAY=MO']) {
     await refused(ctx, m, 422, 'unsupported_rrule_part', \`the rule \${JSON.stringify(rule)}\`, {rrule: rule});
   }
+  // The rule is judged before the instants.
+  await refused(ctx, m, 422, 'unsupported_rrule_part', "the rule 'FREQ=WEEKLY;COUNT=4;BYDAY=MO' with a dtstart without an offset", {rrule: 'FREQ=WEEKLY;COUNT=4;BYDAY=MO', dtstart: '2026-03-02T09:00:00'});
   const r = await post(ctx, m, {rrule: ''});
   assert.equal(r.status, 201, \`an empty rule (one occurrence) answered \${r.status}: \${r.text}\`);
 }
 
 export async function check_rule_terminates(ctx) {
   const m = ctx.load('api');
-  for (const rule of ['FREQ=DAILY', 'FREQ=DAILY;COUNT=6000', 'FREQ=DAILY;COUNT=0', 'FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z']) {
+  for (const rule of ['FREQ=DAILY', 'FREQ=DAILY;COUNT=6000', 'FREQ=DAILY;COUNT=5001', 'FREQ=DAILY;COUNT=0', 'FREQ=DAILY;COUNT=many', 'FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z', 'FREQ=DAILY;INTERVAL=-1;COUNT=3', 'FREQ=DAILY;INTERVAL=two;COUNT=3']) {
     await refused(ctx, m, 422, 'rule_not_terminating', \`the rule \${JSON.stringify(rule)}\`, {rrule: rule});
   }
-  for (const rule of ['FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z', 'FREQ=DAILY;INTERVAL=2;COUNT=5000']) {
+  // The rule is judged before the instants.
+  await refused(ctx, m, 422, 'rule_not_terminating', "the rule 'FREQ=DAILY;COUNT=0' with a dtstart without an offset", {rrule: 'FREQ=DAILY;COUNT=0', dtstart: '2026-03-02T09:00:00'});
+  for (const rule of ['FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z', 'FREQ=DAILY;INTERVAL=2;COUNT=5000', 'FREQ=WEEKLY;COUNT=1']) {
     const r = await post(ctx, m, {rrule: rule});
     assert.equal(r.status, 201, \`the rule \${JSON.stringify(rule)} ends and answered \${r.status}: \${r.text}\`);
   }
@@ -1026,16 +1039,24 @@ export async function check_tz_aware(ctx) {
   await refused(ctx, m, 422, 'invalid_instant', 'a dtstart without an offset', {dtstart: '2026-03-02T09:00:00'});
   await refused(ctx, m, 422, 'invalid_instant', 'a dtend without an offset', {dtend: '2026-03-02T09:30:00'});
   await refused(ctx, m, 422, 'invalid_instant', 'an UNTIL without an offset', {rrule: 'FREQ=DAILY;UNTIL=2026-06-01T00:00:00'});
+  await refused(ctx, m, 422, 'invalid_instant', 'a dtstart without an offset after its dtend', {dtstart: '2026-03-02T10:00:00'});
   const r = await post(ctx, m, {dtstart: '2026-03-02T10:00:00+01:00', dtend: '2026-03-02T10:30:00+01:00'});
   assert.equal(r.status, 201, \`instants with a +01:00 offset answered \${r.status}: \${r.text}\`);
   const stored = ctx.redis.hgetall(\`event:\${r.json().event_id}\`);
-  assert.equal(stored.dtstart, '2026-03-02T09:00:00Z', \`10:00+01:00 was stored as \${JSON.stringify(stored.dtstart)}, expected 2026-03-02T09:00:00Z\`);
+  assert(
+    stored.dtstart === '2026-03-02T09:00:00Z' && stored.dtend === '2026-03-02T09:30:00Z',
+    \`10:00+01:00 to 10:30+01:00 was stored as \${JSON.stringify(stored.dtstart)} to \${JSON.stringify(stored.dtend)}, expected 2026-03-02T09:00:00Z to 2026-03-02T09:30:00Z\`,
+  );
 }
 
 export async function check_range_order(ctx) {
   const m = ctx.load('api');
   await refused(ctx, m, 422, 'invalid_range', 'an event that ends when it starts', {dtend: BODY.dtstart});
   await refused(ctx, m, 422, 'invalid_range', 'an event that ends before it starts', {dtend: '2026-03-02T08:00:00Z'});
+  await refused(ctx, m, 422, 'invalid_range', '09:00Z to 09:30+01:00 (08:30Z)', {dtend: '2026-03-02T09:30:00+01:00'});
+  // Instants are compared, not their text: 10:00+02:00 is 08:00Z.
+  const r = await post(ctx, m, {dtstart: '2026-03-02T10:00:00+02:00', dtend: '2026-03-02T09:30:00Z'});
+  assert.equal(r.status, 201, \`10:00+02:00 (08:00Z) to 09:30Z answered \${r.status}: \${r.text}\`);
 }
 `,
     go: `package main
@@ -1102,19 +1123,23 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckUnknownParts(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	for _, rule := range []string{"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT"} {
+	for _, rule := range []string{"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT", "COUNT=3", "FREQ=DAILY;BYDAY=MO"} {
 		apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule "+rule, map[string]any{"rrule": rule})
 	}
+	// The rule is judged before the instants.
+	apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule FREQ=WEEKLY;COUNT=4;BYDAY=MO with a dtstart without an offset", map[string]any{"rrule": "FREQ=WEEKLY;COUNT=4;BYDAY=MO", "dtstart": "2026-03-02T09:00:00"})
 	r := apiPost(c, map[string]any{"rrule": ""})
 	ctx.Equal(r.Status, 201, "an empty rule, one occurrence (%s)", r.Text())
 }
 
 func CheckRuleTerminates(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	for _, rule := range []string{"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z"} {
+	for _, rule := range []string{"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=5001", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=many", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=-1;COUNT=3", "FREQ=DAILY;INTERVAL=two;COUNT=3"} {
 		apiRefused(ctx, c, 422, "rule_not_terminating", "the rule "+rule, map[string]any{"rrule": rule})
 	}
-	for _, rule := range []string{"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000"} {
+	// The rule is judged before the instants.
+	apiRefused(ctx, c, 422, "rule_not_terminating", "the rule FREQ=DAILY;COUNT=0 with a dtstart without an offset", map[string]any{"rrule": "FREQ=DAILY;COUNT=0", "dtstart": "2026-03-02T09:00:00"})
+	for _, rule := range []string{"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000", "FREQ=WEEKLY;COUNT=1"} {
 		r := apiPost(c, map[string]any{"rrule": rule})
 		ctx.Equal(r.Status, 201, "the rule %s ends (%s)", rule, r.Text())
 	}
@@ -1125,16 +1150,23 @@ func CheckTzAware(ctx *harness.Ctx) {
 	apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", map[string]any{"dtstart": "2026-03-02T09:00:00"})
 	apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", map[string]any{"dtend": "2026-03-02T09:30:00"})
 	apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", map[string]any{"rrule": "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"})
+	apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset after its dtend", map[string]any{"dtstart": "2026-03-02T10:00:00"})
 	r := apiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+01:00", "dtend": "2026-03-02T10:30:00+01:00"})
 	ctx.Equal(r.Status, 201, "instants with a +01:00 offset (%s)", r.Text())
 	eventID, _ := apiBody(r)["event_id"].(string)
-	ctx.Equal(ctx.Redis.HGetAll("event:" + eventID)["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00")
+	stored := ctx.Redis.HGetAll("event:" + eventID)
+	ctx.Equal(stored["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00")
+	ctx.Equal(stored["dtend"], "2026-03-02T09:30:00Z", "the stored dtend of 10:30+01:00")
 }
 
 func CheckRangeOrder(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", map[string]any{"dtend": "2026-03-02T09:00:00Z"})
 	apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", map[string]any{"dtend": "2026-03-02T08:00:00Z"})
+	apiRefused(ctx, c, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", map[string]any{"dtend": "2026-03-02T09:30:00+01:00"})
+	// Instants are compared, not their text: 10:00+02:00 is 08:00Z.
+	r := apiPost(c, map[string]any{"dtstart": "2026-03-02T10:00:00+02:00", "dtend": "2026-03-02T09:30:00Z"})
+	ctx.Equal(r.Status, 201, "10:00+02:00 (08:00Z) to 09:30Z (%s)", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1156,15 +1188,15 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-// A weekly 30-minute standup, four times from Monday 2 March 2026, with one field changed.
-harness::Response apiPost(harness::HTTP& c, const std::string& field = "", const std::string& value = "") {
+// A weekly 30-minute standup, four times from Monday 2 March 2026, with the given fields changed.
+harness::Response apiPost(harness::HTTP& c, const nlohmann::json& changes = nlohmann::json::object()) {
   nlohmann::json body = {{"calendar_id", "c1"},
                          {"title", "Standup"},
                          {"rrule", "FREQ=WEEKLY;COUNT=4"},
                          {"dtstart", "2026-03-02T09:00:00Z"},
                          {"dtend", "2026-03-02T09:30:00Z"},
                          {"attendees", {"ana@example.com", "bo@example.com"}}};
-  if (!field.empty()) body[field] = value;
+  for (const auto& [field, value] : changes.items()) body[field] = value;
   return c.Post("/v1/events", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
 }
 
@@ -1174,8 +1206,8 @@ nlohmann::json apiBody(const harness::Response& r) {
 }
 
 void apiRefused(harness::Ctx& ctx, harness::HTTP& c, int status, const std::string& code, const std::string& what,
-                const std::string& field, const std::string& value) {
-  const auto r = apiPost(c, field, value);
+                const nlohmann::json& changes) {
+  const auto r = apiPost(c, changes);
   ctx.Assert(r.Status == status && apiBody(r).value("error", "") == code, "%s answered %d %s, expected %d %s", what, r.Status,
              r.Text(), status, code);
   const auto keys = ctx.Redis.Keys("event:*");
@@ -1199,44 +1231,52 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckUnknownParts(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
-  for (const std::string rule : {"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT"}) {
-    apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule " + rule, "rrule", rule);
+  for (const std::string rule : {"FREQ=WEEKLY;COUNT=4;BYSECOND=30", "FREQ=WEEKLY;COUNT=4;BYDAY=MO,WE", "FREQ=SECONDLY;COUNT=10", "FREQ=WEEKLY;COUNT", "COUNT=3", "FREQ=DAILY;BYDAY=MO"}) {
+    apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule " + rule, {{"rrule", rule}});
   }
-  const auto r = apiPost(c, "rrule", "");
+  // The rule is judged before the instants.
+  apiRefused(ctx, c, 422, "unsupported_rrule_part", "the rule FREQ=WEEKLY;COUNT=4;BYDAY=MO with a dtstart without an offset",
+             {{"rrule", "FREQ=WEEKLY;COUNT=4;BYDAY=MO"}, {"dtstart", "2026-03-02T09:00:00"}});
+  const auto r = apiPost(c, {{"rrule", ""}});
   ctx.Equal(r.Status, 201, "an empty rule, one occurrence (%s)", r.Text());
 }
 
 void CheckRuleTerminates(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
-  for (const std::string rule : {"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z"}) {
-    apiRefused(ctx, c, 422, "rule_not_terminating", "the rule " + rule, "rrule", rule);
+  for (const std::string rule : {"FREQ=DAILY", "FREQ=DAILY;COUNT=6000", "FREQ=DAILY;COUNT=5001", "FREQ=DAILY;COUNT=0", "FREQ=DAILY;COUNT=many",
+                                 "FREQ=DAILY;INTERVAL=0;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=-1;COUNT=3", "FREQ=DAILY;INTERVAL=two;COUNT=3"}) {
+    apiRefused(ctx, c, 422, "rule_not_terminating", "the rule " + rule, {{"rrule", rule}});
   }
-  for (const std::string rule : {"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000"}) {
-    const auto r = apiPost(c, "rrule", rule);
+  // The rule is judged before the instants.
+  apiRefused(ctx, c, 422, "rule_not_terminating", "the rule FREQ=DAILY;COUNT=0 with a dtstart without an offset",
+             {{"rrule", "FREQ=DAILY;COUNT=0"}, {"dtstart", "2026-03-02T09:00:00"}});
+  for (const std::string rule : {"FREQ=DAILY;UNTIL=2026-06-01T00:00:00Z", "FREQ=DAILY;INTERVAL=2;COUNT=5000", "FREQ=WEEKLY;COUNT=1"}) {
+    const auto r = apiPost(c, {{"rrule", rule}});
     ctx.Equal(r.Status, 201, "the rule %s ends (%s)", rule, r.Text());
   }
 }
 
 void CheckTzAware(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
-  apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", "dtstart", "2026-03-02T09:00:00");
-  apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", "dtend", "2026-03-02T09:30:00");
-  apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", "rrule", "FREQ=DAILY;UNTIL=2026-06-01T00:00:00");
-  nlohmann::json body = {{"calendar_id", "c1"},
-                         {"title", "Standup"},
-                         {"rrule", "FREQ=WEEKLY;COUNT=4"},
-                         {"dtstart", "2026-03-02T10:00:00+01:00"},
-                         {"dtend", "2026-03-02T10:30:00+01:00"}};
-  const auto r = c.Post("/v1/events", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset", {{"dtstart", "2026-03-02T09:00:00"}});
+  apiRefused(ctx, c, 422, "invalid_instant", "a dtend without an offset", {{"dtend", "2026-03-02T09:30:00"}});
+  apiRefused(ctx, c, 422, "invalid_instant", "an UNTIL without an offset", {{"rrule", "FREQ=DAILY;UNTIL=2026-06-01T00:00:00"}});
+  apiRefused(ctx, c, 422, "invalid_instant", "a dtstart without an offset after its dtend", {{"dtstart", "2026-03-02T10:00:00"}});
+  const auto r = apiPost(c, {{"dtstart", "2026-03-02T10:00:00+01:00"}, {"dtend", "2026-03-02T10:30:00+01:00"}});
   ctx.Equal(r.Status, 201, "instants with a +01:00 offset (%s)", r.Text());
   auto stored = ctx.Redis.HGetAll("event:" + apiBody(r).value("event_id", ""));
   ctx.Equal(stored["dtstart"], "2026-03-02T09:00:00Z", "the stored dtstart of 10:00+01:00");
+  ctx.Equal(stored["dtend"], "2026-03-02T09:30:00Z", "the stored dtend of 10:30+01:00");
 }
 
 void CheckRangeOrder(harness::Ctx& ctx) {
   auto c = apiClient(ctx);
-  apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", "dtend", "2026-03-02T09:00:00Z");
-  apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", "dtend", "2026-03-02T08:00:00Z");
+  apiRefused(ctx, c, 422, "invalid_range", "an event that ends when it starts", {{"dtend", "2026-03-02T09:00:00Z"}});
+  apiRefused(ctx, c, 422, "invalid_range", "an event that ends before it starts", {{"dtend", "2026-03-02T08:00:00Z"}});
+  apiRefused(ctx, c, 422, "invalid_range", "09:00Z to 09:30+01:00 (08:30Z)", {{"dtend", "2026-03-02T09:30:00+01:00"}});
+  // Instants are compared, not their text: 10:00+02:00 is 08:00Z.
+  const auto r = apiPost(c, {{"dtstart", "2026-03-02T10:00:00+02:00"}, {"dtend", "2026-03-02T09:30:00Z"}});
+  ctx.Equal(r.Status, 201, "10:00+02:00 (08:00Z) to 09:30Z (%s)", r.Text());
 }
 `,
   },

@@ -22,11 +22,12 @@ out; and a client that retries after a timeout files the same submission twice.
 - Validate against \`store.published_schema\`: the published version is the contract with
   submitters, the draft belongs to the author.
 - A field the schema does not declare, or a value longer than its \`max_bytes\` (counted in UTF-8
-  bytes), is **422** with a body naming every offending field; nothing is stored.
+  bytes of the value as submitted), is **422** with a body naming every offending field; nothing is
+  stored.
 - Store values **HTML-escaped** (\`&\`, \`<\`, \`>\`), not stripped.
-- \`Idempotency-Key\` is required (**400** without it). Look up \`store.submission_for_key(form, key)\`
-  before inserting and answer the original \`submission_id\` on a replay; record the key with
-  \`store.record_key\` after the insert.`,
+- \`Idempotency-Key\` is required (**400** when it is missing or empty). Look up
+  \`store.submission_for_key(form, key)\` before inserting and answer the original \`submission_id\`
+  on a replay; record the key with \`store.record_key\` after the insert.`,
   sequence: {
     participants: ['Submitter', 'Form API', 'Form store'],
     messages: [
@@ -74,7 +75,7 @@ out; and a client that retries after a timeout files the same submission twice.
       id: 'field-limits',
       title: 'Enforces each field’s max_bytes in bytes',
       detail:
-        'A value longer than its field’s `max_bytes`, counted in UTF-8 bytes (21 × `é` is 42 bytes), answers **422** naming the field. The starter stores any length.',
+        'A value longer than its field’s `max_bytes`, counted in UTF-8 bytes of the value as submitted (21 × `é` is 42 bytes; markup counts before it is escaped), answers **422**; a submission with an over-long field and an undeclared one names both. The starter stores any length.',
       match: {
         python: {all: [/len\([^)\n]*\.encode\(/]},
         typescript: {all: [/Buffer\.byteLength\(|TextEncoder\(\)\.encode\(/]},
@@ -100,7 +101,7 @@ out; and a client that retries after a timeout files the same submission twice.
       id: 'replay-id',
       title: 'A replayed Idempotency-Key answers the original submission',
       detail:
-        '`Idempotency-Key` is required (**400**), looked up with `submission_for_key`/`submissionForKey` before the insert and recorded with `record_key`/`recordKey` after it, so a retry answers the first `submission_id`. The starter ignores the header.',
+        '`Idempotency-Key` is required (**400** when missing or empty), looked up with `submission_for_key`/`submissionForKey` before the insert and recorded with `record_key`/`recordKey` after it, so a retry answers the first `submission_id`. The starter ignores the header.',
       match: {
         python: {
           all: [/idempotency-key/i, /\b400\b/, /store\.record_key\(/],
@@ -645,9 +646,13 @@ async def check_field_limits(ctx):
         assert "name" in r.text, f"the 422 must name the field, got {r.text}"
         r = await _submit(c, {"message": "x" * 201}, "k-2")
         assert r.status_code == 422, f"201 bytes in message, declared max_bytes 200, answered {r.status_code}"
-        r = await _submit(c, {"name": "a" * 40, "message": "x" * 200}, "k-3")
-    assert r.status_code == 201, f"values exactly at their max_bytes answered {r.status_code}: {r.text}"
-    assert _count(ctx) == 1, f"the form holds {_count(ctx)} submissions, expected only the one within its limits"
+        r = await _submit(c, {"name": "é" * 21, "plan": "enterprise"}, "k-3")
+        assert r.status_code == 422 and "name" in r.text and "plan" in r.text, f"a submission with an over-long name and an undeclared plan answered {r.status_code} {r.text}: the 422 must name every offending field, whatever is wrong with each"
+        r = await _submit(c, {"name": "a" * 40, "message": "x" * 200}, "k-4")
+        assert r.status_code == 201, f"values exactly at their max_bytes answered {r.status_code}: {r.text}"
+        r = await _submit(c, {"message": "<b>" + "x" * 193 + "&"}, "k-5")
+    assert r.status_code == 201, f"a message of 197 bytes with markup answered {r.status_code}: {r.text}. The limit holds the value as submitted, not its escaped form"
+    assert _count(ctx) == 2, f"the form holds {_count(ctx)} submissions, expected only the two within their limits"
 
 
 async def check_escape_markup(ctx):
@@ -670,7 +675,10 @@ async def check_replay_id(ctx):
         other = await _submit(c, {"name": "Grace"}, "k-2")
         assert other.status_code == 201 and other.json().get("submission_id") != first.json().get("submission_id"), f"a new key must store a new submission, got {other.status_code} {other.text}"
         none = await _submit(c, {"name": "Ada"}, None)
-    assert none.status_code == 400, f"a POST without Idempotency-Key answered {none.status_code}, expected 400"
+        assert none.status_code == 400, f"a POST without Idempotency-Key answered {none.status_code}, expected 400"
+        empty = await c.post("/v1/forms/f-1/submissions", json={"fields": {"name": "Ada"}}, headers={"Idempotency-Key": ""})
+    assert empty.status_code == 400, f"a POST with an empty Idempotency-Key answered {empty.status_code}, expected 400: an empty key is no key"
+    assert _count(ctx) == 2, f"the form holds {_count(ctx)} submissions after the keyless POSTs, expected 2"
 `,
     typescript: `const PUBLISHED = {name: 40, email: 80, message: 200};
 // The author's next version: phone added, message dropped. Not published yet.
@@ -714,9 +722,13 @@ export async function check_field_limits(ctx) {
   assert(r.text.includes('name'), \`the 422 must name the field, got \${r.text}\`);
   r = await submit(c, {message: 'x'.repeat(201)}, 'k-2');
   assert.equal(r.status, 422, \`201 bytes in message, declared max_bytes 200, answered \${r.status}\`);
-  r = await submit(c, {name: 'a'.repeat(40), message: 'x'.repeat(200)}, 'k-3');
+  r = await submit(c, {name: 'é'.repeat(21), plan: 'enterprise'}, 'k-3');
+  assert(r.status === 422 && r.text.includes('name') && r.text.includes('plan'), \`a submission with an over-long name and an undeclared plan answered \${r.status} \${r.text}: the 422 must name every offending field, whatever is wrong with each\`);
+  r = await submit(c, {name: 'a'.repeat(40), message: 'x'.repeat(200)}, 'k-4');
   assert.equal(r.status, 201, \`values exactly at their max_bytes answered \${r.status}: \${r.text}\`);
-  assert.equal(count(ctx), 1, 'the form must hold only the submission within its limits');
+  r = await submit(c, {message: '<b>' + 'x'.repeat(193) + '&'}, 'k-5');
+  assert.equal(r.status, 201, \`a message of 197 bytes with markup answered \${r.status}: \${r.text}. The limit holds the value as submitted, not its escaped form\`);
+  assert.equal(count(ctx), 2, 'the form must hold only the two submissions within their limits');
 }
 
 export async function check_escape_markup(ctx) {
@@ -739,6 +751,9 @@ export async function check_replay_id(ctx) {
   assert(other.status === 201 && other.json().submission_id !== first.json().submission_id, \`a new key must store a new submission, got \${other.status} \${other.text}\`);
   const none = await submit(c, {name: 'Ada'}, null);
   assert.equal(none.status, 400, \`a POST without Idempotency-Key answered \${none.status}, expected 400\`);
+  const empty = await submit(c, {name: 'Ada'}, '');
+  assert.equal(empty.status, 400, \`a POST with an empty Idempotency-Key answered \${empty.status}, expected 400: an empty key is no key\`);
+  assert.equal(count(ctx), 2, 'the keyless POSTs must store nothing');
 }
 `,
     go: `package main
@@ -811,9 +826,13 @@ func CheckFieldLimits(ctx *harness.Ctx) {
 	ctx.Assert(strings.Contains(r.Text(), "name"), "the 422 must name the field, got %s", r.Text())
 	r = apiSubmit(c, map[string]string{"message": strings.Repeat("x", 201)}, "k-2")
 	ctx.Equal(r.Status, 422, "201 bytes in message, declared max_bytes 200")
-	r = apiSubmit(c, map[string]string{"name": strings.Repeat("a", 40), "message": strings.Repeat("x", 200)}, "k-3")
+	r = apiSubmit(c, map[string]string{"name": strings.Repeat("é", 21), "plan": "enterprise"}, "k-3")
+	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "name") && strings.Contains(r.Text(), "plan"), "a submission with an over-long name and an undeclared plan answered %d %s: the 422 must name every offending field, whatever is wrong with each", r.Status, r.Text())
+	r = apiSubmit(c, map[string]string{"name": strings.Repeat("a", 40), "message": strings.Repeat("x", 200)}, "k-4")
 	ctx.Equal(r.Status, 201, "values exactly at their max_bytes (%s)", r.Text())
-	ctx.Equal(apiCount(ctx), 1, "the form must hold only the submission within its limits; submissions")
+	r = apiSubmit(c, map[string]string{"message": "<b>" + strings.Repeat("x", 193) + "&"}, "k-5")
+	ctx.Equal(r.Status, 201, "a message of 197 bytes with markup (%s): the limit holds the value as submitted, not its escaped form", r.Text())
+	ctx.Equal(apiCount(ctx), 2, "the form must hold only the two submissions within their limits; submissions")
 }
 
 func CheckEscapeMarkup(ctx *harness.Ctx) {
@@ -838,6 +857,9 @@ func CheckReplayId(ctx *harness.Ctx) {
 	ctx.Assert(other.Status == 201 && apiID(other) != apiID(first), "a new key must store a new submission, got %d %s", other.Status, other.Text())
 	none := apiSubmit(c, map[string]string{"name": "Ada"}, "")
 	ctx.Equal(none.Status, 400, "a POST without Idempotency-Key")
+	empty := c.Post("/v1/forms/f-1/submissions", map[string]any{"fields": map[string]string{"name": "Ada"}}, "Idempotency-Key", "")
+	ctx.Equal(empty.Status, 400, "a POST with an empty Idempotency-Key (an empty key is no key)")
+	ctx.Equal(apiCount(ctx), 2, "the keyless POSTs must store nothing; submissions")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -851,11 +873,11 @@ func CheckReplayId(ctx *harness.Ctx) {
 namespace {
 
 // The author's next version adds phone and drops message; it is not published yet.
-const store::Schema kPublished = {{"name", 40}, {"email", 80}, {"message", 200}};
-const store::Schema kDraft = {{"name", 40}, {"email", 80}, {"phone", 20}};
+const store::Schema hPublished = {{"name", 40}, {"email", 80}, {"message", 200}};
+const store::Schema hDraft = {{"name", 40}, {"email", 80}, {"phone", 20}};
 
-harness::HTTP api(harness::Ctx& ctx) {
-  store::defineForm("f-1", "u-owner", kPublished, kDraft);
+harness::HTTP hApi(harness::Ctx& ctx) {
+  store::defineForm("f-1", "u-owner", hPublished, hDraft);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -863,22 +885,22 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response submitWith(harness::HTTP& c, const nlohmann::json& fields, const std::string& key) {
+harness::Response hSubmit(harness::HTTP& c, const nlohmann::json& fields, const std::string& key) {
   const std::string body = nlohmann::json{{"fields", fields}}.dump();
   if (key.empty()) return c.Post("/v1/forms/f-1/submissions", body, "Content-Type", "application/json");
   return c.Post("/v1/forms/f-1/submissions", body, "Content-Type", "application/json", "Idempotency-Key", key);
 }
 
-long long count(harness::Ctx& ctx) { return ctx.Redis.ZCard("form:f-1:submissions"); }
+long long hCount(harness::Ctx& ctx) { return ctx.Redis.ZCard("form:f-1:submissions"); }
 
-std::string idOf(const harness::Response& r) {
+std::string hIdOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("submission_id", "") : "";
 }
 
-bool has(const harness::Response& r, const std::string& text) { return r.Text().find(text) != std::string::npos; }
+bool hHas(const harness::Response& r, const std::string& text) { return r.Text().find(text) != std::string::npos; }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
@@ -887,59 +909,66 @@ std::string repeat(const std::string& s, int n) {
 }  // namespace
 
 void CheckPublishedSchema(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = submitWith(c, {{"name", "Ada"}, {"message", "Hello"}}, "k-1");
+  auto c = hApi(ctx);
+  auto r = hSubmit(c, {{"name", "Ada"}, {"message", "Hello"}}, "k-1");
   ctx.Equal(r.Status, 201, "a submission of the published fields name and message (%s); submitters see the published form, whatever the draft dropped", r.Text());
-  r = submitWith(c, {{"name", "Ada"}, {"phone", "555-0100"}}, "k-2");
+  r = hSubmit(c, {{"name", "Ada"}, {"phone", "555-0100"}}, "k-2");
   ctx.Equal(r.Status, 422, "a submission of phone, a field only the unpublished draft declares: a public caller must not write a field the author has not shipped");
-  ctx.Assert(has(r, "phone"), "the 422 must name the field phone, got %s", r.Text());
-  ctx.Equal(count(ctx), 1, "the form must hold only the valid submission; submissions");
+  ctx.Assert(hHas(r, "phone"), "the 422 must name the field phone, got %s", r.Text());
+  ctx.Equal(hCount(ctx), 1, "the form must hold only the valid submission; submissions");
 }
 
 void CheckUnknownFields(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = submitWith(c, {{"name", "Ada"}, {"is_admin", "true"}, {"plan", "enterprise"}}, "k-1");
+  auto c = hApi(ctx);
+  auto r = hSubmit(c, {{"name", "Ada"}, {"is_admin", "true"}, {"plan", "enterprise"}}, "k-1");
   ctx.Equal(r.Status, 422, "a submission with the undeclared fields is_admin and plan");
-  ctx.Assert(has(r, "is_admin") && has(r, "plan"), "the 422 must name every undeclared field (is_admin, plan), got %s", r.Text());
-  ctx.Equal(count(ctx), 0, "a rejected submission must not be stored; submissions");
-  r = submitWith(c, {{"name", "Ada"}}, "k-2");
+  ctx.Assert(hHas(r, "is_admin") && hHas(r, "plan"), "the 422 must name every undeclared field (is_admin, plan), got %s", r.Text());
+  ctx.Equal(hCount(ctx), 0, "a rejected submission must not be stored; submissions");
+  r = hSubmit(c, {{"name", "Ada"}}, "k-2");
   ctx.Equal(r.Status, 201, "a submission of declared fields only (%s)", r.Text());
 }
 
 void CheckFieldLimits(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = submitWith(c, {{"name", repeat("é", 21)}}, "k-1");
+  auto c = hApi(ctx);
+  auto r = hSubmit(c, {{"name", hRepeat("é", 21)}}, "k-1");
   ctx.Equal(r.Status, 422, "21 characters of é (42 bytes) in name, declared max_bytes 40: count the limit in UTF-8 bytes, not characters");
-  ctx.Assert(has(r, "name"), "the 422 must name the field, got %s", r.Text());
-  r = submitWith(c, {{"message", repeat("x", 201)}}, "k-2");
+  ctx.Assert(hHas(r, "name"), "the 422 must name the field, got %s", r.Text());
+  r = hSubmit(c, {{"message", hRepeat("x", 201)}}, "k-2");
   ctx.Equal(r.Status, 422, "201 bytes in message, declared max_bytes 200");
-  r = submitWith(c, {{"name", repeat("a", 40)}, {"message", repeat("x", 200)}}, "k-3");
+  r = hSubmit(c, {{"name", hRepeat("é", 21)}, {"plan", "enterprise"}}, "k-3");
+  ctx.Assert(r.Status == 422 && hHas(r, "name") && hHas(r, "plan"), "a submission with an over-long name and an undeclared plan answered %d %s: the 422 must name every offending field, whatever is wrong with each", r.Status, r.Text());
+  r = hSubmit(c, {{"name", hRepeat("a", 40)}, {"message", hRepeat("x", 200)}}, "k-4");
   ctx.Equal(r.Status, 201, "values exactly at their max_bytes (%s)", r.Text());
-  ctx.Equal(count(ctx), 1, "the form must hold only the submission within its limits; submissions");
+  r = hSubmit(c, {{"message", "<b>" + hRepeat("x", 193) + "&"}}, "k-5");
+  ctx.Equal(r.Status, 201, "a message of 197 bytes with markup (%s): the limit holds the value as submitted, not its escaped form", r.Text());
+  ctx.Equal(hCount(ctx), 2, "the form must hold only the two submissions within their limits; submissions");
 }
 
 void CheckEscapeMarkup(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = submitWith(c, {{"message", "<script>alert(1)</script> & thanks"}}, "k-1");
+  auto c = hApi(ctx);
+  const auto r = hSubmit(c, {{"message", "<script>alert(1)</script> & thanks"}}, "k-1");
   ctx.Equal(r.Status, 201, "a message with markup (%s)", r.Text());
-  const auto s = store::loadSubmission(idOf(r));
-  ctx.Assert(s.has_value(), "the submission %s is not in the store", idOf(r));
+  const auto s = store::loadSubmission(hIdOf(r));
+  ctx.Assert(s.has_value(), "the submission %s is not in the store", hIdOf(r));
   const std::string stored = s->values.count("message") ? s->values.at("message") : "";
   ctx.Assert(stored.find_first_of("<>") == std::string::npos, "the stored message %q still holds raw markup the dashboard would run", stored);
   ctx.Equal(stored, "&lt;script&gt;alert(1)&lt;/script&gt; &amp; thanks", "the markup must be escaped (&lt; &gt; &amp;), not cut out with the submitter's words; the stored message");
 }
 
 void CheckReplayId(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = submitWith(c, {{"name", "Ada"}}, "k-1");
-  const auto replay = submitWith(c, {{"name", "Ada"}}, "k-1");
+  auto c = hApi(ctx);
+  const auto first = hSubmit(c, {{"name", "Ada"}}, "k-1");
+  const auto replay = hSubmit(c, {{"name", "Ada"}}, "k-1");
   ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the first POST answered %d, its replay %d", first.Status, replay.Status);
-  ctx.Equal(idOf(replay), idOf(first), "a replay of Idempotency-Key k-1 must answer the first submission_id (one person, one submission)");
-  ctx.Equal(count(ctx), 1, "two POSTs with one Idempotency-Key; submissions");
-  const auto other = submitWith(c, {{"name", "Grace"}}, "k-2");
-  ctx.Assert(other.Status == 201 && idOf(other) != idOf(first), "a new key must store a new submission, got %d %s", other.Status, other.Text());
-  const auto none = submitWith(c, {{"name", "Ada"}}, "");
+  ctx.Equal(hIdOf(replay), hIdOf(first), "a replay of Idempotency-Key k-1 must answer the first submission_id (one person, one submission)");
+  ctx.Equal(hCount(ctx), 1, "two POSTs with one Idempotency-Key; submissions");
+  const auto other = hSubmit(c, {{"name", "Grace"}}, "k-2");
+  ctx.Assert(other.Status == 201 && hIdOf(other) != hIdOf(first), "a new key must store a new submission, got %d %s", other.Status, other.Text());
+  const auto none = hSubmit(c, {{"name", "Ada"}}, "");
   ctx.Equal(none.Status, 400, "a POST without Idempotency-Key");
+  const auto empty = c.Post("/v1/forms/f-1/submissions", nlohmann::json{{"fields", {{"name", "Ada"}}}}.dump(), "Content-Type", "application/json", "Idempotency-Key", "");
+  ctx.Equal(empty.Status, 400, "a POST with an empty Idempotency-Key (an empty key is no key)");
+  ctx.Equal(hCount(ctx), 2, "the keyless POSTs must store nothing; submissions");
 }
 `,
   },

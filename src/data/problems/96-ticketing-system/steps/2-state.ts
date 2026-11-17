@@ -57,7 +57,7 @@ the queue, and the customer's badge misses a reply.
       id: 'lease-expiry',
       title: 'A lease expires after 120 seconds',
       detail:
-        'The same `SET` carries `EX LEASE_S` (120 s), so the ticket of an agent who crashed or went home comes back by itself; the starter’s lease never expires.',
+        'The same `SET` carries `EX LEASE_S` (120 s), so the ticket of an agent who crashed or went home comes back by itself: the lease has its TTL from the moment it exists, and holds until 120 s have passed. The starter’s lease never expires.',
       match: {
         python: {all: [/LEASE_S\s*=\s*120\b/, /\bex\s*=\s*LEASE_S/]},
         typescript: {all: [/LEASE_S\s*=\s*120\b/, /['"]EX['"],\s*LEASE_S/]},
@@ -98,7 +98,7 @@ the queue, and the customer's badge misses a reply.
       id: 'queue-return',
       title: 'Assignment takes the ticket off the queue, release puts it back',
       detail:
-        'An assign that wins removes the ticket from `assign:queue` (`ZREM`) and a release adds it back (`ZADD`, score now), so the queue lists exactly the tickets nobody holds; the starter never touches the queue.',
+        'An assign that wins removes the ticket from `assign:queue` (`ZREM`) and a release adds it back (`ZADD`, score now) in the same script that deletes the lease, so the queue lists exactly the tickets nobody holds; the starter never touches the queue.',
       match: {
         python: {all: [/\.zrem\(/, /['"]ZADD['"]|\.zadd\(/]},
         typescript: {all: [/\.zrem\(/, /['"]ZADD['"]|\.zadd\(/]},
@@ -111,7 +111,7 @@ the queue, and the customer's badge misses a reply.
       id: 'unread-atomic',
       title: 'The unread badge moves with HINCRBY',
       detail:
-        'The requester’s badge for the ticket is incremented by Redis (`HINCRBY unread:{requester} {ticket_id} 1`), so two replies posted at once count twice; the starter reads the count, adds one and writes it back, and the second write erases the first.',
+        'The requester’s badge for the ticket is incremented by Redis (`HINCRBY unread:{requester} {ticket_id} 1`), so two replies posted at once count twice, and `post_message` returns the count its own increment produced; the starter reads the count, adds one and writes it back, and the second write erases the first.',
       match: {
         python: {all: [/\.hincrby\(/], none: [/\.hset\(/]},
         typescript: {all: [/\.hincrby\(/], none: [/\.hset\(/]},
@@ -582,7 +582,9 @@ long long postMessage(const std::string& ticket_id, const std::string& agent, co
     },
   },
   harness: {
-    python: `from tickets import store
+    python: `import time
+
+from tickets import store
 
 QUEUE = "assign:queue"
 
@@ -619,10 +621,17 @@ def check_lease_exclusive(ctx):
 def check_lease_expiry(ctx):
     m, t = _state(ctx)
     lease = f"lease:{t}"
+    # Read the TTL the instant the lease is written, before any follow-up command can set one.
+    first = ctx.redis_after(lease, lambda: ctx.redis.ttl(lease))
     m.assign(t, "A-1")
+    ttl = _settled(first, lease)
+    assert ttl == -2 or 0 < ttl <= 120, f"{lease} had TTL {ttl} right after the command that wrote it: the lease must carry EX LEASE_S = 120 s in the same SET NX, or the ticket of an agent who went home stays theirs"
     ttl = ctx.redis.ttl(lease)
     assert 0 < ttl <= 120, f"{lease} has TTL {ttl}: a lease must expire after LEASE_S = 120 s, or the ticket of an agent who went home stays theirs"
-    ctx.clock.advance(121)
+    ctx.clock.advance(119)
+    got = m.assign(t, "A-2")
+    assert got == "A-1", f"119 s after A-1 took the lease, A-2's assign answered {got!r}: the lease lasts LEASE_S = 120 s"
+    ctx.clock.advance(2)
     got = m.assign(t, "A-2")
     assert got == "A-2", f"121 s after A-1 took the lease and went silent, A-2's assign answered {got!r}: the lease must have expired"
 
@@ -651,10 +660,27 @@ def check_queue_return(ctx):
     ctx.redis.zadd(QUEUE, {t: 1})
     m.assign(t, "A-1")
     assert ctx.redis.zscore(QUEUE, t) is None, f"{t} is still on {QUEUE} after A-1 took it: the next agent would pick it up too"
+    ctx.clock.advance(30)
     assert m.release(t, "A-1") is True, "the holder's release must answer True"
     assert ctx.redis.exists(lease) == 0, f"{lease} is still there after its holder released it"
-    assert ctx.redis.zscore(QUEUE, t) is not None, f"{t} is not on {QUEUE} after its release: a ticket nobody holds must be back in the queue"
+    score = ctx.redis.zscore(QUEUE, t)
+    assert score is not None, f"{t} is not on {QUEUE} after its release: a ticket nobody holds must be back in the queue"
+    assert abs(score - time.time()) <= 2, f"{t} went back on {QUEUE} with score {score}, the release ran at {int(time.time())}: the score is the time of the release"
     assert m.assign(t, "A-2") == "A-2", "a released ticket must go to the next agent who asks"
+
+    # A-3 takes the ticket the instant A-2's release has touched the lease.
+    def take():
+        won = ctx.redis.set(lease, "A-3", nx=True, ex=120)
+        if won:
+            ctx.redis.zrem(QUEUE, t)
+        return bool(won)
+
+    rival = ctx.redis_after(lease, take)
+    m.release(t, "A-2")
+    if _settled(rival, lease):
+        assert ctx.redis.zscore(QUEUE, t) is None, f"A-3 took {t} right after A-2's release deleted the lease, and {t} is back on {QUEUE} anyway: delete the lease and ZADD in the same script"
+    else:
+        assert ctx.redis.zscore(QUEUE, t) is not None and ctx.redis.exists(lease) == 0, f"after A-2's release {t} must be off its lease and back on {QUEUE}"
 
 
 def check_unread_atomic(ctx):
@@ -662,10 +688,11 @@ def check_unread_atomic(ctx):
     key = "unread:R-1"
     # Another replica posts a reply on the same ticket the instant this post first touches the badge.
     rival = ctx.redis_after(key, lambda: ctx.redis.hincrby(key, t, 1))
-    m.post_message(t, "A-1", "We refunded the second charge.")
+    got = m.post_message(t, "A-1", "We refunded the second charge.")
     _settled(rival, key)
     count = ctx.redis.hget(key, t)
     assert count == "2", f"two replies were posted on {t} and the badge reads {count!r}: one increment was lost between a read and a write. Increment with HINCRBY"
+    assert got == 1, f"post_message answered {got!r}: it returns the count its own HINCRBY produced (1), not a later read that includes another reply"
     bodies = [n["body"] for n in store.page(t, None, 10)]
     assert bodies == ["We refunded the second charge."], f"post_message must append the reply as a note, the ticket has {bodies}"
 `,
@@ -704,11 +731,18 @@ export async function check_lease_exclusive(ctx) {
 export async function check_lease_expiry(ctx) {
   const {m, t} = await state(ctx);
   const lease = \`lease:\${t}\`;
+  // Read the TTL the instant the lease is written, before any follow-up command can set one.
+  const first = ctx.redisAfter(lease, () => ctx.redis.ttl(lease));
   await m.assign(t, 'A-1');
-  const ttl = ctx.redis.ttl(lease);
+  let ttl = settled(first, lease);
+  assert(ttl === -2 || (ttl > 0 && ttl <= 120), \`\${lease} had TTL \${ttl} right after the command that wrote it: the lease must carry EX LEASE_S = 120 s in the same SET NX, or the ticket of an agent who went home stays theirs\`);
+  ttl = ctx.redis.ttl(lease);
   assert(ttl > 0 && ttl <= 120, \`\${lease} has TTL \${ttl}: a lease must expire after LEASE_S = 120 s, or the ticket of an agent who went home stays theirs\`);
-  ctx.clock.advance(121);
-  const got = await m.assign(t, 'A-2');
+  ctx.clock.advance(119);
+  let got = await m.assign(t, 'A-2');
+  assert.equal(got, 'A-1', \`119 s after A-1 took the lease, A-2's assign answered \${JSON.stringify(got)}: the lease lasts LEASE_S = 120 s\`);
+  ctx.clock.advance(2);
+  got = await m.assign(t, 'A-2');
   assert.equal(got, 'A-2', \`121 s after A-1 took the lease and went silent, A-2's assign answered \${JSON.stringify(got)}: the lease must have expired\`);
 }
 
@@ -734,10 +768,26 @@ export async function check_queue_return(ctx) {
   ctx.redis.zadd(QUEUE, 1, t);
   await m.assign(t, 'A-1');
   assert.equal(ctx.redis.zscore(QUEUE, t), null, \`\${t} is still on \${QUEUE} after A-1 took it: the next agent would pick it up too\`);
+  ctx.clock.advance(30);
   assert.equal(await m.release(t, 'A-1'), true, "the holder's release must answer true");
   assert.equal(ctx.redis.exists(lease), 0, \`\${lease} is still there after its holder released it\`);
-  assert.notEqual(ctx.redis.zscore(QUEUE, t), null, \`\${t} is not on \${QUEUE} after its release: a ticket nobody holds must be back in the queue\`);
+  const score = ctx.redis.zscore(QUEUE, t);
+  assert.notEqual(score, null, \`\${t} is not on \${QUEUE} after its release: a ticket nobody holds must be back in the queue\`);
+  const now = ctx.clock.now() / 1000;
+  assert(Math.abs(Number(score) - now) <= 2, \`\${t} went back on \${QUEUE} with score \${score}, the release ran at \${Math.floor(now)}: the score is the time of the release\`);
   assert.equal(await m.assign(t, 'A-2'), 'A-2', 'a released ticket must go to the next agent who asks');
+  // A-3 takes the ticket the instant A-2's release has touched the lease.
+  const rival = ctx.redisAfter(lease, () => {
+    const won = ctx.redis.set(lease, 'A-3', 'NX', 'EX', 120) === 'OK';
+    if (won) ctx.redis.zrem(QUEUE, t);
+    return won;
+  });
+  await m.release(t, 'A-2');
+  if (settled(rival, lease)) {
+    assert.equal(ctx.redis.zscore(QUEUE, t), null, \`A-3 took \${t} right after A-2's release deleted the lease, and \${t} is back on \${QUEUE} anyway: delete the lease and ZADD in the same script\`);
+  } else {
+    assert(ctx.redis.zscore(QUEUE, t) !== null && ctx.redis.exists(lease) === 0, \`after A-2's release \${t} must be off its lease and back on \${QUEUE}\`);
+  }
 }
 
 export async function check_unread_atomic(ctx) {
@@ -745,10 +795,11 @@ export async function check_unread_atomic(ctx) {
   const key = 'unread:R-1';
   // Another replica posts a reply on the same ticket the instant this post first touches the badge.
   const rival = ctx.redisAfter(key, () => ctx.redis.hincrby(key, t, 1));
-  await m.postMessage(t, 'A-1', 'We refunded the second charge.');
+  const got = await m.postMessage(t, 'A-1', 'We refunded the second charge.');
   settled(rival, key);
   const count = ctx.redis.hget(key, t);
   assert.equal(count, '2', \`two replies were posted on \${t} and the badge reads \${JSON.stringify(count)}: one increment was lost between a read and a write. Increment with HINCRBY\`);
+  assert.equal(Number(got), 1, \`postMessage answered \${JSON.stringify(got)}: it returns the count its own HINCRBY produced (1), not a later read that includes another reply\`);
   const bodies = (await store.page(t, null, 10)).map(n => n.body);
   assert.deepStrictEqual(bodies, ['We refunded the second charge.'], \`postMessage must append the reply as a note, the ticket has \${JSON.stringify(bodies)}\`);
 }
@@ -810,10 +861,17 @@ func CheckLeaseExclusive(ctx *harness.Ctx) {
 
 func CheckLeaseExpiry(ctx *harness.Ctx) {
 	t := stateTicket("Printer on fire")
+	// Read the TTL the instant the lease is written, before any follow-up command can set one.
+	first := ctx.Redis.After("lease:"+t, func() any { return ctx.Redis.TTL("lease:" + t) })
 	stateAssign(ctx, t, "A-1")
+	ctx.Assert(first.Fired, "assign never touched lease:%s", t)
+	early, _ := first.Result.(int64)
+	ctx.Assert(early == -2 || (early > 0 && early <= 120), "lease:%s had TTL %d right after the command that wrote it: the lease must carry EX leaseTTL = 120 s in the same SET NX, or the ticket of an agent who went home stays theirs", t, early)
 	ttl := ctx.Redis.TTL("lease:" + t)
 	ctx.Assert(ttl > 0 && ttl <= 120, "lease:%s has TTL %d: a lease must expire after leaseTTL = 120 s, or the ticket of an agent who went home stays theirs", t, ttl)
-	ctx.Clock.Advance(121)
+	ctx.Clock.Advance(119)
+	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-1", "119 s after A-1 took the lease it is still A-1's (the lease lasts 120 s); A-2's assign answered")
+	ctx.Clock.Advance(2)
 	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-2", "121 s after A-1 took the lease and went silent, the lease must have expired; A-2's assign answered")
 }
 
@@ -839,11 +897,31 @@ func CheckQueueReturn(ctx *harness.Ctx) {
 	stateAssign(ctx, t, "A-1")
 	_, queued := ctx.Redis.ZScore(stateQueue, t)
 	ctx.Assert(!queued, "%s is still on %s after A-1 took it: the next agent would pick it up too", t, stateQueue)
+	ctx.Clock.Advance(30)
 	ctx.Equal(stateRelease(ctx, t, "A-1"), true, "the holder's release; it answered")
 	ctx.Equal(ctx.Redis.Exists("lease:"+t), int64(0), "lease:%s after its holder released it; exists", t)
-	_, queued = ctx.Redis.ZScore(stateQueue, t)
+	score, queued := ctx.Redis.ZScore(stateQueue, t)
 	ctx.Assert(queued, "%s is not on %s after its release: a ticket nobody holds must be back in the queue", t, stateQueue)
+	now := float64(ctx.Clock.Now()) / 1000
+	ctx.Assert(score >= now-2 && score <= now+2, "%s went back on %s with score %v, the release ran at %d: the score is the time of the release", t, stateQueue, score, int64(now))
 	ctx.Equal(stateAssign(ctx, t, "A-2"), "A-2", "a released ticket must go to the next agent who asks; assign answered")
+	// A-3 takes the ticket the instant A-2's release has touched the lease.
+	lease := "lease:" + t
+	rival := ctx.Redis.After(lease, func() any {
+		won := ctx.Redis.Set(lease, "A-3", "NX", "EX", 120)
+		if won {
+			ctx.Redis.Do("ZREM", stateQueue, t)
+		}
+		return won
+	})
+	stateRelease(ctx, t, "A-2")
+	ctx.Assert(rival.Fired, "A-2's release never touched %s", lease)
+	_, queued = ctx.Redis.ZScore(stateQueue, t)
+	if rival.Result == true {
+		ctx.Assert(!queued, "A-3 took %s right after A-2's release deleted the lease, and %s is back on %s anyway: delete the lease and ZADD in the same script", t, t, stateQueue)
+	} else {
+		ctx.Assert(queued && ctx.Redis.Exists(lease) == 0, "after A-2's release %s must be off its lease and back on %s", t, stateQueue)
+	}
 }
 
 func CheckUnreadAtomic(ctx *harness.Ctx) {
@@ -851,11 +929,12 @@ func CheckUnreadAtomic(ctx *harness.Ctx) {
 	key := "unread:R-1"
 	// Another replica posts a reply on the same ticket the instant this post first touches the badge.
 	rival := ctx.Redis.After(key, func() any { return ctx.Redis.Do("HINCRBY", key, t, 1) })
-	_, err := postMessage(stateBg, t, "A-1", "We refunded the second charge.")
+	got, err := postMessage(stateBg, t, "A-1", "We refunded the second charge.")
 	ctx.NoError(err, "postMessage failed")
 	ctx.Assert(rival.Fired, "postMessage never touched %s", key)
 	count, _ := ctx.Redis.HGet(key, t)
 	ctx.Equal(count, "2", "two replies were posted on %s: one increment was lost between a read and a write (increment with HINCRBY); the badge", t)
+	ctx.Equal(got, int64(1), "postMessage returns the count its own HINCRBY produced, not a later read that includes another reply; it answered")
 	notes := store.Page(stateBg, t, 0, 10)
 	ctx.Assert(len(notes) == 1 && notes[0].Body == "We refunded the second charge.", "postMessage must append the reply as a note, the ticket has %+v", notes)
 }
@@ -871,16 +950,16 @@ func CheckUnreadAtomic(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQueue = "assign:queue";
+const std::string kHQueue = "assign:queue";
 
-std::string newTicket(const std::string& subject) { return store::createTicket("R-1", subject).id; }
+std::string hNewTicket(const std::string& subject) { return store::createTicket("R-1", subject).id; }
 
-std::string leaseOf(harness::Ctx& ctx, const std::string& ticket_id) {
+std::string hLeaseOf(harness::Ctx& ctx, const std::string& ticket_id) {
   return ctx.Redis.Get("lease:" + ticket_id).value_or("");
 }
 
 // What a parallel call did: whether it ran and what it answered.
-struct Rival {
+struct HRival {
   bool fired = false;
   bool won = false;
 };
@@ -888,13 +967,13 @@ struct Rival {
 }  // namespace
 
 void CheckLeaseExclusive(harness::Ctx& ctx) {
-  const std::string t = newTicket("Printer on fire");
+  const std::string t = hNewTicket("Printer on fire");
   ctx.Equal(assign(t, "A-1"), "A-1", "a free ticket must go to the first agent who asks; assign answered");
   ctx.Equal(assign(t, "A-2"), "A-1", "the ticket is A-1's, so a second agent's assign must answer its holder; it answered");
-  ctx.Equal(leaseOf(ctx, t), "A-1", "lease:%s after a second agent's assign (taking it from A-1 means both agents answer the customer)", t);
+  ctx.Equal(hLeaseOf(ctx, t), "A-1", "lease:%s after a second agent's assign (taking it from A-1 means both agents answer the customer)", t);
   // Two agents click Assign on another ticket at the same instant.
-  const std::string t2 = newTicket("Second printer on fire");
-  auto rival = std::make_shared<Rival>();
+  const std::string t2 = hNewTicket("Second printer on fire");
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After("lease:" + t2, [&ctx, rival, t2] {
     rival->fired = true;
     rival->won = ctx.Redis.Set("lease:" + t2, "A-2", "NX", "EX", 120);
@@ -905,26 +984,37 @@ void CheckLeaseExclusive(harness::Ctx& ctx) {
   if (mine == "A-1") owners.push_back("A-1");
   if (rival->won) owners.push_back("A-2");
   ctx.Assert(owners.size() == 1, "two agents assigning %s at once: A-1's assign answered %q and A-2's SET NX won=%t, so %d agents own it. Take the lease in one SET NX", t2, mine, rival->won, owners.size());
-  ctx.Equal(leaseOf(ctx, t2), owners[0], "lease:%s must name the one owner", t2);
+  ctx.Equal(hLeaseOf(ctx, t2), owners[0], "lease:%s must name the one owner", t2);
 }
 
 void CheckLeaseExpiry(harness::Ctx& ctx) {
-  const std::string t = newTicket("Printer on fire");
+  const std::string t = hNewTicket("Printer on fire");
+  // Read the TTL the instant the lease is written, before any follow-up command can set one.
+  auto early = std::make_shared<long long>(0);
+  auto fired = std::make_shared<bool>(false);
+  ctx.Redis.After("lease:" + t, [&ctx, early, fired, t] {
+    *fired = true;
+    *early = ctx.Redis.TTL("lease:" + t);
+  });
   assign(t, "A-1");
+  ctx.Assert(*fired, "assign never touched lease:%s", t);
+  ctx.Assert(*early == -2 || (*early > 0 && *early <= 120), "lease:%s had TTL %d right after the command that wrote it: the lease must carry EX kLeaseTTL = 120 s in the same SET NX, or the ticket of an agent who went home stays theirs", t, *early);
   const long long ttl = ctx.Redis.TTL("lease:" + t);
   ctx.Assert(ttl > 0 && ttl <= 120, "lease:%s has TTL %d: a lease must expire after kLeaseTTL = 120 s, or the ticket of an agent who went home stays theirs", t, ttl);
-  ctx.Clock.Advance(121);
+  ctx.Clock.Advance(119);
+  ctx.Equal(assign(t, "A-2"), "A-1", "119 s after A-1 took the lease it is still A-1's (the lease lasts 120 s); A-2's assign answered");
+  ctx.Clock.Advance(2);
   ctx.Equal(assign(t, "A-2"), "A-2", "121 s after A-1 took the lease and went silent, the lease must have expired; A-2's assign answered");
 }
 
 void CheckReleaseHolder(harness::Ctx& ctx) {
-  const std::string t = newTicket("Printer on fire");
+  const std::string t = hNewTicket("Printer on fire");
   const std::string lease = "lease:" + t;
   assign(t, "A-1");
   ctx.Equal(release(t, "A-2"), false, "A-2 released A-1's ticket: only the lease's holder may release it; release answered");
-  ctx.Equal(leaseOf(ctx, t), "A-1", "%s after A-2's release (A-1 must keep it)", lease);
+  ctx.Equal(hLeaseOf(ctx, t), "A-1", "%s after A-2's release (A-1 must keep it)", lease);
   // A-1's lease runs out while its release is in flight, and A-2 takes the ticket.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After(lease, [&ctx, rival, lease] {
     rival->fired = true;
     ctx.Redis.Del(lease);
@@ -932,32 +1022,52 @@ void CheckReleaseHolder(harness::Ctx& ctx) {
   });
   release(t, "A-1");
   ctx.Assert(rival->fired, "nothing touched %s", lease);
-  ctx.Equal(leaseOf(ctx, t), "A-2", "after A-1's late release, %s (A-1 deleted the lease A-2 had just taken: compare the holder and delete in one script)", lease);
+  ctx.Equal(hLeaseOf(ctx, t), "A-2", "after A-1's late release, %s (A-1 deleted the lease A-2 had just taken: compare the holder and delete in one script)", lease);
 }
 
 void CheckQueueReturn(harness::Ctx& ctx) {
-  const std::string t = newTicket("Printer on fire");
-  ctx.Redis.Do("ZADD", kQueue, 1, t);
+  const std::string t = hNewTicket("Printer on fire");
+  ctx.Redis.Do("ZADD", kHQueue, 1, t);
   assign(t, "A-1");
-  ctx.Assert(!ctx.Redis.ZScore(kQueue, t).has_value(), "%s is still on %s after A-1 took it: the next agent would pick it up too", t, kQueue);
+  ctx.Assert(!ctx.Redis.ZScore(kHQueue, t).has_value(), "%s is still on %s after A-1 took it: the next agent would pick it up too", t, kHQueue);
+  ctx.Clock.Advance(30);
   ctx.Equal(release(t, "A-1"), true, "the holder's release; it answered");
   ctx.Equal(ctx.Redis.Exists("lease:" + t), 0, "lease:%s after its holder released it; exists", t);
-  ctx.Assert(ctx.Redis.ZScore(kQueue, t).has_value(), "%s is not on %s after its release: a ticket nobody holds must be back in the queue", t, kQueue);
+  const auto score = ctx.Redis.ZScore(kHQueue, t);
+  ctx.Assert(score.has_value(), "%s is not on %s after its release: a ticket nobody holds must be back in the queue", t, kHQueue);
+  const double now = ctx.Clock.Now() / 1000.0;
+  ctx.Assert(*score >= now - 2 && *score <= now + 2, "%s went back on %s with score %v, the release ran at %d: the score is the time of the release", t, kHQueue, *score, static_cast<long long>(now));
   ctx.Equal(assign(t, "A-2"), "A-2", "a released ticket must go to the next agent who asks; assign answered");
+  // A-3 takes the ticket the instant A-2's release has touched the lease.
+  const std::string lease = "lease:" + t;
+  auto rival = std::make_shared<HRival>();
+  ctx.Redis.After(lease, [&ctx, rival, lease, t] {
+    rival->fired = true;
+    rival->won = ctx.Redis.Set(lease, "A-3", "NX", "EX", 120);
+    if (rival->won) ctx.Redis.Do("ZREM", kHQueue, t);
+  });
+  release(t, "A-2");
+  ctx.Assert(rival->fired, "A-2's release never touched %s", lease);
+  if (rival->won) {
+    ctx.Assert(!ctx.Redis.ZScore(kHQueue, t).has_value(), "A-3 took %s right after A-2's release deleted the lease, and %s is back on %s anyway: delete the lease and ZADD in the same script", t, t, kHQueue);
+  } else {
+    ctx.Assert(ctx.Redis.ZScore(kHQueue, t).has_value() && ctx.Redis.Exists(lease) == 0, "after A-2's release %s must be off its lease and back on %s", t, kHQueue);
+  }
 }
 
 void CheckUnreadAtomic(harness::Ctx& ctx) {
-  const std::string t = newTicket("Printer on fire");
+  const std::string t = hNewTicket("Printer on fire");
   const std::string key = "unread:R-1";
   // Another replica posts a reply on the same ticket the instant this post first touches the badge.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<HRival>();
   ctx.Redis.After(key, [&ctx, rival, key, t] {
     rival->fired = true;
     ctx.Redis.Do("HINCRBY", key, t, 1);
   });
-  postMessage(t, "A-1", "We refunded the second charge.");
+  const long long got = postMessage(t, "A-1", "We refunded the second charge.");
   ctx.Assert(rival->fired, "postMessage never touched %s", key);
   ctx.Equal(ctx.Redis.HGet(key, t).value_or(""), "2", "two replies were posted on %s: one increment was lost between a read and a write (increment with HINCRBY); the badge", t);
+  ctx.Equal(got, 1LL, "postMessage returns the count its own HINCRBY produced, not a later read that includes another reply; it answered");
   const auto notes = store::page(t, 0, 10);
   ctx.Assert(notes.size() == 1 && notes[0].body == "We refunded the second charge.", "postMessage must append the reply as a note, the ticket has %d notes", notes.size());
 }

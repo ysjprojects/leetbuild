@@ -103,7 +103,7 @@ an invoice the processor charged twice looks like one it charged once.
       id: 'reconciled',
       title: 'Ties each invoice out against the processor',
       detail:
-        "Each invoice carries the processor's own total (`processor_total_cents`, from `lookup_invoice`/`lookupInvoice`) and `reconciled`, true only when it equals the stored amount; nothing is charged. The starter never asks the processor.",
+        "Each invoice, whatever its stored state, carries the processor's own total (`processor_total_cents`, from `lookup_invoice`/`lookupInvoice`) and `reconciled`, true only when it equals the stored amount, credits aside; nothing is charged. The starter never asks the processor.",
       match: {
         python: {all: [/processor\.lookup_invoice\(/, /processor_total_cents/, /reconciled/]},
         typescript: {all: [/lookupInvoice\(/, /processor_total_cents/, /reconciled/]},
@@ -581,6 +581,7 @@ async def check_tenant(ctx):
         assert "in_" not in foreign.text, f"the foreign read leaked invoices: {foreign.text}"
         missing = await c.get("/v1/subscriptions/sub_9/invoices", headers=OWNER)
     assert missing.status_code == 404, f"a missing subscription answered {missing.status_code}, expected 404"
+    assert foreign.text.replace("sub_2", "sub_9") == missing.text, f"t-other's sub_2 answered {foreign.text!r} and a missing sub_9 {missing.text!r}: a foreign subscription must read exactly like a missing one"
 
 
 async def check_stored_invoices(ctx):
@@ -605,13 +606,18 @@ async def check_credits(ctx):
 async def check_reconciled(ctx):
     c, processor = _world(ctx)
     once = _charged(processor, "2026-01-01", "2026-02-01", 9900)
+    store.grant_credit(once, 500, "service outage")
     twice = _charged(processor, "2026-02-01", "2026-03-01", 9900, total=19800)
     unknown = store.open_invoice("sub_1", "2026-03-01", "2026-04-01", 9900)["invoice_id"]
+    # The store still reads open (the run crashed before recording), yet the processor charged it.
+    stale = store.open_invoice("sub_1", "2026-04-01", "2026-05-01", 9900)["invoice_id"]
+    processor.charged[stale] = (f"ch_{stale}", 9900)
     async with c:
         invoices = {i.get("invoice_id"): i for i in await _ledger(c)}
-    assert invoices[once].get("processor_total_cents") == 9900 and invoices[once].get("reconciled") is True, f"an invoice the processor charged once reads {invoices[once]}, expected processor_total_cents 9900 and reconciled true"
+    assert invoices[once].get("processor_total_cents") == 9900 and invoices[once].get("reconciled") is True, f"an invoice billed 9900 with a 500 credit, which the processor charged once for 9900, reads {invoices[once]}, expected processor_total_cents 9900 and reconciled true: the processor charged the stored amount"
     assert invoices[twice].get("processor_total_cents") == 19800 and invoices[twice].get("reconciled") is False, f"an invoice the processor charged twice reads {invoices[twice]}, expected processor_total_cents 19800 and reconciled false"
     assert invoices[unknown].get("processor_total_cents") == 0 and invoices[unknown].get("reconciled") is False, f"an invoice the processor never charged reads {invoices[unknown]}, expected processor_total_cents 0 and reconciled false"
+    assert invoices[stale].get("processor_total_cents") == 9900 and invoices[stale].get("reconciled") is True, f"an invoice the store still holds as open but the processor charged reads {invoices[stale]}, expected processor_total_cents 9900 and reconciled true: ask the processor about every invoice, whatever its stored state"
     assert not ctx.grpc.calls_to("Charge"), "a ledger read must not charge"
 `,
     typescript: `const OWNER = {'X-Tenant-Id': 't-acme'};
@@ -646,7 +652,7 @@ async function world(ctx) {
     assert(Array.isArray(invoices), \`the answer must carry an invoices list, got \${r.text}\`);
     return invoices;
   };
-  return {c, store, charge, ledger};
+  return {c, store, charged, charge, ledger};
 }
 
 export async function check_route(ctx) {
@@ -669,6 +675,7 @@ export async function check_tenant(ctx) {
   assert(!foreign.text.includes('in_'), \`the foreign read leaked invoices: \${foreign.text}\`);
   const missing = await c.get('/v1/subscriptions/sub_9/invoices', {headers: OWNER});
   assert.equal(missing.status, 404, \`a missing subscription answered \${missing.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll('sub_2', 'sub_9'), missing.text, \`t-other's sub_2 answered \${foreign.text} and a missing sub_9 \${missing.text}: a foreign subscription must read exactly like a missing one\`);
 }
 
 export async function check_stored_invoices(ctx) {
@@ -688,14 +695,19 @@ export async function check_credits(ctx) {
 }
 
 export async function check_reconciled(ctx) {
-  const {store, charge, ledger} = await world(ctx);
+  const {store, charged, charge, ledger} = await world(ctx);
   const once = await charge('2026-01-01', '2026-02-01', 9900);
+  await store.grantCredit(once, 500, 'service outage');
   const twice = await charge('2026-02-01', '2026-03-01', 9900, 19800);
   const unknown = (await store.openInvoice('sub_1', '2026-03-01', '2026-04-01', 9900)).invoice_id;
+  // The store still reads open (the run crashed before recording), yet the processor charged it.
+  const stale = (await store.openInvoice('sub_1', '2026-04-01', '2026-05-01', 9900)).invoice_id;
+  charged.set(stale, {reference: \`ch_\${stale}\`, total: 9900});
   const invoices = Object.fromEntries((await ledger()).map(i => [i.invoice_id, i]));
-  assert(invoices[once].processor_total_cents === 9900 && invoices[once].reconciled === true, \`an invoice the processor charged once reads \${JSON.stringify(invoices[once])}, expected processor_total_cents 9900 and reconciled true\`);
+  assert(invoices[once].processor_total_cents === 9900 && invoices[once].reconciled === true, \`an invoice billed 9900 with a 500 credit, which the processor charged once for 9900, reads \${JSON.stringify(invoices[once])}, expected processor_total_cents 9900 and reconciled true: the processor charged the stored amount\`);
   assert(invoices[twice].processor_total_cents === 19800 && invoices[twice].reconciled === false, \`an invoice the processor charged twice reads \${JSON.stringify(invoices[twice])}, expected processor_total_cents 19800 and reconciled false\`);
   assert(invoices[unknown].processor_total_cents === 0 && invoices[unknown].reconciled === false, \`an invoice the processor never charged reads \${JSON.stringify(invoices[unknown])}, expected processor_total_cents 0 and reconciled false\`);
+  assert(invoices[stale].processor_total_cents === 9900 && invoices[stale].reconciled === true, \`an invoice the store still holds as open but the processor charged reads \${JSON.stringify(invoices[stale])}, expected processor_total_cents 9900 and reconciled true: ask the processor about every invoice, whatever its stored state\`);
   assert.equal(ctx.grpc.callsTo('Charge').length, 0, 'a ledger read must not charge');
 }
 `,
@@ -703,6 +715,7 @@ export async function check_reconciled(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -798,6 +811,7 @@ func CheckTenant(ctx *harness.Ctx) {
 	ctx.Assert(!strings.Contains(foreign.Text(), "in_"), "the foreign read leaked invoices: %s", foreign.Text())
 	missing := c.Get("/v1/subscriptions/sub_9/invoices", "X-Tenant-Id", "t-acme")
 	ctx.Equal(missing.Status, 404, "a missing subscription")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), "sub_2", "sub_9"), missing.Text(), "a foreign subscription must read exactly like a missing one; t-other's sub_2 (with the id swapped for sub_9's)")
 }
 
 func CheckStoredInvoices(ctx *harness.Ctx) {
@@ -819,20 +833,29 @@ func CheckCredits(ctx *harness.Ctx) {
 func CheckReconciled(ctx *harness.Ctx) {
 	c, p := readWorld(ctx)
 	once := readCharged(p, "sub_1", "2026-01-01", "2026-02-01", 9900, 9900)
+	store.GrantCredit(readBg, once, 500, "service outage")
 	twice := readCharged(p, "sub_1", "2026-02-01", "2026-03-01", 9900, 19800)
 	unknown := store.OpenInvoice(readBg, "sub_1", "2026-03-01", "2026-04-01", 9900).InvoiceID
+	// The store still reads open (the run crashed before recording), yet the processor charged it.
+	stale := store.OpenInvoice(readBg, "sub_1", "2026-04-01", "2026-05-01", 9900).InvoiceID
+	p.charged[stale] = readCharge{"ch_" + stale, 9900}
 	invoices := map[string]readLine{}
 	for _, i := range readLedger(ctx, c) {
 		invoices[i.InvoiceID] = i
 	}
 	tiesOut := func(id string, total int64, reconciled bool, what string) {
 		line := invoices[id]
+		got := "no processor_total_cents or reconciled"
+		if line.ProcessorTotalCents != nil && line.Reconciled != nil {
+			got = fmt.Sprintf("processor_total_cents %d and reconciled %t", *line.ProcessorTotalCents, *line.Reconciled)
+		}
 		ctx.Assert(line.ProcessorTotalCents != nil && *line.ProcessorTotalCents == total && line.Reconciled != nil && *line.Reconciled == reconciled,
-			"an invoice the processor %s must read processor_total_cents %d and reconciled %t, got %+v", what, total, reconciled, line)
+			"an invoice the processor %s must read processor_total_cents %d and reconciled %t, got %s", what, total, reconciled, got)
 	}
-	tiesOut(once, 9900, true, "charged once")
+	tiesOut(once, 9900, true, "charged once for the stored 9900 (a 500 credit aside)")
 	tiesOut(twice, 19800, false, "charged twice")
 	tiesOut(unknown, 0, false, "never charged")
+	tiesOut(stale, 9900, true, "charged while the store still holds it as open (ask about every invoice, whatever its stored state)")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Charge", "")), 0, "a ledger read must not charge; Charge calls")
 }
 `,
@@ -880,7 +903,7 @@ ReadPeer& readWorld(harness::Ctx& ctx) {
   return *peer;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -910,7 +933,7 @@ nlohmann::json readLedger(harness::Ctx& ctx, harness::HTTP& c) {
 
 void CheckRoute(harness::Ctx& ctx) {
   ReadPeer& peer = readWorld(ctx);
-  auto c = api(ctx);
+  auto c = hReadAPI(ctx);
   const std::string first = readCharged(peer, "sub_1", "2026-02-01", "2026-03-01", 9900, 9900);
   const std::string second = readCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900);
   const auto invoices = readLedger(ctx, c);
@@ -922,7 +945,7 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTenant(harness::Ctx& ctx) {
   ReadPeer& peer = readWorld(ctx);
-  auto c = api(ctx);
+  auto c = hReadAPI(ctx);
   readCharged(peer, "sub_2", "2026-03-01", "2026-04-01", 9900, 9900);
   const auto anonymous = c.Get("/v1/subscriptions/sub_1/invoices");
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
@@ -931,11 +954,14 @@ void CheckTenant(harness::Ctx& ctx) {
   ctx.Assert(foreign.Text().find("in_") == std::string::npos, "the foreign read leaked invoices: %s", foreign.Text());
   const auto missing = c.Get("/v1/subscriptions/sub_9/invoices", "X-Tenant-Id", "t-acme");
   ctx.Equal(missing.Status, 404, "a missing subscription");
+  std::string swapped = foreign.Text();
+  for (size_t at = swapped.find("sub_2"); at != std::string::npos; at = swapped.find("sub_2", at + 5)) swapped.replace(at, 5, "sub_9");
+  ctx.Equal(swapped, missing.Text(), "a foreign subscription must read exactly like a missing one; t-other's sub_2 (with the id swapped for sub_9's)");
 }
 
 void CheckStoredInvoices(harness::Ctx& ctx) {
   ReadPeer& peer = readWorld(ctx);
-  auto c = api(ctx);
+  auto c = hReadAPI(ctx);
   const std::string prorated = readCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 4790, 4790);
   const auto invoices = readLedger(ctx, c);
   ctx.Assert(invoices.size() == 1 && invoices[0].value("amount_cents", 0LL) == 4790,
@@ -944,7 +970,7 @@ void CheckStoredInvoices(harness::Ctx& ctx) {
 
 void CheckCredits(harness::Ctx& ctx) {
   ReadPeer& peer = readWorld(ctx);
-  auto c = api(ctx);
+  auto c = hReadAPI(ctx);
   const std::string invoice_id = readCharged(peer, "sub_1", "2026-03-01", "2026-04-01", 9900, 9900);
   const store::Credit credit = store::grantCredit(invoice_id, 500, "service outage");
   const auto line = readLedger(ctx, c)[0];
@@ -957,10 +983,14 @@ void CheckCredits(harness::Ctx& ctx) {
 
 void CheckReconciled(harness::Ctx& ctx) {
   ReadPeer& peer = readWorld(ctx);
-  auto c = api(ctx);
+  auto c = hReadAPI(ctx);
   const std::string once = readCharged(peer, "sub_1", "2026-01-01", "2026-02-01", 9900, 9900);
+  store::grantCredit(once, 500, "service outage");
   const std::string twice = readCharged(peer, "sub_1", "2026-02-01", "2026-03-01", 9900, 19800);
   const std::string unknown = store::openInvoice("sub_1", "2026-03-01", "2026-04-01", 9900).invoice_id;
+  // The store still reads open (the run crashed before recording), yet the processor charged it.
+  const std::string stale = store::openInvoice("sub_1", "2026-04-01", "2026-05-01", 9900).invoice_id;
+  peer.charged[stale] = {"ch_" + stale, 9900};
   std::map<std::string, nlohmann::json> invoices;
   for (const auto& i : readLedger(ctx, c)) invoices[i.value("invoice_id", "")] = i;
   const auto tiesOut = [&](const std::string& id, long long total, bool reconciled, const std::string& what) {
@@ -969,9 +999,10 @@ void CheckReconciled(harness::Ctx& ctx) {
                     line.contains("reconciled") && line["reconciled"] == reconciled;
     ctx.Assert(ok, "an invoice the processor %s must read processor_total_cents %d and reconciled %t, got %s", what, total, reconciled, line.dump());
   };
-  tiesOut(once, 9900, true, "charged once");
+  tiesOut(once, 9900, true, "charged once for the stored 9900 (a 500 credit aside)");
   tiesOut(twice, 19800, false, "charged twice");
   tiesOut(unknown, 0, false, "never charged");
+  tiesOut(stale, 9900, true, "charged while the store still holds it as open (ask about every invoice, whatever its stored state)");
   ctx.Equal(ctx.GRPC.CallsTo("Charge").size(), 0, "a ledger read must not charge; Charge calls");
 }
 `,

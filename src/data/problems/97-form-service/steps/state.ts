@@ -21,7 +21,8 @@ requests at the limit both get through; and a refused client is told to wait lon
 - A token is consumed by **one command**: \`GETDEL captcha:{token}\`; it passes only if it was there.
 - A submission is limited per window of \`WINDOW_S\` = 60 s on **two dimensions**, \`FORM_LIMIT\` = 20
   per form and \`IP_LIMIT\` = 5 per address, under \`limit:form:{form_id}:{window}\` and
-  \`limit:ip:{ip}:{window}\` with \`window = floor(now / WINDOW_S)\`; both keys expire with it.
+  \`limit:ip:{ip}:{window}\` with \`window = floor(now / WINDOW_S)\`; both keys expire with it, from the
+  command that creates them.
 - One **Lua script** checks both counters and increments both only when both have room, so a refused
   request spends nothing.
 - \`remaining\` is the smaller room left; a refusal's \`retry_after\` is the seconds until the window
@@ -72,7 +73,7 @@ requests at the limit both get through; and a refused client is told to wait lon
       id: 'window-bucket',
       title: 'Keys carry the window and expire with it',
       detail:
-        'The counters are `limit:…:{window}` with `window = floor(now / WINDOW_S)`, and the script sets an `EXPIRE`, so the next minute starts from zero and old keys go away. The starter’s counter has no window and no TTL.',
+        'The counters are `limit:…:{window}` with `window = floor(now / WINDOW_S)`, and the script that creates them sets their `EXPIRE` (a TTL is read right after that command), so the next minute starts from zero and old keys go away. The starter’s counter has no window and no TTL.',
       match: {
         python: {all: [/\/\/\s*WINDOW_S/, /EXPIRE/]},
         typescript: {all: [/\/\s*WINDOW_S/, /EXPIRE/]},
@@ -98,7 +99,7 @@ requests at the limit both get through; and a refused client is told to wait lon
       id: 'retry-after',
       title: 'Retry-after counts down to the window’s end',
       detail:
-        'A refusal reports `retry_after = WINDOW_S - now % WINDOW_S`, the seconds until the counters reset. The starter always answers 60.',
+        'A refusal reports `retry_after = WINDOW_S - now % WINDOW_S`, the seconds until the counters reset, and `remaining` is the smaller room left of the two (on a nearly full form, a fresh address has the form’s room left, not its own). The starter always answers 60.',
       match: {
         python: {all: [/%\s*WINDOW_S/]},
         typescript: {all: [/%\s*WINDOW_S/]},
@@ -595,8 +596,15 @@ def check_both_dimensions(ctx):
 
 def check_window_bucket(ctx):
     m = ctx.load("state")
+    window = int(ctx.clock.time()) // WINDOW_S
+    # Another replica reads the TTL the moment the counters are created.
+    created = [ctx.redis_after(key, lambda key=key: ctx.redis.ttl(key)) for key in (f"limit:form:f-1:{window}", f"limit:ip:10.0.0.1:{window}")]
     for _ in range(5):
         m.reserve("f-1", "10.0.0.1")
+    for key, probe in zip((f"limit:form:f-1:{window}", f"limit:ip:10.0.0.1:{window}"), created):
+        if probe.fired:
+            ttl = _settled(probe, key)
+            assert ttl > 0, f"{key} had TTL {ttl} right after the command that created it: a crash before the separate EXPIRE leaves a counter that never resets. Set the TTL in the same script"
     assert m.reserve("f-1", "10.0.0.1")["allowed"] is False, "the sixth submission from one address in a window must be refused (IP_LIMIT = 5)"
     keys = sorted(ctx.redis.keys("limit:*"))
     assert keys, "reserve wrote no limit:* key"
@@ -635,6 +643,10 @@ def check_retry_after(ctx):
     refused = m.reserve("f-1", "10.0.0.1")
     assert refused["allowed"] is False, f"the sixth submission in a window answered {refused}, expected a refusal"
     assert refused["retry_after"] == left, f"the refusal says retry_after {refused['retry_after']} s, but this window ends in {left} s: the client waits longer than it must"
+    for i in range(18):
+        m.reserve("f-3", f"10.3.0.{i}")
+    got = m.reserve("f-3", "10.3.9.9")
+    assert got["allowed"] is True and got["remaining"] == 1, f"form f-3 with 18 of 20 slots used answered {got} to a fresh address, expected remaining 1: remaining is the smaller room left, here the form's"
 `,
     typescript: `const WINDOW_S = 60;
 
@@ -674,7 +686,17 @@ export async function check_both_dimensions(ctx) {
 
 export async function check_window_bucket(ctx) {
   const m = ctx.load('state');
+  const created = ['limit:form:f-1', 'limit:ip:10.0.0.1'].map(name => {
+    const key = \`\${name}:\${Math.floor(nowS(ctx) / WINDOW_S)}\`;
+    // Another replica reads the TTL the moment the counter is created.
+    return {key, probe: ctx.redisAfter(key, () => ctx.redis.ttl(key))};
+  });
   for (let i = 0; i < 5; i++) await m.reserve('f-1', '10.0.0.1');
+  for (const {key, probe} of created) {
+    if (!probe.fired) continue;
+    const ttl = await settled(probe, key);
+    assert(ttl > 0, \`\${key} had TTL \${ttl} right after the command that created it: a crash before the separate EXPIRE leaves a counter that never resets. Set the TTL in the same script\`);
+  }
   assert.equal((await m.reserve('f-1', '10.0.0.1')).allowed, false, 'the sixth submission from one address in a window must be refused (IP_LIMIT = 5)');
   const keys = (ctx.redis.keys('limit:*') as string[]).sort();
   assert(keys.length > 0, 'reserve wrote no limit:* key');
@@ -714,6 +736,9 @@ export async function check_retry_after(ctx) {
   const refused = await m.reserve('f-1', '10.0.0.1');
   assert.equal(refused.allowed, false, \`the sixth submission in a window answered \${JSON.stringify(refused)}, expected a refusal\`);
   assert.equal(refused.retryAfter, left, \`the refusal says retryAfter \${refused.retryAfter} s, but this window ends in \${left} s: the client waits longer than it must\`);
+  for (let i = 0; i < 18; i++) await m.reserve('f-3', \`10.3.0.\${i}\`);
+  const got = await m.reserve('f-3', '10.3.9.9');
+  assert(got.allowed === true && got.remaining === 1, \`form f-3 with 18 of 20 slots used answered \${JSON.stringify(got)} to a fresh address, expected remaining 1: remaining is the smaller room left, here the form's\`);
 }
 `,
     go: `package main
@@ -789,8 +814,27 @@ func CheckBothDimensions(ctx *harness.Ctx) {
 }
 
 func CheckWindowBucket(ctx *harness.Ctx) {
+	createdWindow := stateNow(ctx) / stateWindow
+	formKey := fmt.Sprintf("limit:form:f-1:%d", createdWindow)
+	ipKey := fmt.Sprintf("limit:ip:10.0.0.1:%d", createdWindow)
+	// Another replica reads the TTL the moment the counter is created.
+	formTTL := ctx.Redis.After(formKey, func() any { return ctx.Redis.TTL(formKey) })
+	ipTTL := ctx.Redis.After(ipKey, func() any { return ctx.Redis.TTL(ipKey) })
 	for i := 0; i < 5; i++ {
 		stateReserve(ctx, "f-1", "10.0.0.1")
+	}
+	for _, created := range []struct {
+		key    string
+		fired  bool
+		err    error
+		result any
+	}{{formKey, formTTL.Fired, formTTL.Err, formTTL.Result}, {ipKey, ipTTL.Fired, ipTTL.Err, ipTTL.Result}} {
+		if !created.fired {
+			continue
+		}
+		ctx.NoError(created.err, "reading the TTL of %s", created.key)
+		ttl, _ := created.result.(int64)
+		ctx.Assert(ttl > 0, "%s had TTL %d right after the command that created it: a crash before the separate EXPIRE leaves a counter that never resets. Set the TTL in the same script", created.key, ttl)
 	}
 	ctx.Equal(stateReserve(ctx, "f-1", "10.0.0.1").Allowed, false, "the sixth submission from one address in a window must be refused (IP_LIMIT = 5)")
 	keys := ctx.Redis.Keys("limit:*")
@@ -838,6 +882,11 @@ func CheckRetryAfter(ctx *harness.Ctx) {
 	refused := stateReserve(ctx, "f-1", "10.0.0.1")
 	ctx.Equal(refused.Allowed, false, "the sixth submission in a window must be refused")
 	ctx.Equal(refused.RetryAfter, left, "the refusal's RetryAfter must be the seconds until this window ends")
+	for i := 0; i < 18; i++ {
+		stateReserve(ctx, "f-3", fmt.Sprintf("10.3.0.%d", i))
+	}
+	got := stateReserve(ctx, "f-3", "10.3.9.9")
+	ctx.Assert(got.Allowed && got.Remaining == 1, "form f-3 with 18 of 20 slots used answered %+v to a fresh address, expected remaining 1: remaining is the smaller room left, here the form's", got)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -849,9 +898,9 @@ func CheckRetryAfter(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kWindow = 60;
+constexpr long long hWindow = 60;
 
-long long nowS(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
+long long hNowS(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
 
 }  // namespace
 
@@ -882,24 +931,33 @@ void CheckBothDimensions(harness::Ctx& ctx) {
 }
 
 void CheckWindowBucket(harness::Ctx& ctx) {
+  const long long created_window = hNowS(ctx) / hWindow;
+  auto created = std::make_shared<std::vector<std::pair<std::string, long long>>>();
+  for (const std::string key : {"limit:form:f-1:" + std::to_string(created_window), "limit:ip:10.0.0.1:" + std::to_string(created_window)}) {
+    // Another replica reads the TTL the moment the counter is created.
+    ctx.Redis.After(key, [&ctx, created, key] { created->emplace_back(key, ctx.Redis.TTL(key)); });
+  }
   for (int i = 0; i < 5; i++) reserve("f-1", "10.0.0.1");
+  for (const auto& [key, ttl] : *created) {
+    ctx.Assert(ttl > 0, "%s had TTL %d right after the command that created it: a crash before the separate EXPIRE leaves a counter that never resets. Set the TTL in the same script", key, ttl);
+  }
   ctx.Equal(reserve("f-1", "10.0.0.1").allowed, false, "the sixth submission from one address in a window must be refused (IP_LIMIT = 5)");
   auto keys = ctx.Redis.Keys("limit:*");
   ctx.Assert(!keys.empty(), "reserve wrote no limit:* key");
   for (const auto& key : keys) {
     const long long ttl = ctx.Redis.TTL(key);
-    ctx.Assert(ttl > 0 && ttl <= 2 * kWindow, "%s has TTL %d: a limit key must expire with its window, or one busy minute blocks the address forever", key, ttl);
+    ctx.Assert(ttl > 0 && ttl <= 2 * hWindow, "%s has TTL %d: a limit key must expire with its window, or one busy minute blocks the address forever", key, ttl);
   }
-  const long long window = nowS(ctx) / kWindow;
+  const long long window = hNowS(ctx) / hWindow;
   std::sort(keys.begin(), keys.end());
   ctx.Equal(keys, std::vector<std::string>{"limit:form:f-1:" + std::to_string(window), "limit:ip:10.0.0.1:" + std::to_string(window)}, "the limit keys must carry the window in their names");
-  ctx.Clock.Advance(kWindow);
+  ctx.Clock.Advance(hWindow);
   ctx.Equal(reserve("f-1", "10.0.0.1").allowed, true, "a minute later the address must be allowed again: the next window has keys of its own");
 }
 
 void CheckAtomicReserve(harness::Ctx& ctx) {
   for (int i = 0; i < 4; i++) ctx.Equal(reserve("f-1", "10.0.0.1").allowed, true, "the first four submissions from one address must be allowed");
-  const long long window = nowS(ctx) / kWindow;
+  const long long window = hNowS(ctx) / hWindow;
   // A second request from the same address lands while this one is reserving the fifth slot.
   auto rivals = std::make_shared<std::vector<bool>>();
   for (const std::string key : {std::string("limit:ip:10.0.0.1"), "limit:ip:10.0.0.1:" + std::to_string(window)}) {
@@ -912,8 +970,8 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {
-  ctx.Clock.Advance(static_cast<double>(((45 - nowS(ctx) % kWindow) % kWindow + kWindow) % kWindow));
-  const long long left = kWindow - nowS(ctx) % kWindow;
+  ctx.Clock.Advance(static_cast<double>(((45 - hNowS(ctx) % hWindow) % hWindow + hWindow) % hWindow));
+  const long long left = hWindow - hNowS(ctx) % hWindow;
   for (const long long expected : {4LL, 3LL, 2LL, 1LL, 0LL}) {
     const auto got = reserve("f-1", "10.0.0.1");
     ctx.Assert(got.allowed && got.remaining == expected, "a submission with %d slots left answered allowed=%t remaining=%d, expected allowed with remaining %d", expected + 1, got.allowed, got.remaining, expected);
@@ -921,6 +979,9 @@ void CheckRetryAfter(harness::Ctx& ctx) {
   const auto refused = reserve("f-1", "10.0.0.1");
   ctx.Equal(refused.allowed, false, "the sixth submission in a window must be refused");
   ctx.Equal(refused.retry_after, left, "the refusal's retry_after must be the seconds until this window ends");
+  for (int i = 0; i < 18; i++) reserve("f-3", "10.3.0." + std::to_string(i));
+  const auto got = reserve("f-3", "10.3.9.9");
+  ctx.Assert(got.allowed && got.remaining == 1, "form f-3 with 18 of 20 slots used answered allowed=%t remaining=%d to a fresh address, expected remaining 1: remaining is the smaller room left, here the form's", got.allowed, got.remaining);
 }
 `,
   },

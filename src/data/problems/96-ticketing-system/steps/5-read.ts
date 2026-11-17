@@ -75,7 +75,7 @@ next page repeats a note it already showed.
       id: 'requester-scope',
       title: 'A requester reads only their own ticket',
       detail:
-        'A requester whose id is not the ticket’s `requester_id` is answered **403**, and a caller without `X-Actor-Id` **401**; the starter answers any ticket to anyone who knows its id.',
+        'A requester whose id is not the ticket’s `requester_id` is answered **403**, as is a role other than `requester` or `agent` (or none), and a caller without `X-Actor-Id` **401**; the starter answers any ticket to anyone who knows its id.',
       match: {
         python: {all: [/\["requester_id"\]\s*!=|!=\s*\w+\["requester_id"\]/, /\b403\b/, /\b401\b/]},
         typescript: {all: [/\.requester_id\s*!==|!==\s*\w+\.requester_id/, /\b403\b/, /\b401\b/]},
@@ -88,7 +88,7 @@ next page repeats a note it already showed.
       id: 'keyset-cursor',
       title: 'Pages by keyset cursor, never by offset',
       detail:
-        'The page is `store.page(ticket_id, before_seq, limit)` below the `cursor`, and `next_cursor` is the `seq` of the last note fetched, so a note posted while someone scrolls neither repeats nor hides one; the starter counts rows with `offset`.',
+        'The page is `store.page(ticket_id, before_seq, limit)` below the `cursor`, and `next_cursor` is the `seq` of the last note fetched, so a note posted while someone scrolls neither repeats nor hides one. A `cursor` that is not a positive integer (`abc`, `0`, `-2`) is **400**. The starter counts rows with `offset`.',
       match: {
         python: {all: [/store\.page\(/, /next_cursor/], none: [/page_at\(|\boffset\b/]},
         typescript: {all: [/\bpage\(/, /next_cursor/], none: [/pageAt\(|\boffset\b/]},
@@ -641,6 +641,8 @@ async def check_requester_scope(ctx):
         assert anonymous.status_code == 401, f"a read without X-Actor-Id answered {anonymous.status_code}, expected 401"
         admin = await _read(c, t, {"X-Actor-Id": "R-1", "X-Actor-Role": "admin"})
         assert admin.status_code == 403, f"X-Actor-Role admin answered {admin.status_code}, expected 403"
+        roleless = await _read(c, t, {"X-Actor-Id": "R-1"})
+        assert roleless.status_code == 403, f"the owner reading without X-Actor-Role answered {roleless.status_code}: a missing role is not requester or agent, expected 403"
         own = await _read(c, t, R1)
         agent = await _read(c, t, AGENT)
     assert own.status_code == 200 and agent.status_code == 200, f"the owner and an agent must read the ticket, got {own.status_code} and {agent.status_code}"
@@ -660,6 +662,9 @@ async def check_keyset_cursor(ctx):
         assert _bodies(third) == ["note 1"] and third.json().get("next_cursor") is None, f"the last page must be note 1 with next_cursor null, got {third.text}"
         bad = await _read(c, t, AGENT, cursor="abc")
         assert bad.status_code == 400, f"cursor=abc answered {bad.status_code}, expected 400"
+        for value in ("0", "-2"):
+            bad = await _read(c, t, AGENT, cursor=value)
+            assert bad.status_code == 400, f"cursor={value} answered {bad.status_code}: a cursor that is not a positive integer is 400"
         # A requester walks a timeline whose newest notes are internal: every public note once, and the walk ends.
         t2 = _seed([("R-1", "public", "p1"), ("A-7", "internal", "i1"), ("A-7", "internal", "i2"), ("A-7", "public", "p2"), ("A-7", "internal", "i3")])
         seen, cursor = [], None
@@ -722,6 +727,8 @@ export async function check_requester_scope(ctx) {
   assert.equal(anonymous.status, 401, \`a read without X-Actor-Id answered \${anonymous.status}, expected 401\`);
   const admin = await read(c, t, {'X-Actor-Id': 'R-1', 'X-Actor-Role': 'admin'});
   assert.equal(admin.status, 403, \`X-Actor-Role admin answered \${admin.status}, expected 403\`);
+  const roleless = await read(c, t, {'X-Actor-Id': 'R-1'});
+  assert.equal(roleless.status, 403, \`the owner reading without X-Actor-Role answered \${roleless.status}: a missing role is not requester or agent, expected 403\`);
   const own = await read(c, t, R1);
   const agent = await read(c, t, AGENT);
   assert(own.status === 200 && agent.status === 200, \`the owner and an agent must read the ticket, got \${own.status} and \${agent.status}\`);
@@ -741,6 +748,10 @@ export async function check_keyset_cursor(ctx) {
   assert(JSON.stringify(bodies(third)) === '["note 1"]' && third.json().next_cursor === null, \`the last page must be note 1 with next_cursor null, got \${third.text}\`);
   const bad = await read(c, t, AGENT, {cursor: 'abc'});
   assert.equal(bad.status, 400, \`cursor=abc answered \${bad.status}, expected 400\`);
+  for (const value of ['0', '-2']) {
+    const r = await read(c, t, AGENT, {cursor: value});
+    assert.equal(r.status, 400, \`cursor=\${value} answered \${r.status}: a cursor that is not a positive integer is 400\`);
+  }
   // A requester walks a timeline whose newest notes are internal: every public note once, and the walk ends.
   const t2 = await seed(store, [['R-1', 'public', 'p1'], ['A-7', 'internal', 'i1'], ['A-7', 'internal', 'i2'], ['A-7', 'public', 'p2'], ['A-7', 'internal', 'i3']]);
   const seen: string[] = [];
@@ -847,6 +858,8 @@ func CheckRequesterScope(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 401, "a read without X-Actor-Id")
 	r, _ = readGet(c, t, []string{"X-Actor-Id", "R-1", "X-Actor-Role", "admin"}, nil)
 	ctx.Equal(r.Status, 403, "X-Actor-Role admin")
+	r, _ = readGet(c, t, []string{"X-Actor-Id", "R-1"}, nil)
+	ctx.Equal(r.Status, 403, "the owner reading without X-Actor-Role (a missing role is not requester or agent)")
 	own, _ := readGet(c, t, readR1, nil)
 	agent, _ := readGet(c, t, readAgent, nil)
 	ctx.Assert(own.Status == 200 && agent.Status == 200, "the owner and an agent must read the ticket, got %d and %d", own.Status, agent.Status)
@@ -870,6 +883,10 @@ func CheckKeysetCursor(ctx *harness.Ctx) {
 	ctx.Assert(len(thirdPage.Notes) == 1 && thirdPage.Notes[0].Body == "note 1" && thirdPage.NextCursor == nil, "the last page must be note 1 with next_cursor null, got %s", third.Text())
 	bad, _ := readGet(c, t, readAgent, url.Values{"cursor": {"abc"}})
 	ctx.Equal(bad.Status, 400, "cursor=abc")
+	for _, value := range []string{"0", "-2"} {
+		r, _ := readGet(c, t, readAgent, url.Values{"cursor": {value}})
+		ctx.Equal(r.Status, 400, "cursor=%s (a cursor that is not a positive integer is 400)", value)
+	}
 	// A requester walks a timeline whose newest notes are internal: every public note once, and the walk ends.
 	t2 := readSeed(ctx, [][3]string{{"R-1", "public", "p1"}, {"A-7", "internal", "i1"}, {"A-7", "internal", "i2"}, {"A-7", "public", "p2"}, {"A-7", "internal", "i3"}})
 	seen := []string{}
@@ -899,17 +916,17 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kInternal = "Customer is on the fraud watchlist, do not refund.";
+const std::string kHInternal = "Customer is on the fraud watchlist, do not refund.";
 
-struct Actor {
+struct HActor {
   std::string id;
   std::string role;
 };
-const Actor kR1{"R-1", "requester"};
-const Actor kR2{"R-2", "requester"};
-const Actor kAgent{"A-7", "agent"};
+const HActor kHR1{"R-1", "requester"};
+const HActor kHR2{"R-2", "requester"};
+const HActor kHAgent{"A-7", "agent"};
 
-harness::HTTP reader(harness::Ctx& ctx) {
+harness::HTTP hReader(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -917,94 +934,99 @@ harness::HTTP reader(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string seed(const std::vector<std::array<std::string, 3>>& notes) {
+std::string hSeed(const std::vector<std::array<std::string, 3>>& notes) {
   const std::string ticket_id = store::createTicket("R-1", "Invoice 4471 charged twice").id;
   for (const auto& n : notes) store::appendNote(ticket_id, n[0], n[1], n[2]);
   return ticket_id;
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& ticket_id, const Actor& who, const std::string& query = "") {
+harness::Response hReadAs(harness::HTTP& c, const std::string& ticket_id, const HActor& who, const std::string& query = "") {
   const std::string path = "/v1/tickets/" + ticket_id + (query.empty() ? "" : "?" + query);
   if (who.id.empty()) return c.Get(path, "X-Actor-Role", who.role);
+  if (who.role.empty()) return c.Get(path, "X-Actor-Id", who.id);
   return c.Get(path, "X-Actor-Id", who.id, "X-Actor-Role", who.role);
 }
 
-json pageOf(const harness::Response& r) {
+json hPageOf(const harness::Response& r) {
   const json page = json::parse(r.Text(), nullptr, false);
   return page.is_object() ? page : json::object();
 }
 
-std::vector<std::string> bodies(const harness::Response& r) {
+std::vector<std::string> hBodies(const harness::Response& r) {
   std::vector<std::string> out;
-  const json page = pageOf(r);
+  const json page = hPageOf(r);
   if (page.contains("notes") && page["notes"].is_array()) {
     for (const auto& n : page["notes"]) out.push_back(n.value("body", ""));
   }
   return out;
 }
 
-std::string cursorOf(const harness::Response& r) {
-  const json page = pageOf(r);
+std::string hCursorOf(const harness::Response& r) {
+  const json page = hPageOf(r);
   return page.contains("next_cursor") && page["next_cursor"].is_string() ? page["next_cursor"].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = reader(ctx);
-  const std::string t = seed({{"R-1", "public", "My card was charged twice."}, {"A-7", "public", "We refunded the second charge."}});
-  const auto r = readAs(c, t, kAgent);
+  auto c = hReader(ctx);
+  const std::string t = hSeed({{"R-1", "public", "My card was charged twice."}, {"A-7", "public", "We refunded the second charge."}});
+  const auto r = hReadAs(c, t, kHAgent);
   ctx.Equal(r.Status, 200, "GET /v1/tickets/%s (%s)", t, r.Text());
-  ctx.Assert(pageOf(r).value("ticket_id", "") == t && pageOf(r).value("state", "") == "open", "the page must name the ticket and its state, got %s", r.Text());
-  ctx.Equal(bodies(r), {"We refunded the second charge.", "My card was charged twice."}, "the page must list the notes newest first");
+  ctx.Assert(hPageOf(r).value("ticket_id", "") == t && hPageOf(r).value("state", "") == "open", "the page must name the ticket and its state, got %s", r.Text());
+  ctx.Equal(hBodies(r), {"We refunded the second charge.", "My card was charged twice."}, "the page must list the notes newest first");
 }
 
 void CheckInternalHidden(harness::Ctx& ctx) {
-  auto c = reader(ctx);
-  const std::string t = seed({{"R-1", "public", "My card was charged twice."}, {"A-7", "internal", kInternal}, {"A-7", "public", "We refunded the second charge."}});
-  const auto mine = readAs(c, t, kR1);
+  auto c = hReader(ctx);
+  const std::string t = hSeed({{"R-1", "public", "My card was charged twice."}, {"A-7", "internal", kHInternal}, {"A-7", "public", "We refunded the second charge."}});
+  const auto mine = hReadAs(c, t, kHR1);
   ctx.Equal(mine.Status, 200, "the requester reading their ticket (%s)", mine.Text());
-  ctx.Assert(mine.Text().find(kInternal) == std::string::npos, "the requester's page carries an internal note: %q. Leave out visibility internal for a requester", bodies(mine));
-  ctx.Equal(bodies(mine), {"We refunded the second charge.", "My card was charged twice."}, "the requester must see the public notes");
-  const auto agent = readAs(c, t, kAgent);
-  ctx.Assert(agent.Text().find(kInternal) != std::string::npos, "an agent's page must keep the internal note, got %q", bodies(agent));
+  ctx.Assert(mine.Text().find(kHInternal) == std::string::npos, "the requester's page carries an internal note: %q. Leave out visibility internal for a requester", hBodies(mine));
+  ctx.Equal(hBodies(mine), {"We refunded the second charge.", "My card was charged twice."}, "the requester must see the public notes");
+  const auto agent = hReadAs(c, t, kHAgent);
+  ctx.Assert(agent.Text().find(kHInternal) != std::string::npos, "an agent's page must keep the internal note, got %q", hBodies(agent));
 }
 
 void CheckRequesterScope(harness::Ctx& ctx) {
-  auto c = reader(ctx);
-  const std::string t = seed({{"R-1", "public", "My card was charged twice."}});
-  ctx.Equal(readAs(c, t, kR2).Status, 403, "requester R-2 reading R-1's ticket (a requester reads only their own tickets)");
-  ctx.Equal(readAs(c, t, Actor{"", "requester"}).Status, 401, "a read without X-Actor-Id");
-  ctx.Equal(readAs(c, t, Actor{"R-1", "admin"}).Status, 403, "X-Actor-Role admin");
-  const int own = readAs(c, t, kR1).Status;
-  const int agent = readAs(c, t, kAgent).Status;
+  auto c = hReader(ctx);
+  const std::string t = hSeed({{"R-1", "public", "My card was charged twice."}});
+  ctx.Equal(hReadAs(c, t, kHR2).Status, 403, "requester R-2 reading R-1's ticket (a requester reads only their own tickets)");
+  ctx.Equal(hReadAs(c, t, HActor{"", "requester"}).Status, 401, "a read without X-Actor-Id");
+  ctx.Equal(hReadAs(c, t, HActor{"R-1", "admin"}).Status, 403, "X-Actor-Role admin");
+  ctx.Equal(hReadAs(c, t, HActor{"R-1", ""}).Status, 403, "the owner reading without X-Actor-Role (a missing role is not requester or agent)");
+  const int own = hReadAs(c, t, kHR1).Status;
+  const int agent = hReadAs(c, t, kHAgent).Status;
   ctx.Assert(own == 200 && agent == 200, "the owner and an agent must read the ticket, got %d and %d", own, agent);
 }
 
 void CheckKeysetCursor(harness::Ctx& ctx) {
-  auto c = reader(ctx);
+  auto c = hReader(ctx);
   std::vector<std::array<std::string, 3>> five;
   for (int i = 1; i <= 5; ++i) five.push_back({"A-7", "public", "note " + std::to_string(i)});
-  const std::string t = seed(five);
-  const auto first = readAs(c, t, kAgent, "limit=2");
-  ctx.Equal(bodies(first), {"note 5", "note 4"}, "the first page of 2 must be the two newest notes");
-  const std::string cursor = cursorOf(first);
+  const std::string t = hSeed(five);
+  const auto first = hReadAs(c, t, kHAgent, "limit=2");
+  ctx.Equal(hBodies(first), {"note 5", "note 4"}, "the first page of 2 must be the two newest notes");
+  const std::string cursor = hCursorOf(first);
   ctx.Assert(!cursor.empty(), "a full page must carry next_cursor, got %s", first.Text());
   store::appendNote(t, "R-1", "public", "note 6");  // posted while the agent scrolls
-  const auto second = readAs(c, t, kAgent, "limit=2&cursor=" + cursor);
-  ctx.Equal(bodies(second), {"note 3", "note 2"}, "after a note was posted, the page must continue below the last note fetched; the second page");
-  const auto third = readAs(c, t, kAgent, "limit=2&cursor=" + cursorOf(second));
-  ctx.Assert(bodies(third) == std::vector<std::string>{"note 1"} && pageOf(third).contains("next_cursor") && pageOf(third)["next_cursor"].is_null(),
+  const auto second = hReadAs(c, t, kHAgent, "limit=2&cursor=" + cursor);
+  ctx.Equal(hBodies(second), {"note 3", "note 2"}, "after a note was posted, the page must continue below the last note fetched; the second page");
+  const auto third = hReadAs(c, t, kHAgent, "limit=2&cursor=" + hCursorOf(second));
+  ctx.Assert(hBodies(third) == std::vector<std::string>{"note 1"} && hPageOf(third).contains("next_cursor") && hPageOf(third)["next_cursor"].is_null(),
              "the last page must be note 1 with next_cursor null, got %s", third.Text());
-  ctx.Equal(readAs(c, t, kAgent, "cursor=abc").Status, 400, "cursor=abc");
+  ctx.Equal(hReadAs(c, t, kHAgent, "cursor=abc").Status, 400, "cursor=abc");
+  for (const std::string value : {"0", "-2"}) {
+    ctx.Equal(hReadAs(c, t, kHAgent, "cursor=" + value).Status, 400, "cursor=%s (a cursor that is not a positive integer is 400)", value);
+  }
   // A requester walks a timeline whose newest notes are internal: every public note once, and the walk ends.
-  const std::string t2 = seed({{"R-1", "public", "p1"}, {"A-7", "internal", "i1"}, {"A-7", "internal", "i2"}, {"A-7", "public", "p2"}, {"A-7", "internal", "i3"}});
+  const std::string t2 = hSeed({{"R-1", "public", "p1"}, {"A-7", "internal", "i1"}, {"A-7", "internal", "i2"}, {"A-7", "public", "p2"}, {"A-7", "internal", "i3"}});
   std::vector<std::string> seen;
   std::string next;
   for (int i = 0; i < 10; ++i) {
-    const auto r = readAs(c, t2, kR1, next.empty() ? "limit=2" : "limit=2&cursor=" + next);
-    for (const auto& b : bodies(r)) seen.push_back(b);
-    next = cursorOf(r);
+    const auto r = hReadAs(c, t2, kHR1, next.empty() ? "limit=2" : "limit=2&cursor=" + next);
+    for (const auto& b : hBodies(r)) seen.push_back(b);
+    next = hCursorOf(r);
     if (next.empty()) break;
   }
   ctx.Equal(seen, {"p2", "p1"}, "a requester paging the whole timeline must see every public note once (next_cursor follows the last note fetched, not the last one shown)");

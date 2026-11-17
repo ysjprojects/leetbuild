@@ -94,7 +94,7 @@ not be answered with 5 000 records at once.
       id: 'freshness',
       title: 'stale past FRESHNESS_BOUND_MS',
       detail:
-        'A record older than 60 000 ms at `snapshot_at_ms`, or missing, is `"stale": true`; the response counts them in `stale`. The starter draws an hour-old position as current.',
+        'A record older than 60 000 ms at `snapshot_at_ms`, or missing, is `"stale": true`, and one exactly 60 000 ms old is not; the response counts them in `stale`. The starter draws an hour-old position as current.',
       match: {
         python: {all: [/FRESHNESS_BOUND_MS\s*=\s*60_?000/, /["']stale["']/, />\s*FRESHNESS_BOUND_MS/]},
         typescript: {all: [/FRESHNESS_BOUND_MS\s*=\s*60_?000/, /stale/, />\s*FRESHNESS_BOUND_MS/]},
@@ -107,7 +107,7 @@ not be answered with 5 000 records at once.
       id: 'cap',
       title: 'At most 5 000 vehicles, truncated past it',
       detail:
-        'A fleet of 5 002 is answered as its first 5 000 vehicles in id order over the pages, with `"truncated": true`. The starter answers them all.',
+        'A fleet of 5 002 is answered as its first 5 000 vehicles in id order over exactly five pages of 1 000, with `"truncated": true`; a fleet of exactly 5 000 is not truncated. The starter answers them all.',
       match: {
         python: {all: [/MAX_VEHICLES\s*=\s*5000/, /truncated/, /MAX_VEHICLES\s*\]/]},
         typescript: {all: [/MAX_VEHICLES\s*=\s*5000/, /truncated/, /slice\(\s*0\s*,\s*MAX_VEHICLES\s*\)/]},
@@ -122,7 +122,7 @@ not be answered with 5 000 records at once.
       id: 'pagination',
       title: 'limit and cursor page through the fleet',
       detail:
-        '`limit` 1..1000 (default 500, else 400) and `cursor` chain the pages without gap or overlap; the last page answers `"cursor": null`. The starter answers the whole fleet.',
+        '`limit` 1..1000 (default 500, else 400) and `cursor` chain the pages without gap or overlap, even when the vehicle a cursor names has left the fleet; the page that reaches the end answers `"cursor": null`. The starter answers the whole fleet.',
       match: {
         python: {all: [/MAX_LIMIT\s*=\s*1000/, /DEFAULT_LIMIT\s*=\s*500/, /cursor/]},
         typescript: {all: [/MAX_LIMIT\s*=\s*1000/, /DEFAULT_LIMIT\s*=\s*500/, /cursor/]},
@@ -775,8 +775,8 @@ def now_ms(ctx):
 
 
 def seed(ctx, vehicles):
-    """A fleet of the given vehicles: id → device timestamp of its latest record (None: no record)."""
-    ctx.redis.sadd(FLEET, *vehicles)
+    """A fleet of the given vehicles: id → device timestamp of its latest record (None: no record), added in reverse id order."""
+    ctx.redis.sadd(FLEET, *reversed(list(vehicles)))
     for vehicle_id, ts in vehicles.items():
         if ts is not None:
             ctx.redis.hset(f"vehicle:{vehicle_id}:latest", mapping={"ts": ts, "seq": 1, "lat": 47.6, "lon": -122.3})
@@ -819,18 +819,18 @@ async def check_tenant_scope(ctx):
 
 async def check_freshness(ctx):
     now = now_ms(ctx)
-    seed(ctx, {"v-1": now - 1000, "v-2": now - 120_000, "v-3": None})
+    seed(ctx, {"v-1": now - 1000, "v-2": now - 120_000, "v-3": None, "v-4": now - 60_000, "v-5": now - 60_001})
     m = ctx.load("snapshot")
     r = await get(ctx, m, "/v1/fleets/f-1/positions")
     assert r.status_code == 200, f"GET answered {r.status_code}: {r.text}"
     body = r.json()
     flags = [v.get("stale") for v in body["vehicles"]]
-    assert flags == [False, True, True], f"stale flags for (1 s old, 2 min old, no record) are {flags}, expected [False, True, True]: a position older than FRESHNESS_BOUND_MS (60 000 ms) at snapshot_at_ms, or missing, is not current"
-    assert body.get("stale") == 2, f"the response's stale count is {body.get('stale')!r}, expected 2"
+    assert flags == [False, True, True, False, True], f"stale flags for (1 s old, 2 min old, no record, exactly 60 000 ms old, 60 001 ms old) are {flags}, expected [False, True, True, False, True]: a position older than FRESHNESS_BOUND_MS (60 000 ms) at snapshot_at_ms, or missing, is not current; one exactly at the bound still is"
+    assert body.get("stale") == 3, f"the response's stale count is {body.get('stale')!r}, expected 3"
     assert abs(body["snapshot_at_ms"] - now) < 1000, f"snapshot_at_ms is {body['snapshot_at_ms']}, expected the server clock ({now})"
     ctx.clock.advance(120)
     body = (await get(ctx, m, "/v1/fleets/f-1/positions")).json()
-    assert [v.get("stale") for v in body["vehicles"]] == [True, True, True] and body.get("stale") == 3, f"two minutes later every record is older than the bound: got {[v.get('stale') for v in body['vehicles']]}"
+    assert [v.get("stale") for v in body["vehicles"]] == [True] * 5 and body.get("stale") == 5, f"two minutes later every record is older than the bound: got {[v.get('stale') for v in body['vehicles']]}, stale count {body.get('stale')!r}"
 
 
 async def check_cap(ctx):
@@ -854,8 +854,14 @@ async def check_cap(ctx):
             break
     assert len(seen) == 5000, f"a fleet of 5 002 vehicles was answered with {len(seen)} over {pages} pages, expected MAX_VEHICLES = 5 000 (the first 5 000 in id order)"
     assert seen == sorted(seen) and seen[-1] == "v-4999", f"the pages must cover v-0000 … v-4999 in order (last was {seen[-1]})"
+    assert pages == 5, f"5 000 vehicles at limit=1000 took {pages} pages, expected 5: the page that reaches the cap carries cursor null, not a cursor to an empty page"
     assert truncated is True, f"the last page says truncated {truncated!r}, expected true: the caller must learn the fleet is larger than the cap"
     assert body.get("max_vehicles") == 5000, f"max_vehicles is {body.get('max_vehicles')!r}, expected 5000"
+    ctx.redis.srem(FLEET, "v-5000", "v-5001")
+    r = await get(ctx, m, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999")
+    body = r.json()
+    assert r.status_code == 200 and len(ids(body)) == 1000 and body.get("cursor") is None, f"the last page of a fleet of exactly 5 000 answered {r.status_code} with {len(ids(body)) if r.status_code == 200 else 0} vehicles and cursor {body.get('cursor')!r}, expected 1000 and null"
+    assert body.get("truncated") is False, f"a fleet of exactly MAX_VEHICLES says truncated {body.get('truncated')!r}, expected false: nothing was left out"
 
 
 async def check_pagination(ctx):
@@ -874,7 +880,13 @@ async def check_pagination(ctx):
     assert ids(third) == ["v-5"] and third.get("cursor") is None, f"the last page holds {ids(third)} with cursor {third.get('cursor')!r}, expected v-5 and cursor null"
     body = (await get(ctx, m, "/v1/fleets/f-1/positions")).json()
     assert len(ids(body)) == 5 and body.get("cursor") is None, f"without a limit the default (500) covers all five: got {ids(body)} cursor {body.get('cursor')!r}"
-    for bad in ("0", "1001", "-1"):
+    body = (await get(ctx, m, "/v1/fleets/f-1/positions?limit=5")).json()
+    assert len(ids(body)) == 5 and body.get("cursor") is None, f"limit=5 over five vehicles answered {ids(body)} with cursor {body.get('cursor')!r}, expected all five and cursor null: a page that reaches the end has no next page"
+    # The vehicle a cursor names leaves the fleet between two pages: the next page still starts after it.
+    ctx.redis.srem(FLEET, "v-2")
+    r = await get(ctx, m, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")
+    assert r.status_code == 200 and ids(r.json()) == ["v-3", "v-4"], f"with v-2 removed from the fleet, the page after cursor v-2 answered {r.status_code}: {r.text}, expected v-3 and v-4: the cursor is a position in id order, not a member to look up"
+    for bad in ("0", "1001", "-1", "abc"):
         r = await get(ctx, m, f"/v1/fleets/f-1/positions?limit={bad}")
         assert r.status_code == 400, f"limit={bad} answered {r.status_code}, expected 400 (limit is 1..1000)"
 
@@ -897,9 +909,9 @@ async def check_one_instant(ctx):
     typescript: `const T1 = {'X-Tenant-Id': 't-1'};
 const FLEET = 'fleet:t-1:f-1';
 
-/** A fleet of the given vehicles: id → device timestamp of its latest record (null: no record). */
+/** A fleet of the given vehicles: id → device timestamp of its latest record (null: no record), added in reverse id order. */
 function seed(ctx, vehicles: Record<string, number | null>) {
-  ctx.redis.sadd(FLEET, ...Object.keys(vehicles));
+  ctx.redis.sadd(FLEET, ...Object.keys(vehicles).reverse());
   for (const [vehicleId, ts] of Object.entries(vehicles)) {
     if (ts !== null) ctx.redis.hset(\`vehicle:\${vehicleId}:latest\`, 'ts', ts, 'seq', 1, 'lat', 47.6, 'lon', -122.3);
   }
@@ -960,18 +972,18 @@ export async function check_tenant_scope(ctx) {
 
 export async function check_freshness(ctx) {
   const now = ctx.clock.now();
-  seed(ctx, {'v-1': now - 1000, 'v-2': now - 120_000, 'v-3': null});
+  seed(ctx, {'v-1': now - 1000, 'v-2': now - 120_000, 'v-3': null, 'v-4': now - 60_000, 'v-5': now - 60_001});
   const c = snapshot(ctx);
-  let r = await c.get('/v1/fleets/f-1/positions', {headers: T1});
+  const r = await c.get('/v1/fleets/f-1/positions', {headers: T1});
   assert.equal(r.status, 200, \`GET answered \${r.status}: \${r.text}\`);
   let body = r.json() as Snapshot;
   const flags = body.vehicles.map(v => v.stale);
-  assert.deepStrictEqual(flags, [false, true, true], \`stale flags for (1 s old, 2 min old, no record) are \${JSON.stringify(flags)}, expected [false, true, true]: a position older than FRESHNESS_BOUND_MS (60 000 ms) at snapshot_at_ms, or missing, is not current\`);
-  assert.equal(body.stale, 2, \`the response's stale count is \${JSON.stringify(body.stale)}, expected 2\`);
+  assert.deepStrictEqual(flags, [false, true, true, false, true], \`stale flags for (1 s old, 2 min old, no record, exactly 60 000 ms old, 60 001 ms old) are \${JSON.stringify(flags)}, expected [false, true, true, false, true]: a position older than FRESHNESS_BOUND_MS (60 000 ms) at snapshot_at_ms, or missing, is not current; one exactly at the bound still is\`);
+  assert.equal(body.stale, 3, \`the response's stale count is \${JSON.stringify(body.stale)}, expected 3\`);
   assert(Math.abs(body.snapshot_at_ms - now) < 1000, \`snapshot_at_ms is \${body.snapshot_at_ms}, expected the server clock (\${now})\`);
   ctx.clock.advance(120);
   body = (await c.get('/v1/fleets/f-1/positions', {headers: T1})).json() as Snapshot;
-  assert(JSON.stringify(body.vehicles.map(v => v.stale)) === '[true,true,true]' && body.stale === 3, \`two minutes later every record is older than the bound: got \${JSON.stringify(body.vehicles.map(v => v.stale))}\`);
+  assert(JSON.stringify(body.vehicles.map(v => v.stale)) === '[true,true,true,true,true]' && body.stale === 5, \`two minutes later every record is older than the bound: got \${JSON.stringify(body.vehicles.map(v => v.stale))}, stale count \${JSON.stringify(body.stale)}\`);
 }
 
 export async function check_cap(ctx) {
@@ -996,8 +1008,15 @@ export async function check_cap(ctx) {
   }
   assert.equal(seen.length, 5000, \`a fleet of 5 002 vehicles was answered with \${seen.length} over \${pages} pages, expected MAX_VEHICLES = 5 000 (the first 5 000 in id order)\`);
   assert(seen.every((id, i) => i === 0 || seen[i - 1] < id) && seen[seen.length - 1] === 'v-4999', \`the pages must cover v-0000 … v-4999 in order (last was \${seen[seen.length - 1]})\`);
+  assert.equal(pages, 5, \`5 000 vehicles at limit=1000 took \${pages} pages, expected 5: the page that reaches the cap carries cursor null, not a cursor to an empty page\`);
   assert.strictEqual(body.truncated, true, \`the last page says truncated \${JSON.stringify(body.truncated)}, expected true: the caller must learn the fleet is larger than the cap\`);
   assert.equal(body.max_vehicles, 5000, \`max_vehicles is \${JSON.stringify(body.max_vehicles)}, expected 5000\`);
+  ctx.redis.srem(FLEET, 'v-5000', 'v-5001');
+  const r = await c.get('/v1/fleets/f-1/positions?limit=1000&cursor=v-3999', {headers: T1});
+  assert.equal(r.status, 200, \`the last page of a fleet of exactly 5 000 answered \${r.status}: \${r.text}\`);
+  const last = r.json() as Snapshot;
+  assert(ids(last).length === 1000 && last.cursor === null, \`the last page of a fleet of exactly 5 000 holds \${ids(last).length} vehicles with cursor \${JSON.stringify(last.cursor)}, expected 1000 and null\`);
+  assert.strictEqual(last.truncated, false, \`a fleet of exactly MAX_VEHICLES says truncated \${JSON.stringify(last.truncated)}, expected false: nothing was left out\`);
 }
 
 export async function check_pagination(ctx) {
@@ -1015,7 +1034,13 @@ export async function check_pagination(ctx) {
   assert(JSON.stringify(ids(third)) === '["v-5"]' && third.cursor === null, \`the last page holds \${JSON.stringify(ids(third))} with cursor \${JSON.stringify(third.cursor)}, expected v-5 and cursor null\`);
   const all = (await c.get('/v1/fleets/f-1/positions', {headers: T1})).json() as Snapshot;
   assert(ids(all).length === 5 && all.cursor === null, \`without a limit the default (500) covers all five: got \${JSON.stringify(ids(all))} cursor \${JSON.stringify(all.cursor)}\`);
-  for (const bad of ['0', '1001', '-1']) {
+  const exact = (await c.get('/v1/fleets/f-1/positions?limit=5', {headers: T1})).json() as Snapshot;
+  assert(ids(exact).length === 5 && exact.cursor === null, \`limit=5 over five vehicles answered \${JSON.stringify(ids(exact))} with cursor \${JSON.stringify(exact.cursor)}, expected all five and cursor null: a page that reaches the end has no next page\`);
+  // The vehicle a cursor names leaves the fleet between two pages: the next page still starts after it.
+  ctx.redis.srem(FLEET, 'v-2');
+  r = await c.get('/v1/fleets/f-1/positions?limit=2&cursor=v-2', {headers: T1});
+  assert(r.status === 200 && JSON.stringify(ids(r.json())) === '["v-3","v-4"]', \`with v-2 removed from the fleet, the page after cursor v-2 answered \${r.status}: \${r.text}, expected v-3 and v-4: the cursor is a position in id order, not a member to look up\`);
+  for (const bad of ['0', '1001', '-1', 'abc']) {
     r = await c.get(\`/v1/fleets/f-1/positions?limit=\${bad}\`, {headers: T1});
     assert.equal(r.status, 400, \`limit=\${bad} answered \${r.status}, expected 400 (limit is 1..1000)\`);
   }
@@ -1095,6 +1120,25 @@ func (b snapshotBody) ids() []string {
 	return out
 }
 
+// snapshotShow is what a pointer field of the answer held, for a message: its value, or nil when absent.
+func snapshotShow(p any) any {
+	switch v := p.(type) {
+	case *string:
+		if v != nil {
+			return *v
+		}
+	case *bool:
+		if v != nil {
+			return *v
+		}
+	case *int:
+		if v != nil {
+			return *v
+		}
+	}
+	return nil
+}
+
 func (b snapshotBody) stale() []any {
 	out := make([]any, 0, len(b.Vehicles))
 	for _, v := range b.Vehicles {
@@ -1122,23 +1166,23 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id")
 	r = c.Get("/v1/fleets/f-1/positions", "X-Tenant-Id", "t-2")
 	ctx.Equal(r.Status, 404, "tenant t-2 reading t-1's fleet f-1 (the fleet is read from fleet:{tenant}:{fleet_id}, and t-2 has no f-1)")
-	ctx.Assert(!contains(r.Text(), "v-1"), "tenant t-2's read of t-1's fleet leaked v-1: %s", r.Text())
+	ctx.Assert(!snapshotContains(r.Text(), "v-1"), "tenant t-2's read of t-1's fleet leaked v-1: %s", r.Text())
 	_, body := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
 	ctx.Equal(body.ids(), []string{"v-1"}, "t-1 reading its own fleet")
 }
 
 func CheckFreshness(ctx *harness.Ctx) {
 	now := ctx.Clock.Now()
-	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 120_000, "v-3": -1})
+	snapshotSeed(ctx, map[string]int64{"v-1": now - 1000, "v-2": now - 120_000, "v-3": -1, "v-4": now - 60_000, "v-5": now - 60_001})
 	c := snapshotAPI(ctx)
 	_, body := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
-	ctx.Equal(body.stale(), []any{false, true, true}, "stale flags for (1 s old, 2 min old, no record): a position older than freshnessBoundMs (60 000 ms) at snapshot_at_ms, or missing, is not current")
-	ctx.Assert(body.Stale != nil && *body.Stale == 2, "the response's stale count is %v, expected 2", body.Stale)
+	ctx.Equal(body.stale(), []any{false, true, true, false, true}, "stale flags for (1 s old, 2 min old, no record, exactly 60 000 ms old, 60 001 ms old): a position older than freshnessBoundMs (60 000 ms) at snapshot_at_ms, or missing, is not current; one exactly at the bound still is")
+	ctx.Assert(body.Stale != nil && *body.Stale == 3, "the response's stale count is %v, expected 3", snapshotShow(body.Stale))
 	ctx.Assert(body.SnapshotAtMs-now < 1000 && now-body.SnapshotAtMs < 1000, "snapshot_at_ms is %d, expected the server clock (%d)", body.SnapshotAtMs, now)
 	ctx.Clock.Advance(120)
 	_, body = snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
-	ctx.Equal(body.stale(), []any{true, true, true}, "two minutes later every record is older than the bound")
-	ctx.Assert(body.Stale != nil && *body.Stale == 3, "the stale count two minutes later is %v, expected 3", body.Stale)
+	ctx.Equal(body.stale(), []any{true, true, true, true, true}, "two minutes later every record is older than the bound")
+	ctx.Assert(body.Stale != nil && *body.Stale == 5, "the stale count two minutes later is %v, expected 5", snapshotShow(body.Stale))
 }
 
 func CheckCap(ctx *harness.Ctx) {
@@ -1171,8 +1215,13 @@ func CheckCap(ctx *harness.Ctx) {
 	}
 	ctx.Equal(len(seen), 5000, "a fleet of 5 002 vehicles over %d pages must answer maxVehicles = 5 000 (the first 5 000 in id order); the vehicles answered", pages)
 	ctx.Assert(sort.StringsAreSorted(seen) && seen[len(seen)-1] == "v-4999", "the pages must cover v-0000 … v-4999 in order (last was %s)", seen[len(seen)-1])
-	ctx.Assert(body.Truncated != nil && *body.Truncated, "the last page says truncated %v, expected true: the caller must learn the fleet is larger than the cap", body.Truncated)
-	ctx.Assert(body.MaxVehicles != nil && *body.MaxVehicles == 5000, "max_vehicles is %v, expected 5000", body.MaxVehicles)
+	ctx.Assert(body.Truncated != nil && *body.Truncated, "the last page says truncated %v, expected true: the caller must learn the fleet is larger than the cap", snapshotShow(body.Truncated))
+	ctx.Assert(body.MaxVehicles != nil && *body.MaxVehicles == 5000, "max_vehicles is %v, expected 5000", snapshotShow(body.MaxVehicles))
+	ctx.Equal(pages, 5, "5 000 vehicles at limit=1000 must take 5 pages: the page that reaches the cap carries cursor null, not a cursor to an empty page; the pages")
+	ctx.Redis.Do("SREM", snapshotFleet, "v-5000", "v-5001")
+	_, last := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999")
+	ctx.Assert(len(last.ids()) == 1000 && last.Cursor == nil, "the last page of a fleet of exactly 5 000 holds %d vehicles with cursor %v, expected 1000 and null", len(last.ids()), snapshotShow(last.Cursor))
+	ctx.Assert(last.Truncated != nil && !*last.Truncated, "a fleet of exactly maxVehicles says truncated %v, expected false: nothing was left out", snapshotShow(last.Truncated))
 }
 
 func CheckPagination(ctx *harness.Ctx) {
@@ -1181,15 +1230,21 @@ func CheckPagination(ctx *harness.Ctx) {
 	c := snapshotAPI(ctx)
 	_, first := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2")
 	ctx.Equal(first.ids(), []string{"v-1", "v-2"}, "the first page with limit=2")
-	ctx.Assert(first.Cursor != nil && *first.Cursor != "", "with three vehicles left the first page carries cursor %v, expected the last vehicle id of the page", first.Cursor)
+	ctx.Assert(first.Cursor != nil && *first.Cursor != "", "with three vehicles left the first page carries cursor %v, expected the last vehicle id of the page", snapshotShow(first.Cursor))
 	_, second := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor="+*first.Cursor)
 	ctx.Equal(second.ids(), []string{"v-3", "v-4"}, "the second page (pages must chain without gap or overlap)")
 	_, third := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor="+*second.Cursor)
 	ctx.Equal(third.ids(), []string{"v-5"}, "the last page")
-	ctx.Assert(third.Cursor == nil, "the last page's cursor is %v, expected null", third.Cursor)
+	ctx.Assert(third.Cursor == nil, "the last page's cursor is %v, expected null", snapshotShow(third.Cursor))
 	_, all := snapshotGet(ctx, c, "/v1/fleets/f-1/positions")
-	ctx.Assert(len(all.ids()) == 5 && all.Cursor == nil, "without a limit the default (500) covers all five: got %v cursor %v", all.ids(), all.Cursor)
-	for _, bad := range []string{"0", "1001", "-1"} {
+	ctx.Assert(len(all.ids()) == 5 && all.Cursor == nil, "without a limit the default (500) covers all five: got %v cursor %v", all.ids(), snapshotShow(all.Cursor))
+	_, exact := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=5")
+	ctx.Assert(len(exact.ids()) == 5 && exact.Cursor == nil, "limit=5 over five vehicles answered %v with cursor %v, expected all five and cursor null: a page that reaches the end has no next page", exact.ids(), snapshotShow(exact.Cursor))
+	// The vehicle a cursor names leaves the fleet between two pages: the next page still starts after it.
+	ctx.Redis.Do("SREM", snapshotFleet, "v-2")
+	_, after := snapshotGet(ctx, c, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")
+	ctx.Equal(after.ids(), []string{"v-3", "v-4"}, "with v-2 removed from the fleet, the page after cursor v-2 (the cursor is a position in id order, not a member to look up)")
+	for _, bad := range []string{"0", "1001", "-1", "abc"} {
 		r := c.Get("/v1/fleets/f-1/positions?limit="+bad, "X-Tenant-Id", "t-1")
 		ctx.Equal(r.Status, 400, "limit=%s (limit is 1..1000)", bad)
 	}
@@ -1217,7 +1272,7 @@ func CheckOneInstant(ctx *harness.Ctx) {
 	ctx.Assert(trips <= 3, "the read cost %d Redis round trips for three vehicles, expected the members and one MULTI/EXEC: a 5 000-vehicle fleet must not cost 5 000 round trips", trips)
 }
 
-func contains(s, sub string) bool {
+func snapshotContains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {
 			return true
@@ -1243,7 +1298,7 @@ const std::string kSnapshotFleet = "fleet:t-1:f-1";
 // A fleet of the given vehicles: id → device timestamp of its latest record (-1: no record).
 void snapshotSeed(harness::Ctx& ctx, const std::map<std::string, long long>& vehicles) {
   std::vector<std::string> args = {"SADD", kSnapshotFleet};
-  for (const auto& [id, _] : vehicles) args.push_back(id);
+  for (auto it = vehicles.rbegin(); it != vehicles.rend(); ++it) args.push_back(it->first);  // reverse id order
   ctx.Redis.Must(args);
   for (const auto& [id, ts] : vehicles) {
     if (ts >= 0) ctx.Redis.Do("HSET", "vehicle:" + id + ":latest", "ts", ts, "seq", 1, "lat", 47.6, "lon", -122.3);
@@ -1262,7 +1317,7 @@ nlohmann::json snapshotGet(harness::Ctx& ctx, SnapshotApi& api, const std::strin
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-std::vector<std::string> ids(const nlohmann::json& body) {
+std::vector<std::string> snapshotIds(const nlohmann::json& body) {
   std::vector<std::string> out;
   if (body.contains("vehicles")) {
     for (const auto& v : body["vehicles"]) out.push_back(v.value("vehicle_id", ""));
@@ -1270,7 +1325,7 @@ std::vector<std::string> ids(const nlohmann::json& body) {
   return out;
 }
 
-std::vector<nlohmann::json> stale(const nlohmann::json& body) {
+std::vector<nlohmann::json> snapshotStale(const nlohmann::json& body) {
   std::vector<nlohmann::json> out;
   for (const auto& v : body["vehicles"]) out.push_back(v.value("stale", nlohmann::json()));
   return out;
@@ -1285,7 +1340,7 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
   ctx.Assert(body.value("fleet_id", "") == "f-1" && body.contains("snapshot_at_ms"),
              "the response must carry fleet_id and snapshot_at_ms: %s", body.dump());
-  ctx.Equal(ids(body), {"v-1", "v-2"}, "the fleet's vehicles in id order");
+  ctx.Equal(snapshotIds(body), {"v-1", "v-2"}, "the fleet's vehicles in id order");
   const auto v1 = body["vehicles"][0];
   ctx.Assert(v1.value("lat", 0.0) == 47.6 && v1.value("lon", 0.0) == -122.3 && v1.value("device_timestamp_ms", 0LL) == now - 1000 &&
                  v1.value("sequence", 0LL) == 1,
@@ -1301,25 +1356,25 @@ void CheckTenantScope(harness::Ctx& ctx) {
   r = api.http.Get("/v1/fleets/f-1/positions", "X-Tenant-Id", "t-2");
   ctx.Equal(r.Status, 404, "tenant t-2 reading t-1's fleet f-1 (the fleet is read from fleet:{tenant}:{fleet_id}, and t-2 has no f-1)");
   ctx.Assert(r.Text().find("v-1") == std::string::npos, "tenant t-2's read of t-1's fleet leaked v-1: %s", r.Text());
-  ctx.Equal(ids(snapshotGet(ctx, api, "/v1/fleets/f-1/positions")), {"v-1"}, "t-1 reading its own fleet");
+  ctx.Equal(snapshotIds(snapshotGet(ctx, api, "/v1/fleets/f-1/positions")), {"v-1"}, "t-1 reading its own fleet");
 }
 
 void CheckFreshness(harness::Ctx& ctx) {
   const long long now = ctx.Clock.Now();
-  snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 120000}, {"v-3", -1}});
+  snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 120000}, {"v-3", -1}, {"v-4", now - 60000}, {"v-5", now - 60001}});
   SnapshotApi api(ctx);
   auto body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
-  ctx.Equal(stale(body), {nlohmann::json(false), nlohmann::json(true), nlohmann::json(true)},
-            "stale flags for (1 s old, 2 min old, no record): a position older than kFreshnessBoundMs (60 000 ms) at "
-            "snapshot_at_ms, or missing, is not current");
-  ctx.Equal(body.value("stale", nlohmann::json()), nlohmann::json(2), "the response's stale count");
+  ctx.Equal(snapshotStale(body),
+            {nlohmann::json(false), nlohmann::json(true), nlohmann::json(true), nlohmann::json(false), nlohmann::json(true)},
+            "stale flags for (1 s old, 2 min old, no record, exactly 60 000 ms old, 60 001 ms old): a position older than "
+            "kFreshnessBoundMs (60 000 ms) at snapshot_at_ms, or missing, is not current; one exactly at the bound still is");
+  ctx.Equal(body.value("stale", nlohmann::json()), nlohmann::json(3), "the response's stale count");
   const long long at = body.value("snapshot_at_ms", 0LL);
   ctx.Assert(at - now < 1000 && now - at < 1000, "snapshot_at_ms is %d, expected the server clock (%d)", at, now);
   ctx.Clock.Advance(120);
   body = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
-  ctx.Equal(stale(body), {nlohmann::json(true), nlohmann::json(true), nlohmann::json(true)},
-            "two minutes later every record is older than the bound");
-  ctx.Equal(body.value("stale", nlohmann::json()), nlohmann::json(3), "the stale count two minutes later");
+  ctx.Equal(snapshotStale(body), std::vector<nlohmann::json>(5, nlohmann::json(true)), "two minutes later every record is older than the bound");
+  ctx.Equal(body.value("stale", nlohmann::json()), nlohmann::json(5), "the stale count two minutes later");
 }
 
 void CheckCap(harness::Ctx& ctx) {
@@ -1339,7 +1394,7 @@ void CheckCap(harness::Ctx& ctx) {
     std::string path = "/v1/fleets/f-1/positions?limit=1000";
     if (!cursor.empty()) path += "&cursor=" + cursor;
     body = snapshotGet(ctx, api, path);
-    const auto page = ids(body);
+    const auto page = snapshotIds(body);
     seen.insert(seen.end(), page.begin(), page.end());
     pages++;
     cursor = body.contains("cursor") && body["cursor"].is_string() ? body["cursor"].get<std::string>() : "";
@@ -1355,6 +1410,17 @@ void CheckCap(harness::Ctx& ctx) {
   ctx.Assert(body.value("truncated", false), "the last page says truncated %s, expected true: the caller must learn the fleet is larger than the cap",
              body.value("truncated", nlohmann::json()).dump());
   ctx.Equal(body.value("max_vehicles", nlohmann::json()), nlohmann::json(5000), "max_vehicles");
+  ctx.Equal(pages, 5,
+            "5 000 vehicles at limit=1000 must take 5 pages: the page that reaches the cap carries cursor null, not a cursor "
+            "to an empty page; the pages");
+  ctx.Redis.Do("SREM", kSnapshotFleet, "v-5000", "v-5001");
+  const auto last = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=1000&cursor=v-3999");
+  ctx.Assert(snapshotIds(last).size() == 1000 && last.contains("cursor") && last["cursor"].is_null(),
+             "the last page of a fleet of exactly 5 000 holds %d vehicles with cursor %s, expected 1000 and null",
+             static_cast<int>(snapshotIds(last).size()), last.value("cursor", nlohmann::json()).dump());
+  ctx.Assert(last.contains("truncated") && last["truncated"] == false,
+             "a fleet of exactly kMaxVehicles says truncated %s, expected false: nothing was left out",
+             last.value("truncated", nlohmann::json()).dump());
 }
 
 void CheckPagination(harness::Ctx& ctx) {
@@ -1362,21 +1428,31 @@ void CheckPagination(harness::Ctx& ctx) {
   snapshotSeed(ctx, {{"v-1", now - 1000}, {"v-2", now - 1000}, {"v-3", now - 1000}, {"v-4", now - 1000}, {"v-5", now - 1000}});
   SnapshotApi api(ctx);
   const auto first = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2");
-  ctx.Equal(ids(first), {"v-1", "v-2"}, "the first page with limit=2");
+  ctx.Equal(snapshotIds(first), {"v-1", "v-2"}, "the first page with limit=2");
   ctx.Assert(first.contains("cursor") && first["cursor"].is_string() && !first["cursor"].get<std::string>().empty(),
              "with three vehicles left the first page carries cursor %s, expected the last vehicle id of the page",
              first.value("cursor", nlohmann::json()).dump());
   const auto second = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=" + first["cursor"].get<std::string>());
-  ctx.Equal(ids(second), {"v-3", "v-4"}, "the second page (pages must chain without gap or overlap)");
+  ctx.Equal(snapshotIds(second), {"v-3", "v-4"}, "the second page (pages must chain without gap or overlap)");
   ctx.Assert(second.contains("cursor") && second["cursor"].is_string(), "the second page carries no cursor: %s", second.dump());
   const auto third = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=" + second["cursor"].get<std::string>());
-  ctx.Equal(ids(third), {"v-5"}, "the last page");
+  ctx.Equal(snapshotIds(third), {"v-5"}, "the last page");
   ctx.Assert(third.contains("cursor") && third["cursor"].is_null(), "the last page's cursor is %s, expected null",
              third.value("cursor", nlohmann::json()).dump());
   const auto all = snapshotGet(ctx, api, "/v1/fleets/f-1/positions");
-  ctx.Assert(ids(all).size() == 5 && all.contains("cursor") && all["cursor"].is_null(),
-             "without a limit the default (500) covers all five: got %v cursor %s", ids(all), all.value("cursor", nlohmann::json()).dump());
-  for (const std::string bad : {"0", "1001", "-1"}) {
+  ctx.Assert(snapshotIds(all).size() == 5 && all.contains("cursor") && all["cursor"].is_null(),
+             "without a limit the default (500) covers all five: got %v cursor %s", snapshotIds(all), all.value("cursor", nlohmann::json()).dump());
+  const auto exact = snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=5");
+  ctx.Assert(snapshotIds(exact).size() == 5 && exact.contains("cursor") && exact["cursor"].is_null(),
+             "limit=5 over five vehicles answered %v with cursor %s, expected all five and cursor null: a page that reaches "
+             "the end has no next page",
+             snapshotIds(exact), exact.value("cursor", nlohmann::json()).dump());
+  // The vehicle a cursor names leaves the fleet between two pages: the next page still starts after it.
+  ctx.Redis.Do("SREM", kSnapshotFleet, "v-2");
+  ctx.Equal(snapshotIds(snapshotGet(ctx, api, "/v1/fleets/f-1/positions?limit=2&cursor=v-2")), {"v-3", "v-4"},
+            "with v-2 removed from the fleet, the page after cursor v-2 (the cursor is a position in id order, not a member "
+            "to look up)");
+  for (const std::string bad : {"0", "1001", "-1", "abc"}) {
     const auto r = api.http.Get("/v1/fleets/f-1/positions?limit=" + bad, "X-Tenant-Id", "t-1");
     ctx.Equal(r.Status, 400, "limit=%s (limit is 1..1000)", bad);
   }

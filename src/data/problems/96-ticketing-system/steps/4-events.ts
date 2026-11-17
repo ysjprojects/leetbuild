@@ -59,7 +59,7 @@ acknowledgement writes the event twice.
       id: 'no-customer-text',
       title: 'Carries ids, never the customer’s words',
       detail:
-        'The payload carries ids and the transition; the subject the customer wrote stays in the ticket store, out of a topic every consumer can read and that outlives any deletion in the store. The starter copies `subject` in.',
+        'The payload carries ids and the transition; the subject the customer wrote, or any part of it, stays in the ticket store, out of a topic every consumer can read and that outlives any deletion in the store. The starter copies `subject` in.',
       match: {
         python: {none: [/["']subject["']/]},
         typescript: {none: [/\bsubject\b/]},
@@ -72,7 +72,7 @@ acknowledgement writes the event twice.
       id: 'event-fields',
       title: 'Names the actor’s role and the transition',
       detail:
-        'The payload carries `actor_role`, `from` and `to`, so a consumer renders "agent A-7 moved it from open to pending" from the event alone; the starter sends the new state only.',
+        'The payload carries `requester_id`, `actor_role`, `from` and `to`, so a consumer renders "agent A-7 moved it from open to pending" from the event alone; the starter sends the new state only.',
       match: {
         python: {all: [/["']actor_role["']\s*:/, /["']from["']\s*:/, /["']to["']\s*:/]},
         typescript: {all: [/\bactor_role:/, /\bfrom:/, /\bto:/]},
@@ -85,7 +85,7 @@ acknowledgement writes the event twice.
       id: 'commit-before-produce',
       title: 'Commits the transition before producing',
       detail:
-        '`store.transition` runs first and the record is produced only when it moved the ticket, so no consumer hears about a state the store refused; the starter produces, then commits.',
+        '`store.transition` runs first and the record is produced only when it moved the ticket, so no consumer hears about a state the store refused, even when another agent moves the ticket between a read and the commit; the starter produces, then commits.',
       match: {
         python: {order: [/store\.transition\(/, /producer\.produce\(/]},
         typescript: {order: [/await transition\(/, /producer\.send\(/]},
@@ -625,7 +625,8 @@ def check_no_customer_text(ctx):
     records = ctx.kafka.records(TOPIC)
     assert records, f"the transition produced nothing on {TOPIC}"
     text = records[0].value.decode() if isinstance(records[0].value, bytes) else str(records[0].value)
-    assert SUBJECT not in text, f"the event carries the ticket's subject: {text}. {TOPIC} is retained and replicated; carry ids and the transition"
+    for words in (SUBJECT, "4471", "charged"):
+        assert words not in text, f"the event carries the ticket's subject ({words!r}): {text}. {TOPIC} is retained and replicated; carry ids and the transition"
     assert "subject" not in _payload(records[0]), f"the event has a subject field: {text}"
 
 
@@ -633,7 +634,7 @@ def check_event_fields(ctx):
     m, t = _events(ctx)
     _publish(m, t, "open", "pending", "R-1", "requester")
     payload = _payload(ctx.kafka.records(TOPIC)[0])
-    expected = {"type": "ticket.transition", "ticket_id": t, "actor_id": "R-1", "actor_role": "requester", "from": "open", "to": "pending"}
+    expected = {"type": "ticket.transition", "ticket_id": t, "requester_id": "R-1", "actor_id": "R-1", "actor_role": "requester", "from": "open", "to": "pending"}
     for name, value in expected.items():
         assert payload.get(name) == value, f"the event's {name} is {payload.get(name)!r}, expected {value!r}: a consumer renders the timeline entry from the event alone ({payload})"
 
@@ -648,6 +649,16 @@ def check_commit_before_produce(ctx):
     _publish(m, t, "open", "pending")
     assert len(ctx.kafka.records(TOPIC)) == 1, f"a committed transition must produce one record, the topic holds {len(ctx.kafka.records(TOPIC))}"
     assert store.get_ticket(t)["state"] == "pending", f"the store holds {store.get_ticket(t)} after the move"
+    # Another agent resolves the next ticket the instant this call first touches it.
+    t2 = store.create_ticket("R-1", SUBJECT)["id"]
+    rival = ctx.redis_after(f"ticket:{t2}", lambda: ctx.redis.hset(f"ticket:{t2}", "state", "resolved"))
+    event = m.publish_transition(t2, "open", "pending", "A-7", "agent")
+    assert rival.fired, f"publish_transition never touched ticket:{t2}"
+    produced = [r for r in ctx.kafka.records(TOPIC) if _payload(r).get("ticket_id") == t2]
+    if event is None:
+        assert produced == [], f"another agent resolved {t2} between this call's read and its commit, so the move did not commit, yet it produced {len(produced)} record(s). Produce only after store.transition moved the ticket"
+    else:
+        assert len(produced) == 1, f"the committed move of {t2} produced {len(produced)} records, expected 1"
 
 
 def check_durable_producer(ctx):
@@ -703,7 +714,9 @@ export async function check_no_customer_text(ctx) {
   const records = ctx.kafka.records(TOPIC);
   assert(records.length > 0, \`the transition produced nothing on \${TOPIC}\`);
   const text = records[0].value.toString();
-  assert(!text.includes(SUBJECT), \`the event carries the ticket's subject: \${text}. \${TOPIC} is retained and replicated; carry ids and the transition\`);
+  for (const words of [SUBJECT, '4471', 'charged']) {
+    assert(!text.includes(words), \`the event carries the ticket's subject (\${JSON.stringify(words)}): \${text}. \${TOPIC} is retained and replicated; carry ids and the transition\`);
+  }
   assert(!('subject' in payload(records[0])), \`the event has a subject field: \${text}\`);
 }
 
@@ -711,7 +724,7 @@ export async function check_event_fields(ctx) {
   const {m, t} = await events(ctx);
   await publish(m, t, 'open', 'pending', 'R-1', 'requester');
   const p = payload(ctx.kafka.records(TOPIC)[0]);
-  const expected = {type: 'ticket.transition', ticket_id: t, actor_id: 'R-1', actor_role: 'requester', from: 'open', to: 'pending'};
+  const expected = {type: 'ticket.transition', ticket_id: t, requester_id: 'R-1', actor_id: 'R-1', actor_role: 'requester', from: 'open', to: 'pending'};
   for (const [name, value] of Object.entries(expected)) {
     assert.equal(p[name], value, \`the event's \${name} is \${JSON.stringify(p[name])}, expected \${JSON.stringify(value)}: a consumer renders the timeline entry from the event alone (\${JSON.stringify(p)})\`);
   }
@@ -727,6 +740,17 @@ export async function check_commit_before_produce(ctx) {
   await publish(m, t, 'open', 'pending');
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'a committed transition must produce one record');
   assert.equal((await store.getTicket(t)).state, 'pending', 'the store must hold the committed state');
+  // Another agent resolves the next ticket the instant this call first touches it.
+  const t2 = (await store.createTicket('R-1', SUBJECT)).id;
+  const rival = ctx.redisAfter(\`ticket:\${t2}\`, () => ctx.redis.hset(\`ticket:\${t2}\`, 'state', 'resolved'));
+  const event = await m.publishTransition(t2, 'open', 'pending', 'A-7', 'agent');
+  assert(rival.fired, \`publishTransition never touched ticket:\${t2}\`);
+  const produced = ctx.kafka.records(TOPIC).filter(r => payload(r).ticket_id === t2);
+  if (event === null || event === undefined) {
+    assert.equal(produced.length, 0, \`another agent resolved \${t2} between this call's read and its commit, so the move did not commit, yet it produced \${produced.length} record(s). Produce only after the store's transition moved the ticket\`);
+  } else {
+    assert.equal(produced.length, 1, \`the committed move of \${t2} produced \${produced.length} records, expected 1\`);
+  }
 }
 
 export async function check_durable_producer(ctx) {
@@ -792,7 +816,9 @@ func CheckNoCustomerText(ctx *harness.Ctx) {
 	records := ctx.Kafka.Records(eventsTopic)
 	ctx.Assert(len(records) > 0, "the transition produced nothing on %s", eventsTopic)
 	text := string(records[0].Value)
-	ctx.Assert(!strings.Contains(text, eventsSubject), "the event carries the ticket's subject: %s. %s is retained and replicated; carry ids and the transition", text, eventsTopic)
+	for _, words := range []string{eventsSubject, "4471", "charged"} {
+		ctx.Assert(!strings.Contains(text, words), "the event carries the ticket's subject (%q): %s. %s is retained and replicated; carry ids and the transition", words, text, eventsTopic)
+	}
 	_, has := eventsPayload(ctx, records[0].Value)["subject"]
 	ctx.Assert(!has, "the event has a subject field: %s", text)
 }
@@ -801,8 +827,8 @@ func CheckEventFields(ctx *harness.Ctx) {
 	t := eventsTicket()
 	eventsPublish(ctx, t, "open", "pending", "R-1", "requester")
 	p := eventsPayload(ctx, ctx.Kafka.Records(eventsTopic)[0].Value)
-	expected := map[string]string{"type": "ticket.transition", "ticket_id": t, "actor_id": "R-1", "actor_role": "requester", "from": "open", "to": "pending"}
-	for _, name := range []string{"type", "ticket_id", "actor_id", "actor_role", "from", "to"} {
+	expected := map[string]string{"type": "ticket.transition", "ticket_id": t, "requester_id": "R-1", "actor_id": "R-1", "actor_role": "requester", "from": "open", "to": "pending"}
+	for _, name := range []string{"type", "ticket_id", "requester_id", "actor_id", "actor_role", "from", "to"} {
 		ctx.Equal(p[name], expected[name], "a consumer renders the timeline entry from the event alone (%v); the event's %s", p, name)
 	}
 }
@@ -819,6 +845,24 @@ func CheckCommitBeforeProduce(ctx *harness.Ctx) {
 	eventsPublish(ctx, t, "open", "pending", "A-7", "agent")
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a committed transition must produce one record; the records")
 	ctx.Equal(store.GetTicket(eventsBg, t).State, "pending", "the committed state")
+	// Another agent resolves the next ticket the instant this call first touches it.
+	t2 := eventsTicket()
+	rival := ctx.Redis.After("ticket:"+t2, func() any { return ctx.Redis.Do("HSET", "ticket:"+t2, "state", "resolved") })
+	event, err := publishTransition(eventsBg, t2, "open", "pending", "A-7", "agent")
+	ctx.NoError(err, "publishTransition(%s) failed", t2)
+	ctx.Settle()
+	ctx.Assert(rival.Fired, "publishTransition never touched ticket:%s", t2)
+	produced := 0
+	for _, r := range ctx.Kafka.Records(eventsTopic) {
+		if eventsPayload(ctx, r.Value)["ticket_id"] == t2 {
+			produced++
+		}
+	}
+	if event == nil {
+		ctx.Assert(produced == 0, "another agent resolved %s between this call's read and its commit, so the move did not commit, yet it produced %d record(s). Produce only after store.Transition moved the ticket", t2, produced)
+	} else {
+		ctx.Equal(produced, 1, "the committed move of %s; its records", t2)
+	}
 }
 
 func CheckDurableProducer(ctx *harness.Ctx) {
@@ -835,6 +879,7 @@ func CheckDurableProducer(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -845,12 +890,12 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kEventsTopic = "ticket.event";
-const std::string kEventsSubject = "Invoice 4471 charged twice";
+const std::string kHEventsTopic = "ticket.event";
+const std::string kHEventsSubject = "Invoice 4471 charged twice";
 
-std::string eventsTicket() { return store::createTicket("R-1", kEventsSubject).id; }
+std::string hEventsTicket() { return store::createTicket("R-1", kHEventsSubject).id; }
 
-json mustPublish(harness::Ctx& ctx, const std::string& t, const std::string& from_state, const std::string& to_state,
+json hMustPublish(harness::Ctx& ctx, const std::string& t, const std::string& from_state, const std::string& to_state,
                  const std::string& actor = "A-7", const std::string& role = "agent") {
   std::optional<json> event;
   try {
@@ -862,7 +907,7 @@ json mustPublish(harness::Ctx& ctx, const std::string& t, const std::string& fro
   return *event;
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -873,41 +918,43 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
 }  // namespace
 
 void CheckTicketKey(harness::Ctx& ctx) {
-  const std::string t = eventsTicket();
-  mustPublish(ctx, t, "open", "pending", "A-7", "agent");
-  mustPublish(ctx, t, "pending", "open", "R-1", "requester");
-  mustPublish(ctx, t, "open", "resolved", "A-9", "agent");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three transitions must produce three records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {t, t, t}, "records must be keyed by the ticket id (keyed by the actor, one ticket's events land on several partitions and its timeline is read out of order)");
+  const std::string t = hEventsTicket();
+  hMustPublish(ctx, t, "open", "pending", "A-7", "agent");
+  hMustPublish(ctx, t, "pending", "open", "R-1", "requester");
+  hMustPublish(ctx, t, "open", "resolved", "A-9", "agent");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 3, "three transitions must produce three records on %s; the records", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {t, t, t}, "records must be keyed by the ticket id (keyed by the actor, one ticket's events land on several partitions and its timeline is read out of order)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "%s's events landed on partitions %d, %d, %d: one ticket's history must stay on one partition", t, records[0].Partition,
              records[1].Partition, records[2].Partition);
 }
 
 void CheckNoCustomerText(harness::Ctx& ctx) {
-  const std::string t = eventsTicket();
-  mustPublish(ctx, t, "open", "pending");
-  const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Assert(!records.empty(), "the transition produced nothing on %s", kEventsTopic);
+  const std::string t = hEventsTicket();
+  hMustPublish(ctx, t, "open", "pending");
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Assert(!records.empty(), "the transition produced nothing on %s", kHEventsTopic);
   const std::string text = records[0].Value.value_or("");
-  ctx.Assert(text.find(kEventsSubject) == std::string::npos, "the event carries the ticket's subject: %s. %s is retained and replicated; carry ids and the transition", text, kEventsTopic);
-  ctx.Assert(!payloadOf(ctx, records[0]).contains("subject"), "the event has a subject field: %s", text);
+  for (const std::string& words : {kHEventsSubject, std::string("4471"), std::string("charged")}) {
+    ctx.Assert(text.find(words) == std::string::npos, "the event carries the ticket's subject (%q): %s. %s is retained and replicated; carry ids and the transition", words, text, kHEventsTopic);
+  }
+  ctx.Assert(!hPayloadOf(ctx, records[0]).contains("subject"), "the event has a subject field: %s", text);
 }
 
 void CheckEventFields(harness::Ctx& ctx) {
-  const std::string t = eventsTicket();
-  mustPublish(ctx, t, "open", "pending", "R-1", "requester");
-  const json p = payloadOf(ctx, ctx.Kafka.Records(kEventsTopic)[0]);
+  const std::string t = hEventsTicket();
+  hMustPublish(ctx, t, "open", "pending", "R-1", "requester");
+  const json p = hPayloadOf(ctx, ctx.Kafka.Records(kHEventsTopic)[0]);
   const std::vector<std::pair<std::string, std::string>> expected = {
-      {"type", "ticket.transition"}, {"ticket_id", t}, {"actor_id", "R-1"}, {"actor_role", "requester"}, {"from", "open"}, {"to", "pending"}};
+      {"type", "ticket.transition"}, {"ticket_id", t}, {"requester_id", "R-1"}, {"actor_id", "R-1"}, {"actor_role", "requester"}, {"from", "open"}, {"to", "pending"}};
   for (const auto& [name, value] : expected) {
     ctx.Equal(p.value(name, ""), value, "a consumer renders the timeline entry from the event alone (%s); the event's %s", p.dump(), name);
   }
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
-  const std::string t = eventsTicket();
+  const std::string t = hEventsTicket();
   std::optional<json> stale;
   try {
     stale = publishTransition(t, "pending", "resolved", "A-7", "agent");
@@ -915,22 +962,45 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
     ctx.Fatalf("a refused transition threw %s: %s", harness::CurrentExceptionType(), e.what());
   }
   ctx.Assert(!stale, "%s is open, so a move from pending must not commit and must answer nothing", t);
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Assert(records.empty(), "a transition the store refused produced %d record(s): consumers now believe %s is resolved while it is open. Commit first, produce after", records.size(), t);
   ctx.Equal(store::getTicket(t)->state, "open", "the refused move must leave the ticket; its state");
-  mustPublish(ctx, t, "open", "pending");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "a committed transition must produce one record; the records");
+  hMustPublish(ctx, t, "open", "pending");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "a committed transition must produce one record; the records");
   ctx.Equal(store::getTicket(t)->state, "pending", "the committed state");
+  // Another agent resolves the next ticket the instant this call first touches it.
+  const std::string t2 = hEventsTicket();
+  auto fired = std::make_shared<bool>(false);
+  ctx.Redis.After("ticket:" + t2, [&ctx, fired, t2] {
+    *fired = true;
+    ctx.Redis.Do("HSET", "ticket:" + t2, "state", "resolved");
+  });
+  std::optional<json> event;
+  try {
+    event = publishTransition(t2, "open", "pending", "A-7", "agent");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("publishTransition(%s) threw %s: %s", t2, harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Assert(*fired, "publishTransition never touched ticket:%s", t2);
+  size_t produced = 0;
+  for (const auto& r : ctx.Kafka.Records(kHEventsTopic)) {
+    if (hPayloadOf(ctx, r).value("ticket_id", "") == t2) ++produced;
+  }
+  if (!event) {
+    ctx.Assert(produced == 0, "another agent resolved %s between this call's read and its commit, so the move did not commit, yet it produced %d record(s). Produce only after store::transition moved the ticket", t2, produced);
+  } else {
+    ctx.Equal(produced, 1, "the committed move of %s; its records", t2);
+  }
 }
 
 void CheckDurableProducer(harness::Ctx& ctx) {
-  const std::string t = eventsTicket();
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);
-  mustPublish(ctx, t, "open", "pending");
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "one transition whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records");
-  mustPublish(ctx, t, "pending", "resolved");
-  const int lost = ctx.Kafka.Failover(kEventsTopic);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records", lost);
+  const std::string t = hEventsTicket();
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);
+  hMustPublish(ctx, t, "open", "pending");
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "one transition whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records");
+  hMustPublish(ctx, t, "pending", "resolved");
+  const int lost = ctx.Kafka.Failover(kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records", lost);
 }
 `,
   },

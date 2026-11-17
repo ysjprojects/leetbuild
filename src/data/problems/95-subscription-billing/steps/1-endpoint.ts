@@ -815,12 +815,14 @@ async def check_tenant(ctx):
 
 
 async def check_effective_date(ctx):
-    _, end = _seed()
+    start, end = _seed()
     async with _api(ctx) as c:
-        r = await _change(c, effective=dates.add_days(dates.today(), 3))
-        assert r.status_code == 400, f"effective_date three days from now (neither now nor the period end) answered {r.status_code}, expected 400"
-        r = await _change(c, policy="thirty_day_month")
-        assert r.status_code == 400, f"proration_policy thirty_day_month answered {r.status_code}, expected 400"
+        for effective, what in ((dates.add_days(dates.today(), 3), "three days from now"), (start, "the period start"), (dates.add_days(end, 30), "30 days after the period end")):
+            r = await _change(c, effective=effective)
+            assert r.status_code == 400, f"effective_date {effective}, {what} (neither now nor the period end), answered {r.status_code}, expected 400"
+        for policy in ("thirty_day_month", "none", "create_prorations"):
+            r = await _change(c, policy=policy)
+            assert r.status_code == 400, f"proration_policy {policy} (not in PRORATION_POLICIES) answered {r.status_code}, expected 400"
         r = await _change(c, plan="enterprise")
         assert r.status_code == 400, f"a plan with no price answered {r.status_code}, expected 400"
         assert store.invoices_of("sub_1") == [], f"a rejected change opened an invoice: {store.invoices_of('sub_1')}"
@@ -904,12 +906,16 @@ export async function check_tenant(ctx) {
 
 export async function check_effective_date(ctx) {
   const {dates, store, seed, change} = world(ctx);
-  const {end} = await seed();
-  let r = await change({effective: dates.addDays(dates.today(), 3)});
-  assert.equal(r.status, 400, \`effective_date three days from now (neither now nor the period end) answered \${r.status}, expected 400\`);
-  r = await change({policy: 'thirty_day_month'});
-  assert.equal(r.status, 400, \`proration_policy thirty_day_month answered \${r.status}, expected 400\`);
-  r = await change({plan: 'enterprise'});
+  const {start, end} = await seed();
+  for (const [effective, what] of [[dates.addDays(dates.today(), 3), 'three days from now'], [start, 'the period start'], [dates.addDays(end, 30), '30 days after the period end']]) {
+    const r = await change({effective});
+    assert.equal(r.status, 400, \`effective_date \${effective}, \${what} (neither now nor the period end), answered \${r.status}, expected 400\`);
+  }
+  for (const policy of ['thirty_day_month', 'none', 'create_prorations']) {
+    const r = await change({policy});
+    assert.equal(r.status, 400, \`proration_policy \${policy} (not in PRORATION_POLICIES) answered \${r.status}, expected 400\`);
+  }
+  let r = await change({plan: 'enterprise'});
   assert.equal(r.status, 400, \`a plan with no price answered \${r.status}, expected 400\`);
   assert.deepEqual(await store.invoicesOf('sub_1'), [], 'a rejected change opened an invoice');
   r = await change({effective: end});
@@ -952,89 +958,99 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hBg = context.Background()
 
-type changeAnswer struct {
-	EffectiveAt string \`json:"effective_at"\`
-	Lines       []line \`json:"lines"\`
-	TotalCents  int64  \`json:"total_cents"\`
-	InvoiceID   string \`json:"invoice_id"\`
+type hChangeLine struct {
+	Plan        string \`json:"plan"\`
+	Days        int    \`json:"days"\`
+	AmountCents int64  \`json:"amount_cents"\`
 }
 
-// seed writes a starter-plan subscription whose period started before days ago and ends after days from today.
-func seed(subscriptionID, tenant string, before, after int) (string, string) {
+type hChangeAnswer struct {
+	EffectiveAt string        \`json:"effective_at"\`
+	Lines       []hChangeLine \`json:"lines"\`
+	TotalCents  int64         \`json:"total_cents"\`
+	InvoiceID   string        \`json:"invoice_id"\`
+}
+
+// hSeed writes a starter-plan subscription whose period started before days ago and ends after days from today.
+func hSeed(subscriptionID, tenant string, before, after int) (string, string) {
 	today := dates.Today()
 	start, end := dates.AddDays(today, -before), dates.AddDays(today, after)
-	store.PutSubscription(apiBg, subscriptionID, tenant, "starter", start, end)
+	store.PutSubscription(hBg, subscriptionID, tenant, "starter", start, end)
 	return start, end
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func change(c *harness.HTTP, subscriptionID, plan, effective, policy string, header ...string) *harness.Response {
+func hChange(c *harness.HTTP, subscriptionID, plan, effective, policy string, header ...string) *harness.Response {
 	body := map[string]string{"subscription_id": subscriptionID, "plan": plan, "effective_date": effective, "proration_policy": policy}
 	return c.Post("/v1/subscriptions", body, header...)
 }
 
-func owner(c *harness.HTTP, subscriptionID, plan, effective, policy string) *harness.Response {
-	return change(c, subscriptionID, plan, effective, policy, "X-Tenant-Id", "t-acme")
+func hOwner(c *harness.HTTP, subscriptionID, plan, effective, policy string) *harness.Response {
+	return hChange(c, subscriptionID, plan, effective, policy, "X-Tenant-Id", "t-acme")
 }
 
-func answer(ctx *harness.Ctx, r *harness.Response) changeAnswer {
+func hAnswer(ctx *harness.Ctx, r *harness.Response) hChangeAnswer {
 	ctx.Equal(r.Status, 200, "a plan change from starter to scale (%s)", r.Text())
-	var out changeAnswer
+	var out hChangeAnswer
 	r.Decode(&out)
 	ctx.Assert(len(out.Lines) == 2, "the answer must carry two lines (old plan, new plan), got %s", r.Text())
 	return out
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	seed("sub_1", "t-acme", 16, 15)
-	out := answer(ctx, owner(api(ctx), "sub_1", "scale", "now", "actual_days"))
+	hSeed("sub_1", "t-acme", 16, 15)
+	out := hAnswer(ctx, hOwner(hAPI(ctx), "sub_1", "scale", "now", "actual_days"))
 	ctx.Assert(out.Lines[0].Plan == "starter" && out.Lines[1].Plan == "scale", "the lines are %+v, expected the starter line then the scale line", out.Lines)
 	ctx.Equal(out.TotalCents, out.Lines[0].AmountCents+out.Lines[1].AmountCents, "total_cents must be the sum of the lines; total_cents")
-	invoice := store.FindInvoice(apiBg, out.InvoiceID)
+	invoice := store.FindInvoice(hBg, out.InvoiceID)
 	ctx.Assert(invoice != nil && invoice.AmountCents == out.TotalCents, "the change must open the period's invoice for the total, the store holds %+v", invoice)
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	seed("sub_1", "t-acme", 16, 15)
-	seed("sub_2", "t-other", 16, 15)
-	c := api(ctx)
-	anonymous := change(c, "sub_1", "scale", "now", "actual_days")
+	hSeed("sub_1", "t-acme", 16, 15)
+	hSeed("sub_2", "t-other", 16, 15)
+	c := hAPI(ctx)
+	anonymous := hChange(c, "sub_1", "scale", "now", "actual_days")
 	ctx.Equal(anonymous.Status, 401, "a plan change without X-Tenant-Id")
-	foreign := owner(c, "sub_2", "scale", "now", "actual_days")
+	foreign := hOwner(c, "sub_2", "scale", "now", "actual_days")
 	ctx.Equal(foreign.Status, 404, "t-acme changing t-other's subscription")
-	ctx.Equal(len(store.InvoicesOf(apiBg, "sub_2")), 0, "a foreign tenant's change must open no invoice on sub_2; invoices")
-	own := owner(c, "sub_1", "scale", "now", "actual_days")
+	ctx.Equal(len(store.InvoicesOf(hBg, "sub_2")), 0, "a foreign tenant's change must open no invoice on sub_2; invoices")
+	own := hOwner(c, "sub_1", "scale", "now", "actual_days")
 	ctx.Equal(own.Status, 200, "the owner's change (%s)", own.Text())
 }
 
 func CheckEffectiveDate(ctx *harness.Ctx) {
-	_, end := seed("sub_1", "t-acme", 16, 15)
-	c := api(ctx)
-	r := owner(c, "sub_1", "scale", dates.AddDays(dates.Today(), 3), "actual_days")
-	ctx.Equal(r.Status, 400, "effective_date three days from now (neither now nor the period end)")
-	r = owner(c, "sub_1", "scale", "now", "thirty_day_month")
-	ctx.Equal(r.Status, 400, "proration_policy thirty_day_month")
-	r = owner(c, "sub_1", "enterprise", "now", "actual_days")
+	start, end := hSeed("sub_1", "t-acme", 16, 15)
+	c := hAPI(ctx)
+	for _, bad := range [][2]string{{dates.AddDays(dates.Today(), 3), "three days from now"}, {start, "the period start"}, {dates.AddDays(end, 30), "30 days after the period end"}} {
+		r := hOwner(c, "sub_1", "scale", bad[0], "actual_days")
+		ctx.Equal(r.Status, 400, "effective_date %s, %s (neither now nor the period end)", bad[0], bad[1])
+	}
+	for _, policy := range []string{"thirty_day_month", "none", "create_prorations"} {
+		r := hOwner(c, "sub_1", "scale", "now", policy)
+		ctx.Equal(r.Status, 400, "proration_policy %s (not in PRORATION_POLICIES)", policy)
+	}
+	r := hOwner(c, "sub_1", "enterprise", "now", "actual_days")
 	ctx.Equal(r.Status, 400, "a plan with no price")
-	ctx.Equal(len(store.InvoicesOf(apiBg, "sub_1")), 0, "a rejected change must open no invoice; invoices")
-	out := answer(ctx, owner(c, "sub_1", "scale", end, "actual_days"))
+	ctx.Equal(len(store.InvoicesOf(hBg, "sub_1")), 0, "a rejected change must open no invoice; invoices")
+	out := hAnswer(ctx, hOwner(c, "sub_1", "scale", end, "actual_days"))
 	ctx.Equal(out.EffectiveAt, end, "a change at the period end; effective_at")
 }
 
 func CheckActualDays(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	for i, span := range [][2]int{{16, 15}, {10, 18}} {
 		subscriptionID := fmt.Sprintf("sub_%d", i+1)
-		seed(subscriptionID, "t-acme", span[0], span[1])
+		hSeed(subscriptionID, "t-acme", span[0], span[1])
 		period := span[0] + span[1]
-		out := answer(ctx, owner(c, subscriptionID, "scale", "now", "actual_days"))
+		out := hAnswer(ctx, hOwner(c, subscriptionID, "scale", "now", "actual_days"))
 		for j, price := range []float64{1900, 9900} {
 			l := out.Lines[j]
 			expected := int64(math.Round(price * float64(l.Days) / float64(period)))
@@ -1044,8 +1060,8 @@ func CheckActualDays(ctx *harness.Ctx) {
 }
 
 func CheckExclusiveDay(ctx *harness.Ctx) {
-	start, end := seed("sub_1", "t-acme", 16, 15)
-	out := answer(ctx, owner(api(ctx), "sub_1", "scale", "now", "actual_days"))
+	start, end := hSeed("sub_1", "t-acme", 16, 15)
+	out := hAnswer(ctx, hOwner(hAPI(ctx), "sub_1", "scale", "now", "actual_days"))
 	ctx.Assert(out.Lines[0].Days == 16, "the starter line covers %d days of [%s, today): 16 days. The switch day belongs to the new plan", out.Lines[0].Days, start)
 	ctx.Assert(out.Lines[1].Days == 15, "the scale line covers %d days of [today, %s), expected 15", out.Lines[1].Days, end)
 	ctx.Equal(out.Lines[0].Days+out.Lines[1].Days, 31, "the lines' days in a 31-day period")
@@ -1065,7 +1081,7 @@ func CheckExclusiveDay(ctx *harness.Ctx) {
 namespace {
 
 // A starter-plan subscription whose period started before days ago and ends after days from today.
-std::pair<std::string, std::string> seed(const std::string& subscription_id, const std::string& tenant, long before, long after) {
+std::pair<std::string, std::string> hSeed(const std::string& subscription_id, const std::string& tenant, long before, long after) {
   const std::string today = dates::today();
   const std::string start = dates::addDays(today, -before);
   const std::string stop = dates::addDays(today, after);
@@ -1073,7 +1089,7 @@ std::pair<std::string, std::string> seed(const std::string& subscription_id, con
   return {start, stop};
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1081,16 +1097,16 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string changeBody(const std::string& subscription_id, const std::string& plan, const std::string& effective, const std::string& policy) {
+std::string hChangeBody(const std::string& subscription_id, const std::string& plan, const std::string& effective, const std::string& policy) {
   return nlohmann::json{{"subscription_id", subscription_id}, {"plan", plan}, {"effective_date", effective}, {"proration_policy", policy}}.dump();
 }
 
-harness::Response owner(harness::HTTP& c, const std::string& subscription_id, const std::string& plan, const std::string& effective,
+harness::Response hOwner(harness::HTTP& c, const std::string& subscription_id, const std::string& plan, const std::string& effective,
                         const std::string& policy) {
-  return c.Post("/v1/subscriptions", changeBody(subscription_id, plan, effective, policy), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
+  return c.Post("/v1/subscriptions", hChangeBody(subscription_id, plan, effective, policy), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
 }
 
-nlohmann::json answer(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hAnswer(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "a plan change from starter to scale (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.contains("lines") && body["lines"].is_array() && body["lines"].size() == 2,
@@ -1101,9 +1117,9 @@ nlohmann::json answer(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  seed("sub_1", "t-acme", 16, 15);
-  auto c = api(ctx);
-  const auto body = answer(ctx, owner(c, "sub_1", "scale", "now", "actual_days"));
+  hSeed("sub_1", "t-acme", 16, 15);
+  auto c = hAPI(ctx);
+  const auto body = hAnswer(ctx, hOwner(c, "sub_1", "scale", "now", "actual_days"));
   const auto& lines = body["lines"];
   ctx.Assert(lines[0].value("plan", "") == "starter" && lines[1].value("plan", "") == "scale", "the lines are %s, expected the starter line then the scale line", lines.dump());
   ctx.Equal(body.value("total_cents", 0LL), lines[0].value("amount_cents", 0LL) + lines[1].value("amount_cents", 0LL), "total_cents must be the sum of the lines; total_cents");
@@ -1112,40 +1128,46 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  seed("sub_1", "t-acme", 16, 15);
-  seed("sub_2", "t-other", 16, 15);
-  auto c = api(ctx);
-  const auto anonymous = c.Post("/v1/subscriptions", changeBody("sub_1", "scale", "now", "actual_days"), "Content-Type", "application/json");
+  hSeed("sub_1", "t-acme", 16, 15);
+  hSeed("sub_2", "t-other", 16, 15);
+  auto c = hAPI(ctx);
+  const auto anonymous = c.Post("/v1/subscriptions", hChangeBody("sub_1", "scale", "now", "actual_days"), "Content-Type", "application/json");
   ctx.Equal(anonymous.Status, 401, "a plan change without X-Tenant-Id");
-  const auto foreign = owner(c, "sub_2", "scale", "now", "actual_days");
+  const auto foreign = hOwner(c, "sub_2", "scale", "now", "actual_days");
   ctx.Equal(foreign.Status, 404, "t-acme changing t-other's subscription");
   ctx.Equal(store::invoicesOf("sub_2").size(), 0, "a foreign tenant's change must open no invoice on sub_2; invoices");
-  const auto own = owner(c, "sub_1", "scale", "now", "actual_days");
+  const auto own = hOwner(c, "sub_1", "scale", "now", "actual_days");
   ctx.Equal(own.Status, 200, "the owner's change (%s)", own.Text());
 }
 
 void CheckEffectiveDate(harness::Ctx& ctx) {
-  const auto period = seed("sub_1", "t-acme", 16, 15);
-  auto c = api(ctx);
-  auto r = owner(c, "sub_1", "scale", dates::addDays(dates::today(), 3), "actual_days");
-  ctx.Equal(r.Status, 400, "effective_date three days from now (neither now nor the period end)");
-  r = owner(c, "sub_1", "scale", "now", "thirty_day_month");
-  ctx.Equal(r.Status, 400, "proration_policy thirty_day_month");
-  r = owner(c, "sub_1", "enterprise", "now", "actual_days");
+  const auto period = hSeed("sub_1", "t-acme", 16, 15);
+  auto c = hAPI(ctx);
+  const std::pair<std::string, std::string> bad_dates[] = {
+      {dates::addDays(dates::today(), 3), "three days from now"}, {period.first, "the period start"}, {dates::addDays(period.second, 30), "30 days after the period end"}};
+  for (const auto& bad : bad_dates) {
+    const auto r = hOwner(c, "sub_1", "scale", bad.first, "actual_days");
+    ctx.Equal(r.Status, 400, "effective_date %s, %s (neither now nor the period end)", bad.first, bad.second);
+  }
+  for (const std::string policy : {"thirty_day_month", "none", "create_prorations"}) {
+    const auto r = hOwner(c, "sub_1", "scale", "now", policy);
+    ctx.Equal(r.Status, 400, "proration_policy %s (not in PRORATION_POLICIES)", policy);
+  }
+  auto r = hOwner(c, "sub_1", "enterprise", "now", "actual_days");
   ctx.Equal(r.Status, 400, "a plan with no price");
   ctx.Equal(store::invoicesOf("sub_1").size(), 0, "a rejected change must open no invoice; invoices");
-  const auto body = answer(ctx, owner(c, "sub_1", "scale", period.second, "actual_days"));
+  const auto body = hAnswer(ctx, hOwner(c, "sub_1", "scale", period.second, "actual_days"));
   ctx.Equal(body.value("effective_at", ""), period.second, "a change at the period end; effective_at");
 }
 
 void CheckActualDays(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   const long spans[2][2] = {{16, 15}, {10, 18}};
   for (int i = 0; i < 2; i++) {
     const std::string subscription_id = "sub_" + std::to_string(i + 1);
-    seed(subscription_id, "t-acme", spans[i][0], spans[i][1]);
+    hSeed(subscription_id, "t-acme", spans[i][0], spans[i][1]);
     const long period = spans[i][0] + spans[i][1];
-    const auto body = answer(ctx, owner(c, subscription_id, "scale", "now", "actual_days"));
+    const auto body = hAnswer(ctx, hOwner(c, subscription_id, "scale", "now", "actual_days"));
     const double prices[2] = {1900, 9900};
     for (int j = 0; j < 2; j++) {
       const auto& l = body["lines"][j];
@@ -1159,9 +1181,9 @@ void CheckActualDays(harness::Ctx& ctx) {
 }
 
 void CheckExclusiveDay(harness::Ctx& ctx) {
-  const auto period = seed("sub_1", "t-acme", 16, 15);
-  auto c = api(ctx);
-  const auto body = answer(ctx, owner(c, "sub_1", "scale", "now", "actual_days"));
+  const auto period = hSeed("sub_1", "t-acme", 16, 15);
+  auto c = hAPI(ctx);
+  const auto body = hAnswer(ctx, hOwner(c, "sub_1", "scale", "now", "actual_days"));
   const long old_days = body["lines"][0].value("days", 0L);
   const long new_days = body["lines"][1].value("days", 0L);
   ctx.Assert(old_days == 16, "the starter line covers %d days of [%s, today): 16 days. The switch day belongs to the new plan", old_days, period.first);

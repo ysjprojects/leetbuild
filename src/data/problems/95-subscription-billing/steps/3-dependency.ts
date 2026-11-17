@@ -26,10 +26,10 @@ service Processor {
 }
 \`\`\`
 
-- Every call carries a **\`DEADLINE_S\` = 5 s** deadline.
+- Every call, each retry included, carries its own **\`DEADLINE_S\` = 5 s** deadline.
 - The idempotency key is the **invoice id**, the same on every attempt.
 - \`DEADLINE_EXCEEDED\` leaves the outcome unknown: \`lookup_invoice\` first, and adopt the reference
-  when the processor holds a charge; retry only when it holds none. \`UNAVAILABLE\` is retried.
+  when the processor holds a charge; retry when it holds none. \`UNAVAILABLE\` is retried.
 - A \`declined\` result is final after one call: \`{state: "failed", reason: decline_code}\`.`,
   sequence: {
     participants: ['Billing run', 'Payment processor'],
@@ -61,7 +61,7 @@ service Processor {
       id: 'deadline',
       title: 'Every processor call carries a 5-second deadline',
       detail:
-        '`Charge` and `GetInvoice` are sent with `DEADLINE_S` (5 s), so a processor that stops answering costs the run seconds, not the night. The starter sets no deadline.',
+        '`Charge` and `GetInvoice` are sent with `DEADLINE_S` (5 s), and every retry gets a full 5 s of its own, so a processor that stops answering costs the run seconds, not the night. The starter sets no deadline.',
       match: {
         python: {
           all: [
@@ -99,7 +99,7 @@ service Processor {
       id: 'reconcile-before-retry',
       title: 'Asks GetInvoice before retrying a deadline',
       detail:
-        'After `DEADLINE_EXCEEDED` the client calls `lookup_invoice`/`lookupInvoice` and adopts the reference of a charge that landed; only an invoice the processor does not hold is charged again. The starter retries at once.',
+        'After `DEADLINE_EXCEEDED` the client calls `lookup_invoice`/`lookupInvoice` and adopts the reference of a charge that landed, with no second `Charge`; an invoice the processor does not hold is charged again. The starter retries at once.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/], order: [/processor\.Charge\(/, /lookup_invoice\(\s*invoice\[/]},
         typescript: {all: [/DEADLINE_EXCEEDED/], order: [/processor\.Charge\(/, /lookupInvoice\(\s*invoice\./]},
@@ -695,6 +695,9 @@ def check_deadline(ctx):
     waited = ctx.clock.time() - before
     assert outcome["state"] == "failed", f"against a processor that never answers charge_invoice answered {outcome}"
     assert waited <= 40, f"charge_invoice waited {waited:.0f} s on a processor that never answers"
+    timeouts = [call.timeout for call in ctx.grpc.calls_to("Charge") if call.request.invoice_id == "in_2"]
+    assert len(timeouts) >= 2, f"a deadline the processor holds no charge for must be retried, charge_invoice sent {len(timeouts)} Charge call(s)"
+    assert all(t is not None and 4.5 <= t <= 5.5 for t in timeouts), f"the attempts against a silent processor carried the deadlines {timeouts} s: every attempt gets its own DEADLINE_S = 5, not what is left of the first one's"
 
 
 def check_invoice_key(ctx):
@@ -714,6 +717,15 @@ def check_reconcile_before_retry(ctx):
     assert processor.charges == 1, f"the charge landed and only its reply was lost, yet the processor made {processor.charges} charges for in_1: ask GetInvoice before charging again"
     assert outcome["state"] == "charged" and outcome["reference"] == "ch_1", f"charge_invoice answered {outcome}, expected the reference of the charge that landed, ch_1"
     assert ctx.grpc.calls_to("GetInvoice"), "a DEADLINE_EXCEEDED must be followed by GetInvoice for the invoice"
+    sent = len(ctx.grpc.calls_to("Charge"))
+    assert sent == 1, f"GetInvoice reported the charge that landed, yet charge_invoice sent {sent} Charge calls: adopt its reference instead of charging again"
+    # A deadline the request never survived: the processor holds nothing, so the client charges again.
+    ctx.grpc.fail("Charge", grpc.StatusCode.DEADLINE_EXCEEDED, "the request never reached the processor", times=1)
+    outcome = m.charge_invoice({**INVOICE, "invoice_id": "in_2"})
+    sent = len([c for c in ctx.grpc.calls_to("Charge") if c.request.invoice_id == "in_2"])
+    asked = [c for c in ctx.grpc.calls_to("GetInvoice") if c.request.invoice_id == "in_2"]
+    assert asked, "a DEADLINE_EXCEEDED for in_2 must be followed by GetInvoice for in_2"
+    assert sent == 2 and outcome["state"] == "charged" and outcome["reference"] == "ch_2", f"the processor holds nothing for in_2 after a deadline; charge_invoice sent {sent} Charge call(s) and answered {outcome}, expected one retry charged as ch_2"
 
 
 def check_decline_terminal(ctx):
@@ -777,6 +789,9 @@ export async function check_deadline(ctx) {
   const waited = (ctx.clock.now() - before) / 1000;
   assert.equal(outcome.state, 'failed', \`against a processor that never answers chargeInvoice answered \${JSON.stringify(outcome)}\`);
   assert(waited <= 40, \`chargeInvoice waited \${waited.toFixed(0)} s on a processor that never answers\`);
+  const timeouts = ctx.grpc.callsTo('Charge').filter(c => c.request.invoice_id === 'in_2').map(c => c.timeout);
+  assert(timeouts.length >= 2, \`a deadline the processor holds no charge for must be retried, chargeInvoice sent \${timeouts.length} Charge call(s)\`);
+  assert(timeouts.every(t => t !== null && 4.5 <= t && t <= 5.5), \`the attempts against a silent processor carried the deadlines \${JSON.stringify(timeouts)} s: every attempt gets its own DEADLINE_MS = 5000, not what is left of the first one's\`);
 }
 
 export async function check_invoice_key(ctx) {
@@ -796,6 +811,14 @@ export async function check_reconcile_before_retry(ctx) {
   assert.equal(p.charges, 1, \`the charge landed and only its reply was lost, yet the processor made \${p.charges} charges for in_1: ask GetInvoice before charging again\`);
   assert(outcome.state === 'charged' && outcome.reference === 'ch_1', \`chargeInvoice answered \${JSON.stringify(outcome)}, expected the reference of the charge that landed, ch_1\`);
   assert(ctx.grpc.callsTo('GetInvoice').length > 0, 'a DEADLINE_EXCEEDED must be followed by GetInvoice for the invoice');
+  let sent = ctx.grpc.callsTo('Charge').length;
+  assert.equal(sent, 1, \`GetInvoice reported the charge that landed, yet chargeInvoice sent \${sent} Charge calls: adopt its reference instead of charging again\`);
+  // A deadline the request never survived: the processor holds nothing, so the client charges again.
+  ctx.grpc.fail('Charge', ctx.grpc.status.DEADLINE_EXCEEDED, 'the request never reached the processor', 1);
+  const retried = await m.chargeInvoice({...INVOICE, invoice_id: 'in_2'});
+  sent = ctx.grpc.callsTo('Charge').filter(c => c.request.invoice_id === 'in_2').length;
+  assert(ctx.grpc.callsTo('GetInvoice').some(c => c.request.invoice_id === 'in_2'), 'a DEADLINE_EXCEEDED for in_2 must be followed by GetInvoice for in_2');
+  assert(sent === 2 && retried.state === 'charged' && retried.reference === 'ch_2', \`the processor holds nothing for in_2 after a deadline; chargeInvoice sent \${sent} Charge call(s) and answered \${JSON.stringify(retried)}, expected one retry charged as ch_2\`);
 }
 
 export async function check_decline_terminal(ctx) {
@@ -828,7 +851,7 @@ var (
 	invoiceIn = store.Invoice{InvoiceID: "in_1", SubscriptionID: "sub_1", Tenant: "t-acme", PeriodStart: "2026-03-01", PeriodEnd: "2026-04-01", AmountCents: 9900, State: "open"}
 )
 
-type landed struct {
+type clientLanded struct {
 	reference string
 	total     int64
 }
@@ -837,7 +860,7 @@ type landed struct {
 // declines lists invoices the issuer refuses; loseReplies is how many next charges land but lose their reply.
 type clientPeer struct {
 	pb.UnimplementedProcessorServer
-	charged     map[string]landed
+	charged     map[string]clientLanded
 	keys        map[string]string
 	charges     int
 	declines    map[string]bool
@@ -851,7 +874,7 @@ func (p *clientPeer) Charge(_ context.Context, req *pb.ChargeRequest) (*pb.Charg
 	if _, seen := p.keys[req.GetIdempotencyKey()]; !seen {
 		p.charges++
 		p.keys[req.GetIdempotencyKey()] = fmt.Sprintf("ch_%d", p.charges)
-		p.charged[req.GetInvoiceId()] = landed{p.keys[req.GetIdempotencyKey()], p.charged[req.GetInvoiceId()].total + req.GetAmountCents()}
+		p.charged[req.GetInvoiceId()] = clientLanded{p.keys[req.GetIdempotencyKey()], p.charged[req.GetInvoiceId()].total + req.GetAmountCents()}
 	}
 	if p.loseReplies > 0 {
 		p.loseReplies--
@@ -869,7 +892,7 @@ func (p *clientPeer) GetInvoice(_ context.Context, req *pb.GetInvoiceRequest) (*
 }
 
 func clientWorld(ctx *harness.Ctx) *clientPeer {
-	p := &clientPeer{charged: map[string]landed{}, keys: map[string]string{}, declines: map[string]bool{}}
+	p := &clientPeer{charged: map[string]clientLanded{}, keys: map[string]string{}, declines: map[string]bool{}}
 	pb.RegisterProcessorServer(ctx.GRPC.Server(""), p)
 	return p
 }
@@ -894,6 +917,17 @@ func CheckDeadline(ctx *harness.Ctx) {
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Equal(outcome.State, "failed", "against a processor that never answers, chargeInvoice's state")
 	ctx.Assert(waited <= 40, "chargeInvoice waited %.0f s on a processor that never answers", waited)
+	var timeouts []time.Duration
+	for _, call := range ctx.GRPC.CallsTo("Charge", "") {
+		if call.Request.(*pb.ChargeRequest).GetInvoiceId() == "in_2" {
+			ctx.Assert(call.HasDeadline(), "an attempt against a silent processor carries no deadline")
+			timeouts = append(timeouts, call.Timeout)
+		}
+	}
+	ctx.Assert(len(timeouts) >= 2, "a deadline the processor holds no charge for must be retried, chargeInvoice sent %d Charge call(s)", len(timeouts))
+	for _, t := range timeouts {
+		ctx.Assert(4500*time.Millisecond <= t && t <= 5500*time.Millisecond, "the attempts against a silent processor carried the deadlines %v: every attempt gets its own 5 s deadline, not what is left of the first one's", timeouts)
+	}
 }
 
 func CheckInvoiceKey(ctx *harness.Ctx) {
@@ -918,6 +952,25 @@ func CheckReconcileBeforeRetry(ctx *harness.Ctx) {
 	ctx.Assert(p.charges == 1, "the charge landed and only its reply was lost, yet the processor made %d charges for in_1: ask GetInvoice before charging again", p.charges)
 	ctx.Assert(outcome.State == "charged" && outcome.Reference == "ch_1", "chargeInvoice answered %+v, expected the reference of the charge that landed, ch_1", outcome)
 	ctx.Assert(len(ctx.GRPC.CallsTo("GetInvoice", "")) > 0, "a DEADLINE_EXCEEDED must be followed by GetInvoice for the invoice")
+	sent := len(ctx.GRPC.CallsTo("Charge", ""))
+	ctx.Equal(sent, 1, "GetInvoice reported the charge that landed: adopt its reference instead of charging again; Charge calls")
+	// A deadline the request never survived: the processor holds nothing, so the client charges again.
+	ctx.GRPC.Fail("Charge", codes.DeadlineExceeded, "the request never reached the processor", 1, "")
+	other := invoiceIn
+	other.InvoiceID = "in_2"
+	retried := chargeInvoice(clientBg, &other)
+	sent = 0
+	for _, c := range ctx.GRPC.CallsTo("Charge", "") {
+		if c.Request.(*pb.ChargeRequest).GetInvoiceId() == "in_2" {
+			sent++
+		}
+	}
+	asked := false
+	for _, c := range ctx.GRPC.CallsTo("GetInvoice", "") {
+		asked = asked || c.Request.(*pb.GetInvoiceRequest).GetInvoiceId() == "in_2"
+	}
+	ctx.Assert(asked, "a DEADLINE_EXCEEDED for in_2 must be followed by GetInvoice for in_2")
+	ctx.Assert(sent == 2 && retried.State == "charged" && retried.Reference == "ch_2", "the processor holds nothing for in_2 after a deadline; chargeInvoice sent %d Charge call(s) and answered %+v, expected one retry charged as ch_2", sent, retried)
 }
 
 func CheckDeclineTerminal(ctx *harness.Ctx) {
@@ -941,7 +994,7 @@ func CheckDeclineTerminal(ctx *harness.Ctx) {
 
 namespace {
 
-const store::Invoice kInvoice{"in_1", "sub_1", "t-acme", "2026-03-01", "2026-04-01", 9900, "open", "", ""};
+const store::Invoice kClientInvoice{"in_1", "sub_1", "t-acme", "2026-03-01", "2026-04-01", 9900, "open", "", ""};
 
 struct Landed {
   std::string reference;
@@ -989,7 +1042,7 @@ class ProcessorPeer final : public subbilling::Processor::Service {
   }
 };
 
-ProcessorPeer& world(harness::Ctx& ctx) {
+ProcessorPeer& hClientWorld(harness::Ctx& ctx) {
   static ProcessorPeer* peer = nullptr;
   delete peer;
   peer = new ProcessorPeer;
@@ -997,13 +1050,13 @@ ProcessorPeer& world(harness::Ctx& ctx) {
   return *peer;
 }
 
-std::string show(const store::Outcome& o) { return "{" + o.state + ", " + o.reference + ", " + o.reason + "}"; }
+std::string hShow(const store::Outcome& o) { return "{" + o.state + ", " + o.reference + ", " + o.reason + "}"; }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  world(ctx);
-  store::Outcome outcome = chargeInvoice(kInvoice);
+  hClientWorld(ctx);
+  store::Outcome outcome = chargeInvoice(kClientInvoice);
   ctx.Equal(outcome.state, "charged", "with a healthy processor, chargeInvoice's state");
   ctx.Assert(lookupInvoice("in_1").has_value(), "lookupInvoice found nothing for the invoice the processor just charged");
   for (const std::string method : {"Charge", "GetInvoice"}) {
@@ -1014,18 +1067,29 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Charge", 120.0);
   const int64_t before = ctx.Clock.Now();
-  store::Invoice other = kInvoice;
+  store::Invoice other = kClientInvoice;
   other.invoice_id = "in_2";
   outcome = chargeInvoice(other);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Equal(outcome.state, "failed", "against a processor that never answers, chargeInvoice's state");
   ctx.Assert(waited <= 40, "chargeInvoice waited %.0f s on a processor that never answers", waited);
+  size_t attempts = 0;
+  bool own_deadline = true;
+  std::string deadlines;
+  for (const auto& call : ctx.GRPC.CallsTo("Charge")) {
+    if (call.Request<subbilling::ChargeRequest>().invoice_id() != "in_2") continue;
+    attempts++;
+    own_deadline = own_deadline && call.HasDeadline() && 4.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 5.5;
+    deadlines += (deadlines.empty() ? "" : ", ") + std::to_string(call.TimeoutSeconds());
+  }
+  ctx.Assert(attempts >= 2, "a deadline the processor holds no charge for must be retried, chargeInvoice sent %d Charge call(s)", attempts);
+  ctx.Assert(own_deadline, "the attempts against a silent processor carried the deadlines [%s] s: every attempt gets its own kDeadline = 5 s, not what is left of the first one's", deadlines);
 }
 
 void CheckInvoiceKey(harness::Ctx& ctx) {
-  world(ctx);
+  hClientWorld(ctx);
   ctx.GRPC.Fail("Charge", grpc::StatusCode::UNAVAILABLE, "connection reset", 1);
-  const store::Outcome outcome = chargeInvoice(kInvoice);
+  const store::Outcome outcome = chargeInvoice(kClientInvoice);
   ctx.Equal(outcome.state, "charged", "a charge retried after UNAVAILABLE; the state");
   std::vector<std::string> keys;
   for (const auto& c : ctx.GRPC.CallsTo("Charge")) keys.push_back(c.Request<subbilling::ChargeRequest>().idempotency_key());
@@ -1034,21 +1098,34 @@ void CheckInvoiceKey(harness::Ctx& ctx) {
 }
 
 void CheckReconcileBeforeRetry(harness::Ctx& ctx) {
-  ProcessorPeer& peer = world(ctx);
+  ProcessorPeer& peer = hClientWorld(ctx);
   peer.lose_replies = 1;
-  const store::Outcome outcome = chargeInvoice(kInvoice);
+  const store::Outcome outcome = chargeInvoice(kClientInvoice);
   ctx.Assert(peer.charges == 1, "the charge landed and only its reply was lost, yet the processor made %d charges for in_1: ask GetInvoice before charging again", peer.charges);
-  ctx.Assert(outcome.state == "charged" && outcome.reference == "ch_1", "chargeInvoice answered %s, expected the reference of the charge that landed, ch_1", show(outcome));
+  ctx.Assert(outcome.state == "charged" && outcome.reference == "ch_1", "chargeInvoice answered %s, expected the reference of the charge that landed, ch_1", hShow(outcome));
   ctx.Assert(!ctx.GRPC.CallsTo("GetInvoice").empty(), "a DEADLINE_EXCEEDED must be followed by GetInvoice for the invoice");
+  ctx.Equal(ctx.GRPC.CallsTo("Charge").size(), 1, "GetInvoice reported the charge that landed: adopt its reference instead of charging again; Charge calls");
+  // A deadline the request never survived: the processor holds nothing, so the client charges again.
+  ctx.GRPC.Fail("Charge", grpc::StatusCode::DEADLINE_EXCEEDED, "the request never reached the processor", 1);
+  store::Invoice other = kClientInvoice;
+  other.invoice_id = "in_2";
+  const store::Outcome retried = chargeInvoice(other);
+  size_t sent = 0;
+  for (const auto& c : ctx.GRPC.CallsTo("Charge")) sent += c.Request<subbilling::ChargeRequest>().invoice_id() == "in_2";
+  bool asked = false;
+  for (const auto& c : ctx.GRPC.CallsTo("GetInvoice")) asked = asked || c.Request<subbilling::GetInvoiceRequest>().invoice_id() == "in_2";
+  ctx.Assert(asked, "a DEADLINE_EXCEEDED for in_2 must be followed by GetInvoice for in_2");
+  ctx.Assert(sent == 2 && retried.state == "charged" && retried.reference == "ch_2",
+             "the processor holds nothing for in_2 after a deadline; chargeInvoice sent %d Charge call(s) and answered %s, expected one retry charged as ch_2", sent, hShow(retried));
 }
 
 void CheckDeclineTerminal(harness::Ctx& ctx) {
-  ProcessorPeer& peer = world(ctx);
+  ProcessorPeer& peer = hClientWorld(ctx);
   peer.declines.insert("in_1");
-  const store::Outcome outcome = chargeInvoice(kInvoice);
+  const store::Outcome outcome = chargeInvoice(kClientInvoice);
   ctx.Equal(ctx.GRPC.CallsTo("Charge").size(), 1, "a decline is final; Charge calls for a declined card");
   ctx.Assert(outcome.state == "failed" && outcome.reference.empty() && outcome.reason == "card_declined",
-             "a decline answered %s, expected state failed with the decline code card_declined as the reason", show(outcome));
+             "a decline answered %s, expected state failed with the decline code card_declined as the reason", hShow(outcome));
 }
 `,
   },

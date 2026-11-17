@@ -52,7 +52,7 @@ counts do not add up.
       id: 'route',
       title: 'Serves the tenant’s own load report',
       detail:
-        'Register `GET /v1/loads/{id}`: 401 without `X-Tenant-Id`, 404 for another tenant’s load, 200 with the load’s report.',
+        'Register `GET /v1/loads/{id}`: 401 without `X-Tenant-Id`, 404 for a missing load and for another tenant’s alike, 200 with the load’s report.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/loads\/\{load_id\}["']/, /store\.get_load\(/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/loads\/:loadId['"]/, /getLoad\(/]},
@@ -78,7 +78,7 @@ counts do not add up.
       id: 'rejections',
       title: 'Surfaces rejected rows with their reasons',
       detail:
-        'The report carries `rows_rejected` (the sum) and `rejections` (`partition_id`, `reason`, `rows` per batch) from `store.rejections`; the starter never reads them.',
+        'The report carries `rows_rejected` (the sum, 0 for a clean load) and `rejections` (`partition_id`, `reason`, `rows` per batch) from `store.rejections`; the starter never reads them.',
       match: {
         python: {all: [/store\.rejections\(/, /rows_rejected/]},
         typescript: {all: [/\brejections\(/, /rows_rejected/]},
@@ -91,7 +91,7 @@ counts do not add up.
       id: 'freshness-scoped',
       title: 'Scopes freshness to the target table',
       detail:
-        '`freshness` is the table’s newest commit (`table_freshness(target)`); the starter reads the shared source dataset’s, where another tenant’s newer load makes a lagging table look fresh.',
+        '`freshness` is the table’s newest commit (`table_freshness(target)`), null when the table has none, never the source’s; the starter reads the shared source dataset’s, where another tenant’s newer load makes a lagging table look fresh.',
       match: {
         python: {all: [/table_freshness\(/], none: [/source_freshness\(/]},
         typescript: {all: [/tableFreshness\(/], none: [/sourceFreshness\(/]},
@@ -104,7 +104,7 @@ counts do not add up.
       id: 'delta-flag',
       title: 'Flags counts that do not reconcile',
       detail:
-        '`delta` = `rows_read - rows_written - rows_rejected` and `flagged` is true whenever it is not 0; the starter reports neither, so a missing slice of a load reaches the books unnoticed.',
+        '`delta` = `rows_read - rows_written - rows_rejected` and `flagged` is true whenever it is not 0, a negative delta or one of a single row included; the starter reports neither, so a missing slice of a load reaches the books unnoticed.',
       match: {
         python: {all: [/["']delta["']/, /["']flagged["']/]},
         typescript: {all: [/\bdelta\b/, /\bflagged\b/]},
@@ -620,10 +620,12 @@ async def check_route(ctx):
     async with client as c:
         r = await _report(c)
         theirs = await _report(c, tenant="globex")
+        missing = await c.get("/v1/loads/ld-404", headers={"X-Tenant-Id": "acme"})
         anonymous = await _report(c, tenant=None)
     body = r.json()
     assert body.get("load_id") == "ld-1" and body.get("rows_read") == 1000 and body.get("target") == "wh_acme.orders", f"the report must carry load_id, target and rows_read, got {body}"
     assert theirs.status_code == 404, f"tenant globex reading acme's load answered {theirs.status_code}, expected 404"
+    assert missing.status_code == 404, f"a load that does not exist answered {missing.status_code}, expected 404"
     assert anonymous.status_code == 401, f"a report without X-Tenant-Id answered {anonymous.status_code}, expected 401"
 
 
@@ -644,11 +646,15 @@ async def check_rejections(ctx):
     warehouse.held[("wh_acme.orders", "ld-1")] = 960
     _reject(ctx, "ld-1", "p-1", "amount is not a decimal", 30)
     _reject(ctx, "ld-1", "p-3", "id is null", 10)
+    _seed(ctx, "ld-2", planned=500, read=500)
+    warehouse.held[("wh_acme.orders", "ld-2")] = 500
     async with client as c:
         body = (await _report(c)).json()
+        clean = (await _report(c, "ld-2")).json()
     assert body.get("rows_rejected") == 40, f"two rejected batches of 30 and 10 rows, and the report says rows_rejected={body.get('rows_rejected')}"
     want = [{"partition_id": "p-1", "reason": "amount is not a decimal", "rows": 30}, {"partition_id": "p-3", "reason": "id is null", "rows": 10}]
     assert body.get("rejections") == want, f"the report must list each rejection with partition_id, reason and rows, got {body.get('rejections')}"
+    assert clean.get("rows_rejected") == 0 and not clean.get("rejections"), f"a load with no rejected rows must report rows_rejected 0 and no rejection, got {clean}"
 
 
 async def check_freshness_scoped(ctx):
@@ -661,8 +667,11 @@ async def check_freshness_scoped(ctx):
     ctx.redis.hset("freshness:wh_globex.orders", mapping={"committed_at": 200, "load_id": "ld-9"})
     async with client as c:
         body = (await _report(c)).json()
-    freshness = body.get("freshness") or {}
-    assert freshness.get("committed_at") == 100 and freshness.get("load_id") == "ld-1", f"wh_acme.orders last committed at 100 (ld-1) and the report says {freshness}: another tenant's load of the shared source is not this table's freshness"
+        freshness = body.get("freshness") or {}
+        assert freshness.get("committed_at") == 100 and freshness.get("load_id") == "ld-1", f"wh_acme.orders last committed at 100 (ld-1) and the report says {freshness}: another tenant's load of the shared source is not this table's freshness"
+        ctx.redis.delete("freshness:wh_acme.orders")
+        body = (await _report(c)).json()
+    assert body.get("freshness") is None, f"wh_acme.orders has no commit on record and the report says freshness {body.get('freshness')}: the shared source's freshness never stands in for the table's"
 
 
 async def check_delta_flag(ctx):
@@ -672,14 +681,18 @@ async def check_delta_flag(ctx):
     _reject(ctx, "ld-1", "p-1", "amount is not a decimal", 40)
     _seed(ctx, "ld-2", planned=500, read=500)
     warehouse.held[("wh_acme.orders", "ld-2")] = 500
+    # ld-3: the warehouse holds one row more than was read (a duplicated row).
+    _seed(ctx, "ld-3", planned=500, read=500)
+    warehouse.held[("wh_acme.orders", "ld-3")] = 501
     async with client as c:
-        reports = [(await _report(c, load_id)).json() for load_id in ("ld-1", "ld-2")]
+        reports = [(await _report(c, load_id)).json() for load_id in ("ld-1", "ld-2", "ld-3")]
     for body in reports:
         assert "delta" in body and "flagged" in body, f"the report must carry delta and flagged, got {body}"
         delta = body["rows_read"] - body["rows_written"] - body.get("rows_rejected", 0)
         assert body["delta"] == delta, f"delta must be rows_read - rows_written - rows_rejected = {delta}, the report says {body['delta']} ({body})"
         assert body["flagged"] is (delta != 0), f"flagged must be true exactly when delta is not 0; delta {delta}, flagged {body['flagged']}"
     assert reports[1]["flagged"] is False, f"a load whose counts reconcile must not be flagged, got {reports[1]}"
+    assert reports[2].get("delta") == -1 and reports[2]["flagged"] is True, f"the warehouse holds 501 rows of a 500-row load: delta -1 must be flagged, any delta that is not 0 is, got {reports[2]}"
 `,
     typescript: `/** held: "target/load_id" -> the rows the table holds for that load. */
 function api(ctx) {
@@ -717,6 +730,8 @@ export async function check_route(ctx) {
   assert(body.load_id === 'ld-1' && body.rows_read === 1000 && body.target === 'wh_acme.orders', \`the report must carry load_id, target and rows_read, got \${JSON.stringify(body)}\`);
   const theirs = await c.get('/v1/loads/ld-1', {headers: {'X-Tenant-Id': 'globex'}});
   assert.equal(theirs.status, 404, \`tenant globex reading acme's load answered \${theirs.status}, expected 404\`);
+  const missing = await c.get('/v1/loads/ld-404', {headers: {'X-Tenant-Id': 'acme'}});
+  assert.equal(missing.status, 404, \`a load that does not exist answered \${missing.status}, expected 404\`);
   const anonymous = await c.get('/v1/loads/ld-1');
   assert.equal(anonymous.status, 401, \`a report without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
 }
@@ -737,10 +752,14 @@ export async function check_rejections(ctx) {
   held['wh_acme.orders/ld-1'] = 960;
   reject(ctx, 'ld-1', 'p-1', 'amount is not a decimal', 30);
   reject(ctx, 'ld-1', 'p-3', 'id is null', 10);
+  seed(ctx, 'ld-2', 500, 500);
+  held['wh_acme.orders/ld-2'] = 500;
   const body = await report(c);
   assert.equal(body.rows_rejected, 40, \`two rejected batches of 30 and 10 rows, and the report says rows_rejected=\${body.rows_rejected}\`);
   const want = [{partition_id: 'p-1', reason: 'amount is not a decimal', rows: 30}, {partition_id: 'p-3', reason: 'id is null', rows: 10}];
   assert.deepEqual(body.rejections, want, \`the report must list each rejection with partition_id, reason and rows, got \${JSON.stringify(body.rejections)}\`);
+  const clean = await report(c, 'ld-2');
+  assert(clean.rows_rejected === 0 && (clean.rejections ?? []).length === 0, \`a load with no rejected rows must report rows_rejected 0 and no rejection, got \${JSON.stringify(clean)}\`);
 }
 
 export async function check_freshness_scoped(ctx) {
@@ -754,6 +773,9 @@ export async function check_freshness_scoped(ctx) {
   const body = await report(c);
   const freshness = body.freshness ?? {};
   assert(freshness.committed_at === 100 && freshness.load_id === 'ld-1', \`wh_acme.orders last committed at 100 (ld-1) and the report says \${JSON.stringify(freshness)}: another tenant's load of the shared source is not this table's freshness\`);
+  ctx.redis.del('freshness:wh_acme.orders');
+  const none = await report(c);
+  assert(none.freshness === null || none.freshness === undefined, \`wh_acme.orders has no commit on record and the report says freshness \${JSON.stringify(none.freshness)}: the shared source's freshness never stands in for the table's\`);
 }
 
 export async function check_delta_flag(ctx) {
@@ -763,7 +785,10 @@ export async function check_delta_flag(ctx) {
   reject(ctx, 'ld-1', 'p-1', 'amount is not a decimal', 40);
   seed(ctx, 'ld-2', 500, 500);
   held['wh_acme.orders/ld-2'] = 500;
-  const reports = [await report(c, 'ld-1'), await report(c, 'ld-2')];
+  // ld-3: the warehouse holds one row more than was read (a duplicated row).
+  seed(ctx, 'ld-3', 500, 500);
+  held['wh_acme.orders/ld-3'] = 501;
+  const reports = [await report(c, 'ld-1'), await report(c, 'ld-2'), await report(c, 'ld-3')];
   for (const body of reports) {
     assert('delta' in body && 'flagged' in body, \`the report must carry delta and flagged, got \${JSON.stringify(body)}\`);
     const delta = body.rows_read - body.rows_written - (body.rows_rejected ?? 0);
@@ -771,6 +796,7 @@ export async function check_delta_flag(ctx) {
     assert.equal(body.flagged, delta !== 0, \`flagged must be true exactly when delta is not 0; delta \${delta}, flagged \${body.flagged}\`);
   }
   assert.equal(reports[1].flagged, false, 'a load whose counts reconcile must not be flagged');
+  assert(reports[2].delta === -1 && reports[2].flagged === true, \`the warehouse holds 501 rows of a 500-row load: delta -1 must be flagged, any delta that is not 0 is, got \${JSON.stringify(reports[2])}\`);
 }
 `,
     go: `package main
@@ -828,6 +854,7 @@ func CheckRoute(ctx *harness.Ctx) {
 	body := readReport(ctx, c, "ld-1")
 	ctx.Assert(body["load_id"] == "ld-1" && body["rows_read"] == float64(1000) && body["target"] == "wh_acme.orders", "the report must carry load_id, target and rows_read, got %v", body)
 	ctx.Equal(c.Get("/v1/loads/ld-1", "X-Tenant-Id", "globex").Status, 404, "tenant globex reading acme's load")
+	ctx.Equal(c.Get("/v1/loads/ld-404", "X-Tenant-Id", "acme").Status, 404, "a load that does not exist")
 	ctx.Equal(c.Get("/v1/loads/ld-1").Status, 401, "a report without X-Tenant-Id")
 }
 
@@ -849,6 +876,8 @@ func CheckRejections(ctx *harness.Ctx) {
 	peer.held["wh_acme.orders/ld-1"] = 960
 	readReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30)
 	readReject(ctx, "ld-1", "p-3", "id is null", 10)
+	readSeed(ctx, "ld-2", "500", "500")
+	peer.held["wh_acme.orders/ld-2"] = 500
 	body := readReport(ctx, c, "ld-1")
 	ctx.Equal(body["rows_rejected"], 40, "two rejected batches of 30 and 10 rows; rows_rejected")
 	want := []any{
@@ -856,6 +885,10 @@ func CheckRejections(ctx *harness.Ctx) {
 		map[string]any{"partition_id": "p-3", "reason": "id is null", "rows": 10},
 	}
 	ctx.Equal(body["rejections"], want, "the report must list each rejection with partition_id, reason and rows")
+	clean := readReport(ctx, c, "ld-2")
+	ctx.Equal(clean["rows_rejected"], 0, "a load with no rejected rows; rows_rejected")
+	listed, _ := clean["rejections"].([]any)
+	ctx.Equal(len(listed), 0, "a load with no rejected rows lists no rejection; rejections")
 }
 
 func CheckFreshnessScoped(ctx *harness.Ctx) {
@@ -868,6 +901,9 @@ func CheckFreshnessScoped(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "freshness:wh_globex.orders", "committed_at", "200", "load_id", "ld-9")
 	body := readReport(ctx, c, "ld-1")
 	ctx.Equal(body["freshness"], map[string]any{"committed_at": 100, "load_id": "ld-1"}, "wh_acme.orders last committed at 100 (ld-1): another tenant's load of the shared source is not this table's freshness")
+	ctx.Redis.Do("DEL", "freshness:wh_acme.orders")
+	none := readReport(ctx, c, "ld-1")
+	ctx.Assert(none["freshness"] == nil, "wh_acme.orders has no commit on record and the report says freshness %v: the shared source's freshness never stands in for the table's", none["freshness"])
 }
 
 func CheckDeltaFlag(ctx *harness.Ctx) {
@@ -877,7 +913,10 @@ func CheckDeltaFlag(ctx *harness.Ctx) {
 	readReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40)
 	readSeed(ctx, "ld-2", "500", "500")
 	peer.held["wh_acme.orders/ld-2"] = 500
-	reports := []map[string]any{readReport(ctx, c, "ld-1"), readReport(ctx, c, "ld-2")}
+	// ld-3: the warehouse holds one row more than was read (a duplicated row).
+	readSeed(ctx, "ld-3", "500", "500")
+	peer.held["wh_acme.orders/ld-3"] = 501
+	reports := []map[string]any{readReport(ctx, c, "ld-1"), readReport(ctx, c, "ld-2"), readReport(ctx, c, "ld-3")}
 	for _, body := range reports {
 		_, hasDelta := body["delta"]
 		_, hasFlag := body["flagged"]
@@ -890,6 +929,7 @@ func CheckDeltaFlag(ctx *harness.Ctx) {
 		ctx.Equal(body["flagged"], delta != 0, "flagged must be true exactly when delta (%v) is not 0", delta)
 	}
 	ctx.Equal(reports[1]["flagged"], false, "a load whose counts reconcile must not be flagged")
+	ctx.Assert(reports[2]["delta"] == float64(-1) && reports[2]["flagged"] == true, "the warehouse holds 501 rows of a 500-row load: delta -1 must be flagged, any delta that is not 0 is, got %v", reports[2])
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -915,17 +955,17 @@ class ReadPeer final : public whloader::Warehouse::Service {
   }
 };
 
-struct World {
+struct HlWorld {
   ReadPeer peer;
   httplib::Server svr;
 };
 
-World& api(harness::Ctx& ctx, harness::HTTP*& c) {
-  static World* world = nullptr;
+HlWorld& hlApi(harness::Ctx& ctx, harness::HTTP*& c) {
+  static HlWorld* world = nullptr;
   static harness::HTTP* http = nullptr;
   delete world;
   delete http;
-  world = new World;
+  world = new HlWorld;
   ctx.GRPC.Server("")->RegisterService(&world->peer);
   register_routes(world->svr);
   http = new harness::HTTP(ctx.HTTP(world->svr));
@@ -933,16 +973,16 @@ World& api(harness::Ctx& ctx, harness::HTTP*& c) {
   return *world;
 }
 
-void seed(harness::Ctx& ctx, const std::string& load_id, const std::string& planned, const std::string& read) {
+void hlSeed(harness::Ctx& ctx, const std::string& load_id, const std::string& planned, const std::string& read) {
   ctx.Redis.Do("HSET", "load:" + load_id, "load_id", load_id, "tenant", "acme", "dataset", "orders", "version", "2026-10-20", "target", "wh_acme.orders",
                "mode", "merge", "transform", "dedupe", "sql", "SELECT DISTINCT * FROM source", "partitions", "4", "rows_planned", planned, "rows_read", read, "status", "complete");
 }
 
-void reject(harness::Ctx& ctx, const std::string& load_id, const std::string& partition_id, const std::string& reason, long rows) {
+void hlReject(harness::Ctx& ctx, const std::string& load_id, const std::string& partition_id, const std::string& reason, long rows) {
   ctx.Redis.Do("RPUSH", "load:" + load_id + ":rejects", nlohmann::json{{"partition_id", partition_id}, {"reason", reason}, {"rows", rows}}.dump());
 }
 
-nlohmann::json report(harness::Ctx& ctx, harness::HTTP& c, const std::string& load_id) {
+nlohmann::json hlReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& load_id) {
   const auto r = c.Get("/v1/loads/" + load_id, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/loads/%s (%s)", load_id, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
@@ -952,22 +992,23 @@ nlohmann::json report(harness::Ctx& ctx, harness::HTTP& c, const std::string& lo
 
 void CheckRoute(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  World& world = api(ctx, c);
-  seed(ctx, "ld-1", "1000", "1000");
+  HlWorld& world = hlApi(ctx, c);
+  hlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 1000;
-  const auto body = report(ctx, *c, "ld-1");
+  const auto body = hlReport(ctx, *c, "ld-1");
   ctx.Assert(body.value("load_id", "") == "ld-1" && body.value("rows_read", 0L) == 1000 && body.value("target", "") == "wh_acme.orders",
              "the report must carry load_id, target and rows_read, got %s", body.dump());
   ctx.Equal(c->Get("/v1/loads/ld-1", "X-Tenant-Id", "globex").Status, 404, "tenant globex reading acme's load");
+  ctx.Equal(c->Get("/v1/loads/ld-404", "X-Tenant-Id", "acme").Status, 404, "a load that does not exist");
   ctx.Equal(c->Get("/v1/loads/ld-1").Status, 401, "a report without X-Tenant-Id");
 }
 
 void CheckWrittenFromWarehouse(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  World& world = api(ctx, c);
-  seed(ctx, "ld-1", "1000", "1000");
+  HlWorld& world = hlApi(ctx, c);
+  hlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 940;
-  const auto body = report(ctx, *c, "ld-1");
+  const auto body = hlReport(ctx, *c, "ld-1");
   ctx.Equal(body.value("rows_written", 0L), 940, "the warehouse holds 940 rows of ld-1: written is what the warehouse holds, not the plan; rows_written");
   const auto calls = ctx.GRPC.CallsTo("CountRows");
   ctx.Assert(!calls.empty(), "the report must ask the warehouse CountRows(wh_acme.orders, ld-1)");
@@ -977,40 +1018,51 @@ void CheckWrittenFromWarehouse(harness::Ctx& ctx) {
 
 void CheckRejections(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  World& world = api(ctx, c);
-  seed(ctx, "ld-1", "1000", "1000");
+  HlWorld& world = hlApi(ctx, c);
+  hlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 960;
-  reject(ctx, "ld-1", "p-1", "amount is not a decimal", 30);
-  reject(ctx, "ld-1", "p-3", "id is null", 10);
-  const auto body = report(ctx, *c, "ld-1");
+  hlReject(ctx, "ld-1", "p-1", "amount is not a decimal", 30);
+  hlReject(ctx, "ld-1", "p-3", "id is null", 10);
+  hlSeed(ctx, "ld-2", "500", "500");
+  world.peer.held["wh_acme.orders/ld-2"] = 500;
+  const auto body = hlReport(ctx, *c, "ld-1");
   ctx.Equal(body.value("rows_rejected", 0L), 40, "two rejected batches of 30 and 10 rows; rows_rejected");
   const nlohmann::json want = nlohmann::json::array({{{"partition_id", "p-1"}, {"reason", "amount is not a decimal"}, {"rows", 30}}, {{"partition_id", "p-3"}, {"reason", "id is null"}, {"rows", 10}}});
   ctx.Equal(body.contains("rejections") ? body["rejections"] : nlohmann::json(), want, "the report must list each rejection with partition_id, reason and rows");
+  const auto clean = hlReport(ctx, *c, "ld-2");
+  ctx.Equal(clean.value("rows_rejected", -1L), 0, "a load with no rejected rows; rows_rejected");
+  ctx.Equal(clean.contains("rejections") ? clean["rejections"].size() : 0, 0, "a load with no rejected rows lists no rejection; rejections");
 }
 
 void CheckFreshnessScoped(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  World& world = api(ctx, c);
-  seed(ctx, "ld-1", "1000", "1000");
+  HlWorld& world = hlApi(ctx, c);
+  hlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 1000;
   ctx.Redis.Do("HSET", "freshness:wh_acme.orders", "committed_at", "100", "load_id", "ld-1");
   // globex loaded the same source into its own table later.
   ctx.Redis.Do("HSET", "freshness:orders", "committed_at", "200", "load_id", "ld-9");
   ctx.Redis.Do("HSET", "freshness:wh_globex.orders", "committed_at", "200", "load_id", "ld-9");
-  const auto body = report(ctx, *c, "ld-1");
+  const auto body = hlReport(ctx, *c, "ld-1");
   ctx.Equal(body.contains("freshness") ? body["freshness"] : nlohmann::json(), nlohmann::json({{"committed_at", 100}, {"load_id", "ld-1"}}),
             "wh_acme.orders last committed at 100 (ld-1): another tenant's load of the shared source is not this table's freshness");
+  ctx.Redis.Do("DEL", "freshness:wh_acme.orders");
+  const auto none = hlReport(ctx, *c, "ld-1");
+  ctx.Assert(!none.contains("freshness") || none["freshness"].is_null(), "wh_acme.orders has no commit on record and the report says freshness %s: the shared source's freshness never stands in for the table's", none.value("freshness", nlohmann::json()).dump());
 }
 
 void CheckDeltaFlag(harness::Ctx& ctx) {
   harness::HTTP* c = nullptr;
-  World& world = api(ctx, c);
-  seed(ctx, "ld-1", "1000", "1000");
+  HlWorld& world = hlApi(ctx, c);
+  hlSeed(ctx, "ld-1", "1000", "1000");
   world.peer.held["wh_acme.orders/ld-1"] = 940;
-  reject(ctx, "ld-1", "p-1", "amount is not a decimal", 40);
-  seed(ctx, "ld-2", "500", "500");
+  hlReject(ctx, "ld-1", "p-1", "amount is not a decimal", 40);
+  hlSeed(ctx, "ld-2", "500", "500");
   world.peer.held["wh_acme.orders/ld-2"] = 500;
-  const std::vector<nlohmann::json> reports = {report(ctx, *c, "ld-1"), report(ctx, *c, "ld-2")};
+  // ld-3: the warehouse holds one row more than was read (a duplicated row).
+  hlSeed(ctx, "ld-3", "500", "500");
+  world.peer.held["wh_acme.orders/ld-3"] = 501;
+  const std::vector<nlohmann::json> reports = {hlReport(ctx, *c, "ld-1"), hlReport(ctx, *c, "ld-2"), hlReport(ctx, *c, "ld-3")};
   for (const auto& body : reports) {
     ctx.Assert(body.contains("delta") && body.contains("flagged"), "the report must carry delta and flagged, got %s", body.dump());
     const long delta = body.value("rows_read", 0L) - body.value("rows_written", 0L) - body.value("rows_rejected", 0L);
@@ -1018,6 +1070,7 @@ void CheckDeltaFlag(harness::Ctx& ctx) {
     ctx.Equal(body.value("flagged", false), delta != 0, "flagged must be true exactly when delta (%d) is not 0", delta);
   }
   ctx.Equal(reports[1].value("flagged", true), false, "a load whose counts reconcile must not be flagged");
+  ctx.Assert(reports[2].value("delta", 0L) == -1 && reports[2].value("flagged", false), "the warehouse holds 501 rows of a 500-row load: delta -1 must be flagged, any delta that is not 0 is, got %s", reports[2].dump());
 }
 `,
   },

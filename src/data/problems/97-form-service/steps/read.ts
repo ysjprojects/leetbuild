@@ -747,6 +747,8 @@ async def check_owner_role(ctx):
         assert r.status_code == 403, f"a user who does not own form f-1 exported its submissions: {r.status_code}, expected 403"
         r = await c.get("/v1/forms/f-1/submissions")
         assert r.status_code == 401, f"a list without X-User-Id answered {r.status_code}, expected 401"
+        r = await c.post("/v1/forms/f-1/exports")
+        assert r.status_code == 401, f"an export without X-User-Id answered {r.status_code}, expected 401"
         r = await c.get("/v1/forms/f-1/submissions", headers=OWNER)
     assert r.status_code == 200 and len(r.json().get("items", [])) == 3, f"the owner's list answered {r.status_code} {r.text}, expected the 3 submissions"
 
@@ -822,6 +824,8 @@ export async function check_owner_role(ctx) {
   assert.equal(r.status, 403, \`a user who does not own form f-1 exported its submissions: \${r.status}, expected 403\`);
   r = await c.get('/v1/forms/f-1/submissions');
   assert.equal(r.status, 401, \`a list without X-User-Id answered \${r.status}, expected 401\`);
+  r = await c.post('/v1/forms/f-1/exports');
+  assert.equal(r.status, 401, \`an export without X-User-Id answered \${r.status}, expected 401\`);
   r = await c.get('/v1/forms/f-1/submissions', {headers: OWNER});
   assert(r.status === 200 && r.json().items?.length === 3, \`the owner's list answered \${r.status} \${r.text}, expected the 3 submissions\`);
 }
@@ -942,6 +946,8 @@ func CheckOwnerRole(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 403, "a user who does not own form f-1 exported its submissions")
 	r = c.Get("/v1/forms/f-1/submissions")
 	ctx.Equal(r.Status, 401, "a list without X-User-Id")
+	r = c.Post("/v1/forms/f-1/exports", nil)
+	ctx.Equal(r.Status, 401, "an export without X-User-Id")
 	r = c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-owner")
 	var page readPage
 	r.Decode(&page)
@@ -1027,18 +1033,18 @@ using json = nlohmann::json;
 
 namespace {
 
-const store::Schema kSchema = {{"name", 80}, {"email", 80}, {"phone", 20}, {"message", 200}};
+const store::Schema hSchema = {{"name", 80}, {"email", 80}, {"phone", 20}, {"message", 200}};
 
-void add(int i, const std::string& name = "") {
+void hAdd(int i, const std::string& name = "") {
   store::insertSubmission("f-1", {{"name", name.empty() ? "Person " + std::to_string(i) : name},
                                   {"email", "p" + std::to_string(i) + "@example.com"},
                                   {"phone", "555-010" + std::to_string(i)},
                                   {"message", "Hello"}});
 }
 
-harness::HTTP setup(harness::Ctx& ctx, int n = 3, const std::string& name = "") {
-  store::defineForm("f-1", "u-owner", kSchema, kSchema);
-  for (int i = 1; i <= n; i++) add(i, name);
+harness::HTTP hSetup(harness::Ctx& ctx, int n = 3, const std::string& name = "") {
+  store::defineForm("f-1", "u-owner", hSchema, hSchema);
+  for (int i = 1; i <= n; i++) hAdd(i, name);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1046,12 +1052,12 @@ harness::HTTP setup(harness::Ctx& ctx, int n = 3, const std::string& name = "") 
   return ctx.HTTP(*svr);
 }
 
-json body(const harness::Response& r) {
+json hBody(const harness::Response& r) {
   const json j = json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : json::object();
 }
 
-std::vector<std::string> ids(const json& page) {
+std::vector<std::string> hIds(const json& page) {
   std::vector<std::string> out;
   if (page.contains("items") && page["items"].is_array()) {
     for (const auto& item : page["items"]) out.push_back(item.value("submission_id", ""));
@@ -1059,30 +1065,32 @@ std::vector<std::string> ids(const json& page) {
   return out;
 }
 
-std::string cursorOf(const json& page) {
+std::string hCursorOf(const json& page) {
   return page.contains("next_cursor") && page["next_cursor"].is_string() ? page["next_cursor"].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckOwnerRole(harness::Ctx& ctx) {
-  auto c = setup(ctx);
+  auto c = hSetup(ctx);
   auto r = c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-member");
   ctx.Equal(r.Status, 403, "a user who does not own form f-1 listed its submissions");
   r = c.Post("/v1/forms/f-1/exports", "", "X-User-Id", "u-member");
   ctx.Equal(r.Status, 403, "a user who does not own form f-1 exported its submissions");
   r = c.Get("/v1/forms/f-1/submissions");
   ctx.Equal(r.Status, 401, "a list without X-User-Id");
+  r = c.Post("/v1/forms/f-1/exports", "");
+  ctx.Equal(r.Status, 401, "an export without X-User-Id");
   r = c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-owner");
-  ctx.Assert(r.Status == 200 && ids(body(r)).size() == 3, "the owner's list answered %d %s, expected the 3 submissions", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hIds(hBody(r)).size() == 3, "the owner's list answered %d %s, expected the 3 submissions", r.Status, r.Text());
 }
 
 void CheckRedactedDefault(harness::Ctx& ctx) {
-  auto c = setup(ctx);
+  auto c = hSetup(ctx);
   const auto r = c.Get("/v1/forms/f-1/submissions", "X-User-Id", "u-owner");
   ctx.Equal(r.Status, 200, "the owner's list (%s)", r.Text());
-  const json page = body(r);
-  ctx.Assert(!ids(page).empty(), "the list is empty: %s", r.Text());
+  const json page = hBody(r);
+  ctx.Assert(!hIds(page).empty(), "the list is empty: %s", r.Text());
   for (const auto& item : page["items"]) {
     const json values = item.value("values", json::object());
     ctx.Assert(values.value("email", "") == "[redacted]" && values.value("phone", "") == "[redacted]", "the list shows %s: email and phone must read [redacted] outside the audited export", values.dump());
@@ -1092,10 +1100,10 @@ void CheckRedactedDefault(harness::Ctx& ctx) {
 }
 
 void CheckAuditedExport(harness::Ctx& ctx) {
-  auto c = setup(ctx);
+  auto c = hSetup(ctx);
   const auto r = c.Post("/v1/forms/f-1/exports", "", "X-User-Id", "u-owner");
   ctx.Equal(r.Status, 200, "the owner's export (%s)", r.Text());
-  const json exported = body(r);
+  const json exported = hBody(r);
   std::vector<std::string> emails;
   if (exported.contains("rows")) {
     for (const auto& row : exported["rows"]) emails.push_back(row.value("values", json::object()).value("email", ""));
@@ -1109,28 +1117,28 @@ void CheckAuditedExport(harness::Ctx& ctx) {
 }
 
 void CheckGeneratedFilename(harness::Ctx& ctx) {
-  auto c = setup(ctx, 1, "../../etc/passwd");
+  auto c = hSetup(ctx, 1, "../../etc/passwd");
   const auto first = c.Post("/v1/forms/f-1/exports", "", "X-User-Id", "u-owner");
   const auto second = c.Post("/v1/forms/f-1/exports", "", "X-User-Id", "u-owner");
   ctx.Equal(first.Status, 200, "the owner's export (%s)", first.Text());
-  const std::string file = body(first).value("file", "");
+  const std::string file = hBody(first).value("file", "");
   ctx.Assert(file.find_first_of("/\\\\") == std::string::npos && file.find("..") == std::string::npos, "the export file is named %q: a submitted name chose a path for the export tool", file);
   ctx.Assert(file.find("passwd") == std::string::npos, "the export file name %q is built from submitted values", file);
-  ctx.Assert(file != body(second).value("file", ""), "two exports got the same file name %q: generate one per export", file);
+  ctx.Assert(file != hBody(second).value("file", ""), "two exports got the same file name %q: generate one per export", file);
 }
 
 void CheckCursorPagination(harness::Ctx& ctx) {
-  auto c = setup(ctx, 5);
-  const json page = body(c.Get("/v1/forms/f-1/submissions?limit=2", "X-User-Id", "u-owner"));
-  ctx.Equal(ids(page), std::vector<std::string>{"sub-5", "sub-4"}, "the first page must hold the newest two");
-  const std::string cursor = cursorOf(page);
+  auto c = hSetup(ctx, 5);
+  const json page = hBody(c.Get("/v1/forms/f-1/submissions?limit=2", "X-User-Id", "u-owner"));
+  ctx.Equal(hIds(page), std::vector<std::string>{"sub-5", "sub-4"}, "the first page must hold the newest two");
+  const std::string cursor = hCursorOf(page);
   ctx.Assert(!cursor.empty(), "the first page carries no next_cursor: %s. A list that pages by offset repeats rows when someone submits between two pages", page.dump());
-  add(6);  // someone submits while the owner reads
-  const json second = body(c.Get("/v1/forms/f-1/submissions?limit=2&cursor=" + cursor, "X-User-Id", "u-owner"));
-  ctx.Equal(ids(second), std::vector<std::string>{"sub-3", "sub-2"}, "after a new submission, the second page");
-  const json third = body(c.Get("/v1/forms/f-1/submissions?limit=2&cursor=" + cursorOf(second), "X-User-Id", "u-owner"));
-  ctx.Equal(ids(third), std::vector<std::string>{"sub-1"}, "the last page");
-  ctx.Assert(cursorOf(third).empty(), "the last page must carry no next_cursor, got %s", third.dump());
+  hAdd(6);  // someone submits while the owner reads
+  const json second = hBody(c.Get("/v1/forms/f-1/submissions?limit=2&cursor=" + cursor, "X-User-Id", "u-owner"));
+  ctx.Equal(hIds(second), std::vector<std::string>{"sub-3", "sub-2"}, "after a new submission, the second page");
+  const json third = hBody(c.Get("/v1/forms/f-1/submissions?limit=2&cursor=" + hCursorOf(second), "X-User-Id", "u-owner"));
+  ctx.Equal(hIds(third), std::vector<std::string>{"sub-1"}, "the last page");
+  ctx.Assert(hCursorOf(third).empty(), "the last page must carry no next_cursor, got %s", third.dump());
 }
 `,
   },

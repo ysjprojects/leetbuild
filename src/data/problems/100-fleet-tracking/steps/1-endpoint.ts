@@ -101,7 +101,7 @@ and the response says what the state did with each update.
       id: 'skew',
       title: 'A device timestamp more than five minutes off is 400',
       detail:
-        '`abs(server_now_ms - device_timestamp_ms) > MAX_SKEW_MS` (300 000) rejects the batch with 400 and writes nothing; four minutes either way is accepted. The starter trusts the device clock.',
+        '`abs(server_now_ms - device_timestamp_ms) > MAX_SKEW_MS` (300 000) rejects the batch with 400 and writes nothing, in either direction; exactly 300 000 ms either way is accepted, one millisecond more is not. The starter trusts the device clock.',
       match: {
         python: {all: [/MAX_SKEW_MS\s*=\s*300_?000/, /abs\(/, /MAX_SKEW_MS/]},
         typescript: {all: [/MAX_SKEW_MS\s*=\s*300_?000/, /Math\.abs\(/, /MAX_SKEW_MS/]},
@@ -807,6 +807,12 @@ async def check_skew(ctx):
         r = await c.post("/v1/vehicles/positions", json=batch(update("v-1", now - 4 * 60_000), update("v-2", now + 4 * 60_000)), headers=T1)
         assert r.status_code == 200, f"positions four minutes either side of the server clock answered {r.status_code}, expected 200 (within MAX_SKEW_MS = 300 000)"
         assert written(ctx) == ["v-1", "v-2"], f"the accepted batch wrote {written(ctx)}, expected v-1 and v-2"
+        r = await c.post("/v1/vehicles/positions", json=batch(update("v-3", now - 300_000), update("v-4", now + 300_000)), headers=T1)
+        assert r.status_code == 200, f"positions exactly 300 000 ms either side of the server clock answered {r.status_code}, expected 200: only a skew greater than MAX_SKEW_MS is rejected"
+        for ts in (now - 300_001, now + 300_001):
+            r = await c.post("/v1/vehicles/positions", json=batch(update("v-5", ts)), headers=T1)
+            assert r.status_code == 400, f"a position {ts - now:+d} ms from the server clock answered {r.status_code}, expected 400: one millisecond past MAX_SKEW_MS is rejected"
+        assert written(ctx) == ["v-1", "v-2", "v-3", "v-4"], f"after the boundary batches the latest records are {written(ctx)}, expected v-1 to v-4 (v-5 was outside the skew)"
 
 
 async def check_counts(ctx):
@@ -882,6 +888,13 @@ export async function check_skew(ctx) {
   r = await c.post('/v1/vehicles/positions', {json: batch(update('v-1', now - 4 * 60_000), update('v-2', now + 4 * 60_000)), headers: T1});
   assert.equal(r.status, 200, \`positions four minutes either side of the server clock answered \${r.status}, expected 200 (within MAX_SKEW_MS = 300 000)\`);
   assert.deepStrictEqual(written(ctx), ['v-1', 'v-2'], \`the accepted batch wrote \${JSON.stringify(written(ctx))}, expected v-1 and v-2\`);
+  r = await c.post('/v1/vehicles/positions', {json: batch(update('v-3', now - 300_000), update('v-4', now + 300_000)), headers: T1});
+  assert.equal(r.status, 200, \`positions exactly 300 000 ms either side of the server clock answered \${r.status}, expected 200: only a skew greater than MAX_SKEW_MS is rejected\`);
+  for (const ts of [now - 300_001, now + 300_001]) {
+    r = await c.post('/v1/vehicles/positions', {json: batch(update('v-5', ts)), headers: T1});
+    assert.equal(r.status, 400, \`a position \${ts - now} ms from the server clock answered \${r.status}, expected 400: one millisecond past MAX_SKEW_MS is rejected\`);
+  }
+  assert.deepStrictEqual(written(ctx), ['v-1', 'v-2', 'v-3', 'v-4'], \`after the boundary batches the latest records are \${JSON.stringify(written(ctx))}, expected v-1 to v-4 (v-5 was outside the skew)\`);
 }
 
 export async function check_counts(ctx) {
@@ -1002,6 +1015,13 @@ func CheckSkew(ctx *harness.Ctx) {
 	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-1", now-4*60_000, 1), apiUpdate("v-2", now+4*60_000, 1)), "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "positions four minutes either side of the server clock (within maxSkewMs = 300 000): %s", r.Text())
 	ctx.Equal(s.written(), []string{"v-1", "v-2"}, "the accepted batch's vehicles")
+	r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-3", now-300_000, 1), apiUpdate("v-4", now+300_000, 1)), "X-Tenant-Id", "t-1")
+	ctx.Equal(r.Status, 200, "positions exactly 300 000 ms either side of the server clock (only a skew greater than maxSkewMs is rejected): %s", r.Text())
+	for _, ts := range []int64{now - 300_001, now + 300_001} {
+		r = c.Post("/v1/vehicles/positions", apiBatch(apiUpdate("v-5", ts, 1)), "X-Tenant-Id", "t-1")
+		ctx.Equal(r.Status, 400, "a position %+d ms from the server clock (one millisecond past maxSkewMs is rejected)", ts-now)
+	}
+	ctx.Equal(s.written(), []string{"v-1", "v-2", "v-3", "v-4"}, "after the boundary batches the vehicles recorded (v-5 was outside the skew)")
 }
 
 func CheckCounts(ctx *harness.Ctx) {
@@ -1057,7 +1077,7 @@ nlohmann::json apiBatch(std::vector<nlohmann::json> updates) {
   return {{"batch_id", "b-1"}, {"updates", updates}};
 }
 
-harness::Response post(Api& api, const nlohmann::json& body, const std::vector<std::string>& headers = {"X-Tenant-Id", "t-1"}) {
+harness::Response apiPost(Api& api, const nlohmann::json& body, const std::vector<std::string>& headers = {"X-Tenant-Id", "t-1"}) {
   return api.http.Send("POST", "/v1/vehicles/positions", body.dump(), headers);
 }
 
@@ -1074,7 +1094,7 @@ bool record_position(const std::string& vehicle_id, const Position& p) {
 
 void CheckRoute(harness::Ctx& ctx) {
   Api api(ctx);
-  const auto r = post(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now(), 42)}));
+  const auto r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now(), 42)}));
   ctx.Equal(r.Status, 200, "POST /v1/vehicles/positions with a valid batch (%s)", r.Text());
   const std::string ctype = r.HeaderValue("Content-Type");
   ctx.Assert(ctype.rfind("application/json", 0) == 0, "the answer must be JSON, got Content-Type %q", ctype);
@@ -1084,19 +1104,19 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTenant(harness::Ctx& ctx) {
   Api api(ctx);
-  auto r = post(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}), {});
+  auto r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}), {});
   ctx.Equal(r.Status, 401, "a batch without X-Tenant-Id");
   ctx.Equal(apiWritten(), std::vector<std::string>{}, "a batch without a tenant recorded vehicles: nothing may be recorded for nobody; the vehicles written");
-  r = post(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}), {"X-Tenant-Id", ""});
+  r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}), {"X-Tenant-Id", ""});
   ctx.Equal(r.Status, 401, "a batch with an empty X-Tenant-Id");
-  r = post(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}));
+  r = apiPost(api, apiBatch({apiUpdate("v-1", ctx.Clock.Now())}));
   ctx.Equal(r.Status, 200, "with a tenant the same batch (%s)", r.Text());
 }
 
 void CheckValidateFirst(harness::Ctx& ctx) {
   Api api(ctx);
   const long long now = ctx.Clock.Now();
-  auto r = post(api, apiBatch({apiUpdate("v-1", now), apiUpdate("v-2", now), apiUpdate("v-3", now, 1, 200.0)}));
+  auto r = apiPost(api, apiBatch({apiUpdate("v-1", now), apiUpdate("v-2", now), apiUpdate("v-3", now, 1, 200.0)}));
   ctx.Equal(r.Status, 400, "a batch whose third update has lat 200");
   ctx.Equal(apiWritten(), std::vector<std::string>{},
             "the batch was rejected with 400 but vehicles were recorded: every update is validated before any is "
@@ -1104,40 +1124,47 @@ void CheckValidateFirst(harness::Ctx& ctx) {
   const std::vector<nlohmann::json> bads = {apiUpdate("", now), apiUpdate("v-1", -5), apiUpdate("v-1", now, -1),
                                            apiUpdate("v-1", now, 1, 47.6, 181.0), {{"vehicle_id", "v-1"}}};
   for (const auto& bad : bads) {
-    r = post(api, apiBatch({apiUpdate("v-9", now), bad}));
+    r = apiPost(api, apiBatch({apiUpdate("v-9", now), bad}));
     ctx.Equal(r.Status, 400, "a batch with the invalid update %s", bad.dump());
   }
   ctx.Equal(apiWritten(), std::vector<std::string>{}, "rejected batches recorded vehicles; the vehicles written");
-  r = post(api, nlohmann::json{{"batch_id", "b-2"}, {"updates", nlohmann::json::array()}});
+  r = apiPost(api, nlohmann::json{{"batch_id", "b-2"}, {"updates", nlohmann::json::array()}});
   ctx.Equal(r.Status, 400, "an empty batch");
 }
 
 void CheckSkew(harness::Ctx& ctx) {
   Api api(ctx);
   const long long now = ctx.Clock.Now();
-  auto r = post(api, apiBatch({apiUpdate("v-1", now), apiUpdate("v-2", now - 10 * 60000)}));
+  auto r = apiPost(api, apiBatch({apiUpdate("v-1", now), apiUpdate("v-2", now - 10 * 60000)}));
   ctx.Equal(r.Status, 400, "a batch with a position dated ten minutes ago (a device clock that far off is not trusted)");
   ctx.Equal(apiWritten(), std::vector<std::string>{},
             "the skewed batch recorded vehicles: a skewed update rejects the batch before anything is written; the vehicles written");
-  r = post(api, apiBatch({apiUpdate("v-1", now + 10 * 60000)}));
+  r = apiPost(api, apiBatch({apiUpdate("v-1", now + 10 * 60000)}));
   ctx.Equal(r.Status, 400, "a position dated ten minutes in the future (the skew bound is abs(now - ts))");
-  r = post(api, apiBatch({apiUpdate("v-1", now - 4 * 60000), apiUpdate("v-2", now + 4 * 60000)}));
+  r = apiPost(api, apiBatch({apiUpdate("v-1", now - 4 * 60000), apiUpdate("v-2", now + 4 * 60000)}));
   ctx.Equal(r.Status, 200, "positions four minutes either side of the server clock (within kMaxSkewMs = 300 000): %s", r.Text());
   ctx.Equal(apiWritten(), {"v-1", "v-2"}, "the accepted batch's vehicles");
+  r = apiPost(api, apiBatch({apiUpdate("v-3", now - 300000), apiUpdate("v-4", now + 300000)}));
+  ctx.Equal(r.Status, 200, "positions exactly 300 000 ms either side of the server clock (only a skew greater than kMaxSkewMs is rejected): %s", r.Text());
+  for (const long long ts : {now - 300001, now + 300001}) {
+    r = apiPost(api, apiBatch({apiUpdate("v-5", ts)}));
+    ctx.Equal(r.Status, 400, "a position %d ms from the server clock (one millisecond past kMaxSkewMs is rejected)", ts - now);
+  }
+  ctx.Equal(apiWritten(), {"v-1", "v-2", "v-3", "v-4"}, "after the boundary batches the vehicles recorded (v-5 was outside the skew)");
 }
 
 void CheckCounts(harness::Ctx& ctx) {
   Api api(ctx);
   const long long now = ctx.Clock.Now();
   const auto first = apiBatch({apiUpdate("v-1", now, 5), apiUpdate("v-2", now, 7)});
-  auto r = post(api, first);
+  auto r = apiPost(api, first);
   ctx.Equal(r.Status, 200, "two new updates (%s)", r.Text());
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":2,"duplicate":0})"), "two new updates");
-  r = post(api, first);
+  r = apiPost(api, first);
   ctx.Equal(r.Status, 200, "the same batch again (%s)", r.Text());
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":0,"duplicate":2})"),
             "the same batch again (a device replaying its buffer): the state ignored both, the response must say so");
-  r = post(api, apiBatch({apiUpdate("v-1", now + 1000, 6), apiUpdate("v-2", now, 7)}));
+  r = apiPost(api, apiBatch({apiUpdate("v-1", now + 1000, 6), apiUpdate("v-2", now, 7)}));
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"accepted":1,"duplicate":1})"), "one new and one replayed update");
 }
 `,

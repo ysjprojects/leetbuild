@@ -65,7 +65,7 @@ Rules, in this order:
       id: 'range-cap',
       title: 'Refuses a missing bound or a window over 90 days with 400',
       detail:
-        'A 120-day window, a missing `to` and a missing `from` are **400** `invalid_window`; exactly 90 days is served. The starter fills a missing bound with a year and expands any window it is given.',
+        'A 120-day window, 90 days and one second, a missing `to`, a missing `from`, a `from` without an offset and a `to` before `from` are **400** `invalid_window`; exactly 90 days is served. The starter fills a missing bound with a year and expands any window it is given.',
       match: {
         python: {all: [/MAX_RANGE_DAYS/], none: [/DEFAULT_WINDOW_DAYS/]},
         typescript: {all: [/MAX_RANGE_DAYS/], none: [/DEFAULT_WINDOW_DAYS/]},
@@ -78,7 +78,7 @@ Rules, in this order:
       id: 'unknown-calendar',
       title: 'Answers 404 for a calendar that does not exist',
       detail:
-        'An unknown calendar id is **404** `calendar_not_found`, and no slice is cached for it. The starter answers 200 with an empty week, so a typo looks like a free calendar and costs an expansion.',
+        'An unknown calendar id is **404** `calendar_not_found`, also when its window is invalid, and no slice is cached for it. The starter answers 200 with an empty week, so a typo looks like a free calendar and costs an expansion.',
       match: {
         python: {all: [/calendar_not_found/, /store\.get_calendar\(/]},
         typescript: {all: [/calendar_not_found/, /store\.getCalendar\(/]},
@@ -91,7 +91,7 @@ Rules, in this order:
       id: 'private-calendars',
       title: 'Refuses a private calendar to a tenant outside it with 403',
       detail:
-        'A `private` calendar is **403** `not_a_member` for a tenant that is not a member and for a request with no tenant, and served to a member. The starter serves it to anyone who knows the id.',
+        'A `private` calendar is **403** `not_a_member` for a tenant that is not a member (whatever the query names, and also when its window is invalid) and for a request with no tenant, leaves no slice behind, and is served to a member; a public calendar is served to anyone. The starter serves it to anyone who knows the id.',
       match: {
         python: {all: [/not_a_member/, /store\.is_member\(/]},
         typescript: {all: [/not_a_member/, /store\.isMember\(/]},
@@ -596,8 +596,11 @@ async def check_range_cap(ctx):
     m = _world(ctx)
     for query, what in (
         ("from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"),
+        ("from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:01Z", "a window of 90 days and one second"),
         ("from=2026-03-02T00:00:00Z", "a window without to"),
         ("to=2026-03-09T00:00:00Z", "a window without from"),
+        ("from=2026-03-02T00:00:00&to=2026-03-09T00:00:00Z", "a from without an offset"),
+        ("from=2026-03-09T00:00:00Z&to=2026-03-02T00:00:00Z", "a to before from"),
     ):
         r = await _get(ctx, m, f"/v1/calendars/c1/events?{query}")
         assert r.status_code == 400 and _error(r) == "invalid_window", f"{what} answered {r.status_code} {r.text[:200]}, expected 400 invalid_window: a read bounds what one request may expand"
@@ -609,16 +612,26 @@ async def check_unknown_calendar(ctx):
     m = _world(ctx)
     r = await _get(ctx, m, f"/v1/calendars/nope/events?{WEEK}")
     assert r.status_code == 404 and _error(r) == "calendar_not_found", f"an unknown calendar answered {r.status_code} {r.text}, expected 404 calendar_not_found: an empty week is a different answer"
+    r = await _get(ctx, m, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z")
+    assert r.status_code == 404 and _error(r) == "calendar_not_found", f"an unknown calendar with a window without to answered {r.status_code} {r.text}, expected 404 calendar_not_found: the calendar is judged before the window"
     assert ctx.redis.keys("exp:nope*") == [], f"an unknown calendar left {ctx.redis.keys('exp:nope*')} in the cache"
 
 
 async def check_private_calendars(ctx):
     m = _world(ctx)
-    for tenant, what in (("t2", "a tenant outside the calendar"), ("", "a request without X-Tenant-Id")):
-        r = await _get(ctx, m, f"/v1/calendars/c2/events?{WEEK}", tenant=tenant)
+    for tenant, query, what in (
+        ("t2", WEEK, "a tenant outside the calendar"),
+        ("", WEEK, "a request without X-Tenant-Id"),
+        ("t2", f"{WEEK}&tenant=t1", "a tenant outside the calendar naming t1 in the query"),
+        ("t2", "from=2026-03-02T00:00:00Z", "a tenant outside the calendar with a window without to"),
+    ):
+        r = await _get(ctx, m, f"/v1/calendars/c2/events?{query}", tenant=tenant)
         assert r.status_code == 403 and _error(r) == "not_a_member", f"{what} reading the private calendar c2 answered {r.status_code} {r.text[:200]}, expected 403 not_a_member"
+    assert ctx.redis.keys("exp:c2*") == [], f"the refused reads of c2 left {ctx.redis.keys('exp:c2*')} in the cache: a stranger is refused before anything is expanded"
     r = await _get(ctx, m, f"/v1/calendars/c2/events?{WEEK}", tenant="t1")
     assert r.status_code == 200 and len(r.json().get("occurrences", [])) == 7, f"the member t1 reading c2 answered {r.status_code} {r.text[:200]}"
+    r = await _get(ctx, m, f"/v1/calendars/c1/events?{WEEK}", tenant="t2")
+    assert r.status_code == 200 and len(r.json().get("occurrences", [])) == 7, f"t2 reading the public calendar c1 answered {r.status_code} {r.text[:200]}: a public calendar is readable by anyone"
 
 
 async def check_cache_control(ctx):
@@ -679,8 +692,11 @@ export async function check_range_cap(ctx) {
   const m = await world(ctx);
   for (const [query, what] of [
     ['from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z', 'a 120-day window'],
+    ['from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:01Z', 'a window of 90 days and one second'],
     ['from=2026-03-02T00:00:00Z', 'a window without to'],
     ['to=2026-03-09T00:00:00Z', 'a window without from'],
+    ['from=2026-03-02T00:00:00&to=2026-03-09T00:00:00Z', 'a from without an offset'],
+    ['from=2026-03-09T00:00:00Z&to=2026-03-02T00:00:00Z', 'a to before from'],
   ]) {
     const r = await get(ctx, m, \`/v1/calendars/c1/events?\${query}\`);
     assert(r.status === 400 && errorOf(r) === 'invalid_window', \`\${what} answered \${r.status} \${r.text.slice(0, 200)}, expected 400 invalid_window: a read bounds what one request may expand\`);
@@ -691,22 +707,29 @@ export async function check_range_cap(ctx) {
 
 export async function check_unknown_calendar(ctx) {
   const m = await world(ctx);
-  const r = await get(ctx, m, \`/v1/calendars/nope/events?\${WEEK}\`);
+  let r = await get(ctx, m, \`/v1/calendars/nope/events?\${WEEK}\`);
   assert(r.status === 404 && errorOf(r) === 'calendar_not_found', \`an unknown calendar answered \${r.status} \${r.text}, expected 404 calendar_not_found: an empty week is a different answer\`);
+  r = await get(ctx, m, '/v1/calendars/nope/events?from=2026-03-02T00:00:00Z');
+  assert(r.status === 404 && errorOf(r) === 'calendar_not_found', \`an unknown calendar with a window without to answered \${r.status} \${r.text}, expected 404 calendar_not_found: the calendar is judged before the window\`);
   assert.deepEqual(ctx.redis.keys('exp:nope*'), [], \`an unknown calendar left \${JSON.stringify(ctx.redis.keys('exp:nope*'))} in the cache\`);
 }
 
 export async function check_private_calendars(ctx) {
   const m = await world(ctx);
-  for (const [tenant, what] of [
-    ['t2', 'a tenant outside the calendar'],
-    ['', 'a request without X-Tenant-Id'],
+  for (const [tenant, query, what] of [
+    ['t2', WEEK, 'a tenant outside the calendar'],
+    ['', WEEK, 'a request without X-Tenant-Id'],
+    ['t2', \`\${WEEK}&tenant=t1\`, 'a tenant outside the calendar naming t1 in the query'],
+    ['t2', 'from=2026-03-02T00:00:00Z', 'a tenant outside the calendar with a window without to'],
   ]) {
-    const r = await get(ctx, m, \`/v1/calendars/c2/events?\${WEEK}\`, tenant);
+    const r = await get(ctx, m, \`/v1/calendars/c2/events?\${query}\`, tenant);
     assert(r.status === 403 && errorOf(r) === 'not_a_member', \`\${what} reading the private calendar c2 answered \${r.status} \${r.text.slice(0, 200)}, expected 403 not_a_member\`);
   }
-  const r = await get(ctx, m, \`/v1/calendars/c2/events?\${WEEK}\`, 't1');
+  assert.deepEqual(ctx.redis.keys('exp:c2*'), [], \`the refused reads of c2 left \${JSON.stringify(ctx.redis.keys('exp:c2*'))} in the cache: a stranger is refused before anything is expanded\`);
+  let r = await get(ctx, m, \`/v1/calendars/c2/events?\${WEEK}\`, 't1');
   assert(r.status === 200 && (r.json().occurrences ?? []).length === 7, \`the member t1 reading c2 answered \${r.status} \${r.text.slice(0, 200)}\`);
+  r = await get(ctx, m, \`/v1/calendars/c1/events?\${WEEK}\`, 't2');
+  assert(r.status === 200 && (r.json().occurrences ?? []).length === 7, \`t2 reading the public calendar c1 answered \${r.status} \${r.text.slice(0, 200)}: a public calendar is readable by anyone\`);
 }
 
 export async function check_cache_control(ctx) {
@@ -802,8 +825,11 @@ func CheckRangeCap(ctx *harness.Ctx) {
 	c := rdClient(ctx)
 	for _, tc := range [][2]string{
 		{"from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"},
+		{"from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:01Z", "a window of 90 days and one second"},
 		{"from=2026-03-02T00:00:00Z", "a window without to"},
 		{"to=2026-03-09T00:00:00Z", "a window without from"},
+		{"from=2026-03-02T00:00:00&to=2026-03-09T00:00:00Z", "a from without an offset"},
+		{"from=2026-03-09T00:00:00Z&to=2026-03-02T00:00:00Z", "a to before from"},
 	} {
 		r := rdGet(c, "/v1/calendars/c1/events?"+tc[0], "t1")
 		ctx.Assert(r.Status == 400 && rdDecode(r).Error == "invalid_window", "%s answered %d, expected 400 invalid_window: a read bounds what one request may expand", tc[1], r.Status)
@@ -816,17 +842,27 @@ func CheckUnknownCalendar(ctx *harness.Ctx) {
 	c := rdClient(ctx)
 	r := rdGet(c, "/v1/calendars/nope/events?"+rdWeek, "t1")
 	ctx.Assert(r.Status == 404 && rdDecode(r).Error == "calendar_not_found", "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text())
+	r = rdGet(c, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z", "t1")
+	ctx.Assert(r.Status == 404 && rdDecode(r).Error == "calendar_not_found", "an unknown calendar with a window without to answered %d %s, expected 404 calendar_not_found: the calendar is judged before the window", r.Status, r.Text())
 	ctx.Equal(ctx.Redis.Keys("exp:nope*"), []string{}, "the slices an unknown calendar left in the cache")
 }
 
 func CheckPrivateCalendars(ctx *harness.Ctx) {
 	c := rdClient(ctx)
-	for _, tc := range [][2]string{{"t2", "a tenant outside the calendar"}, {"", "a request without X-Tenant-Id"}} {
-		r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, tc[0])
-		ctx.Assert(r.Status == 403 && rdDecode(r).Error == "not_a_member", "%s reading the private calendar c2 answered %d, expected 403 not_a_member", tc[1], r.Status)
+	for _, tc := range [][3]string{
+		{"t2", rdWeek, "a tenant outside the calendar"},
+		{"", rdWeek, "a request without X-Tenant-Id"},
+		{"t2", rdWeek + "&tenant=t1", "a tenant outside the calendar naming t1 in the query"},
+		{"t2", "from=2026-03-02T00:00:00Z", "a tenant outside the calendar with a window without to"},
+	} {
+		r := rdGet(c, "/v1/calendars/c2/events?"+tc[1], tc[0])
+		ctx.Assert(r.Status == 403 && rdDecode(r).Error == "not_a_member", "%s reading the private calendar c2 answered %d, expected 403 not_a_member", tc[2], r.Status)
 	}
+	ctx.Equal(ctx.Redis.Keys("exp:c2*"), []string{}, "the slices the refused reads of c2 left in the cache (a stranger is refused before anything is expanded)")
 	r := rdGet(c, "/v1/calendars/c2/events?"+rdWeek, "t1")
 	ctx.Assert(r.Status == 200 && len(rdDecode(r).Occurrences) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text())
+	r = rdGet(c, "/v1/calendars/c1/events?"+rdWeek, "t2")
+	ctx.Assert(r.Status == 200 && len(rdDecode(r).Occurrences) == 7, "t2 reading the public calendar c1 answered %d %s: a public calendar is readable by anyone", r.Status, r.Text())
 }
 
 func CheckCacheControl(ctx *harness.Ctx) {
@@ -844,6 +880,7 @@ func CheckCacheControl(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "state.cpp"
@@ -897,8 +934,11 @@ void CheckRangeCap(harness::Ctx& ctx) {
   auto c = rdClient(ctx);
   const std::vector<std::pair<std::string, std::string>> cases = {
       {"from=2026-03-02T00:00:00Z&to=2026-06-30T00:00:00Z", "a 120-day window"},
+      {"from=2026-03-02T00:00:00Z&to=2026-05-31T00:00:01Z", "a window of 90 days and one second"},
       {"from=2026-03-02T00:00:00Z", "a window without to"},
       {"to=2026-03-09T00:00:00Z", "a window without from"},
+      {"from=2026-03-02T00:00:00&to=2026-03-09T00:00:00Z", "a from without an offset"},
+      {"from=2026-03-09T00:00:00Z&to=2026-03-02T00:00:00Z", "a to before from"},
   };
   for (const auto& [query, what] : cases) {
     const auto r = rdGet(c, "/v1/calendars/c1/events?" + query);
@@ -911,22 +951,35 @@ void CheckRangeCap(harness::Ctx& ctx) {
 
 void CheckUnknownCalendar(harness::Ctx& ctx) {
   auto c = rdClient(ctx);
-  const auto r = rdGet(c, "/v1/calendars/nope/events?" + kRdWeek);
+  auto r = rdGet(c, "/v1/calendars/nope/events?" + kRdWeek);
   ctx.Assert(r.Status == 404 && rdBody(r).value("error", "") == "calendar_not_found",
              "an unknown calendar answered %d %s, expected 404 calendar_not_found: an empty week is a different answer", r.Status, r.Text());
+  r = rdGet(c, "/v1/calendars/nope/events?from=2026-03-02T00:00:00Z");
+  ctx.Assert(r.Status == 404 && rdBody(r).value("error", "") == "calendar_not_found",
+             "an unknown calendar with a window without to answered %d %s, expected 404 calendar_not_found: the calendar is judged before the window", r.Status,
+             r.Text());
   ctx.Equal(ctx.Redis.Keys("exp:nope*"), std::vector<std::string>{}, "the slices an unknown calendar left in the cache");
 }
 
 void CheckPrivateCalendars(harness::Ctx& ctx) {
   auto c = rdClient(ctx);
-  const std::vector<std::pair<std::string, std::string>> cases = {{"t2", "a tenant outside the calendar"}, {"", "a request without X-Tenant-Id"}};
-  for (const auto& [tenant, what] : cases) {
-    const auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, tenant);
+  const std::vector<std::tuple<std::string, std::string, std::string>> cases = {
+      {"t2", kRdWeek, "a tenant outside the calendar"},
+      {"", kRdWeek, "a request without X-Tenant-Id"},
+      {"t2", kRdWeek + "&tenant=t1", "a tenant outside the calendar naming t1 in the query"},
+      {"t2", "from=2026-03-02T00:00:00Z", "a tenant outside the calendar with a window without to"},
+  };
+  for (const auto& [tenant, query, what] : cases) {
+    const auto r = rdGet(c, "/v1/calendars/c2/events?" + query, tenant);
     ctx.Assert(r.Status == 403 && rdBody(r).value("error", "") == "not_a_member",
                "%s reading the private calendar c2 answered %d, expected 403 not_a_member", what, r.Status);
   }
-  const auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, "t1");
+  ctx.Equal(ctx.Redis.Keys("exp:c2*"), std::vector<std::string>{},
+            "the slices the refused reads of c2 left in the cache (a stranger is refused before anything is expanded)");
+  auto r = rdGet(c, "/v1/calendars/c2/events?" + kRdWeek, "t1");
   ctx.Assert(r.Status == 200 && rdCount(r) == 7, "the member t1 reading c2 answered %d %s", r.Status, r.Text());
+  r = rdGet(c, "/v1/calendars/c1/events?" + kRdWeek, "t2");
+  ctx.Assert(r.Status == 200 && rdCount(r) == 7, "t2 reading the public calendar c1 answered %d %s: a public calendar is readable by anyone", r.Status, r.Text());
 }
 
 void CheckCacheControl(harness::Ctx& ctx) {

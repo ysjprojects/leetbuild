@@ -74,7 +74,7 @@ report; and a retry after a lost acknowledgement writes the event twice.
       id: 'outbox-from-delivery',
       title: 'Keeps a refused event in the outbox',
       detail:
-        'A produce the broker refuses is put in the outbox where the broker answers (the delivery callback, the rejected send, the returned write error), and `publish_partition` goes on; the starter’s `try` around the enqueue never sees the refusal.',
+        'A produce the broker refuses is put in the outbox, with the topic, key and value it was produced with, where the broker answers (the delivery callback, the rejected send, the returned write error), and `publish_partition` goes on; the starter’s `try` around the enqueue never sees the refusal.',
       match: {
         python: {all: [/on_delivery\s*=/, /outbox\.put\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/\bput\(TOPIC,/]},
@@ -579,6 +579,8 @@ def check_outbox_from_delivery(ctx):
     assert len(rows) == 1, f"the broker refused one produce and the outbox holds {len(rows)} rows: a refused event must be kept for the relay, from the delivery report"
     event = json.loads(rows[0].get("value", "null") or "null")
     assert rows[0].get("topic") == TOPIC and isinstance(event, dict) and event.get("partition_id") == "p-0", f"the outbox row must be the refused event on {TOPIC}, got {rows[0]}"
+    want = {"type": "partition_committed", "load_id": "ld-1", "target": "wh_acme.orders", "partition_id": "p-0", "rows_written": 250}
+    assert rows[0].get("key") == "wh_acme.orders" and event == want, f"the outbox row must keep the refused record as produced, key wh_acme.orders and value {want}, got {rows[0]}"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
     _publish(m, LOAD, "p-1")
     assert len(ctx.kafka.records(TOPIC)) == 1 and len(ctx.redis.lrange("loader:outbox", 0, -1)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row"
@@ -661,6 +663,9 @@ export async function check_outbox_from_delivery(ctx) {
   assert.equal(rows.length, 1, \`the broker refused one produce and the outbox holds \${rows.length} rows: a refused event must be kept for the relay, from the delivery report\`);
   const event = JSON.parse(rows[0].value ?? 'null');
   assert(rows[0].topic === TOPIC && event !== null && event.partition_id === 'p-0', \`the outbox row must be the refused event on \${TOPIC}, got \${JSON.stringify(rows[0])}\`);
+  const want = {type: 'partition_committed', load_id: 'ld-1', target: 'wh_acme.orders', partition_id: 'p-0', rows_written: 250};
+  assert.equal(rows[0].key, 'wh_acme.orders', \`the outbox row must keep the refused record's key, the target table, got \${JSON.stringify(rows[0])}\`);
+  assert.deepEqual(event, want, \`the outbox row must keep the refused event as produced, \${JSON.stringify(want)}, got \${JSON.stringify(rows[0])}\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
   await publish(m, LOAD, 'p-1');
   assert(ctx.kafka.records(TOPIC).length === 1 && outboxRows(ctx).length === 1, 'a healthy produce after the refusal reaches the topic and adds no outbox row');
@@ -780,6 +785,9 @@ func CheckOutboxFromDelivery(ctx *harness.Ctx) {
 	var event map[string]any
 	json.Unmarshal([]byte(row["value"]), &event)
 	ctx.Assert(row["topic"] == eventsTopic && event["partition_id"] == "p-0", "the outbox row must be the refused event on %s, got %s", eventsTopic, rows[0])
+	ctx.Equal(row["key"], "wh_acme.orders", "the outbox row keeps the refused record's key, the target table; its key")
+	want := map[string]any{"type": "partition_committed", "load_id": "ld-1", "target": "wh_acme.orders", "partition_id": "p-0", "rows_written": float64(250)}
+	ctx.Equal(event, want, "the outbox row keeps the refused event as produced; its value")
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
 	eventsPublish(ctx, eventsLoad, "p-1", 240)
 	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(ctx.Redis.LRange("loader:outbox", 0, -1)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
@@ -810,7 +818,7 @@ namespace {
 const std::string kEventsTopic = "load.event";
 const store::Load kLoad{"ld-1", "acme", "orders", "2026-10-20", "wh_acme.orders", "merge", "dedupe", "SELECT DISTINCT * FROM source", 3, 750, 750, "loading"};
 
-store::Load variant(const std::string& load_id, const std::string& target, long partitions) {
+store::Load hlVariant(const std::string& load_id, const std::string& target, long partitions) {
   store::Load load = kLoad;
   load.load_id = load_id;
   load.target = target;
@@ -818,7 +826,7 @@ store::Load variant(const std::string& load_id, const std::string& target, long 
   return load;
 }
 
-bool publish(harness::Ctx& ctx, const store::Load& load, const std::string& partition_id, long rows) {
+bool hlPublish(harness::Ctx& ctx, const store::Load& load, const std::string& partition_id, long rows) {
   bool done = false;
   try {
     done = publishPartition(load, partition_id, rows);
@@ -830,7 +838,7 @@ bool publish(harness::Ctx& ctx, const store::Load& load, const std::string& part
   return done;
 }
 
-std::vector<nlohmann::json> events(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hlEvents(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& r : ctx.Kafka.Records(kEventsTopic)) out.push_back(nlohmann::json::parse(r.Value.value_or("null"), nullptr, false));
   return out;
@@ -838,7 +846,7 @@ std::vector<nlohmann::json> events(harness::Ctx& ctx) {
 
 size_t completedCount(harness::Ctx& ctx) {
   size_t n = 0;
-  for (const auto& e : events(ctx)) {
+  for (const auto& e : hlEvents(ctx)) {
     if (e.is_object() && e.value("type", "") == "load_completed") n++;
   }
   return n;
@@ -847,9 +855,9 @@ size_t completedCount(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckTableKey(harness::Ctx& ctx) {
-  publish(ctx, kLoad, "p-0", 250);
-  publish(ctx, variant("ld-2", "wh_acme.orders", 2), "p-0", 250);
-  publish(ctx, variant("ld-3", "wh_acme.refunds", 1), "p-0", 250);
+  hlPublish(ctx, kLoad, "p-0", 250);
+  hlPublish(ctx, hlVariant("ld-2", "wh_acme.orders", 2), "p-0", 250);
+  hlPublish(ctx, hlVariant("ld-3", "wh_acme.refunds", 1), "p-0", 250);
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(records.size(), 4, "three partition commits, one completing ld-3; the records on %s", kEventsTopic);
   std::set<int> partitions;
@@ -863,12 +871,12 @@ void CheckTableKey(harness::Ctx& ctx) {
 }
 
 void CheckCompleteAfterFinal(harness::Ctx& ctx) {
-  ctx.Equal(publish(ctx, kLoad, "p-2", 260), false, "p-2 committed first: ld-1 still misses p-0 and p-1; completed");
+  ctx.Equal(hlPublish(ctx, kLoad, "p-2", 260), false, "p-2 committed first: ld-1 still misses p-0 and p-1; completed");
   ctx.Equal(completedCount(ctx), 0, "load_completed must not be produced when p-2, the last partition by number, commits first; load_completed events");
-  ctx.Equal(publish(ctx, kLoad, "p-0", 250), false, "with p-1 missing; completed");
-  ctx.Equal(publish(ctx, kLoad, "p-1", 240), true, "the commit of p-1 completed ld-1; completed");
+  ctx.Equal(hlPublish(ctx, kLoad, "p-0", 250), false, "with p-1 missing; completed");
+  ctx.Equal(hlPublish(ctx, kLoad, "p-1", 240), true, "the commit of p-1 completed ld-1; completed");
   ctx.Equal(completedCount(ctx), 1, "ld-1 completed once; load_completed events");
-  const auto all = events(ctx);
+  const auto all = hlEvents(ctx);
   ctx.Equal(all.back(), nlohmann::json({{"type", "load_completed"}, {"load_id", "ld-1"}, {"target", "wh_acme.orders"}, {"partitions", 3}}),
             "load_completed must follow the final partition_committed; the last event");
   std::map<std::string, long> committed;
@@ -876,31 +884,33 @@ void CheckCompleteAfterFinal(harness::Ctx& ctx) {
     if (e.value("type", "") == "partition_committed") committed[e.value("partition_id", "")] = e.value("rows_written", 0L);
   }
   ctx.Equal(committed, std::map<std::string, long>{{"p-0", 250}, {"p-1", 240}, {"p-2", 260}}, "partition_committed must carry each partition with the rows the warehouse wrote");
-  ctx.Equal(publish(ctx, kLoad, "p-1", 240), false, "a redelivered p-1 did not complete the load again; completed");
+  ctx.Equal(hlPublish(ctx, kLoad, "p-1", 240), false, "a redelivered p-1 did not complete the load again; completed");
   ctx.Equal(completedCount(ctx), 1, "a redelivered final partition must not produce a second load_completed; load_completed events");
 }
 
 void CheckOutboxFromDelivery(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  publish(ctx, kLoad, "p-0", 250);
+  hlPublish(ctx, kLoad, "p-0", 250);
   const auto rows = ctx.Redis.LRange("loader:outbox", 0, -1);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: a refused event must be kept for the relay, from the delivery report; outbox rows");
   const auto row = nlohmann::json::parse(rows[0], nullptr, false);
   const auto event = nlohmann::json::parse(row.is_object() ? row.value("value", "null") : "null", nullptr, false);
   ctx.Assert(row.is_object() && row.value("topic", "") == kEventsTopic && event.is_object() && event.value("partition_id", "") == "p-0",
              "the outbox row must be the refused event on %s, got %s", kEventsTopic, rows[0]);
+  const nlohmann::json want = {{"type", "partition_committed"}, {"load_id", "ld-1"}, {"target", "wh_acme.orders"}, {"partition_id", "p-0"}, {"rows_written", 250}};
+  ctx.Assert(row.is_object() && row.value("key", "") == "wh_acme.orders" && event == want, "the outbox row must keep the refused record as produced, key wh_acme.orders and value %s, got %s", want.dump(), rows[0]);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
-  publish(ctx, kLoad, "p-1", 240);
+  hlPublish(ctx, kLoad, "p-1", 240);
   ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && ctx.Redis.LRange("loader:outbox", 0, -1).size() == 1,
              "a healthy produce after the refusal reaches the topic and adds no outbox row");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kEventsTopic, 1);
-  publish(ctx, kLoad, "p-0", 250);
+  hlPublish(ctx, kLoad, "p-0", 250);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
             "one partition_committed whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence (with acks=all); the records on the topic");
-  publish(ctx, kLoad, "p-1", 240);
+  hlPublish(ctx, kLoad, "p-1", 240);
   const int lost = ctx.Kafka.Failover(kEventsTopic);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }

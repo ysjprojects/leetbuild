@@ -49,7 +49,7 @@ service Notifier {
       id: 'deadline',
       title: 'Bounds every attempt with a 3 s deadline',
       detail:
-        'A notifier that answers in two seconds is notified, and the call carries a deadline of about 3 s. The starter sends the call with no deadline, so a notifier that hangs holds the request worker with it.',
+        'A notifier that answers in two seconds is notified, and every attempt carries its own deadline of about 3 s: after a 2 s attempt whose reply was lost, the retry still gets 3 s and the notice is delivered. The starter sends the call with no deadline, so a notifier that hangs holds the request worker with it.',
       match: {
         python: {all: [/NotifyAttendees\([\s\S]{0,200}?timeout\s*=\s*(NOTIFY_DEADLINE_S|3(\.0)?)\b/]},
         typescript: {
@@ -68,7 +68,7 @@ service Notifier {
       id: 'one-token',
       title: 'Retries a notification with the token of the change',
       detail:
-        'When the first call mails the attendees and its reply is lost, the retry carries the same `{event_id}:{revision}:{kind}` token and every attendee is mailed once. The starter draws a new token for every attempt, so the notifier mails everyone again.',
+        'When the first call mails the attendees and its reply is lost, the retry carries the same `{event_id}:{revision}:{kind}` token and every attendee is mailed once. Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, up to 3 attempts: `INVALID_ARGUMENT` and `PERMISSION_DENIED` get one call. The starter draws a new token for every attempt, so the notifier mails everyone again.',
       match: {
         python: {
           all: [/f["']\{[^}]*event_id[^}]*\}:\{[^}]*revision[^}]*\}:\{kind\}["']/],
@@ -96,7 +96,7 @@ service Notifier {
       id: 'change-kind',
       title: 'Sends an update, not a new invitation, to attendees who stay',
       detail:
-        'A title fix that keeps two attendees and adds one sends `update` to the two and `create` to the new one. The starter sends `create` to everyone, so people who already accepted are asked again.',
+        'After the invitations of revision 1, a title fix in revision 2 that keeps two attendees and adds one sends `update` to the two and `create` to the new one, with tokens of revision 2. The starter sends `create` to everyone, so people who already accepted are asked again.',
       match: {
         python: {all: [/["']update["']/, /in before\[["']attendees["']\]/]},
         typescript: {all: [/['"]update['"]/, /before\.attendees\.includes\(/]},
@@ -109,7 +109,7 @@ service Notifier {
       id: 'removed-cancel',
       title: 'Sends a cancel to attendees taken off the event',
       detail:
-        'An attendee in `before` but not in `after` receives `cancel`. The starter only writes to the attendees of `after`, so a removed colleague keeps the meeting in their calendar.',
+        'An attendee in `before` but not in `after` receives `cancel`, and a group with nobody in it gets no call. The starter only writes to the attendees of `after`, so a removed colleague keeps the meeting in their calendar.',
       match: {
         python: {all: [/["']cancel["']/, /not in after\[["']attendees["']\]/]},
         typescript: {all: [/['"]cancel['"]/, /!after\.attendees\.includes\(/]},
@@ -763,6 +763,10 @@ def _revision(**changes):
     return {**EVENT, "revision": 2, **changes}
 
 
+def _calls_for(ctx, event_id):
+    return [c for c in ctx.grpc.calls_to("NotifyAttendees") if c.request.event_id == event_id]
+
+
 def check_deadline(ctx):
     m, notifier = _world(ctx)
     ctx.grpc.set_latency("NotifyAttendees", 2.0)
@@ -771,6 +775,15 @@ def check_deadline(ctx):
     call = ctx.grpc.calls_to("NotifyAttendees")[0]
     assert call.timeout is not None, "the NotifyAttendees call carries no deadline: a notifier that hangs holds the request worker with it"
     assert 2.5 <= call.timeout <= 3.5, f"the NotifyAttendees deadline is {call.timeout} s, expected about 3 s"
+    # The first attempt takes 2 s and its reply is lost: the retry gets 3 s of its own.
+    notifier.drop_replies = 1
+    error = None
+    try:
+        m.notify_change(None, {**EVENT, "event_id": "e-2"})
+    except Exception as exc:
+        error = exc
+    timeouts = [c.timeout for c in _calls_for(ctx, "e-2")]
+    assert error is None and len(timeouts) == 2 and all(t is not None and 2.5 <= t <= 3.5 for t in timeouts), f"after a 2 s attempt whose reply was lost the attempts carried the deadlines {timeouts} and notify_change {'raised ' + type(error).__name__ if error else 'returned'}, expected about 3 s on each of 2 attempts and the notice delivered: every attempt gets its own deadline"
 
 
 def check_one_token(ctx):
@@ -782,23 +795,37 @@ def check_one_token(ctx):
     tokens = [c.request.idempotency_token for c in calls]
     assert tokens == ["e-1:1:create", "e-1:1:create"], f"the attempts carried the tokens {tokens}, expected e-1:1:create on both: the retry is the same notification"
     assert sorted(notifier.mails) == [("ana@example.com", "create"), ("bo@example.com", "create")], f"the attendees were mailed {sorted(notifier.mails)}: a retry after a lost reply mailed them again"
+    # Only UNAVAILABLE and DEADLINE_EXCEEDED are retried, at most 3 attempts in all.
+    for n, (code, expected) in enumerate(((grpc.StatusCode.INVALID_ARGUMENT, 1), (grpc.StatusCode.PERMISSION_DENIED, 1), (grpc.StatusCode.UNAVAILABLE, 3))):
+        event_id = f"e-{n + 2}"
+        ctx.grpc.fail("NotifyAttendees", code, times=expected)
+        try:
+            m.notify_change(None, {**EVENT, "event_id": event_id})
+        except Exception:
+            pass  # whether the failure reaches the caller is not this check's question
+        made = len(_calls_for(ctx, event_id))
+        assert made == expected, f"a notifier failing {code.name} got {made} calls, expected {expected}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, up to 3 attempts"
 
 
 def check_change_kind(ctx):
     m, notifier = _world(ctx)
+    m.notify_change(None, dict(EVENT))  # revision 1 invited ana and bo
+    notifier.mails.clear()
     after = _revision(title="Standup (moved to room 4)", attendees=["ana@example.com", "bo@example.com", "cy@example.com"])
     sent = m.notify_change(dict(EVENT), after)
     assert ("ana@example.com", "create") not in notifier.mails, f"ana, who already has the invitation, got a new one for a title fix: {sorted(notifier.mails)}"
-    assert sorted(notifier.mails) == [("ana@example.com", "update"), ("bo@example.com", "update"), ("cy@example.com", "create")], f"the change mailed {sorted(notifier.mails)}, expected an update to ana and bo and an invitation to cy"
+    assert sorted(notifier.mails) == [("ana@example.com", "update"), ("bo@example.com", "update"), ("cy@example.com", "create")], f"after the invitations of revision 1, the change to revision 2 mailed {sorted(notifier.mails)}, expected an update to ana and bo and an invitation to cy (each notification's token names revision 2)"
     assert sent == 2, f"notify_change returned {sent}, expected 2 notifications (update, create)"
 
 
 def check_removed_cancel(ctx):
     m, notifier = _world(ctx)
     before = {**EVENT, "attendees": ["ana@example.com", "bo@example.com", "cy@example.com"]}
-    m.notify_change(before, _revision(attendees=["ana@example.com", "bo@example.com"]))
+    sent = m.notify_change(before, _revision(attendees=["ana@example.com", "bo@example.com"]))
     assert ("cy@example.com", "cancel") in notifier.mails, f"cy was taken off the event and was mailed {[k for a, k in notifier.mails if a == 'cy@example.com']}: without a cancel the meeting stays in cy's calendar"
     assert sorted(notifier.mails) == [("ana@example.com", "update"), ("bo@example.com", "update"), ("cy@example.com", "cancel")], f"the change mailed {sorted(notifier.mails)}, expected updates to ana and bo and a cancel to cy"
+    kinds = [c.request.kind for c in ctx.grpc.calls_to("NotifyAttendees")]
+    assert sorted(kinds) == ["cancel", "update"] and sent == 2, f"the change made calls of kinds {kinds} and returned {sent}, expected one update and one cancel: an empty group gets no call"
 `,
     typescript: `const EVENT = {
   event_id: 'e-1',
@@ -847,6 +874,19 @@ export async function check_deadline(ctx) {
   const call = ctx.grpc.callsTo('NotifyAttendees')[0];
   assert(call.timeout !== null, 'the NotifyAttendees call carries no deadline: a notifier that hangs holds the request worker with it');
   assert(2.5 <= call.timeout && call.timeout <= 3.5, \`the NotifyAttendees deadline is \${call.timeout} s, expected about 3 s\`);
+  // The first attempt takes 2 s and its reply is lost: the retry gets 3 s of its own.
+  notifier.dropReplies = 1;
+  let error: unknown = null;
+  try {
+    await m.notifyChange(null, {...EVENT, event_id: 'e-2'});
+  } catch (err) {
+    error = err;
+  }
+  const timeouts = ctx.grpc.callsTo('NotifyAttendees').filter(c => c.request.event_id === 'e-2').map(c => c.timeout);
+  assert(
+    error === null && timeouts.length === 2 && timeouts.every(t => t !== null && 2.5 <= t && t <= 3.5),
+    \`after a 2 s attempt whose reply was lost the attempts carried the deadlines \${JSON.stringify(timeouts)} and notifyChange \${error === null ? 'resolved' : 'rejected'}, expected about 3 s on each of 2 attempts and the notice delivered: every attempt gets its own deadline\`,
+  );
 }
 
 export async function check_one_token(ctx) {
@@ -858,23 +898,40 @@ export async function check_one_token(ctx) {
   const tokens = calls.map(c => c.request.idempotency_token);
   assert.deepEqual(tokens, ['e-1:1:create', 'e-1:1:create'], \`the attempts carried the tokens \${JSON.stringify(tokens)}, expected e-1:1:create on both: the retry is the same notification\`);
   assert.deepEqual([...notifier.mails].sort(), ['ana@example.com create', 'bo@example.com create'], \`the attendees were mailed \${JSON.stringify(notifier.mails)}: a retry after a lost reply mailed them again\`);
+  // Only UNAVAILABLE and DEADLINE_EXCEEDED are retried, at most 3 attempts in all.
+  const cases: [string, number][] = [['INVALID_ARGUMENT', 1], ['PERMISSION_DENIED', 1], ['UNAVAILABLE', 3]];
+  for (const [n, [name, expected]] of cases.entries()) {
+    const eventId = \`e-\${n + 2}\`;
+    ctx.grpc.fail('NotifyAttendees', ctx.grpc.status[name], '', expected);
+    try {
+      await m.notifyChange(null, {...EVENT, event_id: eventId});
+    } catch {
+      // whether the failure reaches the caller is not this check's question
+    }
+    const made = ctx.grpc.callsTo('NotifyAttendees').filter(c => c.request.event_id === eventId).length;
+    assert.equal(made, expected, \`a notifier failing \${name} got \${made} calls, expected \${expected}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, up to 3 attempts\`);
+  }
 }
 
 export async function check_change_kind(ctx) {
   const {m, notifier} = world(ctx);
+  await m.notifyChange(null, {...EVENT}); // revision 1 invited ana and bo
+  notifier.mails.length = 0;
   const after = revision2({title: 'Standup (moved to room 4)', attendees: ['ana@example.com', 'bo@example.com', 'cy@example.com']});
   const sent = await m.notifyChange({...EVENT}, after);
   assert(!notifier.mails.includes('ana@example.com create'), \`ana, who already has the invitation, got a new one for a title fix: \${JSON.stringify(notifier.mails)}\`);
-  assert.deepEqual([...notifier.mails].sort(), ['ana@example.com update', 'bo@example.com update', 'cy@example.com create'], \`the change mailed \${JSON.stringify(notifier.mails)}, expected an update to ana and bo and an invitation to cy\`);
+  assert.deepEqual([...notifier.mails].sort(), ['ana@example.com update', 'bo@example.com update', 'cy@example.com create'], \`after the invitations of revision 1, the change to revision 2 mailed \${JSON.stringify(notifier.mails)}, expected an update to ana and bo and an invitation to cy (each notification's token names revision 2)\`);
   assert.equal(sent, 2, \`notifyChange resolved \${sent}, expected 2 notifications (update, create)\`);
 }
 
 export async function check_removed_cancel(ctx) {
   const {m, notifier} = world(ctx);
   const before = {...EVENT, attendees: ['ana@example.com', 'bo@example.com', 'cy@example.com']};
-  await m.notifyChange(before, revision2({attendees: ['ana@example.com', 'bo@example.com']}));
+  const sent = await m.notifyChange(before, revision2({attendees: ['ana@example.com', 'bo@example.com']}));
   assert(notifier.mails.includes('cy@example.com cancel'), \`cy was taken off the event and was mailed \${JSON.stringify(notifier.mails.filter(x => x.startsWith('cy@')))}: without a cancel the meeting stays in cy's calendar\`);
   assert.deepEqual([...notifier.mails].sort(), ['ana@example.com update', 'bo@example.com update', 'cy@example.com cancel'], \`the change mailed \${JSON.stringify(notifier.mails)}, expected updates to ana and bo and a cancel to cy\`);
+  const kinds = ctx.grpc.callsTo('NotifyAttendees').map(c => c.request.kind);
+  assert(JSON.stringify([...kinds].sort()) === '["cancel","update"]' && sent === 2, \`the change made calls of kinds \${JSON.stringify(kinds)} and resolved \${sent}, expected one update and one cancel: an empty group gets no call\`);
 }
 `,
     go: `package main
@@ -882,6 +939,7 @@ export async function check_removed_cancel(ctx) {
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -943,6 +1001,22 @@ func ntMails(n *notifierPeer) []string {
 	return mails
 }
 
+func ntCallsFor(ctx *harness.Ctx, eventID string) []harness.Call {
+	var calls []harness.Call
+	for _, c := range ctx.GRPC.CallsTo("NotifyAttendees", "") {
+		if req, _ := c.Request.(*pb.NotifyRequest); req.GetEventId() == eventID {
+			calls = append(calls, c)
+		}
+	}
+	return calls
+}
+
+func ntEventWithID(eventID string) store.Event {
+	e := ntEvent(1, "Standup", "ana@example.com", "bo@example.com")
+	e.EventID = eventID
+	return e
+}
+
 func CheckDeadline(ctx *harness.Ctx) {
 	notifier := ntWorld(ctx)
 	ctx.GRPC.SetLatency("NotifyAttendees", 2.0, "")
@@ -951,6 +1025,16 @@ func CheckDeadline(ctx *harness.Ctx) {
 	call := ctx.GRPC.CallsTo("NotifyAttendees", "")[0]
 	ctx.Assert(call.HasDeadline(), "the NotifyAttendees call carries no deadline: a notifier that hangs holds the request worker with it")
 	ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "the NotifyAttendees deadline is %v, expected about 3 s", call.Timeout)
+	// The first attempt takes 2 s and its reply is lost: the retry gets 3 s of its own.
+	notifier.dropReplies = 1
+	_, err := notifyChange(context.Background(), nil, ntEventWithID("e-2"))
+	var timeouts []time.Duration
+	ok := err == nil
+	for _, c := range ntCallsFor(ctx, "e-2") {
+		timeouts = append(timeouts, c.Timeout)
+		ok = ok && c.HasDeadline() && 2500*time.Millisecond <= c.Timeout && c.Timeout <= 3500*time.Millisecond
+	}
+	ctx.Assert(ok && len(timeouts) == 2, "after a 2 s attempt whose reply was lost the attempts carried the deadlines %v and notifyChange returned %v, expected about 3 s on each of 2 attempts and the notice delivered: every attempt gets its own deadline", timeouts, err)
 }
 
 func CheckOneToken(ctx *harness.Ctx) {
@@ -966,23 +1050,37 @@ func CheckOneToken(ctx *harness.Ctx) {
 	}
 	ctx.Equal(tokens, []string{"e-1:1:create", "e-1:1:create"}, "the attempts' tokens (the retry is the same notification)")
 	ctx.Equal(ntMails(notifier), []string{"ana@example.com create", "bo@example.com create"}, "the mails after a lost reply (a retry must not mail the attendees again)")
+	// Only UNAVAILABLE and DEADLINE_EXCEEDED are retried, at most 3 attempts in all.
+	cases := []struct {
+		code     codes.Code
+		expected int
+	}{{codes.InvalidArgument, 1}, {codes.PermissionDenied, 1}, {codes.Unavailable, 3}}
+	for n, tc := range cases {
+		eventID := "e-" + strconv.Itoa(n+2)
+		ctx.GRPC.Fail("NotifyAttendees", tc.code, "", tc.expected, "")
+		_, _ = notifyChange(context.Background(), nil, ntEventWithID(eventID)) // whether the failure reaches the caller is not this check's question
+		made := len(ntCallsFor(ctx, eventID))
+		ctx.Assert(made == tc.expected, "a notifier failing %v got %d calls, expected %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, up to 3 attempts", tc.code, made, tc.expected)
+	}
 }
 
 func CheckChangeKind(ctx *harness.Ctx) {
 	notifier := ntWorld(ctx)
 	before := ntEvent(1, "Standup", "ana@example.com", "bo@example.com")
+	ntNotify(ctx, nil, before) // revision 1 invited ana and bo
+	notifier.mails = nil
 	sent := ntNotify(ctx, &before, ntEvent(2, "Standup (moved to room 4)", "ana@example.com", "bo@example.com", "cy@example.com"))
 	for _, mail := range notifier.mails {
 		ctx.Assert(mail != "ana@example.com create", "ana, who already has the invitation, got a new one for a title fix: %v", notifier.mails)
 	}
-	ctx.Equal(ntMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com create"}, "an update to ana and bo and an invitation to cy; the mails")
+	ctx.Equal(ntMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com create"}, "after the invitations of revision 1, an update to ana and bo and an invitation to cy (each notification's token names revision 2); the mails")
 	ctx.Equal(sent, 2, "notifyChange's count of notifications (update, create)")
 }
 
 func CheckRemovedCancel(ctx *harness.Ctx) {
 	notifier := ntWorld(ctx)
 	before := ntEvent(1, "Standup", "ana@example.com", "bo@example.com", "cy@example.com")
-	ntNotify(ctx, &before, ntEvent(2, "Standup", "ana@example.com", "bo@example.com"))
+	sent := ntNotify(ctx, &before, ntEvent(2, "Standup", "ana@example.com", "bo@example.com"))
 	var cy []string
 	for _, mail := range notifier.mails {
 		if strings.HasPrefix(mail, "cy@") {
@@ -991,6 +1089,13 @@ func CheckRemovedCancel(ctx *harness.Ctx) {
 	}
 	ctx.Equal(cy, []string{"cy@example.com cancel"}, "cy was taken off the event: without a cancel the meeting stays in cy's calendar; cy's mails")
 	ctx.Equal(ntMails(notifier), []string{"ana@example.com update", "bo@example.com update", "cy@example.com cancel"}, "updates to ana and bo and a cancel to cy; the mails")
+	var kinds []string
+	for _, c := range ctx.GRPC.CallsTo("NotifyAttendees", "") {
+		req, _ := c.Request.(*pb.NotifyRequest)
+		kinds = append(kinds, req.GetKind())
+	}
+	sort.Strings(kinds)
+	ctx.Assert(strings.Join(kinds, ",") == "cancel,update" && sent == 2, "the change made calls of kinds %v and returned %d, expected one update and one cancel: an empty group gets no call", kinds, sent)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -999,6 +1104,7 @@ func CheckRemovedCancel(ctx *harness.Ctx) {
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -1046,6 +1152,20 @@ std::vector<std::string> ntMails(const NotifierPeer* n) {
   return mails;
 }
 
+calendard::Event ntEventWithId(const std::string& event_id) {
+  auto e = ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"});
+  e.event_id = event_id;
+  return e;
+}
+
+std::vector<harness::Call> ntCallsFor(harness::Ctx& ctx, const std::string& event_id) {
+  std::vector<harness::Call> calls;
+  for (const auto& c : ctx.GRPC.CallsTo("NotifyAttendees")) {
+    if (c.Request<calnotify::NotifyRequest>().event_id() == event_id) calls.push_back(c);
+  }
+  return calls;
+}
+
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
@@ -1056,6 +1176,24 @@ void CheckDeadline(harness::Ctx& ctx) {
   const auto call = ctx.GRPC.CallsTo("NotifyAttendees")[0];
   ctx.Assert(call.HasDeadline(), "the NotifyAttendees call carries no deadline: a notifier that hangs holds the request worker with it");
   ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "the NotifyAttendees deadline is %vs, expected about 3 s", call.TimeoutSeconds());
+  // The first attempt takes 2 s and its reply is lost: the retry gets 3 s of its own.
+  notifier->drop_replies = 1;
+  std::string error;
+  try {
+    notifyChange(std::nullopt, ntEventWithId("e-2"));
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+  std::vector<double> timeouts;
+  bool ok = error.empty();
+  for (const auto& c : ntCallsFor(ctx, "e-2")) {
+    timeouts.push_back(c.TimeoutSeconds());
+    ok = ok && c.HasDeadline() && 2.5 <= c.TimeoutSeconds() && c.TimeoutSeconds() <= 3.5;
+  }
+  ctx.Assert(ok && timeouts.size() == 2,
+             "after a 2 s attempt whose reply was lost the attempts carried the deadlines %v and notifyChange threw %q, expected about 3 s on each of 2 "
+             "attempts and the notice delivered: every attempt gets its own deadline",
+             timeouts, error);
 }
 
 void CheckOneToken(harness::Ctx& ctx) {
@@ -1068,29 +1206,52 @@ void CheckOneToken(harness::Ctx& ctx) {
   for (const auto& c : calls) tokens.push_back(c.Request<calnotify::NotifyRequest>().idempotency_token());
   ctx.Equal(tokens, {"e-1:1:create", "e-1:1:create"}, "the attempts' tokens (the retry is the same notification)");
   ctx.Equal(ntMails(notifier), {"ana@example.com create", "bo@example.com create"}, "the mails after a lost reply (a retry must not mail the attendees again)");
+  // Only UNAVAILABLE and DEADLINE_EXCEEDED are retried, at most 3 attempts in all.
+  const std::vector<std::tuple<grpc::StatusCode, std::string, int>> cases = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT", 1}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", 1}, {grpc::StatusCode::UNAVAILABLE, "UNAVAILABLE", 3}};
+  for (size_t n = 0; n < cases.size(); n++) {
+    const auto& [code, name, expected] = cases[n];
+    const std::string event_id = "e-" + std::to_string(n + 2);
+    ctx.GRPC.Fail("NotifyAttendees", code, "", expected);
+    try {
+      notifyChange(std::nullopt, ntEventWithId(event_id));
+    } catch (...) {
+      // whether the failure reaches the caller is not this check's question
+    }
+    const int made = static_cast<int>(ntCallsFor(ctx, event_id).size());
+    ctx.Assert(made == expected, "a notifier failing %s got %d calls, expected %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, up to 3 attempts", name, made, expected);
+  }
 }
 
 void CheckChangeKind(harness::Ctx& ctx) {
   auto* notifier = ntWorld(ctx);
-  const int sent = notifyChange(ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"}),
-                                ntEvent(2, "Standup (moved to room 4)", {"ana@example.com", "bo@example.com", "cy@example.com"}));
+  const auto before = ntEvent(1, "Standup", {"ana@example.com", "bo@example.com"});
+  notifyChange(std::nullopt, before);  // revision 1 invited ana and bo
+  notifier->mails.clear();
+  const int sent = notifyChange(before, ntEvent(2, "Standup (moved to room 4)", {"ana@example.com", "bo@example.com", "cy@example.com"}));
   for (const auto& mail : notifier->mails) {
     ctx.Assert(mail != "ana@example.com create", "ana, who already has the invitation, got a new one for a title fix: %v", notifier->mails);
   }
-  ctx.Equal(ntMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com create"}, "an update to ana and bo and an invitation to cy; the mails");
+  ctx.Equal(ntMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com create"},
+            "after the invitations of revision 1, an update to ana and bo and an invitation to cy (each notification's token names revision 2); the mails");
   ctx.Equal(sent, 2, "notifyChange's count of notifications (update, create)");
 }
 
 void CheckRemovedCancel(harness::Ctx& ctx) {
   auto* notifier = ntWorld(ctx);
-  notifyChange(ntEvent(1, "Standup", {"ana@example.com", "bo@example.com", "cy@example.com"}),
-               ntEvent(2, "Standup", {"ana@example.com", "bo@example.com"}));
+  const int sent = notifyChange(ntEvent(1, "Standup", {"ana@example.com", "bo@example.com", "cy@example.com"}),
+                                ntEvent(2, "Standup", {"ana@example.com", "bo@example.com"}));
   std::vector<std::string> cy;
   for (const auto& mail : notifier->mails) {
     if (mail.rfind("cy@", 0) == 0) cy.push_back(mail);
   }
   ctx.Equal(cy, {"cy@example.com cancel"}, "cy was taken off the event: without a cancel the meeting stays in cy's calendar; cy's mails");
   ctx.Equal(ntMails(notifier), {"ana@example.com update", "bo@example.com update", "cy@example.com cancel"}, "updates to ana and bo and a cancel to cy; the mails");
+  std::vector<std::string> kinds;
+  for (const auto& c : ctx.GRPC.CallsTo("NotifyAttendees")) kinds.push_back(c.Request<calnotify::NotifyRequest>().kind());
+  std::sort(kinds.begin(), kinds.end());
+  ctx.Assert(kinds == std::vector<std::string>{"cancel", "update"} && sent == 2,
+             "the change made calls of kinds %v and returned %d, expected one update and one cancel: an empty group gets no call", kinds, sent);
 }
 `,
   },

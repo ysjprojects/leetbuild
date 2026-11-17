@@ -53,7 +53,7 @@ abandoned load stay in Redis.
       id: 'complete-once',
       title: 'Exactly one commit completes the load',
       detail:
-        'One Lua script adds the partition, counts the set and sets the flag only if it was unset, answering 1 to that commit alone; the starter’s separate commands let two workers both see a full count.',
+        'One Lua script adds the partition, counts the set and sets the flag only if it was unset, answering 1 to that commit alone, also when two workers commit the same redelivered last partition at once; the starter’s separate commands let two workers both see a full count.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /EXISTS|\bNX\b/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /EXISTS|\bNX\b/]},
@@ -66,7 +66,7 @@ abandoned load stay in Redis.
       id: 'expiry',
       title: 'Expires the progress keys',
       detail:
-        'Both `load:{id}:partitions` and `load:{id}:complete` carry `LOAD_TTL_S` (7 days); the starter writes them without a TTL, so every abandoned load stays in Redis.',
+        'Both `load:{id}:partitions` and `load:{id}:complete` carry `LOAD_TTL_S` (7 days) from the command that writes them, not from a later one; the starter writes them without a TTL, so every abandoned load stays in Redis.',
       match: {
         python: {all: [/LOAD_TTL_S\s*=/, /EXPIRE|'EX'|"EX"/]},
         typescript: {all: [/LOAD_TTL_S\s*=/, /EXPIRE|'EX'|"EX"/]},
@@ -375,14 +375,29 @@ def check_complete_once(ctx):
     assert winners == 1, f"two workers committed the last two partitions at once and {winners} of them were told they completed the load (this one {mine}, the other {rival.result}): exactly one may announce the completion"
     assert m.is_complete("ld-1") is True, "after all three partitions committed ld-1 must read as complete"
     assert m.commit_partition("ld-1", "p-2", 3) is False, "a redelivered final partition reported completing the load a second time"
+    # The last partition of ld-2 was redelivered: two workers commit it at once, and the other one
+    # lands right after this worker's first command on the completion flag.
+    assert m.commit_partition("ld-2", "p-0", 2) is False, "the first of two partitions must not complete the load"
+    rival = ctx.redis_after("load:ld-2:complete", lambda: m.commit_partition("ld-2", "p-1", 2))
+    mine = m.commit_partition("ld-2", "p-1", 2)
+    assert rival.fired, "the commit of the last partition never touched load:ld-2:complete"
+    if rival.error is not None:
+        raise rival.error
+    winners = [mine, rival.result].count(True)
+    assert winners == 1, f"two workers committed the redelivered last partition at once and {winners} of them were told they completed the load (this one {mine}, the other {rival.result}): checking the flag and setting it are one step"
 
 
 def check_expiry(ctx):
     m = ctx.load("state")
+    # The TTL as it stands right after the first command that touched each key: -2 if it did not create it.
+    created = ctx.redis_after("load:ld-1:partitions", lambda: ctx.redis.ttl("load:ld-1:partitions"))
     m.commit_partition("ld-1", "p-0", 2)
+    assert created.fired and created.result != -1, "load:ld-1:partitions existed without a TTL right after the command that wrote it: the TTL is set in the same step as the write, or a crash in between leaves it forever"
     ttl = ctx.redis.ttl("load:ld-1:partitions")
     assert LOAD_TTL_S - 60 <= ttl <= LOAD_TTL_S, f"load:ld-1:partitions has TTL {ttl}, expected LOAD_TTL_S ({LOAD_TTL_S} s): an abandoned load's progress must expire"
+    created = ctx.redis_after("load:ld-1:complete", lambda: ctx.redis.ttl("load:ld-1:complete"))
     m.commit_partition("ld-1", "p-1", 2)
+    assert created.fired and created.result != -1, "load:ld-1:complete existed without a TTL right after the command that set it: the TTL is set in the same step as the flag"
     ttl = ctx.redis.ttl("load:ld-1:complete")
     assert LOAD_TTL_S - 60 <= ttl <= LOAD_TTL_S, f"load:ld-1:complete has TTL {ttl}, expected LOAD_TTL_S ({LOAD_TTL_S} s): a flag that outlives its load makes a re-run look done"
 `,
@@ -410,14 +425,29 @@ export async function check_complete_once(ctx) {
   assert.equal(winners, 1, \`two workers committed the last two partitions at once and \${winners} of them were told they completed the load (this one \${mine}, the other \${theirs}): exactly one may announce the completion\`);
   assert.equal(await m.isComplete('ld-1'), true, 'after all three partitions committed ld-1 must read as complete');
   assert.equal(await m.commitPartition('ld-1', 'p-2', 3), false, 'a redelivered final partition reported completing the load a second time');
+  // The last partition of ld-2 was redelivered: two workers commit it at once, and the other one
+  // lands right after this worker's first command on the completion flag.
+  assert.equal(await m.commitPartition('ld-2', 'p-0', 2), false, 'the first of two partitions must not complete the load');
+  const twin = ctx.redisAfter('load:ld-2:complete', () => m.commitPartition('ld-2', 'p-1', 2));
+  const again = await m.commitPartition('ld-2', 'p-1', 2);
+  assert(twin.fired, 'the commit of the last partition never touched load:ld-2:complete');
+  if (twin.error !== undefined) throw twin.error;
+  const other = await twin.result;
+  const both = [again, other].filter(won => won === true).length;
+  assert.equal(both, 1, \`two workers committed the redelivered last partition at once and \${both} of them were told they completed the load (this one \${again}, the other \${other}): checking the flag and setting it are one step\`);
 }
 
 export async function check_expiry(ctx) {
   const m = ctx.load('state');
+  // The TTL as it stands right after the first command that touched each key: -2 if it did not create it.
+  let created = ctx.redisAfter('load:ld-1:partitions', () => ctx.redis.ttl('load:ld-1:partitions'));
   await m.commitPartition('ld-1', 'p-0', 2);
+  assert(created.fired && (await created.result) !== -1, 'load:ld-1:partitions existed without a TTL right after the command that wrote it: the TTL is set in the same step as the write, or a crash in between leaves it forever');
   let ttl = ctx.redis.ttl('load:ld-1:partitions');
   assert(LOAD_TTL_S - 60 <= ttl && ttl <= LOAD_TTL_S, \`load:ld-1:partitions has TTL \${ttl}, expected LOAD_TTL_S (\${LOAD_TTL_S} s): an abandoned load's progress must expire\`);
+  created = ctx.redisAfter('load:ld-1:complete', () => ctx.redis.ttl('load:ld-1:complete'));
   await m.commitPartition('ld-1', 'p-1', 2);
+  assert(created.fired && (await created.result) !== -1, 'load:ld-1:complete existed without a TTL right after the command that set it: the TTL is set in the same step as the flag');
   ttl = ctx.redis.ttl('load:ld-1:complete');
   assert(LOAD_TTL_S - 60 <= ttl && ttl <= LOAD_TTL_S, \`load:ld-1:complete has TTL \${ttl}, expected LOAD_TTL_S (\${LOAD_TTL_S} s): a flag that outlives its load makes a re-run look done\`);
 }
@@ -437,6 +467,12 @@ var stateBg = context.Background()
 func stateCommit(ctx *harness.Ctx, partitionID string, total int) bool {
 	done, err := commitPartition(stateBg, "ld-1", partitionID, total)
 	ctx.NoError(err, "commitPartition(ld-1, %s, %d) failed", partitionID, total)
+	return done
+}
+
+func stateCommitOf(ctx *harness.Ctx, loadID, partitionID string, total int) bool {
+	done, err := commitPartition(stateBg, loadID, partitionID, total)
+	ctx.NoError(err, "commitPartition(%s, %s, %d) failed", loadID, partitionID, total)
 	return done
 }
 
@@ -474,13 +510,35 @@ func CheckCompleteOnce(ctx *harness.Ctx) {
 	ctx.Equal(winners, 1, "two workers committed the last two partitions at once (this one %v, the other %v): exactly one may be told it completed the load; the commits answered true", mine, rival.Result)
 	ctx.Equal(stateComplete(ctx), true, "after all three partitions committed, ld-1 complete")
 	ctx.Equal(stateCommit(ctx, "p-2", 3), false, "a redelivered final partition must not report completing the load a second time; completed")
+	// The last partition of ld-2 was redelivered: two workers commit it at once, and the other one
+	// lands right after this worker's first command on the completion flag.
+	ctx.Equal(stateCommitOf(ctx, "ld-2", "p-0", 2), false, "the first of two partitions must not complete the load; completed")
+	twin := ctx.Redis.After("load:ld-2:complete", func() any {
+		done, err := commitPartition(stateBg, "ld-2", "p-1", 2)
+		ctx.NoError(err, "the other worker's commit failed")
+		return done
+	})
+	again := stateCommitOf(ctx, "ld-2", "p-1", 2)
+	ctx.Assert(twin.Fired, "the commit of the last partition never touched load:ld-2:complete")
+	both := 0
+	for _, won := range []any{again, twin.Result} {
+		if won == true {
+			both++
+		}
+	}
+	ctx.Equal(both, 1, "two workers committed the redelivered last partition at once (this one %v, the other %v): checking the flag and setting it are one step; the commits answered true", again, twin.Result)
 }
 
 func CheckExpiry(ctx *harness.Ctx) {
+	// The TTL as it stands right after the first command that touched each key: -2 if it did not create it.
+	created := ctx.Redis.After("load:ld-1:partitions", func() any { return ctx.Redis.TTL("load:ld-1:partitions") })
 	stateCommit(ctx, "p-0", 2)
+	ctx.Assert(created.Fired && created.Result != any(int64(-1)), "load:ld-1:partitions existed without a TTL right after the command that wrote it: the TTL is set in the same step as the write, or a crash in between leaves it forever")
 	ttl := ctx.Redis.TTL("load:ld-1:partitions")
 	ctx.Assert(stateTTL-60 <= ttl && ttl <= stateTTL, "load:ld-1:partitions has TTL %d, expected loadTTLSeconds (%d s): an abandoned load's progress must expire", ttl, stateTTL)
+	created = ctx.Redis.After("load:ld-1:complete", func() any { return ctx.Redis.TTL("load:ld-1:complete") })
 	stateCommit(ctx, "p-1", 2)
+	ctx.Assert(created.Fired && created.Result != any(int64(-1)), "load:ld-1:complete existed without a TTL right after the command that set it: the TTL is set in the same step as the flag")
 	ttl = ctx.Redis.TTL("load:ld-1:complete")
 	ctx.Assert(stateTTL-60 <= ttl && ttl <= stateTTL, "load:ld-1:complete has TTL %d, expected loadTTLSeconds (%d s): a flag that outlives its load makes a re-run look done", ttl, stateTTL)
 }
@@ -529,13 +587,36 @@ void CheckCompleteOnce(harness::Ctx& ctx) {
   ctx.Equal(int(mine) + int(rival->done), 1, "two workers committed the last two partitions at once (this one %t, the other %t): exactly one may be told it completed the load; the commits answered true", mine, rival->done);
   ctx.Equal(isComplete("ld-1"), true, "after all three partitions committed, ld-1 complete");
   ctx.Equal(commitPartition("ld-1", "p-2", 3), false, "a redelivered final partition must not report completing the load a second time; completed");
+  // The last partition of ld-2 was redelivered: two workers commit it at once, and the other one
+  // lands right after this worker's first command on the completion flag.
+  ctx.Equal(commitPartition("ld-2", "p-0", 2), false, "the first of two partitions must not complete the load; completed");
+  auto twin = std::make_shared<Rival>();
+  ctx.Redis.After("load:ld-2:complete", [twin] {
+    twin->fired = true;
+    try {
+      twin->done = commitPartition("ld-2", "p-1", 2);
+    } catch (const std::exception& e) {
+      twin->err = e.what();
+    }
+  });
+  const bool again = commitPartition("ld-2", "p-1", 2);
+  ctx.Assert(twin->fired, "the commit of the last partition never touched load:ld-2:complete");
+  ctx.Assert(!twin->err, "the other worker's commit failed: %s", twin->err.value_or(""));
+  ctx.Equal(int(again) + int(twin->done), 1, "two workers committed the redelivered last partition at once (this one %t, the other %t): checking the flag and setting it are one step; the commits answered true", again, twin->done);
 }
 
 void CheckExpiry(harness::Ctx& ctx) {
+  // The TTL as it stands right after the first command that touched each key: -2 if it did not create it.
+  auto created = std::make_shared<long long>(0);
+  ctx.Redis.After("load:ld-1:partitions", [&ctx, created] { *created = ctx.Redis.TTL("load:ld-1:partitions"); });
   commitPartition("ld-1", "p-0", 2);
+  ctx.Assert(*created != 0 && *created != -1, "load:ld-1:partitions existed without a TTL right after the command that wrote it: the TTL is set in the same step as the write, or a crash in between leaves it forever");
   long long ttl = ctx.Redis.TTL("load:ld-1:partitions");
   ctx.Assert(kStateTtl - 60 <= ttl && ttl <= kStateTtl, "load:ld-1:partitions has TTL %d, expected kLoadTtlSeconds (%d s): an abandoned load's progress must expire", ttl, kStateTtl);
+  *created = 0;
+  ctx.Redis.After("load:ld-1:complete", [&ctx, created] { *created = ctx.Redis.TTL("load:ld-1:complete"); });
   commitPartition("ld-1", "p-1", 2);
+  ctx.Assert(*created != 0 && *created != -1, "load:ld-1:complete existed without a TTL right after the command that set it: the TTL is set in the same step as the flag");
   ttl = ctx.Redis.TTL("load:ld-1:complete");
   ctx.Assert(kStateTtl - 60 <= ttl && ttl <= kStateTtl, "load:ld-1:complete has TTL %d, expected kLoadTtlSeconds (%d s): a flag that outlives its load makes a re-run look done", ttl, kStateTtl);
 }

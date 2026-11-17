@@ -57,7 +57,7 @@ customer's words into the log.
       id: 'transition-guard',
       title: 'Moves a ticket only along the transition table',
       detail:
-        'The handler consults `ALLOWED_TRANSITIONS` for the ticket’s current state and answers **409** with the states allowed from here; an unknown state is **400**. The starter hands the body’s `state` to `store.transition` as it came, so `open → closed` succeeds.',
+        'The handler consults `ALLOWED_TRANSITIONS` for the ticket’s current state and answers **409** with the states allowed from here for every move the table does not list, a move to the same state included; an unknown state is **400**. The starter hands the body’s `state` to `store.transition` as it came, so `open → closed` succeeds.',
       match: {
         python: {all: [/ALLOWED_TRANSITIONS\s*=/, /ALLOWED_TRANSITIONS\[/, /["']allowed["']/, /\b400\b/]},
         typescript: {all: [/ALLOWED_TRANSITIONS\s*[:=]/, /ALLOWED_TRANSITIONS\[/, /\ballowed\b/, /\b400\b/]},
@@ -70,7 +70,7 @@ customer's words into the log.
       id: 'actor-scope',
       title: 'Scopes a requester to their own ticket',
       detail:
-        'The role comes from `X-Actor-Role` (`requester` or `agent`, **403** otherwise): an agent moves any ticket, a requester only one whose `requester_id` is theirs. The starter reads no role and compares no owner, so any caller moves any ticket by id.',
+        'The role comes from `X-Actor-Role` (`requester` or `agent`; **403** for any other role or none): an agent moves any ticket, a requester only one whose `requester_id` is theirs. The starter reads no role and compares no owner, so any caller moves any ticket by id.',
       match: {
         python: {all: [/x-actor-role/i, /\["requester_id"\]\s*!=|!=\s*\w+\["requester_id"\]/, /\b403\b/]},
         typescript: {all: [/x-actor-role/i, /\.requester_id\s*!==|!==\s*\w+\.requester_id/, /\b403\b/]},
@@ -83,7 +83,7 @@ customer's words into the log.
       id: 'reopen-window',
       title: 'Reopens a closed ticket only inside the window',
       detail:
-        '`closed → open` is allowed only while the ticket’s `closed_at` is within `REOPEN_WINDOW_SECONDS` (7 days); later the move is **409** with an empty `allowed`. The starter has no window, so a ticket closed a month ago reopens.',
+        '`closed → open` is allowed only while the ticket’s `closed_at` is within `REOPEN_WINDOW_SECONDS` (7 days): a reopen a minute before the 7 days are up succeeds, one a minute after is **409** with an empty `allowed`. The starter has no window, so a ticket closed a month ago reopens.',
       match: {
         python: {
           all: [
@@ -110,7 +110,7 @@ customer's words into the log.
       id: 'no-content-in-logs',
       title: 'Logs ids and states, never the subject or the body',
       detail:
-        'The write path logs the ticket id, the caller, the role and the states; the subject and the body text never reach a log line. The starter logs both on every create.',
+        'The write path logs the ticket id, the caller, the role and the states; the subject and the body text never reach a log line, on refused moves either. The starter logs both on every create.',
       match: {
         python: {all: [/logger\.info\(/], none: [/logger\.\w+\([^)]*\b(subject|body)\b/]},
         typescript: {all: [/\.log\.info\(/], none: [/log\.\w+\([^)]*\b(subject|body)\b/]},
@@ -826,6 +826,8 @@ AGENT = {"X-Actor-Id": "A-7", "X-Actor-Role": "agent"}
 SUBJECT = "Invoice 4471 charged twice"
 BODY = "My card ending 4917 was charged twice for invoice 4471."
 DAY = 24 * 3600
+GUARD_TABLE = {"open": ["pending", "resolved"], "pending": ["open", "resolved"], "resolved": ["closed", "open"], "closed": ["open"]}
+GUARD_PATHS = {"open": [], "pending": ["pending"], "resolved": ["resolved"], "closed": ["resolved", "closed"]}
 
 
 def _api(ctx):
@@ -874,7 +876,17 @@ async def check_transition_guard(ctx):
         assert r.status_code == 400, f"state 'archived' answered {r.status_code}: a state outside STATES is 400"
         await _walk(c, ticket_id, "resolved", "closed")
         r = await _move(c, ticket_id, "pending")
-    assert r.status_code == 409 and r.json().get("allowed") == ["open"], f"closed → pending answered {r.status_code} {r.text}, expected 409 allowing only open"
+        assert r.status_code == 409 and r.json().get("allowed") == ["open"], f"closed → pending answered {r.status_code} {r.text}, expected 409 allowing only open"
+        for state, path in GUARD_PATHS.items():
+            for to in ("open", "pending", "resolved", "closed"):
+                ticket_id = await _open(c)
+                await _walk(c, ticket_id, *path)
+                r = await _move(c, ticket_id, to)
+                if to in GUARD_TABLE[state]:
+                    assert r.status_code == 200, f"{state} → {to} answered {r.status_code} ({r.text}): ALLOWED_TRANSITIONS allows it"
+                else:
+                    assert r.status_code == 409, f"{state} → {to} answered {r.status_code} ({r.text}): ALLOWED_TRANSITIONS does not allow it, expected 409"
+                    assert sorted(r.json().get("allowed") or []) == GUARD_TABLE[state], f"the 409 for {state} → {to} must allow {GUARD_TABLE[state]}, got {r.text}"
 
 
 async def check_actor_scope(ctx):
@@ -885,6 +897,8 @@ async def check_actor_scope(ctx):
         assert store.get_ticket(ticket_id)["state"] == "open", "another requester's move changed the ticket"
         r = await _move(c, ticket_id, "pending", {"X-Actor-Id": "R-1", "X-Actor-Role": "admin"})
         assert r.status_code == 403, f"X-Actor-Role admin answered {r.status_code}: a role other than requester or agent is 403"
+        r = await _move(c, ticket_id, "pending", {"X-Actor-Id": "R-1"})
+        assert r.status_code == 403, f"the owner moving without X-Actor-Role answered {r.status_code}: a missing role is not requester or agent, expected 403"
         r = await _move(c, ticket_id, "pending", {"X-Actor-Role": "agent"})
         assert r.status_code == 401, f"a move without X-Actor-Id answered {r.status_code}, expected 401"
         r = await _move(c, ticket_id, "pending", AGENT)
@@ -895,13 +909,13 @@ async def check_reopen_window(ctx):
     async with _api(ctx) as c:
         ticket_id = await _open(c)
         await _walk(c, ticket_id, "resolved", "closed")
-        ctx.clock.advance(3 * DAY)
+        ctx.clock.advance(7 * DAY - 60)
         r = await _move(c, ticket_id, "open", R1)
-        assert r.status_code == 200, f"reopening 3 days after the close answered {r.status_code}: {r.text}"
+        assert r.status_code == 200, f"reopening a minute before 7 days after the close answered {r.status_code}: {r.text}"
         await _walk(c, ticket_id, "resolved", "closed")
-        ctx.clock.advance(8 * DAY)
+        ctx.clock.advance(7 * DAY + 60)
         r = await _move(c, ticket_id, "open", R1)
-        assert r.status_code == 409, f"reopening 8 days after the close answered {r.status_code}: past REOPEN_WINDOW_SECONDS (7 days) the move is 409"
+        assert r.status_code == 409, f"reopening a minute past 7 days after the close answered {r.status_code}: past REOPEN_WINDOW_SECONDS (7 days) the move is 409"
         assert r.json().get("allowed") == [], f"a reopen past the window has nowhere to go: allowed must be empty, got {r.json()}"
     assert store.get_ticket(ticket_id)["state"] == "closed", f"the stale reopen changed the ticket: {store.get_ticket(ticket_id)}"
 
@@ -924,6 +938,8 @@ async def check_no_content_in_logs(ctx):
     try:
         async with _api(ctx) as c:
             ticket_id = await _open(c)
+            await _move(c, ticket_id, "closed", R1)
+            await _move(c, ticket_id, "pending", R2)
             await _move(c, ticket_id, "pending", R1)
     finally:
         root.removeHandler(lines)
@@ -939,6 +955,8 @@ const AGENT = {'X-Actor-Id': 'A-7', 'X-Actor-Role': 'agent'};
 const SUBJECT = 'Invoice 4471 charged twice';
 const BODY = 'My card ending 4917 was charged twice for invoice 4471.';
 const DAY = 24 * 3600;
+const GUARD_TABLE: Record<string, string[]> = {open: ['pending', 'resolved'], pending: ['open', 'resolved'], resolved: ['closed', 'open'], closed: ['open']};
+const GUARD_PATHS: Record<string, string[]> = {open: [], pending: ['pending'], resolved: ['resolved'], closed: ['resolved', 'closed']};
 
 function api(ctx) {
   const m = ctx.load('api');
@@ -987,6 +1005,20 @@ export async function check_transition_guard(ctx) {
   await walk(c, ticketId, 'resolved', 'closed');
   r = await move(c, ticketId, 'pending');
   assert(r.status === 409 && JSON.stringify(r.json().allowed) === '["open"]', \`closed → pending answered \${r.status} \${r.text}, expected 409 allowing only open\`);
+  for (const [state, path] of Object.entries(GUARD_PATHS)) {
+    for (const to of ['open', 'pending', 'resolved', 'closed']) {
+      const id = await open(c);
+      await walk(c, id, ...path);
+      r = await move(c, id, to);
+      if (GUARD_TABLE[state].includes(to)) {
+        assert.equal(r.status, 200, \`\${state} → \${to} answered \${r.status} (\${r.text}): ALLOWED_TRANSITIONS allows it\`);
+      } else {
+        assert.equal(r.status, 409, \`\${state} → \${to} answered \${r.status} (\${r.text}): ALLOWED_TRANSITIONS does not allow it, expected 409\`);
+        const allowed = JSON.stringify([...(r.json().allowed ?? [])].sort());
+        assert.equal(allowed, JSON.stringify(GUARD_TABLE[state]), \`the 409 for \${state} → \${to} must allow \${GUARD_TABLE[state]}, got \${r.text}\`);
+      }
+    }
+  }
 }
 
 export async function check_actor_scope(ctx) {
@@ -997,6 +1029,8 @@ export async function check_actor_scope(ctx) {
   assert.equal((await store.getTicket(ticketId)).state, 'open', "another requester's move changed the ticket");
   r = await move(c, ticketId, 'pending', {'X-Actor-Id': 'R-1', 'X-Actor-Role': 'admin'});
   assert.equal(r.status, 403, \`X-Actor-Role admin answered \${r.status}: a role other than requester or agent is 403\`);
+  r = await move(c, ticketId, 'pending', {'X-Actor-Id': 'R-1'});
+  assert.equal(r.status, 403, \`the owner moving without X-Actor-Role answered \${r.status}: a missing role is not requester or agent, expected 403\`);
   r = await move(c, ticketId, 'pending', {'X-Actor-Role': 'agent'});
   assert.equal(r.status, 401, \`a move without X-Actor-Id answered \${r.status}, expected 401\`);
   r = await move(c, ticketId, 'pending', AGENT);
@@ -1007,13 +1041,13 @@ export async function check_reopen_window(ctx) {
   const {c, store} = api(ctx);
   const ticketId = await open(c);
   await walk(c, ticketId, 'resolved', 'closed');
-  ctx.clock.advance(3 * DAY);
+  ctx.clock.advance(7 * DAY - 60);
   let r = await move(c, ticketId, 'open', R1);
-  assert.equal(r.status, 200, \`reopening 3 days after the close answered \${r.status}: \${r.text}\`);
+  assert.equal(r.status, 200, \`reopening a minute before 7 days after the close answered \${r.status}: \${r.text}\`);
   await walk(c, ticketId, 'resolved', 'closed');
-  ctx.clock.advance(8 * DAY);
+  ctx.clock.advance(7 * DAY + 60);
   r = await move(c, ticketId, 'open', R1);
-  assert.equal(r.status, 409, \`reopening 8 days after the close answered \${r.status}: past REOPEN_WINDOW_SECONDS (7 days) the move is 409\`);
+  assert.equal(r.status, 409, \`reopening a minute past 7 days after the close answered \${r.status}: past REOPEN_WINDOW_SECONDS (7 days) the move is 409\`);
   assert.deepStrictEqual(r.json().allowed, [], \`a reopen past the window has nowhere to go: allowed must be empty, got \${r.text}\`);
   assert.equal((await store.getTicket(ticketId)).state, 'closed', 'the stale reopen changed the ticket');
 }
@@ -1027,6 +1061,8 @@ export async function check_no_content_in_logs(ctx) {
   try {
     const {c} = api(ctx);
     ticketId = await open(c);
+    await move(c, ticketId, 'closed', R1);
+    await move(c, ticketId, 'pending', R2);
     await move(c, ticketId, 'pending', R1);
   } finally {
     Object.assign(console, real);
@@ -1064,6 +1100,11 @@ var (
 	apiR1    = []string{"X-Actor-Id", "R-1", "X-Actor-Role", "requester"}
 	apiR2    = []string{"X-Actor-Id", "R-2", "X-Actor-Role", "requester"}
 	apiAgent = []string{"X-Actor-Id", "A-7", "X-Actor-Role", "agent"}
+)
+
+var (
+	apiGuardTable = map[string]string{"open": "pending,resolved", "pending": "open,resolved", "resolved": "closed,open", "closed": "open"}
+	apiGuardPaths = map[string][]string{"open": nil, "pending": {"pending"}, "resolved": {"resolved"}, "closed": {"resolved", "closed"}}
 )
 
 type apiRefusal struct {
@@ -1128,6 +1169,22 @@ func CheckTransitionGuard(ctx *harness.Ctx) {
 	refusal = apiRefusal{}
 	r.Decode(&refusal)
 	ctx.Assert(r.Status == 409 && strings.Join(refusal.Allowed, ",") == "open", "closed → pending answered %d %s, expected 409 allowing only open", r.Status, r.Text())
+	for _, from := range []string{"open", "pending", "resolved", "closed"} {
+		for _, to := range []string{"open", "pending", "resolved", "closed"} {
+			id := apiOpen(ctx, c)
+			apiWalk(ctx, c, id, apiGuardPaths[from]...)
+			r = apiMove(c, id, to, apiAgent)
+			if strings.Contains(","+apiGuardTable[from]+",", ","+to+",") {
+				ctx.Equal(r.Status, 200, "%s → %s (%s): allowedTransitions allows it", from, to, r.Text())
+				continue
+			}
+			ctx.Equal(r.Status, 409, "%s → %s (%s): allowedTransitions does not allow it", from, to, r.Text())
+			refusal = apiRefusal{}
+			r.Decode(&refusal)
+			sort.Strings(refusal.Allowed)
+			ctx.Equal(strings.Join(refusal.Allowed, ","), apiGuardTable[from], "the states the 409 for %s → %s allows", from, to)
+		}
+	}
 }
 
 func CheckActorScope(ctx *harness.Ctx) {
@@ -1138,6 +1195,8 @@ func CheckActorScope(ctx *harness.Ctx) {
 	ctx.Equal(apiState(ticketID), "open", "another requester's move must leave the ticket; its state")
 	r = apiMove(c, ticketID, "pending", []string{"X-Actor-Id", "R-1", "X-Actor-Role", "admin"})
 	ctx.Equal(r.Status, 403, "X-Actor-Role admin (a role other than requester or agent is 403)")
+	r = apiMove(c, ticketID, "pending", []string{"X-Actor-Id", "R-1"})
+	ctx.Equal(r.Status, 403, "the owner moving without X-Actor-Role (a missing role is not requester or agent)")
 	r = apiMove(c, ticketID, "pending", []string{"X-Actor-Role", "agent"})
 	ctx.Equal(r.Status, 401, "a move without X-Actor-Id")
 	r = apiMove(c, ticketID, "pending", apiAgent)
@@ -1148,13 +1207,13 @@ func CheckReopenWindow(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	ticketID := apiOpen(ctx, c)
 	apiWalk(ctx, c, ticketID, "resolved", "closed")
-	ctx.Clock.Advance(3 * apiDay)
+	ctx.Clock.Advance(7*apiDay - 60)
 	r := apiMove(c, ticketID, "open", apiR1)
-	ctx.Equal(r.Status, 200, "reopening 3 days after the close (%s)", r.Text())
+	ctx.Equal(r.Status, 200, "reopening a minute before 7 days after the close (%s)", r.Text())
 	apiWalk(ctx, c, ticketID, "resolved", "closed")
-	ctx.Clock.Advance(8 * apiDay)
+	ctx.Clock.Advance(7*apiDay + 60)
 	r = apiMove(c, ticketID, "open", apiR1)
-	ctx.Equal(r.Status, 409, "reopening 8 days after the close (past reopenWindowSeconds, 7 days, the move is 409)")
+	ctx.Equal(r.Status, 409, "reopening a minute past 7 days after the close (past reopenWindowSeconds, 7 days, the move is 409)")
 	var refusal apiRefusal
 	r.Decode(&refusal)
 	ctx.Assert(refusal.Allowed != nil && len(refusal.Allowed) == 0, "a reopen past the window has nowhere to go: allowed must be empty, got %s", r.Text())
@@ -1167,6 +1226,8 @@ func CheckNoContentInLogs(ctx *harness.Ctx) {
 	defer log.SetOutput(os.Stderr)
 	c := apiClient(ctx)
 	ticketID := apiOpen(ctx, c)
+	apiMove(c, ticketID, "closed", apiR1)
+	apiMove(c, ticketID, "pending", apiR2)
 	apiMove(c, ticketID, "pending", apiR1)
 	text := logged.String()
 	ctx.Assert(strings.Contains(text, ticketID), "the write path must log the ticket id; it logged %q", text)
@@ -1181,6 +1242,7 @@ func CheckNoContentInLogs(ctx *harness.Ctx) {
 
 #include <algorithm>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1191,19 +1253,19 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kSubject = "Invoice 4471 charged twice";
-const std::string kBody = "My card ending 4917 was charged twice for invoice 4471.";
-constexpr double kDay = 24 * 3600;
+const std::string kHSubject = "Invoice 4471 charged twice";
+const std::string kHBody = "My card ending 4917 was charged twice for invoice 4471.";
+constexpr double kHDay = 24 * 3600;
 
-struct Actor {
+struct HActor {
   std::string id;
   std::string role;
 };
-const Actor kR1{"R-1", "requester"};
-const Actor kR2{"R-2", "requester"};
-const Actor kAgent{"A-7", "agent"};
+const HActor kHR1{"R-1", "requester"};
+const HActor kHR2{"R-2", "requester"};
+const HActor kHAgent{"A-7", "agent"};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1211,29 +1273,30 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string openTicket(harness::Ctx& ctx, harness::HTTP& c) {
-  const auto r = c.Post("/v1/tickets", json{{"subject", kSubject}, {"body", kBody}}.dump(), "Content-Type", "application/json",
-                        "X-Actor-Id", kR1.id, "X-Actor-Role", kR1.role);
+std::string hOpenTicket(harness::Ctx& ctx, harness::HTTP& c) {
+  const auto r = c.Post("/v1/tickets", json{{"subject", kHSubject}, {"body", kHBody}}.dump(), "Content-Type", "application/json",
+                        "X-Actor-Id", kHR1.id, "X-Actor-Role", kHR1.role);
   ctx.Equal(r.Status, 201, "POST /v1/tickets (%s)", r.Text());
   const json ticket = json::parse(r.Text());
   ctx.Equal(ticket.value("state", ""), "open", "a new ticket's state");
   return ticket.value("id", "");
 }
 
-harness::Response moveTo(harness::HTTP& c, const std::string& ticket_id, const std::string& state, const Actor& who) {
+harness::Response hMoveTo(harness::HTTP& c, const std::string& ticket_id, const std::string& state, const HActor& who) {
   const std::string body = json{{"state", state}}.dump();
   if (who.id.empty()) return c.Patch("/v1/tickets/" + ticket_id, body, "Content-Type", "application/json", "X-Actor-Role", who.role);
+  if (who.role.empty()) return c.Patch("/v1/tickets/" + ticket_id, body, "Content-Type", "application/json", "X-Actor-Id", who.id);
   return c.Patch("/v1/tickets/" + ticket_id, body, "Content-Type", "application/json", "X-Actor-Id", who.id, "X-Actor-Role", who.role);
 }
 
-void walk(harness::Ctx& ctx, harness::HTTP& c, const std::string& ticket_id, const std::vector<std::string>& states) {
+void hWalk(harness::Ctx& ctx, harness::HTTP& c, const std::string& ticket_id, const std::vector<std::string>& states) {
   for (const auto& state : states) {
-    const auto r = moveTo(c, ticket_id, state, kAgent);
+    const auto r = hMoveTo(c, ticket_id, state, kHAgent);
     ctx.Equal(r.Status, 200, "an agent moving %s to %s (%s)", ticket_id, state, r.Text());
   }
 }
 
-std::vector<std::string> allowedOf(const harness::Response& r) {
+std::vector<std::string> hAllowedOf(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   if (!body.is_object() || !body.contains("allowed") || !body["allowed"].is_array()) return {"<none>"};
   auto allowed = body["allowed"].get<std::vector<std::string>>();
@@ -1241,64 +1304,84 @@ std::vector<std::string> allowedOf(const harness::Response& r) {
   return allowed;
 }
 
-std::string stateOf(const std::string& ticket_id) { return store::getTicket(ticket_id)->state; }
+std::string hStateOf(const std::string& ticket_id) { return store::getTicket(ticket_id)->state; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string ticket_id = openTicket(ctx, c);
-  const auto r = moveTo(c, ticket_id, "pending", kR1);
+  auto c = hApi(ctx);
+  const std::string ticket_id = hOpenTicket(ctx, c);
+  const auto r = hMoveTo(c, ticket_id, "pending", kHR1);
   ctx.Equal(r.Status, 200, "the requester moving their ticket open → pending (%s)", r.Text());
   ctx.Assert(r.Text().find("\\"pending\\"") != std::string::npos, "the move must answer the ticket in its new state, got %s", r.Text());
   const auto stored = store::getTicket(ticket_id);
   ctx.Assert(stored->state == "pending" && stored->requester_id == "R-1", "the store holds state %q, requester %q", stored->state, stored->requester_id);
   const auto notes = store::page(ticket_id, 0, 10);
-  ctx.Assert(notes.size() == 1 && notes[0].body == kBody, "the create must append the body as the first note, the ticket has %d notes", notes.size());
+  ctx.Assert(notes.size() == 1 && notes[0].body == kHBody, "the create must append the body as the first note, the ticket has %d notes", notes.size());
 }
 
 void CheckTransitionGuard(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string ticket_id = openTicket(ctx, c);
-  auto r = moveTo(c, ticket_id, "closed", kR1);
+  auto c = hApi(ctx);
+  const std::string ticket_id = hOpenTicket(ctx, c);
+  auto r = hMoveTo(c, ticket_id, "closed", kHR1);
   ctx.Equal(r.Status, 409, "open → closed (%s): a ticket closes only from resolved", r.Text());
   ctx.Assert(json::parse(r.Text(), nullptr, false).value("from", "") == "open", "the 409 must name the current state, got %s", r.Text());
-  ctx.Equal(allowedOf(r), {"pending", "resolved"}, "the 409 must list the states allowed from open");
-  ctx.Equal(stateOf(ticket_id), "open", "a refused move must leave the ticket; its state");
-  r = moveTo(c, ticket_id, "archived", kAgent);
+  ctx.Equal(hAllowedOf(r), {"pending", "resolved"}, "the 409 must list the states allowed from open");
+  ctx.Equal(hStateOf(ticket_id), "open", "a refused move must leave the ticket; its state");
+  r = hMoveTo(c, ticket_id, "archived", kHAgent);
   ctx.Equal(r.Status, 400, "state 'archived' (a state outside kStates is 400)");
-  walk(ctx, c, ticket_id, {"resolved", "closed"});
-  r = moveTo(c, ticket_id, "pending", kAgent);
-  ctx.Assert(r.Status == 409 && allowedOf(r) == std::vector<std::string>{"open"}, "closed → pending answered %d %s, expected 409 allowing only open", r.Status, r.Text());
+  hWalk(ctx, c, ticket_id, {"resolved", "closed"});
+  r = hMoveTo(c, ticket_id, "pending", kHAgent);
+  ctx.Assert(r.Status == 409 && hAllowedOf(r) == std::vector<std::string>{"open"}, "closed → pending answered %d %s, expected 409 allowing only open", r.Status, r.Text());
+  const std::map<std::string, std::vector<std::string>> table = {
+      {"open", {"pending", "resolved"}}, {"pending", {"open", "resolved"}}, {"resolved", {"closed", "open"}}, {"closed", {"open"}}};
+  const std::map<std::string, std::vector<std::string>> paths = {
+      {"open", {}}, {"pending", {"pending"}}, {"resolved", {"resolved"}}, {"closed", {"resolved", "closed"}}};
+  for (const auto& [from, path] : paths) {
+    for (const std::string to : {"open", "pending", "resolved", "closed"}) {
+      const std::string id = hOpenTicket(ctx, c);
+      hWalk(ctx, c, id, path);
+      r = hMoveTo(c, id, to, kHAgent);
+      const auto& allowed = table.at(from);
+      if (std::find(allowed.begin(), allowed.end(), to) != allowed.end()) {
+        ctx.Equal(r.Status, 200, "%s → %s (%s): kAllowedTransitions allows it", from, to, r.Text());
+        continue;
+      }
+      ctx.Equal(r.Status, 409, "%s → %s (%s): kAllowedTransitions does not allow it", from, to, r.Text());
+      ctx.Equal(hAllowedOf(r), allowed, "the states the 409 for %s → %s allows", from, to);
+    }
+  }
 }
 
 void CheckActorScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string ticket_id = openTicket(ctx, c);
-  auto r = moveTo(c, ticket_id, "pending", kR2);
+  auto c = hApi(ctx);
+  const std::string ticket_id = hOpenTicket(ctx, c);
+  auto r = hMoveTo(c, ticket_id, "pending", kHR2);
   ctx.Equal(r.Status, 403, "requester R-2 moving R-1's ticket (a requester moves only their own tickets)");
-  ctx.Equal(stateOf(ticket_id), "open", "another requester's move must leave the ticket; its state");
-  r = moveTo(c, ticket_id, "pending", Actor{"R-1", "admin"});
+  ctx.Equal(hStateOf(ticket_id), "open", "another requester's move must leave the ticket; its state");
+  r = hMoveTo(c, ticket_id, "pending", HActor{"R-1", "admin"});
   ctx.Equal(r.Status, 403, "X-Actor-Role admin (a role other than requester or agent is 403)");
-  r = moveTo(c, ticket_id, "pending", Actor{"", "agent"});
+  r = hMoveTo(c, ticket_id, "pending", HActor{"R-1", ""});
+  ctx.Equal(r.Status, 403, "the owner moving without X-Actor-Role (a missing role is not requester or agent)");
+  r = hMoveTo(c, ticket_id, "pending", HActor{"", "agent"});
   ctx.Equal(r.Status, 401, "a move without X-Actor-Id");
-  r = moveTo(c, ticket_id, "pending", kAgent);
+  r = hMoveTo(c, ticket_id, "pending", kHAgent);
   ctx.Equal(r.Status, 200, "an agent moving any ticket (%s)", r.Text());
 }
 
 void CheckReopenWindow(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string ticket_id = openTicket(ctx, c);
-  walk(ctx, c, ticket_id, {"resolved", "closed"});
-  ctx.Clock.Advance(3 * kDay);
-  auto r = moveTo(c, ticket_id, "open", kR1);
-  ctx.Equal(r.Status, 200, "reopening 3 days after the close (%s)", r.Text());
-  walk(ctx, c, ticket_id, {"resolved", "closed"});
-  ctx.Clock.Advance(8 * kDay);
-  r = moveTo(c, ticket_id, "open", kR1);
-  ctx.Equal(r.Status, 409, "reopening 8 days after the close (past kReopenWindowSeconds, 7 days, the move is 409)");
-  ctx.Equal(allowedOf(r), std::vector<std::string>{}, "a reopen past the window has nowhere to go: allowed must be empty");
-  ctx.Equal(stateOf(ticket_id), "closed", "the stale reopen must leave the ticket; its state");
+  auto c = hApi(ctx);
+  const std::string ticket_id = hOpenTicket(ctx, c);
+  hWalk(ctx, c, ticket_id, {"resolved", "closed"});
+  ctx.Clock.Advance(7 * kHDay - 60);
+  auto r = hMoveTo(c, ticket_id, "open", kHR1);
+  ctx.Equal(r.Status, 200, "reopening a minute before 7 days after the close (%s)", r.Text());
+  hWalk(ctx, c, ticket_id, {"resolved", "closed"});
+  ctx.Clock.Advance(7 * kHDay + 60);
+  r = hMoveTo(c, ticket_id, "open", kHR1);
+  ctx.Equal(r.Status, 409, "reopening a minute past 7 days after the close (past kReopenWindowSeconds, 7 days, the move is 409)");
+  ctx.Equal(hAllowedOf(r), std::vector<std::string>{}, "a reopen past the window has nowhere to go: allowed must be empty");
+  ctx.Equal(hStateOf(ticket_id), "closed", "the stale reopen must leave the ticket; its state");
 }
 
 void CheckNoContentInLogs(harness::Ctx& ctx) {
@@ -1308,9 +1391,11 @@ void CheckNoContentInLogs(harness::Ctx& ctx) {
   auto* out = std::cout.rdbuf(logged.rdbuf());
   std::string ticket_id;
   try {
-    auto c = api(ctx);
-    ticket_id = openTicket(ctx, c);
-    moveTo(c, ticket_id, "pending", kR1);
+    auto c = hApi(ctx);
+    ticket_id = hOpenTicket(ctx, c);
+    hMoveTo(c, ticket_id, "closed", kHR1);
+    hMoveTo(c, ticket_id, "pending", kHR2);
+    hMoveTo(c, ticket_id, "pending", kHR1);
   } catch (...) {
     std::clog.rdbuf(clg);
     std::cerr.rdbuf(err);
@@ -1322,7 +1407,7 @@ void CheckNoContentInLogs(harness::Ctx& ctx) {
   std::cout.rdbuf(out);
   const std::string text = logged.str();
   ctx.Assert(text.find(ticket_id) != std::string::npos, "the write path must log the ticket id; it logged %q", text);
-  for (const std::string& words : {kSubject, kBody, std::string("4917")}) {
+  for (const std::string& words : {kHSubject, kHBody, std::string("4917")}) {
     ctx.Assert(text.find(words) == std::string::npos, "a log line carries what the customer wrote (%q): %q. Log ids, roles and states", words, text);
   }
 }

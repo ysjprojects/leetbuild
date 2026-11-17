@@ -22,7 +22,7 @@ and a broker that refuses the record or does not answer.
   calendar's changes in order.
 - The payload is \`{"event_id", "calendar_id", "revision", "kind"}\` and nothing else: consumers read
   the event from the store.
-- **Commit first**: \`store.put_event(event)\` before the produce.
+- **Commit first**: \`store.put_event(event)\` before the produce; a commit that fails announces nothing.
 - **Wait for the ack**, at most 2 s. If it does not come, or the delivery fails, insert an
   **outbox** row with the topic, the key and the payload and return \`False\`. In Go the writer is
   kafka-go's synchronous \`WriteMessages\` with \`RequireAll\`, and its error is the delivery report.`,
@@ -67,7 +67,7 @@ and a broker that refuses the record or does not answer.
       id: 'commit-then-publish',
       title: 'Commits the event before producing its change',
       detail:
-        'When `event:{id}` is written the topic is still empty: the change follows the commit. The starter produces first, so a commit that fails leaves a change no consumer can read.',
+        'When `event:{id}` is written the topic is still empty: the change follows the commit. A commit that fails (`event:{id}` is not a hash) puts nothing on the topic or in the outbox. The starter produces first, so a commit that fails leaves a change no consumer can read.',
       match: {
         python: {order: [/store\.put_event\(/, /producer\.produce\(/]},
         typescript: {order: [/await store\.putEvent\(/, /producer\.send\(/]},
@@ -80,7 +80,7 @@ and a broker that refuses the record or does not answer.
       id: 'outbox-on-failure',
       title: 'Waits for the ack and falls back to the outbox',
       detail:
-        'A failed delivery, or no acknowledgement within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter fires and forgets, so the change is lost.',
+        'A failed delivery, or no acknowledgement within 2 s (the call is back within 2.5 s), leaves an outbox row with the topic, the key and exactly the payload, and the call returns false; a broker that acknowledges after 1.5 s gets true and no row. The starter fires and forgets, so the change is lost.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -554,22 +554,37 @@ def check_commit_then_publish(ctx):
     assert probe.fired, "publish_change never committed the event (no write to event:e-1)"
     assert probe.result == 0, f"when the event was committed the topic already held {probe.result} record(s): a change for a revision nobody can read yet is a phantom. Commit first, then produce"
     assert len(ctx.kafka.records(TOPIC)) == 1, "the change must still be produced after the commit"
+    # A commit that fails (event:e-5 holds a string: WRONGTYPE) announces nothing.
+    ctx.redis.set("event:e-5", "not a hash")
+    try:
+        m.publish_change(_event(5), "update")
+    except Exception:
+        pass  # the failed commit reaching the caller is fine
+    announced = [json.loads(r.value).get("event_id") for r in ctx.kafka.records(TOPIC)]
+    queued = [row.get("payload", {}).get("event_id") for row in _outbox(ctx)]
+    assert "e-5" not in announced and "e-5" not in queued, f"the commit of e-5 failed and its change went out anyway (topic: {announced}, outbox: {queued}): a change for a revision nobody can read is a phantom"
 
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    expected = {"event_id": "e-1", "calendar_id": "c1", "revision": 2, "kind": "update"}
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_change(_event(1), "update")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the change never reaches a sync client"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "c1" and rows[0].get("payload", {}).get("event_id") == "e-1", f"the outbox row is {rows[0]}, expected the topic, the key c1 and the payload"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "c1" and rows[0].get("payload") == expected, f"the outbox row is {rows[0]}, expected the topic, the key c1 and the payload {expected}"
     assert ok is False, f"publish_change returned {ok!r} after a failed delivery, expected False"
     assert ctx.redis.exists("event:e-1") == 1, "the event must stay committed when only the produce failed"
+    # The broker acknowledges after 1.5 s: inside the window, so the change is on its way.
+    ctx.kafka.stall(TOPIC, 1.5)
+    ok = m.publish_change(_event(3), "update")
+    rows = _outbox(ctx)
+    assert ok is True and len(rows) == 1, f"a broker that acknowledged after 1.5 s got publish_change returning {ok!r} and the outbox {rows}: the ack is awaited for 2 s"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_change(_event(2), "update")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_change waited {waited:.0f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_change waited {waited:.1f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("event_id") == "e-2", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish_change returned {ok!r} without an acknowledgement, expected False"
@@ -630,23 +645,41 @@ export async function check_commit_then_publish(ctx) {
   assert(probe.fired, 'publishChange never committed the event (no write to event:e-1)');
   assert.equal(probe.result, 0, \`when the event was committed the topic already held \${probe.result} record(s): a change for a revision nobody can read yet is a phantom. Commit first, then produce\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the change must still be produced after the commit');
+  // A commit that fails (event:e-5 holds a string: WRONGTYPE) announces nothing.
+  ctx.redis.set('event:e-5', 'not a hash');
+  try {
+    await m.publishChange(event(5), 'update');
+  } catch {
+    // the failed commit reaching the caller is fine
+  }
+  await settle();
+  const announced = (ctx.kafka.values(TOPIC) as string[]).map(v => JSON.parse(v).event_id);
+  const queued = outboxRows(ctx).map(row => row.payload?.event_id);
+  assert(!announced.includes('e-5') && !queued.includes('e-5'), \`the commit of e-5 failed and its change went out anyway (topic: \${JSON.stringify(announced)}, outbox: \${JSON.stringify(queued)}): a change for a revision nobody can read is a phantom\`);
 }
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  const expected = {event_id: 'e-1', calendar_id: 'c1', revision: 2, kind: 'update'};
   ctx.kafka.failNext(TOPIC, 1);
   let ok = await m.publishChange(event(1), 'update');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the change never reaches a sync client\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'c1' && rows[0].payload?.event_id === 'e-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key c1 and the payload\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'c1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic and the key c1\`);
+  assert.deepEqual(rows[0].payload, expected, \`the outbox row carries the payload \${JSON.stringify(rows[0].payload)}, expected exactly \${JSON.stringify(expected)}\`);
   assert.equal(ok, false, \`publishChange resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal(ctx.redis.exists('event:e-1'), 1, 'the event must stay committed when only the produce failed');
+  // The broker acknowledges after 1.5 s: inside the window, so the change is on its way.
+  ctx.kafka.stall(TOPIC, 1.5);
+  ok = await m.publishChange(event(3), 'update');
+  rows = outboxRows(ctx);
+  assert(ok === true && rows.length === 1, \`a broker that acknowledged after 1.5 s got publishChange resolving \${JSON.stringify(ok)} and the outbox \${JSON.stringify(rows)}: the ack is awaited for 2 s\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishChange(event(2), 'update');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishChange waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishChange waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.event_id === 'e-2', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishChange resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -735,6 +768,22 @@ func CheckCommitThenPublish(ctx *harness.Ctx) {
 	ctx.Assert(probe.Fired, "publishChange never committed the event (no write to event:e-1)")
 	ctx.Equal(probe.Result, 0, "when the event was committed the topic already held records: a change for a revision nobody can read yet is a phantom. Commit first, then produce; the records at commit time")
 	ctx.Equal(len(ctx.Kafka.Records(evTopic)), 1, "the change must still be produced after the commit; the records")
+	// A commit that fails (event:e-5 holds a string: WRONGTYPE) announces nothing.
+	ctx.Redis.Set("event:e-5", "not a hash")
+	_, _ = publishChange(context.Background(), evEvent(5, "c1"), "update") // the failed commit reaching the caller is fine
+	ctx.Settle()
+	var announced, queued []any
+	for _, text := range ctx.Kafka.Values(evTopic) {
+		var value map[string]any
+		_ = json.Unmarshal([]byte(text), &value)
+		announced = append(announced, value["event_id"])
+	}
+	for _, row := range evOutbox(ctx) {
+		queued = append(queued, row.Payload["event_id"])
+	}
+	for _, id := range append(append([]any{}, announced...), queued...) {
+		ctx.Assert(id != "e-5", "the commit of e-5 failed and its change went out anyway (topic: %v, outbox: %v): a change for a revision nobody can read is a phantom", announced, queued)
+	}
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
@@ -743,14 +792,20 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := evOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the change never reaches a sync client; the rows")
-	ctx.Assert(rows[0].Topic == evTopic && rows[0].Key == "c1" && rows[0].Payload["event_id"] == "e-1", "the outbox row is %v, expected the topic, the key c1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == evTopic && rows[0].Key == "c1", "the outbox row is %v, expected the topic and the key c1", rows[0])
+	ctx.Equal(rows[0].Payload, map[string]any{"event_id": "e-1", "calendar_id": "c1", "revision": 2, "kind": "update"}, "the outbox row's payload")
 	ctx.Equal(ok, false, "publishChange's result after a failed delivery")
 	ctx.Equal(ctx.Redis.Exists("event:e-1"), 1, "the event must stay committed when only the produce failed")
+	// The broker acknowledges after 1.5 s: inside the window, so the change is on its way.
+	ctx.Kafka.StallFor(evTopic, 1.5)
+	ok = evPublish(ctx, evEvent(3, "c1"))
+	rows = evOutbox(ctx)
+	ctx.Assert(ok && len(rows) == 1, "a broker that acknowledged after 1.5 s got publishChange returning %v and the outbox %v: the ack is awaited for 2 s", ok, rows)
 	ctx.Kafka.Stall(evTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = evPublish(ctx, evEvent(2, "c1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishChange waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishChange waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
 	rows = evOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["event_id"] == "e-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishChange's result without an acknowledgement")
@@ -833,6 +888,20 @@ void CheckCommitThenPublish(harness::Ctx& ctx) {
             "when the event was committed the topic already held records: a change for a revision nobody can read yet is a "
             "phantom. Commit first, then produce; the records at commit time");
   ctx.Equal(ctx.Kafka.Records(kEvTopic).size(), 1, "the change must still be produced after the commit; the records");
+  // A commit that fails (event:e-5 holds a string: WRONGTYPE) announces nothing.
+  ctx.Redis.Do("SET", "event:e-5", "not a hash");
+  try {
+    publishChange(evEvent(5), "update");
+  } catch (...) {
+    // the failed commit reaching the caller is fine
+  }
+  ctx.Settle();
+  std::vector<std::string> announced, queued;
+  for (const auto& text : ctx.Kafka.Values(kEvTopic)) announced.push_back(evField(nlohmann::json::parse(text, nullptr, false), "event_id"));
+  for (const auto& row : evOutbox(ctx)) queued.push_back(row.contains("payload") ? evField(row["payload"], "event_id") : "");
+  ctx.Assert(std::find(announced.begin(), announced.end(), "e-5") == announced.end() && std::find(queued.begin(), queued.end(), "e-5") == queued.end(),
+             "the commit of e-5 failed and its change went out anyway (topic: %v, outbox: %v): a change for a revision nobody can read is a phantom",
+             announced, queued);
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
@@ -841,16 +910,22 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = evOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the change never reaches a sync client; the rows");
-  ctx.Assert(evField(rows[0], "topic") == kEvTopic && evField(rows[0], "key") == "c1" && rows[0].contains("payload") &&
-                 evField(rows[0]["payload"], "event_id") == "e-1",
-             "the outbox row is %s, expected the topic, the key c1 and the payload", rows[0].dump());
+  ctx.Assert(evField(rows[0], "topic") == kEvTopic && evField(rows[0], "key") == "c1", "the outbox row is %s, expected the topic and the key c1", rows[0].dump());
+  ctx.Equal(rows[0].value("payload", nlohmann::json()), nlohmann::json{{"event_id", "e-1"}, {"calendar_id", "c1"}, {"revision", 2}, {"kind", "update"}},
+            "the outbox row's payload");
   ctx.Equal(ok, false, "publishChange's result after a failed delivery");
   ctx.Equal(ctx.Redis.Exists("event:e-1"), 1, "the event must stay committed when only the produce failed");
+  // The broker acknowledges after 1.5 s: inside the window, so the change is on its way.
+  ctx.Kafka.StallFor(kEvTopic, 1.5);
+  ok = publishChange(evEvent(3), "update");
+  rows = evOutbox(ctx);
+  ctx.Assert(ok && rows.size() == 1, "a broker that acknowledged after 1.5 s got publishChange returning %v and %d outbox rows: the ack is awaited for 2 s", ok,
+             rows.size());
   ctx.Kafka.Stall(kEvTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishChange(evEvent(2), "update");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishChange waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishChange waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
   rows = evOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && evField(rows[1]["payload"], "event_id") == "e-2",
              "no acknowledgement within the window and the outbox holds %d rows", rows.size());

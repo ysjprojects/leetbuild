@@ -314,11 +314,14 @@ export const store = {
   },
   /** Commit the event: write its hash and index it under its calendar, in one transaction. */
   async putEvent(event: Event): Promise<void> {
-    await redis
+    const replies = await redis
       .multi()
       .hset(\`event:\${event.event_id}\`, {...event, revision: String(event.revision), attendees: event.attendees.join(',')})
       .sadd(\`calendar:\${event.calendar_id}:events\`, event.event_id)
       .exec();
+    // EXEC resolves even when one command failed (WRONGTYPE): raise it, as redis-py does.
+    const failed = (replies ?? []).find(([err]) => err !== null);
+    if (failed !== undefined) throw failed[0];
   },
   async getEvent(eventId: string): Promise<Event | null> {
     const fields = await redis.hgetall(\`event:\${eventId}\`);
@@ -724,9 +727,9 @@ inline void PutEvent(const Event& e) {
       {"title", e.title},       {"rrule", e.rrule},             {"dtstart", e.dtstart},
       {"dtend", e.dtend},       {"revision", std::to_string(e.revision)}, {"attendees", attendees}};
   auto tx = client().transaction();
-  tx.hset("event:" + e.event_id, row.begin(), row.end());
-  tx.sadd("calendar:" + e.calendar_id + ":events", e.event_id);
-  tx.exec();
+  auto replies = tx.hset("event:" + e.event_id, row.begin(), row.end()).sadd("calendar:" + e.calendar_id + ":events", e.event_id).exec();
+  // EXEC answers even when one command failed (WRONGTYPE): get throws its ReplyError, as redis-py raises.
+  for (std::size_t i = 0; i < replies.size(); ++i) replies.get<long long>(i);
 }
 
 // The event, if the store has it.
@@ -1107,7 +1110,8 @@ object Store {
     val tx = jedis.multi()
     tx.hset(s"event:\${e.event_id}", row.asJava)
     tx.sadd(s"calendar:\${e.calendar_id}:events", e.event_id)
-    tx.exec()
+    // EXEC answers even when one command failed (WRONGTYPE): raise it, as redis-py does.
+    tx.exec().asScala.collectFirst { case err: Exception => err }.foreach(err => throw err)
   }
 
   /** The event, if the store has it. */

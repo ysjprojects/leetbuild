@@ -79,7 +79,7 @@ fail right after it acknowledges a write.
       id: 'no-driver-id',
       title: 'Nothing about the driver in the event',
       detail:
-        'A retained, replicated position topic must not be joinable to a person: the event names the vehicle only. The starter reads the driver assignment into it.',
+        'A retained, replicated position topic must not be joinable to a person: the event names the vehicle only, and carries its five fields even when the device sent more with its position. The starter reads the driver assignment into it.',
       match: {
         python: {none: [/driver/i]},
         typescript: {none: [/driver/i]},
@@ -557,6 +557,12 @@ def check_no_driver_id(ctx):
     assert len(records) == 1, f"one applied position produced {len(records)} records"
     value = records[0].value.decode()
     assert "d-77" not in value and "driver" not in value.lower(), f"the event {value} names the driver: a retained, replicated position topic must not be joinable to a person. Carry the vehicle, not who drives it"
+    # A device that sends more than a position: the event carries the five fields, not what the update held.
+    m.record_position("v-1", {**pos(2000, 43), "driver_id": "d-88", "driver_name": "Ana Ruiz"})
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 2, f"a second applied position produced {len(records) - 1} records, expected 1"
+    value = records[1].value.decode()
+    assert "d-88" not in value and "Ana Ruiz" not in value and "driver" not in value.lower(), f"the event {value} copied the driver fields the device sent with its position: build the event from vehicle_id, device_timestamp_ms, sequence, lat and lon only"
 
 
 def check_publish_after_write(ctx):
@@ -615,6 +621,12 @@ export async function check_no_driver_id(ctx) {
   assert.equal(records.length, 1, \`one applied position produced \${records.length} records\`);
   const value = records[0].value.toString();
   assert(!value.includes('d-77') && !value.toLowerCase().includes('driver'), \`the event \${value} names the driver: a retained, replicated position topic must not be joinable to a person. Carry the vehicle, not who drives it\`);
+  // A device that sends more than a position: the event carries the five fields, not what the update held.
+  await m.recordPosition('v-1', {...pos(2000, 43), driver_id: 'd-88', driver_name: 'Ana Ruiz'});
+  const all = ctx.kafka.records(TOPIC);
+  assert.equal(all.length, 2, \`a second applied position produced \${all.length - 1} records, expected 1\`);
+  const second = all[1].value.toString();
+  assert(!second.includes('d-88') && !second.includes('Ana Ruiz') && !second.toLowerCase().includes('driver'), \`the event \${second} copied the driver fields the device sent with its position: build the event from vehicle_id, device_timestamp_ms, sequence, lat and lon only\`);
 }
 
 export async function check_publish_after_write(ctx) {
@@ -771,7 +783,7 @@ Position eventsPos(long long ts, long long seq, const std::string& vehicle_id = 
   return Position{vehicle_id, ts, seq, 47.6, -122.3};
 }
 
-std::string lower(std::string s) {
+std::string eventsLower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
   return s;
 }
@@ -836,7 +848,7 @@ void CheckNoDriverId(harness::Ctx& ctx) {
   const auto records = ctx.Kafka.Records(kPositionTopic);
   ctx.Equal(records.size(), 1, "one applied position; the records");
   const std::string value = records[0].Value.value_or("");
-  ctx.Assert(value.find("d-77") == std::string::npos && lower(value).find("driver") == std::string::npos,
+  ctx.Assert(value.find("d-77") == std::string::npos && eventsLower(value).find("driver") == std::string::npos,
              "the event %s names the driver: a retained, replicated position topic must not be joinable to a person. "
              "Carry the vehicle, not who drives it",
              value);

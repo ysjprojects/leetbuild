@@ -25,7 +25,8 @@ or cancelled.
   retires them all.
 - Every slice expires after \`EXPANSION_TTL_S = 300\` seconds.
 - \`record_exception\` writes the exception first and bumps second, so a reader that sees the new
-  generation also sees the exception.
+  generation also sees the exception; a change that lands while a reader is expanding is in the next
+  read.
 - \`"cancelled"\` drops the occurrence; \`"moved:{ISO start}"\` lists it once, under the same occurrence
   id, at its new start with its length kept.`,
   sequence: {
@@ -45,7 +46,7 @@ or cancelled.
       id: 'range-key',
       title: 'Caches one slice per window',
       detail:
-        'The week of 2 March and the week of 9 March of one calendar answer their own occurrences. The starter keys the slice by calendar and generation only, so the second week is answered with the first.',
+        'The week of 2 March, the week of 9 March and 2 to 4 March (the same start, a shorter window) of one calendar answer their own occurrences. The starter keys the slice by calendar and generation only, so the second week is answered with the first.',
       match: {
         python: {all: [/slice_key\(\s*[\w.]+\s*,\s*[\w.()]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
         typescript: {all: [/sliceKey\(\s*[\w.]+\s*,\s*[\w.()\s]+\s*,\s*\w+\s*,\s*\w+\s*\)/]},
@@ -58,7 +59,7 @@ or cancelled.
       id: 'ttl',
       title: 'Expires every slice after 300 seconds',
       detail:
-        'A cached slice carries a TTL of at most 300 s and is gone 301 s later. The starter writes slices that never expire, so every retired generation stays in memory.',
+        'The command that writes a slice gives it its TTL, at most 300 s; the slice is still there 299 s later and gone 301 s later. The starter writes slices that never expire, so every retired generation stays in memory.',
       match: {
         python: {all: [/\bex\s*=\s*(EXPANSION_TTL_S|300)\b|setex\(/]},
         typescript: {all: [/['"]EX['"]\s*,\s*(EXPANSION_TTL_S|300)\b/]},
@@ -71,7 +72,7 @@ or cancelled.
       id: 'write-then-bump',
       title: 'Writes the exception before bumping the generation',
       detail:
-        'At the instant `gen:{calendar}` moves, the exception is already in `exceptions:{calendar}`. The starter bumps first, so a reader in between expands the old calendar and caches it under the new generation for the whole TTL.',
+        'At the instant `gen:{calendar}` moves, the exception is already in `exceptions:{calendar}`; and a change that lands while a reader is expanding the calendar is in the next read, not hidden under the new generation. The starter bumps first, so a reader in between expands the old calendar and caches it under the new generation for the whole TTL.',
       match: {
         python: {order: [/def record_exception\(/, /store\.put_exception\(/, /bump_generation\(/]},
         typescript: {order: [/function recordException\(/, /store\.putException\(/, /bumpGeneration\(/]},
@@ -84,7 +85,7 @@ or cancelled.
       id: 'exceptions',
       title: 'Drops cancelled instances and moves moved ones in place',
       detail:
-        'A cancelled occurrence is not listed; a moved one is listed once, at its new start and end, under its occurrence id. The starter ignores cancellations and lists a moved instance twice: at its old time and at its new one.',
+        'A cancelled occurrence is not listed; a moved one is listed once, at its new start and end in UTC (`moved:` with an offset included), under its occurrence id, and the week is earliest first after the moves. The starter ignores cancellations and lists a moved instance twice: at its old time and at its new one.',
       match: {
         python: {all: [/==\s*["']cancelled["']/], none: [/\.append\(\s*moved\s*\)/]},
         typescript: {all: [/===\s*['"]cancelled['"]/], none: [/\.push\(\s*moved\s*\)/]},
@@ -863,6 +864,16 @@ def _starts(occurrences):
     return [o["start"] for o in occurrences]
 
 
+def _ttl_when_written(ctx, key, box):
+    """Fires on every command that touches key until the key exists, then records its TTL: the TTL the creating command gave it."""
+    def probe():
+        if ctx.redis.exists(key):
+            box["ttl"] = ctx.redis.ttl(key)
+        else:
+            _ttl_when_written(ctx, key, box)
+    ctx.redis_after(key, probe)
+
+
 def check_range_key(ctx):
     m = _world(ctx)
     week_1 = m.cached_expansion("c1", *WEEK_1)
@@ -872,17 +883,28 @@ def check_range_key(ctx):
     assert _starts(week_2) == expected, f"the week of 9 March answered {_starts(week_2)}, expected {expected}: the slice cached for one window was served for another"
     again = m.cached_expansion("c1", *WEEK_1)
     assert _starts(again) == _starts(week_1), f"the week of 2 March, read again, answered {_starts(again)}"
+    # Same start, shorter window: 2 to 4 March.
+    short = m.cached_expansion("c1", WEEK_1[0], WEEK_1[0] + 2 * 86400)
+    expected = ["2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"]
+    assert _starts(short) == expected, f"2 to 4 March answered {_starts(short)}, expected {expected}: a window is its start and its end"
 
 
 def check_ttl(ctx):
     m = _world(ctx)
+    key = f"exp:c1:0:{WEEK_1[0]}:{WEEK_1[1]}"
+    box = {}
+    _ttl_when_written(ctx, key, box)
     m.cached_expansion("c1", *WEEK_1)
     keys = ctx.redis.keys("exp:*")
     assert keys, "cached_expansion cached nothing under exp:*"
+    # A slice under the key the task names is checked the instant it is written.
+    assert "ttl" not in box or 0 < box["ttl"] <= 300, f"right after {key} was written its TTL was {box['ttl']}: the command that writes a slice gives it its TTL, or a crash before the next one leaves it forever"
     for key in keys:
         ttl = ctx.redis.ttl(key)
         assert 0 < ttl <= 300, f"{key} has TTL {ttl}: a slice must expire within 300 s, or every retired generation stays in memory"
-    ctx.clock.advance(301)
+    ctx.clock.advance(299)
+    assert ctx.redis.keys("exp:*") == keys, f"299 s later Redis holds {ctx.redis.keys('exp:*')}, expected {keys}: a slice lives 300 s"
+    ctx.clock.advance(2)
     assert ctx.redis.keys("exp:*") == [], f"301 s later Redis still holds {ctx.redis.keys('exp:*')}"
 
 
@@ -897,12 +919,25 @@ def check_write_then_bump(ctx):
     assert probe.result == "cancelled", "when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it under the new generation for the whole TTL. Write the exception, then bump"
     ids = [o["occurrence_id"] for o in m.cached_expansion("c1", *WEEK_1)]
     assert cancelled not in ids, "after record_exception the cancelled 4 March standup is still in the week"
+    # Another replica cancels 9 March while this reader is expanding the week of 9 March.
+    late = _occurrence(9)
+
+    def change():
+        ctx.redis.hset("exceptions:c1", late, "cancelled")
+        ctx.redis.incr("gen:c1")
+
+    during = ctx.redis_after("exceptions:c1", change)
+    m.cached_expansion("c1", *WEEK_2)
+    assert during.fired, "cached_expansion never read exceptions:c1 for the week of 9 March"
+    ids = [o["occurrence_id"] for o in m.cached_expansion("c1", *WEEK_2)]
+    assert late not in ids, "9 March was cancelled (and gen:c1 bumped) while the week of 9 March was being expanded, and the next read still lists it: the expansion of the old calendar was cached under the new generation"
 
 
 def check_exceptions(ctx):
     m = _world(ctx)
     store.put_exception("c1", _occurrence(3), "cancelled")
     store.put_exception("c1", _occurrence(5), "moved:2026-03-05T14:00:00Z")
+    store.put_exception("c1", _occurrence(6), "moved:2026-03-04T08:00:00+01:00")
     week = m.cached_expansion("c1", *WEEK_1)
     ids = [o["occurrence_id"] for o in week]
     assert _occurrence(3) not in ids, f"the cancelled 3 March standup is still listed: {_starts(week)}"
@@ -910,6 +945,10 @@ def check_exceptions(ctx):
     moved = next(o for o in week if o["occurrence_id"] == _occurrence(5))
     assert moved["start"] == "2026-03-05T14:00:00Z" and moved["end"] == "2026-03-05T14:30:00Z", f"the moved standup is {moved}, expected 14:00 to 14:30 on 5 March"
     assert len(week) == 6, f"the week answered {len(week)} standups, expected 6 (7 minus the cancelled one): {_starts(week)}"
+    early = next(o for o in week if o["occurrence_id"] == _occurrence(6))
+    assert early["start"] == "2026-03-04T07:00:00Z" and early["end"] == "2026-03-04T07:30:00Z", f"the 6 March standup moved to 08:00+01:00 on 4 March is {early}, expected 07:00Z to 07:30Z"
+    expected = ["2026-03-02T09:00:00Z", "2026-03-04T07:00:00Z", "2026-03-04T09:00:00Z", "2026-03-05T14:00:00Z", "2026-03-07T09:00:00Z", "2026-03-08T09:00:00Z"]
+    assert _starts(week) == expected, f"the week answered {_starts(week)}, expected {expected}: earliest first, moved instances at their new start"
 `,
     typescript: `import {parseInstant} from 'calendard/rrule';
 import {store} from 'calendard/store';
@@ -938,6 +977,14 @@ async function world(ctx) {
 const occurrence = (day: number): string => 'e-1:' + Date.UTC(2026, 2, day, 9) / 1000;
 const starts = (occurrences): string[] => occurrences.map(o => o.start);
 
+/** Fires on every command that touches key until the key exists, then records its TTL: the TTL the creating command gave it. */
+function ttlWhenWritten(ctx, key: string, box: {ttl?: number}) {
+  ctx.redisAfter(key, () => {
+    if (ctx.redis.exists(key)) box.ttl = ctx.redis.ttl(key);
+    else ttlWhenWritten(ctx, key, box);
+  });
+}
+
 export async function check_range_key(ctx) {
   const m = await world(ctx);
   const week1 = await m.cachedExpansion('c1', ...WEEK_1);
@@ -947,18 +994,29 @@ export async function check_range_key(ctx) {
   assert.deepEqual(starts(week2), expected, \`the week of 9 March answered \${JSON.stringify(starts(week2))}, expected \${JSON.stringify(expected)}: the slice cached for one window was served for another\`);
   const again = await m.cachedExpansion('c1', ...WEEK_1);
   assert.deepEqual(starts(again), starts(week1), \`the week of 2 March, read again, answered \${JSON.stringify(starts(again))}\`);
+  // Same start, shorter window: 2 to 4 March.
+  const short = await m.cachedExpansion('c1', WEEK_1[0], WEEK_1[0] + 2 * 86400);
+  const shortExpected = ['2026-03-02T09:00:00Z', '2026-03-03T09:00:00Z'];
+  assert.deepEqual(starts(short), shortExpected, \`2 to 4 March answered \${JSON.stringify(starts(short))}, expected \${JSON.stringify(shortExpected)}: a window is its start and its end\`);
 }
 
 export async function check_ttl(ctx) {
   const m = await world(ctx);
+  const key = \`exp:c1:0:\${WEEK_1[0]}:\${WEEK_1[1]}\`;
+  const box: {ttl?: number} = {};
+  ttlWhenWritten(ctx, key, box);
   await m.cachedExpansion('c1', ...WEEK_1);
   const keys = ctx.redis.keys('exp:*');
   assert(keys.length > 0, 'cachedExpansion cached nothing under exp:*');
-  for (const key of keys) {
-    const ttl = ctx.redis.ttl(key);
-    assert(ttl > 0 && ttl <= 300, \`\${key} has TTL \${ttl}: a slice must expire within 300 s, or every retired generation stays in memory\`);
+  // A slice under the key the task names is checked the instant it is written.
+  assert(box.ttl === undefined || (box.ttl > 0 && box.ttl <= 300), \`right after \${key} was written its TTL was \${box.ttl}: the command that writes a slice gives it its TTL, or a crash before the next one leaves it forever\`);
+  for (const k of keys) {
+    const ttl = ctx.redis.ttl(k);
+    assert(ttl > 0 && ttl <= 300, \`\${k} has TTL \${ttl}: a slice must expire within 300 s, or every retired generation stays in memory\`);
   }
-  ctx.clock.advance(301);
+  ctx.clock.advance(299);
+  assert.deepEqual(ctx.redis.keys('exp:*'), keys, \`299 s later Redis holds \${JSON.stringify(ctx.redis.keys('exp:*'))}, expected \${JSON.stringify(keys)}: a slice lives 300 s\`);
+  ctx.clock.advance(2);
   assert.deepEqual(ctx.redis.keys('exp:*'), [], \`301 s later Redis still holds \${JSON.stringify(ctx.redis.keys('exp:*'))}\`);
 }
 
@@ -973,12 +1031,23 @@ export async function check_write_then_bump(ctx) {
   assert.equal(probe.result, 'cancelled', 'when gen:c1 moved the exception was not written yet: a reader in between expands the old calendar and caches it under the new generation for the whole TTL. Write the exception, then bump');
   const ids = (await m.cachedExpansion('c1', ...WEEK_1)).map(o => o.occurrence_id);
   assert(!ids.includes(cancelled), 'after recordException the cancelled 4 March standup is still in the week');
+  // Another replica cancels 9 March while this reader is expanding the week of 9 March.
+  const late = occurrence(9);
+  const during = ctx.redisAfter('exceptions:c1', () => {
+    ctx.redis.hset('exceptions:c1', late, 'cancelled');
+    ctx.redis.incr('gen:c1');
+  });
+  await m.cachedExpansion('c1', ...WEEK_2);
+  assert(during.fired, 'cachedExpansion never read exceptions:c1 for the week of 9 March');
+  const after = (await m.cachedExpansion('c1', ...WEEK_2)).map(o => o.occurrence_id);
+  assert(!after.includes(late), '9 March was cancelled (and gen:c1 bumped) while the week of 9 March was being expanded, and the next read still lists it: the expansion of the old calendar was cached under the new generation');
 }
 
 export async function check_exceptions(ctx) {
   const m = await world(ctx);
   await store.putException('c1', occurrence(3), 'cancelled');
   await store.putException('c1', occurrence(5), 'moved:2026-03-05T14:00:00Z');
+  await store.putException('c1', occurrence(6), 'moved:2026-03-04T08:00:00+01:00');
   const week = await m.cachedExpansion('c1', ...WEEK_1);
   const ids = week.map(o => o.occurrence_id);
   assert(!ids.includes(occurrence(3)), \`the cancelled 3 March standup is still listed: \${JSON.stringify(starts(week))}\`);
@@ -987,6 +1056,10 @@ export async function check_exceptions(ctx) {
   const moved = week.find(o => o.occurrence_id === occurrence(5));
   assert(moved.start === '2026-03-05T14:00:00Z' && moved.end === '2026-03-05T14:30:00Z', \`the moved standup is \${JSON.stringify(moved)}, expected 14:00 to 14:30 on 5 March\`);
   assert.equal(week.length, 6, \`the week answered \${week.length} standups, expected 6 (7 minus the cancelled one): \${JSON.stringify(starts(week))}\`);
+  const early = week.find(o => o.occurrence_id === occurrence(6));
+  assert(early.start === '2026-03-04T07:00:00Z' && early.end === '2026-03-04T07:30:00Z', \`the 6 March standup moved to 08:00+01:00 on 4 March is \${JSON.stringify(early)}, expected 07:00Z to 07:30Z\`);
+  const expected = ['2026-03-02T09:00:00Z', '2026-03-04T07:00:00Z', '2026-03-04T09:00:00Z', '2026-03-05T14:00:00Z', '2026-03-07T09:00:00Z', '2026-03-08T09:00:00Z'];
+  assert.deepEqual(starts(week), expected, \`the week answered \${JSON.stringify(starts(week))}, expected \${JSON.stringify(expected)}: earliest first, moved instances at their new start\`);
 }
 `,
     go: `package main
@@ -1047,6 +1120,19 @@ func stIDs(occurrences []rrule.Occurrence) []string {
 	return ids
 }
 
+// stTTLWhenWritten fires on every command that touches key until the key exists, then records its TTL:
+// the TTL the creating command gave it.
+func stTTLWhenWritten(ctx *harness.Ctx, key string, ttl *int64, written *bool) {
+	ctx.Redis.After(key, func() any {
+		if ctx.Redis.Exists(key) > 0 {
+			*ttl, *written = ctx.Redis.TTL(key), true
+		} else {
+			stTTLWhenWritten(ctx, key, ttl, written)
+		}
+		return nil
+	})
+}
+
 func CheckRangeKey(ctx *harness.Ctx) {
 	stWorld(ctx)
 	week1 := stRead(ctx, stWeek1)
@@ -1054,18 +1140,29 @@ func CheckRangeKey(ctx *harness.Ctx) {
 	week2 := stRead(ctx, stWeek2)
 	ctx.Equal(stStarts(week2), []string{"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"}, "the week of 9 March (a slice cached for one window must not be served for another)")
 	ctx.Equal(stStarts(stRead(ctx, stWeek1)), stStarts(week1), "the week of 2 March, read again")
+	// Same start, shorter window: 2 to 4 March.
+	short := stRead(ctx, [2]int64{stWeek1[0], stWeek1[0] + 2*86400})
+	ctx.Equal(stStarts(short), []string{"2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"}, "2 to 4 March (a window is its start and its end)")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
 	stWorld(ctx)
+	key := "exp:c1:0:" + strconv.FormatInt(stWeek1[0], 10) + ":" + strconv.FormatInt(stWeek1[1], 10)
+	var ttlAtWrite int64
+	written := false
+	stTTLWhenWritten(ctx, key, &ttlAtWrite, &written)
 	stRead(ctx, stWeek1)
 	keys := ctx.Redis.Keys("exp:*")
 	ctx.Assert(len(keys) > 0, "cachedExpansion cached nothing under exp:*")
-	for _, key := range keys {
-		ttl := ctx.Redis.TTL(key)
-		ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a slice must expire within 300 s, or every retired generation stays in memory", key, ttl)
+	// A slice under the key the task names is checked the instant it is written.
+	ctx.Assert(!written || (ttlAtWrite > 0 && ttlAtWrite <= 300), "right after %s was written its TTL was %d: the command that writes a slice gives it its TTL, or a crash before the next one leaves it forever", key, ttlAtWrite)
+	for _, k := range keys {
+		ttl := ctx.Redis.TTL(k)
+		ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a slice must expire within 300 s, or every retired generation stays in memory", k, ttl)
 	}
-	ctx.Clock.Advance(301)
+	ctx.Clock.Advance(299)
+	ctx.Equal(ctx.Redis.Keys("exp:*"), keys, "the slices 299 s later (a slice lives 300 s)")
+	ctx.Clock.Advance(2)
 	ctx.Equal(ctx.Redis.Keys("exp:*"), []string{}, "the slices 301 s later")
 }
 
@@ -1084,12 +1181,25 @@ func CheckWriteThenBump(ctx *harness.Ctx) {
 	for _, id := range stIDs(stRead(ctx, stWeek1)) {
 		ctx.Assert(id != cancelled, "after recordException the cancelled 4 March standup is still in the week")
 	}
+	// Another replica cancels 9 March while this reader is expanding the week of 9 March.
+	late := stOccurrence(9)
+	during := ctx.Redis.After("exceptions:c1", func() any {
+		ctx.Redis.Do("HSET", "exceptions:c1", late, "cancelled")
+		ctx.Redis.Do("INCR", "gen:c1")
+		return nil
+	})
+	stRead(ctx, stWeek2)
+	ctx.Assert(during.Fired, "cachedExpansion never read exceptions:c1 for the week of 9 March")
+	for _, id := range stIDs(stRead(ctx, stWeek2)) {
+		ctx.Assert(id != late, "9 March was cancelled (and gen:c1 bumped) while the week of 9 March was being expanded, and the next read still lists it: the expansion of the old calendar was cached under the new generation")
+	}
 }
 
 func CheckExceptions(ctx *harness.Ctx) {
 	stWorld(ctx)
 	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(3), "cancelled"), "seeding an exception")
 	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(5), "moved:2026-03-05T14:00:00Z"), "seeding an exception")
+	ctx.NoError(store.PutException(context.Background(), "c1", stOccurrence(6), "moved:2026-03-04T08:00:00+01:00"), "seeding an exception")
 	week := stRead(ctx, stWeek1)
 	copies := 0
 	for _, o := range week {
@@ -1098,9 +1208,13 @@ func CheckExceptions(ctx *harness.Ctx) {
 			copies++
 			ctx.Assert(o.Start == "2026-03-05T14:00:00Z" && o.End == "2026-03-05T14:30:00Z", "the moved standup is %v, expected 14:00 to 14:30 on 5 March", o)
 		}
+		if o.OccurrenceID == stOccurrence(6) {
+			ctx.Assert(o.Start == "2026-03-04T07:00:00Z" && o.End == "2026-03-04T07:30:00Z", "the 6 March standup moved to 08:00+01:00 on 4 March is %v, expected 07:00Z to 07:30Z", o)
+		}
 	}
 	ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", stStarts(week))
 	ctx.Equal(len(week), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", stStarts(week))
+	ctx.Equal(stStarts(week), []string{"2026-03-02T09:00:00Z", "2026-03-04T07:00:00Z", "2026-03-04T09:00:00Z", "2026-03-05T14:00:00Z", "2026-03-07T09:00:00Z", "2026-03-08T09:00:00Z"}, "the week, earliest first with moved instances at their new start")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1131,6 +1245,18 @@ std::vector<std::string> stStarts(const std::vector<calendard::Occurrence>& occu
   return starts;
 }
 
+// Fires on every command that touches key until the key exists, then records its TTL: the TTL the creating command gave it.
+void stTtlWhenWritten(harness::Ctx& ctx, const std::string& key, long long& ttl, bool& written) {
+  ctx.Redis.After(key, [&ctx, key, &ttl, &written] {
+    if (ctx.Redis.Exists(key) > 0) {
+      ttl = ctx.Redis.TTL(key);
+      written = true;
+    } else {
+      stTtlWhenWritten(ctx, key, ttl, written);
+    }
+  });
+}
+
 }  // namespace
 
 void CheckRangeKey(harness::Ctx& ctx) {
@@ -1141,18 +1267,32 @@ void CheckRangeKey(harness::Ctx& ctx) {
   ctx.Equal(stStarts(week2), {"2026-03-09T09:00:00Z", "2026-03-10T09:00:00Z", "2026-03-11T09:00:00Z"},
             "the week of 9 March (a slice cached for one window must not be served for another)");
   ctx.Equal(stStarts(cachedExpansion("c1", kWeek1Start, kWeek1End)), stStarts(week1), "the week of 2 March, read again");
+  // Same start, shorter window: 2 to 4 March.
+  ctx.Equal(stStarts(cachedExpansion("c1", kWeek1Start, kWeek1Start + 2 * 86400)), {"2026-03-02T09:00:00Z", "2026-03-03T09:00:00Z"},
+            "2 to 4 March (a window is its start and its end)");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
   stWorld();
+  const std::string key = "exp:c1:0:" + std::to_string(kWeek1Start) + ":" + std::to_string(kWeek1End);
+  long long ttlAtWrite = 0;
+  bool written = false;
+  stTtlWhenWritten(ctx, key, ttlAtWrite, written);
   cachedExpansion("c1", kWeek1Start, kWeek1End);
   const auto keys = ctx.Redis.Keys("exp:*");
   ctx.Assert(!keys.empty(), "cachedExpansion cached nothing under exp:*");
-  for (const auto& key : keys) {
-    const long long ttl = ctx.Redis.TTL(key);
-    ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a slice must expire within 300 s, or every retired generation stays in memory", key, ttl);
+  // A slice under the key the task names is checked the instant it is written.
+  ctx.Assert(!written || (ttlAtWrite > 0 && ttlAtWrite <= 300),
+             "right after %s was written its TTL was %d: the command that writes a slice gives it its TTL, or a crash before the next one "
+             "leaves it forever",
+             key, ttlAtWrite);
+  for (const auto& k : keys) {
+    const long long ttl = ctx.Redis.TTL(k);
+    ctx.Assert(ttl > 0 && ttl <= 300, "%s has TTL %d: a slice must expire within 300 s, or every retired generation stays in memory", k, ttl);
   }
-  ctx.Clock.Advance(301);
+  ctx.Clock.Advance(299);
+  ctx.Equal(ctx.Redis.Keys("exp:*"), keys, "the slices 299 s later (a slice lives 300 s)");
+  ctx.Clock.Advance(2);
   ctx.Equal(ctx.Redis.Keys("exp:*"), std::vector<std::string>{}, "the slices 301 s later");
 }
 
@@ -1175,12 +1315,28 @@ void CheckWriteThenBump(harness::Ctx& ctx) {
   for (const auto& o : cachedExpansion("c1", kWeek1Start, kWeek1End)) {
     ctx.Assert(o.occurrence_id != cancelled, "after recordException the cancelled 4 March standup is still in the week");
   }
+  // Another replica cancels 9 March while this reader is expanding the week of 9 March.
+  const std::string late = stOccurrence(9);
+  bool during = false;
+  ctx.Redis.After("exceptions:c1", [&] {
+    during = true;
+    ctx.Redis.Do("HSET", "exceptions:c1", late, "cancelled");
+    ctx.Redis.Do("INCR", "gen:c1");
+  });
+  cachedExpansion("c1", kWeek1End, kWeek2End);
+  ctx.Assert(during, "cachedExpansion never read exceptions:c1 for the week of 9 March");
+  for (const auto& o : cachedExpansion("c1", kWeek1End, kWeek2End)) {
+    ctx.Assert(o.occurrence_id != late,
+               "9 March was cancelled (and gen:c1 bumped) while the week of 9 March was being expanded, and the next read still lists it: "
+               "the expansion of the old calendar was cached under the new generation");
+  }
 }
 
 void CheckExceptions(harness::Ctx& ctx) {
   stWorld();
   calendard::store::PutException("c1", stOccurrence(3), "cancelled");
   calendard::store::PutException("c1", stOccurrence(5), "moved:2026-03-05T14:00:00Z");
+  calendard::store::PutException("c1", stOccurrence(6), "moved:2026-03-04T08:00:00+01:00");
   const auto week = cachedExpansion("c1", kWeek1Start, kWeek1End);
   int copies = 0;
   for (const auto& o : week) {
@@ -1190,9 +1346,17 @@ void CheckExceptions(harness::Ctx& ctx) {
       ctx.Assert(o.start == "2026-03-05T14:00:00Z" && o.end == "2026-03-05T14:30:00Z",
                  "the moved standup runs %s to %s, expected 14:00 to 14:30 on 5 March", o.start, o.end);
     }
+    if (o.occurrence_id == stOccurrence(6)) {
+      ctx.Assert(o.start == "2026-03-04T07:00:00Z" && o.end == "2026-03-04T07:30:00Z",
+                 "the 6 March standup moved to 08:00+01:00 on 4 March runs %s to %s, expected 07:00Z to 07:30Z", o.start, o.end);
+    }
   }
   ctx.Equal(copies, 1, "the moved 5 March standup must be listed once, in place of the original (%v); the copies", stStarts(week));
   ctx.Equal(week.size(), 6, "the week must answer 6 standups, 7 minus the cancelled one (%v); the count", stStarts(week));
+  ctx.Equal(stStarts(week),
+            {"2026-03-02T09:00:00Z", "2026-03-04T07:00:00Z", "2026-03-04T09:00:00Z", "2026-03-05T14:00:00Z", "2026-03-07T09:00:00Z",
+             "2026-03-08T09:00:00Z"},
+            "the week, earliest first with moved instances at their new start");
 }
 `,
   },

@@ -47,7 +47,7 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
       id: 'stable-key',
       title: 'One idempotency key per submission and handler',
       detail:
-        'Every attempt and every replay of one `(submission, handler)` carries the key `{submission_id}:{handler}`, so the CRM recognises a retry and keeps one lead. The starter mints a random key per attempt.',
+        'Every attempt and every replay of one `(submission, handler)` carries exactly the key `{submission_id}:{handler}`, so the CRM recognises a retry and keeps one lead; a lost answer is retried within the same `deliver` call, up to `ATTEMPTS`. The starter mints a random key per attempt.',
       match: {
         python: {all: [/idempotency_key\s*=/], none: [/uuid/i]},
         typescript: {all: [/idempotency_key:/], none: [/randomUUID|uuid/i]},
@@ -99,7 +99,7 @@ service Handler { rpc Deliver(DeliverRequest) returns (DeliverReply); }  // upse
       id: 'replay-failed-only',
       title: 'A replay calls only the handlers that failed',
       detail:
-        '`deliver` reads `delivery:{submission_id}` before calling anyone and skips the handlers already `ok`. The starter calls all three handlers on every replay.',
+        '`deliver` reads `delivery:{submission_id}` before calling anyone and skips the handlers already `ok`, which still count: a replay with one handler still down answers `partial` with every handler’s outcome. The starter calls all three handlers on every replay.',
       match: {
         python: {all: [/r\.hgetall\(/], order: [/r\.hgetall\(/, /\.Deliver\(/]},
         typescript: {all: [/redis\.hgetall\(/], order: [/redis\.hgetall\(/, /\.Deliver\(/]},
@@ -764,13 +764,14 @@ def check_stable_key(ctx):
     m, handlers = _setup(ctx)
     sid = _submission()
     ctx.grpc.fail("Deliver", grpc.StatusCode.UNAVAILABLE, times=1, target="crm:9000")  # the crm's first answer is lost
-    m.deliver(sid)
+    first = m.deliver(sid)
+    assert (first.get("outcomes") or {}).get("crm") == "ok", f"the crm failed once and deliver answered {first}: one lost answer must be retried within ATTEMPTS, not left to the retry job"
     m.deliver(sid)  # the retry job replays it
     calls = _calls(ctx, "crm")
     keys = sorted({c.request.idempotency_key for c in calls})
     assert len(calls) >= 2, f"the crm failed once and was called {len(calls)} times: it must be retried"
     assert len(keys) == 1, f"the crm was called with {len(keys)} idempotency keys {keys} for one submission: each retry looks like a new lead. Send {sid}:crm every time"
-    assert sid in keys[0], f"the key {keys[0]!r} does not name the submission {sid}"
+    assert keys[0] == f"{sid}:crm", f"the crm got the key {keys[0]!r}, expected {sid}:crm: the key names the submission and the handler"
     assert len(handlers["crm"].records) == 1, f"the crm holds {len(handlers['crm'].records)} leads for one submission"
     other = _submission()
     m.deliver(other)
@@ -829,6 +830,13 @@ def check_replay_failed_only(ctx):
     assert called == ["queue:9000"], f"the replay called {called}: only the handler that failed (queue) needs the submission again"
     assert result.get("status") == "delivered", f"after the queue took it on the replay the status is {result.get('status')!r}, expected delivered"
     assert len(handlers["webhook"].records) == 1 and len(handlers["crm"].records) == 1, "the replay re-sent the submission to a handler that already had it"
+    still = _submission()
+    handlers["queue"].down = True
+    m.deliver(still)
+    again = m.deliver(still)  # replayed while the queue is still down
+    expected = {"webhook": "ok", "crm": "ok", "queue": "failed"}
+    assert again.get("status") == "partial" and again.get("outcomes") == expected, f"a replay with the queue still down answered {again}, expected status partial and outcomes {expected}: the handlers that took it on the first run still count"
+    assert ctx.redis.hget(f"delivery:{still}", "status") == "partial", f"delivery:{still} says {ctx.redis.hget(f'delivery:{still}', 'status')!r} after a replay with the queue still down, expected partial"
 `,
     typescript: `const HANDLERS = ['webhook', 'crm', 'queue'];
 
@@ -870,13 +878,14 @@ export async function check_stable_key(ctx) {
   const {m, handlers, submission} = await setup(ctx);
   const sid = await submission();
   ctx.grpc.fail('Deliver', ctx.grpc.status.UNAVAILABLE, '', 1, 'crm:9000'); // the crm's first answer is lost
-  await m.deliver(sid);
+  const first = await m.deliver(sid);
+  assert.equal(first.outcomes?.crm, 'ok', \`the crm failed once and deliver answered \${JSON.stringify(first)}: one lost answer must be retried within ATTEMPTS, not left to the retry job\`);
   await m.deliver(sid); // the retry job replays it
   const calls = callsTo(ctx, 'crm');
   const keys = [...new Set(calls.map(c => c.request.idempotency_key))].sort();
   assert(calls.length >= 2, \`the crm failed once and was called \${calls.length} times: it must be retried\`);
   assert.equal(keys.length, 1, \`the crm was called with \${keys.length} idempotency keys \${JSON.stringify(keys)} for one submission: each retry looks like a new lead. Send \${sid}:crm every time\`);
-  assert(keys[0].includes(sid), \`the key \${keys[0]} does not name the submission \${sid}\`);
+  assert.equal(keys[0], \`\${sid}:crm\`, \`the crm got the key \${keys[0]}, expected \${sid}:crm: the key names the submission and the handler\`);
   assert.equal(handlers.crm.records.size, 1, \`the crm holds \${handlers.crm.records.size} leads for one submission\`);
   const other = await submission();
   await m.deliver(other);
@@ -935,6 +944,14 @@ export async function check_replay_failed_only(ctx) {
   assert.deepEqual(called, ['queue:9000'], \`the replay called \${JSON.stringify(called)}: only the handler that failed (queue) needs the submission again\`);
   assert.equal(result.status, 'delivered', \`after the queue took it on the replay the status is \${JSON.stringify(result.status)}, expected delivered\`);
   assert(handlers.webhook.records.size === 1 && handlers.crm.records.size === 1, 'the replay re-sent the submission to a handler that already had it');
+  const still = await submission();
+  handlers.queue.down = true;
+  await m.deliver(still);
+  const again = await m.deliver(still); // replayed while the queue is still down
+  const expected = {webhook: 'ok', crm: 'ok', queue: 'failed'};
+  assert.equal(again.status, 'partial', \`a replay with the queue still down answered \${JSON.stringify(again)}, expected status partial: the handlers that took it on the first run still count\`);
+  assert.deepEqual(again.outcomes, expected, \`a replay with the queue still down answered outcomes \${JSON.stringify(again.outcomes)}, expected \${JSON.stringify(expected)}\`);
+  assert.equal(ctx.redis.hget(\`delivery:\${still}\`, 'status'), 'partial', \`delivery:\${still} must say partial after a replay with the queue still down\`);
 }
 `,
     go: `package main
@@ -943,7 +960,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -1000,19 +1016,20 @@ func clientDeliver(ctx *harness.Ctx, id string) Delivery {
 	return d
 }
 
-func keyOf(c any) string { return c.(*pb.DeliverRequest).GetIdempotencyKey() }
+func clientKeyOf(c any) string { return c.(*pb.DeliverRequest).GetIdempotencyKey() }
 
 func CheckStableKey(ctx *harness.Ctx) {
 	peers := clientSetup(ctx)
 	sid := clientSubmission(ctx)
 	ctx.GRPC.Fail("Deliver", codes.Unavailable, "", 1, "crm:9000") // the crm's first answer is lost
-	clientDeliver(ctx, sid)
+	first := clientDeliver(ctx, sid)
+	ctx.Equal(first.Outcomes["crm"], "ok", "the crm failed once: one lost answer must be retried within ATTEMPTS, not left to the retry job; the crm's outcome")
 	clientDeliver(ctx, sid) // the retry job replays it
 	calls := ctx.GRPC.CallsTo("Deliver", "crm:9000")
 	ctx.Assert(len(calls) >= 2, "the crm failed once and was called %d times: it must be retried", len(calls))
 	seen := map[string]bool{}
 	for _, c := range calls {
-		seen[keyOf(c.Request)] = true
+		seen[clientKeyOf(c.Request)] = true
 	}
 	keys := []string{}
 	for k := range seen {
@@ -1020,14 +1037,14 @@ func CheckStableKey(ctx *harness.Ctx) {
 	}
 	sort.Strings(keys)
 	ctx.Assert(len(keys) == 1, "the crm was called with %d idempotency keys %q for one submission: each retry looks like a new lead. Send %s:crm every time", len(keys), keys, sid)
-	ctx.Assert(strings.Contains(keys[0], sid), "the key %q does not name the submission %s", keys[0], sid)
+	ctx.Equal(keys[0], sid+":crm", "the key names the submission and the handler; the crm's key")
 	ctx.Equal(len(peers["crm"].records), 1, "the crm must hold one lead for one submission; leads")
 	other := clientSubmission(ctx)
 	clientDeliver(ctx, other)
 	var otherKeys []string
 	for _, c := range ctx.GRPC.CallsTo("Deliver", "crm:9000") {
 		if c.Request.(*pb.DeliverRequest).GetSubmissionId() == other {
-			otherKeys = append(otherKeys, keyOf(c.Request))
+			otherKeys = append(otherKeys, clientKeyOf(c.Request))
 		}
 	}
 	ctx.Assert(len(otherKeys) > 0 && !seen[otherKeys[0]], "a second submission was sent with the key %q: each submission needs its own", otherKeys)
@@ -1098,6 +1115,14 @@ func CheckReplayFailedOnly(ctx *harness.Ctx) {
 	ctx.Equal(called, []string{"queue:9000"}, "the replay must call only the handler that failed (queue); it called")
 	ctx.Equal(result.Status, "delivered", "after the queue took it on the replay, the status")
 	ctx.Assert(len(peers["webhook"].records) == 1 && len(peers["crm"].records) == 1, "the replay re-sent the submission to a handler that already had it")
+	still := clientSubmission(ctx)
+	peers["queue"].down = true
+	clientDeliver(ctx, still)
+	again := clientDeliver(ctx, still) // replayed while the queue is still down
+	ctx.Equal(again.Status, "partial", "a replay with the queue still down: the handlers that took it on the first run still count; the status")
+	ctx.Equal(again.Outcomes, map[string]string{"webhook": "ok", "crm": "ok", "queue": "failed"}, "a replay with the queue still down, deliver's outcomes")
+	stillStatus, _ := ctx.Redis.HGet("delivery:"+still, "status")
+	ctx.Equal(stillStatus, "partial", "delivery:%s's status after a replay with the queue still down", still)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1136,7 +1161,7 @@ struct Peers {
   HandlerPeer queue{"queue"};
 };
 
-Peers& setup(harness::Ctx& ctx) {
+Peers& hSetup(harness::Ctx& ctx) {
   store::defineForm("f-1", "u-owner", {{"name", 40}, {"email", 80}}, {{"name", 40}, {"email", 80}});
   static Peers* peers = nullptr;
   delete peers;
@@ -1147,37 +1172,38 @@ Peers& setup(harness::Ctx& ctx) {
   return *peers;
 }
 
-std::string newSubmission() { return store::insertSubmission("f-1", {{"name", "Ada"}, {"email", "ada@example.com"}}); }
+std::string hNewSubmission() { return store::insertSubmission("f-1", {{"name", "Ada"}, {"email", "ada@example.com"}}); }
 
-std::string keyOf(const harness::Call& c) { return c.Request<formd::DeliverRequest>().idempotency_key(); }
+std::string hKeyOf(const harness::Call& c) { return c.Request<formd::DeliverRequest>().idempotency_key(); }
 
 }  // namespace
 
 void CheckStableKey(harness::Ctx& ctx) {
-  Peers& peers = setup(ctx);
-  const std::string sid = newSubmission();
+  Peers& peers = hSetup(ctx);
+  const std::string sid = hNewSubmission();
   ctx.GRPC.Fail("Deliver", grpc::StatusCode::UNAVAILABLE, "", 1, "crm:9000");  // the crm's first answer is lost
-  deliver(sid);
+  const Delivery first = deliver(sid);
+  ctx.Equal(first.outcomes.count("crm") ? first.outcomes.at("crm") : "", "ok", "the crm failed once: one lost answer must be retried within ATTEMPTS, not left to the retry job; the crm's outcome");
   deliver(sid);  // the retry job replays it
   const auto calls = ctx.GRPC.CallsTo("Deliver", "crm:9000");
   ctx.Assert(calls.size() >= 2, "the crm failed once and was called %d times: it must be retried", calls.size());
   std::set<std::string> keys;
-  for (const auto& c : calls) keys.insert(keyOf(c));
+  for (const auto& c : calls) keys.insert(hKeyOf(c));
   ctx.Assert(keys.size() == 1, "the crm was called with %d idempotency keys %q for one submission: each retry looks like a new lead. Send %s:crm every time", keys.size(), std::vector<std::string>(keys.begin(), keys.end()), sid);
-  ctx.Assert(keys.begin()->find(sid) != std::string::npos, "the key %q does not name the submission %s", *keys.begin(), sid);
+  ctx.Equal(*keys.begin(), sid + ":crm", "the key names the submission and the handler; the crm's key");
   ctx.Equal(peers.crm.records.size(), 1, "the crm must hold one lead for one submission; leads");
-  const std::string other = newSubmission();
+  const std::string other = hNewSubmission();
   deliver(other);
   std::vector<std::string> otherKeys;
   for (const auto& c : ctx.GRPC.CallsTo("Deliver", "crm:9000")) {
-    if (c.Request<formd::DeliverRequest>().submission_id() == other) otherKeys.push_back(keyOf(c));
+    if (c.Request<formd::DeliverRequest>().submission_id() == other) otherKeys.push_back(hKeyOf(c));
   }
   ctx.Assert(!otherKeys.empty() && !keys.count(otherKeys.front()), "a second submission was sent with the key %q: each submission needs its own", otherKeys);
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  setup(ctx);
-  const std::string sid = newSubmission();
+  hSetup(ctx);
+  const std::string sid = hNewSubmission();
   ctx.GRPC.SetLatency("Deliver", 10.0, "webhook:9000");  // the webhook hangs
   const long long start = ctx.Clock.Now();
   deliver(sid);
@@ -1191,8 +1217,8 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckPerHandlerOutcomes(harness::Ctx& ctx) {
-  Peers& peers = setup(ctx);
-  const std::string sid = newSubmission();
+  Peers& peers = hSetup(ctx);
+  const std::string sid = hNewSubmission();
   peers.queue.down = true;
   const Delivery result = deliver(sid);
   const std::map<std::string, std::string> expected = {{"webhook", "ok"}, {"crm", "ok"}, {"queue", "failed"}};
@@ -1204,20 +1230,20 @@ void CheckPerHandlerOutcomes(harness::Ctx& ctx) {
 }
 
 void CheckPartialStatus(harness::Ctx& ctx) {
-  Peers& peers = setup(ctx);
+  Peers& peers = hSetup(ctx);
   peers.queue.down = true;
-  const std::string sid = newSubmission();
+  const std::string sid = hNewSubmission();
   ctx.Equal(deliver(sid).status, "partial", "with the queue down, deliver's status");
   ctx.Equal(ctx.Redis.HGet("delivery:" + sid, "status").value_or(""), "partial", "delivery:%s's status while the queue never got it", sid);
   peers.queue.down = false;
-  ctx.Equal(deliver(newSubmission()).status, "delivered", "with every handler up, the status");
+  ctx.Equal(deliver(hNewSubmission()).status, "delivered", "with every handler up, the status");
   peers.webhook.down = peers.crm.down = peers.queue.down = true;
-  ctx.Equal(deliver(newSubmission()).status, "failed", "with every handler down, the status");
+  ctx.Equal(deliver(hNewSubmission()).status, "failed", "with every handler down, the status");
 }
 
 void CheckReplayFailedOnly(harness::Ctx& ctx) {
-  Peers& peers = setup(ctx);
-  const std::string sid = newSubmission();
+  Peers& peers = hSetup(ctx);
+  const std::string sid = hNewSubmission();
   peers.queue.down = true;
   deliver(sid);
   peers.queue.down = false;
@@ -1229,6 +1255,13 @@ void CheckReplayFailedOnly(harness::Ctx& ctx) {
   ctx.Equal(std::vector<std::string>(targets.begin(), targets.end()), std::vector<std::string>{"queue:9000"}, "the replay must call only the handler that failed (queue); it called");
   ctx.Equal(result.status, "delivered", "after the queue took it on the replay, the status");
   ctx.Assert(peers.webhook.records.size() == 1 && peers.crm.records.size() == 1, "the replay re-sent the submission to a handler that already had it");
+  const std::string still = hNewSubmission();
+  peers.queue.down = true;
+  deliver(still);
+  const Delivery again = deliver(still);  // replayed while the queue is still down
+  ctx.Equal(again.status, "partial", "a replay with the queue still down: the handlers that took it on the first run still count; the status");
+  ctx.Equal(again.outcomes, std::map<std::string, std::string>{{"webhook", "ok"}, {"crm", "ok"}, {"queue", "failed"}}, "a replay with the queue still down, deliver's outcomes");
+  ctx.Equal(ctx.Redis.HGet("delivery:" + still, "status").value_or(""), "partial", "delivery:%s's status after a replay with the queue still down", still);
 }
 `,
   },

@@ -68,7 +68,7 @@ unknown mode is accepted.
       id: 'tenant-schema',
       title: 'Refuses a target outside the tenant’s schema',
       detail:
-        'The target is `schema.table` (**400** otherwise) and its schema is `wh_{tenant}` for the authenticated tenant (**403** otherwise); the starter writes wherever the body points.',
+        'The target is `schema.table` (**400** otherwise) and its schema is exactly `wh_{tenant}` for the authenticated tenant (**403** otherwise, a schema that only starts with it included); the starter writes wherever the body points.',
       match: {
         python: {all: [/wh_/, /\b403\b/]},
         typescript: {all: [/wh_/, /\b403\b/]},
@@ -81,7 +81,7 @@ unknown mode is accepted.
       id: 'manifest-key',
       title: 'Keys the load by (tenant, Idempotency-Key) and the manifest',
       detail:
-        '`Idempotency-Key` is required (**400**) and looked up (`find_key`/`findKey`) before a load is created: the same manifest answers the recorded load with 200, another manifest under the key is **409**, and a new load is remembered.',
+        '`Idempotency-Key` is required (**400**) and looked up (`find_key`/`findKey`) before a load is created: the same manifest answers the recorded load, as the store holds it, with 200; a manifest that differs in any part of the fingerprint (dataset, version, target, mode, transform) is **409**; and a new load is remembered.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.find_key\(/, /store\.remember_key\(/, /\b409\b/],
@@ -109,7 +109,7 @@ unknown mode is accepted.
       id: 'manifest-bounds',
       title: 'Bounds the manifest and validates the mode',
       detail:
-        'A body over `MAX_MANIFEST_BYTES` (`1 << 16`) is **413** and a `mode` outside `LOAD_MODES` (`append`, `merge`, `replace`) is **400**; the starter accepts any size and defaults any mode through.',
+        'A body over `MAX_MANIFEST_BYTES` (`1 << 16`) bytes is **413** while one of exactly that size is accepted, and a `mode` outside `LOAD_MODES` (`append`, `merge`, `replace`) is **400**; the starter accepts any size and defaults any mode through.',
       match: {
         python: {all: [/MAX_MANIFEST_BYTES\s*=\s*1\s*<<\s*16/, /\b413\b/, /LOAD_MODES/]},
         typescript: {
@@ -751,8 +751,11 @@ void register_routes(httplib::Server& svr) { svr.Post("/v1/loads", create_load);
     },
   },
   harness: {
-    python: `from loader import store
+    python: `import json
 
+from loader import store
+
+DEDUPE_SQL = "SELECT DISTINCT * FROM source"
 MANIFEST = {"source": {"dataset": "orders", "version": "2026-10-20"}, "target": "wh_acme.orders", "mode": "merge", "transform": "dedupe"}
 
 
@@ -766,6 +769,18 @@ def _api(ctx):
 async def _post(c, body=None, tenant="acme", key="k-1"):
     headers = {name: value for name, value in (("X-Tenant-Id", tenant), ("Idempotency-Key", key)) if value}
     return await c.post("/v1/loads", json=MANIFEST if body is None else body, headers=headers)
+
+
+async def _post_text(c, text, key):
+    """A manifest sent as these exact UTF-8 bytes."""
+    headers = {"X-Tenant-Id": "acme", "Idempotency-Key": key, "Content-Type": "application/json"}
+    return await c.post("/v1/loads", content=text.encode(), headers=headers)
+
+
+def _sized(size):
+    """A valid manifest whose body is exactly size bytes."""
+    pad = size - len(json.dumps({**MANIFEST, "notes": ""}, separators=(",", ":")))
+    return json.dumps({**MANIFEST, "notes": "x" * pad}, separators=(",", ":"))
 
 
 def _loads(ctx):
@@ -786,27 +801,29 @@ async def check_route(ctx):
 
 
 async def check_registered_transform(ctx):
-    m, client = _api(ctx)
+    _, client = _api(ctx)
     async with client as c:
         sql = await _post(c, {**MANIFEST, "transform": "SELECT * FROM wh_globex.orders"}, key="k-sql")
         assert sql.status_code == 400, f"a transform that is SQL, not a registered name, answered {sql.status_code}: {sql.text}. It would run with the loader's warehouse credentials"
         assert _loads(ctx) == [], f"the load with caller SQL was stored: {[ctx.redis.hgetall(k) for k in _loads(ctx)]}"
-        unknown = await _post(c, {**MANIFEST, "transform": "pivot"}, key="k-pivot")
-        assert unknown.status_code == 400, f"an unregistered transform name answered {unknown.status_code}, expected 400"
+        for name in ("pivot", "constructor"):
+            unknown = await _post(c, {**MANIFEST, "transform": name}, key=f"k-{name}")
+            assert unknown.status_code == 400, f"the unregistered transform name {name!r} answered {unknown.status_code}, expected 400"
         r = await _post(c, key="k-ok")
     assert r.status_code == 202, f"a load with the registered transform dedupe answered {r.status_code}: {r.text}"
     load = store.get_load("acme", r.json()["load_id"])
-    assert load["sql"] == m.TRANSFORMS["dedupe"], f"the load must carry the registry's SQL for dedupe, it carries {load['sql']!r}"
+    assert load["sql"] == DEDUPE_SQL, f"the load must carry the registry's SQL for dedupe, it carries {load['sql']!r}"
 
 
 async def check_tenant_schema(ctx):
     _, client = _api(ctx)
     async with client as c:
-        for target in ("wh_globex.orders", "shared.loads"):
+        for target in ("wh_globex.orders", "shared.loads", "wh_acmecorp.orders"):
             r = await _post(c, {**MANIFEST, "target": target}, key=f"k-{target}")
             assert r.status_code == 403, f"tenant acme loading into {target} answered {r.status_code}: {r.text}. A load writes into wh_acme only"
-        r = await _post(c, {**MANIFEST, "target": "orders"}, key="k-bare")
-        assert r.status_code == 400, f"a target that is not schema.table answered {r.status_code}, expected 400"
+        for target in ("orders", "wh_acme."):
+            r = await _post(c, {**MANIFEST, "target": target}, key=f"k-bare-{target}")
+            assert r.status_code == 400, f"the target {target!r}, not schema.table, answered {r.status_code}, expected 400"
         assert _loads(ctx) == [], f"a refused target was stored as a load: {[ctx.redis.hgetall(k) for k in _loads(ctx)]}"
         r = await _post(c, key="k-own")
     assert r.status_code == 202, f"tenant acme loading into wh_acme.orders answered {r.status_code}: {r.text}"
@@ -820,11 +837,14 @@ async def check_manifest_key(ctx):
         assert none.status_code == 400, f"a POST without Idempotency-Key answered {none.status_code}, expected 400"
         first = await _post(c, key="k-1")
         assert first.status_code == 202, f"the first POST answered {first.status_code}: {first.text}"
+        ctx.redis.hset(f"load:{first.json()['load_id']}", "status", "running")
         replay = await _post(c, key="k-1")
         assert replay.status_code == 200, f"a retry of the same manifest under the same key answered {replay.status_code}, expected 200 with the recorded load"
         assert replay.json().get("load_id") == first.json()["load_id"], f"the retry started load {replay.json().get('load_id')}, the first POST started {first.json()['load_id']}: one manifest, one load"
-        changed = await _post(c, other, key="k-1")
-        assert changed.status_code == 409, f"another manifest under a used key answered {changed.status_code}, expected 409"
+        assert replay.json().get("status") == "running", f"the retry must answer the recorded load as the store holds it (status running), got {replay.json()}"
+        for field, value in (("source", other["source"]), ("mode", "append"), ("transform", "identity"), ("target", "wh_acme.orders_v2")):
+            changed = await _post(c, {**MANIFEST, field: value}, key="k-1")
+            assert changed.status_code == 409, f"the manifest with another {field} under a used key answered {changed.status_code}, expected 409: the fingerprint covers dataset, version, target, mode and transform"
         fresh = await _post(c, other, key="k-2")
         assert fresh.status_code == 202 and fresh.json().get("load_id") != first.json()["load_id"], f"a new key must start a new load, got {fresh.status_code} {fresh.text}"
         theirs = await _post(c, {**MANIFEST, "target": "wh_globex.orders"}, tenant="globex", key="k-1")
@@ -839,11 +859,18 @@ async def check_manifest_bounds(ctx):
         assert r.status_code == 400, f"mode upsert answered {r.status_code}, expected 400: the modes are append, merge and replace"
         r = await _post(c, {**MANIFEST, "notes": "x" * 70000}, key="k-big")
         assert r.status_code == 413, f"a 70 KB manifest answered {r.status_code}, expected 413 over MAX_MANIFEST_BYTES (64 KiB)"
+        r = await _post_text(c, json.dumps({**MANIFEST, "notes": "\\u00e9" * 40000}, ensure_ascii=False), "k-wide")
+        assert r.status_code == 413, f"a manifest of 40,000 two-byte characters (80 KB) answered {r.status_code}, expected 413: the limit counts bytes"
+        r = await _post_text(c, _sized(65537), "k-over")
+        assert r.status_code == 413, f"a manifest of 65,537 bytes answered {r.status_code}, expected 413 over MAX_MANIFEST_BYTES"
         assert _loads(ctx) == [], f"a refused manifest was stored as a load: {[ctx.redis.hgetall(k) for k in _loads(ctx)]}"
         r = await _post(c, {**MANIFEST, "mode": "replace"}, key="k-replace")
-    assert r.status_code == 202, f"mode replace answered {r.status_code}: {r.text}"
+        assert r.status_code == 202, f"mode replace answered {r.status_code}: {r.text}"
+        r = await _post_text(c, _sized(65536), "k-edge")
+    assert r.status_code == 202, f"a manifest of exactly 65,536 bytes answered {r.status_code}, expected 202: only a body over MAX_MANIFEST_BYTES is refused"
 `,
-    typescript: `const MANIFEST = {source: {dataset: 'orders', version: '2026-10-20'}, target: 'wh_acme.orders', mode: 'merge', transform: 'dedupe'};
+    typescript: `const DEDUPE_SQL = 'SELECT DISTINCT * FROM source';
+const MANIFEST = {source: {dataset: 'orders', version: '2026-10-20'}, target: 'wh_acme.orders', mode: 'merge', transform: 'dedupe'};
 
 function api(ctx) {
   ctx.redis.hset('source:orders:2026-10-20', {'p-0': '250', 'p-1': '250', 'p-2': '250', 'p-3': '250'});
@@ -857,6 +884,17 @@ function post(c, body: object = MANIFEST, tenant: string | null = 'acme', key: s
   if (tenant !== null) headers['X-Tenant-Id'] = tenant;
   if (key !== null) headers['Idempotency-Key'] = key;
   return c.post('/v1/loads', {json: body, headers});
+}
+
+/** A manifest sent as these exact UTF-8 bytes. */
+function postText(c, text: string, key: string) {
+  return c.post('/v1/loads', {body: Buffer.from(text, 'utf8'), headers: {'X-Tenant-Id': 'acme', 'Idempotency-Key': key, 'Content-Type': 'application/json'}});
+}
+
+/** A valid manifest whose body is exactly size bytes. */
+function sized(size: number): string {
+  const pad = size - JSON.stringify({...MANIFEST, notes: ''}).length;
+  return JSON.stringify({...MANIFEST, notes: 'x'.repeat(pad)});
 }
 
 const loads = ctx => ctx.redis.keys('load:ld-*').filter(k => k.split(':').length === 2);
@@ -875,26 +913,30 @@ export async function check_route(ctx) {
 }
 
 export async function check_registered_transform(ctx) {
-  const {m, c, store} = api(ctx);
+  const {c, store} = api(ctx);
   const sql = await post(c, {...MANIFEST, transform: 'SELECT * FROM wh_globex.orders'}, 'acme', 'k-sql');
   assert.equal(sql.status, 400, \`a transform that is SQL, not a registered name, answered \${sql.status}: \${sql.text}. It would run with the loader's warehouse credentials\`);
   assert.deepEqual(loads(ctx), [], 'the load with caller SQL was stored');
-  const unknown = await post(c, {...MANIFEST, transform: 'pivot'}, 'acme', 'k-pivot');
-  assert.equal(unknown.status, 400, \`an unregistered transform name answered \${unknown.status}, expected 400\`);
+  for (const name of ['pivot', 'constructor']) {
+    const unknown = await post(c, {...MANIFEST, transform: name}, 'acme', \`k-\${name}\`);
+    assert.equal(unknown.status, 400, \`the unregistered transform name \${JSON.stringify(name)} answered \${unknown.status}, expected 400\`);
+  }
   const r = await post(c, MANIFEST, 'acme', 'k-ok');
   assert.equal(r.status, 202, \`a load with the registered transform dedupe answered \${r.status}: \${r.text}\`);
   const load = await store.getLoad('acme', r.json().load_id);
-  assert.equal(load.sql, m.TRANSFORMS.dedupe, \`the load must carry the registry's SQL for dedupe, it carries \${JSON.stringify(load.sql)}\`);
+  assert.equal(load.sql, DEDUPE_SQL, \`the load must carry the registry's SQL for dedupe, it carries \${JSON.stringify(load.sql)}\`);
 }
 
 export async function check_tenant_schema(ctx) {
   const {c} = api(ctx);
-  for (const target of ['wh_globex.orders', 'shared.loads']) {
+  for (const target of ['wh_globex.orders', 'shared.loads', 'wh_acmecorp.orders']) {
     const r = await post(c, {...MANIFEST, target}, 'acme', \`k-\${target}\`);
     assert.equal(r.status, 403, \`tenant acme loading into \${target} answered \${r.status}: \${r.text}. A load writes into wh_acme only\`);
   }
-  const bare = await post(c, {...MANIFEST, target: 'orders'}, 'acme', 'k-bare');
-  assert.equal(bare.status, 400, \`a target that is not schema.table answered \${bare.status}, expected 400\`);
+  for (const target of ['orders', 'wh_acme.']) {
+    const bare = await post(c, {...MANIFEST, target}, 'acme', \`k-bare-\${target}\`);
+    assert.equal(bare.status, 400, \`the target \${JSON.stringify(target)}, not schema.table, answered \${bare.status}, expected 400\`);
+  }
   assert.deepEqual(loads(ctx), [], 'a refused target was stored as a load');
   const own = await post(c, MANIFEST, 'acme', 'k-own');
   assert.equal(own.status, 202, \`tenant acme loading into wh_acme.orders answered \${own.status}: \${own.text}\`);
@@ -907,11 +949,15 @@ export async function check_manifest_key(ctx) {
   assert.equal(none.status, 400, \`a POST without Idempotency-Key answered \${none.status}, expected 400\`);
   const first = await post(c, MANIFEST, 'acme', 'k-1');
   assert.equal(first.status, 202, \`the first POST answered \${first.status}: \${first.text}\`);
+  ctx.redis.hset(\`load:\${first.json().load_id}\`, {status: 'running'});
   const replay = await post(c, MANIFEST, 'acme', 'k-1');
   assert.equal(replay.status, 200, \`a retry of the same manifest under the same key answered \${replay.status}, expected 200 with the recorded load\`);
   assert.equal(replay.json().load_id, first.json().load_id, \`the retry started load \${replay.json().load_id}, the first POST started \${first.json().load_id}: one manifest, one load\`);
-  const changed = await post(c, other, 'acme', 'k-1');
-  assert.equal(changed.status, 409, \`another manifest under a used key answered \${changed.status}, expected 409\`);
+  assert.equal(replay.json().status, 'running', \`the retry must answer the recorded load as the store holds it (status running), got \${replay.text}\`);
+  for (const [field, value] of [['source', other.source], ['mode', 'append'], ['transform', 'identity'], ['target', 'wh_acme.orders_v2']] as const) {
+    const changed = await post(c, {...MANIFEST, [field]: value}, 'acme', 'k-1');
+    assert.equal(changed.status, 409, \`the manifest with another \${field} under a used key answered \${changed.status}, expected 409: the fingerprint covers dataset, version, target, mode and transform\`);
+  }
   const fresh = await post(c, other, 'acme', 'k-2');
   assert(fresh.status === 202 && fresh.json().load_id !== first.json().load_id, \`a new key must start a new load, got \${fresh.status} \${fresh.text}\`);
   const theirs = await post(c, {...MANIFEST, target: 'wh_globex.orders'}, 'globex', 'k-1');
@@ -925,15 +971,22 @@ export async function check_manifest_bounds(ctx) {
   assert.equal(mode.status, 400, \`mode upsert answered \${mode.status}, expected 400: the modes are append, merge and replace\`);
   const big = await post(c, {...MANIFEST, notes: 'x'.repeat(70000)}, 'acme', 'k-big');
   assert.equal(big.status, 413, \`a 70 KB manifest answered \${big.status}, expected 413 over MAX_MANIFEST_BYTES (64 KiB)\`);
+  const wide = await postText(c, JSON.stringify({...MANIFEST, notes: '\\u00e9'.repeat(40000)}), 'k-wide');
+  assert.equal(wide.status, 413, \`a manifest of 40,000 two-byte characters (80 KB) answered \${wide.status}, expected 413: the limit counts bytes\`);
+  const over = await postText(c, sized(65537), 'k-over');
+  assert.equal(over.status, 413, \`a manifest of 65,537 bytes answered \${over.status}, expected 413 over MAX_MANIFEST_BYTES\`);
   assert.deepEqual(loads(ctx), [], 'a refused manifest was stored as a load');
   const replace = await post(c, {...MANIFEST, mode: 'replace'}, 'acme', 'k-replace');
   assert.equal(replace.status, 202, \`mode replace answered \${replace.status}: \${replace.text}\`);
+  const edge = await postText(c, sized(65536), 'k-edge');
+  assert.equal(edge.status, 202, \`a manifest of exactly 65,536 bytes answered \${edge.status}, expected 202: only a body over MAX_MANIFEST_BYTES is refused\`);
 }
 `,
     go: `package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -942,13 +995,13 @@ import (
 	"leetbuild/harness"
 )
 
-func apiManifest(version, target, mode, transform string) map[string]any {
+func hlManifest(version, target, mode, transform string) map[string]any {
 	return map[string]any{"source": map[string]string{"dataset": "orders", "version": version}, "target": target, "mode": mode, "transform": transform}
 }
 
-var apiDefault = apiManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+var hlDefault = hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hlAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Do("HSET", "source:orders:2026-10-20", "p-0", "250", "p-1", "250", "p-2", "250", "p-3", "250")
 	ctx.Redis.Do("HSET", "source:orders:2026-10-21", "p-0", "300", "p-1", "300")
 	mux := http.NewServeMux()
@@ -956,7 +1009,7 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
+func hlPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
 	var header []string
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -967,13 +1020,30 @@ func apiPost(c *harness.HTTP, body any, tenant, key string) *harness.Response {
 	return c.Post("/v1/loads", body, header...)
 }
 
-func apiBody(r *harness.Response) map[string]any {
+// hlPostText sends a manifest as these exact bytes.
+func hlPostText(c *harness.HTTP, text, key string) *harness.Response {
+	return c.Post("/v1/loads", text, "X-Tenant-Id", "acme", "Idempotency-Key", key, "Content-Type", "application/json")
+}
+
+// hlSized is a valid manifest whose body is exactly size bytes.
+func hlSized(size int) string {
+	m := hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+	m["notes"] = ""
+	base, _ := json.Marshal(m)
+	m["notes"] = strings.Repeat("x", size-len(base))
+	out, _ := json.Marshal(m)
+	return string(out)
+}
+
+const hlDedupeSQL = "SELECT DISTINCT * FROM source"
+
+func hlBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
-func apiLoads(ctx *harness.Ctx) []string {
+func hlLoads(ctx *harness.Ctx) []string {
 	var out []string
 	for _, k := range ctx.Redis.Keys("load:ld-*") {
 		if strings.Count(k, ":") == 1 {
@@ -984,78 +1054,102 @@ func apiLoads(ctx *harness.Ctx) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := apiPost(c, apiDefault, "acme", "k-1")
+	c := hlAPI(ctx)
+	r := hlPost(c, hlDefault, "acme", "k-1")
 	ctx.Equal(r.Status, 202, "POST /v1/loads (%s)", r.Text())
-	body := apiBody(r)
+	body := hlBody(r)
 	want := map[string]any{"status": "queued", "target": "wh_acme.orders", "mode": "merge", "partitions": 4, "rows_planned": 1000}
 	for name, value := range want {
 		ctx.Equal(body[name], value, "the new load's %s (%s)", name, r.Text())
 	}
 	loadID, _ := body["load_id"].(string)
 	ctx.Assert(store.GetLoad(context.Background(), "acme", loadID) != nil, "the load %q the API answered is not in the loads store", loadID)
-	anonymous := apiPost(c, apiDefault, "", "k-2")
+	anonymous := hlPost(c, hlDefault, "", "k-2")
 	ctx.Equal(anonymous.Status, 401, "a POST without X-Tenant-Id")
 }
 
 func CheckRegisteredTransform(ctx *harness.Ctx) {
-	c := api(ctx)
-	sql := apiPost(c, apiManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql")
+	c := hlAPI(ctx)
+	sql := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql")
 	ctx.Equal(sql.Status, 400, "a transform that is SQL, not a registered name, would run with the loader's warehouse credentials (%s)", sql.Text())
-	ctx.Equal(len(apiLoads(ctx)), 0, "the load with caller SQL must not be stored; loads")
-	unknown := apiPost(c, apiManifest("2026-10-20", "wh_acme.orders", "merge", "pivot"), "acme", "k-pivot")
-	ctx.Equal(unknown.Status, 400, "an unregistered transform name")
-	r := apiPost(c, apiDefault, "acme", "k-ok")
+	ctx.Equal(len(hlLoads(ctx)), 0, "the load with caller SQL must not be stored; loads")
+	for _, name := range []string{"pivot", "constructor"} {
+		unknown := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", name), "acme", "k-"+name)
+		ctx.Equal(unknown.Status, 400, "the unregistered transform name %q", name)
+	}
+	r := hlPost(c, hlDefault, "acme", "k-ok")
 	ctx.Equal(r.Status, 202, "a load with the registered transform dedupe (%s)", r.Text())
-	loadID, _ := apiBody(r)["load_id"].(string)
+	loadID, _ := hlBody(r)["load_id"].(string)
 	load := store.GetLoad(context.Background(), "acme", loadID)
 	ctx.Assert(load != nil, "the load %q is not in the store", loadID)
-	ctx.Equal(load.SQL, transforms["dedupe"], "the load must carry the registry's SQL for dedupe; its sql")
+	ctx.Equal(load.SQL, hlDedupeSQL, "the load must carry the registry's SQL for dedupe; its sql")
 }
 
 func CheckTenantSchema(ctx *harness.Ctx) {
-	c := api(ctx)
-	for _, target := range []string{"wh_globex.orders", "shared.loads"} {
-		r := apiPost(c, apiManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-"+target)
+	c := hlAPI(ctx)
+	for _, target := range []string{"wh_globex.orders", "shared.loads", "wh_acmecorp.orders"} {
+		r := hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-"+target)
 		ctx.Equal(r.Status, 403, "tenant acme loading into %s must be refused: a load writes into wh_acme only (%s)", target, r.Text())
 	}
-	bare := apiPost(c, apiManifest("2026-10-20", "orders", "merge", "dedupe"), "acme", "k-bare")
-	ctx.Equal(bare.Status, 400, "a target that is not schema.table")
-	ctx.Equal(len(apiLoads(ctx)), 0, "a refused target must not be stored as a load; loads")
-	own := apiPost(c, apiDefault, "acme", "k-own")
+	for _, target := range []string{"orders", "wh_acme."} {
+		bare := hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-bare-"+target)
+		ctx.Equal(bare.Status, 400, "the target %q is not schema.table", target)
+	}
+	ctx.Equal(len(hlLoads(ctx)), 0, "a refused target must not be stored as a load; loads")
+	own := hlPost(c, hlDefault, "acme", "k-own")
 	ctx.Equal(own.Status, 202, "tenant acme loading into wh_acme.orders (%s)", own.Text())
 }
 
 func CheckManifestKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	other := apiManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe")
-	none := apiPost(c, apiDefault, "acme", "")
+	c := hlAPI(ctx)
+	other := hlManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe")
+	none := hlPost(c, hlDefault, "acme", "")
 	ctx.Equal(none.Status, 400, "a POST without Idempotency-Key")
-	first := apiPost(c, apiDefault, "acme", "k-1")
+	first := hlPost(c, hlDefault, "acme", "k-1")
 	ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text())
-	replay := apiPost(c, apiDefault, "acme", "k-1")
+	firstID, _ := hlBody(first)["load_id"].(string)
+	ctx.Redis.Do("HSET", "load:"+firstID, "status", "running")
+	replay := hlPost(c, hlDefault, "acme", "k-1")
 	ctx.Equal(replay.Status, 200, "a retry of the same manifest under the same key must answer the recorded load")
-	ctx.Equal(apiBody(replay)["load_id"], apiBody(first)["load_id"], "one manifest, one load: the retry's load_id")
-	changed := apiPost(c, other, "acme", "k-1")
-	ctx.Equal(changed.Status, 409, "another manifest under a used key")
-	fresh := apiPost(c, other, "acme", "k-2")
-	ctx.Assert(fresh.Status == 202 && apiBody(fresh)["load_id"] != apiBody(first)["load_id"], "a new key must start a new load, got %d %s", fresh.Status, fresh.Text())
-	theirs := apiPost(c, apiManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1")
+	ctx.Equal(hlBody(replay)["load_id"], hlBody(first)["load_id"], "one manifest, one load: the retry's load_id")
+	ctx.Equal(hlBody(replay)["status"], "running", "the retry must answer the recorded load as the store holds it; its status")
+	for _, changed := range []struct {
+		field string
+		body  map[string]any
+	}{
+		{"source", other},
+		{"mode", hlManifest("2026-10-20", "wh_acme.orders", "append", "dedupe")},
+		{"transform", hlManifest("2026-10-20", "wh_acme.orders", "merge", "identity")},
+		{"target", hlManifest("2026-10-20", "wh_acme.orders_v2", "merge", "dedupe")},
+	} {
+		r := hlPost(c, changed.body, "acme", "k-1")
+		ctx.Equal(r.Status, 409, "the manifest with another %s under a used key (the fingerprint covers dataset, version, target, mode and transform)", changed.field)
+	}
+	fresh := hlPost(c, other, "acme", "k-2")
+	ctx.Assert(fresh.Status == 202 && hlBody(fresh)["load_id"] != hlBody(first)["load_id"], "a new key must start a new load, got %d %s", fresh.Status, fresh.Text())
+	theirs := hlPost(c, hlManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1")
 	ctx.Equal(theirs.Status, 202, "another tenant's k-1 is its own key: globex's first POST (%s)", theirs.Text())
-	ctx.Equal(len(apiLoads(ctx)), 3, "three distinct loads were started; the loads in the store")
+	ctx.Equal(len(hlLoads(ctx)), 3, "three distinct loads were started; the loads in the store")
 }
 
 func CheckManifestBounds(ctx *harness.Ctx) {
-	c := api(ctx)
-	mode := apiPost(c, apiManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode")
+	c := hlAPI(ctx)
+	mode := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode")
 	ctx.Equal(mode.Status, 400, "mode upsert (the modes are append, merge and replace)")
-	big := apiManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+	big := hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
 	big["notes"] = strings.Repeat("x", 70000)
-	r := apiPost(c, big, "acme", "k-big")
+	r := hlPost(c, big, "acme", "k-big")
 	ctx.Equal(r.Status, 413, "a 70 KB manifest is over maxManifestBytes (64 KiB)")
-	ctx.Equal(len(apiLoads(ctx)), 0, "a refused manifest must not be stored as a load; loads")
-	replace := apiPost(c, apiManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace")
+	wide := hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe")
+	wide["notes"] = strings.Repeat("\\u00e9", 40000)
+	wideText, _ := json.Marshal(wide)
+	ctx.Equal(hlPostText(c, string(wideText), "k-wide").Status, 413, "a manifest of 40,000 two-byte characters (80 KB): the limit counts bytes")
+	ctx.Equal(hlPostText(c, hlSized(65537), "k-over").Status, 413, "a manifest of 65,537 bytes is over maxManifestBytes")
+	ctx.Equal(len(hlLoads(ctx)), 0, "a refused manifest must not be stored as a load; loads")
+	replace := hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace")
 	ctx.Equal(replace.Status, 202, "mode replace (%s)", replace.Text())
+	edge := hlPostText(c, hlSized(65536), "k-edge")
+	ctx.Equal(edge.Status, 202, "a manifest of exactly 65,536 bytes: only a body over maxManifestBytes is refused (%s)", edge.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1063,19 +1157,20 @@ func CheckManifestBounds(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "loader/store.h"
 
 namespace {
 
-nlohmann::json manifest(const std::string& version, const std::string& target, const std::string& mode, const std::string& transform) {
+nlohmann::json hlManifest(const std::string& version, const std::string& target, const std::string& mode, const std::string& transform) {
   return {{"source", {{"dataset", "orders"}, {"version", version}}}, {"target", target}, {"mode", mode}, {"transform", transform}};
 }
 
-const nlohmann::json kManifest = manifest("2026-10-20", "wh_acme.orders", "merge", "dedupe");
+const nlohmann::json kHlManifest = hlManifest("2026-10-20", "wh_acme.orders", "merge", "dedupe");
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hlApi(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "source:orders:2026-10-20", "p-0", "250", "p-1", "250", "p-2", "250", "p-3", "250");
   ctx.Redis.Do("HSET", "source:orders:2026-10-21", "p-0", "300", "p-1", "300");
   static httplib::Server* svr = nullptr;
@@ -1085,16 +1180,31 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+harness::Response hlPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
   const std::string text = body.dump();
   if (tenant.empty()) return c.Post("/v1/loads", text, "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/loads", text, "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/loads", text, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+// A manifest sent as these exact bytes.
+harness::Response hlPostText(harness::HTTP& c, const std::string& text, const std::string& key) {
+  return c.Post("/v1/loads", text, "Content-Type", "application/json", "X-Tenant-Id", "acme", "Idempotency-Key", key);
+}
 
-size_t loads(harness::Ctx& ctx) {
+// A valid manifest whose body is exactly size bytes.
+std::string hlSized(size_t size) {
+  nlohmann::json m = kHlManifest;
+  m["notes"] = "";
+  m["notes"] = std::string(size - m.dump().size(), 'x');
+  return m.dump();
+}
+
+const std::string kHlDedupeSql = "SELECT DISTINCT * FROM source";
+
+nlohmann::json hlBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+size_t hlLoads(harness::Ctx& ctx) {
   size_t n = 0;
   for (const auto& k : ctx.Redis.Keys("load:ld-*")) {
     if (k.find(':', 5) == std::string::npos) n++;
@@ -1105,10 +1215,10 @@ size_t loads(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kManifest, "acme", "k-1");
+  auto c = hlApi(ctx);
+  const auto r = hlPost(c, kHlManifest, "acme", "k-1");
   ctx.Equal(r.Status, 202, "POST /v1/loads (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hlBodyOf(r);
   ctx.Equal(body.value("status", ""), "queued", "the new load's status (%s)", r.Text());
   ctx.Equal(body.value("target", ""), "wh_acme.orders", "the new load's target (%s)", r.Text());
   ctx.Equal(body.value("mode", ""), "merge", "the new load's mode (%s)", r.Text());
@@ -1116,67 +1226,89 @@ void CheckRoute(harness::Ctx& ctx) {
   ctx.Equal(body.value("rows_planned", 0L), 1000, "the new load's rows_planned (%s)", r.Text());
   const std::string load_id = body.value("load_id", "");
   ctx.Assert(store::getLoad("acme", load_id).has_value(), "the load %q the API answered is not in the loads store", load_id);
-  const auto anonymous = post(c, kManifest, "", "k-2");
+  const auto anonymous = hlPost(c, kHlManifest, "", "k-2");
   ctx.Equal(anonymous.Status, 401, "a POST without X-Tenant-Id");
 }
 
 void CheckRegisteredTransform(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto sql = post(c, manifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql");
+  auto c = hlApi(ctx);
+  const auto sql = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", "SELECT * FROM wh_globex.orders"), "acme", "k-sql");
   ctx.Equal(sql.Status, 400, "a transform that is SQL, not a registered name, would run with the loader's warehouse credentials (%s)", sql.Text());
-  ctx.Equal(loads(ctx), 0, "the load with caller SQL must not be stored; loads");
-  const auto unknown = post(c, manifest("2026-10-20", "wh_acme.orders", "merge", "pivot"), "acme", "k-pivot");
-  ctx.Equal(unknown.Status, 400, "an unregistered transform name");
-  const auto r = post(c, kManifest, "acme", "k-ok");
+  ctx.Equal(hlLoads(ctx), 0, "the load with caller SQL must not be stored; loads");
+  for (const std::string name : {"pivot", "constructor"}) {
+    const auto unknown = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "merge", name), "acme", "k-" + name);
+    ctx.Equal(unknown.Status, 400, "the unregistered transform name %q", name);
+  }
+  const auto r = hlPost(c, kHlManifest, "acme", "k-ok");
   ctx.Equal(r.Status, 202, "a load with the registered transform dedupe (%s)", r.Text());
-  const auto load = store::getLoad("acme", bodyOf(r).value("load_id", ""));
+  const auto load = store::getLoad("acme", hlBodyOf(r).value("load_id", ""));
   ctx.Assert(load.has_value(), "the load the API answered is not in the store");
-  ctx.Equal(load->sql, kTransforms.at("dedupe"), "the load must carry the registry's SQL for dedupe; its sql");
+  ctx.Equal(load->sql, kHlDedupeSql, "the load must carry the registry's SQL for dedupe; its sql");
 }
 
 void CheckTenantSchema(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const std::string target : {"wh_globex.orders", "shared.loads"}) {
-    const auto r = post(c, manifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-" + target);
+  auto c = hlApi(ctx);
+  for (const std::string target : {"wh_globex.orders", "shared.loads", "wh_acmecorp.orders"}) {
+    const auto r = hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-" + target);
     ctx.Equal(r.Status, 403, "tenant acme loading into %s must be refused: a load writes into wh_acme only (%s)", target, r.Text());
   }
-  const auto bare = post(c, manifest("2026-10-20", "orders", "merge", "dedupe"), "acme", "k-bare");
-  ctx.Equal(bare.Status, 400, "a target that is not schema.table");
-  ctx.Equal(loads(ctx), 0, "a refused target must not be stored as a load; loads");
-  const auto own = post(c, kManifest, "acme", "k-own");
+  for (const std::string target : {"orders", "wh_acme."}) {
+    const auto bare = hlPost(c, hlManifest("2026-10-20", target, "merge", "dedupe"), "acme", "k-bare-" + target);
+    ctx.Equal(bare.Status, 400, "the target %q is not schema.table", target);
+  }
+  ctx.Equal(hlLoads(ctx), 0, "a refused target must not be stored as a load; loads");
+  const auto own = hlPost(c, kHlManifest, "acme", "k-own");
   ctx.Equal(own.Status, 202, "tenant acme loading into wh_acme.orders (%s)", own.Text());
 }
 
 void CheckManifestKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto other = manifest("2026-10-21", "wh_acme.orders", "merge", "dedupe");
-  const auto none = post(c, kManifest, "acme", "");
+  auto c = hlApi(ctx);
+  const auto other = hlManifest("2026-10-21", "wh_acme.orders", "merge", "dedupe");
+  const auto none = hlPost(c, kHlManifest, "acme", "");
   ctx.Equal(none.Status, 400, "a POST without Idempotency-Key");
-  const auto first = post(c, kManifest, "acme", "k-1");
+  const auto first = hlPost(c, kHlManifest, "acme", "k-1");
   ctx.Equal(first.Status, 202, "the first POST (%s)", first.Text());
-  const auto replay = post(c, kManifest, "acme", "k-1");
+  ctx.Redis.Do("HSET", "load:" + hlBodyOf(first).value("load_id", ""), "status", "running");
+  const auto replay = hlPost(c, kHlManifest, "acme", "k-1");
   ctx.Equal(replay.Status, 200, "a retry of the same manifest under the same key must answer the recorded load");
-  ctx.Equal(bodyOf(replay).value("load_id", ""), bodyOf(first).value("load_id", ""), "one manifest, one load: the retry's load_id");
-  const auto changed = post(c, other, "acme", "k-1");
-  ctx.Equal(changed.Status, 409, "another manifest under a used key");
-  const auto fresh = post(c, other, "acme", "k-2");
-  ctx.Assert(fresh.Status == 202 && bodyOf(fresh).value("load_id", "") != bodyOf(first).value("load_id", ""), "a new key must start a new load, got %d %s", fresh.Status, fresh.Text());
-  const auto theirs = post(c, manifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1");
+  ctx.Equal(hlBodyOf(replay).value("load_id", ""), hlBodyOf(first).value("load_id", ""), "one manifest, one load: the retry's load_id");
+  ctx.Equal(hlBodyOf(replay).value("status", ""), "running", "the retry must answer the recorded load as the store holds it; its status");
+  const std::vector<std::pair<std::string, nlohmann::json>> changed = {
+      {"source", other},
+      {"mode", hlManifest("2026-10-20", "wh_acme.orders", "append", "dedupe")},
+      {"transform", hlManifest("2026-10-20", "wh_acme.orders", "merge", "identity")},
+      {"target", hlManifest("2026-10-20", "wh_acme.orders_v2", "merge", "dedupe")},
+  };
+  for (const auto& [field, body] : changed) {
+    const auto r = hlPost(c, body, "acme", "k-1");
+    ctx.Equal(r.Status, 409, "the manifest with another %s under a used key (the fingerprint covers dataset, version, target, mode and transform)", field);
+  }
+  const auto fresh = hlPost(c, other, "acme", "k-2");
+  ctx.Assert(fresh.Status == 202 && hlBodyOf(fresh).value("load_id", "") != hlBodyOf(first).value("load_id", ""), "a new key must start a new load, got %d %s", fresh.Status, fresh.Text());
+  const auto theirs = hlPost(c, hlManifest("2026-10-20", "wh_globex.orders", "merge", "dedupe"), "globex", "k-1");
   ctx.Equal(theirs.Status, 202, "another tenant's k-1 is its own key: globex's first POST (%s)", theirs.Text());
-  ctx.Equal(loads(ctx), 3, "three distinct loads were started; the loads in the store");
+  ctx.Equal(hlLoads(ctx), 3, "three distinct loads were started; the loads in the store");
 }
 
 void CheckManifestBounds(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto mode = post(c, manifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode");
+  auto c = hlApi(ctx);
+  const auto mode = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "upsert", "dedupe"), "acme", "k-mode");
   ctx.Equal(mode.Status, 400, "mode upsert (the modes are append, merge and replace)");
-  nlohmann::json big = kManifest;
+  nlohmann::json big = kHlManifest;
   big["notes"] = std::string(70000, 'x');
-  const auto r = post(c, big, "acme", "k-big");
+  const auto r = hlPost(c, big, "acme", "k-big");
   ctx.Equal(r.Status, 413, "a 70 KB manifest is over kMaxManifestBytes (64 KiB)");
-  ctx.Equal(loads(ctx), 0, "a refused manifest must not be stored as a load; loads");
-  const auto replace = post(c, manifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace");
+  nlohmann::json wide = kHlManifest;
+  std::string accents;
+  for (int i = 0; i < 40000; i++) accents += "\\xc3\\xa9";
+  wide["notes"] = accents;
+  ctx.Equal(hlPostText(c, wide.dump(), "k-wide").Status, 413, "a manifest of 40,000 two-byte characters (80 KB): the limit counts bytes");
+  ctx.Equal(hlPostText(c, hlSized(65537), "k-over").Status, 413, "a manifest of 65,537 bytes is over kMaxManifestBytes");
+  ctx.Equal(hlLoads(ctx), 0, "a refused manifest must not be stored as a load; loads");
+  const auto replace = hlPost(c, hlManifest("2026-10-20", "wh_acme.orders", "replace", "dedupe"), "acme", "k-replace");
   ctx.Equal(replace.Status, 202, "mode replace (%s)", replace.Text());
+  const auto edge = hlPostText(c, hlSized(65536), "k-edge");
+  ctx.Equal(edge.Status, 202, "a manifest of exactly 65,536 bytes: only a body over kMaxManifestBytes is refused (%s)", edge.Text());
 }
 `,
   },

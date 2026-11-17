@@ -71,7 +71,7 @@ service Crm { rpc SyncNote(SyncNoteRequest) returns (SyncNoteReply); }  // INVAL
       id: 'sync-deadline',
       title: 'Every attempt carries a 3-second deadline',
       detail:
-        'Each `SyncNote` call is made with `DEADLINE_S` (3 s), so a CRM that accepts the connection and never answers costs one attempt, not the drain; the starter sets no deadline.',
+        'Each `SyncNote` attempt is made with its own `DEADLINE_S` (3 s), so a CRM that accepts the connection and never answers costs one attempt, not the drain, and the attempts after it still get their full 3 s; the starter sets no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*3\b/, /SyncNote\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*3000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -662,7 +662,9 @@ int drainOutbox() {
     },
   },
   harness: {
-    python: `import grpc
+    python: `import re
+
+import grpc
 
 import ticketing_system_pb2 as pb
 import ticketing_system_pb2_grpc as pb_grpc
@@ -737,6 +739,12 @@ def check_sync_deadline(ctx):
     assert m.sync_note(note) is False, "a CRM that takes 30 s per call must not count as synced"
     took = ctx.clock.time() - started
     assert took <= 10, f"sync_note spent {took:.0f} s on a CRM that does not answer, expected at most MAX_ATTEMPTS × DEADLINE_S"
+    slow = ctx.grpc.calls_to("SyncNote")[1:]
+    assert len(slow) == 3, f"a CRM that never answers got {len(slow)} attempts: a deadline exceeded is transient, so the sync makes MAX_ATTEMPTS = 3"
+    timeouts = [c.timeout for c in slow]
+    assert all(t is not None and 2.5 <= t <= 3.5 for t in timeouts), f"the attempts carried deadlines {timeouts}: every attempt gets its own DEADLINE_S = 3, not what is left of the first one's"
+    assert not ctx.redis.hexists("crm:quarantine", note["id"]), "a note whose attempts ran out of time was quarantined: DEADLINE_EXCEEDED is transient, the note stays in crm:outbox"
+    assert _pending() == [note["id"]], f"a note whose attempts ran out of time must stay in crm:outbox, which holds {_pending()}"
 
 
 def check_idempotent_sync(ctx):
@@ -759,18 +767,34 @@ def check_retry_policy(ctx):
     assert _pending() == [note["id"]], f"a note whose attempts ran out must stay in crm:outbox for the next drain, which holds {_pending()}"
     assert m.drain_outbox() == 1, "the next drain (two more failures, then a healthy CRM) must sync the note"
     assert _pending() == [], f"crm:outbox holds {_pending()} after the note was synced"
+    note = _note()
+    before = len(ctx.grpc.calls_to("SyncNote"))
+    ctx.grpc.fail("SyncNote", grpc.StatusCode.DEADLINE_EXCEEDED, "crm too slow", times=2)
+    assert m.sync_note(note) is True, "two DEADLINE_EXCEEDED then a healthy CRM: DEADLINE_EXCEEDED is transient, so the third attempt must land"
+    calls = len(ctx.grpc.calls_to("SyncNote")) - before
+    assert calls == 3, f"the sync made {calls} attempts after two DEADLINE_EXCEEDED, expected 3"
 
 
 def check_quarantine_schema(ctx):
     m, _ = _crm(ctx)
     note = _note()
-    ctx.grpc.fail("SyncNote", grpc.StatusCode.INVALID_ARGUMENT, "author A-1 is not a CRM user", times=4)
+    before = len(ctx.grpc.calls_to("SyncNote"))
+    ctx.grpc.fail("SyncNote", grpc.StatusCode.INVALID_ARGUMENT, "author A-1 is not a CRM user", times=1)
     assert m.sync_note(note) is False, "a note the CRM's schema refuses must not count as synced"
-    calls = len(ctx.grpc.calls_to("SyncNote"))
+    calls = len(ctx.grpc.calls_to("SyncNote")) - before
     assert calls == 1, f"a note the CRM refused with INVALID_ARGUMENT was sent {calls} times: the refusal is permanent, another attempt gets the same answer"
     reason = ctx.redis.hget("crm:quarantine", note["id"])
     assert reason, "the refused note is not in crm:quarantine: store.quarantine(note id, reason) parks it with the reason for a person to look at"
+    assert re.search(r"invalid[_ ]?argument|\\b3\\b", reason, re.I), f"the quarantine reason is {reason!r}: it must name the status the CRM answered (INVALID_ARGUMENT)"
     assert _pending() == [], f"a quarantined note must leave crm:outbox, or every drain sends it again; it holds {_pending()}"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INTERNAL):
+        note = _note()
+        before = len(ctx.grpc.calls_to("SyncNote"))
+        ctx.grpc.fail("SyncNote", code, "refused", times=1)
+        assert m.sync_note(note) is False, f"a note the CRM refused with {code.name} must not count as synced"
+        calls = len(ctx.grpc.calls_to("SyncNote")) - before
+        assert calls == 1, f"a note the CRM refused with {code.name} was sent {calls} times: only UNAVAILABLE and DEADLINE_EXCEEDED are transient"
+        assert ctx.redis.hexists("crm:quarantine", note["id"]), f"a note the CRM refused with {code.name} is not in crm:quarantine: every status but the two transient ones is permanent"
 `,
     typescript: `const REPLY = 'We refunded the second charge.';
 
@@ -833,6 +857,12 @@ export async function check_sync_deadline(ctx) {
   assert.equal(await m.syncNote(note), false, 'a CRM that takes 30 s per call must not count as synced');
   const took = (ctx.clock.now() - started) / 1000;
   assert(took <= 10, \`syncNote spent \${took} s on a CRM that does not answer, expected at most MAX_ATTEMPTS × DEADLINE_MS\`);
+  const slow = ctx.grpc.callsTo('SyncNote').slice(1);
+  assert.equal(slow.length, 3, \`a CRM that never answers got \${slow.length} attempts: a deadline exceeded is transient, so the sync makes MAX_ATTEMPTS = 3\`);
+  const timeouts = slow.map(c => c.timeout);
+  assert(timeouts.every(t => t != null && t >= 2.5 && t <= 3.5), \`the attempts carried deadlines \${JSON.stringify(timeouts)} s: every attempt gets its own DEADLINE_MS = 3000, not what is left of the first one's\`);
+  assert.equal(ctx.redis.hget('crm:quarantine', note.id), null, 'a note whose attempts ran out of time was quarantined: DEADLINE_EXCEEDED is transient, the note stays in crm:outbox');
+  assert.deepStrictEqual(await pending(store), [note.id], 'a note whose attempts ran out of time must stay in crm:outbox');
 }
 
 export async function check_idempotent_sync(ctx) {
@@ -855,17 +885,35 @@ export async function check_retry_policy(ctx) {
   assert.deepStrictEqual(await pending(store), [note.id], 'a note whose attempts ran out must stay in crm:outbox for the next drain');
   assert.equal(await m.drainOutbox(), 1, 'the next drain (two more failures, then a healthy CRM) must sync the note');
   assert.deepStrictEqual(await pending(store), [], 'crm:outbox must be empty once the note was synced');
+  const late = await newNote(store);
+  const before = ctx.grpc.callsTo('SyncNote').length;
+  ctx.grpc.fail('SyncNote', ctx.grpc.status.DEADLINE_EXCEEDED, 'crm too slow', 2);
+  assert.equal(await m.syncNote(late), true, 'two DEADLINE_EXCEEDED then a healthy CRM: DEADLINE_EXCEEDED is transient, so the third attempt must land');
+  const after = ctx.grpc.callsTo('SyncNote').length - before;
+  assert.equal(after, 3, \`the sync made \${after} attempts after two DEADLINE_EXCEEDED, expected 3\`);
 }
 
 export async function check_quarantine_schema(ctx) {
   const {m, store} = crmSync(ctx);
   const note = await newNote(store);
-  ctx.grpc.fail('SyncNote', ctx.grpc.status.INVALID_ARGUMENT, 'author A-1 is not a CRM user', 4);
+  const before = ctx.grpc.callsTo('SyncNote').length;
+  ctx.grpc.fail('SyncNote', ctx.grpc.status.INVALID_ARGUMENT, 'author A-1 is not a CRM user', 1);
   assert.equal(await m.syncNote(note), false, "a note the CRM's schema refuses must not count as synced");
-  const calls = ctx.grpc.callsTo('SyncNote').length;
+  const calls = ctx.grpc.callsTo('SyncNote').length - before;
   assert.equal(calls, 1, \`a note the CRM refused with INVALID_ARGUMENT was sent \${calls} times: the refusal is permanent, another attempt gets the same answer\`);
-  assert(ctx.redis.hget('crm:quarantine', note.id), 'the refused note is not in crm:quarantine: quarantine(note id, reason) parks it with the reason for a person to look at');
+  const reason = ctx.redis.hget('crm:quarantine', note.id);
+  assert(reason, 'the refused note is not in crm:quarantine: quarantine(note id, reason) parks it with the reason for a person to look at');
+  assert(/invalid[_ ]?argument|\\b3\\b/i.test(reason), \`the quarantine reason is \${JSON.stringify(reason)}: it must name the status the CRM answered (INVALID_ARGUMENT)\`);
   assert.deepStrictEqual(await pending(store), [], 'a quarantined note must leave crm:outbox, or every drain sends it again');
+  for (const code of ['PERMISSION_DENIED', 'FAILED_PRECONDITION', 'INTERNAL']) {
+    const refused = await newNote(store);
+    const sentBefore = ctx.grpc.callsTo('SyncNote').length;
+    ctx.grpc.fail('SyncNote', ctx.grpc.status[code], 'refused', 1);
+    assert.equal(await m.syncNote(refused), false, \`a note the CRM refused with \${code} must not count as synced\`);
+    const sent = ctx.grpc.callsTo('SyncNote').length - sentBefore;
+    assert.equal(sent, 1, \`a note the CRM refused with \${code} was sent \${sent} times: only UNAVAILABLE and DEADLINE_EXCEEDED are transient\`);
+    assert.notEqual(ctx.redis.hget('crm:quarantine', refused.id), null, \`a note the CRM refused with \${code} is not in crm:quarantine: every status but the two transient ones is permanent\`);
+  }
 }
 `,
     go: `package main
@@ -873,6 +921,7 @@ export async function check_quarantine_schema(ctx) {
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -966,6 +1015,14 @@ func CheckSyncDeadline(ctx *harness.Ctx) {
 	ctx.Equal(syncNote(crmBg, note), false, "a CRM that takes 30 s per call must not count as synced; the sync answered")
 	took := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(took <= 10, "syncNote spent %.0f s on a CRM that does not answer, expected at most maxAttempts × deadline", took)
+	slow := ctx.GRPC.CallsTo("SyncNote", "")[1:]
+	ctx.Assert(len(slow) == 3, "a CRM that never answers got %d attempts: a deadline exceeded is transient, so the sync makes maxAttempts = 3", len(slow))
+	for _, c := range slow {
+		ctx.Assert(c.HasDeadline() && 2500*time.Millisecond <= c.Timeout && c.Timeout <= 3500*time.Millisecond, "an attempt carried a %v deadline: every attempt gets its own 3 s, not what is left of the first one's", c.Timeout)
+	}
+	_, quarantined := ctx.Redis.HGet("crm:quarantine", note.ID)
+	ctx.Assert(!quarantined, "a note whose attempts ran out of time was quarantined: DEADLINE_EXCEEDED is transient, the note stays in crm:outbox")
+	ctx.Equal(crmPending(), []string{note.ID}, "a note whose attempts ran out of time must stay in crm:outbox; it holds")
 }
 
 func CheckIdempotentSync(ctx *harness.Ctx) {
@@ -989,23 +1046,41 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	ctx.Equal(crmPending(), []string{note.ID}, "a note whose attempts ran out must stay in crm:outbox for the next drain; it holds")
 	ctx.Equal(drainOutbox(crmBg), 1, "the next drain (two more failures, then a healthy CRM) must sync the note; it synced")
 	ctx.Equal(crmPending(), []string{}, "crm:outbox once the note was synced")
+	late := crmNote(ctx)
+	before := len(ctx.GRPC.CallsTo("SyncNote", ""))
+	ctx.GRPC.Fail("SyncNote", codes.DeadlineExceeded, "crm too slow", 2, "")
+	ctx.Equal(syncNote(crmBg, late), true, "two DEADLINE_EXCEEDED then a healthy CRM: DEADLINE_EXCEEDED is transient, so the third attempt must land; the sync answered")
+	ctx.Equal(len(ctx.GRPC.CallsTo("SyncNote", ""))-before, 3, "the attempts after two DEADLINE_EXCEEDED")
 }
 
 func CheckQuarantineSchema(ctx *harness.Ctx) {
 	crmStandIn(ctx)
 	note := crmNote(ctx)
-	ctx.GRPC.Fail("SyncNote", codes.InvalidArgument, "author A-1 is not a CRM user", 4, "")
+	before := len(ctx.GRPC.CallsTo("SyncNote", ""))
+	ctx.GRPC.Fail("SyncNote", codes.InvalidArgument, "author A-1 is not a CRM user", 1, "")
 	ctx.Equal(syncNote(crmBg, note), false, "a note the CRM's schema refuses must not count as synced; the sync answered")
-	calls := len(ctx.GRPC.CallsTo("SyncNote", ""))
+	calls := len(ctx.GRPC.CallsTo("SyncNote", "")) - before
 	ctx.Assert(calls == 1, "a note the CRM refused with INVALID_ARGUMENT was sent %d times: the refusal is permanent, another attempt gets the same answer", calls)
 	reason, _ := ctx.Redis.HGet("crm:quarantine", note.ID)
 	ctx.Assert(reason != "", "the refused note is not in crm:quarantine: store.Quarantine(note id, reason) parks it with the reason for a person to look at")
+	ctx.Assert(regexp.MustCompile(\`(?i)invalid[_ ]?argument|\\b3\\b\`).MatchString(reason), "the quarantine reason is %q: it must name the status the CRM answered (INVALID_ARGUMENT)", reason)
 	ctx.Equal(crmPending(), []string{}, "a quarantined note must leave crm:outbox, or every drain sends it again; it holds")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.FailedPrecondition, codes.Internal} {
+		refused := crmNote(ctx)
+		sentBefore := len(ctx.GRPC.CallsTo("SyncNote", ""))
+		ctx.GRPC.Fail("SyncNote", code, "refused", 1, "")
+		ctx.Equal(syncNote(crmBg, refused), false, "a note the CRM refused with %v must not count as synced; the sync answered", code)
+		sent := len(ctx.GRPC.CallsTo("SyncNote", "")) - sentBefore
+		ctx.Assert(sent == 1, "a note the CRM refused with %v was sent %d times: only UNAVAILABLE and DEADLINE_EXCEEDED are transient", code, sent)
+		_, quarantined := ctx.Redis.HGet("crm:quarantine", refused.ID)
+		ctx.Assert(quarantined, "a note the CRM refused with %v is not in crm:quarantine: every status but the two transient ones is permanent", code)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <map>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -1014,11 +1089,11 @@ func CheckQuarantineSchema(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kReply = "We refunded the second charge.";
+const std::string kHReply = "We refunded the second charge.";
 
 // The CRM: one record per idempotency key (a request without one is always a new record);
 // drop_replies of the next calls are recorded but answered UNAVAILABLE.
-class CrmPeer final : public ticketcrm::Crm::Service {
+class HCrmPeer final : public ticketcrm::Crm::Service {
  public:
   std::vector<std::string> records;
   std::map<std::string, std::string> keys;
@@ -1042,19 +1117,19 @@ class CrmPeer final : public ticketcrm::Crm::Service {
   }
 };
 
-CrmPeer& standIn(harness::Ctx& ctx) {
-  static CrmPeer* peer = nullptr;
+HCrmPeer& hStandIn(harness::Ctx& ctx) {
+  static HCrmPeer* peer = nullptr;
   delete peer;
-  peer = new CrmPeer;
+  peer = new HCrmPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::string newTicket() { return store::createTicket("R-1", "Invoice 4471 charged twice").id; }
+std::string hNewTicket() { return store::createTicket("R-1", "Invoice 4471 charged twice").id; }
 
-store::Note newNote() { return store::commitNote(newTicket(), "A-1", "public", kReply); }
+store::Note hNewNote() { return store::commitNote(hNewTicket(), "A-1", "public", kHReply); }
 
-std::vector<std::string> pending() {
+std::vector<std::string> hPending() {
   std::vector<std::string> ids;
   for (const auto& n : store::pendingSyncs()) ids.push_back(n.id);
   return ids;
@@ -1063,23 +1138,23 @@ std::vector<std::string> pending() {
 }  // namespace
 
 void CheckNonblockingSync(harness::Ctx& ctx) {
-  CrmPeer& peer = standIn(ctx);
-  const std::string ticket_id = newTicket();
+  HCrmPeer& peer = hStandIn(ctx);
+  const std::string ticket_id = hNewTicket();
   ctx.GRPC.SetLatency("SyncNote", 2.0);
-  const store::Note note = postNote(ticket_id, "A-1", "public", kReply);
+  const store::Note note = postNote(ticket_id, "A-1", "public", kHReply);
   const size_t calls = ctx.GRPC.CallsTo("SyncNote").size();
   ctx.Assert(calls == 0, "postNote called the CRM %d time(s) before answering: the agent waits on the CRM and an outage fails their post. Commit the note with its outbox entry and answer", calls);
-  ctx.Equal(pending(), {note.id}, "the posted note must wait in crm:outbox; it holds");
+  ctx.Equal(hPending(), {note.id}, "the posted note must wait in crm:outbox; it holds");
   ctx.GRPC.SetLatency("SyncNote", 0);
   ctx.Equal(drainOutbox(), 1, "the drain must sync the one pending note; it synced");
-  ctx.Equal(pending(), std::vector<std::string>{}, "a synced note must leave crm:outbox; it holds");
+  ctx.Equal(hPending(), std::vector<std::string>{}, "a synced note must leave crm:outbox; it holds");
   ctx.Assert(ctx.Redis.SIsMember("crm:synced", note.id), "the drain must mark the note synced");
   ctx.Equal(peer.records, {note.id}, "the CRM's records");
 }
 
 void CheckSyncDeadline(harness::Ctx& ctx) {
-  standIn(ctx);
-  const store::Note note = newNote();
+  hStandIn(ctx);
+  const store::Note note = hNewNote();
   ctx.Equal(syncNote(note), true, "with the CRM healthy the sync must succeed; it answered");
   const auto call = ctx.GRPC.CallsTo("SyncNote")[0];
   ctx.Assert(call.HasDeadline(), "a SyncNote call carries no deadline: a CRM that accepts the connection and never answers holds the drain forever");
@@ -1089,11 +1164,18 @@ void CheckSyncDeadline(harness::Ctx& ctx) {
   ctx.Equal(syncNote(note), false, "a CRM that takes 30 s per call must not count as synced; the sync answered");
   const double took = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(took <= 10, "syncNote spent %v s on a CRM that does not answer, expected at most kMaxAttempts × kDeadline", took);
+  const auto calls = ctx.GRPC.CallsTo("SyncNote");
+  ctx.Assert(calls.size() == 4, "a CRM that never answers got %d attempts: a deadline exceeded is transient, so the sync makes kMaxAttempts = 3", calls.size() - 1);
+  for (size_t i = 1; i < calls.size(); ++i) {
+    ctx.Assert(calls[i].HasDeadline() && 2.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 3.5, "an attempt carried a %v s deadline: every attempt gets its own 3 s, not what is left of the first one's", calls[i].TimeoutSeconds());
+  }
+  ctx.Assert(!ctx.Redis.HGet("crm:quarantine", note.id).has_value(), "a note whose attempts ran out of time was quarantined: DEADLINE_EXCEEDED is transient, the note stays in crm:outbox");
+  ctx.Equal(hPending(), {note.id}, "a note whose attempts ran out of time must stay in crm:outbox; it holds");
 }
 
 void CheckIdempotentSync(harness::Ctx& ctx) {
-  CrmPeer& peer = standIn(ctx);
-  const store::Note note = newNote();
+  HCrmPeer& peer = hStandIn(ctx);
+  const store::Note note = hNewNote();
   peer.drop_replies = 1;
   ctx.Equal(syncNote(note), true, "after one lost reply the retry must land; the sync answered");
   ctx.Assert(peer.records.size() == 1, "the CRM recorded the note %d times after one lost reply: the retry made a second record. Send the note id as idempotency_key", peer.records.size());
@@ -1103,25 +1185,46 @@ void CheckIdempotentSync(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  standIn(ctx);
-  const store::Note note = newNote();
+  hStandIn(ctx);
+  const store::Note note = hNewNote();
   ctx.GRPC.Fail("SyncNote", grpc::StatusCode::UNAVAILABLE, "crm restarting", 5);
   ctx.Equal(syncNote(note), false, "five UNAVAILABLE in a row: the sync must give up after kMaxAttempts = 3; it answered");
   ctx.Equal(ctx.GRPC.CallsTo("SyncNote").size(), 3, "the attempts (kMaxAttempts = 3)");
-  ctx.Equal(pending(), {note.id}, "a note whose attempts ran out must stay in crm:outbox for the next drain; it holds");
+  ctx.Equal(hPending(), {note.id}, "a note whose attempts ran out must stay in crm:outbox for the next drain; it holds");
   ctx.Equal(drainOutbox(), 1, "the next drain (two more failures, then a healthy CRM) must sync the note; it synced");
-  ctx.Equal(pending(), std::vector<std::string>{}, "crm:outbox once the note was synced");
+  ctx.Equal(hPending(), std::vector<std::string>{}, "crm:outbox once the note was synced");
+  const store::Note late = hNewNote();
+  const size_t before = ctx.GRPC.CallsTo("SyncNote").size();
+  ctx.GRPC.Fail("SyncNote", grpc::StatusCode::DEADLINE_EXCEEDED, "crm too slow", 2);
+  ctx.Equal(syncNote(late), true, "two DEADLINE_EXCEEDED then a healthy CRM: DEADLINE_EXCEEDED is transient, so the third attempt must land; the sync answered");
+  ctx.Equal(ctx.GRPC.CallsTo("SyncNote").size() - before, 3, "the attempts after two DEADLINE_EXCEEDED");
 }
 
 void CheckQuarantineSchema(harness::Ctx& ctx) {
-  standIn(ctx);
-  const store::Note note = newNote();
-  ctx.GRPC.Fail("SyncNote", grpc::StatusCode::INVALID_ARGUMENT, "author A-1 is not a CRM user", 4);
+  hStandIn(ctx);
+  const store::Note note = hNewNote();
+  const size_t before = ctx.GRPC.CallsTo("SyncNote").size();
+  ctx.GRPC.Fail("SyncNote", grpc::StatusCode::INVALID_ARGUMENT, "author A-1 is not a CRM user", 1);
   ctx.Equal(syncNote(note), false, "a note the CRM's schema refuses must not count as synced; the sync answered");
-  const size_t calls = ctx.GRPC.CallsTo("SyncNote").size();
+  const size_t calls = ctx.GRPC.CallsTo("SyncNote").size() - before;
   ctx.Assert(calls == 1, "a note the CRM refused with INVALID_ARGUMENT was sent %d times: the refusal is permanent, another attempt gets the same answer", calls);
-  ctx.Assert(!ctx.Redis.HGet("crm:quarantine", note.id).value_or("").empty(), "the refused note is not in crm:quarantine: store::quarantine(note id, reason) parks it with the reason for a person to look at");
-  ctx.Equal(pending(), std::vector<std::string>{}, "a quarantined note must leave crm:outbox, or every drain sends it again; it holds");
+  const std::string reason = ctx.Redis.HGet("crm:quarantine", note.id).value_or("");
+  ctx.Assert(!reason.empty(), "the refused note is not in crm:quarantine: store::quarantine(note id, reason) parks it with the reason for a person to look at");
+  ctx.Assert(std::regex_search(reason, std::regex("invalid[_ ]?argument|\\\\b3\\\\b", std::regex::icase)), "the quarantine reason is %q: it must name the status the CRM answered (INVALID_ARGUMENT)", reason);
+  ctx.Equal(hPending(), std::vector<std::string>{}, "a quarantined note must leave crm:outbox, or every drain sends it again; it holds");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+      {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}};
+  for (const auto& [code, name] : terminal) {
+    const store::Note refused = hNewNote();
+    const size_t sent_before = ctx.GRPC.CallsTo("SyncNote").size();
+    ctx.GRPC.Fail("SyncNote", code, "refused", 1);
+    ctx.Equal(syncNote(refused), false, "a note the CRM refused with %s must not count as synced; the sync answered", name);
+    const size_t sent = ctx.GRPC.CallsTo("SyncNote").size() - sent_before;
+    ctx.Assert(sent == 1, "a note the CRM refused with %s was sent %d times: only UNAVAILABLE and DEADLINE_EXCEEDED are transient", name, sent);
+    ctx.Assert(ctx.Redis.HGet("crm:quarantine", refused.id).has_value(), "a note the CRM refused with %s is not in crm:quarantine: every status but the two transient ones is permanent", name);
+  }
 }
 `,
   },

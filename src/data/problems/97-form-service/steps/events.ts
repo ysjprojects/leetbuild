@@ -25,7 +25,7 @@ caller hears it went out.
 - The producer is **idempotent** with **\`acks=all\`** (in Go, confluent-kafka-go: kafka-go has no
   idempotent producer).
 - **Wait for the delivery report**, at most \`ACK_TIMEOUT_S\` = 2 s; a failed or missing one writes
-  the outbox row and returns \`False\`.`,
+  the outbox row (the event's own payload) and returns \`False\`.`,
   sequence: {
     participants: ['Form API', 'Kafka form.submission', 'Outbox'],
     messages: [
@@ -97,7 +97,7 @@ caller hears it went out.
       id: 'outbox-on-reject',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A rejected delivery, or no report within 2 s, writes an outbox row with the topic, the key and the payload, and the call returns false; the report arrives through the delivery callback (`on_delivery`, an awaited `send`, the `Produce` event channel, a `get` with a timeout, `dr_cb`). The starter catches only errors raised while enqueueing, which a broker rejection never is.',
+        'A report within 2 s is a success (a broker answering after 1.5 s writes no outbox row); a rejected delivery, or no report within 2 s, writes an outbox row with the topic, the key and the event’s own payload, and the call returns false. The report arrives through the delivery callback (`on_delivery`, an awaited `send`, the `Produce` event channel, a `get` with a timeout, `dr_cb`). The starter catches only errors raised while enqueueing, which a broker rejection never is.',
       match: {
         python: {
           all: [/store\.outbox_insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -685,18 +685,24 @@ def check_producer_durable(ctx):
 
 def check_outbox_on_reject(ctx):
     m = ctx.load("events")
+    ctx.kafka.stall(TOPIC, 1.5)  # a slow broker: the report comes 1.5 s later, inside the window
+    ok = m.publish_submission(_submission(3))
+    assert ok is True and _outbox(ctx) == [], f"a broker that acknowledged after 1.5 s got publish_submission {ok!r} and the outbox {_outbox(ctx)}: wait the whole ACK_TIMEOUT_S = 2 s for the report"
     ctx.kafka.fail_next(TOPIC, 1)  # the broker rejects the record
-    ok = m.publish_submission(_submission(1))
+    rejected = _submission(1)
+    ok = m.publish_submission(rejected)
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: nothing downstream will ever hear about sub-1"
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "f-1" and row.get("payload", {}).get("submission_id") == "sub-1", f"the outbox row is {row}, expected the topic, the key f-1 and the payload"
+    expected = {"submission_id": "sub-1", "form_id": "f-1", "field_names": ["email", "message", "name"], "value_hash": _hash(rejected["values"])}
+    assert row.get("payload") == expected, f"the outbox row's payload is {row.get('payload')}, expected the event's own payload {expected}: the relay publishes it as it is"
     assert ok is False, f"publish_submission returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_submission(_submission(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_submission waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_submission waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("submission_id") == "sub-2", f"no report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_submission returned {ok!r} without a delivery report, expected False"
@@ -786,18 +792,25 @@ export async function check_producer_durable(ctx) {
 
 export async function check_outbox_on_reject(ctx) {
   const m = ctx.load('events');
+  ctx.kafka.stall(TOPIC, 1.5); // a slow broker: the report comes 1.5 s later, inside the window
+  let ok = await m.publishSubmission(submission(3));
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`a broker that acknowledged after 1.5 s got publishSubmission \${JSON.stringify(ok)} and the outbox \${JSON.stringify(outboxRows(ctx))}: wait the whole ACK_TIMEOUT_MS = 2000 for the report\`);
   ctx.kafka.failNext(TOPIC, 1); // the broker rejects the record
-  let ok = await m.publishSubmission(submission(1));
+  const rejected = submission(1);
+  ok = await m.publishSubmission(rejected);
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: nothing downstream will ever hear about sub-1\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'f-1' && rows[0].payload?.submission_id === 'sub-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key f-1 and the payload\`);
+  const expected = {submission_id: 'sub-1', form_id: 'f-1', field_names: ['email', 'message', 'name'], value_hash: hashOf(rejected.values)};
+  assert.deepEqual(rows[0].payload, expected, \`the outbox row's payload is \${JSON.stringify(rows[0].payload)}, expected the event's own payload \${JSON.stringify(expected)}: the relay publishes it as it is\`);
   assert.equal(ok, false, \`publishSubmission resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishSubmission(submission(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishSubmission waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishSubmission waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.submission_id === 'sub-2', \`no report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishSubmission resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -917,18 +930,25 @@ func CheckProducerDurable(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnReject(ctx *harness.Ctx) {
+	ctx.Kafka.StallFor(eventsTopic, 1.5) // a slow broker: the report comes 1.5 s later, inside the window
+	ok := eventsPublish(ctx, eventsSubmission(3, "f-1"))
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a broker that acknowledged after 1.5 s got publishSubmission %t and the outbox %v: wait the whole 2 s for the report", ok, eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1) // the broker rejects the record
-	ok := eventsPublish(ctx, eventsSubmission(1, "f-1"))
+	rejected := eventsSubmission(1, "f-1")
+	ok = eventsPublish(ctx, rejected)
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row nothing downstream will ever hear about sub-1; the rows")
 	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "f-1" && rows[0].Payload["submission_id"] == "sub-1", "the outbox row is %v, expected the topic, the key f-1 and the payload", rows[0])
+	expected := map[string]any{"submission_id": "sub-1", "form_id": "f-1", "field_names": []any{"email", "message", "name"}, "value_hash": eventsHash(rejected.Values)}
+	ctx.Equal(rows[0].Payload, expected, "the outbox row's payload must be the event's own payload: the relay publishes it as it is")
 	ctx.Equal(ok, false, "publishSubmission's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsSubmission(2, "f-1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishSubmission waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishSubmission waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["submission_id"] == "sub-2", "no report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishSubmission's result without a delivery report")
@@ -1035,20 +1055,27 @@ void CheckProducerDurable(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnReject(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor(kEventsTopic, 1.5);  // a slow broker: the report comes 1.5 s later, inside the window
+  bool ok = publishSubmission(eventsSubmission(3));
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a broker that acknowledged after 1.5 s got publishSubmission %t and %d outbox rows: wait the whole 2 s for the report", ok, eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);  // the broker rejects the record
-  bool ok = publishSubmission(eventsSubmission(1));
+  const auto rejected = eventsSubmission(1);
+  ok = publishSubmission(rejected);
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row nothing downstream will ever hear about sub-1; the rows");
   ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "f-1" && rows[0].contains("payload") &&
                  eventsField(rows[0]["payload"], "submission_id") == "sub-1",
              "the outbox row is %s, expected the topic, the key f-1 and the payload", rows[0].dump());
+  const nlohmann::json expected = {{"submission_id", "sub-1"}, {"form_id", "f-1"}, {"field_names", {"email", "message", "name"}}, {"value_hash", eventsHash(rejected.values)}};
+  ctx.Assert(rows[0].contains("payload") && rows[0]["payload"] == expected, "the outbox row's payload is %s, expected the event's own payload %s: the relay publishes it as it is", rows[0].value("payload", nlohmann::json()).dump(), expected.dump());
   ctx.Equal(ok, false, "publishSubmission's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishSubmission(eventsSubmission(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishSubmission waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishSubmission waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "submission_id") == "sub-2",
              "no report within the window and the outbox holds %d rows", rows.size());
